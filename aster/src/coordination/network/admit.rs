@@ -337,6 +337,29 @@ pub(crate) fn admit(
             )
         })?;
 
+    // The **inner** payload is canonicality-checked too, and the outer check
+    // cannot stand in for it. Fory tolerates trailing bytes, so appending one
+    // to a valid `RaftMessageV1` and wrapping the result in a freshly encoded
+    // envelope passes the envelope comparison above while the message has a
+    // second valid spelling. §5.1 refuses "trailing internal-codec bytes"
+    // before dispatch, and this is where a Raft message meets that rule.
+    let reencoded_payload = payload_fory::<RaftMessageV1>()
+        .serialize(&message)
+        .map_err(|_| {
+            Refusal::at(
+                5,
+                StatusCode::InvalidArgument,
+                "the Raft payload could not be re-encoded",
+            )
+        })?;
+    if reencoded_payload != envelope.payload {
+        return Err(Refusal::at(
+            5,
+            StatusCode::InvalidArgument,
+            "the Raft payload is not its own canonical encoding",
+        ));
+    }
+
     if !pairs_with(method, &message) {
         return Err(Refusal::at(
             5,
@@ -748,6 +771,52 @@ mod tests {
         let seed = CoordinationNodeId::from_array(SENDER);
         assert!(!list.permits(&seed, &BTreeSet::new()));
         assert!(list.permits(&seed, &[seed].into_iter().collect()));
+    }
+
+    /// The **inner** payload is canonicality-checked, and the outer envelope
+    /// check does not stand in for it.
+    ///
+    /// The fixture is the exact escape: a byte appended to a valid
+    /// `RaftMessageV1`, wrapped in a **freshly encoded** envelope. The envelope
+    /// is canonical — it was just produced by the encoder — so the outer
+    /// comparison passes, and Fory accepts the trailing byte on the way in. Two
+    /// spellings of one vote request is a vote two peers can disagree about
+    /// while both verify.
+    #[test]
+    fn a_payload_with_a_second_spelling_is_refused_though_its_envelope_is_canonical() {
+        let ctx = Ctx::new();
+
+        let mut payload = payload_fory::<RaftMessageV1>()
+            .serialize(&vote_message())
+            .expect("encode");
+        payload.push(0);
+        let smuggled = RaftEnvelopeV1 {
+            payload,
+            ..envelope(&vote_message())
+        };
+        let frame = encode(&smuggled);
+
+        // The envelope really is canonical, so this test is not passing for the
+        // outer reason.
+        let decoded: RaftEnvelopeV1 = payload_fory::<RaftEnvelopeV1>()
+            .deserialize(&frame)
+            .expect("decode");
+        assert_eq!(
+            payload_fory::<RaftEnvelopeV1>()
+                .serialize(&decoded)
+                .expect("encode"),
+            frame,
+            "the fixture's envelope must be canonical, or the inner check is untested"
+        );
+        // And the payload really does still decode, so the refusal is about
+        // canonicality rather than about a decode failure.
+        assert!(payload_fory::<RaftMessageV1>()
+            .deserialize::<RaftMessageV1>(&decoded.payload)
+            .is_ok());
+
+        let refusal = admit_with(&ctx, &frame).expect_err("refused");
+        assert_eq!(refusal.step, 5, "{refusal}");
+        assert!(refusal.detail.contains("canonical"), "{refusal}");
     }
 
     /// An oversized payload is refused before it is decoded, and as the peer's

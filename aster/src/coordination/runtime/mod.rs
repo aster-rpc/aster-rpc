@@ -18,6 +18,7 @@
 //! |---|---|
 //! | [`config`] | the one pinned `openraft::Config` and its cross-constant invariants |
 //! | [`lifecycle`] | the §7.6 table, and the only producer of a lifecycle code |
+//! | [`owner`] | the one owner of the Raft, its storage, its controllers, and their shutdown |
 //! | [`readiness`] | the published view and the level-triggered `wait_ready()` |
 //!
 //! ## Unreached-by-shipping-code allowance
@@ -31,4 +32,5 @@
 
 pub(crate) mod config;
 pub(crate) mod lifecycle;
+pub(crate) mod owner;
 pub(crate) mod readiness;

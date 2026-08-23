@@ -1,0 +1,522 @@
+//! `CoordinationRuntime`: the one owner of the Raft instance, its storage, its
+//! controllers, and their shutdown (§7.6).
+//!
+//! ## Why one owner
+//!
+//! §7.6 fixes cancellation as the strict reverse of construction:
+//!
+//! ```text
+//! construct: storage → runtime → Raft → RPC registration → controllers
+//! shutdown:  controllers → deregister RPC → Raft::shutdown() → state and log
+//!            actors and read leases → directory lock
+//! ```
+//!
+//! That ordering is only enforceable if one value owns all of it. A runtime
+//! assembled from independently-dropped handles has whatever order the compiler
+//! picks, and **releasing the directory lock while an actor still holds a
+//! database open is how a second voter is admitted to a directory the first has
+//! not finished with**. Rust drops fields in declaration order, so the field
+//! order below is the shutdown order and is load-bearing — the same rule
+//! `VoterStorage` already documents one layer down.
+//!
+//! ## The metrics loop is the only writer of the lifecycle view
+//!
+//! It watches `Raft::metrics()`, classifies through
+//! [`lifecycle::classify`](super::lifecycle::classify), and publishes. Nothing
+//! else writes: two writers would let a node disagree with itself about its own
+//! state, which is the failure `classify` already exists to prevent one level
+//! down.
+//!
+//! It also carries the two facts OpenRaft does not have — which start corridor
+//! is still running, and how long since a follower last accepted an append from
+//! its leader — because neither is a Raft concept.
+
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use openraft::Raft;
+
+use super::config::leader_liveness_timeout;
+use super::lifecycle::{
+    classify, Corridor, FatalCause, LifecycleCode, LifecycleView, LocalFacts, LocalRole,
+};
+use super::readiness::{channel, LifecyclePublisher, Readiness};
+use crate::coordination::ids::CoordinationNodeId;
+use crate::coordination::network::admit::SenderAllowlist;
+use crate::coordination::network::service::{AttachedRuntime, RaftEndpoint};
+use crate::coordination::typeconfig::CoordinationTypeConfig;
+
+/// The local facts the metrics loop maintains, shared with whatever updates
+/// them.
+///
+/// Atomics rather than a mutex: every one is a single value written by one
+/// place and read by the metrics loop, and a lock here would put the Raft
+/// append path behind the classification loop.
+#[derive(Debug)]
+pub(crate) struct RuntimeFacts {
+    /// Which corridor is running, as a `LifecycleCode` discriminant so it fits
+    /// an atomic. `0` means `Running`.
+    corridor: AtomicU64,
+    draining: AtomicBool,
+    /// Milliseconds since the process start reference at the last accepted
+    /// append from the recognised leader. `u64::MAX` means "never".
+    ///
+    /// **Advisory** — see [`lifecycle`](super::lifecycle) for why a follower's
+    /// leader contact is not quorum evidence, and why v1 says so rather than
+    /// pretending otherwise.
+    last_leader_contact_ms: AtomicU64,
+    /// The reference point the value above is measured from. A monotonic
+    /// `Instant` cannot live in an atomic, so the runtime holds one origin and
+    /// stores offsets from it.
+    origin: Instant,
+    /// Latched. A `Fatal` that a later observation could clear would not be
+    /// `Fatal`.
+    fatal: std::sync::Mutex<Option<FatalCause>>,
+}
+
+impl RuntimeFacts {
+    /// Start in the corridor this start mode begins in.
+    pub(crate) fn new(corridor: Corridor) -> Self {
+        Self {
+            corridor: AtomicU64::new(corridor_code(corridor)),
+            draining: AtomicBool::new(false),
+            last_leader_contact_ms: AtomicU64::new(u64::MAX),
+            origin: Instant::now(),
+            fatal: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Record an accepted `append_entries` from the recognised leader.
+    ///
+    /// Called by the Raft service handler. Advisory: it proves one node
+    /// believes itself leader and is reaching us, and nothing about quorum.
+    pub(crate) fn note_leader_contact(&self) {
+        let elapsed = self.origin.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.last_leader_contact_ms.store(elapsed, Ordering::SeqCst);
+    }
+
+    pub(crate) fn enter(&self, corridor: Corridor) {
+        self.corridor
+            .store(corridor_code(corridor), Ordering::SeqCst);
+    }
+
+    pub(crate) fn corridor(&self) -> Corridor {
+        corridor_of(self.corridor.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn begin_draining(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Latch a fatal cause. The **first** one wins: it is the one that
+    /// explains the others.
+    pub(crate) fn latch_fatal(&self, cause: FatalCause) {
+        let mut held = self.fatal.lock().expect("the fatal latch");
+        if held.is_none() {
+            *held = Some(cause);
+        }
+    }
+
+    fn snapshot(&self, timeout: Duration) -> LocalFacts {
+        let contact = self.last_leader_contact_ms.load(Ordering::SeqCst);
+        LocalFacts {
+            corridor: self.corridor(),
+            draining: self.draining.load(Ordering::SeqCst),
+            fatal: self.fatal.lock().expect("the fatal latch").clone(),
+            follower_contact_age: (contact != u64::MAX).then(|| {
+                let now = self.origin.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                Duration::from_millis(now.saturating_sub(contact))
+            }),
+            leader_liveness_timeout: timeout,
+        }
+    }
+}
+
+fn corridor_code(corridor: Corridor) -> u64 {
+    match corridor {
+        Corridor::Running => 0,
+        Corridor::Bootstrapping => 1,
+        Corridor::Joining => 2,
+    }
+}
+
+fn corridor_of(code: u64) -> Corridor {
+    match code {
+        1 => Corridor::Bootstrapping,
+        2 => Corridor::Joining,
+        // Anything else is `Running`. Total rather than panicking: the value is
+        // written only by `enter`, so an unrecognised one is unreachable, and a
+        // panic in the metrics loop would take the lifecycle surface with it.
+        _ => Corridor::Running,
+    }
+}
+
+/// The lifecycle loop: the only writer of the published view.
+///
+/// Returns when the Raft metrics channel closes, which happens on
+/// `Raft::shutdown()`. Dropping the publisher then releases every outstanding
+/// `wait_ready()` with `ShutDown` rather than stranding it.
+pub(crate) async fn run_lifecycle(
+    raft: Raft<CoordinationTypeConfig>,
+    facts: Arc<RuntimeFacts>,
+    publisher: LifecyclePublisher,
+    allowlist: Arc<SenderAllowlist>,
+    local: CoordinationNodeId,
+    timeout: Duration,
+) {
+    let mut metrics = raft.metrics();
+    loop {
+        {
+            let current = metrics.borrow_and_update().clone();
+
+            // §7.2's graduation: the allowlist stops reading the signed seeds
+            // once a committed membership contains this node. Observed here
+            // because this is where committed membership is already being read,
+            // and a second observer would be a second answer.
+            let members: BTreeSet<CoordinationNodeId> =
+                current.membership_config.membership().voter_ids().collect();
+            allowlist.observe(&local, &members);
+
+            // A corridor ends on an observable durable fact, never on a timer.
+            // `Bootstrapping` ends when initialization commits — that is,
+            // when a membership exists at all. `Joining` ends when a committed
+            // membership contains us.
+            match facts.corridor() {
+                Corridor::Bootstrapping if !members.is_empty() => facts.enter(Corridor::Running),
+                Corridor::Joining if members.contains(&local) => facts.enter(Corridor::Running),
+                _ => {}
+            }
+
+            publisher.publish(classify(&current, &facts.snapshot(timeout)));
+        }
+        if metrics.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The running voter: one owner for everything Slice 3 starts.
+///
+/// **Field order is shutdown order.** See the module docs.
+pub(crate) struct CoordinationRuntime {
+    raft: Raft<CoordinationTypeConfig>,
+    facts: Arc<RuntimeFacts>,
+    readiness: Readiness,
+    endpoint: RaftEndpoint,
+    local: CoordinationNodeId,
+
+    /// 1. Controllers stop first. A controller that outlived the Raft would
+    ///    submit a membership change into a shut-down instance and report a
+    ///    failure that is really our own shutdown.
+    controllers: Vec<tokio::task::JoinHandle<()>>,
+    /// 2. Then the lifecycle loop, which holds the publisher: dropping it is
+    ///    what releases outstanding `wait_ready()` calls.
+    lifecycle: Option<tokio::task::JoinHandle<()>>,
+    /// 3. Then storage — its own field order stops both actors and drains the
+    ///    read leases before releasing the directory lock.
+    storage: crate::coordination::storage::VoterStorage,
+}
+
+impl CoordinationRuntime {
+    /// Assemble a runtime around an already-open store and an already-created
+    /// `Raft`.
+    ///
+    /// Takes both by value rather than creating them, because §3.3's order puts
+    /// service registration between them: the endpoint must be attachable
+    /// before the `Raft` exists, and this is the step that attaches it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn attach(
+        raft: Raft<CoordinationTypeConfig>,
+        storage: crate::coordination::storage::VoterStorage,
+        endpoint: RaftEndpoint,
+        attached: AttachedRuntime,
+        facts: Arc<RuntimeFacts>,
+        allowlist: Arc<SenderAllowlist>,
+        local: CoordinationNodeId,
+        config: &openraft::Config,
+    ) -> Self {
+        let timeout = leader_liveness_timeout(config);
+
+        // The initial view is the state `start()` may legitimately return in.
+        // Never `Ready`: readiness is observed, and `channel` asserts it.
+        let initial = LifecycleView {
+            code: match facts.corridor() {
+                Corridor::Bootstrapping => LifecycleCode::Bootstrapping,
+                Corridor::Joining => LifecycleCode::Joining,
+                Corridor::Running => LifecycleCode::NoQuorum,
+            },
+            local_role: LocalRole::None,
+            quorum_available: None,
+            fatal: None,
+        };
+        let (publisher, readiness) = channel(initial);
+
+        endpoint.attach(attached).await;
+
+        let lifecycle = tokio::spawn(run_lifecycle(
+            raft.clone(),
+            Arc::clone(&facts),
+            publisher,
+            allowlist,
+            local,
+            timeout,
+        ));
+
+        Self {
+            raft,
+            facts,
+            readiness,
+            endpoint,
+            local,
+            controllers: Vec::new(),
+            lifecycle: Some(lifecycle),
+            storage,
+        }
+    }
+
+    /// Register a controller task the runtime owns and stops first.
+    pub(crate) fn spawn_controller(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.controllers.push(task);
+    }
+
+    pub(crate) fn readiness(&self) -> Readiness {
+        self.readiness.clone()
+    }
+
+    pub(crate) fn facts(&self) -> &Arc<RuntimeFacts> {
+        &self.facts
+    }
+
+    pub(crate) fn raft(&self) -> &Raft<CoordinationTypeConfig> {
+        &self.raft
+    }
+
+    pub(crate) fn local(&self) -> &CoordinationNodeId {
+        &self.local
+    }
+
+    pub(crate) fn storage(&self) -> &crate::coordination::storage::VoterStorage {
+        &self.storage
+    }
+
+    /// §7.6's cancellation, in the strict reverse of construction.
+    ///
+    /// Explicit and `async` rather than left to `Drop`: three of the five steps
+    /// need to await, and a `Drop` that blocked on a runtime would deadlock the
+    /// executor it is running on. `Drop` still stops the storage actors in the
+    /// right order if this is never called — the field order guarantees that —
+    /// but a runtime dropped without `shutdown` skips the RPC deregistration,
+    /// so a call can reach a `Raft` that is going away.
+    pub(crate) async fn shutdown(mut self) {
+        // 1. Controllers.
+        self.facts.begin_draining();
+        for task in std::mem::take(&mut self.controllers) {
+            task.abort();
+            let _ = task.await;
+        }
+
+        // 2. Deregister RPC. After this a call is answered
+        //    `FailedPrecondition` — the same status a node that has not yet
+        //    attached answers, which is right: in both cases the node is up and
+        //    not serving Raft.
+        self.endpoint.detach().await;
+
+        // 3. The Raft itself.
+        let _ = self.raft.shutdown().await;
+
+        // 4. The lifecycle loop, which the metrics channel closing has already
+        //    ended. Awaiting it drops the publisher, releasing every
+        //    outstanding `wait_ready()` with `ShutDown`.
+        if let Some(lifecycle) = self.lifecycle.take() {
+            let _ = lifecycle.await;
+        }
+
+        // 5. Storage: dropping `self` runs its field order, which stops both
+        //    actors and drains the read leases *before* the directory lock.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The corridor round-trips through its atomic encoding, for every value.
+    ///
+    /// The encoding exists so the corridor fits an atomic; a mapping that lost
+    /// a variant would silently report `Running` for a node that is still
+    /// joining, which precedence says must win over every health question.
+    #[test]
+    fn every_corridor_survives_its_atomic_encoding() {
+        for corridor in [
+            Corridor::Running,
+            Corridor::Bootstrapping,
+            Corridor::Joining,
+        ] {
+            assert_eq!(corridor_of(corridor_code(corridor)), corridor);
+        }
+        // Distinct codes, or two corridors would collide.
+        let codes: BTreeSet<u64> = [
+            Corridor::Running,
+            Corridor::Bootstrapping,
+            Corridor::Joining,
+        ]
+        .into_iter()
+        .map(corridor_code)
+        .collect();
+        assert_eq!(codes.len(), 3);
+    }
+
+    /// The facts start where the start mode says and move only when told.
+    #[test]
+    fn the_facts_begin_in_their_start_corridor() {
+        let facts = RuntimeFacts::new(Corridor::Bootstrapping);
+        assert_eq!(facts.corridor(), Corridor::Bootstrapping);
+        facts.enter(Corridor::Running);
+        assert_eq!(facts.corridor(), Corridor::Running);
+    }
+
+    /// A follower with no contact reports `None`, and one with contact reports
+    /// an age that is not in the future.
+    #[test]
+    fn leader_contact_is_absent_until_it_happens() {
+        let facts = RuntimeFacts::new(Corridor::Running);
+        let timeout = Duration::from_millis(3_000);
+        assert_eq!(facts.snapshot(timeout).follower_contact_age, None);
+
+        facts.note_leader_contact();
+        let age = facts
+            .snapshot(timeout)
+            .follower_contact_age
+            .expect("contact was recorded");
+        assert!(
+            age <= Duration::from_secs(1),
+            "a just-recorded contact must be fresh, got {age:?}"
+        );
+    }
+
+    /// The **first** fatal cause wins: it is the one that explains the others.
+    ///
+    /// A latch that kept the most recent would report a downstream consequence
+    /// — the Raft stopping — instead of the storage failure that stopped it.
+    #[test]
+    fn the_first_fatal_cause_is_the_one_that_is_kept() {
+        let facts = RuntimeFacts::new(Corridor::Running);
+        assert_eq!(facts.snapshot(Duration::ZERO).fatal, None);
+
+        facts.latch_fatal(FatalCause::Storage("out of disk".into()));
+        facts.latch_fatal(FatalCause::Raft("stopped".into()));
+        assert_eq!(
+            facts.snapshot(Duration::ZERO).fatal,
+            Some(FatalCause::Storage("out of disk".into())),
+            "the cause that explains the others must survive"
+        );
+    }
+
+    /// Draining is one-way and visible to the classifier.
+    #[test]
+    fn draining_is_one_way() {
+        let facts = RuntimeFacts::new(Corridor::Running);
+        assert!(!facts.snapshot(Duration::ZERO).draining);
+        facts.begin_draining();
+        assert!(facts.snapshot(Duration::ZERO).draining);
+    }
+
+    /// **Field order is shutdown order**, and the order is §7.6's.
+    ///
+    /// A statement about the source, because Rust's drop order is a property of
+    /// the declaration rather than of any behaviour a test can observe: a
+    /// reordered struct compiles, passes every functional test, and releases
+    /// the directory lock while an actor still holds a database open. The
+    /// storage layer guards its own field order the same way and for the same
+    /// reason.
+    #[test]
+    fn the_field_order_is_the_shutdown_order() {
+        let source = include_str!("owner.rs");
+        let at = source
+            .find("pub(crate) struct CoordinationRuntime {")
+            .expect("the runtime struct exists");
+        let body = &source[at..at + source[at..].find("\n}").expect("a close")];
+
+        let positions: Vec<(&str, usize)> = ["controllers:", "lifecycle:", "storage:"]
+            .into_iter()
+            .map(|field| {
+                (
+                    field,
+                    body.find(field)
+                        .unwrap_or_else(|| panic!("{field} must be a field")),
+                )
+            })
+            .collect();
+
+        for pair in positions.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].1,
+                "{} must be declared before {}: §7.6 stops controllers, then the \
+                 lifecycle loop, then storage — and storage releases the directory lock last",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    /// The shutdown body performs §7.6's five steps in order.
+    ///
+    /// The same instrument, for the same reason: the ordering is not observable
+    /// from outside without a real cluster, and a reordered body deadlocks or
+    /// races rather than failing an assertion.
+    #[test]
+    fn the_shutdown_body_follows_the_reverse_of_construction() {
+        let source = include_str!("owner.rs");
+        let at = source
+            .find("pub(crate) async fn shutdown(")
+            .expect("shutdown exists");
+        let body = &source[at..];
+
+        let steps = [
+            "begin_draining()",
+            "endpoint.detach()",
+            "raft.shutdown()",
+            "lifecycle.take()",
+        ];
+        let mut last = 0usize;
+        for step in steps {
+            let at = body
+                .find(step)
+                .unwrap_or_else(|| panic!("shutdown must {step}"));
+            assert!(
+                at > last,
+                "{step} is out of §7.6's order: controllers, RPC, Raft, lifecycle, storage"
+            );
+            last = at;
+        }
+    }
+
+    /// The lifecycle loop is the only writer of the published view.
+    ///
+    /// Two writers would let a node disagree with itself about its own state,
+    /// which is the failure `classify` exists to prevent one level down.
+    #[test]
+    fn only_the_lifecycle_loop_publishes() {
+        let source = include_str!("owner.rs");
+        let end = source
+            .rfind("\n#[cfg(test)]\nmod ")
+            .map(|at| at + 1)
+            .unwrap_or(source.len());
+        let sites: Vec<usize> = source[..end]
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let code = line.split("//").next().unwrap_or("");
+                code.contains("publisher.publish(")
+            })
+            .map(|(n, _)| n + 1)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "the lifecycle view must have exactly one writer; found {sites:?}"
+        );
+    }
+}

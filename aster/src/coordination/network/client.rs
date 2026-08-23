@@ -261,9 +261,27 @@ impl CoordinationNetwork {
             Ok(bytes) => bytes,
             Err(err) => return Err(transport_of(&err)),
         };
+        // A completed exchange proves the latched condition is gone: a peer
+        // that answers is not running an incompatible protocol, is not in
+        // another group, and is not denying us. `FaultLatch::clear`'s own
+        // contract says a successful exchange clears it, and nothing was
+        // calling it.
+        self.ctx.faults.clear(&self.target);
 
+        self.open_response(&reply)
+    }
+
+    /// Check a response envelope and return the message inside it.
+    ///
+    /// **One rule for both the unary and the streaming reply paths.** An
+    /// earlier revision checked protocol, codec and group on the unary reply
+    /// and only the responder on the snapshot reply — so a peer answering a
+    /// snapshot stream could have used any protocol version and any group id.
+    /// The reply half deserves the same checks as the request half, and having
+    /// two copies is how one of them ends up shorter.
+    fn open_response(&self, reply: &[u8]) -> Result<RaftMessageV1, Transport> {
         let envelope: RaftResponseEnvelopeV1 = payload_fory::<RaftResponseEnvelopeV1>()
-            .deserialize(&reply)
+            .deserialize(reply)
             .map_err(|_| Transport::Undecodable)?;
         if envelope.protocol_version != PROTOCOL_VERSION
             || envelope.raft_codec_version != RAFT_CODEC_VERSION
@@ -278,9 +296,20 @@ impl CoordinationNetwork {
         if envelope.responder_node_id != self.target.as_bytes() {
             return Err(Transport::WrongGroup);
         }
-        payload_fory::<RaftMessageV1>()
+        let message: RaftMessageV1 = payload_fory::<RaftMessageV1>()
             .deserialize(&envelope.payload)
-            .map_err(|_| Transport::Undecodable)
+            .map_err(|_| Transport::Undecodable)?;
+        // And the reply payload is canonicality-checked for the same reason the
+        // request's is: Fory tolerates trailing bytes, so a decoding payload is
+        // not thereby its own canonical encoding, and §5.1 refuses trailing
+        // internal-codec bytes in either direction.
+        let reencoded = payload_fory::<RaftMessageV1>()
+            .serialize(&message)
+            .map_err(|_| Transport::Undecodable)?;
+        if reencoded != envelope.payload {
+            return Err(Transport::Undecodable);
+        }
+        Ok(message)
     }
 
     /// Classify, latch, and build the `RPCError` the trait returns.
@@ -450,12 +479,77 @@ fn stream_error(
     }
 }
 
+/// Fill `buffer` from `reader`, returning how many bytes were read.
+///
+/// Returns less than `buffer.len()` **only** at end of file. A short read is
+/// not EOF — `Read` may return fewer bytes than asked for at any time — and
+/// treating one as the end would truncate the body and fail the receiver's
+/// checksum with no explanation of why.
+///
+/// The one reading rule, shared by the hashing pass and the sending pass, so
+/// the two cannot disagree about where the body ends.
+pub(crate) fn read_chunk(
+    reader: &mut impl std::io::Read,
+    buffer: &mut [u8],
+) -> Result<usize, StreamFailure> {
+    let mut filled = 0usize;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(StreamFailure::LocalStorage),
+        }
+    }
+    Ok(filled)
+}
+
+/// Hash a snapshot body in `chunk`-sized pieces, returning its length and
+/// digest.
+///
+/// Constant memory: one chunk, reused. An earlier revision called
+/// `read_to_end` here and then built every encoded frame into a second `Vec`,
+/// so a 512 MiB snapshot needed over a gigabyte — against a §11.4 body ceiling
+/// of exactly 512 MiB and a §11.3 rule that "no snapshot is held whole in
+/// memory". The bound was declared and the sender ignored it.
+pub(crate) fn measure_body(
+    reader: &mut impl std::io::Read,
+    chunk: usize,
+) -> Result<(u64, [u8; 32]), StreamFailure> {
+    debug_assert!(chunk > 0, "a zero-sized chunk never terminates");
+    let mut buffer = vec![0u8; chunk];
+    let mut hasher = blake3::Hasher::new();
+    let mut total = 0u64;
+    loop {
+        let filled = read_chunk(reader, &mut buffer)?;
+        if filled == 0 {
+            break;
+        }
+        hasher.update(&buffer[..filled]);
+        total += filled as u64;
+        if filled < chunk {
+            break;
+        }
+    }
+    Ok((total, *hasher.finalize().as_bytes()))
+}
+
 impl CoordinationNetwork {
     /// The snapshot stream itself: one header frame, then contiguous bounded
-    /// chunks.
+    /// chunks, each encoded and written before the next is read.
     ///
-    /// Split out so [`full_snapshot`](RaftNetwork::full_snapshot) is only the
-    /// classification, and this is only the protocol.
+    /// Two streaming passes over the body, and **neither holds it whole**. The
+    /// header must carry `total_len` and the checksum before the first chunk —
+    /// that is what lets a receiver bound the transfer instead of discovering
+    /// its size as it arrives — so the digest needs a pass of its own.
+    ///
+    /// Reading the file twice is the cost of putting the checksum in the
+    /// header, and it is the right trade: the alternative is a trailer, which
+    /// would mean the receiver has already written 512 MiB before it can find
+    /// out the bytes were wrong.
+    ///
+    /// Peak memory is one chunk plus its encoded frame, whatever the body's
+    /// size.
     async fn send_snapshot(
         &mut self,
         vote: Vote<CoordinationNodeId>,
@@ -466,24 +560,19 @@ impl CoordinationNetwork {
         use crate::coordination::raft::{
             RaftSnapshotChunkWireV1, RaftSnapshotFrameV1, RaftSnapshotHeaderWireV1,
         };
-        use std::io::Read;
 
-        let _ = option;
         tokio::pin!(cancel);
 
-        // Read the whole body through the role-safe reader, hashing as we go.
-        // The length and checksum go in the **header**, so they are known
-        // before the first chunk — which is what lets a receiver bound the
-        // transfer rather than discovering its size as it arrives.
-        let mut reader = snapshot
-            .snapshot
-            .reader()
-            .map_err(|_| StreamFailure::LocalStorage)?;
-        let mut body = Vec::new();
-        reader
-            .read_to_end(&mut body)
-            .map_err(|_| StreamFailure::LocalStorage)?;
-        let checksum = blake3::hash(&body);
+        let chunk_size = super::super::runtime::config::SNAPSHOT_MAX_CHUNK_SIZE as usize;
+
+        // Pass one: length and digest, in constant memory.
+        let (total_len, checksum) = {
+            let mut hashing = snapshot
+                .snapshot
+                .reader()
+                .map_err(|_| StreamFailure::LocalStorage)?;
+            measure_body(&mut hashing, chunk_size)?
+        };
 
         let meta = SnapshotMetaV1::from(&snapshot.meta);
         let header = RaftSnapshotHeaderWireV1 {
@@ -497,68 +586,105 @@ impl CoordinationNetwork {
             snapshot_meta_payload: payload_fory::<SnapshotMetaV1>()
                 .serialize(&meta)
                 .map_err(|_| StreamFailure::LocalStorage)?,
-            total_len: body.len() as u64,
-            blake3_checksum: checksum.as_bytes().to_vec(),
+            total_len,
+            blake3_checksum: checksum.to_vec(),
         };
-
-        let fory = payload_fory::<RaftSnapshotFrameV1>();
-        let mut frames = vec![fory
-            .serialize(&RaftSnapshotFrameV1::Header(header))
-            .map_err(|_| StreamFailure::LocalStorage)?];
-
-        // §7.5's `snapshot_max_chunk_size`, which §12.3 has already proved fits
-        // its frame with the chunk header.
-        let chunk_size = super::super::runtime::config::SNAPSHOT_MAX_CHUNK_SIZE as usize;
-        let mut offset = 0u64;
-        for piece in body.chunks(chunk_size) {
-            let final_chunk = offset + piece.len() as u64 == body.len() as u64;
-            frames.push(
-                fory.serialize(&RaftSnapshotFrameV1::Chunk(RaftSnapshotChunkWireV1 {
-                    offset,
-                    data: piece.to_vec(),
-                    final_chunk,
-                }))
-                .map_err(|_| StreamFailure::LocalStorage)?,
-            );
-            offset += piece.len() as u64;
-        }
-        // An empty body still needs a final chunk, or the receiver cannot tell
-        // a finished stream from a truncated one.
-        if body.is_empty() {
-            frames.push(
-                fory.serialize(&RaftSnapshotFrameV1::Chunk(RaftSnapshotChunkWireV1 {
-                    offset: 0,
-                    data: Vec::new(),
-                    final_chunk: true,
-                }))
-                .map_err(|_| StreamFailure::LocalStorage)?,
-            );
-        }
 
         let connection = self.connect().await.map_err(StreamFailure::Transport)?;
         let stream_header = StreamHeader {
             service: RAFT_SERVICE.to_string(),
             method: "install_snapshot".to_string(),
             version: RAFT_VERSION,
+            // §5.3: the caller's deadline rides on the header, as it does for
+            // the unary path. An earlier revision ignored `option` entirely, so
+            // a snapshot transfer had no deadline at all while
+            // `install_snapshot_timeout` was configured at 30 s and enforced
+            // nowhere.
+            deadline: option.hard_ttl().as_secs().min(i16::MAX as u64) as i16,
             ..Default::default()
         };
 
-        let reply = tokio::select! {
-            biased;
-            _ = &mut cancel => return Err(StreamFailure::Closed),
-            reply = connection.client_stream(&stream_header, frames) => reply,
-        };
-        let reply = reply.map_err(|err| StreamFailure::Transport(transport_of(&err)))?;
+        // `bidi_open` rather than `client_stream`: the latter takes
+        // `Vec<Vec<u8>>` and would put every encoded frame in memory at once,
+        // which is the allocation this method exists to avoid.
+        // `BidiSink::send` writes one frame immediately and awaits, so the
+        // transport's own backpressure paces the read.
+        let (sink, mut responses) = connection
+            .bidi_open(&stream_header)
+            .await
+            .map_err(|err| StreamFailure::Transport(transport_of(&err)))?;
 
-        let envelope: RaftResponseEnvelopeV1 = payload_fory::<RaftResponseEnvelopeV1>()
-            .deserialize(&reply)
-            .map_err(|_| StreamFailure::Transport(Transport::Undecodable))?;
-        if envelope.responder_node_id != self.target.as_bytes() {
-            return Err(StreamFailure::Transport(Transport::WrongGroup));
+        let fory = payload_fory::<RaftSnapshotFrameV1>();
+        let send_frame = |frame: RaftSnapshotFrameV1| {
+            let sink = &sink;
+            let encoded = fory.serialize(&frame);
+            async move {
+                let encoded = encoded.map_err(|_| StreamFailure::LocalStorage)?;
+                sink.send(encoded)
+                    .await
+                    .map_err(|err| StreamFailure::Transport(transport_of(&err)))
+            }
+        };
+
+        send_frame(RaftSnapshotFrameV1::Header(header)).await?;
+
+        // Pass two: read one chunk, encode it, write it, and only then read the
+        // next. Nothing accumulates.
+        let mut sending = snapshot
+            .snapshot
+            .reader()
+            .map_err(|_| StreamFailure::LocalStorage)?;
+        let mut buffer = vec![0u8; chunk_size];
+        let mut offset = 0u64;
+        loop {
+            let filled = read_chunk(&mut sending, &mut buffer)?;
+            if filled == 0 {
+                break;
+            }
+            let chunk = RaftSnapshotFrameV1::Chunk(RaftSnapshotChunkWireV1 {
+                offset,
+                data: buffer[..filled].to_vec(),
+                final_chunk: false,
+            });
+            tokio::select! {
+                biased;
+                _ = &mut cancel => return Err(StreamFailure::Closed),
+                sent = send_frame(chunk) => sent?,
+            }
+            offset += filled as u64;
+            if filled < chunk_size {
+                break;
+            }
         }
-        let message: RaftMessageV1 = payload_fory::<RaftMessageV1>()
-            .deserialize(&envelope.payload)
-            .map_err(|_| StreamFailure::Transport(Transport::Undecodable))?;
+
+        // The final marker is its own zero-length chunk rather than a flag on
+        // the last data chunk. That makes an empty body and a truncated stream
+        // different things the receiver can tell apart, under one rule.
+        send_frame(RaftSnapshotFrameV1::Chunk(RaftSnapshotChunkWireV1 {
+            offset,
+            data: Vec::new(),
+            final_chunk: true,
+        }))
+        .await?;
+
+        sink.finish()
+            .await
+            .map_err(|err| StreamFailure::Transport(transport_of(&err)))?;
+
+        let reply = match responses.next().await {
+            Some(Ok(payload)) => payload,
+            Some(Err(err)) => return Err(StreamFailure::Transport(transport_of(&err))),
+            None => return Err(StreamFailure::Transport(Transport::ConnectionLost)),
+        };
+        // Drain the trailer so a non-OK status still surfaces.
+        if let Some(Err(err)) = responses.next().await {
+            return Err(StreamFailure::Transport(transport_of(&err)));
+        }
+        self.ctx.faults.clear(&self.target);
+
+        let message = self
+            .open_response(&reply)
+            .map_err(StreamFailure::Transport)?;
         match message {
             RaftMessageV1::SnapshotResponse(response) => Ok(SnapshotResponse {
                 vote: Vote::try_from(&response.vote)
@@ -719,6 +845,157 @@ mod tests {
             stream_error(StreamRetry::Network, "x".into()),
             StreamingError::Network(_)
         ));
+    }
+
+    /// A reader that records the largest single buffer it is ever asked to
+    /// fill, and how many bytes it has served.
+    ///
+    /// The instrument for the flat-peak-memory claim: `Read::read` is handed
+    /// the *whole* destination buffer, so the maximum slice length this sees is
+    /// the largest allocation the caller made to hold body bytes. A
+    /// `read_to_end` grows its buffer as it goes and would show a maximum on
+    /// the order of the body.
+    struct Watched {
+        remaining: u64,
+        max_ask: usize,
+        served: u64,
+    }
+
+    impl std::io::Read for Watched {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.max_ask = self.max_ask.max(buf.len());
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let n = (buf.len() as u64).min(self.remaining) as usize;
+            buf[..n].fill(0xA5);
+            self.remaining -= n as u64;
+            self.served += n as u64;
+            Ok(n)
+        }
+    }
+
+    /// **Peak memory is flat in the body size.**
+    ///
+    /// A 64 MiB body through a 1 MiB chunk never asks for more than one chunk
+    /// at a time, and the total served equals the body — so the pass is
+    /// complete as well as bounded. Sixty-four times the chunk size is enough
+    /// to make a whole-body buffer unmistakable while keeping the test fast.
+    #[test]
+    fn hashing_a_body_never_holds_more_than_one_chunk() {
+        const CHUNK: usize = 1024 * 1024;
+        const BODY: u64 = 64 * 1024 * 1024;
+
+        let mut reader = Watched {
+            remaining: BODY,
+            max_ask: 0,
+            served: 0,
+        };
+        let (len, digest) = measure_body(&mut reader, CHUNK).expect("hash");
+
+        assert_eq!(len, BODY, "the whole body must be measured");
+        assert_eq!(reader.served, BODY);
+        assert_eq!(
+            reader.max_ask, CHUNK,
+            "the largest buffer offered to the reader must be one chunk, not the body"
+        );
+
+        // And the digest is the body's, computed here independently of the
+        // chunking — so a pass that dropped or double-counted a chunk fails.
+        let expected = blake3::hash(&vec![0xA5u8; BODY as usize]);
+        assert_eq!(&digest, expected.as_bytes());
+    }
+
+    /// The chunk size does not change the answer, which is what makes the
+    /// chunking incidental rather than part of the protocol's meaning.
+    #[test]
+    fn the_digest_is_independent_of_the_chunk_size() {
+        const BODY: u64 = 300_000;
+        let digests: Vec<[u8; 32]> = [1usize, 7, 4096, 65_536, 1 << 20]
+            .into_iter()
+            .map(|chunk| {
+                let mut reader = Watched {
+                    remaining: BODY,
+                    max_ask: 0,
+                    served: 0,
+                };
+                let (len, digest) = measure_body(&mut reader, chunk).expect("hash");
+                assert_eq!(len, BODY, "chunk {chunk}");
+                assert!(reader.max_ask <= chunk, "chunk {chunk}");
+                digest
+            })
+            .collect();
+        assert!(
+            digests.windows(2).all(|w| w[0] == w[1]),
+            "the digest must not depend on how the body was chunked"
+        );
+    }
+
+    /// A short read is not end-of-file.
+    ///
+    /// `Read` may return fewer bytes than asked for at any time. Treating one
+    /// as EOF truncates the body and fails the receiver's checksum with no
+    /// explanation, which is the worst possible way for this to break: the
+    /// sender looks healthy and the receiver looks corrupt.
+    #[test]
+    fn a_short_read_does_not_end_the_body() {
+        /// Serves one byte at a time however much is asked for.
+        struct Dribble(u64);
+        impl std::io::Read for Dribble {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = 0x5A;
+                self.0 -= 1;
+                Ok(1)
+            }
+        }
+
+        let (len, digest) = measure_body(&mut Dribble(5_000), 1024).expect("hash");
+        assert_eq!(
+            len, 5_000,
+            "a one-byte-at-a-time reader must still be read whole"
+        );
+        assert_eq!(&digest, blake3::hash(&vec![0x5Au8; 5_000]).as_bytes());
+    }
+
+    /// An empty body measures as empty rather than failing.
+    #[test]
+    fn an_empty_body_measures_as_empty() {
+        let (len, digest) = measure_body(&mut std::io::empty(), 1024).expect("hash");
+        assert_eq!(len, 0);
+        assert_eq!(&digest, blake3::hash(&[]).as_bytes());
+    }
+
+    /// **No whole-body buffering anywhere in the network tree.**
+    ///
+    /// The source-level half of the claim above, because the memory property is
+    /// about code that does not exist: a single `read_to_end` reintroduces the
+    /// gigabyte, and no runtime test of the *streaming* path would notice
+    /// another path that buffers.
+    #[test]
+    fn nothing_in_the_network_tree_reads_a_body_whole() {
+        use crate::coordination::guards::{production_code, SOURCES};
+        let mut sites = Vec::new();
+        for (name, source) in SOURCES {
+            if !name.starts_with("network/") {
+                continue;
+            }
+            for (n, line) in production_code(source) {
+                for forbidden in ["read_to_end(", "client_stream("] {
+                    if line.contains(forbidden) {
+                        sites.push(format!("{name}:{n} {forbidden}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            sites.is_empty(),
+            "a snapshot body must never be held whole: read_to_end grows to the body's \
+             size, and client_stream takes Vec<Vec<u8>> so every encoded frame is live at \
+             once; found {sites:?}"
+        );
     }
 
     /// The source-level half of §5.4's method-awareness rule.

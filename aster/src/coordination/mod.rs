@@ -4,6 +4,11 @@
 //! types, and (later) the client stub. `coordination` adds the voter — the
 //! replicated state machine and its redb storage.
 
+/// Source-level guards over the whole subsystem: the rules that cannot be
+/// checked at runtime, with one inventory of every file they read.
+#[cfg(all(test, feature = "coordination"))]
+pub(crate) mod guards;
+
 pub mod contract;
 pub mod hash;
 pub mod ids;

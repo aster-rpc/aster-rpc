@@ -7,6 +7,7 @@
 //! | [`admit`] | the §5.3 request-check order, as one function |
 //! | [`client`] | `RaftNetwork`/`RaftNetworkFactory` over Aster RPC |
 //! | [`errors`] | `S3-NETERR`: the two exhaustive mappings into OpenRaft's error variants |
+//! | [`service`] | the live `aster.coordination.Raft` v1 dispatcher |
 //! | [`handoff`] | one stream's vote, metadata and body, bound from the wire to `install_full_snapshot` |
 //!
 //! ## Unreached-by-shipping-code allowance
@@ -23,3 +24,4 @@ pub(crate) mod admit;
 pub(crate) mod client;
 pub(crate) mod errors;
 pub(crate) mod handoff;
+pub(crate) mod service;

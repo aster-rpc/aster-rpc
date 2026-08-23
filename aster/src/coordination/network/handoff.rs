@@ -123,58 +123,143 @@ impl std::fmt::Display for StreamRefusal {
 
 impl std::error::Error for StreamRefusal {}
 
-/// The receiving half of exactly one `install_snapshot` stream.
+/// One snapshot stream header, decoded — vote, metadata, length and checksum
+/// as a single value.
 ///
-/// Owns the vote and metadata from its single header frame together with the
-/// body those chunks are being written into, and hands all three on as one
-/// value. **This is the only place a [`SnapshotReceipt`] is built**, and it is
-/// built by consuming this receiver — so the three parts are never separately
-/// selectable, not even inside this module.
+/// **The only constructor decodes them all from one `RaftSnapshotHeaderWireV1`.**
+/// That is the whole point: an earlier revision of this module handed
+/// [`SnapshotStreamReceiver::begin`] a header, a decoded vote, a decoded
+/// metadata and a body as four independent arguments, so
+/// `begin(header_a, vote_b, meta_a, body_a)` compiled and nothing compared the
+/// vote with `header_a.vote_payload`. That is exactly the vote-substitution
+/// hole the whole handoff exists to close, reintroduced one level below it —
+/// a sealing type is only as strong as its constructor's argument list, and
+/// the argument list had grown back.
 #[derive(Debug)]
-pub(crate) struct SnapshotStreamReceiver {
+pub(crate) struct AdmittedHeader {
     vote: Vote<CoordinationNodeId>,
     meta: Meta,
+    total_len: u64,
+    checksum: [u8; 32],
+}
+
+impl AdmittedHeader {
+    /// Decode one header. The only way to obtain this value.
+    ///
+    /// Both payloads are canonicality-checked, not merely decoded: Fory accepts
+    /// trailing bytes, so a payload that decodes is not thereby its own
+    /// canonical encoding, and §5.1 rejects "trailing internal-codec bytes"
+    /// before dispatch. A vote with a second valid spelling is a vote two
+    /// peers can disagree about while both verifying.
+    pub(crate) fn decode(header: &RaftSnapshotHeaderWireV1) -> Result<Self, StreamRefusal> {
+        let checksum: [u8; 32] = header
+            .blake3_checksum
+            .as_slice()
+            .try_into()
+            .map_err(|_| StreamRefusal::Malformed("the checksum is not 32 bytes".into()))?;
+
+        let wire_vote: VoteV1 = canonical_decode(&header.vote_payload, "the header vote")?;
+        let vote = Vote::try_from(&wire_vote).map_err(|e| {
+            StreamRefusal::Malformed(format!("the header vote is not a vote: {e:?}"))
+        })?;
+
+        let wire_meta: SnapshotMetaV1 =
+            canonical_decode(&header.snapshot_meta_payload, "the header metadata")?;
+        let meta = Meta::try_from(&wire_meta).map_err(|e| {
+            StreamRefusal::Malformed(format!("the header metadata is not metadata: {e:?}"))
+        })?;
+
+        Ok(Self {
+            vote,
+            meta,
+            total_len: header.total_len,
+            checksum,
+        })
+    }
+
+    /// The vote this stream arrived under, for the §8.4 recheck before install.
+    ///
+    /// A read, not an extraction: the value stays inside this header and is
+    /// moved out only by [`SnapshotStreamReceiver::finish`], which consumes the
+    /// receiver that owns it.
+    pub(crate) fn vote(&self) -> &Vote<CoordinationNodeId> {
+        &self.vote
+    }
+
+    /// How many bytes the sender declared. A claim, bounded before use.
+    pub(crate) fn total_len(&self) -> u64 {
+        self.total_len
+    }
+}
+
+/// Decode a bounded payload and prove it is its own canonical encoding.
+///
+/// Fory tolerates trailing bytes, so "it decoded" is not "these are the bytes
+/// the encoder would produce". §5.1 refuses trailing internal-codec bytes
+/// before dispatch, and this is where that applies to a snapshot header's two
+/// nested payloads — the outer envelope check cannot see inside them.
+fn canonical_decode<T>(bytes: &[u8], what: &str) -> Result<T, StreamRefusal>
+where
+    T: crate::rpc::contract::WireField + fory_core::serializer::Serializer + fory_core::ForyDefault,
+{
+    use crate::coordination::contract::payload_fory;
+    let value: T = payload_fory::<T>()
+        .deserialize(bytes)
+        .map_err(|e| StreamRefusal::Malformed(format!("{what} will not decode: {e}")))?;
+    let reencoded = payload_fory::<T>()
+        .serialize(&value)
+        .map_err(|e| StreamRefusal::Malformed(format!("{what} will not re-encode: {e}")))?;
+    if reencoded != bytes {
+        return Err(StreamRefusal::Malformed(format!(
+            "{what} is not its own canonical encoding"
+        )));
+    }
+    Ok(value)
+}
+
+/// The receiving half of exactly one `install_snapshot` stream.
+///
+/// Owns one decoded header and the body its chunks are being written into, and
+/// hands both on as one value. **This is the only place a [`SnapshotReceipt`]
+/// is built**, and it is built by consuming this receiver.
+///
+/// There is nothing to cross: the header is one already-sealed value, and the
+/// body is created *here* rather than passed in, so the constructor has no two
+/// arguments that could come from two streams.
+#[derive(Debug)]
+pub(crate) struct SnapshotStreamReceiver {
+    header: AdmittedHeader,
     body: Box<CoordinationSnapshotFile>,
     writer: IncomingWriter,
     /// The next offset a chunk must start at. §5.3 requires exact contiguity.
     expected_offset: u64,
-    declared_len: u64,
-    declared_checksum: [u8; 32],
     hasher: blake3::Hasher,
     complete: bool,
 }
 
 impl SnapshotStreamReceiver {
-    /// Begin receiving, from the one header frame and the receiver-owned
-    /// temporary the chunks will land in.
+    /// Begin receiving into a fresh receiver-owned temporary.
     ///
-    /// `vote` and `meta` are the *decoded* header payloads. They are passed in
-    /// already decoded because decoding needs the §5.3 bounds check that runs
-    /// before any payload is interpreted, which is the caller's step — but they
-    /// come from **one** header, and this is the only constructor, so there is
-    /// no path by which they can come from two.
+    /// Takes the sealed header and the storage layout — **not** a body. The
+    /// temporary is created here, so no caller can hand this receiver a body
+    /// that belongs to another stream, and no caller can hand it a vote or
+    /// metadata that came from another header.
     pub(crate) fn begin(
-        header: &RaftSnapshotHeaderWireV1,
-        vote: Vote<CoordinationNodeId>,
-        meta: Meta,
-        body: Box<CoordinationSnapshotFile>,
+        layout: &crate::coordination::storage::schema::StorageLayout,
+        header: AdmittedHeader,
     ) -> Result<Self, StreamRefusal> {
-        let declared_checksum: [u8; 32] = header
-            .blake3_checksum
-            .as_slice()
-            .try_into()
-            .map_err(|_| StreamRefusal::Malformed("the checksum is not 32 bytes".into()))?;
+        let body = Box::new(
+            crate::coordination::storage::snapshot::begin_receiving(layout)
+                .map_err(|e| StreamRefusal::Storage(e.to_string()))?,
+        );
         let writer = body
             .writer()
             .map_err(|e| StreamRefusal::Storage(e.to_string()))?;
         Ok(Self {
-            vote,
-            meta,
+            header,
             body,
             writer,
             expected_offset: 0,
-            declared_len: header.total_len,
-            declared_checksum,
             hasher: blake3::Hasher::new(),
             complete: false,
         })
@@ -202,9 +287,9 @@ impl SnapshotStreamReceiver {
             });
         }
         let after = self.expected_offset.saturating_add(chunk.data.len() as u64);
-        if after > self.declared_len {
+        if after > self.header.total_len {
             return Err(StreamRefusal::LengthMismatch {
-                declared: self.declared_len,
+                declared: self.header.total_len,
                 received: after,
             });
         }
@@ -222,10 +307,10 @@ impl SnapshotStreamReceiver {
         self.complete
     }
 
-    /// The vote this stream arrived under, for the admission recheck §8.4
-    /// requires before install.
-    pub(crate) fn vote(&self) -> &Vote<CoordinationNodeId> {
-        &self.vote
+    /// The header this stream arrived under, for the §8.4 recheck before
+    /// install.
+    pub(crate) fn header(&self) -> &AdmittedHeader {
+        &self.header
     }
 
     /// Close the stream and produce the receipt.
@@ -239,13 +324,10 @@ impl SnapshotStreamReceiver {
             return Err(StreamRefusal::Incomplete);
         }
         let SnapshotStreamReceiver {
-            vote,
-            meta,
+            header,
             body,
             writer,
             expected_offset,
-            declared_len,
-            declared_checksum,
             hasher,
             complete: _,
         } = self;
@@ -253,16 +335,17 @@ impl SnapshotStreamReceiver {
         let written = writer
             .finish()
             .map_err(|e| StreamRefusal::Storage(e.to_string()))?;
-        if written != declared_len || expected_offset != declared_len {
+        if written != header.total_len || expected_offset != header.total_len {
             return Err(StreamRefusal::LengthMismatch {
-                declared: declared_len,
+                declared: header.total_len,
                 received: written,
             });
         }
-        if hasher.finalize().as_bytes() != &declared_checksum {
+        if hasher.finalize().as_bytes() != &header.checksum {
             return Err(StreamRefusal::ChecksumMismatch);
         }
 
+        let AdmittedHeader { vote, meta, .. } = header;
         Ok(SnapshotReceipt { vote, meta, body })
     }
 }
@@ -354,209 +437,75 @@ impl SnapshotHandoff {
     }
 }
 
-/// Decode the vote a header carries.
-///
-/// Separate from the receiver's constructor so the receiver takes one already-
-/// decoded value per field: decoding needs §5.3's bounds check, which runs
-/// before any payload is interpreted at all.
-pub(crate) fn decode_header_vote(
-    header: &RaftSnapshotHeaderWireV1,
-) -> Result<Vote<CoordinationNodeId>, StreamRefusal> {
-    use crate::coordination::contract::payload_fory;
-    let wire: VoteV1 = payload_fory::<VoteV1>()
-        .deserialize(&header.vote_payload)
-        .map_err(|e| StreamRefusal::Malformed(format!("the header vote will not decode: {e}")))?;
-    Vote::try_from(&wire)
-        .map_err(|e| StreamRefusal::Malformed(format!("the header vote is not a vote: {e:?}")))
-}
-
-/// Decode the metadata a header carries.
-pub(crate) fn decode_header_meta(header: &RaftSnapshotHeaderWireV1) -> Result<Meta, StreamRefusal> {
-    use crate::coordination::contract::payload_fory;
-    let wire: SnapshotMetaV1 = payload_fory::<SnapshotMetaV1>()
-        .deserialize(&header.snapshot_meta_payload)
-        .map_err(|e| {
-            StreamRefusal::Malformed(format!("the header metadata will not decode: {e}"))
-        })?;
-    Meta::try_from(&wire).map_err(|e| {
-        StreamRefusal::Malformed(format!("the header metadata is not metadata: {e:?}"))
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    /// The structural obligations, stated as source guards because **no
-    /// runtime test can hold them**.
+    /// The **local** obligations. The subsystem-wide ones — one constructor for
+    /// each sealed value, one production call site for `install_full_snapshot`,
+    /// two construction sites for `SnapshotData::Prepared` — live in
+    /// [`coordination::guards`](crate::coordination::guards), because a guard
+    /// that scans only this file is exempt from its own rule the moment the
+    /// construct appears in another. An earlier revision of these guards did
+    /// scan only this file, and the Raft service handler was outside all of
+    /// them.
     ///
-    /// The vote-only substitution is unobservable: after
-    /// [`SnapshotReceipt::prepare`] the vote is inside the token with no
-    /// setter, and before it the vote arrived inside the receiver with the
-    /// bytes. There is no value downstream to compare a vote against, so a test
-    /// that appeared to exercise the crossing at runtime would be asserting a
-    /// property no code path has. What *can* be checked is that the code has no
-    /// shape in which the crossing could be expressed, and that is a statement
-    /// about the source — the same instrument `storage::durability_guard` uses
-    /// for the deferred-fsync rule.
+    /// What is left here is the shape of *this* module's API, which no other
+    /// file can affect.
     #[test]
-    fn the_handoff_has_one_constructor_and_one_call_site() {
+    fn no_constructor_assembles_the_parts_separately() {
         let source = include_str!("handoff.rs");
-        let end = production_end(source);
-        let production = &source[..end];
+        let production = &source[..crate::coordination::guards::production_end(source)];
 
-        // Exactly one call to `install_full_snapshot`, and it is inside the
-        // token's consuming method.
-        let call_sites: Vec<usize> = production
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| {
-                let code = line.split("//").next().unwrap_or("");
-                code.contains("install_full_snapshot(")
-            })
-            .map(|(n, _)| n + 1)
-            .collect();
-        assert_eq!(
-            call_sites.len(),
-            1,
-            "install_full_snapshot must have exactly one call site; found at {call_sites:?}"
-        );
-
-        // Exactly one *construction* of each sealed value, and exactly one
-        // destructuring. A struct literal and a `let` pattern are the only two
-        // shapes either name can appear in as a value, so counting them
-        // separately is what makes this a statement about construction rather
-        // than about how often the word occurs.
-        let count = |needle: &str| production.matches(needle).count();
-
-        assert_eq!(
-            count("Ok(SnapshotHandoff {"),
-            1,
-            "SnapshotHandoff must be constructed in exactly one place"
-        );
-        assert_eq!(
-            count("let SnapshotHandoff {"),
-            1,
-            "and destructured in exactly one place — its consuming install"
-        );
-        assert_eq!(
-            count("Ok(SnapshotReceipt {"),
-            1,
-            "SnapshotReceipt must be constructed in exactly one place"
-        );
-        assert_eq!(
-            count("let SnapshotReceipt {"),
-            1,
-            "and destructured in exactly one place — prepare, which consumes it"
-        );
-
-        // And there is no constructor function for either: the only way in is
-        // the two struct literals above, both inside methods that consume the
-        // value that produced them.
+        // No function anywhere in this module takes a vote and a metadata as
+        // separate parameters. That signature is what made the first revision
+        // forgeable: `begin(header_a, vote_b, meta_a, body_a)` compiled.
         for forbidden in [
+            "vote: Vote<CoordinationNodeId>,\n        meta: Meta,",
             "fn new(vote",
-            "pub(crate) fn new(",
-            "impl From<(",
             "fn from_parts(",
+            "impl From<(",
         ] {
             assert!(
                 !production.contains(forbidden),
-                "a {forbidden:?} constructor would let three separately chosen parts be \
-                 assembled, which relocates the substitution rather than removing it"
+                "a {forbidden:?} constructor would let separately chosen parts be assembled, \
+                 which relocates the substitution rather than removing it"
             );
         }
-    }
 
-    /// `CoordinationSnapshotFile::Prepared` is constructed in exactly two
-    /// places: [`SnapshotHandoff::install`] and the test-only suite adapter.
-    ///
-    /// `prepare_install` is deliberately **not** one of them: it returns a bare
-    /// `PreparedSnapshot` and never wraps it. A guard naming it as a producer
-    /// would readmit exactly the assembled-token path this design removes —
-    /// obtain a `PreparedSnapshot`, wrap it yourself, and supply your own vote
-    /// and metadata.
-    ///
-    /// A *pattern* is not a construction, so match arms and `let` bindings that
-    /// destructure the variant are excluded. Counting them would make the guard
-    /// fail for the one thing it wants: `install_snapshot` destructuring the
-    /// role it accepts.
-    #[test]
-    fn the_prepared_variant_is_constructed_in_exactly_two_places() {
-        const SOURCES: &[(&str, &str)] = &[
-            ("network/handoff.rs", include_str!("handoff.rs")),
-            ("network/errors.rs", include_str!("errors.rs")),
-            (
-                "storage/snapshot.rs",
-                include_str!("../storage/snapshot.rs"),
-            ),
-            ("storage/machine.rs", include_str!("../storage/machine.rs")),
-        ];
-        let mut sites = Vec::new();
-        for (name, source) in SOURCES {
-            // Up to each file's trailing test module. A test that drives the
-            // boundary directly — handing `install_snapshot` a `Prepared` it
-            // built itself — is exercising the rule rather than escaping it,
-            // and counting those would make the guard fail for the tests that
-            // prove the property. What must stay bounded is the *shipped*
-            // build, plus the one test-only adapter above the boundary.
-            for (n, line) in source[..production_end(source)].lines().enumerate() {
-                let code = line.split("//").next().unwrap_or("");
-                let names_it = code.contains("CoordinationSnapshotFile::Prepared(");
-                // A match arm or a binding pattern destructures; it does not
-                // build one.
-                let is_pattern = code.contains("=>") || code.trim_start().starts_with("let ");
-                if names_it && !is_pattern && !code.contains("Prepared(_)") {
-                    sites.push((*name, n + 1, code.trim().to_string()));
-                }
-            }
-        }
-
-        let names: Vec<String> = sites
-            .iter()
-            .map(|(name, line, _)| format!("{name}:{line}"))
-            .collect();
-        assert_eq!(
-            sites.len(),
-            2,
-            "the Prepared variant must be constructed in exactly two places — the handoff's \
-             install and the test-only suite adapter; found: {names:?}"
-        );
-        assert_eq!(sites[0].0, "network/handoff.rs", "{names:?}");
-        assert_eq!(sites[1].0, "storage/machine.rs", "{names:?}");
-
-        // And the second one really is test-only. Without this the guard would
-        // accept a *production* second producer as long as it lived in
-        // `machine.rs`, which is the whole thing it is meant to forbid.
-        let machine = include_str!("../storage/machine.rs");
-        let before = &machine[..machine
-            .lines()
-            .take(sites[1].1 - 1)
-            .map(|l| l.len() + 1)
-            .sum::<usize>()];
-        let guard = before
-            .rfind("#[cfg(test)]")
-            .expect("the second producer must sit under a #[cfg(test)] item");
+        // `begin` takes the sealed header and a layout — never a body, so no
+        // caller can hand this receiver another stream's temporary.
+        let begin = production
+            .find("pub(crate) fn begin(")
+            .expect("the receiver has a constructor");
+        let signature = &production[begin..begin + 200];
         assert!(
-            before[guard..].matches("\nimpl ").count() <= 1
-                && before[guard..].matches("\nfn ").count() == 0,
-            "the second producer must be inside the #[cfg(test)] item that immediately \
-             precedes it, not merely somewhere after one"
+            signature.contains("header: AdmittedHeader"),
+            "begin must take the sealed header: {signature}"
+        );
+        assert!(
+            !signature.contains("body:"),
+            "begin must create its own temporary rather than accept one: {signature}"
+        );
+        assert!(
+            !signature.contains("vote:") && !signature.contains("meta:"),
+            "begin must not take a vote or metadata separately: {signature}"
         );
     }
 
-    /// The production `install_snapshot` has no non-fatal raw-role arm.
+    /// The production `install_snapshot` has no `cfg(test)` raw-role arm.
     ///
-    /// A `cfg(test)` arm inside it would delete the invariant from the very
-    /// type the real-Raft boundary test exercises, so that test would prove a
-    /// property the shipped build does not have. The suite reaches production
-    /// installation through an adapter instead.
+    /// An arm inside the production method would delete the invariant from the
+    /// very type the real-Raft boundary test exercises, so that test would be
+    /// proving a property the shipped build does not have. The suite reaches
+    /// production installation through an adapter instead.
     #[test]
     fn the_production_install_has_no_test_only_raw_role_arm() {
         let machine = include_str!("../storage/machine.rs");
-        let production = &machine[..production_end(machine)];
+        let production = &machine[..crate::coordination::guards::production_end(machine)];
         let install = production
             .find("async fn install_snapshot(")
             .expect("the state machine implements install_snapshot");
-        // The body ends at the next `async fn` at the same indentation.
         let rest = &production[install..];
         let body_end = rest[1..]
             .find("\n    async fn ")
@@ -573,28 +522,113 @@ mod tests {
         );
     }
 
-    /// Where a file's production code ends: at its **last** `#[cfg(test)]`
-    /// module. The same rule, and the same reasons, as
-    /// `storage::durability_guard::production_end`.
-    fn production_end(source: &str) -> usize {
-        source
-            .rfind("\n#[cfg(test)]\nmod ")
-            .map(|at| at + 1)
-            .unwrap_or(source.len())
+    /// A header's two payloads are canonicality-checked, not merely decoded.
+    ///
+    /// Fory tolerates trailing bytes, so a vote payload with one appended byte
+    /// decodes to the same vote and is a *second spelling* of it. §5.1 refuses
+    /// trailing internal-codec bytes before dispatch, and the outer envelope
+    /// check cannot see inside a nested payload.
+    #[test]
+    fn a_header_payload_with_a_second_spelling_is_refused() {
+        use crate::coordination::contract::payload_fory;
+        use crate::coordination::raft::RaftSnapshotHeaderWireV1;
+
+        let vote = VoteV1::from(&Vote::new_committed(
+            7,
+            CoordinationNodeId::from_array([1u8; 32]),
+        ));
+        // Built from a real `SnapshotMeta` with a non-empty membership: the
+        // wire form's `TryFrom` refuses an empty one, and a baseline that could
+        // not decode would make every negative case below pass for the wrong
+        // reason.
+        let meta = SnapshotMetaV1::from(&Meta {
+            last_log_id: None,
+            last_membership: openraft::StoredMembership::new(
+                None,
+                openraft::Membership::new(
+                    vec![[CoordinationNodeId::from_array([1u8; 32])]
+                        .into_iter()
+                        .collect()],
+                    None,
+                ),
+            ),
+            snapshot_id: "s1".into(),
+        });
+        let good_vote = payload_fory::<VoteV1>().serialize(&vote).expect("encode");
+        let good_meta = payload_fory::<SnapshotMetaV1>()
+            .serialize(&meta)
+            .expect("encode");
+
+        let header = |vote_payload: Vec<u8>, meta_payload: Vec<u8>| RaftSnapshotHeaderWireV1 {
+            protocol_version: 1,
+            raft_codec_version: 1,
+            group_id: vec![0xAB; 32],
+            sender_node_id: vec![2u8; 32],
+            vote_payload,
+            snapshot_meta_payload: meta_payload,
+            total_len: 0,
+            blake3_checksum: vec![0u8; 32],
+        };
+
+        // The honest baseline: the untouched header decodes.
+        AdmittedHeader::decode(&header(good_vote.clone(), good_meta.clone()))
+            .expect("the untouched header must decode, or every case below passes vacuously");
+
+        let mut trailing_vote = good_vote.clone();
+        trailing_vote.push(0);
+        // It still *decodes* — which is what makes the canonicality check the
+        // thing doing the work here.
+        assert!(payload_fory::<VoteV1>()
+            .deserialize::<VoteV1>(&trailing_vote)
+            .is_ok());
+        let refusal = AdmittedHeader::decode(&header(trailing_vote, good_meta.clone()))
+            .expect_err("a second spelling of the vote must be refused");
+        assert!(refusal.to_string().contains("canonical"), "{refusal}");
+
+        let mut trailing_meta = good_meta;
+        trailing_meta.push(0);
+        let refusal = AdmittedHeader::decode(&header(good_vote, trailing_meta))
+            .expect_err("a second spelling of the metadata must be refused");
+        assert!(refusal.to_string().contains("canonical"), "{refusal}");
     }
 
-    /// The guards above search for strings the code really contains, so a guard
-    /// pointed at the wrong token cannot pass by finding nothing.
+    /// A checksum that is not 32 bytes is refused before any chunk is
+    /// accepted, so the receiver never runs without a comparison to make.
     #[test]
-    fn the_guards_look_for_tokens_that_exist() {
-        let handoff = include_str!("handoff.rs");
-        assert!(handoff.contains("install_full_snapshot("));
-        // Built rather than written, so this line does not itself become a
-        // third "construction site" for the guard above to find — the same
-        // reason `storage::durability_guard` assembles the level name it
-        // forbids.
-        let variant = format!("{}::{}(", "CoordinationSnapshotFile", "Prepared");
-        assert!(handoff.contains(&variant));
-        assert!(include_str!("../storage/machine.rs").contains("async fn install_snapshot("));
+    fn a_header_without_a_full_checksum_is_refused() {
+        use crate::coordination::contract::payload_fory;
+        use crate::coordination::raft::RaftSnapshotHeaderWireV1;
+
+        let header = RaftSnapshotHeaderWireV1 {
+            protocol_version: 1,
+            raft_codec_version: 1,
+            group_id: vec![0xAB; 32],
+            sender_node_id: vec![2u8; 32],
+            vote_payload: payload_fory::<VoteV1>()
+                .serialize(&VoteV1::from(&Vote::new_committed(
+                    7,
+                    CoordinationNodeId::from_array([1u8; 32]),
+                )))
+                .expect("encode"),
+            snapshot_meta_payload: payload_fory::<SnapshotMetaV1>()
+                .serialize(&SnapshotMetaV1::from(&Meta {
+                    last_log_id: None,
+                    last_membership: openraft::StoredMembership::new(
+                        None,
+                        openraft::Membership::new(
+                            vec![[CoordinationNodeId::from_array([1u8; 32])]
+                                .into_iter()
+                                .collect()],
+                            None,
+                        ),
+                    ),
+                    snapshot_id: "s1".into(),
+                }))
+                .expect("encode"),
+            total_len: 0,
+            blake3_checksum: vec![0u8; 31],
+        };
+        let refusal = AdmittedHeader::decode(&header).expect_err("31 bytes is not a checksum");
+        assert!(refusal.to_string().contains("32 bytes"), "{refusal}");
     }
 }

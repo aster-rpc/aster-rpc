@@ -246,6 +246,15 @@ pub type SharedAdmissionSource = Arc<dyn VerifiedAdmissionSource>;
 /// must never verify as another.
 pub const ADMISSION_DOMAIN: &[u8] = b"aster-coordination/admission/v1\0";
 
+/// The `format_version` a v1 admission set and its envelope must declare.
+///
+/// Named rather than written as a literal `1`, and versioned for the same
+/// reason every other signed document is: these are **externally signed bytes**
+/// minted by a tool this build does not control. "Host-local" describes who
+/// reads them, not who wrote them — a set signed by last year's provisioning
+/// script is exactly the case a format version exists to refuse.
+pub const ADMISSION_FORMAT_VERSION: u32 = 1;
+
 /// The §12.1 cap on one admission set.
 ///
 /// Sized to the largest group v1 permits plus room for the clients an operator
@@ -395,7 +404,7 @@ impl SignedAdmissionSet {
             .deserialize(signed_bytes)
             .map_err(|_| AdmissionSetError::Malformed)?;
 
-        if envelope.format_version != 1 {
+        if envelope.format_version != ADMISSION_FORMAT_VERSION {
             return Err(AdmissionSetError::UnknownFormat(envelope.format_version));
         }
         if envelope.authority_public_key.len() != 32 || envelope.signature.len() != 64 {
@@ -425,7 +434,7 @@ impl SignedAdmissionSet {
             return Err(AdmissionSetError::NonCanonical);
         }
 
-        if set.format_version != 1 {
+        if set.format_version != ADMISSION_FORMAT_VERSION {
             return Err(AdmissionSetError::UnknownFormat(set.format_version));
         }
         if set.authority_domain.is_empty()
@@ -539,7 +548,7 @@ pub(crate) mod testing {
             .collect();
         entries.sort_by(|l, r| l.node_id.cmp(&r.node_id));
         AdmissionSetV1 {
-            format_version: 1,
+            format_version: ADMISSION_FORMAT_VERSION,
             authority_domain: "aster0.net".into(),
             revision,
             entries,
@@ -917,6 +926,72 @@ mod tests {
             Err(AdmissionSetError::UnknownClass(99))
         );
     }
+
+    /// A byte-level golden vector for the canonical encoding.
+    ///
+    /// §5.1 requires one for every signed document, and this is one: the bytes
+    /// are what an external tool signs, so a Fory framing change or a field
+    /// renumbering would silently invalidate every set an operator has already
+    /// minted. A round-trip test cannot see that — a type decodes its own
+    /// encoding perfectly whatever the layout is.
+    ///
+    /// If this fails, the encoding changed. That is a protocol-version
+    /// decision, not a rebase: bump `ADMISSION_FORMAT_VERSION` and say what
+    /// happens to sets signed under the old one.
+    #[test]
+    fn the_canonical_admission_set_encoding_is_pinned() {
+        use crate::coordination::model::authority::canonical_document_bytes;
+
+        let set = AdmissionSetV1 {
+            format_version: ADMISSION_FORMAT_VERSION,
+            authority_domain: "aster0.net".into(),
+            revision: 7,
+            entries: vec![
+                AdmissionEntryV1 {
+                    node_id: vec![0x11u8; 32],
+                    class_code: ADMISSION_CLASS_PRODUCER,
+                },
+                AdmissionEntryV1 {
+                    node_id: vec![0x22u8; 32],
+                    class_code: ADMISSION_CLASS_CONSUMER,
+                },
+            ],
+        };
+        let bytes = canonical_document_bytes(&set).expect("encode");
+
+        // The digest rather than the whole blob: it pins the bytes exactly and
+        // stays readable in a diff. The length is asserted too, so a change
+        // that happened to collide is still visible.
+        let digest = blake3::hash(&bytes);
+        assert_eq!(
+            (bytes.len(), digest.to_hex().to_string()),
+            (
+                GOLDEN_ADMISSION_SET_LEN,
+                GOLDEN_ADMISSION_SET_DIGEST.to_string()
+            ),
+            "the canonical admission-set encoding changed; that invalidates every set an \
+             operator has already signed, so it is a format-version decision"
+        );
+
+        // And the pinned bytes still verify end to end, so the vector is of a
+        // document this build accepts rather than of an arbitrary struct.
+        let signature = {
+            use ed25519_dalek::Signer;
+            signing_key().sign(&admission_signing_bytes(&bytes))
+        };
+        let signed = crate::coordination::model::authority::signed_document_from_parts(
+            bytes,
+            &key(),
+            &signature.to_bytes(),
+        )
+        .expect("encode");
+        assert!(SignedAdmissionSet::verify(&key(), "aster0.net", &signed).is_ok());
+    }
+
+    /// The pinned encoding of the fixture above.
+    const GOLDEN_ADMISSION_SET_LEN: usize = 176;
+    const GOLDEN_ADMISSION_SET_DIGEST: &str =
+        "3986d0e7db2ca4b871d515f930f907523ef85f84ba0ba87d1c67960ba9d66c50";
 
     #[test]
     fn an_empty_document_is_not_an_admission_set() {
