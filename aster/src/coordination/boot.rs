@@ -27,12 +27,22 @@
 //!   genesis* names. Every initial voter calls it with the same set, and
 //!   identical concurrent initialization is tolerated: OpenRaft answers
 //!   `NotAllowed` to the losers, which is success here, not failure.
-//! - **Join** calls nothing. A permit grants no membership; an existing
-//!   administrator must commit an intent through the current quorum. The
-//!   corridor's whole job is to wait until a committed membership contains this
-//!   node, which the lifecycle loop observes.
-//! - **Existing** calls nothing and never initializes. Its storage is already
-//!   bound; initializing would found a second group over the first.
+//! - **Join** calls nothing, and is the one mode that never may. A permit
+//!   grants no membership; an existing administrator must commit an intent
+//!   through the current quorum, and a joining node that initialized would
+//!   found a second group beside the one it is asking to join. The corridor's
+//!   whole job is to wait until a committed membership contains this node,
+//!   which the lifecycle loop observes. It restarts freely: its first start
+//!   binds the directory and every later one opens a bound directory, so
+//!   `Join` admits both.
+//! - **Existing** initializes **only when OpenRaft says the node is not
+//!   initialized**. Ordinarily that never happens — its storage is bound and
+//!   its group formed long ago. It matters for one window: a fresh open
+//!   commits both identity bindings *before* `Raft::initialize` runs, so a
+//!   crash in between leaves a directory that is bound with no membership,
+//!   which `Bootstrap` refuses as not `Fresh`. Without this the group could
+//!   never elect, never install its genesis, and never leave `NoQuorum`.
+//!   Completing that founding is not founding a second group.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -274,14 +284,17 @@ async fn run_corridor(
         // `NotAllowed` is the backstop if one commits between the check and the
         // call.
         ResolvedStart::Existing { genesis } => {
+            // `Raft::is_initialized()`, not "does the membership have voters".
+            // OpenRaft's own predicate also counts an existing log or a
+            // non-default vote, so the two disagree on a store that crashed
+            // *after* appending but before any membership committed — and this
+            // arm would then call `initialize` on a node OpenRaft considers
+            // initialized. Using its definition means the code and the claim
+            // cannot drift apart.
             if raft
-                .metrics()
-                .borrow()
-                .membership_config
-                .membership()
-                .voter_ids()
-                .next()
-                .is_some()
+                .is_initialized()
+                .await
+                .map_err(|err| Error::Transport(anyhow::anyhow!("coordination raft: {err}")))?
             {
                 return Ok(());
             }
@@ -633,7 +646,7 @@ mod tests {
             .find("initialize(raft, initial_members(genesis))")
             .expect("the existing arm may initialize");
         assert!(
-            existing[..init_at].contains(".voter_ids()"),
+            existing[..init_at].contains("is_initialized()"),
             "the existing arm must check for an empty membership before initializing"
         );
     }

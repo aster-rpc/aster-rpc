@@ -169,15 +169,34 @@ impl ResolvedStart {
         }
     }
 
-    /// Whether this mode requires an empty storage directory.
+    /// Which opened-directory states this mode admits (§7.2).
     ///
-    /// Two of the three do, and the rule is per §7.2 rather than per accident:
-    /// `Bootstrap` and `Join` both *create* a binding, and creating one over an
-    /// existing group is how a directory ends up bound to two groups.
-    pub(crate) fn requires_empty_directory(&self) -> bool {
+    /// Three answers, not two, and the third is the one an earlier revision got
+    /// wrong.
+    ///
+    /// * `Bootstrap` requires an **empty** directory: it founds a group, and
+    ///   founding one over an existing group is how a directory ends up bound
+    ///   to two.
+    /// * `Existing` requires a **bound** one: its whole premise is that the
+    ///   binding is already there.
+    /// * `Join` admits **either**, because a joining node restarts. Its first
+    ///   start binds the directory; every start after that opens a bound one,
+    ///   and requiring `Fresh` refused the restart outright. §S3-JOIN is
+    ///   explicit that "restart retains the same restricted state until
+    ///   membership lands", and deleting the directory is not a workaround: the
+    ///   group's quorum may already count the candidate a voter, so a wiped
+    ///   store rejoins as a member with no log.
+    ///
+    /// A `Join` into a directory bound to *another* group is still refused —
+    /// by the storage identity check, which compares the permit's group id and
+    /// genesis hash with what the store holds. That check is the one that
+    /// matters here, and it runs either way.
+    pub(crate) fn admits(&self, outcome: OpenOutcome) -> bool {
+        let empty = matches!(outcome, OpenOutcome::Fresh);
         match self {
-            ResolvedStart::Bootstrap { .. } | ResolvedStart::Join { .. } => true,
-            ResolvedStart::Existing { .. } => false,
+            ResolvedStart::Bootstrap { .. } => empty,
+            ResolvedStart::Existing { .. } => !empty,
+            ResolvedStart::Join { .. } => true,
         }
     }
 }
@@ -219,8 +238,7 @@ impl StartPlan {
     /// idempotent for a `Fresh` result, so the cost of learning this late is a
     /// directory created and then abandoned, which is the safe direction.
     pub(crate) fn check_directory_state(&self, outcome: OpenOutcome) -> Result<(), StartError> {
-        let empty = matches!(outcome, OpenOutcome::Fresh);
-        if self.resolved.requires_empty_directory() != empty {
+        if !self.resolved.admits(outcome) {
             return Err(StartError::WrongDirectoryState {
                 mode: self.resolved.name(),
                 outcome,
@@ -733,10 +751,23 @@ mod tests {
         for (name, plan) in &plans {
             for outcome in outcomes {
                 let fresh = matches!(outcome, OpenOutcome::Fresh);
-                let creates = *name != "Existing";
+                // Three answers, not two. `Bootstrap` founds a group and needs
+                // an empty directory; `Existing` reopens one and needs a bound
+                // directory; **`Join` takes either**, because a joining node
+                // restarts — its first start binds the directory and every
+                // later one opens a bound one. Requiring `Fresh` there refused
+                // the restart outright, and wiping the directory is not the
+                // workaround: the group's quorum may already count the
+                // candidate a voter.
+                let expected = match *name {
+                    "Bootstrap" => fresh,
+                    "Existing" => !fresh,
+                    "Join" => true,
+                    other => unreachable!("unknown mode {other}"),
+                };
                 assert_eq!(
                     plan.check_directory_state(outcome).is_ok(),
-                    fresh == creates,
+                    expected,
                     "{name} against {outcome:?}"
                 );
             }

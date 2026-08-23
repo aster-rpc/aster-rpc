@@ -5,9 +5,15 @@
 //! Slice 0 carried only the storage directory, on the rule that "a field
 //! accepted now and checked later is worse than an absent field, because it
 //! reads as configured while nothing enforces it". Slice 3 owns the parsing, so
-//! the fields land together with the code that verifies them: the pinned
-//! authority key and domain, exactly one [`CoordinationStart`], and a
+//! the fields land together with the code that verifies them: the authority
+//! domain, exactly one [`CoordinationStart`], and a
 //! [`VerifiedAdmissionSource`].
+//!
+//! The deployment **ROOT** public key is deliberately not among them. It is
+//! `AsterConfig`'s, resolved once from `ASTER_ROOT_PUBKEY` /
+//! `ASTER_ROOT_PUBKEY_FILE` / `[trust] root_pubkey`, and coordination consumes
+//! it: one deployment has one ROOT, and a second place to configure it is a
+//! second place for it to be wrong.
 //!
 //! There is no `Default` for the config, no unset admission source, and no
 //! allow-all fallback. A config that omits any of them does not build.
@@ -48,11 +54,17 @@ use crate::error::{Error, Result};
 
 /// How this voter starts (§7.2). Exactly three modes exist.
 ///
-/// The pinned authority key and domain are **not** here: they live once on
-/// [`CoordinationConfig`] and apply identically to all three. An earlier
-/// revision put a key inside `Existing` while also requiring one at the top
-/// level, which left it ambiguous which was authoritative and made
-/// `Bootstrap`/`Join` read as though they had no pin at all.
+/// The **ROOT key is not here, and is not on [`CoordinationConfig`] either**:
+/// it is the deployment's, resolved once by `AsterConfig` from
+/// `ASTER_ROOT_PUBKEY`, `ASTER_ROOT_PUBKEY_FILE` or `[trust] root_pubkey`. Two
+/// earlier revisions put a key on a start mode and then on the coordination
+/// config; both made it a second place to configure one value, and while the
+/// second existed every test fixture used it, so nothing proved a voter could
+/// start from the deployment's key at all.
+///
+/// The `authority_domain` *is* configured here, and is a different thing: one
+/// authority legitimately signs for several deployments, so the domain is what
+/// stops a staging document verifying cleanly against production's key.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum CoordinationStart {
@@ -72,8 +84,15 @@ pub enum CoordinationStart {
     },
     /// Reopen storage this voter already owns.
     ///
-    /// Never calls `initialize`. Every configured value must match what is
-    /// persisted, including the top-level authority key and domain.
+    /// Every configured value must match what is persisted, including the
+    /// deployment ROOT key and the domain.
+    ///
+    /// It initializes Raft in exactly one case: when OpenRaft reports the node
+    /// is **not initialized**, which for a bound directory means the first
+    /// start crashed between committing the identity bindings and
+    /// `Raft::initialize`. `Bootstrap` cannot recover that — the directory is
+    /// no longer `Fresh` — so without it the group would never elect and never
+    /// install its genesis. In every ordinary restart this is a no-op.
     Existing {
         /// The **same signed genesis** the group was founded on.
         ///

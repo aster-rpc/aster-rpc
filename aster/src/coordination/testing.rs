@@ -402,6 +402,80 @@ impl GroupFixture {
         &self.domain
     }
 
+    /// A signed join permit for `candidate`, naming `senders` as its bootstrap
+    /// senders.
+    ///
+    /// `candidate_ticket` must be the candidate's **own** canonical Open
+    /// ticket, because the permit binds it: `verify_join_permit_for_start`
+    /// compares it with the ticket the starting node renders for itself, which
+    /// is what stops a permit minted for one endpoint being replayed by
+    /// another.
+    pub fn join_permit_with_ticket(
+        &self,
+        candidate_secret: [u8; 32],
+        candidate_ticket: &str,
+        senders: &[usize],
+    ) -> Vec<u8> {
+        use crate::coordination::model::authority::{
+            canonical_document_bytes, join_signing_bytes, signed_document_from_parts,
+        };
+        use crate::coordination::raft::{JoinPermitV1, NodeIdV1};
+
+        let candidate = ed25519_dalek::SigningKey::from_bytes(&candidate_secret)
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        let mut bootstrap_senders: Vec<NodeIdV1> = senders
+            .iter()
+            .map(|i| NodeIdV1 {
+                node_id: self.node_id(*i),
+            })
+            .collect();
+        bootstrap_senders.sort_by(|l, r| l.node_id.cmp(&r.node_id));
+
+        let permit = JoinPermitV1 {
+            format_version: 1,
+            group_id: self.group.to_vec(),
+            authority_domain: self.domain.clone(),
+            genesis_hash: self.genesis_hash().to_vec(),
+            candidate_ticket: candidate_ticket.to_string(),
+            candidate_node_id: candidate,
+            bootstrap_senders,
+            join_nonce: vec![self.group[0] ^ 0x5A; 32],
+        };
+        let document = canonical_document_bytes(&permit).expect("encode a permit");
+        let signature = self.sign_for_testing(&join_signing_bytes(&document));
+        signed_document_from_parts(document, &self.authority_key(), &signature)
+            .expect("encode a signed permit")
+    }
+
+    /// A `Join` configuration for `dir` under this fixture's group.
+    ///
+    /// `candidate_ticket` is the candidate's **own rendered** ticket, which a
+    /// caller learns by starting the endpoint once and reading it. That is not
+    /// a test artefact: a permit binds the ticket, so an operator mints one for
+    /// a candidate whose address they already have.
+    pub fn join_config(
+        &self,
+        dir: &std::path::Path,
+        candidate_secret: [u8; 32],
+        candidate_ticket: &str,
+        senders: &[usize],
+    ) -> crate::coordination::host::CoordinationConfig {
+        use crate::coordination::host::{CoordinationConfig, CoordinationStart};
+
+        self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
+            CoordinationStart::Join {
+                signed_join_permit: self.join_permit_with_ticket(
+                    candidate_secret,
+                    candidate_ticket,
+                    senders,
+                ),
+                expected_deployment_profile_code: self.profile(),
+            },
+        ))
+    }
+
     /// Bind a storage directory and stop, **without** initializing Raft.
     ///
     /// Reproduces the interrupted bootstrap exactly: a fresh open commits both
@@ -413,7 +487,7 @@ impl GroupFixture {
     ///
     /// It opens through the production `VoterStorage::open` with the production
     /// identity, so the directory it leaves is the one a real crash leaves.
-    pub fn bind_without_initializing_for_testing(&self, dir: &std::path::Path, index: usize) {
+    pub fn bind_without_initializing_for_testing(&self, dir: &std::path::Path, local: &[u8]) {
         use crate::coordination::storage::identity::{OpenPolicy, StorageIdentity};
         use crate::coordination::storage::schema::StorageLayout;
         use crate::coordination::storage::VoterStorage;
@@ -423,8 +497,7 @@ impl GroupFixture {
             self.genesis_hash(),
             self.authority_key(),
             self.domain(),
-            crate::coordination::ids::CoordinationNodeId::from_slice(&self.node_id(index))
-                .expect("a node id"),
+            crate::coordination::ids::CoordinationNodeId::from_slice(local).expect("a node id"),
             self.profile(),
         );
         let storage = VoterStorage::open(

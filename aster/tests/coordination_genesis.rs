@@ -783,7 +783,7 @@ async fn an_interrupted_bootstrap_recovers_through_existing() {
     let dir = tempfile::tempdir().expect("a storage directory");
 
     // Bind, and stop before `Raft::initialize`.
-    fixture.bind_without_initializing_for_testing(dir.path(), 0);
+    fixture.bind_without_initializing_for_testing(dir.path(), &fixture.node_id(0));
 
     // `Bootstrap` is no longer available: the directory is bound.
     let refused = AsterServer::builder()
@@ -986,4 +986,186 @@ async fn a_membership_plan_naming_root_is_refused() {
     );
 
     voter.server.shutdown().await;
+}
+
+/// **A genesis naming ROOT as an initial administrator does not verify.**
+///
+/// The other half of §8.1's exclusion, and previously unevidenced: the existing
+/// gate placed ROOT among the *voters*, so it exercised `RootIsNotAMember` and
+/// removing the delegate check would have kept passing.
+///
+/// The document is otherwise well formed — ordinary voters, correct signature,
+/// this fixture's own ROOT and domain — so the only thing wrong with it is the
+/// administrator entry. A delegated ROOT would be a mutable row: `set_admin`
+/// could remove it and the final-delegate rule would start counting it, so a
+/// group could "remove ROOT" and reach a state where the key that founded it
+/// authorizes nothing.
+#[test]
+fn root_cannot_be_founded_as_a_delegate() {
+    use aster::coordination::model::authority::{
+        canonical_document_bytes, genesis_signing_bytes, signed_document_from_parts, verify_genesis,
+    };
+    use aster::coordination::raft::{GenesisV1, NodeIdV1 as WireNodeId, VoterSeedV1};
+
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x0D, 1);
+    let voter = fixture.node_id(0);
+    let ticket = aster_transport_core::ticket::AsterTicket {
+        endpoint_id: voter.clone().try_into().expect("32 bytes"),
+        relay: None,
+        direct_addrs: Vec::new(),
+        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
+    }
+    .to_base58_string()
+    .expect("a canonical ticket");
+
+    // Ordinary voters; ROOT appears **only** as an administrator.
+    let genesis = GenesisV1 {
+        format_version: 1,
+        group_id: vec![SEED ^ 0x0D; 32],
+        authority_domain: DOMAIN.into(),
+        genesis_nonce: vec![0x02u8; 32],
+        deployment_profile_code: 2,
+        initial_voters: vec![VoterSeedV1 {
+            node_id: voter,
+            ticket,
+        }],
+        initial_admins: vec![WireNodeId {
+            node_id: fixture.authority_key().to_vec(),
+        }],
+        recovery_export_hash: None,
+    };
+    let document = canonical_document_bytes(&genesis).expect("encode");
+    let signature = fixture.sign_for_testing(&genesis_signing_bytes(&document));
+    let signed =
+        signed_document_from_parts(document, &fixture.authority_key(), &signature).expect("encode");
+
+    let err = verify_genesis(&fixture.authority_key(), DOMAIN, &signed)
+        .expect_err("a genesis naming ROOT as an administrator must not verify");
+    assert!(
+        format!("{err:?}").contains("RootIsNotDelegable"),
+        "the refusal must name the delegate rule, not the member one: {err:?}"
+    );
+}
+
+/// **A joining node survives restart, in the same restricted state.**
+///
+/// Its first start binds the directory; every later start opens a bound one.
+/// `Join` required `Fresh`, so the second start was refused outright — and
+/// deleting the directory is not a workaround, because the group's quorum may
+/// already count the candidate a voter, so a wiped store would rejoin as a
+/// member with no log.
+///
+/// §S3-JOIN is explicit that a restart "retains the same restricted state until
+/// membership lands", and that is what this checks: same permit, same `Joining`
+/// corridor, same restricted allowlist. The candidate stays at `Joining` across
+/// both starts because no administrator ever commits an intent for it — a
+/// permit grants no membership, which is the other half of the same rule.
+///
+/// The permit is **re-verified** at each start rather than persisted. It
+/// already binds the candidate's NodeId and its ticket, so re-verifying costs
+/// no new durable fact; a store that remembered a permit would be a second
+/// place for the group's opinion of this node to live, and the two could
+/// disagree after a revocation.
+///
+/// The endpoint binds a fixed port so its rendered ticket is identical across
+/// starts. That is not a test artefact: a permit binds the ticket, so an
+/// operator mints one for a candidate whose address they already have — the
+/// same two-step this performs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_node_survives_restart_in_the_same_restricted_state() {
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x0E, 1);
+    let candidate = [0xB9u8; 32];
+    let dir = tempfile::tempdir().expect("a storage directory");
+
+    let node_config = || {
+        aster::AsterConfig::builder()
+            .relay(aster::RelayMode::Disabled)
+            .bind_addr("127.0.0.1:47731")
+            .secret_key(aster::SecretKey::from_bytes(candidate))
+            .root_pubkey(aster::PublicKey::from_bytes(fixture.authority_key()))
+            .build()
+    };
+
+    // The ticket the candidate will render at this address, constructed rather
+    // than probed: a permit binds the ticket byte for byte, so if the node
+    // rendered anything else the start below fails with `TicketMismatch` and
+    // says so — which is a better failure than a probe that has to hand the
+    // port back before the real start can take it.
+    let ticket = aster::Ticket::from_node_addr(
+        &aster::NodeAddr {
+            node_id: aster::NodeId::from_hex(hex::encode(fixture_node_id(candidate))),
+            relay_url: None,
+            direct_addresses: vec!["127.0.0.1:47731".to_string()],
+        },
+        aster::Credential::Open,
+    )
+    .and_then(|t| t.to_base58())
+    .expect("a canonical ticket");
+
+    // The state a first `Join` start leaves: the directory bound to this
+    // group, and no membership, because a permit grants none.
+    //
+    // Constructed rather than produced by starting and stopping a server, and
+    // for the same reason the interrupted-bootstrap gate does it: one bind. A
+    // permit binds the candidate's rendered ticket, so both starts must share
+    // an address — and an endpoint's socket is not free the instant
+    // `shutdown()` returns, so a two-start version spends its time waiting on a
+    // port rather than on the property.
+    fixture.bind_without_initializing_for_testing(dir.path(), &fixture_node_id(candidate));
+
+    // This start therefore opens a **bound** directory, which is exactly what
+    // `Join` refused: it required `Fresh`, so a joining node could never
+    // restart. Wiping the directory is not the answer — the group's quorum may
+    // already count this candidate a voter, and a wiped store would rejoin as
+    // a member with no log.
+    let restarted = start_on_the_fixed_port(|| {
+        AsterServer::builder()
+            .config(node_config())
+            .builtin_coordination(fixture.join_config(dir.path(), candidate, &ticket, &[0]))
+    })
+    .await
+    .expect("a joining candidate restarts into a directory it already bound");
+
+    // Still restricted: `Joining`, not `Bootstrapping` and not `Ready`. A
+    // permit grants no membership, so nothing about the restart advances it.
+    assert_eq!(
+        restarted.coordination().expect("hosted").lifecycle_code(),
+        2,
+        "the restart retains the same restricted state until membership lands"
+    );
+
+    restarted.shutdown().await;
+}
+
+/// The node id a secret produces, without starting anything.
+fn fixture_node_id(secret: [u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&secret)
+        .verifying_key()
+        .to_bytes()
+}
+
+/// Start a server on the test's fixed port, waiting for the previous one's
+/// socket to be released.
+///
+/// **Bounded**, so a port that never frees fails the test rather than hanging
+/// it. The fixed port is not a convenience: a join permit binds the candidate's
+/// rendered ticket, so a candidate that restarts at a different address needs a
+/// new permit — the address is part of what was signed for.
+async fn start_on_the_fixed_port<F>(mut build: F) -> aster::Result<AsterServer>
+where
+    F: FnMut() -> aster::rpc::AsterServerBuilder,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match build().start().await {
+            Ok(server) => return Ok(server),
+            Err(err)
+                if err.to_string().contains("Address already in use")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
