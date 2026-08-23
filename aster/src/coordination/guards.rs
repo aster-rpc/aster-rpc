@@ -71,6 +71,10 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("network/service.rs", include_str!("network/service.rs")),
     ("runtime/config.rs", include_str!("runtime/config.rs")),
     ("runtime/lifecycle.rs", include_str!("runtime/lifecycle.rs")),
+    (
+        "runtime/membership.rs",
+        include_str!("runtime/membership.rs"),
+    ),
     ("runtime/mod.rs", include_str!("runtime/mod.rs")),
     ("runtime/owner.rs", include_str!("runtime/owner.rs")),
     ("runtime/readiness.rs", include_str!("runtime/readiness.rs")),

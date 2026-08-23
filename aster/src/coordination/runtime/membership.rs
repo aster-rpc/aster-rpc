@@ -57,19 +57,13 @@ pub(crate) enum ChangeOutcome {
     },
     /// Go back to learner reconciliation and retry against the same durable
     /// intent.
-    Reconcile {
-        detail: String,
-    },
+    Reconcile { detail: String },
     /// End this leader generation without touching the intent. The next
     /// generation reacquires and re-observes.
-    EndGeneration {
-        detail: String,
-    },
+    EndGeneration { detail: String },
     /// An invariant this build guarantees does not hold. Not a coordination
     /// result, and never an intent outcome.
-    Invariant {
-        detail: String,
-    },
+    Invariant { detail: String },
 }
 
 /// The three exhaustive levels of §7.3, as one function.
@@ -109,7 +103,7 @@ pub(crate) fn classify_change(
                 detail: format!("no longer leader; {to}"),
             },
             // Level 3: `ChangeMembershipError`.
-            ClientWriteError::ChangeMembership(change) => match change {
+            ClientWriteError::ChangeMembershipError(change) => match change {
                 // The effective membership log id is ahead of the committed
                 // one: the ordinary state during a joint transition, and
                 // indistinguishable from healthy progress. Never `Failed`.
@@ -270,26 +264,6 @@ pub(crate) fn completion_is_visible(
     learners == retained_learners.iter().copied().collect()
 }
 
-/// The one active intent this controller is working on, if any.
-///
-/// Read from durable state on every pass. `None` means nothing to do — not
-/// "we finished", which is a different fact the intent's own phase records.
-pub(crate) fn active_intent(
-    state: &crate::coordination::storage::rows::DurableState,
-) -> Option<(
-    crate::coordination::model::state::OperationId,
-    crate::coordination::model::state::Intent,
-)> {
-    state
-        .model
-        .intents
-        .iter()
-        .find(|(_, intent)| {
-            !crate::coordination::model::membership::is_terminal_phase(intent.status_code)
-        })
-        .map(|(id, intent)| (*id, intent.clone()))
-}
-
 /// The leader generation a controller task belongs to.
 ///
 /// A plain counter, incremented by the runtime each time this node acquires
@@ -316,12 +290,401 @@ pub(crate) fn still_leading(
     matches!(metrics.state, openraft::ServerState::Leader) && &metrics.id == local
 }
 
+/// Commit one `MembershipProgress` record.
+///
+/// The **only** way a phase advances. `decide_progress` checks both ends of the
+/// transition and, for `Completed`, that the native membership it claims has
+/// already been applied — so a controller cannot talk an intent forward. This
+/// function's job is to say what was observed; apply decides whether it counts.
+///
+/// A stale report commits harmlessly, like a stale `Expire`: every voter
+/// evaluates the same `decide_progress` and reaches `None`.
+pub(crate) async fn report_progress(
+    raft: &Raft<CoordinationTypeConfig>,
+    operation_id: &crate::coordination::model::state::OperationId,
+    expected_phase: i32,
+    new_phase: i32,
+    observed: Option<crate::coordination::contract::LogIdV1>,
+    result_code: i32,
+) -> Result<(), ChangeOutcome> {
+    use crate::coordination::contract::{CommandV1, MembershipProgressCommandV1};
+
+    let command = CommandV1::MembershipProgress(MembershipProgressCommandV1 {
+        operation_id: operation_id.to_vec(),
+        expected_phase,
+        new_phase,
+        observed_membership_log_id: observed,
+        result_code,
+    });
+    raft.client_write(command)
+        .await
+        .map(|_| ())
+        .map_err(|err| classify_change(&err))
+}
+
+/// One pass of the §7.3 phase table.
+///
+/// Every arm re-reads committed membership rather than trusting anything
+/// carried from a previous pass — a pass that resumed from a remembered
+/// position would be a third source of truth, and §7.3 has exactly two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// Nothing to drive: no active intent, or a terminal phase.
+    Idle,
+    /// Add these learners, then re-observe.
+    AddLearners(BTreeSet<CoordinationNodeId>),
+    /// Every node is present; wait for each desired voter to reach `barrier`.
+    AwaitCatchUp {
+        barrier: u64,
+        outstanding: BTreeSet<CoordinationNodeId>,
+    },
+    /// Advance the phase and call `change_membership` (§7.3 step 4).
+    ChangeVoters,
+    /// The uniform voter entry landed: replace the node map (step 5).
+    ReplaceNodes,
+    /// The observed membership is exactly the plan's: report completion.
+    ReportComplete,
+    /// A cancel was requested: remove only the learners this intent
+    /// introduced, then report `Cancelled`.
+    CancelCleanup(BTreeSet<CoordinationNodeId>),
+}
+
+/// Decide the next step from durable intent and committed membership.
+///
+/// A pure function of the two sources, so the phase table is testable without a
+/// cluster — and, more importantly, so there is exactly one place the table
+/// lives. The controller loop is only sequencing and cancellation.
+pub(crate) fn next_step(
+    intent: &crate::coordination::model::state::Intent,
+    metrics: &super::lifecycle::Metrics,
+    catch_up_barrier: Option<u64>,
+) -> Step {
+    use crate::coordination::model::membership as phases;
+
+    let desired: Vec<CoordinationNodeId> = intent
+        .plan
+        .desired_voters
+        .iter()
+        .map(|n| CoordinationNodeId::from_array(*n))
+        .collect();
+    let retained: Vec<CoordinationNodeId> = intent
+        .plan
+        .retained_learners
+        .iter()
+        .map(|n| CoordinationNodeId::from_array(*n))
+        .collect();
+
+    let membership = metrics.membership_config.membership();
+    let current: BTreeSet<CoordinationNodeId> = membership.nodes().map(|(id, _)| *id).collect();
+
+    match intent.status_code {
+        // §7.3 step 1: commit the transition to `AddingLearners` **before** any
+        // external learner work, so a crash between the two resumes rather than
+        // repeating a step whose effects are already visible. Route import is
+        // the caller's — it touches the address book, not Raft.
+        phases::PHASE_PENDING => Step::ChangeVoters,
+
+        phases::PHASE_ADDING_LEARNERS => {
+            let missing = missing_learners(&desired, &retained, &current);
+            if !missing.is_empty() {
+                return Step::AddLearners(missing);
+            }
+            // Every node is present. Wait for the **desired voters** to catch
+            // up: a retained learner does not vote, so its lag cannot block a
+            // membership the group can commit, and waiting for it would let one
+            // slow non-voter stall a change indefinitely.
+            let Some(barrier) = catch_up_barrier else {
+                // §7.3 step 3 measures against the committed index observed
+                // *when the promotion step began*. No barrier yet means this
+                // pass is that beginning — a barrier re-read every pass is a
+                // moving target no learner ever reaches.
+                return Step::AwaitCatchUp {
+                    barrier: metrics.last_log_index.unwrap_or(0),
+                    outstanding: desired.iter().copied().collect(),
+                };
+            };
+            let outstanding: BTreeSet<CoordinationNodeId> = desired
+                .iter()
+                .filter(|node| {
+                    // A node is trivially caught up with itself, and OpenRaft
+                    // reports no replication entry for the leader.
+                    **node != metrics.id && !caught_up(metrics, node, barrier)
+                })
+                .copied()
+                .collect();
+            if outstanding.is_empty() {
+                Step::ChangeVoters
+            } else {
+                Step::AwaitCatchUp {
+                    barrier,
+                    outstanding,
+                }
+            }
+        }
+
+        phases::PHASE_CHANGING_VOTERS => {
+            if completion_is_visible(metrics, &desired, &retained) {
+                return Step::ReportComplete;
+            }
+            let voters: BTreeSet<CoordinationNodeId> = membership.voter_ids().collect();
+            if voters == desired.iter().copied().collect()
+                && membership.get_joint_config().len() == 1
+            {
+                // The uniform voter entry landed; only the node map is owed.
+                Step::ReplaceNodes
+            } else {
+                Step::ChangeVoters
+            }
+        }
+
+        phases::PHASE_CANCEL_REQUESTED => {
+            // Only the learners **this intent introduced**, and only those the
+            // plan does not retain. Removing every learner would strip nodes
+            // another intent added; removing a retained one would undo the
+            // plan's own intent in reverse.
+            let introduced: BTreeSet<CoordinationNodeId> = intent
+                .plan
+                .member_seeds
+                .iter()
+                .map(|seed| CoordinationNodeId::from_array(seed.node_id))
+                .filter(|node| current.contains(node) && !desired.contains(node))
+                .collect();
+            Step::CancelCleanup(introduced)
+        }
+
+        // Terminal, or a phase this build does not implement. Either way there
+        // is nothing to drive, and inventing a step for one would be acting on
+        // a state the model does not define.
+        _ => Step::Idle,
+    }
+}
+
+/// The controller task: one leader generation, driving [`next_step`] until the
+/// generation ends.
+///
+/// ## What ends a generation
+///
+/// Losing leadership, being superseded by a newer generation, or a
+/// [`ChangeOutcome::EndGeneration`]. In every case the intent is **untouched**:
+/// a generation that has lost leadership must not perform one more side effect,
+/// including marking an intent it can no longer see the outcome of.
+///
+/// An invariant failure latches the runtime fatal rather than failing the
+/// intent, because §7.3 reserves `Failed` for "a deterministic
+/// invalid/invariant/storage outcome that cannot succeed unchanged" as an
+/// *intent* outcome — and a broken invariant in this build is not a fact about
+/// the operator's plan.
+pub(crate) async fn run_generation(
+    raft: Raft<CoordinationTypeConfig>,
+    state: crate::coordination::storage::machine::StateHandle,
+    local: CoordinationNodeId,
+    generation: Generation,
+    current_generation: Arc<std::sync::atomic::AtomicU64>,
+    facts: Arc<super::owner::RuntimeFacts>,
+) {
+    use crate::coordination::model::membership as phases;
+
+    // The catch-up barrier is per generation and per intent, and it is the one
+    // value the loop legitimately carries: §7.3 measures against the index
+    // observed *when the promotion step began*, and re-reading it each pass
+    // makes it a moving target no learner reaches. A new generation observes a
+    // fresh one, which is correct — it has re-observed everything else too.
+    let mut barrier: Option<(crate::coordination::model::state::OperationId, u64)> = None;
+
+    loop {
+        let metrics = raft.metrics().borrow().clone();
+        if !still_leading(
+            &metrics,
+            &local,
+            generation,
+            Arc::clone(&current_generation),
+        ) {
+            return;
+        }
+
+        let Ok(active) = state.active_intent().await else {
+            // The store cannot say what it holds. The lifecycle surface already
+            // reports that; this generation simply stops driving.
+            return;
+        };
+        let Some((operation_id, intent)) = active else {
+            // Nothing to do. Sleep a beat rather than spinning: the next intent
+            // arrives through apply, which the metrics watch does not observe.
+            tokio::time::sleep(IDLE_POLL).await;
+            continue;
+        };
+        if barrier.as_ref().map(|(id, _)| *id) != Some(operation_id) {
+            barrier = None;
+        }
+
+        let step = next_step(&intent, &metrics, barrier.map(|(_, at)| at));
+        let outcome = match step {
+            Step::Idle => {
+                tokio::time::sleep(IDLE_POLL).await;
+                continue;
+            }
+            Step::AddLearners(missing) => {
+                let mut result = Ok(());
+                for node in missing {
+                    // Re-checked before **every** side effect, not once per
+                    // pass: a generation that lost leadership mid-sequence
+                    // stops there rather than completing a step the new leader
+                    // will redo.
+                    if !still_leading(
+                        &raft.metrics().borrow().clone(),
+                        &local,
+                        generation,
+                        Arc::clone(&current_generation),
+                    ) {
+                        return;
+                    }
+                    result = add_learner(&raft, node).await;
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result
+            }
+            Step::AwaitCatchUp {
+                barrier: observed,
+                outstanding: _,
+            } => {
+                barrier = Some((operation_id, observed));
+                tokio::time::sleep(IDLE_POLL).await;
+                Ok(())
+            }
+            Step::ChangeVoters => {
+                if intent.status_code == phases::PHASE_PENDING {
+                    // The transition commits **before** external learner work,
+                    // so a crash between the two resumes rather than repeating
+                    // a step whose effects are already visible.
+                    report_progress(
+                        &raft,
+                        &operation_id,
+                        phases::PHASE_PENDING,
+                        phases::PHASE_ADDING_LEARNERS,
+                        None,
+                        0,
+                    )
+                    .await
+                } else if intent.status_code == phases::PHASE_ADDING_LEARNERS {
+                    report_progress(
+                        &raft,
+                        &operation_id,
+                        phases::PHASE_ADDING_LEARNERS,
+                        phases::PHASE_CHANGING_VOTERS,
+                        None,
+                        0,
+                    )
+                    .await
+                } else {
+                    let desired: Vec<CoordinationNodeId> = intent
+                        .plan
+                        .desired_voters
+                        .iter()
+                        .map(|n| CoordinationNodeId::from_array(*n))
+                        .collect();
+                    change_voters(&raft, &desired).await
+                }
+            }
+            Step::ReplaceNodes => {
+                let desired: Vec<CoordinationNodeId> = intent
+                    .plan
+                    .desired_voters
+                    .iter()
+                    .map(|n| CoordinationNodeId::from_array(*n))
+                    .collect();
+                let retained: Vec<CoordinationNodeId> = intent
+                    .plan
+                    .retained_learners
+                    .iter()
+                    .map(|n| CoordinationNodeId::from_array(*n))
+                    .collect();
+                replace_node_map(&raft, &desired, &retained).await
+            }
+            Step::ReportComplete => {
+                let observed = metrics
+                    .membership_config
+                    .log_id()
+                    .map(crate::coordination::contract::LogIdV1::from);
+                report_progress(
+                    &raft,
+                    &operation_id,
+                    phases::PHASE_CHANGING_VOTERS,
+                    phases::PHASE_COMPLETED,
+                    observed,
+                    crate::coordination::contract::SYS_MEMBERSHIP_ADVANCED,
+                )
+                .await
+            }
+            Step::CancelCleanup(introduced) => {
+                let mut result = Ok(());
+                for node in introduced {
+                    if !still_leading(
+                        &raft.metrics().borrow().clone(),
+                        &local,
+                        generation,
+                        Arc::clone(&current_generation),
+                    ) {
+                        return;
+                    }
+                    result = raft
+                        .change_membership(
+                            ChangeMembers::RemoveNodes([node].into()),
+                            MEMBERSHIP_RETAIN,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| classify_change(&err));
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                if result.is_ok() {
+                    result = report_progress(
+                        &raft,
+                        &operation_id,
+                        phases::PHASE_CANCEL_REQUESTED,
+                        phases::PHASE_CANCELLED,
+                        None,
+                        0,
+                    )
+                    .await;
+                }
+                result
+            }
+        };
+
+        match outcome {
+            Ok(()) => {}
+            // Wait, re-observe, retry the same phase. The intent is untouched.
+            Err(ChangeOutcome::Retry { .. }) => tokio::time::sleep(IDLE_POLL).await,
+            // Back to learner reconciliation against the same durable intent.
+            // The barrier is dropped: it described a set that has changed.
+            Err(ChangeOutcome::Reconcile { .. }) => {
+                barrier = None;
+                tokio::time::sleep(IDLE_POLL).await;
+            }
+            Err(ChangeOutcome::EndGeneration { .. }) => return,
+            Err(ChangeOutcome::Invariant { detail }) => {
+                facts.latch_fatal(super::lifecycle::FatalCause::Raft(detail));
+                return;
+            }
+        }
+    }
+}
+
+/// How long the controller waits when there is nothing to drive.
+///
+/// Short enough that a new intent is picked up promptly, long enough that an
+/// idle group is not spinning. Not a timeout: §7.3 forbids a wall-clock
+/// transition to `Failed`, and nothing here counts elapsed time.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openraft::error::{
-        EmptyMembership, ForwardToLeader, InProgress, LearnerNotFound,
-    };
+    use openraft::error::{EmptyMembership, ForwardToLeader, InProgress, LearnerNotFound};
 
     fn node(n: u8) -> CoordinationNodeId {
         CoordinationNodeId::from_array([n; 32])
@@ -360,7 +723,7 @@ mod tests {
 
         // Level 3.
         let in_progress: RaftError<CoordinationNodeId, ClientWriteError<_, _>> =
-            RaftError::APIError(ClientWriteError::ChangeMembership(
+            RaftError::APIError(ClientWriteError::ChangeMembershipError(
                 ChangeMembershipError::InProgress(InProgress {
                     committed: None,
                     membership_log_id: None,
@@ -371,21 +734,19 @@ mod tests {
             ChangeOutcome::Retry { .. }
         ));
 
-        let empty: RaftError<CoordinationNodeId, ClientWriteError<_, _>> = RaftError::APIError(
-            ClientWriteError::ChangeMembership(ChangeMembershipError::EmptyMembership(
-                EmptyMembership {},
-            )),
-        );
+        let empty: RaftError<CoordinationNodeId, ClientWriteError<_, _>> =
+            RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::EmptyMembership(EmptyMembership {}),
+            ));
         assert!(matches!(
             classify_change(&empty),
             ChangeOutcome::Invariant { .. }
         ));
 
-        let missing: RaftError<CoordinationNodeId, ClientWriteError<_, _>> = RaftError::APIError(
-            ClientWriteError::ChangeMembership(ChangeMembershipError::LearnerNotFound(
-                LearnerNotFound { node_id: node(3) },
-            )),
-        );
+        let missing: RaftError<CoordinationNodeId, ClientWriteError<_, _>> =
+            RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::LearnerNotFound(LearnerNotFound { node_id: node(3) }),
+            ));
         assert!(matches!(
             classify_change(&missing),
             ChangeOutcome::Reconcile { .. }
@@ -404,13 +765,12 @@ mod tests {
     #[test]
     fn a_missing_learner_always_reconciles_and_never_fails_the_intent() {
         for target in [1u8, 2, 3, 200] {
-            let err: RaftError<CoordinationNodeId, ClientWriteError<_, _>> = RaftError::APIError(
-                ClientWriteError::ChangeMembership(ChangeMembershipError::LearnerNotFound(
-                    LearnerNotFound {
+            let err: RaftError<CoordinationNodeId, ClientWriteError<_, _>> =
+                RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                    ChangeMembershipError::LearnerNotFound(LearnerNotFound {
                         node_id: node(target),
-                    },
-                )),
-            );
+                    }),
+                ));
             assert!(
                 matches!(classify_change(&err), ChangeOutcome::Reconcile { .. }),
                 "node {target}"
@@ -428,17 +788,16 @@ mod tests {
     #[test]
     fn waiting_out_a_joint_change_is_not_the_same_as_rebuilding_learners() {
         let in_progress: RaftError<CoordinationNodeId, ClientWriteError<_, _>> =
-            RaftError::APIError(ClientWriteError::ChangeMembership(
+            RaftError::APIError(ClientWriteError::ChangeMembershipError(
                 ChangeMembershipError::InProgress(InProgress {
                     committed: None,
                     membership_log_id: None,
                 }),
             ));
-        let missing: RaftError<CoordinationNodeId, ClientWriteError<_, _>> = RaftError::APIError(
-            ClientWriteError::ChangeMembership(ChangeMembershipError::LearnerNotFound(
-                LearnerNotFound { node_id: node(3) },
-            )),
-        );
+        let missing: RaftError<CoordinationNodeId, ClientWriteError<_, _>> =
+            RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::LearnerNotFound(LearnerNotFound { node_id: node(3) }),
+            ));
         assert_ne!(classify_change(&in_progress), classify_change(&missing));
     }
 
@@ -516,14 +875,18 @@ mod tests {
             .lines()
             .filter(|line| line.contains("change_membership("))
             .collect();
-        assert!(!calls.is_empty(), "the controller must call change_membership");
+        assert!(
+            !calls.is_empty(),
+            "the controller must call change_membership"
+        );
 
         let literals: Vec<usize> = production
             .lines()
             .enumerate()
             .filter(|(_, line)| {
                 let code = line.split("//").next().unwrap_or("");
-                code.contains("change_membership(") && (code.contains(", false") || code.contains(", true"))
+                code.contains("change_membership(")
+                    && (code.contains(", false") || code.contains(", true"))
             })
             .map(|(n, _)| n + 1)
             .collect();
@@ -531,17 +894,31 @@ mod tests {
             literals.is_empty(),
             "the retain flag must be MEMBERSHIP_RETAIN, not a literal; found at {literals:?}"
         );
+        // Counted over **code** lines: the doc comments name the constant
+        // constantly, which is the point of them, and counting prose would
+        // make this assertion about how much was written rather than about
+        // what is called.
+        let uses = production
+            .lines()
+            .filter(|line| {
+                let code = line.split("//").next().unwrap_or("");
+                code.contains("MEMBERSHIP_RETAIN")
+            })
+            .count();
         assert_eq!(
-            production.matches("MEMBERSHIP_RETAIN").count(),
+            uses,
             // The import, plus one per call site.
             1 + calls.len(),
             "every change_membership call must pass the constant"
         );
 
-        // And the constant is what §9 says it is. Asserted here so a change to
-        // it is visible from the controller that depends on it.
+        // And the constant is what §9 says it is, so a change to it is visible
+        // from the controller that depends on it. Read through a runtime value
+        // because a direct assertion on a `const bool` is a constant
+        // expression the lints reject — the fact under test is the same.
+        let retain: bool = std::hint::black_box(MEMBERSHIP_RETAIN);
         assert!(
-            !MEMBERSHIP_RETAIN,
+            !retain,
             "retain = true adds learners the plan never named, which §9's envelope cannot see"
         );
     }
@@ -568,10 +945,7 @@ mod tests {
                 5,
                 Some(5),
                 Some(10),
-                Arc::new(StoredMembership::new(
-                    None,
-                    Membership::new(configs, nodes),
-                )),
+                Arc::new(StoredMembership::new(None, Membership::new(configs, nodes))),
             )
         };
 
@@ -619,6 +993,284 @@ mod tests {
                 &retained
             ),
             "an extra learner is not completion either"
+        );
+    }
+
+    // ── the §7.3 phase table ────────────────────────────────────────────────
+
+    use crate::coordination::model::membership as phases;
+    use crate::coordination::model::state::{Intent, MemberSeed, MembershipPlan};
+    use openraft::{Membership, StoredMembership};
+
+    fn intent(phase: i32, desired: &[u8], retained: &[u8], seeds: &[u8]) -> Intent {
+        Intent {
+            actor: [1u8; 32],
+            request_hash: [0u8; 32],
+            expected_membership: None,
+            plan: MembershipPlan {
+                desired_voters: desired.iter().map(|n| [*n; 32]).collect(),
+                retained_learners: retained.iter().map(|n| [*n; 32]).collect(),
+                member_seeds: seeds
+                    .iter()
+                    .map(|n| MemberSeed {
+                        node_id: [*n; 32],
+                        ticket: Vec::new(),
+                        join_permit: None,
+                    })
+                    .collect(),
+            },
+            status_code: phase,
+            result_code: 0,
+            accepted_log_id: crate::coordination::model::state::LogId {
+                term: 1,
+                leader_node_id: [1u8; 32],
+                index: 1,
+            },
+            completed_log_id: None,
+            observed_membership_log_id: None,
+        }
+    }
+
+    /// A metrics snapshot with `voters`, `learners`, and per-peer replication
+    /// progress.
+    fn view(
+        voters: &[&[u8]],
+        learners: &[u8],
+        replication: &[(u8, u64)],
+    ) -> super::super::lifecycle::Metrics {
+        let configs: Vec<BTreeSet<CoordinationNodeId>> = voters
+            .iter()
+            .map(|c| c.iter().copied().map(node).collect())
+            .collect();
+        let mut nodes: BTreeMap<CoordinationNodeId, CoordinationNode> = configs
+            .iter()
+            .flatten()
+            .map(|id| (*id, CoordinationNode))
+            .collect();
+        for l in learners {
+            nodes.insert(node(*l), CoordinationNode);
+        }
+        let mut metrics = super::super::lifecycle::testing::metrics(
+            1,
+            openraft::ServerState::Leader,
+            5,
+            Some(5),
+            Some(10),
+            Arc::new(StoredMembership::new(None, Membership::new(configs, nodes))),
+        );
+        metrics.last_log_index = Some(100);
+        metrics.replication = Some(
+            replication
+                .iter()
+                .map(|(n, index)| {
+                    (
+                        node(*n),
+                        Some(openraft::LogId::new(
+                            openraft::CommittedLeaderId::new(5, node(1)),
+                            *index,
+                        )),
+                    )
+                })
+                .collect(),
+        );
+        metrics
+    }
+
+    /// **The whole phase table**, one row at a time, from the two sources it is
+    /// allowed to read.
+    ///
+    /// Each row is decided from durable intent plus committed membership and
+    /// nothing else — no carried position, no retry count. That is why the same
+    /// function answers correctly after a restart: there is nothing to restore.
+    #[test]
+    fn each_phase_selects_its_step_from_intent_and_membership() {
+        // Pending: commit the transition before any external learner work.
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_PENDING, &[1, 2, 3], &[], &[]),
+                &view(&[&[1]], &[], &[]),
+                None
+            ),
+            Step::ChangeVoters
+        );
+
+        // AddingLearners with nodes missing: add exactly the missing ones.
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
+                &view(&[&[1]], &[], &[]),
+                None
+            ),
+            Step::AddLearners(members(&[2, 3, 9]))
+        );
+
+        // All present, no barrier yet: this pass observes one.
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
+                &view(&[&[1]], &[2, 3, 9], &[]),
+                None
+            ),
+            Step::AwaitCatchUp {
+                barrier: 100,
+                outstanding: members(&[1, 2, 3]),
+            }
+        );
+
+        // A barrier, and one voter still behind.
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
+                &view(&[&[1]], &[2, 3, 9], &[(2, 100), (3, 40)]),
+                Some(100)
+            ),
+            Step::AwaitCatchUp {
+                barrier: 100,
+                outstanding: members(&[3]),
+            }
+        );
+
+        // Everyone caught up: promote.
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
+                &view(&[&[1]], &[2, 3, 9], &[(2, 100), (3, 100)]),
+                Some(100)
+            ),
+            Step::ChangeVoters
+        );
+
+        // ChangingVoters, mid-joint: keep calling step 4.
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]),
+                &view(&[&[1], &[1, 2, 3]], &[9], &[]),
+                None
+            ),
+            Step::ChangeVoters
+        );
+
+        // The uniform voter entry landed, the node map is still wrong: step 5.
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]),
+                &view(&[&[1, 2, 3]], &[], &[]),
+                None
+            ),
+            Step::ReplaceNodes
+        );
+
+        // Exactly the plan: report.
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]),
+                &view(&[&[1, 2, 3]], &[9], &[]),
+                None
+            ),
+            Step::ReportComplete
+        );
+
+        // Terminal phases drive nothing.
+        for terminal in [
+            phases::PHASE_COMPLETED,
+            phases::PHASE_FAILED,
+            phases::PHASE_CANCELLED,
+        ] {
+            assert_eq!(
+                next_step(
+                    &intent(terminal, &[1, 2, 3], &[], &[]),
+                    &view(&[&[1, 2, 3]], &[], &[]),
+                    None
+                ),
+                Step::Idle,
+                "phase {terminal}"
+            );
+        }
+    }
+
+    /// **The catch-up barrier is observed once**, not re-read every pass.
+    ///
+    /// §7.3 measures against the committed index observed *when the promotion
+    /// step began*. A barrier taken fresh each pass advances with the log, so a
+    /// learner catching up at any finite rate never reaches it — the change
+    /// would stall forever while looking like progress.
+    #[test]
+    fn the_catch_up_barrier_does_not_move_under_the_learner() {
+        let intent = intent(phases::PHASE_ADDING_LEARNERS, &[1, 2], &[], &[]);
+
+        // The log has advanced well past the barrier, and the learner has
+        // reached the barrier but not the head.
+        let mut advanced = view(&[&[1]], &[2], &[(2, 100)]);
+        advanced.last_log_index = Some(5_000);
+
+        assert_eq!(
+            next_step(&intent, &advanced, Some(100)),
+            Step::ChangeVoters,
+            "a learner that reached the observed barrier is caught up, whatever the head is"
+        );
+
+        // Against a barrier taken from the current head it would still be
+        // behind — which is the stall this rule prevents.
+        assert_eq!(
+            next_step(&intent, &advanced, Some(5_000)),
+            Step::AwaitCatchUp {
+                barrier: 5_000,
+                outstanding: members(&[2]),
+            }
+        );
+    }
+
+    /// A **retained learner's** lag never blocks the voter change.
+    ///
+    /// It does not vote, so a membership the group can commit does not depend
+    /// on it — and waiting would let one slow non-voter stall a change
+    /// indefinitely.
+    #[test]
+    fn a_lagging_retained_learner_does_not_block_the_change() {
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2], &[9], &[]),
+                // Node 9 is present but far behind; the voters are current.
+                &view(&[&[1]], &[2, 9], &[(2, 100), (9, 1)]),
+                Some(100)
+            ),
+            Step::ChangeVoters
+        );
+    }
+
+    /// **Cancellation removes only what this intent introduced**, and never a
+    /// node the plan retains.
+    ///
+    /// Removing every learner would strip nodes another intent added; removing
+    /// a retained one would undo the plan's own intent in reverse.
+    #[test]
+    fn a_cancel_removes_only_this_intents_introductions() {
+        // Seeds name 4 and 5; 5 is a desired voter, so only 4 is an
+        // introduction to clean up. Node 7 is a learner this intent never
+        // touched.
+        let step = next_step(
+            &intent(phases::PHASE_CANCEL_REQUESTED, &[1, 2, 5], &[], &[4, 5]),
+            &view(&[&[1, 2]], &[4, 5, 7], &[]),
+            None,
+        );
+        assert_eq!(
+            step,
+            Step::CancelCleanup(members(&[4])),
+            "only the introduced, non-desired node is removed"
+        );
+    }
+
+    /// A cancel cleans up nothing when its introductions are already gone,
+    /// rather than removing something else.
+    #[test]
+    fn a_cancel_with_nothing_left_to_undo_removes_nothing() {
+        assert_eq!(
+            next_step(
+                &intent(phases::PHASE_CANCEL_REQUESTED, &[1, 2], &[], &[4]),
+                &view(&[&[1, 2]], &[7], &[]),
+                None
+            ),
+            Step::CancelCleanup(members(&[]))
         );
     }
 

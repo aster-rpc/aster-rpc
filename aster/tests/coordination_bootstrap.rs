@@ -428,7 +428,7 @@ async fn a_bootstrapped_group_reopens_through_existing() {
                     signed_genesis: genesis,
                     recovery_export_path: None,
                 })
-                .verified_admission(admission_source(&[node_id.clone()]))
+                .verified_admission(admission_source(std::slice::from_ref(&node_id)))
                 .acknowledge_single_voter_development_group(true)
                 .build()
                 .expect("config"),

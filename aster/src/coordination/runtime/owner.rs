@@ -158,6 +158,7 @@ fn corridor_of(code: u64) -> Corridor {
 /// Returns when the Raft metrics channel closes, which happens on
 /// `Raft::shutdown()`. Dropping the publisher then releases every outstanding
 /// `wait_ready()` with `ShutDown` rather than stranding it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_lifecycle(
     raft: Raft<CoordinationTypeConfig>,
     facts: Arc<RuntimeFacts>,
@@ -165,8 +166,15 @@ pub(crate) async fn run_lifecycle(
     allowlist: Arc<SenderAllowlist>,
     local: CoordinationNodeId,
     timeout: Duration,
+    state: crate::coordination::storage::machine::StateHandle,
+    generation: Arc<AtomicU64>,
 ) {
     let mut metrics = raft.metrics();
+    // The controller task for the generation this node currently holds.
+    // Aborted and replaced on every leadership change, which is what makes
+    // "one leader-generation task" true rather than aspirational.
+    let mut controller: Option<tokio::task::JoinHandle<()>> = None;
+    let mut leading = false;
     loop {
         {
             let current = metrics.borrow_and_update().clone();
@@ -189,9 +197,41 @@ pub(crate) async fn run_lifecycle(
                 _ => {}
             }
 
+            // §7.3's controller is per leader generation. Acquiring leadership
+            // starts one; losing it aborts the current one **before** the next
+            // begins, so two generations never run side by side — the failure
+            // that makes "the controller compares state after every retry"
+            // false, because two of them would be comparing against each
+            // other's half-finished work.
+            let is_leader =
+                matches!(current.state, openraft::ServerState::Leader) && current.id == local;
+            if is_leader != leading {
+                if let Some(task) = controller.take() {
+                    task.abort();
+                }
+                // Superseding the generation stops the old task even if its
+                // abort has not landed yet: it rechecks this counter before
+                // every side effect.
+                let next = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                if is_leader {
+                    controller = Some(tokio::spawn(super::membership::run_generation(
+                        raft.clone(),
+                        state.clone(),
+                        local,
+                        super::membership::Generation(next),
+                        Arc::clone(&generation),
+                        Arc::clone(&facts),
+                    )));
+                }
+                leading = is_leader;
+            }
+
             publisher.publish(classify(&current, &facts.snapshot(timeout)));
         }
         if metrics.changed().await.is_err() {
+            if let Some(task) = controller.take() {
+                task.abort();
+            }
             return;
         }
     }
@@ -206,6 +246,10 @@ pub(crate) struct CoordinationRuntime {
     readiness: Readiness,
     endpoint: RaftEndpoint,
     local: CoordinationNodeId,
+    /// The leader generation counter. Bumping it is what makes a superseded
+    /// controller stop at its next side effect, whether or not its abort has
+    /// landed.
+    generation: Arc<AtomicU64>,
 
     /// 1. Controllers stop first. A controller that outlived the Raft would
     ///    submit a membership change into a shut-down instance and report a
@@ -237,6 +281,8 @@ impl CoordinationRuntime {
         local: CoordinationNodeId,
         config: &openraft::Config,
     ) -> Self {
+        let state = attached.state.clone();
+        let generation = Arc::new(AtomicU64::new(0));
         let timeout = leader_liveness_timeout(config);
 
         // The initial view is the state `start()` may legitimately return in.
@@ -262,6 +308,8 @@ impl CoordinationRuntime {
             allowlist,
             local,
             timeout,
+            state,
+            Arc::clone(&generation),
         ));
 
         Self {
@@ -270,6 +318,7 @@ impl CoordinationRuntime {
             readiness,
             endpoint,
             local,
+            generation,
             controllers: Vec::new(),
             lifecycle: Some(lifecycle),
             storage,
@@ -310,8 +359,11 @@ impl CoordinationRuntime {
     /// but a runtime dropped without `shutdown` skips the RPC deregistration,
     /// so a call can reach a `Raft` that is going away.
     pub(crate) async fn shutdown(mut self) {
-        // 1. Controllers.
+        // 1. Controllers. Bumping the generation first stops the membership
+        //    controller at its next leadership check even if it is mid-await,
+        //    which an abort alone cannot guarantee.
         self.facts.begin_draining();
+        self.generation.fetch_add(1, Ordering::SeqCst);
         for task in std::mem::take(&mut self.controllers) {
             task.abort();
             let _ = task.await;

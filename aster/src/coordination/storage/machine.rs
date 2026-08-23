@@ -83,6 +83,8 @@ type Applied = (
     StoredMembership<CoordinationNodeId, CoordinationNode>,
 );
 
+use crate::coordination::model::state::{Intent, OperationId};
+
 type Entry = openraft::Entry<CoordinationTypeConfig>;
 type Reply<T> = oneshot::Sender<StorageResult<T>>;
 
@@ -124,6 +126,13 @@ pub(crate) enum StateCommand {
     /// Force a fatal failure through the ordinary serve path.
     #[cfg(test)]
     InjectFatal(Reply<()>),
+    /// The one active (non-terminal) membership intent, if any.
+    ///
+    /// Targeted rather than a whole-state copy: the §7.3 controller re-reads
+    /// this before every side effect, and copying a hundred thousand resource
+    /// rows to find one intent would make the correct behaviour — re-observing
+    /// rather than remembering — the expensive one.
+    ActiveIntent(Reply<Option<(OperationId, Intent)>>),
     /// Install an already-prepared snapshot over this store's state.
     ///
     /// Takes the proved role only. `supplied` is OpenRaft's own copy of the
@@ -220,6 +229,7 @@ impl StateActor {
                 // `StorageError`, precisely so a refusal of the sender's bytes
                 // cannot be mistaken for this store's own failure and latch it
                 // fatal. `serve` exists to do that latching.
+                StateCommand::ActiveIntent(reply) => self.serve(reply, StateActor::active_intent),
                 StateCommand::Install {
                     prepared,
                     supplied,
@@ -287,6 +297,7 @@ impl StateActor {
                 StateCommand::AppliedState(reply) => fail(reply),
                 StateCommand::Apply { reply, .. } => fail(reply),
                 StateCommand::ReadTransaction(reply) => fail(reply),
+                StateCommand::ActiveIntent(reply) => fail(reply),
                 StateCommand::Install { reply, .. } => fail(reply),
                 #[cfg(test)]
                 StateCommand::Snapshot(reply) => fail(reply),
@@ -332,6 +343,23 @@ impl StateActor {
     /// reopen, revalidation, body promotion, `CURRENT`, retirement, and the
     /// in-memory update — because a store whose database and marker disagree is
     /// exactly what a reader must never be admitted to.
+    /// The one active membership intent, read from the published state.
+    ///
+    /// `None` means there is none — which is not "we finished": that is a fact
+    /// the intent's own terminal phase records, and it is exactly the
+    /// distinction a controller must not blur.
+    fn active_intent(&mut self) -> StorageResult<Option<(OperationId, Intent)>> {
+        let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
+        Ok(state
+            .model
+            .intents
+            .iter()
+            .find(|(_, intent)| {
+                !crate::coordination::model::membership::is_terminal_phase(intent.status_code)
+            })
+            .map(|(id, intent)| (*id, intent.clone())))
+    }
+
     /// Resolve a prepared snapshot against this store's state and act on the
     /// verdict — the installation half.
     ///
@@ -719,6 +747,11 @@ impl StateHandle {
                 Err(StorageError::ActorStopped { db: Db::State })
             }
         }
+    }
+
+    /// The one active membership intent, for the §7.3 controller.
+    pub(crate) async fn active_intent(&self) -> StorageResult<Option<(OperationId, Intent)>> {
+        self.call(StateCommand::ActiveIntent).await
     }
 
     /// A snapshot-consistent read transaction over `state.redb`.
