@@ -178,7 +178,7 @@ async fn main() {
             });
             let command = CommandV1::Client(ClientCommandV1 {
                 actor_node_id: fixture.node_id(index),
-                client_id: key.clone().into_bytes(),
+                client_id: aster::coordination::testing::id16(key.as_bytes()),
                 sequence: 1,
                 request_hash: aster::coordination::hash::request_hash(&action)
                     .expect("a canonical action hashes")

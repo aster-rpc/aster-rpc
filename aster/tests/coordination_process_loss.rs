@@ -19,7 +19,11 @@
 //!
 //! 1. The **leader** is the one killed, and killed without warning.
 //! 2. The survivors elect among themselves and **commit a real write**, so the
-//!    group is working rather than merely reporting health.
+//!    group is working rather than merely reporting health. The command is
+//!    refused on its merits — a fresh group has no administrators, see
+//!    `S3-GENESIS-ADMINS` — but a refusal is a decision the group *reached*,
+//!    replicated and applied, which is the property here. A minority reaches no
+//!    decision at all.
 //! 3. The killed voter **restarts onto its own storage** and rejoins — which is
 //!    also the only place the storage lock left behind by a killed process is
 //!    exercised end to end, rather than in isolation.
@@ -187,7 +191,7 @@ fn a_group_survives_losing_its_leader_to_a_kill_and_takes_it_back() {
     // The survivors must elect among *themselves*. Requiring a new leader that
     // is not the dead one is the assertion; a test that only waited for "some
     // leader" would pass on stale status files the killed voter left behind.
-    voters.until("the survivors elect a new leader", |statuses| {
+    let observed = voters.until("the survivors elect a new leader", |statuses| {
         (0..SIZE)
             .filter(|i| *i != leader)
             .filter_map(|i| statuses[i].as_ref())
@@ -195,12 +199,20 @@ fn a_group_survives_losing_its_leader_to_a_kill_and_takes_it_back() {
             .count()
             == SIZE - 1
     });
+    let elected = (0..SIZE)
+        .filter(|i| *i != leader)
+        .find_map(|i| observed[i].as_ref())
+        .expect("a survivor's status")
+        .leader as usize;
 
     // And the group still *works*. Two of three is a quorum, and this is the
     // difference between a group that survived and one that merely re-elected.
-    let survivor = (0..SIZE).find(|i| *i != leader).expect("a survivor");
+    //
+    // Proposed at the **new leader**: a follower answers `ForwardToLeader`,
+    // which is correct behaviour and not a commit, so asking one would test the
+    // forwarding rule rather than the group's ability to make progress.
     let after_index = voters
-        .propose(survivor, "after-the-kill")
+        .propose(elected, "after-the-kill")
         .expect("two of three commit");
     assert!(
         after_index > control_index,

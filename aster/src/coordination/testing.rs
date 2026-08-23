@@ -151,6 +151,42 @@ impl Coordination {
             .map(|log_id| log_id.index)
     }
 
+    /// The last log index included in this node's snapshot, if it has one.
+    ///
+    /// The evidence that distinguishes a catch-up by **snapshot** from a
+    /// catch-up by log replay. Both end with the same applied index, so a gate
+    /// that only checked the applied index would pass on a follower the leader
+    /// had simply re-sent every entry to — and would have proven nothing about
+    /// the install path.
+    pub fn snapshot_index_for_testing(&self) -> Option<u64> {
+        self.raft.metrics().borrow().snapshot.map(|id| id.index)
+    }
+
+    /// The last log index this node has purged, inclusive.
+    ///
+    /// A leader that has not purged past a follower's position can still replay
+    /// to it, so this is how a gate knows the group has actually reached the
+    /// state where a snapshot is the *only* way to catch that follower up.
+    pub fn purged_index_for_testing(&self) -> Option<u64> {
+        self.raft.metrics().borrow().purged.map(|id| id.index)
+    }
+
+    /// The log id of the currently committed membership.
+    ///
+    /// A `change_membership` intent names the membership it was planned
+    /// against, and the apply path refuses one that names a different revision
+    /// — which is what stops two administrators planning from the same starting
+    /// point and both being admitted. A gate seeding an intent therefore has to
+    /// read the same value the request will be compared against.
+    pub fn membership_log_id_for_testing(&self) -> Option<crate::coordination::contract::LogIdV1> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .log_id()
+            .map(crate::coordination::contract::LogIdV1::from)
+    }
+
     /// The voter ids in the currently committed membership.
     ///
     /// Read from `RaftMetrics`, which is the group's agreed answer rather than
@@ -511,6 +547,23 @@ impl GroupFixture {
             .build()
             .expect("a complete fixture configuration")
     }
+}
+
+/// A 16-byte id from a short label.
+///
+/// `ClientId` and `OperationId` are `[u8; 16]`, and a command carrying anything
+/// else is refused before it reaches any decision — as a *shapeless request*,
+/// which commits and replies `(100, 0)`. That is a rejection with no reason
+/// code, because §5.2 has none for a request the protocol cannot parse, so a
+/// gate that only checked "the proposal returned `Ok`" would see a committed
+/// entry, an advancing log, and no change at all. Every fixture in this
+/// subsystem mints its ids here so none of them can be the wrong width.
+///
+/// BLAKE3 rather than zero-padding: labels of different lengths that share a
+/// prefix would otherwise collide, and two operations with one id is the case
+/// the idempotency path is built to notice.
+pub fn id16(label: &[u8]) -> Vec<u8> {
+    blake3::hash(label).as_bytes()[..16].to_vec()
 }
 
 /// An address-only Open ticket naming `node_id`.

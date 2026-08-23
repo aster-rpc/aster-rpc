@@ -27,9 +27,7 @@ use aster::coordination::admission::{
     AdmissionEntryV1, AdmissionSetV1, SignedAdmissionSet, VerifiedAdmissionSource,
     ADMISSION_CLASS_PRODUCER, ADMISSION_FORMAT_VERSION,
 };
-use aster::coordination::contract::{
-    AcquireActionV1, ActionV1, ClientCommandV1, CommandV1, ResourceKeyV1,
-};
+use aster::coordination::contract::{ActionV1, ClientCommandV1, CommandV1, ResourceKeyV1};
 use aster::coordination::host::{CoordinationConfig, CoordinationStart};
 use aster::coordination::model::authority::{
     canonical_document_bytes, genesis_signing_bytes, signed_document_from_parts,
@@ -143,29 +141,61 @@ fn admission_source(secrets: &[[u8; 32]]) -> Arc<dyn VerifiedAdmissionSource> {
 /// this is the bound on the harness's patience rather than on the group's.
 const WRITE_WINDOW: Duration = Duration::from_secs(5);
 
-/// One real client command: acquire a lease on `key`.
+/// One real client command: grant `key`'s rights to the actor.
 ///
-/// The full production shape — an `ActionV1` inside a `ClientCommandV1`, with
-/// the canonical request hash the state machine computes for itself. A command
-/// the apply path would reject is no evidence about commits, because it would
-/// fail identically in a quorum and out of one.
-fn acquire(secret: &[u8; 32], key: &[u8]) -> CommandV1 {
-    let action = ActionV1::Acquire(AcquireActionV1 {
+/// A **grant**, not an acquire. Acquiring needs `RIGHT_ACQUIRE`, which a fresh
+/// resource grants nobody, so an acquire is refused for a reason that has
+/// nothing to do with quorum. A grant is the shortest path to the authority
+/// question this group can actually answer, and the genesis names every voter
+/// an administrator.
+///
+/// It is still refused today — see `S3-GENESIS-ADMINS` at the call site: the
+/// genesis's administrators reach no replicated state, so the group has none.
+/// What matters for a minority-safety gate is that the refusal is a *decision
+/// the group reached and recorded*, which is exactly what a minority cannot
+/// produce.
+fn grant(secret: &[u8; 32], key: &[u8]) -> CommandV1 {
+    use aster::coordination::contract::SetGrantActionV1;
+    use aster::coordination::model::limits::{RIGHT_ACQUIRE, RIGHT_READ, RIGHT_RENEW};
+
+    let action = ActionV1::SetGrant(SetGrantActionV1 {
         resource: ResourceKeyV1 {
             namespace: "cluster-gate".into(),
             key: key.to_vec(),
         },
-        ttl_ms: 60_000,
+        target_node_id: node_id_of(*secret),
+        rights: RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW,
+        // A resource nobody has granted anything on is at revision 0.
+        expected_acl_revision: 0,
     });
     CommandV1::Client(ClientCommandV1 {
         actor_node_id: node_id_of(*secret),
-        client_id: key.to_vec(),
+        client_id: aster::coordination::testing::id16(key),
         sequence: 1,
         request_hash: aster::coordination::hash::request_hash(&action)
             .expect("a canonical action hashes")
             .to_vec(),
         action,
     })
+}
+
+/// §5.2's rejection outcome.
+///
+/// **Every** refusal shares it and the reason carries the cause, so this is the
+/// one code that means "the group decided against this" regardless of why.
+const REJECTED: i32 = 100;
+
+/// §5.2 reason 12: the actor does not hold the authority the action needs.
+const PERMISSION_CHANGED: i32 = 12;
+
+/// The outcome and reason a committed command answered with.
+fn outcome_of(committed: &aster::coordination::testing::Committed) -> (i32, i32) {
+    match &committed.reply {
+        aster::coordination::contract::CommandReplyV1::Client(reply) => {
+            (reply.outcome_code, reply.reason_code)
+        }
+        other => panic!("a client command must answer with a Client reply, got {other:?}"),
+    }
 }
 
 /// One running voter and the directory it owns.
@@ -406,9 +436,31 @@ async fn a_minority_cannot_commit() {
     let coordination = voters[leader].server.coordination().expect("hosted");
     let before = coordination.last_applied_for_testing();
     let committed = coordination
-        .propose_for_testing_within(acquire(&secrets[leader], b"quorum-control"), WRITE_WINDOW)
+        .propose_for_testing_within(grant(&secrets[leader], b"quorum-control"), WRITE_WINDOW)
         .await
         .expect("a three-voter group commits a write");
+    // The control asserts the group **reached a decision**, not that it accepted
+    // the write — and the difference is a finding, not a preference.
+    //
+    // A bootstrapped group's replicated administrator set is empty: the signed
+    // genesis's `initial_admins` is verified and bounded and then reaches no
+    // durable state, and `SetAdmin` itself requires an existing administrator.
+    // So no administrator command can be accepted, and no ordinary command can
+    // either, because every resource right comes from a grant only an
+    // administrator can issue. Today there is no command a fresh group accepts.
+    //
+    // What the control still establishes is exactly what the minority case is
+    // compared against: with a quorum the group decides and records the
+    // decision; without one it cannot decide at all. Recorded as
+    // `S3-GENESIS-ADMINS` in the evidence ledger; when it closes, this becomes
+    // an acceptance assertion.
+    assert_eq!(
+        outcome_of(&committed),
+        (REJECTED, PERMISSION_CHANGED),
+        "the control write must be decided by the group; if this outcome \
+         changed, S3-GENESIS-ADMINS has moved and this assertion should \
+         tighten to acceptance"
+    );
     assert!(
         Some(committed.index) > before,
         "the control write must land past the index the group was at: \
@@ -431,7 +483,7 @@ async fn a_minority_cannot_commit() {
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     let outcome = coordination
-        .propose_for_testing_within(acquire(&secrets[leader], b"minority-write"), WRITE_WINDOW)
+        .propose_for_testing_within(grant(&secrets[leader], b"minority-write"), WRITE_WINDOW)
         .await;
     assert!(
         outcome.is_err(),
