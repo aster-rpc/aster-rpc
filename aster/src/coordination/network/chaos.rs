@@ -16,9 +16,12 @@
 //! has — which peer, which message — makes the schedule a pure function, so a
 //! failing seed is a failing seed on any machine.
 //!
-//! It is **not** a network. Wiring it into a live cluster needs an injection
-//! point in the Raft client, which is where the remaining §6.2 work is; the
-//! schedule is separable and is what a reader has to trust either way.
+//! [`ChaosNetwork`] is the other half: the live handle a Raft client consults
+//! before every send. The schedule stays a pure function; the handle owns only
+//! what a pure function cannot have — the per-peer message ordinal, the current
+//! partition epoch, and a tally of what was actually applied. That tally is not
+//! decoration: a chaos test whose schedule never fired is a test of a healthy
+//! network wearing a costume, and only the counts can tell the two apart.
 //!
 //! ## Why a hand-rolled hash rather than a crate
 //!
@@ -27,6 +30,9 @@
 //! across platforms and architectures — which a `HashMap`'s `DefaultHasher`
 //! explicitly is not, and a recorded seed that reproduced only on one machine
 //! would be worse than no seed at all.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::coordination::ids::CoordinationNodeId;
 
@@ -58,7 +64,7 @@ pub(crate) enum Fault {
 /// caller's own facts, so clones agree by construction rather than by sharing
 /// state.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Schedule {
+pub struct Schedule {
     seed: u64,
     /// Out of 100. `0` is a perfect network, which is worth being able to
     /// express: a test that fails at zero fault rate has a bug that is not
@@ -68,7 +74,7 @@ pub(crate) struct Schedule {
 
 impl Schedule {
     /// A schedule with a recorded seed and fault rate.
-    pub(crate) fn new(seed: u64, fault_percent: u8) -> Self {
+    pub fn new(seed: u64, fault_percent: u8) -> Self {
         Self {
             seed,
             fault_percent: fault_percent.min(100),
@@ -76,11 +82,11 @@ impl Schedule {
     }
 
     /// A perfect network. Every message is delivered unchanged.
-    pub(crate) fn perfect() -> Self {
+    pub fn perfect() -> Self {
         Self::new(0, 0)
     }
 
-    pub(crate) fn seed(&self) -> u64 {
+    pub fn seed(&self) -> u64 {
         self.seed
     }
 
@@ -120,13 +126,18 @@ impl Schedule {
     /// of a *pair* over a *period*, not of a message: dropping each message
     /// independently at 50% is not a partition, and a test that used one for
     /// the other would never see a stable minority.
+    /// **Epoch 0 is a whole network.** Partitions are opt-in: a harness that
+    /// merely installed a schedule would otherwise start every run with the
+    /// group already split, which conflates the two faults it is trying to
+    /// tell apart — and a gate about drops and delays would silently be a gate
+    /// about partitions. Advancing the epoch is what asks for one.
     pub(crate) fn same_side(
         &self,
         a: &CoordinationNodeId,
         b: &CoordinationNodeId,
         epoch: u64,
     ) -> bool {
-        if self.fault_percent == 0 {
+        if self.fault_percent == 0 || epoch == 0 {
             return true;
         }
         // Order-independent: a partition that separated A from B but not B from
@@ -159,6 +170,189 @@ impl Schedule {
         z ^ (z >> 31)
     }
 }
+
+/// How many times each kind of fault was actually applied.
+///
+/// The non-vacuity oracle. A seed and a fault rate describe what *should*
+/// happen; this records what did, so a test can require that the run it just
+/// passed contained real drops and real delays rather than a lucky sequence of
+/// `Deliver`s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaultTally {
+    pub delivered: u64,
+    pub dropped: u64,
+    pub delayed: u64,
+    pub duplicated: u64,
+    pub reordered: u64,
+    pub partitioned: u64,
+}
+
+impl FaultTally {
+    /// Every message the schedule touched, however it ended up.
+    pub fn total(&self) -> u64 {
+        self.delivered
+            + self.dropped
+            + self.delayed
+            + self.duplicated
+            + self.reordered
+            + self.partitioned
+    }
+
+    /// Whether every kind the schedule can produce was produced at least once.
+    ///
+    /// What a test asserts instead of trusting the fault rate: the rate is a
+    /// property of the schedule, this is a property of the run.
+    pub fn every_kind_fired(&self) -> bool {
+        self.dropped > 0 && self.delayed > 0 && self.duplicated > 0 && self.reordered > 0
+    }
+}
+
+#[derive(Default)]
+struct ChaosState {
+    /// Next message ordinal per peer. The schedule's second input, and the one
+    /// thing it cannot derive: "which message is this" is inherently stateful.
+    ordinals: BTreeMap<CoordinationNodeId, u64>,
+    /// The current partition epoch. A test advances it to re-draw the sides;
+    /// within one epoch the split is stable, which is what makes a minority
+    /// stay a minority long enough to observe.
+    epoch: u64,
+    tally: FaultTally,
+}
+
+/// The live fault injector a Raft client consults before each send.
+///
+/// Shared by every per-peer client of one voter, so ordinals and the epoch are
+/// per-*voter* rather than per-connection: a client rebuilt mid-run must not
+/// restart the schedule, or a flapping peer would silently get a fresh draw.
+#[derive(Debug)]
+pub struct ChaosNetwork {
+    schedule: Schedule,
+    state: Mutex<ChaosState>,
+}
+
+impl std::fmt::Debug for ChaosState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChaosState")
+            .field("epoch", &self.epoch)
+            .field("tally", &self.tally)
+            .finish()
+    }
+}
+
+/// What the client should do with the message it is about to send.
+///
+/// Deliberately not [`Fault`]: this is the *action*, after the partition check
+/// has been folded in and after a delay has already been waited out. The client
+/// should not have to re-derive policy from a schedule verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChaosAction {
+    /// Send once, normally.
+    Send,
+    /// Send twice and keep the first answer.
+    SendTwice,
+    /// Do not send. The caller reports an unreachable peer, which is what a
+    /// dropped request looks like from the sender's side.
+    Swallow,
+}
+
+impl ChaosNetwork {
+    pub fn new(schedule: Schedule) -> Arc<Self> {
+        Arc::new(Self {
+            schedule,
+            state: Mutex::new(ChaosState::default()),
+        })
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.schedule.seed()
+    }
+
+    pub fn tally(&self) -> FaultTally {
+        self.locked().tally
+    }
+
+    /// Re-draw the partition. Within an epoch the sides are fixed; advancing it
+    /// heals one split and creates another.
+    pub fn advance_epoch(&self) {
+        self.locked().epoch += 1;
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.locked().epoch
+    }
+
+    /// Decide what happens to the next message from `local` to `peer`, waiting
+    /// out a delay before returning if the schedule called for one.
+    ///
+    /// `async` because a delay must be *lived*, not reported: returning "delay
+    /// by 40ms" and trusting the caller to honour it is one more place for the
+    /// harness and the schedule to disagree.
+    pub(crate) async fn before_send(
+        &self,
+        local: &CoordinationNodeId,
+        peer: &CoordinationNodeId,
+    ) -> ChaosAction {
+        let (fault, partitioned) = {
+            let mut state = self.locked();
+            let ordinal = {
+                let slot = state.ordinals.entry(*peer).or_insert(0);
+                let current = *slot;
+                *slot += 1;
+                current
+            };
+            let epoch = state.epoch;
+            // Partition wins over the per-message draw. A pair on opposite
+            // sides drops *everything* between them for the whole epoch, which
+            // is the difference between a partition and a high drop rate.
+            let partitioned = !self.schedule.same_side(local, peer, epoch);
+            let fault = if partitioned {
+                Fault::Drop
+            } else {
+                self.schedule.fault_for(peer, ordinal)
+            };
+            match (partitioned, fault) {
+                (true, _) => state.tally.partitioned += 1,
+                (false, Fault::Deliver) => state.tally.delivered += 1,
+                (false, Fault::Drop) => state.tally.dropped += 1,
+                (false, Fault::Delay { .. }) => state.tally.delayed += 1,
+                (false, Fault::Duplicate) => state.tally.duplicated += 1,
+                (false, Fault::Reorder) => state.tally.reordered += 1,
+            }
+            (fault, partitioned)
+        };
+
+        if partitioned {
+            return ChaosAction::Swallow;
+        }
+        match fault {
+            Fault::Deliver => ChaosAction::Send,
+            Fault::Drop => ChaosAction::Swallow,
+            Fault::Delay { ms } => {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                ChaosAction::Send
+            }
+            Fault::Duplicate => ChaosAction::SendTwice,
+            // A request/response client has no queue to shuffle, so "arrives
+            // after the next one" is expressed the only way it can be: hold
+            // this message longer than the next one will take. The bound is the
+            // schedule's own delay ceiling, so a reorder cannot become a
+            // disguised partition any more than a delay can.
+            Fault::Reorder => {
+                tokio::time::sleep(std::time::Duration::from_millis(REORDER_HOLD_MS)).await;
+                ChaosAction::Send
+            }
+        }
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, ChaosState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// How long a reordered message is held. Above the delay ceiling so it lands
+/// after a normally-delayed successor, and still well under
+/// `election_timeout_min`.
+const REORDER_HOLD_MS: u64 = 250;
 
 #[cfg(test)]
 mod tests {
@@ -270,7 +464,7 @@ mod tests {
     #[test]
     fn a_partition_separates_pairs_symmetrically() {
         let schedule = Schedule::new(0xBEEF, 50);
-        for epoch in 0..50 {
+        for epoch in 1..51 {
             for a in 1..6u8 {
                 for b in 1..6u8 {
                     assert_eq!(
@@ -296,17 +490,35 @@ mod tests {
             }
         }
 
-        let split = (0..200).any(|epoch| {
+        let split = (1..200).any(|epoch| {
             (1..6u8).any(|a| (1..6u8).any(|b| !schedule.same_side(&node(a), &node(b), epoch)))
         });
         assert!(split, "the schedule never separated any pair");
 
         // And the split is not permanent: a partition that never healed would
         // be a dead group rather than a network under fault.
-        let healed = (0..200).any(|epoch| {
+        let healed = (1..200).any(|epoch| {
             (1..6u8).all(|a| (1..6u8).all(|b| schedule.same_side(&node(a), &node(b), epoch)))
         });
         assert!(healed, "the schedule never healed a partition");
+    }
+
+    /// **Epoch 0 partitions nobody.**
+    ///
+    /// Asserted rather than assumed, because the first chaos run built on this
+    /// module started every group already split and its message-level gate was
+    /// therefore measuring a partition.
+    #[test]
+    fn epoch_zero_is_a_whole_network() {
+        let schedule = Schedule::new(0xC0FFEE, 50);
+        for a in 1..8u8 {
+            for b in 1..8u8 {
+                assert!(
+                    schedule.same_side(&node(a), &node(b), 0),
+                    "epoch 0 must connect every pair; {a}/{b} was split"
+                );
+            }
+        }
     }
 
     /// Two peers at the same ordinal get independent decisions.

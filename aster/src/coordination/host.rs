@@ -292,6 +292,14 @@ pub struct CoordinationConfig {
     verified_admission: Arc<dyn VerifiedAdmissionSource>,
     development: DevelopmentAcknowledgements,
     allow_broad_storage_permissions: bool,
+    /// The §6.2 fault injector.
+    ///
+    /// Gated on `coordination-testing`, so a shipping build has no field to
+    /// set and `boot` has nothing to read: a deliberately unreliable network
+    /// cannot reach a production voter by configuration mistake, which is a
+    /// stronger guarantee than a runtime default of `None` would be.
+    #[cfg(feature = "coordination-testing")]
+    chaos: Option<Arc<crate::coordination::network::chaos::ChaosNetwork>>,
 }
 
 // Hand-written because `Arc<dyn VerifiedAdmissionSource>` is not `Debug` and
@@ -355,6 +363,12 @@ impl CoordinationConfig {
         &self.authority_domain
     }
 
+    /// The §6.2 fault injector, if one was installed for a test.
+    #[cfg(feature = "coordination-testing")]
+    pub(crate) fn chaos(&self) -> Option<Arc<crate::coordination::network::chaos::ChaosNetwork>> {
+        self.chaos.clone()
+    }
+
     /// How this voter starts.
     pub fn start_mode(&self) -> &CoordinationStart {
         &self.start_mode
@@ -380,6 +394,8 @@ impl CoordinationConfig {
 /// Builder for a [`CoordinationConfig`].
 #[derive(Clone, Default)]
 pub struct CoordinationConfigBuilder {
+    #[cfg(feature = "coordination-testing")]
+    chaos: Option<Arc<crate::coordination::network::chaos::ChaosNetwork>>,
     storage_dir: Option<PathBuf>,
     authority_domain: Option<String>,
     start_mode: Option<CoordinationStart>,
@@ -454,6 +470,20 @@ impl CoordinationConfigBuilder {
     /// one would let a test prove a property the shipping voter does not have.
     pub fn allow_broad_storage_permissions(mut self, yes: bool) -> Self {
         self.allow_broad_storage_permissions = yes;
+        self
+    }
+
+    /// Install a §6.2 fault schedule on this voter's Raft client.
+    ///
+    /// Only under `coordination-testing`. The handle is shared with the caller,
+    /// so a test reads the applied-fault tally and moves the partition epoch
+    /// through the same value the client consults.
+    #[cfg(feature = "coordination-testing")]
+    pub fn chaos_for_testing(
+        mut self,
+        chaos: Arc<crate::coordination::network::chaos::ChaosNetwork>,
+    ) -> Self {
+        self.chaos = Some(chaos);
         self
     }
 
@@ -566,6 +596,8 @@ impl CoordinationConfigBuilder {
             verified_admission,
             development: self.development,
             allow_broad_storage_permissions: self.allow_broad_storage_permissions,
+            #[cfg(feature = "coordination-testing")]
+            chaos: self.chaos,
         })
     }
 }

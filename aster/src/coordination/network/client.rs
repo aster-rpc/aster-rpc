@@ -155,6 +155,16 @@ pub(crate) struct NetworkContext {
     pub(crate) local: CoordinationNodeId,
     pub(crate) routes: RouteTable,
     pub(crate) faults: FaultLatch,
+    /// The §6.2 fault injector, or `None` for a real network.
+    ///
+    /// `None` in every production start — asserted by a source guard in
+    /// `boot.rs`, because a chaos handle reaching a shipping voter would be a
+    /// deliberately unreliable network that nothing would notice. It lives on
+    /// the production path rather than behind `cfg(test)` on purpose: a harness
+    /// that wrapped a *different* client would be testing the wrapper, and the
+    /// §5.3 checks, the envelope and the error classification are exactly what
+    /// chaos has to run through.
+    pub(crate) chaos: Option<std::sync::Arc<super::chaos::ChaosNetwork>>,
 }
 
 /// The factory. One per voter; it makes a client per peer.
@@ -231,8 +241,41 @@ impl CoordinationNetwork {
             .map_err(|_| Transport::NotDialable)
     }
 
-    /// One unary exchange, classified through the mapping tables at every exit.
+    /// One unary exchange, through the §6.2 fault schedule when one is
+    /// installed.
+    ///
+    /// The schedule is consulted **before** the frame is built, so a dropped
+    /// message costs what a dropped message costs: nothing is serialised, no
+    /// connection is opened, and the peer never hears from us. A `Swallow`
+    /// answers `NotDialable`, which is what a request that vanished looks like
+    /// from the sender — it classifies `Unreachable`, so OpenRaft retries,
+    /// which is the whole point of dropping it.
     async fn unary(
+        &self,
+        method: &'static str,
+        message: &RaftMessageV1,
+        option: &RPCOption,
+    ) -> Result<RaftMessageV1, Transport> {
+        let Some(chaos) = self.ctx.chaos.clone() else {
+            return self.unary_once(method, message, option).await;
+        };
+        match chaos.before_send(&self.ctx.local, &self.target).await {
+            super::chaos::ChaosAction::Send => self.unary_once(method, message, option).await,
+            super::chaos::ChaosAction::Swallow => Err(Transport::NotDialable),
+            // Both copies are really sent, and the **first** answer is the one
+            // returned: a duplicate that discarded its first reply would test
+            // nothing, because the receiver's second handling is exactly the
+            // idempotence under test.
+            super::chaos::ChaosAction::SendTwice => {
+                let first = self.unary_once(method, message, option).await;
+                let _ = self.unary_once(method, message, option).await;
+                first
+            }
+        }
+    }
+
+    /// The real exchange, classified through the mapping tables at every exit.
+    async fn unary_once(
         &self,
         method: &'static str,
         message: &RaftMessageV1,
@@ -438,6 +481,22 @@ impl RaftNetwork<CoordinationTypeConfig> for CoordinationNetwork {
         SnapshotResponse<CoordinationNodeId>,
         StreamingError<CoordinationTypeConfig, Fatal<CoordinationNodeId>>,
     > {
+        // A snapshot stream is subject to the same schedule as a unary call,
+        // and for the same reason: catch-up through a lossy network is exactly
+        // the case §6.2 asks about. A duplicate is meaningless for a stream —
+        // the receiver rejects a second concurrent one by design — so a
+        // `SendTwice` verdict sends once here.
+        if let Some(chaos) = self.ctx.chaos.clone() {
+            if chaos.before_send(&self.ctx.local, &self.target).await
+                == super::chaos::ChaosAction::Swallow
+            {
+                self.ctx.faults.record(self.target, FaultClass::Transient);
+                return Err(stream_error(
+                    super::errors::StreamRetry::Unreachable,
+                    "the chaos schedule dropped this snapshot stream".into(),
+                ));
+            }
+        }
         match self.send_snapshot(vote, snapshot, cancel, option).await {
             Ok(response) => Ok(response),
             Err(failure) => {

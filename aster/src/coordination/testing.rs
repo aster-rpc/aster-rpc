@@ -41,6 +41,12 @@ use crate::coordination::contract::{CommandReplyV1, CommandV1};
 use crate::coordination::typeconfig::CoordinationTypeConfig;
 use crate::coordination::Coordination;
 
+/// The §6.2 deterministic fault schedule and its live injector.
+///
+/// Re-exported here rather than made public at its own path: chaos is a
+/// testing capability, and `coordination::network` stays crate-private.
+pub use crate::coordination::network::chaos::{ChaosNetwork, FaultTally, Schedule};
+
 /// The `RaftError` a client write can answer with, spelled once.
 pub type WriteRejection = RaftError<
     crate::coordination::ids::CoordinationNodeId,

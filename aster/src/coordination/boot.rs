@@ -180,6 +180,13 @@ pub(crate) async fn start(
         local,
         routes,
         faults,
+        // A shipping build has no field to read: `CoordinationConfig::chaos` is
+        // gated on `coordination-testing`, so this arm is the only one that
+        // compiles into a release and it is a literal `None`.
+        #[cfg(feature = "coordination-testing")]
+        chaos: config.chaos(),
+        #[cfg(not(feature = "coordination-testing"))]
+        chaos: None,
     });
 
     let raft = Raft::new(
@@ -578,6 +585,38 @@ mod tests {
                 if graduated { "reading" } else { "without" }
             );
         }
+    }
+
+    /// **A shipping voter has no fault injector.**
+    ///
+    /// The §6.2 chaos handle is a deliberately unreliable network, and one that
+    /// reached production would be a group quietly dropping its own Raft
+    /// traffic with nothing to attribute it to. The guarantee is structural
+    /// rather than a runtime default: `CoordinationConfig`'s field is gated on
+    /// `coordination-testing`, so a release build has nothing to read and this
+    /// arm is the only one that compiles.
+    ///
+    /// Asserted on the source because the property is about the *absence* of a
+    /// configuration path — a build without the feature cannot express the
+    /// mistake, so no run of it can observe the check working.
+    #[test]
+    fn a_production_voter_installs_no_fault_injector() {
+        let source = include_str!("boot.rs");
+        let end = crate::coordination::guards::production_end(source);
+        let production = &source[..end];
+
+        assert!(
+            production.contains("#[cfg(not(feature = \"coordination-testing\"))]")
+                && production.contains("chaos: None,"),
+            "a build without `coordination-testing` must set the injector to None"
+        );
+        // And the only other arm is gated on the testing feature, so there is
+        // no third path that could supply one.
+        let sites = production.matches("chaos:").count();
+        assert_eq!(
+            sites, 2,
+            "the injector must be set in exactly the two cfg arms; found {sites}"
+        );
     }
 
     /// **`Join` never initializes, and `Existing` only recovers.**
