@@ -100,7 +100,6 @@ fn coordination_config(dir: &std::path::Path, secret: [u8; 32]) -> CoordinationC
 
     CoordinationConfig::builder()
         .storage_dir(dir)
-        .authority_public_key(authority().verifying_key().to_bytes())
         .authority_domain(DOMAIN)
         .start_mode(CoordinationStart::Bootstrap {
             signed_genesis: signed,
@@ -138,7 +137,6 @@ fn existing_config(dir: &std::path::Path, secret: [u8; 32]) -> CoordinationConfi
 
     CoordinationConfig::builder()
         .storage_dir(dir)
-        .authority_public_key(authority().verifying_key().to_bytes())
         .authority_domain(DOMAIN)
         .start_mode(CoordinationStart::Existing {
             signed_genesis: signed,

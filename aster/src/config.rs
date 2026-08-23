@@ -1631,3 +1631,64 @@ signature = "sig-consumer"
         );
     }
 }
+
+#[cfg(test)]
+mod root_pubkey_tests {
+    use super::*;
+
+    fn key(byte: u8) -> PublicKey {
+        PublicKey::from_bytes([byte; 32])
+    }
+
+    /// **Both sources are read, and they must agree.**
+    ///
+    /// The inline key used to short-circuit before the file was ever opened, so
+    /// a deployment that set both and rotated only one ran on the stale value
+    /// silently — and nothing said so. There is one root key; two configured
+    /// spellings of it that differ is a configuration error, not a precedence
+    /// question, and guessing wrong is not visible until a signature fails to
+    /// verify somewhere far away.
+    #[test]
+    fn a_root_key_configured_twice_must_agree() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("root.pub");
+        std::fs::write(&path, key(9).to_hex()).expect("write the key file");
+
+        // File alone.
+        let mut only_file = AsterConfig::builder().build();
+        only_file.root_pubkey_file = Some(path.clone());
+        assert_eq!(only_file.resolve_root_pubkey().expect("file"), Some(key(9)));
+
+        // Inline alone.
+        let mut only_inline = AsterConfig::builder().build();
+        only_inline.root_pubkey = Some(key(7));
+        assert_eq!(
+            only_inline.resolve_root_pubkey().expect("inline"),
+            Some(key(7))
+        );
+
+        // Both, agreeing.
+        let mut agreeing = AsterConfig::builder().build();
+        agreeing.root_pubkey = Some(key(9));
+        agreeing.root_pubkey_file = Some(path.clone());
+        assert_eq!(
+            agreeing.resolve_root_pubkey().expect("agreement"),
+            Some(key(9))
+        );
+
+        // Both, disagreeing: refused rather than resolved by precedence, and
+        // the message names the file so an operator can see which record is
+        // stale. Restoring the inline short-circuit returns `Some(key(7))` here
+        // and this fails.
+        let mut conflicting = AsterConfig::builder().build();
+        conflicting.root_pubkey = Some(key(7));
+        conflicting.root_pubkey_file = Some(path);
+        let err = conflicting
+            .resolve_root_pubkey()
+            .expect_err("one deployment has one ROOT");
+        let rendered = err.to_string();
+        assert!(rendered.contains(&key(7).to_hex()), "{rendered}");
+        assert!(rendered.contains(&key(9).to_hex()), "{rendered}");
+        assert!(rendered.contains("root.pub"), "{rendered}");
+    }
+}

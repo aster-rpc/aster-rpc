@@ -146,6 +146,34 @@ impl DurableState {
 /// native-entry path. §11.3 persists only the `StoredMembership`, so this runs
 /// again at every open; a second implementation would mean a restart could
 /// disagree with the running store about who the voters are.
+/// Does this membership name **ROOT**, in any role?
+///
+/// ## Why this is the invariant that matters
+///
+/// §8.1 forbids ROOT from committed membership, and the two places that
+/// *decide* — `verify_genesis` and `plan_shape` — are admission checks. Neither
+/// is the durable authority. A forced native entry from a non-conforming
+/// leader, or a snapshot assembled elsewhere, reaches the state machine and the
+/// loader without passing either, so a rule enforced only at admission is a
+/// rule a store can be made to hold in violation of.
+///
+/// So this runs at both durable boundaries — the native membership writer and
+/// load validation — from one definition. The writer must not write what the
+/// reader refuses: persisting a membership that fails at the next open is the
+/// worst place to discover it.
+///
+/// The **union** of every configuration plus the node map, not the projection's
+/// `voters`: during a joint change the projection's voter set is already the
+/// union, but a node map entry that no configuration names is a learner, and a
+/// ROOT learner is exactly the shape a plan-shape-only check would have missed.
+pub(crate) fn membership_names_root(
+    membership: &openraft::Membership<CoordinationNodeId, CoordinationNode>,
+    root: &[u8; 32],
+) -> bool {
+    membership.voter_ids().any(|id| id.as_bytes() == root)
+        || membership.nodes().any(|(id, _)| id.as_bytes() == root)
+}
+
 pub(crate) fn project_membership(
     membership: &openraft::Membership<CoordinationNodeId, CoordinationNode>,
 ) -> CommittedMembership {
@@ -1138,6 +1166,10 @@ struct Invariant {
 /// wrongly is refused rather than blessed by the same code that made it.
 static INVARIANTS: &[Invariant] = &[
     Invariant {
+        name: "membership",
+        check: check_root_not_a_member,
+    },
+    Invariant {
         name: "table-row-caps",
         check: check_table_caps,
     },
@@ -1588,6 +1620,27 @@ fn check_grant_rows(state: &DurableState) -> Result<(), String> {
                  in one step"
             ));
         }
+    }
+    Ok(())
+}
+
+/// ROOT is never a committed voter or learner (§8.1).
+///
+/// The load half of the invariant; the native membership writer is the other,
+/// and both call [`membership_names_root`] so the writer cannot write what this
+/// refuses. Enforced here rather than left to admission because a forced native
+/// entry from a non-conforming leader, or a snapshot assembled elsewhere,
+/// reaches durable state without passing `verify_genesis` or `plan_shape`.
+fn check_root_not_a_member(state: &DurableState) -> Result<(), String> {
+    if membership_names_root(
+        state.membership.membership(),
+        &state.model.authority.public_key,
+    ) {
+        return Err(
+            "the committed membership names the deployment ROOT; ROOT is never a voter or \
+             learner"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -3261,6 +3314,65 @@ mod tests {
             rule: "admin-revision",
             what: "an admin revision over §5.2's ceiling",
             break_it: |state| state.model.admin_revision = limits::MAX_COUNTER + 1,
+        },
+        // The two pairings that make `admin_revision` a readable fact rather
+        // than a bounded counter. Revision 0 is the pre-Genesis state, so it
+        // means *no delegates*; any other revision means the genesis applied,
+        // so it means at least one. A store whose halves disagreed would load
+        // cleanly and every later authorization decision would read from it.
+        Negative {
+            rule: "admin-revision",
+            what: "revision 0 with delegated administrators",
+            break_it: |state| {
+                state.model.admin_revision = 0;
+                state.model.admins.insert([0xA7u8; 32]);
+            },
+        },
+        Negative {
+            rule: "admin-revision",
+            what: "a nonzero revision with no delegated administrators",
+            break_it: |state| {
+                state.model.admin_revision = 1;
+                state.model.admins.clear();
+            },
+        },
+        // §8.1: ROOT is immutable and is never a row. A store holding one was
+        // written by neither `verify_genesis` nor `set_admin`, and loading it
+        // would let `set_admin` remove ROOT with the final-delegate rule
+        // counting it.
+        Negative {
+            rule: "admin-revision",
+            what: "the ROOT key as a delegated administrator row",
+            break_it: |state| {
+                state.model.admin_revision = 1;
+                let root = state.model.authority.public_key;
+                state.model.admins.insert(root);
+            },
+        },
+        // §8.1: ROOT is never a committed member either. Admission refuses a
+        // genesis and a plan that name it, but neither sees a forced native
+        // entry or a snapshot assembled elsewhere — so the load path refuses
+        // it, from the same predicate the native writer uses.
+        Negative {
+            rule: "membership",
+            what: "the ROOT key as a committed voter",
+            break_it: |state| {
+                use openraft::Membership;
+                let root = crate::coordination::ids::CoordinationNodeId::from_array(
+                    state.model.authority.public_key,
+                );
+                let mut voters: std::collections::BTreeSet<_> =
+                    state.membership.membership().voter_ids().collect();
+                voters.insert(root);
+                let nodes: std::collections::BTreeMap<_, _> = voters
+                    .iter()
+                    .map(|id| (*id, crate::coordination::typeconfig::CoordinationNode))
+                    .collect();
+                state.membership = openraft::StoredMembership::new(
+                    *state.membership.log_id(),
+                    Membership::new(vec![voters], nodes),
+                );
+            },
         },
         Negative {
             rule: "session-row-shape",

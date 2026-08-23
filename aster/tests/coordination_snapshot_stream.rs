@@ -207,7 +207,6 @@ fn coordination_config(
 
     CoordinationConfig::builder()
         .storage_dir(dir)
-        .authority_public_key(authority().verifying_key().to_bytes())
         .authority_domain(DOMAIN)
         .start_mode(CoordinationStart::Bootstrap {
             signed_genesis: signed,

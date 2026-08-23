@@ -250,26 +250,64 @@ async fn run_corridor(
 ) -> Result<()> {
     match resolved {
         ResolvedStart::Bootstrap { genesis, .. } => {
-            let members: BTreeMap<CoordinationNodeId, CoordinationNode> = genesis
-                .initial_voters()
-                .iter()
-                .map(|seed| {
-                    (
-                        CoordinationNodeId::from_array(*seed.node_id()),
-                        CoordinationNode,
-                    )
-                })
-                .collect();
+            let members = initial_members(genesis);
             debug_assert!(
                 members.contains_key(&local),
                 "start::resolve refuses a bootstrap by a node outside the initial voters"
             );
             initialize(raft, members).await
         }
-        // A permit grants no membership, and reopening a bound directory must
-        // never found a second group over the first.
-        ResolvedStart::Join { .. } | ResolvedStart::Existing { .. } => Ok(()),
+        // **An interrupted bootstrap finishes here.**
+        //
+        // A fresh open commits both identity bindings *before* `initialize`
+        // runs, so a crash in between leaves a directory that is bound and has
+        // no membership. `Bootstrap` then refuses it — the directory is no
+        // longer `Fresh` — and if `Existing` also did nothing, the group could
+        // never elect a leader, never propose its genesis, and never leave
+        // `NoQuorum`. Nothing would say why.
+        //
+        // This is not "Existing founds a group". It initializes only when there
+        // is **no committed membership at all**, with the membership named by
+        // the genesis this directory is already bound to — completing the
+        // founding of *this* group rather than starting a second one. Once a
+        // membership exists this is a no-op, and `initialize`'s own
+        // `NotAllowed` is the backstop if one commits between the check and the
+        // call.
+        ResolvedStart::Existing { genesis } => {
+            if raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .next()
+                .is_some()
+            {
+                return Ok(());
+            }
+            initialize(raft, initial_members(genesis)).await
+        }
+        // A permit grants no membership, and a joining node must never
+        // initialize: it would found a second group beside the one it is
+        // asking to join.
+        ResolvedStart::Join { .. } => Ok(()),
     }
+}
+
+/// The membership a genesis names, as `Raft::initialize` takes it.
+fn initial_members(
+    genesis: &super::model::authority::VerifiedGenesis,
+) -> BTreeMap<CoordinationNodeId, CoordinationNode> {
+    genesis
+        .initial_voters()
+        .iter()
+        .map(|seed| {
+            (
+                CoordinationNodeId::from_array(*seed.node_id()),
+                CoordinationNode,
+            )
+        })
+        .collect()
 }
 
 /// `Raft::initialize`, with concurrent initialization treated as success.
@@ -343,7 +381,6 @@ mod tests {
         let a = authority();
         CoordinationConfig::builder()
             .storage_dir("/tmp/unused-in-these-tests")
-            .authority_public_key(a.public_key)
             .authority_domain(a.domain)
             .start_mode(start)
             .verified_admission(Arc::new(source_admitting(&[LOCAL, PEER, THIRD])))
@@ -563,25 +600,41 @@ mod tests {
             "Raft::initialize must be called from exactly one place; found {sites:?}"
         );
 
-        // And that place is inside `initialize`, which `run_corridor` reaches
-        // only from the `Bootstrap` arm.
+        // And **`Join` never initializes**, which is the arm where founding a
+        // second group would actually be possible: a joining node is asking to
+        // be admitted to a group that already exists.
+        //
+        // `Existing` may initialize, and that is a deliberate change. A fresh
+        // open commits both identity bindings before `Raft::initialize` runs,
+        // so a crash in between leaves a directory that is bound and has no
+        // membership — `Bootstrap` then refuses it as not `Fresh`, and if
+        // `Existing` also did nothing the group could never elect, never
+        // propose its genesis, and never leave `NoQuorum`. It initializes only
+        // when there is no committed membership at all, with the set named by
+        // the genesis the directory is already bound to.
         let corridor_at = production
             .find("async fn run_corridor(")
             .expect("the corridor exists");
         let arm = &production[corridor_at..];
-        let bootstrap_at = arm
-            .find("ResolvedStart::Bootstrap")
-            .expect("a bootstrap arm");
-        let other_at = arm
-            .find("ResolvedStart::Join { .. } | ResolvedStart::Existing { .. } => Ok(())")
-            .expect("join and existing do nothing");
         assert!(
-            bootstrap_at < other_at,
-            "the corridor must dispatch on the mode, with join and existing doing nothing"
+            arm.contains("ResolvedStart::Join { .. } => Ok(())"),
+            "the join arm must do nothing: a permit grants no membership"
         );
+
+        // The `Existing` arm's initialize is gated on an empty membership, not
+        // unconditional. Asserted on the source because the alternative — an
+        // `Existing` start that initializes over a live group — is not
+        // something a test can safely provoke.
+        let existing_at = arm
+            .find("ResolvedStart::Existing { genesis }")
+            .expect("an existing arm");
+        let existing = &arm[existing_at..];
+        let init_at = existing
+            .find("initialize(raft, initial_members(genesis))")
+            .expect("the existing arm may initialize");
         assert!(
-            arm[..other_at].contains("initialize(raft, members)"),
-            "only the bootstrap arm may initialize"
+            existing[..init_at].contains(".voter_ids()"),
+            "the existing arm must check for an empty membership before initializing"
         );
     }
 }

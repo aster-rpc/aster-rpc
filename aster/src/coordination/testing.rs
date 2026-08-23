@@ -402,6 +402,40 @@ impl GroupFixture {
         &self.domain
     }
 
+    /// Bind a storage directory and stop, **without** initializing Raft.
+    ///
+    /// Reproduces the interrupted bootstrap exactly: a fresh open commits both
+    /// identity bindings before `Raft::initialize` runs, so a crash in between
+    /// leaves a directory that is bound and has no membership. Nothing else can
+    /// construct that state — a test that started a voter and shut it down
+    /// after `wait_ready()` has a fully initialized group, which is the case
+    /// that was already working.
+    ///
+    /// It opens through the production `VoterStorage::open` with the production
+    /// identity, so the directory it leaves is the one a real crash leaves.
+    pub fn bind_without_initializing_for_testing(&self, dir: &std::path::Path, index: usize) {
+        use crate::coordination::storage::identity::{OpenPolicy, StorageIdentity};
+        use crate::coordination::storage::schema::StorageLayout;
+        use crate::coordination::storage::VoterStorage;
+
+        let identity = StorageIdentity::new(
+            self.group_id(),
+            self.genesis_hash(),
+            self.authority_key(),
+            self.domain(),
+            crate::coordination::ids::CoordinationNodeId::from_slice(&self.node_id(index))
+                .expect("a node id"),
+            self.profile(),
+        );
+        let storage = VoterStorage::open(
+            StorageLayout::new(dir),
+            identity,
+            OpenPolicy::production().allowing_broad_permissions(),
+        )
+        .expect("the directory binds");
+        drop(storage);
+    }
+
     /// Sign `bytes` with this fixture's ROOT secret.
     ///
     /// For gates that mint a document the fixture's own builders will not — a
@@ -589,7 +623,6 @@ impl GroupFixture {
         builder: crate::coordination::host::CoordinationConfigBuilder,
     ) -> crate::coordination::host::CoordinationConfig {
         builder
-            .authority_public_key(self.authority_key())
             .authority_domain(&self.domain)
             .verified_admission(self.admission())
             // §7.1 requires each acknowledgement only for the shape it names,

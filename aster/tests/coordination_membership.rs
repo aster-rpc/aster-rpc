@@ -410,3 +410,96 @@ async fn a_second_plan_is_refused_without_disturbing_the_first() {
         voter.server.shutdown().await;
     }
 }
+
+/// **An exact genesis replay survives a membership change.**
+///
+/// The discriminating case for the check ordering. `apply_genesis` compares the
+/// genesis's `initial_voters` with the committed membership, and that comparison
+/// belongs to *first installation* only: running it on every arrival made
+/// idempotence expire the moment the group legally changed shape, so the
+/// founding document would be `GenesisRefused` — fatal, on every voter, for the
+/// one document they all agree on.
+///
+/// A replay that only followed an *administrator* change would still pass with
+/// the old ordering, because the voter set would be unchanged. This one shrinks
+/// five voters to three first, so the sets genuinely differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_genesis_replay_survives_a_membership_change() {
+    use aster::coordination::contract::GenesisCommandV1;
+
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x02, SIZE);
+    let voters = start_group(&fixture).await;
+    let leader = await_leader(&voters, "before the change").await;
+
+    let departing: Vec<usize> = (0..SIZE)
+        .filter(|i| *i != voters[leader].index)
+        .take(2)
+        .collect();
+    let staying: Vec<usize> = (0..SIZE).filter(|i| !departing.contains(i)).collect();
+
+    let coordination = voters[leader].coordination();
+    let accepted = coordination
+        .propose_for_testing_within(
+            plan(
+                &fixture,
+                voters[leader].index,
+                b"shrink-before-replay",
+                coordination.membership_log_id_for_testing(),
+                &staying,
+                &departing,
+            ),
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("the plan commits");
+    assert_eq!(outcome_of(&accepted).0, MEMBERSHIP_ACCEPTED);
+    await_shape(
+        &voters[leader],
+        &fixture,
+        &staying,
+        &departing,
+        "before the replay",
+    )
+    .await;
+
+    // The committed voter set is now three; the genesis names five. Under the
+    // old ordering this is the point at which the founding document became
+    // fatal.
+    let coordination = voters[leader].coordination();
+    let replay = coordination
+        .propose_for_testing_within(
+            CommandV1::Genesis(GenesisCommandV1 {
+                signed_genesis: fixture.signed_genesis(),
+            }),
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("an exact replay commits after the membership changed");
+    match &replay.reply {
+        aster::coordination::contract::CommandReplyV1::System(reply) => assert_eq!(
+            reply.system_result_code, 8,
+            "SYS_GENESIS_ALREADY_INSTALLED: recognised, not reinstalled"
+        ),
+        other => panic!("a genesis answers with a System reply, got {other:?}"),
+    }
+
+    // And nothing moved: the replay is a business-state no-op, not a
+    // reinstallation that would have restored the genesis's five voters.
+    await_shape(
+        &voters[leader],
+        &fixture,
+        &staying,
+        &departing,
+        "after the replay",
+    )
+    .await;
+    assert_eq!(
+        voters[leader].coordination().lifecycle_code(),
+        3,
+        "still Ready"
+    );
+
+    for voter in voters {
+        voter.server.shutdown().await;
+    }
+}

@@ -161,7 +161,6 @@ async fn a_single_voter_development_group_forms_and_becomes_ready() {
 
     let config = CoordinationConfig::builder()
         .storage_dir(dir.path())
-        .authority_public_key(authority_key())
         .authority_domain(DOMAIN)
         .start_mode(CoordinationStart::Bootstrap {
             signed_genesis: signed_genesis(&[(node_id.clone(), ticket)], 2),
@@ -224,7 +223,6 @@ async fn a_one_voter_group_will_not_start_without_its_acknowledgement() {
 
     let config = CoordinationConfig::builder()
         .storage_dir(dir.path())
-        .authority_public_key(authority_key())
         .authority_domain(DOMAIN)
         .start_mode(CoordinationStart::Bootstrap {
             signed_genesis: signed_genesis(&[(node_id.clone(), ticket)], 2),
@@ -307,7 +305,6 @@ async fn a_genesis_from_another_authority_is_refused_at_start() {
 
     let config = CoordinationConfig::builder()
         .storage_dir(dir.path())
-        .authority_public_key(authority_key())
         .authority_domain(DOMAIN)
         .start_mode(CoordinationStart::Bootstrap {
             signed_genesis: signed,
@@ -358,7 +355,6 @@ async fn a_node_outside_the_initial_voters_cannot_bootstrap() {
 
     let config = CoordinationConfig::builder()
         .storage_dir(dir.path())
-        .authority_public_key(authority_key())
         .authority_domain(DOMAIN)
         .start_mode(CoordinationStart::Bootstrap {
             signed_genesis: signed_genesis(&[(stranger.clone(), ticket)], 2),
@@ -425,7 +421,6 @@ async fn a_bootstrapped_group_reopens_through_existing() {
         .builtin_coordination(
             CoordinationConfig::builder()
                 .storage_dir(dir.path())
-                .authority_public_key(authority_key())
                 .authority_domain(DOMAIN)
                 .start_mode(CoordinationStart::Bootstrap {
                     signed_genesis: genesis.clone(),
@@ -455,7 +450,6 @@ async fn a_bootstrapped_group_reopens_through_existing() {
         .builtin_coordination(
             CoordinationConfig::builder()
                 .storage_dir(dir.path())
-                .authority_public_key(authority_key())
                 .authority_domain(DOMAIN)
                 .start_mode(CoordinationStart::Existing {
                     // The same document: a restart may still have to propose

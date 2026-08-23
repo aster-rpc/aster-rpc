@@ -424,7 +424,6 @@ mod tests {
         tweak(
             CoordinationConfig::builder()
                 .storage_dir("/tmp/does-not-need-to-exist")
-                .authority_public_key(a.public_key)
                 .authority_domain(a.domain)
                 .start_mode(start)
                 .verified_admission(Arc::new(source_admitting(&[LOCAL]))),

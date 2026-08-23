@@ -1076,9 +1076,25 @@ fn apply_genesis(
     }
 
     // 4. First installation only: the membership the group actually formed
-    //    with. `raft.initialize` was given this set, so a committed membership
-    //    that disagrees means one of the two was not derived from this
-    //    document.
+    //    with, and **exactly** that.
+    //
+    //    All three parts. `raft.initialize` was given a uniform set with no
+    //    learners, so anything else at first installation means the group did
+    //    not form from this document — and comparing the voter projection
+    //    alone would admit a genesis installed over a joint configuration, or
+    //    over one carrying learners the document never named. A ROOT learner
+    //    is precisely that shape: initial voters plus ROOT in the node map
+    //    matches on voters and differs everywhere it matters.
+    if state.membership.joint {
+        return Err(refuse(
+            "a genesis installs into a uniform membership, and this one is joint".into(),
+        ));
+    }
+    if !state.membership.learners.is_empty() {
+        return Err(refuse(
+            "a genesis installs into a membership with no learners".into(),
+        ));
+    }
     let initial: BTreeSet<NodeId> = verified
         .initial_voters()
         .iter()

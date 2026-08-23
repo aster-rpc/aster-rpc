@@ -215,7 +215,6 @@ async fn start_group(secrets: &[[u8; 32]], profile: i32, acknowledge: bool) -> V
         let dir = tempfile::tempdir().expect("a storage directory");
         let mut builder = CoordinationConfig::builder()
             .storage_dir(dir.path())
-            .authority_public_key(authority_key())
             .authority_domain(DOMAIN)
             .start_mode(CoordinationStart::Bootstrap {
                 signed_genesis: genesis.clone(),
@@ -541,7 +540,6 @@ async fn a_three_voter_group_reforms_after_a_full_restart() {
             .builtin_coordination(
                 CoordinationConfig::builder()
                     .storage_dir(dirs[i].path())
-                    .authority_public_key(authority_key())
                     .authority_domain(DOMAIN)
                     .start_mode(CoordinationStart::Bootstrap {
                         signed_genesis: genesis.clone(),
@@ -599,7 +597,6 @@ async fn a_three_voter_group_reforms_after_a_full_restart() {
             .builtin_coordination(
                 CoordinationConfig::builder()
                     .storage_dir(dirs[i].path())
-                    .authority_public_key(authority_key())
                     .authority_domain(DOMAIN)
                     .start_mode(CoordinationStart::Existing {
                         signed_genesis: genesis.clone(),

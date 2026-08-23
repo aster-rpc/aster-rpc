@@ -540,6 +540,20 @@ impl StateActor {
                     // it means a controller ignored that -- and persisting it
                     // would leave a store that applied cleanly and cannot
                     // reopen, which is the worst place to find out.
+                    // §8.1: ROOT is never a committed member. Enforced here as
+                    // well as at admission, and from the same predicate the
+                    // loader uses — admission checks do not see a forced native
+                    // entry from a non-conforming leader, and a rule that lives
+                    // only there is a rule a store can be made to violate.
+                    if rows::membership_names_root(membership, &working.model.authority.public_key)
+                    {
+                        return Err(StorageError::corrupt(
+                            Db::State,
+                            "membership",
+                            "a membership entry names the deployment ROOT; ROOT is never a \
+                             committed voter or learner",
+                        ));
+                    }
                     if projection.learners.len()
                         > crate::coordination::model::shape::MAX_LEARNER_ENVELOPE
                     {
@@ -2627,6 +2641,59 @@ mod tests {
         let (applied, membership) = machine.applied_state().await.expect("applied state");
         assert_eq!(applied, None, "nothing was written");
         assert!(membership.membership().nodes().next().is_none());
+    }
+
+    /// **A native membership entry naming ROOT is refused before it is
+    /// written** (§8.1), in either role.
+    ///
+    /// The durable half of the rule. `verify_genesis` and `plan_shape` refuse a
+    /// genesis and a plan that name ROOT, but neither is on this path: a forced
+    /// entry from a non-conforming leader reaches the state machine directly.
+    /// A rule enforced only at admission is a rule a store can be made to hold
+    /// in violation of — and this store would then apply cleanly and fail to
+    /// reopen, since the loader refuses the same shape from the same predicate.
+    #[tokio::test]
+    async fn a_membership_entry_naming_root_is_refused_before_it_is_written() {
+        use openraft::Membership;
+
+        for as_voter in [true, false] {
+            let dir = scratch_dir();
+            let (mut machine, shutdown, _drain) = machine(&dir);
+
+            let root = CoordinationNodeId::from_array(
+                crate::coordination::storage::fixture::authority_public_key(),
+            );
+            let mut voters: std::collections::BTreeSet<CoordinationNodeId> = (1u8..=3)
+                .map(|b| CoordinationNodeId::from_array([b; 32]))
+                .collect();
+            if as_voter {
+                voters.insert(root);
+            }
+            let mut nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+                voters.iter().map(|id| (*id, CoordinationNode)).collect();
+            // As a learner: in the node map, in no configuration.
+            nodes.insert(root, CoordinationNode);
+
+            let err = machine
+                .apply([Entry {
+                    log_id: log_id(1),
+                    payload: EntryPayload::Membership(Membership::new(vec![voters], nodes)),
+                }])
+                .await
+                .expect_err("ROOT is never a committed member");
+            assert!(
+                format!("{err:?}").contains("ROOT"),
+                "the refusal must name the rule: {err:?}"
+            );
+            assert!(machine.handle().is_fatal());
+
+            drop(shutdown);
+            drop(machine);
+            let (mut machine, _shutdown, _drain) = reopen(&dir);
+            let (applied, membership) = machine.applied_state().await.expect("applied state");
+            assert_eq!(applied, None, "nothing was written");
+            assert!(membership.membership().nodes().next().is_none());
+        }
     }
 
     /// The §7.3 shrink that `retain = true` would have made unloadable.

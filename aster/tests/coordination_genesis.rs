@@ -762,3 +762,228 @@ fn root_cannot_be_founded_as_a_member() {
         "the refusal must name the rule, got {err:?}"
     );
 }
+
+/// **An interrupted bootstrap recovers: bound storage, no membership.**
+///
+/// The real cut, which the restart-after-`Ready` gate does not construct. A
+/// fresh open commits both identity bindings *before* `Raft::initialize` runs,
+/// so a crash in between leaves a directory that is bound and has no
+/// membership. `Bootstrap` then refuses it — the directory is no longer
+/// `Fresh` — and if `Existing` also did nothing the group could never elect,
+/// never propose its genesis, and never leave `NoQuorum`, with no error to
+/// explain it.
+///
+/// The fixture binds the directory through the production storage path and
+/// stops, which is exactly the state a crash there leaves. Restarting through
+/// `Existing` must then complete the founding: elect, install the genesis,
+/// reach `Ready`, and authorize.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_bootstrap_recovers_through_existing() {
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x0A, 1);
+    let dir = tempfile::tempdir().expect("a storage directory");
+
+    // Bind, and stop before `Raft::initialize`.
+    fixture.bind_without_initializing_for_testing(dir.path(), 0);
+
+    // `Bootstrap` is no longer available: the directory is bound.
+    let refused = AsterServer::builder()
+        .config(fixture.aster_config(0))
+        .builtin_coordination(fixture.config(dir.path(), 0))
+        .start()
+        .await;
+    assert!(
+        refused.is_err(),
+        "a bound directory is not a Bootstrap target"
+    );
+
+    // `Existing` is, and it must finish what the interrupted start began.
+    let server = AsterServer::builder()
+        .config(fixture.aster_config(0))
+        .builtin_coordination(fixture.existing_config(dir.path()))
+        .start()
+        .await
+        .expect("the interrupted bootstrap reopens");
+    let coordination = server.coordination().expect("hosted");
+    tokio::time::timeout(PATIENCE, coordination.wait_ready())
+        .await
+        .expect("a recovered voter reaches Ready in time")
+        .expect("ready");
+
+    assert!(
+        coordination.genesis_installed_for_testing().await,
+        "the recovered voter installed the genesis it was interrupted before"
+    );
+    let committed = coordination
+        .propose_for_testing_within(set_grant(&fixture, 0, "after-recovery"), PATIENCE)
+        .await
+        .expect("the grant commits");
+    assert_eq!(
+        outcome_of(&committed),
+        (GRANT_UPDATED, NO_REASON),
+        "a recovered group can authorize"
+    );
+
+    server.shutdown().await;
+}
+
+/// **A correctly signed *alternative* genesis for the same group is fatal.**
+///
+/// The earlier version used another ROOT and another group, so it never reached
+/// past the first check — a document that does not verify is refused for the
+/// signature, which proves nothing about the "two genesis documents for one
+/// group" rule. This one is signed by the *same* ROOT, names the *same* group
+/// and domain, and differs only in its nonce, so it verifies cleanly and is
+/// refused on the binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alternative_genesis_for_the_same_group_is_fatal() {
+    use aster::coordination::model::authority::{
+        canonical_document_bytes, genesis_signing_bytes, signed_document_from_parts,
+    };
+    use aster::coordination::raft::{GenesisV1, NodeIdV1 as WireNodeId, VoterSeedV1};
+
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x0B, 1);
+    let voter = start(&fixture).await;
+    let coordination = voter.coordination();
+    let before = coordination
+        .last_applied_for_testing()
+        .expect("an applied index");
+
+    // Same ROOT, same group, same domain, same voters — a different nonce, so a
+    // different document with a different hash.
+    let ticket = aster_transport_core::ticket::AsterTicket {
+        endpoint_id: fixture.node_id(0).try_into().expect("32 bytes"),
+        relay: None,
+        direct_addrs: Vec::new(),
+        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
+    }
+    .to_base58_string()
+    .expect("a canonical ticket");
+    let genesis = GenesisV1 {
+        format_version: 1,
+        group_id: vec![SEED ^ 0x0B; 32],
+        authority_domain: DOMAIN.into(),
+        // The one difference.
+        genesis_nonce: vec![0xFEu8; 32],
+        deployment_profile_code: 2,
+        initial_voters: vec![VoterSeedV1 {
+            node_id: fixture.node_id(0),
+            ticket,
+        }],
+        initial_admins: vec![WireNodeId {
+            node_id: fixture.node_id(0),
+        }],
+        recovery_export_hash: None,
+    };
+    let document = canonical_document_bytes(&genesis).expect("encode");
+    let signature = fixture.sign_for_testing(&genesis_signing_bytes(&document));
+    let alternative =
+        signed_document_from_parts(document, &fixture.authority_key(), &signature).expect("encode");
+    assert_ne!(
+        alternative,
+        fixture.signed_genesis(),
+        "the fixture must produce a genuinely different document"
+    );
+
+    let outcome = coordination
+        .propose_for_testing_within(
+            CommandV1::Genesis(GenesisCommandV1 {
+                signed_genesis: alternative,
+            }),
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a second genesis for this group must not be accepted: {outcome:?}"
+    );
+    assert!(
+        coordination.last_applied_for_testing() <= Some(before),
+        "a refused genesis must not advance the applied index"
+    );
+
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        if coordination.lifecycle_code() == 6 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "two genesis documents for one group is fatal, reported {}",
+            coordination.lifecycle_code()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    voter.server.shutdown().await;
+}
+
+/// **A membership plan naming ROOT is refused.**
+///
+/// The second door. `verify_genesis` closes the first; without this a group
+/// founded correctly could have ROOT added by an ordinary change. Shapeless
+/// rather than reason-coded, because it does not depend on replicated state —
+/// ROOT is ROOT at every revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_membership_plan_naming_root_is_refused() {
+    use aster::coordination::contract::{ChangeMembershipActionV1, NodeIdV1};
+
+    let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x0C, 1);
+    let voter = start(&fixture).await;
+    let coordination = voter.coordination();
+
+    for (label, voters, learners) in [
+        ("as a voter", vec![fixture.authority_key().to_vec()], vec![]),
+        (
+            "as a learner",
+            vec![fixture.node_id(0)],
+            vec![fixture.authority_key().to_vec()],
+        ),
+    ] {
+        let action = ActionV1::ChangeMembership(ChangeMembershipActionV1 {
+            operation_id: aster::coordination::testing::id16(label.as_bytes()),
+            expected_membership_log_id: coordination.membership_log_id_for_testing(),
+            desired_voters: voters
+                .into_iter()
+                .map(|node_id| NodeIdV1 { node_id })
+                .collect(),
+            retained_learners: learners
+                .into_iter()
+                .map(|node_id| NodeIdV1 { node_id })
+                .collect(),
+            member_seeds: Vec::new(),
+        });
+        let committed = coordination
+            .propose_for_testing_within(
+                CommandV1::Client(ClientCommandV1 {
+                    actor_node_id: fixture.node_id(0),
+                    client_id: aster::coordination::testing::id16(label.as_bytes()),
+                    sequence: 1,
+                    request_hash: aster::coordination::hash::request_hash(&action)
+                        .expect("a canonical action hashes")
+                        .to_vec(),
+                    action,
+                }),
+                PATIENCE,
+            )
+            .await
+            .expect("the plan commits");
+        // `(100, 0)` — shapeless. A reason-coded refusal would say the rule
+        // depends on replicated state, and it does not.
+        assert_eq!(
+            outcome_of(&committed),
+            (REJECTED, NO_REASON),
+            "a plan naming ROOT {label} must be refused as shapeless"
+        );
+    }
+
+    // And the membership is untouched.
+    assert!(
+        !coordination
+            .committed_nodes_for_testing()
+            .iter()
+            .any(|node| node.as_bytes() == &fixture.authority_key()),
+        "ROOT never enters the committed membership"
+    );
+
+    voter.server.shutdown().await;
+}
