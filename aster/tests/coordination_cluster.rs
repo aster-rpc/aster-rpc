@@ -533,3 +533,122 @@ async fn a_three_voter_group_reforms_after_a_full_restart() {
         server.shutdown().await;
     }
 }
+
+/// **No unauthorized identity reaches OpenRaft.**
+///
+/// A fourth node, cryptographically real and perfectly able to dial, is absent
+/// from both the signed genesis and the admission set. It speaks the §5.3
+/// protocol correctly — a well-formed envelope, a real vote request, its own
+/// authenticated NodeId — and is refused.
+///
+/// Two refusals are checked, because they are different failures and a single
+/// one would leave the other untested:
+///
+/// * a **well-formed, correctly-addressed** call from an unlisted node, which
+///   must fail admission or the allowlist and never reach a handler; and
+/// * the same node claiming *someone else's* `sender_node_id` in the envelope,
+///   which must fail against the authenticated peer regardless of what the
+///   payload says.
+///
+/// The second is the one that matters most: it is the only way a remote could
+/// select a local role from payload bytes, and §5.3 exists to make it
+/// impossible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unauthorized_identity_never_reaches_openraft() {
+    use aster::coordination::contract::payload_fory;
+    use aster::coordination::raft::{RaftEnvelopeV1, RaftMessageV1, VoteRequestV1, VoteV1};
+    use aster::rpc::StreamHeader;
+
+    let secrets = [[0x71u8; 32], [0x72u8; 32], [0x73u8; 32]];
+    let voters = start_group(&secrets, 1, false).await;
+    let leader = await_leader(&voters, "the target group").await;
+    let target = voters[leader].server.node().addr();
+
+    // The stranger: a real endpoint, a real key, and no place in the group.
+    let stranger_secret = [0x7Fu8; 32];
+    let stranger_id = node_id_of(stranger_secret);
+    let stranger = aster::Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(SecretKey::from_bytes(stranger_secret))
+            .build(),
+    )
+    .await
+    .expect("the stranger starts");
+    stranger
+        .add_node_addr(target.clone())
+        .expect("the stranger can reach the group");
+
+    let vote = RaftMessageV1::VoteRequest(VoteRequestV1 {
+        vote: VoteV1 {
+            term: 99,
+            leader_node_id: stranger_id.clone(),
+            committed: false,
+        },
+        last_log_id: None,
+    });
+    let payload = payload_fory::<RaftMessageV1>()
+        .serialize(&vote)
+        .expect("encode");
+
+    let call = |sender_node_id: Vec<u8>| {
+        let envelope = RaftEnvelopeV1 {
+            protocol_version: 1,
+            raft_codec_version: 1,
+            group_id: GROUP.to_vec(),
+            sender_node_id,
+            payload: payload.clone(),
+        };
+        payload_fory::<RaftEnvelopeV1>()
+            .serialize(&envelope)
+            .expect("encode")
+    };
+
+    let header = StreamHeader {
+        service: aster::coordination::service::RAFT_SERVICE.to_string(),
+        method: "vote".to_string(),
+        version: 1,
+        ..Default::default()
+    };
+
+    let connection = stranger
+        .rpc_connect(&aster::NodeId::from_hex(
+            target.node_id.as_str().to_string(),
+        ))
+        .await
+        .expect("the stranger connects to a live voter");
+
+    // 1. Honest about who it is, and simply not a member.
+    let honest = connection
+        .unary(&header, call(stranger_id.clone()))
+        .await
+        .expect_err("an unlisted node must be refused");
+    let honest = honest.to_string();
+    assert!(
+        honest.contains("admission denied") || honest.contains("not a member"),
+        "an unlisted node must fail admission or the allowlist, got: {honest}"
+    );
+
+    // 2. Claiming a real voter's identity in the envelope. The authenticated
+    //    peer is still the stranger, and that is what decides.
+    let impersonating = connection
+        .unary(&header, call(node_id_of(secrets[0])))
+        .await
+        .expect_err("a forged sender must be refused");
+    let impersonating = impersonating.to_string();
+    assert!(
+        impersonating.contains("does not match the authenticated peer"),
+        "identity must come from the handshake, never from the payload; got: {impersonating}"
+    );
+
+    // And the group is unharmed: it still has a leader, and its term was not
+    // moved by a vote request from outside. A refusal that reached OpenRaft
+    // first would have bumped it.
+    exactly_one_leader_claims_quorum(&voters, "after the intrusion");
+
+    stranger.shutdown().await;
+    for voter in voters {
+        voter.server.shutdown().await;
+    }
+}

@@ -1274,6 +1274,79 @@ mod tests {
         );
     }
 
+    /// **A new generation carries nothing but the catch-up barrier.**
+    ///
+    /// This is what makes "membership resumes across leader loss" true rather
+    /// than hoped for: a generation that started mid-intent derives every
+    /// decision from durable intent and committed membership, so it reaches the
+    /// same step the old one would have. `next_step` is a pure function of
+    /// those two, and the tests above cover its table; what this adds is that
+    /// the *loop* has nothing else to restore.
+    ///
+    /// The barrier is the one exception, and it is deliberate: §7.3 measures
+    /// catch-up against the index observed when the promotion step began, so a
+    /// new generation observes a fresh one — correct, because it has
+    /// re-observed everything else too.
+    ///
+    /// A source guard, because the property is about state that does not exist.
+    /// No behavioural test can observe a field nobody wrote.
+    #[test]
+    fn a_generation_carries_no_state_but_its_barrier() {
+        let source = include_str!("membership.rs");
+        let end = crate::coordination::guards::production_end(source);
+        let production = &source[..end];
+
+        let at = production
+            .find("pub(crate) async fn run_generation(")
+            .expect("the controller loop exists");
+        let body_end = production[at..]
+            .find("\n/// How long the controller waits")
+            .expect("the loop is followed by IDLE_POLL");
+        let body = &production[at..at + body_end];
+
+        // Only the **prologue** — what is declared before `loop {` and
+        // therefore survives a pass. A `let mut` inside a match arm is a
+        // per-pass local and carries nothing; counting those would make the
+        // guard fail for code that is exactly right.
+        let loop_at = body.find("\n    loop {").expect("the controller loops");
+        let prologue = &body[..loop_at];
+        let carried: Vec<&str> = prologue
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .filter(|code| code.trim_start().starts_with("let mut "))
+            .collect();
+        assert_eq!(
+            carried.len(),
+            1,
+            "the loop must carry exactly one value across passes — the catch-up \
+             barrier; found {carried:?}"
+        );
+        assert!(
+            carried[0].contains("barrier"),
+            "the one carried value must be the barrier: {}",
+            carried[0].trim()
+        );
+
+        // And it is dropped whenever the intent changes or reconciliation
+        // restarts, so it cannot describe a set that has moved.
+        assert!(
+            body.contains("barrier = None"),
+            "the barrier must be dropped when the intent changes or a \
+             reconciliation restarts"
+        );
+
+        // Nothing counts attempts. §7.3 forbids deciding an intent's fate from
+        // a local retry count, which resets on failover.
+        for forbidden in ["retries", "attempt", "retry_count", "elapsed"] {
+            assert!(
+                !body.contains(forbidden),
+                "the loop must not count {forbidden:?}: a counter lives in one leader \
+                 generation and would make an intent's fate depend on which node was \
+                 leader and for how long"
+            );
+        }
+    }
+
     /// A generation that has been superseded stops, whatever the metrics say.
     #[test]
     fn a_superseded_generation_stops_leading() {
