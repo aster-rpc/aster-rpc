@@ -77,6 +77,11 @@ pub mod typeconfig;
 #[cfg(feature = "coordination")]
 pub(crate) mod storage;
 
+/// The Slice 3 internal test harness (§S3-E, §S3-F). Never enabled by a
+/// shipping profile; see the module docs for why it is one method.
+#[cfg(feature = "coordination-testing")]
+pub mod testing;
+
 /// A handle on a running coordination voter (§3.3).
 ///
 /// The public surface Slice 3 owns: readiness, and the lifecycle a caller
@@ -88,6 +93,13 @@ pub(crate) mod storage;
 #[derive(Clone)]
 pub struct Coordination {
     readiness: runtime::readiness::Readiness,
+    /// The seam's handle onto the running `Raft`.
+    ///
+    /// Gated with the seam that reads it, so a shipping build carries neither
+    /// the field nor a method that could reach it. Cloning a `Raft` is an
+    /// `Arc` bump, so this costs the handle nothing when it is present.
+    #[cfg(feature = "coordination-testing")]
+    raft: openraft::Raft<typeconfig::CoordinationTypeConfig>,
 }
 
 #[cfg(feature = "coordination")]
@@ -95,6 +107,8 @@ impl Coordination {
     pub(crate) fn of(rt: &runtime::owner::CoordinationRuntime) -> Self {
         Self {
             readiness: rt.readiness(),
+            #[cfg(feature = "coordination-testing")]
+            raft: rt.raft().clone(),
         }
     }
 

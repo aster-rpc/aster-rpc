@@ -136,7 +136,7 @@ impl Schedule {
     }
 
     fn side(&self, node: &CoordinationNodeId, epoch: u64) -> bool {
-        self.draw(node, epoch, 3) % 2 == 0
+        self.draw(node, epoch, 3).is_multiple_of(2)
     }
 
     /// splitmix64 over BLAKE3 of the inputs.

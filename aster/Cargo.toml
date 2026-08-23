@@ -30,6 +30,16 @@ rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"
 # --depth 1` and the full feature graph with `-e features`.
 coordination-client = ["rpc", "dep:blake3"]
 coordination = ["coordination-client", "dep:openraft", "dep:redb", "dep:ed25519-dalek", "dep:windows-sys"]
+# The Slice 3 internal test harness (contract matrix §S3-E, §S3-F). Adds no
+# dependency: it exposes one already-existing production path -- proposing a
+# command through `Raft::client_write` -- so that gate tests can seed accepted
+# intents and generate committed traffic without a partial Store RPC, which
+# §6.2 forbids before Slice 4.
+#
+# It is deliberately *not* implied by `coordination`, and no shipping profile
+# turns it on. `scripts/check-coordination-deps.sh` asserts the default and
+# `coordination` graphs do not enable it.
+coordination-testing = ["coordination"]
 discovery = []
 hooks = []
 metrics = []

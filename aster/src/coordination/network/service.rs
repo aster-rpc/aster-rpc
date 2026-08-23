@@ -38,9 +38,10 @@ use openraft::Raft;
 use tokio::sync::RwLock;
 
 use super::admit::{
-    admit, AdmissionContext, Refusal, SenderAllowlist, PROTOCOL_VERSION, RAFT_CODEC_VERSION,
+    admit, admit_identity, AdmissionContext, ClaimedIdentity, Refusal, SenderAllowlist,
+    PROTOCOL_VERSION, RAFT_CODEC_VERSION,
 };
-use super::handoff::{AdmittedHeader, SnapshotStreamReceiver, StreamRefusal};
+use super::handoff::{AdmittedHeader, InstallRefusal, SnapshotStreamReceiver, StreamRefusal};
 use crate::coordination::admission::VerifiedAdmissionSource;
 use crate::coordination::contract::payload_fory;
 use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
@@ -350,34 +351,14 @@ async fn install_snapshot(runtime: &AttachedRuntime, mut call: Call) {
         return;
     };
 
-    let members = committed_members(runtime);
-    let recheck = |members: &BTreeSet<CoordinationNodeId>| -> Result<(), Refusal> {
-        let ctx = AdmissionContext {
-            group: &runtime.group,
-            admission: runtime.admission.as_ref(),
-            allowlist: &runtime.allowlist,
-            members,
-        };
-        // The header is re-admitted rather than a cached verdict replayed:
-        // §8.4's recheck is about the *current* policy, and a saved answer is
-        // the previous one by definition.
-        admit(&ctx, "install_snapshot", provenance, &peer, &first).map(|_| ())
-    };
-
     // The header is a `RaftSnapshotFrameV1`, not a `RaftEnvelopeV1`, so the
-    // §5.3 checks that read an envelope do not apply to it directly. What does
-    // apply — provenance, group, sender, admission, allowlist — is checked
-    // against the header's own fields below, in the same order.
-    let frame: RaftSnapshotFrameV1 = match payload_fory::<RaftSnapshotFrameV1>().deserialize(&first)
-    {
+    // envelope decode of step 2a does not apply to it. Everything else does,
+    // and it is the *same* code: the header's claims are named as a
+    // `ClaimedIdentity` and go through `admit_identity`.
+    let frame = match decode_snapshot_frame(&first) {
         Ok(frame) => frame,
-        Err(_) => {
-            let _ = call
-                .finish(&RpcStatus::error(
-                    StatusCode::InvalidArgument,
-                    "the snapshot stream header will not decode",
-                ))
-                .await;
+        Err(status) => {
+            let _ = call.finish(&status).await;
             return;
         }
     };
@@ -391,8 +372,25 @@ async fn install_snapshot(runtime: &AttachedRuntime, mut call: Call) {
         return;
     };
 
-    if let Err(status) = check_snapshot_header(runtime, provenance, &peer, &header, &members) {
-        let _ = call.finish(&status).await;
+    // One closure, used for the initial admission **and** every recheck. Not
+    // two code paths that ought to agree: the previous revision admitted the
+    // header one way and rechecked it another, and the recheck was the copy
+    // that could not work.
+    let recheck = |members: &BTreeSet<CoordinationNodeId>| -> Result<(), Refusal> {
+        let ctx = AdmissionContext {
+            group: &runtime.group,
+            admission: runtime.admission.as_ref(),
+            allowlist: &runtime.allowlist,
+            members,
+        };
+        // Re-admitted rather than a cached verdict replayed: §8.4's recheck is
+        // about the *current* policy, and a saved answer is the previous one by
+        // definition.
+        admit_identity(&ctx, provenance, &peer, &header_claim(&header)).map(|_| ())
+    };
+
+    if let Err(refusal) = recheck(&committed_members(runtime)) {
+        let _ = call.finish(&refusal.status()).await;
         return;
     }
 
@@ -425,19 +423,13 @@ async fn install_snapshot(runtime: &AttachedRuntime, mut call: Call) {
             let _ = call.finish(&refusal.status()).await;
             return;
         }
-        let frame: RaftSnapshotFrameV1 =
-            match payload_fory::<RaftSnapshotFrameV1>().deserialize(&bytes) {
-                Ok(frame) => frame,
-                Err(_) => {
-                    let _ = call
-                        .finish(&RpcStatus::error(
-                            StatusCode::InvalidArgument,
-                            "a snapshot chunk will not decode",
-                        ))
-                        .await;
-                    return;
-                }
-            };
+        let frame = match decode_snapshot_frame(&bytes) {
+            Ok(frame) => frame,
+            Err(status) => {
+                let _ = call.finish(&status).await;
+                return;
+            }
+        };
         let RaftSnapshotFrameV1::Chunk(chunk) = frame else {
             let _ = call
                 .finish(&RpcStatus::error(
@@ -494,80 +486,72 @@ async fn install_snapshot(runtime: &AttachedRuntime, mut call: Call) {
                 }
             }
         }
+        // A leader declining to install is not a fault on either side, and
+        // answering `Internal` would latch a peer fault on a node that is
+        // healthy and leading.
+        Err(err @ InstallRefusal::NotAFollower) => {
+            let _ = call
+                .finish(&RpcStatus::error(
+                    StatusCode::FailedPrecondition,
+                    err.to_string(),
+                ))
+                .await;
+        }
         Err(err) => {
             let _ = call.finish(&fatal_status(&err)).await;
         }
     }
 }
 
-/// The §5.3 header checks, in the same order [`admit`] applies to an envelope.
+/// A snapshot header's four identity claims, named for the shared check order.
 ///
-/// A snapshot header is not a `RaftEnvelopeV1`, so it cannot go through
-/// `admit` directly — but the *questions* are identical and the order is the
-/// same one, which is why they are written here in that order rather than in
-/// whatever sequence the fields happen to appear.
-fn check_snapshot_header(
-    runtime: &AttachedRuntime,
-    provenance: crate::rpc::PeerProvenance,
-    peer: &str,
+/// This is the *whole* snapshot-specific part of steps 1–4: which fields carry
+/// the claims. What is then done with them is [`admit_identity`], the same
+/// function the unary path uses — so there is no second transcription of the
+/// order to drift, and no way for the snapshot path to be checked by rules the
+/// unary path does not have or vice versa.
+fn header_claim(
     header: &crate::coordination::raft::RaftSnapshotHeaderWireV1,
-    members: &BTreeSet<CoordinationNodeId>,
-) -> Result<CoordinationNodeId, RpcStatus> {
-    // 1. Transport identity.
-    if !provenance.is_authenticated() {
-        return Err(RpcStatus::error(
-            StatusCode::Unauthenticated,
-            "the coordination Raft service requires an authenticated Iroh peer",
-        ));
+) -> ClaimedIdentity<'_> {
+    ClaimedIdentity {
+        protocol_version: header.protocol_version,
+        raft_codec_version: header.raft_codec_version,
+        group_id: &header.group_id,
+        sender_node_id: &header.sender_node_id,
     }
-    let sender = CoordinationNodeId::parse_hex(peer).map_err(|_| {
-        RpcStatus::error(
-            StatusCode::Unauthenticated,
-            "the authenticated peer is not a coordination node id",
-        )
-    })?;
+}
 
-    // 2. Version, group, sender width, sender == peer.
-    if header.protocol_version != PROTOCOL_VERSION
-        || header.raft_codec_version != RAFT_CODEC_VERSION
-    {
+/// Decode one snapshot frame and prove it is its own canonical encoding.
+///
+/// §5.1 refuses trailing internal-codec bytes **before dispatch**, and Fory
+/// tolerates them. The header's two nested payloads are checked separately
+/// inside `AdmittedHeader::decode`, but that check cannot see the frame that
+/// carried them: bytes appended after a valid `RaftSnapshotFrameV1` leave every
+/// nested payload canonical while the frame itself has a second spelling.
+fn decode_snapshot_frame(bytes: &[u8]) -> Result<RaftSnapshotFrameV1, RpcStatus> {
+    let frame: RaftSnapshotFrameV1 = payload_fory::<RaftSnapshotFrameV1>()
+        .deserialize(bytes)
+        .map_err(|_| {
+            RpcStatus::error(
+                StatusCode::InvalidArgument,
+                "the snapshot frame will not decode",
+            )
+        })?;
+    let reencoded = payload_fory::<RaftSnapshotFrameV1>()
+        .serialize(&frame)
+        .map_err(|_| {
+            RpcStatus::error(
+                StatusCode::InvalidArgument,
+                "the snapshot frame could not be re-encoded",
+            )
+        })?;
+    if reencoded != bytes {
         return Err(RpcStatus::error(
             StatusCode::InvalidArgument,
-            "the snapshot stream is not protocol v1",
+            "the snapshot frame is not its own canonical encoding",
         ));
     }
-    if header.group_id != runtime.group.as_bytes() {
-        return Err(RpcStatus::error(
-            StatusCode::PermissionDenied,
-            "this node does not serve that group",
-        ));
-    }
-    let claimed = CoordinationNodeId::from_slice(&header.sender_node_id).map_err(|_| {
-        RpcStatus::error(
-            StatusCode::InvalidArgument,
-            "the header's sender_node_id is not a node id",
-        )
-    })?;
-    if claimed != sender {
-        return Err(RpcStatus::error(
-            StatusCode::PermissionDenied,
-            "the header's sender does not match the authenticated peer",
-        ));
-    }
-
-    // 3. Producer admission.
-    crate::coordination::admission::decide(runtime.admission.as_ref(), sender)
-        .map_err(|_| RpcStatus::error(StatusCode::PermissionDenied, "producer admission denied"))?;
-
-    // 4. The allowlist.
-    if !runtime.allowlist.permits(&sender, members) {
-        return Err(RpcStatus::error(
-            StatusCode::PermissionDenied,
-            "the sender is not a member of this group",
-        ));
-    }
-
-    Ok(sender)
+    Ok(frame)
 }
 
 /// A stream refusal is the **sender's** problem except when it is not.
@@ -582,6 +566,7 @@ async fn refuse_stream(call: Call, refusal: &StreamRefusal) {
         StreamRefusal::Malformed(_)
         | StreamRefusal::NonContiguous { .. }
         | StreamRefusal::LengthMismatch { .. }
+        | StreamRefusal::Oversized { .. }
         | StreamRefusal::Incomplete => StatusCode::InvalidArgument,
     };
     let _ = call
@@ -738,21 +723,25 @@ mod tests {
         );
     }
 
-    /// The check order is not restated here.
+    /// Neither handler restates the check order; both delegate to `admit`.
     ///
-    /// `admit` owns it, and a second copy in this module would be a second
-    /// thing to get wrong — the ordering test only covers the copy it can see.
-    /// The snapshot header, which cannot go through `admit` because it is not a
-    /// `RaftEnvelopeV1`, is the one exception, and it is written in the same
-    /// order with the same questions.
+    /// This once exempted the snapshot path, on the grounds that a header is
+    /// not a `RaftEnvelopeV1` and so "cannot go through `admit`". The exemption
+    /// was the defect: the transcription that grew under it drifted into
+    /// calling the envelope-only `admit` with a header frame, which cannot
+    /// decode, so every per-chunk recheck refused and no snapshot was ever
+    /// received. Only the *decode* differs between the two frames, and
+    /// `ClaimedIdentity` is what separates it from the checks that do not.
+    ///
+    /// The subsystem-wide form — steps 1–4 exist in exactly one place across
+    /// every coordination source file — is in
+    /// [`coordination::guards`](crate::coordination::guards), because a rule
+    /// scanning one file is exempt from itself the moment a third handler
+    /// appears somewhere else.
     #[test]
-    fn the_unary_path_delegates_the_order_rather_than_repeating_it() {
+    fn neither_handler_restates_the_check_order() {
         let source = include_str!("service.rs");
-        let end = source
-            .rfind("\n#[cfg(test)]\nmod ")
-            .map(|at| at + 1)
-            .unwrap_or(source.len());
-        let production = &source[..end];
+        let production = &source[..crate::coordination::guards::production_end(source)];
 
         let unary_at = production
             .find("async fn unary(")
@@ -760,50 +749,29 @@ mod tests {
         let install_at = production
             .find("async fn install_snapshot(")
             .expect("the snapshot handler exists");
-        let unary_body = &production[unary_at..install_at];
 
         assert!(
-            unary_body.contains("admit(&ctx,"),
+            production[unary_at..install_at].contains("admit(&ctx,"),
             "the unary path must call admit"
         );
-        for own_check in ["is_authenticated()", "parse_hex(", "protocol_version !="] {
+        assert!(
+            production[install_at..].contains("admit_identity(&ctx,"),
+            "the snapshot path must call admit_identity"
+        );
+
+        // Neither may ask any of the questions itself. `header_claim` names the
+        // fields; it does not compare them.
+        for own_check in [
+            "is_authenticated()",
+            "parse_hex(",
+            "protocol_version !=",
+            "allowlist.permits(",
+            "admission::decide(",
+        ] {
             assert!(
-                !unary_body.contains(own_check),
-                "the unary path repeats {own_check:?} instead of delegating to admit"
+                !production[unary_at..].contains(own_check),
+                "a handler repeats {own_check:?} instead of delegating the order"
             );
         }
-    }
-
-    /// Admission is rechecked on **every** chunk and once before install, per
-    /// §8.4 — a stream outlives the decision that admitted it.
-    ///
-    /// Counted in the source because the property is about *how often* the
-    /// check runs, and a handler that checked once would pass every test that
-    /// drives a stream to completion under a policy that never changes.
-    #[test]
-    fn the_snapshot_path_rechecks_admission_per_chunk_and_before_install() {
-        let source = include_str!("service.rs");
-        let end = source
-            .rfind("\n#[cfg(test)]\nmod ")
-            .map(|at| at + 1)
-            .unwrap_or(source.len());
-        let install_at = source[..end]
-            .find("async fn install_snapshot(")
-            .expect("the snapshot handler exists");
-        let header_at = source[..end]
-            .find("fn check_snapshot_header(")
-            .expect("the header check exists");
-        let body = &source[install_at..header_at];
-
-        let rechecks = body.matches("recheck(&committed_members(runtime))").count();
-        assert_eq!(
-            rechecks, 2,
-            "admission must be rechecked inside the chunk loop and once more before \
-             install; found {rechecks} call sites"
-        );
-        assert!(
-            body.contains("while !receiver.is_complete()"),
-            "one of the two must be inside the chunk loop"
-        );
     }
 }

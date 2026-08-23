@@ -43,6 +43,12 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("rowstream.rs", include_str!("rowstream.rs")),
     ("service.rs", include_str!("service.rs")),
     ("start.rs", include_str!("start.rs")),
+    // Inventoried unconditionally, though it compiles only under
+    // `coordination-testing`. The inventory is about the *filesystem*: a file
+    // exempt from the guards while the feature is off is a file that could grow
+    // a second `install_full_snapshot` call site unobserved, and be turned on
+    // by a later profile.
+    ("testing.rs", include_str!("testing.rs")),
     ("typeconfig.rs", include_str!("typeconfig.rs")),
     ("model/adapter.rs", include_str!("model/adapter.rs")),
     ("model/admin.rs", include_str!("model/admin.rs")),
@@ -264,6 +270,82 @@ mod tests {
         assert!(
             sites[0].starts_with("network/handoff.rs"),
             "the single call site must be the handoff token's consuming method: {sites:?}"
+        );
+    }
+
+    /// **Steps 1–4 of the §5.3 check order exist in exactly one place**,
+    /// subsystem-wide.
+    ///
+    /// The order was written twice: once in `admit` for a unary envelope, once
+    /// transcribed into the Raft service for a snapshot header, on the reasoning
+    /// that a header is not an envelope and so cannot go through the same
+    /// function. Both copies were individually correct when written. Then the
+    /// snapshot path's per-chunk recheck was pointed at `admit` — the
+    /// *envelope* one — which cannot decode a header frame, so it refused at
+    /// step 2 every time and no node ever accepted a snapshot chunk. The
+    /// per-module ordering test could not see it, because it only ever read the
+    /// copy that was right.
+    ///
+    /// Only the decode differs between the two frames. Everything else is one
+    /// function taking a `ClaimedIdentity`, and this asserts it stays that way:
+    /// each question is asked from one line in the whole subsystem.
+    ///
+    /// A third frame type is welcome. It just has to name its claims rather
+    /// than re-answer them.
+    #[test]
+    fn the_check_order_is_implemented_once_subsystem_wide() {
+        let sites_of = |question: &str| {
+            let mut sites = Vec::new();
+            for (name, source) in SOURCES {
+                for (n, line) in production_code(source) {
+                    if line.contains(question) {
+                        sites.push(format!("{name}:{n}"));
+                    }
+                }
+            }
+            sites
+        };
+
+        // The inbound questions. Nothing but the check order may ask these:
+        // they are about whether to talk to a sender at all.
+        for question in [
+            "provenance.is_authenticated()",
+            "CoordinationNodeId::parse_hex(peer)",
+            "ctx.allowlist.permits(",
+            "decide(ctx.admission,",
+        ] {
+            let sites = sites_of(question);
+            assert_eq!(
+                sites.len(),
+                1,
+                "{question:?} must be asked in exactly one place — a second copy \
+                 of the check order is a second thing to get wrong, and the test \
+                 that reads one copy cannot see the other; found: {sites:?}"
+            );
+            assert!(
+                sites[0].starts_with("network/admit.rs"),
+                "{question:?} belongs to the check order, not to a handler: {sites:?}"
+            );
+        }
+
+        // The version check has **two** legitimate sites, and naming them is the
+        // guard rather than an exception to it. `admit.rs` refuses an inbound
+        // request; `client.rs` refuses a *response* from a peer we dialled.
+        // Those are opposite directions with no admission or allowlist question
+        // between them, and collapsing them would mean checking a reply against
+        // a sender's membership — which a reply does not have.
+        let versions = sites_of("!= PROTOCOL_VERSION");
+        assert_eq!(
+            versions.len(),
+            2,
+            "the protocol version is checked on the inbound request and on the \
+             reply, and nowhere else; found: {versions:?}"
+        );
+        assert!(
+            versions.iter().any(|s| s.starts_with("network/admit.rs"))
+                && versions.iter().any(|s| s.starts_with("network/client.rs")),
+            "the two version checks must be the request one and the reply one: \
+             {versions:?}"
         );
     }
 

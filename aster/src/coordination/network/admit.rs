@@ -188,6 +188,147 @@ pub(crate) struct AdmissionContext<'a> {
     pub(crate) members: &'a BTreeSet<CoordinationNodeId>,
 }
 
+/// The four identity claims steps 2–4 read, whichever frame carried them.
+///
+/// A unary `RaftEnvelopeV1` and a snapshot stream's
+/// `RaftSnapshotHeaderWireV1` are different types making the *same* four
+/// claims. Naming the claims apart from the frame that carried them is what
+/// lets **one** implementation of steps 1–4 serve both.
+///
+/// An earlier revision had two implementations — this one and a transcription
+/// of it in the snapshot service — and the snapshot path's per-chunk recheck
+/// reached for [`admit`], which decodes a `RaftEnvelopeV1`. A header frame is
+/// not one, so every recheck refused at step 2 and no snapshot chunk was ever
+/// accepted. Two copies of an order is two things to get wrong, and the copy
+/// the ordering test could see was the one that was right.
+pub(crate) struct ClaimedIdentity<'a> {
+    pub(crate) protocol_version: i32,
+    pub(crate) raft_codec_version: i32,
+    pub(crate) group_id: &'a [u8],
+    pub(crate) sender_node_id: &'a [u8],
+}
+
+/// Step 1: who the transport says is speaking.
+///
+/// Both halves. Provenance says the id was learned from an authenticated
+/// handshake; parsing says it is a node id at all. An HTTP caller whose
+/// principal string is identical to a voter's NodeId fails the first, and a
+/// malformed authenticated peer fails the second.
+fn transport_identity(
+    provenance: PeerProvenance,
+    peer: &str,
+) -> Result<CoordinationNodeId, Refusal> {
+    if !provenance.is_authenticated() {
+        return Err(Refusal::at(
+            1,
+            StatusCode::Unauthenticated,
+            "the coordination Raft service requires an authenticated Iroh peer",
+        ));
+    }
+    CoordinationNodeId::parse_hex(peer).map_err(|e| {
+        Refusal::at(
+            1,
+            StatusCode::Unauthenticated,
+            format!("the authenticated peer is not a coordination node id: {e}"),
+        )
+    })
+}
+
+/// Steps 2 (the claims), 3 and 4, against an already-authenticated sender.
+///
+/// Split from the frame decode because the decode differs per frame type and
+/// these checks do not. `sender` is the transport's answer from step 1; nothing
+/// here may substitute a value read out of the frame for it.
+fn check_claim(
+    ctx: &AdmissionContext<'_>,
+    sender: CoordinationNodeId,
+    claimed: &ClaimedIdentity<'_>,
+) -> Result<(), Refusal> {
+    if claimed.protocol_version != PROTOCOL_VERSION
+        || claimed.raft_codec_version != RAFT_CODEC_VERSION
+    {
+        // A permanent protocol fault. §5.4 refuses it rather than negotiating:
+        // v1 supports same-protocol rolling restarts only.
+        return Err(Refusal::at(
+            2,
+            StatusCode::InvalidArgument,
+            format!(
+                "protocol {}/codec {} is not v1",
+                claimed.protocol_version, claimed.raft_codec_version
+            ),
+        ));
+    }
+
+    if claimed.group_id != ctx.group.as_bytes() {
+        // `PermissionDenied` rather than `InvalidArgument`: the frame is well
+        // formed, and what is wrong is that it is addressed to a group this
+        // node is not. The reply names no local state.
+        return Err(Refusal::at(
+            2,
+            StatusCode::PermissionDenied,
+            "this node does not serve that group",
+        ));
+    }
+
+    // The width check is separate from the equality check below, so a
+    // truncated id is diagnosed as malformed rather than as impersonation.
+    let stated = CoordinationNodeId::from_slice(claimed.sender_node_id).map_err(|e| {
+        Refusal::at(
+            2,
+            StatusCode::InvalidArgument,
+            format!("the frame's sender_node_id is not a node id: {e}"),
+        )
+    })?;
+    if stated != sender {
+        return Err(Refusal::at(
+            2,
+            StatusCode::PermissionDenied,
+            "the frame's sender does not match the authenticated peer",
+        ));
+    }
+
+    // ── 3. Verified producer admission ───────────────────────────────────────
+    //
+    // Rechecked on **every** call, per §8.4: a decision made once outlives the
+    // policy that made it, and revocation has to take effect somewhere.
+    decide(ctx.admission, sender).map_err(|denial| {
+        Refusal::at(
+            3,
+            admission_status(&denial),
+            // The peer learns that it was denied, not why: which of the five
+            // denials it was is this node's operational state.
+            "producer admission denied",
+        )
+    })?;
+
+    // ── 4. The allowlist ─────────────────────────────────────────────────────
+    if !ctx.allowlist.permits(&sender, ctx.members) {
+        return Err(Refusal::at(
+            4,
+            StatusCode::PermissionDenied,
+            "the sender is not a member of this group",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Steps 1 through 4 for any frame carrying a [`ClaimedIdentity`].
+///
+/// The whole check order **except** the payload, which only a unary request
+/// has. A snapshot stream's header goes through this and stops here; its body
+/// is not a Raft message and has no step 5.
+pub(crate) fn admit_identity(
+    ctx: &AdmissionContext<'_>,
+    provenance: PeerProvenance,
+    peer: &str,
+    claimed: &ClaimedIdentity<'_>,
+) -> Result<CoordinationNodeId, Refusal> {
+    let sender = transport_identity(provenance, peer)?;
+    check_claim(ctx, sender, claimed)?;
+    Ok(sender)
+}
+
 /// Steps 1 through 5, in order, for one unary request.
 ///
 /// Returns at the **first** failure. `frame` is the envelope bytes; the inner
@@ -200,27 +341,13 @@ pub(crate) fn admit(
     frame: &[u8],
 ) -> Result<Admitted, Refusal> {
     // ── 1. Transport identity ────────────────────────────────────────────────
-    //
-    // Both halves. Provenance says the id was learned from an authenticated
-    // handshake; parsing says it is a node id at all. An HTTP caller whose
-    // principal string is identical to a voter's NodeId fails the first, and a
-    // malformed authenticated peer fails the second.
-    if !provenance.is_authenticated() {
-        return Err(Refusal::at(
-            1,
-            StatusCode::Unauthenticated,
-            "the coordination Raft service requires an authenticated Iroh peer",
-        ));
-    }
-    let sender = CoordinationNodeId::parse_hex(peer).map_err(|e| {
-        Refusal::at(
-            1,
-            StatusCode::Unauthenticated,
-            format!("the authenticated peer is not a coordination node id: {e}"),
-        )
-    })?;
+    let sender = transport_identity(provenance, peer)?;
 
-    // ── 2. The envelope, without its payload ─────────────────────────────────
+    // ── 2a. The envelope, without its payload ────────────────────────────────
+    //
+    // The decode is the one part of step 2 that is specific to this frame type,
+    // which is why it sits here and the claims it yields go through the shared
+    // `check_claim` below.
     let envelope: RaftEnvelopeV1 = payload_fory::<RaftEnvelopeV1>()
         .deserialize(frame)
         .map_err(|_| {
@@ -250,71 +377,17 @@ pub(crate) fn admit(
         ));
     }
 
-    if envelope.protocol_version != PROTOCOL_VERSION
-        || envelope.raft_codec_version != RAFT_CODEC_VERSION
-    {
-        // A permanent protocol fault. §5.4 refuses it rather than negotiating:
-        // v1 supports same-protocol rolling restarts only.
-        return Err(Refusal::at(
-            2,
-            StatusCode::InvalidArgument,
-            format!(
-                "protocol {}/codec {} is not v1",
-                envelope.protocol_version, envelope.raft_codec_version
-            ),
-        ));
-    }
-
-    if envelope.group_id != ctx.group.as_bytes() {
-        // `PermissionDenied` rather than `InvalidArgument`: the envelope is
-        // well formed, and what is wrong is that it is addressed to a group
-        // this node is not. The reply names no local state.
-        return Err(Refusal::at(
-            2,
-            StatusCode::PermissionDenied,
-            "this node does not serve that group",
-        ));
-    }
-
-    // The width check is separate from the equality check below, so a
-    // truncated id is diagnosed as malformed rather than as impersonation.
-    let claimed = CoordinationNodeId::from_slice(&envelope.sender_node_id).map_err(|e| {
-        Refusal::at(
-            2,
-            StatusCode::InvalidArgument,
-            format!("the envelope's sender_node_id is not a node id: {e}"),
-        )
-    })?;
-    if claimed != sender {
-        return Err(Refusal::at(
-            2,
-            StatusCode::PermissionDenied,
-            "the envelope's sender does not match the authenticated peer",
-        ));
-    }
-
-    // ── 3. Verified producer admission ───────────────────────────────────────
-    //
-    // Rechecked on **every** call, per §8.4: a decision made once outlives the
-    // policy that made it, and revocation has to take effect somewhere.
-    decide(ctx.admission, sender).map_err(|denial| {
-        Refusal::at(
-            3,
-            admission_status(&denial),
-            // The peer learns that it was denied, not why: which of the five
-            // denials it was is this node's operational state.
-            "producer admission denied",
-        )
-    })?;
-
-    // ── 4. The allowlist ─────────────────────────────────────────────────────
-    if !ctx.allowlist.permits(&sender, ctx.members) {
-        return Err(Refusal::at(
-            4,
-            StatusCode::PermissionDenied,
-            "the sender is not a member of this group",
-        ));
-    }
+    // ── 2b, 3, 4. The claims, admission and the allowlist ────────────────────
+    check_claim(
+        ctx,
+        sender,
+        &ClaimedIdentity {
+            protocol_version: envelope.protocol_version,
+            raft_codec_version: envelope.raft_codec_version,
+            group_id: &envelope.group_id,
+            sender_node_id: &envelope.sender_node_id,
+        },
+    )?;
 
     // ── 5. The payload, at last ──────────────────────────────────────────────
     if envelope.payload.len() > MAX_RAFT_PAYLOAD {

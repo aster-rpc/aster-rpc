@@ -58,6 +58,8 @@ use crate::coordination::ids::CoordinationNodeId;
 use crate::coordination::raft::{
     RaftSnapshotChunkWireV1, RaftSnapshotHeaderWireV1, SnapshotMetaV1, VoteV1,
 };
+use crate::coordination::rowstream::MAX_SNAPSHOT_BODY_BYTES;
+use crate::coordination::runtime::config::SNAPSHOT_MAX_CHUNK_SIZE;
 use crate::coordination::storage::machine::StateHandle;
 use crate::coordination::storage::snapshot::{
     CoordinationSnapshotFile, IncomingWriter, PrepareInstallError, PreparedSnapshot,
@@ -85,6 +87,20 @@ pub(crate) enum StreamRefusal {
     NonContiguous { expected: u64, found: u64 },
     /// More bytes arrived than the header declared, or the stream ended short.
     LengthMismatch { declared: u64, received: u64 },
+    /// The sender declared, or sent, more than a frozen ceiling permits.
+    ///
+    /// Distinct from [`Storage`](Self::Storage), and the distinction is the
+    /// point. Without this check a body declared at 4 GiB would open a
+    /// temporary and stream into it until `IncomingWriter` hit its own 512 MiB
+    /// ceiling — arriving as a **local storage failure**, answered `Internal`,
+    /// which tells a hostile peer that its oversized stream found a fault in
+    /// our disk and invites it to retry. A declared ceiling crossed is the
+    /// sender's fault, refused before a byte is staged.
+    Oversized {
+        what: &'static str,
+        limit: u64,
+        found: u64,
+    },
     /// The assembled body does not hash to the checksum the header declared.
     ChecksumMismatch,
     /// The stream ended without a final chunk.
@@ -108,6 +124,9 @@ impl std::fmt::Display for StreamRefusal {
                 f,
                 "the snapshot stream declared {declared} bytes and carried {received}"
             ),
+            StreamRefusal::Oversized { what, limit, found } => {
+                write!(f, "{what} is {found} bytes; the ceiling is {limit}")
+            }
             StreamRefusal::ChecksumMismatch => {
                 f.write_str("the assembled snapshot body does not match its declared checksum")
             }
@@ -248,6 +267,16 @@ impl SnapshotStreamReceiver {
         layout: &crate::coordination::storage::schema::StorageLayout,
         header: AdmittedHeader,
     ) -> Result<Self, StreamRefusal> {
+        // Before a temporary exists. The declared length is a *claim*, and a
+        // claim above the ceiling is refusable without staging anything —
+        // which is the only point at which refusing it is free.
+        if header.total_len > MAX_SNAPSHOT_BODY_BYTES {
+            return Err(StreamRefusal::Oversized {
+                what: "the declared snapshot body",
+                limit: MAX_SNAPSHOT_BODY_BYTES,
+                found: header.total_len,
+            });
+        }
         let body = Box::new(
             crate::coordination::storage::snapshot::begin_receiving(layout)
                 .map_err(|e| StreamRefusal::Storage(e.to_string()))?,
@@ -279,6 +308,18 @@ impl SnapshotStreamReceiver {
             return Err(StreamRefusal::Malformed(
                 "a chunk arrived after the final one".into(),
             ));
+        }
+        // The chunk ceiling §12.3 sizes the frame for. The transport's
+        // per-method frame cap bounds the *frame*, which is larger by the
+        // chunk header and frame overhead; this is the bound on the data, and
+        // it is what makes "one chunk" a known revocation interval rather than
+        // whatever the sender chose to send.
+        if chunk.data.len() as u64 > SNAPSHOT_MAX_CHUNK_SIZE {
+            return Err(StreamRefusal::Oversized {
+                what: "a snapshot chunk",
+                limit: SNAPSHOT_MAX_CHUNK_SIZE,
+                found: chunk.data.len() as u64,
+            });
         }
         if chunk.offset != self.expected_offset {
             return Err(StreamRefusal::NonContiguous {
@@ -417,15 +458,35 @@ impl SnapshotHandoff {
     pub(crate) async fn install(
         self,
         raft: &Raft<CoordinationTypeConfig>,
-    ) -> Result<
-        openraft::raft::SnapshotResponse<CoordinationNodeId>,
-        openraft::error::Fatal<CoordinationNodeId>,
-    > {
+    ) -> Result<openraft::raft::SnapshotResponse<CoordinationNodeId>, InstallRefusal> {
         let SnapshotHandoff {
             vote,
             meta,
             prepared,
         } = self;
+
+        // **A snapshot is installed on a follower.** OpenRaft's
+        // `handle_install_full_snapshot` calls `accept_vote` and then
+        // `following_handler()`, which asserts `self.leader.is_none()`. A vote
+        // strictly greater than ours steps this node down first, so the
+        // assertion holds; a vote *equal* to ours does not, and if we are the
+        // leader under that vote the engine walks into its own assertion —
+        // panicking the state-machine worker in a debug build and continuing
+        // into a leader-installing-a-snapshot state in a release one.
+        //
+        // Nothing upstream prevents it. An admitted member may send a
+        // well-formed stream naming the current leader's own vote; every check
+        // from §5.3 passes, because none of them compares the arriving vote
+        // with local leadership. Refusing here is the only place the question
+        // can be asked, and §5.4's `FailedPrecondition` is the honest answer:
+        // the peer is not wrong, this node is simply not in a state to install
+        // — and leadership is exactly the sort of condition a later message
+        // repairs.
+        let metrics = raft.metrics().borrow().clone();
+        if metrics.state.is_leader() && vote <= metrics.vote {
+            return Err(InstallRefusal::NotAFollower);
+        }
+
         raft.install_full_snapshot(
             vote,
             Snapshot {
@@ -434,8 +495,40 @@ impl SnapshotHandoff {
             },
         )
         .await
+        .map_err(|err| InstallRefusal::Fatal(Box::new(err)))
     }
 }
+
+/// Why a prepared handoff was not installed.
+///
+/// Two outcomes, and they are not the same kind of thing: one is this node's
+/// own Raft ending, the other is this node declining a well-formed stream it is
+/// momentarily unable to accept. Collapsing them would answer a transient
+/// condition with `Internal` — which the sender's §5.4 table latches as a peer
+/// fault — and would hide the only case where the peer should simply try again.
+#[derive(Debug)]
+pub(crate) enum InstallRefusal {
+    /// This node is the leader under a vote no lower than the arriving one, so
+    /// it is not in a position to install. Transient by construction.
+    NotAFollower,
+    /// Our own Raft is gone. Boxed: it is by far the larger variant, and the
+    /// common answer is the empty one above.
+    Fatal(Box<openraft::error::Fatal<CoordinationNodeId>>),
+}
+
+impl std::fmt::Display for InstallRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallRefusal::NotAFollower => f.write_str(
+                "this node is the leader under a vote no lower than the stream's; a \
+                 snapshot is installed on a follower",
+            ),
+            InstallRefusal::Fatal(err) => write!(f, "this node cannot serve Raft: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for InstallRefusal {}
 
 #[cfg(test)]
 mod tests {
