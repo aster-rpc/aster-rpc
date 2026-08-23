@@ -124,20 +124,6 @@ pub(crate) enum StateCommand {
     /// Force a fatal failure through the ordinary serve path.
     #[cfg(test)]
     InjectFatal(Reply<()>),
-    /// Stream, verify and rebuild a raw snapshot source (§11.4 preparation).
-    ///
-    /// Carries the source handle, so the actor owns it for the whole operation
-    /// and drops it -- and, if it is Incoming, removes it -- when done.
-    ///
-    /// Separate from [`Install`](Self::Install) because the two halves are
-    /// answered differently: a refusal here is the sender's and is reported to
-    /// that sender **without ever entering OpenRaft**, where any storage error
-    /// becomes a `Fatal` that ends the state-machine worker.
-    PrepareInstall {
-        source: Box<CoordinationSnapshotFile>,
-        supplied: crate::coordination::raft::SnapshotMetaV1,
-        reply: PreparationReply,
-    },
     /// Install an already-prepared snapshot over this store's state.
     ///
     /// Takes the proved role only. `supplied` is OpenRaft's own copy of the
@@ -234,11 +220,6 @@ impl StateActor {
                 // `StorageError`, precisely so a refusal of the sender's bytes
                 // cannot be mistaken for this store's own failure and latch it
                 // fatal. `serve` exists to do that latching.
-                StateCommand::PrepareInstall {
-                    source,
-                    supplied,
-                    reply,
-                } => self.serve_preparation(reply, &source, &supplied),
                 StateCommand::Install {
                     prepared,
                     supplied,
@@ -294,39 +275,6 @@ impl StateActor {
         outcome
     }
 
-    /// [`serve`](Self::serve) for preparation, whose failure type is not
-    /// `StorageError`.
-    ///
-    /// A separate method rather than a `map_err` into `serve`, because the
-    /// whole point of [`snapshot::PrepareInstallError`] is that its two arms
-    /// are answered differently — and that difference is exactly the latching
-    /// decision. Flattening them here would put a peer's corrupt bytes on the
-    /// same path as this store's failed disk, which is the failure the split
-    /// exists to prevent.
-    fn serve_preparation(
-        &mut self,
-        reply: PreparationReply,
-        source: &CoordinationSnapshotFile,
-        supplied: &crate::coordination::raft::SnapshotMetaV1,
-    ) -> Outcome {
-        let result = self.prepare_install(source, supplied);
-        let outcome = match &result {
-            // This store's own durability is in question. Same rule as every
-            // other command.
-            Err(snapshot::PrepareInstallError::Storage(err))
-                if err.puts_durability_in_question() =>
-            {
-                self.fatal.store(true, Ordering::SeqCst);
-                Outcome::Fatal
-            }
-            // A rejection is the sender's bytes. The voter keeps serving —
-            // that is the property the whole boundary exists for.
-            _ => Outcome::Continue,
-        };
-        let _ = reply.send(result);
-        outcome
-    }
-
     /// Refuse everything already queued behind a failure.
     ///
     /// Those commands were enqueued while the store still looked healthy, and
@@ -340,14 +288,6 @@ impl StateActor {
                 StateCommand::Apply { reply, .. } => fail(reply),
                 StateCommand::ReadTransaction(reply) => fail(reply),
                 StateCommand::Install { reply, .. } => fail(reply),
-                // Refused as a *storage* failure, not as a rejection: the store
-                // is fatal, which says nothing about the sender's bytes and
-                // must not be reported to that sender as if it did.
-                StateCommand::PrepareInstall { reply, .. } => {
-                    let _ = reply.send(Err(snapshot::PrepareInstallError::Storage(
-                        StorageError::Fatal,
-                    )));
-                }
                 #[cfg(test)]
                 StateCommand::Snapshot(reply) => fail(reply),
                 #[cfg(test)]
@@ -392,29 +332,6 @@ impl StateActor {
     /// reopen, revalidation, body promotion, `CURRENT`, retirement, and the
     /// in-memory update — because a store whose database and marker disagree is
     /// exactly what a reader must never be admitted to.
-    /// Stream, verify and rebuild a raw source — the preparation half.
-    ///
-    /// Runs on the actor because [`snapshot::check_identity`] needs this
-    /// store's durable state, but holds **no** exclusion: nothing here touches
-    /// anything a reader can see, and the comparison that does need exclusion
-    /// is deliberately left to [`install`](Self::install).
-    ///
-    /// Its two failures are kept apart by [`snapshot::PrepareInstallError`],
-    /// because the caller must answer them differently: a refusal of the
-    /// sender's bytes is reported to that sender, and this store's own staging
-    /// failure is not.
-    fn prepare_install(
-        &mut self,
-        source: &CoordinationSnapshotFile,
-        supplied: &crate::coordination::raft::SnapshotMetaV1,
-    ) -> Result<snapshot::PreparedSnapshot, snapshot::PrepareInstallError> {
-        let state = self
-            .state
-            .as_ref()
-            .ok_or(snapshot::PrepareInstallError::Storage(StorageError::Fatal))?;
-        snapshot::prepare_install(&self.layout, source, state, supplied)
-    }
-
     /// Resolve a prepared snapshot against this store's state and act on the
     /// verdict — the installation half.
     ///
@@ -685,6 +602,13 @@ pub(crate) type StateShutdown = ActorShutdown<StateCommand>;
 pub(crate) struct StateHandle {
     tx: mpsc::Sender<StateCommand>,
     fatal: Arc<AtomicBool>,
+    /// Where this store's files live. Carried so preparation can run without
+    /// asking the actor for anything.
+    layout: StorageLayout,
+    /// The immutable bindings a snapshot is checked against. Read once, at
+    /// spawn: every field is fixed when storage opens, so a copy here cannot
+    /// go stale — which is exactly why preparation does not need the actor.
+    identity: Arc<snapshot::SnapshotIdentity>,
 }
 
 impl std::fmt::Debug for StateHandle {
@@ -713,6 +637,11 @@ impl StateHandle {
         catalog: SnapshotCatalog,
         current: Arc<Mutex<Option<SnapshotFile>>>,
     ) -> StorageResult<(Self, StateShutdown)> {
+        // Read before the state moves into the actor. Both are immutable for
+        // the life of the store, which is what lets preparation run off the
+        // actor entirely.
+        let handle_identity = snapshot::SnapshotIdentity::of(&state);
+        let handle_layout = layout.clone();
         let (tx, rx) = mpsc::channel(STATE_ACTOR_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let actor_stop = Arc::clone(&stop);
@@ -743,6 +672,8 @@ impl StateHandle {
             Self {
                 tx: tx.clone(),
                 fatal,
+                layout: handle_layout,
+                identity: Arc::new(handle_identity),
             },
             ActorShutdown::new(tx, stop, thread, || StateCommand::Shutdown),
         ))
@@ -798,45 +729,72 @@ impl StateHandle {
     /// Stream, verify and rebuild a raw snapshot source (§11.4 preparation).
     ///
     /// **This is the whole install boundary.** It runs outside any OpenRaft
-    /// call, so a refusal of the sender's bytes is answered here and the voter
-    /// keeps serving — where the same refusal inside `install_snapshot` becomes
-    /// an OpenRaft `Fatal` that ends the state-machine worker.
+    /// call, so a refusal of the sender's bytes is answered by the caller and
+    /// the voter keeps serving — where the same refusal inside
+    /// `install_snapshot` becomes an OpenRaft `Fatal` that ends the
+    /// state-machine worker.
     ///
-    /// It has its own body rather than reusing [`call`](Self::call) because its
-    /// failure type is not `StorageError`: preparation's two arms are answered
-    /// to different audiences, and a shared helper would have to flatten them.
-    /// The refusals it manufactures locally are `Storage`, not `Rejected` — a
-    /// dead actor says nothing about the sender's snapshot.
+    /// ## Off the actor, on a blocking worker
+    ///
+    /// An earlier revision ran this *on* the state actor, which put a rebuild
+    /// of up to 512 MiB on the single-writer thread that also serves applies
+    /// and reads — a snapshot transfer stalled unrelated work for its whole
+    /// duration. It does not need to be there: everything preparation compares
+    /// against is a [`SnapshotIdentity`](snapshot::SnapshotIdentity), and every
+    /// field of one is fixed when storage opens and immutable for the group's
+    /// lifetime. The comparison that *does* need the live state — the
+    /// candidate's applied index against this store's — stays on the actor
+    /// under the same exclusion as the rename, which is the split's whole
+    /// point.
+    ///
+    /// `spawn_blocking` rather than the async runtime's worker pool: this is
+    /// hundreds of megabytes of file I/O and redb writes, and running it on a
+    /// cooperative executor thread starves every other task on it.
+    ///
+    /// Its own body rather than [`call`](Self::call), because its failure type
+    /// is not `StorageError`: preparation's two arms are answered to different
+    /// audiences, and a shared helper would have to flatten them. The refusals
+    /// it manufactures locally are `Storage`, not `Rejected` — a store that has
+    /// stopped says nothing about the sender's snapshot.
     pub(crate) async fn prepare_install(
         &self,
         source: Box<CoordinationSnapshotFile>,
         supplied: crate::coordination::raft::SnapshotMetaV1,
     ) -> std::result::Result<snapshot::PreparedSnapshot, snapshot::PrepareInstallError> {
-        let stopped =
-            || snapshot::PrepareInstallError::Storage(StorageError::ActorStopped { db: Db::State });
         if self.is_fatal() {
             return Err(snapshot::PrepareInstallError::Storage(StorageError::Fatal));
         }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let command = StateCommand::PrepareInstall {
-            source,
-            supplied,
-            reply: reply_tx,
-        };
-        if self.tx.send(command).await.is_err() {
-            self.mark_fatal();
-            return Err(stopped());
-        }
-        match reply_rx.await {
-            Ok(result) => result,
-            Err(_) => {
-                self.mark_fatal();
-                Err(stopped())
+        let layout = self.layout.clone();
+        let identity = self.identity.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            snapshot::prepare_install(&layout, &source, &identity, &supplied)
+        })
+        .await;
+
+        match outcome {
+            Ok(result) => {
+                // A *storage* failure during preparation latches, for the same
+                // reason every other one does: this store's disk failed. A
+                // rejection does not — that is the property the whole boundary
+                // exists for.
+                if let Err(snapshot::PrepareInstallError::Storage(err)) = &result {
+                    if err.puts_durability_in_question() {
+                        self.mark_fatal();
+                    }
+                }
+                result
             }
+            // The worker panicked or the runtime is shutting down. Ours either
+            // way, and never reported to the peer as a bad snapshot.
+            Err(join) => Err(snapshot::PrepareInstallError::Storage(StorageError::io(
+                "preparing a snapshot",
+                std::path::Path::new("<worker>"),
+                std::io::Error::other(join.to_string()),
+            ))),
         }
     }
 
-    /// A copy of the published state, for tests that compare memory with disk.
+    /// A copy of the published state, for tests that compare memory with disk.    /// A copy of the published state, for tests that compare memory with disk.
     #[cfg(test)]
     pub(crate) async fn published(&self) -> StorageResult<Box<DurableState>> {
         self.call(StateCommand::Snapshot).await
@@ -6340,7 +6298,7 @@ mod tests {
             let staged = super::super::snapshot::receive(
                 &StorageLayout::new(&dir),
                 &published.snapshot,
-                &durable_of(&machine).await,
+                &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
                 &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
             )
             .expect("stage");
@@ -6657,7 +6615,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &StorageLayout::new(&dir),
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("a foreign store's published snapshot is an install source");
@@ -6710,7 +6668,7 @@ mod tests {
         let err = super::super::snapshot::receive(
             &StorageLayout::new(&dir),
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect_err("another group's state is not installable here");
@@ -6738,9 +6696,13 @@ mod tests {
         let layout = StorageLayout::new(&dir);
 
         let refused = |supplied: crate::coordination::raft::SnapshotMetaV1, what: &str| {
-            let err =
-                super::super::snapshot::receive(&layout, &published.snapshot, &state, &supplied)
-                    .expect_err("supplied metadata is not evidence about the body");
+            let err = super::super::snapshot::receive(
+                &layout,
+                &published.snapshot,
+                &super::super::snapshot::SnapshotIdentity::of(&state),
+                &supplied,
+            )
+            .expect_err("supplied metadata is not evidence about the body");
             assert!(format!("{err:?}").contains(what), "{err:?}");
         };
 
@@ -6767,8 +6729,13 @@ mod tests {
 
         // The truthful copy still works, so the three refusals above are about
         // the fields changed and not about the fixture.
-        super::super::snapshot::receive(&layout, &published.snapshot, &state, &truthful)
-            .expect("the metadata the body actually implies");
+        super::super::snapshot::receive(
+            &layout,
+            &published.snapshot,
+            &super::super::snapshot::SnapshotIdentity::of(&state),
+            &truthful,
+        )
+        .expect("the metadata the body actually implies");
     }
 
     /// **The metadata half of the crossing.**
@@ -7051,7 +7018,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &StorageLayout::new(&dir),
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage the source");
@@ -7121,7 +7088,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &StorageLayout::new(&dir),
             &source,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &supplied,
         )
         .expect("row decoding and body binding both succeed");
@@ -7156,7 +7123,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &layout,
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage the source");
@@ -7230,7 +7197,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &StorageLayout::new(&dir),
             &first.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&first.meta),
         )
         .expect("stage the first body");
@@ -7266,7 +7233,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &StorageLayout::new(&dir),
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage the source");
@@ -7321,10 +7288,11 @@ mod tests {
         let state = durable_of(&machine).await;
         let layout = StorageLayout::new(&dir);
 
+        let identity_for_receive = super::super::snapshot::SnapshotIdentity::of(&state);
         let staged_bad = super::super::snapshot::receive(
             &layout,
             &CoordinationSnapshotFile::incoming(bad.path()),
-            &state,
+            &identity_for_receive,
             bad.meta(),
         )
         .expect("the bad body stages");
@@ -7346,7 +7314,7 @@ mod tests {
         let staged_good = super::super::snapshot::receive(
             &layout,
             &good.snapshot,
-            &state,
+            &identity_for_receive,
             &crate::coordination::raft::SnapshotMetaV1::from(&good.meta),
         )
         .expect("the good body stages");
@@ -7578,8 +7546,13 @@ mod tests {
         meta: &crate::coordination::raft::SnapshotMetaV1,
     ) -> super::super::snapshot::PreparedInstall {
         let layout = StorageLayout::new(dir);
-        let staged = super::super::snapshot::receive(&layout, source, durable, meta)
-            .expect("stage the source");
+        let staged = super::super::snapshot::receive(
+            &layout,
+            source,
+            &super::super::snapshot::SnapshotIdentity::of(durable),
+            meta,
+        )
+        .expect("stage the source");
         super::super::snapshot::rebuild_candidate(&layout, staged).expect("rebuild the candidate")
     }
 
@@ -7611,7 +7584,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &layout_a,
             &published.snapshot,
-            &durable_of(&machine_a).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine_a).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage for A");
@@ -7683,7 +7656,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &layout,
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage");
@@ -7737,7 +7710,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &layout,
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage");
@@ -7780,7 +7753,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &StorageLayout::new(&dir),
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage");
@@ -7819,7 +7792,7 @@ mod tests {
         let staged = super::super::snapshot::receive(
             &StorageLayout::new(&dir),
             &published.snapshot,
-            &durable_of(&machine).await,
+            &super::super::snapshot::SnapshotIdentity::of(&durable_of(&machine).await),
             &crate::coordination::raft::SnapshotMetaV1::from(&published.meta),
         )
         .expect("stage the source");

@@ -1250,7 +1250,7 @@ impl PublishInstall {
 pub(crate) fn receive(
     layout: &StorageLayout,
     source: &CoordinationSnapshotFile,
-    state: &super::rows::DurableState,
+    identity: &SnapshotIdentity,
     supplied: &SnapshotMetaV1,
 ) -> StorageResult<StagedSnapshot> {
     let dir = layout.incoming();
@@ -1315,7 +1315,7 @@ pub(crate) fn receive(
             "the staged snapshot body changed between being written and being read",
         ));
     }
-    check_identity(&header, state)?;
+    check_identity(&header, identity)?;
     check_claimed_meta("the supplied snapshot metadata", supplied, &header, &digest)?;
 
     Ok(StagedSnapshot {
@@ -1869,7 +1869,7 @@ pub(crate) fn check_binding(
     state: &super::rows::DurableState,
     canonical: impl FnOnce() -> StorageResult<[u8; 32]>,
 ) -> StorageResult<()> {
-    check_identity(header, state)?;
+    check_identity(header, &SnapshotIdentity::of(state))?;
     check_not_ahead(header, digest, state, canonical)
 }
 
@@ -1885,7 +1885,7 @@ pub(crate) fn check_binding(
 /// checks a second time would have produced two lists that drift.
 pub(crate) fn check_identity(
     header: &SnapshotHeaderV1,
-    state: &super::rows::DurableState,
+    identity: &SnapshotIdentity,
 ) -> StorageResult<()> {
     use crate::coordination::rowstream::SNAPSHOT_FORMAT_VERSION;
 
@@ -1910,7 +1910,7 @@ pub(crate) fn check_identity(
         ));
     }
 
-    let authority = &state.model.authority;
+    let authority = &identity.authority;
     let bindings: [(&str, &[u8], &[u8]); 3] = [
         ("group id", &header.meta.group_id, &authority.group_id),
         (
@@ -1936,11 +1936,11 @@ pub(crate) fn check_identity(
             format!("{:?}", authority.domain),
         ));
     }
-    if header.meta.deployment_profile_code != state.model.deployment_profile_code {
+    if header.meta.deployment_profile_code != identity.deployment_profile_code {
         return Err(mismatch(
             "deployment profile",
             header.meta.deployment_profile_code.to_string(),
-            state.model.deployment_profile_code.to_string(),
+            identity.deployment_profile_code.to_string(),
         ));
     }
     Ok(())
@@ -2495,6 +2495,35 @@ impl Read for SnapshotReader<'_> {
     }
 }
 
+/// The **immutable** bindings a snapshot body is checked against.
+///
+/// Every one is fixed when storage is opened and never changes: §7.1 makes the
+/// authority key, domain, group id and genesis hash immutable for a v1 group's
+/// lifetime, and the deployment profile is replicated and equally fixed.
+///
+/// Extracting them matters because it is what lets preparation run **off the
+/// state actor**. Taking `&DurableState` forced a rebuild of up to 512 MiB onto
+/// the single-writer thread that also serves applies and reads, for the sake of
+/// five values that could not have changed while it ran. The comparison that
+/// genuinely needs the live state — the candidate's applied index against this
+/// store's — stays on the actor under exclusion, which is the whole point of
+/// the split.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotIdentity {
+    authority: crate::coordination::model::state::GroupAuthority,
+    deployment_profile_code: i32,
+}
+
+impl SnapshotIdentity {
+    /// Read the bindings out of a loaded state, once.
+    pub(crate) fn of(state: &super::rows::DurableState) -> Self {
+        Self {
+            authority: state.model.authority.clone(),
+            deployment_profile_code: state.model.deployment_profile_code,
+        }
+    }
+}
+
 /// A body that has already been streamed, bounds-checked, verified and rebuilt
 /// into a candidate database, sealed with the metadata proved against it.
 ///
@@ -2607,10 +2636,10 @@ impl std::fmt::Display for PrepareInstallError {
 pub(crate) fn prepare_install(
     layout: &StorageLayout,
     source: &CoordinationSnapshotFile,
-    state: &super::rows::DurableState,
+    identity: &SnapshotIdentity,
     supplied: &SnapshotMetaV1,
 ) -> Result<PreparedSnapshot, PrepareInstallError> {
-    let staged = receive(layout, source, state, supplied).map_err(classify_prepare)?;
+    let staged = receive(layout, source, identity, supplied).map_err(classify_prepare)?;
     let prepared = rebuild_candidate(layout, staged).map_err(classify_prepare)?;
     Ok(PreparedSnapshot { prepared })
 }

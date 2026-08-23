@@ -401,6 +401,120 @@ mod tests {
         );
     }
 
+    /// **The three sealed values have no public fields**, which is the premise
+    /// that makes "one construction site" mean "unassemblable elsewhere".
+    ///
+    /// ## Why this rather than a `trybuild` compile-fail case
+    ///
+    /// The plan asks for compile-fail evidence that no vote, `SnapshotMeta` and
+    /// `PreparedSnapshot` can be assembled into a `SnapshotHandoff`. `trybuild`
+    /// compiles *external* crates, and all three types are `pub(crate)` — so
+    /// such a case would fail because the **type** is unnameable outside the
+    /// crate, and would keep passing if every field were made `pub`. It would
+    /// be evidence for a property nobody doubted, and none for the one that
+    /// matters.
+    ///
+    /// The real risk is intra-crate: another coordination module building one.
+    /// Rust's own rules make that impossible given three facts, and each is
+    /// checkable here:
+    ///
+    /// 1. every field is private to the defining module (this test);
+    /// 2. there is no constructor function taking the parts separately
+    ///    (`no_constructor_assembles_the_parts_separately`, in `handoff`);
+    /// 3. the struct literal appears exactly once, inside that module
+    ///    (the three `*_has_one_constructor_subsystem_wide` tests above).
+    ///
+    /// Together those *are* the compile-fail argument, with the implication
+    /// supplied by the language rather than by a harness. A `trybuild` case
+    /// would restate a weaker conclusion; this states the premises of the
+    /// stronger one.
+    #[test]
+    fn the_sealed_values_have_no_public_fields() {
+        let handoff = SOURCES
+            .iter()
+            .find(|(name, _)| *name == "network/handoff.rs")
+            .map(|(_, source)| *source)
+            .expect("the handoff module is inventoried");
+        let production = &handoff[..production_end(handoff)];
+
+        for name in ["AdmittedHeader", "SnapshotReceipt", "SnapshotHandoff"] {
+            let at = production
+                .find(&format!("struct {name} {{"))
+                .unwrap_or_else(|| panic!("{name} must be declared in the handoff module"));
+            let body_end = production[at..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("{name} has no close"));
+            let body = &production[at..at + body_end];
+
+            for (offset, line) in body.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("").trim();
+                assert!(
+                    !code.starts_with("pub "),
+                    "{name} field on line {offset} is public: {code:?}. A public field is a \
+                     constructor — a struct literal in any module can then assemble the parts \
+                     separately, which is the substitution the seal exists to remove"
+                );
+                assert!(
+                    !code.starts_with("pub(crate)") && !code.starts_with("pub(super)"),
+                    "{name} field on line {offset} is visible outside its module: {code:?}"
+                );
+            }
+            // And the type itself is not `pub`, so nothing outside the crate can
+            // name it either.
+            let declaration_start = production[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+            let declaration = &production[declaration_start..at + body_end];
+            assert!(
+                !declaration.contains("pub struct"),
+                "{name} must not be publicly nameable"
+            );
+        }
+    }
+
+    /// **Preparation does not occupy the state actor.**
+    ///
+    /// A rebuild is bounded by §11.4's ceiling at 512 MiB, and the state actor
+    /// is the single writer that also serves every apply and every read. An
+    /// earlier revision ran preparation there, so a snapshot transfer stalled
+    /// unrelated work for its whole duration — for the sake of five values
+    /// (`SnapshotIdentity`) that are fixed when storage opens and cannot change
+    /// while it runs.
+    ///
+    /// A source guard rather than a timing test: "did the actor stay free?" is
+    /// answered by a race, and a concurrency test that passed on a fast machine
+    /// would say nothing on a slow one. What is checkable is that the method
+    /// sends no actor command at all.
+    #[test]
+    fn preparation_never_sends_an_actor_command() {
+        let machine = SOURCES
+            .iter()
+            .find(|(name, _)| *name == "storage/machine.rs")
+            .map(|(_, source)| *source)
+            .expect("the state machine is inventoried");
+        let production = &machine[..production_end(machine)];
+
+        let at = production
+            .find("pub(crate) async fn prepare_install(")
+            .expect("the handle exposes preparation");
+        let body_end = production[at..]
+            .find("\n    /// ")
+            .unwrap_or(production.len() - at);
+        let body = &production[at..at + body_end];
+
+        assert!(
+            body.contains("spawn_blocking"),
+            "preparation must run on a blocking worker: it is hundreds of megabytes of \
+             file I/O and redb writes, and a cooperative executor thread would starve"
+        );
+        for actor_route in ["self.tx.send", "StateCommand::", "self.call("] {
+            assert!(
+                !body.contains(actor_route),
+                "preparation must not reach the state actor ({actor_route:?}); everything \
+                 it compares against is immutable, and queuing it behind an apply is the \
+                 stall this moved off the actor to avoid"
+            );
+        }
+    }
+
     /// The guards above search for tokens that exist, so one pointed at a
     /// renamed construct cannot pass by finding nothing.
     #[test]
