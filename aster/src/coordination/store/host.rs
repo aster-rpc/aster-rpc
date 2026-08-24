@@ -116,6 +116,46 @@ pub struct StoreMetrics {
     pub reads_served: std::sync::atomic::AtomicU64,
     /// Mutations refused by the §11.5 growth pressure gate.
     pub pressure_refusals: std::sync::atomic::AtomicU64,
+
+    // ── §14: applied register outcomes, counted at the propose reply ──
+    pub granted: std::sync::atomic::AtomicU64,
+    pub renewed: std::sync::atomic::AtomicU64,
+    pub mutated: std::sync::atomic::AtomicU64,
+    pub released: std::sync::atomic::AtomicU64,
+    pub revoked: std::sync::atomic::AtomicU64,
+
+    // ── §14: denial classes. Each denial also lands in `denied_typed` or
+    // `denied_status`; these split the §14 families out of the totals. ──
+    /// Authorization denials: missing committed permission or the
+    /// administrator predicate.
+    pub denied_auth: std::sync::atomic::AtomicU64,
+    /// Stale-fence denials: NotHeld / NotHolder / EpochMismatch.
+    pub denied_stale_fence: std::sync::atomic::AtomicU64,
+    /// Revision-mismatch denials: value / ACL / admin / membership revision.
+    pub denied_revision: std::sync::atomic::AtomicU64,
+    /// Membership-rule denials: intent active, cannot cancel, operation id
+    /// conflict, learner envelope.
+    pub denied_membership: std::sync::atomic::AtomicU64,
+    /// §12.2 admission denials: in-flight ceilings, token buckets, and both
+    /// §11.5 pressure tiers.
+    pub denied_admission: std::sync::atomic::AtomicU64,
+
+    // ── §14: the §9.2 expiry loop ──
+    /// `Expire` commands proposed by the leader sweep.
+    pub expire_proposed: std::sync::atomic::AtomicU64,
+    /// Timers re-armed for a full TTL because the lease identity moved —
+    /// which is exactly what a renewal means.
+    pub expiry_rearms: std::sync::atomic::AtomicU64,
+
+    // ── §14: consensus transitions, observed by the lifecycle loop ──
+    pub leader_changes: std::sync::atomic::AtomicU64,
+    pub quorum_losses: std::sync::atomic::AtomicU64,
+
+    // ── §14: command/read latency, as cumulative micros over a count ──
+    pub command_latency_micros: std::sync::atomic::AtomicU64,
+    pub commands_timed: std::sync::atomic::AtomicU64,
+    pub read_latency_micros: std::sync::atomic::AtomicU64,
+    pub reads_timed: std::sync::atomic::AtomicU64,
 }
 
 impl StoreMetrics {
@@ -141,6 +181,12 @@ pub(crate) struct PressureState {
     /// forced tier survives the next sampling pass.
     pub(crate) force_growth: std::sync::atomic::AtomicBool,
     pub(crate) force_hard: std::sync::atomic::AtomicBool,
+    /// §14 disk gauges, refreshed by the same sampling pass that sets the
+    /// tiers: byte sizes and free-space state, never file contents.
+    pub(crate) state_db_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) raft_db_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) snapshot_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) free_space_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl PressureState {
@@ -621,6 +667,7 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
     // resolution so a saved result can replay; its own bucket sits on the
     // propose path instead.
     let Some(_actor_slot) = ActorInFlight::enter(runtime, actor) else {
+        StoreMetrics::bump(&runtime.metrics.denied_admission);
         let _ = call
             .finish(&RpcStatus::error(
                 StatusCode::ResourceExhausted,
@@ -634,6 +681,7 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
         Class::SequencedMutation | Class::SessionlessMutation
     );
     if !mutating && runtime.buckets.denied_exhausted(&actor) {
+        StoreMetrics::bump(&runtime.metrics.denied_admission);
         let _ = call
             .finish(&RpcStatus::error(
                 StatusCode::ResourceExhausted,
@@ -643,6 +691,7 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
         return;
     }
 
+    let started = std::time::Instant::now();
     match (spec.class, method) {
         (Class::SequencedMutation, _) => mutation(runtime, method, actor, &frame, call).await,
         (Class::SessionlessMutation, _) => retire_client(runtime, actor, &frame, call).await,
@@ -671,6 +720,35 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
                 .await;
         }
     }
+    // §14 latency: the handlers finish their calls before returning, so
+    // this spans decode through the last frame — barrier, transaction and
+    // propose included.
+    let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if mutating {
+        runtime
+            .metrics
+            .command_latency_micros
+            .fetch_add(micros, std::sync::atomic::Ordering::Relaxed);
+        StoreMetrics::bump(&runtime.metrics.commands_timed);
+    } else {
+        runtime
+            .metrics
+            .read_latency_micros
+            .fetch_add(micros, std::sync::atomic::Ordering::Relaxed);
+        StoreMetrics::bump(&runtime.metrics.reads_timed);
+    }
+}
+
+/// The §14 denial family of one reason-coded refusal.
+fn classify_denial(metrics: &StoreMetrics, reason_code: i32) {
+    let family = match reason_code {
+        12 => &metrics.denied_auth,
+        2 | 3 | 4 => &metrics.denied_stale_fence,
+        5 | 6 | 7 | 13 => &metrics.denied_revision,
+        14 | 16 | 17 | 25 => &metrics.denied_membership,
+        _ => return,
+    };
+    StoreMetrics::bump(family);
 }
 
 // ── Mutations (stage 0 decode per method, then one shared path) ─────────────
@@ -901,6 +979,7 @@ async fn mutation(
         // nothing written.
         Admission::Deny(refusal) => {
             StoreMetrics::bump(&runtime.metrics.denied_typed);
+            classify_denial(&runtime.metrics, Reason::from(refusal).code());
             let projected = ClientReplyV1 {
                 disposition_code: 2,
                 outcome_code: Outcome::Rejected.code(),
@@ -937,6 +1016,7 @@ async fn mutation(
             if runtime.pressure.hard_hit() {
                 StoreMetrics::bump(&runtime.metrics.pressure_refusals);
                 StoreMetrics::bump(&runtime.metrics.denied_status);
+                StoreMetrics::bump(&runtime.metrics.denied_admission);
                 let _ = call
                     .finish(&RpcStatus::error(
                         StatusCode::ResourceExhausted,
@@ -955,6 +1035,7 @@ async fn mutation(
             {
                 StoreMetrics::bump(&runtime.metrics.pressure_refusals);
                 StoreMetrics::bump(&runtime.metrics.denied_status);
+                StoreMetrics::bump(&runtime.metrics.denied_admission);
                 let _ = call
                     .finish(&RpcStatus::error(
                         StatusCode::ResourceExhausted,
@@ -969,6 +1050,7 @@ async fn mutation(
             // propose.
             if !runtime.buckets.take_mutate(&actor) {
                 StoreMetrics::bump(&runtime.metrics.denied_status);
+                StoreMetrics::bump(&runtime.metrics.denied_admission);
                 let _ = call
                     .finish(&RpcStatus::error(
                         StatusCode::ResourceExhausted,
@@ -985,8 +1067,24 @@ async fn mutation(
                 request_hash: request_hash.to_vec(),
                 action: decoded.wire_action,
             });
-            propose_and_reply(runtime, command, call, |reply_v1| match reply_v1 {
-                CommandReplyV1::Client(client_reply) => Ok(reply(client_reply)),
+            let metrics = Arc::clone(&runtime.metrics);
+            propose_and_reply(runtime, command, call, move |reply_v1| match reply_v1 {
+                CommandReplyV1::Client(client_reply) => {
+                    // §14 outcome counters, from the applied reply itself.
+                    let family = match client_reply.outcome_code {
+                        1 => Some(&metrics.granted),
+                        2 => Some(&metrics.renewed),
+                        3 => Some(&metrics.mutated),
+                        4 => Some(&metrics.released),
+                        5 => Some(&metrics.revoked),
+                        _ => None,
+                    };
+                    if let Some(counter) = family {
+                        StoreMetrics::bump(counter);
+                    }
+                    classify_denial(&metrics, client_reply.reason_code);
+                    Ok(reply(client_reply))
+                }
                 other => Err(internal(&format!(
                     "a client command must answer with a Client reply, got {other:?}"
                 ))),
@@ -1173,6 +1271,7 @@ async fn retire_client(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], c
             if runtime.pressure.hard_hit() {
                 StoreMetrics::bump(&runtime.metrics.pressure_refusals);
                 StoreMetrics::bump(&runtime.metrics.denied_status);
+                StoreMetrics::bump(&runtime.metrics.denied_admission);
                 let _ = call
                     .finish(&RpcStatus::error(
                         StatusCode::ResourceExhausted,
@@ -1184,6 +1283,7 @@ async fn retire_client(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], c
             }
             if !runtime.buckets.take_mutate(&actor) {
                 StoreMetrics::bump(&runtime.metrics.denied_status);
+                StoreMetrics::bump(&runtime.metrics.denied_admission);
                 let _ = call
                     .finish(&RpcStatus::error(
                         StatusCode::ResourceExhausted,
@@ -1364,6 +1464,9 @@ async fn fail(call: Call, status: RpcStatus) {
 /// eventually short-circuited at entry before any barrier work.
 async fn deny(runtime: &AttachedStore, actor: &[u8; 32], call: Call, status: RpcStatus) {
     runtime.buckets.note_denied(actor);
+    if status.code == StatusCode::PermissionDenied.as_i32() {
+        StoreMetrics::bump(&runtime.metrics.denied_auth);
+    }
     let _ = call.finish(&status).await;
 }
 

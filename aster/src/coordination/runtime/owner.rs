@@ -205,8 +205,13 @@ pub(crate) async fn run_lifecycle(
     state: crate::coordination::storage::machine::StateHandle,
     generation: Arc<AtomicU64>,
     genesis: Option<Arc<Vec<u8>>>,
+    store_metrics: std::sync::Arc<crate::coordination::store::host::StoreMetrics>,
 ) {
     let mut metrics = raft.metrics();
+    // §14 transition counters: observed here because this loop is the one
+    // reader of every metrics change.
+    let mut last_leader: Option<CoordinationNodeId> = None;
+    let mut last_quorum: Option<bool> = None;
     // The controller task for the generation this node currently holds.
     // Aborted and replaced on every leadership change, which is what makes
     // "one leader-generation task" true rather than aspirational.
@@ -248,6 +253,10 @@ pub(crate) async fn run_lifecycle(
 
         {
             let current = metrics.borrow_and_update().clone();
+            if current.current_leader.is_some() && current.current_leader != last_leader {
+                crate::coordination::store::host::StoreMetrics::bump(&store_metrics.leader_changes);
+            }
+            last_leader = current.current_leader;
 
             // §7.2's graduation: the allowlist stops reading the signed seeds
             // once a committed membership contains this node.
@@ -326,6 +335,7 @@ pub(crate) async fn run_lifecycle(
                         state.clone(),
                         next,
                         Arc::clone(&generation),
+                        std::sync::Arc::clone(&store_metrics),
                     )));
                 }
                 leading = is_leader;
@@ -364,10 +374,17 @@ pub(crate) async fn run_lifecycle(
                 }
             }
 
-            publisher.publish(classify(
+            let view = classify(
                 &current,
                 &facts.snapshot(timeout, std::sync::Arc::clone(&committed)),
-            ));
+            );
+            if last_quorum == Some(true) && view.quorum_available == Some(false) {
+                crate::coordination::store::host::StoreMetrics::bump(&store_metrics.quorum_losses);
+            }
+            if let Some(quorum) = view.quorum_available {
+                last_quorum = Some(quorum);
+            }
+            publisher.publish(view);
         }
 
         if metrics.changed().await.is_err() {
@@ -442,6 +459,9 @@ impl CoordinationRuntime {
             std::sync::Arc::new(crate::coordination::store::host::PressureState::default());
         let buckets = std::sync::Arc::new(crate::coordination::store::host::Buckets::default());
         let snapshots = attached.layout.snapshots();
+        let raft_db = attached
+            .layout
+            .database(crate::coordination::storage::error::Db::Raft);
         let generation = Arc::new(AtomicU64::new(0));
         let timeout = leader_liveness_timeout(config);
 
@@ -478,6 +498,7 @@ impl CoordinationRuntime {
         // because all it does is publish two atomics.
         let monitor = tokio::spawn(super::pressure::run(
             state_db,
+            raft_db,
             snapshots,
             std::sync::Arc::clone(&pressure),
             Arc::clone(&facts),
@@ -494,6 +515,7 @@ impl CoordinationRuntime {
             state,
             Arc::clone(&generation),
             genesis,
+            std::sync::Arc::clone(&store_metrics),
         ));
 
         Self {

@@ -96,19 +96,34 @@ pub(crate) fn free_space(path: &Path) -> Option<u64> {
 /// job because the drain side effect must fire exactly once.
 pub(crate) fn sample(
     state_db: &Path,
+    raft_db: &Path,
     snapshots: &Path,
     volume: &Path,
     pressure: &PressureState,
 ) -> bool {
+    use std::sync::atomic::Ordering;
+    let file_len = |path: &Path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let growth = growth_pressure_at(state_db, LOCAL_HIGH_WATER);
+    pressure.growth.store(growth, Ordering::Relaxed);
+    let snapshot_len = largest_snapshot(snapshots);
+    let floor = hard_floor(snapshot_len);
+    let free = free_space(volume);
+    let hard = free.is_some_and(|free| free < floor);
+    pressure.hard.store(hard, Ordering::Relaxed);
+    // The §14 disk gauges ride the same pass: sizes and free-space state,
+    // never file contents.
     pressure
-        .growth
-        .store(growth, std::sync::atomic::Ordering::Relaxed);
-    let floor = hard_floor(largest_snapshot(snapshots));
-    let hard = free_space(volume).is_some_and(|free| free < floor);
+        .state_db_bytes
+        .store(file_len(state_db), Ordering::Relaxed);
     pressure
-        .hard
-        .store(hard, std::sync::atomic::Ordering::Relaxed);
+        .raft_db_bytes
+        .store(file_len(raft_db), Ordering::Relaxed);
+    pressure
+        .snapshot_bytes
+        .store(snapshot_len, Ordering::Relaxed);
+    pressure
+        .free_space_bytes
+        .store(free.unwrap_or(0), Ordering::Relaxed);
     hard
 }
 
@@ -121,6 +136,7 @@ pub(crate) fn growth_pressure_at(state_db: &Path, high_water: u64) -> bool {
 /// The monitor task. Runs until aborted at §11.5 shutdown step 3.
 pub(crate) async fn run(
     state_db: PathBuf,
+    raft_db: PathBuf,
     snapshots: PathBuf,
     pressure: Arc<PressureState>,
     facts: Arc<RuntimeFacts>,
@@ -134,7 +150,7 @@ pub(crate) async fn run(
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
-        let hard = sample(&state_db, &snapshots, &volume, &pressure);
+        let hard = sample(&state_db, &raft_db, &snapshots, &volume, &pressure);
         if hard && !latched {
             latched = true;
             StoreMetrics::bump(&metrics.pressure_refusals);
@@ -189,7 +205,20 @@ mod tests {
         let pressure = PressureState::default();
 
         // Not at the high-water mark, plenty of space: both tiers off.
-        assert!(!sample(&db, dir.path(), dir.path(), &pressure));
+        assert!(!sample(&db, &db, dir.path(), dir.path(), &pressure));
+        assert!(
+            pressure
+                .state_db_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 2048,
+            "the gauges ride the sampling pass"
+        );
+        assert!(
+            pressure
+                .free_space_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
         assert!(!pressure.growth.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!pressure.hard.load(std::sync::atomic::Ordering::Relaxed));
 

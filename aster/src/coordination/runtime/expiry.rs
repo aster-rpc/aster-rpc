@@ -48,7 +48,9 @@ pub(crate) async fn run_generation(
     state: StateHandle,
     my_generation: u64,
     generation: Arc<AtomicU64>,
+    metrics: Arc<crate::coordination::store::host::StoreMetrics>,
 ) {
+    use crate::coordination::store::host::StoreMetrics;
     let mut deadlines: BTreeMap<ResourceKey, (u64, u64, Instant)> = BTreeMap::new();
     loop {
         tokio::time::sleep(SWEEP_INTERVAL).await;
@@ -83,8 +85,14 @@ pub(crate) async fn run_generation(
                 // The identity is unchanged: the armed timer stands.
                 Some((armed_epoch, armed_revision, _))
                     if armed_epoch == epoch && armed_revision == lease_revision => {}
-                // New, renewed, or re-acquired: a full fresh TTL.
-                _ => {
+                // Renewed or re-acquired under an armed timer: a full fresh
+                // TTL — §14's full-TTL re-arm event.
+                Some(_) => {
+                    StoreMetrics::bump(&metrics.expiry_rearms);
+                    deadlines.insert(key.clone(), fresh);
+                }
+                // Newly held: the first arming, not a re-arm.
+                None => {
                     deadlines.insert(key.clone(), fresh);
                 }
             }
@@ -105,6 +113,7 @@ pub(crate) async fn run_generation(
                 epoch,
                 lease_revision,
             });
+            StoreMetrics::bump(&metrics.expire_proposed);
             match raft.client_write(command).await {
                 Ok(_) => {
                     // Applied — as an expiry or as a harmless stale rejection;

@@ -98,18 +98,14 @@ pub mod testing;
 pub struct Coordination {
     readiness: runtime::readiness::Readiness,
     store_metrics: std::sync::Arc<store::host::StoreMetrics>,
-    /// The seam's handle onto the running `Raft`.
-    ///
-    /// Gated with the seam that reads it, so a shipping build carries neither
-    /// the field nor a method that could reach it. Cloning a `Raft` is an
-    /// `Arc` bump, so this costs the handle nothing when it is present.
-    #[cfg(feature = "coordination-testing")]
+    /// The handle onto the running `Raft` — read here **only** for the §14
+    /// consensus snapshot; every mutation path stays behind the RPC service.
+    /// Cloning a `Raft` is an `Arc` bump.
     raft: openraft::Raft<typeconfig::CoordinationTypeConfig>,
     /// The state actor, for reads the Raft metrics cannot answer.
     #[cfg(feature = "coordination-testing")]
     state: storage::machine::StateHandle,
-    /// The §11.5 tiers, so a gate can force them without filling a disk.
-    #[cfg(feature = "coordination-testing")]
+    /// The §11.5 tiers and §14 disk gauges.
     pressure: std::sync::Arc<store::host::PressureState>,
 }
 
@@ -119,11 +115,9 @@ impl Coordination {
         Self {
             readiness: rt.readiness(),
             store_metrics: rt.store_metrics(),
-            #[cfg(feature = "coordination-testing")]
             raft: rt.raft().clone(),
             #[cfg(feature = "coordination-testing")]
             state: rt.state().clone(),
-            #[cfg(feature = "coordination-testing")]
             pressure: rt.pressure(),
         }
     }
@@ -193,8 +187,94 @@ impl Coordination {
             redirected: m.redirected.load(Ordering::Relaxed),
             reads_served: m.reads_served.load(Ordering::Relaxed),
             pressure_refusals: m.pressure_refusals.load(Ordering::Relaxed),
+            granted: m.granted.load(Ordering::Relaxed),
+            renewed: m.renewed.load(Ordering::Relaxed),
+            mutated: m.mutated.load(Ordering::Relaxed),
+            released: m.released.load(Ordering::Relaxed),
+            revoked: m.revoked.load(Ordering::Relaxed),
+            denied_auth: m.denied_auth.load(Ordering::Relaxed),
+            denied_stale_fence: m.denied_stale_fence.load(Ordering::Relaxed),
+            denied_revision: m.denied_revision.load(Ordering::Relaxed),
+            denied_membership: m.denied_membership.load(Ordering::Relaxed),
+            denied_admission: m.denied_admission.load(Ordering::Relaxed),
+            expire_proposed: m.expire_proposed.load(Ordering::Relaxed),
+            expiry_rearms: m.expiry_rearms.load(Ordering::Relaxed),
+            leader_changes: m.leader_changes.load(Ordering::Relaxed),
+            quorum_losses: m.quorum_losses.load(Ordering::Relaxed),
+            command_latency_micros: m.command_latency_micros.load(Ordering::Relaxed),
+            commands_timed: m.commands_timed.load(Ordering::Relaxed),
+            read_latency_micros: m.read_latency_micros.load(Ordering::Relaxed),
+            reads_timed: m.reads_timed.load(Ordering::Relaxed),
         }
     }
+
+    /// The §14 disk gauges and pressure tiers, as the monitor last sampled
+    /// them: byte sizes and free-space state, never file contents.
+    pub fn disk_status(&self) -> DiskStatusSnapshot {
+        use std::sync::atomic::Ordering;
+        let p = &self.pressure;
+        DiskStatusSnapshot {
+            state_db_bytes: p.state_db_bytes.load(Ordering::Relaxed),
+            raft_db_bytes: p.raft_db_bytes.load(Ordering::Relaxed),
+            snapshot_bytes: p.snapshot_bytes.load(Ordering::Relaxed),
+            free_space_bytes: p.free_space_bytes.load(Ordering::Relaxed),
+            growth_pressure: p.growth.load(Ordering::Relaxed)
+                || p.force_growth.load(Ordering::Relaxed),
+            free_space_pressure: p.hard.load(Ordering::Relaxed)
+                || p.force_hard.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The §14 consensus snapshot: log positions, leadership, quorum age
+    /// and (on the leader) per-peer replication progress — identifiers and
+    /// indexes only, from `RaftMetrics`, advisory like every local field.
+    pub fn consensus_status(&self) -> ConsensusSnapshot {
+        let metrics = self.raft.metrics().borrow().clone();
+        ConsensusSnapshot {
+            leader_node_id: metrics.current_leader.map(|n| *n.as_bytes()),
+            term: metrics.vote.leader_id().get_term(),
+            last_log_index: metrics.last_log_index,
+            last_applied_index: metrics.last_applied.map(|id| id.index),
+            millis_since_quorum_ack: metrics.millis_since_quorum_ack,
+            replication: metrics
+                .replication
+                .map(|peers| {
+                    peers
+                        .into_iter()
+                        .map(|(node, matched)| (*node.as_bytes(), matched.map(|id| id.index)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// One sample of the §14 disk gauges.
+#[cfg(feature = "coordination")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskStatusSnapshot {
+    pub state_db_bytes: u64,
+    pub raft_db_bytes: u64,
+    pub snapshot_bytes: u64,
+    pub free_space_bytes: u64,
+    /// §11.5 tier one: the state database reached its high-water mark.
+    pub growth_pressure: bool,
+    /// §11.5 tier two: free space fell below the snapshot-replacement floor.
+    pub free_space_pressure: bool,
+}
+
+/// One sample of the §14 consensus facts (advisory, from `RaftMetrics`).
+#[cfg(feature = "coordination")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConsensusSnapshot {
+    pub leader_node_id: Option<[u8; 32]>,
+    pub term: u64,
+    pub last_log_index: Option<u64>,
+    pub last_applied_index: Option<u64>,
+    pub millis_since_quorum_ack: Option<u64>,
+    /// Leader only: per-peer matched log index — the replication lag
+    /// witness. Empty on followers.
+    pub replication: Vec<([u8; 32], Option<u64>)>,
 }
 
 /// One sample of the §14 Store counters.
@@ -215,4 +295,27 @@ pub struct StoreMetricsSnapshot {
     pub reads_served: u64,
     /// Growth-class mutations refused at the state-database high-water mark.
     pub pressure_refusals: u64,
+    // §14: applied register outcomes.
+    pub granted: u64,
+    pub renewed: u64,
+    pub mutated: u64,
+    pub released: u64,
+    pub revoked: u64,
+    // §14: denial families (each also counted in a total above).
+    pub denied_auth: u64,
+    pub denied_stale_fence: u64,
+    pub denied_revision: u64,
+    pub denied_membership: u64,
+    pub denied_admission: u64,
+    // §14: the §9.2 expiry loop.
+    pub expire_proposed: u64,
+    pub expiry_rearms: u64,
+    // §14: consensus transitions.
+    pub leader_changes: u64,
+    pub quorum_losses: u64,
+    // §14: command/read latency, cumulative micros over a count.
+    pub command_latency_micros: u64,
+    pub commands_timed: u64,
+    pub read_latency_micros: u64,
+    pub reads_timed: u64,
 }

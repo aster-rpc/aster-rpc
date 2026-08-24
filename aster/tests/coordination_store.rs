@@ -1742,3 +1742,215 @@ async fn a_denial_storm_is_short_circuited_per_actor() {
     let admins: AdminStatusReplyWireV1 = call(&h.root, "inspect_admins", &request).await;
     assert_eq!(admins.admin_snapshot.administrators.len(), 1);
 }
+
+// ── §14: the observability contract ─────────────────────────────────────────
+
+/// **The §14 counters move with the operations that define them.** One run
+/// exercises grant → acquire → renew → CAS → release → revoke, an
+/// authorization denial, a stale-fence denial and linearizable reads, then
+/// samples every §14 surface: outcome counters, denial families, latency
+/// accumulators, consensus facts (leader, term, applied index, per-peer
+/// replication on the leader) and the disk gauges the pressure monitor
+/// publishes. Counters are operation counts only — no value, resource or
+/// actor identity appears in any surface sampled here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_section_14_surfaces_move_with_the_operations() {
+    let h = harness(0xDB).await;
+    let coordination = h._voter.coordination().expect("hosted");
+    let rights = RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW | RIGHT_MUTATE | RIGHT_RELEASE;
+    grant(&h, 1, b"observed", h.worker.id, rights, 0).await;
+    let root_grant: MutationReplyWireV1 = call(
+        &h.root,
+        "set_grant",
+        &SetGrantRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"root-admin"),
+            sequence: 2,
+            resource: resource(b"observed"),
+            target_node_id: h.root.id.to_vec(),
+            rights: RIGHT_REVOKE,
+            expected_acl_revision: 1,
+        },
+    )
+    .await;
+    assert_eq!(root_grant.outcome_code, 6);
+
+    // The register lifecycle, each §14 outcome once.
+    let acquired: MutationReplyWireV1 = call(
+        &h.worker,
+        "acquire",
+        &AcquireRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 1,
+            resource: resource(b"observed"),
+            ttl_ms: 60_000,
+        },
+    )
+    .await;
+    assert_eq!(acquired.disposition_code, 1);
+    let fence = fence_of(acquired.snapshot.as_ref().expect("held"));
+    let renewed: MutationReplyWireV1 = call(
+        &h.worker,
+        "renew",
+        &RenewRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 2,
+            fence: fence.clone(),
+        },
+    )
+    .await;
+    assert_eq!(renewed.outcome_code, 2);
+    let mutated: MutationReplyWireV1 = call(
+        &h.worker,
+        "compare_and_set",
+        &CompareAndSetRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 3,
+            fence: fence.clone(),
+            expected_value_revision: 0,
+            new_value: vec![1, 2, 3],
+        },
+    )
+    .await;
+    assert_eq!(mutated.outcome_code, 3);
+    let released: MutationReplyWireV1 = call(
+        &h.worker,
+        "release",
+        &ReleaseRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 4,
+            fence: fence.clone(),
+        },
+    )
+    .await;
+    assert_eq!(released.outcome_code, 4);
+
+    // A stale-fence denial: the released fence renews nothing.
+    let stale: MutationReplyWireV1 = call(
+        &h.worker,
+        "renew",
+        &RenewRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 5,
+            fence,
+        },
+    )
+    .await;
+    assert_eq!(stale.reason_code, 2, "NotHeld: {stale:?}");
+
+    // A second holder, then ROOT's revoke fences it.
+    let held: MutationReplyWireV1 = call(
+        &h.worker,
+        "acquire",
+        &AcquireRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 6,
+            resource: resource(b"observed"),
+            ttl_ms: 60_000,
+        },
+    )
+    .await;
+    assert_eq!(held.disposition_code, 1);
+    let revoked: MutationReplyWireV1 = call(
+        &h.root,
+        "revoke",
+        &RevokeRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"root-admin"),
+            sequence: 3,
+            resource: resource(b"observed"),
+            expected_epoch: None,
+        },
+    )
+    .await;
+    assert_eq!(revoked.outcome_code, 5, "{revoked:?}");
+
+    // An authorization denial (the stranger reads the admin set) and a
+    // linearizable read.
+    let (code, _, _) = call_refused(
+        &h.stranger,
+        "inspect_admins",
+        &AdminStatusRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+        },
+    )
+    .await;
+    assert_eq!(code, PERMISSION_DENIED);
+    let _read: ReadReplyWireV1 = call(
+        &h.worker,
+        "read_linearizable",
+        &ReadRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            resource: resource(b"observed"),
+        },
+    )
+    .await;
+
+    // ── The counters. ──
+    let m = coordination.store_metrics();
+    assert!(m.granted >= 2, "two grants of the register: {m:?}");
+    assert!(m.renewed >= 1, "{m:?}");
+    assert!(m.mutated >= 1, "{m:?}");
+    assert!(m.released >= 1, "{m:?}");
+    assert!(m.revoked >= 1, "{m:?}");
+    assert!(m.denied_auth >= 1, "the stranger's denial: {m:?}");
+    assert!(m.denied_stale_fence >= 1, "the stale renew: {m:?}");
+    assert!(m.proposed >= 8, "{m:?}");
+    assert!(m.reads_served >= 1, "{m:?}");
+    assert!(
+        m.commands_timed >= 8 && m.command_latency_micros > 0,
+        "command latency accumulates: {m:?}"
+    );
+    assert!(
+        m.reads_timed >= 1 && m.read_latency_micros > 0,
+        "read latency accumulates: {m:?}"
+    );
+    assert!(m.leader_changes >= 1, "the election was observed: {m:?}");
+
+    // ── The consensus facts. ──
+    let consensus = coordination.consensus_status();
+    assert!(consensus.leader_node_id.is_some(), "{consensus:?}");
+    assert!(
+        consensus.last_applied_index.unwrap_or(0) >= 8,
+        "the applied index advanced: {consensus:?}"
+    );
+    assert!(
+        !consensus.replication.is_empty(),
+        "the leader reports per-peer replication progress: {consensus:?}"
+    );
+
+    // ── The disk gauges, once the monitor has sampled. ──
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let disk = loop {
+        let disk = coordination.disk_status();
+        if disk.state_db_bytes > 0 && disk.free_space_bytes > 0 {
+            break disk;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pressure monitor never sampled: {disk:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert!(disk.raft_db_bytes > 0, "{disk:?}");
+    assert!(
+        !disk.growth_pressure && !disk.free_space_pressure,
+        "{disk:?}"
+    );
+}
