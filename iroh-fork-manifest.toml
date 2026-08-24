@@ -56,22 +56,22 @@ registry_bridge_crates = [
 [forks.iroh-blobs]
 repo = "https://forge.emrul.dev/Aster/iroh-blobs.git"
 upstream_base = "v0.103.0"
-tag = "aster-iroh-blobs-v0.103.1-p1"
-commit = "dfac111c61946c970c5a98e79112957f94291bc3"
+tag = "aster-iroh-blobs-v0.103.2"
+commit = "188c4555854c5ad4b45bf7e3b5e7edf09e492657"
 branch = "upgrade/iroh-blobs-v0.103"
 crates = ["iroh-blobs"]
 registry_crates = ["iroh-blobs"]
-crate_version = "0.103.1"
+crate_version = "0.103.2"
 
 [forks.iroh-docs]
 repo = "https://forge.emrul.dev/Aster/iroh-docs.git"
 upstream_base = "v0.101.0"
-tag = "aster-iroh-docs-v0.101.3"
-commit = "d80d7a6c612b96b5e58e9b888f63f83b74e947e1"
+tag = "aster-iroh-docs-v0.101.4"
+commit = "f38c2a5cb140a83a1c97db4ace1063a7f67e4dfd"
 branch = "upgrade/iroh-docs-v0.101"
 crates = ["iroh-docs"]
 registry_crates = ["iroh-docs"]
-crate_version = "0.101.3"
+crate_version = "0.101.4"
 
 [forks.iroh-gossip]
 repo = "https://forge.emrul.dev/Aster/iroh-gossip.git"
@@ -176,8 +176,8 @@ ed25519-dalek = "=3.0.0-rc.0"        # iroh #4324 bumped from =3.0.0-pre.7
 # Workspace version specs ([workspace.dependencies]):
 version_specs = """
 iroh        = "=1.0.1"
-iroh-blobs  = "0.103.1"
-iroh-docs   = "0.101.3"
+iroh-blobs  = "0.103.2"
+iroh-docs   = "0.101.4"
 iroh-gossip = "0.101.0"
 iroh-tickets = "=1.0.0"
 iroh-mdns-address-lookup = "0.4"
@@ -189,8 +189,8 @@ patch_crates_io = """
 iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
 iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
-iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "dfac111c61946c970c5a98e79112957f94291bc3" }
-iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "d80d7a6c612b96b5e58e9b888f63f83b74e947e1" }
+iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "188c4555854c5ad4b45bf7e3b5e7edf09e492657" }
+iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "f38c2a5cb140a83a1c97db4ace1063a7f67e4dfd" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5c021f998a172b81a69669e71786e14a339fa963" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
 noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
