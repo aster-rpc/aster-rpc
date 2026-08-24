@@ -743,7 +743,7 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
 fn classify_denial(metrics: &StoreMetrics, reason_code: i32) {
     let family = match reason_code {
         12 => &metrics.denied_auth,
-        2 | 3 | 4 => &metrics.denied_stale_fence,
+        2..=4 => &metrics.denied_stale_fence,
         5 | 6 | 7 | 13 => &metrics.denied_revision,
         14 | 16 | 17 | 25 => &metrics.denied_membership,
         _ => return,
