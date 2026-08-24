@@ -9,7 +9,7 @@
 > refine the exact spelling without changing the responsibilities described
 > here.
 
-**Status date:** 2026-08-23.
+**Status date:** 2026-08-24.
 
 Aster coordination gives an Aster application a small, durable place to decide
 facts for which there must be exactly one current answer:
@@ -230,6 +230,12 @@ Every potential coordination host needs a restart-stable Aster identity. Raft
 membership names the exact NodeId; restarting with a new secret creates a
 different node, not a recovered copy of the old one.
 
+The NodeId is the address. Aster discovery resolves a NodeId to its current
+route, and a node ordinarily binds an ephemeral UDP port, so the same identity
+keeps working across IP and port changes. Tests, examples, and deployment
+tooling must not pin direct ports or treat coordination endpoints like HTTP
+host:port pairs — a rendered address is at best an advisory routing hint.
+
 Keep these together in the host's durable state:
 
 ```text
@@ -314,7 +320,8 @@ The deployment tool constructs one signed genesis containing:
 
 - the random group id;
 - the production profile;
-- exactly three initial voter NodeIds and their canonical open route tickets;
+- exactly three initial voter NodeIds and their canonical, credential-free
+  addressless tickets (routes are resolved from NodeId by Aster discovery);
 - one or more initial administrator NodeIds;
 - the authority domain and nonce; and
 - no recovery hash for a new group.
@@ -367,9 +374,15 @@ local rows written beside Raft.
 
 Only empty stores use `Bootstrap`. An initialized voter restarts with
 `CoordinationStart::Existing` and independently supplies the expected group id,
-genesis hash, and deployment profile. A new empty candidate uses
-`CoordinationStart::Join` with a signed permit; the permit lets it communicate
-with bootstrap senders but does not add it to membership.
+genesis hash, and deployment profile. A candidate uses `CoordinationStart::Join`
+with a signed permit; the permit lets it communicate with bootstrap senders but
+does not add it to membership. A joining node's own first start binds its
+storage directory, so a `Join` restart reuses the same stable secret, the same
+NodeId, and that already-bound directory — the permit is re-verified on every
+start rather than persisted, and it stays valid across restarts because it
+binds the candidate's NodeId, not an address: its `candidate_ticket` is the
+canonical addressless ticket derived from that NodeId. An ephemeral IP or UDP
+port change therefore never requires another permit.
 
 For routine control, run a durable client under one of the NodeIds named in
 `initial_admins`; do not turn a voter into ROOT. Keep a separate break-glass
@@ -603,9 +616,11 @@ One reconciliation:
 
 The provisioner owns machines and credentials. It receives the idempotency tuple
 `(group, policy digest, membership LogId, candidate NodeId)`, starts a
-persistent-identity `Join` candidate, and returns its canonical route ticket and
-signed join permit. Repeating that tuple must be safe. Aster never receives the
-Aster ROOT signing secret.
+persistent-identity `Join` candidate, and returns its NodeId and signed join
+permit; the permit's `candidate_ticket` is the canonical addressless ticket
+derived from that NodeId, and the candidate's current route comes from Aster
+discovery. Repeating that tuple must be safe. Aster never receives the Aster
+ROOT signing secret.
 
 The planner normally preserves healthy current voters. It replaces one only
 after an explicit exclusion, removal from the eligible set, or continuous
@@ -670,7 +685,13 @@ durable store, or infer expected identity from the database being checked.
 
 Provision an empty host with a stable Aster identity and a signed join permit.
 Starting in `Join` mode makes it reachable as a candidate; it is still not a
-member. An administrator submits a membership plan, after which Aster:
+member. If the candidate restarts before membership lands, start it in `Join`
+mode again with the same stable secret, the same NodeId, and the directory its
+first start bound; the same permit is simply re-verified — it binds the NodeId
+through its addressless `candidate_ticket`, so new ephemeral addresses or ports
+change nothing and no new permit is minted. Never wipe the bound directory to
+"retry cleanly": the group's quorum may already count the candidate a voter.
+An administrator submits a membership plan, after which Aster:
 
 1. adds the candidate as a learner;
 2. waits for it to apply through the observed committed index;
