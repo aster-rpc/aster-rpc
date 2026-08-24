@@ -238,3 +238,34 @@ pub(crate) fn audit_after(
     }
     Ok(rows.into_values().collect())
 }
+
+/// Every **held** resource row: `(key, epoch, lease_revision, ttl_ms)`.
+///
+/// The §9.2 expiry sweep's input. A full-table scan per sweep is a measured
+/// cost, not an accident: rows do not persist a grant instant — apply reads no
+/// clock — so the leader's timers are reconstructed from the held set, and the
+/// sweep interval bounds how often this runs. Slice 5's benchmark pass owns
+/// the numbers.
+pub(crate) fn held_rows(
+    read: &redb::ReadTransaction,
+) -> StorageResult<Vec<(ResourceKey, u64, u64, u64)>> {
+    let table = read.open_table(RESOURCES).map_err(state_err)?;
+    let mut out = Vec::new();
+    for entry in table.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let (namespace, raw) = key.value();
+        let wire: crate::coordination::raft::ResourceRowV1 = decode_persisted_bounded(
+            Db::State,
+            "ResourceRowV1",
+            value.value(),
+            super::rows::MAX_RESOURCE_ROW_BYTES,
+        )?;
+        if !wire.held {
+            continue;
+        }
+        let resource = ResourceKey::new(namespace, raw.to_vec())
+            .map_err(|err| corrupt("resources.key", format!("{err:?}")))?;
+        out.push((resource, wire.epoch, wire.lease_revision, wire.ttl_ms));
+    }
+    Ok(out)
+}

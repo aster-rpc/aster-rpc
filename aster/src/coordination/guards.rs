@@ -34,6 +34,7 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("client/driver.rs", include_str!("client/driver.rs")),
     ("client/engine.rs", include_str!("client/engine.rs")),
     ("client/journal.rs", include_str!("client/journal.rs")),
+    ("client/lease.rs", include_str!("client/lease.rs")),
     ("client/mod.rs", include_str!("client/mod.rs")),
     ("contract.rs", include_str!("contract.rs")),
     ("convert.rs", include_str!("convert.rs")),
@@ -81,6 +82,7 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("network/mod.rs", include_str!("network/mod.rs")),
     ("network/service.rs", include_str!("network/service.rs")),
     ("runtime/config.rs", include_str!("runtime/config.rs")),
+    ("runtime/expiry.rs", include_str!("runtime/expiry.rs")),
     ("runtime/lifecycle.rs", include_str!("runtime/lifecycle.rs")),
     (
         "runtime/membership.rs",

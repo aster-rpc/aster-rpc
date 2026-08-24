@@ -211,6 +211,8 @@ pub(crate) async fn run_lifecycle(
     // Aborted and replaced on every leadership change, which is what makes
     // "one leader-generation task" true rather than aspirational.
     let mut controller: Option<tokio::task::JoinHandle<()>> = None;
+    // The §9.2 expiry loop, likewise per leader generation.
+    let mut expiry: Option<tokio::task::JoinHandle<()>> = None;
     // The in-flight genesis proposal, if any. Held so a second is not spawned
     // beside it: a proposal into a group without a quorum does not fail, it
     // waits, and one metrics change per heartbeat would otherwise queue an
@@ -300,6 +302,9 @@ pub(crate) async fn run_lifecycle(
                 if let Some(task) = controller.take() {
                     task.abort();
                 }
+                if let Some(task) = expiry.take() {
+                    task.abort();
+                }
                 // Superseding the generation stops the old task even if its
                 // abort has not landed yet: it rechecks this counter before
                 // every side effect.
@@ -312,6 +317,15 @@ pub(crate) async fn run_lifecycle(
                         super::membership::Generation(next),
                         Arc::clone(&generation),
                         Arc::clone(&facts),
+                    )));
+                    // A fresh generation starts with no timers, so every held
+                    // row gets a fresh full TTL (§9.2): failover may delay a
+                    // takeover, never overlap one.
+                    expiry = Some(tokio::spawn(super::expiry::run_generation(
+                        raft.clone(),
+                        state.clone(),
+                        next,
+                        Arc::clone(&generation),
                     )));
                 }
                 leading = is_leader;

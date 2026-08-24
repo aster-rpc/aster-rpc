@@ -291,7 +291,9 @@ impl Engine {
             .await;
             let mut response = match opened {
                 Ok(Ok(response)) => response,
-                Ok(Err(Error::Rpc { code, details, .. })) if code == 14 => {
+                Ok(Err(Error::Rpc {
+                    code: 14, details, ..
+                })) => {
                     if let Some((_, hint)) =
                         details.iter().find(|(key, _)| key == DETAIL_LEADER_NODE_ID)
                     {

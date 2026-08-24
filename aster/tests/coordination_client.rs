@@ -346,3 +346,169 @@ async fn a_client_seeded_with_a_follower_follows_the_hint_to_the_leader() {
         voter.shutdown().await;
     }
 }
+
+/// **The §9.2/§9.4 lease surface end to end**: `CoordinationLease` drives the
+/// existing renewal engine through committed commands; a holder that stops
+/// renewing loses its fence at the self-limit *first*, and the leader's
+/// conservative timer then expires the lease so a successor can acquire —
+/// takeover latency, never overlap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_lease_expires_and_a_successor_acquires() {
+    use aster::coordination::client::lease::{CoordinationLease, LeaseAcquireOutcome};
+    use aster_transport_core::lease::LeaseOptions;
+
+    let fixture = GroupFixture::new("client.expiry", 0xE4, 1);
+    let dir = tempfile::tempdir().expect("a directory");
+    let voter = start_voter(&fixture, 0, dir.path()).await;
+
+    // ROOT grants two workers on one register.
+    let root_node = client_node([0xE4 ^ 0xFF; 32], &fixture, &voter).await;
+    let root_journal = tempfile::tempdir().expect("a directory");
+    let root = CoordinationClient::builder(root_node, group(&fixture))
+        .seed_tickets([voter_ticket(&fixture, 0)])
+        .journal_dir(root_journal.path())
+        .build()
+        .expect("the ROOT client builds");
+    let holder_secret = [0xE4 ^ 0x41; 32];
+    let successor_secret = [0xE4 ^ 0x42; 32];
+    for (sequence, secret) in [(1u64, holder_secret), (2, successor_secret)] {
+        let subject = ed25519_dalek::SigningKey::from_bytes(&secret)
+            .verifying_key()
+            .to_bytes();
+        let granted = within(
+            "grant",
+            root.set_grant(
+                resource(b"reg"),
+                subject,
+                RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW | RIGHT_MUTATE | RIGHT_RELEASE,
+                sequence - 1,
+            ),
+        )
+        .await
+        .expect("ROOT grants");
+        assert_eq!(granted.reply().outcome_code, 6);
+        within("ack", granted.acknowledge()).await.expect("ack");
+    }
+
+    let build_client = |secret: [u8; 32], journal: std::path::PathBuf| {
+        let fixture_ticket = voter_ticket(&fixture, 0);
+        let group_id = group(&fixture);
+        let voter = &voter;
+        let fixture = &fixture;
+        async move {
+            let node = client_node(secret, fixture, voter).await;
+            CoordinationClient::builder(node, group_id)
+                .seed_tickets([fixture_ticket])
+                .journal_dir(&journal)
+                .build()
+                .expect("the client builds")
+        }
+    };
+
+    // The §12.1 minimum TTL, renewals that would keep it alive, and the
+    // default 1s holder margin.
+    let options = LeaseOptions {
+        ttl: Duration::from_millis(5_000),
+        renew_interval: Duration::from_millis(1_500),
+        holder_margin: Duration::from_millis(1_000),
+    };
+
+    let holder_journal = tempfile::tempdir().expect("a directory");
+    let holder = build_client(holder_secret, holder_journal.path().to_path_buf()).await;
+    let lease = match within(
+        "acquire",
+        CoordinationLease::acquire(holder.clone(), resource(b"reg"), options),
+    )
+    .await
+    .expect("the acquire round-trips")
+    {
+        LeaseAcquireOutcome::Granted(lease) => lease,
+        LeaseAcquireOutcome::Denied(reason, snapshot) => {
+            panic!("the first acquire must grant, got {reason:?} over {snapshot:?}")
+        }
+    };
+    let fence = lease.fence().expect("a fresh lease presents its fence");
+    assert_eq!(
+        fence.holder,
+        holder.local_id().expect("a local id").to_vec()
+    );
+
+    // While held, a competing acquire is denied — no live steal.
+    let successor_journal = tempfile::tempdir().expect("a directory");
+    let successor = build_client(successor_secret, successor_journal.path().to_path_buf()).await;
+    match within(
+        "competing acquire",
+        CoordinationLease::acquire(successor.clone(), resource(b"reg"), options),
+    )
+    .await
+    .expect("the competing acquire round-trips")
+    {
+        LeaseAcquireOutcome::Denied(reason, _) => {
+            assert_eq!(reason, aster_transport_core::lease::DenyReason::HeldByOther)
+        }
+        LeaseAcquireOutcome::Granted(_) => panic!("a live lease must not be stolen"),
+    }
+
+    // The holder abandons: renewals stop, and the self-limit strips the fence
+    // strictly before the server timer can transfer ownership.
+    let abandoned_at = std::time::Instant::now();
+    drop(lease);
+
+    // The successor polls for takeover. The §9.2 promise is an order, not a
+    // deadline: the acquire that eventually succeeds must happen only after
+    // the abandoned holder's self-limit (ttl - margin) has passed.
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let successor_lease = loop {
+        match within(
+            "takeover acquire",
+            CoordinationLease::acquire(successor.clone(), resource(b"reg"), options),
+        )
+        .await
+        .expect("the takeover attempt round-trips")
+        {
+            LeaseAcquireOutcome::Granted(lease) => break lease,
+            LeaseAcquireOutcome::Denied(_, _) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the expiry loop never freed the abandoned lease"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    };
+    assert!(
+        abandoned_at.elapsed() >= Duration::from_millis(4_000),
+        "a takeover before the abandoned holder's self-limit would overlap: {:?}",
+        abandoned_at.elapsed()
+    );
+    let successor_fence = successor_lease
+        .fence()
+        .expect("the successor presents its fence");
+    assert!(
+        successor_fence.epoch > fence.epoch,
+        "a takeover advances the epoch: {} then {}",
+        fence.epoch,
+        successor_fence.epoch
+    );
+
+    // The old fence is dead: a mutation under it is a committed EpochMismatch.
+    let stale = within(
+        "stale mutation",
+        holder.compare_and_set(fence, 0, b"stale".to_vec()),
+    )
+    .await
+    .expect("the stale mutation resolves");
+    assert_eq!(stale.reply().outcome_code, 100);
+    assert!(
+        matches!(stale.reply().reason_code, 3 | 4),
+        "the survived race is a committed fence refusal — NotHolder or          EpochMismatch, whichever §9 rule the row met first: {:?}",
+        stale.reply()
+    );
+    within("stale ack", stale.acknowledge()).await.expect("ack");
+
+    within("release", successor_lease.release())
+        .await
+        .expect("the successor releases cleanly");
+
+    voter.shutdown().await;
+}

@@ -28,6 +28,7 @@
 pub(crate) mod driver;
 pub(crate) mod engine;
 pub mod journal;
+pub mod lease;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -626,6 +627,16 @@ impl CoordinationClient {
             target_client_id: target_client_id.to_vec(),
         })?;
         unary_typed(&self.engine, "retire_client", request).await
+    }
+
+    /// The group this client is bound to.
+    pub fn group(&self) -> CoordinationGroupId {
+        self.engine.group
+    }
+
+    /// The local actor identity, as the group authenticates it.
+    pub fn local_id(&self) -> Result<[u8; 32]> {
+        self.engine.local_id()
     }
 
     /// The journal's current client id. Operational: pair it with

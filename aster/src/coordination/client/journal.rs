@@ -834,7 +834,7 @@ mod tests {
         );
 
         // Now kill at each boundary in turn and reopen.
-        for kill_at in 0..walked.len() {
+        for (kill_at, kill_name) in walked.iter().enumerate() {
             let dir = tempfile::tempdir().expect("a directory");
             let counter = Arc::new(AtomicUsize::new(0));
             {
@@ -866,9 +866,8 @@ mod tests {
                         | JournalState::Closing
                         | JournalState::ReplayAfterRetire
                 ),
-                "kill at boundary {kill_at} ({}) reopened into {state:?}, which the \
-                 protocol cannot continue from",
-                walked[kill_at]
+                "kill at boundary {kill_at} ({kill_name}) reopened into {state:?}, which \
+                 the protocol cannot continue from"
             );
             // The invariant the resend rule rests on: whenever the record says
             // Pending / Closing / ReplayAfterRetire, the exact bytes are there.
