@@ -97,6 +97,7 @@ pub mod testing;
 #[derive(Clone)]
 pub struct Coordination {
     readiness: runtime::readiness::Readiness,
+    store_metrics: std::sync::Arc<store::host::StoreMetrics>,
     /// The seam's handle onto the running `Raft`.
     ///
     /// Gated with the seam that reads it, so a shipping build carries neither
@@ -114,6 +115,7 @@ impl Coordination {
     pub(crate) fn of(rt: &runtime::owner::CoordinationRuntime) -> Self {
         Self {
             readiness: rt.readiness(),
+            store_metrics: rt.store_metrics(),
             #[cfg(feature = "coordination-testing")]
             raft: rt.raft().clone(),
             #[cfg(feature = "coordination-testing")]
@@ -155,4 +157,43 @@ impl Coordination {
     pub fn quorum_available(&self) -> Option<bool> {
         self.readiness.view().quorum_available
     }
+
+    /// A snapshot of the bounded Store counters (§14).
+    ///
+    /// Monotonic operation counts only — no value, resource key, or actor is
+    /// ever recorded, so metrics can be exported without touching the audit
+    /// boundary.
+    pub fn store_metrics(&self) -> StoreMetricsSnapshot {
+        use std::sync::atomic::Ordering;
+        let m = &self.store_metrics;
+        StoreMetricsSnapshot {
+            proposed: m.proposed.load(Ordering::Relaxed),
+            replayed: m.replayed.load(Ordering::Relaxed),
+            denied_typed: m.denied_typed.load(Ordering::Relaxed),
+            denied_status: m.denied_status.load(Ordering::Relaxed),
+            redirected: m.redirected.load(Ordering::Relaxed),
+            reads_served: m.reads_served.load(Ordering::Relaxed),
+            pressure_refusals: m.pressure_refusals.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One sample of the §14 Store counters.
+#[cfg(feature = "coordination")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreMetricsSnapshot {
+    /// Mutations admitted and proposed through consensus.
+    pub proposed: u64,
+    /// Requests answered from the saved session result.
+    pub replayed: u64,
+    /// Typed reason-coded denials.
+    pub denied_typed: u64,
+    /// Status-only denials, including the §11.5 pressure gate.
+    pub denied_status: u64,
+    /// Follower answers carrying the redirect hint.
+    pub redirected: u64,
+    /// Linearizable read/status/stream calls served.
+    pub reads_served: u64,
+    /// Growth-class mutations refused at the state-database high-water mark.
+    pub pressure_refusals: u64,
 }

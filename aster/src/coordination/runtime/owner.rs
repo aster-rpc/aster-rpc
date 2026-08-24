@@ -388,6 +388,7 @@ pub(crate) struct CoordinationRuntime {
     readiness: Readiness,
     endpoint: RaftEndpoint,
     store_endpoint: crate::coordination::store::host::StoreEndpoint,
+    store_metrics: std::sync::Arc<crate::coordination::store::host::StoreMetrics>,
     local: CoordinationNodeId,
     /// The leader generation counter. Bumping it is what makes a superseded
     /// controller stop at its next side effect, whether or not its abort has
@@ -431,6 +432,11 @@ impl CoordinationRuntime {
     ) -> Self {
         let state = attached.state.clone();
         let group = attached.group;
+        let state_db = attached
+            .layout
+            .database(crate::coordination::storage::error::Db::State);
+        let store_metrics =
+            std::sync::Arc::new(crate::coordination::store::host::StoreMetrics::default());
         let generation = Arc::new(AtomicU64::new(0));
         let timeout = leader_liveness_timeout(config);
 
@@ -456,6 +462,8 @@ impl CoordinationRuntime {
                 group,
                 local,
                 readiness: readiness.clone(),
+                state_db,
+                metrics: std::sync::Arc::clone(&store_metrics),
             })
             .await;
 
@@ -477,6 +485,7 @@ impl CoordinationRuntime {
             readiness,
             endpoint,
             store_endpoint,
+            store_metrics,
             local,
             generation,
             controllers: Vec::new(),
@@ -492,6 +501,12 @@ impl CoordinationRuntime {
 
     pub(crate) fn readiness(&self) -> Readiness {
         self.readiness.clone()
+    }
+
+    pub(crate) fn store_metrics(
+        &self,
+    ) -> std::sync::Arc<crate::coordination::store::host::StoreMetrics> {
+        std::sync::Arc::clone(&self.store_metrics)
     }
 
     pub(crate) fn facts(&self) -> &Arc<RuntimeFacts> {

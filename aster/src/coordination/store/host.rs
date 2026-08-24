@@ -83,6 +83,82 @@ pub(crate) struct AttachedStore {
     pub(crate) group: CoordinationGroupId,
     pub(crate) local: CoordinationNodeId,
     pub(crate) readiness: Readiness,
+    /// Where `state.redb` lives, for the §11.5 host-local pressure gate.
+    pub(crate) state_db: std::path::PathBuf,
+    /// The bounded operational counters (§14).
+    pub(crate) metrics: Arc<StoreMetrics>,
+}
+
+/// Bounded Store counters (§14): what the service did, never what it carried.
+///
+/// Atomics, monotonic, sampled by [`crate::coordination::Coordination`]'s
+/// public accessor. No value, resource key or actor ever enters a metric.
+#[derive(Debug, Default)]
+pub struct StoreMetrics {
+    /// Mutations admitted and proposed through Raft.
+    pub proposed: std::sync::atomic::AtomicU64,
+    /// Requests answered from the session table (§8.2.1 stage 2).
+    pub replayed: std::sync::atomic::AtomicU64,
+    /// Typed reason-coded denials (stages 2–3).
+    pub denied_typed: std::sync::atomic::AtomicU64,
+    /// Status-only denials (stages 0 and 4), including the pressure gate.
+    pub denied_status: std::sync::atomic::AtomicU64,
+    /// Follower answers carrying the §5.4 redirect hint.
+    pub redirected: std::sync::atomic::AtomicU64,
+    /// Linearizable read/status/stream calls served.
+    pub reads_served: std::sync::atomic::AtomicU64,
+    /// Mutations refused by the §11.5 growth pressure gate.
+    pub pressure_refusals: std::sync::atomic::AtomicU64,
+}
+
+impl StoreMetrics {
+    fn bump(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// §11.5's first tier: at the state-database high-water mark, growth-class
+/// mutations are refused pre-proposal with a status (§10 stage 4 — after
+/// session resolution) while reads and safety-reducing operations continue.
+///
+/// The free-space tier below it needs a platform free-space API the crate does
+/// not carry (the dependency gate excludes the fs2/fs4 family); the evidence
+/// ledger records that half as host-integration work rather than claiming it.
+fn growth_pressure(runtime: &AttachedStore) -> bool {
+    growth_pressure_at(
+        &runtime.state_db,
+        crate::coordination::model::limits::LOCAL_HIGH_WATER,
+    )
+}
+
+/// The tier-one predicate with its threshold explicit, so a test can prove
+/// the comparison without manufacturing a 384 MiB database.
+fn growth_pressure_at(state_db: &std::path::Path, high_water: u64) -> bool {
+    std::fs::metadata(state_db)
+        .map(|meta| meta.len() >= high_water)
+        .unwrap_or(false)
+}
+
+/// Which decoded mutations the §11.5 growth tier refuses.
+///
+/// Method identity is not enough: `set_grant` removing rights and `set_admin`
+/// disabling a row are the ACL *removals* §11.5 keeps available, while the
+/// same methods adding them are growth. The classification reads the decoded
+/// action, never state — this is a host-local admission gate, and the
+/// replicated byte budget in apply stays the exact authority.
+fn is_growth_mutation(action: &ActionV1) -> bool {
+    match action {
+        ActionV1::Acquire(_) => true,
+        ActionV1::CompareAndSet(_) => true,
+        ActionV1::ReleaseWithValue(_) => true,
+        ActionV1::ChangeMembership(_) => true,
+        ActionV1::SetGrant(grant) => grant.rights != 0,
+        ActionV1::SetAdmin(admin) => admin.enabled,
+        // Safety-reducing or size-preserving: release, revoke, cancel.
+        ActionV1::Release(_) | ActionV1::Revoke(_) | ActionV1::CancelMembership(_) => false,
+        ActionV1::Renew(_) => false,
+        ActionV1::Unknown(_) => false,
+    }
 }
 
 impl StoreEndpoint {
@@ -213,6 +289,7 @@ where
 /// admitted-peer operational metadata. No resource existence, holder, ACL or
 /// value ever rides in a status.
 fn not_leader(runtime: &AttachedStore) -> RpcStatus {
+    StoreMetrics::bump(&runtime.metrics.redirected);
     let metrics = runtime.raft.metrics().borrow().clone();
     let mut status = RpcStatus::error(
         StatusCode::Unavailable,
@@ -561,6 +638,11 @@ async fn mutation(
     match admission {
         // Stage 2: every resolved row — replays and refusals, terminal or not.
         Admission::Resolved(result) => {
+            if result.replayed {
+                StoreMetrics::bump(&runtime.metrics.replayed);
+            } else {
+                StoreMetrics::bump(&runtime.metrics.denied_typed);
+            }
             let provenance = if result.replayed {
                 crate::coordination::model::project::Provenance::Replay
             } else {
@@ -578,6 +660,7 @@ async fn mutation(
         // Stage 3: a reason-coded admission denial. Typed, NotConsumed,
         // nothing written.
         Admission::Deny(refusal) => {
+            StoreMetrics::bump(&runtime.metrics.denied_typed);
             let projected = ClientReplyV1 {
                 disposition_code: 2,
                 outcome_code: Outcome::Rejected.code(),
@@ -592,6 +675,7 @@ async fn mutation(
         }
         // Stage 4: no §5.2 reason code exists, so an `RpcStatus`.
         Admission::Status(denial) => {
+            StoreMetrics::bump(&runtime.metrics.denied_status);
             let status = match denial {
                 StatusDenial::NotAuthorized => RpcStatus::error(
                     StatusCode::PermissionDenied,
@@ -604,8 +688,23 @@ async fn mutation(
             let _ = call.finish(&status).await;
         }
         // Stage 4 → 5: propose the leader-stamped command and project the
-        // exact applied reply.
+        // exact applied reply. The §11.5 growth pressure gate sits here —
+        // after session resolution, with the other host-local stage-4
+        // denials — so a saved result is never stranded behind disk pressure.
         Admission::Admit => {
+            if is_growth_mutation(&decoded.wire_action) && growth_pressure(runtime) {
+                StoreMetrics::bump(&runtime.metrics.pressure_refusals);
+                StoreMetrics::bump(&runtime.metrics.denied_status);
+                let _ = call
+                    .finish(&RpcStatus::error(
+                        StatusCode::ResourceExhausted,
+                        "the state database is at its §11.5 high-water mark; growth-class \
+                         mutations are refused while safety-reducing operations continue",
+                    ))
+                    .await;
+                return;
+            }
+            StoreMetrics::bump(&runtime.metrics.proposed);
             let command = CommandV1::Client(ClientCommandV1 {
                 actor_node_id: actor.to_vec(),
                 client_id: decoded.prefix.client_id.to_vec(),
@@ -825,6 +924,7 @@ struct ReadCut {
 }
 
 async fn read_cut(runtime: &AttachedStore) -> Result<ReadCut, RpcStatus> {
+    StoreMetrics::bump(&runtime.metrics.reads_served);
     let barrier_id = barrier(runtime).await?;
     let guarded = runtime
         .state
@@ -1477,4 +1577,116 @@ async fn recovery_export(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8],
         }
     }
     let _ = call.finish(&RpcStatus::ok()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordination::contract::{
+        AcquireActionV1, CancelMembershipActionV1, ChangeMembershipActionV1, CompareAndSetActionV1,
+        FenceV1, ReleaseActionV1, ReleaseWithValueActionV1, ResourceKeyV1, RevokeActionV1,
+        SetAdminActionV1, SetGrantActionV1,
+    };
+
+    fn key() -> ResourceKeyV1 {
+        ResourceKeyV1 {
+            namespace: "ns".into(),
+            key: vec![1],
+        }
+    }
+
+    fn fence() -> FenceV1 {
+        FenceV1 {
+            group_id: vec![0xAA; 32],
+            resource: key(),
+            epoch: 1,
+            holder: vec![0xBB; 32],
+        }
+    }
+
+    /// §11.5's split, per decoded action: growth is refused at the high-water
+    /// mark, safety-reducing and size-preserving operations continue — and the
+    /// two directions of `set_grant`/`set_admin` land on opposite sides.
+    #[test]
+    fn the_growth_classification_matches_the_section_11_5_lists() {
+        let growth = [
+            ActionV1::Acquire(AcquireActionV1 {
+                resource: key(),
+                ttl_ms: 30_000,
+            }),
+            ActionV1::CompareAndSet(CompareAndSetActionV1 {
+                fence: fence(),
+                expected_value_revision: 0,
+                new_value: vec![1],
+            }),
+            ActionV1::ReleaseWithValue(ReleaseWithValueActionV1 {
+                fence: fence(),
+                expected_value_revision: 0,
+                final_value: vec![1],
+            }),
+            ActionV1::ChangeMembership(ChangeMembershipActionV1 {
+                operation_id: vec![0; 16],
+                expected_membership_log_id: None,
+                desired_voters: Vec::new(),
+                retained_learners: Vec::new(),
+                member_seeds: Vec::new(),
+            }),
+            ActionV1::SetGrant(SetGrantActionV1 {
+                resource: key(),
+                target_node_id: vec![0xCC; 32],
+                rights: 1,
+                expected_acl_revision: 0,
+            }),
+            ActionV1::SetAdmin(SetAdminActionV1 {
+                target_node_id: vec![0xCC; 32],
+                enabled: true,
+                expected_admin_revision: 1,
+            }),
+        ];
+        for action in &growth {
+            assert!(is_growth_mutation(action), "{action:?} adds bytes");
+        }
+
+        let continuing = [
+            ActionV1::Renew(crate::coordination::contract::RenewActionV1 { fence: fence() }),
+            ActionV1::Release(ReleaseActionV1 { fence: fence() }),
+            ActionV1::Revoke(RevokeActionV1 {
+                resource: key(),
+                expected_epoch: None,
+            }),
+            ActionV1::CancelMembership(CancelMembershipActionV1 {
+                operation_id: vec![0; 16],
+                expected_phase_code: 1,
+            }),
+            // ACL removal and admin removal free bytes; §11.5 keeps them.
+            ActionV1::SetGrant(SetGrantActionV1 {
+                resource: key(),
+                target_node_id: vec![0xCC; 32],
+                rights: 0,
+                expected_acl_revision: 0,
+            }),
+            ActionV1::SetAdmin(SetAdminActionV1 {
+                target_node_id: vec![0xCC; 32],
+                enabled: false,
+                expected_admin_revision: 1,
+            }),
+        ];
+        for action in &continuing {
+            assert!(!is_growth_mutation(action), "{action:?} must continue");
+        }
+    }
+
+    /// The tier-one predicate compares the database's real size against the
+    /// threshold, and answers false for a database it cannot stat rather than
+    /// refusing service on a metadata hiccup.
+    #[test]
+    fn the_pressure_predicate_reads_the_database_size() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let db = dir.path().join("state.redb");
+        std::fs::write(&db, vec![0u8; 1024]).expect("write");
+        assert!(!growth_pressure_at(&db, 2048));
+        assert!(growth_pressure_at(&db, 1024));
+        assert!(growth_pressure_at(&db, 512));
+        assert!(!growth_pressure_at(&dir.path().join("absent"), 1));
+    }
 }
