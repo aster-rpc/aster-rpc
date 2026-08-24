@@ -338,6 +338,21 @@ pub(crate) enum Step {
     Idle,
     /// Add these learners, then re-observe.
     AddLearners(BTreeSet<CoordinationNodeId>),
+    /// Every node is present and no barrier has been taken: confirm leadership
+    /// with a quorum and record the committed cut (§7.3 step 3).
+    ///
+    /// A step rather than a value the table computes, because the committed cut
+    /// is not in `RaftMetrics` and cannot be. `last_log_index` is the log head,
+    /// which includes entries no quorum has accepted — a learner could be told
+    /// to reach a position that never commits. `last_applied` is only a *lower
+    /// bound* on the committed state, not the contract's committed cut. Only
+    /// `Raft::ensure_linearizable` produces that: it heartbeats a quorum, which
+    /// is the only thing that proves this node still holds authority *now*, and
+    /// then waits until the state machine has applied up to the read log id.
+    ///
+    /// Costing one round trip per intent per generation, not per polling pass:
+    /// the barrier is taken once and remembered for the life of the generation.
+    EstablishCatchUpBarrier,
     /// Every node is present; wait for each desired voter to reach `barrier`.
     AwaitCatchUp {
         barrier: u64,
@@ -372,7 +387,10 @@ pub(crate) enum Step {
 /// which `classify_change` turns into `ChangeOutcome::Retry`.
 ///
 /// `metrics` is still needed, and only for what it is authoritative about:
-/// this node's id, its last log index, and per-peer replication progress.
+/// this node's id, and per-peer replication progress. Not `last_log_index` —
+/// the table read it for the catch-up barrier and no longer does, because the
+/// barrier is a committed cut that costs a quorum round trip
+/// ([`Step::EstablishCatchUpBarrier`]).
 pub(crate) fn next_step(
     intent: &crate::coordination::model::state::Intent,
     metrics: &super::lifecycle::Metrics,
@@ -414,14 +432,13 @@ pub(crate) fn next_step(
             // membership the group can commit, and waiting for it would let one
             // slow non-voter stall a change indefinitely.
             let Some(barrier) = catch_up_barrier else {
-                // §7.3 step 3 measures against the committed index observed
+                // §7.3 step 3 measures against the **committed cut** observed
                 // *when the promotion step began*. No barrier yet means this
                 // pass is that beginning — a barrier re-read every pass is a
-                // moving target no learner ever reaches.
-                return Step::AwaitCatchUp {
-                    barrier: metrics.last_log_index.unwrap_or(0),
-                    outstanding: desired.iter().copied().collect(),
-                };
+                // moving target no learner ever reaches — and taking it needs a
+                // quorum round trip the table cannot make. See
+                // [`Step::EstablishCatchUpBarrier`].
+                return Step::EstablishCatchUpBarrier;
             };
             let outstanding: BTreeSet<CoordinationNodeId> = desired
                 .iter()
@@ -476,6 +493,46 @@ pub(crate) fn next_step(
         // is nothing to drive, and inventing a step for one would be acting on
         // a state the model does not define.
         _ => Step::Idle,
+    }
+}
+
+/// Confirm leadership with a quorum and take the committed cut (§7.3 step 3).
+///
+/// `ensure_linearizable` is the only call that produces it. It heartbeats a
+/// quorum — which is what proves this node still holds authority *now*, and is
+/// exactly what `still_leading` cannot prove: an isolated leader goes on
+/// reporting `ServerState::Leader` indefinitely, and the resume gates depend on
+/// that being true. It then waits until the state machine has applied up to the
+/// read log id, so the value returned is a position the group has agreed on and
+/// this node has.
+///
+/// The three failures are three different things and are answered as such:
+/// leadership that has moved ends the generation, a quorum this node cannot
+/// currently reach is a retry that leaves the intent untouched, and a fatal
+/// runtime is a lifecycle state rather than an intent outcome.
+async fn establish_barrier(raft: &Raft<CoordinationTypeConfig>) -> Result<u64, ChangeOutcome> {
+    use openraft::error::CheckIsLeaderError;
+
+    match raft.ensure_linearizable().await {
+        // `None` is a leader that has committed nothing at all, whose committed
+        // cut is the empty prefix. Zero is that, not a fallback.
+        Ok(read) => Ok(read.map(|id| id.index).unwrap_or(0)),
+        Err(RaftError::Fatal(fatal)) => Err(ChangeOutcome::Invariant {
+            detail: format!("the Raft runtime is fatal: {fatal}"),
+        }),
+        Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(to))) => {
+            Err(ChangeOutcome::EndGeneration {
+                detail: format!(
+                    "leadership moved while taking the catch-up barrier: {:?}",
+                    to.leader_id
+                ),
+            })
+        }
+        Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(err))) => {
+            Err(ChangeOutcome::Retry {
+                detail: format!("no quorum answered the barrier heartbeat: {err}"),
+            })
+        }
     }
 }
 
@@ -574,11 +631,31 @@ pub(crate) async fn run_generation(
                 }
                 result
             }
+            Step::EstablishCatchUpBarrier => {
+                // Re-checked immediately before the round trip, like every
+                // other side effect: a generation that has been superseded must
+                // not spend a quorum's heartbeats on an intent it no longer
+                // drives.
+                if !still_leading(
+                    &raft.metrics().borrow().clone(),
+                    &local,
+                    generation,
+                    Arc::clone(&current_generation),
+                ) {
+                    return;
+                }
+                match establish_barrier(&raft).await {
+                    Ok(cut) => {
+                        barrier = Some((operation_id, cut));
+                        Ok(())
+                    }
+                    Err(outcome) => Err(outcome),
+                }
+            }
             Step::AwaitCatchUp {
-                barrier: observed,
+                barrier: _,
                 outstanding: _,
             } => {
-                barrier = Some((operation_id, observed));
                 tokio::time::sleep(IDLE_POLL).await;
                 Ok(())
             }
@@ -1109,6 +1186,11 @@ mod tests {
             Some(10),
             Arc::new(StoredMembership::new(None, Membership::new(configs, nodes))),
         );
+        // The head runs **ahead of** the applied index on purpose: 100 against
+        // the 7 the fixture applies. §7.3's catch-up barrier is the committed
+        // index, and a fixture where the two agreed could not tell a correct
+        // reading from the log head — which is exactly what this locked in
+        // while the barrier read `last_log_index`.
         metrics.last_log_index = Some(100);
         metrics.replication = Some(
             replication
@@ -1145,6 +1227,49 @@ mod tests {
             metrics.membership_config.membership(),
             barrier,
         )
+    }
+
+    /// **The catch-up barrier is not computed from metrics at all.**
+    ///
+    /// §7.3 step 3 measures promotion against the committed cut observed when
+    /// the step began, and no field of `RaftMetrics` is that. `last_log_index`
+    /// is the log head, which includes entries no quorum has accepted — a
+    /// learner could be told to reach a position that never commits, and the
+    /// promotion would wait forever for an index the group had abandoned.
+    /// `last_applied` is only a *lower bound* on committed state. Both were
+    /// used here in turn, and both were wrong for the same reason: the value
+    /// requires a quorum round trip, so the table asks for one instead of
+    /// guessing.
+    ///
+    /// The fixture's head deliberately runs far ahead of its applied index, so
+    /// a table that reached for either would produce a number and this would
+    /// catch it.
+    #[test]
+    fn the_catch_up_barrier_is_taken_by_a_quorum_round_trip_not_read_from_metrics() {
+        let plan = intent(phases::PHASE_ADDING_LEARNERS, &[1, 2], &[], &[]);
+        let mut diverged = view(&[&[1]], &[2], &[]);
+        diverged.last_log_index = Some(9_000);
+        diverged.last_applied = Some(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(5, node(0)),
+            42,
+        ));
+
+        assert_eq!(
+            step(&plan, &diverged, None),
+            Step::EstablishCatchUpBarrier,
+            "with every node present and no barrier recorded, the table asks for the \
+             committed cut rather than inventing one from the head (9000) or from the \
+             applied index (42)"
+        );
+
+        // And once a barrier exists it is *used*, not re-derived: a learner
+        // that reached it is caught up whatever the head says.
+        assert_eq!(
+            step(&plan, &view(&[&[1]], &[2], &[(2, 42)]), Some(42)),
+            Step::ChangeVoters,
+            "a recorded barrier is the measure, and re-reading one every pass would be \
+             a moving target no learner reaches"
+        );
     }
 
     /// **An entry that is only *effective* does not advance the table.**
@@ -1215,17 +1340,16 @@ mod tests {
             Step::AddLearners(members(&[2, 3, 9]))
         );
 
-        // All present, no barrier yet: this pass observes one.
+        // All present, no barrier yet: this pass asks for one, and asking is a
+        // quorum round trip rather than a metrics read. See
+        // `the_catch_up_barrier_is_taken_by_a_quorum_round_trip_not_read_from_metrics`.
         assert_eq!(
             step(
                 &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
                 &view(&[&[1]], &[2, 3, 9], &[]),
                 None
             ),
-            Step::AwaitCatchUp {
-                barrier: 100,
-                outstanding: members(&[1, 2, 3]),
-            }
+            Step::EstablishCatchUpBarrier
         );
 
         // A barrier, and one voter still behind.

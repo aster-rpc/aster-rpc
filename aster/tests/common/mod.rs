@@ -69,6 +69,11 @@ pub struct ChaosFixture {
     group: [u8; 32],
     authority: SigningKey,
     secrets: Vec<[u8; 32]>,
+    /// Candidates outside the genesis that the signed admission set still
+    /// names. §5.3 checks the admission class **before** the membership
+    /// allowlist, so a joiner missing from the set is refused for a reason that
+    /// has nothing to do with the rule under test.
+    admitted: Vec<[u8; 32]>,
 }
 
 impl ChaosFixture {
@@ -81,7 +86,14 @@ impl ChaosFixture {
             group: [seed; 32],
             authority: SigningKey::from_bytes(&[seed ^ 0xFF; 32]),
             secrets: (0..size).map(|i| [seed ^ (0x10 + i as u8); 32]).collect(),
+            admitted: Vec::new(),
         }
+    }
+
+    /// Also name `candidate` in the signed admission set.
+    pub fn admitting(mut self, candidate: [u8; 32]) -> Self {
+        self.admitted.push(candidate);
+        self
     }
 
     pub fn size(&self) -> usize {
@@ -173,8 +185,15 @@ impl ChaosFixture {
 
     pub fn admission(&self) -> Arc<dyn VerifiedAdmissionSource> {
         let mut entries: Vec<AdmissionEntryV1> = (0..self.size())
-            .map(|i| AdmissionEntryV1 {
-                node_id: self.node_id(i),
+            .map(|i| self.node_id(i))
+            .chain(self.admitted.iter().map(|secret| {
+                SigningKey::from_bytes(secret)
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec()
+            }))
+            .map(|node_id| AdmissionEntryV1 {
+                node_id,
                 class_code: ADMISSION_CLASS_PRODUCER,
             })
             .collect();
@@ -195,6 +214,110 @@ impl ChaosFixture {
             SignedAdmissionSet::verify(&self.authority_key(), &self.domain, &signed)
                 .expect("the fixture's own set verifies"),
         )
+    }
+
+    /// The hash of this fixture's genesis **document**.
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        use aster::coordination::raft::SignedCoordinationDocumentV1;
+        let signed = self.signed_genesis();
+        let envelope: SignedCoordinationDocumentV1 =
+            aster::coordination::contract::payload_fory::<SignedCoordinationDocumentV1>()
+                .deserialize(&signed)
+                .expect("the fixture's own genesis decodes");
+        aster::coordination::model::authority::genesis_hash(&envelope.document_bytes)
+    }
+
+    /// A signed join permit for `candidate`, naming `senders` as the **only**
+    /// bootstrap senders it will accept Raft from before graduation.
+    ///
+    /// The narrowness is the point for
+    /// `a_joiner_survives_leadership_moving_outside_its_bootstrap_senders`:
+    /// §7.2's seed allowlist is exactly this list, and the group's leader can
+    /// move to a voter that is not on it.
+    pub fn join_permit(&self, candidate: [u8; 32], senders: &[usize]) -> Vec<u8> {
+        use aster::coordination::model::authority::{
+            canonical_document_bytes, join_signing_bytes, signed_document_from_parts,
+        };
+        use aster::coordination::raft::JoinPermitV1;
+
+        let candidate_key = SigningKey::from_bytes(&candidate)
+            .verifying_key()
+            .to_bytes();
+        let candidate_id = candidate_key.to_vec();
+        let mut bootstrap_senders: Vec<NodeIdV1> = senders
+            .iter()
+            .map(|i| NodeIdV1 {
+                node_id: self.node_id(*i),
+            })
+            .collect();
+        bootstrap_senders.sort_by(|l, r| l.node_id.cmp(&r.node_id));
+
+        let permit = JoinPermitV1 {
+            format_version: 1,
+            group_id: self.group.to_vec(),
+            authority_domain: self.domain.clone(),
+            genesis_hash: self.genesis_hash().to_vec(),
+            candidate_ticket: aster::coordination::model::authority::canonical_candidate_ticket(
+                &candidate_key,
+            )
+            .expect("a canonical candidate ticket"),
+            candidate_node_id: candidate_id,
+            bootstrap_senders,
+            join_nonce: vec![self.group[0] ^ 0x5A; 32],
+        };
+        let document = canonical_document_bytes(&permit).expect("encode a permit");
+        let signature = self.authority.sign(&join_signing_bytes(&document));
+        signed_document_from_parts(document, &self.authority_key(), &signature.to_bytes())
+            .expect("encode a signed permit")
+    }
+
+    /// Start a **candidate**: a node outside the genesis, joining on a permit.
+    ///
+    /// It carries an injector like every other node here, so a gate can cut it
+    /// off or cut off the voter it was told to talk to.
+    pub async fn start_joiner(
+        &self,
+        candidate: [u8; 32],
+        senders: &[usize],
+        schedule: Schedule,
+    ) -> ChaoticVoter {
+        let dir = tempfile::tempdir().expect("a storage directory");
+        let chaos = ChaosNetwork::new(schedule);
+        let config = CoordinationConfig::builder()
+            .storage_dir(dir.path())
+            .authority_domain(&self.domain)
+            .start_mode(CoordinationStart::Join {
+                signed_join_permit: self.join_permit(candidate, senders),
+                expected_deployment_profile_code: self.profile(),
+            })
+            .verified_admission(self.admission())
+            .chaos_for_testing(Arc::clone(&chaos))
+            .build()
+            .expect("a complete configuration");
+        let server = AsterServer::builder()
+            .config(
+                AsterConfig::builder()
+                    .relay(RelayMode::Disabled)
+                    .bind_addr("127.0.0.1:0")
+                    .secret_key(SecretKey::from_bytes(candidate))
+                    .root_pubkey(aster::PublicKey::from_bytes(self.authority_key()))
+                    .build(),
+            )
+            .builtin_coordination(config)
+            .start()
+            .await
+            .expect("a candidate joins with a valid permit");
+        ChaoticVoter {
+            server,
+            chaos,
+            id: CoordinationNodeId::from_slice(
+                SigningKey::from_bytes(&candidate)
+                    .verifying_key()
+                    .as_bytes(),
+            )
+            .expect("a 32-byte node id"),
+            _dir: dir,
+        }
     }
 
     /// Start every voter, each behind its own injector running `schedule`, and
@@ -257,6 +380,26 @@ impl ChaosFixture {
             }
         }
         voters
+    }
+}
+
+/// Tell every node in `group` about every other's current address.
+///
+/// The same `add_node_addr` substitution for discovery the other same-host
+/// cluster gates use: a voter binds an ephemeral port, so nothing signed can
+/// name where it is, and the group finds each other by NodeId.
+pub fn cross_register(group: &[&ChaoticVoter]) {
+    let addrs: Vec<_> = group.iter().map(|v| v.server.node().addr()).collect();
+    for voter in group {
+        for addr in &addrs {
+            if addr.node_id != voter.server.node().addr().node_id {
+                voter
+                    .server
+                    .node()
+                    .add_node_addr(addr.clone())
+                    .expect("register a peer address");
+            }
+        }
     }
 }
 

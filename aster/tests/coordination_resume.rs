@@ -609,9 +609,18 @@ async fn openraft_refuses_a_repeat_change_while_one_is_uncommitted() {
         Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(
             ChangeMembershipError::InProgress(in_progress),
         ))) => {
-            // And it names the entry that is in the way, which is what makes
-            // the retry a wait rather than a guess.
-            println!("InProgress: {in_progress:?}");
+            // And it names an entry that is genuinely **ahead of** the
+            // committed position — which is what makes the corridor's retry a
+            // wait for something identifiable rather than a guess. Asserted,
+            // not printed: a refusal whose two ids agreed would describe a
+            // group with nothing in flight, and this gate would be reporting
+            // the right variant for the wrong reason.
+            let committed = in_progress.committed.as_ref().map(|id| id.index);
+            let pending = in_progress.membership_log_id.as_ref().map(|id| id.index);
+            assert!(
+                pending > committed,
+                "InProgress must name a membership entry past the committed                  index; committed {committed:?}, membership {pending:?}"
+            );
         }
         other => panic!(
             "a repeat change while one is uncommitted must answer InProgress; it \

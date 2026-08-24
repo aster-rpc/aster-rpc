@@ -261,8 +261,21 @@ pub(crate) async fn run_lifecycle(
             // says "a *committed* membership contains us", and an uncommitted
             // one saying so is not that.
             let committed = state.committed_membership();
+            // **Every node, not every voter.** §7.2 makes the event "a committed
+            // membership contains this node", and §7.3 adds a candidate as a
+            // *learner* first and promotes it only after catch-up. Reading
+            // `voter_ids()` meant a joining node never graduated during the one
+            // interval where graduation matters: it stayed on the signed seed
+            // allowlist, which admits only its `bootstrap_senders`, so a
+            // leadership change to a voter outside that list left the joiner
+            // unable to be spoken to by the leader responsible for catching it
+            // up — wedged, with nothing in its own state saying why.
+            //
+            // The same set drives the corridor exit below for the same reason:
+            // a `Joining` node becomes `Running` when the group has committed
+            // its membership, in whichever role.
             let members: BTreeSet<CoordinationNodeId> =
-                committed.membership().voter_ids().collect();
+                committed.membership().nodes().map(|(id, _)| *id).collect();
             allowlist.observe(&local, &members);
 
             // A corridor ends on an observable durable fact, never on a timer.

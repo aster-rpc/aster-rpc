@@ -184,7 +184,15 @@ pub(crate) struct AdmissionContext<'a> {
     pub(crate) group: &'a CoordinationGroupId,
     pub(crate) admission: &'a dyn VerifiedAdmissionSource,
     pub(crate) allowlist: &'a SenderAllowlist,
-    /// The current committed membership, as the allowlist reads it.
+    /// Who may speak Raft to this node right now: the union of the committed
+    /// and effective memberships, built by
+    /// `service::admissible_members`.
+    ///
+    /// **Not "the committed membership"**, which is what this said. Admission
+    /// is re-derived per request and must include the effective membership, or
+    /// a node whose state machine trails its log admits nobody — including the
+    /// leader carrying the snapshot it needs. §7.2's *graduation*, the
+    /// permanent step, is the one that reads committed alone.
     pub(crate) members: &'a BTreeSet<CoordinationNodeId>,
 }
 
