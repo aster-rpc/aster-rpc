@@ -9,6 +9,8 @@
 #[cfg(all(test, feature = "coordination"))]
 pub(crate) mod guards;
 
+/// The public durable client (§3.4). Client-graph only.
+pub mod client;
 pub mod contract;
 pub mod hash;
 pub mod ids;
