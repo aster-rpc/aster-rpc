@@ -1,0 +1,348 @@
+//! §S4-D/§S4-E: the public `CoordinationClient` — journaled mutations,
+//! durable redelivery across a process restart, the closing corridor over a
+//! live group, and redirect routing from a follower seed.
+//!
+//! These are the client-side halves of the properties `coordination_store`
+//! proves server-side. Every gate runs against real voters over real Iroh
+//! RPC; the "restart" in the redelivery gate is a real drop-and-rebuild of
+//! the client over the same journal directory, which is what a process
+//! restart is to the journal.
+
+#![cfg(feature = "coordination-testing")]
+
+use std::time::Duration;
+
+use aster::coordination::client::CoordinationClient;
+use aster::coordination::contract::ResourceKeyV1;
+use aster::coordination::ids::CoordinationGroupId;
+use aster::coordination::model::limits::{
+    RIGHT_ACQUIRE, RIGHT_MUTATE, RIGHT_READ, RIGHT_RELEASE, RIGHT_RENEW,
+};
+use aster::coordination::testing::GroupFixture;
+use aster::rpc::AsterServer;
+use aster::{AsterConfig, Node, PublicKey, RelayMode, SecretKey};
+
+const PATIENCE: Duration = Duration::from_secs(60);
+
+async fn within<T, F: std::future::Future<Output = T>>(what: &str, f: F) -> T {
+    match tokio::time::timeout(PATIENCE, f).await {
+        Ok(value) => value,
+        Err(_) => panic!("{what}: no answer within {PATIENCE:?}"),
+    }
+}
+
+fn resource(key: &[u8]) -> ResourceKeyV1 {
+    ResourceKeyV1 {
+        namespace: "client.gate".into(),
+        key: key.to_vec(),
+    }
+}
+
+async fn start_voter(fixture: &GroupFixture, index: usize, dir: &std::path::Path) -> AsterServer {
+    let voter = AsterServer::builder()
+        .config(fixture.aster_config(index))
+        .builtin_coordination(fixture.config(dir, index))
+        .start()
+        .await
+        .expect("the voter starts");
+    within(
+        "voter readiness",
+        voter.coordination().expect("hosted").wait_ready(),
+    )
+    .await
+    .expect("the group becomes ready");
+    voter
+}
+
+async fn client_node(secret: [u8; 32], fixture: &GroupFixture, voter: &AsterServer) -> Node {
+    let node = Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(SecretKey::from_bytes(secret))
+            .root_pubkey(PublicKey::from_bytes(fixture.authority_key()))
+            .build(),
+    )
+    .await
+    .expect("a client node starts");
+    node.add_node_addr(voter.node().addr())
+        .expect("register the voter's address");
+    node
+}
+
+/// The canonical addressless ticket for voter `index` — exactly what an
+/// operator would hand a client, and exactly what a permit carries: NodeId
+/// only, routes from discovery.
+fn voter_ticket(fixture: &GroupFixture, index: usize) -> String {
+    let id: [u8; 32] = fixture.node_id(index).try_into().expect("32 bytes");
+    aster::coordination::model::authority::canonical_candidate_ticket(&id)
+        .expect("a canonical ticket")
+}
+
+fn group(fixture: &GroupFixture) -> CoordinationGroupId {
+    fixture.group_id()
+}
+
+/// **The full journaled lifecycle, with redelivery across a restart.**
+///
+/// A mutation resolves, the process "dies" without acknowledging, and the
+/// rebuilt client — same node identity, same journal directory — redelivers
+/// the exact saved reply. Until it is acknowledged no new sequence is
+/// permitted; after it, the next mutation proceeds on the same client id at
+/// the next sequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resolved_result_survives_a_client_restart_until_acknowledged() {
+    let fixture = GroupFixture::new("client.test", 0xE1, 1);
+    let dir = tempfile::tempdir().expect("a directory");
+    let voter = start_voter(&fixture, 0, dir.path()).await;
+
+    // ROOT grants the worker over its own durable client.
+    let root_node = client_node([0xE1 ^ 0xFF; 32], &fixture, &voter).await;
+    let root_journal = tempfile::tempdir().expect("a directory");
+    let root = CoordinationClient::builder(root_node, group(&fixture))
+        .seed_tickets([voter_ticket(&fixture, 0)])
+        .journal_dir(root_journal.path())
+        .build()
+        .expect("the ROOT client builds");
+
+    let worker_secret = [0xE1 ^ 0x41; 32];
+    let worker_id = ed25519_dalek::SigningKey::from_bytes(&worker_secret)
+        .verifying_key()
+        .to_bytes();
+    let granted = within(
+        "grant",
+        root.set_grant(
+            resource(b"head"),
+            worker_id,
+            RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW | RIGHT_MUTATE | RIGHT_RELEASE,
+            0,
+        ),
+    )
+    .await
+    .expect("ROOT grants");
+    assert_eq!(granted.reply().outcome_code, 6);
+    within("grant ack", granted.acknowledge())
+        .await
+        .expect("acknowledge");
+
+    // The worker acquires and does NOT acknowledge.
+    let worker_node = client_node(worker_secret, &fixture, &voter).await;
+    let journal_dir = tempfile::tempdir().expect("a directory");
+    let saved_reply;
+    {
+        let worker = CoordinationClient::builder(worker_node.clone(), group(&fixture))
+            .seed_tickets([voter_ticket(&fixture, 0)])
+            .journal_dir(journal_dir.path())
+            .build()
+            .expect("the worker client builds");
+
+        let resolved = within("acquire", worker.acquire(resource(b"head"), 30_000))
+            .await
+            .expect("the acquire resolves");
+        assert_eq!(resolved.reply().outcome_code, 1, "Granted");
+        assert_eq!(resolved.reply().sequence, 1);
+        saved_reply = resolved.reply().clone();
+
+        // A second mutation while unacknowledged is refused by contract.
+        let refused = worker.acquire(resource(b"other"), 30_000).await;
+        assert!(
+            refused.is_err(),
+            "no new sequence until the application acknowledges"
+        );
+        // The process dies here: the handle drops unacknowledged.
+        drop(resolved);
+    }
+
+    // "Restart": a new client over the same journal, same identity.
+    let worker = CoordinationClient::builder(worker_node, group(&fixture))
+        .seed_tickets([voter_ticket(&fixture, 0)])
+        .journal_dir(journal_dir.path())
+        .build()
+        .expect("the journal reopens");
+
+    let redelivered = within("unacknowledged", worker.unacknowledged())
+        .await
+        .expect("recovery reads the journal")
+        .expect("the unacknowledged result is redelivered");
+    assert_eq!(
+        redelivered.reply(),
+        &saved_reply,
+        "redelivery is the exact saved reply"
+    );
+    within("redelivery ack", redelivered.acknowledge())
+        .await
+        .expect("acknowledge");
+
+    // The journal is free: the next mutation runs at sequence 2 on the same
+    // client id.
+    let snapshot = saved_reply.snapshot.as_ref().expect("a snapshot");
+    let fence = aster::coordination::contract::FenceV1 {
+        group_id: snapshot.group_id.clone(),
+        resource: snapshot.resource.clone(),
+        epoch: snapshot.epoch,
+        holder: snapshot.holder.clone().expect("held"),
+    };
+    let renewed = within("renew", worker.renew(fence))
+        .await
+        .expect("the renew resolves");
+    assert_eq!(renewed.reply().outcome_code, 2, "Renewed");
+    assert_eq!(renewed.reply().sequence, 2, "the same journal continued");
+    within("renew ack", renewed.acknowledge())
+        .await
+        .expect("acknowledge");
+
+    voter.shutdown().await;
+}
+
+/// **The closing corridor over a live group.** A terminal typed refusal —
+/// ROOT targeting itself with `set_admin`, the immutable 26 — retires the
+/// client id, replays on the tombstone, delivers the *original* terminal
+/// reason, rotates, and the next mutation runs on a fresh client id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_refusal_retires_replays_delivers_and_rotates() {
+    let fixture = GroupFixture::new("client.corridor", 0xE2, 1);
+    let dir = tempfile::tempdir().expect("a directory");
+    let voter = start_voter(&fixture, 0, dir.path()).await;
+
+    let root_secret = [0xE2 ^ 0xFF; 32];
+    let root_id = ed25519_dalek::SigningKey::from_bytes(&root_secret)
+        .verifying_key()
+        .to_bytes();
+    let node = client_node(root_secret, &fixture, &voter).await;
+    let journal_dir = tempfile::tempdir().expect("a directory");
+    let root = CoordinationClient::builder(node, group(&fixture))
+        .seed_tickets([voter_ticket(&fixture, 0)])
+        .journal_dir(journal_dir.path())
+        .build()
+        .expect("the ROOT client builds");
+
+    let before = root.client_id().await;
+
+    // The §5.2 immutable-ROOT refusal: typed, NotConsumed, terminal (26).
+    let resolved = within("set_admin(ROOT)", root.set_admin(root_id, false, 1))
+        .await
+        .expect("the corridor resolves the terminal refusal");
+    assert_eq!(
+        (
+            resolved.reply().disposition_code,
+            resolved.reply().outcome_code,
+            resolved.reply().reason_code
+        ),
+        (2, 100, 26),
+        "the delivered answer is the original terminal reason, not the \
+         tombstone's ClientRetired: {:?}",
+        resolved.reply()
+    );
+    within("corridor ack", resolved.acknowledge())
+        .await
+        .expect("acknowledgement rotates");
+
+    let after = root.client_id().await;
+    assert_ne!(before, after, "the corridor rotated to a fresh client id");
+
+    // The old id is a tombstone the group remembers.
+    let probe = within("probe", root.reads().probe_client(root_id, before))
+        .await
+        .expect("ROOT probes its own retired session");
+    assert!(probe.exists);
+    assert!(probe.retired);
+
+    // And the fresh id mutates from sequence 1.
+    let granted = within(
+        "grant after rotation",
+        root.set_grant(resource(b"fresh"), root_id, RIGHT_READ, 0),
+    )
+    .await
+    .expect("the rotated journal mutates");
+    assert_eq!(granted.reply().sequence, 1, "a fresh id starts at 1");
+    assert_eq!(granted.reply().outcome_code, 6);
+    within("ack", granted.acknowledge()).await.expect("ack");
+
+    voter.shutdown().await;
+}
+
+/// **Redirects: a client seeded only with a follower finds the leader.**
+/// The §5.4 loop: the follower's authenticated `UNAVAILABLE` hint names the
+/// leader, the engine follows it within the cap, and the mutation commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_client_seeded_with_a_follower_follows_the_hint_to_the_leader() {
+    let fixture = GroupFixture::new("client.redirect", 0xE3, 3);
+    let dirs: Vec<tempfile::TempDir> = (0..3)
+        .map(|_| tempfile::tempdir().expect("a directory"))
+        .collect();
+    let mut voters = Vec::new();
+    for (index, dir) in dirs.iter().enumerate() {
+        voters.push(
+            AsterServer::builder()
+                .config(fixture.aster_config(index))
+                .builtin_coordination(fixture.config(dir.path(), index))
+                .start()
+                .await
+                .expect("a voter starts"),
+        );
+    }
+    let addrs: Vec<_> = voters.iter().map(|v| v.node().addr()).collect();
+    for voter in &voters {
+        for addr in &addrs {
+            if addr.node_id != voter.node().addr().node_id {
+                voter
+                    .node()
+                    .add_node_addr(addr.clone())
+                    .expect("register a peer");
+            }
+        }
+    }
+    for voter in &voters {
+        within(
+            "readiness",
+            voter.coordination().expect("hosted").wait_ready(),
+        )
+        .await
+        .expect("the group becomes ready");
+    }
+
+    let leader_id = voters[0]
+        .coordination()
+        .expect("hosted")
+        .current_leader_for_testing()
+        .expect("a ready group leads");
+    let follower_index = (0..3)
+        .find(|i| {
+            aster::coordination::ids::CoordinationNodeId::from_slice(&fixture.node_id(*i))
+                .expect("a node id")
+                != leader_id
+        })
+        .expect("two of three follow");
+
+    // The ROOT client knows only the follower.
+    let root_secret = [0xE3 ^ 0xFF; 32];
+    let root_id = ed25519_dalek::SigningKey::from_bytes(&root_secret)
+        .verifying_key()
+        .to_bytes();
+    let node = client_node(root_secret, &fixture, &voters[follower_index]).await;
+    // The leader must be dialable once the hint names it: same-host discovery
+    // substitution, as everywhere in these gates.
+    for addr in &addrs {
+        let _ = node.add_node_addr(addr.clone());
+    }
+    let journal_dir = tempfile::tempdir().expect("a directory");
+    let root = CoordinationClient::builder(node, group(&fixture))
+        // Only the follower is seeded; the leader is reached by its hint.
+        .seed_tickets([voter_ticket(&fixture, follower_index)])
+        .journal_dir(journal_dir.path())
+        .build()
+        .expect("the client builds");
+
+    let granted = within(
+        "grant via redirect",
+        root.set_grant(resource(b"via-follower"), root_id, RIGHT_READ, 0),
+    )
+    .await
+    .expect("the client follows the authenticated hint to the leader");
+    assert_eq!(granted.reply().outcome_code, 6);
+    within("ack", granted.acknowledge()).await.expect("ack");
+
+    for voter in voters {
+        voter.shutdown().await;
+    }
+}

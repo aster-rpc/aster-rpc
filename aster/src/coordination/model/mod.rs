@@ -10,7 +10,10 @@
 //! Storage (Slice 2) and consensus (Slice 3) call into this module rather than
 //! reimplementing its transitions.
 
-#[cfg(feature = "coordination")]
+/// The §9.4 lease-engine adapter is **client** surface: `CoordinationSerializer`
+/// binds the existing `LeaseSerializer` trait over a `CoordinationBackend`, and
+/// Slice 4's live backend is the redirecting client. It compiles in the
+/// `coordination-client` graph; nothing in it touches a transition.
 pub mod adapter;
 #[cfg(feature = "coordination")]
 pub mod admin;

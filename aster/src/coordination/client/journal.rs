@@ -125,6 +125,12 @@ pub struct ClientJournalV1 {
     /// when it was not.
     #[fory(id = 11)]
     pub retirement_confirmed: bool,
+    /// The encoded terminal refusal that opened the closing corridor. When the
+    /// replay proves the original never applied (`ClientRetired`), **this** is
+    /// what resolves the entry: the business answer is the terminal reason the
+    /// group actually gave, not the tombstone's generic refusal.
+    #[fory(id = 12, bytes)]
+    pub terminal_refusal: Vec<u8>,
 }
 
 /// A named stop the crash matrix can arm (test builds only).
@@ -434,8 +440,9 @@ impl Journal {
     }
 
     /// `Pending` → `Closing`: a terminal `NotConsumed` ended this client id
-    /// (§10). The pending bytes stay — the replay step needs them.
-    pub fn close_for_retirement(&mut self) -> Result<()> {
+    /// (§10). The pending bytes stay — the replay step needs them — and the
+    /// refusal that ended it is kept so the eventual resolution can name it.
+    pub fn close_for_retirement(&mut self, terminal_refusal: Vec<u8>) -> Result<()> {
         if self.state() != JournalState::Pending {
             return Err(journal_error("closing starts from Pending"));
         }
@@ -443,6 +450,7 @@ impl Journal {
         let mut next = self.record.clone();
         next.state_code = JournalState::Closing.code();
         next.retirement_confirmed = false;
+        next.terminal_refusal = terminal_refusal;
         self.persist(next)?;
         self.boundary("after_closing_fsync")?;
         Ok(())
@@ -609,12 +617,19 @@ mod tests {
             journal
                 .begin(1, "set_admin", b"refused-request".to_vec(), [0x44; 32])
                 .expect("begin");
-            journal.close_for_retirement().expect("close");
+            journal
+                .close_for_retirement(b"the-terminal-24".to_vec())
+                .expect("close");
         }
         {
             let journal = open(dir.path());
             assert_eq!(journal.state(), JournalState::Closing);
             assert!(!journal.record().retirement_confirmed);
+            assert_eq!(
+                journal.record().terminal_refusal,
+                b"the-terminal-24",
+                "the refusal that opened the corridor is retained for the resolution"
+            );
             assert_eq!(
                 journal.record().pending_request,
                 b"refused-request",
@@ -668,7 +683,9 @@ mod tests {
             journal
                 .begin(1, "acquire", b"x".to_vec(), [0x55; 32])
                 .expect("begin");
-            journal.close_for_retirement().expect("close");
+            journal
+                .close_for_retirement(b"the-26".to_vec())
+                .expect("close");
             journal.retirement_confirmed().expect("retired");
             journal.resolve(b"not-applied".to_vec()).expect("resolve");
             journal.rotate(CLIENT_B).expect("rotate");
@@ -886,7 +903,9 @@ mod tests {
         journal
             .begin(2, "set_admin", b"second".to_vec(), [0x72; 32])
             .expect("begin 2");
-        journal.close_for_retirement().expect("close");
+        journal
+            .close_for_retirement(b"terminal".to_vec())
+            .expect("close");
         journal.retirement_confirmed().expect("retired");
         journal.resolve(b"not-applied".to_vec()).expect("resolve 2");
         journal.rotate(CLIENT_B).expect("rotate");

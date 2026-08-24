@@ -31,6 +31,8 @@
 pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("admission.rs", include_str!("admission.rs")),
     ("boot.rs", include_str!("boot.rs")),
+    ("client/driver.rs", include_str!("client/driver.rs")),
+    ("client/engine.rs", include_str!("client/engine.rs")),
     ("client/journal.rs", include_str!("client/journal.rs")),
     ("client/mod.rs", include_str!("client/mod.rs")),
     ("contract.rs", include_str!("contract.rs")),
