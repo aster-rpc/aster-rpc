@@ -213,12 +213,19 @@ impl Coordination {
         self.state.genesis_installed().await.unwrap_or(false)
     }
 
-    /// The voter ids in the currently committed membership.
+    /// The voter ids in the **effective** membership.
     ///
-    /// Read from `RaftMetrics`, which is the group's agreed answer rather than
-    /// a controller's local view of what it was trying to achieve — the
-    /// distinction the §S3-E completion rule turns on.
-    pub fn committed_voters_for_testing(
+    /// Effective, not committed: `RaftMetrics::membership_config` is
+    /// `membership_state.effective()`, which is the last membership entry in
+    /// the log whether or not it has been committed. That is the same value the
+    /// controller's own `next_step` reads, so it is the right one for a gate
+    /// about the controller — but a gate that means "the group agreed on this"
+    /// has to pair it with
+    /// [`membership_is_committed_for_testing`](Self::membership_is_committed_for_testing).
+    ///
+    /// It was named `committed_voters_for_testing` and documented as "the
+    /// group's agreed answer", which is a claim about a different value.
+    pub fn effective_voters_for_testing(
         &self,
     ) -> Vec<crate::coordination::ids::CoordinationNodeId> {
         self.raft
@@ -230,8 +237,8 @@ impl Coordination {
             .collect()
     }
 
-    /// Every node in the committed membership, voter or learner.
-    pub fn committed_nodes_for_testing(&self) -> Vec<crate::coordination::ids::CoordinationNodeId> {
+    /// Every node in the effective membership, voter or learner.
+    pub fn effective_nodes_for_testing(&self) -> Vec<crate::coordination::ids::CoordinationNodeId> {
         self.raft
             .metrics()
             .borrow()
@@ -242,11 +249,13 @@ impl Coordination {
             .collect()
     }
 
-    /// Whether the committed membership is a **joint** configuration.
+    /// Whether the effective membership is a **joint** configuration.
     ///
-    /// One of the four `S3-JOINT-RESUME` boundaries is "leadership lost while a
+    /// One of the four `S3-JOINT-RESUME` boundaries is "leadership lost after a
     /// joint entry is committed", and a test cannot arrange to be at that
-    /// boundary without being able to see it.
+    /// boundary without being able to see it — nor tell it from the boundary
+    /// *before* the joint entry commits, which is why this is not enough on its
+    /// own.
     pub fn membership_is_joint_for_testing(&self) -> bool {
         self.raft
             .metrics()
@@ -256,6 +265,68 @@ impl Coordination {
             .get_joint_config()
             .len()
             > 1
+    }
+
+    /// The voter ids in the **committed** membership.
+    ///
+    /// From the state actor, which applies committed entries and nothing else —
+    /// the same source production reads for the allowlist, the lifecycle role
+    /// and the controller's phase table. A gate that watches for a state
+    /// between two committed entries has to read this: from the effective
+    /// membership the interval does not exist, because the *next* entry is
+    /// already effective before the previous one has committed.
+    pub fn committed_voters_for_testing(
+        &self,
+    ) -> Vec<crate::coordination::ids::CoordinationNodeId> {
+        self.state
+            .committed_membership()
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
+    /// Every node in the committed membership, voter or learner.
+    pub fn committed_nodes_for_testing(&self) -> Vec<crate::coordination::ids::CoordinationNodeId> {
+        self.state
+            .committed_membership()
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Whether the **committed** membership is a joint configuration.
+    pub fn committed_membership_is_joint_for_testing(&self) -> bool {
+        self.state
+            .committed_membership()
+            .membership()
+            .get_joint_config()
+            .len()
+            > 1
+    }
+
+    /// Whether the effective membership entry has been **applied**, and so
+    /// committed.
+    ///
+    /// The missing half of the two boundaries that differ only in this: "lost
+    /// before the joint entry committed" and "lost after the joint entry
+    /// committed" have the same effective membership and are different states.
+    /// OpenRaft 0.9's metrics carry no committed index, but a membership entry
+    /// is applied exactly when it commits, so `last_applied` past the
+    /// membership's own log id is the same statement.
+    ///
+    /// An initial membership with no log id counts as committed: it is the
+    /// genesis configuration, which no entry introduced.
+    pub fn membership_is_committed_for_testing(&self) -> bool {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        let Some(at) = metrics.membership_config.log_id() else {
+            return true;
+        };
+        metrics
+            .last_applied
+            .map(|applied| applied.index >= at.index)
+            .unwrap_or(false)
     }
 
     /// Build a snapshot now, rather than waiting for the log-size policy.

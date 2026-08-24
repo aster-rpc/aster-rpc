@@ -26,6 +26,13 @@
 //! promise that a failure repeats on demand. The pure-function property is
 //! pinned separately by the unit tests in `network::chaos`.
 //!
+//! `FaultTally` is what a run has instead of replay, and both halves matter:
+//! `reordered` counts only messages a **later** one actually overtook, and
+//! `reorder_expired` counts the ones nothing did. An earlier version of this
+//! harness slept for a fixed interval and counted the verdict, so the number
+//! recorded how often the schedule had said the word "reorder" and never once
+//! that two messages had changed places.
+//!
 //! ## Why this drives the public surface
 //!
 //! The injector lives in the production Raft client, behind an `Option` that
@@ -33,31 +40,38 @@
 //! different client would prove things about the wrapper: the §5.3 admission
 //! checks, the envelope encoding and the error classification are exactly what
 //! a lossy network has to be survived *through*.
+//!
+//! ## Lost leadership is placed, not waited for
+//!
+//! `trigger().elect()` on the current leader is a **no-op** in the pinned
+//! OpenRaft — it says so, and `raft_core` ignores the command outright — so the
+//! first version of this gate deposed nobody and its "commit after failover"
+//! was just another commit. Leadership is now taken away by cutting the leader
+//! off from every peer, and the gate requires a *different* voter leading at a
+//! *higher* term before it accepts renewed progress.
+//!
+//! `coordination_resume` uses the same instrument to place a loss at each of
+//! the four `S3-JOINT-RESUME` boundaries individually. This file is about a
+//! group under a faulty network; that one is about a group under a chosen
+//! failure.
 
 #![cfg(feature = "coordination-testing")]
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use aster::coordination::admission::{
-    AdmissionEntryV1, AdmissionSetV1, SignedAdmissionSet, VerifiedAdmissionSource,
-    ADMISSION_CLASS_PRODUCER, ADMISSION_FORMAT_VERSION,
-};
 use aster::coordination::contract::{
     ActionV1, ClientCommandV1, CommandReplyV1, CommandV1, ResourceKeyV1, SetGrantActionV1,
 };
-use aster::coordination::host::{CoordinationConfig, CoordinationStart};
-use aster::coordination::model::authority::{
-    canonical_document_bytes, genesis_signing_bytes, signed_document_from_parts,
+use aster::coordination::ids::CoordinationNodeId;
+use aster::coordination::testing::Schedule;
+
+mod common;
+use common::{
+    await_leader, await_leader_other_than, combined_tally, every_core_is_alive, isolate_everywhere,
+    rejoin_everywhere, shutdown_all, ChaosFixture, ChaoticVoter,
 };
-use aster::coordination::raft::{GenesisV1, NodeIdV1, VoterSeedV1};
-use aster::coordination::testing::{ChaosNetwork, FaultTally, Schedule};
-use aster::rpc::AsterServer;
-use aster::{AsterConfig, RelayMode, SecretKey};
-use ed25519_dalek::{Signer, SigningKey};
 
 const DOMAIN: &str = "chaos.test";
-const GROUP: [u8; 32] = [0xF0u8; 32];
 
 /// The recorded seed. Changing it is changing the test: a different seed is a
 /// different network, and a gate that passes only on one seed has found a bug
@@ -85,200 +99,6 @@ const COMMIT_ROUNDS: u8 = 20;
 /// waits forever.
 const PATIENCE: Duration = Duration::from_secs(90);
 
-fn authority() -> SigningKey {
-    SigningKey::from_bytes(&[0x91u8; 32])
-}
-
-fn authority_key() -> [u8; 32] {
-    authority().verifying_key().to_bytes()
-}
-
-fn node_id_of(secret: [u8; 32]) -> Vec<u8> {
-    SigningKey::from_bytes(&secret)
-        .verifying_key()
-        .to_bytes()
-        .to_vec()
-}
-
-fn seed_ticket(node_id: &[u8]) -> String {
-    aster_transport_core::ticket::AsterTicket {
-        endpoint_id: node_id.to_vec().try_into().expect("32 bytes"),
-        relay: None,
-        direct_addrs: Vec::new(),
-        credential: Some(aster_transport_core::ticket::TicketCredential::Open),
-    }
-    .to_base58_string()
-    .expect("a canonical ticket")
-}
-
-fn signed_genesis(secrets: &[[u8; 32]]) -> Vec<u8> {
-    let mut initial_voters: Vec<VoterSeedV1> = secrets
-        .iter()
-        .map(|secret| {
-            let node_id = node_id_of(*secret);
-            VoterSeedV1 {
-                ticket: seed_ticket(&node_id),
-                node_id,
-            }
-        })
-        .collect();
-    initial_voters.sort_by(|l, r| l.node_id.cmp(&r.node_id));
-
-    let mut initial_admins: Vec<NodeIdV1> = secrets
-        .iter()
-        .map(|secret| NodeIdV1 {
-            node_id: node_id_of(*secret),
-        })
-        .collect();
-    initial_admins.sort_by(|l, r| l.node_id.cmp(&r.node_id));
-
-    let genesis = GenesisV1 {
-        format_version: 1,
-        group_id: GROUP.to_vec(),
-        authority_domain: DOMAIN.into(),
-        genesis_nonce: vec![0xA5u8; 32],
-        deployment_profile_code: 1,
-        initial_voters,
-        initial_admins,
-        recovery_export_hash: None,
-    };
-    let document = canonical_document_bytes(&genesis).expect("encode");
-    let signature = authority().sign(&genesis_signing_bytes(&document));
-    signed_document_from_parts(document, &authority_key(), &signature.to_bytes()).expect("encode")
-}
-
-fn admission_source(secrets: &[[u8; 32]]) -> Arc<dyn VerifiedAdmissionSource> {
-    let mut entries: Vec<AdmissionEntryV1> = secrets
-        .iter()
-        .map(|secret| AdmissionEntryV1 {
-            node_id: node_id_of(*secret),
-            class_code: ADMISSION_CLASS_PRODUCER,
-        })
-        .collect();
-    entries.sort_by(|l, r| l.node_id.cmp(&r.node_id));
-
-    let set = AdmissionSetV1 {
-        format_version: ADMISSION_FORMAT_VERSION,
-        authority_domain: DOMAIN.into(),
-        revision: 1,
-        entries,
-    };
-    let document = canonical_document_bytes(&set).expect("encode");
-    let signature = authority().sign(&aster::coordination::admission::admission_signing_bytes(
-        &document,
-    ));
-    let signed = signed_document_from_parts(document, &authority_key(), &signature.to_bytes())
-        .expect("encode");
-    Arc::new(SignedAdmissionSet::verify(&authority_key(), DOMAIN, &signed).expect("a signed set"))
-}
-
-/// One running voter, its directory, and the injector its client consults.
-struct ChaoticVoter {
-    server: AsterServer,
-    chaos: Arc<ChaosNetwork>,
-    _dir: tempfile::TempDir,
-}
-
-/// A group of `secrets`, every voter behind the same schedule.
-async fn start_chaotic_group(secrets: &[[u8; 32]], schedule: Schedule) -> Vec<ChaoticVoter> {
-    let genesis = signed_genesis(secrets);
-    let admission = admission_source(secrets);
-
-    let mut voters = Vec::new();
-    for secret in secrets {
-        let dir = tempfile::tempdir().expect("a storage directory");
-        let chaos = ChaosNetwork::new(schedule);
-        let config = CoordinationConfig::builder()
-            .storage_dir(dir.path())
-            .authority_domain(DOMAIN)
-            .start_mode(CoordinationStart::Bootstrap {
-                signed_genesis: genesis.clone(),
-                recovery_export_path: None,
-            })
-            .verified_admission(Arc::clone(&admission))
-            .chaos_for_testing(Arc::clone(&chaos))
-            .build()
-            .expect("a complete configuration");
-        let server = AsterServer::builder()
-            .config(
-                AsterConfig::builder()
-                    .relay(RelayMode::Disabled)
-                    .bind_addr("127.0.0.1:0")
-                    .secret_key(SecretKey::from_bytes(*secret))
-                    .root_pubkey(aster::PublicKey::from_bytes(authority_key()))
-                    .build(),
-            )
-            .builtin_coordination(config)
-            .start()
-            .await
-            .expect("a voter starts");
-        voters.push(ChaoticVoter {
-            server,
-            chaos,
-            _dir: dir,
-        });
-    }
-
-    let addrs: Vec<_> = voters.iter().map(|v| v.server.node().addr()).collect();
-    for voter in &voters {
-        for addr in &addrs {
-            if addr.node_id != voter.server.node().addr().node_id {
-                voter
-                    .server
-                    .node()
-                    .add_node_addr(addr.clone())
-                    .expect("register a peer address");
-            }
-        }
-    }
-    voters
-}
-
-/// The applied-fault totals across every voter.
-fn combined_tally(voters: &[ChaoticVoter]) -> FaultTally {
-    voters
-        .iter()
-        .map(|v| v.chaos.tally())
-        .fold(FaultTally::default(), |mut acc, t| {
-            acc.delivered += t.delivered;
-            acc.dropped += t.dropped;
-            acc.delayed += t.delayed;
-            acc.duplicated += t.duplicated;
-            acc.reordered += t.reordered;
-            acc.partitioned += t.partitioned;
-            acc
-        })
-}
-
-/// Wait for a quorum-acknowledged leader, reporting the seed if none appears.
-async fn await_leader(voters: &[ChaoticVoter], what: &str) -> usize {
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    loop {
-        for (index, voter) in voters.iter().enumerate() {
-            let coordination = voter.server.coordination().expect("hosted");
-            if coordination.lifecycle_code() == 3 && coordination.quorum_available() == Some(true) {
-                return index;
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let observed: Vec<(i32, Option<bool>)> = voters
-                .iter()
-                .map(|v| {
-                    let c = v.server.coordination().expect("hosted");
-                    (c.lifecycle_code(), c.quorum_available())
-                })
-                .collect();
-            panic!(
-                "{what}: no leader within {PATIENCE:?} at seed {SEED:#x} \
-                 (fault rate {FAULT_PERCENT}%); observed {observed:?}, \
-                 faults {:?}",
-                combined_tally(voters)
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// A grant on a fresh resource `key`, from **one** client at `sequence`.
 ///
 /// One client id for the whole run, not one per command. A new client id per
@@ -291,7 +111,7 @@ async fn await_leader(voters: &[ChaoticVoter], what: &str) -> usize {
 /// meaningful rather than merely tolerated: a proposal whose reply the schedule
 /// dropped is re-proposed as an **exact replay**, which the state machine must
 /// answer from its saved result instead of applying twice.
-fn grant(secret: &[u8; 32], client: &[u8], sequence: u64, key: &[u8]) -> CommandV1 {
+fn grant(actor: &[u8], client: &[u8], sequence: u64, key: &[u8]) -> CommandV1 {
     use aster::coordination::model::limits::{RIGHT_ACQUIRE, RIGHT_READ, RIGHT_RENEW};
 
     let action = ActionV1::SetGrant(SetGrantActionV1 {
@@ -299,14 +119,14 @@ fn grant(secret: &[u8; 32], client: &[u8], sequence: u64, key: &[u8]) -> Command
             namespace: "chaos-gate".into(),
             key: key.to_vec(),
         },
-        target_node_id: node_id_of(*secret),
+        target_node_id: actor.to_vec(),
         rights: RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW,
         // Each round grants on its own resource key, so every one is a fresh
         // ACL at revision 0.
         expected_acl_revision: 0,
     });
     CommandV1::Client(ClientCommandV1 {
-        actor_node_id: node_id_of(*secret),
+        actor_node_id: actor.to_vec(),
         client_id: aster::coordination::testing::id16(client),
         sequence,
         request_hash: aster::coordination::hash::request_hash(&action)
@@ -337,10 +157,20 @@ async fn commit_somewhere(
     command: CommandV1,
     what: &str,
 ) -> aster::coordination::testing::Committed {
+    commit_avoiding(voters, &[], command, what).await
+}
+
+/// [`commit_somewhere`], but never asking a voter in `excluding`.
+async fn commit_avoiding(
+    voters: &[ChaoticVoter],
+    excluding: &[CoordinationNodeId],
+    command: CommandV1,
+    what: &str,
+) -> aster::coordination::testing::Committed {
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
-        let leader = await_leader(voters, what).await;
-        let coordination = voters[leader].server.coordination().expect("hosted");
+        let leader = await_leader_other_than(voters, excluding, PATIENCE, what).await;
+        let coordination = voters[leader].coordination();
         if let Ok(committed) = coordination
             .propose_for_testing_within(command.clone(), Duration::from_secs(20))
             .await
@@ -367,18 +197,18 @@ async fn commit_somewhere(
 /// silently delivered everything fails instead of passing quietly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_group_makes_progress_through_a_seeded_faulty_network() {
-    let secrets = [[0xA1u8; 32], [0xA2u8; 32], [0xA3u8; 32]];
-    let voters = start_chaotic_group(&secrets, Schedule::new(SEED, FAULT_PERCENT)).await;
+    let fixture = ChaosFixture::new(DOMAIN, 0xA0, 3);
+    let voters = fixture.start(Schedule::new(SEED, FAULT_PERCENT)).await;
 
     // Election, through a network that is dropping and delaying votes.
-    let leader = await_leader(&voters, "the first election under chaos").await;
+    let leader = await_leader(&voters, PATIENCE, "the first election under chaos").await;
 
     // Replication, likewise.
     let client = b"chaos-client";
     let mut sequence = 0u64;
     let mut next = |key: &[u8]| {
         sequence += 1;
-        grant(&secrets[0], client, sequence, key)
+        grant(&fixture.node_id(0), client, sequence, key)
     };
 
     let first = commit_somewhere(&voters, next(b"before"), "the first commit").await;
@@ -405,24 +235,69 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
 
     // Lost leadership, at a moment the schedule did not choose — the phase
     // §S3-F names last, and the one a purely message-level fault never reaches.
-    voters[leader]
-        .server
-        .coordination()
-        .expect("hosted")
-        .raft_for_testing()
-        .trigger()
-        .elect()
-        .await
-        .expect("an election can be triggered");
+    //
+    // **Not** `trigger().elect()` on the leader. The pinned OpenRaft documents
+    // that as a no-op for a node that already leads, and the first version of
+    // this gate called it exactly there: the same voter kept leading, the term
+    // never moved, and the "commit after failover" below was just another
+    // commit. Cutting the leader off is a loss the group cannot decline.
+    let lost = voters[leader].id;
+    let term_before = voters[leader].term();
+    isolate_everywhere(&voters, lost);
+
+    let successor = await_leader_other_than(
+        &voters,
+        &[lost],
+        PATIENCE,
+        "an election after the leader was cut off",
+    )
+    .await;
+    assert_ne!(
+        voters[successor].id, lost,
+        "the successor must be a different voter, or nothing was lost"
+    );
+    assert!(
+        voters[successor].term() > term_before,
+        "a successor at the same term would be the same leadership under another \
+         name; {} then {} (seed {SEED:#x})",
+        term_before,
+        voters[successor].term()
+    );
 
     // And progress again afterwards, which is the actual claim: the group
     // recovered rather than merely survived.
-    let second = commit_somewhere(&voters, next(b"after"), "a commit after lost leadership").await;
+    let second = commit_avoiding(
+        &voters,
+        &[lost],
+        next(b"after"),
+        "a commit after lost leadership",
+    )
+    .await;
     assert_eq!(
         outcome_of(&second),
         (GRANT_UPDATED, 0),
         "the group commits again after leadership moved (seed {SEED:#x})"
     );
+
+    // The deposed voter rejoins and catches up, so the loss was a loss and not
+    // a removal — a group that could only continue by forgetting a member has
+    // not survived a leader failure, it has survived a smaller cluster.
+    rejoin_everywhere(&voters, &lost);
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let recovered = voters[leader].coordination().last_applied_for_testing();
+        if recovered >= Some(second.index) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deposed voter never caught up: applied {recovered:?} against \
+             {} at seed {SEED:#x}; faults {:?}",
+            second.index,
+            combined_tally(&voters)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // Non-vacuity. Without this the gate would pass just as well on a perfect
     // network, and would therefore prove nothing about a faulty one.
@@ -434,50 +309,109 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
          nothing about a faulty network; seed {SEED:#x} produced {tally:?}"
     );
 
-    for voter in voters {
-        voter.server.shutdown().await;
-    }
+    every_core_is_alive(&voters, "after the gate").await;
+    shutdown_all(voters).await;
 }
 
-/// **A partition is stable within an epoch, and heals when the epoch moves.**
+/// The lone voter at `epoch`, if the schedule separates exactly one from the
+/// other two.
+///
+/// Asked of the schedule rather than guessed. A gate that stepped to the next
+/// epoch and hoped would sometimes be testing a whole network while claiming a
+/// partition — which is what the first version of this gate did.
+fn minority_at(schedule: &Schedule, ids: &[CoordinationNodeId], epoch: u64) -> Option<usize> {
+    (0..ids.len()).find(|alone| {
+        (0..ids.len()).all(|other| {
+            let connected = schedule.reaches(&ids[*alone], &ids[other], epoch);
+            connected == (other == *alone)
+        })
+    })
+}
+
+/// Whether every pair can reach every other at `epoch`.
+fn whole_at(schedule: &Schedule, ids: &[CoordinationNodeId], epoch: u64) -> bool {
+    ids.iter()
+        .all(|a| ids.iter().all(|b| schedule.reaches(a, b, epoch)))
+}
+
+/// **A partition strands a minority, and healing it lets that minority back
+/// in.**
 ///
 /// Distinct from the gate above because a partition is not a high drop rate:
 /// dropping each message independently never leaves a *stable* minority, and a
 /// group that only ever met independent drops would never exercise the case
 /// where one side must refuse to commit for a sustained period.
 ///
-/// Every voter advances its epoch together, because the epoch selects the sides
-/// and two voters at different epochs would be a one-way link.
+/// Three claims, and the middle one is the one the earlier version of this gate
+/// left out entirely — it advanced into one epoch, committed on whichever side
+/// led, and stopped, so "heals across one" named something that never happened:
+///
+/// 1. while the split holds, the majority commits and the stranded voter's log
+///    does not move at all;
+/// 2. the epoch is then moved to one the schedule says connects **every** pair;
+/// 3. after which the stranded voter catches up to the entries it missed, and
+///    the whole group commits again.
+///
+/// Both epochs are chosen by asking the schedule, so neither is a hope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_partition_is_stable_within_an_epoch_and_heals_across_one() {
-    let secrets = [[0xB1u8; 32], [0xB2u8; 32], [0xB3u8; 32]];
-    let voters = start_chaotic_group(&secrets, Schedule::new(SEED ^ 0xBEEF, FAULT_PERCENT)).await;
+async fn a_partition_strands_a_minority_and_heals() {
+    let fixture = ChaosFixture::new(DOMAIN, 0xB0, 3);
+    let schedule = Schedule::new(SEED ^ 0xBEEF, FAULT_PERCENT);
+    let ids: Vec<CoordinationNodeId> = (0..fixture.size()).map(|i| fixture.id(i)).collect();
 
-    await_leader(&voters, "the election before any partition").await;
+    // Chosen from the schedule before anything starts: an epoch that genuinely
+    // strands one voter, and a later one that genuinely connects everybody.
+    let (split_epoch, stranded) = (1..2_000u64)
+        .find_map(|epoch| minority_at(&schedule, &ids, epoch).map(|alone| (epoch, alone)))
+        .expect("this seed separates one voter at some epoch");
+    let healed_epoch = (split_epoch + 1..4_000u64)
+        .find(|epoch| whole_at(&schedule, &ids, *epoch))
+        .expect("this seed reconnects the group at some later epoch");
+
+    let voters = fixture.start(schedule).await;
+    let client = b"chaos-client";
+
+    await_leader(&voters, PATIENCE, "the election before any partition").await;
     let before = commit_somewhere(
         &voters,
-        grant(&secrets[0], b"chaos-client", 1, b"pre-partition"),
+        grant(&fixture.node_id(0), client, 1, b"pre-partition"),
         "a commit before the partition",
     )
     .await;
     assert_eq!(outcome_of(&before), (GRANT_UPDATED, 0));
 
-    // Move every voter to the next epoch at once. The sides are re-drawn from
-    // the shared seed, so all three agree on who can reach whom.
+    // Move every voter to the split epoch at once. The sides come from the
+    // shared seed, so all three agree on who can reach whom; two voters at
+    // different epochs would be a one-way link.
     for voter in &voters {
-        voter.chaos.advance_epoch();
+        voter.chaos.set_epoch(split_epoch);
     }
     assert!(
-        voters.iter().all(|v| v.chaos.epoch() == 1),
+        voters.iter().all(|v| v.chaos.epoch() == split_epoch),
         "every voter must be at the same epoch, or the split is one-way"
     );
 
-    // A majority side still commits. Which voters are on it is the schedule's
-    // decision, not the test's, so the commit is asked of whoever leads.
-    let after = commit_somewhere(
+    // 1. The majority commits; the stranded voter hears none of it.
+    //
+    // The mark is taken after a beat, not at the instant the epoch moved: the
+    // schedule is consulted when a message is *sent*, so a message dispatched
+    // microseconds before the split still lands, and the stranded voter can
+    // legitimately apply one more entry from before it. Asserting against the
+    // instant of the split failed on exactly that, and the failure was the
+    // test's, not the group's.
+    //
+    // `Option` rather than an unwrapped index, and that is not tidiness: a
+    // follower that was still behind when the split landed has applied nothing
+    // at all, and `None` is the honest mark for it. Requiring `Some` failed
+    // once for exactly that reason — a test asserting the group had done
+    // something before it had finished doing it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let marooned_at = voters[stranded].coordination().last_applied_for_testing();
+    let after = commit_avoiding(
         &voters,
-        grant(&secrets[0], b"chaos-client", 2, b"post-partition"),
-        "a commit after the partition was re-drawn",
+        &[ids[stranded]],
+        grant(&fixture.node_id(0), client, 2, b"post-partition"),
+        "a commit on the majority side of the partition",
     )
     .await;
     assert_eq!(
@@ -486,17 +420,71 @@ async fn a_partition_is_stable_within_an_epoch_and_heals_across_one() {
         "a majority side commits across a partition (seed {:#x})",
         SEED ^ 0xBEEF
     );
+    assert!(
+        Some(after.index) > marooned_at,
+        "the majority's commit must be past where the stranded voter stopped: \
+         {marooned_at:?} against {}",
+        after.index
+    );
+    assert_eq!(
+        voters[stranded].coordination().last_applied_for_testing(),
+        marooned_at,
+        "a stranded minority must not apply anything the majority commits; \
+         seed {:#x} produced {:?}",
+        SEED ^ 0xBEEF,
+        combined_tally(&voters)
+    );
+
+    // 2. Heal, to an epoch the schedule says connects every pair.
+    for voter in &voters {
+        voter.chaos.set_epoch(healed_epoch);
+    }
+    assert!(
+        whole_at(&schedule, &ids, healed_epoch),
+        "the healed epoch must connect every pair, or nothing healed"
+    );
+
+    // 3. The stranded voter catches up on what it missed, and the whole group
+    //    commits again.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let caught_up = voters[stranded].coordination().last_applied_for_testing();
+        if caught_up >= Some(after.index) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stranded voter never caught up after the partition healed: \
+             applied {caught_up:?} against {} at seed {:#x}; faults {:?}",
+            after.index,
+            SEED ^ 0xBEEF,
+            combined_tally(&voters)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let healed = commit_somewhere(
+        &voters,
+        grant(&fixture.node_id(0), client, 3, b"post-heal"),
+        "a commit once the partition healed",
+    )
+    .await;
+    assert_eq!(
+        outcome_of(&healed),
+        (GRANT_UPDATED, 0),
+        "the whole group commits again once the split is gone (seed {:#x})",
+        SEED ^ 0xBEEF
+    );
 
     let tally = combined_tally(&voters);
+    println!("partition at epochs {split_epoch}/{healed_epoch} applied {tally:?}");
     assert!(
         tally.partitioned > 0,
         "the partition must have actually dropped traffic; seed {:#x} produced {tally:?}",
         SEED ^ 0xBEEF
     );
 
-    for voter in voters {
-        voter.server.shutdown().await;
-    }
+    every_core_is_alive(&voters, "after the gate").await;
+    shutdown_all(voters).await;
 }
 
 /// **A perfect schedule changes nothing.**
@@ -506,13 +494,13 @@ async fn a_partition_is_stable_within_an_epoch_and_heals_across_one() {
 /// the group and every result above is about the harness rather than the code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_zero_fault_schedule_leaves_the_group_untouched() {
-    let secrets = [[0xC1u8; 32], [0xC2u8; 32], [0xC3u8; 32]];
-    let voters = start_chaotic_group(&secrets, Schedule::perfect()).await;
+    let fixture = ChaosFixture::new(DOMAIN, 0xC0, 3);
+    let voters = fixture.start(Schedule::perfect()).await;
 
-    await_leader(&voters, "an election with no faults").await;
+    await_leader(&voters, PATIENCE, "an election with no faults").await;
     let committed = commit_somewhere(
         &voters,
-        grant(&secrets[0], b"chaos-client", 1, b"control"),
+        grant(&fixture.node_id(0), b"chaos-client", 1, b"control"),
         "a commit with no faults",
     )
     .await;
@@ -525,9 +513,10 @@ async fn a_zero_fault_schedule_leaves_the_group_untouched() {
             tally.delayed,
             tally.duplicated,
             tally.reordered,
+            tally.reorder_expired,
             tally.partitioned
         ),
-        (0, 0, 0, 0, 0),
+        (0, 0, 0, 0, 0, 0),
         "a perfect schedule applies no faults at all, and delivered {tally:?}"
     );
     assert!(
@@ -535,9 +524,8 @@ async fn a_zero_fault_schedule_leaves_the_group_untouched() {
         "the injector must actually be on the path, or this control proves nothing"
     );
 
-    for voter in voters {
-        voter.server.shutdown().await;
-    }
+    every_core_is_alive(&voters, "after the gate").await;
+    shutdown_all(voters).await;
 }
 
 /// **A membership change completes through the faulty network.**
@@ -567,18 +555,14 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
         ChangeMembershipActionV1, MemberSeedV1, NodeIdV1 as PlanNodeId,
     };
 
-    let secrets = [
-        [0xD1u8; 32],
-        [0xD2u8; 32],
-        [0xD3u8; 32],
-        [0xD4u8; 32],
-        [0xD5u8; 32],
-    ];
-    let voters = start_chaotic_group(&secrets, Schedule::new(SEED ^ 0x5171, FAULT_PERCENT)).await;
+    let fixture = ChaosFixture::new(DOMAIN, 0xD0, 5);
+    let voters = fixture
+        .start(Schedule::new(SEED ^ 0x5171, FAULT_PERCENT))
+        .await;
     // Wait for a first leader before planning: a plan proposed into a group
     // that has not elected is refused for a reason that is about the election
     // rather than about the network.
-    await_leader(&voters, "the election before a membership change").await;
+    await_leader(&voters, PATIENCE, "the election before a membership change").await;
 
     // Sorted unique by node id, which is a public key: fixture order and byte
     // order are unrelated, and an unsorted plan is refused as shapeless before
@@ -587,7 +571,7 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
         let mut ids: Vec<PlanNodeId> = indices
             .iter()
             .map(|i| PlanNodeId {
-                node_id: node_id_of(secrets[*i]),
+                node_id: fixture.node_id(*i),
             })
             .collect();
         ids.sort_by(|l, r| l.node_id.cmp(&r.node_id));
@@ -617,7 +601,7 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
             member_seeds: Vec::<MemberSeedV1>::new(),
         });
         CommandV1::Client(ClientCommandV1 {
-            actor_node_id: node_id_of(secrets[leader]),
+            actor_node_id: fixture.node_id(leader),
             client_id: aster::coordination::testing::id16(b"chaos-admin"),
             sequence: 1,
             request_hash: aster::coordination::hash::request_hash(&action)
@@ -629,8 +613,8 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
 
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
-        let at = await_leader(&voters, "a leader to accept the membership plan").await;
-        let coordination = voters[at].server.coordination().expect("hosted");
+        let at = await_leader(&voters, PATIENCE, "a leader to accept the membership plan").await;
+        let coordination = voters[at].coordination();
         let expected = coordination.membership_log_id_for_testing();
         match coordination
             .propose_for_testing_within(plan_at(at, expected), Duration::from_secs(20))
@@ -658,22 +642,21 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
     // configuration containing the desired voters is what a change looks like
     // *mid-flight*, and the committed shape reaches its final form one entry
     // before the controller records completion.
-    let want_voters: BTreeSet<Vec<u8>> =
-        [0, 1, 2].iter().map(|i| node_id_of(secrets[*i])).collect();
-    let want_nodes: BTreeSet<Vec<u8>> = (0..5).map(|i| node_id_of(secrets[i])).collect();
+    let want_voters: BTreeSet<Vec<u8>> = [0, 1, 2].iter().map(|i| fixture.node_id(*i)).collect();
+    let want_nodes: BTreeSet<Vec<u8>> = (0..5).map(|i| fixture.node_id(i)).collect();
 
     let settle_deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         let mut settled = false;
         for voter in &voters {
-            let c = voter.server.coordination().expect("hosted");
+            let c = voter.coordination();
             let have_voters: BTreeSet<Vec<u8>> = c
-                .committed_voters_for_testing()
+                .effective_voters_for_testing()
                 .into_iter()
                 .map(|n| n.as_bytes().to_vec())
                 .collect();
             let have_nodes: BTreeSet<Vec<u8>> = c
-                .committed_nodes_for_testing()
+                .effective_nodes_for_testing()
                 .into_iter()
                 .map(|n| n.as_bytes().to_vec())
                 .collect();
@@ -707,7 +690,6 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
         SEED ^ 0x5171
     );
 
-    for voter in voters {
-        voter.server.shutdown().await;
-    }
+    every_core_is_alive(&voters, "after the gate").await;
+    shutdown_all(voters).await;
 }

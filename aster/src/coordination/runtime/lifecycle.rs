@@ -55,9 +55,10 @@
 //! on a leader, `None` on a follower. A plain `bool` would force the stranded
 //! follower above to claim a quorum it cannot observe.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{RaftMetrics, ServerState};
+use openraft::{RaftMetrics, ServerState, StoredMembership};
 
 use crate::coordination::ids::CoordinationNodeId;
 use crate::coordination::typeconfig::CoordinationNode;
@@ -188,6 +189,16 @@ pub(crate) struct LocalFacts {
     /// or by the snapshot that subsumes it. Neither has a different question to
     /// answer.
     pub(crate) genesis_installed: bool,
+    /// The **committed** membership, from the state actor.
+    ///
+    /// Not from `metrics.membership_config`, which is
+    /// `membership_state.effective()` — the newest membership entry seen,
+    /// committed or not. §7.6 asks what the *group has agreed* this node is,
+    /// and an entry one leader appended and no quorum accepted is not an
+    /// agreement: a new leader can overwrite it, and a node that had already
+    /// been reported a voter on the strength of it would have been reported
+    /// something that never became true.
+    pub(crate) committed: Arc<StoredMembership<CoordinationNodeId, CoordinationNode>>,
 }
 
 /// What this node reports about itself.
@@ -216,7 +227,7 @@ pub(crate) struct LifecycleView {
 /// health is being reported — which is also why "membership does not yet
 /// contain self" is **not** a `NoQuorum` condition.
 pub(crate) fn classify(metrics: &Metrics, local: &LocalFacts) -> LifecycleView {
-    let local_role = role_of(metrics);
+    let local_role = role_of(metrics, local);
     let quorum_available = quorum_evidence(metrics, local);
 
     // 1. Fatal. Both the latched local cause and OpenRaft's own running state,
@@ -287,11 +298,13 @@ fn view(
 
 /// This node's role in the **committed** membership.
 ///
-/// Read from `membership_config`, which is the committed `StoredMembership`,
-/// rather than from `ServerState`: `ServerState::Leader` says what this node is
-/// doing, and the question here is what the group has agreed this node is.
-fn role_of(metrics: &Metrics) -> LocalRole {
-    let membership = metrics.membership_config.membership();
+/// From the state actor rather than from `ServerState`: `ServerState::Leader`
+/// says what this node is doing, and the question here is what the group has
+/// agreed this node is. And from the state actor rather than from
+/// `metrics.membership_config`, which despite this comment's earlier wording is
+/// the *effective* membership — the newest entry seen, committed or not.
+fn role_of(metrics: &Metrics, local: &LocalFacts) -> LocalRole {
+    let membership = local.committed.membership();
     // `voter_ids` unions every configuration, which is the right reading during
     // a joint change: a node that is a voter in either config votes, and the
     // question here is what the group has agreed this node is, not which half
@@ -445,8 +458,26 @@ pub(crate) mod testing {
         }
     }
 
+    /// Local facts whose **committed** membership is taken from `metrics`.
+    ///
+    /// For the cases that are about `local_role`: production reads the role
+    /// from the state actor's committed membership, so a fixture that left the
+    /// two unrelated would be asserting about a membership the classifier never
+    /// sees. Everything else uses [`local`], whose default already makes this
+    /// node a voter.
+    pub(crate) fn local_of(metrics: &Metrics, corridor: Corridor) -> LocalFacts {
+        LocalFacts {
+            committed: Arc::clone(&metrics.membership_config),
+            ..local(corridor)
+        }
+    }
+
     pub(crate) fn local(corridor: Corridor) -> LocalFacts {
         LocalFacts {
+            // A settled group in which this node — id 1 — is a voter, which is
+            // what every case that is not about the role already assumed when
+            // this was read from the metrics fixture.
+            committed: membership(&[&[1, 2, 3]], &[]),
             corridor,
             draining: false,
             fatal: None,
@@ -687,8 +718,6 @@ mod tests {
     /// `Ready` fact is that the committed membership makes this node a voter.
     #[test]
     fn a_learner_is_not_ready_and_reports_its_role() {
-        let mut facts = local(Corridor::Running);
-        facts.follower_contact_age = Some(Duration::from_millis(1));
         let learner = metrics(
             9,
             ServerState::Learner,
@@ -697,6 +726,11 @@ mod tests {
             None,
             membership(PROD, &[9]),
         );
+        // The role comes from the **committed** membership, so the facts carry
+        // it: a fixture whose facts and metrics named different memberships
+        // would be asserting about one the classifier never reads.
+        let mut facts = local_of(&learner, Corridor::Running);
+        facts.follower_contact_age = Some(Duration::from_millis(1));
         let view = classify(&learner, &facts);
         assert_eq!(view.local_role, LocalRole::Learner);
         assert_eq!(view.code, LifecycleCode::NoQuorum);
@@ -710,7 +744,12 @@ mod tests {
             None,
             membership(PROD, &[]),
         );
-        assert_eq!(classify(&stranger, &facts).local_role, LocalRole::None);
+        let mut stranger_facts = local_of(&stranger, Corridor::Running);
+        stranger_facts.follower_contact_age = Some(Duration::from_millis(1));
+        assert_eq!(
+            classify(&stranger, &stranger_facts).local_role,
+            LocalRole::None
+        );
     }
 
     /// Precedence is strict, and each level is asserted to beat the one below
@@ -772,8 +811,6 @@ mod tests {
     /// `NoQuorum` looks for a partition, and the group is healthy.
     #[test]
     fn a_joining_node_reports_joining_even_while_the_group_is_healthy() {
-        let mut facts = local(Corridor::Joining);
-        facts.follower_contact_age = Some(Duration::from_millis(1));
         let candidate = metrics(
             9,
             ServerState::Learner,
@@ -782,6 +819,8 @@ mod tests {
             None,
             membership(PROD, &[9]),
         );
+        let mut facts = local_of(&candidate, Corridor::Joining);
+        facts.follower_contact_age = Some(Duration::from_millis(1));
         let view = classify(&candidate, &facts);
         assert_eq!(view.code, LifecycleCode::Joining);
         assert_eq!(view.local_role, LocalRole::Learner);

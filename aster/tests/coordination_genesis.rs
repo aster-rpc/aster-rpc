@@ -174,7 +174,7 @@ async fn an_exact_genesis_replay_is_idempotent() {
     let voter = start(&fixture).await;
     let coordination = voter.coordination();
 
-    let before = coordination.committed_voters_for_testing();
+    let before = coordination.effective_voters_for_testing();
 
     let replay = coordination
         .propose_for_testing_within(
@@ -192,7 +192,7 @@ async fn an_exact_genesis_replay_is_idempotent() {
     );
 
     // And the group is unchanged and still working.
-    assert_eq!(coordination.committed_voters_for_testing(), before);
+    assert_eq!(coordination.effective_voters_for_testing(), before);
     assert_eq!(coordination.lifecycle_code(), 3, "still Ready");
 
     voter.server.shutdown().await;
@@ -345,7 +345,7 @@ async fn root_is_an_administrator_on_every_administrative_path() {
 
     assert!(
         !coordination
-            .committed_nodes_for_testing()
+            .effective_nodes_for_testing()
             .iter()
             .any(|node| node.as_bytes() == root.as_slice()),
         "ROOT is never a committed member"
@@ -826,6 +826,30 @@ async fn an_interrupted_bootstrap_recovers_through_existing() {
     server.shutdown().await;
 }
 
+/// The applied index, once it has stopped moving on its own.
+///
+/// A fresh leader applies its own blank entry and then the genesis, and
+/// `wait_ready` is level-triggered — it reports that the node reached `Ready`,
+/// not that its log has come to rest. A gate that means "this proposal did not
+/// advance the log" has to start from an index that was not going to advance
+/// anyway, or it is measuring startup.
+async fn settled_applied_index(coordination: &aster::coordination::Coordination) -> u64 {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut last = coordination.last_applied_for_testing();
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = coordination.last_applied_for_testing();
+        if now == last {
+            return now.expect("an applied index");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the applied index never settled: {last:?} then {now:?}"
+        );
+        last = now;
+    }
+}
+
 /// **A correctly signed *alternative* genesis for the same group is fatal.**
 ///
 /// The earlier version used another ROOT and another group, so it never reached
@@ -844,9 +868,22 @@ async fn an_alternative_genesis_for_the_same_group_is_fatal() {
     let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x0B, 1);
     let voter = start(&fixture).await;
     let coordination = voter.coordination();
-    let before = coordination
-        .last_applied_for_testing()
-        .expect("an applied index");
+
+    // The mark is taken once the log has **stopped moving**, not at the first
+    // opportunity. `wait_ready` is level-triggered and says nothing about the
+    // entries a fresh leader is still applying — its blank entry and the
+    // genesis itself — so an index read straight after it can still advance on
+    // its own. The "a refused genesis must not advance the applied index"
+    // assertion below then fails for a reason that has nothing to do with the
+    // genesis, which is the most likely explanation for the one unreproduced
+    // failure of this test under parallel load; nothing captured the panic at
+    // the time, so this is a fix for a plausible cause rather than a confirmed
+    // one, and the assertions below now say which is which.
+    assert!(
+        coordination.genesis_installed_for_testing().await,
+        "the group's own genesis must be installed before a second one is offered"
+    );
+    let before = settled_applied_index(&coordination).await;
 
     // Same ROOT, same group, same domain, same voters — a different nonce, so a
     // different document with a different hash.
@@ -892,13 +929,31 @@ async fn an_alternative_genesis_for_the_same_group_is_fatal() {
             PATIENCE,
         )
         .await;
+    // **The refusal has to be the genesis binding rule**, named. `is_err()` was
+    // what this asserted, and `is_err()` is satisfied by a timeout, a
+    // `ForwardToLeader`, or any transport failure — none of which say anything
+    // about two genesis documents for one group. `Fault::GenesisRefused` is
+    // rendered into the storage error that ends the apply, so the name is on
+    // the wire the caller sees.
+    let refusal = match outcome {
+        Err(err) => err.to_string(),
+        Ok(committed) => panic!(
+            "a second genesis for this group must not be accepted; it committed at \
+             index {} and replied {:?}",
+            committed.index, committed.reply
+        ),
+    };
     assert!(
-        outcome.is_err(),
-        "a second genesis for this group must not be accepted: {outcome:?}"
+        refusal.contains("GenesisRefused"),
+        "the refusal must be the genesis binding rule and not something else that \
+         merely failed. The proposal answered: {refusal}"
     );
+
+    let after = coordination.last_applied_for_testing();
     assert!(
-        coordination.last_applied_for_testing() <= Some(before),
-        "a refused genesis must not advance the applied index"
+        after <= Some(before),
+        "a refused genesis must not advance the applied index: it was {before} \
+         before the proposal and {after:?} after"
     );
 
     let deadline = tokio::time::Instant::now() + PATIENCE;
@@ -908,8 +963,11 @@ async fn an_alternative_genesis_for_the_same_group_is_fatal() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "two genesis documents for one group is fatal, reported {}",
-            coordination.lifecycle_code()
+            "two genesis documents for one group is fatal; after the refusal \
+             ({refusal}) the voter reported lifecycle {} rather than 6, with applied \
+             index {:?}",
+            coordination.lifecycle_code(),
+            coordination.last_applied_for_testing()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -979,7 +1037,7 @@ async fn a_membership_plan_naming_root_is_refused() {
     // And the membership is untouched.
     assert!(
         !coordination
-            .committed_nodes_for_testing()
+            .effective_nodes_for_testing()
             .iter()
             .any(|node| node.as_bytes() == &fixture.authority_key()),
         "ROOT never enters the committed membership"

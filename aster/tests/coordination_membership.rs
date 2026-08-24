@@ -198,8 +198,8 @@ async fn await_shape(
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         let c = voter.coordination();
-        let have_voters: BTreeSet<_> = c.committed_voters_for_testing().into_iter().collect();
-        let have_nodes: BTreeSet<_> = c.committed_nodes_for_testing().into_iter().collect();
+        let have_voters: BTreeSet<_> = c.effective_voters_for_testing().into_iter().collect();
+        let have_nodes: BTreeSet<_> = c.effective_nodes_for_testing().into_iter().collect();
         // Non-joint as well as correct. A joint configuration containing the
         // desired voters is what a change looks like *mid-flight*, and §S3-E
         // refuses to call that completion.

@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
-use openraft::{ChangeMembers, Raft};
+use openraft::{ChangeMembers, Membership, Raft};
 
 use crate::coordination::ids::CoordinationNodeId;
 use crate::coordination::model::shape::MEMBERSHIP_RETAIN;
@@ -238,6 +238,12 @@ pub(crate) fn caught_up(
 
 /// Completion is **observed**, never claimed (§7.3).
 ///
+/// Against the **committed** membership. This read was
+/// `metrics.membership_config`, which is the effective membership, so an intent
+/// could be reported complete against a uniform entry that had been appended
+/// and not accepted by any quorum — the one thing §S3-E's completion rule
+/// exists to forbid.
+///
 /// A controller reply, a local node-map edit, or a combined member set is not
 /// enough: the committed membership must be non-joint, its voters exactly the
 /// desired set, and its learners exactly the retained set. `decide_progress`
@@ -245,11 +251,10 @@ pub(crate) fn caught_up(
 /// reported early would simply not advance the intent — but reporting early is
 /// still wrong, and this is where it is not done.
 pub(crate) fn completion_is_visible(
-    metrics: &super::lifecycle::Metrics,
+    membership: &Membership<CoordinationNodeId, CoordinationNode>,
     desired_voters: &[CoordinationNodeId],
     retained_learners: &[CoordinationNodeId],
 ) -> bool {
-    let membership = metrics.membership_config.membership();
     // A joint entry is the *middle* of a change. An intent that reported
     // itself complete during one has not observed the uniform membership it
     // claims.
@@ -354,9 +359,24 @@ pub(crate) enum Step {
 /// A pure function of the two sources, so the phase table is testable without a
 /// cluster — and, more importantly, so there is exactly one place the table
 /// lives. The controller loop is only sequencing and cancellation.
+///
+/// **`committed` is the state machine's membership, not
+/// `metrics.membership_config`.** That field is
+/// `membership_state.effective()`: the newest membership entry this node has
+/// *seen*. Reading it here made the table act on entries no quorum had
+/// accepted — treating an appended joint entry as "the joint entry landed", and
+/// an appended uniform entry as licence to replace the node map. Both can be
+/// overwritten by a new leader, and the corridor's own rule is the opposite
+/// one: while effective is ahead of committed, wait and retry. Asking the same
+/// change again is what does that waiting — OpenRaft answers `InProgress`,
+/// which `classify_change` turns into `ChangeOutcome::Retry`.
+///
+/// `metrics` is still needed, and only for what it is authoritative about:
+/// this node's id, its last log index, and per-peer replication progress.
 pub(crate) fn next_step(
     intent: &crate::coordination::model::state::Intent,
     metrics: &super::lifecycle::Metrics,
+    committed: &Membership<CoordinationNodeId, CoordinationNode>,
     catch_up_barrier: Option<u64>,
 ) -> Step {
     use crate::coordination::model::membership as phases;
@@ -374,7 +394,7 @@ pub(crate) fn next_step(
         .map(|n| CoordinationNodeId::from_array(*n))
         .collect();
 
-    let membership = metrics.membership_config.membership();
+    let membership = committed;
     let current: BTreeSet<CoordinationNodeId> = membership.nodes().map(|(id, _)| *id).collect();
 
     match intent.status_code {
@@ -423,7 +443,7 @@ pub(crate) fn next_step(
         }
 
         phases::PHASE_CHANGING_VOTERS => {
-            if completion_is_visible(metrics, &desired, &retained) {
+            if completion_is_visible(membership, &desired, &retained) {
                 return Step::ReportComplete;
             }
             let voters: BTreeSet<CoordinationNodeId> = membership.voter_ids().collect();
@@ -517,7 +537,16 @@ pub(crate) async fn run_generation(
             barrier = None;
         }
 
-        let step = next_step(&intent, &metrics, barrier.map(|(_, at)| at));
+        // The state machine's membership, which is the committed one. Re-read
+        // every pass for the same reason everything else here is: the point of
+        // §7.3's two sources is that neither is remembered.
+        let committed = state.committed_membership();
+        let step = next_step(
+            &intent,
+            &metrics,
+            committed.membership(),
+            barrier.map(|(_, at)| at),
+        );
         let outcome = match step {
             Step::Idle => {
                 tokio::time::sleep(IDLE_POLL).await;
@@ -603,8 +632,12 @@ pub(crate) async fn run_generation(
                 replace_node_map(&raft, &desired, &retained).await
             }
             Step::ReportComplete => {
-                let observed = metrics
-                    .membership_config
+                // The **committed** membership's log id, which is what
+                // `decide_progress` compares a `Completed` report against. From
+                // the effective one it could name an entry no quorum accepted,
+                // and the report would be refused for naming a membership the
+                // group does not have — or, worse, accepted before it did.
+                let observed = committed
                     .log_id()
                     .map(crate::coordination::contract::LogIdV1::from);
                 report_progress(
@@ -654,6 +687,29 @@ pub(crate) async fn run_generation(
                 result
             }
         };
+
+        // **A generation that has committed its own removal stops here.**
+        //
+        // Once a membership excluding this node commits and applies, OpenRaft
+        // steps the leader down of its own accord; driving one more step from
+        // this generation is a side effect performed by a leader the group has
+        // already voted out. §7.3 hands the rest — `ReplaceAllNodes` and the
+        // completion report — to the next generation, which reaches the same
+        // step from the same durable intent because that is the whole point of
+        // deciding from observation.
+        //
+        // Checked *after* the step, not before: refusing to act at all would
+        // stall, because the membership that removes this node is the very
+        // entry this controller has to commit, and no election can be caused
+        // while it still leads. `trigger().elect()` is a no-op on a leader.
+        if !state
+            .committed_membership()
+            .membership()
+            .voter_ids()
+            .any(|id| id == local)
+        {
+            return;
+        }
 
         match outcome {
             Ok(()) => {}
@@ -927,9 +983,11 @@ mod tests {
     /// wrong learner set each refuses it.
     #[test]
     fn completion_requires_the_exact_uniform_membership() {
-        use openraft::{Membership, StoredMembership};
-        use std::sync::Arc;
+        use openraft::Membership;
 
+        // A **membership**, not a metrics snapshot: completion is decided
+        // against the committed membership the state machine holds, and the
+        // metrics field this used to read is the effective one.
         let view = |configs: Vec<BTreeSet<CoordinationNodeId>>, learners: &[u8]| {
             let mut nodes: BTreeMap<CoordinationNodeId, CoordinationNode> = configs
                 .iter()
@@ -939,14 +997,7 @@ mod tests {
             for l in learners {
                 nodes.insert(node(*l), CoordinationNode);
             }
-            super::super::lifecycle::testing::metrics(
-                1,
-                openraft::ServerState::Leader,
-                5,
-                Some(5),
-                Some(10),
-                Arc::new(StoredMembership::new(None, Membership::new(configs, nodes))),
-            )
+            Membership::new(configs, nodes)
         };
 
         let desired = [node(1), node(2), node(3)];
@@ -1076,6 +1127,66 @@ mod tests {
         metrics
     }
 
+    /// `next_step` where the effective and committed membership agree.
+    ///
+    /// Every row of the table below describes a **settled** state, so the two
+    /// coincide and saying so once keeps the rows about the table. The case
+    /// where they differ is the whole point of reading the committed one, and
+    /// is pinned on its own by
+    /// [`an_uncommitted_entry_does_not_advance_the_table`].
+    fn step(
+        intent: &Intent,
+        metrics: &super::super::lifecycle::Metrics,
+        barrier: Option<u64>,
+    ) -> Step {
+        next_step(
+            intent,
+            metrics,
+            metrics.membership_config.membership(),
+            barrier,
+        )
+    }
+
+    /// **An entry that is only *effective* does not advance the table.**
+    ///
+    /// The regression for the defect this whole reading exists to prevent.
+    /// `RaftMetrics::membership_config` is `membership_state.effective()`: the
+    /// newest membership entry seen, committed or not. A controller reading it
+    /// treats a joint entry one leader appended as "the joint entry landed" and
+    /// a uniform entry as licence to replace the node map — both of which a new
+    /// leader can overwrite.
+    ///
+    /// Here the effective membership is already the finished uniform shape
+    /// while the committed one is still the old five. The table must decide
+    /// from the committed one and ask for the voter change again; OpenRaft
+    /// answers `InProgress` while effective is ahead, which `classify_change`
+    /// turns into a retry — the corridor's own "wait and retry" rule.
+    #[test]
+    fn an_uncommitted_entry_does_not_advance_the_table() {
+        let plan = intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]);
+        let ahead = view(&[&[1, 2, 3]], &[9], &[]);
+        let behind = Membership::new(
+            vec![members(&[1, 2, 3, 4, 5])],
+            [1u8, 2, 3, 4, 5, 9]
+                .iter()
+                .map(|n| (node(*n), CoordinationNode))
+                .collect::<BTreeMap<_, _>>(),
+        );
+
+        assert_eq!(
+            next_step(&plan, &ahead, &behind, None),
+            Step::ChangeVoters,
+            "an uncommitted uniform entry is not a landed one; the corridor asks again"
+        );
+        // And read from the effective membership — as it was — the same state
+        // reports the change finished, which is the bug.
+        assert_eq!(
+            next_step(&plan, &ahead, ahead.membership_config.membership(), None),
+            Step::ReportComplete,
+            "this is what reading the effective membership did, and why it was wrong"
+        );
+    }
+
     /// **The whole phase table**, one row at a time, from the two sources it is
     /// allowed to read.
     ///
@@ -1086,7 +1197,7 @@ mod tests {
     fn each_phase_selects_its_step_from_intent_and_membership() {
         // Pending: commit the transition before any external learner work.
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_PENDING, &[1, 2, 3], &[], &[]),
                 &view(&[&[1]], &[], &[]),
                 None
@@ -1096,7 +1207,7 @@ mod tests {
 
         // AddingLearners with nodes missing: add exactly the missing ones.
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
                 &view(&[&[1]], &[], &[]),
                 None
@@ -1106,7 +1217,7 @@ mod tests {
 
         // All present, no barrier yet: this pass observes one.
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
                 &view(&[&[1]], &[2, 3, 9], &[]),
                 None
@@ -1119,7 +1230,7 @@ mod tests {
 
         // A barrier, and one voter still behind.
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
                 &view(&[&[1]], &[2, 3, 9], &[(2, 100), (3, 40)]),
                 Some(100)
@@ -1132,7 +1243,7 @@ mod tests {
 
         // Everyone caught up: promote.
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2, 3], &[9], &[]),
                 &view(&[&[1]], &[2, 3, 9], &[(2, 100), (3, 100)]),
                 Some(100)
@@ -1142,7 +1253,7 @@ mod tests {
 
         // ChangingVoters, mid-joint: keep calling step 4.
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]),
                 &view(&[&[1], &[1, 2, 3]], &[9], &[]),
                 None
@@ -1152,7 +1263,7 @@ mod tests {
 
         // The uniform voter entry landed, the node map is still wrong: step 5.
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]),
                 &view(&[&[1, 2, 3]], &[], &[]),
                 None
@@ -1162,7 +1273,7 @@ mod tests {
 
         // Exactly the plan: report.
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_CHANGING_VOTERS, &[1, 2, 3], &[9], &[]),
                 &view(&[&[1, 2, 3]], &[9], &[]),
                 None
@@ -1177,7 +1288,7 @@ mod tests {
             phases::PHASE_CANCELLED,
         ] {
             assert_eq!(
-                next_step(
+                step(
                     &intent(terminal, &[1, 2, 3], &[], &[]),
                     &view(&[&[1, 2, 3]], &[], &[]),
                     None
@@ -1204,7 +1315,7 @@ mod tests {
         advanced.last_log_index = Some(5_000);
 
         assert_eq!(
-            next_step(&intent, &advanced, Some(100)),
+            step(&intent, &advanced, Some(100)),
             Step::ChangeVoters,
             "a learner that reached the observed barrier is caught up, whatever the head is"
         );
@@ -1212,7 +1323,7 @@ mod tests {
         // Against a barrier taken from the current head it would still be
         // behind — which is the stall this rule prevents.
         assert_eq!(
-            next_step(&intent, &advanced, Some(5_000)),
+            step(&intent, &advanced, Some(5_000)),
             Step::AwaitCatchUp {
                 barrier: 5_000,
                 outstanding: members(&[2]),
@@ -1228,7 +1339,7 @@ mod tests {
     #[test]
     fn a_lagging_retained_learner_does_not_block_the_change() {
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_ADDING_LEARNERS, &[1, 2], &[9], &[]),
                 // Node 9 is present but far behind; the voters are current.
                 &view(&[&[1]], &[2, 9], &[(2, 100), (9, 1)]),
@@ -1248,7 +1359,7 @@ mod tests {
         // Seeds name 4 and 5; 5 is a desired voter, so only 4 is an
         // introduction to clean up. Node 7 is a learner this intent never
         // touched.
-        let step = next_step(
+        let step = step(
             &intent(phases::PHASE_CANCEL_REQUESTED, &[1, 2, 5], &[], &[4, 5]),
             &view(&[&[1, 2]], &[4, 5, 7], &[]),
             None,
@@ -1265,7 +1376,7 @@ mod tests {
     #[test]
     fn a_cancel_with_nothing_left_to_undo_removes_nothing() {
         assert_eq!(
-            next_step(
+            step(
                 &intent(phases::PHASE_CANCEL_REQUESTED, &[1, 2], &[], &[4]),
                 &view(&[&[1, 2]], &[7], &[]),
                 None
@@ -1298,7 +1409,7 @@ mod tests {
         //    old uniform set. Call the same desired change again; OpenRaft's
         //    coherent next step emits the joint entry.
         assert_eq!(
-            next_step(&plan, &view(&[&[1, 2]], &[3, 9], &[]), None),
+            step(&plan, &view(&[&[1, 2]], &[3, 9], &[]), None),
             Step::ChangeVoters,
             "before the joint entry, the corridor restarts from the same desired change"
         );
@@ -1307,7 +1418,7 @@ mod tests {
         //    same call again is what makes OpenRaft emit the uniform entry —
         //    not a different call, and not an assumption that it already did.
         assert_eq!(
-            next_step(&plan, &view(&[&[1, 2], &[1, 2, 3]], &[9], &[]), None),
+            step(&plan, &view(&[&[1, 2], &[1, 2, 3]], &[9], &[]), None),
             Step::ChangeVoters,
             "a joint membership resumes by repeating the desired change"
         );
@@ -1316,7 +1427,7 @@ mod tests {
         //    replaced: the voters are right and a stale learner remains. Only
         //    step 5 is owed, and it is a separate operation.
         assert_eq!(
-            next_step(&plan, &view(&[&[1, 2, 3]], &[7, 9], &[]), None),
+            step(&plan, &view(&[&[1, 2, 3]], &[7, 9], &[]), None),
             Step::ReplaceNodes,
             "after the uniform entry, only the node map is owed"
         );
@@ -1324,7 +1435,7 @@ mod tests {
         // 4. Lost **after the node-map replacement**: everything matches, and
         //    all that remains is to report what has already been observed.
         assert_eq!(
-            next_step(&plan, &view(&[&[1, 2, 3]], &[9], &[]), None),
+            step(&plan, &view(&[&[1, 2, 3]], &[9], &[]), None),
             Step::ReportComplete,
             "after the replacement, completion is reported from observation"
         );
@@ -1333,9 +1444,9 @@ mod tests {
         // the same thing everywhere would pass three of the four above by
         // accident.
         let answers = [
-            next_step(&plan, &view(&[&[1, 2]], &[3, 9], &[]), None),
-            next_step(&plan, &view(&[&[1, 2, 3]], &[7, 9], &[]), None),
-            next_step(&plan, &view(&[&[1, 2, 3]], &[9], &[]), None),
+            step(&plan, &view(&[&[1, 2]], &[3, 9], &[]), None),
+            step(&plan, &view(&[&[1, 2, 3]], &[7, 9], &[]), None),
+            step(&plan, &view(&[&[1, 2, 3]], &[9], &[]), None),
         ];
         let distinct: BTreeSet<String> = answers.iter().map(|a| format!("{a:?}")).collect();
         assert_eq!(
@@ -1363,7 +1474,7 @@ mod tests {
             view(&[&[1, 2, 3], &[1, 2]], &[9], &[]),
         ] {
             assert_ne!(
-                next_step(&plan, &membership, None),
+                step(&plan, &membership, None),
                 Step::ReplaceNodes,
                 "the node map may only be replaced after the uniform voter entry"
             );

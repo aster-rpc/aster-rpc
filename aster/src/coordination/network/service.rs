@@ -109,19 +109,56 @@ impl RaftEndpoint {
     }
 }
 
-/// The committed membership, as the allowlist reads it.
+/// Who may speak Raft to this node: the **union** of the committed and
+/// effective memberships.
 ///
-/// From `RaftMetrics`, which is the group's own agreed answer — not from a
-/// local cache the controller maintains, which would be a second opinion that
-/// disagrees exactly while a change is in flight. The voter *union* during a
-/// joint change, so a node that votes in either configuration may speak.
-fn committed_members(runtime: &AttachedRuntime) -> BTreeSet<CoordinationNodeId> {
-    let metrics = runtime.raft.metrics().borrow().clone();
-    let membership = metrics.membership_config.membership().clone();
-    let mut members: BTreeSet<CoordinationNodeId> = membership.voter_ids().collect();
-    // Learners too: a learner catching up must be able to answer the leader's
-    // appends, and §7.3 adds one before it is ever a voter.
-    members.extend(membership.nodes().map(|(id, _)| *id));
+/// The two halves answer different failures, and using either alone breaks a
+/// real case.
+///
+/// **Committed alone starves the node that most needs to be spoken to.** A
+/// voter returning onto its own store starts already graduated
+/// ([`SenderAllowlist::from_membership`]), so this set *is* its allowlist — and
+/// a node whose state machine is behind its log has applied no membership at
+/// all. Its committed membership is empty, it admits nobody, and the leader
+/// cannot reach it to send the snapshot that would let it catch up. That is a
+/// deadlock, and it is exactly the stranded-follower case §S3-F exists to
+/// prove: `a_stranded_follower_catches_up_by_snapshot` sat at `applied None`
+/// for the full patience window. OpenRaft loads effective membership from the
+/// **log** at startup, which is why it is available when the applied one is
+/// not.
+///
+/// **Effective alone was the defect this replaced.** It is the newest
+/// membership entry *seen*, committed or not, so a node named only by an entry
+/// no quorum accepted would be admitted.
+///
+/// Admitting on the union is the weaker of the two risks by a wide margin, and
+/// deliberately so: this is re-evaluated on **every request**, so an entry that
+/// is rolled back stops admitting its nodes immediately. §7.2's *graduation* —
+/// the permanent step, where a node stops being checked against its signed
+/// seeds for good — reads the committed membership only, in
+/// [`runtime::owner`](crate::coordination::runtime::owner). Those are different
+/// decisions and they get different answers.
+///
+/// The voter *union* across a joint change, so a node that votes in either
+/// configuration may speak.
+fn admissible_members(runtime: &AttachedRuntime) -> BTreeSet<CoordinationNodeId> {
+    let mut members = BTreeSet::new();
+    let mut add = |membership: &openraft::Membership<
+        CoordinationNodeId,
+        crate::coordination::typeconfig::CoordinationNode,
+    >| {
+        members.extend(membership.voter_ids());
+        // Learners too: a learner catching up must be able to answer the
+        // leader's appends, and §7.3 adds one before it is ever a voter.
+        members.extend(membership.nodes().map(|(id, _)| *id));
+    };
+    add(runtime.state.committed_membership().membership());
+    add(runtime
+        .raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership());
     members
 }
 
@@ -232,7 +269,7 @@ async fn unary(runtime: &AttachedRuntime, method: &str, mut call: Call) {
         return;
     };
 
-    let members = committed_members(runtime);
+    let members = admissible_members(runtime);
     let ctx = AdmissionContext {
         group: &runtime.group,
         admission: runtime.admission.as_ref(),
@@ -389,7 +426,7 @@ async fn install_snapshot(runtime: &AttachedRuntime, mut call: Call) {
         admit_identity(&ctx, provenance, &peer, &header_claim(&header)).map(|_| ())
     };
 
-    if let Err(refusal) = recheck(&committed_members(runtime)) {
+    if let Err(refusal) = recheck(&admissible_members(runtime)) {
         let _ = call.finish(&refusal.status()).await;
         return;
     }
@@ -419,7 +456,7 @@ async fn install_snapshot(runtime: &AttachedRuntime, mut call: Call) {
                 .await;
             return;
         };
-        if let Err(refusal) = recheck(&committed_members(runtime)) {
+        if let Err(refusal) = recheck(&admissible_members(runtime)) {
             let _ = call.finish(&refusal.status()).await;
             return;
         }
@@ -445,7 +482,7 @@ async fn install_snapshot(runtime: &AttachedRuntime, mut call: Call) {
     }
 
     // Once more before install, per §8.4.
-    if let Err(refusal) = recheck(&committed_members(runtime)) {
+    if let Err(refusal) = recheck(&admissible_members(runtime)) {
         let _ = call.finish(&refusal.status()).await;
         return;
     }

@@ -259,9 +259,41 @@ impl CoordinationNetwork {
         let Some(chaos) = self.ctx.chaos.clone() else {
             return self.unary_once(method, message, option).await;
         };
-        match chaos.before_send(&self.ctx.local, &self.target).await {
-            super::chaos::ChaosAction::Send => self.unary_once(method, message, option).await,
+        let sent = chaos.before_send(&self.ctx.local, &self.target).await;
+        match sent.action {
+            super::chaos::ChaosAction::Send => {
+                let answer = self.unary_once(method, message, option).await;
+                // This exchange is over, so anything the schedule is holding
+                // for this peer has now been overtaken. Reported whether or not
+                // the exchange succeeded: a message that failed still went, and
+                // a held one behind it still arrives after it.
+                chaos.after_send(&self.target, sent.token);
+                answer
+            }
+            // Nothing left this node, so nothing was overtaken and there is
+            // nothing to report.
             super::chaos::ChaosAction::Swallow => Err(Transport::NotDialable),
+            // A genuine reorder: this message is sent from a **detached** task
+            // once a message issued after it has already gone, so the peer
+            // really receives the two in the opposite order. The caller is
+            // answered as though the message were lost, which is what a
+            // request/response sender sees when a reply never arrives — and is
+            // also what makes the reorder possible, because a caller held here
+            // would be blocking the only task that could produce the successor.
+            super::chaos::ChaosAction::Defer => {
+                let detached = CoordinationNetwork {
+                    ctx: self.ctx.clone(),
+                    target: self.target,
+                };
+                let (message, option, target, token) =
+                    (message.clone(), option.clone(), self.target, sent.token);
+                tokio::spawn(async move {
+                    chaos.await_release(&target, token).await;
+                    let _ = detached.unary_once(method, &message, &option).await;
+                    chaos.after_send(&target, token);
+                });
+                Err(Transport::NotDialable)
+            }
             // Both copies are really sent, and the **first** answer is the one
             // returned: a duplicate that discarded its first reply would test
             // nothing, because the receiver's second handling is exactly the
@@ -269,6 +301,7 @@ impl CoordinationNetwork {
             super::chaos::ChaosAction::SendTwice => {
                 let first = self.unary_once(method, message, option).await;
                 let _ = self.unary_once(method, message, option).await;
+                chaos.after_send(&self.target, sent.token);
                 first
             }
         }
@@ -486,18 +519,33 @@ impl RaftNetwork<CoordinationTypeConfig> for CoordinationNetwork {
         // the case §6.2 asks about. A duplicate is meaningless for a stream —
         // the receiver rejects a second concurrent one by design — so a
         // `SendTwice` verdict sends once here.
+        let mut sent = None;
         if let Some(chaos) = self.ctx.chaos.clone() {
-            if chaos.before_send(&self.ctx.local, &self.target).await
-                == super::chaos::ChaosAction::Swallow
-            {
+            let verdict = chaos.before_send(&self.ctx.local, &self.target).await;
+            // A deferred stream is abandoned rather than sent late. The
+            // receiver refuses a second concurrent transfer by design, so a
+            // detached copy arriving out of order would be testing that
+            // refusal — not arrival order, which is what a reorder is for.
+            if verdict.action == super::chaos::ChaosAction::Defer {
+                chaos.abandon(&self.target, verdict.token);
+            }
+            if matches!(
+                verdict.action,
+                super::chaos::ChaosAction::Swallow | super::chaos::ChaosAction::Defer
+            ) {
                 self.ctx.faults.record(self.target, FaultClass::Transient);
                 return Err(stream_error(
                     super::errors::StreamRetry::Unreachable,
                     "the chaos schedule dropped this snapshot stream".into(),
                 ));
             }
+            sent = Some((chaos, verdict.token));
         }
-        match self.send_snapshot(vote, snapshot, cancel, option).await {
+        let answer = self.send_snapshot(vote, snapshot, cancel, option).await;
+        if let Some((chaos, token)) = sent {
+            chaos.after_send(&self.target, token);
+        }
+        match answer {
             Ok(response) => Ok(response),
             Err(failure) => {
                 let (retry, fault) = classify_stream(&failure);

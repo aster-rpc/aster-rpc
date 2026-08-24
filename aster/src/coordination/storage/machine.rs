@@ -54,7 +54,7 @@ use openraft::{
     StorageError as RaftStorageError, StorageIOError, StoredMembership,
 };
 use redb::Database;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::actor::ActorShutdown;
 use super::error::{Db, StorageError, StorageResult};
@@ -200,6 +200,20 @@ struct StateActor {
     /// no state to serve, because the only copy was the one the failed batch
     /// was holding.
     state: Option<DurableState>,
+    /// The **committed** membership, published for readers outside this actor.
+    ///
+    /// This actor is the only component in the process that sees committed
+    /// membership, because it is the only one that applies committed entries.
+    /// `RaftMetrics::membership_config` is `membership_state.effective()` —
+    /// the newest membership *seen*, committed or not — and six call sites
+    /// read it while their own documentation said "committed". Publishing from
+    /// here means a reader gets the authoritative value without a round trip
+    /// and without a second opinion that disagrees exactly while a change is in
+    /// flight.
+    ///
+    /// Written only where [`Self::state`] is, through
+    /// [`Self::install_state`], so the two cannot diverge.
+    committed: watch::Sender<Arc<StoredMembership<CoordinationNodeId, CoordinationNode>>>,
     fatal: Arc<AtomicBool>,
     /// Fail the next batch's commit, after its entries have already mutated
     /// the working copy.
@@ -215,6 +229,29 @@ struct StateActor {
 }
 
 impl StateActor {
+    /// Publish a new durable state, and the committed membership inside it.
+    ///
+    /// The **only** way [`Self::state`] is assigned. Both places that replace
+    /// the state — an applied batch and an installed snapshot — change the
+    /// committed membership, and a publish that lived at only one of them would
+    /// leave every reader believing a group's membership was whatever it was
+    /// before the snapshot landed.
+    /// Takes the two fields rather than `&mut self` so it can be called from
+    /// the install path, which is holding the current-snapshot mutex — a
+    /// whole-`self` borrow there would not compile, and splitting the publish
+    /// back out to the call sites is exactly the divergence this prevents.
+    fn install_state(
+        slot: &mut Option<DurableState>,
+        committed: &watch::Sender<Arc<StoredMembership<CoordinationNodeId, CoordinationNode>>>,
+        state: DurableState,
+    ) {
+        // `send_replace` rather than `send`: there may be no receiver yet, or
+        // ever, and a membership that failed to publish because nobody was
+        // listening is exactly the silent divergence this exists to prevent.
+        committed.send_replace(Arc::new(state.membership.clone()));
+        *slot = Some(state);
+    }
+
     fn run(mut self, mut rx: mpsc::Receiver<StateCommand>, stop: Arc<AtomicBool>) {
         while let Some(command) = rx.blocking_recv() {
             if stop.load(Ordering::SeqCst) {
@@ -447,7 +484,7 @@ impl StateActor {
                 // can serve *and* is the one this install validated.
                 let (database, reloaded, body) = replaced.reopen()?;
                 self.database = Some(database);
-                self.state = Some(reloaded);
+                Self::install_state(&mut self.state, &self.committed, reloaded);
                 body
             }
         };
@@ -605,7 +642,8 @@ impl StateActor {
         // failure latches fatal before it replies, and a fatal store answers
         // nothing further -- so it is carried by the signature rather than by a
         // test whose name would imply it had been checked.
-        self.state = Some(rows::commit(self.database(), working, &changes)?);
+        let committed = rows::commit(self.database(), working, &changes)?;
+        Self::install_state(&mut self.state, &self.committed, committed);
         // The batch is durable and its replies exist. Dying here is the lost
         // acknowledgement: the entry applied, and the caller never learned it.
         // What must not follow is the entry being applied a second time, which
@@ -669,6 +707,15 @@ pub(crate) struct StateHandle {
     /// spawn: every field is fixed when storage opens, so a copy here cannot
     /// go stale — which is exactly why preparation does not need the actor.
     identity: Arc<snapshot::SnapshotIdentity>,
+    /// The committed membership, republished by the actor on every apply and
+    /// every snapshot install.
+    ///
+    /// A `watch` rather than a command: the readers are the sender allowlist,
+    /// the lifecycle role and the membership controller, and the first of those
+    /// is consulted on **every inbound Raft request**. A round trip to the
+    /// actor there would queue admission behind whatever the actor is applying,
+    /// which is the wrong thing to make slower and the wrong thing to couple.
+    committed: watch::Receiver<Arc<StoredMembership<CoordinationNodeId, CoordinationNode>>>,
 }
 
 impl std::fmt::Debug for StateHandle {
@@ -707,6 +754,10 @@ impl StateHandle {
         let actor_stop = Arc::clone(&stop);
         let fatal = Arc::new(AtomicBool::new(false));
         let actor_fatal = Arc::clone(&fatal);
+        // Seeded from the state that was just loaded and validated, so a reader
+        // that asks before the first apply gets the membership this store
+        // reopened with rather than an empty one.
+        let (committed_tx, committed_rx) = watch::channel(Arc::new(state.membership.clone()));
         let thread = std::thread::Builder::new()
             .name("aster-coordination-state".into())
             .spawn(move || {
@@ -717,6 +768,7 @@ impl StateHandle {
                     catalog,
                     current,
                     state: Some(state),
+                    committed: committed_tx,
                     fatal: actor_fatal,
                     #[cfg(test)]
                     fail_next_commit: false,
@@ -734,6 +786,7 @@ impl StateHandle {
                 fatal,
                 layout: handle_layout,
                 identity: Arc::new(handle_identity),
+                committed: committed_rx,
             },
             ActorShutdown::new(tx, stop, thread, || StateCommand::Shutdown),
         ))
@@ -741,6 +794,23 @@ impl StateHandle {
 
     pub(crate) fn is_fatal(&self) -> bool {
         self.fatal.load(Ordering::SeqCst)
+    }
+
+    /// The **committed** membership: exactly the entries this store has
+    /// applied.
+    ///
+    /// The value `RaftMetrics::membership_config` is not. OpenRaft populates
+    /// that from `membership_state.effective()` — the newest membership entry
+    /// seen, committed or not — and a node named only by an uncommitted entry
+    /// must not graduate off its signed seed allowlist, be reported as a voter,
+    /// or satisfy a completion check, because that entry can still be rolled
+    /// back by a new leader.
+    ///
+    /// Cheap: a `watch` borrow and an `Arc` clone, with no actor round trip.
+    pub(crate) fn committed_membership(
+        &self,
+    ) -> Arc<StoredMembership<CoordinationNodeId, CoordinationNode>> {
+        Arc::clone(&self.committed.borrow())
     }
 
     /// The same refusal every actor command makes, for work that does not go

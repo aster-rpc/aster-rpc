@@ -141,9 +141,22 @@ impl RuntimeFacts {
         }
     }
 
-    fn snapshot(&self, timeout: Duration) -> LocalFacts {
+    /// `committed` is passed in rather than held here: the state actor already
+    /// publishes it, and a second copy on these facts would be a second answer
+    /// that goes stale between the two.
+    fn snapshot(
+        &self,
+        timeout: Duration,
+        committed: std::sync::Arc<
+            openraft::StoredMembership<
+                crate::coordination::ids::CoordinationNodeId,
+                crate::coordination::typeconfig::CoordinationNode,
+            >,
+        >,
+    ) -> LocalFacts {
         let contact = self.last_leader_contact_ms.load(Ordering::SeqCst);
         LocalFacts {
+            committed,
             corridor: self.corridor(),
             draining: self.draining.load(Ordering::SeqCst),
             fatal: self.fatal.lock().expect("the fatal latch").clone(),
@@ -235,11 +248,21 @@ pub(crate) async fn run_lifecycle(
             let current = metrics.borrow_and_update().clone();
 
             // §7.2's graduation: the allowlist stops reading the signed seeds
-            // once a committed membership contains this node. Observed here
-            // because this is where committed membership is already being read,
-            // and a second observer would be a second answer.
+            // once a committed membership contains this node.
+            //
+            // **From the state actor**, which applies committed entries and
+            // nothing else. This read was `current.membership_config`, which
+            // OpenRaft populates from `membership_state.effective()` — the
+            // newest membership entry seen, committed or not. Graduation is
+            // permanent, so an entry a leader appended and a quorum never
+            // accepted could retire this node's signed-seed check for good, and
+            // rolling that entry back would not bring it back. The corridor
+            // transitions below read the same value for the same reason: §7.2
+            // says "a *committed* membership contains us", and an uncommitted
+            // one saying so is not that.
+            let committed = state.committed_membership();
             let members: BTreeSet<CoordinationNodeId> =
-                current.membership_config.membership().voter_ids().collect();
+                committed.membership().voter_ids().collect();
             allowlist.observe(&local, &members);
 
             // A corridor ends on an observable durable fact, never on a timer.
@@ -314,7 +337,10 @@ pub(crate) async fn run_lifecycle(
                 }
             }
 
-            publisher.publish(classify(&current, &facts.snapshot(timeout)));
+            publisher.publish(classify(
+                &current,
+                &facts.snapshot(timeout, std::sync::Arc::clone(&committed)),
+            ));
         }
 
         if metrics.changed().await.is_err() {
@@ -538,11 +564,16 @@ mod tests {
     fn leader_contact_is_absent_until_it_happens() {
         let facts = RuntimeFacts::new(Corridor::Running);
         let timeout = Duration::from_millis(3_000);
-        assert_eq!(facts.snapshot(timeout).follower_contact_age, None);
+        assert_eq!(
+            facts
+                .snapshot(timeout, std::sync::Arc::new(Default::default()))
+                .follower_contact_age,
+            None
+        );
 
         facts.note_leader_contact();
         let age = facts
-            .snapshot(timeout)
+            .snapshot(timeout, std::sync::Arc::new(Default::default()))
             .follower_contact_age
             .expect("contact was recorded");
         assert!(
@@ -558,12 +589,19 @@ mod tests {
     #[test]
     fn the_first_fatal_cause_is_the_one_that_is_kept() {
         let facts = RuntimeFacts::new(Corridor::Running);
-        assert_eq!(facts.snapshot(Duration::ZERO).fatal, None);
+        assert_eq!(
+            facts
+                .snapshot(Duration::ZERO, std::sync::Arc::new(Default::default()))
+                .fatal,
+            None
+        );
 
         facts.latch_fatal(FatalCause::Storage("out of disk".into()));
         facts.latch_fatal(FatalCause::Raft("stopped".into()));
         assert_eq!(
-            facts.snapshot(Duration::ZERO).fatal,
+            facts
+                .snapshot(Duration::ZERO, std::sync::Arc::new(Default::default()))
+                .fatal,
             Some(FatalCause::Storage("out of disk".into())),
             "the cause that explains the others must survive"
         );
@@ -573,9 +611,17 @@ mod tests {
     #[test]
     fn draining_is_one_way() {
         let facts = RuntimeFacts::new(Corridor::Running);
-        assert!(!facts.snapshot(Duration::ZERO).draining);
+        assert!(
+            !facts
+                .snapshot(Duration::ZERO, std::sync::Arc::new(Default::default()))
+                .draining
+        );
         facts.begin_draining();
-        assert!(facts.snapshot(Duration::ZERO).draining);
+        assert!(
+            facts
+                .snapshot(Duration::ZERO, std::sync::Arc::new(Default::default()))
+                .draining
+        );
     }
 
     /// **Field order is shutdown order**, and the order is §7.6's.
