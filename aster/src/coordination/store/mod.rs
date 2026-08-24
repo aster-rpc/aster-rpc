@@ -18,3 +18,8 @@
 
 pub mod methods;
 pub mod wire;
+
+/// The live voter-side service (S4-B/S4-C). Voter-only: it proposes through
+/// Raft and reads the guarded store.
+#[cfg(feature = "coordination")]
+pub(crate) mod host;

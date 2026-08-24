@@ -338,6 +338,36 @@ pub fn preflight(state: &State, client: &ClientRef, action: &Action) -> Admissio
     }
 }
 
+/// §8.2.1's stage 2 for a request whose **action** failed shape narrowing.
+///
+/// Stage 0 is decode failure, not bounds failure: a request with a well-formed
+/// `(client_id, sequence, request_hash)` prefix has a mutation identity even
+/// when its action does not narrow, so session resolution still runs first —
+/// or a committed result would be stranded behind a permanent
+/// `INVALID_ARGUMENT`. `None` means the classifier left the sequence
+/// unresolved (rows 7 and 11), and the caller answers its stage-4 status; the
+/// action never existed, so there is nothing to admit or propose.
+pub fn preflight_shapeless(state: &State, client: &ClientRef) -> Option<Admission> {
+    let session = state.sessions.get(&(client.actor, client.client_id));
+    let capacity = state.capacity_for(&client.actor);
+
+    match classify(session, client.sequence, &client.request_hash, capacity) {
+        Classification::Replay { saved, .. } => Some(Admission::Resolved(Box::new(ClientResult {
+            disposition: Disposition::Consumed,
+            reply: *saved,
+            replayed: true,
+        }))),
+        Classification::Refuse { reason, .. } => {
+            Some(Admission::Resolved(Box::new(ClientResult {
+                disposition: Disposition::NotConsumed,
+                reply: rejection(state, None, reason),
+                replayed: false,
+            })))
+        }
+        Classification::Unresolved { .. } => None,
+    }
+}
+
 /// Project an unresolved decision onto §10's stages 3 and 4.
 ///
 /// Keyed on the refusal reason, not on which command produced it: the stages

@@ -373,6 +373,7 @@ pub(crate) struct CoordinationRuntime {
     facts: Arc<RuntimeFacts>,
     readiness: Readiness,
     endpoint: RaftEndpoint,
+    store_endpoint: crate::coordination::store::host::StoreEndpoint,
     local: CoordinationNodeId,
     /// The leader generation counter. Bumping it is what makes a superseded
     /// controller stop at its next side effect, whether or not its abort has
@@ -403,6 +404,7 @@ impl CoordinationRuntime {
         raft: Raft<CoordinationTypeConfig>,
         storage: crate::coordination::storage::VoterStorage,
         endpoint: RaftEndpoint,
+        store_endpoint: crate::coordination::store::host::StoreEndpoint,
         attached: AttachedRuntime,
         facts: Arc<RuntimeFacts>,
         allowlist: Arc<SenderAllowlist>,
@@ -414,6 +416,7 @@ impl CoordinationRuntime {
         genesis: Option<Arc<Vec<u8>>>,
     ) -> Self {
         let state = attached.state.clone();
+        let group = attached.group;
         let generation = Arc::new(AtomicU64::new(0));
         let timeout = leader_liveness_timeout(config);
 
@@ -432,6 +435,15 @@ impl CoordinationRuntime {
         let (publisher, readiness) = channel(initial);
 
         endpoint.attach(attached).await;
+        store_endpoint
+            .attach(crate::coordination::store::host::AttachedStore {
+                raft: raft.clone(),
+                state: state.clone(),
+                group,
+                local,
+                readiness: readiness.clone(),
+            })
+            .await;
 
         let lifecycle = tokio::spawn(run_lifecycle(
             raft.clone(),
@@ -450,6 +462,7 @@ impl CoordinationRuntime {
             facts,
             readiness,
             endpoint,
+            store_endpoint,
             local,
             generation,
             controllers: Vec::new(),
@@ -511,10 +524,11 @@ impl CoordinationRuntime {
             let _ = task.await;
         }
 
-        // 2. Deregister RPC. After this a call is answered
+        // 2. Deregister RPC — Store first, then Raft. After this a call is answered
         //    `FailedPrecondition` — the same status a node that has not yet
         //    attached answers, which is right: in both cases the node is up and
         //    not serving Raft.
+        self.store_endpoint.detach().await;
         self.endpoint.detach().await;
 
         // 3. The Raft itself.

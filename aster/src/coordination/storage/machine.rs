@@ -97,6 +97,17 @@ type Reply<T> = oneshot::Sender<StorageResult<T>>;
 type PreparationReply =
     oneshot::Sender<std::result::Result<snapshot::PreparedSnapshot, snapshot::PrepareInstallError>>;
 
+/// What [`StateCommand::Preflight`] answers.
+#[derive(Debug)]
+pub(crate) enum PreflightAnswer {
+    /// The §10 stage the request lands on: resolved, denied with a reason,
+    /// denied with a status, or admitted for proposal.
+    Admission(crate::coordination::model::apply::Admission),
+    /// The classifier left the sequence unresolved and the action never
+    /// narrowed: the handler answers its stage-4 `INVALID_ARGUMENT`.
+    ShapelessUnresolved,
+}
+
 // ── Actor protocol ───────────────────────────────────────────────────────────
 
 pub(crate) enum StateCommand {
@@ -135,6 +146,31 @@ pub(crate) enum StateCommand {
     /// rows to find one intent would make the correct behaviour — re-observing
     /// rather than remembering — the expensive one.
     ActiveIntent(Reply<Option<(OperationId, Intent)>>),
+    /// §8.2.1/§10 stages 2–4 for one sequenced mutation, on the same state
+    /// apply runs against.
+    ///
+    /// On the actor deliberately: preflight and apply share one decision
+    /// function, and running preflight anywhere else would mean either copying
+    /// the model per request or rebuilding it from a transaction — both of
+    /// which are how two implementations of one decision start to drift. The
+    /// applied log id returns with the answer so the Store handler can prove
+    /// the state consulted was at or past its linearizable barrier.
+    ///
+    /// `action` is `None` when the decoded action failed shape narrowing:
+    /// session resolution still runs (§10 stage 0 is *decode* failure, not
+    /// bounds failure), and an unresolved sequence then takes the stage-4
+    /// status in the handler.
+    Preflight {
+        client: Box<crate::coordination::model::apply::ClientRef>,
+        action: Option<Box<crate::coordination::model::apply::Action>>,
+        reply: Reply<(PreflightAnswer, Option<LogId>)>,
+    },
+    /// The leader-side decision for one sessionless `retire_client` (§10), on
+    /// the same state apply runs against, with the same applied witness.
+    RetirePreflight {
+        command: crate::coordination::model::retire::RetireCommand,
+        reply: Reply<(crate::coordination::model::retire::Decision, Option<LogId>)>,
+    },
     /// Install an already-prepared snapshot over this store's state.
     ///
     /// Takes the proved role only. `supplied` is OpenRaft's own copy of the
@@ -272,6 +308,14 @@ impl StateActor {
                     self.serve(reply, StateActor::genesis_installed)
                 }
                 StateCommand::ActiveIntent(reply) => self.serve(reply, StateActor::active_intent),
+                StateCommand::Preflight {
+                    client,
+                    action,
+                    reply,
+                } => self.serve(reply, |a| a.preflight(&client, action.as_deref())),
+                StateCommand::RetirePreflight { command, reply } => {
+                    self.serve(reply, |a| a.retire_preflight(&command))
+                }
                 StateCommand::Install {
                     prepared,
                     supplied,
@@ -341,6 +385,8 @@ impl StateActor {
                 StateCommand::ReadTransaction(reply) => fail(reply),
                 StateCommand::GenesisInstalled(reply) => fail(reply),
                 StateCommand::ActiveIntent(reply) => fail(reply),
+                StateCommand::Preflight { reply, .. } => fail(reply),
+                StateCommand::RetirePreflight { reply, .. } => fail(reply),
                 StateCommand::Install { reply, .. } => fail(reply),
                 #[cfg(test)]
                 StateCommand::Snapshot(reply) => fail(reply),
@@ -533,6 +579,39 @@ impl StateActor {
         Ok((
             state.model.last_applied.as_ref().map(Into::into),
             state.membership.clone(),
+        ))
+    }
+
+    /// §10 stages 2–4 for the Store leader, on exactly the state apply runs
+    /// against, with the applied log id as the barrier witness.
+    fn preflight(
+        &mut self,
+        client: &crate::coordination::model::apply::ClientRef,
+        action: Option<&crate::coordination::model::apply::Action>,
+    ) -> StorageResult<(PreflightAnswer, Option<LogId>)> {
+        use crate::coordination::model::apply::{preflight, preflight_shapeless};
+        let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
+        let applied = state.model.last_applied;
+        let answer = match action {
+            Some(action) => PreflightAnswer::Admission(preflight(&state.model, client, action)),
+            None => match preflight_shapeless(&state.model, client) {
+                Some(admission) => PreflightAnswer::Admission(admission),
+                None => PreflightAnswer::ShapelessUnresolved,
+            },
+        };
+        Ok((answer, applied))
+    }
+
+    /// The `retire_client` decision (§10), on the applied state, with the same
+    /// witness.
+    fn retire_preflight(
+        &mut self,
+        command: &crate::coordination::model::retire::RetireCommand,
+    ) -> StorageResult<(crate::coordination::model::retire::Decision, Option<LogId>)> {
+        let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
+        Ok((
+            crate::coordination::model::retire::decide(&state.model, command),
+            state.model.last_applied,
         ))
     }
 
@@ -865,6 +944,30 @@ impl StateHandle {
     /// A snapshot-consistent read transaction over `state.redb`.
     pub(crate) async fn read_transaction(&self) -> StorageResult<GuardedRead> {
         self.call(StateCommand::ReadTransaction).await
+    }
+
+    /// §8.2.1/§10 stages 2–4 for one sequenced mutation, with the applied
+    /// witness (see [`StateCommand::Preflight`]).
+    pub(crate) async fn preflight(
+        &self,
+        client: crate::coordination::model::apply::ClientRef,
+        action: Option<crate::coordination::model::apply::Action>,
+    ) -> StorageResult<(PreflightAnswer, Option<LogId>)> {
+        self.call(|reply| StateCommand::Preflight {
+            client: Box::new(client),
+            action: action.map(Box::new),
+            reply,
+        })
+        .await
+    }
+
+    /// The leader-side `retire_client` decision, with the applied witness.
+    pub(crate) async fn retire_preflight(
+        &self,
+        command: crate::coordination::model::retire::RetireCommand,
+    ) -> StorageResult<(crate::coordination::model::retire::Decision, Option<LogId>)> {
+        self.call(|reply| StateCommand::RetirePreflight { command, reply })
+            .await
     }
 
     /// Stream, verify and rebuild a raw snapshot source (§11.4 preparation).

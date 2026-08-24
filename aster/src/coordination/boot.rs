@@ -147,6 +147,7 @@ pub(crate) async fn start(
     root: &[u8; 32],
     node: &Node,
     endpoint: RaftEndpoint,
+    store_endpoint: crate::coordination::store::host::StoreEndpoint,
     local: CoordinationNodeId,
 ) -> Result<CoordinationRuntime> {
     // 3. Resolve the start mode against this node's verified identity.
@@ -217,6 +218,7 @@ pub(crate) async fn start(
         raft.clone(),
         storage,
         endpoint,
+        store_endpoint,
         attached,
         Arc::clone(&facts),
         allowlist,

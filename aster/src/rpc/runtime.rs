@@ -449,14 +449,20 @@ impl AsterServerBuilder {
         // rolling start, and it is why the endpoint is a handle rather than a
         // constructor argument.
         //
-        // `Store` stays reserved: Slice 4 owns it.
+        // `Store` is live and late-bound exactly like Raft: until the runtime
+        // attaches it answers `FailedPrecondition`, which a client treats as
+        // transient.
         #[cfg(feature = "coordination")]
         let coordination_endpoint = crate::coordination::network::service::RaftEndpoint::new();
         #[cfg(feature = "coordination")]
+        let store_endpoint = crate::coordination::store::host::StoreEndpoint::new();
+        #[cfg(feature = "coordination")]
         if self.coordination.is_some() {
             use crate::coordination::network::service::CoordinationRaftService;
-            use crate::coordination::service::ReservedStore;
-            server = server.register_arc(Arc::new(ReservedStore));
+            use crate::coordination::store::host::CoordinationStoreService;
+            server = server.register_arc(Arc::new(CoordinationStoreService::new(
+                store_endpoint.clone(),
+            )));
             server = server.register_arc(Arc::new(CoordinationRaftService::new(
                 coordination_endpoint.clone(),
             )));
@@ -492,9 +498,14 @@ impl AsterServerBuilder {
                         return Err(err);
                     }
                 };
-                let started =
-                    coordination_start(&coordination_config, root, &node, coordination_endpoint)
-                        .await;
+                let started = coordination_start(
+                    &coordination_config,
+                    root,
+                    &node,
+                    coordination_endpoint,
+                    store_endpoint,
+                )
+                .await;
                 match started {
                     Ok(runtime) => Some(runtime),
                     Err(err) => {
@@ -533,6 +544,7 @@ async fn coordination_start(
     root: [u8; 32],
     node: &Node,
     endpoint: crate::coordination::network::service::RaftEndpoint,
+    store_endpoint: crate::coordination::store::host::StoreEndpoint,
 ) -> Result<crate::coordination::runtime::owner::CoordinationRuntime> {
     let local = crate::coordination::ids::CoordinationNodeId::parse_hex(node.id().as_str())
         .map_err(|err| {
@@ -540,7 +552,7 @@ async fn coordination_start(
                 "coordination requires a 32-byte endpoint identity: {err}"
             ))
         })?;
-    crate::coordination::boot::start(config, &root, node, endpoint, local).await
+    crate::coordination::boot::start(config, &root, node, endpoint, store_endpoint, local).await
 }
 
 /// A running, declarative Aster RPC server: a node serving blobs / docs / gossip

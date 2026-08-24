@@ -98,7 +98,12 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("storage/rows.rs", include_str!("storage/rows.rs")),
     ("storage/scratch.rs", include_str!("storage/scratch.rs")),
     ("storage/schema.rs", include_str!("storage/schema.rs")),
+    ("storage/serve.rs", include_str!("storage/serve.rs")),
     ("storage/snapshot.rs", include_str!("storage/snapshot.rs")),
+    ("store/host.rs", include_str!("store/host.rs")),
+    ("store/methods.rs", include_str!("store/methods.rs")),
+    ("store/mod.rs", include_str!("store/mod.rs")),
+    ("store/wire.rs", include_str!("store/wire.rs")),
 ];
 
 /// Where a file's production code ends: at its **last** `#[cfg(test)]` module.

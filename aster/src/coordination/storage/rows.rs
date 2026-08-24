@@ -58,7 +58,7 @@ use crate::coordination::raft::{
 };
 use crate::coordination::rowstream::{
     AdminRowV1, AuditRowV1, AuditStreamRowV1, BodyError, BodyWriter, GrantRowV1, IntentRowV1,
-    RouteRowV1, RowCountsV1, SessionRowV1, SnapshotBodyRowV1, SnapshotHeaderV1,
+    RecoveryHeaderV1, RouteRowV1, RowCountsV1, SessionRowV1, SnapshotBodyRowV1, SnapshotHeaderV1,
     SnapshotResourceRowV1, SECTION_ADMINS, SECTION_AUDIT, SECTION_GRANTS, SECTION_INTENTS,
     SECTION_RESOURCES, SECTION_ROUTES, SECTION_SESSIONS, SNAPSHOT_FORMAT_VERSION,
 };
@@ -525,7 +525,7 @@ pub(crate) fn meta_from_wire(meta: &CoordinationMetaV1) -> StorageResult<Durable
 /// snapshot header embeds this exact root (§11.4), so a second reader with its
 /// own ceiling would be a second opinion about what the meta row is — and the
 /// one that disagreed would be whichever was not being tested.
-fn read_meta(read: &redb::ReadTransaction) -> StorageResult<CoordinationMetaV1> {
+pub(super) fn read_meta(read: &redb::ReadTransaction) -> StorageResult<CoordinationMetaV1> {
     let bytes = {
         let table = read.open_table(STATE_META).map_err(state_err)?;
         let value =
@@ -919,6 +919,133 @@ pub(crate) fn stream_body<W: std::io::Write>(
             log_term,
             log_index,
             row,
+        }))
+        .map_err(framing)?;
+    }
+
+    let writer = body.finish().map_err(framing)?;
+    Ok((writer, header))
+}
+
+/// Write the canonical §13 recovery body for one read transaction
+/// (S4-EXPORT-OWNERSHIP: Slice 4 serves these bytes; Slice 5 imports them).
+///
+/// The recovery row profile is sections 1–3 only — resources (the recovery
+/// variant, which structurally cannot express holder/held), grants, and
+/// admins. Sessions, intents, routes and audit are absent by construction and
+/// their counts are zero, which the header states rather than implies.
+///
+/// Same transaction discipline as [`stream_body`]: the body is a pure function
+/// of the replicated state the transaction pins, never of memory.
+pub(crate) fn stream_recovery_body<W: std::io::Write>(
+    read: &redb::ReadTransaction,
+    path: &Path,
+    writer: W,
+) -> StorageResult<(W, RecoveryHeaderV1)> {
+    use crate::coordination::rowstream::{RecoveryBodyRowV1, RecoveryResourceRowV1};
+
+    let framing = |err: BodyError| body_error(path, err);
+
+    let resources = read.open_table(RESOURCES).map_err(state_err)?;
+    let acl = read.open_table(ACL).map_err(state_err)?;
+    let admins = read.open_table(ADMINS).map_err(state_err)?;
+    let audit = read.open_table(AUDIT).map_err(state_err)?;
+
+    let meta = read_meta(read)?;
+
+    // The audit tip is derived from the rows exactly as the loader derives it:
+    // max by **index**, not by table order (the table is keyed term-first).
+    let mut audit_tip: Option<LogIdV1> = None;
+    for entry in audit.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let (term, index) = key.value();
+        if audit_tip.as_ref().is_none_or(|tip| index > tip.index) {
+            let wire: AuditRowV1 = decode_persisted_bounded(
+                Db::State,
+                "AuditRowV1",
+                value.value(),
+                MAX_AUDIT_ROW_BYTES,
+            )?;
+            audit_tip = Some(LogIdV1 {
+                term,
+                leader_node_id: wire.leader_node_id,
+                index,
+            });
+        }
+    }
+
+    let row_counts = RowCountsV1 {
+        resources: resources.len().map_err(state_err)?,
+        grants: acl.len().map_err(state_err)?,
+        admins: admins.len().map_err(state_err)?,
+        sessions: 0,
+        intents: 0,
+        routes: 0,
+        audit: 0,
+    };
+
+    let header = RecoveryHeaderV1 {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        schema_version: super::identity::LOGICAL_SCHEMA_VERSION,
+        source_group_id: meta.group_id.clone(),
+        source_genesis_hash: meta.genesis_hash.clone(),
+        source_authority_public_key: meta.authority_public_key.clone(),
+        source_authority_domain: meta.authority_domain.clone(),
+        source_last_applied: meta.last_applied.clone(),
+        source_membership: meta.membership.clone(),
+        source_audit_floor: meta.audit_floor.clone(),
+        source_audit_tip: audit_tip,
+        source_admin_revision: meta.admin_revision,
+        row_counts,
+    };
+
+    let mut body = BodyWriter::<W, RecoveryBodyRowV1>::new(writer, &header).map_err(framing)?;
+
+    body.begin_section(SECTION_RESOURCES).map_err(framing)?;
+    for entry in resources.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let (namespace, raw) = key.value();
+        let wire: ResourceRowV1 = decode_persisted_bounded(
+            Db::State,
+            "ResourceRowV1",
+            value.value(),
+            MAX_RESOURCE_ROW_BYTES,
+        )?;
+        body.row(&RecoveryBodyRowV1::Resource(RecoveryResourceRowV1 {
+            key: ResourceKeyV1 {
+                namespace: namespace.to_string(),
+                key: raw.to_vec(),
+            },
+            source_epoch: wire.epoch,
+            ttl_ms: wire.ttl_ms,
+            lease_revision: wire.lease_revision,
+            value_revision: wire.value_revision,
+            value: wire.value,
+            acl_revision: wire.acl_revision,
+        }))
+        .map_err(framing)?;
+    }
+
+    body.begin_section(SECTION_GRANTS).map_err(framing)?;
+    for entry in acl.iter().map_err(state_err)? {
+        let (key, value) = entry.map_err(state_err)?;
+        let (namespace, raw, subject) = key.value();
+        body.row(&RecoveryBodyRowV1::Grant(GrantRowV1 {
+            key: ResourceKeyV1 {
+                namespace: namespace.to_string(),
+                key: raw.to_vec(),
+            },
+            subject_node_id: subject.to_vec(),
+            rights: value.value(),
+        }))
+        .map_err(framing)?;
+    }
+
+    body.begin_section(SECTION_ADMINS).map_err(framing)?;
+    for entry in admins.iter().map_err(state_err)? {
+        let (key, _) = entry.map_err(state_err)?;
+        body.row(&RecoveryBodyRowV1::Admin(AdminRowV1 {
+            subject_node_id: key.value().to_vec(),
         }))
         .map_err(framing)?;
     }
