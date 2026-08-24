@@ -418,11 +418,14 @@ client id, and next sequence. Redirects, leader changes, timeouts, and retries
 must resend those same bytes. The replicated session row makes the server
 effect idempotent even when the command committed but the reply was lost.
 
-> **Draft client-delivery decision:** the final API must also preserve a
-> resolved result across a client-process crash until the application
-> acknowledges it. The exact `ResolvedAwaitingAck`/recovery surface is not yet
-> frozen. Until it is, this guide intentionally promises a non-duplicated
-> server effect, not exactly-once delivery into application code.
+> **Client-delivery decision (frozen):** a resolved mutation is fsynced as
+> `ResolvedAwaitingAck` before the caller sees it and survives process death.
+> The application acknowledges explicitly after its own durable handling;
+> until then no new sequence is permitted, and on restart
+> `unacknowledged()`/`resume()` redeliver the exact saved result. The
+> guarantee is exactly-once **server effect** plus durable **redelivery**;
+> exactly-once application-side processing additionally requires the
+> application to make its durable handling and its acknowledgement atomic.
 
 A caller that only needs authoritative reads can omit the journal:
 
@@ -656,7 +659,7 @@ has a bounded, unsurprising outcome.
 | One of three voters is unavailable | Remaining two retain quorum; placement may provision one replacement | Report degraded placement; keep eligible capacity available |
 | Two of three voters are unavailable | Stops authoritative writes and membership changes | Restore a voter or follow signed new-group recovery; never force a minority |
 | Reply is lost after commit | Retrying the same journaled sequence returns the saved result | Do not create a replacement request with a new sequence |
-| Client process dies after resolution | Final delivery behavior is still a draft Slice 4 contract | Recover/acknowledge the durable result through the final API before issuing new mutations |
+| Client process dies after resolution | The result was fsynced `ResolvedAwaitingAck` before the caller could see it, and survives | Take `unacknowledged()`/`resume()` on restart and acknowledge after durably handling; only then issue new mutations |
 | Holder loses quorum | Renew cannot commit; its self-limit stops yielding a fence | Stop protected work as soon as the fence disappears |
 | Old holder resumes | Its stale epoch or identity is rejected | Treat fence rejection as a survived race, not as an ordinary retry |
 | Membership leader changes mid-plan | New controller observes the durable intent and resumes its current phase | Do not submit a competing local membership edit |

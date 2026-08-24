@@ -558,6 +558,10 @@ impl CoordinationRuntime {
         //    attached answers, which is right: in both cases the node is up and
         //    not serving Raft.
         self.store_endpoint.detach().await;
+        // §11.5 step 2: new Store mutations are already refused; give the
+        // calls that were inside a handler up to five seconds to finish
+        // before the Raft they depend on goes away.
+        self.store_endpoint.drain().await;
         self.endpoint.detach().await;
 
         // 3. The Raft itself.

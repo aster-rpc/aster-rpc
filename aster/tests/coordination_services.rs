@@ -282,13 +282,12 @@ async fn the_reserved_services_are_absent_unless_coordination_is_configured() {
 /// The partner to the absence proof: with `builtin_coordination` both services
 /// answer, and each says something a missing service cannot.
 ///
-/// The two answers differ now, and deliberately. `Store` is still a
-/// reservation — Slice 4 owns it — so it says so. `Raft` is **live**, so it
-/// refuses the empty payload these probes send as a malformed envelope, which
-/// is stronger evidence than a reservation trailer: only the real §5.3 check
-/// order produces it.
+/// Both are **live** now — Slice 4 replaced the Store reservation with the
+/// real pipeline — so both refuse the empty payload these probes send with
+/// their own decode diagnostics, which is stronger evidence than a
+/// reservation trailer: only the real check order produces either.
 #[tokio::test]
-async fn configuring_coordination_registers_the_store_reservation_and_the_live_raft() {
+async fn configuring_coordination_registers_the_live_store_and_the_live_raft() {
     let dir = tempfile::tempdir().expect("a storage directory");
     let server = AsterServer::builder()
         .config(pinned_cfg())
@@ -306,8 +305,8 @@ async fn configuring_coordination_registers_the_store_reservation_and_the_live_r
     )
     .await;
     assert!(
-        store.contains("aster.coordination.Store v1 reserves 'acquire'"),
-        "expected the reserved-store trailer, got: {store}"
+        store.contains("does not decode as this method's §5.2 request type"),
+        "expected the live Store pipeline's stage-0 decode refusal, got: {store}"
     );
 
     let raft = dispatch(

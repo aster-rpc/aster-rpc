@@ -69,10 +69,15 @@ use crate::coordination::typeconfig::CoordinationTypeConfig;
 use crate::rpc::{Call, RpcStatus, ServiceDispatch, StatusCode};
 
 /// The runtime a live Store service serves, attached after the `Raft` exists
-/// and detached before it shuts down — the same discipline as `RaftEndpoint`.
+/// and detached before it shuts down — the same discipline as `RaftEndpoint`,
+/// plus the §11.5 drain: detach refuses new calls, and shutdown then waits a
+/// bounded five seconds for the calls already past the gate.
 #[derive(Clone, Default)]
 pub(crate) struct StoreEndpoint {
     inner: Arc<RwLock<Option<AttachedStore>>>,
+    /// Calls currently inside a handler. Incremented only after attach was
+    /// observed, so a refused call never counts.
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Everything a live Store handler needs.
@@ -174,8 +179,38 @@ impl StoreEndpoint {
         *self.inner.write().await = None;
     }
 
+    /// §11.5 step 2: after detach has stopped new mutations, wait up to five
+    /// seconds for in-flight Store calls. Bounded and advisory by design — a
+    /// call still running afterwards fails against the stopping Raft and its
+    /// client resends the exact journaled bytes, which is the ambiguity path
+    /// the protocol already covers.
+    pub(crate) async fn drain(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     async fn attached(&self) -> Option<AttachedStore> {
         self.inner.read().await.clone()
+    }
+}
+
+/// Holds the in-flight count for exactly one dispatched call.
+struct InFlight(Arc<std::sync::atomic::AtomicU64>);
+
+impl InFlight {
+    fn enter(counter: &Arc<std::sync::atomic::AtomicU64>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -231,6 +266,7 @@ impl ServiceDispatch for CoordinationStoreService {
             let _ = call.finish(&not_yet_serving()).await;
             return;
         };
+        let _in_flight = InFlight::enter(&self.endpoint.in_flight);
         serve_call(&runtime, method, call).await;
     }
 }
