@@ -551,26 +551,14 @@ fn the_ten_producer_corridor_selects_across_clusters() {
     }
 }
 
-/// **The tie-break is the specified BLAKE3 order.** Two evidence-identical
+/// **The tie-break is the specified BLAKE3 order.** Evidence-identical
 /// candidates are split by the ascending byte order of
 /// `BLAKE3(group_id || "aster.coordination.placement.v1\0" || node_id)` —
-/// pinned here independently, so the planner cannot drift to another rule.
+/// re-derived here independently, over eight disjoint candidate pairs so a
+/// drifted domain string cannot pass by coincidence.
 #[test]
 fn the_tie_break_is_the_specified_hash_order() {
-    let (v0, v1, v2, c1, c2) = (node(1), node(2), node(3), node(4), node(5));
-    let topo = snapshot(&[&[v0, v1, c1, c2]], &[]);
-    let mut planning = input(
-        &[v0, v1, v2],
-        policy(
-            vec![seeded(v0), seeded(v1), seeded(c1), seeded(c2)],
-            3,
-            0,
-            false,
-        ),
-        topo,
-    );
-    // v2 is no longer eligible, so one of the two identical candidates
-    // fills its seat.
+    let (v0, v1, v2) = (node(1), node(2), node(3));
     let tag = |n: &CoordinationNodeId| {
         let mut hasher = blake3::Hasher::new();
         hasher.update(group().as_bytes());
@@ -578,17 +566,33 @@ fn the_tie_break_is_the_specified_hash_order() {
         hasher.update(n.as_bytes());
         *hasher.finalize().as_bytes()
     };
-    let expected = if tag(&c1) < tag(&c2) { c1 } else { c2 };
-    planning.grace_crossed_members.insert(v2);
-    // v2 is not in the eligible map at all: an administrator removal.
-    match plan(&planning) {
-        PlacementRecommendation::Plan(plan) => {
-            assert!(
-                plan.desired_voters.contains(&expected),
-                "the hash order picks {expected:?}: {plan:?}"
-            );
+    for pair in 0u8..8 {
+        let c1 = node(0x10 + pair * 2);
+        let c2 = node(0x11 + pair * 2);
+        let topo = snapshot(&[&[v0, v1, c1, c2]], &[]);
+        let mut planning = input(
+            &[v0, v1, v2],
+            policy(
+                vec![seeded(v0), seeded(v1), seeded(c1), seeded(c2)],
+                3,
+                0,
+                false,
+            ),
+            topo,
+        );
+        // v2 is not in the eligible map at all — an administrator removal —
+        // so one of the two identical candidates fills its seat.
+        planning.grace_crossed_members.insert(v2);
+        let expected = if tag(&c1) < tag(&c2) { c1 } else { c2 };
+        match plan(&planning) {
+            PlacementRecommendation::Plan(plan) => {
+                assert!(
+                    plan.desired_voters.contains(&expected),
+                    "pair {pair}: the hash order picks {expected:?}: {plan:?}"
+                );
+            }
+            other => panic!("pair {pair}: no plan: {other:?}"),
         }
-        other => panic!("no plan: {other:?}"),
     }
 }
 
