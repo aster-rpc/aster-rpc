@@ -427,6 +427,11 @@ pub struct GroupFixture {
     group: [u8; 32],
     authority: ed25519_dalek::SigningKey,
     secrets: Vec<[u8; 32]>,
+    /// Candidates outside the genesis that the signed admission set still
+    /// names. §5.3 checks the admission class **before** the membership
+    /// allowlist, so a joiner absent from the set would be refused for a
+    /// reason that has nothing to do with the rule under test.
+    admitted: Vec<[u8; 32]>,
 }
 
 impl GroupFixture {
@@ -442,7 +447,15 @@ impl GroupFixture {
             group: [seed; 32],
             authority: ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]),
             secrets: (0..size).map(|i| [seed ^ (0x10 + i as u8); 32]).collect(),
+            admitted: Vec::new(),
         }
+    }
+
+    /// Also name `candidate` in the signed admission set — for gates that
+    /// join a node the genesis does not know.
+    pub fn admitting(mut self, candidate: [u8; 32]) -> Self {
+        self.admitted.push(candidate);
+        self
     }
 
     pub fn size(&self) -> usize {
@@ -679,8 +692,15 @@ impl GroupFixture {
         use ed25519_dalek::Signer;
 
         let mut entries: Vec<AdmissionEntryV1> = (0..self.size())
-            .map(|i| AdmissionEntryV1 {
-                node_id: self.node_id(i),
+            .map(|i| self.node_id(i))
+            .chain(self.admitted.iter().map(|secret| {
+                ed25519_dalek::SigningKey::from_bytes(secret)
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec()
+            }))
+            .map(|node_id| AdmissionEntryV1 {
+                node_id,
                 class_code: ADMISSION_CLASS_PRODUCER,
             })
             .collect();

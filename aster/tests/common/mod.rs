@@ -115,6 +115,10 @@ impl ChaosFixture {
             .to_vec()
     }
 
+    pub fn group_id(&self) -> aster::coordination::ids::CoordinationGroupId {
+        aster::coordination::ids::CoordinationGroupId::from_array(self.group)
+    }
+
     pub fn id(&self, index: usize) -> CoordinationNodeId {
         CoordinationNodeId::from_slice(&self.node_id(index)).expect("a 32-byte node id")
     }
