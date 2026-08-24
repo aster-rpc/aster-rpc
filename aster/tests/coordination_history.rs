@@ -4,26 +4,21 @@
 //!
 //! ## What "the history checker" is here, exactly
 //!
-//! The §5.2 register exposes its linearization witness in every reply: a
-//! committed `compare_and_set` carries the `value_revision` it produced, an
-//! `acquire` carries the `epoch` it was granted at, and both counters are
-//! replicated state that only committed commands move. Linearizability of
-//! this object is therefore checkable **exactly**, not approximately:
+//! Every register operation either client performs — grants, renewals,
+//! writes, releases, revocations, reads, **and their denials** — is recorded
+//! as a real-time invocation/response interval with its full observation,
+//! and [`common::linearize::check`] runs the Wing–Gong interval search for a
+//! total order that real time permits and a sequential model of the §5.2
+//! register accepts, comparing outcome codes, reason codes and the
+//! snapshot's epoch/revision/holdership/value at every step. An operation
+//! the client gave up on is recorded as ambiguous — the search may place its
+//! effect anywhere after invocation or drop it, since an exact-byte resend
+//! may land it at any later time or never.
 //!
-//! * the committed CAS revisions across every client form a strictly
-//!   increasing, gap-free chain — one total order, no lost effect, no doubly
-//!   applied effect (a duplicated or resent command that applied twice would
-//!   mint a second revision and break the count);
-//! * granted epochs strictly increase across grants and revocations — two
-//!   holders can never share an epoch;
-//! * the final linearizable read equals the highest-revision write — and
-//!   still does after every voter is restarted onto its own storage, which is
-//!   the durable-recovery half of the claim.
-//!
-//! A general interval-order search (Wing–Gong) is unnecessary for an object
-//! that returns its linearization point; asserting the chain **is** the
-//! linearizability check, and it is sensitive to exactly the failures the
-//! §S4-H list names.
+//! The witness-counter chain remains as a second, independent assertion:
+//! committed CAS revisions form one gap-free strictly increasing chain, and
+//! granted epochs are never shared. The chain would also be implied by the
+//! search, but it is cheap and its failure mode names the defect directly.
 //!
 //! ## The two halves
 //!
@@ -53,6 +48,7 @@ use aster::coordination::store::wire::MutationReplyWireV1;
 use aster::{AsterConfig, Node, PublicKey, RelayMode, SecretKey};
 
 mod common;
+use common::linearize::{self, Observed, Recorded, RegisterCall};
 use common::{await_leader, combined_tally, shutdown_all, ChaosFixture, ChaoticVoter};
 
 const PATIENCE: Duration = Duration::from_secs(90);
@@ -64,20 +60,14 @@ async fn within<T, F: std::future::Future<Output = T>>(what: &str, f: F) -> T {
     }
 }
 
+/// Longer than any phase of either gate runs, so a §9.2 expiry cannot
+/// legitimately fire and the checker's model needs no hidden transition.
+const TTL_MS: u64 = 120_000;
+
 fn resource() -> ResourceKeyV1 {
     ResourceKeyV1 {
         namespace: "history.gate".into(),
         key: b"register".to_vec(),
-    }
-}
-
-fn fence_of(reply: &MutationReplyWireV1) -> FenceV1 {
-    let snapshot = reply.snapshot.as_ref().expect("a snapshot");
-    FenceV1 {
-        group_id: snapshot.group_id.clone(),
-        resource: snapshot.resource.clone(),
-        epoch: snapshot.epoch,
-        holder: snapshot.holder.clone().expect("held"),
     }
 }
 
@@ -89,13 +79,137 @@ struct Committed {
     value: Vec<u8>,
 }
 
-/// One worker's contention loop: acquire → CAS → release, retrying denied
-/// acquires, riding redirects and resends, recording every committed effect.
+/// The shared interval recorder: one monotonic origin, every operation from
+/// every client, in arrival order (the checker orders by the intervals, not
+/// by this vector).
+struct HistoryLog {
+    origin: std::time::Instant,
+    ops: std::sync::Mutex<Vec<Recorded>>,
+}
+
+impl HistoryLog {
+    fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            ops: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_nanos()).expect("a bounded run")
+    }
+
+    fn record(&self, op: Recorded) {
+        self.ops.lock().expect("the history log").push(op);
+    }
+
+    fn into_ops(self) -> Vec<Recorded> {
+        self.ops.into_inner().expect("the history log")
+    }
+}
+
+/// Project one §5.2 mutation reply into the checker's observation. The value
+/// is compared only when the reply carries it unredacted.
+fn observe_mutation(reply: &MutationReplyWireV1) -> Observed {
+    let snapshot = reply.snapshot.as_ref();
+    Observed {
+        outcome_code: reply.outcome_code,
+        reason_code: reply.reason_code,
+        epoch: snapshot.map_or(0, |s| s.epoch),
+        value_revision: snapshot.map_or(0, |s| s.value_revision),
+        held: snapshot.is_some_and(|s| s.held),
+        value: snapshot.and_then(|s| {
+            if s.value_redacted {
+                None
+            } else {
+                s.value.clone()
+            }
+        }),
+    }
+}
+
+/// Perform one register mutation and record its interval and observation.
+///
+/// The invocation instant is taken before the first send. If the drive gives
+/// up, the journaled entry is resumed until it resolves — the §10 loop —
+/// because the fsync-before-send journal means `resume() == None` proves the
+/// request never left this process (recorded as nothing), while a resolved
+/// resume is this same operation's response. An operation this cannot settle
+/// before the caller's patience is recorded ambiguous by the caller's panic
+/// never arriving; in practice the outer `within` bounds the whole loop.
+async fn perform(
+    client: &CoordinationClient,
+    log: &HistoryLog,
+    call: RegisterCall,
+) -> Option<MutationReplyWireV1> {
+    let actor = client.local_id().expect("the client identity");
+    let group_id = client.group().as_bytes().to_vec();
+    let fence = |epoch: u64| FenceV1 {
+        group_id: group_id.clone(),
+        resource: resource(),
+        epoch,
+        holder: actor.to_vec(),
+    };
+    let invoked = log.now();
+    let first = match &call {
+        RegisterCall::Acquire => client.acquire(resource(), TTL_MS).await,
+        RegisterCall::Renew { fence_epoch } => client.renew(fence(*fence_epoch)).await,
+        RegisterCall::CompareAndSet {
+            fence_epoch,
+            expected_value_revision,
+            new_value,
+        } => {
+            client
+                .compare_and_set(
+                    fence(*fence_epoch),
+                    *expected_value_revision,
+                    new_value.clone(),
+                )
+                .await
+        }
+        RegisterCall::Release { fence_epoch } => client.release(fence(*fence_epoch)).await,
+        RegisterCall::Revoke { expected_epoch } => client.revoke(resource(), *expected_epoch).await,
+        RegisterCall::Read => unreachable!("reads go through recorded_read"),
+    };
+    let resolved = match first {
+        Ok(resolved) => resolved,
+        Err(_) => loop {
+            match client.resume().await {
+                Ok(Some(resolved)) => break resolved,
+                // Nothing journaled: fsync-before-send proves the request
+                // never left this process. No operation happened.
+                Ok(None) => return None,
+                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        },
+    };
+    let reply = resolved.reply().clone();
+    log.record(Recorded {
+        actor,
+        invoked,
+        returned: Some(log.now()),
+        call,
+        observed: Some(observe_mutation(&reply)),
+    });
+    resolved
+        .acknowledge()
+        .await
+        .expect("the journal acknowledges");
+    Some(reply)
+}
+
+/// One worker's contention loop: acquire → CAS → release, every operation —
+/// denials included — recorded with its interval.
 ///
 /// Bounded by rounds, not by time: a round that cannot commit keeps retrying
 /// inside the client's own drive loop, and the gate's outer patience is what
 /// catches a wedged group.
-async fn contend(client: &CoordinationClient, label: &[u8], rounds: usize) -> Vec<Committed> {
+async fn contend(
+    client: &CoordinationClient,
+    log: &HistoryLog,
+    label: &[u8],
+    rounds: usize,
+) -> Vec<Committed> {
     let mut committed = Vec::new();
     let mut round = 0usize;
     let deadline = std::time::Instant::now() + PATIENCE;
@@ -104,62 +218,66 @@ async fn contend(client: &CoordinationClient, label: &[u8], rounds: usize) -> Ve
             std::time::Instant::now() < deadline,
             "the contention loop starved: {round}/{rounds} rounds"
         );
-        // Acquire, tolerating HeldByOther and transient unavailability.
-        let acquired = match client.acquire(resource(), 30_000).await {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                continue;
-            }
+        let Some(reply) = perform(client, log, RegisterCall::Acquire).await else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
         };
-        let reply = acquired.reply().clone();
-        acquired.acknowledge().await.expect("acknowledge");
         if reply.outcome_code != 1 {
             // Denied — someone else holds it, or it was revoked mid-flight.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The denial is in the history; the checker must justify it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             continue;
         }
         let epoch = reply.snapshot.as_ref().expect("a snapshot").epoch;
         let base_revision = reply.snapshot.as_ref().expect("a snapshot").value_revision;
-        let fence = fence_of(&reply);
 
         // One CAS under the fence.
         let value = [label, b"-", round.to_string().as_bytes()].concat();
-        let mutated = match client
-            .compare_and_set(fence.clone(), base_revision, value.clone())
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                // Ambiguity exhausted the drive budget; resume until resolved.
-                match client.resume().await {
-                    Ok(Some(resolved)) => resolved,
-                    _ => continue,
-                }
+        let cas = perform(
+            client,
+            log,
+            RegisterCall::CompareAndSet {
+                fence_epoch: epoch,
+                expected_value_revision: base_revision,
+                new_value: value.clone(),
+            },
+        )
+        .await;
+        if let Some(cas_reply) = cas {
+            if cas_reply.outcome_code == 3 {
+                committed.push(Committed {
+                    epoch,
+                    value_revision: cas_reply
+                        .snapshot
+                        .as_ref()
+                        .expect("a snapshot")
+                        .value_revision,
+                    value,
+                });
+                round += 1;
             }
-        };
-        let cas_reply = mutated.reply().clone();
-        mutated.acknowledge().await.expect("acknowledge");
-        if cas_reply.outcome_code == 3 {
-            committed.push(Committed {
-                epoch,
-                value_revision: cas_reply
-                    .snapshot
-                    .as_ref()
-                    .expect("a snapshot")
-                    .value_revision,
-                value,
-            });
-            round += 1;
         }
 
         // Release, so the other workers can take the register. A refusal is
-        // fine — a revocation may have fenced us first.
-        if let Ok(resolved) = client.release(fence).await {
-            let _ = resolved.acknowledge().await;
-        }
+        // fine — a revocation may have fenced us first — and it too is in
+        // the history.
+        let _ = perform(client, log, RegisterCall::Release { fence_epoch: epoch }).await;
     }
     committed
+}
+
+/// Run the interval search and panic with its diagnosis on failure.
+fn check_linearizable(log: HistoryLog) {
+    let ops = log.into_ops();
+    assert!(!ops.is_empty(), "the history recorded nothing");
+    match linearize::check(&ops) {
+        Ok(order) => assert_eq!(
+            order.len(),
+            ops.iter().filter(|op| op.observed.is_some()).count(),
+            "the witness order places every observed operation"
+        ),
+        Err(diagnosis) => panic!("{diagnosis}"),
+    }
 }
 
 /// The exact-history assertions over everything every client committed.
@@ -242,19 +360,31 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
     within("ack", granted.acknowledge()).await.expect("ack");
 
     // Two workers contend through the faulty network while ROOT revokes once
-    // mid-run — the revocation fences whichever holder is current.
+    // mid-run — the revocation fences whichever holder is current. Every
+    // operation from all three, denials and the revocation included, lands
+    // in one interval log.
+    let log = std::sync::Arc::new(HistoryLog::new());
     let contention = {
         let w0 = workers[0].clone();
         let w1 = workers[1].clone();
         let revoker = root.clone();
+        let log = std::sync::Arc::clone(&log);
         async move {
-            let (a, b, _) =
-                tokio::join!(contend(&w0, b"w0", 6), contend(&w1, b"w1", 6), async move {
+            let (a, b, _) = tokio::join!(
+                contend(&w0, &log, b"w0", 6),
+                contend(&w1, &log, b"w1", 6),
+                async {
                     tokio::time::sleep(Duration::from_secs(3)).await;
-                    if let Ok(resolved) = revoker.revoke(resource(), None).await {
-                        let _ = resolved.acknowledge().await;
-                    }
-                });
+                    let _ = perform(
+                        &revoker,
+                        &log,
+                        RegisterCall::Revoke {
+                            expected_epoch: None,
+                        },
+                    )
+                    .await;
+                }
+            );
             (a, b)
         }
     };
@@ -278,19 +408,15 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
     for voter in &voters {
         voter.chaos.set_epoch(split);
     }
-    let mid_partition = within("mutation across the partition", async {
+    let mid_reply = within("mutation across the partition", async {
         loop {
-            match workers[0].acquire(resource(), 30_000).await {
-                Ok(resolved) => break resolved,
-                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+            match perform(&workers[0], &log, RegisterCall::Acquire).await {
+                Some(reply) if reply.outcome_code == 1 => break reply,
+                _ => tokio::time::sleep(Duration::from_millis(250)).await,
             }
         }
     })
     .await;
-    let mid_reply = mid_partition.reply().clone();
-    within("ack", mid_partition.acknowledge())
-        .await
-        .expect("ack");
     assert_eq!(
         mid_reply.outcome_code, 1,
         "the majority side keeps granting through the partition"
@@ -304,7 +430,7 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
         voter.chaos.set_epoch(healed);
     }
 
-    // The history: one chain, no sharing, no gaps.
+    // The counter chains: one chain, no sharing, no gaps.
     let all: Vec<Committed> = committed_a.iter().chain(&committed_b).cloned().collect();
     let grant_epochs: Vec<u64> = all.iter().map(|c| c.epoch).collect();
     check_history(&all, &grant_epochs);
@@ -312,7 +438,7 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
     // The final read reflects the highest committed revision that carried a
     // value this run wrote (the mid-partition acquire holds the register but
     // wrote nothing).
-    let final_read = within("final read", root_read(&workers[0], resource())).await;
+    let final_read = within("final read", recorded_read(&workers[0], &log)).await;
     let best = all
         .iter()
         .max_by_key(|c| c.value_revision)
@@ -322,6 +448,11 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
         Some(best.value.as_slice()),
         "the linearizable read is the highest-revision write"
     );
+
+    // The interval search: a witness order exists that real time permits
+    // and the sequential register accepts, denials and all.
+    let log = std::sync::Arc::into_inner(log).expect("every recorder returned");
+    check_linearizable(log);
 
     // Non-vacuity: the schedule really injected.
     let tally = combined_tally(&voters);
@@ -347,14 +478,40 @@ fn schedule_reaches(
         .reaches(&ids[a], &ids[b], epoch)
 }
 
-async fn root_read(
+/// One linearizable read, recorded with its own interval. Status refusals
+/// (`UNAVAILABLE` during elections) never touched the register and are not
+/// operations; each retry gets a fresh invocation instant.
+async fn recorded_read(
     client: &CoordinationClient,
-    resource: ResourceKeyV1,
+    log: &HistoryLog,
 ) -> aster::coordination::store::wire::ReadReplyWireV1 {
+    let actor = client.local_id().expect("the client identity");
     let deadline = std::time::Instant::now() + PATIENCE;
     loop {
-        match client.reads().read_linearizable(resource.clone()).await {
-            Ok(reply) => return reply,
+        let invoked = log.now();
+        match client.reads().read_linearizable(resource()).await {
+            Ok(reply) => {
+                let snapshot = &reply.snapshot;
+                log.record(Recorded {
+                    actor,
+                    invoked,
+                    returned: Some(log.now()),
+                    call: RegisterCall::Read,
+                    observed: Some(Observed {
+                        outcome_code: 0,
+                        reason_code: 0,
+                        epoch: snapshot.epoch,
+                        value_revision: snapshot.value_revision,
+                        held: snapshot.held,
+                        value: if snapshot.value_redacted {
+                            None
+                        } else {
+                            snapshot.value.clone()
+                        },
+                    }),
+                });
+                return reply;
+            }
             Err(_) => {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -554,8 +711,9 @@ async fn committed_effects_survive_a_leader_kill_and_a_full_restart() {
     assert_eq!(granted.reply().outcome_code, 6);
     within("ack", granted.acknowledge()).await.expect("ack");
 
-    // Traffic before the kill.
-    let mut all = contend(&worker, b"pre", 3).await;
+    // Traffic before the kill, in one interval log spanning every phase.
+    let log = HistoryLog::new();
+    let mut all = contend(&worker, &log, b"pre", 3).await;
 
     // SIGKILL the leader mid-life. `Child::kill` runs no destructor.
     let (_, leader) = status_of(0).expect("a status");
@@ -569,12 +727,12 @@ async fn committed_effects_survive_a_leader_kill_and_a_full_restart() {
 
     // The survivors elect; the client rides redirects and exact resends. The
     // committed chain keeps growing with no gap and no duplicate.
-    all.extend(contend(&worker, b"post-kill", 3).await);
+    all.extend(contend(&worker, &log, b"post-kill", 3).await);
 
     // The killed voter restarts onto its own storage and rejoins.
     children[leader] = Some(spawn(leader));
 
-    all.extend(contend(&worker, b"post-restart", 2).await);
+    all.extend(contend(&worker, &log, b"post-restart", 2).await);
 
     let grant_epochs: Vec<u64> = all.iter().map(|c| c.epoch).collect();
     check_history(&all, &grant_epochs);
@@ -615,12 +773,16 @@ async fn committed_effects_survive_a_leader_kill_and_a_full_restart() {
     register_all(&root_node_handle);
     register_all(&worker_node_handle);
 
-    let final_read = within("final read", root_read(&worker, resource())).await;
+    let final_read = within("final read", recorded_read(&worker, &log)).await;
     assert_eq!(
         final_read.snapshot.value.as_deref(),
         Some(best.value.as_slice()),
         "every committed effect survived the kill, the restart, and the full restart"
     );
+
+    // The interval search over every phase: pre-kill, post-kill,
+    // post-restart, and the read after the full restart.
+    check_linearizable(log);
 
     for child in children.iter_mut().flatten() {
         let _ = child.kill();

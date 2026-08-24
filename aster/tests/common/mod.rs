@@ -20,6 +20,8 @@
 // `-D warnings` turns that into a failure that says nothing about the code.
 #![allow(dead_code)]
 
+pub mod linearize;
+
 use std::sync::Arc;
 use std::time::Duration;
 
