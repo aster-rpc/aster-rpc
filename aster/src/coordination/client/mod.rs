@@ -793,15 +793,23 @@ impl CoordinationReadClient {
         }
     }
 
-    /// `recovery_export` (§5.2, administrator; S4-EXPORT-OWNERSHIP): the
-    /// manifest and the reassembled, checksum-verified canonical body.
-    pub async fn recovery_export(&self) -> Result<(RecoveryExportManifestWireV1, Vec<u8>)> {
+    /// `recovery_export` (§5.2, administrator; S4-EXPORT-OWNERSHIP), streamed:
+    /// the manifest, and the canonical body written into `into` as its chunks
+    /// arrive — decoded, length-checked and hashed incrementally, never
+    /// assembled in memory.
+    ///
+    /// The writer is returned so a caller can hand a file, take it back, and
+    /// only then rename it into place once the checksum has held.
+    pub async fn recovery_export_to<W: std::io::Write>(
+        &self,
+        into: W,
+    ) -> Result<(RecoveryExportManifestWireV1, W)> {
         let request = encode(&RecoveryExportRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
         })?;
-        let frames = match self.engine.stream("recovery_export", request).await {
-            Ok(Ok(frames)) => frames,
+        let mut stream = match self.engine.open_stream("recovery_export", request).await {
+            Ok(Ok(stream)) => stream,
             Ok(Err((code, message))) => {
                 return Err(Error::Rpc {
                     code,
@@ -815,20 +823,44 @@ impl CoordinationReadClient {
                 )))
             }
         };
+
+        let mut writer = into;
         let mut manifest: Option<RecoveryExportManifestWireV1> = None;
-        let mut body = Vec::new();
-        for frame in &frames {
-            match decode::<RecoveryExportFrameV1>(frame)? {
+        let mut hasher = blake3::Hasher::new();
+        let mut received = 0u64;
+        let mut finished = false;
+        while let Some(frame) = stream.next().await {
+            let frame = frame?;
+            if finished {
+                return Err(client_error("the export continued past its final chunk"));
+            }
+            match decode::<RecoveryExportFrameV1>(&frame)? {
                 RecoveryExportFrameV1::Manifest(m) => {
                     if manifest.replace(m).is_some() {
                         return Err(client_error("the export carried two manifests"));
                     }
                 }
                 RecoveryExportFrameV1::Chunk(chunk) => {
-                    if chunk.offset as usize != body.len() {
+                    let Some(seen) = manifest.as_ref() else {
+                        return Err(client_error("the export sent a chunk before its manifest"));
+                    };
+                    if chunk.offset != received {
                         return Err(client_error("the export chunks are not contiguous"));
                     }
-                    body.extend_from_slice(&chunk.data);
+                    received += chunk.data.len() as u64;
+                    if received > seen.total_len {
+                        return Err(client_error("the export body overruns its manifest"));
+                    }
+                    hasher.update(&chunk.data);
+                    writer
+                        .write_all(&chunk.data)
+                        .map_err(|err| client_error(format!("the export writer failed: {err}")))?;
+                    if chunk.final_chunk {
+                        if received != seen.total_len {
+                            return Err(client_error("the export body ends short of its manifest"));
+                        }
+                        finished = true;
+                    }
                 }
                 RecoveryExportFrameV1::Unknown(_) => {
                     return Err(client_error("the export carried an unknown frame"));
@@ -836,14 +868,22 @@ impl CoordinationReadClient {
             }
         }
         let manifest = manifest.ok_or_else(|| client_error("the export carried no manifest"))?;
-        if body.len() as u64 != manifest.total_len {
-            return Err(client_error(
-                "the export body length disagrees with its manifest",
-            ));
+        if !finished {
+            return Err(client_error("the export ended without a final chunk"));
         }
-        if blake3::hash(&body).as_bytes().to_vec() != manifest.blake3_checksum {
+        if hasher.finalize().as_bytes().to_vec() != manifest.blake3_checksum {
             return Err(client_error("the export body fails its manifest checksum"));
         }
-        Ok((manifest, body))
+        writer
+            .flush()
+            .map_err(|err| client_error(format!("the export writer failed: {err}")))?;
+        Ok((manifest, writer))
+    }
+
+    /// [`recovery_export_to`](Self::recovery_export_to) into a `Vec` — the
+    /// convenience for small groups and tests; the streaming variant is the
+    /// primitive.
+    pub async fn recovery_export(&self) -> Result<(RecoveryExportManifestWireV1, Vec<u8>)> {
+        self.recovery_export_to(Vec::new()).await
     }
 }

@@ -512,3 +512,119 @@ async fn an_abandoned_lease_expires_and_a_successor_acquires() {
 
     voter.shutdown().await;
 }
+
+/// **The streamed recovery export is exact and incremental** (the reopen's
+/// blocker 5). The body is written straight into a caller-supplied `File`
+/// writer — never assembled by the client — and the file's bytes match the
+/// convenience `Vec` path byte for byte, with the manifest's length and
+/// checksum holding over real state: resources, grants and an admin row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_recovery_export_streams_into_a_writer_exactly() {
+    let fixture = GroupFixture::new("client.test", 0xE5, 1);
+    let dir = tempfile::tempdir().expect("a directory");
+    let voter = start_voter(&fixture, 0, dir.path()).await;
+
+    let root_node = client_node([0xE5 ^ 0xFF; 32], &fixture, &voter).await;
+    let root_journal = tempfile::tempdir().expect("a directory");
+    let root = CoordinationClient::builder(root_node, group(&fixture))
+        .seed_tickets([voter_ticket(&fixture, 0)])
+        .journal_dir(root_journal.path())
+        .build()
+        .expect("the ROOT client builds");
+
+    // Give the export a body worth checking: a grant, a held register with a
+    // written value, and the ROOT admin row that §13 always carries.
+    let worker_id = ed25519_dalek::SigningKey::from_bytes(&[0xE5 ^ 0x41; 32])
+        .verifying_key()
+        .to_bytes();
+    let granted = within(
+        "grant",
+        root.set_grant(
+            resource(b"exported"),
+            worker_id,
+            RIGHT_READ | RIGHT_ACQUIRE | RIGHT_MUTATE | RIGHT_RELEASE,
+            0,
+        ),
+    )
+    .await
+    .expect("ROOT grants");
+    within("grant ack", granted.acknowledge())
+        .await
+        .expect("acknowledge");
+    let self_grant = within(
+        "self grant",
+        root.set_grant(
+            resource(b"exported"),
+            root.local_id().expect("the local id"),
+            RIGHT_ACQUIRE | RIGHT_MUTATE,
+            1,
+        ),
+    )
+    .await
+    .expect("ROOT grants itself");
+    within("self grant ack", self_grant.acknowledge())
+        .await
+        .expect("acknowledge");
+    let acquired = within("acquire", root.acquire(resource(b"exported"), 30_000))
+        .await
+        .expect("the acquire resolves");
+    let snapshot = acquired.reply().snapshot.clone().expect("a snapshot");
+    within("acquire ack", acquired.acknowledge())
+        .await
+        .expect("acknowledge");
+    let fence = aster::coordination::contract::FenceV1 {
+        group_id: snapshot.group_id.clone(),
+        resource: snapshot.resource.clone(),
+        epoch: snapshot.epoch,
+        holder: snapshot.holder.clone().expect("held"),
+    };
+    let written = within(
+        "compare_and_set",
+        root.compare_and_set(fence, 0, vec![0xAB; 4096]),
+    )
+    .await
+    .expect("the value writes");
+    within("cas ack", written.acknowledge())
+        .await
+        .expect("acknowledge");
+
+    let reads = root.reads();
+
+    // The streaming path, into a real file writer.
+    let export_dir = tempfile::tempdir().expect("a directory");
+    let path = export_dir.path().join("recovery.body");
+    let file = std::fs::File::create(&path).expect("the export file opens");
+    let (manifest, file) = within(
+        "recovery_export_to",
+        reads.recovery_export_to(std::io::BufWriter::new(file)),
+    )
+    .await
+    .expect("the export streams");
+    drop(file);
+
+    let streamed = std::fs::read(&path).expect("the export file reads back");
+    assert_eq!(
+        streamed.len() as u64,
+        manifest.total_len,
+        "the file holds exactly the manifest's length"
+    );
+    assert!(
+        manifest.total_len > 0,
+        "the seeded state produced a non-empty body"
+    );
+    assert_eq!(
+        blake3::hash(&streamed).as_bytes().to_vec(),
+        manifest.blake3_checksum,
+        "the file re-hashes to the manifest checksum"
+    );
+
+    // The convenience path yields the same bytes: one pinned body, two
+    // consumers.
+    let (again, body) = within("recovery_export", reads.recovery_export())
+        .await
+        .expect("the convenience export succeeds");
+    assert_eq!(body, streamed, "both paths deliver identical bytes");
+    assert_eq!(again.total_len, manifest.total_len);
+
+    voter.shutdown().await;
+}

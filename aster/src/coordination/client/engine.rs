@@ -319,6 +319,83 @@ impl Engine {
             }
         }
     }
+
+    /// Open a server stream and hand back the live frame source once a member
+    /// accepts it.
+    ///
+    /// The same routing walk as [`stream`](Self::stream) up to the open;
+    /// unlike it, the frames are *not* collected, so the caller consumes them
+    /// incrementally and a mid-stream failure surfaces to the caller instead
+    /// of being retried here. A Store stream is a read: re-issuing the whole
+    /// call is always safe, so the caller loses nothing but the walk.
+    pub(crate) async fn open_stream(
+        &self,
+        method: &str,
+        request: Vec<u8>,
+    ) -> Result<Result<crate::rpc::ResponseStream, (i32, String)>, CallFailure> {
+        let cap = self.candidates().await.len() + 2;
+        let mut hops = 0usize;
+        let mut tried: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut target: Option<[u8; 32]> = self.current.lock().await.as_ref().map(|(id, _)| *id);
+
+        loop {
+            if hops >= cap {
+                return Err(CallFailure::Unavailable(format!(
+                    "no member served {method} within {cap} redirect hops"
+                )));
+            }
+            hops += 1;
+            let member = match target.take() {
+                Some(member) => member,
+                None => match self
+                    .candidates()
+                    .await
+                    .into_iter()
+                    .find(|m| !tried.contains(m))
+                {
+                    Some(member) => member,
+                    None => {
+                        return Err(CallFailure::Unavailable(
+                            "every known member refused or was unreachable".into(),
+                        ))
+                    }
+                },
+            };
+            tried.insert(member);
+            let conn = match self.connect(member).await {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            let opened = tokio::time::timeout(
+                ATTEMPT_DEADLINE,
+                conn.server_stream(&Self::header(method), request.clone()),
+            )
+            .await;
+            match opened {
+                Ok(Ok(response)) => {
+                    *self.current.lock().await = Some((member, conn));
+                    return Ok(Ok(response));
+                }
+                Ok(Err(Error::Rpc {
+                    code: 14, details, ..
+                })) => {
+                    if let Some((_, hint)) =
+                        details.iter().find(|(key, _)| key == DETAIL_LEADER_NODE_ID)
+                    {
+                        if let Ok(decoded) = hex::decode(hint) {
+                            if let Ok(id) = <[u8; 32]>::try_from(decoded.as_slice()) {
+                                self.members.lock().await.insert(id);
+                                target = Some(id);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Ok(Err(Error::Rpc { code, message, .. })) => return Ok(Err((code, message))),
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+    }
 }
 
 /// A shared handle: both public clients hold the same engine.

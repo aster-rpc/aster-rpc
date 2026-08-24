@@ -1882,26 +1882,39 @@ async fn recovery_export(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8],
         return deny(runtime, &actor, call, status).await;
     }
 
-    // The canonical §13 recovery body, streamed from the same pinned
-    // transaction the authorization ran in. Bounded by construction: the body
-    // is a projection of state the §12.1 budgets cap.
-    let body = match crate::coordination::storage::rows::stream_recovery_body(
-        &cut.guarded,
-        std::path::Path::new("<recovery-export>"),
-        Vec::new(),
-    ) {
-        Ok((body, _header)) => body,
+    let group_id = cut.meta.group_id.clone();
+    let applied_log_id: Option<LogIdV1> = cut.pinned.as_ref().map(Into::into);
+    let guarded = cut.guarded;
+
+    // Pass 1: measure and hash the canonical §13 body without keeping a byte
+    // of it. On a blocking worker for the same reason the snapshot builder
+    // is: it is state-sized file I/O and hashing, and the transaction moves
+    // with it, pinning the version both passes read.
+    let (guarded, counted) = match tokio::task::spawn_blocking(move || {
+        let counted = crate::coordination::storage::rows::stream_recovery_body(
+            &guarded,
+            std::path::Path::new("<recovery-export>"),
+            CountingWriter::default(),
+        );
+        (guarded, counted)
+    })
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => return fail(call, internal("the export counter did not finish")).await,
+    };
+    let (total_len, checksum) = match counted {
+        Ok((counter, _header)) => (counter.len, counter.hasher.finalize()),
         Err(_) => return fail(call, internal("the recovery body does not build")).await,
     };
-    let checksum = blake3::hash(&body);
 
     let fory = payload_fory::<wire::RecoveryExportFrameV1>();
     let manifest = wire::RecoveryExportFrameV1::Manifest(wire::RecoveryExportManifestWireV1 {
         protocol_version: wire::STORE_PROTOCOL_VERSION,
-        group_id: cut.meta.group_id.clone(),
-        total_len: body.len() as u64,
+        group_id,
+        total_len,
         blake3_checksum: checksum.as_bytes().to_vec(),
-        applied_log_id: cut.pinned.as_ref().map(Into::into),
+        applied_log_id,
     });
     let Ok(bytes) = fory.serialize(&manifest) else {
         return fail(call, internal("the manifest does not encode")).await;
@@ -1910,16 +1923,36 @@ async fn recovery_export(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8],
         return;
     }
 
-    let mut offset = 0usize;
-    while offset < body.len() || (body.is_empty() && offset == 0) {
+    // Pass 2: stream the same pinned transaction again through a bounded
+    // channel — the body is a pure function of the transaction, so these are
+    // the bytes pass 1 measured. At most a few chunks exist at once: one in
+    // the producer's buffer, four in the channel, one being sent. The full
+    // body is never materialized (the reopen's blocker 5).
+    let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let producer = tokio::task::spawn_blocking(move || {
+        let outcome = crate::coordination::storage::rows::stream_recovery_body(
+            &guarded,
+            std::path::Path::new("<recovery-export>"),
+            ChunkWriter::new(chunks_tx),
+        );
+        match outcome {
+            Ok((writer, _header)) => writer.finish().is_ok(),
+            Err(_) => false,
+        }
+    });
+
+    let mut offset = 0u64;
+    while let Some(data) = chunks_rx.recv().await {
+        // Dropping the receiver on any early return unblocks the producer:
+        // its next `blocking_send` fails and the worker winds down.
         if call.is_cancelled() {
             return;
         }
-        let end = usize::min(offset + EXPORT_CHUNK, body.len());
+        let end = offset + data.len() as u64;
         let chunk = wire::RecoveryExportFrameV1::Chunk(wire::RecoveryExportChunkWireV1 {
-            offset: offset as u64,
-            data: body[offset..end].to_vec(),
-            final_chunk: end == body.len(),
+            offset,
+            data,
+            final_chunk: end == total_len,
         });
         let Ok(bytes) = fory.serialize(&chunk) else {
             let _ = call
@@ -1931,11 +1964,109 @@ async fn recovery_export(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8],
             return;
         }
         offset = end;
-        if body.is_empty() {
-            break;
+    }
+
+    // The channel closed: the producer is done. Its verdict and the byte
+    // count both have to agree with pass 1 before the stream may end OK.
+    let produced = matches!(producer.await, Ok(true));
+    if !produced || offset != total_len {
+        let _ = call
+            .finish(&internal("the export body diverged between its two passes"))
+            .await;
+        return;
+    }
+    if total_len == 0 {
+        // The §5.2 contract ends every export with an explicit final chunk,
+        // the empty body included.
+        let chunk = wire::RecoveryExportFrameV1::Chunk(wire::RecoveryExportChunkWireV1 {
+            offset: 0,
+            data: Vec::new(),
+            final_chunk: true,
+        });
+        let Ok(bytes) = fory.serialize(&chunk) else {
+            let _ = call
+                .finish(&internal("an export chunk does not encode"))
+                .await;
+            return;
+        };
+        if call.send(bytes).await.is_err() {
+            return;
         }
     }
     let _ = call.finish(&RpcStatus::ok()).await;
+}
+
+/// Pass 1's writer: the running length and checksum, no bytes kept.
+#[derive(Default)]
+struct CountingWriter {
+    len: u64,
+    hasher: blake3::Hasher,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        self.len += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Pass 2's writer: exact [`EXPORT_CHUNK`]-sized slices into a bounded
+/// channel, blocking when the consumer is behind — that backpressure, not a
+/// buffer, is what bounds the memory.
+struct ChunkWriter {
+    buffer: Vec<u8>,
+    chunks: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl ChunkWriter {
+    fn new(chunks: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            chunks,
+        }
+    }
+
+    fn send_buffer(&mut self) -> std::io::Result<()> {
+        let chunk = std::mem::take(&mut self.buffer);
+        self.chunks.blocking_send(chunk).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the export consumer is gone",
+            )
+        })
+    }
+
+    /// Flush the sub-chunk remainder. Consumes the writer: nothing may be
+    /// written after the last partial chunk.
+    fn finish(mut self) -> std::io::Result<()> {
+        if !self.buffer.is_empty() {
+            self.send_buffer()?;
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Write for ChunkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut data = buf;
+        while !data.is_empty() {
+            let room = EXPORT_CHUNK - self.buffer.len();
+            let take = room.min(data.len());
+            self.buffer.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buffer.len() == EXPORT_CHUNK {
+                self.send_buffer()?;
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
