@@ -346,6 +346,9 @@ impl AsterServerBuilder {
                 builder = builder.secret_key(key);
             }
         }
+        // `mut` for `resolve_root_pubkey(&mut self)`, which only the
+        // coordination graph calls.
+        #[cfg_attr(not(feature = "coordination"), allow(unused_mut))]
         let mut config = builder.build();
 
         // The deployment ROOT public key, resolved once, here. Coordination

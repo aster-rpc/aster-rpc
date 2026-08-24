@@ -15,6 +15,7 @@ pub mod ids;
 pub mod reason;
 pub mod rowstream;
 pub mod service;
+pub mod store;
 
 /// The §8.4 verified admission source. Voter-only: a client is admitted *by* a
 /// voter and consults no directory itself.
@@ -27,9 +28,10 @@ pub mod admission;
 #[cfg(feature = "coordination")]
 pub mod host;
 
-/// The replicated state machine. Voter-only: a client evaluates no transition,
-/// so `coordination-client` compiles none of it.
-#[cfg(feature = "coordination")]
+/// The replicated state machine. A client evaluates no transition, so
+/// `coordination-client` compiles none of them — but §12.1's logical limits
+/// and the §8.1 rights bits are contract facts, and `model::limits` compiles
+/// in both graphs. Every other submodule stays voter-only; see `model/mod.rs`.
 pub mod model;
 
 /// The OpenRaft type configuration. Voter-only, so it needs `coordination`
