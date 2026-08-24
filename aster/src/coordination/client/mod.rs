@@ -59,7 +59,7 @@ use crate::ticket::{Credential, Ticket};
 
 use driver::{drive, Delivery};
 use engine::{CallFailure, CallOutcome, Engine, SharedEngine};
-use journal::{Journal, JournalState};
+use journal::{AckToken, Journal, JournalState};
 
 fn client_error(what: impl Into<String>) -> Error {
     Error::InvalidArgument(format!("coordination client: {}", what.into()))
@@ -191,6 +191,10 @@ pub struct ResolvedMutation {
     client: CoordinationClient,
     reply: MutationReplyWireV1,
     via_retirement: bool,
+    /// Binds this handle to the exact persisted entry it was delivered for:
+    /// a stale handle cannot acknowledge a later result (the journal refuses
+    /// any token but the current entry's).
+    token: AckToken,
 }
 
 impl std::fmt::Debug for ResolvedMutation {
@@ -215,9 +219,9 @@ impl ResolvedMutation {
     pub async fn acknowledge(self) -> Result<()> {
         let mut journal = self.client.journal.lock().await;
         if self.via_retirement {
-            journal.rotate(random_id16()?)
+            journal.rotate(&self.token, random_id16()?)
         } else {
-            journal.acknowledge()
+            journal.acknowledge(&self.token)
         }
     }
 }
@@ -239,7 +243,7 @@ impl CoordinationClient {
     /// new sequences until it is taken and acknowledged.
     pub async fn unacknowledged(&self) -> Result<Option<ResolvedMutation>> {
         let journal = self.journal.lock().await;
-        let Some(bytes) = journal.unacknowledged() else {
+        let Some((bytes, token)) = journal.unacknowledged() else {
             return Ok(None);
         };
         let reply: MutationReplyWireV1 =
@@ -252,6 +256,7 @@ impl CoordinationClient {
             client: self.clone(),
             reply,
             via_retirement,
+            token,
         }))
     }
 
@@ -284,6 +289,7 @@ impl CoordinationClient {
             client: self.clone(),
             reply: delivery.reply,
             via_retirement: delivery.via_retirement,
+            token: delivery.token,
         }
     }
 

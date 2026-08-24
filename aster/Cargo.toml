@@ -28,8 +28,8 @@ rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"
 # Neither is in `default`, so voter-only dependencies are not enabled there.
 # Verify the direct edges with `cargo tree -p aster --no-default-features
 # --depth 1` and the full feature graph with `-e features`.
-coordination-client = ["rpc", "dep:blake3"]
-coordination = ["coordination-client", "dep:openraft", "dep:redb", "dep:ed25519-dalek", "dep:windows-sys"]
+coordination-client = ["rpc", "dep:blake3", "dep:windows-sys"]
+coordination = ["coordination-client", "dep:openraft", "dep:redb", "dep:ed25519-dalek"]
 # The Slice 3 internal test harness (contract matrix §S3-E, §S3-F). Adds no
 # dependency: it exposes one already-existing production path -- proposing a
 # command through `Raft::client_write` -- so that gate tests can seed accepted
@@ -125,13 +125,15 @@ url = "2"
 # is not the same operation there that it is on Unix, so the replacement step
 # goes through `ReplaceFileW`.
 #
-# Voter-only, and deliberately so: it is enabled by `coordination`, never by
-# `coordination-client`. A client installs no snapshot and replaces no
-# database, so a client-only consumer must not gain this edge — which is what
-# `scripts/check-coordination-deps.sh` proves rather than trusting this
-# comment. The directory lock does *not* need it: `std::fs::File::try_lock()`
-# is stable on the pinned toolchain, so v1 adds no `fs2`/`fs4` edge for an
-# operation the standard library provides.
+# Enabled by `coordination-client` (and therefore by `coordination`): the
+# client journal's atomic-replace needs `MoveFileExW(..., WRITE_THROUGH)` on
+# Windows for exactly the reason the snapshot replacement does — a rename
+# that is atomic but not write-through leaves the S4-D durability claim
+# false on one platform. `scripts/check-coordination-deps.sh` proves the edge
+# is present in both graphs and absent from `default`. The directory lock
+# does *not* need it: `std::fs::File::try_lock()` is stable on the pinned
+# toolchain, so v1 adds no `fs2`/`fs4` edge for an operation the standard
+# library provides.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",

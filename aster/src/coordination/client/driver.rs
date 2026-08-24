@@ -32,7 +32,7 @@ use crate::coordination::store::wire::{
 use crate::error::{Error, Result};
 
 use super::engine::{CallFailure, CallOutcome, Engine};
-use super::journal::{Journal, JournalState};
+use super::journal::{AckToken, Journal, JournalState};
 
 /// Attempts one drive makes before returning with the sequence still open.
 const DRIVE_ATTEMPTS: usize = 8;
@@ -49,6 +49,8 @@ pub(crate) struct Delivery {
     /// Whether the closing corridor produced it — in which case its
     /// acknowledgement is a **rotation** (§10), not an ordinary ack.
     pub(crate) via_retirement: bool,
+    /// The token acknowledging exactly this entry must present.
+    pub(crate) token: AckToken,
 }
 
 fn client_error(what: impl Into<String>) -> Error {
@@ -117,10 +119,11 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
                     continue;
                 };
                 if reply.disposition_code == 1 {
-                    journal.resolve(payload)?;
+                    let token = journal.resolve(payload)?;
                     return Ok(Some(Delivery {
                         reply,
                         via_retirement: false,
+                        token,
                     }));
                 }
                 if is_terminal_refusal(&reply) {
@@ -258,10 +261,11 @@ async fn replay_on_tombstone(engine: &Engine, journal: &mut Journal) -> Result<D
                     // The saved reply: the original **committed**, and this is
                     // its exact result — possibly a committed rejection.
                     (1, _) => {
-                        journal.resolve(payload)?;
+                        let token = journal.resolve(payload)?;
                         return Ok(Delivery {
                             reply,
                             via_retirement: true,
+                            token,
                         });
                     }
                     // ClientRetired: retirement won, the original never
@@ -276,10 +280,11 @@ async fn replay_on_tombstone(engine: &Engine, journal: &mut Journal) -> Result<D
                             .map_err(|_| {
                                 client_error("the stored terminal refusal does not decode")
                             })?;
-                        journal.resolve(refusal)?;
+                        let token = journal.resolve(refusal)?;
                         return Ok(Delivery {
                             reply: delivered,
                             via_retirement: true,
+                            token,
                         });
                     }
                     // A tombstoned session answers nothing else; anything

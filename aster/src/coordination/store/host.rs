@@ -262,11 +262,15 @@ impl ServiceDispatch for CoordinationStoreService {
     }
 
     async fn dispatch(&self, method: &str, call: Call) {
+        // The count is taken **before** the attachment is read, so a drain
+        // that observes zero after detach cannot race a call that had already
+        // cloned the runtime: any call that will serve is counted first, and
+        // a call that finds no attachment drops its count on refusal.
+        let _in_flight = InFlight::enter(&self.endpoint.in_flight);
         let Some(runtime) = self.endpoint.attached().await else {
             let _ = call.finish(&not_yet_serving()).await;
             return;
         };
-        let _in_flight = InFlight::enter(&self.endpoint.in_flight);
         serve_call(&runtime, method, call).await;
     }
 }

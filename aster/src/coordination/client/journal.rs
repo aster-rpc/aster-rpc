@@ -81,9 +81,9 @@ impl JournalState {
 /// The stored record. A local storage root with the same declaration
 /// discipline as every other frozen root: explicit ids, validated widths, a
 /// version field first. The journal may contain resource values (inside the
-/// pending request), so no `Debug` impl prints the byte fields and diagnostics
-/// never dump records.
-#[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
+/// pending request), so `Debug` is written by hand below to print lengths
+/// only, and diagnostics never dump records.
+#[derive(ForyStruct, aster_macros::AsterType, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/ClientJournal")]
 pub struct ClientJournalV1 {
     #[fory(id = 1)]
@@ -133,8 +133,39 @@ pub struct ClientJournalV1 {
     pub terminal_refusal: Vec<u8>,
 }
 
+impl std::fmt::Debug for ClientJournalV1 {
+    /// Lengths only: the pending request and the resolved reply may carry
+    /// resource values, and a record that reaches a log through `{:?}` must
+    /// not take them with it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientJournalV1")
+            .field("format_version", &self.format_version)
+            .field("state_code", &self.state_code)
+            .field("sequence", &self.sequence)
+            .field("pending_method", &self.pending_method)
+            .field("pending_request_len", &self.pending_request.len())
+            .field("resolved_reply_len", &self.resolved_reply.len())
+            .field("retirement_confirmed", &self.retirement_confirmed)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A named stop the crash matrix can arm (test builds only).
 pub type CrashPoint = &'static str;
+
+/// The identity of one resolved entry, presented back at acknowledgement.
+///
+/// Without it a stale handle could acknowledge a *later* result: obtain two
+/// handles for result A, acknowledge one, resolve B, and the surviving A
+/// handle would silently mark B handled. The token binds the acknowledgement
+/// to the exact `(client id, sequence, request hash)` the reply was fsynced
+/// for, and the journal refuses any other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AckToken {
+    pub(crate) client_id: Vec<u8>,
+    pub(crate) sequence: u64,
+    pub(crate) request_hash: Vec<u8>,
+}
 
 #[cfg(any(test, feature = "coordination-testing"))]
 type CrashHook = std::sync::Arc<dyn Fn(CrashPoint) -> Result<()> + Send + Sync>;
@@ -183,6 +214,49 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
     }
     #[cfg(not(unix))]
     let _ = (path, mode);
+    Ok(())
+}
+
+/// The stored record's own invariants: widths, and the fields each state is
+/// required to hold. A record that fails is refused rather than repaired — a
+/// journal whose `Pending` entry has no bytes cannot resend anything, and
+/// discovering that at the resend site would look like a network fault.
+fn validate_record(record: &ClientJournalV1) -> Result<()> {
+    let state = JournalState::from_code(record.state_code)
+        .ok_or_else(|| journal_error("the stored state code is unknown"))?;
+    if record.group_id.len() != 32 {
+        return Err(journal_error("the stored group id is not 32 bytes"));
+    }
+    if record.actor_node_id.len() != 32 {
+        return Err(journal_error("the stored actor id is not 32 bytes"));
+    }
+    if record.client_id.len() != 16 {
+        return Err(journal_error("the stored client id is not 16 bytes"));
+    }
+    let has_entry = matches!(
+        state,
+        JournalState::Pending
+            | JournalState::Closing
+            | JournalState::ReplayAfterRetire
+            | JournalState::ResolvedAwaitingAck
+    );
+    if has_entry {
+        if record.request_hash.len() != 32 {
+            return Err(journal_error(
+                "a state carrying an entry must hold its 32-byte request hash",
+            ));
+        }
+        if record.pending_request.is_empty() {
+            return Err(journal_error(
+                "a state carrying an entry must hold the exact request bytes",
+            ));
+        }
+    }
+    if state == JournalState::ResolvedAwaitingAck && record.resolved_reply.is_empty() {
+        return Err(journal_error(
+            "a resolved state must hold the exact resolved reply",
+        ));
+    }
     Ok(())
 }
 
@@ -253,8 +327,7 @@ impl Journal {
             if record.actor_node_id != actor.to_vec() {
                 return Err(journal_error("this journal is bound to another actor"));
             }
-            JournalState::from_code(record.state_code)
-                .ok_or_else(|| journal_error("the stored state code is unknown"))?;
+            validate_record(&record)?;
             record
         } else {
             // First use: fsync a fresh random client id before anything else
@@ -343,14 +416,10 @@ impl Journal {
         }
         // A kill here leaves the *old* record: the temporary is never read.
         self.boundary("persist_tmp_fsynced")?;
-        std::fs::rename(&tmp, &target).map_err(|source| io_error("renaming", &target, source))?;
+        atomic_replace(&tmp, &target)?;
         // A kill here leaves the *new* record: the rename is the commit point.
         self.boundary("persist_renamed")?;
-        let dir_handle =
-            File::open(&self.dir).map_err(|source| io_error("opening", &self.dir, source))?;
-        dir_handle
-            .sync_all()
-            .map_err(|source| io_error("fsyncing the directory", &self.dir, source))?;
+        fsync_dir(&self.dir)?;
         self.record = record;
         Ok(())
     }
@@ -388,8 +457,9 @@ impl Journal {
     }
 
     /// `Pending`/`ReplayAfterRetire` → `ResolvedAwaitingAck`: fsync the exact
-    /// resolved reply before the caller can observe it.
-    pub fn resolve(&mut self, encoded_reply: Vec<u8>) -> Result<()> {
+    /// resolved reply before the caller can observe it. Returns the token an
+    /// acknowledgement of exactly this entry must present.
+    pub fn resolve(&mut self, encoded_reply: Vec<u8>) -> Result<AckToken> {
         let state = self.state();
         if state != JournalState::Pending && state != JournalState::ReplayAfterRetire {
             return Err(journal_error(format!(
@@ -402,13 +472,29 @@ impl Journal {
         next.resolved_reply = encoded_reply;
         self.persist(next)?;
         self.boundary("after_resolve_fsync")?;
-        Ok(())
+        Ok(self.token_of_current())
     }
 
-    /// The saved reply this journal is holding for the application, if any.
-    pub fn unacknowledged(&self) -> Option<&[u8]> {
-        (self.state() == JournalState::ResolvedAwaitingAck)
-            .then_some(self.record.resolved_reply.as_slice())
+    /// The saved reply this journal is holding for the application, if any,
+    /// with the token that binds an acknowledgement to exactly this entry.
+    pub fn unacknowledged(&self) -> Option<(&[u8], AckToken)> {
+        (self.state() == JournalState::ResolvedAwaitingAck).then(|| {
+            (
+                self.record.resolved_reply.as_slice(),
+                self.token_of_current(),
+            )
+        })
+    }
+
+    /// The identity of the record's current entry — what an acknowledgement
+    /// must present to prove it acknowledges *this* result and not a later
+    /// one that resolved after a stale handle was obtained.
+    fn token_of_current(&self) -> AckToken {
+        AckToken {
+            client_id: self.record.client_id.clone(),
+            sequence: self.record.sequence,
+            request_hash: self.record.request_hash.clone(),
+        }
     }
 
     /// `ResolvedAwaitingAck` → `Ready`: the application has durably handled
@@ -418,9 +504,15 @@ impl Journal {
     /// acknowledgement **is** [`rotate`](Self::rotate), because the client id
     /// it was resolved on is a tombstone and continuing on it would strand the
     /// next sequence behind `ClientRetired` forever.
-    pub fn acknowledge(&mut self) -> Result<()> {
+    pub fn acknowledge(&mut self, token: &AckToken) -> Result<()> {
         if self.state() != JournalState::ResolvedAwaitingAck {
             return Err(journal_error("nothing is awaiting acknowledgement"));
+        }
+        if self.token_of_current() != *token {
+            return Err(journal_error(
+                "stale acknowledgement: the journal's resolved entry is not the one \
+                 this handle was delivered for",
+            ));
         }
         if self.record.retirement_confirmed {
             return Err(journal_error(
@@ -488,10 +580,16 @@ impl Journal {
     /// redelivered result, exactly as [`acknowledge`](Self::acknowledge) for
     /// the ordinary path. The sequence restarts; the first request on the new
     /// id is 1.
-    pub fn rotate(&mut self, fresh_client_id: [u8; 16]) -> Result<()> {
+    pub fn rotate(&mut self, token: &AckToken, fresh_client_id: [u8; 16]) -> Result<()> {
         if self.state() != JournalState::ResolvedAwaitingAck || !self.record.retirement_confirmed {
             return Err(journal_error(
                 "rotation acknowledges a result the closing corridor resolved, and nothing else",
+            ));
+        }
+        if self.token_of_current() != *token {
+            return Err(journal_error(
+                "stale acknowledgement: the journal's resolved entry is not the one \
+                 this handle was delivered for",
             ));
         }
         self.boundary("before_rotate_write")?;
@@ -510,6 +608,67 @@ impl Journal {
     }
 }
 
+/// Make `to` name `from`'s content, atomically **and durably** — the same
+/// platform split the §11.4 snapshot replacement uses, because the guarantee
+/// lives in different places. On Unix the rename is atomic and the directory
+/// entry is fsynced separately. On Windows `std::fs::rename` is `MoveFileExW`
+/// with `MOVEFILE_REPLACE_EXISTING` and nothing else — atomic but **not**
+/// write-through, and there is no directory handle to synchronize instead —
+/// so `MOVEFILE_WRITE_THROUGH` supplies the durability half and has to be
+/// asked for. A journal without it would fsync its bytes into a rename the
+/// disk had not seen, and the §S4-D crash claim would be false on exactly one
+/// platform.
+#[cfg(not(windows))]
+fn atomic_replace(from: &Path, to: &Path) -> Result<()> {
+    std::fs::rename(from, to).map_err(|source| io_error("renaming", to, source))
+}
+
+#[cfg(windows)]
+fn atomic_replace(from: &Path, to: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let (source, destination) = (wide(from), wide(to));
+    // SAFETY: both buffers are NUL-terminated and outlive the call, which is
+    // the whole of `MoveFileExW`'s contract on its two path arguments.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(io_error("renaming", to, std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// fsync the journal directory so a rename within it is durable. Unix only —
+/// on Windows there is no directory handle to synchronize, and the
+/// write-through flag on the replacement above is the platform's equivalent.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> Result<()> {
+    let handle = File::open(dir).map_err(|source| io_error("opening", dir, source))?;
+    handle
+        .sync_all()
+        .map_err(|source| io_error("fsyncing the directory", dir, source))
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Write → fsync file → rename → fsync directory. The record is complete-old
 /// or complete-new at every kill point in between.
 fn persist_record(dir: &Path, record: &ClientJournalV1) -> Result<()> {
@@ -526,11 +685,8 @@ fn persist_record(dir: &Path, record: &ClientJournalV1) -> Result<()> {
         file.sync_all()
             .map_err(|source| io_error("fsyncing", &tmp, source))?;
     }
-    std::fs::rename(&tmp, &target).map_err(|source| io_error("renaming", &target, source))?;
-    let dir_handle = File::open(dir).map_err(|source| io_error("opening", dir, source))?;
-    dir_handle
-        .sync_all()
-        .map_err(|source| io_error("fsyncing the directory", dir, source))?;
+    atomic_replace(&tmp, &target)?;
+    fsync_dir(dir)?;
     Ok(())
 }
 
@@ -589,20 +745,23 @@ mod tests {
         {
             let journal = open(dir.path());
             assert_eq!(journal.state(), JournalState::ResolvedAwaitingAck);
-            assert_eq!(journal.unacknowledged(), Some(b"the-exact-reply".as_ref()));
+            let (reply, _) = journal.unacknowledged().expect("held");
+            assert_eq!(reply, b"the-exact-reply".as_ref());
         }
 
         // ResolvedAwaitingAck → Ready on acknowledgement; the reply is gone
-        // and the sequence is consumed.
+        // and the sequence is consumed. The acknowledgement presents the
+        // token the redelivery came with.
         {
             let mut journal = open(dir.path());
-            journal.acknowledge().expect("acknowledge");
+            let (_, token) = journal.unacknowledged().expect("held");
+            journal.acknowledge(&token).expect("acknowledge");
         }
         {
             let journal = open(dir.path());
             assert_eq!(journal.state(), JournalState::Ready);
             assert_eq!(journal.sequence(), 1);
-            assert_eq!(journal.unacknowledged(), None);
+            assert!(journal.unacknowledged().is_none());
         }
     }
 
@@ -651,26 +810,35 @@ mod tests {
         // sequence.
         {
             let mut journal = open(dir.path());
-            journal
+            let token = journal
                 .resolve(b"replayed-answer".to_vec())
                 .expect("resolve");
+            let (reply, redelivered) = journal.unacknowledged().expect("held");
             assert_eq!(
-                journal.unacknowledged(),
-                Some(b"replayed-answer".as_ref()),
+                reply,
+                b"replayed-answer".as_ref(),
                 "the redelivered result is readable until acknowledged"
             );
+            assert_eq!(token, redelivered, "one entry, one token");
             assert!(
-                journal.acknowledge().is_err(),
+                journal.acknowledge(&token).is_err(),
                 "a retirement-resolved result is acknowledged by rotating"
             );
-            journal.rotate(CLIENT_B).expect("rotate acknowledges it");
+            journal
+                .rotate(&token, CLIENT_B)
+                .expect("rotate acknowledges it");
             assert_eq!(journal.client_id(), CLIENT_B);
             assert_eq!(journal.state(), JournalState::Ready);
         }
         // Rotation is not reachable outside the corridor.
         {
             let mut journal = open(dir.path());
-            assert!(journal.rotate(CLIENT_A).is_err());
+            let stale = AckToken {
+                client_id: CLIENT_B.to_vec(),
+                sequence: 1,
+                request_hash: vec![0x44; 32],
+            };
+            assert!(journal.rotate(&stale, CLIENT_A).is_err());
         }
     }
 
@@ -687,8 +855,8 @@ mod tests {
                 .close_for_retirement(b"the-26".to_vec())
                 .expect("close");
             journal.retirement_confirmed().expect("retired");
-            journal.resolve(b"not-applied".to_vec()).expect("resolve");
-            journal.rotate(CLIENT_B).expect("rotate");
+            let token = journal.resolve(b"not-applied".to_vec()).expect("resolve");
+            journal.rotate(&token, CLIENT_B).expect("rotate");
         }
         let journal = open(dir.path());
         assert_eq!(journal.client_id(), CLIENT_B);
@@ -712,17 +880,49 @@ mod tests {
                 .is_err(),
             "one outstanding request per client id"
         );
-        journal.resolve(b"r".to_vec()).expect("resolve");
+        let token = journal.resolve(b"r".to_vec()).expect("resolve");
         assert!(
             journal
                 .begin(2, "acquire", b"b".to_vec(), [0x67; 32])
                 .is_err(),
             "no new sequence until the application acknowledges"
         );
-        journal.acknowledge().expect("acknowledge");
+        journal.acknowledge(&token).expect("acknowledge");
         journal
             .begin(2, "acquire", b"b".to_vec(), [0x67; 32])
             .expect("the next sequence is 2");
+    }
+
+    /// The reviewer's race, made unspellable: a token captured for result A
+    /// cannot acknowledge result B. Acknowledge A, resolve B at the next
+    /// sequence, and the stale A token is refused while B's own succeeds.
+    #[test]
+    fn a_stale_token_cannot_acknowledge_a_later_result() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let mut journal = open(dir.path());
+        journal
+            .begin(1, "acquire", b"a".to_vec(), [0x71; 32])
+            .expect("begin A");
+        let token_a = journal.resolve(b"result-a".to_vec()).expect("resolve A");
+        // Two handles for A exist in the reviewer's scenario; the first one
+        // acknowledges.
+        journal.acknowledge(&token_a).expect("A acknowledged");
+        journal
+            .begin(2, "acquire", b"b".to_vec(), [0x72; 32])
+            .expect("begin B");
+        let token_b = journal.resolve(b"result-b".to_vec()).expect("resolve B");
+        assert!(
+            journal.acknowledge(&token_a).is_err(),
+            "the surviving A handle must not mark B handled"
+        );
+        assert_eq!(
+            journal.state(),
+            JournalState::ResolvedAwaitingAck,
+            "B still awaits its own acknowledgement"
+        );
+        journal
+            .acknowledge(&token_b)
+            .expect("B's own token succeeds");
     }
 
     /// The journal binds `(actor, group)`: another actor's or group's
@@ -897,8 +1097,8 @@ mod tests {
         journal
             .begin(1, "acquire", b"first".to_vec(), [0x71; 32])
             .expect("begin 1");
-        journal.resolve(b"ok".to_vec()).expect("resolve 1");
-        journal.acknowledge().expect("ack 1");
+        let token = journal.resolve(b"ok".to_vec()).expect("resolve 1");
+        journal.acknowledge(&token).expect("ack 1");
         journal
             .begin(2, "set_admin", b"second".to_vec(), [0x72; 32])
             .expect("begin 2");
@@ -906,7 +1106,7 @@ mod tests {
             .close_for_retirement(b"terminal".to_vec())
             .expect("close");
         journal.retirement_confirmed().expect("retired");
-        journal.resolve(b"not-applied".to_vec()).expect("resolve 2");
-        journal.rotate(CLIENT_B).expect("rotate");
+        let token = journal.resolve(b"not-applied".to_vec()).expect("resolve 2");
+        journal.rotate(&token, CLIENT_B).expect("rotate");
     }
 }

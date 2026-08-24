@@ -14,7 +14,7 @@
 #      gate asserting it would be wrong. What must not appear is `aster`
 #      declaring its own dependency on it.
 #
-#   3. `windows-sys` gains no direct edge outside `coordination` either. It
+#   3. `windows-sys` gains no direct edge outside the coordination features. It
 #      exists for §11.4's `ReplaceFileW` snapshot replacement, which only a
 #      voter performs.
 #
@@ -90,25 +90,23 @@ pass "direct redb v4.1.0 edge present in the 'coordination' graph"
 WIN_TARGET=x86_64-pc-windows-msvc
 wintree() { tree --target "$WIN_TARGET" "$@"; }
 
-for label in "default" "coordination-client"; do
-    if [[ "$label" == "default" ]]; then
-        out=$(wintree --depth 1)
-    else
-        out=$(wintree --depth 1 --no-default-features --features coordination-client)
-    fi
-    if grep -q '\bwindows-sys\b' <<<"$out"; then
-        fail "aster declares a direct windows-sys dependency in the '$label' \
-Windows graph; it belongs only to 'coordination'"
-    fi
-    pass "no direct windows-sys edge in the '$label' Windows graph"
-done
-
-voter_win=$(wintree --depth 1 --no-default-features --features coordination)
-if ! grep -q 'windows-sys v0.61.2' <<<"$voter_win"; then
-    fail "the 'coordination' Windows graph does not declare the pinned direct \
-windows-sys v0.61.2 edge that §11.4's ReplaceFileW replacement needs"
+out=$(wintree --depth 1)
+if grep -q '\bwindows-sys\b' <<<"$out"; then
+    fail "aster declares a direct windows-sys dependency in the 'default' Windows graph; it belongs to the coordination features only"
 fi
-pass "direct windows-sys v0.61.2 edge present in the 'coordination' Windows graph"
+pass "no direct windows-sys edge in the 'default' Windows graph"
+
+# Both coordination graphs need the pinned edge on Windows: the voter for
+# the write-through snapshot replacement, the client for the S4-D journal's
+# write-through record replacement. A client without it would make the
+# journal's durability claim quietly false on one platform.
+for label in "coordination-client" "coordination"; do
+    graph_win=$(wintree --depth 1 --no-default-features --features "$label")
+    if ! grep -q 'windows-sys v0.61.2' <<<"$graph_win"; then
+        fail "the '$label' Windows graph does not declare the pinned direct windows-sys v0.61.2 edge its write-through replacement needs"
+    fi
+    pass "direct windows-sys v0.61.2 edge present in the '$label' Windows graph"
+done
 
 # The lock is the standard library's, not a crate's. A reintroduced fs2/fs4
 # would compile and pass every other gate while silently adding a supply-chain

@@ -543,25 +543,29 @@ impl CoordinationRuntime {
     /// but a runtime dropped without `shutdown` skips the RPC deregistration,
     /// so a call can reach a `Raft` that is going away.
     pub(crate) async fn shutdown(mut self) {
-        // 1. Controllers. Bumping the generation first stops the membership
-        //    controller at its next leadership check even if it is mid-await,
-        //    which an abort alone cannot guarantee.
+        // 1. §11.5 step 1: mark draining and stop accepting new Store
+        //    mutations — the Store endpoint detaches before anything the
+        //    in-flight calls depend on is taken down.
         self.facts.begin_draining();
+        self.store_endpoint.detach().await;
+        // 2. §11.5 step 2: wait up to five bounded seconds for the Store
+        //    calls that were already inside a handler, while the Raft and
+        //    controllers they may be awaiting still run.
+        self.store_endpoint.drain().await;
+
+        // 3. §11.5 step 3 begins: controllers. Bumping the generation first
+        //    stops the membership controller at its next leadership check even
+        //    if it is mid-await, which an abort alone cannot guarantee.
         self.generation.fetch_add(1, Ordering::SeqCst);
         for task in std::mem::take(&mut self.controllers) {
             task.abort();
             let _ = task.await;
         }
 
-        // 2. Deregister RPC — Store first, then Raft. After this a call is answered
+        //    Deregister the Raft RPC. After this a call is answered
         //    `FailedPrecondition` — the same status a node that has not yet
         //    attached answers, which is right: in both cases the node is up and
         //    not serving Raft.
-        self.store_endpoint.detach().await;
-        // §11.5 step 2: new Store mutations are already refused; give the
-        // calls that were inside a handler up to five seconds to finish
-        // before the Raft they depend on goes away.
-        self.store_endpoint.drain().await;
         self.endpoint.detach().await;
 
         // 3. The Raft itself.

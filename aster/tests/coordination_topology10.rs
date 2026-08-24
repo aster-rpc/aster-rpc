@@ -18,6 +18,11 @@
 //! reached by NodeId. `add_node_addr` is the same-host substitution for
 //! discovery that every cluster gate uses; nothing pins a port and nothing
 //! treats an endpoint as a host:port service.
+//!
+//! The scenario's ten are the group's own nodes. The ROOT administrator runs
+//! on an **eleventh, transient** endpoint — the §8.1 break-glass identity is
+//! deliberately not one of the fleet, and counting it among the ten would
+//! misstate what the ten-node claim is about.
 
 #![cfg(feature = "coordination-testing")]
 
@@ -377,7 +382,11 @@ async fn ten_nodes_three_voters_move_leadership_and_replace_a_voter() {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
-    assert_eq!(final_status.voters.len(), 3, "exactly three, always");
+    assert_eq!(
+        final_status.voters.len(),
+        3,
+        "the settled uniform membership names exactly three"
+    );
     assert!(
         !final_status
             .voters
