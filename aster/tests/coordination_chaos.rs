@@ -68,7 +68,7 @@ use aster::coordination::testing::Schedule;
 mod common;
 use common::{
     await_leader, await_leader_other_than, combined_tally, every_core_is_alive, isolate_everywhere,
-    rejoin_everywhere, shutdown_all, ChaosFixture, ChaoticVoter,
+    rejoin_everywhere, shutdown_all, ChaosFixture, ChaoticVoter, PhaseClock,
 };
 
 const DOMAIN: &str = "chaos.test";
@@ -167,14 +167,27 @@ async fn commit_avoiding(
     command: CommandV1,
     what: &str,
 ) -> aster::coordination::testing::Committed {
+    let started = std::time::Instant::now();
+    let mut attempts = 0u32;
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         let leader = await_leader_other_than(voters, excluding, PATIENCE, what).await;
         let coordination = voters[leader].coordination();
+        attempts += 1;
         if let Ok(committed) = coordination
             .propose_for_testing_within(command.clone(), Duration::from_secs(20))
             .await
         {
+            // The walltime ledger: a commit that needed more than one proposal
+            // or more than a couple of seconds is exactly the event whose cost
+            // S3-CHAOS-WALLTIME could not attribute.
+            let elapsed = started.elapsed();
+            if attempts > 1 || elapsed > Duration::from_secs(2) {
+                println!(
+                    "[chaos-timing] slow commit: {what} took {:.2}s over {attempts} proposal(s)",
+                    elapsed.as_secs_f64()
+                );
+            }
             return committed;
         }
         assert!(
@@ -197,11 +210,14 @@ async fn commit_avoiding(
 /// silently delivered everything fails instead of passing quietly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_group_makes_progress_through_a_seeded_faulty_network() {
+    let mut clock = PhaseClock::start("progress-under-chaos");
     let fixture = ChaosFixture::new(DOMAIN, 0xA0, 3);
     let voters = fixture.start(Schedule::new(SEED, FAULT_PERCENT)).await;
+    clock.mark("start 3 voters");
 
     // Election, through a network that is dropping and delaying votes.
     let leader = await_leader(&voters, PATIENCE, "the first election under chaos").await;
+    clock.mark("first election");
 
     // Replication, likewise.
     let client = b"chaos-client";
@@ -217,6 +233,7 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
         (GRANT_UPDATED, 0),
         "a committed grant is accepted even through a faulty network (seed {SEED:#x})"
     );
+    clock.mark("first commit");
 
     // Enough traffic for the schedule to be a schedule rather than a coin
     // flip. An election plus one commit is a couple of dozen messages, and at
@@ -232,6 +249,7 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
             "round {round} commits (seed {SEED:#x})"
         );
     }
+    clock.mark("20 commit rounds");
 
     // Lost leadership, at a moment the schedule did not choose — the phase
     // §S3-F names last, and the one a purely message-level fault never reaches.
@@ -252,6 +270,7 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
         "an election after the leader was cut off",
     )
     .await;
+    clock.mark("failover election");
     assert_ne!(
         voters[successor].id, lost,
         "the successor must be a different voter, or nothing was lost"
@@ -278,6 +297,7 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
         (GRANT_UPDATED, 0),
         "the group commits again after leadership moved (seed {SEED:#x})"
     );
+    clock.mark("post-failover commit");
 
     // The deposed voter rejoins and catches up, so the loss was a loss and not
     // a removal — a group that could only continue by forgetting a member has
@@ -298,6 +318,7 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    clock.mark("deposed voter catch-up");
 
     // Non-vacuity. Without this the gate would pass just as well on a perfect
     // network, and would therefore prove nothing about a faulty one.
@@ -311,6 +332,7 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
 
     every_core_is_alive(&voters, "after the gate").await;
     shutdown_all(voters).await;
+    clock.mark("shutdown");
 }
 
 /// The lone voter at `epoch`, if the schedule separates exactly one from the
@@ -368,10 +390,12 @@ async fn a_partition_strands_a_minority_and_heals() {
         .find(|epoch| whole_at(&schedule, &ids, *epoch))
         .expect("this seed reconnects the group at some later epoch");
 
+    let mut clock = PhaseClock::start("partition-strand-heal");
     let voters = fixture.start(schedule).await;
     let client = b"chaos-client";
 
     await_leader(&voters, PATIENCE, "the election before any partition").await;
+    clock.mark("start + pre-partition election");
     let before = commit_somewhere(
         &voters,
         grant(&fixture.node_id(0), client, 1, b"pre-partition"),
@@ -379,6 +403,7 @@ async fn a_partition_strands_a_minority_and_heals() {
     )
     .await;
     assert_eq!(outcome_of(&before), (GRANT_UPDATED, 0));
+    clock.mark("pre-partition commit");
 
     // Move every voter to the split epoch at once. The sides come from the
     // shared seed, so all three agree on who can reach whom; two voters at
@@ -434,6 +459,7 @@ async fn a_partition_strands_a_minority_and_heals() {
         SEED ^ 0xBEEF,
         combined_tally(&voters)
     );
+    clock.mark("majority commit while stranded");
 
     // 2. Heal, to an epoch the schedule says connects every pair.
     for voter in &voters {
@@ -462,6 +488,7 @@ async fn a_partition_strands_a_minority_and_heals() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    clock.mark("stranded voter catch-up after heal");
     let healed = commit_somewhere(
         &voters,
         grant(&fixture.node_id(0), client, 3, b"post-heal"),
@@ -485,6 +512,7 @@ async fn a_partition_strands_a_minority_and_heals() {
 
     every_core_is_alive(&voters, "after the gate").await;
     shutdown_all(voters).await;
+    clock.mark("post-heal commit + shutdown");
 }
 
 /// **A perfect schedule changes nothing.**
@@ -494,10 +522,12 @@ async fn a_partition_strands_a_minority_and_heals() {
 /// the group and every result above is about the harness rather than the code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_zero_fault_schedule_leaves_the_group_untouched() {
+    let mut clock = PhaseClock::start("zero-fault-control");
     let fixture = ChaosFixture::new(DOMAIN, 0xC0, 3);
     let voters = fixture.start(Schedule::perfect()).await;
 
     await_leader(&voters, PATIENCE, "an election with no faults").await;
+    clock.mark("start + election");
     let committed = commit_somewhere(
         &voters,
         grant(&fixture.node_id(0), b"chaos-client", 1, b"control"),
@@ -526,6 +556,7 @@ async fn a_zero_fault_schedule_leaves_the_group_untouched() {
 
     every_core_is_alive(&voters, "after the gate").await;
     shutdown_all(voters).await;
+    clock.mark("commit + shutdown");
 }
 
 /// **A membership change completes through the faulty network.**
@@ -555,6 +586,7 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
         ChangeMembershipActionV1, MemberSeedV1, NodeIdV1 as PlanNodeId,
     };
 
+    let mut clock = PhaseClock::start("membership-under-chaos");
     let fixture = ChaosFixture::new(DOMAIN, 0xD0, 5);
     let voters = fixture
         .start(Schedule::new(SEED ^ 0x5171, FAULT_PERCENT))
@@ -563,6 +595,7 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
     // that has not elected is refused for a reason that is about the election
     // rather than about the network.
     await_leader(&voters, PATIENCE, "the election before a membership change").await;
+    clock.mark("start 5 voters + election");
 
     // Sorted unique by node id, which is a public key: fixture order and byte
     // order are unrelated, and an unsorted plan is refused as shapeless before
@@ -637,6 +670,7 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    clock.mark("plan accepted");
 
     // Settled, non-joint, and with the durable intent finished. A joint
     // configuration containing the desired voters is what a change looks like
@@ -681,6 +715,7 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    clock.mark("membership settled");
 
     let tally = combined_tally(&voters);
     println!("membership under chaos applied {tally:?}");
@@ -692,4 +727,5 @@ async fn a_membership_change_completes_through_a_seeded_faulty_network() {
 
     every_core_is_alive(&voters, "after the gate").await;
     shutdown_all(voters).await;
+    clock.mark("shutdown");
 }

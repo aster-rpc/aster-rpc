@@ -403,6 +403,44 @@ pub fn cross_register(group: &[&ChaoticVoter]) {
     }
 }
 
+/// Wall-clock phase timing for a chaos gate, printed on every mark.
+///
+/// `S3-CHAOS-WALLTIME` observed identical code finish in 27 s and 629 s. The
+/// suite's assertions cannot say where such a run spent its time, and a gate
+/// whose duration swings by an order of magnitude will eventually be blamed on
+/// CI rather than investigated. Every gate therefore narrates its phases; the
+/// output costs nothing when nobody is asking and is the whole investigation
+/// when somebody is.
+pub struct PhaseClock {
+    gate: &'static str,
+    start: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl PhaseClock {
+    pub fn start(gate: &'static str) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            gate,
+            start: now,
+            last: now,
+        }
+    }
+
+    /// Record that `phase` just finished.
+    pub fn mark(&mut self, phase: &str) {
+        let now = std::time::Instant::now();
+        println!(
+            "[chaos-timing] {}: {} took {:.2}s (total {:.2}s)",
+            self.gate,
+            phase,
+            now.duration_since(self.last).as_secs_f64(),
+            now.duration_since(self.start).as_secs_f64(),
+        );
+        self.last = now;
+    }
+}
+
 /// The applied-fault totals across every voter.
 pub fn combined_tally(voters: &[ChaoticVoter]) -> FaultTally {
     voters
