@@ -90,6 +90,7 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ),
     ("runtime/mod.rs", include_str!("runtime/mod.rs")),
     ("runtime/owner.rs", include_str!("runtime/owner.rs")),
+    ("runtime/pressure.rs", include_str!("runtime/pressure.rs")),
     ("runtime/readiness.rs", include_str!("runtime/readiness.rs")),
     ("storage/actor.rs", include_str!("storage/actor.rs")),
     ("storage/codec.rs", include_str!("storage/codec.rs")),

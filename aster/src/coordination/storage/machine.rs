@@ -97,6 +97,33 @@ type Reply<T> = oneshot::Sender<StorageResult<T>>;
 type PreparationReply =
     oneshot::Sender<std::result::Result<snapshot::PreparedSnapshot, snapshot::PrepareInstallError>>;
 
+fn admin_view_of(state: &DurableState) -> AdminView {
+    AdminView {
+        revision: state.model.admin_revision,
+        root: state.model.authority.public_key,
+        delegates: state.model.admins.clone(),
+    }
+}
+
+/// The §8.1 administrative facts, republished on every apply and install so
+/// the Store service can make its **cheap preliminary** authorization check
+/// without an actor round trip or a barrier. Advisory only: the authoritative
+/// check stays inside the guarded read transaction. Safe as a pre-denial on
+/// the leader because `client_write` returns only after apply — an appointed
+/// administrator is in this view before it can learn of its appointment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdminView {
+    pub(crate) revision: u64,
+    pub(crate) root: [u8; 32],
+    pub(crate) delegates: std::collections::BTreeSet<[u8; 32]>,
+}
+
+impl AdminView {
+    pub(crate) fn is_administrator(&self, actor: &[u8; 32]) -> bool {
+        self.revision > 0 && (self.root == *actor || self.delegates.contains(actor))
+    }
+}
+
 /// What [`StateCommand::Preflight`] answers.
 #[derive(Debug)]
 pub(crate) enum PreflightAnswer {
@@ -163,7 +190,7 @@ pub(crate) enum StateCommand {
     Preflight {
         client: Box<crate::coordination::model::apply::ClientRef>,
         action: Option<Box<crate::coordination::model::apply::Action>>,
-        reply: Reply<(PreflightAnswer, Option<LogId>)>,
+        reply: Reply<(PreflightAnswer, Option<LogId>, bool)>,
     },
     /// The leader-side decision for one sessionless `retire_client` (§10), on
     /// the same state apply runs against, with the same applied witness.
@@ -250,6 +277,8 @@ struct StateActor {
     /// Written only where [`Self::state`] is, through
     /// [`Self::install_state`], so the two cannot diverge.
     committed: watch::Sender<Arc<StoredMembership<CoordinationNodeId, CoordinationNode>>>,
+    /// The §8.1 administrative view, republished with every install.
+    admins: watch::Sender<Arc<AdminView>>,
     fatal: Arc<AtomicBool>,
     /// Fail the next batch's commit, after its entries have already mutated
     /// the working copy.
@@ -279,12 +308,14 @@ impl StateActor {
     fn install_state(
         slot: &mut Option<DurableState>,
         committed: &watch::Sender<Arc<StoredMembership<CoordinationNodeId, CoordinationNode>>>,
+        admins: &watch::Sender<Arc<AdminView>>,
         state: DurableState,
     ) {
         // `send_replace` rather than `send`: there may be no receiver yet, or
         // ever, and a membership that failed to publish because nobody was
         // listening is exactly the silent divergence this exists to prevent.
         committed.send_replace(Arc::new(state.membership.clone()));
+        admins.send_replace(Arc::new(admin_view_of(&state)));
         *slot = Some(state);
     }
 
@@ -530,7 +561,7 @@ impl StateActor {
                 // can serve *and* is the one this install validated.
                 let (database, reloaded, body) = replaced.reopen()?;
                 self.database = Some(database);
-                Self::install_state(&mut self.state, &self.committed, reloaded);
+                Self::install_state(&mut self.state, &self.committed, &self.admins, reloaded);
                 body
             }
         };
@@ -583,15 +614,28 @@ impl StateActor {
     }
 
     /// §10 stages 2–4 for the Store leader, on exactly the state apply runs
-    /// against, with the applied log id as the barrier witness.
+    /// against, with the applied log id as the barrier witness. The third
+    /// element reports whether an admitted request would **create** a session
+    /// row — the §11.5 "new clients" fact the pressure gate needs, taken from
+    /// the same classifier apply uses rather than re-derived at the service.
     fn preflight(
         &mut self,
         client: &crate::coordination::model::apply::ClientRef,
         action: Option<&crate::coordination::model::apply::Action>,
-    ) -> StorageResult<(PreflightAnswer, Option<LogId>)> {
+    ) -> StorageResult<(PreflightAnswer, Option<LogId>, bool)> {
         use crate::coordination::model::apply::{preflight, preflight_shapeless};
+        use crate::coordination::model::classify::{classify, Classification};
         let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
         let applied = state.model.last_applied;
+        let session = state.model.sessions.get(&(client.actor, client.client_id));
+        let capacity = state.model.capacity_for(&client.actor);
+        let creates_session = matches!(
+            classify(session, client.sequence, &client.request_hash, capacity),
+            Classification::Unresolved {
+                creates_session: true,
+                ..
+            }
+        );
         let answer = match action {
             Some(action) => PreflightAnswer::Admission(preflight(&state.model, client, action)),
             None => match preflight_shapeless(&state.model, client) {
@@ -599,7 +643,7 @@ impl StateActor {
                 None => PreflightAnswer::ShapelessUnresolved,
             },
         };
-        Ok((answer, applied))
+        Ok((answer, applied, creates_session))
     }
 
     /// The `retire_client` decision (§10), on the applied state, with the same
@@ -722,7 +766,7 @@ impl StateActor {
         // nothing further -- so it is carried by the signature rather than by a
         // test whose name would imply it had been checked.
         let committed = rows::commit(self.database(), working, &changes)?;
-        Self::install_state(&mut self.state, &self.committed, committed);
+        Self::install_state(&mut self.state, &self.committed, &self.admins, committed);
         // The batch is durable and its replies exist. Dying here is the lost
         // acknowledgement: the entry applied, and the caller never learned it.
         // What must not follow is the entry being applied a second time, which
@@ -795,6 +839,9 @@ pub(crate) struct StateHandle {
     /// actor there would queue admission behind whatever the actor is applying,
     /// which is the wrong thing to make slower and the wrong thing to couple.
     committed: watch::Receiver<Arc<StoredMembership<CoordinationNodeId, CoordinationNode>>>,
+    /// The §8.1 administrative facts, for the Store service's cheap
+    /// preliminary check — same discipline as `committed`.
+    admins: watch::Receiver<Arc<AdminView>>,
 }
 
 impl std::fmt::Debug for StateHandle {
@@ -837,6 +884,7 @@ impl StateHandle {
         // that asks before the first apply gets the membership this store
         // reopened with rather than an empty one.
         let (committed_tx, committed_rx) = watch::channel(Arc::new(state.membership.clone()));
+        let (admins_tx, admins_rx) = watch::channel(Arc::new(admin_view_of(&state)));
         let thread = std::thread::Builder::new()
             .name("aster-coordination-state".into())
             .spawn(move || {
@@ -848,6 +896,7 @@ impl StateHandle {
                     current,
                     state: Some(state),
                     committed: committed_tx,
+                    admins: admins_tx,
                     fatal: actor_fatal,
                     #[cfg(test)]
                     fail_next_commit: false,
@@ -866,6 +915,7 @@ impl StateHandle {
                 layout: handle_layout,
                 identity: Arc::new(handle_identity),
                 committed: committed_rx,
+                admins: admins_rx,
             },
             ActorShutdown::new(tx, stop, thread, || StateCommand::Shutdown),
         ))
@@ -890,6 +940,11 @@ impl StateHandle {
         &self,
     ) -> Arc<StoredMembership<CoordinationNodeId, CoordinationNode>> {
         Arc::clone(&self.committed.borrow())
+    }
+
+    /// The advisory §8.1 administrative view — cheap, no actor round trip.
+    pub(crate) fn admin_view(&self) -> Arc<AdminView> {
+        Arc::clone(&self.admins.borrow())
     }
 
     /// The same refusal every actor command makes, for work that does not go
@@ -952,7 +1007,7 @@ impl StateHandle {
         &self,
         client: crate::coordination::model::apply::ClientRef,
         action: Option<crate::coordination::model::apply::Action>,
-    ) -> StorageResult<(PreflightAnswer, Option<LogId>)> {
+    ) -> StorageResult<(PreflightAnswer, Option<LogId>, bool)> {
         self.call(|reply| StateCommand::Preflight {
             client: Box::new(client),
             action: action.map(Box::new),

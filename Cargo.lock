@@ -265,6 +265,7 @@ dependencies = [
  "iroh-docs",
  "iroh-gossip",
  "iroh-tickets",
+ "libc",
  "openraft",
  "portable-pty",
  "redb 4.1.0",

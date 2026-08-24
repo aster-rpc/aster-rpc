@@ -88,10 +88,12 @@ pub(crate) struct AttachedStore {
     pub(crate) group: CoordinationGroupId,
     pub(crate) local: CoordinationNodeId,
     pub(crate) readiness: Readiness,
-    /// Where `state.redb` lives, for the §11.5 host-local pressure gate.
-    pub(crate) state_db: std::path::PathBuf,
     /// The bounded operational counters (§14).
     pub(crate) metrics: Arc<StoreMetrics>,
+    /// The §11.5 tiers, maintained by the runtime's pressure monitor.
+    pub(crate) pressure: Arc<PressureState>,
+    /// The §12.2 per-actor admission state.
+    pub(crate) buckets: Arc<Buckets>,
 }
 
 /// Bounded Store counters (§14): what the service did, never what it carried.
@@ -117,34 +119,158 @@ pub struct StoreMetrics {
 }
 
 impl StoreMetrics {
-    fn bump(counter: &std::sync::atomic::AtomicU64) {
+    pub(crate) fn bump(counter: &std::sync::atomic::AtomicU64) {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// §11.5's first tier: at the state-database high-water mark, growth-class
-/// mutations are refused pre-proposal with a status (§10 stage 4 — after
-/// session resolution) while reads and safety-reducing operations continue.
-///
-/// The free-space tier below it needs a platform free-space API the crate does
-/// not carry (the dependency gate excludes the fs2/fs4 family); the evidence
-/// ledger records that half as host-integration work rather than claiming it.
-fn growth_pressure(runtime: &AttachedStore) -> bool {
-    growth_pressure_at(
-        &runtime.state_db,
-        crate::coordination::model::limits::LOCAL_HIGH_WATER,
-    )
+/// The §11.5 tiers, maintained by the runtime's pressure monitor and read on
+/// the admission path. Host-local; never consulted by apply.
+#[derive(Debug, Default)]
+pub(crate) struct PressureState {
+    /// Tier one: the state database is at its high-water mark. Growth-class
+    /// mutations and new-session creation are refused; reads and
+    /// safety-reducing operations continue.
+    pub(crate) growth: std::sync::atomic::AtomicBool,
+    /// Tier two: free space is below the larger of 1 GiB or twice the latest
+    /// snapshot. **All** new Store mutations are refused and the runtime is
+    /// marked draining so operators (and `wait_ready` callers) see it.
+    pub(crate) hard: std::sync::atomic::AtomicBool,
+    /// Test-seam overrides, OR'd into the tiers. Set only by the
+    /// `coordination-testing` seam; the monitor never touches them, so a
+    /// forced tier survives the next sampling pass.
+    pub(crate) force_growth: std::sync::atomic::AtomicBool,
+    pub(crate) force_hard: std::sync::atomic::AtomicBool,
 }
 
-/// The tier-one predicate with its threshold explicit, so a test can prove
-/// the comparison without manufacturing a 384 MiB database.
-fn growth_pressure_at(state_db: &std::path::Path, high_water: u64) -> bool {
-    std::fs::metadata(state_db)
-        .map(|meta| meta.len() >= high_water)
-        .unwrap_or(false)
+impl PressureState {
+    fn growth_hit(&self) -> bool {
+        self.growth.load(std::sync::atomic::Ordering::Relaxed)
+            || self.force_growth.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn hard_hit(&self) -> bool {
+        self.hard.load(std::sync::atomic::Ordering::Relaxed)
+            || self.force_hard.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
-/// Which decoded mutations the §11.5 growth tier refuses.
+/// One refill-on-read token bucket (§12.2).
+#[derive(Debug, Clone, Copy)]
+struct TokenBucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl TokenBucket {
+    fn new(burst: f64) -> Self {
+        Self {
+            tokens: burst,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Refill at `rate`/s up to `burst`, then try to take one token.
+    fn take(&mut self, rate: f64, burst: f64) -> bool {
+        let now = std::time::Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * rate).min(burst);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a take would currently succeed, without consuming.
+    fn would_take(&mut self, rate: f64, burst: f64) -> bool {
+        let now = std::time::Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * rate).min(burst);
+        self.last = now;
+        self.tokens >= 1.0
+    }
+}
+
+/// §12.2's per-actor admission state: in-flight calls, the mutating-request
+/// bucket (20/s, burst 40) and the denied-request bucket (10/s, burst 20),
+/// bounded to [`MAX_TRACKED_ACTORS`] actors with least-recently-touched
+/// eviction so a rotating flood of identities cannot grow the table.
+#[derive(Debug)]
+struct ActorAdmission {
+    in_flight: u32,
+    mutate: TokenBucket,
+    denied: TokenBucket,
+    touched: std::time::Instant,
+}
+
+const MAX_TRACKED_ACTORS: usize = 1024;
+const MAX_IN_FLIGHT_PER_ACTOR: u32 = 32;
+const MAX_IN_FLIGHT_PER_GROUP: u64 = 256;
+const MUTATE_RATE: f64 = 20.0;
+const MUTATE_BURST: f64 = 40.0;
+const DENIED_RATE: f64 = 10.0;
+const DENIED_BURST: f64 = 20.0;
+
+#[derive(Debug, Default)]
+pub(crate) struct Buckets {
+    actors: std::sync::Mutex<std::collections::HashMap<[u8; 32], ActorAdmission>>,
+}
+
+impl Buckets {
+    fn with<T>(&self, actor: &[u8; 32], run: impl FnOnce(&mut ActorAdmission) -> T) -> T {
+        let mut actors = self.actors.lock().expect("the admission table");
+        if !actors.contains_key(actor) && actors.len() >= MAX_TRACKED_ACTORS {
+            if let Some(oldest) = actors
+                .iter()
+                .min_by_key(|(_, a)| a.touched)
+                .map(|(k, _)| *k)
+            {
+                actors.remove(&oldest);
+            }
+        }
+        let entry = actors.entry(*actor).or_insert_with(|| ActorAdmission {
+            in_flight: 0,
+            mutate: TokenBucket::new(MUTATE_BURST),
+            denied: TokenBucket::new(DENIED_BURST),
+            touched: std::time::Instant::now(),
+        });
+        entry.touched = std::time::Instant::now();
+        run(entry)
+    }
+
+    fn enter(&self, actor: &[u8; 32]) -> bool {
+        self.with(actor, |a| {
+            if a.in_flight >= MAX_IN_FLIGHT_PER_ACTOR {
+                false
+            } else {
+                a.in_flight += 1;
+                true
+            }
+        })
+    }
+
+    fn leave(&self, actor: &[u8; 32]) {
+        self.with(actor, |a| a.in_flight = a.in_flight.saturating_sub(1));
+    }
+
+    fn take_mutate(&self, actor: &[u8; 32]) -> bool {
+        self.with(actor, |a| a.mutate.take(MUTATE_RATE, MUTATE_BURST))
+    }
+
+    fn note_denied(&self, actor: &[u8; 32]) {
+        self.with(actor, |a| {
+            let _ = a.denied.take(DENIED_RATE, DENIED_BURST);
+        });
+    }
+
+    fn denied_exhausted(&self, actor: &[u8; 32]) -> bool {
+        self.with(actor, |a| !a.denied.would_take(DENIED_RATE, DENIED_BURST))
+    }
+}
+
+/// Which decoded mutations the §11.5 growth tier refuses. Both tiers
+/// themselves live on [`PressureState`], published by the runtime's
+/// [`pressure`](crate::coordination::runtime::pressure) monitor.
 ///
 /// Method identity is not enough: `set_grant` removing rights and `set_admin`
 /// disabling a row are the ACL *removals* §11.5 keeps available, while the
@@ -156,7 +282,10 @@ fn is_growth_mutation(action: &ActionV1) -> bool {
         ActionV1::Acquire(_) => true,
         ActionV1::CompareAndSet(_) => true,
         ActionV1::ReleaseWithValue(_) => true,
-        ActionV1::ChangeMembership(_) => true,
+        // A membership change only grows state when it admits somebody new;
+        // a cleanup plan (shrink, or reshuffle of already-admitted peers)
+        // carries no seeds and must stay possible under pressure.
+        ActionV1::ChangeMembership(change) => !change.member_seeds.is_empty(),
         ActionV1::SetGrant(grant) => grant.rights != 0,
         ActionV1::SetAdmin(admin) => admin.enabled,
         // Safety-reducing or size-preserving: release, revoke, cancel.
@@ -205,6 +334,31 @@ impl InFlight {
     fn enter(counter: &Arc<std::sync::atomic::AtomicU64>) -> Self {
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self(Arc::clone(counter))
+    }
+}
+
+/// The per-actor §12.2 in-flight slot, held for the life of one call.
+struct ActorInFlight {
+    buckets: Arc<Buckets>,
+    actor: [u8; 32],
+}
+
+impl ActorInFlight {
+    fn enter(runtime: &AttachedStore, actor: [u8; 32]) -> Option<Self> {
+        if runtime.buckets.enter(&actor) {
+            Some(Self {
+                buckets: Arc::clone(&runtime.buckets),
+                actor,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ActorInFlight {
+    fn drop(&mut self) {
+        self.buckets.leave(&self.actor);
     }
 }
 
@@ -267,6 +421,23 @@ impl ServiceDispatch for CoordinationStoreService {
         // cloned the runtime: any call that will serve is counted first, and
         // a call that finds no attachment drops its count on refusal.
         let _in_flight = InFlight::enter(&self.endpoint.in_flight);
+        // §12.2: at most 256 Store calls in flight per group, counted by the
+        // same counter drain waits on, checked after our own increment so
+        // concurrent entries cannot all read the pre-increment value.
+        if self
+            .endpoint
+            .in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > MAX_IN_FLIGHT_PER_GROUP
+        {
+            let _ = call
+                .finish(&RpcStatus::error(
+                    StatusCode::ResourceExhausted,
+                    "the group's in-flight admission ceiling is reached; retry later",
+                ))
+                .await;
+            return;
+        }
         let Some(runtime) = self.endpoint.attached().await else {
             let _ = call.finish(&not_yet_serving()).await;
             return;
@@ -442,6 +613,35 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
             .await;
         return;
     };
+
+    // §12.2, before any barrier or storage work: at most 32 calls in flight
+    // per actor, and an actor whose denied-request bucket is dry has its
+    // *reads* short-circuited here. Mutations are exempt from the
+    // short-circuit on purpose — a mutation must always reach session
+    // resolution so a saved result can replay; its own bucket sits on the
+    // propose path instead.
+    let Some(_actor_slot) = ActorInFlight::enter(runtime, actor) else {
+        let _ = call
+            .finish(&RpcStatus::error(
+                StatusCode::ResourceExhausted,
+                "the actor's in-flight admission ceiling is reached; retry later",
+            ))
+            .await;
+        return;
+    };
+    let mutating = matches!(
+        spec.class,
+        Class::SequencedMutation | Class::SessionlessMutation
+    );
+    if !mutating && runtime.buckets.denied_exhausted(&actor) {
+        let _ = call
+            .finish(&RpcStatus::error(
+                StatusCode::ResourceExhausted,
+                "the actor's denied-request budget is exhausted; retry later",
+            ))
+            .await;
+        return;
+    }
 
     match (spec.class, method) {
         (Class::SequencedMutation, _) => mutation(runtime, method, actor, &frame, call).await,
@@ -639,7 +839,7 @@ async fn mutation(
         sequence: decoded.prefix.sequence,
         request_hash,
     };
-    let (answer, applied) = match runtime.state.preflight(client, narrowed).await {
+    let (answer, applied, creates_session) = match runtime.state.preflight(client, narrowed).await {
         Ok(result) => result,
         Err(_) => {
             let _ = call
@@ -725,14 +925,34 @@ async fn mutation(
                     RpcStatus::error(StatusCode::InvalidArgument, limit.describe())
                 }
             };
-            let _ = call.finish(&status).await;
+            deny(runtime, &actor, call, status).await;
         }
         // Stage 4 → 5: propose the leader-stamped command and project the
         // exact applied reply. The §11.5 growth pressure gate sits here —
         // after session resolution, with the other host-local stage-4
         // denials — so a saved result is never stranded behind disk pressure.
         Admission::Admit => {
-            if is_growth_mutation(&decoded.wire_action) && growth_pressure(runtime) {
+            // §11.5 tier two: below the free-space floor, *every* new
+            // mutation is refused — applying anything writes.
+            if runtime.pressure.hard_hit() {
+                StoreMetrics::bump(&runtime.metrics.pressure_refusals);
+                StoreMetrics::bump(&runtime.metrics.denied_status);
+                let _ = call
+                    .finish(&RpcStatus::error(
+                        StatusCode::ResourceExhausted,
+                        "free disk space is below the §11.5 floor; this node is draining \
+                         and refuses all new mutations",
+                    ))
+                    .await;
+                return;
+            }
+            // §11.5 tier one: at the state-database high-water mark, refuse
+            // what grows the state — growth-class actions and the creation
+            // of a new session row — while safety-reducing operations from
+            // known sessions continue.
+            if runtime.pressure.growth_hit()
+                && (is_growth_mutation(&decoded.wire_action) || creates_session)
+            {
                 StoreMetrics::bump(&runtime.metrics.pressure_refusals);
                 StoreMetrics::bump(&runtime.metrics.denied_status);
                 let _ = call
@@ -740,6 +960,19 @@ async fn mutation(
                         StatusCode::ResourceExhausted,
                         "the state database is at its §11.5 high-water mark; growth-class \
                          mutations are refused while safety-reducing operations continue",
+                    ))
+                    .await;
+                return;
+            }
+            // §12.2: the mutating-request bucket — after session resolution
+            // so replays of saved results are never throttled, before any
+            // propose.
+            if !runtime.buckets.take_mutate(&actor) {
+                StoreMetrics::bump(&runtime.metrics.denied_status);
+                let _ = call
+                    .finish(&RpcStatus::error(
+                        StatusCode::ResourceExhausted,
+                        "the actor's mutating-request budget is exhausted; retry later",
                     ))
                     .await;
                 return;
@@ -912,12 +1145,16 @@ async fn retire_client(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], c
     match decision {
         // Authorization has no §5.2 reason code pre-proposal: a status.
         retire::Decision::Refuse(RefusalReason::PermissionChanged) => {
-            let _ = call
-                .finish(&RpcStatus::error(
+            deny(
+                runtime,
+                &actor,
+                call,
+                RpcStatus::error(
                     StatusCode::PermissionDenied,
                     "only the session's own actor or a group administrator may retire it",
-                ))
-                .await;
+                ),
+            )
+            .await;
         }
         // The reason-coded refusal — the terminal 18 — is typed, like stage 3.
         retire::Decision::Refuse(refusal) => {
@@ -930,6 +1167,31 @@ async fn retire_client(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], c
             respond_reply(call, reply).await;
         }
         retire::Decision::Apply(_) => {
+            // §11.5 tier two refuses even retirement — it writes. Tier one
+            // does not: retirement shrinks state and §11.5 lists it among
+            // the operations that continue at the high-water mark.
+            if runtime.pressure.hard_hit() {
+                StoreMetrics::bump(&runtime.metrics.pressure_refusals);
+                StoreMetrics::bump(&runtime.metrics.denied_status);
+                let _ = call
+                    .finish(&RpcStatus::error(
+                        StatusCode::ResourceExhausted,
+                        "free disk space is below the §11.5 floor; this node is draining \
+                         and refuses all new mutations",
+                    ))
+                    .await;
+                return;
+            }
+            if !runtime.buckets.take_mutate(&actor) {
+                StoreMetrics::bump(&runtime.metrics.denied_status);
+                let _ = call
+                    .finish(&RpcStatus::error(
+                        StatusCode::ResourceExhausted,
+                        "the actor's mutating-request budget is exhausted; retry later",
+                    ))
+                    .await;
+                return;
+            }
             let group = runtime.group.as_bytes().to_vec();
             let command = CommandV1::RetireClient(RetireClientCommandV1 {
                 actor_node_id: actor.to_vec(),
@@ -1039,22 +1301,25 @@ async fn read_linearizable(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8
         Ok(key) => key,
         Err(status) => return fail(call, status).await,
     };
+    if let Err(status) = check_group(runtime.group.as_bytes(), &request.group_id) {
+        return deny(runtime, &actor, call, status).await;
+    }
     let cut = match read_cut(runtime).await {
         Ok(cut) => cut,
         Err(status) => return fail(call, status).await,
     };
-    if let Err(status) = check_group(&cut.meta.group_id, &request.group_id) {
-        return fail(call, status).await;
-    }
 
     // Authorize at the pinned version: the exact §5.2 permission row —
-    // resource `READ`, with no administrator bypass.
+    // resource `READ`, with no administrator bypass. Per-resource rights
+    // have no published pre-barrier view, so this stays in-transaction.
     let rights = match serve::rights_of(&cut.guarded, &key, &actor) {
         Ok(rights) => rights.unwrap_or(0),
         Err(_) => return fail(call, internal("the ACL does not decode")).await,
     };
     if rights & RIGHT_READ == 0 {
-        return fail(
+        return deny(
+            runtime,
+            &actor,
             call,
             RpcStatus::error(
                 StatusCode::PermissionDenied,
@@ -1094,6 +1359,37 @@ async fn fail(call: Call, status: RpcStatus) {
     let _ = call.finish(&status).await;
 }
 
+/// Finish with a denial the caller earned — permission or argument — and
+/// charge the §12.2 denied-request bucket so a sustained stream of them is
+/// eventually short-circuited at entry before any barrier work.
+async fn deny(runtime: &AttachedStore, actor: &[u8; 32], call: Call, status: RpcStatus) {
+    runtime.buckets.note_denied(actor);
+    let _ = call.finish(&status).await;
+}
+
+/// The cheap pre-barrier administrator gate (§12.2 ordering): consult the
+/// state actor's published [`AdminView`] before paying for a quorum barrier
+/// or a storage transaction.
+///
+/// It only *denies* on the node that currently believes it is the leader,
+/// where the view is republished by the same apply loop the authoritative
+/// transaction reads. On any other node it passes, so a follower still
+/// answers with stage 1's redirect rather than a possibly-stale denial. The
+/// in-transaction [`require_administrator`] remains the decision of record.
+fn cheap_administrator_gate(runtime: &AttachedStore, actor: &[u8; 32]) -> Result<(), RpcStatus> {
+    if runtime.raft.metrics().borrow().current_leader != Some(runtime.local) {
+        return Ok(());
+    }
+    if runtime.state.admin_view().is_administrator(actor) {
+        Ok(())
+    } else {
+        Err(RpcStatus::error(
+            StatusCode::PermissionDenied,
+            "this method requires the group-administrator predicate",
+        ))
+    }
+}
+
 // ── inspect_acl / inspect_admins ────────────────────────────────────────────
 
 async fn inspect_acl(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], call: Call) {
@@ -1108,15 +1404,18 @@ async fn inspect_acl(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], cal
         Ok(key) => key,
         Err(status) => return fail(call, status).await,
     };
+    if let Err(status) = check_group(runtime.group.as_bytes(), &request.group_id) {
+        return deny(runtime, &actor, call, status).await;
+    }
+    if let Err(status) = cheap_administrator_gate(runtime, &actor) {
+        return deny(runtime, &actor, call, status).await;
+    }
     let cut = match read_cut(runtime).await {
         Ok(cut) => cut,
         Err(status) => return fail(call, status).await,
     };
-    if let Err(status) = check_group(&cut.meta.group_id, &request.group_id) {
-        return fail(call, status).await;
-    }
     if let Err(status) = require_administrator(&cut, &actor) {
-        return fail(call, status).await;
+        return deny(runtime, &actor, call, status).await;
     }
 
     let grants = match serve::grants_of(&cut.guarded, &key) {
@@ -1153,15 +1452,18 @@ async fn inspect_admins(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], 
     if request.protocol_version != wire::STORE_PROTOCOL_VERSION {
         return fail(call, invalid(WireInvalid::ProtocolVersion)).await;
     }
+    if let Err(status) = check_group(runtime.group.as_bytes(), &request.group_id) {
+        return deny(runtime, &actor, call, status).await;
+    }
+    if let Err(status) = cheap_administrator_gate(runtime, &actor) {
+        return deny(runtime, &actor, call, status).await;
+    }
     let cut = match read_cut(runtime).await {
         Ok(cut) => cut,
         Err(status) => return fail(call, status).await,
     };
-    if let Err(status) = check_group(&cut.meta.group_id, &request.group_id) {
-        return fail(call, status).await;
-    }
     if let Err(status) = require_administrator(&cut, &actor) {
-        return fail(call, status).await;
+        return deny(runtime, &actor, call, status).await;
     }
     let administrators = match serve::administrators(&cut.guarded) {
         Ok(admins) => admins,
@@ -1200,15 +1502,18 @@ async fn membership_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8
         },
         None => None,
     };
+    if let Err(status) = check_group(runtime.group.as_bytes(), &request.group_id) {
+        return deny(runtime, &actor, call, status).await;
+    }
+    if let Err(status) = cheap_administrator_gate(runtime, &actor) {
+        return deny(runtime, &actor, call, status).await;
+    }
     let cut = match read_cut(runtime).await {
         Ok(cut) => cut,
         Err(status) => return fail(call, status).await,
     };
-    if let Err(status) = check_group(&cut.meta.group_id, &request.group_id) {
-        return fail(call, status).await;
-    }
     if let Err(status) = require_administrator(&cut, &actor) {
-        return fail(call, status).await;
+        return deny(runtime, &actor, call, status).await;
     }
 
     let found = match asked {
@@ -1282,17 +1587,22 @@ async fn probe_client(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
         Ok(id) => id,
         Err(err) => return fail(call, invalid(err)).await,
     };
+    if let Err(status) = check_group(runtime.group.as_bytes(), &request.group_id) {
+        return deny(runtime, &actor, call, status).await;
+    }
+    // §5.2: an actor may probe only its own sessions; an administrator any.
+    if target != actor {
+        if let Err(status) = cheap_administrator_gate(runtime, &actor) {
+            return deny(runtime, &actor, call, status).await;
+        }
+    }
     let cut = match read_cut(runtime).await {
         Ok(cut) => cut,
         Err(status) => return fail(call, status).await,
     };
-    if let Err(status) = check_group(&cut.meta.group_id, &request.group_id) {
-        return fail(call, status).await;
-    }
-    // §5.2: an actor may probe only its own sessions; an administrator any.
     if target != actor {
         if let Err(status) = require_administrator(&cut, &actor) {
-            return fail(call, status).await;
+            return deny(runtime, &actor, call, status).await;
         }
     }
 
@@ -1341,15 +1651,18 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
     if request.protocol_version != wire::STORE_PROTOCOL_VERSION {
         return fail(call, invalid(WireInvalid::ProtocolVersion)).await;
     }
+    if let Err(status) = check_group(runtime.group.as_bytes(), &request.group_id) {
+        return deny(runtime, &actor, call, status).await;
+    }
+    if let Err(status) = cheap_administrator_gate(runtime, &actor) {
+        return deny(runtime, &actor, call, status).await;
+    }
     let cut = match read_cut(runtime).await {
         Ok(cut) => cut,
         Err(status) => return fail(call, status).await,
     };
-    if let Err(status) = check_group(&cut.meta.group_id, &request.group_id) {
-        return fail(call, status).await;
-    }
     if let Err(status) = require_administrator(&cut, &actor) {
-        return fail(call, status).await;
+        return deny(runtime, &actor, call, status).await;
     }
 
     // Replicated: everything below comes from the one guarded transaction.
@@ -1455,15 +1768,18 @@ async fn audit_stream(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
         },
         None => None,
     };
+    if let Err(status) = check_group(runtime.group.as_bytes(), &request.group_id) {
+        return deny(runtime, &actor, call, status).await;
+    }
+    if let Err(status) = cheap_administrator_gate(runtime, &actor) {
+        return deny(runtime, &actor, call, status).await;
+    }
     let cut = match read_cut(runtime).await {
         Ok(cut) => cut,
         Err(status) => return fail(call, status).await,
     };
-    if let Err(status) = check_group(&cut.meta.group_id, &request.group_id) {
-        return fail(call, status).await;
-    }
     if let Err(status) = require_administrator(&cut, &actor) {
-        return fail(call, status).await;
+        return deny(runtime, &actor, call, status).await;
     }
 
     // §5.2: a request below the retained floor is OUT_OF_RANGE with the floor
@@ -1552,15 +1868,18 @@ async fn recovery_export(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8],
     if request.protocol_version != wire::STORE_PROTOCOL_VERSION {
         return fail(call, invalid(WireInvalid::ProtocolVersion)).await;
     }
+    if let Err(status) = check_group(runtime.group.as_bytes(), &request.group_id) {
+        return deny(runtime, &actor, call, status).await;
+    }
+    if let Err(status) = cheap_administrator_gate(runtime, &actor) {
+        return deny(runtime, &actor, call, status).await;
+    }
     let cut = match read_cut(runtime).await {
         Ok(cut) => cut,
         Err(status) => return fail(call, status).await,
     };
-    if let Err(status) = check_group(&cut.meta.group_id, &request.group_id) {
-        return fail(call, status).await;
-    }
     if let Err(status) = require_administrator(&cut, &actor) {
-        return fail(call, status).await;
+        return deny(runtime, &actor, call, status).await;
     }
 
     // The canonical §13 recovery body, streamed from the same pinned
@@ -1664,12 +1983,17 @@ mod tests {
                 expected_value_revision: 0,
                 final_value: vec![1],
             }),
+            // Admitting somebody new carries a seed and grows the group.
             ActionV1::ChangeMembership(ChangeMembershipActionV1 {
                 operation_id: vec![0; 16],
                 expected_membership_log_id: None,
                 desired_voters: Vec::new(),
                 retained_learners: Vec::new(),
-                member_seeds: Vec::new(),
+                member_seeds: vec![crate::coordination::contract::MemberSeedV1 {
+                    node_id: vec![0xDD; 32],
+                    ticket: String::new(),
+                    signed_join_permit: None,
+                }],
             }),
             ActionV1::SetGrant(SetGrantActionV1 {
                 resource: key(),
@@ -1698,6 +2022,15 @@ mod tests {
                 operation_id: vec![0; 16],
                 expected_phase_code: 1,
             }),
+            // A cleanup plan carries no seeds: shrinking or reshuffling
+            // already-admitted peers must stay possible under pressure.
+            ActionV1::ChangeMembership(ChangeMembershipActionV1 {
+                operation_id: vec![0; 16],
+                expected_membership_log_id: None,
+                desired_voters: Vec::new(),
+                retained_learners: Vec::new(),
+                member_seeds: Vec::new(),
+            }),
             // ACL removal and admin removal free bytes; §11.5 keeps them.
             ActionV1::SetGrant(SetGrantActionV1 {
                 resource: key(),
@@ -1716,6 +2049,68 @@ mod tests {
         }
     }
 
+    /// The refill-on-read bucket: a burst empties, time refills at the rate,
+    /// and `would_take` observes without consuming.
+    #[test]
+    fn the_token_bucket_refills_at_its_rate() {
+        let mut bucket = TokenBucket::new(2.0);
+        assert!(bucket.take(1.0, 2.0));
+        assert!(bucket.take(1.0, 2.0));
+        assert!(!bucket.take(1.0, 2.0));
+        // Refill is driven by the clock; simulate one second of it.
+        bucket.last -= std::time::Duration::from_secs(1);
+        assert!(bucket.would_take(1.0, 2.0));
+        assert!(bucket.take(1.0, 2.0));
+        assert!(!bucket.take(1.0, 2.0));
+        // The burst is a ceiling: a long idle never stores more than it.
+        bucket.last -= std::time::Duration::from_secs(3600);
+        assert!(bucket.take(1.0, 2.0));
+        assert!(bucket.take(1.0, 2.0));
+        assert!(!bucket.take(1.0, 2.0));
+    }
+
+    /// §12.2's per-actor in-flight ceiling: 32 slots, released on leave.
+    #[test]
+    fn the_actor_in_flight_ceiling_is_thirty_two() {
+        let buckets = Buckets::default();
+        let actor = [0xAA; 32];
+        for _ in 0..MAX_IN_FLIGHT_PER_ACTOR {
+            assert!(buckets.enter(&actor));
+        }
+        assert!(!buckets.enter(&actor));
+        buckets.leave(&actor);
+        assert!(buckets.enter(&actor));
+        // Another actor has its own ceiling.
+        assert!(buckets.enter(&[0xBB; 32]));
+    }
+
+    /// The denied bucket starts full — `denied_exhausted` is false until an
+    /// actor has actually earned twenty denials — and drains one per denial.
+    #[test]
+    fn the_denied_bucket_short_circuits_only_after_the_burst() {
+        let buckets = Buckets::default();
+        let actor = [0xAC; 32];
+        assert!(!buckets.denied_exhausted(&actor));
+        for _ in 0..20 {
+            buckets.note_denied(&actor);
+        }
+        assert!(buckets.denied_exhausted(&actor));
+    }
+
+    /// The admission table is bounded: a rotating flood of fresh identities
+    /// evicts the least-recently-touched entry instead of growing the map.
+    #[test]
+    fn the_admission_table_is_bounded_by_eviction() {
+        let buckets = Buckets::default();
+        for i in 0..(MAX_TRACKED_ACTORS + 64) {
+            let mut actor = [0u8; 32];
+            actor[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert!(buckets.enter(&actor));
+        }
+        let actors = buckets.actors.lock().expect("the admission table");
+        assert_eq!(actors.len(), MAX_TRACKED_ACTORS);
+    }
+
     /// The tier-one predicate compares the database's real size against the
     /// threshold, and answers false for a database it cannot stat rather than
     /// refusing service on a metadata hiccup.
@@ -1724,6 +2119,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let db = dir.path().join("state.redb");
         std::fs::write(&db, vec![0u8; 1024]).expect("write");
+        use crate::coordination::runtime::pressure::growth_pressure_at;
         assert!(!growth_pressure_at(&db, 2048));
         assert!(growth_pressure_at(&db, 1024));
         assert!(growth_pressure_at(&db, 512));

@@ -108,6 +108,32 @@ for label in "coordination-client" "coordination"; do
     pass "direct windows-sys v0.61.2 edge present in the '$label' Windows graph"
 done
 
+# ── 4. No direct libc edge outside the voter feature ────────────────────────
+#
+# libc exists for §11.5's free-space probe (`statvfs`), which only a voter's
+# pressure monitor performs. Same target-resolution caveat as windows-sys: the
+# edge lives under `[target.'cfg(unix)'.dependencies]`, so resolve a Unix
+# triple explicitly rather than trusting the host's.
+UNIX_TARGET=x86_64-unknown-linux-gnu
+unixtree() { tree --target "$UNIX_TARGET" "$@"; }
+
+for label in "default" "coordination-client"; do
+    if [[ "$label" == "default" ]]; then
+        out=$(unixtree --depth 1)
+    else
+        out=$(unixtree --depth 1 --no-default-features --features coordination-client)
+    fi
+    if grep -q '\blibc v' <<<"$out"; then
+        fail "aster declares a direct libc dependency in the '$label' Unix graph; it belongs to 'coordination' only"
+    fi
+    pass "no direct libc edge in the '$label' Unix graph"
+done
+
+if ! grep -q '\blibc v' <<<"$(unixtree --depth 1 --no-default-features --features coordination)"; then
+    fail "the 'coordination' Unix graph does not declare the direct libc edge the free-space probe needs"
+fi
+pass "direct libc edge present in the 'coordination' Unix graph"
+
 # The lock is the standard library's, not a crate's. A reintroduced fs2/fs4
 # would compile and pass every other gate while silently adding a supply-chain
 # edge for an operation `std::fs::File::try_lock()` already provides.

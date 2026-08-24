@@ -29,7 +29,13 @@ rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"
 # Verify the direct edges with `cargo tree -p aster --no-default-features
 # --depth 1` and the full feature graph with `-e features`.
 coordination-client = ["rpc", "dep:blake3", "dep:windows-sys"]
-coordination = ["coordination-client", "dep:openraft", "dep:redb", "dep:ed25519-dalek"]
+coordination = [
+    "coordination-client",
+    "dep:openraft",
+    "dep:redb",
+    "dep:ed25519-dalek",
+    "dep:libc",
+]
 # The Slice 3 internal test harness (contract matrix §S3-E, §S3-F). Adds no
 # dependency: it exposes one already-existing production path -- proposing a
 # command through `Raft::client_write` -- so that gate tests can seed accepted
@@ -134,6 +140,10 @@ url = "2"
 # does *not* need it: `std::fs::File::try_lock()` is stable on the pinned
 # toolchain, so v1 adds no `fs2`/`fs4` edge for an operation the standard
 # library provides.
+# The §11.5 free-space tier reads `statvfs` on Unix hosts.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",

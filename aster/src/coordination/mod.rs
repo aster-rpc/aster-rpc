@@ -108,6 +108,9 @@ pub struct Coordination {
     /// The state actor, for reads the Raft metrics cannot answer.
     #[cfg(feature = "coordination-testing")]
     state: storage::machine::StateHandle,
+    /// The §11.5 tiers, so a gate can force them without filling a disk.
+    #[cfg(feature = "coordination-testing")]
+    pressure: std::sync::Arc<store::host::PressureState>,
 }
 
 #[cfg(feature = "coordination")]
@@ -120,7 +123,23 @@ impl Coordination {
             raft: rt.raft().clone(),
             #[cfg(feature = "coordination-testing")]
             state: rt.state().clone(),
+            #[cfg(feature = "coordination-testing")]
+            pressure: rt.pressure(),
         }
+    }
+
+    /// Force the §11.5 tiers, overriding what the monitor measured.
+    ///
+    /// The override is OR'd with the measured tiers, so forcing `false`
+    /// releases the override rather than masking a genuinely full disk.
+    #[cfg(feature = "coordination-testing")]
+    pub fn set_pressure_for_testing(&self, growth: bool, hard: bool) {
+        self.pressure
+            .force_growth
+            .store(growth, std::sync::atomic::Ordering::Relaxed);
+        self.pressure
+            .force_hard
+            .store(hard, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Wait until this voter is `Ready`.

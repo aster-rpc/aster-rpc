@@ -37,4 +37,5 @@ pub(crate) mod expiry;
 pub(crate) mod lifecycle;
 pub(crate) mod membership;
 pub(crate) mod owner;
+pub(crate) mod pressure;
 pub(crate) mod readiness;

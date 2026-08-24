@@ -219,6 +219,7 @@ where
 const PERMISSION_DENIED: i32 = 7;
 const INVALID_ARGUMENT: i32 = 3;
 const UNAVAILABLE: i32 = 14;
+const RESOURCE_EXHAUSTED: i32 = 8;
 
 fn resource(key: &[u8]) -> ResourceKeyV1 {
     ResourceKeyV1 {
@@ -1499,4 +1500,245 @@ async fn a_never_written_register_reads_as_its_default_value() {
     assert_eq!(read.snapshot.holder, None);
     assert_eq!(read.snapshot.value, Some(Vec::new()));
     assert!(!read.snapshot.value_redacted);
+}
+
+// ── §11.5 pressure tiers and §12.2 admission (the reopen's blocker 6) ───────
+
+/// **The two §11.5 tiers refuse exactly what they claim to refuse.**
+///
+/// Tier one (state-db high-water): growth-class mutations and the creation of
+/// a **new session row** are refused — even when the new session's action is
+/// itself safety-reducing — while renewals from known sessions continue.
+/// Tier two (free-space floor): every new mutation is refused, retirement
+/// included, while linearizable reads keep serving. Clearing the tiers
+/// restores everything, and no refused sequence was consumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pressure_tiers_refuse_growth_then_everything_and_reads_survive() {
+    let h = harness(0xD9).await;
+    let coordination = h._voter.coordination().expect("hosted");
+    let rights = RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW | RIGHT_RELEASE | RIGHT_MUTATE;
+    grant(&h, 1, b"pressured", h.worker.id, rights, 0).await;
+
+    // Two worker sessions exist before any pressure: "wk" holds the register,
+    // "wk3" is a known session created by a renewal.
+    let acquired: MutationReplyWireV1 = call(
+        &h.worker,
+        "acquire",
+        &AcquireRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 1,
+            resource: resource(b"pressured"),
+            ttl_ms: 60_000,
+        },
+    )
+    .await;
+    assert_eq!(
+        acquired.disposition_code, 1,
+        "the acquire commits: {acquired:?}"
+    );
+    let fence = fence_of(acquired.snapshot.as_ref().expect("a snapshot"));
+    let renewed: MutationReplyWireV1 = call(
+        &h.worker,
+        "renew",
+        &RenewRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk3"),
+            sequence: 1,
+            fence: fence.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        renewed.disposition_code, 1,
+        "the renewal commits: {renewed:?}"
+    );
+
+    // ── Tier one: the high-water mark ──
+    coordination.set_pressure_for_testing(true, false);
+
+    // A brand-new client would need a session row. Its action — release with
+    // a valid fence — is safety-reducing, so this refusal is *specifically*
+    // the new-session rule, not the growth-action rule.
+    let (code, message, _) = call_refused(
+        &h.worker,
+        "release",
+        &ReleaseRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk2"),
+            sequence: 1,
+            fence: fence.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        code, RESOURCE_EXHAUSTED,
+        "a new session row is growth under tier one: {message}"
+    );
+    assert!(
+        message.contains("high-water"),
+        "the tier is named: {message}"
+    );
+
+    // A known session's renewal continues at the high-water mark.
+    let renewed: MutationReplyWireV1 = call(
+        &h.worker,
+        "renew",
+        &RenewRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 2,
+            fence: fence.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        renewed.disposition_code, 1,
+        "renewal survives tier one: {renewed:?}"
+    );
+
+    // A known session's growth-class mutation does not.
+    let (code, _, _) = call_refused(
+        &h.worker,
+        "compare_and_set",
+        &CompareAndSetRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 3,
+            fence: fence.clone(),
+            expected_value_revision: 0,
+            new_value: vec![1, 2, 3],
+        },
+    )
+    .await;
+    assert_eq!(code, RESOURCE_EXHAUSTED, "compare_and_set is growth");
+
+    // ── Tier two: the free-space floor ──
+    coordination.set_pressure_for_testing(false, true);
+
+    // The release the high-water mark would have allowed is now refused too.
+    let (code, message, _) = call_refused(
+        &h.worker,
+        "release",
+        &ReleaseRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 3,
+            fence: fence.clone(),
+        },
+    )
+    .await;
+    assert_eq!(code, RESOURCE_EXHAUSTED, "tier two refuses everything");
+    assert!(message.contains("draining"), "the tier is named: {message}");
+
+    // Even retirement, because applying it writes.
+    let (code, _, _) = call_refused(
+        &h.root,
+        "retire_client",
+        &RetireClientRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            target_node_id: h.worker.id.to_vec(),
+            target_client_id: id16(b"wk3").to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(code, RESOURCE_EXHAUSTED, "tier two refuses retirement");
+
+    // Reads keep serving under the floor.
+    let read: ReadReplyWireV1 = call(
+        &h.worker,
+        "read_linearizable",
+        &ReadRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            resource: resource(b"pressured"),
+        },
+    )
+    .await;
+    assert!(read.snapshot.held, "the read serves under tier two");
+
+    // ── Clear: the refused sequences were never consumed ──
+    coordination.set_pressure_for_testing(false, false);
+    let released: MutationReplyWireV1 = call(
+        &h.worker,
+        "release",
+        &ReleaseRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 3,
+            fence,
+        },
+    )
+    .await;
+    assert_eq!(
+        released.disposition_code, 1,
+        "the same sequence commits after: {released:?}"
+    );
+    let retired: RetireClientReplyWireV1 = call(
+        &h.root,
+        "retire_client",
+        &RetireClientRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            target_node_id: h.worker.id.to_vec(),
+            target_client_id: id16(b"wk3").to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        retired.reason_code, 0,
+        "retirement commits after: {retired:?}"
+    );
+}
+
+/// **§12.2's denied-request bucket short-circuits a denial storm at entry.**
+///
+/// A stranger hammering an administrator-only read earns `PERMISSION_DENIED`
+/// until its denied bucket (10/s, burst 20) runs dry; after that the same
+/// request is `RESOURCE_EXHAUSTED` before any barrier or transaction work.
+/// The worker's independent bucket is untouched throughout, and the storm
+/// never smuggles out anything but the two status codes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_denial_storm_is_short_circuited_per_actor() {
+    let h = harness(0xDA).await;
+    let request = AdminStatusRequestV1 {
+        protocol_version: STORE_PROTOCOL_VERSION,
+        group_id: group_of(&h.fixture),
+    };
+    let mut exhausted = false;
+    for attempt in 0..300 {
+        let (code, message, _) = call_refused(&h.stranger, "inspect_admins", &request).await;
+        match code {
+            PERMISSION_DENIED => continue,
+            RESOURCE_EXHAUSTED => {
+                assert!(
+                    message.contains("denied-request"),
+                    "the short-circuit names its bucket: {message}"
+                );
+                assert!(attempt >= 20, "the burst is honoured before the cut-off");
+                exhausted = true;
+                break;
+            }
+            other => panic!("attempt {attempt}: unexpected status {other}: {message}"),
+        }
+    }
+    assert!(
+        exhausted,
+        "300 straight denials never tripped the §12.2 bucket"
+    );
+
+    // Per-actor means per actor: the stranger's storm costs the worker
+    // nothing, and ROOT still reads.
+    let (code, _, _) = call_refused(&h.worker, "inspect_admins", &request).await;
+    assert_eq!(code, PERMISSION_DENIED, "the worker's bucket is its own");
+    let admins: AdminStatusReplyWireV1 = call(&h.root, "inspect_admins", &request).await;
+    assert_eq!(admins.admin_snapshot.administrators.len(), 1);
 }
