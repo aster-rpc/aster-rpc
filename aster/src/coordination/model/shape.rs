@@ -352,6 +352,53 @@ pub fn check_member_seed(ticket_len: usize, join_permit_len: Option<usize>) -> O
     None
 }
 
+/// Validate one member-seed ticket (§9).
+///
+/// Decoded on every voter from the committed command, so the verdict is
+/// replicated rather than taken on a controller's word.
+pub(crate) fn check_seed_ticket(ticket: &[u8], node: &[u8; 32]) -> Result<(), ShapeLimit> {
+    if ticket.is_empty() {
+        return Err(ShapeLimit::MemberSeedTicketEmpty);
+    }
+    let text = std::str::from_utf8(ticket).map_err(|_| ShapeLimit::MemberSeedTicketInvalid)?;
+    let parsed = aster_transport_core::ticket::AsterTicket::from_base58_str(text)
+        .map_err(|_| ShapeLimit::MemberSeedTicketInvalid)?;
+
+    // **Parsing is not canonicity.** The core decoder ignores the header's
+    // unused low bits and other reserved space, so a ticket with a reserved bit
+    // set decodes cleanly to the same value -- which would give one route two
+    // spellings, and put bytes into replicated state that no encoder produces.
+    // Re-encoding and comparing is the check: the writer emits exactly one
+    // encoding of a given value, so equality proves the input was that one.
+    //
+    // Done here rather than by tightening the core decoder: that decoder is
+    // shared with every existing ticket consumer, and changing what it accepts
+    // is a far wider change than this rule needs. A stricter rule at the point
+    // where bytes enter replicated state is both narrower and stronger.
+    let canonical = parsed
+        .to_base58_string()
+        .map_err(|_| ShapeLimit::MemberSeedTicketInvalid)?;
+    if canonical != text {
+        return Err(ShapeLimit::MemberSeedTicketNonCanonical);
+    }
+
+    // Open only: a route row is replicated group state that every voter and
+    // every future snapshot reader holds, so a credential in it is a secret
+    // distributed to everyone who can read the group.
+    if !matches!(
+        parsed.credential,
+        None | Some(aster_transport_core::ticket::TicketCredential::Open)
+    ) {
+        return Err(ShapeLimit::MemberSeedTicketCredential);
+    }
+    // The ticket must be for the node it seeds. Without this a plan may add
+    // node A while installing a route that dials node B.
+    if &parsed.endpoint_id != node {
+        return Err(ShapeLimit::MemberSeedTicketNode);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

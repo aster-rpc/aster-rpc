@@ -25,10 +25,12 @@
 //! application-side processing additionally requires the application to make
 //! its durable handling and its acknowledgement atomic, which only it can do.
 
-pub(crate) mod driver;
+mod driver;
 pub(crate) mod engine;
 pub mod journal;
 pub mod lease;
+pub mod manager;
+pub mod placement;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

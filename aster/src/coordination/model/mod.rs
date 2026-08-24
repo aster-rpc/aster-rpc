@@ -45,7 +45,10 @@ pub mod project;
 pub mod resource;
 #[cfg(feature = "coordination")]
 pub mod retire;
-#[cfg(feature = "coordination")]
+/// §12.1 request-shape limits and the seed-ticket canonicity rule are, like
+/// `limits`, **contract** facts the client validates against before sending
+/// — the §7.7 placement planner runs them in the `coordination-client`
+/// graph. Every transition that consumes them stays voter-only.
 pub mod shape;
 #[cfg(feature = "coordination")]
 pub mod state;

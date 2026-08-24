@@ -117,6 +117,70 @@ impl Topology {
             .await?
             .separated(a.as_str(), b.as_str()))
     }
+
+    /// One immutable topology observation (§7.7).
+    ///
+    /// Every method of the returned [`TopologySnapshot`] answers from the
+    /// **same** derived view. Calling [`clusters`](Self::clusters) and
+    /// [`separated`](Self::separated) separately may combine two different
+    /// eventual views; a consumer making a placement-grade decision must
+    /// take one snapshot and ask it everything.
+    pub async fn snapshot(&self) -> Result<TopologySnapshot> {
+        Ok(TopologySnapshot {
+            view: self.swarm()?.view().await?,
+        })
+    }
+}
+
+/// An immutable, clone-cheap topology observation: one derived shared view,
+/// captured once, answering every question from that one value. It is local
+/// evidence — never serialized, replicated, or treated as proof of policy.
+#[derive(Clone)]
+pub struct TopologySnapshot {
+    view: Arc<aster_transport_core::CoreTopoSharedView>,
+}
+
+impl TopologySnapshot {
+    /// Wrap an explicit view — for harnesses that need a deterministic
+    /// topology without running a swarm. Production code reaches a snapshot
+    /// only through [`Topology::snapshot`].
+    pub fn from_view(view: Arc<aster_transport_core::CoreTopoSharedView>) -> Self {
+        Self { view }
+    }
+
+    /// The derived clusters of this one view.
+    pub fn clusters(&self) -> &[ClusterView] {
+        &self.view.clusters
+    }
+
+    /// The cluster containing `node` in this one view.
+    pub fn cluster_of(&self, node: &NodeId) -> Option<&ClusterView> {
+        self.view.cluster_of(node.as_str())
+    }
+
+    /// The index of the cluster containing the node with this hex id, in
+    /// this one view. `None` when the node is not a live vertex.
+    pub fn cluster_index_of_hex(&self, node_hex: &str) -> Option<usize> {
+        self.view
+            .clusters
+            .iter()
+            .position(|c| c.members.iter().any(|m| m == node_hex))
+    }
+
+    /// Whether the node with this hex id is a live vertex of this view.
+    pub fn contains_hex(&self, node_hex: &str) -> bool {
+        self.cluster_index_of_hex(node_hex).is_some()
+    }
+
+    /// Separation verdict between two nodes, from this one view.
+    pub fn separated(&self, a: &NodeId, b: &NodeId) -> SeparationVerdict {
+        self.view.separated(a.as_str(), b.as_str())
+    }
+
+    /// Separation verdict by hex ids, from this one view.
+    pub fn separated_hex(&self, a: &str, b: &str) -> SeparationVerdict {
+        self.view.separated(a, b)
+    }
 }
 
 /// Options for [`Topology::enable_shared`].

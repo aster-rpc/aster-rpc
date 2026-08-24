@@ -151,6 +151,36 @@ pub struct SharedView {
 }
 
 impl SharedView {
+    /// Assemble a view directly from its parts.
+    ///
+    /// For embedders and test harnesses that need a deterministic view
+    /// without running a swarm — the placement planner's gate builds its
+    /// topologies this way. The derived index is computed here exactly as
+    /// the deriver computes it, so a synthetic view answers `cluster_of`
+    /// and `separated` by the same rules as a live one.
+    pub fn from_parts(
+        clusters: Vec<CoreClusterView>,
+        far_pairs: Vec<(String, String)>,
+        separation_coverage: usize,
+    ) -> Self {
+        let mut cluster_of = HashMap::new();
+        for (index, cluster) in clusters.iter().enumerate() {
+            for member in &cluster.members {
+                cluster_of.insert(member.clone(), index);
+            }
+        }
+        Self {
+            clusters,
+            dropped: 0,
+            cluster_of,
+            far_pairs: far_pairs
+                .into_iter()
+                .map(|(a, b)| ordered(&a, &b))
+                .collect(),
+            separation_coverage,
+        }
+    }
+
     pub fn cluster_of(&self, node_hex: &str) -> Option<&CoreClusterView> {
         self.cluster_of.get(node_hex).map(|i| &self.clusters[*i])
     }
