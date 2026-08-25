@@ -656,7 +656,7 @@ enum Deformation {
     /// A perfect snapshot about some other resource.
     WrongResource,
     /// `held: true` with no holder — a self-contradiction.
-    HeldWithoutHolder,
+    HolderWithoutHeld,
     /// A success wearing a terminal refusal reason.
     TerminalReasonOnSuccess,
 }
@@ -764,9 +764,12 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                             };
                         }
                     }
-                    Deformation::HeldWithoutHolder => {
+                    Deformation::HolderWithoutHeld => {
+                        // The holder is still this client — the grant-holder
+                        // fact passes — but the held flag contradicts it, so
+                        // only the coherence check can refuse this shape.
                         if let Some(s) = snapshot.as_mut() {
-                            s.holder = None;
+                            s.held = false;
                         }
                     }
                     Deformation::TerminalReasonOnSuccess => reason_code = 24,
@@ -940,7 +943,7 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
             "a snapshot about another resource",
         ),
         (
-            Deformation::HeldWithoutHolder,
+            Deformation::HolderWithoutHeld,
             "a held register with no holder",
         ),
         (
