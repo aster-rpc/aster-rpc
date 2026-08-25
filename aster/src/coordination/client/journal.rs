@@ -1106,18 +1106,35 @@ mod tests {
         let path = dir.path().join(RECORD);
         let pristine = std::fs::read(&path).expect("the record reads");
 
-        // A flipped byte in the payload half.
+        // A flipped byte **inside a field's value bytes** — the exact request
+        // frame the journal exists to resend verbatim. The mutated record is
+        // still structurally valid fory (a decoder-caught flip would let a
+        // checksumless envelope pass this gate), so the checksum is the only
+        // line that can catch it — which is precisely the §10 claim.
+        let at = pristine
+            .windows(5)
+            .position(|w| w == b"exact")
+            .expect("the pending request bytes are in the file");
         let mut flipped = pristine.clone();
-        let last = flipped.len() - 1;
-        flipped[last] ^= 0x01;
+        flipped[at] ^= 0x01;
         std::fs::write(&path, &flipped).expect("write");
         let refused = Journal::open(dir.path(), ACTOR, group(), CLIENT_A);
-        assert!(refused.is_err(), "a flipped byte must fail the checksum");
+        assert!(
+            refused.is_err(),
+            "a flipped value byte must fail the checksum"
+        );
         assert_eq!(
             std::fs::read(&path).expect("still there"),
             flipped,
             "fail closed means the corrupt file is refused, not rewritten"
         );
+
+        // And a flipped final byte, whatever structure it lands in.
+        let mut flipped_tail = pristine.clone();
+        let last = flipped_tail.len() - 1;
+        flipped_tail[last] ^= 0x01;
+        std::fs::write(&path, &flipped_tail).expect("write");
+        assert!(Journal::open(dir.path(), ACTOR, group(), CLIENT_A).is_err());
 
         // Truncation.
         std::fs::write(&path, &pristine[..pristine.len() / 2]).expect("write");
