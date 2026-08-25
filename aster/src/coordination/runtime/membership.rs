@@ -1668,10 +1668,14 @@ mod tests {
             .expect("the loop is followed by IDLE_POLL");
         let body = &production[at..at + body_end];
         let rechecks = body.matches("still_leading(").count();
-        assert!(
-            rechecks >= 6,
-            "all six side-effecting arms must recheck still_leading before \
-             their side effect; found {rechecks}"
+        // Exactly seven: the per-pass check plus one in each of the six
+        // side-effecting arms. Exact rather than a floor — the mutation
+        // campaign proved a `>= 6` floor vacuous, because removing one arm's
+        // recheck still left six.
+        assert_eq!(
+            rechecks, 7,
+            "the pass check and all six side-effecting arms must recheck \
+             still_leading; found {rechecks}"
         );
     }
 

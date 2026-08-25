@@ -1318,6 +1318,28 @@ mod tests {
                 .expect("encodes");
         refuses(&record, "a non-terminal refusal cannot open the corridor");
 
+        // And a **consumed** reply wearing a terminal reason: the corridor
+        // opener must be a `NotConsumed` disposition, not merely a terminal
+        // reason code. (The mutation campaign found the earlier gate blind
+        // to this spelling.)
+        let mut record = base(JournalState::Closing);
+        let consumed = crate::coordination::store::wire::MutationReplyWireV1 {
+            protocol_version: crate::coordination::store::wire::STORE_PROTOCOL_VERSION,
+            group_id: group().as_bytes().to_vec(),
+            client_id: CLIENT_A.to_vec(),
+            sequence: 1,
+            request_hash: HASH.to_vec(),
+            disposition_code: 1,
+            outcome_code: 1,
+            reason_code: 24,
+            ..Default::default()
+        };
+        record.terminal_refusal =
+            payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
+                .serialize(&consumed)
+                .expect("encodes");
+        refuses(&record, "a consumed reply cannot open the corridor");
+
         // Ready with entry residue.
         let mut record = base(JournalState::Ready);
         record.resolved_reply = reply_bytes_for(CLIENT_A, 1, HASH, 3);
