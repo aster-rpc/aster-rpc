@@ -49,9 +49,7 @@ branch = "upgrade/iroh-v1.0.1"
 crates = ["iroh", "iroh-base", "iroh-relay"]
 registry_crates = ["iroh", "iroh-base", "iroh-dns", "iroh-relay"]
 crate_version = "1.0.1"
-registry_bridge_crates = [
-  "iroh-mdns-address-lookup", "iroh-tickets", "iroh-util",
-]
+registry_bridge_crates = ["iroh-mdns-address-lookup", "iroh-tickets"]
 
 [forks.iroh-blobs]
 repo = "https://forge.emrul.dev/Aster/iroh-blobs.git"
@@ -72,6 +70,19 @@ branch = "upgrade/iroh-docs-v0.101"
 crates = ["iroh-docs"]
 registry_crates = ["iroh-docs"]
 crate_version = "0.101.4"
+
+[forks.iroh-util]
+# Promoted from a bridge for the connection-pool deadlock fix; the repo lives
+# on github.com/aster-rpc (forge org repo creation needs an admin token not
+# available to the release tooling — move by flipping this URL when it exists).
+repo = "https://github.com/aster-rpc/iroh-util.git"
+upstream_base = "iroh-util-v0.6.0 (2b5447a)"
+tag = "aster-iroh-util-v0.6.1"
+commit = "fc724bdd39c62e8efc616414e77ba75e75688786"
+branch = "upgrade/iroh-util-v0.6"
+crates = ["iroh-util"]
+registry_crates = ["iroh-util"]
+crate_version = "0.6.1"
 
 [forks.iroh-gossip]
 repo = "https://forge.emrul.dev/Aster/iroh-gossip.git"
@@ -142,12 +153,6 @@ commit = "4899684e1209dea29ed28aa2314450927557b037"
 version = "1.0.0"
 rewrites = ["iroh-base"]
 
-[bridges.iroh-util]
-repo = "https://github.com/n0-computer/iroh-util"
-commit = "2b5447abf79bc0d7c02c202f2cc21f44f42d39fa"
-version = "0.6.0"
-rewrites = ["iroh"]
-
 [bridges.h3-datagram]
 repo = "https://github.com/hyperium/h3"
 commit = "230744a80ad49aa14ae68c4b9698fb6260992dbd"
@@ -200,7 +205,7 @@ netwatch    = { git = "https://github.com/n0-computer/net-tools",      rev = "05
 portmapper  = { git = "https://github.com/n0-computer/net-tools",      rev = "051ab8761006d7f2155e34a49f6bb881b582d5ab" }
 iroh-mdns-address-lookup = { git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
 iroh-tickets = { git = "https://github.com/n0-computer/iroh-tickets",  rev = "4899684e1209dea29ed28aa2314450927557b037" }
-iroh-util    = { git = "https://github.com/n0-computer/iroh-util",     rev = "2b5447abf79bc0d7c02c202f2cc21f44f42d39fa" }
+iroh-util    = { git = "https://github.com/aster-rpc/iroh-util.git",   rev = "fc724bdd39c62e8efc616414e77ba75e75688786" }
 """
 
 # Salvo fork pin block ([patch.crates-io]) — the fork patches h3 / h3-quinn /

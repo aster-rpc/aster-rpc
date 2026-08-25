@@ -62,7 +62,7 @@ netwatch                 = { git = "https://github.com/n0-computer/net-tools",  
 portmapper               = { git = "https://github.com/n0-computer/net-tools",            rev = "051ab8761006d7f2155e34a49f6bb881b582d5ab" }
 iroh-mdns-address-lookup = { git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
 iroh-tickets             = { git = "https://github.com/n0-computer/iroh-tickets",         rev = "4899684e1209dea29ed28aa2314450927557b037" }
-iroh-util                = { git = "https://github.com/n0-computer/iroh-util",            rev = "2b5447abf79bc0d7c02c202f2cc21f44f42d39fa" }
+iroh-util                = { git = "https://github.com/aster-rpc/iroh-util.git",          rev = "fc724bdd39c62e8efc616414e77ba75e75688786" }
 
 # ──────────────────────────────────────────────────────────────────────────
 # Aster Salvo fork (HTTP transport — see docs/_internal/working_ideas/aster-http3-transport.md)
