@@ -108,23 +108,37 @@ impl HistoryLog {
     }
 }
 
-/// Project one §5.2 mutation reply into the checker's observation. The value
-/// is compared only when the reply carries it unredacted.
+/// Project one §5.2 mutation reply into the checker's observation, in full:
+/// every snapshot fact the reply states — epoch, lease revision, value
+/// revision, holdership, **holder identity** and value — is a claim the
+/// model must agree with. The value is compared only when the reply carries
+/// it unredacted.
 fn observe_mutation(reply: &MutationReplyWireV1) -> Observed {
-    let snapshot = reply.snapshot.as_ref();
     Observed {
         outcome_code: reply.outcome_code,
         reason_code: reply.reason_code,
-        epoch: snapshot.map_or(0, |s| s.epoch),
-        value_revision: snapshot.map_or(0, |s| s.value_revision),
-        held: snapshot.is_some_and(|s| s.held),
-        value: snapshot.and_then(|s| {
-            if s.value_redacted {
-                None
-            } else {
-                s.value.clone()
-            }
-        }),
+        snapshot: reply.snapshot.as_ref().map(snapshot_facts),
+    }
+}
+
+/// The full fact set of one wire snapshot.
+fn snapshot_facts(
+    s: &aster::coordination::contract::ResourceSnapshotV1,
+) -> linearize::SnapshotFacts {
+    linearize::SnapshotFacts {
+        epoch: s.epoch,
+        lease_revision: s.lease_revision,
+        value_revision: s.value_revision,
+        held: s.held,
+        holder: s
+            .holder
+            .as_ref()
+            .and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok()),
+        value: if s.value_redacted {
+            None
+        } else {
+            s.value.clone()
+        },
     }
 }
 
@@ -491,7 +505,6 @@ async fn recorded_read(
         let invoked = log.now();
         match client.reads().read_linearizable(resource()).await {
             Ok(reply) => {
-                let snapshot = &reply.snapshot;
                 log.record(Recorded {
                     actor,
                     invoked,
@@ -500,14 +513,7 @@ async fn recorded_read(
                     observed: Some(Observed {
                         outcome_code: 0,
                         reason_code: 0,
-                        epoch: snapshot.epoch,
-                        value_revision: snapshot.value_revision,
-                        held: snapshot.held,
-                        value: if snapshot.value_redacted {
-                            None
-                        } else {
-                            snapshot.value.clone()
-                        },
+                        snapshot: Some(snapshot_facts(&reply.snapshot)),
                     }),
                 });
                 return reply;

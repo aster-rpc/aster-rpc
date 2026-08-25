@@ -115,10 +115,19 @@ pub(crate) async fn run_generation(
             });
             StoreMetrics::bump(&metrics.expire_proposed);
             match raft.client_write(command).await {
-                Ok(_) => {
+                Ok(response) => {
                     // Applied — as an expiry or as a harmless stale rejection;
                     // either way this timer's work is done and the next sweep
-                    // re-reads the row.
+                    // re-reads the row. An actual expiry is §14's client
+                    // self-limit event: the lease reached the TTL its own
+                    // holder chose.
+                    if let crate::coordination::contract::CommandReplyV1::System(system) =
+                        &response.data
+                    {
+                        if system.system_result_code == crate::coordination::contract::SYS_EXPIRED {
+                            StoreMetrics::bump(&metrics.self_limit_expirations);
+                        }
+                    }
                     deadlines.remove(&key);
                 }
                 Err(err) => {

@@ -217,10 +217,12 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// The stored record's own invariants: widths, and the fields each state is
-/// required to hold. A record that fails is refused rather than repaired — a
-/// journal whose `Pending` entry has no bytes cannot resend anything, and
-/// discovering that at the resend site would look like a network fault.
+/// The stored record's own invariants: widths, the fields each state is
+/// required to hold, and — because the record is the resend/redeliver
+/// authority — that every saved reply it claims to hold actually decodes.
+/// A record that fails is refused rather than repaired — a journal whose
+/// `Pending` entry has no bytes cannot resend anything, and discovering that
+/// at the resend site would look like a network fault.
 fn validate_record(record: &ClientJournalV1) -> Result<()> {
     let state = JournalState::from_code(record.state_code)
         .ok_or_else(|| journal_error("the stored state code is unknown"))?;
@@ -251,11 +253,65 @@ fn validate_record(record: &ClientJournalV1) -> Result<()> {
                 "a state carrying an entry must hold the exact request bytes",
             ));
         }
+        if record.pending_method.is_empty() {
+            return Err(journal_error(
+                "a state carrying an entry must name the method its bytes resend to",
+            ));
+        }
     }
-    if state == JournalState::ResolvedAwaitingAck && record.resolved_reply.is_empty() {
-        return Err(journal_error(
-            "a resolved state must hold the exact resolved reply",
-        ));
+    // A decodable saved reply is part of the delivery contract: the bytes in
+    // these fields are what `resume`/`unacknowledged` hand back as typed
+    // replies, so bytes that do not decode are corruption discovered now,
+    // not a decode failure blamed on the network later.
+    let decodes = |bytes: &[u8]| {
+        let decoded: std::result::Result<crate::coordination::store::wire::MutationReplyWireV1, _> =
+            payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
+                .deserialize(bytes);
+        decoded.is_ok()
+    };
+    match state {
+        JournalState::ResolvedAwaitingAck
+            if record.resolved_reply.is_empty() || !decodes(&record.resolved_reply) =>
+        {
+            return Err(journal_error(
+                "a resolved state must hold the exact resolved reply, decodable",
+            ));
+        }
+        JournalState::Closing | JournalState::ReplayAfterRetire
+            if record.terminal_refusal.is_empty() || !decodes(&record.terminal_refusal) =>
+        {
+            return Err(journal_error(
+                "the closing corridor must hold the decodable terminal refusal \
+                 that opened it",
+            ));
+        }
+        _ => {}
+    }
+    // The corridor's own invariant: `retirement_confirmed` is set by exactly
+    // one transition, `Closing` → `ReplayAfterRetire`. A `ReplayAfterRetire`
+    // without it would replay on a client id whose retirement was never
+    // confirmed; a `Closing` with it would skip the confirmation step.
+    match state {
+        JournalState::ReplayAfterRetire if !record.retirement_confirmed => {
+            return Err(journal_error(
+                "ReplayAfterRetire requires a confirmed retirement",
+            ));
+        }
+        JournalState::Closing if record.retirement_confirmed => {
+            return Err(journal_error(
+                "Closing precedes the retirement confirmation, not follows it",
+            ));
+        }
+        JournalState::Ready
+            if !record.pending_method.is_empty()
+                || !record.pending_request.is_empty()
+                || !record.request_hash.is_empty()
+                || !record.resolved_reply.is_empty()
+                || record.retirement_confirmed =>
+        {
+            return Err(journal_error("a Ready record must carry no entry residue"));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -263,6 +319,42 @@ fn validate_record(record: &ClientJournalV1) -> Result<()> {
 const RECORD: &str = "journal.v1";
 const RECORD_TMP: &str = "journal.v1.tmp";
 const LOCK: &str = "LOCK";
+
+/// The on-disk envelope (§10): a magic tag, the BLAKE3 of the encoded record,
+/// then the record. The plan's "records carry format version and checksum"
+/// splits across the two layers — the version lives in the record (so an
+/// unknown newer format is a *versioning* refusal, distinguishable from
+/// damage), and the checksum lives out here where it can vouch for the whole
+/// encoding. A file that fails the magic or the hash is **corruption and
+/// fails closed**: the library never deletes or reinitializes it, because a
+/// lost ambiguous journal is an operator reconciliation decision, not an
+/// automatic retry.
+const ENVELOPE_MAGIC: &[u8; 8] = b"AJRNL1\0\0";
+
+fn envelope(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 32 + bytes.len());
+    out.extend_from_slice(ENVELOPE_MAGIC);
+    out.extend_from_slice(blake3::hash(bytes).as_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+fn open_envelope(file: &[u8]) -> Result<&[u8]> {
+    if file.len() < 8 + 32 || &file[..8] != ENVELOPE_MAGIC {
+        return Err(journal_error(
+            "the stored record is not a journal envelope; refusing to guess (corrupt, \
+             or written by an unknown newer format)",
+        ));
+    }
+    let (claimed, payload) = file[8..].split_at(32);
+    if blake3::hash(payload).as_bytes() != claimed {
+        return Err(journal_error(
+            "the stored record fails its checksum; the journal is corrupt and is \
+             refused, never repaired",
+        ));
+    }
+    Ok(payload)
+}
 
 impl Journal {
     /// Open (or create) the journal for `(actor, group)` in `dir`, taking the
@@ -312,8 +404,9 @@ impl Journal {
         let record = if record_path.exists() {
             let bytes = std::fs::read(&record_path)
                 .map_err(|source| io_error("reading the record", &record_path, source))?;
+            let payload = open_envelope(&bytes)?;
             let record: ClientJournalV1 = payload_fory::<ClientJournalV1>()
-                .deserialize(&bytes)
+                .deserialize(payload)
                 .map_err(|_| journal_error("the stored record does not decode"))?;
             if record.format_version != JOURNAL_FORMAT_VERSION {
                 return Err(journal_error(format!(
@@ -400,9 +493,11 @@ impl Journal {
     /// with the §S4-D rename boundaries named so the crash matrix can stop on
     /// either side of the commit point.
     fn persist(&mut self, record: ClientJournalV1) -> Result<()> {
-        let bytes = payload_fory::<ClientJournalV1>()
-            .serialize(&record)
-            .map_err(|_| journal_error("the record does not encode"))?;
+        let bytes = envelope(
+            &payload_fory::<ClientJournalV1>()
+                .serialize(&record)
+                .map_err(|_| journal_error("the record does not encode"))?,
+        );
         let tmp = self.dir.join(RECORD_TMP);
         let target = self.dir.join(RECORD);
         {
@@ -602,6 +697,7 @@ impl Journal {
         next.request_hash = Vec::new();
         next.resolved_reply = Vec::new();
         next.retirement_confirmed = false;
+        next.terminal_refusal = Vec::new();
         self.persist(next)?;
         self.boundary("after_rotate_fsync")?;
         Ok(())
@@ -672,9 +768,11 @@ fn fsync_dir(_dir: &Path) -> Result<()> {
 /// Write → fsync file → rename → fsync directory. The record is complete-old
 /// or complete-new at every kill point in between.
 fn persist_record(dir: &Path, record: &ClientJournalV1) -> Result<()> {
-    let bytes = payload_fory::<ClientJournalV1>()
-        .serialize(record)
-        .map_err(|_| journal_error("the record does not encode"))?;
+    let bytes = envelope(
+        &payload_fory::<ClientJournalV1>()
+            .serialize(record)
+            .map_err(|_| journal_error("the record does not encode"))?,
+    );
     let tmp = dir.join(RECORD_TMP);
     let target = dir.join(RECORD);
     {
@@ -704,6 +802,19 @@ mod tests {
 
     fn open(dir: &Path) -> Journal {
         Journal::open(dir, ACTOR, group(), CLIENT_A).expect("the journal opens")
+    }
+
+    /// A genuinely decodable `MutationReplyWireV1`, tagged so two replies
+    /// are distinguishable. Validation decodes every saved reply, so the
+    /// tests store what production stores — encoded replies, never labels.
+    fn reply_bytes(tag: u64) -> Vec<u8> {
+        let reply = crate::coordination::store::wire::MutationReplyWireV1 {
+            sequence: tag,
+            ..Default::default()
+        };
+        payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
+            .serialize(&reply)
+            .expect("a reply encodes")
     }
 
     /// The §S4-D transition walk, with a reopen after every persisted step —
@@ -738,15 +849,13 @@ mod tests {
         // Pending → ResolvedAwaitingAck, and the reply survives death.
         {
             let mut journal = open(dir.path());
-            journal
-                .resolve(b"the-exact-reply".to_vec())
-                .expect("resolve");
+            journal.resolve(reply_bytes(1)).expect("resolve");
         }
         {
             let journal = open(dir.path());
             assert_eq!(journal.state(), JournalState::ResolvedAwaitingAck);
             let (reply, _) = journal.unacknowledged().expect("held");
-            assert_eq!(reply, b"the-exact-reply".as_ref());
+            assert_eq!(reply, reply_bytes(1));
         }
 
         // ResolvedAwaitingAck → Ready on acknowledgement; the reply is gone
@@ -777,7 +886,7 @@ mod tests {
                 .begin(1, "set_admin", b"refused-request".to_vec(), [0x44; 32])
                 .expect("begin");
             journal
-                .close_for_retirement(b"the-terminal-24".to_vec())
+                .close_for_retirement(reply_bytes(24))
                 .expect("close");
         }
         {
@@ -786,7 +895,7 @@ mod tests {
             assert!(!journal.record().retirement_confirmed);
             assert_eq!(
                 journal.record().terminal_refusal,
-                b"the-terminal-24",
+                reply_bytes(24),
                 "the refusal that opened the corridor is retained for the resolution"
             );
             assert_eq!(
@@ -810,13 +919,11 @@ mod tests {
         // sequence.
         {
             let mut journal = open(dir.path());
-            let token = journal
-                .resolve(b"replayed-answer".to_vec())
-                .expect("resolve");
+            let token = journal.resolve(reply_bytes(7)).expect("resolve");
             let (reply, redelivered) = journal.unacknowledged().expect("held");
             assert_eq!(
                 reply,
-                b"replayed-answer".as_ref(),
+                reply_bytes(7),
                 "the redelivered result is readable until acknowledged"
             );
             assert_eq!(token, redelivered, "one entry, one token");
@@ -852,10 +959,10 @@ mod tests {
                 .begin(1, "acquire", b"x".to_vec(), [0x55; 32])
                 .expect("begin");
             journal
-                .close_for_retirement(b"the-26".to_vec())
+                .close_for_retirement(reply_bytes(26))
                 .expect("close");
             journal.retirement_confirmed().expect("retired");
-            let token = journal.resolve(b"not-applied".to_vec()).expect("resolve");
+            let token = journal.resolve(reply_bytes(9)).expect("resolve");
             journal.rotate(&token, CLIENT_B).expect("rotate");
         }
         let journal = open(dir.path());
@@ -880,7 +987,7 @@ mod tests {
                 .is_err(),
             "one outstanding request per client id"
         );
-        let token = journal.resolve(b"r".to_vec()).expect("resolve");
+        let token = journal.resolve(reply_bytes(3)).expect("resolve");
         assert!(
             journal
                 .begin(2, "acquire", b"b".to_vec(), [0x67; 32])
@@ -903,14 +1010,14 @@ mod tests {
         journal
             .begin(1, "acquire", b"a".to_vec(), [0x71; 32])
             .expect("begin A");
-        let token_a = journal.resolve(b"result-a".to_vec()).expect("resolve A");
+        let token_a = journal.resolve(reply_bytes(101)).expect("resolve A");
         // Two handles for A exist in the reviewer's scenario; the first one
         // acknowledges.
         journal.acknowledge(&token_a).expect("A acknowledged");
         journal
             .begin(2, "acquire", b"b".to_vec(), [0x72; 32])
             .expect("begin B");
-        let token_b = journal.resolve(b"result-b".to_vec()).expect("resolve B");
+        let token_b = journal.resolve(reply_bytes(102)).expect("resolve B");
         assert!(
             journal.acknowledge(&token_a).is_err(),
             "the surviving A handle must not mark B handled"
@@ -969,6 +1076,134 @@ mod tests {
             journal.persist(record).expect("persist");
         }
         assert!(Journal::open(dir.path(), ACTOR, group(), CLIENT_A).is_err());
+    }
+
+    /// Write `record` to `dir` with a **valid** envelope, bypassing the
+    /// transition rules — the corruption tests' way of minting records no
+    /// healthy transition produces.
+    fn write_raw(dir: &Path, record: &ClientJournalV1) {
+        let bytes = envelope(
+            &payload_fory::<ClientJournalV1>()
+                .serialize(record)
+                .expect("encodes"),
+        );
+        std::fs::write(dir.join(RECORD), bytes).expect("writes");
+    }
+
+    /// §10: "Corruption … fails closed; the library never
+    /// deletes/reinitializes it automatically." One flipped byte anywhere in
+    /// the record fails the checksum; truncation and a non-envelope file are
+    /// refused as corruption too — and the file is left exactly as found.
+    #[test]
+    fn corruption_fails_closed_and_is_never_repaired() {
+        let dir = tempfile::tempdir().expect("a directory");
+        {
+            let mut journal = open(dir.path());
+            journal
+                .begin(1, "acquire", b"exact".to_vec(), [0x21; 32])
+                .expect("begin");
+        }
+        let path = dir.path().join(RECORD);
+        let pristine = std::fs::read(&path).expect("the record reads");
+
+        // A flipped byte in the payload half.
+        let mut flipped = pristine.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x01;
+        std::fs::write(&path, &flipped).expect("write");
+        let refused = Journal::open(dir.path(), ACTOR, group(), CLIENT_A);
+        assert!(refused.is_err(), "a flipped byte must fail the checksum");
+        assert_eq!(
+            std::fs::read(&path).expect("still there"),
+            flipped,
+            "fail closed means the corrupt file is refused, not rewritten"
+        );
+
+        // Truncation.
+        std::fs::write(&path, &pristine[..pristine.len() / 2]).expect("write");
+        assert!(Journal::open(dir.path(), ACTOR, group(), CLIENT_A).is_err());
+
+        // Not an envelope at all — an unknown newer container included.
+        std::fs::write(&path, b"not-a-journal-envelope-at-all-....").expect("write");
+        assert!(Journal::open(dir.path(), ACTOR, group(), CLIENT_A).is_err());
+
+        // The pristine bytes still open: the refusals above were the
+        // envelope's verdicts, not collateral state damage.
+        std::fs::write(&path, &pristine).expect("write");
+        assert!(Journal::open(dir.path(), ACTOR, group(), CLIENT_A).is_ok());
+    }
+
+    /// The state-dependent invariants fail closed at open: a
+    /// `ReplayAfterRetire` without a confirmed retirement, a `Pending` with
+    /// no method to resend to, an undecodable saved reply or terminal
+    /// refusal, and entry residue on a `Ready` record are each refused.
+    #[test]
+    fn invalid_state_combinations_are_refused_at_open() {
+        let base = |state: JournalState| ClientJournalV1 {
+            format_version: JOURNAL_FORMAT_VERSION,
+            group_id: group().as_bytes().to_vec(),
+            actor_node_id: ACTOR.to_vec(),
+            client_id: CLIENT_A.to_vec(),
+            state_code: state.code(),
+            sequence: 1,
+            pending_method: "acquire".to_string(),
+            pending_request: b"exact".to_vec(),
+            request_hash: vec![0x31; 32],
+            resolved_reply: Vec::new(),
+            retirement_confirmed: false,
+            terminal_refusal: Vec::new(),
+        };
+        let refuses = |record: &ClientJournalV1, why: &str| {
+            let dir = tempfile::tempdir().expect("a directory");
+            write_raw(dir.path(), record);
+            assert!(
+                Journal::open(dir.path(), ACTOR, group(), CLIENT_A).is_err(),
+                "{why}"
+            );
+        };
+
+        // ReplayAfterRetire without retirement_confirmed.
+        let mut record = base(JournalState::ReplayAfterRetire);
+        record.terminal_refusal = reply_bytes(24);
+        record.retirement_confirmed = false;
+        refuses(
+            &record,
+            "a replay on an unconfirmed retirement must be refused",
+        );
+
+        // Closing that claims a confirmed retirement.
+        let mut record = base(JournalState::Closing);
+        record.terminal_refusal = reply_bytes(24);
+        record.retirement_confirmed = true;
+        refuses(&record, "Closing precedes confirmation");
+
+        // Pending with an empty method: nothing to resend to.
+        let mut record = base(JournalState::Pending);
+        record.pending_method = String::new();
+        refuses(&record, "a Pending entry with no method cannot resend");
+
+        // A resolved state whose saved reply is not a decodable reply.
+        let mut record = base(JournalState::ResolvedAwaitingAck);
+        record.resolved_reply = b"garbage-not-a-reply".to_vec();
+        refuses(&record, "an undecodable saved reply is corruption");
+
+        // A closing state whose terminal refusal is not decodable.
+        let mut record = base(JournalState::Closing);
+        record.terminal_refusal = b"garbage-not-a-refusal".to_vec();
+        refuses(&record, "an undecodable terminal refusal is corruption");
+
+        // Ready with entry residue.
+        let mut record = base(JournalState::Ready);
+        record.resolved_reply = reply_bytes(3);
+        refuses(&record, "a Ready record must carry no entry residue");
+
+        // And the healthy spellings of the same states still open.
+        let mut record = base(JournalState::ReplayAfterRetire);
+        record.terminal_refusal = reply_bytes(24);
+        record.retirement_confirmed = true;
+        let dir = tempfile::tempdir().expect("a directory");
+        write_raw(dir.path(), &record);
+        assert!(Journal::open(dir.path(), ACTOR, group(), CLIENT_A).is_ok());
     }
 
     /// Owner-only permissions on the directory and every file in it (S4-D).
@@ -1097,16 +1332,16 @@ mod tests {
         journal
             .begin(1, "acquire", b"first".to_vec(), [0x71; 32])
             .expect("begin 1");
-        let token = journal.resolve(b"ok".to_vec()).expect("resolve 1");
+        let token = journal.resolve(reply_bytes(11)).expect("resolve 1");
         journal.acknowledge(&token).expect("ack 1");
         journal
             .begin(2, "set_admin", b"second".to_vec(), [0x72; 32])
             .expect("begin 2");
         journal
-            .close_for_retirement(b"terminal".to_vec())
+            .close_for_retirement(reply_bytes(12))
             .expect("close");
         journal.retirement_confirmed().expect("retired");
-        let token = journal.resolve(b"not-applied".to_vec()).expect("resolve 2");
+        let token = journal.resolve(reply_bytes(13)).expect("resolve 2");
         journal.rotate(&token, CLIENT_B).expect("rotate");
     }
 }

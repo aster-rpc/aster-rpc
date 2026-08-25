@@ -153,6 +153,10 @@ pub struct PlacementReport {
     pub current_learners: Vec<CoordinationNodeId>,
     pub selected_voters: Vec<CoordinationNodeId>,
     pub selected_learners: Vec<CoordinationNodeId>,
+    /// §14: the members whose continuous absence the manager has observed
+    /// for the full replacement grace, as supplied to the planner. Empty on
+    /// the paths where no observation pass ran.
+    pub grace_crossed_members: Vec<CoordinationNodeId>,
     pub separation: Option<SeparationSummary>,
     pub pending_operation_id: Option<[u8; 16]>,
     pub reason: String,
@@ -270,6 +274,23 @@ fn validate_policy(input: &PlacementInput) -> Result<(), String> {
                     "the seed ticket for {} is not the canonical Aster ticket",
                     key.to_hex()
                 ));
+            }
+            // §7.7.1: every supplied/provisioned seed passes the existing
+            // canonical ticket **and permit** validation before the planner
+            // can emit `Plan`. The planner runs the structural half — the
+            // envelope, the canonical document, the shape rules, and the
+            // candidate/ticket bindings; the signature is verified against
+            // the pinned authority key at replicated apply, which a planner
+            // does not hold.
+            if let Some(permit) = &seed.signed_join_permit {
+                if let Err(why) =
+                    crate::coordination::model::shape::check_seed_permit(permit, key.as_bytes())
+                {
+                    return Err(format!(
+                        "the join permit for {} is invalid: {why}",
+                        key.to_hex()
+                    ));
+                }
             }
         }
     }
@@ -560,6 +581,22 @@ pub fn plan(input: &PlacementInput) -> PlacementRecommendation {
             break;
         }
         learners.insert(filler);
+    }
+    // The learner target is policy, not preference: a shortfall the filler
+    // could not close means the required live eligible candidates do not
+    // exist, and reporting `Stable` because roles happen to equal current
+    // roles would report health for an objective that is unmet. (A filled
+    // slot whose candidate merely lacks seed material still flows to the
+    // `NeedsProvisioning` answer below.)
+    if learners.len() < learner_target {
+        return PlacementRecommendation::InsufficientEvidence {
+            missing: format!(
+                "only {} of {} retained-learner slots can be filled by live eligible \
+                 candidates outside the voter set",
+                learners.len(),
+                learner_target
+            ),
+        };
     }
 
     if best.voters == input.current_voters && learners == input.current_learners {

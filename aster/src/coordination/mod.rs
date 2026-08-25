@@ -102,8 +102,8 @@ pub struct Coordination {
     /// consensus snapshot; every mutation path stays behind the RPC service.
     /// Cloning a `Raft` is an `Arc` bump.
     raft: openraft::Raft<typeconfig::CoordinationTypeConfig>,
-    /// The state actor, for reads the Raft metrics cannot answer.
-    #[cfg(feature = "coordination-testing")]
+    /// The state actor, for reads the Raft metrics cannot answer — the §14
+    /// genesis hash and audit floor, and the testing seams.
     state: storage::machine::StateHandle,
     /// The §11.5 tiers and §14 disk gauges.
     pressure: std::sync::Arc<store::host::PressureState>,
@@ -116,7 +116,6 @@ impl Coordination {
             readiness: rt.readiness(),
             store_metrics: rt.store_metrics(),
             raft: rt.raft().clone(),
-            #[cfg(feature = "coordination-testing")]
             state: rt.state().clone(),
             pressure: rt.pressure(),
         }
@@ -126,6 +125,10 @@ impl Coordination {
     ///
     /// The override is OR'd with the measured tiers, so forcing `false`
     /// releases the override rather than masking a genuinely full disk.
+    /// Forcing the **hard** tier is one-way in effect: the monitor's next
+    /// pass latches it and evacuates the runtime, exactly as a genuinely
+    /// full disk would, and withdrawing the force afterwards un-drains
+    /// nothing.
     #[cfg(feature = "coordination-testing")]
     pub fn set_pressure_for_testing(&self, growth: bool, hard: bool) {
         self.pressure
@@ -197,8 +200,10 @@ impl Coordination {
             denied_revision: m.denied_revision.load(Ordering::Relaxed),
             denied_membership: m.denied_membership.load(Ordering::Relaxed),
             denied_admission: m.denied_admission.load(Ordering::Relaxed),
+            denied_rate_limited: m.denied_rate_limited.load(Ordering::Relaxed),
             expire_proposed: m.expire_proposed.load(Ordering::Relaxed),
             expiry_rearms: m.expiry_rearms.load(Ordering::Relaxed),
+            self_limit_expirations: m.self_limit_expirations.load(Ordering::Relaxed),
             leader_changes: m.leader_changes.load(Ordering::Relaxed),
             quorum_losses: m.quorum_losses.load(Ordering::Relaxed),
             command_latency_micros: m.command_latency_micros.load(Ordering::Relaxed),
@@ -225,17 +230,50 @@ impl Coordination {
         }
     }
 
-    /// The §14 consensus snapshot: log positions, leadership, quorum age
-    /// and (on the leader) per-peer replication progress — identifiers and
-    /// indexes only, from `RaftMetrics`, advisory like every local field.
-    pub fn consensus_status(&self) -> ConsensusSnapshot {
+    /// The §14 consensus snapshot: the group's genesis identity, full log
+    /// positions (last/committed/applied), the audit floor, leadership,
+    /// quorum age, learner membership and per-peer replication progress —
+    /// identifiers and indexes only, advisory like every local field.
+    ///
+    /// `async` because two of the §14 facts do not live in `RaftMetrics`:
+    /// the last/committed log ids come from the Raft's own state, and the
+    /// genesis hash and audit floor from the state machine.
+    pub async fn consensus_status(&self) -> ConsensusSnapshot {
         let metrics = self.raft.metrics().borrow().clone();
+        let of = |id: openraft::LogId<ids::CoordinationNodeId>| LogPosition {
+            term: id.leader_id.term,
+            index: id.index,
+        };
+        let last_log = self.raft.data_metrics().borrow().last_log;
+        let committed = self
+            .raft
+            .with_raft_state(|state| state.committed)
+            .await
+            .unwrap_or(None);
+        let voters: std::collections::BTreeSet<ids::CoordinationNodeId> =
+            metrics.membership_config.membership().voter_ids().collect();
+        let learners: Vec<[u8; 32]> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .filter(|(id, _)| !voters.contains(id))
+            .map(|(id, _)| *id.as_bytes())
+            .collect();
+        let observability = self.state.observability().await.ok();
         ConsensusSnapshot {
             leader_node_id: metrics.current_leader.map(|n| *n.as_bytes()),
             term: metrics.vote.leader_id().get_term(),
+            genesis_hash: observability.map(|o| o.genesis_hash),
+            genesis_installed: observability.is_some_and(|o| o.genesis_installed),
+            audit_floor_index: observability.and_then(|o| o.audit_floor_index),
+            last_log: last_log.map(of),
+            committed: committed.map(of),
+            last_applied: metrics.last_applied.map(of),
             last_log_index: metrics.last_log_index,
             last_applied_index: metrics.last_applied.map(|id| id.index),
+            snapshot_index: metrics.snapshot.map(|id| id.index),
             millis_since_quorum_ack: metrics.millis_since_quorum_ack,
+            learners,
             replication: metrics
                 .replication
                 .map(|peers| {
@@ -263,17 +301,46 @@ pub struct DiskStatusSnapshot {
     pub free_space_pressure: bool,
 }
 
-/// One sample of the §14 consensus facts (advisory, from `RaftMetrics`).
+/// One log position: the §14 "id" spelling — term and index — without the
+/// leader NodeId (which `leader_node_id` and `replication` already carry).
+#[cfg(feature = "coordination")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogPosition {
+    pub term: u64,
+    pub index: u64,
+}
+
+/// One sample of the §14 consensus facts (advisory; from `RaftMetrics`, the
+/// Raft state, and the state machine's own bounded facts).
 #[cfg(feature = "coordination")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConsensusSnapshot {
     pub leader_node_id: Option<[u8; 32]>,
     pub term: u64,
+    /// The group's genesis hash, from the bound authority; `None` only when
+    /// the state actor is unreachable (fatal or shutting down).
+    pub genesis_hash: Option<[u8; 32]>,
+    /// Whether the committed genesis has been applied on this voter.
+    pub genesis_installed: bool,
+    /// The lowest retained audit row's log index; `None` before any pruning
+    /// (the full history is retained) or when the state actor is unreachable.
+    pub audit_floor_index: Option<u64>,
+    /// The last appended, committed and applied log ids in full.
+    pub last_log: Option<LogPosition>,
+    pub committed: Option<LogPosition>,
+    pub last_applied: Option<LogPosition>,
     pub last_log_index: Option<u64>,
     pub last_applied_index: Option<u64>,
+    /// The last snapshot's log index — the floor a lagging learner restores
+    /// from.
+    pub snapshot_index: Option<u64>,
     pub millis_since_quorum_ack: Option<u64>,
+    /// The committed membership's learners. Paired with `replication`, this
+    /// is the §14 learner-progress witness: a learner's matched index
+    /// against `last_log_index`.
+    pub learners: Vec<[u8; 32]>,
     /// Leader only: per-peer matched log index — the replication lag
-    /// witness. Empty on followers.
+    /// witness for voters and learners alike. Empty on followers.
     pub replication: Vec<([u8; 32], Option<u64>)>,
 }
 
@@ -307,9 +374,14 @@ pub struct StoreMetricsSnapshot {
     pub denied_revision: u64,
     pub denied_membership: u64,
     pub denied_admission: u64,
+    /// §14's rate-limit split of `denied_admission`: the two token buckets
+    /// alone.
+    pub denied_rate_limited: u64,
     // §14: the §9.2 expiry loop.
     pub expire_proposed: u64,
     pub expiry_rearms: u64,
+    /// Expiries that applied: leases that reached their holder's own TTL.
+    pub self_limit_expirations: u64,
     // §14: consensus transitions.
     pub leader_changes: u64,
     pub quorum_losses: u64,

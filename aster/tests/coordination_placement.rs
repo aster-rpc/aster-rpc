@@ -81,9 +81,45 @@ fn snapshot(
     TopologySnapshot::from_view(Arc::new(CoreTopoSharedView::from_parts(views, pairs, 1)))
 }
 
-/// A seed whose ticket is canonical and whose permit is present (the pure
-/// planner validates ticket canonicity and permit presence; signatures are
-/// the replicated apply's to verify).
+/// A structurally valid signed-permit envelope for `id`: canonical inner
+/// document, correct widths, candidate/ticket bindings — everything the
+/// planner's §7.7.1 structural validation checks. The signature bytes are
+/// arbitrary, because verifying them needs the pinned authority key only
+/// the replicated apply holds.
+fn structural_permit(id: CoordinationNodeId) -> Vec<u8> {
+    use aster::coordination::contract::payload_fory;
+    use aster::coordination::raft::{JoinPermitV1, NodeIdV1, SignedCoordinationDocumentV1};
+    let permit = JoinPermitV1 {
+        format_version: 1,
+        group_id: group().as_bytes().to_vec(),
+        authority_domain: "placement.test".to_string(),
+        genesis_hash: vec![0x55; 32],
+        candidate_node_id: id.as_bytes().to_vec(),
+        candidate_ticket: aster::coordination::model::authority::canonical_candidate_ticket(
+            id.as_bytes(),
+        )
+        .expect("canonical"),
+        bootstrap_senders: vec![NodeIdV1 {
+            node_id: vec![0x01; 32],
+        }],
+        join_nonce: vec![0x66; 32],
+    };
+    let document_bytes = payload_fory::<JoinPermitV1>()
+        .serialize(&permit)
+        .expect("the permit encodes");
+    payload_fory::<SignedCoordinationDocumentV1>()
+        .serialize(&SignedCoordinationDocumentV1 {
+            format_version: 1,
+            document_bytes,
+            authority_public_key: vec![0x11; 32],
+            signature: vec![0x22; 64],
+        })
+        .expect("the envelope encodes")
+}
+
+/// A seed whose ticket is canonical and whose permit passes the planner's
+/// structural validation (the signature itself is the replicated apply's to
+/// verify).
 fn seeded(id: CoordinationNodeId) -> PlacementCandidate {
     PlacementCandidate {
         node_id: id,
@@ -93,7 +129,7 @@ fn seeded(id: CoordinationNodeId) -> PlacementCandidate {
                 id.as_bytes(),
             )
             .expect("canonical"),
-            signed_join_permit: Some(vec![1, 2, 3]),
+            signed_join_permit: Some(structural_permit(id)),
         }),
     }
 }
@@ -612,6 +648,108 @@ fn a_cardinality_shortfall_names_the_missing_fact() {
     }
 }
 
+/// **An unfillable retained-learner target is never `Stable`** (closure
+/// item 4). With roles equal to current roles and no live eligible
+/// candidate outside the voter set, the old planner reported health for an
+/// unmet policy objective; the target is policy, and the shortfall is
+/// `InsufficientEvidence`. A live eligible candidate that merely lacks seed
+/// material fills the slot and flows to `NeedsProvisioning` instead.
+#[test]
+fn an_unfillable_learner_target_is_insufficient_evidence() {
+    let (a, b, c, d) = (node(1), node(2), node(3), node(4));
+    let learner_policy = |eligible: Vec<PlacementCandidate>| {
+        let mut p = policy(eligible, 3, 0, false);
+        p.target_retained_learners = 1;
+        p
+    };
+
+    // Every eligible node is a voter: no learner candidate exists at all.
+    match plan(&input(
+        &[a, b, c],
+        learner_policy(vec![seeded(a), seeded(b), seeded(c)]),
+        snapshot(&[&[a, b, c]], &[]),
+    )) {
+        PlacementRecommendation::InsufficientEvidence { missing } => {
+            assert!(missing.contains("retained-learner"), "{missing}");
+        }
+        other => panic!("expected InsufficientEvidence, got {other:?}"),
+    }
+
+    // A live eligible fourth node without a seed fills the slot and asks
+    // for provisioning — the shortfall answer is reserved for a slot no
+    // candidate can fill.
+    match plan(&input(
+        &[a, b, c],
+        learner_policy(vec![seeded(a), seeded(b), seeded(c), unseeded(d)]),
+        snapshot(&[&[a, b, c, d]], &[]),
+    )) {
+        PlacementRecommendation::NeedsProvisioning { candidates } => {
+            assert_eq!(candidates.into_iter().collect::<Vec<_>>(), vec![d]);
+        }
+        other => panic!("expected NeedsProvisioning, got {other:?}"),
+    }
+}
+
+/// **A malformed join permit is refused before any plan exists** (closure
+/// item 4): §7.7.1 requires every supplied seed to pass the canonical
+/// ticket **and permit** validation before `Plan` can be emitted. The same
+/// input with the structurally valid permit plans.
+#[test]
+fn a_malformed_permit_is_refused_before_any_plan() {
+    let (a, b, d) = (node(1), node(2), node(4));
+    let topo = || snapshot(&[&[a, b, d]], &[]);
+
+    // The candidate's permit bytes are garbage: InvalidPolicy, not a Plan
+    // whose refusal is discovered as a replicated apply failure.
+    let mut garbage = seeded(d);
+    garbage
+        .member_seed
+        .as_mut()
+        .expect("seeded")
+        .signed_join_permit = Some(vec![1, 2, 3]);
+    match plan(&input(
+        &[a, b],
+        policy(vec![seeded(a), seeded(b), garbage], 3, 0, false),
+        topo(),
+    )) {
+        PlacementRecommendation::InvalidPolicy { why } => {
+            assert!(why.contains("permit"), "{why}");
+        }
+        other => panic!("expected InvalidPolicy, got {other:?}"),
+    }
+
+    // A permit minted for a *different* node fails the candidate binding.
+    let mut misbound = seeded(d);
+    misbound
+        .member_seed
+        .as_mut()
+        .expect("seeded")
+        .signed_join_permit = Some(structural_permit(a));
+    match plan(&input(
+        &[a, b],
+        policy(vec![seeded(a), seeded(b), misbound], 3, 0, false),
+        topo(),
+    )) {
+        PlacementRecommendation::InvalidPolicy { why } => {
+            assert!(why.contains("permit"), "{why}");
+        }
+        other => panic!("expected InvalidPolicy, got {other:?}"),
+    }
+
+    // The honest permit plans, and the new member's seed rides the plan.
+    match plan(&input(
+        &[a, b],
+        policy(vec![seeded(a), seeded(b), seeded(d)], 3, 0, false),
+        topo(),
+    )) {
+        PlacementRecommendation::Plan(plan) => {
+            assert_eq!(plan.member_seeds.len(), 1);
+            assert_eq!(plan.member_seeds[0].node_id, d.as_bytes().to_vec());
+        }
+        other => panic!("expected a Plan, got {other:?}"),
+    }
+}
+
 // ── Manager-half fixtures ───────────────────────────────────────────────────
 
 struct ScriptedTopology(Mutex<Vec<TopologySnapshot>>);
@@ -936,16 +1074,19 @@ async fn restart_delays_the_grace_and_the_recheck_discards_superseded_plans() {
         fresh.reason
     );
 
-    // The recheck fence: the original manager's timer has crossed, but its
-    // policy source now answers with a *changed* policy for the recheck —
-    // the candidate withdrawn — so the plan is discarded, not submitted.
-    let mut withdrawn = policy_now();
-    withdrawn.revision = 2;
-    withdrawn.digest = [0xD3; 32];
-    withdrawn.eligible.remove(&candidate_id);
+    // The recheck fence: the original manager's timer has crossed, but the
+    // policy revision/digest advances between planning and submission — the
+    // **same content**, so the freshly recomputed plan would be identical.
+    // That is exactly the reviewer's trap: a recheck that merely replans and
+    // submits "any fresh Plan it sees" would sail through, injecting a plan
+    // (and any seeds) minted under the old `(digest, membership LogId)`
+    // tuple. The retained fingerprint discards it instead.
+    let mut redigested = policy_now();
+    redigested.revision = 2;
+    redigested.digest = [0xD3; 32];
     manager.replace_sources_for_testing(
         ScriptedTopology(Mutex::new(vec![live(&members)])),
-        ScriptedPolicy(Mutex::new(vec![policy_now(), withdrawn])),
+        ScriptedPolicy(Mutex::new(vec![policy_now(), redigested])),
     );
     let superseded = within("superseded reconcile", manager.reconcile())
         .await
@@ -956,8 +1097,8 @@ async fn restart_delays_the_grace_and_the_recheck_discards_superseded_plans() {
         superseded.reason
     );
     assert!(
-        superseded.reason.contains("superseded") || superseded.reason.contains("insufficient"),
-        "the report says the recheck won: {}",
+        superseded.reason.contains("discarded"),
+        "the report names the fingerprint discard: {}",
         superseded.reason
     );
 
@@ -1125,6 +1266,104 @@ async fn no_quorum_produces_a_report_and_no_command() {
         "the report names the stop: {}",
         report.reason
     );
+
+    for voter in voters {
+        voter.shutdown().await;
+    }
+}
+
+/// **An unresolvable journalled request stops the reconciliation cold**
+/// (closure item 3). A membership request fsyncs `Pending` before its send;
+/// with the quorum gone the surviving voter refuses it and the sequence
+/// stays open. The next reconciliation's resume cannot resolve it, and the
+/// reconciliation must surface that instead of observing, provisioning or
+/// planning anything — the earlier `if let Ok(Some(..))` swallowed the
+/// error and carried on. `NoProvisioning` panics if touched, so the
+/// no-work claim is enforced, not assumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unresolvable_journalled_request_stops_reconciliation() {
+    let (fixture, mut voters, _dirs) = manager_group().await;
+    let (candidate_id, candidate) = real_candidate(&fixture);
+    let members = vec![
+        voter_id(&fixture, 0),
+        voter_id(&fixture, 1),
+        voter_id(&fixture, 2),
+        candidate_id,
+    ];
+    let journal = tempfile::tempdir().expect("a directory");
+    // The client is seeded with voter 0 alone, so every routing walk speaks
+    // to exactly one live, promptly-refusing member — the test's timing
+    // never depends on dial timeouts to dead nodes.
+    let node = Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(SecretKey::from_bytes(root_secret(&fixture)))
+            .root_pubkey(PublicKey::from_bytes(fixture.authority_key()))
+            .build(),
+    )
+    .await
+    .expect("a client node starts");
+    node.add_node_addr(voters[0].node().addr())
+        .expect("register");
+    let id: [u8; 32] = fixture.node_id(0).try_into().expect("32 bytes");
+    let client = CoordinationClient::builder(node, fixture.group_id())
+        .seed_tickets([
+            aster::coordination::model::authority::canonical_candidate_ticket(&id)
+                .expect("a canonical ticket"),
+        ])
+        .journal_dir(journal.path())
+        .build()
+        .expect("the client builds");
+
+    // The quorum dies (voter 0 stays reachable so the refusals are prompt),
+    // then a mutation is attempted: the journal fsyncs the exact request as
+    // Pending before any send, and no quorum can resolve it.
+    voters.remove(2).shutdown().await;
+    voters.remove(1).shutdown().await;
+    let mut desired: Vec<aster::coordination::contract::NodeIdV1> =
+        [voter_id(&fixture, 0), voter_id(&fixture, 1), candidate_id]
+            .iter()
+            .map(|n| aster::coordination::contract::NodeIdV1 {
+                node_id: n.as_bytes().to_vec(),
+            })
+            .collect();
+    desired.sort_by(|l, r| l.node_id.cmp(&r.node_id));
+    let seed = candidate.member_seed.clone().expect("seeded");
+    let unresolved = within(
+        "doomed submission",
+        client.change_membership([0xAD; 16], None, desired, Vec::new(), vec![seed]),
+    )
+    .await;
+    assert!(unresolved.is_err(), "no quorum can resolve the request");
+
+    // The reconciliation's first act is the resume, and the resume's
+    // failure is the whole answer: no observation, no provisioning, no
+    // plan. A reachability/quorum failure is a stop-report naming the
+    // unresolved request; an exhausted drive surfaces as the error it is.
+    // Either way nothing runs after it — the panicking provisioner proves
+    // that.
+    let mut manager = CoordinationPlacementManager::new(
+        client,
+        ScriptedTopology(Mutex::new(vec![live(&members)])),
+        ScriptedPolicy(Mutex::new(vec![replacement_policy(
+            &fixture,
+            &candidate,
+            None,
+            Duration::from_secs(600),
+        )])),
+        NoProvisioning,
+    );
+    match within("stopped reconcile", manager.reconcile()).await {
+        Err(_) => {}
+        Ok(report) => {
+            assert!(
+                report.pending_operation_id.is_none() && report.reason.contains("unresolved"),
+                "an unresolved journal permits no new work: {}",
+                report.reason
+            );
+        }
+    }
 
     for voter in voters {
         voter.shutdown().await;

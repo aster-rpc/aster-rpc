@@ -9,9 +9,11 @@
 //!   are refused; reads and safety-reducing operations continue.
 //! * **Hard** — free space on the volume is below the larger of one GiB or
 //!   twice the latest snapshot, the room §11 needs to write a snapshot and
-//!   replace it atomically. Every new mutation is refused and the runtime
-//!   latches Draining so operators and `wait_ready` callers see a node that
-//!   is asking to be evacuated, not one that is merely slow.
+//!   replace it atomically. This tier is a **latch**: once hit it never
+//!   clears, every new mutation is refused, and the monitor runs the §11.5
+//!   shutdown sequence itself — "shut down the local coordination runtime
+//!   cleanly so another voter can lead". A pressured leader must step aside,
+//!   not retain leadership while refusing every mutation.
 //!
 //! The monitor is deliberately a *sampler*: admission reads two atomics, never
 //! the filesystem, so the §12.2 promise that cheap rejection precedes
@@ -22,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::owner::RuntimeFacts;
+use super::owner::ShutdownSequence;
 use crate::coordination::model::limits::LOCAL_HIGH_WATER;
 use crate::coordination::store::host::{PressureState, StoreMetrics};
 
@@ -92,8 +94,12 @@ pub(crate) fn free_space(path: &Path) -> Option<u64> {
 
 /// One sampling pass, factored out so the loop and the tests share it.
 ///
-/// Returns whether the hard tier is hit *this* pass; latching is the loop's
-/// job because the drain side effect must fire exactly once.
+/// Returns whether the hard tier is (now) hit. The hard tier **latches** in
+/// [`PressureState`] itself: once a pass observes free space below the floor
+/// — or the test seam forces the tier — no later pass clears it. §11.5 makes
+/// the tier a one-way trip into evacuation, never a reversible refusal gate:
+/// space freed after the latch does not un-drain a node whose runtime is
+/// already stepping aside.
 pub(crate) fn sample(
     state_db: &Path,
     raft_db: &Path,
@@ -108,7 +114,9 @@ pub(crate) fn sample(
     let snapshot_len = largest_snapshot(snapshots);
     let floor = hard_floor(snapshot_len);
     let free = free_space(volume);
-    let hard = free.is_some_and(|free| free < floor);
+    let hard = pressure.hard.load(Ordering::Relaxed)
+        || pressure.force_hard.load(Ordering::Relaxed)
+        || free.is_some_and(|free| free < floor);
     pressure.hard.store(hard, Ordering::Relaxed);
     // The §14 disk gauges ride the same pass: sizes and free-space state,
     // never file contents.
@@ -133,28 +141,34 @@ pub(crate) fn growth_pressure_at(state_db: &Path, high_water: u64) -> bool {
     std::fs::metadata(state_db).is_ok_and(|meta| meta.len() >= high_water)
 }
 
-/// The monitor task. Runs until aborted at §11.5 shutdown step 3.
+/// The monitor task. Samples until the hard tier latches, then evacuates:
+/// §11.5's "reject all new Store mutations, emit storage-pressure health,
+/// and shut down the local coordination runtime cleanly so another voter can
+/// lead". The shutdown sequence marks the node draining (the storage-pressure
+/// health signal, beside the latched free-space gauge), drains in-flight
+/// Store calls, and stops the Raft — which is what actually lets another
+/// voter win the next election. The monitor then returns; the latched tier
+/// and gauges keep reporting the pressure that ended the runtime.
 pub(crate) async fn run(
     state_db: PathBuf,
     raft_db: PathBuf,
     snapshots: PathBuf,
     pressure: Arc<PressureState>,
-    facts: Arc<RuntimeFacts>,
     metrics: Arc<StoreMetrics>,
+    shutdown: ShutdownSequence,
 ) {
     // The volume is probed at the voter directory, the parent that must hold
     // both databases and the snapshot being written.
     let volume = state_db.parent().map(Path::to_path_buf).unwrap_or_default();
-    let mut latched = false;
     let mut ticks = tokio::time::interval(SAMPLE_EVERY);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
         let hard = sample(&state_db, &raft_db, &snapshots, &volume, &pressure);
-        if hard && !latched {
-            latched = true;
+        if hard {
             StoreMetrics::bump(&metrics.pressure_refusals);
-            facts.begin_draining();
+            shutdown.run().await;
+            return;
         }
     }
 }
@@ -226,5 +240,29 @@ mod tests {
         // pinned separately against the shared helper.
         assert!(growth_pressure_at(&db, 1024));
         assert!(!growth_pressure_at(&db, 1024 * 1024));
+    }
+
+    /// §11.5's hard tier is a latch: a pass that observes it (here through
+    /// the forced seam, as a full disk would in production) leaves it set,
+    /// and no later pass — however much space is free — clears it.
+    #[test]
+    fn the_hard_tier_latches_across_passes() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let db = dir.path().join("state.redb");
+        std::fs::write(&db, vec![0u8; 16]).expect("write");
+        let pressure = PressureState::default();
+
+        pressure.force_hard.store(true, Ordering::Relaxed);
+        assert!(sample(&db, &db, dir.path(), dir.path(), &pressure));
+
+        // The force is withdrawn; the latch is not.
+        pressure.force_hard.store(false, Ordering::Relaxed);
+        assert!(
+            sample(&db, &db, dir.path(), dir.path(), &pressure),
+            "a hard tier that clears when space returns is a reversible \
+             refusal gate, which §11.5 forbids"
+        );
+        assert!(pressure.hard.load(Ordering::Relaxed));
     }
 }

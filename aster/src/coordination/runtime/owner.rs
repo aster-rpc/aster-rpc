@@ -388,11 +388,70 @@ pub(crate) async fn run_lifecycle(
         }
 
         if metrics.changed().await.is_err() {
-            for task in [controller.take(), proposing.take()].into_iter().flatten() {
+            for task in [controller.take(), expiry.take(), proposing.take()]
+                .into_iter()
+                .flatten()
+            {
                 task.abort();
             }
             return;
         }
+    }
+}
+
+/// §7.6/§11.5 steps 1–3 as one idempotent, cloneable value.
+///
+/// Two callers need the same sequence: [`CoordinationRuntime::shutdown`]
+/// (the server's graceful path) and the §11.5 pressure monitor, which must
+/// take the local runtime down when free space falls below the hard floor —
+/// "shut down the local coordination runtime cleanly so another voter can
+/// lead" — without owning the runtime. The `ran` latch makes the second
+/// caller a no-op, so an evacuated node's later server shutdown does not
+/// re-run a sequence against an already-stopped Raft.
+///
+/// The membership/expiry controllers are stopped here by the **generation
+/// bump**, not by task aborts: bumping the counter stops a superseded
+/// controller at its next side effect whether or not an abort has landed,
+/// and it is the only mechanism available to a caller that does not own the
+/// `JoinHandle`s. The owning runtime still aborts and awaits them afterwards.
+#[derive(Clone)]
+pub(crate) struct ShutdownSequence {
+    facts: Arc<RuntimeFacts>,
+    store_endpoint: crate::coordination::store::host::StoreEndpoint,
+    endpoint: RaftEndpoint,
+    raft: Raft<CoordinationTypeConfig>,
+    generation: Arc<AtomicU64>,
+    /// Latched by the first caller; §11.5's evacuation is one-way.
+    ran: Arc<tokio::sync::Mutex<bool>>,
+}
+
+impl ShutdownSequence {
+    /// §11.5 steps 1–3, in order, exactly once.
+    pub(crate) async fn run(&self) {
+        let mut ran = self.ran.lock().await;
+        if *ran {
+            return;
+        }
+        *ran = true;
+        // 1. Mark draining and stop accepting new Store calls — the Store
+        //    endpoint detaches before anything the in-flight calls depend on
+        //    is taken down.
+        self.facts.begin_draining();
+        self.store_endpoint.detach().await;
+        // 2. Wait up to five bounded seconds for the Store calls that were
+        //    already inside a handler, while the Raft they may be awaiting
+        //    still runs.
+        self.store_endpoint.drain().await;
+        // 3. Controllers stop before the Raft: the generation bump halts the
+        //    membership and expiry loops at their next side effect even
+        //    mid-await, which an abort alone cannot guarantee. Then the Raft
+        //    RPC deregisters — a call is answered `FailedPrecondition`, the
+        //    same status a node that has not yet attached answers — and the
+        //    Raft itself shuts down, which closes the metrics channel and
+        //    ends the lifecycle loop.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.endpoint.detach().await;
+        let _ = self.raft.shutdown().await;
     }
 }
 
@@ -412,6 +471,8 @@ pub(crate) struct CoordinationRuntime {
     /// controller stop at its next side effect, whether or not its abort has
     /// landed.
     generation: Arc<AtomicU64>,
+    /// §7.6/§11.5 steps 1–3, shared with the pressure monitor.
+    sequence: ShutdownSequence,
 
     /// 1. Controllers stop first. A controller that outlived the Raft would
     ///    submit a membership change into a shut-down instance and report a
@@ -493,16 +554,29 @@ impl CoordinationRuntime {
             })
             .await;
 
+        let sequence = ShutdownSequence {
+            facts: Arc::clone(&facts),
+            store_endpoint: store_endpoint.clone(),
+            endpoint: endpoint.clone(),
+            raft: raft.clone(),
+            generation: Arc::clone(&generation),
+            ran: Arc::new(tokio::sync::Mutex::new(false)),
+        };
+
         // The §11.5 pressure monitor. A controller in the ownership sense:
-        // stopped at shutdown step 3, harmless during the drain window
-        // because all it does is publish two atomics.
+        // stopped at shutdown step 3 if still running. It holds a clone of
+        // the shutdown sequence because the hard tier's contract is
+        // latch-and-exit — below the free-space floor the monitor takes this
+        // runtime down itself so another voter can lead, rather than leaving
+        // a pressured leader refusing every mutation while retaining
+        // leadership.
         let monitor = tokio::spawn(super::pressure::run(
             state_db,
             raft_db,
             snapshots,
             std::sync::Arc::clone(&pressure),
-            Arc::clone(&facts),
             std::sync::Arc::clone(&store_metrics),
+            sequence.clone(),
         ));
 
         let lifecycle = tokio::spawn(run_lifecycle(
@@ -528,6 +602,7 @@ impl CoordinationRuntime {
             pressure,
             local,
             generation,
+            sequence,
             controllers: vec![monitor],
             lifecycle: Some(lifecycle),
             storage,
@@ -590,33 +665,16 @@ impl CoordinationRuntime {
     /// but a runtime dropped without `shutdown` skips the RPC deregistration,
     /// so a call can reach a `Raft` that is going away.
     pub(crate) async fn shutdown(mut self) {
-        // 1. §11.5 step 1: mark draining and stop accepting new Store
-        //    mutations — the Store endpoint detaches before anything the
-        //    in-flight calls depend on is taken down.
-        self.facts.begin_draining();
-        self.store_endpoint.detach().await;
-        // 2. §11.5 step 2: wait up to five bounded seconds for the Store
-        //    calls that were already inside a handler, while the Raft and
-        //    controllers they may be awaiting still run.
-        self.store_endpoint.drain().await;
-
-        // 3. §11.5 step 3 begins: controllers. Bumping the generation first
-        //    stops the membership controller at its next leadership check even
-        //    if it is mid-await, which an abort alone cannot guarantee.
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        // Steps 1–3 live on [`ShutdownSequence::run`], shared with the §11.5
+        // pressure monitor and idempotent — a node the monitor already
+        // evacuated passes straight through. The generation bump inside the
+        // sequence has already stopped the controllers' side effects; the
+        // aborts here are the owner reclaiming the tasks themselves.
+        self.sequence.run().await;
         for task in std::mem::take(&mut self.controllers) {
             task.abort();
             let _ = task.await;
         }
-
-        //    Deregister the Raft RPC. After this a call is answered
-        //    `FailedPrecondition` — the same status a node that has not yet
-        //    attached answers, which is right: in both cases the node is up and
-        //    not serving Raft.
-        self.endpoint.detach().await;
-
-        // 3. The Raft itself.
-        let _ = self.raft.shutdown().await;
 
         // 4. The lifecycle loop, which the metrics channel closing has already
         //    ended. Awaiting it drops the publisher, releasing every
@@ -773,7 +831,8 @@ mod tests {
         }
     }
 
-    /// The shutdown body performs §7.6's five steps in order.
+    /// The shutdown sequence performs §11.5 steps 1–3 in order, and the
+    /// owner's shutdown runs it before reclaiming tasks and storage.
     ///
     /// The same instrument, for the same reason: the ordering is not observable
     /// from outside without a real cluster, and a reordered body deadlocks or
@@ -782,25 +841,50 @@ mod tests {
     fn the_shutdown_body_follows_the_reverse_of_construction() {
         let source = include_str!("owner.rs");
         let at = source
-            .find("pub(crate) async fn shutdown(")
-            .expect("shutdown exists");
-        let body = &source[at..];
+            .find("pub(crate) async fn run(&self)")
+            .expect("the shared sequence exists");
+        let body = &source[at..at + source[at..].find("\n}").expect("a close")];
 
         let steps = [
             "begin_draining()",
-            "endpoint.detach()",
+            "store_endpoint.detach()",
+            "store_endpoint.drain()",
+            "generation.fetch_add",
+            // `self.`-qualified so the match cannot land inside
+            // `store_endpoint.detach()` above.
+            "self.endpoint.detach()",
             "raft.shutdown()",
+        ];
+        let mut last = 0usize;
+        for step in steps {
+            let at = body
+                .find(step)
+                .unwrap_or_else(|| panic!("the sequence must {step}"));
+            assert!(
+                at > last,
+                "{step} is out of §11.5's order: drain the store, stop controllers, \
+                 deregister RPC, stop the Raft"
+            );
+            last = at;
+        }
+
+        // And the owner runs the shared sequence before it reclaims the
+        // controller tasks, the lifecycle loop, and storage.
+        let at = source
+            .find("pub(crate) async fn shutdown(")
+            .expect("shutdown exists");
+        let body = &source[at..];
+        let steps = [
+            "sequence.run()",
+            "std::mem::take(&mut self.controllers)",
             "lifecycle.take()",
         ];
         let mut last = 0usize;
         for step in steps {
             let at = body
                 .find(step)
-                .unwrap_or_else(|| panic!("shutdown must {step}"));
-            assert!(
-                at > last,
-                "{step} is out of §7.6's order: controllers, RPC, Raft, lifecycle, storage"
-            );
+                .unwrap_or_else(|| panic!("shutdown must reach {step}"));
+            assert!(at > last, "{step} is out of §7.6's order");
             last = at;
         }
     }

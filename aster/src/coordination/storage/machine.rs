@@ -137,6 +137,18 @@ pub(crate) enum PreflightAnswer {
 
 // ── Actor protocol ───────────────────────────────────────────────────────────
 
+/// The §14 facts only the state machine holds (see
+/// [`StateCommand::Observability`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservabilityFacts {
+    /// The group's genesis hash, from the bound authority.
+    pub(crate) genesis_hash: [u8; 32],
+    /// Whether the committed genesis has been applied (`admin_revision > 0`).
+    pub(crate) genesis_installed: bool,
+    /// The lowest retained audit row's log index; `None` before any pruning.
+    pub(crate) audit_floor_index: Option<u64>,
+}
+
 pub(crate) enum StateCommand {
     AppliedState(Reply<Applied>),
     Apply {
@@ -154,6 +166,10 @@ pub(crate) enum StateCommand {
     ReadTransaction(Reply<GuardedRead>),
     /// Has the committed genesis been applied? (§7.6 readiness.)
     GenesisInstalled(Reply<bool>),
+    /// The bounded §14 state-machine facts: the group's genesis hash,
+    /// whether it is installed, and the audit floor. Identifiers and
+    /// indexes only — no row data leaves the actor.
+    Observability(Reply<ObservabilityFacts>),
     /// Hand out a copy of the published state.
     ///
     /// Test-only, and deliberately so. It clones the whole state — up to 192
@@ -338,6 +354,7 @@ impl StateActor {
                 StateCommand::GenesisInstalled(reply) => {
                     self.serve(reply, StateActor::genesis_installed)
                 }
+                StateCommand::Observability(reply) => self.serve(reply, StateActor::observability),
                 StateCommand::ActiveIntent(reply) => self.serve(reply, StateActor::active_intent),
                 StateCommand::Preflight {
                     client,
@@ -415,6 +432,7 @@ impl StateActor {
                 StateCommand::Apply { reply, .. } => fail(reply),
                 StateCommand::ReadTransaction(reply) => fail(reply),
                 StateCommand::GenesisInstalled(reply) => fail(reply),
+                StateCommand::Observability(reply) => fail(reply),
                 StateCommand::ActiveIntent(reply) => fail(reply),
                 StateCommand::Preflight { reply, .. } => fail(reply),
                 StateCommand::RetirePreflight { reply, .. } => fail(reply),
@@ -478,6 +496,15 @@ impl StateActor {
     fn genesis_installed(&mut self) -> StorageResult<bool> {
         let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
         Ok(state.model.admin_revision > 0)
+    }
+
+    fn observability(&mut self) -> StorageResult<ObservabilityFacts> {
+        let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
+        Ok(ObservabilityFacts {
+            genesis_hash: state.model.authority.genesis_hash,
+            genesis_installed: state.model.admin_revision > 0,
+            audit_floor_index: state.model.audit_floor.as_ref().map(|id| id.index),
+        })
     }
 
     fn active_intent(&mut self) -> StorageResult<Option<(OperationId, Intent)>> {
@@ -989,6 +1016,12 @@ impl StateHandle {
     /// Whether the committed genesis has been applied (§7.6).
     pub(crate) async fn genesis_installed(&self) -> StorageResult<bool> {
         self.call(StateCommand::GenesisInstalled).await
+    }
+
+    /// The bounded §14 state-machine facts, for the local handle's
+    /// consensus snapshot.
+    pub(crate) async fn observability(&self) -> StorageResult<ObservabilityFacts> {
+        self.call(StateCommand::Observability).await
     }
 
     /// The one active membership intent, for the §7.3 controller.

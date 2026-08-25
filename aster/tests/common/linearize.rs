@@ -13,7 +13,10 @@
 //!   transcription of §5.2/§9.1's transitions (acquire, renew,
 //!   compare_and_set, release, revoke, read), checked against the full
 //!   observation: outcome code, reason code, and the snapshot's epoch,
-//!   value revision, holdership and value.
+//!   lease revision, value revision, holdership, **holder identity** and
+//!   value. A successful reply must carry a snapshot and a zero reason; a
+//!   refusal must carry the model's reason, and any snapshot it does carry
+//!   must state the unchanged pre-state.
 //!
 //! If no such order exists the history is not linearizable and the checker
 //! says which operations could not be placed.
@@ -61,17 +64,29 @@ pub enum RegisterCall {
     Read,
 }
 
+/// The snapshot a reply carried, in full: every fact the wire snapshot
+/// states is a fact the model must agree with. `value` is `None` only when
+/// the reply redacted it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SnapshotFacts {
+    pub epoch: u64,
+    pub lease_revision: u64,
+    pub value_revision: u64,
+    pub held: bool,
+    /// The holder the reply named; `None` when the row is free.
+    pub holder: Option<[u8; 32]>,
+    /// `None` when redacted; compared only when present.
+    pub value: Option<Vec<u8>>,
+}
+
 /// What the caller observed when the operation responded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Observed {
     pub outcome_code: i32,
     pub reason_code: i32,
-    /// Snapshot fields, zero/false/`None` when the reply carried no snapshot.
-    pub epoch: u64,
-    pub value_revision: u64,
-    pub held: bool,
-    /// `None` when absent or redacted; compared only when present.
-    pub value: Option<Vec<u8>>,
+    /// `None` when the reply carried no snapshot — which the model permits
+    /// only for refusals.
+    pub snapshot: Option<SnapshotFacts>,
 }
 
 /// One recorded operation: the interval, the call, and the observation.
@@ -117,19 +132,13 @@ struct Register {
     value: Vec<u8>,
 }
 
-/// What one sequential step must have produced.
+/// What one sequential step must have produced. The state facts live on the
+/// registers themselves: an applied observation is compared against the
+/// post-state, a refused one against the unchanged pre-state.
 #[derive(Debug, PartialEq)]
 enum Expected {
-    Applied {
-        outcome_code: i32,
-        epoch: u64,
-        value_revision: u64,
-        held: bool,
-        value: Vec<u8>,
-    },
-    Refused {
-        reason_code: i32,
-    },
+    Applied { outcome_code: i32 },
+    Refused { reason_code: i32 },
 }
 
 impl Register {
@@ -162,28 +171,24 @@ impl Register {
                 next.lease_revision += 1;
                 next.held = true;
                 next.holder = Some(*actor);
-                let expected = Expected::Applied {
-                    outcome_code: GRANTED,
-                    epoch: next.epoch,
-                    value_revision: next.value_revision,
-                    held: true,
-                    value: next.value.clone(),
-                };
-                (next, expected)
+                (
+                    next,
+                    Expected::Applied {
+                        outcome_code: GRANTED,
+                    },
+                )
             }
             RegisterCall::Renew { fence_epoch } => {
                 if let Some(reason) = self.fence_refusal(actor, *fence_epoch) {
                     return (next, refuse(reason));
                 }
                 next.lease_revision += 1;
-                let expected = Expected::Applied {
-                    outcome_code: RENEWED,
-                    epoch: next.epoch,
-                    value_revision: next.value_revision,
-                    held: true,
-                    value: next.value.clone(),
-                };
-                (next, expected)
+                (
+                    next,
+                    Expected::Applied {
+                        outcome_code: RENEWED,
+                    },
+                )
             }
             RegisterCall::CompareAndSet {
                 fence_epoch,
@@ -198,14 +203,12 @@ impl Register {
                 }
                 next.value = new_value.clone();
                 next.value_revision += 1;
-                let expected = Expected::Applied {
-                    outcome_code: MUTATED,
-                    epoch: next.epoch,
-                    value_revision: next.value_revision,
-                    held: true,
-                    value: next.value.clone(),
-                };
-                (next, expected)
+                (
+                    next,
+                    Expected::Applied {
+                        outcome_code: MUTATED,
+                    },
+                )
             }
             RegisterCall::Release { fence_epoch } => {
                 if let Some(reason) = self.fence_refusal(actor, *fence_epoch) {
@@ -215,14 +218,12 @@ impl Register {
                 next.holder = None;
                 next.epoch += 1;
                 next.lease_revision += 1;
-                let expected = Expected::Applied {
-                    outcome_code: RELEASED,
-                    epoch: next.epoch,
-                    value_revision: next.value_revision,
-                    held: false,
-                    value: next.value.clone(),
-                };
-                (next, expected)
+                (
+                    next,
+                    Expected::Applied {
+                        outcome_code: RELEASED,
+                    },
+                )
             }
             RegisterCall::Revoke { expected_epoch } => {
                 // §9.1: revoke is unconditional fencing — no `held`
@@ -240,55 +241,66 @@ impl Register {
                 next.holder = None;
                 next.epoch += 1;
                 next.lease_revision += 1;
-                let expected = Expected::Applied {
-                    outcome_code: REVOKED,
-                    epoch: next.epoch,
-                    value_revision: next.value_revision,
-                    held: false,
-                    value: next.value.clone(),
-                };
-                (next, expected)
+                (
+                    next,
+                    Expected::Applied {
+                        outcome_code: REVOKED,
+                    },
+                )
             }
-            RegisterCall::Read => {
-                let expected = Expected::Applied {
-                    outcome_code: 0,
-                    epoch: self.epoch,
-                    value_revision: self.value_revision,
-                    held: self.held,
-                    value: self.value.clone(),
-                };
-                (next, expected)
-            }
+            RegisterCall::Read => (next, Expected::Applied { outcome_code: 0 }),
         }
     }
 }
 
+/// Every fact the snapshot states must be the register's fact. The value is
+/// compared only when the reply did not redact it.
+fn facts_match(snapshot: &SnapshotFacts, register: &Register) -> bool {
+    snapshot.epoch == register.epoch
+        && snapshot.lease_revision == register.lease_revision
+        && snapshot.value_revision == register.value_revision
+        && snapshot.held == register.held
+        && snapshot.holder == register.holder
+        && snapshot.value.as_ref().is_none_or(|v| *v == register.value)
+}
+
 /// Does `observed` match what the model required of this step?
-fn matches(expected: &Expected, observed: &Observed, call: &RegisterCall) -> bool {
+///
+/// `pre` is the register the step ran on and `post` the register it
+/// produced; a refusal changes nothing, so any snapshot a refusal carries
+/// must state `pre`, while an applied reply must carry a snapshot stating
+/// `post`.
+fn matches(
+    expected: &Expected,
+    observed: &Observed,
+    call: &RegisterCall,
+    pre: &Register,
+    post: &Register,
+) -> bool {
     match expected {
-        Expected::Applied {
-            outcome_code,
-            epoch,
-            value_revision,
-            held,
-            value,
-        } => {
-            if matches!(call, RegisterCall::Read) {
+        Expected::Applied { outcome_code } => {
+            let outcome_matches = if matches!(call, RegisterCall::Read) {
                 // A read reply has no outcome code; it is all snapshot.
-                observed.epoch == *epoch
-                    && observed.value_revision == *value_revision
-                    && observed.held == *held
-                    && observed.value.as_ref().is_none_or(|v| v == value)
+                true
             } else {
                 observed.outcome_code == *outcome_code
-                    && observed.epoch == *epoch
-                    && observed.value_revision == *value_revision
-                    && observed.held == *held
-                    && observed.value.as_ref().is_none_or(|v| v == value)
-            }
+            };
+            // A success carrying a refusal reason is a malformed reply, not
+            // a permissible spelling of success.
+            outcome_matches
+                && observed.reason_code == 0
+                && observed
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| facts_match(snapshot, post))
         }
         Expected::Refused { reason_code } => {
-            observed.outcome_code == REJECTED && observed.reason_code == *reason_code
+            observed.outcome_code == REJECTED
+                && observed.reason_code == *reason_code
+                && observed
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| facts_match(snapshot, pre))
         }
     }
 }
@@ -348,7 +360,7 @@ pub fn check(history: &[Recorded]) -> Result<Vec<usize>, String> {
             let (next, expected) = register.step(&op.actor, &op.call);
             match &op.observed {
                 Some(observed) => {
-                    if !matches(&expected, observed, &op.call) {
+                    if !matches(&expected, observed, &op.call, &register, &next) {
                         continue;
                     }
                 }
@@ -413,14 +425,20 @@ mod tests {
         [tag; 32]
     }
 
-    fn granted(epoch: u64, value_revision: u64) -> Observed {
+    /// A granted acquire's observation: held by `holder`, epoch and lease
+    /// revision as the model's transition produces them.
+    fn granted(holder_tag: u8, epoch: u64, lease_revision: u64, value_revision: u64) -> Observed {
         Observed {
             outcome_code: GRANTED,
             reason_code: 0,
-            epoch,
-            value_revision,
-            held: true,
-            value: None,
+            snapshot: Some(SnapshotFacts {
+                epoch,
+                lease_revision,
+                value_revision,
+                held: true,
+                holder: Some(actor(holder_tag)),
+                value: None,
+            }),
         }
     }
 
@@ -428,10 +446,7 @@ mod tests {
         Observed {
             outcome_code: REJECTED,
             reason_code,
-            epoch: 0,
-            value_revision: 0,
-            held: false,
-            value: None,
+            snapshot: None,
         }
     }
 
@@ -451,12 +466,34 @@ mod tests {
         }
     }
 
+    fn applied(
+        outcome_code: i32,
+        holder_tag: Option<u8>,
+        epoch: u64,
+        lease_revision: u64,
+        value_revision: u64,
+        value: Option<Vec<u8>>,
+    ) -> Observed {
+        Observed {
+            outcome_code,
+            reason_code: 0,
+            snapshot: Some(SnapshotFacts {
+                epoch,
+                lease_revision,
+                value_revision,
+                held: holder_tag.is_some(),
+                holder: holder_tag.map(actor),
+                value,
+            }),
+        }
+    }
+
     /// A sequential grant/CAS/release chain with a justified denial in the
     /// middle linearizes, and the witness order respects real time.
     #[test]
     fn a_clean_history_linearizes() {
         let history = vec![
-            op(1, 0, 10, RegisterCall::Acquire, granted(1, 0)),
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
             // Concurrent with the release below: the denial is legal before
             // it, the second grant after it.
             op(2, 5, 40, RegisterCall::Acquire, refused(HELD_BY_OTHER)),
@@ -469,30 +506,16 @@ mod tests {
                     expected_value_revision: 0,
                     new_value: vec![7],
                 },
-                Observed {
-                    outcome_code: MUTATED,
-                    reason_code: 0,
-                    epoch: 1,
-                    value_revision: 1,
-                    held: true,
-                    value: Some(vec![7]),
-                },
+                applied(MUTATED, Some(1), 1, 1, 1, Some(vec![7])),
             ),
             op(
                 1,
                 21,
                 30,
                 RegisterCall::Release { fence_epoch: 1 },
-                Observed {
-                    outcome_code: RELEASED,
-                    reason_code: 0,
-                    epoch: 2,
-                    value_revision: 1,
-                    held: false,
-                    value: None,
-                },
+                applied(RELEASED, None, 2, 2, 1, None),
             ),
-            op(2, 35, 45, RegisterCall::Acquire, granted(3, 1)),
+            op(2, 35, 45, RegisterCall::Acquire, granted(2, 3, 3, 1)),
         ];
         check(&history).expect("linearizable");
     }
@@ -501,8 +524,8 @@ mod tests {
     #[test]
     fn a_shared_epoch_is_refuted() {
         let history = vec![
-            op(1, 0, 10, RegisterCall::Acquire, granted(1, 0)),
-            op(2, 2, 12, RegisterCall::Acquire, granted(1, 0)),
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
+            op(2, 2, 12, RegisterCall::Acquire, granted(2, 1, 1, 0)),
         ];
         check(&history).expect_err("two holders at one epoch");
     }
@@ -513,7 +536,7 @@ mod tests {
     fn an_unjustified_denial_is_refuted() {
         let history = vec![
             op(1, 0, 10, RegisterCall::Acquire, refused(HELD_BY_OTHER)),
-            op(1, 20, 30, RegisterCall::Acquire, granted(1, 0)),
+            op(1, 20, 30, RegisterCall::Acquire, granted(1, 1, 1, 0)),
         ];
         check(&history).expect_err("nobody held the register");
     }
@@ -523,7 +546,7 @@ mod tests {
     #[test]
     fn a_stale_read_is_refuted() {
         let history = vec![
-            op(1, 0, 10, RegisterCall::Acquire, granted(1, 0)),
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
             op(
                 1,
                 11,
@@ -533,14 +556,7 @@ mod tests {
                     expected_value_revision: 0,
                     new_value: vec![9],
                 },
-                Observed {
-                    outcome_code: MUTATED,
-                    reason_code: 0,
-                    epoch: 1,
-                    value_revision: 1,
-                    held: true,
-                    value: Some(vec![9]),
-                },
+                applied(MUTATED, Some(1), 1, 1, 1, Some(vec![9])),
             ),
             // Invoked after the CAS responded, yet reads revision 0.
             op(
@@ -548,14 +564,7 @@ mod tests {
                 25,
                 35,
                 RegisterCall::Read,
-                Observed {
-                    outcome_code: 0,
-                    reason_code: 0,
-                    epoch: 1,
-                    value_revision: 0,
-                    held: true,
-                    value: Some(Vec::new()),
-                },
+                applied(0, Some(1), 1, 1, 0, Some(Vec::new())),
             ),
         ];
         check(&history).expect_err("the read is stale past a completed write");
@@ -566,7 +575,7 @@ mod tests {
     #[test]
     fn a_lost_write_is_refuted() {
         let history = vec![
-            op(1, 0, 10, RegisterCall::Acquire, granted(1, 0)),
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
             op(
                 1,
                 11,
@@ -576,32 +585,94 @@ mod tests {
                     expected_value_revision: 0,
                     new_value: vec![9],
                 },
-                Observed {
-                    outcome_code: MUTATED,
-                    reason_code: 0,
-                    epoch: 1,
-                    value_revision: 1,
-                    held: true,
-                    value: Some(vec![9]),
-                },
+                applied(MUTATED, Some(1), 1, 1, 1, Some(vec![9])),
             ),
             op(
                 2,
                 25,
                 35,
                 RegisterCall::Read,
-                Observed {
-                    outcome_code: 0,
-                    reason_code: 0,
-                    epoch: 1,
-                    value_revision: 1,
-                    held: true,
-                    // The revision advanced but the value is not the write's.
-                    value: Some(vec![4]),
-                },
+                // The revision advanced but the value is not the write's.
+                applied(0, Some(1), 1, 1, 1, Some(vec![4])),
             ),
         ];
         check(&history).expect_err("the committed value vanished");
+    }
+
+    /// A reply naming the wrong holder — actor 1 acquired, the snapshot says
+    /// actor 2 holds — cannot linearize. This is the fact the holder field
+    /// exists to pin: without it a grant handed to the wrong identity reads
+    /// as healthy.
+    #[test]
+    fn a_wrong_holder_reply_is_refuted() {
+        let history = vec![op(1, 0, 10, RegisterCall::Acquire, granted(2, 1, 1, 0))];
+        check(&history).expect_err("the snapshot names a holder that is not the acquirer");
+    }
+
+    /// A success carrying a refusal reason is malformed: outcome `GRANTED`
+    /// with reason `HeldByOther` is neither a grant nor a refusal, and no
+    /// interleaving may absorb it.
+    #[test]
+    fn a_success_with_a_refusal_reason_is_refuted() {
+        let mut observed = granted(1, 1, 1, 0);
+        observed.reason_code = HELD_BY_OTHER;
+        let history = vec![op(1, 0, 10, RegisterCall::Acquire, observed)];
+        check(&history).expect_err("a success must carry reason 0");
+    }
+
+    /// A renewal that does not advance the lease revision did not renew
+    /// anything: the §9.2 timer identity is `(epoch, lease_revision)`, and a
+    /// "renewal" that leaves it unchanged would never re-arm the expiry.
+    #[test]
+    fn a_renewal_that_freezes_the_lease_revision_is_refuted() {
+        let history = vec![
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
+            op(
+                1,
+                11,
+                20,
+                RegisterCall::Renew { fence_epoch: 1 },
+                // Same lease revision as the grant: nothing was renewed.
+                applied(RENEWED, Some(1), 1, 1, 0, None),
+            ),
+        ];
+        check(&history).expect_err("a renewal must advance the lease revision");
+
+        // The same history with the advanced revision linearizes, so the
+        // refutation above is the lease-revision check and nothing else.
+        let history = vec![
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
+            op(
+                1,
+                11,
+                20,
+                RegisterCall::Renew { fence_epoch: 1 },
+                applied(RENEWED, Some(1), 1, 2, 0, None),
+            ),
+        ];
+        check(&history).expect("the honest renewal linearizes");
+    }
+
+    /// A refusal that carries a snapshot must state the unchanged pre-state;
+    /// one that contradicts it — claiming the register free while the model
+    /// holds it — is refuted.
+    #[test]
+    fn a_refusal_contradicting_the_state_is_refuted() {
+        let mut denial = refused(HELD_BY_OTHER);
+        denial.snapshot = Some(SnapshotFacts {
+            epoch: 0,
+            lease_revision: 0,
+            value_revision: 0,
+            held: false,
+            holder: None,
+            value: None,
+        });
+        let history = vec![
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
+            // Denied because held — but the snapshot claims nobody holds it.
+            op(2, 11, 20, RegisterCall::Acquire, denial),
+        ];
+        check(&history).expect_err("a refusal's snapshot must state the pre-state");
     }
 
     /// An ambiguous operation is free to land in the gap that explains the
@@ -610,7 +681,7 @@ mod tests {
     fn an_ambiguous_operation_may_land_or_vanish() {
         // The ambiguous release explains how actor 2 acquired after 1.
         let history = vec![
-            op(1, 0, 10, RegisterCall::Acquire, granted(1, 0)),
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
             Recorded {
                 actor: actor(1),
                 invoked: 11,
@@ -618,13 +689,13 @@ mod tests {
                 call: RegisterCall::Release { fence_epoch: 1 },
                 observed: None,
             },
-            op(2, 12, 40, RegisterCall::Acquire, granted(3, 0)),
+            op(2, 12, 40, RegisterCall::Acquire, granted(2, 3, 3, 0)),
         ];
         check(&history).expect("the ambiguous release lands");
 
         // And with nothing depending on it, it vanishes.
         let history = vec![
-            op(1, 0, 10, RegisterCall::Acquire, granted(1, 0)),
+            op(1, 0, 10, RegisterCall::Acquire, granted(1, 1, 1, 0)),
             Recorded {
                 actor: actor(1),
                 invoked: 11,

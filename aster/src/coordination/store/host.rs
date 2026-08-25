@@ -139,6 +139,11 @@ pub struct StoreMetrics {
     /// §12.2 admission denials: in-flight ceilings, token buckets, and both
     /// §11.5 pressure tiers.
     pub denied_admission: std::sync::atomic::AtomicU64,
+    /// §14's rate-limit split of the admission family: refusals from the two
+    /// token buckets alone — the mutating-request bucket and the
+    /// denied-request short-circuit — without the in-flight ceilings or the
+    /// pressure tiers. Each also lands in `denied_admission`.
+    pub denied_rate_limited: std::sync::atomic::AtomicU64,
 
     // ── §14: the §9.2 expiry loop ──
     /// `Expire` commands proposed by the leader sweep.
@@ -146,6 +151,10 @@ pub struct StoreMetrics {
     /// Timers re-armed for a full TTL because the lease identity moved —
     /// which is exactly what a renewal means.
     pub expiry_rearms: std::sync::atomic::AtomicU64,
+    /// §14's client self-limit expirations: `Expire` commands that applied
+    /// (`SYS_EXPIRED`) — a lease that reached the TTL its own holder chose,
+    /// as opposed to a stale proposal that applied as a harmless rejection.
+    pub self_limit_expirations: std::sync::atomic::AtomicU64,
 
     // ── §14: consensus transitions, observed by the lifecycle loop ──
     pub leader_changes: std::sync::atomic::AtomicU64,
@@ -263,15 +272,30 @@ pub(crate) struct Buckets {
 }
 
 impl Buckets {
-    fn with<T>(&self, actor: &[u8; 32], run: impl FnOnce(&mut ActorAdmission) -> T) -> T {
+    /// Find-or-create the actor's entry and run `run` on it. `None` means the
+    /// table is full **of actors with live calls** and this actor is new —
+    /// the caller must refuse the call rather than grow the table.
+    ///
+    /// Only an idle entry (`in_flight == 0`) may be evicted. An active entry
+    /// holds RAII guards whose release must decrement this exact counter;
+    /// evicting it would mint the actor a fresh zero on its next call —
+    /// admitting a 33rd in-flight past the ceiling — and the old guards'
+    /// drops would then decrement the replacement's live count. The group's
+    /// 256-call ceiling keeps active entries far below the table bound, so
+    /// the `None` arm is a defensive refusal, not an expected state.
+    fn with<T>(&self, actor: &[u8; 32], run: impl FnOnce(&mut ActorAdmission) -> T) -> Option<T> {
         let mut actors = self.actors.lock().expect("the admission table");
         if !actors.contains_key(actor) && actors.len() >= MAX_TRACKED_ACTORS {
-            if let Some(oldest) = actors
+            let oldest_idle = actors
                 .iter()
+                .filter(|(_, a)| a.in_flight == 0)
                 .min_by_key(|(_, a)| a.touched)
-                .map(|(k, _)| *k)
-            {
-                actors.remove(&oldest);
+                .map(|(k, _)| *k);
+            match oldest_idle {
+                Some(oldest) => {
+                    actors.remove(&oldest);
+                }
+                None => return None,
             }
         }
         let entry = actors.entry(*actor).or_insert_with(|| ActorAdmission {
@@ -281,7 +305,7 @@ impl Buckets {
             touched: std::time::Instant::now(),
         });
         entry.touched = std::time::Instant::now();
-        run(entry)
+        Some(run(entry))
     }
 
     fn enter(&self, actor: &[u8; 32]) -> bool {
@@ -293,24 +317,29 @@ impl Buckets {
                 true
             }
         })
+        .unwrap_or(false)
     }
 
     fn leave(&self, actor: &[u8; 32]) {
-        self.with(actor, |a| a.in_flight = a.in_flight.saturating_sub(1));
+        // The entry exists: a leave comes from a guard whose enter
+        // succeeded, and an active entry is never evicted.
+        let _ = self.with(actor, |a| a.in_flight = a.in_flight.saturating_sub(1));
     }
 
     fn take_mutate(&self, actor: &[u8; 32]) -> bool {
         self.with(actor, |a| a.mutate.take(MUTATE_RATE, MUTATE_BURST))
+            .unwrap_or(false)
     }
 
     fn note_denied(&self, actor: &[u8; 32]) {
-        self.with(actor, |a| {
+        let _ = self.with(actor, |a| {
             let _ = a.denied.take(DENIED_RATE, DENIED_BURST);
         });
     }
 
     fn denied_exhausted(&self, actor: &[u8; 32]) -> bool {
         self.with(actor, |a| !a.denied.would_take(DENIED_RATE, DENIED_BURST))
+            .unwrap_or(true)
     }
 }
 
@@ -627,18 +656,6 @@ fn behind() -> RpcStatus {
 // ── The router ──────────────────────────────────────────────────────────────
 
 async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
-    // One request frame for every method: the two streams are
-    // server-streaming, not client-streaming.
-    let Some(frame) = call.recv_request().await else {
-        let _ = call
-            .finish(&RpcStatus::error(
-                StatusCode::InvalidArgument,
-                "a Store call carries exactly one request frame",
-            ))
-            .await;
-        return;
-    };
-
     let actor = match actor_of(&call) {
         Ok(actor) => actor,
         Err(status) => {
@@ -660,12 +677,15 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
         return;
     };
 
-    // §12.2, before any barrier or storage work: at most 32 calls in flight
-    // per actor, and an actor whose denied-request bucket is dry has its
-    // *reads* short-circuited here. Mutations are exempt from the
-    // short-circuit on purpose — a mutation must always reach session
-    // resolution so a saved result can replay; its own bucket sits on the
-    // propose path instead.
+    // §12.2, **before the request frame is received**: at most 32 calls in
+    // flight per actor, and an actor whose denied-request bucket is dry has
+    // its *reads* short-circuited here. The identity and the method name are
+    // already known from the transport and the call header, so an actor
+    // holding calls open without ever sending a body is counted against its
+    // own 32-slot ceiling — not left free to occupy the group-wide 256 with
+    // bodyless calls. Mutations are exempt from the denied short-circuit on
+    // purpose — a mutation must always reach session resolution so a saved
+    // result can replay; its own bucket sits on the propose path instead.
     let Some(_actor_slot) = ActorInFlight::enter(runtime, actor) else {
         StoreMetrics::bump(&runtime.metrics.denied_admission);
         let _ = call
@@ -682,6 +702,7 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
     );
     if !mutating && runtime.buckets.denied_exhausted(&actor) {
         StoreMetrics::bump(&runtime.metrics.denied_admission);
+        StoreMetrics::bump(&runtime.metrics.denied_rate_limited);
         let _ = call
             .finish(&RpcStatus::error(
                 StatusCode::ResourceExhausted,
@@ -690,6 +711,18 @@ async fn serve_call(runtime: &AttachedStore, method: &str, mut call: Call) {
             .await;
         return;
     }
+
+    // One request frame for every method: the two streams are
+    // server-streaming, not client-streaming.
+    let Some(frame) = call.recv_request().await else {
+        let _ = call
+            .finish(&RpcStatus::error(
+                StatusCode::InvalidArgument,
+                "a Store call carries exactly one request frame",
+            ))
+            .await;
+        return;
+    };
 
     let started = std::time::Instant::now();
     match (spec.class, method) {
@@ -1051,6 +1084,7 @@ async fn mutation(
             if !runtime.buckets.take_mutate(&actor) {
                 StoreMetrics::bump(&runtime.metrics.denied_status);
                 StoreMetrics::bump(&runtime.metrics.denied_admission);
+                StoreMetrics::bump(&runtime.metrics.denied_rate_limited);
                 let _ = call
                     .finish(&RpcStatus::error(
                         StatusCode::ResourceExhausted,
@@ -1284,6 +1318,7 @@ async fn retire_client(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], c
             if !runtime.buckets.take_mutate(&actor) {
                 StoreMetrics::bump(&runtime.metrics.denied_status);
                 StoreMetrics::bump(&runtime.metrics.denied_admission);
+                StoreMetrics::bump(&runtime.metrics.denied_rate_limited);
                 let _ = call
                     .finish(&RpcStatus::error(
                         StatusCode::ResourceExhausted,
@@ -1797,12 +1832,30 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
     let membership_log_id = cut.meta.membership.log_id.clone();
     let deployment_profile_code = cut.meta.deployment_profile_code;
     let group_id = cut.meta.group_id.clone();
+    // Replicated §14 facts riding the same cut: the audit floor and the
+    // genesis hash are rows of the meta the transaction pinned.
+    let audit_floor = cut.meta.audit_floor.clone();
+    let genesis_hash = cut.meta.genesis_hash.clone();
 
     // Advisory: sampled only after the replicated cut, and declared advisory
     // on the wire type. The transaction stays open until the reply is built,
     // but nothing below reads it.
     let view = runtime.readiness.view();
     let metrics = runtime.raft.metrics().borrow().clone();
+    // `RaftMetrics` carries indexes, not full log ids; the full §14 pair
+    // comes from the Raft's own data metrics and state instead of being
+    // fabricated from halves. Advisory, like every non-replicated field.
+    let last_log_id: Option<LogIdV1> = runtime
+        .raft
+        .data_metrics()
+        .borrow()
+        .last_log
+        .map(LogIdV1::from);
+    let committed_log_id: Option<LogIdV1> = runtime
+        .raft
+        .with_raft_state(|state| state.committed.map(LogIdV1::from))
+        .await
+        .unwrap_or(None);
     let reply = wire::GroupStatusReplyWireV1 {
         protocol_version: wire::STORE_PROTOCOL_VERSION,
         group_id,
@@ -1811,12 +1864,8 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
         local_role_code: view.local_role.code(),
         leader_node_id: metrics.current_leader.map(|n| n.as_bytes().to_vec()),
         term: metrics.vote.leader_id().get_term(),
-        // `RaftMetrics` carries indexes, not full log ids, and an advisory
-        // field must not fabricate the halves it does not have. v1 reports the
-        // advisory pair absent; the replicated `applied_log_id` below is the
-        // one that carries proof.
-        last_log_id: None,
-        committed_log_id: None,
+        last_log_id,
+        committed_log_id,
         applied_log_id,
         deployment_profile_code,
         membership_log_id,
@@ -1829,6 +1878,8 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
         pending_operation_id: pending,
         quorum_available: view.quorum_available,
         fatal_code: view.fatal.as_ref().map_or(0, fatal_code_of),
+        audit_floor,
+        genesis_hash,
     };
     respond_reply(call, reply).await;
 }
@@ -2332,7 +2383,8 @@ mod tests {
     }
 
     /// The admission table is bounded: a rotating flood of fresh identities
-    /// evicts the least-recently-touched entry instead of growing the map.
+    /// evicts the least-recently-touched **idle** entry instead of growing
+    /// the map.
     #[test]
     fn the_admission_table_is_bounded_by_eviction() {
         let buckets = Buckets::default();
@@ -2340,9 +2392,92 @@ mod tests {
             let mut actor = [0u8; 32];
             actor[..8].copy_from_slice(&(i as u64).to_be_bytes());
             assert!(buckets.enter(&actor));
+            buckets.leave(&actor);
         }
         let actors = buckets.actors.lock().expect("the admission table");
         assert_eq!(actors.len(), MAX_TRACKED_ACTORS);
+    }
+
+    /// An actor with live calls is never evicted, whatever floods the table.
+    ///
+    /// The reviewer's bypass: churn 1,024 fresh identities so the LRU evicts
+    /// an actor holding 32 slots; that actor's next call would mint a fresh
+    /// zeroed counter and admit a 33rd, and the old guards' drops would then
+    /// decrement the replacement entry. The ceiling must hold across any
+    /// amount of identity churn.
+    #[test]
+    fn an_actor_with_live_calls_survives_identity_churn() {
+        let buckets = Buckets::default();
+        let held = [0xAA; 32];
+        for _ in 0..MAX_IN_FLIGHT_PER_ACTOR {
+            assert!(buckets.enter(&held));
+        }
+
+        // Far more than a table's worth of rotating identities, entered and
+        // left so they are idle and evictable.
+        for i in 0..(2 * MAX_TRACKED_ACTORS) {
+            let mut actor = [0u8; 32];
+            actor[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert!(buckets.enter(&actor));
+            buckets.leave(&actor);
+        }
+
+        assert!(
+            !buckets.enter(&held),
+            "the churn must not have evicted the active entry: a 33rd call \
+             would be past the ceiling"
+        );
+        buckets.leave(&held);
+        assert!(buckets.enter(&held), "the same entry still counts releases");
+    }
+
+    /// A table saturated with **active** actors refuses a newcomer rather
+    /// than evicting a live entry. Defensive: the group's 256-call ceiling
+    /// keeps live entries far below the table bound in production.
+    #[test]
+    fn a_table_full_of_active_actors_refuses_the_newcomer() {
+        let buckets = Buckets::default();
+        for i in 0..MAX_TRACKED_ACTORS {
+            let mut actor = [0u8; 32];
+            actor[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert!(buckets.enter(&actor));
+        }
+        assert!(
+            !buckets.enter(&[0xEE; 32]),
+            "no idle entry exists to evict; the newcomer is refused"
+        );
+        // One release makes one slot evictable again.
+        let mut first = [0u8; 32];
+        first[..8].copy_from_slice(&0u64.to_be_bytes());
+        buckets.leave(&first);
+        assert!(buckets.enter(&[0xEE; 32]));
+    }
+
+    /// §12.2's admission runs before the request frame is received: the
+    /// actor slot and the denied-bucket short-circuit are charged on call
+    /// arrival, so bodyless calls cannot occupy group capacity outside the
+    /// actor's own ceiling. A source-order statement, like the shutdown
+    /// order in `runtime::owner` and for the same reason: the ordering is
+    /// not observable from outside without a transport that half-sends.
+    #[test]
+    fn admission_precedes_the_request_frame() {
+        let source = include_str!("host.rs");
+        let at = source
+            .find("async fn serve_call(")
+            .expect("serve_call exists");
+        let body = &source[at..];
+        let enter = body
+            .find("ActorInFlight::enter(")
+            .expect("the actor slot is taken");
+        let denied = body
+            .find("denied_exhausted(")
+            .expect("the denied bucket is consulted");
+        let recv = body.find("recv_request()").expect("the frame is received");
+        assert!(
+            enter < recv && denied < recv,
+            "the actor slot and the denied short-circuit must be charged \
+             before the request frame is awaited"
+        );
     }
 
     /// The tier-one predicate compares the database's real size against the

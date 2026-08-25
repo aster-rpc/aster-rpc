@@ -91,6 +91,28 @@ enum Observed {
     Ready(Box<PlacementInput>, Box<GroupStatusReplyWireV1>),
 }
 
+/// The facts a plan was computed against, retained across provisioning so
+/// the §7.7.3 recheck can *prove* nothing moved rather than trusting that a
+/// fresh plan is the same plan. A seed was provisioned under exactly this
+/// `(policy digest, membership LogId)` tuple; submitting it after the tuple
+/// changed would inject material minted for a different world.
+#[derive(Debug, Clone, PartialEq)]
+struct ObservationFingerprint {
+    policy_revision: u64,
+    policy_digest: [u8; 32],
+    membership_log_id: Option<LogIdV1>,
+}
+
+impl ObservationFingerprint {
+    fn of(input: &PlacementInput) -> Self {
+        Self {
+            policy_revision: input.policy.revision,
+            policy_digest: input.policy.digest,
+            membership_log_id: input.membership_log_id.clone(),
+        }
+    }
+}
+
 pub struct CoordinationPlacementManager<T, P, V> {
     client: CoordinationClient,
     topology: T,
@@ -131,20 +153,46 @@ where
     /// or an active intent.
     pub async fn reconcile(&mut self) -> Result<PlacementReport> {
         // §7.7.3's "exact journalled retry": a membership request fsynced by
-        // a previous life of this client resolves before anything new.
-        if let Ok(Some(resolved)) = self.client.resume().await {
-            let outcome = resolved.reply().outcome_code;
-            resolved.acknowledge().await?;
-            return Ok(self.stub_report(format!(
-                "a journalled membership request from a previous run resolved \
-                 with outcome {outcome}; re-observe before planning again"
-            )));
+        // a previous life of this client resolves before anything new. An
+        // error here means an older durable request **may still be
+        // unresolved**, so no observation, provisioning, or planning may
+        // run: reachability failures become stop-reports like the ones the
+        // observation pass produces, and anything else surfaces as the
+        // failure it is.
+        match self.client.resume().await {
+            Ok(Some(resolved)) => {
+                let outcome = resolved.reply().outcome_code;
+                resolved.acknowledge().await?;
+                return Ok(self.stub_report(format!(
+                    "a journalled membership request from a previous run resolved \
+                     with outcome {outcome}; re-observe before planning again"
+                )));
+            }
+            Ok(None) => {}
+            Err(Error::Rpc {
+                code: 14, message, ..
+            }) => {
+                return Ok(self.stub_report(format!(
+                    "a journalled membership request from a previous run is still \
+                     unresolved (no leader or no quorum: {message}); nothing new \
+                     is planned until it resolves"
+                )))
+            }
+            Err(Error::Transport(err)) => {
+                return Ok(self.stub_report(format!(
+                    "a journalled membership request from a previous run is still \
+                     unresolved (unreachable: {err}); nothing new is planned until \
+                     it resolves"
+                )))
+            }
+            Err(other) => return Err(other),
         }
 
         let (input, status) = match self.observe().await? {
             Observed::Stop(report) => return Ok(*report),
             Observed::Ready(input, status) => (*input, *status),
         };
+        let planned = ObservationFingerprint::of(&input);
 
         match placement::plan(&input) {
             PlacementRecommendation::NeedsProvisioning { candidates } => {
@@ -165,13 +213,16 @@ where
                     }
                     provisioned.insert(node, seed);
                 }
-                self.recheck_and_submit(provisioned).await
+                self.recheck_and_submit(planned, provisioned).await
             }
-            PlacementRecommendation::Plan(_) => self.recheck_and_submit(BTreeMap::new()).await,
+            PlacementRecommendation::Plan(_) => {
+                self.recheck_and_submit(planned, BTreeMap::new()).await
+            }
             other => Ok(report_of(
                 &self.client,
                 &input.policy,
                 &status,
+                &input.grace_crossed_members,
                 None,
                 reason_of(&other),
                 separation_of(&other),
@@ -180,19 +231,39 @@ where
     }
 
     /// §7.7.3 step 5: re-read status, topology and policy, recompute, and
-    /// only submit what the **fresh** observation still recommends. The
-    /// earlier recommendation is discarded by construction — it is simply
-    /// never submitted.
+    /// submit only when the **fresh** observation still carries the exact
+    /// `(policy revision/digest, membership LogId)` the plan — and any
+    /// provisioning — was computed against. A changed tuple discards the
+    /// recommendation outright: the provisioned seeds were minted for the
+    /// old tuple and are not injected into the new world, and no fresh plan
+    /// is submitted on this pass — the next reconciliation starts over.
     async fn recheck_and_submit(
         &mut self,
+        planned: ObservationFingerprint,
         provisioned: BTreeMap<CoordinationNodeId, MemberSeedV1>,
     ) -> Result<PlacementReport> {
         let (mut input, status) = match self.observe().await? {
             Observed::Stop(report) => return Ok(*report),
             Observed::Ready(input, status) => (*input, *status),
         };
-        // Provisioned seeds join the candidate material only where the fresh
-        // policy still names the candidate eligible and still lacks a seed.
+        let fresh = ObservationFingerprint::of(&input);
+        if fresh != planned {
+            return Ok(report_of(
+                &self.client,
+                &input.policy,
+                &status,
+                &input.grace_crossed_members,
+                None,
+                "the policy revision/digest or membership log id changed between \
+                 planning and submission; the plan and its provisioned seeds are \
+                 discarded — the next reconciliation re-observes"
+                    .to_string(),
+                None,
+            ));
+        }
+        // The tuple is unchanged, so the provisioned seeds join the candidate
+        // material — only where the fresh policy still names the candidate
+        // eligible and still lacks a seed.
         for (node, seed) in provisioned {
             if let Some(candidate) = input.policy.eligible.get_mut(&node) {
                 if candidate.member_seed.is_none() {
@@ -201,11 +272,15 @@ where
             }
         }
         match placement::plan(&input) {
-            PlacementRecommendation::Plan(plan) => self.submit(&input.policy, &status, *plan).await,
+            PlacementRecommendation::Plan(plan) => {
+                self.submit(&input.policy, &status, &input.grace_crossed_members, *plan)
+                    .await
+            }
             other => Ok(report_of(
                 &self.client,
                 &input.policy,
                 &status,
+                &input.grace_crossed_members,
                 None,
                 format!("the recheck superseded the plan: {}", reason_of(&other)),
                 separation_of(&other),
@@ -220,6 +295,7 @@ where
         &mut self,
         policy: &PlacementPolicy,
         status: &GroupStatusReplyWireV1,
+        grace_crossed: &BTreeSet<CoordinationNodeId>,
         plan: PlacementPlan,
     ) -> Result<PlacementReport> {
         let mut operation_id = [0u8; 16];
@@ -270,6 +346,7 @@ where
             &self.client,
             policy,
             status,
+            grace_crossed,
             pending,
             reason,
             Some(plan.separation.clone()),
@@ -313,6 +390,8 @@ where
                 &self.client,
                 &policy,
                 &status,
+                // No topology pass ran, so no grace observation exists yet.
+                &BTreeSet::new(),
                 pending,
                 "a membership operation is converging; no second plan exists".to_string(),
                 None,
@@ -367,6 +446,7 @@ where
             current_learners: Vec::new(),
             selected_voters: Vec::new(),
             selected_learners: Vec::new(),
+            grace_crossed_members: Vec::new(),
             separation: None,
             pending_operation_id: None,
             reason,
@@ -389,6 +469,7 @@ fn report_of(
     client: &CoordinationClient,
     policy: &PlacementPolicy,
     status: &GroupStatusReplyWireV1,
+    grace_crossed: &BTreeSet<CoordinationNodeId>,
     pending: Option<[u8; 16]>,
     reason: String,
     separation: Option<placement::SeparationSummary>,
@@ -408,6 +489,7 @@ fn report_of(
         current_learners: as_ids(&status.learners),
         selected_voters: Vec::new(),
         selected_learners: Vec::new(),
+        grace_crossed_members: grace_crossed.iter().copied().collect(),
         separation,
         pending_operation_id: pending,
         reason,

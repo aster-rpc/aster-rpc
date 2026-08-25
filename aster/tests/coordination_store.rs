@@ -177,6 +177,22 @@ where
     decode(&raw)
 }
 
+/// Call and report only the status code: `None` for a served reply, the
+/// code for a refusal. For polls whose target may serve or refuse while a
+/// transition (like the §11.5 evacuation) is landing.
+async fn client_status<Req>(client: &Client, method: &str, request: &Req) -> Option<i32>
+where
+    Req: aster::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+{
+    match within(method, client.conn.unary(&header(method), encode(request))).await {
+        Ok(_) => None,
+        Err(Error::Rpc { code, .. }) => Some(code),
+        // A transport-level failure mid-transition (a stream reset while the
+        // runtime tears down) reads as "not the answer yet".
+        Err(_) => Some(-1),
+    }
+}
+
 /// Call and expect a non-OK status; return `(code, message, details)`.
 async fn call_refused<Req>(
     client: &Client,
@@ -220,6 +236,7 @@ const PERMISSION_DENIED: i32 = 7;
 const INVALID_ARGUMENT: i32 = 3;
 const UNAVAILABLE: i32 = 14;
 const RESOURCE_EXHAUSTED: i32 = 8;
+const FAILED_PRECONDITION: i32 = 9;
 
 fn resource(key: &[u8]) -> ResourceKeyV1 {
     ResourceKeyV1 {
@@ -1504,14 +1521,19 @@ async fn a_never_written_register_reads_as_its_default_value() {
 
 // ── §11.5 pressure tiers and §12.2 admission (the reopen's blocker 6) ───────
 
-/// **The two §11.5 tiers refuse exactly what they claim to refuse.**
+/// **The two §11.5 tiers behave as the contract splits them.**
 ///
-/// Tier one (state-db high-water): growth-class mutations and the creation of
-/// a **new session row** are refused — even when the new session's action is
-/// itself safety-reducing — while renewals from known sessions continue.
-/// Tier two (free-space floor): every new mutation is refused, retirement
-/// included, while linearizable reads keep serving. Clearing the tiers
-/// restores everything, and no refused sequence was consumed.
+/// Tier one (state-db high-water) is a *reversible refusal gate*:
+/// growth-class mutations and the creation of a **new session row** are
+/// refused — even when the new session's action is itself safety-reducing —
+/// while renewals from known sessions and linearizable reads continue, and
+/// clearing the tier restores everything with no refused sequence consumed.
+///
+/// Tier two (free-space floor) is **latch-and-exit**: every new mutation is
+/// refused immediately, the monitor's next pass latches the tier and shuts
+/// the local runtime down cleanly so another voter can lead, and
+/// withdrawing the pressure afterwards resurrects nothing — the opposite of
+/// a reversible gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_pressure_tiers_refuse_growth_then_everything_and_reads_survive() {
     let h = harness(0xD9).await;
@@ -1618,26 +1640,77 @@ async fn the_pressure_tiers_refuse_growth_then_everything_and_reads_survive() {
     .await;
     assert_eq!(code, RESOURCE_EXHAUSTED, "compare_and_set is growth");
 
-    // ── Tier two: the free-space floor ──
-    coordination.set_pressure_for_testing(false, true);
-
-    // The release the high-water mark would have allowed is now refused too.
-    let (code, message, _) = call_refused(
+    // Reads keep serving at the high-water mark.
+    let read: ReadReplyWireV1 = call(
         &h.worker,
-        "release",
-        &ReleaseRequestV1 {
+        "read_linearizable",
+        &ReadRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            resource: resource(b"pressured"),
+        },
+    )
+    .await;
+    assert!(read.snapshot.held, "the read serves under tier one");
+
+    // ── Clear tier one: reversible, and no refused sequence was consumed ──
+    coordination.set_pressure_for_testing(false, false);
+    let mutated: MutationReplyWireV1 = call(
+        &h.worker,
+        "compare_and_set",
+        &CompareAndSetRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: group_of(&h.fixture),
             client_id: id16(b"wk"),
             sequence: 3,
             fence: fence.clone(),
+            expected_value_revision: 0,
+            new_value: vec![1, 2, 3],
+        },
+    )
+    .await;
+    assert_eq!(
+        mutated.disposition_code, 1,
+        "the same sequence commits after tier one clears: {mutated:?}"
+    );
+    let released: MutationReplyWireV1 = call(
+        &h.worker,
+        "release",
+        &ReleaseRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk2"),
+            sequence: 1,
+            fence: fence.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        released.disposition_code, 1,
+        "the new session commits after tier one clears: {released:?}"
+    );
+
+    // ── Tier two: the free-space floor is latch-and-exit (§11.5) ──
+    coordination.set_pressure_for_testing(false, true);
+
+    // Immediately: every new mutation is refused, retirement included. (An
+    // acquire, so the request passes session resolution and admission and
+    // meets the tier-two gate itself, not an earlier typed refusal.)
+    let (code, message, _) = call_refused(
+        &h.worker,
+        "acquire",
+        &AcquireRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+            client_id: id16(b"wk"),
+            sequence: 4,
+            resource: resource(b"pressured"),
+            ttl_ms: 60_000,
         },
     )
     .await;
     assert_eq!(code, RESOURCE_EXHAUSTED, "tier two refuses everything");
     assert!(message.contains("draining"), "the tier is named: {message}");
-
-    // Even retirement, because applying it writes.
     let (code, _, _) = call_refused(
         &h.root,
         "retire_client",
@@ -1651,51 +1724,47 @@ async fn the_pressure_tiers_refuse_growth_then_everything_and_reads_survive() {
     .await;
     assert_eq!(code, RESOURCE_EXHAUSTED, "tier two refuses retirement");
 
-    // Reads keep serving under the floor.
-    let read: ReadReplyWireV1 = call(
-        &h.worker,
-        "read_linearizable",
-        &ReadRequestV1 {
-            protocol_version: STORE_PROTOCOL_VERSION,
-            group_id: group_of(&h.fixture),
-            resource: resource(b"pressured"),
-        },
-    )
-    .await;
-    assert!(read.snapshot.held, "the read serves under tier two");
+    // Then the monitor's next pass (≤ 2s) latches the tier and runs the
+    // §11.5 shutdown sequence: the Store detaches, the Raft stops, and this
+    // node steps aside so another voter can lead. Every call — reads
+    // included — now answers `FAILED_PRECONDITION`, the same status a node
+    // that has not attached yet answers.
+    let read_request = ReadRequestV1 {
+        protocol_version: STORE_PROTOCOL_VERSION,
+        group_id: group_of(&h.fixture),
+        resource: resource(b"pressured"),
+    };
+    // A read may still serve in the window before the monitor's pass, so
+    // the poll accepts replies until the detach lands.
+    let probe = || async { client_status(&h.worker, "read_linearizable", &read_request).await };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match probe().await {
+            Some(FAILED_PRECONDITION) => break,
+            last => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the monitor must evacuate the runtime under hard \
+                     pressure, last answer {last:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
 
-    // ── Clear: the refused sequences were never consumed ──
+    // The latch: withdrawing the pressure resurrects nothing. Space freed
+    // after the latch does not un-drain a node that already stepped aside.
     coordination.set_pressure_for_testing(false, false);
-    let released: MutationReplyWireV1 = call(
-        &h.worker,
-        "release",
-        &ReleaseRequestV1 {
-            protocol_version: STORE_PROTOCOL_VERSION,
-            group_id: group_of(&h.fixture),
-            client_id: id16(b"wk"),
-            sequence: 3,
-            fence,
-        },
-    )
-    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
-        released.disposition_code, 1,
-        "the same sequence commits after: {released:?}"
+        probe().await,
+        Some(FAILED_PRECONDITION),
+        "a hard tier that clears when space returns is a reversible refusal \
+         gate, which §11.5 forbids"
     );
-    let retired: RetireClientReplyWireV1 = call(
-        &h.root,
-        "retire_client",
-        &RetireClientRequestV1 {
-            protocol_version: STORE_PROTOCOL_VERSION,
-            group_id: group_of(&h.fixture),
-            target_node_id: h.worker.id.to_vec(),
-            target_client_id: id16(b"wk3").to_vec(),
-        },
-    )
-    .await;
-    assert_eq!(
-        retired.reason_code, 0,
-        "retirement commits after: {retired:?}"
+    assert!(
+        coordination.disk_status().free_space_pressure,
+        "the latched tier keeps reporting the pressure that ended the runtime"
     );
 }
 
@@ -1741,6 +1810,13 @@ async fn a_denial_storm_is_short_circuited_per_actor() {
     assert_eq!(code, PERMISSION_DENIED, "the worker's bucket is its own");
     let admins: AdminStatusReplyWireV1 = call(&h.root, "inspect_admins", &request).await;
     assert_eq!(admins.admin_snapshot.administrators.len(), 1);
+
+    // §14: every short-circuit landed in the rate-limit family.
+    let m = h._voter.coordination().expect("hosted").store_metrics();
+    assert!(
+        m.denied_rate_limited >= 1 && m.denied_admission >= m.denied_rate_limited,
+        "the token-bucket denials are their own §14 family: {m:?}"
+    );
 }
 
 // ── §14: the observability contract ─────────────────────────────────────────
@@ -1924,7 +2000,7 @@ async fn the_section_14_surfaces_move_with_the_operations() {
     assert!(m.leader_changes >= 1, "the election was observed: {m:?}");
 
     // ── The consensus facts. ──
-    let consensus = coordination.consensus_status();
+    let consensus = coordination.consensus_status().await;
     assert!(consensus.leader_node_id.is_some(), "{consensus:?}");
     assert!(
         consensus.last_applied_index.unwrap_or(0) >= 8,
@@ -1933,6 +2009,24 @@ async fn the_section_14_surfaces_move_with_the_operations() {
     assert!(
         !consensus.replication.is_empty(),
         "the leader reports per-peer replication progress: {consensus:?}"
+    );
+    // The §14 identity and log-position facts: the genesis is installed and
+    // named, and the full last/committed/applied ids are reported — not
+    // fabricated index-only halves.
+    assert!(
+        consensus.genesis_installed && consensus.genesis_hash.is_some(),
+        "{consensus:?}"
+    );
+    let committed = consensus.committed.expect("a committed id");
+    let last_log = consensus.last_log.expect("a last log id");
+    assert!(
+        last_log.index >= committed.index
+            && committed.index >= consensus.last_applied.expect("applied").index,
+        "last >= committed >= applied: {consensus:?}"
+    );
+    assert!(
+        consensus.audit_floor_index.is_none(),
+        "no audit pruning ran, so the full history is retained: {consensus:?}"
     );
 
     // ── The disk gauges, once the monitor has sampled. ──

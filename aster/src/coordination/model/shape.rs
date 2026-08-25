@@ -399,6 +399,87 @@ pub(crate) fn check_seed_ticket(ticket: &[u8], node: &[u8; 32]) -> Result<(), Sh
     Ok(())
 }
 
+/// The structural half of the §7.1 join-permit validation, for callers that
+/// hold no group authority — the §7.7 placement planner (§7.7.1: "every
+/// supplied/provisioned seed passes the existing canonical ticket and permit
+/// validation before the planner can emit `Plan`").
+///
+/// Mirrors [`model::authority`](crate::coordination::model::authority)'s
+/// apply-time checks minus the two things a planner cannot hold: the pinned
+/// authority key (so no signature verdict — a signature checked with the key
+/// that came with the envelope proves nothing) and the group's own
+/// domain/group-id/genesis bindings. Apply remains the decision of record;
+/// this exists so a malformed or misbound permit is refused before a plan is
+/// ever emitted, not discovered as a replicated refusal.
+pub(crate) fn check_seed_permit(permit_bytes: &[u8], node: &[u8; 32]) -> Result<(), String> {
+    use crate::coordination::contract::payload_fory;
+    use crate::coordination::raft::{JoinPermitV1, SignedCoordinationDocumentV1};
+
+    let envelope: SignedCoordinationDocumentV1 = payload_fory::<SignedCoordinationDocumentV1>()
+        .deserialize(permit_bytes)
+        .map_err(|_| "the permit envelope does not decode".to_string())?;
+    if envelope.format_version != 1 {
+        return Err(format!(
+            "permit envelope format {} is not version 1",
+            envelope.format_version
+        ));
+    }
+    if envelope.authority_public_key.len() != 32 || envelope.signature.len() != 64 {
+        return Err("the permit envelope's key or signature has the wrong width".to_string());
+    }
+
+    let permit: JoinPermitV1 = payload_fory::<JoinPermitV1>()
+        .deserialize(&envelope.document_bytes)
+        .map_err(|_| "the permit document does not decode".to_string())?;
+    // §7.1: decode then re-encode must reproduce the signed bytes exactly.
+    let reencoded = payload_fory::<JoinPermitV1>()
+        .serialize(&permit)
+        .map_err(|_| "the permit document does not re-encode".to_string())?;
+    if reencoded != envelope.document_bytes {
+        return Err("the permit document is not the canonical encoding".to_string());
+    }
+
+    if permit.format_version != 1 {
+        return Err(format!(
+            "permit format {} is not version 1",
+            permit.format_version
+        ));
+    }
+    if permit.group_id.len() != 32
+        || permit.genesis_hash.len() != 32
+        || permit.candidate_node_id.len() != 32
+        || permit.join_nonce.len() != 32
+        || permit.authority_domain.is_empty()
+        // 128 is `authority::MAX_AUTHORITY_DOMAIN_BYTES`, restated because
+        // that module is voter-gated and this check compiles for the client.
+        || permit.authority_domain.len() > 128
+        || !permit.authority_domain.is_ascii()
+    {
+        return Err("a permit field has the wrong width".to_string());
+    }
+    if permit.bootstrap_senders.is_empty()
+        || permit
+            .bootstrap_senders
+            .iter()
+            .any(|n| n.node_id.len() != 32)
+        || permit
+            .bootstrap_senders
+            .windows(2)
+            .any(|w| w[0].node_id >= w[1].node_id)
+    {
+        return Err("the permit's bootstrap senders are empty, unsorted, or malformed".to_string());
+    }
+
+    // The bindings a planner can check: this permit is for this seed's node,
+    // via the same canonical-ticket rule the seed's own ticket passes.
+    if permit.candidate_node_id.as_slice() != node.as_slice() {
+        return Err("the permit names a different candidate node".to_string());
+    }
+    check_seed_ticket(permit.candidate_ticket.as_bytes(), node)
+        .map_err(|limit| format!("the permit's candidate ticket is invalid: {limit:?}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

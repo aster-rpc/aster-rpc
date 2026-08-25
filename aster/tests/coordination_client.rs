@@ -510,6 +510,15 @@ async fn an_abandoned_lease_expires_and_a_successor_acquires() {
         .await
         .expect("the successor releases cleanly");
 
+    // §14: the expiry that freed the abandoned lease is exactly one client
+    // self-limit event — the lease reached the TTL its own holder chose —
+    // and it rode an `Expire` proposal from the leader sweep.
+    let metrics = voter.coordination().expect("hosted").store_metrics();
+    assert!(
+        metrics.expire_proposed >= 1 && metrics.self_limit_expirations >= 1,
+        "the applied expiry must land in the §14 self-limit counter: {metrics:?}"
+    );
+
     voter.shutdown().await;
 }
 
