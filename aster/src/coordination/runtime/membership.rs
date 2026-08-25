@@ -660,6 +660,18 @@ pub(crate) async fn run_generation(
                 Ok(())
             }
             Step::ChangeVoters => {
+                // Re-checked before the side effect, exactly like
+                // `AddLearners` and the barrier: a superseded or shut-down
+                // generation must not commit a phase report or a voter
+                // change it no longer drives.
+                if !still_leading(
+                    &raft.metrics().borrow().clone(),
+                    &local,
+                    generation,
+                    Arc::clone(&current_generation),
+                ) {
+                    return;
+                }
                 if intent.status_code == phases::PHASE_PENDING {
                     // The transition commits **before** external learner work,
                     // so a crash between the two resumes rather than repeating
@@ -694,6 +706,14 @@ pub(crate) async fn run_generation(
                 }
             }
             Step::ReplaceNodes => {
+                if !still_leading(
+                    &raft.metrics().borrow().clone(),
+                    &local,
+                    generation,
+                    Arc::clone(&current_generation),
+                ) {
+                    return;
+                }
                 let desired: Vec<CoordinationNodeId> = intent
                     .plan
                     .desired_voters
@@ -709,6 +729,14 @@ pub(crate) async fn run_generation(
                 replace_node_map(&raft, &desired, &retained).await
             }
             Step::ReportComplete => {
+                if !still_leading(
+                    &raft.metrics().borrow().clone(),
+                    &local,
+                    generation,
+                    Arc::clone(&current_generation),
+                ) {
+                    return;
+                }
                 // The **committed** membership's log id, which is what
                 // `decide_progress` compares a `Completed` report against. From
                 // the effective one it could name an entry no quorum accepted,
@@ -1619,6 +1647,34 @@ mod tests {
     /// new generation observes a fresh one — correct, because it has
     /// re-observed everything else too.
     ///
+    /// **Every side-effecting step re-checks leadership and generation
+    /// immediately before acting** — `AddLearners`, the catch-up barrier,
+    /// `ChangeVoters`, `ReplaceNodes`, `ReportComplete`, and the cancel
+    /// cleanup. The third review found three arms without the recheck: a
+    /// superseded or shut-down generation could commit a phase report or a
+    /// voter change it no longer drove. A source guard, because the window
+    /// is scheduler-shaped: the recheck's absence only matters in the
+    /// milliseconds between supersession and the arm's round trip.
+    #[test]
+    fn every_side_effecting_step_rechecks_leadership() {
+        let source = include_str!("membership.rs");
+        let end = crate::coordination::guards::production_end(source);
+        let production = &source[..end];
+        let at = production
+            .find("pub(crate) async fn run_generation(")
+            .expect("the controller loop exists");
+        let body_end = production[at..]
+            .find("\n/// How long the controller waits")
+            .expect("the loop is followed by IDLE_POLL");
+        let body = &production[at..at + body_end];
+        let rechecks = body.matches("still_leading(").count();
+        assert!(
+            rechecks >= 6,
+            "all six side-effecting arms must recheck still_leading before \
+             their side effect; found {rechecks}"
+        );
+    }
+
     /// A source guard, because the property is about state that does not exist.
     /// No behavioural test can observe a field nobody wrote.
     #[test]

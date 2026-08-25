@@ -697,7 +697,9 @@ fn seal_genesis(
         }
         // The same validator §9 applies to a member seed's ticket, so a genesis
         // seed and a membership seed cannot disagree about what a route is.
-        super::membership::check_seed_ticket(seed.ticket.as_bytes(), &node_id)
+        // (`shape` is the owner; the voter-gated `membership` module re-exports
+        // it, and this module compiles for the client graph too.)
+        super::shape::check_seed_ticket(seed.ticket.as_bytes(), &node_id)
             .map_err(|limit| GenesisError::VoterSeedTicket { limit })?;
         initial_voters.push(VerifiedVoterSeed {
             node_id,

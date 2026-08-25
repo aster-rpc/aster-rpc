@@ -234,6 +234,9 @@ impl MembershipPlan {
     /// also what §11.3 stores. An earlier revision built its own copy here and
     /// narrowed the ticket with `from_utf8_lossy`, so a charge could in
     /// principle be measured from bytes that differ from the ones written.
+    /// Voter-gated: the wire projection it charges through lives in the
+    /// voter graph, and only apply's accounting calls this.
+    #[cfg(feature = "coordination")]
     pub fn encoded_len(
         &self,
         operation_id: &OperationId,
@@ -297,6 +300,8 @@ impl Intent {
     ///
     /// Takes the operation id because the row is keyed by it and stores it, so
     /// the charge and the stored value are measured from the same thing.
+    /// Voter-gated with [`MembershipPlan::encoded_len`], for the same reason.
+    #[cfg(feature = "coordination")]
     pub fn charge_len(&self, operation_id: &OperationId) -> usize {
         self.plan
             .encoded_len(operation_id, self.expected_membership)
@@ -619,6 +624,8 @@ impl State {
     /// Partitioned by **table**, never by the command that wrote the row -- a
     /// row on disk does not record what created it, so any command-dependent
     /// split is unrecomputable and a snapshot could not reproduce the counter.
+    /// Voter-gated with the wire projection its intent charges ride on.
+    #[cfg(feature = "coordination")]
     pub fn recompute_growth(&self) -> u64 {
         let resources: u64 = self
             .resources
@@ -664,6 +671,8 @@ impl State {
     /// This is the property snapshot install and log replay depend on. It is
     /// checked in tests after arbitrary histories rather than asserted in
     /// apply, where recomputing on every transition would be O(state).
+    /// Voter-gated with [`Self::recompute_growth`].
+    #[cfg(feature = "coordination")]
     pub fn counters_match_recomputation(&self) -> bool {
         self.growth_bytes == self.recompute_growth()
             && self.reserve_bytes == self.recompute_reserve()

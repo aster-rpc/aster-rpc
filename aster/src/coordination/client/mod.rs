@@ -27,7 +27,12 @@
 
 mod driver;
 pub(crate) mod engine;
-pub mod journal;
+/// Crate-private on purpose (the third review's capability note): the only
+/// paths that may persist into a journal are the driver — which checks the
+/// reply echoes the pending entry before `resolve` — and the client's own
+/// transitions. A public mutation surface would let arbitrary bytes become
+/// "this entry's saved answer" without that check.
+pub(crate) mod journal;
 pub mod lease;
 pub mod manager;
 pub mod placement;

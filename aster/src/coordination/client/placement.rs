@@ -52,6 +52,13 @@ pub struct PlacementCandidate {
 pub struct PlacementPolicy {
     pub revision: u64,
     pub digest: [u8; 32],
+    /// The deployment's pinned authority key — the same value every voter is
+    /// configured with. Supplied by the application (which configures the
+    /// voters), so the planner can run the **same** permit verification
+    /// apply runs, signature included, before a plan exists.
+    pub authority_public_key: [u8; 32],
+    /// The deployment's authority domain, paired with the key above.
+    pub authority_domain: String,
     pub target_voters: u8,
     pub target_retained_learners: u8,
     pub eligible: BTreeMap<CoordinationNodeId, PlacementCandidate>,
@@ -69,6 +76,9 @@ pub struct PlacementPolicy {
 #[derive(Clone)]
 pub struct PlacementInput {
     pub group_id: CoordinationGroupId,
+    /// The group's genesis hash from the same replicated status cut the
+    /// membership came from — the fourth binding a join permit must name.
+    pub genesis_hash: [u8; 32],
     pub deployment_profile_code: i32,
     pub membership_log_id: Option<LogIdV1>,
     pub current_voters: BTreeSet<CoordinationNodeId>,
@@ -125,9 +135,18 @@ pub enum PlacementRecommendation {
     },
     /// One membership intent is active; no second plan exists.
     Converging,
-    /// Exactly these selected NodeIds lack canonical seed material.
+    /// Exactly these selected NodeIds lack canonical seed material. The
+    /// selection they belong to rides along so the manager can retain it as
+    /// part of the recommendation fingerprint: after provisioning, a fresh
+    /// topology snapshot that selects *different* members discards the pass
+    /// instead of submitting whatever the second snapshot produced.
     NeedsProvisioning {
         candidates: BTreeSet<CoordinationNodeId>,
+        /// The full voter selection the candidates were chosen for
+        /// (ascending byte order, like a plan's).
+        desired_voters: Vec<CoordinationNodeId>,
+        /// The learner selection beside it.
+        retained_learners: Vec<CoordinationNodeId>,
     },
     /// Required eligible/live candidates or requested positive separation
     /// are unavailable; `missing` names the fact.
@@ -275,19 +294,30 @@ fn validate_policy(input: &PlacementInput) -> Result<(), String> {
                     key.to_hex()
                 ));
             }
-            // §7.7.1: every supplied/provisioned seed passes the existing
-            // canonical ticket **and permit** validation before the planner
-            // can emit `Plan`. The planner runs the structural half — the
-            // envelope, the canonical document, the shape rules, and the
-            // candidate/ticket bindings; the signature is verified against
-            // the pinned authority key at replicated apply, which a planner
-            // does not hold.
+            // §7.7.1: every supplied/provisioned seed passes **the existing
+            // permit validation** before the planner can emit `Plan` — the
+            // same `verify_join_permit` apply runs, signature and all four
+            // bindings included. The authority key and domain come from the
+            // policy (the application configures the voters with the same
+            // values); the group id and genesis hash from the replicated
+            // status cut the input was built from. A permit for another
+            // group, another genesis, or under another key is refused here,
+            // not discovered as a replicated apply refusal after a
+            // quorum-committed intent.
             if let Some(permit) = &seed.signed_join_permit {
-                if let Err(why) =
-                    crate::coordination::model::shape::check_seed_permit(permit, key.as_bytes())
-                {
+                let authority = crate::coordination::model::state::GroupAuthority {
+                    public_key: policy.authority_public_key,
+                    domain: policy.authority_domain.clone(),
+                    group_id: *input.group_id.as_bytes(),
+                    genesis_hash: input.genesis_hash,
+                };
+                if let Err(why) = crate::coordination::model::authority::verify_join_permit(
+                    &authority,
+                    permit,
+                    key.as_bytes(),
+                ) {
                     return Err(format!(
-                        "the join permit for {} is invalid: {why}",
+                        "the join permit for {} does not verify: {why:?}",
                         key.to_hex()
                     ));
                 }
@@ -641,17 +671,18 @@ pub fn plan(input: &PlacementInput) -> PlacementRecommendation {
             }
         }
     }
-    if !unprovisioned.is_empty() {
-        return PlacementRecommendation::NeedsProvisioning {
-            candidates: unprovisioned,
-        };
-    }
-    member_seeds.sort_by(|l, r| l.node_id.cmp(&r.node_id));
-
     let mut desired_voters: Vec<CoordinationNodeId> = best.voters.iter().copied().collect();
     desired_voters.sort_by_key(|n| *n.as_bytes());
     let mut retained_learners: Vec<CoordinationNodeId> = learners.into_iter().collect();
     retained_learners.sort_by_key(|n| *n.as_bytes());
+    if !unprovisioned.is_empty() {
+        return PlacementRecommendation::NeedsProvisioning {
+            candidates: unprovisioned,
+            desired_voters,
+            retained_learners,
+        };
+    }
+    member_seeds.sort_by(|l, r| l.node_id.cmp(&r.node_id));
     PlacementRecommendation::Plan(Box::new(PlacementPlan {
         desired_voters,
         retained_learners,

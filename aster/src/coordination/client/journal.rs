@@ -259,31 +259,51 @@ fn validate_record(record: &ClientJournalV1) -> Result<()> {
             ));
         }
     }
-    // A decodable saved reply is part of the delivery contract: the bytes in
-    // these fields are what `resume`/`unacknowledged` hand back as typed
-    // replies, so bytes that do not decode are corruption discovered now,
-    // not a decode failure blamed on the network later.
-    let decodes = |bytes: &[u8]| {
-        let decoded: std::result::Result<crate::coordination::store::wire::MutationReplyWireV1, _> =
+    // A saved reply is not merely decodable bytes — it is **this entry's**
+    // answer. The bytes in these fields are what `resume`/`unacknowledged`
+    // hand back as typed replies, so a reply that decodes but names another
+    // group, client, sequence or request hash is corruption (or injection)
+    // discovered now, not a wrong answer delivered as this entry's later.
+    let owned = |bytes: &[u8]| -> Option<crate::coordination::store::wire::MutationReplyWireV1> {
+        let reply: crate::coordination::store::wire::MutationReplyWireV1 =
             payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
-                .deserialize(bytes);
-        decoded.is_ok()
+                .deserialize(bytes)
+                .ok()?;
+        (reply.protocol_version == crate::coordination::store::wire::STORE_PROTOCOL_VERSION
+            && reply.group_id == record.group_id
+            && reply.client_id == record.client_id
+            && reply.sequence == record.sequence
+            && reply.request_hash == record.request_hash)
+            .then_some(reply)
     };
     match state {
         JournalState::ResolvedAwaitingAck
-            if record.resolved_reply.is_empty() || !decodes(&record.resolved_reply) =>
+            if record.resolved_reply.is_empty() || owned(&record.resolved_reply).is_none() =>
         {
             return Err(journal_error(
-                "a resolved state must hold the exact resolved reply, decodable",
+                "a resolved state must hold the exact resolved reply, decodable and \
+                 echoing this entry's group, client id, sequence and request hash",
             ));
         }
-        JournalState::Closing | JournalState::ReplayAfterRetire
-            if record.terminal_refusal.is_empty() || !decodes(&record.terminal_refusal) =>
-        {
-            return Err(journal_error(
-                "the closing corridor must hold the decodable terminal refusal \
-                 that opened it",
-            ));
+        JournalState::Closing | JournalState::ReplayAfterRetire => {
+            // The corridor's opener must additionally be what §10 calls
+            // terminal: a `NotConsumed` refusal whose reason ends the client
+            // id. Anything else in this slot would drive retirement off an
+            // answer that never authorized it.
+            let terminal = owned(&record.terminal_refusal).is_some_and(|refusal| {
+                refusal.disposition_code == 2
+                    && crate::coordination::reason::Reason::from_code(refusal.reason_code)
+                        .is_some_and(|reason| {
+                            crate::coordination::reason::Disposition::NotConsumed
+                                .is_terminal(reason)
+                        })
+            });
+            if record.terminal_refusal.is_empty() || !terminal {
+                return Err(journal_error(
+                    "the closing corridor must hold the decodable, entry-owned, \
+                     §10-terminal refusal that opened it",
+                ));
+            }
         }
         _ => {}
     }
@@ -449,7 +469,12 @@ impl Journal {
 
     /// Arm the crash matrix: `hook` runs at every named boundary and an `Err`
     /// stops the run there, exactly as process death would.
+    ///
+    /// Only the in-module crash matrix arms it today; the allow keeps the
+    /// `coordination-testing` (non-`test`) build quiet now that the module
+    /// is crate-private.
     #[cfg(any(test, feature = "coordination-testing"))]
+    #[allow(dead_code)]
     pub fn with_crash_hook(
         mut self,
         hook: impl Fn(CrashPoint) -> Result<()> + Send + Sync + 'static,
@@ -804,17 +829,49 @@ mod tests {
         Journal::open(dir, ACTOR, group(), CLIENT_A).expect("the journal opens")
     }
 
-    /// A genuinely decodable `MutationReplyWireV1`, tagged so two replies
-    /// are distinguishable. Validation decodes every saved reply, so the
-    /// tests store what production stores — encoded replies, never labels.
-    fn reply_bytes(tag: u64) -> Vec<u8> {
+    /// An entry-owned `MutationReplyWireV1`: validation compares every saved
+    /// reply's identity against the record, so the tests store what
+    /// production stores — encoded replies echoing the entry's group,
+    /// client id, sequence and request hash. `tag` distinguishes replies
+    /// through `outcome_code`.
+    fn reply_bytes_for(
+        client_id: [u8; 16],
+        sequence: u64,
+        request_hash: [u8; 32],
+        tag: i32,
+    ) -> Vec<u8> {
         let reply = crate::coordination::store::wire::MutationReplyWireV1 {
-            sequence: tag,
+            protocol_version: crate::coordination::store::wire::STORE_PROTOCOL_VERSION,
+            group_id: group().as_bytes().to_vec(),
+            client_id: client_id.to_vec(),
+            sequence,
+            request_hash: request_hash.to_vec(),
+            disposition_code: 1,
+            outcome_code: tag,
             ..Default::default()
         };
         payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
             .serialize(&reply)
             .expect("a reply encodes")
+    }
+
+    /// An entry-owned terminal refusal: `NotConsumed` with a Section 10
+    /// terminal reason, as the closing corridor requires of its opener.
+    fn refusal_bytes_for(client_id: [u8; 16], sequence: u64, request_hash: [u8; 32]) -> Vec<u8> {
+        let reply = crate::coordination::store::wire::MutationReplyWireV1 {
+            protocol_version: crate::coordination::store::wire::STORE_PROTOCOL_VERSION,
+            group_id: group().as_bytes().to_vec(),
+            client_id: client_id.to_vec(),
+            sequence,
+            request_hash: request_hash.to_vec(),
+            disposition_code: 2,
+            outcome_code: 100,
+            reason_code: 24,
+            ..Default::default()
+        };
+        payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
+            .serialize(&reply)
+            .expect("a refusal encodes")
     }
 
     /// The §S4-D transition walk, with a reopen after every persisted step —
@@ -849,13 +906,15 @@ mod tests {
         // Pending → ResolvedAwaitingAck, and the reply survives death.
         {
             let mut journal = open(dir.path());
-            journal.resolve(reply_bytes(1)).expect("resolve");
+            journal
+                .resolve(reply_bytes_for(CLIENT_A, 1, [0x33; 32], 1))
+                .expect("resolve");
         }
         {
             let journal = open(dir.path());
             assert_eq!(journal.state(), JournalState::ResolvedAwaitingAck);
             let (reply, _) = journal.unacknowledged().expect("held");
-            assert_eq!(reply, reply_bytes(1));
+            assert_eq!(reply, reply_bytes_for(CLIENT_A, 1, [0x33; 32], 1));
         }
 
         // ResolvedAwaitingAck → Ready on acknowledgement; the reply is gone
@@ -886,7 +945,7 @@ mod tests {
                 .begin(1, "set_admin", b"refused-request".to_vec(), [0x44; 32])
                 .expect("begin");
             journal
-                .close_for_retirement(reply_bytes(24))
+                .close_for_retirement(refusal_bytes_for(CLIENT_A, 1, [0x44; 32]))
                 .expect("close");
         }
         {
@@ -895,7 +954,7 @@ mod tests {
             assert!(!journal.record().retirement_confirmed);
             assert_eq!(
                 journal.record().terminal_refusal,
-                reply_bytes(24),
+                refusal_bytes_for(CLIENT_A, 1, [0x44; 32]),
                 "the refusal that opened the corridor is retained for the resolution"
             );
             assert_eq!(
@@ -919,11 +978,13 @@ mod tests {
         // sequence.
         {
             let mut journal = open(dir.path());
-            let token = journal.resolve(reply_bytes(7)).expect("resolve");
+            let token = journal
+                .resolve(reply_bytes_for(CLIENT_A, 1, [0x44; 32], 7))
+                .expect("resolve");
             let (reply, redelivered) = journal.unacknowledged().expect("held");
             assert_eq!(
                 reply,
-                reply_bytes(7),
+                reply_bytes_for(CLIENT_A, 1, [0x44; 32], 7),
                 "the redelivered result is readable until acknowledged"
             );
             assert_eq!(token, redelivered, "one entry, one token");
@@ -959,10 +1020,12 @@ mod tests {
                 .begin(1, "acquire", b"x".to_vec(), [0x55; 32])
                 .expect("begin");
             journal
-                .close_for_retirement(reply_bytes(26))
+                .close_for_retirement(refusal_bytes_for(CLIENT_A, 1, [0x55; 32]))
                 .expect("close");
             journal.retirement_confirmed().expect("retired");
-            let token = journal.resolve(reply_bytes(9)).expect("resolve");
+            let token = journal
+                .resolve(reply_bytes_for(CLIENT_A, 1, [0x55; 32], 9))
+                .expect("resolve");
             journal.rotate(&token, CLIENT_B).expect("rotate");
         }
         let journal = open(dir.path());
@@ -987,7 +1050,9 @@ mod tests {
                 .is_err(),
             "one outstanding request per client id"
         );
-        let token = journal.resolve(reply_bytes(3)).expect("resolve");
+        let token = journal
+            .resolve(reply_bytes_for(CLIENT_A, 1, [0x66; 32], 3))
+            .expect("resolve");
         assert!(
             journal
                 .begin(2, "acquire", b"b".to_vec(), [0x67; 32])
@@ -1010,14 +1075,18 @@ mod tests {
         journal
             .begin(1, "acquire", b"a".to_vec(), [0x71; 32])
             .expect("begin A");
-        let token_a = journal.resolve(reply_bytes(101)).expect("resolve A");
+        let token_a = journal
+            .resolve(reply_bytes_for(CLIENT_A, 1, [0x71; 32], 101))
+            .expect("resolve A");
         // Two handles for A exist in the reviewer's scenario; the first one
         // acknowledges.
         journal.acknowledge(&token_a).expect("A acknowledged");
         journal
             .begin(2, "acquire", b"b".to_vec(), [0x72; 32])
             .expect("begin B");
-        let token_b = journal.resolve(reply_bytes(102)).expect("resolve B");
+        let token_b = journal
+            .resolve(reply_bytes_for(CLIENT_A, 2, [0x72; 32], 102))
+            .expect("resolve B");
         assert!(
             journal.acknowledge(&token_a).is_err(),
             "the surviving A handle must not mark B handled"
@@ -1152,10 +1221,13 @@ mod tests {
 
     /// The state-dependent invariants fail closed at open: a
     /// `ReplayAfterRetire` without a confirmed retirement, a `Pending` with
-    /// no method to resend to, an undecodable saved reply or terminal
-    /// refusal, and entry residue on a `Ready` record are each refused.
+    /// no method to resend to, an undecodable — or decodable but
+    /// **unowned** — saved reply or terminal refusal, a non-terminal
+    /// refusal in the corridor slot, and entry residue on a `Ready` record
+    /// are each refused.
     #[test]
     fn invalid_state_combinations_are_refused_at_open() {
+        const HASH: [u8; 32] = [0x31; 32];
         let base = |state: JournalState| ClientJournalV1 {
             format_version: JOURNAL_FORMAT_VERSION,
             group_id: group().as_bytes().to_vec(),
@@ -1165,11 +1237,12 @@ mod tests {
             sequence: 1,
             pending_method: "acquire".to_string(),
             pending_request: b"exact".to_vec(),
-            request_hash: vec![0x31; 32],
+            request_hash: HASH.to_vec(),
             resolved_reply: Vec::new(),
             retirement_confirmed: false,
             terminal_refusal: Vec::new(),
         };
+        let owned_refusal = || refusal_bytes_for(CLIENT_A, 1, HASH);
         let refuses = |record: &ClientJournalV1, why: &str| {
             let dir = tempfile::tempdir().expect("a directory");
             write_raw(dir.path(), record);
@@ -1181,7 +1254,7 @@ mod tests {
 
         // ReplayAfterRetire without retirement_confirmed.
         let mut record = base(JournalState::ReplayAfterRetire);
-        record.terminal_refusal = reply_bytes(24);
+        record.terminal_refusal = owned_refusal();
         record.retirement_confirmed = false;
         refuses(
             &record,
@@ -1190,7 +1263,7 @@ mod tests {
 
         // Closing that claims a confirmed retirement.
         let mut record = base(JournalState::Closing);
-        record.terminal_refusal = reply_bytes(24);
+        record.terminal_refusal = owned_refusal();
         record.retirement_confirmed = true;
         refuses(&record, "Closing precedes confirmation");
 
@@ -1204,19 +1277,55 @@ mod tests {
         record.resolved_reply = b"garbage-not-a-reply".to_vec();
         refuses(&record, "an undecodable saved reply is corruption");
 
-        // A closing state whose terminal refusal is not decodable.
+        // The reviewer's ownership hole: a perfectly decodable reply whose
+        // identity is not this entry's. Wrong sequence, wrong client id and
+        // wrong request hash are each refused — a saved answer must echo
+        // the exact entry it claims to answer.
+        let mut record = base(JournalState::ResolvedAwaitingAck);
+        record.resolved_reply = reply_bytes_for(CLIENT_A, 2, HASH, 1);
+        refuses(&record, "a saved reply for another sequence is not ours");
+        let mut record = base(JournalState::ResolvedAwaitingAck);
+        record.resolved_reply = reply_bytes_for(CLIENT_B, 1, HASH, 1);
+        refuses(&record, "a saved reply for another client id is not ours");
+        let mut record = base(JournalState::ResolvedAwaitingAck);
+        record.resolved_reply = reply_bytes_for(CLIENT_A, 1, [0x99; 32], 1);
+        refuses(
+            &record,
+            "a saved reply for another request hash is not ours",
+        );
+
+        // A closing state whose terminal refusal is not decodable, and one
+        // whose refusal is owned but **not terminal** — a corridor opened by
+        // a retryable refusal never authorized retirement.
         let mut record = base(JournalState::Closing);
         record.terminal_refusal = b"garbage-not-a-refusal".to_vec();
         refuses(&record, "an undecodable terminal refusal is corruption");
+        let mut record = base(JournalState::Closing);
+        let mut retryable = crate::coordination::store::wire::MutationReplyWireV1 {
+            protocol_version: crate::coordination::store::wire::STORE_PROTOCOL_VERSION,
+            group_id: group().as_bytes().to_vec(),
+            client_id: CLIENT_A.to_vec(),
+            sequence: 1,
+            request_hash: HASH.to_vec(),
+            disposition_code: 2,
+            outcome_code: 100,
+            ..Default::default()
+        };
+        retryable.reason_code = 1; // HeldByOther: NotConsumed but retryable
+        record.terminal_refusal =
+            payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
+                .serialize(&retryable)
+                .expect("encodes");
+        refuses(&record, "a non-terminal refusal cannot open the corridor");
 
         // Ready with entry residue.
         let mut record = base(JournalState::Ready);
-        record.resolved_reply = reply_bytes(3);
+        record.resolved_reply = reply_bytes_for(CLIENT_A, 1, HASH, 3);
         refuses(&record, "a Ready record must carry no entry residue");
 
         // And the healthy spellings of the same states still open.
         let mut record = base(JournalState::ReplayAfterRetire);
-        record.terminal_refusal = reply_bytes(24);
+        record.terminal_refusal = owned_refusal();
         record.retirement_confirmed = true;
         let dir = tempfile::tempdir().expect("a directory");
         write_raw(dir.path(), &record);
@@ -1349,16 +1458,20 @@ mod tests {
         journal
             .begin(1, "acquire", b"first".to_vec(), [0x71; 32])
             .expect("begin 1");
-        let token = journal.resolve(reply_bytes(11)).expect("resolve 1");
+        let token = journal
+            .resolve(reply_bytes_for(CLIENT_A, 1, [0x71; 32], 11))
+            .expect("resolve 1");
         journal.acknowledge(&token).expect("ack 1");
         journal
             .begin(2, "set_admin", b"second".to_vec(), [0x72; 32])
             .expect("begin 2");
         journal
-            .close_for_retirement(reply_bytes(12))
+            .close_for_retirement(refusal_bytes_for(CLIENT_A, 2, [0x72; 32]))
             .expect("close");
         journal.retirement_confirmed().expect("retired");
-        let token = journal.resolve(reply_bytes(13)).expect("resolve 2");
+        let token = journal
+            .resolve(reply_bytes_for(CLIENT_A, 2, [0x72; 32], 13))
+            .expect("resolve 2");
         journal.rotate(&token, CLIENT_B).expect("rotate");
     }
 }

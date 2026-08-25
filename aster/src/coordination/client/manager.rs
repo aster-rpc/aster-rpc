@@ -113,6 +113,21 @@ impl ObservationFingerprint {
     }
 }
 
+/// The whole retained recommendation: the observation tuple **and the
+/// selection it produced**. §7.7.1's revalidation rule covers "any changed
+/// selected topology fact" — the policy and membership may be untouched
+/// while a second topology snapshot selects a different member, and
+/// submitting that second selection would be exactly the race the recheck
+/// exists to refuse. The selection is the topology facts' fingerprint: a
+/// topology change that alters no selected fact leaves it equal, and one
+/// that moves any selected member discards the pass.
+#[derive(Debug, Clone, PartialEq)]
+struct PlannedPass {
+    observation: ObservationFingerprint,
+    desired_voters: Vec<CoordinationNodeId>,
+    retained_learners: Vec<CoordinationNodeId>,
+}
+
 pub struct CoordinationPlacementManager<T, P, V> {
     client: CoordinationClient,
     topology: T,
@@ -192,10 +207,19 @@ where
             Observed::Stop(report) => return Ok(*report),
             Observed::Ready(input, status) => (*input, *status),
         };
-        let planned = ObservationFingerprint::of(&input);
+        let observation = ObservationFingerprint::of(&input);
 
         match placement::plan(&input) {
-            PlacementRecommendation::NeedsProvisioning { candidates } => {
+            PlacementRecommendation::NeedsProvisioning {
+                candidates,
+                desired_voters,
+                retained_learners,
+            } => {
+                let planned = PlannedPass {
+                    observation,
+                    desired_voters,
+                    retained_learners,
+                };
                 let mut provisioned: BTreeMap<CoordinationNodeId, MemberSeedV1> = BTreeMap::new();
                 for node in candidates {
                     let request = ProvisionRequest {
@@ -215,7 +239,12 @@ where
                 }
                 self.recheck_and_submit(planned, provisioned).await
             }
-            PlacementRecommendation::Plan(_) => {
+            PlacementRecommendation::Plan(plan) => {
+                let planned = PlannedPass {
+                    observation,
+                    desired_voters: plan.desired_voters.clone(),
+                    retained_learners: plan.retained_learners.clone(),
+                };
                 self.recheck_and_submit(planned, BTreeMap::new()).await
             }
             other => Ok(report_of(
@@ -233,13 +262,15 @@ where
     /// §7.7.3 step 5: re-read status, topology and policy, recompute, and
     /// submit only when the **fresh** observation still carries the exact
     /// `(policy revision/digest, membership LogId)` the plan — and any
-    /// provisioning — was computed against. A changed tuple discards the
-    /// recommendation outright: the provisioned seeds were minted for the
-    /// old tuple and are not injected into the new world, and no fresh plan
-    /// is submitted on this pass — the next reconciliation starts over.
+    /// provisioning — was computed against, **and** the freshly recomputed
+    /// selection is the retained one. A changed tuple or a changed selected
+    /// topology fact discards the recommendation outright: the provisioned
+    /// seeds were minted for the old pass and are not submitted into a new
+    /// one, and no fresh plan is submitted on this pass — the next
+    /// reconciliation starts over.
     async fn recheck_and_submit(
         &mut self,
-        planned: ObservationFingerprint,
+        planned: PlannedPass,
         provisioned: BTreeMap<CoordinationNodeId, MemberSeedV1>,
     ) -> Result<PlacementReport> {
         let (mut input, status) = match self.observe().await? {
@@ -247,7 +278,7 @@ where
             Observed::Ready(input, status) => (*input, *status),
         };
         let fresh = ObservationFingerprint::of(&input);
-        if fresh != planned {
+        if fresh != planned.observation {
             return Ok(report_of(
                 &self.client,
                 &input.policy,
@@ -272,10 +303,29 @@ where
             }
         }
         match placement::plan(&input) {
-            PlacementRecommendation::Plan(plan) => {
+            PlacementRecommendation::Plan(plan)
+                if plan.desired_voters == planned.desired_voters
+                    && plan.retained_learners == planned.retained_learners =>
+            {
                 self.submit(&input.policy, &status, &input.grace_crossed_members, *plan)
                     .await
             }
+            // §7.7.1: "any changed selected topology fact discards the
+            // earlier recommendation." Same policy, same membership, but the
+            // second snapshot selects different members — this pass submits
+            // nothing, whatever the fresh plan says.
+            PlacementRecommendation::Plan(_) => Ok(report_of(
+                &self.client,
+                &input.policy,
+                &status,
+                &input.grace_crossed_members,
+                None,
+                "the selected topology facts changed between planning and \
+                 submission; the plan is discarded — the next reconciliation \
+                 re-observes"
+                    .to_string(),
+                None,
+            )),
             other => Ok(report_of(
                 &self.client,
                 &input.policy,
@@ -420,9 +470,21 @@ where
             .map(|(node, _)| *node)
             .collect();
 
+        // The genesis hash rides the same replicated cut as the membership:
+        // it is the fourth binding every seed's join permit must verify
+        // against before a plan may exist.
+        let genesis_hash: [u8; 32] = status.genesis_hash.as_slice().try_into().map_err(|_| {
+            Error::InvalidArgument(
+                "the group status carries no 32-byte genesis hash; permits cannot be \
+                 verified against this cut"
+                    .into(),
+            )
+        })?;
+
         Ok(Observed::Ready(
             Box::new(PlacementInput {
                 group_id: self.client.group(),
+                genesis_hash,
                 deployment_profile_code: status.deployment_profile_code,
                 membership_log_id: status.membership_log_id.clone(),
                 current_voters: voters,
@@ -503,7 +565,7 @@ fn reason_of(recommendation: &PlacementRecommendation) -> String {
         }
         PlacementRecommendation::Degraded { why, .. } => format!("degraded: {why}"),
         PlacementRecommendation::Converging => "a membership operation is converging".to_string(),
-        PlacementRecommendation::NeedsProvisioning { candidates } => format!(
+        PlacementRecommendation::NeedsProvisioning { candidates, .. } => format!(
             "{} selected candidates lack seed material",
             candidates.len()
         ),

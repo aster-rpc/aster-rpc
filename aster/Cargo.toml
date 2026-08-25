@@ -28,12 +28,11 @@ rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"
 # Neither is in `default`, so voter-only dependencies are not enabled there.
 # Verify the direct edges with `cargo tree -p aster --no-default-features
 # --depth 1` and the full feature graph with `-e features`.
-coordination-client = ["rpc", "dep:blake3", "dep:windows-sys"]
+coordination-client = ["rpc", "dep:blake3", "dep:windows-sys", "dep:ed25519-dalek"]
 coordination = [
     "coordination-client",
     "dep:openraft",
     "dep:redb",
-    "dep:ed25519-dalek",
     "dep:libc",
 ]
 # The Slice 3 internal test harness (contract matrix §S3-E, §S3-F). Adds no

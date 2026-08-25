@@ -242,6 +242,7 @@ impl Coordination {
         let metrics = self.raft.metrics().borrow().clone();
         let of = |id: openraft::LogId<ids::CoordinationNodeId>| LogPosition {
             term: id.leader_id.term,
+            leader_node_id: *id.leader_id.node_id.as_bytes(),
             index: id.index,
         };
         let last_log = self.raft.data_metrics().borrow().last_log;
@@ -250,10 +251,16 @@ impl Coordination {
             .with_raft_state(|state| state.committed)
             .await
             .unwrap_or(None);
+        // **Committed** membership, from the state actor that applies
+        // committed entries and nothing else — not `RaftMetrics`'s
+        // `membership_config`, which is the *effective* view (the newest
+        // membership entry seen, committed or not; see
+        // `storage::machine`). A learner an appended-but-uncommitted entry
+        // introduced must not be reported as committed and then roll back.
+        let committed_membership = self.state.committed_membership();
         let voters: std::collections::BTreeSet<ids::CoordinationNodeId> =
-            metrics.membership_config.membership().voter_ids().collect();
-        let learners: Vec<[u8; 32]> = metrics
-            .membership_config
+            committed_membership.membership().voter_ids().collect();
+        let learners: Vec<[u8; 32]> = committed_membership
             .membership()
             .nodes()
             .filter(|(id, _)| !voters.contains(id))
@@ -301,12 +308,17 @@ pub struct DiskStatusSnapshot {
     pub free_space_pressure: bool,
 }
 
-/// One log position: the §14 "id" spelling — term and index — without the
-/// leader NodeId (which `leader_node_id` and `replication` already carry).
+/// One full log id: the term and node id of the leader that proposed the
+/// entry, and its index. All three, because the current leader cannot
+/// reconstruct a historical entry's author — dropping the node id would
+/// make two ids with equal `(term, index)` from different leaders read as
+/// the same entry.
 #[cfg(feature = "coordination")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LogPosition {
     pub term: u64,
+    /// The proposing leader's node id.
+    pub leader_node_id: [u8; 32],
     pub index: u64,
 }
 
@@ -335,9 +347,10 @@ pub struct ConsensusSnapshot {
     /// from.
     pub snapshot_index: Option<u64>,
     pub millis_since_quorum_ack: Option<u64>,
-    /// The committed membership's learners. Paired with `replication`, this
-    /// is the §14 learner-progress witness: a learner's matched index
-    /// against `last_log_index`.
+    /// The **committed** membership's learners — from the state actor that
+    /// applies committed entries, never the effective config. Paired with
+    /// `replication`, this is the §14 learner-progress witness: a learner's
+    /// matched index against `last_log_index`.
     pub learners: Vec<[u8; 32]>,
     /// Leader only: per-peer matched log index — the replication lag
     /// witness for voters and learners alike. Empty on followers.
@@ -390,4 +403,39 @@ pub struct StoreMetricsSnapshot {
     pub commands_timed: u64,
     pub read_latency_micros: u64,
     pub reads_timed: u64,
+}
+
+#[cfg(all(test, feature = "coordination"))]
+mod section_14_tests {
+    /// `consensus_status` sources membership from the state actor's
+    /// **committed** view, never from `RaftMetrics`' *effective* config —
+    /// the newest membership entry seen, committed or not (the distinction
+    /// `storage::machine` documents). A source-level statement, like the
+    /// shutdown-order tests and for the same reason: in a settled group the
+    /// two views are equal, so no single-group functional test can
+    /// discriminate them, while the uncommitted window they differ in is
+    /// milliseconds wide and scheduler-shaped. The code scan ignores
+    /// comments so the rationale can name the forbidden source.
+    #[test]
+    fn the_consensus_snapshot_reads_committed_membership_only() {
+        let source = include_str!("mod.rs");
+        let at = source
+            .find("pub async fn consensus_status")
+            .expect("consensus_status exists");
+        let end = source[at..].find("\n    }").expect("the method closes");
+        let body = &source[at..at + end];
+
+        let code_contains = |needle: &str| {
+            body.lines()
+                .any(|line| line.split("//").next().unwrap_or("").contains(needle))
+        };
+        assert!(
+            !code_contains("membership_config"),
+            "consensus_status must not read the effective membership"
+        );
+        assert!(
+            code_contains("committed_membership"),
+            "consensus_status must read the state actor's committed membership"
+        );
+    }
 }

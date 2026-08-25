@@ -121,11 +121,14 @@ fn observe_mutation(reply: &MutationReplyWireV1) -> Observed {
     }
 }
 
-/// The full fact set of one wire snapshot.
+/// The full fact set of one wire snapshot — identity, TTL and ACL revision
+/// included, with the value as an explicit present-or-redacted fact.
 fn snapshot_facts(
     s: &aster::coordination::contract::ResourceSnapshotV1,
 ) -> linearize::SnapshotFacts {
     linearize::SnapshotFacts {
+        group_id: <[u8; 32]>::try_from(s.group_id.as_slice()).expect("a 32-byte group id"),
+        resource: (s.resource.namespace.clone(), s.resource.key.clone()),
         epoch: s.epoch,
         lease_revision: s.lease_revision,
         value_revision: s.value_revision,
@@ -134,10 +137,17 @@ fn snapshot_facts(
             .holder
             .as_ref()
             .and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok()),
-        value: if s.value_redacted {
-            None
-        } else {
-            s.value.clone()
+        ttl_ms: s.ttl_ms,
+        acl_revision: s.acl_revision,
+        value: match (&s.value, s.value_redacted) {
+            // A replay: the bytes were never stored.
+            (_, true) => linearize::ValueFact::Redacted,
+            // A readable first attempt — `Some(empty)` is "the resource has
+            // no value", a real fact compared byte-for-byte.
+            (Some(bytes), false) => linearize::ValueFact::Present(bytes.clone()),
+            // Absent and unredacted: the caller lacks `RIGHT_READ`. An
+            // authorization outcome, not a value fact.
+            (None, false) => linearize::ValueFact::Withheld,
         },
     }
 }
@@ -166,7 +176,7 @@ async fn perform(
     };
     let invoked = log.now();
     let first = match &call {
-        RegisterCall::Acquire => client.acquire(resource(), TTL_MS).await,
+        RegisterCall::Acquire { ttl_ms } => client.acquire(resource(), *ttl_ms).await,
         RegisterCall::Renew { fence_epoch } => client.renew(fence(*fence_epoch)).await,
         RegisterCall::CompareAndSet {
             fence_epoch,
@@ -232,7 +242,8 @@ async fn contend(
             std::time::Instant::now() < deadline,
             "the contention loop starved: {round}/{rounds} rounds"
         );
-        let Some(reply) = perform(client, log, RegisterCall::Acquire).await else {
+        let Some(reply) = perform(client, log, RegisterCall::Acquire { ttl_ms: TTL_MS }).await
+        else {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
@@ -424,7 +435,7 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
     }
     let mid_reply = within("mutation across the partition", async {
         loop {
-            match perform(&workers[0], &log, RegisterCall::Acquire).await {
+            match perform(&workers[0], &log, RegisterCall::Acquire { ttl_ms: TTL_MS }).await {
                 Some(reply) if reply.outcome_code == 1 => break reply,
                 _ => tokio::time::sleep(Duration::from_millis(250)).await,
             }

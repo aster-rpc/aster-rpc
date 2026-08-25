@@ -81,19 +81,32 @@ fn snapshot(
     TopologySnapshot::from_view(Arc::new(CoreTopoSharedView::from_parts(views, pairs, 1)))
 }
 
-/// A structurally valid signed-permit envelope for `id`: canonical inner
-/// document, correct widths, candidate/ticket bindings — everything the
-/// planner's §7.7.1 structural validation checks. The signature bytes are
-/// arbitrary, because verifying them needs the pinned authority key only
-/// the replicated apply holds.
-fn structural_permit(id: CoordinationNodeId) -> Vec<u8> {
+/// The pure half's authority: a real signing key, so every fixture permit
+/// carries a genuine signature the planner's full `verify_join_permit` —
+/// the same one apply runs — accepts, and a tampered one fails.
+const PURE_AUTHORITY_SECRET: [u8; 32] = [0xA9; 32];
+const PURE_AUTHORITY_DOMAIN: &str = "placement.test";
+const PURE_GENESIS_HASH: [u8; 32] = [0x55; 32];
+
+fn pure_authority_key() -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&PURE_AUTHORITY_SECRET)
+        .verifying_key()
+        .to_bytes()
+}
+
+/// A fully signed permit for `id` under the pure authority, binding the pure
+/// group, genesis and domain. `group_id`/`genesis_hash` are parameters so
+/// the misbinding gates can mint a canonical permit for the wrong world.
+fn signed_permit(id: CoordinationNodeId, group_id: [u8; 32], genesis_hash: [u8; 32]) -> Vec<u8> {
     use aster::coordination::contract::payload_fory;
-    use aster::coordination::raft::{JoinPermitV1, NodeIdV1, SignedCoordinationDocumentV1};
+    use aster::coordination::model::authority::{join_signing_bytes, signed_document_from_parts};
+    use aster::coordination::raft::{JoinPermitV1, NodeIdV1};
+    use ed25519_dalek::Signer;
     let permit = JoinPermitV1 {
         format_version: 1,
-        group_id: group().as_bytes().to_vec(),
-        authority_domain: "placement.test".to_string(),
-        genesis_hash: vec![0x55; 32],
+        group_id: group_id.to_vec(),
+        authority_domain: PURE_AUTHORITY_DOMAIN.to_string(),
+        genesis_hash: genesis_hash.to_vec(),
         candidate_node_id: id.as_bytes().to_vec(),
         candidate_ticket: aster::coordination::model::authority::canonical_candidate_ticket(
             id.as_bytes(),
@@ -107,19 +120,15 @@ fn structural_permit(id: CoordinationNodeId) -> Vec<u8> {
     let document_bytes = payload_fory::<JoinPermitV1>()
         .serialize(&permit)
         .expect("the permit encodes");
-    payload_fory::<SignedCoordinationDocumentV1>()
-        .serialize(&SignedCoordinationDocumentV1 {
-            format_version: 1,
-            document_bytes,
-            authority_public_key: vec![0x11; 32],
-            signature: vec![0x22; 64],
-        })
+    let signature = ed25519_dalek::SigningKey::from_bytes(&PURE_AUTHORITY_SECRET)
+        .sign(&join_signing_bytes(&document_bytes));
+    signed_document_from_parts(document_bytes, &pure_authority_key(), &signature.to_bytes())
         .expect("the envelope encodes")
 }
 
-/// A seed whose ticket is canonical and whose permit passes the planner's
-/// structural validation (the signature itself is the replicated apply's to
-/// verify).
+/// A seed whose ticket is canonical and whose permit fully verifies under
+/// the pure authority — signature, group, genesis, domain, candidate and
+/// ticket bindings alike.
 fn seeded(id: CoordinationNodeId) -> PlacementCandidate {
     PlacementCandidate {
         node_id: id,
@@ -129,7 +138,7 @@ fn seeded(id: CoordinationNodeId) -> PlacementCandidate {
                 id.as_bytes(),
             )
             .expect("canonical"),
-            signed_join_permit: Some(structural_permit(id)),
+            signed_join_permit: Some(signed_permit(id, *group().as_bytes(), PURE_GENESIS_HASH)),
         }),
     }
 }
@@ -150,6 +159,8 @@ fn policy(
     PlacementPolicy {
         revision: 1,
         digest: [0xD1; 32],
+        authority_public_key: pure_authority_key(),
+        authority_domain: PURE_AUTHORITY_DOMAIN.to_string(),
         target_voters: target,
         target_retained_learners: 0,
         eligible: eligible.into_iter().map(|c| (c.node_id, c)).collect(),
@@ -170,6 +181,7 @@ fn input(
 ) -> PlacementInput {
     PlacementInput {
         group_id: group(),
+        genesis_hash: PURE_GENESIS_HASH,
         deployment_profile_code: PROFILE_PROD,
         membership_log_id: None,
         current_voters: current.iter().copied().collect(),
@@ -490,7 +502,7 @@ fn provisioning_names_the_exact_candidates() {
     );
     unprovisioned.grace_crossed_members.insert(v2);
     match plan(&unprovisioned) {
-        PlacementRecommendation::NeedsProvisioning { candidates } => {
+        PlacementRecommendation::NeedsProvisioning { candidates, .. } => {
             let expected: BTreeSet<CoordinationNodeId> = [fresh].into_iter().collect();
             assert_eq!(candidates, expected);
         }
@@ -683,58 +695,97 @@ fn an_unfillable_learner_target_is_insufficient_evidence() {
         learner_policy(vec![seeded(a), seeded(b), seeded(c), unseeded(d)]),
         snapshot(&[&[a, b, c, d]], &[]),
     )) {
-        PlacementRecommendation::NeedsProvisioning { candidates } => {
+        PlacementRecommendation::NeedsProvisioning { candidates, .. } => {
             assert_eq!(candidates.into_iter().collect::<Vec<_>>(), vec![d]);
         }
         other => panic!("expected NeedsProvisioning, got {other:?}"),
     }
 }
 
-/// **A malformed join permit is refused before any plan exists** (closure
-/// item 4): §7.7.1 requires every supplied seed to pass the canonical
-/// ticket **and permit** validation before `Plan` can be emitted. The same
-/// input with the structurally valid permit plans.
+/// **A permit that does not fully verify is refused before any plan
+/// exists** (closure items from reviews two and three): §7.7.1 requires
+/// every supplied seed to pass **the same permit validation apply runs** —
+/// signature under the pinned authority key and all four bindings — before
+/// `Plan` can be emitted. Garbage bytes, a permit for another node, a
+/// canonical permit for another **group**, one for another **genesis**, and
+/// one whose signature was tampered are each `InvalidPolicy`; the honest
+/// permit plans.
 #[test]
 fn a_malformed_permit_is_refused_before_any_plan() {
     let (a, b, d) = (node(1), node(2), node(4));
     let topo = || snapshot(&[&[a, b, d]], &[]);
-
-    // The candidate's permit bytes are garbage: InvalidPolicy, not a Plan
-    // whose refusal is discovered as a replicated apply failure.
-    let mut garbage = seeded(d);
-    garbage
-        .member_seed
-        .as_mut()
-        .expect("seeded")
-        .signed_join_permit = Some(vec![1, 2, 3]);
-    match plan(&input(
+    let refuses = |candidate: PlacementCandidate, why_name: &str| match plan(&input(
         &[a, b],
-        policy(vec![seeded(a), seeded(b), garbage], 3, 0, false),
+        policy(vec![seeded(a), seeded(b), candidate], 3, 0, false),
         topo(),
     )) {
         PlacementRecommendation::InvalidPolicy { why } => {
-            assert!(why.contains("permit"), "{why}");
+            assert!(why.contains("permit"), "{why_name}: {why}");
         }
-        other => panic!("expected InvalidPolicy, got {other:?}"),
-    }
+        other => panic!("{why_name}: expected InvalidPolicy, got {other:?}"),
+    };
+    let with_permit = |permit: Vec<u8>| {
+        let mut candidate = seeded(d);
+        candidate
+            .member_seed
+            .as_mut()
+            .expect("seeded")
+            .signed_join_permit = Some(permit);
+        candidate
+    };
+
+    // Garbage bytes: InvalidPolicy, not a Plan whose refusal is discovered
+    // as a replicated apply failure.
+    refuses(with_permit(vec![1, 2, 3]), "garbage");
 
     // A permit minted for a *different* node fails the candidate binding.
-    let mut misbound = seeded(d);
-    misbound
-        .member_seed
-        .as_mut()
-        .expect("seeded")
-        .signed_join_permit = Some(structural_permit(a));
-    match plan(&input(
-        &[a, b],
-        policy(vec![seeded(a), seeded(b), misbound], 3, 0, false),
-        topo(),
-    )) {
-        PlacementRecommendation::InvalidPolicy { why } => {
-            assert!(why.contains("permit"), "{why}");
-        }
-        other => panic!("expected InvalidPolicy, got {other:?}"),
-    }
+    refuses(
+        with_permit(signed_permit(a, *group().as_bytes(), PURE_GENESIS_HASH)),
+        "wrong node",
+    );
+
+    // The third review's counterexample: a canonical, correctly signed
+    // permit for the same candidate but **another group** — structurally
+    // perfect, and only the group binding refuses it.
+    refuses(
+        with_permit(signed_permit(d, [0xB7; 32], PURE_GENESIS_HASH)),
+        "wrong group",
+    );
+
+    // Another genesis under the same group id.
+    refuses(
+        with_permit(signed_permit(d, *group().as_bytes(), [0xB8; 32])),
+        "wrong genesis",
+    );
+
+    // A forged signature: the envelope names the pinned authority key, but
+    // the signature was made by some other key. Only signature verification
+    // under the pinned key can refuse this one.
+    let forged = {
+        use aster::coordination::contract::payload_fory;
+        use aster::coordination::model::authority::{
+            join_signing_bytes, signed_document_from_parts,
+        };
+        use aster::coordination::raft::JoinPermitV1;
+        use ed25519_dalek::Signer;
+        let honest = signed_permit(d, *group().as_bytes(), PURE_GENESIS_HASH);
+        let envelope: aster::coordination::raft::SignedCoordinationDocumentV1 =
+            payload_fory::<aster::coordination::raft::SignedCoordinationDocumentV1>()
+                .deserialize(&honest)
+                .expect("the honest envelope decodes");
+        let _typed: JoinPermitV1 = payload_fory::<JoinPermitV1>()
+            .deserialize(&envelope.document_bytes)
+            .expect("the honest document decodes");
+        let interloper = ed25519_dalek::SigningKey::from_bytes(&[0x13; 32]);
+        let signature = interloper.sign(&join_signing_bytes(&envelope.document_bytes));
+        signed_document_from_parts(
+            envelope.document_bytes,
+            &pure_authority_key(),
+            &signature.to_bytes(),
+        )
+        .expect("the forged envelope encodes")
+    };
+    refuses(with_permit(forged), "forged signature");
 
     // The honest permit plans, and the new member's seed rides the plan.
     match plan(&input(
@@ -846,7 +897,15 @@ fn voter_id(fixture: &GroupFixture, index: usize) -> CoordinationNodeId {
 /// A real, signed candidate seed for a fresh node under this fixture's
 /// authority — the plan that carries it is accepted by apply.
 fn real_candidate(fixture: &GroupFixture) -> (CoordinationNodeId, PlacementCandidate) {
-    let secret = [SEED ^ 0x77; 32];
+    real_candidate_from(fixture, [SEED ^ 0x77; 32])
+}
+
+/// [`real_candidate`] for an explicit candidate secret, so a gate can mint
+/// several distinct fixture-signed candidates.
+fn real_candidate_from(
+    fixture: &GroupFixture,
+    secret: [u8; 32],
+) -> (CoordinationNodeId, PlacementCandidate) {
     let id_bytes = ed25519_dalek::SigningKey::from_bytes(&secret)
         .verifying_key()
         .to_bytes();
@@ -916,6 +975,10 @@ fn replacement_policy(
     PlacementPolicy {
         revision: 1,
         digest: [0xD2; 32],
+        // The fixture's real authority: the same key and domain the voters
+        // pin, so the candidate's fixture-signed permit fully verifies.
+        authority_public_key: fixture.authority_key(),
+        authority_domain: fixture.domain().to_string(),
         target_voters: 3,
         target_retained_learners: 0,
         eligible,
@@ -1364,6 +1427,111 @@ async fn an_unresolvable_journalled_request_stops_reconciliation() {
             );
         }
     }
+
+    for voter in voters {
+        voter.shutdown().await;
+    }
+}
+
+/// **A topology-only change between planning and submission discards the
+/// pass** (the third review's item 2). The policy and the membership are
+/// byte-identical across both observations — only the topology snapshot
+/// changes, and with it the selected replacement: the first selects D, the
+/// recheck's selects E. §7.7.1 says any changed selected topology fact
+/// discards the earlier recommendation; a manager that merely replans and
+/// submits "whatever the second snapshot produced" would commit E under a
+/// pass that chose D. With the same snapshot replayed, the same pass
+/// submits — proving the discard is the selection comparison and nothing
+/// else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_topology_only_change_discards_the_recommendation() {
+    let (fixture, voters, _dirs) = manager_group().await;
+    let (candidate_d, seed_d) = real_candidate_from(&fixture, [SEED ^ 0x77; 32]);
+    let (candidate_e, seed_e) = real_candidate_from(&fixture, [SEED ^ 0x78; 32]);
+    let grace = Duration::from_millis(400);
+
+    // Voter 2 is absent from every snapshot; only the replacement candidate
+    // differs between the two worlds.
+    let world_d = vec![voter_id(&fixture, 0), voter_id(&fixture, 1), candidate_d];
+    let world_e = vec![voter_id(&fixture, 0), voter_id(&fixture, 1), candidate_e];
+
+    // One policy for the whole test: both candidates eligible and seeded,
+    // voter 2 retained-eligible so only the grace can replace it.
+    let policy_now = || {
+        let mut policy = replacement_policy(&fixture, &seed_d, None, grace);
+        policy.eligible.insert(candidate_e, seed_e.clone());
+        policy
+    };
+
+    let journal = tempfile::tempdir().expect("a directory");
+    let client = admin_client(&fixture, &voters, journal.path()).await;
+    let mut manager = CoordinationPlacementManager::new(
+        client,
+        ScriptedTopology(Mutex::new(vec![live(&world_d)])),
+        ScriptedPolicy(Mutex::new(vec![policy_now()])),
+        NoProvisioning,
+    );
+
+    // First reconciliation starts the grace timer; nothing is submitted.
+    let first = within("first reconcile", manager.reconcile())
+        .await
+        .expect("a report");
+    assert!(
+        first.pending_operation_id.is_none(),
+        "no command before the grace: {}",
+        first.reason
+    );
+    tokio::time::sleep(grace + Duration::from_millis(300)).await;
+
+    // The grace has crossed. The planning observation sees world D and
+    // selects D; the recheck observation sees world E and would select E.
+    // Same policy, same membership — the pass must be discarded.
+    manager.replace_sources_for_testing(
+        ScriptedTopology(Mutex::new(vec![live(&world_d), live(&world_e)])),
+        ScriptedPolicy(Mutex::new(vec![policy_now()])),
+    );
+    let discarded = within("topology-shifted reconcile", manager.reconcile())
+        .await
+        .expect("a report");
+    assert!(
+        discarded.pending_operation_id.is_none(),
+        "a shifted selection must not be submitted: {}",
+        discarded.reason
+    );
+    assert!(
+        discarded.reason.contains("selected topology facts"),
+        "the report names the topology discard: {}",
+        discarded.reason
+    );
+
+    // The group agrees nothing was committed.
+    let observer_journal = tempfile::tempdir().expect("a directory");
+    let observer = admin_client(&fixture, &voters, observer_journal.path()).await;
+    let status = within("status", observer.reads().group_status())
+        .await
+        .expect("the status cut");
+    assert!(
+        status.pending_operation_id.is_none(),
+        "no intent was created by the discarded pass"
+    );
+
+    // A stable topology submits: same manager, same policy, one world.
+    manager.replace_sources_for_testing(
+        ScriptedTopology(Mutex::new(vec![live(&world_d)])),
+        ScriptedPolicy(Mutex::new(vec![policy_now()])),
+    );
+    let submitted = within("stable reconcile", manager.reconcile())
+        .await
+        .expect("a report");
+    assert!(
+        submitted.pending_operation_id.is_some(),
+        "the same pass under a stable topology submits: {}",
+        submitted.reason
+    );
+    assert!(
+        submitted.selected_voters.contains(&candidate_d),
+        "the submitted plan names the selection the pass was planned for"
+    );
 
     for voter in voters {
         voter.shutdown().await;

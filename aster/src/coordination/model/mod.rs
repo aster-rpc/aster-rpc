@@ -19,7 +19,6 @@ pub mod adapter;
 pub mod admin;
 #[cfg(feature = "coordination")]
 pub mod apply;
-#[cfg(feature = "coordination")]
 pub mod authority;
 #[cfg(feature = "coordination")]
 pub mod boundary;
@@ -50,7 +49,6 @@ pub mod retire;
 /// — the §7.7 placement planner runs them in the `coordination-client`
 /// graph. Every transition that consumes them stays voter-only.
 pub mod shape;
-#[cfg(feature = "coordination")]
 pub mod state;
 #[cfg(feature = "coordination")]
 pub mod tables;

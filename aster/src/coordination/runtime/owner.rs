@@ -206,23 +206,18 @@ pub(crate) async fn run_lifecycle(
     generation: Arc<AtomicU64>,
     genesis: Option<Arc<Vec<u8>>>,
     store_metrics: std::sync::Arc<crate::coordination::store::host::StoreMetrics>,
+    // The per-generation task registry. The loop spawns membership, expiry
+    // and genesis tasks but does **not** own their handles: they live here,
+    // where §11.5's shutdown sequence can stop them with an acknowledged
+    // abort-and-await. Registration after the stop is refused by the
+    // registry itself.
+    tasks: Arc<ControllerTasks>,
 ) {
     let mut metrics = raft.metrics();
     // §14 transition counters: observed here because this loop is the one
     // reader of every metrics change.
     let mut last_leader: Option<CoordinationNodeId> = None;
     let mut last_quorum: Option<bool> = None;
-    // The controller task for the generation this node currently holds.
-    // Aborted and replaced on every leadership change, which is what makes
-    // "one leader-generation task" true rather than aspirational.
-    let mut controller: Option<tokio::task::JoinHandle<()>> = None;
-    // The §9.2 expiry loop, likewise per leader generation.
-    let mut expiry: Option<tokio::task::JoinHandle<()>> = None;
-    // The in-flight genesis proposal, if any. Held so a second is not spawned
-    // beside it: a proposal into a group without a quorum does not fail, it
-    // waits, and one metrics change per heartbeat would otherwise queue an
-    // unbounded number of identical entries behind it.
-    let mut proposing: Option<tokio::task::JoinHandle<()>> = None;
     let mut leading = false;
     loop {
         // Observe the genesis before classifying. Applying an entry moves
@@ -308,36 +303,37 @@ pub(crate) async fn run_lifecycle(
             let is_leader =
                 matches!(current.state, openraft::ServerState::Leader) && current.id == local;
             if is_leader != leading {
-                if let Some(task) = controller.take() {
-                    task.abort();
-                }
-                if let Some(task) = expiry.take() {
-                    task.abort();
-                }
                 // Superseding the generation stops the old task even if its
                 // abort has not landed yet: it rechecks this counter before
-                // every side effect.
+                // every side effect. The registry aborts the previous
+                // generation's tasks and refuses new ones once the shutdown
+                // sequence has stopped controllers for good.
                 let next = generation.fetch_add(1, Ordering::SeqCst) + 1;
-                if is_leader {
-                    controller = Some(tokio::spawn(super::membership::run_generation(
-                        raft.clone(),
-                        state.clone(),
-                        local,
-                        super::membership::Generation(next),
-                        Arc::clone(&generation),
-                        Arc::clone(&facts),
-                    )));
-                    // A fresh generation starts with no timers, so every held
-                    // row gets a fresh full TTL (§9.2): failover may delay a
-                    // takeover, never overlap one.
-                    expiry = Some(tokio::spawn(super::expiry::run_generation(
-                        raft.clone(),
-                        state.clone(),
-                        next,
-                        Arc::clone(&generation),
-                        std::sync::Arc::clone(&store_metrics),
-                    )));
-                }
+                let (membership, expiry) = if is_leader {
+                    (
+                        Some(tokio::spawn(super::membership::run_generation(
+                            raft.clone(),
+                            state.clone(),
+                            local,
+                            super::membership::Generation(next),
+                            Arc::clone(&generation),
+                            Arc::clone(&facts),
+                        ))),
+                        // A fresh generation starts with no timers, so every
+                        // held row gets a fresh full TTL (§9.2): failover may
+                        // delay a takeover, never overlap one.
+                        Some(tokio::spawn(super::expiry::run_generation(
+                            raft.clone(),
+                            state.clone(),
+                            next,
+                            Arc::clone(&generation),
+                            std::sync::Arc::clone(&store_metrics),
+                        ))),
+                    )
+                } else {
+                    (None, None)
+                };
+                tasks.replace_generation(membership, expiry).await;
                 leading = is_leader;
             }
 
@@ -352,25 +348,27 @@ pub(crate) async fn run_lifecycle(
             // is set from `admin_revision > 0`, so a healthy restart into a
             // long-running group proposes nothing, and only a voter that came
             // back before the entry applied still has work to do.
-            if is_leader
-                && !facts.genesis_installed()
-                && proposing.as_ref().is_none_or(|task| task.is_finished())
-            {
+            if is_leader && !facts.genesis_installed() {
                 if let Some(document) = genesis.clone() {
                     let raft = raft.clone();
-                    proposing = Some(tokio::spawn(async move {
-                        let command = crate::coordination::contract::CommandV1::Genesis(
-                            crate::coordination::contract::GenesisCommandV1 {
-                                signed_genesis: document.as_ref().clone(),
-                            },
-                        );
-                        // The outcome is not inspected. A refusal is fatal on
-                        // every voter including this one, and would arrive as a
-                        // `Fatal` through the same latch every other storage
-                        // failure uses; a timeout means no quorum yet, and the
-                        // next metrics change tries again.
-                        let _ = raft.client_write(command).await;
-                    }));
+                    tasks
+                        .propose_if_idle(move || {
+                            tokio::spawn(async move {
+                                let command = crate::coordination::contract::CommandV1::Genesis(
+                                    crate::coordination::contract::GenesisCommandV1 {
+                                        signed_genesis: document.as_ref().clone(),
+                                    },
+                                );
+                                // The outcome is not inspected. A refusal is
+                                // fatal on every voter including this one, and
+                                // would arrive as a `Fatal` through the same
+                                // latch every other storage failure uses; a
+                                // timeout means no quorum yet, and the next
+                                // metrics change tries again.
+                                let _ = raft.client_write(command).await;
+                            })
+                        })
+                        .await;
                 }
             }
 
@@ -388,13 +386,111 @@ pub(crate) async fn run_lifecycle(
         }
 
         if metrics.changed().await.is_err() {
-            for task in [controller.take(), expiry.take(), proposing.take()]
-                .into_iter()
-                .flatten()
-            {
-                task.abort();
-            }
+            // The metrics channel closed — `Raft::shutdown()`. On the §11.5
+            // path the sequence has already stopped these with an
+            // acknowledged await; this is the cleanup for a Raft that ended
+            // any other way.
+            tasks.stop_all().await;
             return;
+        }
+    }
+}
+
+/// The per-generation controller tasks — membership, expiry, and the genesis
+/// proposal — held where the shutdown sequence can stop them with an
+/// **acknowledged** abort-and-await, not a counter bump alone.
+///
+/// The lifecycle loop spawns these tasks, so it used to own their handles —
+/// which meant §11.5 step 3 could only bump the generation counter and hope:
+/// a step that had already passed its generation recheck could still submit
+/// into the Raft while the sequence was shutting it down. Registration here
+/// closes that: `stop_all` takes every handle under the lock, sets the
+/// one-way `stopping` flag so no later registration can slip a fresh task
+/// past it, and then aborts **and awaits** each task — the await is the
+/// acknowledgement that no controller instruction can run after it returns.
+#[derive(Default)]
+pub(crate) struct ControllerTasks {
+    inner: tokio::sync::Mutex<ControllerSlots>,
+}
+
+#[derive(Default)]
+struct ControllerSlots {
+    /// One-way: set by `stop_all`. A registration that arrives afterwards is
+    /// aborted instead of stored, so the acknowledged stop stays final.
+    stopping: bool,
+    membership: Option<tokio::task::JoinHandle<()>>,
+    expiry: Option<tokio::task::JoinHandle<()>>,
+    proposing: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ControllerTasks {
+    /// Install this generation's membership/expiry tasks, aborting the
+    /// previous generation's. After `stop_all`, the new tasks are aborted
+    /// instead of installed.
+    pub(crate) async fn replace_generation(
+        &self,
+        membership: Option<tokio::task::JoinHandle<()>>,
+        expiry: Option<tokio::task::JoinHandle<()>>,
+    ) {
+        let doomed: Vec<tokio::task::JoinHandle<()>> = {
+            let mut slots = self.inner.lock().await;
+            let mut doomed: Vec<tokio::task::JoinHandle<()>> =
+                [slots.membership.take(), slots.expiry.take()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            if slots.stopping {
+                doomed.extend([membership, expiry].into_iter().flatten());
+            } else {
+                slots.membership = membership;
+                slots.expiry = expiry;
+            }
+            doomed
+        };
+        for task in doomed {
+            task.abort();
+        }
+    }
+
+    /// Spawn the genesis proposal if none is in flight — under the same lock
+    /// as the stop, so a proposal cannot start beside it.
+    pub(crate) async fn propose_if_idle(
+        &self,
+        spawn: impl FnOnce() -> tokio::task::JoinHandle<()>,
+    ) {
+        let mut slots = self.inner.lock().await;
+        if slots.stopping {
+            return;
+        }
+        if slots
+            .proposing
+            .as_ref()
+            .is_none_or(|task| task.is_finished())
+        {
+            slots.proposing = Some(spawn());
+        }
+    }
+
+    /// §11.5 step 3's acknowledged half: latch `stopping`, take every task,
+    /// abort it, and **await its termination**. When this returns, no
+    /// membership change, expiry proposal, or genesis proposal can execute
+    /// another instruction, and none can be spawned.
+    pub(crate) async fn stop_all(&self) {
+        let taken: Vec<tokio::task::JoinHandle<()>> = {
+            let mut slots = self.inner.lock().await;
+            slots.stopping = true;
+            [
+                slots.membership.take(),
+                slots.expiry.take(),
+                slots.proposing.take(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        };
+        for task in taken {
+            task.abort();
+            let _ = task.await;
         }
     }
 }
@@ -421,6 +517,7 @@ pub(crate) struct ShutdownSequence {
     endpoint: RaftEndpoint,
     raft: Raft<CoordinationTypeConfig>,
     generation: Arc<AtomicU64>,
+    controller_tasks: Arc<ControllerTasks>,
     /// Latched by the first caller; §11.5's evacuation is one-way.
     ran: Arc<tokio::sync::Mutex<bool>>,
 }
@@ -442,14 +539,17 @@ impl ShutdownSequence {
         //    already inside a handler, while the Raft they may be awaiting
         //    still runs.
         self.store_endpoint.drain().await;
-        // 3. Controllers stop before the Raft: the generation bump halts the
-        //    membership and expiry loops at their next side effect even
-        //    mid-await, which an abort alone cannot guarantee. Then the Raft
-        //    RPC deregisters — a call is answered `FailedPrecondition`, the
-        //    same status a node that has not yet attached answers — and the
-        //    Raft itself shuts down, which closes the metrics channel and
-        //    ends the lifecycle loop.
+        // 3. Controllers stop before the Raft, and the stop is
+        //    **acknowledged**: the generation bump halts a superseded loop at
+        //    its next recheck, and `stop_all` then aborts and *awaits* the
+        //    membership, expiry and genesis tasks — when it returns, no
+        //    controller instruction can run and none can be spawned. Only
+        //    then does the Raft RPC deregister — a call is answered
+        //    `FailedPrecondition`, the same status a node that has not yet
+        //    attached answers — and the Raft itself shuts down, which closes
+        //    the metrics channel and ends the lifecycle loop.
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.controller_tasks.stop_all().await;
         self.endpoint.detach().await;
         let _ = self.raft.shutdown().await;
     }
@@ -554,12 +654,14 @@ impl CoordinationRuntime {
             })
             .await;
 
+        let controller_tasks = Arc::new(ControllerTasks::default());
         let sequence = ShutdownSequence {
             facts: Arc::clone(&facts),
             store_endpoint: store_endpoint.clone(),
             endpoint: endpoint.clone(),
             raft: raft.clone(),
             generation: Arc::clone(&generation),
+            controller_tasks: Arc::clone(&controller_tasks),
             ran: Arc::new(tokio::sync::Mutex::new(false)),
         };
 
@@ -590,6 +692,7 @@ impl CoordinationRuntime {
             Arc::clone(&generation),
             genesis,
             std::sync::Arc::clone(&store_metrics),
+            controller_tasks,
         ));
 
         Self {
@@ -850,6 +953,7 @@ mod tests {
             "store_endpoint.detach()",
             "store_endpoint.drain()",
             "generation.fetch_add",
+            "controller_tasks.stop_all()",
             // `self.`-qualified so the match cannot land inside
             // `store_endpoint.detach()` above.
             "self.endpoint.detach()",
@@ -887,6 +991,63 @@ mod tests {
             assert!(at > last, "{step} is out of §7.6's order");
             last = at;
         }
+    }
+
+    /// The controller stop is **acknowledged**, not advisory: after
+    /// `stop_all` returns, a registered task can execute no further
+    /// instruction, and a task registered afterwards is aborted instead of
+    /// installed. A counter bump alone gives neither guarantee — a task
+    /// that had already passed its recheck could still act.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_controller_stop_is_acknowledged_not_advisory() {
+        use std::sync::atomic::AtomicU64;
+
+        let tasks = ControllerTasks::default();
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = |ticks: Arc<AtomicU64>| {
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+
+        tasks
+            .replace_generation(Some(ticker(Arc::clone(&ticks))), None)
+            .await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(ticks.load(Ordering::SeqCst) > 0, "the task ran");
+
+        tasks.stop_all().await;
+        // The await inside stop_all is the acknowledgement: the task has
+        // terminated, so the counter can never advance again.
+        let at_stop = ticks.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            at_stop,
+            "no controller effect may run after the acknowledged stop"
+        );
+
+        // Registration after the stop installs nothing.
+        let late = Arc::new(AtomicU64::new(0));
+        tasks
+            .replace_generation(Some(ticker(Arc::clone(&late))), None)
+            .await;
+        let mut proposed = false;
+        tasks
+            .propose_if_idle(|| {
+                proposed = true;
+                ticker(Arc::clone(&late))
+            })
+            .await;
+        assert!(!proposed, "no proposal may be spawned after the stop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            late.load(Ordering::SeqCst) <= 1,
+            "a task registered after the stop is aborted, not installed"
+        );
     }
 
     /// The lifecycle loop is the only writer of the published view.

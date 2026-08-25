@@ -1768,6 +1768,161 @@ async fn the_pressure_tiers_refuse_growth_then_everything_and_reads_survive() {
     );
 }
 
+/// **Hard pressure on the leader lets another voter lead** — the §11.5
+/// sentence made observable, and the third review's P0 gate. Three voters;
+/// the sitting leader's hard tier is forced; its monitor runs the
+/// acknowledged shutdown sequence (controllers aborted **and awaited**
+/// before the Raft stops), the evacuated node answers
+/// `FAILED_PRECONDITION`, the survivors elect a new leader with the
+/// remaining quorum, and a ROOT mutation **commits** against that new
+/// leader — leadership and progress moved, they were not merely refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn hard_pressure_on_the_leader_lets_another_voter_lead() {
+    let fixture = GroupFixture::new("store.evacuate", 0xDC, 3);
+    let dirs: Vec<tempfile::TempDir> = (0..3)
+        .map(|_| tempfile::tempdir().expect("a directory"))
+        .collect();
+    let mut voters = Vec::new();
+    for (index, dir) in dirs.iter().enumerate() {
+        voters.push(
+            AsterServer::builder()
+                .config(fixture.aster_config(index))
+                .builtin_coordination(fixture.config(dir.path(), index))
+                .start()
+                .await
+                .expect("a voter starts"),
+        );
+    }
+    let addrs: Vec<_> = voters.iter().map(|v| v.node().addr()).collect();
+    for voter in &voters {
+        for addr in &addrs {
+            if addr.node_id != voter.node().addr().node_id {
+                voter
+                    .node()
+                    .add_node_addr(addr.clone())
+                    .expect("register a peer");
+            }
+        }
+    }
+    for voter in &voters {
+        within(
+            "readiness",
+            voter.coordination().expect("hosted").wait_ready(),
+        )
+        .await
+        .expect("the group becomes ready");
+    }
+
+    let old_leader_id = voters[0]
+        .coordination()
+        .expect("hosted")
+        .current_leader_for_testing()
+        .expect("a ready group has a leader");
+    let leader_index = voters
+        .iter()
+        .position(|v| {
+            aster::coordination::ids::CoordinationNodeId::parse_hex(v.node().id().as_str())
+                .expect("a voter id")
+                == old_leader_id
+        })
+        .expect("the leader is among the voters");
+    let survivor_index = (leader_index + 1) % 3;
+
+    // Force the hard tier on the leader. Its monitor latches, runs the
+    // acknowledged shutdown sequence, and steps the node aside.
+    voters[leader_index]
+        .coordination()
+        .expect("hosted")
+        .set_pressure_for_testing(false, true);
+
+    // The evacuated node stops serving coordination entirely.
+    let probe_client = Client::connect([0xDC ^ 0x42; 32], &fixture, &voters[leader_index]).await;
+    let status_request = GroupStatusRequestV1 {
+        protocol_version: STORE_PROTOCOL_VERSION,
+        group_id: group_of(&fixture),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match client_status(&probe_client, "group_status", &status_request).await {
+            Some(FAILED_PRECONDITION) => break,
+            last => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pressured leader must evacuate, last answer {last:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    // The survivors elect: a different leader emerges from the remaining
+    // quorum of two.
+    let new_leader_id = loop {
+        let seen = voters[survivor_index]
+            .coordination()
+            .expect("hosted")
+            .current_leader_for_testing();
+        match seen {
+            Some(id) if id != old_leader_id => break id,
+            _ => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no new leader emerged after the evacuation, last {seen:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    };
+    let new_leader = voters
+        .iter()
+        .find(|v| {
+            aster::coordination::ids::CoordinationNodeId::parse_hex(v.node().id().as_str())
+                .expect("a voter id")
+                == new_leader_id
+        })
+        .expect("the new leader is a survivor");
+
+    // And the group makes progress: a ROOT mutation commits against the new
+    // leader — the claim is leadership *and* a committed write, not a
+    // refusal. Retried through UNAVAILABLE while the election settles.
+    let root = Client::connect(root_secret(0xDC), &fixture, new_leader).await;
+    let request = SetGrantRequestV1 {
+        protocol_version: STORE_PROTOCOL_VERSION,
+        group_id: group_of(&fixture),
+        client_id: id16(b"evac-root"),
+        sequence: 1,
+        resource: resource(b"after-evacuation"),
+        target_node_id: root.id.to_vec(),
+        rights: RIGHT_READ,
+        expected_acl_revision: 0,
+    };
+    let granted: MutationReplyWireV1 = loop {
+        match within(
+            "post-evacuation grant",
+            root.conn.unary(&header("set_grant"), encode(&request)),
+        )
+        .await
+        {
+            Ok(raw) => break decode(&raw),
+            Err(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the new leader never committed the grant"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    };
+    assert_eq!(
+        granted.outcome_code, 6,
+        "the group commits after the evacuation: {granted:?}"
+    );
+
+    for voter in voters {
+        voter.shutdown().await;
+    }
+}
+
 /// **§12.2's denied-request bucket short-circuits a denial storm at entry.**
 ///
 /// A stranger hammering an administrator-only read earns `PERMISSION_DENIED`
@@ -2027,6 +2182,35 @@ async fn the_section_14_surfaces_move_with_the_operations() {
     assert!(
         consensus.audit_floor_index.is_none(),
         "no audit pruning ran, so the full history is retained: {consensus:?}"
+    );
+    // The full log ids name their proposing leader — the §14 "id", not an
+    // index-only half.
+    assert_eq!(
+        last_log.leader_node_id,
+        consensus.leader_node_id.expect("a leader"),
+        "the single-term group's entries were proposed by its leader: {consensus:?}"
+    );
+    // Cross-surface: the snapshot's membership equals the **replicated**
+    // committed membership `group_status` carries (its source is the state
+    // actor's committed view; the structural test in `coordination::mod`
+    // pins that it is never the effective config).
+    let status: GroupStatusReplyWireV1 = call(
+        &h.root,
+        "group_status",
+        &GroupStatusRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group_of(&h.fixture),
+        },
+    )
+    .await;
+    assert!(
+        consensus.learners.is_empty() && status.learners.is_empty(),
+        "the settled group has no learners on either surface: {consensus:?}"
+    );
+    assert_eq!(
+        status.voters.len(),
+        1,
+        "one committed voter on the replicated surface: {status:?}"
     );
 
     // ── The disk gauges, once the monitor has sampled. ──
