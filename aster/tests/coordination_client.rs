@@ -637,3 +637,315 @@ async fn the_recovery_export_streams_into_a_writer_exactly() {
 
     voter.shutdown().await;
 }
+
+// ── The inbound-reply boundary, over live RPC (the fourth review's P0) ──────
+
+/// A counterfeit `aster.coordination.Store`: it answers with **validly
+/// encoded** replies that echo the caller's client id, sequence and exact
+/// request hash — everything a pre-boundary client checked — while naming a
+/// configurable group and protocol version. The one thing it cannot forge
+/// is what the boundary checks.
+struct ForeignStore {
+    group_id: std::sync::Mutex<Vec<u8>>,
+    protocol_version: std::sync::Mutex<i32>,
+    /// When set, `acquire` answers an entry-owned §10-terminal refusal
+    /// instead of a grant — the corridor opener for the retirement gate.
+    terminal: std::sync::Mutex<bool>,
+    /// The group stamped onto `retire_client` confirmations, separately
+    /// switchable from the mutation stamp.
+    retire_group: std::sync::Mutex<Vec<u8>>,
+}
+
+impl ForeignStore {
+    fn stamp(&self) -> (Vec<u8>, i32) {
+        (
+            self.group_id.lock().expect("stamp").clone(),
+            *self.protocol_version.lock().expect("stamp"),
+        )
+    }
+}
+
+/// The registered wrapper: the builder's `service` takes ownership, so the
+/// test keeps the shared state through this delegating handle.
+struct ForeignStoreService(std::sync::Arc<ForeignStore>);
+
+#[async_trait::async_trait]
+impl aster::rpc::ServiceDispatch for ForeignStoreService {
+    fn name(&self) -> &str {
+        aster::coordination::service::STORE_SERVICE
+    }
+    fn version(&self) -> i32 {
+        aster::coordination::service::STORE_VERSION
+    }
+    fn methods(&self) -> &[&str] {
+        aster::coordination::service::STORE_METHODS
+    }
+    async fn dispatch(&self, method: &str, mut call: aster::rpc::Call) {
+        use aster::coordination::contract::{payload_fory, AcquireActionV1, ActionV1};
+        use aster::coordination::store::wire::{
+            AcquireRequestV1, GroupStatusReplyWireV1, MutationReplyWireV1, STORE_PROTOCOL_VERSION,
+        };
+        let Some(frame) = call.recv_request().await else {
+            return;
+        };
+        let (group_id, protocol_version) = self.0.stamp();
+        let reply_bytes = match method {
+            "acquire" => {
+                let request: AcquireRequestV1 = payload_fory::<AcquireRequestV1>()
+                    .deserialize(&frame)
+                    .expect("the counterfeit decodes the request");
+                // Echo exactly what a pre-boundary client verified: the
+                // client id, the sequence, and the true canonical hash of
+                // the requested action.
+                let hash =
+                    aster::coordination::hash::request_hash(&ActionV1::Acquire(AcquireActionV1 {
+                        resource: request.resource,
+                        ttl_ms: request.ttl_ms,
+                    }))
+                    .expect("the action hashes");
+                let terminal = *self.0.terminal.lock().expect("stamp");
+                let (disposition_code, outcome_code, reason_code) = if terminal {
+                    // NotConsumed with a §10-terminal reason: the corridor
+                    // opener, honestly owned by the entry.
+                    (2, 100, 24)
+                } else {
+                    (1, 1, 0)
+                };
+                payload_fory::<MutationReplyWireV1>()
+                    .serialize(&MutationReplyWireV1 {
+                        protocol_version,
+                        group_id,
+                        client_id: request.client_id,
+                        sequence: request.sequence,
+                        request_hash: hash.to_vec(),
+                        disposition_code,
+                        outcome_code,
+                        reason_code,
+                        ..Default::default()
+                    })
+                    .expect("the counterfeit encodes")
+            }
+            "retire_client" => {
+                use aster::coordination::store::wire::RetireClientReplyWireV1;
+                payload_fory::<RetireClientReplyWireV1>()
+                    .serialize(&RetireClientReplyWireV1 {
+                        protocol_version: STORE_PROTOCOL_VERSION,
+                        group_id: self.0.retire_group.lock().expect("stamp").clone(),
+                        outcome_code: 9,
+                        ..Default::default()
+                    })
+                    .expect("the counterfeit encodes")
+            }
+            "group_status" => payload_fory::<GroupStatusReplyWireV1>()
+                .serialize(&GroupStatusReplyWireV1 {
+                    protocol_version: STORE_PROTOCOL_VERSION,
+                    group_id,
+                    lifecycle_code: 3,
+                    local_node_id: vec![0xEE; 32],
+                    genesis_hash: vec![0xEE; 32],
+                    ..Default::default()
+                })
+                .expect("the counterfeit encodes"),
+            _ => {
+                let _ = call
+                    .finish(&aster::rpc::RpcStatus::error(
+                        aster::rpc::StatusCode::Unimplemented,
+                        "the counterfeit serves acquire and group_status only",
+                    ))
+                    .await;
+                return;
+            }
+        };
+        let _ = call
+            .respond(reply_bytes, &aster::rpc::RpcStatus::ok())
+            .await;
+    }
+}
+
+/// **A validly encoded foreign reply is refused at the boundary, live.**
+/// The counterfeit store echoes the client id, sequence and true request
+/// hash — the pre-boundary checks — while naming another group (then
+/// another protocol version). The mutation must not resolve and nothing
+/// may be persisted for delivery; a linearizable-status read must surface
+/// the refusal rather than the counterfeit's answer. Flipping the
+/// counterfeit to the honest stamps makes the same call succeed, pinning
+/// every refusal to the envelope boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
+    let fixture = GroupFixture::new("client.boundary", 0xE9, 1);
+    let real_group = group(&fixture);
+
+    let foreign = std::sync::Arc::new(ForeignStore {
+        group_id: std::sync::Mutex::new(vec![0xEE; 32]),
+        protocol_version: std::sync::Mutex::new(1),
+        terminal: std::sync::Mutex::new(false),
+        retire_group: std::sync::Mutex::new(vec![0xEE; 32]),
+    });
+    let counterfeit = AsterServer::builder()
+        .config(
+            AsterConfig::builder()
+                .relay(RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0")
+                .secret_key(SecretKey::from_bytes([0xE9 ^ 0x7A; 32]))
+                .build(),
+        )
+        .service(ForeignStoreService(std::sync::Arc::clone(&foreign)))
+        .start()
+        .await
+        .expect("the counterfeit starts");
+    let counterfeit_id: [u8; 32] =
+        *aster::coordination::ids::CoordinationNodeId::parse_hex(counterfeit.node().id().as_str())
+            .expect("a 32-byte id")
+            .as_bytes();
+
+    let node = Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(SecretKey::from_bytes([0xE9 ^ 0x41; 32]))
+            .build(),
+    )
+    .await
+    .expect("a client node starts");
+    node.add_node_addr(counterfeit.node().addr())
+        .expect("register the counterfeit");
+    let journal = tempfile::tempdir().expect("a directory");
+    let client = CoordinationClient::builder(node, real_group)
+        .seed_tickets([
+            aster::coordination::model::authority::canonical_candidate_ticket(&counterfeit_id)
+                .expect("a canonical ticket"),
+        ])
+        .journal_dir(journal.path())
+        .build()
+        .expect("the client builds");
+
+    // Wrong group: the drive classifies every reply as not-this-entry's and
+    // exhausts; nothing is delivered and nothing awaits acknowledgement.
+    let refused = within(
+        "wrong-group acquire",
+        client.acquire(resource(b"boundary"), 60_000),
+    )
+    .await;
+    let Err(err) = refused else {
+        panic!("a foreign reply must not resolve")
+    };
+    assert!(
+        format!("{err}").contains("no resolution"),
+        "the driver classifies the foreign reply as not-this-entry's and \
+         exhausts — it never reaches the journal: {err}"
+    );
+    assert!(
+        within("unacknowledged", client.unacknowledged())
+            .await
+            .expect("the journal answers")
+            .is_none(),
+        "a foreign reply must never be persisted for delivery"
+    );
+
+    // The read path refuses a foreign group_status outright — checked while
+    // the counterfeit still stamps the foreign group.
+    let status = within("foreign status", client.reads().group_status()).await;
+    let _ = status.expect_err("a foreign status reply must be refused");
+
+    // Wrong protocol version under the true group: same refusal.
+    *foreign.group_id.lock().expect("stamp") = real_group.as_bytes().to_vec();
+    *foreign.protocol_version.lock().expect("stamp") = 99;
+    let refused = within("wrong-version resume", client.resume()).await;
+    let Err(err) = refused else {
+        panic!("a wrong-version reply must not resolve")
+    };
+    assert!(
+        format!("{err}").contains("no resolution"),
+        "the driver, not the journal backstop, refuses the wrong version: {err}"
+    );
+
+    // Honest stamps: the same journaled request now resolves — the earlier
+    // refusals were the boundary's, not some other fault's.
+    *foreign.protocol_version.lock().expect("stamp") =
+        aster::coordination::store::wire::STORE_PROTOCOL_VERSION;
+    let resolved = within("honest resume", client.resume())
+        .await
+        .expect("the honest reply resolves")
+        .expect("the journaled request resolves");
+    assert_eq!(resolved.reply().outcome_code, 1);
+    within("ack", resolved.acknowledge()).await.expect("ack");
+
+    counterfeit.shutdown().await;
+}
+
+/// **A retirement confirmation from another group confirms nothing** (the
+/// fourth review's P0, retirement half). The counterfeit opens the closing
+/// corridor honestly — an entry-owned §10-terminal refusal under the true
+/// group — and then answers `retire_client` with outcome 9 stamped with a
+/// **foreign** group. The client must keep the journal `Closing` and
+/// surface the exhausted confirmation attempt, not honor the foreign 9 and
+/// replay on a tombstone that may not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_retirement_confirmation_is_not_honored() {
+    let fixture = GroupFixture::new("client.boundary2", 0xEA, 1);
+    let real_group = group(&fixture);
+
+    let foreign = std::sync::Arc::new(ForeignStore {
+        group_id: std::sync::Mutex::new(real_group.as_bytes().to_vec()),
+        protocol_version: std::sync::Mutex::new(
+            aster::coordination::store::wire::STORE_PROTOCOL_VERSION,
+        ),
+        terminal: std::sync::Mutex::new(true),
+        retire_group: std::sync::Mutex::new(vec![0xEE; 32]),
+    });
+    let counterfeit = AsterServer::builder()
+        .config(
+            AsterConfig::builder()
+                .relay(RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0")
+                .secret_key(SecretKey::from_bytes([0xEA ^ 0x7A; 32]))
+                .build(),
+        )
+        .service(ForeignStoreService(std::sync::Arc::clone(&foreign)))
+        .start()
+        .await
+        .expect("the counterfeit starts");
+    let counterfeit_id: [u8; 32] =
+        *aster::coordination::ids::CoordinationNodeId::parse_hex(counterfeit.node().id().as_str())
+            .expect("a 32-byte id")
+            .as_bytes();
+
+    let node = Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(SecretKey::from_bytes([0xEA ^ 0x41; 32]))
+            .build(),
+    )
+    .await
+    .expect("a client node starts");
+    node.add_node_addr(counterfeit.node().addr())
+        .expect("register the counterfeit");
+    let journal = tempfile::tempdir().expect("a directory");
+    let client = CoordinationClient::builder(node, real_group)
+        .seed_tickets([
+            aster::coordination::model::authority::canonical_candidate_ticket(&counterfeit_id)
+                .expect("a canonical ticket"),
+        ])
+        .journal_dir(journal.path())
+        .build()
+        .expect("the client builds");
+
+    // The terminal refusal opens the corridor; the foreign outcome-9 must
+    // then be skipped until the confirmation budget exhausts, with the
+    // journal still Closing.
+    let refused = within(
+        "corridor under a foreign confirmation",
+        client.acquire(resource(b"boundary2"), 60_000),
+    )
+    .await;
+    let Err(err) = refused else {
+        panic!("the corridor cannot complete on a foreign confirmation")
+    };
+    assert!(
+        format!("{err}").contains("retirement did not confirm"),
+        "the foreign outcome 9 must be skipped, not honored: {err}"
+    );
+
+    counterfeit.shutdown().await;
+}

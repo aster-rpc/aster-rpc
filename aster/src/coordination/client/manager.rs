@@ -113,19 +113,20 @@ impl ObservationFingerprint {
     }
 }
 
-/// The whole retained recommendation: the observation tuple **and the
-/// selection it produced**. §7.7.1's revalidation rule covers "any changed
-/// selected topology fact" — the policy and membership may be untouched
-/// while a second topology snapshot selects a different member, and
-/// submitting that second selection would be exactly the race the recheck
-/// exists to refuse. The selection is the topology facts' fingerprint: a
-/// topology change that alters no selected fact leaves it equal, and one
-/// that moves any selected member discards the pass.
+/// The whole retained recommendation: the observation tuple, the selection
+/// it produced, **and the topology evidence behind that selection**.
+/// §7.7.1's revalidation rule covers "any changed selected topology fact" —
+/// and the same nodes can remain selected while their presence, cluster
+/// equivalence or pairwise separation evidence changes underneath, so
+/// selected IDs alone are not the fingerprint. The recheck recomputes the
+/// evidence for the *retained* selection from the fresh snapshot and
+/// discards the pass when any fact moved.
 #[derive(Debug, Clone, PartialEq)]
 struct PlannedPass {
     observation: ObservationFingerprint,
     desired_voters: Vec<CoordinationNodeId>,
     retained_learners: Vec<CoordinationNodeId>,
+    evidence: placement::SelectionEvidence,
 }
 
 pub struct CoordinationPlacementManager<T, P, V> {
@@ -215,10 +216,13 @@ where
                 desired_voters,
                 retained_learners,
             } => {
+                let evidence =
+                    placement::selection_evidence(&input, &desired_voters, &retained_learners);
                 let planned = PlannedPass {
                     observation,
                     desired_voters,
                     retained_learners,
+                    evidence,
                 };
                 let mut provisioned: BTreeMap<CoordinationNodeId, MemberSeedV1> = BTreeMap::new();
                 for node in candidates {
@@ -240,10 +244,16 @@ where
                 self.recheck_and_submit(planned, provisioned).await
             }
             PlacementRecommendation::Plan(plan) => {
+                let evidence = placement::selection_evidence(
+                    &input,
+                    &plan.desired_voters,
+                    &plan.retained_learners,
+                );
                 let planned = PlannedPass {
                     observation,
                     desired_voters: plan.desired_voters.clone(),
                     retained_learners: plan.retained_learners.clone(),
+                    evidence,
                 };
                 self.recheck_and_submit(planned, BTreeMap::new()).await
             }
@@ -305,15 +315,26 @@ where
         match placement::plan(&input) {
             PlacementRecommendation::Plan(plan)
                 if plan.desired_voters == planned.desired_voters
-                    && plan.retained_learners == planned.retained_learners =>
+                    && plan.retained_learners == planned.retained_learners
+                    // The evidence behind the retained selection, recomputed
+                    // from the **fresh** snapshot: presence, co-clustering
+                    // and pairwise separation verdicts must all be the facts
+                    // the pass was planned on — identity equality alone
+                    // would submit under moved evidence.
+                    && placement::selection_evidence(
+                        &input,
+                        &planned.desired_voters,
+                        &planned.retained_learners,
+                    ) == planned.evidence =>
             {
                 self.submit(&input.policy, &status, &input.grace_crossed_members, *plan)
                     .await
             }
             // §7.7.1: "any changed selected topology fact discards the
             // earlier recommendation." Same policy, same membership, but the
-            // second snapshot selects different members — this pass submits
-            // nothing, whatever the fresh plan says.
+            // second snapshot selects different members — or the same
+            // members under changed evidence — this pass submits nothing,
+            // whatever the fresh plan says.
             PlacementRecommendation::Plan(_) => Ok(report_of(
                 &self.client,
                 &input.policy,

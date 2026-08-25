@@ -23,13 +23,16 @@
 //! If no such order exists the history is not linearizable and the checker
 //! says which operations could not be placed.
 //!
-//! ## Identity and ACL pinning
+//! ## Independent identity, ACL and visibility oracles
 //!
-//! The model tracks one register, so the group id, resource key and ACL
-//! revision are **pinned from the first accepted snapshot** and every later
-//! snapshot must repeat them exactly: a reply about another resource, another
-//! group, or under a shifted ACL revision is refuted rather than absorbed.
-//! (No recorded operation mutates the ACL, so constancy is the invariant.)
+//! The group id, resource key and ACL revision are **supplied by the
+//! harness** ([`Expectations`]), never learned from a reply: a checker that
+//! pinned them from the first production snapshot would accept a defect
+//! that returns the same wrong identity in every reply. Likewise each
+//! recorded operation carries `may_read_value`, the harness's independent
+//! knowledge of the caller's `READ` grant: an authorized caller receiving a
+//! withheld value — or an unauthorized one receiving bytes — is refuted,
+//! not absorbed as "unknown".
 //!
 //! ## Ambiguous operations
 //!
@@ -128,6 +131,10 @@ pub struct Observed {
 pub struct Recorded {
     /// Who called, as the transport authenticated them.
     pub actor: [u8; 32],
+    /// The harness's **independent** knowledge of whether this caller holds
+    /// `RIGHT_READ` on the register — from the grants it made, never from
+    /// any reply.
+    pub may_read_value: bool,
     /// Nanoseconds since the history's origin at invocation.
     pub invoked: u64,
     /// Nanoseconds at response; `None` for an ambiguous operation.
@@ -152,14 +159,15 @@ const NOT_HOLDER: i32 = 3;
 const EPOCH_MISMATCH: i32 = 4;
 const VALUE_REVISION_MISMATCH: i32 = 5;
 
-/// The identity facts pinned from the first accepted snapshot. No recorded
-/// operation changes any of them, so a later snapshot that disagrees is a
-/// reply about some other register — or an ACL history the run never made.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PinnedFacts {
-    group_id: [u8; 32],
-    resource: (String, Vec<u8>),
-    acl_revision: u64,
+/// The harness-supplied identity oracle: the group, resource and ACL
+/// revision every snapshot in this history must state. Independent of the
+/// replies by construction — the harness knows which group it built, which
+/// register it drove, and how many ACL operations it performed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expectations {
+    pub group_id: [u8; 32],
+    pub resource: (String, Vec<u8>),
+    pub acl_revision: u64,
 }
 
 /// The sequential register: an independent transcription of the §9.1 rows,
@@ -178,8 +186,6 @@ struct Register {
     /// every other transition, exactly as `resource::decide` keeps the row's
     /// `ttl_ms`.
     ttl_ms: u64,
-    /// Pinned identity facts; `None` until the first accepted snapshot.
-    pinned: Option<PinnedFacts>,
 }
 
 /// What one sequential step must have produced. The state facts live on the
@@ -302,37 +308,30 @@ impl Register {
             RegisterCall::Read => (next, Expected::Applied { outcome_code: 0 }),
         }
     }
-
-    /// Pin the identity facts from an accepted snapshot. Called only after
-    /// [`matches`] accepted the step, so a snapshot that *contradicts* an
-    /// existing pin never reaches here.
-    fn pinning(mut self, observed: &Observed) -> Register {
-        if self.pinned.is_none() {
-            if let Some(snapshot) = &observed.snapshot {
-                self.pinned = Some(PinnedFacts {
-                    group_id: snapshot.group_id,
-                    resource: snapshot.resource.clone(),
-                    acl_revision: snapshot.acl_revision,
-                });
-            }
-        }
-        self
-    }
 }
 
-/// Every fact the snapshot states must be the register's fact.
-fn facts_match(snapshot: &SnapshotFacts, register: &Register) -> bool {
-    let identity = register.pinned.as_ref().is_none_or(|pinned| {
-        snapshot.group_id == pinned.group_id
-            && snapshot.resource == pinned.resource
-            && snapshot.acl_revision == pinned.acl_revision
-    });
+/// Every fact the snapshot states must be the register's fact — with the
+/// identity judged against the harness's independent [`Expectations`] and
+/// the value judged against the caller's independent `READ` visibility.
+fn facts_match(
+    expected: &Expectations,
+    snapshot: &SnapshotFacts,
+    register: &Register,
+    may_read_value: bool,
+) -> bool {
+    let identity = snapshot.group_id == expected.group_id
+        && snapshot.resource == expected.resource
+        && snapshot.acl_revision == expected.acl_revision;
     let value = match &snapshot.value {
-        ValueFact::Present(bytes) => *bytes == register.value,
-        // Genuinely unknown: a replayed reply's bytes were never stored, and
-        // a withheld one is an authorization outcome. Neither states a value
-        // fact to compare — unlike `Present(empty)`, which does.
-        ValueFact::Redacted | ValueFact::Withheld => true,
+        // Bytes reach only a caller entitled to them, and must be the
+        // model's bytes exactly — empty included.
+        ValueFact::Present(bytes) => may_read_value && *bytes == register.value,
+        // A replay's bytes were never stored; legitimate for any caller.
+        ValueFact::Redacted => true,
+        // An authorization outcome: legitimate **only** for a caller the
+        // harness independently knows lacks `READ`. For an authorized
+        // caller a withheld value is a lost value, not an unknown one.
+        ValueFact::Withheld => !may_read_value,
     };
     identity
         && value
@@ -351,15 +350,16 @@ fn facts_match(snapshot: &SnapshotFacts, register: &Register) -> bool {
 /// must state `pre`, while an applied reply must carry a snapshot stating
 /// `post`.
 fn matches(
+    oracle: &Expectations,
     expected: &Expected,
+    op: &Recorded,
     observed: &Observed,
-    call: &RegisterCall,
     pre: &Register,
     post: &Register,
 ) -> bool {
     match expected {
         Expected::Applied { outcome_code } => {
-            let outcome_matches = if matches!(call, RegisterCall::Read) {
+            let outcome_matches = if matches!(op.call, RegisterCall::Read) {
                 // A read reply has no outcome code; it is all snapshot.
                 true
             } else {
@@ -372,7 +372,7 @@ fn matches(
                 && observed
                     .snapshot
                     .as_ref()
-                    .is_some_and(|snapshot| facts_match(snapshot, post))
+                    .is_some_and(|snapshot| facts_match(oracle, snapshot, post, op.may_read_value))
         }
         Expected::Refused { reason_code } => {
             observed.outcome_code == REJECTED
@@ -380,14 +380,14 @@ fn matches(
                 && observed
                     .snapshot
                     .as_ref()
-                    .is_none_or(|snapshot| facts_match(snapshot, pre))
+                    .is_none_or(|snapshot| facts_match(oracle, snapshot, pre, op.may_read_value))
         }
     }
 }
 
 /// Search for a linearization of `history`. `Ok` carries the witness order
 /// (indices into `history`); `Err` carries a diagnosis.
-pub fn check(history: &[Recorded]) -> Result<Vec<usize>, String> {
+pub fn check(oracle: &Expectations, history: &[Recorded]) -> Result<Vec<usize>, String> {
     assert!(
         history.len() <= 128,
         "the bitmask search handles at most 128 operations"
@@ -414,6 +414,7 @@ pub fn check(history: &[Recorded]) -> Result<Vec<usize>, String> {
 
     #[allow(clippy::too_many_arguments)]
     fn dfs(
+        oracle: &Expectations,
         history: &[Recorded],
         candidate: &dyn Fn(u128, usize) -> bool,
         complete: &dyn Fn(u128) -> bool,
@@ -440,16 +441,14 @@ pub fn check(history: &[Recorded]) -> Result<Vec<usize>, String> {
             let (next, expected) = register.step(&op.actor, &op.call);
             let next = match &op.observed {
                 Some(observed) => {
-                    if !matches(&expected, observed, &op.call, &register, &next) {
+                    if !matches(oracle, &expected, op, observed, &register, &next) {
                         continue;
                     }
-                    // The accepted snapshot pins the identity facts every
-                    // later snapshot must repeat. A refusal leaves the state
-                    // untouched, so the pin lands on the pre-state clone.
+                    // A refusal leaves the state untouched.
                     if matches!(expected, Expected::Refused { .. }) {
-                        register.clone().pinning(observed)
+                        register.clone()
                     } else {
-                        next.pinning(observed)
+                        next
                     }
                 }
                 // Ambiguous: only the applied branch matters — a refusal has
@@ -463,6 +462,7 @@ pub fn check(history: &[Recorded]) -> Result<Vec<usize>, String> {
             };
             order.push(i);
             if dfs(
+                oracle,
                 history,
                 candidate,
                 complete,
@@ -480,6 +480,7 @@ pub fn check(history: &[Recorded]) -> Result<Vec<usize>, String> {
     }
 
     if dfs(
+        oracle,
         history,
         &candidate,
         &complete,
@@ -519,6 +520,14 @@ mod tests {
 
     fn actor(tag: u8) -> [u8; 32] {
         [tag; 32]
+    }
+
+    fn oracle() -> Expectations {
+        Expectations {
+            group_id: GROUP,
+            resource: resource(),
+            acl_revision: 1,
+        }
     }
 
     fn acquire() -> RegisterCall {
@@ -604,6 +613,7 @@ mod tests {
     ) -> Recorded {
         Recorded {
             actor: actor(actor_tag),
+            may_read_value: true,
             invoked,
             returned: Some(returned),
             call,
@@ -640,7 +650,7 @@ mod tests {
             ),
             op(2, 35, 45, acquire(), granted(2, 3, 3, 1)),
         ];
-        check(&history).expect("linearizable");
+        check(&oracle(), &history).expect("linearizable");
     }
 
     /// Two grants at the same epoch — two holders at once — cannot linearize.
@@ -650,7 +660,7 @@ mod tests {
             op(1, 0, 10, acquire(), granted(1, 1, 1, 0)),
             op(2, 2, 12, acquire(), granted(2, 1, 1, 0)),
         ];
-        check(&history).expect_err("two holders at one epoch");
+        check(&oracle(), &history).expect_err("two holders at one epoch");
     }
 
     /// A denial that no interleaving justifies — the register was free for
@@ -661,7 +671,7 @@ mod tests {
             op(1, 0, 10, acquire(), refused(HELD_BY_OTHER)),
             op(1, 20, 30, acquire(), granted(1, 1, 1, 0)),
         ];
-        check(&history).expect_err("nobody held the register");
+        check(&oracle(), &history).expect_err("nobody held the register");
     }
 
     /// Real-time order binds: a write that responded before a read began
@@ -690,7 +700,7 @@ mod tests {
                 applied(0, Some(1), 1, 1, 0, ValueFact::Present(Vec::new())),
             ),
         ];
-        check(&history).expect_err("the read is stale past a completed write");
+        check(&oracle(), &history).expect_err("the read is stale past a completed write");
     }
 
     /// A lost effect: a CAS the client saw commit whose value a later read
@@ -719,7 +729,7 @@ mod tests {
                 applied(0, Some(1), 1, 1, 1, ValueFact::Present(vec![4])),
             ),
         ];
-        check(&history).expect_err("the committed value vanished");
+        check(&oracle(), &history).expect_err("the committed value vanished");
     }
 
     /// A **cleared unredacted value** is a lost value, not an unknown one:
@@ -749,7 +759,8 @@ mod tests {
                 applied(0, Some(1), 1, 1, 1, ValueFact::Present(Vec::new())),
             ),
         ];
-        check(&history).expect_err("an unredacted empty value is not the committed value");
+        check(&oracle(), &history)
+            .expect_err("an unredacted empty value is not the committed value");
 
         // The honestly redacted twin linearizes: redaction is policy.
         let history = vec![
@@ -773,7 +784,7 @@ mod tests {
                 applied(0, Some(1), 1, 1, 1, ValueFact::Redacted),
             ),
         ];
-        check(&history).expect("a redacted value states no value fact");
+        check(&oracle(), &history).expect("a redacted value states no value fact");
     }
 
     /// A reply naming the wrong holder — actor 1 acquired, the snapshot says
@@ -783,7 +794,8 @@ mod tests {
     #[test]
     fn a_wrong_holder_reply_is_refuted() {
         let history = vec![op(1, 0, 10, acquire(), granted(2, 1, 1, 0))];
-        check(&history).expect_err("the snapshot names a holder that is not the acquirer");
+        check(&oracle(), &history)
+            .expect_err("the snapshot names a holder that is not the acquirer");
     }
 
     /// A success carrying a refusal reason is malformed: outcome `GRANTED`
@@ -794,7 +806,7 @@ mod tests {
         let mut observed = granted(1, 1, 1, 0);
         observed.reason_code = HELD_BY_OTHER;
         let history = vec![op(1, 0, 10, acquire(), observed)];
-        check(&history).expect_err("a success must carry reason 0");
+        check(&oracle(), &history).expect_err("a success must carry reason 0");
     }
 
     /// A renewal that does not advance the lease revision did not renew
@@ -813,7 +825,7 @@ mod tests {
                 applied(RENEWED, Some(1), 1, 1, 0, ValueFact::Redacted),
             ),
         ];
-        check(&history).expect_err("a renewal must advance the lease revision");
+        check(&oracle(), &history).expect_err("a renewal must advance the lease revision");
 
         // The same history with the advanced revision linearizes, so the
         // refutation above is the lease-revision check and nothing else.
@@ -827,7 +839,7 @@ mod tests {
                 applied(RENEWED, Some(1), 1, 2, 0, ValueFact::Redacted),
             ),
         ];
-        check(&history).expect("the honest renewal linearizes");
+        check(&oracle(), &history).expect("the honest renewal linearizes");
     }
 
     /// A grant that reports a different TTL than the acquire asked for is a
@@ -838,7 +850,7 @@ mod tests {
         let mut observed = granted(1, 1, 1, 0);
         observed.snapshot.as_mut().expect("a snapshot").ttl_ms = TTL / 2;
         let history = vec![op(1, 0, 10, acquire(), observed)];
-        check(&history).expect_err("the snapshot's TTL is not the acquire's");
+        check(&oracle(), &history).expect_err("the snapshot's TTL is not the acquire's");
     }
 
     /// The ACL revision is pinned: no recorded operation changes it, so two
@@ -851,7 +863,7 @@ mod tests {
             op(1, 0, 10, acquire(), granted(1, 1, 1, 0)),
             op(1, 11, 20, RegisterCall::Renew { fence_epoch: 1 }, renewed),
         ];
-        check(&history).expect_err("the ACL revision moved without an ACL operation");
+        check(&oracle(), &history).expect_err("the ACL revision moved without an ACL operation");
     }
 
     /// The resource identity is pinned: a snapshot about another resource —
@@ -866,7 +878,7 @@ mod tests {
             op(1, 0, 10, acquire(), granted(1, 1, 1, 0)),
             op(1, 11, 20, RegisterCall::Renew { fence_epoch: 1 }, renewed),
         ];
-        check(&history).expect_err("the snapshot names another resource");
+        check(&oracle(), &history).expect_err("the snapshot names another resource");
 
         let mut foreign = applied(RENEWED, Some(1), 1, 2, 0, ValueFact::Redacted);
         foreign.snapshot.as_mut().expect("a snapshot").group_id = [0xBB; 32];
@@ -874,7 +886,7 @@ mod tests {
             op(1, 0, 10, acquire(), granted(1, 1, 1, 0)),
             op(1, 11, 20, RegisterCall::Renew { fence_epoch: 1 }, foreign),
         ];
-        check(&history).expect_err("the snapshot names another group");
+        check(&oracle(), &history).expect_err("the snapshot names another group");
     }
 
     /// A refusal that carries a snapshot must state the unchanged pre-state;
@@ -889,7 +901,55 @@ mod tests {
             // Denied because held — but the snapshot claims nobody holds it.
             op(2, 11, 20, acquire(), denial),
         ];
-        check(&history).expect_err("a refusal's snapshot must state the pre-state");
+        check(&oracle(), &history).expect_err("a refusal's snapshot must state the pre-state");
+    }
+
+    /// **An authorized caller receiving a withheld value is refuted** (the
+    /// fourth review's escape): `None, value_redacted = false` maps to
+    /// `Withheld`, and for a caller the harness independently knows holds
+    /// `READ`, that is a lost value — production only withholds for want of
+    /// the right. The same observation from a caller *without* `READ`
+    /// linearizes, pinning the refutation to the visibility oracle.
+    #[test]
+    fn a_withheld_value_for_an_authorized_reader_is_refuted() {
+        let withheld = applied(GRANTED, Some(1), 1, 1, 0, ValueFact::Withheld);
+        let history = vec![op(1, 0, 10, acquire(), withheld.clone())];
+        check(&oracle(), &history).expect_err("an authorized reader must receive the value");
+
+        let mut unauthorized = op(1, 0, 10, acquire(), withheld);
+        unauthorized.may_read_value = false;
+        check(&oracle(), &[unauthorized]).expect("withheld is exactly the unauthorized outcome");
+    }
+
+    /// **An unauthorized caller receiving value bytes is refuted**: the
+    /// server never hands bytes to a caller without `READ`, so a reply that
+    /// does is not this group's reply.
+    #[test]
+    fn a_present_value_for_an_unauthorized_reader_is_refuted() {
+        let mut with_bytes = op(1, 0, 10, acquire(), granted(1, 1, 1, 0));
+        with_bytes
+            .observed
+            .as_mut()
+            .expect("observed")
+            .snapshot
+            .as_mut()
+            .expect("snapshot")
+            .value = ValueFact::Present(vec![7]);
+        with_bytes.may_read_value = false;
+        check(&oracle(), &[with_bytes]).expect_err("no bytes for a caller without READ");
+    }
+
+    /// **The identity oracle is the harness's, not the replies'**: a history
+    /// whose *every* snapshot consistently names a wrong group — the defect
+    /// a first-reply pin would normalize — is refuted against the supplied
+    /// expectations.
+    #[test]
+    fn a_consistently_wrong_identity_is_refuted() {
+        let mut foreign = granted(1, 1, 1, 0);
+        foreign.snapshot.as_mut().expect("snapshot").group_id = [0xBB; 32];
+        let history = vec![op(1, 0, 10, acquire(), foreign)];
+        check(&oracle(), &history)
+            .expect_err("even a consistent wrong group must fail the supplied oracle");
     }
 
     /// An ambiguous operation is free to land in the gap that explains the
@@ -901,6 +961,7 @@ mod tests {
             op(1, 0, 10, acquire(), granted(1, 1, 1, 0)),
             Recorded {
                 actor: actor(1),
+                may_read_value: true,
                 invoked: 11,
                 returned: None,
                 call: RegisterCall::Release { fence_epoch: 1 },
@@ -908,19 +969,20 @@ mod tests {
             },
             op(2, 12, 40, acquire(), granted(2, 3, 3, 0)),
         ];
-        check(&history).expect("the ambiguous release lands");
+        check(&oracle(), &history).expect("the ambiguous release lands");
 
         // And with nothing depending on it, it vanishes.
         let history = vec![
             op(1, 0, 10, acquire(), granted(1, 1, 1, 0)),
             Recorded {
                 actor: actor(1),
+                may_read_value: true,
                 invoked: 11,
                 returned: None,
                 call: RegisterCall::Release { fence_epoch: 1 },
                 observed: None,
             },
         ];
-        check(&history).expect("the ambiguous release vanishes");
+        check(&oracle(), &history).expect("the ambiguous release vanishes");
     }
 }

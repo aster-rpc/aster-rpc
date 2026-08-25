@@ -165,6 +165,10 @@ async fn perform(
     client: &CoordinationClient,
     log: &HistoryLog,
     call: RegisterCall,
+    // The harness's independent knowledge of this caller's READ grant,
+    // recorded on the operation so the checker can hold value visibility
+    // to it (workers hold READ; the revoker deliberately does not).
+    may_read_value: bool,
 ) -> Option<MutationReplyWireV1> {
     let actor = client.local_id().expect("the client identity");
     let group_id = client.group().as_bytes().to_vec();
@@ -210,6 +214,7 @@ async fn perform(
     let reply = resolved.reply().clone();
     log.record(Recorded {
         actor,
+        may_read_value,
         invoked,
         returned: Some(log.now()),
         call,
@@ -242,7 +247,8 @@ async fn contend(
             std::time::Instant::now() < deadline,
             "the contention loop starved: {round}/{rounds} rounds"
         );
-        let Some(reply) = perform(client, log, RegisterCall::Acquire { ttl_ms: TTL_MS }).await
+        let Some(reply) =
+            perform(client, log, RegisterCall::Acquire { ttl_ms: TTL_MS }, true).await
         else {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
@@ -266,6 +272,7 @@ async fn contend(
                 expected_value_revision: base_revision,
                 new_value: value.clone(),
             },
+            true,
         )
         .await;
         if let Some(cas_reply) = cas {
@@ -286,16 +293,25 @@ async fn contend(
         // Release, so the other workers can take the register. A refusal is
         // fine — a revocation may have fenced us first — and it too is in
         // the history.
-        let _ = perform(client, log, RegisterCall::Release { fence_epoch: epoch }).await;
+        let _ = perform(
+            client,
+            log,
+            RegisterCall::Release { fence_epoch: epoch },
+            true,
+        )
+        .await;
     }
     committed
 }
 
-/// Run the interval search and panic with its diagnosis on failure.
-fn check_linearizable(log: HistoryLog) {
+/// Run the interval search and panic with its diagnosis on failure. The
+/// identity and ACL oracle comes from the harness's own knowledge — the
+/// group it built, the register it drove, and the number of ACL operations
+/// it performed — never from any reply.
+fn check_linearizable(expected: linearize::Expectations, log: HistoryLog) {
     let ops = log.into_ops();
     assert!(!ops.is_empty(), "the history recorded nothing");
-    match linearize::check(&ops) {
+    match linearize::check(&expected, &ops) {
         Ok(order) => assert_eq!(
             order.len(),
             ops.iter().filter(|op| op.observed.is_some()).count(),
@@ -400,12 +416,16 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
                 contend(&w1, &log, b"w1", 6),
                 async {
                     tokio::time::sleep(Duration::from_secs(3)).await;
+                    // The revoker holds REVOKE and nothing else: the
+                    // checker must see its values as legitimately withheld
+                    // and everyone else's as owed.
                     let _ = perform(
                         &revoker,
                         &log,
                         RegisterCall::Revoke {
                             expected_epoch: None,
                         },
+                        false,
                     )
                     .await;
                 }
@@ -435,7 +455,14 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
     }
     let mid_reply = within("mutation across the partition", async {
         loop {
-            match perform(&workers[0], &log, RegisterCall::Acquire { ttl_ms: TTL_MS }).await {
+            match perform(
+                &workers[0],
+                &log,
+                RegisterCall::Acquire { ttl_ms: TTL_MS },
+                true,
+            )
+            .await
+            {
                 Some(reply) if reply.outcome_code == 1 => break reply,
                 _ => tokio::time::sleep(Duration::from_millis(250)).await,
             }
@@ -475,9 +502,18 @@ async fn the_register_history_is_linearizable_through_a_seeded_faulty_network() 
     );
 
     // The interval search: a witness order exists that real time permits
-    // and the sequential register accepts, denials and all.
+    // and the sequential register accepts, denials and all. The oracle is
+    // the harness's own: this fixture's group, this file's register, and
+    // exactly three ACL operations (two worker grants, one REVOKE grant).
     let log = std::sync::Arc::into_inner(log).expect("every recorder returned");
-    check_linearizable(log);
+    check_linearizable(
+        linearize::Expectations {
+            group_id: *root.group().as_bytes(),
+            resource: (resource().namespace, resource().key),
+            acl_revision: 3,
+        },
+        log,
+    );
 
     // Non-vacuity: the schedule really injected.
     let tally = combined_tally(&voters);
@@ -511,6 +547,8 @@ async fn recorded_read(
     log: &HistoryLog,
 ) -> aster::coordination::store::wire::ReadReplyWireV1 {
     let actor = client.local_id().expect("the client identity");
+    // Reads are performed by workers, which hold READ.
+    let may_read_value = true;
     let deadline = std::time::Instant::now() + PATIENCE;
     loop {
         let invoked = log.now();
@@ -518,6 +556,7 @@ async fn recorded_read(
             Ok(reply) => {
                 log.record(Recorded {
                     actor,
+                    may_read_value,
                     invoked,
                     returned: Some(log.now()),
                     call: RegisterCall::Read,
@@ -799,7 +838,14 @@ async fn committed_effects_survive_a_leader_kill_and_a_full_restart() {
 
     // The interval search over every phase: pre-kill, post-kill,
     // post-restart, and the read after the full restart.
-    check_linearizable(log);
+    check_linearizable(
+        linearize::Expectations {
+            group_id: *group.as_bytes(),
+            resource: (resource().namespace, resource().key),
+            acl_revision: 1,
+        },
+        log,
+    );
 
     for child in children.iter_mut().flatten() {
         let _ = child.kill();

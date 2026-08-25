@@ -163,14 +163,20 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
     )))
 }
 
-/// The reply must echo this journal's client id, sequence and hash, or it is
-/// not an answer to the pending request.
+/// The reply must echo this journal's **whole entry identity** — protocol
+/// version and group as well as client id, sequence and hash — or it is not
+/// an answer to the pending request. The same rule the journal itself
+/// enforces at `resolve` and at reopen, applied here first so a foreign
+/// reply is classified as a malformed disposition (ambiguous, resend)
+/// rather than reaching the persist path at all.
 fn decode_and_check(journal: &Journal, payload: &[u8]) -> Option<MutationReplyWireV1> {
     let reply: MutationReplyWireV1 = payload_fory::<MutationReplyWireV1>()
         .deserialize(payload)
         .ok()?;
     let record = journal.record();
-    (reply.client_id == record.client_id
+    (reply.protocol_version == STORE_PROTOCOL_VERSION
+        && reply.group_id == record.group_id
+        && reply.client_id == record.client_id
         && reply.sequence == record.sequence
         && reply.request_hash == record.request_hash)
         .then_some(reply)
@@ -202,6 +208,16 @@ async fn retire_until_confirmed(engine: &Engine, journal: &mut Journal) -> Resul
                     tokio::time::sleep(backoff(attempt)).await;
                     continue;
                 };
+                // A retirement confirmation must come from **this** group
+                // and protocol: an outcome-9 reply naming another world
+                // confirms nothing, and honoring it would replay the
+                // original on a tombstone that may not exist.
+                if reply.protocol_version != STORE_PROTOCOL_VERSION
+                    || reply.group_id != engine.group.as_bytes().to_vec()
+                {
+                    tokio::time::sleep(backoff(attempt)).await;
+                    continue;
+                }
                 if reply.outcome_code == 9 {
                     journal.retirement_confirmed()?;
                     return Ok(());

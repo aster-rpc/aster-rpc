@@ -259,51 +259,24 @@ fn validate_record(record: &ClientJournalV1) -> Result<()> {
             ));
         }
     }
-    // A saved reply is not merely decodable bytes — it is **this entry's**
-    // answer. The bytes in these fields are what `resume`/`unacknowledged`
-    // hand back as typed replies, so a reply that decodes but names another
-    // group, client, sequence or request hash is corruption (or injection)
-    // discovered now, not a wrong answer delivered as this entry's later.
-    let owned = |bytes: &[u8]| -> Option<crate::coordination::store::wire::MutationReplyWireV1> {
-        let reply: crate::coordination::store::wire::MutationReplyWireV1 =
-            payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
-                .deserialize(bytes)
-                .ok()?;
-        (reply.protocol_version == crate::coordination::store::wire::STORE_PROTOCOL_VERSION
-            && reply.group_id == record.group_id
-            && reply.client_id == record.client_id
-            && reply.sequence == record.sequence
-            && reply.request_hash == record.request_hash)
-            .then_some(reply)
-    };
     match state {
         JournalState::ResolvedAwaitingAck
-            if record.resolved_reply.is_empty() || owned(&record.resolved_reply).is_none() =>
+            if record.resolved_reply.is_empty()
+                || reply_owned_by(record, &record.resolved_reply).is_none() =>
         {
             return Err(journal_error(
                 "a resolved state must hold the exact resolved reply, decodable and \
                  echoing this entry's group, client id, sequence and request hash",
             ));
         }
-        JournalState::Closing | JournalState::ReplayAfterRetire => {
-            // The corridor's opener must additionally be what §10 calls
-            // terminal: a `NotConsumed` refusal whose reason ends the client
-            // id. Anything else in this slot would drive retirement off an
-            // answer that never authorized it.
-            let terminal = owned(&record.terminal_refusal).is_some_and(|refusal| {
-                refusal.disposition_code == 2
-                    && crate::coordination::reason::Reason::from_code(refusal.reason_code)
-                        .is_some_and(|reason| {
-                            crate::coordination::reason::Disposition::NotConsumed
-                                .is_terminal(reason)
-                        })
-            });
-            if record.terminal_refusal.is_empty() || !terminal {
-                return Err(journal_error(
-                    "the closing corridor must hold the decodable, entry-owned, \
-                     §10-terminal refusal that opened it",
-                ));
-            }
+        JournalState::Closing | JournalState::ReplayAfterRetire
+            if record.terminal_refusal.is_empty()
+                || !opens_corridor(record, &record.terminal_refusal) =>
+        {
+            return Err(journal_error(
+                "the closing corridor must hold the decodable, entry-owned, \
+                 §10-terminal refusal that opened it",
+            ));
         }
         _ => {}
     }
@@ -327,6 +300,7 @@ fn validate_record(record: &ClientJournalV1) -> Result<()> {
                 || !record.pending_request.is_empty()
                 || !record.request_hash.is_empty()
                 || !record.resolved_reply.is_empty()
+                || !record.terminal_refusal.is_empty()
                 || record.retirement_confirmed =>
         {
             return Err(journal_error("a Ready record must carry no entry residue"));
@@ -334,6 +308,41 @@ fn validate_record(record: &ClientJournalV1) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// The one ownership check every saved mutation reply passes — at open
+/// **and at the transition that persists it**: the bytes must decode as a
+/// `MutationReplyWireV1` echoing this entry's protocol version, group,
+/// client id, sequence and request hash. A reply that decodes but names
+/// another world is refused as injection/corruption, never persisted or
+/// redelivered as this entry's answer.
+fn reply_owned_by(
+    record: &ClientJournalV1,
+    bytes: &[u8],
+) -> Option<crate::coordination::store::wire::MutationReplyWireV1> {
+    let reply: crate::coordination::store::wire::MutationReplyWireV1 =
+        payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
+            .deserialize(bytes)
+            .ok()?;
+    (reply.protocol_version == crate::coordination::store::wire::STORE_PROTOCOL_VERSION
+        && reply.group_id == record.group_id
+        && reply.client_id == record.client_id
+        && reply.sequence == record.sequence
+        && reply.request_hash == record.request_hash)
+        .then_some(reply)
+}
+
+/// Whether `bytes` may open the closing corridor for this entry: owned by
+/// the entry (above) **and** what §10 calls terminal — a `NotConsumed`
+/// refusal whose reason ends the client id. Anything else in this slot
+/// would drive retirement off an answer that never authorized it.
+fn opens_corridor(record: &ClientJournalV1, bytes: &[u8]) -> bool {
+    reply_owned_by(record, bytes).is_some_and(|refusal| {
+        refusal.disposition_code == 2
+            && crate::coordination::reason::Reason::from_code(refusal.reason_code).is_some_and(
+                |reason| crate::coordination::reason::Disposition::NotConsumed.is_terminal(reason),
+            )
+    })
 }
 
 const RECORD: &str = "journal.v1";
@@ -586,6 +595,16 @@ impl Journal {
                 "resolve is not a transition out of {state:?}"
             )));
         }
+        // The same ownership validation the reopen runs, applied **before**
+        // the bytes are ever persisted: a live reply that names another
+        // protocol version, group, client id, sequence or request hash is
+        // not this entry's answer, and the journal refuses to make it one.
+        if reply_owned_by(&self.record, &encoded_reply).is_none() {
+            return Err(journal_error(
+                "the resolved reply does not echo this entry's protocol version, \
+                 group, client id, sequence and request hash",
+            ));
+        }
         self.boundary("before_resolve_write")?;
         let mut next = self.record.clone();
         next.state_code = JournalState::ResolvedAwaitingAck.code();
@@ -657,6 +676,14 @@ impl Journal {
     pub fn close_for_retirement(&mut self, terminal_refusal: Vec<u8>) -> Result<()> {
         if self.state() != JournalState::Pending {
             return Err(journal_error("closing starts from Pending"));
+        }
+        // Same rule as the reopen: only an entry-owned, §10-terminal
+        // `NotConsumed` refusal opens the corridor — checked before it is
+        // persisted, not discovered at the next open.
+        if !opens_corridor(&self.record, &terminal_refusal) {
+            return Err(journal_error(
+                "the corridor opener must be this entry's own §10-terminal refusal",
+            ));
         }
         self.boundary("before_closing_write")?;
         let mut next = self.record.clone();
@@ -1145,6 +1172,69 @@ mod tests {
             journal.persist(record).expect("persist");
         }
         assert!(Journal::open(dir.path(), ACTOR, group(), CLIENT_A).is_err());
+    }
+
+    /// **The transitions are as strict as the reopen** (the fourth review's
+    /// P0): `resolve` refuses a decodable reply naming another group or
+    /// protocol version before persisting it, and `close_for_retirement`
+    /// refuses a non-terminal or unowned opener — live delivery cannot store
+    /// what open-time validation would refuse.
+    #[test]
+    fn transitions_refuse_unowned_replies() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let mut journal = open(dir.path());
+        journal
+            .begin(1, "acquire", b"exact".to_vec(), [0x21; 32])
+            .expect("begin");
+
+        let owned =
+            |mutate: &dyn Fn(&mut crate::coordination::store::wire::MutationReplyWireV1)| {
+                let mut reply = crate::coordination::store::wire::MutationReplyWireV1 {
+                    protocol_version: crate::coordination::store::wire::STORE_PROTOCOL_VERSION,
+                    group_id: group().as_bytes().to_vec(),
+                    client_id: CLIENT_A.to_vec(),
+                    sequence: 1,
+                    request_hash: vec![0x21; 32],
+                    disposition_code: 1,
+                    outcome_code: 1,
+                    ..Default::default()
+                };
+                mutate(&mut reply);
+                payload_fory::<crate::coordination::store::wire::MutationReplyWireV1>()
+                    .serialize(&reply)
+                    .expect("encodes")
+            };
+
+        assert!(
+            journal
+                .resolve(owned(&|r| r.group_id = vec![0xEE; 32]))
+                .is_err(),
+            "a wrong-group reply must not be persisted"
+        );
+        assert!(
+            journal
+                .resolve(owned(&|r| r.protocol_version = 99))
+                .is_err(),
+            "a wrong-protocol reply must not be persisted"
+        );
+        assert!(
+            journal
+                .close_for_retirement(owned(&|r| {
+                    r.disposition_code = 2;
+                    r.outcome_code = 100;
+                    r.reason_code = 1; // NotConsumed but retryable
+                }))
+                .is_err(),
+            "a non-terminal refusal must not open the corridor"
+        );
+        assert_eq!(
+            journal.state(),
+            JournalState::Pending,
+            "every refusal leaves the entry pending"
+        );
+        journal
+            .resolve(owned(&|_| {}))
+            .expect("the entry's own reply still resolves");
     }
 
     /// Write `record` to `dir` with a **valid** envelope, bypassing the

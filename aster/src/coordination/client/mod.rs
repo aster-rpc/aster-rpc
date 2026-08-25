@@ -685,15 +685,70 @@ where
         .map_err(|_| client_error("the reply does not decode"))
 }
 
+/// The envelope every §5.2 reply carries. The client's one inbound
+/// validation boundary reads it: a reply that decodes but names another
+/// protocol version or another group is refused, never handed to the
+/// caller — live replies are held to the same standard the journal holds
+/// its saved ones to.
+trait ReplyEnvelope {
+    fn envelope(&self) -> (i32, &[u8]);
+}
+
+macro_rules! reply_envelope {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl ReplyEnvelope for $ty {
+            fn envelope(&self) -> (i32, &[u8]) {
+                (self.protocol_version, &self.group_id)
+            }
+        }
+    )+};
+}
+
+reply_envelope!(
+    RetireClientReplyWireV1,
+    ReadReplyWireV1,
+    AclStatusReplyWireV1,
+    AdminStatusReplyWireV1,
+    MembershipStatusReplyWireV1,
+    ProbeClientReplyWireV1,
+    GroupStatusReplyWireV1,
+    crate::coordination::store::wire::AuditRecordWireV1,
+    crate::coordination::store::wire::RecoveryExportManifestWireV1,
+);
+
+/// The inbound boundary itself: protocol version and group, checked on
+/// every typed reply the client accepts.
+fn check_envelope<T: ReplyEnvelope>(engine: &Engine, method: &str, reply: T) -> Result<T> {
+    let (protocol_version, group_id) = reply.envelope();
+    if protocol_version != STORE_PROTOCOL_VERSION {
+        return Err(client_error(format!(
+            "{method}: the reply carries protocol version {protocol_version}, not \
+             {STORE_PROTOCOL_VERSION}"
+        )));
+    }
+    if group_id != engine.group.as_bytes() {
+        return Err(client_error(format!(
+            "{method}: the reply names another coordination group"
+        )));
+    }
+    Ok(reply)
+}
+
 /// One redirect-routed unary call with a typed reply; a denial surfaces as
 /// `Error::Rpc` and ambiguity as a transport error — reads are safely
-/// re-issued by the caller.
+/// re-issued by the caller. Every reply passes the envelope boundary.
 async fn unary_typed<T>(engine: &Engine, method: &str, request: Vec<u8>) -> Result<T>
 where
-    T: crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: crate::rpc::contract::WireField
+        + fory_core::Serializer
+        + fory_core::ForyDefault
+        + ReplyEnvelope
+        + 'static,
 {
     match engine.unary(method, request).await {
-        Ok(CallOutcome::Reply(payload)) => decode(&payload),
+        Ok(CallOutcome::Reply(payload)) => {
+            decode(&payload).and_then(|reply| check_envelope(engine, method, reply))
+        }
         Ok(CallOutcome::Denied { code, message }) => Err(Error::Rpc {
             code,
             message,
@@ -788,7 +843,13 @@ impl CoordinationReadClient {
             limit,
         })?;
         match self.engine.stream("audit_stream", request).await {
-            Ok(Ok(frames)) => frames.iter().map(|frame| decode(frame)).collect(),
+            Ok(Ok(frames)) => frames
+                .iter()
+                .map(|frame| {
+                    decode(frame)
+                        .and_then(|record| check_envelope(&self.engine, "audit_stream", record))
+                })
+                .collect(),
             Ok(Err((code, message))) => Err(Error::Rpc {
                 code,
                 message,
@@ -843,6 +904,10 @@ impl CoordinationReadClient {
             }
             match decode::<RecoveryExportFrameV1>(&frame)? {
                 RecoveryExportFrameV1::Manifest(m) => {
+                    // The manifest passes the same envelope boundary as
+                    // every typed reply: a manifest for another group or
+                    // protocol binds nothing here.
+                    let m = check_envelope(&self.engine, "recovery_export", m)?;
                     if manifest.replace(m).is_some() {
                         return Err(client_error("the export carried two manifests"));
                     }

@@ -305,34 +305,49 @@ pub(crate) async fn run_lifecycle(
             if is_leader != leading {
                 // Superseding the generation stops the old task even if its
                 // abort has not landed yet: it rechecks this counter before
-                // every side effect. The registry aborts the previous
-                // generation's tasks and refuses new ones once the shutdown
-                // sequence has stopped controllers for good.
+                // every side effect. The **registry** creates the new tasks
+                // — the factories run inside its lock, after the previous
+                // generation was aborted and awaited, and never at all once
+                // the shutdown sequence has stopped controllers for good.
                 let next = generation.fetch_add(1, Ordering::SeqCst) + 1;
-                let (membership, expiry) = if is_leader {
-                    (
-                        Some(tokio::spawn(super::membership::run_generation(
-                            raft.clone(),
-                            state.clone(),
-                            local,
-                            super::membership::Generation(next),
-                            Arc::clone(&generation),
-                            Arc::clone(&facts),
-                        ))),
-                        // A fresh generation starts with no timers, so every
-                        // held row gets a fresh full TTL (§9.2): failover may
-                        // delay a takeover, never overlap one.
-                        Some(tokio::spawn(super::expiry::run_generation(
-                            raft.clone(),
-                            state.clone(),
-                            next,
-                            Arc::clone(&generation),
-                            std::sync::Arc::clone(&store_metrics),
-                        ))),
-                    )
-                } else {
-                    (None, None)
-                };
+                let (membership, expiry): (Option<ControllerFactory>, Option<ControllerFactory>) =
+                    if is_leader {
+                        let membership_raft = raft.clone();
+                        let membership_state = state.clone();
+                        let membership_generation = Arc::clone(&generation);
+                        let membership_facts = Arc::clone(&facts);
+                        let expiry_raft = raft.clone();
+                        let expiry_state = state.clone();
+                        let expiry_generation = Arc::clone(&generation);
+                        let expiry_metrics = std::sync::Arc::clone(&store_metrics);
+                        (
+                            Some(Box::new(move || {
+                                tokio::spawn(super::membership::run_generation(
+                                    membership_raft,
+                                    membership_state,
+                                    local,
+                                    super::membership::Generation(next),
+                                    membership_generation,
+                                    membership_facts,
+                                ))
+                            })),
+                            // A fresh generation starts with no timers, so
+                            // every held row gets a fresh full TTL (§9.2):
+                            // failover may delay a takeover, never overlap
+                            // one.
+                            Some(Box::new(move || {
+                                tokio::spawn(super::expiry::run_generation(
+                                    expiry_raft,
+                                    expiry_state,
+                                    next,
+                                    expiry_generation,
+                                    expiry_metrics,
+                                ))
+                            })),
+                        )
+                    } else {
+                        (None, None)
+                    };
                 tasks.replace_generation(membership, expiry).await;
                 leading = is_leader;
             }
@@ -396,18 +411,25 @@ pub(crate) async fn run_lifecycle(
     }
 }
 
+/// A deferred controller task: the registry invokes it — or never does.
+pub(crate) type ControllerFactory = Box<dyn FnOnce() -> tokio::task::JoinHandle<()> + Send>;
+
 /// The per-generation controller tasks — membership, expiry, and the genesis
-/// proposal — held where the shutdown sequence can stop them with an
-/// **acknowledged** abort-and-await, not a counter bump alone.
+/// proposal — **created by this registry**, so a task cannot exist outside
+/// it and the shutdown sequence's stop is total.
 ///
-/// The lifecycle loop spawns these tasks, so it used to own their handles —
-/// which meant §11.5 step 3 could only bump the generation counter and hope:
-/// a step that had already passed its generation recheck could still submit
-/// into the Raft while the sequence was shutting it down. Registration here
-/// closes that: `stop_all` takes every handle under the lock, sets the
-/// one-way `stopping` flag so no later registration can slip a fresh task
-/// past it, and then aborts **and awaits** each task — the await is the
-/// acknowledgement that no controller instruction can run after it returns.
+/// The lifecycle loop used to spawn tasks and register the handles after
+/// the fact, which left two races the fourth review named: `stop_all` could
+/// latch between the spawn and the registration and return while the
+/// unregistered task ran, and a replacement spawned the new generation
+/// while the old one was merely aborted, not yet terminated. Creation now
+/// happens **inside the registry's lock**: `replace_generation` first
+/// aborts *and awaits* the old generation, then rechecks `stopping`, and
+/// only then invokes the factories and stores the handles — atomically with
+/// respect to `stop_all`, which holds the same lock. After a stop, a
+/// factory is never invoked at all; two generations can never overlap,
+/// because the new one is not created until the old has provably
+/// terminated.
 #[derive(Default)]
 pub(crate) struct ControllerTasks {
     inner: tokio::sync::Mutex<ControllerSlots>,
@@ -415,45 +437,55 @@ pub(crate) struct ControllerTasks {
 
 #[derive(Default)]
 struct ControllerSlots {
-    /// One-way: set by `stop_all`. A registration that arrives afterwards is
-    /// aborted instead of stored, so the acknowledged stop stays final.
+    /// One-way: set by `stop_all`. A factory offered afterwards is never
+    /// invoked, so the acknowledged stop stays final.
     stopping: bool,
     membership: Option<tokio::task::JoinHandle<()>>,
     expiry: Option<tokio::task::JoinHandle<()>>,
     proposing: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl ControllerSlots {
+    /// Abort and **await** the current generation's tasks. Called with the
+    /// registry lock held; the controller tasks never touch this lock, so
+    /// awaiting them here cannot deadlock, and holding it is what makes the
+    /// stop atomic against a concurrent replacement.
+    async fn terminate_generation(&mut self) {
+        for task in [self.membership.take(), self.expiry.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
 impl ControllerTasks {
-    /// Install this generation's membership/expiry tasks, aborting the
-    /// previous generation's. After `stop_all`, the new tasks are aborted
-    /// instead of installed.
+    /// Install this generation's membership/expiry tasks from factories.
+    ///
+    /// Order under one lock hold: terminate the old generation (abort and
+    /// await, so two generations never run side by side — not even for the
+    /// instant between a spawn and an abort), recheck `stopping`, then
+    /// invoke the factories and store the handles. After `stop_all` the
+    /// factories are never invoked.
     pub(crate) async fn replace_generation(
         &self,
-        membership: Option<tokio::task::JoinHandle<()>>,
-        expiry: Option<tokio::task::JoinHandle<()>>,
+        membership: Option<ControllerFactory>,
+        expiry: Option<ControllerFactory>,
     ) {
-        let doomed: Vec<tokio::task::JoinHandle<()>> = {
-            let mut slots = self.inner.lock().await;
-            let mut doomed: Vec<tokio::task::JoinHandle<()>> =
-                [slots.membership.take(), slots.expiry.take()]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-            if slots.stopping {
-                doomed.extend([membership, expiry].into_iter().flatten());
-            } else {
-                slots.membership = membership;
-                slots.expiry = expiry;
-            }
-            doomed
-        };
-        for task in doomed {
-            task.abort();
+        let mut slots = self.inner.lock().await;
+        slots.terminate_generation().await;
+        if slots.stopping {
+            return;
         }
+        slots.membership = membership.map(|factory| factory());
+        slots.expiry = expiry.map(|factory| factory());
     }
 
     /// Spawn the genesis proposal if none is in flight — under the same lock
-    /// as the stop, so a proposal cannot start beside it.
+    /// as the stop, so a proposal cannot start beside it and a stopped
+    /// registry never invokes the factory.
     pub(crate) async fn propose_if_idle(
         &self,
         spawn: impl FnOnce() -> tokio::task::JoinHandle<()>,
@@ -471,24 +503,17 @@ impl ControllerTasks {
         }
     }
 
-    /// §11.5 step 3's acknowledged half: latch `stopping`, take every task,
-    /// abort it, and **await its termination**. When this returns, no
-    /// membership change, expiry proposal, or genesis proposal can execute
-    /// another instruction, and none can be spawned.
+    /// §11.5 step 3's acknowledged half: latch `stopping`, abort every task
+    /// and **await its termination**, all under the one lock every creation
+    /// path holds. When this returns, no membership change, expiry
+    /// proposal, or genesis proposal can execute another instruction — and
+    /// because creation itself lives behind this lock, none can come into
+    /// existence afterwards: a later factory is simply never invoked.
     pub(crate) async fn stop_all(&self) {
-        let taken: Vec<tokio::task::JoinHandle<()>> = {
-            let mut slots = self.inner.lock().await;
-            slots.stopping = true;
-            [
-                slots.membership.take(),
-                slots.expiry.take(),
-                slots.proposing.take(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect()
-        };
-        for task in taken {
+        let mut slots = self.inner.lock().await;
+        slots.stopping = true;
+        slots.terminate_generation().await;
+        if let Some(task) = slots.proposing.take() {
             task.abort();
             let _ = task.await;
         }
@@ -993,35 +1018,40 @@ mod tests {
         }
     }
 
-    /// The controller stop is **acknowledged**, not advisory: after
-    /// `stop_all` returns, a registered task can execute no further
-    /// instruction, and a task registered afterwards is aborted instead of
-    /// installed. A counter bump alone gives neither guarantee — a task
-    /// that had already passed its recheck could still act.
+    /// The controller stop is **total**: after `stop_all` returns, a
+    /// registered task can execute no further instruction — exactly at the
+    /// return, no grace — and a factory offered afterwards is **never
+    /// invoked**, because creation itself lives behind the registry's lock.
+    /// The fourth review's race (spawn before register; a stop landing in
+    /// between) is unspellable now: there is no task that exists outside
+    /// the registry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_controller_stop_is_acknowledged_not_advisory() {
         use std::sync::atomic::AtomicU64;
 
         let tasks = ControllerTasks::default();
         let ticks = Arc::new(AtomicU64::new(0));
-        let ticker = |ticks: Arc<AtomicU64>| {
-            tokio::spawn(async move {
-                loop {
-                    ticks.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
+        let ticker_factory = |ticks: Arc<AtomicU64>| -> ControllerFactory {
+            Box::new(move || {
+                tokio::spawn(async move {
+                    loop {
+                        ticks.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
             })
         };
 
         tasks
-            .replace_generation(Some(ticker(Arc::clone(&ticks))), None)
+            .replace_generation(Some(ticker_factory(Arc::clone(&ticks))), None)
             .await;
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(ticks.load(Ordering::SeqCst) > 0, "the task ran");
 
         tasks.stop_all().await;
         // The await inside stop_all is the acknowledgement: the task has
-        // terminated, so the counter can never advance again.
+        // terminated **when stop_all returns**, so the counter is frozen at
+        // that instant — sampled immediately, no settling grace.
         let at_stop = ticks.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -1030,24 +1060,90 @@ mod tests {
             "no controller effect may run after the acknowledged stop"
         );
 
-        // Registration after the stop installs nothing.
-        let late = Arc::new(AtomicU64::new(0));
+        // A factory offered after the stop is never invoked — strictly
+        // never, not "may execute once before its abort lands".
+        let invoked = Arc::new(AtomicU64::new(0));
+        let counting_factory = |invoked: Arc<AtomicU64>| -> ControllerFactory {
+            Box::new(move || {
+                invoked.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async {})
+            })
+        };
         tasks
-            .replace_generation(Some(ticker(Arc::clone(&late))), None)
+            .replace_generation(Some(counting_factory(Arc::clone(&invoked))), None)
             .await;
         let mut proposed = false;
         tasks
             .propose_if_idle(|| {
                 proposed = true;
-                ticker(Arc::clone(&late))
+                tokio::spawn(async {})
             })
             .await;
         assert!(!proposed, "no proposal may be spawned after the stop");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            late.load(Ordering::SeqCst) <= 1,
-            "a task registered after the stop is aborted, not installed"
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "a factory offered after the stop must never be invoked"
         );
+    }
+
+    /// Two generations never run side by side — not even for the instant
+    /// between a spawn and an abort: the replacement terminates (aborts
+    /// **and awaits**) the old generation before the new factory runs, so
+    /// the new generation's first instruction is ordered after the old
+    /// generation's last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_terminates_the_old_generation_before_creating_the_new() {
+        use std::sync::atomic::AtomicU64;
+
+        let tasks = ControllerTasks::default();
+        let ticks = Arc::new(AtomicU64::new(0));
+        tasks
+            .replace_generation(
+                Some({
+                    let ticks = Arc::clone(&ticks);
+                    Box::new(move || {
+                        tokio::spawn(async move {
+                            loop {
+                                ticks.fetch_add(1, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                            }
+                        })
+                    })
+                }),
+                None,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The replacement factory observes the old counter at its own
+        // invocation; the old generation must already be dead, so the value
+        // it sees is final.
+        let seen_at_creation = Arc::new(AtomicU64::new(u64::MAX));
+        tasks
+            .replace_generation(
+                Some({
+                    let ticks = Arc::clone(&ticks);
+                    let seen = Arc::clone(&seen_at_creation);
+                    Box::new(move || {
+                        seen.store(ticks.load(Ordering::SeqCst), Ordering::SeqCst);
+                        tokio::spawn(async {})
+                    })
+                }),
+                None,
+            )
+            .await;
+        let seen = seen_at_creation.load(Ordering::SeqCst);
+        assert_ne!(seen, u64::MAX, "the replacement factory ran");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            seen,
+            "the old generation must be terminated before the new factory \
+             runs; a tick after creation means the two overlapped"
+        );
+
+        tasks.stop_all().await;
     }
 
     /// The lifecycle loop is the only writer of the published view.

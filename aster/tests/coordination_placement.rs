@@ -1537,3 +1537,97 @@ async fn a_topology_only_change_discards_the_recommendation() {
         voter.shutdown().await;
     }
 }
+
+/// **The same selected nodes under changed topology evidence discard the
+/// pass** (the fourth review's item 3). Selection identity is not the
+/// fingerprint: here the planning observation and the recheck observation
+/// select the *identical* voters, but the pairwise separation evidence
+/// behind them moves from corroborated `Separated` to `Unknown` between
+/// the two snapshots. §7.7.1 discards on any changed selected topology
+/// fact — a pass planned on proved separation must not be submitted on
+/// unproved separation. The same evidence replayed submits, pinning the
+/// discard to the evidence comparison and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changed_separation_evidence_discards_the_same_selection() {
+    let (fixture, voters, _dirs) = manager_group().await;
+    let (candidate_id, candidate) = real_candidate(&fixture);
+    let grace = Duration::from_millis(400);
+    let members = [voter_id(&fixture, 0), voter_id(&fixture, 1), candidate_id];
+
+    // Each member in its own cluster; `corroborated` controls whether every
+    // cross-cluster pair carries far-pair evidence (Separated) or none
+    // (Unknown). The member set — and therefore the selection — is the same
+    // in both worlds.
+    let world = |corroborated: bool| {
+        let clusters: Vec<&[CoordinationNodeId]> =
+            members.iter().map(std::slice::from_ref).collect();
+        let far: Vec<(CoordinationNodeId, CoordinationNodeId)> = if corroborated {
+            let mut pairs = Vec::new();
+            for (i, a) in members.iter().enumerate() {
+                for b in &members[i + 1..] {
+                    pairs.push((*a, *b));
+                }
+            }
+            pairs
+        } else {
+            Vec::new()
+        };
+        snapshot(&clusters, &far)
+    };
+
+    let policy_now = || replacement_policy(&fixture, &candidate, None, grace);
+    let journal = tempfile::tempdir().expect("a directory");
+    let client = admin_client(&fixture, &voters, journal.path()).await;
+    let mut manager = CoordinationPlacementManager::new(
+        client,
+        ScriptedTopology(Mutex::new(vec![world(true)])),
+        ScriptedPolicy(Mutex::new(vec![policy_now()])),
+        NoProvisioning,
+    );
+
+    // Start the grace timer for the absent voter 2.
+    let first = within("first reconcile", manager.reconcile())
+        .await
+        .expect("a report");
+    assert!(first.pending_operation_id.is_none(), "{}", first.reason);
+    tokio::time::sleep(grace + Duration::from_millis(300)).await;
+
+    // Planning observation: corroborated separation. Recheck observation:
+    // the same members, the same selection — but every voter pair's verdict
+    // fell to Unknown. The pass must be discarded.
+    manager.replace_sources_for_testing(
+        ScriptedTopology(Mutex::new(vec![world(true), world(false)])),
+        ScriptedPolicy(Mutex::new(vec![policy_now()])),
+    );
+    let discarded = within("evidence-shifted reconcile", manager.reconcile())
+        .await
+        .expect("a report");
+    assert!(
+        discarded.pending_operation_id.is_none(),
+        "moved evidence must not be submitted: {}",
+        discarded.reason
+    );
+    assert!(
+        discarded.reason.contains("selected topology facts"),
+        "the report names the discard: {}",
+        discarded.reason
+    );
+
+    // Stable evidence submits the identical pass.
+    manager.replace_sources_for_testing(
+        ScriptedTopology(Mutex::new(vec![world(true)])),
+        ScriptedPolicy(Mutex::new(vec![policy_now()])),
+    );
+    let submitted = within("stable reconcile", manager.reconcile())
+        .await
+        .expect("a report");
+    assert!(
+        submitted.pending_operation_id.is_some(),
+        "the same pass under stable evidence submits: {}",
+        submitted.reason
+    );
+
+    for voter in voters {
+        voter.shutdown().await;
+    }
+}

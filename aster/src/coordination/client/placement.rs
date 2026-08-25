@@ -181,6 +181,78 @@ pub struct PlacementReport {
     pub reason: String,
 }
 
+/// The canonical topology evidence behind one selection — the facts §7.7.1
+/// means by "any changed selected topology fact discards the earlier
+/// recommendation". Selected node **identity** alone is not enough: the
+/// same nodes can stay selected while their presence, cluster equivalence
+/// or pairwise separation evidence changes underneath, and a pass planned
+/// on the old evidence must not be submitted on the new.
+///
+/// Cluster indices are snapshot-local, so cluster membership is
+/// canonicalized as **co-clustering over the selected set** — for each
+/// selected pair, whether the snapshot places them in the same cluster —
+/// which is equal across snapshots exactly when the induced partition is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectionEvidence {
+    /// Per selected member (ascending): is it a live vertex of the snapshot?
+    present: Vec<(CoordinationNodeId, bool)>,
+    /// Per selected pair (ascending): co-clustered in this snapshot?
+    co_clustered: Vec<(CoordinationNodeId, CoordinationNodeId, bool)>,
+    /// Per selected **voter** pair (ascending): the separation verdict.
+    separation: Vec<(CoordinationNodeId, CoordinationNodeId, i8)>,
+}
+
+/// Compute the evidence for `voters`/`learners` from `input`'s snapshot.
+pub(crate) fn selection_evidence(
+    input: &PlacementInput,
+    voters: &[CoordinationNodeId],
+    learners: &[CoordinationNodeId],
+) -> SelectionEvidence {
+    let mut members: Vec<CoordinationNodeId> =
+        voters.iter().chain(learners.iter()).copied().collect();
+    members.sort_by_key(|n| *n.as_bytes());
+    members.dedup();
+
+    let present = members
+        .iter()
+        .map(|n| (*n, input.topology.contains_hex(&n.to_hex())))
+        .collect();
+
+    let mut co_clustered = Vec::new();
+    for (i, a) in members.iter().enumerate() {
+        for b in &members[i + 1..] {
+            let same = match (
+                input.topology.cluster_index_of_hex(&a.to_hex()),
+                input.topology.cluster_index_of_hex(&b.to_hex()),
+            ) {
+                (Some(ca), Some(cb)) => ca == cb,
+                _ => false,
+            };
+            co_clustered.push((*a, *b, same));
+        }
+    }
+
+    let mut sorted_voters: Vec<CoordinationNodeId> = voters.to_vec();
+    sorted_voters.sort_by_key(|n| *n.as_bytes());
+    let mut separation = Vec::new();
+    for (i, a) in sorted_voters.iter().enumerate() {
+        for b in &sorted_voters[i + 1..] {
+            let verdict = match input.topology.separated_hex(&a.to_hex(), &b.to_hex()) {
+                SeparationVerdict::Separated => 1,
+                SeparationVerdict::Connected => 2,
+                SeparationVerdict::Unknown => 0,
+            };
+            separation.push((*a, *b, verdict));
+        }
+    }
+
+    SelectionEvidence {
+        present,
+        co_clustered,
+        separation,
+    }
+}
+
 /// §7.7.2 step 5: the group-specific tie-break tag.
 pub(crate) fn tie_break_tag(group: &CoordinationGroupId, node: &CoordinationNodeId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
