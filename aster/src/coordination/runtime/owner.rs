@@ -530,11 +530,14 @@ impl ControllerTasks {
 /// caller a no-op, so an evacuated node's later server shutdown does not
 /// re-run a sequence against an already-stopped Raft.
 ///
-/// The membership/expiry controllers are stopped here by the **generation
-/// bump**, not by task aborts: bumping the counter stops a superseded
-/// controller at its next side effect whether or not an abort has landed,
-/// and it is the only mechanism available to a caller that does not own the
-/// `JoinHandle`s. The owning runtime still aborts and awaits them afterwards.
+/// The membership/expiry/genesis controllers are stopped here by
+/// [`ControllerTasks::stop_all`] — the registry that also created them —
+/// with an acknowledged abort-and-await; the generation bump beforehand is
+/// belt-and-braces for a task mid-recheck. "No further instruction" is a
+/// claim about the **controller task itself**: a Raft operation the task
+/// had already submitted before the stop may still commit, which is
+/// ordinary pre-stop in-flight work (a stale report or expire commits as a
+/// harmless applied rejection, exactly as a leadership change makes them).
 #[derive(Clone)]
 pub(crate) struct ShutdownSequence {
     facts: Arc<RuntimeFacts>,
@@ -567,9 +570,12 @@ impl ShutdownSequence {
         // 3. Controllers stop before the Raft, and the stop is
         //    **acknowledged**: the generation bump halts a superseded loop at
         //    its next recheck, and `stop_all` then aborts and *awaits* the
-        //    membership, expiry and genesis tasks — when it returns, no
-        //    controller instruction can run and none can be spawned. Only
-        //    then does the Raft RPC deregister — a call is answered
+        //    membership, expiry and genesis tasks — when it returns, the
+        //    tasks themselves execute no further instruction and none can be
+        //    created (a Raft write one of them had already submitted may
+        //    still commit; that is pre-stop in-flight work and lands as a
+        //    harmless applied rejection like any stale report). Only then
+        //    does the Raft RPC deregister — a call is answered
         //    `FailedPrecondition`, the same status a node that has not yet
         //    attached answers — and the Raft itself shuts down, which closes
         //    the metrics channel and ends the lifecycle loop.
@@ -599,10 +605,14 @@ pub(crate) struct CoordinationRuntime {
     /// §7.6/§11.5 steps 1–3, shared with the pressure monitor.
     sequence: ShutdownSequence,
 
-    /// 1. Controllers stop first. A controller that outlived the Raft would
-    ///    submit a membership change into a shut-down instance and report a
-    ///    failure that is really our own shutdown.
-    controllers: Vec<tokio::task::JoinHandle<()>>,
+    /// 1. The §11.5 pressure monitor stops first. Deliberately an explicit,
+    ///    named slot rather than a generic controller list: the membership,
+    ///    expiry and genesis tasks live **only** in [`ControllerTasks`],
+    ///    where the shutdown sequence's acknowledged stop can reach them,
+    ///    and no API accepts an already-running handle into this runtime —
+    ///    that capability was exactly the fifth review's spawn-then-register
+    ///    race, and it is deleted rather than merely unused.
+    monitor: Option<tokio::task::JoinHandle<()>>,
     /// 2. Then the lifecycle loop, which holds the publisher: dropping it is
     ///    what releases outstanding `wait_ready()` calls.
     lifecycle: Option<tokio::task::JoinHandle<()>>,
@@ -731,15 +741,10 @@ impl CoordinationRuntime {
             local,
             generation,
             sequence,
-            controllers: vec![monitor],
+            monitor: Some(monitor),
             lifecycle: Some(lifecycle),
             storage,
         }
-    }
-
-    /// Register a controller task the runtime owns and stops first.
-    pub(crate) fn spawn_controller(&mut self, task: tokio::task::JoinHandle<()>) {
-        self.controllers.push(task);
     }
 
     pub(crate) fn readiness(&self) -> Readiness {
@@ -799,9 +804,9 @@ impl CoordinationRuntime {
         // sequence has already stopped the controllers' side effects; the
         // aborts here are the owner reclaiming the tasks themselves.
         self.sequence.run().await;
-        for task in std::mem::take(&mut self.controllers) {
-            task.abort();
-            let _ = task.await;
+        if let Some(monitor) = self.monitor.take() {
+            monitor.abort();
+            let _ = monitor.await;
         }
 
         // 4. The lifecycle loop, which the metrics channel closing has already
@@ -937,7 +942,7 @@ mod tests {
             .expect("the runtime struct exists");
         let body = &source[at..at + source[at..].find("\n}").expect("a close")];
 
-        let positions: Vec<(&str, usize)> = ["controllers:", "lifecycle:", "storage:"]
+        let positions: Vec<(&str, usize)> = ["monitor:", "lifecycle:", "storage:"]
             .into_iter()
             .map(|field| {
                 (
@@ -1003,11 +1008,7 @@ mod tests {
             .find("pub(crate) async fn shutdown(")
             .expect("shutdown exists");
         let body = &source[at..];
-        let steps = [
-            "sequence.run()",
-            "std::mem::take(&mut self.controllers)",
-            "lifecycle.take()",
-        ];
+        let steps = ["sequence.run()", "self.monitor.take()", "lifecycle.take()"];
         let mut last = 0usize;
         for step in steps {
             let at = body

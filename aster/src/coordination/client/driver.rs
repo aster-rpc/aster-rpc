@@ -163,23 +163,30 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
     )))
 }
 
-/// The reply must echo this journal's **whole entry identity** — protocol
-/// version and group as well as client id, sequence and hash — or it is not
-/// an answer to the pending request. The same rule the journal itself
-/// enforces at `resolve` and at reopen, applied here first so a foreign
-/// reply is classified as a malformed disposition (ambiguous, resend)
-/// rather than reaching the persist path at all.
+/// The reply must be a **valid §5.2 answer to this journal's entry** — the
+/// full request-aware verdict (`client::inbound`): entry identity, coherent
+/// disposition/outcome/reason, the method's outcome, snapshot presence and
+/// nested facts. The same validator the journal itself runs at `resolve`
+/// and at reopen, applied here first so an invalid reply is classified as a
+/// malformed disposition (ambiguous, resend) rather than reaching the
+/// persist path at all.
 fn decode_and_check(journal: &Journal, payload: &[u8]) -> Option<MutationReplyWireV1> {
     let reply: MutationReplyWireV1 = payload_fory::<MutationReplyWireV1>()
         .deserialize(payload)
         .ok()?;
     let record = journal.record();
-    (reply.protocol_version == STORE_PROTOCOL_VERSION
-        && reply.group_id == record.group_id
-        && reply.client_id == record.client_id
-        && reply.sequence == record.sequence
-        && reply.request_hash == record.request_hash)
-        .then_some(reply)
+    let cx = super::inbound::MutationContext {
+        group_id: &record.group_id,
+        local_actor: &record.actor_node_id,
+        method: &record.pending_method,
+        request: &record.pending_request,
+        client_id: &record.client_id,
+        sequence: record.sequence,
+        request_hash: &record.request_hash,
+    };
+    super::inbound::validate_mutation_reply(&cx, &reply)
+        .ok()
+        .map(|()| reply)
 }
 
 /// `Closing`: retry sessionless retirement through ambiguity until a reply

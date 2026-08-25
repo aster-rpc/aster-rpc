@@ -27,6 +27,7 @@
 
 mod driver;
 pub(crate) mod engine;
+pub(crate) mod inbound;
 /// Crate-private on purpose (the third review's capability note): the only
 /// paths that may persist into a journal are the driver — which checks the
 /// reply echoes the pending entry before `resolve` — and the client's own
@@ -716,9 +717,15 @@ reply_envelope!(
     crate::coordination::store::wire::RecoveryExportManifestWireV1,
 );
 
-/// The inbound boundary itself: protocol version and group, checked on
-/// every typed reply the client accepts.
-fn check_envelope<T: ReplyEnvelope>(engine: &Engine, method: &str, reply: T) -> Result<T> {
+/// The inbound boundary itself: protocol version and group on every typed
+/// reply the client accepts, then the reply type's own nested validity —
+/// identifier widths, ordering, and facts that must not contradict
+/// themselves (`client::inbound::ValidNested`).
+fn check_envelope<T: ReplyEnvelope + inbound::ValidNested>(
+    engine: &Engine,
+    method: &str,
+    reply: T,
+) -> Result<T> {
     let (protocol_version, group_id) = reply.envelope();
     if protocol_version != STORE_PROTOCOL_VERSION {
         return Err(client_error(format!(
@@ -731,6 +738,9 @@ fn check_envelope<T: ReplyEnvelope>(engine: &Engine, method: &str, reply: T) -> 
             "{method}: the reply names another coordination group"
         )));
     }
+    reply
+        .validate_nested(engine.group.as_bytes())
+        .map_err(|why| client_error(format!("{method}: {why}")))?;
     Ok(reply)
 }
 
@@ -743,6 +753,7 @@ where
         + fory_core::Serializer
         + fory_core::ForyDefault
         + ReplyEnvelope
+        + inbound::ValidNested
         + 'static,
 {
     match engine.unary(method, request).await {
@@ -767,9 +778,18 @@ impl CoordinationReadClient {
         let request = encode(&ReadRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
-            resource,
+            resource: resource.clone(),
         })?;
-        unary_typed(&self.engine, "read_linearizable", request).await
+        let reply: ReadReplyWireV1 =
+            unary_typed(&self.engine, "read_linearizable", request).await?;
+        // Request correlation: the snapshot must be about the resource this
+        // call asked for, not merely any well-formed one.
+        if reply.snapshot.resource != resource {
+            return Err(client_error(
+                "read_linearizable: the reply's snapshot names another resource",
+            ));
+        }
+        Ok(reply)
     }
 
     /// `inspect_acl` (§5.2, administrator).
@@ -777,9 +797,15 @@ impl CoordinationReadClient {
         let request = encode(&AclStatusRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
-            resource,
+            resource: resource.clone(),
         })?;
-        unary_typed(&self.engine, "inspect_acl", request).await
+        let reply: AclStatusReplyWireV1 = unary_typed(&self.engine, "inspect_acl", request).await?;
+        if reply.acl_snapshot.resource != resource {
+            return Err(client_error(
+                "inspect_acl: the reply's snapshot names another resource",
+            ));
+        }
+        Ok(reply)
     }
 
     /// `inspect_admins` (§5.2, administrator).

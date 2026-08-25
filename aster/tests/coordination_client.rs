@@ -645,6 +645,22 @@ async fn the_recovery_export_streams_into_a_writer_exactly() {
 /// request hash — everything a pre-boundary client checked — while naming a
 /// configurable group and protocol version. The one thing it cannot forge
 /// is what the boundary checks.
+/// How the counterfeit deforms an otherwise fully valid grant — each one a
+/// §5.2 violation only the request-aware validity boundary can catch, since
+/// ownership (protocol/group/client/sequence/hash) stays perfect.
+#[derive(Clone, Copy, PartialEq)]
+enum Deformation {
+    None,
+    /// `Granted` with no snapshot at all — the fifth review's own example.
+    NoSnapshot,
+    /// A perfect snapshot about some other resource.
+    WrongResource,
+    /// `held: true` with no holder — a self-contradiction.
+    HeldWithoutHolder,
+    /// A success wearing a terminal refusal reason.
+    TerminalReasonOnSuccess,
+}
+
 struct ForeignStore {
     group_id: std::sync::Mutex<Vec<u8>>,
     protocol_version: std::sync::Mutex<i32>,
@@ -654,6 +670,8 @@ struct ForeignStore {
     /// The group stamped onto `retire_client` confirmations, separately
     /// switchable from the mutation stamp.
     retire_group: std::sync::Mutex<Vec<u8>>,
+    /// The active grant deformation.
+    deformation: std::sync::Mutex<Deformation>,
 }
 
 impl ForeignStore {
@@ -699,18 +717,60 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                 // the requested action.
                 let hash =
                     aster::coordination::hash::request_hash(&ActionV1::Acquire(AcquireActionV1 {
-                        resource: request.resource,
+                        resource: request.resource.clone(),
                         ttl_ms: request.ttl_ms,
                     }))
                     .expect("the action hashes");
                 let terminal = *self.0.terminal.lock().expect("stamp");
-                let (disposition_code, outcome_code, reason_code) = if terminal {
+                let deformation = *self.0.deformation.lock().expect("stamp");
+                let (disposition_code, outcome_code, mut reason_code) = if terminal {
                     // NotConsumed with a §10-terminal reason: the corridor
                     // opener, honestly owned by the entry.
                     (2, 100, 24)
                 } else {
                     (1, 1, 0)
                 };
+                // A grant is otherwise **fully valid**: complete snapshot
+                // about the requested resource, held by the caller — so a
+                // refusal downstream can only be the deformation's.
+                let holder: Vec<u8> = {
+                    let peer = call.peer();
+                    aster::coordination::ids::CoordinationNodeId::parse_hex(peer)
+                        .map(|id| id.as_bytes().to_vec())
+                        .unwrap_or_else(|_| vec![0xEE; 32])
+                };
+                let mut snapshot =
+                    (!terminal).then(|| aster::coordination::contract::ResourceSnapshotV1 {
+                        group_id: group_id.clone(),
+                        resource: request.resource.clone(),
+                        epoch: 1,
+                        holder: Some(holder),
+                        held: true,
+                        ttl_ms: request.ttl_ms,
+                        lease_revision: 1,
+                        value_revision: 0,
+                        acl_revision: 1,
+                        value: Some(Vec::new()),
+                        value_redacted: false,
+                    });
+                match deformation {
+                    Deformation::None => {}
+                    Deformation::NoSnapshot => snapshot = None,
+                    Deformation::WrongResource => {
+                        if let Some(s) = snapshot.as_mut() {
+                            s.resource = aster::coordination::contract::ResourceKeyV1 {
+                                namespace: "client.gate".into(),
+                                key: b"some-other-register".to_vec(),
+                            };
+                        }
+                    }
+                    Deformation::HeldWithoutHolder => {
+                        if let Some(s) = snapshot.as_mut() {
+                            s.holder = None;
+                        }
+                    }
+                    Deformation::TerminalReasonOnSuccess => reason_code = 24,
+                }
                 payload_fory::<MutationReplyWireV1>()
                     .serialize(&MutationReplyWireV1 {
                         protocol_version,
@@ -721,6 +781,7 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                         disposition_code,
                         outcome_code,
                         reason_code,
+                        snapshot,
                         ..Default::default()
                     })
                     .expect("the counterfeit encodes")
@@ -743,6 +804,12 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                     lifecycle_code: 3,
                     local_node_id: vec![0xEE; 32],
                     genesis_hash: vec![0xEE; 32],
+                    // A malformed nested identifier: 31 bytes where a voter
+                    // id must be 32. Outer envelope perfect once the group
+                    // stamp is honest — only nested validation can refuse.
+                    voters: vec![aster::coordination::contract::NodeIdV1 {
+                        node_id: vec![0xEE; 31],
+                    }],
                     ..Default::default()
                 })
                 .expect("the counterfeit encodes"),
@@ -780,6 +847,7 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
         protocol_version: std::sync::Mutex::new(1),
         terminal: std::sync::Mutex::new(false),
         retire_group: std::sync::Mutex::new(vec![0xEE; 32]),
+        deformation: std::sync::Mutex::new(Deformation::None),
     });
     let counterfeit = AsterServer::builder()
         .config(
@@ -859,6 +927,50 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
         "the driver, not the journal backstop, refuses the wrong version: {err}"
     );
 
+    // The fifth review's half: **ownership-perfect but invalid** replies.
+    // Honest stamps from here on — protocol, group, client, sequence and
+    // the true hash all echo — and each §5.2 deformation must still be
+    // refused by the request-aware boundary.
+    *foreign.protocol_version.lock().expect("stamp") =
+        aster::coordination::store::wire::STORE_PROTOCOL_VERSION;
+    for (deformation, why) in [
+        (Deformation::NoSnapshot, "a grant with no snapshot"),
+        (
+            Deformation::WrongResource,
+            "a snapshot about another resource",
+        ),
+        (
+            Deformation::HeldWithoutHolder,
+            "a held register with no holder",
+        ),
+        (
+            Deformation::TerminalReasonOnSuccess,
+            "a success wearing a terminal reason",
+        ),
+    ] {
+        *foreign.deformation.lock().expect("stamp") = deformation;
+        let refused = within("deformed resume", client.resume()).await;
+        let Err(err) = refused else {
+            panic!("{why} must not resolve");
+        };
+        assert!(
+            format!("{err}").contains("no resolution"),
+            "{why} is refused at the boundary: {err}"
+        );
+    }
+    *foreign.deformation.lock().expect("stamp") = Deformation::None;
+
+    // With an honest envelope, the status is still refused — its nested
+    // voter id is 31 bytes, a fact only nested validation can see.
+    let nested = within("malformed status", client.reads().group_status()).await;
+    let Err(err) = nested else {
+        panic!("a malformed nested identifier must be refused")
+    };
+    assert!(
+        format!("{err}").contains("malformed"),
+        "the nested validator names the fault: {err}"
+    );
+
     // Honest stamps: the same journaled request now resolves — the earlier
     // refusals were the boundary's, not some other fault's.
     *foreign.protocol_version.lock().expect("stamp") =
@@ -892,6 +1004,7 @@ async fn a_foreign_retirement_confirmation_is_not_honored() {
         ),
         terminal: std::sync::Mutex::new(true),
         retire_group: std::sync::Mutex::new(vec![0xEE; 32]),
+        deformation: std::sync::Mutex::new(Deformation::None),
     });
     let counterfeit = AsterServer::builder()
         .config(
