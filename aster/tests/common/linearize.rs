@@ -921,9 +921,12 @@ mod tests {
         check(&oracle(), &[unauthorized]).expect("withheld is exactly the unauthorized outcome");
     }
 
-    /// **An unauthorized caller receiving value bytes is refuted**: the
-    /// server never hands bytes to a caller without `READ`, so a reply that
-    /// does is not this group's reply.
+    /// **An unauthorized caller receiving value bytes is refuted** — even
+    /// the *correct* bytes: the server never hands a value to a caller
+    /// without `READ`, so a reply that does is not this group's reply. The
+    /// bytes here equal the model's value exactly (the mutation campaign
+    /// proved a mismatched-bytes spelling vacuous — the value comparison
+    /// refuted it before the authorization gate could).
     #[test]
     fn a_present_value_for_an_unauthorized_reader_is_refuted() {
         let mut with_bytes = op(1, 0, 10, acquire(), granted(1, 1, 1, 0));
@@ -934,9 +937,15 @@ mod tests {
             .snapshot
             .as_mut()
             .expect("snapshot")
-            .value = ValueFact::Present(vec![7]);
+            .value = ValueFact::Present(Vec::new());
         with_bytes.may_read_value = false;
-        check(&oracle(), &[with_bytes]).expect_err("no bytes for a caller without READ");
+        check(&oracle(), &[with_bytes.clone()])
+            .expect_err("no bytes for a caller without READ, correct or not");
+
+        // The same observation from an authorized caller linearizes: the
+        // refutation above is the authorization gate and nothing else.
+        with_bytes.may_read_value = true;
+        check(&oracle(), &[with_bytes]).expect("the authorized twin is healthy");
     }
 
     /// **The identity oracle is the harness's, not the replies'**: a history
