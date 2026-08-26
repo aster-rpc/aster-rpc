@@ -692,6 +692,10 @@ enum StreamMode {
     /// An honest manifest, then empty non-final chunks — frames that exist
     /// only to reset idle timers while the body never advances.
     EmptyChunkDrip,
+    /// An honest manifest, then one-byte chunks every few seconds — real
+    /// progress, never idle, never finishing. Only the absolute stream
+    /// deadline terminates this one.
+    SlowDrip,
     /// Accept the stream, then send neither data nor trailer.
     Park,
 }
@@ -893,6 +897,47 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                 // Accept, then stall: neither data nor trailer. The call is
                 // held open until far past the client's frame deadline.
                 tokio::time::sleep(Duration::from_secs(300)).await;
+                return;
+            }
+            if mode == StreamMode::SlowDrip && method == "recovery_export" {
+                use aster::coordination::contract::payload_fory;
+                use aster::coordination::store::wire::{
+                    RecoveryExportChunkWireV1, RecoveryExportFrameV1, RecoveryExportManifestWireV1,
+                    STORE_PROTOCOL_VERSION,
+                };
+                let manifest = RecoveryExportFrameV1::Manifest(RecoveryExportManifestWireV1 {
+                    protocol_version: STORE_PROTOCOL_VERSION,
+                    group_id: group_id.clone(),
+                    total_len: 1024,
+                    blake3_checksum: vec![0x33; 32],
+                    applied_log_id: None,
+                });
+                let _ = call
+                    .send(
+                        payload_fory::<RecoveryExportFrameV1>()
+                            .serialize(&manifest)
+                            .expect("encodes"),
+                    )
+                    .await;
+                for offset in 0u64..1024 {
+                    let chunk = RecoveryExportFrameV1::Chunk(RecoveryExportChunkWireV1 {
+                        offset,
+                        data: vec![0xAB],
+                        final_chunk: false,
+                    });
+                    if call
+                        .send(
+                            payload_fory::<RecoveryExportFrameV1>()
+                                .serialize(&chunk)
+                                .expect("encodes"),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
                 return;
             }
             let frames = counterfeit_stream_frames(method, mode, &group_id);
@@ -1516,6 +1561,22 @@ async fn stream_contracts_are_enforced_at_the_boundary() {
         panic!("a no-progress chunk must be refused")
     };
     assert!(format!("{err}").contains("no progress"), "{err}");
+
+    // A dripping peer — one honest byte every few seconds, never idle,
+    // never finishing — is terminated by the **absolute** stream deadline.
+    // Bounded by its own patience because the whole point is that this
+    // takes the deadline, not forever.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::SlowDrip;
+    let dripped = tokio::time::timeout(Duration::from_secs(90), reads.recovery_export())
+        .await
+        .expect("the absolute deadline fires well before this patience");
+    let Err(err) = dripped else {
+        panic!("a slow drip must be terminated by the absolute deadline")
+    };
+    // The final wait is min(idle, remaining-absolute), so the terminating
+    // error may carry either bound's message; what the gate pins is that
+    // the drip ends within the absolute budget at all.
+    assert!(format!("{err}").contains("deadline"), "{err}");
 
     // The §5.2 audit cap is the client's own: zero and above the hard cap
     // are refused before a byte is sent.
