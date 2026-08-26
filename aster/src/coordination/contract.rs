@@ -361,6 +361,55 @@ pub fn payload_fory<T: WireField>() -> fory_core::Fory {
 
 #[cfg(test)]
 mod tests {
+    /// **The independently transcribed §5.2 audit matrix.** Sharing
+    /// `audit_results_for` between the two readers proves they cannot drift
+    /// from each other; it does not prove either matches the specification.
+    /// This table is transcribed from §5.2 by hand — NOT derived from the
+    /// function under test — and the assertion sweeps every operation code
+    /// in and around the declared space against every result code either
+    /// code space can spell.
+    #[test]
+    fn the_audit_table_matches_the_transcribed_specification() {
+        // (operation, the exact §5.2 result list), quoted from the document.
+        let transcribed: &[(i32, &[i32])] = &[
+            (1, &[1, 100]),
+            (2, &[2, 100]),
+            (3, &[3, 100]),
+            (4, &[4, 100]),
+            (5, &[4, 100]),
+            (6, &[5, 100]),
+            (7, &[6, 100]),
+            (8, &[7, 100]),
+            (9, &[8, 100]),
+            (10, &[9, 100]),
+            (11, &[10, 100]),
+            (100, &[1, 2, 5]),
+            (101, &[3, 4, 6]),
+            (102, &[7, 8]),
+        ];
+        // Every result code either code space can spell, plus brackets.
+        let candidate_results: Vec<i32> = (-1..=12).chain([99, 100, 101, 102, i32::MAX]).collect();
+
+        for (operation, allowed) in transcribed {
+            let table = super::audit_results_for(*operation)
+                .unwrap_or_else(|| panic!("§5.2 declares operation {operation}"));
+            for result in &candidate_results {
+                assert_eq!(
+                    table.contains(result),
+                    allowed.contains(result),
+                    "operation {operation} × result {result}"
+                );
+            }
+        }
+        // And nothing outside the declared operation space maps at all.
+        for operation in [-1, 0, 12, 99, 103, i32::MAX] {
+            assert!(
+                super::audit_results_for(operation).is_none(),
+                "operation {operation} is not §5.2's"
+            );
+        }
+    }
+
     use super::*;
 
     fn key() -> ResourceKeyV1 {

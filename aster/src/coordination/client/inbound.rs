@@ -99,7 +99,7 @@ pub(crate) enum RequestFacts {
     CompareAndSet {
         fence: FenceV1,
         expected_value_revision: u64,
-        new_value_len: usize,
+        new_value: Vec<u8>,
     },
     Release {
         fence: FenceV1,
@@ -107,7 +107,7 @@ pub(crate) enum RequestFacts {
     ReleaseWithValue {
         fence: FenceV1,
         expected_value_revision: u64,
-        final_value_len: usize,
+        final_value: Vec<u8>,
     },
     Revoke {
         resource: ResourceKeyV1,
@@ -125,9 +125,14 @@ pub(crate) enum RequestFacts {
     },
     ChangeMembership {
         operation_id: Vec<u8>,
+        expected_membership_log_id: Option<LogIdV1>,
+        desired_voters: Vec<Vec<u8>>,
+        retained_learners: Vec<Vec<u8>>,
+        member_seeds: Vec<crate::coordination::contract::MemberSeedV1>,
     },
     CancelMembership {
         operation_id: Vec<u8>,
+        expected_phase_code: i32,
     },
 }
 
@@ -179,8 +184,8 @@ impl RequestFacts {
     /// The operation id a membership success must echo.
     fn operation_id(&self) -> Option<&[u8]> {
         match self {
-            RequestFacts::ChangeMembership { operation_id }
-            | RequestFacts::CancelMembership { operation_id } => Some(operation_id),
+            RequestFacts::ChangeMembership { operation_id, .. }
+            | RequestFacts::CancelMembership { operation_id, .. } => Some(operation_id),
             _ => None,
         }
     }
@@ -207,7 +212,7 @@ pub(crate) fn decode_facts(method: &str, request: &[u8]) -> Result<RequestFacts,
             RequestFacts::CompareAndSet {
                 fence: r.fence,
                 expected_value_revision: r.expected_value_revision,
-                new_value_len: r.new_value.len(),
+                new_value: r.new_value,
             }
         }
         MutationKind::Release => RequestFacts::Release {
@@ -218,7 +223,7 @@ pub(crate) fn decode_facts(method: &str, request: &[u8]) -> Result<RequestFacts,
             RequestFacts::ReleaseWithValue {
                 fence: r.fence,
                 expected_value_revision: r.expected_value_revision,
-                final_value_len: r.final_value.len(),
+                final_value: r.final_value,
             }
         }
         MutationKind::Revoke => {
@@ -244,30 +249,65 @@ pub(crate) fn decode_facts(method: &str, request: &[u8]) -> Result<RequestFacts,
                 expected_admin_revision: r.expected_admin_revision,
             }
         }
-        MutationKind::ChangeMembership => RequestFacts::ChangeMembership {
-            operation_id: decode::<ChangeMembershipRequestV1>(request)?.operation_id,
-        },
-        MutationKind::CancelMembership => RequestFacts::CancelMembership {
-            operation_id: decode::<CancelMembershipRequestV1>(request)?.operation_id,
-        },
+        MutationKind::ChangeMembership => {
+            let r = decode::<ChangeMembershipRequestV1>(request)?;
+            RequestFacts::ChangeMembership {
+                operation_id: r.operation_id,
+                expected_membership_log_id: r.expected_membership_log_id,
+                desired_voters: r.desired_voters.into_iter().map(|n| n.node_id).collect(),
+                retained_learners: r.retained_learners.into_iter().map(|n| n.node_id).collect(),
+                member_seeds: r.member_seeds,
+            }
+        }
+        MutationKind::CancelMembership => {
+            let r = decode::<CancelMembershipRequestV1>(request)?;
+            RequestFacts::CancelMembership {
+                operation_id: r.operation_id,
+                expected_phase_code: r.expected_phase_code,
+            }
+        }
     })
 }
 
 /// The **outbound** half of the per-method specification: is this a request
-/// the client may send at all? §12.1 leaf bounds, and the two facts no reply
-/// can repair — a fence must name this client's group (a fence minted
-/// elsewhere is §4.1-invalid and the request could only burn a sequence),
-/// and a fence's holder must be this actor, because §9.1 makes every fenced
-/// operation a holder's operation and a success against another holder's
-/// fence is a reply this client must never accept.
+/// the client may send at all?
+///
+/// Every **deterministic** request-shape rule runs here, before anything is
+/// journaled — because a journaled request that can only earn a stage-4
+/// status denial is a permanent wedge: §10 forbids substituting bytes at a
+/// sent sequence, so the driver could only resend the same impossible frame
+/// forever. That covers the §4.2 namespace grammar (not merely lengths),
+/// §12.1 leaf and TTL bounds, counter ceilings on every expectation a reply
+/// successor is computed from, the §9 membership-plan shape (ordering, role
+/// disjointness, the profile-independent voter counts, seed bounds,
+/// seed-in-plan, canonical tickets), the §7.3 phase domain, and the two
+/// fence facts no reply can repair — the minting group and this actor's
+/// hold.
+///
+/// The rules that depend on replicated state — the profile's exact voter
+/// count, ROOT membership, which seeds need permits and whether they
+/// verify — cannot be decided here and remain the group's stage-4 refusals.
 pub(crate) fn validate_request(
     group_id: &[u8],
     local_actor: &[u8],
     facts: &RequestFacts,
 ) -> Result<(), String> {
+    use crate::coordination::model::shape;
+
+    let counter = |what: &str, value: u64| {
+        if value > MAX_COUNTER {
+            Err(format!("{what} is past the §12.1 counter ceiling"))
+        } else {
+            Ok(())
+        }
+    };
+
     if let Some(resource) = facts.resource() {
-        crate::coordination::store::wire::resource_bounds(resource)
-            .map_err(|invalid| invalid.describe())?;
+        // The full §4.2 grammar, via the identity type's own constructor —
+        // not a length check. An invalid namespace is shapeless to the
+        // protocol and can only be denied.
+        shape::validate_resource_key(&resource.namespace, &resource.key)
+            .map_err(|limit| limit.describe().to_string())?;
     }
     if let Some(fence) = facts.fence() {
         if fence.group_id != group_id {
@@ -276,27 +316,42 @@ pub(crate) fn validate_request(
         if fence.holder != local_actor {
             return Err("the fence's holder is not this client's actor".to_string());
         }
+        counter("the fence's epoch", fence.epoch)?;
     }
     match facts {
         RequestFacts::Acquire { ttl_ms, .. } => {
             crate::coordination::store::wire::ttl_bounds(*ttl_ms)
                 .map_err(|invalid| invalid.describe())?;
         }
-        RequestFacts::CompareAndSet { new_value_len, .. } => {
-            if *new_value_len > MAX_VALUE {
+        RequestFacts::CompareAndSet {
+            expected_value_revision,
+            new_value,
+            ..
+        } => {
+            if new_value.len() > MAX_VALUE {
                 return Err("the new value exceeds the §12.1 bound".to_string());
             }
+            counter("the expected value revision", *expected_value_revision)?;
         }
         RequestFacts::ReleaseWithValue {
-            final_value_len, ..
+            expected_value_revision,
+            final_value,
+            ..
         } => {
-            if *final_value_len > MAX_VALUE {
+            if final_value.len() > MAX_VALUE {
                 return Err("the final value exceeds the §12.1 bound".to_string());
+            }
+            counter("the expected value revision", *expected_value_revision)?;
+        }
+        RequestFacts::Revoke { expected_epoch, .. } => {
+            if let Some(expected) = expected_epoch {
+                counter("the expected epoch", *expected)?;
             }
         }
         RequestFacts::SetGrant {
             target_node_id,
             rights,
+            expected_acl_revision,
             ..
         } => {
             if target_node_id.len() != 32 {
@@ -305,20 +360,106 @@ pub(crate) fn validate_request(
             if !rights_are_known(*rights) {
                 return Err("the rights carry a bit v1 does not define".to_string());
             }
+            counter("the expected ACL revision", *expected_acl_revision)?;
         }
-        RequestFacts::SetAdmin { target_node_id, .. } => {
+        RequestFacts::SetAdmin {
+            target_node_id,
+            expected_admin_revision,
+            ..
+        } => {
             if target_node_id.len() != 32 {
                 return Err("the admin target is not a 32-byte node id".to_string());
             }
+            counter("the expected admin revision", *expected_admin_revision)?;
         }
-        RequestFacts::ChangeMembership { operation_id }
-        | RequestFacts::CancelMembership { operation_id } => {
+        RequestFacts::ChangeMembership {
+            operation_id,
+            expected_membership_log_id,
+            desired_voters,
+            retained_learners,
+            member_seeds,
+        } => {
             if operation_id.len() != 16 {
                 return Err("the operation id is not 16 bytes".to_string());
             }
+            if let Some(id) = expected_membership_log_id {
+                check_log_id("the expected membership log id", id)?;
+            }
+            validate_membership_plan(desired_voters, retained_learners, member_seeds)?;
         }
-        RequestFacts::Renew { .. } | RequestFacts::Release { .. } | RequestFacts::Revoke { .. } => {
+        RequestFacts::CancelMembership {
+            operation_id,
+            expected_phase_code,
+        } => {
+            if operation_id.len() != 16 {
+                return Err("the operation id is not 16 bytes".to_string());
+            }
+            if !domains::PHASE.contains(expected_phase_code) {
+                return Err(format!(
+                    "phase {expected_phase_code} is not a §7.3 intent phase"
+                ));
+            }
         }
+        RequestFacts::Renew { .. } | RequestFacts::Release { .. } => {}
+    }
+    Ok(())
+}
+
+/// The deterministic subset of the model's §9 `plan_shape`: everything a
+/// plan can violate without consulting replicated state, via the same
+/// shared `shape` functions the model runs, so the two cannot disagree
+/// about what these rules mean.
+fn validate_membership_plan(
+    desired_voters: &[Vec<u8>],
+    retained_learners: &[Vec<u8>],
+    member_seeds: &[crate::coordination::contract::MemberSeedV1],
+) -> Result<(), String> {
+    use crate::coordination::model::shape;
+
+    let narrow = |what: &str, ids: &[Vec<u8>]| -> Result<Vec<[u8; 32]>, String> {
+        ids.iter()
+            .map(|id| {
+                <[u8; 32]>::try_from(id.as_slice())
+                    .map_err(|_| format!("{what} contains a malformed node id"))
+            })
+            .collect()
+    };
+    let voters = narrow("the desired voter list", desired_voters)?;
+    let learners = narrow("the retained learner list", retained_learners)?;
+
+    // §9's profile-independent envelope: no §7.1 profile legalizes zero
+    // voters, four, or more than five; the profile's exact rule is
+    // replicated state and stays the group's.
+    if !matches!(voters.len(), 1 | 2 | 3 | 5) {
+        return Err("no §7.1 profile permits this desired voter count".to_string());
+    }
+    if learners.len() > 2 {
+        return Err("a plan retains at most two learners (§9)".to_string());
+    }
+    if !shape::sorted_unique(&voters) || !shape::sorted_unique(&learners) {
+        return Err("a plan's node vectors must be sorted and unique (§9)".to_string());
+    }
+    if voters.iter().any(|v| learners.contains(v)) {
+        return Err("a node cannot be both a voter and a learner (§9)".to_string());
+    }
+    let seed_ids: Vec<[u8; 32]> = member_seeds
+        .iter()
+        .map(|seed| {
+            <[u8; 32]>::try_from(seed.node_id.as_slice())
+                .map_err(|_| "a member seed names a malformed node id".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    if !shape::sorted_unique(&seed_ids) {
+        return Err("the member seeds must be sorted and unique (§9)".to_string());
+    }
+    for (seed, id) in member_seeds.iter().zip(&seed_ids) {
+        crate::coordination::store::wire::member_seed_bounds(seed)
+            .map_err(|invalid| invalid.describe())?;
+        if !voters.contains(id) && !learners.contains(id) {
+            return Err("a member seed names a node the plan does not contain (§9)".to_string());
+        }
+        shape::check_seed_ticket(seed.ticket.as_bytes(), id)
+            .map_err(|limit| limit.describe().to_string())?;
     }
     Ok(())
 }
@@ -503,6 +644,15 @@ pub(crate) fn validate_mutation_reply(
     // fences on `expected_admin_revision`, so a success reports either the
     // advanced revision or, for a no-op, the expected one it echoed — the
     // observed revision on a rejection, and `0` everywhere else.
+    // Reply-level counters obey the §12.1 ceiling before any successor is
+    // computed from them: apply can never write past `MAX_COUNTER`, and a
+    // revision above it is not a value any checked successor produced.
+    if reply.acl_revision > MAX_COUNTER {
+        return Err("the reply's ACL revision is past the counter ceiling".to_string());
+    }
+    if reply.admin_revision > MAX_COUNTER {
+        return Err("the reply's admin revision is past the counter ceiling".to_string());
+    }
     match outcome {
         Outcome::AdminUpdated => {
             let RequestFacts::SetAdmin {
@@ -512,8 +662,11 @@ pub(crate) fn validate_mutation_reply(
             else {
                 return Err("outcome 7 answers only set_admin".to_string());
             };
+            let advanced = expected_admin_revision
+                .checked_add(1)
+                .filter(|next| *next <= MAX_COUNTER);
             if reply.admin_revision != *expected_admin_revision
-                && reply.admin_revision != expected_admin_revision + 1
+                && Some(reply.admin_revision) != advanced
             {
                 return Err(
                     "an AdminUpdated revision does not follow from the request's fence".to_string(),
@@ -559,9 +712,10 @@ pub(crate) fn validate_mutation_reply(
         else {
             return Err("outcome 6 answers only set_grant".to_string());
         };
-        if reply.acl_revision != *expected_acl_revision
-            && reply.acl_revision != expected_acl_revision + 1
-        {
+        let advanced = expected_acl_revision
+            .checked_add(1)
+            .filter(|next| *next <= MAX_COUNTER);
+        if reply.acl_revision != *expected_acl_revision && Some(reply.acl_revision) != advanced {
             return Err("a GrantUpdated revision does not follow from the request".to_string());
         }
     }
@@ -628,12 +782,13 @@ fn validate_snapshot(
             RequestFacts::CompareAndSet {
                 fence,
                 expected_value_revision,
-                ..
+                new_value,
             } => {
                 if snapshot.epoch != fence.epoch {
                     return Err("a write never moves the fenced epoch".to_string());
                 }
-                if snapshot.value_revision != expected_value_revision + 1 {
+                check_written_value(snapshot, new_value)?;
+                if Some(snapshot.value_revision) != expected_value_revision.checked_add(1) {
                     return Err(
                         "a write advances the value revision from the request's expectation"
                             .to_string(),
@@ -641,19 +796,20 @@ fn validate_snapshot(
                 }
             }
             RequestFacts::Release { fence } => {
-                if snapshot.epoch != fence.epoch + 1 {
+                if Some(snapshot.epoch) != fence.epoch.checked_add(1) {
                     return Err("a release advances the fenced epoch by one".to_string());
                 }
             }
             RequestFacts::ReleaseWithValue {
                 fence,
                 expected_value_revision,
-                ..
+                final_value,
             } => {
-                if snapshot.epoch != fence.epoch + 1 {
+                if Some(snapshot.epoch) != fence.epoch.checked_add(1) {
                     return Err("a release advances the fenced epoch by one".to_string());
                 }
-                if snapshot.value_revision != expected_value_revision + 1 {
+                check_written_value(snapshot, final_value)?;
+                if Some(snapshot.value_revision) != expected_value_revision.checked_add(1) {
                     return Err(
                         "a write advances the value revision from the request's expectation"
                             .to_string(),
@@ -662,7 +818,7 @@ fn validate_snapshot(
             }
             RequestFacts::Revoke { expected_epoch, .. } => match expected_epoch {
                 Some(expected) => {
-                    if snapshot.epoch != expected + 1 {
+                    if Some(snapshot.epoch) != expected.checked_add(1) {
                         return Err(
                             "a fenced revoke advances the expected epoch by one".to_string()
                         );
@@ -681,6 +837,20 @@ fn validate_snapshot(
         }
     }
     Ok(())
+}
+
+/// A written value's echo: a success snapshot that carries readable bytes
+/// must carry **exactly** the bytes this request wrote. §4.3 legitimately
+/// withholds them — a replay is redacted, and a caller without `READ` gets
+/// `None` — but visible bytes that differ from what the command wrote are
+/// not this command's result.
+fn check_written_value(snapshot: &ResourceSnapshotV1, written: &[u8]) -> Result<(), String> {
+    match &snapshot.value {
+        Some(value) if value != written => {
+            Err("the snapshot's value is not the value this request wrote".to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The §12.1 leaf bounds every snapshot obeys, mutation and read alike: a
@@ -1448,6 +1618,9 @@ mod tests {
                 "compare_and_set" => {
                     reply.snapshot = Some(ResourceSnapshotV1 {
                         value_revision: 1,
+                        // §4.3: a readable success snapshot echoes exactly
+                        // the bytes the request wrote.
+                        value: Some(b"v".to_vec()),
                         ..held_snapshot()
                     });
                     reply.acl_revision = 3;
@@ -2187,7 +2360,7 @@ mod tests {
         let oversized = RequestFacts::CompareAndSet {
             fence: fence_v1(),
             expected_value_revision: 0,
-            new_value_len: MAX_VALUE + 1,
+            new_value: vec![0u8; MAX_VALUE + 1],
         };
         assert!(validate_request(&GROUP, &ACTOR, &oversized).is_err());
 
@@ -2198,6 +2371,118 @@ mod tests {
             expected_acl_revision: 0,
         };
         assert!(validate_request(&GROUP, &ACTOR, &unknown_rights).is_err());
+    }
+
+    /// **The wedge-prevention rules** (§10): every deterministic shape rule
+    /// the group could only answer with a stage-4 status denial is refused
+    /// here, before a sequence could be burned on it.
+    #[test]
+    fn shapeless_requests_are_refused_before_journaling() {
+        // §4.2 grammar, not lengths: uppercase is in bounds and invalid.
+        let bad_namespace = RequestFacts::Acquire {
+            resource: ResourceKeyV1 {
+                namespace: "NOT a namespace".into(),
+                key: b"k".to_vec(),
+            },
+            ttl_ms: 30_000,
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &bad_namespace).is_err());
+
+        // Counter ceilings on everything a successor is computed from.
+        let past_ceiling = RequestFacts::Renew {
+            fence: FenceV1 {
+                epoch: MAX_COUNTER + 1,
+                ..fence_v1()
+            },
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &past_ceiling).is_err());
+        let past_ceiling = RequestFacts::SetAdmin {
+            target_node_id: OTHER.to_vec(),
+            expected_admin_revision: u64::MAX,
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &past_ceiling).is_err());
+
+        // The §9 membership-plan shape, deterministic subset.
+        let plan = |voters: Vec<Vec<u8>>, learners: Vec<Vec<u8>>| RequestFacts::ChangeMembership {
+            operation_id: OP.to_vec(),
+            expected_membership_log_id: None,
+            desired_voters: voters,
+            retained_learners: learners,
+            member_seeds: Vec::new(),
+        };
+        let node = |b: u8| vec![b; 32];
+        // A count no §7.1 profile permits.
+        assert!(validate_request(
+            &GROUP,
+            &ACTOR,
+            &plan(vec![node(1), node(2), node(3), node(4)], Vec::new())
+        )
+        .is_err());
+        // Unsorted voters.
+        assert!(
+            validate_request(&GROUP, &ACTOR, &plan(vec![node(2), node(1)], Vec::new())).is_err()
+        );
+        // A node in both roles.
+        assert!(validate_request(
+            &GROUP,
+            &ACTOR,
+            &plan(vec![node(1), node(2), node(3)], vec![node(2)])
+        )
+        .is_err());
+        // A seed for a node the plan does not contain, and a non-ticket.
+        let with_seed = |seed_node: Vec<u8>, ticket: &str| RequestFacts::ChangeMembership {
+            operation_id: OP.to_vec(),
+            expected_membership_log_id: None,
+            desired_voters: vec![node(1), node(2), node(3)],
+            retained_learners: Vec::new(),
+            member_seeds: vec![crate::coordination::contract::MemberSeedV1 {
+                node_id: seed_node,
+                ticket: ticket.into(),
+                signed_join_permit: None,
+            }],
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &with_seed(node(9), "x")).is_err());
+        assert!(validate_request(&GROUP, &ACTOR, &with_seed(node(1), "not a ticket")).is_err());
+        // The sound plan passes: three sorted voters, a canonical seed.
+        let candidate: [u8; 32] = node(1).try_into().expect("32 bytes");
+        let ticket = crate::coordination::model::authority::canonical_candidate_ticket(&candidate)
+            .expect("a canonical ticket");
+        assert!(
+            validate_request(&GROUP, &ACTOR, &with_seed(node(1), &ticket)).is_ok(),
+            "the deterministic subset admits a sound plan"
+        );
+
+        // The §7.3 phase domain on a cancel.
+        let bad_phase = RequestFacts::CancelMembership {
+            operation_id: OP.to_vec(),
+            expected_phase_code: 99,
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &bad_phase).is_err());
+    }
+
+    /// A readable success snapshot echoes **exactly** the written bytes:
+    /// different bytes of the same length are not this command's result.
+    #[test]
+    fn a_success_snapshot_must_echo_the_written_bytes() {
+        let request = sequenced_request("compare_and_set");
+        let mut reply = well_shaped("compare_and_set", 1, 3, 0);
+        // Same length as the request's b"v", different byte.
+        reply.snapshot.as_mut().expect("snapshot").value = Some(b"x".to_vec());
+        assert!(validate_mutation_reply(&cx("compare_and_set", &request), &reply).is_err());
+        // Legitimately withheld bytes still pass: no READ, or a replay.
+        let mut withheld = well_shaped("compare_and_set", 1, 3, 0);
+        withheld.snapshot.as_mut().expect("snapshot").value = None;
+        assert!(validate_mutation_reply(&cx("compare_and_set", &request), &withheld).is_ok());
+    }
+
+    /// Reply-level counters obey the ceiling: a forged revision above
+    /// `MAX_COUNTER` is refused even where the request cannot bound it.
+    #[test]
+    fn reply_counters_are_bounded() {
+        let request = sequenced_request("set_admin");
+        let mut reply = well_shaped("set_admin", 1, 7, 0);
+        reply.admin_revision = MAX_COUNTER + 1;
+        assert!(validate_mutation_reply(&cx("set_admin", &request), &reply).is_err());
     }
 
     /// The renew/fence request family decodes for correlation too — one

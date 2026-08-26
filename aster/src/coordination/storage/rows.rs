@@ -1580,7 +1580,7 @@ fn check_audit_key_order(state: &DurableState) -> Result<(), String> {
     Ok(())
 }
 
-/// §5.2 declares eleven client method codes and two system ones. A row naming
+/// §5.2 declares eleven client method codes and three system ones. A row naming
 /// anything else describes an operation this build cannot interpret, and its
 /// result code cannot be placed in either code space.
 fn check_audit_rows(state: &DurableState) -> Result<(), String> {

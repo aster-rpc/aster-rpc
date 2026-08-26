@@ -875,6 +875,12 @@ impl CoordinationReadClient {
         after_log_id: Option<crate::coordination::contract::LogIdV1>,
         limit: u32,
     ) -> Result<Vec<AuditRecordWireV1>> {
+        // The §5.2 hard cap is enforced here, not merely trusted to the
+        // server: a limit of zero asks for nothing, and one above
+        // `MAX_AUDIT_STREAM_LIMIT` is a request no conforming server
+        // honors — and an unbounded license for a counterfeit one.
+        crate::coordination::store::wire::audit_limit_bounds(limit)
+            .map_err(|invalid| client_error(format!("audit_stream: {}", invalid.describe())))?;
         let request = encode(&AuditStreamRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
@@ -981,6 +987,12 @@ impl CoordinationReadClient {
                     // writer sees it.
                     if chunk.data.len() > crate::coordination::store::wire::MAX_EXPORT_CHUNK_BYTES {
                         return Err(client_error("the export chunk exceeds the §5.2 bound"));
+                    }
+                    // Every non-final chunk advances the body. An empty one
+                    // makes no progress — a frame that exists only to reset
+                    // idle timers — and no conforming slicer emits it.
+                    if chunk.data.is_empty() && !chunk.final_chunk {
+                        return Err(client_error("the export sent a chunk with no progress"));
                     }
                     if chunk.offset != received {
                         return Err(client_error("the export chunks are not contiguous"));

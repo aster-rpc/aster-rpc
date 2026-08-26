@@ -689,6 +689,9 @@ enum StreamMode {
     /// A validly encoded audit row whose result no apply path produces for
     /// its operation: an acquire recording `MembershipAccepted`.
     AuditWrongResult,
+    /// An honest manifest, then empty non-final chunks — frames that exist
+    /// only to reset idle timers while the body never advances.
+    EmptyChunkDrip,
     /// Accept the stream, then send neither data nor trailer.
     Park,
 }
@@ -784,6 +787,25 @@ fn counterfeit_stream_frames(method: &str, mode: StreamMode, group_id: &[u8]) ->
                     applied_log_id: None,
                 },
             ))]
+        }
+        ("recovery_export", StreamMode::EmptyChunkDrip) => {
+            let mut frames = vec![encode_frame(&RecoveryExportFrameV1::Manifest(
+                RecoveryExportManifestWireV1 {
+                    protocol_version: STORE_PROTOCOL_VERSION,
+                    group_id: group_id.to_vec(),
+                    total_len: 1024,
+                    blake3_checksum: vec![0x33; 32],
+                    applied_log_id: None,
+                },
+            ))];
+            frames.push(encode_frame(&RecoveryExportFrameV1::Chunk(
+                RecoveryExportChunkWireV1 {
+                    offset: 0,
+                    data: Vec::new(),
+                    final_chunk: false,
+                },
+            )));
+            frames
         }
         ("recovery_export", StreamMode::ExportOversizedChunk) => {
             // An honest, in-bounds manifest — followed by one chunk a full
@@ -1183,6 +1205,29 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
         "the nested validator names the fault: {err}"
     );
 
+    // The wedge-prevention rule (§10): a request the group could only
+    // status-deny is refused before journaling — and because nothing was
+    // journaled, the client is immediately free for the next mutation
+    // rather than permanently resending impossible bytes.
+    let shapeless = within(
+        "a shapeless acquire",
+        client.acquire(
+            aster::coordination::contract::ResourceKeyV1 {
+                namespace: "NOT A NAMESPACE".into(),
+                key: b"k".to_vec(),
+            },
+            60_000,
+        ),
+    )
+    .await;
+    let Err(err) = shapeless else {
+        panic!("an invalid namespace must be refused before journaling")
+    };
+    assert!(
+        format!("{err}").contains("namespace"),
+        "the refusal names the grammar: {err}"
+    );
+
     // Honest stamps: the same journaled request now resolves — the earlier
     // refusals were the boundary's, not some other fault's.
     *foreign.protocol_version.lock().expect("stamp") =
@@ -1462,6 +1507,29 @@ async fn stream_contracts_are_enforced_at_the_boundary() {
         panic!("a result no apply path produces must be refused")
     };
     assert!(format!("{err}").contains("cannot record"), "{err}");
+
+    // A chunk that makes no progress — empty and non-final, a frame that
+    // exists only to reset idle timers — is refused at the first one.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::EmptyChunkDrip;
+    let drip = within("empty-chunk drip", reads.recovery_export()).await;
+    let Err(err) = drip else {
+        panic!("a no-progress chunk must be refused")
+    };
+    assert!(format!("{err}").contains("no progress"), "{err}");
+
+    // The §5.2 audit cap is the client's own: zero and above the hard cap
+    // are refused before a byte is sent.
+    for bad_limit in [0u32, 10_001] {
+        let refused = within(
+            "out-of-cap audit limit",
+            reads.audit_stream(None, bad_limit),
+        )
+        .await;
+        let Err(err) = refused else {
+            panic!("limit {bad_limit} must be refused client-side")
+        };
+        assert!(format!("{err}").contains("limit"), "{err}");
+    }
 
     // A peer that accepts either stream and then parks — neither data nor
     // trailer — is cut off at the frame deadline instead of hanging the

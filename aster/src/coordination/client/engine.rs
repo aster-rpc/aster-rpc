@@ -42,6 +42,14 @@ use crate::rpc::{RpcConnection, StreamHeader};
 /// How long one attempt may wait for the peer before it is ambiguous.
 const ATTEMPT_DEADLINE: Duration = Duration::from_secs(20);
 
+/// The **absolute** budget for one whole stream attempt (§5.2's streams are
+/// bounded operator surfaces: at most `MAX_AUDIT_STREAM_LIMIT` audit rows,
+/// or a §11.4-bounded export). The per-frame idle timeout alone is not a
+/// deadline — a peer dripping one small frame every nineteen seconds would
+/// hold the future forever while never going idle. Sixty seconds admits any
+/// plausibly healthy stream and terminates every drip.
+const STREAM_DEADLINE: Duration = Duration::from_secs(60);
+
 /// What one routed call produced.
 #[derive(Debug)]
 pub(crate) enum CallOutcome {
@@ -298,7 +306,7 @@ impl Engine {
             match opened {
                 Ok(Ok(response)) => {
                     *self.current.lock().await = Some((member, conn));
-                    return Ok(Ok(BoundedFrames { inner: response }));
+                    return Ok(Ok(BoundedFrames::new(response)));
                 }
                 Ok(Err(Error::Rpc {
                     code: 14, details, ..
@@ -333,14 +341,34 @@ impl Engine {
 /// caller re-issues the read like any other ambiguous stream failure.
 pub(crate) struct BoundedFrames {
     inner: crate::rpc::ResponseStream,
+    /// One absolute deadline for the whole attempt, fixed at the open.
+    deadline: tokio::time::Instant,
 }
 
 impl BoundedFrames {
+    fn new(inner: crate::rpc::ResponseStream) -> Self {
+        Self {
+            inner,
+            deadline: tokio::time::Instant::now() + STREAM_DEADLINE,
+        }
+    }
+
     pub(crate) async fn next(&mut self) -> Option<crate::Result<Vec<u8>>> {
-        match tokio::time::timeout(ATTEMPT_DEADLINE, self.inner.next()).await {
+        // Each wait is the shorter of the idle bound and what remains of the
+        // absolute budget — so a stalled peer is cut off within the idle
+        // bound, and a dripping one within the absolute one.
+        let remaining = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Some(Err(crate::error::Error::Transport(anyhow::anyhow!(
+                "the stream did not complete within {STREAM_DEADLINE:?}"
+            ))));
+        }
+        match tokio::time::timeout(ATTEMPT_DEADLINE.min(remaining), self.inner.next()).await {
             Ok(frame) => frame,
             Err(_) => Some(Err(crate::error::Error::Transport(anyhow::anyhow!(
-                "the stream produced no frame within {ATTEMPT_DEADLINE:?}"
+                "the stream produced no frame within its deadline"
             )))),
         }
     }
