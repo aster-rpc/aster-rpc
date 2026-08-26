@@ -872,13 +872,12 @@ fn apply_retire(
 /// (§5.2), so 10 is the code the contract retains for it. An earlier revision
 /// invented 12, which is outside the 1-11 range the contract declares.
 pub const OPERATION_RETIRE_CLIENT: i32 = 10;
-/// System `Expire` (§5.2).
-pub const OPERATION_EXPIRE: i32 = 100;
-/// `MembershipProgress` (§5.2).
-pub const OPERATION_MEMBERSHIP_PROGRESS: i32 = 101;
-
-/// The committed signed genesis (§7.1).
-pub const OPERATION_GENESIS: i32 = 102;
+/// The system operation codes are contract surface — both audit readers key
+/// their result-space decisions off them — so they are declared in
+/// `contract` and re-exported here for the apply-side call sites.
+pub use crate::coordination::contract::{
+    OPERATION_EXPIRE, OPERATION_GENESIS, OPERATION_MEMBERSHIP_PROGRESS,
+};
 
 /// Whether an operation code names a **system** command.
 ///
@@ -1684,6 +1683,7 @@ mod tests {
     fn oversized_value() -> Action {
         Action::Resource(ResourceAction::CompareAndSet {
             fence: Fence {
+                group: [0u8; 32],
                 resource: raw(),
                 epoch: 1,
                 holder: ACTOR,
@@ -2115,6 +2115,7 @@ mod tests {
             &client(1),
             &Action::Resource(ResourceAction::CompareAndSet {
                 fence: Fence {
+                    group: [0u8; 32],
                     resource: raw(),
                     epoch: 1,
                     holder: ACTOR,
@@ -2152,6 +2153,7 @@ mod tests {
 
         let first_cas = Action::Resource(ResourceAction::CompareAndSet {
             fence: Fence {
+                group: [0u8; 32],
                 resource: raw(),
                 epoch: 1,
                 holder: ACTOR,
@@ -2161,6 +2163,7 @@ mod tests {
         });
         let second_cas = Action::Resource(ResourceAction::CompareAndSet {
             fence: Fence {
+                group: [0u8; 32],
                 resource: raw(),
                 epoch: 1,
                 holder: ACTOR,
@@ -2510,6 +2513,7 @@ mod tests {
                 held_state(),
                 Action::Resource(ResourceAction::CompareAndSet {
                     fence: Fence {
+                        group: [0u8; 32],
                         resource: raw(),
                         epoch: 1,
                         holder: ACTOR,
@@ -3064,6 +3068,7 @@ mod tests {
                 0 => acquire(),
                 1 => Action::Resource(ResourceAction::CompareAndSet {
                     fence: Fence {
+                        group: [0u8; 32],
                         resource: raw(),
                         epoch,
                         holder: ACTOR,
@@ -3073,6 +3078,7 @@ mod tests {
                 }),
                 2 => Action::Resource(ResourceAction::Renew {
                     fence: Fence {
+                        group: [0u8; 32],
                         resource: raw(),
                         epoch,
                         holder: ACTOR,
@@ -3080,6 +3086,7 @@ mod tests {
                 }),
                 _ => Action::Resource(ResourceAction::Release {
                     fence: Fence {
+                        group: [0u8; 32],
                         resource: raw(),
                         epoch,
                         holder: ACTOR,

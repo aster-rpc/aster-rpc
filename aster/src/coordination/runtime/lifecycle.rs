@@ -141,6 +141,20 @@ pub(crate) enum FatalCause {
     IdentityMismatch(String),
 }
 
+impl FatalCause {
+    /// The §5.2 `fatal_code` projection: one nonzero code per variant (`0`
+    /// on the wire means "not fatal" and is never a variant's code). The
+    /// authoritative declaration the client's restated domain is pinned to.
+    pub(crate) fn code(&self) -> i32 {
+        match self {
+            FatalCause::Storage(_) => 1,
+            FatalCause::Raft(_) => 2,
+            FatalCause::ProfileViolation { .. } => 3,
+            FatalCause::IdentityMismatch(_) => 4,
+        }
+    }
+}
+
 impl std::fmt::Display for FatalCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

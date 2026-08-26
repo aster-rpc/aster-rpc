@@ -219,6 +219,7 @@ fn step(state: &State, n: u64) -> Command {
     };
 
     let fence = Fence {
+        group: crate::coordination::model::authority::testing::authority().group_id,
         resource: raw(resource),
         epoch,
         holder,
@@ -1582,6 +1583,7 @@ fn renew_and_expire_resolve_by_log_order() {
             },
             action: Action::Resource(ResourceAction::Renew {
                 fence: Fence {
+                    group: crate::coordination::model::authority::testing::authority().group_id,
                     resource: raw(0),
                     epoch: held.epoch,
                     holder: ALICE,
@@ -1639,6 +1641,7 @@ fn renew_and_expire_resolve_by_log_order() {
             },
             action: Action::Resource(ResourceAction::Renew {
                 fence: Fence {
+                    group: crate::coordination::model::authority::testing::authority().group_id,
                     resource: raw(0),
                     epoch: held.epoch,
                     holder: ALICE,

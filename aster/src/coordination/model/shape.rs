@@ -102,6 +102,10 @@ shape_limits! {
     MemberSeedJoinPermit => "a signed join permit exceeds its limit",
     /// A `Vec<u8>` node id that is not exactly 32 bytes.
     NodeIdWidth => "a node id is not 32 bytes",
+    /// A fence's group id is not exactly 32 bytes. Its own limit rather than
+    /// `NodeIdWidth`: the §4.1 recovery invariant hangs off this field, and a
+    /// diagnostic that misnames it sends an operator to check the wrong id.
+    FenceGroupWidth => "a fence group id is not 32 bytes",
     /// A `Vec<u8>` client or operation id that is not exactly 16 bytes.
     ClientIdWidth => "a client or operation id is not 16 bytes",
     /// A `request_hash` that is not exactly 32 bytes.
@@ -410,7 +414,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ShapeLimit::ALL.len());
-        assert_eq!(ShapeLimit::ALL.len(), 23, "update this count with the enum");
+        assert_eq!(ShapeLimit::ALL.len(), 24, "update this count with the enum");
         // Every variant has its own description; a shared one would make two
         // different failures read identically in a status message.
         let mut descriptions: Vec<_> = ShapeLimit::ALL.iter().map(|l| l.describe()).collect();

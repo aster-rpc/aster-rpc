@@ -44,9 +44,10 @@
 //! sizes — live at the consuming loops in `client::mod`, bounded by
 //! `wire::MAX_EXPORT_CHUNK_BYTES`.
 
-use crate::coordination::contract::{LogIdV1, ResourceKeyV1, ResourceSnapshotV1};
-use crate::coordination::model::limits::rights_are_known;
+use crate::coordination::contract::{FenceV1, LogIdV1, ResourceKeyV1, ResourceSnapshotV1};
+use crate::coordination::model::limits::{rights_are_known, MAX_COUNTER, MAX_VALUE};
 use crate::coordination::reason::{Outcome, Reason};
+use crate::coordination::store::methods::{spec, MutationKind};
 use crate::coordination::store::wire::{
     AclStatusReplyWireV1, AclStatusRequestV1, AcquireRequestV1, AdminStatusReplyWireV1,
     AdminStatusRequestV1, AuditRecordWireV1, CancelMembershipRequestV1, ChangeMembershipRequestV1,
@@ -55,7 +56,7 @@ use crate::coordination::store::wire::{
     ProbeClientReplyWireV1, ProbeClientRequestV1, ReadReplyWireV1, ReadRequestV1,
     RecoveryExportManifestWireV1, RecoveryExportRequestV1, ReleaseRequestV1,
     ReleaseWithValueRequestV1, RenewRequestV1, RetireClientReplyWireV1, RetireClientRequestV1,
-    RevokeRequestV1, SetGrantRequestV1, STORE_PROTOCOL_VERSION,
+    RevokeRequestV1, SetAdminRequestV1, SetGrantRequestV1, STORE_PROTOCOL_VERSION,
 };
 
 /// What a mutation reply must be validated **against**: the entry it claims
@@ -82,46 +83,244 @@ where
         .map_err(|_| "the pending request no longer decodes as its method's type".to_string())
 }
 
-/// The resource the pending request names, for snapshot correlation.
-/// `None` for the methods whose replies carry no resource snapshot.
-fn expected_resource(method: &str, request: &[u8]) -> Result<Option<ResourceKeyV1>, String> {
-    Ok(match method {
-        "acquire" => Some(decode::<AcquireRequestV1>(request)?.resource),
-        "renew" => Some(decode::<RenewRequestV1>(request)?.fence.resource),
-        "compare_and_set" => Some(decode::<CompareAndSetRequestV1>(request)?.fence.resource),
-        "release" => Some(decode::<ReleaseRequestV1>(request)?.fence.resource),
-        "release_with_value" => Some(decode::<ReleaseWithValueRequestV1>(request)?.fence.resource),
-        "revoke" => Some(decode::<RevokeRequestV1>(request)?.resource),
-        "set_grant" => Some(decode::<SetGrantRequestV1>(request)?.resource),
-        "set_admin" | "change_membership" | "cancel_membership" => None,
-        other => return Err(format!("'{other}' is not a sequenced mutation method")),
+/// The decoded facts of one pending request — everything its reply must be
+/// correlated against, per method. Decoding is driven by the §5.2 method
+/// table's [`MutationKind`] column, so a method the table does not classify
+/// as a sequenced mutation cannot be validated at all, and a new variant is
+/// a compile error in the exhaustive matches below.
+pub(crate) enum RequestFacts {
+    Acquire {
+        resource: ResourceKeyV1,
+        ttl_ms: u64,
+    },
+    Renew {
+        fence: FenceV1,
+    },
+    CompareAndSet {
+        fence: FenceV1,
+        expected_value_revision: u64,
+        new_value_len: usize,
+    },
+    Release {
+        fence: FenceV1,
+    },
+    ReleaseWithValue {
+        fence: FenceV1,
+        expected_value_revision: u64,
+        final_value_len: usize,
+    },
+    Revoke {
+        resource: ResourceKeyV1,
+        expected_epoch: Option<u64>,
+    },
+    SetGrant {
+        resource: ResourceKeyV1,
+        target_node_id: Vec<u8>,
+        rights: u64,
+        expected_acl_revision: u64,
+    },
+    SetAdmin {
+        target_node_id: Vec<u8>,
+        expected_admin_revision: u64,
+    },
+    ChangeMembership {
+        operation_id: Vec<u8>,
+    },
+    CancelMembership {
+        operation_id: Vec<u8>,
+    },
+}
+
+impl RequestFacts {
+    /// The §5.2 mutation this request is.
+    fn kind(&self) -> MutationKind {
+        match self {
+            RequestFacts::Acquire { .. } => MutationKind::Acquire,
+            RequestFacts::Renew { .. } => MutationKind::Renew,
+            RequestFacts::CompareAndSet { .. } => MutationKind::CompareAndSet,
+            RequestFacts::Release { .. } => MutationKind::Release,
+            RequestFacts::ReleaseWithValue { .. } => MutationKind::ReleaseWithValue,
+            RequestFacts::Revoke { .. } => MutationKind::Revoke,
+            RequestFacts::SetGrant { .. } => MutationKind::SetGrant,
+            RequestFacts::SetAdmin { .. } => MutationKind::SetAdmin,
+            RequestFacts::ChangeMembership { .. } => MutationKind::ChangeMembership,
+            RequestFacts::CancelMembership { .. } => MutationKind::CancelMembership,
+        }
+    }
+
+    /// The resource this request names, for snapshot correlation. `None` for
+    /// the methods whose replies carry no resource snapshot.
+    fn resource(&self) -> Option<&ResourceKeyV1> {
+        match self {
+            RequestFacts::Acquire { resource, .. }
+            | RequestFacts::Revoke { resource, .. }
+            | RequestFacts::SetGrant { resource, .. } => Some(resource),
+            RequestFacts::Renew { fence }
+            | RequestFacts::CompareAndSet { fence, .. }
+            | RequestFacts::Release { fence }
+            | RequestFacts::ReleaseWithValue { fence, .. } => Some(&fence.resource),
+            RequestFacts::SetAdmin { .. }
+            | RequestFacts::ChangeMembership { .. }
+            | RequestFacts::CancelMembership { .. } => None,
+        }
+    }
+
+    /// The fence this request presents, if it is a fenced operation.
+    fn fence(&self) -> Option<&FenceV1> {
+        match self {
+            RequestFacts::Renew { fence }
+            | RequestFacts::CompareAndSet { fence, .. }
+            | RequestFacts::Release { fence }
+            | RequestFacts::ReleaseWithValue { fence, .. } => Some(fence),
+            _ => None,
+        }
+    }
+
+    /// The operation id a membership success must echo.
+    fn operation_id(&self) -> Option<&[u8]> {
+        match self {
+            RequestFacts::ChangeMembership { operation_id }
+            | RequestFacts::CancelMembership { operation_id } => Some(operation_id),
+            _ => None,
+        }
+    }
+}
+
+/// Decode one pending request per the §5.2 method table.
+pub(crate) fn decode_facts(method: &str, request: &[u8]) -> Result<RequestFacts, String> {
+    let Some(kind) = spec(method).and_then(|m| m.mutation) else {
+        return Err(format!("'{method}' is not a sequenced mutation method"));
+    };
+    Ok(match kind {
+        MutationKind::Acquire => {
+            let r = decode::<AcquireRequestV1>(request)?;
+            RequestFacts::Acquire {
+                resource: r.resource,
+                ttl_ms: r.ttl_ms,
+            }
+        }
+        MutationKind::Renew => RequestFacts::Renew {
+            fence: decode::<RenewRequestV1>(request)?.fence,
+        },
+        MutationKind::CompareAndSet => {
+            let r = decode::<CompareAndSetRequestV1>(request)?;
+            RequestFacts::CompareAndSet {
+                fence: r.fence,
+                expected_value_revision: r.expected_value_revision,
+                new_value_len: r.new_value.len(),
+            }
+        }
+        MutationKind::Release => RequestFacts::Release {
+            fence: decode::<ReleaseRequestV1>(request)?.fence,
+        },
+        MutationKind::ReleaseWithValue => {
+            let r = decode::<ReleaseWithValueRequestV1>(request)?;
+            RequestFacts::ReleaseWithValue {
+                fence: r.fence,
+                expected_value_revision: r.expected_value_revision,
+                final_value_len: r.final_value.len(),
+            }
+        }
+        MutationKind::Revoke => {
+            let r = decode::<RevokeRequestV1>(request)?;
+            RequestFacts::Revoke {
+                resource: r.resource,
+                expected_epoch: r.expected_epoch,
+            }
+        }
+        MutationKind::SetGrant => {
+            let r = decode::<SetGrantRequestV1>(request)?;
+            RequestFacts::SetGrant {
+                resource: r.resource,
+                target_node_id: r.target_node_id,
+                rights: r.rights,
+                expected_acl_revision: r.expected_acl_revision,
+            }
+        }
+        MutationKind::SetAdmin => {
+            let r = decode::<SetAdminRequestV1>(request)?;
+            RequestFacts::SetAdmin {
+                target_node_id: r.target_node_id,
+                expected_admin_revision: r.expected_admin_revision,
+            }
+        }
+        MutationKind::ChangeMembership => RequestFacts::ChangeMembership {
+            operation_id: decode::<ChangeMembershipRequestV1>(request)?.operation_id,
+        },
+        MutationKind::CancelMembership => RequestFacts::CancelMembership {
+            operation_id: decode::<CancelMembershipRequestV1>(request)?.operation_id,
+        },
     })
 }
 
-/// The operation id the pending request names — the one a membership
-/// success must echo. `None` for every non-membership method.
-fn expected_operation_id(method: &str, request: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    Ok(match method {
-        "change_membership" => Some(decode::<ChangeMembershipRequestV1>(request)?.operation_id),
-        "cancel_membership" => Some(decode::<CancelMembershipRequestV1>(request)?.operation_id),
-        _ => None,
-    })
-}
-
-/// The one success outcome each sequenced mutation may report.
-fn method_success(method: &str) -> Result<Outcome, String> {
-    Ok(match method {
-        "acquire" => Outcome::Granted,
-        "renew" => Outcome::Renewed,
-        "compare_and_set" => Outcome::Mutated,
-        "release" | "release_with_value" => Outcome::Released,
-        "revoke" => Outcome::Revoked,
-        "set_grant" => Outcome::GrantUpdated,
-        "set_admin" => Outcome::AdminUpdated,
-        "change_membership" => Outcome::MembershipAccepted,
-        "cancel_membership" => Outcome::MembershipCancelled,
-        other => return Err(format!("'{other}' is not a sequenced mutation method")),
-    })
+/// The **outbound** half of the per-method specification: is this a request
+/// the client may send at all? §12.1 leaf bounds, and the two facts no reply
+/// can repair — a fence must name this client's group (a fence minted
+/// elsewhere is §4.1-invalid and the request could only burn a sequence),
+/// and a fence's holder must be this actor, because §9.1 makes every fenced
+/// operation a holder's operation and a success against another holder's
+/// fence is a reply this client must never accept.
+pub(crate) fn validate_request(
+    group_id: &[u8],
+    local_actor: &[u8],
+    facts: &RequestFacts,
+) -> Result<(), String> {
+    if let Some(resource) = facts.resource() {
+        crate::coordination::store::wire::resource_bounds(resource)
+            .map_err(|invalid| invalid.describe())?;
+    }
+    if let Some(fence) = facts.fence() {
+        if fence.group_id != group_id {
+            return Err("the fence names another coordination group".to_string());
+        }
+        if fence.holder != local_actor {
+            return Err("the fence's holder is not this client's actor".to_string());
+        }
+    }
+    match facts {
+        RequestFacts::Acquire { ttl_ms, .. } => {
+            crate::coordination::store::wire::ttl_bounds(*ttl_ms)
+                .map_err(|invalid| invalid.describe())?;
+        }
+        RequestFacts::CompareAndSet { new_value_len, .. } => {
+            if *new_value_len > MAX_VALUE {
+                return Err("the new value exceeds the §12.1 bound".to_string());
+            }
+        }
+        RequestFacts::ReleaseWithValue {
+            final_value_len, ..
+        } => {
+            if *final_value_len > MAX_VALUE {
+                return Err("the final value exceeds the §12.1 bound".to_string());
+            }
+        }
+        RequestFacts::SetGrant {
+            target_node_id,
+            rights,
+            ..
+        } => {
+            if target_node_id.len() != 32 {
+                return Err("the grant target is not a 32-byte node id".to_string());
+            }
+            if !rights_are_known(*rights) {
+                return Err("the rights carry a bit v1 does not define".to_string());
+            }
+        }
+        RequestFacts::SetAdmin { target_node_id, .. } => {
+            if target_node_id.len() != 32 {
+                return Err("the admin target is not a 32-byte node id".to_string());
+            }
+        }
+        RequestFacts::ChangeMembership { operation_id }
+        | RequestFacts::CancelMembership { operation_id } => {
+            if operation_id.len() != 16 {
+                return Err("the operation id is not 16 bytes".to_string());
+            }
+        }
+        RequestFacts::Renew { .. } | RequestFacts::Release { .. } | RequestFacts::Revoke { .. } => {
+        }
+    }
+    Ok(())
 }
 
 fn check_log_id(what: &str, id: &LogIdV1) -> Result<(), String> {
@@ -214,10 +413,11 @@ pub(crate) fn validate_mutation_reply(
         }
     }
 
-    // Method correlation: this method's success, a rejection, or the
-    // tombstone's ClientRetired refusal — nothing else.
-    let success = method_success(cx.method)?;
-    if outcome != success && outcome != Outcome::Rejected {
+    // Method correlation, from the §5.2 method table: this method's success
+    // or a rejection — nothing else.
+    let facts = decode_facts(cx.method, cx.request)?;
+    let success_code = facts.kind().success_outcome_code();
+    if reply.outcome_code != success_code && outcome != Outcome::Rejected {
         return Err(format!(
             "outcome {} does not answer method '{}'",
             reply.outcome_code, cx.method
@@ -255,7 +455,7 @@ pub(crate) fn validate_mutation_reply(
     }
 
     if let Some(snapshot) = &reply.snapshot {
-        validate_snapshot(cx, outcome, snapshot)?;
+        validate_snapshot(cx, &facts, outcome, snapshot)?;
     }
 
     // Auxiliary fields are method-correlated, not merely well-formed
@@ -274,9 +474,10 @@ pub(crate) fn validate_mutation_reply(
                     reply.outcome_code
                 ));
             }
-            let expected = expected_operation_id(cx.method, cx.request)?
+            let expected = facts
+                .operation_id()
                 .ok_or_else(|| "a membership success must echo an operation id".to_string())?;
-            if *op != expected {
+            if op != expected {
                 return Err("the reply's operation id does not echo the request".to_string());
             }
         }
@@ -298,12 +499,25 @@ pub(crate) fn validate_mutation_reply(
     if let Some(id) = &reply.membership_log_id {
         check_log_id("the reply's membership log id", id)?;
     }
-    // `admin_revision`: the new committed revision on AdminUpdated, the
+    // `admin_revision`: correlated to the request on AdminUpdated — apply
+    // fences on `expected_admin_revision`, so a success reports either the
+    // advanced revision or, for a no-op, the expected one it echoed — the
     // observed revision on a rejection, and `0` everywhere else.
     match outcome {
         Outcome::AdminUpdated => {
-            if reply.admin_revision == 0 {
-                return Err("an AdminUpdated reply must report the committed revision".to_string());
+            let RequestFacts::SetAdmin {
+                expected_admin_revision,
+                ..
+            } = &facts
+            else {
+                return Err("outcome 7 answers only set_admin".to_string());
+            };
+            if reply.admin_revision != *expected_admin_revision
+                && reply.admin_revision != expected_admin_revision + 1
+            {
+                return Err(
+                    "an AdminUpdated revision does not follow from the request's fence".to_string(),
+                );
             }
         }
         Outcome::Rejected => {}
@@ -318,7 +532,9 @@ pub(crate) fn validate_mutation_reply(
     }
     // `acl_revision`: apply copies it from the same row the snapshot was
     // taken from, so the two never disagree; without a snapshot it is the
-    // grant echo (GrantUpdated) or `0`.
+    // grant echo (GrantUpdated) or `0`. A GrantUpdated additionally follows
+    // from the request's `expected_acl_revision` fence: the advanced
+    // revision, or the echoed one for a no-op re-issue.
     match (&reply.snapshot, outcome) {
         (Some(snapshot), _) => {
             if reply.acl_revision != snapshot.acl_revision {
@@ -335,36 +551,40 @@ pub(crate) fn validate_mutation_reply(
             }
         }
     }
+    if outcome == Outcome::GrantUpdated {
+        let RequestFacts::SetGrant {
+            expected_acl_revision,
+            ..
+        } = &facts
+        else {
+            return Err("outcome 6 answers only set_grant".to_string());
+        };
+        if reply.acl_revision != *expected_acl_revision
+            && reply.acl_revision != expected_acl_revision + 1
+        {
+            return Err("a GrantUpdated revision does not follow from the request".to_string());
+        }
+    }
     Ok(())
 }
 
-/// The nested snapshot: identity echoed from the request, and facts that
-/// cannot contradict themselves or the outcome that carried them.
+/// The nested snapshot: identity echoed from the request, §12.1 leaf
+/// bounds, and the §9.1 postconditions of the outcome that carried it.
 fn validate_snapshot(
     cx: &MutationContext<'_>,
+    facts: &RequestFacts,
     outcome: Outcome,
     snapshot: &ResourceSnapshotV1,
 ) -> Result<(), String> {
     if snapshot.group_id != cx.group_id {
         return Err("the snapshot names another coordination group".to_string());
     }
-    if let Some(expected) = expected_resource(cx.method, cx.request)? {
-        if snapshot.resource != expected {
+    if let Some(expected) = facts.resource() {
+        if snapshot.resource != *expected {
             return Err("the snapshot names another resource than the request".to_string());
         }
     }
-    match &snapshot.holder {
-        Some(holder) if holder.len() != 32 => {
-            return Err("the snapshot's holder is not a 32-byte node id".to_string());
-        }
-        _ => {}
-    }
-    if snapshot.held != snapshot.holder.is_some() {
-        return Err("the snapshot's held flag contradicts its holder".to_string());
-    }
-    if snapshot.value_redacted && snapshot.value.is_some() {
-        return Err("a redacted value cannot carry bytes".to_string());
-    }
+    check_snapshot_bounds(snapshot)?;
     // Outcome-specific facts: a grant/renewal/write this client committed
     // is held by this client; a release/revoke ends with a free row.
     match outcome {
@@ -383,6 +603,129 @@ fn validate_snapshot(
             ));
         }
         _ => {}
+    }
+    // The §9.1 success postconditions, correlated to the decoded request.
+    // Each is a fact apply's transition arithmetic guarantees, so a success
+    // that violates one is a reply no honest apply produced — an acquire
+    // granted at a TTL apply can never set, a CAS whose value revision did
+    // not advance from the request's expectation, a release that left the
+    // fenced epoch unbumped.
+    if outcome.code() == facts.kind().success_outcome_code() {
+        match facts {
+            RequestFacts::Acquire { ttl_ms, .. } => {
+                if snapshot.ttl_ms != *ttl_ms {
+                    return Err("a grant's TTL must equal the requested TTL".to_string());
+                }
+                if snapshot.epoch == 0 || snapshot.lease_revision == 0 {
+                    return Err("a grant advances the epoch and lease revision".to_string());
+                }
+            }
+            RequestFacts::Renew { fence } => {
+                if snapshot.epoch != fence.epoch {
+                    return Err("a renewal never moves the fenced epoch".to_string());
+                }
+            }
+            RequestFacts::CompareAndSet {
+                fence,
+                expected_value_revision,
+                ..
+            } => {
+                if snapshot.epoch != fence.epoch {
+                    return Err("a write never moves the fenced epoch".to_string());
+                }
+                if snapshot.value_revision != expected_value_revision + 1 {
+                    return Err(
+                        "a write advances the value revision from the request's expectation"
+                            .to_string(),
+                    );
+                }
+            }
+            RequestFacts::Release { fence } => {
+                if snapshot.epoch != fence.epoch + 1 {
+                    return Err("a release advances the fenced epoch by one".to_string());
+                }
+            }
+            RequestFacts::ReleaseWithValue {
+                fence,
+                expected_value_revision,
+                ..
+            } => {
+                if snapshot.epoch != fence.epoch + 1 {
+                    return Err("a release advances the fenced epoch by one".to_string());
+                }
+                if snapshot.value_revision != expected_value_revision + 1 {
+                    return Err(
+                        "a write advances the value revision from the request's expectation"
+                            .to_string(),
+                    );
+                }
+            }
+            RequestFacts::Revoke { expected_epoch, .. } => match expected_epoch {
+                Some(expected) => {
+                    if snapshot.epoch != expected + 1 {
+                        return Err(
+                            "a fenced revoke advances the expected epoch by one".to_string()
+                        );
+                    }
+                }
+                None => {
+                    if snapshot.epoch == 0 {
+                        return Err("a revoke advances the epoch".to_string());
+                    }
+                }
+            },
+            RequestFacts::SetGrant { .. }
+            | RequestFacts::SetAdmin { .. }
+            | RequestFacts::ChangeMembership { .. }
+            | RequestFacts::CancelMembership { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// The §12.1 leaf bounds every snapshot obeys, mutation and read alike: a
+/// snapshot naming an out-of-bounds identity, an oversized value, a TTL no
+/// grant can set, an exhausted counter, or a self-contradictory hold is not
+/// a projection of any legal row.
+fn check_snapshot_bounds(snapshot: &ResourceSnapshotV1) -> Result<(), String> {
+    crate::coordination::store::wire::resource_bounds(&snapshot.resource)
+        .map_err(|invalid| invalid.describe())?;
+    match &snapshot.holder {
+        Some(holder) if holder.len() != 32 => {
+            return Err("the snapshot's holder is not a 32-byte node id".to_string());
+        }
+        _ => {}
+    }
+    if snapshot.held != snapshot.holder.is_some() {
+        return Err("the snapshot's held flag contradicts its holder".to_string());
+    }
+    if snapshot.value_redacted && snapshot.value.is_some() {
+        return Err("a redacted value cannot carry bytes".to_string());
+    }
+    if let Some(value) = &snapshot.value {
+        if value.len() > MAX_VALUE {
+            return Err("the snapshot's value exceeds the §12.1 bound".to_string());
+        }
+    }
+    // A held row's TTL was set by a bounds-checked grant; an unheld row
+    // retains its last TTL or the never-written zero.
+    if snapshot.held {
+        crate::coordination::store::wire::ttl_bounds(snapshot.ttl_ms)
+            .map_err(|invalid| invalid.describe())?;
+    } else if snapshot.ttl_ms != 0
+        && crate::coordination::store::wire::ttl_bounds(snapshot.ttl_ms).is_err()
+    {
+        return Err("the snapshot's TTL is outside the §12.1 bounds".to_string());
+    }
+    for (what, counter) in [
+        ("epoch", snapshot.epoch),
+        ("lease revision", snapshot.lease_revision),
+        ("value revision", snapshot.value_revision),
+        ("ACL revision", snapshot.acl_revision),
+    ] {
+        if counter > MAX_COUNTER {
+            return Err(format!("the snapshot's {what} is past the counter ceiling"));
+        }
     }
     Ok(())
 }
@@ -439,13 +782,6 @@ mod domains {
     pub(super) const PHASE: std::ops::RangeInclusive<i32> = 1..=7;
     /// The §7.3 phases that may carry a completion result code.
     pub(super) const PHASE_TERMINAL: [i32; 3] = [4, 5, 7];
-    /// §5.2 audit operation codes: 1–11 the mutation methods, 100 `Expire`,
-    /// 101 `MembershipProgress`, 102 the committed genesis installation.
-    pub(super) fn audit_operation(code: i32) -> bool {
-        (1..=11).contains(&code) || (100..=102).contains(&code)
-    }
-    /// §5.3 system result codes: 1–8.
-    pub(super) const SYSTEM_RESULT: std::ops::RangeInclusive<i32> = 1..=8;
 }
 
 fn check_sorted_unique_32(what: &str, ids: &[Vec<u8>]) -> Result<(), String> {
@@ -462,19 +798,7 @@ fn check_read_snapshot(group_id: &[u8], snapshot: &ResourceSnapshotV1) -> Result
     if snapshot.group_id != group_id {
         return Err("the snapshot names another coordination group".to_string());
     }
-    match &snapshot.holder {
-        Some(holder) if holder.len() != 32 => {
-            return Err("the snapshot's holder is not a 32-byte node id".to_string());
-        }
-        _ => {}
-    }
-    if snapshot.held != snapshot.holder.is_some() {
-        return Err("the snapshot's held flag contradicts its holder".to_string());
-    }
-    if snapshot.value_redacted && snapshot.value.is_some() {
-        return Err("a redacted value cannot carry bytes".to_string());
-    }
-    Ok(())
+    check_snapshot_bounds(snapshot)
 }
 
 /// Request-aware validity for one typed reply, run after the outer
@@ -739,25 +1063,22 @@ pub(crate) fn validate_audit_record(record: &AuditRecordWireV1) -> Result<(), St
             return Err("the audit record names a malformed actor".to_string());
         }
     }
-    if !domains::audit_operation(record.operation_code) {
+    // The exact §5.2 operation × result pairing, from the one shared table
+    // (`contract::audit_results_for`) the durable-state validator also
+    // reads. Not merely the code space: an acquire recording
+    // `MembershipAccepted` is in the right space and is still a result no
+    // apply path produces.
+    let Some(allowed) = crate::coordination::contract::audit_results_for(record.operation_code)
+    else {
         return Err(format!(
             "operation code {} is not a §5.2 audit operation",
             record.operation_code
         ));
-    }
-    // The result code space follows the operation family: a client command
-    // records its public outcome, a system command its declared result.
-    if record.operation_code <= 11 {
-        if Outcome::from_code(record.result_code).is_none() {
-            return Err(format!(
-                "a client operation cannot record result {}",
-                record.result_code
-            ));
-        }
-    } else if !domains::SYSTEM_RESULT.contains(&record.result_code) {
+    };
+    if !allowed.contains(&record.result_code) {
         return Err(format!(
-            "a system operation cannot record result {}",
-            record.result_code
+            "operation {} cannot record result {}",
+            record.operation_code, record.result_code
         ));
     }
     if let Some(resource) = &record.resource {
@@ -829,6 +1150,42 @@ mod domain_tests {
             domains::PROFILE
         );
 
+        // Role and fatal domains, against their declarations.
+        use crate::coordination::runtime::lifecycle::{FatalCause, LocalRole};
+        for (role, code) in [
+            (LocalRole::None, 0),
+            (LocalRole::Learner, 1),
+            (LocalRole::Voter, 2),
+        ] {
+            assert_eq!(role.code(), code);
+            assert!(domains::ROLE.contains(&code));
+        }
+        assert_eq!(domains::ROLE, 0..=2);
+        let causes = [
+            FatalCause::Storage(String::new()),
+            FatalCause::Raft(String::new()),
+            FatalCause::ProfileViolation {
+                profile: 1,
+                voters: 0,
+            },
+            FatalCause::IdentityMismatch(String::new()),
+        ];
+        for cause in &causes {
+            assert!(
+                domains::FATAL.contains(&cause.code()) && cause.code() != 0,
+                "{cause:?}"
+            );
+        }
+        assert_eq!(
+            *domains::FATAL.end(),
+            causes
+                .iter()
+                .map(|cause| cause.code())
+                .max()
+                .expect("codes"),
+            "the fatal domain ends at the last declared cause"
+        );
+
         let phases = [
             m::PHASE_PENDING,
             m::PHASE_ADDING_LEARNERS,
@@ -853,7 +1210,6 @@ mod tests {
     use crate::coordination::contract::{payload_fory, FenceV1, NodeIdV1};
     use crate::coordination::store::wire::{
         AclGrantWireV1, AclSnapshotWireV1, AdminSnapshotWireV1, AuditStreamRequestV1,
-        SetAdminRequestV1,
     };
 
     const GROUP: [u8; 32] = [0xAA; 32];
@@ -893,42 +1249,126 @@ mod tests {
         payload_fory::<T>().serialize(value).expect("encodes")
     }
 
-    fn acquire_request() -> Vec<u8> {
-        encode(&AcquireRequestV1 {
-            protocol_version: STORE_PROTOCOL_VERSION,
+    fn prefix() -> (i32, Vec<u8>, Vec<u8>, u64) {
+        (STORE_PROTOCOL_VERSION, GROUP.to_vec(), CLIENT.to_vec(), 1)
+    }
+
+    fn fence_v1() -> FenceV1 {
+        FenceV1 {
             group_id: GROUP.to_vec(),
-            client_id: CLIENT.to_vec(),
-            sequence: 1,
             resource: resource(),
-            ttl_ms: 30_000,
-        })
+            epoch: 1,
+            holder: ACTOR.to_vec(),
+        }
     }
 
-    fn change_membership_request() -> Vec<u8> {
-        encode(&ChangeMembershipRequestV1 {
-            protocol_version: STORE_PROTOCOL_VERSION,
-            group_id: GROUP.to_vec(),
-            client_id: CLIENT.to_vec(),
-            sequence: 1,
-            operation_id: OP.to_vec(),
-            expected_membership_log_id: None,
-            desired_voters: Vec::new(),
-            retained_learners: Vec::new(),
-            ..Default::default()
-        })
+    /// One well-formed request per sequenced method — the pending frames the
+    /// matrix decodes and correlates against.
+    fn sequenced_request(method: &str) -> Vec<u8> {
+        let (protocol_version, group_id, client_id, sequence) = prefix();
+        match method {
+            "acquire" => encode(&AcquireRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                resource: resource(),
+                ttl_ms: 30_000,
+            }),
+            "renew" => encode(&RenewRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                fence: fence_v1(),
+            }),
+            "compare_and_set" => encode(&CompareAndSetRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                fence: fence_v1(),
+                expected_value_revision: 0,
+                new_value: b"v".to_vec(),
+            }),
+            "release" => encode(&ReleaseRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                fence: fence_v1(),
+            }),
+            "release_with_value" => encode(&ReleaseWithValueRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                fence: fence_v1(),
+                expected_value_revision: 0,
+                final_value: Vec::new(),
+            }),
+            "revoke" => encode(&RevokeRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                resource: resource(),
+                expected_epoch: Some(1),
+            }),
+            "set_grant" => encode(&SetGrantRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                resource: resource(),
+                target_node_id: OTHER.to_vec(),
+                rights: 0x01,
+                expected_acl_revision: 3,
+            }),
+            "set_admin" => encode(&SetAdminRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                target_node_id: OTHER.to_vec(),
+                enabled: true,
+                expected_admin_revision: 1,
+            }),
+            "change_membership" => encode(&ChangeMembershipRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                operation_id: OP.to_vec(),
+                expected_membership_log_id: None,
+                desired_voters: Vec::new(),
+                retained_learners: Vec::new(),
+                ..Default::default()
+            }),
+            "cancel_membership" => encode(&CancelMembershipRequestV1 {
+                protocol_version,
+                group_id,
+                client_id,
+                sequence,
+                operation_id: OP.to_vec(),
+                expected_phase_code: 1,
+            }),
+            other => panic!("{other} is not a sequenced method"),
+        }
     }
 
-    fn set_admin_request() -> Vec<u8> {
-        encode(&SetAdminRequestV1 {
-            protocol_version: STORE_PROTOCOL_VERSION,
-            group_id: GROUP.to_vec(),
-            client_id: CLIENT.to_vec(),
-            sequence: 1,
-            target_node_id: OTHER.to_vec(),
-            enabled: true,
-            expected_admin_revision: 1,
-        })
-    }
+    const SEQUENCED: [&str; 10] = [
+        "acquire",
+        "renew",
+        "compare_and_set",
+        "release",
+        "release_with_value",
+        "revoke",
+        "set_grant",
+        "set_admin",
+        "change_membership",
+        "cancel_membership",
+    ];
 
     fn cx<'a>(method: &'a str, request: &'a [u8]) -> MutationContext<'a> {
         MutationContext {
@@ -980,9 +1420,10 @@ mod tests {
         }
     }
 
-    /// A structurally legal reply for the triple, so the matrix verdict is
-    /// about the **pair rules**, never about a missing snapshot or a stray
-    /// auxiliary field.
+    /// A reply satisfying the **method's own** §9.1 success postconditions
+    /// when the triple is that method's success, and the rejection shape
+    /// otherwise — so the matrix verdict is about the pair and correlation
+    /// rules, never about a missing snapshot or a stray auxiliary field.
     fn well_shaped(
         method: &str,
         disposition: i32,
@@ -990,20 +1431,59 @@ mod tests {
         reason: i32,
     ) -> MutationReplyWireV1 {
         let mut reply = owned_reply(disposition, outcome, reason);
-        match outcome {
-            1..=3 => {
-                reply.snapshot = Some(held_snapshot());
-                reply.acl_revision = 3;
+        let success = spec(method)
+            .and_then(|m| m.mutation)
+            .expect("a sequenced method")
+            .success_outcome_code();
+        if outcome == success {
+            match method {
+                "acquire" => {
+                    reply.snapshot = Some(held_snapshot());
+                    reply.acl_revision = 3;
+                }
+                "renew" => {
+                    reply.snapshot = Some(held_snapshot());
+                    reply.acl_revision = 3;
+                }
+                "compare_and_set" => {
+                    reply.snapshot = Some(ResourceSnapshotV1 {
+                        value_revision: 1,
+                        ..held_snapshot()
+                    });
+                    reply.acl_revision = 3;
+                }
+                "release" => {
+                    reply.snapshot = Some(ResourceSnapshotV1 {
+                        epoch: 2,
+                        ..free_snapshot()
+                    });
+                    reply.acl_revision = 3;
+                }
+                "release_with_value" => {
+                    reply.snapshot = Some(ResourceSnapshotV1 {
+                        epoch: 2,
+                        value_revision: 1,
+                        ..free_snapshot()
+                    });
+                    reply.acl_revision = 3;
+                }
+                "revoke" => {
+                    reply.snapshot = Some(ResourceSnapshotV1 {
+                        epoch: 2,
+                        ..free_snapshot()
+                    });
+                    reply.acl_revision = 3;
+                }
+                "set_grant" => {
+                    reply.snapshot = Some(free_snapshot());
+                    reply.acl_revision = 3;
+                }
+                "set_admin" => reply.admin_revision = 2,
+                "change_membership" | "cancel_membership" => {
+                    reply.operation_id = Some(OP.to_vec());
+                }
+                other => panic!("{other} is not a sequenced method"),
             }
-            4..=6 => {
-                reply.snapshot = Some(free_snapshot());
-                reply.acl_revision = 3;
-            }
-            7 => reply.admin_revision = 2,
-            8 | 10 if method == "change_membership" || method == "cancel_membership" => {
-                reply.operation_id = Some(OP.to_vec());
-            }
-            _ => {}
         }
         reply
     }
@@ -1013,27 +1493,33 @@ mod tests {
     /// acquire entry, each row's verdict from the quoted spec lists alone.
     #[test]
     fn the_mutation_pair_matrix_is_exhaustive() {
-        let request = acquire_request();
-        for disposition in [0, 1, 2, 3] {
-            for outcome in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 99, 100] {
-                for reason in (0..=27).chain([-1, 20]) {
-                    let legal = match (disposition, outcome, reason) {
-                        // The method's one success, Consumed, no reason.
-                        (1, 1, 0) => true,
-                        // §10.1 shapeless, saved conflicts and refusals.
-                        (1, 100, 0) => true,
-                        (1, 100, r) => SAVED.contains(&r),
-                        // Pre-write answers.
-                        (2, 100, r) => NOT_CONSUMED.contains(&r),
-                        _ => false,
-                    };
-                    let reply = well_shaped("acquire", disposition, outcome, reason);
-                    let verdict = validate_mutation_reply(&cx("acquire", &request), &reply);
-                    assert_eq!(
-                        verdict.is_ok(),
-                        legal,
-                        "({disposition}, {outcome}, {reason}) on acquire: {verdict:?}"
-                    );
+        for method in SEQUENCED {
+            let request = sequenced_request(method);
+            let success = spec(method)
+                .and_then(|m| m.mutation)
+                .expect("a sequenced method")
+                .success_outcome_code();
+            for disposition in [0, 1, 2, 3] {
+                for outcome in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 99, 100] {
+                    for reason in (0..=27).chain([-1, 20]) {
+                        let legal = match (disposition, outcome, reason) {
+                            // The method's one success, Consumed, no reason.
+                            (1, o, 0) if o == success => true,
+                            // §10.1 shapeless, saved conflicts and refusals.
+                            (1, 100, 0) => true,
+                            (1, 100, r) => SAVED.contains(&r),
+                            // Pre-write answers.
+                            (2, 100, r) => NOT_CONSUMED.contains(&r),
+                            _ => false,
+                        };
+                        let reply = well_shaped(method, disposition, outcome, reason);
+                        let verdict = validate_mutation_reply(&cx(method, &request), &reply);
+                        assert_eq!(
+                            verdict.is_ok(),
+                            legal,
+                            "({disposition}, {outcome}, {reason}) on {method}: {verdict:?}"
+                        );
+                    }
                 }
             }
         }
@@ -1044,7 +1530,7 @@ mod tests {
     /// would advance the journal past a sequence the group still expects.
     #[test]
     fn a_consumed_active_client_cap_is_refused() {
-        let request = acquire_request();
+        let request = sequenced_request("acquire");
         let reply = well_shaped("acquire", 1, 100, 21);
         let why = validate_mutation_reply(&cx("acquire", &request), &reply)
             .expect_err("Consumed + ActiveClientCap");
@@ -1060,9 +1546,9 @@ mod tests {
     /// refused, and the legal decorations pass.
     #[test]
     fn auxiliary_fields_follow_their_reply_family() {
-        let acquire = acquire_request();
-        let change = change_membership_request();
-        let admin = set_admin_request();
+        let acquire = sequenced_request("acquire");
+        let change = sequenced_request("change_membership");
+        let admin = sequenced_request("set_admin");
 
         // A grant dressed with a membership operation id.
         let mut reply = well_shaped("acquire", 1, 1, 0);
@@ -1566,8 +2052,156 @@ mod tests {
         refused("a malformed checksum", &request, checksum);
     }
 
+    /// **The §9.1 success postconditions, per method** — each deformation is
+    /// a success apply's transition arithmetic can never produce, refused
+    /// against the decoded request even though the reply is otherwise
+    /// perfectly shaped.
+    #[test]
+    fn impossible_successes_are_refused_per_method() {
+        type Deform = Box<dyn Fn(&mut MutationReplyWireV1)>;
+        let deformations: Vec<(&str, Deform)> = vec![
+            (
+                "acquire",
+                Box::new(|r| r.snapshot.as_mut().expect("snapshot").ttl_ms = 60_000),
+            ),
+            (
+                "acquire",
+                Box::new(|r| {
+                    let s = r.snapshot.as_mut().expect("snapshot");
+                    s.epoch = 0;
+                }),
+            ),
+            (
+                "renew",
+                Box::new(|r| r.snapshot.as_mut().expect("snapshot").epoch = 2),
+            ),
+            (
+                "compare_and_set",
+                Box::new(|r| r.snapshot.as_mut().expect("snapshot").value_revision = 5),
+            ),
+            (
+                "compare_and_set",
+                Box::new(|r| r.snapshot.as_mut().expect("snapshot").epoch = 2),
+            ),
+            (
+                "release",
+                Box::new(|r| r.snapshot.as_mut().expect("snapshot").epoch = 1),
+            ),
+            (
+                "release_with_value",
+                Box::new(|r| r.snapshot.as_mut().expect("snapshot").value_revision = 9),
+            ),
+            (
+                "revoke",
+                Box::new(|r| r.snapshot.as_mut().expect("snapshot").epoch = 7),
+            ),
+            (
+                "set_grant",
+                Box::new(|r| {
+                    // Coherent with its snapshot, so only the request's
+                    // revision fence can refuse it.
+                    r.acl_revision = 9;
+                    r.snapshot.as_mut().expect("snapshot").acl_revision = 9;
+                }),
+            ),
+            ("set_admin", Box::new(|r| r.admin_revision = 9)),
+        ];
+        for (method, deform) in &deformations {
+            let request = sequenced_request(method);
+            let success = spec(method)
+                .and_then(|m| m.mutation)
+                .expect("a sequenced method")
+                .success_outcome_code();
+            let mut reply = well_shaped(method, 1, success, 0);
+            assert!(
+                validate_mutation_reply(&cx(method, &request), &reply).is_ok(),
+                "{method}: the well-shaped success is the baseline"
+            );
+            deform(&mut reply);
+            assert!(
+                validate_mutation_reply(&cx(method, &request), &reply).is_err(),
+                "{method}: an impossible success must be refused"
+            );
+        }
+    }
+
+    /// The §12.1 leaf bounds on every snapshot: oversized values, illegal
+    /// TTLs on held rows, exhausted counters, out-of-bounds identities.
+    #[test]
+    fn snapshot_leaf_bounds_are_enforced() {
+        let request = sequenced_request("acquire");
+        let base = || well_shaped("acquire", 1, 1, 0);
+
+        let mut oversized = base();
+        oversized.snapshot.as_mut().expect("snapshot").value = Some(vec![0u8; MAX_VALUE + 1]);
+        assert!(validate_mutation_reply(&cx("acquire", &request), &oversized).is_err());
+
+        let mut exhausted = base();
+        exhausted
+            .snapshot
+            .as_mut()
+            .expect("snapshot")
+            .lease_revision = MAX_COUNTER + 1;
+        assert!(validate_mutation_reply(&cx("acquire", &request), &exhausted).is_err());
+
+        let mut bad_key = base();
+        bad_key
+            .snapshot
+            .as_mut()
+            .expect("snapshot")
+            .resource
+            .namespace = String::new();
+        assert!(validate_mutation_reply(&cx("acquire", &request), &bad_key).is_err());
+    }
+
+    /// **The outbound half**: requests the client must refuse to send at
+    /// all — an out-of-bounds TTL apply can never grant, a fence naming
+    /// another group (§4.1) or another actor's hold.
+    #[test]
+    fn illegal_requests_are_refused_before_sending() {
+        let ok = decode_facts("acquire", &sequenced_request("acquire")).expect("decodes");
+        assert!(validate_request(&GROUP, &ACTOR, &ok).is_ok());
+
+        let short_ttl = RequestFacts::Acquire {
+            resource: resource(),
+            ttl_ms: 1,
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &short_ttl).is_err());
+
+        let foreign_fence = RequestFacts::Renew {
+            fence: FenceV1 {
+                group_id: vec![0xEE; 32],
+                ..fence_v1()
+            },
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &foreign_fence).is_err());
+
+        let anothers_fence = RequestFacts::Renew {
+            fence: FenceV1 {
+                holder: OTHER.to_vec(),
+                ..fence_v1()
+            },
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &anothers_fence).is_err());
+
+        let oversized = RequestFacts::CompareAndSet {
+            fence: fence_v1(),
+            expected_value_revision: 0,
+            new_value_len: MAX_VALUE + 1,
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &oversized).is_err());
+
+        let unknown_rights = RequestFacts::SetGrant {
+            resource: resource(),
+            target_node_id: OTHER.to_vec(),
+            rights: u64::MAX,
+            expected_acl_revision: 0,
+        };
+        assert!(validate_request(&GROUP, &ACTOR, &unknown_rights).is_err());
+    }
+
     /// The renew/fence request family decodes for correlation too — one
-    /// spot-check that `expected_resource` reads through the fence.
+    /// spot-check that resource correlation reads through the fence.
     #[test]
     fn correlation_reads_through_a_fence() {
         let renew = encode(&RenewRequestV1 {

@@ -73,9 +73,18 @@ impl From<&ResourceKey> for RawResourceKey {
     }
 }
 
-/// A lease fence: the resource, the epoch it was granted at, and the holder.
+/// A lease fence: the group that minted it, the resource, the epoch it was
+/// granted at, and the holder.
+///
+/// The group id is load-bearing, not descriptive. §4.1's recovery invariant:
+/// "all fences include the group id so a fence from a disaster-recovery
+/// replacement group is invalid even if its numeric epoch is the same." A
+/// fence type without the group made that invariant unenforceable — the
+/// outer request's group says where the request is *addressed*, never where
+/// the fence was *minted*.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fence {
+    pub group: [u8; 32],
     pub resource: RawResourceKey,
     pub epoch: u64,
     pub holder: NodeId,
@@ -116,6 +125,17 @@ pub enum ResourceAction {
 }
 
 impl ResourceAction {
+    /// The fence this action presents, if it is a fenced operation.
+    pub fn fence(&self) -> Option<&Fence> {
+        match self {
+            ResourceAction::Renew { fence }
+            | ResourceAction::CompareAndSet { fence, .. }
+            | ResourceAction::Release { fence }
+            | ResourceAction::ReleaseWithValue { fence, .. } => Some(fence),
+            ResourceAction::Acquire { .. } | ResourceAction::Revoke { .. } => None,
+        }
+    }
+
     /// The raw, still-unvalidated resource this action names.
     pub fn raw_resource(&self) -> &RawResourceKey {
         match self {
@@ -278,6 +298,19 @@ pub fn decide(state: &State, actor: &NodeId, action: &ResourceAction) -> Decisio
     let needed = required_rights(action);
     if granted_rights(state, &key, actor) & needed != needed {
         return Decision::Refuse(RefusalReason::PermissionChanged);
+    }
+
+    // §4.1's recovery invariant, enforced where every voter can see it: a
+    // fence names the group that minted it, and a fence minted by another
+    // group -- a disaster-recovery replacement's, for instance -- is not this
+    // group's lease at any epoch, even when resource, holder and epoch all
+    // coincide. `EpochMismatch` is exact: no epoch of this group ever
+    // validates that fence, and the recovery -- re-read, then re-acquire --
+    // is the stale-fence recovery.
+    if let Some(fence) = action.fence() {
+        if fence.group != state.authority.group_id {
+            return Decision::Refuse(RefusalReason::EpochMismatch);
+        }
     }
 
     match action {
@@ -619,9 +652,85 @@ mod tests {
 
     fn fence(epoch: u64, holder: NodeId) -> Fence {
         Fence {
+            // The test states are `State::default()`-rooted, so their
+            // authority group is the zero id; a fence naming it is this
+            // group's own.
+            group: [0u8; 32],
             resource: raw(),
             epoch,
             holder,
+        }
+    }
+
+    /// **§4.1's recovery invariant, at the replicated decision** — the frozen
+    /// sentence: "all fences include the group id so a fence from a
+    /// disaster-recovery replacement group is invalid even if its numeric
+    /// epoch is the same."
+    ///
+    /// Two groups, coincident rows: the same resource, held by the same
+    /// actor, at the same epoch — everything the pre-group fence check ever
+    /// compared. A fence minted by group A must be refused by group B on
+    /// **every** fenced operation, while the identical fence naming B's own
+    /// group applies. `EpochMismatch` is the reported reason: no epoch of B
+    /// ever validates A's fence, and the recovery — re-read, re-acquire — is
+    /// the stale-fence recovery.
+    #[test]
+    fn a_fence_minted_by_another_group_is_refused_on_every_fenced_operation() {
+        const GROUP_A: [u8; 32] = [0xA1; 32];
+        const GROUP_B: [u8; 32] = [0xB2; 32];
+
+        let mut group_b = with_row(state_with_rights(HOLDER, ALL_RIGHTS), held_row(HOLDER, 7));
+        group_b.authority.group_id = GROUP_B;
+
+        let minted_by = |group: [u8; 32]| Fence {
+            group,
+            resource: raw(),
+            epoch: 7,
+            holder: HOLDER,
+        };
+
+        type Build = Box<dyn Fn(Fence) -> ResourceAction>;
+        let operations: Vec<(&str, Build)> = vec![
+            ("renew", Box::new(|fence| ResourceAction::Renew { fence })),
+            (
+                "compare_and_set",
+                Box::new(|fence| ResourceAction::CompareAndSet {
+                    fence,
+                    expected_value_revision: 0,
+                    new_value: b"v".to_vec(),
+                }),
+            ),
+            (
+                "release",
+                Box::new(|fence| ResourceAction::Release { fence }),
+            ),
+            (
+                "release_with_value",
+                Box::new(|fence| ResourceAction::ReleaseWithValue {
+                    fence,
+                    expected_value_revision: 0,
+                    final_value: Vec::new(),
+                }),
+            ),
+        ];
+
+        for (name, build) in &operations {
+            // The foreign fence: resource, holder and epoch all coincide with
+            // B's row — only the minting group differs.
+            let decision = decide(&group_b, &HOLDER, &build(minted_by(GROUP_A)));
+            assert_eq!(
+                decision,
+                Decision::Refuse(RefusalReason::EpochMismatch),
+                "{name}: a fence minted by another group must be refused"
+            );
+
+            // And the same fence naming B's own group applies, so the refusal
+            // above is the group's doing and nothing else's.
+            let own = decide(&group_b, &HOLDER, &build(minted_by(GROUP_B)));
+            assert!(
+                matches!(own, Decision::Apply(_)),
+                "{name}: the same fence minted by this group applies: {own:?}"
+            );
         }
     }
 

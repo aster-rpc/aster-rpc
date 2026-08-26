@@ -968,6 +968,20 @@ mod tests {
             .expect("a reply encodes")
     }
 
+    fn set_admin_request(client_id: [u8; 16], sequence: u64) -> Vec<u8> {
+        payload_fory::<crate::coordination::store::wire::SetAdminRequestV1>()
+            .serialize(&crate::coordination::store::wire::SetAdminRequestV1 {
+                protocol_version: crate::coordination::store::wire::STORE_PROTOCOL_VERSION,
+                group_id: group().as_bytes().to_vec(),
+                client_id: client_id.to_vec(),
+                sequence,
+                target_node_id: vec![0x0D; 32],
+                enabled: true,
+                expected_admin_revision: 1,
+            })
+            .expect("the request encodes")
+    }
+
     /// An entry-owned terminal refusal: `NotConsumed` with a Section 10
     /// terminal reason, as the closing corridor requires of its opener.
     fn refusal_bytes_for(client_id: [u8; 16], sequence: u64, request_hash: [u8; 32]) -> Vec<u8> {
@@ -1058,7 +1072,7 @@ mod tests {
         {
             let mut journal = open(dir.path());
             journal
-                .begin(1, "set_admin", b"refused-request".to_vec(), [0x44; 32])
+                .begin(1, "set_admin", set_admin_request(CLIENT_A, 1), [0x44; 32])
                 .expect("begin");
             journal
                 .close_for_retirement(refusal_bytes_for(CLIENT_A, 1, [0x44; 32]))
@@ -1075,7 +1089,7 @@ mod tests {
             );
             assert_eq!(
                 journal.record().pending_request,
-                b"refused-request",
+                set_admin_request(CLIENT_A, 1).as_slice(),
                 "the replay step still needs the exact bytes"
             );
         }
@@ -1737,7 +1751,7 @@ mod tests {
             .expect("resolve 1");
         journal.acknowledge(&token).expect("ack 1");
         journal
-            .begin(2, "set_admin", b"second".to_vec(), [0x72; 32])
+            .begin(2, "set_admin", set_admin_request(CLIENT_A, 2), [0x72; 32])
             .expect("begin 2");
         journal
             .close_for_retirement(refusal_bytes_for(CLIENT_A, 2, [0x72; 32]))

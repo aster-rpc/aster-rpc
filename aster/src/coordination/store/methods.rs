@@ -53,6 +53,44 @@ pub enum Permission {
     ActorOrAdministrator,
 }
 
+/// Which sequenced mutation a method is — the column that lets the client's
+/// request/reply validator decode and correlate without a method-name match
+/// of its own. `None` for every non-sequenced method.
+///
+/// One variant per §5.2 sequenced mutation, so adding a twentieth method (or
+/// renaming one) forces a decision here — and the client validator, which
+/// matches this enum exhaustively, fails to compile until it handles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationKind {
+    Acquire,
+    Renew,
+    CompareAndSet,
+    Release,
+    ReleaseWithValue,
+    Revoke,
+    SetGrant,
+    SetAdmin,
+    ChangeMembership,
+    CancelMembership,
+}
+
+impl MutationKind {
+    /// The §5.2 outcome code this method's success reports.
+    pub fn success_outcome_code(self) -> i32 {
+        match self {
+            MutationKind::Acquire => 1,
+            MutationKind::Renew => 2,
+            MutationKind::CompareAndSet => 3,
+            MutationKind::Release | MutationKind::ReleaseWithValue => 4,
+            MutationKind::Revoke => 5,
+            MutationKind::SetGrant => 6,
+            MutationKind::SetAdmin => 7,
+            MutationKind::ChangeMembership => 8,
+            MutationKind::CancelMembership => 10,
+        }
+    }
+}
+
 /// One row of the §5.2 method table.
 #[derive(Clone, Copy, Debug)]
 pub struct MethodSpec {
@@ -65,6 +103,9 @@ pub struct MethodSpec {
     pub class: Class,
     /// The committed permission it requires.
     pub permission: Permission,
+    /// Which sequenced mutation this is, for the client's request-aware
+    /// validation. `None` exactly when `class` is not `SequencedMutation`.
+    pub mutation: Option<MutationKind>,
 }
 
 /// The nineteen §5.2 methods, in the frozen table's order.
@@ -74,114 +115,133 @@ pub const METHODS: &[MethodSpec] = &[
         code: 1,
         class: Class::SequencedMutation,
         permission: Permission::Resource(RIGHT_ACQUIRE),
+        mutation: Some(MutationKind::Acquire),
     },
     MethodSpec {
         name: "renew",
         code: 2,
         class: Class::SequencedMutation,
         permission: Permission::HolderPlus(RIGHT_RENEW),
+        mutation: Some(MutationKind::Renew),
     },
     MethodSpec {
         name: "read_linearizable",
         code: 0,
         class: Class::LinearizableRead,
         permission: Permission::Resource(RIGHT_READ),
+        mutation: None,
     },
     MethodSpec {
         name: "compare_and_set",
         code: 3,
         class: Class::SequencedMutation,
         permission: Permission::HolderPlus(RIGHT_MUTATE),
+        mutation: Some(MutationKind::CompareAndSet),
     },
     MethodSpec {
         name: "release",
         code: 4,
         class: Class::SequencedMutation,
         permission: Permission::HolderPlus(RIGHT_RELEASE),
+        mutation: Some(MutationKind::Release),
     },
     MethodSpec {
         name: "release_with_value",
         code: 5,
         class: Class::SequencedMutation,
         permission: Permission::HolderPlus(RIGHT_RELEASE | RIGHT_MUTATE),
+        mutation: Some(MutationKind::ReleaseWithValue),
     },
     MethodSpec {
         name: "revoke",
         code: 6,
         class: Class::SequencedMutation,
         permission: Permission::Resource(RIGHT_REVOKE),
+        mutation: Some(MutationKind::Revoke),
     },
     MethodSpec {
         name: "set_grant",
         code: 7,
         class: Class::SequencedMutation,
         permission: Permission::Administrator,
+        mutation: Some(MutationKind::SetGrant),
     },
     MethodSpec {
         name: "set_admin",
         code: 8,
         class: Class::SequencedMutation,
         permission: Permission::Administrator,
+        mutation: Some(MutationKind::SetAdmin),
     },
     MethodSpec {
         name: "change_membership",
         code: 9,
         class: Class::SequencedMutation,
         permission: Permission::Administrator,
+        mutation: Some(MutationKind::ChangeMembership),
     },
     MethodSpec {
         name: "cancel_membership",
         code: 11,
         class: Class::SequencedMutation,
         permission: Permission::Administrator,
+        mutation: Some(MutationKind::CancelMembership),
     },
     MethodSpec {
         name: "membership_status",
         code: 0,
         class: Class::LinearizableRead,
         permission: Permission::Administrator,
+        mutation: None,
     },
     MethodSpec {
         name: "inspect_acl",
         code: 0,
         class: Class::LinearizableRead,
         permission: Permission::Administrator,
+        mutation: None,
     },
     MethodSpec {
         name: "inspect_admins",
         code: 0,
         class: Class::LinearizableRead,
         permission: Permission::Administrator,
+        mutation: None,
     },
     MethodSpec {
         name: "retire_client",
         code: 10,
         class: Class::SessionlessMutation,
         permission: Permission::ActorOrAdministrator,
+        mutation: None,
     },
     MethodSpec {
         name: "probe_client",
         code: 0,
         class: Class::LinearizableRead,
         permission: Permission::ActorOrAdministrator,
+        mutation: None,
     },
     MethodSpec {
         name: "group_status",
         code: 0,
         class: Class::StatusCut,
         permission: Permission::Administrator,
+        mutation: None,
     },
     MethodSpec {
         name: "audit_stream",
         code: 0,
         class: Class::Stream,
         permission: Permission::Administrator,
+        mutation: None,
     },
     MethodSpec {
         name: "recovery_export",
         code: 0,
         class: Class::Stream,
         permission: Permission::Administrator,
+        mutation: None,
     },
 ];
 
@@ -194,6 +254,45 @@ pub fn spec(name: &str) -> Option<&'static MethodSpec> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The `mutation` column exists exactly on the sequenced rows, and each
+    /// kind's method code is the row's — so the client validator, which
+    /// derives everything from this table, cannot disagree with the router
+    /// about what a method is.
+    #[test]
+    fn the_mutation_column_matches_the_class_and_codes() {
+        for m in METHODS {
+            assert_eq!(
+                m.mutation.is_some(),
+                m.class == Class::SequencedMutation,
+                "{}",
+                m.name
+            );
+            if let Some(kind) = m.mutation {
+                let expected_code = match kind {
+                    MutationKind::Acquire => 1,
+                    MutationKind::Renew => 2,
+                    MutationKind::CompareAndSet => 3,
+                    MutationKind::Release => 4,
+                    MutationKind::ReleaseWithValue => 5,
+                    MutationKind::Revoke => 6,
+                    MutationKind::SetGrant => 7,
+                    MutationKind::SetAdmin => 8,
+                    MutationKind::ChangeMembership => 9,
+                    MutationKind::CancelMembership => 11,
+                };
+                assert_eq!(m.code, expected_code, "{}", m.name);
+            }
+        }
+        // The frozen success-outcome column, quoted from §5.2 rather than
+        // derived: both release variants report Released.
+        let successes: Vec<i32> = METHODS
+            .iter()
+            .filter_map(|m| m.mutation)
+            .map(MutationKind::success_outcome_code)
+            .collect();
+        assert_eq!(successes, vec![1, 2, 3, 4, 4, 5, 6, 7, 8, 10]);
+    }
 
     /// The S4-A gate: the classification's method set equals
     /// `service::STORE_METHODS` **as a set** — and both equal the nineteen

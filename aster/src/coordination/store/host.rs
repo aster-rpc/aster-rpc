@@ -1877,23 +1877,11 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
             .collect(),
         pending_operation_id: pending,
         quorum_available: view.quorum_available,
-        fatal_code: view.fatal.as_ref().map_or(0, fatal_code_of),
+        fatal_code: view.fatal.as_ref().map_or(0, |cause| cause.code()),
         audit_floor,
         genesis_hash,
     };
     respond_reply(call, reply).await;
-}
-
-/// The §5.2 `fatal_code` projection: `0` not fatal, then one code per
-/// [`FatalCause`] variant. Advisory, like every local field it rides with.
-fn fatal_code_of(cause: &crate::coordination::runtime::lifecycle::FatalCause) -> i32 {
-    use crate::coordination::runtime::lifecycle::FatalCause;
-    match cause {
-        FatalCause::Storage(_) => 1,
-        FatalCause::Raft(_) => 2,
-        FatalCause::ProfileViolation { .. } => 3,
-        FatalCause::IdentityMismatch(_) => 4,
-    }
 }
 
 // ── audit_stream ────────────────────────────────────────────────────────────

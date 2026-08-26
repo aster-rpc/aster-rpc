@@ -310,6 +310,17 @@ impl CoordinationClient {
     ) -> Result<ResolvedMutation> {
         let request_hash = hash::request_hash(action)
             .map_err(|_| client_error("the action has no canonical hash"))?;
+        // The outbound half of the per-method specification, before anything
+        // is journaled: §12.1 leaf bounds, and a fence that names this
+        // client's group and actor — a fence minted elsewhere is §4.1-invalid
+        // and sending it could only burn a sequence on a guaranteed refusal.
+        let facts = inbound::decode_facts(method, &request).map_err(client_error)?;
+        inbound::validate_request(
+            self.engine.group.as_bytes(),
+            &self.engine.local_id()?,
+            &facts,
+        )
+        .map_err(client_error)?;
         let mut journal = self.journal.lock().await;
         match journal.state() {
             JournalState::Ready => {

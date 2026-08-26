@@ -796,6 +796,51 @@ pub const SYS_GENESIS_INSTALLED: i32 = 7;
 /// group is a disagreement no voter can resolve locally.
 pub const SYS_GENESIS_ALREADY_INSTALLED: i32 = 8;
 
+/// The §5.2 audit operation codes for the three system commands. Declared
+/// here — the contract surface both graphs compile — rather than in the
+/// voter-only apply module, because the audit *readers* on both sides key
+/// their result-space decisions off them.
+pub const OPERATION_EXPIRE: i32 = 100;
+pub const OPERATION_MEMBERSHIP_PROGRESS: i32 = 101;
+pub const OPERATION_GENESIS: i32 = 102;
+
+/// **The exact §5.2 audit operation × result table** — the one answer to
+/// "which results can this operation record", shared by the durable-state
+/// validator and the client's inbound boundary so the two readers cannot
+/// hold different oracles. `None` for an operation §5.2 does not declare.
+///
+/// The exact pairing, not merely the code space: `Expire` reporting
+/// `SYS_MEMBERSHIP_MALFORMED`, or `Acquire` reporting `MembershipAccepted`,
+/// are both in the right space and describe results no apply path produces.
+pub fn audit_results_for(operation_code: i32) -> Option<&'static [i32]> {
+    use crate::coordination::reason::Outcome;
+    const REJECTED: i32 = Outcome::Rejected as i32;
+    Some(match operation_code {
+        1 => &[Outcome::Granted as i32, REJECTED],
+        2 => &[Outcome::Renewed as i32, REJECTED],
+        3 => &[Outcome::Mutated as i32, REJECTED],
+        // Release and release-with-value share an outcome; they differ in
+        // what they write, not in what they report.
+        4 | 5 => &[Outcome::Released as i32, REJECTED],
+        6 => &[Outcome::Revoked as i32, REJECTED],
+        7 => &[Outcome::GrantUpdated as i32, REJECTED],
+        8 => &[Outcome::AdminUpdated as i32, REJECTED],
+        9 => &[Outcome::MembershipAccepted as i32, REJECTED],
+        10 => &[Outcome::ClientRetired as i32, REJECTED],
+        11 => &[Outcome::MembershipCancelled as i32, REJECTED],
+        OPERATION_EXPIRE => &[SYS_EXPIRED, SYS_EXPIRY_STALE, SYS_EXPIRE_MALFORMED],
+        OPERATION_MEMBERSHIP_PROGRESS => &[
+            SYS_MEMBERSHIP_ADVANCED,
+            SYS_MEMBERSHIP_PHASE_MISMATCH,
+            SYS_MEMBERSHIP_MALFORMED,
+        ],
+        // Two results and no rejection: a genesis that does not verify is
+        // fatal before any row is written, so no audit row can record one.
+        OPERATION_GENESIS => &[SYS_GENESIS_INSTALLED, SYS_GENESIS_ALREADY_INSTALLED],
+        _ => return None,
+    })
+}
+
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/ClientReply")]
 pub struct ClientReplyV1 {

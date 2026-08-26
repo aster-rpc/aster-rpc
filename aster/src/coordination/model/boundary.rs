@@ -69,6 +69,11 @@ fn raw_key(k: &crate::coordination::contract::ResourceKeyV1) -> RawResourceKey {
 
 fn fence(f: &crate::coordination::contract::FenceV1) -> Result<Fence, NarrowError> {
     Ok(Fence {
+        group: f
+            .group_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| NarrowError::MalformedField(ShapeLimit::FenceGroupWidth))?,
         resource: raw_key(&f.resource),
         epoch: f.epoch,
         holder: node_id(&f.holder)?,
@@ -1450,7 +1455,10 @@ mod tests {
 
     fn fence_wire() -> crate::coordination::contract::FenceV1 {
         crate::coordination::contract::FenceV1 {
-            group_id: GROUP.to_vec(),
+            // The 32-byte group the test states are bound to
+            // (`authority::testing::authority()`), not the 16-byte outer
+            // echo: a fence names the group that minted it.
+            group_id: vec![0xAB; 32],
             resource: wire_key(),
             epoch: 1,
             holder: ACTOR.to_vec(),

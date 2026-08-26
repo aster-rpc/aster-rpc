@@ -242,19 +242,21 @@ impl Engine {
         }
     }
 
-    /// Open a server stream and hand back the live frame source once a member
-    /// accepts it.
+    /// Open a server stream and hand back a **deadline-bounded** frame
+    /// source once a member accepts it.
     ///
-    /// The same routing walk as [`stream`](Self::stream) up to the open;
-    /// unlike it, the frames are *not* collected, so the caller consumes them
-    /// incrementally and a mid-stream failure surfaces to the caller instead
-    /// of being retried here. A Store stream is a read: re-issuing the whole
-    /// call is always safe, so the caller loses nothing but the walk.
+    /// The same routing walk as [`unary`](Self::unary) up to the open; the
+    /// frames are not collected, so the caller consumes them incrementally
+    /// and a mid-stream failure surfaces to the caller instead of being
+    /// retried here. A Store stream is a read: re-issuing the whole call is
+    /// always safe, so the caller loses nothing but the walk. Every frame
+    /// wait is bounded by [`BoundedFrames`] — a peer that accepts the stream
+    /// and then sends neither data nor trailer parks nothing.
     pub(crate) async fn open_stream(
         &self,
         method: &str,
         request: Vec<u8>,
-    ) -> Result<Result<crate::rpc::ResponseStream, (i32, String)>, CallFailure> {
+    ) -> Result<Result<BoundedFrames, (i32, String)>, CallFailure> {
         let cap = self.candidates().await.len() + 2;
         let mut hops = 0usize;
         let mut tried: BTreeSet<[u8; 32]> = BTreeSet::new();
@@ -296,7 +298,7 @@ impl Engine {
             match opened {
                 Ok(Ok(response)) => {
                     *self.current.lock().await = Some((member, conn));
-                    return Ok(Ok(response));
+                    return Ok(Ok(BoundedFrames { inner: response }));
                 }
                 Ok(Err(Error::Rpc {
                     code: 14, details, ..
@@ -316,6 +318,30 @@ impl Engine {
                 Ok(Err(Error::Rpc { code, message, .. })) => return Ok(Err((code, message))),
                 Ok(Err(_)) | Err(_) => continue,
             }
+        }
+    }
+}
+
+/// A server stream whose every frame wait is bounded by the attempt
+/// deadline.
+///
+/// The open is deadline-bounded by the routing walk, but a stream is frames:
+/// a peer that accepts and then parks — neither data nor trailer — would
+/// otherwise hang the public future forever, since the transport's own
+/// `next()` has no timeout. Each `next` here waits at most
+/// [`ATTEMPT_DEADLINE`] and then reports the stall as a transport error; the
+/// caller re-issues the read like any other ambiguous stream failure.
+pub(crate) struct BoundedFrames {
+    inner: crate::rpc::ResponseStream,
+}
+
+impl BoundedFrames {
+    pub(crate) async fn next(&mut self) -> Option<crate::Result<Vec<u8>>> {
+        match tokio::time::timeout(ATTEMPT_DEADLINE, self.inner.next()).await {
+            Ok(frame) => frame,
+            Err(_) => Some(Err(crate::error::Error::Transport(anyhow::anyhow!(
+                "the stream produced no frame within {ATTEMPT_DEADLINE:?}"
+            )))),
         }
     }
 }

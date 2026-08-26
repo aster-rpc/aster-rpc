@@ -686,6 +686,11 @@ enum StreamMode {
     ExportOverCeiling,
     /// An honest manifest followed by a chunk over the §5.2 chunk bound.
     ExportOversizedChunk,
+    /// A validly encoded audit row whose result no apply path produces for
+    /// its operation: an acquire recording `MembershipAccepted`.
+    AuditWrongResult,
+    /// Accept the stream, then send neither data nor trailer.
+    Park,
 }
 
 struct ForeignStore {
@@ -760,6 +765,14 @@ fn counterfeit_stream_frames(method: &str, mode: StreamMode, group_id: &[u8]) ->
         ("audit_stream", StreamMode::AuditDescending) => {
             vec![encode_row(&audit_row(2)), encode_row(&audit_row(1))]
         }
+        ("audit_stream", StreamMode::AuditWrongResult) => {
+            // Operation 1 (acquire) recording result 8 (MembershipAccepted):
+            // in the client outcome space, and a pairing no apply path
+            // produces — only the shared operation × result table refuses it.
+            let mut row = audit_row(1);
+            row.result_code = 8;
+            vec![encode_row(&row)]
+        }
         ("audit_stream", _) => (1..=2).map(|i| encode_row(&audit_row(i))).collect(),
         ("recovery_export", StreamMode::ExportOverCeiling) => {
             vec![encode_frame(&RecoveryExportFrameV1::Manifest(
@@ -772,7 +785,7 @@ fn counterfeit_stream_frames(method: &str, mode: StreamMode, group_id: &[u8]) ->
                 },
             ))]
         }
-        ("recovery_export", _) => {
+        ("recovery_export", StreamMode::ExportOversizedChunk) => {
             // An honest, in-bounds manifest — followed by one chunk a full
             // §5.2 bound and one byte long, which the client must refuse
             // before writing.
@@ -791,6 +804,34 @@ fn counterfeit_stream_frames(method: &str, mode: StreamMode, group_id: &[u8]) ->
                     offset: 0,
                     data: oversized,
                     final_chunk: false,
+                })),
+            ]
+        }
+        ("recovery_export", _) => {
+            // The fully honest export: a bounded manifest whose checksum is
+            // the body's, then the body in two contiguous chunks.
+            let body = b"the canonical recovery body".to_vec();
+            let checksum = blake3::hash(&body).as_bytes().to_vec();
+            let split = 7usize;
+            vec![
+                encode_frame(&RecoveryExportFrameV1::Manifest(
+                    RecoveryExportManifestWireV1 {
+                        protocol_version: STORE_PROTOCOL_VERSION,
+                        group_id: group_id.to_vec(),
+                        total_len: body.len() as u64,
+                        blake3_checksum: checksum,
+                        applied_log_id: None,
+                    },
+                )),
+                encode_frame(&RecoveryExportFrameV1::Chunk(RecoveryExportChunkWireV1 {
+                    offset: 0,
+                    data: body[..split].to_vec(),
+                    final_chunk: false,
+                })),
+                encode_frame(&RecoveryExportFrameV1::Chunk(RecoveryExportChunkWireV1 {
+                    offset: split as u64,
+                    data: body[split..].to_vec(),
+                    final_chunk: true,
                 })),
             ]
         }
@@ -826,6 +867,12 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
         // The streaming methods: frames via `send`, then an OK finish.
         if method == "audit_stream" || method == "recovery_export" {
             let mode = *self.0.stream_mode.lock().expect("stamp");
+            if mode == StreamMode::Park {
+                // Accept, then stall: neither data nor trailer. The call is
+                // held open until far past the client's frame deadline.
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                return;
+            }
             let frames = counterfeit_stream_frames(method, mode, &group_id);
             for frame in frames {
                 let _ = call.send(frame).await;
@@ -1370,6 +1417,66 @@ async fn stream_contracts_are_enforced_at_the_boundary() {
         panic!("an oversized chunk must be refused")
     };
     assert!(format!("{err}").contains("chunk exceeds"), "{err}");
+
+    // The honest export from the **same counterfeit** is accepted whole —
+    // manifest, contiguous chunks, checksum — so every refusal above is the
+    // stream boundary's and not some other fault's.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::Honest;
+    let (manifest, body) = within("honest export", reads.recovery_export())
+        .await
+        .expect("an honest export is accepted");
+    assert_eq!(body, b"the canonical recovery body".to_vec());
+    assert_eq!(manifest.total_len, body.len() as u64);
+
+    // The strictly-after cursor: the same honest rows (1, 2) served against
+    // a cursor at index 1 violate "strictly after", and against a cursor at
+    // index 0 they are exactly right.
+    let cursor = |index: u64| aster::coordination::contract::LogIdV1 {
+        term: 1,
+        leader_node_id: vec![0x11; 32],
+        index,
+    };
+    let stale = within(
+        "cursor-violating audit stream",
+        reads.audit_stream(Some(cursor(1)), 2),
+    )
+    .await;
+    let Err(err) = stale else {
+        panic!("a row at the cursor must be refused")
+    };
+    assert!(format!("{err}").contains("ascending"), "{err}");
+    let after = within(
+        "cursor audit stream",
+        reads.audit_stream(Some(cursor(0)), 2),
+    )
+    .await
+    .expect("rows strictly after the cursor are accepted");
+    assert_eq!(after.len(), 2);
+
+    // A wrong-but-known audit result: operation 1 recording outcome 8 is in
+    // the right code space, and the shared operation × result table still
+    // refuses it.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::AuditWrongResult;
+    let wrong = within("wrong-result audit stream", reads.audit_stream(None, 2)).await;
+    let Err(err) = wrong else {
+        panic!("a result no apply path produces must be refused")
+    };
+    assert!(format!("{err}").contains("cannot record"), "{err}");
+
+    // A peer that accepts either stream and then parks — neither data nor
+    // trailer — is cut off at the frame deadline instead of hanging the
+    // public future forever.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::Park;
+    let parked = within("parked audit stream", reads.audit_stream(None, 2)).await;
+    let Err(err) = parked else {
+        panic!("a parked audit stream must time out")
+    };
+    assert!(format!("{err}").contains("no frame"), "{err}");
+    let parked = within("parked export", reads.recovery_export()).await;
+    let Err(err) = parked else {
+        panic!("a parked export must time out")
+    };
+    assert!(format!("{err}").contains("no frame"), "{err}");
 
     counterfeit.shutdown().await;
 }

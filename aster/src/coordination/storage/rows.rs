@@ -1584,50 +1584,19 @@ fn check_audit_key_order(state: &DurableState) -> Result<(), String> {
 /// anything else describes an operation this build cannot interpret, and its
 /// result code cannot be placed in either code space.
 fn check_audit_rows(state: &DurableState) -> Result<(), String> {
-    use crate::coordination::contract::{
-        SYS_EXPIRED, SYS_EXPIRE_MALFORMED, SYS_EXPIRY_STALE, SYS_GENESIS_ALREADY_INSTALLED,
-        SYS_GENESIS_INSTALLED, SYS_MEMBERSHIP_ADVANCED, SYS_MEMBERSHIP_MALFORMED,
-        SYS_MEMBERSHIP_PHASE_MISMATCH,
-    };
-    use crate::coordination::model::apply::{
-        OPERATION_EXPIRE, OPERATION_GENESIS, OPERATION_MEMBERSHIP_PROGRESS,
-    };
-    use crate::coordination::reason::Outcome;
-
     for (at, row) in &state.model.audit {
-        // The exact pairing, not merely the code space. `Expire` reporting
-        // `SYS_MEMBERSHIP_MALFORMED`, or `Acquire` reporting `Released`, are
-        // both in the right space and describe results no apply path produces.
-        let allowed: &[i32] = match row.operation_code {
-            1 => &[Outcome::Granted as i32, Outcome::Rejected as i32],
-            2 => &[Outcome::Renewed as i32, Outcome::Rejected as i32],
-            3 => &[Outcome::Mutated as i32, Outcome::Rejected as i32],
-            // Release and release-with-value share an outcome; they differ in
-            // what they write, not in what they report.
-            4 | 5 => &[Outcome::Released as i32, Outcome::Rejected as i32],
-            6 => &[Outcome::Revoked as i32, Outcome::Rejected as i32],
-            7 => &[Outcome::GrantUpdated as i32, Outcome::Rejected as i32],
-            8 => &[Outcome::AdminUpdated as i32, Outcome::Rejected as i32],
-            9 => &[Outcome::MembershipAccepted as i32, Outcome::Rejected as i32],
-            10 => &[Outcome::ClientRetired as i32, Outcome::Rejected as i32],
-            11 => &[
-                Outcome::MembershipCancelled as i32,
-                Outcome::Rejected as i32,
-            ],
-            OPERATION_EXPIRE => &[SYS_EXPIRED, SYS_EXPIRY_STALE, SYS_EXPIRE_MALFORMED],
-            OPERATION_MEMBERSHIP_PROGRESS => &[
-                SYS_MEMBERSHIP_ADVANCED,
-                SYS_MEMBERSHIP_PHASE_MISMATCH,
-                SYS_MEMBERSHIP_MALFORMED,
-            ],
-            // Two results and no rejection: a genesis that does not verify is
-            // fatal before any row is written, so no audit row can record one.
-            OPERATION_GENESIS => &[SYS_GENESIS_INSTALLED, SYS_GENESIS_ALREADY_INSTALLED],
-            other => {
-                return Err(format!(
-                    "row {at:?} names operation code {other}, which §5.2 does not declare"
-                ))
-            }
+        // The exact pairing, not merely the code space — and the **shared**
+        // table (`contract::audit_results_for`), so this reader and the
+        // client's inbound boundary cannot hold different oracles. `Expire`
+        // reporting `SYS_MEMBERSHIP_MALFORMED`, or `Acquire` reporting
+        // `Released`, are both in the right space and describe results no
+        // apply path produces.
+        let Some(allowed) = crate::coordination::contract::audit_results_for(row.operation_code)
+        else {
+            return Err(format!(
+                "row {at:?} names operation code {}, which §5.2 does not declare",
+                row.operation_code
+            ));
         };
 
         // Which code space the row is in is decided by its operation, and the
