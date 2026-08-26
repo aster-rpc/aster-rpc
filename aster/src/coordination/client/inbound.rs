@@ -2476,13 +2476,22 @@ mod tests {
     }
 
     /// Reply-level counters obey the ceiling: a forged revision above
-    /// `MAX_COUNTER` is refused even where the request cannot bound it.
+    /// `MAX_COUNTER` is refused even where nothing else bounds it — a
+    /// **rejection**, whose observed revisions carry no request correlation,
+    /// is the shape only the ceiling can refuse.
     #[test]
     fn reply_counters_are_bounded() {
         let request = sequenced_request("set_admin");
-        let mut reply = well_shaped("set_admin", 1, 7, 0);
+        let mut reply = well_shaped("set_admin", 1, 100, 7);
         reply.admin_revision = MAX_COUNTER + 1;
         assert!(validate_mutation_reply(&cx("set_admin", &request), &reply).is_err());
+
+        let mut reply = well_shaped("set_grant", 1, 100, 6);
+        reply.acl_revision = MAX_COUNTER + 1;
+        assert!(
+            validate_mutation_reply(&cx("set_grant", &sequenced_request("set_grant")), &reply)
+                .is_err()
+        );
     }
 
     /// The renew/fence request family decodes for correlation too — one
