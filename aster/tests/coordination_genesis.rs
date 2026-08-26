@@ -587,15 +587,18 @@ async fn a_replay_survives_the_state_moving_on() {
 /// is raised before `last_applied` moves, on the same rule as `UnknownCommand`:
 /// a voter that cannot interpret a committed entry must not record having
 /// applied it.
+///
+/// What this gate reads end to end is the refusal and the Fatal latch. The
+/// applied index itself is not readable evidence here -- a blank entry from a
+/// re-election legally advances it at any moment (§11.3), so the
+/// records-nothing half is pinned deterministically by
+/// `a_foreign_genesis_is_fatal_and_records_nothing` in `storage::machine`,
+/// where the machine receives exactly one entry and no elections exist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_different_genesis_is_fatal_and_writes_nothing() {
     let fixture = GroupFixture::new(DOMAIN, SEED ^ 0x06, 1);
     let voter = start(&fixture).await;
     let coordination = voter.coordination();
-
-    let before = coordination
-        .last_applied_for_testing()
-        .expect("an applied index");
 
     // A different group's genesis, signed by a different ROOT — so it does not
     // even verify under ours, which is the first of the checks.
@@ -613,16 +616,8 @@ async fn a_different_genesis_is_fatal_and_writes_nothing() {
         "a foreign genesis must not be accepted: {outcome:?}"
     );
 
-    // Nothing was written for it. The entry is committed — apply cannot skip a
-    // committed entry — but the *state machine* refused it before `last_applied`
-    // moved, so the node stops rather than recording it as applied.
-    let after = coordination.last_applied_for_testing();
-    assert!(
-        after <= Some(before),
-        "a refused genesis must not advance the applied index: {before} -> {after:?}"
-    );
-
-    // And the node reports Fatal rather than continuing to serve.
+    // The node reports Fatal rather than continuing to serve. (That nothing
+    // was recorded as applied is the machine gate's claim; see the doc above.)
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         if coordination.lifecycle_code() == 6 {

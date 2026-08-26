@@ -2060,6 +2060,63 @@ mod tests {
         assert_eq!(applied, None);
     }
 
+    /// **A committed genesis this group cannot accept records nothing.**
+    ///
+    /// The deterministic half of the integration gate
+    /// `a_different_genesis_is_fatal_and_writes_nothing`: end to end, the
+    /// applied index is not readable evidence for this rule, because a blank
+    /// entry from a re-election legally advances it at any moment (§11.3). Here
+    /// the machine receives exactly one entry and no elections exist, so
+    /// `last_applied` staying unmoved is exactly the claim -- a voter that
+    /// refused a committed genesis must not record having applied it.
+    #[tokio::test]
+    async fn a_foreign_genesis_is_fatal_and_records_nothing() {
+        use ed25519_dalek::Signer as _;
+
+        let dir = scratch_dir();
+        let (mut machine, shutdown, _drain) = machine(&dir);
+
+        // A structurally valid genesis signed by a ROOT this store is not
+        // bound to, so it fails the first of apply's checks: the signature
+        // under the replicated key.
+        let genesis = crate::coordination::model::authority::testing::genesis_for(
+            &[[1u8; 32], [2u8; 32], [3u8; 32]],
+            crate::coordination::model::shape::PROFILE_PROD,
+        );
+        let document_bytes =
+            crate::coordination::model::authority::canonical_document_bytes(&genesis)
+                .expect("encode a genesis");
+        let foreign_root = ed25519_dalek::SigningKey::from_bytes(&[0x66u8; 32]);
+        let signature = foreign_root
+            .sign(&crate::coordination::model::authority::genesis_signing_bytes(&document_bytes));
+        let signed_genesis = crate::coordination::model::authority::signed_document_from_parts(
+            document_bytes,
+            &foreign_root.verifying_key().to_bytes(),
+            &signature.to_bytes(),
+        )
+        .expect("encode a signed genesis");
+
+        let err = machine
+            .apply([normal(
+                1,
+                CommandV1::Genesis(crate::coordination::contract::GenesisCommandV1 {
+                    signed_genesis,
+                }),
+            )])
+            .await
+            .expect_err("a foreign genesis");
+        assert!(format!("{err:?}").contains("GenesisRefused"), "{err:?}");
+        assert!(machine.handle().is_fatal());
+
+        // And nothing was applied: `last_applied` must not record an entry
+        // this voter refused to interpret.
+        drop(shutdown);
+        drop(machine);
+        let (mut machine, _shutdown, _drain) = reopen(&dir);
+        let (applied, _) = machine.applied_state().await.expect("applied state");
+        assert_eq!(applied, None);
+    }
+
     // ── Normal commands ─────────────────────────────────────────────────────
 
     /// A committed command persists its effects, its audit row, its session and
