@@ -169,12 +169,10 @@ pub(crate) fn validate_mutation_reply(
     let Some(reason) = Reason::from_code(reply.reason_code) else {
         return Err(format!("reason {} is not a §5.2 reason", reply.reason_code));
     };
-    if reason.is_reserved() {
-        return Err(format!(
-            "reason {} is reserved and never emitted",
-            reply.reason_code
-        ));
-    }
+    // No separate reserved-code clause: the reserved `20` is in neither
+    // saveable nor NotConsumed-answerable list and a success demands reason
+    // 0, so the pair rules below refuse it on every path. The campaign
+    // proved an explicit clause here unfalsifiable — shadowed on all inputs.
     if outcome != Outcome::Rejected {
         // A success carrying a refusal reason — a terminal one included — is
         // neither a success nor a refusal.
