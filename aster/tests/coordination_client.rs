@@ -715,6 +715,9 @@ struct ForeignStore {
     retire_pair: std::sync::Mutex<(i32, i32)>,
     /// What the streaming methods serve.
     stream_mode: std::sync::Mutex<StreamMode>,
+    /// When set, `group_status` serves a fully §5.2-valid production cut
+    /// instead of the malformed-nested one the boundary gate uses.
+    honest_status: std::sync::Mutex<bool>,
 }
 
 impl ForeignStore {
@@ -1062,6 +1065,33 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                     })
                     .expect("the counterfeit encodes")
             }
+            "group_status" if *self.0.honest_status.lock().expect("stamp") => {
+                payload_fory::<GroupStatusReplyWireV1>()
+                    .serialize(&GroupStatusReplyWireV1 {
+                        protocol_version: STORE_PROTOCOL_VERSION,
+                        group_id,
+                        lifecycle_code: 3,
+                        local_node_id: vec![0x01; 32],
+                        local_role_code: 2,
+                        leader_node_id: Some(vec![0x01; 32]),
+                        term: 1,
+                        deployment_profile_code: 1,
+                        voters: vec![
+                            aster::coordination::contract::NodeIdV1 {
+                                node_id: vec![0x01; 32],
+                            },
+                            aster::coordination::contract::NodeIdV1 {
+                                node_id: vec![0x02; 32],
+                            },
+                            aster::coordination::contract::NodeIdV1 {
+                                node_id: vec![0x03; 32],
+                            },
+                        ],
+                        genesis_hash: vec![0x11; 32],
+                        ..Default::default()
+                    })
+                    .expect("the counterfeit encodes")
+            }
             "group_status" => payload_fory::<GroupStatusReplyWireV1>()
                 .serialize(&GroupStatusReplyWireV1 {
                     protocol_version: STORE_PROTOCOL_VERSION,
@@ -1115,6 +1145,7 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
         deformation: std::sync::Mutex::new(Deformation::None),
         retire_pair: std::sync::Mutex::new((9, 0)),
         stream_mode: std::sync::Mutex::new(StreamMode::Honest),
+        honest_status: std::sync::Mutex::new(false),
     });
     let counterfeit = AsterServer::builder()
         .config(
@@ -1307,6 +1338,7 @@ async fn a_shapeless_request_leaves_the_journal_ready() {
         deformation: std::sync::Mutex::new(Deformation::None),
         retire_pair: std::sync::Mutex::new((9, 0)),
         stream_mode: std::sync::Mutex::new(StreamMode::Honest),
+        honest_status: std::sync::Mutex::new(false),
     });
     let counterfeit = AsterServer::builder()
         .config(
@@ -1383,6 +1415,54 @@ async fn a_shapeless_request_leaves_the_journal_ready() {
     };
     assert!(format!("{err}").contains("group_authority"), "{err}");
 
+    // With the authority sealed and an honest status cut, a plan the
+    // group's committed profile can never accept — one voter under
+    // production — is refused **client-side** by the same §9 predicate
+    // apply runs, before anything is journaled.
+    *foreign.honest_status.lock().expect("stamp") = true;
+    let sealed_node = Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(SecretKey::from_bytes([0xEC ^ 0x42; 32]))
+            .build(),
+    )
+    .await
+    .expect("a sealed client node starts");
+    sealed_node
+        .add_node_addr(counterfeit.node().addr())
+        .expect("register the counterfeit");
+    let sealed_journal = tempfile::tempdir().expect("a directory");
+    let sealed = CoordinationClient::builder(sealed_node, real_group)
+        .seed_tickets([
+            aster::coordination::model::authority::canonical_candidate_ticket(&counterfeit_id)
+                .expect("a canonical ticket"),
+        ])
+        .journal_dir(sealed_journal.path())
+        .group_authority([0x42; 32], "client.boundary4")
+        .build()
+        .expect("the sealed client builds");
+    let impossible = within(
+        "a plan no profile of this group accepts",
+        sealed.change_membership(
+            [0x78; 16],
+            None,
+            vec![aster::coordination::contract::NodeIdV1 {
+                node_id: vec![0x05; 32],
+            }],
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    let Err(err) = impossible else {
+        panic!("a group-relative impossible plan must be refused before journaling")
+    };
+    assert!(
+        format!("{err}").contains("cannot apply against this group"),
+        "the refusal names the group-relative verdict: {err}"
+    );
+
     // The journal is untouched: the next valid mutation resolves from Ready
     // at sequence one and acknowledges cleanly.
     let resolved = within(
@@ -1424,6 +1504,7 @@ async fn a_foreign_retirement_confirmation_is_not_honored() {
         deformation: std::sync::Mutex::new(Deformation::None),
         retire_pair: std::sync::Mutex::new((9, 0)),
         stream_mode: std::sync::Mutex::new(StreamMode::Honest),
+        honest_status: std::sync::Mutex::new(false),
     });
     let counterfeit = AsterServer::builder()
         .config(
@@ -1544,6 +1625,7 @@ async fn stream_contracts_are_enforced_at_the_boundary() {
         deformation: std::sync::Mutex::new(Deformation::None),
         retire_pair: std::sync::Mutex::new((9, 0)),
         stream_mode: std::sync::Mutex::new(StreamMode::Honest),
+        honest_status: std::sync::Mutex::new(false),
     });
     let counterfeit = AsterServer::builder()
         .config(
