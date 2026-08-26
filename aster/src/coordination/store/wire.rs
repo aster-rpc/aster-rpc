@@ -383,6 +383,13 @@ pub struct RetireClientRequestV1 {
 /// `retire_client`'s reply. No disposition field: a sessionless command has no
 /// sequence to consume, and terminality is a property of the reason —
 /// `18 RetainedSessionCapReached` is terminal.
+///
+/// The pairs are frozen, not the fields independently: `(9, 0)` retired,
+/// `(100, 18)` the terminal capacity refusal, and `(100, 12
+/// PermissionChanged)` for a cross-actor retirement without administrative
+/// authority. A **self-targeted** request — the only kind the §10 closing
+/// corridor and `retire_other_client` send — is always authorized, so its
+/// answer space is exactly the first two.
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "aster.coordination.v1/RetireClientReply")]
 pub struct RetireClientReplyWireV1 {
@@ -393,7 +400,7 @@ pub struct RetireClientReplyWireV1 {
     /// `9 ClientRetired`, or `100 Rejected`.
     #[fory(id = 3)]
     pub outcome_code: i32,
-    /// `0`, or `18 RetainedSessionCapReached`.
+    /// `0`, `18 RetainedSessionCapReached`, or `12 PermissionChanged`.
     #[fory(id = 4)]
     pub reason_code: i32,
 }
@@ -742,6 +749,11 @@ pub struct RecoveryExportManifestWireV1 {
     #[fory(id = 5)]
     pub applied_log_id: Option<LogIdV1>,
 }
+
+/// One export chunk's byte ceiling. The server slices the canonical body
+/// into at most this; the client refuses a larger chunk before writing a
+/// byte of it, so both sides compile against the one constant.
+pub const MAX_EXPORT_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// One contiguous chunk of the canonical recovery body.
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]

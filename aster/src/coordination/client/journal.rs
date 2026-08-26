@@ -944,6 +944,10 @@ mod tests {
             request_hash: request_hash.to_vec(),
             disposition_code: 1,
             outcome_code: 1,
+            // §5.2.1: the reply's ACL revision is copied from the same row
+            // the snapshot was taken from, and the validator holds the two
+            // to that.
+            acl_revision: 1,
             snapshot: Some(crate::coordination::contract::ResourceSnapshotV1 {
                 group_id: group().as_bytes().to_vec(),
                 resource: test_resource(),
@@ -1282,6 +1286,7 @@ mod tests {
                     request_hash: vec![0x21; 32],
                     disposition_code: 1,
                     outcome_code: 1,
+                    acl_revision: 1,
                     snapshot: Some(crate::coordination::contract::ResourceSnapshotV1 {
                         group_id: group().as_bytes().to_vec(),
                         resource: test_resource(),

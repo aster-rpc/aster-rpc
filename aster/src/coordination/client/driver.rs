@@ -215,13 +215,13 @@ async fn retire_until_confirmed(engine: &Engine, journal: &mut Journal) -> Resul
                     tokio::time::sleep(backoff(attempt)).await;
                     continue;
                 };
-                // A retirement confirmation must come from **this** group
-                // and protocol: an outcome-9 reply naming another world
-                // confirms nothing, and honoring it would replay the
-                // original on a tombstone that may not exist.
-                if reply.protocol_version != STORE_PROTOCOL_VERSION
-                    || reply.group_id != engine.group.as_bytes().to_vec()
-                {
+                // A self-targeted retirement has exactly two §10 answers:
+                // `(9, 0)` and `(100, 18)` — validated as **pairs**, from
+                // this group and protocol. A contradictory reply — outcome 9
+                // dressed with reason 18, an unrelated outcome smuggling the
+                // fatal reason, a foreign group — neither confirms nor
+                // fatals: it is not this request's answer, and is resent.
+                if super::inbound::validate_retire_reply(engine.group.as_bytes(), &reply).is_err() {
                     tokio::time::sleep(backoff(attempt)).await;
                     continue;
                 }
@@ -229,17 +229,15 @@ async fn retire_until_confirmed(engine: &Engine, journal: &mut Journal) -> Resul
                     journal.retirement_confirmed()?;
                     return Ok(());
                 }
-                if reply.reason_code == Reason::RetainedSessionCapReached.code() {
-                    // §10: an explicit 18 is a proof, not a failure to retry.
-                    // The absent session cannot be created and neither can the
-                    // delayed original's, so the original can never commit.
-                    journal.fatal()?;
-                    return Err(client_error(
-                        "retained-session capacity is exhausted; this journal cannot be \
-                         closed and no further mutation is possible (§10 reason 18)",
-                    ));
-                }
-                tokio::time::sleep(backoff(attempt)).await;
+                // The other legal pair: an explicit `(100, 18)` is a proof,
+                // not a failure to retry. The absent session cannot be
+                // created and neither can the delayed original's, so the
+                // original can never commit.
+                journal.fatal()?;
+                return Err(client_error(
+                    "retained-session capacity is exhausted; this journal cannot be \
+                     closed and no further mutation is possible (§10 reason 18)",
+                ));
             }
             Ok(CallOutcome::Denied { code, message }) => {
                 // Self-retirement needs no grant; a denial here is a

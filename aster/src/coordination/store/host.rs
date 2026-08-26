@@ -2011,8 +2011,9 @@ async fn audit_stream(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
 // ── recovery_export (S4-EXPORT-OWNERSHIP: Slice 4 serves) ───────────────────
 
 /// Export chunk size: comfortably under the 2 MiB store frame with envelope
-/// headroom, matching the snapshot transfer's chunking discipline.
-const EXPORT_CHUNK: usize = 1024 * 1024;
+/// headroom, matching the snapshot transfer's chunking discipline. The wire
+/// constant, so the client's inbound bound and this slicer cannot drift.
+const EXPORT_CHUNK: usize = wire::MAX_EXPORT_CHUNK_BYTES;
 
 async fn recovery_export(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], call: Call) {
     let request: wire::RecoveryExportRequestV1 = match decode(frame) {

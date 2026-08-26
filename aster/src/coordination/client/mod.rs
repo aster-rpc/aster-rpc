@@ -634,13 +634,15 @@ impl CoordinationClient {
                 "this journal's own client id is retired only by its closing corridor",
             ));
         }
-        let request = encode(&RetireClientRequestV1 {
+        let request = RetireClientRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
             target_node_id: actor.to_vec(),
             target_client_id: target_client_id.to_vec(),
-        })?;
-        unary_typed(&self.engine, "retire_client", request).await
+        };
+        // The reply is held to the frozen §10 pair set for a self-targeted
+        // retirement — `(9, 0)` or `(100, 18)` — by the inbound boundary.
+        unary_typed(&self.engine, "retire_client", &request).await
     }
 
     /// The group this client is bound to.
@@ -718,12 +720,13 @@ reply_envelope!(
 );
 
 /// The inbound boundary itself: protocol version and group on every typed
-/// reply the client accepts, then the reply type's own nested validity —
-/// identifier widths, ordering, and facts that must not contradict
-/// themselves (`client::inbound::ValidNested`).
-fn check_envelope<T: ReplyEnvelope + inbound::ValidNested>(
+/// reply the client accepts, then the reply type's own **request-aware**
+/// validity — identity echoes, code domains, ordering, and facts that must
+/// not contradict themselves (`client::inbound::ValidReply`).
+fn check_envelope<T: ReplyEnvelope + inbound::ValidReply>(
     engine: &Engine,
     method: &str,
+    request: &T::Request,
     reply: T,
 ) -> Result<T> {
     let (protocol_version, group_id) = reply.envelope();
@@ -739,26 +742,30 @@ fn check_envelope<T: ReplyEnvelope + inbound::ValidNested>(
         )));
     }
     reply
-        .validate_nested(engine.group.as_bytes())
+        .validate_reply(engine.group.as_bytes(), request)
         .map_err(|why| client_error(format!("{method}: {why}")))?;
     Ok(reply)
 }
 
 /// One redirect-routed unary call with a typed reply; a denial surfaces as
 /// `Error::Rpc` and ambiguity as a transport error — reads are safely
-/// re-issued by the caller. Every reply passes the envelope boundary.
-async fn unary_typed<T>(engine: &Engine, method: &str, request: Vec<u8>) -> Result<T>
+/// re-issued by the caller. Every reply passes the envelope boundary,
+/// validated against the typed request it answers.
+async fn unary_typed<T>(engine: &Engine, method: &str, request: &T::Request) -> Result<T>
 where
     T: crate::rpc::contract::WireField
         + fory_core::Serializer
         + fory_core::ForyDefault
         + ReplyEnvelope
-        + inbound::ValidNested
+        + inbound::ValidReply
         + 'static,
+    T::Request:
+        crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
 {
-    match engine.unary(method, request).await {
+    let bytes = encode(request)?;
+    match engine.unary(method, bytes).await {
         Ok(CallOutcome::Reply(payload)) => {
-            decode(&payload).and_then(|reply| check_envelope(engine, method, reply))
+            decode(&payload).and_then(|reply| check_envelope(engine, method, request, reply))
         }
         Ok(CallOutcome::Denied { code, message }) => Err(Error::Rpc {
             code,
@@ -775,46 +782,34 @@ impl CoordinationReadClient {
     /// `read_linearizable` (§5.2): the leader barrier and the one pinned
     /// transaction are the server's; the reply is the snapshot at that cut.
     pub async fn read_linearizable(&self, resource: ResourceKeyV1) -> Result<ReadReplyWireV1> {
-        let request = encode(&ReadRequestV1 {
+        // Request correlation — the snapshot is about the resource this call
+        // asked for, carries its value, and is never redacted — is the
+        // validator's (`inbound::ValidReply`), run against this request.
+        let request = ReadRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
-            resource: resource.clone(),
-        })?;
-        let reply: ReadReplyWireV1 =
-            unary_typed(&self.engine, "read_linearizable", request).await?;
-        // Request correlation: the snapshot must be about the resource this
-        // call asked for, not merely any well-formed one.
-        if reply.snapshot.resource != resource {
-            return Err(client_error(
-                "read_linearizable: the reply's snapshot names another resource",
-            ));
-        }
-        Ok(reply)
+            resource,
+        };
+        unary_typed(&self.engine, "read_linearizable", &request).await
     }
 
     /// `inspect_acl` (§5.2, administrator).
     pub async fn inspect_acl(&self, resource: ResourceKeyV1) -> Result<AclStatusReplyWireV1> {
-        let request = encode(&AclStatusRequestV1 {
+        let request = AclStatusRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
-            resource: resource.clone(),
-        })?;
-        let reply: AclStatusReplyWireV1 = unary_typed(&self.engine, "inspect_acl", request).await?;
-        if reply.acl_snapshot.resource != resource {
-            return Err(client_error(
-                "inspect_acl: the reply's snapshot names another resource",
-            ));
-        }
-        Ok(reply)
+            resource,
+        };
+        unary_typed(&self.engine, "inspect_acl", &request).await
     }
 
     /// `inspect_admins` (§5.2, administrator).
     pub async fn inspect_admins(&self) -> Result<AdminStatusReplyWireV1> {
-        let request = encode(&AdminStatusRequestV1 {
+        let request = AdminStatusRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
-        })?;
-        unary_typed(&self.engine, "inspect_admins", request).await
+        };
+        unary_typed(&self.engine, "inspect_admins", &request).await
     }
 
     /// `membership_status` (§5.2, administrator).
@@ -822,21 +817,21 @@ impl CoordinationReadClient {
         &self,
         operation_id: Option<[u8; 16]>,
     ) -> Result<MembershipStatusReplyWireV1> {
-        let request = encode(&MembershipStatusRequestV1 {
+        let request = MembershipStatusRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
             operation_id: operation_id.map(|id| id.to_vec()),
-        })?;
-        unary_typed(&self.engine, "membership_status", request).await
+        };
+        unary_typed(&self.engine, "membership_status", &request).await
     }
 
     /// `group_status` (§5.2, administrator): the S4-STATUS-CUT reply.
     pub async fn group_status(&self) -> Result<GroupStatusReplyWireV1> {
-        let request = encode(&GroupStatusRequestV1 {
+        let request = GroupStatusRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
-        })?;
-        unary_typed(&self.engine, "group_status", request).await
+        };
+        unary_typed(&self.engine, "group_status", &request).await
     }
 
     /// `probe_client` (§5.2): diagnostic only, never authority to reassign a
@@ -846,17 +841,24 @@ impl CoordinationReadClient {
         target_node_id: [u8; 32],
         target_client_id: [u8; 16],
     ) -> Result<ProbeClientReplyWireV1> {
-        let request = encode(&ProbeClientRequestV1 {
+        let request = ProbeClientRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
             target_node_id: target_node_id.to_vec(),
             target_client_id: target_client_id.to_vec(),
-        })?;
-        unary_typed(&self.engine, "probe_client", request).await
+        };
+        unary_typed(&self.engine, "probe_client", &request).await
     }
 
     /// `audit_stream` (§5.2, administrator): at most `limit` retained rows
     /// strictly after `after_log_id`, ascending.
+    ///
+    /// Every contract word is enforced **as the frames arrive**, before the
+    /// next one is read: each record passes the envelope and its own §5.2
+    /// validity, the count never exceeds the requested limit, the log
+    /// indices ascend strictly, and the first is strictly after the cursor.
+    /// A stream that violates any of these stops there — nothing past the
+    /// violation is decoded, and nothing is returned.
     pub async fn audit_stream(
         &self,
         after_log_id: Option<crate::coordination::contract::LogIdV1>,
@@ -865,26 +867,44 @@ impl CoordinationReadClient {
         let request = encode(&AuditStreamRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
-            after_log_id,
+            after_log_id: after_log_id.clone(),
             limit,
         })?;
-        match self.engine.stream("audit_stream", request).await {
-            Ok(Ok(frames)) => frames
-                .iter()
-                .map(|frame| {
-                    decode(frame)
-                        .and_then(|record| check_envelope(&self.engine, "audit_stream", record))
+        let mut stream = match self.engine.open_stream("audit_stream", request).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err((code, message))) => {
+                return Err(Error::Rpc {
+                    code,
+                    message,
+                    details: Vec::new(),
                 })
-                .collect(),
-            Ok(Err((code, message))) => Err(Error::Rpc {
-                code,
-                message,
-                details: Vec::new(),
-            }),
-            Err(CallFailure::Ambiguous(detail)) | Err(CallFailure::Unavailable(detail)) => {
-                Err(Error::Transport(anyhow::anyhow!("audit_stream: {detail}")))
             }
+            Err(CallFailure::Ambiguous(detail)) | Err(CallFailure::Unavailable(detail)) => {
+                return Err(Error::Transport(anyhow::anyhow!("audit_stream: {detail}")))
+            }
+        };
+        let mut records: Vec<AuditRecordWireV1> = Vec::new();
+        let mut floor: Option<u64> = after_log_id.as_ref().map(|id| id.index);
+        while let Some(frame) = stream.next().await {
+            let frame = frame?;
+            if records.len() as u64 >= u64::from(limit) {
+                return Err(client_error(
+                    "audit_stream: the stream overran the requested limit",
+                ));
+            }
+            let record: AuditRecordWireV1 = decode(&frame)?;
+            let record = check_envelope(&self.engine, "audit_stream", &(), record)?;
+            if let Some(floor) = floor {
+                if record.log_id.index <= floor {
+                    return Err(client_error(
+                        "audit_stream: the rows are not strictly ascending past the cursor",
+                    ));
+                }
+            }
+            floor = Some(record.log_id.index);
+            records.push(record);
         }
+        Ok(records)
     }
 
     /// `recovery_export` (§5.2, administrator; S4-EXPORT-OWNERSHIP), streamed:
@@ -898,10 +918,11 @@ impl CoordinationReadClient {
         &self,
         into: W,
     ) -> Result<(RecoveryExportManifestWireV1, W)> {
-        let request = encode(&RecoveryExportRequestV1 {
+        let typed_request = RecoveryExportRequestV1 {
             protocol_version: STORE_PROTOCOL_VERSION,
             group_id: self.engine.group.as_bytes().to_vec(),
-        })?;
+        };
+        let request = encode(&typed_request)?;
         let mut stream = match self.engine.open_stream("recovery_export", request).await {
             Ok(Ok(stream)) => stream,
             Ok(Err((code, message))) => {
@@ -932,8 +953,10 @@ impl CoordinationReadClient {
                 RecoveryExportFrameV1::Manifest(m) => {
                     // The manifest passes the same envelope boundary as
                     // every typed reply: a manifest for another group or
-                    // protocol binds nothing here.
-                    let m = check_envelope(&self.engine, "recovery_export", m)?;
+                    // protocol binds nothing here, and one whose claimed
+                    // length exceeds the §11.4 body ceiling is refused
+                    // before a byte is written toward it.
+                    let m = check_envelope(&self.engine, "recovery_export", &typed_request, m)?;
                     if manifest.replace(m).is_some() {
                         return Err(client_error("the export carried two manifests"));
                     }
@@ -942,6 +965,12 @@ impl CoordinationReadClient {
                     let Some(seen) = manifest.as_ref() else {
                         return Err(client_error("the export sent a chunk before its manifest"));
                     };
+                    // §5.2 slices the body into bounded chunks; an oversized
+                    // one is not this protocol's frame, refused before the
+                    // writer sees it.
+                    if chunk.data.len() > crate::coordination::store::wire::MAX_EXPORT_CHUNK_BYTES {
+                        return Err(client_error("the export chunk exceeds the §5.2 bound"));
+                    }
                     if chunk.offset != received {
                         return Err(client_error("the export chunks are not contiguous"));
                     }

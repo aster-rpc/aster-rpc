@@ -337,6 +337,109 @@ impl Reason {
         }
     }
 
+    /// May a **`NotConsumed`** mutation rejection carry this reason?
+    ///
+    /// Exactly the reasons the two pre-write answer paths can produce: the
+    /// §8.2.1 session classifier's refusing rows (`8`, `9`, `10`, `11`, `15`,
+    /// `18`, `21`) and §10 stage 3's admission denials (`15`, `19`, `22`,
+    /// `23`, `24`, `25`, `26`). Every other refusable reason is an apply-time
+    /// refusal that **must** reach the log and save a `Consumed` result --
+    /// §8.2.1's wedge rule: a stale-revision conflict answered `NotConsumed`
+    /// tells a client that may never alter an already-sent sequence to retry
+    /// the same stale expectation forever. A reply pairing one of those
+    /// reasons with `NotConsumed` is therefore not a §5.2 reply at all, and
+    /// the client boundary refuses it.
+    ///
+    /// Exhaustive like the other classifications: adding a reason is a compile
+    /// error until someone decides which answer paths can emit it.
+    pub fn may_be_not_consumed(self) -> bool {
+        match self {
+            // §8.2.1 classifier refusals (rows 1, 3, 4, 5, 6, 8, 9, 10, 12, 13).
+            Reason::SequenceTooOld
+            | Reason::SequenceGap
+            | Reason::SequenceConflict
+            | Reason::ClientRetired
+            | Reason::RetainedSessionCapReached
+            | Reason::ActiveClientCap => true,
+
+            // §10 stage-3 admission denials; `CounterExhausted` is also
+            // classifier rows 6 and 12.
+            Reason::CounterExhausted
+            | Reason::StateBudgetExhausted
+            | Reason::ResourceSlotsExhausted
+            | Reason::AclSlotsExhausted
+            | Reason::LastAdministrator
+            | Reason::RootAuthorityImmutable
+            | Reason::MembershipLearnerEnvelope => true,
+
+            // Apply-time refusals: consumed conflicts and business refusals.
+            // Each is decided against replicated state at apply and saved.
+            Reason::HeldByOther
+            | Reason::NotHeld
+            | Reason::NotHolder
+            | Reason::EpochMismatch
+            | Reason::ValueRevisionMismatch
+            | Reason::AclRevisionMismatch
+            | Reason::AdminRevisionMismatch
+            | Reason::MembershipRevisionMismatch
+            | Reason::MembershipIntentActive
+            | Reason::MembershipCannotCancel
+            | Reason::OperationIdConflict
+            | Reason::PermissionChanged => false,
+
+            // `None` belongs to successes and the one Consumed shapeless
+            // rejection; reserved codes are never emitted at all.
+            Reason::None | Reason::IntentSlotsExhausted => false,
+        }
+    }
+
+    /// May a **`Consumed`** mutation rejection carry this reason -- that is,
+    /// can apply save a rejection with it?
+    ///
+    /// Everything refusable except the session-classifier-only reasons: the
+    /// classifier answers before anything is written, so `8 SequenceTooOld`,
+    /// `9 SequenceGap`, `10 SequenceConflict`, `11 ClientRetired`,
+    /// `18 RetainedSessionCapReached` and `21 ActiveClientCap` are never
+    /// saved. The admission-denial reasons *are* saveable: apply must be
+    /// total, so an entry a conforming leader would have denied pre-proposal
+    /// commits its refusal when a non-conforming leader proposes it anyway --
+    /// a committed `19` is the canonical example (§10). `Reason::None` is
+    /// legal on a Consumed rejection only as §10.1's shapeless pairing, which
+    /// the caller checks separately.
+    pub fn may_be_saved_rejection(self) -> bool {
+        match self {
+            Reason::HeldByOther
+            | Reason::NotHeld
+            | Reason::NotHolder
+            | Reason::EpochMismatch
+            | Reason::ValueRevisionMismatch
+            | Reason::AclRevisionMismatch
+            | Reason::AdminRevisionMismatch
+            | Reason::MembershipRevisionMismatch
+            | Reason::MembershipIntentActive
+            | Reason::MembershipCannotCancel
+            | Reason::OperationIdConflict
+            | Reason::PermissionChanged
+            | Reason::CounterExhausted
+            | Reason::StateBudgetExhausted
+            | Reason::ResourceSlotsExhausted
+            | Reason::AclSlotsExhausted
+            | Reason::LastAdministrator
+            | Reason::RootAuthorityImmutable
+            | Reason::MembershipLearnerEnvelope => true,
+
+            // Classifier-only: answered before anything is written.
+            Reason::SequenceTooOld
+            | Reason::SequenceGap
+            | Reason::SequenceConflict
+            | Reason::ClientRetired
+            | Reason::RetainedSessionCapReached
+            | Reason::ActiveClientCap => false,
+
+            Reason::None | Reason::IntentSlotsExhausted => false,
+        }
+    }
+
     /// Is a `NotConsumed` refusal carrying this reason **terminal** (§10)?
     ///
     /// The unifying rule: a refusal is terminal exactly when no v1 command can
@@ -520,6 +623,18 @@ mod tests {
     /// §5.2: defined so it cannot be reused, but never emitted.
     const RESERVED_CODES: [i32; 1] = [20];
 
+    /// The reasons a `NotConsumed` mutation rejection may carry: §8.2.1's
+    /// classifier refusals (8, 9, 10, 11, 15, 18, 21) united with §10
+    /// stage 3's admission denials (15, 19, 22, 23, 24, 25, 26).
+    const NOT_CONSUMED_CODES: [i32; 13] = [8, 9, 10, 11, 15, 18, 19, 21, 22, 23, 24, 25, 26];
+
+    /// The reasons apply can save on a `Consumed` rejection: every refusable
+    /// reason except the classifier-only six (8, 9, 10, 11, 18, 21), which
+    /// answer before anything is written.
+    const SAVED_REJECTION_CODES: [i32; 19] = [
+        1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 19, 22, 23, 24, 25, 26,
+    ];
+
     /// §5.2 declares reasons 0 through 26 with no gaps.
     const REASON_CODE_RANGE: std::ops::RangeInclusive<i32> = 0..=26;
 
@@ -601,6 +716,66 @@ mod tests {
                 "{reason:?} denied pre-proposal wedges a client that may not \
                  change the request at an already-sent sequence: it would retry \
                  the stale revision forever"
+            );
+        }
+    }
+
+    #[test]
+    fn the_not_consumed_reasons_match_the_classifier_and_admission_lists() {
+        for reason in Reason::ALL {
+            assert_eq!(
+                reason.may_be_not_consumed(),
+                NOT_CONSUMED_CODES.contains(&reason.code()),
+                "{reason:?} (code {}) against §8.2.1's refusing rows ∪ §10 stage 3",
+                reason.code()
+            );
+        }
+        // Every admission denial is answerable NotConsumed; the wedge rule --
+        // a consumed conflict denied pre-proposal retries a stale expectation
+        // forever -- is the complement.
+        for reason in Reason::ALL {
+            if reason.is_admission_denial() {
+                assert!(reason.may_be_not_consumed(), "{reason:?}");
+            }
+        }
+        for reason in [
+            Reason::AclRevisionMismatch,
+            Reason::AdminRevisionMismatch,
+            Reason::ValueRevisionMismatch,
+            Reason::EpochMismatch,
+            Reason::MembershipRevisionMismatch,
+            Reason::OperationIdConflict,
+            Reason::HeldByOther,
+            Reason::PermissionChanged,
+        ] {
+            assert!(
+                !reason.may_be_not_consumed(),
+                "{reason:?} must reach the log and save a Consumed result"
+            );
+        }
+    }
+
+    #[test]
+    fn the_saveable_rejection_reasons_are_everything_but_the_classifier_six() {
+        for reason in Reason::ALL {
+            assert_eq!(
+                reason.may_be_saved_rejection(),
+                SAVED_REJECTION_CODES.contains(&reason.code()),
+                "{reason:?} (code {}) against the apply-saveable list",
+                reason.code()
+            );
+        }
+        // The reviewer's counterexample, named: a Consumed ActiveClientCap
+        // claims a session was created by a path that never creates one.
+        assert!(!Reason::ActiveClientCap.may_be_saved_rejection());
+        // And every reason is either saveable, NotConsumed-answerable, or one
+        // of the two non-refusable codes -- nothing falls through both nets.
+        for reason in Reason::ALL {
+            let reachable = reason.may_be_saved_rejection() || reason.may_be_not_consumed();
+            assert_eq!(
+                reachable,
+                reason.is_refusable(),
+                "{reason:?} must be emittable by exactly the refusable paths"
             );
         }
     }

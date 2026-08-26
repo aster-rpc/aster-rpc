@@ -659,6 +659,33 @@ enum Deformation {
     HolderWithoutHeld,
     /// A success wearing a terminal refusal reason.
     TerminalReasonOnSuccess,
+    /// `Consumed` + `100 Rejected` + `21 ActiveClientCap` — the sixth
+    /// review's durable wedge: the classifier answers 21 only pre-write,
+    /// so a Consumed 21 claims a session no path creates, and
+    /// acknowledging it would advance the journal past a sequence the
+    /// group still expects.
+    ConsumedActiveClientCap,
+    /// `NotConsumed` + `6 AclRevisionMismatch` — a consumed conflict
+    /// answered pre-write, §8.2.1's forbidden wedge.
+    NotConsumedConflict,
+    /// A perfect grant decorated with a membership operation id.
+    OperationIdOnSuccess,
+}
+
+/// What the counterfeit's streams serve.
+#[derive(Clone, Copy, PartialEq)]
+enum StreamMode {
+    /// Honest §5.2 streams: ascending audit rows within the limit, a
+    /// bounded export.
+    Honest,
+    /// One more audit row than the caller's limit.
+    AuditOverLimit,
+    /// Audit rows out of order.
+    AuditDescending,
+    /// An export manifest claiming more than the §11.4 body ceiling.
+    ExportOverCeiling,
+    /// An honest manifest followed by a chunk over the §5.2 chunk bound.
+    ExportOversizedChunk,
 }
 
 struct ForeignStore {
@@ -672,6 +699,10 @@ struct ForeignStore {
     retire_group: std::sync::Mutex<Vec<u8>>,
     /// The active grant deformation.
     deformation: std::sync::Mutex<Deformation>,
+    /// The `(outcome, reason)` pair `retire_client` answers.
+    retire_pair: std::sync::Mutex<(i32, i32)>,
+    /// What the streaming methods serve.
+    stream_mode: std::sync::Mutex<StreamMode>,
 }
 
 impl ForeignStore {
@@ -680,6 +711,90 @@ impl ForeignStore {
             self.group_id.lock().expect("stamp").clone(),
             *self.protocol_version.lock().expect("stamp"),
         )
+    }
+}
+
+/// The counterfeit's stream frames per mode — audit rows that are honest,
+/// too many, or out of order; export manifests over the §11.4 ceiling or
+/// chunks over the §5.2 chunk bound.
+fn counterfeit_stream_frames(method: &str, mode: StreamMode, group_id: &[u8]) -> Vec<Vec<u8>> {
+    use aster::coordination::contract::payload_fory;
+    use aster::coordination::store::wire::{
+        AuditRecordWireV1, RecoveryExportChunkWireV1, RecoveryExportFrameV1,
+        RecoveryExportManifestWireV1, STORE_PROTOCOL_VERSION,
+    };
+
+    let audit_row = |index: u64| AuditRecordWireV1 {
+        protocol_version: STORE_PROTOCOL_VERSION,
+        group_id: group_id.to_vec(),
+        log_id: aster::coordination::contract::LogIdV1 {
+            term: 1,
+            leader_node_id: vec![0x11; 32],
+            index,
+        },
+        actor_node_id: Some(vec![0x0B; 32]),
+        operation_code: 1,
+        resource: Some(aster::coordination::contract::ResourceKeyV1 {
+            namespace: "client.gate".into(),
+            key: b"stream".to_vec(),
+        }),
+        result_code: 1,
+        epoch: 1,
+        value_revision: 0,
+    };
+    let encode_row = |row: &AuditRecordWireV1| {
+        payload_fory::<AuditRecordWireV1>()
+            .serialize(row)
+            .expect("a row encodes")
+    };
+    let encode_frame = |frame: &RecoveryExportFrameV1| {
+        payload_fory::<RecoveryExportFrameV1>()
+            .serialize(frame)
+            .expect("a frame encodes")
+    };
+
+    match (method, mode) {
+        ("audit_stream", StreamMode::AuditOverLimit) => {
+            (1..=3).map(|i| encode_row(&audit_row(i))).collect()
+        }
+        ("audit_stream", StreamMode::AuditDescending) => {
+            vec![encode_row(&audit_row(2)), encode_row(&audit_row(1))]
+        }
+        ("audit_stream", _) => (1..=2).map(|i| encode_row(&audit_row(i))).collect(),
+        ("recovery_export", StreamMode::ExportOverCeiling) => {
+            vec![encode_frame(&RecoveryExportFrameV1::Manifest(
+                RecoveryExportManifestWireV1 {
+                    protocol_version: STORE_PROTOCOL_VERSION,
+                    group_id: group_id.to_vec(),
+                    total_len: aster::coordination::rowstream::MAX_SNAPSHOT_BODY_BYTES + 1,
+                    blake3_checksum: vec![0x33; 32],
+                    applied_log_id: None,
+                },
+            ))]
+        }
+        ("recovery_export", _) => {
+            // An honest, in-bounds manifest — followed by one chunk a full
+            // §5.2 bound and one byte long, which the client must refuse
+            // before writing.
+            let oversized = vec![0xAB; 1024 * 1024 + 1];
+            vec![
+                encode_frame(&RecoveryExportFrameV1::Manifest(
+                    RecoveryExportManifestWireV1 {
+                        protocol_version: STORE_PROTOCOL_VERSION,
+                        group_id: group_id.to_vec(),
+                        total_len: 4 * 1024 * 1024,
+                        blake3_checksum: vec![0x33; 32],
+                        applied_log_id: None,
+                    },
+                )),
+                encode_frame(&RecoveryExportFrameV1::Chunk(RecoveryExportChunkWireV1 {
+                    offset: 0,
+                    data: oversized,
+                    final_chunk: false,
+                })),
+            ]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -707,6 +822,18 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
             return;
         };
         let (group_id, protocol_version) = self.0.stamp();
+
+        // The streaming methods: frames via `send`, then an OK finish.
+        if method == "audit_stream" || method == "recovery_export" {
+            let mode = *self.0.stream_mode.lock().expect("stamp");
+            let frames = counterfeit_stream_frames(method, mode, &group_id);
+            for frame in frames {
+                let _ = call.send(frame).await;
+            }
+            let _ = call.finish(&aster::rpc::RpcStatus::ok()).await;
+            return;
+        }
+
         let reply_bytes = match method {
             "acquire" => {
                 let request: AcquireRequestV1 = payload_fory::<AcquireRequestV1>()
@@ -723,7 +850,7 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                     .expect("the action hashes");
                 let terminal = *self.0.terminal.lock().expect("stamp");
                 let deformation = *self.0.deformation.lock().expect("stamp");
-                let (disposition_code, outcome_code, mut reason_code) = if terminal {
+                let (mut disposition_code, mut outcome_code, mut reason_code) = if terminal {
                     // NotConsumed with a §10-terminal reason: the corridor
                     // opener, honestly owned by the entry.
                     (2, 100, 24)
@@ -753,8 +880,24 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                         value: Some(Vec::new()),
                         value_redacted: false,
                     });
+                let mut operation_id = None;
                 match deformation {
                     Deformation::None => {}
+                    Deformation::ConsumedActiveClientCap => {
+                        disposition_code = 1;
+                        outcome_code = 100;
+                        reason_code = 21;
+                        snapshot = None;
+                    }
+                    Deformation::NotConsumedConflict => {
+                        disposition_code = 2;
+                        outcome_code = 100;
+                        reason_code = 6;
+                        snapshot = None;
+                    }
+                    Deformation::OperationIdOnSuccess => {
+                        operation_id = Some(vec![0x55; 16]);
+                    }
                     Deformation::NoSnapshot => snapshot = None,
                     Deformation::WrongResource => {
                         if let Some(s) = snapshot.as_mut() {
@@ -774,6 +917,8 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                     }
                     Deformation::TerminalReasonOnSuccess => reason_code = 24,
                 }
+                // §5.2.1 copies the ACL revision from the snapshot's row.
+                let acl_revision = snapshot.as_ref().map_or(0, |s| s.acl_revision);
                 payload_fory::<MutationReplyWireV1>()
                     .serialize(&MutationReplyWireV1 {
                         protocol_version,
@@ -785,18 +930,21 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                         outcome_code,
                         reason_code,
                         snapshot,
+                        acl_revision,
+                        operation_id,
                         ..Default::default()
                     })
                     .expect("the counterfeit encodes")
             }
             "retire_client" => {
                 use aster::coordination::store::wire::RetireClientReplyWireV1;
+                let (outcome_code, reason_code) = *self.0.retire_pair.lock().expect("stamp");
                 payload_fory::<RetireClientReplyWireV1>()
                     .serialize(&RetireClientReplyWireV1 {
                         protocol_version: STORE_PROTOCOL_VERSION,
                         group_id: self.0.retire_group.lock().expect("stamp").clone(),
-                        outcome_code: 9,
-                        ..Default::default()
+                        outcome_code,
+                        reason_code,
                     })
                     .expect("the counterfeit encodes")
             }
@@ -851,6 +999,8 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
         terminal: std::sync::Mutex::new(false),
         retire_group: std::sync::Mutex::new(vec![0xEE; 32]),
         deformation: std::sync::Mutex::new(Deformation::None),
+        retire_pair: std::sync::Mutex::new((9, 0)),
+        stream_mode: std::sync::Mutex::new(StreamMode::Honest),
     });
     let counterfeit = AsterServer::builder()
         .config(
@@ -950,6 +1100,18 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
             Deformation::TerminalReasonOnSuccess,
             "a success wearing a terminal reason",
         ),
+        (
+            Deformation::ConsumedActiveClientCap,
+            "a Consumed rejection with the classifier-only 21",
+        ),
+        (
+            Deformation::NotConsumedConflict,
+            "a consumed conflict answered NotConsumed",
+        ),
+        (
+            Deformation::OperationIdOnSuccess,
+            "a grant decorated with a membership operation id",
+        ),
     ] {
         *foreign.deformation.lock().expect("stamp") = deformation;
         let refused = within("deformed resume", client.resume()).await;
@@ -1008,6 +1170,8 @@ async fn a_foreign_retirement_confirmation_is_not_honored() {
         terminal: std::sync::Mutex::new(true),
         retire_group: std::sync::Mutex::new(vec![0xEE; 32]),
         deformation: std::sync::Mutex::new(Deformation::None),
+        retire_pair: std::sync::Mutex::new((9, 0)),
+        stream_mode: std::sync::Mutex::new(StreamMode::Honest),
     });
     let counterfeit = AsterServer::builder()
         .config(
@@ -1062,6 +1226,150 @@ async fn a_foreign_retirement_confirmation_is_not_honored() {
         format!("{err}").contains("retirement did not confirm"),
         "the foreign outcome 9 must be skipped, not honored: {err}"
     );
+
+    // The sixth review's half: an honest-world confirmation whose **pair**
+    // is contradictory. `(9, 18)` — retired, dressed with the fatal reason —
+    // must neither confirm nor latch FatalJournal; `(100, 12)` — the
+    // model's cross-actor refusal — cannot answer a self-targeted request.
+    *foreign.retire_group.lock().expect("stamp") = real_group.as_bytes().to_vec();
+    for (pair, why) in [
+        ((9, 18), "outcome 9 dressed with reason 18"),
+        ((100, 12), "the cross-actor pair on a self-targeted request"),
+    ] {
+        *foreign.retire_pair.lock().expect("stamp") = pair;
+        let refused = within("contradictory retirement pair", client.resume()).await;
+        let Err(err) = refused else {
+            panic!("{why} must not be honored");
+        };
+        assert!(
+            format!("{err}").contains("retirement did not confirm"),
+            "{why} is skipped as not-this-request's answer, with the \
+             journal still Closing: {err}"
+        );
+    }
+
+    // The honest pair confirms, and the §10 corridor completes: retire,
+    // replay the exact mutation on the tombstone, deliver. The counterfeit
+    // now grants the replay, which is the tombstone's saved answer.
+    *foreign.retire_pair.lock().expect("stamp") = (9, 0);
+    *foreign.terminal.lock().expect("stamp") = false;
+    let resolved = within("the corridor completes", client.resume())
+        .await
+        .expect("the corridor completes on the honest pair")
+        .expect("the journaled request resolves");
+    assert_eq!(
+        resolved.reply().outcome_code,
+        1,
+        "the tombstone's saved answer"
+    );
+    within("rotation ack", resolved.acknowledge())
+        .await
+        .expect("the rotation acknowledges");
+
+    counterfeit.shutdown().await;
+}
+
+/// **The stream contracts are enforced client-side, live** (the sixth
+/// review's P0, stream half). The counterfeit serves validly encoded,
+/// honestly stamped streams that violate exactly one contract word each:
+/// one audit row over the requested limit, rows out of order, an export
+/// manifest over the §11.4 body ceiling, and a chunk over the §5.2 chunk
+/// bound. Each is refused at its own violation — and the honest stream,
+/// served by the same counterfeit, is accepted, pinning every refusal to
+/// the stream boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_contracts_are_enforced_at_the_boundary() {
+    let fixture = GroupFixture::new("client.boundary3", 0xEB, 1);
+    let real_group = group(&fixture);
+
+    let foreign = std::sync::Arc::new(ForeignStore {
+        group_id: std::sync::Mutex::new(real_group.as_bytes().to_vec()),
+        protocol_version: std::sync::Mutex::new(
+            aster::coordination::store::wire::STORE_PROTOCOL_VERSION,
+        ),
+        terminal: std::sync::Mutex::new(false),
+        retire_group: std::sync::Mutex::new(real_group.as_bytes().to_vec()),
+        deformation: std::sync::Mutex::new(Deformation::None),
+        retire_pair: std::sync::Mutex::new((9, 0)),
+        stream_mode: std::sync::Mutex::new(StreamMode::Honest),
+    });
+    let counterfeit = AsterServer::builder()
+        .config(
+            AsterConfig::builder()
+                .relay(RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0")
+                .secret_key(SecretKey::from_bytes([0xEB ^ 0x7A; 32]))
+                .build(),
+        )
+        .service(ForeignStoreService(std::sync::Arc::clone(&foreign)))
+        .start()
+        .await
+        .expect("the counterfeit starts");
+    let counterfeit_id: [u8; 32] =
+        *aster::coordination::ids::CoordinationNodeId::parse_hex(counterfeit.node().id().as_str())
+            .expect("a 32-byte id")
+            .as_bytes();
+
+    let node = Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(SecretKey::from_bytes([0xEB ^ 0x41; 32]))
+            .build(),
+    )
+    .await
+    .expect("a client node starts");
+    node.add_node_addr(counterfeit.node().addr())
+        .expect("register the counterfeit");
+    let journal = tempfile::tempdir().expect("a directory");
+    let client = CoordinationClient::builder(node, real_group)
+        .seed_tickets([
+            aster::coordination::model::authority::canonical_candidate_ticket(&counterfeit_id)
+                .expect("a canonical ticket"),
+        ])
+        .journal_dir(journal.path())
+        .build()
+        .expect("the client builds");
+    let reads = client.reads();
+
+    // The honest stream is accepted: two ascending rows within the limit.
+    let rows = within("honest audit stream", reads.audit_stream(None, 2))
+        .await
+        .expect("an honest stream is accepted");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].log_id.index < rows[1].log_id.index);
+
+    // One row over the requested limit: refused at the third frame.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::AuditOverLimit;
+    let over = within("over-limit audit stream", reads.audit_stream(None, 2)).await;
+    let Err(err) = over else {
+        panic!("a stream over the requested limit must be refused")
+    };
+    assert!(format!("{err}").contains("overran"), "{err}");
+
+    // Out of order: refused at the violating row.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::AuditDescending;
+    let unordered = within("descending audit stream", reads.audit_stream(None, 2)).await;
+    let Err(err) = unordered else {
+        panic!("a non-ascending stream must be refused")
+    };
+    assert!(format!("{err}").contains("ascending"), "{err}");
+
+    // A manifest over the §11.4 body ceiling: refused before any chunk.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::ExportOverCeiling;
+    let over = within("over-ceiling export", reads.recovery_export()).await;
+    let Err(err) = over else {
+        panic!("a manifest over the body ceiling must be refused")
+    };
+    assert!(format!("{err}").contains("ceiling"), "{err}");
+
+    // A chunk over the §5.2 chunk bound: refused before it is written.
+    *foreign.stream_mode.lock().expect("stamp") = StreamMode::ExportOversizedChunk;
+    let oversized = within("oversized export chunk", reads.recovery_export()).await;
+    let Err(err) = oversized else {
+        panic!("an oversized chunk must be refused")
+    };
+    assert!(format!("{err}").contains("chunk exceeds"), "{err}");
 
     counterfeit.shutdown().await;
 }
