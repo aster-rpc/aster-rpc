@@ -32,12 +32,9 @@
 //! expected phase, so a controller report could drive an intent from `Pending`
 //! straight to `Cancelled`, or out of a terminal phase entirely.
 
-use super::authority;
 use super::limits::{charge_intent, charge_route, MAX_RETAINED_INTENTS, MAX_RETAINED_ROUTES};
 use super::shape::{self, ShapeLimit};
-use super::state::{
-    GroupAuthority, Intent, LogId, MembershipPlan, NodeId, OperationId, Route, State,
-};
+use super::state::{Intent, LogId, MembershipPlan, NodeId, OperationId, Route, State};
 use crate::coordination::contract::{SYS_MEMBERSHIP_ADVANCED, SYS_MEMBERSHIP_PHASE_MISMATCH};
 use crate::coordination::reason::{Outcome, RefusalReason};
 
@@ -122,134 +119,14 @@ pub enum Decision {
     RefuseShapeless(ShapeLimit),
 }
 
-/// Every §9/§12.1 shape bound a membership plan can violate.
-///
-/// Ordered so a plan violating two reports the same one on every voter.
-///
-/// `current_members` is the committed membership, which decides what "new node"
-/// means -- and therefore which seeds must carry a join permit. Passing it in
-/// rather than reading state here keeps the function a pure predicate over the
-/// two things it compares.
-fn plan_shape(
-    plan: &MembershipPlan,
-    current: &crate::coordination::model::state::CommittedMembership,
-    authority_material: &GroupAuthority,
-    deployment_profile_code: i32,
-) -> Option<ShapeLimit> {
-    let current_members = &current.members();
-    // §7.1's profile decides the legal voter counts, read from replicated state
-    // rather than hard-coded. An earlier revision applied the production rule
-    // unconditionally, so a `DevSingle` or `DevEven` group had no legal
-    // membership transition at all.
-    if let Some(limit) = shape::check_membership_plan(
-        plan.desired_voters.len(),
-        plan.retained_learners.len(),
-        deployment_profile_code,
-    ) {
-        return Some(limit);
-    }
+/// The §9/§12.1 plan-shape predicate lives in [`shape`] so the client graph
+/// compiles it too: with the group facts in hand — the committed membership
+/// from a validated status cut, the genesis-fixed profile, the sealed
+/// authority — a client runs **the same function** apply runs, which is what
+/// makes group-relative stage-4 denials unreachable for a validated plan.
+pub(crate) use super::shape::plan_shape;
 
-    // §9: both vectors are **sorted unique**. Without this a plan may name the
-    // same voter five times and satisfy a count check while describing a
-    // one-voter group.
-    if !shape::sorted_unique(&plan.desired_voters) || !shape::sorted_unique(&plan.retained_learners)
-    {
-        return Some(ShapeLimit::MembershipPlanOrder);
-    }
-    let seed_ids: Vec<NodeId> = plan.member_seeds.iter().map(|s| s.node_id).collect();
-    if !shape::sorted_unique(&seed_ids) {
-        return Some(ShapeLimit::MembershipPlanOrder);
-    }
-    // A voter that is also a learner is two different roles for one node.
-    if plan
-        .desired_voters
-        .iter()
-        .any(|v| plan.retained_learners.contains(v))
-    {
-        return Some(ShapeLimit::MembershipPlanOrder);
-    }
-
-    // §8.1: ROOT is never a committed member, in either role. A genesis naming
-    // it as an initial voter is refused by `verify_genesis`; this is the other
-    // way in, and without it a group could be founded correctly and then have
-    // ROOT added by an ordinary membership change.
-    if plan
-        .desired_voters
-        .iter()
-        .chain(&plan.retained_learners)
-        .any(|node| node == &authority_material.public_key)
-    {
-        return Some(ShapeLimit::MembershipPlanRoot);
-    }
-
-    // §12.1: at most two new voter identities per change. Without it a single
-    // command replaces an entire quorum -- a membership no surviving voter voted
-    // for -- and `max_encoded_command`'s sizing, which assumes two new seeds,
-    // stops describing the worst case.
-    if shape::new_voters(&plan.desired_voters, current_members) > shape::MAX_NEW_VOTERS {
-        return Some(ShapeLimit::MembershipNewVoters);
-    }
-
-    let in_plan =
-        |node: &NodeId| plan.desired_voters.contains(node) || plan.retained_learners.contains(node);
-    for seed in &plan.member_seeds {
-        if let Some(limit) =
-            shape::check_member_seed(seed.ticket.len(), seed.join_permit.as_ref().map(Vec::len))
-        {
-            return Some(limit);
-        }
-        // §9: seeds carry route material for the plan's own members. Without
-        // this rule the seed vector is unbounded independently of the plan, so a
-        // legal three-voter plan could carry sixty-five seeds and insert
-        // sixty-five routes past §12.1's cap of 64 -- which is exactly how the
-        // cap was bypassed. Bounding seeds by plan membership makes the route
-        // count per intent at most `MAX_VOTERS + MAX_RETAINED_LEARNERS`.
-        if !in_plan(&seed.node_id) {
-            return Some(ShapeLimit::MemberSeedUnknownNode);
-        }
-        // §9: the ticket must be a **canonical Aster ticket**, carry no
-        // credential, and embed this seed's own node id.
-        //
-        // Authenticating a ticket is not validating it. An earlier revision
-        // checked size, non-emptiness, and byte-equality with the signed
-        // permit -- so a correctly signed permit for a literal that is not a
-        // ticket at all replicated happily, and every voter stored dialling
-        // material that dials nothing. A credential-bearing ticket is worse
-        // than useless here: it would put a bearer secret in the replicated
-        // route table.
-        if let Err(limit) = check_seed_ticket(&seed.ticket, &seed.node_id) {
-            return Some(limit);
-        }
-        // §9: a valid signed join permit is mandatory exactly for a new node and
-        // absent for an existing member -- and **valid** means verified, not
-        // present. An earlier revision checked presence and length only, so
-        // `Some(vec![])` was a permit, as was one minted for another node,
-        // group, genesis or deployment.
-        let is_new = !current_members.contains(&seed.node_id);
-        match (is_new, &seed.join_permit) {
-            (true, Some(permit)) => {
-                if authority::verify_join_permit(authority_material, permit, &seed.node_id).is_err()
-                {
-                    return Some(ShapeLimit::MemberSeedPermit);
-                }
-            }
-            (false, None) => {}
-            _ => return Some(ShapeLimit::MemberSeedPermit),
-        }
-    }
-
-    // §9: every **new** node must be seeded, or the group commits a membership
-    // containing a node it has no route to.
-    let seeded = |node: &NodeId| plan.member_seeds.iter().any(|s| &s.node_id == node);
-    for node in plan.desired_voters.iter().chain(&plan.retained_learners) {
-        if !current_members.contains(node) && !seeded(node) {
-            return Some(ShapeLimit::MemberSeedUnknownNode);
-        }
-    }
-    None
-}
-
-/// The intent an accepted command writes.
+/// The intent an accepted command writes./// The intent an accepted command writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IntentEffect {
     pub operation_id: OperationId,
@@ -316,9 +193,29 @@ pub fn decide_change(
         return Decision::Refuse(RefusalReason::OperationIdConflict);
     }
 
-    // §12.1 request-shape bounds, checked before anything is decided against
-    // replicated state: a plan outside the v1 shape was never a well-posed
-    // request. These were declared and had no caller.
+    // **The membership revision fence comes before the plan-shape verdict,
+    // and the order is load-bearing for the client's §10 liveness.** The
+    // plan-shape rules read replicated state — the committed membership set
+    // decides which nodes are new, and which seeds therefore need permits —
+    // so their shapeless answer is really "malformed *against this
+    // membership*". A client that validated its plan against a linearizable
+    // status cut and fenced on that cut's membership log id must never meet
+    // a shapeless status: either the fence still matches, in which case the
+    // state the plan is judged against is exactly the state it was proven
+    // against and `plan_shape` cannot fire, or the world moved and the
+    // reason-coded `13` answers — a typed, saved result the journal
+    // resolves on. The old order let a concurrent membership change turn a
+    // proven plan into a permanent stage-4 wedge.
+    //
+    // Compared against the committed membership log id, not a synthetic
+    // counter: `None` is "no membership committed yet", which is a value in
+    // its own right rather than a zero.
+    if action.expected_membership_log_id != state.membership_log_id {
+        return Decision::Refuse(RefusalReason::MembershipRevisionMismatch);
+    }
+
+    // §12.1 request-shape bounds — behind the fence, deterministic given it:
+    // a plan outside the v1 shape was never a well-posed request.
     if let Some(limit) = plan_shape(
         &action.plan,
         &state.membership,
@@ -326,13 +223,6 @@ pub fn decide_change(
         state.deployment_profile_code,
     ) {
         return Decision::RefuseShapeless(limit);
-    }
-
-    // Compared against the committed membership log id, not a synthetic
-    // counter: `None` is "no membership committed yet", which is a value in its
-    // own right rather than a zero.
-    if action.expected_membership_log_id != state.membership_log_id {
-        return Decision::Refuse(RefusalReason::MembershipRevisionMismatch);
     }
 
     if state
@@ -711,6 +601,7 @@ fn evictions(state: &State, incoming_terminal: u64) -> Vec<OperationId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::model::authority;
     use crate::coordination::model::state::CommittedMembership;
     use crate::coordination::model::state::MemberSeed;
     use crate::coordination::reason::Reason;
@@ -820,6 +711,43 @@ mod tests {
             expected_membership_log_id: expected,
             plan: plan(voters),
         }
+    }
+
+    /// **The fence precedes the plan-shape verdict** — the ordering the
+    /// client's §10 liveness depends on. A stale-fenced plan that is *also*
+    /// malformed must answer the reason-coded `13`, a typed saved result the
+    /// journal resolves on — not a shapeless status that would wedge the
+    /// sequence forever. Discriminating: with the old order this plan (four
+    /// voters, no §7.1 profile permits it) answered `RefuseShapeless`.
+    #[test]
+    fn a_stale_fence_answers_before_the_plan_shape() {
+        let mut s = base();
+        s.membership_log_id = Some(log(9));
+        // Four voters — a count no §7.1 profile permits. Built by hand:
+        // the `plan` fixture deliberately truncates to a legal shape.
+        let mut four_voters = plan(&[1, 2, 3]);
+        four_voters.desired_voters.push([4u8; 32]);
+        let malformed = ChangeMembershipAction {
+            operation_id: op(1),
+            // Fenced on a membership that is not the committed one.
+            expected_membership_log_id: Some(log(2)),
+            plan: four_voters,
+        };
+        assert_eq!(
+            decide_change(&s, &ADMIN, &[0xAB; 32], &malformed),
+            Decision::Refuse(RefusalReason::MembershipRevisionMismatch),
+            "a stale fence is the answer even for a malformed plan"
+        );
+        // And with the fence current, the same malformed plan is shapeless —
+        // the reorder moved the fence, not the shape rules.
+        let fresh = ChangeMembershipAction {
+            expected_membership_log_id: Some(log(9)),
+            ..malformed
+        };
+        assert!(matches!(
+            decide_change(&s, &ADMIN, &[0xAB; 32], &fresh),
+            Decision::RefuseShapeless(_)
+        ));
     }
 
     fn intent(phase: i32, completed: Option<LogId>) -> Intent {

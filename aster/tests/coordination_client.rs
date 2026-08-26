@@ -1287,6 +1287,121 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
     counterfeit.shutdown().await;
 }
 
+/// **A shapeless request on a Ready journal leaves it Ready** (§10
+/// liveness, the ninth review's evidence gap): the refusal happens before
+/// `journal.begin`, so no sequence is burned, a second attempt reports the
+/// same shape error rather than "resume first", and the very next valid
+/// mutation resolves from the untouched journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shapeless_request_leaves_the_journal_ready() {
+    let fixture = GroupFixture::new("client.boundary4", 0xEC, 1);
+    let real_group = group(&fixture);
+
+    let foreign = std::sync::Arc::new(ForeignStore {
+        group_id: std::sync::Mutex::new(real_group.as_bytes().to_vec()),
+        protocol_version: std::sync::Mutex::new(
+            aster::coordination::store::wire::STORE_PROTOCOL_VERSION,
+        ),
+        terminal: std::sync::Mutex::new(false),
+        retire_group: std::sync::Mutex::new(real_group.as_bytes().to_vec()),
+        deformation: std::sync::Mutex::new(Deformation::None),
+        retire_pair: std::sync::Mutex::new((9, 0)),
+        stream_mode: std::sync::Mutex::new(StreamMode::Honest),
+    });
+    let counterfeit = AsterServer::builder()
+        .config(
+            AsterConfig::builder()
+                .relay(RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0")
+                .secret_key(SecretKey::from_bytes([0xEC ^ 0x7A; 32]))
+                .build(),
+        )
+        .service(ForeignStoreService(std::sync::Arc::clone(&foreign)))
+        .start()
+        .await
+        .expect("the counterfeit starts");
+    let counterfeit_id: [u8; 32] =
+        *aster::coordination::ids::CoordinationNodeId::parse_hex(counterfeit.node().id().as_str())
+            .expect("a 32-byte id")
+            .as_bytes();
+
+    let node = Node::start(
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .secret_key(SecretKey::from_bytes([0xEC ^ 0x41; 32]))
+            .build(),
+    )
+    .await
+    .expect("a client node starts");
+    node.add_node_addr(counterfeit.node().addr())
+        .expect("register the counterfeit");
+    let journal = tempfile::tempdir().expect("a directory");
+    let client = CoordinationClient::builder(node, real_group)
+        .seed_tickets([
+            aster::coordination::model::authority::canonical_candidate_ticket(&counterfeit_id)
+                .expect("a canonical ticket"),
+        ])
+        .journal_dir(journal.path())
+        .build()
+        .expect("the client builds");
+
+    // Twice: the second identical error is the proof the first refusal
+    // journaled nothing — a journaled entry would answer "resume first".
+    for attempt in 0..2 {
+        let refused = within(
+            "a shapeless acquire on Ready",
+            client.acquire(
+                aster::coordination::contract::ResourceKeyV1 {
+                    namespace: "NOT A NAMESPACE".into(),
+                    key: b"k".to_vec(),
+                },
+                60_000,
+            ),
+        )
+        .await;
+        let Err(err) = refused else {
+            panic!("attempt {attempt}: an invalid namespace must be refused")
+        };
+        assert!(
+            format!("{err}").contains("namespace"),
+            "attempt {attempt} names the grammar, not a journal state: {err}"
+        );
+    }
+
+    // A membership change without the sealed authority facts is refused
+    // before any journaling or network — the group-relative §9 rules cannot
+    // be validated without them, and sending unvalidated would risk the
+    // §10 wedge this test polices.
+    let unsealed = within(
+        "change_membership without authority",
+        client.change_membership([0x77; 16], None, Vec::new(), Vec::new(), Vec::new()),
+    )
+    .await;
+    let Err(err) = unsealed else {
+        panic!("change_membership requires the sealed authority facts")
+    };
+    assert!(format!("{err}").contains("group_authority"), "{err}");
+
+    // The journal is untouched: the next valid mutation resolves from Ready
+    // at sequence one and acknowledges cleanly.
+    let resolved = within(
+        "the next valid mutation",
+        client.acquire(resource(b"ready-after-refusal"), 60_000),
+    )
+    .await
+    .expect("a valid mutation after refusals resolves");
+    assert_eq!(resolved.reply().outcome_code, 1);
+    assert_eq!(
+        resolved.reply().sequence,
+        1,
+        "the refused requests consumed no sequence"
+    );
+    within("ack", resolved.acknowledge()).await.expect("ack");
+
+    counterfeit.shutdown().await;
+}
+
 /// **A retirement confirmation from another group confirms nothing** (the
 /// fourth review's P0, retirement half). The counterfeit opens the closing
 /// corridor honestly — an entry-owned §10-terminal refusal under the true

@@ -286,7 +286,12 @@ pub(crate) fn decode_facts(method: &str, request: &[u8]) -> Result<RequestFacts,
 ///
 /// The rules that depend on replicated state — the profile's exact voter
 /// count, ROOT membership, which seeds need permits and whether they
-/// verify — cannot be decided here and remain the group's stage-4 refusals.
+/// verify — cannot be decided from the request alone; `change_membership`
+/// closes them by running the shared §9 `plan_shape` against a validated
+/// linearizable status cut plus the operator-sealed authority, and the
+/// voter's fence-before-shape ordering guarantees the plan is judged
+/// against exactly the state it was proven against (or answered with the
+/// typed `13`).
 pub(crate) fn validate_request(
     group_id: &[u8],
     local_actor: &[u8],

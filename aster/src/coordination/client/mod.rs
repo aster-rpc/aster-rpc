@@ -87,6 +87,7 @@ pub struct CoordinationClientBuilder {
     seeds: BTreeSet<[u8; 32]>,
     journal_dir: Option<PathBuf>,
     seed_error: Option<Error>,
+    authority: Option<([u8; 32], String)>,
 }
 
 impl CoordinationClientBuilder {
@@ -137,6 +138,22 @@ impl CoordinationClientBuilder {
     }
 
     /// Where the durable journal lives. Required for the mutating client.
+    /// Seal the deployment's authority facts — the ROOT public key and
+    /// authority domain from the group's operator documents (§4.1).
+    ///
+    /// Required for `change_membership`: with these plus a linearizable
+    /// status cut, the client runs the **same** §9 plan-shape predicate
+    /// apply runs, so a plan that could only earn a permanent stage-4
+    /// denial is refused before it is journaled (§10 liveness).
+    pub fn group_authority(
+        mut self,
+        root_public_key: [u8; 32],
+        authority_domain: impl Into<String>,
+    ) -> Self {
+        self.authority = Some((root_public_key, authority_domain.into()));
+        self
+    }
+
     pub fn journal_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.journal_dir = Some(dir.into());
         self
@@ -159,6 +176,7 @@ impl CoordinationClientBuilder {
         Ok(CoordinationClient {
             engine,
             journal: Arc::new(Mutex::new(journal)),
+            authority: self.authority,
         })
     }
 
@@ -179,6 +197,7 @@ impl CoordinationClientBuilder {
 pub struct CoordinationClient {
     engine: SharedEngine,
     journal: Arc<Mutex<Journal>>,
+    authority: Option<([u8; 32], String)>,
 }
 
 /// The read-only client (§3.4).
@@ -243,6 +262,7 @@ impl CoordinationClient {
             seeds: BTreeSet::new(),
             journal_dir: None,
             seed_error: None,
+            authority: None,
         }
     }
 
@@ -554,6 +574,55 @@ impl CoordinationClient {
         retained_learners: Vec<NodeIdV1>,
         member_seeds: Vec<MemberSeedV1>,
     ) -> Result<ResolvedMutation> {
+        // §10 liveness: a plan the group would refuse at stage 4 must never
+        // be journaled, and the plan-shape rules are group-relative — the
+        // committed membership decides which nodes are new, the genesis
+        // fixes the profile and the ROOT. So the client runs **the same**
+        // §9 predicate apply runs, against a validated linearizable status
+        // cut and the operator-sealed authority. The voter checks the
+        // membership revision fence before the plan shape, so at apply the
+        // plan is judged against exactly the state it was proven against —
+        // or the fence answers the typed, journal-resolvable `13`.
+        let Some((root_key, domain)) = &self.authority else {
+            return Err(client_error(
+                "change_membership requires the sealed group authority facts; \
+                 supply them with builder.group_authority(root_public_key, domain)",
+            ));
+        };
+        let status = self.reads().group_status().await?;
+        let plan = narrow_plan(&desired_voters, &retained_learners, &member_seeds)?;
+        let committed = crate::coordination::model::state::CommittedMembership {
+            voters: status
+                .voters
+                .iter()
+                .filter_map(|n| <[u8; 32]>::try_from(n.node_id.as_slice()).ok())
+                .collect(),
+            learners: status
+                .learners
+                .iter()
+                .filter_map(|n| <[u8; 32]>::try_from(n.node_id.as_slice()).ok())
+                .collect(),
+            joint: status.membership_joint,
+        };
+        let authority = crate::coordination::model::state::GroupAuthority {
+            public_key: *root_key,
+            domain: domain.clone(),
+            group_id: *self.engine.group.as_bytes(),
+            genesis_hash: <[u8; 32]>::try_from(status.genesis_hash.as_slice())
+                .map_err(|_| client_error("the status cut carries a malformed genesis hash"))?,
+        };
+        if let Some(limit) = crate::coordination::model::shape::plan_shape(
+            &plan,
+            &committed,
+            &authority,
+            status.deployment_profile_code,
+        ) {
+            return Err(client_error(format!(
+                "the membership plan cannot apply against this group: {}",
+                limit.describe()
+            )));
+        }
+
         let action = ActionV1::ChangeMembership(ChangeMembershipActionV1 {
             operation_id: operation_id.to_vec(),
             expected_membership_log_id: expected_membership_log_id.clone(),
@@ -679,6 +748,39 @@ impl CoordinationClient {
             engine: Arc::clone(&self.engine),
         }
     }
+}
+
+/// Narrow a wire membership plan into the model plan `shape::plan_shape`
+/// judges — widths refused here are the same widths the voter refuses.
+fn narrow_plan(
+    desired_voters: &[NodeIdV1],
+    retained_learners: &[NodeIdV1],
+    member_seeds: &[MemberSeedV1],
+) -> Result<crate::coordination::model::state::MembershipPlan> {
+    let narrow = |nodes: &[NodeIdV1]| -> Result<Vec<[u8; 32]>> {
+        nodes
+            .iter()
+            .map(|n| {
+                <[u8; 32]>::try_from(n.node_id.as_slice())
+                    .map_err(|_| client_error("a plan node id is not 32 bytes"))
+            })
+            .collect()
+    };
+    Ok(crate::coordination::model::state::MembershipPlan {
+        desired_voters: narrow(desired_voters)?,
+        retained_learners: narrow(retained_learners)?,
+        member_seeds: member_seeds
+            .iter()
+            .map(|seed| {
+                Ok(crate::coordination::model::state::MemberSeed {
+                    node_id: <[u8; 32]>::try_from(seed.node_id.as_slice())
+                        .map_err(|_| client_error("a seed node id is not 32 bytes"))?,
+                    ticket: seed.ticket.clone().into_bytes(),
+                    join_permit: seed.signed_join_permit.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
 }
 
 fn encode<T>(value: &T) -> Result<Vec<u8>>
@@ -900,6 +1002,9 @@ impl CoordinationReadClient {
                 return Err(Error::Transport(anyhow::anyhow!("audit_stream: {detail}")))
             }
         };
+        // The absolute budget earns the declared work: the validated limit's
+        // rows at the per-item allowance.
+        stream.allow_items(u64::from(limit));
         let mut records: Vec<AuditRecordWireV1> = Vec::new();
         let mut floor: Option<u64> = after_log_id.as_ref().map(|id| id.index);
         while let Some(frame) = stream.next().await {
@@ -974,6 +1079,10 @@ impl CoordinationReadClient {
                     // length exceeds the §11.4 body ceiling is refused
                     // before a byte is written toward it.
                     let m = check_envelope(&self.engine, "recovery_export", &typed_request, m)?;
+                    // The validated manifest's declared body earns transfer
+                    // budget at the declared minimum throughput — bounded,
+                    // because the ceiling check above already held.
+                    stream.allow_bytes(m.total_len);
                     if manifest.replace(m).is_some() {
                         return Err(client_error("the export carried two manifests"));
                     }

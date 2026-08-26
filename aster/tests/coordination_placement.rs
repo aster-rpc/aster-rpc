@@ -879,6 +879,7 @@ async fn admin_client(
     CoordinationClient::builder(node, fixture.group_id())
         .seed_tickets(tickets)
         .journal_dir(journal)
+        .group_authority(fixture.authority_key(), fixture.domain())
         .build()
         .expect("the client builds")
 }
@@ -1376,6 +1377,7 @@ async fn an_unresolvable_journalled_request_stops_reconciliation() {
                 .expect("a canonical ticket"),
         ])
         .journal_dir(journal.path())
+        .group_authority(fixture.authority_key(), fixture.domain())
         .build()
         .expect("the client builds");
 
@@ -1384,18 +1386,20 @@ async fn an_unresolvable_journalled_request_stops_reconciliation() {
     // Pending before any send, and no quorum can resolve it.
     voters.remove(2).shutdown().await;
     voters.remove(1).shutdown().await;
-    let mut desired: Vec<aster::coordination::contract::NodeIdV1> =
-        [voter_id(&fixture, 0), voter_id(&fixture, 1), candidate_id]
-            .iter()
-            .map(|n| aster::coordination::contract::NodeIdV1 {
-                node_id: n.as_bytes().to_vec(),
-            })
-            .collect();
-    desired.sort_by(|l, r| l.node_id.cmp(&r.node_id));
-    let seed = candidate.member_seed.clone().expect("seeded");
+    // The doomed entry is an `acquire`: a membership change now refuses to
+    // journal at all when the linearizable status cut it validates against
+    // is unreachable (nothing at risk, the caller simply retries), so the
+    // unresolvable **journalled** request this gate needs is an ordinary
+    // mutation — §10 treats every pending entry the same at resume.
     let unresolved = within(
         "doomed submission",
-        client.change_membership([0xAD; 16], None, desired, Vec::new(), vec![seed]),
+        client.acquire(
+            aster::coordination::contract::ResourceKeyV1 {
+                namespace: "placement.test".into(),
+                key: b"doomed".to_vec(),
+            },
+            60_000,
+        ),
     )
     .await;
     assert!(unresolved.is_err(), "no quorum can resolve the request");

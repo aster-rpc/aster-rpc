@@ -39,6 +39,7 @@
 use crate::coordination::ids::{IdError, ResourceKey};
 
 use super::limits::{MAX_JOIN_PERMIT, MAX_TICKET, MAX_TTL_MS, MAX_VALUE, MIN_TTL_MS};
+use super::state::{GroupAuthority, MembershipPlan, NodeId};
 
 /// Generates the [`ShapeLimit`] enum, its `ALL` list, and its descriptions from
 /// one declaration -- the same reason `reasons!` exists.
@@ -278,6 +279,133 @@ pub const MAX_LEARNER_ENVELOPE: usize =
 /// signed join permit. It also keeps a single change from replacing a quorum
 /// outright, which is a membership change no surviving voter voted for.
 pub const MAX_NEW_VOTERS: usize = 2;
+
+/// Every §9/§12.1 shape bound a membership plan can violate.
+///
+/// Ordered so a plan violating two reports the same one on every voter.
+///
+/// `current_members` is the committed membership, which decides what "new node"
+/// means -- and therefore which seeds must carry a join permit. Passing it in
+/// rather than reading state here keeps the function a pure predicate over the
+/// two things it compares.
+pub fn plan_shape(
+    plan: &MembershipPlan,
+    current: &super::state::CommittedMembership,
+    authority_material: &GroupAuthority,
+    deployment_profile_code: i32,
+) -> Option<ShapeLimit> {
+    let current_members = &current.members();
+    // §7.1's profile decides the legal voter counts, read from replicated state
+    // rather than hard-coded. An earlier revision applied the production rule
+    // unconditionally, so a `DevSingle` or `DevEven` group had no legal
+    // membership transition at all.
+    if let Some(limit) = check_membership_plan(
+        plan.desired_voters.len(),
+        plan.retained_learners.len(),
+        deployment_profile_code,
+    ) {
+        return Some(limit);
+    }
+
+    // §9: both vectors are **sorted unique**. Without this a plan may name the
+    // same voter five times and satisfy a count check while describing a
+    // one-voter group.
+    if !sorted_unique(&plan.desired_voters) || !sorted_unique(&plan.retained_learners) {
+        return Some(ShapeLimit::MembershipPlanOrder);
+    }
+    let seed_ids: Vec<NodeId> = plan.member_seeds.iter().map(|s| s.node_id).collect();
+    if !sorted_unique(&seed_ids) {
+        return Some(ShapeLimit::MembershipPlanOrder);
+    }
+    // A voter that is also a learner is two different roles for one node.
+    if plan
+        .desired_voters
+        .iter()
+        .any(|v| plan.retained_learners.contains(v))
+    {
+        return Some(ShapeLimit::MembershipPlanOrder);
+    }
+
+    // §8.1: ROOT is never a committed member, in either role. A genesis naming
+    // it as an initial voter is refused by `verify_genesis`; this is the other
+    // way in, and without it a group could be founded correctly and then have
+    // ROOT added by an ordinary membership change.
+    if plan
+        .desired_voters
+        .iter()
+        .chain(&plan.retained_learners)
+        .any(|node| node == &authority_material.public_key)
+    {
+        return Some(ShapeLimit::MembershipPlanRoot);
+    }
+
+    // §12.1: at most two new voter identities per change. Without it a single
+    // command replaces an entire quorum -- a membership no surviving voter voted
+    // for -- and `max_encoded_command`'s sizing, which assumes two new seeds,
+    // stops describing the worst case.
+    if new_voters(&plan.desired_voters, current_members) > MAX_NEW_VOTERS {
+        return Some(ShapeLimit::MembershipNewVoters);
+    }
+
+    let in_plan =
+        |node: &NodeId| plan.desired_voters.contains(node) || plan.retained_learners.contains(node);
+    for seed in &plan.member_seeds {
+        if let Some(limit) =
+            check_member_seed(seed.ticket.len(), seed.join_permit.as_ref().map(Vec::len))
+        {
+            return Some(limit);
+        }
+        // §9: seeds carry route material for the plan's own members. Without
+        // this rule the seed vector is unbounded independently of the plan, so a
+        // legal three-voter plan could carry sixty-five seeds and insert
+        // sixty-five routes past §12.1's cap of 64 -- which is exactly how the
+        // cap was bypassed. Bounding seeds by plan membership makes the route
+        // count per intent at most `MAX_VOTERS + MAX_RETAINED_LEARNERS`.
+        if !in_plan(&seed.node_id) {
+            return Some(ShapeLimit::MemberSeedUnknownNode);
+        }
+        // §9: the ticket must be a **canonical Aster ticket**, carry no
+        // credential, and embed this seed's own node id.
+        //
+        // Authenticating a ticket is not validating it. An earlier revision
+        // checked size, non-emptiness, and byte-equality with the signed
+        // permit -- so a correctly signed permit for a literal that is not a
+        // ticket at all replicated happily, and every voter stored dialling
+        // material that dials nothing. A credential-bearing ticket is worse
+        // than useless here: it would put a bearer secret in the replicated
+        // route table.
+        if let Err(limit) = check_seed_ticket(&seed.ticket, &seed.node_id) {
+            return Some(limit);
+        }
+        // §9: a valid signed join permit is mandatory exactly for a new node and
+        // absent for an existing member -- and **valid** means verified, not
+        // present. An earlier revision checked presence and length only, so
+        // `Some(vec![])` was a permit, as was one minted for another node,
+        // group, genesis or deployment.
+        let is_new = !current_members.contains(&seed.node_id);
+        match (is_new, &seed.join_permit) {
+            (true, Some(permit)) => {
+                if super::authority::verify_join_permit(authority_material, permit, &seed.node_id)
+                    .is_err()
+                {
+                    return Some(ShapeLimit::MemberSeedPermit);
+                }
+            }
+            (false, None) => {}
+            _ => return Some(ShapeLimit::MemberSeedPermit),
+        }
+    }
+
+    // §9: every **new** node must be seeded, or the group commits a membership
+    // containing a node it has no route to.
+    let seeded = |node: &NodeId| plan.member_seeds.iter().any(|s| &s.node_id == node);
+    for node in plan.desired_voters.iter().chain(&plan.retained_learners) {
+        if !current_members.contains(node) && !seeded(node) {
+            return Some(ShapeLimit::MemberSeedUnknownNode);
+        }
+    }
+    None
+}
 
 /// Check a membership plan's shape.
 ///

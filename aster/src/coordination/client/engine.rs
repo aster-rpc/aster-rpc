@@ -42,13 +42,26 @@ use crate::rpc::{RpcConnection, StreamHeader};
 /// How long one attempt may wait for the peer before it is ambiguous.
 const ATTEMPT_DEADLINE: Duration = Duration::from_secs(20);
 
-/// The **absolute** budget for one whole stream attempt (§5.2's streams are
-/// bounded operator surfaces: at most `MAX_AUDIT_STREAM_LIMIT` audit rows,
-/// or a §11.4-bounded export). The per-frame idle timeout alone is not a
-/// deadline — a peer dripping one small frame every nineteen seconds would
-/// hold the future forever while never going idle. Sixty seconds admits any
-/// plausibly healthy stream and terminates every drip.
-const STREAM_DEADLINE: Duration = Duration::from_secs(60);
+/// The **base** absolute budget for one stream attempt. The per-frame idle
+/// timeout alone is not a deadline — a peer dripping one small frame every
+/// nineteen seconds would hold the future forever while never going idle —
+/// so every stream carries an absolute budget: this base, plus an allowance
+/// derived from the **declared work** once the consumer knows it
+/// ([`BoundedFrames::allow_bytes`], [`BoundedFrames::allow_items`]). The
+/// protocol declares no minimum throughput, so the allowance encodes one
+/// explicitly rather than asserting any fixed wall time is universally
+/// healthy: a full §11.4 export earns its transfer time, a drip never earns
+/// more than its declared bytes.
+const STREAM_BASE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The minimum sustained throughput a declared export body earns budget at:
+/// one mebibyte per second, so the largest legal body (512 MiB) earns
+/// ~8.5 minutes on top of the base.
+const MIN_STREAM_THROUGHPUT_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// The per-item allowance a declared audit limit earns: 25 ms per row, so
+/// the §5.2 cap of 10,000 rows earns 250 s on top of the base.
+const STREAM_ITEM_ALLOWANCE: Duration = Duration::from_millis(25);
 
 /// What one routed call produced.
 #[derive(Debug)]
@@ -349,8 +362,22 @@ impl BoundedFrames {
     fn new(inner: crate::rpc::ResponseStream) -> Self {
         Self {
             inner,
-            deadline: tokio::time::Instant::now() + STREAM_DEADLINE,
+            deadline: tokio::time::Instant::now() + STREAM_BASE_DEADLINE,
         }
+    }
+
+    /// Extend the absolute budget for `bytes` of declared body, at the
+    /// declared minimum throughput. Called once the manifest has passed
+    /// validation, so the allowance is bounded by the §11.4 ceiling.
+    pub(crate) fn allow_bytes(&mut self, bytes: u64) {
+        let seconds = bytes.div_ceil(MIN_STREAM_THROUGHPUT_BYTES_PER_SEC);
+        self.deadline += Duration::from_secs(seconds);
+    }
+
+    /// Extend the absolute budget for `items` declared rows. Bounded by the
+    /// §5.2 audit cap, which the caller has already enforced.
+    pub(crate) fn allow_items(&mut self, items: u64) {
+        self.deadline += STREAM_ITEM_ALLOWANCE * (items as u32);
     }
 
     pub(crate) async fn next(&mut self) -> Option<crate::Result<Vec<u8>>> {
@@ -362,7 +389,7 @@ impl BoundedFrames {
             .saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Some(Err(crate::error::Error::Transport(anyhow::anyhow!(
-                "the stream did not complete within {STREAM_DEADLINE:?}"
+                "the stream did not complete within its absolute budget"
             ))));
         }
         match tokio::time::timeout(ATTEMPT_DEADLINE.min(remaining), self.inner.next()).await {

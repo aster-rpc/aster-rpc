@@ -388,24 +388,28 @@ mod tests {
             (102, &[7, 8]),
         ];
         // Every result code either code space can spell, plus brackets.
-        let candidate_results: Vec<i32> = (-1..=12).chain([99, 100, 101, 102, i32::MAX]).collect();
-
+        // Exact slice equality — not membership probes, which an added
+        // result code would survive.
         for (operation, allowed) in transcribed {
             let table = super::audit_results_for(*operation)
                 .unwrap_or_else(|| panic!("§5.2 declares operation {operation}"));
-            for result in &candidate_results {
-                assert_eq!(
-                    table.contains(result),
-                    allowed.contains(result),
-                    "operation {operation} × result {result}"
-                );
-            }
+            assert_eq!(
+                table, *allowed,
+                "operation {operation}'s result list must equal the transcription exactly"
+            );
         }
-        // And nothing outside the declared operation space maps at all.
-        for operation in [-1, 0, 12, 99, 103, i32::MAX] {
-            assert!(
-                super::audit_results_for(operation).is_none(),
-                "operation {operation} is not §5.2's"
+        // And the declared operation-key set equals the transcription's over
+        // a dense sweep — an operation code added to the function without a
+        // transcribed row fails here.
+        let keys: Vec<i32> = transcribed
+            .iter()
+            .map(|(operation, _)| *operation)
+            .collect();
+        for operation in (-1000..=1000).chain([i32::MIN, i32::MAX]) {
+            assert_eq!(
+                super::audit_results_for(operation).is_some(),
+                keys.contains(&operation),
+                "operation {operation}"
             );
         }
     }
