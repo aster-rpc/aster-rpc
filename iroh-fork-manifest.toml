@@ -64,12 +64,12 @@ crate_version = "0.103.5"
 [forks.iroh-docs]
 repo = "https://forge.emrul.dev/Aster/iroh-docs.git"
 upstream_base = "v0.101.0"
-tag = "aster-iroh-docs-v0.101.4"
-commit = "f38c2a5cb140a83a1c97db4ace1063a7f67e4dfd"
+tag = "aster-iroh-docs-v0.101.5"
+commit = "0db8c5cc05f62e2fd13f6dc6079cf5237767ec83"
 branch = "upgrade/iroh-docs-v0.101"
 crates = ["iroh-docs"]
 registry_crates = ["iroh-docs"]
-crate_version = "0.101.4"
+crate_version = "0.101.5"
 
 [forks.iroh-util]
 # Promoted from a bridge for the connection-pool deadlock fix; the repo lives
@@ -185,7 +185,7 @@ ed25519-dalek = "=3.0.0-rc.0"        # iroh #4324 bumped from =3.0.0-pre.7
 version_specs = """
 iroh        = "=1.0.1"
 iroh-blobs  = "0.103.5"
-iroh-docs   = "0.101.4"
+iroh-docs   = "0.101.5"
 iroh-gossip = "0.101.0"
 iroh-tickets = "=1.0.0"
 iroh-mdns-address-lookup = "0.4"
@@ -198,7 +198,7 @@ iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b1
 iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
 iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "bf21d4fe409181c983a755df574754e99a0d0a60" }
-iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "f38c2a5cb140a83a1c97db4ace1063a7f67e4dfd" }
+iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "0db8c5cc05f62e2fd13f6dc6079cf5237767ec83" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5c021f998a172b81a69669e71786e14a339fa963" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
 noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
