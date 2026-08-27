@@ -208,7 +208,6 @@ async fn ten_nodes_three_voters_move_leadership_and_replace_a_voter() {
     let root = CoordinationClient::builder(root_node, fixture.group_id())
         .seed_tickets(seed_tickets.clone())
         .journal_dir(root_journal.path())
-        .group_authority(fixture.authority_key(), fixture.domain())
         .build()
         .expect("the ROOT client builds");
 

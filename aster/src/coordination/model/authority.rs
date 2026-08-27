@@ -877,6 +877,16 @@ pub(crate) mod testing {
         SigningKey::from_bytes(&[0x42u8; 32])
     }
 
+    /// The canonical ticket bytes a fixture seeds a node with — the same
+    /// derivation a join permit's `candidate_ticket` must carry. Local to
+    /// this module (not `membership::test_ticket`) so the client-only test
+    /// graph, which compiles no membership transitions, still builds.
+    pub fn test_ticket(node: &NodeId) -> Vec<u8> {
+        super::canonical_candidate_ticket(node)
+            .expect("a well-formed ticket")
+            .into_bytes()
+    }
+
     pub fn authority() -> GroupAuthority {
         GroupAuthority {
             public_key: signing_key().verifying_key().to_bytes(),
@@ -931,7 +941,7 @@ pub(crate) mod testing {
     /// A genesis for `voters` under the test authority, with real tickets.
     ///
     /// Real tickets rather than literals for the same reason
-    /// [`membership::test_ticket`](super::super::membership::test_ticket) is:
+    /// [`membership::test_ticket`](test_ticket) is:
     /// a fixture that could not pass the validator would let every negative
     /// test pass for the wrong reason.
     pub fn genesis_for(voters: &[NodeId], profile: i32) -> GenesisV1 {
@@ -940,8 +950,7 @@ pub(crate) mod testing {
             .iter()
             .map(|node| crate::coordination::raft::VoterSeedV1 {
                 node_id: node.to_vec(),
-                ticket: String::from_utf8(super::super::membership::test_ticket(node))
-                    .expect("a ticket is ASCII base58"),
+                ticket: String::from_utf8(test_ticket(node)).expect("a ticket is ASCII base58"),
             })
             .collect();
         initial_voters.sort_by(|l, r| l.node_id.cmp(&r.node_id));
@@ -1654,18 +1663,15 @@ mod tests {
             initial_voters: vec![
                 crate::coordination::raft::VoterSeedV1 {
                     node_id: vec![3u8; 32],
-                    ticket: String::from_utf8(super::super::membership::test_ticket(&[3u8; 32]))
-                        .expect("ascii"),
+                    ticket: String::from_utf8(test_ticket(&[3u8; 32])).expect("ascii"),
                 },
                 crate::coordination::raft::VoterSeedV1 {
                     node_id: vec![1u8; 32],
-                    ticket: String::from_utf8(super::super::membership::test_ticket(&[1u8; 32]))
-                        .expect("ascii"),
+                    ticket: String::from_utf8(test_ticket(&[1u8; 32])).expect("ascii"),
                 },
                 crate::coordination::raft::VoterSeedV1 {
                     node_id: vec![2u8; 32],
-                    ticket: String::from_utf8(super::super::membership::test_ticket(&[2u8; 32]))
-                        .expect("ascii"),
+                    ticket: String::from_utf8(test_ticket(&[2u8; 32])).expect("ascii"),
                 },
             ],
             ..genesis_for(&[[1u8; 32], [2u8; 32], [3u8; 32]], PROFILE_PROD)
@@ -1680,7 +1686,7 @@ mod tests {
     fn a_voter_seed_ticket_for_another_node_is_refused() {
         let mut genesis = genesis_for(&[[1u8; 32], [2u8; 32], [3u8; 32]], PROFILE_PROD);
         genesis.initial_voters[0].ticket =
-            String::from_utf8(super::super::membership::test_ticket(&[9u8; 32])).expect("ascii");
+            String::from_utf8(test_ticket(&[9u8; 32])).expect("ascii");
         assert_eq!(
             verify_g(&sign_genesis(&genesis)),
             Err(GenesisError::VoterSeedTicket {

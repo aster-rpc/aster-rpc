@@ -738,6 +738,7 @@ mod tests {
     }
 
     /// A named mutation used to probe which counter a table charges to.
+    #[cfg(feature = "coordination")]
     type TableProbe = (&'static str, fn(&mut State));
 
     /// The ordering the canonical row stream and redb's tuple comparator both
@@ -794,6 +795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "coordination")]
     fn an_empty_state_has_zero_counters_and_they_match_recomputation() {
         let s = State::default();
         assert_eq!(s.recompute_growth(), 0);
@@ -806,6 +808,7 @@ mod tests {
     /// checking which counter moved -- a partition stated in a comment is not
     /// enforced by anything.
     #[test]
+    #[cfg(feature = "coordination")]
     fn each_table_charges_to_the_counter_section_12_1_assigns_it() {
         let growth_tables: Vec<TableProbe> = vec![
             ("resources", |s| {
@@ -902,6 +905,7 @@ mod tests {
     /// A session row's charge follows the key stored in its saved reply, not the
     /// command that wrote it -- the property that makes the counter recomputable.
     #[test]
+    #[cfg(feature = "coordination")]
     fn a_sessions_charge_follows_the_key_in_its_stored_row() {
         let mut bare = State::default();
         bare.sessions.insert(
@@ -947,6 +951,7 @@ mod tests {
     /// active. Conflating the two is what let create/retire/repeat grow
     /// permanent rows without tripping either cap.
     #[test]
+    #[cfg(feature = "coordination")]
     fn a_retired_session_consumes_retained_capacity_but_not_active() {
         let actor = [1u8; 32];
         let mut s = State::default();

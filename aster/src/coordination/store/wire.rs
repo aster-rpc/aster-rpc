@@ -611,6 +611,15 @@ pub struct GroupStatusReplyWireV1 {
     /// "group id/genesis hash" pair — the group id is field 2).
     #[fory(id = 20, bytes)]
     pub genesis_hash: Vec<u8>,
+    /// Replicated. Exactly 32 bytes: the deployment ROOT public key this
+    /// store is bound to (§4.1). Exposed so a client validating a §9
+    /// membership plan uses the **group's** sealed authority evidence
+    /// rather than trusted local configuration.
+    #[fory(id = 21, bytes)]
+    pub authority_public_key: Vec<u8>,
+    /// Replicated. The authority domain the ROOT signs under (§4.1).
+    #[fory(id = 22)]
+    pub authority_domain: String,
 }
 
 /// `probe_client` — a diagnostic read, never authority to reassign a sequence
@@ -1287,6 +1296,8 @@ mod tests {
                 fatal_code: 0,
                 audit_floor: Some(log_id()),
                 genesis_hash: vec![0x77; 32],
+                authority_public_key: vec![0xCC; 32],
+                authority_domain: "wire.test".into(),
             }
         );
         round_trip!(
@@ -1575,6 +1586,8 @@ mod tests {
                         fatal_code: 0,
                         audit_floor: None,
                         genesis_hash: vec![0xAB; 32],
+                        authority_public_key: vec![0xCC; 32],
+                        authority_domain: "wire.test".into(),
                     })
                     .expect("encode"),
             ),
@@ -1628,7 +1641,8 @@ mod tests {
         ("AcquireRequestV1", "01ff1e002a70f78395aced17e64200926223f0471c88641a02641c6fcaea2df402851112762485092980d00ed80ec405c829cc29d41e01b0ea010220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10111111111111111111111111111111111e022080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c829226170702e68656164020102"),
         ("MutationReplyWireV1", "01ff1e00371050d40f629748ed4200926223f0471c88641a02641c6fcaea29759498268737b123d780d00ee80eec0ec405d805dc05e005c829cc29d429e61ef229f61e0100000202020020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1011111111111111111111111111111111203333333333333333333333333333333333333333333333333333333333333333fdfdfd"),
         ("RetireClientRequestV1", "01ff1e002930d78a4e8e7a39e44200926223f0471c88641a02641c6fcaea3976249a224e89682367d8921424a6c405c829cc29d0290220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd1011111111111111111111111111111111"),
-        ("GroupStatusReplyWireV1", "01ff1e004fa099a7e555af7cf44200926223f0471c88641a02641c6fcaea3174d1751fd94c13a4bb123d78f401dc0ec405cc05d405ec05fc0305fe0201c829d029da29e21ee61eea1ef21ef81678fc001678fe0129fe041efc052900030206040200fd20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddfdfdfdff1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff1e03032920cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc01081e041a60c8b14607e62de14200926223f0471c88641a02641c6fcaea164e70624418c42920dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd00fdfd20abababababababababababababababababababababababababababababababab"),
+        ("GroupStatusReplyWireV1",
+            "01ff1e0055604d0eb6926176f64200926223f0471c88641a02641c6fcaea3174d1751fd94c13a4bb123d78f401dc0ec405cc05d405ec05fc0305fe0201c829d029da29e21ee61eea1ef21ef81678fc001678fe0129fe041efc0529fc0629fc071500030206040200fd20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddfdfdfdff1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff1e03032920cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc01081e041a60c8b14607e62de14200926223f0471c88641a02641c6fcaea164e70624418c42920dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd00fdfd20abababababababababababababababababababababababababababababababab20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc26776972652e74657374"),
         ("AuditRecordWireV1", "01ff1e002e10e667386bd047e94200926223f0471c88641a02641c6fcaea25f4141a27d8904e88c0e00ee40ec405d405dc05c829cc1ed229da1e0705020e0c20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccfdff1e042080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c829226170702e68656164020102"),
     ];
 }

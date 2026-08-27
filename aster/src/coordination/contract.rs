@@ -387,30 +387,23 @@ mod tests {
             (101, &[3, 4, 6]),
             (102, &[7, 8]),
         ];
-        // Every result code either code space can spell, plus brackets.
-        // Exact slice equality — not membership probes, which an added
-        // result code would survive.
+        // The production mapping is an enumerable constant, so the
+        // comparison is the **complete** key/value set — not sampled probes.
+        // A smuggled operation (2001, anything) fails the equality; a
+        // widened result list fails the per-row slice equality.
+        assert_eq!(
+            super::AUDIT_RESULTS,
+            transcribed,
+            "the production table must equal the transcription in full — \
+             same operations, same order, same result lists"
+        );
+        // And the lookup is exactly the table: every declared key maps to
+        // its row, and the near-bracket codes map to nothing.
         for (operation, allowed) in transcribed {
-            let table = super::audit_results_for(*operation)
-                .unwrap_or_else(|| panic!("§5.2 declares operation {operation}"));
-            assert_eq!(
-                table, *allowed,
-                "operation {operation}'s result list must equal the transcription exactly"
-            );
+            assert_eq!(super::audit_results_for(*operation), Some(*allowed));
         }
-        // And the declared operation-key set equals the transcription's over
-        // a dense sweep — an operation code added to the function without a
-        // transcribed row fails here.
-        let keys: Vec<i32> = transcribed
-            .iter()
-            .map(|(operation, _)| *operation)
-            .collect();
-        for operation in (-1000..=1000).chain([i32::MIN, i32::MAX]) {
-            assert_eq!(
-                super::audit_results_for(operation).is_some(),
-                keys.contains(&operation),
-                "operation {operation}"
-            );
+        for operation in [-1, 0, 12, 99, 103, 2001, i32::MIN, i32::MAX] {
+            assert_eq!(super::audit_results_for(operation), None);
         }
     }
 
@@ -857,41 +850,61 @@ pub const OPERATION_EXPIRE: i32 = 100;
 pub const OPERATION_MEMBERSHIP_PROGRESS: i32 = 101;
 pub const OPERATION_GENESIS: i32 = 102;
 
-/// **The exact §5.2 audit operation × result table** — the one answer to
-/// "which results can this operation record", shared by the durable-state
-/// validator and the client's inbound boundary so the two readers cannot
-/// hold different oracles. `None` for an operation §5.2 does not declare.
+/// **The exact §5.2 audit operation × result table**, as an enumerable
+/// constant — the one answer to "which results can this operation record",
+/// shared by the durable-state validator and the client's inbound boundary
+/// so the two readers cannot hold different oracles, and enumerable so the
+/// independent transcription test compares the **complete** key/value set
+/// rather than probing samples.
 ///
 /// The exact pairing, not merely the code space: `Expire` reporting
 /// `SYS_MEMBERSHIP_MALFORMED`, or `Acquire` reporting `MembershipAccepted`,
 /// are both in the right space and describe results no apply path produces.
-pub fn audit_results_for(operation_code: i32) -> Option<&'static [i32]> {
+pub const AUDIT_RESULTS: &[(i32, &[i32])] = {
     use crate::coordination::reason::Outcome;
     const REJECTED: i32 = Outcome::Rejected as i32;
-    Some(match operation_code {
-        1 => &[Outcome::Granted as i32, REJECTED],
-        2 => &[Outcome::Renewed as i32, REJECTED],
-        3 => &[Outcome::Mutated as i32, REJECTED],
+    &[
+        (1, &[Outcome::Granted as i32, REJECTED]),
+        (2, &[Outcome::Renewed as i32, REJECTED]),
+        (3, &[Outcome::Mutated as i32, REJECTED]),
         // Release and release-with-value share an outcome; they differ in
         // what they write, not in what they report.
-        4 | 5 => &[Outcome::Released as i32, REJECTED],
-        6 => &[Outcome::Revoked as i32, REJECTED],
-        7 => &[Outcome::GrantUpdated as i32, REJECTED],
-        8 => &[Outcome::AdminUpdated as i32, REJECTED],
-        9 => &[Outcome::MembershipAccepted as i32, REJECTED],
-        10 => &[Outcome::ClientRetired as i32, REJECTED],
-        11 => &[Outcome::MembershipCancelled as i32, REJECTED],
-        OPERATION_EXPIRE => &[SYS_EXPIRED, SYS_EXPIRY_STALE, SYS_EXPIRE_MALFORMED],
-        OPERATION_MEMBERSHIP_PROGRESS => &[
-            SYS_MEMBERSHIP_ADVANCED,
-            SYS_MEMBERSHIP_PHASE_MISMATCH,
-            SYS_MEMBERSHIP_MALFORMED,
-        ],
+        (4, &[Outcome::Released as i32, REJECTED]),
+        (5, &[Outcome::Released as i32, REJECTED]),
+        (6, &[Outcome::Revoked as i32, REJECTED]),
+        (7, &[Outcome::GrantUpdated as i32, REJECTED]),
+        (8, &[Outcome::AdminUpdated as i32, REJECTED]),
+        (9, &[Outcome::MembershipAccepted as i32, REJECTED]),
+        (10, &[Outcome::ClientRetired as i32, REJECTED]),
+        (11, &[Outcome::MembershipCancelled as i32, REJECTED]),
+        (
+            OPERATION_EXPIRE,
+            &[SYS_EXPIRED, SYS_EXPIRY_STALE, SYS_EXPIRE_MALFORMED],
+        ),
+        (
+            OPERATION_MEMBERSHIP_PROGRESS,
+            &[
+                SYS_MEMBERSHIP_ADVANCED,
+                SYS_MEMBERSHIP_PHASE_MISMATCH,
+                SYS_MEMBERSHIP_MALFORMED,
+            ],
+        ),
         // Two results and no rejection: a genesis that does not verify is
         // fatal before any row is written, so no audit row can record one.
-        OPERATION_GENESIS => &[SYS_GENESIS_INSTALLED, SYS_GENESIS_ALREADY_INSTALLED],
-        _ => return None,
-    })
+        (
+            OPERATION_GENESIS,
+            &[SYS_GENESIS_INSTALLED, SYS_GENESIS_ALREADY_INSTALLED],
+        ),
+    ]
+};
+
+/// Look one operation up in [`AUDIT_RESULTS`]. `None` for an operation §5.2
+/// does not declare.
+pub fn audit_results_for(operation_code: i32) -> Option<&'static [i32]> {
+    AUDIT_RESULTS
+        .iter()
+        .find(|(operation, _)| *operation == operation_code)
+        .map(|(_, results)| *results)
 }
 
 #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]

@@ -1836,6 +1836,8 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
     // genesis hash are rows of the meta the transaction pinned.
     let audit_floor = cut.meta.audit_floor.clone();
     let genesis_hash = cut.meta.genesis_hash.clone();
+    let authority_public_key = cut.meta.authority_public_key.clone();
+    let authority_domain = cut.meta.authority_domain.clone();
 
     // Advisory: sampled only after the replicated cut, and declared advisory
     // on the wire type. The transaction stays open until the reply is built,
@@ -1880,6 +1882,8 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
         fatal_code: view.fatal.as_ref().map_or(0, |cause| cause.code()),
         audit_floor,
         genesis_hash,
+        authority_public_key,
+        authority_domain,
     };
     respond_reply(call, reply).await;
 }

@@ -1192,6 +1192,12 @@ impl ValidReply for GroupStatusReplyWireV1 {
         if self.genesis_hash.len() != 32 {
             return Err("the status's genesis hash is not 32 bytes".to_string());
         }
+        if self.authority_public_key.len() != 32 {
+            return Err("the status's authority key is not 32 bytes".to_string());
+        }
+        if self.authority_domain.is_empty() {
+            return Err("the status carries no authority domain".to_string());
+        }
         if let Some(op) = &self.pending_operation_id {
             if op.len() != 16 {
                 return Err("the pending operation id is not 16 bytes".to_string());
@@ -2115,6 +2121,8 @@ mod tests {
             fatal_code: 0,
             audit_floor: None,
             genesis_hash: vec![0x11; 32],
+            authority_public_key: vec![0x42; 32],
+            authority_domain: "matrix.test".into(),
         };
         accepted("a ready voter", &request, valid());
 

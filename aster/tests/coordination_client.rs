@@ -1088,6 +1088,8 @@ impl aster::rpc::ServiceDispatch for ForeignStoreService {
                             },
                         ],
                         genesis_hash: vec![0x11; 32],
+                        authority_public_key: vec![0x42; 32],
+                        authority_domain: "client.boundary4".into(),
                         ..Default::default()
                     })
                     .expect("the counterfeit encodes")
@@ -1401,20 +1403,6 @@ async fn a_shapeless_request_leaves_the_journal_ready() {
         );
     }
 
-    // A membership change without the sealed authority facts is refused
-    // before any journaling or network — the group-relative §9 rules cannot
-    // be validated without them, and sending unvalidated would risk the
-    // §10 wedge this test polices.
-    let unsealed = within(
-        "change_membership without authority",
-        client.change_membership([0x77; 16], None, Vec::new(), Vec::new(), Vec::new()),
-    )
-    .await;
-    let Err(err) = unsealed else {
-        panic!("change_membership requires the sealed authority facts")
-    };
-    assert!(format!("{err}").contains("group_authority"), "{err}");
-
     // With the authority sealed and an honest status cut, a plan the
     // group's committed profile can never accept — one voter under
     // production — is refused **client-side** by the same §9 predicate
@@ -1439,7 +1427,6 @@ async fn a_shapeless_request_leaves_the_journal_ready() {
                 .expect("a canonical ticket"),
         ])
         .journal_dir(sealed_journal.path())
-        .group_authority([0x42; 32], "client.boundary4")
         .build()
         .expect("the sealed client builds");
     let impossible = within(
@@ -1462,6 +1449,55 @@ async fn a_shapeless_request_leaves_the_journal_ready() {
         format!("{err}").contains("cannot apply against this group"),
         "the refusal names the group-relative verdict: {err}"
     );
+
+    // A plan fenced on a membership other than the validated cut's is
+    // refused before journaling: the preflight proof is bound to the
+    // request's own fence, never to a cut the request does not name.
+    let misfenced = within(
+        "a plan fenced off the cut",
+        sealed.change_membership(
+            [0x79; 16],
+            Some(aster::coordination::contract::LogIdV1 {
+                term: 1,
+                leader_node_id: vec![0x11; 32],
+                index: 99,
+            }),
+            vec![
+                aster::coordination::contract::NodeIdV1 {
+                    node_id: vec![0x01; 32],
+                },
+                aster::coordination::contract::NodeIdV1 {
+                    node_id: vec![0x02; 32],
+                },
+                aster::coordination::contract::NodeIdV1 {
+                    node_id: vec![0x03; 32],
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    let Err(err) = misfenced else {
+        panic!("a plan fenced off the validated cut must be refused before journaling")
+    };
+    assert!(
+        format!("{err}").contains("fence does not match"),
+        "the refusal names the fence binding: {err}"
+    );
+
+    // And the **sealed** client's journal is untouched by both refusals:
+    // its own next valid mutation resolves from Ready at sequence one.
+    let sealed_resolved = within(
+        "the sealed client's next valid mutation",
+        sealed.acquire(resource(b"sealed-ready-after-refusal"), 60_000),
+    )
+    .await
+    .expect("the sealed client remained Ready");
+    assert_eq!(sealed_resolved.reply().sequence, 1);
+    within("sealed ack", sealed_resolved.acknowledge())
+        .await
+        .expect("ack");
 
     // The journal is untouched: the next valid mutation resolves from Ready
     // at sequence one and acknowledges cleanly.

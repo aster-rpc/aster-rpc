@@ -87,7 +87,6 @@ pub struct CoordinationClientBuilder {
     seeds: BTreeSet<[u8; 32]>,
     journal_dir: Option<PathBuf>,
     seed_error: Option<Error>,
-    authority: Option<([u8; 32], String)>,
 }
 
 impl CoordinationClientBuilder {
@@ -138,22 +137,6 @@ impl CoordinationClientBuilder {
     }
 
     /// Where the durable journal lives. Required for the mutating client.
-    /// Seal the deployment's authority facts — the ROOT public key and
-    /// authority domain from the group's operator documents (§4.1).
-    ///
-    /// Required for `change_membership`: with these plus a linearizable
-    /// status cut, the client runs the **same** §9 plan-shape predicate
-    /// apply runs, so a plan that could only earn a permanent stage-4
-    /// denial is refused before it is journaled (§10 liveness).
-    pub fn group_authority(
-        mut self,
-        root_public_key: [u8; 32],
-        authority_domain: impl Into<String>,
-    ) -> Self {
-        self.authority = Some((root_public_key, authority_domain.into()));
-        self
-    }
-
     pub fn journal_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.journal_dir = Some(dir.into());
         self
@@ -176,7 +159,6 @@ impl CoordinationClientBuilder {
         Ok(CoordinationClient {
             engine,
             journal: Arc::new(Mutex::new(journal)),
-            authority: self.authority,
         })
     }
 
@@ -197,7 +179,6 @@ impl CoordinationClientBuilder {
 pub struct CoordinationClient {
     engine: SharedEngine,
     journal: Arc<Mutex<Journal>>,
-    authority: Option<([u8; 32], String)>,
 }
 
 /// The read-only client (§3.4).
@@ -262,7 +243,6 @@ impl CoordinationClient {
             seeds: BTreeSet::new(),
             journal_dir: None,
             seed_error: None,
-            authority: None,
         }
     }
 
@@ -578,18 +558,25 @@ impl CoordinationClient {
         // be journaled, and the plan-shape rules are group-relative — the
         // committed membership decides which nodes are new, the genesis
         // fixes the profile and the ROOT. So the client runs **the same**
-        // §9 predicate apply runs, against a validated linearizable status
-        // cut and the operator-sealed authority. The voter checks the
-        // membership revision fence before the plan shape, so at apply the
-        // plan is judged against exactly the state it was proven against —
-        // or the fence answers the typed, journal-resolvable `13`.
-        let Some((root_key, domain)) = &self.authority else {
-            return Err(client_error(
-                "change_membership requires the sealed group authority facts; \
-                 supply them with builder.group_authority(root_public_key, domain)",
-            ));
-        };
+        // §9 predicate apply runs, against one validated linearizable
+        // status cut — which carries the group's **replicated** authority
+        // facts (ROOT key and domain), so the proof rests on sealed group
+        // evidence rather than trusted local configuration. The voter
+        // checks the membership revision fence before the plan shape, so at
+        // apply the plan is judged against exactly the state it was proven
+        // against — or the fence answers the typed, journal-resolvable
+        // `13`.
         let status = self.reads().group_status().await?;
+        // The proof is bound to the request's own fence: a plan validated
+        // against this cut but fenced elsewhere could be judged against a
+        // membership it was never proven for. Requiring equality closes it —
+        // and a fence that goes stale after this check answers typed.
+        if expected_membership_log_id != status.membership_log_id {
+            return Err(client_error(
+                "the plan's membership fence does not match the validated status cut; \
+                 re-plan against the current membership",
+            ));
+        }
         let plan = narrow_plan(&desired_voters, &retained_learners, &member_seeds)?;
         let committed = crate::coordination::model::state::CommittedMembership {
             voters: status
@@ -605,8 +592,9 @@ impl CoordinationClient {
             joint: status.membership_joint,
         };
         let authority = crate::coordination::model::state::GroupAuthority {
-            public_key: *root_key,
-            domain: domain.clone(),
+            public_key: <[u8; 32]>::try_from(status.authority_public_key.as_slice())
+                .map_err(|_| client_error("the status cut carries a malformed authority key"))?,
+            domain: status.authority_domain.clone(),
             group_id: *self.engine.group.as_bytes(),
             genesis_hash: <[u8; 32]>::try_from(status.genesis_hash.as_slice())
                 .map_err(|_| client_error("the status cut carries a malformed genesis hash"))?,

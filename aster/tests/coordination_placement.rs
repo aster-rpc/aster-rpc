@@ -879,7 +879,6 @@ async fn admin_client(
     CoordinationClient::builder(node, fixture.group_id())
         .seed_tickets(tickets)
         .journal_dir(journal)
-        .group_authority(fixture.authority_key(), fixture.domain())
         .build()
         .expect("the client builds")
 }
@@ -1377,7 +1376,6 @@ async fn an_unresolvable_journalled_request_stops_reconciliation() {
                 .expect("a canonical ticket"),
         ])
         .journal_dir(journal.path())
-        .group_authority(fixture.authority_key(), fixture.domain())
         .build()
         .expect("the client builds");
 
