@@ -2142,6 +2142,14 @@ mod tests {
             ("Fatal without a cause", Box::new(|r| r.lifecycle_code = 6)),
             ("profile 0", Box::new(|r| r.deployment_profile_code = 0)),
             ("profile 4", Box::new(|r| r.deployment_profile_code = 4)),
+            (
+                "a 31-byte authority key",
+                Box::new(|r| r.authority_public_key = vec![0x42; 31]),
+            ),
+            (
+                "an empty authority domain",
+                Box::new(|r| r.authority_domain = String::new()),
+            ),
         ] {
             let mut reply = valid();
             mutate(&mut reply);
