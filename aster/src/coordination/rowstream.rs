@@ -724,6 +724,16 @@ pub enum BodyError {
     NoOpenSection,
     InvalidRow(&'static str),
     InvalidHeader(&'static str),
+    /// The header's declared bytes are not the canonical encoding of the
+    /// value they decode to — e.g. Fory-tolerated trailing bytes under an
+    /// adjusted length. Distinct from `Decode` (not parseable at all) and
+    /// from `InvalidHeader` (parseable, semantically illegal).
+    NoncanonicalHeader,
+    /// A row's declared bytes are not the canonical encoding of the value
+    /// they decode to.
+    NoncanonicalRow {
+        section: u64,
+    },
     /// A version field this build does not support. Newer is refused, never
     /// skipped: v1 has no automatic cross-version upgrade, so the actionable
     /// diagnostic names the field, what the body declared, and what this
@@ -1067,6 +1077,15 @@ pub fn read_body<R: Read, T: BodyRow>(
     let mut hbuf = vec![0u8; hlen as usize];
     r.read_exact(&mut hbuf).map_err(|_| BodyError::Truncated)?;
     let header = T::Header::decode(&hbuf)?;
+    // Canonicality: the declared bytes must be exactly what this build would
+    // emit for the decoded value. Minimal outer varints alone do not give the
+    // body one encoding, because Fory tolerates trailing bytes — a frame of
+    // `fory(value) || 0x00` decodes to the same value under an adjusted
+    // length, and a genesis could legitimately bind the hash of those
+    // noncanonical bytes. Decode/re-encode equality closes the gap.
+    if T::Header::encode(&header)? != hbuf {
+        return Err(BodyError::NoncanonicalHeader);
+    }
     drop(hbuf);
     header.validate()?;
     v.header(&header)?;
@@ -1122,6 +1141,12 @@ pub fn read_body<R: Read, T: BodyRow>(
             buf.resize(rlen as usize, 0);
             r.read_exact(&mut buf).map_err(|_| BodyError::Truncated)?;
             let row = T::decode(&fory, &buf)?;
+            // Same canonicality rule as the header, per row: Fory's
+            // trailing-byte tolerance must not let two byte streams name one
+            // logical body.
+            if T::encode(&fory, &row)? != buf {
+                return Err(BodyError::NoncanonicalRow { section: sid });
+            }
 
             match row.section() {
                 None => return Err(BodyError::UnknownVariant),
@@ -2337,6 +2362,80 @@ mod tests {
             assert_eq!(
                 read_recovery(&bytes).unwrap_err(),
                 BodyError::InvalidRow(why)
+            );
+        }
+    }
+
+    /// Fory tolerates trailing bytes; the framing must not.
+    ///
+    /// Two stages per case, deliberately. First prove Fory **alone** accepts
+    /// the appended byte and still yields the original value — if a Fory
+    /// upgrade ever makes it strict, this precondition fails loudly and the
+    /// canonicality guard is known to be redundant rather than silently
+    /// double-checked. Then prove `read_body` refuses the same bytes once the
+    /// inner length is adjusted, with the distinct noncanonical error — not
+    /// `Decode`, because the bytes *do* decode; that is the whole problem. A
+    /// new genesis could legitimately bind the BLAKE3 of such a mutated body,
+    /// so the checksum cannot repair this; only the reader can.
+    #[test]
+    fn noncanonical_inner_fory_bytes_are_refused() {
+        // ── Header ──
+        let header = recovery_header_for(RowCountsV1::default());
+        let mut enc = BodyHeader::encode(&header).unwrap();
+        enc.push(0x00);
+        let tolerated = <RecoveryHeaderV1 as BodyHeader>::decode(&enc)
+            .expect("precondition: Fory alone tolerates the trailing byte");
+        assert_eq!(
+            tolerated, header,
+            "precondition: the padded bytes decode to the same value"
+        );
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, enc.len() as u64);
+        bytes.extend_from_slice(&enc);
+        for id in RECOVERY_SECTIONS {
+            write_varint(&mut bytes, *id);
+            write_varint(&mut bytes, 0);
+        }
+        assert_eq!(
+            read_recovery(&bytes).unwrap_err(),
+            BodyError::NoncanonicalHeader
+        );
+
+        // ── Every row variant ──
+        let fory = RecoveryBodyRowV1::fory();
+        let rows = vec![
+            RecoveryBodyRowV1::Resource(rec_resource(1)),
+            RecoveryBodyRowV1::Grant(GrantRowV1 {
+                key: key("p", b"k"),
+                subject_node_id: nid(2),
+                rights: 0x3f,
+            }),
+            r_admin(1),
+        ];
+        for row in rows {
+            let section = row.section().unwrap();
+            let mut enc = RecoveryBodyRowV1::encode(&fory, &row).unwrap();
+            enc.push(0x00);
+            let tolerated = RecoveryBodyRowV1::decode(&fory, &enc)
+                .expect("precondition: Fory alone tolerates the trailing byte");
+            assert_eq!(tolerated, row);
+
+            let mut counts = RowCountsV1::default();
+            counts.set(section, 1);
+            let mut bytes = manual_recovery_bytes(
+                &recovery_header_for(counts),
+                &RECOVERY_SECTIONS
+                    .iter()
+                    .filter(|s| **s <= section)
+                    .map(|s| (*s, u64::from(*s == section)))
+                    .collect::<Vec<_>>(),
+            );
+            write_varint(&mut bytes, enc.len() as u64);
+            bytes.extend_from_slice(&enc);
+            assert_eq!(
+                read_recovery(&bytes).unwrap_err(),
+                BodyError::NoncanonicalRow { section },
+                "section {section}"
             );
         }
     }
