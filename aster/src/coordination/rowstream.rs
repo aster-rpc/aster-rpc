@@ -55,6 +55,27 @@ pub const MAX_SNAPSHOT_BODY_BYTES: u64 = 512 * 1024 * 1024;
 /// another reads as correct precisely because they are all `1` today.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
+/// The recovery **body format** version stamped into
+/// [`RecoveryHeaderV1::format_version`].
+///
+/// Distinct from [`SNAPSHOT_FORMAT_VERSION`] for the same reason that constant
+/// is distinct from the schema and codec versions: the two framings are
+/// separate compatibility concerns and may diverge, and both being `1` today
+/// is exactly the situation in which stamping one from the other reads as
+/// correct. Unlike the snapshot constant — whose enforcement site is the
+/// install path, its only consumer — this one is enforced by the body reader
+/// itself, because a recovery body's consumers include the §13 import and the
+/// golden vectors, and a newer export must be *refused*, never partially read.
+pub const RECOVERY_FORMAT_VERSION: u32 = 1;
+
+/// The logical schema version a v1 recovery header carries.
+///
+/// Declared here because this module compiles in the client graph and
+/// `storage::identity::LOGICAL_SCHEMA_VERSION` is voter-only;
+/// `the_recovery_versions_match_the_storage_identity` pins the two together
+/// under the voter feature.
+pub const RECOVERY_SCHEMA_VERSION: u32 = 1;
+
 /// Per-section limits. One global 1 MiB row cap was far too loose: an admin row
 /// is 32 bytes of payload and had four orders of magnitude of headroom.
 pub struct SectionLimits {
@@ -62,24 +83,28 @@ pub struct SectionLimits {
     pub max_row_bytes: u64,
 }
 
-/// Intent rows a snapshot section may carry.
-///
-/// 65, not 64: §9 retains 64 *terminal* intents and never evicts the active
-/// one, so a legal group holds one more row than the cap. Declared here rather
-/// than imported because `model` is voter-only and this module is in the client
-/// graph; `the_intent_section_limit_matches_the_model` pins the two together
-/// under the voter feature.
-const MAX_INTENT_ROWS: u64 = 65;
-
+/// Row-count caps are the §12.1 constants themselves — `model::limits`
+/// compiles in both graphs precisely because these are contract facts, so the
+/// caps cannot drift from the model the way an earlier local restatement
+/// could. The byte ceilings are framing facts with no model counterpart and
+/// are pinned by `the_section_limits_are_frozen`.
 pub fn limits(section: u64) -> Option<SectionLimits> {
+    use super::model::limits as ml;
     let (max_rows, max_row_bytes) = match section {
-        SECTION_RESOURCES => (100_000u64, 128 * 1024u64), // 64 KiB value + 576 key + framing
-        SECTION_GRANTS => (100_000, 2 * 1024),
-        SECTION_ADMINS => (64, 256),
-        SECTION_SESSIONS => (1_024 + 16_384, 4 * 1024),
-        SECTION_INTENTS => (MAX_INTENT_ROWS, 64 * 1024), // plan carries seeds + permits
-        SECTION_ROUTES => (64, 16 * 1024),               // ticket
-        SECTION_AUDIT => (100_000, 2 * 1024),
+        // 64 KiB value + 576 key + framing
+        SECTION_RESOURCES => (ml::MAX_RESOURCES_PER_GROUP, 128 * 1024u64),
+        SECTION_GRANTS => (ml::MAX_ACL_ROWS_PER_GROUP, 2 * 1024),
+        SECTION_ADMINS => (ml::MAX_ADMINS_PER_GROUP, 256),
+        SECTION_SESSIONS => (
+            ml::MAX_ACTIVE_CLIENTS_PER_GROUP + ml::MAX_RETAINED_SESSIONS_PER_GROUP,
+            4 * 1024,
+        ),
+        // 65, not 64: §9 retains 64 terminal intents and never evicts the
+        // active one, so a legal group holds one more row than the cap. The
+        // plan inside carries seeds + permits, hence the wide ceiling.
+        SECTION_INTENTS => (ml::MAX_INTENT_ROWS, 64 * 1024),
+        SECTION_ROUTES => (ml::MAX_RETAINED_ROUTES, 16 * 1024), // ticket
+        SECTION_AUDIT => (ml::MAX_AUDIT_ROWS, 2 * 1024),
         _ => return None,
     };
     Some(SectionLimits {
@@ -202,6 +227,8 @@ pub trait BodyHeader: Sized + std::fmt::Debug + Clone + PartialEq {
     fn encode(&self) -> Result<Vec<u8>, BodyError>;
     fn decode(bytes: &[u8]) -> Result<Self, BodyError>;
     fn row_counts(&self) -> &RowCountsV1;
+    /// Header-level validation, applied by both the writer and the reader.
+    fn validate(&self) -> Result<(), BodyError>;
 }
 
 impl BodyHeader for SnapshotHeaderV1 {
@@ -219,6 +246,14 @@ impl BodyHeader for SnapshotHeaderV1 {
     fn row_counts(&self) -> &RowCountsV1 {
         &self.row_counts
     }
+    /// Deliberately empty: snapshot header versions and the nested
+    /// `CoordinationMetaV1` are enforced at the install path, the snapshot
+    /// body's only consumer, where a mismatch has its own richer diagnostics
+    /// and fatal/refuse classification. Enforcing them here too would change
+    /// which error that path reports without adding a defense.
+    fn validate(&self) -> Result<(), BodyError> {
+        Ok(())
+    }
 }
 
 impl BodyHeader for RecoveryHeaderV1 {
@@ -235,6 +270,54 @@ impl BodyHeader for RecoveryHeaderV1 {
     }
     fn row_counts(&self) -> &RowCountsV1 {
         &self.row_counts
+    }
+    /// The recovery header is validated by the framing itself: unlike the
+    /// snapshot root it has more than one consumer (the §13 import, the golden
+    /// vectors, operator tooling), so the rules cannot live at one call site.
+    /// A newer version is *refused* — v1 has no cross-version recovery read —
+    /// and the counts the row profile cannot express must be declared zero,
+    /// which was previously a comment rather than a check.
+    fn validate(&self) -> Result<(), BodyError> {
+        if self.format_version != RECOVERY_FORMAT_VERSION {
+            return Err(BodyError::UnsupportedVersion {
+                field: "format_version",
+                declared: self.format_version,
+                supported: RECOVERY_FORMAT_VERSION,
+            });
+        }
+        if self.schema_version != RECOVERY_SCHEMA_VERSION {
+            return Err(BodyError::UnsupportedVersion {
+                field: "schema_version",
+                declared: self.schema_version,
+                supported: RECOVERY_SCHEMA_VERSION,
+            });
+        }
+        if self.source_group_id.len() != 32 {
+            return Err(BodyError::InvalidHeader("source group id must be 32 bytes"));
+        }
+        if self.source_genesis_hash.len() != 32 {
+            return Err(BodyError::InvalidHeader(
+                "source genesis hash must be 32 bytes",
+            ));
+        }
+        if self.source_authority_public_key.len() != 32 {
+            return Err(BodyError::InvalidHeader(
+                "source authority public key must be 32 bytes",
+            ));
+        }
+        if self.source_authority_domain.is_empty()
+            || self.source_authority_domain.len()
+                > super::model::authority::MAX_AUTHORITY_DOMAIN_BYTES
+        {
+            return Err(BodyError::InvalidHeader("source authority domain width"));
+        }
+        let c = &self.row_counts;
+        if c.sessions != 0 || c.intents != 0 || c.routes != 0 || c.audit != 0 {
+            return Err(BodyError::InvalidHeader(
+                "a recovery export declares no sessions, intents, routes, or audit rows",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -640,6 +723,16 @@ pub enum BodyError {
     },
     NoOpenSection,
     InvalidRow(&'static str),
+    InvalidHeader(&'static str),
+    /// A version field this build does not support. Newer is refused, never
+    /// skipped: v1 has no automatic cross-version upgrade, so the actionable
+    /// diagnostic names the field, what the body declared, and what this
+    /// build supports.
+    UnsupportedVersion {
+        field: &'static str,
+        declared: u32,
+        supported: u32,
+    },
     Decode,
     Encode,
     Io,
@@ -726,6 +819,7 @@ pub struct BodyWriter<W: Write, T: BodyRow> {
 
 impl<W: Write, T: BodyRow> BodyWriter<W, T> {
     pub fn new(mut w: W, header: &T::Header) -> Result<Self, BodyError> {
+        header.validate()?;
         let enc = header.encode()?;
         if enc.len() as u64 > MAX_HEADER_BYTES {
             return Err(BodyError::HeaderTooLarge {
@@ -974,6 +1068,7 @@ pub fn read_body<R: Read, T: BodyRow>(
     r.read_exact(&mut hbuf).map_err(|_| BodyError::Truncated)?;
     let header = T::Header::decode(&hbuf)?;
     drop(hbuf);
+    header.validate()?;
     v.header(&header)?;
 
     let mut seen: Vec<u64> = Vec::new();
@@ -1069,22 +1164,50 @@ pub fn read_body<R: Read, T: BodyRow>(
 mod tests {
     use super::*;
 
-    /// The section limit and the model's ceiling are one number.
-    ///
-    /// Declared twice because `model` is voter-only, so this is the only place
-    /// that can compare them -- and a stream that admitted fewer intent rows
-    /// than a store can hold would refuse to carry a legal group's snapshot.
-    #[cfg(feature = "coordination")]
+    /// The section limits are frozen format facts, pinned as the numbers
+    /// themselves. The row caps come from `model::limits`, so this also pins
+    /// those constants against an accidental edit silently changing what the
+    /// frozen v1 framing accepts; the byte ceilings exist only here.
     #[test]
-    fn the_intent_section_limit_matches_the_model() {
+    fn the_section_limits_are_frozen() {
+        let expect: &[(u64, u64, u64)] = &[
+            (SECTION_RESOURCES, 100_000, 128 * 1024),
+            (SECTION_GRANTS, 100_000, 2 * 1024),
+            (SECTION_ADMINS, 64, 256),
+            (SECTION_SESSIONS, 1_024 + 16_384, 4 * 1024),
+            (SECTION_INTENTS, 65, 64 * 1024),
+            (SECTION_ROUTES, 64, 16 * 1024),
+            (SECTION_AUDIT, 100_000, 2 * 1024),
+        ];
+        for &(section, rows, bytes) in expect {
+            let lim = limits(section).unwrap();
+            assert_eq!(lim.max_rows, rows, "row cap for section {section}");
+            assert_eq!(
+                lim.max_row_bytes, bytes,
+                "byte ceiling for section {section}"
+            );
+        }
+        assert!(limits(0).is_none());
+        assert!(limits(8).is_none());
         assert_eq!(
-            MAX_INTENT_ROWS,
-            crate::coordination::model::limits::MAX_INTENT_ROWS
-        );
-        assert_eq!(
-            MAX_INTENT_ROWS,
+            crate::coordination::model::limits::MAX_INTENT_ROWS,
             crate::coordination::model::limits::MAX_RETAINED_INTENTS + 1,
             "64 terminal intents plus the one active intent §9 never evicts"
+        );
+    }
+
+    /// The recovery header's version constants and the storage identity are
+    /// one number each; this is the only module that can compare them, since
+    /// `storage` is voter-only and `rowstream` is in the client graph.
+    #[cfg(feature = "coordination")]
+    #[test]
+    fn the_recovery_versions_match_the_storage_identity() {
+        assert_eq!(RECOVERY_FORMAT_VERSION, 1);
+        assert_eq!(RECOVERY_SCHEMA_VERSION, 1);
+        assert_eq!(SNAPSHOT_FORMAT_VERSION, 1);
+        assert_eq!(
+            RECOVERY_SCHEMA_VERSION,
+            crate::coordination::storage::identity::LOGICAL_SCHEMA_VERSION,
         );
     }
 
@@ -1197,7 +1320,7 @@ mod tests {
         RecoveryHeaderV1 {
             format_version: 1,
             schema_version: 1,
-            source_group_id: vec![7u8; 16],
+            source_group_id: vec![7u8; 32],
             source_genesis_hash: vec![0x11u8; 32],
             source_authority_public_key: nid(3),
             source_authority_domain: "aster0.net".into(),
@@ -1728,7 +1851,11 @@ mod tests {
 
     #[test]
     fn different_insertion_orders_produce_identical_bytes() {
-        let build = |mut rows: Vec<SnapshotBodyRowV1>| {
+        // An earlier version of this test built both byte streams and compared
+        // neither: its closure discarded the writer's output, so the only real
+        // assertion was `full_snapshot() == full_snapshot()` — the same helper,
+        // twice, in the same order. This one returns the bytes.
+        let build = |mut rows: Vec<SnapshotBodyRowV1>| -> Vec<u8> {
             rows.sort_by_key(|r| r.order_key());
             let c = RowCountsV1 {
                 admins: rows.len() as u64,
@@ -1736,23 +1863,79 @@ mod tests {
             };
             let mut w =
                 BodyWriter::<_, SnapshotBodyRowV1>::new(Vec::new(), &header_for(c)).unwrap();
-            w.begin_section(SECTION_ADMINS).unwrap();
-            for r in &rows {
-                w.row(r).unwrap();
+            for section in SNAPSHOT_SECTIONS {
+                w.begin_section(*section).unwrap();
+                if *section == SECTION_ADMINS {
+                    for r in &rows {
+                        w.row(r).unwrap();
+                    }
+                }
             }
-            // Deliberately incomplete profile; compare the bytes written so far.
-            let _ = w.finish();
+            w.finish().unwrap()
         };
         let forward = vec![admin(1), admin(2), admin(3)];
         let reverse = vec![admin(3), admin(1), admin(2)];
         assert_ne!(forward, reverse);
-        build(forward);
-        build(reverse);
+        assert_eq!(build(forward), build(reverse));
+    }
 
-        // Same comparison via the full-profile path.
-        let a = full_snapshot();
-        let b = full_snapshot();
-        assert_eq!(a, b);
+    /// The same property for the root whose bytes a replacement genesis binds:
+    /// two writers fed the same recovery rows in different insertion orders
+    /// emit byte-identical bodies, and therefore one BLAKE3.
+    #[test]
+    fn recovery_bodies_are_byte_deterministic_across_insertion_orders() {
+        let build = |mut rows: Vec<RecoveryBodyRowV1>| -> Vec<u8> {
+            rows.sort_by_key(|r| r.order_key());
+            let (mut nr, mut ng, mut na) = (0u64, 0u64, 0u64);
+            for r in &rows {
+                match r.section().unwrap() {
+                    SECTION_RESOURCES => nr += 1,
+                    SECTION_GRANTS => ng += 1,
+                    _ => na += 1,
+                }
+            }
+            let c = RowCountsV1 {
+                resources: nr,
+                grants: ng,
+                admins: na,
+                ..Default::default()
+            };
+            let mut w =
+                BodyWriter::<_, RecoveryBodyRowV1>::new(Vec::new(), &recovery_header_for(c))
+                    .unwrap();
+            for section in RECOVERY_SECTIONS {
+                w.begin_section(*section).unwrap();
+                for r in rows.iter().filter(|r| r.section() == Some(*section)) {
+                    w.row(r).unwrap();
+                }
+            }
+            w.finish().unwrap()
+        };
+        let forward = vec![
+            RecoveryBodyRowV1::Resource(rec_resource(1)),
+            RecoveryBodyRowV1::Resource(rec_resource(2)),
+            r_admin(1),
+            r_admin(2),
+        ];
+        let reverse = vec![
+            r_admin(2),
+            RecoveryBodyRowV1::Resource(rec_resource(2)),
+            r_admin(1),
+            RecoveryBodyRowV1::Resource(rec_resource(1)),
+        ];
+        let a = build(forward);
+        assert_eq!(a, build(reverse));
+        // And one hash: this equality is what lets the manifest checksum and
+        // the genesis binding name "the" export rather than "an" encoding.
+        assert_eq!(
+            blake3::hash(&a),
+            blake3::hash(&build(vec![
+                RecoveryBodyRowV1::Resource(rec_resource(2)),
+                r_admin(1),
+                r_admin(2),
+                RecoveryBodyRowV1::Resource(rec_resource(1)),
+            ]))
+        );
     }
 
     #[test]
@@ -1763,4 +1946,532 @@ mod tests {
         assert_eq!(streamed.log_id(), streamed.row.log_id((7, 42)));
         assert_eq!(streamed.log_id().term, 7);
     }
+
+    // ── S5-A: recovery-format freeze evidence ────────────────────────────────
+
+    /// An empty-but-complete recovery body under the given header, built by
+    /// hand so tests can splice arbitrary section framing after it.
+    fn manual_recovery_bytes(header: &RecoveryHeaderV1, sections: &[(u64, u64)]) -> Vec<u8> {
+        let enc = BodyHeader::encode(header).unwrap();
+        let mut out = Vec::new();
+        write_varint(&mut out, enc.len() as u64);
+        out.extend_from_slice(&enc);
+        for (id, count) in sections {
+            write_varint(&mut out, *id);
+            write_varint(&mut out, *count);
+        }
+        out
+    }
+
+    fn read_recovery(bytes: &[u8]) -> Result<(), BodyError> {
+        let mut c = Counting::default();
+        read_body::<_, RecoveryBodyRowV1>(&mut &bytes[..], &mut c)
+    }
+
+    /// The recovery header is validated by both ends of the framing: an
+    /// unsupported *newer* version is refused with a diagnostic naming the
+    /// field and both values — never skipped — and the widths/counts the row
+    /// profile cannot check are checked here.
+    #[test]
+    fn a_recovery_header_is_validated_by_both_ends() {
+        let ok = recovery_header_for(RowCountsV1::default());
+        assert!(BodyWriter::<Vec<u8>, RecoveryBodyRowV1>::new(Vec::new(), &ok).is_ok());
+
+        let cases: Vec<(RecoveryHeaderV1, BodyError)> = vec![
+            (
+                RecoveryHeaderV1 {
+                    format_version: 2,
+                    ..recovery_header_for(RowCountsV1::default())
+                },
+                BodyError::UnsupportedVersion {
+                    field: "format_version",
+                    declared: 2,
+                    supported: RECOVERY_FORMAT_VERSION,
+                },
+            ),
+            (
+                RecoveryHeaderV1 {
+                    schema_version: 9,
+                    ..recovery_header_for(RowCountsV1::default())
+                },
+                BodyError::UnsupportedVersion {
+                    field: "schema_version",
+                    declared: 9,
+                    supported: RECOVERY_SCHEMA_VERSION,
+                },
+            ),
+            (
+                RecoveryHeaderV1 {
+                    source_group_id: vec![7u8; 16],
+                    ..recovery_header_for(RowCountsV1::default())
+                },
+                BodyError::InvalidHeader("source group id must be 32 bytes"),
+            ),
+            (
+                RecoveryHeaderV1 {
+                    source_genesis_hash: vec![0x11u8; 31],
+                    ..recovery_header_for(RowCountsV1::default())
+                },
+                BodyError::InvalidHeader("source genesis hash must be 32 bytes"),
+            ),
+            (
+                RecoveryHeaderV1 {
+                    source_authority_public_key: Vec::new(),
+                    ..recovery_header_for(RowCountsV1::default())
+                },
+                BodyError::InvalidHeader("source authority public key must be 32 bytes"),
+            ),
+            (
+                RecoveryHeaderV1 {
+                    source_authority_domain: String::new(),
+                    ..recovery_header_for(RowCountsV1::default())
+                },
+                BodyError::InvalidHeader("source authority domain width"),
+            ),
+            (
+                RecoveryHeaderV1 {
+                    source_authority_domain: "a".repeat(129),
+                    ..recovery_header_for(RowCountsV1::default())
+                },
+                BodyError::InvalidHeader("source authority domain width"),
+            ),
+            (
+                recovery_header_for(RowCountsV1 {
+                    sessions: 1,
+                    ..Default::default()
+                }),
+                BodyError::InvalidHeader(
+                    "a recovery export declares no sessions, intents, routes, or audit rows",
+                ),
+            ),
+            (
+                recovery_header_for(RowCountsV1 {
+                    audit: 7,
+                    ..Default::default()
+                }),
+                BodyError::InvalidHeader(
+                    "a recovery export declares no sessions, intents, routes, or audit rows",
+                ),
+            ),
+        ];
+        for (header, expect) in cases {
+            // Writer side.
+            let got = BodyWriter::<Vec<u8>, RecoveryBodyRowV1>::new(Vec::new(), &header)
+                .err()
+                .expect("the writer must refuse the header");
+            assert_eq!(got, expect);
+            // Reader side, through the real decoder: the header still encodes
+            // (the shape is legal Fory), so the refusal is semantic, not a
+            // parse accident.
+            let bytes = manual_recovery_bytes(&header, &[]);
+            assert_eq!(read_recovery(&bytes).unwrap_err(), expect);
+        }
+    }
+
+    /// Section ids must strictly ascend in both directions; a repeated or
+    /// descending section is `SectionOutOfOrder`, not a silent merge.
+    #[test]
+    fn section_order_is_enforced_in_both_directions() {
+        // Writer: grants then resources.
+        let h = recovery_header_for(RowCountsV1::default());
+        let mut w = BodyWriter::<Vec<u8>, RecoveryBodyRowV1>::new(Vec::new(), &h).unwrap();
+        w.begin_section(SECTION_GRANTS).unwrap();
+        assert_eq!(
+            w.begin_section(SECTION_RESOURCES).unwrap_err(),
+            BodyError::SectionOutOfOrder {
+                got: SECTION_RESOURCES,
+                previous: SECTION_GRANTS
+            }
+        );
+        // Writer: the same section twice.
+        let mut w = BodyWriter::<Vec<u8>, RecoveryBodyRowV1>::new(
+            Vec::new(),
+            &recovery_header_for(RowCountsV1::default()),
+        )
+        .unwrap();
+        w.begin_section(SECTION_ADMINS).unwrap();
+        assert_eq!(
+            w.begin_section(SECTION_ADMINS).unwrap_err(),
+            BodyError::SectionOutOfOrder {
+                got: SECTION_ADMINS,
+                previous: SECTION_ADMINS
+            }
+        );
+        // Reader: section 2 then section 1.
+        let bytes = manual_recovery_bytes(
+            &recovery_header_for(RowCountsV1::default()),
+            &[(SECTION_GRANTS, 0), (SECTION_RESOURCES, 0)],
+        );
+        assert_eq!(
+            read_recovery(&bytes).unwrap_err(),
+            BodyError::SectionOutOfOrder {
+                got: SECTION_RESOURCES,
+                previous: SECTION_GRANTS
+            }
+        );
+    }
+
+    /// A recovery body naming an authority-bearing section is refused by
+    /// section id alone — pinned as `IllegalSection`, complementing the
+    /// whole-snapshot cross-decode test whose refusal may fire earlier at row
+    /// decode.
+    #[test]
+    fn a_recovery_reader_pins_the_illegal_section() {
+        let bytes = manual_recovery_bytes(
+            &recovery_header_for(RowCountsV1::default()),
+            &[
+                (SECTION_RESOURCES, 0),
+                (SECTION_GRANTS, 0),
+                (SECTION_ADMINS, 0),
+                (SECTION_SESSIONS, 0),
+            ],
+        );
+        assert_eq!(
+            read_recovery(&bytes).unwrap_err(),
+            BodyError::IllegalSection(SECTION_SESSIONS)
+        );
+    }
+
+    /// Declared lengths are checked before any allocation or read from them:
+    /// each stream below *ends* immediately after the hostile declaration, so
+    /// reaching for the promised bytes would report `Truncated` — the specific
+    /// error asserted proves the bound fired first.
+    #[test]
+    fn preallocation_bounds_fire_before_any_read() {
+        // Header length over MAX_HEADER_BYTES.
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, MAX_HEADER_BYTES + 1);
+        assert_eq!(
+            read_recovery(&bytes).unwrap_err(),
+            BodyError::HeaderTooLarge {
+                declared: MAX_HEADER_BYTES + 1
+            }
+        );
+
+        // Row count over the section cap, declared in the section framing.
+        // The header must agree (its counts are compared later), so it is
+        // built with the same hostile count — which the header validation
+        // does not cap-check, the section framing does.
+        let over = limits(SECTION_ADMINS).unwrap().max_rows + 1;
+        let bytes = manual_recovery_bytes(
+            &recovery_header_for(RowCountsV1 {
+                admins: over,
+                ..Default::default()
+            }),
+            &[
+                (SECTION_RESOURCES, 0),
+                (SECTION_GRANTS, 0),
+                (SECTION_ADMINS, over),
+            ],
+        );
+        assert_eq!(
+            read_recovery(&bytes).unwrap_err(),
+            BodyError::RowCountTooLarge {
+                section: SECTION_ADMINS,
+                declared: over,
+                max: limits(SECTION_ADMINS).unwrap().max_rows,
+            }
+        );
+
+        // Writer side of the same bound.
+        let header = recovery_header_for(RowCountsV1 {
+            admins: over,
+            ..Default::default()
+        });
+        let mut w = BodyWriter::<Vec<u8>, RecoveryBodyRowV1>::new(Vec::new(), &header).unwrap();
+        w.begin_section(SECTION_RESOURCES).unwrap();
+        w.begin_section(SECTION_GRANTS).unwrap();
+        assert_eq!(
+            w.begin_section(SECTION_ADMINS).unwrap_err(),
+            BodyError::RowCountTooLarge {
+                section: SECTION_ADMINS,
+                declared: over,
+                max: limits(SECTION_ADMINS).unwrap().max_rows,
+            }
+        );
+
+        // Row length over the section's byte ceiling. Writer-side is
+        // unreachable for a validated row — §12.1 ceilings admit every
+        // maximal legal row and validation rejects wider ones first — so the
+        // reader-side declaration is the live edge.
+        let ceiling = limits(SECTION_ADMINS).unwrap().max_row_bytes;
+        let mut bytes = manual_recovery_bytes(
+            &recovery_header_for(RowCountsV1 {
+                admins: 1,
+                ..Default::default()
+            }),
+            &[
+                (SECTION_RESOURCES, 0),
+                (SECTION_GRANTS, 0),
+                (SECTION_ADMINS, 1),
+            ],
+        );
+        write_varint(&mut bytes, ceiling + 1);
+        assert_eq!(
+            read_recovery(&bytes).unwrap_err(),
+            BodyError::RowTooLarge {
+                section: SECTION_ADMINS,
+                declared: ceiling + 1,
+                max: ceiling,
+            }
+        );
+    }
+
+    /// The recovery root refuses the same framing corruption the snapshot
+    /// tests pin: a trailing partial varint is `Truncated`, not a clean EOF,
+    /// and a non-minimal LEB128 is refused even where the value would be
+    /// legal.
+    #[test]
+    fn recovery_framing_rejects_truncation_and_non_minimal_varints() {
+        let good = {
+            let mut w = BodyWriter::<_, RecoveryBodyRowV1>::new(
+                Vec::new(),
+                &recovery_header_for(RowCountsV1 {
+                    admins: 1,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+            w.begin_section(SECTION_RESOURCES).unwrap();
+            w.begin_section(SECTION_GRANTS).unwrap();
+            w.begin_section(SECTION_ADMINS).unwrap();
+            w.row(&r_admin(1)).unwrap();
+            w.finish().unwrap()
+        };
+        assert!(read_recovery(&good).is_ok());
+
+        // A trailing partial varint after a valid body.
+        let mut truncated = good.clone();
+        truncated.push(0x80);
+        assert_eq!(read_recovery(&truncated).unwrap_err(), BodyError::Truncated);
+
+        // Cut mid-row.
+        let cut = &good[..good.len() - 1];
+        assert_eq!(read_recovery(cut).unwrap_err(), BodyError::Truncated);
+
+        // A non-minimal section id where a section id is expected: the body
+        // is complete through section 3, then declares `[0x81, 0x00]` — a
+        // two-byte encoding of 1.
+        let mut nonminimal = good.clone();
+        nonminimal.extend_from_slice(&[0x81, 0x00]);
+        assert_eq!(
+            read_recovery(&nonminimal).unwrap_err(),
+            BodyError::NonMinimalVarint
+        );
+    }
+
+    /// Recovery rows are logically validated on both ends — widths and rights
+    /// bits the byte ceiling does not imply, for the root whose bytes a
+    /// genesis binds. The snapshot-row test cannot stand in for this: the two
+    /// roots have separate validators.
+    #[test]
+    fn recovery_rows_are_logically_validated() {
+        let cases: Vec<(RecoveryBodyRowV1, &str)> = vec![
+            (
+                RecoveryBodyRowV1::Resource(RecoveryResourceRowV1 {
+                    value: vec![0u8; MAX_VALUE + 1],
+                    ..rec_resource(1)
+                }),
+                "value width",
+            ),
+            (
+                RecoveryBodyRowV1::Grant(GrantRowV1 {
+                    key: key("p", b"k"),
+                    subject_node_id: nid(2),
+                    rights: 0x40,
+                }),
+                "unknown rights bits",
+            ),
+            (
+                RecoveryBodyRowV1::Grant(GrantRowV1 {
+                    key: key("p", b"k"),
+                    subject_node_id: vec![2u8; 4],
+                    rights: 1,
+                }),
+                "node id must be 32 bytes",
+            ),
+            (
+                RecoveryBodyRowV1::Admin(AdminRowV1 {
+                    subject_node_id: vec![1u8; 31],
+                }),
+                "node id must be 32 bytes",
+            ),
+        ];
+        for (row, why) in cases {
+            assert_eq!(
+                validate_recovery_row(&row).unwrap_err(),
+                BodyError::InvalidRow(why)
+            );
+            // Writer side refuses to emit it.
+            let section = row.section().unwrap();
+            let mut counts = RowCountsV1::default();
+            counts.set(section, 1);
+            let mut w = BodyWriter::<Vec<u8>, RecoveryBodyRowV1>::new(
+                Vec::new(),
+                &recovery_header_for(counts),
+            )
+            .unwrap();
+            for s in RECOVERY_SECTIONS {
+                if *s > section {
+                    break;
+                }
+                w.begin_section(*s).unwrap();
+            }
+            assert_eq!(w.row(&row).unwrap_err(), BodyError::InvalidRow(why));
+            // Reader side refuses the same row arriving in raw bytes.
+            let mut bytes = manual_recovery_bytes(
+                &recovery_header_for({
+                    let mut c = RowCountsV1::default();
+                    c.set(section, 1);
+                    c
+                }),
+                &RECOVERY_SECTIONS
+                    .iter()
+                    .filter(|s| **s <= section)
+                    .map(|s| (*s, if *s == section { 1 } else { 0 }))
+                    .collect::<Vec<_>>(),
+            );
+            let enc = RecoveryBodyRowV1::encode(&RecoveryBodyRowV1::fory(), &row).unwrap();
+            write_varint(&mut bytes, enc.len() as u64);
+            bytes.extend_from_slice(&enc);
+            assert_eq!(
+                read_recovery(&bytes).unwrap_err(),
+                BodyError::InvalidRow(why)
+            );
+        }
+    }
+
+    /// Independent golden vectors for the recovery format (S5-A).
+    ///
+    /// These pin the exact bytes — header root, each row root, the complete
+    /// framed body, and the BLAKE3 a replacement genesis would bind — so a
+    /// codec, framing, or declaration change is a visible re-pin, never a
+    /// silent drift. The body vector is the full §13 canonical form: header
+    /// length varint, Fory header, all three sections in ascending order.
+    #[test]
+    fn golden_recovery_vectors_are_unchanged() {
+        fn to_hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+
+        let header = RecoveryHeaderV1 {
+            format_version: RECOVERY_FORMAT_VERSION,
+            schema_version: RECOVERY_SCHEMA_VERSION,
+            source_group_id: vec![0xAA; 32],
+            source_genesis_hash: vec![0xBB; 32],
+            source_authority_public_key: vec![0xCC; 32],
+            source_authority_domain: "aster0.net".into(),
+            source_last_applied: Some(LogIdV1 {
+                term: 3,
+                leader_node_id: vec![0xDD; 32],
+                index: 41,
+            }),
+            source_membership: StoredMembershipV1::default(),
+            source_audit_floor: None,
+            source_audit_tip: Some(LogIdV1 {
+                term: 3,
+                leader_node_id: vec![0xDD; 32],
+                index: 40,
+            }),
+            source_admin_revision: 5,
+            row_counts: RowCountsV1 {
+                resources: 1,
+                grants: 1,
+                admins: 1,
+                ..Default::default()
+            },
+        };
+        let resource = RecoveryResourceRowV1 {
+            key: key("portal.roaming", b"tree-1"),
+            source_epoch: 9,
+            ttl_ms: 30_000,
+            lease_revision: 4,
+            value_revision: 7,
+            value: vec![0x01, 0x02, 0x03],
+            acl_revision: 2,
+        };
+        let grant = GrantRowV1 {
+            key: key("portal.roaming", b"tree-1"),
+            subject_node_id: vec![0xEE; 32],
+            rights: 0x3f,
+        };
+        let admin = AdminRowV1 {
+            subject_node_id: vec![0xEE; 32],
+        };
+
+        let body = {
+            let mut w = BodyWriter::<_, RecoveryBodyRowV1>::new(Vec::new(), &header).unwrap();
+            w.begin_section(SECTION_RESOURCES).unwrap();
+            w.row(&RecoveryBodyRowV1::Resource(resource.clone()))
+                .unwrap();
+            w.begin_section(SECTION_GRANTS).unwrap();
+            w.row(&RecoveryBodyRowV1::Grant(grant.clone())).unwrap();
+            w.begin_section(SECTION_ADMINS).unwrap();
+            w.row(&RecoveryBodyRowV1::Admin(admin.clone())).unwrap();
+            w.finish().unwrap()
+        };
+        // The pinned body must read back cleanly: the vector is canonical, not
+        // merely stable.
+        assert!(read_recovery(&body).is_ok());
+
+        let fory = RecoveryBodyRowV1::fory();
+        let actual: Vec<(&str, String)> = vec![
+            (
+                "RecoveryHeaderV1",
+                to_hex(&BodyHeader::encode(&header).unwrap()),
+            ),
+            (
+                "RecoveryBodyRowV1::Resource",
+                to_hex(
+                    &RecoveryBodyRowV1::encode(&fory, &RecoveryBodyRowV1::Resource(resource))
+                        .unwrap(),
+                ),
+            ),
+            (
+                "RecoveryBodyRowV1::Grant",
+                to_hex(
+                    &RecoveryBodyRowV1::encode(&fory, &RecoveryBodyRowV1::Grant(grant)).unwrap(),
+                ),
+            ),
+            (
+                "RecoveryBodyRowV1::Admin",
+                to_hex(
+                    &RecoveryBodyRowV1::encode(&fory, &RecoveryBodyRowV1::Admin(admin)).unwrap(),
+                ),
+            ),
+            ("recovery_body", to_hex(&body)),
+            (
+                "recovery_body_blake3",
+                blake3::hash(&body).to_hex().to_string(),
+            ),
+        ];
+
+        let expected: &[(&str, &str)] = GOLDEN_RECOVERY;
+        let matches = actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected.iter())
+                .all(|((an, ah), (en, eh))| an == en && ah == eh);
+        if !matches {
+            let rendered: String = actual
+                .iter()
+                .map(|(n, h)| format!("    (\"{n}\", \"{h}\"),\n"))
+                .collect();
+            panic!(
+                "recovery encodings changed. If the change is intended and \
+                 recorded, update GOLDEN_RECOVERY to:\n{rendered}"
+            );
+        }
+    }
+
+    /// Pinned 2026-08-27 from the first encode of the frozen declarations
+    /// (S5-A); from then on it pins the §13 recovery format.
+    const GOLDEN_RECOVERY: &[(&str, &str)] = &[
+        ("RecoveryHeaderV1", "01ff1e003640feff5538fd52ec4200926223f0471c88641a02641c6fcaea2df62413aa48e3a720064880ec0ec40cc80ccc29d029d429d815de1ee01ee61eea1ef01e05010120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2a6173746572302e6e6574ff1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd1e0423905a2b61cfa86ee24200926223f0471c88641a02641c6fcaea31f65374483eb08c092323a1e0c61ec81efd1e0620c0a01f31e86b34e24200926223f0471c88641a02641c6fcaea1fb08c092323a1e0c41678c816780000fdff1e03032820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd1e0828300991f9eaaa66e74200926223f0471c88641a02641c6fcaea1e5672ce1ca1a9a4c40ec80ecc0ed00ed40ed80edc0e01010100000000"),
+        ("RecoveryBodyRowV1::Resource", "01ff23001f600e3d914d5f70054200926223f0471c88641a02641c6fcaea325620472a222c36706c5672c001001e022f00b9a04aa9d63de74200926223f0471c88641a02641c6fcaea39762413aa48e3b1249d48889d8bacc80ecc0ed00ed40edc0ec41ed82909b0ea010407021e042080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c8293a706f7274616c2e726f616d696e6706747265652d3103010203"),
+        ("RecoveryBodyRowV1::Grant", "01ff23001f600e3d914d5f70054200926223f0471c88641a02641c6fcaea325620472a222c36706c5672c002001e0220c0c28f1e012224e34200926223f0471c88641a02641c6fcaea1ec08806a759cb00cc0ec41ec8293f1e042080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c8293a706f7274616c2e726f616d696e6706747265652d3120eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        ("RecoveryBodyRowV1::Admin", "01ff23001f600e3d914d5f70054200926223f0471c88641a02641c6fcaea325620472a222c36706c5672c003001e021c1034a7e7c96b1ce14200926223f0471c88641a02641c6fcaea1eb419841b59cb00c42920eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        ("recovery_body", "b80301ff1e003640feff5538fd52ec4200926223f0471c88641a02641c6fcaea2df62413aa48e3a720064880ec0ec40cc80ccc29d029d429d815de1ee01ee61eea1ef01e05010120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2a6173746572302e6e6574ff1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd1e0423905a2b61cfa86ee24200926223f0471c88641a02641c6fcaea31f65374483eb08c092323a1e0c61ec81efd1e0620c0a01f31e86b34e24200926223f0471c88641a02641c6fcaea1fb08c092323a1e0c41678c816780000fdff1e03032820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd1e0828300991f9eaaa66e74200926223f0471c88641a02641c6fcaea1e5672ce1ca1a9a4c40ec80ecc0ed00ed40ed80edc0e010101000000000101b10101ff23001f600e3d914d5f70054200926223f0471c88641a02641c6fcaea325620472a222c36706c5672c001001e022f00b9a04aa9d63de74200926223f0471c88641a02641c6fcaea39762413aa48e3b1249d48889d8bacc80ecc0ed00ed40edc0ec41ed82909b0ea010407021e042080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c8293a706f7274616c2e726f616d696e6706747265652d31030102030201b90101ff23001f600e3d914d5f70054200926223f0471c88641a02641c6fcaea325620472a222c36706c5672c002001e0220c0c28f1e012224e34200926223f0471c88641a02641c6fcaea1ec08806a759cb00cc0ec41ec8293f1e042080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c8293a706f7274616c2e726f616d696e6706747265652d3120eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee03017401ff23001f600e3d914d5f70054200926223f0471c88641a02641c6fcaea325620472a222c36706c5672c003001e021c1034a7e7c96b1ce14200926223f0471c88641a02641c6fcaea1eb419841b59cb00c42920eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        ("recovery_body_blake3", "ddf8ef56eb535a921d550b4791b0a03009a648fdb9d5a3c06237577aa07ab51d"),
+    ];
 }

@@ -730,6 +730,55 @@ mod tests {
         );
     }
 
+    /// A golden byte pin for the §13 provenance record inside its storage
+    /// root (S5-A). `RecoveredFromV1` is nested, not a standalone payload, so
+    /// the vector pins the `CoordinationMetaV1` that carries it — the exact
+    /// bytes every initial voter of a recovered group persists identically and
+    /// every later snapshot re-emits.
+    #[test]
+    fn golden_recovered_from_meta_bytes_are_unchanged() {
+        let log = LogIdV1 {
+            term: 3,
+            leader_node_id: vec![0xDD; 32],
+            index: 41,
+        };
+        let meta = CoordinationMetaV1 {
+            schema_version: 1,
+            group_id: vec![0xAA; 32],
+            genesis_hash: vec![0xBB; 32],
+            authority_public_key: vec![0xCC; 32],
+            authority_domain: "aster0.net".into(),
+            deployment_profile_code: 1,
+            last_applied: Some(log.clone()),
+            membership: StoredMembershipV1::default(),
+            admin_revision: 2,
+            recovery_export_hash: Some(vec![0xEE; 32]),
+            recovered_from: Some(RecoveredFromV1 {
+                source_group_id: vec![0x11; 32],
+                source_genesis_hash: vec![0x22; 32],
+                source_authority_public_key: vec![0x33; 32],
+                source_authority_domain: "old.aster0.net".into(),
+                export_hash: vec![0xEE; 32],
+                source_last_applied: Some(log),
+            }),
+            aggregate_growth_bytes: 4096,
+            aggregate_reserve_bytes: 512,
+            audit_floor: None,
+        };
+        let encoded = payload_fory::<CoordinationMetaV1>()
+            .serialize(&meta)
+            .expect("encode");
+        let hex: String = encoded.iter().map(|x| format!("{x:02x}")).collect();
+        // Pinned 2026-08-27 from the first encode of the frozen declaration.
+        let golden = "01ff1e003b8068b61b0e7e19ee4200926223f0471c88641a02641c6fcaea31f44e7446868268737ac24c00e40ef00ef40ed805c40cc829cc29d029d415de1ee01eea29ee1efa1e0280208004020120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2a6173746572302e6e6574ff1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd1e0423905a2b61cfa86ee24200926223f0471c88641a02641c6fcaea31f65374483eb08c092323a1e0c61ec81efd1e0620c0a01f31e86b34e24200926223f0471c88641a02641c6fcaea1fb08c092323a1e0c41678c816780000ff20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeff1e082910d5084713e80ee64200926223f0471c88641a02641c6fcaea29762413aa48907d2c5cc0c429c829cc29d015d429da1e2011111111111111111111111111111111111111111111111111111111111111112022222222222222222222222222222222222222222222222222222222222222222033333333333333333333333333333333333333333333333333333333333333333a6f6c642e6173746572302e6e657420eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeff1e03032920ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddfd";
+        if hex != golden {
+            panic!(
+                "CoordinationMetaV1 (recovered) encoding changed. If the \
+                 change is intended and recorded, update the pin to:\n{hex}"
+            );
+        }
+    }
+
     /// Every wire root round-trips at its **empty** and its **maximal** shape,
     /// not only at a convenient middle one. Empty collections and absent
     /// options are where a codec most often substitutes a default, and the

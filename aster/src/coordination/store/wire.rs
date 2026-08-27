@@ -1607,6 +1607,39 @@ mod tests {
                     })
                     .expect("encode"),
             ),
+            (
+                "RecoveryExportRequestV1",
+                payload_fory::<RecoveryExportRequestV1>()
+                    .serialize(&RecoveryExportRequestV1 {
+                        protocol_version: 1,
+                        group_id: vec![0xAA; 32],
+                    })
+                    .expect("encode"),
+            ),
+            (
+                "RecoveryExportFrameV1::Manifest",
+                payload_fory::<RecoveryExportFrameV1>()
+                    .serialize(&RecoveryExportFrameV1::Manifest(
+                        RecoveryExportManifestWireV1 {
+                            protocol_version: 1,
+                            group_id: vec![0xAA; 32],
+                            total_len: 10,
+                            blake3_checksum: vec![0x44; 32],
+                            applied_log_id: Some(log_id()),
+                        },
+                    ))
+                    .expect("encode"),
+            ),
+            (
+                "RecoveryExportFrameV1::Chunk",
+                payload_fory::<RecoveryExportFrameV1>()
+                    .serialize(&RecoveryExportFrameV1::Chunk(RecoveryExportChunkWireV1 {
+                        offset: 0,
+                        data: b"0123456789".to_vec(),
+                        final_chunk: true,
+                    }))
+                    .expect("encode"),
+            ),
         ];
 
         let actual: Vec<(String, String)> = vectors
@@ -1636,6 +1669,8 @@ mod tests {
     /// closure: `GroupStatusReplyWireV1` gained the replicated `audit_floor`
     /// (id 19) and `genesis_hash` (id 20) trailing fields — a recorded,
     /// intended extension of the pre-release v1 reply; every other vector is
+    /// byte-identical. Extended 2026-08-27 (S5-A) with the recovery-export
+    /// request and both stream-frame variants; every prior vector is
     /// byte-identical.
     const GOLDEN: &[(&str, &str)] = &[
         ("AcquireRequestV1", "01ff1e002a70f78395aced17e64200926223f0471c88641a02641c6fcaea2df402851112762485092980d00ed80ec405c829cc29d41e01b0ea010220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10111111111111111111111111111111111e022080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c829226170702e68656164020102"),
@@ -1644,5 +1679,8 @@ mod tests {
         ("GroupStatusReplyWireV1",
             "01ff1e0055604d0eb6926176f64200926223f0471c88641a02641c6fcaea3174d1751fd94c13a4bb123d78f401dc0ec405cc05d405ec05fc0305fe0201c829d029da29e21ee61eea1ef21ef81678fc001678fe0129fe041efc0529fc0629fc071500030206040200fd20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddfdfdfdff1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff1e03032920cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc01081e041a60c8b14607e62de14200926223f0471c88641a02641c6fcaea164e70624418c42920dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd00fdfd20abababababababababababababababababababababababababababababababab20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc26776972652e74657374"),
         ("AuditRecordWireV1", "01ff1e002e10e667386bd047e94200926223f0471c88641a02641c6fcaea25f4141a27d8904e88c0e00ee40ec405d405dc05c829cc1ed229da1e0705020e0c20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccfdff1e042080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c829226170702e68656164020102"),
+        ("RecoveryExportRequestV1", "01ff1e002760f3c1a3a8e81ee24200926223f0471c88641a02641c6fcaea41f62413aa48e3a4bbdd19f62485092980c405c8290220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ("RecoveryExportFrameV1::Manifest", "01ff230021f013608d4b9108054200926223f0471c88641a02641c6fcaea39762413aa48e3a4bbdd19f4b1030801001e022d40225367125543e54200926223f0471c88641a02641c6fcaea41762413aa48e3a4bbdd19f5806a0a494ccc0ec405c829d029d61e0a0220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa204444444444444444444444444444444444444444444444444444444444444444ff1e041db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+        ("RecoveryExportFrameV1::Chunk", "01ff230021f013608d4b9108054200926223f0471c88641a02641c6fcaea39762413aa48e3a4bbdd19f4b1030802001e022720dcc25fa4592fe34200926223f0471c88641a02641c6fcaea39762413aa48e3a4bbdd19f447a354cc01c40ec82901000a30313233343536373839"),
     ];
 }

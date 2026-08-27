@@ -1492,6 +1492,127 @@ async fn a_follower_answers_unavailable_with_the_leader_hint() {
     }
 }
 
+/// **A minority or follower cannot create a recovery export** (§13, S5-A).
+///
+/// The §13 rule this evidences: an export exists only while the source group
+/// has a linearizable leader, so a disaster discovered late cannot be papered
+/// over by blessing whatever state a survivor happens to hold. The actor here
+/// is ROOT — an administrator everywhere — so both refusals are about
+/// leadership and quorum, never permission:
+///
+/// 1. a follower refuses the export with the leader hint, administrator or
+///    not;
+/// 2. the leader serves the identical request — the control that separates
+///    "refused because follower" from "refused because broken";
+/// 3. after the other two voters are gone, the survivor refuses the same
+///    request and emits no manifest: one voter of three holds the same bytes,
+///    but cannot bless them as a recovery point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_minority_or_follower_cannot_create_a_recovery_export() {
+    let fixture = GroupFixture::new("store.exportquorum", 0xE3, 3);
+    let dirs: Vec<tempfile::TempDir> = (0..3)
+        .map(|_| tempfile::tempdir().expect("a directory"))
+        .collect();
+    let mut voters = Vec::new();
+    for (index, dir) in dirs.iter().enumerate() {
+        voters.push(
+            AsterServer::builder()
+                .config(fixture.aster_config(index))
+                .builtin_coordination(fixture.config(dir.path(), index))
+                .start()
+                .await
+                .expect("a voter starts"),
+        );
+    }
+    let addrs: Vec<_> = voters.iter().map(|v| v.node().addr()).collect();
+    for voter in &voters {
+        for addr in &addrs {
+            if addr.node_id != voter.node().addr().node_id {
+                voter
+                    .node()
+                    .add_node_addr(addr.clone())
+                    .expect("register a peer");
+            }
+        }
+    }
+    for voter in &voters {
+        within(
+            "readiness",
+            voter.coordination().expect("hosted").wait_ready(),
+        )
+        .await
+        .expect("the group becomes ready");
+    }
+
+    let leader_id = voters[0]
+        .coordination()
+        .expect("hosted")
+        .current_leader_for_testing()
+        .expect("a ready group has a leader");
+    let is_leader = |v: &AsterServer| {
+        aster::coordination::ids::CoordinationNodeId::parse_hex(v.node().id().as_str())
+            .expect("a voter id")
+            == leader_id
+    };
+    let request = RecoveryExportRequestV1 {
+        protocol_version: STORE_PROTOCOL_VERSION,
+        group_id: fixture.group_id().as_bytes().to_vec(),
+    };
+
+    // 1. A follower refuses ROOT itself, with the leader hint.
+    let follower = voters.iter().find(|v| !is_leader(v)).expect("a follower");
+    let root_at_follower = Client::connect(root_secret(0xE3), &fixture, follower).await;
+    let (code, _, details) = call_refused(&root_at_follower, "recovery_export", &request).await;
+    assert_eq!(
+        code, UNAVAILABLE,
+        "a follower refuses the export for leadership, not permission"
+    );
+    let hint = details
+        .iter()
+        .find(|(k, _)| k == DETAIL_LEADER_NODE_ID)
+        .map(|(_, v)| v.clone())
+        .expect("the refusal carries the leader hint");
+    assert_eq!(hint, leader_id.to_hex());
+
+    // 2. The control: the leader serves the identical request to the same
+    // actor, manifest first.
+    let leader = voters.iter().find(|v| is_leader(v)).expect("the leader");
+    let root_at_leader = Client::connect(root_secret(0xE3), &fixture, leader).await;
+    let frames = stream(&root_at_leader, "recovery_export", &request).await;
+    assert!(
+        matches!(
+            decode::<RecoveryExportFrameV1>(&frames[0]),
+            RecoveryExportFrameV1::Manifest(_)
+        ),
+        "the leader answers the request the follower refused"
+    );
+
+    // 3. Two losses leave a minority. The survivor is the old leader — the
+    // hardest case, because it once had every right to answer.
+    let mut survivor = None;
+    for voter in voters {
+        if is_leader(&voter) {
+            survivor = Some(voter);
+        } else {
+            voter.shutdown().await;
+        }
+    }
+    let survivor = survivor.expect("the leader survives");
+    // Past the leader lease and election timeout, so the refusal below is a
+    // settled fact rather than a node caught mid-election.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let root_at_survivor = Client::connect(root_secret(0xE3), &fixture, &survivor).await;
+    let (code, message, _) = call_refused(&root_at_survivor, "recovery_export", &request).await;
+    assert_eq!(
+        code, UNAVAILABLE,
+        "one voter of three cannot bless its local state as the recovery \
+         point; got: {message}"
+    );
+
+    survivor.shutdown().await;
+}
+
 /// **read_linearizable of a never-written register** is its value — epoch 0,
 /// unheld, an empty present value — not an error and not an oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

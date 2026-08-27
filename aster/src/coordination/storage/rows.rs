@@ -985,7 +985,7 @@ pub(crate) fn stream_recovery_body<W: std::io::Write>(
     };
 
     let header = RecoveryHeaderV1 {
-        format_version: SNAPSHOT_FORMAT_VERSION,
+        format_version: crate::coordination::rowstream::RECOVERY_FORMAT_VERSION,
         schema_version: super::identity::LOGICAL_SCHEMA_VERSION,
         source_group_id: meta.group_id.clone(),
         source_genesis_hash: meta.genesis_hash.clone(),
@@ -2307,6 +2307,26 @@ mod tests {
         assert!(
             fields.contains("schema_version: super::identity::LOGICAL_SCHEMA_VERSION"),
             "the schema version must come from the logical schema constant: {fields}"
+        );
+
+        // The recovery header is the same shape of claim for its own framing
+        // constant: stamping the snapshot constant read as correct precisely
+        // because both are `1` today.
+        let literal = "RecoveryHeaderV1 {";
+        assert_eq!(flat.matches(literal).count(), 1);
+        let after = flat.split(literal).nth(1).expect("one construction");
+        let fields = &after[..after.find("};").unwrap_or(after.len())];
+        assert!(
+            fields.contains(
+                "format_version: crate::coordination::rowstream::RECOVERY_FORMAT_VERSION"
+            ),
+            "the recovery body's format version must come from the recovery \
+             framing constant, not the snapshot one: {fields}"
+        );
+        assert!(
+            fields.contains("schema_version: super::identity::LOGICAL_SCHEMA_VERSION"),
+            "the recovery schema version must come from the logical schema \
+             constant: {fields}"
         );
     }
 
@@ -4226,6 +4246,104 @@ mod tests {
             loaded.model, state.model,
             "every field, not only the ones named above"
         );
+    }
+
+    /// The §13 export body is a pure function of the pinned transaction
+    /// (S5-A): two streams over the same state emit byte-identical bodies —
+    /// the property that makes the manifest BLAKE3 and the genesis binding
+    /// name *the* export — the header carries the meta's provenance with the
+    /// inexpressible counts zero, the audit tip is recomputed max-by-index,
+    /// and the bytes read back as exactly the state's resource/grant/admin
+    /// rows through the real recovery decoder.
+    #[test]
+    fn the_recovery_body_is_a_pure_function_of_the_pinned_state() {
+        use crate::coordination::rowstream::{
+            read_body, BodyError as RowStreamError, BodyVisitor, RecoveryBodyRowV1,
+            RECOVERY_FORMAT_VERSION,
+        };
+
+        let scratch = scratch_database();
+        let database = &scratch.database;
+        let state = coherent_state();
+        commit(database, state.clone(), &every_row(&state)).expect("commit");
+
+        let read = database.begin_read().expect("read");
+        let path = std::path::Path::new("<test>");
+        let (a, header) = stream_recovery_body(&read, path, Vec::new()).expect("stream");
+        let (b, again) = stream_recovery_body(&read, path, Vec::new()).expect("stream again");
+        assert_eq!(a, b, "the body is deterministic over one transaction");
+        assert_eq!(header, again);
+        assert_eq!(blake3::hash(&a), blake3::hash(&b));
+
+        // Provenance is the meta's, stamped from the recovery constants.
+        assert_eq!(header.format_version, RECOVERY_FORMAT_VERSION);
+        assert_eq!(
+            header.schema_version,
+            super::super::identity::LOGICAL_SCHEMA_VERSION
+        );
+        assert_eq!(
+            header.source_group_id,
+            state.model.authority.group_id.to_vec()
+        );
+        assert_eq!(header.source_admin_revision, state.model.admin_revision);
+        let counts = &header.row_counts;
+        assert_eq!(counts.resources, state.model.resources.len() as u64);
+        assert_eq!(counts.grants, state.model.acl.len() as u64);
+        assert_eq!(counts.admins, state.model.admins.len() as u64);
+        assert_eq!(
+            (counts.sessions, counts.intents, counts.routes, counts.audit),
+            (0, 0, 0, 0),
+            "the counts the recovery profile cannot express are declared zero"
+        );
+        // The audit tip is recomputed from the rows, max by index.
+        let max_index = state.model.audit.keys().map(|(_, index)| *index).max();
+        assert_eq!(header.source_audit_tip.as_ref().map(|t| t.index), max_index);
+
+        // The bytes decode through the real recovery reader, and the rows are
+        // exactly the state's — holder-free by type.
+        #[derive(Default)]
+        struct Collect {
+            resources: Vec<crate::coordination::rowstream::RecoveryResourceRowV1>,
+            grants: usize,
+            admins: usize,
+        }
+        impl BodyVisitor<RecoveryBodyRowV1> for Collect {
+            fn header(
+                &mut self,
+                _h: &crate::coordination::rowstream::RecoveryHeaderV1,
+            ) -> Result<(), RowStreamError> {
+                Ok(())
+            }
+            fn row(&mut self, _s: u64, r: RecoveryBodyRowV1) -> Result<(), RowStreamError> {
+                match r {
+                    RecoveryBodyRowV1::Resource(x) => self.resources.push(x),
+                    RecoveryBodyRowV1::Grant(_) => self.grants += 1,
+                    RecoveryBodyRowV1::Admin(_) => self.admins += 1,
+                    RecoveryBodyRowV1::Unknown(_) => unreachable!(),
+                }
+                Ok(())
+            }
+        }
+        let mut got = Collect::default();
+        read_body::<_, RecoveryBodyRowV1>(&mut &a[..], &mut got).expect("the body reads back");
+        assert_eq!(got.resources.len(), state.model.resources.len());
+        assert_eq!(got.grants, state.model.acl.len());
+        assert_eq!(got.admins, state.model.admins.len());
+        for row in &got.resources {
+            let key = ResourceKey::new(row.key.namespace.clone(), row.key.key.clone())
+                .expect("exported keys are legal");
+            let model = state
+                .model
+                .resources
+                .get(&key)
+                .expect("an exported row exists");
+            assert_eq!(row.source_epoch, model.epoch);
+            assert_eq!(row.value, model.value);
+            assert_eq!(row.value_revision, model.value_revision);
+            assert_eq!(row.lease_revision, model.lease_revision);
+            assert_eq!(row.acl_revision, model.acl_revision);
+            assert_eq!(row.ttl_ms, model.ttl_ms);
+        }
     }
 
     /// A deletion is persisted as a deletion, not merely dropped from memory.
