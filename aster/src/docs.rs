@@ -522,6 +522,25 @@ impl Doc {
         ))
     }
 
+    /// Write a key/value after committing its blob metadata to disk.
+    ///
+    /// This is the crash-durable publication boundary for records that must
+    /// never outlive their locally-authored value. It costs a blob-store
+    /// commit per call; use [`Self::set_bytes`] for retryable high-rate state.
+    /// The guarantee covers a hard process kill, not sudden machine power loss.
+    pub async fn set_bytes_durable(
+        &self,
+        author: &AuthorId,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<Hash> {
+        Ok(Hash::from_hex(
+            self.inner
+                .set_bytes_durable(author.as_str().to_string(), key.into(), value.into())
+                .await?,
+        ))
+    }
+
     /// Delete all entries for `author` whose key starts with `prefix`.
     ///
     /// This writes iroh-docs' deletion marker at `prefix` and returns the

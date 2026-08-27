@@ -4361,6 +4361,27 @@ impl CoreDoc {
             .to_string())
     }
 
+    /// Write a key/value only after its blob metadata is durable.
+    ///
+    /// Unlike [`Self::set_bytes`], this orders the blob-store commit before
+    /// iroh-docs inserts the record that names it. A hard process kill after
+    /// this call returns therefore cannot leave a durable document record
+    /// whose locally-authored value reopens as missing.
+    pub async fn set_bytes_durable(
+        &self,
+        author_hex: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<String> {
+        let author_id: AuthorId = author_hex.parse()?;
+        Ok(self
+            .doc
+            .set_bytes_durable(author_id, Bytes::from(key), Bytes::from(value))
+            .await?
+            .to_hex()
+            .to_string())
+    }
+
     /// Delete all entries for `author_hex` whose key starts with `prefix`.
     ///
     /// iroh-docs implements this by writing a deletion marker at `prefix`.

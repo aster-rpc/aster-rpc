@@ -2598,7 +2598,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2900,8 +2900,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.103.1"
-source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=dfac111c61946c970c5a98e79112957f94291bc3#dfac111c61946c970c5a98e79112957f94291bc3"
+version = "0.103.5"
+source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=bf21d4fe409181c983a755df574754e99a0d0a60#bf21d4fe409181c983a755df574754e99a0d0a60"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -2963,8 +2963,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-docs"
-version = "0.101.3"
-source = "git+https://forge.emrul.dev/Aster/iroh-docs.git?rev=d80d7a6c612b96b5e58e9b888f63f83b74e947e1#d80d7a6c612b96b5e58e9b888f63f83b74e947e1"
+version = "0.101.5"
+source = "git+https://forge.emrul.dev/Aster/iroh-docs.git?rev=0db8c5cc05f62e2fd13f6dc6079cf5237767ec83#0db8c5cc05f62e2fd13f6dc6079cf5237767ec83"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3145,8 +3145,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-util"
-version = "0.6.0"
-source = "git+https://github.com/n0-computer/iroh-util?rev=2b5447abf79bc0d7c02c202f2cc21f44f42d39fa#2b5447abf79bc0d7c02c202f2cc21f44f42d39fa"
+version = "0.6.2"
+source = "git+https://github.com/aster-rpc/iroh-util.git?rev=afed9e6d07e41450fe1970e794782bab7df9c2f4#afed9e6d07e41450fe1970e794782bab7df9c2f4"
 dependencies = [
  "derive_more 2.1.1",
  "iroh",
@@ -3833,7 +3833,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3876,7 +3876,7 @@ source = "git+https://forge.emrul.dev/Aster/noq.git?rev=c84091f4c1d62f3c9025e400
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4789,7 +4789,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4827,7 +4827,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.52.0",
 ]
@@ -7107,7 +7107,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
