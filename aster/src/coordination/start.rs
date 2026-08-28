@@ -230,6 +230,32 @@ impl StartPlan {
         self.policy
     }
 
+    /// The §13 import request, when this start is a recovery bootstrap.
+    ///
+    /// Built from [`VerifiedGenesis`] accessors only: the exact hash the new
+    /// signed genesis binds, and its `initial_admins` for the administrator
+    /// union. `resolve` proved the pairing, so a `Bootstrap` with a path
+    /// always has the hash.
+    pub(crate) fn recovery_import(
+        &self,
+    ) -> Option<crate::coordination::storage::import::RecoveryImport> {
+        let ResolvedStart::Bootstrap {
+            genesis,
+            recovery_export_path: Some(path),
+        } = &self.resolved
+        else {
+            return None;
+        };
+        let expected_hash = *genesis
+            .recovery_export_hash()
+            .expect("resolve pairs the path with the bound hash");
+        Some(crate::coordination::storage::import::RecoveryImport {
+            path: path.clone(),
+            expected_hash,
+            genesis_admins: genesis.initial_admins().to_vec(),
+        })
+    }
+
     /// Check the opened directory's state against the mode (§7.2).
     ///
     /// Runs *after* the open rather than before it, because "is this directory

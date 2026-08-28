@@ -1838,6 +1838,9 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
     let genesis_hash = cut.meta.genesis_hash.clone();
     let authority_public_key = cut.meta.authority_public_key.clone();
     let authority_domain = cut.meta.authority_domain.clone();
+    // §13 provenance: written identically on every initial voter of a
+    // recovered group, so it is a replicated fact of the same cut.
+    let recovered_from = cut.meta.recovered_from.clone();
 
     // Advisory: sampled only after the replicated cut, and declared advisory
     // on the wire type. The transaction stays open until the reply is built,
@@ -1884,6 +1887,7 @@ async fn group_status(runtime: &AttachedStore, actor: [u8; 32], frame: &[u8], ca
         genesis_hash,
         authority_public_key,
         authority_domain,
+        recovered_from,
     };
     respond_reply(call, reply).await;
 }

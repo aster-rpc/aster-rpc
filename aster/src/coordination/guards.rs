@@ -101,6 +101,7 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("storage/error.rs", include_str!("storage/error.rs")),
     ("storage/fixture.rs", include_str!("storage/fixture.rs")),
     ("storage/identity.rs", include_str!("storage/identity.rs")),
+    ("storage/import.rs", include_str!("storage/import.rs")),
     ("storage/log.rs", include_str!("storage/log.rs")),
     ("storage/machine.rs", include_str!("storage/machine.rs")),
     ("storage/mod.rs", include_str!("storage/mod.rs")),

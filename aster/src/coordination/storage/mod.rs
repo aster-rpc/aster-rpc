@@ -56,6 +56,7 @@ pub(crate) mod error;
 #[cfg(test)]
 pub(crate) mod fixture;
 pub(crate) mod identity;
+pub(crate) mod import;
 pub(crate) mod log;
 pub(crate) mod machine;
 pub(crate) mod reads;
@@ -69,7 +70,7 @@ pub(crate) mod snapshot;
 
 pub(crate) use snapshot::CoordinationSnapshotFile;
 
-use error::StorageResult;
+use error::{StorageError, StorageResult};
 #[cfg(test)]
 use fixture::SuiteFixture;
 use identity::{OpenPolicy, StorageIdentity};
@@ -213,7 +214,50 @@ impl VoterStorage {
         identity: StorageIdentity,
         policy: OpenPolicy,
     ) -> StorageResult<Self> {
+        Self::open_inner(layout, identity, policy, None)
+    }
+
+    /// Open a **fresh** storage directory and run the §13 recovery import
+    /// before any actor exists, under the same directory lock.
+    ///
+    /// The import commits the transformed founding state in one durable
+    /// transaction between binding and the state machine's own load — so the
+    /// load's full row validation runs over the imported state exactly as it
+    /// would over any restart, and a store this returns has already re-read
+    /// what the import wrote.
+    pub(crate) fn open_with_recovery(
+        layout: StorageLayout,
+        identity: StorageIdentity,
+        policy: OpenPolicy,
+        recovery: &import::RecoveryImport,
+    ) -> StorageResult<Self> {
+        Self::open_inner(layout, identity, policy, Some(recovery))
+    }
+
+    fn open_inner(
+        layout: StorageLayout,
+        identity: StorageIdentity,
+        policy: OpenPolicy,
+        recovery: Option<&import::RecoveryImport>,
+    ) -> StorageResult<Self> {
         let parts = schema::open(layout, identity, policy)?.into_parts();
+
+        if let Some(import) = recovery {
+            // Only a directory nothing was ever bound to may receive an
+            // import; `import_recovery_export` re-derives emptiness from the
+            // database itself as its own §13 obligation.
+            if !matches!(parts.outcome, schema::OpenOutcome::Fresh) {
+                return Err(StorageError::RecoveryImportRefused {
+                    path: import.path.clone(),
+                    detail: format!(
+                        "the storage directory is not fresh (open outcome {:?}); a \
+                         recovery import bootstraps only an empty directory",
+                        parts.outcome
+                    ),
+                });
+            }
+            import::import_recovery_export(&parts.state, &parts.identity, import)?;
+        }
 
         // Before any actor exists. Schema and identity validation prove the
         // file is ours; they prove nothing about whether its contents decode.
@@ -349,6 +393,7 @@ mod durability_guard {
         ("crash.rs", include_str!("crash.rs")),
         ("error.rs", include_str!("error.rs")),
         ("identity.rs", include_str!("identity.rs")),
+        ("import.rs", include_str!("import.rs")),
         ("schema.rs", include_str!("schema.rs")),
         ("log.rs", include_str!("log.rs")),
         ("machine.rs", include_str!("machine.rs")),

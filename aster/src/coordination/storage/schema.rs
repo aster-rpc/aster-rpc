@@ -899,6 +899,41 @@ fn classify_state(database: &Database, presence: Presence) -> StorageResult<Side
     })
 }
 
+/// Whether a bound `state.redb` is still exactly what `write_state_identity`
+/// left: no data rows and no durable replicated meta fields.
+///
+/// The §13 import's own non-empty refusal. The caller (a `Fresh` open) already
+/// believes this; the import re-derives it from the database because "rejected
+/// for non-empty storage" is a property of the import, not of its caller.
+pub(crate) fn state_is_import_pristine(database: &Database) -> StorageResult<bool> {
+    let read = database
+        .begin_read()
+        .map_err(|source| StorageError::redb(Db::State, source))?;
+    if state_data_tables_have_rows(&read)? {
+        return Ok(false);
+    }
+    let Some(bytes) = meta_bytes(
+        &read,
+        Db::State,
+        STATE_META,
+        KEY_META,
+        MAX_COORDINATION_META_BYTES,
+    )?
+    else {
+        // No binding at all: the import runs only after `schema::open` has
+        // bound the store, so an unbound database here is not a state the
+        // corridor can produce — refuse rather than write into it.
+        return Ok(false);
+    };
+    let meta: CoordinationMetaV1 = decode_persisted_bounded(
+        Db::State,
+        "CoordinationMetaV1",
+        &bytes,
+        MAX_COORDINATION_META_BYTES,
+    )?;
+    Ok(!replicated_state_is_durable(&meta))
+}
+
 /// Whether a decoded replicated meta row records anything beyond the identity
 /// binding a first open writes.
 ///

@@ -371,6 +371,15 @@ pub(crate) enum StorageError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// A §13 recovery import was refused before anything was written.
+    ///
+    /// Its own variant, not `StoredCorruption`: the store is untouched and
+    /// healthy — the *input* was refused — and the operator's next action is
+    /// to check the export file and the genesis binding, not the database.
+    /// `detail` names the exact rule so a refusal is actionable.
+    #[error("recovery import from {path} refused: {detail}")]
+    RecoveryImportRefused { path: PathBuf, detail: String },
 }
 
 impl StorageError {

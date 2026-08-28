@@ -158,11 +158,25 @@ pub(crate) async fn start(
     //    matches the mode. The check is after the open because "is this
     //    directory initialized?" is a question only the open coordinator can
     //    answer without racing another opener.
-    let storage = VoterStorage::open(
-        plan.layout().clone(),
-        plan.identity().clone(),
-        plan.policy(),
-    )
+    //
+    //    A recovery bootstrap runs the §13 import inside the open, under the
+    //    directory lock, before any actor exists: verify the bound export,
+    //    transform it, and durably commit the founding state — or refuse and
+    //    leave the store untouched. `Raft::initialize` below then only ever
+    //    runs over a store whose import has already succeeded.
+    let storage = match plan.recovery_import() {
+        Some(import) => VoterStorage::open_with_recovery(
+            plan.layout().clone(),
+            plan.identity().clone(),
+            plan.policy(),
+            &import,
+        ),
+        None => VoterStorage::open(
+            plan.layout().clone(),
+            plan.identity().clone(),
+            plan.policy(),
+        ),
+    }
     .map_err(|err| Error::Transport(anyhow::anyhow!("coordination storage: {err}")))?;
     plan.check_directory_state(storage.outcome())
         .map_err(Error::from)?;

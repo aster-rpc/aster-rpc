@@ -432,6 +432,9 @@ pub struct GroupFixture {
     /// allowlist, so a joiner absent from the set would be refused for a
     /// reason that has nothing to do with the rule under test.
     admitted: Vec<[u8; 32]>,
+    /// §13: the export hash this fixture's genesis binds, plus administrator
+    /// **node ids** named beyond the voter set. `None` for an ordinary group.
+    recovery: Option<([u8; 32], Vec<[u8; 32]>)>,
 }
 
 impl GroupFixture {
@@ -448,7 +451,19 @@ impl GroupFixture {
             authority: ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]),
             secrets: (0..size).map(|i| [seed ^ (0x10 + i as u8); 32]).collect(),
             admitted: Vec::new(),
+            recovery: None,
         }
+    }
+
+    /// Bind this fixture's genesis to a §13 recovery export hash, optionally
+    /// naming administrators beyond the voter set (node ids, not secrets).
+    ///
+    /// The returned fixture founds a **new** group whose bootstrap must import
+    /// the export whose canonical body hashes to `export_hash`; use
+    /// [`recovery_config`](Self::recovery_config) to start its voters.
+    pub fn recovering(mut self, export_hash: [u8; 32], extra_admins: &[[u8; 32]]) -> Self {
+        self.recovery = Some((export_hash, extra_admins.to_vec()));
+        self
     }
 
     /// Also name `candidate` in the signed admission set — for gates that
@@ -659,8 +674,17 @@ impl GroupFixture {
             .map(|i| NodeIdV1 {
                 node_id: self.node_id(i),
             })
+            .chain(
+                self.recovery
+                    .iter()
+                    .flat_map(|(_, extra)| extra.iter())
+                    .map(|node_id| NodeIdV1 {
+                        node_id: node_id.to_vec(),
+                    }),
+            )
             .collect();
         initial_admins.sort_by(|l, r| l.node_id.cmp(&r.node_id));
+        initial_admins.dedup_by(|l, r| l.node_id == r.node_id);
 
         let genesis = GenesisV1 {
             format_version: 1,
@@ -670,7 +694,7 @@ impl GroupFixture {
             deployment_profile_code: self.profile(),
             initial_voters,
             initial_admins,
-            recovery_export_hash: None,
+            recovery_export_hash: self.recovery.as_ref().map(|(hash, _)| hash.to_vec()),
         };
         let document = canonical_document_bytes(&genesis).expect("encode a genesis");
         let signature = self.authority.sign(&genesis_signing_bytes(&document));
@@ -761,6 +785,32 @@ impl GroupFixture {
             CoordinationStart::Bootstrap {
                 signed_genesis: self.signed_genesis(),
                 recovery_export_path: None,
+            },
+        ))
+    }
+
+    /// A **recovery bootstrap** configuration for voter `index` in `dir`,
+    /// importing the export file at `export` (§13).
+    ///
+    /// Legal only on a fixture built with [`recovering`](Self::recovering):
+    /// the genesis must bind the export's hash, and `resolve` enforces the
+    /// pairing in both directions.
+    pub fn recovery_config(
+        &self,
+        dir: &std::path::Path,
+        _index: usize,
+        export: &std::path::Path,
+    ) -> crate::coordination::host::CoordinationConfig {
+        use crate::coordination::host::{CoordinationConfig, CoordinationStart};
+
+        assert!(
+            self.recovery.is_some(),
+            "recovery_config needs a fixture built with recovering()"
+        );
+        self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
+            CoordinationStart::Bootstrap {
+                signed_genesis: self.signed_genesis(),
+                recovery_export_path: Some(export.to_path_buf()),
             },
         ))
     }

@@ -620,6 +620,12 @@ pub struct GroupStatusReplyWireV1 {
     /// Replicated. The authority domain the ROOT signs under (§4.1).
     #[fory(id = 22)]
     pub authority_domain: String,
+    /// Replicated. Present exactly when this group was founded by a §13
+    /// recovery import: the source group's recorded provenance and the
+    /// export hash the founding genesis bound. `None` for an ordinary group —
+    /// a recovered group is deliberately distinguishable over the status API.
+    #[fory(id = 23)]
+    pub recovered_from: Option<crate::coordination::raft::RecoveredFromV1>,
 }
 
 /// `probe_client` — a diagnostic read, never authority to reassign a sequence
@@ -1298,6 +1304,14 @@ mod tests {
                 genesis_hash: vec![0x77; 32],
                 authority_public_key: vec![0xCC; 32],
                 authority_domain: "wire.test".into(),
+                recovered_from: Some(crate::coordination::raft::RecoveredFromV1 {
+                    source_group_id: vec![0x11; 32],
+                    source_genesis_hash: vec![0x22; 32],
+                    source_authority_public_key: vec![0x33; 32],
+                    source_authority_domain: "old.wire.test".into(),
+                    export_hash: vec![0x44; 32],
+                    source_last_applied: Some(log_id()),
+                }),
             }
         );
         round_trip!(
@@ -1588,6 +1602,14 @@ mod tests {
                         genesis_hash: vec![0xAB; 32],
                         authority_public_key: vec![0xCC; 32],
                         authority_domain: "wire.test".into(),
+                        recovered_from: Some(crate::coordination::raft::RecoveredFromV1 {
+                            source_group_id: vec![0x11; 32],
+                            source_genesis_hash: vec![0x22; 32],
+                            source_authority_public_key: vec![0x33; 32],
+                            source_authority_domain: "old.wire.test".into(),
+                            export_hash: vec![0x44; 32],
+                            source_last_applied: Some(log_id()),
+                        }),
                     })
                     .expect("encode"),
             ),
@@ -1671,13 +1693,17 @@ mod tests {
     /// intended extension of the pre-release v1 reply; every other vector is
     /// byte-identical. Extended 2026-08-27 (S5-A) with the recovery-export
     /// request and both stream-frame variants; every prior vector is
+    /// byte-identical. Re-pinned 2026-08-27 (S5-B): `GroupStatusReplyWireV1`
+    /// gained the replicated `recovered_from` trailing field (id 23) so a
+    /// recovered group is distinguishable over the status API — a recorded,
+    /// intended extension of the pre-release v1 reply; every other vector is
     /// byte-identical.
     const GOLDEN: &[(&str, &str)] = &[
         ("AcquireRequestV1", "01ff1e002a70f78395aced17e64200926223f0471c88641a02641c6fcaea2df402851112762485092980d00ed80ec405c829cc29d41e01b0ea010220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10111111111111111111111111111111111e022080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c829226170702e68656164020102"),
         ("MutationReplyWireV1", "01ff1e00371050d40f629748ed4200926223f0471c88641a02641c6fcaea29759498268737b123d780d00ee80eec0ec405d805dc05e005c829cc29d429e61ef229f61e0100000202020020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1011111111111111111111111111111111203333333333333333333333333333333333333333333333333333333333333333fdfdfd"),
         ("RetireClientRequestV1", "01ff1e002930d78a4e8e7a39e44200926223f0471c88641a02641c6fcaea3976249a224e89682367d8921424a6c405c829cc29d0290220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd1011111111111111111111111111111111"),
         ("GroupStatusReplyWireV1",
-            "01ff1e0055604d0eb6926176f64200926223f0471c88641a02641c6fcaea3174d1751fd94c13a4bb123d78f401dc0ec405cc05d405ec05fc0305fe0201c829d029da29e21ee61eea1ef21ef81678fc001678fe0129fe041efc0529fc0629fc071500030206040200fd20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddfdfdfdff1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff1e03032920cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc01081e041a60c8b14607e62de14200926223f0471c88641a02641c6fcaea164e70624418c42920dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd00fdfd20abababababababababababababababababababababababababababababababab20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc26776972652e74657374"),
+            "01ff1e005800d072b2ebca7af74200926223f0471c88641a02641c6fcaea3174d1751fd94c13a4bb123d78f401dc0ec405cc05d405ec05fc0305fe0201c829d029da29e21ee61eea1ef21ef81678fc001678fe0129fe041efc0529fc0629fc0715fe081e00030206040200fd20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddfdfdfdff1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff1e03032920cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc01081e041a60c8b14607e62de14200926223f0471c88641a02641c6fcaea164e70624418c42920dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd00fdfd20abababababababababababababababababababababababababababababababab20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc26776972652e74657374ff1e062910d5084713e80ee64200926223f0471c88641a02641c6fcaea29762413aa48907d2c5cc0c429c829cc29d015d429da1e201111111111111111111111111111111111111111111111111111111111111111202222222222222222222222222222222222222222222222222222222222222222203333333333333333333333333333333333333333333333333333333333333333366f6c642e776972652e74657374204444444444444444444444444444444444444444444444444444444444444444ff1e03032920cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
         ("AuditRecordWireV1", "01ff1e002e10e667386bd047e94200926223f0471c88641a02641c6fcaea25f4141a27d8904e88c0e00ee40ec405d405dc05c829cc1ed229da1e0705020e0c20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1e021db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccfdff1e042080156928a9022fe24200926223f0471c88641a02641c6fcaea25f62493a91113aa2600c415c829226170702e68656164020102"),
         ("RecoveryExportRequestV1", "01ff1e002760f3c1a3a8e81ee24200926223f0471c88641a02641c6fcaea41f62413aa48e3a4bbdd19f62485092980c405c8290220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         ("RecoveryExportFrameV1::Manifest", "01ff230021f013608d4b9108054200926223f0471c88641a02641c6fcaea39762413aa48e3a4bbdd19f4b1030801001e022d40225367125543e54200926223f0471c88641a02641c6fcaea41762413aa48e3a4bbdd19f5806a0a494ccc0ec405c829d029d61e0a0220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa204444444444444444444444444444444444444444444444444444444444444444ff1e041db0293536d64121e34200926223f0471c88641a02641c6fcaea124a70d106c40ecc0ec829032920cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),

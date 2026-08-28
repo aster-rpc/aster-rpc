@@ -1230,6 +1230,27 @@ impl ValidReply for GroupStatusReplyWireV1 {
                 self.deployment_profile_code
             ));
         }
+        if let Some(recovered) = &self.recovered_from {
+            for (what, bytes) in [
+                ("source group id", &recovered.source_group_id),
+                ("source genesis hash", &recovered.source_genesis_hash),
+                (
+                    "source authority public key",
+                    &recovered.source_authority_public_key,
+                ),
+                ("export hash", &recovered.export_hash),
+            ] {
+                if bytes.len() != 32 {
+                    return Err(format!("the status's recovery {what} is not 32 bytes"));
+                }
+            }
+            if recovered.source_authority_domain.is_empty() {
+                return Err("the status's recovery provenance carries no domain".to_string());
+            }
+            if let Some(id) = &recovered.source_last_applied {
+                check_log_id("the recovery source last-applied id", id)?;
+            }
+        }
         Ok(())
     }
 }
@@ -2107,6 +2128,7 @@ mod tests {
             deployment_profile_code: 1,
             membership_log_id: None,
             membership_joint: false,
+            recovered_from: None,
             voters: vec![
                 NodeIdV1 {
                     node_id: vec![0x01; 32],

@@ -488,21 +488,31 @@ impl StateActor {
     /// distinction a controller must not blur.
     /// Whether the committed genesis has been applied.
     ///
-    /// `admin_revision > 0` is the fact, not a proxy for it: the only thing
-    /// that sets it to 1 is `apply_genesis` installing the delegated set, and
-    /// `set_admin` cannot run before that because it needs an administrator.
-    /// So a nonzero revision means the genesis entry is in this node's applied
-    /// state, whether it arrived by replay or inside a snapshot.
+    /// For an ordinary store, `admin_revision > 0` is the fact, not a proxy
+    /// for it: the only thing that sets it to 1 is `apply_genesis` installing
+    /// the delegated set, and `set_admin` cannot run before that because it
+    /// needs an administrator. So a nonzero revision means the genesis entry
+    /// is in this node's applied state, whether by replay or snapshot.
+    ///
+    /// A §13-recovered store breaks that equivalence on purpose: the import
+    /// writes the administrator union and `source_admin_revision + 1` *before*
+    /// any log exists, and the plan still requires the signed Genesis command
+    /// to commit and confirm the import. So for a recovered store the fact is
+    /// an applied `OPERATION_GENESIS` audit row. Deterministic and replicated;
+    /// and if audit pruning ever evicts that row in a very old group, the
+    /// leader merely re-proposes the same genesis, whose apply is the
+    /// documented idempotent no-op that writes a fresh row — convergent, never
+    /// fatal.
     fn genesis_installed(&mut self) -> StorageResult<bool> {
         let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
-        Ok(state.model.admin_revision > 0)
+        Ok(genesis_applied_fact(state))
     }
 
     fn observability(&mut self) -> StorageResult<ObservabilityFacts> {
         let state = self.state.as_ref().ok_or(StorageError::Fatal)?;
         Ok(ObservabilityFacts {
             genesis_hash: state.model.authority.genesis_hash,
-            genesis_installed: state.model.admin_revision > 0,
+            genesis_installed: genesis_applied_fact(state),
             audit_floor_index: state.model.audit_floor.as_ref().map(|id| id.index),
         })
     }
@@ -1557,6 +1567,29 @@ impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
 
 /// Run the **production** preparation in front of the **production** install.
 ///
+/// Whether this state's committed genesis command has applied (§7.2, §13).
+///
+/// Ordinary store: `admin_revision > 0` — only `apply_genesis` moves it off
+/// zero. §13-recovered store: the import pre-writes the administrator union
+/// and `source_admin_revision + 1` before any log exists, so the revision can
+/// no longer answer; the fact becomes an applied `OPERATION_GENESIS` audit
+/// row, which the confirming Genesis writes on either of its branches. Both
+/// readings are pure functions of replicated state, so every voter answers
+/// identically at the same applied index.
+pub(crate) fn genesis_applied_fact(state: &rows::DurableState) -> bool {
+    if state.model.admin_revision == 0 {
+        return false;
+    }
+    if state.recovered_from.is_none() {
+        return true;
+    }
+    state
+        .model
+        .audit
+        .values()
+        .any(|row| row.operation_code == crate::coordination::contract::OPERATION_GENESIS)
+}
+
 /// The one body behind [`SuiteStateMachine`], and behind every storage test
 /// that installs a snapshot without a network in front of it. It adds no path
 /// production lacks: the same `prepare_install`, then the same
