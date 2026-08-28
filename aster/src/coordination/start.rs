@@ -76,6 +76,13 @@ pub(crate) enum StartError {
     RecoveryExportMissing,
     /// A recovery export path was configured for a genesis that binds none.
     RecoveryExportUnexpected,
+    /// The §13 import capability could not be sealed from this plan.
+    ///
+    /// Only reachable if the identity and the genesis in one resolved plan stop
+    /// describing one document — a wiring regression, not operator input, and
+    /// exactly the one that would otherwise found a group from another group's
+    /// export.
+    RecoveryImportUnsealable(String),
     /// The signed genesis supplied to `Existing` is not this directory's.
     ///
     /// The group id, genesis hash or profile disagrees with the independently
@@ -120,6 +127,10 @@ impl std::fmt::Display for StartError {
             StartError::RecoveryExportUnexpected => f.write_str(
                 "the genesis binds no recovery export, so supplying recovery_export_path is an \
                  error rather than a no-op",
+            ),
+            StartError::RecoveryImportUnsealable(detail) => write!(
+                f,
+                "the recovery import could not be authorised for this start: {detail}"
             ),
             StartError::WrongDirectoryState { mode, outcome } => write!(
                 f,
@@ -230,30 +241,33 @@ impl StartPlan {
         self.policy
     }
 
-    /// The §13 import request, when this start is a recovery bootstrap.
+    /// The §13 import capability, when this start is a recovery bootstrap.
     ///
-    /// Built from [`VerifiedGenesis`] accessors only: the exact hash the new
-    /// signed genesis binds, and its `initial_admins` for the administrator
-    /// union. `resolve` proved the pairing, so a `Bootstrap` with a path
-    /// always has the hash.
+    /// Sealed from this plan's own identity and its own verified genesis in one
+    /// call, so the hash, the administrators and the identity the store binds to
+    /// all come from one document. `resolve` proved the path is paired with a
+    /// bound hash, and it derived the identity from the same genesis, so the
+    /// seal's agreement checks cannot fail here — which is the reason they are
+    /// worth making: any future path that could break the pairing fails loudly
+    /// at construction instead of quietly founding a group from another
+    /// group's export.
     pub(crate) fn recovery_import(
         &self,
-    ) -> Option<crate::coordination::storage::import::RecoveryImport> {
+    ) -> Result<Option<crate::coordination::storage::import::RecoveryImport>, StartError> {
         let ResolvedStart::Bootstrap {
             genesis,
             recovery_export_path: Some(path),
         } = &self.resolved
         else {
-            return None;
+            return Ok(None);
         };
-        let expected_hash = *genesis
-            .recovery_export_hash()
-            .expect("resolve pairs the path with the bound hash");
-        Some(crate::coordination::storage::import::RecoveryImport {
-            path: path.clone(),
-            expected_hash,
-            genesis_admins: genesis.initial_admins().to_vec(),
-        })
+        crate::coordination::storage::import::RecoveryImport::seal(
+            &self.identity,
+            genesis,
+            path.clone(),
+        )
+        .map(Some)
+        .map_err(StartError::RecoveryImportUnsealable)
     }
 
     /// Check the opened directory's state against the mode (§7.2).

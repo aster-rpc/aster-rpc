@@ -359,10 +359,16 @@ pub(crate) async fn run_lifecycle(
             // second leader proposing it after a leadership change is safe;
             // that is why this can simply retry rather than having to know
             // whether an earlier attempt survived.
-            // `!facts.genesis_installed()` **is** the revision-0 gate: the fact
-            // is set from `admin_revision > 0`, so a healthy restart into a
-            // long-running group proposes nothing, and only a voter that came
-            // back before the entry applied still has work to do.
+            // `!facts.genesis_installed()` is the gate, and the fact it reads
+            // is defined by the state machine (`genesis_applied_fact`):
+            // `admin_revision > 0` for an ordinary store, so a healthy restart
+            // into a long-running group proposes nothing and only a voter that
+            // came back before the entry applied still has work to do. A
+            // §13-recovered store is the case that made the definition
+            // necessary — its import writes a nonzero admin revision *before*
+            // any log exists, so under the revision-only reading a recovered
+            // group would never have proposed the Genesis that confirms it.
+            // There the fact is an applied `OPERATION_GENESIS` audit row.
             if is_leader && !facts.genesis_installed() {
                 if let Some(document) = genesis.clone() {
                     let raft = raft.clone();

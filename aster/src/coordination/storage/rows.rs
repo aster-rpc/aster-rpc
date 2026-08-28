@@ -379,22 +379,55 @@ fn validate_meta_wire(meta: &CoordinationMetaV1) -> StorageResult<()> {
     // refuses by design.
     let wire = &meta.membership.membership;
     if !(wire.configs.is_empty() && wire.nodes.is_empty()) {
-        let converted =
-            openraft::Membership::<CoordinationNodeId, CoordinationNode>::try_from(wire)
-                .map_err(|err| bad("StoredMembershipV1.membership", format!("{err:?}")))?;
-        let canonical = crate::coordination::raft::MembershipV1::from(&converted);
-        if canonical != *wire {
-            return Err(bad(
-                "StoredMembershipV1.membership",
-                "the stored membership is not the canonical encoding of itself: it holds \
-                 duplicate ids, an id no node map entry covers, or an unsorted config or \
-                 node map, and converting it would silently repair it"
-                    .into(),
-            ));
-        }
+        membership_is_canonical(wire)
+            .map_err(|detail| bad("StoredMembershipV1.membership", detail))?;
     }
 
     Ok(())
+}
+
+/// The canonical round trip a non-empty membership must survive.
+///
+/// Convert in, convert back out, require equality. That catches duplicates,
+/// manufactured nodes, unsorted configs and unsorted node maps in one
+/// statement, and keeps catching whatever the conversion is taught to
+/// normalise next.
+///
+/// Factored out because §13 needs exactly this rule about a membership that is
+/// not stored here at all -- the one a recovery export carries as provenance --
+/// and a second spelling of "canonical" is a second thing to keep in step.
+pub(crate) fn membership_is_canonical(
+    wire: &crate::coordination::raft::MembershipV1,
+) -> Result<(), String> {
+    let converted = openraft::Membership::<CoordinationNodeId, CoordinationNode>::try_from(wire)
+        .map_err(|err| format!("{err:?}"))?;
+    let canonical = crate::coordination::raft::MembershipV1::from(&converted);
+    if canonical != *wire {
+        return Err(
+            "not the canonical encoding of itself: it holds duplicate ids, an id no \
+                    node map entry covers, or an unsorted config or node map, and converting \
+                    it would silently repair it"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Everything [`load`] would refuse, asked about a state that has **not been
+/// written yet**.
+///
+/// The two halves are the two the loader runs, in the loader's order: the raw
+/// stored-metadata rules over the wire form this state would be persisted as,
+/// then the whole-state rules over the state itself. Nothing here is a
+/// paraphrase; both are the functions `load` calls.
+///
+/// §13's import is the caller that needs it. An import that transformed, wrote,
+/// and only then discovered the result does not load leaves a durable store
+/// that no restart can open and no operator asked for -- so the check that the
+/// output is loadable has to happen while refusing is still free.
+pub(crate) fn validate_before_commit(state: &DurableState) -> StorageResult<()> {
+    validate_meta_wire(&meta_to_wire(state))?;
+    validate(state)
 }
 
 /// Narrow a stored meta row into the state it describes, with no rows yet.

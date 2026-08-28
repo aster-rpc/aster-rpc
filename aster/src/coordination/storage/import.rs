@@ -37,19 +37,95 @@ use crate::coordination::rowstream::{
     read_body, BodyError, BodyVisitor, RecoveryBodyRowV1, RecoveryHeaderV1, MAX_SNAPSHOT_BODY_BYTES,
 };
 
-/// What the boot corridor hands storage when the verified genesis binds a
-/// recovery export. Constructed only from [`VerifiedGenesis`] accessors — the
-/// import never re-parses the signed document.
+/// The capability to bootstrap one storage directory from one recovery export.
+///
+/// Every field is derived from **one** verified genesis together with the
+/// storage identity that genesis produced, inside [`RecoveryImport::seal`], and
+/// nothing outside this module can build one any other way. That is the point
+/// of the type. The alternative — a plain struct of public fields plus an
+/// identity passed separately to the open — lets a caller pair identity and
+/// genesis `A` with the export hash and administrators of `B`, and the
+/// confirming Genesis deliberately will not rediscover the mismatch: it
+/// re-verifies the signed document against the binding the import wrote, and
+/// under a crossed pair both of those came from `A`.
+///
+/// So the identity travels *inside* the capability and the open path reads it
+/// from here rather than accepting its own. There is exactly one identity in
+/// play, and it is the one whose genesis bound this hash.
 ///
 /// [`VerifiedGenesis`]: crate::coordination::model::authority::VerifiedGenesis
 #[derive(Debug, Clone)]
 pub(crate) struct RecoveryImport {
-    pub(crate) path: std::path::PathBuf,
+    path: std::path::PathBuf,
+    /// The identity the sealing genesis produced. The store binds to this and
+    /// [`transform`] reads the new group's authority from it.
+    identity: StorageIdentity,
     /// `optional_recovery_export_hash` from the verified new genesis — the
     /// exact BLAKE3 the canonical body must have.
-    pub(crate) expected_hash: [u8; 32],
+    expected_hash: [u8; 32],
     /// The new genesis's `initial_admins`, unioned with the exported set.
-    pub(crate) genesis_admins: Vec<NodeId>,
+    genesis_admins: Vec<NodeId>,
+}
+
+impl RecoveryImport {
+    /// Seal one capability from a verified genesis, the identity derived from
+    /// it, and the operator-supplied export path.
+    ///
+    /// Refuses unless the identity really is *this* genesis's identity. The
+    /// boot corridor derives both from the same document, so a disagreement is
+    /// a wiring mistake rather than input — but it is precisely the wiring
+    /// mistake that would otherwise found a group from the wrong export, and it
+    /// costs four comparisons to make it unrepresentable.
+    pub(crate) fn seal(
+        identity: &StorageIdentity,
+        genesis: &crate::coordination::model::authority::VerifiedGenesis,
+        path: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        let expected_hash = *genesis
+            .recovery_export_hash()
+            .ok_or("this genesis binds no recovery export, so there is no import to authorise")?;
+        for (what, agrees) in [
+            (
+                "genesis hash",
+                identity.genesis_hash() == genesis.genesis_hash(),
+            ),
+            (
+                "group id",
+                identity.group_id().as_bytes() == genesis.group_id(),
+            ),
+            (
+                "authority domain",
+                identity.authority_domain() == genesis.authority_domain(),
+            ),
+            (
+                "deployment profile",
+                identity.deployment_profile_code() == genesis.deployment_profile_code(),
+            ),
+        ] {
+            if !agrees {
+                return Err(format!(
+                    "the storage identity's {what} is not this genesis's; a recovery import \
+                     may only be sealed from the identity its own genesis produced"
+                ));
+            }
+        }
+        Ok(Self {
+            path,
+            identity: identity.clone(),
+            expected_hash,
+            genesis_admins: genesis.initial_admins().to_vec(),
+        })
+    }
+
+    /// The identity this capability was sealed against — the one the store
+    /// binds to and the one [`transform`] writes into the founding state.
+    pub(crate) fn identity(&self) -> &StorageIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 fn refused(path: &Path, detail: impl std::fmt::Display) -> StorageError {
@@ -61,12 +137,15 @@ fn refused(path: &Path, detail: impl std::fmt::Display) -> StorageError {
 
 /// Read, verify, transform, and durably commit a recovery export into a
 /// freshly bound, pristine `state.redb`.
+///
+/// The identity is the sealed one: [`RecoveryImport`] carries the identity its
+/// own genesis produced, so there is no second identity for this to be handed.
 pub(crate) fn import_recovery_export(
     database: &Database,
-    identity: &StorageIdentity,
     import: &RecoveryImport,
 ) -> StorageResult<()> {
     let path = import.path.as_path();
+    let identity = &import.identity;
 
     // 1. The store must hold no durable replicated state and no data rows.
     //    The caller only runs an import on a `Fresh` open, but "rejected for
@@ -80,28 +159,13 @@ pub(crate) fn import_recovery_export(
         ));
     }
 
-    // 2. Bounded read. The length gate precedes the read so a wrong file
-    //    cannot induce a half-gigabyte allocation before failing its hash.
-    let meta = std::fs::metadata(path).map_err(|source| StorageError::Io {
-        what: "reading recovery export metadata",
+    // 2. Bounded read through one pinned descriptor.
+    let file = std::fs::File::open(path).map_err(|source| StorageError::Io {
+        what: "opening recovery export",
         path: path.to_path_buf(),
         source,
     })?;
-    if meta.len() > MAX_SNAPSHOT_BODY_BYTES {
-        return Err(refused(
-            path,
-            format!(
-                "the export file is {} bytes, over the {} byte §11.4 body bound",
-                meta.len(),
-                MAX_SNAPSHOT_BODY_BYTES
-            ),
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(|source| StorageError::Io {
-        what: "reading recovery export",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let bytes = read_bounded(file, path, MAX_SNAPSHOT_BODY_BYTES)?;
 
     // 3. The exact hash the new signed genesis binds, before any parsing:
     //    the file's authenticity is the binding, not its parseability.
@@ -139,11 +203,81 @@ pub(crate) fn import_recovery_export(
     )
     .map_err(|detail| refused(path, detail))?;
 
-    // 7. One durable transaction. Either the whole founding state exists or
+    // 7. The output must be a state this build would *load*, checked while
+    //    refusing is still free.
+    //
+    //    Not a belt on top of the transform's braces. The two validators have
+    //    genuinely different subjects: the transform enforces §13's rules about
+    //    the input, and this enforces §11.3's rules about the result — over
+    //    fields §13 only ever copies, notably the recorded source authority
+    //    domain, which the framing reader bounds by width and the loader
+    //    additionally requires to be ASCII. Without this, a body carrying a
+    //    non-ASCII source domain would be transformed, committed, and only then
+    //    refused by the production open, leaving behind exactly the dirty store
+    //    the all-or-nothing claim says cannot exist.
+    rows::validate_before_commit(&state).map_err(|err| {
+        refused(
+            path,
+            format!("the transformed founding state is not one this build could load: {err}"),
+        )
+    })?;
+
+    // 8. One durable transaction. Either the whole founding state exists or
     //    none of it does; there is no partially imported store to observe.
     let changes = every_key(&state);
     rows::commit(database, state, &changes)?;
     Ok(())
+}
+
+/// Size and read one **already-open** export, all through that descriptor.
+///
+/// Takes the `File` rather than the path, and that is the whole point. Stat the
+/// name, then read the name, is two resolutions of one path: a rename between
+/// them replaces the small file that passed the bound with an oversized one,
+/// and the check becomes a fact about a file that is no longer there. `fstat`
+/// on an open handle and a read through that same handle describe one inode
+/// whatever happens to the name, and taking the handle as an argument is what
+/// makes the substitution stageable in a test.
+///
+/// Two bounds, not one. The declared size refuses an oversized file before any
+/// allocation; `take(max + 1)` then bounds the bytes actually read, because the
+/// guarantee that matters is about this allocation rather than about an earlier
+/// measurement. The `+ 1` is what distinguishes "exactly at the bound" from
+/// "over it" without reading the whole of an oversized file.
+fn read_bounded(file: std::fs::File, path: &Path, max: u64) -> StorageResult<Vec<u8>> {
+    use std::io::Read;
+
+    let declared = file
+        .metadata()
+        .map_err(|source| StorageError::Io {
+            what: "sizing recovery export",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if declared > max {
+        return Err(refused(
+            path,
+            format!("the export file is {declared} bytes, over the {max} byte §11.4 body bound"),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(declared as usize);
+    std::io::BufReader::new(file)
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| StorageError::Io {
+            what: "reading recovery export",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > max {
+        return Err(refused(
+            path,
+            format!("the export file is over the {max} byte §11.4 body bound"),
+        ));
+    }
+    Ok(bytes)
 }
 
 #[derive(Default)]
@@ -201,38 +335,98 @@ pub(crate) fn transform(
                 .into(),
         );
     }
-    let not_ahead = |what: &str,
-                     id: &Option<crate::coordination::contract::LogIdV1>,
-                     bound: u64|
+
+    // A log id inside the export is a position in the source's *own* history,
+    // so "not ahead of" is not enough: two log ids at one index are the same
+    // entry or the history is not a history. Comparing the index alone would
+    // admit provenance that names a real index under a term and leader the
+    // source never had there, which is a fabricated record that still passes
+    // every width and ordering rule.
+    let within = |what: &str,
+                  id: &Option<crate::coordination::contract::LogIdV1>,
+                  bound: &crate::coordination::contract::LogIdV1,
+                  bound_name: &str|
      -> Result<(), String> {
-        if let Some(id) = id {
-            if id.index > bound {
-                return Err(format!(
-                    "{what} is at index {} but the source last-applied index is {bound}; \
-                     provenance cannot run ahead of the state it describes",
-                    id.index
-                ));
-            }
+        let Some(id) = id else { return Ok(()) };
+        if id.index > bound.index {
+            return Err(format!(
+                "{what} is at index {} but {bound_name} is at index {}; provenance \
+                 cannot run ahead of the state it describes",
+                id.index, bound.index
+            ));
+        }
+        if id.index == bound.index && id != bound {
+            return Err(format!(
+                "{what} and {bound_name} are both at index {} but are different log ids; \
+                 one index in one history is one entry",
+                id.index
+            ));
         }
         Ok(())
     };
-    not_ahead(
+    within(
         "the source audit floor",
         &header.source_audit_floor,
-        source_last_applied.index,
+        source_last_applied,
+        "the source last-applied",
     )?;
-    not_ahead(
+    within(
         "the source audit tip",
         &header.source_audit_tip,
-        source_last_applied.index,
+        source_last_applied,
+        "the source last-applied",
     )?;
-    if let (Some(floor), Some(tip)) = (&header.source_audit_floor, &header.source_audit_tip) {
-        if floor.index > tip.index {
-            return Err(format!(
-                "the source audit floor {} is above its tip {}",
-                floor.index, tip.index
-            ));
-        }
+    if let Some(tip) = &header.source_audit_tip {
+        within(
+            "the source audit floor",
+            &header.source_audit_floor,
+            tip,
+            "the source audit tip",
+        )?;
+    }
+
+    // ── The source membership ───────────────────────────────────────────────
+    //
+    // Recorded provenance, never matched to the new group (frozen decision 1) —
+    // but a record is still a record, and this one is written into the store and
+    // served to operators. A group that could export has committed a membership,
+    // so an absent or empty one says the export did not come from a v1 group
+    // that ever ran.
+    let membership = &header.source_membership;
+    let membership_log_id = membership.log_id.as_ref().ok_or(
+        "the source membership carries no log id, which no group that has committed \
+         a membership can produce",
+    )?;
+    wide32(
+        "the source membership leader id",
+        &membership_log_id.leader_node_id,
+    )?;
+    if membership.membership.configs.is_empty() && membership.membership.nodes.is_empty() {
+        return Err(
+            "the source membership is empty; a group that can serve an export has \
+             applied its own initial membership"
+                .into(),
+        );
+    }
+    rows::membership_is_canonical(&membership.membership)
+        .map_err(|detail| format!("the source membership is {detail}"))?;
+    within(
+        "the source membership",
+        &membership.log_id,
+        source_last_applied,
+        "the source last-applied",
+    )?;
+
+    // §13 founds a **new** group. A body whose source group id is the one being
+    // created is either a crossed wiring or an operator re-importing a group
+    // into itself, and both produce a store whose provenance says it recovered
+    // from the group it is.
+    if header.source_group_id.as_slice() == identity.group_id().as_bytes().as_slice() {
+        return Err(
+            "the export's source group id is the new group's own; §13 recovery founds \
+             a new group from a dead one, and a group cannot be its own source"
+                .into(),
+        );
     }
 
     // ── Rows: ceilings, TTL, transformation ─────────────────────────────────
@@ -329,6 +523,25 @@ pub(crate) fn transform(
              nonzero; the source store disagrees with itself"
                 .into(),
         );
+    }
+    // The same rule the new group's ROOT gets, applied to the source's. ROOT
+    // authorizes without a delegated row, so the source's administrator table
+    // never held it and a body that carries it was not written by
+    // `stream_recovery_body` over a loadable store. Checked against the
+    // *exported* set, before the union, so the message names the export rather
+    // than the new genesis.
+    {
+        let source_root = wide32(
+            "the source authority public key",
+            &header.source_authority_public_key,
+        )?;
+        if state.admins.contains(&source_root) {
+            return Err(
+                "the export carries its own source ROOT key as a delegated administrator \
+                 row; ROOT authorizes without a row, so no v1 store held that row"
+                    .into(),
+            );
+        }
     }
     // One ordered pass, not a scan per resource. `acl` is a `BTreeMap` keyed
     // `(ResourceKey, NodeId)`, so every grant on one resource is contiguous —
@@ -496,6 +709,29 @@ mod tests {
         }
     }
 
+    /// A real three-voter membership at index 12, built through the same
+    /// conversion the loader validates against — so the fixture is one a
+    /// running source group could actually have exported, rather than the
+    /// `default()` that no group ever holds.
+    fn source_membership(index: u64) -> crate::coordination::raft::StoredMembershipV1 {
+        use crate::coordination::ids::CoordinationNodeId;
+        use crate::coordination::raft::MembershipV1;
+        use crate::coordination::typeconfig::CoordinationNode;
+
+        let voters: std::collections::BTreeSet<CoordinationNodeId> = [0xA1u8, 0xA2, 0xA3]
+            .into_iter()
+            .map(|b| CoordinationNodeId::from_array([b; 32]))
+            .collect();
+        let nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+            voters.iter().map(|id| (*id, CoordinationNode)).collect();
+        let membership =
+            openraft::Membership::<CoordinationNodeId, CoordinationNode>::new(vec![voters], nodes);
+        crate::coordination::raft::StoredMembershipV1 {
+            log_id: Some(log_id(index)),
+            membership: MembershipV1::from(&membership),
+        }
+    }
+
     /// A small but complete source export: two resources (one with the fields
     /// a lease left behind), two grants on the first, one admin.
     fn baseline() -> (RecoveryHeaderV1, Vec<RecoveryBodyRowV1>) {
@@ -540,7 +776,7 @@ mod tests {
             source_authority_public_key: vec![0xCC; 32],
             source_authority_domain: "old.aster0.net".into(),
             source_last_applied: Some(log_id(40)),
-            source_membership: Default::default(),
+            source_membership: source_membership(12),
             source_audit_floor: Some(log_id(10)),
             source_audit_tip: Some(log_id(39)),
             source_admin_revision: 5,
@@ -588,6 +824,23 @@ mod tests {
         (dir, database)
     }
 
+    /// A capability built directly, which only this module can do. Production
+    /// reaches [`RecoveryImport::seal`] instead, and
+    /// `only_a_genesis_can_seal_its_own_import` covers that door.
+    fn capability(
+        path: std::path::PathBuf,
+        identity: &StorageIdentity,
+        expected_hash: [u8; 32],
+        genesis_admins: &[NodeId],
+    ) -> RecoveryImport {
+        RecoveryImport {
+            path,
+            identity: identity.clone(),
+            expected_hash,
+            genesis_admins: genesis_admins.to_vec(),
+        }
+    }
+
     fn run_import(
         bytes: &[u8],
         expected_hash: [u8; 32],
@@ -599,12 +852,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let outcome = import_recovery_export(
             &database,
-            &identity,
-            &RecoveryImport {
-                path,
-                expected_hash,
-                genesis_admins: genesis_admins.to_vec(),
-            },
+            &capability(path, &identity, expected_hash, genesis_admins),
         );
         (dir, database, outcome)
     }
@@ -855,7 +1103,122 @@ mod tests {
                     }),
                     None,
                     vec![nid(0x41)],
-                    "above its tip",
+                    "cannot run ahead",
+                ),
+                (
+                    // Same index, different term: a real index under a term the
+                    // source never had there. Every width and ordering rule
+                    // still passes; only exactness catches it.
+                    "an audit tip at the last-applied index under another term",
+                    with_header(&|h| {
+                        let mut tip = log_id(40);
+                        tip.term = 9;
+                        h.source_audit_tip = Some(tip);
+                    }),
+                    None,
+                    vec![nid(0x41)],
+                    "one index in one history is one entry",
+                ),
+                (
+                    "an audit floor at the tip index under another leader",
+                    with_header(&|h| {
+                        let mut floor = log_id(39);
+                        floor.leader_node_id = vec![0xEE; 32];
+                        h.source_audit_floor = Some(floor);
+                    }),
+                    None,
+                    vec![nid(0x41)],
+                    "one index in one history is one entry",
+                ),
+                (
+                    "a source membership with no log id",
+                    with_header(&|h| h.source_membership.log_id = None),
+                    None,
+                    vec![nid(0x41)],
+                    "carries no log id",
+                ),
+                (
+                    // The `StoredMembershipV1::default()` this fixture itself
+                    // used to carry, which no group that ever ran can produce.
+                    "a wholly default source membership",
+                    with_header(&|h| h.source_membership = Default::default()),
+                    None,
+                    vec![nid(0x41)],
+                    "carries no log id",
+                ),
+                (
+                    "a source membership whose config is empty",
+                    with_header(&|h| {
+                        h.source_membership = crate::coordination::raft::StoredMembershipV1 {
+                            log_id: Some(log_id(12)),
+                            membership: Default::default(),
+                        };
+                    }),
+                    None,
+                    vec![nid(0x41)],
+                    "the source membership is empty",
+                ),
+                (
+                    // Unsorted ids: the conversion would silently repair it,
+                    // and a repaired record is not the record the source held.
+                    "a non-canonical source membership",
+                    with_header(&|h| {
+                        let mut membership = source_membership(12);
+                        membership.membership.configs[0].ids.reverse();
+                        h.source_membership = membership;
+                    }),
+                    None,
+                    vec![nid(0x41)],
+                    "the canonical encoding of itself",
+                ),
+                (
+                    "a source membership ahead of the source last-applied",
+                    with_header(&|h| h.source_membership = source_membership(41)),
+                    None,
+                    vec![nid(0x41)],
+                    "cannot run ahead",
+                ),
+                (
+                    "a source membership at the last-applied index under another term",
+                    with_header(&|h| {
+                        let mut membership = source_membership(40);
+                        membership.log_id.as_mut().unwrap().term = 9;
+                        h.source_membership = membership;
+                    }),
+                    None,
+                    vec![nid(0x41)],
+                    "one index in one history is one entry",
+                ),
+                (
+                    "an export whose source group is the group being founded",
+                    with_header(&|h| h.source_group_id = vec![0xEE; 32]),
+                    None,
+                    vec![nid(0x41)],
+                    "a group cannot be its own source",
+                ),
+                (
+                    "the source ROOT key carried as a delegated administrator row",
+                    with_rows(&|rows, header| {
+                        rows.push(RecoveryBodyRowV1::Admin(AdminRowV1 {
+                            subject_node_id: header.source_authority_public_key.clone(),
+                        }));
+                        header.row_counts.admins = 2;
+                    }),
+                    None,
+                    vec![nid(0x41)],
+                    "its own source ROOT key",
+                ),
+                (
+                    // The framing reader bounds the source domain by width
+                    // only; §7.1 additionally requires ASCII, and the loader
+                    // enforces that. Without the pre-commit whole-state check
+                    // this body transforms, commits, and is refused by the next
+                    // open — leaving the dirty store the atomicity claim denies.
+                    "a non-ASCII source authority domain",
+                    with_header(&|h| h.source_authority_domain = "öld.aster0.net".into()),
+                    None,
+                    vec![nid(0x41)],
+                    "not one this build could load",
                 ),
                 (
                     "a TTL below the lease floor",
@@ -1122,19 +1485,11 @@ mod tests {
                 .expect("the first open binds the directory"),
         );
 
-        let import = RecoveryImport {
-            path: export,
-            expected_hash: hash,
-            genesis_admins: vec![nid(0x41)],
-        };
+        let import = capability(export, &identity, hash, &[nid(0x41)]);
         // `match` rather than `expect_err`: `VoterStorage` is deliberately not
         // `Debug`, so the `Result`'s success arm cannot be formatted.
-        let err = match VoterStorage::open_with_recovery(
-            layout,
-            identity,
-            OpenPolicy::production(),
-            &import,
-        ) {
+        let err = match VoterStorage::open_with_recovery(layout, OpenPolicy::production(), &import)
+        {
             Ok(_) => panic!("a bound directory must not receive an import"),
             Err(err) => err,
         };
@@ -1182,12 +1537,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let err = import_recovery_export(
             &database,
-            &identity,
-            &RecoveryImport {
-                path: path.clone(),
-                expected_hash: hash,
-                genesis_admins: vec![nid(0x41)],
-            },
+            &capability(path.clone(), &identity, hash, &[nid(0x41)]),
         )
         .unwrap_err();
         assert!(err.to_string().contains("already holds replicated state"));
@@ -1200,17 +1550,188 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(MAX_SNAPSHOT_BODY_BYTES + 1).unwrap();
         drop(file);
-        let err = import_recovery_export(
-            &database,
-            &identity,
-            &RecoveryImport {
-                path,
-                expected_hash: hash,
-                genesis_admins: vec![nid(0x41)],
-            },
-        )
-        .unwrap_err();
+        let err =
+            import_recovery_export(&database, &capability(path, &identity, hash, &[nid(0x41)]))
+                .unwrap_err();
         assert!(err.to_string().contains("body bound"));
         assert!(schema::state_is_import_pristine(&database).unwrap());
+    }
+
+    /// The §11.4 bound is a fact about the **descriptor** the import reads, not
+    /// about the name it was given.
+    ///
+    /// The race is staged exactly where it would happen: the handle is opened,
+    /// an oversized file is then renamed over the very path it came from, and
+    /// only then is the file sized and read. Both must still describe the small
+    /// file. The final assertion is what makes this discriminating — through the
+    /// name, the same path now yields the oversized content, which is what a
+    /// `metadata(path)` + `read(path)` pair would have sized and allocated.
+    #[test]
+    fn the_size_bound_follows_the_handle_and_not_the_name() {
+        let dir = ScratchDir::new("import-rename");
+        let path = dir.join("export.recovery");
+        let small = vec![0xA5u8; 16];
+        std::fs::write(&path, &small).unwrap();
+
+        // The import's own first step: one open, before anything is measured.
+        let file = std::fs::File::open(&path).unwrap();
+
+        // The substitution: a file over the bound replaces the name atomically,
+        // as an operator's `mv` or a tool's write-then-rename would.
+        let replacement = dir.join("oversized.recovery");
+        std::fs::write(&replacement, vec![0x5Au8; 4096]).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let read =
+            read_bounded(file, &path, 64).expect("the pinned handle is still the small file");
+        assert_eq!(
+            read, small,
+            "the read followed the descriptor, not the name"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            4096,
+            "and the name now resolves to the oversized file a second open would have read"
+        );
+
+        // An ordinary oversized file is refused from its declared size, before
+        // a byte is allocated.
+        let big = dir.join("big.recovery");
+        std::fs::write(&big, vec![0x11u8; 200]).unwrap();
+        let err = read_bounded(std::fs::File::open(&big).unwrap(), &big, 64).unwrap_err();
+        assert!(
+            err.to_string().contains("is 200 bytes, over the 64 byte"),
+            "{err}"
+        );
+    }
+
+    /// The streaming bound is not a restatement of the declared size, and this
+    /// is the case that proves it: a **FIFO** reports a length of zero however
+    /// much data it will deliver. An operator who points
+    /// `recovery_export_path` at a named pipe — a plausible way to feed an
+    /// export from a decrypting or decompressing pipeline — passes any
+    /// declared-size gate and would then read without any bound at all.
+    /// `take(max + 1)` is what stops that, and the refusal is the same one an
+    /// oversized file gets.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_that_declares_no_size_is_still_bounded() {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = ScratchDir::new("import-fifo");
+        let path = dir.join("export.fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Both ends block until they are paired, so the writer is started
+        // first and the reader's open is what releases it.
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut pipe = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open the fifo for writing");
+            // Far under a pipe buffer, so this never blocks on the reader.
+            let _ = pipe.write_all(&vec![0x77u8; 4096]);
+        });
+
+        let file = std::fs::File::open(&path).expect("open the fifo for reading");
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            0,
+            "a fifo declares no size, which is the whole point of this case"
+        );
+        let err = read_bounded(file, &path, 64).unwrap_err();
+        assert!(
+            err.to_string().contains("over the 64 byte"),
+            "an unsized source must still be bounded by the read: {err}"
+        );
+        let _ = writer.join();
+    }
+
+    /// A capability exists only when the identity and the genesis are one
+    /// document's. The crossed pair — identity and genesis `A`, export hash and
+    /// administrators `B` — is refused at construction, which is the only place
+    /// it can be refused: the confirming Genesis checks the signed document
+    /// against the binding the import wrote, and under a crossed pair both of
+    /// those came from `A`, so it would confirm happily.
+    #[test]
+    fn only_a_genesis_can_seal_its_own_import() {
+        use crate::coordination::model::authority::{
+            genesis_hash, testing as auth, verify_genesis,
+        };
+        use crate::coordination::model::shape;
+
+        let sealed_for = |genesis: &crate::coordination::model::authority::VerifiedGenesis| {
+            let authority = auth::authority();
+            StorageIdentity::new(
+                CoordinationGroupId::from_array(*genesis.group_id()),
+                *genesis.genesis_hash(),
+                authority.public_key,
+                genesis.authority_domain(),
+                crate::coordination::ids::CoordinationNodeId::from_array([1u8; 32]),
+                genesis.deployment_profile_code(),
+            )
+        };
+        let verified = |document: &crate::coordination::raft::GenesisV1| {
+            let authority = auth::authority();
+            verify_genesis(
+                &authority.public_key,
+                &authority.domain,
+                &auth::sign_genesis(document),
+            )
+            .expect("the fixture genesis verifies")
+        };
+
+        let voters: Vec<NodeId> = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        let mut a = auth::genesis_for(&voters, shape::PROFILE_PROD);
+        a.recovery_export_hash = Some(vec![0xA0; 32]);
+        let mut b = a.clone();
+        b.genesis_nonce = vec![0x66; 32];
+        b.recovery_export_hash = Some(vec![0xB0; 32]);
+        let (a, b) = (verified(&a), verified(&b));
+        assert_ne!(a.genesis_hash(), b.genesis_hash());
+
+        // The honest pair seals, and carries A's hash and admins.
+        let identity_a = sealed_for(&a);
+        let capability = RecoveryImport::seal(&identity_a, &a, "/tmp/export".into())
+            .expect("a genesis seals its own import");
+        assert_eq!(capability.expected_hash, [0xA0; 32]);
+        assert_eq!(capability.identity(), &identity_a);
+        assert_eq!(capability.genesis_admins, a.initial_admins().to_vec());
+
+        // The crossed pair does not exist. This is the P0: without the seal,
+        // `A`'s identity would bind the store while `B`'s hash decided which
+        // export founded it.
+        let err = RecoveryImport::seal(&identity_a, &b, "/tmp/export".into())
+            .expect_err("identity A and genesis B are not one document");
+        assert!(err.contains("genesis hash"), "got: {err}");
+
+        // And a genesis that binds no export authorises no import at all.
+        let mut plain = auth::genesis_for(&voters, shape::PROFILE_PROD);
+        plain.recovery_export_hash = None;
+        let plain = verified(&plain);
+        let err = RecoveryImport::seal(&sealed_for(&plain), &plain, "/tmp/export".into())
+            .expect_err("no bound export, no capability");
+        assert!(err.contains("binds no recovery export"), "got: {err}");
+
+        // The identity really is derived from the document: a hash that is not
+        // this genesis's is the same refusal from the other side.
+        let mut wrong = identity_a.clone();
+        wrong = StorageIdentity::new(
+            *wrong.group_id(),
+            genesis_hash(b"not this document"),
+            *wrong.authority_public_key(),
+            wrong.authority_domain(),
+            *wrong.local_node_id(),
+            wrong.deployment_profile_code(),
+        );
+        assert!(RecoveryImport::seal(&wrong, &a, "/tmp/export".into()).is_err());
     }
 }

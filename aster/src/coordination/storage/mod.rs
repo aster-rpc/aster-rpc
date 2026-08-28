@@ -225,13 +225,16 @@ impl VoterStorage {
     /// load's full row validation runs over the imported state exactly as it
     /// would over any restart, and a store this returns has already re-read
     /// what the import wrote.
+    ///
+    /// Takes **no** identity. The capability carries the one its own genesis
+    /// produced, and the store binds to that; there is no second identity for a
+    /// caller to supply and therefore no pair to cross.
     pub(crate) fn open_with_recovery(
         layout: StorageLayout,
-        identity: StorageIdentity,
         policy: OpenPolicy,
         recovery: &import::RecoveryImport,
     ) -> StorageResult<Self> {
-        Self::open_inner(layout, identity, policy, Some(recovery))
+        Self::open_inner(layout, recovery.identity().clone(), policy, Some(recovery))
     }
 
     fn open_inner(
@@ -248,7 +251,7 @@ impl VoterStorage {
             // database itself as its own §13 obligation.
             if !matches!(parts.outcome, schema::OpenOutcome::Fresh) {
                 return Err(StorageError::RecoveryImportRefused {
-                    path: import.path.clone(),
+                    path: import.path().to_path_buf(),
                     detail: format!(
                         "the storage directory is not fresh (open outcome {:?}); a \
                          recovery import bootstraps only an empty directory",
@@ -256,7 +259,11 @@ impl VoterStorage {
                     ),
                 });
             }
-            import::import_recovery_export(&parts.state, &parts.identity, import)?;
+            // `parts.identity` is the capability's own identity — it is what
+            // this open was given — and the import reads it from the capability
+            // rather than from here, so the two cannot drift apart.
+            debug_assert_eq!(&parts.identity, import.identity());
+            import::import_recovery_export(&parts.state, import)?;
         }
 
         // Before any actor exists. Schema and identity validation prove the

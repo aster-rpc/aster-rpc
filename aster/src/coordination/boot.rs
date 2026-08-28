@@ -164,13 +164,13 @@ pub(crate) async fn start(
     //    transform it, and durably commit the founding state — or refuse and
     //    leave the store untouched. `Raft::initialize` below then only ever
     //    runs over a store whose import has already succeeded.
-    let storage = match plan.recovery_import() {
-        Some(import) => VoterStorage::open_with_recovery(
-            plan.layout().clone(),
-            plan.identity().clone(),
-            plan.policy(),
-            &import,
-        ),
+    let recovery = plan.recovery_import().map_err(Error::from)?;
+    let storage = match &recovery {
+        // The capability carries the identity its own genesis produced, so the
+        // recovery open is not given one — there is no pair here to cross.
+        Some(import) => {
+            VoterStorage::open_with_recovery(plan.layout().clone(), plan.policy(), import)
+        }
         None => VoterStorage::open(
             plan.layout().clone(),
             plan.identity().clone(),

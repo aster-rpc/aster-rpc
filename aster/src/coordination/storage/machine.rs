@@ -143,7 +143,12 @@ pub(crate) enum PreflightAnswer {
 pub(crate) struct ObservabilityFacts {
     /// The group's genesis hash, from the bound authority.
     pub(crate) genesis_hash: [u8; 32],
-    /// Whether the committed genesis has been applied (`admin_revision > 0`).
+    /// Whether the committed genesis has been applied.
+    ///
+    /// `admin_revision > 0` for an ordinary store; an applied
+    /// `OPERATION_GENESIS` audit row for a §13-recovered one, whose import
+    /// writes a nonzero revision before any log exists. See
+    /// [`genesis_applied_fact`].
     pub(crate) genesis_installed: bool,
     /// The lowest retained audit row's log index; `None` before any pruning.
     pub(crate) audit_floor_index: Option<u64>,
