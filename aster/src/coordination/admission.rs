@@ -807,6 +807,44 @@ mod tests {
         );
     }
 
+    /// The **envelope's** own format version, which is a different gate from
+    /// the document's (S5-C).
+    ///
+    /// The two are checked at different points and for different reasons: the
+    /// envelope's runs before the signature, because a build that cannot read
+    /// this envelope shape cannot locate the bytes to verify; the document's
+    /// runs after, over content the signature has already covered. A matrix
+    /// that exercised only the document arm would leave the earlier one — the
+    /// one an older reader hits first — with no evidence at all.
+    ///
+    /// Signed correctly and then re-wrapped, so the signature over
+    /// `document_bytes` is still good and only the version can be the reason.
+    #[test]
+    fn an_admission_envelope_from_a_future_format_is_refused_before_its_signature() {
+        use crate::coordination::contract::payload_fory;
+        use crate::coordination::raft::SignedCoordinationDocumentV1;
+
+        let signed = sign_set(&set_of(&[[1u8; 32]], &[], 1));
+        assert!(SignedAdmissionSet::verify(&key(), "aster0.net", &signed).is_ok());
+
+        let mut envelope: SignedCoordinationDocumentV1 =
+            payload_fory::<SignedCoordinationDocumentV1>()
+                .deserialize(&signed)
+                .expect("the fixture envelope decodes");
+        envelope.format_version = ADMISSION_FORMAT_VERSION + 1;
+        let future = payload_fory::<SignedCoordinationDocumentV1>()
+            .serialize(&envelope)
+            .expect("encode");
+
+        assert_eq!(
+            SignedAdmissionSet::verify(&key(), "aster0.net", &future),
+            Err(AdmissionSetError::UnknownFormat(
+                ADMISSION_FORMAT_VERSION + 1
+            )),
+            "a newer envelope is refused by version, never partially read"
+        );
+    }
+
     /// Each malformed-set field on its own, correctly signed.
     #[test]
     fn each_malformed_set_field_is_refused_on_its_own() {

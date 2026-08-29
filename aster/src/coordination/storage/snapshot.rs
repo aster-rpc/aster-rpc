@@ -2851,6 +2851,58 @@ mod tests {
     use super::super::scratch::ScratchDir;
     use super::*;
 
+    /// The snapshot body's two version axes, each refused on its own at the
+    /// gate `prepare_install` runs before it will rebuild anything (S5-C).
+    ///
+    /// `check_identity` is the production site: an installing follower reaches
+    /// it with a leader's header, and it is the last thing between a newer body
+    /// and a candidate database. Both arms are exercised from one otherwise
+    /// legal header, so nothing but the version under test can be the reason
+    /// for the refusal — and the two are asserted separately because they are
+    /// separate compatibility concerns that merely share the value 1 today.
+    /// Substituting one constant for the other has already happened once in
+    /// this crate (the recovery header stamped the snapshot's version, fixed at
+    /// S5-A), which is why the arms are not folded together.
+    #[test]
+    fn a_snapshot_body_from_a_future_format_or_schema_is_refused() {
+        use super::super::fixture::maximal_legal_meta;
+        use super::super::identity::LOGICAL_SCHEMA_VERSION;
+        use crate::coordination::rowstream::{SnapshotHeaderV1, SNAPSHOT_FORMAT_VERSION};
+
+        let meta = maximal_legal_meta();
+        let state = super::super::rows::meta_from_wire(&meta).expect("the fixture meta narrows");
+        let identity = SnapshotIdentity::of(&state);
+        let legal = SnapshotHeaderV1 {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            schema_version: LOGICAL_SCHEMA_VERSION,
+            meta,
+            row_counts: Default::default(),
+        };
+        check_identity(&legal, &identity).expect("the baseline header is accepted");
+
+        let newer_format = SnapshotHeaderV1 {
+            format_version: SNAPSHOT_FORMAT_VERSION + 1,
+            ..legal.clone()
+        };
+        let err = check_identity(&newer_format, &identity)
+            .expect_err("a newer body format must be refused, never partially read");
+        assert!(
+            err.to_string().contains("body format version"),
+            "the refusal must name the axis: {err}"
+        );
+
+        let newer_schema = SnapshotHeaderV1 {
+            schema_version: LOGICAL_SCHEMA_VERSION + 1,
+            ..legal
+        };
+        let err = check_identity(&newer_schema, &identity)
+            .expect_err("a newer logical schema must be refused");
+        assert!(
+            err.to_string().contains("schema version"),
+            "the refusal must name the axis: {err}"
+        );
+    }
+
     /// Acting on an install is reachable only through the verdict that grants
     /// it.
     ///

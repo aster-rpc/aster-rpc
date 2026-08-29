@@ -1092,6 +1092,36 @@ mod tests {
         assert_eq!(verify(&bytes), Err(PermitError::BadSignature));
     }
 
+    /// The **envelope's** format version, which is a separate gate from the
+    /// permit document's (S5-C).
+    ///
+    /// `each_mismatched_binding_is_refused_on_its_own` covers the document
+    /// arm, reached only after the signature verifies. This one runs *before*
+    /// the signature, because a build that cannot read this envelope shape
+    /// cannot even locate the bytes to verify — so it is the arm an older
+    /// reader meets first, and the matrix needs its own evidence for it.
+    ///
+    /// Correctly signed and then re-wrapped, so only the version can refuse it.
+    #[test]
+    fn a_permit_envelope_from_a_future_format_is_refused_before_its_signature() {
+        let signed = valid(&CANDIDATE, &ticket_bytes());
+        assert_eq!(verify(&signed), Ok(()));
+
+        let mut envelope: SignedCoordinationDocumentV1 =
+            payload_fory::<SignedCoordinationDocumentV1>()
+                .deserialize(&signed)
+                .expect("the fixture envelope decodes");
+        envelope.format_version = PERMIT_FORMAT_VERSION + 1;
+        let future = payload_fory::<SignedCoordinationDocumentV1>()
+            .serialize(&envelope)
+            .expect("encode");
+
+        assert_eq!(
+            verify(&future),
+            Err(PermitError::UnknownFormat(PERMIT_FORMAT_VERSION + 1))
+        );
+    }
+
     /// Every binding, each broken on its own and **correctly signed**, so the
     /// test proves the binding is checked rather than the signature.
     #[test]
@@ -1565,6 +1595,30 @@ mod tests {
 
     /// Every binding broken on its own and **correctly signed**, so each case
     /// proves the binding is checked rather than the signature.
+    /// The genesis **envelope's** format version — the same separate gate the
+    /// permit has, and for the same reason (S5-C). Checked before the
+    /// signature, so the fixture is correctly signed and only re-wrapped.
+    #[test]
+    fn a_genesis_envelope_from_a_future_format_is_refused_before_its_signature() {
+        let signed = valid_genesis();
+        let authority_key = signing_key().verifying_key().to_bytes();
+        assert!(verify_genesis(&authority_key, "aster0.net", &signed).is_ok());
+
+        let mut envelope: SignedCoordinationDocumentV1 =
+            payload_fory::<SignedCoordinationDocumentV1>()
+                .deserialize(&signed)
+                .expect("the fixture envelope decodes");
+        envelope.format_version = PERMIT_FORMAT_VERSION + 1;
+        let future = payload_fory::<SignedCoordinationDocumentV1>()
+            .serialize(&envelope)
+            .expect("encode");
+
+        assert_eq!(
+            verify_genesis(&authority_key, "aster0.net", &future),
+            Err(GenesisError::UnknownFormat(PERMIT_FORMAT_VERSION + 1))
+        );
+    }
+
     #[test]
     fn each_malformed_genesis_field_is_refused_on_its_own() {
         let base = || genesis_for(&[[1u8; 32], [2u8; 32], [3u8; 32]], PROFILE_PROD);

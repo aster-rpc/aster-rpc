@@ -32,7 +32,7 @@ use aster::coordination::model::limits::{
     RIGHT_ACQUIRE, RIGHT_MUTATE, RIGHT_READ, RIGHT_RELEASE, RIGHT_RENEW, RIGHT_REVOKE,
 };
 
-use aster::coordination::service::{STORE_SERVICE, STORE_VERSION};
+use aster::coordination::service::{RAFT_SERVICE, RAFT_VERSION, STORE_SERVICE, STORE_VERSION};
 use aster::coordination::store::wire::{
     AclStatusReplyWireV1, AclStatusRequestV1, AcquireRequestV1, AdminStatusReplyWireV1,
     AdminStatusRequestV1, AuditRecordWireV1, AuditStreamRequestV1, CompareAndSetRequestV1,
@@ -297,6 +297,94 @@ fn fence_of(snapshot: &ResourceSnapshotV1) -> FenceV1 {
 // ── The ACL/admin path first (the §S4 ordering), then resources ─────────────
 
 /// **ROOT administers without a delegated row; the ACL it writes is exact；
+/// The reserved service **version** is part of routing, not decoration (S5-C).
+///
+/// `STORE_VERSION` and `RAFT_VERSION` are the two axes with no field inside any
+/// coordination payload: they live in the RPC `StreamHeader`, and the server
+/// routes on `(service, version)`. So their refusal arm is a routing miss, and
+/// the only way to reach it is to ask for a version that is not registered.
+///
+/// Both halves are asserted, and the pairing is what makes this evidence rather
+/// than a tautology: at v1 the store is *found* (refused later on its own
+/// merits, with some other code), and at v1 + 1 it is `NotFound` — so the
+/// difference is attributable to the version alone. Constructing a v1 header
+/// and comparing it with the v1 constant would prove nothing, which is exactly
+/// the trap S5-C names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reserved_service_is_routed_by_version_and_a_newer_one_is_not_found() {
+    const NOT_FOUND: i32 = 5;
+
+    let h = harness(0xC5).await;
+    let group = group_of(&h.fixture);
+
+    async fn ask(
+        client: &Client,
+        service: &str,
+        version: i32,
+        method: &str,
+        group: &[u8],
+    ) -> Option<i32> {
+        let header = StreamHeader {
+            service: service.to_string(),
+            method: method.to_string(),
+            version,
+            ..Default::default()
+        };
+        let request = encode(&MembershipStatusRequestV1 {
+            protocol_version: STORE_PROTOCOL_VERSION,
+            group_id: group.to_vec(),
+            operation_id: Default::default(),
+        });
+        match within(method, client.conn.unary(&header, request)).await {
+            Ok(_) => None,
+            Err(Error::Rpc { code, .. }) => Some(code),
+            Err(other) => panic!("{service} v{version}: expected a status, got {other}"),
+        }
+    }
+
+    // The store at its own version is reached: served, or refused by the
+    // handler — either way, not a routing miss.
+    assert_ne!(
+        ask(
+            &h.worker,
+            STORE_SERVICE,
+            STORE_VERSION,
+            "membership_status",
+            &group
+        )
+        .await,
+        Some(NOT_FOUND),
+        "the store at its own version must be routed to its handler"
+    );
+
+    // One version newer is a service this build does not host.
+    assert_eq!(
+        ask(
+            &h.worker,
+            STORE_SERVICE,
+            STORE_VERSION + 1,
+            "membership_status",
+            &group
+        )
+        .await,
+        Some(NOT_FOUND),
+        "a newer store version is refused by routing, never served by the v1 handler"
+    );
+
+    // The Raft service is voter-internal (`iroh_only`), so an application
+    // client is told `NotFound` at *every* version — its existence is not
+    // confirmed to a caller the transport cannot vouch for. That makes the
+    // version arm unobservable from here by design, and recording why is the
+    // honest answer: the axis is enforced by the same `(service, version)`
+    // routing proved above, while §5.3's own protocol and Raft-codec version
+    // fields have their own fixtures in `network::admit` (request half) and
+    // `network::client` (response half).
+    assert_eq!(
+        ask(&h.worker, RAFT_SERVICE, RAFT_VERSION + 1, "vote", &group).await,
+        Some(NOT_FOUND)
+    );
+}
+
 /// and the register lifecycle runs end to end on committed grants.**
 ///
 /// One flowing gate rather than many, because the §5.2 lifecycle is a

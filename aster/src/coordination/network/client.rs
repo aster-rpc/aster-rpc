@@ -198,6 +198,53 @@ impl RaftNetworkFactory<CoordinationTypeConfig> for CoordinationNetworkFactory {
     }
 }
 
+/// The §5.3 response-envelope rule, as a function of the bytes and the two
+/// facts it compares them against.
+///
+/// A free function rather than a method because the rule *is* pure — group and
+/// target are the only state it reads — and because the alternative left the
+/// reply half of §5.3 with no fixture at all. The request half already has one
+/// ([`super::admit`] checks a constructed envelope directly); the reply half
+/// could only be reached through a `CoordinationNetwork`, which needs a live
+/// endpoint, so the version, group, responder and canonicality arms were
+/// asserted nowhere. Same rule, same order, now reachable (S5-C).
+fn open_response_from(
+    reply: &[u8],
+    group: &CoordinationGroupId,
+    target: &CoordinationNodeId,
+) -> Result<RaftMessageV1, Transport> {
+    let envelope: RaftResponseEnvelopeV1 = payload_fory::<RaftResponseEnvelopeV1>()
+        .deserialize(reply)
+        .map_err(|_| Transport::Undecodable)?;
+    if envelope.protocol_version != PROTOCOL_VERSION
+        || envelope.raft_codec_version != RAFT_CODEC_VERSION
+    {
+        return Err(Transport::VersionMismatch);
+    }
+    if envelope.group_id != group.as_bytes() {
+        return Err(Transport::WrongGroup);
+    }
+    // §5.3: "a response's responder must equal the connected peer". Without
+    // this a redirected or proxied reply would be accepted as the target's.
+    if envelope.responder_node_id != target.as_bytes() {
+        return Err(Transport::WrongGroup);
+    }
+    let message: RaftMessageV1 = payload_fory::<RaftMessageV1>()
+        .deserialize(&envelope.payload)
+        .map_err(|_| Transport::Undecodable)?;
+    // And the reply payload is canonicality-checked for the same reason the
+    // request's is: Fory tolerates trailing bytes, so a decoding payload is
+    // not thereby its own canonical encoding, and §5.1 refuses trailing
+    // internal-codec bytes in either direction.
+    let reencoded = payload_fory::<RaftMessageV1>()
+        .serialize(&message)
+        .map_err(|_| Transport::Undecodable)?;
+    if reencoded != envelope.payload {
+        return Err(Transport::Undecodable);
+    }
+    Ok(message)
+}
+
 /// One peer's client.
 pub(crate) struct CoordinationNetwork {
     ctx: NetworkContext,
@@ -356,36 +403,7 @@ impl CoordinationNetwork {
     /// The reply half deserves the same checks as the request half, and having
     /// two copies is how one of them ends up shorter.
     fn open_response(&self, reply: &[u8]) -> Result<RaftMessageV1, Transport> {
-        let envelope: RaftResponseEnvelopeV1 = payload_fory::<RaftResponseEnvelopeV1>()
-            .deserialize(reply)
-            .map_err(|_| Transport::Undecodable)?;
-        if envelope.protocol_version != PROTOCOL_VERSION
-            || envelope.raft_codec_version != RAFT_CODEC_VERSION
-        {
-            return Err(Transport::VersionMismatch);
-        }
-        if envelope.group_id != self.ctx.group.as_bytes() {
-            return Err(Transport::WrongGroup);
-        }
-        // §5.3: "a response's responder must equal the connected peer". Without
-        // this a redirected or proxied reply would be accepted as the target's.
-        if envelope.responder_node_id != self.target.as_bytes() {
-            return Err(Transport::WrongGroup);
-        }
-        let message: RaftMessageV1 = payload_fory::<RaftMessageV1>()
-            .deserialize(&envelope.payload)
-            .map_err(|_| Transport::Undecodable)?;
-        // And the reply payload is canonicality-checked for the same reason the
-        // request's is: Fory tolerates trailing bytes, so a decoding payload is
-        // not thereby its own canonical encoding, and §5.1 refuses trailing
-        // internal-codec bytes in either direction.
-        let reencoded = payload_fory::<RaftMessageV1>()
-            .serialize(&message)
-            .map_err(|_| Transport::Undecodable)?;
-        if reencoded != envelope.payload {
-            return Err(Transport::Undecodable);
-        }
-        Ok(message)
+        open_response_from(reply, &self.ctx.group, &self.target)
     }
 
     /// Classify, latch, and build the `RPCError` the trait returns.
@@ -809,6 +827,112 @@ mod tests {
 
     fn node(n: u8) -> CoordinationNodeId {
         CoordinationNodeId::from_array([n; 32])
+    }
+
+    /// Every arm of the §5.3 **response** envelope rule, each broken on its
+    /// own from one otherwise-legal reply (S5-C).
+    ///
+    /// The request half of this rule has had a fixture since Slice 3; the reply
+    /// half had none, because reaching it needed a live endpoint. Both versions
+    /// matter independently: a peer answering under a newer protocol or a newer
+    /// Raft codec must be refused as a version mismatch — classified
+    /// `PermanentProtocol`, so the latch surfaces it rather than retrying
+    /// forever — and never partially read.
+    #[test]
+    fn a_response_envelope_is_refused_on_every_axis_it_declares() {
+        use crate::coordination::raft::{RaftMessageV1, RaftResponseEnvelopeV1};
+
+        let group = CoordinationGroupId::from_array([0x77; 32]);
+        let target = node(9);
+        let message = RaftMessageV1::VoteResponse(Default::default());
+        let payload = payload_fory::<RaftMessageV1>()
+            .serialize(&message)
+            .expect("encode");
+        let legal = RaftResponseEnvelopeV1 {
+            protocol_version: PROTOCOL_VERSION,
+            raft_codec_version: RAFT_CODEC_VERSION,
+            group_id: group.as_bytes().to_vec(),
+            responder_node_id: target.as_bytes().to_vec(),
+            payload: payload.clone(),
+        };
+        let encode = |envelope: &RaftResponseEnvelopeV1| {
+            payload_fory::<RaftResponseEnvelopeV1>()
+                .serialize(envelope)
+                .expect("encode")
+        };
+        assert_eq!(
+            open_response_from(&encode(&legal), &group, &target),
+            Ok(message),
+            "the baseline reply is accepted, so nothing below is refused for an unrelated reason"
+        );
+
+        let cases: Vec<(&str, RaftResponseEnvelopeV1, Transport)> = vec![
+            (
+                "a newer protocol version",
+                RaftResponseEnvelopeV1 {
+                    protocol_version: PROTOCOL_VERSION + 1,
+                    ..legal.clone()
+                },
+                Transport::VersionMismatch,
+            ),
+            (
+                "a newer Raft codec version",
+                RaftResponseEnvelopeV1 {
+                    raft_codec_version: RAFT_CODEC_VERSION + 1,
+                    ..legal.clone()
+                },
+                Transport::VersionMismatch,
+            ),
+            (
+                "another group",
+                RaftResponseEnvelopeV1 {
+                    group_id: vec![0x11; 32],
+                    ..legal.clone()
+                },
+                Transport::WrongGroup,
+            ),
+            (
+                "a responder that is not the connected peer",
+                RaftResponseEnvelopeV1 {
+                    responder_node_id: node(8).as_bytes().to_vec(),
+                    ..legal.clone()
+                },
+                Transport::WrongGroup,
+            ),
+            (
+                // Fory tolerates trailing bytes, so a payload that decodes is
+                // not thereby canonical.
+                "a noncanonical payload",
+                RaftResponseEnvelopeV1 {
+                    payload: {
+                        let mut padded = payload.clone();
+                        padded.push(0x00);
+                        padded
+                    },
+                    ..legal.clone()
+                },
+                Transport::Undecodable,
+            ),
+        ];
+        for (label, envelope, expected) in cases {
+            assert_eq!(
+                open_response_from(&encode(&envelope), &group, &target),
+                Err(expected),
+                "{label}"
+            );
+        }
+
+        // Not an envelope at all.
+        assert_eq!(
+            open_response_from(b"not a response envelope", &group, &target),
+            Err(Transport::Undecodable)
+        );
+
+        // And a version mismatch is permanent, not something to retry at.
+        assert_eq!(
+            super::super::errors::classify(&Transport::VersionMismatch).fault,
+            FaultClass::PermanentProtocol
+        );
     }
 
     /// Routes are advisory: a table entry makes a peer reachable sooner and
