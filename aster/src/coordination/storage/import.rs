@@ -71,11 +71,29 @@ impl RecoveryImport {
     /// Seal one capability from a verified genesis, the identity derived from
     /// it, and the operator-supplied export path.
     ///
-    /// Refuses unless the identity really is *this* genesis's identity. The
-    /// boot corridor derives both from the same document, so a disagreement is
-    /// a wiring mistake rather than input — but it is precisely the wiring
-    /// mistake that would otherwise found a group from the wrong export, and it
-    /// costs four comparisons to make it unrepresentable.
+    /// Refuses unless the identity really is *this* genesis's identity — **all
+    /// five replicated fields**, plus the local node.
+    ///
+    /// The boot corridor derives both from the same document, so a disagreement
+    /// is a wiring mistake rather than input; but it is precisely the wiring
+    /// mistake that would otherwise found a group from the wrong export, so the
+    /// comparison has to be total rather than representative. Two of the six
+    /// carry their own argument:
+    ///
+    /// - **The authority key.** [`StorageIdentity`] binds a replicated ROOT
+    ///   key, and it is the key every later signed document — including the
+    ///   confirming Genesis of §13 step 5 — is verified under. A partial seal
+    ///   that omitted it would let an identity naming a *different* ROOT be
+    ///   sealed against this document, and the recovered group would bind an
+    ///   authority no signature here was ever checked with. That is why
+    ///   [`VerifiedGenesis`] retains the key `verify_genesis` used rather than
+    ///   the caller re-supplying one.
+    /// - **The local node.** §7.2 lets only a signed initial voter bootstrap,
+    ///   and a recovery bootstrap is a bootstrap. Deriving that from the
+    ///   document rather than trusting the corridor to have checked it keeps the
+    ///   capability meaningful on its own: an unauthorised node cannot hold one.
+    ///
+    /// [`VerifiedGenesis`]: crate::coordination::model::authority::VerifiedGenesis
     pub(crate) fn seal(
         identity: &StorageIdentity,
         genesis: &crate::coordination::model::authority::VerifiedGenesis,
@@ -94,6 +112,10 @@ impl RecoveryImport {
                 identity.group_id().as_bytes() == genesis.group_id(),
             ),
             (
+                "authority public key",
+                identity.authority_public_key() == genesis.authority_public_key(),
+            ),
+            (
                 "authority domain",
                 identity.authority_domain() == genesis.authority_domain(),
             ),
@@ -108,6 +130,13 @@ impl RecoveryImport {
                      may only be sealed from the identity its own genesis produced"
                 ));
             }
+        }
+        if !genesis.is_initial_voter(identity.local_node_id().as_bytes()) {
+            return Err(
+                "this node is not one of the genesis's signed initial voters; §7.2 lets \
+                 only an initial voter bootstrap, and a recovery bootstrap is a bootstrap"
+                    .into(),
+            );
         }
         Ok(Self {
             path,
@@ -342,12 +371,20 @@ pub(crate) fn transform(
     // admit provenance that names a real index under a term and leader the
     // source never had there, which is a fabricated record that still passes
     // every width and ordering rule.
+    //
+    // The width check lives here rather than beside the other `wide32` calls
+    // for one reason: these two log ids are optional, so there is no
+    // unconditional site that sees them. The reader validates the header's
+    // fixed-width fields, but `source_audit_floor`/`source_audit_tip` carry
+    // their leader id inside an `Option<LogIdV1>` that no width rule reaches —
+    // and this is the predicate every optional log id already passes through.
     let within = |what: &str,
                   id: &Option<crate::coordination::contract::LogIdV1>,
                   bound: &crate::coordination::contract::LogIdV1,
                   bound_name: &str|
      -> Result<(), String> {
         let Some(id) = id else { return Ok(()) };
+        wide32(&format!("{what}'s leader id"), &id.leader_node_id)?;
         if id.index > bound.index {
             return Err(format!(
                 "{what} is at index {} but {bound_name} is at index {}; provenance \
@@ -1131,6 +1168,31 @@ mod tests {
                     "one index in one history is one entry",
                 ),
                 (
+                    // The reader validates the header's fixed-width fields;
+                    // these two carry a leader id inside an `Option<LogIdV1>`
+                    // that no width rule reaches, so the import owns it.
+                    "an audit floor whose leader id is not 32 bytes",
+                    with_header(&|h| {
+                        let mut floor = log_id(10);
+                        floor.leader_node_id = vec![0xDD; 31];
+                        h.source_audit_floor = Some(floor);
+                    }),
+                    None,
+                    vec![nid(0x41)],
+                    "leader id must be 32 bytes",
+                ),
+                (
+                    "an audit tip whose leader id is not 32 bytes",
+                    with_header(&|h| {
+                        let mut tip = log_id(39);
+                        tip.leader_node_id = Vec::new();
+                        h.source_audit_tip = Some(tip);
+                    }),
+                    None,
+                    vec![nid(0x41)],
+                    "leader id must be 32 bytes",
+                ),
+                (
                     "a source membership with no log id",
                     with_header(&|h| h.source_membership.log_id = None),
                     None,
@@ -1613,11 +1675,28 @@ mod tests {
     /// declared-size gate and would then read without any bound at all.
     /// `take(max + 1)` is what stops that, and the refusal is the same one an
     /// oversized file gets.
+    ///
+    /// **Every blocking step here is timeout-bounded, and that is not
+    /// defensiveness — it is a correctness property of the test itself.** A
+    /// FIFO open blocks until the other end appears, so any implementation that
+    /// stops reading through the handle it was given and reopens the *name*
+    /// blocks forever: the writer has finished and closed its end, and nothing
+    /// will ever pair with the new reader. A test that simply called
+    /// `read_bounded` would then hang the whole suite instead of failing, which
+    /// is exactly what happened to a mutation run of this file. Running the
+    /// call on a worker and failing on timeout turns that deadlock back into
+    /// the assertion failure it should always have been.
     #[cfg(unix)]
     #[test]
     fn a_source_that_declares_no_size_is_still_bounded() {
         use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        /// Generous enough that a loaded machine never trips it, short enough
+        /// that a genuine deadlock is reported rather than waited on.
+        const PATIENCE: Duration = Duration::from_secs(20);
 
         let dir = ScratchDir::new("import-fifo");
         let path = dir.join("export.fifo");
@@ -1632,7 +1711,7 @@ mod tests {
         // Both ends block until they are paired, so the writer is started
         // first and the reader's open is what releases it.
         let writer_path = path.clone();
-        let writer = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut pipe = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&writer_path)
@@ -1641,18 +1720,34 @@ mod tests {
             let _ = pipe.write_all(&vec![0x77u8; 4096]);
         });
 
-        let file = std::fs::File::open(&path).expect("open the fifo for reading");
+        // The reader's own open is bounded too: if the writer thread failed
+        // before pairing, this would otherwise never return.
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let open_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = opened_tx.send(std::fs::File::open(&open_path));
+        });
+        let file = opened_rx
+            .recv_timeout(PATIENCE)
+            .expect("the fifo reader and writer never paired")
+            .expect("open the fifo for reading");
         assert_eq!(
             file.metadata().unwrap().len(),
             0,
             "a fifo declares no size, which is the whole point of this case"
         );
-        let err = read_bounded(file, &path, 64).unwrap_err();
-        assert!(
-            err.to_string().contains("over the 64 byte"),
-            "an unsized source must still be bounded by the read: {err}"
+
+        let (read_tx, read_rx) = mpsc::channel();
+        let read_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = read_tx.send(read_bounded(file, &read_path, 64).map(|_| ()));
+        });
+        let outcome = read_rx.recv_timeout(PATIENCE).expect(
+            "read_bounded never returned: it stopped reading through the handle it was \
+             given and reopened the name, which on a fifo can never pair again",
         );
-        let _ = writer.join();
+        let err = outcome.expect_err("an unsized source must still be bounded by the read");
+        assert!(err.to_string().contains("over the 64 byte"), "{err}");
     }
 
     /// A capability exists only when the identity and the genesis are one
@@ -1721,16 +1816,56 @@ mod tests {
             .expect_err("no bound export, no capability");
         assert!(err.contains("binds no recovery export"), "got: {err}");
 
+        // Each replicated field is compared, not a representative sample. The
+        // two below are the ones a partial seal would plausibly omit, and each
+        // is refused on its own with the others left honest.
+
+        // A different ROOT. The identity's key is what the store binds as its
+        // replicated authority and what every later signed document — including
+        // the confirming Genesis — is verified under, so sealing this pair
+        // would found a group under an authority that signed nothing here.
+        let other_root = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_ne!(other_root, *a.authority_public_key());
+        let wrong_root = StorageIdentity::new(
+            *identity_a.group_id(),
+            *identity_a.genesis_hash(),
+            other_root,
+            identity_a.authority_domain(),
+            *identity_a.local_node_id(),
+            identity_a.deployment_profile_code(),
+        );
+        let err = RecoveryImport::seal(&wrong_root, &a, "/tmp/export".into())
+            .expect_err("a ROOT this document was not verified under cannot seal it");
+        assert!(err.contains("authority public key"), "got: {err}");
+
+        // A local node the document never named as an initial voter. §7.2 lets
+        // only a signed initial voter bootstrap, and a recovery bootstrap is a
+        // bootstrap; every replicated field here is correct.
+        let stranger = crate::coordination::ids::CoordinationNodeId::from_array([0x9F; 32]);
+        assert!(!a.is_initial_voter(stranger.as_bytes()));
+        let not_a_voter = StorageIdentity::new(
+            *identity_a.group_id(),
+            *identity_a.genesis_hash(),
+            *identity_a.authority_public_key(),
+            identity_a.authority_domain(),
+            stranger,
+            identity_a.deployment_profile_code(),
+        );
+        let err = RecoveryImport::seal(&not_a_voter, &a, "/tmp/export".into())
+            .expect_err("an unauthorised node cannot hold a recovery capability");
+        assert!(err.contains("signed initial voters"), "got: {err}");
+
         // The identity really is derived from the document: a hash that is not
         // this genesis's is the same refusal from the other side.
-        let mut wrong = identity_a.clone();
-        wrong = StorageIdentity::new(
-            *wrong.group_id(),
+        let wrong = StorageIdentity::new(
+            *identity_a.group_id(),
             genesis_hash(b"not this document"),
-            *wrong.authority_public_key(),
-            wrong.authority_domain(),
-            *wrong.local_node_id(),
-            wrong.deployment_profile_code(),
+            *identity_a.authority_public_key(),
+            identity_a.authority_domain(),
+            *identity_a.local_node_id(),
+            identity_a.deployment_profile_code(),
         );
         assert!(RecoveryImport::seal(&wrong, &a, "/tmp/export".into()).is_err());
     }

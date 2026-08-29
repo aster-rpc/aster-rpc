@@ -493,6 +493,7 @@ pub struct VerifiedGenesis {
     document_bytes: Vec<u8>,
     genesis_hash: [u8; 32],
     group_id: [u8; 32],
+    authority_public_key: [u8; 32],
     authority_domain: String,
     deployment_profile_code: i32,
     initial_voters: Vec<VerifiedVoterSeed>,
@@ -525,6 +526,20 @@ impl VerifiedGenesis {
 
     pub fn group_id(&self) -> &[u8; 32] {
         &self.group_id
+    }
+
+    /// The ROOT key this document's signature was **actually verified with**.
+    ///
+    /// Not read out of the envelope — the envelope's copy is compared to the
+    /// configured key and never verified against, precisely because a signature
+    /// checked with the key that arrived beside it proves nothing. This is that
+    /// configured key, retained so a later consumer can require that whatever
+    /// else it holds was derived under the same authority. §13's import seal is
+    /// that consumer: without this, an identity naming a *different* ROOT could
+    /// be sealed against this document, and the group would then bind a
+    /// replicated authority key no signature here was ever checked under.
+    pub fn authority_public_key(&self) -> &[u8; 32] {
+        &self.authority_public_key
     }
 
     pub fn authority_domain(&self) -> &str {
@@ -765,6 +780,7 @@ fn seal_genesis(
         genesis_hash: genesis_hash(&document_bytes),
         document_bytes,
         group_id,
+        authority_public_key: *authority_public_key,
         authority_domain: genesis.authority_domain,
         deployment_profile_code: genesis.deployment_profile_code,
         initial_voters,
