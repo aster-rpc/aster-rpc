@@ -183,6 +183,13 @@ pub(crate) fn import_recovery_export(
     //    armed `transaction-commit` here would stop the child in the *bind* and
     //    file the result under "import", which reads as evidence and is about
     //    another operation entirely.
+    //    Arming happens here rather than in the harness: this function is
+    //    reached from inside `VoterStorage::open_with_recovery`, so a caller
+    //    that armed before the call would have armed `schema::open`'s binding
+    //    transaction instead. Everything below — including the shared
+    //    transaction boundaries inside the single `rows::commit` — is therefore
+    //    the import's own.
+    super::crash::arm_here();
     super::crash::reached(super::crash::CrashPoint::ImportBound);
 
     // 1. The store must hold no durable replicated state and no data rows.

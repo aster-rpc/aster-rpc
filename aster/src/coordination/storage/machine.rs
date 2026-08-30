@@ -5441,6 +5441,20 @@ mod tests {
         Import = "import" => [
             ImportBound => BoundPristine,
             ImportTransformed => BoundPristine,
+            // The shared transaction seams, which belong to the import's own
+            // `rows::commit` because arming happens after the bind. These are
+            // the cells that make "the whole founding state or none of it" a
+            // proved property rather than a claim: `TransactionWrite` stops the
+            // process with every row staged *inside* the transaction, so an
+            // implementation that committed resources separately from grants,
+            // administrators and meta would be caught here and at
+            // `TransactionCommit` — where the store would come back holding
+            // part of the export. Without them, `ImportTransformed` sits before
+            // the commit and `ImportCommitted` after it, and a split import
+            // passes both.
+            TransactionBegin => BoundPristine,
+            TransactionWrite => BoundPristine,
+            TransactionCommit => Durable,
             ImportCommitted => Durable,
         ],
         Install = "install" => [
@@ -5773,7 +5787,10 @@ mod tests {
         // are distinct, and they are reached only after `schema::open` has
         // finished binding.
         if operation == Operation::Import {
-            super::super::crash::arm();
+            // Deliberately not armed here. `open_with_recovery` binds the
+            // directory before the import begins, and arming across that would
+            // crash the bind while calling the result an import.
+            // `import_recovery_export` arms itself once the bind is done.
             let export_hash = write_import_export(dir);
             let sealed = import_capability(dir, export_hash);
             let storage = super::super::VoterStorage::open_with_recovery(
@@ -6467,20 +6484,26 @@ mod tests {
     /// and `candidate-commit` is reached by more than one. Nor can either notice
     /// an outcome changing.
     ///
-    /// This is the inventory: thirty-three cells, each with the operation, the
+    /// This is the inventory: thirty-six cells, each with the operation, the
     /// boundary and what dying there means, written out rather than derived.
     /// Deleting an operation, dropping a cell, adding one, or weakening an
     /// outcome all fail here, and fail saying which. The published claim is
-    /// "thirty-three kills", so the number is checked as well as the contents --
+    /// "thirty-six kills", so the number is checked as well as the contents --
     /// but the contents first, because a count alone passes when a cell is
     /// renamed into something nobody asked for.
     ///
-    /// The three `import` cells joined at S5-D. They are also the only cells
-    /// whose outcome is not fully expressed by the before/after comparison:
-    /// `BoundPristine` carries an extra obligation, asserted separately, that a
-    /// second import is refused.
+    /// The six `import` cells joined at S5-D — three of its own plus the three
+    /// shared transaction seams, which belong to its single `rows::commit`
+    /// because arming happens after the bind. The shared three are what make
+    /// atomicity a *proved* property: `transaction-write` stops the process with
+    /// every row staged inside the transaction, so a split import is caught
+    /// rather than passing between two import-level boundaries.
+    ///
+    /// They are also the only cells whose outcome is not fully expressed by the
+    /// before/after comparison: `BoundPristine` carries an extra obligation,
+    /// asserted separately, that a second import is refused.
     #[test]
-    fn the_matrix_is_the_thirty_three_cells_that_were_agreed() {
+    fn the_matrix_is_the_thirty_six_cells_that_were_agreed() {
         let actual: Vec<String> = Operation::ALL
             .iter()
             .flat_map(|operation| {
@@ -6515,6 +6538,9 @@ mod tests {
             "build current-publication Durable",
             "import import-bound BoundPristine",
             "import import-transformed BoundPristine",
+            "import transaction-begin BoundPristine",
+            "import transaction-write BoundPristine",
+            "import transaction-commit Durable",
             "import import-committed Durable",
             "install transaction-begin Discarded",
             "install transaction-write Discarded",
@@ -6527,7 +6553,7 @@ mod tests {
         ];
 
         assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 33, "the matrix is thirty-three cells");
+        assert_eq!(actual.len(), 36, "the matrix is thirty-six cells");
     }
 
     /// Nothing is declared `Undetermined`.

@@ -274,6 +274,25 @@ pub(crate) fn arm() {
     ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Arm from a production path, and compile to nothing outside tests.
+///
+/// The §13 import needs this and the other operations do not, because it is the
+/// one operation that *is* an open: the harness cannot arm before calling it
+/// without arming the identity binding `schema::open` performs first, and
+/// cannot arm after because by then the import has finished. So the moment is
+/// named where it actually occurs — immediately after the bind, before the
+/// import has read anything — and the shared transaction boundaries inside its
+/// single `rows::commit` become the import's own.
+///
+/// Given the same treatment as [`reached`] for the same reason: an empty inline
+/// call outside tests, rather than a `cfg` split that would let the armed path
+/// and the shipped path drift.
+#[inline]
+pub(crate) fn arm_here() {
+    #[cfg(test)]
+    arm();
+}
+
 /// The boundary this process was told to stop at, if any.
 ///
 /// Read from the environment rather than set through a Rust seam, because the
