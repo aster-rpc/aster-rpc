@@ -47,12 +47,15 @@
 //! Slice 3 wires the voter runtime, not before.
 
 pub(crate) mod actor;
-pub(crate) mod codec;
-pub(crate) mod crash;
-pub(crate) mod error;
 /// The OpenRaft storage-suite fixture. Test-only: it exists to hold one group
 /// identity fixed across every store a builder makes, which is what
 /// `transfer_snapshot` requires.
+/// S5-E's measured costs. `#[ignore]`d, so it adds nothing to the battery.
+#[cfg(test)]
+mod bench;
+pub(crate) mod codec;
+pub(crate) mod crash;
+pub(crate) mod error;
 #[cfg(test)]
 pub(crate) mod fixture;
 pub(crate) mod identity;
@@ -397,6 +400,7 @@ mod durability_guard {
         ("mod.rs", include_str!("mod.rs")),
         ("actor.rs", include_str!("actor.rs")),
         ("codec.rs", include_str!("codec.rs")),
+        ("bench.rs", include_str!("bench.rs")),
         ("crash.rs", include_str!("crash.rs")),
         ("error.rs", include_str!("error.rs")),
         ("identity.rs", include_str!("identity.rs")),
