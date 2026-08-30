@@ -268,6 +268,38 @@ impl CoordinationClient {
         }))
     }
 
+    /// The exact durable request this journal is holding:
+    /// `(state code, method, request bytes, action hash, sequence)`.
+    ///
+    /// §S5-F's corridor has to prove that a manager killed **after** the
+    /// journal fsync retries *the same operation id and the same request
+    /// bytes* rather than planning afresh, and "the same bytes" is only
+    /// assertable against the bytes themselves: two plans that select the same
+    /// members produce different operation ids, and a report naming the right
+    /// members proves nothing about which request was sent.
+    ///
+    /// Reported for every state, not only `Pending`. `resolve` carries the
+    /// request frame and its hash forward unchanged, so the `ResolvedAwaitingAck`
+    /// record still names exactly which request the redelivered reply answers —
+    /// which is the half of the retry contract a resolved-before-death manager
+    /// exercises.
+    ///
+    /// Read-only, and test-gated. The journal's own mutation surface stays
+    /// crate-private for the reason its module header gives.
+    #[cfg(feature = "coordination-testing")]
+    pub async fn journal_entry_for_testing(&self) -> (i32, String, Vec<u8>, Vec<u8>, u64) {
+        let journal = self.journal.lock().await;
+        let state = journal.state().code();
+        let record = journal.record();
+        (
+            state,
+            record.pending_method.clone(),
+            record.pending_request.clone(),
+            record.request_hash.clone(),
+            record.sequence,
+        )
+    }
+
     /// Drive any half-finished request from a previous run to resolution.
     ///
     /// `Ok(None)` means the journal is `Ready` and mutations may proceed.
