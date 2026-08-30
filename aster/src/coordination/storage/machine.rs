@@ -5425,6 +5425,24 @@ mod tests {
         /// became durable while `state.redb` was still untouched. It is the one
         /// cell where the boundary that means "durable" everywhere else means
         /// the operation left no trace.
+        /// §13's recovery import: founding a new group from an export.
+        ///
+        /// The only operation that runs *inside* the open rather than against
+        /// an already-open store, which is why it has boundaries of its own —
+        /// by the time it starts, `schema::open` has already bound the
+        /// directory and passed the three shared transaction points doing it.
+        ///
+        /// Its two pre-commit cells are `BoundPristine`, not `Discarded`, and
+        /// the difference is the whole reason the variant exists: the
+        /// replicated state really is untouched, but the identity binding is
+        /// durable, so the next open is not `Fresh` and the import guard
+        /// refuses a second attempt. `Discarded` would imply a retry the code
+        /// forbids. The cell asserts the refusal rather than describing it.
+        Import = "import" => [
+            ImportBound => BoundPristine,
+            ImportTransformed => BoundPristine,
+            ImportCommitted => Durable,
+        ],
         Install = "install" => [
             TransactionBegin => Discarded,
             TransactionWrite => Discarded,
@@ -5559,9 +5577,16 @@ mod tests {
     /// already let redb recover the file and let the startup sweep tidy
     /// `snapshots/` and `incoming/`. See [`Observation`].
     async fn observe(dir: &std::path::Path) -> Observation {
+        observe_as(dir, voter_identity()).await
+    }
+
+    async fn observe_as(
+        dir: &std::path::Path,
+        identity: super::super::identity::StorageIdentity,
+    ) -> Observation {
         use openraft::StorageHelper;
 
-        let mut storage = voter(dir);
+        let mut storage = voter_as(dir, identity);
         let pre_replay = view_of(&mut storage).await;
         {
             let (log, state) = storage.recovery_parts();
@@ -5667,6 +5692,15 @@ mod tests {
         use openraft::storage::RaftLogStorage as _;
         use openraft::storage::RaftLogStorageExt as _;
 
+        // Before the open, not inside the match: opening *is* binding, and the
+        // import's precondition is a directory nothing has bound. Staging it
+        // the way every other operation is staged would bind it to
+        // `voter_identity` and the import would then be refused for an identity
+        // mismatch that the harness itself created.
+        if operation == Operation::Import {
+            return;
+        }
+
         let mut storage = voter(dir);
         match operation {
             // Entries for the marker to move over, left uncommitted: moving it
@@ -5703,7 +5737,11 @@ mod tests {
             | Operation::Append
             | Operation::Purge
             | Operation::Build
-            | Operation::Install => {}
+            | Operation::Install
+            // The import's staging is the export file, written by the parent
+            // beside the directory before any of this runs: it must not have a
+            // store at all, which is what `Fresh` means.
+            | Operation::Import => {}
         }
         drop(storage);
     }
@@ -5729,12 +5767,34 @@ mod tests {
             None
         };
 
+        // The import is the one operation that *is* an open, so it cannot use
+        // the shared `voter(dir)` above. The seam is armed first, but the three
+        // shared transaction points cannot trip it: the import's own boundaries
+        // are distinct, and they are reached only after `schema::open` has
+        // finished binding.
+        if operation == Operation::Import {
+            super::super::crash::arm();
+            let export_hash = write_import_export(dir);
+            let sealed = import_capability(dir, export_hash);
+            let storage = super::super::VoterStorage::open_with_recovery(
+                StorageLayout::new(dir),
+                super::super::identity::OpenPolicy::production(),
+                &sealed.capability,
+            )
+            .expect("the import completes");
+            drop(storage);
+            return;
+        }
+
         let mut storage = voter(dir);
         // Everything above this line is setup, including the open's own
         // transactions. The boundary the environment names starts counting now.
         super::super::crash::arm();
 
         match operation {
+            // Handled above, before the shared open: an import *is* an open, so
+            // it cannot act on the `storage` this arm holds.
+            Operation::Import => unreachable!("the import returns before the shared open"),
             Operation::Vote => {
                 let vote = openraft::Vote::new(7, CoordinationNodeId::from_array([9u8; 32]));
                 storage
@@ -6055,24 +6115,72 @@ mod tests {
     /// Exhaustive rather than defaulted: an operation added to the table has to
     /// say what makes it observable, even if the answer is "nothing beyond the
     /// state the whole comparison already covers".
-    fn distinguishing_facts(operation: Operation, before: &Observation, after: &Observation) {
+    ///
+    /// Returns **how many facts it named**, which the caller pins against a
+    /// declared table. Without that the assertions here are decorative: a
+    /// mutation deleting one leaves the matrix green, because nothing forces an
+    /// arm to assert anything at all. Found by the S5-D campaign (M39), where
+    /// removing an import fact survived.
+    fn distinguishing_facts(
+        operation: Operation,
+        before: &Observation,
+        after: &Observation,
+    ) -> usize {
+        // The count is *produced by* asserting, never written beside it. A
+        // literal count in the arm is worth nothing: deleting an assertion
+        // leaves the literal, the total still matches, and the mutation
+        // survives -- which is exactly what happened to the first version of
+        // this guard (S5-D, M39). Going through `Facts::check` means a deleted
+        // fact takes its increment with it.
+        #[derive(Default)]
+        struct Facts(usize);
+        impl Facts {
+            #[track_caller]
+            fn check(&mut self, held: bool, what: &str) {
+                assert!(held, "{what}");
+                self.0 += 1;
+            }
+        }
+        let mut facts = Facts::default();
         let purge_marker = |o: &Observation| o.recovered.view.log_state.last_purged_log_id;
         match operation {
-            // The one operation whose whole point is a marker, and the reason
-            // `LogState` is in `View` at all. Asserted on the recovered side
-            // because that is the value a restarted voter replicates from.
-            Operation::Purge => {
-                assert_eq!(
-                    purge_marker(before),
-                    None,
-                    "the fixture must start with nothing purged, or the purge \
-                     has nothing to prove"
+            // An import turns an empty directory into a founded group, so the
+            // fact that separates its two stores is the founding state itself:
+            // nothing before, the exported resources after. Named here because
+            // the whole-state comparison would also pass if the import had
+            // written something arbitrary — this says what it must have
+            // written, and that the "before" store really is empty rather than
+            // merely different.
+            Operation::Import => {
+                facts.check(
+                    before.recovered.view.state.model.resources.is_empty()
+                        && before.recovered.view.state.model.admins.is_empty(),
+                    "an unimported directory must hold no founding state, or the \
+                     import has nothing to prove",
                 );
-                assert_eq!(
-                    purge_marker(after),
-                    Some(purge_upto()),
+                facts.check(
+                    !after.recovered.view.state.model.resources.is_empty(),
+                    "a completed import must leave the exported resources",
+                );
+                facts.check(
+                    after.recovered.view.state.recovered_from.is_some(),
+                    "a completed import must record its §13 provenance",
+                );
+                facts.check(
+                    before.recovered.view.state.recovered_from.is_none(),
+                    "and an unimported directory must record none",
+                );
+            }
+            Operation::Purge => {
+                facts.check(
+                    purge_marker(before).is_none(),
+                    "the fixture must start with nothing purged, or the purge \
+                     has nothing to prove",
+                );
+                facts.check(
+                    purge_marker(after) == Some(purge_upto()),
                     "a completed purge must leave the marker it advanced, and a \
-                     reopen must report it"
+                     reopen must report it",
                 );
             }
             // The other operation that moves the marker, and it does so without
@@ -6085,24 +6193,22 @@ mod tests {
             // marker a reopened voter reports after an install is a real,
             // install-specific observable, and one no other field carries.
             Operation::Install => {
-                assert_eq!(
-                    purge_marker(before),
-                    None,
-                    "the fixture must start with nothing purged"
+                facts.check(
+                    purge_marker(before).is_none(),
+                    "the fixture must start with nothing purged",
                 );
                 let applied = after.recovered.view.applied;
-                assert!(
+                facts.check(
                     applied > before.recovered.view.applied,
                     "the installed snapshot must be ahead of what the fixture \
                      applied, or §11.4 would have classified it stale and no \
-                     install would have happened"
+                     install would have happened",
                 );
-                assert_eq!(
-                    purge_marker(after),
-                    applied,
+                facts.check(
+                    purge_marker(after) == applied,
                     "a reopened voter must report the marker at `last_applied` \
                      after an install, which is where OpenRaft's own recovery \
-                     purges the log to"
+                     purges the log to",
                 );
             }
             // Every other operation is fully covered by the whole-view
@@ -6116,13 +6222,32 @@ mod tests {
             | Operation::Truncate
             | Operation::Apply
             | Operation::Build => {
-                assert_eq!(
-                    purge_marker(before),
-                    purge_marker(after),
-                    "{} must not move the purge marker",
-                    operation.name()
+                facts.check(
+                    purge_marker(before) == purge_marker(after),
+                    &format!("{} must not move the purge marker", operation.name()),
                 );
             }
+        }
+        facts.0
+    }
+
+    /// How many facts each operation must name, declared rather than counted.
+    ///
+    /// The other half of `distinguishing_facts`' return value. A deleted
+    /// assertion changes the count and fails here, saying which operation went
+    /// quiet — which is what makes those assertions load-bearing instead of
+    /// decorative.
+    fn expected_facts(operation: Operation) -> usize {
+        match operation {
+            Operation::Import => 4,
+            Operation::Purge => 2,
+            Operation::Install => 3,
+            Operation::Vote
+            | Operation::Append
+            | Operation::CommitMarker
+            | Operation::Truncate
+            | Operation::Apply
+            | Operation::Build => 1,
         }
     }
 
@@ -6142,16 +6267,34 @@ mod tests {
     #[tokio::test]
     async fn every_boundary_recovers_to_a_state_the_protocol_permits() {
         for operation in Operation::ALL {
+            // The import founds a group from an empty directory, so it must not
+            // be handed one an initialised voter already owns. Every other
+            // operation is the opposite: it acts on a store that exists.
+            let bootstrapped = *operation != Operation::Import;
+
+            // An imported store is bound to its genesis's identity, not the
+            // harness's default; observing it through the wrong one would fail
+            // as a mismatch the harness itself caused.
+            let identity = if bootstrapped {
+                voter_identity()
+            } else {
+                import_identity()
+            };
+
             let before_dir = scratch_dir();
-            crash_fixture(&before_dir).await;
+            if bootstrapped {
+                crash_fixture(&before_dir).await;
+            }
             stage_for(&before_dir, *operation).await;
-            let before = observe(&before_dir).await;
+            let before = observe_as(&before_dir, identity.clone()).await;
 
             let after_dir = scratch_dir();
-            crash_fixture(&after_dir).await;
+            if bootstrapped {
+                crash_fixture(&after_dir).await;
+            }
             stage_for(&after_dir, *operation).await;
             perform(&after_dir, *operation).await;
-            let after = observe(&after_dir).await;
+            let after = observe_as(&after_dir, identity.clone()).await;
             // On one axis or the other. An apply's two recovered views are
             // *equal* -- recovery replays the entry the crash lost, which is the
             // whole point -- and it is the pre-replay axis that tells the two
@@ -6163,14 +6306,36 @@ mod tests {
                  distinguished from any other",
                 operation.name()
             );
-            distinguishing_facts(*operation, &before, &after);
+            assert_eq!(
+                distinguishing_facts(*operation, &before, &after),
+                expected_facts(*operation),
+                "{} named a different number of distinguishing facts than it \
+                 declares; an assertion was added or deleted",
+                operation.name()
+            );
+
+            // Counted, not merely called. `a_second_import_is_refused` is the
+            // whole content of `BoundPristine` — the durable identity effect the
+            // before/after comparison structurally cannot see — and a call whose
+            // absence nothing notices asserts nothing. The S5-D campaign found
+            // exactly that (M35 survived until this counter existed).
+            let mut retry_refusals = 0usize;
 
             for (point, outcome) in operation.cells() {
                 let dir = scratch_dir();
-                crash_fixture(&dir).await;
+                if bootstrapped {
+                    crash_fixture(&dir).await;
+                }
                 stage_for(&dir, *operation).await;
                 kill_at(&dir, *operation, *point);
-                let crashed = observe(&dir).await;
+                // Asserted *before* `observe`, which opens the directory and
+                // would bind one the crash had left unbound — the oracle would
+                // otherwise create the very condition it is meant to detect.
+                if *outcome == Outcome::BoundPristine || *operation == Operation::Import {
+                    a_second_import_is_refused(&dir, *operation, *point);
+                    retry_refusals += 1;
+                }
+                let crashed = observe_as(&dir, identity.clone()).await;
 
                 let what = format!(
                     "{} killed at {} ({outcome:?})",
@@ -6210,6 +6375,18 @@ mod tests {
                     &crashed.recovered.view.state,
                 );
                 match outcome {
+                    // The replicated state is untouched, exactly as
+                    // `Discarded` requires; what separates the two is the
+                    // durable identity binding, and that is asserted by
+                    // `a_second_import_is_refused` before the observation —
+                    // opening the directory here would bind it and destroy the
+                    // distinction.
+                    Outcome::BoundPristine => assert_eq!(
+                        (owed.0, owed.2),
+                        (owed.1, owed.3),
+                        "{what}: nothing replicated was written, so the reopen \
+                         owed the state machine nothing"
+                    ),
                     Outcome::Discarded => assert_eq!(
                         (owed.0, owed.2),
                         (owed.1, owed.3),
@@ -6229,6 +6406,18 @@ mod tests {
                     Outcome::Durable | Outcome::Undetermined => {}
                 }
             }
+
+            assert_eq!(
+                retry_refusals,
+                if *operation == Operation::Import {
+                    operation.cells().len()
+                } else {
+                    0
+                },
+                "{}: every import cell must have proved that a second import is \
+                 refused, and no other operation may claim to have",
+                operation.name()
+            );
         }
     }
 
@@ -6278,15 +6467,20 @@ mod tests {
     /// and `candidate-commit` is reached by more than one. Nor can either notice
     /// an outcome changing.
     ///
-    /// This is the inventory: thirty cells, each with the operation, the
+    /// This is the inventory: thirty-three cells, each with the operation, the
     /// boundary and what dying there means, written out rather than derived.
     /// Deleting an operation, dropping a cell, adding one, or weakening an
     /// outcome all fail here, and fail saying which. The published claim is
-    /// "thirty kills", so the number is checked as well as the contents -- but
-    /// the contents first, because a count alone passes when a cell is renamed
-    /// into something nobody asked for.
+    /// "thirty-three kills", so the number is checked as well as the contents --
+    /// but the contents first, because a count alone passes when a cell is
+    /// renamed into something nobody asked for.
+    ///
+    /// The three `import` cells joined at S5-D. They are also the only cells
+    /// whose outcome is not fully expressed by the before/after comparison:
+    /// `BoundPristine` carries an extra obligation, asserted separately, that a
+    /// second import is refused.
     #[test]
-    fn the_matrix_is_the_thirty_cells_that_were_agreed() {
+    fn the_matrix_is_the_thirty_three_cells_that_were_agreed() {
         let actual: Vec<String> = Operation::ALL
             .iter()
             .flat_map(|operation| {
@@ -6319,6 +6513,9 @@ mod tests {
             "build snapshot-body-write Discarded",
             "build snapshot-body-fsync Discarded",
             "build current-publication Durable",
+            "import import-bound BoundPristine",
+            "import import-transformed BoundPristine",
+            "import import-committed Durable",
             "install transaction-begin Discarded",
             "install transaction-write Discarded",
             "install transaction-commit Discarded",
@@ -6330,7 +6527,7 @@ mod tests {
         ];
 
         assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 30, "the matrix is thirty cells");
+        assert_eq!(actual.len(), 33, "the matrix is thirty-three cells");
     }
 
     /// Nothing is declared `Undetermined`.
@@ -6472,12 +6669,160 @@ mod tests {
 
     /// A complete voter store, opened as production opens one.
     fn voter(dir: &std::path::Path) -> super::super::VoterStorage {
+        voter_as(dir, voter_identity())
+    }
+
+    /// Open a store bound to a **named** identity.
+    ///
+    /// The matrix needs this because one operation does not use
+    /// `voter_identity`: a §13 import binds the directory to the identity its
+    /// own genesis produced, so observing an imported store with the harness's
+    /// default identity would fail as a mismatch — a failure the harness caused
+    /// rather than one the crash did.
+    fn voter_as(
+        dir: &std::path::Path,
+        identity: super::super::identity::StorageIdentity,
+    ) -> super::super::VoterStorage {
         super::super::VoterStorage::open(
             StorageLayout::new(dir),
-            voter_identity(),
+            identity,
             super::super::identity::OpenPolicy::production(),
         )
         .expect("open voter storage")
+    }
+
+    /// **A crashed import is never retried in place** (S5-D, and the rule S5-E
+    /// hands to operators).
+    ///
+    /// This is the obligation `Outcome::BoundPristine` carries, and it exists
+    /// because the before/after comparison structurally cannot see it: `observe`
+    /// opens each directory, and opening a fresh one binds it — so by the time
+    /// the oracle has looked, every directory is bound and the two cases are
+    /// indistinguishable. It therefore runs *before* the observation.
+    ///
+    /// Both sides of the matrix are covered by the same call. After a crash
+    /// before the commit, the replicated state is pristine and a retry is still
+    /// refused, because the identity binding is durable. After a crash once the
+    /// commit returned, the founding state is complete and a retry is refused
+    /// for the same reason plus a second one. Either way the answer to "just run
+    /// it again" is no, and the refusal names the directory state rather than
+    /// failing somewhere deeper.
+    fn a_second_import_is_refused(
+        dir: &std::path::Path,
+        operation: Operation,
+        point: super::super::crash::CrashPoint,
+    ) {
+        let what = format!("{} killed at {}", operation.name(), point.name());
+        let sealed = import_capability(dir, canonical_import_export().1);
+        // `match` rather than `expect_err`: `VoterStorage` is deliberately not
+        // `Debug`, so the success arm cannot be formatted.
+        let err = match super::super::VoterStorage::open_with_recovery(
+            StorageLayout::new(dir),
+            super::super::identity::OpenPolicy::production(),
+            &sealed.capability,
+        ) {
+            Ok(_) => panic!(
+                "{what}: a second import was accepted; recovery must be retried on a new \
+                 or explicitly cleared directory, never in place"
+            ),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("is not fresh"),
+            "{what}: the refusal must name the directory state, got: {message}"
+        );
+    }
+
+    /// The node the §13 import fixture runs as. Sorted first, and one of the
+    /// genesis's own initial voters — `RecoveryImport::seal` requires it.
+    const IMPORT_LOCAL: [u8; 32] = [1u8; 32];
+
+    /// The export a crashed import is importing, and the path it is read from.
+    ///
+    /// A sibling of the storage directory, never inside it: a stray file in a
+    /// directory whose layout is under test is a variable nobody asked for.
+    fn import_export_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.with_extension("export")
+    }
+
+    /// One canonical export, written where the import will look for it.
+    fn write_import_export(dir: &std::path::Path) -> [u8; 32] {
+        let (bytes, hash) = canonical_import_export();
+        std::fs::write(import_export_path(dir), &bytes).expect("write the export");
+        hash
+    }
+
+    /// The §13 capability, built the only way production can build one.
+    ///
+    /// Deterministically: one genesis, signed and then **verified**, the
+    /// identity derived from that verified value, and `RecoveryImport::seal`
+    /// asked to pair them. Constructing the capability directly would be
+    /// possible from inside `import`'s own module and is deliberately not done
+    /// here — the seal is the thing under test as much as the commit is, and a
+    /// harness that bypassed it would be crashing a code path production
+    /// cannot reach.
+    /// The canonical fixture export and its hash. One definition, so the hash
+    /// the genesis binds and the bytes the import reads cannot drift.
+    fn canonical_import_export() -> (Vec<u8>, [u8; 32]) {
+        super::super::fixture::canonical_recovery_export()
+    }
+
+    /// The identity a §13 import binds its directory to.
+    ///
+    /// Derived from the same verified genesis the capability is sealed from, so
+    /// the harness observes an imported store through exactly the identity
+    /// production wrote — not through `voter_identity`, which is another
+    /// group's.
+    fn import_identity() -> super::super::identity::StorageIdentity {
+        import_capability(std::path::Path::new("unused"), canonical_import_export().1).identity
+    }
+
+    fn import_capability(dir: &std::path::Path, export_hash: [u8; 32]) -> ImportCapability {
+        use crate::coordination::model::authority::{testing as auth, verify_genesis};
+
+        let voters: Vec<[u8; 32]> = vec![IMPORT_LOCAL, [2u8; 32], [3u8; 32]];
+        let mut genesis =
+            auth::genesis_for(&voters, crate::coordination::model::shape::PROFILE_PROD);
+        genesis.recovery_export_hash = Some(export_hash.to_vec());
+        let signed = auth::sign_genesis(&genesis);
+        let authority = auth::authority();
+        let verified = verify_genesis(&authority.public_key, &authority.domain, &signed)
+            .expect("the fixture genesis verifies");
+
+        // §13 founds a *new* group, and the import refuses a body whose source
+        // is the group being founded. The fixture export's source is
+        // `0xAA..`; if the test authority ever adopted that id the refusal
+        // would fire and the cell would be measuring the wrong thing.
+        assert_ne!(
+            verified.group_id(),
+            &[0xAAu8; 32],
+            "the fixture's new group must differ from the export's source group"
+        );
+
+        let identity = super::super::identity::StorageIdentity::new(
+            crate::coordination::ids::CoordinationGroupId::from_array(*verified.group_id()),
+            *verified.genesis_hash(),
+            authority.public_key,
+            verified.authority_domain(),
+            CoordinationNodeId::from_array(IMPORT_LOCAL),
+            verified.deployment_profile_code(),
+        );
+        let capability = super::super::import::RecoveryImport::seal(
+            &identity,
+            &verified,
+            import_export_path(dir),
+        )
+        .expect("the fixture identity and genesis are one document");
+        ImportCapability {
+            capability,
+            identity,
+        }
+    }
+
+    struct ImportCapability {
+        capability: super::super::import::RecoveryImport,
+        identity: super::super::identity::StorageIdentity,
     }
 
     fn voter_identity() -> super::super::identity::StorageIdentity {

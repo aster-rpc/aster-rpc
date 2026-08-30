@@ -176,6 +176,15 @@ pub(crate) fn import_recovery_export(
     let path = import.path.as_path();
     let identity = &import.identity;
 
+    // 0. The first §13 boundary, and the reason the import has boundaries of
+    //    its own (S5-D). This runs *inside* `VoterStorage::open_with_recovery`,
+    //    so by now `schema::open` has already bound the directory and passed
+    //    the three shared transaction points doing it. A crash matrix that
+    //    armed `transaction-commit` here would stop the child in the *bind* and
+    //    file the result under "import", which reads as evidence and is about
+    //    another operation entirely.
+    super::crash::reached(super::crash::CrashPoint::ImportBound);
+
     // 1. The store must hold no durable replicated state and no data rows.
     //    The caller only runs an import on a `Fresh` open, but "rejected for
     //    non-empty storage" is this function's own §13 obligation, not its
@@ -251,10 +260,20 @@ pub(crate) fn import_recovery_export(
         )
     })?;
 
+    // Everything is verified and nothing is written. A crash here must leave
+    // the replicated state exactly as pristine as it was at `ImportBound` —
+    // which is what makes "verify, then write once" observable rather than
+    // merely stated.
+    super::crash::reached(super::crash::CrashPoint::ImportTransformed);
+
     // 8. One durable transaction. Either the whole founding state exists or
     //    none of it does; there is no partially imported store to observe.
+    //    There is no boundary *inside* this, deliberately: a single redb
+    //    transaction has no half, so a point between its begin and its commit
+    //    would be a place the store cannot be observed in.
     let changes = every_key(&state);
     rows::commit(database, state, &changes)?;
+    super::crash::reached(super::crash::CrashPoint::ImportCommitted);
     Ok(())
 }
 
@@ -712,8 +731,7 @@ mod tests {
     use crate::coordination::contract::{LogIdV1, ResourceKeyV1};
     use crate::coordination::ids::{CoordinationGroupId, ResourceKey};
     use crate::coordination::rowstream::{
-        write_varint, AdminRowV1, BodyRow, BodyWriter, GrantRowV1, RecoveryResourceRowV1,
-        RowCountsV1, SECTION_ADMINS, SECTION_GRANTS, SECTION_RESOURCES,
+        write_varint, AdminRowV1, BodyRow, BodyWriter, GrantRowV1,
     };
     use redb::Database;
 
@@ -746,99 +764,24 @@ mod tests {
         }
     }
 
-    /// A real three-voter membership at index 12, built through the same
-    /// conversion the loader validates against — so the fixture is one a
-    /// running source group could actually have exported, rather than the
-    /// `default()` that no group ever holds.
-    fn source_membership(index: u64) -> crate::coordination::raft::StoredMembershipV1 {
-        use crate::coordination::ids::CoordinationNodeId;
-        use crate::coordination::raft::MembershipV1;
-        use crate::coordination::typeconfig::CoordinationNode;
-
-        let voters: std::collections::BTreeSet<CoordinationNodeId> = [0xA1u8, 0xA2, 0xA3]
-            .into_iter()
-            .map(|b| CoordinationNodeId::from_array([b; 32]))
-            .collect();
-        let nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
-            voters.iter().map(|id| (*id, CoordinationNode)).collect();
-        let membership =
-            openraft::Membership::<CoordinationNodeId, CoordinationNode>::new(vec![voters], nodes);
-        crate::coordination::raft::StoredMembershipV1 {
-            log_id: Some(log_id(index)),
-            membership: MembershipV1::from(&membership),
-        }
+    /// The canonical source export, shared with the crash matrix.
+    ///
+    /// One definition in `fixture`, because the §13 import has two independent
+    /// consumers of these exact bytes — these unit tests, and the S5-D crash
+    /// matrix that kills a process part-way through importing them — and two
+    /// spellings of "the canonical export" would drift.
+    fn baseline() -> (RecoveryHeaderV1, Vec<RecoveryBodyRowV1>) {
+        super::super::fixture::recovery_export_parts()
     }
 
-    /// A small but complete source export: two resources (one with the fields
-    /// a lease left behind), two grants on the first, one admin.
-    fn baseline() -> (RecoveryHeaderV1, Vec<RecoveryBodyRowV1>) {
-        let resource = |key: &[u8], epoch: u64| {
-            RecoveryBodyRowV1::Resource(RecoveryResourceRowV1 {
-                key: ResourceKeyV1 {
-                    namespace: "portal.roaming".into(),
-                    key: key.to_vec(),
-                },
-                source_epoch: epoch,
-                ttl_ms: 30_000,
-                lease_revision: epoch + 1,
-                value_revision: 7,
-                value: vec![0x01, 0x02, 0x03],
-                acl_revision: 2,
-            })
-        };
-        let grant = |key: &[u8], subject: u8| {
-            RecoveryBodyRowV1::Grant(GrantRowV1 {
-                key: ResourceKeyV1 {
-                    namespace: "portal.roaming".into(),
-                    key: key.to_vec(),
-                },
-                subject_node_id: nid(subject).to_vec(),
-                rights: 0x3f,
-            })
-        };
-        let rows = vec![
-            resource(b"tree-1", 9),
-            resource(b"tree-2", 4),
-            grant(b"tree-1", 0x21),
-            grant(b"tree-1", 0x22),
-            RecoveryBodyRowV1::Admin(AdminRowV1 {
-                subject_node_id: nid(0x31).to_vec(),
-            }),
-        ];
-        let header = RecoveryHeaderV1 {
-            format_version: crate::coordination::rowstream::RECOVERY_FORMAT_VERSION,
-            schema_version: crate::coordination::rowstream::RECOVERY_SCHEMA_VERSION,
-            source_group_id: vec![0xAA; 32],
-            source_genesis_hash: vec![0xBB; 32],
-            source_authority_public_key: vec![0xCC; 32],
-            source_authority_domain: "old.aster0.net".into(),
-            source_last_applied: Some(log_id(40)),
-            source_membership: source_membership(12),
-            source_audit_floor: Some(log_id(10)),
-            source_audit_tip: Some(log_id(39)),
-            source_admin_revision: 5,
-            row_counts: RowCountsV1 {
-                resources: 2,
-                grants: 2,
-                admins: 1,
-                ..Default::default()
-            },
-        };
-        (header, rows)
+    fn source_membership(index: u64) -> crate::coordination::raft::StoredMembershipV1 {
+        let mut membership = baseline().0.source_membership;
+        membership.log_id = Some(log_id(index));
+        membership
     }
 
     fn encode_export(header: &RecoveryHeaderV1, rows: &[RecoveryBodyRowV1]) -> Vec<u8> {
-        let mut w = BodyWriter::<_, RecoveryBodyRowV1>::new(Vec::new(), header).unwrap();
-        for section in [SECTION_RESOURCES, SECTION_GRANTS, SECTION_ADMINS] {
-            w.begin_section(section).unwrap();
-            for row in rows
-                .iter()
-                .filter(|r| crate::coordination::rowstream::BodyRow::section(*r) == Some(section))
-            {
-                w.row(row).unwrap();
-            }
-        }
-        w.finish().unwrap()
+        super::super::fixture::encode_recovery_export(header, rows)
     }
 
     /// A freshly bound, pristine `state.redb` — what `schema::open` leaves a

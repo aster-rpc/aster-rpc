@@ -99,6 +99,24 @@ pub(crate) enum Outcome {
     /// committed log entry standing behind this operation to make recovery redo
     /// it.
     Discarded,
+    /// Nothing replicated was written, **but the directory is bound.**
+    ///
+    /// Only the §13 import reaches this, and it needs its own name rather than
+    /// [`Outcome::Discarded`] because the two differ in exactly the way an
+    /// operator has to act on. A discarded transaction leaves a store that can
+    /// simply be used again. A crashed import leaves a store whose replicated
+    /// state is pristine — the same comparison `Discarded` makes — while
+    /// `schema::open` has already written the identity binding, so the next
+    /// open is no longer `Fresh` and the import guard refuses to try again.
+    ///
+    /// That durable identity effect is invisible to the before/after
+    /// comparison, because the harness's own `observe` binds every directory it
+    /// opens. So this variant carries an extra obligation, asserted at the cell:
+    /// **a second import must be refused.** Without it the matrix would call a
+    /// crashed import "discarded" and quietly imply a retry that the code
+    /// forbids — which is precisely the S5-E rule that recovery is retried on a
+    /// new or explicitly cleared directory, never in place.
+    BoundPristine,
     /// The operation's effect survived, and recovery keeps it.
     Durable,
     /// The write was thrown away and OpenRaft's recovery redoes it from the
@@ -119,7 +137,7 @@ impl Outcome {
     /// What an opened store must hold before OpenRaft replays anything.
     pub(crate) fn pre_replay(self) -> Expected {
         match self {
-            Outcome::Discarded | Outcome::Replayed => Expected::Before,
+            Outcome::Discarded | Outcome::BoundPristine | Outcome::Replayed => Expected::Before,
             Outcome::Durable => Expected::After,
             Outcome::Undetermined => Expected::Either,
         }
@@ -128,7 +146,7 @@ impl Outcome {
     /// What a production reopen must come back holding.
     pub(crate) fn recovered(self) -> Expected {
         match self {
-            Outcome::Discarded => Expected::Before,
+            Outcome::Discarded | Outcome::BoundPristine => Expected::Before,
             Outcome::Durable | Outcome::Replayed => Expected::After,
             Outcome::Undetermined => Expected::Either,
         }
@@ -208,6 +226,24 @@ crash_points! {
     /// `CURRENT` has been renamed into place and its directory fsynced, so the
     /// marker names the snapshot this operation published.
     CurrentPublication = "current-publication",
+    /// §13's import, immediately after `schema::open` bound the directory and
+    /// before the export has been read.
+    ///
+    /// The import needs boundaries of its own rather than reusing the three
+    /// transaction points, and the reason is structural: it runs *inside* the
+    /// open, so the open's own binding transaction passes `transaction-begin`,
+    /// `transaction-write` and `transaction-commit` before the import has done
+    /// anything at all. Arming a shared point would stop the child in the bind
+    /// and label the result an import crash — a cell that reads as evidence and
+    /// is about a different operation entirely.
+    ImportBound = "import-bound",
+    /// The export has been read, hashed against the bound genesis, decoded,
+    /// transformed and proved loadable — and none of it is written yet.
+    ImportTransformed = "import-transformed",
+    /// The single `rows::commit` has returned: the whole founding state is
+    /// durable, and there is no partial store any boundary can produce because
+    /// there is only one transaction to be inside.
+    ImportCommitted = "import-committed",
 }
 
 /// The environment variable naming the boundary the child stops at.
@@ -314,8 +350,9 @@ mod tests {
     /// The handover inventory, restated as a test.
     ///
     /// Not a count: a count passes when a boundary is renamed into something
-    /// nobody asked for. These are the eleven the review named, spelled out, so
-    /// dropping one fails here rather than reducing the matrix quietly.
+    /// nobody asked for. These are the eleven the review named plus the three
+    /// the §13 import brought at S5-D, spelled out, so dropping one fails here
+    /// rather than reducing the matrix quietly.
     #[test]
     fn the_boundary_list_is_the_one_that_was_agreed() {
         let names: Vec<&str> = CrashPoint::ALL.iter().map(|p| p.name()).collect();
@@ -333,6 +370,9 @@ mod tests {
                 "replacement-directory-sync",
                 "post-replacement-reopen",
                 "current-publication",
+                "import-bound",
+                "import-transformed",
+                "import-committed",
             ]
         );
     }

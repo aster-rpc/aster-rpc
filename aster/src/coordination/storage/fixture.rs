@@ -330,6 +330,142 @@ pub(crate) fn oversized_meta_for_envelope() -> CoordinationMetaV1 {
     meta
 }
 
+// ── §13 recovery export (S5-D) ───────────────────────────────────────────────
+
+/// A canonical §13 recovery export: two resources, two grants on the first, one
+/// administrator, and a real three-voter source membership at index 12.
+///
+/// Lives here rather than inside `import`'s own test module for a reason worth
+/// recording. Two consumers need these exact bytes — the import's unit tests and
+/// the crash matrix, which crashes an import mid-flight — and the obvious way to
+/// share them, widening `import`'s `mod tests` to `pub(crate)`, is not
+/// available: the architectural guards locate the production/test split with the
+/// literal string `"\n#[cfg(test)]\nmod "`, so widening it reclassifies the whole
+/// test module as production and fires guards that have nothing to do with the
+/// change. A `#[cfg(test)] pub(crate)` module that already exists for exactly
+/// this purpose is the right home.
+///
+/// The two builders are separate because the crash matrix needs the *bytes* and
+/// the import's tests need the *parts* to mutate before encoding.
+pub(crate) fn recovery_export_parts() -> (
+    crate::coordination::rowstream::RecoveryHeaderV1,
+    Vec<crate::coordination::rowstream::RecoveryBodyRowV1>,
+) {
+    use crate::coordination::contract::{LogIdV1, ResourceKeyV1};
+    use crate::coordination::raft::{MembershipV1, StoredMembershipV1};
+    use crate::coordination::rowstream::{
+        AdminRowV1, GrantRowV1, RecoveryBodyRowV1, RecoveryHeaderV1, RecoveryResourceRowV1,
+        RowCountsV1, RECOVERY_FORMAT_VERSION, RECOVERY_SCHEMA_VERSION,
+    };
+    use crate::coordination::typeconfig::CoordinationNode;
+
+    let log_id = |index: u64| LogIdV1 {
+        term: 3,
+        leader_node_id: vec![0xDD; 32],
+        index,
+    };
+    let resource = |key: &[u8], epoch: u64| {
+        RecoveryBodyRowV1::Resource(RecoveryResourceRowV1 {
+            key: ResourceKeyV1 {
+                namespace: "portal.roaming".into(),
+                key: key.to_vec(),
+            },
+            source_epoch: epoch,
+            ttl_ms: 30_000,
+            lease_revision: epoch + 1,
+            value_revision: 7,
+            value: vec![0x01, 0x02, 0x03],
+            acl_revision: 2,
+        })
+    };
+    let grant = |key: &[u8], subject: u8| {
+        RecoveryBodyRowV1::Grant(GrantRowV1 {
+            key: ResourceKeyV1 {
+                namespace: "portal.roaming".into(),
+                key: key.to_vec(),
+            },
+            subject_node_id: [subject; 32].to_vec(),
+            rights: 0x3f,
+        })
+    };
+    let rows = vec![
+        resource(b"tree-1", 9),
+        resource(b"tree-2", 4),
+        grant(b"tree-1", 0x21),
+        grant(b"tree-1", 0x22),
+        RecoveryBodyRowV1::Admin(AdminRowV1 {
+            subject_node_id: [0x31u8; 32].to_vec(),
+        }),
+    ];
+
+    // A membership a running source group could actually have exported, built
+    // through the same conversion the loader validates against.
+    let voters: std::collections::BTreeSet<CoordinationNodeId> = [0xA1u8, 0xA2, 0xA3]
+        .into_iter()
+        .map(|b| CoordinationNodeId::from_array([b; 32]))
+        .collect();
+    let nodes: std::collections::BTreeMap<CoordinationNodeId, CoordinationNode> =
+        voters.iter().map(|id| (*id, CoordinationNode)).collect();
+    let membership =
+        openraft::Membership::<CoordinationNodeId, CoordinationNode>::new(vec![voters], nodes);
+
+    let header = RecoveryHeaderV1 {
+        format_version: RECOVERY_FORMAT_VERSION,
+        schema_version: RECOVERY_SCHEMA_VERSION,
+        source_group_id: vec![0xAA; 32],
+        source_genesis_hash: vec![0xBB; 32],
+        source_authority_public_key: vec![0xCC; 32],
+        source_authority_domain: "old.aster0.net".into(),
+        source_last_applied: Some(log_id(40)),
+        source_membership: StoredMembershipV1 {
+            log_id: Some(log_id(12)),
+            membership: MembershipV1::from(&membership),
+        },
+        source_audit_floor: Some(log_id(10)),
+        source_audit_tip: Some(log_id(39)),
+        source_admin_revision: 5,
+        row_counts: RowCountsV1 {
+            resources: 2,
+            grants: 2,
+            admins: 1,
+            ..Default::default()
+        },
+    };
+    (header, rows)
+}
+
+/// Encode one recovery export into the canonical §11.3 body bytes.
+pub(crate) fn encode_recovery_export(
+    header: &crate::coordination::rowstream::RecoveryHeaderV1,
+    rows: &[crate::coordination::rowstream::RecoveryBodyRowV1],
+) -> Vec<u8> {
+    use crate::coordination::rowstream::{
+        BodyRow, BodyWriter, RecoveryBodyRowV1, SECTION_ADMINS, SECTION_GRANTS, SECTION_RESOURCES,
+    };
+
+    let mut w =
+        BodyWriter::<_, RecoveryBodyRowV1>::new(Vec::new(), header).expect("a legal header");
+    for section in [SECTION_RESOURCES, SECTION_GRANTS, SECTION_ADMINS] {
+        w.begin_section(section).expect("begin");
+        for row in rows
+            .iter()
+            .filter(|r| BodyRow::section(*r) == Some(section))
+        {
+            w.row(row).expect("row");
+        }
+    }
+    w.finish().expect("finish")
+}
+
+/// The canonical export and its BLAKE3, from one definition — so the hash a
+/// genesis binds and the bytes an import reads cannot drift apart.
+pub(crate) fn canonical_recovery_export() -> (Vec<u8>, [u8; 32]) {
+    let (header, rows) = recovery_export_parts();
+    let bytes = encode_recovery_export(&header, &rows);
+    let hash = *blake3::hash(&bytes).as_bytes();
+    (bytes, hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::scratch::ScratchDir;
