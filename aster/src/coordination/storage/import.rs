@@ -717,7 +717,13 @@ fn advanced(
 
 /// Name every row the transformed state holds, so [`rows::commit`] writes all
 /// of it. Sessions, intents, routes and audit are structurally empty.
-fn every_key(state: &DurableState) -> ChangeSet {
+///
+/// `pub(super)` so the S5-E scaling probe in `storage::bench` can commit the
+/// **production** change set rather than reconstructing one beside it. A
+/// benchmark that builds its own change set is measuring a different write than
+/// the import performs, and the whole point of separating `rows::commit` from
+/// `rows::load` is to attribute the import's own cost.
+pub(super) fn every_key(state: &DurableState) -> ChangeSet {
     ChangeSet {
         resources: state.model.resources.keys().cloned().collect(),
         grants: state.model.acl.keys().cloned().collect(),

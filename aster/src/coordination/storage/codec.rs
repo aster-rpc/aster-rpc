@@ -30,8 +30,87 @@ use fory_core::serializer::Serializer;
 use fory_core::ForyDefault;
 
 use super::error::{Db, StorageError, StorageResult};
-use crate::coordination::contract::payload_fory;
 use crate::rpc::contract::WireField;
+
+/// One payload runtime per persisted root type, built once for the process.
+///
+/// ## Why this exists (S5-E)
+///
+/// [`payload_fory`](crate::coordination::contract::payload_fory) *constructs* a runtime: a fresh `PayloadRegistry`, a
+/// `register_by_name` and the type meta that comes with it. Every persisted
+/// encode and decode called it, so a bulk pass paid that construction **once per
+/// row**. Measured on macOS aarch64, release, over a 130-byte `ResourceRowV1`:
+///
+/// | | p50 |
+/// |---|---|
+/// | `payload_fory::<ResourceRowV1>()` alone | 10.7 µs |
+/// | `encode_committed` (constructing) | 33.2 µs |
+/// | `decode_persisted_bounded` (constructing) | 37.6 µs |
+/// | `serialize` against a reused runtime | 42 ns |
+/// | `deserialize` against a reused runtime | 42 ns |
+///
+/// Three orders of magnitude, and it is the whole reason `rows::commit` and
+/// `rows::load` cost tens of seconds at 200,000 rows while redb itself inserts
+/// those rows in 290 ms and scans them in 8.6 ms. This is a defect, not a
+/// property of the format.
+///
+/// ## Why a cache rather than threading a runtime through every caller
+///
+/// There are about fifty persisted encode/decode sites across seven modules,
+/// several of them inside streaming visitors that cannot conveniently hold one.
+/// Hoisting a runtime at each is fifty chances to hoist none, and the next
+/// call site added would silently start constructing per row again. Caching
+/// here fixes every site at once and keeps this module what its header says it
+/// is: the single place a persisted value is encoded or decoded.
+///
+/// The runtimes are leaked deliberately. The set of persisted root types is
+/// fixed and small — one per persisted table plus the metadata roots — so this
+/// is a bounded one-time allocation, not growth.
+mod runtime {
+    use std::any::TypeId;
+    use std::collections::HashMap;
+    use std::sync::{OnceLock, RwLock};
+
+    use fory_core::serializer::Serializer;
+    use fory_core::ForyDefault;
+
+    use crate::coordination::contract::payload_fory;
+    use crate::rpc::contract::WireField;
+
+    /// Runtimes actually constructed, so a gate can prove a bulk pass builds
+    /// none rather than one per row. A wall-clock assertion would be the wrong
+    /// shape for CI; a construction count is exact.
+    #[cfg(test)]
+    pub(super) static CONSTRUCTED: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    #[allow(clippy::type_complexity)]
+    fn cache() -> &'static RwLock<HashMap<TypeId, &'static fory_core::Fory>> {
+        static CACHE: OnceLock<RwLock<HashMap<TypeId, &'static fory_core::Fory>>> = OnceLock::new();
+        CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    /// The process-wide runtime for `T`, constructing it at most once.
+    pub(super) fn for_type<T>() -> &'static fory_core::Fory
+    where
+        T: WireField + Serializer + ForyDefault + 'static,
+    {
+        let key = TypeId::of::<T>();
+        if let Some(found) = cache().read().expect("the codec cache").get(&key) {
+            return found;
+        }
+        let mut guard = cache().write().expect("the codec cache");
+        // Another thread may have inserted between the read and the write.
+        if let Some(found) = guard.get(&key) {
+            return found;
+        }
+        #[cfg(test)]
+        CONSTRUCTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let built: &'static fory_core::Fory = Box::leak(Box::new(payload_fory::<T>()));
+        guard.insert(key, built);
+        built
+    }
+}
 
 /// Refuse a stored value over its ceiling, before it is decoded.
 ///
@@ -89,7 +168,7 @@ pub(crate) fn decode_persisted_bounded<T>(
     max_bytes: usize,
 ) -> StorageResult<T>
 where
-    T: WireField + Serializer + ForyDefault,
+    T: WireField + Serializer + ForyDefault + 'static,
 {
     check_stored_len(db, what, bytes, max_bytes)?;
     decode_persisted(db, what, bytes)
@@ -102,9 +181,9 @@ where
 /// is the way in.
 fn decode_persisted<T>(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<T>
 where
-    T: WireField + Serializer + ForyDefault,
+    T: WireField + Serializer + ForyDefault + 'static,
 {
-    payload_fory::<T>()
+    runtime::for_type::<T>()
         .deserialize(bytes)
         .map_err(|source| StorageError::corrupt(db, what, source))
 }
@@ -137,9 +216,9 @@ pub(crate) fn decode_string(db: Db, what: &'static str, bytes: &[u8]) -> Storage
 /// legitimately try again with a different one.
 pub(crate) fn encode_owned<T>(db: Db, what: &'static str, value: &T) -> StorageResult<Vec<u8>>
 where
-    T: WireField + Serializer + ForyDefault,
+    T: WireField + Serializer + ForyDefault + 'static,
 {
-    payload_fory::<T>()
+    runtime::for_type::<T>()
         .serialize(value)
         .map_err(|source| StorageError::encode_failed(db, what, source))
 }
@@ -160,7 +239,7 @@ pub(crate) fn encode_committed<T>(
     max_bytes: usize,
 ) -> StorageResult<Vec<u8>>
 where
-    T: WireField + Serializer + ForyDefault,
+    T: WireField + Serializer + ForyDefault + 'static,
 {
     encode_bounded(db, what, value, max_bytes).map_err(|err| {
         StorageError::corrupt(
@@ -184,7 +263,7 @@ pub(crate) fn encode_bounded<T>(
     max_bytes: usize,
 ) -> StorageResult<Vec<u8>>
 where
-    T: WireField + Serializer + ForyDefault,
+    T: WireField + Serializer + ForyDefault + 'static,
 {
     let bytes = encode_owned(db, what, value)?;
     if bytes.len() > max_bytes {
@@ -317,6 +396,104 @@ mod tests {
         assert!(
             committed.to_string().contains("already-committed"),
             "and the message must say why: {committed}"
+        );
+    }
+
+    /// **A bulk pass constructs no payload runtime at all** (S5-E).
+    ///
+    /// The defect this gate exists for was invisible to every functional test:
+    /// building a fresh `payload_fory::<T>()` per row is *correct*, just three
+    /// orders of magnitude too slow, so nothing failed and the cost only
+    /// appeared as tens of seconds in the §13 import at 200,000 rows.
+    ///
+    /// A wall-clock assertion is the wrong instrument — loose enough to pass on
+    /// a busy runner is loose enough to catch nothing. The exact statement is
+    /// about *construction count*: after one warm-up encode and one warm-up
+    /// decode of the same type, a thousand more of each must construct
+    /// **zero** runtimes. Reverting `encode_owned`/`decode_persisted` to call
+    /// `payload_fory` directly makes this two thousand.
+    ///
+    /// The warm-up is per type and is what makes the delta exact rather than
+    /// "small": the count is process-wide and other tests share the process, so
+    /// only a delta measured around this type's own calls means anything.
+    #[test]
+    fn a_bulk_pass_constructs_no_payload_runtime() {
+        use std::sync::atomic::Ordering;
+
+        let meta = CoordinationMetaV1 {
+            schema_version: 1,
+            admin_revision: 3,
+            ..Default::default()
+        };
+
+        // Warm this type's runtime, whatever any other test already did.
+        let bytes = encode_owned(Db::State, "CoordinationMetaV1", &meta).expect("encode");
+        let _: CoordinationMetaV1 =
+            decode_persisted(Db::State, "CoordinationMetaV1", &bytes).expect("decode");
+
+        let before = runtime::CONSTRUCTED.load(Ordering::Relaxed);
+        for _ in 0..1_000 {
+            let encoded = encode_owned(Db::State, "CoordinationMetaV1", &meta).expect("encode");
+            let back: CoordinationMetaV1 =
+                decode_persisted(Db::State, "CoordinationMetaV1", &encoded).expect("decode");
+            assert_eq!(back.admin_revision, 3, "the cached runtime round-trips");
+        }
+        let constructed = runtime::CONSTRUCTED.load(Ordering::Relaxed) - before;
+
+        assert_eq!(
+            constructed, 0,
+            "2,000 persisted encodes/decodes of one already-warmed type constructed \
+             {constructed} payload runtimes; the runtime is per type, not per value"
+        );
+    }
+
+    /// **The cache is per type, not one runtime for everything.**
+    ///
+    /// A `HashMap` keyed on something constant — or a single `OnceLock` holding
+    /// one runtime — would return the first type's runtime for every later
+    /// type, and every decode after the first would fail or, worse, succeed
+    /// against the wrong type meta. This asserts a second, distinct persisted
+    /// root both constructs its own runtime on first use and round-trips.
+    #[test]
+    fn each_persisted_root_gets_its_own_runtime() {
+        use crate::coordination::raft::ResourceRowV1;
+        use std::sync::atomic::Ordering;
+
+        // Warm the first type.
+        let meta = CoordinationMetaV1::default();
+        let _ = encode_owned(Db::State, "CoordinationMetaV1", &meta).expect("encode");
+
+        let before = runtime::CONSTRUCTED.load(Ordering::Relaxed);
+        let row = ResourceRowV1 {
+            epoch: 4,
+            ttl_ms: 1_000,
+            lease_revision: 2,
+            value_revision: 5,
+            value: vec![0xAB; 8],
+            acl_revision: 1,
+            ..Default::default()
+        };
+        let encoded = encode_owned(Db::State, "ResourceRowV1", &row).expect("encode");
+        let after_first = runtime::CONSTRUCTED.load(Ordering::Relaxed);
+        let back: ResourceRowV1 =
+            decode_persisted(Db::State, "ResourceRowV1", &encoded).expect("decode");
+
+        assert_eq!(
+            back.value_revision, 5,
+            "a second root decodes against its own type meta"
+        );
+        assert_eq!(back.value, vec![0xAB; 8]);
+        // Either this test warmed `ResourceRowV1` (delta 1) or an earlier test
+        // in the same process already did (delta 0). What must never happen is
+        // the second call constructing again.
+        assert!(
+            after_first - before <= 1,
+            "the first use of a second root constructs at most one runtime"
+        );
+        assert_eq!(
+            runtime::CONSTRUCTED.load(Ordering::Relaxed),
+            after_first,
+            "the decode reused the runtime the encode constructed"
         );
     }
 

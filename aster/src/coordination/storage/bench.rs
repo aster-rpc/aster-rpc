@@ -137,6 +137,34 @@ fn measure_open<T>(
     measured
 }
 
+/// Time an explicitly delimited inner region, so setup a run genuinely needs
+/// (a fresh directory, a fresh database, a cloned input) is charged to the
+/// harness and not to the operation.
+///
+/// The closure returns the elapsed time of the region it chose to time. That is
+/// weaker than `measure`, which cannot be lied to — so it is used only where the
+/// per-run setup is unavoidable, and every use says what it excludes.
+fn measure_region(
+    what: &'static str,
+    shape: impl Into<String>,
+    runs: usize,
+    mut body: impl FnMut() -> Duration,
+) -> Measured {
+    let cold = body();
+    let mut samples = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        samples.push(body());
+    }
+    let measured = Measured {
+        what,
+        shape: shape.into(),
+        cold,
+        samples,
+    };
+    measured.report();
+    measured
+}
+
 /// Time `body` once, then `runs` times.
 fn measure(
     what: &'static str,
@@ -362,6 +390,291 @@ fn capability(
     (sealed, identity)
 }
 
+/// The canonical reader's visitor, collecting one decoded body.
+#[derive(Default)]
+struct Collect {
+    header: Option<crate::coordination::rowstream::RecoveryHeaderV1>,
+    rows: Vec<crate::coordination::rowstream::RecoveryBodyRowV1>,
+}
+
+impl crate::coordination::rowstream::BodyVisitor<crate::coordination::rowstream::RecoveryBodyRowV1>
+    for Collect
+{
+    fn header(
+        &mut self,
+        header: &crate::coordination::rowstream::RecoveryHeaderV1,
+    ) -> Result<(), crate::coordination::rowstream::BodyError> {
+        self.header = Some(header.clone());
+        Ok(())
+    }
+    fn row(
+        &mut self,
+        _section: u64,
+        row: crate::coordination::rowstream::RecoveryBodyRowV1,
+    ) -> Result<(), crate::coordination::rowstream::BodyError> {
+        self.rows.push(row);
+        Ok(())
+    }
+}
+
+/// Decode one shape's export and run the production `transform` over it,
+/// yielding the exact `DurableState` the import would commit.
+fn transformed(shape: &Shape) -> (Vec<u8>, [u8; 32], super::rows::DurableState) {
+    use crate::coordination::rowstream::{read_body, RecoveryBodyRowV1};
+
+    let bytes = export_for(shape);
+    let hash = *blake3::hash(&bytes).as_bytes();
+    let mut collected = Collect::default();
+    read_body::<_, RecoveryBodyRowV1>(&mut &bytes[..], &mut collected).expect("canonical");
+    let header = collected.header.clone().expect("a header");
+    let (_, identity) = capability("/unused".into(), hash);
+    let state =
+        super::import::transform(&header, &collected.rows, &identity, &[[0x41u8; 32]], &hash)
+            .expect("the transform succeeds");
+    (bytes, hash, state)
+}
+
+/// **Where a persisted row's cost actually goes.**
+///
+/// `rows::commit` and `rows::load` each do two things per row: run the storage
+/// codec, and touch redb. Separating those two answers a question the sweep
+/// below cannot: whether the cost that grows with scale is the B-tree or the
+/// encoder.
+///
+/// Three measurements, all on the same `ResourceRowV1`:
+///
+/// * building one `payload_fory::<ResourceRowV1>()` runtime — a fresh
+///   `PayloadRegistry`, a `register_by_name`, and the type meta that comes with
+///   it;
+/// * `encode_committed` / `decode_persisted_bounded`, the production calls,
+///   each of which builds that runtime again;
+/// * the same encode and decode against a runtime built **once**.
+///
+/// And then redb alone, at four scales, with the codec removed entirely:
+/// pre-encoded bytes inserted into one table in ascending key order inside one
+/// `Durability::Immediate` transaction. A flat per-row column there puts the
+/// scale-dependence in the caller; a rising one puts it in the B-tree.
+#[test]
+#[ignore = "benchmark: run explicitly, see the module header"]
+fn where_the_per_row_cost_goes() {
+    use crate::coordination::contract::payload_fory;
+    use crate::coordination::model::state::ResourceRow;
+    use crate::coordination::raft::ResourceRowV1;
+    use crate::coordination::storage::codec::{decode_persisted_bounded, encode_committed};
+    use redb::{ReadableDatabase, ReadableTable};
+
+    println!(
+        "\n§13 import — per-row cost attribution\n{}",
+        "-".repeat(112)
+    );
+
+    let row = ResourceRowV1::from(&ResourceRow {
+        epoch: 9,
+        held: false,
+        holder: None,
+        ttl_ms: 30_000,
+        lease_revision: 10,
+        value_revision: 7,
+        value: vec![0x5A; 64],
+        acl_revision: 2,
+    });
+    let encoded = encode_committed(
+        super::error::Db::State,
+        "ResourceRowV1",
+        &row,
+        super::rows::MAX_RESOURCE_ROW_BYTES,
+    )
+    .expect("encodes");
+    println!(
+        "\none ResourceRowV1 with a 64-byte value encodes to {} B",
+        encoded.len()
+    );
+
+    measure("payload_fory::<Row>() alone", "one runtime", 200, || {
+        black_box(payload_fory::<ResourceRowV1>());
+    });
+    measure("encode_committed (production)", "one row", 200, || {
+        black_box(
+            encode_committed(
+                super::error::Db::State,
+                "ResourceRowV1",
+                &row,
+                super::rows::MAX_RESOURCE_ROW_BYTES,
+            )
+            .expect("encodes"),
+        );
+    });
+    measure("decode_persisted_bounded (prod)", "one row", 200, || {
+        black_box(
+            decode_persisted_bounded::<ResourceRowV1>(
+                super::error::Db::State,
+                "ResourceRowV1",
+                &encoded,
+                super::rows::MAX_RESOURCE_ROW_BYTES,
+            )
+            .expect("decodes"),
+        );
+    });
+
+    let reused = payload_fory::<ResourceRowV1>();
+    measure("serialize (runtime reused)", "one row", 200, || {
+        black_box(reused.serialize(&row).expect("encodes"));
+    });
+    measure("deserialize (runtime reused)", "one row", 200, || {
+        black_box(
+            reused
+                .deserialize::<ResourceRowV1>(&encoded)
+                .expect("decodes"),
+        );
+    });
+
+    // redb alone: the same row bytes, the same ascending key order, and the
+    // subsystem's **one** durable write site — `schema::durable_write` /
+    // `durable_commit`, `Durability::Immediate` and all — with no codec
+    // anywhere in the timed region. Reaching for `begin_write` here would
+    // measure a transaction production never opens, and the storage guards
+    // refuse it for exactly that reason.
+    const PROBE: redb::TableDefinition<(&str, &[u8]), &[u8]> =
+        redb::TableDefinition::new("bench_probe");
+    println!("\nredb alone — pre-encoded bytes, one transaction, Durability::Immediate");
+    for rows in [25_000usize, 50_000, 100_000, 200_000] {
+        let keys: Vec<Vec<u8>> = (0..rows as u64).map(|n| n.to_be_bytes().to_vec()).collect();
+        let runs = if rows >= 100_000 { HEAVY_RUNS } else { RUNS };
+        let label = format!("{rows} rows");
+
+        let insert = measure_region("redb insert", label.clone(), runs, || {
+            let dir = ScratchDir::new("bench-redb");
+            let database = redb::Database::create(dir.join("probe.redb")).expect("a database");
+            let at = Instant::now();
+            let write = super::schema::durable_write(&database, super::error::Db::State)
+                .expect("a durable write transaction");
+            {
+                let mut table = write.open_table(PROBE).expect("the table");
+                for key in &keys {
+                    table
+                        .insert(("portal.roaming", key.as_slice()), encoded.as_slice())
+                        .expect("inserts");
+                }
+            }
+            super::schema::durable_commit(write, super::error::Db::State).expect("commits");
+            at.elapsed()
+        });
+
+        let home = ScratchDir::new("bench-redb-read");
+        let database = redb::Database::create(home.join("probe.redb")).expect("a database");
+        {
+            let write = super::schema::durable_write(&database, super::error::Db::State)
+                .expect("a durable write transaction");
+            {
+                let mut table = write.open_table(PROBE).expect("the table");
+                for key in &keys {
+                    table
+                        .insert(("portal.roaming", key.as_slice()), encoded.as_slice())
+                        .expect("inserts");
+                }
+            }
+            super::schema::durable_commit(write, super::error::Db::State).expect("commits");
+        }
+        let scan = measure("redb scan", label.clone(), runs.min(RUNS), || {
+            let read = database.begin_read().expect("a read transaction");
+            let table = read.open_table(PROBE).expect("the table");
+            let mut total = 0usize;
+            for entry in table.iter().expect("iterates") {
+                let (_, value) = entry.expect("an entry");
+                total += value.value().len();
+            }
+            black_box(total);
+        });
+
+        println!(
+            "  {:<30} {:<26} insert={:>8.3?}/row   scan={:>8.3?}/row",
+            "per-row (p50)",
+            label,
+            insert.percentile(50.0) / rows as u32,
+            scan.percentile(50.0) / rows as u32,
+        );
+    }
+}
+
+/// **The two halves of the import's storage cost, measured apart.**
+///
+/// The withdrawn measurement reported one number for `open_with_recovery` and
+/// observed that ten times the row scale cost roughly twenty-nine times the
+/// latency. One number cannot say whether that is the durable write, the
+/// read-back, or both, so no threshold could be drawn from it and none was.
+///
+/// This sweeps one axis — resource count, at a fixed 64-byte value and one
+/// grant each — across four scales and times `rows::commit` and `rows::load`
+/// separately at each, alongside the two pure stages. The per-row column is the
+/// point: a constant column is linear scaling, and a rising one localises the
+/// super-linearity to the stage whose column rises.
+///
+/// Per-run setup is real here (`commit` needs a database that has never been
+/// committed into, and consumes the state by value), so the timed region is
+/// delimited explicitly and excludes the scratch directory, the
+/// `Database::create` and the `DurableState::clone`.
+#[test]
+#[ignore = "benchmark: run explicitly, see the module header"]
+fn the_commit_and_the_read_back_scale_apart() {
+    println!(
+        "\n§13 import — rows::commit and rows::load, apart\n{}",
+        "-".repeat(112)
+    );
+    for resources in [12_500u64, 25_000, 50_000, 100_000] {
+        let shape = Shape {
+            label: "scaling sweep",
+            resources,
+            grants_each: 1,
+            value_bytes: 64,
+            admins: 1,
+            runs: if resources >= 50_000 {
+                HEAVY_RUNS
+            } else {
+                RUNS
+            },
+        };
+        let (bytes, _, state) = transformed(&shape);
+        let changes = super::import::every_key(&state);
+        // Rows actually written: resources + grants + administrators. The
+        // per-row column divides by this, not by the resource count, because
+        // "10,000 rows" meaning 20,001 is the mislabelling that made the first
+        // scaling claim unreadable.
+        let rows = state.model.resources.len() + state.model.acl.len() + state.model.admins.len();
+        println!(
+            "\n{rows} rows ({resources} resources + {resources} grants + 1 admin), body {} B",
+            bytes.len()
+        );
+
+        let label = format!("{rows} rows");
+        let commit = measure_region("rows::commit", label.clone(), shape.runs, || {
+            let dir = ScratchDir::new("bench-commit");
+            let database = redb::Database::create(dir.join("state.redb")).expect("a database");
+            let cloned = state.clone();
+            let at = Instant::now();
+            let committed = super::rows::commit(&database, cloned, &changes).expect("commits");
+            let elapsed = at.elapsed();
+            black_box(committed);
+            elapsed
+        });
+
+        let committed_home = ScratchDir::new("bench-committed");
+        let database =
+            redb::Database::create(committed_home.join("state.redb")).expect("a database");
+        super::rows::commit(&database, state.clone(), &changes).expect("commits");
+        let load = measure("rows::load", label.clone(), shape.runs.min(RUNS), || {
+            black_box(super::rows::load(&database).expect("loads"));
+        });
+
+        println!(
+            "  {:<30} {:<26} commit={:>8.3?}/row   load={:>8.3?}/row",
+            "per-row (p50)",
+            label,
+            commit.percentile(50.0) / rows as u32,
+            load.percentile(50.0) / rows as u32,
+        );
+    }
+}
+
 /// **The whole production import, end to end, at every legal shape.**
 ///
 /// Each run is a fresh directory: bind, read through the pinned descriptor,
@@ -489,31 +802,137 @@ fn the_whole_recovery_import_costs_what_it_costs() {
     }
 }
 
+// ── Process-cold ────────────────────────────────────────────────────────────
+
+/// The export the child imports, and the hash its genesis must bind. Passed as
+/// environment rather than recomputed, so the child's **first** read of the
+/// file is inside the timed region.
+const COLD_EXPORT_VAR: &str = "ASTER_S5E_COLD_EXPORT";
+const COLD_HASH_VAR: &str = "ASTER_S5E_COLD_HASH";
+/// The line the child prints, and the parent parses.
+const COLD_MARKER: &str = "S5E-COLD-IMPORT-NANOS";
+
+/// The child half of the process-cold measurement.
+///
+/// A no-op unless the parent names an export, so the ordinary suite pays one
+/// skipped test. When it is armed it seals one capability, opens one fresh
+/// directory through `open_with_recovery`, and prints the elapsed nanoseconds
+/// of that call alone.
+///
+/// **This is process-cold and nothing more.** The process is new — no warmed
+/// allocator, no touched pages, no constructed payload runtimes — but the file
+/// was written by the parent moments earlier and is in the page cache.
+/// Evicting it needs privileges this suite does not take, so page-cache-cold
+/// stays unmeasured and is not claimed.
+#[test]
+fn process_cold_import_child() {
+    let Ok(export) = std::env::var(COLD_EXPORT_VAR) else {
+        return;
+    };
+    let hex = std::env::var(COLD_HASH_VAR).expect("the parent named the export hash");
+    let mut hash = [0u8; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).expect("hex");
+    }
+    let dir = ScratchDir::new("cold-import");
+    let (sealed, _) = capability(std::path::PathBuf::from(&export), hash);
+
+    let at = Instant::now();
+    let store = super::VoterStorage::open_with_recovery(
+        super::schema::StorageLayout::new(dir.to_path_buf()),
+        super::identity::OpenPolicy::production(),
+        &sealed,
+    )
+    .expect("the cold import succeeds");
+    let elapsed = at.elapsed();
+    println!("{COLD_MARKER} {}", elapsed.as_nanos());
+    drop(store);
+}
+
+/// **The §13 import from a genuinely cold process**, at every legal shape.
+///
+/// Each sample is a fresh subprocess doing exactly one import. That is what
+/// makes the label honest: the withdrawn measurement called its first
+/// in-process sample "cold" when the process had already run a complete probe
+/// import, so every allocator arena, every page and every payload runtime was
+/// warm. Here nothing is.
+///
+/// Page-cache-cold is a different claim and is still not made: the export was
+/// written by this parent, and evicting it needs privileges the suite does not
+/// take.
+#[test]
+#[ignore = "benchmark: run explicitly, see the module header"]
+fn the_import_from_a_cold_process_costs_what_it_costs() {
+    /// Fresh processes per shape. Each is a full test-binary start, so this is
+    /// reported as a range over a handful of samples rather than as a
+    /// percentile it cannot support.
+    const CHILDREN: usize = 5;
+
+    println!(
+        "\n§13 recovery import — process-cold (fresh subprocess per sample)\n{}",
+        "-".repeat(112)
+    );
+    let exe = std::env::current_exe().expect("the test binary");
+    for shape in shapes() {
+        let bytes = export_for(&shape);
+        let hash = *blake3::hash(&bytes).as_bytes();
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        let home = ScratchDir::new("cold-export");
+        let path = home.join("export.recovery");
+        std::fs::write(&path, &bytes).expect("stage the export");
+
+        let mut samples: Vec<Duration> = Vec::with_capacity(CHILDREN);
+        for _ in 0..CHILDREN {
+            let output = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "coordination::storage::bench::process_cold_import_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(COLD_EXPORT_VAR, &path)
+                .env(COLD_HASH_VAR, &hex)
+                .output()
+                .expect("spawn the cold child");
+            assert!(
+                output.status.success(),
+                "the cold child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // Found as a substring, not as a line prefix: under `--nocapture`
+            // the child's harness prints the test's name and the test's own
+            // output on one line, so the marker is mid-line.
+            let text = String::from_utf8_lossy(&output.stdout);
+            let nanos: u64 = text
+                .split(COLD_MARKER)
+                .nth(1)
+                .unwrap_or_else(|| panic!("the child printed no {COLD_MARKER}: {text}"))
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("the {COLD_MARKER} carried no value: {text}"))
+                .parse()
+                .expect("nanoseconds");
+            samples.push(Duration::from_nanos(nanos));
+        }
+        samples.sort_unstable();
+        println!(
+            "  {:<30} {:<26} n={:<3} min={:>10.3?} p50={:>10.3?} max={:>10.3?}",
+            "storage open: import (cold)",
+            shape.label,
+            samples.len(),
+            samples[0],
+            samples[samples.len() / 2],
+            samples[samples.len() - 1],
+        );
+    }
+}
+
 /// **The import's components**, for localising a regression the whole-path
 /// number only reveals the existence of.
 #[test]
 #[ignore = "benchmark: run explicitly, see the module header"]
 fn the_import_components_cost_what_they_cost() {
-    use crate::coordination::rowstream::{read_body, BodyError, BodyVisitor, RecoveryBodyRowV1};
-
-    #[derive(Default)]
-    struct Collect {
-        header: Option<crate::coordination::rowstream::RecoveryHeaderV1>,
-        rows: Vec<RecoveryBodyRowV1>,
-    }
-    impl BodyVisitor<RecoveryBodyRowV1> for Collect {
-        fn header(
-            &mut self,
-            header: &crate::coordination::rowstream::RecoveryHeaderV1,
-        ) -> Result<(), BodyError> {
-            self.header = Some(header.clone());
-            Ok(())
-        }
-        fn row(&mut self, _section: u64, row: RecoveryBodyRowV1) -> Result<(), BodyError> {
-            self.rows.push(row);
-            Ok(())
-        }
-    }
+    use crate::coordination::rowstream::{read_body, RecoveryBodyRowV1};
 
     println!("\n§13 import components\n{}", "-".repeat(112));
     for shape in shapes() {
