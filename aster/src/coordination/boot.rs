@@ -150,6 +150,12 @@ pub(crate) async fn start(
     store_endpoint: crate::coordination::store::host::StoreEndpoint,
     local: CoordinationNodeId,
 ) -> Result<CoordinationRuntime> {
+    // The §S5-E startup gauge starts before anything is resolved or opened, so
+    // start-to-`Ready` measures the whole start rather than the part after the
+    // expensive one.
+    let startup =
+        std::sync::Arc::new(crate::coordination::runtime::readiness::StartupClock::started());
+
     // 3. Resolve the start mode against this node's verified identity.
     let plan = resolve(config, root, local).map_err(Error::from)?;
     let corridor = CorridorPlan::of(&plan, &local);
@@ -165,6 +171,7 @@ pub(crate) async fn start(
     //    leave the store untouched. `Raft::initialize` below then only ever
     //    runs over a store whose import has already succeeded.
     let recovery = plan.recovery_import().map_err(Error::from)?;
+    let opening = std::time::Instant::now();
     let storage = match &recovery {
         // The capability carries the identity its own genesis produced, so the
         // recovery open is not given one — there is no pair here to cross.
@@ -178,6 +185,7 @@ pub(crate) async fn start(
         ),
     }
     .map_err(|err| Error::Transport(anyhow::anyhow!("coordination storage: {err}")))?;
+    startup.record_storage_open(opening.elapsed());
     plan.check_directory_state(storage.outcome())
         .map_err(Error::from)?;
 
@@ -265,6 +273,7 @@ pub(crate) async fn start(
             }
             CoordinationStart::Join { .. } => None,
         },
+        std::sync::Arc::clone(&startup),
     )
     .await;
 

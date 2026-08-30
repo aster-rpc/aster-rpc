@@ -42,7 +42,7 @@ use super::config::leader_liveness_timeout;
 use super::lifecycle::{
     classify, Corridor, FatalCause, LifecycleCode, LifecycleView, LocalFacts, LocalRole,
 };
-use super::readiness::{channel, LifecyclePublisher, Readiness};
+use super::readiness::{channel, LifecyclePublisher, Readiness, StartupClock};
 use crate::coordination::ids::CoordinationNodeId;
 use crate::coordination::network::admit::SenderAllowlist;
 use crate::coordination::network::service::{AttachedRuntime, RaftEndpoint};
@@ -625,6 +625,9 @@ pub(crate) struct CoordinationRuntime {
     /// 3. Then storage — its own field order stops both actors and drains the
     ///    read leases before releasing the directory lock.
     storage: crate::coordination::storage::VoterStorage,
+    /// The §S5-E startup gauge: how long the storage open took, and how long
+    /// this node took to first reach `Ready`.
+    startup: Arc<StartupClock>,
 }
 
 impl CoordinationRuntime {
@@ -649,6 +652,9 @@ impl CoordinationRuntime {
         // `Join` and `Existing`: neither founds a group, so neither proposes
         // the entry — they receive it like any other committed state.
         genesis: Option<Arc<Vec<u8>>>,
+        // Started by `boot::start` before it opened anything, and already
+        // carrying the storage-open measurement.
+        startup: Arc<StartupClock>,
     ) -> Self {
         let state = attached.state.clone();
         let group = attached.group;
@@ -679,7 +685,7 @@ impl CoordinationRuntime {
             quorum_available: None,
             fatal: None,
         };
-        let (publisher, readiness) = channel(initial);
+        let (publisher, readiness) = channel(initial, Arc::clone(&startup));
 
         endpoint.attach(attached).await;
         store_endpoint
@@ -750,11 +756,16 @@ impl CoordinationRuntime {
             monitor: Some(monitor),
             lifecycle: Some(lifecycle),
             storage,
+            startup,
         }
     }
 
     pub(crate) fn readiness(&self) -> Readiness {
         self.readiness.clone()
+    }
+
+    pub(crate) fn startup(&self) -> Arc<StartupClock> {
+        Arc::clone(&self.startup)
     }
 
     pub(crate) fn store_metrics(

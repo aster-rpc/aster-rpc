@@ -62,11 +62,90 @@ impl From<NotReady> for crate::error::Error {
     }
 }
 
+/// The two startup durations an operator needs separated (§S5-E).
+///
+/// A slow start has two very different causes — a large store to open, or a
+/// group that took a while to elect and catch this node up — and every signal
+/// the runtime published before this could distinguish them only by
+/// subtraction from outside, which an operator watching a restart cannot do.
+///
+/// Deliberately two counters and one `Instant`, written at most once each. It
+/// is a gauge, not a history: nothing here grows with uptime, request rate or
+/// state size, so it can be read on every scrape.
+#[derive(Debug)]
+pub(crate) struct StartupClock {
+    began: std::time::Instant,
+    /// Microseconds `VoterStorage::open*` took. `u64::MAX` until recorded, so
+    /// "not measured" is distinguishable from "instantaneous".
+    storage_open_micros: std::sync::atomic::AtomicU64,
+    /// Microseconds from the start of `boot::start` to the **first** `Ready`.
+    /// `u64::MAX` until this node has ever been ready.
+    ready_micros: std::sync::atomic::AtomicU64,
+}
+
+/// The value [`StartupClock`]'s counters hold before they are recorded.
+pub(crate) const UNMEASURED: u64 = u64::MAX;
+
+impl StartupClock {
+    pub(crate) fn started() -> Self {
+        Self {
+            began: std::time::Instant::now(),
+            storage_open_micros: std::sync::atomic::AtomicU64::new(UNMEASURED),
+            ready_micros: std::sync::atomic::AtomicU64::new(UNMEASURED),
+        }
+    }
+
+    /// Record how long the storage open took. First writer wins: a recovery
+    /// open and an ordinary open are alternatives, never both.
+    pub(crate) fn record_storage_open(&self, took: std::time::Duration) {
+        let _ = self.storage_open_micros.compare_exchange(
+            UNMEASURED,
+            took.as_micros().min(u128::from(u64::MAX - 1)) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Record the first transition into `Ready`. Later transitions in and out
+    /// of `Ready` do not move it: this is "how long did starting take", not
+    /// "when was this node last healthy", and readiness is explicitly not a
+    /// latch.
+    fn record_ready(&self) {
+        let _ = self.ready_micros.compare_exchange(
+            UNMEASURED,
+            self.began
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX - 1)) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn storage_open_micros(&self) -> Option<u64> {
+        match self
+            .storage_open_micros
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            UNMEASURED => None,
+            value => Some(value),
+        }
+    }
+
+    pub(crate) fn start_to_ready_micros(&self) -> Option<u64> {
+        match self.ready_micros.load(std::sync::atomic::Ordering::Relaxed) {
+            UNMEASURED => None,
+            value => Some(value),
+        }
+    }
+}
+
 /// The write side. Held by the runtime's metrics loop; dropping it is what
 /// makes an outstanding [`Readiness::wait_ready`] return [`NotReady::ShutDown`].
 #[derive(Debug)]
 pub(crate) struct LifecyclePublisher {
     tx: watch::Sender<LifecycleView>,
+    startup: std::sync::Arc<StartupClock>,
 }
 
 impl LifecyclePublisher {
@@ -75,7 +154,15 @@ impl LifecyclePublisher {
     /// `send_replace` rather than `send`: `watch::Sender::send` fails when
     /// there are no receivers, and a runtime whose observers have all gone away
     /// must keep classifying itself — its own shutdown path reads the view.
+    ///
+    /// This is the subsystem's **only** publish site, which is why the
+    /// start-to-`Ready` stamp is taken here: a timer placed beside one caller
+    /// measures that caller, and there would be no way to tell which
+    /// transitions it missed.
     pub(crate) fn publish(&self, view: LifecycleView) {
+        if view.code == LifecycleCode::Ready {
+            self.startup.record_ready();
+        }
         self.tx.send_replace(view);
     }
 
@@ -98,14 +185,17 @@ pub(crate) struct Readiness {
 /// `initial` is the state `start()` may legitimately return in —
 /// `Bootstrapping`, `Joining` or `NoQuorum` per §7.6, and never `Ready`, which
 /// is observed rather than asserted by construction.
-pub(crate) fn channel(initial: LifecycleView) -> (LifecyclePublisher, Readiness) {
+pub(crate) fn channel(
+    initial: LifecycleView,
+    startup: std::sync::Arc<StartupClock>,
+) -> (LifecyclePublisher, Readiness) {
     debug_assert_ne!(
         initial.code,
         LifecycleCode::Ready,
         "readiness is observed, never asserted at construction (§7.6)"
     );
     let (tx, rx) = watch::channel(initial);
-    (LifecyclePublisher { tx }, Readiness { rx })
+    (LifecyclePublisher { tx, startup }, Readiness { rx })
 }
 
 impl Readiness {
@@ -180,7 +270,10 @@ mod tests {
     /// fail rather than pass slowly.
     #[tokio::test]
     async fn a_node_that_is_already_ready_returns_without_waiting() {
-        let (publisher, mut readiness) = channel(view(LifecycleCode::NoQuorum));
+        let (publisher, mut readiness) = channel(
+            view(LifecycleCode::NoQuorum),
+            std::sync::Arc::new(StartupClock::started()),
+        );
         publisher.publish(view(LifecycleCode::Ready));
 
         tokio::time::timeout(std::time::Duration::ZERO, readiness.wait_ready())
@@ -193,7 +286,10 @@ mod tests {
     /// it.
     #[tokio::test]
     async fn a_waiter_is_released_by_the_next_transition_into_ready() {
-        let (publisher, mut readiness) = channel(view(LifecycleCode::Bootstrapping));
+        let (publisher, mut readiness) = channel(
+            view(LifecycleCode::Bootstrapping),
+            std::sync::Arc::new(StartupClock::started()),
+        );
         let waiter = tokio::spawn(async move { readiness.wait_ready().await });
 
         // Intervening states must not release it.
@@ -209,7 +305,10 @@ mod tests {
     /// readiness, and a fresh wait parks again.
     #[tokio::test]
     async fn readiness_is_not_latched_once_observed() {
-        let (publisher, mut readiness) = channel(view(LifecycleCode::NoQuorum));
+        let (publisher, mut readiness) = channel(
+            view(LifecycleCode::NoQuorum),
+            std::sync::Arc::new(StartupClock::started()),
+        );
         publisher.publish(view(LifecycleCode::Ready));
         readiness.wait_ready().await.expect("ready");
 
@@ -227,7 +326,10 @@ mod tests {
     /// forever. The cause is what makes the failure diagnosable at all.
     #[tokio::test]
     async fn a_fatal_node_ends_the_wait_with_its_cause() {
-        let (publisher, mut readiness) = channel(view(LifecycleCode::Bootstrapping));
+        let (publisher, mut readiness) = channel(
+            view(LifecycleCode::Bootstrapping),
+            std::sync::Arc::new(StartupClock::started()),
+        );
         let waiter = tokio::spawn(async move { readiness.wait_ready().await });
         publisher.publish(fatal(FatalCause::Storage("out of disk".into())));
 
@@ -241,7 +343,10 @@ mod tests {
     /// pre-await check that makes readiness level-triggered.
     #[tokio::test]
     async fn an_already_fatal_node_ends_the_wait_immediately() {
-        let (publisher, mut readiness) = channel(view(LifecycleCode::NoQuorum));
+        let (publisher, mut readiness) = channel(
+            view(LifecycleCode::NoQuorum),
+            std::sync::Arc::new(StartupClock::started()),
+        );
         publisher.publish(fatal(FatalCause::IdentityMismatch("group id".into())));
         let result = tokio::time::timeout(std::time::Duration::ZERO, readiness.wait_ready())
             .await
@@ -252,7 +357,10 @@ mod tests {
     /// Shutdown releases waiters rather than stranding them.
     #[tokio::test]
     async fn shutting_the_runtime_down_releases_a_waiter() {
-        let (publisher, mut readiness) = channel(view(LifecycleCode::Joining));
+        let (publisher, mut readiness) = channel(
+            view(LifecycleCode::Joining),
+            std::sync::Arc::new(StartupClock::started()),
+        );
         let waiter = tokio::spawn(async move { readiness.wait_ready().await });
         drop(publisher);
         assert_eq!(waiter.await.expect("join"), Err(NotReady::ShutDown));
@@ -263,7 +371,10 @@ mod tests {
     /// the last caller went away would stop reporting its own state.
     #[test]
     fn publishing_survives_the_last_observer_leaving() {
-        let (publisher, readiness) = channel(view(LifecycleCode::NoQuorum));
+        let (publisher, readiness) = channel(
+            view(LifecycleCode::NoQuorum),
+            std::sync::Arc::new(StartupClock::started()),
+        );
         drop(readiness);
         publisher.publish(view(LifecycleCode::Ready));
         assert_eq!(publisher.subscribe().code(), LifecycleCode::Ready);
@@ -276,6 +387,62 @@ mod tests {
     #[test]
     #[should_panic(expected = "readiness is observed")]
     fn a_runtime_cannot_be_constructed_already_ready() {
-        let _ = channel(view(LifecycleCode::Ready));
+        let _ = channel(
+            view(LifecycleCode::Ready),
+            std::sync::Arc::new(StartupClock::started()),
+        );
+    }
+
+    /// **Start-to-`Ready` is stamped once, by the first `Ready`** (§S5-E).
+    ///
+    /// Readiness is level-triggered and not a latch, so a node moves in and out
+    /// of `Ready` for the rest of its life. "How long did starting take" is
+    /// answered exactly once, and a gauge that moved on every later transition
+    /// would answer "how long since this node was last unhealthy" while wearing
+    /// the startup label — which is worse than not measuring it.
+    #[test]
+    fn start_to_ready_is_stamped_by_the_first_ready_only() {
+        let startup = std::sync::Arc::new(StartupClock::started());
+        let (publisher, _readiness) = channel(
+            view(LifecycleCode::Bootstrapping),
+            std::sync::Arc::clone(&startup),
+        );
+
+        assert_eq!(
+            startup.start_to_ready_micros(),
+            None,
+            "a node that has never been ready reports nothing, not zero"
+        );
+        publisher.publish(view(LifecycleCode::Ready));
+        let first = startup
+            .start_to_ready_micros()
+            .expect("the first Ready is stamped");
+
+        publisher.publish(view(LifecycleCode::NoQuorum));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        publisher.publish(view(LifecycleCode::Ready));
+        assert_eq!(
+            startup.start_to_ready_micros(),
+            Some(first),
+            "a later return to Ready does not restate how long starting took"
+        );
+    }
+
+    /// **The storage-open gauge is written once, and reports `None` until it
+    /// is.** A recovery open and an ordinary open are alternatives — a store is
+    /// opened one way — so a second write is a bug rather than an update, and
+    /// the first value is kept.
+    #[test]
+    fn the_storage_open_gauge_is_written_once() {
+        let startup = StartupClock::started();
+        assert_eq!(startup.storage_open_micros(), None);
+        startup.record_storage_open(std::time::Duration::from_millis(7));
+        assert_eq!(startup.storage_open_micros(), Some(7_000));
+        startup.record_storage_open(std::time::Duration::from_millis(900));
+        assert_eq!(
+            startup.storage_open_micros(),
+            Some(7_000),
+            "the first open is the one that happened"
+        );
     }
 }

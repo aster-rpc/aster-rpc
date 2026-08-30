@@ -107,6 +107,18 @@ pub struct Coordination {
     state: storage::machine::StateHandle,
     /// The §11.5 tiers and §14 disk gauges.
     pressure: std::sync::Arc<store::host::PressureState>,
+    /// The §S5-E startup gauge.
+    startup: std::sync::Arc<runtime::readiness::StartupClock>,
+}
+
+/// The two startup durations [`Coordination::startup_timings`] reports.
+///
+/// Microseconds, and `None` until measured. A bounded gauge: two values
+/// written at most once each, so nothing here grows with uptime or state size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupTimings {
+    pub storage_open_micros: Option<u64>,
+    pub start_to_ready_micros: Option<u64>,
 }
 
 #[cfg(feature = "coordination")]
@@ -118,6 +130,7 @@ impl Coordination {
             raft: rt.raft().clone(),
             state: rt.state().clone(),
             pressure: rt.pressure(),
+            startup: rt.startup(),
         }
     }
 
@@ -210,6 +223,27 @@ impl Coordination {
             commands_timed: m.commands_timed.load(Ordering::Relaxed),
             read_latency_micros: m.read_latency_micros.load(Ordering::Relaxed),
             reads_timed: m.reads_timed.load(Ordering::Relaxed),
+        }
+    }
+
+    /// How long this node's start took, split into its two halves (§S5-E).
+    ///
+    /// `storage_open_micros` is `VoterStorage::open` (or, for a §13 recovery
+    /// bootstrap, `open_with_recovery` including the import);
+    /// `start_to_ready_micros` is from the first line of the coordination start
+    /// to the **first** time this node published `Ready`, and stays at the
+    /// first value across every later readiness change — readiness is not a
+    /// latch, but "how long did starting take" is answered once.
+    ///
+    /// Both are `None` until measured: a start that never reached `Ready` says
+    /// so rather than reporting zero, and the two are separated because a slow
+    /// start has two unrelated causes — a large store to open, or a group that
+    /// took time to elect and catch this node up — that an operator watching a
+    /// restart cannot tell apart by subtraction.
+    pub fn startup_timings(&self) -> StartupTimings {
+        StartupTimings {
+            storage_open_micros: self.startup.storage_open_micros(),
+            start_to_ready_micros: self.startup.start_to_ready_micros(),
         }
     }
 
