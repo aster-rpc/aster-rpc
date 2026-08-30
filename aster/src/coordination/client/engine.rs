@@ -233,9 +233,26 @@ impl Engine {
                             if let Ok(decoded) = hex::decode(hint) {
                                 if let Ok(id) = <[u8; 32]>::try_from(decoded.as_slice()) {
                                     self.members.lock().await.insert(id);
-                                    // The hint is staleable: following it is
-                                    // still bounded by the cap.
-                                    target = Some(id);
+                                    // The hint is staleable, and a stale hint
+                                    // can point at a member this call has
+                                    // already asked — including the answerer
+                                    // itself. A voter removed by a committed
+                                    // membership change keeps naming itself
+                                    // leader until it steps down, and following
+                                    // that hint again spends a hop on a node
+                                    // whose answer is already known.
+                                    //
+                                    // The cap alone does not save the call: it
+                                    // bounds termination, not fairness, so one
+                                    // self-referential hint consumed the whole
+                                    // budget and the real leader — a candidate
+                                    // this walk had not tried — was never
+                                    // reached. Following only *untried* hints
+                                    // keeps every hop informative and leaves
+                                    // the cap doing what it was for.
+                                    if !tried.contains(&id) {
+                                        target = Some(id);
+                                    }
                                 }
                             }
                         }
@@ -330,7 +347,13 @@ impl Engine {
                         if let Ok(decoded) = hex::decode(hint) {
                             if let Ok(id) = <[u8; 32]>::try_from(decoded.as_slice()) {
                                 self.members.lock().await.insert(id);
-                                target = Some(id);
+                                // Untried only, for the reason `unary` gives:
+                                // a hint that points back at an already-asked
+                                // member spends hops without learning
+                                // anything, and can spend all of them.
+                                if !tried.contains(&id) {
+                                    target = Some(id);
+                                }
                             }
                         }
                     }
