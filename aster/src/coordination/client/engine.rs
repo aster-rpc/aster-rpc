@@ -233,24 +233,28 @@ impl Engine {
                             if let Ok(decoded) = hex::decode(hint) {
                                 if let Ok(id) = <[u8; 32]>::try_from(decoded.as_slice()) {
                                     self.members.lock().await.insert(id);
-                                    // The hint is staleable, and a stale hint
-                                    // can point at a member this call has
-                                    // already asked — including the answerer
-                                    // itself. A voter removed by a committed
-                                    // membership change keeps naming itself
-                                    // leader until it steps down, and following
-                                    // that hint again spends a hop on a node
-                                    // whose answer is already known.
+                                    // A hint that names **the answerer itself**
+                                    // is not followed. Everything else is,
+                                    // including a hint naming a member this
+                                    // call has already asked: that one may have
+                                    // become true since — a group mid-election
+                                    // hands out the old leader's id until the
+                                    // new one is known, and following it again
+                                    // a moment later is how a read survives a
+                                    // leadership change.
                                     //
-                                    // The cap alone does not save the call: it
-                                    // bounds termination, not fairness, so one
-                                    // self-referential hint consumed the whole
-                                    // budget and the real leader — a candidate
-                                    // this walk had not tried — was never
-                                    // reached. Following only *untried* hints
-                                    // keeps every hop informative and leaves
-                                    // the cap doing what it was for.
-                                    if !tried.contains(&id) {
+                                    // A self-hint cannot become true that way.
+                                    // The answerer has just said two things at
+                                    // once — "I lead" and "I cannot serve you"
+                                    // — and asking it again gets the same pair.
+                                    // A voter removed by a committed membership
+                                    // change keeps naming itself leader until
+                                    // it steps down, and following that
+                                    // consumed the whole redirect budget while
+                                    // the real leader, a candidate this walk had
+                                    // not yet tried, was never reached. The cap
+                                    // bounds termination, not fairness.
+                                    if id != member {
                                         target = Some(id);
                                     }
                                 }
@@ -347,11 +351,12 @@ impl Engine {
                         if let Ok(decoded) = hex::decode(hint) {
                             if let Ok(id) = <[u8; 32]>::try_from(decoded.as_slice()) {
                                 self.members.lock().await.insert(id);
-                                // Untried only, for the reason `unary` gives:
-                                // a hint that points back at an already-asked
-                                // member spends hops without learning
-                                // anything, and can spend all of them.
-                                if !tried.contains(&id) {
+                                // Not the answerer itself, for the reason
+                                // `unary` gives: a member that says "I lead"
+                                // and "I cannot serve you" in one answer gives
+                                // the same pair when asked again, and one such
+                                // hint can spend the whole budget.
+                                if id != member {
                                     target = Some(id);
                                 }
                             }
