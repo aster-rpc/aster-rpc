@@ -76,6 +76,29 @@ const CLUSTER_A: &[usize] = &[0, 1, 2, 3];
 const CLUSTER_B: &[usize] = &[4, 5, 7];
 const CLUSTER_C: &[usize] = &[6, 8, 9];
 
+/// Wait for `server` to report `Ready`, by polling.
+///
+/// Not `wait_ready()`: that resolves on the *next* transition into `Ready`, so
+/// it is one await against a group that may pass through `NoQuorum` while a
+/// joint membership converges. Polling the published code asks the same
+/// question repeatedly, which is what an operator does and what a loaded runner
+/// needs.
+async fn becomes_ready(server: &AsterServer, what: &str) {
+    let handle = server.coordination().expect("hosted");
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        match handle.lifecycle_code() {
+            3 => return,
+            6 => panic!("{what}: the node latched Fatal"),
+            code => assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: still lifecycle {code} after {PATIENCE:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// The §S4-D journal state codes this gate asserts against. Transcribed here
 /// rather than imported: `JournalState` is crate-private, and a gate that read
 /// the code from the same enum it is checking would prove nothing about the
@@ -1047,21 +1070,15 @@ async fn the_corridor_places_one_voter_per_cluster_and_repairs_one_loss() {
         .map(|v| corridor.position_of(v))
         .collect();
     expected.sort_unstable();
+    // Settle first: the committed uniform membership is what proves the two new
+    // voters were caught up and promoted. Readiness is the follow-up check, and
+    // is polled rather than awaited once.
+    corridor.settles_on(&admin, &expected).await;
     for position in &expected {
         if *position >= VOTERS {
-            within(
-                "replacement readiness",
-                corridor
-                    .host(*position)
-                    .coordination()
-                    .expect("hosted")
-                    .wait_ready(),
-            )
-            .await
-            .expect("a newly placed voter catches up and becomes ready");
+            becomes_ready(corridor.host(*position), "a newly placed voter").await;
         }
     }
-    corridor.settles_on(&admin, &expected).await;
     let spread_clusters: BTreeSet<usize> = expected
         .iter()
         .map(|p| corridor.cluster_of(&corridor.ids[*p]))
@@ -1227,17 +1244,6 @@ async fn the_corridor_places_one_voter_per_cluster_and_repairs_one_loss() {
         "the lost voter left the selection"
     );
 
-    within(
-        "replacement readiness",
-        corridor
-            .host(replacement)
-            .coordination()
-            .expect("hosted")
-            .wait_ready(),
-    )
-    .await
-    .expect("the replacement catches up and becomes ready");
-
     // The provisioning callback ran, exactly once, for exactly the selected
     // candidate, keyed by the policy digest the plan was computed against.
     let calls = provisioning.calls();
@@ -1257,6 +1263,7 @@ async fn the_corridor_places_one_voter_per_cluster_and_repairs_one_loss() {
     settled.push(replacement);
     settled.sort_unstable();
     corridor.settles_on(&admin, &settled).await;
+    becomes_ready(corridor.host(replacement), "the replacement").await;
 
     let final_clusters: BTreeSet<usize> = settled
         .iter()
@@ -1351,21 +1358,12 @@ async fn two_racing_corridor_managers_commit_one_intent_and_one_transition() {
         .map(|v| corridor.position_of(v))
         .collect();
     expected.sort_unstable();
+    corridor.settles_on(&observer, &expected).await;
     for position in &expected {
         if *position >= VOTERS {
-            within(
-                "placed voter readiness",
-                corridor
-                    .host(*position)
-                    .coordination()
-                    .expect("hosted")
-                    .wait_ready(),
-            )
-            .await
-            .expect("ready");
+            becomes_ready(corridor.host(*position), "a placed voter").await;
         }
     }
-    corridor.settles_on(&observer, &expected).await;
     assert_ne!(expected, before, "the one transition actually moved");
 
     corridor.shutdown().await;
