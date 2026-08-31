@@ -907,6 +907,55 @@ async fn the_operator_runbook_runs_from_an_empty_machine() {
     }
     runbook.many("8. journal retry (clean)", "resume, journal Ready", resumes);
 
+    // ── 8b. The signals the S5-E thresholds are set on ──────────────────────
+    // Sampled rather than assumed: the budget table's "measured healthy"
+    // column has to come from a reading, and a threshold whose signal is never
+    // read in the runbook that justifies it is a threshold nobody has checked.
+    {
+        let handle = leader.coordination().expect("hosted");
+        let metrics = handle.store_metrics();
+        let mean_command = metrics
+            .command_latency_micros
+            .checked_div(metrics.commands_timed)
+            .unwrap_or_default();
+        let mean_read = metrics
+            .read_latency_micros
+            .checked_div(metrics.reads_timed)
+            .unwrap_or_default();
+        runbook.note(
+            "8b. signals (T2, T5–T7, T15)",
+            format!(
+                "quorum={:?} leader_changes={} quorum_losses={} cmd={mean_command}us                  read={mean_read}us stale_fence={} revision={}",
+                handle.quorum_available(),
+                metrics.leader_changes,
+                metrics.quorum_losses,
+                metrics.denied_stale_fence,
+                metrics.denied_revision,
+            ),
+        );
+        assert_eq!(
+            handle.quorum_available(),
+            Some(true),
+            "T2: a healthy leader holds direct quorum evidence"
+        );
+        // **Not** an assertion that `quorum_losses` is zero. This runbook takes
+        // a voter down and replaces another, and a leader that briefly cannot
+        // reach a quorum during those is the counter working. What must hold at
+        // the end is that the group recovered, which the assertion above says.
+        // T7's budget is a *rate* in steady state, and a runbook that reshapes
+        // membership three times is not steady state.
+        assert!(
+            metrics.leader_changes <= 8,
+            "T6: a rollout with three membership operations should not have \
+             re-elected {} times",
+            metrics.leader_changes
+        );
+        assert!(
+            handle.startup_timings().storage_open_micros.is_some(),
+            "T10: the storage-open gauge is populated on a running voter"
+        );
+    }
+
     // ── 9. Backup: the canonical recovery export ────────────────────────────
     let at = Instant::now();
     let (manifest, body) = within("recovery_export", admin.reads().recovery_export())
