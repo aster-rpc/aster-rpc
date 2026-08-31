@@ -523,6 +523,28 @@ impl GroupFixture {
         candidate_ticket: &str,
         senders: &[usize],
     ) -> Vec<u8> {
+        let ids: Vec<Vec<u8>> = senders.iter().map(|i| self.node_id(*i)).collect();
+        self.join_permit_for_senders(candidate_secret, candidate_ticket, &ids)
+    }
+
+    /// [`join_permit_with_ticket`](Self::join_permit_with_ticket) with the
+    /// bootstrap senders named **by NodeId** rather than by genesis-voter index.
+    ///
+    /// The index form can only name this fixture's own initial voters, which is
+    /// right for a candidate admitted at bootstrap and wrong for one that may be
+    /// provisioned after placement has moved the voter set. §7.2 lets only the
+    /// permit's senders speak to a candidate until a committed membership
+    /// contains it — so a permit naming three nodes that are no longer voters
+    /// leaves the candidate unable to be caught up by whoever now leads, and the
+    /// replacement stalls as a learner with nothing applied. An operator mints
+    /// the permit against the hosts eligible to hold the quorum, which is the
+    /// same set the placement policy declares eligible.
+    pub fn join_permit_for_senders(
+        &self,
+        candidate_secret: [u8; 32],
+        candidate_ticket: &str,
+        senders: &[Vec<u8>],
+    ) -> Vec<u8> {
         use crate::coordination::model::authority::{
             canonical_document_bytes, join_signing_bytes, signed_document_from_parts,
         };
@@ -534,11 +556,12 @@ impl GroupFixture {
             .to_vec();
         let mut bootstrap_senders: Vec<NodeIdV1> = senders
             .iter()
-            .map(|i| NodeIdV1 {
-                node_id: self.node_id(*i),
+            .map(|node_id| NodeIdV1 {
+                node_id: node_id.clone(),
             })
             .collect();
         bootstrap_senders.sort_by(|l, r| l.node_id.cmp(&r.node_id));
+        bootstrap_senders.dedup_by(|l, r| l.node_id == r.node_id);
 
         let permit = JoinPermitV1 {
             format_version: 1,
@@ -569,11 +592,25 @@ impl GroupFixture {
         candidate_ticket: &str,
         senders: &[usize],
     ) -> crate::coordination::host::CoordinationConfig {
+        let ids: Vec<Vec<u8>> = senders.iter().map(|i| self.node_id(*i)).collect();
+        self.join_config_for_senders(dir, candidate_secret, candidate_ticket, &ids)
+    }
+
+    /// [`join_config`](Self::join_config) with the bootstrap senders named by
+    /// NodeId. See [`join_permit_for_senders`](Self::join_permit_for_senders)
+    /// for why a corridor whose voter set moves needs it.
+    pub fn join_config_for_senders(
+        &self,
+        dir: &std::path::Path,
+        candidate_secret: [u8; 32],
+        candidate_ticket: &str,
+        senders: &[Vec<u8>],
+    ) -> crate::coordination::host::CoordinationConfig {
         use crate::coordination::host::{CoordinationConfig, CoordinationStart};
 
         self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
             CoordinationStart::Join {
-                signed_join_permit: self.join_permit_with_ticket(
+                signed_join_permit: self.join_permit_for_senders(
                     candidate_secret,
                     candidate_ticket,
                     senders,

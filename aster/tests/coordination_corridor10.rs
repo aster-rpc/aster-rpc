@@ -294,6 +294,26 @@ fn canonical_ticket(id: &[u8; 32]) -> String {
         .expect("a canonical ticket")
 }
 
+/// The bootstrap senders every candidate's permit names: **the whole eligible
+/// host set**, by NodeId.
+///
+/// Not the three genesis voters. §7.2 lets only the permit's senders speak to a
+/// candidate until a committed membership contains it, and this corridor's
+/// whole point is that the voter set *moves*: after the initial spread the
+/// leader is very often one of the placed candidates, and a permit naming only
+/// the genesis three leaves the next replacement stalled as a learner with
+/// nothing applied — which is what the first full-battery run of this gate
+/// produced, non-deterministically, depending on who happened to lead.
+///
+/// An operator mints the permit against the hosts eligible to hold the quorum,
+/// which is exactly the set the placement policy declares eligible.
+fn eligible_senders(ids: &[CoordinationNodeId]) -> Vec<Vec<u8>> {
+    ELIGIBLE
+        .iter()
+        .map(|position| ids[*position].as_bytes().to_vec())
+        .collect()
+}
+
 impl Corridor {
     /// Start all ten producers, cross-register them, and wait for the three
     /// genesis voters to be ready.
@@ -340,11 +360,11 @@ impl Corridor {
                         .root_pubkey(PublicKey::from_bytes(fixture.authority_key()))
                         .build(),
                 )
-                .builtin_coordination(fixture.join_config(
+                .builtin_coordination(fixture.join_config_for_senders(
                     dir.path(),
                     secret,
                     &canonical_ticket(&node_id_of(secret)),
-                    &[0, 1, 2],
+                    &eligible_senders(&ids),
                 ))
                 .start()
                 .await
@@ -738,10 +758,10 @@ fn seed_for(corridor: &Corridor, position: usize) -> MemberSeedV1 {
     MemberSeedV1 {
         node_id: id.to_vec(),
         ticket: ticket.clone(),
-        signed_join_permit: Some(corridor.fixture.join_permit_with_ticket(
+        signed_join_permit: Some(corridor.fixture.join_permit_for_senders(
             secret,
             &ticket,
-            &[0, 1, 2],
+            &eligible_senders(&corridor.ids),
         )),
     }
 }
