@@ -1043,6 +1043,41 @@ async fn the_corridor_places_one_voter_per_cluster_and_repairs_one_loss() {
         );
     }
 
+    // Absence from a selection that had eligible candidates to spare proves
+    // little. **Starve the record**: remove every eligible cluster-B candidate
+    // so the only live node that could restore three separated pairs is
+    // producer 7 — admitted, live, in cluster B, and not in the eligible
+    // record. The planner must refuse rather than reach for it, and must not
+    // *name* it in any answer: `NeedsProvisioning` names a candidate as surely
+    // as `Plan` does.
+    let starved = {
+        let mut policy = corridor_policy(&corridor, 9, true, Duration::from_secs(600), &[]);
+        for position in CLUSTER_B {
+            policy.eligible.remove(&corridor.ids[*position]);
+        }
+        policy
+    };
+    artifacts.policy("starved of eligible cluster-B candidates", &starved);
+    let starved_answer =
+        plan(&observed_input(&corridor, &admin, starved, healthy_view.clone()).await);
+    artifacts.record(
+        "starved of eligible cluster-B candidates",
+        format!("  {starved_answer:?}"),
+    );
+    assert!(
+        !matches!(starved_answer, PlacementRecommendation::Plan(_)),
+        "with no eligible cluster-B candidate the planner must refuse, not \
+         reach for an ineligible one: {starved_answer:?}"
+    );
+    let rendered = format!("{starved_answer:?}");
+    for position in PLAIN {
+        assert!(
+            !rendered.contains(&corridor.ids[position].to_hex()),
+            "producer {position} is admitted and live but not eligible; no \
+             recommendation may name it: {rendered}"
+        );
+    }
+
     // ── Submit the initial placement for real ───────────────────────────────
     let mut manager = CoordinationPlacementManager::new(
         admin.clone(),
