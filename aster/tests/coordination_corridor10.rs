@@ -1251,14 +1251,41 @@ async fn the_corridor_places_one_voter_per_cluster_and_repairs_one_loss() {
 
     // The first pass notes the absence and submits nothing: the grace has not
     // been observed to pass, and an unobserved absence is not a failure.
-    let first = within("first repair reconcile", repair.reconcile())
-        .await
-        .expect("a report");
-    artifacts.report("repair: before grace", &first);
+    //
+    // **The grace clock starts at the first observation, not at the kill**, so
+    // this loops until an observation actually happened. A status read taken in
+    // the instant after the victim was shut down can fail on the connection it
+    // just closed, and that pass stops before `observe` runs — it starts no
+    // timer at all. Sleeping the grace after such a pass and then asserting a
+    // submission tests nothing but how fast the runner is; it was observed
+    // failing that way, with the second pass reporting `Degraded` because the
+    // clock had only just started.
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let first = loop {
+        let report = within("first repair reconcile", repair.reconcile())
+            .await
+            .expect("a report");
+        artifacts.report("repair: observation", &report);
+        if !report.current_voters.is_empty() {
+            break report;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the manager never obtained a status cut after the loss: {}",
+            report.reason
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let observed_at = std::time::Instant::now();
     assert!(
         first.pending_operation_id.is_none(),
         "no command before the grace: {}",
         first.reason
+    );
+    assert!(
+        first.grace_crossed_members.is_empty(),
+        "the first observation starts the clock; it cannot already have crossed: {:?}",
+        short_set(first.grace_crossed_members.iter().copied())
     );
     assert_eq!(
         corridor.committed_voters(&admin).await,
@@ -1266,7 +1293,10 @@ async fn the_corridor_places_one_voter_per_cluster_and_repairs_one_loss() {
         "nothing moved before the grace"
     );
 
-    tokio::time::sleep(grace + Duration::from_millis(400)).await;
+    tokio::time::sleep(
+        (observed_at + grace + Duration::from_millis(400)) - std::time::Instant::now(),
+    )
+    .await;
 
     let repaired = within("repair reconcile", repair.reconcile())
         .await
