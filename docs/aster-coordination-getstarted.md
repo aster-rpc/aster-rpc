@@ -702,12 +702,28 @@ An administrator submits a membership plan, after which Aster:
 4. settles the exact voter and retained-learner roles; and
 5. records completion durably.
 
+**Mint the join permit against every host eligible to hold the quorum, not
+against today's voters.** A permit's `bootstrap_senders` are the only nodes that
+may speak to a `Join` candidate until a committed membership contains it. If the
+voter set later moves — which is the point of topology-aware placement — a
+permit naming only the original voters leaves the candidate unable to be caught
+up by whoever now leads: it is added as a learner, applies nothing, and never
+becomes ready. Nothing refuses the permit; the replacement simply stalls. Name
+the eligible-host set, which is the same set the placement policy carries.
+
 ### Remove a routine member
 
 Commit the membership plan first, then revoke producer admission. Reversing the
 order can make the quorum unable to communicate with the member it must remove.
 For suspected compromise, admission may be denied immediately for containment,
 then the surviving quorum commits removal.
+
+**Routine removal is of a retained learner.** A three-voter production group
+cannot remove a *voter*: the plan would leave two, the deployment shape refuses
+it, and the request is rejected before it is proposed ("the membership plan is
+outside the v1 shape"). Removing a voter is therefore always a **replacement** —
+the plan names the departing member out and its successor in, in one committed
+transition. Plan for that rather than for a two-step shrink-then-grow.
 
 ### Recover after quorum loss
 
@@ -719,9 +735,23 @@ bootstraps a **new group id** whose signed genesis binds that export hash.
 Imported state records its provenance. Because the group id changes, every old
 fence becomes invalid even if an epoch number happens to match.
 
-The recovery signing document, compatibility matrix, and import API remain
-draft work. Do not improvise this procedure from snapshots or by copying voter
-directories.
+**A refused import is not retryable in place.** The import runs inside the
+storage open, *after* the directory has been bound, so a refusal — a damaged
+export, the wrong bound hash — leaves a directory that is bound and replicated-
+pristine. Nothing was written, and the all-or-nothing guarantee holds; but the
+next open is no longer `Fresh` and the import guard refuses it by design rather
+than writing into a directory something has already claimed. The refusal names
+the directory's state, so it is distinguishable in the log from a bad export.
+**After any refused import, retry against a new or explicitly cleared storage
+directory on that voter — never the same one.**
+
+**A status read against a group with no quorum takes about twenty seconds to
+refuse.** The client's routing walk tries every candidate and each attempt has
+its own deadline. That is correct behaviour, not a hang, but a dashboard polling
+`group_status` during an incident will look stalled before it reports. Size
+scrape timeouts accordingly.
+
+Do not improvise this procedure from snapshots or by copying voter directories.
 
 **Benefit:** routine lifecycle operations converge through committed state, and
 catastrophic recovery cannot accidentally resurrect authority from the old
@@ -760,6 +790,19 @@ Monitor at least:
 - renewals, expiries, revocations, and fence rejections;
 - snapshot progress and storage sizes; and
 - placement outcome, missing evidence, exclusions, and replacement grace.
+
+`Coordination::startup_timings()` reports the two halves of a start separately —
+how long the storage open took, and how long this node took to first reach
+`Ready`. A slow start has two unrelated causes, a large store to open or a group
+that took time to elect and catch this node up, and an operator watching a
+restart cannot tell them apart by subtraction. Both are `None` until measured, so
+a start that never reached `Ready` says so rather than reporting zero.
+
+Alert thresholds — which signal, what budget fixes the number, and where warn and
+page sit — are the S5-E budget table in the coordination contract matrix. Two
+rules are worth repeating here: **stale-fence and revision refusals are never an
+alarm** (they are the register working), and every threshold is set by an
+operational budget rather than by a multiple of a benchmark.
 
 **Benefit:** the API distinguishes temporary unavailability, advisory local
 knowledge, and local corruption instead of compressing them into a misleading
