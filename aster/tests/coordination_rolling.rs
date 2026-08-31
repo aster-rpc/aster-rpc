@@ -321,13 +321,25 @@ async fn a_same_v1_group_survives_a_rolling_restart_of_every_voter() {
 
     // And every voter converges on the same applied index, which is what
     // "rejoined" has to mean.
+    //
+    // On **some** common index at or beyond the one sampled above, not on that
+    // exact one. The sample comes from a single voter at a single instant and
+    // the group is still running: a lease sweep or the new leader's own initial
+    // entry may commit between the sample and the check, and then all three
+    // agree at 12 while an equality against 11 reports "never converged" about
+    // a group that has. That is a race in the assertion, not in the group —
+    // observed once with all three voters reporting `Some(12)` against a
+    // sampled 11 — and the property the rollout has to prove is agreement, not
+    // a particular number.
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         let indexes: Vec<Option<u64>> = voters
             .iter()
             .map(|v| v.coordination().last_applied_for_testing())
             .collect();
-        if indexes.iter().all(|i| *i == Some(applied)) {
+        let converged = matches!(indexes[0], Some(index) if index >= applied)
+            && indexes.iter().all(|i| *i == indexes[0]);
+        if converged {
             break;
         }
         assert!(
