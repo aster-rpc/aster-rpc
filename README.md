@@ -179,7 +179,8 @@ You only need this if you're contributing to Aster itself. Most users should `pi
 ### Prerequisites
 
 - Python ≥ 3.9
-- Rust toolchain (1.94+ recommended)
+- Rust toolchain — pinned to 1.96.0 by `rust-toolchain.toml`; rustup selects it
+  automatically, and 1.94 cannot parse this workspace
 - [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`
 - For TypeScript binding: [`bun`](https://bun.sh/) or Node.js 20+
 

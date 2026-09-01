@@ -2,6 +2,7 @@
 name = "aster-transport-salvo"
 version = "0.3.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Aster RPC over HTTP (H1/H2/H3 + WebTransport) via the Aster Salvo fork."
 license = "MIT OR Apache-2.0"
 repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"

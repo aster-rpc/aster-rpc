@@ -2,6 +2,7 @@
 name = "aster-transport-napi"
 version = "0.3.0"
 edition = "2021"
+rust-version.workspace = true
 description = "NAPI-RS bindings for Aster transport (Iroh P2P)"
 license = "Apache-2.0"
 publish = false

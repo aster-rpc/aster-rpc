@@ -3,6 +3,16 @@ members = ["core", "ffi", "aster", "aster-expose", "aster-macros", "aster-transp
 exclude = ["core/fuzz", "ffi/fuzz"]
 resolver = "2"
 
+[workspace.package]
+# Minimum supported Rust version, inherited by every member.
+#
+# 1.96 is *known-good* rather than bisected: 1.94.1 cannot parse this manifest
+# at all (`registry` and `git` on one dependency is rejected), and 1.96.0 is
+# what CI, the runner images and `rust-toolchain.toml` all run. Whether 1.95
+# would also do has not been established, and claiming it without testing would
+# be the same kind of guess this pin exists to remove.
+rust-version = "1.96"
+
 [workspace.dependencies]
 # Core Iroh
 # Each forked direct dependency has two locations: the public Forgejo Git

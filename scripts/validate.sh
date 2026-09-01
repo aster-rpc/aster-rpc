@@ -17,8 +17,11 @@
 
 set -euo pipefail
 
-# Keep in sync with .github/workflows/ci.yml
-RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.94.1}"
+# The toolchain is chosen by `rust-toolchain.toml` at the workspace root, which
+# every `cargo` invocation below picks up. This script used to declare
+# RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.94.1}" and then never use or export it, so
+# it selected nothing while appearing to: the value was stale (CI was on 1.96.0)
+# and could not have parsed this workspace even if it had been honoured.
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

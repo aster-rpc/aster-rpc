@@ -1,0 +1,27 @@
+# The one place the Rust toolchain for this workspace is chosen.
+#
+# Before this file existed, nothing selected a toolchain. `scripts/validate.sh`
+# declared `RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.94.1}"` and then never used or
+# exported it, the runner documentation advertised 1.94.1, and every local
+# `cargo` invocation silently used whatever the host default happened to be.
+#
+# That was not merely untidy. The workspace root specifies `registry` *and*
+# `git` on its iroh dependencies, which 1.94.1 rejects outright:
+#
+#   dependency (iroh) specification is ambiguous.
+#   Only one of `git` or `registry` is allowed.
+#
+# So the advertised and default compiler could not parse this workspace at all,
+# and that was only discovered by running the suite on a Linux host whose
+# rustup default was still the documented version. Every CI workflow already
+# pinned 1.96.0 and passed; the gap was between CI and everything else.
+#
+# 1.96.0 is the version CI runs and the version `.forgejo/runner/Dockerfile`
+# builds into the job images. Keep those three in step: this file, that ARG, and
+# `RUST_TOOLCHAIN` in the GitHub workflows.
+[toolchain]
+channel = "1.96.0"
+# `rustfmt` and `clippy` because `scripts/validate.sh` runs both, and a pinned
+# channel without them turns a formatting check into a missing-component error.
+components = ["rustfmt", "clippy"]
+profile = "minimal"

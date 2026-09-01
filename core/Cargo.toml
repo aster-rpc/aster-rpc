@@ -2,6 +2,7 @@
 name = "aster_transport_core"
 version = "0.3.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Shared Rust transport engine for the Aster SDK."
 license = "MIT OR Apache-2.0"
 repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
