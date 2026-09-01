@@ -85,8 +85,26 @@ type Applied = (
 
 use crate::coordination::model::state::{Intent, OperationId};
 
-type Entry = openraft::Entry<CoordinationTypeConfig>;
+pub(crate) type Entry = openraft::Entry<CoordinationTypeConfig>;
 type Reply<T> = oneshot::Sender<StorageResult<T>>;
+
+/// One `Blank` entry at `index`, attributed to `leader`.
+///
+/// Module-level rather than inside the test module because the S5-E snapshot
+/// benchmark needs it too: it advances a sender's applied index without
+/// touching a row, so the body it then streams is the fixture's shape and not
+/// one the harness quietly altered. The test module's own `blank` delegates
+/// here, so there is one definition of what a blank entry is.
+#[cfg(test)]
+pub(crate) fn blank_entry(leader: [u8; 32], index: u64) -> Entry {
+    Entry {
+        log_id: RaftLogId {
+            leader_id: openraft::CommittedLeaderId::new(1, CoordinationNodeId::from_array(leader)),
+            index,
+        },
+        payload: EntryPayload::Blank,
+    }
+}
 
 /// A reply whose failure is **not** a `StorageError`.
 ///
@@ -1879,10 +1897,7 @@ mod tests {
     }
 
     fn blank(index: u64) -> Entry {
-        Entry {
-            log_id: log_id(index),
-            payload: EntryPayload::Blank,
-        }
+        super::blank_entry(LEADER, index)
     }
 
     fn uniform_membership(voters: &[[u8; 32]]) -> Membership<CoordinationNodeId, CoordinationNode> {

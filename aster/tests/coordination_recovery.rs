@@ -9,6 +9,15 @@
 //! old-group fence dies at the door, the administrator union holds, the
 //! signed Genesis *confirms* the import rather than overwriting it, and a
 //! tampered or mismatched export never founds a group at all.
+//!
+//! The feature guard is the same one every sibling integration test carries,
+//! and it was missing here from this file's first commit: the body reaches for
+//! `coordination::testing::GroupFixture`, so without it a workspace-wide
+//! `--all-targets` build with no features fails to compile this target rather
+//! than skipping it. `cargo test` with the feature never noticed, because the
+//! feature was always on when anyone ran it.
+
+#![cfg(feature = "coordination-testing")]
 
 use std::time::Duration;
 

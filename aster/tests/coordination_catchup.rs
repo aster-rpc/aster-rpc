@@ -31,10 +31,28 @@
 //! and it is not a hang. Every alternative costs the property: a smaller
 //! trigger tests a configuration nothing runs, and writing entries straight to
 //! the log would skip the replication this exists to exercise.
+//!
+//! ## It is also the S5-E measurement of a whole snapshot catch-up
+//!
+//! The gate prints the elapsed time of each phase under `--nocapture`, and the
+//! catch-up phase is the operator-visible cost of a snapshot install: it starts
+//! when the returned voter's process starts and stops when its applied index
+//! reaches the leader's, with the snapshot-covers-the-purged-region assertion
+//! standing behind it. It is the only measurement in the checkpoint that
+//! includes OpenRaft *deciding* to send a snapshot, the sender building the
+//! stream and the QUIC transfer, so it is the whole operation and not a
+//! component.
+//!
+//! It is one sample, and it is reported as one. A run costs six minutes and
+//! reshapes a real group, so there is no distribution here — the per-shape
+//! distribution of the build and the install themselves is in
+//! `coordination::storage::bench`, which prices the same two production calls
+//! over every §12.1 shape without the network in front of them. Neither
+//! measurement subsumes the other and the checkpoint quotes both.
 
 #![cfg(feature = "coordination-testing")]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aster::coordination::contract::{
     AcquireActionV1, ActionV1, ClientCommandV1, CommandV1, ResourceKeyV1,
@@ -171,6 +189,7 @@ async fn a_stranded_follower_catches_up_by_snapshot() {
     // Enough traffic to snapshot and purge. Two of three is a quorum, so the
     // remaining pair commits without the stranded voter.
     let actor = voters[leader].index;
+    let writes_began = Instant::now();
     let mut next = 0u64;
     while next < ENTRIES {
         let end = (next + IN_FLIGHT as u64).min(ENTRIES);
@@ -190,9 +209,19 @@ async fn a_stranded_follower_catches_up_by_snapshot() {
         }
     }
 
+    let writes_took = writes_began.elapsed();
+
     // The leader must have snapshotted *and* purged past where the stranded
     // voter stopped — otherwise a replay would still be possible and a
     // successful catch-up would prove nothing about snapshots.
+    //
+    // The wait is timed separately from the writes so it cannot be mistaken for
+    // part of them. It is **not** a build measurement and must not be quoted as
+    // one: the policy fires on the write that crosses the trigger, so the build
+    // and the purge run concurrently with the remaining writes and this loop
+    // usually finds the condition already true. The per-shape build cost is
+    // measured in `coordination::storage::bench`.
+    let snapshot_wait_began = Instant::now();
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         let purged = coordination.purged_index_for_testing();
@@ -207,6 +236,7 @@ async fn a_stranded_follower_catches_up_by_snapshot() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    let snapshot_wait_took = snapshot_wait_began.elapsed();
     let purged = coordination
         .purged_index_for_testing()
         .expect("the leader purged");
@@ -214,17 +244,29 @@ async fn a_stranded_follower_catches_up_by_snapshot() {
         .last_applied_for_testing()
         .expect("the leader applied");
 
+    // The catch-up clock starts here, before the process does. What an operator
+    // waits through is the whole thing: the voter starting, OpenRaft deciding a
+    // snapshot is the only route, the sender building and streaming it, and the
+    // receiver installing it. Starting the clock after the process was up would
+    // exclude a cost the operator still pays.
+    let catchup_began = Instant::now();
+
     // Bring it back onto its own store, and re-register addresses so the dial
     // succeeds without waiting for discovery.
     voters.push(start(&fixture, index, dir, false).await);
     cross_register(&voters);
     let returned = voters.last().expect("the returned voter");
 
+    // The loop yields the elapsed time rather than assigning into a binding
+    // declared outside it: the only way out is the branch that observed the
+    // catch-up, so there is no path on which the duration is unset and none on
+    // which it belongs to a different observation.
     let deadline = tokio::time::Instant::now() + PATIENCE;
-    loop {
+    let catchup_took = loop {
         let c = returned.coordination();
         let applied = c.last_applied_for_testing();
         if applied >= Some(target) {
+            let elapsed = catchup_began.elapsed();
             // The evidence that it came by snapshot: the follower holds one,
             // and it covers a region the leader had already purged, so no
             // replay could have delivered it.
@@ -236,14 +278,34 @@ async fn a_stranded_follower_catches_up_by_snapshot() {
                 "the follower's snapshot must cover the purged region it could \
                  not have replayed: snapshot {snapshot}, purged {purged}"
             );
-            break;
+            break elapsed;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "the returned follower never caught up: applied {applied:?}, target {target}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    };
+
+    // S5-E. One sample, labelled as one — see the module header for why there
+    // is no distribution here and where the distribution lives.
+    let installed = returned
+        .coordination()
+        .snapshot_index_for_testing()
+        .expect("the caught-up follower holds a snapshot");
+    println!(
+        "\nS5-E — whole snapshot catch-up over the real network (n=1)\n\
+         {}\n  \
+         entries written                {ENTRIES} in {writes_took:.3?}\n  \
+         leader snapshot + purge wait   {snapshot_wait_took:.3?} (near-zero means the leader had already \
+snapshotted and purged before the writes finished — not a build measurement)\n  \
+         stranded at index              {stopped_at:?}\n  \
+         leader purged through          {purged}\n  \
+         catch-up target index          {target}\n  \
+         follower snapshot index        {installed}\n  \
+         WHOLE CATCH-UP                 {catchup_took:.3?}  (process start → applied == target, by snapshot)\n",
+        "-".repeat(78),
+    );
 
     for voter in voters {
         voter.server.shutdown().await;
