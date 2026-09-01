@@ -50,6 +50,7 @@ impl ScratchDir {
     /// runs sharing a directory would be a test failure with no cause visible
     /// in either.
     pub(crate) fn new(family: &str) -> Self {
+        narrow_process_umask();
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "aster-coordination-{family}-{}-{n}",
@@ -60,6 +61,7 @@ impl ScratchDir {
         // tolerate, confusing to inherit.
         remove_tree(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
+        make_owner_only(&dir);
         Self(dir)
     }
 
@@ -162,9 +164,119 @@ fn restore_owner_write(path: &Path) {
 #[cfg(not(unix))]
 fn restore_owner_write(_path: &Path) {}
 
+/// Narrow a freshly created scratch directory to `0700`.
+///
+/// `create_dir_all` requests `0777` and lets the process umask subtract from
+/// it, so what a scratch directory ends up as is a property of the host and not
+/// of this helper. That is a difference between platforms with teeth:
+/// `OpenPolicy::production()` refuses a storage directory writable beyond its
+/// owner, so under macOS's usual `022` a scratch directory is `0755` and opens,
+/// while under Ubuntu's default `002` it is `0775` and is **correctly refused**
+/// with `BroadPermissions { mode: 509 }`.
+///
+/// Found by running the fault matrix natively on Linux for the first time, which
+/// is the sort of thing that gate exists for. The production policy is right and
+/// is not what changed here; a test fixture that hands it a group-writable
+/// directory was simply asserting the host's umask.
+///
+/// This pins the root. [`narrow_process_umask`] is what covers everything
+/// created *inside* it.
+#[cfg(unix)]
+fn make_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+/// Narrow this process's umask to `0o077`, once, for the whole test binary.
+///
+/// Chmod-ing the scratch root is not enough on its own, and the first Linux
+/// run showed exactly why: a fixture that creates `store-0` beneath the root,
+/// or a test that seeds a `raft.redb` by hand before handing the directory to
+/// production, creates that path at the ambient umask no matter what the root
+/// is set to. Under Ubuntu's default `002` those came out `0775` and `0664`
+/// and were refused — eight further failures beyond the one the root fixed,
+/// spread across `fixture` and `schema`, every one of them a fixture asserting
+/// the host's umask rather than the code.
+///
+/// Patching each creation site would fix today's and leave the next fixture to
+/// reintroduce it, so the narrowing goes here: every test directory in this
+/// subsystem comes through [`ScratchDir::new`].
+///
+/// **This is deliberately process-wide, having first been rejected as such.**
+/// The objection was that the crash matrix's spawned children inherit it —
+/// which is true, and is the reason to want it: those children open storage
+/// through the production path and need the same modes. It is set once, before
+/// any scratch directory exists, and never restored, so there is no window in
+/// which one thread's creation races another's change. It cannot affect
+/// production behaviour: `restrict_permissions` uses `set_permissions`, which
+/// ignores the umask, and this module is `cfg(test)`.
+#[cfg(unix)]
+fn narrow_process_umask() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: `umask` is always successful and cannot fail or alias. It is
+        // `unsafe` only because it is a raw libc call.
+        unsafe { libc::umask(0o077) };
+    });
+}
+
+#[cfg(not(unix))]
+fn narrow_process_umask() {}
+
+/// Windows has no mode bits to narrow, and the production permission check is
+/// itself Unix-only.
+#[cfg(not(unix))]
+fn make_owner_only(_path: &Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A scratch directory is `0700` whatever the host's umask is.**
+    ///
+    /// The regression this pins is a platform difference that hid on macOS for
+    /// the whole of Slices 2–5: `create_dir_all` subtracts the ambient umask,
+    /// so the mode was the host's opinion rather than this helper's. macOS's
+    /// usual `022` gives `0755`, which `OpenPolicy::production()` accepts;
+    /// Ubuntu's default `002` gives `0775`, which it refuses — correctly, since
+    /// a group-writable storage directory is exactly what that check is for.
+    /// The first native Linux run of the fault matrix failed on it.
+    ///
+    /// Asserted as the whole low nine bits, not as "no group write": a fixture
+    /// that drifted to `0777` would still have to be caught, and a mask that
+    /// only looked at one bit would miss `o+w`.
+    #[cfg(unix)]
+    #[test]
+    fn a_scratch_directory_is_owner_only_whatever_the_hosts_umask_is() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Force the process-wide narrowing to have already happened, so this
+        // test's own `umask(0)` below is not silently undone by it. Without
+        // this the test passes whether or not `make_owner_only` runs, but only
+        // when it happens to be the first in the binary to build a scratch
+        // directory — an ordering-dependent gate, which is no gate.
+        drop(ScratchDir::new("umask-independence-warmup"));
+
+        // Now widen, so the assertion is about this helper and not about
+        // whatever the host happens to run with. A test that only passed under
+        // a strict umask would be asserting the host again, which is the defect
+        // being fixed.
+        let previous = unsafe { libc::umask(0) };
+        let dir = ScratchDir::new("umask-independence");
+        let mode = std::fs::metadata(&*dir)
+            .expect("the scratch directory exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        unsafe { libc::umask(previous) };
+
+        assert_eq!(
+            mode, 0o700,
+            "a scratch directory must be owner-only regardless of umask; \
+             production storage refuses anything writable beyond its owner, \
+             so a broader one asserts the host rather than the code (got {mode:o})"
+        );
+    }
 
     /// The ordinary case: a directory with contents, gone when its guard is.
     #[test]
