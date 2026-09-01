@@ -245,37 +245,190 @@ mod tests {
     /// Asserted as the whole low nine bits, not as "no group write": a fixture
     /// that drifted to `0777` would still have to be caught, and a mask that
     /// only looked at one bit would miss `o+w`.
+    ///
+    /// ## Why this runs in a child process
+    ///
+    /// The property is "whatever the host's umask is", so the test has to *set*
+    /// one — and `umask` is process-global. Setting and restoring it inside a
+    /// libtest process is a race against every other test creating a file at
+    /// the same moment, and libtest is parallel by default. An earlier version
+    /// did exactly that; it is not made safe by `--test-threads=1`, because the
+    /// suite is not always run that way.
+    ///
+    /// So the widened umask is established **once, at the start of a fresh
+    /// process, before any filesystem activity**, and nothing restores it —
+    /// which is the only form of the manipulation that is not shared mutable
+    /// state. The parent asserts on the child's exit status.
+    #[cfg(unix)]
+    const PERMISSIVE_UMASK_VAR: &str = "ASTER_SCRATCH_PERMISSIVE_UMASK_CHILD";
+    /// Armed separately from [`PERMISSIVE_UMASK_VAR`], so the two boundaries
+    /// cannot be run in one process by accident — which is how the production
+    /// half was vacuous the first time.
+    #[cfg(unix)]
+    const PRODUCTION_UMASK_VAR: &str = "ASTER_SCRATCH_PRODUCTION_UMASK_CHILD";
+
+    /// **The two boundaries get a child each, and that is not tidiness.**
+    ///
+    /// The first version ran both in one child and the production half was
+    /// **vacuous**: the fixture half calls [`ScratchDir::new`] first, which
+    /// fires [`narrow_process_umask`], so by the time production created
+    /// anything the umask was already `0o077` and safe modes came from the
+    /// umask rather than from `restrict_permissions`. Deleting production's
+    /// permission handling entirely left the test green — fixture
+    /// normalisation masking exactly the thing the test claimed to prove.
+    ///
+    /// So the production child never constructs a `ScratchDir`. It builds its
+    /// root by hand and narrows only that one directory, because the store's
+    /// *parent* has to pass the production check for the open to get far enough
+    /// to create anything.
+    #[cfg(unix)]
+    fn spawn_umask_child(case: &str, marker: &str) {
+        let exe = std::env::current_exe().expect("the test binary knows its own path");
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                &format!("coordination::storage::scratch::tests::{case}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(marker, "1")
+            .output()
+            .unwrap_or_else(|e| panic!("spawn {case}: {e}"));
+
+        assert!(
+            output.status.success(),
+            "the {case} child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // The child exits successfully when it is *not* armed, too, so the run
+        // is only evidence if the case actually executed.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "the {case} child must have run the case, not skipped it:\n{stdout}"
+        );
+    }
+
+    /// Fixture boundary: a scratch directory is `0700` under a permissive
+    /// umask. Armed by the parent; a no-op otherwise.
     #[cfg(unix)]
     #[test]
-    fn a_scratch_directory_is_owner_only_whatever_the_hosts_umask_is() {
+    fn permissive_umask_fixture_child() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        // Force the process-wide narrowing to have already happened, so this
-        // test's own `umask(0)` below is not silently undone by it. Without
-        // this the test passes whether or not `make_owner_only` runs, but only
-        // when it happens to be the first in the binary to build a scratch
-        // directory — an ordering-dependent gate, which is no gate.
-        drop(ScratchDir::new("umask-independence-warmup"));
+        if std::env::var(PERMISSIVE_UMASK_VAR).is_err() {
+            return;
+        }
+        // First statement to touch the process, and nothing restores it.
+        unsafe { libc::umask(0) };
 
-        // Now widen, so the assertion is about this helper and not about
-        // whatever the host happens to run with. A test that only passed under
-        // a strict umask would be asserting the host again, which is the defect
-        // being fixed.
-        let previous = unsafe { libc::umask(0) };
-        let dir = ScratchDir::new("umask-independence");
+        let dir = ScratchDir::new("permissive-umask");
         let mode = std::fs::metadata(&*dir)
             .expect("the scratch directory exists")
             .permissions()
             .mode()
             & 0o777;
-        unsafe { libc::umask(previous) };
-
         assert_eq!(
             mode, 0o700,
             "a scratch directory must be owner-only regardless of umask; \
              production storage refuses anything writable beyond its owner, \
              so a broader one asserts the host rather than the code (got {mode:o})"
         );
+    }
+
+    /// Production boundary: the store directory and both databases carry the
+    /// modes **production** chose, under a permissive umask that is never
+    /// narrowed.
+    ///
+    /// Deliberately constructs no [`ScratchDir`] — one call would narrow the
+    /// umask and make this pass on the umask alone. The root is created and
+    /// chmod-ed here instead, because the store's parent must satisfy the
+    /// production permission check for the open to proceed at all.
+    #[cfg(unix)]
+    #[test]
+    fn permissive_umask_production_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if std::env::var(PRODUCTION_UMASK_VAR).is_err() {
+            return;
+        }
+        unsafe { libc::umask(0) };
+
+        let root = std::env::temp_dir().join(format!(
+            "aster-coordination-production-modes-{}",
+            std::process::id()
+        ));
+        let store_dir = root.join("store-0");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&store_dir).expect("the store root");
+        // These two by hand, and nothing below them. The store's own directory
+        // is created by the *fixture* in the ordinary path, so production never
+        // chooses its mode — asserting on it would be asserting on the fixture
+        // again, which is precisely the confusion that made the first version
+        // of this test vacuous. It has to be narrowed for the open to be
+        // allowed to proceed at all, and then everything asserted below is
+        // something production created for itself.
+        for path in [&root, &store_dir] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("narrow the root");
+        }
+
+        let fixture = crate::coordination::storage::fixture::SuiteFixture::new(&root, 0x5E);
+        let layout = crate::coordination::storage::schema::StorageLayout::new(&store_dir);
+        let store = crate::coordination::storage::VoterStorage::open(
+            crate::coordination::storage::schema::StorageLayout::new(&store_dir),
+            fixture.identity_for(0),
+            crate::coordination::storage::identity::OpenPolicy::production(),
+        )
+        .expect("production opens a fresh store");
+        drop(store);
+
+        // Every path here is created by production during that open: two redb
+        // files, two directories and the lock file. Under `umask(0)` an
+        // implementation that let the umask decide would leave `0777`/`0666`.
+        for (path, want) in [
+            (
+                layout.database(crate::coordination::storage::error::Db::Raft),
+                0o600u32,
+            ),
+            (
+                layout.database(crate::coordination::storage::error::Db::State),
+                0o600,
+            ),
+            (layout.snapshots(), 0o700),
+            (layout.incoming(), 0o700),
+            (layout.lock(), 0o600),
+        ] {
+            let got = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("{} is missing: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                got,
+                want,
+                "production must set its own mode on {} rather than inherit the \
+                 umask: wanted {want:o}, got {got:o}",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The fixture normalises what it creates**, under a permissive umask.
+    #[cfg(unix)]
+    #[test]
+    fn the_fixture_normalises_permissions_under_a_permissive_umask() {
+        spawn_umask_child("permissive_umask_fixture_child", PERMISSIVE_UMASK_VAR);
+    }
+
+    /// **Production sets its own modes**, under a permissive umask, with no
+    /// fixture normalisation anywhere in the child to do it for them.
+    #[cfg(unix)]
+    #[test]
+    fn production_sets_its_own_permissions_under_a_permissive_umask() {
+        spawn_umask_child("permissive_umask_production_child", PRODUCTION_UMASK_VAR);
     }
 
     /// The ordinary case: a directory with contents, gone when its guard is.

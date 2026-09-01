@@ -6517,8 +6517,18 @@ mod tests {
     /// They are also the only cells whose outcome is not fully expressed by the
     /// before/after comparison: `BoundPristine` carries an extra obligation,
     /// asserted separately, that a second import is refused.
+    ///
+    /// **The name deliberately does not carry the count.** It used to —
+    /// `the_matrix_is_the_thirty_three_cells_that_were_agreed`, then
+    /// `..._thirty_six_...` — and both CI jobs named it in full in their test
+    /// filters. So every change to the matrix renamed the test, the filters
+    /// stopped matching, and this gate quietly stopped running in CI: at
+    /// 33 → 36 it did exactly that and nobody noticed, because the other terms
+    /// in the filter still matched. The count is a property to assert *inside*
+    /// the test, where changing it is the point; it is not part of the identity
+    /// CI selects by. Do not put it back in the name.
     #[test]
-    fn the_matrix_is_the_thirty_six_cells_that_were_agreed() {
+    fn the_crash_matrix_inventory_is_complete() {
         let actual: Vec<String> = Operation::ALL
             .iter()
             .flat_map(|operation| {
