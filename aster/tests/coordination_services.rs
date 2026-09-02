@@ -25,6 +25,12 @@
 
 #![cfg(feature = "coordination")]
 
+// Addressed by path rather than through `common/mod.rs`: this target needs the
+// scratch helper and none of the rest of that harness, and compiling it whole
+// would drag in items this feature set does not build.
+#[path = "common/scratch.rs"]
+mod scratch;
+
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -288,7 +294,7 @@ async fn the_reserved_services_are_absent_unless_coordination_is_configured() {
 /// reservation trailer: only the real check order produces either.
 #[tokio::test]
 async fn configuring_coordination_registers_the_live_store_and_the_live_raft() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let server = AsterServer::builder()
         .config(pinned_cfg())
         .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
@@ -333,7 +339,7 @@ async fn configuring_coordination_registers_the_live_store_and_the_live_raft() {
 /// would confirm the existence of methods the contract does not declare.
 #[tokio::test]
 async fn a_method_outside_the_reserved_table_is_not_answered_by_the_reservation() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let server = AsterServer::builder()
         .config(pinned_cfg())
         .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
@@ -360,7 +366,7 @@ async fn a_method_outside_the_reserved_table_is_not_answered_by_the_reservation(
 
 #[tokio::test]
 async fn the_reserved_services_refuse_an_unauthenticatable_transport() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let server = AsterServer::builder()
         .config(pinned_cfg())
         .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
@@ -392,7 +398,7 @@ async fn the_reserved_services_refuse_an_unauthenticatable_transport() {
 /// *returns* -- the path a frame is measured against.
 #[tokio::test]
 async fn the_reserved_frame_caps_reach_the_production_resolver() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let server = AsterServer::builder()
         .config(pinned_cfg())
         .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
@@ -460,7 +466,7 @@ async fn an_unconfigured_node_installs_no_coordination_frame_caps() {
 
 #[tokio::test]
 async fn a_voter_without_a_persistent_identity_is_refused_at_start() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let msg = match AsterServer::builder()
         .config(cfg())
         .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
@@ -498,7 +504,7 @@ async fn an_ordinary_server_still_starts_without_a_persistent_identity() {
 
 #[tokio::test]
 async fn an_explicit_secret_key_satisfies_the_voter_identity_rule() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let server = AsterServer::builder()
         .config(pinned_cfg())
         .builtin_coordination(coordination_config(dir.path(), PINNED_SECRET))
@@ -515,7 +521,7 @@ async fn an_explicit_secret_key_satisfies_the_voter_identity_rule() {
 /// `is_none()` check that implements it.
 #[tokio::test]
 async fn an_identity_path_yields_the_same_voter_node_id_after_a_restart() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = scratch::storage_dir();
     let key_path = dir.path().join("node.secret");
     assert!(!key_path.exists(), "the file must not exist on first start");
 

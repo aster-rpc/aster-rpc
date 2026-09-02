@@ -17,6 +17,12 @@
 
 #![cfg(feature = "coordination")]
 
+// Addressed by path rather than through `common/mod.rs`: this target needs the
+// scratch helper and none of the rest of that harness, and compiling it whole
+// would drag in items this feature set does not build.
+#[path = "common/scratch.rs"]
+mod scratch;
+
 use std::sync::Arc;
 
 use aster::coordination::admission::{
@@ -142,7 +148,7 @@ fn node_id_of(secret: [u8; 32]) -> Vec<u8> {
 /// below proves it is load-bearing.
 #[tokio::test]
 async fn a_single_voter_development_group_forms_and_becomes_ready() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let secret = [0x11u8; 32];
     let node_id = node_id_of(secret);
 
@@ -209,7 +215,7 @@ async fn a_single_voter_development_group_forms_and_becomes_ready() {
 /// about.
 #[tokio::test]
 async fn a_one_voter_group_will_not_start_without_its_acknowledgement() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let secret = [0x12u8; 32];
     let node_id = node_id_of(secret);
     let ticket = aster_transport_core::ticket::AsterTicket {
@@ -265,7 +271,7 @@ async fn a_one_voter_group_will_not_start_without_its_acknowledgement() {
 /// signature, by the wrong signer.
 #[tokio::test]
 async fn a_genesis_from_another_authority_is_refused_at_start() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let secret = [0x13u8; 32];
     let node_id = node_id_of(secret);
     let ticket = aster_transport_core::ticket::AsterTicket {
@@ -340,7 +346,7 @@ async fn a_genesis_from_another_authority_is_refused_at_start() {
 /// speak to it — an unrecoverable state that looks like a healthy start.
 #[tokio::test]
 async fn a_node_outside_the_initial_voters_cannot_bootstrap() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let secret = [0x14u8; 32];
     // The genesis names somebody else entirely.
     let stranger = node_id_of([0xEEu8; 32]);
@@ -391,7 +397,7 @@ async fn a_node_outside_the_initial_voters_cannot_bootstrap() {
 /// because they are what the store is being checked against.
 #[tokio::test]
 async fn a_bootstrapped_group_reopens_through_existing() {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let secret = [0x15u8; 32];
     let node_id = node_id_of(secret);
     let ticket = aster_transport_core::ticket::AsterTicket {

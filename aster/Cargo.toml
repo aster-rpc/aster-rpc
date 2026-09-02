@@ -186,6 +186,13 @@ async-trait = "0.1"
 # would make every bootstrap test pass for the wrong reason. Same exact pin as
 # the optional dependency above, so this adds nothing to the graph.
 ed25519-dalek = { version = "=3.0.0-rc.0" }
+# `umask(2)`, for the storage scratch helper in `tests/common/scratch.rs`. The
+# integration targets are separate binaries and inherit none of the library's
+# `cfg(test)` umask narrowing, so a host (or a `docker exec` step) with a
+# permissive umask hands production a world-writable storage directory, which it
+# refuses. Dev-only: `scripts/check-coordination-deps.sh` resolves with
+# `-e normal`, so this adds no edge to any shipped feature graph.
+libc = { workspace = true }
 # Coordination ticket tests forge a non-canonical ticket -- a reserved header bit
 # set -- to prove apply refuses bytes no encoder produces. The same version core
 # encodes tickets with, so the test and the production encoder agree.
