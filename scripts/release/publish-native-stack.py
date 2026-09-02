@@ -103,6 +103,50 @@ def run(
     )
 
 
+def run_networked(args: list[str], *, cwd: Path | None = None) -> None:
+    """Run a git command that talks to a remote, retrying a transient refusal.
+
+    Anonymous git access to github.com is rate limited per source address, and
+    the refusal does not look like one: the ref advertisement returns 200 and
+    the request that follows it returns `401` with
+    `www-authenticate: Basic realm="GitHub"`. Git then tries to prompt for a
+    username, finds no terminal, and reports
+
+        fatal: could not read Username for 'https://github.com'
+
+    which reads like a missing credential for a private repository rather than
+    a throttle on a public one. Measured from the Forge host while diagnosing
+    this, roughly two attempts in three failed, against `n0-computer` and
+    `aster-rpc` repositories alike -- so it is the address being throttled, not
+    a repository being unreadable.
+
+    Retrying is the fix available here. The durable one is to authenticate
+    these fetches, which needs a GitHub token this workflow does not have; a
+    release that depends on an unauthenticated third party being unthrottled at
+    that moment is fragile whether or not it fails today.
+    """
+    # Sized against the observed failure rate rather than a guess: three
+    # successes in twelve attempts means four tries would still fail about a
+    # third of the time, which is not a fix. Six attempts spread over roughly
+    # eight minutes also outlast a throttle window, which matters more than the
+    # attempt count -- the limit is time-based, so waiting longer beats
+    # retrying harder.
+    delays = [10, 30, 60, 120, 300]
+    for attempt, delay in enumerate([*delays, None], start=1):
+        try:
+            run(args, cwd=cwd)
+            return
+        except subprocess.CalledProcessError:
+            if delay is None:
+                raise
+            print(
+                f"  network git failed (attempt {attempt}/{len(delays) + 1}); "
+                f"retrying in {delay}s",
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 def get_json(url: str) -> Any:
     request = Request(url, headers={"User-Agent": USER_AGENT})
     with urlopen(request, timeout=30) as response:
@@ -359,7 +403,9 @@ def clone_fork(
     manifest: dict[str, Any], source: str, destination: Path
 ) -> Path:
     fork = manifest["forks"][source]
-    run(["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout", fork["repo"], str(destination)])
+    run_networked(
+        ["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout", fork["repo"], str(destination)]
+    )
     run(["git", "checkout", "--quiet", "--detach", fork["commit"]], cwd=destination)
     revision = run(["git", "rev-parse", "HEAD"], cwd=destination, capture=True).stdout.strip()
     if revision != fork["commit"]:
