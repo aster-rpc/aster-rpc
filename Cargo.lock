@@ -3146,7 +3146,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.6.2"
-source = "git+https://github.com/aster-rpc/iroh-util.git?rev=afed9e6d07e41450fe1970e794782bab7df9c2f4#afed9e6d07e41450fe1970e794782bab7df9c2f4"
+source = "git+https://forge.emrul.dev/Aster/iroh-util.git?rev=afed9e6d07e41450fe1970e794782bab7df9c2f4#afed9e6d07e41450fe1970e794782bab7df9c2f4"
 dependencies = [
  "derive_more 2.1.1",
  "iroh",

@@ -72,13 +72,26 @@ registry_crates = ["iroh-docs"]
 crate_version = "0.101.5"
 
 [forks.iroh-util]
-# Promoted from a bridge for the connection-pool deadlock fix; the repo lives
-# on github.com/aster-rpc (forge org repo creation needs an admin token not
-# available to the release tooling — move by flipping this URL when it exists).
+# Promoted from a bridge for the connection-pool deadlock fix. Lived on
+# github.com/aster-rpc until the forge org repo existed; it now does, and this
+# is that flip.
+#
+# Moved because it was the last fork not on the forge, and the only one whose
+# fetch could be refused by someone else. GitHub rate limits anonymous git per
+# source address, and when the Forge host crossed that limit the release
+# stopped here -- reporting "could not read Username for 'https://github.com'",
+# which reads like a private repository rather than a throttled public one.
+# Every other fork was already on forge.emrul.dev and unaffected.
+#
+# The mirror is the same history, not a copy of it: same commit ids, same tags,
+# and `publish-native-stack.py` checks out `commit` below and fails unless
+# `git rev-parse HEAD` matches. A mirror serving different content cannot
+# satisfy that, so provenance rests on the hash rather than on the hostname.
+# github.com/aster-rpc/iroh-util remains as the upstream-facing copy.
 # 0.6.2 packages upstream's cpfix rewrite (n0-computer/iroh-util PR #5,
 # aef1db3) plus the portal-sync witness tests; it supersedes the published but
 # never-consumed 0.6.1 independent patch (tag preserved).
-repo = "https://github.com/aster-rpc/iroh-util.git"
+repo = "https://forge.emrul.dev/Aster/iroh-util.git"
 upstream_base = "cpfix @ aef1db3 (upstream PR #5, over iroh-util-v0.6.0)"
 tag = "aster-iroh-util-v0.6.2"
 commit = "afed9e6d07e41450fe1970e794782bab7df9c2f4"
@@ -208,7 +221,7 @@ netwatch    = { git = "https://github.com/n0-computer/net-tools",      rev = "05
 portmapper  = { git = "https://github.com/n0-computer/net-tools",      rev = "051ab8761006d7f2155e34a49f6bb881b582d5ab" }
 iroh-mdns-address-lookup = { git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
 iroh-tickets = { git = "https://github.com/n0-computer/iroh-tickets",  rev = "4899684e1209dea29ed28aa2314450927557b037" }
-iroh-util    = { git = "https://github.com/aster-rpc/iroh-util.git",   rev = "afed9e6d07e41450fe1970e794782bab7df9c2f4" }
+iroh-util    = { git = "https://forge.emrul.dev/Aster/iroh-util.git",  rev = "afed9e6d07e41450fe1970e794782bab7df9c2f4" }
 """
 
 # Salvo fork pin block ([patch.crates-io]) — the fork patches h3 / h3-quinn /
