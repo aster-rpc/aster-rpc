@@ -406,7 +406,18 @@ def clone_fork(
     run_networked(
         ["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout", fork["repo"], str(destination)]
     )
-    run(["git", "checkout", "--quiet", "--detach", fork["commit"]], cwd=destination)
+    # Networked for the same reason the clone is, which is easy to miss: the
+    # clone above is `--filter=blob:none --no-checkout`, so it brings down no
+    # file contents at all and the checkout is what fetches them, lazily, from
+    # the promisor remote. Throttled, it fails as
+    #
+    #   fatal: could not fetch <oid> from promisor remote
+    #
+    # Retrying the clone alone left this one bare and the release still stopped
+    # here, one command further on.
+    run_networked(
+        ["git", "checkout", "--quiet", "--detach", fork["commit"]], cwd=destination
+    )
     revision = run(["git", "rev-parse", "HEAD"], cwd=destination, capture=True).stdout.strip()
     if revision != fork["commit"]:
         raise RuntimeError(f"{source} checkout mismatch: {revision}")
