@@ -182,6 +182,13 @@ fn restore_owner_write(path: &Path) {
     }
     if meta.permissions().readonly() {
         let mut permissions = meta.permissions();
+        // The lint warns because on Unix this would make a file world-writable;
+        // this arm compiles only on Windows, where clearing the read-only
+        // attribute is precisely the operation, and Unix has its own arm above.
+        #[allow(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows-only arm: the attribute is the removability bit here"
+        )]
         permissions.set_readonly(false);
         let _ = std::fs::set_permissions(path, permissions);
     }
