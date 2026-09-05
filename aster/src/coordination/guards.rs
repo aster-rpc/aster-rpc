@@ -205,6 +205,34 @@ mod tests {
         );
     }
 
+    /// Every inventoried source is LF-terminated text.
+    ///
+    /// The guards in this module and in `storage` read their sources through
+    /// `include_str!` and cut each file at a literal `"\n#[cfg(test)]\n"`.
+    /// A checkout that converts to CRLF hides that marker, every test module
+    /// is scanned as production, and twenty-eight guards fail at once with
+    /// messages about duplicate constructors — which is what the first native
+    /// Windows run produced under Git for Windows' default
+    /// `core.autocrlf=true`. `.gitattributes` pins LF for every text file so a
+    /// fresh clone cannot reach that state; this is the one failure that
+    /// names the cause if a checkout predates the attribute.
+    #[test]
+    fn every_inventoried_source_is_checked_out_with_lf_line_endings() {
+        let crlf: Vec<&str> = SOURCES
+            .iter()
+            .filter(|(_, text)| text.contains('\r'))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            crlf.is_empty(),
+            "these sources were compiled with CRLF line endings, which hides the \
+             `#[cfg(test)]` markers every source guard cuts on: {crlf:?}. The \
+             repository's .gitattributes pins LF; renormalise the checkout \
+             (`git add --renormalize .` or a fresh clone) rather than editing the \
+             guards to tolerate it"
+        );
+    }
+
     /// Nothing follows a file's test module.
     ///
     /// `production_end` cuts at the last `#[cfg(test)] mod`, so production code

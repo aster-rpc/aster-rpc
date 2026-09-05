@@ -1,0 +1,11 @@
+# Every text file is checked out with LF line endings on every platform.
+#
+# The coordination subsystem's source guards read the crate's own source as
+# text and cut each file at literal `\n#[cfg(test)]\n` markers. A checkout
+# that converts to CRLF (Git for Windows defaults to `core.autocrlf=true`)
+# hides those markers, so test modules are scanned as production and
+# twenty-eight guards fail at once — measured on the first native Windows run
+# of the suite. The shell scripts under `scripts/` need LF as well.
+#
+# Git detects binary content itself; `text=auto` leaves it alone.
+* text=auto eol=lf

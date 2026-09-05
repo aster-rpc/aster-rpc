@@ -1475,7 +1475,14 @@ level = "debug"
 mask = false
 "#,
                 hex::encode(file_root),
-                dir.path().join("file-store").display(),
+                // A TOML basic string: on Windows the temp path carries
+                // backslashes, which TOML reads as escapes, so they are
+                // doubled rather than written raw.
+                dir.path()
+                    .join("file-store")
+                    .display()
+                    .to_string()
+                    .replace('\\', "\\\\"),
                 base64::engine::general_purpose::STANDARD.encode(file_secret)
             ),
         )

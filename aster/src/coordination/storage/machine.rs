@@ -1860,6 +1860,73 @@ mod tests {
             .expect("open the state machine")
     }
 
+    /// What can be observed about a live `state.redb` without its owner's
+    /// cooperation: which file it is, how big, when last written, and — where
+    /// the platform allows a read beside an open redb database — its bytes.
+    ///
+    /// The identity is the inode on Unix and the NTFS file reference number on
+    /// Windows, read through `GetFileInformationByHandle` on a handle opened
+    /// for attributes only, which a byte-range lock does not refuse.
+    #[derive(Debug, PartialEq, Eq)]
+    struct DatabaseFile {
+        identity: u64,
+        len: u64,
+        modified: std::time::SystemTime,
+        #[cfg(unix)]
+        bytes: Vec<u8>,
+    }
+
+    impl DatabaseFile {
+        fn observe(path: &std::path::Path) -> Self {
+            let meta = std::fs::metadata(path).expect("the database's metadata");
+            Self {
+                identity: Self::identity(path, &meta),
+                len: meta.len(),
+                modified: meta.modified().expect("a modification time"),
+                #[cfg(unix)]
+                bytes: std::fs::read(path).expect("the database's bytes"),
+            }
+        }
+
+        #[cfg(unix)]
+        fn identity(_path: &std::path::Path, meta: &std::fs::Metadata) -> u64 {
+            use std::os::unix::fs::MetadataExt as _;
+            meta.ino()
+        }
+
+        #[cfg(windows)]
+        fn identity(path: &std::path::Path, _meta: &std::fs::Metadata) -> u64 {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path)
+                .expect("open the database for its attributes");
+            // SAFETY: a zeroed `BY_HANDLE_FILE_INFORMATION` is a valid value
+            // of a plain C struct, and the handle is open for the duration of
+            // the call, which is all `GetFileInformationByHandle` requires.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+            assert!(
+                ok != 0,
+                "GetFileInformationByHandle: {}",
+                std::io::Error::last_os_error()
+            );
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        fn identity(_path: &std::path::Path, _meta: &std::fs::Metadata) -> u64 {
+            0
+        }
+    }
+
     /// Reopen the same directory, which is what proves a write was durable.
     fn reopen(dir: &std::path::Path) -> Store {
         let database = Database::create(dir.join("state.redb")).expect("reopen");
@@ -6954,6 +7021,19 @@ mod tests {
     /// what it must: the state database is compared byte for byte across it,
     /// because a rewrite would produce a different file holding the same state
     /// and every other assertion here would still pass.
+    ///
+    /// "Never rewritten" is observed through [`DatabaseFile`]: the file's
+    /// identity (inode, or the NTFS file reference number), length and
+    /// modification time, plus its bytes where the platform lets a live redb
+    /// database be read beside its owner. A `Replace` renames a candidate over
+    /// `state.redb`, which is a different file under the old name, so the
+    /// identity is what a rewrite cannot preserve; the bytes are the stronger
+    /// check where they can be taken. On Windows redb holds the open file
+    /// locked and a read beside it fails with `ERROR_LOCK_VIOLATION` — which
+    /// is what the first native Windows run of this test reported — and
+    /// closing the store around a read is not an option either, because
+    /// redb's own open and close rewrite its header, so equal bytes across a
+    /// reopen is not a property this test can claim on any platform.
     #[tokio::test]
     async fn the_same_snapshot_arriving_again_repairs_the_marker_only() {
         let source_dir = scratch_dir();
@@ -6967,7 +7047,7 @@ mod tests {
             .expect("the first install");
 
         let installed = durable_of(&machine).await;
-        let state_db = std::fs::read(dir.join("state.redb")).expect("the installed database");
+        let state_db = DatabaseFile::observe(&dir.join("state.redb"));
         let body = std::fs::read(body_path(&dir, &first.meta.snapshot_id)).expect("the body");
 
         // The leader resends: a fresh lease on the same published snapshot.
@@ -6992,7 +7072,7 @@ mod tests {
             "the state is unchanged"
         );
         assert_eq!(
-            std::fs::read(dir.join("state.redb")).expect("the database"),
+            DatabaseFile::observe(&dir.join("state.redb")),
             state_db,
             "and the database file itself was never rewritten"
         );
