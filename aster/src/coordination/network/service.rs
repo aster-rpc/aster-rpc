@@ -1,8 +1,8 @@
 //! The live `aster.coordination.Raft` v1 service (§5.3).
 //!
-//! Replaces the Slice 0 reservation once a runtime exists. Everything the
-//! reservation established — the name, the per-method frame caps, `iroh_only` —
-//! is preserved here rather than restated, by delegating to the same constants.
+//! The name, the per-method frame caps and `iroh_only` are the contract
+//! constants in [`coordination::service`](crate::coordination::service),
+//! consumed here rather than restated.
 //!
 //! ## Registered before the Raft exists, on purpose
 //!
@@ -48,9 +48,7 @@ use crate::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
 use crate::coordination::raft::{
     RaftMessageV1, RaftResponseEnvelopeV1, RaftSnapshotFrameV1, SnapshotResponseV1, VoteV1,
 };
-use crate::coordination::service::{
-    RAFT_METHODS, RAFT_SERVICE, RAFT_UNARY_FRAME_MAX, RAFT_VERSION, SNAPSHOT_CHUNK_FRAME_MAX,
-};
+use crate::coordination::service::{raft_frame_max, RAFT_METHODS, RAFT_SERVICE, RAFT_VERSION};
 use crate::coordination::storage::machine::StateHandle;
 use crate::coordination::storage::snapshot::PrepareInstallError;
 use crate::coordination::typeconfig::CoordinationTypeConfig;
@@ -225,10 +223,7 @@ impl ServiceDispatch for CoordinationRaftService {
     /// constants rather than restating the numbers is what keeps the live
     /// service from quietly widening a cap the reservation installed.
     fn max_frame_size(&self, method: &str) -> Option<u32> {
-        match method {
-            "vote" | "append_entries" => Some(RAFT_UNARY_FRAME_MAX),
-            _ => Some(SNAPSHOT_CHUNK_FRAME_MAX),
-        }
+        raft_frame_max(method)
     }
 
     async fn dispatch(&self, method: &str, call: Call) {
@@ -727,28 +722,25 @@ mod tests {
         );
     }
 
-    /// The live service preserves every property the reservation installed.
+    /// The live service carries every property the contract declares.
     ///
-    /// Asserted against the reservation itself rather than against literals: it
-    /// is the thing this type replaces, so any cap or flag that moved is
-    /// visible here. A live service that quietly widened `install_snapshot` to
-    /// the 8 MiB unary cap would otherwise be a four-times-larger allocation
-    /// nothing failed on.
+    /// Asserted against the declared constants and cap functions rather than
+    /// against literals, so any cap or flag that moved is visible here. A
+    /// live service that quietly widened `install_snapshot` to the 8 MiB
+    /// unary cap would otherwise be a four-times-larger allocation nothing
+    /// failed on.
     #[test]
-    fn the_live_service_keeps_the_reservations_caps_and_flags() {
-        use crate::coordination::service::ReservedRaft;
-
+    fn the_live_service_keeps_the_declared_caps_and_flags() {
         let live = CoordinationRaftService::new(RaftEndpoint::new());
-        assert_eq!(live.name(), ReservedRaft.name());
-        assert_eq!(live.version(), ReservedRaft.version());
-        assert_eq!(live.methods(), ReservedRaft.methods());
-        assert_eq!(live.iroh_only(), ReservedRaft.iroh_only());
-        assert!(live.iroh_only(), "and it is on");
+        assert_eq!(live.name(), RAFT_SERVICE);
+        assert_eq!(live.version(), RAFT_VERSION);
+        assert_eq!(live.methods(), RAFT_METHODS);
+        assert!(live.iroh_only(), "the Raft service is Iroh-only");
 
         for method in RAFT_METHODS.iter().chain(["no_such_method"].iter()) {
             assert_eq!(
                 live.max_frame_size(method),
-                ReservedRaft.max_frame_size(method),
+                raft_frame_max(method),
                 "{method}"
             );
         }

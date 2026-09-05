@@ -1,15 +1,16 @@
 # Aster coordination: a consumer walkthrough
 
-> **Draft — the coordination feature has not landed as a supported public
-> API.** The examples below describe the intended Rust consumption pattern and
-> use prospective API names from the coordination design. They are deliberately
-> marked `rust,ignore`: do not expect them to compile until this banner is
-> removed. Public wire declarations, durable result delivery, status cuts,
-> recovery import, and compatibility gates must still be completed and may
-> refine the exact spelling without changing the responsibilities described
-> here.
+> **Released.** Coordination ships in the `aster` crate from **0.3.337**
+> (tag `v0.3.337`, commit `9cfb0f59`), Rust-first, behind the opt-in
+> `coordination` and `coordination-client` features. Every block below
+> presented as Rust is compiled against the released API: the same text
+> lives in `aster/tests/coordination_guide.rs`, which fails if the guide
+> drifts. Blocks marked `pseudocode` or `text` are schematic on purpose.
+> Portal's roaming workspaces are the first consumer; its acceptance matrix
+> is recorded in the Portal repository's `docs/design/roaming-coordination.md`.
 
-**Status date:** 2026-08-24.
+**Status date:** 2026-09-05 (aster 0.3.337; native macOS, Linux and Windows
+evidence — see §15).
 
 Aster coordination gives an Aster application a small, durable place to decide
 facts for which there must be exactly one current answer:
@@ -23,7 +24,7 @@ It is not a general database. Large data remains in blobs, documents, or the
 application's own store. Coordination holds a compact pointer or generation and
 orders changes to it.
 
-The intended consumer experience is:
+The consumer experience is:
 
 1. enable coordination on a few persistent producer nodes;
 2. tell Aster which nodes are eligible and what placement constraints matter;
@@ -292,6 +293,29 @@ authenticated NodeId is a verified producer and preserves evidence from the
 application's enrollment or policy layer. Missing, unavailable, malformed, or
 consumer-only results deny consensus traffic.
 
+The released shape is a ROOT-signed admission set: the enrollment layer keeps
+the signed document, and `SignedAdmissionSet::verify` checks its signature and
+authority domain before a single lookup is answered from it.
+
+```rust
+use std::sync::Arc;
+
+use aster::coordination::admission::{SignedAdmissionSet, VerifiedAdmissionSource};
+
+/// The enrollment layer already holds a ROOT-signed admission set; Aster
+/// verifies its signature and authority domain before answering a single
+/// lookup from it.
+fn admission_source(
+    root_public_key: [u8; 32],
+    authority_domain: &str,
+    signed_admission_set: &[u8],
+) -> Result<Arc<dyn VerifiedAdmissionSource>, Box<dyn std::error::Error>> {
+    let verified =
+        SignedAdmissionSet::verify(&root_public_key, authority_domain, signed_admission_set)?;
+    Ok(Arc::new(verified))
+}
+```
+
 Producer admission is necessary but deliberately insufficient:
 
 - it does not grant resource rights;
@@ -331,31 +355,48 @@ identity and storage directory. Before starting, each of the three must also
 resolve the other two as verified producers through the application's admission
 source:
 
-```rust,ignore
-// Contract preview: exact constructors may change before release.
-let aster_config = AsterConfig::from_env()?;
+```rust
+use std::sync::Arc;
 
-let coordination = CoordinationConfig::builder()
-    .storage_dir("/var/lib/my-app/coordination")
-    .authority_domain("example.my-app.production")
-    .start_mode(CoordinationStart::Bootstrap {
-        signed_genesis: signed_genesis.clone(),
-        recovery_export_path: None,
-    })
-    .verified_admission(admission_source.clone())
-    .build()?;
+use aster::AsterConfig;
+use aster::coordination::admission::VerifiedAdmissionSource;
+use aster::coordination::host::{CoordinationConfig, CoordinationStart};
+use aster::rpc::AsterServer;
 
-let server = AsterServer::builder()
-    // Coordination consumes the ROOT public key resolved by ordinary Aster
-    // trust configuration. There is no second coordination authority key.
-    .config(aster_config)
-    .identity("/var/lib/my-app/node.secret")
-    .builtin_coordination(coordination)
-    .start()
-    .await?;
+async fn start_initial_voter(
+    signed_genesis: Vec<u8>,
+    admission_source: Arc<dyn VerifiedAdmissionSource>,
+) -> aster::Result<AsterServer> {
+    // ASTER_ROOT_PUBKEY / ASTER_ROOT_PUBKEY_FILE name the deployment ROOT.
+    // Coordination consumes that key; it has no second authority key to
+    // configure.
+    let aster_config = AsterConfig::from_env()?;
 
-// start() may return while the nodes are still finding one another.
-server.coordination().unwrap().wait_ready().await?;
+    let coordination = CoordinationConfig::builder()
+        .storage_dir("/var/lib/my-app/coordination")
+        .authority_domain("example.my-app.production")
+        .start_mode(CoordinationStart::Bootstrap {
+            signed_genesis,
+            recovery_export_path: None,
+        })
+        .verified_admission(admission_source)
+        .build()?;
+
+    let server = AsterServer::builder()
+        .config(aster_config)
+        .identity("/var/lib/my-app/node.secret")
+        .builtin_coordination(coordination)
+        .start()
+        .await?;
+
+    // start() returns once storage is open and the runtime is spawned;
+    // the voters may still be finding one another.
+    let coordination = server
+        .coordination()
+        .expect("a server built with builtin_coordination hosts it");
+    coordination.wait_ready().await?;
+    Ok(server)
+}
 ```
 
 `start()` validates static configuration and opens bound storage before it
@@ -399,11 +440,34 @@ at startup instead of becoming a split brain later.
 A mutating client binds its local Aster identity to one group and owns a durable
 sequence journal:
 
-```rust,ignore
-let client = CoordinationClient::builder(node.clone(), group_id)
-    .seed_tickets(initial_member_tickets)
-    .journal_dir(app_state.join("coordination-client"))
-    .build()?;
+```rust
+use std::path::Path;
+
+use aster::Node;
+use aster::coordination::client::{CoordinationClient, CoordinationReadClient};
+use aster::coordination::ids::CoordinationGroupId;
+
+fn open_durable_client(
+    node: Node,
+    group_id: CoordinationGroupId,
+    initial_member_tickets: Vec<String>,
+    app_state: &Path,
+) -> aster::Result<CoordinationClient> {
+    CoordinationClient::builder(node, group_id)
+        .seed_tickets(initial_member_tickets)
+        .journal_dir(app_state.join("coordination-client"))
+        .build()
+}
+
+fn open_read_only_client(
+    node: Node,
+    group_id: CoordinationGroupId,
+    initial_member_tickets: Vec<String>,
+) -> aster::Result<CoordinationReadClient> {
+    CoordinationClient::builder(node, group_id)
+        .seed_tickets(initial_member_tickets)
+        .build_read_only()
+}
 ```
 
 Persist the client's Aster identity and journal together. The journal is bound
@@ -427,13 +491,9 @@ effect idempotent even when the command committed but the reply was lost.
 > exactly-once application-side processing additionally requires the
 > application to make its durable handling and its acknowledgement atomic.
 
-A caller that only needs authoritative reads can omit the journal:
-
-```rust,ignore
-let reads = CoordinationClient::builder(node.clone(), group_id)
-    .seed_tickets(initial_member_tickets)
-    .build_read_only()?;
-```
+A caller that only needs authoritative reads can omit the journal —
+`open_read_only_client` above — and gets linearizable reads and status
+without a mutation or lease constructor.
 
 The client can dial any known member. Followers return an authenticated leader
 hint; the client reconnects directly so the leader authenticates the real
@@ -457,27 +517,51 @@ namespace = "my-app.active-head"
 key       = raw canonical workload or document id bytes
 ```
 
-It then grants only the rights the subject needs:
+It then grants only the rights the subject needs. Rights are a bit set of
+the `RIGHT_*` constants; the target is a NodeId; the ACL revision is the
+compare-and-set guard for the grant itself:
 
-```rust,ignore
-// Illustrative API shape. ACL writes are revision-checked mutations.
-admin_client
-    .set_grant(
-        resource.clone(),
-        worker_node_id,
-        Rights::READ
-            | Rights::ACQUIRE
-            | Rights::RENEW
-            | Rights::MUTATE
-            | Rights::RELEASE,
-        expected_acl_revision,
-    )
-    .await?;
+```rust
+use aster::coordination::client::CoordinationClient;
+use aster::coordination::contract::ResourceKeyV1;
+use aster::coordination::model::limits::{
+    RIGHT_ACQUIRE, RIGHT_MUTATE, RIGHT_READ, RIGHT_RELEASE, RIGHT_RENEW,
+};
+
+fn active_head_resource(workload_id: &[u8]) -> ResourceKeyV1 {
+    ResourceKeyV1 {
+        namespace: "my-app.active-head".to_string(),
+        key: workload_id.to_vec(),
+    }
+}
+
+async fn grant_worker(
+    admin_client: &CoordinationClient,
+    resource: ResourceKeyV1,
+    worker_node_id: [u8; 32],
+    expected_acl_revision: u64,
+) -> aster::Result<u64> {
+    let resolved = admin_client
+        .set_grant(
+            resource,
+            worker_node_id,
+            RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW | RIGHT_MUTATE | RIGHT_RELEASE,
+            expected_acl_revision,
+        )
+        .await?;
+    let acl_revision = resolved.reply().acl_revision;
+    // The result was fsynced `ResolvedAwaitingAck` before it was returned.
+    // Acknowledge once the application has durably handled it; until then
+    // the journal permits no new sequence.
+    resolved.acknowledge().await?;
+    Ok(acl_revision)
+}
 ```
 
-Rights are exact: `READ`, `ACQUIRE`, `RENEW`, `MUTATE`, `RELEASE`, and `REVOKE`.
-There are no namespace prefixes, wildcards, inherited grants, or implicit
-producer/voter permissions in v1.
+Rights are exact: `RIGHT_READ`, `RIGHT_ACQUIRE`, `RIGHT_RENEW`,
+`RIGHT_MUTATE`, `RIGHT_RELEASE`, and `RIGHT_REVOKE`. There are no namespace
+prefixes, wildcards, inherited grants, or implicit producer/voter permissions
+in v1.
 
 The service checks access before proposing obvious denials, then the replicated
 state machine checks it again in committed order. If an ACL changes during a
@@ -492,39 +576,63 @@ Aster's replicated enforcement.
 The stable abstraction is a fenced register: one current holder, a monotonic
 epoch, a value revision, and a small opaque value.
 
-The intended convenience API reuses Aster's existing holder/renewal engine:
+The convenience API reuses Aster's existing holder/renewal engine
+(`aster::lease::LeaseOptions` sets the TTL, renew cadence and holder
+margin). The lease presents its own current fence with each mutation, so the
+application never copies a fence across an `await`:
 
-```rust,ignore
-let lease = match CoordinationLease::acquire(
-    client.clone(),
-    resource.clone(),
-    LeaseOptions::default(),
-)
-.await?
-{
-    AcquireOutcome::Granted(lease) => lease,
-    AcquireOutcome::Denied(reason, current) => {
-        return handle_contention(reason, current).await;
-    }
-};
+```rust
+use aster::coordination::client::CoordinationClient;
+use aster::coordination::client::lease::{CoordinationLease, LeaseAcquireOutcome};
+use aster::coordination::contract::ResourceKeyV1;
+use aster::lease::LeaseOptions;
 
-// Fetch the current fence immediately before protected work.
-let fence = lease.fence().ok_or(Error::LeaseLost)?;
-let current = client.read_linearizable(resource.clone()).await?;
-
-let next_head = encode_active_head(manifest_hash, format_version)?;
-let updated = client
-    .compare_and_set(
-        fence,
-        current.value_revision,
-        next_head,
+async fn advance_head_then_hand_off(
+    client: CoordinationClient,
+    resource: ResourceKeyV1,
+    next_head: Vec<u8>,
+    final_head: Vec<u8>,
+) -> aster::Result<()> {
+    let lease = match CoordinationLease::acquire(
+        client.clone(),
+        resource.clone(),
+        LeaseOptions::default(),
     )
-    .await?;
+    .await?
+    {
+        LeaseAcquireOutcome::Granted(lease) => lease,
+        LeaseAcquireOutcome::Denied(reason, _current) => {
+            return Err(aster::Error::InvalidArgument(format!(
+                "the register is held elsewhere: {reason:?}"
+            )));
+        }
+    };
 
-// A graceful handoff can commit the final value and release atomically.
-lease
-    .release_with_value(updated.value_revision, final_head)
-    .await?;
+    // Ask for the fence immediately before protected work; `None` means
+    // the self-limit has passed and this process must stop.
+    if lease.fence().is_none() {
+        return Err(aster::Error::InvalidArgument("the lease was lost".into()));
+    }
+    let current = client.reads().read_linearizable(resource.clone()).await?;
+
+    // The lease presents its current fence with the mutation; the group
+    // checks epoch, holder, held, and expected value revision together.
+    let updated = lease
+        .compare_and_set(current.snapshot.value_revision, next_head)
+        .await?;
+    let committed_revision = updated
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.value_revision)
+        .unwrap_or(current.snapshot.value_revision);
+
+    // A graceful handoff commits the final value and releases atomically:
+    // both, or neither.
+    lease
+        .release_with_value(committed_revision, final_head)
+        .await?;
+    Ok(())
+}
 ```
 
 The value belongs to the application and must be explicitly versioned. It is
@@ -542,8 +650,9 @@ the lease is still held
 the expected value revision is current
 ```
 
-Do not cache a fence across awaits. Ask the lease for it immediately before
-each protected action, and stop when `fence()` returns `None`.
+Do not cache a fence across awaits. The lease's own `compare_and_set` and
+`release_with_value` fetch it at the moment of the call; ask `fence()` before
+work the register does not serialize, and stop when it returns `None`.
 
 If the coordinated register itself is the protected resource, Aster performs
 the fence check and value update in one replicated transaction. If the fence
@@ -574,39 +683,84 @@ view, not coordination permission. A new candidate must be both present in that
 snapshot and named in the application's exact eligible-host map; producer
 admission alone never makes it selectable.
 
-The application policy for the ten-node example might look like this:
+The application policy for the ten-node example, and one reconciliation of
+the optional manager:
 
-```rust,ignore
-let policy = PlacementPolicy {
-    revision: policy_revision,
-    digest: verified_policy_digest,
-    target_voters: 3,
-    target_retained_learners: 0,
-    eligible: eligible_hosts_a_through_j,
-    pinned_voters: Default::default(),
-    excluded: maintenance_exclusions,
-    // With three voters there are three pairs. This test policy requires
-    // positive separation evidence for all three; it is not a geography claim.
-    minimum_separated_voter_pairs: 3,
-    replacement_grace: Duration::from_secs(300),
-    allow_healthy_rebalance: false,
+```rust
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+use aster::coordination::client::CoordinationClient;
+use aster::coordination::client::manager::{
+    CoordinationPlacementManager, PlacementPolicySource, PlacementProvisioner,
 };
+use aster::coordination::client::placement::{
+    PlacementCandidate, PlacementPolicy, PlacementReport,
+};
+use aster::coordination::ids::CoordinationNodeId;
+use aster::rpc::AsterServer;
+
+fn ten_node_policy(
+    policy_revision: u64,
+    verified_policy_digest: [u8; 32],
+    root_public_key: [u8; 32],
+    eligible_hosts_a_through_j: &[CoordinationNodeId],
+    maintenance_exclusions: BTreeSet<CoordinationNodeId>,
+) -> PlacementPolicy {
+    PlacementPolicy {
+        revision: policy_revision,
+        digest: verified_policy_digest,
+        authority_public_key: root_public_key,
+        authority_domain: "example.my-app.production".to_string(),
+        target_voters: 3,
+        target_retained_learners: 0,
+        eligible: eligible_hosts_a_through_j
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    PlacementCandidate {
+                        node_id: *id,
+                        member_seed: None,
+                    },
+                )
+            })
+            .collect(),
+        pinned_voters: BTreeSet::new(),
+        excluded: maintenance_exclusions,
+        // Three voters make three pairs. This policy requires positive
+        // separation evidence for all three; it is not a geography claim.
+        minimum_separated_voter_pairs: 3,
+        replacement_grace: Duration::from_secs(300),
+        allow_healthy_rebalance: false,
+    }
+}
+
+async fn reconcile_placement<P, V>(
+    admin_client: CoordinationClient,
+    server: &AsterServer,
+    policy_source: P,
+    provisioner: V,
+) -> aster::Result<PlacementReport>
+where
+    P: PlacementPolicySource,
+    V: PlacementProvisioner,
+{
+    // The server's topology handle must have joined the producer-only
+    // shared namespace; that gives the manager a view, not a permission.
+    let mut manager = CoordinationPlacementManager::new(
+        admin_client,
+        server.topology(),
+        policy_source,
+        provisioner,
+    );
+    manager.reconcile().await
+}
 ```
 
 The placement manager is an optional application control-plane task. Run one
 active instance, or tolerate several racing instances: the membership revision
 and one-active-intent rule make only one plan authoritative.
-
-```rust,ignore
-let mut manager = CoordinationPlacementManager::new(
-    admin_client.clone(),
-    node.topology(),
-)?;
-
-let report = manager
-    .reconcile_once(policy, &candidate_provisioner)
-    .await?;
-```
 
 One reconciliation:
 
@@ -639,9 +793,10 @@ Topology provides evidence, not geography:
   availability zone; and
 - topology bridge rank is never voter rank.
 
-The manager reports `Stable`, `Degraded`, `Converging`, `NeedsProvisioning`,
-`InsufficientEvidence`, `InvalidPolicy`, or an exact `Plan`. It never edits a
-database or membership locally.
+The manager's `PlacementReport` carries the policy revision and digest it
+observed, the current and selected voters and learners, the members past
+their replacement grace, the separation summary, any pending operation, and
+a `reason`. It never edits a database or membership locally.
 
 **Benefit:** Aster turns current topology and application policy into a safe
 membership request, while the application retains control over trust, machines,
@@ -683,6 +838,71 @@ committed log work the state machine had not applied before the process stopped.
 
 Never point `Bootstrap` at initialized storage, initialize a missing half of a
 durable store, or infer expected identity from the database being checked.
+
+```rust
+use std::path::Path;
+use std::sync::Arc;
+
+use aster::coordination::admission::VerifiedAdmissionSource;
+use aster::coordination::client::CoordinationClient;
+use aster::coordination::host::{CoordinationConfig, CoordinationStart};
+use aster::coordination::ids::CoordinationGroupId;
+
+fn restart_existing_voter(
+    signed_genesis: Vec<u8>,
+    expected_group_id: CoordinationGroupId,
+    expected_genesis_hash: [u8; 32],
+    expected_deployment_profile_code: i32,
+    admission_source: Arc<dyn VerifiedAdmissionSource>,
+) -> aster::Result<CoordinationConfig> {
+    CoordinationConfig::builder()
+        .storage_dir("/var/lib/my-app/coordination")
+        .authority_domain("example.my-app.production")
+        // Independently expected identity: never inferred from the
+        // database being checked.
+        .start_mode(CoordinationStart::Existing {
+            signed_genesis,
+            expected_group_id,
+            expected_genesis_hash,
+            expected_deployment_profile_code,
+        })
+        .verified_admission(admission_source)
+        .build()
+}
+
+/// While the source group still has quorum: one linearizable, canonical
+/// recovery point, streamed to a file outside the live voter set.
+async fn take_recovery_point(
+    admin_client: &CoordinationClient,
+    outside_the_voters: &Path,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let file = std::fs::File::create(outside_the_voters)?;
+    let (manifest, file) = admin_client.reads().recovery_export_to(file).await?;
+    file.sync_all()?;
+    let mut export_hash = [0u8; 32];
+    export_hash.copy_from_slice(&manifest.blake3_checksum);
+    Ok(export_hash)
+}
+
+/// After an unrecoverable quorum loss: a **new** group whose signed
+/// genesis binds the export's hash. The group id changes, so every old
+/// fence fails against it.
+fn bootstrap_recovered_group(
+    signed_recovery_genesis: Vec<u8>,
+    saved_export: &Path,
+    admission_source: Arc<dyn VerifiedAdmissionSource>,
+) -> aster::Result<CoordinationConfig> {
+    CoordinationConfig::builder()
+        .storage_dir("/var/lib/my-app/coordination-recovered")
+        .authority_domain("example.my-app.production")
+        .start_mode(CoordinationStart::Bootstrap {
+            signed_genesis: signed_recovery_genesis,
+            recovery_export_path: Some(saved_export.to_path_buf()),
+        })
+        .verified_admission(admission_source)
+        .build()
+}
+```
 
 ### Add or replace a member
 
@@ -752,6 +972,9 @@ its own deadline. That is correct behaviour, not a hang, but a dashboard polling
 scrape timeouts accordingly.
 
 Do not improvise this procedure from snapshots or by copying voter directories.
+`take_recovery_point` and `bootstrap_recovered_group` above are the two ends
+of it; the signed recovery genesis in between is minted by the deployment
+ROOT tooling against the export's hash.
 
 **Benefit:** routine lifecycle operations converge through committed state, and
 catastrophic recovery cannot accidentally resurrect authority from the old
@@ -798,6 +1021,23 @@ that took time to elect and catch this node up, and an operator watching a
 restart cannot tell them apart by subtraction. Both are `None` until measured, so
 a start that never reached `Ready` says so rather than reporting zero.
 
+```rust
+use aster::coordination::Coordination;
+
+fn report_startup(coordination: &Coordination) {
+    let timings = coordination.startup_timings();
+    // Both are `None` until measured: a start that never reached Ready
+    // says so rather than reporting zero.
+    match (timings.storage_open_micros, timings.start_to_ready_micros) {
+        (Some(open), Some(ready)) => {
+            println!("storage open {open} µs, start to Ready {ready} µs");
+        }
+        (Some(open), None) => println!("storage open {open} µs; not Ready yet"),
+        _ => println!("still opening storage"),
+    }
+}
+```
+
 Alert thresholds — which signal, what budget fixes the number, and where warn and
 page sit — are the S5-E budget table in the coordination contract matrix. Two
 rules are worth repeating here: **stale-fence and revision refusals are never an
@@ -830,38 +1070,40 @@ membership controller beside Aster.
 
 ## 15. Production checklist
 
-Before removing the draft banner, the released feature and a consuming
-application should demonstrate this end to end:
+Each item the draft of this guide asked for before the feature could be
+called released, and where the released feature and its first consumer
+demonstrate it. Aster rows name the test target or the evidence-ledger row in
+`docs/_internal/working_ideas/aster-coordination-implementation-plan.md`
+§19; Portal rows name the scenario in Portal's
+`docs/design/slice6-acceptance-inventory.md`.
 
-- [ ] Three initial voters start from one signed genesis under persistent,
-  distinct identities and storage directories.
-- [ ] A non-voter client obtains only the exact rights granted to it.
-- [ ] A fenced register rejects a stale holder after takeover.
-- [ ] A committed result survives a lost response and a client-process restart
-  through the finalized delivery/acknowledgement API.
-- [ ] One voter can stop while the remaining two continue.
-- [ ] In a ten-producer topology, policy maintains exactly three voters and
-  provisions at most one automatic replacement per plan.
-- [ ] Unknown topology evidence is reported rather than promoted to physical
-  separation.
-- [ ] Losing two voters stops writes; no minority-force path exists.
-- [ ] Restart, snapshot catch-up, membership leader loss, and process death at
-  durability boundaries preserve complete-old-or-complete-new state.
-- [ ] A recovery export can create only a signed new group, and old fences fail
-  against it.
-- [ ] The supported rolling-upgrade matrix and native Linux, macOS, and Windows
-  fault evidence are green.
-- [ ] The consumer can reconstruct every committed content pointer from its own
-  durable content replicas.
+| Demonstrated | Where |
+| --- | --- |
+| Three initial voters start from one signed genesis under persistent, distinct identities and storage directories | `coordination_bootstrap.rs`, `coordination_cluster.rs`; Portal `coordination_bootstrap.rs` (four daemons, three voters) |
+| A non-voter client obtains only the exact rights granted to it | `coordination_client.rs`, `coordination_services.rs`; Portal `verifier_boundary.rs` (ROOT, admitted and ungranted, earns no receipt) |
+| A fenced register rejects a stale holder after takeover | `coordination_history.rs`; Portal `roaming_forced_takeover.rs`, `stale_holder.rs` |
+| A committed result survives a lost response and a client-process restart through the delivery/acknowledgement API | client journal tests (`a_kill_at_every_boundary_reopens_into_a_continuable_state`); Portal `response_loss.rs` |
+| One voter can stop while the remaining two continue | `coordination_process_loss.rs` (real SIGKILL / `TerminateProcess`); Portal `production_shape.rs` |
+| In a ten-producer topology, policy maintains exactly three voters and provisions at most one automatic replacement per plan | `coordination_corridor10.rs` (ledger `S5-F-CORRIDOR`); Portal `production_shape.rs`, `voter_replacement.rs` |
+| Unknown topology evidence is reported rather than promoted to physical separation | `coordination_placement.rs`, `coordination_topology10.rs` |
+| Losing two voters stops writes; no minority-force path exists | `coordination_corridor10.rs`; Portal `quorum_loss.rs`, `production_shape.rs` |
+| Restart, snapshot catch-up, membership leader loss, and process death at durability boundaries preserve complete-old-or-complete-new state | the thirty-six-cell crash matrix (`the_crash_matrix_inventory_is_complete`, `every_boundary_recovers_to_a_state_the_protocol_permits`), `coordination_catchup.rs`, `coordination_membership.rs` |
+| A recovery export can create only a signed new group, and old fences fail against it | `coordination_recovery.rs`, `coordination_runbook.rs`; Portal `new_group_recovery.rs` |
+| The supported rolling-upgrade matrix and native Linux, macOS, and Windows fault evidence are green | `coordination_rolling.rs` (ledger `S5-C`); native execution: macOS (Forgejo `coordination-fault-macos`), Linux (Forgejo `test`, main run 87 / tag run 88 for `v0.3.337`), Windows (MAV-WIN-001, ledger `S2-FAULT-WINDOWS-NATIVE`) |
+| The consumer can reconstruct every committed content pointer from its own durable content replicas | Portal `roaming_durability.rs` (kill-holder oracle), `roaming_forced_takeover.rs`, `incomplete_closure.rs` |
+
+Recurring Windows CI is not installed: the Windows row above is a native
+manual run on a dedicated host, recorded with its toolchain, filesystem and
+counts, and the platform matrix says so rather than implying a job.
 
 The reference acceptance deployment is ten producers with exactly three
 voters. Ten is a test corridor, not a maximum network size. Three is a deliberate
 availability/latency tradeoff: it tolerates one unavailable voter without
 making every producer participate in consensus.
 
-## 16. What the consumer should ultimately feel
+## 16. What the consumer should feel
 
-Once the feature lands, application code should mostly answer five questions:
+Application code mostly answers five questions:
 
 1. What compact fact needs one authoritative answer?
 2. Which identities may operate on it?
@@ -873,6 +1115,6 @@ Everything below that line—election, log replication, durable apply, snapshots
 ambiguous retries, learner catch-up, joint consensus, and restart recovery—is
 Aster's problem.
 
-That is the consumption promise: not “consensus has no operational cost,” but
-“every Aster consumer does not have to assemble and maintain its own consensus
-system.”
+That is the consumption promise, kept in 0.3.337: not “consensus has no
+operational cost,” but “every Aster consumer does not have to assemble and
+maintain its own consensus system.”

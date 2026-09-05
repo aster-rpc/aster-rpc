@@ -1486,20 +1486,6 @@ impl RaftSnapshotBuilder<CoordinationTypeConfig> for CoordinationSnapshotBuilder
     }
 }
 
-/// Install lands in Checkpoint D's second half, and refusing is the honest
-/// placeholder.
-///
-/// Not `unimplemented!()`: a panic inside a library is not a failure a runtime
-/// can report, so a caller that has got ahead of the plan should get an error
-/// saying so rather than take the process down.
-fn not_yet_implemented(what: &'static str) -> RaftStorageError<CoordinationNodeId> {
-    io_state(StorageError::corrupt(
-        Db::State,
-        "snapshot",
-        format!("{what} is not implemented yet"),
-    ))
-}
-
 impl RaftStateMachine<CoordinationTypeConfig> for CoordinationStateMachine {
     type SnapshotBuilder = CoordinationSnapshotBuilder;
 

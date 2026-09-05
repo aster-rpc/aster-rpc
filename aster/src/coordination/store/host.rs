@@ -59,7 +59,7 @@ use crate::coordination::model::retire::{self, RetireCommand};
 use crate::coordination::model::state::LogId;
 use crate::coordination::reason::{Outcome, Reason, RefusalReason};
 use crate::coordination::runtime::readiness::Readiness;
-use crate::coordination::service::{STORE_FRAME_MAX, STORE_METHODS, STORE_SERVICE, STORE_VERSION};
+use crate::coordination::service::{store_frame_max, STORE_METHODS, STORE_SERVICE, STORE_VERSION};
 use crate::coordination::storage::machine::{PreflightAnswer, StateHandle};
 use crate::coordination::storage::reads::{BarrierFit, GuardedRead};
 use crate::coordination::storage::serve;
@@ -486,8 +486,8 @@ impl ServiceDispatch for CoordinationStoreService {
 
     /// §12.3: 2 MiB for every method, including one not in the table, for the
     /// same reason the reservation gives.
-    fn max_frame_size(&self, _method: &str) -> Option<u32> {
-        Some(STORE_FRAME_MAX)
+    fn max_frame_size(&self, method: &str) -> Option<u32> {
+        store_frame_max(method)
     }
 
     async fn dispatch(&self, method: &str, call: Call) {
