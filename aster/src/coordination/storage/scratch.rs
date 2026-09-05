@@ -159,9 +159,45 @@ fn restore_owner_write(path: &Path) {
     }
 }
 
-/// Nothing to do: Windows removability is not a permission bit in this sense,
-/// and `remove_dir_all` handles the read-only attribute itself.
-#[cfg(not(unix))]
+/// The Windows half of the same pass: clear the read-only attribute over the
+/// whole tree.
+///
+/// Windows removability is not a mode bit, but it is not nothing either: a
+/// file carrying `FILE_ATTRIBUTE_READONLY` fails `DeleteFile` with
+/// `ERROR_ACCESS_DENIED`, and `remove_dir_all` stops at it. The previous
+/// version of this function claimed the standard library cleared the
+/// attribute itself and did nothing; the first native Windows run of this
+/// module is what turned that claim into a test (`a_read_only_scratch_file_is_still_removed`),
+/// and this pass is what makes the test hold rather than the claim.
+///
+/// Symlinks and junctions are skipped, as on Unix: the pass touches nothing
+/// outside its own tree.
+#[cfg(windows)]
+fn restore_owner_write(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    if meta.permissions().readonly() {
+        let mut permissions = meta.permissions();
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+    if meta.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            restore_owner_write(&entry.path());
+        }
+    }
+}
+
+/// Nothing to do on a platform that is neither: there is no removability
+/// attribute this helper knows how to restore.
+#[cfg(not(any(unix, windows)))]
 fn restore_owner_write(_path: &Path) {}
 
 /// Narrow a freshly created scratch directory to `0700`.
@@ -451,6 +487,11 @@ mod tests {
     /// writable, and the directory it lives in is not, so it cannot be
     /// unlinked. Without the permission pass this assertion fails and the
     /// directory is still on disk afterwards.
+    ///
+    /// Unix only: the failure it reproduces is a mode bit on the *directory*.
+    /// The Windows analogue is the read-only attribute on a *file*, covered by
+    /// `a_read_only_scratch_file_is_still_removed` below.
+    #[cfg(unix)]
     #[test]
     fn a_read_only_scratch_directory_is_still_removed() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -471,6 +512,33 @@ mod tests {
             !path.exists(),
             "{} survived its guard; the permission pass did not run or did not \
              reach far enough",
+            path.display()
+        );
+    }
+
+    /// The Windows case that the previous comment claimed could not happen.
+    ///
+    /// A file carrying the read-only attribute refuses `DeleteFile`, and
+    /// `remove_dir_all` fails at it. This is the discriminating control for
+    /// the Windows permission pass: with the pass replaced by the old no-op the
+    /// directory survives its guard, and the first native Windows run is
+    /// where that was measured rather than assumed.
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_scratch_file_is_still_removed() {
+        let path = {
+            let dir = ScratchDir::new("guard-read-only-attribute");
+            std::fs::create_dir_all(dir.join("inner")).expect("inner");
+            let file = dir.join("inner/file");
+            std::fs::write(&file, b"contents").expect("write");
+            let mut permissions = std::fs::metadata(&file).expect("metadata").permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&file, permissions).expect("set read-only");
+            dir.to_path_buf()
+        };
+        assert!(
+            !path.exists(),
+            "{} survived its guard; the read-only attribute was not cleared before removal",
             path.display()
         );
     }

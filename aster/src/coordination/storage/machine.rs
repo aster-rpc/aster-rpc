@@ -7906,6 +7906,10 @@ mod tests {
         let verified = super::super::snapshot::rebuild_candidate(&StorageLayout::new(&dir), staged)
             .expect("the candidate rebuilds and opens as production would");
         let rebuilt = candidate_in(&dir).expect("the candidate is under incoming/");
+        assert!(
+            rebuilt.is_file(),
+            "the verified candidate is a file under incoming/ on every platform"
+        );
         assert_seven_sections(verified.rebuilt(), "after the rebuild");
         assert_eq!(
             verified.rebuilt(),
