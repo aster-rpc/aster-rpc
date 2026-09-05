@@ -358,10 +358,10 @@ source:
 ```rust
 use std::sync::Arc;
 
-use aster::AsterConfig;
 use aster::coordination::admission::VerifiedAdmissionSource;
 use aster::coordination::host::{CoordinationConfig, CoordinationStart};
 use aster::rpc::AsterServer;
+use aster::AsterConfig;
 
 async fn start_initial_voter(
     signed_genesis: Vec<u8>,
@@ -443,9 +443,9 @@ sequence journal:
 ```rust
 use std::path::Path;
 
-use aster::Node;
 use aster::coordination::client::{CoordinationClient, CoordinationReadClient};
 use aster::coordination::ids::CoordinationGroupId;
+use aster::Node;
 
 fn open_durable_client(
     node: Node,
@@ -582,8 +582,8 @@ margin). The lease presents its own current fence with each mutation, so the
 application never copies a fence across an `await`:
 
 ```rust
-use aster::coordination::client::CoordinationClient;
 use aster::coordination::client::lease::{CoordinationLease, LeaseAcquireOutcome};
+use aster::coordination::client::CoordinationClient;
 use aster::coordination::contract::ResourceKeyV1;
 use aster::lease::LeaseOptions;
 
@@ -690,13 +690,13 @@ the optional manager:
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use aster::coordination::client::CoordinationClient;
 use aster::coordination::client::manager::{
     CoordinationPlacementManager, PlacementPolicySource, PlacementProvisioner,
 };
 use aster::coordination::client::placement::{
     PlacementCandidate, PlacementPolicy, PlacementReport,
 };
+use aster::coordination::client::CoordinationClient;
 use aster::coordination::ids::CoordinationNodeId;
 use aster::rpc::AsterServer;
 
