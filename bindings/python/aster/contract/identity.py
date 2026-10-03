@@ -559,63 +559,59 @@ _PYTHON_TO_XLANG_PRIMITIVE: dict[type, str] = {
 }
 
 
-# pyfory exposes bit-width-specific integer/float markers as ``TypeVar``
-# instances (``pyfory.int32`` etc). They are NOT Python types, so they
-# miss the ``_PYTHON_TO_XLANG_PRIMITIVE`` lookup and used to fall through
-# to TypeKind.ANY, which made the published TypeDef lossy: a producer
-# declaring ``accepted: pyfory.int32`` emitted the same canonical bytes
-# as one declaring ``accepted: <Any>``. Consumers (dynamic proxy) could
-# not reconstruct a matching Fory struct hash and Ch3 ingestMetrics
-# tripped the ``Hash ... is not consistent`` guard. We intercept the
-# TypeVar identity here and emit the correct primitive name.
-def _pyfory_typevar_primitive(tp: Any) -> str | None:
-    """Map a pyfory TypeVar to its Fory xlang primitive name.
+# pyfory (>= 1.0) spells bit-width-specific integer/float types as
+# ``typing.Annotated[int | float, TypeId.X]`` aliases (``pyfory.Int32`` etc.).
+# The TypeId decides the wire encoding, so it -- not the Python base type --
+# decides the canonical ``type_primitive``. Note the naming: ``pyfory.Int32``
+# is the zig-zag **varint** (xlang ``varint32``, Rust ``i32``);
+# ``pyfory.FixedInt32`` is the fixed 4-byte ``int32``.
+_FORY_TYPE_ID_TO_PRIMITIVE: dict[int, str] = {
+    1: "bool",
+    2: "int8",
+    3: "int16",
+    4: "int32",
+    5: "varint32",
+    6: "int64",
+    7: "varint64",
+    8: "tagged_int64",
+    9: "uint8",
+    10: "uint16",
+    11: "uint32",
+    12: "var_uint32",
+    13: "uint64",
+    14: "var_uint64",
+    15: "tagged_uint64",
+    17: "float16",
+    18: "bfloat16",
+    19: "float32",
+    20: "float64",
+    21: "string",
+}
 
-    Critical: pyfory distinguishes fixed-width vs. variable-width encodings
-    via separate TypeVars per the xlang type mapping spec
-    (docs/specification/xlang_type_mapping.md). pyfory.int32 serializes as
-    spec "varint32" (type id 5), NOT spec "int32" (type id 4) -- the
-    latter is pyfory.fixed_int32. Mis-labeling here caused cross-binding
-    hash drift: a producer declaring pyfory.int64 emitted bytes that TS
-    interpreted as fixed int64, which is a different wire format.
+
+def _unwrap_annotated(tp: Any) -> tuple[Any, str | None]:
+    """Strip ``typing.Annotated``; return ``(base_type, fory_primitive|None)``.
+
+    The primitive is set when the annotation carries a pyfory ``TypeId``
+    (``pyfory.Int32``, ``pyfory.FixedInt64``, ``pyfory.Float32``, ...).
+    Other metadata (``pyfory.Ref``, user annotations) is ignored.
     """
-    try:
-        import pyfory  # type: ignore[import-untyped]
-    except ImportError:
-        return None
-    if tp is pyfory.int8:
-        return "int8"
-    if tp is pyfory.int16:
-        return "int16"
-    if tp is pyfory.int32:
-        return "varint32"
-    if tp is pyfory.int64:
-        return "varint64"
-    fixed_i32 = getattr(pyfory, "fixed_int32", None)
-    fixed_i64 = getattr(pyfory, "fixed_int64", None)
-    if fixed_i32 is not None and tp is fixed_i32:
-        return "int32"
-    if fixed_i64 is not None and tp is fixed_i64:
-        return "int64"
-    if tp is pyfory.uint8:
-        return "uint8"
-    if tp is pyfory.uint16:
-        return "uint16"
-    if tp is pyfory.uint32:
-        return "var_uint32"
-    if tp is pyfory.uint64:
-        return "var_uint64"
-    fixed_u32 = getattr(pyfory, "fixed_uint32", None)
-    fixed_u64 = getattr(pyfory, "fixed_uint64", None)
-    if fixed_u32 is not None and tp is fixed_u32:
-        return "uint32"
-    if fixed_u64 is not None and tp is fixed_u64:
-        return "uint64"
-    if tp is pyfory.float32:
-        return "float32"
-    if tp is pyfory.float64:
-        return "float64"
-    return None
+    import typing
+
+    prim: str | None = None
+    while typing.get_origin(tp) is typing.Annotated:
+        args = typing.get_args(tp)
+        for meta in args[1:]:
+            if type(meta) is int and meta in _FORY_TYPE_ID_TO_PRIMITIVE:
+                prim = _FORY_TYPE_ID_TO_PRIMITIVE[meta]
+        tp = args[0]
+    return tp, prim
+
+
+def _pyfory_typevar_primitive(tp: Any) -> str | None:
+    """Map a pyfory width annotation (``pyfory.Int32`` ...) to its Fory xlang
+    primitive name, or ``None`` if *tp* carries none."""
+    return _unwrap_annotated(tp)[1]
 
 
 def _get_type_args(tp: Any) -> tuple[Any, ...]:
@@ -705,6 +701,12 @@ def _build_field_def_for(
     Returns:
         FieldDef with all 12 fields populated.
     """
+    # A width annotation on the whole field (``x: pyfory.Int32``) is resolved
+    # by `_resolve_field_type`; only peel Annotated here when it wraps a
+    # container / Optional (e.g. ``Annotated[list[int], ...]``).
+    base_tp, _ = _unwrap_annotated(tp)
+    if _get_origin(base_tp) is not None and _unwrap_annotated(tp)[1] is None:
+        tp = base_tp
     is_opt, inner_tp = _is_optional(tp)
     container = ContainerKind.NONE
     type_kind = TypeKind.PRIMITIVE
@@ -756,6 +758,14 @@ def _build_field_def_for(
             actual_tp, back_edges, type_hashes, scc_members
         )
 
+    required = True
+    default_value = b""
+    if is_contract_default(field_obj):
+        required = False
+        default_value = lower_contract_default(
+            field_obj, type_kind, type_primitive, container,
+        )
+
     return FieldDef(
         id=field_index,
         name=field_obj.name,
@@ -769,6 +779,125 @@ def _build_field_def_for(
         container_key_kind=container_key_kind,
         container_key_primitive=container_key_primitive,
         container_key_ref=container_key_ref,
+        required=required,
+        default_value=default_value,
+    )
+
+
+# ── Contract defaults (§11.3.2.3 "Default lowering into FieldDef") ───────────
+
+
+def is_contract_default(field_obj: dataclasses.Field) -> bool:
+    """True if the field was declared with :func:`aster.contract_default`."""
+    from aster.codec import CONTRACT_DEFAULT_KEY
+
+    try:
+        return bool((field_obj.metadata or {}).get(CONTRACT_DEFAULT_KEY, False))
+    except Exception:
+        return False
+
+
+def _zigzag_varint(value: int, bits: int) -> bytes:
+    lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    if not lo <= value <= hi:
+        raise ValueError(f"{value} out of range for a {bits}-bit integer")
+    return _uvarint((value << 1) ^ (value >> (bits - 1)))
+
+
+def _canonical_string(value: str) -> bytes:
+    data = value.encode("utf-8")
+    return _uvarint((len(data) << 2) | 2) + data
+
+
+def _uvarint(n: int) -> bytes:
+    """Unsigned LEB128 varint."""
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def lower_contract_default(
+    field_obj: dataclasses.Field,
+    type_kind: "TypeKind",
+    type_primitive: str,
+    container: "ContainerKind",
+) -> bytes:
+    """Canonical ``FieldDef.default_value`` bytes for a contract default.
+
+    Implements the normative table in Aster-ContractIdentity.md §11.3.2.3.
+    Raises ``TypeError`` (decoration-time fail-fast) for any default the
+    table does not define: non-empty containers, ``None``, nested messages,
+    and the reserved wire types (int8/int16/uint*/float32/binary/enum/...).
+    """
+    import math
+    import struct
+
+    if field_obj.default is not dataclasses.MISSING:
+        value = field_obj.default
+    elif field_obj.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+        value = field_obj.default_factory()  # type: ignore[misc]
+    else:
+        raise TypeError(f"contract default on field {field_obj.name!r} has no value")
+
+    where = f"field {field_obj.name!r}"
+
+    if container != ContainerKind.NONE:
+        if value is None or len(value) != 0:
+            raise TypeError(
+                f"{where}: a list/set/map contract default must be the empty "
+                f"container (got {value!r}) (§11.3.2.3 rule 2)"
+            )
+        return b"\x00"
+
+    if value is None:
+        raise TypeError(
+            f"{where}: a None contract default is not expressible in v1; "
+            f"drop contract_default() to keep the field required (§11.3.2.3)"
+        )
+    if type_kind != TypeKind.PRIMITIVE:
+        raise TypeError(
+            f"{where}: only scalar fields may carry a contract default "
+            f"(§11.3.2.3 rule 3)"
+        )
+
+    if type_primitive == "string":
+        if not isinstance(value, str):
+            raise TypeError(f"{where}: string contract default must be str, got {value!r}")
+        return _canonical_string(value)
+    if type_primitive == "bool":
+        if not isinstance(value, bool):
+            raise TypeError(f"{where}: bool contract default must be bool, got {value!r}")
+        return b"\x01" if value else b"\x00"
+    if type_primitive in ("varint32", "varint64"):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{where}: integer contract default must be int, got {value!r}")
+        bits = 32 if type_primitive == "varint32" else 64
+        try:
+            return _zigzag_varint(value, bits)
+        except ValueError as e:
+            raise TypeError(f"{where}: {e}") from None
+    if type_primitive == "float64":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{where}: float contract default must be float, got {value!r}")
+        f = float(value)
+        if not math.isfinite(f):
+            raise TypeError(f"{where}: float contract default must be finite")
+        if f != 0.0 and abs(f) < 2.2250738585072014e-308:
+            raise TypeError(f"{where}: float contract default must not be subnormal")
+        if f == 0.0:
+            f = 0.0  # normalise -0.0
+        return struct.pack("<d", f)
+
+    raise TypeError(
+        f"{where}: contract defaults for wire type {type_primitive!r} are "
+        f"reserved in v1 (§11.3.2.3); supported: string, bool, varint32 "
+        f"(pyfory.Int32), varint64 (int), float64 (float), empty containers"
     )
 
 
@@ -792,7 +921,7 @@ def _resolve_field_type(
     if tp is None or tp is type(None):
         return TypeKind.PRIMITIVE, "null", b"", ""
 
-    prim_name = _pyfory_typevar_primitive(tp)
+    tp, prim_name = _unwrap_annotated(tp)
     if prim_name is not None:
         return TypeKind.PRIMITIVE, prim_name, b"", ""
 
@@ -840,9 +969,10 @@ def _build_type_def(
     package = _get_package_name(cls)
     name = _get_type_name(cls)
 
-    # Get field type hints
+    # Get field type hints. include_extras keeps ``Annotated`` so pyfory
+    # width annotations (``pyfory.Int32``) reach the primitive mapping.
     try:
-        hints = get_type_hints(cls)
+        hints = get_type_hints(cls, include_extras=True)
     except Exception:
         hints = {}
 

@@ -65,19 +65,19 @@ describe('aster-gen scanner', () => {
     expect(generatedSource).toContain('tag: "sample/StatusEvent"');
   });
 
-  it('maps bigint brand i64 to int64 wire type', () => {
+  it('maps bigint brand i64 to varint64 wire type (Rust i64 / Python int)', () => {
     // StatusRequest.nonce: i64 (brand on bigint)
     const nonceIdx = generatedSource.indexOf('name: "nonce"');
     expect(nonceIdx).toBeGreaterThan(-1);
     const nonceLine = generatedSource.slice(nonceIdx, nonceIdx + 200);
-    expect(nonceLine).toMatch(/wire: "int64"/);
+    expect(nonceLine).toMatch(/wire: "varint64"/);
   });
 
-  it('maps number brand i32 to int32 wire type', () => {
+  it('maps number brand i32 to varint32 wire type (Rust i32)', () => {
     const uptimeIdx = generatedSource.indexOf('name: "uptime"');
     expect(uptimeIdx).toBeGreaterThan(-1);
     const uptimeLine = generatedSource.slice(uptimeIdx, uptimeIdx + 200);
-    expect(uptimeLine).toMatch(/wire: "int32"/);
+    expect(uptimeLine).toMatch(/wire: "varint32"/);
   });
 
   it('maps plain TypeScript string to string wire type (spec §11.3.2.3)', () => {
@@ -202,12 +202,13 @@ describe('aster-gen scanner', () => {
   });
 
   it('cross-language parity: TS StatusRequest hash matches Python', () => {
-    // Python reference for the equivalent dataclass (verified via
-    // `aster.contract.identity.compute_type_hash` on a dataclass with
-    // fields { agentId: str, nonce: int } tagged sample/StatusRequest).
+    // Reference for the equivalent type { agentId: str, nonce: <64-bit
+    // varint> } tagged sample/StatusRequest: Python `int` and Rust `i64`
+    // both lower to type_primitive "varint64" (the old expected value,
+    // a3c16e64..., was the fixed-width "int64" TS used to emit).
     // This locks the TS TypeDef JSON builder + canonical encoder
-    // against the Python path — if either drifts, this test fails.
-    const expected = 'a3c16e643a313abb3429a94e941e70f8c9d3b0d410936fc30c8e4969a73afc57';
+    // against the Python/Rust path -- if either drifts, this test fails.
+    const expected = 'bea00806f2b102cb1036b6119dbc0db1377f39e2ac647052a30a7a235a9a75e0';
     const getStatusIdx = generatedSource.indexOf('name: "getStatus"');
     const block = generatedSource.slice(getStatusIdx, getStatusIdx + 1500);
     const m = block.match(/requestTypeHash: new Uint8Array\(\[([^\]]+)\]\)/);
@@ -335,5 +336,52 @@ describe('aster-gen + registerGenerated roundtrip', () => {
     expect(fields).toBeDefined();
     expect(fields!.requestFields.length).toBeGreaterThanOrEqual(2);
     expect(fields!.requestFields.find((f: any) => f.name === 'agentId')).toBeDefined();
+  });
+});
+
+describe('aster-gen BUILD_ALL_TYPES under Fory 1.7 (xlang, compatible, ref off)', () => {
+  it('registers the sample types and round-trips nested / list / nullable / varint fields', async () => {
+    const gen = await import(path.join(FIXTURE_DIR, 'aster-rpc.generated.ts')) as any;
+    const { newXlangFory, ForyCodec } = await import('@aster-rpc/aster');
+    const { fory, Type } = newXlangFory();
+    const codec = new ForyCodec(fory);
+    gen.BUILD_ALL_TYPES(fory, Type, codec);
+    expect(codec.registeredTypes()).toEqual(expect.arrayContaining([
+      'sample/StatusRequest', 'sample/StatusResponse', 'sample/StatusEvent',
+    ]));
+
+    const Req = gen.WIRE_TYPES.find((w: any) => w.tag === 'sample/StatusRequest').ctor;
+    const req = Object.assign(new Req(), { agentId: 'edge-1', nonce: -(2n ** 40n) });
+    const back = codec.decode(codec.encode(req)) as any;
+    expect(back).toBeInstanceOf(Req);
+    expect(back.agentId).toBe('edge-1');
+    expect(back.nonce).toBe(-(2n ** 40n));
+
+    const Ev = gen.WIRE_TYPES.find((w: any) => w.tag === 'sample/StatusEvent').ctor;
+    const Resp = gen.WIRE_TYPES.find((w: any) => w.tag === 'sample/StatusResponse').ctor;
+    const ev = Object.assign(new Ev(), {
+      status: Object.assign(new Resp(), { status: 'ok', uptime: 300, warnings: ['w'] }),
+      optionalNote: null,
+    });
+    const evBack = codec.decode(codec.encode(ev)) as any;
+    expect(evBack.status).toBeInstanceOf(Resp);
+    expect(evBack.status.uptime).toBe(300);
+    expect(evBack.status.warnings).toEqual(['w']);
+    expect(evBack.optionalNote ?? null).toBeNull();
+  });
+
+  it('registers a self-referential type (by-name back-edge) and round-trips a tree', async () => {
+    const gen = await import(path.join(PKG_ROOT, 'tests/fixtures/cyclic/aster-rpc.generated.ts')) as any;
+    const { newXlangFory, ForyCodec } = await import('@aster-rpc/aster');
+    const { fory, Type } = newXlangFory();
+    const codec = new ForyCodec(fory);
+    gen.BUILD_ALL_TYPES(fory, Type, codec);
+    const Entry = gen.WIRE_TYPES.find((w: any) => w.tag === 'tree/Entry').ctor;
+    const kid = Object.assign(new Entry(), { name: 'kid', children: [] });
+    const root = Object.assign(new Entry(), { name: 'root', children: [kid] });
+    const back = codec.decode(codec.encode(root)) as any;
+    expect(back.name).toBe('root');
+    expect(back.children[0]).toBeInstanceOf(Entry);
+    expect(back.children[0].name).toBe('kid');
   });
 });

@@ -18,7 +18,6 @@ import { configFromEnv } from './config.js';
 import { createLogger, type AsterLogger } from './logging.js';
 import { HealthServer } from './health.js';
 import { DEFAULT_BACKOFF, RpcPattern, RpcScope, type ExponentialBackoff } from './types.js';
-import { JsonCodec } from './codec.js';
 import { createXlangCodec, getXlangForyAndType } from './xlang.js';
 import { RpcServer } from './server.js';
 
@@ -291,7 +290,17 @@ export class AsterServer {
       Buffer.from(ALPN_DELEGATED_ADMISSION),
     ];
     const gate0Needed = !this._allowAllConsumers;
-    const endpointConfig = gate0EndpointConfig(gate0Needed);
+    // Network settings from the resolved config (ASTER_RELAY_MODE,
+    // ASTER_BIND_ADDR, [network] in TOML) must reach the endpoint, or an
+    // offline / loopback-only server is impossible.
+    const networkConfig = {
+      ...(this.config.relayMode ? { relayMode: this.config.relayMode } : {}),
+      ...(this.config.bindAddr ? { bindAddr: this.config.bindAddr } : {}),
+    };
+    const gate0Config = gate0EndpointConfig(gate0Needed);
+    const endpointConfig = gate0Config || Object.keys(networkConfig).length > 0
+      ? { ...gate0Config, ...networkConfig }
+      : undefined;
     this._node = await native.IrohNode.memoryWithAlpns(alpns, endpointConfig);
 
     // Build service summaries for admission response
@@ -663,9 +672,8 @@ export class AsterServer {
       typeHashes: [],
       methodCount: methods.length,
       methods,
-      // The TypeScript binding speaks XLANG on the wire.
-      // Cross-language consumers reading the manifest use SerializationMode.JSON.
-      serializationModes: ['json'],
+      // The TypeScript binding speaks Fory XLANG on the wire.
+      serializationModes: ['xlang'],
       scoped: (info.scoped === RpcScope.SESSION || info.scoped === 'stream') ? RpcScope.SESSION : RpcScope.SHARED,
       deprecated: false,
     };
@@ -784,10 +792,12 @@ export class AsterServer {
     try {
       const native = tryLoadNative();
       if (native) {
+        // Carry the direct addresses: a ticket with none is only dialable via
+        // relay/discovery, so a relay-less (LAN / loopback) client hangs.
         const info: any = {
           endpointId: this._node.nodeId(),
           relayAddr: undefined,
-          directAddrs: [],
+          directAddrs: this._node.directAddresses?.() ?? [],
         };
         return native.asterTicketToString(info);
       }
@@ -1337,19 +1347,13 @@ export class AsterClientWrapper {
     this._registryNamespace = admissionResponse.registryNamespace ?? '';
     this._gossipTopic = admissionResponse.gossipTopic ?? '';
 
-    // Pick codec based on server's advertised serialization modes.
-    // JsonCodec when all services are JSON-only; ForyCodec otherwise.
-    const allJsonOnly = this._services.every((svc) => {
-      const modes = svc.serializationModes;
-      if (!modes || modes.length === 0) return false;
-      return modes.includes('json') && !modes.includes('xlang');
-    });
-    const codec = allJsonOnly ? new JsonCodec() : createXlangCodec();
+    // Payload codec: Fory XLANG (JSON mode 3 is retired, Aster-SPEC §5.1).
+    const codec = createXlangCodec();
     this._codec = codec;
 
-    // If ForyCodec and generated metadata provided, register wire types
-    // so the client can encode requests without "Failed to detect Fory type" errors.
-    if (!allJsonOnly && this._generated?.buildAllTypes) {
+    // Register generated wire types so the client can encode requests
+    // without "Failed to detect Fory type" errors.
+    if (this._generated?.buildAllTypes) {
       const { fory, Type } = getXlangForyAndType();
       this._generated.buildAllTypes(fory, Type, codec);
     }
@@ -1390,6 +1394,16 @@ export class AsterClientWrapper {
   async proxy(serviceName: string): Promise<ProxyClient> {
     const summary = this._services.find(s => s.name === serviceName);
     const hintTypes = await this._registerDynamicTypesForService(summary);
+    if (!hintTypes || hintTypes.size === 0) {
+      // Without synthesised Fory types the proxy used to fall back to JSON
+      // (mode 3), which is retired. Untyped calls need manifest-driven
+      // Fory encode/decode in Rust core (plan D5).
+      throw new Error(
+        `proxy('${serviceName}'): dynamic Fory pending (plan D5) -- no Fory types could be ` +
+        `synthesised for this service from its published contract, and JSON mode is retired. ` +
+        `Use a typed client (client.client(ServiceClass)) instead.`,
+      );
+    }
     if (summary && (summary.pattern === 'session' || summary.pattern === 'stream')) {
       return new SessionProxyClient(
         serviceName, this._node, this.transport, this._codec, hintTypes,
@@ -1610,8 +1624,8 @@ export class AsterClientWrapper {
    * Register request/response types for a service against the live Fory
    * codec, so dynamic proxy / session calls encode as Fory XLANG instead
    * of failing with "Failed to detect Fory type" on a plain object.
-   * No-op when the service advertises json-only, or when the codec is
-   * not Fory (shell-style JsonCodec path).
+   * Returns `undefined` when the service does not advertise xlang or no
+   * types could be synthesised (the caller then refuses: plan D5).
    */
   private async _registerDynamicTypesForService(
     summary: ServiceSummary | undefined,
@@ -1952,7 +1966,7 @@ class SessionProxyClient {
     // (registered via DynamicTypeFactory at proxy() time) are visible on
     // this session's stream header frames too. Fall back to the raw
     // codec on the transport when one isn't supplied explicitly.
-    const activeCodec = codec ?? (transport as any).codec ?? new JsonCodec();
+    const activeCodec = codec ?? (transport as any).codec ?? createXlangCodec();
     this._sessionTransport = new IrohTransport(conn, activeCodec, { sessionId });
 
     return new Proxy(this, {

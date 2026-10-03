@@ -130,21 +130,26 @@ from .tunnel import Tcp, Udp, HttpProxy, TunnelHandle, TunnelTarget
 
 from .status import StatusCode, RpcError
 from .rpc_types import RpcScope, SerializationMode, RetryPolicy, ExponentialBackoff
-from .framing import (
+from .wire import (
     COMPRESSED,
     TRAILER,
     HEADER,
     ROW_SCHEMA,
     CALL,
     CANCEL,
+    END_STREAM,
     MAX_FRAME_SIZE,
     FramingError,
+    EnvelopeError,
     write_frame,
     read_frame,
+    StreamHeader,
+    CallHeader,
+    RpcStatus,
 )
-from .protocol import StreamHeader, CallHeader, RpcStatus
 from .codec import (
     wire_type,
+    contract_default,
     ForyCodec,
     ForyConfig,
     DEFAULT_COMPRESSION_THRESHOLD,
@@ -270,14 +275,17 @@ __all__ = [
     "ROW_SCHEMA",
     "CALL",
     "CANCEL",
+    "END_STREAM",
     "MAX_FRAME_SIZE",
     "FramingError",
+    "EnvelopeError",
     "write_frame",
     "read_frame",
     "StreamHeader",
     "CallHeader",
     "RpcStatus",
     "wire_type",
+    "contract_default",
     "Metadata",
     "describe",
     "Description",

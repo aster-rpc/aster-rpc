@@ -15,8 +15,8 @@ _contract = _aster.contract
 compute_contract_id_from_json = _contract.compute_contract_id_from_json
 canonical_bytes_from_json = _contract.canonical_bytes_from_json
 compute_type_hash = _contract.compute_type_hash
-encode_frame = _contract.encode_frame
-decode_frame = _contract.decode_frame
+encode_frame = _aster.wire.encode_frame
+decode_frame = _aster.wire.decode_frame
 canonical_signing_bytes_from_json = _contract.canonical_signing_bytes_from_json
 canonical_json = _contract.canonical_json
 

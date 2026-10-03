@@ -17,7 +17,7 @@
  *   2  setup/usage error
  */
 
-import { AsterClientWrapper, JsonCodec, IrohTransport } from '@aster-rpc/aster';
+import { AsterClientWrapper, ForyCodec, IrohTransport, newXlangFory } from '@aster-rpc/aster';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -401,10 +401,10 @@ async function testScopeMismatch(client: AsterClientWrapper): Promise<void> {
   // servers. This is a defensive guard against clients that don't know
   // about session protocol.
   //
-  // Use a JsonCodec transport wrapping the same QUIC connection so we
-  // don't need Fory type registration just to send a request the server
-  // will reject on scope grounds anyway. Mirrors Python's
-  // `JsonProxyCodec` shortcut in test_guide.py.
+  // JSON mode is retired, so the probe is a real Fory payload: a minimal
+  // probe struct is enough, because both servers reject a session-scoped
+  // service on the StreamHeader (sessionId == 0) before decoding the
+  // request. Mirrors the probe in test_guide.py.
   try {
     const liveTransport = (client as any).transport;
     const conn = liveTransport?.conn;
@@ -412,12 +412,21 @@ async function testScopeMismatch(client: AsterClientWrapper): Promise<void> {
       ok('scope mismatch (skipped — no rpc connection)');
       return;
     }
-    const raw = new IrohTransport(conn, new JsonCodec());
-    const r = await raw.unary('AgentSession', 'register', {
-      agent_id: 'scope-test',
-      capabilities: [],
-      load_avg: 0,
-    });
+    class ScopeProbe {
+      agent_id = '';
+      constructor(init?: Partial<ScopeProbe>) { if (init) Object.assign(this, init); }
+    }
+    const { fory, Type } = newXlangFory();
+    const codec = new ForyCodec(fory);
+    const probe = Type.struct(
+      { namespace: 'mission.test', typeName: 'ScopeProbe' },
+      { agent_id: Type.string() },
+      { withConstructor: true },
+    );
+    probe.initMeta(ScopeProbe);
+    codec.registerType(probe);
+    const raw = new IrohTransport(conn, codec);
+    const r = await raw.unary('AgentSession', 'register', new ScopeProbe({ agent_id: 'scope-test' }));
     fail('scope mismatch guard', `call succeeded (should have been rejected): ${JSON.stringify(r)}`);
   } catch (e) {
     const msg = String(e);

@@ -69,10 +69,11 @@ Compose capability requirements:
 Serialization
 -------------
 
-- :class:`SerializationMode` -- pick between XLANG (cross-language Fory),
-  NATIVE (single-language Fory), ROW (zero-copy Fory rows for data-heavy
-  workloads), and JSON (human-readable wire format for debugging and the
-  dynamic proxy client).
+- :class:`SerializationMode` -- XLANG (cross-language Fory, the default and
+  the only interoperable mode); NATIVE (single-language Fory) and ROW
+  (zero-copy Fory rows) are reserved.
+- :func:`contract_default` -- publish a field default as part of the
+  contract (Aster-ContractIdentity §11.3.2.3).
 
 Error Handling
 --------------
@@ -105,7 +106,7 @@ Built-in middleware that wraps every RPC call. Configure them on the
 
 from aster.runtime import AsterServer, AsterClient, AdmissionDeniedError
 from aster.decorators import service, rpc, server_stream, client_stream, bidi_stream
-from aster.codec import wire_type
+from aster.codec import contract_default, wire_type
 from aster.status import RpcError, StatusCode, ContractViolationError
 from aster.rpc_types import SerializationMode
 from aster.config import AsterConfig
@@ -134,6 +135,7 @@ __all__ = [
     "client_stream",
     "bidi_stream",
     "wire_type",
+    "contract_default",
     # Authorization
     "any_of",
     "all_of",

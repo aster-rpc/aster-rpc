@@ -360,6 +360,12 @@ export declare class IrohNode {
   nodeId(): string
   /** Return the node's address info (debug format). */
   nodeAddr(): string
+  /**
+   * Direct socket addresses (`"ip:port"`) this node currently advertises.
+   * Empty until the endpoint has bound and discovered its local addresses.
+   * Used to put dialable material into `aster1` tickets.
+   */
+  directAddresses(): Array<string>
   /** Export the node's secret key as 32 bytes. */
   exportSecretKey(): Array<number>
   /**
@@ -643,6 +649,9 @@ export interface CollectionFile {
   data: Buffer
 }
 
+/** Payloads strictly larger than this many bytes are compressed on send. */
+export const COMPRESSION_THRESHOLD: number
+
 /**
  * Compute contract_id from a ServiceContract JSON string.
  * Returns 64-char hex BLAKE3 hash.
@@ -658,6 +667,9 @@ export declare function computeTypeHash(data: Buffer): Buffer
  * bundled in a [`ReactorPair`] for take-once extraction.
  */
 export declare function createReactor(channelCapacity: number): ReactorPair
+
+/** Decode AEv1 bytes to a `CallHeader`. Throws on any malformed input. */
+export declare function decodeCallHeader(data: Uint8Array): NativeCallHeader
 
 /** Decode a frame from bytes. Returns { payload, flags, bytesConsumed }. */
 export interface DecodedFrame {
@@ -679,6 +691,18 @@ export interface DecodedNamespaceCapability {
 
 export declare function decodeFrameNative(data: Buffer): DecodedFrame
 
+/** Decode AEv1 bytes to an `RpcStatus`. Throws on any malformed input. */
+export declare function decodeRpcStatus(data: Uint8Array): NativeRpcStatus
+
+/** Decode AEv1 bytes to a `StreamHeader`. Throws on any malformed input. */
+export declare function decodeStreamHeader(data: Uint8Array): NativeStreamHeader
+
+/**
+ * Decompress a `FLAG_COMPRESSED` payload, refusing output larger than
+ * `limit` bytes (default [`MAX_DECOMPRESSED_SIZE`]).
+ */
+export declare function decompressPayload(data: Uint8Array, limit?: number | undefined | null): Buffer
+
 /** A doc event returned from subscribe(). */
 export interface DocEvent {
   /**
@@ -696,8 +720,25 @@ export interface DocEvent {
   peer?: string
 }
 
+/** Encode a `CallHeader` to AEv1 bytes. */
+export declare function encodeCallHeader(h: NativeCallHeader): Buffer
+
 /** Encode a frame: returns [4-byte LE length][flags][payload]. */
 export declare function encodeFrameNative(payload: Buffer, flags: number): Buffer
+
+/**
+ * Encode a data frame (`[len LE u32][flags][payload]`), compressing the
+ * payload and setting `FLAG_COMPRESSED` when it exceeds `threshold`
+ * (default [`COMPRESSION_THRESHOLD`]). A caller-supplied `FLAG_COMPRESSED`
+ * is ignored: core decides.
+ */
+export declare function encodePayloadFrame(payload: Uint8Array, flags: number, threshold?: number | undefined | null): Buffer
+
+/** Encode an `RpcStatus` to AEv1 bytes. */
+export declare function encodeRpcStatus(s: NativeRpcStatus): Buffer
+
+/** Encode a `StreamHeader` to AEv1 bytes. */
+export declare function encodeStreamHeader(h: NativeStreamHeader): Buffer
 
 /**
  * Endpoint configuration for `IrohNode.memoryWithAlpns` / `persistentWithAlpns`.
@@ -761,6 +802,27 @@ export interface EndpointConfig {
   dataDir?: string
 }
 
+/** Frame flag: per-call header in a session stream (payload is a `CallHeader`). */
+export const FLAG_CALL: number
+
+/** Frame flag: cancel the current call. */
+export const FLAG_CANCEL: number
+
+/** Frame flag: payload is zstd-compressed. */
+export const FLAG_COMPRESSED: number
+
+/** Frame flag: last request frame of a call. */
+export const FLAG_END_STREAM: number
+
+/** Frame flag: stream header (payload is an encoded `StreamHeader`). */
+export const FLAG_HEADER: number
+
+/** Frame flag: Fory row schema (reserved). */
+export const FLAG_ROW_SCHEMA: number
+
+/** Frame flag: trailing status frame (payload is an encoded `RpcStatus`). */
+export const FLAG_TRAILER: number
+
 export interface GossipEvent {
   eventType: string
   data?: Buffer
@@ -816,6 +878,19 @@ export declare function hpkePublicKeyFromPrivate(privateKey: Buffer): Buffer
 
 export declare function hpkeSeal(recipientPublicKey: Buffer, associatedData: Buffer, plaintext: Buffer): HpkeEnvelopeObject
 
+/** Largest size a compressed payload may expand to, bytes. */
+export const MAX_DECOMPRESSED_SIZE: number
+
+/** Maximum frame body size (flags byte + payload), bytes. */
+export const MAX_FRAME_SIZE: number
+
+/**
+ * zstd-compress `payload` if it is strictly larger than `threshold` bytes
+ * (default [`COMPRESSION_THRESHOLD`]) and the result is smaller. Returns
+ * `null` when the payload should be sent uncompressed.
+ */
+export declare function maybeCompress(payload: Uint8Array, threshold?: number | undefined | null): Buffer | null
+
 export declare function namespaceCapabilityDecode(data: Buffer): DecodedNamespaceCapability
 
 export declare function namespaceCapabilityEncodeRead(namespaceId: Buffer): Buffer
@@ -823,6 +898,46 @@ export declare function namespaceCapabilityEncodeRead(namespaceId: Buffer): Buff
 export declare function namespaceCapabilityEncodeWrite(namespaceSecret: Buffer): Buffer
 
 export declare function namespaceSecretId(secret: Buffer): Buffer
+
+/** `CallHeader` fields (per-call header in a session stream, `FLAG_CALL`). */
+export interface NativeCallHeader {
+  method: string
+  callId: number
+  /** Relative seconds, int16 range; `0` = no deadline. */
+  deadline: number
+  metadataKeys: Array<string>
+  metadataValues: Array<string>
+}
+
+/** `RpcStatus` fields (trailing status frame, `FLAG_TRAILER`). */
+export interface NativeRpcStatus {
+  code: number
+  message: string
+  detailKeys: Array<string>
+  detailValues: Array<string>
+}
+
+/** `StreamHeader` fields (first frame of every stream, `FLAG_HEADER`). */
+export interface NativeStreamHeader {
+  service: string
+  method: string
+  version: number
+  callId: number
+  /** Relative seconds, int16 range; `0` = no deadline. */
+  deadline: number
+  /** int8 range: XLANG=0 (NATIVE=1, ROW=2 reserved). */
+  serializationMode: number
+  metadataKeys: Array<string>
+  metadataValues: Array<string>
+  /** `0` = stateless shared-pool stream; non-zero = session-bound. */
+  sessionId: number
+}
+
+/**
+ * The logical payload of a received frame: decompressed (with the 16 MiB
+ * cap) if `flags` carries `FLAG_COMPRESSED`, otherwise a copy of `payload`.
+ */
+export declare function payloadOf(payload: Uint8Array, flags: number): Buffer
 
 export interface PeerAddr {
   host: string
@@ -918,3 +1033,6 @@ export interface UnaryFastPathResult {
 
 /** Exact version embedded by the shared Rust core build. */
 export declare function version(): string
+
+/** zstd level used on send. */
+export const ZSTD_LEVEL: number

@@ -39,7 +39,7 @@
     "docs": "typedoc --options typedoc.json"
   },
   "dependencies": {
-    "@apache-fory/core": "0.17.0",
+    "@apache-fory/core": "1.7.5",
     "@aster-rpc/transport": "0.3.0"
   },
   "peerDependencies": {

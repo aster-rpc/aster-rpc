@@ -35,6 +35,7 @@ import {
 } from './service.js';
 import { WIRE_TYPE_KEY } from './decorators.js';
 import type { ManifestField } from './contract/manifest.js';
+import type { CanonicalPrimitive } from './wire-types.js';
 
 /**
  * Canonical wire type tokens recognized by the scanner.
@@ -45,13 +46,7 @@ import type { ManifestField } from './contract/manifest.js';
  * discriminator rather than embedded in a string, so readers don't have
  * to parse.
  */
-export type WirePrimitive =
-  | 'bool'
-  | 'int8' | 'int16' | 'int32' | 'int64'
-  | 'uint8' | 'uint16' | 'uint32' | 'uint64'
-  | 'float32' | 'float64'
-  | 'string' | 'binary'
-  | 'timestamp' | 'uuid';
+export type WirePrimitive = CanonicalPrimitive;
 
 /**
  * A single field on a `@WireType` class, as the scanner sees it.

@@ -24,7 +24,7 @@ from aster.status import (
     InvalidArgumentError,
 )
 from aster.rpc_types import SerializationMode, RetryPolicy, ExponentialBackoff
-from aster.framing import (
+from aster.wire import (
     COMPRESSED,
     TRAILER,
     HEADER,
@@ -35,8 +35,12 @@ from aster.framing import (
     FramingError,
     write_frame,
     read_frame,
+    StreamHeader,
+    CallHeader,
+    RpcStatus,
+    EnvelopeError,
 )
-from aster.protocol import StreamHeader, CallHeader, RpcStatus, wire_type
+from aster.codec import wire_type
 
 # ── In-memory async stream helpers ──────────────────────────────────────────
 
@@ -338,7 +342,7 @@ class TestMaxSizeRejection:
         """Writing a frame larger than MAX_FRAME_SIZE raises FramingError."""
         send = MemSendStream()
         payload = b"\x00" * MAX_FRAME_SIZE  # +1 for flags = over limit
-        with pytest.raises(FramingError, match="exceeds maximum"):
+        with pytest.raises(FramingError, match="exceeds"):
             await write_frame(send, payload, flags=0)
 
     @pytest.mark.asyncio
@@ -360,7 +364,7 @@ class TestZeroLengthRejection:
     async def test_write_empty_payload_no_trailer(self):
         """Writing an empty payload without TRAILER flag raises FramingError."""
         send = MemSendStream()
-        with pytest.raises(FramingError, match="zero-length"):
+        with pytest.raises(FramingError, match="empty payload"):
             await write_frame(send, b"", flags=0)
 
     @pytest.mark.asyncio
@@ -384,7 +388,7 @@ class TestEOFHandling:
         assert result is None
 
 
-# ── Protocol type tests ─────────────────────────────────────────────────────
+# ── Envelope type tests (AEv1, Aster-SPEC §6.9) ─────────────────────────────
 
 
 class TestProtocolTypes:
@@ -393,27 +397,27 @@ class TestProtocolTypes:
         assert h.service == ""
         assert h.method == ""
         assert h.version == 0
-        assert h.metadataKeys == []
+        assert h.metadata_keys == []
 
     def test_stream_header_construction(self):
         h = StreamHeader(
             service="MyService",
             method="do_thing",
             version=1,
-            callId=1,
+            call_id=1,
             deadline=1000,
-            serializationMode=0,
-            metadataKeys=["key"],
-            metadataValues=["val"],
+            serialization_mode=0,
+            metadata_keys=["key"],
+            metadata_values=["val"],
         )
         assert h.service == "MyService"
         assert h.method == "do_thing"
-        assert h.metadataKeys == ["key"]
+        assert h.metadata_keys == ["key"]
 
     def test_call_header_defaults(self):
         h = CallHeader()
         assert h.method == ""
-        assert h.callId == 0
+        assert h.call_id == 0
 
     def test_rpc_status_defaults(self):
         s = RpcStatus()
@@ -424,32 +428,22 @@ class TestProtocolTypes:
         s = RpcStatus(
             code=StatusCode.INTERNAL,
             message="oops",
-            detailKeys=["k"],
-            detailValues=["v"],
+            detail_keys=["k"],
+            detail_values=["v"],
         )
         assert s.code == 13
         assert s.message == "oops"
 
+    def test_envelopes_are_not_fory_types(self):
+        """The envelope left Fory (D2): no wire_type registration."""
+        for cls in (StreamHeader, CallHeader, RpcStatus):
+            assert not hasattr(cls, "__wire_type__")
 
-# ── Fory tag tests ──────────────────────────────────────────────────────────
+
+# ── wire_type tag tests ─────────────────────────────────────────────────────
 
 
 class TestForyTags:
-    def test_stream_header_tag(self):
-        assert StreamHeader.__wire_type__ == "_aster/StreamHeader"
-        assert StreamHeader.__fory_namespace__ == "_aster"
-        assert StreamHeader.__fory_typename__ == "StreamHeader"
-
-    def test_call_header_tag(self):
-        assert CallHeader.__wire_type__ == "_aster/CallHeader"
-        assert CallHeader.__fory_namespace__ == "_aster"
-        assert CallHeader.__fory_typename__ == "CallHeader"
-
-    def test_rpc_status_tag(self):
-        assert RpcStatus.__wire_type__ == "_aster/RpcStatus"
-        assert RpcStatus.__fory_namespace__ == "_aster"
-        assert RpcStatus.__fory_typename__ == "RpcStatus"
-
     def test_custom_wire_type(self):
         @wire_type("myapp.pkg/MyType")
         class MyType:
@@ -469,124 +463,77 @@ class TestForyTags:
         assert Simple.__fory_typename__ == "SimpleTag"
 
 
-# ── Fory serialization round-trip tests ─────────────────────────────────────
-
-try:
-    import pyfory
-
-    HAS_PYFORY = True
-except ImportError:
-    HAS_PYFORY = False
+# ── AEv1 round-trip tests ───────────────────────────────────────────────────
 
 
-@pytest.mark.skipif(not HAS_PYFORY, reason="pyfory not installed")
-class TestForySerializationRoundTrip:
-    """Verify that protocol types round-trip through Fory XLANG."""
-
-    def _create_fory(self, *types):
-        f = pyfory.Fory()
-        for cls in types:
-            f.register_type(
-                cls,
-                namespace=cls.__fory_namespace__,
-                typename=cls.__fory_typename__,
-            )
-        return f
+class TestEnvelopeRoundTrip:
+    """Envelope encode/decode through Rust core (``_aster.wire``)."""
 
     def test_stream_header_round_trip(self):
-        f = self._create_fory(StreamHeader)
         original = StreamHeader(
             service="TestService",
             method="test_method",
             version=1,
-            callId=2,
+            call_id=2,
             deadline=30,
-            serializationMode=0,
-            metadataKeys=["trace_id", "auth"],
-            metadataValues=["t1", "token"],
+            serialization_mode=0,
+            metadata_keys=["trace_id", "auth"],
+            metadata_values=["t1", "token"],
+            session_id=7,
         )
-        data = f.serialize(original)
-        assert isinstance(data, (bytes, bytearray))
-        assert len(data) > 0
-
-        restored = f.deserialize(data)
-        assert isinstance(restored, StreamHeader)
-        assert restored.service == original.service
-        assert restored.method == original.method
-        assert restored.version == original.version
-        assert restored.callId == original.callId
-        assert restored.deadline == original.deadline
-        assert restored.serializationMode == original.serializationMode
-        assert restored.metadataKeys == original.metadataKeys
-        assert restored.metadataValues == original.metadataValues
+        data = original.encode()
+        assert data[:2] == b"\xa1\x01"
+        assert StreamHeader.decode(data) == original
 
     def test_call_header_round_trip(self):
-        f = self._create_fory(CallHeader)
         original = CallHeader(
             method="assign_task",
-            callId=3,
+            call_id=3,
             deadline=60,
-            metadataKeys=["k1"],
-            metadataValues=["v1"],
+            metadata_keys=["k1"],
+            metadata_values=["v1"],
         )
-        data = f.serialize(original)
-        restored = f.deserialize(data)
-        assert isinstance(restored, CallHeader)
-        assert restored.method == original.method
-        assert restored.callId == original.callId
-        assert restored.deadline == original.deadline
-        assert restored.metadataKeys == original.metadataKeys
-        assert restored.metadataValues == original.metadataValues
+        data = original.encode()
+        assert data[:2] == b"\xa2\x01"
+        assert CallHeader.decode(data) == original
 
     def test_rpc_status_round_trip(self):
-        f = self._create_fory(RpcStatus)
         original = RpcStatus(
             code=StatusCode.DEADLINE_EXCEEDED,
             message="timed out after 30s",
-            detailKeys=["retry_after_ms"],
-            detailValues=["5000"],
+            detail_keys=["retry_after_ms"],
+            detail_values=["5000"],
         )
-        data = f.serialize(original)
-        restored = f.deserialize(data)
-        assert isinstance(restored, RpcStatus)
+        data = original.encode()
+        assert data[:2] == b"\xa3\x01"
+        restored = RpcStatus.decode(data)
         assert restored.code == original.code
         assert restored.message == original.message
-        assert restored.detailKeys == original.detailKeys
-        assert restored.detailValues == original.detailValues
+        assert restored.detail_keys == original.detail_keys
+        assert restored.detail_values == original.detail_values
 
-    def test_stream_header_determinism(self):
-        """Same StreamHeader serializes to identical bytes."""
-        f = self._create_fory(StreamHeader)
-        h = StreamHeader(
-            service="Svc", method="m", version=1,
-            callId=4,
-        )
-        b1 = f.serialize(h)
-        b2 = f.serialize(h)
-        assert b1 == b2
+    def test_determinism(self):
+        h = StreamHeader(service="Svc", method="m", version=1, call_id=4)
+        assert h.encode() == h.encode()
 
-    def test_rpc_status_determinism(self):
-        """Same RpcStatus serializes to identical bytes."""
-        f = self._create_fory(RpcStatus)
-        s = RpcStatus(code=0, message="ok")
-        b1 = f.serialize(s)
-        b2 = f.serialize(s)
-        assert b1 == b2
+    def test_rpc_status_ok_is_minimal(self):
+        # tag, version, code=0, message="", two empty lists (count 0, 0x0C)
+        assert RpcStatus().encode() == bytes.fromhex("a3010002000c000c")
 
-    def test_rpc_status_ok(self):
-        """An OK status round-trips correctly."""
-        f = self._create_fory(RpcStatus)
-        ok = RpcStatus(code=StatusCode.OK, message="")
-        data = f.serialize(ok)
-        restored = f.deserialize(data)
-        assert restored.code == 0
-        assert restored.message == ""
+    def test_wrong_type_rejected(self):
+        with pytest.raises(EnvelopeError):
+            RpcStatus.decode(StreamHeader(service="S", method="m").encode())
+
+    def test_mismatched_metadata_rejected_on_encode(self):
+        with pytest.raises(EnvelopeError):
+            StreamHeader(service="S", metadata_keys=["a"], metadata_values=[]).encode()
+
+    def test_out_of_range_rejected_on_encode(self):
+        with pytest.raises(EnvelopeError):
+            CallHeader(method="m", deadline=40000).encode()
 
     def test_stream_header_empty_metadata(self):
-        """StreamHeader with no metadata round-trips."""
-        f = self._create_fory(StreamHeader)
         h = StreamHeader(service="S", method="m")
-        data = f.serialize(h)
-        restored = f.deserialize(data)
-        assert restored.metadataKeys == []
-        assert restored.metadataValues == []
+        restored = StreamHeader.decode(h.encode())
+        assert restored.metadata_keys == []
+        assert restored.metadata_values == []

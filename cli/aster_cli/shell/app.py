@@ -28,7 +28,6 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console
 
-from aster.json_codec import JsonProxyCodec
 
 from aster_cli.shell.completer import ShellCompleter
 from aster_cli.shell.display import Display
@@ -785,17 +784,11 @@ class PeerConnection:
 
         conn = self._rpc_conns[channel_addr]
 
-        # If the peer advertises JSON-only (e.g. the TypeScript binding,
-        # whose Fory implementation is not yet XLANG-compliant), use the
-        # JSON proxy codec -- otherwise the Fory client would send bytes
-        # the server can't decode and the call would fail with the opaque
-        # "Expected RpcStatus, got NoneType". Mirrors the auto-selection
-        # in AsterClient._rpc_for_service.
+        # Fory XLANG with manifest-synthesised types. JSON mode 3 is
+        # retired; manifest-less peers wait for Rust-core dynamic Fory
+        # (plan D5).
         codec = None
-        modes = list(getattr(summary, "serialization_modes", None) or [])
-        if modes and "xlang" not in modes and "json" in modes:
-            codec = JsonProxyCodec()
-        elif self._type_factory and self._type_factory.type_count > 0:
+        if self._type_factory and self._type_factory.type_count > 0:
             try:
                 codec = ForyCodec(
                     mode=SerializationMode.XLANG,
@@ -874,9 +867,7 @@ class PeerConnection:
         The Fory codec expects @wire_type-decorated dataclass instances,
         not raw dicts. When the transport uses Fory (Python servers), we
         synthesize the right typed instance from the manifest's field
-        descriptors via ``DynamicTypeFactory``. When the transport uses
-        ``JsonProxyCodec`` (TS servers), we leave the dict alone -- the
-        JSON codec sends keys verbatim.
+        descriptors via ``DynamicTypeFactory``.
 
         This was originally only called from ``invoke()`` for unary
         calls; the streaming methods (server_stream, client_stream,
@@ -889,8 +880,6 @@ class PeerConnection:
             return payload  # already typed (e.g. user passed a dataclass)
         if not self._type_factory:
             return payload
-        if isinstance(getattr(transport, "_codec", None), JsonProxyCodec):
-            return payload  # JSON path takes raw dicts
         meta = self._get_method_meta(service, method)
         if not meta or not meta.get("request_wire_tag"):
             return payload

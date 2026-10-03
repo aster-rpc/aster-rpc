@@ -1870,15 +1870,16 @@ class AsterClient:
     ) -> tuple[Any, Any | None, dict[str, dict[str, Any]]]:
         """Build a codec suitable for dynamic proxy / session against
         ``summary``. Prefers Fory XLANG with manifest-synthesised types
-        so requests ride the same wire the typed client uses. Falls back
-        to JSON only when the server advertises json-only, or when the
-        manifest is unavailable (older producer missing the shortcut).
+        so requests ride the same wire the typed client uses.
 
-        Returns ``(codec, factory_or_None, method_map)`` where
-        ``method_map`` is ``{method_name: method_descriptor_dict}`` so
-        callers can build typed request instances from dicts before
-        encoding. On the JSON fallback path, ``factory`` is ``None`` and
-        ``method_map`` may be empty.
+        Returns ``(codec, factory, method_map)`` where ``method_map`` is
+        ``{method_name: method_descriptor_dict}`` so callers can build
+        typed request instances from dicts before encoding.
+
+        Raises:
+            NotImplementedError: no usable XLANG manifest. The former JSON
+                (mode 3) fallback is retired; manifest-less dynamic calls
+                wait for Rust-core dynamic Fory (plan D5).
         """
         modes = list(getattr(summary, "serialization_modes", None) or [])
         server_supports_xlang = not modes or "xlang" in modes
@@ -1936,16 +1937,17 @@ class AsterClient:
                     method_map = {m.get("name"): m for m in manifest.methods if m.get("name")}
                     return codec, factory, method_map
                 except Exception as exc:
-                    logger.debug(
-                        "dynamic Fory codec build failed for %s: %s "
-                        "-- falling back to JSON",
-                        summary.name,
-                        exc,
-                    )
+                    raise NotImplementedError(
+                        f"dynamic proxy for {summary.name!r}: could not build a "
+                        f"Fory codec from the published manifest ({exc}); JSON "
+                        f"mode 3 is retired and Rust-core dynamic Fory is "
+                        f"pending (dynamic Fory pending, see plan D5)"
+                    ) from exc
 
-        from aster.json_codec import JsonProxyCodec
-
-        return JsonProxyCodec(), None, {}
+        raise NotImplementedError(
+            f"dynamic proxy for {summary.name!r} needs the producer's Fory XLANG "
+            f"manifest; JSON mode 3 is retired (dynamic Fory pending, see plan D5)"
+        )
 
     async def _resolve_service(
         self,
@@ -2070,17 +2072,6 @@ class AsterClient:
             )
 
         conn = await self._rpc_conn_for(summary.channels[channel_key])
-
-        # If the server advertises JSON-only (e.g. the TypeScript binding,
-        # whose Fory implementation is not yet XLANG-compliant), pick the
-        # JSON proxy codec automatically -- otherwise the typed Fory client
-        # would send Fory bytes the server can't decode and the call would
-        # fail with an opaque "Expected RpcStatus, got NoneType".
-        if codec is None:
-            modes = list(getattr(summary, "serialization_modes", None) or [])
-            if modes and "xlang" not in modes and "json" in modes:
-                from aster.json_codec import JsonProxyCodec
-                codec = JsonProxyCodec()
 
         # Session-scoped services route via a ClientSession allocated on
         # the fly. Every call threads the same monotonic sessionId into
@@ -2362,22 +2353,7 @@ class ClientSession:
                 f"(missing __aster_service_info__)"
             )
 
-        # Auto-pick JSON codec when producer advertises JSON-only, same
-        # logic as `AsterClient.client`.
-        if codec is None:
-            summary: ServiceSummary | None = None
-            for s in self._parent.services:
-                if s.name == info.name and s.version == info.version:
-                    summary = s
-                    break
-            if summary is not None:
-                modes = list(getattr(summary, "serialization_modes", None) or [])
-                if modes and "xlang" not in modes and "json" in modes:
-                    from aster.json_codec import JsonProxyCodec
-                    codec = JsonProxyCodec()
-
-        # If no explicit codec was supplied AND JSON auto-pick didn't
-        # trigger, build a service-aware Fory XLANG codec NOW so the
+        # If no explicit codec was supplied, build a service-aware Fory XLANG codec NOW so the
         # IrohTransport we hand to `create_client` knows about the
         # service's request/response types. Without this, the
         # transport's codec defaults to a bare ForyCodec with zero
@@ -2484,21 +2460,12 @@ class SessionProxyClient:
         """Call a unary method on this session. Returns decoded response."""
         if self._closed:
             raise RuntimeError("SessionProxyClient is closed")
-        from aster.json_codec import JsonProxyCodec
-
-        # Codec is JSON only on the legacy fallback path (older producer
-        # without manifest). Everywhere else we're on XLANG Fory.
-        mode = (
-            SerializationMode.JSON.value
-            if isinstance(self._codec, JsonProxyCodec)
-            else SerializationMode.XLANG.value
-        )
         wire_payload = self._wrap_request(method, request or {})
         result = await self._transport.unary(
             self._service_name,
             method,
             wire_payload,
-            serialization_mode=mode,
+            serialization_mode=SerializationMode.XLANG.value,
         )
         if _is_dataclass_instance(result):
             return _dataclasses_asdict(result)
@@ -2806,7 +2773,9 @@ class ProxyClient:
         conn = await self._client._rpc_conn_for(rpc_addr)
 
         if self._codec is None:
-            self._codec = await self._client._build_dynamic_codec(summary)
+            self._codec, self._factory, self._method_map = (
+                await self._client._build_dynamic_codec(summary)
+            )
         self._transport = IrohTransport(conn, codec=self._codec)
 
     def __getattr__(self, method_name: str) -> "_ProxyMethod":

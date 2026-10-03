@@ -71,7 +71,7 @@ export function BUILD_ALL_TYPES(
       { namespace: "tree", typeName: "Entry" },
       {
       "name": Type.string(),
-      "children": Type.array(typesByTag.get("tree/Entry"))
+      "children": Type.list((typesByTag.get("tree/Entry") ?? Type.struct({ namespace: "tree", typeName: "Entry" })))
       },
       { withConstructor: true },
     );
@@ -94,7 +94,7 @@ export function BUILD_ALL_TYPES(
     const typeStruct = Type.struct(
       { namespace: "tree", typeName: "TreeRequest" },
       {
-      "root": typesByTag.get("tree/Entry")
+      "root": (typesByTag.get("tree/Entry") ?? Type.struct({ namespace: "tree", typeName: "Entry" }))
       },
       { withConstructor: true },
     );
@@ -117,7 +117,7 @@ export function BUILD_ALL_TYPES(
     const typeStruct = Type.struct(
       { namespace: "tree", typeName: "TreeResponse" },
       {
-      "tree": typesByTag.get("tree/Entry")
+      "tree": (typesByTag.get("tree/Entry") ?? Type.struct({ namespace: "tree", typeName: "Entry" }))
       },
       { withConstructor: true },
     );

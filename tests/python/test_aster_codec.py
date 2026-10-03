@@ -28,7 +28,6 @@ from aster.codec import (
     _validate_xlang_tags,
 )
 from aster.rpc_types import SerializationMode
-from aster.protocol import StreamHeader, CallHeader, RpcStatus
 
 
 def test_pyfory_cython_acceleration_is_enabled():
@@ -221,47 +220,29 @@ class TestForyCodecInit:
         class DummyFory:
             def __init__(self, **kwargs):
                 seen["kwargs"] = kwargs
-            def register_type(self, *args, **kwargs):
+            def register(self, *args, **kwargs):
                 return None
 
         monkeypatch.setattr("aster.codec.pyfory.Fory", DummyFory)
 
         ForyCodec(mode=SerializationMode.XLANG, types=[])
 
-        # ref=True, strict=True, and compatible=True are Aster's Fory
-        # baseline (XLANG + ref-tracking + strict + NAMED_COMPATIBLE_STRUCT
-        # layout) so the Python config stays in lockstep with Java's
-        # `ForyCodec` (`withCompatibleMode(COMPATIBLE)`) and TS's
-        # `createXlangCodec`. See docs/_internal/fory-cross-binding.md.
+        # Aster's payload Fory options are fixed and match Rust core's
+        # `xlang::new_fory`: xlang + compatible, reference tracking OFF.
         assert seen["kwargs"] == {
             "xlang": True,
-            "ref": True,
+            "ref": False,
             "strict": True,
             "compatible": True,
         }
 
-    def test_fory_config_defaults_to_non_xlang_for_native_mode(self, monkeypatch):
+    def test_xlang_options_cannot_be_overridden(self, monkeypatch):
         seen: dict[str, object] = {}
 
         class DummyFory:
             def __init__(self, **kwargs):
                 seen["kwargs"] = kwargs
-            def register_type(self, *args, **kwargs):
-                return None
-
-        monkeypatch.setattr("aster.codec.pyfory.Fory", DummyFory)
-
-        ForyCodec(mode=SerializationMode.NATIVE, types=[])
-
-        assert seen["kwargs"] == {"xlang": False, "ref": True, "strict": True}
-
-    def test_fory_config_allows_explicit_override(self, monkeypatch):
-        seen: dict[str, object] = {}
-
-        class DummyFory:
-            def __init__(self, **kwargs):
-                seen["kwargs"] = kwargs
-            def register_type(self, *args, **kwargs):
+            def register(self, *args, **kwargs):
                 return None
 
         monkeypatch.setattr("aster.codec.pyfory.Fory", DummyFory)
@@ -269,13 +250,47 @@ class TestForyCodecInit:
         ForyCodec(
             mode=SerializationMode.XLANG,
             types=[],
-            fory_config=ForyConfig(xlang=False, extra_kwargs={"require_class_registration": True}),
+            fory_config=ForyConfig(extra_kwargs={"ref": True, "compatible": False}),
+        )
+        assert seen["kwargs"]["ref"] is False
+        assert seen["kwargs"]["compatible"] is True
+
+    def test_fory_config_defaults_to_non_xlang_for_native_mode(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        class DummyFory:
+            def __init__(self, **kwargs):
+                seen["kwargs"] = kwargs
+            def register(self, *args, **kwargs):
+                return None
+
+        monkeypatch.setattr("aster.codec.pyfory.Fory", DummyFory)
+
+        ForyCodec(mode=SerializationMode.NATIVE, types=[])
+
+        assert seen["kwargs"] == {"xlang": False, "ref": False, "strict": True}
+
+    def test_fory_config_allows_explicit_override(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        class DummyFory:
+            def __init__(self, **kwargs):
+                seen["kwargs"] = kwargs
+            def register(self, *args, **kwargs):
+                return None
+
+        monkeypatch.setattr("aster.codec.pyfory.Fory", DummyFory)
+
+        ForyCodec(
+            mode=SerializationMode.XLANG,
+            types=[],
+            fory_config=ForyConfig(xlang=False, extra_kwargs={"max_depth": 10}),
         )
 
         assert seen["kwargs"] == {
             "xlang": False,
-            "require_class_registration": True,
-            "ref": True,
+            "max_depth": 10,
+            "ref": False,
             "strict": True,
         }
 
@@ -292,9 +307,10 @@ class TestForyCodecInit:
         assert codec.mode == SerializationMode.ROW
 
     def test_no_types(self):
-        """Codec can be created with no user types (framework-internal only)."""
+        """Codec can be created with no user types; the envelope is not
+        Fory-encoded, so nothing is registered."""
         codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
-        assert len(codec.registered_types) > 0  # internal types
+        assert codec.registered_types == []
 
     def test_untagged_type_xlang_raises(self):
         """Creating an XLANG codec with untagged types raises TypeError."""
@@ -306,14 +322,6 @@ class TestForyCodecInit:
         # UntaggedMsg has no tag, but NATIVE should still work
         codec = ForyCodec(mode=SerializationMode.NATIVE, types=[UntaggedMsg])
         assert codec.mode == SerializationMode.NATIVE
-
-    def test_framework_internal_types_registered(self):
-        """StreamHeader, CallHeader, RpcStatus are always registered."""
-        codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
-        registered = codec.registered_types
-        assert StreamHeader in registered
-        assert CallHeader in registered
-        assert RpcStatus in registered
 
     def test_nested_types_auto_discovered(self):
         """Nested types are automatically discovered and registered."""
@@ -394,39 +402,6 @@ class TestXlangRoundTrip:
         assert restored.optional_str is None
         assert restored.optional_int is None
 
-    def test_framework_types_round_trip(self):
-        """Framework-internal types (StreamHeader, RpcStatus) round-trip."""
-        codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
-        header = StreamHeader(
-            service="TestSvc",
-            method="do_thing",
-            version=1,
-            callId=1,
-            deadline=30,
-            serializationMode=0,
-            metadataKeys=["k1"],
-            metadataValues=["v1"],
-        )
-        data = codec.encode(header)
-        restored = codec.decode(data, StreamHeader)
-        assert restored.service == header.service
-        assert restored.method == header.method
-        assert restored.version == header.version
-        assert restored.metadataKeys == header.metadataKeys
-
-    def test_rpc_status_round_trip(self):
-        codec = ForyCodec(mode=SerializationMode.XLANG, types=[])
-        status = RpcStatus(
-            code=StatusCode.INTERNAL,
-            message="something broke",
-            detailKeys=["trace"],
-            detailValues=["abc"],
-        )
-        data = codec.encode(status)
-        restored = codec.decode(data, RpcStatus)
-        assert restored.code == StatusCode.INTERNAL
-        assert restored.message == "something broke"
-
     def test_determinism(self):
         """Same object encodes to identical bytes."""
         codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
@@ -440,8 +415,8 @@ class TestXlangRoundTrip:
         codec = ForyCodec(mode=SerializationMode.XLANG, types=[SimpleMsg])
         msg = SimpleMsg(name="test", value=1, active=False)
         data = codec.encode(msg)
-        with pytest.raises(TypeError, match="Expected RpcStatus"):
-            codec.decode(data, RpcStatus)
+        with pytest.raises(TypeError, match="Expected OuterMsg"):
+            codec.decode(data, OuterMsg)
 
 
 # ── NATIVE round-trip tests ─────────────────────────────────────────────────

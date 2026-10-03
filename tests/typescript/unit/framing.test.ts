@@ -122,7 +122,7 @@ describe('conformance vectors', () => {
   it('error vectors: zero-length frame rejected on decode', () => {
     const zeroLen = fromHex('00000000');
     expect(() => decodeFrame(zeroLen)).toThrow(FramingError);
-    expect(() => decodeFrame(zeroLen)).toThrow('zero-length frame');
+    expect(() => decodeFrame(zeroLen)).toThrow('frame body length is zero');
   });
 });
 
@@ -194,7 +194,7 @@ describe('writeFrame / readFrame', () => {
   it('rejects zero-length payload without TRAILER/CANCEL', async () => {
     await expect(
       writeFrame(new MemSendStream(), new Uint8Array(0), 0),
-    ).rejects.toThrow('zero-length payload is not permitted');
+    ).rejects.toThrow('empty payload only allowed with TRAILER, CANCEL or END_STREAM');
   });
 
   it('allows empty payload with TRAILER', async () => {

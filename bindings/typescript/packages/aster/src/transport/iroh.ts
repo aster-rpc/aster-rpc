@@ -8,17 +8,19 @@
  */
 
 import type { Codec } from '../codec.js';
-import { JsonCodec } from '../codec.js';
+import { createXlangCodec } from '../xlang.js';
 import {
   writeFrame,
+  writePayloadFrame,
   readFrame,
   encodeFrame,
+  encodePayloadFrame,
+  payloadOf,
   HEADER,
   TRAILER,
-  COMPRESSED,
   END_STREAM,
 } from '../framing.js';
-import { StreamHeader, RpcStatus } from '../protocol.js';
+import { encodeStreamHeader, decodeRpcStatus } from '../protocol.js';
 import { StatusCode, RpcError } from '../status.js';
 import type { AsterTransport, CallOptions } from './base.js';
 import type { BidiChannel } from './base.js';
@@ -72,7 +74,7 @@ export class IrohTransport implements AsterTransport {
     options?: { sessionId?: number },
   ) {
     this.conn = connection;
-    this.codec = codec ?? new JsonCodec();
+    this.codec = codec ?? createXlangCodec();
     this.sessionId = options?.sessionId ?? 0;
   }
 
@@ -96,25 +98,10 @@ export class IrohTransport implements AsterTransport {
         // write on the server side. The request carries
         // `FLAG_END_STREAM` so the core dispatch loop knows the
         // request phase is done and can start responding.
-        const headerBytes = this.codec.encode(
-          new StreamHeader({
-            service,
-            method,
-            version: 1,
-            callId: opts?.callId ?? 0,
-            deadline: opts?.deadlineSecs ?? 0,
-            serializationMode:
-              opts?.serializationMode ?? (this.codec instanceof JsonCodec ? 3 : 0),
-            metadataKeys: buildMetadata(opts?.metadata)[0],
-            metadataValues: buildMetadata(opts?.metadata)[1],
-            sessionId: this.sessionId,
-          }),
-        );
-        const headerFrame = encodeFrame(headerBytes, HEADER);
-        const [reqPayload, compressed] = this.codec.encodeCompressed(request, opts?.hintType);
-        const requestFrame = encodeFrame(
-          reqPayload,
-          (compressed ? COMPRESSED : 0) | END_STREAM,
+        const headerFrame = encodeFrame(this.headerBytes(service, method, opts), HEADER);
+        const requestFrame = encodePayloadFrame(
+          this.codec.encode(request, opts?.hintType),
+          END_STREAM,
         );
         const requestPair = new Uint8Array(
           headerFrame.byteLength + requestFrame.byteLength,
@@ -140,7 +127,7 @@ export class IrohTransport implements AsterTransport {
         if (!result.response || result.response.byteLength === 0) {
           return undefined;
         }
-        return this.codec.decode(result.response);
+        return this.codec.decode(payloadOf(result.response, result.responseFlags));
       } catch (e) {
         throw mapTransportError(e);
       }
@@ -158,8 +145,7 @@ export class IrohTransport implements AsterTransport {
       await this.writeHeader(send, service, method, opts);
 
       // Write request
-      const [payload, compressed] = this.codec.encodeCompressed(request, opts?.hintType);
-      await writeFrame(send, payload, compressed ? COMPRESSED : 0);
+      await writePayloadFrame(send, this.codec.encode(request, opts?.hintType));
       await send.finish();
 
       // Read response frames
@@ -174,7 +160,7 @@ export class IrohTransport implements AsterTransport {
           break;
         }
 
-        response = this.codec.decode(data);
+        response = this.codec.decode(payloadOf(data, flags));
       }
 
       return response;
@@ -196,8 +182,7 @@ export class IrohTransport implements AsterTransport {
     try {
       await this.writeHeader(send, service, method, opts);
 
-      const [payload, compressed] = this.codec.encodeCompressed(request, opts?.hintType);
-      await writeFrame(send, payload, compressed ? COMPRESSED : 0);
+      await writePayloadFrame(send, this.codec.encode(request, opts?.hintType));
       await send.finish();
 
       while (true) {
@@ -210,7 +195,7 @@ export class IrohTransport implements AsterTransport {
           break;
         }
 
-        yield this.codec.decode(data);
+        yield this.codec.decode(payloadOf(data, flags));
       }
     } catch (e) {
       throw mapTransportError(e);
@@ -231,8 +216,7 @@ export class IrohTransport implements AsterTransport {
       await this.writeHeader(send, service, method, opts);
 
       for await (const req of requests) {
-        const [payload, compressed] = this.codec.encodeCompressed(req, opts?.hintType);
-        await writeFrame(send, payload, compressed ? COMPRESSED : 0);
+        await writePayloadFrame(send, this.codec.encode(req, opts?.hintType));
       }
       await send.finish();
 
@@ -248,7 +232,7 @@ export class IrohTransport implements AsterTransport {
           break;
         }
 
-        response = this.codec.decode(data);
+        response = this.codec.decode(payloadOf(data, flags));
       }
 
       return response;
@@ -283,8 +267,7 @@ export class IrohTransport implements AsterTransport {
     const channel: BidiChannel = {
       async send(msg: unknown): Promise<void> {
         await streamReady;
-        const [payload, compressed] = codec.encodeCompressed(msg, opts?.hintType);
-        await writeFrame(sendStream!, payload, compressed ? COMPRESSED : 0);
+        await writePayloadFrame(sendStream!, codec.encode(msg, opts?.hintType));
       },
 
       async *[Symbol.asyncIterator](): AsyncIterator<unknown> {
@@ -299,7 +282,7 @@ export class IrohTransport implements AsterTransport {
               receiveDone = true;
               return;
             }
-            yield codec.decode(data);
+            yield codec.decode(payloadOf(data, flags));
           } catch (e) {
             receiveDone = true;
             throw mapTransportError(e);
@@ -321,7 +304,7 @@ export class IrohTransport implements AsterTransport {
           const [data, flags] = frame;
           if (flags & TRAILER) {
             if (data.length === 0) return [StatusCode.OK, ''];
-            const status = codec.decode(data) as RpcStatus;
+            const status = decodeRpcStatus(data);
             return [status.code as StatusCode, status.message];
           }
         }
@@ -344,25 +327,28 @@ export class IrohTransport implements AsterTransport {
     method: string,
     opts?: CallOptions,
   ): Promise<void> {
+    await writeFrame(send, this.headerBytes(service, method, opts), HEADER);
+  }
+
+  /** AEv1-encoded StreamHeader for one call (Aster-SPEC §6.9). */
+  private headerBytes(service: string, method: string, opts?: CallOptions): Uint8Array {
     const [keys, values] = buildMetadata(opts?.metadata);
-    const header = new StreamHeader({
+    return encodeStreamHeader({
       service,
       method,
       version: 1,
       callId: opts?.callId ?? 0,
       deadline: opts?.deadlineSecs ?? 0,
-      serializationMode: opts?.serializationMode ?? (this.codec instanceof JsonCodec ? 3 : 0),
+      serializationMode: opts?.serializationMode ?? 0,
       metadataKeys: keys,
       metadataValues: values,
       sessionId: this.sessionId,
     });
-    const headerBytes = this.codec.encode(header);
-    await writeFrame(send, headerBytes, HEADER);
   }
 
   private checkTrailer(data: Uint8Array): void {
     if (data.length === 0) return; // empty trailer = OK
-    const status = this.codec.decode(data) as RpcStatus;
+    const status = decodeRpcStatus(data);
     if (status.code !== StatusCode.OK) {
       throw RpcError.fromStatus(
         status.code as any,

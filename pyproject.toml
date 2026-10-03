@@ -8,8 +8,11 @@ version = "0.3.0"
 description = "Aster RPC framework with Iroh P2P transport (Python bindings)"
 requires-python = ">=3.9,<3.14"
 dependencies = [
-    "pyfory==0.17.0",
-    "zstandard>=0.25.0",
+    # Payload codec: Apache Fory, pinned to the same release line as Rust core
+    # (core/src/xlang.rs FORY_VERSION = 1.7.6). TODO(P2): bump to ==1.7.6 once
+    # it clears the local package-cooldown policy (2026-10-05); 1.7.5 -> 1.7.6
+    # changed only Java JSON, no Python or wire bytes.
+    "pyfory==1.7.5",
     "tomli>=2.0; python_version < '3.11'",
     # uvloop: libuv-backed asyncio replacement, ~20-25% faster on the
     # RPC hot path. Required on Linux/macOS, skipped on Windows (no
@@ -40,9 +43,6 @@ testpaths = ["tests/python"]
 # before counting them as failures.  Requires pytest-rerunfailures.
 reruns = 2
 reruns_delay = 2
-# Suppress known Cython warning from pyfory's internal pxd/enum mismatch.
-# pyfory 0.16.0 ships a cpdef enum in a .pxd file whose Python wrapper is
-# not importable from pyfory.includes.libformat.  Benign third-party issue.
 markers = [
     "network: tests that require real network I/O (node pairs, gossip, etc.)",
     "iroh_primitives: tests for iroh upstream primitives (blobs, docs, gossip, dumbpipe, raw QUIC). Run when iroh deps or our Rust binding changes.",

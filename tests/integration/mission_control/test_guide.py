@@ -538,10 +538,21 @@ async def run_dev_mode(address: str, work_dir: str | None) -> None:
             next(iter(client._rpc_conns), ""), None
         )
         if mc_transport is not None:
+            # JSON mode is retired: send a minimal Fory probe. The server
+            # rejects a session-scoped service on the StreamHeader
+            # (sessionId == 0) before it decodes the request.
+            from dataclasses import dataclass as _dc
+            from aster import ForyCodec, SerializationMode, wire_type
             from aster.transport.iroh import IrohTransport
-            from aster.json_codec import JsonProxyCodec
-            raw = IrohTransport(mc_transport, codec=JsonProxyCodec())
-            await raw.unary("AgentSession", "register", {"agent_id": "scope-test"})
+
+            @wire_type("mission.test/ScopeProbe")
+            @_dc
+            class ScopeProbe:
+                agent_id: str = ""
+
+            probe_codec = ForyCodec(mode=SerializationMode.XLANG, types=[ScopeProbe])
+            raw = IrohTransport(mc_transport, codec=probe_codec)
+            await raw.unary("AgentSession", "register", ScopeProbe(agent_id="scope-test"))
             fail("scope mismatch guard", "call succeeded (should have been rejected)")
         else:
             ok("scope mismatch (skipped -- no rpc connection)")

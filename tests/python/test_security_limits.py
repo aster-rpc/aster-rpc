@@ -6,7 +6,6 @@ import json
 import struct
 
 import pytest
-import zstandard
 
 from aster.limits import (
     HEX_FIELD_LENGTHS,
@@ -141,8 +140,9 @@ class TestDecompressionBomb:
         codec = ForyCodec(mode=SerializationMode.XLANG)
         # Create a payload significantly larger than the limit
         large_data = b"\x00" * (MAX_DECOMPRESSED_SIZE * 2)
-        cctx = zstandard.ZstdCompressor()
-        bomb = cctx.compress(large_data)
+        from aster.wire import compress_payload
+        bomb, compressed = compress_payload(large_data, 0)
+        assert compressed
         # The bomb is tiny but decompresses to 2x limit → must be rejected
         assert len(bomb) < 2000  # compressed should be tiny
         with pytest.raises(LimitExceeded, match="decompressed payload"):
@@ -156,7 +156,7 @@ class TestFrameReadTimeout:
     def test_read_frame_has_timeout_parameter(self):
         """Verify read_frame accepts a timeout_s parameter."""
         import inspect
-        from aster.framing import read_frame
+        from aster.wire import read_frame
 
         sig = inspect.signature(read_frame)
         assert "timeout_s" in sig.parameters

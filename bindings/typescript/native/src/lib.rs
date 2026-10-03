@@ -13,6 +13,7 @@ mod call;
 mod contract;
 mod crypto;
 mod docs;
+mod envelope;
 mod error;
 mod gossip;
 mod hooks;

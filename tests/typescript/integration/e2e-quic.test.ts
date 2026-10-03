@@ -23,7 +23,8 @@ import {
   WireType,
   ServiceRegistry,
   RpcServer,
-  JsonCodec,
+  ForyCodec,
+  newXlangFory,
   RpcPattern,
   IrohTransport,
   createClient,
@@ -66,6 +67,44 @@ class PingResponse {
   constructor(init?: Partial<PingResponse>) { if (init) Object.assign(this, init); }
 }
 
+@WireType('e2e/CountRequest')
+class CountRequest {
+  n = 0;
+  constructor(init?: Partial<CountRequest>) { if (init) Object.assign(this, init); }
+}
+
+@WireType('e2e/Value')
+class Value {
+  value = 0;
+  constructor(init?: Partial<Value>) { if (init) Object.assign(this, init); }
+}
+
+@WireType('e2e/Total')
+class Total {
+  total = 0;
+  constructor(init?: Partial<Total>) { if (init) Object.assign(this, init); }
+}
+
+/**
+ * One Fory runtime (xlang, compatible, ref off) shared by the in-process
+ * server and client: JSON mode is retired, so payloads are always Fory.
+ */
+function e2eCodec(): ForyCodec {
+  const { fory, Type } = newXlangFory();
+  const codec = new ForyCodec(fory);
+  const reg = (cls: any, typeName: string, props: Record<string, any>) => {
+    const t = Type.struct({ namespace: 'e2e', typeName }, props, { withConstructor: true });
+    t.initMeta(cls);
+    codec.registerType(t);
+  };
+  reg(PingRequest, 'PingRequest', { message: Type.string() });
+  reg(PingResponse, 'PingResponse', { reply: Type.string() });
+  reg(CountRequest, 'CountRequest', { n: Type.int32() });
+  reg(Value, 'Value', { value: Type.int32() });
+  reg(Total, 'Total', { total: Type.int32() });
+  return codec;
+}
+
 @Service({ name: 'PingService', version: 1 })
 class PingService {
   @Rpc()
@@ -74,19 +113,19 @@ class PingService {
   }
 
   @ServerStream()
-  async *count(req: { n: number }): AsyncGenerator<{ value: number }> {
+  async *count(req: CountRequest): AsyncGenerator<Value> {
     for (let i = 1; i <= req.n; i++) {
-      yield { value: i };
+      yield new Value({ value: i });
     }
   }
 
   @ClientStream()
-  async sum(reqs: AsyncIterable<{ value: number }>): Promise<{ total: number }> {
+  async sum(reqs: AsyncIterable<Value>): Promise<Total> {
     let total = 0;
     for await (const req of reqs) {
       total += req.value;
     }
-    return { total };
+    return new Total({ total });
   }
 
   @BidiStream()
@@ -104,6 +143,7 @@ describe('E2E: TS server + TS client over QUIC', () => {
   let clientNode: any;
   let rpcServer: RpcServer;
   let serverRunning: Promise<void>;
+  let codec: ForyCodec;
 
   beforeAll(async () => {
     if (!available) return;
@@ -120,7 +160,8 @@ describe('E2E: TS server + TS client over QUIC', () => {
     // Set up RPC server
     const registry = new ServiceRegistry();
     registry.register(new PingService());
-    rpcServer = new RpcServer({ registry, codec: new JsonCodec() });
+    codec = e2eCodec();
+    rpcServer = new RpcServer({ registry, codec });
 
     // Start server in background
     serverRunning = rpcServer.serve(serverNode);
@@ -139,14 +180,23 @@ describe('E2E: TS server + TS client over QUIC', () => {
 
     // Client connects to server
     const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
-    const transport = new IrohTransport(conn);
+    const transport = new IrohTransport(conn, codec);
 
     // Make a real unary RPC call
-    const response = await transport.unary('PingService', 'ping', { message: 'hello' });
+    const response = await transport.unary('PingService', 'ping', new PingRequest({ message: 'hello' }));
 
     expect(response).toBeDefined();
     expect((response as any).reply).toBe('pong: hello');
 
+    conn.close(0, 'done');
+  });
+
+  it.skipIf(!available)('unary RPC with payloads above the zstd threshold', async () => {
+    const conn = await clientNode.connect(serverNode.nodeId(), Buffer.from('aster/1'));
+    const transport = new IrohTransport(conn, codec);
+    const big = 'x'.repeat(64 * 1024);
+    const response = await transport.unary('PingService', 'ping', new PingRequest({ message: big }));
+    expect((response as any).reply).toBe(`pong: ${big}`);
     conn.close(0, 'done');
   });
 
@@ -155,10 +205,10 @@ describe('E2E: TS server + TS client over QUIC', () => {
     const RPC_ALPN = Buffer.from('aster/1');
 
     const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
-    const transport = new IrohTransport(conn);
+    const transport = new IrohTransport(conn, codec);
 
     const items: number[] = [];
-    for await (const item of transport.serverStream('PingService', 'count', { n: 5 })) {
+    for await (const item of transport.serverStream('PingService', 'count', new CountRequest({ n: 5 }))) {
       items.push((item as any).value);
     }
 
@@ -250,12 +300,12 @@ describe('E2E: TS server + TS client over QUIC', () => {
     const RPC_ALPN = Buffer.from('aster/1');
 
     const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
-    const transport = new IrohTransport(conn);
+    const transport = new IrohTransport(conn, codec);
 
     async function* values() {
-      yield { value: 10 };
-      yield { value: 20 };
-      yield { value: 30 };
+      yield new Value({ value: 10 });
+      yield new Value({ value: 20 });
+      yield new Value({ value: 30 });
     }
 
     const result = await transport.clientStream('PingService', 'sum', values());
@@ -269,13 +319,13 @@ describe('E2E: TS server + TS client over QUIC', () => {
     const RPC_ALPN = Buffer.from('aster/1');
 
     const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
-    const transport = new IrohTransport(conn);
+    const transport = new IrohTransport(conn, codec);
 
     const channel = transport.bidiStream('PingService', 'echo');
 
     // Send messages
-    await channel.send({ message: 'hello' });
-    await channel.send({ message: 'world' });
+    await channel.send(new PingRequest({ message: 'hello' }));
+    await channel.send(new PingRequest({ message: 'world' }));
     await channel.close(); // Signal end of sends
 
     // Collect responses
@@ -311,7 +361,7 @@ describe('E2E: TS server + TS client over QUIC', () => {
     const serverEndpointId = serverNode.nodeId();
     const RPC_ALPN = Buffer.from('aster/1');
     const conn = await clientNode.connect(serverEndpointId, RPC_ALPN);
-    const transport = new IrohTransport(conn);
+    const transport = new IrohTransport(conn, codec);
 
     const client = createClient(PingService, transport);
     const response = await client.ping(new PingRequest({ message: 'typed client' }));

@@ -69,8 +69,8 @@ class IngestResult:
     # Java peers declare these as ``int`` (32-bit); pyfory's bare ``int``
     # defaults to ``int64`` and the fingerprint tuple diverges, so pin
     # the wire width explicitly.
-    accepted: pyfory.int32 = 0
-    dropped: pyfory.int32 = 0
+    accepted: pyfory.Int32 = 0
+    dropped: pyfory.Int32 = 0
 
 
 # -- Chapter 4: Sessions & Commands -------------------------------------------
@@ -102,4 +102,4 @@ class CommandResult:
     stdout: str = ""
     stderr: str = ""
     # Java peers declare ``int`` (32-bit); pin to match.
-    exit_code: pyfory.int32 = -1
+    exit_code: pyfory.Int32 = -1

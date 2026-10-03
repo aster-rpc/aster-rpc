@@ -23,15 +23,16 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 import aster
 from aster._aster import AsterCall, StreamAcquireError
 from aster.codec import ForyCodec, ForyConfig
-from aster.framing import (
+from aster.wire import (
     COMPRESSED,
     END_STREAM,
     HEADER,
     ROW_SCHEMA,
     TRAILER,
+    RpcStatus,
+    StreamHeader,
     encode_frame,
 )
-from aster.protocol import RpcStatus, StreamHeader
 from aster.rpc_types import SerializationMode
 from aster.status import RpcError, StatusCode
 from aster.transport.base import (
@@ -137,14 +138,14 @@ class _CallDriver:
             service=service,
             method=method,
             version=1,
-            callId=0,
+            call_id=0,
             deadline=deadline_secs,
-            serializationMode=serialization_mode,
-            metadataKeys=keys,
-            metadataValues=values,
-            sessionId=session_id,
+            serialization_mode=serialization_mode,
+            metadata_keys=keys,
+            metadata_values=values,
+            session_id=session_id,
         )
-        header_bytes = self._codec.encode(header)
+        header_bytes = header.encode()
         await self._call.send_frame(encode_frame(header_bytes, HEADER))
 
     async def send_request(self, request: Any, *, last: bool = True) -> None:
@@ -186,12 +187,12 @@ class _CallDriver:
         """
         if not payload:
             return
-        status = self._codec.decode(payload, RpcStatus)
+        status = RpcStatus.decode(payload)
         if status.code != StatusCode.OK:
             raise RpcError.from_status(
                 StatusCode(status.code),
                 status.message,
-                dict(zip(status.detailKeys, status.detailValues)),
+                dict(zip(status.detail_keys, status.detail_values)),
             )
 
     def release(self) -> None:
@@ -235,12 +236,7 @@ class IrohTransport(Transport):
             fory_config=fory_config,
         )
         self._session_id = session_id
-        from aster.json_codec import JsonProxyCodec
-        self._default_serialization_mode = (
-            SerializationMode.JSON.value
-            if isinstance(self._codec, JsonProxyCodec)
-            else SerializationMode.XLANG.value
-        )
+        self._default_serialization_mode = SerializationMode.XLANG.value
 
     @property
     def session_id(self) -> int:
@@ -277,19 +273,19 @@ class IrohTransport(Transport):
             service=service,
             method=method,
             version=1,
-            callId=0,
+            call_id=0,
             deadline=deadline_secs,
-            serializationMode=resolved_mode,
-            metadataKeys=keys,
-            metadataValues=values,
-            sessionId=self._session_id,
+            serialization_mode=resolved_mode,
+            metadata_keys=keys,
+            metadata_values=values,
+            session_id=self._session_id,
         )
-        header_bytes = self._codec.encode(header)
+        header_bytes = header.encode()
         header_frame = encode_frame(header_bytes, HEADER)
         req_payload, compressed = self._codec.encode_compressed(request)
         req_flags = END_STREAM | (COMPRESSED if compressed else 0)
         request_frame = encode_frame(req_payload, req_flags)
-        request_pair = bytes(header_frame) + bytes(request_frame)
+        request_pair = header_frame + request_frame
 
         try:
             response_bytes, response_flags, trailer_bytes = (
@@ -302,12 +298,12 @@ class IrohTransport(Transport):
 
         # Trailer: empty == clean OK; non-empty carries an RpcStatus.
         if trailer_bytes:
-            status = self._codec.decode(trailer_bytes, RpcStatus)
+            status = RpcStatus.decode(trailer_bytes)
             if status.code != StatusCode.OK:
                 raise RpcError.from_status(
                     StatusCode(status.code),
                     status.message,
-                    dict(zip(status.detailKeys, status.detailValues)),
+                    dict(zip(status.detail_keys, status.detail_values)),
                 )
 
         if not response_bytes:
@@ -555,7 +551,7 @@ class IrohBidiChannel(BidiChannel):
                     driver.release()
                     self._driver = None
                     return None
-                status = self._codec.decode(payload, RpcStatus)
+                status = RpcStatus.decode(payload)
                 self._last_trailer = (status.code, status.message)
                 if status.code != StatusCode.OK:
                     driver.discard()
@@ -563,7 +559,7 @@ class IrohBidiChannel(BidiChannel):
                     raise RpcError.from_status(
                         StatusCode(status.code),
                         status.message,
-                        dict(zip(status.detailKeys, status.detailValues)),
+                        dict(zip(status.detail_keys, status.detail_values)),
                     )
                 driver.release()
                 self._driver = None
@@ -602,7 +598,7 @@ class IrohBidiChannel(BidiChannel):
                 if not payload:
                     self._last_trailer = (StatusCode.OK, "")
                 else:
-                    status = self._codec.decode(payload, RpcStatus)
+                    status = RpcStatus.decode(payload)
                     self._last_trailer = (status.code, status.message)
                 driver.release()
                 self._driver = None

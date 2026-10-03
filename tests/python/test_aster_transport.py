@@ -17,8 +17,7 @@ from typing import AsyncIterator
 import pytest
 
 from aster.codec import wire_type, ForyCodec, ForyConfig
-from aster.framing import HEADER, TRAILER, COMPRESSED, write_frame, read_frame
-from aster.protocol import StreamHeader, RpcStatus
+from aster.wire import HEADER, TRAILER, COMPRESSED, RpcStatus, StreamHeader, write_frame, read_frame
 from aster.rpc_types import SerializationMode
 from aster.status import StatusCode
 from aster.transport.base import (
@@ -533,7 +532,7 @@ class TestIrohTransportIntegration:
                 payload, flags = frame
                 assert flags & HEADER
 
-                header = codec.decode(payload, StreamHeader)
+                header = StreamHeader.decode(payload)
                 assert header.service == "TestService"
                 assert header.method == "Echo"
 
@@ -561,7 +560,7 @@ class TestIrohTransportIntegration:
 
                 # Write OK trailer
                 trailer = RpcStatus(code=StatusCode.OK, message="")
-                await write_frame(send, codec.encode(trailer), flags=TRAILER)
+                await write_frame(send, trailer.encode(), flags=TRAILER)
                 await send.finish()
             finally:
                 conn.close(0, b"done")

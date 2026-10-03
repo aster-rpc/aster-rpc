@@ -291,12 +291,94 @@ export interface WireTypeOptions {
 export function WireType(tag: string, options?: WireTypeOptions) {
   return function <T extends new (...args: any[]) => any>(
     target: T,
-    _context: ClassDecoratorContext,
+    context: ClassDecoratorContext,
   ): T {
     (target as any)[WIRE_TYPE_KEY] = tag;
     if (options?.metadata) {
       (target as any)[WIRE_TYPE_FIELDS_KEY] = options.metadata;
     }
+    const defaults = (context?.metadata as any)?.[CONTRACT_DEFAULTS_KEY];
+    if (defaults) {
+      Object.defineProperty(target, CONTRACT_DEFAULTS_KEY, { value: { ...defaults } });
+    }
     return target;
   };
+}
+
+// -- Contract defaults ------------------------------------------------------------
+
+// TC39 decorator metadata needs `Symbol.metadata`; Node does not ship it yet.
+// `Symbol.for('Symbol.metadata')` is the shared fallback that TypeScript- and
+// esbuild-compiled decorators both pick up.
+(Symbol as any).metadata ??= Symbol.for('Symbol.metadata');
+
+/** Static key holding a `@WireType` class's declared contract defaults. */
+export const CONTRACT_DEFAULTS_KEY = Symbol.for('aster.contract_defaults');
+
+/** Marker for `@ContractDefault()` without an argument (default = initializer). */
+const FROM_INITIALIZER = Symbol.for('aster.contract_default.initializer');
+
+/**
+ * Declare a field's **contract default** (Aster-ContractIdentity §11.3.2.3).
+ *
+ * Every TypeScript field needs an initializer, so a plain initializer is
+ * *not* a contract default: such a field stays `required` in the contract.
+ * Mark the fields whose default is part of the contract -- the value is then
+ * baked into `contract_id` (`FieldDef.required = false`, `default_value` =
+ * the canonical encoding), exactly as Rust's `#[aster(default = ...)]`.
+ *
+ * - `@ContractDefault()` -- the field's initializer is the default.
+ * - `@ContractDefault(value)` -- `value` is the default (should equal the
+ *   initializer).
+ *
+ * Allowed: `string`, `boolean`, `i32`/`i64`/`bigint`, `number` (float64),
+ * nullable scalars (non-null default), and empty `[]` / `Set` / `Map` /
+ * `Record`. Anything else fails at `aster-gen` time. Defaults never change
+ * the Fory payload bytes. `aster-gen` reads these decorators statically,
+ * so the value must be a literal.
+ *
+ * @example
+ * ```ts
+ * @WireType('defaults.v1/Settings')
+ * class Settings {
+ *   name = '';                          // required
+ *   @ContractDefault() state = 'idle';  // default "idle"
+ *   @ContractDefault() retries: i32 = i32(-3);
+ *   @ContractDefault() tags: string[] = [];
+ * }
+ * ```
+ * @group Decorators
+ */
+export function ContractDefault(...args: [] | [value: unknown]) {
+  const declared = args.length > 0 ? args[0] : FROM_INITIALIZER;
+  return function (_value: undefined, context: ClassFieldDecoratorContext): void {
+    const meta = context.metadata as Record<PropertyKey, any> | undefined;
+    if (!meta) return;
+    const own = Object.prototype.hasOwnProperty.call(meta, CONTRACT_DEFAULTS_KEY)
+      ? meta[CONTRACT_DEFAULTS_KEY]
+      : (meta[CONTRACT_DEFAULTS_KEY] = { ...(meta[CONTRACT_DEFAULTS_KEY] ?? {}) });
+    own[String(context.name)] = declared;
+  };
+}
+
+/**
+ * The contract defaults declared on a `@WireType` class, as
+ * `{ fieldName: value }`. Fields declared with a bare `@ContractDefault()`
+ * resolve to the value a default-constructed instance holds.
+ */
+export function getContractDefaults(cls: new (...args: any[]) => any): Record<string, unknown> {
+  const raw: Record<string, unknown> | undefined =
+    (cls as any)[CONTRACT_DEFAULTS_KEY] ?? (cls as any)[(Symbol as any).metadata]?.[CONTRACT_DEFAULTS_KEY];
+  if (!raw) return {};
+  const out: Record<string, unknown> = {};
+  let instance: any;
+  for (const [name, v] of Object.entries(raw)) {
+    if (v === FROM_INITIALIZER) {
+      instance ??= new cls();
+      out[name] = instance[name];
+    } else {
+      out[name] = v;
+    }
+  }
+  return out;
 }

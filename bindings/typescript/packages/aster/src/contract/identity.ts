@@ -62,6 +62,19 @@ const PATTERN_NAMES: Record<number, string> = {
 const SCOPE_NAMES: Record<number, string> = { 0: 'shared', 1: 'stream' };
 const CAP_NAMES: Record<number, string> = { 0: 'role', 1: 'any_of', 2: 'all_of' };
 
+const MODE_NAMES: Record<number, string> = { 0: 'xlang', 1: 'native', 2: 'row' };
+
+/**
+ * Normalise declared serialization modes to the canonical lowercase names.
+ * An empty / absent list means the default, `["xlang"]` -- the same default
+ * the Rust (`#[aster::service]`) and Python producers apply, so the three
+ * compute the same `contract_id` for the same service.
+ */
+export function canonicalSerializationModes(modes?: readonly (number | string)[]): string[] {
+  const out = (modes ?? []).map(m => (typeof m === 'number' ? MODE_NAMES[m] ?? String(m) : m.toLowerCase()));
+  return out.length > 0 ? out : ['xlang'];
+}
+
 function hex(data: Uint8Array): string {
   return Array.from(data, b => b.toString(16).padStart(2, '0')).join('');
 }
@@ -285,7 +298,7 @@ export function contractIdFromService(serviceClass: new (...args: any[]) => any)
     name: info.name,
     version: info.version,
     methods: [],
-    serializationModes: [],
+    serializationModes: canonicalSerializationModes(info.serializationModes),
     // Accept both the canonical 'session' value and the legacy 'stream' alias.
     scoped: (info.scoped === 'session' || info.scoped === 'stream') ? 1 : 0,
     requires: undefined,
@@ -354,12 +367,13 @@ export function fromServiceInfo(info: {
     responseTypeHash?: Uint8Array;
   }>;
   requires?: { kind: string; roles: string[] };
+  serializationModes?: readonly (number | string)[];
 }): ServiceContract {
   const contract: ServiceContract = {
     name: info.name,
     version: info.version,
     methods: [],
-    serializationModes: [],
+    serializationModes: canonicalSerializationModes(info.serializationModes),
     // Accept both the canonical 'session' value and the legacy 'stream' alias.
     scoped: (info.scoped === 'session' || info.scoped === 'stream') ? 1 : 0,
     requires: info.requires ? { kind: info.requires.kind === 'any_of' ? 1 : 2, roles: info.requires.roles } : undefined,

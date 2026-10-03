@@ -72,14 +72,27 @@ export {
   END_STREAM,
   FramingError,
   writeFrame,
+  writePayloadFrame,
   readFrame,
   encodeFrame,
+  encodePayloadFrame,
   decodeFrame,
+  payloadOf,
   type FrameResult,
 } from './framing.js';
 
-// Protocol types
-export { StreamHeader, CallHeader, RpcStatus } from './protocol.js';
+// Protocol envelope (AEv1, Aster-SPEC §6.9; encoded by Rust core)
+export {
+  StreamHeader,
+  CallHeader,
+  RpcStatus,
+  encodeStreamHeader,
+  decodeStreamHeader,
+  encodeCallHeader,
+  decodeCallHeader,
+  encodeRpcStatus,
+  decodeRpcStatus,
+} from './protocol.js';
 
 // Service metadata and registry
 export {
@@ -107,8 +120,11 @@ export {
   ClientStream,
   BidiStream,
   WireType,
+  ContractDefault,
+  getContractDefaults,
   WIRE_TYPE_KEY,
   WIRE_TYPE_FIELDS_KEY,
+  CONTRACT_DEFAULTS_KEY,
   type ServiceOptions,
   type WireTypeOptions,
 } from './decorators.js';
@@ -138,19 +154,29 @@ export {
 
 // Codec
 export {
-  JsonCodec,
   ForyCodec,
   DEFAULT_COMPRESSION_THRESHOLD,
   walkTypeGraph,
   wireType,
-  resolveForyConfig,
   type Codec,
-  type ForyConfig,
-  type ResolvedForyConfig,
 } from './codec.js';
 
-// XLANG Fory helpers
-export { createXlangCodec, getXlangForyAndType, newXlangFory } from './xlang.js';
+// XLANG Fory helpers (the one Fory configuration: xlang, compatible, ref off)
+export {
+  createXlangCodec,
+  getXlangForyAndType,
+  newXlangFory,
+  FORY_VERSION,
+  FORY_OPTIONS,
+} from './xlang.js';
+
+// Canonical wire primitives + contract-default lowering (§11.3.2.3)
+export {
+  CANONICAL_PRIMITIVES,
+  encodeContractDefault,
+  foryTypeFor,
+  type CanonicalPrimitive,
+} from './wire-types.js';
 
 // Simple trust-config primitives (Rust core + Fory XLANG)
 export {
@@ -259,9 +285,6 @@ export {
   createDynamicType,
   type DynamicType,
 } from './dynamic.js';
-
-// Session-scoped services (extended)
-export { SessionServer, SessionStub, createSession } from './session.js';
 
 // Transport implementations
 export { IrohTransport } from './transport/iroh.js';

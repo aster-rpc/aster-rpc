@@ -23,6 +23,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import ts from 'typescript';
+import { encodeContractDefault, foryTypeExpr } from '../wire-types.js';
 
 // ─── CLI argv ────────────────────────────────────────────────────────────────
 
@@ -165,17 +166,32 @@ function literalValue(expr: ts.Expression): unknown {
  * Canonical wire-type tokens that can appear on a `@WireType` field.
  * Kept in sync with `src/generated.ts`.
  */
-type ScanField =
+type ScanField = (
   | { name: string; kind: 'primitive'; wire: string; nullable: boolean }
   | { name: string; kind: 'ref'; refTag: string; nullable: boolean }
   | { name: string; kind: 'list'; element: ScanField; nullable: boolean }
   | { name: string; kind: 'set'; element: ScanField; nullable: boolean }
-  | { name: string; kind: 'map'; key: ScanField; value: ScanField; nullable: boolean };
+  | { name: string; kind: 'map'; key: ScanField; value: ScanField; nullable: boolean }
+) & {
+  /**
+   * Contract default declared with `@ContractDefault` (§11.3.2.3), as the
+   * hex `FieldDef.default_value`. Absent = required field. Top-level
+   * fields only.
+   */
+  contractDefaultHex?: string;
+  /** The declared default value itself (for the manifest). */
+  contractDefaultValue?: unknown;
+};
 
-/** Maps a brand tag (from `src/brand.ts`) to its wire primitive. */
+/**
+ * Maps a brand tag (from `src/brand.ts`) to its canonical wire primitive.
+ * Integer brands use Fory's varint encodings (what `Type.int32()` etc.
+ * emit, and what Rust `i32`/`i64`/`u32`/`u64` use), so their canonical
+ * names are `varint32` / `varint64` / `var_uint32` / `var_uint64`.
+ */
 const BRAND_WIRE: Record<string, string> = {
-  i8: 'int8', i16: 'int16', i32: 'int32', i64: 'int64',
-  u8: 'uint8', u16: 'uint16', u32: 'uint32', u64: 'uint64',
+  i8: 'int8', i16: 'int16', i32: 'varint32', i64: 'varint64',
+  u8: 'uint8', u16: 'uint16', u32: 'var_uint32', u64: 'var_uint64',
   f32: 'float32', f64: 'float64',
 };
 
@@ -184,10 +200,10 @@ const PRIMITIVE_WIRE: Record<string, string> = {
   string: 'string',
   number: 'float64',
   boolean: 'bool',
-  int8: 'int8', int16: 'int16', int32: 'int32', int64: 'int64',
-  uint8: 'uint8', uint16: 'uint16', uint32: 'uint32', uint64: 'uint64',
-  Float32: 'float32', Float64: 'float64',
-  undefined: 'string', // fallback for unknown
+  bigint: 'varint64',
+  i8: 'int8', i16: 'int16', i32: 'varint32', i64: 'varint64',
+  u8: 'uint8', u16: 'uint16', u32: 'var_uint32', u64: 'var_uint64',
+  f32: 'float32', f64: 'float64',
 };
 
 /** Spec §11.3.2.3 suspicious-field regex for `number` fields. */
@@ -288,7 +304,7 @@ function typeToFieldInner(
     return { name, kind: 'primitive', wire: 'float64', nullable: false };
   }
   if (t.flags & ts.TypeFlags.BigIntLike) {
-    return { name, kind: 'primitive', wire: 'int64', nullable: false };
+    return { name, kind: 'primitive', wire: 'varint64', nullable: false };
   }
   if (t.flags & ts.TypeFlags.StringLike) {
     return { name, kind: 'primitive', wire: 'string', nullable: false };
@@ -446,6 +462,104 @@ const METHOD_DECORATORS: Record<string, ScannedMethod['pattern']> = {
   BidiStream: 'bidi_stream',
 };
 
+// ─── Contract defaults (§11.3.2.3) ───────────────────────────────────────────
+
+const NOT_A_LITERAL = Symbol('not-a-literal');
+
+/**
+ * Evaluate a default-value expression the scanner can resolve statically:
+ * string / number / boolean / bigint literals (with unary minus), `null`,
+ * empty `[]` / `{}` / `new Map()` / `new Set()`, brand casts like
+ * `i32(-3)`, and `x as T` / `<T>x` / parenthesised wrappers.
+ */
+function staticValue(expr: ts.Expression): unknown {
+  if (ts.isParenthesizedExpression(expr) || ts.isAsExpression(expr) ||
+      ts.isTypeAssertionExpression(expr) || ts.isSatisfiesExpression(expr) ||
+      ts.isNonNullExpression(expr)) {
+    return staticValue(expr.expression);
+  }
+  if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) return expr.text;
+  if (ts.isNumericLiteral(expr)) return Number(expr.text.replace(/_/g, ''));
+  if (ts.isBigIntLiteral(expr)) return BigInt(expr.text.replace(/_/g, '').slice(0, -1));
+  if (expr.kind === ts.SyntaxKind.TrueKeyword) return true;
+  if (expr.kind === ts.SyntaxKind.FalseKeyword) return false;
+  if (expr.kind === ts.SyntaxKind.NullKeyword) return null;
+  if (ts.isPrefixUnaryExpression(expr) && expr.operator === ts.SyntaxKind.MinusToken) {
+    const v = staticValue(expr.operand);
+    if (typeof v === 'number') return -v;
+    if (typeof v === 'bigint') return -v;
+    return NOT_A_LITERAL;
+  }
+  if (ts.isArrayLiteralExpression(expr) && expr.elements.length === 0) return [];
+  if (ts.isObjectLiteralExpression(expr) && expr.properties.length === 0) return {};
+  if (ts.isNewExpression(expr) && ts.isIdentifier(expr.expression) &&
+      (expr.expression.text === 'Map' || expr.expression.text === 'Set') &&
+      (expr.arguments?.length ?? 0) === 0) {
+    return expr.expression.text === 'Map' ? new Map() : new Set();
+  }
+  // Brand cast helpers: i32(-3), i64(5n), f64(0.5), ...
+  if (ts.isCallExpression(expr) && ts.isIdentifier(expr.expression) &&
+      expr.expression.text in BRAND_WIRE && expr.arguments.length === 1) {
+    return staticValue(expr.arguments[0]!);
+  }
+  return NOT_A_LITERAL;
+}
+
+/**
+ * Lower an `@ContractDefault(...)` decorator on a property into the
+ * field's `FieldDef.required` / `default_value`. `@ContractDefault()`
+ * with no argument takes the property initializer as the default.
+ */
+function applyContractDefault(field: ScanField, decl: ts.PropertyDeclaration): void {
+  const dec = findDecorator(decl, ['ContractDefault']);
+  if (!dec) return;
+  const loc = locationOf(dec);
+  let expr: ts.Expression | undefined;
+  if (ts.isCallExpression(dec.expression) && dec.expression.arguments.length > 0) {
+    expr = dec.expression.arguments[0];
+  } else {
+    expr = decl.initializer;
+    if (!expr) {
+      throw new ScanError(
+        `@ContractDefault() on '${field.name}' needs an argument or a property initializer`,
+        loc,
+      );
+    }
+  }
+  const value = staticValue(expr!);
+  if (value === NOT_A_LITERAL) {
+    throw new ScanError(
+      `@ContractDefault on '${field.name}': the default must be a literal ` +
+      `(string, number, boolean, bigint, or an empty []/{}/Map/Set)`,
+      loc,
+    );
+  }
+  // A null default is not expressible in v1: the field stays required (§11.3.2.3).
+  if (value === null) return;
+  if (field.kind === 'ref') {
+    throw new ScanError(
+      `@ContractDefault on '${field.name}': a nested message may only default to null (§11.3.2.3 rule 3)`,
+      loc,
+    );
+  }
+  const container = field.kind === 'primitive' ? 'none' : field.kind;
+  const leaf = field.kind === 'primitive' ? field
+    : field.kind === 'map' ? field.value
+      : field.element;
+  const prim = leaf.kind === 'primitive' ? leaf.wire : '';
+  try {
+    field.contractDefaultHex = encodeContractDefault(prim, container, value, field.name);
+  } catch (e) {
+    throw new ScanError(`@ContractDefault: ${(e as Error).message}`, loc);
+  }
+  field.contractDefaultValue =
+    value instanceof Map ? {}
+      : value instanceof Set ? []
+        : typeof value === 'bigint'
+          ? (Number.isSafeInteger(Number(value)) ? Number(value) : value.toString())
+          : value;
+}
+
 function scanWireType(
   ctx: ScanContext,
   classDecl: ts.ClassDeclaration,
@@ -475,6 +589,7 @@ function scanWireType(
 
     const propType = ctx.checker.getTypeOfSymbolAtLocation(prop, decl);
     const field = typeToField(ctx, prop.getName(), propType, locationOf(decl));
+    applyContractDefault(field, decl);
     fields.push(field);
   }
 
@@ -879,8 +994,8 @@ function scanFieldToFieldDef(
     container_key_kind: 'primitive',
     container_key_primitive: '',
     container_key_ref: '',
-    required: true,
-    default_value: '',
+    required: f.contractDefaultHex === undefined,
+    default_value: f.contractDefaultHex ?? '',
   };
 
   if (f.kind === 'primitive' || f.kind === 'ref') {
@@ -1129,22 +1244,35 @@ ${fieldExprs}
   const buildAllTypesBody = wireTypes.map(w => {
     const ctorAlias = aliasFor.get(w.sym)!;
     const fieldsCode = w.fields.map(f => {
-      function fieldToTypeExpr(fld: typeof f): string {
-        const wrap = fld.nullable ? 'Type.optional(' : '';
-        const close = fld.nullable ? ')' : '';
+      function fieldToTypeExpr(fld: ScanField): string {
+        let expr: string;
         switch (fld.kind) {
           case 'primitive':
-            return `${wrap}Type.${fld.wire}()${close}`;
-          case 'ref':
-            // typesByTag has the type registered when we reach this field.
-            return `${wrap}typesByTag.get(${JSON.stringify(fld.refTag)})${close}`;
+            expr = foryTypeExpr(fld.wire);
+            break;
+          case 'ref': {
+            // Dependencies are registered first (topological order), so
+            // typesByTag has them. A back-edge (self / cyclic reference)
+            // isn't registered yet: refer to it by name, which Fory
+            // resolves when it generates the serializer. Clone before
+            // marking nullable: the registered TypeInfo is shared.
+            const { package: ns, name: tn } = splitTag(fld.refTag);
+            const byName = `Type.struct({ namespace: ${JSON.stringify(ns)}, typeName: ${JSON.stringify(tn)} })`;
+            expr = `(typesByTag.get(${JSON.stringify(fld.refTag)}) ?? ${byName})`;
+            if (fld.nullable) return `${expr}.clone().setNullable(true)`;
+            return expr;
+          }
           case 'list':
-            return `${wrap}Type.array(${fieldToTypeExpr(fld.element)})${close}`;
+            expr = `Type.list(${fieldToTypeExpr(fld.element)})`;
+            break;
           case 'set':
-            return `${wrap}Type.set(${fieldToTypeExpr(fld.element)})${close}`;
+            expr = `Type.set(${fieldToTypeExpr(fld.element)})`;
+            break;
           case 'map':
-            return `${wrap}Type.map(${fieldToTypeExpr(fld.key)}, ${fieldToTypeExpr(fld.value)})${close}`;
+            expr = `Type.map(${fieldToTypeExpr(fld.key)}, ${fieldToTypeExpr(fld.value)})`;
+            break;
         }
+        return fld.nullable ? `${expr}.setNullable(true)` : expr;
       }
       return `      ${JSON.stringify(f.name)}: ${fieldToTypeExpr(f)}`;
     }).join(',\n');
@@ -1298,8 +1426,8 @@ function scanFieldToManifest(f: ScanField): ManifestFieldOut {
   return {
     name: f.name,
     type: wireToManifestType(f),
-    required: !f.nullable,
-    default: manifestDefault(f),
+    required: !f.nullable && f.contractDefaultHex === undefined,
+    default: f.contractDefaultHex !== undefined ? f.contractDefaultValue : manifestDefault(f),
   };
 }
 

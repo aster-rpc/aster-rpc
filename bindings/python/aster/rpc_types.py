@@ -11,12 +11,15 @@ from enum import Enum, IntEnum
 
 
 class SerializationMode(IntEnum):
-    """Serialization protocol negotiated between client and server."""
+    """Serialization protocol negotiated between client and server.
+
+    Only XLANG interoperates across bindings; NATIVE and ROW are reserved
+    (Aster-SPEC §5.1). The former JSON mode (3) is retired.
+    """
 
     XLANG = 0
     NATIVE = 1
     ROW = 2
-    JSON = 3
 
 
 class RpcScope(str, Enum):

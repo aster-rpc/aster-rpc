@@ -254,7 +254,7 @@ export function BUILD_ALL_TYPES(
       { namespace: "mission", typeName: "Heartbeat" },
       {
       "agent_id": Type.string(),
-      "capabilities": Type.array(Type.string()),
+      "capabilities": Type.list(Type.string()),
       "load_avg": Type.float64()
       },
       { withConstructor: true },

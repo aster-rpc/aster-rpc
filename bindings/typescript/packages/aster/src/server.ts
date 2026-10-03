@@ -11,18 +11,23 @@
  */
 
 import type { Codec } from './codec.js';
-import { JsonCodec } from './codec.js';
+import { createXlangCodec } from './xlang.js';
 import {
   writeFrame,
+  writePayloadFrame,
   readFrame,
+  payloadOf,
   HEADER,
   TRAILER,
-  COMPRESSED,
   CANCEL,
   END_STREAM,
 } from './framing.js';
-import { SessionServer } from './session.js';
-import { StreamHeader, RpcStatus } from './protocol.js';
+import {
+  type StreamHeader,
+  decodeStreamHeader,
+  decodeRpcStatus,
+  encodeRpcStatus,
+} from './protocol.js';
 import { StatusCode, RpcError } from './status.js';
 import { RpcPattern } from './types.js';
 import type { ServiceRegistry, ServiceInfo, MethodInfo } from './service.js';
@@ -83,7 +88,7 @@ export interface ServerOptions {
  * ```ts
  * const server = new RpcServer({
  *   registry,
- *   codec: new JsonCodec(),
+ *   codec: createXlangCodec(),
  * });
  * await server.serve(node);
  * ```
@@ -102,7 +107,7 @@ export class RpcServer {
 
   constructor(opts: ServerOptions) {
     this.registry = opts.registry;
-    this.codec = opts.codec ?? new JsonCodec();
+    this.codec = opts.codec ?? createXlangCodec();
     this.interceptors = opts.interceptors ?? [new DeadlineInterceptor()];
     this.logger = opts.logger ?? createLogger();
     this.peerStore = opts.peerStore;
@@ -198,22 +203,14 @@ export class RpcServer {
         return false;
       }
 
-      // Sniff the first byte: '{' (0x7B) means JSON, anything else is binary
-      // (Fory XLANG). Try JSON decoding first if payload looks like JSON,
-      // since clients may send JSON even when the server advertises Fory
-      // (e.g., if the manifest incorrectly said JSON-only).
-      let header: StreamHeader | null = null;
-      if (payload && payload[0] === 0x7b /* '{' */) {
-        // Try JSON decoding first
-        try {
-          const jsonCodec = new JsonCodec();
-          header = jsonCodec.decode(payload) as StreamHeader;
-        } catch {
-          // JSON decode failed, try Fory
-        }
-      }
-      if (!header) {
-        header = this.codec.decode(payload) as StreamHeader;
+      // AEv1 envelope (Aster-SPEC §6.9), decoded by Rust core.
+      let header: StreamHeader;
+      try {
+        header = decodeStreamHeader(payload);
+      } catch (e) {
+        await this.writeErrorTrailer(send, StatusCode.INVALID_ARGUMENT,
+          `malformed StreamHeader: ${e instanceof Error ? e.message : String(e)}`);
+        return false;
       }
 
       if (!header.service) {
@@ -230,71 +227,21 @@ export class RpcServer {
 
       // ── Session discriminator check ─────────────────────────────────
       // Spec §6 (multiplexed streams): the method name always lives in
-      // the StreamHeader. Session-scoped services are indicated by
-      // `StreamHeader.sessionId != 0`, NOT by an empty method.
-      // Legacy v1 clients that still send `method=''` + CALL frames
-      // are routed through the pre-migration `SessionServer` path as
-      // long as the service is session-scoped AND the client used
-      // the legacy discriminator. Everyone else sends `method=<name>`
-      // and is dispatched through the normal per-pattern path
-      // regardless of scope.
-      const isLegacySessionStream = (header.method === '');
-      const isSessionService = (svcInfo.scoped === 'session');
-      const sessionId = (header as { sessionId?: number }).sessionId ?? 0;
-
-      if (isLegacySessionStream && !isSessionService) {
-        // Legacy session shape on a shared service — error out.
-        const msg = `'${header.service}' is shared: send a method name instead of opening a session stream (method='')`;
+      // the StreamHeader; session-scoped services are addressed with a
+      // non-zero `StreamHeader.sessionId`. The pre-migration session
+      // protocol (method='' + FLAG_CALL frames) is no longer served.
+      if (!header.method) {
+        await this.writeErrorTrailer(send, StatusCode.INVALID_ARGUMENT,
+          `missing method name for '${header.service}' (session streams with method='' ` +
+          `are no longer supported; send the method name and a non-zero sessionId)`);
+        return false;
+      }
+      if (svcInfo.scoped === 'session' && header.sessionId === 0) {
+        const msg = `'${header.service}' is session-scoped: call it with a non-zero StreamHeader.sessionId`;
         this.logger.warn(`scope mismatch: ${msg}`);
         await this.writeErrorTrailer(send, StatusCode.FAILED_PRECONDITION, msg);
         return false;
       }
-
-      if (!isLegacySessionStream && isSessionService && sessionId === 0) {
-        // Session-scoped service called with method name but no
-        // sessionId. Pre-migration behaviour: reject (the client
-        // should open a session stream).
-        const msg = `'${header.service}' is session-scoped: open a session stream (method='') instead of calling method '${header.method}' directly`;
-        this.logger.warn(`scope mismatch: ${msg}`);
-        await this.writeErrorTrailer(send, StatusCode.FAILED_PRECONDITION, msg);
-        return false;
-      }
-
-      if (isLegacySessionStream) {
-        let peerId: string | undefined;
-        try { peerId = conn.remoteNodeId(); } catch { /* ignore */ }
-
-        let attributes: Record<string, string> | undefined;
-        if (peerId && this.peerStore) {
-          const m = this.peerStore.getAttributes(peerId);
-          if (m.size > 0) attributes = Object.fromEntries(m);
-        }
-
-        let sessionPeerAddr: { host: string; port: number } | undefined;
-        let sessionRelayUrl: string | undefined;
-        let sessionRttMicros: number | undefined;
-        try {
-          const snap = conn.transportSnapshot?.();
-          if (snap) {
-            if (snap.peerAddr) {
-              sessionPeerAddr = { host: snap.peerAddr.host, port: snap.peerAddr.port };
-            }
-            sessionRelayUrl = snap.relayUrl ?? undefined;
-            sessionRttMicros = snap.rttMicros ?? undefined;
-          }
-        } catch { /* ignore */ }
-
-        const sessionServer = new SessionServer(this.codec, this.interceptors);
-        await sessionServer.handleSession(
-          recv, send, svcInfo, header, peerId, attributes,
-          sessionPeerAddr, sessionRelayUrl, sessionRttMicros,
-        );
-        // Legacy session protocol owns the whole stream; after it
-        // returns the stream is done.
-        try { await send.finish(); } catch { /* best effort */ }
-        return false;
-      }
-      // ── End session discriminator ──────────────────────────────────
 
       // Look up method (shared services only — session dispatch is above)
       const methodInfo = svcInfo.methods.get(header.method);
@@ -437,14 +384,9 @@ export class RpcServer {
       return;
     }
     const [reqPayload, reqFlags] = reqFrame;
-    const compressed = !!(reqFlags & COMPRESSED);
-    // Pass the request type as the codec hint so JsonCodec can do
-    // strict shape validation. Wrong/extra/missing fields raise
-    // CONTRACT_VIOLATION before the handler runs.
+    // The request type is the codec hint (plain-object -> typed instance).
     const reqType = methodInfo.requestType as unknown;
-    let request = compressed
-      ? (this.codec as any).decodeCompressed(reqPayload, true, reqType)
-      : this.codec.decode(reqPayload, reqType);
+    let request = this.codec.decode(payloadOf(reqPayload, reqFlags), reqType);
 
     // Interceptors
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
@@ -473,8 +415,7 @@ export class RpcServer {
     // the outer loop in `handleStream` will read the next StreamHeader
     // on this multiplexed bi-stream.
     const respType = methodInfo.responseType as unknown;
-    const [respPayload, respCompressed] = this.codec.encodeCompressed(response, respType);
-    await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
+    await writePayloadFrame(send, this.codec.encode(response, respType));
     await this.writeOkTrailer(send);
   }
 
@@ -488,11 +429,8 @@ export class RpcServer {
       return;
     }
     const [reqPayload, reqFlags] = reqFrame;
-    const compressed = !!(reqFlags & COMPRESSED);
     const reqType = methodInfo.requestType as unknown;
-    let request = compressed
-      ? (this.codec as any).decodeCompressed(reqPayload, true, reqType)
-      : this.codec.decode(reqPayload, reqType);
+    let request = this.codec.decode(payloadOf(reqPayload, reqFlags), reqType);
 
     request = await applyRequestInterceptors(this.interceptors, callCtx, request);
 
@@ -510,8 +448,7 @@ export class RpcServer {
         return;
       }
       response = await applyResponseInterceptors(this.interceptors, callCtx, response);
-      const [respPayload, respCompressed] = this.codec.encodeCompressed(response, respType);
-      await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
+      await writePayloadFrame(send, this.codec.encode(response, respType));
     }
 
     await this.writeOkTrailer(send);
@@ -540,7 +477,7 @@ export class RpcServer {
       const [payload, flags] = frame;
       if (flags & TRAILER) {
         try {
-          const eoi = this.codec.decode(payload) as RpcStatus;
+          const eoi = decodeRpcStatus(payload);
           if (eoi.code !== StatusCode.OK) {
             await this.writeErrorTrailer(send, StatusCode.INTERNAL,
               `client sent non-OK EoI trailer (code=${eoi.code})`);
@@ -555,10 +492,7 @@ export class RpcServer {
           `client stream exceeded ${MAX_CLIENT_STREAM_ITEMS} items`);
         return;
       }
-      const compressed = !!(flags & COMPRESSED);
-      let request = compressed
-        ? (this.codec as any).decodeCompressed(payload, true, reqType)
-        : this.codec.decode(payload, reqType);
+      let request = this.codec.decode(payloadOf(payload, flags), reqType);
       request = await applyRequestInterceptors(this.interceptors, callCtx, request);
       requests.push(request);
       // Spec §6: last request is marked with FLAG_END_STREAM.
@@ -590,8 +524,7 @@ export class RpcServer {
     response = await applyResponseInterceptors(this.interceptors, callCtx, response);
 
     const respType = methodInfo.responseType as unknown;
-    const [respPayload, respCompressed] = this.codec.encodeCompressed(response, respType);
-    await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
+    await writePayloadFrame(send, this.codec.encode(response, respType));
     await this.writeOkTrailer(send);
     // Spec §6: don't finish — let `handleStream` loop for the next call.
   }
@@ -618,10 +551,7 @@ export class RpcServer {
           const [payload, flags] = frame;
           if (flags & TRAILER) break; // legacy explicit end-of-input
           if (flags & CANCEL) continue;
-          const compressed = !!(flags & COMPRESSED);
-          const request = compressed
-            ? (self.codec as any).decodeCompressed(payload, true, reqType)
-            : self.codec.decode(payload, reqType);
+          const request = self.codec.decode(payloadOf(payload, flags), reqType);
           yield request;
           // Spec §6: the client marks the last request with
           // FLAG_END_STREAM on the same frame as the payload. After
@@ -648,8 +578,7 @@ export class RpcServer {
         await this.writeErrorTrailer(send, StatusCode.DEADLINE_EXCEEDED, 'deadline exceeded');
         return;
       }
-      const [respPayload, respCompressed] = this.codec.encodeCompressed(response, respType);
-      await writeFrame(send, respPayload, respCompressed ? COMPRESSED : 0);
+      await writePayloadFrame(send, this.codec.encode(response, respType));
     }
 
     if (errBox.value !== null) {
@@ -703,14 +632,12 @@ export class RpcServer {
   }
 
   private async writeOkTrailer(send: ServerSendStream): Promise<void> {
-    const status = new RpcStatus({ code: StatusCode.OK });
-    await writeFrame(send, this.codec.encode(status), TRAILER);
+    await writeFrame(send, encodeRpcStatus({ code: StatusCode.OK }), TRAILER);
   }
 
   private async writeErrorTrailer(send: ServerSendStream, code: number, message: string): Promise<void> {
-    const status = new RpcStatus({ code, message });
     try {
-      await writeFrame(send, this.codec.encode(status), TRAILER);
+      await writeFrame(send, encodeRpcStatus({ code, message }), TRAILER);
       await send.finish();
     } catch {
       // Best effort — stream may already be closed

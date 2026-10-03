@@ -203,7 +203,7 @@ class _PlainConn:
 def _build_ctx(conn):
     from types import SimpleNamespace
 
-    from aster.protocol import StreamHeader
+    from aster.wire import StreamHeader
     from aster.server import ConnectionContext, Server
     from aster.service import MethodInfo
 

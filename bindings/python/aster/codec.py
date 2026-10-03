@@ -3,13 +3,16 @@ aster.codec -- Fory serialization codec.
 
 Spec reference: §5.1--5.6 (serialization protocols), §5.3 (XLANG tags), §5.5 (ROW mode)
 
-Wraps Apache Fory (pyfory) to provide three serialization modes:
-- XLANG: Cross-language, tag-based type registration
-- NATIVE: Python-native serialization (no tag requirement)
-- ROW: Row-oriented format for random-access field reads
+Wraps Apache Fory (pyfory 1.7.x, the release line pinned by Rust core in
+``core/src/xlang.rs``) for RPC **payloads**:
 
-Also provides transparent zstd compression for payloads exceeding a
-configurable threshold.
+- XLANG: cross-language, named type registration. The only interoperable
+  mode; options are fixed to Aster's standard (xlang on, compatible on,
+  reference tracking off), matching ``core::xlang::new_fory``.
+- NATIVE / ROW: reserved by the spec, Python-only.
+
+The RPC envelope is not Fory-encoded (see :mod:`aster.wire`). Payload
+compression delegates to Rust core (Aster-SPEC §5.6).
 """
 
 from __future__ import annotations
@@ -22,13 +25,13 @@ from typing import Any, get_type_hints
 
 import pyfory
 import pyfory.format as pyfory_format
-import zstandard
 
+from aster import wire as _wire
 from aster.rpc_types import SerializationMode
 
 # ── Default compression threshold ────────────────────────────────────────────
 
-DEFAULT_COMPRESSION_THRESHOLD: int = 4096  # bytes
+DEFAULT_COMPRESSION_THRESHOLD: int = _wire.COMPRESSION_THRESHOLD  # 4096 bytes
 
 
 @dataclass(slots=True)
@@ -55,33 +58,23 @@ class ForyConfig:
     def to_kwargs(self, mode: SerializationMode) -> dict[str, Any]:
         """Convert the config into ``pyfory.Fory`` constructor kwargs.
 
-        Aster's Fory baseline is XLANG + ref-tracking + strict. pyfory
-        defaults ``xlang=False``, ``ref=False``, ``strict=True`` -- we flip
-        xlang / ref to match Java's ``ForyCodec`` (see
-        ``bindings/java/.../ForyCodec.java`` and
-        ``docs/_internal/fory-cross-binding.md`` for the rationale).
+        Aster's payload Fory options are fixed (Aster-SPEC §5.2,
+        ``core/src/xlang.rs::new_fory``): ``xlang=True``, ``compatible=True``
+        (NAMED_COMPATIBLE_STRUCT, field add/remove tolerated) and
+        ``ref=False`` (no shared/cyclic graphs on the wire). They feed the
+        encoded bytes, so drift between producer and consumer is a wire
+        break. ``extra_kwargs`` may add other pyfory options but cannot
+        override these for XLANG.
         """
         kwargs = dict(self.extra_kwargs)
         xlang = self.resolved_xlang(mode)
-        kwargs.setdefault("xlang", xlang)
-        # ref=True matches Fory's FDL-generated Python for xlang + the
-        # Java ForyBuilder defaults of withRefTracking(true). Byte-for-
-        # byte identity across pyfory 0.17 and fory-java 0.17 was
-        # verified with a minimal Point(x,y) struct registered by
-        # type_id with matching pyfory.field(id=N) / @ForyField(id=N).
-        kwargs.setdefault("ref", True)
-        # pyfory's strict=True is already the default, but set it
-        # explicitly so any future pyfory release flipping the default
-        # doesn't silently change our behaviour.
+        kwargs["xlang"] = xlang
         kwargs.setdefault("strict", True)
-        # Compatible mode enables the NAMED_COMPATIBLE_STRUCT layout
-        # (meta-share TypeMeta with struct-hash check instead of the
-        # non-compatible 32-bit version prefix). Every other binding's
-        # Fory XLANG default is compatible=true (Java/Kotlin via
-        # ForyBuilder.withCompatibleMode, TS via `createXlangCodec`),
-        # so opting in here is required for cross-binding interop.
         if xlang:
-            kwargs.setdefault("compatible", True)
+            kwargs["ref"] = False
+            kwargs["compatible"] = True
+        else:
+            kwargs.setdefault("ref", False)
         return kwargs
 
 
@@ -120,20 +113,18 @@ def wire_type(tag: str, *, metadata: dict | None = None):
       ``bytes``, ``list[T]``, ``dict[str, V]``, ``Optional[T]``,
       and other ``@wire_type`` dataclasses.
 
-    - **Use ``Optional[T]`` for nullable fields, NOT ``T | None``.**
-      The Fory serializer does not support PEP 604 union syntax.
-      This will fail at runtime::
+    - **Use ``Optional[T]`` for nullable fields.**
 
-          bio: str | None = None          # WRONG -- Fory can't serialize this
-
-      Use this instead::
-
-          bio: Optional[str] = None       # CORRECT
+    - **Integer widths:** a plain ``int`` is a zig-zag ``varint64`` (Rust
+      ``i64``). Use ``pyfory.Int32`` for ``varint32`` (Rust ``i32``),
+      ``pyfory.FixedInt32`` for a fixed 4-byte ``int32``, ``pyfory.Int8`` /
+      ``pyfory.Int16`` / ``pyfory.Float32`` etc. for the other widths.
 
     - **Every field must have a default value.** Fory XLANG needs defaults
-      for cross-language compatibility. Use ``""`` for strings, ``0`` for
-      ints, ``False`` for bools, and ``field(default_factory=list)`` for
-      collections.
+      for construction. Use ``""`` for strings, ``0`` for ints, ``False``
+      for bools, and ``field(default_factory=list)`` for collections. Such
+      defaults are *not* part of the contract (the field is published as
+      required); use :func:`contract_default` to publish one.
 
     - **``@rpc`` methods must return a ``@wire_type`` dataclass, not None.**
       Even if your response has no fields, define an empty response type::
@@ -162,6 +153,72 @@ def wire_type(tag: str, *, metadata: dict | None = None):
         return cls
 
     return decorator
+
+
+# ── Contract defaults (Aster-ContractIdentity §11.3.2.3) ────────────────────
+
+#: ``dataclasses.Field.metadata`` key marking a contract default.
+CONTRACT_DEFAULT_KEY = "aster.contract_default"
+
+_FORY_FIELD_KWARGS = frozenset({"id", "nullable", "ref", "ignore", "dynamic"})
+
+
+def contract_default(
+    default: Any = dataclasses.MISSING,
+    *,
+    default_factory: Any = dataclasses.MISSING,
+    **field_kwargs: Any,
+) -> Any:
+    """Declare a field default that is **part of the contract**.
+
+    Every ``@wire_type`` dataclass field needs a Python construction default,
+    but a plain default (``name: str = ""``) does *not* enter the contract:
+    the field is published as ``required``. Wrap the default in
+    ``contract_default`` to publish it (``required = false`` plus the
+    canonical default bytes), exactly like Rust's ``#[aster(default = …)]``::
+
+        @wire_type("defaults.v1/Settings")
+        @dataclass
+        class Settings:
+            name: str = ""                                   # required
+            state: str = contract_default("idle")
+            retries: pyfory.Int32 = contract_default(-3)
+            tags: list[str] = contract_default(default_factory=list)
+
+    Changing a contract default changes ``contract_id`` (it is a breaking
+    change); Fory payload bytes are unaffected. Supported in v1: ``str``,
+    ``bool``, ``pyfory.Int32`` (varint32), ``int`` (varint64), ``float``
+    (float64), ``Optional`` of those with a non-``None`` value, and empty
+    ``list`` / ``set`` / ``dict``. Anything else raises ``TypeError`` when the
+    contract is computed.
+
+    Extra keyword arguments go to :func:`pyfory.field` when they are pyfory
+    field options (``id``, ``nullable``, ...), else to
+    :func:`dataclasses.field`.
+    """
+    if (default is dataclasses.MISSING) == (default_factory is dataclasses.MISSING):
+        raise TypeError("contract_default() takes exactly one of default / default_factory")
+    metadata = dict(field_kwargs.pop("metadata", None) or {})
+    metadata[CONTRACT_DEFAULT_KEY] = True
+    kwargs: dict[str, Any] = {"metadata": metadata, **field_kwargs}
+    if default is not dataclasses.MISSING:
+        kwargs["default"] = default
+    else:
+        kwargs["default_factory"] = default_factory
+    if _FORY_FIELD_KWARGS & field_kwargs.keys():
+        return pyfory.field(**kwargs)
+    return dataclasses.field(**kwargs)
+
+
+def fory_registration_name(namespace: str, typename: str) -> str:
+    """The Fory named-registration string for ``namespace`` + ``typename``.
+
+    Matches Rust's ``register_by_name(format!("{package}.{name}"))``: Fory
+    splits the name on its **last** ``.`` into (namespace, type name). So the
+    tag ``"billing/Invoice"`` registers as ``"billing.Invoice"`` in every
+    binding.
+    """
+    return f"{namespace}.{typename}" if namespace else typename
 
 
 def _auto_apply_wire_type(cls: type) -> None:
@@ -414,23 +471,6 @@ def _validate_xlang_tags(types: list[type]) -> None:
             )
 
 
-# ── Framework-internal types ─────────────────────────────────────────────────
-
-# These are registered automatically by ForyCodec.
-# Import here to avoid circular imports -- the types themselves are defined
-# in protocol.py which uses the wire_type from this module (or its own copy).
-_INTERNAL_TYPES: list[type] | None = None
-
-
-def _get_internal_types() -> list[type]:
-    """Lazily import and return framework-internal protocol types."""
-    global _INTERNAL_TYPES
-    if _INTERNAL_TYPES is None:
-        from aster.protocol import StreamHeader, CallHeader, RpcStatus
-        _INTERNAL_TYPES = [StreamHeader, CallHeader, RpcStatus]
-    return _INTERNAL_TYPES
-
-
 # ── ForyCodec ────────────────────────────────────────────────────────────────
 
 
@@ -463,8 +503,6 @@ class ForyCodec:
         self.fory_config = fory_config or ForyConfig()
         from aster.limits import MAX_DECOMPRESSED_SIZE
 
-        self._cctx = zstandard.ZstdCompressor()
-        self._dctx = zstandard.ZstdDecompressor()
         self._max_decompress = MAX_DECOMPRESSED_SIZE
 
         user_types = list(types) if types else []
@@ -475,12 +513,6 @@ class ForyCodec:
         # For XLANG mode, validate that all types have tags.
         if mode == SerializationMode.XLANG:
             _validate_xlang_tags(all_types)
-
-        # Add framework-internal types (always registered for XLANG).
-        internal = _get_internal_types()
-        for it in internal:
-            if it not in all_types:
-                all_types.append(it)
 
         self._registered_types = all_types
 
@@ -507,15 +539,16 @@ class ForyCodec:
             if tag is not None:
                 ns = getattr(tp, "__fory_namespace__", "")
                 tn = getattr(tp, "__fory_typename__", tp.__name__)
-                self._fory.register_type(tp, namespace=ns, typename=tn)
+                self._fory.register(tp, name=fory_registration_name(ns, tn))
             elif _is_enum(tp):
                 # Enums: derive namespace/typename like auto wire_type
-                ns = tp.__module__ or ""
-                tn = tp.__qualname__
-                self._fory.register_type(tp, namespace=ns, typename=tn)
+                self._fory.register(
+                    tp,
+                    name=fory_registration_name(tp.__module__ or "", tp.__qualname__),
+                )
             elif mode == SerializationMode.NATIVE:
                 # NATIVE mode: register without tag
-                self._fory.register_type(tp)
+                self._fory.register(tp)
             # else: type is already validated above for XLANG
 
         # For ROW mode, build encoder/decoder if available
@@ -655,19 +688,14 @@ class ForyCodec:
         return row.get(index)
 
     def encode_compressed(self, obj: Any) -> tuple[bytes, bool]:
-        """Serialize and optionally compress.
+        """Serialize and optionally compress (Aster-SPEC §5.6).
 
         Returns:
             A ``(data, compressed)`` tuple where *compressed* is ``True``
-            if zstd compression was applied.
+            if zstd compression was applied (payload strictly larger than
+            the threshold and the compressed form smaller).
         """
-        raw = self.encode(obj)
-        if (
-            self.compression_threshold >= 0
-            and len(raw) > self.compression_threshold
-        ):
-            return self._cctx.compress(raw), True
-        return raw, False
+        return _wire.compress_payload(self.encode(obj), self.compression_threshold)
 
     def decode_compressed(
         self, data: bytes, compressed: bool, expected_type: type | None = None
@@ -684,35 +712,20 @@ class ForyCodec:
         return self.decode(data, expected_type)
 
     def compress(self, data: bytes) -> bytes:
-        """Compress raw bytes with zstd."""
-        return self._cctx.compress(data)
+        """Compress raw bytes with zstd (level 3, unconditionally)."""
+        out, compressed = _wire.compress_payload(data, 0)
+        if not compressed:
+            raise ValueError("payload does not compress")
+        return out
 
     def decompress(self, data: bytes) -> bytes:
         """Decompress zstd-compressed bytes. Enforces MAX_DECOMPRESSED_SIZE."""
         return self._safe_decompress(data)
 
     def _safe_decompress(self, data: bytes) -> bytes:
-        """Decompress with size limit enforcement.
-
-        Uses streaming decompression to enforce the limit without trusting
-        the content-size header in the compressed data.
-        """
-        from aster.limits import LimitExceeded
-
-        reader = self._dctx.stream_reader(data)
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = reader.read(65536)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > self._max_decompress:
-                raise LimitExceeded(
-                    "decompressed payload", self._max_decompress, total
-                )
-            chunks.append(chunk)
-        return b"".join(chunks)
+        """Streaming decompression with the size limit enforced in Rust core
+        (the zstd frame's content-size header is never trusted)."""
+        return _wire.decompress_payload(data, self._max_decompress)
 
     def encode_row_schema(self) -> bytes:
         """For ROW mode: serialize the schema for hoisting.

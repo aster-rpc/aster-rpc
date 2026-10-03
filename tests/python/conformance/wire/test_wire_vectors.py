@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from aster.framing import (
+from aster.wire import (
     CALL,
     CANCEL,
     COMPRESSED,

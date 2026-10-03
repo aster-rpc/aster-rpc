@@ -1,4 +1,4 @@
-//! Contract submodule — exposes core contract identity, framing, and signing
+//! Contract submodule — exposes core contract identity and signing
 //! functions to Python via `_aster.contract`.
 
 use pyo3::prelude::*;
@@ -39,22 +39,6 @@ fn compute_type_hash(data: &[u8]) -> PyBytesResult {
     PyBytesResult(hash.to_vec())
 }
 
-/// Encode a frame: returns [4-byte LE length][flags][payload].
-#[pyfunction]
-fn encode_frame(payload: &[u8], flags: u8) -> PyResult<PyBytesResult> {
-    let frame = aster_transport_core::framing::encode_frame(payload, flags)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    Ok(PyBytesResult(frame))
-}
-
-/// Decode a frame from bytes. Returns (payload_bytes, flags, bytes_consumed).
-#[pyfunction]
-fn decode_frame(data: &[u8]) -> PyResult<(PyBytesResult, u8, usize)> {
-    let (payload, flags, consumed) = aster_transport_core::framing::decode_frame(data)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    Ok((PyBytesResult(payload), flags, consumed))
-}
-
 /// Compute canonical signing bytes from credential JSON.
 #[pyfunction]
 fn canonical_signing_bytes_from_json(json_str: &str) -> PyResult<PyBytesResult> {
@@ -80,8 +64,6 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(canonical_bytes_from_json, &m)?)?;
     m.add_function(wrap_pyfunction!(canonical_bytes_to_json, &m)?)?;
     m.add_function(wrap_pyfunction!(compute_type_hash, &m)?)?;
-    m.add_function(wrap_pyfunction!(encode_frame, &m)?)?;
-    m.add_function(wrap_pyfunction!(decode_frame, &m)?)?;
     m.add_function(wrap_pyfunction!(canonical_signing_bytes_from_json, &m)?)?;
     m.add_function(wrap_pyfunction!(canonical_json, &m)?)?;
     parent.add_submodule(&m)?;

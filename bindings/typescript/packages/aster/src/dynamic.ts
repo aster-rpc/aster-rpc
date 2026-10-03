@@ -18,6 +18,7 @@ import {
   ContainerKind,
   TypeKind,
 } from './contract/identity.js';
+import { foryTypeFor } from './wire-types.js';
 
 /** A dynamically synthesized type class. */
 export interface DynamicType {
@@ -107,7 +108,7 @@ function foryFieldTypeFromField(f: ManifestField, Type: any): any {
     case 'list': {
       const itemKind = (f as any).item_kind ?? 'string';
       const itemType = foryFieldTypeFromString(itemKind, Type);
-      return Type.array(itemType);
+      return Type.list(itemType);
     }
     case 'map': {
       const keyKind = (f as any).key_kind ?? 'string';
@@ -133,7 +134,7 @@ function foryFieldTypeFromString(typeStr: string, Type: any): any {
   const lower = (typeStr || 'string').toLowerCase();
   if (lower.startsWith('list[') || lower.startsWith('array[')) {
     const inner = typeStr.slice(typeStr.indexOf('[') + 1, typeStr.lastIndexOf(']'));
-    return Type.array(foryFieldTypeFromString(inner, Type));
+    return Type.list(foryFieldTypeFromString(inner, Type));
   }
   if (lower.startsWith('optional[') || lower.startsWith('nullable[')) {
     const inner = typeStr.slice(typeStr.indexOf('[') + 1, typeStr.lastIndexOf(']'));
@@ -214,7 +215,7 @@ export class DynamicTypeFactory {
    */
   registerWithFory(
     methods: ManifestMethod[],
-    _fory: { registerSerializer: (t: unknown) => unknown },
+    _fory: unknown,
     Type: { struct: (opts: unknown, fields: unknown, meta?: unknown) => any },
     codec: { registerType(typeInfo: unknown): void },
   ): void {
@@ -388,67 +389,21 @@ export class DynamicTypeFactory {
 
 // ── CanonicalTypeDef-driven helpers ─────────────────────────────────────────
 
-interface ForyTypeNamespace {
-  struct(opts: unknown, fields: unknown, meta?: unknown): any;
-  string(): any;
-  bool(): any;
-  int8(): any;
-  int16(): any;
-  int32(): any;
-  int64(): any;
-  varInt32(): any;
-  varInt64(): any;
-  varUInt32(): any;
-  varUInt64(): any;
-  float32(): any;
-  float64(): any;
-  binary(): any;
-  array(element: any): any;
-  set(element: any): any;
-  map(key: any, value: any): any;
-  optional?(inner: any): any;
-}
+/** The `Type` namespace of `@apache-fory/core` (1.7). */
+type ForyTypeNamespace = any;
 
-// Canonical ``type_primitive`` -> TS Fory Type factory. Keys MUST match
-// the Fory xlang type mapping spec byte-for-byte
-// (docs/specification/xlang_type_mapping.md). Notably "int32" is fixed
-// 4 bytes (Type.int32()) while "varint32" is zigzag varint
-// (Type.varInt32()) -- these are distinct type ids on the wire, and
-// pyfory emits pyfory.int32 as spec "varint32" (NOT "int32"). Mapping
-// both to Type.int32() here would cause a cross-binding length
-// mismatch: pyfory writes 1 byte for small ints while TS would expect
-// 4, so the reader runs off the payload with "Out of bounds access".
-const PRIMITIVE_TO_FORY: Record<string, (T: ForyTypeNamespace) => any> = {
-  bool: T => T.bool(),
-  string: T => T.string(),
-  binary: T => T.binary(),
-  int8: T => T.int8(),
-  int16: T => T.int16(),
-  int32: T => T.int32(),
-  int64: T => T.int64(),
-  varint32: T => T.varInt32(),
-  varint64: T => T.varInt64(),
-  uint8: T => T.int8(),
-  uint16: T => T.int16(),
-  uint32: T => T.int32(),
-  uint64: T => T.int64(),
-  var_uint32: T => T.varUInt32(),
-  var_uint64: T => T.varUInt64(),
-  float32: T => T.float32(),
-  float64: T => T.float64(),
-  // Timestamps are carried as varint64 millis in pyfory's xlang.
-  timestamp: T => T.varInt64(),
-  uuid: T => T.string(),
-};
-
+/**
+ * Canonical `type_primitive` -> Fory type (see `wire-types.ts`; e.g.
+ * `"varint32"` is `Type.int32()`, `"int32"` is the fixed encoding).
+ * Unknown names fall back to string so decode surfaces a value instead of
+ * crashing.
+ */
 function foryPrimitiveForCanonical(primName: string, Type: ForyTypeNamespace): any {
-  const fn = PRIMITIVE_TO_FORY[primName];
-  if (fn) return fn(Type);
-  // Unknown primitive name — fall back to string so decode surfaces a
-  // stringified value rather than crashing. The server-side Fory hash
-  // check would reject a mismatched type anyway; we never silently
-  // encode wrong bytes.
-  return Type.string();
+  try {
+    return foryTypeFor(primName, Type);
+  } catch {
+    return Type.string();
+  }
 }
 
 /**
@@ -510,8 +465,8 @@ function foryFieldTypeFromCanonical(
   typeDefs: { byTag: ReadonlyMap<string, CanonicalTypeDef>; byHash: ReadonlyMap<string, CanonicalTypeDef> },
   typesByTag: ReadonlyMap<string, any>,
 ): any {
-  const wrap = (inner: any) =>
-    f.optional && typeof Type.optional === 'function' ? Type.optional(inner) : inner;
+  // Clone before marking nullable: struct TypeInfos are shared.
+  const wrap = (inner: any) => (f.optional ? inner.clone().setNullable(true) : inner);
 
   const resolveRef = (typeRefHex: string): any | undefined => {
     const nested = typeDefs.byHash.get(typeRefHex);
@@ -522,6 +477,12 @@ function foryFieldTypeFromCanonical(
 
   const resolveLeaf = (kind: number, primitive: string, typeRefHex: string): any => {
     if (kind === TypeKind.PRIMITIVE) return foryPrimitiveForCanonical(primitive, Type);
+    if (kind === TypeKind.SELF_REF && f.selfRefName) {
+      // Back-edge in a cyclic graph: refer to the struct by name; Fory
+      // resolves it when generating the serializer.
+      const { namespace, typeName } = splitWireTag(f.selfRefName);
+      return Type.struct({ namespace, typeName });
+    }
     if (kind === TypeKind.REF) {
       const ref = resolveRef(typeRefHex);
       if (ref) return ref;
@@ -537,7 +498,7 @@ function foryFieldTypeFromCanonical(
     const element = resolveLeaf(f.typeKind, f.typePrimitive, f.typeRef);
     const container = f.container === ContainerKind.SET
       ? Type.set(element)
-      : Type.array(element);
+      : Type.list(element);
     return wrap(container);
   }
   if (f.container === ContainerKind.MAP) {
@@ -548,6 +509,9 @@ function foryFieldTypeFromCanonical(
   if (f.typeKind === TypeKind.REF) {
     const ref = resolveRef(f.typeRef);
     return wrap(ref ?? Type.string());
+  }
+  if (f.typeKind === TypeKind.SELF_REF) {
+    return wrap(resolveLeaf(f.typeKind, f.typePrimitive, f.typeRef));
   }
   if (f.typeKind === TypeKind.PRIMITIVE) {
     return wrap(foryPrimitiveForCanonical(f.typePrimitive, Type));

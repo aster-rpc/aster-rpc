@@ -178,6 +178,14 @@ impl IrohNode {
         format!("{:?}", self.inner.node_addr_info())
     }
 
+    /// Direct socket addresses (`"ip:port"`) this node currently advertises.
+    /// Empty until the endpoint has bound and discovered its local addresses.
+    /// Used to put dialable material into `aster1` tickets.
+    #[napi]
+    pub fn direct_addresses(&self) -> Vec<String> {
+        self.inner.node_addr_info().direct_addresses
+    }
+
     /// Export the node's secret key as 32 bytes.
     #[napi]
     pub fn export_secret_key(&self) -> Vec<u8> {

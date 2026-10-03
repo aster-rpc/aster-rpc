@@ -11,11 +11,9 @@ export const SerializationMode = {
   XLANG: 0,
   /** Language-native. Only for LocalTransport (same trust domain). */
   NATIVE: 1,
-  /** Row-oriented. For random-access reads. */
+  /** Row-oriented. For random-access reads. Reserved. */
   ROW: 2,
-  /** JSON over UTF-8. Cross-language fallback. The TypeScript binding
-   *  uses this exclusively because Fory JS is not yet XLANG-compliant. */
-  JSON: 3,
+  // JSON (3) is retired across all bindings (Aster-SPEC §5.1).
 } as const;
 
 export type SerializationMode = (typeof SerializationMode)[keyof typeof SerializationMode];

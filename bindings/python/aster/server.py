@@ -21,7 +21,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from aster.codec import ForyCodec, ForyConfig
-from aster.framing import HEADER, TRAILER, COMPRESSED, CANCEL, ROW_SCHEMA, write_frame, read_frame
+from aster.wire import (
+    CANCEL, COMPRESSED, HEADER, ROW_SCHEMA, TRAILER,
+    EnvelopeError, RpcStatus, StreamHeader, encode_frame, read_frame, write_frame,
+)
 from aster.interceptors.base import (
     apply_error_interceptors,
     apply_request_interceptors,
@@ -29,14 +32,12 @@ from aster.interceptors.base import (
     build_call_context,
     normalize_error,
 )
-from aster.json_codec import json_decode, json_encode, safe_decompress
 from aster.limits import (
     LimitExceeded,
     MAX_METADATA_ENTRIES,
     validate_metadata,
 )
 from aster.logging import request_context
-from aster.protocol import StreamHeader, RpcStatus
 from aster.status import StatusCode, RpcError
 from aster.rpc_types import RpcScope, SerializationMode
 from aster.service import ServiceRegistry, ServiceInfo, MethodInfo
@@ -46,6 +47,9 @@ if TYPE_CHECKING:
     from aster.peer_store import PeerAttributeStore
 
 logger = logging.getLogger(__name__)
+
+# AEv1 encoding of an OK RpcStatus; identical for every call.
+_OK_TRAILER_PAYLOAD: bytes = RpcStatus().encode()
 
 
 # ── Server Errors ────────────────────────────────────────────────────────────
@@ -119,14 +123,14 @@ class _SessionScopeMismatch(Exception):
 # These let the reactor dispatch path reuse `_handle_server_stream`,
 # `_handle_client_stream`, `_handle_bidi_stream` without duplicating their
 # ~300 lines of interceptor / deadline / error-trailer logic. The adapters
-# look enough like a real QUIC bi-stream for `framing.write_frame` /
-# `framing.read_frame` to drive them.
+# look enough like a real QUIC bi-stream for `wire.write_frame` /
+# `wire.read_frame` to drive them.
 
 
 class _ReactorSendAdapter:
     """SendStream-shaped wrapper over `ReactorResponseSender`.
 
-    ``framing.write_frame`` serializes its payload as
+    ``wire.write_frame`` serializes its payload as
     ``[4B LE len][1B flags][payload]`` and then calls ``write_all(data)``.
     This adapter inspects the flags byte and routes to the streaming or
     terminal reactor-sender API. After a trailer is written, further
@@ -159,7 +163,7 @@ class _ReactorRecvAdapter:
 
     The reactor delivers frames as ``(payload, flags)`` tuples. This
     adapter re-frames them into the on-wire byte layout and serves them
-    through ``read_exact(n)`` so ``framing.read_frame`` can drive dispatch.
+    through ``read_exact(n)`` so ``wire.read_frame`` can drive dispatch.
     The first request frame arrives inline on the ``ReactorEvent``; callers
     pass it as ``first_frame_bytes`` so it shows up as the first frame on
     the adapter.
@@ -494,8 +498,6 @@ class Server:
         cancel_flag: Any = None,
         connection: Any = None,
     ) -> None:
-        import struct as _struct
-
         header: StreamHeader | None = None
         ser_mode = 0
         try:
@@ -506,12 +508,16 @@ class Server:
                 )
                 return
 
-            if header_payload and header_payload[0:1] == b'{':
-                header = json_decode(header_payload, StreamHeader)
-            else:
-                header = self._codec.decode(header_payload, StreamHeader)
+            try:
+                header = StreamHeader.decode(header_payload)
+            except EnvelopeError as e:
+                self._reactor_error_response(
+                    response_sender, StatusCode.INVALID_ARGUMENT,
+                    f"Malformed stream header: {e}",
+                )
+                return
 
-            ser_mode = header.serializationMode
+            ser_mode = header.serialization_mode
 
             if not header.service:
                 self._reactor_error_response(
@@ -541,7 +547,7 @@ class Server:
             try:
                 handler = self._resolve_instance(
                     service_info, connection_id,
-                    getattr(header, "sessionId", 0), peer_id,
+                    header.session_id, peer_id,
                 )
             except _SessionScopeMismatch as e:
                 self._reactor_error_response(
@@ -568,14 +574,13 @@ class Server:
                 )
                 return
 
-            # Validate the client's requested serialization mode. JSON is
-            # always accepted for cross-language interop.
+            # Validate the client's requested serialization mode (JSON mode 3
+            # is retired, Aster-SPEC §5.1).
             accepted_modes = [m.value for m in service_info.serialization_modes]
-            accepted_modes.append(SerializationMode.JSON.value)
-            if header.serializationMode not in accepted_modes:
+            if header.serialization_mode not in accepted_modes:
                 self._reactor_error_response(
                     response_sender, StatusCode.INVALID_ARGUMENT,
-                    f"Unsupported serialization mode: {header.serializationMode}",
+                    f"Unsupported serialization mode: {header.serialization_mode}",
                     ser_mode,
                 )
                 return
@@ -590,13 +595,13 @@ class Server:
             pre_call_ctx = build_call_context(
                 service=header.service,
                 method=header.method,
-                metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
+                metadata=_validated_metadata(header.metadata_keys, header.metadata_values),
                 deadline_secs=header.deadline,
                 peer=peer_id,
                 is_streaming=(method_info.pattern != "unary"),
                 pattern=method_info.pattern,
                 idempotent=method_info.idempotent,
-                call_id=header.callId,
+                call_id=header.call_id,
                 attributes=(
                     self._peer_store.get_attributes(peer_id)
                     if self._peer_store and peer_id else {}
@@ -624,7 +629,7 @@ class Server:
             pattern = method_info.pattern
             if pattern != "unary":
                 with request_context(
-                    request_id=str(header.callId) if header.callId else "",
+                    request_id=str(header.call_id) if header.call_id else "",
                     service=header.service,
                     method=header.method,
                     peer=peer_id,
@@ -638,26 +643,21 @@ class Server:
 
             # Decode request
             compressed = bool(request_flags & COMPRESSED)
-            if ser_mode == SerializationMode.JSON.value:
-                if compressed:
-                    request_payload = safe_decompress(request_payload)
-                request = json_decode(request_payload, method_info.request_type)
-            else:
-                request = self._codec.decode_compressed(
-                    request_payload, compressed, method_info.request_type,
-                )
+            request = self._codec.decode_compressed(
+                request_payload, compressed, method_info.request_type,
+            )
 
             # Interceptors
             call_ctx = build_call_context(
                 service=header.service,
                 method=header.method,
-                metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
+                metadata=_validated_metadata(header.metadata_keys, header.metadata_values),
                 deadline_secs=header.deadline,
                 peer=peer_id,
                 is_streaming=False,
                 pattern="unary",
                 idempotent=method_info.idempotent,
-                call_id=header.callId,
+                call_id=header.call_id,
                 attributes=(
                     self._peer_store.get_attributes(peer_id)
                     if self._peer_store and peer_id else {}
@@ -691,26 +691,10 @@ class Server:
             )
             resp_flags = COMPRESSED if response_compressed else 0
 
-            status = RpcStatus(code=StatusCode.OK, message="")
-            if ser_mode == SerializationMode.JSON.value:
-                trailer_payload = json_encode({
-                    "code": 0, "message": "", "detailKeys": [], "detailValues": [],
-                })
-            else:
-                trailer_payload = self._codec.encode(status)
+            trailer_frame = encode_frame(_OK_TRAILER_PAYLOAD, TRAILER)
+            response_frame = encode_frame(response_payload, resp_flags)
 
-            response_frame = (
-                _struct.pack("<I", len(response_payload) + 1)
-                + bytes([resp_flags])
-                + response_payload
-            )
-            trailer_frame = (
-                _struct.pack("<I", len(trailer_payload) + 1)
-                + bytes([TRAILER])
-                + trailer_payload
-            )
-
-            response_sender.submit(bytes(response_frame), bytes(trailer_frame))
+            response_sender.submit(response_frame, trailer_frame)
 
         except RpcError as e:
             self._reactor_error_response(
@@ -747,16 +731,10 @@ class Server:
         existing `_handle_server_stream` / `_handle_client_stream` /
         `_handle_bidi_stream` methods work unchanged. The first request
         frame is already inline on the reactor event; we reframe it into
-        the recv adapter's buffer so ``framing.read_frame`` sees it as
+        the recv adapter's buffer so ``wire.read_frame`` sees it as
         the first frame on the stream.
         """
-        import struct as _struct
-
-        first_frame_bytes = (
-            _struct.pack("<I", len(first_request_payload) + 1)
-            + bytes([first_request_flags])
-            + first_request_payload
-        )
+        first_frame_bytes = encode_frame(first_request_payload, first_request_flags)
 
         send_adapter = _ReactorSendAdapter(response_sender)
         recv_adapter = _ReactorRecvAdapter(request_receiver, first_frame_bytes)
@@ -792,7 +770,7 @@ class Server:
             self._reactor_error_response(
                 response_sender, StatusCode.INTERNAL,
                 f"unknown RPC pattern '{pattern}'",
-                header.serializationMode,
+                header.serialization_mode,
             )
 
     def _reactor_error_response(
@@ -802,22 +780,9 @@ class Server:
         message: str,
         serialization_mode: int = 0,
     ) -> None:
-        import struct as _struct
         try:
-            if serialization_mode == SerializationMode.JSON.value:
-                trailer_payload = json_encode({
-                    "code": code.value, "message": message,
-                    "detailKeys": [], "detailValues": [],
-                })
-            else:
-                status = RpcStatus(code=code, message=message)
-                trailer_payload = self._codec.encode(status)
-            trailer_frame = (
-                _struct.pack("<I", len(trailer_payload) + 1)
-                + bytes([TRAILER])
-                + trailer_payload
-            )
-            response_sender.submit(b"", bytes(trailer_frame))
+            trailer_payload = RpcStatus(code=code, message=message).encode()
+            response_sender.submit(b"", encode_frame(trailer_payload, TRAILER))
         except Exception as e:
             logger.error("Failed to send reactor error response: %s", e)
 
@@ -945,13 +910,13 @@ class Server:
         call_ctx = build_call_context(
             service=header.service,
             method=header.method,
-            metadata=_validated_metadata(header.metadataKeys, header.metadataValues),
+            metadata=_validated_metadata(header.metadata_keys, header.metadata_values),
             deadline_secs=header.deadline,
             peer=peer,
             is_streaming=method_info.pattern != "unary",
             pattern=method_info.pattern,
             idempotent=method_info.idempotent,
-            call_id=header.callId,
+            call_id=header.call_id,
             attributes=attributes,
             peer_addr=peer_addr,
             relay_url=relay_url,
@@ -990,20 +955,13 @@ class Server:
                 )
                 continue
             compressed = bool(flags & COMPRESSED)
-            if serialization_mode == SerializationMode.JSON.value:
-                if compressed:
-                    payload = safe_decompress(payload)
-                request = json_decode(payload, expected_type)
-            else:
-                request = self._codec.decode_compressed(payload, compressed, expected_type)
+            request = self._codec.decode_compressed(payload, compressed, expected_type)
             return request, flags
 
     def _encode_response(
         self, response: Any, serialization_mode: int = 0
     ) -> tuple[bytes, bool]:
-        """Encode a response payload, respecting the stream's serialization mode."""
-        if serialization_mode == SerializationMode.JSON.value:
-            return json_encode(response), False
+        """Encode (and maybe compress) a response payload."""
         return self._codec.encode_compressed(response)
 
     @staticmethod
@@ -1029,7 +987,7 @@ class Server:
         interceptors = self._resolve_interceptors(self._registry.lookup(header.service, header.version))
         try:
             # Read the request frame
-            request, flags = await self._decode_request_frame(recv, method_info.request_type, header.serializationMode)
+            request, flags = await self._decode_request_frame(recv, method_info.request_type, header.serialization_mode)
             if request is None:
                 await self._write_error_trailer(send, StatusCode.UNAVAILABLE, "Stream ended")
                 return
@@ -1049,7 +1007,7 @@ class Server:
 
                 # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
                 row_schema_sent = False
-                if header.serializationMode == SerializationMode.ROW.value:
+                if header.serialization_mode == SerializationMode.ROW.value:
                     try:
                         schema_bytes = self._codec.encode_row_schema()
                         await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
@@ -1064,12 +1022,12 @@ class Server:
                         await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
                         return
                     response = await apply_response_interceptors(interceptors, call_ctx, response)
-                    response_payload, response_compressed = self._encode_response(response, header.serializationMode)
+                    response_payload, response_compressed = self._encode_response(response, header.serialization_mode)
                     response_flags = COMPRESSED if response_compressed else 0
                     await write_frame(send, response_payload, response_flags)
 
                 # Write trailer
-                await self._write_ok_trailer(send, header.serializationMode)
+                await self._write_ok_trailer(send, header.serialization_mode)
                 await send.finish()
             finally:
                 reset_call_context(_cv_token)
@@ -1111,12 +1069,12 @@ class Server:
                 payload, flags = frame
                 if flags & TRAILER:
                     try:
-                        eoi_status: RpcStatus = self._codec.decode(payload) if not header.serializationMode == SerializationMode.JSON.value else json_decode(payload, RpcStatus)
+                        eoi_status = RpcStatus.decode(payload)
                         if eoi_status.code != StatusCode.OK:
                             await self._write_error_trailer(
                                 send, StatusCode.INTERNAL,
                                 f"client sent non-OK EoI trailer (code={eoi_status.code})",
-                                serialization_mode=header.serializationMode,
+                                serialization_mode=header.serialization_mode,
                             )
                             return
                     except Exception:
@@ -1133,17 +1091,12 @@ class Server:
                     await self._write_error_trailer(
                         send, StatusCode.RESOURCE_EXHAUSTED,
                         f"client stream exceeded {MAX_CLIENT_STREAM_ITEMS} items",
-                        serialization_mode=header.serializationMode,
+                        serialization_mode=header.serialization_mode,
                     )
                     return
 
                 compressed = bool(flags & COMPRESSED)
-                if header.serializationMode == SerializationMode.JSON.value:
-                    if compressed:
-                        payload = safe_decompress(payload)
-                    request = json_decode(payload, method_info.request_type)
-                else:
-                    request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
+                request = self._codec.decode_compressed(payload, compressed, method_info.request_type)
                 request = await apply_request_interceptors(interceptors, call_ctx, request)
                 requests.append(request)
 
@@ -1169,12 +1122,12 @@ class Server:
                 reset_call_context(_cv_token)
 
             # Encode and write response
-            response_payload, response_compressed = self._encode_response(response, header.serializationMode)
+            response_payload, response_compressed = self._encode_response(response, header.serialization_mode)
             response_flags = COMPRESSED if response_compressed else 0
             await write_frame(send, response_payload, response_flags)
 
             # Write trailer
-            await self._write_ok_trailer(send, header.serializationMode)
+            await self._write_ok_trailer(send, header.serialization_mode)
             await send.finish()
 
         except asyncio.CancelledError:
@@ -1226,11 +1179,11 @@ class Server:
 
                 # Start reader task
                 reader_task = asyncio.create_task(
-                    self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx, header.serializationMode)
+                    self._bidi_reader(recv, method_info.request_type, request_queue, request_done, interceptors, call_ctx, header.serialization_mode)
                 )
 
                 # §5.5.2: ROW_SCHEMA hoisting -- send schema frame before first data frame
-                if header.serializationMode == SerializationMode.ROW.value:
+                if header.serialization_mode == SerializationMode.ROW.value:
                     try:
                         schema_bytes = self._codec.encode_row_schema()
                         await write_frame(send, schema_bytes, flags=ROW_SCHEMA)
@@ -1249,12 +1202,12 @@ class Server:
                         await self._write_error_trailer(send, StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
                         return
                     response = await apply_response_interceptors(interceptors, call_ctx, response)
-                    response_payload, response_compressed = self._encode_response(response, header.serializationMode)
+                    response_payload, response_compressed = self._encode_response(response, header.serialization_mode)
                     response_flags = COMPRESSED if response_compressed else 0
                     await write_frame(send, response_payload, response_flags)
 
                 # Write trailer
-                await self._write_ok_trailer(send, header.serializationMode)
+                await self._write_ok_trailer(send, header.serialization_mode)
                 await send.finish()
 
                 # Wait for reader to finish
@@ -1302,13 +1255,7 @@ class Server:
                     continue
 
                 compressed = bool(flags & COMPRESSED)
-                if serialization_mode == SerializationMode.JSON.value:
-                    if compressed:
-                        import zstandard
-                        payload = zstandard.ZstdDecompressor().decompress(payload)
-                    request = json_decode(payload, request_type)
-                else:
-                    request = self._codec.decode_compressed(payload, compressed, request_type)
+                request = self._codec.decode_compressed(payload, compressed, request_type)
                 request = await apply_request_interceptors(interceptors, call_ctx, request)
                 await request_queue.put(request)
 
@@ -1322,12 +1269,7 @@ class Server:
 
     async def _write_ok_trailer(self, send: Any, serialization_mode: int = 0) -> None:
         """Write an OK status trailer."""
-        status = RpcStatus(code=StatusCode.OK, message="")
-        if serialization_mode == SerializationMode.JSON.value:
-            payload = json_encode({"code": 0, "message": "", "detailKeys": [], "detailValues": []})
-        else:
-            payload = self._codec.encode(status)
-        await write_frame(send, payload, flags=TRAILER)
+        await write_frame(send, _OK_TRAILER_PAYLOAD, flags=TRAILER)
 
     async def _write_error_trailer(
         self, send: Any, code: StatusCode, message: str,
@@ -1335,11 +1277,7 @@ class Server:
     ) -> None:
         """Write an error status trailer."""
         try:
-            if serialization_mode == SerializationMode.JSON.value:
-                payload = json_encode({"code": code.value, "message": message, "detailKeys": [], "detailValues": []})
-            else:
-                status = RpcStatus(code=code, message=message)
-                payload = self._codec.encode(status)
+            payload = RpcStatus(code=code, message=message).encode()
             await write_frame(send, payload, flags=TRAILER)
             await send.finish()
         except Exception as e:
