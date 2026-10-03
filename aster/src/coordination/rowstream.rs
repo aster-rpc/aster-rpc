@@ -231,9 +231,26 @@ pub trait BodyHeader: Sized + std::fmt::Debug + Clone + PartialEq {
     fn validate(&self) -> Result<(), BodyError>;
 }
 
+/// One runtime with **both** header roots registered, used to read either.
+///
+/// Fory ≥ 1.7 decodes a compatible-mode root whose wire type name is not
+/// registered locally through a structural stub: the unknown fields are
+/// dropped and the target comes back with defaults instead of an error. A
+/// recovery header opened as a snapshot header would therefore decode into a
+/// header with empty provenance. Registering the sibling root makes its name
+/// resolve to a concrete, *different* target, which Fory refuses — so the two
+/// roots stay mutually unreadable, as the framing requires.
+fn both_headers_fory() -> fory_core::Fory {
+    use crate::rpc::contract::{PayloadRegistry, WireField};
+    let mut reg = PayloadRegistry::new();
+    SnapshotHeaderV1::register_payload(&mut reg);
+    RecoveryHeaderV1::register_payload(&mut reg);
+    reg.into_fory()
+}
+
 impl BodyHeader for SnapshotHeaderV1 {
     fn fory() -> fory_core::Fory {
-        payload_fory::<SnapshotHeaderV1>()
+        both_headers_fory()
     }
     fn encode(&self) -> Result<Vec<u8>, BodyError> {
         Self::fory().serialize(self).map_err(|_| BodyError::Encode)
@@ -258,7 +275,7 @@ impl BodyHeader for SnapshotHeaderV1 {
 
 impl BodyHeader for RecoveryHeaderV1 {
     fn fory() -> fory_core::Fory {
-        payload_fory::<RecoveryHeaderV1>()
+        both_headers_fory()
     }
     fn encode(&self) -> Result<Vec<u8>, BodyError> {
         Self::fory().serialize(self).map_err(|_| BodyError::Encode)

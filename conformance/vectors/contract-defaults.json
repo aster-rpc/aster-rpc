@@ -1,0 +1,110 @@
+{
+  "description": "Contract-identity golden vector for declared field defaults (Aster-ContractIdentity.md §11.3.2.3, 'Default Values in contract_id'). Produced by the Rust #[derive(AsterType)] with #[aster(default = ...)] attributes.",
+  "rules": {
+    "default_value": "FieldDef.default_value (field 14): empty bytes when required; else the canonical encoding of the default (see spec table); 0x00 for an empty list/set/map",
+    "field_ids": "unaffected by defaults: 1-based position in NFC-name-sorted order",
+    "required": "FieldDef.required (field 13) = false iff the producer declared a contract default; true otherwise",
+    "wire_payload": "defaults never change the Fory payload bytes; they only change type_hash / contract_id"
+  },
+  "rust_source": "aster/tests/contract_defaults_vector.rs",
+  "vector": {
+    "expected_canonical_type_def_hex": "002e64656661756c74732e76312253657474696e67730b0c02166174747273001a737472696e670002000003001a737472696e67000001000412626c6f62001a62696e61727900020000000002000100061e656e61626c65640012626f6f6c000200000000020000010108166c6162656c001a737472696e670002010000000200000206780a126e616d65001a737472696e67000200000000020001000c126e6f7465001a737472696e6700020000000002000001020e16726174696f001e666c6f6174363400020000000002000008000000000000e03f101e726574726965730022766172696e7433320002000000000200000105122273696e63655f6d730022766172696e7436340002000000000200000680a0abfef96214167374617465001a737472696e67000200000000020000051269646c65161274616773001a737472696e670002000001000200000100000c000c",
+    "expected_contract_id": "06fa57d4f8674809d6dbfa54749234758bae9989b174ac098f06c96c8acaa53d",
+    "expected_type_hash": "c6e81a7d0e67179e6e40fe7fe6197557824e8d0e75eff9895756e176356a1b3f",
+    "service": "Defaults v1, one unary method `put` taking and returning Settings, serialization [\"xlang\"], SHARED",
+    "type_def": {
+      "fields_in_declaration_order": [
+        {
+          "container": 0,
+          "default_value_hex": "",
+          "name": "name",
+          "optional": false,
+          "required": true,
+          "type_primitive": "string"
+        },
+        {
+          "container": 0,
+          "default_value_hex": "1269646c65",
+          "name": "state",
+          "optional": false,
+          "required": false,
+          "type_primitive": "string"
+        },
+        {
+          "container": 0,
+          "default_value_hex": "02",
+          "name": "note",
+          "optional": false,
+          "required": false,
+          "type_primitive": "string"
+        },
+        {
+          "container": 0,
+          "default_value_hex": "01",
+          "name": "enabled",
+          "optional": false,
+          "required": false,
+          "type_primitive": "bool"
+        },
+        {
+          "container": 0,
+          "default_value_hex": "05",
+          "name": "retries",
+          "optional": false,
+          "required": false,
+          "type_primitive": "varint32"
+        },
+        {
+          "container": 0,
+          "default_value_hex": "80a0abfef962",
+          "name": "since_ms",
+          "optional": false,
+          "required": false,
+          "type_primitive": "varint64"
+        },
+        {
+          "container": 0,
+          "default_value_hex": "000000000000e03f",
+          "name": "ratio",
+          "optional": false,
+          "required": false,
+          "type_primitive": "float64"
+        },
+        {
+          "container": 0,
+          "default_value_hex": "0678",
+          "name": "label",
+          "optional": true,
+          "required": false,
+          "type_primitive": "string"
+        },
+        {
+          "container": 1,
+          "default_value_hex": "00",
+          "name": "tags",
+          "optional": false,
+          "required": false,
+          "type_primitive": "string"
+        },
+        {
+          "container": 3,
+          "default_value_hex": "00",
+          "name": "attrs",
+          "optional": false,
+          "required": false,
+          "type_primitive": "string"
+        },
+        {
+          "container": 0,
+          "default_value_hex": "",
+          "name": "blob",
+          "optional": false,
+          "required": true,
+          "type_primitive": "binary"
+        }
+      ],
+      "name": "Settings",
+      "package": "defaults.v1"
+    }
+  }
+}

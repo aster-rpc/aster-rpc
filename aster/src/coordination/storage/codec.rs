@@ -27,7 +27,6 @@
 #![allow(dead_code)]
 
 use fory_core::serializer::Serializer;
-use fory_core::ForyDefault;
 
 use super::error::{Db, StorageError, StorageResult};
 use crate::rpc::contract::WireField;
@@ -72,7 +71,6 @@ mod runtime {
     use std::sync::{OnceLock, RwLock};
 
     use fory_core::serializer::Serializer;
-    use fory_core::ForyDefault;
 
     use crate::coordination::contract::payload_fory;
     use crate::rpc::contract::WireField;
@@ -93,7 +91,7 @@ mod runtime {
     /// The process-wide runtime for `T`, constructing it at most once.
     pub(super) fn for_type<T>() -> &'static fory_core::Fory
     where
-        T: WireField + Serializer + ForyDefault + 'static,
+        T: WireField + Serializer<Target = T> + 'static,
     {
         let key = TypeId::of::<T>();
         if let Some(found) = cache().read().expect("the codec cache").get(&key) {
@@ -168,7 +166,7 @@ pub(crate) fn decode_persisted_bounded<T>(
     max_bytes: usize,
 ) -> StorageResult<T>
 where
-    T: WireField + Serializer + ForyDefault + 'static,
+    T: WireField + Serializer<Target = T> + 'static,
 {
     check_stored_len(db, what, bytes, max_bytes)?;
     decode_persisted(db, what, bytes)
@@ -181,7 +179,7 @@ where
 /// is the way in.
 fn decode_persisted<T>(db: Db, what: &'static str, bytes: &[u8]) -> StorageResult<T>
 where
-    T: WireField + Serializer + ForyDefault + 'static,
+    T: WireField + Serializer<Target = T> + 'static,
 {
     runtime::for_type::<T>()
         .deserialize(bytes)
@@ -216,7 +214,7 @@ pub(crate) fn decode_string(db: Db, what: &'static str, bytes: &[u8]) -> Storage
 /// legitimately try again with a different one.
 pub(crate) fn encode_owned<T>(db: Db, what: &'static str, value: &T) -> StorageResult<Vec<u8>>
 where
-    T: WireField + Serializer + ForyDefault + 'static,
+    T: WireField + Serializer<Target = T> + 'static,
 {
     runtime::for_type::<T>()
         .serialize(value)
@@ -239,7 +237,7 @@ pub(crate) fn encode_committed<T>(
     max_bytes: usize,
 ) -> StorageResult<Vec<u8>>
 where
-    T: WireField + Serializer + ForyDefault + 'static,
+    T: WireField + Serializer<Target = T> + 'static,
 {
     encode_bounded(db, what, value, max_bytes).map_err(|err| {
         StorageError::corrupt(
@@ -263,7 +261,7 @@ pub(crate) fn encode_bounded<T>(
     max_bytes: usize,
 ) -> StorageResult<Vec<u8>>
 where
-    T: WireField + Serializer + ForyDefault + 'static,
+    T: WireField + Serializer<Target = T> + 'static,
 {
     let bytes = encode_owned(db, what, value)?;
     if bytes.len() > max_bytes {

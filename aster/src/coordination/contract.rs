@@ -332,8 +332,10 @@ pub struct UnsignedCountersV1 {
 /// actual length. A string's header packs its byte length, so 4095 encodes a
 /// header below `0x4000` and 4096 crosses into the over-writing branch --
 /// which is why the boundary is exactly here and not at a round number of the
-/// string itself. The branches are still present on Apache Fory `main`, and the
-/// latest release is 1.5.0, so this is not merely a property of the 1.3.0 pin.
+/// string itself. This was measured on `fory-core` 1.3.0. The workspace now
+/// pins 1.7.6, where the defect is fixed (long strings round-trip; see the
+/// `strings_past_the_wire_cap_round_trip_on_the_pinned_codec` test), but the
+/// cap stays for the mixed-version reason below.
 ///
 /// 4096 is the **first failing length** that has been measured. Larger lengths
 /// were sampled and also fail, but the cap is set from the first failure, not
@@ -425,14 +427,14 @@ mod tests {
         }
     }
 
-    /// The measured boundary behind [`MAX_WIRE_STRING`]: 4095 round-trips and
-    /// 4096 does not. Pinned as a test so that if the codec changes under us,
-    /// this fails and the change is noticed rather than discovered by a peer
-    /// that cannot read a ticket. A failure here is **not** an instruction to
-    /// raise the cap -- see [`MAX_WIRE_STRING`] for why that is a
-    /// protocol-version decision.
+    /// The upstream defect behind [`MAX_WIRE_STRING`] is fixed in the pinned
+    /// Fory (1.7.6): strings of 4096 bytes and longer now round-trip. Pinned as
+    /// a test so a codec regression is noticed. Passing here is **not** an
+    /// instruction to raise the cap -- a voter still on a 1.3.0 build cannot
+    /// read what it would admit, so lifting it remains a protocol-version
+    /// decision (see [`MAX_WIRE_STRING`]).
     #[test]
-    fn the_first_failing_string_length_is_4096_bytes() {
+    fn strings_past_the_wire_cap_round_trip_on_the_pinned_codec() {
         #[derive(ForyStruct, aster_macros::AsterType, Debug, Default, Clone, PartialEq)]
         #[aster(wire = "aster.coordination.v1/StringBoundProbe")]
         struct Probe {
@@ -459,9 +461,14 @@ mod tests {
             blob: Vec::new(),
         };
         assert!(
-            !encodes_and_decodes(&over_limit),
-            "4096 is the first failing length; if it now passes, the codec changed"
+            encodes_and_decodes(&over_limit),
+            "4096 bytes round-trips on fory 1.7.6; if it fails, the codec regressed"
         );
+        let long = Probe {
+            text: "x".repeat(64 * 1024),
+            blob: Vec::new(),
+        };
+        assert!(encodes_and_decodes(&long), "a 64 KiB string round-trips");
 
         // The same byte count as bytes, which is why byte fields keep their
         // full declared ceilings.
@@ -471,7 +478,7 @@ mod tests {
         };
         assert!(
             encodes_and_decodes(&as_bytes),
-            "the defect is specific to the string path"
+            "byte fields keep their full declared ceilings"
         );
     }
 

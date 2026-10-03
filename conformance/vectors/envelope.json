@@ -1,0 +1,245 @@
+{
+  "description": "Aster RPC envelope vectors, format AEv1 (Aster-SPEC §6.9). These are frame PAYLOADS (HEADER / CALL / TRAILER frames), not whole frames. Fory is not involved.",
+  "format": {
+    "CallHeader": "method, callId:i32, deadline:i16, metadataKeys, metadataValues",
+    "RpcStatus": "code:i32, message, detailKeys, detailValues",
+    "StreamHeader": "service, method, version:i32, callId:i32, deadline:i16, serializationMode:i8, metadataKeys, metadataValues, sessionId:i32",
+    "int": "zigzag LEB128 varint, minimal length, range-checked to the field width",
+    "list<string>": "varint(count) 0x0C then each string",
+    "prefix": "tag:u8 version:u8 (0x01); tags: 0xA1 StreamHeader, 0xA2 CallHeader, 0xA3 RpcStatus",
+    "rules": "every field always present, fixed order, no trailing bytes; key/value lists must have equal length",
+    "string": "varint((utf8_len << 2) | 2) then UTF-8 bytes"
+  },
+  "invalid": [
+    {
+      "hex": "",
+      "name": "empty input",
+      "reason": "empty",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a101020200000000000c000c00",
+      "name": "wrong tag (StreamHeader bytes read as RpcStatus)",
+      "reason": "tag",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a3020002000c000c",
+      "name": "unsupported version",
+      "reason": "version",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a3010002000c000c00",
+      "name": "trailing byte",
+      "reason": "trailing",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a3010002000c00",
+      "name": "truncated",
+      "reason": "truncated",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a301800002000c000c",
+      "name": "non-minimal varint (code 0 as 80 00)",
+      "reason": "non-minimal",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a3010001000c000c",
+      "name": "string header with non-UTF8 marker bits (0x01)",
+      "reason": "string",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a201126d6574680000010c066b000c",
+      "name": "metadata key/value count mismatch (1 key, 0 values)",
+      "reason": "mismatch",
+      "type": "CallHeader"
+    },
+    {
+      "hex": "a201126d6574680080f104000c000c",
+      "name": "deadline out of int16 range (40000)",
+      "reason": "range",
+      "type": "CallHeader"
+    },
+    {
+      "hex": "a30100020000000c",
+      "name": "list element marker wrong (0x00 instead of 0x0C)",
+      "reason": "list",
+      "type": "RpcStatus"
+    }
+  ],
+  "note": "Encoders MUST produce `hex` exactly for `input`; decoders MUST decode `hex` to `input` and MUST reject every `invalid` vector.",
+  "vectors": [
+    {
+      "hex": "a101124563686f126563686f02020000000c000c00",
+      "input": {
+        "callId": 1,
+        "deadline": 0,
+        "metadataKeys": [],
+        "metadataValues": [],
+        "method": "echo",
+        "serializationMode": 0,
+        "service": "Echo",
+        "sessionId": 0,
+        "version": 1
+      },
+      "length": 21,
+      "name": "StreamHeader: basic unary",
+      "type": "StreamHeader"
+    },
+    {
+      "hex": "a101324167656e7453657373696f6e0202000000000c000c06",
+      "input": {
+        "callId": 0,
+        "deadline": 0,
+        "metadataKeys": [],
+        "metadataValues": [],
+        "method": "",
+        "serializationMode": 0,
+        "service": "AgentSession",
+        "sessionId": 3,
+        "version": 1
+      },
+      "length": 25,
+      "name": "StreamHeader: session open (empty method, session id)",
+      "type": "StreamHeader"
+    },
+    {
+      "hex": "a1013a4d697373696f6e436f6e74726f6c2667657453746174757304d8043c00020c2a61737465722e726f6c65167472616365020c2a6f70732e7374617475730200",
+      "input": {
+        "callId": 300,
+        "deadline": 30,
+        "metadataKeys": [
+          "aster.role",
+          "trace"
+        ],
+        "metadataValues": [
+          "ops.status",
+          ""
+        ],
+        "method": "getStatus",
+        "serializationMode": 0,
+        "service": "MissionControl",
+        "sessionId": 0,
+        "version": 2
+      },
+      "length": 66,
+      "name": "StreamHeader: deadline + metadata",
+      "type": "StreamHeader"
+    },
+    {
+      "hex": "a101020200000000000c000c00",
+      "input": {
+        "callId": 0,
+        "deadline": 0,
+        "metadataKeys": [],
+        "metadataValues": [],
+        "method": "",
+        "serializationMode": 0,
+        "service": "",
+        "sessionId": 0,
+        "version": 0
+      },
+      "length": 13,
+      "name": "StreamHeader: all defaults",
+      "type": "StreamHeader"
+    },
+    {
+      "hex": "a1012a4772c3b6c39f65e29c93066dfeffffff0f01ffff0304000c000cffffffff0f",
+      "input": {
+        "callId": -1,
+        "deadline": -32768,
+        "metadataKeys": [],
+        "metadataValues": [],
+        "method": "m",
+        "serializationMode": 2,
+        "service": "Größe✓",
+        "sessionId": -2147483648,
+        "version": 2147483647
+      },
+      "length": 34,
+      "name": "StreamHeader: extremes + unicode",
+      "type": "StreamHeader"
+    },
+    {
+      "hex": "a20112737465700e00000c000c",
+      "input": {
+        "callId": 7,
+        "deadline": 0,
+        "metadataKeys": [],
+        "metadataValues": [],
+        "method": "step"
+      },
+      "length": 13,
+      "name": "CallHeader: basic session call",
+      "type": "CallHeader"
+    },
+    {
+      "hex": "a2012e61737369676e5f7461736b100a010c066b010c0676",
+      "input": {
+        "callId": 8,
+        "deadline": 5,
+        "metadataKeys": [
+          "k"
+        ],
+        "metadataValues": [
+          "v"
+        ],
+        "method": "assign_task"
+      },
+      "length": 24,
+      "name": "CallHeader: deadline + metadata",
+      "type": "CallHeader"
+    },
+    {
+      "hex": "a3010002000c000c",
+      "input": {
+        "code": 0,
+        "detailKeys": [],
+        "detailValues": [],
+        "message": ""
+      },
+      "length": 8,
+      "name": "RpcStatus: OK",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a3010a266e6f7420666f756e64010c227265736f75726365010c1a7461736b2f39",
+      "input": {
+        "code": 5,
+        "detailKeys": [
+          "resource"
+        ],
+        "detailValues": [
+          "task/9"
+        ],
+        "message": "not found"
+      },
+      "length": 33,
+      "name": "RpcStatus: NOT_FOUND with details",
+      "type": "RpcStatus"
+    },
+    {
+      "hex": "a301ca0152636f6e747261742076696f6cc3a9202d20e29c97020c06610662020c06310632",
+      "input": {
+        "code": 101,
+        "detailKeys": [
+          "a",
+          "b"
+        ],
+        "detailValues": [
+          "1",
+          "2"
+        ],
+        "message": "contrat violé - ✗"
+      },
+      "length": 37,
+      "name": "RpcStatus: application code + unicode",
+      "type": "RpcStatus"
+    }
+  ]
+}

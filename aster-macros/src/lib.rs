@@ -199,7 +199,7 @@ fn expand_union(
                     return;
                 }
                 let __td = <Self as ::aster::rpc::AsterType>::aster_type_def();
-                __reg.register::<Self>(&::std::format!("{}.{}", __td.package, __td.name));
+                __reg.register_union::<Self>(&::std::format!("{}.{}", __td.package, __td.name));
                 #(#register_children)*
             }
         }

@@ -189,6 +189,30 @@ async fn all_patterns_and_errors() {
     let items = within(s.collect()).await.unwrap();
     assert_eq!(items, vec![vec![2u8, 1u8], vec![4u8, 3u8]]);
 
+    // Payloads over the 4 KiB threshold travel zstd-compressed (COMPRESSED
+    // flag) in both directions and arrive as the original bytes.
+    let big: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    let mut big_rev = big.clone();
+    big_rev.reverse();
+    let resp = within(conn.unary(&header("unary"), big.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp, big_rev);
+    let mut s = within(conn.bidi(&header("bidi"), vec![big.clone(), vec![1, 2], big.clone()]))
+        .await
+        .unwrap();
+    let items = within(s.collect()).await.unwrap();
+    assert_eq!(
+        items,
+        vec![big_rev.clone(), vec![2u8, 1u8], big_rev.clone()]
+    );
+    let resp = within(conn.client_stream(&header("client_stream"), vec![vec![5], big.clone()]))
+        .await
+        .unwrap();
+    // The handler sums first bytes: 5 + big[0] (= 0). Had the second frame
+    // reached it still compressed, its first byte would be zstd's magic 0x28.
+    assert_eq!(resp, vec![5u8]);
+
     // error propagation (non-OK trailer → Error::Rpc)
     let err = within(conn.unary(&header("fails"), vec![0]))
         .await

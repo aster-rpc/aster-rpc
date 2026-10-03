@@ -54,6 +54,90 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// method, once the header has been decoded.
 pub const MAX_CALL_HEADER_SIZE: u32 = 64 * 1024;
 
+// ── Payload compression (Aster-SPEC §5.6) ────────────────────────────────────
+
+/// Payloads strictly larger than this many bytes are zstd-compressed on send
+/// (matches Python `DEFAULT_COMPRESSION_THRESHOLD` / TS
+/// `DEFAULT_COMPRESSION_THRESHOLD`).
+pub const COMPRESSION_THRESHOLD: usize = 4096;
+
+/// zstd level used on send (the zstd / python-zstandard / Node default).
+pub const ZSTD_LEVEL: i32 = 3;
+
+/// Decompression-bomb limit: a compressed payload may expand to at most this
+/// many bytes (16 MiB, matches Python/TS `MAX_DECOMPRESSED_SIZE`). Enforced
+/// while streaming; the frame's declared content size is never trusted.
+pub const MAX_DECOMPRESSED_SIZE: usize = 16 * 1024 * 1024;
+
+/// Compress `payload` for sending if it is larger than `threshold` bytes.
+///
+/// Returns `Some(compressed)` when the caller should send the compressed bytes
+/// with [`FLAG_COMPRESSED`] set, `None` to send `payload` unchanged. Like the
+/// TypeScript binding, a compressed form that is not smaller than the input is
+/// discarded. Receivers accept both forms, so this choice never affects
+/// interoperability.
+pub fn maybe_compress(payload: &[u8], threshold: usize) -> Result<Option<Vec<u8>>> {
+    if payload.len() <= threshold {
+        return Ok(None);
+    }
+    let compressed = zstd::bulk::compress(payload, ZSTD_LEVEL)
+        .map_err(|e| anyhow::anyhow!("zstd compress failed: {e}"))?;
+    Ok((compressed.len() < payload.len()).then_some(compressed))
+}
+
+/// Decompress a `FLAG_COMPRESSED` payload, refusing output larger than
+/// [`MAX_DECOMPRESSED_SIZE`].
+pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    decompress_with_limit(data, MAX_DECOMPRESSED_SIZE)
+}
+
+/// [`decompress`] with an explicit output limit (bytes).
+pub fn decompress_with_limit(data: &[u8], limit: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let decoder = zstd::stream::read::Decoder::new(data)
+        .map_err(|e| anyhow::anyhow!("zstd decoder init failed: {e}"))?;
+    let mut out = Vec::new();
+    // Read at most limit+1 bytes: one byte past the limit proves the bomb
+    // without materialising the rest of it.
+    decoder
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| anyhow::anyhow!("zstd decompress failed: {e}"))?;
+    if out.len() > limit {
+        bail!("decompressed payload exceeds limit of {limit} bytes");
+    }
+    Ok(out)
+}
+
+/// Encode a data frame, compressing the payload when it exceeds
+/// [`COMPRESSION_THRESHOLD`] (and setting [`FLAG_COMPRESSED`]).
+pub fn encode_payload_frame(payload: &[u8], flags: u8) -> Result<Vec<u8>> {
+    encode_payload_frame_with_threshold(payload, flags, COMPRESSION_THRESHOLD)
+}
+
+/// [`encode_payload_frame`] with an explicit threshold (`usize::MAX` disables
+/// compression).
+pub fn encode_payload_frame_with_threshold(
+    payload: &[u8],
+    flags: u8,
+    threshold: usize,
+) -> Result<Vec<u8>> {
+    match maybe_compress(payload, threshold)? {
+        Some(c) => encode_frame(&c, flags | FLAG_COMPRESSED),
+        None => encode_frame(payload, flags & !FLAG_COMPRESSED),
+    }
+}
+
+/// The logical payload of a received frame: decompressed if `flags` carries
+/// [`FLAG_COMPRESSED`], otherwise `payload` itself.
+pub fn payload_of(payload: Vec<u8>, flags: u8) -> Result<Vec<u8>> {
+    if flags & FLAG_COMPRESSED != 0 {
+        decompress(&payload)
+    } else {
+        Ok(payload)
+    }
+}
+
 /// Encode a frame: returns `[4-byte LE length][1-byte flags][payload]`.
 ///
 /// *Length* equals `1` (the flags byte) plus `payload.len()`.
@@ -269,6 +353,62 @@ mod tests {
         assert_eq!(frame[5], 0xDE); // payload[0]
         assert_eq!(frame[6], 0xAD); // payload[1]
         assert_eq!(frame.len(), 7);
+    }
+
+    // ---- Compression ----
+
+    #[test]
+    fn small_payloads_are_not_compressed() {
+        let p = vec![b'a'; COMPRESSION_THRESHOLD];
+        let f = encode_payload_frame(&p, FLAG_END_STREAM).unwrap();
+        let (payload, flags, _) = decode_frame(&f).unwrap();
+        assert_eq!(flags, FLAG_END_STREAM);
+        assert_eq!(payload, p);
+    }
+
+    #[test]
+    fn large_payloads_compress_and_round_trip() {
+        let p = vec![b'a'; COMPRESSION_THRESHOLD + 1];
+        let f = encode_payload_frame(&p, FLAG_END_STREAM).unwrap();
+        let (payload, flags, _) = decode_frame(&f).unwrap();
+        assert_eq!(flags, FLAG_END_STREAM | FLAG_COMPRESSED);
+        assert!(payload.len() < p.len());
+        assert_eq!(payload_of(payload, flags).unwrap(), p);
+    }
+
+    #[test]
+    fn incompressible_payloads_are_sent_raw() {
+        // xorshift noise: zstd cannot shrink it.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let p: Vec<u8> = (0..8192)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let f = encode_payload_frame(&p, 0).unwrap();
+        let (payload, flags, _) = decode_frame(&f).unwrap();
+        assert_eq!(flags & FLAG_COMPRESSED, 0);
+        assert_eq!(payload, p);
+    }
+
+    #[test]
+    fn decompression_bomb_is_refused() {
+        let bomb = zstd::bulk::compress(&vec![0u8; MAX_DECOMPRESSED_SIZE + 1], 3).unwrap();
+        assert!(bomb.len() < 64 * 1024);
+        let e = decompress(&bomb).unwrap_err().to_string();
+        assert!(e.contains("exceeds limit"), "{e}");
+        // Exactly at the limit is fine.
+        let ok = zstd::bulk::compress(&vec![0u8; 1024], 3).unwrap();
+        assert_eq!(decompress_with_limit(&ok, 1024).unwrap().len(), 1024);
+        assert!(decompress_with_limit(&ok, 1023).is_err());
+    }
+
+    #[test]
+    fn corrupt_compressed_payload_errors() {
+        assert!(payload_of(vec![1, 2, 3, 4], FLAG_COMPRESSED).is_err());
     }
 
     // ---- Multiple frames ----

@@ -9,10 +9,10 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use fory_core::{Fory, ForyDefault, Serializer};
+use fory_core::{Fory, Serializer};
 use tokio::sync::mpsc::Receiver;
 
-use aster_transport_core::framing::encode_frame;
+use aster_transport_core::framing::encode_payload_frame;
 use aster_transport_core::reactor::{OutgoingFrame, RequestFrame, ResponseSender};
 
 use super::client::{BidiSink, ResponseStream};
@@ -47,12 +47,12 @@ impl<T> ResponseSink<T> {
     }
 }
 
-impl<T: Serializer> ResponseSink<T> {
+impl<T: Serializer<Target = T>> ResponseSink<T> {
     /// Encode and send one streaming response item.
     /// Async since §12.4 bounded the response channel; see [`Call::send`].
     pub async fn send(&self, item: &T) -> Result<()> {
         let bytes = self.fory.serialize(item).map_err(encode_err)?;
-        let frame = encode_frame(&bytes, 0)?;
+        let frame = encode_payload_frame(&bytes, 0)?;
         self.tx
             .send(OutgoingFrame::Frame(frame))
             .await
@@ -87,7 +87,7 @@ impl<T> BidiCall<T> {
     }
 }
 
-impl<T: Serializer> BidiCall<T> {
+impl<T: Serializer<Target = T>> BidiCall<T> {
     /// Encode and send one request, flushed immediately.
     pub async fn send(&self, item: &T) -> Result<()> {
         let bytes = self.fory.serialize(item).map_err(encode_err)?;
@@ -129,13 +129,13 @@ impl<T> RequestStream<T> {
             return None;
         }
         match &mut self.rx {
-            Some(rx) => rx.recv().await.map(|f| f.payload),
+            Some(rx) => super::server::next_request_frame(rx).await,
             None => None,
         }
     }
 }
 
-impl<T: Serializer + ForyDefault> RequestStream<T> {
+impl<T: Serializer<Target = T>> RequestStream<T> {
     /// Receive and decode the next request, or `None` at end of stream.
     pub async fn recv(&mut self) -> Result<Option<T>> {
         match self.recv_bytes().await {
@@ -168,7 +168,7 @@ impl<T> MessageStream<T> {
     }
 }
 
-impl<T: Serializer + ForyDefault> MessageStream<T> {
+impl<T: Serializer<Target = T>> MessageStream<T> {
     /// The next decoded response: `Some(Ok(_))` per item, `None` at the OK
     /// trailer / EOF, `Some(Err(_))` on a non-OK trailer or a decode error.
     pub async fn recv(&mut self) -> Option<Result<T>> {

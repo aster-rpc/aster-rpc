@@ -52,7 +52,9 @@ use aster::rpc::{
     CallParts, Dispatcher, MethodPattern, OutgoingFrame, PeerProvenance, Projection,
     ProjectionRegistry, RequestFrame,
 };
-use aster_transport_core::framing::{decode_frame, FLAG_END_STREAM, FLAG_TRAILER};
+use aster_transport_core::framing::{
+    decode_frame, payload_of, FLAG_COMPRESSED, FLAG_END_STREAM, FLAG_TRAILER,
+};
 use aster_transport_core::reactor::{
     response_channel, ResponseItem, ResponseLease, ResponseReceiver,
 };
@@ -483,13 +485,18 @@ fn split_request(media_in: &str, body: &[u8]) -> Vec<Vec<u8>> {
     }
 }
 
-/// Walk the (possibly multiple) length-prefixed frames in `raw`.
+/// Walk the (possibly multiple) length-prefixed frames in `raw`, handing each
+/// callback the logical payload (zstd-inflated when `FLAG_COMPRESSED` is set;
+/// the flag is cleared). A frame that fails to inflate ends the walk.
 fn for_each_frame(raw: Vec<u8>, mut f: impl FnMut(&[u8], u8)) {
     let mut buf = &raw[..];
     while !buf.is_empty() {
         match decode_frame(buf) {
             Ok((payload, flags, consumed)) if consumed > 0 => {
-                f(&payload, flags);
+                let Ok(payload) = payload_of(payload, flags) else {
+                    break;
+                };
+                f(&payload, flags & !FLAG_COMPRESSED);
                 buf = &buf[consumed..];
             }
             _ => break,

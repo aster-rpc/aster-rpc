@@ -3,6 +3,7 @@ pub mod attestation;
 pub mod canonical;
 pub mod contract;
 pub mod datagram;
+pub mod envelope;
 pub mod framing;
 pub mod grant_record;
 pub mod hpke_envelope;
@@ -18,6 +19,7 @@ pub mod ticket;
 pub mod topology;
 pub mod trust;
 pub mod tunnel;
+pub mod xlang;
 
 /// Exact Aster build version (`major.minor.commit-offset`) embedded at compile time.
 pub const VERSION: &str = env!("ASTER_BUILD_VERSION");

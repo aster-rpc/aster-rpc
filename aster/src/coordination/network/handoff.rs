@@ -219,7 +219,7 @@ impl AdmittedHeader {
 /// nested payloads — the outer envelope check cannot see inside them.
 fn canonical_decode<T>(bytes: &[u8], what: &str) -> Result<T, StreamRefusal>
 where
-    T: crate::rpc::contract::WireField + fory_core::serializer::Serializer + fory_core::ForyDefault,
+    T: crate::rpc::contract::WireField + fory_core::serializer::Serializer<Target = T>,
 {
     use crate::coordination::contract::payload_fory;
     let value: T = payload_fory::<T>()

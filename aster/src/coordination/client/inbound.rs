@@ -76,7 +76,7 @@ pub(crate) struct MutationContext<'a> {
 
 fn decode<T>(bytes: &[u8]) -> Result<T, String>
 where
-    T: crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: crate::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
 {
     crate::coordination::contract::payload_fory::<T>()
         .deserialize(bytes)
@@ -1443,10 +1443,7 @@ mod tests {
 
     fn encode<T>(value: &T) -> Vec<u8>
     where
-        T: crate::rpc::contract::WireField
-            + fory_core::Serializer
-            + fory_core::ForyDefault
-            + 'static,
+        T: crate::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
     {
         payload_fory::<T>().serialize(value).expect("encodes")
     }

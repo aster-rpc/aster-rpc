@@ -560,7 +560,7 @@ fn internal(what: &str) -> RpcStatus {
 /// Decode one unary request frame as `T`, or say why not (stage 0).
 fn decode<T>(frame: &[u8]) -> Result<T, RpcStatus>
 where
-    T: crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: crate::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
 {
     payload_fory::<T>()
         .deserialize(frame)
@@ -1160,7 +1160,7 @@ async fn propose_and_reply<T, F>(
     call: Call,
     project: F,
 ) where
-    T: crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: crate::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
     F: FnOnce(CommandReplyV1) -> Result<T, RpcStatus>,
 {
     use openraft::error::ClientWriteError;
@@ -1191,7 +1191,7 @@ async fn propose_and_reply<T, F>(
 /// Encode and send one typed unary reply.
 async fn respond_reply<T>(call: Call, reply: T)
 where
-    T: crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: crate::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
 {
     match payload_fory::<T>().serialize(&reply) {
         Ok(bytes) => {
