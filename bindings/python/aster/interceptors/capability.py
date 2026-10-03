@@ -1,3 +1,8 @@
+# STATUS: TBD - possibly retired.
+# Aster authentication/authorization will be designed once in Rust and
+# exposed to every binding (docs/_internal/bindings/BINDINGS_CATCHUP_PLAN.md,
+# D3). Until then this module is frozen: fix bugs, but do not extend it
+# or port it to other languages.
 """Capability interceptor -- Gate 3 method-level access control.
 
 Evaluates ``CapabilityRequirement`` from the service and method definitions

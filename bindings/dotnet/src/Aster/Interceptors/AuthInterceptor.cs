@@ -1,3 +1,8 @@
+// STATUS: TBD - possibly retired.
+// Aster authentication/authorization will be designed once in Rust and
+// exposed to every binding (docs/_internal/bindings/BINDINGS_CATCHUP_PLAN.md,
+// D3). Until then this module is frozen: fix bugs, but do not extend it
+// or port it to other languages.
 namespace Aster.Interceptors;
 
 /// <summary>

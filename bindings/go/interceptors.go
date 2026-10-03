@@ -296,6 +296,12 @@ func (f funcValidator) Validate(tok string) bool { return f(tok) }
 // FuncValidator returns a TokenValidator backed by a function.
 func FuncValidator(fn func(string) bool) TokenValidator { return funcValidator(fn) }
 
+// STATUS: TBD - possibly retired.
+// Aster authentication/authorization will be designed once in Rust and
+// exposed to every binding (docs/_internal/bindings/BINDINGS_CATCHUP_PLAN.md,
+// D3). Until then this module is frozen: fix bugs, but do not extend it
+// or port it to other languages.
+//
 // AuthInterceptor injects and/or validates auth metadata.
 type AuthInterceptor struct {
 	BaseInterceptor
@@ -475,6 +481,12 @@ func (r *RateLimitInterceptor) OnRequest(ctx *CallContext, request any) (any, er
 // CapabilityInterceptor
 // ---------------------------------------------------------------------------
 
+// STATUS: TBD - possibly retired.
+// Aster authentication/authorization will be designed once in Rust and
+// exposed to every binding (docs/_internal/bindings/BINDINGS_CATCHUP_PLAN.md,
+// D3). Until then this module is frozen: fix bugs, but do not extend it
+// or port it to other languages.
+//
 // CapabilityInterceptor enforces role-based access control.
 // ServiceRoles maps "ServiceName" or "ServiceName.MethodName" to the list
 // of roles that are permitted to call it. The caller's role is read from
