@@ -422,6 +422,14 @@ def clone_fork(
     revision = run(["git", "rev-parse", "HEAD"], cwd=destination, capture=True).stdout.strip()
     if revision != fork["commit"]:
         raise RuntimeError(f"{source} checkout mismatch: {revision}")
+    # A fork's own `.cargo/config.toml` is for its upstream CI, never shipped in
+    # the crate tarball, and so never seen by a registry consumer. Verify the
+    # package the way a consumer builds it. Upstream iroh's sets
+    # `linker = "clang"` + lld for x86_64 Linux, which the release image lacks:
+    #
+    #   error: linker `clang` not found
+    for config in (destination / ".cargo" / "config.toml", destination / ".cargo" / "config"):
+        config.unlink(missing_ok=True)
     patch_tree(destination)
     return destination
 
