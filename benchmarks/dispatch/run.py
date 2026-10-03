@@ -232,8 +232,8 @@ def machine_info() -> dict:
         "os": f"{platform.system()} {platform.release()} ({platform.platform()})",
         "machine": platform.machine(),
         "git": cmd_out(["git", "-C", str(REPO), "rev-parse", "HEAD"]),
-        "git_dirty": bool(cmd_out(["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=no"])
-                          .strip().replace("<", "")),
+        "git_dirty": bool(subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=no"],
+                                         capture_output=True, text=True).stdout.strip()),
         "python": cmd_out(["uv", "run", "--no-sync", "python", "--version"]),
         "bun": cmd_out(["bun", "--version"]),
         "node": cmd_out(["node", "--version"]),
