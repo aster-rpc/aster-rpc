@@ -18,6 +18,7 @@ pub mod ticket;
 pub mod topology;
 pub mod trust;
 pub mod tunnel;
+pub mod xlang;
 
 /// Exact Aster build version (`major.minor.commit-offset`) embedded at compile time.
 pub const VERSION: &str = env!("ASTER_BUILD_VERSION");

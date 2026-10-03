@@ -71,7 +71,7 @@ static FORY: OnceLock<Fory> = OnceLock::new();
 
 fn fory() -> &'static Fory {
     FORY.get_or_init(|| {
-        let mut f = Fory::builder().xlang(true).compatible(true).build();
+        let mut f = crate::xlang::new_fory();
         f.register_by_name::<NetworkPosition>("aster.topo.NetworkPosition")
             .expect("register NetworkPosition");
         f.register_by_name::<RttEdge>("aster.topo.RttEdge")

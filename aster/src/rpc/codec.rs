@@ -96,7 +96,7 @@ static ENVELOPE_FORY: OnceLock<Fory> = OnceLock::new();
 /// ser/de goes through this.
 fn envelope_fory() -> &'static Fory {
     ENVELOPE_FORY.get_or_init(|| {
-        let mut f = Fory::builder().xlang(true).compatible(true).build();
+        let mut f = aster_transport_core::xlang::new_fory();
         f.register_by_name::<StreamHeader>("_aster.StreamHeader")
             .expect("register StreamHeader");
         f.register_by_name::<CallHeader>("_aster.CallHeader")
@@ -113,7 +113,7 @@ fn envelope_fory() -> &'static Fory {
 /// `serialize`/`deserialize`. Envelope types use the separate process-global
 /// runtime above and must **not** be registered here.
 pub fn new_payload_fory() -> Fory {
-    Fory::builder().xlang(true).compatible(true).build()
+    aster_transport_core::xlang::new_fory()
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────

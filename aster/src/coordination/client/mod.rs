@@ -805,7 +805,7 @@ fn narrow_plan(
 
 fn encode<T>(value: &T) -> Result<Vec<u8>>
 where
-    T: crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: crate::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
 {
     payload_fory::<T>()
         .serialize(value)
@@ -814,7 +814,7 @@ where
 
 fn decode<T>(bytes: &[u8]) -> Result<T>
 where
-    T: crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: crate::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
 {
     payload_fory::<T>()
         .deserialize(bytes)
@@ -887,13 +887,12 @@ fn check_envelope<T: ReplyEnvelope + inbound::ValidReply>(
 async fn unary_typed<T>(engine: &Engine, method: &str, request: &T::Request) -> Result<T>
 where
     T: crate::rpc::contract::WireField
-        + fory_core::Serializer
-        + fory_core::ForyDefault
+        + fory_core::Serializer<Target = T>
         + ReplyEnvelope
         + inbound::ValidReply
         + 'static,
     T::Request:
-        crate::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+        crate::rpc::contract::WireField + fory_core::Serializer<Target = T::Request> + 'static,
 {
     let bytes = encode(request)?;
     match engine.unary(method, bytes).await {

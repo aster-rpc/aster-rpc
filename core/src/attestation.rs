@@ -140,7 +140,7 @@ static FORY: OnceLock<Fory> = OnceLock::new();
 /// must always go through this.
 fn fory() -> &'static Fory {
     FORY.get_or_init(|| {
-        let mut f = Fory::builder().xlang(true).compatible(true).build();
+        let mut f = crate::xlang::new_fory();
         // Register leaf-to-root: Statement is nested inside AttestationBody.
         f.register_by_name::<Statement>("aster.attestation.statement.v1")
             .expect("register Statement");

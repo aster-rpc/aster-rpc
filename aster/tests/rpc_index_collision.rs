@@ -1,9 +1,9 @@
 #![cfg(feature = "rpc")]
 //! Regression test for cross-crate Fory type-index collisions (TradeStorm).
 //!
-//! Fory 1.3.0 gives every `#[derive(ForyStruct)]` type a `fory_type_index()`
+//! Fory 1.3.0 gives every `#[derive(ForyStruct)]` type a `type_index()`
 //! allocated from a **per-crate** counter that restarts at 0 in each crate.
-//! Registration claims `type_id_index[fory_type_index()]` and errors when the
+//! Registration claims `type_id_index[type_index()]` and errors when the
 //! slot is taken — so two types from *different* crates (e.g. a user payload
 //! type and `aster::rpc::Empty`) can collide inside one Fory runtime even
 //! though both are registered by wire name.
@@ -207,10 +207,10 @@ async fn wait_for_addr(n: &Node) {
 /// the payload set above.
 #[test]
 fn empty_index_within_test_payload_range() {
-    let e = <aster::rpc::Empty as StructSerializer>::fory_type_index();
+    let e = <aster::rpc::Empty as StructSerializer>::type_index();
     assert!(
         e < 32,
-        "aster::rpc::Empty has fory_type_index {e}; widen P00..P31 so the \
+        "aster::rpc::Empty has type_index {e}; widen P00..P31 so the \
          collision scenario stays covered"
     );
 }
@@ -255,7 +255,7 @@ async fn server_with_cross_crate_index_overlap_starts_and_serves() {
 fn intra_tree_collision_names_both_types() {
     use aster::rpc::{PayloadRegistry, WireField};
 
-    let e = <aster::rpc::Empty as StructSerializer>::fory_type_index();
+    let e = <aster::rpc::Empty as StructSerializer>::type_index();
     let mut reg = PayloadRegistry::new();
     <aster::rpc::Empty as WireField>::register_payload(&mut reg);
 

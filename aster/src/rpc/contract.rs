@@ -91,8 +91,8 @@ pub trait WireField {
 /// request or response) and its transitive field tree.
 ///
 /// Apache Fory's `#[derive(ForyStruct)]` allocates each type a
-/// `fory_type_index()` from a **per-crate** counter that restarts at 0 in
-/// every crate, and registration claims `type_id_index[fory_type_index()]`
+/// `type_index()` from a **per-crate** counter that restarts at 0 in
+/// every crate, and registration claims `type_id_index[type_index()]`
 /// unconditionally — even for name-based registration. Two types from
 /// different crates can therefore collide inside one runtime ("Type index N
 /// already registered"). The `#[aster::service]` macro avoids cross-root
@@ -128,27 +128,48 @@ impl PayloadRegistry {
     /// # Panics
     ///
     /// When another type in this registry already occupies
-    /// `T::fory_type_index()`, or when Fory rejects the registration.
+    /// `T::type_index()`, or when Fory rejects the registration.
     pub fn register<T>(&mut self, wire_name: &str)
     where
-        T: fory_core::StructSerializer + fory_core::Serializer + fory_core::ForyDefault + 'static,
+        T: fory_core::StructSerializer + fory_core::Serializer<Target = T> + 'static,
     {
-        let index = T::fory_type_index();
+        self.register_inner::<T>(wire_name, false)
+    }
+
+    /// Register a data-carrying enum (`#[derive(ForyUnion)]`) under
+    /// `wire_name`. Fory ≥ 1.7 refuses to register a UNION-category serializer
+    /// through `register_by_name`; unions take `register_union_by_name`. Same
+    /// collision diagnostic as [`register`](Self::register).
+    pub fn register_union<T>(&mut self, wire_name: &str)
+    where
+        T: fory_core::StructSerializer + fory_core::Serializer<Target = T> + 'static,
+    {
+        self.register_inner::<T>(wire_name, true)
+    }
+
+    fn register_inner<T>(&mut self, wire_name: &str, union: bool)
+    where
+        T: fory_core::StructSerializer + fory_core::Serializer<Target = T> + 'static,
+    {
+        let index = T::type_index();
         if let Some(prev) = self.wire_name_by_index.get(&index) {
             panic!(
                 "aster: Fory type-index collision: payload types `{prev}` and `{wire_name}` \
                  both have per-crate Fory type index {index}, so they cannot share one payload \
-                 runtime. Fory allocates `fory_type_index()` per crate (restarting at 0), so \
+                 runtime. Fory allocates `type_index()` per crate (restarting at 0), so \
                  this happens when one payload type's field tree spans types defined in two \
                  crates. Workarounds: move both types into the same crate, or reorder the \
                  `#[derive(ForyStruct)]` items in one crate so their indices no longer clash."
             );
         }
-        self.fory
-            .register_by_name::<T>(wire_name)
-            .unwrap_or_else(|e| {
-                panic!("aster: failed to register payload type `{wire_name}`: {e}")
-            });
+        let registered = if union {
+            self.fory.register_union_by_name::<T>(wire_name)
+        } else {
+            self.fory.register_by_name::<T>(wire_name)
+        };
+        registered.unwrap_or_else(|e| {
+            panic!("aster: failed to register payload type `{wire_name}`: {e}")
+        });
         self.wire_name_by_index.insert(index, wire_name.to_string());
     }
 

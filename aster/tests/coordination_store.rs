@@ -152,14 +152,14 @@ fn header(method: &str) -> StreamHeader {
 
 fn encode<T>(value: &T) -> Vec<u8>
 where
-    T: aster::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: aster::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
 {
     payload_fory::<T>().serialize(value).expect("encode")
 }
 
 fn decode<T>(bytes: &[u8]) -> T
 where
-    T: aster::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    T: aster::rpc::contract::WireField + fory_core::Serializer<Target = T> + 'static,
 {
     payload_fory::<T>().deserialize(bytes).expect("decode")
 }
@@ -167,9 +167,8 @@ where
 /// Call and expect a typed reply.
 async fn call<Req, Reply>(client: &Client, method: &str, request: &Req) -> Reply
 where
-    Req: aster::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
-    Reply:
-        aster::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    Req: aster::rpc::contract::WireField + fory_core::Serializer<Target = Req> + 'static,
+    Reply: aster::rpc::contract::WireField + fory_core::Serializer<Target = Reply> + 'static,
 {
     let raw = within(method, client.conn.unary(&header(method), encode(request)))
         .await
@@ -182,7 +181,7 @@ where
 /// transition (like the §11.5 evacuation) is landing.
 async fn client_status<Req>(client: &Client, method: &str, request: &Req) -> Option<i32>
 where
-    Req: aster::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    Req: aster::rpc::contract::WireField + fory_core::Serializer<Target = Req> + 'static,
 {
     match within(method, client.conn.unary(&header(method), encode(request))).await {
         Ok(_) => None,
@@ -200,7 +199,7 @@ async fn call_refused<Req>(
     request: &Req,
 ) -> (i32, String, Vec<(String, String)>)
 where
-    Req: aster::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    Req: aster::rpc::contract::WireField + fory_core::Serializer<Target = Req> + 'static,
 {
     let err = within(method, client.conn.unary(&header(method), encode(request)))
         .await
@@ -219,7 +218,7 @@ where
 /// Open a server stream, collect every frame, and require a clean end.
 async fn stream<Req>(client: &Client, method: &str, request: &Req) -> Vec<Vec<u8>>
 where
-    Req: aster::rpc::contract::WireField + fory_core::Serializer + fory_core::ForyDefault + 'static,
+    Req: aster::rpc::contract::WireField + fory_core::Serializer<Target = Req> + 'static,
 {
     let mut response = within(
         method,

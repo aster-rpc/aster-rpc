@@ -820,7 +820,7 @@ pub fn genesis_hash(document_bytes: &[u8]) -> [u8; 32] {
 /// non-canonical.
 pub fn canonical_document_bytes<T>(document: &T) -> Result<Vec<u8>, EncodeError>
 where
-    T: crate::rpc::contract::WireField + fory_core::serializer::Serializer + fory_core::ForyDefault,
+    T: crate::rpc::contract::WireField + fory_core::serializer::Serializer<Target = T>,
 {
     payload_fory::<T>()
         .serialize(document)
