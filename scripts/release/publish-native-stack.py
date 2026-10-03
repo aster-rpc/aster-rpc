@@ -77,6 +77,7 @@ PACKAGES = [
     Package("salvo-serde-util", "1.0.1", "fork", "salvo", "crates/serde-util/Cargo.toml"),
     Package("salvo_macros", "1.0.1", "fork", "salvo", "crates/macros/Cargo.toml"),
     Package("salvo_core", "1.0.1", "fork", "salvo", "crates/core/Cargo.toml"),
+    Package("salvo_extra", "1.0.1", "fork", "salvo", "crates/extra/Cargo.toml"),
     Package("salvo-acme", "1.0.1", "fork", "salvo", "crates/acme/Cargo.toml"),
     Package("salvo-otel", "1.0.1", "fork", "salvo", "crates/otel/Cargo.toml"),
     Package("salvo-proxy", "1.0.1", "fork", "salvo", "crates/proxy/Cargo.toml"),

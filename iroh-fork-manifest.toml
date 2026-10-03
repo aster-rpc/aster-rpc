@@ -123,7 +123,7 @@ crates = ["salvo", "salvo_core", "salvo_macros", "salvo-http3", "h3", "h3-quinn"
 registry_crates = [
   "h3", "h3-datagram", "h3-quinn", "salvo", "salvo-acme", "salvo-http3", "salvo-otel",
   "salvo-proxy", "salvo-serde-util", "salvo-serve-static", "salvo_core",
-  "salvo_macros",
+  "salvo_extra", "salvo_macros",
 ]
 crate_version = "1.0.1"
 
