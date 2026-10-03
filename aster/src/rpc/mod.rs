@@ -32,6 +32,7 @@ pub mod lease;
 pub mod projection;
 pub mod runtime;
 pub mod server;
+mod sessions;
 pub mod status;
 pub mod streaming;
 
@@ -71,6 +72,7 @@ pub use server::{
 /// [`CallParts`] (wire request frames into `request_receiver`, drain
 /// `OutgoingFrame`s from `response_sender`).
 pub use aster_transport_core::reactor::{OutgoingFrame, RequestFrame};
+pub use sessions::DEFAULT_MAX_SESSIONS_PER_CONNECTION;
 pub use status::{status_from_error, StatusCode};
 pub use streaming::{BidiCall, MessageStream, RequestStream, ResponseSink};
 

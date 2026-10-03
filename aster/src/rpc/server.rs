@@ -35,6 +35,10 @@ use super::auth::{AttributeStore, AuthContext, Authenticator, CapabilityRequirem
 use super::codec::{
     decode_stream_header, encode_rpc_status, RpcStatus, SerializationMode, StreamHeader,
 };
+use super::sessions::{
+    check_shared, missing_session, ServiceKey, SessionFactory, SessionStore,
+    DEFAULT_MAX_SESSIONS_PER_CONNECTION,
+};
 use super::status::StatusCode;
 use super::streaming::{RequestStream, ResponseSink};
 use crate::error::{Error, Result};
@@ -109,14 +113,9 @@ pub trait ServiceDispatch: Send + Sync + 'static {
     async fn dispatch(&self, method: &str, call: Call);
 }
 
-type Registry = HashMap<(String, i32), Arc<dyn ServiceDispatch>>;
+type Registry = HashMap<ServiceKey, Arc<dyn ServiceDispatch>>;
 
-/// Builds a fresh per-session instance of a session-scoped service.
-type SessionFactory = Arc<dyn Fn() -> Arc<dyn ServiceDispatch> + Send + Sync>;
-
-type SessionFactories = HashMap<(String, i32), SessionFactory>;
-/// Per-session instances, keyed by `(service, version, session-id)`.
-type SessionTable = std::sync::RwLock<HashMap<(String, i32, String), Arc<dyn ServiceDispatch>>>;
+type SessionFactories = HashMap<ServiceKey, SessionFactory>;
 
 /// Handler for an inbound connection on a non-`aster/1` ALPN. Invoked once per
 /// accepted connection from the reactor's single accept loop, so it **must not
@@ -139,6 +138,7 @@ pub struct Server {
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
     routes: AlpnRoutes,
+    max_sessions_per_connection: usize,
 }
 
 impl Server {
@@ -153,7 +153,17 @@ impl Server {
             attributes: AttributeStore::new(),
             authenticator: None,
             routes: HashMap::new(),
+            max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
         }
+    }
+
+    /// Cap the number of **active** sessions one connection may hold
+    /// (Aster-multiplexed-streams §7.5; default 1024). A call that would open
+    /// one more is refused with `RESOURCE_EXHAUSTED`. Applies to
+    /// connection-scoped (Iroh) sessions; HTTP-scoped sessions are not capped.
+    pub fn max_sessions_per_connection(mut self, max: usize) -> Self {
+        self.max_sessions_per_connection = max;
+        self
     }
 
     /// Attach a pre-dispatch [`Authenticator`] (builder-style). It runs on every
@@ -188,13 +198,27 @@ impl Server {
     }
 
     /// Register a **session-scoped** service: `factory` builds a fresh instance
-    /// per session, keyed by the caller's session id (the `aster-session-id`
-    /// header, or `StreamHeader.session_id`). State on the instance is private to
-    /// that session — the analogue of Python's `scoped="session"` services. A
-    /// call with no session id is rejected with `INVALID_ARGUMENT`.
+    /// per session. State on the instance is private to that session — the
+    /// analogue of Python's `scoped="session"` services.
     ///
-    /// (Reaping today: instances are dropped when [`end_session`] is called or,
-    /// on Iroh, when the owning connection closes; an idle TTL is a follow-up.)
+    /// Over Iroh a session is identified by `(connection, StreamHeader.session_id)`
+    /// and follows Aster-multiplexed-streams §7.5 exactly as Python and Java do:
+    ///
+    /// - a call with `session_id == 0` is refused with `FAILED_PRECONDITION`;
+    /// - a new id above the connection's highest opened id creates an instance,
+    ///   unless the connection already holds
+    ///   [`max_sessions_per_connection`](Server::max_sessions_per_connection)
+    ///   active sessions (`RESOURCE_EXHAUSTED`);
+    /// - an id at or below that high-water mark that is not active is
+    ///   `NOT_FOUND`;
+    /// - every session on a connection is dropped when the connection closes.
+    ///
+    /// Another connection presenting the same id gets its own instance, never
+    /// this one. Over HTTP-style transports, which have no connection id, the
+    /// `aster-session-id` header (or a non-zero `session_id`) names the
+    /// session, scoped to the caller's principal (the [`Authenticator`]
+    /// principal, else the transport's peer id); those instances have no cap
+    /// and live until [`end_session`].
     ///
     /// [`end_session`]: Dispatcher::end_session
     pub fn register_session<S, F>(mut self, factory: F) -> Self
@@ -279,7 +303,7 @@ impl Server {
             services: Arc::new(self.services.clone()),
             session_probes: Arc::new(self.session_probes.clone()),
             session_factories: Arc::new(self.session_factories.clone()),
-            sessions: Arc::new(SessionTable::default()),
+            sessions: Arc::new(SessionStore::new(self.max_sessions_per_connection)),
             attributes: self.attributes.clone(),
             authenticator: self.authenticator.clone(),
         }
@@ -298,12 +322,16 @@ impl Server {
         // RPC pipeline: dispatch each `aster/1` call.
         let rpc_join = tokio::spawn(async move {
             while let Some(ev) = event_rx.recv().await {
-                if let ReactorEvent::Call(call) = ev {
-                    let dispatcher = dispatcher.clone();
-                    tokio::spawn(async move { dispatcher.dispatch_call(call).await });
+                match ev {
+                    ReactorEvent::Call(call) => {
+                        let dispatcher = dispatcher.clone();
+                        tokio::spawn(async move { dispatcher.dispatch_call(call).await });
+                    }
+                    // §7.5: a connection's sessions die with it.
+                    ReactorEvent::ConnectionClosed { connection_id, .. } => {
+                        dispatcher.close_connection(connection_id);
+                    }
                 }
-                // ConnectionClosed: per-connection session / attribute reaping
-                // lands with session-scoped services (a later step).
             }
         });
 
@@ -346,7 +374,7 @@ pub struct Dispatcher {
     session_probes: Arc<Registry>,
     session_factories: Arc<SessionFactories>,
     /// Live per-session instances, shared across clones of this dispatcher.
-    sessions: Arc<SessionTable>,
+    sessions: Arc<SessionStore>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
 }
@@ -413,13 +441,22 @@ impl Dispatcher {
         &self.attributes
     }
 
-    /// Drop all session-scoped instances for `session_id` (e.g. on session
-    /// close). Subsequent calls with that id create fresh instances.
+    /// Drop the HTTP-scoped session instances named `session_id` (the
+    /// `aster-session-id` string), for every principal. Subsequent calls with
+    /// that id create fresh instances. Connection-scoped (Iroh) sessions are
+    /// not affected; they end with their connection
+    /// ([`close_connection`](Dispatcher::close_connection)).
     pub fn end_session(&self, session_id: &str) {
-        self.sessions
-            .write()
-            .unwrap()
-            .retain(|(_, _, sid), _| sid != session_id);
+        self.sessions.end_http_session(session_id);
+    }
+
+    /// Reap every session opened on `connection_id`, along with that
+    /// connection's graveyard and session count (§7.5). [`Server::serve`] does
+    /// this on the reactor's `ConnectionClosed`; a transport that assigns its
+    /// own connection ids (see [`CallParts::with_connection_id`]) calls it when
+    /// a connection ends. Returns the number of sessions dropped.
+    pub fn close_connection(&self, connection_id: u64) -> usize {
+        self.sessions.close_connection(connection_id)
     }
 }
 
@@ -493,6 +530,12 @@ pub struct CallParts {
     pub response_sender: ResponseSender,
     pub request_receiver: Receiver<RequestFrame>,
     pub cancelled: Arc<AtomicBool>,
+    /// The connection the call arrived on, when the transport has one. Session
+    /// scoping depends on it: `Some` gives connection-scoped sessions (§7.5),
+    /// `None` gives HTTP-style principal-scoped sessions. Set by
+    /// [`from_incoming`](CallParts::from_incoming), or
+    /// [`with_connection_id`](CallParts::with_connection_id).
+    pub connection_id: Option<u64>,
 }
 
 impl CallParts {
@@ -518,7 +561,18 @@ impl CallParts {
             response_sender,
             request_receiver,
             cancelled,
+            connection_id: None,
         }
+    }
+
+    /// Mark the call as arriving on connection `connection_id`, so
+    /// session-scoped services key their instances by `(connection, session
+    /// id)` (§7.5). The transport must then call
+    /// [`Dispatcher::close_connection`] when that connection ends, or its
+    /// sessions are never reaped. Ids must be unique among live connections.
+    pub fn with_connection_id(mut self, connection_id: u64) -> Self {
+        self.connection_id = Some(connection_id);
+        self
     }
 
     /// Extract the dispatch-relevant parts from a reactor [`IncomingCall`],
@@ -537,6 +591,7 @@ impl CallParts {
             response_sender: call.response_sender,
             request_receiver: call.request_receiver,
             cancelled: call.cancelled,
+            connection_id: Some(call.connection_id),
         }
     }
 }
@@ -568,7 +623,7 @@ impl ServerHandle {
 async fn handle_call(
     services: Arc<Registry>,
     session_factories: Arc<SessionFactories>,
-    sessions: Arc<SessionTable>,
+    sessions: Arc<SessionStore>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
     mut call: CallParts,
@@ -601,25 +656,23 @@ async fn handle_call(
     }
 
     let key = (header.service.clone(), header.version);
-    let svc = if let Some(s) = services.get(&key) {
-        // SHARED service: one instance for everyone.
-        s.clone()
+    let resolved = if let Some(s) = services.get(&key) {
+        // SHARED service: one instance for everyone, and no session id.
+        check_shared(&header.service, header.session_id).map(|()| s.clone())
     } else if let Some(factory) = session_factories.get(&key) {
-        // SESSION-scoped service: an instance per session id.
-        let sid = session_key(&header);
-        if sid.is_empty() {
-            emit_trailer(
-                &call.response_sender,
-                StatusCode::InvalidArgument,
-                &format!(
-                    "service '{}' v{} is session-scoped; an aster-session-id is required",
-                    header.service, header.version
-                ),
-            )
-            .await;
-            return;
+        // SESSION-scoped service: an instance per session.
+        match call.connection_id {
+            // §7.5: keyed by (connection, session id), never by the id alone.
+            Some(conn) if header.session_id != 0 => {
+                sessions.resolve_connection(conn, &key, header.session_id, factory)
+            }
+            Some(_) => Err(missing_session(&header.service)),
+            // No connection (HTTP): string id, scoped to the caller.
+            None => match http_session_id(&header) {
+                Some(sid) => Ok(sessions.resolve_http(&call.peer_id, &key, &sid, factory)),
+                None => Err(missing_session(&header.service)),
+            },
         }
-        get_or_create_session(&sessions, &key, &sid, factory)
     } else {
         emit_trailer(
             &call.response_sender,
@@ -628,6 +681,13 @@ async fn handle_call(
         )
         .await;
         return;
+    };
+    let svc = match resolved {
+        Ok(svc) => svc,
+        Err(e) => {
+            emit_rpc_status(&call.response_sender, &e.status()).await;
+            return;
+        }
     };
 
     // Provenance BEFORE method routing and before any handler runs. A service
@@ -775,34 +835,15 @@ fn metadata_map(h: &StreamHeader) -> HashMap<String, String> {
         .collect()
 }
 
-/// The session id for a call: the `aster-session-id` metadata header (HTTP), or
-/// the numeric `StreamHeader.session_id` (Iroh) when non-zero. Empty = none.
-fn session_key(h: &StreamHeader) -> String {
+/// The session id of an HTTP-style call (no connection id): the
+/// `aster-session-id` metadata header, else a non-zero `StreamHeader.session_id`.
+fn http_session_id(h: &StreamHeader) -> Option<String> {
     for (k, v) in h.metadata_keys.iter().zip(h.metadata_values.iter()) {
         if k == "aster-session-id" && !v.is_empty() {
-            return v.clone();
+            return Some(v.clone());
         }
     }
-    if h.session_id != 0 {
-        return h.session_id.to_string();
-    }
-    String::new()
-}
-
-/// Get (or lazily create) the per-session instance for `(service, session-id)`.
-fn get_or_create_session(
-    sessions: &SessionTable,
-    key: &(String, i32),
-    sid: &str,
-    factory: &SessionFactory,
-) -> Arc<dyn ServiceDispatch> {
-    let full = (key.0.clone(), key.1, sid.to_string());
-    if let Some(inst) = sessions.read().unwrap().get(&full) {
-        return inst.clone();
-    }
-    let mut guard = sessions.write().unwrap();
-    // Re-check under the write lock (another call may have created it).
-    guard.entry(full).or_insert_with(|| factory()).clone()
+    (h.session_id != 0).then(|| h.session_id.to_string())
 }
 
 /// Per-call server context: request input, response output, and the decoded
