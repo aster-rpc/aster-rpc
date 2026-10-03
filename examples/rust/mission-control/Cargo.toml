@@ -12,7 +12,7 @@ aster-transport-salvo = { path = "../../../aster-transport-salvo" }
 fory-core = "=1.3.0"
 fory-derive = "=1.3.0"
 tokio = { workspace = true }
-salvo = { version = "0.93" }
+salvo = { workspace = true }
 # Required by the generated JSON projection (codecs = ["json"]): serde on the
 # payload types, serde_json in the generated transcoder.
 serde = { version = "1", features = ["derive"] }
@@ -20,5 +20,5 @@ serde_json = "1"
 
 [dev-dependencies]
 # In-process HTTP client for the typed round-trip test.
-salvo = { version = "0.93", features = ["test"] }
+salvo = { workspace = true, features = ["test"] }
 aster_transport_core = { path = "../../../core" }

@@ -7,18 +7,19 @@
 # publisher. Consumers should install a versioned Aster SDK release; they must
 # not copy this file's patch blocks once the public registry is bootstrapped.
 # A `rev` is authoritative and its tag is a human label on the same commit.
-# Pin == tag == validated code. The 1.0.1 wave absorbs upstream's
-# Windows UDP ICMP-reset fix (n0-computer/noq#707), replacing the Aster -p1
-# hand-rolled SIO_UDP_CONNRESET patch; the iroh recv-error log throttle is
-# still carried as an Aster patch.
+# Pin == tag == validated code. The 1.3.0 wave re-ports the noq stack
+# (read_into, poll_driver, plus poll_driver GSO/stream-accept fixes) onto
+# noq-v1.3.0 and the iroh stack (poll_driver re-export, recv-error log
+# throttle, noq fork patch) onto iroh v1.3.0. Upstream iroh 1.0.3 lowered the
+# recv-error log to debug! without throttling; the throttle is still carried.
 #
 # Regenerate every upgrade cycle. See docs/iroh-patches.md for the patch ledger
 # and the full upgrade procedure.
 # =============================================================================
 
 schema = 1
-wave = "iroh-1.0.1"
-released = "2026-07-02"
+wave = "iroh-1.3.0"
+released = "2026-10-03"
 
 [distribution]
 cargo_registry = "sparse+https://forge.emrul.dev/api/packages/Aster/cargo/"
@@ -31,24 +32,24 @@ consumer_contract = "Aster version plus Cargo.lock; never copy fork pins"
 
 [forks.noq]
 repo = "https://forge.emrul.dev/Aster/noq.git"
-upstream_base = "noq-v1.0.1"
-tag = "aster-noq-v1.0.1"
-commit = "c84091f4c1d62f3c9025e40014fc2db59f239ffc"
-branch = "upgrade/noq-v1.0.1"
+upstream_base = "noq-v1.3.0"
+tag = "aster-noq-v1.3.0"
+commit = "67c1364453a48de3ef9141f339f3ab0697b39de5"
+branch = "upgrade/noq-v1.3.0"
 crates = ["noq", "noq-udp", "noq-proto"]
 registry_crates = ["noq", "noq-udp", "noq-proto"]
-crate_version = "1.0.1"
+crate_version = "1.3.0"
 registry_bridge_crates = ["irpc", "netwatch", "portmapper"]
 
 [forks.iroh]
 repo = "https://forge.emrul.dev/Aster/iroh.git"
-upstream_base = "v1.0.1"
-tag = "aster-iroh-v1.0.1-p1"
-commit = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9"
-branch = "upgrade/iroh-v1.0.1"
+upstream_base = "v1.3.0"
+tag = "aster-iroh-v1.3.0"
+commit = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2"
+branch = "upgrade/iroh-v1.3.0"
 crates = ["iroh", "iroh-base", "iroh-relay"]
 registry_crates = ["iroh", "iroh-base", "iroh-dns", "iroh-relay"]
-crate_version = "1.0.1"
+crate_version = "1.3.0"
 registry_bridge_crates = ["iroh-mdns-address-lookup", "iroh-tickets"]
 
 [forks.iroh-blobs]
@@ -113,16 +114,17 @@ crate_version = "0.101.0"
 
 [forks.salvo]
 repo = "https://forge.emrul.dev/Aster/salvo.git"
-upstream_base = "upstream/main through #1621 (2026-06-27 merge)"
-tag = "aster-salvo-2026-07-05"
-commit = "0e8477c10760b7f66fa5667e2755c938d07393c0"
+upstream_base = "v1.0.0"
+tag = "v1.0.0-aster.1"  # also aster-salvo-2026-10-03
+commit = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f"
 branch = "main"
 crates = ["salvo", "salvo_core", "salvo_macros", "salvo-http3", "h3", "h3-quinn"]
 registry_crates = [
-  "h3", "h3-quinn", "salvo", "salvo-acme", "salvo-http3", "salvo-proxy",
-  "salvo-serde-util", "salvo-serve-static", "salvo_core", "salvo_macros",
+  "h3", "h3-quinn", "salvo", "salvo-acme", "salvo-http3", "salvo-otel",
+  "salvo-proxy", "salvo-serde-util", "salvo-serve-static", "salvo_core",
+  "salvo_macros",
 ]
-crate_version = "0.93.0"
+crate_version = "1.0.0"
 registry_bridge_crates = ["h3-datagram"]
 
 # Fory is part of Aster's supported native surface, but this release carries
@@ -147,14 +149,14 @@ rewrites = ["noq"]
 
 [bridges.netwatch]
 repo = "https://github.com/n0-computer/net-tools"
-commit = "051ab8761006d7f2155e34a49f6bb881b582d5ab"
-version = "0.19.1"
+commit = "0030e57fc70981895bb86212ff0f059cc41c8a4e"
+version = "0.19.3"
 rewrites = ["noq-udp"]
 
 [bridges.portmapper]
 repo = "https://github.com/n0-computer/net-tools"
-commit = "051ab8761006d7f2155e34a49f6bb881b582d5ab"
-version = "0.19.1"
+commit = "0030e57fc70981895bb86212ff0f059cc41c8a4e"
+version = "0.19.3"
 rewrites = ["netwatch"]
 
 [bridges.iroh-mdns-address-lookup]
@@ -176,7 +178,7 @@ version = "0.0.2"
 rewrites = ["h3"]
 
 # -----------------------------------------------------------------------------
-# Transitive crates.io constraints forced by upstream's 1.0 dependency update.
+# Transitive crates.io constraints forced by upstream's dependency updates (1.0, 1.3.0).
 # These are NOT forks. They are recorded for repository bootstrap and publisher
 # validation; ordinary SDK consumers receive them through released metadata and
 # must not copy them into their own Cargo.toml.
@@ -185,7 +187,9 @@ rewrites = ["h3"]
 [transitive]
 iroh-tickets = "=1.0.0"
 iroh-mdns-address-lookup = "0.4"     # 0.4.0 tracks iroh ^1.0.0 (0.3 pinned rc.1)
-ed25519-dalek = "=3.0.0-rc.0"        # iroh #4324 bumped from =3.0.0-pre.7
+ed25519-dalek = "3.0.0"              # iroh 1.3.0 requires >=3.0.0-rc.0,<4.0.0; lock resolves 3.0.0
+netwatch = "0.19.3"                  # iroh 1.3.0 (net-tools 0030e57fc70981895bb86212ff0f059cc41c8a4e)
+portmapper = "0.19.3"                # iroh 1.3.0 (net-tools 0030e57fc70981895bb86212ff0f059cc41c8a4e)
 
 # -----------------------------------------------------------------------------
 # Bootstrap-only Cargo snippets. These exist for source-tree development and
@@ -196,7 +200,7 @@ ed25519-dalek = "=3.0.0-rc.0"        # iroh #4324 bumped from =3.0.0-pre.7
 
 # Workspace version specs ([workspace.dependencies]):
 version_specs = """
-iroh        = "=1.0.1"
+iroh        = "=1.3.0"
 iroh-blobs  = "0.103.5"
 iroh-docs   = "0.101.5"
 iroh-gossip = "0.101.0"
@@ -207,18 +211,18 @@ iroh-mdns-address-lookup = "0.4"
 # Pin block ([patch.crates-io]):
 patch_crates_io = """
 [patch.crates-io]
-iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
-iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
-iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "b15ae8071384f2643b46600ccfebbc2f4d36b6e9" }
+iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
+iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
+iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
 iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "bf21d4fe409181c983a755df574754e99a0d0a60" }
 iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "0db8c5cc05f62e2fd13f6dc6079cf5237767ec83" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5c021f998a172b81a69669e71786e14a339fa963" }
-noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
-noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
-noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "c84091f4c1d62f3c9025e40014fc2db59f239ffc" }
+noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
+noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
+noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
 irpc        = { git = "https://github.com/n0-computer/irpc",           rev = "0ed2b235d5c797b54d8263ecb3b0247272d055f9" }
-netwatch    = { git = "https://github.com/n0-computer/net-tools",      rev = "051ab8761006d7f2155e34a49f6bb881b582d5ab" }
-portmapper  = { git = "https://github.com/n0-computer/net-tools",      rev = "051ab8761006d7f2155e34a49f6bb881b582d5ab" }
+netwatch    = { git = "https://github.com/n0-computer/net-tools",      rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }
+portmapper  = { git = "https://github.com/n0-computer/net-tools",      rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }
 iroh-mdns-address-lookup = { git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
 iroh-tickets = { git = "https://github.com/n0-computer/iroh-tickets",  rev = "4899684e1209dea29ed28aa2314450927557b037" }
 iroh-util    = { git = "https://forge.emrul.dev/Aster/iroh-util.git",  rev = "afed9e6d07e41450fe1970e794782bab7df9c2f4" }
@@ -228,10 +232,10 @@ iroh-util    = { git = "https://forge.emrul.dev/Aster/iroh-util.git",  rev = "af
 # salvo-http3 internally and [patch.crates-io] does not cross workspaces, so
 # every source-tree bootstrap root re-declares the whole family at the same rev:
 salvo_patch_crates_io = """
-salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
-salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
-salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
-salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
-h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
-h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0e8477c10760b7f66fa5667e2755c938d07393c0" }
+salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
 """
