@@ -336,9 +336,21 @@ impl ScalarDefault for i64 {
     }
 }
 impl ScalarDefault for f64 {
+    /// §11.3.2.3 rule 1: float defaults must be finite and normal (or zero);
+    /// `-0.0` is normalised to `+0.0`.
+    ///
+    /// # Panics
+    ///
+    /// On a NaN, infinite or subnormal default — the Rust analogue of the
+    /// decoration-time error the other bindings raise.
     fn encode_canonical(&self) -> Vec<u8> {
+        let v = if *self == 0.0 { 0.0 } else { *self };
+        assert!(
+            v.is_finite() && !v.is_subnormal(),
+            "aster: float default {v} is not allowed (must be finite and not subnormal)"
+        );
         let mut b = Vec::new();
-        canonical::write_float64(&mut b, *self);
+        canonical::write_float64(&mut b, v);
         b
     }
 }
