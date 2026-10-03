@@ -148,9 +148,13 @@ pub fn payload_of(payload: Vec<u8>, flags: u8) -> Result<Vec<u8>> {
 pub fn encode_frame(payload: &[u8], flags: u8) -> Result<Vec<u8>> {
     let frame_body_len = 1u32 + payload.len() as u32;
 
-    // Empty payload only allowed for control frames (TRAILER or CANCEL)
-    if payload.is_empty() && (flags & (FLAG_TRAILER | FLAG_CANCEL)) == 0 {
-        bail!("empty payload only allowed with TRAILER or CANCEL flags");
+    // Empty payload only allowed for control frames: TRAILER, CANCEL, or an
+    // END_STREAM that ends the request phase without a final request (a
+    // client streaming from an iterator learns it is done only after the last
+    // item went out). The reactor drops the empty END_STREAM frame and closes
+    // the request channel.
+    if payload.is_empty() && (flags & (FLAG_TRAILER | FLAG_CANCEL | FLAG_END_STREAM)) == 0 {
+        bail!("empty payload only allowed with TRAILER, CANCEL or END_STREAM flags");
     }
 
     if frame_body_len > MAX_FRAME_SIZE {
@@ -280,6 +284,16 @@ mod tests {
     }
 
     // ---- Error cases ----
+
+    #[test]
+    fn test_empty_end_stream_frame() {
+        let frame = encode_frame(&[], FLAG_END_STREAM).unwrap();
+        assert_eq!(frame, vec![1, 0, 0, 0, FLAG_END_STREAM]);
+        let (payload, flags, consumed) = decode_frame(&frame).unwrap();
+        assert!(payload.is_empty());
+        assert_eq!(flags, FLAG_END_STREAM);
+        assert_eq!(consumed, 5);
+    }
 
     #[test]
     fn test_error_empty_payload_no_control_flags() {
