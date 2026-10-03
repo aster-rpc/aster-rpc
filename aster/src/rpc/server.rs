@@ -22,7 +22,10 @@ use fory_core::Fory;
 use tokio::sync::mpsc::Receiver;
 
 use aster_transport_core::contract::evaluate_capability;
-use aster_transport_core::framing::{encode_frame, FLAG_END_STREAM, FLAG_TRAILER};
+use aster_transport_core::framing::{
+    decompress, encode_frame, encode_payload_frame, payload_of, FLAG_COMPRESSED, FLAG_END_STREAM,
+    FLAG_TRAILER,
+};
 use aster_transport_core::reactor::{
     self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame, ResponseSender,
 };
@@ -719,6 +722,27 @@ async fn handle_call(
         }
     }
 
+    // §5.6: inflate a compressed first request frame once, after the gates (an
+    // unauthorised caller costs no decompression), so handlers see the logical
+    // payload. Later client-stream / bidi frames are inflated as they are read.
+    if call.request_flags & FLAG_COMPRESSED != 0 {
+        match decompress(&call.request_payload) {
+            Ok(p) => {
+                call.request_payload = p;
+                call.request_flags &= !FLAG_COMPRESSED;
+            }
+            Err(e) => {
+                emit_trailer(
+                    &call.response_sender,
+                    StatusCode::InvalidArgument,
+                    &format!("request payload: {e}"),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
     let method = header.method.clone();
     svc.dispatch(&method, Call::new(call, header, attrs)).await;
 }
@@ -882,7 +906,7 @@ impl Call {
             return None;
         }
         match &mut self.request_receiver {
-            Some(rx) => rx.recv().await.map(|f| f.payload),
+            Some(rx) => next_request_frame(rx).await,
             None => None,
         }
     }
@@ -894,7 +918,7 @@ impl Call {
     /// down rather than queueing without limit — which is the whole point, as
     /// the peer controls that memory.
     pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
-        let frame = encode_frame(&payload, 0)?;
+        let frame = encode_payload_frame(&payload, 0)?;
         self.response_sender
             .send(OutgoingFrame::Frame(frame))
             .await
@@ -910,7 +934,7 @@ impl Call {
         let buf = if payload.is_empty() {
             trailer
         } else {
-            let mut b = encode_frame(&payload, 0)?;
+            let mut b = encode_payload_frame(&payload, 0)?;
             b.extend_from_slice(&trailer);
             b
         };
@@ -946,6 +970,21 @@ impl Call {
             self.first_is_end,
             fory,
         )
+    }
+}
+
+/// Read the next client-stream / bidi request frame, inflating it if it is
+/// `FLAG_COMPRESSED`. A frame that fails to inflate (corrupt, or over the
+/// 16 MiB bomb limit) ends the request stream: the reader sees `None`, as on a
+/// transport break, and no further frames are accepted.
+pub(crate) async fn next_request_frame(rx: &mut Receiver<RequestFrame>) -> Option<Vec<u8>> {
+    let f = rx.recv().await?;
+    match payload_of(f.payload, f.flags) {
+        Ok(p) => Some(p),
+        Err(_) => {
+            rx.close();
+            None
+        }
     }
 }
 

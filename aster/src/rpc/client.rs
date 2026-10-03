@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aster_transport_core::framing::{
-    encode_frame, FLAG_END_STREAM, FLAG_HEADER, FLAG_TRAILER, MAX_FRAME_SIZE,
+    encode_frame, encode_payload_frame, payload_of, FLAG_END_STREAM, FLAG_HEADER, FLAG_TRAILER,
+    MAX_FRAME_SIZE,
 };
 use aster_transport_core::{CoreConnection, CoreRecvStream, CoreSendStream};
 
@@ -105,10 +106,10 @@ impl RpcConnection {
     /// response + trailer.
     async fn transport_unary(&self, header: &StreamHeader, request: Vec<u8>) -> Result<Vec<u8>> {
         let header_frame = encode_frame(&encode_stream_header(header)?, FLAG_HEADER)?;
-        let request_frame = encode_frame(&request, FLAG_END_STREAM)?;
+        let request_frame = encode_payload_frame(&request, FLAG_END_STREAM)?;
         let res = self.inner.unary_call(&header_frame, &request_frame).await?;
         check_trailer(&res.trailer_payload)?;
-        Ok(res.response_payload)
+        Ok(payload_of(res.response_payload, res.response_flags)?)
     }
 
     /// Server-streaming call: send one request, read a stream of responses.
@@ -119,7 +120,7 @@ impl RpcConnection {
     ) -> Result<ResponseStream> {
         let (send, recv) = self.inner.open_streaming_substream().await?;
         write_header(&send, header).await?;
-        send.write_all(encode_frame(&request, FLAG_END_STREAM)?)
+        send.write_all(encode_payload_frame(&request, FLAG_END_STREAM)?)
             .await?;
         send.finish().await?;
         Ok(ResponseStream::new(recv))
@@ -220,7 +221,9 @@ impl BidiSink {
     /// Send one already-serialized request payload as a data frame, flushed
     /// immediately. (Typed callers go through [`BidiCall`](super::streaming::BidiCall).)
     pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
-        self.send.write_all(encode_frame(&payload, 0)?).await?;
+        self.send
+            .write_all(encode_payload_frame(&payload, 0)?)
+            .await?;
         Ok(())
     }
 
@@ -276,7 +279,7 @@ impl ResponseStream {
                     Err(e) => Some(Err(e.into())),
                 }
             }
-            Ok(Some((payload, _))) => Some(Ok(payload)),
+            Ok(Some((payload, flags))) => Some(payload_of(payload, flags).map_err(Error::from)),
             Err(e) => {
                 self.done = true;
                 Some(Err(e))
@@ -307,7 +310,7 @@ async fn write_requests(send: &CoreSendStream, requests: Vec<Vec<u8>>) -> Result
     let n = requests.len();
     for (i, req) in requests.into_iter().enumerate() {
         let flags = if i + 1 == n { FLAG_END_STREAM } else { 0 };
-        send.write_all(encode_frame(&req, flags)?).await?;
+        send.write_all(encode_payload_frame(&req, flags)?).await?;
     }
     Ok(())
 }

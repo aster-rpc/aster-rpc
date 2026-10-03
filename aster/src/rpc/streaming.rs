@@ -12,7 +12,7 @@ use std::sync::Arc;
 use fory_core::{Fory, Serializer};
 use tokio::sync::mpsc::Receiver;
 
-use aster_transport_core::framing::encode_frame;
+use aster_transport_core::framing::encode_payload_frame;
 use aster_transport_core::reactor::{OutgoingFrame, RequestFrame, ResponseSender};
 
 use super::client::{BidiSink, ResponseStream};
@@ -52,7 +52,7 @@ impl<T: Serializer<Target = T>> ResponseSink<T> {
     /// Async since §12.4 bounded the response channel; see [`Call::send`].
     pub async fn send(&self, item: &T) -> Result<()> {
         let bytes = self.fory.serialize(item).map_err(encode_err)?;
-        let frame = encode_frame(&bytes, 0)?;
+        let frame = encode_payload_frame(&bytes, 0)?;
         self.tx
             .send(OutgoingFrame::Frame(frame))
             .await
@@ -129,7 +129,7 @@ impl<T> RequestStream<T> {
             return None;
         }
         match &mut self.rx {
-            Some(rx) => rx.recv().await.map(|f| f.payload),
+            Some(rx) => super::server::next_request_frame(rx).await,
             None => None,
         }
     }
