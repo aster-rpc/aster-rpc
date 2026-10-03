@@ -34,24 +34,28 @@ impl Node {
 
     /// Like [`start`](Node::start) but also accept inbound connections on each
     /// custom ALPN in `alpns` (for non-RPC protocols layered on the node).
-    pub async fn start_with_alpns(config: AsterConfig, alpns: Vec<Vec<u8>>) -> Result<Node> {
-        let core = match &config.data_dir {
+    pub async fn start_with_alpns(mut config: AsterConfig, alpns: Vec<Vec<u8>>) -> Result<Node> {
+        config.resolve_secret_key_file()?;
+        let mut all_alpns = config.alpns.clone();
+        for alpn in alpns {
+            if !all_alpns.contains(&alpn) {
+                all_alpns.push(alpn);
+            }
+        }
+        let endpoint = config.to_core_endpoint_config();
+        let core = match &config.storage_path {
             Some(dir) => {
                 CoreNode::persistent_with_alpns_and_gc(
                     dir.to_string_lossy().into_owned(),
-                    alpns,
-                    Some(config.inner.clone()),
+                    all_alpns,
+                    Some(endpoint),
                     config.gc_interval,
                 )
                 .await?
             }
             None => {
-                CoreNode::memory_with_alpns_and_gc(
-                    alpns,
-                    Some(config.inner.clone()),
-                    config.gc_interval,
-                )
-                .await?
+                CoreNode::memory_with_alpns_and_gc(all_alpns, Some(endpoint), config.gc_interval)
+                    .await?
             }
         };
         Ok(Node { inner: core })
@@ -200,6 +204,23 @@ impl Node {
     #[cfg(feature = "rpc")]
     pub(crate) fn core(&self) -> CoreNode {
         self.inner.clone()
+    }
+
+    /// Binding support: borrow the underlying transport-core node (reactor,
+    /// client-call pool, tunnels, raw hook receiver). See
+    /// `aster::binding_support`. Not part of the stable API.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn core_node(&self) -> &CoreNode {
+        &self.inner
+    }
+
+    /// Binding support: wrap a transport-core node already started by a
+    /// binding. Not part of the stable API.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn from_core_node(inner: CoreNode) -> Node {
+        Node { inner }
     }
 
     /// Create an [`Expose`](crate::expose::Expose) handle for publishing local

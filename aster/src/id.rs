@@ -273,7 +273,7 @@ impl SecretKey {
     /// Generate a fresh random identity from the OS CSPRNG.
     ///
     /// An Aster identity is a 32-byte Ed25519 seed; this fills it from
-    /// `getrandom` — the same construction the C FFI (`iroh_secret_key_generate`)
+    /// `getrandom` — the same construction the C FFI (`aster_secret_key_generate`)
     /// and the Python binding (`ed25519_generate_keypair`) use. Derive the public
     /// half (the value peers see as the [`NodeId`]) with
     /// [`attestation::public_key`](crate::attestation::public_key), or pin a node
@@ -290,6 +290,99 @@ impl SecretKey {
     /// The raw 32 bytes.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
+    }
+
+    /// The canonical text form: 64 lowercase hex characters. This is exactly
+    /// the content of a secret key file ([`write_file`](Self::write_file)).
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    /// Parse 64 hex characters (either case; surrounding whitespace ignored).
+    pub fn from_hex(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if s.len() != 64 {
+            return Err(Error::InvalidArgument(format!(
+                "secret key must be 64 hex characters, got {}",
+                s.len()
+            )));
+        }
+        let bytes = hex::decode(s)
+            .map_err(|e| Error::InvalidArgument(format!("secret key is not hex: {e}")))?;
+        bytes
+            .try_into()
+            .map(Self)
+            .map_err(|_| Error::InvalidArgument("secret key must be 32 bytes".into()))
+    }
+
+    /// Read a **secret key file**: the 32-byte key as 64 hex characters,
+    /// optionally followed by a newline. This is the one on-disk identity
+    /// format shared by the Rust SDK and every binding (it is what
+    /// [`AsterConfig::secret_key_file`](crate::AsterConfig::secret_key_file) and
+    /// `rpc::AsterServerBuilder::identity` read and write).
+    pub fn read_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            Error::InvalidArgument(format!("secret key file {}: {e}", path.display()))
+        })?;
+        Self::from_hex(&text)
+            .map_err(|e| Error::InvalidArgument(format!("secret key file {}: {e}", path.display())))
+    }
+
+    /// Like [`read_file`](Self::read_file), but `Ok(None)` when the file does
+    /// not exist.
+    pub fn read_file_if_exists(path: impl AsRef<std::path::Path>) -> Result<Option<Self>> {
+        let path = path.as_ref();
+        match std::fs::metadata(path) {
+            Ok(_) => Self::read_file(path).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::InvalidArgument(format!(
+                "secret key file {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Write this key as a secret key file (64 lowercase hex characters and a
+    /// trailing newline). Parent directories are created. On Unix the file is
+    /// created with mode `0600`. Fails if the file already exists, so an
+    /// existing identity is never overwritten.
+    pub fn write_file(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        use std::io::Write;
+        let path = path.as_ref();
+        let err = |e: std::io::Error| {
+            Error::InvalidArgument(format!("secret key file {}: {e}", path.display()))
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(err)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path).map_err(err)?;
+        file.write_all(format!("{}\n", self.to_hex()).as_bytes())
+            .map_err(err)?;
+        file.sync_all().map_err(err)
+    }
+
+    /// Load the secret key file at `path`, or generate a fresh key and write it
+    /// there if the file does not exist. The restart-stable identity helper.
+    pub fn load_or_generate(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(key) = Self::read_file_if_exists(path)? {
+            return Ok(key);
+        }
+        let key = Self::generate();
+        match key.write_file(path) {
+            Ok(()) => Ok(key),
+            // Lost a creation race with another process: use its key.
+            Err(_) if path.exists() => Self::read_file(path),
+            Err(e) => Err(e),
+        }
     }
 }
 

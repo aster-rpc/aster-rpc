@@ -41,6 +41,11 @@
 //! ([`Node::take_admission`]) additionally requires the node to be started with
 //! [`AsterConfigBuilder::hooks(true)`].
 //!
+//! `binding-support` is for the language bindings (PyO3, NAPI, C ABI) only: it
+//! adds `#[doc(hidden)]` accessors to the transport-core handles they drive
+//! directly (reactor, client-call pool, tunnels, raw hook receiver). It is not
+//! a stable API. See the "binding profile" note in `Cargo.toml`.
+//!
 //! ## Native interop
 //!
 //! The facade is the stable entry point. Advanced Rust consumers can use
@@ -55,6 +60,9 @@ extern crate self as aster;
 pub const VERSION: &str = aster_transport_core::VERSION;
 
 mod admission;
+#[cfg(feature = "binding-support")]
+#[doc(hidden)]
+pub mod binding_support;
 mod config;
 pub mod crypto;
 mod error;
@@ -96,7 +104,14 @@ pub use aster_transport_core::trust::{
     AdmissionSource, GateDecision, GatePolicy, HookFailureMode, PeerAdmission, PeerAdmissionStore,
     TrustMode,
 };
-pub use config::{AsterConfig, AsterConfigBuilder, RelayMode};
+pub use config::{
+    AsterConfig, AsterConfigBuilder, AsterIdentityPeer, LoadedIdentity, PublishedServices,
+    RelayMode,
+};
+
+/// The Aster RPC ALPN (`aster/1`). Also [`alpns::RPC`] and, with the `rpc`
+/// feature, `rpc::RPC_ALPN`.
+pub const RPC_ALPN: &[u8] = aster_transport_core::reactor::RPC_ALPN;
 pub use crypto::{
     hpke_x25519_public_from_identity, hpke_x25519_public_from_node_id,
     hpke_x25519_secret_from_identity,

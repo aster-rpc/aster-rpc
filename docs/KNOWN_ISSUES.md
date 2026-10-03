@@ -32,7 +32,9 @@ cross-language consumer needs it.
 only:
 
 - `AsterConfig::gc_interval` / `AsterConfigBuilder::gc_interval(Duration)`
-  (`aster/src/config.rs`) — enable the periodic GC loop.
+  (`aster/src/config.rs`) — enable the periodic GC loop. Also loadable from
+  `ASTER_GC_INTERVAL_MS` / `[storage] gc_interval_ms`, so a binding that starts
+  its node from an `AsterConfig` (plan R1 → P1/T1/F1) gets it for free.
 - `Blobs::gc_run_once()` (`aster/src/blobs.rs`) — deterministic single-pass
   mark+sweep.
 

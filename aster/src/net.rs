@@ -48,6 +48,22 @@ impl Connection {
         &self.inner
     }
 
+    /// Binding support: borrow the underlying transport-core connection (for
+    /// the client-call pool, tunnels, framing). Not part of the stable API.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn core_connection(&self) -> &CoreConnection {
+        &self.inner
+    }
+
+    /// Binding support: wrap a transport-core connection. Not part of the
+    /// stable API.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn from_core_connection(inner: CoreConnection) -> Self {
+        Self { inner }
+    }
+
     /// The remote peer's id.
     pub fn peer(&self) -> NodeId {
         NodeId::from_hex(self.inner.remote_id())

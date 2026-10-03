@@ -28,13 +28,14 @@
 //!   calls rather than a `services=[…]` list (Rust can't hold heterogeneous
 //!   service instances in one `Vec`).
 //! - [`identity`](AsterServerBuilder::identity) persists only the endpoint
-//!   **secret key** (64 hex chars), load-or-create. The Python `.aster-identity`
-//!   is a richer JSON credential file (root pubkey + enrollment material); Gate-1
-//!   credential plumbing isn't in the Rust crate yet, so this is the key alone.
+//!   **secret key file** (64 hex chars, [`SecretKey::read_file`]), load-or-create.
+//!   This is the one on-disk node-key format every binding uses. The richer
+//!   `.aster-identity` TOML credential file (peers, root pubkey, enrollment
+//!   material) is read separately by [`AsterConfig::load_identity`].
 //! - Lifecycle is explicit ([`run`](AsterServer::run) /
 //!   [`shutdown`](AsterServer::shutdown)) rather than `async with`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::{AsterConfig, RelayMode};
@@ -106,8 +107,10 @@ impl AsterServerBuilder {
     }
 
     /// Persist the endpoint's secret key at `path` for a restart-stable
-    /// [`NodeId`]. The file is created (64 hex chars) on first start and read on
-    /// subsequent starts. Overrides any `secret_key` in [`config`](Self::config).
+    /// [`NodeId`]. The file is created (64 hex chars, see
+    /// [`SecretKey::write_file`]) on first start — from the config's
+    /// `secret_key` if set, else a fresh key — and read on subsequent starts.
+    /// An existing file overrides any `secret_key` in [`config`](Self::config).
     pub fn identity(mut self, path: impl Into<PathBuf>) -> Self {
         self.identity = Some(path.into());
         self
@@ -341,10 +344,14 @@ impl AsterServerBuilder {
             builder = builder.hooks(on);
         }
         // Identity file present → pin the endpoint key before start.
+        // The file wins over any `secret_key` in the config (documented on
+        // `identity`); a missing file is created by `Node::start` from the
+        // config's key or a fresh one (`AsterConfig::resolve_secret_key_file`).
         if let Some(path) = &self.identity {
-            if let Some(key) = read_identity(path)? {
+            if let Some(key) = SecretKey::read_file_if_exists(path)? {
                 builder = builder.secret_key(key);
             }
+            builder = builder.secret_key_file(path.clone());
         }
         // `mut` for `resolve_root_pubkey(&mut self)`, which only the
         // coordination graph calls.
@@ -367,7 +374,10 @@ impl AsterServerBuilder {
         // longer produce. When storage lands, it opens after this point, not
         // before.
         #[cfg(feature = "coordination")]
-        if self.coordination.is_some() && self.identity.is_none() && config.secret_key.is_none() {
+        if self.coordination.is_some()
+            && config.secret_key_file.is_none()
+            && config.secret_key.is_none()
+        {
             return Err(Error::InvalidArgument(
                 "builtin_coordination requires a persistent endpoint identity: set \
                  AsterServerBuilder::identity(path) or an explicit secret_key in AsterConfig. \
@@ -397,14 +407,6 @@ impl AsterServerBuilder {
         }
 
         let node = Node::start_with_alpns(config, alpns).await?;
-
-        // First boot with an identity path and no file yet → persist the key the
-        // node just generated, so the NodeId is stable across restarts.
-        if let Some(path) = &self.identity {
-            if !path.exists() {
-                write_identity(path, &node.export_secret_key()?)?;
-            }
-        }
 
         let attributes = self.attributes.unwrap_or_default();
         let mut server = Server::new(&node).attributes(attributes.clone());
@@ -703,52 +705,4 @@ impl AsterServer {
         self.handle.abort();
         self.node.shutdown().await;
     }
-}
-
-/// Read a hex-encoded secret key from an identity file, if it exists.
-fn read_identity(path: &Path) -> Result<Option<SecretKey>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| Error::InvalidArgument(format!("identity file {}: {e}", path.display())))?;
-    let bytes = decode_hex32(text.trim()).ok_or_else(|| {
-        Error::InvalidArgument(format!(
-            "identity file {}: expected 64 hex characters",
-            path.display()
-        ))
-    })?;
-    Ok(Some(SecretKey::from_bytes(bytes)))
-}
-
-/// Write a secret key to an identity file as 64 hex characters.
-fn write_identity(path: &Path, key: &SecretKey) -> Result<()> {
-    let hex = encode_hex(&key.to_bytes());
-    std::fs::write(path, hex)
-        .map_err(|e| Error::InvalidArgument(format!("identity file {}: {e}", path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
-fn encode_hex(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn decode_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
 }

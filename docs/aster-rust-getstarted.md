@@ -120,9 +120,39 @@ let _node_fut = Node::start(cfg);
 ```
 
 `SecretKey::generate()` is the same construction as the C FFI
-(`iroh_secret_key_generate`) and the Python binding (`ed25519_generate_keypair`)
+(`aster_secret_key_generate`) and the Python binding (`ed25519_generate_keypair`)
 — 32 CSPRNG bytes — so a key minted in any binding is usable from the others.
-`AsterServer`'s `.identity(path)` does this load-or-create for you on disk (§4.3).
+
+**On disk, a node key is a secret key file**: the 32 bytes as 64 hex characters
+(plus a trailing newline). This is the one identity-file format shared by the
+Rust SDK and every binding. `SecretKey::{to_hex, from_hex}` give the text form;
+`SecretKey::read_file`, `read_file_if_exists`, `write_file` (refuses to
+overwrite, mode `0600` on Unix, creates parent dirs) and `load_or_generate`
+handle the file. Most code just points the config at it and lets `Node::start`
+load-or-create it:
+
+```rust
+# use aster::{AsterConfig, Node};
+# async fn run() -> aster::Result<()> {
+let node = Node::start(
+    AsterConfig::builder()
+        .secret_key_file("/var/lib/my-app/node.key") // or ASTER_SECRET_KEY_FILE
+        .persistent("/var/lib/my-app")
+        .build(),
+)
+.await?;
+# node.shutdown().await;
+# Ok(())
+# }
+```
+
+If the file exists its key is used (and an explicit `secret_key` that disagrees
+is an error); if not, the explicit `secret_key` — or a fresh key — is written
+there first. `AsterServer`'s `.identity(path)` is the same file (§4.3). Inline
+keys (`ASTER_SECRET_KEY`, `[network] secret_key`, `.aster-identity`'s
+`[node] secret_key`) accept the same 64 hex characters, or base64 for older
+files. The `.aster-identity` TOML (peers, root key, enrollment material, read by
+`AsterConfig::load_identity`) is a credential file, not a node-key file.
 
 The same secret key can also **bind a TLS certificate** to this identity: when
 serving over HTTP/WebTransport, the node key signs the cert so peers can verify
@@ -130,6 +160,39 @@ it (and reject a MITM) without trusting a CA — see [Binding the cert to your
 Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identity).
 
 ---
+
+### 2.2 Configuration reference
+
+`AsterConfig` resolves defaults < `aster.toml` (`AsterConfig::from_file`) <
+`ASTER_*` env (`from_env`) < builder calls (`AsterConfig::builder().load_file(p)?
+.…`). Every endpoint/transport knob the bindings expose has a builder method:
+
+| Builder | Env | TOML | Notes |
+|---|---|---|---|
+| `relay(RelayMode)` | `ASTER_RELAY_MODE` | `[network] relay_mode` | `default` / `staging` / `disabled` / `custom` (a bare URL means custom) |
+| `relay_urls([..])` | `ASTER_RELAY_URLS` (comma-separated) | `[network] relay_urls = [..]` | selects `RelayMode::Custom`; with a mode set, it must be `custom` |
+| `secret_key(k)` | `ASTER_SECRET_KEY` | `[network] secret_key` | 64 hex (or base64) |
+| `secret_key_file(p)` | `ASTER_SECRET_KEY_FILE` | `[network] secret_key_file` | load-or-create at start (§2.1) |
+| `persistent(dir)` | `ASTER_STORAGE_PATH` | `[storage] path` | in-memory when unset |
+| `gc_interval(d)` | `ASTER_GC_INTERVAL_MS` | `[storage] gc_interval_ms` | `0` / unset = no GC |
+| `bind_addr(a)` | `ASTER_BIND_ADDR` | `[network] bind_addr` | e.g. `0.0.0.0:9000` |
+| `alpn(bytes)` | — | — | extra inbound ALPNs, merged with `Node::start_with_alpns` |
+| `discovery(b)` | `ASTER_LOCAL_DISCOVERY` | `[network] local_discovery` | mDNS |
+| `monitoring(b)` | `ASTER_ENABLE_MONITORING` | `[network] enable_monitoring` | |
+| `hooks(b)` | `ASTER_ENABLE_HOOKS` | `[network] enable_hooks` | needed for `take_admission` |
+| `hook_timeout_ms(ms)` | `ASTER_HOOK_TIMEOUT_MS` | `[network] hook_timeout_ms` | default 5000 |
+| `hook_failure_mode(m)` | `ASTER_HOOK_FAILURE_MODE` | `[network] hook_failure_mode` | `fail_open` (default) / `fail_closed` |
+| `clear_ip_transports(b)` | `ASTER_CLEAR_IP_TRANSPORTS` | `[network] clear_ip_transports` | relay-only |
+| `clear_relay_transports(b)` | `ASTER_CLEAR_RELAY_TRANSPORTS` | `[network] clear_relay_transports` | direct-only |
+| `portmapper(b)` | `ASTER_PORTMAPPER_CONFIG` | `[network] portmapper_config` | `enabled` / `disabled` |
+| `proxy_url(u)` | `ASTER_PROXY_URL` | `[network] proxy_url` | HTTP/SOCKS |
+| `proxy_from_env(b)` | `ASTER_PROXY_FROM_ENV` | `[network] proxy_from_env` | `HTTP(S)_PROXY` |
+| `transport_<knob>(v)` | `ASTER_TRANSPORT_<KNOB>` | `[network] transport_<knob>` | `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`, `stream_receive_window`, `receive_window`, `send_window`, `max_idle_timeout_ms`, `keep_alive_interval_ms`, `initial_mtu`, `datagram_receive_buffer_size`, `datagram_send_buffer_size`, `send_fairness`, `enable_segmentation_offload` |
+| `identity_file(p)` | `ASTER_IDENTITY_FILE` | `[identity] file` | `.aster-identity` credential file |
+
+The ALPNs are exported as `aster::RPC_ALPN` and `aster::alpns::{RPC,
+CONSUMER_ADMISSION, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,
+GOSSIP}`.
 
 ## 3. Admission (Gate 0) and ownership attestations
 

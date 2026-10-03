@@ -44,6 +44,22 @@ impl RpcConnection {
         }
     }
 
+    /// Binding support: wrap a transport-core connection already dialled on
+    /// [`RPC_ALPN`](crate::RPC_ALPN). Not part of the stable API.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn from_core_connection(inner: CoreConnection) -> Self {
+        Self::from_core(inner)
+    }
+
+    /// Binding support: borrow the underlying transport-core connection. Not
+    /// part of the stable API.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn core_connection(&self) -> &CoreConnection {
+        &self.inner
+    }
+
     /// Add a client [`Interceptor`] (runs `on_request`/`on_response`/`on_error`
     /// around unary calls). Builder-style.
     pub fn with_interceptor(mut self, interceptor: impl Interceptor) -> Self {

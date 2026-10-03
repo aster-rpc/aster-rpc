@@ -96,3 +96,33 @@ async fn default_docs_author_equals_node_id() {
     assert_eq!(author, aster::default_author_id(&secret));
     node.shutdown().await;
 }
+
+/// `AsterConfigBuilder::secret_key_file` is the one on-disk identity format
+/// (64 hex chars): created on first start, reused on the next, and the same
+/// file `SecretKey::read_file` reads.
+#[tokio::test]
+async fn secret_key_file_gives_a_restart_stable_node_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("node.key");
+
+    let cfg = || {
+        AsterConfig::builder()
+            .relay(RelayMode::Disabled)
+            .secret_key_file(&key_path)
+            .build()
+    };
+
+    let n1 = Node::start(cfg()).await.expect("first start");
+    let id1 = n1.id();
+    n1.shutdown().await;
+
+    let on_disk = SecretKey::read_file(&key_path).expect("the key file was written");
+    assert_eq!(
+        aster::attestation::public_key(&on_disk).to_hex(),
+        id1.to_string()
+    );
+
+    let n2 = Node::start(cfg()).await.expect("second start");
+    assert_eq!(n2.id(), id1, "same key file, same node id");
+    n2.shutdown().await;
+}

@@ -49,6 +49,21 @@ coordination-testing = ["coordination"]
 discovery = []
 hooks = []
 metrics = []
+# Language-binding support (PyO3, NAPI, C ABI). Adds no dependency: it exposes
+# `#[doc(hidden)]` accessors from the facade types to the transport-core
+# handles a binding still drives directly (reactor ring, client-call pool,
+# tunnels, raw hook receiver) -- `aster::binding_support`. Not a stable API;
+# no Rust application should enable it.
+#
+# Binding profile -- what a binding crate enables on `aster`:
+#
+#   default (blobs, docs, gossip, attestation) + rpc + metrics + binding-support
+#
+# and, only once the binding surfaces them, `coordination-client` (wrap the
+# coordination client, never port it) and `expose` (HTTP-over-Aster).
+# `coordination`, `coordination-testing` and `expose-edge` are Rust-only (D7)
+# and never belong in a binding.
+binding-support = []
 # Expose local HTTP services over Aster (the `aster-expose` L7 relay). Off by
 # default so non-expose consumers don't pull in http/tower. See
 # docs/aster-expose-getstarted.md.

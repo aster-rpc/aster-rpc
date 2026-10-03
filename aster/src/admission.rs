@@ -18,8 +18,12 @@ use aster_transport_core::{
 };
 use tokio::sync::oneshot;
 
-/// Well-known admission ALPNs — connections on these are let through to present
-/// a credential, even from peers not yet admitted (see [`Gate0`]).
+/// Well-known ALPNs.
+///
+/// The three `*_ADMISSION` ALPNs are let through to present a credential, even
+/// from peers not yet admitted (see [`Gate0`]). [`RPC`](alpns::RPC) is the Aster
+/// RPC ALPN; `BLOBS` / `DOCS` / `GOSSIP` are the built-in protocol ALPNs every
+/// node registers.
 pub mod alpns {
     use aster_transport_core::trust;
 
@@ -29,6 +33,20 @@ pub mod alpns {
     pub const CONSUMER_ADMISSION: &[u8] = trust::ALPN_CONSUMER_ADMISSION;
     /// Delegated (@aster-issued token) admission.
     pub const DELEGATED_ADMISSION: &[u8] = trust::ALPN_DELEGATED_ADMISSION;
+
+    /// Aster RPC (`aster/1`). Same value as [`crate::RPC_ALPN`].
+    pub const RPC: &[u8] = aster_transport_core::reactor::RPC_ALPN;
+
+    /// iroh-blobs transfer protocol (registered by every node).
+    #[cfg(feature = "blobs")]
+    pub const BLOBS: &[u8] = iroh_blobs::ALPN;
+
+    /// iroh-docs sync protocol (registered by every node).
+    pub const DOCS: &[u8] = iroh_docs::ALPN;
+
+    /// iroh-gossip protocol (registered by every node).
+    #[cfg(feature = "gossip")]
+    pub const GOSSIP: &[u8] = iroh_gossip::ALPN;
 }
 
 /// Gate-0 admission policy: the rule an [`Admission`] handler applies per
@@ -115,6 +133,23 @@ pub struct Admission {
 impl Admission {
     pub(crate) fn new(rx: CoreHookReceiver) -> Self {
         Self { rx }
+    }
+
+    /// Binding support: wrap a raw transport-core hook receiver. Not part of
+    /// the stable API.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn from_core_receiver(rx: CoreHookReceiver) -> Self {
+        Self { rx }
+    }
+
+    /// Binding support: unwrap into the raw transport-core hook receiver (the
+    /// `before_connect` / `after_handshake` channels), for a binding that
+    /// drives admission decisions itself. Not part of the stable API.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn into_core_receiver(self) -> CoreHookReceiver {
+        self.rx
     }
 
     /// Await the next **outbound** connect attempt by this node, or `None` when
