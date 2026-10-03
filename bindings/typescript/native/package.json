@@ -47,7 +47,8 @@
   },
   "scripts": {
     "build": "napi build --platform --release",
-    "build:debug": "napi build --platform"
+    "build:debug": "napi build --platform",
+    "check:generated": "node ../scripts/check-native-generated.mjs"
   },
   "optionalDependencies": {
     "@aster-rpc/transport-darwin-arm64": "0.3.0",

@@ -15,6 +15,7 @@
 
 import { ForyCodec } from './codec.js';
 import { StreamHeader, CallHeader, RpcStatus } from './protocol.js';
+import { requireCjs } from './native.js';
 
 // Cached Fory instance and Type - shared across all modules
 let _cachedFory: any | undefined;
@@ -27,8 +28,8 @@ let _cachedCodec: ForyCodec | undefined;
  */
 export function getXlangForyAndType(): { fory: any; Type: any } {
   if (_cachedFory) return { fory: _cachedFory, Type: _cachedType! };
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const foryModule = require('@apache-fory/core');
+  // @apache-fory/core is CommonJS; load it through createRequire.
+  const foryModule = requireCjs('@apache-fory/core');
   const Fory = foryModule.default;
   const Type = foryModule.Type;
   // `compatible: true` picks NAMED_COMPATIBLE_STRUCT layout (what
@@ -52,8 +53,7 @@ export function getXlangForyAndType(): { fory: any; Type: any } {
  * {@link getXlangForyAndType}.
  */
 export function newXlangFory(): { fory: any; Type: any } {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const foryModule = require('@apache-fory/core');
+  const foryModule = requireCjs('@apache-fory/core');
   const Fory = foryModule.default;
   const Type = foryModule.Type;
   return { fory: new Fory({ ref: true, compatible: true }), Type };

@@ -5,6 +5,10 @@
  * details of endpoint creation, admission, and transport wiring.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve as resolvePath } from 'node:path';
+
 import { ServiceRegistry } from './service.js';
 import { LocalTransport } from './transport/local.js';
 import { createClient, type AsterClient as ClientProxy } from './client.js';
@@ -32,11 +36,13 @@ import { getGeneratedMethodFields, getWireShape, registerGenerated, type Registe
 import { IrohTransport } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
 import { gate0EndpointConfig } from './gate0.js';
+import { loadNative, tryLoadNative, type NativeAddon } from './native.js';
+
+type NativeIrohNode = InstanceType<NativeAddon['IrohNode']>;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const ALPN_CONSUMER_ADMISSION = 'aster.consumer_admission';
-const ALPN_PRODUCER_ADMISSION = 'aster.producer_admission';
 const ALPN_DELEGATED_ADMISSION = 'aster.admission';
 const RPC_ALPN = 'aster/1';
 
@@ -153,7 +159,7 @@ export class AsterServer {
   readonly config: AsterConfig;
   readonly logger: AsterLogger;
   private health: HealthServer;
-  private _node: any = null;
+  private _node: NativeIrohNode | null = null;
   private _rpcServer: RpcServer | null = null;
   private _hook: MeshEndpointHook;
   private _peerStore: PeerAttributeStore;
@@ -186,6 +192,13 @@ export class AsterServer {
       host: this.config.healthHost,
     });
     this._peerStore = new PeerAttributeStore();
+    if (this.config.allowAllProducers === false) {
+      throw new Error(
+        'allowAllProducers=false is not supported: producer mesh admission ' +
+        '(aster.producer_admission) has been removed from the TypeScript binding. ' +
+        'Leave allowAllProducers at its default (true).',
+      );
+    }
     this._allowAllConsumers = opts.allowAllConsumers ?? this.config.allowAllConsumers;
     // In dev mode the hook must allow unenrolled peers, otherwise post-admission
     // RPC connections would be denied (they reach Gate 0 before the peer-store
@@ -230,7 +243,7 @@ export class AsterServer {
         try {
           const resolved = await import(
             /* webpackIgnore: true */
-            require('node:path').resolve(process.cwd(), GENERATED_FILENAME)
+            resolvePath(process.cwd(), GENERATED_FILENAME)
           );
           if (resolved.SERVICES && resolved.WIRE_TYPES) {
             registerGenerated({
@@ -258,12 +271,7 @@ export class AsterServer {
     }
 
     // Load native addon
-    const native = await loadNative();
-    if (!native) {
-      throw new Error(
-        'Aster native addon not found. Build with: cd native && npx napi build --release --platform',
-      );
-    }
+    const native = loadNative();
 
     // Initialize contract identity binding (needed for _publishContracts)
     const { setNativeContract } = await import('./contract/identity.js');
@@ -280,7 +288,6 @@ export class AsterServer {
     const alpns = [
       Buffer.from(RPC_ALPN),
       Buffer.from(ALPN_CONSUMER_ADMISSION),
-      Buffer.from(ALPN_PRODUCER_ADMISSION),
       Buffer.from(ALPN_DELEGATED_ADMISSION),
     ];
     const gate0Needed = !this._allowAllConsumers;
@@ -362,8 +369,8 @@ export class AsterServer {
    */
   private async _publishContracts(): Promise<void> {
     try {
-      const dc = this._node.docsClient();
-      const bc = this._node.blobsClient();
+      const dc = this._node!.docsClient();
+      const bc = this._node!.blobsClient();
 
       // Step 1: Create registry doc and author
       const registryDoc = await dc.create();
@@ -775,7 +782,7 @@ export class AsterServer {
   get address(): string {
     if (!this._node) throw new Error('Server not started');
     try {
-      const native = loadNativeSync();
+      const native = tryLoadNative();
       if (native) {
         const info: any = {
           endpointId: this._node.nodeId(),
@@ -833,11 +840,6 @@ export class AsterServer {
           this._handleAdmission(conn).catch(e => {
             this.logger.error('admission error', { error: String(e) });
           });
-        } else if (alpn === ALPN_PRODUCER_ADMISSION) {
-          // Producer-to-producer mesh admission
-          this._handleProducerAdmission(conn).catch(e => {
-            this.logger.error('producer admission error', { error: String(e) });
-          });
         } else if (alpn === ALPN_DELEGATED_ADMISSION) {
           // Delegated admission
           this._handleDelegatedAdmission(conn).catch(e => {
@@ -876,27 +878,10 @@ export class AsterServer {
     );
   }
 
-  // ── Producer admission ───────────────────────────────────────────────────
-
-  private async _handleProducerAdmission(conn: any): Promise<void> {
-    // Producer admission requires root pubkey and mesh state.
-    // If not configured (open mode), reject gracefully.
-    if (!this.config.rootPubkey && !this.config.rootPubkeyFile) {
-      this.logger.warn('producer admission: no root pubkey configured, ignoring');
-      return;
-    }
-    const { handleProducerAdmissionConnection } = await import('./trust/bootstrap.js');
-    const rootKeyHex = this._resolveRootPubkeyHex();
-    const { MeshState } = await import('./trust/mesh.js');
-    const meshState = new MeshState();
-    await handleProducerAdmissionConnection(conn, rootKeyHex, meshState);
-  }
-
   private _resolveRootPubkeyHex(): string {
     if (this.config.rootPubkey) return Buffer.from(this.config.rootPubkey).toString('hex');
     if (this.config.rootPubkeyFile) {
       try {
-        const { readFileSync } = require('node:fs');
         const expanded = this.config.rootPubkeyFile.replace(/^~/, process.env.HOME ?? '');
         const raw = readFileSync(expanded, 'utf-8').trim();
         if (raw.startsWith('{')) {
@@ -1037,8 +1022,6 @@ function loadRawConsumerPeer(
   filePath: string | undefined,
   peerName: string | undefined,
 ): Record<string, unknown> | null {
-  const { existsSync, readFileSync } = require('node:fs');
-  const { join } = require('node:path');
   const path = filePath ?? join(process.cwd(), '.aster-identity');
   if (!existsSync(path)) return null;
   try {
@@ -1088,8 +1071,6 @@ function credentialFromPeerEntry(peer: Record<string, unknown>): ConsumerEnrollm
  * and `identity:` end up doing the same thing for the same file.
  */
 function loadEnrollmentCredential(filePath: string): ConsumerEnrollmentCredential {
-  const { readFileSync } = require('node:fs');
-  const { homedir } = require('node:os');
   const expanded = filePath.startsWith('~')
     ? filePath.replace(/^~/, homedir())
     : filePath;
@@ -1138,7 +1119,7 @@ export class AsterClientWrapper {
   private _connected = false;
   private _gossipTopic = '';
   private _address: string | undefined;
-  private _node: any = null;
+  private _node: NativeIrohNode | null = null;
   private _services: ServiceSummary[] = [];
   private _registryNamespace = '';
   private _inlineCredential: ConsumerEnrollmentCredential | null = null;
@@ -1266,10 +1247,7 @@ export class AsterClientWrapper {
       );
     }
 
-    const native = await loadNative();
-    if (!native) {
-      throw new Error('Aster native addon not found.');
-    }
+    const native = loadNative();
 
     // Wire the native contract binding for this process. `AsterServer`
     // does this inside `start()`; clients need it too as soon as the
@@ -1323,9 +1301,9 @@ export class AsterClientWrapper {
     const doConnect = (alpn: Buffer) => {
       if (directAddrs) {
         // No relay URL — iroh's connect_node_addr handles direct addresses
-        return this._node.connectNodeAddr(endpointId, alpn, directAddrs, undefined);
+        return this._node!.connectNodeAddr(endpointId, alpn, directAddrs, undefined);
       }
-      return this._node.connect(endpointId, alpn);
+      return this._node!.connect(endpointId, alpn);
     };
 
     // Build credential: inline peer entry > credential file > null (open-gate).
@@ -1433,7 +1411,7 @@ export class AsterClientWrapper {
 
     this._registryJoinPromise = (async () => {
       try {
-        const dc = this._node.docsClient();
+        const dc = this._node!.docsClient();
         const result = await dc.joinAndSubscribeNamespace(
           this._registryNamespace,
           this._remoteEndpointId,
@@ -1526,7 +1504,7 @@ export class AsterClientWrapper {
           const collectionHash = artifactRef.collection_hash;
           if (collectionHash) {
             const { fetchContract } = await import('./contract/publication.js');
-            const blobs = this._node.blobsClient();
+            const blobs = this._node!.blobsClient();
             manifest = await fetchContract(blobs, collectionHash);
           }
         }
@@ -1580,7 +1558,7 @@ export class AsterClientWrapper {
       const collectionHash = artifactRef.collection_hash;
       if (!collectionHash) return empty;
 
-      const blobs = this._node.blobsClient();
+      const blobs = this._node!.blobsClient();
 
       // The contract collection was produced on the remote peer; its
       // HashSeq + child blobs aren't yet in our local store. Pull the
@@ -2041,67 +2019,4 @@ class SessionProxyClient {
   async close(): Promise<void> {
     this._closed = true;
   }
-}
-
-// ── Native addon loader ──────────────────────────────────────────────────────
-
-let _native: any = null;
-
-function loadNativeSync(): any {
-  if (_native) return _native;
-
-  const { resolve } = require('node:path');
-  const { existsSync } = require('node:fs');
-
-  const platforms = [
-    'aster-transport.darwin-arm64.node',
-    'aster-transport.darwin-x64.node',
-    'aster-transport.linux-x64-gnu.node',
-    'aster-transport.linux-arm64-gnu.node',
-    'aster-transport.win32-x64-msvc.node',
-  ];
-
-  // 1. Try the workspace package
-  try {
-    _native = require('@aster-rpc/transport');
-    return _native;
-  } catch { /* next */ }
-
-  // 2. Try ASTER_NATIVE_PATH env var
-  const envPath = process.env.ASTER_NATIVE_PATH;
-  if (envPath) {
-    for (const name of platforms) {
-      const full = resolve(envPath, name);
-      if (existsSync(full)) { _native = require(full); return _native; }
-    }
-  }
-
-  // 3. Try common workspace layouts relative to this file
-  const searchDirs: string[] = [];
-  try {
-    const { dirname } = require('node:path');
-    // When loaded from packages/aster/src/
-    const thisDir = typeof __dirname !== 'undefined'
-      ? __dirname
-      : dirname(new URL(import.meta.url).pathname);
-    searchDirs.push(resolve(thisDir, '../../../native'));    // packages/aster/src -> native
-    searchDirs.push(resolve(thisDir, '../../native'));       // packages/aster -> native
-    searchDirs.push(resolve(process.cwd(), 'bindings/typescript/native')); // repo root
-    searchDirs.push(resolve(process.cwd(), 'node_modules/@aster-rpc/transport')); // linked
-  } catch { /* ignore */ }
-
-  for (const dir of searchDirs) {
-    for (const name of platforms) {
-      const full = resolve(dir, name);
-      try {
-        if (existsSync(full)) { _native = require(full); return _native; }
-      } catch { /* next */ }
-    }
-  }
-
-  return null;
-}
-
-async function loadNative(): Promise<any> {
-  return loadNativeSync();
 }

@@ -22,21 +22,16 @@ import { StreamHeader, RpcStatus } from '../protocol.js';
 import { StatusCode, RpcError } from '../status.js';
 import type { AsterTransport, CallOptions } from './base.js';
 import type { BidiChannel } from './base.js';
+import { tryLoadNative, type NativeAddon } from '../native.js';
 
 // Lazy handle to the napi AsterCall class. Cached on first access so
 // the unary hot path doesn't re-resolve the native addon every call.
 // Falls back to `null` if the addon isn't loadable — the caller keeps
 // the old openBi path as a safety net.
-let _nativeAsterCall: any | null | undefined = undefined;
-function getNativeAsterCall(): any | null {
+let _nativeAsterCall: NativeAddon['AsterCall'] | null | undefined = undefined;
+function getNativeAsterCall(): NativeAddon['AsterCall'] | null {
   if (_nativeAsterCall !== undefined) return _nativeAsterCall;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const native = require('@aster-rpc/transport');
-    _nativeAsterCall = native?.AsterCall ?? null;
-  } catch {
-    _nativeAsterCall = null;
-  }
+  _nativeAsterCall = tryLoadNative()?.AsterCall ?? null;
   return _nativeAsterCall;
 }
 
@@ -127,10 +122,12 @@ export class IrohTransport implements AsterTransport {
         requestPair.set(headerFrame, 0);
         requestPair.set(requestFrame, headerFrame.byteLength);
 
+        // The fast path needs the real napi connection; structural
+        // test doubles make it throw and fall back to the openBi path.
         const result = await fast.unaryFastPath(
-          this.conn,
+          this.conn as unknown as InstanceType<NativeAddon['IrohConnection']>,
           this.sessionId,
-          requestPair,
+          Buffer.from(requestPair.buffer, requestPair.byteOffset, requestPair.byteLength),
         );
 
         // Trailer: empty means clean OK; non-empty carries an RpcStatus.

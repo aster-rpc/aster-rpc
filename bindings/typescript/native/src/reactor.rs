@@ -431,7 +431,9 @@ impl ReactorPair {
 /// Suitable when the server only serves the Aster ALPN.
 #[napi]
 pub fn start_reactor(node: &IrohNode, channel_capacity: u32) -> ReactorHandle {
-    let rt_handle = tokio::runtime::Handle::current();
+    // napi v3 no longer enters the Tokio runtime around synchronous exports
+    // (v2 did), so resolve napi's runtime handle explicitly.
+    let rt_handle = within_runtime_if_available(tokio::runtime::Handle::current);
     let core_handle =
         core_reactor::start_reactor_on(&rt_handle, node.core_clone(), channel_capacity as usize);
     ReactorHandle {
@@ -444,7 +446,9 @@ pub fn start_reactor(node: &IrohNode, channel_capacity: u32) -> ReactorHandle {
 /// bundled in a [`ReactorPair`] for take-once extraction.
 #[napi]
 pub fn create_reactor(channel_capacity: u32) -> ReactorPair {
-    let rt_handle = tokio::runtime::Handle::current();
+    // napi v3 no longer enters the Tokio runtime around synchronous exports
+    // (v2 did), so resolve napi's runtime handle explicitly.
+    let rt_handle = within_runtime_if_available(tokio::runtime::Handle::current);
     let (core_handle, core_feeder) =
         core_reactor::create_reactor(&rt_handle, channel_capacity as usize);
     ReactorPair {

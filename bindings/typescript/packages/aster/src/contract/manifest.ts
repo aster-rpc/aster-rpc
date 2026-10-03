@@ -10,6 +10,8 @@
  * - Contract publication (registry + blobs)
  */
 
+import { writeFileSync } from 'node:fs';
+
 import { MAX_MANIFEST_METHODS, MAX_MANIFEST_TYPE_HASHES } from '../limits.js';
 
 /** Method descriptor within a manifest. */
@@ -135,7 +137,6 @@ export function extractMethodDescriptors(manifest: ContractManifest): Record<str
  * Save a manifest to a JSON file.
  */
 export function saveManifest(manifest: ContractManifest, filePath: string): void {
-  const { writeFileSync } = require('node:fs');
   writeFileSync(filePath, manifestToJson(manifest), 'utf-8');
 }
 

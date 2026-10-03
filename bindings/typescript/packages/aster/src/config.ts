@@ -11,12 +11,21 @@
  * Aster configuration.
  * @group Server and Client
  */
+
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 export interface AsterConfig {
   // Trust
   rootPubkey?: Uint8Array;
   rootPubkeyFile?: string;
   enrollmentCredentialFile?: string;
   allowAllConsumers: boolean;
+  /**
+   * Kept for config-schema parity with the Rust `AsterConfig`. Producer mesh
+   * admission is not supported by the TypeScript binding, so only `true` is
+   * accepted; `AsterServer` throws on `false`.
+   */
   allowAllProducers: boolean;
 
   // Connect
@@ -101,7 +110,6 @@ export function configFromEnv(): AsterConfig {
  * [network], [logging], [health].
  */
 export function configFromFile(filePath: string): AsterConfig {
-  const { readFileSync } = require('node:fs');
   const text = readFileSync(filePath, 'utf-8');
   const toml = parseSimpleToml(text);
   const base = configFromEnv(); // env always wins
@@ -208,9 +216,6 @@ export interface IdentityData {
 export function loadIdentityFile(
   filePath?: string,
 ): IdentityData | null {
-  const { existsSync, readFileSync } = require('node:fs');
-  const { join } = require('node:path');
-
   const path = filePath ?? join(process.cwd(), '.aster-identity');
   if (!existsSync(path)) return null;
 
@@ -467,7 +472,6 @@ export function resolveRootPubkey(config: AsterConfig): Uint8Array | undefined {
   if (config.rootPubkey) return config.rootPubkey;
   if (config.rootPubkeyFile) {
     try {
-      const { readFileSync } = require('node:fs');
       const raw = readFileSync(config.rootPubkeyFile, 'utf-8').trim();
       // Support both raw hex and JSON {"public_key": "hex"} format
       let hex = raw;

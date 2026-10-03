@@ -13,6 +13,7 @@ import { MAX_DECOMPRESSED_SIZE } from './limits.js';
 import { WIRE_TYPE_KEY } from './decorators.js';
 import { ContractViolationError } from './status.js';
 import { getWireShape } from './generated.js';
+import { createXlangCodec } from './xlang.js';
 
 /** Default compression threshold in bytes (4 KiB). */
 export const DEFAULT_COMPRESSION_THRESHOLD = 4096;
@@ -116,8 +117,6 @@ export class JsonCodec implements Codec {
     // client hasn't registered any types with Fory.
     if (payload.length > 0 && payload[0] !== 0x7b /* '{' */) {
       try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { createXlangCodec } = require('./xlang.js');
         const fallback = createXlangCodec();
         return fallback.decode(payload, hintType);
       } catch {

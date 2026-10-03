@@ -6,13 +6,15 @@
  * reimplement the Fory wire shape in JavaScript.
  */
 
+import { loadNative } from '../native.js';
+
 export const HPKE_ENVELOPE_ALG =
   'HPKE-Base-X25519-HKDF-SHA256-ChaCha20Poly1305' as const;
 
 const INSPECT_CUSTOM = Symbol.for('nodejs.util.inspect.custom');
 
 interface NativeDecodedNamespaceCapability {
-  kind: 'read' | 'write';
+  kind: string;
   namespaceId: Uint8Array;
   canWrite: boolean;
   material: Uint8Array;
@@ -60,8 +62,7 @@ export function setNativeTrustConfigPrimitives(native: NativeTrustConfigPrimitiv
 function requireNative(): NativeTrustConfigPrimitives {
   if (_native) return _native;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    _native = require('@aster-rpc/transport') as NativeTrustConfigPrimitives;
+    _native = loadNative();
     return _native;
   } catch (err) {
     throw new Error(
@@ -106,6 +107,9 @@ export class NamespaceCapability {
 
   static decodeFory(data: Uint8Array): NamespaceCapability {
     const decoded = requireNative().namespaceCapabilityDecode(data);
+    if (decoded.kind !== 'read' && decoded.kind !== 'write') {
+      throw new Error(`unknown namespace capability kind: ${decoded.kind}`);
+    }
     return new NamespaceCapability(
       decoded.kind,
       copyBytes(decoded.namespaceId),

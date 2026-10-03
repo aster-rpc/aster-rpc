@@ -78,42 +78,6 @@ export {
   type FrameResult,
 } from './framing.js';
 
-// -- Multiplexed-streams v2 (spec §6) ---------------------------------------
-// These exports ship alongside the v1 AsterClient / RpcServer during the
-// Session 1 migration window. Session 3 renames them to drop the `2`
-// suffix and deletes v1 (see ffi_spec/Aster-multiplexed-streams.md §11).
-export {
-  IrohTransport2,
-  StreamAcquireError,
-  type IrohTransport2Options,
-  type NativeConnection,
-  type AsterCallFactory,
-  type NativeAsterCall,
-  type AsterCallRecvResult,
-} from './transport/iroh2.js';
-
-export {
-  AsterClient2,
-  ClientSession,
-  type AsterClient2Options,
-  type OpenSessionOptions,
-} from './client2.js';
-
-export {
-  AsterServer2,
-  DEFAULT_MAX_SESSIONS_PER_CONNECTION,
-  type AsterServer2Options,
-  type SharedRegistration,
-  type SessionRegistration,
-  type NativeNode,
-  type NativeReactorHandle,
-  type NativeReactorEvent,
-  type NativeResponseSender,
-  type NativeRequestReceiver,
-  type NativeCancelFlag,
-  type StartReactorFn,
-} from './server2.js';
-
 // Protocol types
 export { StreamHeader, CallHeader, RpcStatus } from './protocol.js';
 
@@ -405,28 +369,12 @@ export {
   AllowAllPolicy,
   DenyAllPolicy,
   MeshEndpointHook,
+  PRODUCER_ADMISSION_ALPN,
   CONSUMER_ADMISSION_ALPN,
   DELEGATED_ADMISSION_ALPN,
   type ConnectionPolicy,
   type HookDecision,
 } from './trust/hooks.js';
-export {
-  MeshState,
-  saveMeshState,
-  loadMeshState,
-  type PeerService,
-} from './trust/mesh.js';
-
-// Producer admission
-export {
-  handleProducerAdmission,
-  serveProducerAdmission,
-  PRODUCER_ADMISSION_ALPN,
-  type ProducerAdmissionRequest,
-  type ProducerAdmissionResponse,
-  type ProducerAdmissionOptions,
-} from './trust/producer.js';
-
 // Nonce store
 export {
   InMemoryNonceStore,
@@ -456,44 +404,6 @@ export {
   ATTR_IID_ROLE_ARN,
   type IIDBackend,
 } from './trust/iid.js';
-
-// Clock drift
-export {
-  ClockDriftTracker,
-  computeDrift,
-  shouldIsolate,
-  DEFAULT_CLOCK_DRIFT_CONFIG,
-  type ClockDriftConfig,
-} from './trust/clock.js';
-
-// Producer mesh gossip
-export {
-  ProducerMessageType,
-  deriveGossipTopic,
-  producerMessageSigningBytes,
-  signProducerMessage,
-  verifyProducerMessage,
-  handleProducerMessage,
-  encodeIntroducePayload,
-  encodeDepartPayload,
-  encodeContractPublishedPayload,
-  encodeLeaseUpdatePayload,
-  startLeaseHeartbeat,
-  runLeaseHeartbeat,
-  type ProducerMessage,
-  type HandleMessageOptions,
-} from './trust/gossip.js';
-
-// Mesh bootstrap
-export {
-  startFoundingNode,
-  joinMesh,
-  applyAdmissionResponse,
-  handleAdmissionRpc,
-  handleProducerAdmissionConnection,
-  makeEphemeralMeshState,
-  type BootstrapConfig,
-} from './trust/bootstrap.js';
 
 // Connection & Admission Metrics (from metrics.ts)
 export { ConnectionMetrics, AdmissionMetrics } from './metrics.js';

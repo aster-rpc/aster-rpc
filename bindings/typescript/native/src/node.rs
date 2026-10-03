@@ -20,7 +20,7 @@ use crate::net::IrohConnection;
 /// surface is available across PyO3 and NAPI bindings. All fields are
 /// optional with sensible defaults; pass `undefined` to use core defaults.
 #[napi(object)]
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct EndpointConfig {
     /// Relay mode: `"default"`, `"disabled"`, or `"staging"`.
     pub relay_mode: Option<String>,

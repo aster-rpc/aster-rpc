@@ -8,6 +8,7 @@
 import type { Interceptor } from './base.js';
 import { CallContext } from './base.js';
 import type { RpcError } from '../status.js';
+import { requireCjs } from '../native.js';
 
 export class MetricsInterceptor implements Interceptor {
   started = 0;
@@ -31,8 +32,8 @@ export class MetricsInterceptor implements Interceptor {
 
   constructor() {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { trace, metrics } = require('@opentelemetry/api');
+      // Optional peer: resolved at runtime, absent installs fall through.
+      const { trace, metrics } = requireCjs('@opentelemetry/api');
       this._tracer = trace.getTracer('aster.rpc', '0.1.0');
       this._meter = metrics.getMeter('aster.rpc', '0.1.0');
       this._startedCounter = (this._meter as any).createCounter('aster.rpc.started', {
