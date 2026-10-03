@@ -54,9 +54,9 @@ class Package:
 # out of the Salvo workspace because upstream deliberately excludes vendor/ as
 # workspace members.
 PACKAGES = [
-    Package("noq-proto", "1.3.0", "fork", "noq", "noq-proto/Cargo.toml"),
-    Package("noq-udp", "1.3.0", "fork", "noq", "noq-udp/Cargo.toml"),
-    Package("noq", "1.3.0", "fork", "noq", "noq/Cargo.toml"),
+    Package("noq-proto", "1.3.1", "fork", "noq", "noq-proto/Cargo.toml"),
+    Package("noq-udp", "1.3.1", "fork", "noq", "noq-udp/Cargo.toml"),
+    Package("noq", "1.3.1", "fork", "noq", "noq/Cargo.toml"),
     Package("irpc", "0.17.0", "bridge", "irpc"),
     Package("netwatch", "0.19.3", "bridge", "netwatch"),
     Package("portmapper", "0.19.3", "bridge", "portmapper"),

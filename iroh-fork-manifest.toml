@@ -8,7 +8,8 @@
 # not copy this file's patch blocks once the public registry is bootstrapped.
 # A `rev` is authoritative and its tag is a human label on the same commit.
 # Pin == tag == validated code. The 1.3.0 wave re-ports the noq stack
-# (read_into, poll_driver, plus poll_driver GSO/stream-accept fixes) onto
+# (read_into, poll_driver, plus poll_driver GSO/stream-accept fixes, and the
+# 1.3.1 read_to_end end-of-stream fix for upstream #794) onto
 # noq-v1.3.0 and the iroh stack (poll_driver re-export, recv-error log
 # throttle, noq fork patch) onto iroh v1.3.0. Upstream iroh 1.0.3 lowered the
 # recv-error log to debug! without throttling; the throttle is still carried.
@@ -33,19 +34,19 @@ consumer_contract = "Aster version plus Cargo.lock; never copy fork pins"
 [forks.noq]
 repo = "https://forge.emrul.dev/Aster/noq.git"
 upstream_base = "noq-v1.3.0"
-tag = "aster-noq-v1.3.0"
-commit = "67c1364453a48de3ef9141f339f3ab0697b39de5"
+tag = "aster-noq-v1.3.1"
+commit = "867a3a9a33cc75436a52272ee49ba34a007a957b"
 branch = "upgrade/noq-v1.3.0"
 crates = ["noq", "noq-udp", "noq-proto"]
 registry_crates = ["noq", "noq-udp", "noq-proto"]
-crate_version = "1.3.0"
+crate_version = "1.3.1"
 registry_bridge_crates = ["irpc", "netwatch", "portmapper"]
 
 [forks.iroh]
 repo = "https://forge.emrul.dev/Aster/iroh.git"
 upstream_base = "v1.3.0"
-tag = "aster-iroh-v1.3.0"
-commit = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2"
+tag = "aster-iroh-v1.3.0-p1"
+commit = "1974e95825313f09e0870ef5bef11c6bc9fd97d9"
 branch = "upgrade/iroh-v1.3.0"
 crates = ["iroh", "iroh-base", "iroh-relay"]
 registry_crates = ["iroh", "iroh-base", "iroh-dns", "iroh-relay"]
@@ -55,8 +56,8 @@ registry_bridge_crates = ["iroh-mdns-address-lookup", "iroh-tickets"]
 [forks.iroh-blobs]
 repo = "https://forge.emrul.dev/Aster/iroh-blobs.git"
 upstream_base = "v0.103.0"
-tag = "aster-iroh-blobs-v0.103.5"
-commit = "bf21d4fe409181c983a755df574754e99a0d0a60"
+tag = "aster-iroh-blobs-v0.103.5-p2"
+commit = "b535aa30ae61f82a1b048015817bf4365862ce62"
 branch = "upgrade/iroh-blobs-v0.103"
 crates = ["iroh-blobs"]
 registry_crates = ["iroh-blobs"]
@@ -65,8 +66,8 @@ crate_version = "0.103.5"
 [forks.iroh-docs]
 repo = "https://forge.emrul.dev/Aster/iroh-docs.git"
 upstream_base = "v0.101.0"
-tag = "aster-iroh-docs-v0.101.5"
-commit = "0db8c5cc05f62e2fd13f6dc6079cf5237767ec83"
+tag = "aster-iroh-docs-v0.101.5-p1"
+commit = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678"
 branch = "upgrade/iroh-docs-v0.101"
 crates = ["iroh-docs"]
 registry_crates = ["iroh-docs"]
@@ -104,8 +105,8 @@ crate_version = "0.6.2"
 [forks.iroh-gossip]
 repo = "https://forge.emrul.dev/Aster/iroh-gossip.git"
 upstream_base = "v0.101.0"
-tag = "aster-iroh-gossip-v0.101.0-p1"
-commit = "5c021f998a172b81a69669e71786e14a339fa963"
+tag = "aster-iroh-gossip-v0.101.0-p2"
+commit = "de100e9aa59386e39a32d6744bd902935c16fcf6"
 branch = "upgrade/iroh-gossip-v0.101"
 crates = ["iroh-gossip"]
 registry_crates = ["iroh-gossip"]
@@ -211,15 +212,15 @@ iroh-mdns-address-lookup = "0.4"
 # Pin block ([patch.crates-io]):
 patch_crates_io = """
 [patch.crates-io]
-iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
-iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
-iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
-iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "bf21d4fe409181c983a755df574754e99a0d0a60" }
-iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "0db8c5cc05f62e2fd13f6dc6079cf5237767ec83" }
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5c021f998a172b81a69669e71786e14a339fa963" }
-noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
-noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
-noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
+iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "b535aa30ae61f82a1b048015817bf4365862ce62" }
+iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "de100e9aa59386e39a32d6744bd902935c16fcf6" }
+noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
+noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
+noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
 irpc        = { git = "https://github.com/n0-computer/irpc",           rev = "0ed2b235d5c797b54d8263ecb3b0247272d055f9" }
 netwatch    = { git = "https://github.com/n0-computer/net-tools",      rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }
 portmapper  = { git = "https://github.com/n0-computer/net-tools",      rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }

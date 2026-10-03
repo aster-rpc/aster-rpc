@@ -18,10 +18,10 @@ rust-version = "1.96"
 # Each forked direct dependency has two locations: the public Forgejo Git
 # source used in this workspace, and a version used when packaging for Aster's
 # Cargo registry. [patch.crates-io] below still unifies transitive references.
-iroh        = { version = "=1.3.0", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
-iroh-blobs  = { version = "0.103.5", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "bf21d4fe409181c983a755df574754e99a0d0a60" }
-iroh-docs   = { version = "0.101.5", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "0db8c5cc05f62e2fd13f6dc6079cf5237767ec83" }
-iroh-gossip = { version = "0.101.0", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5c021f998a172b81a69669e71786e14a339fa963" }
+iroh        = { version = "=1.3.0", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh-blobs  = { version = "0.103.5", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "b535aa30ae61f82a1b048015817bf4365862ce62" }
+iroh-docs   = { version = "0.101.5", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
+iroh-gossip = { version = "0.101.0", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "de100e9aa59386e39a32d6744bd902935c16fcf6" }
 iroh-tickets = { version = "=1.0.0", registry = "aster", git = "https://github.com/n0-computer/iroh-tickets", rev = "4899684e1209dea29ed28aa2314450927557b037" }
 # mDNS lookup moved to a separate crate in iroh 1.0.0-rc.0.
 iroh-mdns-address-lookup = { version = "=0.4.0", registry = "aster", git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
@@ -55,15 +55,15 @@ crossbeam-utils = "0.8"
 # iroh from crates.io) must also resolve to the fork. A regular dep override
 # only affects the top-level use; [patch] rewires every resolution.
 [patch.crates-io]
-iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
-iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
-iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "0a7036826267a91c5e34b8fa0e8d3c10522b84a2" }
-iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "bf21d4fe409181c983a755df574754e99a0d0a60" }
-iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "0db8c5cc05f62e2fd13f6dc6079cf5237767ec83" }
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5c021f998a172b81a69669e71786e14a339fa963" }
-noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
-noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
-noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "67c1364453a48de3ef9141f339f3ab0697b39de5" }
+iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "b535aa30ae61f82a1b048015817bf4365862ce62" }
+iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "de100e9aa59386e39a32d6744bd902935c16fcf6" }
+noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
+noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
+noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
 # Registry bridges are code-identical to their crates.io releases. Pinning the
 # upstream commits here makes the development graph match the source that is
 # repackaged with Aster-registry dependency metadata for consumers.
