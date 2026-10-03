@@ -121,9 +121,12 @@ commit = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
 branch = "main"
 crates = ["salvo", "salvo_core", "salvo_macros", "salvo-http3", "h3", "h3-quinn", "h3-datagram"]
 registry_crates = [
-  "h3", "h3-datagram", "h3-quinn", "salvo", "salvo-acme", "salvo-http3", "salvo-otel",
-  "salvo-proxy", "salvo-serde-util", "salvo-serve-static", "salvo_core",
-  "salvo_extra", "salvo_macros",
+  "h3", "h3-datagram", "h3-quinn", "salvo", "salvo-acme", "salvo-cache",
+  "salvo-compression", "salvo-cors", "salvo-craft", "salvo-craft-macros",
+  "salvo-csrf", "salvo-flash", "salvo-http3", "salvo-jwt-auth", "salvo-oapi",
+  "salvo-oapi-macros", "salvo-otel", "salvo-proxy", "salvo-rate-limiter",
+  "salvo-serde-util", "salvo-serve-static", "salvo-session", "salvo-tus",
+  "salvo_core", "salvo_extra", "salvo_macros",
 ]
 crate_version = "1.0.1"
 

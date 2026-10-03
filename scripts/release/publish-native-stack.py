@@ -82,6 +82,19 @@ PACKAGES = [
     Package("salvo-otel", "1.0.1", "fork", "salvo", "crates/otel/Cargo.toml"),
     Package("salvo-proxy", "1.0.1", "fork", "salvo", "crates/proxy/Cargo.toml"),
     Package("salvo-serve-static", "1.0.1", "fork", "salvo", "crates/serve-static/Cargo.toml"),
+    Package("salvo-cache", "1.0.1", "fork", "salvo", "crates/cache/Cargo.toml"),
+    Package("salvo-compression", "1.0.1", "fork", "salvo", "crates/compression/Cargo.toml"),
+    Package("salvo-cors", "1.0.1", "fork", "salvo", "crates/cors/Cargo.toml"),
+    Package("salvo-session", "1.0.1", "fork", "salvo", "crates/session/Cargo.toml"),
+    Package("salvo-csrf", "1.0.1", "fork", "salvo", "crates/csrf/Cargo.toml"),
+    Package("salvo-flash", "1.0.1", "fork", "salvo", "crates/flash/Cargo.toml"),
+    Package("salvo-jwt-auth", "1.0.1", "fork", "salvo", "crates/jwt-auth/Cargo.toml"),
+    Package("salvo-rate-limiter", "1.0.1", "fork", "salvo", "crates/rate-limiter/Cargo.toml"),
+    Package("salvo-tus", "1.0.1", "fork", "salvo", "crates/tus/Cargo.toml"),
+    Package("salvo-oapi-macros", "1.0.1", "fork", "salvo", "crates/oapi-macros/Cargo.toml"),
+    Package("salvo-oapi", "1.0.1", "fork", "salvo", "crates/oapi/Cargo.toml"),
+    Package("salvo-craft-macros", "1.0.1", "fork", "salvo", "crates/craft-macros/Cargo.toml"),
+    Package("salvo-craft", "1.0.1", "fork", "salvo", "crates/craft/Cargo.toml"),
     Package("salvo", "1.0.1", "fork", "salvo", "crates/salvo/Cargo.toml"),
 ]
 
@@ -297,6 +310,21 @@ def add_registry_to_value(value: str, actual_name: str) -> str:
     return "{ " + inner + " }"
 
 
+def path_only_dev_dependency(section: str, text: str) -> bool:
+    """A dev-dependency with `path` and no `version`.
+
+    `cargo package` strips these, which is what breaks dev-dependency cycles
+    (salvo-jwt-auth dev-depends on `salvo = { path = "../salvo" }` while salvo
+    depends on salvo-jwt-auth). Adding a version and registry would turn it into
+    a requirement on a version that is not published yet.
+    """
+    return (
+        "dev-dependencies" in section
+        and re.search(r"\bpath\s*=", text) is not None
+        and re.search(r"\bversion\s*=", text) is None
+    )
+
+
 def patch_manifest(path: Path) -> None:
     lines = path.read_text().splitlines(keepends=True)
     output: list[str] = []
@@ -327,8 +355,8 @@ def patch_manifest(path: Path) -> None:
                     if package_match:
                         actual_name = package_match.group(1)
                         break
-                if actual_name in PACKAGE_NAMES:
-                    joined = "".join(block)
+                joined = "".join(block)
+                if actual_name in PACKAGE_NAMES and not path_only_dev_dependency(section, joined):
                     if "workspace = true" not in joined and not re.search(
                         r"(?m)^\s*registry\s*=", joined
                     ):
@@ -369,6 +397,7 @@ def patch_manifest(path: Path) -> None:
                         actual_name in PACKAGE_NAMES
                         and "workspace = true" not in joined
                         and "registry" not in joined
+                        and not path_only_dev_dependency(section, joined)
                     ):
                         additions = ' registry = "aster",'
                         if not re.search(r"\bversion\s*=", joined):
@@ -381,7 +410,7 @@ def patch_manifest(path: Path) -> None:
                     continue
                 package_match = re.search(r'\bpackage\s*=\s*["\']([^"\']+)["\']', value)
                 actual_name = package_match.group(1) if package_match else key
-                if actual_name in PACKAGE_NAMES:
+                if actual_name in PACKAGE_NAMES and not path_only_dev_dependency(section, value):
                     value = add_registry_to_value(value, actual_name)
                     line = (
                         match.group("indent")
@@ -498,6 +527,24 @@ def validate_package(package: Package, manifest_path: Path) -> None:
     if len(matches) != 1 or matches[0]["version"] != package.version:
         raise RuntimeError(f"could not identify {package.name} {package.version}")
     errors = []
+    unpublished = sorted(
+        dependency["name"]
+        for dependency in matches[0]["dependencies"]
+        if dependency.get("path")
+        and dependency.get("kind") != "dev"
+        and dependency["name"] not in PACKAGE_NAMES
+    )
+    if unpublished:
+        # A path dependency on a sibling crate we do not publish keeps its
+        # crates.io source in the packaged manifest. At an Aster-local version
+        # that crates.io does not have, `cargo publish` cannot resolve it
+        # (salvo 1.0.1 -> salvo-cache ^1.0.1 stopped v0.3.353 half-way); at one
+        # it does have, consumers get a second copy of the family. Publish the
+        # sibling too. Optional dependencies count: Cargo resolves them to package.
+        raise RuntimeError(
+            f"{package.name} depends on unpublished sibling crates: "
+            + ", ".join(unpublished)
+        )
     for dependency in matches[0]["dependencies"]:
         if dependency["name"] not in PACKAGE_NAMES:
             continue
