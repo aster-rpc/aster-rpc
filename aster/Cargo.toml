@@ -183,6 +183,13 @@ name = "interop_echo"
 path = "../tests/interop/rust/interop_echo.rs"
 required-features = ["rpc"]
 
+# Dispatch benchmark load driver (design §6 Step 0). Shares the InteropEcho
+# contract with tests/interop/; driven by benchmarks/dispatch/run.py.
+[[example]]
+name = "dispatch_driver"
+path = "../benchmarks/dispatch/driver.rs"
+required-features = ["rpc", "binding-support"]
+
 # The §S3-F process-loss voter. Built only when the test harness feature is on,
 # so an ordinary `cargo build` neither compiles nor ships it. The integration
 # test finds it through `CARGO_BIN_EXE_coordination-voter`.

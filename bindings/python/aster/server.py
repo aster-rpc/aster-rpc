@@ -146,11 +146,15 @@ class _ReactorSendAdapter:
         if self._closed or len(data) < 5:
             return
         flags = data[4]
+        # Await each send: `send_frame` / `send_trailer` return awaitables
+        # whose sends run as independent tokio tasks, so firing them without
+        # awaiting lets frames reorder and lets the trailer overtake (and
+        # drop) data frames.
         if flags & TRAILER:
-            self._sender.send_trailer(bytes(data))
             self._closed = True
+            await self._sender.send_trailer(bytes(data))
         else:
-            self._sender.send_frame(bytes(data))
+            await self._sender.send_frame(bytes(data))
 
     async def finish(self) -> None:
         # Reactor auto-finishes the QUIC stream after the trailer frame

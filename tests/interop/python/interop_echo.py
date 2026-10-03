@@ -4,7 +4,9 @@ Shared contract (must stay identical to ``tests/interop/rust/interop_echo.rs``
 and ``tests/interop/ts/src/``)::
 
     service InteropEcho v1
-      echo(interop/EchoRequest) -> interop/EchoReply           (unary)
+      echo(interop/EchoRequest) -> interop/EchoReply                (unary)
+      generate(interop/EchoRequest) -> stream interop/EchoReply     (server stream)
+      ingest(stream interop/EchoRequest) -> interop/EchoReply       (client stream)
     interop/EchoRequest { message: string, count: varint32, data: binary }
     interop/EchoReply   { message: string, count: varint32, data: binary, server_lang: string }
 
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import pyfory
@@ -31,6 +34,7 @@ from aster import (
     AsterConfig,
     AsterServer,
     AsterTicket,
+    client_stream,
     EndpointConfig,
     IrohNode,
     NodeAddr,
@@ -38,6 +42,7 @@ from aster import (
     create_client,
     net_client,
     rpc,
+    server_stream,
     service,
     wire_type,
 )
@@ -72,6 +77,20 @@ class InteropEcho:
             server_lang="python",
         )
 
+    @server_stream()
+    async def generate(self, req: EchoRequest) -> AsyncIterator[EchoReply]:
+        for i in range(max(req.count, 0)):
+            yield EchoReply(message=req.message, count=i, data=req.data, server_lang="python")
+
+    @client_stream()
+    async def ingest(self, reqs: AsyncIterator[EchoRequest]) -> EchoReply:
+        n = 0
+        last = ""
+        async for r in reqs:
+            n += 1
+            last = r.message
+        return EchoReply(message=last, count=_wrap_i32(n), data=b"", server_lang="python")
+
 
 def _wrap_i32(v: int) -> int:
     return (v + 2**31) % 2**32 - 2**31
@@ -99,6 +118,33 @@ def check(req: EchoRequest, reply: EchoReply) -> str:
         raise AssertionError(f"count {reply.count} != {_wrap_i32(req.count + 1)}")
     if bytes(reply.data) != req.data:
         raise AssertionError(f"data mismatch (len {len(reply.data)} vs {len(req.data)})")
+    if not reply.server_lang:
+        raise AssertionError("empty server_lang")
+    return reply.server_lang
+
+
+async def _stream_case(client) -> str:
+    """``generate`` with count 3. Must match the Rust and TS drivers."""
+    req = EchoRequest(message="stream", count=3, data=bytes([7, 8, 9]))
+    replies = [r async for r in client.generate(req)]
+    if len(replies) != 3:
+        raise AssertionError(f"{len(replies)} replies != 3")
+    for i, r in enumerate(replies):
+        if r.count != i or r.message != req.message or bytes(r.data) != req.data:
+            raise AssertionError(f"reply {i} mismatch: {r!r}")
+    return replies[0].server_lang
+
+
+async def _ingest_case(client) -> str:
+    """``ingest`` with three requests: one reply, count 3, last message echoed."""
+
+    async def reqs():
+        for i in range(3):
+            yield EchoRequest(message=f"m{i}", count=i, data=bytes([i]))
+
+    reply = await client.ingest(reqs())
+    if reply.count != 3 or reply.message != "m2":
+        raise AssertionError(f"reply mismatch: {reply!r}")
     if not reply.server_lang:
         raise AssertionError("empty server_lang")
     return reply.server_lang
@@ -147,6 +193,13 @@ async def run_client(ticket_str: str) -> bool:
         try:
             reply = await asyncio.wait_for(client.echo(req), 15)
             server_lang = check(req, reply)
+            print(f"CASE {name} OK server_lang={server_lang}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            all_ok = False
+            print(f"CASE {name} FAIL {type(exc).__name__}: {exc}", flush=True)
+    for name, coro in (("server_stream", _stream_case(client)), ("client_stream", _ingest_case(client))):
+        try:
+            server_lang = await asyncio.wait_for(coro, 15)
             print(f"CASE {name} OK server_lang={server_lang}", flush=True)
         except Exception as exc:  # noqa: BLE001
             all_ok = False

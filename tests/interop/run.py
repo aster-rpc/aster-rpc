@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript, open gate, unary.
+"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript, open gate, unary + streaming.
 
 Builds what is needed, checks that all three languages derive the same
 ``contract_id`` for the shared ``InteropEcho`` contract, then runs every

@@ -5,70 +5,34 @@
 //!
 //! ```text
 //! service InteropEcho v1
-//!   echo(interop/EchoRequest) -> interop/EchoReply           (unary)
+//!   echo(interop/EchoRequest) -> interop/EchoReply                (unary)
+//!   generate(interop/EchoRequest) -> stream interop/EchoReply     (server stream)
+//!   ingest(stream interop/EchoRequest) -> interop/EchoReply       (client stream)
 //! interop/EchoRequest { message: string, count: varint32, data: binary }
 //! interop/EchoReply   { message: string, count: varint32, data: binary, server_lang: string }
 //! ```
 //!
-//! Server semantics: `message` and `data` echoed, `count + 1`, `server_lang`
-//! set to the serving language.
+//! Types, service and server semantics live in `contract.rs` (shared with
+//! `benchmarks/dispatch/driver.rs`).
 //!
 //! Usage (built as the `interop_echo` example of the `aster` crate, feature `rpc`):
 //!
 //! ```text
 //! interop_echo contract           # prints CONTRACT_ID <hex>
 //! interop_echo server             # prints CONTRACT_ID, then ADDRESS aster1…, serves until stdin closes
-//! interop_echo client <aster1…>   # runs the unary cases, prints CONTRACT_ID + one CASE line each, exit 0 on success
+//! interop_echo client <aster1…>   # runs the cases (unary + streaming), prints CONTRACT_ID + one CASE line each, exit 0 on success
 //! ```
 //!
 //! Open gate, relay disabled, loopback bind: works offline.
 
 use std::time::Duration;
 
-use aster::rpc::{async_trait, contract_id, RpcConnection};
+use aster::rpc::{contract_id, RpcConnection};
 use aster::{AsterConfig, Node, RelayMode, Result, Ticket};
-use fory_derive::ForyStruct;
 
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
-#[aster(wire = "interop/EchoRequest")]
-struct EchoRequest {
-    message: String,
-    count: i32,
-    // `#[fory(bytes)]` is REQUIRED for interop: without it fory-derive 1.7.6
-    // writes `Vec<u8>` as LIST<UINT8> (type 22) while `AsterType` advertises
-    // `binary` and Python `bytes` / TS `Uint8Array` write BINARY (type 41).
-    #[fory(bytes)]
-    data: Vec<u8>,
-}
-
-#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
-#[aster(wire = "interop/EchoReply")]
-struct EchoReply {
-    message: String,
-    count: i32,
-    #[fory(bytes)]
-    data: Vec<u8>,
-    server_lang: String,
-}
-
-#[aster::service(name = "InteropEcho", version = 1)]
-trait InteropEcho {
-    async fn echo(&self, req: EchoRequest) -> Result<EchoReply>;
-}
-
-struct EchoImpl;
-
-#[async_trait]
-impl InteropEcho for EchoImpl {
-    async fn echo(&self, req: EchoRequest) -> Result<EchoReply> {
-        Ok(EchoReply {
-            message: req.message,
-            count: req.count.wrapping_add(1),
-            data: req.data,
-            server_lang: "rust".into(),
-        })
-    }
-}
+#[path = "contract.rs"]
+mod contract;
+use contract::{EchoImpl, EchoReply, EchoRequest, InteropEchoClient, InteropEchoServer};
 
 fn cfg() -> AsterConfig {
     AsterConfig::builder()
@@ -180,8 +144,71 @@ async fn run_client(ticket: &str) -> bool {
             }
         }
     }
+    for (name, verdict) in [
+        ("server_stream", stream_case(&client).await),
+        ("client_stream", ingest_case(&client).await),
+    ] {
+        match verdict {
+            Ok(server_lang) => println!("CASE {name} OK server_lang={server_lang}"),
+            Err(why) => {
+                all_ok = false;
+                println!("CASE {name} FAIL {why}");
+            }
+        }
+    }
     node.shutdown().await;
     all_ok
+}
+
+/// `generate` with count 3: three replies, `count` 0..3, message/data echoed.
+/// Must match the Python and TS drivers.
+async fn stream_case(client: &InteropEchoClient) -> std::result::Result<String, String> {
+    let req = EchoRequest {
+        message: "stream".into(),
+        count: 3,
+        data: vec![7, 8, 9],
+    };
+    let fut = async {
+        let mut s = client.generate(req.clone()).await?;
+        s.collect().await
+    };
+    let replies = match tokio::time::timeout(Duration::from_secs(15), fut).await {
+        Err(_) => return Err("timeout".into()),
+        Ok(Err(e)) => return Err(format!("rpc error: {e}")),
+        Ok(Ok(r)) => r,
+    };
+    if replies.len() != 3 {
+        return Err(format!("{} replies != 3", replies.len()));
+    }
+    for (i, r) in replies.iter().enumerate() {
+        if r.count != i as i32 || r.message != req.message || r.data != req.data {
+            return Err(format!("reply {i} mismatch: {replies:?}"));
+        }
+    }
+    Ok(replies[0].server_lang.clone())
+}
+
+/// `ingest` with three requests: one reply, count 3, last message echoed.
+async fn ingest_case(client: &InteropEchoClient) -> std::result::Result<String, String> {
+    let reqs: Vec<EchoRequest> = (0..3)
+        .map(|i| EchoRequest {
+            message: format!("m{i}"),
+            count: i,
+            data: vec![i as u8],
+        })
+        .collect();
+    let reply = match tokio::time::timeout(Duration::from_secs(15), client.ingest(reqs)).await {
+        Err(_) => return Err("timeout".into()),
+        Ok(Err(e)) => return Err(format!("rpc error: {e}")),
+        Ok(Ok(r)) => r,
+    };
+    if reply.count != 3 || reply.message != "m2" {
+        return Err(format!("reply mismatch: {reply:?}"));
+    }
+    if reply.server_lang.is_empty() {
+        return Err("empty server_lang".into());
+    }
+    Ok(reply.server_lang)
 }
 
 fn check(req: &EchoRequest, reply: &EchoReply) -> std::result::Result<String, String> {

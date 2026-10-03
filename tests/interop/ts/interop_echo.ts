@@ -134,9 +134,48 @@ async function runClient(ticket: string): Promise<boolean> {
       console.log(`CASE ${name} FAIL ${String(e).split('\n')[0]}`);
     }
   }
+  for (const [name, run] of [
+    ['server_stream', () => streamCase(client)],
+    ['client_stream', () => ingestCase(client)],
+  ] as [string, () => Promise<string>][]) {
+    try {
+      console.log(`CASE ${name} OK server_lang=${await withTimeout(run(), 15_000)}`);
+    } catch (e) {
+      allOk = false;
+      console.log(`CASE ${name} FAIL ${String(e).split('\n')[0]}`);
+    }
+  }
   try { conn.close(0, 'done'); } catch { /* ignore */ }
   await node.close();
   return allOk;
+}
+
+/** `generate` with count 3. Must match the Rust and Python drivers. */
+async function streamCase(client: any): Promise<string> {
+  const req = new EchoRequest({ message: 'stream', count: i32(3), data: new Uint8Array([7, 8, 9]) });
+  const replies: EchoReply[] = [];
+  for await (const r of client.generate(req) as AsyncIterable<EchoReply>) replies.push(r);
+  if (replies.length !== 3) throw new Error(`${replies.length} replies != 3`);
+  replies.forEach((r, i) => {
+    const data = Buffer.from(r.data instanceof Uint8Array ? r.data : new Uint8Array(r.data as any ?? []));
+    if (r.count !== i || r.message !== req.message || Buffer.compare(data, Buffer.from(req.data)) !== 0) {
+      throw new Error(`reply ${i} mismatch: ${JSON.stringify(r)}`);
+    }
+  });
+  return replies[0].server_lang;
+}
+
+/** `ingest` with three requests: one reply, count 3, last message echoed. */
+async function ingestCase(client: any): Promise<string> {
+  async function* reqs() {
+    for (let i = 0; i < 3; i++) {
+      yield new EchoRequest({ message: `m${i}`, count: i32(i), data: new Uint8Array([i]) });
+    }
+  }
+  const reply = (await client.ingest(reqs())) as EchoReply;
+  if (reply.count !== 3 || reply.message !== 'm2') throw new Error(`reply mismatch: ${JSON.stringify(reply)}`);
+  if (!reply.server_lang) throw new Error('empty server_lang');
+  return reply.server_lang;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
