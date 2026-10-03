@@ -4,8 +4,8 @@ aster.peer_store -- Per-peer admission attribute store.
 Bridges the gap between admission (where attributes are determined)
 and RPC dispatch (where attributes are needed for authorization).
 
-Both consumer admission and delegated admission handlers write to this
-store on successful admission. The RPC server reads from it when
+The consumer admission handler writes to this store on successful
+admission. The RPC server reads from it when
 building CallContext for each call.
 
 Expiry: each admission records the credential's ``expires_at`` (epoch
@@ -43,7 +43,7 @@ class PeerAdmission:
     attributes: dict[str, str] = field(default_factory=dict)
     admitted_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
-    admission_path: str = ""  # "consumer_admission" | "aster.admission"
+    admission_path: str = ""  # e.g. "consumer_admission"
 
     def is_expired(self) -> bool:
         now = time.time()

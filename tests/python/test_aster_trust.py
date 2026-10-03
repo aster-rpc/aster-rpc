@@ -122,6 +122,26 @@ def test_canonical_json_unicode():
     assert "café".encode("utf-8") in result
 
 
+def test_delegated_canonical_json_matches_rust_core():
+    """Delegated-token canonical JSON must use the same form as Rust core
+    (raw UTF-8, not \\uXXXX escapes) -- previously it used ensure_ascii=True."""
+    from aster.trust.delegated import _canonical_json_bytes
+
+    attrs = {"z": "naïve ✓", "a": "café", "ctl": "a\nb\x01"}
+    assert _canonical_json_bytes(attrs) == canonical_json(attrs)
+    assert "café".encode("utf-8") in _canonical_json_bytes(attrs)
+
+
+def test_validate_rcan_fails_closed():
+    """rcan format is unspecified; the stub must reject every grant."""
+    from aster.trust.rcan import validate_rcan
+
+    for grant in [b"", b"\x01", b"anything-at-all" * 10]:
+        ok, reason = validate_rcan(grant)
+        assert ok is False
+        assert reason
+
+
 # ── Producer credential: sign + verify ────────────────────────────────────────
 
 
@@ -261,8 +281,11 @@ async def test_ott_nonce_wrong_length_rejected():
             expires_at=int(time.time()) + 3600,
             nonce=bad_nonce,
         )
-        # Sign the malformed cred to get past signature check
-        cred.signature = sign_credential(cred, priv_raw)
+        # Canonical signing bytes come from Rust core, which refuses to
+        # build them for a malformed nonce -- so such a cred can't be signed.
+        with pytest.raises(ValueError, match="32 bytes"):
+            sign_credential(cred, priv_raw)
+        cred.signature = b"\x00" * 64
         store = InMemoryNonceStore()
         # Validation happens at structural level via nonce_store.consume
         with pytest.raises(ValueError, match="32 bytes"):

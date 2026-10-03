@@ -70,7 +70,7 @@ DEFAULT_TOUR = Tour(
             trigger="command",
             trigger_value="ls",
             message=(
-                "  You can explore [cyan]services/[/cyan], [cyan]blobs/[/cyan], or [cyan]gossip/[/cyan].\n"
+                "  You can explore [cyan]services/[/cyan], [cyan]blobs/[/cyan], or [cyan]docs/[/cyan].\n"
                 "  Try [green]cd services[/green] to browse available RPC services."
             ),
         ),

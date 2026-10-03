@@ -959,11 +959,11 @@ class Server:
         )
 
         # Attach a TunnelHandle when the connection is the real
-        # `IrohConnection` (it exposes `authorize_tunnel_many`). Stub
+        # `IrohConnection` (it exposes `authorize_tunnel`). Stub
         # connections used by older tests / dispatch shims expose only
         # `remote_id()` and skip cleanly with `tunnel=None`.
         conn = getattr(ctx, "connection", None)
-        if conn is not None and hasattr(conn, "authorize_tunnel_many"):
+        if conn is not None and hasattr(conn, "authorize_tunnel"):
             from aster.tunnel import TunnelHandle
             call_ctx.tunnel = TunnelHandle(conn)
 

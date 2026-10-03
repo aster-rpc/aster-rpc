@@ -1009,38 +1009,6 @@ class PeerConnection:
         except Exception:
             return None
 
-    async def subscribe_gossip(self) -> Any:
-        """Subscribe to the producer mesh gossip topic.
-
-        The gossip topic is returned by the producer during consumer
-        admission -- but only when the connecting node is the root key
-        holder.  Returns a GossipTopicHandle or raises.
-        """
-        if not self._aster_client or not self._aster_client._node:
-            raise RuntimeError("not connected")
-
-        topic_hex = self._aster_client.gossip_topic
-        if not topic_hex:
-            raise RuntimeError(
-                "gossip topic not available -- the producer only shares it "
-                "with the root node. Connect with the root key to access gossip."
-            )
-
-        topic_bytes = bytes.fromhex(topic_hex)
-
-        from aster import gossip_client
-
-        # Need bootstrap peers -- the producer we connected to
-        bootstrap = []
-        if self._aster_client._endpoint_addr_in:
-            from aster.runtime import _coerce_node_addr
-            addr = _coerce_node_addr(self._aster_client._endpoint_addr_in)
-            if addr.endpoint_id:
-                bootstrap.append(addr.endpoint_id)
-
-        gc = gossip_client(self._aster_client._node)
-        return await gc.subscribe(list(topic_bytes), bootstrap)
-
     async def close(self) -> None:
         """Close the connection and clean up.
 

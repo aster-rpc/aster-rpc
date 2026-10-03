@@ -1,14 +1,13 @@
 """
-aster.trust -- Trust Foundations (Phases 11 & 12).
+aster.trust -- Trust Foundations.
 
-Provides offline root-key authorization, enrollment credentials, Gate 0
-connection-level admission filtering, producer mesh gossip, and clock drift
-detection.
+Provides offline root-key authorization, enrollment credentials, and Gate 0
+connection-level admission filtering. (Producer mesh, mesh gossip, mesh
+bootstrap and clock-drift detection have been removed.)
 
 Spec references:
-  Aster-trust-spec.md §2.2, §2.4, §2.9, §3.1, §3.2, §3.3 (Phase 11)
-  Aster-trust-spec.md §2.1, §2.3, §2.5, §2.6, §2.7, §2.10 (Phase 12)
-  ASTER_PLAN.md §13, §14
+  Aster-trust-spec.md §2.2, §2.4, §2.9, §3.1, §3.2, §3.3
+  ASTER_PLAN.md §13
 
 Quick start::
 
@@ -26,25 +25,10 @@ Quick start::
         verify_signature,
         InMemoryNonceStore,
         NonceStore,
-        # Phase 12
-        ProducerMessage,
-        ProducerMessageType,
-        MeshState,
-        ClockDriftConfig,
-        ClockDriftDetector,
-        sign_producer_message,
-        verify_producer_message,
-        derive_gossip_topic,
     )
 """
 
 from .admission import admit, check_offline, check_runtime
-from .bootstrap import (
-    handle_admission_rpc,
-    handle_producer_admission_connection,
-    make_ephemeral_mesh_state,
-    serve_producer_admission,
-)
 from .credentials import (
     ATTR_IID_ACCOUNT,
     ATTR_IID_PROVIDER,
@@ -56,20 +40,6 @@ from .credentials import (
     ConsumerEnrollmentCredential,
     EnrollmentCredential,
 )
-from .drift import ClockDriftDetector
-from .gossip import (
-    derive_gossip_topic,
-    encode_contract_published_payload,
-    encode_depart_payload,
-    encode_introduce_payload,
-    encode_lease_update_payload,
-    handle_producer_message,
-    producer_message_signing_bytes,
-    run_lease_heartbeat,
-    sign_producer_message,
-    start_lease_heartbeat,
-    verify_producer_message,
-)
 from .hooks import (
     ALPN_CONSUMER_ADMISSION,
     ALPN_DELEGATED_ADMISSION,
@@ -77,18 +47,6 @@ from .hooks import (
     MeshEndpointHook,
 )
 from .iid import IIDBackend, MockIIDBackend, get_iid_backend
-from .mesh import (
-    AdmissionRequest,
-    AdmissionResponse,
-    ClockDriftConfig,
-    ContractPublishedPayload,
-    DepartPayload,
-    IntroducePayload,
-    LeaseUpdatePayload,
-    MeshState,
-    ProducerMessage,
-    ProducerMessageType,
-)
 from .nonces import InMemoryNonceStore, NonceStore
 from .signing import (
     generate_root_keypair,
@@ -116,11 +74,6 @@ __all__ = [
     "admit",
     "check_offline",
     "check_runtime",
-    # Producer admission serve-loop
-    "handle_admission_rpc",
-    "handle_producer_admission_connection",
-    "serve_producer_admission",
-    "make_ephemeral_mesh_state",
     # IID
     "IIDBackend",
     "MockIIDBackend",
@@ -133,29 +86,4 @@ __all__ = [
     "ALPN_PRODUCER_ADMISSION",
     "ALPN_CONSUMER_ADMISSION",
     "ALPN_DELEGATED_ADMISSION",
-    # Phase 12: Producer mesh
-    "ProducerMessage",
-    "ProducerMessageType",
-    "IntroducePayload",
-    "DepartPayload",
-    "ContractPublishedPayload",
-    "LeaseUpdatePayload",
-    "MeshState",
-    "ClockDriftConfig",
-    "AdmissionRequest",
-    "AdmissionResponse",
-    # Phase 12: Gossip
-    "producer_message_signing_bytes",
-    "sign_producer_message",
-    "verify_producer_message",
-    "derive_gossip_topic",
-    "handle_producer_message",
-    "encode_introduce_payload",
-    "encode_depart_payload",
-    "encode_contract_published_payload",
-    "encode_lease_update_payload",
-    "run_lease_heartbeat",
-    "start_lease_heartbeat",
-    # Phase 12: Drift
-    "ClockDriftDetector",
 ]

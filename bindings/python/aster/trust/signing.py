@@ -20,79 +20,83 @@ Canonical signing bytes format:
     || canonical_json(attributes)      # UTF-8, sorted keys
     || u8(has_nonce)                   # 0x00 or 0x01
     || nonce?                          # present only if has_nonce == 0x01 (32 bytes)
+
+The authoritative implementation lives in Rust core (``core/src/signing.rs``);
+this module serializes credentials to JSON and asks the native extension for
+the bytes, so Python never produces its own variant.
 """
 
 from __future__ import annotations
 
 import json
-import struct
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .credentials import ConsumerEnrollmentCredential, EnrollmentCredential
 
 
-def _canonical_json(attributes: dict[str, str]) -> bytes:
-    """Encode attributes as canonical JSON: UTF-8, sorted keys, no extra whitespace.
+def canonical_json_value_bytes(obj: Any) -> bytes:
+    """Canonical JSON for arbitrary JSON values: UTF-8, sorted keys, compact.
 
-    NOTE: The authoritative implementation is in Rust core (core/src/signing.rs).
-    This Python copy exists only as a private helper for sign_credential/verify_signature.
+    Byte-identical to ``serde_json::to_string`` over a ``serde_json::Value``
+    (sorted map keys, no whitespace, non-ASCII emitted as raw UTF-8 rather
+    than ``\\uXXXX`` escapes) and to ``JSON.stringify`` over key-sorted
+    objects in the TypeScript binding. Use this for any signed JSON payload
+    that is not an enrollment-credential attribute map (those go through
+    the Rust core via :func:`_canonical_json`).
     """
-    return json.dumps(attributes, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _canonical_json(attributes: dict[str, str]) -> bytes:
+    """Canonical JSON for a credential attribute map, computed by Rust core
+    (``core/src/signing.rs::canonical_json``)."""
+    from aster._aster import contract as _native
+
+    return bytes(_native.canonical_json(json.dumps(attributes)))
+
+
+def _credential_json(cred: "EnrollmentCredential | ConsumerEnrollmentCredential") -> str:
+    """Serialize a credential into the JSON shape the Rust core's
+    ``CredentialData`` (``core/src/signing.rs``) deserializes."""
+    from .credentials import ConsumerEnrollmentCredential, EnrollmentCredential
+
+    if isinstance(cred, EnrollmentCredential):
+        data: dict[str, Any] = {
+            "kind": "producer",
+            "endpoint_id": cred.endpoint_id,
+            "root_pubkey": bytes(cred.root_pubkey).hex(),
+            "expires_at": cred.expires_at,
+            "attributes": cred.attributes,
+        }
+    elif isinstance(cred, ConsumerEnrollmentCredential):
+        data = {
+            "kind": "consumer",
+            "credential_type": cred.credential_type,
+            "root_pubkey": bytes(cred.root_pubkey).hex(),
+            "expires_at": cred.expires_at,
+            "attributes": cred.attributes,
+            "endpoint_id": cred.endpoint_id,
+            "nonce": bytes(cred.nonce).hex() if cred.nonce is not None else None,
+        }
+    else:
+        raise TypeError(f"Unsupported credential type: {type(cred)}")
+    return json.dumps(data)
 
 
 def _canonical_signing_bytes(cred: "EnrollmentCredential | ConsumerEnrollmentCredential") -> bytes:
     """Produce the canonical byte sequence that is signed/verified.
 
-    NOTE: The authoritative implementation is in Rust core (core/src/signing.rs).
-    This Python copy exists only as a private helper for sign_credential/verify_signature.
+    Computed by Rust core (``canonical_signing_bytes_from_json``) so every
+    binding signs exactly the same bytes. Raises ``ValueError`` on malformed
+    credentials (wrong pubkey/nonce length, unknown credential_type,
+    non-string attribute values) and ``TypeError`` on unsupported types.
     """
-    from .credentials import EnrollmentCredential, ConsumerEnrollmentCredential
+    from aster._aster import contract as _native
 
-    if isinstance(cred, EnrollmentCredential):
-        return _producer_signing_bytes(cred)
-    elif isinstance(cred, ConsumerEnrollmentCredential):
-        return _consumer_signing_bytes(cred)
-    else:
-        raise TypeError(f"Unsupported credential type: {type(cred)}")
-
-
-def _producer_signing_bytes(cred: "EnrollmentCredential") -> bytes:
-    parts = [
-        cred.endpoint_id.encode("utf-8"),
-        cred.root_pubkey,
-        struct.pack(">Q", cred.expires_at),
-        _canonical_json(cred.attributes),
-    ]
-    return b"".join(parts)
-
-
-def _consumer_signing_bytes(cred: "ConsumerEnrollmentCredential") -> bytes:
-    # type_code: 0 = policy, 1 = ott
-    type_code = b"\x01" if cred.credential_type == "ott" else b"\x00"
-
-    # optional endpoint_id
-    if cred.endpoint_id is not None:
-        eid_bytes = cred.endpoint_id.encode("utf-8")
-        eid_part = b"\x01" + eid_bytes
-    else:
-        eid_part = b"\x00"
-
-    # optional nonce
-    if cred.nonce is not None:
-        nonce_part = b"\x01" + cred.nonce
-    else:
-        nonce_part = b"\x00"
-
-    parts = [
-        type_code,
-        eid_part,
-        cred.root_pubkey,
-        struct.pack(">Q", cred.expires_at),
-        _canonical_json(cred.attributes),
-        nonce_part,
-    ]
-    return b"".join(parts)
+    return bytes(_native.canonical_signing_bytes_from_json(_credential_json(cred)))
 
 
 # ── ed25519 helpers ───────────────────────────────────────────────────────────
@@ -142,5 +146,8 @@ def verify_signature(
     from aster._aster import ed25519_verify
 
     pubkey_bytes = root_pubkey_raw if root_pubkey_raw is not None else cred.root_pubkey
-    msg = _canonical_signing_bytes(cred)
+    try:
+        msg = _canonical_signing_bytes(cred)
+    except (ValueError, TypeError):
+        return False
     return ed25519_verify(pubkey_bytes, msg, cred.signature)

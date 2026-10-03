@@ -303,3 +303,16 @@ async def test_admission_then_rpc_manual_flow():
             await client.close()
         finally:
             await ep.close()
+
+
+def test_producer_mesh_admission_rejected():
+    """Producer mesh admission was removed; allow_all_producers=False must
+    fail loudly instead of silently running without a producer gate."""
+    _, pub_raw = generate_root_keypair()
+    with pytest.raises(NotImplementedError, match="allow_all_producers"):
+        AsterServer(
+            services=[Gate0PingService()],
+            config=AsterConfig(),
+            root_pubkey=pub_raw,
+            allow_all_producers=False,
+        )

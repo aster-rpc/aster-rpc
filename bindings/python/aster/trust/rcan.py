@@ -4,8 +4,8 @@ aster.trust.rcan -- rcan capability evaluation and grant serialization.
 Provides:
 - ``evaluate_capability``: runtime check of a caller's roles against a
   ``CapabilityRequirement`` (ROLE, ANY_OF, ALL_OF).
-- Opaque encode/decode/validate helpers for rcan grant bytes (stub until
-  upstream spec pins down the serialization format, §14.12).
+- ``validate_rcan``: stub that rejects every grant (fail closed) until the
+  upstream spec pins down the serialization format, §14.12.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ def _extract_caller_roles(caller_attributes: dict[str, str]) -> set[str]:
     Set by:
     - ``aster enroll node --capabilities ops.status,ops.logs``
     - ``aster trust sign --attr aster.role=ops.status,ops.logs``
-    - Delegated admission tokens (``token.roles`` joined with ``,``)
 
     Returns a set of stripped, non-empty role strings.
     """
@@ -83,9 +82,10 @@ def evaluate_capability(
 def validate_rcan(rcan_bytes: bytes) -> tuple[bool, str | None]:
     """Validate an rcan grant.
 
-    Phase 12: all non-empty grants are accepted (opaque).  Empty bytes -> invalid.
+    The rcan wire format is not yet specified (§14.12), so no grant can be
+    verified. This **fails closed**: every input is rejected. Callers must
+    not treat an rcan grant as authorization until real validation lands.
     """
     if not rcan_bytes:
         return False, "rcan grant must not be empty"
-    # TODO: implement full rcan validation once upstream format is specified (§14.12)
-    return True, None
+    return False, "rcan validation is not implemented; grant rejected (fail closed)"

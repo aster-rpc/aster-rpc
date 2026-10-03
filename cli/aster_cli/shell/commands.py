@@ -157,10 +157,6 @@ class LsCommand(ShellCommand):
                 entries.append(c.metadata)
             ctx.display.doc_entry_table(entries)
 
-        elif node.kind == NodeKind.GOSSIP:
-            ctx.display.info("Gossip topics -- use 'tail' to listen to the producer mesh")
-            ctx.display.print("  [cyan]mesh[/cyan]    [dim]producer mesh topic (derived from root key + salt)[/dim]")
-
         elif node.kind == NodeKind.ASTER:
             handles = []
             for c in node.sorted_children():
@@ -1224,74 +1220,7 @@ class SessionCommand(ShellCommand):
                 and c.name.lower().startswith(partial.lower())]
 
 
-# ── Gossip + docs live commands ───────────────────────────────────────────────
-
-
-@register
-class TailCommand(ShellCommand):
-    name = "tail"
-    description = "Live-stream gossip messages (Ctrl-C to stop)"
-    contexts = ["/gossip"]
-
-    async def execute(self, args: list[str], ctx: CommandContext) -> None:
-
-
-
-        ctx.display.info("Subscribing to producer mesh gossip topic…")
-
-        try:
-            topic = await ctx.connection.subscribe_gossip()
-        except Exception as e:
-            ctx.display.error(f"failed to subscribe: {e}")
-            return
-
-        ctx.display.success("Subscribed -- listening for messages (Ctrl-C to stop)")
-        ctx.display.print()
-
-        try:
-            while True:
-                try:
-                    event_type, data = await asyncio.wait_for(topic.recv(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-
-                ts = time.strftime("%H:%M:%S")
-
-                if event_type == "received":
-                    # Try to decode as JSON (Aster producer messages are JSON)
-                    if data:
-                        try:
-                            text = bytes(data).decode("utf-8")
-                            parsed = json.loads(text)
-                            ctx.display.print(f"[dim]{ts}[/dim] [green]msg[/green] ", end="")
-                            ctx.display.json_value(parsed)
-                        except (UnicodeDecodeError, json.JSONDecodeError):
-                            ctx.display.print(
-                                f"[dim]{ts}[/dim] [green]msg[/green] "
-                                f"[dim]({len(data)} bytes)[/dim] {bytes(data).hex()[:40]}…"
-                            )
-                    else:
-                        ctx.display.print(f"[dim]{ts}[/dim] [green]msg[/green] [dim](empty)[/dim]")
-
-                elif event_type == "neighbor_up":
-                    peer_id = bytes(data).hex()[:16] if data else "?"
-                    ctx.display.print(f"[dim]{ts}[/dim] [cyan]+ neighbor[/cyan] {peer_id}…")
-
-                elif event_type == "neighbor_down":
-                    peer_id = bytes(data).hex()[:16] if data else "?"
-                    ctx.display.print(f"[dim]{ts}[/dim] [yellow]- neighbor[/yellow] {peer_id}…")
-
-                elif event_type == "lagged":
-                    ctx.display.print(f"[dim]{ts}[/dim] [yellow]lagged[/yellow] (missed messages)")
-
-                else:
-                    ctx.display.print(f"[dim]{ts}[/dim] [dim]{event_type}[/dim]")
-
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            ctx.display.print()
-            ctx.display.info("Stopped listening")
-        except Exception as e:
-            ctx.display.error(f"gossip error: {e}")
+# ── Docs live commands ───────────────────────────────────────────────
 
 
 @register
@@ -1610,7 +1539,6 @@ def _kind_detail(node: VfsNode) -> str:
         NodeKind.BLOBS: "content-addressed storage",
         NodeKind.SERVICES: "RPC services",
         NodeKind.DOCS: "registry documents",
-        NodeKind.GOSSIP: "pub/sub topics",
         NodeKind.ASTER: "service directory",
     }
     return details.get(node.kind, "")

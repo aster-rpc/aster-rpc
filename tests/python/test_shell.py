@@ -88,7 +88,7 @@ class TestVfs:
         assert root.path == "/"
         assert "blobs" in root.children
         assert "services" in root.children
-        assert "gossip" in root.children
+        assert "docs" in root.children
 
     def test_resolve_absolute(self, root):
         node, path = resolve_path(root, "/", "/blobs")

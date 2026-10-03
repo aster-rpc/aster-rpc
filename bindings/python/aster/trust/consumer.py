@@ -83,7 +83,6 @@ class ConsumerAdmissionResponse:
     services: list["ServiceSummary"] = field(default_factory=list)
     registry_namespace: str = ""   # 64-char hex namespace_id
     root_pubkey: str = ""        # hex-encoded 32-byte ed25519 public key
-    gossip_topic: str = ""       # hex-encoded 32-byte topic -- only for root node
     reason: str = ""             # MUST be empty in wire response (§3.2.2)
 
     def to_json(self) -> str:
@@ -100,8 +99,6 @@ class ConsumerAdmissionResponse:
             "root_pubkey": self.root_pubkey,
             "reason": "",   # never leak reason on wire
         }
-        if self.gossip_topic:
-            d["gossip_topic"] = self.gossip_topic
         return json.dumps(d, separators=(",", ":"))
 
     @classmethod
@@ -128,7 +125,6 @@ class ConsumerAdmissionResponse:
             services=services,
             registry_namespace=d.get("registry_namespace") or d.get("registry_ticket") or "",
             root_pubkey=d.get("root_pubkey") or "",
-            gossip_topic=d.get("gossip_topic") or "",
             reason="",
         )
 
@@ -193,7 +189,6 @@ async def handle_consumer_admission_rpc(
     services: "list[ServiceSummary] | None" = None,
     registry_namespace: str = "",
     allow_unenrolled: bool = False,
-    gossip_topic_id: bytes | None = None,
 ) -> ConsumerAdmissionResponse:
     """Server-side handler for the ``aster.consumer_admission`` ALPN.
 
@@ -230,28 +225,18 @@ async def handle_consumer_admission_rpc(
     from aster.health import get_admission_metrics
     _adm = get_admission_metrics()
 
-    # Include gossip topic only when the connecting peer IS the root node
-    # (its endpoint_id == root_pubkey hex). This lets the operator's shell
-    # observe the producer mesh without exposing the topic to other consumers.
-    _topic_for_peer = ""
-    if gossip_topic_id and peer_node_id == root_pubkey.hex():
-        _topic_for_peer = gossip_topic_id.hex()
-        logger.debug("consumer admission: root node detected -- including gossip topic")
-
     # Dev mode / open gate: empty credential → auto-admit.
     if not req.credential_json and allow_unenrolled:
         if hook is not None:
             hook.add_peer(peer_node_id)
         _adm.record_consumer_admit()
-        _role = "root" if _topic_for_peer else "open gate"
-        logger.info("consumer admission: auto-admitted %s (%s)", peer_node_id, _role)
+        logger.info("consumer admission: auto-admitted %s (open gate)", peer_node_id)
         return ConsumerAdmissionResponse(
             admitted=True,
             attributes={},
             services=list(services or []),
             registry_namespace=registry_namespace,
             root_pubkey=root_pubkey.hex(),
-            gossip_topic=_topic_for_peer,
         )
 
     try:
@@ -294,7 +279,6 @@ async def handle_consumer_admission_rpc(
         services=list(services or []),
         registry_namespace=registry_namespace,
         root_pubkey=root_pubkey.hex(),
-        gossip_topic=_topic_for_peer,
     )
     resp._credential_expires_at = cred.expires_at
     return resp
@@ -311,7 +295,6 @@ async def handle_consumer_admission_connection(
     services_getter: "Callable[[], list[ServiceSummary]] | None" = None,
     registry_namespace_getter: "Callable[[], str] | None" = None,
     allow_unenrolled: bool = False,
-    gossip_topic_getter: "Callable[[], bytes | None] | None" = None,
     peer_store: "Any | None" = None,
 ) -> None:
     """Handle one consumer admission connection: read request, write response."""
@@ -325,7 +308,6 @@ async def handle_consumer_admission_connection(
 
         services = services_getter() if services_getter is not None else []
         namespace = registry_namespace_getter() if registry_namespace_getter is not None else ""
-        topic = gossip_topic_getter() if gossip_topic_getter is not None else None
 
         response = await handle_consumer_admission_rpc(
             raw.decode(),
@@ -336,7 +318,6 @@ async def handle_consumer_admission_connection(
             nonce_store=nonce_store,
             services=services,
             registry_namespace=namespace,
-            gossip_topic_id=topic,
         )
 
         # Store admission attributes for the RPC dispatch path

@@ -7,7 +7,7 @@ isolation) is covered at the Rust level by
 
 This file covers the Python-facing surface:
 
-- Low-level FFI: `authorize_tunnel_tcp`, `authorize_tunnel_many`, and
+- Low-level FFI: `authorize_tunnel` and
   client-side ticket validation on `IrohConnection`.
 - High-level handler API: the `TunnelHandle` attached to `CallContext`
   (target type dispatch + unsupported-variant errors).
@@ -180,3 +180,49 @@ class _NeverCalledConn:
         raise AssertionError(
             "TunnelHandle should reject this case before reaching the FFI"
         )
+
+
+# ── Dispatcher wiring: ctx.tunnel attached for real connections ──────────────
+
+
+class _TunnelCapableConn:
+    """Mimics the subset of `IrohConnection` the dispatcher probes."""
+
+    def remote_id(self) -> str:
+        return "peer-x"
+
+    def authorize_tunnel(self, targets, ttl_secs):
+        return b"\x00" * 32
+
+
+class _PlainConn:
+    def remote_id(self) -> str:
+        return "peer-y"
+
+
+def _build_ctx(conn):
+    from types import SimpleNamespace
+
+    from aster.protocol import StreamHeader
+    from aster.server import ConnectionContext, Server
+    from aster.service import MethodInfo
+
+    fake_server = SimpleNamespace(_peer_store=None)
+    header = StreamHeader(service="Svc", method="M")
+    method_info = MethodInfo(name="M", pattern="unary")
+    conn_ctx = ConnectionContext(connection=conn, server=fake_server)  # type: ignore[arg-type]
+    return Server._build_call_context(fake_server, header, method_info, conn_ctx)  # type: ignore[arg-type]
+
+
+def test_call_context_attaches_tunnel_handle_for_iroh_connection():
+    """Regression: dispatcher used to probe `authorize_tunnel_many`
+    (which the native connection doesn't expose), so `ctx.tunnel` was
+    always None."""
+    call_ctx = _build_ctx(_TunnelCapableConn())
+    assert isinstance(call_ctx.tunnel, TunnelHandle)
+    assert call_ctx.tunnel.authorize(Tcp("127.0.0.1", 5900)) == b"\x00" * 32
+
+
+def test_call_context_tunnel_none_for_stub_connection():
+    call_ctx = _build_ctx(_PlainConn())
+    assert call_ctx.tunnel is None

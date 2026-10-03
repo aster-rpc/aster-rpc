@@ -357,9 +357,7 @@ class AsterConfig:
     **Trust model (Aster-trust-spec.md §1.1):** The root *private* key is
     offline -- it never touches a running node. Nodes receive only the root
     *public* key (to verify credentials) and optionally an enrollment
-    credential (a pre-signed token for mesh join). The founding node of a
-    mesh needs no enrollment credential; it bootstraps the accepted-producer
-    set with just its own EndpointId.
+    credential (a pre-signed token presented during admission).
 
     Three ways to get an ``AsterConfig``:
 
@@ -388,8 +386,7 @@ class AsterConfig:
 
     enrollment_credential_file: str | None = None
     """Path to a JSON enrollment credential (pre-signed by the offline root
-    key).  Required when a node joins an existing producer mesh.  Not needed
-    for the founding node or for dev/ephemeral mode."""
+    key) presented during admission.  Not needed for dev/ephemeral mode."""
 
     allow_all_consumers: bool = False
     """Skip consumer admission gate. Default: gate consumers."""
@@ -403,7 +400,9 @@ class AsterConfig:
     """Skip consumer admission gate. Default: gate consumers."""
 
     allow_all_producers: bool = True
-    """Skip producer admission gate. Default: allow all producers."""
+    """Kept for config-schema parity with the Rust ``AsterConfig``. Producer
+    mesh admission is not supported by the Python binding, so only ``True``
+    is accepted; ``AsterServer`` raises ``NotImplementedError`` on ``False``."""
 
     # ── Connect (consumer-side) ──────────────────────────────────────────
 

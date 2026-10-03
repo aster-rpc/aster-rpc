@@ -7,7 +7,7 @@ The VFS presents a peer's resources as a navigable tree::
     ├── blobs/       → list and inspect content-addressed blobs
     ├── services/    → list services, inspect contracts, invoke methods
     │   └── <Name>/ → methods of a specific service
-    └── gossip/      → (future) gossip topics
+    └── docs/        → registry documents
 
 Nodes are lazily populated from the live connection.
 """
@@ -27,8 +27,6 @@ class NodeKind(Enum):
     SERVICES = "services"
     SERVICE = "service"
     METHOD = "method"
-    GOSSIP = "gossip"
-    TOPIC = "topic"
     COLLECTION = "collection"  # HashSeq collection (browsable like a dir)
     DOCS = "docs"
     DOC = "doc"
@@ -82,7 +80,6 @@ def build_root() -> VfsNode:
     root.add_child(VfsNode(name="blobs", kind=NodeKind.BLOBS, path="/blobs"))
     root.add_child(VfsNode(name="services", kind=NodeKind.SERVICES, path="/services"))
     root.add_child(VfsNode(name="docs", kind=NodeKind.DOCS, path="/docs"))
-    root.add_child(VfsNode(name="gossip", kind=NodeKind.GOSSIP, path="/gossip"))
 
     root.loaded = True
     return root

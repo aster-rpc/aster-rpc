@@ -65,10 +65,6 @@ from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
 from .rpc_types import RpcScope, SerializationMode
 from .server import Server
-from .trust.bootstrap import (
-    handle_producer_admission_connection,
-    make_ephemeral_mesh_state,
-)
 from .trust.consumer import (
     ConsumerAdmissionRequest,
     ConsumerAdmissionResponse,
@@ -78,10 +74,8 @@ from .trust.consumer import (
 from .trust.credentials import ConsumerEnrollmentCredential
 from .trust.hooks import (
     ALPN_CONSUMER_ADMISSION,
-    ALPN_PRODUCER_ADMISSION,
     MeshEndpointHook,
 )
-from .trust.mesh import ClockDriftConfig, MeshState
 from .trust.nonces import InMemoryNonceStore
 from .trust.signing import sign_credential
 
@@ -154,8 +148,8 @@ class AsterServer:
     (iroh built-in protocols) alongside aster RPC (``aster/1``) and any
     enabled admission ALPNs -- all on **one endpoint, one node ID**.
 
-    When any admission gate is active (``allow_all_consumers=False`` or
-    ``allow_all_producers=False``), the node is built with
+    When consumer admission is active (``allow_all_consumers=False``),
+    the node is built with
     ``enable_hooks=True`` and a background task runs the Gate 0
     connection-level hook loop (``MeshEndpointHook.run_hook_loop``), which
     gates *all* protocols (blobs, docs, gossip, aster/1, admission) at the
@@ -181,9 +175,6 @@ class AsterServer:
         hook: MeshEndpointHook | None = None,
         nonce_store: Any | None = None,
         registry_namespace: str = "",
-        mesh_state: MeshState | None = None,
-        clock_drift_config: ClockDriftConfig | None = None,
-        persist_mesh_state: bool = False,
         max_sessions_per_connection: int | None = None,
     ) -> None:
         """Create an Aster RPC server.
@@ -210,7 +201,9 @@ class AsterServer:
                 Overrides ``config.root_pubkey`` if both are set.
             allow_all_consumers: If ``True``, skip consumer admission
                 (open gate). Overrides ``config.allow_all_consumers``.
-            allow_all_producers: If ``True``, skip producer admission.
+            allow_all_producers: Must be ``True`` (the default). Producer
+                mesh admission (``aster.producer_admission``) is not
+                supported; ``False`` raises ``NotImplementedError``.
                 Overrides ``config.allow_all_producers``.
             endpoint_config: Low-level iroh endpoint configuration.
 
@@ -246,6 +239,13 @@ class AsterServer:
             allow_all_producers if allow_all_producers is not None
             else config.allow_all_producers
         )
+        if not self._allow_all_producers:
+            raise NotImplementedError(
+                "allow_all_producers=False is not supported: producer mesh "
+                "admission (aster.producer_admission) has been removed from "
+                "the Python binding. Leave allow_all_producers at its default "
+                "(True)."
+            )
 
         # Load identity file if present (.aster-identity).
         self._peer_name = peer
@@ -279,10 +279,10 @@ class AsterServer:
                 "Set ASTER_ROOT_PUBKEY_FILE for production admission."
             )
 
-        if (not self._allow_all_consumers or not self._allow_all_producers) and self._root_pubkey is None:
+        if not self._allow_all_consumers and self._root_pubkey is None:
             raise ValueError(
                 "root_pubkey is required when admission is enabled "
-                "(allow_all_consumers=False or allow_all_producers=False). "
+                "(allow_all_consumers=False). "
                 "Set ASTER_ROOT_PUBKEY_FILE or pass root_pubkey= explicitly."
             )
 
@@ -302,9 +302,6 @@ class AsterServer:
         from aster.peer_store import PeerAttributeStore
         self._peer_store = PeerAttributeStore()
         self._registry_namespace = registry_namespace
-        self._mesh_state = mesh_state
-        self._clock_drift_config = clock_drift_config
-        self._persist_mesh_state = persist_mesh_state
         self._max_sessions_per_connection = max_sessions_per_connection
 
         # Populated by start()
@@ -326,10 +323,10 @@ class AsterServer:
         self._producer_tokens: dict[str, dict] = {}  # service_name -> token dict
         self._load_producer_tokens()
 
-        # Delegation policies for aster.admission ALPN.
-        # Built from published_services entries that have aster_root_pubkey.
-        self._delegation_policies: dict[str, Any] = {}  # service_name -> policy
-        self._load_delegation_policies()
+        # Delegated admission (aster.admission ALPN, @aster-issued tokens)
+        # is not served by the Python binding. Warn if the identity file
+        # asks for it so the gap is visible rather than silently ignored.
+        self._warn_if_delegation_configured()
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -357,11 +354,6 @@ class AsterServer:
             if self._nonce_store is None:
                 self._nonce_store = InMemoryNonceStore()
             gate0_needed = True
-        if not self._allow_all_producers:
-            aster_alpns.append(ALPN_PRODUCER_ADMISSION)
-            if self._hook is None:
-                self._hook = MeshEndpointHook(peer_store=self._peer_store)
-            gate0_needed = True
 
         # Build EndpointConfig so hooks (Gate 0) are installed when needed.
         ep_cfg = _build_node_endpoint_config(
@@ -372,11 +364,6 @@ class AsterServer:
         addr_b64 = base64.b64encode(
             self._node.node_addr_info().to_bytes()
         ).decode()
-
-        # Auto-create ephemeral MeshState. Even when allow_all_producers=True
-        # we need the topic_id so the root node's shell can observe gossip.
-        if self._mesh_state is None and self._root_pubkey is not None:
-            self._mesh_state = make_ephemeral_mesh_state(self._root_pubkey)
 
         # Build ServiceSummary list with per-spec contract_id.
         summaries: list[ServiceSummary] = []
@@ -790,15 +777,6 @@ class AsterServer:
             asyncio.create_task(self._accept_loop(), name="aster-accept")
         )
 
-        # Delegated admission loop: accept connections on aster.admission
-        # ALPN for @aster-issued enrollment tokens.
-        if self._delegation_policies:
-            subtasks.append(
-                asyncio.create_task(
-                    self._delegated_admission_loop(), name="aster-delegated-admission"
-                )
-            )
-
         # Auto-register endpoints with @aster for published services.
         # Requires producer service tokens (from `aster publish`).
         if self._producer_tokens:
@@ -864,25 +842,8 @@ class AsterServer:
                             registry_namespace_getter=lambda: self._registry_namespace,
                             allow_unenrolled=self._allow_all_consumers,
                             peer_store=self._peer_store,
-                            gossip_topic_getter=lambda: (
-                                self._mesh_state.topic_id
-                                if self._mesh_state else None
-                            ),
                         ),
                         name="aster-consumer-admission-conn",
-                    )
-                elif alpn == ALPN_PRODUCER_ADMISSION and not self._allow_all_producers:
-                    assert self._root_pubkey is not None
-                    assert self._mesh_state is not None
-                    asyncio.create_task(
-                        handle_producer_admission_connection(
-                            conn,
-                            own_root_pubkey=self._root_pubkey,
-                            own_state=self._mesh_state,
-                            config=self._clock_drift_config,
-                            persist_state=self._persist_mesh_state,
-                        ),
-                        name="aster-producer-admission-conn",
                     )
                 else:
                     try:
@@ -986,71 +947,38 @@ class AsterServer:
                 self._producer_tokens[svc_name] = token_data
                 logger.debug("Loaded producer token for %s", svc_name)
 
-    def _load_delegation_policies(self) -> None:
-        """Build DelegatedAdmissionPolicy for each published service with aster_root_pubkey."""
-        from aster.trust.delegated import DelegatedAdmissionPolicy
+    def _warn_if_delegation_configured(self) -> None:
+        """Warn when published services carry an @aster delegation anchor.
 
+        Delegated admission (``aster.admission`` ALPN, Aster-trust-spec §3a)
+        is NOT implemented in the Python binding: the ALPN is not registered
+        and no handler runs, so consumers holding @aster enrollment tokens
+        cannot be admitted by a Python producer. Use consumer credentials
+        (``aster.consumer_admission``) instead. Tracked by
+        BINDINGS_CATCHUP_PLAN.md P5 (credential admission moves into Rust).
+        """
         _, peer_entry = self._config.load_identity(
             peer_name=self._peer_name, role="producer"
         )
         if not peer_entry:
             return
-
         published = peer_entry.get("published_services", {})
         if not isinstance(published, dict):
             return
-
-        # Match published services to the services we're hosting
-        for svc_name, pub_data in published.items():
-            if not isinstance(pub_data, dict):
-                continue
-            aster_root_pubkey = pub_data.get("aster_root_pubkey", "")
-            contract_id = pub_data.get("contract_id", "")
-            handle = pub_data.get("handle", peer_entry.get("handle", ""))
-            if aster_root_pubkey and contract_id:
-                self._delegation_policies[svc_name] = DelegatedAdmissionPolicy(
-                    target_handle=handle,
-                    target_service=svc_name,
-                    target_contract_id=contract_id,
-                    aster_root_pubkey=aster_root_pubkey,
-                )
-                logger.debug("Delegation policy loaded for %s", svc_name)
-
-    async def _delegated_admission_loop(self) -> None:
-        """Accept connections on aster.admission ALPN and verify delegated tokens."""
-        from aster.trust.delegated import handle_delegated_admission_connection
-
-        assert self._node is not None
-        ALPN_DELEGATED = b"aster.admission"
-
-        try:
-            while not self._closed:
-                try:
-                    conn = await self._node.accept_aster(ALPN_DELEGATED)
-                except asyncio.CancelledError:
-                    return
-                except Exception as exc:
-                    logger.debug("delegated admission accept error: %s", exc)
-                    continue
-
-                # Determine which policy applies based on connection metadata
-                # For now, use the first available policy (single-service producer)
-                # or match by peer request content
-                policy = next(iter(self._delegation_policies.values()), None)
-                if policy is None:
-                    logger.warning("delegated admission: no policy configured")
-                    continue
-
-                asyncio.create_task(
-                    handle_delegated_admission_connection(
-                        conn,
-                        policy=policy,
-                        hook=self._hook,
-                        peer_store=self._peer_store,
-                    )
-                )
-        except asyncio.CancelledError:
-            pass
+        delegated = sorted(
+            name
+            for name, pub in published.items()
+            if isinstance(pub, dict)
+            and pub.get("aster_root_pubkey")
+            and pub.get("contract_id")
+        )
+        if delegated:
+            logger.warning(
+                "Delegated admission (aster.admission) is not supported by the "
+                "Python binding; @aster enrollment tokens for %s will not be "
+                "accepted. Consumers must use consumer-admission credentials.",
+                ", ".join(delegated),
+            )
 
     async def _aster_registration_loop(self) -> None:
         """Background loop: register endpoints with @aster for published services.
@@ -1293,19 +1221,13 @@ class AsterServer:
 
     @property
     def _admission_addr_b64(self) -> str | None:
-        if self._allow_all_consumers and self._allow_all_producers:
+        if self._allow_all_consumers:
             return None
         return self.endpoint_addr_b64
 
     @property
     def _consumer_admission_addr_b64(self) -> str | None:
         if self._allow_all_consumers:
-            return None
-        return self.endpoint_addr_b64
-
-    @property
-    def _producer_admission_addr_b64(self) -> str | None:
-        if self._allow_all_producers:
             return None
         return self.endpoint_addr_b64
 
@@ -1519,7 +1441,6 @@ class AsterClient:
         self._ep: Any | None = None
         self._services: list[ServiceSummary] = []
         self._registry_namespace: str = ""
-        self._gossip_topic: str = ""
         self._open_gate: bool = False
         self._rpc_conns: dict[str, Any] = {}
         # Serialises concurrent `_rpc_conn_for` lookups so bursts of
@@ -1691,12 +1612,10 @@ class AsterClient:
 
         self._services = list(resp.services)
         self._registry_namespace = resp.registry_namespace or ""
-        self._gossip_topic = resp.gossip_topic or ""
         logger.info(
-            "Admitted -- services: %s, registry_namespace: %s, gossip_topic: %s",
+            "Admitted -- services: %s, registry_namespace: %s",
             [s.name for s in self._services],
             bool(self._registry_namespace),
-            bool(self._gossip_topic),
         )
 
     async def _rpc_conn_for(self, rpc_addr_b64: str) -> Any:
@@ -2348,15 +2267,6 @@ class AsterClient:
             f"Service '{service_name}' not found. "
             f"Available: {available}"
         )
-
-    @property
-    def gossip_topic(self) -> str:
-        """Hex-encoded 32-byte gossip topic ID for the producer mesh.
-
-        Only populated when the connecting consumer is the root node
-        (endpoint_id == root_pubkey). Empty string otherwise.
-        """
-        return self._gossip_topic
 
 
 class ClientSession:

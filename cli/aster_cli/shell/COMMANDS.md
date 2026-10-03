@@ -212,8 +212,7 @@ passing it to `GuideManager`.
 ├── services/           → RPC services
 │   └── <ServiceName>/  → single service
 │       └── <method>    → method (leaf, invocable)
-└── gossip/             → pub/sub topics (future)
-    └── <topic>         → topic (future)
+└── docs/               → registry documents
 ```
 
 ## Streaming Patterns
