@@ -27,7 +27,8 @@ use aster_transport_core::framing::{
     FLAG_TRAILER,
 };
 use aster_transport_core::reactor::{
-    self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame, ResponseSender,
+    self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame, ResponseReserveError,
+    ResponseSender,
 };
 use aster_transport_core::CoreNode;
 
@@ -324,8 +325,22 @@ impl Server {
             while let Some(ev) = event_rx.recv().await {
                 match ev {
                     ReactorEvent::Call(call) => {
-                        let dispatcher = dispatcher.clone();
-                        tokio::spawn(async move { dispatcher.dispatch_call(call).await });
+                        // Route inline: decoding, lookup, session resolution
+                        // and Gate 3 are synchronous, so a refused call costs
+                        // no task. Only calls that reach a handler (or an
+                        // authenticator) are spawned. Routing here also orders
+                        // every session lookup before the connection's
+                        // `ConnectionClosed`, which this same loop handles.
+                        let parts = CallParts::from_incoming(call);
+                        match dispatcher.route(&parts) {
+                            Route::Reject(status) => reject_now(parts.response_sender, &status),
+                            route => {
+                                let dispatcher = dispatcher.clone();
+                                tokio::spawn(
+                                    async move { dispatcher.complete(route, parts).await },
+                                );
+                            }
+                        }
                     }
                     // §7.5: a connection's sessions die with it.
                     ReactorEvent::ConnectionClosed { connection_id, .. } => {
@@ -422,16 +437,242 @@ impl Dispatcher {
     /// parts itself (peer id, header + request payloads, a response-frame
     /// channel) and calls this. Same gating and handler invocation as
     /// [`dispatch_call`](Dispatcher::dispatch_call).
+    ///
+    /// Equivalent to [`route`](Dispatcher::route) followed by
+    /// [`complete`](Dispatcher::complete); resolves when the handler returns.
     pub async fn dispatch_parts(&self, parts: CallParts) {
-        handle_call(
-            self.services.clone(),
-            self.session_factories.clone(),
-            self.sessions.clone(),
-            self.attributes.clone(),
-            self.authenticator.clone(),
-            parts,
-        )
-        .await;
+        let route = self.route(&parts);
+        self.complete(route, parts).await;
+    }
+
+    /// Decide, synchronously, what happens to a call: decode the header, look
+    /// up the service, check `iroh_only`, the method and the serialization
+    /// mode, resolve the session (§7.5), then run Gate 3. Nothing here awaits
+    /// and no handler runs; pass the result to [`complete`](Dispatcher::complete).
+    ///
+    /// Checks run in that order and the first failure wins (see
+    /// `conformance/scenarios/error-mapping.yaml`). With an [`Authenticator`]
+    /// configured, Gate 3 (and the lookup of an HTTP-scoped session, which is
+    /// keyed by the authenticated principal) moves to `complete`, and the
+    /// result is [`Route::Authenticate`].
+    pub fn route(&self, parts: &CallParts) -> Route {
+        let header = match decode_stream_header(&parts.header_payload) {
+            Ok(h) => h,
+            // Aster-SPEC §6.5 and the Python server: a header that does not
+            // decode is the caller's error, not ours.
+            Err(_) => {
+                return Route::Reject(RpcStatus::error(
+                    StatusCode::InvalidArgument,
+                    "malformed stream header",
+                ))
+            }
+        };
+        if header.service.is_empty() {
+            return Route::Reject(RpcStatus::error(
+                StatusCode::InvalidArgument,
+                "missing service name",
+            ));
+        }
+
+        let key = (header.service.clone(), header.version);
+        let (meta, factory) = if let Some(s) = self.services.get(&key) {
+            (s.clone(), None)
+        } else if let (Some(probe), Some(f)) = (
+            self.session_probes.get(&key),
+            self.session_factories.get(&key),
+        ) {
+            // Session-scoped: gate on the metadata probe; the instance is
+            // resolved below, after the cheap checks.
+            (probe.clone(), Some(f.clone()))
+        } else {
+            return Route::Reject(not_found(&header));
+        };
+
+        // Provenance BEFORE method routing and before any handler runs. A
+        // service that declares `iroh_only` must never see a call whose peer id
+        // the transport could not vouch for, and it must not have to remember
+        // to check. `NotFound` rather than `PermissionDenied`: over an
+        // unauthenticated transport the service's existence is itself not
+        // something to confirm.
+        if meta.iroh_only() && !parts.provenance.is_authenticated() {
+            return Route::Reject(not_found(&header));
+        }
+
+        let methods = meta.methods();
+        if !methods.is_empty() && !methods.iter().any(|m| *m == header.method) {
+            return Route::Reject(RpcStatus::error(
+                StatusCode::Unimplemented,
+                format!(
+                    "method '{}.{}' not implemented",
+                    header.service, header.method
+                ),
+            ));
+        }
+
+        // Rust speaks XLANG on the wire only (JSON is intentionally unsupported).
+        if header.serialization_mode != SerializationMode::Xlang.as_i8() {
+            return Route::Reject(RpcStatus::error(
+                StatusCode::InvalidArgument,
+                format!(
+                    "unsupported serialization mode: {}",
+                    header.serialization_mode
+                ),
+            ));
+        }
+
+        let target = match factory {
+            // SHARED service: one instance for everyone, and no session id.
+            None => match check_shared(&header.service, header.session_id) {
+                Ok(()) => Target::Ready(meta.clone()),
+                Err(e) => return Route::Reject(e.status()),
+            },
+            Some(factory) => match parts.connection_id {
+                // §7.5: keyed by (connection, session id), never by the id
+                // alone. Resolved here, before any authenticator, so that this
+                // runs in the serve loop ahead of the connection's
+                // `ConnectionClosed` and can never resurrect a reaped entry.
+                Some(conn) if header.session_id != 0 => {
+                    match self
+                        .sessions
+                        .resolve_connection(conn, &key, header.session_id, &factory)
+                    {
+                        Ok(inst) => Target::Ready(inst),
+                        Err(e) => return Route::Reject(e.status()),
+                    }
+                }
+                Some(_) => return Route::Reject(missing_session(&header.service).status()),
+                // No connection (HTTP): string id, scoped to the caller's
+                // principal, which an authenticator may still change.
+                None => match http_session_id(&header) {
+                    None => return Route::Reject(missing_session(&header.service).status()),
+                    Some(sid) if self.authenticator.is_some() => {
+                        Target::HttpSession { factory, sid }
+                    }
+                    Some(sid) => Target::Ready(self.sessions.resolve_http(
+                        &parts.peer_id,
+                        &key,
+                        &sid,
+                        &factory,
+                    )),
+                },
+            },
+        };
+
+        let routed = Routed {
+            header,
+            key,
+            meta,
+            target,
+            attributes: HashMap::new(),
+        };
+        if self.authenticator.is_some() {
+            return Route::Authenticate(routed);
+        }
+        let attributes = self.attributes.get(&parts.peer_id);
+        if let Err(status) = gate3(&*routed.meta, &routed.header, &attributes) {
+            return Route::Reject(status);
+        }
+        Route::Dispatch(Routed {
+            attributes,
+            ..routed
+        })
+    }
+
+    /// Finish a call routed by [`route`](Dispatcher::route): send the refusal
+    /// trailer, or run the authenticator and Gate 3 if still pending, then
+    /// inflate the first request frame and run the handler. Resolves when the
+    /// handler returns.
+    pub async fn complete(&self, route: Route, mut parts: CallParts) {
+        let routed = match route {
+            Route::Reject(status) => {
+                emit_rpc_status(&parts.response_sender, &status).await;
+                return;
+            }
+            Route::Dispatch(routed) => routed,
+            Route::Authenticate(routed) => match self.authenticate(routed, &mut parts).await {
+                Ok(routed) => routed,
+                Err(status) => {
+                    emit_rpc_status(&parts.response_sender, &status).await;
+                    return;
+                }
+            },
+        };
+        let Routed {
+            header,
+            target,
+            attributes,
+            ..
+        } = routed;
+        let svc = match target {
+            Target::Ready(svc) => svc,
+            // `authenticate` resolves every HTTP session before returning.
+            Target::HttpSession { .. } => unreachable!("HTTP session left unresolved"),
+        };
+
+        // §5.6: inflate a compressed first request frame once, after the gates
+        // (an unauthorised caller costs no decompression), so handlers see the
+        // logical payload. Later client-stream / bidi frames are inflated as
+        // they are read.
+        if parts.request_flags & FLAG_COMPRESSED != 0 {
+            match decompress(&parts.request_payload) {
+                Ok(p) => {
+                    parts.request_payload = p;
+                    parts.request_flags &= !FLAG_COMPRESSED;
+                }
+                Err(e) => {
+                    emit_trailer(
+                        &parts.response_sender,
+                        StatusCode::InvalidArgument,
+                        &format!("request payload: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        let method = header.method.clone();
+        svc.dispatch(&method, Call::new(parts, header, attributes))
+            .await;
+    }
+
+    /// The async half of routing when an [`Authenticator`] is configured: run
+    /// it, merge its attributes (enrollment wins on key collision), apply its
+    /// principal, run Gate 3, and resolve an HTTP-scoped session under the
+    /// resulting principal.
+    async fn authenticate(
+        &self,
+        mut routed: Routed,
+        parts: &mut CallParts,
+    ) -> std::result::Result<Routed, RpcStatus> {
+        let mut attrs = self.attributes.get(&parts.peer_id);
+        if let Some(auth) = self.authenticator.as_ref() {
+            let ctx = AuthContext {
+                peer_id: parts.peer_id.clone(),
+                service: routed.header.service.clone(),
+                method: routed.header.method.clone(),
+                session_id: routed.header.session_id,
+                metadata: metadata_map(&routed.header),
+            };
+            let outcome = auth.authenticate(&ctx).await?;
+            if let Some(principal) = outcome.principal {
+                parts.peer_id = principal;
+            }
+            for (k, v) in outcome.attributes {
+                attrs.entry(k).or_insert(v);
+            }
+        }
+        gate3(&*routed.meta, &routed.header, &attrs)?;
+        if let Target::HttpSession { factory, sid } = &routed.target {
+            routed.target = Target::Ready(self.sessions.resolve_http(
+                &parts.peer_id,
+                &routed.key,
+                sid,
+                factory,
+            ));
+        }
+        routed.attributes = attrs;
+        Ok(routed)
     }
 
     /// The Gate-3 [`AttributeStore`] this dispatcher checks. A transport's auth
@@ -619,192 +860,113 @@ impl ServerHandle {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_call(
-    services: Arc<Registry>,
-    session_factories: Arc<SessionFactories>,
-    sessions: Arc<SessionStore>,
-    attributes: AttributeStore,
-    authenticator: Option<Arc<dyn Authenticator>>,
-    mut call: CallParts,
-) {
-    // Pre-dispatch gating, mirroring `bindings/python/aster/server.py`:
-    // missing service → INVALID_ARGUMENT, unknown (service, version) → NOT_FOUND,
-    // unknown method → UNIMPLEMENTED, unsupported serialization mode →
-    // INVALID_ARGUMENT, capability denied → PERMISSION_DENIED (Aster-SPEC §6.5).
-    let header = match decode_stream_header(&call.header_payload) {
-        Ok(h) => h,
-        Err(_) => {
-            emit_trailer(
-                &call.response_sender,
-                StatusCode::Internal,
-                "malformed stream header",
-            )
-            .await;
-            return;
-        }
-    };
+/// The outcome of [`Dispatcher::route`].
+pub enum Route {
+    /// Every gate passed: run the handler ([`Dispatcher::complete`]).
+    Dispatch(Routed),
+    /// The synchronous gates passed, but the configured [`Authenticator`]
+    /// must run before Gate 3; [`Dispatcher::complete`] does both.
+    Authenticate(Routed),
+    /// Refused before any handler: send this status as a trailer-only
+    /// response.
+    Reject(RpcStatus),
+}
 
-    if header.service.is_empty() {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::InvalidArgument,
-            "missing service name",
-        )
-        .await;
-        return;
-    }
-
-    let key = (header.service.clone(), header.version);
-    let resolved = if let Some(s) = services.get(&key) {
-        // SHARED service: one instance for everyone, and no session id.
-        check_shared(&header.service, header.session_id).map(|()| s.clone())
-    } else if let Some(factory) = session_factories.get(&key) {
-        // SESSION-scoped service: an instance per session.
-        match call.connection_id {
-            // §7.5: keyed by (connection, session id), never by the id alone.
-            Some(conn) if header.session_id != 0 => {
-                sessions.resolve_connection(conn, &key, header.session_id, factory)
-            }
-            Some(_) => Err(missing_session(&header.service)),
-            // No connection (HTTP): string id, scoped to the caller.
-            None => match http_session_id(&header) {
-                Some(sid) => Ok(sessions.resolve_http(&call.peer_id, &key, &sid, factory)),
-                None => Err(missing_session(&header.service)),
-            },
-        }
-    } else {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::NotFound,
-            &format!("service '{}' v{} not found", header.service, header.version),
-        )
-        .await;
-        return;
-    };
-    let svc = match resolved {
-        Ok(svc) => svc,
-        Err(e) => {
-            emit_rpc_status(&call.response_sender, &e.status()).await;
-            return;
-        }
-    };
-
-    // Provenance BEFORE method routing and before any handler runs. A service
-    // that declares `iroh_only` must never see a call whose peer id the
-    // transport could not vouch for, and it must not have to remember to check.
-    // `NotFound` rather than `PermissionDenied`: over an unauthenticated
-    // transport the service's existence is itself not something to confirm.
-    if svc.iroh_only() && !call.provenance.is_authenticated() {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::NotFound,
-            &format!("service '{}' v{} not found", header.service, header.version),
-        )
-        .await;
-        return;
-    }
-
-    let methods = svc.methods();
-    if !methods.is_empty() && !methods.iter().any(|m| *m == header.method) {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::Unimplemented,
-            &format!(
-                "method '{}.{}' not implemented",
-                header.service, header.method
-            ),
-        )
-        .await;
-        return;
-    }
-
-    // Rust speaks XLANG on the wire only (JSON is intentionally unsupported).
-    if header.serialization_mode != SerializationMode::Xlang.as_i8() {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::InvalidArgument,
-            &format!(
-                "unsupported serialization mode: {}",
-                header.serialization_mode
-            ),
-        )
-        .await;
-        return;
-    }
-
-    // Enrollment-derived attributes for this peer (from the application's store).
-    let mut attrs = attributes.get(&call.peer_id);
-
-    // Pre-dispatch auth hook: may reject, override the principal, and contribute
-    // attributes — merged additively, **enrollment wins on key collision**.
-    if let Some(auth) = authenticator.as_ref() {
-        let ctx = AuthContext {
-            peer_id: call.peer_id.clone(),
-            service: header.service.clone(),
-            method: header.method.clone(),
-            session_id: header.session_id,
-            metadata: metadata_map(&header),
-        };
-        match auth.authenticate(&ctx).await {
-            Ok(outcome) => {
-                if let Some(principal) = outcome.principal {
-                    call.peer_id = principal;
-                }
-                for (k, v) in outcome.attributes {
-                    attrs.entry(k).or_insert(v);
-                }
-            }
-            Err(status) => {
-                emit_rpc_status(&call.response_sender, &status).await;
-                return;
-            }
+impl Route {
+    /// The refusal status, if the call was rejected.
+    pub fn rejection(&self) -> Option<&RpcStatus> {
+        match self {
+            Route::Reject(s) => Some(s),
+            _ => None,
         }
     }
+}
 
-    // Gate 3: per-call capability check against the resolved attributes.
-    // Service-level requirement first, then method-level — both must pass.
-    for req in [svc.service_requires(), svc.method_requires(&header.method)]
-        .into_iter()
-        .flatten()
+/// A call that passed routing: its decoded header and resolved target.
+/// Opaque; hand it back to [`Dispatcher::complete`].
+pub struct Routed {
+    header: StreamHeader,
+    key: ServiceKey,
+    /// The registered instance (SHARED) or metadata probe (SESSION) the gates
+    /// consult.
+    meta: Arc<dyn ServiceDispatch>,
+    target: Target,
+    attributes: HashMap<String, String>,
+}
+
+impl Routed {
+    /// The decoded request header.
+    pub fn header(&self) -> &StreamHeader {
+        &self.header
+    }
+}
+
+enum Target {
+    /// The instance that will handle the call.
+    Ready(Arc<dyn ServiceDispatch>),
+    /// An HTTP-scoped session whose instance depends on the principal the
+    /// authenticator resolves.
+    HttpSession {
+        factory: SessionFactory,
+        sid: String,
+    },
+}
+
+fn not_found(header: &StreamHeader) -> RpcStatus {
+    RpcStatus::error(
+        StatusCode::NotFound,
+        format!("service '{}' v{} not found", header.service, header.version),
+    )
+}
+
+/// Gate 3: the service-level requirement, then the method-level one; both must
+/// pass against the caller's resolved attributes.
+fn gate3(
+    meta: &dyn ServiceDispatch,
+    header: &StreamHeader,
+    attrs: &HashMap<String, String>,
+) -> std::result::Result<(), RpcStatus> {
+    for req in [
+        meta.service_requires(),
+        meta.method_requires(&header.method),
+    ]
+    .into_iter()
+    .flatten()
     {
-        if !evaluate_capability(&req, &attrs) {
-            emit_trailer(
-                &call.response_sender,
+        if !evaluate_capability(&req, attrs) {
+            return Err(RpcStatus::error(
                 StatusCode::PermissionDenied,
-                &format!(
+                format!(
                     "capability check failed for '{}.{}'",
                     header.service, header.method
                 ),
-            )
-            .await;
-            return;
+            ));
         }
     }
+    Ok(())
+}
 
-    // §5.6: inflate a compressed first request frame once, after the gates (an
-    // unauthorised caller costs no decompression), so handlers see the logical
-    // payload. Later client-stream / bidi frames are inflated as they are read.
-    if call.request_flags & FLAG_COMPRESSED != 0 {
-        match decompress(&call.request_payload) {
-            Ok(p) => {
-                call.request_payload = p;
-                call.request_flags &= !FLAG_COMPRESSED;
-            }
-            Err(e) => {
-                emit_trailer(
-                    &call.response_sender,
-                    StatusCode::InvalidArgument,
-                    &format!("request payload: {e}"),
-                )
-                .await;
-                return;
-            }
+/// Send a refusal trailer without spawning when the response queue has room
+/// (it always does for a fresh call); fall back to a task only if it is full.
+fn reject_now(sender: ResponseSender, status: &RpcStatus) {
+    let Ok(bytes) = encode_rpc_status(status) else {
+        return;
+    };
+    let Ok(frame) = encode_frame(&bytes, FLAG_TRAILER) else {
+        return;
+    };
+    let frame = OutgoingFrame::Trailer(frame);
+    match sender.try_reserve(frame.encoded_len()) {
+        Ok(permit) => {
+            let _ = permit.send(frame);
         }
+        Err(ResponseReserveError::Full) => {
+            tokio::spawn(async move {
+                let _ = sender.send(frame).await;
+            });
+        }
+        Err(_) => {}
     }
-
-    let method = header.method.clone();
-    svc.dispatch(&method, Call::new(call, header, attrs)).await;
 }
 
 /// Send a trailer-only error response (no data frame) before a [`Call`] exists.
