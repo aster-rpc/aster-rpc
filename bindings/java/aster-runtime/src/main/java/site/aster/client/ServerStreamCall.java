@@ -4,8 +4,8 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.Codec;
-import site.aster.codec.ForyCodec;
 import site.aster.ffi.AsterCall;
+import site.aster.ffi.AsterEnvelope;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
 import site.aster.server.AsterFraming;
@@ -39,7 +39,6 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
 
   private final AsterCall call;
   private final Codec codec;
-  private final ForyCodec headerCodec;
   private final Class<Resp> responseType;
   private final BlockingQueue<Object> responses = new LinkedBlockingQueue<>();
   private final Thread readerThread;
@@ -51,10 +50,9 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
    * Package-private constructor. The caller MUST have already written the StreamHeader and the
    * single request frame (with {@link AsterFraming#FLAG_END_STREAM}) on {@code call}.
    */
-  ServerStreamCall(AsterCall call, Codec codec, ForyCodec headerCodec, Class<Resp> responseType) {
+  ServerStreamCall(AsterCall call, Codec codec, Class<Resp> responseType) {
     this.call = call;
     this.codec = codec;
-    this.headerCodec = headerCodec;
     this.responseType = responseType;
     this.readerThread = Thread.ofVirtual().name("aster-server-stream-reader").start(this::readLoop);
   }
@@ -130,7 +128,7 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
           RpcStatus status =
               ok.payload().length == 0
                   ? RpcStatus.ok()
-                  : (RpcStatus) headerCodec.decode(ok.payload(), RpcStatus.class);
+                  : AsterEnvelope.decodeRpcStatus(ok.payload());
           if (status.code() != RpcStatus.OK) {
             trailerError =
                 new RpcError(
@@ -145,7 +143,8 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
         if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
           continue;
         }
-        Object decoded = codec.decode(ok.payload(), responseType);
+        Object decoded =
+            codec.decode(AsterFraming.payloadOf(ok.payload(), ok.flags()), responseType);
         responses.offer(decoded);
       }
     } catch (Throwable t) {

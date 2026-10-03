@@ -21,6 +21,7 @@ use anyhow::Result;
 use aster_transport_core::*;
 
 pub mod call;
+pub mod envelope;
 mod layout;
 pub mod probe;
 pub mod reactor;
@@ -38,8 +39,12 @@ pub mod reactor;
 //   `aster_runtime_new` takes `expected_abi_major` and refuses a mismatch
 //   with `ASTER_STATUS_ABI_MISMATCH`; reactor event-kind constants renamed
 //   `ASTER_REACTOR_EVENT_*`; every enum is exported to the header.
+// - 3.1.0 (additive): AEv1 RPC envelope codec (`aster_{stream_header,
+//   call_header,rpc_status}_{encode,decode,release}` + their structs) and
+//   zstd payload compression (`aster_zstd_maybe_compress`,
+//   `aster_zstd_decompress`); see `envelope.rs`.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 3;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 0;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 1;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -1152,7 +1157,9 @@ pub unsafe extern "C" fn aster_buffer_release(runtime: aster_runtime_t, buffer: 
 /// out-struct: `aster_remote_info_t.node_id` / `.relay_url` (from
 /// `aster_endpoint_remote_info` and each entry of
 /// `aster_endpoint_remote_info_list`), `aster_connection_info_t.alpn`, and
-/// `aster_transport_snapshot_t.peer_host` / `.relay_url`.
+/// `aster_transport_snapshot_t.peer_host` / `.relay_url`, and the `out`
+/// buffer of `aster_{stream_header,call_header,rpc_status}_encode`,
+/// `aster_zstd_maybe_compress` and `aster_zstd_decompress`.
 ///
 /// Pass back exactly the `ptr` and `len` the library returned. Non-empty
 /// buffers are additionally NUL-terminated (the terminator is not counted in

@@ -140,6 +140,41 @@ OFF(aster_reactor_call_t, request_buffer, 88);
 OFF(aster_reactor_call_t, peer_buffer, 96);
 OFF(aster_reactor_call_t, connection_handle, 104);
 
+/* ABI 3.1: AEv1 envelope structs. */
+LAYOUT(aster_stream_header_t, 96);
+OFF(aster_stream_header_t, struct_size, 0);
+OFF(aster_stream_header_t, version, 4);
+OFF(aster_stream_header_t, call_id, 8);
+OFF(aster_stream_header_t, session_id, 12);
+OFF(aster_stream_header_t, deadline, 16);
+OFF(aster_stream_header_t, serialization_mode, 18);
+OFF(aster_stream_header_t, reserved0, 19);
+OFF(aster_stream_header_t, reserved1, 20);
+OFF(aster_stream_header_t, service, 24);
+OFF(aster_stream_header_t, method, 40);
+OFF(aster_stream_header_t, metadata_keys, 56);
+OFF(aster_stream_header_t, metadata_values, 72);
+OFF(aster_stream_header_t, storage, 88);
+
+LAYOUT(aster_call_header_t, 72);
+OFF(aster_call_header_t, struct_size, 0);
+OFF(aster_call_header_t, call_id, 4);
+OFF(aster_call_header_t, deadline, 8);
+OFF(aster_call_header_t, reserved0, 10);
+OFF(aster_call_header_t, reserved1, 12);
+OFF(aster_call_header_t, method, 16);
+OFF(aster_call_header_t, metadata_keys, 32);
+OFF(aster_call_header_t, metadata_values, 48);
+OFF(aster_call_header_t, storage, 64);
+
+LAYOUT(aster_rpc_status_t, 64);
+OFF(aster_rpc_status_t, struct_size, 0);
+OFF(aster_rpc_status_t, code, 4);
+OFF(aster_rpc_status_t, message, 8);
+OFF(aster_rpc_status_t, detail_keys, 24);
+OFF(aster_rpc_status_t, detail_values, 40);
+OFF(aster_rpc_status_t, storage, 56);
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -162,6 +197,7 @@ static void test_abi_version(void) {
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
     CHECK(ASTER_ABI_VERSION_MAJOR == 3);
+    CHECK(ASTER_ABI_VERSION_MINOR >= 1); /* envelope + zstd */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
 
@@ -230,10 +266,63 @@ static void test_runtime(void) {
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_NOT_FOUND);
 }
 
+static void test_envelope(void) {
+    printf("[envelope]\n");
+    /* Encode the envelope.json vector "RpcStatus: NOT_FOUND with details". */
+    static const uint8_t want[] = {0xa3, 0x01, 0x0a, 0x26, 'n', 'o', 't', ' ', 'f', 'o', 'u',
+                                   'n', 'd', 0x01, 0x0c, 0x22, 'r', 'e', 's', 'o', 'u', 'r',
+                                   'c', 'e', 0x01, 0x0c, 0x1a, 't', 'a', 's', 'k', '/', '9'};
+    aster_bytes_t key = {(const uint8_t *)"resource", 8};
+    aster_bytes_t val = {(const uint8_t *)"task/9", 6};
+    aster_rpc_status_t st = {
+        .struct_size = sizeof(aster_rpc_status_t),
+        .code = 5,
+        .message = {(const uint8_t *)"not found", 9},
+        .detail_keys = {&key, 1},
+        .detail_values = {&val, 1},
+    };
+    aster_bytes_t out = {0};
+    CHECK(aster_rpc_status_encode(&st, &out) == ASTER_STATUS_OK);
+    CHECK(out.len == sizeof want && memcmp(out.ptr, want, sizeof want) == 0);
+    CHECK(out.ptr[0] == ASTER_ENVELOPE_TAG_RPC_STATUS && out.ptr[1] == ASTER_ENVELOPE_VERSION);
+    CHECK(aster_string_release(out.ptr, out.len) == ASTER_STATUS_OK);
+
+    aster_rpc_status_t d;
+    memset(&d, 0, sizeof d);
+    CHECK(aster_rpc_status_decode(want, sizeof want, &d) == ASTER_STATUS_OK);
+    CHECK(d.struct_size == sizeof(aster_rpc_status_t));
+    CHECK(d.code == 5 && d.storage != NULL);
+    CHECK(d.message.len == 9 && memcmp(d.message.ptr, "not found", 9) == 0);
+    CHECK(d.detail_keys.len == 1 && d.detail_values.len == 1);
+    CHECK(d.detail_values.items[0].len == 6 && memcmp(d.detail_values.items[0].ptr, "task/9", 6) == 0);
+    CHECK(aster_rpc_status_release(&d) == ASTER_STATUS_OK);
+    CHECK(d.storage == NULL && d.message.ptr == NULL);
+
+    /* Wrong tag: StreamHeader decoder refuses RpcStatus bytes. */
+    aster_stream_header_t h;
+    CHECK(aster_stream_header_decode(want, sizeof want, &h) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(h.storage == NULL);
+
+    /* zstd: at-threshold payload is not compressed; larger one round-trips. */
+    static uint8_t buf[ASTER_COMPRESSION_THRESHOLD * 2];
+    memset(buf, 'a', sizeof buf);
+    aster_bytes_t c = {0};
+    CHECK(aster_zstd_maybe_compress(buf, ASTER_COMPRESSION_THRESHOLD, ASTER_COMPRESSION_THRESHOLD, &c) == ASTER_STATUS_OK);
+    CHECK(c.ptr == NULL && c.len == 0);
+    CHECK(aster_zstd_maybe_compress(buf, sizeof buf, ASTER_COMPRESSION_THRESHOLD, &c) == ASTER_STATUS_OK);
+    CHECK(c.ptr != NULL && c.len < sizeof buf);
+    aster_bytes_t back = {0};
+    CHECK(aster_zstd_decompress(c.ptr, c.len, &back) == ASTER_STATUS_OK);
+    CHECK(back.len == sizeof buf && memcmp(back.ptr, buf, sizeof buf) == 0);
+    CHECK(aster_string_release(back.ptr, back.len) == ASTER_STATUS_OK);
+    CHECK(aster_string_release(c.ptr, c.len) == ASTER_STATUS_OK);
+}
+
 int main(void) {
     test_abi_version();
     test_enum_values();
     test_runtime();
+    test_envelope();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;

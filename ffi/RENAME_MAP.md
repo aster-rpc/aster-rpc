@@ -20,6 +20,30 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
 
+## New in 3.1 (additive)
+
+ABI 3.1.0 adds the AEv1 RPC envelope codec (Aster-SPEC §6.9) and zstd payload
+compression (§5.6) from `aster_transport_core`, so FFI bindings stop encoding
+the envelope with their own Fory. Nothing in 3.0 changed; a 3.0 binding keeps
+working against a 3.1 library. Source: `ffi/src/envelope.rs`; vectors checked
+by `ffi/tests/envelope_vectors.rs`.
+
+| Kind | Name | Notes |
+|---|---|---|
+| struct | `aster_stream_header_t` (96 B) | `struct_size, version, call_id, session_id, deadline:i16, serialization_mode:i8, reserved0:u8, reserved1:u32, service, method, metadata_keys, metadata_values, storage` |
+| struct | `aster_call_header_t` (72 B) | `struct_size, call_id, deadline:i16, reserved0:u16, reserved1:u32, method, metadata_keys, metadata_values, storage` |
+| struct | `aster_rpc_status_t` (64 B) | `struct_size, code, message, detail_keys, detail_values, storage` |
+| function | `aster_{stream_header,call_header,rpc_status}_encode(const T*, aster_bytes_t* out)` | caller sets `struct_size`; `out` freed with `aster_string_release` |
+| function | `aster_{stream_header,call_header,rpc_status}_decode(const uint8_t*, size_t, T* out)` | library writes `struct_size` and `storage`; strings/lists point into `storage`; empty = `{NULL,0}`; not NUL-terminated |
+| function | `aster_{stream_header,call_header,rpc_status}_release(T*)` | frees `storage`, zeroes pointers; no-op when `storage == NULL` |
+| function | `aster_zstd_maybe_compress(data, len, threshold, aster_bytes_t* out)` | `out == {NULL,0}` means send uncompressed |
+| function | `aster_zstd_decompress(data, len, aster_bytes_t* out)` | 16 MiB cap; corrupt / over-limit -> `ASTER_STATUS_INVALID_ARGUMENT` |
+| macro | `ASTER_COMPRESSION_THRESHOLD` (4096), `ASTER_MAX_DECOMPRESSED_SIZE` (16 MiB), `ASTER_ENVELOPE_TAG_{STREAM_HEADER,CALL_HEADER,RPC_STATUS}` (0xA1..0xA3), `ASTER_ENVELOPE_VERSION` (1) | |
+
+Errors: malformed / non-canonical input, wrong `struct_size`, non-UTF-8
+strings and key/value length mismatches all return
+`ASTER_STATUS_INVALID_ARGUMENT` with `aster_last_error_message` set.
+
 ## New in 3.0
 
 | Kind | Name | Notes |

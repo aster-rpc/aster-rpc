@@ -12,6 +12,7 @@
 
 use core::mem::{align_of, offset_of, size_of};
 
+use crate::envelope::{aster_call_header_t, aster_rpc_status_t, aster_stream_header_t};
 use crate::reactor::aster_reactor_call_t;
 use crate::*;
 
@@ -171,5 +172,43 @@ mod lp64 {
         request_buffer = 88,
         peer_buffer = 96,
         connection_handle = 104,
+    });
+
+    // ABI 3.1: AEv1 envelope structs (envelope.rs).
+    assert_layout!(aster_stream_header_t, size = 96, align = 8, {
+        struct_size = 0,
+        version = 4,
+        call_id = 8,
+        session_id = 12,
+        deadline = 16,
+        serialization_mode = 18,
+        reserved0 = 19,
+        reserved1 = 20,
+        service = 24,
+        method = 40,
+        metadata_keys = 56,
+        metadata_values = 72,
+        storage = 88,
+    });
+
+    assert_layout!(aster_call_header_t, size = 72, align = 8, {
+        struct_size = 0,
+        call_id = 4,
+        deadline = 8,
+        reserved0 = 10,
+        reserved1 = 12,
+        method = 16,
+        metadata_keys = 32,
+        metadata_values = 48,
+        storage = 64,
+    });
+
+    assert_layout!(aster_rpc_status_t, size = 64, align = 8, {
+        struct_size = 0,
+        code = 4,
+        message = 8,
+        detail_keys = 24,
+        detail_values = 40,
+        storage = 56,
     });
 }

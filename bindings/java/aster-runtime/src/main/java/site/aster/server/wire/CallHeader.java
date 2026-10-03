@@ -2,32 +2,24 @@ package site.aster.server.wire;
 
 import java.util.List;
 import java.util.Objects;
-import org.apache.fory.annotation.ForyField;
 
 /**
  * Per-call header within a session stream (CALL flag). Used for session-scoped services where
  * multiple RPCs share a single QUIC stream.
  *
- * <p>Matches the Python reference type {@code _aster/CallHeader} defined in {@code
- * bindings/python/aster/protocol.py}. Plain class (not a record) for the same Fory-collection
- * reason called out on {@link StreamHeader}. Every field carries an explicit {@code ForyField#id}
- * for the same cross-binding hash-stability reason as {@link StreamHeader} / {@link RpcStatus}.
+ * <p>Encoded in the AEv1 envelope format (Aster-SPEC §6.9) via {@link
+ * site.aster.ffi.AsterEnvelope}, not by Fory.
  */
 public final class CallHeader {
 
-  @ForyField(id = 0)
   public String method = "";
 
-  @ForyField(id = 1)
   public int callId;
 
-  @ForyField(id = 2)
   public short deadline;
 
-  @ForyField(id = 3)
   public List<String> metadataKeys = List.of();
 
-  @ForyField(id = 4)
   public List<String> metadataValues = List.of();
 
   public CallHeader() {}

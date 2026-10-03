@@ -7,8 +7,8 @@ import java.util.Map;
  *
  * <p>The producer owns the contract: consumers must use the field names defined by the producer's
  * manifest. Sending an extra key — at any nesting depth — is a contract violation, not a tolerable
- * mismatch. {@link JsonCodec}-style strict decoders raise this before the handler runs, so the
- * error surfaces as a {@link StatusCode#CONTRACT_VIOLATION} trailer on the wire.
+ * mismatch. Strict decoders raise this before the handler runs, so the error surfaces as a {@link
+ * StatusCode#CONTRACT_VIOLATION} trailer on the wire.
  *
  * <p>Carries the offending field names in {@code details} under {@code unexpected_fields}
  * (comma-separated), the dotted violation path under {@code location}, and the expected dataclass

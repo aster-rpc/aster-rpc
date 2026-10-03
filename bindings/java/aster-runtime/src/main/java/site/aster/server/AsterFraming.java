@@ -42,4 +42,33 @@ public final class AsterFraming {
     System.arraycopy(payload, 0, frame, 5, payload.length);
     return frame;
   }
+
+  /**
+   * Encode a <em>data</em> frame (request / response payload), zstd-compressing the payload and
+   * setting {@link #FLAG_COMPRESSED} when it is larger than {@link
+   * site.aster.ffi.AsterEnvelope#COMPRESSION_THRESHOLD} and compression makes it smaller
+   * (Aster-SPEC §5.6). Envelope frames (HEADER / CALL / TRAILER) must use {@link #encodeFrame}.
+   */
+  public static byte[] encodePayloadFrame(byte[] payload, byte flags) {
+    byte[] compressed =
+        site.aster.ffi.AsterEnvelope.maybeCompress(
+            payload, site.aster.ffi.AsterEnvelope.COMPRESSION_THRESHOLD);
+    if (compressed != null) {
+      return encodeFrame(compressed, (byte) (flags | FLAG_COMPRESSED));
+    }
+    return encodeFrame(payload, (byte) (flags & ~FLAG_COMPRESSED));
+  }
+
+  /**
+   * The logical payload of a received data frame: decompressed when {@code flags} carries {@link
+   * #FLAG_COMPRESSED} (16 MiB limit), otherwise {@code payload} itself.
+   *
+   * @throws IllegalArgumentException for corrupt or over-limit compressed data
+   */
+  public static byte[] payloadOf(byte[] payload, byte flags) {
+    if ((flags & FLAG_COMPRESSED) != 0 && payload != null) {
+      return site.aster.ffi.AsterEnvelope.decompress(payload);
+    }
+    return payload;
+  }
 }

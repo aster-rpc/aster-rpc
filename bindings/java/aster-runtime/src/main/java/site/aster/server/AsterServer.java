@@ -20,8 +20,8 @@ import java.util.function.Function;
 import site.aster.annotations.Scope;
 import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
-import site.aster.codec.JsonCodec;
 import site.aster.config.AsterConfig;
+import site.aster.ffi.AsterEnvelope;
 import site.aster.ffi.IrohException;
 import site.aster.ffi.Reactor;
 import site.aster.interceptors.CallContext;
@@ -39,7 +39,6 @@ import site.aster.server.spi.ServerStreamDispatcher;
 import site.aster.server.spi.ServiceDescriptor;
 import site.aster.server.spi.ServiceDispatcher;
 import site.aster.server.spi.UnaryDispatcher;
-import site.aster.server.wire.CallHeader;
 import site.aster.server.wire.RpcStatus;
 import site.aster.server.wire.StreamHeader;
 
@@ -69,32 +68,13 @@ public final class AsterServer implements AutoCloseable {
    */
   static final int DEFAULT_MAX_SESSIONS_PER_CONNECTION = 1024;
 
-  /** Serialization-mode wire value for JSON (spec §5). Matches StreamHeader.serializationMode. */
-  private static final int SERIALIZATION_MODE_JSON = 3;
-
   private final IrohNode node;
   private final Reactor reactor;
   private final Codec codec;
-  private final ForyCodec foryHeaderCodec;
 
-  /**
-   * JSON codec for framework wire types ({@link StreamHeader}, {@link RpcStatus}, …). These are
-   * already camelCase in every binding (Python spells them verbatim in JSON), so the default
-   * Jackson mapper — no naming strategy — is what matches on the wire.
-   */
-  private final JsonCodec jsonFrameworkCodec = new JsonCodec();
-
-  /**
-   * JSON codec for USER request / response types. Cross-binding convention has Python spell user
-   * fields in snake_case ({@code agent_id}) while Java / Kotlin types name them in camelCase
-   * ({@code agentId}); this codec configures Jackson's {@code SNAKE_CASE} naming strategy so both
-   * sides converge — same convergence Fory's name-based fingerprint buys for XLANG mode. Used when
-   * the StreamHeader advertised {@code serializationMode == 3} (JSON).
-   */
-  private final JsonCodec jsonUserCodec = JsonCodec.forUserTypes();
-
+  /** AEv1 encoding of {@code RpcStatus.ok()}, computed once (it never changes). */
   private volatile byte[] okTrailerBytesCache;
-  private volatile byte[] okTrailerBytesCacheJson;
+
   private final Map<String, RegisteredService> services;
   private final SessionRegistry sessionRegistry;
   private final List<Interceptor> interceptors;
@@ -140,7 +120,6 @@ public final class AsterServer implements AutoCloseable {
     this.node = node;
     this.reactor = reactor;
     this.codec = b.codec != null ? b.codec : new ForyCodec();
-    this.foryHeaderCodec = registerFrameworkWireTypes(this.codec);
     this.services = Map.copyOf(b.services);
     this.sessionRegistry = b.sessionRegistry;
     this.interceptors = List.copyOf(b.interceptors);
@@ -259,11 +238,8 @@ public final class AsterServer implements AutoCloseable {
       }
       summary.contractId = cid == null ? "" : cid;
       summary.pattern = rs.descriptor.scope() == Scope.SHARED ? "shared" : "session";
-      // Both Fory XLANG and JSON are decoded server-side — the inbound StreamHeader's first byte
-      // (and its `serializationMode` field) pick the per-call codec. Advertising both lets
-      // JSON-only clients (TS JsonProxy, Python json/dict proxies) find us without a separate
-      // endpoint or a codec negotiation handshake.
-      summary.serializationModes = List.of("xlang", "json");
+      // Payloads are Fory XLANG only; JSON (mode 3) is retired (Aster-SPEC §5.1).
+      summary.serializationModes = List.of("xlang");
       summary.channels.put("rpc", rpcAddr);
       out.add(summary);
     }
@@ -506,21 +482,27 @@ public final class AsterServer implements AutoCloseable {
 
   // ───── Dispatch ──────────────────────────────────────────────────────────
 
-  private void dispatchCall(AsterCall call) {
-    long callId = call.callId();
+  private void dispatchCall(AsterCall inbound) {
+    long callId = inbound.callId();
     long probeT2 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
-    int serializationMode = 0;
     try {
-      StreamHeader header = decodeStreamHeader(call.header());
-      serializationMode = header.serializationMode();
+      StreamHeader header = decodeStreamHeader(inbound.header());
+      if (header.serializationMode() != StreamHeader.SERIALIZATION_XLANG) {
+        // JSON (3) is retired and NATIVE / ROW are reserved (Aster-SPEC §5.1).
+        submitErrorTrailer(
+            callId,
+            StatusCode.INVALID_ARGUMENT,
+            "unsupported serialization mode: " + header.serializationMode());
+        return;
+      }
+      // Decompress the inline first request frame once, so handlers and interceptors see the
+      // logical payload (Aster-SPEC §5.6).
+      AsterCall call = withLogicalRequest(inbound);
       long probeT3 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
       RegisteredService svc = services.get(header.service());
       if (svc == null) {
         submitErrorTrailer(
-            callId,
-            StatusCode.UNIMPLEMENTED,
-            "unknown service: " + header.service(),
-            serializationMode);
+            callId, StatusCode.UNIMPLEMENTED, "unknown service: " + header.service());
         return;
       }
       MethodDispatcher method = svc.dispatcher.methods().get(header.method());
@@ -528,23 +510,20 @@ public final class AsterServer implements AutoCloseable {
         submitErrorTrailer(
             callId,
             StatusCode.UNIMPLEMENTED,
-            "unknown method: " + header.service() + "/" + header.method(),
-            serializationMode);
+            "unknown method: " + header.service() + "/" + header.method());
         return;
       }
       Object instance;
       try {
         instance = resolveInstance(svc, call, header);
       } catch (SessionNotFoundException e) {
-        submitErrorTrailer(callId, StatusCode.NOT_FOUND, e.getMessage(), serializationMode);
+        submitErrorTrailer(callId, StatusCode.NOT_FOUND, e.getMessage());
         return;
       } catch (SessionLimitException e) {
-        submitErrorTrailer(
-            callId, StatusCode.RESOURCE_EXHAUSTED, e.getMessage(), serializationMode);
+        submitErrorTrailer(callId, StatusCode.RESOURCE_EXHAUSTED, e.getMessage());
         return;
       } catch (SessionScopeMismatchException e) {
-        submitErrorTrailer(
-            callId, StatusCode.FAILED_PRECONDITION, e.getMessage(), serializationMode);
+        submitErrorTrailer(callId, StatusCode.FAILED_PRECONDITION, e.getMessage());
         return;
       }
       CallContext ctx = buildCallContext(header, method, call);
@@ -558,14 +537,11 @@ public final class AsterServer implements AutoCloseable {
         try {
           site.aster.interceptors.InterceptorChain.applyRequest(interceptors, ctx, call.request());
         } catch (RpcError e) {
-          submitErrorTrailer(callId, e.code(), e.rpcMessage(), serializationMode);
+          submitErrorTrailer(callId, e.code(), e.rpcMessage());
           return;
         } catch (Exception e) {
           submitErrorTrailer(
-              callId,
-              StatusCode.INTERNAL,
-              e.getMessage() == null ? "error" : e.getMessage(),
-              serializationMode);
+              callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
           return;
         }
       }
@@ -574,28 +550,22 @@ public final class AsterServer implements AutoCloseable {
       // executor so their blocking Reactor.recvFrame calls don't pin a virtual-thread
       // carrier. Unary + server-stream stay on the VT executor (they don't block on
       // recvFrame and benefit from cheap VT fanout).
-      final int pinnedMode = serializationMode;
       if (Thread.currentThread().isVirtual()
           && (method instanceof ClientStreamDispatcher || method instanceof BidiStreamDispatcher)) {
         final MethodDispatcher pinnedMethod = method;
         final Object pinnedInstance = instance;
         final CallContext pinnedCtx = ctx;
         streamingExecutor.execute(
-            () ->
-                runDispatch(
-                    call, pinnedMethod, pinnedInstance, pinnedCtx, pinnedMode, probeT2, probeT3));
+            () -> runDispatch(call, pinnedMethod, pinnedInstance, pinnedCtx, probeT2, probeT3));
         return;
       }
 
-      runDispatch(call, method, instance, ctx, serializationMode, probeT2, probeT3);
+      runDispatch(call, method, instance, ctx, probeT2, probeT3);
     } catch (RpcError e) {
-      submitErrorTrailer(callId, e.code(), e.rpcMessage(), serializationMode);
+      submitErrorTrailer(callId, e.code(), e.rpcMessage());
     } catch (Exception e) {
       submitErrorTrailer(
-          callId,
-          StatusCode.INTERNAL,
-          e.getMessage() == null ? "error" : e.getMessage(),
-          serializationMode);
+          callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
     }
   }
 
@@ -604,27 +574,18 @@ public final class AsterServer implements AutoCloseable {
       MethodDispatcher method,
       Object instance,
       CallContext ctx,
-      int serializationMode,
       long probeT2,
       long probeT3) {
     long callId = call.callId();
-    // Per-call codec and trailer bytes driven by the StreamHeader's serializationMode.
-    // Fory is the default; JSON kicks in when the peer advertised mode=3 (e.g. TS JsonProxy,
-    // Python JsonCodec, dynamic proxies). Identical paths otherwise — same dispatcher contract,
-    // same trailer framing.
-    Codec callCodec = pickCodec(serializationMode);
-    // RpcStatus is a framework wire type — trailers use the camelCase framework codec in JSON
-    // mode, not the snake_case user codec.
-    Codec trailerCodec =
-        serializationMode == SERIALIZATION_MODE_JSON ? jsonFrameworkCodec : foryHeaderCodec;
-    byte[] okTrailer = okTrailerBytes(serializationMode);
+    Codec callCodec = codec;
+    byte[] okTrailer = okTrailerBytes();
     try {
       switch (method) {
         case UnaryDispatcher u -> {
           long probeT4 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
           byte[] responseBytes = u.invoke(instance, call.request(), callCodec, ctx);
           long probeT5 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
-          byte[] responseFrame = AsterFraming.encodeFrame(responseBytes, (byte) 0);
+          byte[] responseFrame = AsterFraming.encodePayloadFrame(responseBytes, (byte) 0);
           byte[] trailerFrame = AsterFraming.encodeFrame(okTrailer, AsterFraming.FLAG_TRAILER);
           submitResponse(callId, new CallResponse(responseFrame, trailerFrame));
           if (site.aster.probe.AsterProbes.ENABLED) {
@@ -633,7 +594,7 @@ public final class AsterServer implements AutoCloseable {
           }
         }
         case ServerStreamDispatcher s -> {
-          ReactorResponseStream out = new ReactorResponseStream(reactor, callId, trailerCodec);
+          ReactorResponseStream out = new ReactorResponseStream(reactor, callId);
           try {
             s.invoke(instance, call.request(), callCodec, ctx, out);
             out.complete();
@@ -645,22 +606,19 @@ public final class AsterServer implements AutoCloseable {
           ReactorRequestStream in = new ReactorRequestStream(reactor, callId, call.request());
           try {
             byte[] responseBytes = c.invoke(instance, in, callCodec, ctx);
-            byte[] responseFrame = AsterFraming.encodeFrame(responseBytes, (byte) 0);
+            byte[] responseFrame = AsterFraming.encodePayloadFrame(responseBytes, (byte) 0);
             byte[] trailerFrame = AsterFraming.encodeFrame(okTrailer, AsterFraming.FLAG_TRAILER);
             submitResponse(callId, new CallResponse(responseFrame, trailerFrame));
           } catch (RpcError e) {
-            submitErrorTrailer(callId, e.code(), e.rpcMessage(), serializationMode);
+            submitErrorTrailer(callId, e.code(), e.rpcMessage());
           } catch (Exception e) {
             submitErrorTrailer(
-                callId,
-                StatusCode.INTERNAL,
-                e.getMessage() == null ? "error" : e.getMessage(),
-                serializationMode);
+                callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
           }
         }
         case BidiStreamDispatcher b -> {
           ReactorRequestStream in = new ReactorRequestStream(reactor, callId, call.request());
-          ReactorResponseStream out = new ReactorResponseStream(reactor, callId, trailerCodec);
+          ReactorResponseStream out = new ReactorResponseStream(reactor, callId);
           try {
             b.invoke(instance, in, callCodec, ctx, out);
             out.complete();
@@ -670,13 +628,10 @@ public final class AsterServer implements AutoCloseable {
         }
       }
     } catch (RpcError e) {
-      submitErrorTrailer(callId, e.code(), e.rpcMessage(), serializationMode);
+      submitErrorTrailer(callId, e.code(), e.rpcMessage());
     } catch (Exception e) {
       submitErrorTrailer(
-          callId,
-          StatusCode.INTERNAL,
-          e.getMessage() == null ? "error" : e.getMessage(),
-          serializationMode);
+          callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
     }
   }
 
@@ -787,33 +742,26 @@ public final class AsterServer implements AutoCloseable {
     }
   }
 
-  private StreamHeader decodeStreamHeader(byte[] bytes) {
-    if (bytes.length == 0) {
-      return new StreamHeader("", "", 0, 0, (short) 0, (byte) 0, List.of(), List.of(), 0);
-    }
-    // First-byte sniff: '{' (0x7B) ⇒ JSON StreamHeader, anything else is Fory XLANG. Mirrors
-    // Python's server-side heuristic (`bindings/python/aster/server.py:488`) so mixed-codec
-    // clients (TS JsonProxy / Python JsonCodec / dynamic proxies) can dial a Fory-primary Java
-    // server without a separate endpoint.
-    Object decoded;
-    if (bytes[0] == (byte) 0x7B) {
-      decoded = jsonFrameworkCodec.decode(bytes, StreamHeader.class);
-    } else {
-      decoded = foryHeaderCodec.decode(bytes, StreamHeader.class);
-    }
-    if (!(decoded instanceof StreamHeader sh)) {
-      throw new IrohException("StreamHeader decode returned " + decoded);
-    }
-    return sh;
+  /** Decode the AEv1 StreamHeader (Aster-SPEC §6.9); malformed bytes throw. */
+  private static StreamHeader decodeStreamHeader(byte[] bytes) {
+    return AsterEnvelope.decodeStreamHeader(bytes);
   }
 
-  /**
-   * Pick the per-call body codec: {@link JsonCodec} when the StreamHeader advertised JSON mode
-   * (spec §5 mode {@code 3}), otherwise the configured {@link Codec} (usually {@link ForyCodec}).
-   * Applied to the request, response, and trailer of this call.
-   */
-  private Codec pickCodec(int serializationMode) {
-    return serializationMode == SERIALIZATION_MODE_JSON ? jsonUserCodec : codec;
+  /** {@code call} with its inline request payload decompressed if it arrived compressed. */
+  private static AsterCall withLogicalRequest(AsterCall call) {
+    if ((call.requestFlags() & AsterFraming.FLAG_COMPRESSED) == 0) {
+      return call;
+    }
+    return new AsterCall(
+        call.callId(),
+        call.connectionId(),
+        call.streamId(),
+        call.header(),
+        call.headerFlags(),
+        AsterFraming.payloadOf(call.request(), call.requestFlags()),
+        (byte) (call.requestFlags() & ~AsterFraming.FLAG_COMPRESSED),
+        call.peerId(),
+        call.connectionHandle());
   }
 
   private CallContext buildCallContext(
@@ -881,63 +829,21 @@ public final class AsterServer implements AutoCloseable {
     }
   }
 
-  private byte[] okTrailerBytes(int serializationMode) {
-    if (serializationMode == SERIALIZATION_MODE_JSON) {
-      byte[] cached = okTrailerBytesCacheJson;
-      if (cached == null) {
-        // RpcStatus is a framework wire type — camelCase in every binding — so use the
-        // default JSON codec, not the snake_case user-type variant.
-        cached = jsonFrameworkCodec.encode(RpcStatus.ok());
-        okTrailerBytesCacheJson = cached;
-      }
-      return cached;
-    }
+  private byte[] okTrailerBytes() {
     byte[] cached = okTrailerBytesCache;
     if (cached == null) {
-      cached = foryHeaderCodec.encode(RpcStatus.ok());
+      cached = AsterEnvelope.encodeRpcStatus(RpcStatus.ok());
       okTrailerBytesCache = cached;
     }
     return cached;
   }
 
   private void submitErrorTrailer(long callId, StatusCode code, String message) {
-    submitErrorTrailer(callId, code, message, 0);
-  }
-
-  private void submitErrorTrailer(
-      long callId, StatusCode code, String message, int serializationMode) {
     RpcStatus status =
         new RpcStatus(code.value(), message == null ? "" : message, List.of(), List.of());
-    // RpcStatus is a framework wire type; JSON encoding uses the camelCase framework codec.
-    Codec trailerCodec =
-        serializationMode == SERIALIZATION_MODE_JSON ? jsonFrameworkCodec : foryHeaderCodec;
-    byte[] trailerPayload = trailerCodec.encode(status);
+    byte[] trailerPayload = AsterEnvelope.encodeRpcStatus(status);
     byte[] trailerFrame = AsterFraming.encodeFrame(trailerPayload, AsterFraming.FLAG_TRAILER);
     submitResponse(callId, new CallResponse(new byte[0], trailerFrame));
-  }
-
-  // ───── Codec / wire type bootstrap ───────────────────────────────────────
-
-  private ForyCodec registerFrameworkWireTypes(Codec userCodec) {
-    // StreamHeader / CallHeader / RpcStatus are always Fory xlang regardless of what the user
-    // picked for their payloads. If the user's codec IS a ForyCodec, register them on its Fory
-    // so header decode and user decode share one pump. Otherwise, build a dedicated Fory
-    // purely for framework wire types.
-    ForyCodec headerCodec = userCodec instanceof ForyCodec fc ? fc : new ForyCodec();
-    try {
-      site.aster.codec.ForyTags.register(
-          headerCodec.fory(), StreamHeader.class, "_aster/StreamHeader");
-    } catch (Throwable ignored) {
-    }
-    try {
-      site.aster.codec.ForyTags.register(headerCodec.fory(), CallHeader.class, "_aster/CallHeader");
-    } catch (Throwable ignored) {
-    }
-    try {
-      site.aster.codec.ForyTags.register(headerCodec.fory(), RpcStatus.class, "_aster/RpcStatus");
-    } catch (Throwable ignored) {
-    }
-    return headerCodec;
   }
 
   // ───── Manifest ──────────────────────────────────────────────────────────

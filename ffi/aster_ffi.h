@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 3
 
-#define ASTER_ABI_VERSION_MINOR 0
+#define ASTER_ABI_VERSION_MINOR 1
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -47,6 +47,37 @@
 #define ASTER_CALL_ERR_STREAM_OPEN_FAILED -13
 
 #define ASTER_CALL_ERR_POOL_CLOSED -14
+
+/**
+ * Payloads strictly larger than this many bytes are compressed on send
+ * (Aster-SPEC §5.6). Pass as `threshold` to `aster_zstd_maybe_compress`.
+ */
+#define ASTER_COMPRESSION_THRESHOLD 4096
+
+/**
+ * `aster_zstd_decompress` refuses output larger than this (16 MiB).
+ */
+#define ASTER_MAX_DECOMPRESSED_SIZE ((16 * 1024) * 1024)
+
+/**
+ * First byte of an encoded StreamHeader.
+ */
+#define ASTER_ENVELOPE_TAG_STREAM_HEADER 161
+
+/**
+ * First byte of an encoded CallHeader.
+ */
+#define ASTER_ENVELOPE_TAG_CALL_HEADER 162
+
+/**
+ * First byte of an encoded RpcStatus.
+ */
+#define ASTER_ENVELOPE_TAG_RPC_STATUS 163
+
+/**
+ * Envelope format version (second byte of every envelope).
+ */
+#define ASTER_ENVELOPE_VERSION 1
 
 /**
  * Event-kind discriminator for `aster_reactor_call_t` (spec §7.5).
@@ -487,6 +518,109 @@ typedef uint64_t aster_call_t;
 
 typedef uint64_t aster_buffer_t;
 
+/**
+ * `StreamHeader` (payload of a `FLAG_HEADER` frame), Aster-SPEC §6.9.
+ */
+typedef struct aster_stream_header_t {
+  /**
+   * `sizeof(aster_stream_header_t)`: set by the caller for encode, written
+   * by the library on decode.
+   */
+  uint32_t struct_size;
+  int32_t version;
+  int32_t call_id;
+  /**
+   * `0` = stateless SHARED-pool stream; non-zero = session-bound.
+   */
+  int32_t session_id;
+  /**
+   * Relative seconds; `0` = no deadline.
+   */
+  int16_t deadline;
+  /**
+   * XLANG=0, NATIVE=1, ROW=2 (JSON=3 is retired).
+   */
+  int8_t serialization_mode;
+  /**
+   * Set to 0.
+   */
+  uint8_t reserved0;
+  /**
+   * Set to 0.
+   */
+  uint32_t reserved1;
+  struct aster_bytes_t service;
+  struct aster_bytes_t method;
+  struct aster_bytes_list_t metadata_keys;
+  /**
+   * Same length as `metadata_keys`.
+   */
+  struct aster_bytes_list_t metadata_values;
+  /**
+   * Library-owned backing store of a decoded struct; NULL otherwise.
+   */
+  void *storage;
+} aster_stream_header_t;
+
+/**
+ * `CallHeader` (payload of a `FLAG_CALL` frame), Aster-SPEC §6.9.
+ */
+typedef struct aster_call_header_t {
+  /**
+   * `sizeof(aster_call_header_t)`: set by the caller for encode, written
+   * by the library on decode.
+   */
+  uint32_t struct_size;
+  int32_t call_id;
+  /**
+   * Relative seconds; `0` = no deadline.
+   */
+  int16_t deadline;
+  /**
+   * Set to 0.
+   */
+  uint16_t reserved0;
+  /**
+   * Set to 0.
+   */
+  uint32_t reserved1;
+  struct aster_bytes_t method;
+  struct aster_bytes_list_t metadata_keys;
+  /**
+   * Same length as `metadata_keys`.
+   */
+  struct aster_bytes_list_t metadata_values;
+  /**
+   * Library-owned backing store of a decoded struct; NULL otherwise.
+   */
+  void *storage;
+} aster_call_header_t;
+
+/**
+ * `RpcStatus` (payload of a `FLAG_TRAILER` frame), Aster-SPEC §6.9.
+ */
+typedef struct aster_rpc_status_t {
+  /**
+   * `sizeof(aster_rpc_status_t)`: set by the caller for encode, written by
+   * the library on decode.
+   */
+  uint32_t struct_size;
+  /**
+   * Status code (Aster-SPEC §6.5): 0 = OK, 1..16 gRPC, 100+ Aster.
+   */
+  int32_t code;
+  struct aster_bytes_t message;
+  struct aster_bytes_list_t detail_keys;
+  /**
+   * Same length as `detail_keys`.
+   */
+  struct aster_bytes_list_t detail_values;
+  /**
+   * Library-owned backing store of a decoded struct; NULL otherwise.
+   */
+  void *storage;
+} aster_rpc_status_t;
+
 typedef uint64_t aster_reactor_t;
 
 /**
@@ -637,7 +771,9 @@ int32_t aster_buffer_release(aster_runtime_t runtime, uint64_t buffer);
  * out-struct: `aster_remote_info_t.node_id` / `.relay_url` (from
  * `aster_endpoint_remote_info` and each entry of
  * `aster_endpoint_remote_info_list`), `aster_connection_info_t.alpn`, and
- * `aster_transport_snapshot_t.peer_host` / `.relay_url`.
+ * `aster_transport_snapshot_t.peer_host` / `.relay_url`, and the `out`
+ * buffer of `aster_{stream_header,call_header,rpc_status}_encode`,
+ * `aster_zstd_maybe_compress` and `aster_zstd_decompress`.
  *
  * Pass back exactly the `ptr` and `len` the library returned. Non-empty
  * buffers are additionally NUL-terminated (the terminator is not counted in
@@ -1773,6 +1909,133 @@ int32_t aster_call_unary(aster_runtime_t runtime,
                          const uint8_t **out_trailer_ptr,
                          uint32_t *out_trailer_len,
                          aster_buffer_t *out_trailer_buffer);
+
+/**
+ * Encode a StreamHeader to AEv1 bytes.
+ *
+ * `header->struct_size` must be `sizeof(aster_stream_header_t)`;
+ * `header->storage` is ignored. On success `*out` holds the encoding;
+ * release it with `aster_string_release(out->ptr, out->len)`.
+ *
+ * # Safety
+ * `header` and `out` must be valid pointers; every buffer the struct
+ * references must be readable for its stated length.
+ */
+int32_t aster_stream_header_encode(const struct aster_stream_header_t *header,
+                                   struct aster_bytes_t *out);
+
+/**
+ * Decode AEv1 bytes into a StreamHeader.
+ *
+ * On success `*out` is filled (including `struct_size`) and must be released
+ * with `aster_stream_header_release(out)`. On failure `*out` is zeroed.
+ *
+ * # Safety
+ * `buf` must be readable for `len` bytes (may be NULL when `len == 0`);
+ * `out` must be a valid pointer.
+ */
+int32_t aster_stream_header_decode(const uint8_t *buf,
+                                   uintptr_t len,
+                                   struct aster_stream_header_t *out);
+
+/**
+ * Free the storage of a StreamHeader filled by `aster_stream_header_decode`
+ * and zero its fields (`struct_size` is kept). A NULL `header` or a struct
+ * whose `storage` is NULL is a no-op.
+ *
+ * # Safety
+ * `header` must be NULL or point to a struct last written by
+ * `aster_stream_header_decode` (or by a caller, with `storage == NULL`).
+ */
+int32_t aster_stream_header_release(struct aster_stream_header_t *header);
+
+/**
+ * Encode a CallHeader to AEv1 bytes. Same contract as
+ * `aster_stream_header_encode`.
+ *
+ * # Safety
+ * See `aster_stream_header_encode`.
+ */
+int32_t aster_call_header_encode(const struct aster_call_header_t *header,
+                                 struct aster_bytes_t *out);
+
+/**
+ * Decode AEv1 bytes into a CallHeader. Same contract as
+ * `aster_stream_header_decode`; release with `aster_call_header_release`.
+ *
+ * # Safety
+ * See `aster_stream_header_decode`.
+ */
+int32_t aster_call_header_decode(const uint8_t *buf,
+                                 uintptr_t len,
+                                 struct aster_call_header_t *out);
+
+/**
+ * Free a CallHeader filled by `aster_call_header_decode`. See
+ * `aster_stream_header_release`.
+ *
+ * # Safety
+ * See `aster_stream_header_release`.
+ */
+int32_t aster_call_header_release(struct aster_call_header_t *header);
+
+/**
+ * Encode an RpcStatus to AEv1 bytes. Same contract as
+ * `aster_stream_header_encode`.
+ *
+ * # Safety
+ * See `aster_stream_header_encode`.
+ */
+int32_t aster_rpc_status_encode(const struct aster_rpc_status_t *status, struct aster_bytes_t *out);
+
+/**
+ * Decode AEv1 bytes into an RpcStatus. Same contract as
+ * `aster_stream_header_decode`; release with `aster_rpc_status_release`.
+ *
+ * # Safety
+ * See `aster_stream_header_decode`.
+ */
+int32_t aster_rpc_status_decode(const uint8_t *buf, uintptr_t len, struct aster_rpc_status_t *out);
+
+/**
+ * Free an RpcStatus filled by `aster_rpc_status_decode`. See
+ * `aster_stream_header_release`.
+ *
+ * # Safety
+ * See `aster_stream_header_release`.
+ */
+int32_t aster_rpc_status_release(struct aster_rpc_status_t *status);
+
+/**
+ * Compress a payload for sending if it is larger than `threshold` bytes
+ * (normally `ASTER_COMPRESSION_THRESHOLD`), with zstd level 3.
+ *
+ * On `ASTER_STATUS_OK`:
+ * - `out->ptr != NULL`: send `out` with `FLAG_COMPRESSED` set; release it
+ *   with `aster_string_release(out->ptr, out->len)`.
+ * - `*out == {NULL, 0}`: send the original payload unchanged (it was at or
+ *   below the threshold, or compression did not make it smaller).
+ *
+ * # Safety
+ * `data` must be readable for `len` bytes (may be NULL when `len == 0`);
+ * `out` must be a valid pointer.
+ */
+int32_t aster_zstd_maybe_compress(const uint8_t *data,
+                                  uintptr_t len,
+                                  uintptr_t threshold,
+                                  struct aster_bytes_t *out);
+
+/**
+ * Decompress a `FLAG_COMPRESSED` payload. Output larger than
+ * `ASTER_MAX_DECOMPRESSED_SIZE` (16 MiB) and corrupt input are refused with
+ * `ASTER_STATUS_INVALID_ARGUMENT`. On success release `out` with
+ * `aster_string_release(out->ptr, out->len)` (an empty result is `{NULL, 0}`).
+ *
+ * # Safety
+ * `data` must be readable for `len` bytes (may be NULL when `len == 0`);
+ * `out` must be a valid pointer.
+ */
+int32_t aster_zstd_decompress(const uint8_t *data, uintptr_t len, struct aster_bytes_t *out);
 
 void aster_probe_reset(void);
 

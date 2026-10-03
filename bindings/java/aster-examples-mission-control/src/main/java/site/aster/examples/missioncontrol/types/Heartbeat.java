@@ -4,9 +4,9 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Plain class (not a record) because Fory v0.16 fails to round-trip Java records that carry
- * collection fields like {@code List<String>}. See {@code project_fory_java_records.md} and the
- * regression test {@code StreamHeaderRoundTripTest}.
+ * Plain class (not a record) because Fory v0.16 failed to round-trip Java records that carry
+ * collection fields like {@code List<String>} (see {@code project_fory_java_records.md}); not
+ * re-checked since the move to Fory 1.7.6.
  */
 public final class Heartbeat {
   public static final String FORY_TAG = "mission/Heartbeat";

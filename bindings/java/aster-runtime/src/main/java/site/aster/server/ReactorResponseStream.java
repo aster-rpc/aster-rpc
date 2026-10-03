@@ -4,7 +4,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.List;
-import site.aster.codec.Codec;
+import site.aster.ffi.AsterEnvelope;
 import site.aster.ffi.Reactor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
@@ -24,19 +24,12 @@ final class ReactorResponseStream implements ResponseStream {
 
   private final Reactor reactor;
   private final long callId;
-  private final Codec trailerCodec;
   private boolean terminated;
 
-  /**
-   * @param trailerCodec codec used to encode the {@link RpcStatus} trailer at stream end. For
-   *     JSON-mode calls this is a {@code JsonCodec}; otherwise the server's {@code ForyCodec}. Must
-   *     match the StreamHeader's serializationMode so the client decodes the trailer on the same
-   *     axis it decoded the body.
-   */
-  ReactorResponseStream(Reactor reactor, long callId, Codec trailerCodec) {
+  /** The {@link RpcStatus} trailer is AEv1-encoded via {@link AsterEnvelope}. */
+  ReactorResponseStream(Reactor reactor, long callId) {
     this.reactor = reactor;
     this.callId = callId;
-    this.trailerCodec = trailerCodec;
   }
 
   @Override
@@ -44,7 +37,7 @@ final class ReactorResponseStream implements ResponseStream {
     if (terminated) {
       throw new IllegalStateException("send() after complete()/fail() for callId=" + callId);
     }
-    byte[] frame = AsterFraming.encodeFrame(encoded, (byte) 0);
+    byte[] frame = AsterFraming.encodePayloadFrame(encoded, (byte) 0);
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment seg = arena.allocate(ValueLayout.JAVA_BYTE, frame.length);
       seg.copyFrom(MemorySegment.ofArray(frame));
@@ -58,7 +51,7 @@ final class ReactorResponseStream implements ResponseStream {
       return;
     }
     terminated = true;
-    byte[] trailerPayload = trailerCodec.encode(RpcStatus.ok());
+    byte[] trailerPayload = AsterEnvelope.encodeRpcStatus(RpcStatus.ok());
     byte[] trailerFrame = AsterFraming.encodeFrame(trailerPayload, AsterFraming.FLAG_TRAILER);
     submitTrailerFrame(trailerFrame);
   }
@@ -80,7 +73,7 @@ final class ReactorResponseStream implements ResponseStream {
     }
     RpcStatus status =
         new RpcStatus(code.value(), message == null ? "" : message, List.of(), List.of());
-    byte[] trailerPayload = trailerCodec.encode(status);
+    byte[] trailerPayload = AsterEnvelope.encodeRpcStatus(status);
     byte[] trailerFrame = AsterFraming.encodeFrame(trailerPayload, AsterFraming.FLAG_TRAILER);
     submitTrailerFrame(trailerFrame);
   }

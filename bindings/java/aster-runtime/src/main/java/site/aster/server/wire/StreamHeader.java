@@ -2,64 +2,44 @@ package site.aster.server.wire;
 
 import java.util.List;
 import java.util.Objects;
-import org.apache.fory.annotation.ForyField;
 
 /**
- * First frame on every QUIC stream (HEADER flag). Carries service routing, contract identity, call
- * metadata, and the negotiated serialization mode.
+ * First frame on every QUIC stream (HEADER flag). Carries service routing, call metadata, the
+ * serialization mode of the payload frames, and the session id.
  *
- * <p>Matches the Python reference type {@code _aster/StreamHeader} defined in {@code
- * bindings/python/aster/protocol.py}. Fory xlang serialization with exactly these field names, in
- * declaration order, is required for cross-language interop.
- *
- * <p>This is a plain class rather than a {@code record} because Fory (as of 0.16) fails to
- * round-trip Java records that carry collection fields like {@code List<String>} — the decoder
- * reads the collection but then stops before the terminator byte, yielding {@code
- * IndexOutOfBoundsException}. Plain classes with public mutable fields work reliably. Accessor
- * methods are kept so callers can read fields as if this were still a record.
+ * <p>Encoded in the AEv1 envelope format (Aster-SPEC §6.9) by Rust core via {@link
+ * site.aster.ffi.AsterEnvelope} — not by Fory — so every binding writes identical bytes. Field
+ * order and widths are fixed by the spec; see {@code conformance/vectors/envelope.json}.
  */
 public final class StreamHeader {
 
   public static final byte SERIALIZATION_XLANG = 0;
   public static final byte SERIALIZATION_NATIVE = 1;
   public static final byte SERIALIZATION_ROW = 2;
-  public static final byte SERIALIZATION_JSON = 3;
+  // 3 (JSON) is retired (Aster-SPEC §5.1): servers answer it with INVALID_ARGUMENT.
 
-  // Explicit ForyField(id=N) on every field keeps the Fory struct fingerprint tag-ID based, so
-  // Java's snake-case field-name conversion doesn't make its hash diverge from Python's (which
-  // uses the raw field name). IDs must stay in sync with bindings/python/aster/protocol.py.
-  @ForyField(id = 0)
   public String service = "";
 
-  @ForyField(id = 1)
   public String method = "";
 
-  @ForyField(id = 2)
   public int version;
 
-  @ForyField(id = 3)
   public int callId;
 
-  @ForyField(id = 4)
   public short deadline;
 
-  @ForyField(id = 5)
   public byte serializationMode;
 
-  @ForyField(id = 6)
   public List<String> metadataKeys = List.of();
 
-  @ForyField(id = 7)
   public List<String> metadataValues = List.of();
 
   /**
    * Session identifier (multiplexed-streams spec §6). {@code 0} means this stream is a stateless
    * SHARED-pool stream; a non-zero value means the stream belongs to the session with this id on
-   * the sender's {@code (peer, connection)}. Monotonically allocated client-side per connection.
-   * Treated as 4-byte little-endian on the wire; a signed {@code int} suffices because the counter
-   * never reaches 2^31 in practice.
+   * the sender's {@code (peer, connection)}. Monotonically allocated client-side per connection. An
+   * {@code int32} on the wire (zigzag varint); the counter never reaches 2^31 in practice.
    */
-  @ForyField(id = 8)
   public int sessionId;
 
   public StreamHeader() {}

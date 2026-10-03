@@ -13,6 +13,7 @@ import site.aster.codec.ForyCodec;
 import site.aster.config.AsterConfig;
 import site.aster.config.AsterIdentity;
 import site.aster.ffi.AsterCall;
+import site.aster.ffi.AsterEnvelope;
 import site.aster.handle.IrohConnection;
 import site.aster.handle.IrohEndpoint;
 import site.aster.interceptors.Interceptor;
@@ -22,7 +23,6 @@ import site.aster.node.NodeAddr;
 import site.aster.registry.ServiceSummary;
 import site.aster.server.AsterFraming;
 import site.aster.server.AsterServer;
-import site.aster.server.wire.CallHeader;
 import site.aster.server.wire.RpcStatus;
 import site.aster.server.wire.StreamHeader;
 import site.aster.trust.ConsumerAdmissionClient;
@@ -44,7 +44,6 @@ public final class AsterClient implements AutoCloseable {
 
   private final IrohEndpoint endpoint;
   private final Codec codec;
-  private final ForyCodec headerCodec;
   private final AsterConfig config;
   private final List<Interceptor> interceptors;
   private final Map<String, IrohConnection> connectionCache = new ConcurrentHashMap<>();
@@ -70,29 +69,11 @@ public final class AsterClient implements AutoCloseable {
   private AsterClient(Builder b, IrohEndpoint endpoint) {
     this.endpoint = endpoint;
     this.codec = b.codec != null ? b.codec : new ForyCodec();
-    this.headerCodec = registerFrameworkWireTypes(this.codec);
     this.config = b.config;
     this.interceptors = List.copyOf(b.interceptors);
     this.admissionCredentialJson =
         b.admissionCredentialJson == null ? "" : b.admissionCredentialJson;
     this.admissionIidToken = b.admissionIidToken == null ? "" : b.admissionIidToken;
-  }
-
-  private static ForyCodec registerFrameworkWireTypes(Codec userCodec) {
-    ForyCodec header = userCodec instanceof ForyCodec fc ? fc : new ForyCodec();
-    try {
-      site.aster.codec.ForyTags.register(header.fory(), StreamHeader.class, "_aster/StreamHeader");
-    } catch (Throwable ignored) {
-    }
-    try {
-      site.aster.codec.ForyTags.register(header.fory(), CallHeader.class, "_aster/CallHeader");
-    } catch (Throwable ignored) {
-    }
-    try {
-      site.aster.codec.ForyTags.register(header.fory(), RpcStatus.class, "_aster/RpcStatus");
-    } catch (Throwable ignored) {
-    }
-    return header;
   }
 
   /** The underlying endpoint's node id (hex). */
@@ -248,12 +229,12 @@ public final class AsterClient implements AutoCloseable {
     try {
       sendStreamHeader(call, sessionId, service, method);
       byte[] reqBytes = codec.encode(request);
-      call.sendFrame(AsterFraming.encodeFrame(reqBytes, AsterFraming.FLAG_END_STREAM));
+      call.sendFrame(AsterFraming.encodePayloadFrame(reqBytes, AsterFraming.FLAG_END_STREAM));
     } catch (Throwable t) {
       call.discard();
       throw reThrow(t);
     }
-    return new ServerStreamCall<>(call, codec, headerCodec, responseType);
+    return new ServerStreamCall<>(call, codec, responseType);
   }
 
   /**
@@ -322,7 +303,7 @@ public final class AsterClient implements AutoCloseable {
       call.discard();
       throw reThrow(t);
     }
-    return new BidiCall<Req, Resp>(call, codec, headerCodec, responseType);
+    return new BidiCall<Req, Resp>(call, codec, responseType);
   }
 
   <Req, Resp> CompletableFuture<Resp> runUnary(
@@ -336,11 +317,12 @@ public final class AsterClient implements AutoCloseable {
     callExecutor.execute(
         () -> {
           try {
-            byte[] headerBytes = headerCodec.encode(buildStreamHeader(sessionId, service, method));
+            byte[] headerBytes =
+                AsterEnvelope.encodeStreamHeader(buildStreamHeader(sessionId, service, method));
             byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
             byte[] requestBytes = codec.encode(request);
             byte[] requestFrame =
-                AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM);
+                AsterFraming.encodePayloadFrame(requestBytes, AsterFraming.FLAG_END_STREAM);
             byte[] requestPair = new byte[headerFrame.length + requestFrame.length];
             System.arraycopy(headerFrame, 0, requestPair, 0, headerFrame.length);
             System.arraycopy(requestFrame, 0, requestPair, headerFrame.length, requestFrame.length);
@@ -357,7 +339,7 @@ public final class AsterClient implements AutoCloseable {
             RpcStatus status =
                 result.trailerPayload().length == 0
                     ? RpcStatus.ok()
-                    : (RpcStatus) headerCodec.decode(result.trailerPayload(), RpcStatus.class);
+                    : AsterEnvelope.decodeRpcStatus(result.trailerPayload());
             if (status.code() != RpcStatus.OK) {
               throw new RpcError(
                   StatusCode.fromValue(status.code()),
@@ -367,7 +349,11 @@ public final class AsterClient implements AutoCloseable {
               throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
             }
             @SuppressWarnings("unchecked")
-            Resp decoded = (Resp) codec.decode(result.responsePayload(), responseType);
+            Resp decoded =
+                (Resp)
+                    codec.decode(
+                        AsterFraming.payloadOf(result.responsePayload(), result.responseFlags()),
+                        responseType);
             out.complete(decoded);
           } catch (Throwable t) {
             out.completeExceptionally(unwrap(t));
@@ -391,7 +377,8 @@ public final class AsterClient implements AutoCloseable {
             call = acquireStreamingOn(conn);
             sendStreamHeader(call, sessionId, service, method);
             byte[] requestBytes = codec.encode(request);
-            call.sendFrame(AsterFraming.encodeFrame(requestBytes, AsterFraming.FLAG_END_STREAM));
+            call.sendFrame(
+                AsterFraming.encodePayloadFrame(requestBytes, AsterFraming.FLAG_END_STREAM));
             List<Resp> collected = drainStreaming(call, responseType);
             call.release();
             call = null;
@@ -421,7 +408,7 @@ public final class AsterClient implements AutoCloseable {
             for (int i = 0; i < requests.size(); i++) {
               byte[] reqBytes = codec.encode(requests.get(i));
               byte flags = (i == requests.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
-              call.sendFrame(AsterFraming.encodeFrame(reqBytes, flags));
+              call.sendFrame(AsterFraming.encodePayloadFrame(reqBytes, flags));
             }
             UnaryResult<Resp> result = drainUnary(call, responseType);
             call.release();
@@ -452,7 +439,7 @@ public final class AsterClient implements AutoCloseable {
             for (int i = 0; i < requests.size(); i++) {
               byte[] reqBytes = codec.encode(requests.get(i));
               byte flags = (i == requests.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
-              call.sendFrame(AsterFraming.encodeFrame(reqBytes, flags));
+              call.sendFrame(AsterFraming.encodePayloadFrame(reqBytes, flags));
             }
             List<Resp> collected = drainStreaming(call, responseType);
             call.release();
@@ -489,7 +476,8 @@ public final class AsterClient implements AutoCloseable {
   }
 
   private void sendStreamHeader(AsterCall call, int sessionId, String service, String method) {
-    byte[] headerBytes = headerCodec.encode(buildStreamHeader(sessionId, service, method));
+    byte[] headerBytes =
+        AsterEnvelope.encodeStreamHeader(buildStreamHeader(sessionId, service, method));
     call.sendFrame(AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER));
   }
 
@@ -526,9 +514,7 @@ public final class AsterClient implements AutoCloseable {
       byte flags = ok.flags();
       if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
         RpcStatus status =
-            ok.payload().length == 0
-                ? RpcStatus.ok()
-                : (RpcStatus) headerCodec.decode(ok.payload(), RpcStatus.class);
+            ok.payload().length == 0 ? RpcStatus.ok() : AsterEnvelope.decodeRpcStatus(ok.payload());
         if (status.code() != RpcStatus.OK) {
           throw new RpcError(
               StatusCode.fromValue(status.code()),
@@ -549,7 +535,7 @@ public final class AsterClient implements AutoCloseable {
         // skip row-schema frames (no row-mode support yet)
         continue;
       }
-      responsePayload = ok.payload();
+      responsePayload = AsterFraming.payloadOf(ok.payload(), ok.flags());
       frameCount++;
     }
   }
@@ -568,9 +554,7 @@ public final class AsterClient implements AutoCloseable {
       byte flags = ok.flags();
       if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
         RpcStatus status =
-            ok.payload().length == 0
-                ? RpcStatus.ok()
-                : (RpcStatus) headerCodec.decode(ok.payload(), RpcStatus.class);
+            ok.payload().length == 0 ? RpcStatus.ok() : AsterEnvelope.decodeRpcStatus(ok.payload());
         if (status.code() != RpcStatus.OK) {
           throw new RpcError(
               StatusCode.fromValue(status.code()),
@@ -582,7 +566,8 @@ public final class AsterClient implements AutoCloseable {
         continue;
       }
       @SuppressWarnings("unchecked")
-      Resp decoded = (Resp) codec.decode(ok.payload(), responseType);
+      Resp decoded =
+          (Resp) codec.decode(AsterFraming.payloadOf(ok.payload(), ok.flags()), responseType);
       collected.add(decoded);
     }
   }

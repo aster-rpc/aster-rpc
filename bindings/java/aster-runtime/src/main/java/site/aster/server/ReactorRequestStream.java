@@ -27,6 +27,9 @@ public final class ReactorRequestStream implements RequestStream {
   private boolean firstDelivered;
   private boolean ended;
 
+  /**
+   * @param firstFramePayload the inline first request payload, already decompressed by the caller
+   */
   public ReactorRequestStream(Reactor reactor, long callId, byte[] firstFramePayload) {
     this.reactor = reactor;
     this.callId = callId;
@@ -48,7 +51,7 @@ public final class ReactorRequestStream implements RequestStream {
       Reactor.RecvFrame result = reactor.recvFrame(callId, POLL_TIMEOUT_MS);
       switch (result) {
         case Reactor.RecvFrame.Ok ok -> {
-          return ok.payload();
+          return AsterFraming.payloadOf(ok.payload(), ok.flags());
         }
         case Reactor.RecvFrame.EndOfStream ignored -> {
           ended = true;

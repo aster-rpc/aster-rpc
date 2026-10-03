@@ -10,7 +10,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
-import site.aster.server.wire.StreamHeader;
 
 /**
  * Stresses {@link ForyCodec} from many virtual threads concurrently. This test exists as the
@@ -20,10 +19,32 @@ import site.aster.server.wire.StreamHeader;
  * the wrapping in {@link ForyCodec} has regressed back to a plain {@code Fory}.
  *
  * <p>We mirror the real server dispatch shape — one virtual thread per iteration, encode then
- * decode a {@link StreamHeader} — rather than a synthetic micro-benchmark, so that the test
+ * decode a small payload struct — rather than a synthetic micro-benchmark, so that the test
  * exercises the same concurrency pattern the server does in production.
  */
 final class ForyCodecConcurrencyTest {
+
+  /** Payload-shaped test type (the RPC envelope itself is no longer Fory-encoded). */
+  public static final class Sample {
+    public String service = "";
+    public String method = "";
+    public int callId;
+    public List<String> tags = List.of();
+
+    public Sample() {}
+
+    Sample(String service, String method, int callId, List<String> tags) {
+      this.service = service;
+      this.method = method;
+      this.callId = callId;
+      this.tags = tags;
+    }
+
+    @Override
+    public String toString() {
+      return service + "/" + method + "#" + callId + tags;
+    }
+  }
 
   private static final int THREAD_COUNT = 32;
   private static final int ITERATIONS_PER_THREAD = 200;
@@ -31,7 +52,7 @@ final class ForyCodecConcurrencyTest {
   @Test
   void sharedCodecSurvivesManyConcurrentVirtualThreads() throws Exception {
     ForyCodec codec = new ForyCodec();
-    site.aster.codec.ForyTags.register(codec.fory(), StreamHeader.class, "_aster/StreamHeader");
+    site.aster.codec.ForyTags.register(codec.fory(), Sample.class, "_test/Sample");
 
     ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     CountDownLatch startGate = new CountDownLatch(1);
@@ -46,21 +67,18 @@ final class ForyCodecConcurrencyTest {
             try {
               startGate.await();
               for (int i = 0; i < ITERATIONS_PER_THREAD; i++) {
-                StreamHeader header =
-                    new StreamHeader(
+                Sample header =
+                    new Sample(
                         "Service-" + threadIndex,
                         "method-" + i,
-                        1,
                         threadIndex * ITERATIONS_PER_THREAD + i,
-                        (short) 0,
-                        StreamHeader.SERIALIZATION_XLANG,
-                        List.of(),
-                        List.of());
+                        List.of("t" + i));
                 byte[] encoded = codec.encode(header);
-                StreamHeader decoded = (StreamHeader) codec.decode(encoded, StreamHeader.class);
-                if (!header.service().equals(decoded.service())
-                    || !header.method().equals(decoded.method())
-                    || header.callId() != decoded.callId()) {
+                Sample decoded = (Sample) codec.decode(encoded, Sample.class);
+                if (!header.service.equals(decoded.service)
+                    || !header.method.equals(decoded.method)
+                    || header.callId != decoded.callId
+                    || !header.tags.equals(decoded.tags)) {
                   throw new AssertionError(
                       "round-trip mismatch on thread "
                           + threadIndex

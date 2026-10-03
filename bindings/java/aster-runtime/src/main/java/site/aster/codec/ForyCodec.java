@@ -3,18 +3,20 @@ package site.aster.codec;
 import org.apache.fory.BaseFory;
 import org.apache.fory.Fory;
 import org.apache.fory.ThreadSafeFory;
-import org.apache.fory.config.Language;
+import org.apache.fory.config.ForyBuilder;
 
 /**
- * Apache Fory v0.16 backed codec. Backed by a {@link ThreadSafeFory} — specifically Fory's {@code
- * ThreadPoolFory}, the default thread-safe implementation — so a single {@code ForyCodec} instance
- * can be shared across every in-flight call on an {@code AsterServer} (which dispatches on a
- * virtual-thread-per-call executor).
+ * Apache Fory 1.7.6 backed codec for RPC <em>payloads</em> (the envelope is AEv1, see {@link
+ * site.aster.ffi.AsterEnvelope}). Backed by a {@link ThreadSafeFory} — Fory's {@code
+ * ThreadPoolFory} — so a single {@code ForyCodec} instance can be shared across every in-flight
+ * call on an {@code AsterServer} (which dispatches on a virtual-thread-per-call executor).
  *
- * <p>See {@code docs/_internal/java-fory-threading.md} for the full rationale, including why we
- * picked {@code ThreadPoolFory} over plain {@link Fory} (not thread-safe), {@code ThreadLocalFory}
- * (allocates a fresh {@code Fory} for every virtual thread), or pinning the server executor to
- * platform threads.
+ * <p>Options match Rust's {@code aster_transport_core::xlang::new_fory} and Aster-SPEC §5.1
+ * (normative for every binding): xlang on, compatible mode on, reference tracking off. Different
+ * options produce different bytes, so they must not drift.
+ *
+ * <p>See {@code docs/_internal/java-fory-threading.md} for why the pool (not {@code
+ * ThreadLocalFory}) is used under virtual threads.
  *
  * <p>Type registration is the caller's responsibility — call {@link #fory()} to reach the
  * underlying {@link BaseFory} and register your types there. Registrations propagate to every
@@ -25,43 +27,28 @@ public final class ForyCodec implements Codec {
 
   private final ThreadSafeFory fory;
 
+  /** Pinned Apache Fory release (Aster-SPEC §5.1; Rust {@code xlang::FORY_VERSION}). */
+  public static final String FORY_VERSION = "1.7.6";
+
   public ForyCodec() {
-    // NOTE: buildThreadSafeFory() in Fory 0.16 returns ThreadLocalFory, which allocates a fresh
-    // Fory per thread on first use. Under newVirtualThreadPerTaskExecutor (every call = new VT)
-    // that's a brand-new Fory + codec recompile on every RPC — ~200 µs per StreamHeader decode.
-    // buildThreadSafeForyPool forces a ClassLoaderForyPooled, which is a true shared pool across
-    // threads/VTs. Pool size is min=2, max=max(CPU/2, 2), matching Fory's own recommendation for
-    // VT workloads.
+    // A true shared pool across threads / virtual threads (ThreadLocalFory would build a fresh
+    // Fory + codegen per virtual thread). Sized to CPU/2, at least 2.
     int cpu = Math.max(Runtime.getRuntime().availableProcessors(), 2);
-    // Fory 0.17: buildThreadSafeForyPool takes a single poolSize arg (was min,max in 0.16).
-    // Size to CPU/2 (rounded up to >= 2) — same sizing logic, just the single-arg form.
     int poolSize = Math.max((cpu + 1) / 2, 2);
-    this.fory =
-        Fory.builder()
-            .withLanguage(Language.XLANG)
-            // Aster's baseline Fory config: XLANG + ref-tracking + strict +
-            // compatible-mode. Must match the matching Python config in
-            // bindings/python/aster/codec.py verbatim -- any drift re-introduces
-            // cross-binding schema-hash divergence (see
-            // docs/_internal/fory-cross-binding.md).
-            //   XLANG:      cross-language binary format.
-            //   refs:       duplicate objects serialize once + circular refs
-            //               survive decode.
-            //   strict:     every type must be registered; unknown types raise
-            //               at encode time instead of smuggling arbitrary
-            //               classes through the wire.
-            //   compatible: NAMED_COMPATIBLE_STRUCT layout (schema meta-share
-            //               with struct hash check). pyfory sets compatible=
-            //               True by default at XLANG; without withCompatibleMode
-            //               here, Java emits SCHEMA_CONSISTENT bytes and any
-            //               py<->java call fails with "Read class version is
-            //               not consistent" or "read objects are: [null]".
-            //               Verified at Fory 0.17: pyfory + java produce
-            //               byte-identical output with this set on both sides.
-            .withRefTracking(true)
-            .withCompatibleMode(org.apache.fory.config.CompatibleMode.COMPATIBLE)
-            .requireClassRegistration(true)
-            .buildThreadSafeForyPool(poolSize);
+    this.fory = newBuilder().buildThreadSafeForyPool(poolSize);
+  }
+
+  /**
+   * A {@link ForyBuilder} preconfigured with Aster's standard options (Aster-SPEC §5.1, Rust {@code
+   * xlang::new_fory}): xlang, compatible mode, no reference tracking. Strict registration is kept
+   * so unregistered classes fail at encode time.
+   */
+  public static ForyBuilder newBuilder() {
+    return Fory.builder()
+        .withXlang(true)
+        .withCompatible(true)
+        .withRefTracking(false)
+        .requireClassRegistration(true);
   }
 
   public ForyCodec(ThreadSafeFory fory) {
