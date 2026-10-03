@@ -150,14 +150,14 @@ func TestParseBlobCollectionJSON_invalid(t *testing.T) {
 
 func TestBlobStatusConstants(t *testing.T) {
 	// Ensure constants match expected values
-	if IROH_EVENT_BLOB_ADDED != 30 {
-		t.Errorf("IROH_EVENT_BLOB_ADDED = %d, want 30", IROH_EVENT_BLOB_ADDED)
+	if ASTER_EVENT_BLOB_ADDED != 30 {
+		t.Errorf("ASTER_EVENT_BLOB_ADDED = %d, want 30", ASTER_EVENT_BLOB_ADDED)
 	}
-	if IROH_EVENT_BLOB_READ != 31 {
-		t.Errorf("IROH_EVENT_BLOB_READ = %d, want 31", IROH_EVENT_BLOB_READ)
+	if ASTER_EVENT_BLOB_READ != 31 {
+		t.Errorf("ASTER_EVENT_BLOB_READ = %d, want 31", ASTER_EVENT_BLOB_READ)
 	}
-	if IROH_EVENT_BLOB_DOWNLOADED != 32 {
-		t.Errorf("IROH_EVENT_BLOB_DOWNLOADED = %d, want 32", IROH_EVENT_BLOB_DOWNLOADED)
+	if ASTER_EVENT_BLOB_DOWNLOADED != 32 {
+		t.Errorf("ASTER_EVENT_BLOB_DOWNLOADED = %d, want 32", ASTER_EVENT_BLOB_DOWNLOADED)
 	}
 }
 

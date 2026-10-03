@@ -1,174 +1,243 @@
-//! C ABI Contract Tests
-//!
-//! Validates the C ABI surface: struct sizes, field offsets, enum values,
-//! and ownership rules. No networking — pure ABI validation.
-//!
-//! Compile and run:
-//!   gcc -o abi_contract_test abi_contract_test.c -L../target/debug -liroh_ffi -lpthread
-//!   ./abi_contract_test
+/*
+ * C ABI contract test for aster_transport_ffi.
+ *
+ * Includes the generated header (ffi/aster_ffi.h) and checks, from the C
+ * side, the same layout numbers that ffi/src/layout.rs asserts on the Rust
+ * side. Layout is checked at compile time (_Static_assert) so a header/Rust
+ * drift fails the build; ABI version, enum values and a few ownership rules
+ * are checked at run time against the built library.
+ *
+ * Run with: ffi/scripts/run-c-abi-test.sh
+ * (builds the cdylib, compiles this file against it, runs it).
+ */
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 
-// Track test results
-static int tests_run = 0;
-static int tests_passed = 0;
+#if UINTPTR_MAX != 0xFFFFFFFFFFFFFFFFu
+#error "abi_contract_test.c assumes a 64-bit target"
+#endif
 
-#define ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (cond) { \
-        tests_passed++; \
-        printf("  PASS: %s\n", msg); \
-    } else { \
-        printf("  FAIL: %s\n", msg); \
-    } \
-} while (0)
+#define LAYOUT(ty, size)                                                       \
+    _Static_assert(sizeof(ty) == (size), "sizeof(" #ty ")")
+#define OFF(ty, field, off)                                                    \
+    _Static_assert(offsetof(ty, field) == (off), "offsetof(" #ty "." #field ")")
 
-#define ASSERT_EQ(a, b, msg) ASSERT((a) == (b), msg " (got " #a "=%lu, " #b "=%lu)")
-#define ASSERT_EQ_HEX(a, b, msg) ASSERT((a) == (b), msg " (got " #a "=0x%lx, " #b "=0x%lx)")
+/* ── Layout (must match ffi/src/layout.rs) ─────────────────────────────── */
 
-// ─── Struct size tests ─────────────────────────────────────────────────────
+_Static_assert(sizeof(aster_status_t) == 4, "enum size");
+_Static_assert(sizeof(aster_event_kind_t) == 4, "enum size");
 
-static void test_struct_sizes(void) {
-    printf("\n[Struct sizes]\n");
+LAYOUT(aster_bytes_t, 16);
+OFF(aster_bytes_t, ptr, 0);
+OFF(aster_bytes_t, len, 8);
 
-    // These sizes come from the Rust struct definitions.
-    // If the Rust side changes struct_layout without updating the C header,
-    // these tests will catch the drift.
-    ASSERT_EQ((size_t)sizeof(iroh_runtime_config_t), (size_t)16, "iroh_runtime_config_t size");
-    ASSERT_EQ((size_t)sizeof(iroh_event_t), (size_t)80, "iroh_event_t size");
+LAYOUT(aster_bytes_list_t, 16);
+OFF(aster_bytes_list_t, items, 0);
+OFF(aster_bytes_list_t, len, 8);
+
+LAYOUT(aster_runtime_config_t, 16);
+OFF(aster_runtime_config_t, struct_size, 0);
+OFF(aster_runtime_config_t, worker_threads, 4);
+OFF(aster_runtime_config_t, event_queue_capacity, 8);
+OFF(aster_runtime_config_t, reserved, 12);
+
+LAYOUT(aster_endpoint_config_t, 152);
+OFF(aster_endpoint_config_t, struct_size, 0);
+OFF(aster_endpoint_config_t, relay_mode, 4);
+OFF(aster_endpoint_config_t, secret_key, 8);
+OFF(aster_endpoint_config_t, alpns, 24);
+OFF(aster_endpoint_config_t, relay_urls, 40);
+OFF(aster_endpoint_config_t, enable_discovery, 56);
+OFF(aster_endpoint_config_t, enable_hooks, 60);
+OFF(aster_endpoint_config_t, hook_timeout_ms, 64);
+OFF(aster_endpoint_config_t, bind_addr, 72);
+OFF(aster_endpoint_config_t, clear_ip_transports, 88);
+OFF(aster_endpoint_config_t, clear_relay_transports, 92);
+OFF(aster_endpoint_config_t, portmapper_config, 96);
+OFF(aster_endpoint_config_t, proxy_url, 104);
+OFF(aster_endpoint_config_t, proxy_from_env, 120);
+OFF(aster_endpoint_config_t, data_dir_utf8, 128);
+OFF(aster_endpoint_config_t, hook_failure_mode, 144);
+
+LAYOUT(aster_connect_config_t, 48);
+OFF(aster_connect_config_t, struct_size, 0);
+OFF(aster_connect_config_t, flags, 4);
+OFF(aster_connect_config_t, node_id, 8);
+OFF(aster_connect_config_t, alpn, 24);
+OFF(aster_connect_config_t, addr, 40);
+
+LAYOUT(aster_node_addr_t, 48);
+OFF(aster_node_addr_t, endpoint_id, 0);
+OFF(aster_node_addr_t, relay_url, 16);
+OFF(aster_node_addr_t, direct_addresses, 32);
+
+LAYOUT(aster_event_t, 80);
+OFF(aster_event_t, struct_size, 0);
+OFF(aster_event_t, kind, 4);
+OFF(aster_event_t, status, 8);
+OFF(aster_event_t, operation, 16);
+OFF(aster_event_t, handle, 24);
+OFF(aster_event_t, related, 32);
+OFF(aster_event_t, user_data, 40);
+OFF(aster_event_t, data_ptr, 48);
+OFF(aster_event_t, data_len, 56);
+OFF(aster_event_t, buffer, 64);
+OFF(aster_event_t, error_code, 72);
+OFF(aster_event_t, flags, 76);
+
+LAYOUT(aster_remote_info_t, 72);
+OFF(aster_remote_info_t, struct_size, 0);
+OFF(aster_remote_info_t, node_id, 8);
+OFF(aster_remote_info_t, is_connected, 24);
+OFF(aster_remote_info_t, connection_type, 28);
+OFF(aster_remote_info_t, relay_url, 32);
+OFF(aster_remote_info_t, last_handshake_ns, 48);
+OFF(aster_remote_info_t, bytes_sent, 56);
+OFF(aster_remote_info_t, bytes_received, 64);
+
+LAYOUT(aster_connection_info_t, 56);
+OFF(aster_connection_info_t, struct_size, 0);
+OFF(aster_connection_info_t, connection_type, 4);
+OFF(aster_connection_info_t, bytes_sent, 8);
+OFF(aster_connection_info_t, bytes_received, 16);
+OFF(aster_connection_info_t, rtt_ns, 24);
+OFF(aster_connection_info_t, alpn, 32);
+OFF(aster_connection_info_t, is_connected, 48);
+
+LAYOUT(aster_transport_snapshot_t, 56);
+OFF(aster_transport_snapshot_t, struct_size, 0);
+OFF(aster_transport_snapshot_t, path_kind, 4);
+OFF(aster_transport_snapshot_t, peer_host, 8);
+OFF(aster_transport_snapshot_t, peer_port, 24);
+OFF(aster_transport_snapshot_t, relay_url, 32);
+OFF(aster_transport_snapshot_t, rtt_micros, 48);
+
+LAYOUT(aster_transport_metrics_t, 136);
+OFF(aster_transport_metrics_t, struct_size, 0);
+OFF(aster_transport_metrics_t, send_ipv4, 8);
+OFF(aster_transport_metrics_t, net_reports_full, 128);
+
+LAYOUT(aster_reactor_call_t, 112);
+OFF(aster_reactor_call_t, event_kind, 0);
+OFF(aster_reactor_call_t, call_id, 8);
+OFF(aster_reactor_call_t, connection_id, 16);
+OFF(aster_reactor_call_t, stream_id, 24);
+OFF(aster_reactor_call_t, header_ptr, 32);
+OFF(aster_reactor_call_t, header_len, 40);
+OFF(aster_reactor_call_t, header_flags, 44);
+OFF(aster_reactor_call_t, request_ptr, 48);
+OFF(aster_reactor_call_t, request_len, 56);
+OFF(aster_reactor_call_t, request_flags, 60);
+OFF(aster_reactor_call_t, peer_ptr, 64);
+OFF(aster_reactor_call_t, peer_len, 72);
+OFF(aster_reactor_call_t, header_buffer, 80);
+OFF(aster_reactor_call_t, request_buffer, 88);
+OFF(aster_reactor_call_t, peer_buffer, 96);
+OFF(aster_reactor_call_t, connection_handle, 104);
+
+/* ── Run-time checks ───────────────────────────────────────────────────── */
+
+static int failures = 0;
+
+#define CHECK(cond)                                                            \
+    do {                                                                       \
+        if (cond) {                                                            \
+            printf("  ok   %s\n", #cond);                                      \
+        } else {                                                               \
+            printf("  FAIL %s  (%s:%d)\n", #cond, __FILE__, __LINE__);         \
+            failures++;                                                        \
+        }                                                                      \
+    } while (0)
+
+static void test_abi_version(void) {
+    printf("[abi version]\n");
+    uint32_t v = aster_abi_version();
+    CHECK(v == ASTER_ABI_VERSION);
+    CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
+    CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
+    CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
+    CHECK(ASTER_ABI_VERSION_MAJOR == 3);
+    CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
-
-// ─── Field offset tests ─────────────────────────────────────────────────────
-
-static void test_field_offsets(void) {
-    printf("\n[Field offsets]\n");
-
-    // iroh_event_t field offsets — verified against generated header with offsetof()
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, struct_size), (size_t)0, "iroh_event_t.struct_size offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, kind), (size_t)4, "iroh_event_t.kind offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, status), (size_t)8, "iroh_event_t.status offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, operation), (size_t)16, "iroh_event_t.operation offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, handle), (size_t)24, "iroh_event_t.handle offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, related), (size_t)32, "iroh_event_t.related offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, user_data), (size_t)40, "iroh_event_t.user_data offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, data_ptr), (size_t)48, "iroh_event_t.data_ptr offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, data_len), (size_t)56, "iroh_event_t.data_len offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, buffer), (size_t)64, "iroh_event_t.buffer offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, error_code), (size_t)72, "iroh_event_t.error_code offset");
-    ASSERT_EQ((size_t)offsetof(iroh_event_t, flags), (size_t)76, "iroh_event_t.flags offset");
-}
-
-// ─── Enum value tests ───────────────────────────────────────────────────────
 
 static void test_enum_values(void) {
-    printf("\n[Enum values]\n");
-
-    // Status codes — must match the Rust iroh_status_t enum
-    ASSERT_EQ((int)IROH_STATUS_OK, 0, "IROH_STATUS_OK == 0");
-    ASSERT_EQ((int)IROH_STATUS_INVALID_ARGUMENT, 1, "IROH_STATUS_INVALID_ARGUMENT == 1");
-    ASSERT_EQ((int)IROH_STATUS_NOT_FOUND, 2, "IROH_STATUS_NOT_FOUND == 2");
-    ASSERT_EQ((int)IROH_STATUS_ALREADY_CLOSED, 3, "IROH_STATUS_ALREADY_CLOSED == 3");
-    ASSERT_EQ((int)IROH_STATUS_QUEUE_FULL, 4, "IROH_STATUS_QUEUE_FULL == 4");
-    ASSERT_EQ((int)IROH_STATUS_BUFFER_TOO_SMALL, 5, "IROH_STATUS_BUFFER_TOO_SMALL == 5");
-    ASSERT_EQ((int)IROH_STATUS_UNSUPPORTED, 6, "IROH_STATUS_UNSUPPORTED == 6");
-    ASSERT_EQ((int)IROH_STATUS_INTERNAL, 7, "IROH_STATUS_INTERNAL == 7");
-    ASSERT_EQ((int)IROH_STATUS_TIMEOUT, 8, "IROH_STATUS_TIMEOUT == 8");
-    ASSERT_EQ((int)IROH_STATUS_CANCELLED, 9, "IROH_STATUS_CANCELLED == 9");
-    ASSERT_EQ((int)IROH_STATUS_CONNECTION_REFUSED, 10, "IROH_STATUS_CONNECTION_REFUSED == 10");
-    ASSERT_EQ((int)IROH_STATUS_STREAM_RESET, 11, "IROH_STATUS_STREAM_RESET == 11");
-
-    // Hook decisions
-    ASSERT_EQ((int)IROH_HOOK_DECISION_ALLOW, 0, "IROH_HOOK_DECISION_ALLOW == 0");
-    ASSERT_EQ((int)IROH_HOOK_DECISION_DENY, 1, "IROH_HOOK_DECISION_DENY == 1");
+    printf("[enum values]\n");
+    CHECK(ASTER_STATUS_OK == 0);
+    CHECK(ASTER_STATUS_QUEUE_FULL == 4);
+    CHECK(ASTER_STATUS_STREAM_RESET == 11);
+    CHECK(ASTER_STATUS_ABI_MISMATCH == 12);
+    CHECK(ASTER_EVENT_NONE == 0);
+    CHECK(ASTER_EVENT_CONNECTED == 10);
+    CHECK(ASTER_EVENT_BLOB_OBSERVE_COMPLETE == 56);
+    CHECK(ASTER_EVENT_ASTER_ACCEPTED == 65);
+    CHECK(ASTER_EVENT_ERROR == 99);
+    CHECK(ASTER_RELAY_MODE_DISABLED == 2);
+    CHECK(ASTER_RELAY_MODE_STAGING == 3);
+    CHECK(ASTER_HOOK_FAILURE_FAIL_CLOSED == 1);
+    CHECK(ASTER_HOOK_DECISION_DENY == 1);
+    CHECK(ASTER_CONNECTION_TYPE_UDP_RELAY == 3);
+    CHECK(ASTER_PATH_KIND_RELAY == 2);
+    CHECK(ASTER_DOC_QUERY_LATEST_PREFIX == 3);
+    CHECK(ASTER_DOWNLOAD_POLICY_EVERYTHING_EXCEPT == 2);
+    CHECK(ASTER_DOC_SHARE_WRITE == 1);
+    CHECK(ASTER_REGISTRY_KEY_ACL == 5);
+    CHECK(ASTER_REACTOR_EVENT_CALL == 0);
+    CHECK(ASTER_REACTOR_EVENT_RESPONSE_CLOSED == 3);
+    CHECK(strcmp(aster_status_name(ASTER_STATUS_ABI_MISMATCH), "ASTER_STATUS_ABI_MISMATCH") == 0);
+    CHECK(strcmp(aster_status_name(-999), "ASTER_STATUS_UNKNOWN") == 0);
 }
 
-// ─── Ownership smoke tests ────────────────────────────────────────────────────
+static void test_runtime(void) {
+    printf("[runtime]\n");
+    aster_runtime_t rt = 0;
 
-static void test_ownership_smoke(void) {
-    printf("\n[Ownership smoke tests]\n");
+    /* Wrong ABI major is refused, nothing is created. */
+    int r = aster_runtime_new(ASTER_ABI_VERSION_MAJOR + 1, NULL, &rt);
+    CHECK(r == ASTER_STATUS_ABI_MISMATCH);
+    CHECK(rt == 0);
+    char msg[256] = {0};
+    size_t n = aster_last_error_message((uint8_t *)msg, sizeof msg - 1);
+    CHECK(n > 0 && strstr(msg, "ABI") != NULL);
 
-    // Create a runtime
-    iroh_runtime_config_t config = {
-        .struct_size = sizeof(iroh_runtime_config_t),
+    /* struct_size is validated. */
+    aster_runtime_config_t bad = {.struct_size = 4};
+    r = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &bad, &rt);
+    CHECK(r == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(rt == 0);
+
+    aster_runtime_config_t cfg = {
+        .struct_size = sizeof(aster_runtime_config_t),
         .worker_threads = 1,
         .event_queue_capacity = 64,
-        .reserved = 0,
     };
+    r = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &cfg, &rt);
+    CHECK(r == ASTER_STATUS_OK);
+    CHECK(rt != 0);
 
-    iroh_runtime_t runtime = 0;
-    int r = iroh_runtime_new(&config, &runtime);
-    ASSERT_EQ(r, IROH_STATUS_OK, "iroh_runtime_new returns OK");
-    ASSERT(runtime != 0, "iroh_runtime_new returns non-zero handle");
+    CHECK(aster_buffer_release(rt, 999999) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_string_release(NULL, 0) == ASTER_STATUS_OK);
 
-    // buffer_release on null buffer — must return OK (idempotent)
-    r = iroh_buffer_release(runtime, 0);
-    ASSERT_EQ(r, IROH_STATUS_OK, "iroh_buffer_release(0) returns OK");
+    aster_event_t events[4];
+    memset(events, 0, sizeof events);
+    CHECK(aster_poll_events(rt, events, 4, 0) == 0);
 
-    // buffer_release on invalid buffer — must return NOT_FOUND (not crash)
-    r = iroh_buffer_release(runtime, 999999);
-    ASSERT_EQ(r, IROH_STATUS_NOT_FOUND, "iroh_buffer_release(invalid) returns NOT_FOUND");
-
-    // string_release on null ptr with len=0 — must return OK
-    r = iroh_string_release(NULL, 0);
-    ASSERT_EQ(r, IROH_STATUS_OK, "iroh_string_release(NULL, 0) returns OK");
-
-    // string_release on valid ptr (we don't have a real string, but validate
-    // that calling it with a garbage pointer doesn't crash the process)
-    // This is a smoke test — real strings come from API return values.
-    // r = iroh_string_release(garbage_ptr, 16);
-    // ASSERT_EQ(r, IROH_STATUS_OK, "iroh_string_release(valid ptr) returns OK");
-
-    // poll_events with null output — should return 0 or a valid count
-    iroh_event_t events[4];
-    memset(events, 0, sizeof(events));
-    uintptr_t n = iroh_poll_events(runtime, events, 4, 0);
-    ASSERT(n >= 0, "iroh_poll_events returns non-negative count");
-
-    // operation_cancel on null operation — should return INVALID_ARGUMENT
-    r = iroh_operation_cancel(runtime, 0);
-    ASSERT_EQ(r, IROH_STATUS_INVALID_ARGUMENT, "iroh_operation_cancel(0) returns INVALID_ARGUMENT");
-
-    // Close the runtime
-    r = iroh_runtime_close(runtime);
-    ASSERT_EQ(r, IROH_STATUS_OK, "iroh_runtime_close returns OK");
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_NOT_FOUND);
 }
-
-// ─── Null pointer handling tests ─────────────────────────────────────────────
-
-static void test_null_handling(void) {
-    printf("\n[Null pointer handling]\n");
-
-    // iroh_runtime_new with null config — should use defaults or return error
-    iroh_runtime_t rt = 0;
-    int r_new = iroh_runtime_new(NULL, &rt);
-    if (r_new == IROH_STATUS_OK && rt != 0) {
-        iroh_runtime_close(rt);
-    }
-    // Just verify it doesn't crash
-
-    // iroh_node_id with null out_buf — should return INVALID_ARGUMENT
-    // (we'd need a valid node handle first, so this is a placeholder)
-
-    printf("  (null handling smoke test completed without crash)\n");
-    tests_run++;
-    tests_passed++;
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
 
 int main(void) {
-    printf("=== C ABI Contract Tests ===\n");
-
-    test_struct_sizes();
-    test_field_offsets();
+    test_abi_version();
     test_enum_values();
-    test_ownership_smoke();
-    test_null_handling();
-
-    printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    test_runtime();
+    if (failures) {
+        printf("abi_contract_test: %d failure(s)\n", failures);
+        return 1;
+    }
+    printf("abi_contract_test: all checks passed\n");
+    return 0;
 }

@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -23,8 +23,8 @@ import (
 func pollForEvent(runtime *Runtime, kind uint32, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		var events [8]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 10)
+		var events [8]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 10)
 		for i := 0; i < int(n); i++ {
 			if uint32(events[i].kind) == kind {
 				return true
@@ -38,8 +38,8 @@ func pollForEvent(runtime *Runtime, kind uint32, timeout time.Duration) bool {
 // drainAllEvents drains all pending events from the runtime.
 func drainAllEvents(runtime *Runtime) {
 	for {
-		var events [16]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 16, 0)
+		var events [16]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 16, 0)
 		if int(n) == 0 {
 			break
 		}
@@ -50,8 +50,8 @@ func drainAllEvents(runtime *Runtime) {
 
 // submitAccept submits an accept operation on the given node.
 func submitAccept(runtime *Runtime, node *Node) (uint64, error) {
-	var acceptOp C.iroh_operation_t
-	r := C.iroh_node_accept_aster(
+	var acceptOp C.aster_operation_t
+	r := C.aster_node_accept_aster(
 		C.uint64_t(runtime.handle),
 		C.uint64_t(node.handle),
 		0,
@@ -65,8 +65,8 @@ func submitAccept(runtime *Runtime, node *Node) (uint64, error) {
 
 // closeNode submits a close operation on the given node.
 func closeNode(runtime *Runtime, node *Node) (uint64, error) {
-	var closeOp C.iroh_operation_t
-	r := C.iroh_node_close(
+	var closeOp C.aster_operation_t
+	r := C.aster_node_close(
 		C.uint64_t(runtime.handle),
 		C.uint64_t(node.handle),
 		0,
@@ -82,18 +82,18 @@ func closeNode(runtime *Runtime, node *Node) (uint64, error) {
 // Returns (success, hadTerminal).
 func drainAcceptEvents(runtime *Runtime, acceptOp uint64) (bool, bool) {
 	for i := 0; i < 100; i++ {
-		var events [8]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 50)
+		var events [8]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 50)
 		if int(n) == 0 {
 			break
 		}
 		for j := 0; j < int(n); j++ {
 			ev := events[j]
 			if uint64(ev.operation) == acceptOp {
-				if ev.status == 0 && uint32(ev.kind) == uint32(IROH_EVENT_ASTER_ACCEPTED) {
+				if ev.status == 0 && uint32(ev.kind) == uint32(ASTER_EVENT_ASTER_ACCEPTED) {
 					return true, true
 				}
-				if uint32(ev.kind) == uint32(IROH_EVENT_OPERATION_CANCELLED) || uint32(ev.kind) == uint32(IROH_EVENT_ERROR) {
+				if uint32(ev.kind) == uint32(ASTER_EVENT_OPERATION_CANCELLED) || uint32(ev.kind) == uint32(ASTER_EVENT_ERROR) {
 					return false, true
 				}
 			}
@@ -105,8 +105,8 @@ func drainAcceptEvents(runtime *Runtime, acceptOp uint64) (bool, bool) {
 // drainEventsWithTracking tracks terminal events for acceptOp and closeOp.
 func drainEventsWithTracking(runtime *Runtime, acceptOp, closeOp uint64) (acceptTerminal, closeTerminal int32) {
 	for i := 0; i < 100; i++ {
-		var events [8]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 50)
+		var events [8]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 50)
 		if int(n) == 0 {
 			break
 		}
@@ -147,8 +147,8 @@ func raceCancelAndDrain(runtime *Runtime, acceptOp uint64) (kind int32, count in
 	go func() {
 		defer wg.Done()
 		for {
-			var events [8]C.iroh_event_t
-			n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 50)
+			var events [8]C.aster_event_t
+			n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 50)
 			for i := 0; i < int(n); i++ {
 				if uint64(events[i].operation) == acceptOp {
 					atomic.AddInt32(&count, 1)
@@ -180,8 +180,8 @@ func drainAllOpsEvents(runtime *Runtime, ops []uint64) int {
 
 	completed := 0
 	for i := 0; i < 200; i++ {
-		var events [8]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 50)
+		var events [8]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 50)
 		if int(n) == 0 {
 			break
 		}
@@ -197,7 +197,7 @@ func drainAllOpsEvents(runtime *Runtime, ops []uint64) int {
 
 // tryPollEvents does a single non-blocking poll and returns the raw event count.
 func tryPollEvents(runtime *Runtime) int {
-	var events [8]C.iroh_event_t
-	n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 0)
+	var events [8]C.aster_event_t
+	n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 0)
 	return int(n)
 }

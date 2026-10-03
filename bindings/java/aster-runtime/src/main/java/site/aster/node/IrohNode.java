@@ -100,7 +100,7 @@ public class IrohNode implements AutoCloseable {
 
     int status = lib.nodeId(runtime.nativeHandle(), nodeHandle, bufSeg, 64, lenSeg);
     if (status != 0) {
-      throw IrohException.forStatus(IrohStatus.fromCode(status), "iroh_node_id failed");
+      throw IrohException.forStatus(IrohStatus.fromCode(status), "aster_node_id failed");
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -115,11 +115,11 @@ public class IrohNode implements AutoCloseable {
     Arena confined = Arena.ofConfined();
     SegmentAllocator alloc = confined;
     MemorySegment bufSeg = alloc.allocate(ValueLayout.JAVA_BYTE, 4096);
-    MemorySegment addrSeg = alloc.allocate(IrohLibrary.IROH_NODE_ADDR);
+    MemorySegment addrSeg = alloc.allocate(IrohLibrary.ASTER_NODE_ADDR);
 
     int status = lib.nodeAddrInfo(runtime.nativeHandle(), nodeHandle, bufSeg, 4096, addrSeg);
     if (status != 0) {
-      throw IrohException.forStatus(IrohStatus.fromCode(status), "iroh_node_addr_info failed");
+      throw IrohException.forStatus(IrohStatus.fromCode(status), "aster_node_addr_info failed");
     }
 
     String endpointId = readIrohBytes(addrSeg.asSlice(0, 16));
@@ -153,7 +153,7 @@ public class IrohNode implements AutoCloseable {
     if (itemsPtr == MemorySegment.NULL || itemsLen == 0) return java.util.Collections.emptyList();
 
     java.util.List<String> result = new java.util.ArrayList<>();
-    long itemSize = 16; // size of iroh_bytes_t { ptr: 8, len: 8 }
+    long itemSize = 16; // size of aster_bytes_t { ptr: 8, len: 8 }
     for (int i = 0; i < itemsLen; i++) {
       MemorySegment itemSeg = MemorySegment.ofAddress(itemsPtr.address() + i * itemSize);
       MemorySegment itemPtr = itemSeg.get(ValueLayout.ADDRESS, 0);
@@ -177,7 +177,7 @@ public class IrohNode implements AutoCloseable {
     int status = lib.nodeExportSecretKey(runtime.nativeHandle(), nodeHandle, bufSeg, 32, lenSeg);
     if (status != 0) {
       throw IrohException.forStatus(
-          IrohStatus.fromCode(status), "iroh_node_export_secret_key failed");
+          IrohStatus.fromCode(status), "aster_node_export_secret_key failed");
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);

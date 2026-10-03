@@ -22,7 +22,7 @@ func TestFakeCQ_SubmitComplete(t *testing.T) {
 	cq.Register(op, ch)
 
 	// Complete the operation with a terminal event.
-	ev := &Event{Kind: IROH_EVENT_STREAM_FINISHED, Handle: 42}
+	ev := &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: 42}
 	cq.Complete(op, ev)
 
 	// Should receive the event.
@@ -31,7 +31,7 @@ func TestFakeCQ_SubmitComplete(t *testing.T) {
 		if got.Handle != 42 {
 			t.Errorf("expected handle 42, got %d", got.Handle)
 		}
-		if got.Kind != IROH_EVENT_STREAM_FINISHED {
+		if got.Kind != ASTER_EVENT_STREAM_FINISHED {
 			t.Errorf("expected STREAM_FINISHED, got %d", got.Kind)
 		}
 	case <-time.After(100 * time.Millisecond):
@@ -57,7 +57,7 @@ func TestFakeCQ_SubmitCancel(t *testing.T) {
 	cq.Unregister(op)
 
 	// Completing a cancelled op should be a no-op (op not found).
-	cq.Complete(op, &Event{Kind: IROH_EVENT_STREAM_FINISHED})
+	cq.Complete(op, &Event{Kind: ASTER_EVENT_STREAM_FINISHED})
 	if cq.Pending() != 0 {
 		t.Errorf("expected 0 pending after cancel, got %d", cq.Pending())
 	}
@@ -89,7 +89,7 @@ func TestFakeCQ_ExactlyOnceTerminal(t *testing.T) {
 	cq.Register(op3, ch3)
 
 	// Complete op1.
-	cq.Complete(op1, &Event{Kind: IROH_EVENT_STREAM_FINISHED, Handle: 1})
+	cq.Complete(op1, &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: 1})
 	select {
 	case <-ch1:
 	case <-time.After(100 * time.Millisecond):
@@ -97,7 +97,7 @@ func TestFakeCQ_ExactlyOnceTerminal(t *testing.T) {
 	}
 
 	// Complete op2.
-	cq.Complete(op2, &Event{Kind: IROH_EVENT_STREAM_FINISHED, Handle: 2})
+	cq.Complete(op2, &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: 2})
 	select {
 	case <-ch2:
 	case <-time.After(100 * time.Millisecond):
@@ -105,7 +105,7 @@ func TestFakeCQ_ExactlyOnceTerminal(t *testing.T) {
 	}
 
 	// Complete op3.
-	cq.Complete(op3, &Event{Kind: IROH_EVENT_ERROR, Handle: 3, ErrorCode: -1})
+	cq.Complete(op3, &Event{Kind: ASTER_EVENT_ERROR, Handle: 3, ErrorCode: -1})
 	select {
 	case <-ch3:
 	case <-time.After(100 * time.Millisecond):
@@ -158,8 +158,8 @@ func TestFakeCQ_NoDoubleComplete(t *testing.T) {
 	ch := make(chan *Event, 1)
 	cq.Register(op, ch)
 
-	ev1 := &Event{Kind: IROH_EVENT_STREAM_FINISHED, Handle: 1}
-	ev2 := &Event{Kind: IROH_EVENT_STREAM_FINISHED, Handle: 2}
+	ev1 := &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: 1}
+	ev2 := &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: 2}
 
 	cq.Complete(op, ev1)
 
@@ -193,7 +193,7 @@ func TestFakeCQ_StaleOpComplete(t *testing.T) {
 	cq.Unregister(stale) // simulate cancelled
 
 	// Should not panic.
-	cq.Complete(stale, &Event{Kind: IROH_EVENT_STREAM_FINISHED})
+	cq.Complete(stale, &Event{Kind: ASTER_EVENT_STREAM_FINISHED})
 }
 
 // TestFakeCQ_EventDataPreserved verifies event fields are preserved through dispatch.
@@ -206,7 +206,7 @@ func TestFakeCQ_EventDataPreserved(t *testing.T) {
 	cq.Register(op, ch)
 
 	ev := &Event{
-		Kind:      IROH_EVENT_FRAME_RECEIVED,
+		Kind:      ASTER_EVENT_FRAME_RECEIVED,
 		Handle:    99,
 		DataLen:   5,
 		Buffer:    7,
@@ -220,7 +220,7 @@ func TestFakeCQ_EventDataPreserved(t *testing.T) {
 		if got.Handle != 99 {
 			t.Errorf("expected handle 99, got %d", got.Handle)
 		}
-		if got.Kind != IROH_EVENT_FRAME_RECEIVED {
+		if got.Kind != ASTER_EVENT_FRAME_RECEIVED {
 			t.Errorf("expected FRAME_RECEIVED, got %d", got.Kind)
 		}
 		if got.Buffer != 7 {
@@ -248,7 +248,7 @@ func TestFakeCQ_ConcurrentSubmitComplete(t *testing.T) {
 			ch := make(chan *Event, 1)
 			cq.Register(op, ch)
 
-			ev := &Event{Kind: IROH_EVENT_STREAM_FINISHED, Handle: uint64(idx)}
+			ev := &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: uint64(idx)}
 			cq.Complete(op, ev)
 
 			// Verify we receive exactly one event.
@@ -290,7 +290,7 @@ func TestFakeCQ_ConcurrentCancelComplete(t *testing.T) {
 		// Complete goroutine
 		go func(idx int, o uint64, c chan *Event) {
 			defer wg.Done()
-			ev := &Event{Kind: IROH_EVENT_STREAM_FINISHED, Handle: uint64(idx)}
+			ev := &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: uint64(idx)}
 			cq.Complete(o, ev)
 			completed[idx] = true
 		}(i, op, ch)

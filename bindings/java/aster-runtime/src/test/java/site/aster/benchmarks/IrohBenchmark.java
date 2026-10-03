@@ -48,7 +48,7 @@ public class IrohBenchmark {
     public void setup() {
       arena = Arena.ofConfined();
       // Create runtime via FFI
-      // Note: We can't call iroh_runtime_new directly from here without JNI
+      // Note: We can't call aster_runtime_new directly from here without JNI
       // These benchmarks validate Java FFM overhead, not the full FFI round-trip
     }
 
@@ -60,11 +60,11 @@ public class IrohBenchmark {
 
   // ─── Benchmarks ────────────────────────────────────────────────────────
 
-  /** Measure overhead of Arena.allocate(IROH_EVENT) — zero allocation, just booking. */
+  /** Measure overhead of Arena.allocate(ASTER_EVENT) — zero allocation, just booking. */
   @Benchmark
   public void benchArenaAllocateEvent(BenchmarkState state) {
     // Just measuring arena allocation (no native call)
-    MemorySegment seg = state.arena.allocate(IrohLibrary.IROH_EVENT);
+    MemorySegment seg = state.arena.allocate(IrohLibrary.ASTER_EVENT);
     // Touch the segment to prevent optimization
     seg.set(ValueLayout.JAVA_BYTE, 0, (byte) 0);
   }
@@ -72,7 +72,7 @@ public class IrohBenchmark {
   /** Measure overhead of MemorySegment.set(ValueLayout, offset, value). */
   @Benchmark
   public void benchEventSegmentWrite(BenchmarkState state) {
-    MemorySegment seg = state.arena.allocate(IrohLibrary.IROH_EVENT);
+    MemorySegment seg = state.arena.allocate(IrohLibrary.ASTER_EVENT);
     seg.set(ValueLayout.JAVA_INT, 0, 80); // struct_size
     seg.set(ValueLayout.JAVA_INT, 4, 2); // kind
     seg.set(ValueLayout.JAVA_LONG, 16, 42); // operation
@@ -82,7 +82,7 @@ public class IrohBenchmark {
   /** Measure overhead of MemorySegment.get(ValueLayout, offset). */
   @Benchmark
   public void benchEventSegmentRead(BenchmarkState state) {
-    MemorySegment seg = state.arena.allocate(IrohLibrary.IROH_EVENT);
+    MemorySegment seg = state.arena.allocate(IrohLibrary.ASTER_EVENT);
     seg.set(ValueLayout.JAVA_INT, 0, 80);
     seg.set(ValueLayout.JAVA_INT, 4, 2);
     seg.set(ValueLayout.JAVA_LONG, 16, 42);
@@ -102,7 +102,7 @@ public class IrohBenchmark {
   @Benchmark
   public void benchFieldOffsetLookup() {
     long offset =
-        IrohLibrary.IROH_EVENT.byteOffset(MemoryLayout.PathElement.groupElement("operation"));
+        IrohLibrary.ASTER_EVENT.byteOffset(MemoryLayout.PathElement.groupElement("operation"));
   }
 
   /**

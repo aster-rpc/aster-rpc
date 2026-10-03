@@ -1,14 +1,13 @@
 //go:build cgo
 
 // Test datagram send and receive between two endpoints.
-// Validates that iroh_connection_read_datagram emits BYTES_RESULT (not DATAGRAM_RECEIVED).
+// Validates that aster_connection_read_datagram emits BYTES_RESULT (not DATAGRAM_RECEIVED).
 package main
 
 import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	aster "aster-ffi"

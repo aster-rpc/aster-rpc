@@ -4,7 +4,8 @@ package site.aster.ffi;
 public enum IrohRelayMode {
   DEFAULT(0),
   CUSTOM(1),
-  DISABLED(2);
+  DISABLED(2),
+  STAGING(3);
 
   public final int code;
 

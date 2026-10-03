@@ -13,7 +13,9 @@ public enum IrohStatus {
   TIMEOUT(8),
   CANCELLED(9),
   CONNECTION_REFUSED(10),
-  STREAM_RESET(11);
+  STREAM_RESET(11),
+  /** {@code aster_runtime_new} was called with a different ABI major than the library. */
+  ABI_MISMATCH(12);
 
   public final int code;
 

@@ -104,7 +104,7 @@ public final class Reactor implements AutoCloseable {
   public static final long OFFSET_PEER_BUFFER = 96;
   public static final long OFFSET_CONNECTION_HANDLE = 104;
 
-  /** Event-kind constants matching {@code ASTER_EVENT_KIND_*} in {@code ffi/iroh_ffi.h}. */
+  /** Event-kind constants matching {@code ASTER_REACTOR_EVENT_*} in {@code ffi/aster_ffi.h}. */
   public static final byte EVENT_KIND_CALL = 0;
 
   public static final byte EVENT_KIND_CONNECTION_CLOSED = 1;
@@ -271,8 +271,8 @@ public final class Reactor implements AutoCloseable {
   /**
    * Create a reactor attached to the given node. Starts accepting connections immediately.
    *
-   * @param runtimeHandle handle returned from {@code iroh_runtime_new}
-   * @param nodeHandle handle of a node created with {@code iroh_node_memory_with_alpns}
+   * @param runtimeHandle handle returned from {@code aster_runtime_new}
+   * @param nodeHandle handle of a node created with {@code aster_node_memory_with_alpns}
    * @param ringCapacity SPSC ring capacity (rounded up to next power of two; 0 → 256)
    * @throws IrohException if the underlying call returns a non-OK status
    */
@@ -345,7 +345,7 @@ public final class Reactor implements AutoCloseable {
     }
   }
 
-  /** One native submission attempt, returning an {@code iroh_status_t} code. */
+  /** One native submission attempt, returning an {@code aster_status_t} code. */
   @FunctionalInterface
   interface SubmitAttempt {
     int invoke() throws Throwable;
@@ -615,7 +615,7 @@ public final class Reactor implements AutoCloseable {
    * id is unknown — already completed, or cancelled and reaped. Both mean "stop"; neither means
    * "keep going".
    *
-   * <p>This used to be {@code return status == 1}, which read {@code IROH_STATUS_NOT_FOUND} —
+   * <p>This used to be {@code return status == 1}, which read {@code ASTER_STATUS_NOT_FOUND} —
    * positive code 2 — as {@code false} and told the producer to continue streaming on a call that
    * no longer existed. Since cancellation now reaps per-call state as soon as the response receiver
    * drops, NOT_FOUND is the <em>common</em> answer after a cancel, not an edge case.

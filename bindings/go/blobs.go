@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -90,14 +90,14 @@ func (b *Blobs) Node() *Node {
 
 // AddBytes stores bytes in the blob store.
 func (b *Blobs) AddBytes(ctx context.Context, data []byte) (BlobID, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
-	bytes := C.struct_iroh_bytes_t{
+	bytes := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&data[0])),
 		len: C.uintptr_t(len(data)),
 	}
 
-	r := C.iroh_blobs_add_bytes(
+	r := C.aster_blobs_add_bytes(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		bytes,
@@ -105,14 +105,14 @@ func (b *Blobs) AddBytes(ctx context.Context, data []byte) (BlobID, error) {
 		&opID,
 	)
 	if r != 0 {
-		return "", fmt.Errorf("iroh_blobs_add_bytes: %w", Error(r))
+		return "", fmt.Errorf("aster_blobs_add_bytes: %w", Error(r))
 	}
 
 	ev, err := b.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return "", fmt.Errorf("add bytes poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_BLOB_ADDED {
+	if ev.Kind != ASTER_EVENT_BLOB_ADDED {
 		return "", fmt.Errorf("add bytes: unexpected event %d", ev.Kind)
 	}
 
@@ -122,21 +122,21 @@ func (b *Blobs) AddBytes(ctx context.Context, data []byte) (BlobID, error) {
 
 // AddBytesAsCollection stores bytes as a named entry in a collection.
 func (b *Blobs) AddBytesAsCollection(ctx context.Context, data []byte, name string) (BlobID, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	nameBytes := []byte(name)
 	dataBytes := data
 
-	bytes := C.struct_iroh_bytes_t{
+	bytes := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&dataBytes[0])),
 		len: C.uintptr_t(len(dataBytes)),
 	}
-	nameC := C.struct_iroh_bytes_t{
+	nameC := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&nameBytes[0])),
 		len: C.uintptr_t(len(nameBytes)),
 	}
 
-	r := C.iroh_blobs_add_bytes_as_collection(
+	r := C.aster_blobs_add_bytes_as_collection(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		nameC,
@@ -145,14 +145,14 @@ func (b *Blobs) AddBytesAsCollection(ctx context.Context, data []byte, name stri
 		&opID,
 	)
 	if r != 0 {
-		return "", fmt.Errorf("iroh_blobs_add_bytes_as_collection: %w", Error(r))
+		return "", fmt.Errorf("aster_blobs_add_bytes_as_collection: %w", Error(r))
 	}
 
 	ev, err := b.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return "", fmt.Errorf("add bytes as collection poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_BLOB_ADDED {
+	if ev.Kind != ASTER_EVENT_BLOB_ADDED {
 		return "", fmt.Errorf("add bytes as collection: unexpected event %d", ev.Kind)
 	}
 
@@ -163,15 +163,15 @@ func (b *Blobs) AddBytesAsCollection(ctx context.Context, data []byte, name stri
 // AddCollection stores a multi-file collection.
 // entriesJson is a UTF-8 JSON string: [[name, base64data], ...]
 func (b *Blobs) AddCollection(ctx context.Context, entriesJson string) (BlobID, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	jsonBytes := []byte(entriesJson)
-	bytes := C.struct_iroh_bytes_t{
+	bytes := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&jsonBytes[0])),
 		len: C.uintptr_t(len(jsonBytes)),
 	}
 
-	r := C.iroh_blobs_add_collection(
+	r := C.aster_blobs_add_collection(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		bytes,
@@ -179,14 +179,14 @@ func (b *Blobs) AddCollection(ctx context.Context, entriesJson string) (BlobID, 
 		&opID,
 	)
 	if r != 0 {
-		return "", fmt.Errorf("iroh_blobs_add_collection: %w", Error(r))
+		return "", fmt.Errorf("aster_blobs_add_collection: %w", Error(r))
 	}
 
 	ev, err := b.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return "", fmt.Errorf("add collection poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_BLOB_COLLECTION_ADDED {
+	if ev.Kind != ASTER_EVENT_BLOB_COLLECTION_ADDED {
 		return "", fmt.Errorf("add collection: unexpected event %d", ev.Kind)
 	}
 
@@ -196,15 +196,15 @@ func (b *Blobs) AddCollection(ctx context.Context, entriesJson string) (BlobID, 
 
 // Read retrieves blob data by hash.
 func (b *Blobs) Read(ctx context.Context, hashHex string) ([]byte, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	hashBytes := []byte(hashHex)
-	hashC := C.struct_iroh_bytes_t{
+	hashC := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
 		len: C.uintptr_t(len(hashBytes)),
 	}
 
-	r := C.iroh_blobs_read(
+	r := C.aster_blobs_read(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		hashC,
@@ -212,14 +212,14 @@ func (b *Blobs) Read(ctx context.Context, hashHex string) ([]byte, error) {
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_blobs_read: %w", Error(r))
+		return nil, fmt.Errorf("aster_blobs_read: %w", Error(r))
 	}
 
 	ev, err := b.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("read poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_BLOB_READ {
+	if ev.Kind != ASTER_EVENT_BLOB_READ {
 		return nil, fmt.Errorf("read: unexpected event %d", ev.Kind)
 	}
 
@@ -233,15 +233,15 @@ func (b *Blobs) Read(ctx context.Context, hashHex string) ([]byte, error) {
 
 // Download downloads a blob from a ticket.
 func (b *Blobs) Download(ctx context.Context, ticket BlobTicket) (BlobID, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	ticketBytes := []byte(ticket)
-	ticketC := C.struct_iroh_bytes_t{
+	ticketC := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&ticketBytes[0])),
 		len: C.uintptr_t(len(ticketBytes)),
 	}
 
-	r := C.iroh_blobs_download(
+	r := C.aster_blobs_download(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		ticketC,
@@ -249,14 +249,14 @@ func (b *Blobs) Download(ctx context.Context, ticket BlobTicket) (BlobID, error)
 		&opID,
 	)
 	if r != 0 {
-		return "", fmt.Errorf("iroh_blobs_download: %w", Error(r))
+		return "", fmt.Errorf("aster_blobs_download: %w", Error(r))
 	}
 
 	ev, err := b.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return "", fmt.Errorf("download poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_BLOB_DOWNLOADED {
+	if ev.Kind != ASTER_EVENT_BLOB_DOWNLOADED {
 		return "", fmt.Errorf("download: unexpected event %d", ev.Kind)
 	}
 
@@ -270,7 +270,7 @@ func (b *Blobs) Status(hashHex string) (BlobStatus, int64, error) {
 	var status C.uint32_t
 	var size C.uint64_t
 
-	r := C.iroh_blobs_status(
+	r := C.aster_blobs_status(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
@@ -279,7 +279,7 @@ func (b *Blobs) Status(hashHex string) (BlobStatus, int64, error) {
 		&size,
 	)
 	if r != 0 {
-		return BLOB_STATUS_NOT_FOUND, 0, fmt.Errorf("iroh_blobs_status: %w", Error(r))
+		return BLOB_STATUS_NOT_FOUND, 0, fmt.Errorf("aster_blobs_status: %w", Error(r))
 	}
 
 	return BlobStatus(status), int64(size), nil
@@ -290,7 +290,7 @@ func (b *Blobs) Has(hashHex string) (bool, error) {
 	hashBytes := []byte(hashHex)
 	var has C.uint32_t
 
-	r := C.iroh_blobs_has(
+	r := C.aster_blobs_has(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
@@ -298,7 +298,7 @@ func (b *Blobs) Has(hashHex string) (bool, error) {
 		&has,
 	)
 	if r != 0 {
-		return false, fmt.Errorf("iroh_blobs_has: %w", Error(r))
+		return false, fmt.Errorf("aster_blobs_has: %w", Error(r))
 	}
 
 	return has != 0, nil
@@ -306,11 +306,11 @@ func (b *Blobs) Has(hashHex string) (bool, error) {
 
 // ObserveComplete waits until a blob is fully downloaded.
 func (b *Blobs) ObserveComplete(ctx context.Context, hashHex string) error {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	hashBytes := []byte(hashHex)
 
-	r := C.iroh_blobs_observe_complete(
+	r := C.aster_blobs_observe_complete(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
@@ -319,7 +319,7 @@ func (b *Blobs) ObserveComplete(ctx context.Context, hashHex string) error {
 		&opID,
 	)
 	if r != 0 {
-		return fmt.Errorf("iroh_blobs_observe_complete: %w", Error(r))
+		return fmt.Errorf("aster_blobs_observe_complete: %w", Error(r))
 	}
 
 	_, err := b.runtime.Poll(ctx, uint64(opID))
@@ -336,7 +336,7 @@ func (b *Blobs) ObserveSnapshot(hashHex string) (bool, int64, error) {
 	var isComplete C.uint32_t
 	var size C.uint64_t
 
-	r := C.iroh_blobs_observe_snapshot(
+	r := C.aster_blobs_observe_snapshot(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
@@ -345,7 +345,7 @@ func (b *Blobs) ObserveSnapshot(hashHex string) (bool, int64, error) {
 		&size,
 	)
 	if r != 0 {
-		return false, 0, fmt.Errorf("iroh_blobs_observe_snapshot: %w", Error(r))
+		return false, 0, fmt.Errorf("aster_blobs_observe_snapshot: %w", Error(r))
 	}
 
 	return isComplete != 0, int64(size), nil
@@ -353,15 +353,15 @@ func (b *Blobs) ObserveSnapshot(hashHex string) (bool, int64, error) {
 
 // ListCollection lists entries in a collection.
 func (b *Blobs) ListCollection(ctx context.Context, hashHex string) (*BlobCollection, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	hashBytes := []byte(hashHex)
-	hashC := C.struct_iroh_bytes_t{
+	hashC := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
 		len: C.uintptr_t(len(hashBytes)),
 	}
 
-	r := C.iroh_blobs_list_collection(
+	r := C.aster_blobs_list_collection(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		hashC,
@@ -369,14 +369,14 @@ func (b *Blobs) ListCollection(ctx context.Context, hashHex string) (*BlobCollec
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_blobs_list_collection: %w", Error(r))
+		return nil, fmt.Errorf("aster_blobs_list_collection: %w", Error(r))
 	}
 
 	ev, err := b.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("list collection poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_BLOB_READ {
+	if ev.Kind != ASTER_EVENT_BLOB_READ {
 		return nil, fmt.Errorf("list collection: unexpected event %d", ev.Kind)
 	}
 
@@ -431,12 +431,12 @@ func (b *Blobs) CreateTicket(hashHex string, format BlobFormat) (BlobTicket, err
 	var buf [1024]byte
 	var outLen C.uintptr_t
 
-	hashC := C.struct_iroh_bytes_t{
+	hashC := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
 		len: C.uintptr_t(len(hashBytes)),
 	}
 
-	r := C.iroh_blobs_create_ticket(
+	r := C.aster_blobs_create_ticket(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		hashC,
@@ -445,7 +445,7 @@ func (b *Blobs) CreateTicket(hashHex string, format BlobFormat) (BlobTicket, err
 		&outLen,
 	)
 	if r != 0 {
-		return "", fmt.Errorf("iroh_blobs_create_ticket: %w", Error(r))
+		return "", fmt.Errorf("aster_blobs_create_ticket: %w", Error(r))
 	}
 
 	ticket := BlobTicket(C.GoStringN((*C.char)(unsafe.Pointer(&buf[0])), C.int(outLen)))
@@ -458,12 +458,12 @@ func (b *Blobs) CreateCollectionTicket(hashHex string, names []string) (BlobTick
 	var buf [1024]byte
 	var outLen C.uintptr_t
 
-	hashC := C.struct_iroh_bytes_t{
+	hashC := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
 		len: C.uintptr_t(len(hashBytes)),
 	}
 
-	r := C.iroh_blobs_create_collection_ticket(
+	r := C.aster_blobs_create_collection_ticket(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		hashC,
@@ -472,7 +472,7 @@ func (b *Blobs) CreateCollectionTicket(hashHex string, names []string) (BlobTick
 		&outLen,
 	)
 	if r != 0 {
-		return "", fmt.Errorf("iroh_blobs_create_collection_ticket: %w", Error(r))
+		return "", fmt.Errorf("aster_blobs_create_collection_ticket: %w", Error(r))
 	}
 
 	ticket := BlobTicket(C.GoStringN((*C.char)(unsafe.Pointer(&buf[0])), C.int(outLen)))
@@ -485,7 +485,7 @@ func (b *Blobs) LocalInfo(hashHex string) (*BlobInfo, error) {
 	var isComplete C.uint32_t
 	var localBytes C.uint64_t
 
-	r := C.iroh_blobs_local_info(
+	r := C.aster_blobs_local_info(
 		C.uint64_t(b.runtime.handle),
 		C.uint64_t(b.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&hashBytes[0])),
@@ -494,7 +494,7 @@ func (b *Blobs) LocalInfo(hashHex string) (*BlobInfo, error) {
 		&localBytes,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_blobs_local_info: %w", Error(r))
+		return nil, fmt.Errorf("aster_blobs_local_info: %w", Error(r))
 	}
 
 	status := BLOB_STATUS_PARTIAL

@@ -10,7 +10,7 @@ import site.aster.ffi.*;
 import site.aster.tracker.LeakTracker;
 
 /**
- * Wraps an {@code iroh_runtime_t} handle.
+ * Wraps an {@code aster_runtime_t} handle.
  *
  * <p>Each {@code IrohRuntime} owns a Tokio runtime and event queue on the native side. There is
  * typically one per JVM process.
@@ -37,24 +37,33 @@ public class IrohRuntime implements AutoCloseable {
     this.tracker = tracker;
     this.registry = new OperationRegistry();
 
-    MemorySegment configSeg = lib.allocator().allocate(IrohLibrary.IROH_RUNTIME_CONFIG);
-    configSeg.set(ValueLayout.JAVA_INT, 0, (int) IrohLibrary.IROH_RUNTIME_CONFIG.byteSize());
-    configSeg.set(ValueLayout.JAVA_INT, 4, 0); // flags = 0
-    configSeg.set(ValueLayout.JAVA_INT, 8, 0); // worker_threads = 0 (default)
-    configSeg.set(ValueLayout.JAVA_INT, 12, 64); // event_queue_capacity = 64
+    MemorySegment configSeg = lib.allocator().allocate(IrohLibrary.ASTER_RUNTIME_CONFIG);
+    configSeg.set(ValueLayout.JAVA_INT, 0, (int) IrohLibrary.ASTER_RUNTIME_CONFIG.byteSize());
+    configSeg.set(ValueLayout.JAVA_INT, 4, 0); // worker_threads = 0 (library default)
+    configSeg.set(ValueLayout.JAVA_INT, 8, 0); // event_queue_capacity = 0 (library default)
+    configSeg.set(ValueLayout.JAVA_INT, 12, 0); // reserved
 
     var runtimeNew =
         lib.getHandle(
-            "iroh_runtime_new",
-            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+            "aster_runtime_new",
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS,
+                ValueLayout.ADDRESS));
 
     try {
-      int status = (int) runtimeNew.invoke(configSeg, lib.runtimeHandleSegment());
+      int status =
+          (int)
+              runtimeNew.invoke(
+                  IrohLibrary.EXPECTED_ABI_MAJOR, configSeg, lib.runtimeHandleSegment());
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_runtime_new failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_runtime_new failed: " + status);
       }
+    } catch (IrohException e) {
+      throw e;
     } catch (Throwable t) {
-      throw new IrohException("iroh_runtime_new threw: " + t.getMessage());
+      throw new IrohException("aster_runtime_new threw: " + t.getMessage());
     }
 
     this.handle = lib.runtimeHandleSegment().get(ValueLayout.JAVA_LONG, 0);
@@ -63,18 +72,18 @@ public class IrohRuntime implements AutoCloseable {
 
     this.runtimeClose =
         lib.getHandle(
-            "iroh_runtime_close",
+            "aster_runtime_close",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
 
     this.bufferRelease =
         lib.getHandle(
-            "iroh_buffer_release",
+            "aster_buffer_release",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
 
     this.operationCancel =
         lib.getHandle(
-            "iroh_operation_cancel",
+            "aster_operation_cancel",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
   }
@@ -93,7 +102,7 @@ public class IrohRuntime implements AutoCloseable {
   public void releaseBuffer(long bufferHandle) {
     int status = callSync(bufferRelease, handle, bufferHandle);
     if (status != 0) {
-      throw new IrohException(IrohStatus.fromCode(status), "iroh_buffer_release failed");
+      throw new IrohException(IrohStatus.fromCode(status), "aster_buffer_release failed");
     }
   }
 
@@ -101,7 +110,7 @@ public class IrohRuntime implements AutoCloseable {
   public void cancelOperation(long operationId) {
     int status = callSync(operationCancel, handle, operationId);
     if (status != 0) {
-      throw new IrohException(IrohStatus.fromCode(status), "iroh_operation_cancel failed");
+      throw new IrohException(IrohStatus.fromCode(status), "aster_operation_cancel failed");
     }
   }
 
@@ -141,7 +150,7 @@ public class IrohRuntime implements AutoCloseable {
 
     var endpointCreate =
         lib.getHandle(
-            "iroh_endpoint_create",
+            "aster_endpoint_create",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -153,10 +162,10 @@ public class IrohRuntime implements AutoCloseable {
       int status = (int) endpointCreate.invoke(handle, configSeg, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_endpoint_create failed: " + status);
+            IrohStatus.fromCode(status), "aster_endpoint_create failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_endpoint_create threw: " + t.getMessage());
+      throw new IrohException("aster_endpoint_create threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -177,7 +186,7 @@ public class IrohRuntime implements AutoCloseable {
     try {
       runtimeClose.invoke(handle);
     } catch (Throwable t) {
-      throw new IrohException("iroh_runtime_close failed: " + t.getMessage());
+      throw new IrohException("aster_runtime_close failed: " + t.getMessage());
     }
   }
 

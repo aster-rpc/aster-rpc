@@ -57,7 +57,7 @@ public class IrohStream implements AutoCloseable {
   private final SubmissionPublisher<StreamTerminated> terminated = new SubmissionPublisher<>();
 
   /**
-   * Pending read operations, keyed by op_id returned from {@code iroh_stream_read}. The {@code
+   * Pending read operations, keyed by op_id returned from {@code aster_stream_read}. The {@code
    * FRAME_RECEIVED} event carries the same op_id, which completes the pending future with the frame
    * bytes.
    */
@@ -77,18 +77,18 @@ public class IrohStream implements AutoCloseable {
 
     this.streamWrite =
         lib.getHandle(
-            "iroh_stream_write",
+            "aster_stream_write",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG, // runtime
                 ValueLayout.JAVA_LONG, // send_stream
-                IrohLibrary.IROH_BYTES, // data (iroh_bytes_t struct)
+                IrohLibrary.ASTER_BYTES, // data (aster_bytes_t struct)
                 ValueLayout.JAVA_LONG, // user_data — used as message_id echo
                 ValueLayout.ADDRESS)); // out_operation
 
     this.streamFinish =
         lib.getHandle(
-            "iroh_stream_finish",
+            "aster_stream_finish",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -98,7 +98,7 @@ public class IrohStream implements AutoCloseable {
 
     this.streamRead =
         lib.getHandle(
-            "iroh_stream_read",
+            "aster_stream_read",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -109,7 +109,7 @@ public class IrohStream implements AutoCloseable {
 
     this.streamReadToEnd =
         lib.getHandle(
-            "iroh_stream_read_to_end",
+            "aster_stream_read_to_end",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG, // runtime
@@ -120,7 +120,7 @@ public class IrohStream implements AutoCloseable {
 
     this.streamStop =
         lib.getHandle(
-            "iroh_stream_stop",
+            "aster_stream_stop",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -129,13 +129,13 @@ public class IrohStream implements AutoCloseable {
 
     this.sendStreamFree =
         lib.getHandle(
-            "iroh_send_stream_free",
+            "aster_send_stream_free",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
 
     this.recvStreamFree =
         lib.getHandle(
-            "iroh_recv_stream_free",
+            "aster_recv_stream_free",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
 
@@ -168,7 +168,7 @@ public class IrohStream implements AutoCloseable {
               }
             }
             case IrohEventKind.SEND_COMPLETED -> {
-              // user_data echoes the message_id passed to iroh_stream_write
+              // user_data echoes the message_id passed to aster_stream_write
               long msgId = event.userData();
               CompletableFuture<Void> future = pendingSends.remove(msgId);
               if (future != null) {
@@ -211,8 +211,8 @@ public class IrohStream implements AutoCloseable {
 
     long messageId = nextMessageId.incrementAndGet();
 
-    // Build iroh_bytes_t payload struct inline
-    var payloadSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    // Build aster_bytes_t payload struct inline
+    var payloadSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     var payloadCopy = alloc.allocate(payload.length);
     payloadCopy.copyFrom(MemorySegment.ofArray(payload));
     payloadSeg.set(ValueLayout.ADDRESS, 0, payloadCopy);
@@ -221,15 +221,16 @@ public class IrohStream implements AutoCloseable {
     var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
     try {
-      // runtime, send_stream, data (iroh_bytes_t), user_data, out_operation
+      // runtime, send_stream, data (aster_bytes_t), user_data, out_operation
       int status =
           (int)
               streamWrite.invoke(runtime.nativeHandle(), sendHandle, payloadSeg, messageId, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_stream_write failed: " + status);
+        throw new IrohException(
+            IrohStatus.fromCode(status), "aster_stream_write failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_stream_write threw: " + t.getMessage());
+      throw new IrohException("aster_stream_write threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -258,10 +259,10 @@ public class IrohStream implements AutoCloseable {
       int status = (int) streamFinish.invoke(runtime.nativeHandle(), sendHandle, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_stream_finish failed: " + status);
+            IrohStatus.fromCode(status), "aster_stream_finish failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_stream_finish threw: " + t.getMessage());
+      throw new IrohException("aster_stream_finish threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -277,10 +278,10 @@ public class IrohStream implements AutoCloseable {
     try {
       int status = (int) streamStop.invoke(runtime.nativeHandle(), sendHandle, (long) errorCode);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_stream_stop failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_stream_stop failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_stream_stop threw: " + t.getMessage());
+      throw new IrohException("aster_stream_stop threw: " + t.getMessage());
     }
   }
 
@@ -299,10 +300,10 @@ public class IrohStream implements AutoCloseable {
     try {
       int status = (int) streamRead.invoke(runtime.nativeHandle(), sendHandle, maxLen, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_stream_read failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_stream_read failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_stream_read threw: " + t.getMessage());
+      throw new IrohException("aster_stream_read threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -321,7 +322,7 @@ public class IrohStream implements AutoCloseable {
    * {@code maxSize} bytes before finishing.
    *
    * <p>Unlike {@link #readAsync(long)} (which consumes {@code FRAME_RECEIVED} events fired as
-   * inbound notifications), {@code iroh_stream_read_to_end} emits exactly one {@code BYTES_RESULT}
+   * inbound notifications), {@code aster_stream_read_to_end} emits exactly one {@code BYTES_RESULT}
    * event on completion — the usual operation-future path via the runtime registry.
    */
   public CompletableFuture<byte[]> readToEndAsync(long maxSize) {
@@ -335,10 +336,10 @@ public class IrohStream implements AutoCloseable {
           (int) streamReadToEnd.invoke(runtime.nativeHandle(), recvHandle, maxSize, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_stream_read_to_end failed: " + status);
+            IrohStatus.fromCode(status), "aster_stream_read_to_end failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_stream_read_to_end threw: " + t.getMessage());
+      throw new IrohException("aster_stream_read_to_end threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -388,13 +389,13 @@ public class IrohStream implements AutoCloseable {
       try {
         sendStreamFree.invoke(runtime.nativeHandle(), sendHandle);
       } catch (Throwable t) {
-        System.err.println("iroh_send_stream_free failed: " + t.getMessage());
+        System.err.println("aster_send_stream_free failed: " + t.getMessage());
       }
       if (recvHandle != 0) {
         try {
           recvStreamFree.invoke(runtime.nativeHandle(), recvHandle);
         } catch (Throwable t) {
-          System.err.println("iroh_recv_stream_free failed: " + t.getMessage());
+          System.err.println("aster_recv_stream_free failed: " + t.getMessage());
         }
       }
     }

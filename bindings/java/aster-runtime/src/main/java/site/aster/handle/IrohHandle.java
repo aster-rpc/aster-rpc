@@ -25,7 +25,7 @@ public abstract class IrohHandle implements AutoCloseable {
     CLEANER.register(this, new Cleanup(handle, freeNativeKind()));
   }
 
-  /** FFI function name to free this handle type (e.g. {@code "iroh_endpoint_free"}). */
+  /** FFI function name to free this handle type (e.g. {@code "aster_endpoint_free"}). */
   protected abstract String freeNativeKind();
 
   /** Called by the Cleaner (or explicitly) to free the native handle. */

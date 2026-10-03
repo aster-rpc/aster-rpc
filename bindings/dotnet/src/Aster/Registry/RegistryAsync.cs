@@ -30,7 +30,7 @@ public static partial class Registry
             fixed (byte* op = optsJson)
             {
                 int r = Native.aster_registry_resolve(
-                    doc.Runtime.Handle, doc.Handle, op, (UIntPtr)optsJson.Length,
+                    doc.Runtime.Handle, doc.Handle, Bytes.FromPointer(op, optsJson.Length),
                     user_data: 0, out opId);
                 if (r != 0) throw IrohException.FromStatus(r, "aster_registry_resolve");
             }
@@ -77,19 +77,20 @@ public static partial class Registry
         unsafe
         {
             fixed (byte* a = author)
-            fixed (byte* l = leaseBytes.Length > 0 ? leaseBytes : new byte[1])
-            fixed (byte* af = artifactBytes.Length > 0 ? artifactBytes : new byte[1])
-            fixed (byte* s = serviceBytes.Length > 0 ? serviceBytes : new byte[1])
-            fixed (byte* c = channelBytes.Length > 0 ? channelBytes : new byte[1])
+            fixed (byte* l = leaseBytes)
+            fixed (byte* af = artifactBytes)
+            fixed (byte* s = serviceBytes)
+            fixed (byte* c = channelBytes)
             {
+                // Bytes.FromPointer maps empty arrays to {NULL, 0}.
                 int r = Native.aster_registry_publish(
                     doc.Runtime.Handle, doc.Handle,
-                    a, (UIntPtr)author.Length,
-                    leaseBytes.Length > 0 ? l : null, (UIntPtr)leaseBytes.Length,
-                    artifactBytes.Length > 0 ? af : null, (UIntPtr)artifactBytes.Length,
-                    serviceBytes.Length > 0 ? s : null, (UIntPtr)serviceBytes.Length,
+                    Bytes.FromPointer(a, author.Length),
+                    Bytes.FromPointer(l, leaseBytes.Length),
+                    Bytes.FromPointer(af, artifactBytes.Length),
+                    Bytes.FromPointer(s, serviceBytes.Length),
                     version,
-                    channelBytes.Length > 0 ? c : null, (UIntPtr)channelBytes.Length,
+                    Bytes.FromPointer(c, channelBytes.Length),
                     topicHandle, user_data: 0, out opId);
                 if (r != 0) throw IrohException.FromStatus(r, "aster_registry_publish");
             }
@@ -134,11 +135,11 @@ public static partial class Registry
             {
                 int r = Native.aster_registry_renew_lease(
                     doc.Runtime.Handle, doc.Handle,
-                    a, (UIntPtr)author.Length,
-                    s, (UIntPtr)svc.Length,
-                    c, (UIntPtr)cid.Length,
-                    e, (UIntPtr)eid.Length,
-                    h, (UIntPtr)hb.Length,
+                    Bytes.FromPointer(a, author.Length),
+                    Bytes.FromPointer(s, svc.Length),
+                    Bytes.FromPointer(c, cid.Length),
+                    Bytes.FromPointer(e, eid.Length),
+                    Bytes.FromPointer(h, hb.Length),
                     load, leaseDurationS,
                     topicHandle, user_data: 0, out opId);
                 if (r != 0) throw IrohException.FromStatus(r, "aster_registry_renew_lease");
@@ -179,11 +180,11 @@ public static partial class Registry
             {
                 int r = add
                     ? Native.aster_registry_acl_add_writer(
-                        doc.Runtime.Handle, doc.Handle, a, (UIntPtr)author.Length,
-                        w, (UIntPtr)writer.Length, user_data: 0, out opId)
+                        doc.Runtime.Handle, doc.Handle, Bytes.FromPointer(a, author.Length),
+                        Bytes.FromPointer(w, writer.Length), user_data: 0, out opId)
                     : Native.aster_registry_acl_remove_writer(
-                        doc.Runtime.Handle, doc.Handle, a, (UIntPtr)author.Length,
-                        w, (UIntPtr)writer.Length, user_data: 0, out opId);
+                        doc.Runtime.Handle, doc.Handle, Bytes.FromPointer(a, author.Length),
+                        Bytes.FromPointer(w, writer.Length), user_data: 0, out opId);
                 if (r != 0)
                     throw IrohException.FromStatus(r,
                         add ? "aster_registry_acl_add_writer" : "aster_registry_acl_remove_writer");

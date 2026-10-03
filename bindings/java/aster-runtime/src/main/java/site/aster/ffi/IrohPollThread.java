@@ -9,7 +9,7 @@ import java.util.function.Consumer;
 import site.aster.event.IrohEvent;
 
 /**
- * Dedicated platform thread that calls {@code iroh_poll_events} and dispatches completions to the
+ * Dedicated platform thread that calls {@code aster_poll_events} and dispatches completions to the
  * {@link OperationRegistry} and registered inbound event handlers.
  *
  * <p>This must be a <b>platform thread</b>, not a virtual thread — it blocks on the native poll
@@ -43,11 +43,11 @@ public class IrohPollThread {
 
     IrohLibrary lib = IrohLibrary.getInstance();
 
-    this.eventBuffer = lib.allocator().allocate(IrohLibrary.IROH_EVENT.byteSize() * maxEvents, 1);
+    this.eventBuffer = lib.allocator().allocate(IrohLibrary.ASTER_EVENT.byteSize() * maxEvents, 1);
 
     this.pollEvents =
         lib.getHandle(
-            "iroh_poll_events",
+            "aster_poll_events",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG,
@@ -105,7 +105,7 @@ public class IrohPollThread {
     for (int i = 0; i < count; i++) {
       MemorySegment eventSeg =
           eventBuffer.asSlice(
-              i * IrohLibrary.IROH_EVENT.byteSize(), IrohLibrary.IROH_EVENT.byteSize());
+              i * IrohLibrary.ASTER_EVENT.byteSize(), IrohLibrary.ASTER_EVENT.byteSize());
       IrohEvent event = IrohEvent.fromSegment(eventSeg);
       dispatchEvent(event);
     }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -7,7 +8,7 @@ using System.Threading.Tasks;
 namespace Aster;
 
 /// <summary>
-/// Owns a native iroh runtime and drives the completion queue poll loop.
+/// Owns a native Aster runtime and drives the completion queue poll loop.
 ///
 /// The poll loop runs on a dedicated background thread and dispatches events
 /// to registered TaskCompletionSources. This matches the same architecture
@@ -25,12 +26,10 @@ public sealed class Runtime : IDisposable
     // Guards dispose so the poll loop exits cleanly.
     private volatile bool _disposed;
 
-    // Batch buffer allocated once and reused across polls.
-    private readonly IntPtr _eventBuffer;
     private const int MaxEvents = 64;
 
     /// <summary>
-    /// Creates a new iroh runtime and starts the poll loop.
+    /// Creates a new Aster runtime and starts the poll loop.
     /// </summary>
     public Runtime()
         : this(RuntimeConfig.Default)
@@ -38,17 +37,20 @@ public sealed class Runtime : IDisposable
     }
 
     /// <summary>
-    /// Creates a new iroh runtime with custom config and starts the poll loop.
+    /// Creates a new Aster runtime with custom config and starts the poll loop.
     /// </summary>
     public Runtime(RuntimeConfig config)
     {
-        int r = Native.iroh_runtime_new(ref config, out _handle);
-        if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_runtime_new");
+        uint loaded = Native.aster_abi_version();
+        if (loaded >> 16 != Native.AbiVersionMajor)
+            throw new IrohException(Status.AbiMismatch,
+                $"native library ABI {loaded >> 16}.{(loaded >> 8) & 0xff}.{loaded & 0xff} " +
+                $"does not match binding ABI major {Native.AbiVersionMajor}");
 
-        // Pre-allocate the event batch buffer.
-        // Each Event is ~64 bytes; 64 * 64 = 4KB, negligible.
-        _eventBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<Event>() * MaxEvents);
+        config.struct_size = (uint)Marshal.SizeOf<RuntimeConfig>();
+        int r = Native.aster_runtime_new(Native.AbiVersionMajor, in config, out _handle);
+        if (r != 0)
+            throw IrohException.FromStatus(r, "aster_runtime_new");
 
         _pollThread = new Thread(PollLoop)
         {
@@ -70,8 +72,9 @@ public sealed class Runtime : IDisposable
     {
         get
         {
-            // These are cheap, stateless queries — no handle needed.
-            return (Native.iroh_abi_version_major(), Native.iroh_abi_version_minor(), Native.iroh_abi_version_patch());
+            // Cheap, stateless query — no handle needed.
+            uint v = Native.aster_abi_version();
+            return ((int)(v >> 16), (int)((v >> 8) & 0xff), (int)(v & 0xff));
         }
     }
 
@@ -84,25 +87,34 @@ public sealed class Runtime : IDisposable
         if (_disposed)
             throw new ObjectDisposedException(nameof(Runtime));
 
-        var tcs = new TaskCompletionSource<Event>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // The native submit has already returned opId, so the completion may
+        // have been dispatched before we get here. Both sides use GetOrAdd so
+        // whichever arrives first creates the TCS and the other finds it.
+        var tcs = _ops.GetOrAdd(opId, NewTcs);
 
-        // If the caller cancels, remove the registration so the event is dropped.
-        using var registration = cancellationToken.Register(
-            state => ((TaskCompletionSource<Event>)state!).TrySetCanceled(),
-            tcs, false);
+        if (tcs.Task.IsCompleted)
+        {
+            _ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(opId, tcs));
+            return tcs.Task;
+        }
 
-        // Store before returning to avoid a race where the event arrives between
-        // Register() completing and storing in the map.
-        _ops[opId] = tcs;
+        CancellationTokenRegistration registration = default;
+        if (cancellationToken.CanBeCanceled)
+        {
+            registration = cancellationToken.Register(
+                state => ((TaskCompletionSource<Event>)state!).TrySetCanceled(),
+                tcs, false);
+        }
 
         // When the Task completes (success, cancel, or fault), unregister.
         tcs.Task.ContinueWith(
             (completedTask, state) =>
             {
-                var (ops, id) = ((ConcurrentDictionary<ulong, TaskCompletionSource<Event>>, ulong))state!;
-                ops.TryRemove(id, out _);
+                var (ops, id, t, reg) = ((ConcurrentDictionary<ulong, TaskCompletionSource<Event>>, ulong, TaskCompletionSource<Event>, CancellationTokenRegistration))state!;
+                ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(id, t));
+                reg.Dispose();
             },
-            (_ops, opId),
+            (_ops, opId, tcs, registration),
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
@@ -143,9 +155,7 @@ public sealed class Runtime : IDisposable
         // Signal with a zero-timeout poll to break out of the sleep.
         _pollThread.Join(TimeSpan.FromSeconds(5));
 
-        Native.iroh_runtime_close(_handle);
-
-        Marshal.FreeHGlobal(_eventBuffer);
+        Native.aster_runtime_close(_handle);
         _cts.Dispose();
     }
 
@@ -191,7 +201,7 @@ public sealed class Runtime : IDisposable
         try
         {
             IntPtr ptr = handle.AddrOfPinnedObject();
-            return Native.iroh_poll_events(_handle, ptr, MaxEvents, timeoutMs);
+            return (int)(nuint)Native.aster_poll_events(_handle, ptr, (UIntPtr)Math.Min(MaxEvents, events.Length), (uint)timeoutMs);
         }
         finally
         {
@@ -205,12 +215,16 @@ public sealed class Runtime : IDisposable
         {
             ref readonly Event ev = ref events[i];
 
-            if (_ops.TryRemove(ev.operation, out var tcs))
-            {
-                tcs.TrySetResult(ev);
-            }
+            if (ev.operation == 0)
+                continue;
+            // If no waiter is registered yet, park the completed TCS for it.
+            // (A registered waiter's continuation removes the entry.)
+            _ops.GetOrAdd(ev.operation, NewTcs).TrySetResult(ev);
         }
     }
+
+    private static TaskCompletionSource<Event> NewTcs(ulong _)
+        => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private void DrainEvents()
     {
@@ -229,9 +243,9 @@ public sealed class Runtime : IDisposable
     /// </summary>
     public void ReleaseBuffer(ulong buffer)
     {
-        int r = Native.iroh_buffer_release(_handle, buffer);
+        int r = Native.aster_buffer_release(_handle, buffer);
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_buffer_release");
+            throw IrohException.FromStatus(r, "aster_buffer_release");
     }
 
     /// <summary>
@@ -239,9 +253,10 @@ public sealed class Runtime : IDisposable
     /// </summary>
     public void Cancel(ulong opId)
     {
-        _ops.TryRemove(opId, out _);
-        int r = Native.iroh_operation_cancel(_handle, opId);
+        if (_ops.TryRemove(opId, out var pending))
+            pending.TrySetCanceled();
+        int r = Native.aster_operation_cancel(_handle, opId);
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_operation_cancel");
+            throw IrohException.FromStatus(r, "aster_operation_cancel");
     }
 }

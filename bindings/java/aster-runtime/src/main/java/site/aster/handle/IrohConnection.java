@@ -42,27 +42,27 @@ public class IrohConnection extends IrohHandle {
 
   @Override
   protected void freeNative(long handle) {
-    // iroh_connection_close is sync: (runtime, connection, error_code, reason)
+    // aster_connection_close is sync: (runtime, connection, error_code, reason)
     // No async operation — safe to call from Cleaner.
     var lib = IrohLibrary.getInstance();
     var alloc = lib.allocator();
 
     var close =
         lib.getHandle(
-            "iroh_connection_close",
+            "aster_connection_close",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG, // runtime
                 ValueLayout.JAVA_LONG, // connection
                 ValueLayout.JAVA_INT, // error_code
-                IrohLibrary.IROH_BYTES // reason
+                IrohLibrary.ASTER_BYTES // reason
                 ));
 
-    var emptyReason = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var emptyReason = alloc.allocate(IrohLibrary.ASTER_BYTES);
     try {
       close.invoke(runtime.nativeHandle(), handle, 0, emptyReason);
     } catch (Throwable t) {
-      System.err.println("iroh_connection_close failed: " + t.getMessage());
+      System.err.println("aster_connection_close failed: " + t.getMessage());
     }
   }
 
@@ -83,7 +83,7 @@ public class IrohConnection extends IrohHandle {
 
     var openBi =
         lib.getHandle(
-            "iroh_open_bi",
+            "aster_open_bi",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -95,10 +95,10 @@ public class IrohConnection extends IrohHandle {
       // runtime, connection, user_data, out_operation
       int status = (int) openBi.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_open_bi failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_open_bi failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_open_bi threw: " + t.getMessage());
+      throw new IrohException("aster_open_bi threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -128,7 +128,7 @@ public class IrohConnection extends IrohHandle {
 
     var acceptBi =
         lib.getHandle(
-            "iroh_accept_bi",
+            "aster_accept_bi",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -140,10 +140,10 @@ public class IrohConnection extends IrohHandle {
       // runtime, connection, user_data, out_operation
       int status = (int) acceptBi.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_accept_bi failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_accept_bi failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_accept_bi threw: " + t.getMessage());
+      throw new IrohException("aster_accept_bi threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -162,7 +162,7 @@ public class IrohConnection extends IrohHandle {
   /**
    * Get the remote peer's node ID as a 64-char hex string.
    *
-   * <p>The FFI's {@code iroh_connection_remote_id} returns the id already hex-formatted — the Rust
+   * <p>The FFI's {@code aster_connection_remote_id} returns the id already hex-formatted — the Rust
    * side calls {@code NodeId::to_string()} and copies those ASCII bytes into the output buffer — so
    * the Java wrapper decodes them as UTF-8 rather than hex-encoding again. Re-hexing was a
    * long-standing bug that doubled the length to 128 chars, diverging from the single-hex form the
@@ -182,10 +182,10 @@ public class IrohConnection extends IrohHandle {
           lib.connectionRemoteId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_connection_remote_id failed: " + status);
+            IrohStatus.fromCode(status), "aster_connection_remote_id failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_connection_remote_id threw: " + t.getMessage());
+      throw new IrohException("aster_connection_remote_id threw: " + t.getMessage());
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -208,8 +208,8 @@ public class IrohConnection extends IrohHandle {
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
-    // Build iroh_bytes_t for the data
-    MemorySegment dataSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    // Build aster_bytes_t for the data
+    MemorySegment dataSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     MemorySegment heapSeg = alloc.allocate(data.length);
     heapSeg.copyFrom(MemorySegment.ofArray(data));
     dataSeg.set(ValueLayout.ADDRESS, 0, heapSeg);
@@ -219,13 +219,13 @@ public class IrohConnection extends IrohHandle {
       int status = lib.connectionSendDatagram(runtime.nativeHandle(), nativeHandle(), dataSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_connection_send_datagram failed: " + status);
+            IrohStatus.fromCode(status), "aster_connection_send_datagram failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_connection_send_datagram threw: " + t.getMessage()));
+          new IrohException("aster_connection_send_datagram threw: " + t.getMessage()));
     }
 
     return CompletableFuture.completedFuture(null);
@@ -246,13 +246,13 @@ public class IrohConnection extends IrohHandle {
       int status = lib.connectionReadDatagram(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_connection_read_datagram failed: " + status);
+            IrohStatus.fromCode(status), "aster_connection_read_datagram failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_connection_read_datagram threw: " + t.getMessage()));
+          new IrohException("aster_connection_read_datagram threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -290,13 +290,13 @@ public class IrohConnection extends IrohHandle {
       int status = lib.connectionClosed(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_connection_closed failed: " + status);
+            IrohStatus.fromCode(status), "aster_connection_closed failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_connection_closed threw: " + t.getMessage()));
+          new IrohException("aster_connection_closed threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -321,10 +321,10 @@ public class IrohConnection extends IrohHandle {
           lib.connectionMaxDatagramSize(runtime.nativeHandle(), nativeHandle(), sizeSeg, isSomeSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_connection_max_datagram_size failed: " + status);
+            IrohStatus.fromCode(status), "aster_connection_max_datagram_size failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_connection_max_datagram_size threw: " + t.getMessage());
+      throw new IrohException("aster_connection_max_datagram_size threw: " + t.getMessage());
     }
 
     int isSome = isSomeSeg.get(ValueLayout.JAVA_INT, 0);
@@ -347,7 +347,7 @@ public class IrohConnection extends IrohHandle {
   }
 
   /**
-   * Snapshot the selected QUIC path for an {@code iroh_connection_t} handle directly. Used by
+   * Snapshot the selected QUIC path for an {@code aster_connection_t} handle directly. Used by
    * callers that hold a borrowed handle (e.g. {@link
    * site.aster.server.AsterCall#connectionHandle()} delivered by the reactor) and don't want to
    * construct a transient {@link IrohConnection} wrapper just to read the snapshot.
@@ -355,12 +355,12 @@ public class IrohConnection extends IrohHandle {
   public static TransportSnapshot transportSnapshot(IrohRuntime runtime, long connectionHandle) {
     var lib = IrohLibrary.getInstance();
     try (Arena confined = Arena.ofConfined()) {
-      var snapSeg = confined.allocate(IrohLibrary.IROH_TRANSPORT_SNAPSHOT);
+      var snapSeg = confined.allocate(IrohLibrary.ASTER_TRANSPORT_SNAPSHOT);
       int status =
           lib.connectionTransportSnapshot(runtime.nativeHandle(), connectionHandle, snapSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_connection_transport_snapshot failed: " + status);
+            IrohStatus.fromCode(status), "aster_connection_transport_snapshot failed: " + status);
       }
 
       int pathKind = (int) SNAPSHOT_PATH_KIND.get(snapSeg, 0L);
@@ -403,25 +403,25 @@ public class IrohConnection extends IrohHandle {
     }
   }
 
-  // VarHandles into iroh_transport_snapshot_t for transportSnapshot().
+  // VarHandles into aster_transport_snapshot_t for transportSnapshot().
   private static final VarHandle SNAPSHOT_PATH_KIND =
-      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("path_kind"));
+      IrohLibrary.ASTER_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("path_kind"));
   private static final VarHandle SNAPSHOT_PEER_HOST_PTR =
-      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(
+      IrohLibrary.ASTER_TRANSPORT_SNAPSHOT.varHandle(
           PathElement.groupElement("peer_host"), PathElement.groupElement("ptr"));
   private static final VarHandle SNAPSHOT_PEER_HOST_LEN =
-      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(
+      IrohLibrary.ASTER_TRANSPORT_SNAPSHOT.varHandle(
           PathElement.groupElement("peer_host"), PathElement.groupElement("len"));
   private static final VarHandle SNAPSHOT_PEER_PORT =
-      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("peer_port"));
+      IrohLibrary.ASTER_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("peer_port"));
   private static final VarHandle SNAPSHOT_RELAY_URL_PTR =
-      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(
+      IrohLibrary.ASTER_TRANSPORT_SNAPSHOT.varHandle(
           PathElement.groupElement("relay_url"), PathElement.groupElement("ptr"));
   private static final VarHandle SNAPSHOT_RELAY_URL_LEN =
-      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(
+      IrohLibrary.ASTER_TRANSPORT_SNAPSHOT.varHandle(
           PathElement.groupElement("relay_url"), PathElement.groupElement("len"));
   private static final VarHandle SNAPSHOT_RTT_MICROS =
-      IrohLibrary.IROH_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("rtt_micros"));
+      IrohLibrary.ASTER_TRANSPORT_SNAPSHOT.varHandle(PathElement.groupElement("rtt_micros"));
 
   /** Snapshot of the selected QUIC path returned by {@link #transportSnapshot()}. */
   public record TransportSnapshot(InetSocketAddress peerAddr, String relayUrl, Duration rtt) {}
@@ -444,11 +444,11 @@ public class IrohConnection extends IrohHandle {
       if (status != 0) {
         throw new IrohException(
             IrohStatus.fromCode(status),
-            "iroh_connection_datagram_send_buffer_space failed: " + status);
+            "aster_connection_datagram_send_buffer_space failed: " + status);
       }
     } catch (Throwable t) {
       throw new IrohException(
-          "iroh_connection_datagram_send_buffer_space threw: " + t.getMessage());
+          "aster_connection_datagram_send_buffer_space threw: " + t.getMessage());
     }
 
     long bytes = bytesSeg.get(ValueLayout.JAVA_LONG, 0);

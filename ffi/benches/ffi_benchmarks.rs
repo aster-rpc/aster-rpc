@@ -23,16 +23,16 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 // ─── Benchmark helpers ─────────────────────────────────────────────────────
 
-fn create_test_runtime() -> iroh_runtime_t {
-    let mut runtime: iroh_runtime_t = 0;
-    let status = unsafe { iroh_runtime_new(ptr::null(), &mut runtime) };
-    assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+fn create_test_runtime() -> aster_runtime_t {
+    let mut runtime: aster_runtime_t = 0;
+    let status = unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime) };
+    assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
     runtime
 }
 
-fn destroy_test_runtime(runtime: iroh_runtime_t) {
-    let status = unsafe { iroh_runtime_close(runtime) };
-    assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+fn destroy_test_runtime(runtime: aster_runtime_t) {
+    let status = unsafe { aster_runtime_close(runtime) };
+    assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 }
 
 // ─── Benchmarks ────────────────────────────────────────────────────────────
@@ -40,10 +40,11 @@ fn destroy_test_runtime(runtime: iroh_runtime_t) {
 fn bench_runtime_create(c: &mut Criterion) {
     c.bench_function("bench_runtime_create", |b| {
         b.iter(|| {
-            let mut runtime: iroh_runtime_t = 0;
-            let status = unsafe { iroh_runtime_new(ptr::null(), &mut runtime) };
+            let mut runtime: aster_runtime_t = 0;
+            let status =
+                unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime) };
             black_box(status);
-            let close_status = unsafe { iroh_runtime_close(runtime) };
+            let close_status = unsafe { aster_runtime_close(runtime) };
             black_box(close_status);
         });
     });
@@ -56,8 +57,8 @@ fn bench_poll_events_empty(c: &mut Criterion) {
         b.iter(|| {
             // SAFETY: zeroed() is unsafe but we're only using this for benchmark
             // memory layout validation; the poll_events function writes to out_events
-            let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 1] };
-            let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 1, 0) };
+            let mut events = unsafe { [std::mem::zeroed::<aster_event_t>(); 1] };
+            let count = unsafe { aster_poll_events(runtime, events.as_mut_ptr(), 1, 0) };
             black_box(count);
         });
 
@@ -68,10 +69,10 @@ fn bench_poll_events_empty(c: &mut Criterion) {
 fn bench_event_encode(c: &mut Criterion) {
     c.bench_function("bench_event_encode", |b| {
         // Create a real event struct and encode it
-        let event = iroh_event_t {
+        let event = aster_event_t {
             struct_size: 80,
-            kind: iroh_event_kind_t::IROH_EVENT_CONNECTED as u32,
-            status: iroh_status_t::IROH_STATUS_OK as u32,
+            kind: aster_event_kind_t::ASTER_EVENT_CONNECTED as u32,
+            status: aster_status_t::ASTER_STATUS_OK as u32,
             operation: 42,
             handle: 7,
             related: 0,
@@ -102,8 +103,8 @@ fn bench_cq_drain_1(c: &mut Criterion) {
         // We can't easily pre-populate in this harness, so just measure drain call overhead
         b.iter(|| {
             // SAFETY: zeroed() is unsafe but benchmark memory; poll_events writes to out_events
-            let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 1] };
-            let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 1, 0) };
+            let mut events = unsafe { [std::mem::zeroed::<aster_event_t>(); 1] };
+            let count = unsafe { aster_poll_events(runtime, events.as_mut_ptr(), 1, 0) };
             black_box(count);
         });
 
@@ -117,8 +118,8 @@ fn bench_cq_drain_batched(c: &mut Criterion) {
 
         b.iter(|| {
             // SAFETY: zeroed() is unsafe but benchmark memory; poll_events writes to out_events
-            let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 64] };
-            let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 64, 0) };
+            let mut events = unsafe { [std::mem::zeroed::<aster_event_t>(); 64] };
+            let count = unsafe { aster_poll_events(runtime, events.as_mut_ptr(), 64, 0) };
             black_box(count);
         });
 
@@ -132,9 +133,9 @@ fn bench_operation_submit_cancel(c: &mut Criterion) {
     let alpn_lens = [4];
 
     // Create a node
-    let mut node_op: iroh_operation_t = 0;
+    let mut node_op: aster_operation_t = 0;
     let _status = unsafe {
-        iroh_node_memory_with_alpns(
+        aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -149,7 +150,7 @@ fn bench_operation_submit_cancel(c: &mut Criterion) {
     c.bench_function("bench_operation_submit_cancel", |b| {
         b.iter(|| {
             // Immediately cancel the operation before it completes
-            let cancel_status = unsafe { iroh_operation_cancel(runtime, node_op) };
+            let cancel_status = unsafe { aster_operation_cancel(runtime, node_op) };
             black_box(cancel_status);
         });
     });
@@ -163,7 +164,7 @@ fn bench_null_buffer_release(c: &mut Criterion) {
 
         b.iter(|| {
             // Release null buffer - should be fast path (idempotent OK)
-            let status = unsafe { iroh_buffer_release(runtime, 0) };
+            let status = unsafe { aster_buffer_release(runtime, 0) };
             black_box(status);
         });
 
@@ -175,7 +176,7 @@ fn bench_string_release_null(c: &mut Criterion) {
     c.bench_function("bench_string_release_null", |b| {
         b.iter(|| {
             // Release null string - should be fast path (idempotent OK)
-            let status = unsafe { iroh_string_release(ptr::null(), 0) };
+            let status = unsafe { aster_string_release(ptr::null(), 0) };
             black_box(status);
         });
     });

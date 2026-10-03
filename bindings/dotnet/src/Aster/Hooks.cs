@@ -1,9 +1,9 @@
 namespace Aster;
 
 /// <summary>
-/// Hook decision for before_connect callbacks. Mirrors iroh_hook_decision_t.
+/// Hook decision for before_connect callbacks. Mirrors aster_hook_decision_t.
 /// </summary>
-public enum HookDecision
+public enum HookDecision : uint
 {
     Allow = 0,
     Deny = 1,
@@ -24,14 +24,14 @@ public static class Hooks
     /// <summary>Respond to a pending before_connect hook invocation.</summary>
     public static void RespondBeforeConnect(Runtime runtime, ulong invocation, HookDecision decision)
     {
-        int r = Native.iroh_hook_before_connect_respond(runtime.Handle, invocation, (int)decision);
-        if (r != 0) throw IrohException.FromStatus(r, "iroh_hook_before_connect_respond");
+        int r = Native.aster_hook_before_connect_respond(runtime.Handle, invocation, (uint)decision);
+        if (r != 0) throw IrohException.FromStatus(r, "aster_hook_before_connect_respond");
     }
 
     /// <summary>Respond to a pending after_connect hook invocation. This always accepts.</summary>
     public static void RespondAfterConnect(Runtime runtime, ulong invocation)
     {
-        int r = Native.iroh_hook_after_connect_respond(runtime.Handle, invocation);
-        if (r != 0) throw IrohException.FromStatus(r, "iroh_hook_after_connect_respond");
+        int r = Native.aster_hook_after_connect_respond(runtime.Handle, invocation);
+        if (r != 0) throw IrohException.FromStatus(r, "aster_hook_after_connect_respond");
     }
 }

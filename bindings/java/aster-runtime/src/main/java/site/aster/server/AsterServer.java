@@ -51,7 +51,7 @@ import site.aster.server.wire.StreamHeader;
  *
  * <p>Manifest submission (via {@code RegistryAsync.publishAsync}) is not yet hooked; the manifest
  * is built at startup and exposed via {@link #manifest()} but not actually published. Hook dispatch
- * ({@code IROH_EVENT_HOOK_*} → user callbacks) is likewise deferred.
+ * ({@code ASTER_EVENT_HOOK_*} → user callbacks) is likewise deferred.
  */
 public final class AsterServer implements AutoCloseable {
 

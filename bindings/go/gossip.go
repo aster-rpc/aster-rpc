@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -53,22 +53,22 @@ func (g *Gossip) Node() *Node {
 
 // Subscribe subscribes to a gossip topic.
 func (g *Gossip) Subscribe(ctx context.Context, topic string, peers []GossipPeer) (*GossipTopic, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	topicBytes := []byte(topic)
-	topicC := C.struct_iroh_bytes_t{
+	topicC := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&topicBytes[0])),
 		len: C.uintptr_t(len(topicBytes)),
 	}
 
 	// Build peers list
-	var peersPtr *C.struct_iroh_bytes_t
+	var peersPtr *C.struct_aster_bytes_t
 	var peersLen C.size_t
 	if len(peers) > 0 {
-		peersSlice := make([]C.struct_iroh_bytes_t, len(peers))
+		peersSlice := make([]C.struct_aster_bytes_t, len(peers))
 		for i, peer := range peers {
 			peerBytes := []byte(peer.ID)
-			peerSeg := C.struct_iroh_bytes_t{
+			peerSeg := C.struct_aster_bytes_t{
 				ptr: (*C.uint8_t)(unsafe.Pointer(&peerBytes[0])),
 				len: C.uintptr_t(len(peerBytes)),
 			}
@@ -78,12 +78,12 @@ func (g *Gossip) Subscribe(ctx context.Context, topic string, peers []GossipPeer
 		peersLen = C.size_t(len(peers))
 	}
 
-	peersListC := C.struct_iroh_bytes_list_t{
+	peersListC := C.struct_aster_bytes_list_t{
 		items: peersPtr,
 		len:   peersLen,
 	}
 
-	r := C.iroh_gossip_subscribe(
+	r := C.aster_gossip_subscribe(
 		C.uint64_t(g.runtime.handle),
 		C.uint64_t(g.node.handle),
 		topicC,
@@ -92,14 +92,14 @@ func (g *Gossip) Subscribe(ctx context.Context, topic string, peers []GossipPeer
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_gossip_subscribe: %w", Error(r))
+		return nil, fmt.Errorf("aster_gossip_subscribe: %w", Error(r))
 	}
 
 	ev, err := g.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("subscribe poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_GOSSIP_SUBSCRIBED {
+	if ev.Kind != ASTER_EVENT_GOSSIP_SUBSCRIBED {
 		return nil, fmt.Errorf("subscribe: unexpected event %d", ev.Kind)
 	}
 
@@ -108,14 +108,14 @@ func (g *Gossip) Subscribe(ctx context.Context, topic string, peers []GossipPeer
 
 // Broadcast broadcasts a message to a topic.
 func (t *GossipTopic) Broadcast(ctx context.Context, data []byte) error {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
-	dataC := C.struct_iroh_bytes_t{
+	dataC := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&data[0])),
 		len: C.uintptr_t(len(data)),
 	}
 
-	r := C.iroh_gossip_broadcast(
+	r := C.aster_gossip_broadcast(
 		C.uint64_t(t.runtime.handle),
 		C.uint64_t(t.handle),
 		dataC,
@@ -123,14 +123,14 @@ func (t *GossipTopic) Broadcast(ctx context.Context, data []byte) error {
 		&opID,
 	)
 	if r != 0 {
-		return fmt.Errorf("iroh_gossip_broadcast: %w", Error(r))
+		return fmt.Errorf("aster_gossip_broadcast: %w", Error(r))
 	}
 
 	ev, err := t.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return fmt.Errorf("broadcast poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_GOSSIP_BROADCAST_DONE {
+	if ev.Kind != ASTER_EVENT_GOSSIP_BROADCAST_DONE {
 		return fmt.Errorf("broadcast: unexpected event %d", ev.Kind)
 	}
 
@@ -139,23 +139,23 @@ func (t *GossipTopic) Broadcast(ctx context.Context, data []byte) error {
 
 // Recv receives a gossip message from the topic.
 func (t *GossipTopic) Recv(ctx context.Context) (*GossipMessage, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
-	r := C.iroh_gossip_recv(
+	r := C.aster_gossip_recv(
 		C.uint64_t(t.runtime.handle),
 		C.uint64_t(t.handle),
 		0,
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_gossip_recv: %w", Error(r))
+		return nil, fmt.Errorf("aster_gossip_recv: %w", Error(r))
 	}
 
 	ev, err := t.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("recv poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_GOSSIP_RECEIVED {
+	if ev.Kind != ASTER_EVENT_GOSSIP_RECEIVED {
 		return nil, fmt.Errorf("recv: unexpected event %d", ev.Kind)
 	}
 
@@ -164,9 +164,9 @@ func (t *GossipTopic) Recv(ctx context.Context) (*GossipMessage, error) {
 
 // Close closes the topic subscription.
 func (t *GossipTopic) Close() error {
-	r := C.iroh_gossip_topic_free(C.uint64_t(t.runtime.handle), C.uint64_t(t.handle))
+	r := C.aster_gossip_topic_free(C.uint64_t(t.runtime.handle), C.uint64_t(t.handle))
 	if r != 0 {
-		return fmt.Errorf("iroh_gossip_topic_free: %w", Error(r))
+		return fmt.Errorf("aster_gossip_topic_free: %w", Error(r))
 	}
 	return nil
 }

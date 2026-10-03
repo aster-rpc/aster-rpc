@@ -71,8 +71,8 @@ public class AbiContractTests
     [Fact]
     public void EndpointConfig_Size_Matches_C_Header()
     {
-        // iroh_endpoint_config_t = 144 bytes (verified against Rust)
-        Assert.Equal(144, Marshal.SizeOf<EndpointConfig>());
+        // aster_endpoint_config_t = 152 bytes (ffi/src/layout.rs)
+        Assert.Equal(152, Marshal.SizeOf<EndpointConfig>());
     }
 
     [Fact]
@@ -146,10 +146,106 @@ public class AbiContractTests
     [Fact]
     public void EndpointConfig_Field_Offsets_By_Size()
     {
-        // Verify 144-byte layout: 4+4+16+16+16+4+4+8+16+4+4+4+16+4+16 = 144
-        // This confirms all fields are present at expected offsets.
-        int size = Marshal.SizeOf<EndpointConfig>();
-        Assert.Equal(144, size);
+        // Offsets pinned by ffi/src/layout.rs (aster_endpoint_config_t).
+        Assert.Equal(152, Marshal.SizeOf<EndpointConfig>());
+        Off<EndpointConfig>("struct_size", 0);
+        Off<EndpointConfig>("relay_mode", 4);
+        Off<EndpointConfig>("secret_key", 8);
+        Off<EndpointConfig>("alpns", 24);
+        Off<EndpointConfig>("relay_urls", 40);
+        Off<EndpointConfig>("enable_discovery", 56);
+        Off<EndpointConfig>("enable_hooks", 60);
+        Off<EndpointConfig>("hook_timeout_ms", 64);
+        Off<EndpointConfig>("bind_addr", 72);
+        Off<EndpointConfig>("clear_ip_transports", 88);
+        Off<EndpointConfig>("clear_relay_transports", 92);
+        Off<EndpointConfig>("portmapper_config", 96);
+        Off<EndpointConfig>("proxy_url", 104);
+        Off<EndpointConfig>("proxy_from_env", 120);
+        Off<EndpointConfig>("data_dir_utf8", 128);
+        Off<EndpointConfig>("hook_failure_mode", 144);
+    }
+
+    private static void Off<T>(string field, int expected)
+        => Assert.Equal(expected, (int)Marshal.OffsetOf<T>(field));
+
+    [Fact]
+    public void All_Struct_Sizes_Match_Header()
+    {
+        // Sizes from ffi/RENAME_MAP.md / ffi/src/layout.rs (LP64). Both the
+        // marshalled size and the blittable in-memory size must agree, since
+        // poll buffers are passed pinned (no marshalling copy).
+        Assert.Equal(80, Marshal.SizeOf<Event>());
+        Assert.Equal(80, System.Runtime.CompilerServices.Unsafe.SizeOf<Event>());
+        Assert.Equal(16, Marshal.SizeOf<RuntimeConfig>());
+        Assert.Equal(152, Marshal.SizeOf<EndpointConfig>());
+        Assert.Equal(48, Marshal.SizeOf<ConnectConfig>());
+        Assert.Equal(48, Marshal.SizeOf<NodeAddr>());
+        Assert.Equal(16, Marshal.SizeOf<Bytes>());
+        Assert.Equal(16, Marshal.SizeOf<BytesList>());
+        Assert.Equal(112, Marshal.SizeOf<ReactorCallNative>());
+        Assert.Equal(112, System.Runtime.CompilerServices.Unsafe.SizeOf<ReactorCallNative>());
+    }
+
+    [Fact]
+    public void Event_Field_Offsets_Match_Header()
+    {
+        Off<Event>("struct_size", 0);
+        Off<Event>("kind", 4);
+        Off<Event>("status", 8);
+        Off<Event>("operation", 16);
+        Off<Event>("handle", 24);
+        Off<Event>("related", 32);
+        Off<Event>("user_data", 40);
+        Off<Event>("data_ptr", 48);
+        Off<Event>("data_len", 56);
+        Off<Event>("buffer", 64);
+        Off<Event>("error_code", 72);
+        Off<Event>("flags", 76);
+    }
+
+    [Fact]
+    public void ConnectConfig_And_NodeAddr_Offsets_Match_Header()
+    {
+        Off<ConnectConfig>("struct_size", 0);
+        Off<ConnectConfig>("flags", 4);
+        Off<ConnectConfig>("node_id", 8);
+        Off<ConnectConfig>("alpn", 24);
+        Off<ConnectConfig>("addr", 40);
+        Off<NodeAddr>("endpoint_id", 0);
+        Off<NodeAddr>("relay_url", 16);
+        Off<NodeAddr>("direct_addresses", 32);
+    }
+
+    [Fact]
+    public void ReactorCall_Offsets_Match_Header()
+    {
+        // aster_reactor_call_t (ffi/src/layout.rs; same as Java Reactor.CALL_LAYOUT).
+        Off<ReactorCallNative>("event_kind", 0);
+        Off<ReactorCallNative>("call_id", 8);
+        Off<ReactorCallNative>("connection_id", 16);
+        Off<ReactorCallNative>("stream_id", 24);
+        Off<ReactorCallNative>("header_ptr", 32);
+        Off<ReactorCallNative>("header_len", 40);
+        Off<ReactorCallNative>("header_flags", 44);
+        Off<ReactorCallNative>("request_ptr", 48);
+        Off<ReactorCallNative>("request_len", 56);
+        Off<ReactorCallNative>("request_flags", 60);
+        Off<ReactorCallNative>("peer_ptr", 64);
+        Off<ReactorCallNative>("peer_len", 72);
+        Off<ReactorCallNative>("header_buffer", 80);
+        Off<ReactorCallNative>("request_buffer", 88);
+        Off<ReactorCallNative>("peer_buffer", 96);
+        Off<ReactorCallNative>("connection_handle", 104);
+    }
+
+    [Fact]
+    public void ReactorEventKind_Values_Match_Header()
+    {
+        Assert.Equal(0, (byte)ReactorEventKind.Call);
+        Assert.Equal(1, (byte)ReactorEventKind.ConnectionClosed);
+        Assert.Equal(2, (byte)ReactorEventKind.ResponseWritable);
+        Assert.Equal(3, (byte)ReactorEventKind.ResponseClosed);
     }
 
     // ─── Enum value verification ────────────────────────────────────────────
@@ -198,6 +294,7 @@ public class AbiContractTests
         Assert.Equal(9, (int)Status.Cancelled);
         Assert.Equal(10, (int)Status.ConnectionRefused);
         Assert.Equal(11, (int)Status.StreamReset);
+        Assert.Equal(12, (int)Status.AbiMismatch);
     }
 
     // ─── Runtime version check ────────────────────────────────────────────────
@@ -206,6 +303,7 @@ public class AbiContractTests
     public void Runtime_Version_Is_Consistent()
     {
         var (major, minor, patch) = Runtime.Version;
+        Assert.Equal(3, major); // ASTER_ABI_VERSION_MAJOR this binding targets
         Assert.True(major >= 0);
         Assert.True(minor >= 0);
         Assert.True(patch >= 0);
@@ -277,7 +375,7 @@ public class AbiContractTests
             data_dir_utf8 = default,
         };
 
-        Assert.Equal(144u, cfg.struct_size);
+        Assert.Equal(152u, cfg.struct_size);
         Assert.Equal(0u, cfg.relay_mode);
         Assert.Equal(1u, cfg.enable_discovery);
     }
@@ -288,8 +386,10 @@ public class AbiContractTests
     public void Bytes_FromArray_And_ToArray_RoundTrip()
     {
         byte[] original = { 0xDE, 0xAD, 0xBE, 0xEF };
-        var b = Bytes.FromArray(original);
-        byte[] roundTrip = b.ToArray();
+        var pin = GCHandle.Alloc(original, GCHandleType.Pinned);
+        byte[] roundTrip;
+        try { roundTrip = Bytes.FromPinned(pin, original.Length).ToArray(); }
+        finally { pin.Free(); }
 
         Assert.Equal(original, roundTrip);
     }
@@ -306,7 +406,8 @@ public class AbiContractTests
     {
         string original = "Hello, Aster!";
         byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(original);
-        var b = Bytes.FromArray(utf8);
-        Assert.Equal(original, b.ToUtf8String());
+        var pin = GCHandle.Alloc(utf8, GCHandleType.Pinned);
+        try { Assert.Equal(original, Bytes.FromPinned(pin, utf8.Length).ToUtf8String()); }
+        finally { pin.Free(); }
     }
 }

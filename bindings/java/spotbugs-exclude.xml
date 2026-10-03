@@ -20,7 +20,7 @@
     </Match>
 
     <!--
-        IROH_EVENT allocation is intentional — Arena handles lifetime.
+        ASTER_EVENT allocation is intentional — Arena handles lifetime.
         These are pre-allocated or short-lived and deliberately not closed individually.
     -->
     <Match>
@@ -105,7 +105,7 @@
     </Match>
 
     <!--
-        CT_CONSTRUCTOR_THROW: IrohRuntime constructor calls native iroh_runtime_new
+        CT_CONSTRUCTOR_THROW: IrohRuntime constructor calls native aster_runtime_new
         which can throw via UnsatisfiedLinkError — this is inherent to FFI and
         unavoidable.
     -->

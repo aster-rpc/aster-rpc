@@ -23,15 +23,7 @@
     <ProjectReference Include="..\Aster\Aster.csproj" />
   </ItemGroup>
 
-  <!-- Copy native library to test output -->
-  <PropertyGroup>
-    <NativeLibraryPath Condition="'$(NativeLibraryPath)' == ''">/Users/emrul/dev/emrul/iroh-python/target/release</NativeLibraryPath>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <None Include="$(NativeLibraryPath)/libaster_transport_ffi.dylib" Link="libaster_transport_ffi.dylib">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
+  <!-- The native library is copied to the output by the Aster project reference
+       (see NativeLibraryPath in ../Aster/Aster.csproj). -->
 
 </Project>

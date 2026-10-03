@@ -25,8 +25,8 @@
 //! ## Note
 //!
 //! These tests require two in-memory nodes with compatible ALPNS to communicate.
-//! The aster ALPN protocol is used for in-memory connections via `iroh_node_memory_with_alpns`
-//! and `iroh_node_accept_aster` / `iroh_connect`.
+//! The aster ALPN protocol is used for in-memory connections via `aster_node_memory_with_alpns`
+//! and `aster_node_accept_aster` / `aster_connect`.
 
 use std::ptr;
 use std::time::Duration;
@@ -41,13 +41,13 @@ use common::{wait_for_successful_operation, wait_for_successful_operations};
 
 /// Wait for node creation by polling for NODE_CREATED event.
 unsafe fn wait_for_node_creation(
-    runtime: iroh_runtime_t,
-    operation: iroh_operation_t,
-) -> iroh_node_t {
+    runtime: aster_runtime_t,
+    operation: aster_operation_t,
+) -> aster_node_t {
     wait_for_successful_operation(
         runtime,
         operation,
-        iroh_event_kind_t::IROH_EVENT_NODE_CREATED,
+        aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
     )
     .handle
 }
@@ -59,16 +59,16 @@ unsafe fn wait_for_node_creation(
 #[test]
 fn test_accept_submit_then_close() {
     unsafe {
-        let mut runtime: iroh_runtime_t = 0;
-        let status = iroh_runtime_new(ptr::null(), &mut runtime);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut runtime: aster_runtime_t = 0;
+        let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create an in-memory node with aster ALPN
         let alpns = [b"aster".as_ptr()];
         let alpn_lens = [5];
 
-        let mut node_op: iroh_operation_t = 0;
-        let status = iroh_node_memory_with_alpns(
+        let mut node_op: aster_operation_t = 0;
+        let status = aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -76,28 +76,28 @@ fn test_accept_submit_then_close() {
             0,
             &mut node_op,
         );
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Wait for node creation
         let node = wait_for_node_creation(runtime, node_op);
 
         // Submit an accept — we don't have a peer, so this will hang.
         // We immediately close the node to force an ERROR terminal.
-        let mut accept_op: iroh_operation_t = 0;
-        let status = iroh_node_accept_aster(runtime, node, 0, &mut accept_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut accept_op: aster_operation_t = 0;
+        let status = aster_node_accept_aster(runtime, node, 0, &mut accept_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Small delay to ensure accept task is running
         std::thread::sleep(Duration::from_millis(10));
 
         // Close the node while accept is pending
-        let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, node, 0, &mut close_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut close_op: aster_operation_t = 0;
+        let status = aster_node_close(runtime, node, 0, &mut close_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Drain events
         let mut events = [std::mem::zeroed(); 8];
-        let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 200);
+        let count = aster_poll_events(runtime, events.as_mut_ptr(), 8, 200);
 
         // Should have events: NODE_CREATED, (maybe) some ACCEPTED or ERROR, and CLOSED.
         // The key invariant: no duplicate terminal events for the same op.
@@ -113,7 +113,7 @@ fn test_accept_submit_then_close() {
             accept_terminals
         );
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -124,16 +124,16 @@ fn test_accept_submit_then_close() {
 #[test]
 fn test_cancel_races_poll() {
     unsafe {
-        let mut runtime: iroh_runtime_t = 0;
-        let status = iroh_runtime_new(ptr::null(), &mut runtime);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut runtime: aster_runtime_t = 0;
+        let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create an in-memory node
         let alpns = [b"aster".as_ptr()];
         let alpn_lens = [5];
 
-        let mut node_op: iroh_operation_t = 0;
-        let status = iroh_node_memory_with_alpns(
+        let mut node_op: aster_operation_t = 0;
+        let status = aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -141,38 +141,38 @@ fn test_cancel_races_poll() {
             0,
             &mut node_op,
         );
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Wait for node creation
         let node = wait_for_node_creation(runtime, node_op);
 
         // Submit accept
-        let mut accept_op: iroh_operation_t = 0;
-        let status = iroh_node_accept_aster(runtime, node, 0, &mut accept_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut accept_op: aster_operation_t = 0;
+        let status = aster_node_accept_aster(runtime, node, 0, &mut accept_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Small delay
         std::thread::sleep(Duration::from_millis(5));
 
         // Cancel the accept before it completes
-        let cancel_status = iroh_operation_cancel(runtime, accept_op);
+        let cancel_status = aster_operation_cancel(runtime, accept_op);
         // May be OK (already completed) or NOT_FOUND (already gone) — both are acceptable
         assert!(
-            cancel_status == iroh_status_t::IROH_STATUS_OK as i32
-                || cancel_status == iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+            cancel_status == aster_status_t::ASTER_STATUS_OK as i32
+                || cancel_status == aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
             "cancel returned unexpected status {}",
             cancel_status
         );
 
         // Drain — should not get a spurious completion for accept_op
         let mut events = [std::mem::zeroed(); 8];
-        let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 100);
+        let count = aster_poll_events(runtime, events.as_mut_ptr(), 8, 100);
 
         // accept_op should NOT appear as a successful completion
         let spurious_completions = events[..count]
             .iter()
             .filter(|e| {
-                e.operation == accept_op && e.status == iroh_status_t::IROH_STATUS_OK as u32
+                e.operation == accept_op && e.status == aster_status_t::ASTER_STATUS_OK as u32
             })
             .count();
 
@@ -181,7 +181,7 @@ fn test_cancel_races_poll() {
             "accept_op should not complete successfully after cancel"
         );
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -192,16 +192,16 @@ fn test_cancel_races_poll() {
 #[test]
 fn test_handle_close_after_submit() {
     unsafe {
-        let mut runtime: iroh_runtime_t = 0;
-        let status = iroh_runtime_new(ptr::null(), &mut runtime);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut runtime: aster_runtime_t = 0;
+        let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create a node
         let alpns = [b"aster".as_ptr()];
         let alpn_lens = [5];
 
-        let mut node_op: iroh_operation_t = 0;
-        let status = iroh_node_memory_with_alpns(
+        let mut node_op: aster_operation_t = 0;
+        let status = aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -209,36 +209,36 @@ fn test_handle_close_after_submit() {
             0,
             &mut node_op,
         );
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         let node = wait_for_node_creation(runtime, node_op);
 
         // Submit accept
-        let mut accept_op: iroh_operation_t = 0;
-        let status = iroh_node_accept_aster(runtime, node, 0, &mut accept_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut accept_op: aster_operation_t = 0;
+        let status = aster_node_accept_aster(runtime, node, 0, &mut accept_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Close the node immediately
-        let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, node, 0, &mut close_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut close_op: aster_operation_t = 0;
+        let status = aster_node_close(runtime, node, 0, &mut close_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Drain
         let mut events = [std::mem::zeroed(); 8];
-        let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 200);
+        let count = aster_poll_events(runtime, events.as_mut_ptr(), 8, 200);
 
         // Check that accept_op does not complete successfully
         for event in &events[..count] {
             if event.operation == accept_op {
                 assert_ne!(
                     event.status,
-                    iroh_status_t::IROH_STATUS_OK as u32,
+                    aster_status_t::ASTER_STATUS_OK as u32,
                     "accept_op should not succeed after node close"
                 );
             }
         }
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -248,16 +248,16 @@ fn test_handle_close_after_submit() {
 #[test]
 fn test_many_outstanding_on_cq() {
     unsafe {
-        let mut runtime: iroh_runtime_t = 0;
-        let status = iroh_runtime_new(ptr::null(), &mut runtime);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut runtime: aster_runtime_t = 0;
+        let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create a node
         let alpns = [b"aster".as_ptr()];
         let alpn_lens = [5];
 
-        let mut node_op: iroh_operation_t = 0;
-        let status = iroh_node_memory_with_alpns(
+        let mut node_op: aster_operation_t = 0;
+        let status = aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -265,7 +265,7 @@ fn test_many_outstanding_on_cq() {
             0,
             &mut node_op,
         );
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let node = wait_for_node_creation(runtime, node_op);
 
         // Submit 100 accept operations rapidly — none will complete (no peer)
@@ -273,23 +273,23 @@ fn test_many_outstanding_on_cq() {
         let mut ops = [0u64; N];
 
         for (i, slot) in ops.iter_mut().enumerate().take(N) {
-            let mut op: iroh_operation_t = 0;
-            let status = iroh_node_accept_aster(runtime, node, i as u64, &mut op);
-            if status == iroh_status_t::IROH_STATUS_OK as i32 {
+            let mut op: aster_operation_t = 0;
+            let status = aster_node_accept_aster(runtime, node, i as u64, &mut op);
+            if status == aster_status_t::ASTER_STATUS_OK as i32 {
                 *slot = op;
             }
         }
 
         // Immediately close the node — all pending accepts should get ERROR
-        let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, node, 0, &mut close_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut close_op: aster_operation_t = 0;
+        let status = aster_node_close(runtime, node, 0, &mut close_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Drain all events
         let mut all_events = Vec::new();
         loop {
             let mut events = [std::mem::zeroed(); 16];
-            let count = iroh_poll_events(runtime, events.as_mut_ptr(), 16, 200);
+            let count = aster_poll_events(runtime, events.as_mut_ptr(), 16, 200);
             if count == 0 {
                 break;
             }
@@ -323,7 +323,7 @@ fn test_many_outstanding_on_cq() {
         let close_terminals = all_events
             .iter()
             .filter(|e| {
-                e.operation == close_op && e.kind == iroh_event_kind_t::IROH_EVENT_CLOSED as u32
+                e.operation == close_op && e.kind == aster_event_kind_t::ASTER_EVENT_CLOSED as u32
             })
             .count();
         assert!(
@@ -331,7 +331,7 @@ fn test_many_outstanding_on_cq() {
             "close_op should have at most one CLOSED event"
         );
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -346,8 +346,8 @@ fn test_peer_disconnect_mid_read() {
     // verify the accept got an error.
     //
     // Full implementation would be:
-    // 1. Node A: iroh_node_memory_with_alpns(["aster"])
-    // 2. Node B: iroh_node_memory_with_alpns(["aster"])
+    // 1. Node A: aster_node_memory_with_alpns(["aster"])
+    // 2. Node B: aster_node_memory_with_alpns(["aster"])
     // 3. Node A: submit accept
     // 4. Node B: connect to Node A
     // 5. Node A: accept completes, get connection handle
@@ -357,15 +357,15 @@ fn test_peer_disconnect_mid_read() {
     //
     // This is a placeholder for the full implementation.
     unsafe {
-        let mut runtime: iroh_runtime_t = 0;
-        let status = iroh_runtime_new(ptr::null(), &mut runtime);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut runtime: aster_runtime_t = 0;
+        let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         let alpns = [b"aster".as_ptr()];
         let alpn_lens = [5];
 
-        let mut node_op: iroh_operation_t = 0;
-        let status = iroh_node_memory_with_alpns(
+        let mut node_op: aster_operation_t = 0;
+        let status = aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -373,22 +373,22 @@ fn test_peer_disconnect_mid_read() {
             0,
             &mut node_op,
         );
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let node = wait_for_node_creation(runtime, node_op);
 
         // Submit accept
-        let mut accept_op: iroh_operation_t = 0;
-        let status = iroh_node_accept_aster(runtime, node, 0, &mut accept_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut accept_op: aster_operation_t = 0;
+        let status = aster_node_accept_aster(runtime, node, 0, &mut accept_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Close node (simulates peer disconnect since no peer will ever connect)
-        let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, node, 0, &mut close_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut close_op: aster_operation_t = 0;
+        let status = aster_node_close(runtime, node, 0, &mut close_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Drain
         let mut events = [std::mem::zeroed(); 8];
-        let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 200);
+        let count = aster_poll_events(runtime, events.as_mut_ptr(), 8, 200);
 
         // accept_op may have ERROR (or nothing) since node was closed; we only
         // assert the negative — never an ACCEPTED post-close.
@@ -396,7 +396,7 @@ fn test_peer_disconnect_mid_read() {
             .iter()
             .filter(|e| {
                 e.operation == accept_op
-                    && e.kind == iroh_event_kind_t::IROH_EVENT_CONNECTION_ACCEPTED as u32
+                    && e.kind == aster_event_kind_t::ASTER_EVENT_CONNECTION_ACCEPTED as u32
             })
             .count();
 
@@ -406,7 +406,7 @@ fn test_peer_disconnect_mid_read() {
             "accept_op should not be ACCEPTED after node was closed"
         );
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -423,16 +423,16 @@ fn test_peer_disconnect_mid_read() {
 #[test]
 fn test_batch_completion_delivery() {
     unsafe {
-        let mut runtime: iroh_runtime_t = 0;
-        let status = iroh_runtime_new(ptr::null(), &mut runtime);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut runtime: aster_runtime_t = 0;
+        let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create node
         let alpns = [b"aster".as_ptr()];
         let alpn_lens = [5];
 
-        let mut node_op: iroh_operation_t = 0;
-        let status = iroh_node_memory_with_alpns(
+        let mut node_op: aster_operation_t = 0;
+        let status = aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -440,7 +440,7 @@ fn test_batch_completion_delivery() {
             0,
             &mut node_op,
         );
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let node = wait_for_node_creation(runtime, node_op);
 
         // Submit many accepts — they'll all be pending when we close the node
@@ -448,17 +448,17 @@ fn test_batch_completion_delivery() {
         let mut ops = [0u64; N];
 
         for (i, slot) in ops.iter_mut().enumerate().take(N) {
-            let mut op: iroh_operation_t = 0;
-            let status = iroh_node_accept_aster(runtime, node, i as u64, &mut op);
-            if status == iroh_status_t::IROH_STATUS_OK as i32 {
+            let mut op: aster_operation_t = 0;
+            let status = aster_node_accept_aster(runtime, node, i as u64, &mut op);
+            if status == aster_status_t::ASTER_STATUS_OK as i32 {
                 *slot = op;
             }
         }
 
         // Close node — all pending accepts should get ERROR simultaneously
-        let mut close_op: iroh_operation_t = 0;
-        let status = iroh_node_close(runtime, node, 0, &mut close_op);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut close_op: aster_operation_t = 0;
+        let status = aster_node_close(runtime, node, 0, &mut close_op);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Wait for close event
         std::thread::sleep(Duration::from_millis(500));
@@ -469,7 +469,7 @@ fn test_batch_completion_delivery() {
 
         loop {
             let mut events = [std::mem::zeroed(); 8];
-            let count = iroh_poll_events(runtime, events.as_mut_ptr(), 8, 200);
+            let count = aster_poll_events(runtime, events.as_mut_ptr(), 8, 200);
             if count == 0 {
                 break;
             }
@@ -493,7 +493,7 @@ fn test_batch_completion_delivery() {
             "Should have gotten at least some events after close"
         );
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -504,9 +504,9 @@ fn test_batch_completion_delivery() {
 #[test]
 fn test_many_nodes_share_runtime_cq() {
     unsafe {
-        let mut runtime: iroh_runtime_t = 0;
-        let status = iroh_runtime_new(ptr::null(), &mut runtime);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        let mut runtime: aster_runtime_t = 0;
+        let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create many nodes rapidly — they all share the same runtime/CQ
         const N: usize = 20;
@@ -516,7 +516,7 @@ fn test_many_nodes_share_runtime_cq() {
             let alpns = [b"aster".as_ptr()];
             let alpn_lens = [5];
 
-            let status = iroh_node_memory_with_alpns(
+            let status = aster_node_memory_with_alpns(
                 runtime,
                 alpns.as_ptr(),
                 alpn_lens.as_ptr(),
@@ -524,13 +524,13 @@ fn test_many_nodes_share_runtime_cq() {
                 i as u64,
                 slot,
             );
-            assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+            assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         }
 
         let all_events = wait_for_successful_operations(
             runtime,
             &node_ops,
-            iroh_event_kind_t::IROH_EVENT_NODE_CREATED,
+            aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
         );
 
         // Key invariant: no duplicate events
@@ -550,15 +550,15 @@ fn test_many_nodes_share_runtime_cq() {
         // Clean up: close all nodes
         let mut close_ops = Vec::with_capacity(N);
         for event in &all_events {
-            let mut close_op: iroh_operation_t = 0;
+            let mut close_op: aster_operation_t = 0;
             assert_eq!(
-                iroh_node_close(runtime, event.handle, 0, &mut close_op),
-                iroh_status_t::IROH_STATUS_OK as i32
+                aster_node_close(runtime, event.handle, 0, &mut close_op),
+                aster_status_t::ASTER_STATUS_OK as i32
             );
             close_ops.push(close_op);
         }
-        wait_for_successful_operations(runtime, &close_ops, iroh_event_kind_t::IROH_EVENT_CLOSED);
+        wait_for_successful_operations(runtime, &close_ops, aster_event_kind_t::ASTER_EVENT_CLOSED);
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }

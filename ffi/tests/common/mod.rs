@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use std::{collections::HashSet, iter::FromIterator};
 
 use aster_transport_ffi::{
-    iroh_buffer_release, iroh_event_kind_t, iroh_event_t, iroh_operation_t, iroh_poll_events,
-    iroh_runtime_t, iroh_status_t,
+    aster_buffer_release, aster_event_kind_t, aster_event_t, aster_operation_t, aster_poll_events,
+    aster_runtime_t, aster_status_t,
 };
 
 /// Wait for one asynchronous FFI operation to produce its terminal event.
@@ -21,9 +21,9 @@ use aster_transport_ffi::{
 /// queue in bounded slices, correlates the exact operation, and retains a
 /// finite failure deadline without turning ordinary host load into a failure.
 pub unsafe fn wait_for_operation(
-    runtime: iroh_runtime_t,
-    operation: iroh_operation_t,
-) -> iroh_event_t {
+    runtime: aster_runtime_t,
+    operation: aster_operation_t,
+) -> aster_event_t {
     const DEADLINE: Duration = Duration::from_secs(30);
     const POLL_SLICE: Duration = Duration::from_millis(250);
 
@@ -42,8 +42,8 @@ pub unsafe fn wait_for_operation(
             .try_into()
             .expect("poll slice fits u32");
 
-        let mut events: [iroh_event_t; 8] = std::mem::zeroed();
-        let count = iroh_poll_events(runtime, events.as_mut_ptr(), events.len(), timeout_ms);
+        let mut events: [aster_event_t; 8] = std::mem::zeroed();
+        let count = aster_poll_events(runtime, events.as_mut_ptr(), events.len(), timeout_ms);
         for event in events.iter().take(count) {
             if event.operation == operation {
                 return *event;
@@ -52,7 +52,7 @@ pub unsafe fn wait_for_operation(
             // The event has been removed from the queue even though it is not
             // ours. Do not leak a payload while waiting for the correlated op.
             if event.buffer != 0 {
-                let _ = iroh_buffer_release(runtime, event.buffer);
+                let _ = aster_buffer_release(runtime, event.buffer);
             }
         }
     }
@@ -60,10 +60,10 @@ pub unsafe fn wait_for_operation(
 
 /// Wait for one operation and require its expected successful event.
 pub unsafe fn wait_for_successful_operation(
-    runtime: iroh_runtime_t,
-    operation: iroh_operation_t,
-    expected_kind: iroh_event_kind_t,
-) -> iroh_event_t {
+    runtime: aster_runtime_t,
+    operation: aster_operation_t,
+    expected_kind: aster_event_kind_t,
+) -> aster_event_t {
     let event = wait_for_operation(runtime, operation);
     assert_eq!(
         event.kind, expected_kind as u32,
@@ -72,7 +72,7 @@ pub unsafe fn wait_for_successful_operation(
     );
     assert_eq!(
         event.status,
-        iroh_status_t::IROH_STATUS_OK as u32,
+        aster_status_t::ASTER_STATUS_OK as u32,
         "operation {operation} failed with status {} (event kind {}, error {})",
         event.status,
         event.kind,
@@ -88,14 +88,14 @@ pub unsafe fn wait_for_successful_operation(
 /// events arrived: the hostile-race CQ test is meant to prove that sharing a
 /// runtime loses and duplicates none of them.
 pub unsafe fn wait_for_successful_operations(
-    runtime: iroh_runtime_t,
-    operations: &[iroh_operation_t],
-    expected_kind: iroh_event_kind_t,
-) -> Vec<iroh_event_t> {
+    runtime: aster_runtime_t,
+    operations: &[aster_operation_t],
+    expected_kind: aster_event_kind_t,
+) -> Vec<aster_event_t> {
     const DEADLINE: Duration = Duration::from_secs(30);
     const POLL_SLICE: Duration = Duration::from_millis(250);
 
-    let all = HashSet::<iroh_operation_t>::from_iter(operations.iter().copied());
+    let all = HashSet::<aster_operation_t>::from_iter(operations.iter().copied());
     assert_eq!(all.len(), operations.len(), "operation ids must be unique");
     let mut pending = all.clone();
     let mut completed = Vec::with_capacity(operations.len());
@@ -117,8 +117,8 @@ pub unsafe fn wait_for_successful_operations(
             .try_into()
             .expect("poll slice fits u32");
 
-        let mut events: [iroh_event_t; 32] = std::mem::zeroed();
-        let count = iroh_poll_events(runtime, events.as_mut_ptr(), events.len(), timeout_ms);
+        let mut events: [aster_event_t; 32] = std::mem::zeroed();
+        let count = aster_poll_events(runtime, events.as_mut_ptr(), events.len(), timeout_ms);
         for event in events.iter().take(count) {
             if all.contains(&event.operation) {
                 assert!(
@@ -138,7 +138,7 @@ pub unsafe fn wait_for_successful_operations(
                 );
                 assert_eq!(
                     event.status,
-                    iroh_status_t::IROH_STATUS_OK as u32,
+                    aster_status_t::ASTER_STATUS_OK as u32,
                     "operation {} failed with status {} (event kind {}, error {})",
                     event.operation,
                     event.status,
@@ -147,7 +147,7 @@ pub unsafe fn wait_for_successful_operations(
                 );
                 completed.push(*event);
             } else if event.buffer != 0 {
-                let _ = iroh_buffer_release(runtime, event.buffer);
+                let _ = aster_buffer_release(runtime, event.buffer);
             }
         }
     }
@@ -157,9 +157,9 @@ pub unsafe fn wait_for_successful_operations(
 
 /// Helper to create a default runtime config
 #[cfg(test)]
-pub fn default_runtime_config() -> aster_transport_ffi::iroh_runtime_config_t {
-    aster_transport_ffi::iroh_runtime_config_t {
-        struct_size: std::mem::size_of::<aster_transport_ffi::iroh_runtime_config_t>() as u32,
+pub fn default_runtime_config() -> aster_transport_ffi::aster_runtime_config_t {
+    aster_transport_ffi::aster_runtime_config_t {
+        struct_size: std::mem::size_of::<aster_transport_ffi::aster_runtime_config_t>() as u32,
         worker_threads: 1,
         event_queue_capacity: 100,
         reserved: 0,
@@ -168,53 +168,53 @@ pub fn default_runtime_config() -> aster_transport_ffi::iroh_runtime_config_t {
 
 /// Helper to create an empty endpoint config
 #[cfg(test)]
-pub fn empty_endpoint_config() -> aster_transport_ffi::iroh_endpoint_config_t {
-    aster_transport_ffi::iroh_endpoint_config_t {
-        struct_size: std::mem::size_of::<aster_transport_ffi::iroh_endpoint_config_t>() as u32,
-        relay_mode: aster_transport_ffi::iroh_relay_mode_t::IROH_RELAY_MODE_DEFAULT as u32,
-        secret_key: aster_transport_ffi::iroh_bytes_t {
+pub fn empty_endpoint_config() -> aster_transport_ffi::aster_endpoint_config_t {
+    aster_transport_ffi::aster_endpoint_config_t {
+        struct_size: std::mem::size_of::<aster_transport_ffi::aster_endpoint_config_t>() as u32,
+        relay_mode: aster_transport_ffi::aster_relay_mode_t::ASTER_RELAY_MODE_DEFAULT as u32,
+        secret_key: aster_transport_ffi::aster_bytes_t {
             ptr: std::ptr::null(),
             len: 0,
         },
-        alpns: aster_transport_ffi::iroh_bytes_list_t {
+        alpns: aster_transport_ffi::aster_bytes_list_t {
             items: std::ptr::null(),
             len: 0,
         },
-        relay_urls: aster_transport_ffi::iroh_bytes_list_t {
+        relay_urls: aster_transport_ffi::aster_bytes_list_t {
             items: std::ptr::null(),
             len: 0,
         },
         enable_discovery: 0,
         enable_hooks: 0,
         hook_timeout_ms: 0,
-        bind_addr: aster_transport_ffi::iroh_bytes_t {
+        bind_addr: aster_transport_ffi::aster_bytes_t {
             ptr: std::ptr::null(),
             len: 0,
         },
         clear_ip_transports: 0,
         clear_relay_transports: 0,
         portmapper_config: 0,
-        proxy_url: aster_transport_ffi::iroh_bytes_t {
+        proxy_url: aster_transport_ffi::aster_bytes_t {
             ptr: std::ptr::null(),
             len: 0,
         },
         proxy_from_env: 0,
-        data_dir_utf8: aster_transport_ffi::iroh_bytes_t {
+        data_dir_utf8: aster_transport_ffi::aster_bytes_t {
             ptr: std::ptr::null(),
             len: 0,
         },
         hook_failure_mode:
-            aster_transport_ffi::iroh_hook_failure_mode_t::IROH_HOOK_FAILURE_FAIL_OPEN as u32,
+            aster_transport_ffi::aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_OPEN as u32,
     }
 }
 
 /// Helper to create an endpoint config with hooks enabled
 #[cfg(test)]
-pub fn hooks_endpoint_config() -> aster_transport_ffi::iroh_endpoint_config_t {
+pub fn hooks_endpoint_config() -> aster_transport_ffi::aster_endpoint_config_t {
     let mut cfg = empty_endpoint_config();
     cfg.enable_hooks = 1;
     cfg.hook_timeout_ms = 2000;
     cfg.hook_failure_mode =
-        aster_transport_ffi::iroh_hook_failure_mode_t::IROH_HOOK_FAILURE_FAIL_CLOSED as u32;
+        aster_transport_ffi::aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_CLOSED as u32;
     cfg
 }

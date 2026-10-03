@@ -1,6 +1,6 @@
 package site.aster.ffi;
 
-/** Event kinds emitted by {@code iroh_poll_events}. Values match Rust iroh_event_kind_t enum. */
+/** Event kinds emitted by {@code aster_poll_events}. Values match Rust aster_event_kind_t enum. */
 public enum IrohEventKind {
   NONE(0),
 
@@ -58,10 +58,13 @@ public enum IrohEventKind {
   GOSSIP_NEIGHBOR_UP(53),
   GOSSIP_NEIGHBOR_DOWN(54),
   GOSSIP_LAGGED(55),
+  // Late additions in the 50s range (see aster_event_kind_t in ffi/aster_ffi.h)
+  BLOB_OBSERVE_COMPLETE(56),
+  DOC_DEL(57),
 
   // Datagrams
   // TODO(iroh): DATAGRAM_RECEIVED (60) is never emitted by any FFI function.
-  // iroh_connection_read_datagram emits BYTES_RESULT (91) instead.
+  // aster_connection_read_datagram emits BYTES_RESULT (91) instead.
   // Consider removing DATAGRAM_RECEIVED from this enum or clarifying its intended use.
   DATAGRAM_RECEIVED(60),
 

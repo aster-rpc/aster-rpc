@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 

@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -48,12 +48,12 @@ func (t *Tags) Node() *Node {
 
 // Set sets a named tag for a blob.
 func (t *Tags) Set(ctx context.Context, name string, hash BlobID, format TagFormat) error {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	nameBytes := []byte(name)
 	hashBytes := []byte(hash)
 
-	r := C.iroh_tags_set(
+	r := C.aster_tags_set(
 		C.uint64_t(t.runtime.handle),
 		C.uint64_t(t.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&nameBytes[0])),
@@ -65,14 +65,14 @@ func (t *Tags) Set(ctx context.Context, name string, hash BlobID, format TagForm
 		&opID,
 	)
 	if r != 0 {
-		return fmt.Errorf("iroh_tags_set: %w", Error(r))
+		return fmt.Errorf("aster_tags_set: %w", Error(r))
 	}
 
 	ev, err := t.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return fmt.Errorf("set poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_TAG_SET {
+	if ev.Kind != ASTER_EVENT_TAG_SET {
 		return fmt.Errorf("set: unexpected event %d", ev.Kind)
 	}
 
@@ -81,11 +81,11 @@ func (t *Tags) Set(ctx context.Context, name string, hash BlobID, format TagForm
 
 // Get retrieves a tag by name.
 func (t *Tags) Get(ctx context.Context, name string) (*TagEntry, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	nameBytes := []byte(name)
 
-	r := C.iroh_tags_get(
+	r := C.aster_tags_get(
 		C.uint64_t(t.runtime.handle),
 		C.uint64_t(t.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&nameBytes[0])),
@@ -94,17 +94,17 @@ func (t *Tags) Get(ctx context.Context, name string) (*TagEntry, error) {
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_tags_get: %w", Error(r))
+		return nil, fmt.Errorf("aster_tags_get: %w", Error(r))
 	}
 
 	ev, err := t.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("get poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_TAG_GET {
+	if ev.Kind != ASTER_EVENT_TAG_GET {
 		return nil, fmt.Errorf("get: unexpected event %d", ev.Kind)
 	}
-	if ev.Status == IROH_STATUS_NOT_FOUND {
+	if ev.Status == ASTER_STATUS_NOT_FOUND {
 		return nil, nil
 	}
 
@@ -113,11 +113,11 @@ func (t *Tags) Get(ctx context.Context, name string) (*TagEntry, error) {
 
 // Delete deletes a tag by name.
 func (t *Tags) Delete(ctx context.Context, name string) (int, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	nameBytes := []byte(name)
 
-	r := C.iroh_tags_delete(
+	r := C.aster_tags_delete(
 		C.uint64_t(t.runtime.handle),
 		C.uint64_t(t.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&nameBytes[0])),
@@ -126,14 +126,14 @@ func (t *Tags) Delete(ctx context.Context, name string) (int, error) {
 		&opID,
 	)
 	if r != 0 {
-		return 0, fmt.Errorf("iroh_tags_delete: %w", Error(r))
+		return 0, fmt.Errorf("aster_tags_delete: %w", Error(r))
 	}
 
 	ev, err := t.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return 0, fmt.Errorf("delete poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_TAG_DELETED {
+	if ev.Kind != ASTER_EVENT_TAG_DELETED {
 		return 0, fmt.Errorf("delete: unexpected event %d", ev.Kind)
 	}
 
@@ -142,11 +142,11 @@ func (t *Tags) Delete(ctx context.Context, name string) (int, error) {
 
 // ListPrefix lists tags matching a prefix.
 func (t *Tags) ListPrefix(ctx context.Context, prefix string) ([]TagEntry, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	prefixBytes := []byte(prefix)
 
-	r := C.iroh_tags_list_prefix(
+	r := C.aster_tags_list_prefix(
 		C.uint64_t(t.runtime.handle),
 		C.uint64_t(t.node.handle),
 		(*C.uint8_t)(unsafe.Pointer(&prefixBytes[0])),
@@ -155,14 +155,14 @@ func (t *Tags) ListPrefix(ctx context.Context, prefix string) ([]TagEntry, error
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_tags_list_prefix: %w", Error(r))
+		return nil, fmt.Errorf("aster_tags_list_prefix: %w", Error(r))
 	}
 
 	ev, err := t.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("list prefix poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_TAG_LIST {
+	if ev.Kind != ASTER_EVENT_TAG_LIST {
 		return nil, fmt.Errorf("list prefix: unexpected event %d", ev.Kind)
 	}
 

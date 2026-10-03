@@ -12,16 +12,16 @@ mod common;
 
 use common::wait_for_successful_operation;
 
-unsafe fn create_runtime_and_node() -> (iroh_runtime_t, iroh_node_t) {
-    let mut runtime: iroh_runtime_t = 0;
-    let status = iroh_runtime_new(ptr::null(), &mut runtime);
-    assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+unsafe fn create_runtime_and_node() -> (aster_runtime_t, aster_node_t) {
+    let mut runtime: aster_runtime_t = 0;
+    let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
+    assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
     let alpns = [b"aster".as_ptr()];
     let alpn_lens = [5usize];
 
-    let mut node_op: iroh_operation_t = 0;
-    let status = iroh_node_memory_with_alpns(
+    let mut node_op: aster_operation_t = 0;
+    let status = aster_node_memory_with_alpns(
         runtime,
         alpns.as_ptr(),
         alpn_lens.as_ptr(),
@@ -29,10 +29,13 @@ unsafe fn create_runtime_and_node() -> (iroh_runtime_t, iroh_node_t) {
         0,
         &mut node_op,
     );
-    assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+    assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
-    let created =
-        wait_for_successful_operation(runtime, node_op, iroh_event_kind_t::IROH_EVENT_NODE_CREATED);
+    let created = wait_for_successful_operation(
+        runtime,
+        node_op,
+        aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
+    );
 
     (runtime, created.handle)
 }
@@ -44,13 +47,13 @@ fn reactor_create_and_destroy() {
 
         let mut reactor: aster_reactor_t = 0;
         let status = aster_reactor_create(runtime, node, 64, &mut reactor);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         assert!(reactor != 0, "reactor handle should be non-zero");
 
         let status = aster_reactor_destroy(runtime, reactor);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -60,23 +63,23 @@ fn reactor_destroy_unknown_returns_not_found() {
         let (runtime, _node) = create_runtime_and_node();
 
         let status = aster_reactor_destroy(runtime, 99999);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_NOT_FOUND as i32);
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
 #[test]
 fn reactor_create_invalid_node_returns_not_found() {
     unsafe {
-        let mut runtime: iroh_runtime_t = 0;
-        iroh_runtime_new(ptr::null(), &mut runtime);
+        let mut runtime: aster_runtime_t = 0;
+        aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
 
         let mut reactor: aster_reactor_t = 0;
         let status = aster_reactor_create(runtime, 99999, 64, &mut reactor);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_NOT_FOUND as i32);
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -86,9 +89,9 @@ fn reactor_create_null_out_returns_invalid_argument() {
         let (runtime, node) = create_runtime_and_node();
 
         let status = aster_reactor_create(runtime, node, 64, ptr::null_mut());
-        assert_eq!(status, iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32);
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -110,7 +113,7 @@ fn reactor_poll_empty_returns_zero() {
         assert_eq!(count, 0);
 
         aster_reactor_destroy(runtime, reactor);
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -126,7 +129,7 @@ fn reactor_poll_null_out_returns_zero() {
         assert_eq!(count, 0);
 
         aster_reactor_destroy(runtime, reactor);
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -148,10 +151,10 @@ fn reactor_submit_unknown_call_returns_not_found() {
             ptr::null(),
             0,
         );
-        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_NOT_FOUND as i32);
 
         aster_reactor_destroy(runtime, reactor);
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -161,9 +164,9 @@ fn reactor_buffer_release_unknown_returns_not_found() {
         let (runtime, _node) = create_runtime_and_node();
 
         let status = aster_reactor_buffer_release(runtime, 99999, 1);
-        assert_eq!(status, iroh_status_t::IROH_STATUS_NOT_FOUND as i32);
+        assert_eq!(status, aster_status_t::ASTER_STATUS_NOT_FOUND as i32);
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }
 
@@ -176,12 +179,12 @@ fn reactor_multiple_create_destroy_cycles() {
         for _ in 0..5 {
             let mut reactor: aster_reactor_t = 0;
             let status = aster_reactor_create(runtime, node, 32, &mut reactor);
-            assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+            assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
             let status = aster_reactor_destroy(runtime, reactor);
-            assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+            assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         }
 
-        iroh_runtime_close(runtime);
+        aster_runtime_close(runtime);
     }
 }

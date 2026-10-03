@@ -3,8 +3,28 @@
 **Package:** `Aster`
 **Target:** .NET 9+
 **ABI contract:** Rust FFI via source-generated P/Invoke (`LibraryImport`)
-**Native library:** `libaster_transport_ffi.dylib` from `iroh-python/target/release`
+**Native library:** `libaster_transport_ffi.{dylib,so}` / `aster_transport_ffi.dll` from `target/release` (falls back to `target/debug`; override with `-p:NativeLibraryPath=...`)
+**C header:** `ffi/aster_ffi.h`, ABI 3.x (`aster_*` symbols; `aster_runtime_new(3, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
+
+## STATUS (ABI 3.0 port, 2026-10)
+
+- Ported to the `aster_*` ABI 3.0: every P/Invoke in `src/Aster/Native.cs` matches its
+  `ffi/aster_ffi.h` prototype (by-value `aster_bytes_t` args are passed as `Bytes`, not
+  split ptr/len), `Runtime` checks `aster_abi_version() >> 16 == 3` and passes 3 to
+  `aster_runtime_new`.
+- Reactor: `aster_reactor_call_t` is read via a 112-byte `ReactorCallNative` struct;
+  `Poll` branches on `event_kind` (Call / ConnectionClosed surfaced, ResponseWritable /
+  ResponseClosed routed to submit waiters). `Submit`/`SubmitAsync` handle `QUEUE_FULL`
+  with `aster_reactor_reserve_response_capacity` (same contract as Java). Submits must
+  not run on the poll thread.
+- `dotnet test Aster.sln`: all non-soak tests pass. `SoakTests.Soak_ConnectionCloseRace_50Iterations`
+  intermittently aborts the test host with a native panic ("Cannot drop a runtime in a
+  context where blocking is not allowed") — an FFI-side issue in `aster_runtime_close`
+  when an in-flight op holds the last runtime reference, not a binding bug.
+- Not covered by tests: an end-to-end RPC through `AsterServer` (no .NET Aster client
+  exists yet), and the QUEUE_FULL reservation path under real backpressure.
+- `SendStream.Reset` throws `NotSupportedException` (the ABI has no send-stream reset).
 
 ---
 
@@ -32,21 +52,21 @@
 
 ### 2. CQ Poller Architecture — One Thread Per Runtime
 
-**Decision:** One background `Task` per `Runtime` calls `iroh_poll_events` in a non-blocking loop. Events are dispatched to `ConcurrentDictionary<ulong, TaskCompletionSource<Event>>`.
+**Decision:** One background `Task` per `Runtime` calls `aster_poll_events` in a non-blocking loop. Events are dispatched to `ConcurrentDictionary<ulong, TaskCompletionSource<Event>>`.
 
 **Rationale:**
 - Matches the Rust async model where tokio runs the event loop
 - `TaskCompletionSource<Event>` provides idiomatic .NET async/await integration
 - No thread-per-operation overhead — single poller handles all ops on a runtime
-- Native event batch processing (`iroh_poll_events` returns multiple events per call)
+- Native event batch processing (`aster_poll_events` returns multiple events per call)
 
 **Comparison with other bindings:**
 
 | Language | Poller Implementation |
 |----------|---------------------|
-| **Go** | One goroutine per `Runtime` calls `iroh_poll_events`, dispatches to `chan *Event` |
-| **Java** | `IrohPollThread` (platform thread) calls `iroh_poll_events`, dispatches to `ConcurrentHashMap<opId, CompletableFuture>` |
-| **.NET** | `Task.Run` (background task) calls `iroh_poll_events`, dispatches to `ConcurrentDictionary<opId, TaskCompletionSource>` |
+| **Go** | One goroutine per `Runtime` calls `aster_poll_events`, dispatches to `chan *Event` |
+| **Java** | `IrohPollThread` (platform thread) calls `aster_poll_events`, dispatches to `ConcurrentHashMap<opId, CompletableFuture>` |
+| **.NET** | `Task.Run` (background task) calls `aster_poll_events`, dispatches to `ConcurrentDictionary<opId, TaskCompletionSource>` |
 
 All three bindings follow the same architectural pattern: submit ops → poll for completions → dispatch to per-op continuations.
 
@@ -88,20 +108,20 @@ internal async Task<Event> WaitForAsync(ulong opId, CancellationToken cancellati
 
 ### 4. Memory Ownership — Rust Owns, .NET Copies and Releases
 
-**Decision:** Rust owns all buffer memory until `.NET` explicitly releases via `iroh_buffer_release`.
+**Decision:** Rust owns all buffer memory until `.NET` explicitly releases via `aster_buffer_release`.
 
 **Pattern:**
 1. Native call returns buffer handle via event
 2. .NET copies data to managed memory (`Marshal.Copy`)
-3. .NET calls `iroh_buffer_release(runtime, bufferHandle)` to free
+3. .NET calls `aster_buffer_release(runtime, bufferHandle)` to free
 
 **Comparison:**
 
 | Language | Buffer Ownership |
 |----------|----------------|
-| **Go** | Rust owns → Go copies via `C.Go()` → calls `iroh_buffer_release` |
-| **Java** | Rust owns → Java reads via `MemorySegment` → calls `iroh_buffer_release` |
-| **.NET** | Rust owns → .NET copies via `Marshal.Copy` → calls `iroh_buffer_release` |
+| **Go** | Rust owns → Go copies via `C.Go()` → calls `aster_buffer_release` |
+| **Java** | Rust owns → Java reads via `MemorySegment` → calls `aster_buffer_release` |
+| **.NET** | Rust owns → .NET copies via `Marshal.Copy` → calls `aster_buffer_release` |
 
 ---
 
@@ -124,7 +144,7 @@ public async ValueTask DisposeAsync()
         // Dispatch to thread pool to avoid async context
         await Task.Run(() =>
         {
-            Native.iroh_runtime_destroy(_runtime);
+            Native.aster_runtime_close(_runtime);
         }).ConfigureAwait(false);
         _handle = IntPtr.Zero;
     }
@@ -146,50 +166,22 @@ public async ValueTask DisposeAsync()
 
 ---
 
-### 6. Endpoint Configuration — 144-Byte Struct
+### 6. Endpoint Configuration — 152-Byte Struct
 
-**Decision:** `EndpointConfig` struct must be exactly 144 bytes to match Rust's `iroh_endpoint_config_t`.
-
-**Fields (16 fields, 144 bytes total):**
-```csharp
-[StructLayout(LayoutKind.Sequential)]
-public struct EndpointConfig
-{
-    public uint struct_size;             // 0
-    public uint relay_mode;             // 4
-    public Bytes secret_key;            // 8 (16 bytes)
-    public BytesList alpns;             // 24 (16 bytes)
-    public BytesList relay_urls;        // 40 (16 bytes)
-    public uint enable_discovery;       // 56
-    public uint enable_hooks;          // 60
-    public ulong hook_timeout_ms;       // 64
-    public Bytes bind_addr;             // 72 (16 bytes)
-    public uint clear_ip_transports;   // 88
-    public uint clear_relay_transports; // 92
-    public uint portmapper_config;      // 96
-    public Bytes proxy_url;            // 100 (16 bytes)
-    public uint proxy_from_env;        // 116
-    public Bytes data_dir_utf8;         // 120 (16 bytes)
-} // 144 bytes total
-```
-
-**Why size matters:** Missing fields cause internal errors (kind=99 events) because Rust interprets garbage data as invalid configuration.
-
-**Comparison:**
-
-| Language | Config Struct Size |
-|----------|------------------|
-| **Go** | `unsafe.Sizeof(iroh_endpoint_config_t{})` = 144 |
-| **Java** | `IrohLibrary.IROH_ENDPOINT_CONFIG.byteSize()` = 144 |
-| **.NET** | `Marshal.SizeOf<EndpointConfig>()` = 144 |
-
-All three bindings verify struct sizes via ABI contract tests.
+**Decision:** `EndpointConfig` mirrors `aster_endpoint_config_t` field-for-field with
+`LayoutKind.Sequential`; the size (152) and every offset are asserted in
+`AbiContractTests` against the numbers pinned in `ffi/src/layout.rs`. The last
+field, `hook_failure_mode` @144, was previously missing (struct was 144 bytes).
+All other ABI structs (`Event` 80, `RuntimeConfig` 16, `ConnectConfig` 48,
+`NodeAddr` 48, `Bytes`/`BytesList` 16, `ReactorCallNative` 112) are checked the
+same way. Never hand-compute offsets — add a field to the struct and a
+`Marshal.OffsetOf` assertion instead.
 
 ---
 
 ### 7. Event Kinds — Cross-Language Constants
 
-**Decision:** `EventKind` enum values must match Rust's `iroh_event_kind_t` exactly.
+**Decision:** `EventKind` enum values must match Rust's `aster_event_kind_t` exactly.
 
 **Critical values:**
 ```csharp

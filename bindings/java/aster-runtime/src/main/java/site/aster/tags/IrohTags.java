@@ -85,13 +85,13 @@ public class IrohTags {
               0L,
               opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_tags_set failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_tags_set failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_tags_set threw: " + t.getMessage()));
+          new IrohException("aster_tags_set threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -119,13 +119,13 @@ public class IrohTags {
       int status =
           lib.tagsGet(runtime.nativeHandle(), nodeHandle, nameSeg, nameBytes.length, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_tags_get failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_tags_get failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_tags_get threw: " + t.getMessage()));
+          new IrohException("aster_tags_get threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -165,13 +165,13 @@ public class IrohTags {
       int status =
           lib.tagsDelete(runtime.nativeHandle(), nodeHandle, nameSeg, nameBytes.length, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_tags_delete failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_tags_delete failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_tags_delete threw: " + t.getMessage()));
+          new IrohException("aster_tags_delete threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -211,13 +211,13 @@ public class IrohTags {
               runtime.nativeHandle(), nodeHandle, prefixSeg, prefixBytes.length, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_tags_list_prefix failed: " + status);
+            IrohStatus.fromCode(status), "aster_tags_list_prefix failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_tags_list_prefix threw: " + t.getMessage()));
+          new IrohException("aster_tags_list_prefix threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);

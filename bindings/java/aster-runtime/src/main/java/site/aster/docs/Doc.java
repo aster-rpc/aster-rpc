@@ -47,7 +47,7 @@ public class Doc {
   }
 
   private MemorySegment toBytesSegment(byte[] data, SegmentAllocator alloc) {
-    MemorySegment dataSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    MemorySegment dataSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     MemorySegment heapSeg = alloc.allocate(data.length);
     heapSeg.copyFrom(MemorySegment.ofArray(data));
     dataSeg.set(ValueLayout.ADDRESS, 0, heapSeg);
@@ -74,7 +74,7 @@ public class Doc {
       outLen.set(ValueLayout.JAVA_LONG, 0, 128L);
       int status = lib.docId(runtime.nativeHandle(), docHandle, outBuf, outLen);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_doc_id failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_doc_id failed: " + status);
       }
       long written = outLen.get(ValueLayout.JAVA_LONG, 0);
       byte[] bytes = outBuf.asSlice(0, written).toArray(ValueLayout.JAVA_BYTE);
@@ -95,7 +95,7 @@ public class Doc {
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
-    // iroh_doc_set_bytes takes three iroh_bytes_t by value; pass each as (ptr, len) separately
+    // aster_doc_set_bytes takes three aster_bytes_t by value; pass each as (ptr, len) separately
     // so FFM marshals them into the consecutive registers the struct-by-value ABI expects.
     byte[] authorBytes = author.hex().getBytes(StandardCharsets.UTF_8);
     byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
@@ -124,13 +124,13 @@ public class Doc {
               opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_doc_set_bytes failed: " + status);
+            IrohStatus.fromCode(status), "aster_doc_set_bytes failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_doc_set_bytes threw: " + t.getMessage()));
+          new IrohException("aster_doc_set_bytes threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -154,13 +154,13 @@ public class Doc {
 
     var authorSeg = alloc.allocate(authorBytes.length);
     authorSeg.copyFrom(MemorySegment.ofArray(authorBytes));
-    var authorBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var authorBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     authorBytesSeg.set(ValueLayout.ADDRESS, 0, authorSeg);
     authorBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) authorBytes.length);
 
     var keySeg = alloc.allocate(keyBytes.length);
     keySeg.copyFrom(MemorySegment.ofArray(keyBytes));
-    var keyBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var keyBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     keyBytesSeg.set(ValueLayout.ADDRESS, 0, keySeg);
     keyBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) keyBytes.length);
 
@@ -172,13 +172,13 @@ public class Doc {
               runtime.nativeHandle(), docHandle, authorBytesSeg, keyBytesSeg, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_doc_get_exact failed: " + status);
+            IrohStatus.fromCode(status), "aster_doc_get_exact failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_doc_get_exact threw: " + t.getMessage()));
+          new IrohException("aster_doc_get_exact threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -219,7 +219,7 @@ public class Doc {
     byte[] keyBytes = keyPrefix.getBytes(StandardCharsets.UTF_8);
     var keySeg = alloc.allocate(keyBytes.length);
     keySeg.copyFrom(MemorySegment.ofArray(keyBytes));
-    var keyBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var keyBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     keyBytesSeg.set(ValueLayout.ADDRESS, 0, keySeg);
     keyBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) keyBytes.length);
 
@@ -229,13 +229,13 @@ public class Doc {
       int status =
           lib.docQuery(runtime.nativeHandle(), docHandle, mode.code(), keyBytesSeg, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_doc_query failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_doc_query failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_doc_query threw: " + t.getMessage()));
+          new IrohException("aster_doc_query threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -272,7 +272,7 @@ public class Doc {
     byte[] hashBytes = contentHash.hex().getBytes(StandardCharsets.UTF_8);
     var hashSeg = alloc.allocate(hashBytes.length);
     hashSeg.copyFrom(MemorySegment.ofArray(hashBytes));
-    var hashBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var hashBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     hashBytesSeg.set(ValueLayout.ADDRESS, 0, hashSeg);
     hashBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) hashBytes.length);
 
@@ -283,13 +283,13 @@ public class Doc {
           lib.docReadEntryContent(runtime.nativeHandle(), docHandle, hashBytesSeg, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_doc_read_entry_content failed: " + status);
+            IrohStatus.fromCode(status), "aster_doc_read_entry_content failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_doc_read_entry_content threw: " + t.getMessage()));
+          new IrohException("aster_doc_read_entry_content threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -328,13 +328,13 @@ public class Doc {
     try {
       int status = lib.docShare(runtime.nativeHandle(), docHandle, mode, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_doc_share failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_doc_share failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_doc_share threw: " + t.getMessage()));
+          new IrohException("aster_doc_share threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -368,7 +368,7 @@ public class Doc {
     var alloc = confined;
 
     // Empty peers list
-    var peersSeg = alloc.allocate(IrohLibrary.IROH_BYTES_LIST);
+    var peersSeg = alloc.allocate(IrohLibrary.ASTER_BYTES_LIST);
     peersSeg.set(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
     peersSeg.set(ValueLayout.JAVA_LONG, 8, 0L);
 
@@ -378,13 +378,13 @@ public class Doc {
       int status = lib.docStartSync(runtime.nativeHandle(), docHandle, peersSeg, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_doc_start_sync failed: " + status);
+            IrohStatus.fromCode(status), "aster_doc_start_sync failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_doc_start_sync threw: " + t.getMessage()));
+          new IrohException("aster_doc_start_sync threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -406,13 +406,13 @@ public class Doc {
     try {
       int status = lib.docLeave(runtime.nativeHandle(), docHandle, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_doc_leave failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_doc_leave failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_doc_leave threw: " + t.getMessage()));
+          new IrohException("aster_doc_leave threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);

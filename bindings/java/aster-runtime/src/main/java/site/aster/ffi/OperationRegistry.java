@@ -6,7 +6,7 @@ import site.aster.event.IrohEvent;
 /**
  * Maps native {@code operation_id} values to Java {@link CompletableFuture} instances.
  *
- * <p>When an async FFI call is made, a future is registered here. When {@code iroh_poll_events}
+ * <p>When an async FFI call is made, a future is registered here. When {@code aster_poll_events}
  * returns a completion event, the poller looks up the future here and completes or fails it.
  */
 public class OperationRegistry {

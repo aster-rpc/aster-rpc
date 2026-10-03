@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -73,8 +73,8 @@ func (m *soakMetrics) snapshot() (submitted, completed, cancelled, errored, maxP
 func soakPollForEvent(runtime *Runtime, kind uint32, timeoutMs int) bool {
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for time.Now().Before(deadline) {
-		var events [4]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 4, 100)
+		var events [4]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 4, 100)
 		for i := 0; i < int(n); i++ {
 			if uint32(events[i].kind) == kind {
 				return true
@@ -87,8 +87,8 @@ func soakPollForEvent(runtime *Runtime, kind uint32, timeoutMs int) bool {
 // soakDrainAllEvents drains all pending events from the runtime.
 func soakDrainAllEvents(runtime *Runtime) {
 	for {
-		var events [16]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 16, 0)
+		var events [16]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 16, 0)
 		if int(n) == 0 {
 			break
 		}
@@ -115,14 +115,14 @@ func runSoakCycleOnRuntime(runtime *Runtime, metrics *soakMetrics) bool {
 	}
 
 	// Wait for node creation event (with a short timeout).
-	if !soakPollForEvent(runtime, uint32(IROH_EVENT_NODE_CREATED), 2000) {
+	if !soakPollForEvent(runtime, uint32(ASTER_EVENT_NODE_CREATED), 2000) {
 		node.Close()
 		return false
 	}
 
 	// Submit an accept operation on the node.
-	var acceptOp C.iroh_operation_t
-	r := C.iroh_node_accept_aster(
+	var acceptOp C.aster_operation_t
+	r := C.aster_node_accept_aster(
 		C.uint64_t(runtime.handle),
 		C.uint64_t(node.handle),
 		0,
@@ -143,8 +143,8 @@ func runSoakCycleOnRuntime(runtime *Runtime, metrics *soakMetrics) bool {
 
 	// Drain accept events.
 	for {
-		var events [8]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 100)
+		var events [8]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 100)
 		if int(n) == 0 {
 			break
 		}

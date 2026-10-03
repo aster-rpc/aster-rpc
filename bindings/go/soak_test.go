@@ -28,6 +28,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 )
@@ -40,6 +41,9 @@ const defaultDurationSecs = 1800 // 30 minutes
 
 // TestSoak_Runs executes the soak test for the configured duration.
 func TestSoak_Runs(t *testing.T) {
+	if os.Getenv("ASTER_GO_SOAK") == "" {
+		t.Skip("30-minute soak; set ASTER_GO_SOAK=1 to run")
+	}
 	durationSecs := defaultDurationSecs
 	flag.Parse()
 	if flag.NArg() > 0 {

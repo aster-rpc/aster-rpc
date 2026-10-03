@@ -32,7 +32,7 @@ public class ReactorContractTest {
     // event_kind with 7 bytes alignment padding + connection_id; dropped
     // is_session_call, since the binding decodes sessionId from the
     // StreamHeader); then 104 → 112 by adding connection_handle (the
-    // borrowed iroh_connection_t handle at offset 104).
+    // borrowed aster_connection_t handle at offset 104).
     assertEquals(112, Reactor.CALL_LAYOUT.byteSize());
   }
 
@@ -160,17 +160,22 @@ public class ReactorContractTest {
     assertTrue(IrohStatus.NOT_FOUND.code > 0, "NOT_FOUND must be positive");
   }
 
-  /** Create a fresh runtime via {@code iroh_runtime_new}. */
+  /** Create a fresh runtime via {@code aster_runtime_new}. */
   private static long createRuntime() throws Throwable {
     var lib = IrohLibrary.getInstance();
     var runtimeNew =
         lib.getHandle(
-            "iroh_runtime_new",
-            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+            "aster_runtime_new",
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS,
+                ValueLayout.ADDRESS));
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment outRuntime = arena.allocate(ValueLayout.JAVA_LONG);
-      int status = (int) runtimeNew.invoke(MemorySegment.NULL, outRuntime);
-      assertEquals(IrohStatus.OK.code, status, "iroh_runtime_new failed");
+      int status =
+          (int) runtimeNew.invoke(IrohLibrary.EXPECTED_ABI_MAJOR, MemorySegment.NULL, outRuntime);
+      assertEquals(IrohStatus.OK.code, status, "aster_runtime_new failed");
       return outRuntime.get(ValueLayout.JAVA_LONG, 0);
     }
   }
@@ -179,18 +184,18 @@ public class ReactorContractTest {
     var lib = IrohLibrary.getInstance();
     var runtimeClose =
         lib.getHandle(
-            "iroh_runtime_close",
+            "aster_runtime_close",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
     runtimeClose.invoke(runtime);
   }
 
-  /** Create a memory node via {@code iroh_node_memory_with_alpns} and return its handle. */
+  /** Create a memory node via {@code aster_node_memory_with_alpns} and return its handle. */
   private static long createNode(long runtime) throws Throwable {
     var lib = IrohLibrary.getInstance();
 
     var nodeMemoryAlpns =
         lib.getHandle(
-            "iroh_node_memory_with_alpns",
+            "aster_node_memory_with_alpns",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG, // runtime
@@ -212,7 +217,7 @@ public class ReactorContractTest {
       MemorySegment outOp = arena.allocate(ValueLayout.JAVA_LONG);
 
       int status = (int) nodeMemoryAlpns.invoke(runtime, alpnsArray, alpnLens, 1L, 0L, outOp);
-      assertEquals(IrohStatus.OK.code, status, "iroh_node_memory_with_alpns failed");
+      assertEquals(IrohStatus.OK.code, status, "aster_node_memory_with_alpns failed");
       long nodeOperation = outOp.get(ValueLayout.JAVA_LONG, 0);
 
       // Correlate NODE_CREATED with the submitted operation. The former
@@ -220,7 +225,7 @@ public class ReactorContractTest {
       // handle 1 made the test observe a handle it had not actually received.
       var pollEvents =
           lib.getHandle(
-              "iroh_poll_events",
+              "aster_poll_events",
               FunctionDescriptor.of(
                   ValueLayout.JAVA_LONG,
                   ValueLayout.JAVA_LONG,
@@ -228,13 +233,13 @@ public class ReactorContractTest {
                   ValueLayout.JAVA_LONG,
                   ValueLayout.JAVA_INT));
 
-      MemorySegment events = arena.allocate(IrohLibrary.IROH_EVENT, 8);
+      MemorySegment events = arena.allocate(IrohLibrary.ASTER_EVENT, 8);
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
       while (System.nanoTime() < deadline) {
         long count = (long) pollEvents.invoke(runtime, events, 8L, 250);
         for (long j = 0; j < count; j++) {
           MemorySegment event =
-              events.asSlice(j * IrohLibrary.IROH_EVENT.byteSize(), IrohLibrary.IROH_EVENT);
+              events.asSlice(j * IrohLibrary.ASTER_EVENT.byteSize(), IrohLibrary.ASTER_EVENT);
           if (event.get(ValueLayout.JAVA_LONG, 16) != nodeOperation) {
             continue;
           }

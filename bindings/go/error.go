@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -60,28 +60,30 @@ func errorFromStatus(code C.int) *IrohError {
 	}
 	c := int32(code)
 	switch code {
-	case IROH_STATUS_INVALID_ARGUMENT:
+	case ASTER_STATUS_INVALID_ARGUMENT:
 		return errorf(c, "invalid argument")
-	case IROH_STATUS_NOT_FOUND:
+	case ASTER_STATUS_NOT_FOUND:
 		return errorf(c, "not found")
-	case IROH_STATUS_ALREADY_CLOSED:
+	case ASTER_STATUS_ALREADY_CLOSED:
 		return errorf(c, "already closed")
-	case IROH_STATUS_QUEUE_FULL:
+	case ASTER_STATUS_QUEUE_FULL:
 		return errorf(c, "queue full")
-	case IROH_STATUS_BUFFER_TOO_SMALL:
+	case ASTER_STATUS_BUFFER_TOO_SMALL:
 		return errorf(c, "buffer too small")
-	case IROH_STATUS_UNSUPPORTED:
+	case ASTER_STATUS_UNSUPPORTED:
 		return errorf(c, "unsupported")
-	case IROH_STATUS_INTERNAL:
+	case ASTER_STATUS_INTERNAL:
 		return errorf(c, "internal error")
-	case IROH_STATUS_TIMEOUT:
+	case ASTER_STATUS_TIMEOUT:
 		return errorf(c, "timeout")
-	case IROH_STATUS_CANCELLED:
+	case ASTER_STATUS_CANCELLED:
 		return errorf(c, "cancelled")
-	case IROH_STATUS_CONNECTION_REFUSED:
+	case ASTER_STATUS_CONNECTION_REFUSED:
 		return errorf(c, "connection refused")
-	case IROH_STATUS_STREAM_RESET:
+	case ASTER_STATUS_STREAM_RESET:
 		return errorf(c, "stream reset")
+	case ASTER_STATUS_ABI_MISMATCH:
+		return errorf(c, "ABI version mismatch")
 	default:
 		return errorf(c, "unknown status %d", c)
 	}
@@ -89,32 +91,34 @@ func errorFromStatus(code C.int) *IrohError {
 
 // errors for sentinel checks via errors.Is
 var (
-	ErrInvalidArgument  = errors.New("invalid argument")
-	ErrNotFound        = errors.New("not found")
-	ErrAlreadyClosed   = errors.New("already closed")
-	ErrQueueFull       = errors.New("queue full")
-	ErrBufferTooSmall  = errors.New("buffer too small")
-	ErrUnsupported     = errors.New("unsupported")
-	ErrInternal        = errors.New("internal error")
-	ErrTimeout         = errors.New("timeout")
-	ErrCancelled       = errors.New("cancelled")
+	ErrInvalidArgument   = errors.New("invalid argument")
+	ErrNotFound          = errors.New("not found")
+	ErrAlreadyClosed     = errors.New("already closed")
+	ErrQueueFull         = errors.New("queue full")
+	ErrBufferTooSmall    = errors.New("buffer too small")
+	ErrUnsupported       = errors.New("unsupported")
+	ErrInternal          = errors.New("internal error")
+	ErrTimeout           = errors.New("timeout")
+	ErrCancelled         = errors.New("cancelled")
 	ErrConnectionRefused = errors.New("connection refused")
-	ErrStreamReset     = errors.New("stream reset")
+	ErrStreamReset       = errors.New("stream reset")
+	ErrABIMismatch       = errors.New("ABI version mismatch")
 )
 
 // statusToError maps status codes to sentinel errors for errors.Is matching.
 var statusToError = map[int32]error{
-	IROH_STATUS_INVALID_ARGUMENT:  ErrInvalidArgument,
-	IROH_STATUS_NOT_FOUND:        ErrNotFound,
-	IROH_STATUS_ALREADY_CLOSED:   ErrAlreadyClosed,
-	IROH_STATUS_QUEUE_FULL:       ErrQueueFull,
-	IROH_STATUS_BUFFER_TOO_SMALL: ErrBufferTooSmall,
-	IROH_STATUS_UNSUPPORTED:     ErrUnsupported,
-	IROH_STATUS_INTERNAL:         ErrInternal,
-	IROH_STATUS_TIMEOUT:         ErrTimeout,
-	IROH_STATUS_CANCELLED:       ErrCancelled,
-	IROH_STATUS_CONNECTION_REFUSED: ErrConnectionRefused,
-	IROH_STATUS_STREAM_RESET:     ErrStreamReset,
+	ASTER_STATUS_INVALID_ARGUMENT:   ErrInvalidArgument,
+	ASTER_STATUS_NOT_FOUND:          ErrNotFound,
+	ASTER_STATUS_ALREADY_CLOSED:     ErrAlreadyClosed,
+	ASTER_STATUS_QUEUE_FULL:         ErrQueueFull,
+	ASTER_STATUS_BUFFER_TOO_SMALL:   ErrBufferTooSmall,
+	ASTER_STATUS_UNSUPPORTED:        ErrUnsupported,
+	ASTER_STATUS_INTERNAL:           ErrInternal,
+	ASTER_STATUS_TIMEOUT:            ErrTimeout,
+	ASTER_STATUS_CANCELLED:          ErrCancelled,
+	ASTER_STATUS_CONNECTION_REFUSED: ErrConnectionRefused,
+	ASTER_STATUS_STREAM_RESET:       ErrStreamReset,
+	ASTER_STATUS_ABI_MISMATCH:       ErrABIMismatch,
 }
 
 // Is returns true if target is a matching sentinel error.
@@ -133,7 +137,7 @@ func (e *IrohError) As(target any) bool {
 }
 
 // wrapError wraps a C status code into a Go error.
-// Returns nil for IROH_STATUS_OK.
+// Returns nil for ASTER_STATUS_OK.
 func wrapError(code C.int) error {
 	if code == 0 {
 		return nil

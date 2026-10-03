@@ -58,7 +58,7 @@ public class IrohException extends RuntimeException {
 
   /**
    * Returns the full message including the native error detail from {@code
-   * iroh_last_error_message}. If no native error is available, returns just this exception's
+   * aster_last_error_message}. If no native error is available, returns just this exception's
    * message.
    */
   public String getMessageWithNativeDetail() {

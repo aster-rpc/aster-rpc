@@ -58,7 +58,7 @@ binding is a thin wrapper — no further core work needed:
   wrappers:
   - Python — `bindings/python/rust/src/node.rs`, `blobs.rs`
   - TypeScript — `bindings/typescript/native/src/node.rs`, `blobs.rs`
-  - FFI (Java/Kotlin/Go/.NET) — `ffi/src/lib.rs` (+ `ffi/iroh_ffi.h`)
+  - FFI (Java/Kotlin/Go/.NET) — `ffi/src/lib.rs` (+ `ffi/aster_ffi.h`)
 
 **Retention roots (what GC protects):** tags, temp-tags, **and** the iroh-docs
 live-content set. The core constructors wire iroh-docs' own GC protect callback

@@ -8,14 +8,14 @@ import java.nio.charset.StandardCharsets;
 import site.aster.ffi.IrohLibrary;
 
 /**
- * Builder for {@code iroh_connect_config_t}.
+ * Builder for {@code aster_connect_config_t}.
  *
  * <p>Call {@link #toNative(SegmentAllocator)} to produce a native struct suitable for {@code
- * iroh_connect}.
+ * aster_connect}.
  */
 public class ConnectionConfig {
 
-  private static final MemoryLayout LAYOUT = IrohLibrary.IROH_CONNECT_CONFIG;
+  private static final MemoryLayout LAYOUT = IrohLibrary.ASTER_CONNECT_CONFIG;
 
   private int flags = 0;
   private byte[] nodeId = new byte[0];
@@ -61,10 +61,10 @@ public class ConnectionConfig {
   }
 
   /**
-   * Encode this config into a native {@code iroh_connect_config_t} struct allocated from {@code
+   * Encode this config into a native {@code aster_connect_config_t} struct allocated from {@code
    * allocator}.
    *
-   * <p>Layout: struct_size(4) + flags(4) + node_id IROH_BYTES(16) + alpn IROH_BYTES(16) + addr
+   * <p>Layout: struct_size(4) + flags(4) + node_id ASTER_BYTES(16) + alpn ASTER_BYTES(16) + addr
    * ADDRESS(8) = 48 bytes.
    */
   public MemorySegment toNative(SegmentAllocator alloc) {
@@ -74,7 +74,7 @@ public class ConnectionConfig {
     seg.set(ValueLayout.JAVA_INT, 0, (int) LAYOUT.byteSize());
     seg.set(ValueLayout.JAVA_INT, 4, flags);
 
-    // node_id: IROH_BYTES at offset 8 (ptr at +0, len at +8)
+    // node_id: ASTER_BYTES at offset 8 (ptr at +0, len at +8)
     if (nodeId.length > 0) {
       MemorySegment dataSeg = alloc.allocate(nodeId.length);
       dataSeg.copyFrom(MemorySegment.ofArray(nodeId));
@@ -82,7 +82,7 @@ public class ConnectionConfig {
       seg.set(ValueLayout.JAVA_LONG, 16, (long) nodeId.length);
     }
 
-    // alpn: IROH_BYTES at offset 24 (ptr at +24, len at +32)
+    // alpn: ASTER_BYTES at offset 24 (ptr at +24, len at +32)
     if (alpn.length > 0) {
       MemorySegment dataSeg = alloc.allocate(alpn.length);
       dataSeg.copyFrom(MemorySegment.ofArray(alpn));

@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -21,22 +21,22 @@ import (
 	"unsafe"
 )
 
-// EventKind is the type of an event kind, mirroring iroh_event_kind_t.
+// EventKind is the type of an event kind, mirroring aster_event_kind_t.
 type EventKind uint32
 
 // Event represents an event emitted by the Rust completion queue.
 type Event struct {
-	Kind       uint32
-	Status     uint32
-	Operation  uint64
-	Handle     uint64
-	Related    uint64
-	UserData   uint64
-	DataPtr    unsafe.Pointer
-	DataLen    uintptr
-	Buffer     uint64
-	ErrorCode  int32
-	Flags      uint32
+	Kind      uint32
+	Status    uint32
+	Operation uint64
+	Handle    uint64
+	Related   uint64
+	UserData  uint64
+	DataPtr   unsafe.Pointer
+	DataLen   uintptr
+	Buffer    uint64
+	ErrorCode int32
+	Flags     uint32
 }
 
 // String returns a human-readable description of the event.
@@ -97,24 +97,28 @@ type Runtime struct {
 // NewRuntime creates a new Runtime with the given config.
 // The background poller goroutine starts immediately.
 func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
-	config := C.iroh_runtime_config_t{
-		struct_size:          16,
+	config := C.aster_runtime_config_t{
+		struct_size:          C.uint32_t(unsafe.Sizeof(C.aster_runtime_config_t{})),
 		worker_threads:       C.uint32_t(cfg.WorkerThreads),
 		event_queue_capacity: C.uint32_t(cfg.EventQueueCapacity),
-		reserved:            0,
+		reserved:             0,
+	}
+
+	if err := CheckABI(); err != nil {
+		return nil, err
 	}
 
 	var handle C.uint64_t
-	r := C.iroh_runtime_new(&config, &handle)
-	if r != 0 {
-		return nil, fmt.Errorf("iroh_runtime_new: %w", Error(r))
+	r := C.aster_runtime_new(C.ASTER_ABI_VERSION_MAJOR, &config, &handle)
+	if r != C.ASTER_STATUS_OK {
+		return nil, fmt.Errorf("aster_runtime_new: %w", Error(r))
 	}
 
 	runtime := &Runtime{
-		handle:          uint64(handle),
-		ops:             make(map[uint64]chan<- *Event),
-		acceptHandlers:  make(map[uint64]*Node),
-		pollCh:          make(chan struct{}, 1),
+		handle:         uint64(handle),
+		ops:            make(map[uint64]chan<- *Event),
+		acceptHandlers: make(map[uint64]*Node),
+		pollCh:         make(chan struct{}, 1),
 	}
 
 	runtime.wg.Add(1)
@@ -146,9 +150,9 @@ func (r *Runtime) Close() error {
 	}
 	r.mu.Unlock()
 
-	err := C.iroh_runtime_close(C.uint64_t(r.handle))
+	err := C.aster_runtime_close(C.uint64_t(r.handle))
 	if err != 0 {
-		return fmt.Errorf("iroh_runtime_close: %w", Error(err))
+		return fmt.Errorf("aster_runtime_close: %w", Error(err))
 	}
 
 	return nil
@@ -174,8 +178,8 @@ func (r *Runtime) pollLoop() {
 	defer r.wg.Done()
 
 	for !r.closed.Load() {
-		var events [64]C.iroh_event_t
-		n := C.iroh_poll_events(C.uint64_t(r.handle), &events[0], 64, 10)
+		var events [64]C.aster_event_t
+		n := C.aster_poll_events(C.uint64_t(r.handle), &events[0], 64, 10)
 		if n < 0 {
 			// Negative return indicates an error; back off.
 			time.Sleep(10 * time.Millisecond)
@@ -189,9 +193,9 @@ func (r *Runtime) pollLoop() {
 	}
 
 	// Drain any remaining events before exiting.
-	var events [64]C.iroh_event_t
+	var events [64]C.aster_event_t
 	for {
-		n := C.iroh_poll_events(C.uint64_t(r.handle), &events[0], 64, 0)
+		n := C.aster_poll_events(C.uint64_t(r.handle), &events[0], 64, 0)
 		if n == 0 {
 			break
 		}
@@ -200,17 +204,17 @@ func (r *Runtime) pollLoop() {
 }
 
 // dispatchBatch dispatches each event to its registered channel.
-func (r *Runtime) dispatchBatch(events []C.iroh_event_t) {
+func (r *Runtime) dispatchBatch(events []C.aster_event_t) {
 	for i := range events {
 		ev := &events[i]
 
 		// Marshal into the Go event type.
 		goEv := &Event{
-			Kind:     uint32(ev.kind),
-			Status:   uint32(ev.status),
+			Kind:      uint32(ev.kind),
+			Status:    uint32(ev.status),
 			Operation: uint64(ev.operation),
-			Handle:   uint64(ev.handle),
-			Related:  uint64(ev.related),
+			Handle:    uint64(ev.handle),
+			Related:   uint64(ev.related),
 			UserData:  uint64(ev.user_data),
 			DataPtr:   unsafe.Pointer(ev.data_ptr),
 			DataLen:   uintptr(ev.data_len),
@@ -220,7 +224,7 @@ func (r *Runtime) dispatchBatch(events []C.iroh_event_t) {
 		}
 
 		// Check if this is an inbound accept event routed to a registered Node.
-		if goEv.Kind == IROH_EVENT_ASTER_ACCEPTED {
+		if goEv.Kind == ASTER_EVENT_ASTER_ACCEPTED {
 			r.mu.Lock()
 			node, ok := r.acceptHandlers[goEv.Handle]
 			r.mu.Unlock()
@@ -250,7 +254,7 @@ func (r *Runtime) dispatchBatch(events []C.iroh_event_t) {
 	}
 }
 
-// registerAcceptHandler registers node as the handler for IROH_EVENT_ASTER_ACCEPTED
+// registerAcceptHandler registers node as the handler for ASTER_EVENT_ASTER_ACCEPTED
 // events whose handle matches node.handle.
 func (r *Runtime) registerAcceptHandler(nodeHandle uint64, node *Node) {
 	r.mu.Lock()
@@ -287,18 +291,18 @@ func (r *Runtime) Cancel(op uint64) error {
 	delete(r.ops, op)
 	r.mu.Unlock()
 
-	err := C.iroh_operation_cancel(C.uint64_t(r.handle), C.uint64_t(op))
+	err := C.aster_operation_cancel(C.uint64_t(r.handle), C.uint64_t(op))
 	if err != 0 {
-		return fmt.Errorf("iroh_operation_cancel: %w", Error(err))
+		return fmt.Errorf("aster_operation_cancel: %w", Error(err))
 	}
 	return nil
 }
 
 // ReleaseBuffer releases a buffer allocated by Rust.
 func (r *Runtime) ReleaseBuffer(buffer uint64) error {
-	err := C.iroh_buffer_release(C.uint64_t(r.handle), C.uint64_t(buffer))
+	err := C.aster_buffer_release(C.uint64_t(r.handle), C.uint64_t(buffer))
 	if err != 0 {
-		return fmt.Errorf("iroh_buffer_release: %w", Error(err))
+		return fmt.Errorf("aster_buffer_release: %w", Error(err))
 	}
 	return nil
 }
@@ -333,7 +337,7 @@ func (r *Runtime) AddNodeAddr(endpointHandle uint64, addr *NodeAddr) error {
 	}
 
 	// Encode direct_addresses
-	daItems := make([]C.struct_iroh_bytes_t, len(addr.DirectAddresses))
+	daItems := make([]C.struct_aster_bytes_t, len(addr.DirectAddresses))
 	for i, da := range addr.DirectAddresses {
 		b := []byte(da)
 		cBuf := C.malloc(C.size_t(len(b)))
@@ -342,24 +346,24 @@ func (r *Runtime) AddNodeAddr(endpointHandle uint64, addr *NodeAddr) error {
 		daItems[i].len = C.uintptr_t(len(b))
 	}
 
-	cAddr := C.struct_iroh_node_addr_t{
-		endpoint_id: C.struct_iroh_bytes_t{
+	cAddr := C.struct_aster_node_addr_t{
+		endpoint_id: C.struct_aster_bytes_t{
 			ptr: endpointIDPtr,
 			len: endpointIDLen,
 		},
-		relay_url: C.struct_iroh_bytes_t{
+		relay_url: C.struct_aster_bytes_t{
 			ptr: relayURLPtr,
 			len: relayURLLen,
 		},
-		direct_addresses: C.struct_iroh_bytes_list_t{
+		direct_addresses: C.struct_aster_bytes_list_t{
 			items: &daItems[0],
 			len:   C.uintptr_t(len(addr.DirectAddresses)),
 		},
 	}
 
-	err := C.iroh_add_node_addr(C.uint64_t(r.handle), C.uint64_t(endpointHandle), cAddr)
+	err := C.aster_add_node_addr(C.uint64_t(r.handle), C.uint64_t(endpointHandle), cAddr)
 	if err != 0 {
-		return fmt.Errorf("iroh_add_node_addr: %w", Error(err))
+		return fmt.Errorf("aster_add_node_addr: %w", Error(err))
 	}
 	return nil
 }
@@ -367,33 +371,47 @@ func (r *Runtime) AddNodeAddr(endpointHandle uint64, addr *NodeAddr) error {
 // ReleaseString releases a string allocated by Rust.
 // data must be the pointer returned from Rust, and len must be its byte length.
 func ReleaseString(data unsafe.Pointer, len uintptr) error {
-	err := C.iroh_string_release((*C.uint8_t)(data), C.uintptr_t(len))
+	err := C.aster_string_release((*C.uint8_t)(data), C.uintptr_t(len))
 	if err != 0 {
-		return fmt.Errorf("iroh_string_release: %w", Error(err))
+		return fmt.Errorf("aster_string_release: %w", Error(err))
 	}
 	return nil
 }
 
 // ─── Sync FFI helpers ─────────────────────────────────────────────────────
 
-// Version returns the ABI version of the native library.
+// ABIVersionMajor is the ABI major version this binding was written against
+// (ASTER_ABI_VERSION_MAJOR from aster_ffi.h).
+const ABIVersionMajor = uint32(C.ASTER_ABI_VERSION_MAJOR)
+
+// Version returns the ABI version of the loaded native library, unpacked from
+// aster_abi_version() ((major << 16) | (minor << 8) | patch).
 func Version() (major, minor, patch uint32) {
-	major = uint32(C.iroh_abi_version_major())
-	minor = uint32(C.iroh_abi_version_minor())
-	patch = uint32(C.iroh_abi_version_patch())
-	return
+	v := uint32(C.aster_abi_version())
+	return v >> 16, (v >> 8) & 0xff, v & 0xff
+}
+
+// CheckABI returns an error if the loaded native library's ABI major version
+// differs from the one this binding was compiled against.
+func CheckABI() error {
+	major, minor, patch := Version()
+	if major != ABIVersionMajor {
+		return fmt.Errorf("aster: native library ABI %d.%d.%d, binding expects major %d: %w",
+			major, minor, patch, ABIVersionMajor, Error(C.ASTER_STATUS_ABI_MISMATCH))
+	}
+	return nil
 }
 
 // Error converts an iroh status code to a Go error.
-// It returns nil for IROH_STATUS_OK.
+// It returns nil for ASTER_STATUS_OK.
 // The returned error supports errors.Is and errors.As for status code matching.
 func Error(code C.int) error {
 	return wrapError(code)
 }
 
 // StatusName returns the string name of a status code.
-func StatusName(code uint32) string {
-	name := C.iroh_status_name(code)
+func StatusName(code int32) string {
+	name := C.aster_status_name(C.int32_t(code))
 	if name == nil {
 		return "UNKNOWN"
 	}
@@ -404,7 +422,7 @@ func StatusName(code uint32) string {
 // Returns an empty string if there is no current error.
 func (r *Runtime) LastErrorMessage() string {
 	var buf [512]byte
-	n := C.iroh_last_error_message((*C.uint8_t)(unsafe.Pointer(&buf[0])), 512)
+	n := C.aster_last_error_message((*C.uint8_t)(unsafe.Pointer(&buf[0])), 512)
 	if n == 0 {
 		return ""
 	}

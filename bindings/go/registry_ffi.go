@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <stdlib.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -136,14 +136,14 @@ func FilterAndRankRust(
 
 // ─── Async doc-backed ops (event kinds 80-84) ──────────────────────────
 
-// bytesC builds a C.struct_iroh_bytes_t from a Go []byte. The empty case
+// bytesC builds a C.struct_aster_bytes_t from a Go []byte. The empty case
 // (len=0) returns a zero struct with a nil ptr; the FFI side checks the
 // length first and ignores the pointer when len is 0.
-func bytesC(b []byte) C.struct_iroh_bytes_t {
+func bytesC(b []byte) C.struct_aster_bytes_t {
 	if len(b) == 0 {
-		return C.struct_iroh_bytes_t{}
+		return C.struct_aster_bytes_t{}
 	}
-	return C.struct_iroh_bytes_t{
+	return C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&b[0])),
 		len: C.uintptr_t(len(b)),
 	}
@@ -158,7 +158,7 @@ func (d *Doc) ResolveAsync(ctx context.Context, opts ResolveOptionsJSON) (*Endpo
 	if err != nil {
 		return nil, fmt.Errorf("marshal opts: %w", err)
 	}
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 	r := C.aster_registry_resolve(
 		C.uint64_t(d.runtime.handle),
 		C.uint64_t(d.handle),
@@ -173,10 +173,10 @@ func (d *Doc) ResolveAsync(ctx context.Context, opts ResolveOptionsJSON) (*Endpo
 	if err != nil {
 		return nil, fmt.Errorf("resolve poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_REGISTRY_RESOLVED {
+	if ev.Kind != ASTER_EVENT_REGISTRY_RESOLVED {
 		return nil, fmt.Errorf("resolve: unexpected event %d", ev.Kind)
 	}
-	if ev.Status == IROH_STATUS_NOT_FOUND {
+	if ev.Status == ASTER_STATUS_NOT_FOUND {
 		return nil, nil
 	}
 	if ev.DataPtr == nil || ev.DataLen == 0 {
@@ -230,7 +230,7 @@ func (d *Doc) PublishAsync(
 		topicHandle = topic.handle
 	}
 
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 	r := C.aster_registry_publish(
 		C.uint64_t(d.runtime.handle),
 		C.uint64_t(d.handle),
@@ -251,7 +251,7 @@ func (d *Doc) PublishAsync(
 	if err != nil {
 		return fmt.Errorf("publish poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_REGISTRY_PUBLISHED {
+	if ev.Kind != ASTER_EVENT_REGISTRY_PUBLISHED {
 		return fmt.Errorf("publish: unexpected event %d", ev.Kind)
 	}
 	return nil
@@ -277,7 +277,7 @@ func (d *Doc) RenewLeaseAsync(
 		topicHandle = topic.handle
 	}
 
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 	r := C.aster_registry_renew_lease(
 		C.uint64_t(d.runtime.handle),
 		C.uint64_t(d.handle),
@@ -299,7 +299,7 @@ func (d *Doc) RenewLeaseAsync(
 	if err != nil {
 		return fmt.Errorf("renew poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_REGISTRY_RENEWED {
+	if ev.Kind != ASTER_EVENT_REGISTRY_RENEWED {
 		return fmt.Errorf("renew_lease: unexpected event %d", ev.Kind)
 	}
 	return nil
@@ -320,7 +320,7 @@ func (d *Doc) AclRemoveWriterAsync(ctx context.Context, authorID, writerID strin
 func (d *Doc) aclMutateWriter(ctx context.Context, authorID, writerID string, add bool) error {
 	authorBytes := []byte(authorID)
 	writerBytes := []byte(writerID)
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 	var r C.int32_t
 	if add {
 		r = C.aster_registry_acl_add_writer(
@@ -352,7 +352,7 @@ func (d *Doc) aclMutateWriter(ctx context.Context, authorID, writerID string, ad
 	if err != nil {
 		return fmt.Errorf("acl mutate poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_REGISTRY_ACL_UPDATED {
+	if ev.Kind != ASTER_EVENT_REGISTRY_ACL_UPDATED {
 		return fmt.Errorf("acl mutate: unexpected event %d", ev.Kind)
 	}
 	return nil
@@ -361,7 +361,7 @@ func (d *Doc) aclMutateWriter(ctx context.Context, authorID, writerID string, ad
 // AclListWritersAsync lists the current writer set for the per-doc
 // registry ACL. Returns an empty slice when the ACL is in open mode.
 func (d *Doc) AclListWritersAsync(ctx context.Context) ([]string, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 	r := C.aster_registry_acl_list_writers(
 		C.uint64_t(d.runtime.handle),
 		C.uint64_t(d.handle),
@@ -375,7 +375,7 @@ func (d *Doc) AclListWritersAsync(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("acl list poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_REGISTRY_ACL_LISTED {
+	if ev.Kind != ASTER_EVENT_REGISTRY_ACL_LISTED {
 		return nil, fmt.Errorf("acl list: unexpected event %d", ev.Kind)
 	}
 	if ev.DataPtr == nil || ev.DataLen == 0 {

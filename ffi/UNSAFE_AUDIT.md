@@ -9,7 +9,7 @@
 **Pattern:** `slice::from_raw_parts(b.ptr, b.len)` on raw pointers from Java.
 
 ```rust
-unsafe fn read_bytes(b: &iroh_bytes_t) -> Vec<u8> {
+unsafe fn read_bytes(b: &aster_bytes_t) -> Vec<u8> {
     if b.ptr.is_null() || b.len == 0 { Vec::new() }
     else { slice::from_raw_parts(b.ptr, b.len).to_vec() }
 }
@@ -18,58 +18,42 @@ unsafe fn read_bytes(b: &iroh_bytes_t) -> Vec<u8> {
 **Safety:** Assumes Java passes a valid, non-null pointer with correct length.
 Null pointers are handled explicitly. Length 0 is handled.
 **Miri concern:** Low. Miri tracks pointer validity. If Java passes an invalid
-pointer, Miri will catch it. Validated by `iroh_buffer_release` buffer lifecycle.
+pointer, Miri will catch it. Validated by `aster_buffer_release` buffer lifecycle.
 
 ---
 
-### 2. `alloc_string` — **MEMORY LEAK BUG**
-**Pattern:** `mem::forget(bytes)` without a corresponding deallocation function.
+### 2. `alloc_string` / `alloc_bytes` + `aster_string_release` — **FIXED**
+**Was:** `alloc_string` pushed a NUL onto a `Vec` and `mem::forget`-ed it
+(capacity could be anything >= `len + 1`), while `aster_string_release` freed
+it as `Vec::from_raw_parts(ptr, len, len)` — a wrong-size deallocation (UB).
+Empty strings still allocated (for the NUL) but `len == 0` made release a
+no-op, so they leaked.
 
-```rust
-fn alloc_string(s: String) -> iroh_bytes_t {
-    let mut bytes = s.into_bytes();
-    let len = bytes.len();
-    bytes.push(0); // null terminator
-    let ptr = bytes.as_mut_ptr();
-    std::mem::forget(bytes); // LEAK: no deallocation path
-    iroh_bytes_t { ptr, len }
-}
-```
-
-**Problem:** Java receives a raw pointer to owned memory that can never be freed.
-There is no `iroh_string_release` equivalent. The memory is leaked for the
-lifetime of the process.
-
-**Impact:** Functions that return strings via `iroh_bytes_t` (e.g.,
-`iroh_endpoint_remote_info_list`, `iroh_connection_info`) allocate via
-`alloc_string` and leak each returned string.
-
-**Fix required:** Either:
-- Add a `iroh_string_release(runtime, ptr, len)` function that reconstructs
-  the Box and drops it, or
-- Switch to `alloc_bytes` (which uses `Box::into_raw` and IS tracked via the
-  `buffers` map and `iroh_buffer_release`).
-
-**Status:** LSan will NOT catch this because the process exits without freeing.
-It would only be caught by long-running processes via RSS growth monitoring.
+**Now:** both helpers go through `alloc_owned_bytes`, which returns `{NULL, 0}`
+for empty input (no allocation) and otherwise allocates exactly `len + 1`
+bytes as a `Box<[u8]>` (trailing NUL, not counted in `len`).
+`aster_string_release(ptr, len)` rebuilds the identical `Box<[u8]>` from
+`(ptr, len + 1)`. The caller contract is unchanged (pass back the returned
+`ptr`/`len`; NULL / 0 is a no-op). Covered by `string_release_tests` in
+`ffi/src/lib.rs` (run under Miri to check the layouts).
 
 ---
 
-### 3. `alloc_bytes` — **SAFE** (with corresponding `iroh_buffer_release`)
+### 3. `alloc_bytes` — **SAFE** (with corresponding `aster_buffer_release`)
 **Pattern:** `Box::into_raw(bytes.into_boxed_slice())` — raw pointer stored in
 the `buffers` map with a u64 key. Java receives the key and calls
-`iroh_buffer_release(runtime, key)` to deallocate.
+`aster_buffer_release(runtime, key)` to deallocate.
 
 ```rust
-fn alloc_bytes(bytes: Vec<u8>) -> iroh_bytes_t {
+fn alloc_bytes(bytes: Vec<u8>) -> aster_bytes_t {
     let len = bytes.len();
     let ptr = Box::into_raw(bytes.into_boxed_slice()) as *mut u8;
-    iroh_bytes_t { ptr, len }
+    aster_bytes_t { ptr, len }
 }
 ```
 
 **Safety:** Correct. Ownership is transferred to the `buffers` map and returned
-to Java as a u64 key. `iroh_buffer_release` removes the entry and drops the Box.
+to Java as a u64 key. `aster_buffer_release` removes the entry and drops the Box.
 
 ---
 
@@ -79,7 +63,7 @@ or direct dereference. Bounds checks precede every write.
 
 ```rust
 if offset + url.len() + 1 > buf_capacity {
-    return iroh_status_t::IROH_STATUS_BUFFER_TOO_SMALL as i32;
+    return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
 }
 ptr::copy_nonoverlapping(url.as_ptr(), out_buf.add(offset), url.len());
 ```
@@ -91,11 +75,11 @@ arithmetic via `.add()` is safe because capacity is validated before use.
 
 ### 5. Struct field pointer injection
 **Pattern:** After writing string data into `out_buf`, construct a struct whose
-`iroh_bytes_t` fields point into that buffer.
+`aster_bytes_t` fields point into that buffer.
 
 ```rust
-*out_addr = iroh_node_addr_t {
-    endpoint_id: iroh_bytes_t {
+*out_addr = aster_node_addr_t {
+    endpoint_id: aster_bytes_t {
         ptr: unsafe { out_buf.add(ep_id_offset) }, // points into caller's buffer
         len: addr.endpoint_id.len(),
     },
@@ -116,11 +100,10 @@ out-of-bounds or invalid pointer passed from Java will be caught by Miri when
 running the FFI tests under `cargo miri test`.
 
 **`alloc_bytes`:** Miri tracks allocations via `Box::into_raw`. The
-`iroh_buffer_release` deallocation is also tracked. Should be Miri-clean.
+`aster_buffer_release` deallocation is also tracked. Should be Miri-clean.
 
-**`alloc_string`:** Miri will NOT report a leak (process-exit leaks aren't
-reported by Miri's leak sanitizer). However, ASan will flag the `mem::forget`
-as a "leaked" allocation if it detects the memory isn't freed by process exit.
+**`alloc_string` / `aster_string_release`:** allocation and deallocation use
+the same `Box<[u8]>` layout; `string_release_tests` exercise the round trip.
 
 **Struct writes with `.add()`:** Miri validates pointer arithmetic. As long as
 the bounds checks are passed, Miri considers these valid.
@@ -132,37 +115,13 @@ the bounds checks are passed, Miri considers these valid.
 | Tool | Target | What it catches |
 |------|--------|----------------|
 | ASan | `aster_transport_ffi` lib + tests | Out-of-bounds, use-after-free, double-free |
-| LSan | `aster_transport_ffi` lib + tests | Memory leaks (but not `alloc_string` process-lifetime leaks) |
+| LSan | `aster_transport_ffi` lib + tests | Memory leaks |
 | TSan | `aster_transport_ffi` lib + tests | Data races in concurrent FFI operations |
 | Miri | `aster_transport_ffi` lib + cq_state_machine | UB in unsafe pointer operations |
 
 ---
 
 ## Recommended Fixes
-
-### Fix `alloc_string` (HIGH PRIORITY — memory leak)
-
-Add a deallocation function and use it for all string-returning FFI calls:
-
-```rust
-#[no_mangle]
-pub unsafe extern "C" fn iroh_string_release(ptr: *const u8, len: usize) {
-    if ptr.is_null() || len == 0 { return; }
-    // Reconstruct the Box and drop it
-    let boxed = Vec::from_raw_parts(ptr as *mut u8, len, len);
-    drop(boxed);
-}
-```
-
-Then update `alloc_string` to NOT use `mem::forget`. Instead, store the allocation
-in the buffers map like `alloc_bytes` does. The Java side can then call
-`iroh_buffer_release` with the returned key.
-
-OR: Simply switch `alloc_string` to use `alloc_bytes` semantics:
-store `Box::into_raw(bytes.into_boxed_slice())` in buffers map, return the key
-alongside the `iroh_bytes_t` in the struct.
-
----
 
 ### Ensure Miri can run on FFI lib
 Add Miri-specific test targets that only exercise the `lib` target and the

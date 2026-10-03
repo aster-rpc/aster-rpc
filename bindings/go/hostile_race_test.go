@@ -100,19 +100,16 @@ func TestHostile_AcceptSubmitThenClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MemoryWithAlpns: %v", err)
 	}
+	// MemoryWithAlpns creates the node on its own runtime; ops must be
+	// submitted against that runtime or they return NOT_FOUND.
+	runtime = node.runtime
 
 	// Submit accept.
-	var acceptOp C.iroh_operation_t
-	r := C.iroh_node_accept_aster(
-		C.uint64_t(runtime.handle),
-		C.uint64_t(node.handle),
-		0,
-		&acceptOp,
-	)
-	if r != 0 {
-		t.Fatalf("iroh_node_accept_aster: %s", Error(r))
+	acceptOp, err := submitAccept(runtime, node)
+	if err != nil {
+		t.Fatalf("aster_node_accept_aster: %s", err)
 	}
-	opID := uint64(acceptOp)
+	opID := acceptOp
 
 	ch := make(chan *Event, 1)
 	runtime.Register(opID, ch)
@@ -131,7 +128,7 @@ func TestHostile_AcceptSubmitThenClose(t *testing.T) {
 				t.Errorf("received more than one terminal event: count=%d", terminalCount)
 			}
 			// Should be ERROR or OPERATION_CANCELLED
-			if ev.Kind != IROH_EVENT_ERROR && ev.Kind != IROH_EVENT_OPERATION_CANCELLED {
+			if ev.Kind != ASTER_EVENT_ERROR && ev.Kind != ASTER_EVENT_OPERATION_CANCELLED {
 				t.Logf("warning: expected ERROR or CANCELLED, got %v", ev.Kind)
 			}
 		case <-timeout:
@@ -180,17 +177,11 @@ func TestHostile_CancelOpAndCompletionRacing(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 
-			var acceptOp C.iroh_operation_t
-			r := C.iroh_node_accept_aster(
-				C.uint64_t(runtime.handle),
-				C.uint64_t(node.handle),
-				0,
-				&acceptOp,
-			)
-			if r != 0 {
+			acceptOp, err := submitAccept(runtime, node)
+			if err != nil {
 				return
 			}
-			opID := uint64(acceptOp)
+			opID := acceptOp
 
 			ch := make(chan *Event, 1)
 			runtime.Register(opID, ch)
@@ -213,7 +204,7 @@ func TestHostile_CancelOpAndCompletionRacing(t *testing.T) {
 			// Drain with timeout
 			select {
 			case ev := <-ch:
-				if ev.Kind == IROH_EVENT_OPERATION_CANCELLED || ev.Kind == IROH_EVENT_ERROR {
+				if ev.Kind == ASTER_EVENT_OPERATION_CANCELLED || ev.Kind == ASTER_EVENT_ERROR {
 					terminals[idx].Store(1)
 				}
 			case <-time.After(500 * time.Millisecond):
@@ -259,19 +250,16 @@ func TestHostile_HandleCloseAfterSubmit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MemoryWithAlpns: %v", err)
 	}
+	// MemoryWithAlpns creates the node on its own runtime; ops must be
+	// submitted against that runtime or they return NOT_FOUND.
+	runtime = node.runtime
 
 	// Submit accept.
-	var acceptOp C.iroh_operation_t
-	r := C.iroh_node_accept_aster(
-		C.uint64_t(runtime.handle),
-		C.uint64_t(node.handle),
-		0,
-		&acceptOp,
-	)
-	if r != 0 {
-		t.Fatalf("iroh_node_accept_aster: %s", Error(r))
+	acceptOp, err := submitAccept(runtime, node)
+	if err != nil {
+		t.Fatalf("aster_node_accept_aster: %s", err)
 	}
-	opID := uint64(acceptOp)
+	opID := acceptOp
 
 	ch := make(chan *Event, 1)
 	runtime.Register(opID, ch)
@@ -297,7 +285,7 @@ func TestHostile_HandleCloseAfterSubmit(t *testing.T) {
 
 func TestHostile_ManyOutstandingOnCQ(t *testing.T) {
 	ctx := context.Background()
-	cfg := DefaultRuntimeConfig{WorkerThreads: 2, EventQueueCapacity: 4096}
+	cfg := RuntimeConfig{WorkerThreads: 2, EventQueueCapacity: 4096}
 
 	runtime, err := NewRuntime(ctx, cfg)
 	if err != nil {
@@ -309,6 +297,9 @@ func TestHostile_ManyOutstandingOnCQ(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MemoryWithAlpns: %v", err)
 	}
+	// MemoryWithAlpns creates the node on its own runtime; ops must be
+	// submitted against that runtime or they return NOT_FOUND.
+	runtime = node.runtime
 	defer node.Close()
 
 	const n = 100
@@ -317,17 +308,11 @@ func TestHostile_ManyOutstandingOnCQ(t *testing.T) {
 
 	// Submit n accepts rapidly.
 	for i := 0; i < n; i++ {
-		var acceptOp C.iroh_operation_t
-		r := C.iroh_node_accept_aster(
-			C.uint64_t(runtime.handle),
-			C.uint64_t(node.handle),
-			0,
-			&acceptOp,
-		)
-		if r != 0 {
-			t.Fatalf("iroh_node_accept_aster: %s", Error(r))
+		acceptOp, err := submitAccept(runtime, node)
+		if err != nil {
+			t.Fatalf("aster_node_accept_aster: %s", err)
 		}
-		ops[i] = uint64(acceptOp)
+		ops[i] = acceptOp
 		chs[i] = make(chan *Event, 1)
 		runtime.Register(ops[i], chs[i])
 	}
@@ -348,7 +333,7 @@ func TestHostile_ManyOutstandingOnCQ(t *testing.T) {
 	eventCount := 0
 	for i := 0; i < n; i++ {
 		select {
-		case ev := <-chs[i]:
+		case <-chs[i]:
 			eventCount++
 		case <-time.After(100 * time.Millisecond):
 			// May timeout for cancelled ops
@@ -369,7 +354,7 @@ func TestHostile_ManyOutstandingOnCQ(t *testing.T) {
 
 func TestHostile_ManyConnectionsShareCQ(t *testing.T) {
 	ctx := context.Background()
-	cfg := DefaultRuntimeConfig{WorkerThreads: 2, EventQueueCapacity: 1024}
+	cfg := RuntimeConfig{WorkerThreads: 2, EventQueueCapacity: 1024}
 
 	runtime, err := NewRuntime(ctx, cfg)
 	if err != nil {
@@ -403,17 +388,11 @@ func TestHostile_ManyConnectionsShareCQ(t *testing.T) {
 
 	for _, node := range nodes {
 		for i := 0; i < opsPerNode; i++ {
-			var acceptOp C.iroh_operation_t
-			r := C.iroh_node_accept_aster(
-				C.uint64_t(runtime.handle),
-				C.uint64_t(node.handle),
-				0,
-				&acceptOp,
-			)
-			if r != 0 {
+			acceptOp, err := submitAccept(runtime, node)
+			if err != nil {
 				continue
 			}
-			ops[opIdx] = uint64(acceptOp)
+			ops[opIdx] = acceptOp
 			chs[opIdx] = make(chan *Event, 1)
 			runtime.Register(ops[opIdx], chs[opIdx])
 			opIdx++

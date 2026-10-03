@@ -8,32 +8,32 @@ import java.util.List;
 import site.aster.ffi.IrohRelayMode;
 
 /**
- * Builder for {@code iroh_endpoint_config_t}.
+ * Builder for {@code aster_endpoint_config_t}.
  *
  * <p>Call {@link #toNative(SegmentAllocator)} to produce a native struct suitable for {@code
- * iroh_endpoint_create}.
+ * aster_endpoint_create}.
  *
  * <p>All fields are set via direct memory access (segment.set) to avoid VarHandle issues with
  * nested structs in Java 25 FFM.
  */
 public class EndpointConfig {
 
-  // iroh_endpoint_config_t layout (verified against Rust iroh_endpoint_config_t):
+  // aster_endpoint_config_t layout (verified against Rust aster_endpoint_config_t):
   // struct_size: 0 (INT)
   // relay_mode: 4 (INT)
-  // secret_key: 8 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
-  // alpns: 24 (IROH_BYTES_LIST: items at +0, len at +8) → 16 bytes
-  // relay_urls: 40 (IROH_BYTES_LIST: items at +0, len at +8) → 16 bytes
+  // secret_key: 8 (ASTER_BYTES: ptr at +0, len at +8) → 16 bytes
+  // alpns: 24 (ASTER_BYTES_LIST: items at +0, len at +8) → 16 bytes
+  // relay_urls: 40 (ASTER_BYTES_LIST: items at +0, len at +8) → 16 bytes
   // enable_discovery: 56 (INT)
   // enable_hooks: 60 (INT)
   // hook_timeout_ms: 64 (LONG)
-  // bind_addr: 72 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
+  // bind_addr: 72 (ASTER_BYTES: ptr at +0, len at +8) → 16 bytes
   // clear_ip_transports: 88 (INT)
   // clear_relay_transports: 92 (INT)
   // portmapper_config: 96 (INT)
-  // proxy_url: 104 (IROH_BYTES: ptr at +0, len at +8) → 16 bytes
+  // proxy_url: 104 (ASTER_BYTES: ptr at +0, len at +8) → 16 bytes
   // proxy_from_env: 120 (INT)
-  // data_dir_utf8: 128 (IROH_BYTES: ptr at +0, len at +8) -> 16 bytes
+  // data_dir_utf8: 128 (ASTER_BYTES: ptr at +0, len at +8) -> 16 bytes
   // hook_failure_mode: 144 (INT)
 
   private int relayMode = 0; // 0=default
@@ -134,7 +134,7 @@ public class EndpointConfig {
   }
 
   /**
-   * Encode this config into a native {@code iroh_endpoint_config_t} struct allocated from {@code
+   * Encode this config into a native {@code aster_endpoint_config_t} struct allocated from {@code
    * allocator}.
    *
    * <p>Uses direct memory access (segment.set) instead of VarHandle to avoid Java 25 FFM issues

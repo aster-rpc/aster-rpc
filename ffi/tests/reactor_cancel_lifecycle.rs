@@ -19,17 +19,17 @@ mod common;
 use common::{wait_for_operation, wait_for_successful_operation};
 
 struct Rig {
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
-    connection: iroh_connection_t,
+    connection: aster_connection_t,
 }
 
 impl Rig {
     unsafe fn start() -> Self {
         let mut runtime = 0;
         assert_eq!(
-            iroh_runtime_new(ptr::null(), &mut runtime),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime),
+            aster_status_t::ASTER_STATUS_OK as i32
         );
 
         let server = create_node(runtime);
@@ -38,24 +38,24 @@ impl Rig {
         let mut reactor = 0;
         assert_eq!(
             aster_reactor_create(runtime, server, 64, &mut reactor),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         );
 
         let mut server_id = [0u8; 128];
         let mut server_id_len = 0;
         assert_eq!(
-            iroh_node_id(
+            aster_node_id(
                 runtime,
                 server,
                 server_id.as_mut_ptr(),
                 server_id.len(),
                 &mut server_id_len,
             ),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         );
 
-        let config = iroh_connect_config_t {
-            struct_size: std::mem::size_of::<iroh_connect_config_t>() as u32,
+        let config = aster_connect_config_t {
+            struct_size: std::mem::size_of::<aster_connect_config_t>() as u32,
             flags: 0,
             node_id: bytes(&server_id[..server_id_len]),
             alpn: bytes(RPC_ALPN),
@@ -63,13 +63,13 @@ impl Rig {
         };
         let mut connect_op = 0;
         assert_eq!(
-            iroh_connect(runtime, client, &config, 0, &mut connect_op),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_connect(runtime, client, &config, 0, &mut connect_op),
+            aster_status_t::ASTER_STATUS_OK as i32
         );
         let connected = wait_for_successful_operation(
             runtime,
             connect_op,
-            iroh_event_kind_t::IROH_EVENT_CONNECTED,
+            aster_event_kind_t::ASTER_EVENT_CONNECTED,
         );
 
         assert_eq!(debug_call_state_len(reactor), Some((0, 0, 0)));
@@ -80,34 +80,34 @@ impl Rig {
         }
     }
 
-    unsafe fn open_stream(&self) -> (iroh_send_stream_t, iroh_recv_stream_t) {
+    unsafe fn open_stream(&self) -> (aster_send_stream_t, aster_recv_stream_t) {
         let mut operation = 0;
         assert_eq!(
-            iroh_open_bi(self.runtime, self.connection, 0, &mut operation),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_open_bi(self.runtime, self.connection, 0, &mut operation),
+            aster_status_t::ASTER_STATUS_OK as i32
         );
         let opened = wait_for_successful_operation(
             self.runtime,
             operation,
-            iroh_event_kind_t::IROH_EVENT_STREAM_OPENED,
+            aster_event_kind_t::ASTER_EVENT_STREAM_OPENED,
         );
         (opened.handle, opened.related)
     }
 
-    unsafe fn write(&self, stream: iroh_send_stream_t, payload: &[u8]) {
+    unsafe fn write(&self, stream: aster_send_stream_t, payload: &[u8]) {
         let mut operation = 0;
         assert_eq!(
-            iroh_stream_write(self.runtime, stream, bytes(payload), 0, &mut operation,),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_stream_write(self.runtime, stream, bytes(payload), 0, &mut operation,),
+            aster_status_t::ASTER_STATUS_OK as i32
         );
         wait_for_successful_operation(
             self.runtime,
             operation,
-            iroh_event_kind_t::IROH_EVENT_SEND_COMPLETED,
+            aster_event_kind_t::ASTER_EVENT_SEND_COMPLETED,
         );
     }
 
-    unsafe fn send_call(&self, stream: iroh_send_stream_t) {
+    unsafe fn send_call(&self, stream: aster_send_stream_t) {
         let mut request = encode_frame(b"ffi-live-header", FLAG_HEADER).expect("header frame");
         request.extend_from_slice(
             &encode_frame(b"ffi-live-request", FLAG_END_STREAM).expect("request frame"),
@@ -117,8 +117,8 @@ impl Rig {
 
     unsafe fn cancel_and_wait_for_reset(
         &self,
-        send_stream: iroh_send_stream_t,
-        recv_stream: iroh_recv_stream_t,
+        send_stream: aster_send_stream_t,
+        recv_stream: aster_recv_stream_t,
     ) {
         let cancel = encode_frame(&[], FLAG_CANCEL).expect("cancel frame");
         self.write(send_stream, &cancel);
@@ -128,21 +128,21 @@ impl Rig {
         // and the read blocks until core observes FLAG_CANCEL and resets it.
         let mut read_op = 0;
         assert_eq!(
-            iroh_stream_read(self.runtime, recv_stream, 1, 0, &mut read_op),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_stream_read(self.runtime, recv_stream, 1, 0, &mut read_op),
+            aster_status_t::ASTER_STATUS_OK as i32
         );
         let reset = wait_for_operation(self.runtime, read_op);
         assert_eq!(
             reset.kind,
-            iroh_event_kind_t::IROH_EVENT_ERROR as u32,
+            aster_event_kind_t::ASTER_EVENT_ERROR as u32,
             "cancelled response direction should reset, got event kind {} status {}",
             reset.kind,
             reset.status
         );
         if reset.buffer != 0 {
             assert_eq!(
-                iroh_buffer_release(self.runtime, reset.buffer),
-                iroh_status_t::IROH_STATUS_OK as i32
+                aster_buffer_release(self.runtime, reset.buffer),
+                aster_status_t::ASTER_STATUS_OK as i32
             );
         }
     }
@@ -161,7 +161,7 @@ impl Rig {
             if buffer != 0 {
                 assert_eq!(
                     aster_reactor_buffer_release(self.runtime, self.reactor, buffer),
-                    iroh_status_t::IROH_STATUS_OK as i32
+                    aster_status_t::ASTER_STATUS_OK as i32
                 );
             }
         }
@@ -170,21 +170,21 @@ impl Rig {
     unsafe fn close(self) {
         assert_eq!(
             aster_reactor_destroy(self.runtime, self.reactor),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         );
         assert_eq!(
-            iroh_runtime_close(self.runtime),
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_runtime_close(self.runtime),
+            aster_status_t::ASTER_STATUS_OK as i32
         );
     }
 }
 
-unsafe fn create_node(runtime: iroh_runtime_t) -> iroh_node_t {
+unsafe fn create_node(runtime: aster_runtime_t) -> aster_node_t {
     let alpns = [RPC_ALPN.as_ptr()];
     let alpn_lens = [RPC_ALPN.len()];
     let mut operation = 0;
     assert_eq!(
-        iroh_node_memory_with_alpns(
+        aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -192,18 +192,18 @@ unsafe fn create_node(runtime: iroh_runtime_t) -> iroh_node_t {
             0,
             &mut operation,
         ),
-        iroh_status_t::IROH_STATUS_OK as i32
+        aster_status_t::ASTER_STATUS_OK as i32
     );
     wait_for_successful_operation(
         runtime,
         operation,
-        iroh_event_kind_t::IROH_EVENT_NODE_CREATED,
+        aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
     )
     .handle
 }
 
-fn bytes(value: &[u8]) -> iroh_bytes_t {
-    iroh_bytes_t {
+fn bytes(value: &[u8]) -> aster_bytes_t {
+    aster_bytes_t {
         ptr: value.as_ptr(),
         len: value.len(),
     }
@@ -251,7 +251,7 @@ fn cancellation_before_poll_reaps_the_real_maps_without_a_submit() {
         wait_for_call_state(rig.reactor, (0, 0, 0));
         assert_eq!(
             aster_reactor_check_cancelled(rig.runtime, rig.reactor, call_id),
-            iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
             "the cancelled call should be reaped without any submit"
         );
         rig.close();
@@ -295,7 +295,7 @@ fn cancellation_after_arrival_in_blocking_poll_reaps_the_real_maps() {
             if buffer != 0 {
                 assert_eq!(
                     aster_reactor_buffer_release(rig.runtime, rig.reactor, buffer),
-                    iroh_status_t::IROH_STATUS_OK as i32
+                    aster_status_t::ASTER_STATUS_OK as i32
                 );
             }
         }
@@ -308,7 +308,7 @@ fn cancellation_after_arrival_in_blocking_poll_reaps_the_real_maps() {
         wait_for_call_state(rig.reactor, (0, 0, 0));
         assert_eq!(
             aster_reactor_check_cancelled(rig.runtime, rig.reactor, call_id),
-            iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
         );
         rig.close();
     }

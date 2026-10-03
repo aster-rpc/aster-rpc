@@ -26,8 +26,8 @@ public sealed class GossipTopic : IDisposable
         try
         {
             var dataBytes = new Bytes { ptr = pin.AddrOfPinnedObject(), len = (UIntPtr)data.Length };
-            int r = Native.iroh_gossip_broadcast(_runtime.Handle, _handle, dataBytes, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_gossip_broadcast");
+            int r = Native.aster_gossip_broadcast(_runtime.Handle, _handle, dataBytes, 0, out ulong opId);
+            if (r != 0) throw IrohException.FromStatus(r, "aster_gossip_broadcast");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.GossipBroadcastDone)
                 throw new IrohException($"broadcast: unexpected event {ev.kind}");
@@ -37,8 +37,8 @@ public sealed class GossipTopic : IDisposable
 
     public async Task<byte[]> RecvAsync(CancellationToken ct = default)
     {
-        int r = Native.iroh_gossip_recv(_runtime.Handle, _handle, 0, out ulong opId);
-        if (r != 0) throw IrohException.FromStatus(r, "iroh_gossip_recv");
+        int r = Native.aster_gossip_recv(_runtime.Handle, _handle, 0, out ulong opId);
+        if (r != 0) throw IrohException.FromStatus(r, "aster_gossip_recv");
         Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
         if (ev.kind != (uint)EventKind.GossipReceived)
             throw new IrohException($"recv: unexpected event {ev.kind}");
@@ -56,7 +56,7 @@ public sealed class GossipTopic : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        Native.iroh_gossip_topic_free(_runtime.Handle, _handle);
+        Native.aster_gossip_topic_free(_runtime.Handle, _handle);
     }
 }
 
@@ -80,8 +80,8 @@ public sealed class Gossip
         try
         {
             var peers = BytesList.Empty;
-            int r = Native.iroh_gossip_subscribe(_runtime.Handle, _nodeHandle, topicNative, peers, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_gossip_subscribe");
+            int r = Native.aster_gossip_subscribe(_runtime.Handle, _nodeHandle, topicNative, peers, 0, out ulong opId);
+            if (r != 0) throw IrohException.FromStatus(r, "aster_gossip_subscribe");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.GossipSubscribed)
                 throw new IrohException($"subscribe: unexpected event {ev.kind}");

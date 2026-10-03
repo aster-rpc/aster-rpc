@@ -7,9 +7,9 @@ import site.aster.ffi.IrohEventKind;
 import site.aster.ffi.IrohLibrary;
 
 /**
- * Immutable view over a native {@code iroh_event_t} struct.
+ * Immutable view over a native {@code aster_event_t} struct.
  *
- * <p>Field mapping (matches Rust iroh_event_t layout exactly):
+ * <p>Field mapping (matches Rust aster_event_t layout exactly):
  *
  * <ul>
  *   <li>{@code handle} — primary handle (endpoint, connection, or stream depending on event kind)
@@ -55,7 +55,7 @@ public record IrohEvent(
 
   /**
    * True if this event carries a native buffer that must be released via {@code
-   * iroh_buffer_release}.
+   * aster_buffer_release}.
    */
   public boolean hasBuffer() {
     return buffer != 0;

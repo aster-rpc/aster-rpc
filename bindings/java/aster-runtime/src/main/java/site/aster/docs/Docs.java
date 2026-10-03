@@ -45,7 +45,7 @@ public class Docs {
   }
 
   private MemorySegment toBytesSegment(byte[] data, SegmentAllocator alloc) {
-    MemorySegment dataSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    MemorySegment dataSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     MemorySegment heapSeg = alloc.allocate(data.length);
     heapSeg.copyFrom(MemorySegment.ofArray(data));
     dataSeg.set(ValueLayout.ADDRESS, 0, heapSeg);
@@ -68,13 +68,13 @@ public class Docs {
     try {
       int status = lib.docsCreate(runtime.nativeHandle(), nodeHandle, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_docs_create failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_docs_create failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_docs_create threw: " + t.getMessage()));
+          new IrohException("aster_docs_create threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -107,13 +107,13 @@ public class Docs {
       int status = lib.docsCreateAuthor(runtime.nativeHandle(), nodeHandle, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_docs_create_author failed: " + status);
+            IrohStatus.fromCode(status), "aster_docs_create_author failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_docs_create_author threw: " + t.getMessage()));
+          new IrohException("aster_docs_create_author threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -152,7 +152,7 @@ public class Docs {
     var ticketSeg = alloc.allocate(ticketBytes.length);
     ticketSeg.copyFrom(MemorySegment.ofArray(ticketBytes));
 
-    var ticketBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var ticketBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     ticketBytesSeg.set(ValueLayout.ADDRESS, 0, ticketSeg);
     ticketBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) ticketBytes.length);
 
@@ -161,13 +161,13 @@ public class Docs {
     try {
       int status = lib.docsJoin(runtime.nativeHandle(), nodeHandle, ticketBytesSeg, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_docs_join failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_docs_join failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_docs_join threw: " + t.getMessage()));
+          new IrohException("aster_docs_join threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -199,7 +199,7 @@ public class Docs {
     var ticketSeg = alloc.allocate(ticketBytes.length);
     ticketSeg.copyFrom(MemorySegment.ofArray(ticketBytes));
 
-    var ticketBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var ticketBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     ticketBytesSeg.set(ValueLayout.ADDRESS, 0, ticketSeg);
     ticketBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) ticketBytes.length);
 
@@ -210,13 +210,13 @@ public class Docs {
           lib.docsJoinAndSubscribe(runtime.nativeHandle(), nodeHandle, ticketBytesSeg, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_docs_join_and_subscribe failed: " + status);
+            IrohStatus.fromCode(status), "aster_docs_join_and_subscribe failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_docs_join_and_subscribe threw: " + t.getMessage()));
+          new IrohException("aster_docs_join_and_subscribe threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);

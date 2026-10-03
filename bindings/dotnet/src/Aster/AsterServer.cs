@@ -43,28 +43,62 @@ public sealed class AsterServer : IDisposable
         _node.Dispose();
     }
 
+    /// <summary>
+    /// Raised (on the poll thread) when the reactor reports a connection closed.
+    /// Per-connection/session state keyed on <see cref="ReactorCall.ConnectionId"/>
+    /// can be dropped here. Handlers must not block.
+    /// </summary>
+    public event Action<ReactorCall>? ConnectionClosed;
+
     private void PollLoop()
     {
         while (_running)
         {
             ReactorCall[] calls;
             try { calls = _reactor.Poll(32, 100); }
-            catch { continue; }
+            catch (ObjectDisposedException) { return; }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"aster reactor poll failed: {ex.Message}");
+                Thread.Sleep(10);
+                continue;
+            }
 
             foreach (var call in calls)
             {
+                if (call.Kind == ReactorEventKind.ConnectionClosed)
+                {
+                    try { ConnectionClosed?.Invoke(call); }
+                    catch (Exception ex) { Console.Error.WriteLine($"ConnectionClosed handler failed: {ex.Message}"); }
+                    continue;
+                }
+                if (call.Kind != ReactorEventKind.Call)
+                    continue;
+
                 var c = call;
+                // Submits run off the poll thread: a QUEUE_FULL submit waits for a
+                // RESPONSE_WRITABLE event that only this loop can deliver.
                 ThreadPool.QueueUserWorkItem(_ =>
                 {
+                    ReactorResponse resp;
                     try
                     {
-                        var resp = _handler(c);
-                        _reactor.Submit(c.CallId, resp);
+                        resp = _handler(c);
                     }
                     catch (Exception ex)
                     {
                         var errorBytes = Encoding.UTF8.GetBytes($"ERROR: {ex.Message}");
-                        _reactor.Submit(c.CallId, ReactorResponse.Of(Array.Empty<byte>(), errorBytes));
+                        resp = ReactorResponse.Of(Array.Empty<byte>(), errorBytes);
+                    }
+                    try
+                    {
+                        _reactor.Submit(c.CallId, resp);
+                    }
+                    catch (Exception ex)
+                    {
+                        // e.g. NOT_FOUND: the peer cancelled/disconnected, or the
+                        // response channel closed while we waited for capacity.
+                        Console.Error.WriteLine($"aster submit for call {c.CallId} failed: {ex.Message}");
                     }
                 });
             }

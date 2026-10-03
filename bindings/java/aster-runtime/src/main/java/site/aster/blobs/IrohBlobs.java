@@ -49,7 +49,7 @@ public class IrohBlobs {
   }
 
   private MemorySegment toBytesSegment(byte[] data, SegmentAllocator alloc) {
-    MemorySegment dataSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    MemorySegment dataSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     MemorySegment heapSeg = alloc.allocate(data.length);
     heapSeg.copyFrom(MemorySegment.ofArray(data));
     dataSeg.set(ValueLayout.ADDRESS, 0, heapSeg);
@@ -82,13 +82,13 @@ public class IrohBlobs {
       int status = lib.blobsAddBytes(runtime.nativeHandle(), nodeHandle, dataSeg, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_add_bytes failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_add_bytes failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_add_bytes threw: " + t.getMessage()));
+          new IrohException("aster_blobs_add_bytes threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -131,13 +131,13 @@ public class IrohBlobs {
           lib.blobsAddPath(runtime.nativeHandle(), nodeHandle, pathSeg, pathBytes.length, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_add_path failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_add_path failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_add_path threw: " + t.getMessage()));
+          new IrohException("aster_blobs_add_path threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -193,13 +193,13 @@ public class IrohBlobs {
               opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_add_path_with_named_tag failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_add_path_with_named_tag failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_add_path_with_named_tag threw: " + t.getMessage()));
+          new IrohException("aster_blobs_add_path_with_named_tag threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -255,13 +255,13 @@ public class IrohBlobs {
               fmt,
               opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_tags_set failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_tags_set failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_tags_set threw: " + t.getMessage()));
+          new IrohException("aster_tags_set threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -299,13 +299,13 @@ public class IrohBlobs {
               runtime.nativeHandle(), nodeHandle, nameSeg, dataSeg, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_add_bytes_as_collection failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_add_bytes_as_collection failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_add_bytes_as_collection threw: " + t.getMessage()));
+          new IrohException("aster_blobs_add_bytes_as_collection threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -335,7 +335,7 @@ public class IrohBlobs {
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
-    // The Rust FFI takes the JSON as an iroh_bytes_t by value. Pass (ptr, len) as two separate
+    // The Rust FFI takes the JSON as an aster_bytes_t by value. Pass (ptr, len) as two separate
     // arguments so FFM places them in the two consecutive registers the struct-by-value ABI
     // uses on AAPCS64 / SysV AMD64 — see IrohLibrary#blobsAddCollection.
     byte[] jsonBytes = entriesJson.getBytes(StandardCharsets.UTF_8);
@@ -349,13 +349,13 @@ public class IrohBlobs {
               runtime.nativeHandle(), nodeHandle, jsonPtr, jsonBytes.length, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_add_collection failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_add_collection failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_add_collection threw: " + t.getMessage()));
+          new IrohException("aster_blobs_add_collection threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -391,8 +391,8 @@ public class IrohBlobs {
     var alloc = confined;
 
     var hashSeg = toHexSegment(hashHex, alloc);
-    // Wrap in iroh_bytes_t struct
-    var hashBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    // Wrap in aster_bytes_t struct
+    var hashBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     hashBytesSeg.set(ValueLayout.ADDRESS, 0, hashSeg);
     hashBytesSeg.set(
         ValueLayout.JAVA_LONG, 8, (long) hashHex.getBytes(StandardCharsets.UTF_8).length);
@@ -402,13 +402,13 @@ public class IrohBlobs {
     try {
       int status = lib.blobsRead(runtime.nativeHandle(), nodeHandle, hashBytesSeg, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_blobs_read failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_blobs_read failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_read threw: " + t.getMessage()));
+          new IrohException("aster_blobs_read threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -443,7 +443,7 @@ public class IrohBlobs {
     var ticketSeg = alloc.allocate(ticketBytes.length);
     ticketSeg.copyFrom(MemorySegment.ofArray(ticketBytes));
 
-    var ticketBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var ticketBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     ticketBytesSeg.set(ValueLayout.ADDRESS, 0, ticketSeg);
     ticketBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) ticketBytes.length);
 
@@ -453,13 +453,13 @@ public class IrohBlobs {
       int status = lib.blobsDownload(runtime.nativeHandle(), nodeHandle, ticketBytesSeg, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_download failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_download failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_download threw: " + t.getMessage()));
+          new IrohException("aster_blobs_download threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -500,10 +500,11 @@ public class IrohBlobs {
           lib.blobsStatus(
               runtime.nativeHandle(), nodeHandle, hexSeg, hexBytes.length, statusSeg, sizeSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_blobs_status failed: " + status);
+        throw new IrohException(
+            IrohStatus.fromCode(status), "aster_blobs_status failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_blobs_status threw: " + t.getMessage());
+      throw new IrohException("aster_blobs_status threw: " + t.getMessage());
     }
 
     int statusCode = statusSeg.get(ValueLayout.JAVA_INT, 0);
@@ -531,10 +532,10 @@ public class IrohBlobs {
       int status =
           lib.blobsHas(runtime.nativeHandle(), nodeHandle, hexSeg, hexBytes.length, hasSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_blobs_has failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_blobs_has failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_blobs_has threw: " + t.getMessage());
+      throw new IrohException("aster_blobs_has threw: " + t.getMessage());
     }
 
     int hasCode = hasSeg.get(ValueLayout.JAVA_INT, 0);
@@ -564,13 +565,13 @@ public class IrohBlobs {
               runtime.nativeHandle(), nodeHandle, hexSeg, hexBytes.length, 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_observe_complete failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_observe_complete failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_observe_complete threw: " + t.getMessage()));
+          new IrohException("aster_blobs_observe_complete threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -628,7 +629,7 @@ public class IrohBlobs {
     var hexSeg = alloc.allocate(hexBytes.length);
     hexSeg.copyFrom(MemorySegment.ofArray(hexBytes));
 
-    var hashBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var hashBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     hashBytesSeg.set(ValueLayout.ADDRESS, 0, hexSeg);
     hashBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) hexBytes.length);
 
@@ -638,13 +639,13 @@ public class IrohBlobs {
       int status = lib.blobsListCollection(runtime.nativeHandle(), nodeHandle, hashBytesSeg, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_list_collection failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_list_collection failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_blobs_list_collection threw: " + t.getMessage()));
+          new IrohException("aster_blobs_list_collection threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -757,7 +758,7 @@ public class IrohBlobs {
     var hexSeg = alloc.allocate(hexBytes.length);
     hexSeg.copyFrom(MemorySegment.ofArray(hexBytes));
 
-    var hashBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var hashBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     hashBytesSeg.set(ValueLayout.ADDRESS, 0, hexSeg);
     hashBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) hexBytes.length);
 
@@ -770,10 +771,10 @@ public class IrohBlobs {
               runtime.nativeHandle(), nodeHandle, hashBytesSeg, bufSeg, 1024, lenSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_create_ticket failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_create_ticket failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_blobs_create_ticket threw: " + t.getMessage());
+      throw new IrohException("aster_blobs_create_ticket threw: " + t.getMessage());
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -801,7 +802,7 @@ public class IrohBlobs {
     var hexSeg = alloc.allocate(hexBytes.length);
     hexSeg.copyFrom(MemorySegment.ofArray(hexBytes));
 
-    var hashBytesSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    var hashBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     hashBytesSeg.set(ValueLayout.ADDRESS, 0, hexSeg);
     hashBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) hexBytes.length);
 
@@ -814,10 +815,10 @@ public class IrohBlobs {
               runtime.nativeHandle(), nodeHandle, hashBytesSeg, bufSeg, 1024, lenSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_blobs_create_collection_ticket failed: " + status);
+            IrohStatus.fromCode(status), "aster_blobs_create_collection_ticket failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_blobs_create_collection_ticket threw: " + t.getMessage());
+      throw new IrohException("aster_blobs_create_collection_ticket threw: " + t.getMessage());
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);

@@ -37,7 +37,7 @@ public final class IrohHook {
         IrohLibrary.getInstance()
             .irohHookBeforeConnectRespond(runtime.nativeHandle(), invocation, decision.code);
     if (r != 0) {
-      throw new IrohException(IrohStatus.fromCode(r), "iroh_hook_before_connect_respond: " + r);
+      throw new IrohException(IrohStatus.fromCode(r), "aster_hook_before_connect_respond: " + r);
     }
   }
 
@@ -46,7 +46,7 @@ public final class IrohHook {
     int r =
         IrohLibrary.getInstance().irohHookAfterConnectRespond(runtime.nativeHandle(), invocation);
     if (r != 0) {
-      throw new IrohException(IrohStatus.fromCode(r), "iroh_hook_after_connect_respond: " + r);
+      throw new IrohException(IrohStatus.fromCode(r), "aster_hook_after_connect_respond: " + r);
     }
   }
 }

@@ -52,9 +52,9 @@ public sealed class Endpoint : IDisposable
         var (configPtr, cleanup) = BuildNativeConfig(builder);
         try
         {
-            int r = Native.iroh_endpoint_create(runtime.Handle, configPtr, user_data: 0, out ulong opId);
+            int r = Native.aster_endpoint_create(runtime.Handle, configPtr, user_data: 0, out ulong opId);
             if (r != 0)
-                throw IrohException.FromStatus(r, "iroh_endpoint_create");
+                throw IrohException.FromStatus(r, "aster_endpoint_create");
 
             Event ev = await runtime.WaitForAsync(opId, cancellationToken);
             if (ev.kind != (uint)EventKind.EndpointCreated)
@@ -124,6 +124,7 @@ public sealed class Endpoint : IDisposable
             proxy_url = default,
             proxy_from_env = 0,
             data_dir_utf8 = default,
+            hook_failure_mode = (uint)HookFailureMode.FailOpen,
         };
         Marshal.StructureToPtr(config, configPtr, fDeleteOld: false);
 
@@ -136,14 +137,14 @@ public sealed class Endpoint : IDisposable
         IntPtr buf = Marshal.AllocHGlobal(65);
         try
         {
-            int r = Native.iroh_endpoint_id(_runtime.Handle, _handle.Value, buf, (UIntPtr)65, out UIntPtr len);
+            int r = Native.aster_endpoint_id(_runtime.Handle, _handle.Value, buf, (UIntPtr)65, out UIntPtr len);
             if (r != 0)
-                throw IrohException.FromStatus(r, "iroh_endpoint_id");
+                throw IrohException.FromStatus(r, "aster_endpoint_id");
             if (len == UIntPtr.Zero)
                 return string.Empty;
             byte[] bytes = new byte[(int)len];
             Marshal.Copy(buf, bytes, 0, (int)len);
-            return Encoding_hex(bytes);
+            return Encoding.UTF8.GetString(bytes); // native returns the hex id as UTF-8 text
         }
         finally { Marshal.FreeHGlobal(buf); }
     }
@@ -151,9 +152,9 @@ public sealed class Endpoint : IDisposable
     /// <summary>Closes this endpoint asynchronously.</summary>
     public async Task CloseAsync(CancellationToken cancellationToken = default)
     {
-        int r = Native.iroh_endpoint_close(_runtime.Handle, _handle.Value, user_data: 0, out ulong opId);
+        int r = Native.aster_endpoint_close(_runtime.Handle, _handle.Value, user_data: 0, out ulong opId);
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_endpoint_close");
+            throw IrohException.FromStatus(r, "aster_endpoint_close");
 
         await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
         _disposed = true;
@@ -174,9 +175,9 @@ public sealed class Endpoint : IDisposable
     /// <summary>Accepts an incoming connection on this endpoint.</summary>
     public async Task<Connection> AcceptAsync(CancellationToken cancellationToken = default)
     {
-        int r = Native.iroh_accept(_runtime.Handle, _handle.Value, user_data: 0, out ulong opId);
+        int r = Native.aster_accept(_runtime.Handle, _handle.Value, user_data: 0, out ulong opId);
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_accept");
+            throw IrohException.FromStatus(r, "aster_accept");
 
         Event ev = await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
         if (ev.kind != (uint)EventKind.ConnectionAccepted)
@@ -188,7 +189,8 @@ public sealed class Endpoint : IDisposable
     /// <summary>Connects to a remote node by node ID (hex) and ALPN.</summary>
     public async Task<Connection> ConnectAsync(string nodeIdHex, string alpn, CancellationToken cancellationToken = default)
     {
-        byte[] nodeIdBytes = Encoding_hex_decode(nodeIdHex);
+        // aster_connect_config_t.node_id is the hex endpoint id as UTF-8 text.
+        byte[] nodeIdBytes = Encoding.UTF8.GetBytes(nodeIdHex);
         byte[] alpnBytes = Encoding.UTF8.GetBytes(alpn);
 
         GCHandle nodeIdHandle = GCHandle.Alloc(nodeIdBytes, GCHandleType.Pinned);
@@ -207,9 +209,9 @@ public sealed class Endpoint : IDisposable
                 };
                 Marshal.StructureToPtr(config, configPtr, fDeleteOld: false);
 
-                int r = Native.iroh_connect(_runtime.Handle, _handle.Value, configPtr, user_data: 0, out ulong opId);
+                int r = Native.aster_connect(_runtime.Handle, _handle.Value, configPtr, user_data: 0, out ulong opId);
                 if (r != 0)
-                    throw IrohException.FromStatus(r, "iroh_connect");
+                    throw IrohException.FromStatus(r, "aster_connect");
 
                 Event ev = await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
                 if (ev.kind != (uint)EventKind.Connected)
@@ -261,9 +263,9 @@ public sealed class Endpoint : IDisposable
                 };
                 Marshal.StructureToPtr(config, configPtr, fDeleteOld: false);
 
-                int r = Native.iroh_connect(_runtime.Handle, _handle.Value, configPtr, user_data: 0, out ulong opId);
+                int r = Native.aster_connect(_runtime.Handle, _handle.Value, configPtr, user_data: 0, out ulong opId);
                 if (r != 0)
-                    throw IrohException.FromStatus(r, "iroh_connect");
+                    throw IrohException.FromStatus(r, "aster_connect");
 
                 Event ev = await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
                 if (ev.kind != (uint)EventKind.Connected)
@@ -287,18 +289,5 @@ public sealed class Endpoint : IDisposable
 
     public void Dispose() { if (!_disposed) Close(); }
 
-    private static string Encoding_hex(byte[] data)
-    {
-        var sb = new StringBuilder(data.Length * 2);
-        foreach (var b in data) sb.AppendFormat("{0:x2}", b);
-        return sb.ToString();
-    }
 
-    private static byte[] Encoding_hex_decode(string hex)
-    {
-        if (string.IsNullOrEmpty(hex)) return Array.Empty<byte>();
-        byte[] result = new byte[hex.Length / 2];
-        for (int i = 0; i < result.Length; i++) result[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
-        return result;
-    }
 }

@@ -1,4 +1,4 @@
-//! Fuzz `iroh_event_t` struct decoding — random bytes parsed as an event.
+//! Fuzz `aster_event_t` struct decoding — random bytes parsed as an event.
 
 #![no_main]
 

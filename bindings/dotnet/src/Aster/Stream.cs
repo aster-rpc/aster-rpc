@@ -29,10 +29,18 @@ public sealed class SendStream : IDisposable
     /// </summary>
     public async Task SendAsync(byte[] data, CancellationToken cancellationToken = default)
     {
-        Bytes dataNative = Bytes.FromArray(data);
-        int r = Native.iroh_stream_write(_runtime.Handle, _handle.Value, dataNative, user_data: 0, out ulong opId);
+        // Native code copies the payload before returning, so pinning only
+        // has to cover the call itself.
+        GCHandle pin = GCHandle.Alloc(data, GCHandleType.Pinned);
+        int r;
+        ulong opId;
+        try
+        {
+            r = Native.aster_stream_write(_runtime.Handle, _handle.Value, Bytes.FromPinned(pin, data.Length), user_data: 0, out opId);
+        }
+        finally { pin.Free(); }
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_stream_write");
+            throw IrohException.FromStatus(r, "aster_stream_write");
 
         Event ev = await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
         if (ev.kind != (uint)EventKind.SendCompleted)
@@ -44,9 +52,9 @@ public sealed class SendStream : IDisposable
     /// </summary>
     public async Task FinishAsync(CancellationToken cancellationToken = default)
     {
-        int r = Native.iroh_stream_finish(_runtime.Handle, _handle.Value, user_data: 0, out ulong opId);
+        int r = Native.aster_stream_finish(_runtime.Handle, _handle.Value, user_data: 0, out ulong opId);
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_stream_finish");
+            throw IrohException.FromStatus(r, "aster_stream_finish");
 
         await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
     }
@@ -54,11 +62,14 @@ public sealed class SendStream : IDisposable
     /// <summary>
     /// Resets this stream with a QUIC error code.
     /// </summary>
+    /// <exception cref="NotSupportedException">
+    /// Always: the C ABI has no send-stream reset. (This previously called
+    /// aster_stream_stop, which takes a <b>recv</b>-stream handle and could stop an
+    /// unrelated recv stream that happened to share the handle value.)
+    /// </exception>
     public void Reset(int errorCode = 0)
     {
-        int r = Native.iroh_stream_stop(_runtime.Handle, _handle.Value, (uint)errorCode);
-        if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_stream_stop");
+        throw new NotSupportedException("The Aster C ABI does not expose a send-stream reset.");
     }
 
     public void Dispose()
@@ -68,7 +79,7 @@ public sealed class SendStream : IDisposable
             _disposed = true;
             try
             {
-                Native.iroh_send_stream_free(_runtime.Handle, _handle.Value);
+                Native.aster_send_stream_free(_runtime.Handle, _handle.Value);
             }
             catch (Exception ex)
             {
@@ -101,9 +112,9 @@ public sealed class RecvStream : IDisposable
     /// </summary>
     public async Task<byte[]> ReadAsync(long maxLen = 65536, CancellationToken cancellationToken = default)
     {
-        int r = Native.iroh_stream_read(_runtime.Handle, _handle.Value, (UIntPtr)maxLen, user_data: 0, out ulong opId);
+        int r = Native.aster_stream_read(_runtime.Handle, _handle.Value, (UIntPtr)maxLen, user_data: 0, out ulong opId);
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_stream_read");
+            throw IrohException.FromStatus(r, "aster_stream_read");
 
         Event ev = await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
         if (ev.kind != (uint)EventKind.FrameReceived)
@@ -125,9 +136,9 @@ public sealed class RecvStream : IDisposable
     /// </summary>
     public async Task<byte[]> ReadToEndAsync(long maxSize = 1024 * 1024, CancellationToken cancellationToken = default)
     {
-        int r = Native.iroh_stream_read_to_end(_runtime.Handle, _handle.Value, (UIntPtr)maxSize, user_data: 0, out ulong opId);
+        int r = Native.aster_stream_read_to_end(_runtime.Handle, _handle.Value, (UIntPtr)maxSize, user_data: 0, out ulong opId);
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_stream_read_to_end");
+            throw IrohException.FromStatus(r, "aster_stream_read_to_end");
 
         Event ev = await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
         if (ev.kind != (uint)EventKind.FrameReceived)
@@ -149,9 +160,9 @@ public sealed class RecvStream : IDisposable
     /// </summary>
     public void Stop(int errorCode = 0)
     {
-        int r = Native.iroh_stream_stop(_runtime.Handle, _handle.Value, (uint)errorCode);
+        int r = Native.aster_stream_stop(_runtime.Handle, _handle.Value, (uint)errorCode);
         if (r != 0)
-            throw IrohException.FromStatus(r, "iroh_stream_stop");
+            throw IrohException.FromStatus(r, "aster_stream_stop");
     }
 
     public void Dispose()
@@ -161,7 +172,7 @@ public sealed class RecvStream : IDisposable
             _disposed = true;
             try
             {
-                Native.iroh_recv_stream_free(_runtime.Handle, _handle.Value);
+                Native.aster_recv_stream_free(_runtime.Handle, _handle.Value);
             }
             catch (Exception ex)
             {

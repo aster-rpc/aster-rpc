@@ -40,25 +40,25 @@ public class IrohGossip {
     Arena confined = Arena.ofConfined();
     SegmentAllocator alloc = confined;
 
-    // Marshal topic as iroh_bytes_t (struct by value: ptr + len)
+    // Marshal topic as aster_bytes_t (struct by value: ptr + len)
     byte[] topicBytes = topic.getBytes(StandardCharsets.UTF_8);
-    MemorySegment topicSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+    MemorySegment topicSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     MemorySegment topicDataSeg = alloc.allocate(topicBytes.length);
     topicDataSeg.copyFrom(MemorySegment.ofArray(topicBytes));
     topicSeg.set(ValueLayout.ADDRESS, 0, topicDataSeg);
     topicSeg.set(ValueLayout.JAVA_LONG, 8, (long) topicBytes.length);
 
-    // Marshal peers as iroh_bytes_list_t (struct by value: items ptr + len)
-    // Each item is an iroh_bytes_t struct { ptr, len } = 16 bytes
+    // Marshal peers as aster_bytes_list_t (struct by value: items ptr + len)
+    // Each item is an aster_bytes_t struct { ptr, len } = 16 bytes
     int peerCount = peers.size();
-    MemorySegment peersSeg = alloc.allocate(IrohLibrary.IROH_BYTES_LIST);
+    MemorySegment peersSeg = alloc.allocate(IrohLibrary.ASTER_BYTES_LIST);
     if (peerCount > 0) {
-      MemorySegment itemsSeg = alloc.allocate(IrohLibrary.IROH_BYTES, peerCount);
+      MemorySegment itemsSeg = alloc.allocate(IrohLibrary.ASTER_BYTES, peerCount);
       for (int i = 0; i < peerCount; i++) {
         byte[] peerBytes = peers.get(i).getBytes(StandardCharsets.UTF_8);
         MemorySegment peerDataSeg = alloc.allocate(peerBytes.length);
         peerDataSeg.copyFrom(MemorySegment.ofArray(peerBytes));
-        long offset = i * IrohLibrary.IROH_BYTES.byteSize();
+        long offset = i * IrohLibrary.ASTER_BYTES.byteSize();
         itemsSeg.set(ValueLayout.ADDRESS, offset, peerDataSeg);
         itemsSeg.set(ValueLayout.JAVA_LONG, offset + 8, (long) peerBytes.length);
       }
@@ -76,13 +76,13 @@ public class IrohGossip {
           lib.gossipSubscribe(runtime.nativeHandle(), nodeHandle, topicSeg, peersSeg, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_gossip_subscribe failed: " + status);
+            IrohStatus.fromCode(status), "aster_gossip_subscribe failed: " + status);
       }
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
-          new IrohException("iroh_gossip_subscribe threw: " + t.getMessage()));
+          new IrohException("aster_gossip_subscribe threw: " + t.getMessage()));
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -126,8 +126,8 @@ public class IrohGossip {
       Arena confined = Arena.ofConfined();
       SegmentAllocator alloc = confined;
 
-      // Marshal data as iroh_bytes_t
-      MemorySegment dataSeg = alloc.allocate(IrohLibrary.IROH_BYTES);
+      // Marshal data as aster_bytes_t
+      MemorySegment dataSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
       MemorySegment heapSeg = alloc.allocate(data.length);
       heapSeg.copyFrom(MemorySegment.ofArray(data));
       dataSeg.set(ValueLayout.ADDRESS, 0, heapSeg);
@@ -139,13 +139,13 @@ public class IrohGossip {
         int status = lib.gossipBroadcast(runtime.nativeHandle(), topicHandle, dataSeg, opSeg);
         if (status != 0) {
           throw new IrohException(
-              IrohStatus.fromCode(status), "iroh_gossip_broadcast failed: " + status);
+              IrohStatus.fromCode(status), "aster_gossip_broadcast failed: " + status);
         }
       } catch (IrohException e) {
         return CompletableFuture.failedFuture(e);
       } catch (Throwable t) {
         return CompletableFuture.failedFuture(
-            new IrohException("iroh_gossip_broadcast threw: " + t.getMessage()));
+            new IrohException("aster_gossip_broadcast threw: " + t.getMessage()));
       }
 
       long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -177,13 +177,13 @@ public class IrohGossip {
         int status = lib.gossipRecv(runtime.nativeHandle(), topicHandle, opSeg);
         if (status != 0) {
           throw new IrohException(
-              IrohStatus.fromCode(status), "iroh_gossip_recv failed: " + status);
+              IrohStatus.fromCode(status), "aster_gossip_recv failed: " + status);
         }
       } catch (IrohException e) {
         return CompletableFuture.failedFuture(e);
       } catch (Throwable t) {
         return CompletableFuture.failedFuture(
-            new IrohException("iroh_gossip_recv threw: " + t.getMessage()));
+            new IrohException("aster_gossip_recv threw: " + t.getMessage()));
       }
 
       long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);

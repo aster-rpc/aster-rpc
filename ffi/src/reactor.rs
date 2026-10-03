@@ -24,7 +24,7 @@ use aster_transport_core::ring;
 use tokio::sync::mpsc;
 
 use crate::{
-    iroh_node_t, iroh_runtime_t, iroh_status_t, load_runtime, BufferRegistry, HandleRegistry,
+    aster_node_t, aster_runtime_t, aster_status_t, load_runtime, BufferRegistry, HandleRegistry,
 };
 
 // ============================================================================
@@ -38,14 +38,14 @@ pub type aster_reactor_t = u64;
 /// `ConnectionClosed` event populates only `event_kind`, `connection_id`,
 /// `peer_*` (peer_id of the closed connection); all other fields are zero
 /// or NULL.
-pub const ASTER_EVENT_KIND_CALL: u8 = 0;
-pub const ASTER_EVENT_KIND_CONNECTION_CLOSED: u8 = 1;
+pub const ASTER_REACTOR_EVENT_CALL: u8 = 0;
+pub const ASTER_REACTOR_EVENT_CONNECTION_CLOSED: u8 = 1;
 /// A previously-full response channel has reserved capacity for `call_id`.
 /// No payload buffers are present; the binding must retry the same submit.
-pub const ASTER_EVENT_KIND_RESPONSE_WRITABLE: u8 = 2;
+pub const ASTER_REACTOR_EVENT_RESPONSE_WRITABLE: u8 = 2;
 /// A pending response-capacity reservation closed before becoming writable.
 /// No payload buffers are present; the binding must stop producing this call.
-pub const ASTER_EVENT_KIND_RESPONSE_CLOSED: u8 = 3;
+pub const ASTER_REACTOR_EVENT_RESPONSE_CLOSED: u8 = 3;
 
 /// C-visible event descriptor returned by aster_reactor_poll.
 ///
@@ -56,7 +56,7 @@ pub const ASTER_EVENT_KIND_RESPONSE_CLOSED: u8 = 3;
 /// `event_kind` before reading the remaining fields.
 #[repr(C)]
 pub struct aster_reactor_call_t {
-    /// Event-kind discriminator. See `ASTER_EVENT_KIND_*` constants.
+    /// Event-kind discriminator. See `ASTER_REACTOR_EVENT_*` constants.
     pub event_kind: u8,
     /// Reactor-assigned call ID (for submit correlation). Zero on
     /// ConnectionClosed events.
@@ -101,11 +101,11 @@ pub struct aster_reactor_call_t {
     /// Buffer ID for the peer ID string. Populated on both Call and
     /// ConnectionClosed.
     pub peer_buffer: u64,
-    /// Borrowed `iroh_connection_t` handle for the QUIC connection this
+    /// Borrowed `aster_connection_t` handle for the QUIC connection this
     /// event arrived on. Populated on both Call and ConnectionClosed.
     /// Same handle for every event from the same `connection_id`; freed
     /// internally by the reactor when ConnectionClosed is consumed.
-    /// Bindings MUST NOT call `iroh_connection_free` on this handle —
+    /// Bindings MUST NOT call `aster_connection_free` on this handle —
     /// the reactor owns its lifetime.
     pub connection_handle: u64,
 }
@@ -150,9 +150,9 @@ impl RingCall {
     fn response_capacity(call_id: u64, writable: bool) -> Self {
         Self {
             event_kind: if writable {
-                ASTER_EVENT_KIND_RESPONSE_WRITABLE
+                ASTER_REACTOR_EVENT_RESPONSE_WRITABLE
             } else {
-                ASTER_EVENT_KIND_RESPONSE_CLOSED
+                ASTER_REACTOR_EVENT_RESPONSE_CLOSED
             },
             call_id,
             connection_id: 0,
@@ -256,7 +256,7 @@ async fn pump_task(
     stopped: Arc<AtomicBool>,
 ) {
     // Per-reactor cache mapping core reactor `connection_id` → bridge
-    // `iroh_connection_t` handle. The reactor's `connection_id` is its own
+    // `aster_connection_t` handle. The reactor's `connection_id` is its own
     // counter (not a bridge handle); we register the `CoreConnection` once
     // per connection here so every Call slot from the same connection
     // shares one borrowed handle, then evict + free on ConnectionClosed.
@@ -293,7 +293,7 @@ async fn pump_task(
                     .or_insert_with(|| bridge.connections.insert(call.connection.clone()));
 
                 RingCall {
-                    event_kind: ASTER_EVENT_KIND_CALL,
+                    event_kind: ASTER_REACTOR_EVENT_CALL,
                     call_id: call.call_id,
                     connection_id: call.connection_id,
                     stream_id: call.stream_id,
@@ -331,7 +331,7 @@ async fn pump_task(
                 }
 
                 RingCall {
-                    event_kind: ASTER_EVENT_KIND_CONNECTION_CLOSED,
+                    event_kind: ASTER_REACTOR_EVENT_CONNECTION_CLOSED,
                     call_id: 0,
                     connection_id,
                     stream_id: 0,
@@ -382,22 +382,22 @@ async fn pump_task(
 /// `out_reactor` receives the reactor handle on success.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_create(
-    runtime: iroh_runtime_t,
-    node: iroh_node_t,
+    runtime: aster_runtime_t,
+    node: aster_node_t,
     ring_capacity: u32,
     out_reactor: *mut aster_reactor_t,
 ) -> i32 {
     if out_reactor.is_null() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
     let bridge = match load_runtime(runtime) {
         Ok(b) => b,
-        Err(_) => return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32,
+        Err(_) => return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
     };
 
     let core_node = match bridge.nodes.get(node) {
         Some(n) => n,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let capacity = if ring_capacity > 0 {
@@ -454,43 +454,43 @@ pub unsafe extern "C" fn aster_reactor_create(
     let handle_id = REACTORS.insert(state);
     unsafe { ptr::write(out_reactor, handle_id) };
 
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 /// Destroy a reactor. Stops the pump task and releases resources.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_destroy(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
 ) -> i32 {
     match REACTORS.remove(reactor) {
         Some(state) => {
             state.stopped.store(true, Ordering::Relaxed);
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         }
-        None => iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     }
 }
 
 /// Long-poll for the next non-rpc aster-ALPN connection accepted by the reactor.
-/// Fires `IROH_EVENT_ASTER_ACCEPTED` when a connection arrives, with the same
-/// payload shape as `iroh_node_accept_aster`: `event.handle` = connection handle,
+/// Fires `ASTER_EVENT_ASTER_ACCEPTED` when a connection arrives, with the same
+/// payload shape as `aster_node_accept_aster`: `event.handle` = connection handle,
 /// `event.data_ptr/len` = ALPN bytes, `event.buffer` = lease to release via
-/// `iroh_buffer_release`. Returns `IROH_STATUS_OK` on successful dispatch of the
+/// `aster_buffer_release`. Returns `ASTER_STATUS_OK` on successful dispatch of the
 /// async wait; the caller awaits completion via the usual operation registry.
 ///
 /// When the reactor is shut down (its non_rpc sender dropped) the async task
 /// emits an error event instead of blocking forever.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_accept_non_rpc(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     user_data: u64,
-    out_operation: *mut crate::iroh_operation_t,
+    out_operation: *mut crate::aster_operation_t,
 ) -> i32 {
-    use crate::{iroh_event_kind_t, iroh_status_t, EventInternal};
+    use crate::{aster_event_kind_t, aster_status_t, EventInternal};
     if out_operation.is_null() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
 
     let bridge = match crate::load_runtime(runtime) {
@@ -500,7 +500,7 @@ pub unsafe extern "C" fn aster_reactor_accept_non_rpc(
 
     let state = match REACTORS.get(reactor) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let (op_id, cancelled) = bridge.new_operation();
@@ -519,8 +519,8 @@ pub unsafe extern "C" fn aster_reactor_accept_non_rpc(
             Some((alpn, conn)) => {
                 let conn_handle = bridge2.connections.insert(conn);
                 let event = EventInternal::new(
-                    iroh_event_kind_t::IROH_EVENT_ASTER_ACCEPTED,
-                    iroh_status_t::IROH_STATUS_OK,
+                    aster_event_kind_t::ASTER_EVENT_ASTER_ACCEPTED,
+                    aster_status_t::ASTER_STATUS_OK,
                     op_id,
                     conn_handle,
                     0,
@@ -535,7 +535,7 @@ pub unsafe extern "C" fn aster_reactor_accept_non_rpc(
         }
     });
 
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 /// Poll for incoming calls. Drains up to `max_calls` from the ring buffer
@@ -545,11 +545,11 @@ pub unsafe extern "C" fn aster_reactor_accept_non_rpc(
 /// If `timeout_ms` is 0, returns immediately (non-blocking).
 /// If `timeout_ms` > 0, blocks up to that duration waiting for at least one call.
 ///
-/// The caller must release each call's buffers via `iroh_buffer_release` after
+/// The caller must release each call's buffers via `aster_buffer_release` after
 /// processing (using the reactor's buffer registry, not the runtime's).
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_poll(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     out_calls: *mut aster_reactor_call_t,
     max_calls: u32,
@@ -822,40 +822,40 @@ fn send_with_capacity(
 /// `encoded_len` is the exact combined framed-byte length of the failed submit.
 /// This call itself never blocks. Once Tokio owns that byte charge, one item
 /// slot, and queue capacity, `aster_reactor_poll` emits
-/// `ASTER_EVENT_KIND_RESPONSE_WRITABLE` for the call. The binding then retries
+/// `ASTER_REACTOR_EVENT_RESPONSE_WRITABLE` for the call. The binding then retries
 /// the exact submit; that retry consumes the held combined permit and therefore
 /// cannot return `QUEUE_FULL`. If cancellation or disconnect closes the channel
 /// first, poll emits
-/// `ASTER_EVENT_KIND_RESPONSE_CLOSED` instead.
+/// `ASTER_REACTOR_EVENT_RESPONSE_CLOSED` instead.
 ///
 /// Only one reservation may be pending per call, matching the ABI's
 /// single-producer-per-call rule.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_reserve_response_capacity(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     call_id: u64,
     encoded_len: u64,
 ) -> i32 {
     if load_runtime(runtime).is_err() {
-        return iroh_status_t::IROH_STATUS_NOT_FOUND as i32;
+        return aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
     }
     let state = match REACTORS.get(reactor) {
         Some(state) => state,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
     let sender = {
         let senders = state.response_senders.lock().unwrap();
         match senders.get(&call_id) {
             Some(sender) => sender.clone(),
-            None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+            None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
         }
     };
     let Ok(encoded_len) = usize::try_from(encoded_len) else {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     };
     if encoded_len > sender.byte_limit() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
 
     let token = state.next_reservation_token.fetch_add(1, Ordering::Relaxed);
@@ -863,7 +863,7 @@ pub unsafe extern "C" fn aster_reactor_reserve_response_capacity(
     {
         let mut reservations = state.response_reservations.lock().unwrap();
         if reservations.contains_key(&call_id) {
-            return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+            return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
         }
         reservations.insert(
             call_id,
@@ -919,32 +919,32 @@ pub unsafe extern "C" fn aster_reactor_reserve_response_capacity(
         }
     });
 
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 /// Cancel a response-capacity wait whose binding thread was interrupted.
 /// Drops either the pending reservation request or an already-held permit.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_cancel_response_reservation(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     call_id: u64,
 ) -> i32 {
     if load_runtime(runtime).is_err() {
-        return iroh_status_t::IROH_STATUS_NOT_FOUND as i32;
+        return aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
     }
     let state = match REACTORS.get(reactor) {
         Some(state) => state,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
     let reservation = state.response_reservations.lock().unwrap().remove(&call_id);
     match reservation {
         Some(ResponseReservation::Pending { cancel, .. }) => {
             let _ = cancel.send(());
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         }
-        Some(ResponseReservation::Ready { .. }) => iroh_status_t::IROH_STATUS_OK as i32,
-        None => iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        Some(ResponseReservation::Ready { .. }) => aster_status_t::ASTER_STATUS_OK as i32,
+        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     }
 }
 
@@ -957,15 +957,15 @@ pub unsafe extern "C" fn aster_reactor_cancel_response_reservation(
 /// After a successful call, `call_id` is no longer valid.
 ///
 /// BACKPRESSURE: the per-call response channel is bounded, so this may return
-/// `IROH_STATUS_QUEUE_FULL`. Nothing was copied, sent, or removed; the caller
+/// `ASTER_STATUS_QUEUE_FULL`. Nothing was copied, sent, or removed; the caller
 /// retains its buffers and MUST retry the exact submit. This function never
 /// blocks. A binding may use bounded backoff, or call
 /// `aster_reactor_reserve_response_capacity` and wait for the corresponding
 /// reactor-poll notification before retrying. A caller that ignores
-/// `IROH_STATUS_QUEUE_FULL` drops its own response frame.
+/// `ASTER_STATUS_QUEUE_FULL` drops its own response frame.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_submit(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     call_id: u64,
     response_ptr: *const u8,
@@ -975,7 +975,7 @@ pub unsafe extern "C" fn aster_reactor_submit(
 ) -> i32 {
     let state = match REACTORS.get(reactor) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     // Clone rather than remove, and reserve before copying: identical
@@ -985,12 +985,12 @@ pub unsafe extern "C" fn aster_reactor_submit(
         let map = state.response_senders.lock().unwrap();
         match map.get(&call_id) {
             Some(s) => s.clone(),
-            None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+            None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
         }
     };
 
     let Some(encoded_len) = (response_len as usize).checked_add(trailer_len as usize) else {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     };
     let sent = send_with_capacity(&state, call_id, &sender, encoded_len, || {
         // Unary fast-path (mirrors the client-side `aster_call_unary` write):
@@ -1013,13 +1013,13 @@ pub unsafe extern "C" fn aster_reactor_submit(
         OutgoingFrame::CompleteUnary(bundled)
     });
     match sent {
-        CapacitySend::Full => return iroh_status_t::IROH_STATUS_QUEUE_FULL as i32,
+        CapacitySend::Full => return aster_status_t::ASTER_STATUS_QUEUE_FULL as i32,
         CapacitySend::Closed => {
             reap_call(&state, call_id);
-            return iroh_status_t::IROH_STATUS_NOT_FOUND as i32;
+            return aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
         }
         CapacitySend::Invalid => {
-            return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+            return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
         }
         CapacitySend::Sent => {}
     }
@@ -1027,21 +1027,21 @@ pub unsafe extern "C" fn aster_reactor_submit(
     // Terminal: dropping the map's sender closes the channel once drained.
     reap_call(&state, call_id);
 
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 /// Submit one streaming response frame for a call. May be called multiple
 /// times per call; each call enqueues one Frame on the reactor's mpsc channel.
 /// The call_id remains valid until `aster_reactor_submit_trailer` is called.
 ///
-/// May return `IROH_STATUS_QUEUE_FULL`; see `aster_reactor_submit` for the
+/// May return `ASTER_STATUS_QUEUE_FULL`; see `aster_reactor_submit` for the
 /// exact-retry and asynchronous-reservation contract. Never blocks.
 ///
 /// `frame_ptr`/`frame_len` point to already-framed bytes (including the 4-byte
 /// length prefix and 1-byte flags). The binding is responsible for framing.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_submit_frame(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     call_id: u64,
     frame_ptr: *const u8,
@@ -1049,7 +1049,7 @@ pub unsafe extern "C" fn aster_reactor_submit_frame(
 ) -> i32 {
     let state = match REACTORS.get(reactor) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     // Clone the sender without removing it — the call remains open for more
@@ -1058,7 +1058,7 @@ pub unsafe extern "C" fn aster_reactor_submit_frame(
         let map = state.response_senders.lock().unwrap();
         match map.get(&call_id) {
             Some(s) => s.clone(),
-            None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+            None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
         }
     };
 
@@ -1078,7 +1078,7 @@ pub unsafe extern "C" fn aster_reactor_submit_frame(
         OutgoingFrame::Frame(frame)
     });
     match sent {
-        CapacitySend::Full => return iroh_status_t::IROH_STATUS_QUEUE_FULL as i32,
+        CapacitySend::Full => return aster_status_t::ASTER_STATUS_QUEUE_FULL as i32,
         CapacitySend::Closed => {
             // The call is over -- cancelled, or the peer went away. Reap this
             // call's state HERE: the maps are otherwise cleaned only on a
@@ -1086,14 +1086,14 @@ pub unsafe extern "C" fn aster_reactor_submit_frame(
             // gets to send a trailer would leave its sender, request receiver
             // and cancellation flag retained for the process's lifetime.
             reap_call(&state, call_id);
-            return iroh_status_t::IROH_STATUS_NOT_FOUND as i32;
+            return aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
         }
         CapacitySend::Invalid => {
-            return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+            return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
         }
         CapacitySend::Sent => {}
     }
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 /// Submit the trailer for a call and close the stream. After this call, the
@@ -1101,13 +1101,13 @@ pub unsafe extern "C" fn aster_reactor_submit_frame(
 /// remains valid and must be retried. The trailer payload may be empty — the
 /// reactor still finishes the send side cleanly.
 ///
-/// May return `IROH_STATUS_QUEUE_FULL`; see `aster_reactor_submit` for the
+/// May return `ASTER_STATUS_QUEUE_FULL`; see `aster_reactor_submit` for the
 /// exact-retry and asynchronous-reservation contract. Terminal state is
 /// removed only after capacity is owned, so a retry cannot turn into a
 /// truncated stream.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_submit_trailer(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     call_id: u64,
     trailer_ptr: *const u8,
@@ -1115,7 +1115,7 @@ pub unsafe extern "C" fn aster_reactor_submit_trailer(
 ) -> i32 {
     let state = match REACTORS.get(reactor) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     // CLONE rather than remove, then reserve. Removing first would make
@@ -1127,7 +1127,7 @@ pub unsafe extern "C" fn aster_reactor_submit_trailer(
         let map = state.response_senders.lock().unwrap();
         match map.get(&call_id) {
             Some(s) => s.clone(),
-            None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+            None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
         }
     };
 
@@ -1140,13 +1140,13 @@ pub unsafe extern "C" fn aster_reactor_submit_trailer(
         OutgoingFrame::Trailer(trailer)
     });
     match sent {
-        CapacitySend::Full => return iroh_status_t::IROH_STATUS_QUEUE_FULL as i32,
+        CapacitySend::Full => return aster_status_t::ASTER_STATUS_QUEUE_FULL as i32,
         CapacitySend::Closed => {
             reap_call(&state, call_id);
-            return iroh_status_t::IROH_STATUS_NOT_FOUND as i32;
+            return aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
         }
         CapacitySend::Invalid => {
-            return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+            return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
         }
         CapacitySend::Sent => {}
     }
@@ -1155,11 +1155,11 @@ pub unsafe extern "C" fn aster_reactor_submit_trailer(
     // channel once drained.
     reap_call(&state, call_id);
 
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 /// Result codes returned by `aster_reactor_recv_frame` in addition to the
-/// usual `iroh_status_t` codes for error cases.
+/// usual `aster_status_t` codes for error cases.
 pub const ASTER_RECV_FRAME_OK: i32 = 0;
 /// Per-call request channel was closed cleanly (peer signalled END_STREAM
 /// or its recv stream EOF'd). No frame was written; the binding should
@@ -1187,8 +1187,8 @@ pub const ASTER_RECV_FRAME_TIMEOUT: i32 = 2;
 /// timeout case) or is now drained (end-of-stream case — further calls
 /// will continue to return end-of-stream).
 ///
-/// Negative return values are `iroh_status_t` error codes (e.g.
-/// `IROH_STATUS_NOT_FOUND` if the call_id is unknown).
+/// Negative return values are `aster_status_t` error codes (e.g.
+/// `ASTER_STATUS_NOT_FOUND` if the call_id is unknown).
 ///
 /// The first request frame is delivered inline via `aster_reactor_poll`'s
 /// `request_ptr` / `request_len` / `request_flags` fields. This function
@@ -1196,7 +1196,7 @@ pub const ASTER_RECV_FRAME_TIMEOUT: i32 = 2;
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn aster_reactor_recv_frame(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     call_id: u64,
     timeout_ms: u32,
@@ -1210,12 +1210,12 @@ pub unsafe extern "C" fn aster_reactor_recv_frame(
         || out_flags.is_null()
         || out_buffer_id.is_null()
     {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
 
     let state = match REACTORS.get(reactor) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     // Take the receiver out of the map for the duration of the recv. This
@@ -1224,12 +1224,12 @@ pub unsafe extern "C" fn aster_reactor_recv_frame(
     // per call_id.
     let receiver_mutex = match state.request_receivers.lock().unwrap().remove(&call_id) {
         Some(r) => r,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let mut receiver = match receiver_mutex.into_inner() {
         Ok(r) => r,
-        Err(_) => return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32,
+        Err(_) => return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
     };
 
     let timeout = std::time::Duration::from_millis(timeout_ms as u64);
@@ -1295,21 +1295,21 @@ pub unsafe extern "C" fn aster_reactor_recv_frame(
 /// Returns:
 ///   0 — call is alive (no cancellation observed yet)
 ///   1 — call has been cancelled (peer sent FLAG_CANCEL or stream errored)
-///   IROH_STATUS_NOT_FOUND (2) — the call_id is unknown: already completed, or
+///   ASTER_STATUS_NOT_FOUND (2) — the call_id is unknown: already completed, or
 ///       cancelled and reaped. A caller MUST treat this as terminal and stop,
 ///       exactly as it treats 1. It is NOT "alive".
-///  other `iroh_status_t` codes — error. Note these are POSITIVE values; an
+///  other `aster_status_t` codes — error. Note these are POSITIVE values; an
 ///       earlier version of this comment said error codes are <0, which led
 ///       callers to test `status == 1` and read NOT_FOUND as "keep going".
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_check_cancelled(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     call_id: u64,
 ) -> i32 {
     let state = match REACTORS.get(reactor) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
     let map = state.cancelled_flags.lock().unwrap();
     // An unknown call_id is NOT_FOUND, as documented. Returning 0 -- "alive,
@@ -1317,7 +1317,7 @@ pub unsafe extern "C" fn aster_reactor_check_cancelled(
     // loop to keep going forever on a call that had already been reaped.
     match map.get(&call_id) {
         Some(flag) => i32::from(flag.load(std::sync::atomic::Ordering::Acquire)),
-        None => iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     }
 }
 
@@ -1325,26 +1325,26 @@ pub unsafe extern "C" fn aster_reactor_check_cancelled(
 /// Each buffer ID from aster_reactor_call_t must be released exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn aster_reactor_buffer_release(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     reactor: aster_reactor_t,
     buffer: u64,
 ) -> i32 {
     let state = match REACTORS.get(reactor) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     state.buffers.release(buffer);
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{iroh_runtime_close, iroh_runtime_new};
+    use crate::{aster_runtime_close, aster_runtime_new, ASTER_ABI_VERSION_MAJOR};
 
     struct ReservationRig {
-        runtime: iroh_runtime_t,
+        runtime: aster_runtime_t,
         reactor: aster_reactor_t,
         bridge: Arc<crate::BridgeRuntime>,
         response_rx: Option<reactor::ResponseReceiver>,
@@ -1365,8 +1365,8 @@ mod tests {
         ) -> Self {
             let mut runtime = 0;
             assert_eq!(
-                unsafe { iroh_runtime_new(ptr::null(), &mut runtime) },
-                iroh_status_t::IROH_STATUS_OK as i32
+                unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime) },
+                aster_status_t::ASTER_STATUS_OK as i32
             );
             let bridge = load_runtime(runtime).expect("runtime exists");
             let rt_handle = bridge.runtime.handle().clone();
@@ -1459,11 +1459,11 @@ mod tests {
         unsafe fn close(self) {
             assert_eq!(
                 unsafe { aster_reactor_destroy(self.runtime, self.reactor) },
-                iroh_status_t::IROH_STATUS_OK as i32
+                aster_status_t::ASTER_STATUS_OK as i32
             );
             assert_eq!(
-                unsafe { iroh_runtime_close(self.runtime) },
-                iroh_status_t::IROH_STATUS_OK as i32
+                unsafe { aster_runtime_close(self.runtime) },
+                aster_status_t::ASTER_STATUS_OK as i32
             );
         }
     }
@@ -1508,12 +1508,12 @@ mod tests {
             let mut rig = ReservationRig::start_full(CALL_ID);
             assert_eq!(
                 aster_reactor_reserve_response_capacity(rig.runtime, rig.reactor, CALL_ID, 3),
-                iroh_status_t::IROH_STATUS_OK as i32
+                aster_status_t::ASTER_STATUS_OK as i32
             );
 
             assert!(matches!(rig.drain_response(), OutgoingFrame::Frame(bytes) if bytes == [0]));
             let event = rig.poll_capacity();
-            assert_eq!(event.event_kind, ASTER_EVENT_KIND_RESPONSE_WRITABLE);
+            assert_eq!(event.event_kind, ASTER_REACTOR_EVENT_RESPONSE_WRITABLE);
             assert_eq!(event.call_id, CALL_ID);
             assert_eq!(
                 (event.header_buffer, event.request_buffer, event.peer_buffer),
@@ -1529,7 +1529,7 @@ mod tests {
                     frame.as_ptr(),
                     frame.len() as u32,
                 ),
-                iroh_status_t::IROH_STATUS_OK as i32,
+                aster_status_t::ASTER_STATUS_OK as i32,
                 "the retry must consume the held permit, not race back to QUEUE_FULL"
             );
             assert!(matches!(rig.drain_response(), OutgoingFrame::Frame(bytes) if bytes == frame));
@@ -1544,16 +1544,16 @@ mod tests {
             let mut rig = ReservationRig::start_full(CALL_ID);
             assert_eq!(
                 aster_reactor_reserve_response_capacity(rig.runtime, rig.reactor, CALL_ID, 1),
-                iroh_status_t::IROH_STATUS_OK as i32
+                aster_status_t::ASTER_STATUS_OK as i32
             );
 
             drop(rig.response_rx.take());
             let event = rig.poll_capacity();
-            assert_eq!(event.event_kind, ASTER_EVENT_KIND_RESPONSE_CLOSED);
+            assert_eq!(event.event_kind, ASTER_REACTOR_EVENT_RESPONSE_CLOSED);
             assert_eq!(event.call_id, CALL_ID);
             assert_eq!(
                 aster_reactor_submit_frame(rig.runtime, rig.reactor, CALL_ID, ptr::null(), 0),
-                iroh_status_t::IROH_STATUS_NOT_FOUND as i32
+                aster_status_t::ASTER_STATUS_NOT_FOUND as i32
             );
             rig.close();
         }
@@ -1566,11 +1566,11 @@ mod tests {
             let mut rig = ReservationRig::start_full(CALL_ID);
             assert_eq!(
                 aster_reactor_reserve_response_capacity(rig.runtime, rig.reactor, CALL_ID, 2),
-                iroh_status_t::IROH_STATUS_OK as i32
+                aster_status_t::ASTER_STATUS_OK as i32
             );
             assert_eq!(
                 aster_reactor_cancel_response_reservation(rig.runtime, rig.reactor, CALL_ID),
-                iroh_status_t::IROH_STATUS_OK as i32
+                aster_status_t::ASTER_STATUS_OK as i32
             );
 
             assert!(matches!(rig.drain_response(), OutgoingFrame::Frame(bytes) if bytes == [0]));
@@ -1584,12 +1584,12 @@ mod tests {
                     frame.as_ptr(),
                     frame.len() as u32,
                 );
-                if status == iroh_status_t::IROH_STATUS_OK as i32 {
+                if status == aster_status_t::ASTER_STATUS_OK as i32 {
                     break;
                 }
                 assert_eq!(
                     status,
-                    iroh_status_t::IROH_STATUS_QUEUE_FULL as i32,
+                    aster_status_t::ASTER_STATUS_QUEUE_FULL as i32,
                     "a cancelled reservation may be briefly in flight, but must not fail otherwise"
                 );
                 assert!(

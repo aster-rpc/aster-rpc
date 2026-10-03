@@ -327,9 +327,10 @@ public class ConformanceTests
         var connC = await epC.ConnectAsync(epAId, ALPN, cts.Token);
         var connA2 = await acceptTask2;
 
-        // Both connections should have independent handles
+        // Both connections accepted on A must have independent handles. (connB
+        // and connC live in different runtimes; handles are runtime-scoped, so
+        // comparing them is meaningless — both are typically 1.)
         Assert.NotEqual(connA1.Handle.Value, connA2.Handle.Value);
-        Assert.NotEqual(connB.Handle.Value, connC.Handle.Value);
 
         // Close all
         connB.Close();
@@ -368,13 +369,14 @@ public class ConformanceTests
         var (sendB, recvB) = await connB.OpenBiAsync(cts.Token);
         events.Add(("open_bi", 20)); // StreamOpened
 
-        var (sendA, recvA) = await connA.AcceptBiAsync(cts.Token);
-        events.Add(("accept_bi", 21)); // StreamAccepted
-
-        // Send and receive data
+        // QUIC only announces a stream to the peer once data is sent on it,
+        // so the opener must write before the acceptor's accept_bi can complete.
         byte[] data = Encoding.UTF8.GetBytes("test");
         await sendB.SendAsync(data, cts.Token);
         events.Add(("send", 23)); // SendCompleted
+
+        var (sendA, recvA) = await connA.AcceptBiAsync(cts.Token);
+        events.Add(("accept_bi", 21)); // StreamAccepted
 
         byte[] received = await recvA.ReadAsync(4096, cts.Token);
         events.Add(("read", 22)); // FrameReceived

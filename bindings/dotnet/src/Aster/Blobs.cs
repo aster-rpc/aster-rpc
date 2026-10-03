@@ -22,8 +22,8 @@ public sealed class Blobs
         GCHandle pin = GCHandle.Alloc(data, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_blobs_add_bytes(_runtime.Handle, _nodeHandle, pin.AddrOfPinnedObject(), (UIntPtr)data.Length, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_blobs_add_bytes");
+            int r = Native.aster_blobs_add_bytes(_runtime.Handle, _nodeHandle, Bytes.FromPinned(pin, data.Length), 0, out ulong opId);
+            if (r != 0) throw IrohException.FromStatus(r, "aster_blobs_add_bytes");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.BlobAdded) throw new IrohException($"add_bytes: unexpected event {ev.kind}");
             // hash is in data_ptr, size is in related
@@ -46,8 +46,8 @@ public sealed class Blobs
         GCHandle pin = GCHandle.Alloc(hashBytes, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_blobs_read(_runtime.Handle, _nodeHandle, pin.AddrOfPinnedObject(), (UIntPtr)hashBytes.Length, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_blobs_read");
+            int r = Native.aster_blobs_read(_runtime.Handle, _nodeHandle, Bytes.FromPinned(pin, hashBytes.Length), 0, out ulong opId);
+            if (r != 0) throw IrohException.FromStatus(r, "aster_blobs_read");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.BlobRead) throw new IrohException($"read: unexpected event {ev.kind}");
             byte[] result = Array.Empty<byte>();
@@ -68,8 +68,8 @@ public sealed class Blobs
         GCHandle pin = GCHandle.Alloc(ticketBytes, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_blobs_download(_runtime.Handle, _nodeHandle, pin.AddrOfPinnedObject(), (UIntPtr)ticketBytes.Length, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_blobs_download");
+            int r = Native.aster_blobs_download(_runtime.Handle, _nodeHandle, Bytes.FromPinned(pin, ticketBytes.Length), 0, out ulong opId);
+            if (r != 0) throw IrohException.FromStatus(r, "aster_blobs_download");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.BlobDownloaded) throw new IrohException($"download: unexpected event {ev.kind}");
             string hash = string.Empty;

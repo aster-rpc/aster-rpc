@@ -7,13 +7,12 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"unsafe"
 )
@@ -28,22 +27,22 @@ type Connection struct {
 // OpenBi opens a bidirectional stream on this connection.
 // Returns send and receive streams as a pair.
 func (c *Connection) OpenBi(ctx context.Context) (*SendStream, *RecvStream, error) {
-	var opID C.iroh_operation_t
-	r := C.iroh_open_bi(
+	var opID C.aster_operation_t
+	r := C.aster_open_bi(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		0,
 		&opID,
 	)
 	if r != 0 {
-		return nil, nil, fmt.Errorf("iroh_open_bi: %w", Error(r))
+		return nil, nil, fmt.Errorf("aster_open_bi: %w", Error(r))
 	}
 
 	ev, err := c.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, nil, fmt.Errorf("open bi poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_STREAM_OPENED {
+	if ev.Kind != ASTER_EVENT_STREAM_OPENED {
 		return nil, nil, fmt.Errorf("open bi: unexpected event %d", ev.Kind)
 	}
 
@@ -54,22 +53,22 @@ func (c *Connection) OpenBi(ctx context.Context) (*SendStream, *RecvStream, erro
 
 // AcceptBi accepts a bidirectional stream offered by the remote peer.
 func (c *Connection) AcceptBi(ctx context.Context) (*SendStream, *RecvStream, error) {
-	var opID C.iroh_operation_t
-	r := C.iroh_accept_bi(
+	var opID C.aster_operation_t
+	r := C.aster_accept_bi(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		0,
 		&opID,
 	)
 	if r != 0 {
-		return nil, nil, fmt.Errorf("iroh_accept_bi: %w", Error(r))
+		return nil, nil, fmt.Errorf("aster_accept_bi: %w", Error(r))
 	}
 
 	ev, err := c.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, nil, fmt.Errorf("accept bi poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_STREAM_ACCEPTED {
+	if ev.Kind != ASTER_EVENT_STREAM_ACCEPTED {
 		return nil, nil, fmt.Errorf("accept bi: unexpected event %d", ev.Kind)
 	}
 
@@ -81,22 +80,22 @@ func (c *Connection) AcceptBi(ctx context.Context) (*SendStream, *RecvStream, er
 // OpenUni opens a unidirectional send stream on this connection.
 // Returns only a SendStream; the remote end receives via AcceptUni.
 func (c *Connection) OpenUni(ctx context.Context) (*SendStream, error) {
-	var opID C.iroh_operation_t
-	r := C.iroh_open_uni(
+	var opID C.aster_operation_t
+	r := C.aster_open_uni(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		0,
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_open_uni: %w", Error(r))
+		return nil, fmt.Errorf("aster_open_uni: %w", Error(r))
 	}
 
 	ev, err := c.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("open uni poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_STREAM_OPENED {
+	if ev.Kind != ASTER_EVENT_STREAM_OPENED {
 		return nil, fmt.Errorf("open uni: unexpected event %d", ev.Kind)
 	}
 
@@ -106,22 +105,22 @@ func (c *Connection) OpenUni(ctx context.Context) (*SendStream, error) {
 // AcceptUni accepts a unidirectional stream offered by the remote peer.
 // Returns a RecvStream for reading.
 func (c *Connection) AcceptUni(ctx context.Context) (*RecvStream, error) {
-	var opID C.iroh_operation_t
-	r := C.iroh_accept_uni(
+	var opID C.aster_operation_t
+	r := C.aster_accept_uni(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		0,
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_accept_uni: %w", Error(r))
+		return nil, fmt.Errorf("aster_accept_uni: %w", Error(r))
 	}
 
 	ev, err := c.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("accept uni poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_STREAM_ACCEPTED {
+	if ev.Kind != ASTER_EVENT_STREAM_ACCEPTED {
 		return nil, fmt.Errorf("accept uni: unexpected event %d", ev.Kind)
 	}
 
@@ -130,17 +129,17 @@ func (c *Connection) AcceptUni(ctx context.Context) (*RecvStream, error) {
 
 // SendDatagram sends a datagram on this connection.
 func (c *Connection) SendDatagram(data []byte) error {
-	bytes := C.struct_iroh_bytes_t{
+	bytes := C.struct_aster_bytes_t{
 		ptr: (*C.uint8_t)(unsafe.Pointer(&data[0])),
 		len: C.uintptr_t(len(data)),
 	}
-	r := C.iroh_connection_send_datagram(
+	r := C.aster_connection_send_datagram(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		bytes,
 	)
 	if r != 0 {
-		return fmt.Errorf("iroh_connection_send_datagram: %w", Error(r))
+		return fmt.Errorf("aster_connection_send_datagram: %w", Error(r))
 	}
 	return nil
 }
@@ -148,22 +147,22 @@ func (c *Connection) SendDatagram(data []byte) error {
 // ReadDatagram reads a datagram on this connection.
 // Returns the datagram bytes.
 func (c *Connection) ReadDatagram(ctx context.Context) ([]byte, error) {
-	var opID C.iroh_operation_t
-	r := C.iroh_connection_read_datagram(
+	var opID C.aster_operation_t
+	r := C.aster_connection_read_datagram(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		0,
 		&opID,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_connection_read_datagram: %w", Error(r))
+		return nil, fmt.Errorf("aster_connection_read_datagram: %w", Error(r))
 	}
 
 	ev, err := c.runtime.Poll(ctx, uint64(opID))
 	if err != nil {
 		return nil, fmt.Errorf("read datagram poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_BYTES_RESULT {
+	if ev.Kind != ASTER_EVENT_BYTES_RESULT {
 		return nil, fmt.Errorf("read datagram: unexpected event %d", ev.Kind)
 	}
 
@@ -178,24 +177,24 @@ func (c *Connection) ReadDatagram(ctx context.Context) ([]byte, error) {
 
 // Close closes this connection with an optional reason string.
 func (c *Connection) Close(reason string) error {
-	var bytes C.struct_iroh_bytes_t
+	var bytes C.struct_aster_bytes_t
 	if len(reason) > 0 {
 		reasonBytes := []byte(reason)
 		cBuf := C.malloc(C.size_t(len(reasonBytes)))
 		C.memcpy(cBuf, unsafe.Pointer(&reasonBytes[0]), C.size_t(len(reasonBytes)))
-		bytes = C.struct_iroh_bytes_t{
+		bytes = C.struct_aster_bytes_t{
 			ptr: (*C.uint8_t)(cBuf),
 			len: C.uintptr_t(len(reasonBytes)),
 		}
 	}
-	r := C.iroh_connection_close(
+	r := C.aster_connection_close(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		0,
 		bytes,
 	)
 	if r != 0 {
-		return fmt.Errorf("iroh_connection_close: %w", Error(r))
+		return fmt.Errorf("aster_connection_close: %w", Error(r))
 	}
 	return nil
 }
@@ -212,37 +211,25 @@ type ConnectionInfo struct {
 
 // Info returns metadata about this connection.
 func (c *Connection) Info() (*ConnectionInfo, error) {
-	var info C.iroh_connection_info_t
-	info.struct_size = 48
+	var info C.aster_connection_info_t
+	info.struct_size = C.uint32_t(unsafe.Sizeof(info))
 
-	r := C.iroh_connection_info(
+	r := C.aster_connection_info(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		&info,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_connection_info: %w", Error(r))
+		return nil, fmt.Errorf("aster_connection_info: %w", Error(r))
 	}
 
-	// The alpn field is an iroh_bytes_t { ptr, len } embedded in the struct.
-	// We need to read it from the C struct memory layout.
-	// struct iroh_connection_info_t {
-	//   uint32_t struct_size;       // offset 0
-	//   uint32_t connection_type;    // offset 4
-	//   uint64_t bytes_sent;        // offset 8
-	//   uint64_t bytes_received;    // offset 16
-	//   uint64_t rtt_ns;           // offset 24
-	//   struct iroh_bytes_t alpn;  // offset 32 (ptr at +0, len at +8)
-	//   uint32_t is_connected;     // offset 48
-	// }
-	//
-	// But we can't safely read C struct fields from Go.
-	// Instead, use the synchronous info-returning functions.
-	// For now, return what we can.
-	_ = info // info is populated by the C call; read via sync FFI if needed.
-
 	ci := &ConnectionInfo{
-		// These fields require reading the C struct — add accessor FFI or parse here.
+		ConnectionType: uint32(info.connection_type),
+		BytesSent:      uint64(info.bytes_sent),
+		BytesReceived:  uint64(info.bytes_received),
+		RTTNs:          uint64(info.rtt_ns),
+		ALPN:           string(takeRustBytes(info.alpn)), // Rust-owned
+		IsConnected:    info.is_connected != 0,
 	}
 	return ci, nil
 }
@@ -251,14 +238,14 @@ func (c *Connection) Info() (*ConnectionInfo, error) {
 func (c *Connection) MaxDatagramSize() (uint64, bool, error) {
 	var size C.uint64_t
 	var isSome C.uint32_t
-	r := C.iroh_connection_max_datagram_size(
+	r := C.aster_connection_max_datagram_size(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		&size,
 		&isSome,
 	)
 	if r != 0 {
-		return 0, false, fmt.Errorf("iroh_connection_max_datagram_size: %w", Error(r))
+		return 0, false, fmt.Errorf("aster_connection_max_datagram_size: %w", Error(r))
 	}
 	return uint64(size), isSome != 0, nil
 }
@@ -267,7 +254,7 @@ func (c *Connection) MaxDatagramSize() (uint64, bool, error) {
 func (c *Connection) RemoteID() (string, error) {
 	var buf [64]byte
 	var len C.uintptr_t
-	r := C.iroh_connection_remote_id(
+	r := C.aster_connection_remote_id(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
@@ -275,22 +262,22 @@ func (c *Connection) RemoteID() (string, error) {
 		&len,
 	)
 	if r != 0 {
-		return "", fmt.Errorf("iroh_connection_remote_id: %w", Error(r))
+		return "", fmt.Errorf("aster_connection_remote_id: %w", Error(r))
 	}
-	return hex.EncodeToString(buf[:int(len)]), nil
+	return string(buf[:int(len)]), nil // already hex text
 }
 
 // OnClosed returns a channel that receives when the connection is closed.
 func (c *Connection) OnClosed(ctx context.Context) error {
-	var opID C.iroh_operation_t
-	r := C.iroh_connection_closed(
+	var opID C.aster_operation_t
+	r := C.aster_connection_closed(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		0,
 		&opID,
 	)
 	if r != 0 {
-		return fmt.Errorf("iroh_connection_closed: %w", Error(r))
+		return fmt.Errorf("aster_connection_closed: %w", Error(r))
 	}
 
 	_, err := c.runtime.Poll(ctx, uint64(opID))
@@ -303,13 +290,13 @@ func (c *Connection) OnClosed(ctx context.Context) error {
 // DatagramBufferSpace returns the available send buffer space for datagrams.
 func (c *Connection) DatagramBufferSpace() (uint64, error) {
 	var bytes C.uint64_t
-	r := C.iroh_connection_datagram_send_buffer_space(
+	r := C.aster_connection_datagram_send_buffer_space(
 		C.uint64_t(c.runtime.handle),
 		C.uint64_t(c.handle),
 		&bytes,
 	)
 	if r != 0 {
-		return 0, fmt.Errorf("iroh_connection_datagram_send_buffer_space: %w", Error(r))
+		return 0, fmt.Errorf("aster_connection_datagram_send_buffer_space: %w", Error(r))
 	}
 	return uint64(bytes), nil
 }

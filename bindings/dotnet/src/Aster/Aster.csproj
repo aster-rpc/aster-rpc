@@ -18,9 +18,12 @@
     <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
-  <!-- Native library configuration -->
+  <!-- Native library configuration. Override with -p:NativeLibraryPath=...;
+       defaults to target/release, falling back to target/debug. -->
   <PropertyGroup>
-    <NativeLibraryPath Condition="'$(NativeLibraryPath)' == ''">$(MSBuildThisFileDirectory)../../../../target/release</NativeLibraryPath>
+    <AsterTargetDir>$(MSBuildThisFileDirectory)../../../../target</AsterTargetDir>
+    <NativeLibraryPath Condition="'$(NativeLibraryPath)' == '' And (Exists('$(AsterTargetDir)/release/libaster_transport_ffi.dylib') Or Exists('$(AsterTargetDir)/release/libaster_transport_ffi.so') Or Exists('$(AsterTargetDir)/release/aster_transport_ffi.dll'))">$(AsterTargetDir)/release</NativeLibraryPath>
+    <NativeLibraryPath Condition="'$(NativeLibraryPath)' == ''">$(AsterTargetDir)/debug</NativeLibraryPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -33,7 +36,11 @@
     <None Include="$(NativeLibraryPath)/aster_transport_ffi.dll" Condition="Exists('$(NativeLibraryPath)/aster_transport_ffi.dll')" Link="aster_transport_ffi.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="$(MSBuildThisFileDirectory)../../../../ffi_spec/iroh_bridge.h" Link="iroh_bridge.h" />
+    <None Include="$(MSBuildThisFileDirectory)../../../../ffi/aster_ffi.h" Link="aster_ffi.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Aster.Tests" />
   </ItemGroup>
 
   <ItemGroup>

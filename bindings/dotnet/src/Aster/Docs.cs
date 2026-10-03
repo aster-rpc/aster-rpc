@@ -31,12 +31,12 @@ public sealed class Doc : IDisposable
         GCHandle valuePin = GCHandle.Alloc(value, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_doc_set_bytes(_runtime.Handle, _handle,
-                authorPin.AddrOfPinnedObject(), (UIntPtr)authorBytes.Length,
-                keyPin.AddrOfPinnedObject(), (UIntPtr)keyBytes.Length,
-                valuePin.AddrOfPinnedObject(), (UIntPtr)value.Length,
+            int r = Native.aster_doc_set_bytes(_runtime.Handle, _handle,
+                Bytes.FromPinned(authorPin, authorBytes.Length),
+                Bytes.FromPinned(keyPin, keyBytes.Length),
+                Bytes.FromPinned(valuePin, value.Length),
                 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_doc_set_bytes");
+            if (r != 0) throw IrohException.FromStatus(r, "aster_doc_set_bytes");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.DocSet) throw new IrohException($"set_bytes: unexpected event {ev.kind}");
         }
@@ -51,11 +51,11 @@ public sealed class Doc : IDisposable
         GCHandle keyPin = GCHandle.Alloc(keyBytes, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_doc_get_exact(_runtime.Handle, _handle,
-                authorPin.AddrOfPinnedObject(), (UIntPtr)authorBytes.Length,
-                keyPin.AddrOfPinnedObject(), (UIntPtr)keyBytes.Length,
+            int r = Native.aster_doc_get_exact(_runtime.Handle, _handle,
+                Bytes.FromPinned(authorPin, authorBytes.Length),
+                Bytes.FromPinned(keyPin, keyBytes.Length),
                 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_doc_get_exact");
+            if (r != 0) throw IrohException.FromStatus(r, "aster_doc_get_exact");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.DocGet) throw new IrohException($"get_exact: unexpected event {ev.kind}");
             byte[] result = Array.Empty<byte>();
@@ -70,10 +70,11 @@ public sealed class Doc : IDisposable
         finally { authorPin.Free(); keyPin.Free(); }
     }
 
+    /// <param name="mode">aster_doc_share_mode_t: 0 = read, 1 = write (other values are rejected).</param>
     public async Task<string> ShareAsync(uint mode = 0, CancellationToken ct = default)
     {
-        int r = Native.iroh_doc_share(_runtime.Handle, _handle, mode, 0, out ulong opId);
-        if (r != 0) throw IrohException.FromStatus(r, "iroh_doc_share");
+        int r = Native.aster_doc_share(_runtime.Handle, _handle, mode, 0, out ulong opId);
+        if (r != 0) throw IrohException.FromStatus(r, "aster_doc_share");
         Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
         if (ev.kind != (uint)EventKind.DocShared) throw new IrohException($"share: unexpected event {ev.kind}");
         string ticket = string.Empty;
@@ -91,7 +92,7 @@ public sealed class Doc : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        Native.iroh_doc_free(_runtime.Handle, _handle);
+        Native.aster_doc_free(_runtime.Handle, _handle);
     }
 }
 
@@ -108,8 +109,8 @@ public sealed class Docs
 
     public async Task<Doc> CreateAsync(CancellationToken ct = default)
     {
-        int r = Native.iroh_docs_create(_runtime.Handle, _nodeHandle, 0, out ulong opId);
-        if (r != 0) throw IrohException.FromStatus(r, "iroh_docs_create");
+        int r = Native.aster_docs_create(_runtime.Handle, _nodeHandle, 0, out ulong opId);
+        if (r != 0) throw IrohException.FromStatus(r, "aster_docs_create");
         Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
         if (ev.kind != (uint)EventKind.DocCreated) throw new IrohException($"create: unexpected event {ev.kind}");
         return new Doc(_runtime, ev.handle);
@@ -117,8 +118,8 @@ public sealed class Docs
 
     public async Task<string> CreateAuthorAsync(CancellationToken ct = default)
     {
-        int r = Native.iroh_docs_create_author(_runtime.Handle, _nodeHandle, 0, out ulong opId);
-        if (r != 0) throw IrohException.FromStatus(r, "iroh_docs_create_author");
+        int r = Native.aster_docs_create_author(_runtime.Handle, _nodeHandle, 0, out ulong opId);
+        if (r != 0) throw IrohException.FromStatus(r, "aster_docs_create_author");
         Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
         if (ev.kind != (uint)EventKind.AuthorCreated) throw new IrohException($"create_author: unexpected event {ev.kind}");
         string authorId = string.Empty;
@@ -138,8 +139,8 @@ public sealed class Docs
         GCHandle pin = GCHandle.Alloc(ticketBytes, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_docs_join(_runtime.Handle, _nodeHandle, pin.AddrOfPinnedObject(), (UIntPtr)ticketBytes.Length, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_docs_join");
+            int r = Native.aster_docs_join(_runtime.Handle, _nodeHandle, Bytes.FromPinned(pin, ticketBytes.Length), 0, out ulong opId);
+            if (r != 0) throw IrohException.FromStatus(r, "aster_docs_join");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.DocJoined) throw new IrohException($"join: unexpected event {ev.kind}");
             return new Doc(_runtime, ev.handle);

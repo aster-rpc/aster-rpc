@@ -137,11 +137,11 @@ public final class AsterCall implements AutoCloseable {
   /**
    * Acquire a call handle from the given connection's multiplexed stream pool.
    *
-   * @param runtimeHandle the {@code iroh_runtime_t} handle
-   * @param connectionHandle the {@code iroh_connection_t} handle
+   * @param runtimeHandle the {@code aster_runtime_t} handle
+   * @param connectionHandle the {@code aster_connection_t} handle
    * @param sessionId session id (0 = SHARED pool; non-zero = session-bound pool)
    * @throws StreamAcquireException mapped from {@code ASTER_CALL_ERR_*} subcodes
-   * @throws IrohException mapped from generic {@code iroh_status_t} codes
+   * @throws IrohException mapped from generic {@code aster_status_t} codes
    */
   public static AsterCall acquire(long runtimeHandle, long connectionHandle, int sessionId) {
     try (Arena arena = Arena.ofConfined()) {
@@ -169,11 +169,11 @@ public final class AsterCall implements AutoCloseable {
    * {@code StreamHeader} it sends itself. Omitted from the signature to make the "no pool
    * involvement" intent unambiguous.
    *
-   * @param runtimeHandle the {@code iroh_runtime_t} handle
-   * @param connectionHandle the {@code iroh_connection_t} handle
+   * @param runtimeHandle the {@code aster_runtime_t} handle
+   * @param connectionHandle the {@code aster_connection_t} handle
    * @throws StreamAcquireException mapped from {@code ASTER_CALL_ERR_*} subcodes (rare — streaming
    *     substreams only fail on QUIC-ceiling or transport errors)
-   * @throws IrohException mapped from generic {@code iroh_status_t} codes
+   * @throws IrohException mapped from generic {@code aster_status_t} codes
    */
   public static AsterCall acquireStreaming(long runtimeHandle, long connectionHandle) {
     try (Arena arena = Arena.ofConfined()) {
@@ -364,8 +364,8 @@ public final class AsterCall implements AutoCloseable {
    * arrives. Replaces the acquire→send_frame→send_frame→recv_frame→recv_frame→release sequence (6
    * hops) with a single FFI call.
    *
-   * @param runtimeHandle the {@code iroh_runtime_t} handle
-   * @param connectionHandle the {@code iroh_connection_t} handle
+   * @param runtimeHandle the {@code aster_runtime_t} handle
+   * @param connectionHandle the {@code aster_connection_t} handle
    * @param sessionId session id (0 = SHARED pool; non-zero = session-bound pool)
    * @param requestPair pre-framed bytes — the StreamHeader frame concatenated with the request
    *     frame (each is {@code [4B LE len][1B flags][payload]})

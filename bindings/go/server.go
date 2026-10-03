@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 )
@@ -37,17 +38,30 @@ type ServerConfig struct {
 	ExtraALPNs []string
 	// PollBatchSize is the max calls to drain per poll (default 32).
 	PollBatchSize int
+	// OnConnectionClosed, if set, is invoked on the poll goroutine for each
+	// ASTER_REACTOR_EVENT_CONNECTION_CLOSED so per-connection state can be
+	// dropped. Must not block.
+	OnConnectionClosed func(connectionID uint64, peerID string)
+	// OnSubmitError, if set, receives errors from submitting a handler's
+	// response (e.g. the call's response channel closed while waiting for
+	// capacity). Defaults to logging via the standard logger.
+	OnSubmitError func(call ReactorCall, err error)
 }
 
 // Server is a high-level Aster RPC server.
 // It creates a node, attaches a reactor, and runs a poll loop
 // that dispatches incoming calls to the configured handler.
 type Server struct {
-	node    *Node
-	reactor *Reactor
-	handler CallHandler
-	running atomic.Bool
-	wg      sync.WaitGroup
+	node        *Node
+	reactor     *Reactor
+	handler     CallHandler
+	onClosed    func(connectionID uint64, peerID string)
+	onSubmitErr func(call ReactorCall, err error)
+	ctx         context.Context
+	cancel      context.CancelFunc
+	calls       sync.WaitGroup
+	running     atomic.Bool
+	wg          sync.WaitGroup
 
 	pollBatch int
 }
@@ -83,11 +97,22 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("create reactor: %w", err)
 	}
 
+	onSubmitErr := cfg.OnSubmitError
+	if onSubmitErr == nil {
+		onSubmitErr = func(call ReactorCall, err error) {
+			log.Printf("aster: submit response for call %d failed: %v", call.CallID, err)
+		}
+	}
+	sctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
-		node:      node,
-		reactor:   reactor,
-		handler:   cfg.Handler,
-		pollBatch: cfg.PollBatchSize,
+		node:        node,
+		reactor:     reactor,
+		handler:     cfg.Handler,
+		onClosed:    cfg.OnConnectionClosed,
+		onSubmitErr: onSubmitErr,
+		ctx:         sctx,
+		cancel:      cancel,
+		pollBatch:   cfg.PollBatchSize,
 	}
 	s.running.Store(true)
 
@@ -112,7 +137,11 @@ func (s *Server) Close() error {
 	if !s.running.Swap(false) {
 		return nil
 	}
+	// Abort submits blocked on response capacity (the poll loop that would
+	// wake them is stopping), then wait for the poll loop and handlers.
+	s.cancel()
 	s.wg.Wait()
+	s.calls.Wait()
 
 	var firstErr error
 	if err := s.reactor.Close(); err != nil && firstErr == nil {
@@ -128,18 +157,30 @@ func (s *Server) pollLoop() {
 	defer s.wg.Done()
 
 	for s.running.Load() {
-		calls, err := s.reactor.Poll(s.pollBatch, 100)
+		// Poll also delivers RESPONSE_WRITABLE/RESPONSE_CLOSED events to
+		// handler goroutines blocked in SubmitContext on QUEUE_FULL.
+		events, err := s.reactor.Poll(s.pollBatch, 100)
 		if err != nil {
 			continue
 		}
 
-		for _, call := range calls {
-			// Dispatch each call in its own goroutine.
-			c := call
-			go func() {
-				resp := s.handler(c)
-				s.reactor.Submit(c.CallID, resp)
-			}()
+		for _, ev := range events {
+			switch ev.Kind {
+			case ReactorEventConnectionClosed:
+				if s.onClosed != nil {
+					s.onClosed(ev.ConnectionID, ev.PeerID)
+				}
+			case ReactorEventCall:
+				c := ev
+				s.calls.Add(1)
+				go func() {
+					defer s.calls.Done()
+					resp := s.handler(c)
+					if err := s.reactor.SubmitContext(s.ctx, c.CallID, resp); err != nil {
+						s.onSubmitErr(c, err)
+					}
+				}()
+			}
 		}
 	}
 }

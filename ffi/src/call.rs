@@ -43,8 +43,8 @@ use aster_transport_core::{
 };
 
 use crate::{
-    iroh_buffer_t, iroh_connection_t, iroh_runtime_t, iroh_status_t, load_runtime, BufferRegistry,
-    HandleRegistry,
+    aster_buffer_t, aster_connection_t, aster_runtime_t, aster_status_t, load_runtime,
+    BufferRegistry, HandleRegistry,
 };
 
 // ============================================================================
@@ -203,16 +203,16 @@ fn map_acquire_error(err: AcquireError) -> i32 {
 /// Blocks (on the FFI thread, via `block_on`) up to the pool's
 /// configured `stream_acquire_timeout`. On success, writes a non-zero
 /// call handle to `*out_call`. On failure, returns one of the
-/// `ASTER_CALL_ERR_*` codes (negative) or an `iroh_status_t` code.
+/// `ASTER_CALL_ERR_*` codes (negative) or an `aster_status_t` code.
 #[no_mangle]
 pub unsafe extern "C" fn aster_call_acquire(
-    runtime: iroh_runtime_t,
-    connection: iroh_connection_t,
+    runtime: aster_runtime_t,
+    connection: aster_connection_t,
     session_id: u32,
     out_call: *mut aster_call_t,
 ) -> i32 {
     if out_call.is_null() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
 
     let bridge = match load_runtime(runtime) {
@@ -222,7 +222,7 @@ pub unsafe extern "C" fn aster_call_acquire(
 
     let conn = match bridge.connections.get(connection) {
         Some(c) => c,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let key = pool_key_for(session_id);
@@ -238,7 +238,7 @@ pub unsafe extern "C" fn aster_call_acquire(
             };
             let id = CALLS.insert(state);
             unsafe { ptr::write(out_call, id) };
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         }
         Err(e) => map_acquire_error(e),
     }
@@ -259,12 +259,12 @@ pub unsafe extern "C" fn aster_call_acquire(
 /// the signature to make the "no pool involvement" intent unambiguous.
 #[no_mangle]
 pub unsafe extern "C" fn aster_call_acquire_streaming(
-    runtime: iroh_runtime_t,
-    connection: iroh_connection_t,
+    runtime: aster_runtime_t,
+    connection: aster_connection_t,
     out_call: *mut aster_call_t,
 ) -> i32 {
     if out_call.is_null() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
 
     let bridge = match load_runtime(runtime) {
@@ -274,7 +274,7 @@ pub unsafe extern "C" fn aster_call_acquire_streaming(
 
     let conn = match bridge.connections.get(connection) {
         Some(c) => c,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let opened = bridge
@@ -289,7 +289,7 @@ pub unsafe extern "C" fn aster_call_acquire_streaming(
             };
             let id = CALLS.insert(state);
             unsafe { ptr::write(out_call, id) };
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         }
         Err(_) => ASTER_CALL_ERR_STREAM_OPEN_FAILED,
     }
@@ -306,7 +306,7 @@ pub unsafe extern "C" fn aster_call_acquire_streaming(
 /// completes.
 #[no_mangle]
 pub unsafe extern "C" fn aster_call_send_frame(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     call: aster_call_t,
     frame_ptr: *const u8,
     frame_len: u32,
@@ -318,12 +318,12 @@ pub unsafe extern "C" fn aster_call_send_frame(
 
     let state = match CALLS.get(call) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let send = match clone_send(&state) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let frame = if frame_ptr.is_null() || frame_len == 0 {
@@ -333,7 +333,7 @@ pub unsafe extern "C" fn aster_call_send_frame(
     };
 
     if frame.is_empty() {
-        return iroh_status_t::IROH_STATUS_OK as i32;
+        return aster_status_t::ASTER_STATUS_OK as i32;
     }
 
     let result = bridge
@@ -342,9 +342,9 @@ pub unsafe extern "C" fn aster_call_send_frame(
         .block_on(async move { send.write_all(frame).await });
 
     if result.is_err() {
-        return iroh_status_t::IROH_STATUS_INTERNAL as i32;
+        return aster_status_t::ASTER_STATUS_INTERNAL as i32;
     }
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 /// Pull the next response frame on a call. Blocks up to `timeout_ms`
@@ -365,24 +365,24 @@ pub unsafe extern "C" fn aster_call_send_frame(
 /// QUIC recv side has closed; further recvs will keep returning EOF.
 /// The binding should release/discard the call.
 ///
-/// Negative return values are `iroh_status_t` error codes.
+/// Negative return values are `aster_status_t` error codes.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn aster_call_recv_frame(
-    runtime: iroh_runtime_t,
+    runtime: aster_runtime_t,
     call: aster_call_t,
     timeout_ms: u32,
     out_payload_ptr: *mut *const u8,
     out_payload_len: *mut u32,
     out_flags: *mut u8,
-    out_buffer_id: *mut iroh_buffer_t,
+    out_buffer_id: *mut aster_buffer_t,
 ) -> i32 {
     if out_payload_ptr.is_null()
         || out_payload_len.is_null()
         || out_flags.is_null()
         || out_buffer_id.is_null()
     {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
 
     let bridge = match load_runtime(runtime) {
@@ -392,12 +392,12 @@ pub unsafe extern "C" fn aster_call_recv_frame(
 
     let state = match CALLS.get(call) {
         Some(s) => s,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let recv = match clone_recv(&state) {
         Some(r) => r,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let result = bridge.runtime.handle().block_on(async move {
@@ -425,7 +425,7 @@ pub unsafe extern "C" fn aster_call_recv_frame(
         }
         Err(RecvErr::Eof) => ASTER_CALL_RECV_END_OF_STREAM,
         Err(RecvErr::Timeout) => ASTER_CALL_RECV_TIMEOUT,
-        Err(RecvErr::Invalid) => iroh_status_t::IROH_STATUS_INTERNAL as i32,
+        Err(RecvErr::Invalid) => aster_status_t::ASTER_STATUS_INTERNAL as i32,
     }
 }
 
@@ -438,7 +438,7 @@ pub unsafe extern "C" fn aster_call_recv_frame(
 /// bytes on the recv side would corrupt the next call that reuses
 /// the stream — the binding MUST drain to the trailer first.
 #[no_mangle]
-pub unsafe extern "C" fn aster_call_release(runtime: iroh_runtime_t, call: aster_call_t) -> i32 {
+pub unsafe extern "C" fn aster_call_release(runtime: aster_runtime_t, call: aster_call_t) -> i32 {
     let _ = runtime;
     match CALLS.remove(call) {
         Some(state) => {
@@ -446,9 +446,9 @@ pub unsafe extern "C" fn aster_call_release(runtime: iroh_runtime_t, call: aster
             // the pool (unless poisoned). For Streaming, the substream
             // just closes — there's no pool to return to.
             let _ = state.stream.lock().unwrap().take();
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         }
-        None => iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     }
 }
 
@@ -463,16 +463,16 @@ pub unsafe extern "C" fn aster_call_release(runtime: iroh_runtime_t, call: aster
 /// - The recv side returned `ASTER_CALL_RECV_END_OF_STREAM` before
 ///   the trailer was seen.
 #[no_mangle]
-pub unsafe extern "C" fn aster_call_discard(runtime: iroh_runtime_t, call: aster_call_t) -> i32 {
+pub unsafe extern "C" fn aster_call_discard(runtime: aster_runtime_t, call: aster_call_t) -> i32 {
     let _ = runtime;
     match CALLS.remove(call) {
         Some(state) => {
             if let Some(stream) = state.stream.lock().unwrap().take() {
                 stream.discard();
             }
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         }
-        None => iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     }
 }
 
@@ -480,12 +480,12 @@ pub unsafe extern "C" fn aster_call_discard(runtime: iroh_runtime_t, call: aster
 /// buffer id returned by recv MUST be released exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn aster_call_buffer_release(
-    runtime: iroh_runtime_t,
-    buffer: iroh_buffer_t,
+    runtime: aster_runtime_t,
+    buffer: aster_buffer_t,
 ) -> i32 {
     let _ = runtime;
     CALL_BUFFERS.release(buffer);
-    iroh_status_t::IROH_STATUS_OK as i32
+    aster_status_t::ASTER_STATUS_OK as i32
 }
 
 /// Unary fast-path (spec §8). Collapses
@@ -520,23 +520,23 @@ pub unsafe extern "C" fn aster_call_buffer_release(
 /// returned. Skipped row-schema frames are released internally.
 ///
 /// On error returns the appropriate `ASTER_CALL_ERR_*` (acquire failure)
-/// or `IROH_STATUS_INTERNAL` (transport / framing failure); no out
+/// or `ASTER_STATUS_INTERNAL` (transport / framing failure); no out
 /// parameters are populated. The pool slot is freed on every error path.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn aster_call_unary(
-    runtime: iroh_runtime_t,
-    connection: iroh_connection_t,
+    runtime: aster_runtime_t,
+    connection: aster_connection_t,
     session_id: u32,
     request_pair_ptr: *const u8,
     request_pair_len: u32,
     out_response_ptr: *mut *const u8,
     out_response_len: *mut u32,
     out_response_flags: *mut u8,
-    out_response_buffer: *mut iroh_buffer_t,
+    out_response_buffer: *mut aster_buffer_t,
     out_trailer_ptr: *mut *const u8,
     out_trailer_len: *mut u32,
-    out_trailer_buffer: *mut iroh_buffer_t,
+    out_trailer_buffer: *mut aster_buffer_t,
 ) -> i32 {
     if out_response_ptr.is_null()
         || out_response_len.is_null()
@@ -546,7 +546,7 @@ pub unsafe extern "C" fn aster_call_unary(
         || out_trailer_len.is_null()
         || out_trailer_buffer.is_null()
     {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
 
     let bridge = match load_runtime(runtime) {
@@ -556,7 +556,7 @@ pub unsafe extern "C" fn aster_call_unary(
 
     let conn = match bridge.connections.get(connection) {
         Some(c) => c,
-        None => return iroh_status_t::IROH_STATUS_NOT_FOUND as i32,
+        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
     let request_pair = if request_pair_ptr.is_null() || request_pair_len == 0 {
@@ -566,7 +566,7 @@ pub unsafe extern "C" fn aster_call_unary(
     };
 
     if request_pair.is_empty() {
-        return iroh_status_t::IROH_STATUS_INVALID_ARGUMENT as i32;
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
 
     let key = pool_key_for(session_id);
@@ -687,10 +687,10 @@ pub unsafe extern "C" fn aster_call_unary(
                     ptr::write(out_trailer_buffer, trailer_buf_id);
                 }
             }
-            iroh_status_t::IROH_STATUS_OK as i32
+            aster_status_t::ASTER_STATUS_OK as i32
         }
         Err(UnaryErr::Acquire(e)) => map_acquire_error(e),
-        Err(UnaryErr::Transport) => iroh_status_t::IROH_STATUS_INTERNAL as i32,
+        Err(UnaryErr::Transport) => aster_status_t::ASTER_STATUS_INTERNAL as i32,
     }
 }
 

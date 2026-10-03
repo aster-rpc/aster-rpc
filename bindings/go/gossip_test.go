@@ -3,7 +3,9 @@
 package aster
 
 import (
+	"encoding/binary"
 	"testing"
+	"unsafe"
 )
 
 func TestGossipPeer(t *testing.T) {
@@ -51,23 +53,23 @@ func TestGossipTopic(t *testing.T) {
 }
 
 func TestGossipEventConstants(t *testing.T) {
-	if IROH_EVENT_GOSSIP_SUBSCRIBED != 50 {
-		t.Errorf("IROH_EVENT_GOSSIP_SUBSCRIBED = %d, want 50", IROH_EVENT_GOSSIP_SUBSCRIBED)
+	if ASTER_EVENT_GOSSIP_SUBSCRIBED != 50 {
+		t.Errorf("ASTER_EVENT_GOSSIP_SUBSCRIBED = %d, want 50", ASTER_EVENT_GOSSIP_SUBSCRIBED)
 	}
-	if IROH_EVENT_GOSSIP_BROADCAST_DONE != 51 {
-		t.Errorf("IROH_EVENT_GOSSIP_BROADCAST_DONE = %d, want 51", IROH_EVENT_GOSSIP_BROADCAST_DONE)
+	if ASTER_EVENT_GOSSIP_BROADCAST_DONE != 51 {
+		t.Errorf("ASTER_EVENT_GOSSIP_BROADCAST_DONE = %d, want 51", ASTER_EVENT_GOSSIP_BROADCAST_DONE)
 	}
-	if IROH_EVENT_GOSSIP_RECEIVED != 52 {
-		t.Errorf("IROH_EVENT_GOSSIP_RECEIVED = %d, want 52", IROH_EVENT_GOSSIP_RECEIVED)
+	if ASTER_EVENT_GOSSIP_RECEIVED != 52 {
+		t.Errorf("ASTER_EVENT_GOSSIP_RECEIVED = %d, want 52", ASTER_EVENT_GOSSIP_RECEIVED)
 	}
-	if IROH_EVENT_GOSSIP_NEIGHBOR_UP != 53 {
-		t.Errorf("IROH_EVENT_GOSSIP_NEIGHBOR_UP = %d, want 53", IROH_EVENT_GOSSIP_NEIGHBOR_UP)
+	if ASTER_EVENT_GOSSIP_NEIGHBOR_UP != 53 {
+		t.Errorf("ASTER_EVENT_GOSSIP_NEIGHBOR_UP = %d, want 53", ASTER_EVENT_GOSSIP_NEIGHBOR_UP)
 	}
-	if IROH_EVENT_GOSSIP_NEIGHBOR_DOWN != 54 {
-		t.Errorf("IROH_EVENT_GOSSIP_NEIGHBOR_DOWN = %d, want 54", IROH_EVENT_GOSSIP_NEIGHBOR_DOWN)
+	if ASTER_EVENT_GOSSIP_NEIGHBOR_DOWN != 54 {
+		t.Errorf("ASTER_EVENT_GOSSIP_NEIGHBOR_DOWN = %d, want 54", ASTER_EVENT_GOSSIP_NEIGHBOR_DOWN)
 	}
-	if IROH_EVENT_GOSSIP_LAGGED != 55 {
-		t.Errorf("IROH_EVENT_GOSSIP_LAGGED = %d, want 55", IROH_EVENT_GOSSIP_LAGGED)
+	if ASTER_EVENT_GOSSIP_LAGGED != 55 {
+		t.Errorf("ASTER_EVENT_GOSSIP_LAGGED = %d, want 55", ASTER_EVENT_GOSSIP_LAGGED)
 	}
 }
 
@@ -101,7 +103,7 @@ func TestParseGossipPeer(t *testing.T) {
 	// addr
 	copy(buf[offset:], addr)
 
-	peer, err := parseGossipPeer(&buf[0], len(buf))
+	peer, err := parseGossipPeer(unsafe.Pointer(&buf[0]), len(buf))
 	if err != nil {
 		t.Fatalf("parseGossipPeer failed: %v", err)
 	}
@@ -149,7 +151,7 @@ func TestParseGossipMessage(t *testing.T) {
 	// content
 	copy(buf[offset:], content)
 
-	msg, err := parseGossipMessage(&buf[0], len(buf))
+	msg, err := parseGossipMessage(unsafe.Pointer(&buf[0]), len(buf))
 	if err != nil {
 		t.Fatalf("parseGossipMessage failed: %v", err)
 	}

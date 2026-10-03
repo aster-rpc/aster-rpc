@@ -25,11 +25,11 @@ public sealed class Tags
         GCHandle hashPin = GCHandle.Alloc(hashBytes, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_tags_set(_runtime.Handle, _nodeHandle,
+            int r = Native.aster_tags_set(_runtime.Handle, _nodeHandle,
                 namePin.AddrOfPinnedObject(), (UIntPtr)nameBytes.Length,
                 hashPin.AddrOfPinnedObject(), (UIntPtr)hashBytes.Length,
                 format, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_tags_set");
+            if (r != 0) throw IrohException.FromStatus(r, "aster_tags_set");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.TagSet) throw new IrohException($"set: unexpected event {ev.kind}");
         }
@@ -42,9 +42,9 @@ public sealed class Tags
         GCHandle namePin = GCHandle.Alloc(nameBytes, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_tags_get(_runtime.Handle, _nodeHandle,
+            int r = Native.aster_tags_get(_runtime.Handle, _nodeHandle,
                 namePin.AddrOfPinnedObject(), (UIntPtr)nameBytes.Length, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_tags_get");
+            if (r != 0) throw IrohException.FromStatus(r, "aster_tags_get");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.TagGet) throw new IrohException($"get: unexpected event {ev.kind}");
             byte[] result = Array.Empty<byte>();
@@ -65,9 +65,9 @@ public sealed class Tags
         GCHandle namePin = GCHandle.Alloc(nameBytes, GCHandleType.Pinned);
         try
         {
-            int r = Native.iroh_tags_delete(_runtime.Handle, _nodeHandle,
+            int r = Native.aster_tags_delete(_runtime.Handle, _nodeHandle,
                 namePin.AddrOfPinnedObject(), (UIntPtr)nameBytes.Length, 0, out ulong opId);
-            if (r != 0) throw IrohException.FromStatus(r, "iroh_tags_delete");
+            if (r != 0) throw IrohException.FromStatus(r, "aster_tags_delete");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.TagDeleted) throw new IrohException($"delete: unexpected event {ev.kind}");
         }

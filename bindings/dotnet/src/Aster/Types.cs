@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 namespace Aster;
 
 /// <summary>
-/// iroh status codes returned by FFI functions.
+/// Status codes returned by FFI functions. Mirrors <c>aster_status_t</c>.
 /// </summary>
 public enum Status
 {
@@ -20,11 +20,14 @@ public enum Status
     Cancelled = 9,
     ConnectionRefused = 10,
     StreamReset = 11,
+    /// <summary><c>aster_runtime_new</c> was called with a different ABI major.</summary>
+    AbiMismatch = 12,
 }
 
 /// <summary>
-/// Event kinds emitted by the Rust completion queue via iroh_poll_events.
-/// Values must exactly match iroh_event_kind_t in the C ABI.
+/// Event kinds emitted by the Rust completion queue via aster_poll_events.
+/// Values must exactly match aster_event_kind_t in the C ABI. (Not to be confused
+/// with the reactor's <see cref="ReactorEventKind"/>.)
 /// </summary>
 public enum EventKind : uint
 {
@@ -88,6 +91,9 @@ public enum EventKind : uint
     // Blobs extra
     BlobObserveComplete = 56,
 
+    // Docs extra
+    DocDel = 57,
+
     // Datagrams
     DatagramReceived = 60,
 
@@ -117,7 +123,7 @@ public enum EventKind : uint
 }
 
 /// <summary>
-/// Configuration passed to iroh_runtime_new.
+/// Configuration passed to aster_runtime_new (aster_runtime_config_t, 16 bytes).
 /// struct_size must be set to the size of this struct by the caller.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
@@ -138,7 +144,7 @@ public struct RuntimeConfig
 }
 
 /// <summary>
-/// An event emitted by the Rust completion queue, mirroring iroh_event_t in C.
+/// An event emitted by the Rust completion queue, mirroring aster_event_t (80 bytes).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct Event
@@ -168,6 +174,19 @@ public struct Bytes
 
     public unsafe Span<byte> AsSpan() => new(ptr.ToPointer(), (int)len);
 
+    /// <summary>True when the pointer is NULL or the length is zero.</summary>
+    public bool IsEmpty => ptr == IntPtr.Zero || len == UIntPtr.Zero;
+
+    /// <summary>Copies the referenced bytes into a new managed array.</summary>
+    public byte[] ToArray() => IsEmpty ? Array.Empty<byte>() : AsSpan().ToArray();
+
+    /// <summary>Decodes the referenced bytes as UTF-8.</summary>
+    public string ToUtf8String() => IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(AsSpan());
+
+    /// <summary>Wraps a pointer that the caller keeps alive (e.g. from a <c>fixed</c> block).</summary>
+    public static unsafe Bytes FromPointer(byte* p, int length)
+        => length == 0 ? default : new Bytes { ptr = (IntPtr)p, len = (UIntPtr)length };
+
     /// <summary>
     /// Creates a Bytes from a GCHandle-pinned array.
     /// Caller must pin the array with GCHandle.Alloc(data, GCHandleType.Pinned)
@@ -175,35 +194,43 @@ public struct Bytes
     /// </summary>
     public static Bytes FromPinned(GCHandle handle, int length)
     {
+        if (length == 0) return default; // {NULL, 0}
         return new Bytes { ptr = handle.AddrOfPinnedObject(), len = (UIntPtr)length };
     }
 
     /// <summary>
-    /// Creates a Bytes from managed array for immediate synchronous FFI calls.
-    /// The data must remain valid for the duration of the call.
+    /// Creates a Bytes that points into an <b>unpinned</b> managed array.
+    /// The pointer is only stable while the GC does not move the array, so it
+    /// must not be passed to native code. Retained for source compatibility;
+    /// use a <c>fixed</c> block with <see cref="FromPointer"/> or
+    /// <see cref="FromPinned"/> instead.
     /// </summary>
+    [Obsolete("Dangling pointer: the array is not pinned. Use fixed + FromPointer or FromPinned.")]
     public static Bytes FromArray(byte[] data)
     {
         if (data == null || data.Length == 0)
             return default;
         var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
-        // NOTE: caller is responsible for ensuring this is used in a synchronous
-        // P/Invoke context where the pinned address remains valid.
         var bytes = new Bytes { ptr = handle.AddrOfPinnedObject(), len = (UIntPtr)data.Length };
-        // We intentionally leak the pin here because FromArray is used in patterns
-        // like Native.foo(Bytes.FromArray(data)) where the call is synchronous.
-        // The GC handle will be collected. For long-lived usage, use FromPinned.
         handle.Free();
         return bytes;
     }
 }
 
-/// <summary>Relay mode for endpoint configuration.</summary>
+/// <summary>Relay mode for endpoint configuration. Mirrors aster_relay_mode_t.</summary>
 public enum RelayMode : uint
 {
     Default = 0,
     Custom = 1,
     Disabled = 2,
+    Staging = 3,
+}
+
+/// <summary>Hook failure mode. Mirrors aster_hook_failure_mode_t.</summary>
+public enum HookFailureMode : uint
+{
+    FailOpen = 0,
+    FailClosed = 1,
 }
 
 /// <summary>Strongly-typed wrapper for a native endpoint handle.</summary>
@@ -223,7 +250,7 @@ public readonly record struct NodeHandle(ulong Value);
 
 /// <summary>
 /// Runtime configuration for creating an endpoint.
-/// Must match iroh_endpoint_config_t in the C header exactly (144 bytes).
+/// Must match aster_endpoint_config_t in the C header exactly (152 bytes on 64-bit).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct EndpointConfig
@@ -243,6 +270,7 @@ public struct EndpointConfig
     public Bytes proxy_url;
     public uint proxy_from_env;
     public Bytes data_dir_utf8;
+    public uint hook_failure_mode;
 
     public static EndpointConfig Default => new()
     {
@@ -268,7 +296,7 @@ public struct BytesList
 }
 
 /// <summary>
-/// Node address used to connect to a remote peer.
+/// Node address used to connect to a remote peer (aster_node_addr_t, 48 bytes).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct NodeAddr
@@ -279,7 +307,7 @@ public struct NodeAddr
 }
 
 /// <summary>
-/// Configuration for iroh_connect.
+/// Configuration for aster_connect (aster_connect_config_t, 48 bytes).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct ConnectConfig
@@ -298,4 +326,49 @@ public struct ConnectConfig
         alpn = default,
         addr = IntPtr.Zero,
     };
+}
+
+/// <summary>
+/// Reactor event discriminator (<c>ASTER_REACTOR_EVENT_*</c>, the <c>event_kind</c>
+/// byte of <c>aster_reactor_call_t</c>).
+/// </summary>
+public enum ReactorEventKind : byte
+{
+    /// <summary>An inbound RPC call; all fields populated.</summary>
+    Call = 0,
+    /// <summary>A connection closed; only connection_id, peer_* and connection_handle are set.</summary>
+    ConnectionClosed = 1,
+    /// <summary>Reserved response capacity is held for call_id; retry the exact submit.</summary>
+    ResponseWritable = 2,
+    /// <summary>The call closed while waiting for response capacity.</summary>
+    ResponseClosed = 3,
+}
+
+/// <summary>
+/// Exact mirror of <c>aster_reactor_call_t</c> (112 bytes on 64-bit, pinned by
+/// ffi/src/layout.rs). Sequential layout reproduces the C padding: event_kind@0,
+/// call_id@8, connection_id@16, stream_id@24, header_ptr@32, header_len@40,
+/// header_flags@44, request_ptr@48, request_len@56, request_flags@60, peer_ptr@64,
+/// peer_len@72, header_buffer@80, request_buffer@88, peer_buffer@96,
+/// connection_handle@104.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct ReactorCallNative
+{
+    public byte event_kind;
+    public ulong call_id;
+    public ulong connection_id;
+    public ulong stream_id;
+    public IntPtr header_ptr;
+    public uint header_len;
+    public byte header_flags;
+    public IntPtr request_ptr;
+    public uint request_len;
+    public byte request_flags;
+    public IntPtr peer_ptr;
+    public uint peer_len;
+    public ulong header_buffer;
+    public ulong request_buffer;
+    public ulong peer_buffer;
+    public ulong connection_handle;
 }

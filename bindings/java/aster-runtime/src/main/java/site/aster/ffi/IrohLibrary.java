@@ -135,6 +135,23 @@ public final class IrohLibrary implements SymbolLookup {
     this.impl = SymbolLookup.libraryLookup(LIB_PATH, arena);
     this.allocator = arena; // Arena implements SegmentAllocator
     this.runtimeHandleSegment = allocator.allocate(ValueLayout.JAVA_LONG);
+    if (impl.find("aster_abi_version").isEmpty()) {
+      throw new UnsatisfiedLinkError(
+          "Native library "
+              + LIB_PATH
+              + " has no aster_abi_version symbol (pre-3.0 ABI); expected ABI major "
+              + EXPECTED_ABI_MAJOR);
+    }
+    int major = abiVersionMajor();
+    if (major != EXPECTED_ABI_MAJOR) {
+      throw new UnsatisfiedLinkError(
+          "Native library "
+              + LIB_PATH
+              + " has ABI major "
+              + major
+              + ", this binding expects "
+              + EXPECTED_ABI_MAJOR);
+    }
   }
 
   public static IrohLibrary getInstance() {
@@ -157,37 +174,39 @@ public final class IrohLibrary implements SymbolLookup {
   public MethodHandle getHandle(String name, FunctionDescriptor desc) {
     MemorySegment symbol =
         impl.find(name)
-            .orElseThrow(() -> new UnsatisfiedLinkError("iroh symbol not found: " + name));
+            .orElseThrow(() -> new UnsatisfiedLinkError("aster symbol not found: " + name));
     return Linker.nativeLinker().downcallHandle(symbol, desc);
   }
 
   // --- Version ---
 
-  public int abiVersionMajor() {
+  /**
+   * C ABI major version this binding is written against. Passed to {@code aster_runtime_new}, which
+   * refuses a mismatch with {@link IrohStatus#ABI_MISMATCH}; also checked when the library is
+   * loaded.
+   */
+  public static final int EXPECTED_ABI_MAJOR = 3;
+
+  /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
+  public int abiVersion() {
     try {
       return (int)
-          getHandle("iroh_abi_version_major", FunctionDescriptor.of(ValueLayout.JAVA_INT)).invoke();
+          getHandle("aster_abi_version", FunctionDescriptor.of(ValueLayout.JAVA_INT)).invoke();
     } catch (Throwable t) {
       throw new AssertionError(t);
     }
+  }
+
+  public int abiVersionMajor() {
+    return abiVersion() >>> 16;
   }
 
   public int abiVersionMinor() {
-    try {
-      return (int)
-          getHandle("iroh_abi_version_minor", FunctionDescriptor.of(ValueLayout.JAVA_INT)).invoke();
-    } catch (Throwable t) {
-      throw new AssertionError(t);
-    }
+    return (abiVersion() >>> 8) & 0xff;
   }
 
   public int abiVersionPatch() {
-    try {
-      return (int)
-          getHandle("iroh_abi_version_patch", FunctionDescriptor.of(ValueLayout.JAVA_INT)).invoke();
-    } catch (Throwable t) {
-      throw new AssertionError(t);
-    }
+    return abiVersion() & 0xff;
   }
 
   // --- Error ---
@@ -203,7 +222,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (long)
           getHandle(
-                  "iroh_last_error_message",
+                  "aster_last_error_message",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))
               .invoke(buffer, capacity);
@@ -233,7 +252,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_endpoint_id",
+                  "aster_endpoint_id",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -256,7 +275,7 @@ public final class IrohLibrary implements SymbolLookup {
     return arena;
   }
 
-  /** Pre-allocated segment for runtime handle output (written by iroh_runtime_new). */
+  /** Pre-allocated segment for runtime handle output (written by aster_runtime_new). */
   public MemorySegment runtimeHandleSegment() {
     return runtimeHandleSegment;
   }
@@ -274,7 +293,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_node_memory",
+                  "aster_node_memory",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -298,17 +317,17 @@ public final class IrohLibrary implements SymbolLookup {
   public int nodePersistentAsync(
       long runtimeHandle, MemorySegment pathBytes, long pathLen, MemorySegment outOpId) {
     try {
-      // Build iroh_bytes_t { ptr, len } struct on the stack/inline in the arena
-      MemorySegment pathIrohBytes = allocator.allocate(IROH_BYTES); // 16 bytes
+      // Build aster_bytes_t { ptr, len } struct on the stack/inline in the arena
+      MemorySegment pathIrohBytes = allocator.allocate(ASTER_BYTES); // 16 bytes
       pathIrohBytes.set(ValueLayout.ADDRESS, 0, pathBytes);
       pathIrohBytes.set(ValueLayout.JAVA_LONG, 8, pathLen);
       return (int)
           getHandle(
-                  "iroh_node_persistent",
+                  "aster_node_persistent",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
-                      IROH_BYTES, // path: iroh_bytes_t { ptr, len }
+                      ASTER_BYTES, // path: aster_bytes_t { ptr, len }
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, pathIrohBytes, 0L, outOpId);
@@ -336,7 +355,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_node_memory_with_alpns",
+                  "aster_node_memory_with_alpns",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -363,7 +382,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_node_accept_aster",
+                  "aster_node_accept_aster",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -378,7 +397,7 @@ public final class IrohLibrary implements SymbolLookup {
 
   /**
    * Long-poll the reactor for the next non-rpc aster-ALPN connection. Emits {@code
-   * IROH_EVENT_ASTER_ACCEPTED} on arrival: event.handle = connection handle, event.data = ALPN
+   * ASTER_EVENT_ASTER_ACCEPTED} on arrival: event.handle = connection handle, event.data = ALPN
    * bytes. See {@code aster_reactor_accept_non_rpc} in the C header.
    */
   public int asterReactorAcceptNonRpc(
@@ -411,7 +430,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_node_close",
+                  "aster_node_close",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -443,7 +462,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_node_id",
+                  "aster_node_id",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -476,7 +495,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_node_export_secret_key",
+                  "aster_node_export_secret_key",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -497,7 +516,7 @@ public final class IrohLibrary implements SymbolLookup {
    * @param nodeHandle the node handle
    * @param outBuf output buffer for string data
    * @param bufCapacity buffer capacity
-   * @param outAddrSegment output segment for the iroh_node_addr_t struct
+   * @param outAddrSegment output segment for the aster_node_addr_t struct
    * @return status code (0 = OK)
    */
   public int nodeAddrInfo(
@@ -509,7 +528,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_node_addr_info",
+                  "aster_node_addr_info",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -530,7 +549,7 @@ public final class IrohLibrary implements SymbolLookup {
    * @param endpointHandle the endpoint handle
    * @param outBuf output buffer for string data (relay URL, direct addresses)
    * @param bufCapacity buffer capacity
-   * @param outAddrSegment output segment for the iroh_node_addr_t struct
+   * @param outAddrSegment output segment for the aster_node_addr_t struct
    * @return status code (0 = OK)
    */
   public int endpointAddrInfo(
@@ -542,7 +561,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_endpoint_addr_info",
+                  "aster_endpoint_addr_info",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -567,7 +586,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_node_free",
+                  "aster_node_free",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
               .invoke(runtimeHandle, nodeHandle);
@@ -581,14 +600,14 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param endpointHandle the endpoint handle
-   * @param addrSegment segment containing the iroh_node_addr_t struct
+   * @param addrSegment segment containing the aster_node_addr_t struct
    * @return status code (0 = OK)
    */
   public int addNodeAddr(long runtimeHandle, long endpointHandle, MemorySegment addrSegment) {
     try {
       return (int)
           getHandle(
-                  "iroh_add_node_addr",
+                  "aster_add_node_addr",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -621,7 +640,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_connection_remote_id",
+                  "aster_connection_remote_id",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -640,7 +659,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param connectionHandle the connection handle
-   * @param dataSegment segment containing the datagram data (iroh_bytes_t)
+   * @param dataSegment segment containing the datagram data (aster_bytes_t)
    * @return status code (0 = OK)
    */
   public int connectionSendDatagram(
@@ -648,7 +667,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_connection_send_datagram",
+                  "aster_connection_send_datagram",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -674,7 +693,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_connection_read_datagram",
+                  "aster_connection_read_datagram",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -701,7 +720,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_connection_closed",
+                  "aster_connection_closed",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -728,7 +747,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_connection_max_datagram_size",
+                  "aster_connection_max_datagram_size",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -754,7 +773,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_connection_transport_snapshot",
+                  "aster_connection_transport_snapshot",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -767,14 +786,14 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
-   * Release a string buffer previously returned in an {@code iroh_bytes_t} struct (e.g. from {@link
-   * #connectionTransportSnapshot}). Safe to call on a null/zero-length buffer.
+   * Release a string buffer previously returned in an {@code aster_bytes_t} struct (e.g. from
+   * {@link #connectionTransportSnapshot}). Safe to call on a null/zero-length buffer.
    */
   public int stringRelease(MemorySegment ptr, long len) {
     try {
       return (int)
           getHandle(
-                  "iroh_string_release",
+                  "aster_string_release",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))
               .invoke(ptr, len);
@@ -796,7 +815,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_connection_datagram_send_buffer_space",
+                  "aster_connection_datagram_send_buffer_space",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -815,7 +834,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param dataSegment segment containing the data (iroh_bytes_t)
+   * @param dataSegment segment containing the data (aster_bytes_t)
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
@@ -824,12 +843,12 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_add_bytes",
+                  "aster_blobs_add_bytes",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      IROH_BYTES,
+                      ASTER_BYTES,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, nodeHandle, dataSegment, 0L, outOpId);
@@ -843,7 +862,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param hashHexSegment segment containing the hash hex string (iroh_bytes_t)
+   * @param hashHexSegment segment containing the hash hex string (aster_bytes_t)
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
@@ -852,7 +871,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_read",
+                  "aster_blobs_read",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -868,9 +887,9 @@ public final class IrohLibrary implements SymbolLookup {
 
   /**
    * Import a file by path into the blob store. The C signature takes the path as an {@code
-   * iroh_bytes_t} by value; we split it into (ptr, len) per the working struct-by-value convention
+   * aster_bytes_t} by value; we split it into (ptr, len) per the working struct-by-value convention
    * (see {@link #blobsAddCollection} / {@link #asterRegistryPublish}). Emits {@code
-   * IROH_EVENT_BLOB_ADDED} with the hash hex as the payload.
+   * ASTER_EVENT_BLOB_ADDED} with the hash hex as the payload.
    *
    * @return status code (0 = OK)
    */
@@ -883,7 +902,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_add_path",
+                  "aster_blobs_add_path",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG, // runtime
@@ -900,8 +919,8 @@ public final class IrohLibrary implements SymbolLookup {
 
   /**
    * Import a file by path and set a persistent named tag in one step. Both {@code path} and {@code
-   * tagName} are {@code iroh_bytes_t} by value, each split into (ptr, len). Emits {@code
-   * IROH_EVENT_BLOB_ADDED} with the hash hex as the payload.
+   * tagName} are {@code aster_bytes_t} by value, each split into (ptr, len). Emits {@code
+   * ASTER_EVENT_BLOB_ADDED} with the hash hex as the payload.
    *
    * @return status code (0 = OK)
    */
@@ -916,7 +935,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_add_path_with_named_tag",
+                  "aster_blobs_add_path_with_named_tag",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG, // runtime
@@ -935,7 +954,7 @@ public final class IrohLibrary implements SymbolLookup {
 
   /**
    * Set a persistent named tag on an existing hash. {@code name} and {@code hashHex} are passed as
-   * (ptr, len); {@code format} is 0 = raw, 1 = hash_seq. Emits {@code IROH_EVENT_TAG_SET}.
+   * (ptr, len); {@code format} is 0 = raw, 1 = hash_seq. Emits {@code ASTER_EVENT_TAG_SET}.
    *
    * @return status code (0 = OK)
    */
@@ -951,7 +970,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_tags_set",
+                  "aster_tags_set",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG, // runtime
@@ -983,8 +1002,8 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param nameSegment segment containing the name (iroh_bytes_t)
-   * @param dataSegment segment containing the data (iroh_bytes_t)
+   * @param nameSegment segment containing the name (aster_bytes_t)
+   * @param dataSegment segment containing the data (aster_bytes_t)
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
@@ -997,7 +1016,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_add_bytes_as_collection",
+                  "aster_blobs_add_bytes_as_collection",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1017,12 +1036,12 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param entriesJsonSegment segment containing the JSON string (iroh_bytes_t)
+   * @param entriesJsonSegment segment containing the JSON string (aster_bytes_t)
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
   /**
-   * Invoke {@code iroh_blobs_add_collection}. The C signature takes an {@code iroh_bytes_t} by
+   * Invoke {@code aster_blobs_add_collection}. The C signature takes an {@code aster_bytes_t} by
    * value; we split it into (ptr, len) so FFM places the pointer + length in the two consecutive
    * registers that the struct-by-value ABI uses on AAPCS64 / SysV AMD64. Matches the working
    * convention in {@link #asterRegistryPublish}.
@@ -1036,7 +1055,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_add_collection",
+                  "aster_blobs_add_collection",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG, // runtime
@@ -1056,7 +1075,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param hashHexSegment segment containing the collection hash (iroh_bytes_t)
+   * @param hashHexSegment segment containing the collection hash (aster_bytes_t)
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
@@ -1065,7 +1084,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_list_collection",
+                  "aster_blobs_list_collection",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1084,7 +1103,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param hashHexSegment segment containing the blob hash (iroh_bytes_t)
+   * @param hashHexSegment segment containing the blob hash (aster_bytes_t)
    * @param outBuf output buffer for the ticket string
    * @param capacity buffer capacity
    * @param outLen where to write the actual length
@@ -1100,7 +1119,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_create_ticket",
+                  "aster_blobs_create_ticket",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1120,7 +1139,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param hashHexSegment segment containing the collection hash (iroh_bytes_t)
+   * @param hashHexSegment segment containing the collection hash (aster_bytes_t)
    * @param outBuf output buffer for the ticket string
    * @param capacity buffer capacity
    * @param outLen where to write the actual length
@@ -1136,7 +1155,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_create_collection_ticket",
+                  "aster_blobs_create_collection_ticket",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1156,7 +1175,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param ticketSegment segment containing the ticket (iroh_bytes_t)
+   * @param ticketSegment segment containing the ticket (aster_bytes_t)
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
@@ -1165,7 +1184,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_download",
+                  "aster_blobs_download",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1200,7 +1219,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_status",
+                  "aster_blobs_status",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1234,7 +1253,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_has",
+                  "aster_blobs_has",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1269,7 +1288,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_observe_snapshot",
+                  "aster_blobs_observe_snapshot",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1305,7 +1324,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_observe_complete",
+                  "aster_blobs_observe_complete",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1341,7 +1360,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_blobs_local_info",
+                  "aster_blobs_local_info",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1366,8 +1385,8 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param topicSegment iroh_bytes_t topic (struct by value)
-   * @param peersSegment iroh_bytes_list_t peers (struct by value)
+   * @param topicSegment aster_bytes_t topic (struct by value)
+   * @param peersSegment aster_bytes_list_t peers (struct by value)
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
@@ -1380,13 +1399,13 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_gossip_subscribe",
+                  "aster_gossip_subscribe",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      IROH_BYTES,
-                      IROH_BYTES_LIST,
+                      ASTER_BYTES,
+                      ASTER_BYTES_LIST,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, nodeHandle, topicSegment, peersSegment, 0L, outOpId);
@@ -1400,7 +1419,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param topicHandle the gossip topic handle
-   * @param dataSegment iroh_bytes_t data (struct by value)
+   * @param dataSegment aster_bytes_t data (struct by value)
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
@@ -1409,12 +1428,12 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_gossip_broadcast",
+                  "aster_gossip_broadcast",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      IROH_BYTES,
+                      ASTER_BYTES,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, topicHandle, dataSegment, 0L, outOpId);
@@ -1435,7 +1454,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_gossip_recv",
+                  "aster_gossip_recv",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1459,7 +1478,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_gossip_topic_free",
+                  "aster_gossip_topic_free",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
               .invoke(runtimeHandle, topicHandle);
@@ -1473,7 +1492,7 @@ public final class IrohLibrary implements SymbolLookup {
   // ============================================================================
 
   /**
-   * Set a named tag. format: 0 = raw, 1 = hash_seq. Emits IROH_EVENT_TAG_SET.
+   * Set a named tag. format: 0 = raw, 1 = hash_seq. Emits ASTER_EVENT_TAG_SET.
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
@@ -1499,7 +1518,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_tags_set",
+                  "aster_tags_set",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1527,7 +1546,7 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
-   * Get a tag by name. Emits IROH_EVENT_TAG_GET with payload on found, NOT_FOUND status if absent.
+   * Get a tag by name. Emits ASTER_EVENT_TAG_GET with payload on found, NOT_FOUND status if absent.
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
@@ -1547,7 +1566,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_tags_get",
+                  "aster_tags_get",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1563,7 +1582,7 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
-   * Delete a tag by name. Emits IROH_EVENT_TAG_DELETED with count in event.flags.
+   * Delete a tag by name. Emits ASTER_EVENT_TAG_DELETED with count in event.flags.
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
@@ -1583,7 +1602,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_tags_delete",
+                  "aster_tags_delete",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1599,7 +1618,7 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
-   * List tags matching a prefix (empty prefix = all tags). Emits IROH_EVENT_TAG_LIST with packed
+   * List tags matching a prefix (empty prefix = all tags). Emits ASTER_EVENT_TAG_LIST with packed
    * tag records in payload; event.flags = count.
    *
    * @param runtimeHandle the runtime handle
@@ -1620,7 +1639,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_tags_list_prefix",
+                  "aster_tags_list_prefix",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1652,7 +1671,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_docs_create",
+                  "aster_docs_create",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1679,7 +1698,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_docs_create_author",
+                  "aster_docs_create_author",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1697,7 +1716,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param ticketSegment segment containing the ticket (iroh_bytes_t)
+   * @param ticketSegment segment containing the ticket (aster_bytes_t)
    * @param userData user data passed to the operation
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
@@ -1711,7 +1730,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_docs_join",
+                  "aster_docs_join",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1730,15 +1749,15 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param docHandle the document handle
-   * @param authorSegment segment containing the author hex (iroh_bytes_t)
-   * @param keySegment segment containing the key (iroh_bytes_t)
-   * @param valueSegment segment containing the value (iroh_bytes_t)
+   * @param authorSegment segment containing the author hex (aster_bytes_t)
+   * @param keySegment segment containing the key (aster_bytes_t)
+   * @param valueSegment segment containing the value (aster_bytes_t)
    * @param userData user data passed to the operation
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
    */
   /**
-   * Invoke {@code iroh_doc_set_bytes}. The C signature takes three {@code iroh_bytes_t} args by
+   * Invoke {@code aster_doc_set_bytes}. The C signature takes three {@code aster_bytes_t} args by
    * value; we split each into (ptr, len) so FFM places the pointer + length in consecutive
    * registers per AAPCS64 §6.8.2 / SysV AMD64 §3.2.3. Same convention as {@link
    * #asterRegistryPublish}.
@@ -1757,7 +1776,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_set_bytes",
+                  "aster_doc_set_bytes",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG, // runtime
@@ -1791,8 +1810,8 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param docHandle the document handle
-   * @param authorSegment segment containing the author hex (iroh_bytes_t)
-   * @param keySegment segment containing the key (iroh_bytes_t)
+   * @param authorSegment segment containing the author hex (aster_bytes_t)
+   * @param keySegment segment containing the key (aster_bytes_t)
    * @param userData user data passed to the operation
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
@@ -1807,7 +1826,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_get_exact",
+                  "aster_doc_get_exact",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1837,7 +1856,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_share",
+                  "aster_doc_share",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1857,7 +1876,7 @@ public final class IrohLibrary implements SymbolLookup {
    * @param runtimeHandle the runtime handle
    * @param docHandle the document handle
    * @param mode the query mode (0=author, 1=all, 2=prefix)
-   * @param keySegment segment containing the key prefix (iroh_bytes_t)
+   * @param keySegment segment containing the key prefix (aster_bytes_t)
    * @param userData user data passed to the operation
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
@@ -1872,7 +1891,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_query",
+                  "aster_doc_query",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1892,7 +1911,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param docHandle the document handle
-   * @param contentHashSegment segment containing the content hash hex (iroh_bytes_t)
+   * @param contentHashSegment segment containing the content hash hex (aster_bytes_t)
    * @param userData user data passed to the operation
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
@@ -1906,7 +1925,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_read_entry_content",
+                  "aster_doc_read_entry_content",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1925,7 +1944,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param docHandle the document handle
-   * @param peersSegment segment containing the peers list (iroh_bytes_list_t)
+   * @param peersSegment segment containing the peers list (aster_bytes_list_t)
    * @param userData user data passed to the operation
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
@@ -1939,7 +1958,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_start_sync",
+                  "aster_doc_start_sync",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1966,7 +1985,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_leave",
+                  "aster_doc_leave",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -1993,7 +2012,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_subscribe",
+                  "aster_doc_subscribe",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -2020,7 +2039,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_event_recv",
+                  "aster_doc_event_recv",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -2039,7 +2058,7 @@ public final class IrohLibrary implements SymbolLookup {
    * @param runtimeHandle the runtime handle
    * @param docHandle the document handle
    * @param mode the download policy mode
-   * @param prefixesSegment segment containing the prefixes list (iroh_bytes_list_t)
+   * @param prefixesSegment segment containing the prefixes list (aster_bytes_list_t)
    * @param userData user data passed to the operation
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
@@ -2054,7 +2073,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_set_download_policy",
+                  "aster_doc_set_download_policy",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -2084,7 +2103,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_share_with_addr",
+                  "aster_doc_share_with_addr",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -2103,7 +2122,7 @@ public final class IrohLibrary implements SymbolLookup {
    *
    * @param runtimeHandle the runtime handle
    * @param nodeHandle the node handle
-   * @param ticketSegment segment containing the ticket (iroh_bytes_t)
+   * @param ticketSegment segment containing the ticket (aster_bytes_t)
    * @param userData user data passed to the operation
    * @param outOpId where to write the operation id
    * @return status code (0 = OK)
@@ -2117,7 +2136,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_docs_join_and_subscribe",
+                  "aster_docs_join_and_subscribe",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -2142,7 +2161,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_free",
+                  "aster_doc_free",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
               .invoke(runtimeHandle, docHandle);
@@ -2159,7 +2178,7 @@ public final class IrohLibrary implements SymbolLookup {
     try {
       return (int)
           getHandle(
-                  "iroh_doc_id",
+                  "aster_doc_id",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -2174,41 +2193,42 @@ public final class IrohLibrary implements SymbolLookup {
 
   // --- Struct layouts (verified against Rust #[repr(C)] structs in ffi/src/lib.rs) ---
 
-  public static final MemoryLayout IROH_BYTES =
+  public static final MemoryLayout ASTER_BYTES =
       MemoryLayout.structLayout(
           ValueLayout.ADDRESS.withName("ptr"), // 0
           ValueLayout.JAVA_LONG.withName("len") // 8
           );
 
-  public static final MemoryLayout IROH_BYTES_LIST =
+  public static final MemoryLayout ASTER_BYTES_LIST =
       MemoryLayout.structLayout(
           ValueLayout.ADDRESS.withName("items"), // 0
           ValueLayout.JAVA_LONG.withName("len") // 8
           );
 
   /**
-   * iroh_transport_snapshot_t: struct_size, path_kind, peer_host (16), peer_port (u16), _pad (u16),
-   * [4-byte tail-padding for 8-byte align], relay_url (16), rtt_micros (u64). Total 56 bytes.
+   * aster_transport_snapshot_t: struct_size, path_kind, peer_host (16), peer_port (u16), _pad
+   * (u16), [4-byte tail-padding for 8-byte align], relay_url (16), rtt_micros (u64). Total 56
+   * bytes.
    *
    * <p>Rust's #[repr(C)] inserts 4 bytes of padding after `_pad` so that the next field
    * (`relay_url`, which contains a pointer) starts at an 8-byte boundary. This layout matches that.
    */
-  public static final MemoryLayout IROH_TRANSPORT_SNAPSHOT =
+  public static final MemoryLayout ASTER_TRANSPORT_SNAPSHOT =
       MemoryLayout.structLayout(
           ValueLayout.JAVA_INT.withName("struct_size"), // 0
           ValueLayout.JAVA_INT.withName("path_kind"), // 4
-          IROH_BYTES.withName("peer_host"), // 8
+          ASTER_BYTES.withName("peer_host"), // 8
           ValueLayout.JAVA_SHORT.withName("peer_port"), // 24
           ValueLayout.JAVA_SHORT.withName("_pad"), // 26
           MemoryLayout.paddingLayout(4), // 28
-          IROH_BYTES.withName("relay_url"), // 32
+          ASTER_BYTES.withName("relay_url"), // 32
           ValueLayout.JAVA_LONG.withName("rtt_micros") // 48
           );
 
   /**
-   * iroh_runtime_config_t: struct_size, worker_threads, event_queue_capacity, reserved. 16 bytes.
+   * aster_runtime_config_t: struct_size, worker_threads, event_queue_capacity, reserved. 16 bytes.
    */
-  public static final MemoryLayout IROH_RUNTIME_CONFIG =
+  public static final MemoryLayout ASTER_RUNTIME_CONFIG =
       MemoryLayout.structLayout(
           ValueLayout.JAVA_INT.withName("struct_size"), // 0
           ValueLayout.JAVA_INT.withName("worker_threads"), // 4
@@ -2217,63 +2237,63 @@ public final class IrohLibrary implements SymbolLookup {
           );
 
   /**
-   * iroh_endpoint_config_t: struct_size, relay_mode, secret_key, alpns, relay_urls,
+   * aster_endpoint_config_t: struct_size, relay_mode, secret_key, alpns, relay_urls,
    * enable_discovery, enable_hooks, hook_timeout_ms, bind_addr, clear_ip_transports,
    * clear_relay_transports, portmapper_config, proxy_url, proxy_from_env, data_dir_utf8,
    * hook_failure_mode.
    *
-   * <p>Total: 152 bytes. Matches Rust iroh_endpoint_config_t exactly.
+   * <p>Total: 152 bytes. Matches Rust aster_endpoint_config_t exactly.
    */
-  public static final MemoryLayout IROH_ENDPOINT_CONFIG =
+  public static final MemoryLayout ASTER_ENDPOINT_CONFIG =
       MemoryLayout.structLayout(
           ValueLayout.JAVA_INT.withName("struct_size"), // 0
           ValueLayout.JAVA_INT.withName("relay_mode"), // 4
-          IROH_BYTES.withName("secret_key"), // 8  (ptr+len = 16 bytes)
-          IROH_BYTES_LIST.withName("alpns"), // 24 (items+len = 16 bytes)
-          IROH_BYTES_LIST.withName("relay_urls"), // 40 (items+len = 16 bytes)
+          ASTER_BYTES.withName("secret_key"), // 8  (ptr+len = 16 bytes)
+          ASTER_BYTES_LIST.withName("alpns"), // 24 (items+len = 16 bytes)
+          ASTER_BYTES_LIST.withName("relay_urls"), // 40 (items+len = 16 bytes)
           ValueLayout.JAVA_INT.withName("enable_discovery"), // 56
           ValueLayout.JAVA_INT.withName("enable_hooks"), // 60
           ValueLayout.JAVA_LONG.withName("hook_timeout_ms"), // 64
-          IROH_BYTES.withName("bind_addr"), // 72 (ptr+len = 16 bytes)
+          ASTER_BYTES.withName("bind_addr"), // 72 (ptr+len = 16 bytes)
           ValueLayout.JAVA_INT.withName("clear_ip_transports"), // 88
           ValueLayout.JAVA_INT.withName("clear_relay_transports"), // 92
           ValueLayout.JAVA_INT.withName("portmapper_config"), // 96
           MemoryLayout.paddingLayout(4), // 4 bytes padding → proxy_url at 104 (8-byte aligned)
-          IROH_BYTES.withName("proxy_url"), // 104 (ptr+len = 16 bytes)
+          ASTER_BYTES.withName("proxy_url"), // 104 (ptr+len = 16 bytes)
           ValueLayout.JAVA_INT.withName("proxy_from_env"), // 120
           MemoryLayout.paddingLayout(4), // 4 bytes padding → data_dir_utf8 at 128 (8-byte aligned)
-          IROH_BYTES.withName("data_dir_utf8"), // 128 (ptr+len = 16 bytes)
+          ASTER_BYTES.withName("data_dir_utf8"), // 128 (ptr+len = 16 bytes)
           ValueLayout.JAVA_INT.withName("hook_failure_mode"), // 144
           MemoryLayout.paddingLayout(4) // 4 bytes tail padding → total 152
           );
 
   /**
-   * iroh_connect_config_t: struct_size, flags, node_id (hex string), alpn, addr. Total: 48 bytes.
-   * addr is *const iroh_node_addr_t, passed as NULL for simple connect.
+   * aster_connect_config_t: struct_size, flags, node_id (hex string), alpn, addr. Total: 48 bytes.
+   * addr is *const aster_node_addr_t, passed as NULL for simple connect.
    */
-  public static final MemoryLayout IROH_CONNECT_CONFIG =
+  public static final MemoryLayout ASTER_CONNECT_CONFIG =
       MemoryLayout.structLayout(
           ValueLayout.JAVA_INT.withName("struct_size"), // 0
           ValueLayout.JAVA_INT.withName("flags"), // 4
-          IROH_BYTES.withName("node_id"), // 8  (ptr+len = 16 bytes)
-          IROH_BYTES.withName("alpn"), // 24 (ptr+len = 16 bytes)
+          ASTER_BYTES.withName("node_id"), // 8  (ptr+len = 16 bytes)
+          ASTER_BYTES.withName("alpn"), // 24 (ptr+len = 16 bytes)
           ValueLayout.ADDRESS.withName("addr") // 40
           );
 
-  /** iroh_node_addr_t: endpoint_id, relay_url, direct_addresses. Total: 48 bytes. */
-  public static final MemoryLayout IROH_NODE_ADDR =
+  /** aster_node_addr_t: endpoint_id, relay_url, direct_addresses. Total: 48 bytes. */
+  public static final MemoryLayout ASTER_NODE_ADDR =
       MemoryLayout.structLayout(
-          IROH_BYTES.withName("endpoint_id"), // 0  (ptr+len = 16 bytes)
-          IROH_BYTES.withName("relay_url"), // 16 (ptr+len = 16 bytes)
-          IROH_BYTES_LIST.withName("direct_addresses") // 32 (items+len = 16 bytes)
+          ASTER_BYTES.withName("endpoint_id"), // 0  (ptr+len = 16 bytes)
+          ASTER_BYTES.withName("relay_url"), // 16 (ptr+len = 16 bytes)
+          ASTER_BYTES_LIST.withName("direct_addresses") // 32 (items+len = 16 bytes)
           );
 
   /**
-   * iroh_event_t: matches Rust iroh_event_t exactly. Total: 80 bytes.
+   * aster_event_t: matches Rust aster_event_t exactly. Total: 80 bytes.
    *
    * <p>Note: 4 bytes of padding at offset 12 between status and operation (u64 alignment).
    */
-  public static final MemoryLayout IROH_EVENT =
+  public static final MemoryLayout ASTER_EVENT =
       MemoryLayout.structLayout(
           ValueLayout.JAVA_INT.withName("struct_size"), // 0
           ValueLayout.JAVA_INT.withName("kind"), // 4
@@ -2597,8 +2617,8 @@ public final class IrohLibrary implements SymbolLookup {
   // --- Registry async doc-backed ops (event kinds 80-84) ----------------
 
   /**
-   * C signature: {@code int32_t aster_registry_resolve(iroh_runtime_t runtime, uint64_t doc, struct
-   * iroh_bytes_t opts_json, uint64_t user_data, iroh_operation_t *out_operation);}
+   * C signature: {@code int32_t aster_registry_resolve(aster_runtime_t runtime, uint64_t doc,
+   * struct aster_bytes_t opts_json, uint64_t user_data, aster_operation_t *out_operation);}
    */
   public int asterRegistryResolve(
       long runtimeHandle,
@@ -2626,10 +2646,10 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
-   * C signature: {@code int32_t aster_registry_publish(iroh_runtime_t runtime, uint64_t doc, struct
-   * iroh_bytes_t author_id, struct iroh_bytes_t lease_json, struct iroh_bytes_t artifact_json,
-   * struct iroh_bytes_t service, int32_t version, struct iroh_bytes_t channel, uint64_t
-   * gossip_topic, uint64_t user_data, iroh_operation_t *out_operation);}
+   * C signature: {@code int32_t aster_registry_publish(aster_runtime_t runtime, uint64_t doc,
+   * struct aster_bytes_t author_id, struct aster_bytes_t lease_json, struct aster_bytes_t
+   * artifact_json, struct aster_bytes_t service, int32_t version, struct aster_bytes_t channel,
+   * uint64_t gossip_topic, uint64_t user_data, aster_operation_t *out_operation);}
    */
   public int asterRegistryPublish(
       long runtimeHandle,
@@ -2693,10 +2713,11 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
-   * C signature: {@code int32_t aster_registry_renew_lease(iroh_runtime_t runtime, uint64_t doc,
-   * struct iroh_bytes_t author_id, struct iroh_bytes_t service, struct iroh_bytes_t contract_id,
-   * struct iroh_bytes_t endpoint_id, struct iroh_bytes_t health, float load, int32_t
-   * lease_duration_s, uint64_t gossip_topic, uint64_t user_data, iroh_operation_t *out_operation);}
+   * C signature: {@code int32_t aster_registry_renew_lease(aster_runtime_t runtime, uint64_t doc,
+   * struct aster_bytes_t author_id, struct aster_bytes_t service, struct aster_bytes_t contract_id,
+   * struct aster_bytes_t endpoint_id, struct aster_bytes_t health, float load, int32_t
+   * lease_duration_s, uint64_t gossip_topic, uint64_t user_data, aster_operation_t
+   * *out_operation);}
    */
   public int asterRegistryRenewLease(
       long runtimeHandle,
@@ -2866,14 +2887,15 @@ public final class IrohLibrary implements SymbolLookup {
   // --- Hook responders (Phase 1b) ---------------------------------------
 
   /**
-   * C signature: {@code int32_t iroh_hook_before_connect_respond(iroh_runtime_t runtime,
-   * iroh_hook_invocation_t invocation, enum iroh_hook_decision_t decision);}
+   * C signature: {@code int32_t aster_hook_before_connect_respond(aster_runtime_t runtime,
+   * aster_hook_invocation_t invocation, uint32_t decision);} ({@code decision} is an {@code
+   * aster_hook_decision_t} value)
    */
   public int irohHookBeforeConnectRespond(long runtimeHandle, long invocation, int decision) {
     try {
       return (int)
           getHandle(
-                  "iroh_hook_before_connect_respond",
+                  "aster_hook_before_connect_respond",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
@@ -2886,14 +2908,14 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   /**
-   * C signature: {@code int32_t iroh_hook_after_connect_respond(iroh_runtime_t runtime,
-   * iroh_hook_invocation_t invocation);}
+   * C signature: {@code int32_t aster_hook_after_connect_respond(aster_runtime_t runtime,
+   * aster_hook_invocation_t invocation);}
    */
   public int irohHookAfterConnectRespond(long runtimeHandle, long invocation) {
     try {
       return (int)
           getHandle(
-                  "iroh_hook_after_connect_respond",
+                  "aster_hook_after_connect_respond",
                   FunctionDescriptor.of(
                       ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
               .invoke(runtimeHandle, invocation);

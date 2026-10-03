@@ -107,7 +107,7 @@ public final class ContractPublisher {
   }
 
   /**
-   * Build the JSON payload accepted by {@code iroh_blobs_add_collection}: a JSON array of {@code
+   * Build the JSON payload accepted by {@code aster_blobs_add_collection}: a JSON array of {@code
    * [name, base64-data]} pairs, in deterministic order (contract.bin, then sorted types/*.bin, then
    * manifest.json — same order as Python's {@code build_collection}).
    */

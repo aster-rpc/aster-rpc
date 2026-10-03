@@ -7,7 +7,7 @@ package aster
 #include <stddef.h>
 #include <string.h>
 
-#include "iroh_ffi.h"
+#include "aster_ffi.h"
 */
 import "C"
 
@@ -78,7 +78,7 @@ func (n *Node) NodeID() (string, error) {
 	var buf [64]byte
 	var outLen C.uintptr_t
 
-	r := C.iroh_node_id(
+	r := C.aster_node_id(
 		C.uint64_t(n.runtime.handle),
 		C.uint64_t(n.handle),
 		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
@@ -86,7 +86,7 @@ func (n *Node) NodeID() (string, error) {
 		&outLen,
 	)
 	if r != 0 {
-		return "", fmt.Errorf("iroh_node_id: %w", Error(r))
+		return "", fmt.Errorf("aster_node_id: %w", Error(r))
 	}
 	if outLen == 0 {
 		return "", nil
@@ -97,9 +97,9 @@ func (n *Node) NodeID() (string, error) {
 // NodeAddr returns the structured address of this node.
 func (n *Node) NodeAddr() (*NodeAddr, error) {
 	var addrBuf [4096]byte
-	var addr C.iroh_node_addr_t
+	var addr C.aster_node_addr_t
 
-	r := C.iroh_node_addr_info(
+	r := C.aster_node_addr_info(
 		C.uint64_t(n.runtime.handle),
 		C.uint64_t(n.handle),
 		(*C.uint8_t)(unsafe.Pointer(&addrBuf[0])),
@@ -107,39 +107,21 @@ func (n *Node) NodeAddr() (*NodeAddr, error) {
 		&addr,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_node_addr_info: %w", Error(r))
+		return nil, fmt.Errorf("aster_node_addr_info: %w", Error(r))
 	}
 
 	nodeAddr := &NodeAddr{
 		DirectAddresses: []string{},
 	}
 
-	// Read from addr struct (not addrBuf)
-	// iroh_node_addr_t layout: endpoint_id(16) + relay_url(16) + direct_addresses(16)
-	// endpoint_id at offset 0: iroh_bytes_t { ptr(8), len(8) }
-	idPtr := (*unsafe.Pointer)(unsafe.Pointer(&addr))
-	idLen := (*C.uintptr_t)(unsafe.Pointer(uintptr(unsafe.Pointer(&addr)) + 8))
-	if idPtr != nil && *idLen > 0 {
-		nodeAddr.EndpointID = C.GoStringN((*C.char)(*idPtr), C.int(*idLen))
-	}
-
-	// relay_url at offset 16
-	relayPtr := (*unsafe.Pointer)(unsafe.Pointer(uintptr(unsafe.Pointer(&addr)) + 16))
-	relayLen := (*C.uintptr_t)(unsafe.Pointer(uintptr(unsafe.Pointer(&addr)) + 24))
-	if relayPtr != nil && *relayLen > 0 {
-		nodeAddr.RelayURL = C.GoStringN((*C.char)(*relayPtr), C.int(*relayLen))
-	}
-
-	// direct_addresses at offset 32: iroh_bytes_list_t { items_ptr(8), len(8) }
-	daListPtr := (*unsafe.Pointer)(unsafe.Pointer(uintptr(unsafe.Pointer(&addr)) + 32))
-	daListLen := (*C.uintptr_t)(unsafe.Pointer(uintptr(unsafe.Pointer(&addr)) + 40))
-	if daListPtr != nil && *daListLen > 0 {
-		daItems := (*[256]C.struct_iroh_bytes_t)(*daListPtr)
-		for i := 0; i < int(*daListLen); i++ {
-			item := daItems[i]
-			if item.ptr != nil && item.len > 0 {
-				nodeAddr.DirectAddresses = append(nodeAddr.DirectAddresses,
-					C.GoStringN((*C.char)(unsafe.Pointer(item.ptr)), C.int(item.len)))
+	// Fields of addr point into addrBuf (borrowed); read via the cgo struct.
+	nodeAddr.EndpointID = string(viewBytes(addr.endpoint_id))
+	nodeAddr.RelayURL = string(viewBytes(addr.relay_url))
+	if addr.direct_addresses.items != nil && addr.direct_addresses.len > 0 {
+		items := unsafe.Slice(addr.direct_addresses.items, int(addr.direct_addresses.len))
+		for _, item := range items {
+			if b := viewBytes(item); len(b) > 0 {
+				nodeAddr.DirectAddresses = append(nodeAddr.DirectAddresses, string(b))
 			}
 		}
 	}
@@ -152,7 +134,7 @@ func (n *Node) ExportSecretKey() ([]byte, error) {
 	var buf [32]byte
 	var outLen C.uintptr_t
 
-	r := C.iroh_node_export_secret_key(
+	r := C.aster_node_export_secret_key(
 		C.uint64_t(n.runtime.handle),
 		C.uint64_t(n.handle),
 		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
@@ -160,7 +142,7 @@ func (n *Node) ExportSecretKey() ([]byte, error) {
 		&outLen,
 	)
 	if r != 0 {
-		return nil, fmt.Errorf("iroh_node_export_secret_key: %w", Error(r))
+		return nil, fmt.Errorf("aster_node_export_secret_key: %w", Error(r))
 	}
 	if outLen == 0 {
 		return nil, nil
@@ -181,9 +163,9 @@ func (n *Node) Close() error {
 	// Remove accept handler so no new connections arrive.
 	n.runtime.removeAcceptHandler(n.handle)
 
-	r := C.iroh_node_free(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle))
+	r := C.aster_node_free(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle))
 	if r != 0 {
-		return fmt.Errorf("iroh_node_free: %w", Error(r))
+		return fmt.Errorf("aster_node_free: %w", Error(r))
 	}
 	return nil
 }
@@ -219,25 +201,25 @@ func PersistentWithAlpns(ctx context.Context, path string, alpns []string) (*Nod
 }
 
 func createNode(ctx context.Context, runtime *Runtime, alpns []string, path string, persistent bool) (*Node, error) {
-	var opID C.iroh_operation_t
+	var opID C.aster_operation_t
 
 	var r C.int32_t
 	if persistent {
 		pathBytes := []byte(path)
 		cBuf := C.malloc(C.size_t(len(pathBytes)))
 		C.memcpy(cBuf, unsafe.Pointer(&pathBytes[0]), C.size_t(len(pathBytes)))
-		bytes := C.struct_iroh_bytes_t{
+		bytes := C.struct_aster_bytes_t{
 			ptr: (*C.uint8_t)(cBuf),
 			len: C.uintptr_t(len(pathBytes)),
 		}
-		r = C.iroh_node_persistent(
+		r = C.aster_node_persistent(
 			C.uint64_t(runtime.handle),
 			bytes,
 			0,
 			&opID,
 		)
 	} else if len(alpns) == 0 {
-		r = C.iroh_node_memory(
+		r = C.aster_node_memory(
 			C.uint64_t(runtime.handle),
 			0,
 			&opID,
@@ -259,7 +241,7 @@ func createNode(ctx context.Context, runtime *Runtime, alpns []string, path stri
 			alpnLens[i] = C.uintptr_t(len(b))
 		}
 
-		r = C.iroh_node_memory_with_alpns(
+		r = C.aster_node_memory_with_alpns(
 			C.uint64_t(runtime.handle),
 			(**C.uint8_t)(unsafe.Pointer(&alpnPtrs[0])),
 			(*C.uintptr_t)(unsafe.Pointer(&alpnLens[0])),
@@ -284,7 +266,7 @@ func createNode(ctx context.Context, runtime *Runtime, alpns []string, path stri
 		runtime.Close()
 		return nil, fmt.Errorf("node create poll: %w", err)
 	}
-	if ev.Kind != IROH_EVENT_NODE_CREATED {
+	if ev.Kind != ASTER_EVENT_NODE_CREATED {
 		runtime.Close()
 		return nil, fmt.Errorf("node create: unexpected event %d", ev.Kind)
 	}
@@ -300,9 +282,9 @@ func createNode(ctx context.Context, runtime *Runtime, alpns []string, path stri
 	return node, nil
 }
 
-// onAcceptEvent is called by the runtime when an IROH_EVENT_ASTER_ACCEPTED event arrives.
+// onAcceptEvent is called by the runtime when an ASTER_EVENT_ASTER_ACCEPTED event arrives.
 func (n *Node) onAcceptEvent(ev *Event) {
-	if ev.Kind != IROH_EVENT_ASTER_ACCEPTED {
+	if ev.Kind != ASTER_EVENT_ASTER_ACCEPTED {
 		return
 	}
 

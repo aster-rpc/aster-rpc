@@ -23,7 +23,7 @@ public class IrohEndpoint extends IrohHandle {
   /** Cleaner cannot call async FFI. This is a no-op; explicit {@link #close()} must be called. */
   @Override
   protected void freeNative(long handle) {
-    // Cannot call async iroh_endpoint_close from Cleaner.
+    // Cannot call async aster_endpoint_close from Cleaner.
     // Explicit close() is required.
     System.err.println("IrohEndpoint: close() not called, handle " + handle + " leaked");
   }
@@ -35,7 +35,7 @@ public class IrohEndpoint extends IrohHandle {
   /**
    * Get this endpoint's node ID as a 64-char hex string.
    *
-   * <p>The FFI {@code iroh_endpoint_id} returns an already-hex-encoded ASCII buffer (Rust's {@code
+   * <p>The FFI {@code aster_endpoint_id} returns an already-hex-encoded ASCII buffer (Rust's {@code
    * NodeId::to_string()}); the Java wrapper decodes those bytes as UTF-8 rather than hex-encoding
    * them again. Re-hexing was a latent bug that doubled the length to 128 chars.
    */
@@ -50,7 +50,7 @@ public class IrohEndpoint extends IrohHandle {
 
     int status = lib.endpointId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
     if (status != 0) {
-      throw new IrohException(IrohStatus.fromCode(status), "iroh_endpoint_id failed: " + status);
+      throw new IrohException(IrohStatus.fromCode(status), "aster_endpoint_id failed: " + status);
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -75,7 +75,7 @@ public class IrohEndpoint extends IrohHandle {
     var alloc = confined;
 
     MemorySegment bufSeg = alloc.allocate(ValueLayout.JAVA_BYTE, 4096);
-    // IROH_NODE_ADDR is 48 bytes but allocate(layout) creates 0-size segment
+    // ASTER_NODE_ADDR is 48 bytes but allocate(layout) creates 0-size segment
     // Use explicit size to ensure proper allocation
     MemorySegment addrSeg = alloc.allocate(48);
 
@@ -83,7 +83,7 @@ public class IrohEndpoint extends IrohHandle {
         lib.endpointAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg);
     if (status != 0) {
       throw new IrohException(
-          IrohStatus.fromCode(status), "iroh_endpoint_addr_info failed: " + status);
+          IrohStatus.fromCode(status), "aster_endpoint_addr_info failed: " + status);
     }
 
     String endpointId = readIrohBytes(addrSeg.asSlice(0, 16));
@@ -125,7 +125,7 @@ public class IrohEndpoint extends IrohHandle {
     }
 
     java.util.List<String> result = new java.util.ArrayList<>();
-    long itemSize = 16; // size of iroh_bytes_t { ptr: 8, len: 8 }
+    long itemSize = 16; // size of aster_bytes_t { ptr: 8, len: 8 }
     for (int i = 0; i < itemsLen; i++) {
       // Create a properly sized segment using reinterpret after ofAddress
       MemorySegment itemSeg =
@@ -155,14 +155,14 @@ public class IrohEndpoint extends IrohHandle {
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
-    // Build iroh_connect_config_t via ConnectionConfig builder
+    // Build aster_connect_config_t via ConnectionConfig builder
     var configSeg = new ConnectionConfig().nodeId(nodeIdHex).alpn(alpn).toNative(alloc);
 
     var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
     var connect =
         lib.getHandle(
-            "iroh_connect",
+            "aster_connect",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -175,10 +175,10 @@ public class IrohEndpoint extends IrohHandle {
       int status =
           (int) connect.invoke(runtime.nativeHandle(), nativeHandle(), configSeg, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_connect failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_connect failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_connect threw: " + t.getMessage());
+      throw new IrohException("aster_connect threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -206,10 +206,10 @@ public class IrohEndpoint extends IrohHandle {
     Arena confined = Arena.ofConfined();
     var alloc = confined;
 
-    // Build iroh_node_addr_t from the NodeAddr
+    // Build aster_node_addr_t from the NodeAddr
     MemorySegment addrSeg = addr.toNative(alloc);
 
-    // Build iroh_connect_config_t with the addr field set to point to addrSeg
+    // Build aster_connect_config_t with the addr field set to point to addrSeg
     var configSeg =
         new ConnectionConfig()
             .nodeId(addr.endpointId())
@@ -221,7 +221,7 @@ public class IrohEndpoint extends IrohHandle {
 
     var connect =
         lib.getHandle(
-            "iroh_connect",
+            "aster_connect",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -234,10 +234,10 @@ public class IrohEndpoint extends IrohHandle {
       int status =
           (int) connect.invoke(runtime.nativeHandle(), nativeHandle(), configSeg, 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_connect failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_connect failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_connect threw: " + t.getMessage());
+      throw new IrohException("aster_connect threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -266,7 +266,7 @@ public class IrohEndpoint extends IrohHandle {
 
     var accept =
         lib.getHandle(
-            "iroh_accept",
+            "aster_accept",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -278,10 +278,10 @@ public class IrohEndpoint extends IrohHandle {
       // runtime, endpoint, user_data, out_operation
       int status = (int) accept.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "iroh_accept failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_accept failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_accept threw: " + t.getMessage());
+      throw new IrohException("aster_accept threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -310,7 +310,7 @@ public class IrohEndpoint extends IrohHandle {
 
     var endpointClose =
         lib.getHandle(
-            "iroh_endpoint_close",
+            "aster_endpoint_close",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -323,10 +323,10 @@ public class IrohEndpoint extends IrohHandle {
       int status = (int) endpointClose.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_endpoint_close failed: " + status);
+            IrohStatus.fromCode(status), "aster_endpoint_close failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_endpoint_close threw: " + t.getMessage());
+      throw new IrohException("aster_endpoint_close threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -363,7 +363,7 @@ public class IrohEndpoint extends IrohHandle {
 
     var exportSecretKey =
         lib.getHandle(
-            "iroh_endpoint_export_secret_key",
+            "aster_endpoint_export_secret_key",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -377,10 +377,10 @@ public class IrohEndpoint extends IrohHandle {
           (int) exportSecretKey.invoke(runtime.nativeHandle(), nativeHandle(), bufSeg, 32L, lenSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "iroh_endpoint_export_secret_key failed: " + status);
+            IrohStatus.fromCode(status), "aster_endpoint_export_secret_key failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("iroh_endpoint_export_secret_key threw: " + t.getMessage());
+      throw new IrohException("aster_endpoint_export_secret_key threw: " + t.getMessage());
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);

@@ -116,7 +116,7 @@ impl Default for SoakMetrics {
 
 // ─── Soak Test ────────────────────────────────────────────────────────────
 
-fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
+fn run_soak_cycle(runtime: aster_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
     // Drain any stale events from the previous cycle before starting a new one.
     drain_all_events(runtime);
 
@@ -124,9 +124,9 @@ fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
     let alpns = [b"aster".as_ptr()];
     let alpn_lens = [5];
 
-    let mut node_op: iroh_operation_t = 0;
+    let mut node_op: aster_operation_t = 0;
     let status = unsafe {
-        iroh_node_memory_with_alpns(
+        aster_node_memory_with_alpns(
             runtime,
             alpns.as_ptr(),
             alpn_lens.as_ptr(),
@@ -136,12 +136,12 @@ fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
         )
     };
 
-    if status != iroh_status_t::IROH_STATUS_OK as i32 {
+    if status != aster_status_t::ASTER_STATUS_OK as i32 {
         return false;
     }
 
     // Poll until node creation is confirmed (not a fixed sleep)
-    let node_created = poll_for_event(runtime, iroh_event_kind_t::IROH_EVENT_NODE_CREATED, 2000);
+    let node_created = poll_for_event(runtime, aster_event_kind_t::ASTER_EVENT_NODE_CREATED, 2000);
     if !node_created {
         // Node creation timed out — treat as error, don't track as pending
         return false;
@@ -150,9 +150,9 @@ fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
     // for it, so we do NOT call record_complete() either.
 
     // Submit accept (will hang since no peer connects)
-    let mut accept_op: iroh_operation_t = 0;
-    let status = unsafe { iroh_node_accept_aster(runtime, 1, 0, &mut accept_op) };
-    if status != iroh_status_t::IROH_STATUS_OK as i32 {
+    let mut accept_op: aster_operation_t = 0;
+    let status = unsafe { aster_node_accept_aster(runtime, 1, 0, &mut accept_op) };
+    if status != aster_status_t::ASTER_STATUS_OK as i32 {
         return false;
     }
     metrics.record_submit();
@@ -164,8 +164,8 @@ fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
 
     if should_cancel {
         std::thread::sleep(Duration::from_millis(5));
-        let cancel_status = unsafe { iroh_operation_cancel(runtime, accept_op) };
-        if cancel_status != iroh_status_t::IROH_STATUS_OK as i32 {
+        let cancel_status = unsafe { aster_operation_cancel(runtime, accept_op) };
+        if cancel_status != aster_status_t::ASTER_STATUS_OK as i32 {
             // Cancel failed (already completed) — that's fine, drain handles it
         }
         // If cancel succeeded, the event will be CANCELLED in the drain loop below.
@@ -174,15 +174,15 @@ fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
     // Drain accept events
     loop {
         // SAFETY: zeroed() is unsafe but we own this memory and poll_events writes to it
-        let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 8] };
-        let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 8, 100) };
+        let mut events = unsafe { [std::mem::zeroed::<aster_event_t>(); 8] };
+        let count = unsafe { aster_poll_events(runtime, events.as_mut_ptr(), 8, 100) };
         if count == 0 {
             break;
         }
         for ev in events.iter().take(count) {
             // Only record accept events (skip node creation/close events)
             if ev.operation == accept_op {
-                if ev.status == iroh_status_t::IROH_STATUS_OK as u32 {
+                if ev.status == aster_status_t::ASTER_STATUS_OK as u32 {
                     metrics.record_complete();
                 } else {
                     // CANCELLED or ERROR — either way, record as error/cancel
@@ -193,11 +193,11 @@ fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
     }
 
     // Close the node
-    let mut close_op: iroh_operation_t = 0;
-    let status = unsafe { iroh_node_close(runtime, 1, 0, &mut close_op) };
-    if status == iroh_status_t::IROH_STATUS_OK as i32 {
+    let mut close_op: aster_operation_t = 0;
+    let status = unsafe { aster_node_close(runtime, 1, 0, &mut close_op) };
+    if status == aster_status_t::ASTER_STATUS_OK as i32 {
         // Wait for close to complete
-        let closed = poll_for_event(runtime, iroh_event_kind_t::IROH_EVENT_CLOSED, 2000);
+        let closed = poll_for_event(runtime, aster_event_kind_t::ASTER_EVENT_CLOSED, 2000);
         if !closed {
             // Close didn't complete in time, but don't fail the cycle — node may be gone
         }
@@ -209,11 +209,11 @@ fn run_soak_cycle(runtime: iroh_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
 }
 
 // Drain all pending events from the runtime (clears stale events between cycles).
-fn drain_all_events(runtime: iroh_runtime_t) {
+fn drain_all_events(runtime: aster_runtime_t) {
     loop {
         // SAFETY: zeroed() is unsafe but we own this memory and poll_events writes to it
-        let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 16] };
-        let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 16, 0) };
+        let mut events = unsafe { [std::mem::zeroed::<aster_event_t>(); 16] };
+        let count = unsafe { aster_poll_events(runtime, events.as_mut_ptr(), 16, 0) };
         if count == 0 {
             break;
         }
@@ -222,15 +222,15 @@ fn drain_all_events(runtime: iroh_runtime_t) {
 
 // Poll for a specific event kind within a timeout (in ms).
 // Returns true if the event was found, false on timeout.
-fn poll_for_event(runtime: iroh_runtime_t, kind: iroh_event_kind_t, timeout_ms: u32) -> bool {
+fn poll_for_event(runtime: aster_runtime_t, kind: aster_event_kind_t, timeout_ms: u32) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
     loop {
         if std::time::Instant::now() >= deadline {
             return false;
         }
         // SAFETY: zeroed() is unsafe but we own this memory and poll_events writes to it
-        let mut events = unsafe { [std::mem::zeroed::<iroh_event_t>(); 4] };
-        let count = unsafe { iroh_poll_events(runtime, events.as_mut_ptr(), 4, 50) };
+        let mut events = unsafe { [std::mem::zeroed::<aster_event_t>(); 4] };
+        let count = unsafe { aster_poll_events(runtime, events.as_mut_ptr(), 4, 50) };
         for ev in events.iter().take(count) {
             if ev.kind == kind as u32 {
                 return true;
@@ -260,9 +260,9 @@ fn run_soak_test(duration_secs: u64) {
     let deadline = start + Duration::from_secs(duration_secs);
 
     // Create runtime
-    let mut runtime: iroh_runtime_t = 0;
-    let status = unsafe { iroh_runtime_new(ptr::null(), &mut runtime) };
-    assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+    let mut runtime: aster_runtime_t = 0;
+    let status = unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime) };
+    assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
     let metrics = Arc::new(SoakMetrics::new());
     let mut cycle_count = 0usize;
@@ -337,8 +337,8 @@ fn run_soak_test(duration_secs: u64) {
     );
 
     // Close runtime
-    let status = unsafe { iroh_runtime_close(runtime) };
-    assert_eq!(status, iroh_status_t::IROH_STATUS_OK as i32);
+    let status = unsafe { aster_runtime_close(runtime) };
+    assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
     println!("Soak test PASSED — no leaks detected");
 }
