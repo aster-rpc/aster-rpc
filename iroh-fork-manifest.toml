@@ -116,17 +116,16 @@ crate_version = "0.101.0"
 [forks.salvo]
 repo = "https://forge.emrul.dev/Aster/salvo.git"
 upstream_base = "v1.0.0"
-tag = "v1.0.0-aster.1"  # also aster-salvo-2026-10-03
-commit = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f"
+tag = "v1.0.0-aster.2"  # also aster-salvo-2026-10-03.2
+commit = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
 branch = "main"
-crates = ["salvo", "salvo_core", "salvo_macros", "salvo-http3", "h3", "h3-quinn"]
+crates = ["salvo", "salvo_core", "salvo_macros", "salvo-http3", "h3", "h3-quinn", "h3-datagram"]
 registry_crates = [
-  "h3", "h3-quinn", "salvo", "salvo-acme", "salvo-http3", "salvo-otel",
+  "h3", "h3-datagram", "h3-quinn", "salvo", "salvo-acme", "salvo-http3", "salvo-otel",
   "salvo-proxy", "salvo-serde-util", "salvo-serve-static", "salvo_core",
   "salvo_macros",
 ]
-crate_version = "1.0.0"
-registry_bridge_crates = ["h3-datagram"]
+crate_version = "1.0.1"
 
 # Fory is part of Aster's supported native surface, but this release carries
 # the unmodified crates.io packages. Do not mirror third-party source merely to
@@ -171,12 +170,6 @@ repo = "https://github.com/n0-computer/iroh-tickets"
 commit = "4899684e1209dea29ed28aa2314450927557b037"
 version = "1.0.0"
 rewrites = ["iroh-base"]
-
-[bridges.h3-datagram]
-repo = "https://github.com/hyperium/h3"
-commit = "230744a80ad49aa14ae68c4b9698fb6260992dbd"
-version = "0.0.2"
-rewrites = ["h3"]
 
 # -----------------------------------------------------------------------------
 # Transitive crates.io constraints forced by upstream's dependency updates (1.0, 1.3.0).
@@ -229,14 +222,15 @@ iroh-tickets = { git = "https://github.com/n0-computer/iroh-tickets",  rev = "48
 iroh-util    = { git = "https://forge.emrul.dev/Aster/iroh-util.git",  rev = "afed9e6d07e41450fe1970e794782bab7df9c2f4" }
 """
 
-# Salvo fork pin block ([patch.crates-io]) — the fork patches h3 / h3-quinn /
+# Salvo fork pin block ([patch.crates-io]) — the fork patches h3 / h3-quinn / h3-datagram /
 # salvo-http3 internally and [patch.crates-io] does not cross workspaces, so
 # every source-tree bootstrap root re-declares the whole family at the same rev:
 salvo_patch_crates_io = """
-salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
 """

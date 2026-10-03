@@ -28,7 +28,7 @@ iroh-mdns-address-lookup = { version = "=0.4.0", registry = "aster", git = "http
 
 # HTTP/WebTransport transport. Like the Iroh entries above, the Git location
 # is used for repository builds and the version is used for registry packages.
-salvo = { version = "1.0", registry = "aster", git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+salvo = { version = "1.0", registry = "aster", git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
 
 # Python FFI
 pyo3        = { version = "0.28.2", features = ["extension-module", "abi3-py39", "generate-import-lib"] }
@@ -78,21 +78,24 @@ iroh-util                = { git = "https://forge.emrul.dev/Aster/iroh-util.git"
 # Aster Salvo fork (HTTP transport — see docs/_internal/working_ideas/aster-http3-transport.md)
 # ──────────────────────────────────────────────────────────────────────────
 # The product family builds one identical Salvo: bump portal_desktop (via the
-# Aster registry) and portal-agent (git patch) to match. c86d797c = tags
-# `v1.0.0-aster.1` / `aster-salvo-2026-10-03`: upstream salvo v1.0.0 plus the
-# six Aster patches (default keepalive, WT stream control,
+# Aster registry) and portal-agent (git patch) to match. d4cdbbd3 = tags
+# `v1.0.0-aster.2` / `aster-salvo-2026-10-03.2`: upstream salvo v1.0.0 plus the
+# seven Aster patches (default keepalive, WT stream control,
 # `Request::web_transport_owned()` with the still-shared hand-off fix,
 # `QuinnListener::transport_config_tuner()`, WT ratified interop, alt-svc
-# toggle). Nothing graduated in the 1.0 absorption. The fork keeps each patch
+# toggle, WT send-stream `transport_acked()`), published as salvo 1.0.1 with
+# h3 0.0.9 / h3-quinn 0.0.11 / salvo-http3 0.7.1 / h3-datagram 0.0.3 (all
+# vendored in the fork). Nothing graduated in the 1.0 absorption. The fork keeps each patch
 # on its own branch and re-cherry-picks onto main after each upstream merge;
 # pin the rev/tag, not the branch. Maintenance workflow: ~/dev/aster/salvo_fork.md.
-# Propagation gotcha: the fork patches h3 / h3-quinn / salvo-http3 internally,
+# Propagation gotcha: the fork patches h3 / h3-quinn / salvo-http3 / h3-datagram internally,
 # but [patch.crates-io] does NOT cross workspaces — re-declare them here.
-salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
 # (salvo_extra is patched by portal-agent but not yet pulled here — re-add the
 #  line when a feature brings it into the graph, else cargo warns "patch unused".)
-salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
-h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "c86d797ca9813beed6ea5f9b0bd3d3cc9a7efc7f" }
+salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }

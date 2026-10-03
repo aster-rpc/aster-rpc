@@ -70,18 +70,18 @@ PACKAGES = [
     Package("iroh-gossip", "0.101.0", "fork", "iroh-gossip", "Cargo.toml"),
     Package("iroh-blobs", "0.103.5", "fork", "iroh-blobs", "Cargo.toml"),
     Package("iroh-docs", "0.101.5", "fork", "iroh-docs", "Cargo.toml"),
-    Package("h3", "0.0.8", "vendor", "salvo", "vendor/h3/Cargo.toml"),
-    Package("h3-datagram", "0.0.2", "bridge", "h3-datagram"),
-    Package("h3-quinn", "0.0.10", "vendor", "salvo", "vendor/h3-quinn/Cargo.toml"),
-    Package("salvo-http3", "0.7.0", "vendor", "salvo", "vendor/salvo-http3/Cargo.toml"),
-    Package("salvo-serde-util", "1.0.0", "fork", "salvo", "crates/serde-util/Cargo.toml"),
-    Package("salvo_macros", "1.0.0", "fork", "salvo", "crates/macros/Cargo.toml"),
-    Package("salvo_core", "1.0.0", "fork", "salvo", "crates/core/Cargo.toml"),
-    Package("salvo-acme", "1.0.0", "fork", "salvo", "crates/acme/Cargo.toml"),
-    Package("salvo-otel", "1.0.0", "fork", "salvo", "crates/otel/Cargo.toml"),
-    Package("salvo-proxy", "1.0.0", "fork", "salvo", "crates/proxy/Cargo.toml"),
-    Package("salvo-serve-static", "1.0.0", "fork", "salvo", "crates/serve-static/Cargo.toml"),
-    Package("salvo", "1.0.0", "fork", "salvo", "crates/salvo/Cargo.toml"),
+    Package("h3", "0.0.9", "vendor", "salvo", "vendor/h3/Cargo.toml"),
+    Package("h3-datagram", "0.0.3", "vendor", "salvo", "vendor/h3-datagram/Cargo.toml"),
+    Package("h3-quinn", "0.0.11", "vendor", "salvo", "vendor/h3-quinn/Cargo.toml"),
+    Package("salvo-http3", "0.7.1", "vendor", "salvo", "vendor/salvo-http3/Cargo.toml"),
+    Package("salvo-serde-util", "1.0.1", "fork", "salvo", "crates/serde-util/Cargo.toml"),
+    Package("salvo_macros", "1.0.1", "fork", "salvo", "crates/macros/Cargo.toml"),
+    Package("salvo_core", "1.0.1", "fork", "salvo", "crates/core/Cargo.toml"),
+    Package("salvo-acme", "1.0.1", "fork", "salvo", "crates/acme/Cargo.toml"),
+    Package("salvo-otel", "1.0.1", "fork", "salvo", "crates/otel/Cargo.toml"),
+    Package("salvo-proxy", "1.0.1", "fork", "salvo", "crates/proxy/Cargo.toml"),
+    Package("salvo-serve-static", "1.0.1", "fork", "salvo", "crates/serve-static/Cargo.toml"),
+    Package("salvo", "1.0.1", "fork", "salvo", "crates/salvo/Cargo.toml"),
 ]
 
 PACKAGE_VERSIONS = {package.name: package.version for package in PACKAGES}
@@ -255,6 +255,7 @@ def load_release_manifest() -> dict[str, Any]:
             recorded = manifest["forks"][package.source]["crate_version"]
             if package.source == "salvo" and package.name in {
                 "h3",
+                "h3-datagram",
                 "h3-quinn",
                 "salvo-http3",
             }:
