@@ -548,7 +548,10 @@ struct HookInvocationState {
 // ============================================================================
 
 pub(crate) struct BridgeRuntime {
-    pub(crate) runtime: tokio::runtime::Runtime,
+    // Dropped by hand in `Drop for BridgeRuntime`: spawned tasks hold
+    // `Arc<BridgeRuntime>` clones, so the last reference can go away on one of
+    // this runtime's own worker threads, where dropping a Runtime panics.
+    pub(crate) runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
     events_tx: tokio::sync::mpsc::UnboundedSender<EventOwned>,
     events_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<EventOwned>>,
 
@@ -592,6 +595,22 @@ pub(crate) struct BridgeRuntime {
     registry_acls: Mutex<HashMap<u64, Arc<aster_transport_core::registry::RegistryAcl>>>,
 }
 
+impl Drop for BridgeRuntime {
+    fn drop(&mut self) {
+        // SAFETY: `runtime` is never touched again after this.
+        let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Inside an async context -- possibly a worker of this very
+            // runtime, which a blocking drop would wait on forever. Hand the
+            // drop to a detached OS thread; it completes once the current
+            // task returns to the scheduler.
+            std::thread::spawn(move || drop(runtime));
+        } else {
+            drop(runtime);
+        }
+    }
+}
+
 struct OperationState {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -617,7 +636,7 @@ impl BridgeRuntime {
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
-            runtime,
+            runtime: std::mem::ManuallyDrop::new(runtime),
             events_tx,
             events_rx: Mutex::new(events_rx),
             nodes: HandleRegistry::new(),
@@ -977,17 +996,9 @@ pub unsafe extern "C" fn aster_runtime_close(runtime: aster_runtime_t) -> i32 {
         Err(_) => return aster_status_t::ASTER_STATUS_INTERNAL as i32,
     };
 
-    // Dropping BridgeRuntime drops the tokio Runtime, which panics if
-    // called from within an async context (e.g. .NET DisposeAsync,
-    // Java Cleaner thread). Detect this and move the drop to a plain
-    // OS thread where blocking is safe.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || drop(arc))
-            .join()
-            .expect("runtime shutdown thread panicked");
-    } else {
-        drop(arc);
-    }
+    // In-flight tasks may still hold clones; whichever reference is last
+    // shuts the runtime down safely (see `Drop for BridgeRuntime`).
+    drop(arc);
 
     aster_status_t::ASTER_STATUS_OK as i32
 }
@@ -8071,5 +8082,45 @@ mod string_release_tests {
                 aster_status_t::ASTER_STATUS_OK as i32
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_drop_tests {
+    use super::*;
+
+    /// The last `Arc<BridgeRuntime>` released inside one of the runtime's own
+    /// tasks must not panic ("Cannot drop a runtime in a context where
+    /// blocking is not allowed") -- the .NET soak test hit exactly this when
+    /// a connection-close task outlived `aster_runtime_close`.
+    #[test]
+    fn last_reference_dropped_on_own_worker_does_not_panic() {
+        let mut handle: aster_runtime_t = 0;
+        let status =
+            unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, std::ptr::null(), &mut handle) };
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
+        let bridge = load_runtime(handle).expect("runtime");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let held = bridge.clone();
+        bridge.runtime.spawn(async move {
+            started_tx.send(()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // By now close() has run and this is the last reference.
+            drop(held);
+            // Unreachable if the drop above panicked.
+            let _ = done_tx.send(());
+        });
+        started_rx.recv().unwrap();
+        drop(bridge);
+        assert_eq!(
+            unsafe { aster_runtime_close(handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("last runtime reference dropped on its own worker panicked");
     }
 }
