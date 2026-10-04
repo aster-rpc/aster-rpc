@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.3)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.4)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -24,6 +24,50 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 4.4 (additive)
+
+ABI 4.4.0 (tranche F7) adds the **coordination client** (the `aster`
+client wrapped, never ported: journal, routing, inbound validation and the
+delivery contract stay in Rust) and the **placement manager** over it, whose
+providers are the existing upcall kinds 17 / 32 / 33 (now issued by the C
+ABI). Nothing in 4.3 changed shape. Sources: `ffi/src/coordination.rs`,
+`ffi/src/coordination_codec.rs`. Tests: `ffi/tests/coordination.rs` (feature
+`coordination-fixture`: an in-process voter group; journaled mutations and
+redelivery across reopen, journal lock, reads, ACL denial, leases, close with
+handles and operations outstanding, placement with hand-answered providers
+incl. error / unimplemented / malformed / timeout) and
+`ffi/tests/abi_contract_test.c` (`test_coordination`). Design:
+`docs/_internal/bindings/coordination-abi-design.md`.
+
+Requests and results are UCv1 messages `D0`-`DE` (tags exported as
+`ASTER_COORDINATION_TAG_*`; op bytes as `aster_coordination_mutation_op_t` /
+`aster_coordination_read_op_t`).
+
+| Function | Notes |
+|---|---|
+| `aster_coordination_client_options_init(*out)` | `aster_coordination_client_options_t` (48 bytes): `flags` (`ASTER_COORDINATION_CLIENT_READ_ONLY`), `group_id` (32 bytes), `seed_tickets` (Open tickets, routing hints), `journal_dir`. |
+| `aster_coordination_client_open(rt, node, opts*, ud, *op)` | `ASTER_EVENT_COORDINATION_CLIENT_OPENED` (110), `handle` = client. A second durable open over one journal: `ERROR`, `error_code` `JOURNAL_LOCKED`. |
+| `aster_coordination_client_close` / `_free` / `_ids(rt, c, group[32], local[32])` / `_id(rt, c, ud, *op)` | Close makes resolved / lease / manager handles inert (`ALREADY_CLOSED`); in-flight ops complete. `_id` → `BYTES_RESULT` (16 bytes). |
+| `aster_coordination_mutate(rt, c, D0, ud, *op)` | `ASTER_EVENT_COORDINATION_RESOLVED` (111): `handle` = `aster_coordination_resolved_t`, payload `D2`. Malformed request: `INVALID_ARGUMENT` at once. |
+| `aster_coordination_unacknowledged` / `_resume(rt, c, ud, *op)` | `RESOLVED`, `handle` 0 = nothing. |
+| `aster_coordination_resolved_acknowledge(rt, r, ud, *op)` / `_free` | Acknowledge consumes the handle (`UNIT_RESULT`); free leaves the result journaled. |
+| `aster_coordination_read(rt, c, D1, ud, *op)` | `ASTER_EVENT_COORDINATION_RESULT` (112), payload `D3`-`DA` by op. Either client. |
+| `aster_coordination_retire_other_client(rt, c, id[16], ud, *op)` / `_recovery_export_to_file(rt, c, path, ud, *op)` | `RESULT`: `DC` / `DB`. |
+| `aster_coordination_lease_acquire(rt, c, ns, key, ttl, renew, margin, ud, *op)` | `ASTER_EVENT_COORDINATION_LEASE_ACQUIRED` (113): granted `handle` + `DD`; denied `handle` 0 + UCv1 `B2`. |
+| `aster_coordination_lease_fence(rt, l, buf, cap, *len)` / `_status` | `DD` (`BUFFER_TOO_SMALL` sets `*len`); `aster_lease_status_t`. Never block. |
+| `aster_coordination_lease_compare_and_set` / `_release` / `_release_with_value` / `_free` | `RESULT` `D2` / `UNIT_RESULT` / `RESULT` `D2`; release consumes the handle and waits for an in-flight CAS. |
+| `aster_coordination_placement_manager_new(rt, c, upcalls, topology_node, *m)` / `_reconcile(rt, m, ud, *op)` / `_free` | Policy kind 32, provisioner kind 33 on `upcalls`; topology = `topology_node`'s view or (0) kind 17. `RESULT` `DE`. Provider failures fail the pass (no fail-open). |
+
+**New values:** `aster_event_kind_t` 110-113; `aster_coordination_error_t`
+(the `error_code` of a coordination `ASTER_EVENT_ERROR`: 1 `AWAITING_ACK`, 2
+`UNRESOLVED`, 3 `JOURNAL_LOCKED`, 4 `JOURNAL_FATAL`, 5 `RPC` (`flags` = the RPC
+code), 6 `UNAVAILABLE`, 7 `CLOSED`, 8 `REJECTED` (reserved), 9 `INVALID`, 10
+`OTHER`). No new `aster_status_t`; coordination admission uses the reserved
+auth outcomes: RPC 7 (ACL refusal) → `PERMISSION_DENIED` (15), RPC 16 →
+`UNAUTHENTICATED` (14); RPC 14 → `CONNECTION_REFUSED`, 12 → `UNSUPPORTED`.
+Error events may now carry a non-zero `flags`. Codec vectors:
+`conformance/vectors/coordination.json` (`ffi/tests/coordination_vectors.rs`).
 
 ## New in 4.3 (additive)
 
@@ -246,8 +290,8 @@ max_batch, *out)` (kind 16, cached + batched, never blocks a read);
 bootstrap, position_refresh_ms, ud, *op)` joins the topology v2 swarm with the
 filter installed (`UNIT_RESULT`; needs `enable_monitoring`).
 
-**Not exposed (gaps):** placement providers (kinds 17/32/33 -- the C ABI has no
-coordination client), expose authorize / HTTP handler / route policy
+**Not exposed (gaps):** placement providers (kinds 17/32/33 -- wired in 4.4
+with the coordination client, see "New in 4.4"), expose authorize / HTTP handler / route policy
 (48/49/50 -- wired in 4.2, see "New in 4.2"), Gate 0 over upcalls (64/65 -- the 3.2 hook iterators keep serving
 admission), and a read side for the shared topology view (clusters /
 serialized snapshot -- needs `SharedView` parts from core). No typed C decode

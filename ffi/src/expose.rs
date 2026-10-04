@@ -1046,6 +1046,7 @@ fn relay_op_error(e: &ResponseError) -> OpError {
     OpError {
         status: body_code_status(code),
         code,
+        flags: 0,
         message: e.to_string(),
     }
 }

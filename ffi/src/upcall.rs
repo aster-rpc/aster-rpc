@@ -30,11 +30,11 @@
 //!   `aster_topology_enable_shared`, which installs it as the swarm's
 //!   read-time `admitted` filter.
 //!
-//! Expose (kinds 48/49/50) is wired in `expose.rs` since ABI 4.2.
+//! Expose (kinds 48/49/50) is wired in `expose.rs` since ABI 4.2; the
+//! placement providers (kinds 17/32/33) in `coordination.rs` since ABI 4.4.
 //!
-//! Not in the C ABI (yet): placement providers (kinds 17/32/33 -- the C ABI
-//! has no coordination client) and Gate 0 over upcalls (kinds 64/65 -- the
-//! 3.2 hook iterators serve admission).
+//! Not in the C ABI (yet): Gate 0 over upcalls (kinds 64/65 -- the 3.2 hook
+//! iterators serve admission).
 //!
 //! # Threading
 //!
@@ -110,11 +110,12 @@ pub enum aster_upcall_kind_t {
     ASTER_UPCALL_KIND_FENCED_MUTATE = 4,
     /// Topology `admitted` filter, batched (decision): `B8` → `B9`.
     ASTER_UPCALL_KIND_TOPOLOGY_ADMITTED = 16,
-    /// Placement topology source: `BA` → `BB` (not issued by the C ABI yet).
+    /// Placement topology source: `BA` → `BB` (ABI 4.4,
+    /// `aster_coordination_placement_manager_new` with no topology node).
     ASTER_UPCALL_KIND_TOPOLOGY_SNAPSHOT = 17,
-    /// Placement policy source: `BC` → `BD` (not issued by the C ABI yet).
+    /// Placement policy source: `BC` → `BD` (ABI 4.4, placement manager).
     ASTER_UPCALL_KIND_PLACEMENT_POLICY = 32,
-    /// Placement provisioner: `BE` → `BF` (not issued by the C ABI yet).
+    /// Placement provisioner: `BE` → `BF` (ABI 4.4, placement manager).
     ASTER_UPCALL_KIND_PLACEMENT_PROVISION = 33,
     /// expose authorize (decision): `C0` → `CF` (ABI 4.2, `expose.rs`).
     ASTER_UPCALL_KIND_EXPOSE_AUTHORIZE = 48,
@@ -270,7 +271,7 @@ fn policy(timeout_ms: u32, mode: u32) -> Result<UpcallPolicy, i32> {
     ))
 }
 
-fn lease_status_code(s: LeaseStatus) -> u32 {
+pub(crate) fn lease_status_code(s: LeaseStatus) -> u32 {
     (match s {
         LeaseStatus::Held => aster_lease_status_t::ASTER_LEASE_STATUS_HELD,
         LeaseStatus::Released => aster_lease_status_t::ASTER_LEASE_STATUS_RELEASED,
@@ -591,7 +592,11 @@ fn serializer_for(serializer: aster_lease_serializer_t) -> Result<Arc<dyn LeaseS
         .ok_or_else(|| not_found(format!("unknown lease serializer {serializer}")))
 }
 
-fn lease_options(ttl_ms: u64, renew_ms: u64, margin_ms: u64) -> Result<LeaseOptions, i32> {
+pub(crate) fn lease_options(
+    ttl_ms: u64,
+    renew_ms: u64,
+    margin_ms: u64,
+) -> Result<LeaseOptions, i32> {
     if ttl_ms == 0 {
         if renew_ms != 0 || margin_ms != 0 {
             return Err(invalid(

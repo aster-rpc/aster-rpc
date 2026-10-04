@@ -14,7 +14,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "aster_ffi.h"
 
@@ -326,6 +328,20 @@ OFF(aster_http_relay_options_t, max_chunk, 8);
 OFF(aster_http_relay_options_t, upload_capacity, 16);
 OFF(aster_http_relay_options_t, reserved, 20);
 
+/* ABI 4.4: coordination client */
+LAYOUT(aster_coordination_client_options_t, 48);
+OFF(aster_coordination_client_options_t, struct_size, 0);
+OFF(aster_coordination_client_options_t, flags, 4);
+OFF(aster_coordination_client_options_t, group_id, 8);
+OFF(aster_coordination_client_options_t, seed_tickets, 16);
+OFF(aster_coordination_client_options_t, journal_dir, 32);
+_Static_assert(sizeof(aster_coordination_error_t) == 4, "enum size");
+_Static_assert(sizeof(aster_coordination_mutation_op_t) == 4, "enum size");
+_Static_assert(sizeof(aster_coordination_read_op_t) == 4, "enum size");
+_Static_assert(sizeof(aster_coordination_client_t) == 8 && sizeof(aster_coordination_resolved_t) == 8 &&
+               sizeof(aster_coordination_lease_t) == 8 &&
+               sizeof(aster_coordination_placement_manager_t) == 8, "handle size");
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -347,7 +363,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 3); /* 4.2: expose; 4.3: streaming relay */
+    CHECK(ASTER_ABI_VERSION_MINOR == 4); /* 4.2: expose; 4.3: streaming relay; 4.4: coordination */
     CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
@@ -420,6 +436,16 @@ static void test_enum_values(void) {
     CHECK(ASTER_UPCALL_CANCEL_TIMEOUT == 1 && ASTER_UPCALL_CANCEL_SHUTDOWN == 3);
     CHECK(ASTER_LEASE_STATUS_HELD == 0 && ASTER_LEASE_STATUS_LOST == 3);
     CHECK(ASTER_UPCALL_DEFAULT_CAPACITY == 1024);
+    /* 4.4 */
+    CHECK(ASTER_EVENT_COORDINATION_CLIENT_OPENED == 110 && ASTER_EVENT_COORDINATION_RESOLVED == 111);
+    CHECK(ASTER_EVENT_COORDINATION_RESULT == 112 && ASTER_EVENT_COORDINATION_LEASE_ACQUIRED == 113);
+    CHECK(ASTER_COORDINATION_ERROR_AWAITING_ACK == 1 && ASTER_COORDINATION_ERROR_JOURNAL_LOCKED == 3);
+    CHECK(ASTER_COORDINATION_ERROR_RPC == 5 && ASTER_COORDINATION_ERROR_UNAVAILABLE == 6);
+    CHECK(ASTER_COORDINATION_ERROR_CLOSED == 7 && ASTER_COORDINATION_ERROR_OTHER == 10);
+    CHECK(ASTER_COORDINATION_MUTATE_ACQUIRE == 1 && ASTER_COORDINATION_MUTATE_CANCEL_MEMBERSHIP == 10);
+    CHECK(ASTER_COORDINATION_READ_READ_LINEARIZABLE == 1 && ASTER_COORDINATION_READ_RECOVERY_EXPORT == 8);
+    CHECK(ASTER_COORDINATION_TAG_MUTATION_REQUEST == 0xD0 && ASTER_COORDINATION_TAG_PLACEMENT_REPORT == 0xDE);
+    CHECK(ASTER_COORDINATION_CLIENT_READ_ONLY == 1);
 }
 
 static void test_data_plane(void) {
@@ -1072,6 +1098,89 @@ static void test_relay_stream(void) {
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
+/* ABI 4.4: the coordination client's lifecycle, from C. No voter group is
+ * reachable here (tests/coordination.rs has a live one): the journal lock,
+ * request validation, an unreachable group's typed error and the handle
+ * rules are what a binding can check without one. */
+static void test_coordination(void) {
+    printf("[coordination 4.4]\n");
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+    aster_config_t c;
+    CHECK(aster_config_init(&c) == ASTER_STATUS_OK);
+    c.relay_mode = ASTER_RELAY_MODE_DISABLED;
+    c.bind_addr = (aster_bytes_t){(const uint8_t *)"127.0.0.1:0", 11};
+    aster_operation_t op = 0;
+    aster_event_t ev;
+    CHECK(aster_node_start(rt, &c, 0, 0, &op) == ASTER_STATUS_OK);
+    CHECK(wait_event(rt, op, &ev) && ev.kind == ASTER_EVENT_NODE_CREATED);
+    aster_node_t node = ev.handle;
+
+    /* A fresh journal directory (the client creates it) inside the runner's
+     * scratch directory, which run-c-abi-test.sh removes. */
+    char dir[512];
+    const char *scratch = getenv("ASTER_ABI_TEST_DIR");
+    snprintf(dir, sizeof dir, "%s/coord-%lx-%lx", scratch ? scratch : "/tmp",
+             (unsigned long)time(NULL), (unsigned long)(uintptr_t)&dir);
+    uint8_t group[32];
+    memset(group, 0x5c, sizeof group);
+    aster_coordination_client_options_t o;
+    CHECK(aster_coordination_client_options_init(&o) == ASTER_STATUS_OK);
+    CHECK(o.struct_size == sizeof o && o.flags == 0 && o.group_id == NULL);
+    /* No group id: refused before anything starts. */
+    CHECK(aster_coordination_client_open(rt, node, &o, 1, &op) == ASTER_STATUS_INVALID_ARGUMENT);
+    o.group_id = group;
+    o.journal_dir = bstr(dir);
+
+    CHECK(aster_coordination_client_open(rt, node, &o, 1, &op) == ASTER_STATUS_OK);
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev));
+    CHECK(ev.kind == ASTER_EVENT_COORDINATION_CLIENT_OPENED && ev.handle != 0 && ev.related == node);
+    aster_coordination_client_t client = ev.handle;
+
+    /* The journal's lifetime lock: a second durable client is refused. */
+    CHECK(aster_coordination_client_open(rt, node, &o, 2, &op) == ASTER_STATUS_OK);
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev));
+    CHECK(ev.kind == ASTER_EVENT_ERROR && ev.error_code == ASTER_COORDINATION_ERROR_JOURNAL_LOCKED);
+    if (ev.buffer) aster_buffer_release(rt, ev.buffer);
+
+    uint8_t gid[32] = {0}, local[32] = {0};
+    CHECK(aster_coordination_client_ids(rt, client, gid, local) == ASTER_STATUS_OK);
+    CHECK(memcmp(gid, group, 32) == 0);
+
+    /* A malformed request never leaves the process. */
+    uint8_t bad[] = {ASTER_COORDINATION_TAG_MUTATION_REQUEST, 0x01, 0};
+    aster_bytes_t req = {bad, sizeof bad};
+    CHECK(aster_coordination_mutate(rt, client, req, 0, &op) == ASTER_STATUS_INVALID_ARGUMENT);
+    /* group_status: tag D1, version, op 5. No member is reachable. */
+    uint8_t status_req[] = {ASTER_COORDINATION_TAG_READ_REQUEST, 0x01, ASTER_COORDINATION_READ_GROUP_STATUS};
+    aster_bytes_t sreq = {status_req, sizeof status_req};
+    CHECK(aster_coordination_read(rt, client, sreq, 3, &op) == ASTER_STATUS_OK);
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev));
+    CHECK(ev.kind == ASTER_EVENT_ERROR && ev.user_data == 3);
+    CHECK(ev.error_code == ASTER_COORDINATION_ERROR_UNAVAILABLE && ev.status == ASTER_STATUS_CONNECTION_REFUSED);
+    if (ev.buffer) aster_buffer_release(rt, ev.buffer);
+
+    /* Close: the handle stays registered but refuses work; free twice. */
+    CHECK(aster_coordination_client_close(rt, client) == ASTER_STATUS_OK);
+    CHECK(aster_coordination_read(rt, client, sreq, 0, &op) == ASTER_STATUS_ALREADY_CLOSED);
+    CHECK(aster_coordination_client_free(rt, client) == ASTER_STATUS_OK);
+    CHECK(aster_coordination_client_free(rt, client) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_coordination_resolved_free(rt, 424242) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_coordination_lease_free(rt, 424242) == ASTER_STATUS_NOT_FOUND);
+
+    /* The journal lock is released: reopen succeeds. */
+    CHECK(aster_coordination_client_open(rt, node, &o, 4, &op) == ASTER_STATUS_OK);
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev) && ev.kind == ASTER_EVENT_COORDINATION_CLIENT_OPENED);
+    CHECK(aster_coordination_client_free(rt, ev.handle) == ASTER_STATUS_OK);
+
+    CHECK(aster_node_free(rt, node) == ASTER_STATUS_OK);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
+}
+
 int main(void) {
     test_abi_version();
     test_enum_values();
@@ -1085,6 +1194,7 @@ int main(void) {
     test_upcalls();
     test_expose();
     test_relay_stream();
+    test_coordination();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;

@@ -50,4 +50,7 @@ include = [
   "aster_lease_status_t",
   "aster_http_body_status_t",
   "aster_route_protocol_t",
+  "aster_coordination_error_t",
+  "aster_coordination_mutation_op_t",
+  "aster_coordination_read_op_t",
 ]

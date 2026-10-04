@@ -1,0 +1,971 @@
+{
+  "description": "Aster C ABI 4.4 coordination client payloads, UCv1 tags D0-DE (docs/_internal/bindings/coordination-abi-design.md section 2). D0 / D1 are the binding's requests (aster_coordination_mutate / _read); D2-DE are results. Byte strings are hex.",
+  "format": {
+    "bool": "0x00 | 0x01",
+    "bytes": "varint(len) then raw bytes; request ids are exact lengths (node 32, client / operation 16)",
+    "code": "uint(u32): an i32 code-space value as its u32 bit pattern",
+    "list<T>": "varint(count) 0x0C then each T",
+    "opt<T>": "0xFD absent | 0x00 then T",
+    "prefix": "tag:u8 version:u8 (0x01)",
+    "rules": "every field present, fixed order, no trailing bytes",
+    "string": "varint((utf8_len << 2) | 2) then UTF-8 bytes",
+    "u8enum": "one raw byte",
+    "uint": "LEB128 varint, minimal length"
+  },
+  "invalid": [
+    {
+      "hex": "",
+      "name": "empty",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d0",
+      "name": "tag only",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d10102203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "wrong tag (a read request)",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "df0105",
+      "name": "unknown tag",
+      "type": "ReadRequest"
+    },
+    {
+      "hex": "d00202203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "unknown version",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d00100",
+      "name": "unknown mutation op 0",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d0010b",
+      "name": "unknown mutation op 11",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d10109",
+      "name": "unknown read op 9",
+      "type": "ReadRequest"
+    },
+    {
+      "hex": "d00102203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00",
+      "name": "trailing byte",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d00102203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "truncated",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d00102203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f3432071faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "31-byte fence holder",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "dd0121333333333333333333333333333333333333333333333333333333333333333300126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "33-byte fence group id",
+      "type": "CoordinationFence"
+    },
+    {
+      "hex": "d00101126a6f627307747265652f34328500",
+      "name": "non-minimal varint (ttl 5 as 0x85 0x00)",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d0010820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0200",
+      "name": "bad bool byte",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d00106126a6f627307747265652f343201",
+      "name": "bad optional marker",
+      "type": "MutationRequest"
+    },
+    {
+      "hex": "d10104000f0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "name": "15-byte operation id",
+      "type": "ReadRequest"
+    },
+    {
+      "hex": "d1010620aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa110d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d00",
+      "name": "17-byte client id",
+      "type": "ReadRequest"
+    },
+    {
+      "hex": "d10107fd00",
+      "name": "audit limit 0",
+      "type": "ReadRequest"
+    },
+    {
+      "hex": "d10107fd914e",
+      "name": "audit limit 10001",
+      "type": "ReadRequest"
+    },
+    {
+      "hex": "dc01808080801000",
+      "name": "code above u32",
+      "type": "RetireReply"
+    },
+    {
+      "hex": "de01001f00000000000000000000000000000000000000000000000000000000000000fd000c000c000c000c000cfdfd02",
+      "name": "31-byte policy digest",
+      "type": "PlacementReport"
+    },
+    {
+      "hex": "d901000b",
+      "name": "bad list header",
+      "type": "AuditRecords"
+    }
+  ],
+  "mutation_ops": [
+    {
+      "code": 1,
+      "name": "acquire"
+    },
+    {
+      "code": 2,
+      "name": "renew"
+    },
+    {
+      "code": 3,
+      "name": "compare_and_set"
+    },
+    {
+      "code": 4,
+      "name": "release"
+    },
+    {
+      "code": 5,
+      "name": "release_with_value"
+    },
+    {
+      "code": 6,
+      "name": "revoke"
+    },
+    {
+      "code": 7,
+      "name": "set_grant"
+    },
+    {
+      "code": 8,
+      "name": "set_admin"
+    },
+    {
+      "code": 9,
+      "name": "change_membership"
+    },
+    {
+      "code": 10,
+      "name": "cancel_membership"
+    }
+  ],
+  "read_ops": [
+    {
+      "code": 1,
+      "name": "read_linearizable"
+    },
+    {
+      "code": 2,
+      "name": "inspect_acl"
+    },
+    {
+      "code": 3,
+      "name": "inspect_admins"
+    },
+    {
+      "code": 4,
+      "name": "membership_status"
+    },
+    {
+      "code": 5,
+      "name": "group_status"
+    },
+    {
+      "code": 6,
+      "name": "probe_client"
+    },
+    {
+      "code": 7,
+      "name": "audit_stream"
+    },
+    {
+      "code": 8,
+      "name": "recovery_export"
+    }
+  ],
+  "tags": [
+    {
+      "name": "MutationRequest",
+      "tag": 208
+    },
+    {
+      "name": "ReadRequest",
+      "tag": 209
+    },
+    {
+      "name": "MutationReply",
+      "tag": 210
+    },
+    {
+      "name": "ReadReply",
+      "tag": 211
+    },
+    {
+      "name": "AclStatus",
+      "tag": 212
+    },
+    {
+      "name": "AdminStatus",
+      "tag": 213
+    },
+    {
+      "name": "MembershipStatus",
+      "tag": 214
+    },
+    {
+      "name": "GroupStatus",
+      "tag": 215
+    },
+    {
+      "name": "ClientProbe",
+      "tag": 216
+    },
+    {
+      "name": "AuditRecords",
+      "tag": 217
+    },
+    {
+      "name": "RecoveryExport",
+      "tag": 218
+    },
+    {
+      "name": "RecoveryExportManifest",
+      "tag": 219
+    },
+    {
+      "name": "RetireReply",
+      "tag": 220
+    },
+    {
+      "name": "CoordinationFence",
+      "tag": 221
+    },
+    {
+      "name": "PlacementReport",
+      "tag": 222
+    }
+  ],
+  "valid": [
+    {
+      "hex": "d00101126a6f627307747265652f3432b0ea01",
+      "name": "mutate: acquire",
+      "type": "MutationRequest",
+      "value": {
+        "op": "acquire",
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        },
+        "ttl_ms": 30000
+      }
+    },
+    {
+      "hex": "d00102203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "mutate: renew",
+      "type": "MutationRequest",
+      "value": {
+        "fence": {
+          "epoch": 7,
+          "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+          "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resource": {
+            "key": "747265652f3432",
+            "namespace": "jobs"
+          }
+        },
+        "op": "renew"
+      }
+    },
+    {
+      "hex": "d00103203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02027631",
+      "name": "mutate: compare_and_set",
+      "type": "MutationRequest",
+      "value": {
+        "expected_value_revision": 2,
+        "fence": {
+          "epoch": 7,
+          "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+          "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resource": {
+            "key": "747265652f3432",
+            "namespace": "jobs"
+          }
+        },
+        "new_value": "7631",
+        "op": "compare_and_set"
+      }
+    },
+    {
+      "hex": "d00104203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "mutate: release",
+      "type": "MutationRequest",
+      "value": {
+        "fence": {
+          "epoch": 7,
+          "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+          "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resource": {
+            "key": "747265652f3432",
+            "namespace": "jobs"
+          }
+        },
+        "op": "release"
+      }
+    },
+    {
+      "hex": "d00105203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000",
+      "name": "mutate: release_with_value (empty value)",
+      "type": "MutationRequest",
+      "value": {
+        "expected_value_revision": 0,
+        "fence": {
+          "epoch": 7,
+          "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+          "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resource": {
+            "key": "747265652f3432",
+            "namespace": "jobs"
+          }
+        },
+        "final_value": "",
+        "op": "release_with_value"
+      }
+    },
+    {
+      "hex": "d00106126a6f627307747265652f34320007",
+      "name": "mutate: revoke",
+      "type": "MutationRequest",
+      "value": {
+        "expected_epoch": 7,
+        "op": "revoke",
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        }
+      }
+    },
+    {
+      "hex": "d00106126a6f627307747265652f3432fd",
+      "name": "mutate: revoke, any epoch",
+      "type": "MutationRequest",
+      "value": {
+        "expected_epoch": null,
+        "op": "revoke",
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        }
+      }
+    },
+    {
+      "hex": "d00107126a6f627307747265652f343220bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1f01",
+      "name": "mutate: set_grant",
+      "type": "MutationRequest",
+      "value": {
+        "expected_acl_revision": 1,
+        "op": "set_grant",
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        },
+        "rights": 31,
+        "target_node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "hex": "d0010820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0100",
+      "name": "mutate: set_admin",
+      "type": "MutationRequest",
+      "value": {
+        "enabled": true,
+        "expected_admin_revision": 0,
+        "op": "set_admin",
+        "target_node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "hex": "d00109100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c00032001010101010101010101010101010101010101010101010101010101010101018201020c200101010101010101010101010101010101010101010101010101010101010101200202020202020202020202020202020202020202020202020202020202020202010c200303030303030303030303030303030303030303030303030303030303030303010c200202020202020202020202020202020202020202020202020202020202020202326173746572317469636b65740002dead",
+      "name": "mutate: change_membership",
+      "type": "MutationRequest",
+      "value": {
+        "desired_voters": [
+          "0101010101010101010101010101010101010101010101010101010101010101",
+          "0202020202020202020202020202020202020202020202020202020202020202"
+        ],
+        "expected_membership_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "member_seeds": [
+          {
+            "node_id": "0202020202020202020202020202020202020202020202020202020202020202",
+            "signed_join_permit": "dead",
+            "ticket": "aster1ticket"
+          }
+        ],
+        "op": "change_membership",
+        "operation_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "retained_learners": [
+          "0303030303030303030303030303030303030303030303030303030303030303"
+        ]
+      }
+    },
+    {
+      "hex": "d00109100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0cfd010c200101010101010101010101010101010101010101010101010101010101010101000c000c",
+      "name": "mutate: change_membership, no fence",
+      "type": "MutationRequest",
+      "value": {
+        "desired_voters": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ],
+        "expected_membership_log_id": null,
+        "member_seeds": [],
+        "op": "change_membership",
+        "operation_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "retained_learners": []
+      }
+    },
+    {
+      "hex": "d0010a100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c02",
+      "name": "mutate: cancel_membership",
+      "type": "MutationRequest",
+      "value": {
+        "expected_phase_code": 2,
+        "op": "cancel_membership",
+        "operation_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+      }
+    },
+    {
+      "hex": "d10101126a6f627307747265652f3432",
+      "name": "read: read_linearizable",
+      "type": "ReadRequest",
+      "value": {
+        "op": "read_linearizable",
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        }
+      }
+    },
+    {
+      "hex": "d10102126a6f627307747265652f3432",
+      "name": "read: inspect_acl",
+      "type": "ReadRequest",
+      "value": {
+        "op": "inspect_acl",
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        }
+      }
+    },
+    {
+      "hex": "d10103",
+      "name": "read: inspect_admins",
+      "type": "ReadRequest",
+      "value": {
+        "op": "inspect_admins"
+      }
+    },
+    {
+      "hex": "d1010400100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "name": "read: membership_status",
+      "type": "ReadRequest",
+      "value": {
+        "op": "membership_status",
+        "operation_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+      }
+    },
+    {
+      "hex": "d10104fd",
+      "name": "read: membership_status, current",
+      "type": "ReadRequest",
+      "value": {
+        "op": "membership_status",
+        "operation_id": null
+      }
+    },
+    {
+      "hex": "d10105",
+      "name": "read: group_status",
+      "type": "ReadRequest",
+      "value": {
+        "op": "group_status"
+      }
+    },
+    {
+      "hex": "d1010620aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa100d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+      "name": "read: probe_client",
+      "type": "ReadRequest",
+      "value": {
+        "op": "probe_client",
+        "target_client_id": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+        "target_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "hex": "d1010700032001010101010101010101010101010101010101010101010101010101010101018201904e",
+      "name": "read: audit_stream",
+      "type": "ReadRequest",
+      "value": {
+        "after": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "limit": 10000,
+        "op": "audit_stream"
+      }
+    },
+    {
+      "hex": "d10107fd01",
+      "name": "read: audit_stream, from the floor",
+      "type": "ReadRequest",
+      "value": {
+        "after": null,
+        "limit": 1,
+        "op": "audit_stream"
+      }
+    },
+    {
+      "hex": "d10108",
+      "name": "read: recovery_export",
+      "type": "ReadRequest",
+      "value": {
+        "op": "recovery_export"
+      }
+    },
+    {
+      "hex": "d201100d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0920444444444444444444444444444444444444444444444444444444444444444401030000203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f3432070020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01b0ea010402010002763100010000100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c00032001010101010101010101010101010101010101010101010101010101010101018201",
+      "name": "mutation reply: mutated",
+      "type": "MutationReply",
+      "value": {
+        "acl_revision": 1,
+        "admin_revision": 0,
+        "client_id": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+        "disposition_code": 1,
+        "membership_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "operation_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "outcome_code": 3,
+        "reason_code": 0,
+        "request_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+        "sequence": 9,
+        "snapshot": {
+          "acl_revision": 1,
+          "epoch": 7,
+          "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+          "held": true,
+          "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_revision": 4,
+          "resource": {
+            "key": "747265652f3432",
+            "namespace": "jobs"
+          },
+          "ttl_ms": 30000,
+          "value": "7631",
+          "value_redacted": false,
+          "value_revision": 2
+        }
+      }
+    },
+    {
+      "hex": "d201100d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0a204545454545454545454545454545454545454545454545454545454545454545016404fd0000fdfd",
+      "name": "mutation reply: rejected",
+      "type": "MutationReply",
+      "value": {
+        "acl_revision": 0,
+        "admin_revision": 0,
+        "client_id": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+        "disposition_code": 1,
+        "membership_log_id": null,
+        "operation_id": null,
+        "outcome_code": 100,
+        "reason_code": 4,
+        "request_hash": "4545454545454545454545454545454545454545454545454545454545454545",
+        "sequence": 10,
+        "snapshot": null
+      }
+    },
+    {
+      "hex": "d301203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f3432070020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01b0ea010402010002763100",
+      "name": "read reply: held",
+      "type": "ReadReply",
+      "value": {
+        "acl_revision": 1,
+        "epoch": 7,
+        "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "held": true,
+        "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "lease_revision": 4,
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        },
+        "ttl_ms": 30000,
+        "value": "7631",
+        "value_redacted": false,
+        "value_revision": 2
+      }
+    },
+    {
+      "hex": "d301203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f343207fd0000040201fd01",
+      "name": "read reply: free, redacted",
+      "type": "ReadReply",
+      "value": {
+        "acl_revision": 1,
+        "epoch": 7,
+        "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "held": false,
+        "holder": null,
+        "lease_revision": 4,
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        },
+        "ttl_ms": 0,
+        "value": null,
+        "value_redacted": true,
+        "value_revision": 2
+      }
+    },
+    {
+      "hex": "d401126a6f627307747265652f343202020c20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1f20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01",
+      "name": "acl status",
+      "type": "AclStatus",
+      "value": {
+        "acl_revision": 2,
+        "grants": [
+          {
+            "rights": 31,
+            "subject_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "rights": 1,
+            "subject_node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ],
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        }
+      }
+    },
+    {
+      "hex": "d50101010c20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "name": "admin status",
+      "type": "AdminStatus",
+      "value": {
+        "admin_revision": 1,
+        "administrators": [
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ]
+      }
+    },
+    {
+      "hex": "d60100100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0200032001010101010101010101010101010101010101010101010101010101010101018201fd020c200101010101010101010101010101010101010101010101010101010101010101200202020202020202020202020202020202020202020202020202020202020202000c00",
+      "name": "membership status",
+      "type": "MembershipStatus",
+      "value": {
+        "desired_voters": [
+          "0101010101010101010101010101010101010101010101010101010101010101",
+          "0202020202020202020202020202020202020202020202020202020202020202"
+        ],
+        "error_code": 0,
+        "expected_membership_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "observed_membership_log_id": null,
+        "operation_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "retained_learners": [],
+        "status_code": 2
+      }
+    },
+    {
+      "hex": "d701032001010101010101010101010101010101010101010101010101010101010101010100200101010101010101010101010101010101010101010101010101010101010101030003200101010101010101010101010101010101010101010101010101010101010101820100032001010101010101010101010101010101010101010101010101010101010101018201000320010101010101010101010101010101010101010101010101010101010101010182010100032001010101010101010101010101010101010101010101010101010101010101010100010c200101010101010101010101010101010101010101010101010101010101010101000cfd000100fd2055555555555555555555555555555555555555555555555555555555555555552022222222222222222222222222222222222222222222222222222222222222222e6578616d706c652e6f7267fd",
+      "name": "group status",
+      "type": "GroupStatus",
+      "value": {
+        "applied_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "audit_floor": null,
+        "authority_domain": "example.org",
+        "authority_public_key": "2222222222222222222222222222222222222222222222222222222222222222",
+        "committed_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "deployment_profile_code": 1,
+        "fatal_code": 0,
+        "genesis_hash": "5555555555555555555555555555555555555555555555555555555555555555",
+        "last_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "learners": [],
+        "lifecycle_code": 3,
+        "local_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "local_role_code": 1,
+        "membership_joint": false,
+        "membership_log_id": {
+          "index": 1,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "pending_operation_id": null,
+        "quorum_available": true,
+        "recovered_from": null,
+        "term": 3,
+        "voters": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ]
+      }
+    },
+    {
+      "hex": "d701032001010101010101010101010101010101010101010101010101010101010101010100200101010101010101010101010101010101010101010101010101010101010101030003200101010101010101010101010101010101010101010101010101010101010101820100032001010101010101010101010101010101010101010101010101010101010101018201000320010101010101010101010101010101010101010101010101010101010101010182010100032001010101010101010101010101010101010101010101010101010101010101010100010c200101010101010101010101010101010101010101010101010101010101010101000cfdfd00fd2055555555555555555555555555555555555555555555555555555555555555552022222222222222222222222222222222222222222222222222222222222222222e6578616d706c652e6f7267002066666666666666666666666666666666666666666666666666666666666666662067676767676767676767676767676767676767676767676767676767676767672068686868686868686868686868686868686868686868686868686868686868683e6f6c642e6578616d706c652e6f726720696969696969696969696969696969696969696969696969696969696969696900032001010101010101010101010101010101010101010101010101010101010101018201",
+      "name": "group status: recovered",
+      "type": "GroupStatus",
+      "value": {
+        "applied_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "audit_floor": null,
+        "authority_domain": "example.org",
+        "authority_public_key": "2222222222222222222222222222222222222222222222222222222222222222",
+        "committed_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "deployment_profile_code": 1,
+        "fatal_code": 0,
+        "genesis_hash": "5555555555555555555555555555555555555555555555555555555555555555",
+        "last_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "learners": [],
+        "lifecycle_code": 3,
+        "local_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "local_role_code": 1,
+        "membership_joint": false,
+        "membership_log_id": {
+          "index": 1,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "pending_operation_id": null,
+        "quorum_available": null,
+        "recovered_from": {
+          "export_hash": "6969696969696969696969696969696969696969696969696969696969696969",
+          "source_authority_domain": "old.example.org",
+          "source_authority_public_key": "6868686868686868686868686868686868686868686868686868686868686868",
+          "source_genesis_hash": "6767676767676767676767676767676767676767676767676767676767676767",
+          "source_group_id": "6666666666666666666666666666666666666666666666666666666666666666",
+          "source_last_applied": {
+            "index": 130,
+            "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+            "term": 3
+          }
+        },
+        "term": 3,
+        "voters": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ]
+      }
+    },
+    {
+      "hex": "d80120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa100d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d01092044444444444444444444444444444444444444444444444444444444444444440100",
+      "name": "client probe",
+      "type": "ClientProbe",
+      "value": {
+        "disposition_code": 1,
+        "exists": true,
+        "last_sequence": 9,
+        "request_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+        "retired": false,
+        "target_client_id": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+        "target_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "hex": "d901020c0320010101010101010101010101010101010101010101010101010101010101010182010020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0100126a6f627307747265652f3432010700032001010101010101010101010101010101010101010101010101010101010101018301fd08fd640000",
+      "name": "audit records",
+      "type": "AuditRecords",
+      "value": [
+        {
+          "actor_node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "epoch": 7,
+          "log_id": {
+            "index": 130,
+            "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+            "term": 3
+          },
+          "operation_code": 1,
+          "resource": {
+            "key": "747265652f3432",
+            "namespace": "jobs"
+          },
+          "result_code": 1,
+          "value_revision": 0
+        },
+        {
+          "actor_node_id": null,
+          "epoch": 0,
+          "log_id": {
+            "index": 131,
+            "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+            "term": 3
+          },
+          "operation_code": 8,
+          "resource": null,
+          "result_code": 100,
+          "value_revision": 0
+        }
+      ]
+    },
+    {
+      "hex": "d901000c",
+      "name": "audit records: none",
+      "type": "AuditRecords",
+      "value": []
+    },
+    {
+      "hex": "da01032077777777777777777777777777777777777777777777777777777777777777770003200101010101010101010101010101010101010101010101010101010101010101820103616263",
+      "name": "recovery export",
+      "type": "RecoveryExport",
+      "value": {
+        "applied_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "blake3_checksum": "7777777777777777777777777777777777777777777777777777777777777777",
+        "body": "616263",
+        "total_len": 3
+      }
+    },
+    {
+      "hex": "db010320777777777777777777777777777777777777777777777777777777777777777700032001010101010101010101010101010101010101010101010101010101010101018201",
+      "name": "recovery export manifest",
+      "type": "RecoveryExportManifest",
+      "value": {
+        "applied_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "blake3_checksum": "7777777777777777777777777777777777777777777777777777777777777777",
+        "total_len": 3
+      }
+    },
+    {
+      "hex": "dc010900",
+      "name": "retire reply",
+      "type": "RetireReply",
+      "value": {
+        "outcome_code": 9,
+        "reason_code": 0
+      }
+    },
+    {
+      "hex": "dd01203333333333333333333333333333333333333333333333333333333333333333126a6f627307747265652f34320720aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "coordination fence",
+      "type": "CoordinationFence",
+      "value": {
+        "epoch": 7,
+        "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "resource": {
+          "key": "747265652f3432",
+          "namespace": "jobs"
+        }
+      }
+    },
+    {
+      "hex": "de010320111111111111111111111111111111111111111111111111111111111111111100032001010101010101010101010101010101010101010101010101010101010101018201010c200101010101010101010101010101010101010101010101010101010101010101000c020c200101010101010101010101010101010101010101010101010101010101010101200202020202020202020202020202020202020202020202020202020202020202000c000c0001000001020100100c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c267375626d6974746564",
+      "name": "placement report: submitted",
+      "type": "PlacementReport",
+      "value": {
+        "current_learners": [],
+        "current_voters": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ],
+        "grace_crossed_members": [],
+        "membership_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 3
+        },
+        "pending_operation_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "policy_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "policy_revision": 3,
+        "reason": "submitted",
+        "selected_learners": [],
+        "selected_voters": [
+          "0101010101010101010101010101010101010101010101010101010101010101",
+          "0202020202020202020202020202020202020202020202020202020202020202"
+        ],
+        "separation": {
+          "connected_pairs": 0,
+          "diversity_proved": true,
+          "represented_clusters": 2,
+          "separated_pairs": 1,
+          "total_pairs": 1,
+          "unknown_pairs": 0
+        }
+      }
+    },
+    {
+      "hex": "de0100200000000000000000000000000000000000000000000000000000000000000000fd000c000c000c000c000cfdfd266e6f206c6561646572",
+      "name": "placement report: stopped",
+      "type": "PlacementReport",
+      "value": {
+        "current_learners": [],
+        "current_voters": [],
+        "grace_crossed_members": [],
+        "membership_log_id": null,
+        "pending_operation_id": null,
+        "policy_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "policy_revision": 0,
+        "reason": "no leader",
+        "selected_learners": [],
+        "selected_voters": [],
+        "separation": null
+      }
+    }
+  ]
+}

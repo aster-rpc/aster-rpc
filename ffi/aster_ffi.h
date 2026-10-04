@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 3
+#define ASTER_ABI_VERSION_MINOR 4
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -23,6 +23,87 @@
  * This is the value `aster_abi_version()` returns.
  */
 #define ASTER_ABI_VERSION (((ASTER_ABI_VERSION_MAJOR << 16) | (ASTER_ABI_VERSION_MINOR << 8)) | ASTER_ABI_VERSION_PATCH)
+
+/**
+ * `aster_coordination_client_options_t.flags`: open the read-only client
+ * (linearizable reads and status; no journal, no mutation, no lease).
+ */
+#define ASTER_COORDINATION_CLIENT_READ_ONLY 1
+
+/**
+ * UCv1 tag `D0` MutationRequest (binding -> Rust, `aster_coordination_mutate`).
+ */
+#define ASTER_COORDINATION_TAG_MUTATION_REQUEST 208
+
+/**
+ * UCv1 tag `D1` ReadRequest (binding -> Rust, `aster_coordination_read`).
+ */
+#define ASTER_COORDINATION_TAG_READ_REQUEST 209
+
+/**
+ * UCv1 tag `D2` MutationReply.
+ */
+#define ASTER_COORDINATION_TAG_MUTATION_REPLY 210
+
+/**
+ * UCv1 tag `D3` ReadReply (a resource snapshot).
+ */
+#define ASTER_COORDINATION_TAG_READ_REPLY 211
+
+/**
+ * UCv1 tag `D4` AclStatus.
+ */
+#define ASTER_COORDINATION_TAG_ACL_STATUS 212
+
+/**
+ * UCv1 tag `D5` AdminStatus.
+ */
+#define ASTER_COORDINATION_TAG_ADMIN_STATUS 213
+
+/**
+ * UCv1 tag `D6` MembershipStatus.
+ */
+#define ASTER_COORDINATION_TAG_MEMBERSHIP_STATUS 214
+
+/**
+ * UCv1 tag `D7` GroupStatus.
+ */
+#define ASTER_COORDINATION_TAG_GROUP_STATUS 215
+
+/**
+ * UCv1 tag `D8` ClientProbe.
+ */
+#define ASTER_COORDINATION_TAG_CLIENT_PROBE 216
+
+/**
+ * UCv1 tag `D9` AuditRecords.
+ */
+#define ASTER_COORDINATION_TAG_AUDIT_RECORDS 217
+
+/**
+ * UCv1 tag `DA` RecoveryExport (manifest + body).
+ */
+#define ASTER_COORDINATION_TAG_RECOVERY_EXPORT 218
+
+/**
+ * UCv1 tag `DB` RecoveryExportManifest.
+ */
+#define ASTER_COORDINATION_TAG_RECOVERY_EXPORT_MANIFEST 219
+
+/**
+ * UCv1 tag `DC` RetireReply.
+ */
+#define ASTER_COORDINATION_TAG_RETIRE_REPLY 220
+
+/**
+ * UCv1 tag `DD` CoordinationFence.
+ */
+#define ASTER_COORDINATION_TAG_COORDINATION_FENCE 221
+
+/**
+ * UCv1 tag `DE` PlacementReport.
+ */
+#define ASTER_COORDINATION_TAG_PLACEMENT_REPORT 222
 
 /**
  * `flags` bit of the 3.3 blob downloads: leave the blob in the local store
@@ -191,15 +272,17 @@ typedef enum aster_status_t {
    */
   ASTER_STATUS_VERIFICATION_FAILED = 13,
   /**
-   * Reserved for the R4 auth model (ABI 4.3): the caller presented no
-   * usable credential. Not returned by any 4.3 function.
+   * An auth outcome (ABI 4.3, reserved for auth results): the caller was
+   * not authenticated. Since 4.4: coordination admission answered RPC 16
+   * (coordination error events).
    */
   ASTER_STATUS_UNAUTHENTICATED = 14,
   /**
-   * The peer's (or local) policy refused the caller (ABI 4.3). Reserved
-   * for the R4 auth model; today only an expose relay the serving node's
-   * authorizer denied reports it (`aster_expose_relay_request` error
-   * events, `ASTER_EVENT_HTTP_RELAY_READY`).
+   * An auth outcome (ABI 4.3): the peer's (or local) policy refused the
+   * caller. Reported by an expose relay the serving node's authorizer
+   * denied (`aster_expose_relay_request` error events,
+   * `ASTER_EVENT_HTTP_RELAY_READY`) and, since 4.4, by a coordination ACL /
+   * admin refusal (RPC 7, coordination error events).
    */
   ASTER_STATUS_PERMISSION_DENIED = 15,
   /**
@@ -340,6 +423,30 @@ typedef enum aster_event_kind_t {
    * after handling.
    */
   ASTER_EVENT_HTTP_RELAY_READY = 109,
+  /**
+   * `aster_coordination_client_open`: `handle` = the new
+   * `aster_coordination_client_t`.
+   */
+  ASTER_EVENT_COORDINATION_CLIENT_OPENED = 110,
+  /**
+   * `aster_coordination_mutate` / `_unacknowledged` / `_resume`:
+   * `handle` = a new `aster_coordination_resolved_t` (0 = nothing to
+   * deliver; then no payload), payload = UCv1 `MutationReply` (`D2`).
+   */
+  ASTER_EVENT_COORDINATION_RESOLVED = 111,
+  /**
+   * `aster_coordination_read`, `_retire_other_client`,
+   * `_recovery_export_to_file`, `_lease_compare_and_set`,
+   * `_lease_release_with_value`, `_placement_reconcile`: payload = the
+   * UCv1 result (`D2`-`DE`, see the call).
+   */
+  ASTER_EVENT_COORDINATION_RESULT = 112,
+  /**
+   * `aster_coordination_lease_acquire`: granted -- `handle` = a new
+   * `aster_coordination_lease_t`, payload = `DD` (the fence); denied --
+   * `handle` = 0, payload = UCv1 `B2` (denied, reason + snapshot).
+   */
+  ASTER_EVENT_COORDINATION_LEASE_ACQUIRED = 113,
 } aster_event_kind_t;
 
 /**
@@ -774,15 +881,16 @@ typedef enum aster_upcall_kind_t {
    */
   ASTER_UPCALL_KIND_TOPOLOGY_ADMITTED = 16,
   /**
-   * Placement topology source: `BA` → `BB` (not issued by the C ABI yet).
+   * Placement topology source: `BA` → `BB` (ABI 4.4,
+   * `aster_coordination_placement_manager_new` with no topology node).
    */
   ASTER_UPCALL_KIND_TOPOLOGY_SNAPSHOT = 17,
   /**
-   * Placement policy source: `BC` → `BD` (not issued by the C ABI yet).
+   * Placement policy source: `BC` → `BD` (ABI 4.4, placement manager).
    */
   ASTER_UPCALL_KIND_PLACEMENT_POLICY = 32,
   /**
-   * Placement provisioner: `BE` → `BF` (not issued by the C ABI yet).
+   * Placement provisioner: `BE` → `BF` (ABI 4.4, placement manager).
    */
   ASTER_UPCALL_KIND_PLACEMENT_PROVISION = 33,
   /**
@@ -968,6 +1076,141 @@ typedef enum aster_route_protocol_t {
   ASTER_ROUTE_PROTOCOL_TCP = 1,
 } aster_route_protocol_t;
 
+/**
+ * `error_code` of a coordination `ASTER_EVENT_ERROR`
+ * (= `aster::coordination::client::CoordinationErrorKind`). Switch on this,
+ * never on the message.
+ */
+typedef enum aster_coordination_error_t {
+  ASTER_COORDINATION_ERROR_NONE = 0,
+  /**
+   * A resolved result awaits acknowledgement: take it with
+   * `aster_coordination_unacknowledged` and acknowledge it first.
+   */
+  ASTER_COORDINATION_ERROR_AWAITING_ACK = 1,
+  /**
+   * Another request is unresolved on this journal: `aster_coordination_resume` first.
+   */
+  ASTER_COORDINATION_ERROR_UNRESOLVED = 2,
+  /**
+   * Another process (or open client) holds this actor/group journal.
+   */
+  ASTER_COORDINATION_ERROR_JOURNAL_LOCKED = 3,
+  /**
+   * The journal is fatal: no further mutation is possible.
+   */
+  ASTER_COORDINATION_ERROR_JOURNAL_FATAL = 4,
+  /**
+   * The group answered with a non-OK RPC status; `flags` = the code
+   * (7 = permission denied by the replicated ACL).
+   */
+  ASTER_COORDINATION_ERROR_RPC = 5,
+  /**
+   * No member answered; a journaled sequence stays open and resumes with
+   * the same bytes.
+   */
+  ASTER_COORDINATION_ERROR_UNAVAILABLE = 6,
+  /**
+   * The client (or this handle's client) is closed.
+   */
+  ASTER_COORDINATION_ERROR_CLOSED = 7,
+  /**
+   * Reserved: a committed typed rejection is a result (`D2`), not an error.
+   */
+  ASTER_COORDINATION_ERROR_REJECTED = 8,
+  /**
+   * An argument or request outside the contract.
+   */
+  ASTER_COORDINATION_ERROR_INVALID = 9,
+  ASTER_COORDINATION_ERROR_OTHER = 10,
+} aster_coordination_error_t;
+
+/**
+ * The `op` byte of a UCv1 `D0` MutationRequest (design §2).
+ */
+typedef enum aster_coordination_mutation_op_t {
+  /**
+   * `resource ttl_ms:uint`
+   */
+  ASTER_COORDINATION_MUTATE_ACQUIRE = 1,
+  /**
+   * `fence`
+   */
+  ASTER_COORDINATION_MUTATE_RENEW = 2,
+  /**
+   * `fence expected_value_revision:uint new_value:bytes`
+   */
+  ASTER_COORDINATION_MUTATE_COMPARE_AND_SET = 3,
+  /**
+   * `fence`
+   */
+  ASTER_COORDINATION_MUTATE_RELEASE = 4,
+  /**
+   * `fence expected_value_revision:uint final_value:bytes`
+   */
+  ASTER_COORDINATION_MUTATE_RELEASE_WITH_VALUE = 5,
+  /**
+   * `resource expected_epoch:opt<uint>`
+   */
+  ASTER_COORDINATION_MUTATE_REVOKE = 6,
+  /**
+   * `resource target_node_id:bytes[32] rights:uint expected_acl_revision:uint`
+   */
+  ASTER_COORDINATION_MUTATE_SET_GRANT = 7,
+  /**
+   * `target_node_id:bytes[32] enabled:bool expected_admin_revision:uint`
+   */
+  ASTER_COORDINATION_MUTATE_SET_ADMIN = 8,
+  /**
+   * `operation_id:bytes[16] expected_membership_log_id:opt<LogId>
+   * desired_voters:list<bytes[32]> retained_learners:list<bytes[32]>
+   * member_seeds:list<MemberSeed>`
+   */
+  ASTER_COORDINATION_MUTATE_CHANGE_MEMBERSHIP = 9,
+  /**
+   * `operation_id:bytes[16] expected_phase_code:code`
+   */
+  ASTER_COORDINATION_MUTATE_CANCEL_MEMBERSHIP = 10,
+} aster_coordination_mutation_op_t;
+
+/**
+ * The `op` byte of a UCv1 `D1` ReadRequest, with the result tag.
+ */
+typedef enum aster_coordination_read_op_t {
+  /**
+   * `resource` -> `D3`
+   */
+  ASTER_COORDINATION_READ_READ_LINEARIZABLE = 1,
+  /**
+   * `resource` -> `D4`
+   */
+  ASTER_COORDINATION_READ_INSPECT_ACL = 2,
+  /**
+   * -> `D5`
+   */
+  ASTER_COORDINATION_READ_INSPECT_ADMINS = 3,
+  /**
+   * `operation_id:opt<bytes[16]>` -> `D6`
+   */
+  ASTER_COORDINATION_READ_MEMBERSHIP_STATUS = 4,
+  /**
+   * -> `D7`
+   */
+  ASTER_COORDINATION_READ_GROUP_STATUS = 5,
+  /**
+   * `target_node_id:bytes[32] target_client_id:bytes[16]` -> `D8`
+   */
+  ASTER_COORDINATION_READ_PROBE_CLIENT = 6,
+  /**
+   * `after:opt<LogId> limit:uint(1..=10000)` -> `D9`
+   */
+  ASTER_COORDINATION_READ_AUDIT_STREAM = 7,
+  /**
+   * -> `DA`
+   */
+  ASTER_COORDINATION_READ_RECOVERY_EXPORT = 8,
+} aster_coordination_read_op_t;
+
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
   uint32_t worker_threads;
@@ -1123,6 +1366,60 @@ typedef struct aster_transport_metrics_t {
 typedef uint64_t aster_call_t;
 
 typedef uint64_t aster_buffer_t;
+
+/**
+ * Options of `aster_coordination_client_open`. 48 bytes (LP64). Fill with
+ * `aster_coordination_client_options_init`; `struct_size` must equal
+ * `sizeof(aster_coordination_client_options_t)`.
+ */
+typedef struct aster_coordination_client_options_t {
+  uint32_t struct_size;
+  /**
+   * `ASTER_COORDINATION_CLIENT_READ_ONLY` or 0.
+   */
+  uint32_t flags;
+  /**
+   * The group id: exactly 32 raw bytes.
+   */
+  const uint8_t *group_id;
+  /**
+   * Seed tickets (UTF-8 base58, Open credential only): routing hints;
+   * they grant nothing.
+   */
+  struct aster_bytes_list_t seed_tickets;
+  /**
+   * Journal directory (UTF-8 path). Required for the durable client,
+   * ignored by the read-only one.
+   */
+  struct aster_bytes_t journal_dir;
+} aster_coordination_client_options_t;
+
+/**
+ * A coordination client (`aster_coordination_client_open`): the durable
+ * journaled client, or a read-only one.
+ */
+typedef uint64_t aster_coordination_client_t;
+
+/**
+ * A resolved mutation awaiting acknowledgement
+ * (`ASTER_EVENT_COORDINATION_RESOLVED`).
+ */
+typedef uint64_t aster_coordination_resolved_t;
+
+/**
+ * A held coordination lease (`ASTER_EVENT_COORDINATION_LEASE_ACQUIRED`).
+ */
+typedef uint64_t aster_coordination_lease_t;
+
+/**
+ * An upcall table plus its bounded event queue (`aster_upcalls_new`).
+ */
+typedef uint64_t aster_upcalls_t;
+
+/**
+ * A placement manager (`aster_coordination_placement_manager_new`).
+ */
+typedef uint64_t aster_coordination_placement_manager_t;
 
 /**
  * One network path of a connection (`aster::PathInfo`). Strings point into
@@ -1294,11 +1591,6 @@ typedef struct aster_rpc_status_t {
  * to peers, plus the reactor that dispatches their inbound relay streams.
  */
 typedef uint64_t aster_expose_t;
-
-/**
- * An upcall table plus its bounded event queue (`aster_upcalls_new`).
- */
-typedef uint64_t aster_upcalls_t;
 
 /**
  * A body-handle table for foreign HTTP exchanges (`aster_http_bodies_new`),
@@ -2960,6 +3252,277 @@ int32_t aster_call_discard(aster_runtime_t runtime, aster_call_t call);
  * Each non-zero buffer id must be released exactly once; 0 is a no-op.
  */
 int32_t aster_call_buffer_release(aster_runtime_t runtime, aster_buffer_t buffer);
+
+/**
+ * Fill `*out` with the defaults (`struct_size` set, durable client, every
+ * pointer NULL / empty). Set `group_id` (and `journal_dir`) before use.
+ */
+int32_t aster_coordination_client_options_init(struct aster_coordination_client_options_t *out);
+
+/**
+ * Open a coordination client bound to `node`'s identity and the options'
+ * group. The durable client (flags 0) opens the journal in `journal_dir`
+ * and holds its per-actor/group lifetime lock until closed; a second open
+ * over the same journal fails with `JOURNAL_LOCKED`. The read-only client
+ * (`ASTER_COORDINATION_CLIENT_READ_ONLY`) has no journal.
+ *
+ * Seed tickets are routing hints (Open credential only; a credential
+ * ticket is refused); coordination access is decided by the group's
+ * replicated ACL against the node's transport identity.
+ *
+ * Completes with `ASTER_EVENT_COORDINATION_CLIENT_OPENED` (`handle` = the
+ * client, `related` = node) or `ASTER_EVENT_ERROR` (`error_code` =
+ * `aster_coordination_error_t`). Bad options are `INVALID_ARGUMENT` here.
+ */
+int32_t aster_coordination_client_open(aster_runtime_t runtime,
+                                       aster_node_t node,
+                                       const struct aster_coordination_client_options_t *options,
+                                       uint64_t user_data,
+                                       aster_operation_t *out_operation);
+
+/**
+ * Close the client: new calls return `ALREADY_CLOSED`; its resolved-
+ * mutation, lease and placement-manager handles become inert (calls return
+ * `ALREADY_CLOSED`; leases stop renewing and lapse by TTL; unacknowledged
+ * results stay journaled and are redelivered after reopening). Operations
+ * already in flight complete; the journal lock is released when the last
+ * of them finishes. Handles stay registered until freed. Idempotent.
+ */
+int32_t aster_coordination_client_close(aster_runtime_t runtime,
+                                        aster_coordination_client_t client);
+
+/**
+ * Close (as `aster_coordination_client_close`) and free the handle.
+ */
+int32_t aster_coordination_client_free(aster_runtime_t runtime, aster_coordination_client_t client);
+
+/**
+ * The group id (32 bytes) and the local actor id (32 bytes: the node's
+ * identity as the group authenticates it). Either output may be NULL.
+ * Works on a closed client.
+ */
+int32_t aster_coordination_client_ids(aster_runtime_t runtime,
+                                      aster_coordination_client_t client,
+                                      uint8_t *out_group_id,
+                                      uint8_t *out_local_id);
+
+/**
+ * The journal's current client id. Completes with
+ * `ASTER_EVENT_BYTES_RESULT` (payload = 16 raw bytes). Durable client only.
+ */
+int32_t aster_coordination_client_id(aster_runtime_t runtime,
+                                     aster_coordination_client_t client,
+                                     uint64_t user_data,
+                                     aster_operation_t *out_operation);
+
+/**
+ * Run one sequenced mutation (`request` = UCv1 `D0`; malformed is
+ * `INVALID_ARGUMENT` here). The reply is fsynced to the journal before the
+ * event: `ASTER_EVENT_COORDINATION_RESOLVED`, `handle` = a new
+ * `aster_coordination_resolved_t`, payload = `D2`. A committed typed
+ * rejection is such a result (`outcome_code` / `reason_code`), not an
+ * error. Acknowledge it after durably handling it; until then no new
+ * mutation is permitted (`AWAITING_ACK`). Durable client only.
+ */
+int32_t aster_coordination_mutate(aster_runtime_t runtime,
+                                  aster_coordination_client_t client,
+                                  struct aster_bytes_t request,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * The saved result a previous run resolved and nobody acknowledged. Call
+ * on startup before any mutation. Completes with
+ * `ASTER_EVENT_COORDINATION_RESOLVED`: `handle` 0 (no payload) when there
+ * is none. Durable client only.
+ */
+int32_t aster_coordination_unacknowledged(aster_runtime_t runtime,
+                                          aster_coordination_client_t client,
+                                          uint64_t user_data,
+                                          aster_operation_t *out_operation);
+
+/**
+ * Drive any half-finished request from a previous run to resolution.
+ * Completes like `aster_coordination_unacknowledged`: `handle` 0 = the
+ * journal is ready. Durable client only.
+ */
+int32_t aster_coordination_resume(aster_runtime_t runtime,
+                                  aster_coordination_client_t client,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * Acknowledge: the application has durably handled this result; frees the
+ * journal for the next sequence. Consumes the handle (later calls
+ * `NOT_FOUND`). Completes with `ASTER_EVENT_UNIT_RESULT`; on failure the
+ * result stays journaled and is redelivered. `ALREADY_CLOSED` here when
+ * the client was closed -- the handle is consumed then too (a later
+ * `aster_coordination_resolved_free` is `NOT_FOUND`); the result stays
+ * journaled for the next open.
+ */
+int32_t aster_coordination_resolved_acknowledge(aster_runtime_t runtime,
+                                                aster_coordination_resolved_t resolved,
+                                                uint64_t user_data,
+                                                aster_operation_t *out_operation);
+
+/**
+ * Free a resolved-mutation handle **without** acknowledging: the result
+ * stays journaled (`aster_coordination_unacknowledged` redelivers it) and
+ * no new mutation is permitted until it is acknowledged.
+ */
+int32_t aster_coordination_resolved_free(aster_runtime_t runtime,
+                                         aster_coordination_resolved_t resolved);
+
+/**
+ * Retire one of this actor's **other** client ids (16 raw bytes). Completes
+ * with `ASTER_EVENT_COORDINATION_RESULT`, payload = `DC`. Durable client
+ * only.
+ */
+int32_t aster_coordination_retire_other_client(aster_runtime_t runtime,
+                                               aster_coordination_client_t client,
+                                               const uint8_t *target_client_id,
+                                               uint64_t user_data,
+                                               aster_operation_t *out_operation);
+
+/**
+ * One linearizable read or status request (`request` = UCv1 `D1`;
+ * malformed, or an `audit_stream` limit outside 1..=10000, is
+ * `INVALID_ARGUMENT` here). Completes with
+ * `ASTER_EVENT_COORDINATION_RESULT`, payload by op: read `D3`, acl `D4`,
+ * admins `D5`, membership `D6`, group `D7`, probe `D8`, audit `D9`,
+ * recovery export `DA`. Either client.
+ */
+int32_t aster_coordination_read(aster_runtime_t runtime,
+                                aster_coordination_client_t client,
+                                struct aster_bytes_t request,
+                                uint64_t user_data,
+                                aster_operation_t *out_operation);
+
+/**
+ * Stream the recovery export into `path` (via `path.partial`, renamed into
+ * place only once the checksum held). Completes with
+ * `ASTER_EVENT_COORDINATION_RESULT`, payload = `DB` (the manifest).
+ */
+int32_t aster_coordination_recovery_export_to_file(aster_runtime_t runtime,
+                                                   aster_coordination_client_t client,
+                                                   struct aster_bytes_t path,
+                                                   uint64_t user_data,
+                                                   aster_operation_t *out_operation);
+
+/**
+ * One committed acquire of `(namespace, key)`; on grant the Rust renew
+ * loop and self-limit take over, and every transition is journaled and
+ * acknowledged by the lease itself. Timing as `aster_lease_acquire` (0 =
+ * defaults). Completes with `ASTER_EVENT_COORDINATION_LEASE_ACQUIRED`:
+ * granted -- `handle` = a new `aster_coordination_lease_t`, payload = `DD`;
+ * denied -- `handle` 0, payload = UCv1 `B2` (denied: reason + snapshot).
+ * Durable client only.
+ */
+int32_t aster_coordination_lease_acquire(aster_runtime_t runtime,
+                                         aster_coordination_client_t client,
+                                         struct aster_bytes_t namespace_,
+                                         struct aster_bytes_t key,
+                                         uint64_t ttl_ms,
+                                         uint64_t renew_interval_ms,
+                                         uint64_t holder_margin_ms,
+                                         uint64_t user_data,
+                                         aster_operation_t *out_operation);
+
+/**
+ * The full fence (UCv1 `DD`) for a protected action, copied into
+ * `(buf, cap)`; `*out_len` = its size (`BUFFER_TOO_SMALL` when it does not
+ * fit: ask with `NULL, 0`). Ask immediately before each action; never
+ * cache it. `ALREADY_CLOSED` once the holder must stop (not held, the
+ * self-limit passed, released, being released, or the client closed).
+ * Never blocks.
+ */
+int32_t aster_coordination_lease_fence(aster_runtime_t runtime,
+                                       aster_coordination_lease_t lease,
+                                       uint8_t *buf,
+                                       uintptr_t cap,
+                                       uintptr_t *out_len);
+
+/**
+ * The holder-side status (`aster_lease_status_t`); `RELEASED` once
+ * released, being released, or its client closed. Never blocks.
+ */
+int32_t aster_coordination_lease_status(aster_runtime_t runtime,
+                                        aster_coordination_lease_t lease,
+                                        uint32_t *out_status);
+
+/**
+ * `compare_and_set` on the register under the lease's current fence;
+ * journaled and acknowledged by the lease. Completes with
+ * `ASTER_EVENT_COORDINATION_RESULT`, payload = `D2`. A release, free or
+ * client close called after this returns waits for it to finish;
+ * `ALREADY_CLOSED` here when the lease is closed or being released.
+ */
+int32_t aster_coordination_lease_compare_and_set(aster_runtime_t runtime,
+                                                 aster_coordination_lease_t lease,
+                                                 uint64_t expected_value_revision,
+                                                 struct aster_bytes_t new_value,
+                                                 uint64_t user_data,
+                                                 aster_operation_t *out_operation);
+
+/**
+ * Graceful release through the lease's own transition. Consumes the handle
+ * (later calls `NOT_FOUND`); waits for an in-flight `compare_and_set` on it.
+ * Completes with `ASTER_EVENT_UNIT_RESULT`.
+ */
+int32_t aster_coordination_lease_release(aster_runtime_t runtime,
+                                         aster_coordination_lease_t lease,
+                                         uint64_t user_data,
+                                         aster_operation_t *out_operation);
+
+/**
+ * The atomic final handoff: write `final_value` and release together, or
+ * neither. Consumes the handle. Completes with
+ * `ASTER_EVENT_COORDINATION_RESULT`, payload = `D2`.
+ */
+int32_t aster_coordination_lease_release_with_value(aster_runtime_t runtime,
+                                                    aster_coordination_lease_t lease,
+                                                    uint64_t expected_value_revision,
+                                                    struct aster_bytes_t final_value,
+                                                    uint64_t user_data,
+                                                    aster_operation_t *out_operation);
+
+/**
+ * Free a lease handle **without** releasing: renewals stop and the lease
+ * lapses by TTL. Prefer `aster_coordination_lease_release`.
+ */
+int32_t aster_coordination_lease_free(aster_runtime_t runtime, aster_coordination_lease_t lease);
+
+/**
+ * The §7.7.3 placement manager over a durable client. Its policy source
+ * (kind 32 `BC` -> `BD`) and provisioner (kind 33 `BE` -> `BF`) are the
+ * binding, answered on `upcalls`; its topology is `topology_node`'s own
+ * shared view (the node must have joined a swarm with
+ * `aster_topology_enable_shared`) or, with 0, the binding (kind 17 `BA` ->
+ * `BB`). Provider failures (error, unimplemented, timeout, malformed
+ * answer) fail the pass: these kinds have no fail-open. It changes
+ * membership only through the client's durable journal.
+ */
+int32_t aster_coordination_placement_manager_new(aster_runtime_t runtime,
+                                                 aster_coordination_client_t client,
+                                                 aster_upcalls_t upcalls,
+                                                 aster_node_t topology_node,
+                                                 aster_coordination_placement_manager_t *out_manager);
+
+/**
+ * Run one reconciliation pass (passes on one manager are serialized).
+ * Completes with `ASTER_EVENT_COORDINATION_RESULT`, payload = `DE` (the
+ * report), or `ASTER_EVENT_ERROR`.
+ */
+int32_t aster_coordination_placement_reconcile(aster_runtime_t runtime,
+                                               aster_coordination_placement_manager_t manager,
+                                               uint64_t user_data,
+                                               aster_operation_t *out_operation);
+
+/**
+ * Free a placement manager (after any running pass).
+ */
+int32_t aster_coordination_placement_manager_free(aster_runtime_t runtime,
+                                                  aster_coordination_placement_manager_t manager);
 
 /**
  * Download a blob by hash from an **ordered** list of providers

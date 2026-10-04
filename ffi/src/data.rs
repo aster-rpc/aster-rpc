@@ -379,6 +379,8 @@ impl Done {
 pub(crate) struct OpError {
     pub(crate) status: aster_status_t,
     pub(crate) code: i32,
+    /// The event's `flags` (a detail code; 0 by default).
+    pub(crate) flags: u32,
     pub(crate) message: String,
 }
 
@@ -387,6 +389,7 @@ impl From<String> for OpError {
         OpError {
             status: aster_status_t::ASTER_STATUS_INTERNAL,
             code: -1,
+            flags: 0,
             message,
         }
     }
@@ -447,7 +450,7 @@ where
                     }),
                 }
             }
-            Err(e) => b.emit_error_coded(op_id, user_data, e.status, e.code, &e.message),
+            Err(e) => b.emit_error_flagged(op_id, user_data, e.status, e.code, e.flags, &e.message),
         }
     });
     OK
