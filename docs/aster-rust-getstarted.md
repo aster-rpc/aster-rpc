@@ -202,6 +202,16 @@ serves the same routes as the Python/TS `HealthServer`: `GET /healthz`
 OpenMetrics or with `?format=prometheus`) and `GET /metrics/prometheus` (the
 `aster_*` series plus, with `metrics`, `Node::metrics_prometheus`).
 
+Under `AsterServer` the counters are fed by the server itself: every RPC call
+counts as started and then succeeded or failed by its final status (calls
+refused before a handler ran count as failed), as an RPC stream while it is in
+flight, and each `aster/1` connection counts from its first call until it
+closes. Gate 0 decisions made through `AsterServer::take_admission()` count as
+the consumer admission series (accept = admitted, `reject` = denied). With a
+hand-built `Server` or a bare `Node`, wire the same counters with
+`Server::health_state(health.state())` and
+`node.take_admission().unwrap().with_health(health.state())`.
+
 The ALPNs are exported as `aster::RPC_ALPN` and `aster::alpns::{RPC,
 CONSUMER_ADMISSION, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,
 GOSSIP}`.
@@ -694,7 +704,57 @@ assert!(fetched.verified);
 
 ---
 
-## 5. Cargo features
+## 5. Logging
+
+`aster` logs through the [`tracing`](https://docs.rs/tracing) facade and
+installs no subscriber: nothing is printed until your application installs
+one. With none installed, each log site costs a level check and allocates
+nothing. The usual choice is `tracing-subscriber` with an `EnvFilter`:
+
+```toml
+# Cargo.toml of your application
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+```
+
+```rust,ignore
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                // Warnings from everything, routine server events from aster.
+                .unwrap_or_else(|_| "warn,aster=info".into()),
+        )
+        .init();
+    // ... start the runtime, the node, the server ...
+}
+```
+
+Then `RUST_LOG=aster=debug` shows every call, `RUST_LOG=aster::rpc::dispatch=debug`
+only the per-call events, and `RUST_LOG=warn,aster::admission=info` the Gate 0
+refusals. The targets (also listed in `aster::log_targets`):
+
+| Target | Level | Events |
+|---|---|---|
+| `aster::rpc::server` | info | `AsterServer` started / shutting down |
+| | debug | serve loop start/end; connection closed (with the number of sessions reaped); connection on an ALPN nobody handles |
+| `aster::rpc::dispatch` | debug | an `rpc` span around every native handler (`service`, `method`, `call_id`, `peer`), so your handler's own events carry the call; `rpc completed` (`status`, `elapsed_us`) for every call; `rpc refused` (status and message) for calls stopped before a handler; deadline expiry |
+| | warn | a corrupt request frame: a frame that does not inflate, or a client-stream / bidi request that does not decode. The call fails with `INVALID_ARGUMENT` |
+| `aster::rpc::session` | debug | session opened, sessions reaped with their connection, HTTP session ended |
+| `aster::rpc::foreign` | debug / trace | binding-implemented services: call cancelled (peer, deadline, invalid request) or abandoned (debug); call delivered (trace) |
+| `aster::admission` | info | Gate 0: inbound peer rejected (`peer`, `alpn`, `code`, `reason`) |
+| | debug | Gate 0: inbound peer accepted; outbound connect allowed / blocked |
+| `aster::health` | info / debug | health listener started / stopped; accept and connection errors |
+
+The transport underneath logs under `aster_transport_core` (reactor, framing)
+and `iroh` / `iroh_*` (QUIC, relay, discovery); `RUST_LOG=warn,aster=debug`
+keeps those quiet while showing everything from `aster`.
+
+The Python and TypeScript packages and the C ABI do not forward these events
+yet; they keep their own logging.
+
+---
+
+## 6. Cargo features
 
 | Feature | Default | What it enables |
 |---------|:-------:|-----------------|
@@ -708,7 +768,7 @@ with `AsterConfigBuilder::hooks(true)`.
 
 ---
 
-## 6. Current limits
+## 7. Current limits
 
 - **Cross-binding RPC payloads** are Rust↔Rust only today (the Rust Fory crate
   and the other bindings' Fory are on different majors). **Contract identity and
@@ -730,7 +790,7 @@ with `AsterConfigBuilder::hooks(true)`.
 
 ---
 
-## 7. See also
+## 8. See also
 
 - [aster-baseline-services-getstarted.md](aster-baseline-services-getstarted.md) —
   the default-on `aster.ops.NodeInfo` service, the `aster/Value` typed
