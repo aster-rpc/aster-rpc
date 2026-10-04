@@ -98,6 +98,9 @@ internal static partial class Native
     [LibraryImport(NativeLib, EntryPoint = "aster_connection_close")]
     public static partial int aster_connection_close(ulong runtime, ulong connection, uint error_code, Bytes reason);
 
+    [LibraryImport(NativeLib, EntryPoint = "aster_connection_free")]
+    public static partial int aster_connection_free(ulong runtime, ulong connection);
+
     [LibraryImport(NativeLib, EntryPoint = "aster_connection_remote_id")]
     public static partial int aster_connection_remote_id(ulong runtime, ulong connection, IntPtr out_buf, UIntPtr capacity, out UIntPtr out_len);
 
@@ -142,30 +145,6 @@ internal static partial class Native
 
     [LibraryImport(NativeLib, EntryPoint = "aster_recv_stream_free")]
     public static partial int aster_recv_stream_free(ulong runtime, ulong recv_stream);
-
-    // ─── Reactor ────────────────────────────────────────────────────────────
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_create")]
-    public static partial int aster_reactor_create(ulong runtime, ulong node, uint ring_capacity, out ulong out_reactor);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_destroy")]
-    public static partial int aster_reactor_destroy(ulong runtime, ulong reactor);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_poll")]
-    public static unsafe partial uint aster_reactor_poll(ulong runtime, ulong reactor, ReactorCallNative* out_calls, uint max_calls, uint timeout_ms);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_submit")]
-    public static partial int aster_reactor_submit(ulong runtime, ulong reactor, ulong call_id,
-        IntPtr response_ptr, uint response_len, IntPtr trailer_ptr, uint trailer_len);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_reserve_response_capacity")]
-    public static partial int aster_reactor_reserve_response_capacity(ulong runtime, ulong reactor, ulong call_id, ulong encoded_len);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_cancel_response_reservation")]
-    public static partial int aster_reactor_cancel_response_reservation(ulong runtime, ulong reactor, ulong call_id);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_buffer_release")]
-    public static partial int aster_reactor_buffer_release(ulong runtime, ulong reactor, ulong buffer);
 
     // ─── Blobs ──────────────────────────────────────────────────────────────
 

@@ -66,22 +66,16 @@ public static class ContractBuilder
             w.WriteString("name", service.Name);
             w.WriteNumber("version", service.Version);
             w.WriteStartArray("methods");
-            foreach (var m in service.Methods.Values.OrderBy(m => m.Name.Normalize(NormalizationForm.FormC), StringComparer.Ordinal))
+            foreach (var m in service.OrderedMethods)
             {
                 w.WriteStartObject();
                 w.WriteString("name", m.Name);
-                w.WriteString("pattern", m.Pattern switch
-                {
-                    MethodPattern.Unary => "unary",
-                    MethodPattern.ServerStream => "server_stream",
-                    MethodPattern.ClientStream => "client_stream",
-                    _ => "bidi_stream",
-                });
+                w.WriteString("pattern", PatternWire(m.Pattern));
                 w.WriteString("request_type", resolver.Hash(m.RequestType));
                 w.WriteString("response_type", resolver.Hash(m.ResponseType));
                 w.WriteBoolean("idempotent", m.Idempotent);
-                w.WriteNumber("default_timeout", 0.0);
-                w.WriteNull("requires");
+                w.WriteNumber("default_timeout", m.DefaultTimeout?.TotalSeconds ?? 0.0);
+                WriteRequires(w, m.Requires);
                 w.WriteEndObject();
             }
             w.WriteEndArray();
@@ -89,11 +83,82 @@ public static class ContractBuilder
             w.WriteStringValue("xlang");
             w.WriteEndArray();
             w.WriteString("scoped", service.Scope == ServiceScope.Session ? "session" : "shared");
-            w.WriteNull("requires");
+            WriteRequires(w, service.Requires);
             w.WriteString("producer_language", "");
             w.WriteEndObject();
         }
         return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    /// <summary>
+    /// The JSON registration form (<c>DynamicService</c>, dynamic-dispatch design §1.5) for
+    /// <c>aster_server_add_service_json</c>. Methods are in <see cref="Ordered"/> order, so a
+    /// method's index is its dispatch <c>method_idx</c>. Rust derives the same contract id from it
+    /// as <see cref="ComputeContractId"/> (checked by <c>aster_dynamic_service_contract_id</c> in
+    /// the tests).
+    /// </summary>
+    public static string RegistrationJson(ServiceDefinition service)
+    {
+        var resolver = new Resolver();
+        using var ms = new MemoryStream();
+        using (var w = new Utf8JsonWriter(ms))
+        {
+            w.WriteStartObject();
+            w.WriteString("name", service.Name);
+            w.WriteNumber("version", service.Version);
+            w.WriteString("scope", service.Scope == ServiceScope.Session ? "session" : "shared");
+            if (service.Requires != null) WriteRequires(w, service.Requires);
+            w.WriteStartArray("serialization_modes");
+            w.WriteStringValue("xlang");
+            w.WriteEndArray();
+            w.WriteStartArray("methods");
+            foreach (var m in service.OrderedMethods)
+            {
+                w.WriteStartObject();
+                w.WriteString("name", m.Name);
+                w.WriteString("pattern", PatternWire(m.Pattern));
+                w.WriteStartObject("request");
+                w.WriteString("hash", resolver.Hash(m.RequestType));
+                w.WriteEndObject();
+                w.WriteStartObject("response");
+                w.WriteString("hash", resolver.Hash(m.ResponseType));
+                w.WriteEndObject();
+                w.WriteBoolean("idempotent", m.Idempotent);
+                if (m.DefaultTimeout is { } t && t > TimeSpan.Zero) w.WriteNumber("default_timeout", t.TotalSeconds);
+                if (m.Requires != null) WriteRequires(w, m.Requires);
+                w.WriteEndObject();
+            }
+            w.WriteEndArray();
+            w.WriteEndObject();
+        }
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    /// <summary>Methods sorted by NFC name, ordinal: the contract (and dispatch index) order.</summary>
+    internal static MethodDefinition[] Ordered(IEnumerable<MethodDefinition> methods)
+        => methods.OrderBy(m => m.Name.Normalize(NormalizationForm.FormC), StringComparer.Ordinal).ToArray();
+
+    private static string PatternWire(MethodPattern p) => p switch
+    {
+        MethodPattern.Unary => "unary",
+        MethodPattern.ServerStream => "server_stream",
+        MethodPattern.ClientStream => "client_stream",
+        _ => "bidi_stream",
+    };
+
+    private static void WriteRequires(Utf8JsonWriter w, CapabilityRequirement? r)
+    {
+        if (r is null)
+        {
+            w.WriteNull("requires");
+            return;
+        }
+        w.WriteStartObject("requires");
+        w.WriteString("kind", r.WireKind);
+        w.WriteStartArray("roles");
+        foreach (var role in r.Roles) w.WriteStringValue(role);
+        w.WriteEndArray();
+        w.WriteEndObject();
     }
 
     /// <summary>The <c>TypeDef</c> JSON of a <see cref="WireTypeAttribute"/> class or enum.</summary>

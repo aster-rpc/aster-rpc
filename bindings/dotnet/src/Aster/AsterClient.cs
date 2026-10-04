@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Aster.Codec;
@@ -14,18 +16,29 @@ namespace Aster;
 /// <summary>Per-call options.</summary>
 public sealed record CallOptions
 {
-    /// <summary>Relative deadline; sent rounded <b>up</b> to whole seconds (max 32767 s).</summary>
+    /// <summary>
+    /// Relative deadline. Enforced by Rust on the client (<c>DEADLINE_EXCEEDED</c>) and sent
+    /// rounded <b>up</b> to whole seconds (max 32767 s).
+    /// </summary>
     public TimeSpan? Deadline { get; init; }
 
     /// <summary>Request metadata (stream header).</summary>
     public IReadOnlyList<KeyValuePair<string, string>>? Metadata { get; init; }
 
-    /// <summary>0 = shared service; non-zero = a session of a session-scoped service.</summary>
+    /// <summary>
+    /// 0 = shared service; non-zero = a session of a session-scoped service (take ids from
+    /// <see cref="RpcConnection.NextSessionId"/>). Unary calls of one session share one pooled stream.
+    /// </summary>
     public int SessionId { get; init; }
 
-    internal short DeadlineSeconds => Deadline is { } d && d > TimeSpan.Zero
-        ? (short)Math.Min(short.MaxValue, Math.Ceiling(d.TotalSeconds))
-        : (short)0;
+    /// <summary>Service version (<c>StreamHeader.version</c>).</summary>
+    public int Version { get; init; } = 1;
+
+    internal const uint MaxDeadlineMs = 32_767_000;
+
+    internal uint DeadlineMs => Deadline is { } d && d > TimeSpan.Zero
+        ? (uint)Math.Min(MaxDeadlineMs, Math.Ceiling(d.TotalMilliseconds))
+        : 0u;
 }
 
 /// <summary>
@@ -111,13 +124,20 @@ public sealed class AsterClient : IAsyncDisposable
 }
 
 /// <summary>
-/// RPC calls over one QUIC connection, through the C ABI multiplexed-stream pool
-/// (<c>aster_call_*</c>): unary calls use the pooled fast path, streaming calls a dedicated
-/// substream. Blocking native calls run on the thread pool.
+/// RPC calls over one QUIC connection through the payload-level C ABI client (3.5,
+/// <c>aster_rpc_*</c> / <c>aster_call_*_payload</c>) on Rust's pooled <c>RpcConnection</c>: Rust
+/// builds the stream header, frames, compresses, enforces the deadline and decodes trailers;
+/// .NET passes options and payloads. Unary calls use the pooled streams; a unary call with a
+/// cancellable token, and every streaming call, get their own stream so that cancelling the token
+/// cancels the native call (<c>aster_call_cancel</c>: the server sees the cancel). Blocking
+/// native calls run on the thread pool.
 /// </summary>
 public sealed class RpcConnection : IAsyncDisposable
 {
-    private const uint RecvPollMs = 100;
+    private const uint RecvWaitMs = 250;
+    private const byte PatternServerStream = 1;
+    private const byte PatternClientStream = 2;
+    private const byte PatternBidiStream = 3;
 
     private readonly Connection _connection;
     private readonly ICodec _codec;
@@ -133,57 +153,91 @@ public sealed class RpcConnection : IAsyncDisposable
     private ulong Rt => _connection.Runtime.Handle;
     private ulong Conn => _connection.Handle.Value;
 
-    private static byte[] HeaderFrame(string service, string method, CallOptions? options)
-        => AsterFraming.EncodeFrame(AsterEnvelope.Encode(new StreamHeader(
-            service, method,
-            Deadline: options?.DeadlineSeconds ?? 0,
-            Metadata: options?.Metadata,
-            SessionId: options?.SessionId ?? 0)), AsterFraming.FlagHeader);
+    /// <summary>
+    /// A fresh session id for a session-scoped service (<see cref="CallOptions.SessionId"/>), from
+    /// the connection's shared counter (unique across every client on the connection). The server
+    /// creates the session on the first call carrying it.
+    /// </summary>
+    public int NextSessionId()
+    {
+        int r = Native.aster_connection_next_session_id(Rt, Conn, out uint id);
+        if (r != 0) throw CallError(r, "aster_connection_next_session_id");
+        return unchecked((int)id);
+    }
+
+    /// <summary>Encoded per-call options (<c>aster_call_options_t</c> fields).</summary>
+    private readonly struct CallSpec(string service, string method, CallOptions? options)
+    {
+        public readonly byte[] Service = Encoding.UTF8.GetBytes(service);
+        public readonly byte[] Method = Encoding.UTF8.GetBytes(method);
+        public readonly byte[] Metadata = options?.Metadata is { Count: > 0 } md ? KvList.Encode(md) : Array.Empty<byte>();
+        public readonly uint SessionId = unchecked((uint)(options?.SessionId ?? 0));
+        public readonly uint DeadlineMs = options?.DeadlineMs ?? 0;
+        public readonly int Version = options?.Version ?? 1;
+
+        public unsafe CallOptionsNative Native(byte* service, byte* method, byte* metadata) => new()
+        {
+            struct_size = (uint)sizeof(CallOptionsNative),
+            version = Version,
+            service = Bytes.FromPointer(service, Service.Length),
+            method = Bytes.FromPointer(method, Method.Length),
+            metadata = Bytes.FromPointer(metadata, Metadata.Length),
+            session_id = SessionId,
+            deadline_ms = DeadlineMs,
+        };
+    }
 
     /// <summary>A unary call.</summary>
     public async Task<TResp> UnaryAsync<TReq, TResp>(string service, string method, TReq request,
         CallOptions? options = null, CancellationToken cancellationToken = default)
     {
-        byte[] header = HeaderFrame(service, method, options);
-        byte[] body = AsterFraming.EncodePayloadFrame(_codec.Encode(request), AsterFraming.FlagEndStream);
-        byte[] pair = new byte[header.Length + body.Length];
-        header.CopyTo(pair, 0);
-        body.CopyTo(pair, header.Length);
-        uint sessionId = (uint)(options?.SessionId ?? 0);
-
-        // aster_call_unary blocks its thread for the whole call; a cancelled caller stops
-        // waiting but the native call runs to completion (or the transport deadline).
-        var native = Task.Run(() => UnaryNative(pair, sessionId), CancellationToken.None);
-        var (responsePayload, responseFlags, trailer) = await native.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-        var status = trailer.Length == 0 ? RpcStatus.Ok : AsterEnvelope.DecodeRpcStatus(trailer);
-        status.ThrowIfError();
-        if (responsePayload is null)
+        byte[] req = _codec.Encode(request);
+        var spec = new CallSpec(service, method, options);
+        byte[] response;
+        if (!cancellationToken.CanBeCanceled)
+        {
+            // Pooled fast path: one blocking native call (header + request in one write).
+            var (code, payload, status) = await Task.Run(() => UnaryNative(spec, req), CancellationToken.None).ConfigureAwait(false);
+            if (code != 0) throw StatusError(code, status);
+            response = payload;
+        }
+        else
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // Same wire shape on a dedicated stream, so the token can cancel the native call.
+            await using var call = await PayloadCall.OpenAsync(this, PatternServerStream, spec, cancellationToken).ConfigureAwait(false);
+            call.Send(req, end: true);
+            response = await call.ReadSingleAsync(cancellationToken).ConfigureAwait(false);
+        }
+        if (response.Length == 0)
             throw new RpcError(StatusCode.Internal, "OK trailer with no response frame");
-        return _codec.Decode<TResp>(AsterFraming.PayloadOf(responsePayload, responseFlags));
+        return _codec.Decode<TResp>(response);
     }
 
-    private unsafe (byte[]? Payload, byte Flags, byte[] Trailer) UnaryNative(byte[] pair, uint sessionId)
+    private unsafe (int Code, byte[] Payload, byte[] Status) UnaryNative(CallSpec spec, byte[] request)
     {
-        byte* respPtr = null, trailerPtr = null;
-        uint respLen = 0, trailerLen = 0;
-        byte respFlags = 0;
-        ulong respBuf = 0, trailerBuf = 0;
+        byte* respPtr = null, statusPtr = null;
+        uint respLen = 0, statusLen = 0;
+        ulong respBuf = 0, statusBuf = 0;
+        int code = 0;
         int r;
-        fixed (byte* p = pair)
-            r = Native.aster_call_unary(Rt, Conn, sessionId, p, (uint)pair.Length,
-                &respPtr, &respLen, &respFlags, &respBuf, &trailerPtr, &trailerLen, &trailerBuf);
-        if (r != 0) throw CallError(r, "aster_call_unary");
+        fixed (byte* sp = spec.Service, mp = spec.Method, kp = spec.Metadata, rp = request)
+        {
+            CallOptionsNative o = spec.Native(sp, mp, kp);
+            r = Native.aster_rpc_unary(Rt, Conn, &o, request.Length == 0 ? null : rp, (uint)request.Length,
+                &respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf);
+        }
+        if (r != 0) throw CallError(r, "aster_rpc_unary");
         try
         {
-            byte[]? payload = respBuf != 0 || respLen > 0 ? new ReadOnlySpan<byte>(respPtr, (int)respLen).ToArray() : null;
-            byte[] trailer = trailerLen > 0 ? new ReadOnlySpan<byte>(trailerPtr, (int)trailerLen).ToArray() : Array.Empty<byte>();
-            return (payload, respFlags, trailer);
+            return (code,
+                respLen == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>(respPtr, (int)respLen).ToArray(),
+                statusLen == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>(statusPtr, (int)statusLen).ToArray());
         }
         finally
         {
             if (respBuf != 0) Native.aster_call_buffer_release(Rt, respBuf);
-            if (trailerBuf != 0) Native.aster_call_buffer_release(Rt, trailerBuf);
+            if (statusBuf != 0) Native.aster_call_buffer_release(Rt, statusBuf);
         }
     }
 
@@ -191,31 +245,23 @@ public sealed class RpcConnection : IAsyncDisposable
     public async IAsyncEnumerable<TResp> ServerStreamAsync<TReq, TResp>(string service, string method, TReq request,
         CallOptions? options = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        await using var call = await StreamingCall.OpenAsync(this, service, method, options, cancellationToken).ConfigureAwait(false);
-        await call.SendAsync(_codec.Encode(request), end: true, cancellationToken).ConfigureAwait(false);
+        await using var call = await PayloadCall.OpenAsync(this, PatternServerStream, new CallSpec(service, method, options), cancellationToken)
+            .ConfigureAwait(false);
+        call.Send(_codec.Encode(request), end: true);
         await foreach (var payload in call.ReadResponsesAsync(cancellationToken).ConfigureAwait(false))
             yield return _codec.Decode<TResp>(payload);
-        call.Succeeded();
     }
 
     /// <summary>A client-streaming call: a stream of requests, one response.</summary>
     public async Task<TResp> ClientStreamAsync<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
         CallOptions? options = null, CancellationToken cancellationToken = default)
     {
-        await using var call = await StreamingCall.OpenAsync(this, service, method, options, cancellationToken).ConfigureAwait(false);
+        await using var call = await PayloadCall.OpenAsync(this, PatternClientStream, new CallSpec(service, method, options), cancellationToken)
+            .ConfigureAwait(false);
         await call.SendAllAsync(requests, _codec, cancellationToken).ConfigureAwait(false);
-        byte[]? response = null;
-        int count = 0;
-        await foreach (var payload in call.ReadResponsesAsync(cancellationToken).ConfigureAwait(false))
-        {
-            response = payload;
-            count++;
-        }
-        if (response is null)
+        byte[] response = await call.ReadSingleAsync(cancellationToken).ConfigureAwait(false);
+        if (response.Length == 0)
             throw new RpcError(StatusCode.Internal, "OK trailer with no response frame");
-        if (count > 1)
-            throw new RpcError(StatusCode.Internal, $"client-stream call received {count} response frames");
-        call.Succeeded();
         return _codec.Decode<TResp>(response);
     }
 
@@ -228,9 +274,10 @@ public sealed class RpcConnection : IAsyncDisposable
     public async IAsyncEnumerable<TResp> BidiStreamAsync<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
         CallOptions? options = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        await using var call = await StreamingCall.OpenAsync(this, service, method, options, cancellationToken).ConfigureAwait(false);
+        await using var call = await PayloadCall.OpenAsync(this, PatternBidiStream, new CallSpec(service, method, options), cancellationToken)
+            .ConfigureAwait(false);
         using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var sending = call.SendAllAsync(requests, _codec, sendCts.Token);
+        var sending = Task.Run(() => call.SendAllAsync(requests, _codec, sendCts.Token), CancellationToken.None);
         try
         {
             await foreach (var payload in call.ReadResponsesAsync(cancellationToken).ConfigureAwait(false))
@@ -242,7 +289,6 @@ public sealed class RpcConnection : IAsyncDisposable
             try { await sending.ConfigureAwait(false); }
             catch (OperationCanceledException) { }
         }
-        call.Succeeded();
     }
 
     public ValueTask DisposeAsync()
@@ -254,122 +300,222 @@ public sealed class RpcConnection : IAsyncDisposable
 
     internal static Exception CallError(int code, string what) => code switch
     {
-        -10 => new RpcError(StatusCode.ResourceExhausted, $"{what}: stream pool full"),
-        -11 => new RpcError(StatusCode.ResourceExhausted, $"{what}: QUIC stream limit reached"),
-        -12 => new RpcError(StatusCode.ResourceExhausted, $"{what}: peer stream limit too low"),
-        -13 => new RpcError(StatusCode.Unavailable, $"{what}: stream open failed: {IrohException.LastErrorMessage()}"),
-        -14 => new RpcError(StatusCode.Unavailable, $"{what}: stream pool closed"),
+        (int)Status.NotFound => new RpcError(StatusCode.Unavailable, $"{what}: connection or call is gone"),
+        (int)Status.InvalidArgument => new RpcError(StatusCode.InvalidArgument, IrohException.FromStatus(code, what).Message),
         _ => new RpcError(StatusCode.Unavailable, IrohException.FromStatus(code, what).Message),
     };
 
-    /// <summary>One streaming call on a dedicated substream (<c>aster_call_acquire_streaming</c>).</summary>
-    private sealed class StreamingCall : IAsyncDisposable
+    /// <summary>The <see cref="RpcError"/> for a failed call's code and AEv1 <c>RpcStatus</c> bytes.</summary>
+    private static RpcError StatusError(int code, byte[] status)
     {
+        RpcStatus st = status.Length > 0 ? AsterEnvelope.DecodeRpcStatus(status) : new RpcStatus((StatusCode)code);
+        if (st.Code == StatusCode.Ok) st = st with { Code = (StatusCode)code };
+        return new RpcError(st.Code, st.Message, st.Details.GroupBy(kv => kv.Key).ToDictionary(g => g.Key, g => g.Last().Value));
+    }
+
+    /// <summary>One call on its own stream (<c>aster_rpc_open</c>); a cancelled token cancels it natively.</summary>
+    private sealed class PayloadCall : IAsyncDisposable
+    {
+        private const int BatchBytes = 64 * 1024;
+        private const int BatchCount = 256;
+
         private readonly RpcConnection _owner;
         private readonly ulong _call;
-        private bool _succeeded;
+        private CancellationTokenRegistration _cancel;
+        private int _released;
 
-        private StreamingCall(RpcConnection owner, ulong call)
+        private PayloadCall(RpcConnection owner, ulong call)
         {
             _owner = owner;
             _call = call;
         }
 
-        public static async Task<StreamingCall> OpenAsync(RpcConnection owner, string service, string method, CallOptions? options, CancellationToken ct)
+        public static async Task<PayloadCall> OpenAsync(RpcConnection owner, byte pattern, CallSpec spec, CancellationToken ct)
         {
-            ulong handle = await Task.Run(() =>
-            {
-                int r = Native.aster_call_acquire_streaming(owner.Rt, owner.Conn, out ulong h);
-                if (r != 0) throw CallError(r, "aster_call_acquire_streaming");
-                return h;
-            }, ct).ConfigureAwait(false);
-            var call = new StreamingCall(owner, handle);
+            ct.ThrowIfCancellationRequested();
+            // Server-stream defers the stream open to the first send; client-stream / bidi open
+            // the stream and send the header now (a network round trip: off the caller's thread).
+            ulong handle = pattern == PatternServerStream
+                ? owner.Open(pattern, spec)
+                : await Task.Run(() => owner.Open(pattern, spec), CancellationToken.None).ConfigureAwait(false);
+            var call = new PayloadCall(owner, handle);
+            if (ct.CanBeCanceled)
+                call._cancel = ct.UnsafeRegister(static s => ((PayloadCall)s!).CancelNative(), call);
+            return call;
+        }
+
+        private void CancelNative()
+        {
+            if (Volatile.Read(ref _released) == 0)
+                Native.aster_call_cancel(_owner.Rt, _call);
+        }
+
+        /// <summary>Sends one request payload; false when the call is over (the trailer says why).</summary>
+        public unsafe bool Send(byte[] payload, bool end)
+        {
+            int r;
+            fixed (byte* p = payload)
+                r = Native.aster_call_send_payload(_owner.Rt, _call, payload.Length == 0 ? null : p, (uint)payload.Length, end ? (byte)1 : (byte)0);
+            if (r == (int)Status.AlreadyClosed) return false;
+            if (r != 0) throw CallError(r, "aster_call_send_payload");
+            return true;
+        }
+
+        /// <summary>Several payloads framed into as few writes as possible (client-stream / bidi).</summary>
+        private unsafe bool SendMany(List<byte[]> payloads, bool end)
+        {
+            if (payloads.Count <= 1)
+                return Send(payloads.Count == 0 ? Array.Empty<byte>() : payloads[0], end);
+            var pins = new GCHandle[payloads.Count];
+            var descs = new Bytes[payloads.Count];
             try
             {
-                await call.SendFrameAsync(HeaderFrame(service, method, options), ct).ConfigureAwait(false);
-                return call;
+                for (int i = 0; i < payloads.Count; i++)
+                {
+                    pins[i] = GCHandle.Alloc(payloads[i], GCHandleType.Pinned);
+                    descs[i] = new Bytes { ptr = pins[i].AddrOfPinnedObject(), len = (UIntPtr)payloads[i].Length };
+                }
+                int r;
+                fixed (Bytes* d = descs)
+                    r = Native.aster_call_send_payloads(_owner.Rt, _call, d, (uint)descs.Length, end ? (byte)1 : (byte)0);
+                if (r == (int)Status.AlreadyClosed) return false;
+                if (r != 0) throw CallError(r, "aster_call_send_payloads");
+                return true;
             }
-            catch
+            finally
             {
-                await call.DisposeAsync().ConfigureAwait(false);
-                throw;
+                foreach (var h in pins)
+                    if (h.IsAllocated) h.Free();
             }
         }
 
-        public Task SendAsync(byte[] payload, bool end, CancellationToken ct)
-            => SendFrameAsync(AsterFraming.EncodePayloadFrame(payload, end ? AsterFraming.FlagEndStream : (byte)0), ct);
-
+        /// <summary>
+        /// Sends every request and ends the request stream. Requests that are ready together are
+        /// batched into one native call; the batch is flushed before waiting for the next one.
+        /// </summary>
         public async Task SendAllAsync<TReq>(IAsyncEnumerable<TReq> requests, ICodec codec, CancellationToken ct)
         {
-            // One message is held back so the last frame can carry END_STREAM.
-            byte[]? pending = null;
-            await foreach (var r in requests.WithCancellation(ct).ConfigureAwait(false))
-            {
-                if (pending != null) await SendAsync(pending, end: false, ct).ConfigureAwait(false);
-                pending = codec.Encode(r);
-            }
-            if (pending != null)
-                await SendAsync(pending, end: true, ct).ConfigureAwait(false);
-            else
-                await SendFrameAsync(AsterFraming.EncodeFrame(ReadOnlySpan<byte>.Empty, AsterFraming.FlagEndStream), ct).ConfigureAwait(false);
-        }
-
-        private Task SendFrameAsync(byte[] frame, CancellationToken ct) => Task.Run(() =>
-        {
-            unsafe
-            {
-                fixed (byte* p = frame)
-                {
-                    int r = Native.aster_call_send_frame(_owner.Rt, _call, p, (uint)frame.Length);
-                    if (r != 0) throw CallError(r, "aster_call_send_frame");
-                }
-            }
-        }, ct);
-
-        /// <summary>Response payloads until the trailer; a non-OK trailer throws <see cref="RpcError"/>.</summary>
-        public async IAsyncEnumerable<byte[]> ReadResponsesAsync([EnumeratorCancellation] CancellationToken ct)
-        {
+            var batch = new List<byte[]>();
+            int bytes = 0;
+            await using var e = requests.GetAsyncEnumerator(ct);
             while (true)
             {
-                ct.ThrowIfCancellationRequested();
-                var (status, payload, flags) = await Task.Run(() => Recv(RecvPollMs), ct).ConfigureAwait(false);
-                if (status == 2) continue; // timeout: poll again
-                if (status == 1) throw new RpcError(StatusCode.Unavailable, "stream ended before trailer");
-                if ((flags & AsterFraming.FlagTrailer) != 0)
+                ValueTask<bool> next = e.MoveNextAsync();
+                if (!next.IsCompleted && batch.Count > 0)
                 {
-                    (payload.Length == 0 ? RpcStatus.Ok : AsterEnvelope.DecodeRpcStatus(payload)).ThrowIfError();
-                    yield break;
+                    if (!SendMany(batch, end: false)) return;
+                    batch.Clear();
+                    bytes = 0;
                 }
-                if ((flags & AsterFraming.FlagRowSchema) != 0) continue;
-                yield return AsterFraming.PayloadOf(payload, flags);
+                if (!await next.ConfigureAwait(false)) break;
+                byte[] payload = codec.Encode(e.Current);
+                batch.Add(payload);
+                bytes += payload.Length;
+                if (bytes >= BatchBytes || batch.Count >= BatchCount)
+                {
+                    if (!SendMany(batch, end: false)) return;
+                    batch.Clear();
+                    bytes = 0;
+                }
             }
+            SendMany(batch, end: true);
         }
 
-        private unsafe (int Status, byte[] Payload, byte Flags) Recv(uint timeoutMs)
+        private enum RecvKind { Payload, Trailer, Timeout, Closed }
+
+        private unsafe (RecvKind, byte[]) Recv(uint timeoutMs)
         {
             byte* ptr = null;
             uint len = 0;
-            byte flags = 0;
             ulong buffer = 0;
-            int r = Native.aster_call_recv_frame(_owner.Rt, _call, timeoutMs, &ptr, &len, &flags, &buffer);
-            if (r < 0) throw CallError(r, "aster_call_recv_frame");
-            if (r != 0) return (r, Array.Empty<byte>(), 0);
-            try { return (0, len == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>(ptr, (int)len).ToArray(), flags); }
+            byte trailer = 0;
+            int r = Native.aster_call_recv_payload(_owner.Rt, _call, timeoutMs, &ptr, &len, &buffer, &trailer);
+            if (r == (int)Status.Timeout) return (RecvKind.Timeout, Array.Empty<byte>());
+            if (r == (int)Status.AlreadyClosed) return (RecvKind.Closed, Array.Empty<byte>());
+            if (r != 0) throw CallError(r, "aster_call_recv_payload");
+            try
+            {
+                byte[] bytes = len == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>(ptr, (int)len).ToArray();
+                return (trailer != 0 ? RecvKind.Trailer : RecvKind.Payload, bytes);
+            }
             finally
             {
                 if (buffer != 0) Native.aster_call_buffer_release(_owner.Rt, buffer);
             }
         }
 
-        public void Succeeded() => _succeeded = true;
+        private (RecvKind, byte[]) WaitRecv()
+        {
+            while (true)
+            {
+                var r = Recv(RecvWaitMs);
+                if (r.Item1 != RecvKind.Timeout) return r;
+            }
+        }
+
+        /// <summary>Response payloads until the trailer; a failed call throws <see cref="RpcError"/>.</summary>
+        public async IAsyncEnumerable<byte[]> ReadResponsesAsync([EnumeratorCancellation] CancellationToken ct)
+        {
+            while (true)
+            {
+                // Buffered payloads are taken without a thread hop; an empty queue waits on the
+                // thread pool (a cancelled token cancels the call, which ends the wait).
+                var (kind, bytes) = Recv(0);
+                if (kind == RecvKind.Timeout)
+                    (kind, bytes) = await Task.Run(WaitRecv, CancellationToken.None).ConfigureAwait(false);
+                switch (kind)
+                {
+                    case RecvKind.Payload:
+                        yield return bytes;
+                        continue;
+                    case RecvKind.Trailer:
+                        ct.ThrowIfCancellationRequested();
+                        var status = bytes.Length == 0 ? RpcStatus.Ok : AsterEnvelope.DecodeRpcStatus(bytes);
+                        if (status.Code != StatusCode.Ok) throw StatusError((int)status.Code, bytes);
+                        yield break;
+                    default:
+                        ct.ThrowIfCancellationRequested();
+                        throw new RpcError(StatusCode.Unavailable, "call already closed");
+                }
+            }
+        }
+
+        /// <summary>Reads the single response of a unary / client-stream call.</summary>
+        public async Task<byte[]> ReadSingleAsync(CancellationToken ct)
+        {
+            byte[]? response = null;
+            int count = 0;
+            await foreach (var payload in ReadResponsesAsync(ct).ConfigureAwait(false))
+            {
+                response = payload;
+                count++;
+            }
+            if (count > 1)
+                throw new RpcError(StatusCode.Internal, $"single-response call received {count} response frames");
+            return response ?? Array.Empty<byte>();
+        }
 
         public ValueTask DisposeAsync()
         {
-            // Release returns the substream cleanly after the trailer; anything else drops it.
-            if (_succeeded) Native.aster_call_release(_owner.Rt, _call);
-            else Native.aster_call_discard(_owner.Rt, _call);
+            // Waits for a running cancel callback, then frees the call (cancelling it if unfinished).
+            _cancel.Dispose();
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+                Native.aster_call_release(_owner.Rt, _call);
             return ValueTask.CompletedTask;
         }
+    }
+
+    private unsafe ulong Open(byte pattern, CallSpec spec)
+    {
+        int r;
+        ulong handle;
+        fixed (byte* sp = spec.Service, mp = spec.Method, kp = spec.Metadata)
+        {
+            CallOptionsNative o = spec.Native(sp, mp, kp);
+            r = Native.aster_rpc_open(Rt, Conn, pattern, &o, out handle);
+        }
+        if (r != 0) throw CallError(r, "aster_rpc_open");
+        return handle;
     }
 }
 

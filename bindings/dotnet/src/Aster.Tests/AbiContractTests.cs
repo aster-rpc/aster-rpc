@@ -183,8 +183,9 @@ public class AbiContractTests
         Assert.Equal(48, Marshal.SizeOf<NodeAddr>());
         Assert.Equal(16, Marshal.SizeOf<Bytes>());
         Assert.Equal(16, Marshal.SizeOf<BytesList>());
-        Assert.Equal(112, Marshal.SizeOf<ReactorCallNative>());
-        Assert.Equal(112, System.Runtime.CompilerServices.Unsafe.SizeOf<ReactorCallNative>());
+        Assert.Equal(DispatchServer.EventSize, Marshal.SizeOf<DispatchEventNative>());
+        Assert.Equal(DispatchServer.EventSize, System.Runtime.CompilerServices.Unsafe.SizeOf<DispatchEventNative>());
+        Assert.Equal(72, Marshal.SizeOf<CallOptionsNative>());
     }
 
     [Fact]
@@ -218,34 +219,78 @@ public class AbiContractTests
     }
 
     [Fact]
-    public void ReactorCall_Offsets_Match_Header()
+    public void DispatchEvent_Offsets_Match_Header()
     {
-        // aster_reactor_call_t (ffi/src/layout.rs; same as Java Reactor.CALL_LAYOUT).
-        Off<ReactorCallNative>("event_kind", 0);
-        Off<ReactorCallNative>("call_id", 8);
-        Off<ReactorCallNative>("connection_id", 16);
-        Off<ReactorCallNative>("stream_id", 24);
-        Off<ReactorCallNative>("header_ptr", 32);
-        Off<ReactorCallNative>("header_len", 40);
-        Off<ReactorCallNative>("header_flags", 44);
-        Off<ReactorCallNative>("request_ptr", 48);
-        Off<ReactorCallNative>("request_len", 56);
-        Off<ReactorCallNative>("request_flags", 60);
-        Off<ReactorCallNative>("peer_ptr", 64);
-        Off<ReactorCallNative>("peer_len", 72);
-        Off<ReactorCallNative>("header_buffer", 80);
-        Off<ReactorCallNative>("request_buffer", 88);
-        Off<ReactorCallNative>("peer_buffer", 96);
-        Off<ReactorCallNative>("connection_handle", 104);
+        // aster_dispatch_event_t (ffi/src/layout.rs; same as Java Dispatch.EVENT_LAYOUT).
+        Off<DispatchEventNative>("kind", 0);
+        Off<DispatchEventNative>("pattern", 1);
+        Off<DispatchEventNative>("reason", 2);
+        Off<DispatchEventNative>("flags", 4);
+        Off<DispatchEventNative>("call_id", 8);
+        Off<DispatchEventNative>("service_idx", 16);
+        Off<DispatchEventNative>("method_idx", 20);
+        Off<DispatchEventNative>("session_key", 24);
+        Off<DispatchEventNative>("connection_id", 32);
+        Off<DispatchEventNative>("connection_handle", 40);
+        Off<DispatchEventNative>("deadline_unix_ms", 48);
+        Off<DispatchEventNative>("wire_call_id", 56);
+        Off<DispatchEventNative>("session_id", 60);
+        Off<DispatchEventNative>("request_ptr", 64);
+        Off<DispatchEventNative>("request_len", 72);
+        Off<DispatchEventNative>("peer_ptr", 80);
+        Off<DispatchEventNative>("peer_len", 88);
+        Off<DispatchEventNative>("buffer", 96);
     }
 
     [Fact]
-    public void ReactorEventKind_Values_Match_Header()
+    public void CallOptions_Offsets_Match_Header()
     {
-        Assert.Equal(0, (byte)ReactorEventKind.Call);
-        Assert.Equal(1, (byte)ReactorEventKind.ConnectionClosed);
-        Assert.Equal(2, (byte)ReactorEventKind.ResponseWritable);
-        Assert.Equal(3, (byte)ReactorEventKind.ResponseClosed);
+        // aster_call_options_t (ffi/src/layout.rs; same as Java Rpc.OPTIONS_LAYOUT).
+        Off<CallOptionsNative>("struct_size", 0);
+        Off<CallOptionsNative>("version", 4);
+        Off<CallOptionsNative>("service", 8);
+        Off<CallOptionsNative>("method", 24);
+        Off<CallOptionsNative>("metadata", 40);
+        Off<CallOptionsNative>("session_id", 56);
+        Off<CallOptionsNative>("deadline_ms", 60);
+        Off<CallOptionsNative>("serialization_mode", 64);
+        Off<CallOptionsNative>("wire_call_id", 68);
+    }
+
+    [Fact]
+    public void Dispatch_Enum_Values_Match_Header()
+    {
+        Assert.Equal(0, (byte)DispatchEventKind.Call);
+        Assert.Equal(1, (byte)DispatchEventKind.Cancelled);
+        Assert.Equal(2, (byte)DispatchEventKind.ResponseWritable);
+        Assert.Equal(3, (byte)DispatchEventKind.ResponseClosed);
+        Assert.Equal(4, (byte)DispatchEventKind.SessionClosed);
+        Assert.Equal(5, (byte)DispatchEventKind.ConnectionClosed);
+        Assert.Equal(6, (byte)DispatchEventKind.NonRpc);
+        Assert.Equal(0, (byte)DispatchCancelReason.Peer);
+        Assert.Equal(1, (byte)DispatchCancelReason.Deadline);
+        Assert.Equal(2, (byte)DispatchCancelReason.InvalidRequest);
+        Assert.Equal(0x1u, (uint)DispatchFlags.FirstIsEnd);
+        Assert.Equal(0x2u, (uint)DispatchFlags.NewSession);
+        Assert.Equal(0x4u, (uint)DispatchFlags.IrohAuthenticated);
+        Assert.Equal(0x100u, (uint)DispatchFlags.HasMetadata);
+        Assert.Equal(0x200u, (uint)DispatchFlags.HasAttributes);
+        Assert.Equal(1u, (uint)DispatchServerOption.BuiltinNodeInfo);
+        Assert.Equal(2u, (uint)DispatchServerOption.BuiltinTopology);
+        Assert.Equal(3u, (uint)DispatchServerOption.MaxSessionsPerConnection);
+        Assert.Equal(4u, (uint)DispatchServerOption.HandlerTimeoutMs);
+        Assert.Equal(uint.MaxValue, Native.TimeoutInfinite);
+    }
+
+    [Fact]
+    public void KvList_RoundTrips()
+    {
+        var entries = new[] { new KeyValuePair<string, string>("a", "1"), new("ключ", "✓"), new("empty", "") };
+        byte[] bytes = KvList.Encode(entries);
+        Assert.Equal(3u, BitConverter.ToUInt32(bytes, 0));
+        Assert.Equal(entries, KvList.Decode(bytes));
+        Assert.Empty(KvList.Encode(Array.Empty<KeyValuePair<string, string>>()));
+        Assert.Empty(KvList.Decode(ReadOnlySpan<byte>.Empty));
     }
 
     // ─── Enum value verification ────────────────────────────────────────────

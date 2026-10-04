@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 
 namespace Aster;
 
-// Blittable mirrors of the ABI 3.1 – 3.4 structs in ffi/aster_ffi.h. Sequential layout
+// Blittable mirrors of the ABI 3.1 – 3.5 structs in ffi/aster_ffi.h. Sequential layout
 // reproduces the C padding on LP64; sizes are pinned by AbiContractTests (and on the
 // native side by ffi/src/layout.rs).
 
@@ -183,4 +183,49 @@ internal struct PathListNative
     public IntPtr items;
     public UIntPtr len;
     public IntPtr storage;
+}
+
+/// <summary>
+/// <c>aster_dispatch_event_t</c> (104 bytes, ABI 3.5): one event from <c>aster_server_poll</c>.
+/// <c>request</c> and <c>peer</c> live in one lease, <c>buffer</c>.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct DispatchEventNative
+{
+    public byte kind;
+    public byte pattern;
+    public byte reason;
+    public byte _p0;
+    public uint flags;
+    public ulong call_id;
+    public uint service_idx;
+    public uint method_idx;
+    public ulong session_key;
+    public ulong connection_id;
+    public ulong connection_handle;
+    public long deadline_unix_ms;
+    public int wire_call_id;
+    public uint session_id;
+    public IntPtr request_ptr;
+    public uint request_len;
+    public uint _p2;
+    public IntPtr peer_ptr;
+    public uint peer_len;
+    public uint _p3;
+    public ulong buffer;
+}
+
+/// <summary><c>aster_call_options_t</c> (72 bytes, ABI 3.5): per-call options of the payload client.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct CallOptionsNative
+{
+    public uint struct_size;
+    public int version;
+    public Bytes service;
+    public Bytes method;
+    public Bytes metadata;
+    public uint session_id;
+    public uint deadline_ms;
+    public int serialization_mode;
+    public int wire_call_id;
 }

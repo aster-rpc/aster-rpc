@@ -5,7 +5,7 @@ using Aster;
 namespace Aster.Tests;
 
 /// <summary>
-/// ABI 3.0 handshake and reactor smoke tests against the real native library.
+/// ABI 3.0 handshake and dispatch-server smoke tests against the real native library.
 /// </summary>
 public class NativeAbiTests
 {
@@ -45,17 +45,33 @@ public class NativeAbiTests
     }
 
     [Fact]
-    public async System.Threading.Tasks.Task Reactor_Poll_Times_Out_Empty_And_Rejects_Unknown_Submit()
+    public async System.Threading.Tasks.Task DispatchServer_Polls_Empty_And_Reports_Unknown_Calls_As_Over()
     {
-        using var node = await Node.MemoryWithAlpnsAsync(new[] { AsterServer.AsterAlpn });
-        using var reactor = new Reactor(node.Runtime.Handle, node.Handle.Value, 64);
-        var calls = reactor.Poll(8, 10);
-        Assert.Empty(calls);
-
-        // Unknown call id: must surface an error (not silently drop / spin).
-        var ex = Assert.Throws<IrohException>(() =>
-            reactor.Submit(0xdead_beef, ReactorResponse.Of(new byte[] { 1, 2, 3 })));
-        Assert.NotEqual(Status.OK, ex.Status);
-        Assert.NotEqual(Status.QueueFull, ex.Status);
+        await using var node = await Node.StartAsync(new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" },
+            null, [AsterServer.AsterAlpn]);
+        DispatchServer server;
+        using (var b = new DispatchServer.Builder(node.Runtime.Handle, node.Handle.Value))
+        {
+            Assert.Equal(0u, b.AddServiceJson(RpcTests.InteropEcho("dotnet").RegistrationJson));
+            // A duplicate (name, version) and unknown options are refused.
+            Assert.Throws<IrohException>(() => b.AddServiceJson(RpcTests.InteropEcho("dotnet").RegistrationJson));
+            Assert.Throws<IrohException>(() => b.Option((DispatchServerOption)99, 1));
+            server = b.Start(64);
+        }
+        using (server)
+        {
+            unsafe
+            {
+                var events = stackalloc DispatchEventNative[8];
+                Assert.Equal(0u, server.Poll(events, 8, 10));
+            }
+            // Unknown call id: the call is over (not an error, not QUEUE_FULL).
+            Assert.False(await server.RespondAsync(0xdead_beef, new byte[] { 1, 2, 3 }, null));
+            Assert.False(await server.FinishAsync(0xdead_beef, null));
+            Assert.True(server.IsCancelled(0xdead_beef));
+            Assert.Equal(DispatchServer.RecvStatus.Gone, server.Recv(0xdead_beef, 0, out _));
+            Assert.Empty(server.Metadata(0xdead_beef));
+            Assert.Equal(0ul, server.LiveCalls);
+        }
     }
 }

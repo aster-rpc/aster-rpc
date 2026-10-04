@@ -29,7 +29,7 @@ public enum Status
 /// <summary>
 /// Event kinds emitted by the Rust completion queue via aster_poll_events.
 /// Values must exactly match aster_event_kind_t in the C ABI. (Not to be confused
-/// with the reactor's <see cref="ReactorEventKind"/>.)
+/// with the dispatch server's <c>aster_dispatch_event_kind_t</c>.)
 /// </summary>
 public enum EventKind : uint
 {
@@ -319,49 +319,4 @@ public struct ConnectConfig
         alpn = default,
         addr = IntPtr.Zero,
     };
-}
-
-/// <summary>
-/// Reactor event discriminator (<c>ASTER_REACTOR_EVENT_*</c>, the <c>event_kind</c>
-/// byte of <c>aster_reactor_call_t</c>).
-/// </summary>
-public enum ReactorEventKind : byte
-{
-    /// <summary>An inbound RPC call; all fields populated.</summary>
-    Call = 0,
-    /// <summary>A connection closed; only connection_id, peer_* and connection_handle are set.</summary>
-    ConnectionClosed = 1,
-    /// <summary>Reserved response capacity is held for call_id; retry the exact submit.</summary>
-    ResponseWritable = 2,
-    /// <summary>The call closed while waiting for response capacity.</summary>
-    ResponseClosed = 3,
-}
-
-/// <summary>
-/// Exact mirror of <c>aster_reactor_call_t</c> (112 bytes on 64-bit, pinned by
-/// ffi/src/layout.rs). Sequential layout reproduces the C padding: event_kind@0,
-/// call_id@8, connection_id@16, stream_id@24, header_ptr@32, header_len@40,
-/// header_flags@44, request_ptr@48, request_len@56, request_flags@60, peer_ptr@64,
-/// peer_len@72, header_buffer@80, request_buffer@88, peer_buffer@96,
-/// connection_handle@104.
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-public struct ReactorCallNative
-{
-    public byte event_kind;
-    public ulong call_id;
-    public ulong connection_id;
-    public ulong stream_id;
-    public IntPtr header_ptr;
-    public uint header_len;
-    public byte header_flags;
-    public IntPtr request_ptr;
-    public uint request_len;
-    public byte request_flags;
-    public IntPtr peer_ptr;
-    public uint peer_len;
-    public ulong header_buffer;
-    public ulong request_buffer;
-    public ulong peer_buffer;
-    public ulong connection_handle;
 }

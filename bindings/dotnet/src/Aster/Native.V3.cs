@@ -3,12 +3,12 @@ using System.Runtime.InteropServices;
 
 namespace Aster;
 
-// P/Invoke declarations for the C ABI 3.1 – 3.4 additions (ffi/RENAME_MAP.md "New in 3.x").
+// P/Invoke declarations for the C ABI 3.1 – 3.5 additions (ffi/RENAME_MAP.md "New in 3.x").
 // Struct mirrors live in NativeStructs.cs; their sizes are pinned by AbiContractTests.
 internal static unsafe partial class Native
 {
     /// <summary>Minimum ABI minor for everything declared in this file.</summary>
-    public const uint RequiredAbiMinor = 4;
+    public const uint RequiredAbiMinor = 5;
 
     // ─── 3.1: AEv1 envelope + zstd ──────────────────────────────────────────
 
@@ -95,40 +95,14 @@ internal static unsafe partial class Native
     [LibraryImport(NativeLib, EntryPoint = "aster_blake3_hex")]
     public static partial int aster_blake3_hex(byte* bytes_ptr, UIntPtr bytes_len, byte* out_buf, UIntPtr* out_len);
 
-    // ─── RPC client: multiplexed call pool ──────────────────────────────────
+    // ─── RPC call handles (shared by the 3.5 payload client) ─────────────────
 
-    [LibraryImport(NativeLib, EntryPoint = "aster_call_acquire")]
-    public static partial int aster_call_acquire(ulong runtime, ulong connection, uint session_id, out ulong out_call);
-    [LibraryImport(NativeLib, EntryPoint = "aster_call_acquire_streaming")]
-    public static partial int aster_call_acquire_streaming(ulong runtime, ulong connection, out ulong out_call);
-    [LibraryImport(NativeLib, EntryPoint = "aster_call_send_frame")]
-    public static partial int aster_call_send_frame(ulong runtime, ulong call, byte* frame_ptr, uint frame_len);
-    [LibraryImport(NativeLib, EntryPoint = "aster_call_recv_frame")]
-    public static partial int aster_call_recv_frame(ulong runtime, ulong call, uint timeout_ms,
-        byte** out_payload_ptr, uint* out_payload_len, byte* out_flags, ulong* out_buffer_id);
     [LibraryImport(NativeLib, EntryPoint = "aster_call_release")]
     public static partial int aster_call_release(ulong runtime, ulong call);
     [LibraryImport(NativeLib, EntryPoint = "aster_call_discard")]
     public static partial int aster_call_discard(ulong runtime, ulong call);
     [LibraryImport(NativeLib, EntryPoint = "aster_call_buffer_release")]
     public static partial int aster_call_buffer_release(ulong runtime, ulong buffer);
-    [LibraryImport(NativeLib, EntryPoint = "aster_call_unary")]
-    public static partial int aster_call_unary(ulong runtime, ulong connection, uint session_id,
-        byte* request_pair_ptr, uint request_pair_len,
-        byte** out_response_ptr, uint* out_response_len, byte* out_response_flags, ulong* out_response_buffer,
-        byte** out_trailer_ptr, uint* out_trailer_len, ulong* out_trailer_buffer);
-
-    // ─── RPC server: streaming reactor responses ────────────────────────────
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_submit_frame")]
-    public static partial int aster_reactor_submit_frame(ulong runtime, ulong reactor, ulong call_id, byte* frame_ptr, uint frame_len);
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_submit_trailer")]
-    public static partial int aster_reactor_submit_trailer(ulong runtime, ulong reactor, ulong call_id, byte* trailer_ptr, uint trailer_len);
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_recv_frame")]
-    public static partial int aster_reactor_recv_frame(ulong runtime, ulong reactor, ulong call_id, uint timeout_ms,
-        byte** out_payload_ptr, uint* out_payload_len, byte* out_flags, ulong* out_buffer_id);
-    [LibraryImport(NativeLib, EntryPoint = "aster_reactor_check_cancelled")]
-    public static partial int aster_reactor_check_cancelled(ulong runtime, ulong reactor, ulong call_id);
 
     // ─── 3.3: data plane ────────────────────────────────────────────────────
 

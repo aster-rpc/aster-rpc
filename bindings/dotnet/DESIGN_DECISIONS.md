@@ -7,18 +7,18 @@
 **C header:** `ffi/aster_ffi.h`, ABI 3.x (`aster_*` symbols; `aster_runtime_new(3, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 3.4 catch-up, 2026-10-04)
+## STATUS (ABI 3.5 dynamic dispatch, 2026-10-04)
 
-- **ABI:** needs `libaster_transport_ffi` ABI >= 3.4 (`Native.RequiredAbiMinor`). Struct
-  mirrors of the 3.1–3.4 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
-  `src/Aster/Native.V3.cs`; sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
+- **ABI:** needs `libaster_transport_ffi` ABI >= 3.5 (`Native.RequiredAbiMinor`). Struct
+  mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
+  `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
 - **Codec:** Apache.Fory **1.7.6** (`ForyCodec`: `ThreadSafeFory`, compatible on, ref tracking
   off; Fory C# is always xlang). Types register under Aster wire tags
   (`Register<T>("ns/Name")`, split on the last `/` like every binding). JSON mode is gone;
   `ICodec` is generic (`Encode<T>` / `Decode<T>`).
 - **Envelope / compression:** AEv1 `StreamHeader` / `CallHeader` / `RpcStatus` and zstd via
   the C ABI (`AsterEnvelope`, `Zstd`, `AsterFraming`). Every server exit path ends with an
-  AEv1 `RpcStatus` TRAILER frame (the old raw `ERROR: msg` trailer is gone). Checked against
+  AEv1 `RpcStatus` trailer, now written by Rust from the status bytes .NET passes. Checked against
   `conformance/vectors/{envelope,compression}.json`.
 - **Contract identity:** `ServiceDefinition.ContractId` builds TypeDef / ServiceContract JSON
   from the handler types (`[WireType]`, `[WireName]`) and lets Rust canonicalize and hash it.
@@ -30,11 +30,26 @@
   `aster::AsterConfig`. Gate 0 (`Gate`), admission events (`Node.Admissions` +
   `AdmissionRequest.Allow/Deny`), tickets (`AsterTicket`), Prometheus metrics.
   `Node.MemoryWithAlpnsAsync` and `Endpoint.CreateAsync` are `[Obsolete]` (removed in ABI 4.0).
-- **RPC:** `AsterServer.StartAsync(AsterServerOptions)` serves `ServiceDefinition`s (unary,
-  server-stream as `IAsyncEnumerable`, client-stream, bidi; deadline → `DEADLINE_EXCEEDED`;
-  handler exceptions → `INTERNAL` or the `RpcError` code). `AsterClient` / `RpcConnection`
-  call through `aster_call_*` (pooled unary fast path, dedicated substreams for streaming).
-  Session-scoped services are not served yet (`FAILED_PRECONDITION`).
+- **RPC (ABI 3.5, F4):** `AsterServer` serves through Rust's `aster::rpc::Server`
+  (`aster_server_*` / `aster_dispatch_*`, wrapped by the internal `DispatchServer`). Each
+  `ServiceDefinition` registers its JSON registration form (`RegistrationJson`; Rust derives the
+  same contract id, checked in `RpcTests`). Rust decodes headers, routes (unknown service →
+  `NOT_FOUND`, unknown method → `UNIMPLEMENTED`), enforces Gate 3 (`CapabilityRequirement` on a
+  service / method, fed by `AsterServer.SetPeerAttributes`), deadlines (`min(header, method
+  DefaultTimeout, HandlerTimeout)`), per-method frame limits and the per-connection session cap,
+  and serves `aster.ops.NodeInfo`. One poll thread drains the events: `CALL` → thread pool,
+  `CANCELLED` → the handler's `CancellationToken`, `RESPONSE_WRITABLE/CLOSED` → the
+  `QUEUE_FULL` → reserve → await path, `SESSION_CLOSED` → session state disposed + `SessionClosed`,
+  `CONNECTION_CLOSED` → `ConnectionClosed`, `NON_RPC` → `NonRpcConnection` (closed when nobody
+  subscribes). **Session-scoped services are served** (`ServiceScope.Session` +
+  `Builder.SessionFactory`, state in `ServerCallContext.Session`; ids from
+  `RpcConnection.NextSessionId`). The client (`RpcConnection`) uses `aster_rpc_unary` (pooled) and
+  `aster_rpc_open` + `aster_call_{send,recv}_payload(s)` for streaming; a unary call with a
+  cancellable token runs on its own stream so the token cancels the native call
+  (`aster_call_cancel`). Rust surfaces a client cancel to the server handler for streaming calls
+  only (it does not watch unary streams). The deprecated `aster_reactor_*` and framed
+  `aster_call_{acquire,acquire_streaming,send_frame,recv_frame,unary}` are no longer used
+  (`Reactor.cs` is gone).
 - **Data plane (3.3):** blobs read-range / provider fetch with report / GC / status, tag prefix
   delete, docs open / import / authority / retire / durable set / entry status, connection
   paths, stream priority. **Pure functions (3.4):** `Aster.Crypto.Ids`, `Hpke`, `Attestation`,
@@ -193,7 +208,7 @@ public async ValueTask DisposeAsync()
 `AbiContractTests` against the numbers pinned in `ffi/src/layout.rs`. The last
 field, `hook_failure_mode` @144, was previously missing (struct was 144 bytes).
 All other ABI structs (`Event` 80, `RuntimeConfig` 16, `ConnectConfig` 48,
-`NodeAddr` 48, `Bytes`/`BytesList` 16, `ReactorCallNative` 112) are checked the
+`NodeAddr` 48, `Bytes`/`BytesList` 16, `DispatchEventNative` 104, `CallOptionsNative` 72) are checked the
 same way. Never hand-compute offsets — add a field to the struct and a
 `Marshal.OffsetOf` assertion instead.
 

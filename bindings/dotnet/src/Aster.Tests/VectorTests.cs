@@ -116,7 +116,7 @@ public class EnvelopeVectorTests
     [Fact]
     public void Trailer_Frame_Is_Framed_Aev1_RpcStatus()
     {
-        byte[] frame = Rpc.ServerCall.TrailerFrame(new RpcStatus(StatusCode.Internal, "boom"));
+        byte[] frame = AsterFraming.EncodeFrame(AsterEnvelope.Encode(new RpcStatus(StatusCode.Internal, "boom")), AsterFraming.FlagTrailer);
         Assert.Equal((uint)(frame.Length - 4), BitConverter.ToUInt32(frame, 0));
         Assert.Equal(AsterFraming.FlagTrailer, frame[4]);
         Assert.Equal(AsterEnvelope.TagRpcStatus, frame[5]);

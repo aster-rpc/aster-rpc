@@ -62,6 +62,8 @@ public class RpcTests : IAsyncLifetime
     private AsterClient _client = null!;
     private RpcConnection _conn = null!;
     private readonly TaskCompletionSource<CancellationToken> _slowCancelled = new();
+    private readonly TaskCompletionSource<bool> _hangStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _hangCancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public static ServiceDefinition InteropEcho(string lang) => ServiceDefinition.Create("InteropEcho", 1)
         .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply
@@ -104,6 +106,16 @@ public class RpcTests : IAsyncLifetime
             return new EchoReply();
         })
         .Unary<EchoRequest, EchoReply>("guarded", (req, _) => ValueTask.FromResult(new EchoReply { Message = req.Message }))
+        .ServerStream<EchoRequest, EchoReply>("hang", Hang)
+        .Unary<EchoRequest, EchoReply>("slowDefault", async (_, ctx) =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30), ctx.CancellationToken);
+            return new EchoReply();
+        }, defaultTimeout: TimeSpan.FromMilliseconds(500))
+        .Unary<EchoRequest, EchoReply>("admin", (_, ctx) => ValueTask.FromResult(new EchoReply
+        {
+            Message = ctx.Attributes.TryGetValue("aster.role", out var role) ? role : "",
+        }), requires: CapabilityRequirement.AnyOf("admin", "ops"))
         .BidiStream<EchoRequest, EchoReply>("chat", Chat)
         .ServerStream<EchoRequest, EchoReply>("failMidStream", FailMidStream)
         .Build();
@@ -112,6 +124,15 @@ public class RpcTests : IAsyncLifetime
     {
         await foreach (var r in reqs)
             yield return new EchoReply { Message = r.Message.ToUpperInvariant(), Count = r.Count };
+    }
+
+    private async IAsyncEnumerable<EchoReply> Hang(EchoRequest req, ServerCallContext ctx)
+    {
+        yield return new EchoReply { Count = 1 };
+        _hangStarted.TrySetResult(true);
+        try { await Task.Delay(TimeSpan.FromSeconds(30), ctx.CancellationToken); }
+        catch (OperationCanceledException) { _hangCancelled.TrySetResult(true); throw; }
+        yield return new EchoReply { Count = 2 };
     }
 
     private static async IAsyncEnumerable<EchoReply> FailMidStream(EchoRequest req, ServerCallContext ctx)
@@ -212,14 +233,14 @@ public class RpcTests : IAsyncLifetime
     [Fact]
     public async Task Server_Stream_Backpressure_Uses_Capacity_Reservation()
     {
-        long before = Reactor.QueueFullHits;
+        long before = DispatchServer.QueueFullHits;
         // 2000 x 8 KiB incompressible frames (16 MiB) overflow the QUIC windows and the
         // per-call response channel while the reader sleeps, so the server must wait for
         // RESPONSE_WRITABLE (the QUEUE_FULL path) instead of dropping frames. Whether the
         // channel actually fills depends on scheduling, so retry a few times.
         var data = new byte[8192];
         new Random(42).NextBytes(data);
-        for (int attempt = 0; attempt < 4 && Reactor.QueueFullHits == before; attempt++)
+        for (int attempt = 0; attempt < 4 && DispatchServer.QueueFullHits == before; attempt++)
         {
             int n = 0;
             await foreach (var r in _conn.ServerStreamAsync<EchoRequest, EchoReply>("InteropEcho", "generate",
@@ -231,7 +252,7 @@ public class RpcTests : IAsyncLifetime
             }
             Assert.Equal(2000, n);
         }
-        Assert.True(Reactor.QueueFullHits > before, "expected at least one QUEUE_FULL");
+        Assert.True(DispatchServer.QueueFullHits > before, "expected at least one QUEUE_FULL");
     }
 
     [Fact]
@@ -248,6 +269,32 @@ public class RpcTests : IAsyncLifetime
         var reply = await _conn.ClientStreamAsync<EchoRequest, EchoReply>("InteropEcho", "ingest", reqs);
         Assert.Equal(10, reply.Count);
         Assert.Equal("m9", reply.Message);
+    }
+
+    [Fact]
+    public async Task Client_Stream_Slow_Producer_Makes_The_Server_Wait()
+    {
+        // Each request arrives after the server drained the queue: the blocking recv path.
+        async IAsyncEnumerable<EchoRequest> Reqs()
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                await Task.Delay(50);
+                yield return new EchoRequest { Message = $"m{i}", Count = i };
+            }
+        }
+        var reply = await _conn.ClientStreamAsync<EchoRequest, EchoReply>("InteropEcho", "ingest", Reqs());
+        Assert.Equal(5, reply.Count);
+        Assert.Equal("m4", reply.Message);
+    }
+
+    [Fact]
+    public async Task Client_Stream_Many_Messages()
+    {
+        var reqs = Enumerable.Range(0, 10_000).Select(i => new EchoRequest { Message = $"m{i}", Count = i, Data = [1, 2, 3] });
+        var reply = await _conn.ClientStreamAsync<EchoRequest, EchoReply>("InteropEcho", "ingest", reqs);
+        Assert.Equal(10_000, reply.Count);
+        Assert.Equal("m9999", reply.Message);
     }
 
     [Fact]
@@ -327,12 +374,12 @@ public class RpcTests : IAsyncLifetime
     }
 
     [Theory]
-    [InlineData("Nope", "echo")]
-    [InlineData("InteropEcho", "nope")]
-    public async Task Unknown_Service_Or_Method_Is_Unimplemented(string service, string method)
+    [InlineData("Nope", "echo", StatusCode.NotFound)] // Rust's server: unknown (service, version)
+    [InlineData("InteropEcho", "nope", StatusCode.Unimplemented)]
+    public async Task Unknown_Service_Or_Method_Is_Rejected_By_Rust(string service, string method, StatusCode expected)
     {
         var ex = await Assert.ThrowsAsync<RpcError>(() => _conn.UnaryAsync<EchoRequest, EchoReply>(service, method, new EchoRequest()));
-        Assert.Equal(StatusCode.Unimplemented, ex.Code);
+        Assert.Equal(expected, ex.Code);
     }
 
     [Fact]
@@ -374,12 +421,84 @@ public class RpcTests : IAsyncLifetime
     }
 
     [Fact]
-    public void CallOptions_Round_Deadline_Up_To_Whole_Seconds()
+    public void CallOptions_Deadline_Is_Whole_Milliseconds_Rounded_Up_And_Capped()
     {
-        Assert.Equal(2, new CallOptions { Deadline = TimeSpan.FromMilliseconds(1001) }.DeadlineSeconds);
-        Assert.Equal(1, new CallOptions { Deadline = TimeSpan.FromMilliseconds(1) }.DeadlineSeconds);
-        Assert.Equal(0, new CallOptions().DeadlineSeconds);
-        Assert.Equal(short.MaxValue, new CallOptions { Deadline = TimeSpan.FromDays(10) }.DeadlineSeconds);
+        Assert.Equal(1001u, new CallOptions { Deadline = TimeSpan.FromMilliseconds(1000.2) }.DeadlineMs);
+        Assert.Equal(1u, new CallOptions { Deadline = TimeSpan.FromTicks(1) }.DeadlineMs);
+        Assert.Equal(0u, new CallOptions().DeadlineMs);
+        Assert.Equal(0u, new CallOptions { Deadline = TimeSpan.FromSeconds(-1) }.DeadlineMs);
+        Assert.Equal(CallOptions.MaxDeadlineMs, new CallOptions { Deadline = TimeSpan.FromDays(10) }.DeadlineMs);
+    }
+
+    [Fact]
+    public void Rust_Derives_The_Same_Contract_Id_From_The_Registration_Json()
+    {
+        foreach (var svc in new[] { InteropEcho("dotnet"), Extra(), SessionTests.Counter(new()) })
+            Assert.Equal(svc.ContractId, DispatchServer.ContractId(svc.RegistrationJson));
+        // Requirements and default timeouts are part of the contract.
+        Assert.NotEqual(Extra().ContractId, ServiceDefinition.Create("Extra", 1)
+            .Unary<EchoRequest, EchoReply>("admin", (_, _) => ValueTask.FromResult(new EchoReply())).Build().ContractId);
+        Assert.Contains("\"requires\":{\"kind\":\"any_of\",\"roles\":[\"admin\",\"ops\"]}", Extra().RegistrationJson);
+        Assert.Contains("\"default_timeout\":0.5", Extra().RegistrationJson);
+    }
+
+    [Fact]
+    public async Task Client_Cancellation_Cancels_The_Server_Handler()
+    {
+        // aster_call_cancel sends FLAG_CANCEL; Rust turns it into a CANCELLED event for streaming
+        // calls (unary calls on the server are not watched for cancels by Rust).
+        using var cts = new CancellationTokenSource();
+        var call = Task.Run(async () =>
+        {
+            await foreach (var _ in _conn.ServerStreamAsync<EchoRequest, EchoReply>("Extra", "hang", new EchoRequest(), cancellationToken: cts.Token))
+            {
+            }
+        });
+        await _hangStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call);
+        Assert.True(await _hangCancelled.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    [Fact]
+    public async Task Method_Default_Timeout_Is_Enforced_By_Rust()
+    {
+        var ex = await Assert.ThrowsAsync<RpcError>(() =>
+            _conn.UnaryAsync<EchoRequest, EchoReply>("Extra", "slowDefault", new EchoRequest()));
+        Assert.Equal(StatusCode.DeadlineExceeded, ex.Code);
+    }
+
+    [Fact]
+    public async Task Gate3_Requires_Uses_The_Peer_Attribute_Bridge()
+    {
+        var ex = await Assert.ThrowsAsync<RpcError>(() => _conn.UnaryAsync<EchoRequest, EchoReply>("Extra", "admin", new EchoRequest()));
+        Assert.Equal(StatusCode.PermissionDenied, ex.Code);
+
+        string peer = _client.Node.NodeId();
+        _server.SetPeerAttributes(peer, new Dictionary<string, string> { ["aster.role"] = "ops" });
+        var reply = await _conn.UnaryAsync<EchoRequest, EchoReply>("Extra", "admin", new EchoRequest());
+        Assert.Equal("ops", reply.Message);
+
+        _server.SetPeerAttributes(peer, null);
+        ex = await Assert.ThrowsAsync<RpcError>(() => _conn.UnaryAsync<EchoRequest, EchoReply>("Extra", "admin", new EchoRequest()));
+        Assert.Equal(StatusCode.PermissionDenied, ex.Code);
+    }
+
+    [Fact]
+    public async Task Server_Stream_Cancel_Stops_Reading()
+    {
+        using var cts = new CancellationTokenSource();
+        int n = 0;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var _ in _conn.ServerStreamAsync<EchoRequest, EchoReply>("InteropEcho", "generate",
+                               new EchoRequest { Count = 1_000_000 }, cancellationToken: cts.Token))
+                if (++n == 10) cts.Cancel();
+        });
+        Assert.InRange(n, 10, 1_000_000 - 1);
+        // The connection is still usable afterwards.
+        var reply = await _conn.UnaryAsync<EchoRequest, EchoReply>("InteropEcho", "echo", new EchoRequest { Count = 1 });
+        Assert.Equal(2, reply.Count);
     }
 }
 
