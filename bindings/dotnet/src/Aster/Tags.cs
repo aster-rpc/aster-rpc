@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace Aster;
 
-public sealed class Tags
+public sealed partial class Tags
 {
     private readonly Runtime _runtime;
     private readonly ulong _nodeHandle;

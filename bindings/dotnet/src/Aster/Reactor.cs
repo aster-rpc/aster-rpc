@@ -163,11 +163,32 @@ public sealed class Reactor : IDisposable
     public Task SubmitAsync(ulong callId, ReactorResponse response, CancellationToken ct = default)
         => SubmitCore(callId, response, ct, sync: false);
 
-    private async Task SubmitCore(ulong callId, ReactorResponse response, CancellationToken ct, bool sync)
+    private Task SubmitCore(ulong callId, ReactorResponse response, CancellationToken ct, bool sync)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
         byte[] resp = response.ResponseFrame ?? Array.Empty<byte>();
         byte[] trailer = response.TrailerFrame ?? Array.Empty<byte>();
+        return SubmitWithRetry(callId, resp, trailer, SubmitKind.Unary, ct, sync);
+    }
+
+    /// <summary>
+    /// Submits one already-framed streaming response frame (server-stream / bidi), awaiting
+    /// while the per-call response channel is full. The call stays open.
+    /// </summary>
+    public Task SubmitFrameAsync(ulong callId, byte[] frame, CancellationToken ct = default)
+        => SubmitWithRetry(callId, frame, Array.Empty<byte>(), SubmitKind.Frame, ct, sync: false);
+
+    /// <summary>
+    /// Submits the trailer frame and closes the call, awaiting while the response channel is
+    /// full. After success the call id is no longer valid.
+    /// </summary>
+    public Task SubmitTrailerAsync(ulong callId, byte[] trailerFrame, CancellationToken ct = default)
+        => SubmitWithRetry(callId, Array.Empty<byte>(), trailerFrame, SubmitKind.Trailer, ct, sync: false);
+
+    private enum SubmitKind { Unary, Frame, Trailer }
+
+    private async Task SubmitWithRetry(ulong callId, byte[] resp, byte[] trailer, SubmitKind kind, CancellationToken ct, bool sync)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         ulong encodedLen = (ulong)resp.Length + (ulong)trailer.Length;
 
         // Pin for the whole retry loop: QUEUE_FULL copies nothing, so the exact
@@ -180,12 +201,28 @@ public sealed class Reactor : IDisposable
             IntPtr trailerPtr = trailerPin.IsAllocated ? trailerPin.AddrOfPinnedObject() : IntPtr.Zero;
             while (true)
             {
-                int r = Native.aster_reactor_submit(_runtimeHandle, _handle, callId,
-                    respPtr, (uint)resp.Length, trailerPtr, (uint)trailer.Length);
+                int r;
+                unsafe
+                {
+                    r = kind switch
+                    {
+                        SubmitKind.Unary => Native.aster_reactor_submit(_runtimeHandle, _handle, callId,
+                            respPtr, (uint)resp.Length, trailerPtr, (uint)trailer.Length),
+                        SubmitKind.Frame => Native.aster_reactor_submit_frame(_runtimeHandle, _handle, callId,
+                            (byte*)respPtr, (uint)resp.Length),
+                        _ => Native.aster_reactor_submit_trailer(_runtimeHandle, _handle, callId,
+                            (byte*)trailerPtr, (uint)trailer.Length),
+                    };
+                }
                 if (r != (int)Status.QueueFull)
                 {
                     if (r != 0)
-                        throw IrohException.FromStatus(r, "aster_reactor_submit");
+                        throw IrohException.FromStatus(r, kind switch
+                        {
+                            SubmitKind.Unary => "aster_reactor_submit",
+                            SubmitKind.Frame => "aster_reactor_submit_frame",
+                            _ => "aster_reactor_submit_trailer",
+                        });
                     return;
                 }
                 Interlocked.Increment(ref s_queueFullHits);
@@ -202,6 +239,54 @@ public sealed class Reactor : IDisposable
             if (respPin.IsAllocated) respPin.Free();
             if (trailerPin.IsAllocated) trailerPin.Free();
         }
+    }
+
+    /// <summary>Result of <see cref="RecvFrame"/>.</summary>
+    public enum RecvStatus { Frame, EndOfStream, Timeout }
+
+    /// <summary>
+    /// Pulls the next ADDITIONAL request frame of a client-stream / bidi call (the first one is
+    /// inline in the polled call), blocking up to <paramref name="timeoutMs"/>. Returns the
+    /// payload as received (still compressed if <paramref name="flags"/> says so).
+    /// </summary>
+    public unsafe RecvStatus RecvFrame(ulong callId, uint timeoutMs, out byte[] payload, out byte flags)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        byte* ptr = null;
+        uint len = 0;
+        byte f = 0;
+        ulong buffer = 0;
+        int r = Native.aster_reactor_recv_frame(_runtimeHandle, _handle, callId, timeoutMs, &ptr, &len, &f, &buffer);
+        payload = Array.Empty<byte>();
+        flags = 0;
+        switch (r)
+        {
+            case 0:
+                try
+                {
+                    payload = len == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>(ptr, (int)len).ToArray();
+                    flags = f;
+                }
+                finally
+                {
+                    if (buffer != 0) Native.aster_reactor_buffer_release(_runtimeHandle, _handle, buffer);
+                }
+                return RecvStatus.Frame;
+            case 1: return RecvStatus.EndOfStream;
+            case 2: return RecvStatus.Timeout;
+            default: throw IrohException.FromStatus(r, "aster_reactor_recv_frame");
+        }
+    }
+
+    /// <summary>
+    /// True once the peer cancelled the call, the stream errored, or the call is gone
+    /// (completed or reaped) — all of which mean "stop sending".
+    /// </summary>
+    public bool IsCancelled(ulong callId)
+    {
+        if (_disposed) return true;
+        int r = Native.aster_reactor_check_cancelled(_runtimeHandle, _handle, callId);
+        return r != 0;
     }
 
     /// <summary>

@@ -7,23 +7,43 @@
 **C header:** `ffi/aster_ffi.h`, ABI 3.x (`aster_*` symbols; `aster_runtime_new(3, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 3.0 port, 2026-10)
+## STATUS (ABI 3.4 catch-up, 2026-10-04)
 
-- Ported to the `aster_*` ABI 3.0: every P/Invoke in `src/Aster/Native.cs` matches its
-  `ffi/aster_ffi.h` prototype (by-value `aster_bytes_t` args are passed as `Bytes`, not
-  split ptr/len), `Runtime` checks `aster_abi_version() >> 16 == 3` and passes 3 to
-  `aster_runtime_new`.
-- Reactor: `aster_reactor_call_t` is read via a 112-byte `ReactorCallNative` struct;
-  `Poll` branches on `event_kind` (Call / ConnectionClosed surfaced, ResponseWritable /
-  ResponseClosed routed to submit waiters). `Submit`/`SubmitAsync` handle `QUEUE_FULL`
-  with `aster_reactor_reserve_response_capacity` (same contract as Java). Submits must
-  not run on the poll thread.
-- `dotnet test Aster.sln`: all non-soak tests pass. `SoakTests.Soak_ConnectionCloseRace_50Iterations`
-  intermittently aborts the test host with a native panic ("Cannot drop a runtime in a
-  context where blocking is not allowed") — an FFI-side issue in `aster_runtime_close`
-  when an in-flight op holds the last runtime reference, not a binding bug.
-- Not covered by tests: an end-to-end RPC through `AsterServer` (no .NET Aster client
-  exists yet), and the QUEUE_FULL reservation path under real backpressure.
+- **ABI:** needs `libaster_transport_ffi` ABI >= 3.4 (`Native.RequiredAbiMinor`). Struct
+  mirrors of the 3.1–3.4 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
+  `src/Aster/Native.V3.cs`; sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
+- **Codec:** Apache.Fory **1.7.6** (`ForyCodec`: `ThreadSafeFory`, compatible on, ref tracking
+  off; Fory C# is always xlang). Types register under Aster wire tags
+  (`Register<T>("ns/Name")`, split on the last `/` like every binding). JSON mode is gone;
+  `ICodec` is generic (`Encode<T>` / `Decode<T>`).
+- **Envelope / compression:** AEv1 `StreamHeader` / `CallHeader` / `RpcStatus` and zstd via
+  the C ABI (`AsterEnvelope`, `Zstd`, `AsterFraming`). Every server exit path ends with an
+  AEv1 `RpcStatus` TRAILER frame (the old raw `ERROR: msg` trailer is gone). Checked against
+  `conformance/vectors/{envelope,compression}.json`.
+- **Contract identity:** `ServiceDefinition.ContractId` builds TypeDef / ServiceContract JSON
+  from the handler types (`[WireType]`, `[WireName]`) and lets Rust canonicalize and hash it.
+  `int`/`long` map to `varint32`/`varint64` (same table as Rust/Java); InteropEcho gives the
+  shared `c5aa690b…`. Contract-default markers (`contract-defaults.json`) are not supported yet
+  (same as Java): every field is `required`.
+- **Node:** `Node.StartAsync(AsterConfig, Gate?, extraAlpns)` on `aster_node_start`;
+  `AsterConfig` is a record with `FromEnv()` / `FromToml()` resolved by the Rust
+  `aster::AsterConfig`. Gate 0 (`Gate`), admission events (`Node.Admissions` +
+  `AdmissionRequest.Allow/Deny`), tickets (`AsterTicket`), Prometheus metrics.
+  `Node.MemoryWithAlpnsAsync` and `Endpoint.CreateAsync` are `[Obsolete]` (removed in ABI 4.0).
+- **RPC:** `AsterServer.StartAsync(AsterServerOptions)` serves `ServiceDefinition`s (unary,
+  server-stream as `IAsyncEnumerable`, client-stream, bidi; deadline → `DEADLINE_EXCEEDED`;
+  handler exceptions → `INTERNAL` or the `RpcError` code). `AsterClient` / `RpcConnection`
+  call through `aster_call_*` (pooled unary fast path, dedicated substreams for streaming).
+  Session-scoped services are not served yet (`FAILED_PRECONDITION`).
+- **Data plane (3.3):** blobs read-range / provider fetch with report / GC / status, tag prefix
+  delete, docs open / import / authority / retire / durable set / entry status, connection
+  paths, stream priority. **Pure functions (3.4):** `Aster.Crypto.Ids`, `Hpke`, `Attestation`,
+  `Grants` (checked against `conformance/vectors/grants.json`).
+- **Interop:** joins `tests/interop/` (`tests/interop/dotnet/`), 5×5 matrix all pass.
+- `Bytes.FromArray` (unpinned pointer) is removed; use `fixed` + `Bytes.FromPointer`,
+  `Bytes.FromPinned`, or the internal `NativeScope`.
+- Tests: `dotnet test Aster.sln --filter "FullyQualifiedName!~SoakTests"`; the soak suite
+  (~27 min, endpoints probe public relays) stays out of quick runs.
 - `SendStream.Reset` throws `NotSupportedException` (the ABI has no send-stream reset).
 
 ---

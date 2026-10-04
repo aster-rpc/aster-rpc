@@ -383,7 +383,7 @@ public class AbiContractTests
     // ─── Bytes helpers ───────────────────────────────────────────────────────
 
     [Fact]
-    public void Bytes_FromArray_And_ToArray_RoundTrip()
+    public void Bytes_FromPinned_And_ToArray_RoundTrip()
     {
         byte[] original = { 0xDE, 0xAD, 0xBE, 0xEF };
         var pin = GCHandle.Alloc(original, GCHandleType.Pinned);

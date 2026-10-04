@@ -22,6 +22,8 @@ public enum Status
     StreamReset = 11,
     /// <summary><c>aster_runtime_new</c> was called with a different ABI major.</summary>
     AbiMismatch = 12,
+    /// <summary>Well-formed input failed a security check (envelope does not open, chain does not verify, ...).</summary>
+    VerificationFailed = 13,
 }
 
 /// <summary>
@@ -117,6 +119,15 @@ public enum EventKind : uint
     BytesResult = 91,
     UnitResult = 92,
 
+    // Data plane (ABI 3.3)
+    BlobFetched = 100,
+    DocAuthorityReport = 101,
+    DocRetireOutcome = 102,
+    DocOpened = 103,
+    DocEntryExists = 104,
+    DocContentStatus = 105,
+    StreamPriority = 106,
+
     // Errors
     OperationCancelled = 98,
     Error = 99,
@@ -196,24 +207,6 @@ public struct Bytes
     {
         if (length == 0) return default; // {NULL, 0}
         return new Bytes { ptr = handle.AddrOfPinnedObject(), len = (UIntPtr)length };
-    }
-
-    /// <summary>
-    /// Creates a Bytes that points into an <b>unpinned</b> managed array.
-    /// The pointer is only stable while the GC does not move the array, so it
-    /// must not be passed to native code. Retained for source compatibility;
-    /// use a <c>fixed</c> block with <see cref="FromPointer"/> or
-    /// <see cref="FromPinned"/> instead.
-    /// </summary>
-    [Obsolete("Dangling pointer: the array is not pinned. Use fixed + FromPointer or FromPinned.")]
-    public static Bytes FromArray(byte[] data)
-    {
-        if (data == null || data.Length == 0)
-            return default;
-        var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
-        var bytes = new Bytes { ptr = handle.AddrOfPinnedObject(), len = (UIntPtr)data.Length };
-        handle.Free();
-        return bytes;
     }
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript x Java, open gate, unary + streaming.
+"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript x Java x .NET, open gate, unary + streaming.
 
 Builds what is needed, checks that all languages derive the same
 ``contract_id`` for the shared ``InteropEcho`` contract, then runs every
@@ -7,7 +7,7 @@ server x client cell (same-language cells included) and prints a matrix.
 
 Usage (from anywhere)::
 
-    python3 tests/interop/run.py                 # build Rust example + FFI lib + Java + TS dist/codegen, run matrix
+    python3 tests/interop/run.py                 # build Rust example + FFI lib + Java + .NET + TS dist/codegen, run matrix
     python3 tests/interop/run.py --native        # also rebuild the Python + TS native modules
     python3 tests/interop/run.py --no-build      # just run
     python3 tests/interop/run.py --servers rust --clients python,ts
@@ -15,7 +15,8 @@ Usage (from anywhere)::
 Cargo goes through ``$ASTER_CARGO_LAUNCHER`` when set (e.g. the Kache
 launcher). Needs: cargo, uv (with the Python extension built), bun, node,
 mvn + java 22+ (Java runs ``java/InteropEcho.java`` against
-``libaster_transport_ffi`` via ``IROH_LIB_PATH``).
+``libaster_transport_ffi`` via ``IROH_LIB_PATH``), the .NET 9 SDK (``dotnet/``
+is built against the same debug ``libaster_transport_ffi``).
 Everything is loopback-only with relays disabled, so it works offline.
 Exit status is non-zero if any contract id disagrees or any cell fails.
 """
@@ -38,11 +39,14 @@ REPO = HERE.parents[1]
 TS_DIR = HERE / "ts"
 TS_PKG = REPO / "bindings/typescript/packages/aster"
 JAVA_DIR = REPO / "bindings/java"
-LANGS = ("rust", "python", "ts", "java")
-# Java joins the default matrix only where a JDK and Maven are installed (the
-# Forgejo runner has neither); name it in --servers/--clients to require it.
+DOTNET_DIR = HERE / "dotnet"
+LANGS = ("rust", "python", "ts", "java", "dotnet")
+# Java and .NET join the default matrix only where their toolchains are
+# installed (the Forgejo runner has neither); name them in --servers/--clients
+# to require them.
+OPTIONAL_TOOLS = {"java": ("java", "mvn"), "dotnet": ("dotnet",)}
 DEFAULT_LANGS = tuple(
-    lang for lang in LANGS if lang != "java" or (shutil.which("java") and shutil.which("mvn"))
+    lang for lang in LANGS if all(shutil.which(t) for t in OPTIONAL_TOOLS.get(lang, ()))
 )
 
 ENV = {
@@ -100,6 +104,8 @@ def command(lang: str, *args: str) -> tuple[list[str], Path]:
     if lang == "java":
         return ["java", "--enable-native-access=ALL-UNNAMED", "-cp", java_classpath(),
                 str(HERE / "java/InteropEcho.java"), *args], REPO
+    if lang == "dotnet":
+        return ["dotnet", str(DOTNET_DIR / "bin/Release/net9.0/InteropEcho.dll"), *args], REPO
     raise ValueError(lang)
 
 
@@ -120,10 +126,17 @@ def build(native: bool, langs: set[str]) -> None:
         [*launcher, "cargo", "build", "-p", "aster", "--features", "rpc", "--example", "interop_echo"],
         REPO,
     )
-    if "java" in langs:
+    if langs & {"java", "dotnet"}:
         run_step("ffi cdylib", [*launcher, "cargo", "build", "-p", "aster_transport_ffi", "--lib"], REPO)
+    if "java" in langs:
         run_step("java aster-runtime", ["mvn", "-B", "-q", "-o", "-pl", "aster-runtime", "-am", "compile"],
                  JAVA_DIR)
+    if "dotnet" in langs:
+        # Pin the native library to the debug build above (the .NET project would
+        # otherwise prefer a possibly stale target/release copy).
+        run_step("dotnet InteropEcho",
+                 ["dotnet", "build", "-c", "Release", "--nologo", "-v", "q",
+                  f"-p:NativeLibraryPath={ffi_lib().parent}", str(DOTNET_DIR)], REPO)
     run_step("ts package (tsc)", ["bun", "run", "build"], TS_PKG)
     run_step(
         "ts aster-gen",
@@ -207,8 +220,9 @@ def main() -> int:
     args = ap.parse_args()
     servers = [s for s in args.servers.split(",") if s]
     clients = [c for c in args.clients.split(",") if c]
-    if "java" not in DEFAULT_LANGS:
-        print("[note] java/mvn not on PATH: Java leg skipped by default", flush=True)
+    for lang, tools in OPTIONAL_TOOLS.items():
+        if lang not in DEFAULT_LANGS:
+            print(f"[note] {'/'.join(tools)} not on PATH: {lang} leg skipped by default", flush=True)
 
     if not args.no_build:
         build(args.native, set(servers) | set(clients))

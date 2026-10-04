@@ -9,7 +9,7 @@ namespace Aster;
 /// <summary>
 /// Represents an active QUIC connection to a remote peer.
 /// </summary>
-public sealed class Connection : IDisposable
+public sealed partial class Connection : IDisposable
 {
     private readonly Runtime _runtime;
     private readonly ConnectionHandle _handle;

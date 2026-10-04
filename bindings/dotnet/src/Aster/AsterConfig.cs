@@ -1,253 +1,136 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
-using System.Text.Json;
-using Tomlyn;  // TomlSerializer
-using Tomlyn.Model;  // TomlTable
+using Tomlyn;
+using Tomlyn.Model;
 
 namespace Aster;
 
-/// <summary>
-/// Unified configuration for AsterServer.
-///
-/// Three-layer resolution (later wins):
-/// 1. Built-in defaults (ephemeral key, in-memory store, all gates open).
-/// 2. TOML config file (aster.toml) -- requires Tomlyn NuGet (future).
-/// 3. ASTER_* environment variables.
-///
-/// Usage:
-///   var config = AsterConfig.FromEnv();
-///   // or inline:
-///   var config = new AsterConfig { AllowAllConsumers = true, StoragePath = "/var/lib/aster" };
-/// </summary>
-public class AsterConfig
+/// <summary>NAT port mapping (<c>aster_portmapper_t</c>).</summary>
+public enum Portmapper : uint
 {
-    // ── Trust ────────────────────────────────────────────────────────────
-    public byte[]? RootPubkey { get; set; }
-    public string? RootPubkeyFile { get; set; }
-    public string? EnrollmentCredentialFile { get; set; }
-    public string? EnrollmentCredentialIid { get; set; }
-    public bool AllowAllConsumers { get; set; }
-    public bool AllowAllProducers { get; set; } = true;
+    /// <summary>Unset: the Rust default.</summary>
+    Default = 0,
+    Enabled = 1,
+    Disabled = 2,
+}
 
-    // ── Connect ──────────────────────────────────────────────────────────
-    public string? EndpointAddr { get; set; }
+/// <summary>
+/// QUIC transport tuning (<c>aster_config_t.transport_*</c>). <c>null</c> keeps the Rust default.
+/// </summary>
+public sealed record TransportConfig
+{
+    public ulong? MaxConcurrentBidiStreams { get; init; }
+    public ulong? MaxConcurrentUniStreams { get; init; }
+    public ulong? StreamReceiveWindow { get; init; }
+    public ulong? ReceiveWindow { get; init; }
+    public ulong? SendWindow { get; init; }
+    public ulong? MaxIdleTimeoutMs { get; init; }
+    public ulong? KeepAliveIntervalMs { get; init; }
+    public uint? InitialMtu { get; init; }
+    public ulong? DatagramReceiveBufferSize { get; init; }
+    public ulong? DatagramSendBufferSize { get; init; }
+    public bool? SendFairness { get; init; }
+    public bool? EnableSegmentationOffload { get; init; }
+}
 
-    // ── Storage ──────────────────────────────────────────────────────────
-    public string? StoragePath { get; set; }
+/// <summary>
+/// Node and server configuration. The node knobs map one-to-one onto the C ABI
+/// <c>aster_config_t</c> (ABI 3.2) and are resolved by the Rust <c>aster::AsterConfig</c>, so
+/// <see cref="FromEnv"/> / <see cref="FromToml"/> read <c>ASTER_*</c> variables and
+/// <c>aster.toml</c> exactly as the Rust SDK and the other bindings do. Use <c>with</c>
+/// expressions to override:
+/// <code>
+/// var config = AsterConfig.FromEnv() with { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
+/// await using var node = await Node.StartAsync(config);
+/// </code>
+/// The binding-level settings at the end (trust, connect, logging) are read from the same
+/// sources by this class.
+/// </summary>
+public sealed record AsterConfig
+{
+    // ── Network (aster_config_t) ──────────────────────────────────────────
 
-    // ── Network ──────────────────────────────────────────────────────────
-    public byte[]? SecretKey { get; set; }
-    public string? RelayMode { get; set; }
-    public string? BindAddr { get; set; }
-    public bool EnableMonitoring { get; set; }
-    public bool EnableHooks { get; set; }
-    public int HookTimeoutMs { get; set; } = 5000;
-    public bool ClearIpTransports { get; set; }
-    public bool ClearRelayTransports { get; set; }
-    public string? PortmapperConfig { get; set; }
-    public string? ProxyUrl { get; set; }
-    public bool ProxyFromEnv { get; set; }
-    public bool LocalDiscovery { get; set; }
+    /// <summary>"default", "disabled", "staging", "custom" (with <see cref="RelayUrls"/>), or a relay URL.</summary>
+    public string? RelayMode { get; init; }
+    public IReadOnlyList<string> RelayUrls { get; init; } = Array.Empty<string>();
+    /// <summary>32-byte Ed25519 secret key; <c>null</c> = <see cref="SecretKeyFile"/> or ephemeral.</summary>
+    public byte[]? SecretKey { get; init; }
+    public string? SecretKeyFile { get; init; }
+    /// <summary>Persistent store directory; <c>null</c> = in memory.</summary>
+    public string? StoragePath { get; init; }
+    /// <summary>Blob GC interval; 0 = the Rust default.</summary>
+    public ulong GcIntervalMs { get; init; }
+    /// <summary>e.g. "127.0.0.1:0"; <c>null</c> = all interfaces.</summary>
+    public string? BindAddr { get; init; }
+    /// <summary>ALPNs the node accepts, in addition to those added by the server/client.</summary>
+    public IReadOnlyList<string> Alpns { get; init; } = Array.Empty<string>();
+    public string? IdentityFile { get; init; }
+    public string? ProxyUrl { get; init; }
+    public bool ProxyFromEnv { get; init; }
+    /// <summary>Hook (admission) timeout; 0 = 5000 ms.</summary>
+    public ulong HookTimeoutMs { get; init; }
+    public HookFailureMode HookFailureMode { get; init; } = HookFailureMode.FailOpen;
+    /// <summary>Raise admission events (<see cref="Node.Admissions"/>) when no <see cref="Gate"/> is attached.</summary>
+    public bool EnableHooks { get; init; }
+    public bool EnableMonitoring { get; init; }
+    public bool LocalDiscovery { get; init; }
+    public bool ClearIpTransports { get; init; }
+    public bool ClearRelayTransports { get; init; }
+    public Portmapper Portmapper { get; init; }
+    public TransportConfig Transport { get; init; } = new();
 
-    // ── Logging ──────────────────────────────────────────────────────────
-    public string LogFormat { get; set; } = "text";
-    public string LogLevel { get; set; } = "info";
-    public bool LogMask { get; set; } = true;
+    // ── Binding-level settings ────────────────────────────────────────────
 
-    // ── Identity ─────────────────────────────────────────────────────────
-    public string? IdentityFile { get; set; }
+    /// <summary>Open Gate 0 to every consumer (dev mode): the server's gate uses <see cref="TrustMode.OpenDev"/>.</summary>
+    public bool AllowAllConsumers { get; init; }
+    public bool AllowAllProducers { get; init; } = true;
+    public byte[]? RootPubkey { get; init; }
+    public string? RootPubkeyFile { get; init; }
+    public string? EnrollmentCredentialFile { get; init; }
+    public string? EnrollmentCredentialIid { get; init; }
+    public string? EndpointAddr { get; init; }
+    public string LogFormat { get; init; } = "text";
+    public string LogLevel { get; init; } = "info";
+    public bool LogMask { get; init; } = true;
 
-    // ── Factory ──────────────────────────────────────────────────────────
+    // ── Factories ─────────────────────────────────────────────────────────
 
-    /// <summary>Build config from ASTER_* environment variables only.</summary>
-    public static AsterConfig FromEnv()
+    /// <summary>The Rust defaults (<c>aster_config_init</c>).</summary>
+    public static unsafe AsterConfig Default()
     {
-        var c = new AsterConfig();
-        c.ApplyEnv();
-        return c;
+        ConfigNative n = default;
+        Native.Check(Native.aster_config_init(&n), "aster_config_init");
+        return FromNative(in n, new AsterConfig());
     }
 
-    /// <summary>Build config from a config file (aster.toml or aster.json), with env-var
-    /// overrides (env wins). Detects format by file extension.</summary>
-    public static AsterConfig FromFile(string path)
+    /// <summary>Rust <c>AsterConfig::from_env</c> plus the binding-level <c>ASTER_*</c> variables.</summary>
+    public static unsafe AsterConfig FromEnv()
     {
-        var c = new AsterConfig();
-        if (path.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
-            c.ApplyJsonFile(path);
-        else
-            c.ApplyTomlFile(path);
-        c.ApplyEnv();
-        return c;
+        ConfigNative n = default;
+        Native.Check(Native.aster_config_from_env(&n), "aster_config_from_env");
+        try { return FromNative(in n, new AsterConfig()).WithBindingEnv(); }
+        finally { Native.aster_config_release(&n); }
     }
 
-    /// <summary>Apply values from an aster.toml file.</summary>
-    public void ApplyTomlFile(string path)
+    /// <summary>
+    /// Rust <c>AsterConfig::from_file</c> (the TOML file, then <c>ASTER_*</c> overrides) plus the
+    /// file's <c>[trust]</c> / <c>[connect]</c> / <c>[logging]</c> sections and their env overrides.
+    /// </summary>
+    public static unsafe AsterConfig FromToml(string path)
     {
-        var text = File.ReadAllText(path);
-        var model = TomlSerializer.Deserialize<TomlTable>(text)
-            ?? throw new InvalidOperationException($"Failed to parse TOML from {path}");
-
-        void Sec(string name, Action<TomlTable> action)
-        {
-            if (model.TryGetValue(name, out var obj) && obj is TomlTable t) action(t);
-        }
-
-        Sec("trust", t =>
-        {
-            TStr(t, "root_pubkey_file", v => RootPubkeyFile = v);
-            TStr(t, "enrollment_credential", v => EnrollmentCredentialFile = v);
-            TStr(t, "enrollment_credential_iid", v => EnrollmentCredentialIid = v);
-            TBool(t, "allow_all_consumers", v => AllowAllConsumers = v);
-            TBool(t, "allow_all_producers", v => AllowAllProducers = v);
-            TStr(t, "root_pubkey", v => RootPubkey = Convert.FromHexString(v));
-        });
-
-        Sec("connect", t => TStr(t, "endpoint_addr", v => EndpointAddr = v));
-        Sec("storage", t => TStr(t, "path", v => StoragePath = v));
-
-        Sec("network", t =>
-        {
-            TStr(t, "relay_mode", v => RelayMode = v);
-            TStr(t, "bind_addr", v => BindAddr = v);
-            TStr(t, "portmapper_config", v => PortmapperConfig = v);
-            TStr(t, "proxy_url", v => ProxyUrl = v);
-            TBool(t, "enable_monitoring", v => EnableMonitoring = v);
-            TBool(t, "enable_hooks", v => EnableHooks = v);
-            TBool(t, "clear_ip_transports", v => ClearIpTransports = v);
-            TBool(t, "clear_relay_transports", v => ClearRelayTransports = v);
-            TBool(t, "proxy_from_env", v => ProxyFromEnv = v);
-            TBool(t, "local_discovery", v => LocalDiscovery = v);
-            if (t.TryGetValue("hook_timeout_ms", out var htm) && htm is long htmVal)
-                HookTimeoutMs = (int)htmVal;
-            TStr(t, "secret_key", v => SecretKey = Convert.FromBase64String(v));
-        });
-
-        Sec("logging", t =>
-        {
-            TStr(t, "format", v => LogFormat = v.ToLowerInvariant());
-            TStr(t, "level", v => LogLevel = v.ToLowerInvariant());
-            TBool(t, "mask", v => LogMask = v);
-        });
+        ConfigNative n = default;
+        using (var scope = new NativeScope())
+            Native.Check(Native.aster_config_from_toml(scope.Utf8(path), &n), "aster_config_from_toml");
+        AsterConfig c;
+        try { c = FromNative(in n, new AsterConfig()); }
+        finally { Native.aster_config_release(&n); }
+        return c.WithBindingToml(path).WithBindingEnv();
     }
 
-    private static void TStr(TomlTable t, string k, Action<string> s) { if (t.TryGetValue(k, out var v) && v is string sv) s(sv); }
-    private static void TBool(TomlTable t, string k, Action<bool> s) { if (t.TryGetValue(k, out var v) && v is bool bv) s(bv); }
-
-    /// <summary>Apply values from a JSON config file (aster.json).
-    /// The file uses the same section structure as aster.toml but in JSON form:
-    /// {"trust": {...}, "connect": {...}, "storage": {...}, "network": {...}, "logging": {...}}</summary>
-    public void ApplyJsonFile(string path)
-    {
-        var text = File.ReadAllText(path);
-        using var doc = JsonDocument.Parse(text);
-        var root = doc.RootElement;
-
-        // trust section
-        if (root.TryGetProperty("trust", out var trust))
-        {
-            JsonStr(trust, "root_pubkey_file", v => RootPubkeyFile = v);
-            JsonStr(trust, "enrollment_credential", v => EnrollmentCredentialFile = v);
-            JsonStr(trust, "enrollment_credential_iid", v => EnrollmentCredentialIid = v);
-            JsonBool(trust, "allow_all_consumers", v => AllowAllConsumers = v);
-            JsonBool(trust, "allow_all_producers", v => AllowAllProducers = v);
-            JsonStr(trust, "root_pubkey", v => RootPubkey = Convert.FromHexString(v));
-        }
-
-        // connect section
-        if (root.TryGetProperty("connect", out var conn))
-            JsonStr(conn, "endpoint_addr", v => EndpointAddr = v);
-
-        // storage section
-        if (root.TryGetProperty("storage", out var stor))
-            JsonStr(stor, "path", v => StoragePath = v);
-
-        // network section
-        if (root.TryGetProperty("network", out var net))
-        {
-            JsonStr(net, "relay_mode", v => RelayMode = v);
-            JsonStr(net, "bind_addr", v => BindAddr = v);
-            JsonStr(net, "portmapper_config", v => PortmapperConfig = v);
-            JsonStr(net, "proxy_url", v => ProxyUrl = v);
-            JsonBool(net, "enable_monitoring", v => EnableMonitoring = v);
-            JsonBool(net, "enable_hooks", v => EnableHooks = v);
-            JsonBool(net, "clear_ip_transports", v => ClearIpTransports = v);
-            JsonBool(net, "clear_relay_transports", v => ClearRelayTransports = v);
-            JsonBool(net, "proxy_from_env", v => ProxyFromEnv = v);
-            JsonBool(net, "local_discovery", v => LocalDiscovery = v);
-            JsonInt(net, "hook_timeout_ms", v => HookTimeoutMs = v);
-            JsonStr(net, "secret_key", v => SecretKey = Convert.FromBase64String(v));
-        }
-
-        // logging section
-        if (root.TryGetProperty("logging", out var log))
-        {
-            JsonStr(log, "format", v => LogFormat = v.ToLowerInvariant());
-            JsonStr(log, "level", v => LogLevel = v.ToLowerInvariant());
-            JsonBool(log, "mask", v => LogMask = v);
-        }
-    }
-
-    private static void JsonStr(JsonElement e, string key, Action<string> setter)
-    {
-        if (e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String)
-            setter(v.GetString()!);
-    }
-
-    private static void JsonBool(JsonElement e, string key, Action<bool> setter)
-    {
-        if (e.TryGetProperty(key, out var v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False))
-            setter(v.GetBoolean());
-    }
-
-    private static void JsonInt(JsonElement e, string key, Action<int> setter)
-    {
-        if (e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number)
-            setter(v.GetInt32());
-    }
-
-    /// <summary>Override fields from ASTER_* environment variables.</summary>
-    public void ApplyEnv()
-    {
-        EnvStr("ASTER_ROOT_PUBKEY_FILE", v => RootPubkeyFile = v);
-        EnvStr("ASTER_ENROLLMENT_CREDENTIAL", v => EnrollmentCredentialFile = v);
-        EnvStr("ASTER_ENROLLMENT_CREDENTIAL_IID", v => EnrollmentCredentialIid = v);
-        EnvStr("ASTER_ENDPOINT_ADDR", v => EndpointAddr = v);
-        EnvStr("ASTER_STORAGE_PATH", v => StoragePath = string.IsNullOrEmpty(v) ? null : v);
-        EnvStr("ASTER_RELAY_MODE", v => RelayMode = string.IsNullOrEmpty(v) ? null : v);
-        EnvStr("ASTER_BIND_ADDR", v => BindAddr = string.IsNullOrEmpty(v) ? null : v);
-        EnvStr("ASTER_PORTMAPPER_CONFIG", v => PortmapperConfig = string.IsNullOrEmpty(v) ? null : v);
-        EnvStr("ASTER_PROXY_URL", v => ProxyUrl = string.IsNullOrEmpty(v) ? null : v);
-        EnvStr("ASTER_IDENTITY_FILE", v => IdentityFile = v);
-        EnvStr("ASTER_LOG_FORMAT", v => LogFormat = v.ToLowerInvariant());
-        EnvStr("ASTER_LOG_LEVEL", v => LogLevel = v.ToLowerInvariant());
-
-        EnvBool("ASTER_ALLOW_ALL_CONSUMERS", v => AllowAllConsumers = v);
-        EnvBool("ASTER_ALLOW_ALL_PRODUCERS", v => AllowAllProducers = v);
-        EnvBool("ASTER_ENABLE_MONITORING", v => EnableMonitoring = v);
-        EnvBool("ASTER_ENABLE_HOOKS", v => EnableHooks = v);
-        EnvBool("ASTER_CLEAR_IP_TRANSPORTS", v => ClearIpTransports = v);
-        EnvBool("ASTER_CLEAR_RELAY_TRANSPORTS", v => ClearRelayTransports = v);
-        EnvBool("ASTER_PROXY_FROM_ENV", v => ProxyFromEnv = v);
-        EnvBool("ASTER_LOCAL_DISCOVERY", v => LocalDiscovery = v);
-        EnvBool("ASTER_LOG_MASK", v => LogMask = v);
-
-        EnvInt("ASTER_HOOK_TIMEOUT_MS", v => HookTimeoutMs = v);
-
-        EnvHex("ASTER_ROOT_PUBKEY", v => RootPubkey = v);
-        EnvBase64("ASTER_SECRET_KEY", v => SecretKey = v);
-    }
-
-    /// <summary>Convert network fields to an EndpointConfigBuilder for the FFI.</summary>
-    public EndpointConfigBuilder ToEndpointConfigBuilder()
-    {
-        var b = new EndpointConfigBuilder().Alpn(AsterServer.AsterAlpn);
-        if (SecretKey != null) b.SecretKey(SecretKey);
-        if (LocalDiscovery) b.EnableDiscovery(true);
-        return b;
-    }
-
-    /// <summary>Resolve root public key from RootPubkey or RootPubkeyFile.</summary>
+    /// <summary>Resolves the root public key from <see cref="RootPubkey"/> or <see cref="RootPubkeyFile"/>.</summary>
     public byte[]? ResolveRootPubkey()
     {
         if (RootPubkey != null) return RootPubkey;
@@ -256,49 +139,192 @@ public class AsterConfig
             var content = File.ReadAllText(RootPubkeyFile).Trim();
             if (content.Length == 64)
             {
-                try { RootPubkey = Convert.FromHexString(content); return RootPubkey; }
-                catch { }
+                try { return Convert.FromHexString(content); } catch (FormatException) { }
             }
         }
         return null;
     }
 
-    // ── Env helpers ──────────────────────────────────────────────────────
+    // ── aster_config_t marshalling ────────────────────────────────────────
 
-    private static void EnvStr(string key, Action<string> setter)
-    {
-        var v = Environment.GetEnvironmentVariable(key);
-        if (v != null) setter(v.Trim());
-    }
+    private const uint TBidi = 1, TUni = 1 << 1, TStreamRecv = 1 << 2, TRecv = 1 << 3, TSend = 1 << 4,
+        TIdle = 1 << 5, TKeepAlive = 1 << 6, TMtu = 1 << 7, TDgramRecv = 1 << 8, TDgramSend = 1 << 9,
+        TFairness = 1 << 10, TGso = 1 << 11;
 
-    private static void EnvBool(string key, Action<bool> setter)
+    /// <summary>Builds an <c>aster_config_t</c> whose buffers live in <paramref name="scope"/>.</summary>
+    internal unsafe ConfigNative ToNative(NativeScope scope, IEnumerable<string>? extraAlpns = null)
     {
-        var v = Environment.GetEnvironmentVariable(key)?.Trim().ToLowerInvariant();
-        if (v is "true" or "1" or "yes" or "on") setter(true);
-        else if (v is "false" or "0" or "no" or "off") setter(false);
-    }
+        ConfigNative n = default;
+        Native.Check(Native.aster_config_init(&n), "aster_config_init");
 
-    private static void EnvInt(string key, Action<int> setter)
-    {
-        var v = Environment.GetEnvironmentVariable(key);
-        if (v != null && int.TryParse(v.Trim(), out var n)) setter(n);
-    }
-
-    private static void EnvHex(string key, Action<byte[]> setter)
-    {
-        var v = Environment.GetEnvironmentVariable(key)?.Trim();
-        if (!string.IsNullOrEmpty(v))
+        var urls = RelayUrls.ToList();
+        string mode = RelayMode?.Trim().ToLowerInvariant() ?? string.Empty;
+        n.relay_mode = mode switch
         {
-            try { setter(Convert.FromHexString(v)); } catch { }
-        }
+            "" or "default" => urls.Count == 0 ? (uint)Aster.RelayMode.Default : (uint)Aster.RelayMode.Custom,
+            "custom" => (uint)Aster.RelayMode.Custom,
+            "disabled" => (uint)Aster.RelayMode.Disabled,
+            "staging" => (uint)Aster.RelayMode.Staging,
+            _ => (uint)Aster.RelayMode.Custom, // a bare URL means custom (same rule as Rust)
+        };
+        if (n.relay_mode == (uint)Aster.RelayMode.Custom && urls.Count == 0 && mode is not ("" or "default" or "custom"))
+            urls.Add(RelayMode!.Trim());
+        n.relay_urls = scope.Utf8List(urls);
+        if (SecretKey is { Length: > 0 }) n.secret_key = scope.Bytes(SecretKey);
+        n.secret_key_file = scope.Utf8(SecretKeyFile);
+        n.storage_path = scope.Utf8(StoragePath);
+        n.gc_interval_ms = GcIntervalMs;
+        n.bind_addr = scope.Utf8(BindAddr);
+        var alpns = Alpns.Concat(extraAlpns ?? Enumerable.Empty<string>()).Distinct().ToList();
+        n.alpns = scope.Utf8List(alpns);
+        n.identity_file = scope.Utf8(IdentityFile);
+        n.proxy_url = scope.Utf8(ProxyUrl);
+        n.hook_timeout_ms = HookTimeoutMs;
+        n.hook_failure_mode = (uint)HookFailureMode;
+        n.enable_hooks = EnableHooks ? 1u : 0u;
+        n.enable_monitoring = EnableMonitoring ? 1u : 0u;
+        n.local_discovery = LocalDiscovery ? 1u : 0u;
+        n.clear_ip_transports = ClearIpTransports ? 1u : 0u;
+        n.clear_relay_transports = ClearRelayTransports ? 1u : 0u;
+        n.portmapper = (uint)Portmapper;
+        n.proxy_from_env = ProxyFromEnv ? 1u : 0u;
+
+        uint set = 0;
+        var t = Transport;
+        void U64(ulong? v, uint bit, ref ulong field) { if (v is { } x) { field = x; set |= bit; } }
+        U64(t.MaxConcurrentBidiStreams, TBidi, ref n.transport_max_concurrent_bidi_streams);
+        U64(t.MaxConcurrentUniStreams, TUni, ref n.transport_max_concurrent_uni_streams);
+        U64(t.StreamReceiveWindow, TStreamRecv, ref n.transport_stream_receive_window);
+        U64(t.ReceiveWindow, TRecv, ref n.transport_receive_window);
+        U64(t.SendWindow, TSend, ref n.transport_send_window);
+        U64(t.MaxIdleTimeoutMs, TIdle, ref n.transport_max_idle_timeout_ms);
+        U64(t.KeepAliveIntervalMs, TKeepAlive, ref n.transport_keep_alive_interval_ms);
+        U64(t.DatagramReceiveBufferSize, TDgramRecv, ref n.transport_datagram_receive_buffer_size);
+        U64(t.DatagramSendBufferSize, TDgramSend, ref n.transport_datagram_send_buffer_size);
+        if (t.InitialMtu is { } mtu) { n.transport_initial_mtu = mtu; set |= TMtu; }
+        if (t.SendFairness is { } fair) { n.transport_send_fairness = fair ? 1u : 0u; set |= TFairness; }
+        if (t.EnableSegmentationOffload is { } gso) { n.transport_enable_segmentation_offload = gso ? 1u : 0u; set |= TGso; }
+        n.transport_set = set;
+        return n;
     }
 
-    private static void EnvBase64(string key, Action<byte[]> setter)
+    private static AsterConfig FromNative(in ConfigNative n, AsterConfig b)
     {
-        var v = Environment.GetEnvironmentVariable(key)?.Trim();
-        if (!string.IsNullOrEmpty(v))
+        string? Str(Bytes x) => x.IsEmpty ? null : x.ToUtf8String();
+        uint set = n.transport_set;
+        ulong? U64(uint bit, ulong v) => (set & bit) != 0 ? v : null;
+        return b with
         {
-            try { setter(Convert.FromBase64String(v)); } catch { }
+            RelayMode = (RelayMode)n.relay_mode switch
+            {
+                Aster.RelayMode.Custom => "custom",
+                Aster.RelayMode.Disabled => "disabled",
+                Aster.RelayMode.Staging => "staging",
+                _ => "default",
+            },
+            RelayUrls = NativeScope.ReadUtf8List(n.relay_urls),
+            SecretKey = n.secret_key.IsEmpty ? null : n.secret_key.ToArray(),
+            SecretKeyFile = Str(n.secret_key_file),
+            StoragePath = Str(n.storage_path),
+            GcIntervalMs = n.gc_interval_ms,
+            BindAddr = Str(n.bind_addr),
+            Alpns = NativeScope.ReadUtf8List(n.alpns),
+            IdentityFile = Str(n.identity_file),
+            ProxyUrl = Str(n.proxy_url),
+            HookTimeoutMs = n.hook_timeout_ms,
+            HookFailureMode = (HookFailureMode)n.hook_failure_mode,
+            EnableHooks = n.enable_hooks != 0,
+            EnableMonitoring = n.enable_monitoring != 0,
+            LocalDiscovery = n.local_discovery != 0,
+            ClearIpTransports = n.clear_ip_transports != 0,
+            ClearRelayTransports = n.clear_relay_transports != 0,
+            Portmapper = (Portmapper)n.portmapper,
+            ProxyFromEnv = n.proxy_from_env != 0,
+            Transport = new TransportConfig
+            {
+                MaxConcurrentBidiStreams = U64(TBidi, n.transport_max_concurrent_bidi_streams),
+                MaxConcurrentUniStreams = U64(TUni, n.transport_max_concurrent_uni_streams),
+                StreamReceiveWindow = U64(TStreamRecv, n.transport_stream_receive_window),
+                ReceiveWindow = U64(TRecv, n.transport_receive_window),
+                SendWindow = U64(TSend, n.transport_send_window),
+                MaxIdleTimeoutMs = U64(TIdle, n.transport_max_idle_timeout_ms),
+                KeepAliveIntervalMs = U64(TKeepAlive, n.transport_keep_alive_interval_ms),
+                DatagramReceiveBufferSize = U64(TDgramRecv, n.transport_datagram_receive_buffer_size),
+                DatagramSendBufferSize = U64(TDgramSend, n.transport_datagram_send_buffer_size),
+                InitialMtu = (set & TMtu) != 0 ? n.transport_initial_mtu : null,
+                SendFairness = (set & TFairness) != 0 ? n.transport_send_fairness != 0 : null,
+                EnableSegmentationOffload = (set & TGso) != 0 ? n.transport_enable_segmentation_offload != 0 : null,
+            },
+        };
+    }
+
+    // ── binding-level sources ─────────────────────────────────────────────
+
+    private AsterConfig WithBindingToml(string path)
+    {
+        var model = TomlSerializer.Deserialize<TomlTable>(File.ReadAllText(path))
+            ?? throw new InvalidOperationException($"Failed to parse TOML from {path}");
+        var c = this;
+        TomlTable? Sec(string name) => model.TryGetValue(name, out var o) && o is TomlTable t ? t : null;
+        static string? S(TomlTable? t, string k) => t != null && t.TryGetValue(k, out var v) && v is string s ? s : null;
+        static bool? B(TomlTable? t, string k) => t != null && t.TryGetValue(k, out var v) && v is bool b ? b : null;
+
+        var trust = Sec("trust");
+        c = c with
+        {
+            RootPubkeyFile = S(trust, "root_pubkey_file") ?? c.RootPubkeyFile,
+            EnrollmentCredentialFile = S(trust, "enrollment_credential") ?? c.EnrollmentCredentialFile,
+            EnrollmentCredentialIid = S(trust, "enrollment_credential_iid") ?? c.EnrollmentCredentialIid,
+            AllowAllConsumers = B(trust, "allow_all_consumers") ?? c.AllowAllConsumers,
+            AllowAllProducers = B(trust, "allow_all_producers") ?? c.AllowAllProducers,
+            RootPubkey = S(trust, "root_pubkey") is { } hex ? Convert.FromHexString(hex) : c.RootPubkey,
+            EndpointAddr = S(Sec("connect"), "endpoint_addr") ?? c.EndpointAddr,
+        };
+        var log = Sec("logging");
+        return c with
+        {
+            LogFormat = S(log, "format")?.ToLowerInvariant() ?? c.LogFormat,
+            LogLevel = S(log, "level")?.ToLowerInvariant() ?? c.LogLevel,
+            LogMask = B(log, "mask") ?? c.LogMask,
+        };
+    }
+
+    private AsterConfig WithBindingEnv()
+    {
+        static string? Env(string k) => Environment.GetEnvironmentVariable(k)?.Trim() is { Length: > 0 } v ? v : null;
+        static bool? EnvBool(string k) => Env(k)?.ToLowerInvariant() switch
+        {
+            "true" or "1" or "yes" or "on" => true,
+            "false" or "0" or "no" or "off" => false,
+            _ => null,
+        };
+        byte[]? rootPubkey = RootPubkey;
+        if (Env("ASTER_ROOT_PUBKEY") is { } hex)
+        {
+            try { rootPubkey = Convert.FromHexString(hex); } catch (FormatException) { }
         }
+        return this with
+        {
+            RootPubkey = rootPubkey,
+            RootPubkeyFile = Env("ASTER_ROOT_PUBKEY_FILE") ?? RootPubkeyFile,
+            EnrollmentCredentialFile = Env("ASTER_ENROLLMENT_CREDENTIAL") ?? EnrollmentCredentialFile,
+            EnrollmentCredentialIid = Env("ASTER_ENROLLMENT_CREDENTIAL_IID") ?? EnrollmentCredentialIid,
+            EndpointAddr = Env("ASTER_ENDPOINT_ADDR") ?? EndpointAddr,
+            AllowAllConsumers = EnvBool("ASTER_ALLOW_ALL_CONSUMERS") ?? AllowAllConsumers,
+            AllowAllProducers = EnvBool("ASTER_ALLOW_ALL_PRODUCERS") ?? AllowAllProducers,
+            LogFormat = Env("ASTER_LOG_FORMAT")?.ToLowerInvariant() ?? LogFormat,
+            LogLevel = Env("ASTER_LOG_LEVEL")?.ToLowerInvariant() ?? LogLevel,
+            LogMask = EnvBool("ASTER_LOG_MASK") ?? LogMask,
+        };
+    }
+
+    /// <summary>Redacts the secret key.</summary>
+    public override string ToString()
+    {
+        var sb = new StringBuilder("AsterConfig { ");
+        sb.Append($"RelayMode = {RelayMode}, BindAddr = {BindAddr}, StoragePath = {StoragePath}, ");
+        sb.Append($"Alpns = [{string.Join(", ", Alpns)}], SecretKey = {(SecretKey is null ? "null" : "<redacted>")}, ");
+        sb.Append($"EnableHooks = {EnableHooks}, AllowAllConsumers = {AllowAllConsumers} }}");
+        return sb.ToString();
     }
 }

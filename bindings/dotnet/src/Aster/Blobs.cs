@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace Aster;
 
-public sealed class Blobs
+public sealed partial class Blobs
 {
     private readonly Runtime _runtime;
     private readonly ulong _nodeHandle;
@@ -26,7 +26,7 @@ public sealed class Blobs
             if (r != 0) throw IrohException.FromStatus(r, "aster_blobs_add_bytes");
             Event ev = await _runtime.WaitForAsync(opId, ct).ConfigureAwait(false);
             if (ev.kind != (uint)EventKind.BlobAdded) throw new IrohException($"add_bytes: unexpected event {ev.kind}");
-            // hash is in data_ptr, size is in related
+            // The event carries the hash hex as payload; the size is the input length.
             string hash = string.Empty;
             if (ev.data_ptr != IntPtr.Zero && ev.data_len != UIntPtr.Zero)
             {
@@ -35,7 +35,7 @@ public sealed class Blobs
                 hash = Encoding.UTF8.GetString(hashBytes);
                 if (ev.buffer != 0) _runtime.ReleaseBuffer(ev.buffer);
             }
-            return (hash, ev.related);
+            return (hash, (ulong)data.Length);
         }
         finally { pin.Free(); }
     }

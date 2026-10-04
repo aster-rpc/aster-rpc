@@ -45,8 +45,10 @@ public sealed class Endpoint : IDisposable
 
     /// <summary>
     /// Creates a new endpoint with the given builder.
+    /// Deprecated with ABI 3.2 (removed in 4.0): use <see cref="Node.StartAsync"/>.
     /// All config data is allocated in native memory and remains valid across the async call.
     /// </summary>
+    [Obsolete("Deprecated with ABI 3.2 (aster_endpoint_create, removed in 4.0): use Node.StartAsync(AsterConfig).")]
     public static async Task<Endpoint> CreateAsync(Runtime runtime, EndpointConfigBuilder builder, CancellationToken cancellationToken = default)
     {
         var (configPtr, cleanup) = BuildNativeConfig(builder);
@@ -70,6 +72,7 @@ public sealed class Endpoint : IDisposable
     }
 
     /// <summary>Creates a new endpoint with default config.</summary>
+    [Obsolete("Deprecated with ABI 3.2 (aster_endpoint_create, removed in 4.0): use Node.StartAsync(AsterConfig).")]
     public static Task<Endpoint> CreateAsync(Runtime runtime, CancellationToken cancellationToken = default)
         => CreateAsync(runtime, new EndpointConfigBuilder(), cancellationToken);
 
@@ -224,68 +227,9 @@ public sealed class Endpoint : IDisposable
         finally { nodeIdHandle.Free(); alpnHandle.Free(); }
     }
 
-    /// <summary>Connects to a remote node using its full address info.</summary>
-    public async Task<Connection> ConnectWithAddrAsync(NodeAddrInfo addr, string alpn, CancellationToken cancellationToken = default)
-    {
-        byte[] nodeIdBytes = Encoding.UTF8.GetBytes(addr.EndpointId);
-        byte[] alpnBytes = Encoding.UTF8.GetBytes(alpn);
-
-        // Build NodeAddr struct with relay URL
-        byte[]? relayBytes = addr.RelayUrl != null ? Encoding.UTF8.GetBytes(addr.RelayUrl) : null;
-
-        GCHandle nodeIdHandle = GCHandle.Alloc(nodeIdBytes, GCHandleType.Pinned);
-        GCHandle alpnHandle = GCHandle.Alloc(alpnBytes, GCHandleType.Pinned);
-        GCHandle relayHandle = relayBytes != null ? GCHandle.Alloc(relayBytes, GCHandleType.Pinned) : default;
-        try
-        {
-            // Build the NodeAddr to pass via ConnectConfig.addr
-            var nodeAddr = new NodeAddr
-            {
-                endpoint_id = new Bytes { ptr = nodeIdHandle.AddrOfPinnedObject(), len = (UIntPtr)nodeIdBytes.Length },
-                relay_url = relayBytes != null
-                    ? new Bytes { ptr = relayHandle.AddrOfPinnedObject(), len = (UIntPtr)relayBytes.Length }
-                    : default,
-                direct_addresses = BytesList.Empty,
-            };
-
-            IntPtr nodeAddrPtr = Marshal.AllocHGlobal(Marshal.SizeOf<NodeAddr>());
-            Marshal.StructureToPtr(nodeAddr, nodeAddrPtr, fDeleteOld: false);
-
-            IntPtr configPtr = Marshal.AllocHGlobal(Marshal.SizeOf<ConnectConfig>());
-            try
-            {
-                var config = new ConnectConfig
-                {
-                    struct_size = (uint)Marshal.SizeOf<ConnectConfig>(),
-                    node_id = new Bytes { ptr = nodeIdHandle.AddrOfPinnedObject(), len = (UIntPtr)nodeIdBytes.Length },
-                    alpn = new Bytes { ptr = alpnHandle.AddrOfPinnedObject(), len = (UIntPtr)alpnBytes.Length },
-                    addr = nodeAddrPtr,
-                };
-                Marshal.StructureToPtr(config, configPtr, fDeleteOld: false);
-
-                int r = Native.aster_connect(_runtime.Handle, _handle.Value, configPtr, user_data: 0, out ulong opId);
-                if (r != 0)
-                    throw IrohException.FromStatus(r, "aster_connect");
-
-                Event ev = await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
-                if (ev.kind != (uint)EventKind.Connected)
-                    throw new IrohException($"connect: unexpected event {(EventKind)ev.kind}");
-
-                return new Connection(_runtime, new ConnectionHandle(ev.handle));
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(configPtr);
-                Marshal.FreeHGlobal(nodeAddrPtr);
-            }
-        }
-        finally
-        {
-            nodeIdHandle.Free();
-            alpnHandle.Free();
-            if (relayHandle.IsAllocated) relayHandle.Free();
-        }
-    }
+    /// <summary>Connects to a remote node using its full address info (relay URL and direct addresses).</summary>
+    public Task<Connection> ConnectWithAddrAsync(NodeAddrInfo addr, string alpn, CancellationToken cancellationToken = default)
+        => Node.ConnectCore(_runtime, _handle.Value, addr, alpn, cancellationToken);
 
     public void Dispose() { if (!_disposed) Close(); }
 

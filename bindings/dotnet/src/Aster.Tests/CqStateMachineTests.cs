@@ -29,7 +29,7 @@ public class CqStateMachineTests
     private sealed class FakeCompletionQueue : IDisposable
     {
         private readonly ConcurrentDictionary<ulong, TaskCompletionSource<FakeEvent>> _ops = new();
-        private ulong _nextOpId = 1;
+        private ulong _nextOpId;
         private bool _closed;
 
         public int Pending => _ops.Count;
@@ -38,7 +38,10 @@ public class CqStateMachineTests
         public ulong Submit()
         {
             if (_closed) throw new ObjectDisposedException(nameof(FakeCompletionQueue));
-            return _nextOpId++;
+            // Atomic, like the native op counter: ConcurrentSubmitComplete_NoDuplicates submits
+            // from 50 tasks, and a plain ++ occasionally handed two ops the same id (one task
+            // then received another's event).
+            return Interlocked.Increment(ref _nextOpId);
         }
 
         public void Register(ulong opId, TaskCompletionSource<FakeEvent> tcs)

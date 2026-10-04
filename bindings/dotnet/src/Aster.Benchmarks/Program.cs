@@ -235,19 +235,19 @@ public class MemoryBenchmarks
     }
 
     [Benchmark]
-    public void Bytes_FromArray_Overhead()
+    public unsafe void Bytes_FromPointer_Overhead()
     {
         byte[] data = new byte[100];
-        var b = Bytes.FromArray(data);
-        _ = b.ToArray();
+        fixed (byte* p = data)
+            _ = Bytes.FromPointer(p, data.Length).ToArray();
     }
 
     [Benchmark]
-    public void Bytes_ToUtf8String_Overhead()
+    public unsafe void Bytes_ToUtf8String_Overhead()
     {
         byte[] utf8 = Encoding.UTF8.GetBytes("Hello, Aster! This is a test string.");
-        var b = Bytes.FromArray(utf8);
-        _ = b.ToUtf8String();
+        fixed (byte* p = utf8)
+            _ = Bytes.FromPointer(p, utf8.Length).ToUtf8String();
     }
 }
 

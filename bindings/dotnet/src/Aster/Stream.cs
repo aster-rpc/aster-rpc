@@ -8,7 +8,7 @@ namespace Aster;
 /// <summary>
 /// A unidirectional send stream. Send streams are used to send frames to a remote peer.
 /// </summary>
-public sealed class SendStream : IDisposable
+public sealed partial class SendStream : IDisposable
 {
     private readonly Runtime _runtime;
     private readonly SendStreamHandle _handle;

@@ -1,91 +1,53 @@
 using System;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
+using Apache.Fory;
 using Aster;
+using Aster.Rpc;
 
 namespace Examples;
 
-class AsterServerExample
+[ForyStruct]
+[WireType("examples/EchoRequest")]
+public sealed class EchoRequest
+{
+    public string Message { get; set; } = "";
+}
+
+[ForyStruct]
+[WireType("examples/EchoReply")]
+public sealed class EchoReply
+{
+    public string Message { get; set; } = "";
+}
+
+/// <summary>A unary echo service served and called in-process over loopback.</summary>
+static class AsterServerExample
 {
     public static async Task RunAsync()
     {
         Console.WriteLine("=== AsterServer Echo Example (.NET) ===\n");
 
-        // 0. Compute contract_id via the Rust FFI
-        Console.WriteLine("0. Computing contract_id via Rust FFI...");
-        string contractJson = """{"name": "EchoService", "version": 1, "methods": [], "serialization_modes": ["xlang"], "scoped": "shared", "requires": null, "producer_language": ""}""";
-        string contractId = ContractIdentity.ComputeContractId(contractJson);
-        Console.WriteLine($"   contract_id: {contractId}");
-        if (contractId.Length != 64)
-        {
-            Console.WriteLine($"   FAIL: Expected 64-char hex, got {contractId.Length} chars");
-            Environment.Exit(1);
-        }
-        Console.WriteLine("   PASS: Got valid 64-char hex contract_id.");
+        var service = ServiceDefinition.Create("EchoService", 1)
+            .Unary<EchoRequest, EchoReply>("echo", (req, ctx) =>
+                ValueTask.FromResult(new EchoReply { Message = $"echo from {ctx.PeerId[..8]}: {req.Message}" }))
+            .Build();
+        Console.WriteLine($"contract_id: {service.ContractId}");
 
-        // 1. Start the echo server
-        Console.WriteLine("1. Starting AsterServer (echo handler)...");
-        using var server = await AsterServer.CreateAsync(call =>
+        // Loopback only, relays off: runs offline.
+        var config = AsterConfig.FromEnv() with { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
+
+        await using var server = await AsterServer.StartAsync(new AsterServerOptions
         {
-            Console.WriteLine($"   Server received call from {call.PeerId[..Math.Min(8, call.PeerId.Length)]}...: header={call.Header.Length} bytes, request={call.Request.Length} bytes");
-            return ReactorResponse.Of(call.Request); // Echo
+            Config = config with { AllowAllConsumers = true },
+            Services = { service },
         });
+        var ticket = await server.TicketAsync();
+        Console.WriteLine($"server: {ticket}");
 
-        string nodeId = server.NodeId();
-        Console.WriteLine($"   Server started! Node ID: {nodeId[..Math.Min(16, nodeId.Length)]}...");
-
-        // 2. Create a client endpoint
-        Console.WriteLine("\n2. Creating client endpoint...");
-        using var clientRuntime = new Runtime();
-        var builder = new EndpointConfigBuilder().Alpn(AsterServer.AsterAlpn);
-        using var clientEndpoint = await Endpoint.CreateAsync(clientRuntime, builder);
-        Console.WriteLine("   Client endpoint created.");
-
-        // 3. Connect client to server
-        Console.WriteLine("\n3. Connecting client to server...");
-        var serverAddr = server.Node.NodeAddr();
-        using var conn = await clientEndpoint.ConnectWithAddrAsync(serverAddr, AsterServer.AsterAlpn);
-        Console.WriteLine("   Connected!");
-
-        // 4. Open stream and send Aster-framed RPC
-        Console.WriteLine("\n4. Opening stream and sending RPC...");
-        var (send, recv) = await conn.OpenBiAsync();
-
-        byte[] headerPayload = Encoding.UTF8.GetBytes("EchoService.echo");
-        byte[] requestPayload = Encoding.UTF8.GetBytes("Hello, Aster!");
-
-        byte[] headerFrame = AsterServer.EncodeFrame(headerPayload, AsterServer.FlagHeader);
-        byte[] requestFrame = AsterServer.EncodeFrame(requestPayload, 0);
-
-        byte[] combined = new byte[headerFrame.Length + requestFrame.Length];
-        Buffer.BlockCopy(headerFrame, 0, combined, 0, headerFrame.Length);
-        Buffer.BlockCopy(requestFrame, 0, combined, headerFrame.Length, requestFrame.Length);
-
-        await send.SendAsync(combined);
-        await send.FinishAsync();
-        Console.WriteLine("   Sent header + request.");
-
-        // 5. Read the response
-        Console.WriteLine("\n5. Reading response...");
-        byte[] response = await recv.ReadAsync(4096);
-        Console.WriteLine($"   Received {response.Length} bytes: {Encoding.UTF8.GetString(response)}");
-
-        if (response.SequenceEqual(requestPayload))
-        {
-            Console.WriteLine("   PASS: Response matches echoed payload!");
-        }
-        else
-        {
-            Console.WriteLine($"   FAIL: Expected {requestPayload.Length} bytes, got {response.Length} bytes.");
-            Environment.Exit(1);
-        }
-
-        // 6. Cleanup
-        Console.WriteLine("\n6. Cleaning up...");
-        send.Dispose();
-        recv.Dispose();
-
-        Console.WriteLine("\n=== SUCCESS: AsterServer echo round-trip works! ===");
+        await using var client = await AsterClient.StartAsync(config);
+        client.RegisterTypes(service);
+        var conn = await client.ConnectAsync(ticket);
+        var reply = await conn.UnaryAsync<EchoRequest, EchoReply>("EchoService", "echo", new EchoRequest { Message = "hello" });
+        Console.WriteLine($"reply: {reply.Message}");
     }
 }

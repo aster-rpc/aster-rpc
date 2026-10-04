@@ -23,8 +23,15 @@ public sealed class Runtime : IDisposable
     // Maps operation ID -> TaskCompletionSource that receives the event.
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<Event>> _ops = new();
 
+    // Unsolicited events (operation == 0, e.g. admission hooks) routed by event.handle.
+    private readonly ConcurrentDictionary<ulong, Action<Event>> _inbound = new();
+
     // Guards dispose so the poll loop exits cleanly.
     private volatile bool _disposed;
+
+    // Owners sharing this runtime (the creator + nodes started on a gate's runtime).
+    private int _refCount = 1;
+    private int _releasedByDispose;
 
     private const int MaxEvents = 64;
 
@@ -46,6 +53,10 @@ public sealed class Runtime : IDisposable
             throw new IrohException(Status.AbiMismatch,
                 $"native library ABI {loaded >> 16}.{(loaded >> 8) & 0xff}.{loaded & 0xff} " +
                 $"does not match binding ABI major {Native.AbiVersionMajor}");
+        if (((loaded >> 8) & 0xff) < Native.RequiredAbiMinor)
+            throw new IrohException(Status.AbiMismatch,
+                $"native library ABI {loaded >> 16}.{(loaded >> 8) & 0xff} is too old: this binding needs " +
+                $"{Native.AbiVersionMajor}.{Native.RequiredAbiMinor}+ (rebuild libaster_transport_ffi or set -p:NativeLibraryPath)");
 
         config.struct_size = (uint)Marshal.SizeOf<RuntimeConfig>();
         int r = Native.aster_runtime_new(Native.AbiVersionMajor, in config, out _handle);
@@ -140,10 +151,41 @@ public sealed class Runtime : IDisposable
         return await eventTask.ConfigureAwait(false);
     }
 
+    /// <summary>Adds an owner; the runtime closes when every owner has released it.</summary>
+    internal Runtime Retain()
+    {
+        if (Interlocked.Increment(ref _refCount) <= 1)
+            throw new ObjectDisposedException(nameof(Runtime));
+        return this;
+    }
+
+    /// <summary>Drops one owner (see <see cref="Retain"/>).</summary>
+    internal void Release()
+    {
+        if (Interlocked.Decrement(ref _refCount) == 0)
+            Close();
+    }
+
     /// <summary>
-    /// Releases the native runtime and stops the poll loop.
+    /// Routes unsolicited events (operation 0) whose <c>handle</c> is <paramref name="handle"/>
+    /// to <paramref name="handler"/>, called on the poll thread. The event's data buffer is
+    /// released after the handler returns, so copy what you need.
+    /// </summary>
+    internal void RegisterInbound(ulong handle, Action<Event> handler) => _inbound[handle] = handler;
+
+    internal void UnregisterInbound(ulong handle) => _inbound.TryRemove(handle, out _);
+
+    /// <summary>
+    /// Releases this owner's reference; the native runtime and the poll loop stop once nodes
+    /// and gates sharing the runtime have been disposed too.
     /// </summary>
     public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _releasedByDispose, 1) == 0)
+            Release();
+    }
+
+    private void Close()
     {
         if (_disposed)
             return;
@@ -216,7 +258,16 @@ public sealed class Runtime : IDisposable
             ref readonly Event ev = ref events[i];
 
             if (ev.operation == 0)
+            {
+                if (_inbound.TryGetValue(ev.handle, out var handler))
+                {
+                    try { handler(ev); }
+                    catch (Exception ex) { Console.Error.WriteLine($"aster inbound handler failed: {ex.Message}"); }
+                }
+                if (ev.buffer != 0)
+                    Native.aster_buffer_release(_handle, ev.buffer);
                 continue;
+            }
             // If no waiter is registered yet, park the completed TCS for it.
             // (A registered waiter's continuation removes the entry.)
             _ops.GetOrAdd(ev.operation, NewTcs).TrySetResult(ev);

@@ -6,6 +6,9 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- These projects deliberately keep exercising the endpoint API that ABI 3.2
+         deprecated (aster_endpoint_create, removed in 4.0). -->
+    <NoWarn>$(NoWarn);CS0618</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -21,6 +24,11 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Aster\Aster.csproj" />
+  </ItemGroup>
+
+  <!-- Conformance vectors travel with the test assembly (VectorTests). -->
+  <ItemGroup>
+    <None Include="../../../../conformance/vectors/*.json" Link="vectors/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- The native library is copied to the output by the Aster project reference

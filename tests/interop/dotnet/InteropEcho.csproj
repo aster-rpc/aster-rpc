@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The .NET leg of tests/interop/run.py. Build:
+         dotnet build -c Release tests/interop/dotnet -p:NativeLibraryPath=<dir of libaster_transport_ffi>
+       Run: dotnet tests/interop/dotnet/bin/Release/net9.0/InteropEcho.dll contract | server | client <ticket> -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../../bindings/dotnet/src/Aster/Aster.csproj" />
+  </ItemGroup>
+
+</Project>

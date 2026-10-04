@@ -43,26 +43,29 @@ public static class ContractIdentity
         byte[] typeNameBytes = Encoding.UTF8.GetBytes(typeName);
         byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
         int bufSize = 4096;
-        byte[] outBuf = new byte[bufSize];
-
-        fixed (byte* typeNamePtr = typeNameBytes)
-        fixed (byte* jsonPtr = jsonBytes)
-        fixed (byte* outPtr = outBuf)
+        while (true)
         {
+            byte[] outBuf = new byte[bufSize];
             UIntPtr outLen = (UIntPtr)bufSize;
-            int status = Native.aster_canonical_bytes(
-                typeNamePtr, (UIntPtr)typeNameBytes.Length,
-                jsonPtr, (UIntPtr)jsonBytes.Length,
-                outPtr, &outLen);
-
+            int status;
+            fixed (byte* typeNamePtr = typeNameBytes)
+            fixed (byte* jsonPtr = jsonBytes)
+            fixed (byte* outPtr = outBuf)
+            {
+                status = Native.aster_canonical_bytes(
+                    typeNamePtr, (UIntPtr)typeNameBytes.Length,
+                    jsonPtr, (UIntPtr)jsonBytes.Length,
+                    outPtr, &outLen);
+            }
+            if (status == (int)Status.BufferTooSmall && (int)(ulong)outLen > bufSize)
+            {
+                bufSize = (int)(ulong)outLen;
+                continue;
+            }
             if (status != 0)
                 throw new InvalidOperationException(
-                    $"aster_canonical_bytes failed with status {status}.");
-
-            int written = (int)(ulong)outLen;
-            byte[] result = new byte[written];
-            Array.Copy(outBuf, result, written);
-            return result;
+                    $"aster_canonical_bytes failed with status {status}: {IrohException.LastErrorMessage()}");
+            return outBuf.AsSpan(0, (int)(ulong)outLen).ToArray();
         }
     }
 }

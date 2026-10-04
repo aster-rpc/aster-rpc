@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace Aster;
 
-public sealed class Doc : IDisposable
+public sealed partial class Doc : IDisposable
 {
     private readonly Runtime _runtime;
     private readonly ulong _handle;
@@ -96,7 +96,7 @@ public sealed class Doc : IDisposable
     }
 }
 
-public sealed class Docs
+public sealed partial class Docs
 {
     private readonly Runtime _runtime;
     private readonly ulong _nodeHandle;
