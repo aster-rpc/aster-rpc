@@ -28,6 +28,26 @@
 //! ```
 //!
 //! See the full guide in `docs/aster-expose-getstarted.md`.
+//!
+//! ## From a language binding
+//!
+//! Everything a binding needs is reachable with concrete types — no generic
+//! parameter has to be chosen by foreign code:
+//!
+//! - **Socket targets**: [`Expose::expose_socket`] takes a plain
+//!   [`SocketAddr`]; the binding's own HTTP server (or any TCP service) runs
+//!   in its language and Aster splices raw bytes to it.
+//! - **Foreign HTTP handlers and policies** (feature `binding-support`):
+//!   `binding_support::upcall::expose` supplies the [`AuthorizeFn`]
+//!   (`foreign_authorize_fn`), the [`RoutePolicy`] for [`Expose::serve_routes`]
+//!   (`foreign_route_policy`) and an [`HttpHandler`] (`ForeignHttpHandler`)
+//!   answered by upcall, with bodies streamed through `HttpBodies` handles.
+//! - **Consumer side**: [`relay_request`] is buffered and non-generic
+//!   (`http::Request<Vec<u8>>` in, `http::Response<Vec<u8>>` out). To stream,
+//!   call [`relay_request_streaming`] with a [`ChannelBody`] from
+//!   [`body_channel`] (the binding pushes upload chunks into the
+//!   [`BodySender`]) and pull the response's [`RelayBody`] with
+//!   `http_body_util::BodyExt::frame`.
 
 use std::net::SocketAddr;
 
@@ -37,7 +57,9 @@ use crate::error::Result;
 use crate::net::Connection;
 
 // Re-exports so consumers needn't depend on `aster-expose` (or `http`) directly.
-pub use aster_expose::body::{RelayBody, RelayError, ResponseBody};
+pub use aster_expose::body::{
+    body_channel, BodyClosed, BodySender, ChannelBody, RelayBody, RelayError, ResponseBody,
+};
 use aster_expose::control::request_route as core_request_route;
 pub use aster_expose::control::{
     EdgeRouter, RoutePolicy, RouteProtocol, RouteRegistration, RouteSpec,
@@ -51,6 +73,8 @@ pub use aster_transport_core::stream_io::BoxFut;
 /// The verified peer identity + attached metadata handed to an [`AuthorizeFn`]
 /// / [`RoutePolicy`]. Re-exported from the transport core.
 pub use aster_transport_core::tunnel::PeerContext;
+/// Re-exported for [`BodySender`] chunks.
+pub use bytes;
 /// Re-exported so consumers can build requests/responses without adding `http`.
 pub use http;
 
