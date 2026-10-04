@@ -42,9 +42,10 @@ const KIND_RESIZE: i32 = 1;
 #[aster(wire = "shell/ShellIn")]
 struct ShellIn {
     kind: i32,
+    #[fory(bytes)]
     data: Vec<u8>, // Data: the bytes
-    rows: i32,     // Resize: new height
-    cols: i32,     // Resize: new width
+    rows: i32, // Resize: new height
+    cols: i32, // Resize: new width
 }
 
 impl ShellIn {
@@ -69,8 +70,9 @@ impl ShellIn {
 #[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "shell/ShellOut")]
 struct ShellOut {
+    #[fory(bytes)]
     data: Vec<u8>, // terminal output (stdout+stderr, merged by the tty)
-    eof: bool,     // the child exited; `exit_code` is now meaningful
+    eof: bool, // the child exited; `exit_code` is now meaningful
     exit_code: i32,
 }
 

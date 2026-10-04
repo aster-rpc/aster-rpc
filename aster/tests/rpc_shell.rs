@@ -26,6 +26,7 @@ const KIND_RESIZE: i32 = 1;
 #[aster(wire = "shell/ShellIn")]
 struct ShellIn {
     kind: i32,
+    #[fory(bytes)]
     data: Vec<u8>,
     rows: i32,
     cols: i32,
@@ -53,6 +54,7 @@ impl ShellIn {
 #[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "shell/ShellOut")]
 struct ShellOut {
+    #[fory(bytes)]
     data: Vec<u8>,
     eof: bool,
     exit_code: i32,

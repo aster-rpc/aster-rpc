@@ -77,6 +77,7 @@ fn echo_service_contract_id_matches_python_golden() {
 #[allow(dead_code)]
 struct Shapes {
     tags: Vec<String>,
+    #[fory(bytes)]
     blob: Vec<u8>,
     maybe: Option<String>,
     nested: EchoRequest,

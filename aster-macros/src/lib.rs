@@ -15,6 +15,14 @@
 //!   `f64`.
 //! - `#[aster(default)]` (field, bare): an empty-container default (`list`/`set`/
 //!   `map`) — `required = false`, `default_value` = the `0x00` sentinel.
+//! - `#[aster(uint8_list)]` (field): keep a `Vec<u8>` / `VecDeque<u8>` as a Fory
+//!   list and publish it as `list<uint8>` instead of `binary`.
+//!
+//! Byte fields: a byte buffer is published as `binary` (Python `bytes`, TS
+//! `Uint8Array`), so its Fory encoding must be BINARY too. `[u8; N]` already is;
+//! a `Vec<u8>` is only with `#[fory(bytes)]` (`list(element(bytes))` /
+//! `map(key(bytes))` / `map(value(bytes))` when nested). An unannotated
+//! `Vec<u8>` is a compile error — the derive cannot add the attribute itself.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -65,7 +73,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let mut register_children: Vec<TokenStream2> = Vec::new();
     for f in fields {
         let fname = f.ident.as_ref().unwrap().to_string();
-        let info = analyze_type(&f.ty)?;
+        let info = analyze_field(f)?;
         let default_expr = parse_default(&f.attrs, &info)?;
         let leaf = &info.leaf_expr;
         let key = match &info.key_expr {
@@ -328,42 +336,302 @@ struct FieldInfo {
     default_ty: Option<Type>,
 }
 
-/// Analyze a field type into (optional, container, leaf, key). `Option<T>` sets
-/// optional; `Vec<u8>` is `binary`; `Vec`/`VecDeque`/sets/maps become containers;
-/// everything else resolves its leaf via the `WireField` impl.
-fn analyze_type(ty: &Type) -> syn::Result<FieldInfo> {
+// ── Byte fields: keep the contract and the Fory wire in agreement ─────────────
+//
+// The contract publishes a byte buffer as `binary`, which is what Python
+// `bytes` and TypeScript `Uint8Array` put on the wire (Fory BINARY). Fory's
+// Rust derive, however, writes an *unannotated* `Vec<u8>` as LIST<UINT8>; only
+// `#[fory(bytes)]` makes it BINARY. A derive macro cannot add attributes to the
+// struct it is applied to, so `AsterType` cannot switch the encoding on by
+// itself. Instead it reads the field's `#[fory(...)]` config (the same
+// attributes `ForyStruct` reads) and refuses to compile when the published
+// contract type and the Fory encoding would disagree.
+
+/// The subset of a field's `#[fory(...)]` config that decides how byte buffers
+/// are encoded: `bytes` / `array` at this value node, plus the nested
+/// `list(element(...))` and `map(key(...), value(...))` nodes. Everything else
+/// (`id`, `nullable`, `encoding`, …) is irrelevant here and skipped.
+#[derive(Default, Debug)]
+struct ForyNode {
+    bytes: bool,
+    array: bool,
+    element: Option<Box<ForyNode>>,
+    key: Option<Box<ForyNode>>,
+    value: Option<Box<ForyNode>>,
+}
+
+impl ForyNode {
+    /// Merge every `#[fory(...)]` attribute on a field into one node.
+    fn from_attrs(attrs: &[syn::Attribute]) -> syn::Result<Self> {
+        let mut node = ForyNode::default();
+        for attr in attrs {
+            if attr.path().is_ident("fory") {
+                attr.parse_nested_meta(|meta| node.parse_item(meta))?;
+            }
+        }
+        Ok(node)
+    }
+
+    fn parse_item(&mut self, meta: syn::meta::ParseNestedMeta) -> syn::Result<()> {
+        let child = |slot: &mut Option<Box<ForyNode>>, m: syn::meta::ParseNestedMeta| {
+            let node = slot.get_or_insert_with(Default::default);
+            m.parse_nested_meta(|c| node.parse_item(c))
+        };
+        if meta.path.is_ident("bytes") {
+            self.bytes = true;
+        } else if meta.path.is_ident("array") {
+            self.array = true;
+        } else if meta.path.is_ident("list") {
+            meta.parse_nested_meta(|m| {
+                if m.path.is_ident("element") {
+                    child(&mut self.element, m)
+                } else {
+                    skip_meta(&m)
+                }
+            })?;
+        } else if meta.path.is_ident("map") {
+            meta.parse_nested_meta(|m| {
+                if m.path.is_ident("key") {
+                    child(&mut self.key, m)
+                } else if m.path.is_ident("value") {
+                    child(&mut self.value, m)
+                } else {
+                    skip_meta(&m)
+                }
+            })?;
+        } else {
+            skip_meta(&meta)?;
+        }
+        Ok(())
+    }
+
+    fn element(&self) -> Option<&ForyNode> {
+        self.element.as_deref()
+    }
+    fn key(&self) -> Option<&ForyNode> {
+        self.key.as_deref()
+    }
+    fn value(&self) -> Option<&ForyNode> {
+        self.value.as_deref()
+    }
+}
+
+/// Consume a `#[fory(...)]` item this derive does not interpret
+/// (`id = 3`, `nullable`, `tuple(...)`, `with = path`, …). `ForyStruct`
+/// validates them; here they only need to be stepped over.
+fn skip_meta(meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
+    if meta.input.peek(Token![=]) {
+        let _: Expr = meta.value()?.parse()?;
+    } else if meta.input.peek(syn::token::Paren) {
+        let content;
+        syn::parenthesized!(content in meta.input);
+        let _: TokenStream2 = content.parse()?;
+    }
+    Ok(())
+}
+
+/// Whether the field carries `#[aster(uint8_list)]` — the explicit opt-out
+/// that keeps a `Vec<u8>` as a Fory LIST<UINT8> and publishes it as
+/// `list<uint8>` instead of `binary`.
+fn has_uint8_list_attr(attrs: &[syn::Attribute]) -> syn::Result<bool> {
+    let mut found = false;
+    for attr in attrs {
+        if !attr.path().is_ident("aster") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("uint8_list") {
+                found = true;
+            } else {
+                // `default` etc. are parsed by `parse_default`.
+                skip_meta(&meta)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(found)
+}
+
+/// The Rust byte-buffer shapes a contract `binary` could map to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteShape {
+    /// `Vec<u8>`: BINARY only under `#[fory(bytes)]`, LIST<UINT8> otherwise.
+    Vec,
+    /// `VecDeque<u8>`: Fory can only write it as LIST<UINT8>.
+    VecDeque,
+    /// `[u8; N]`: Fory writes a fixed `u8` array as BINARY (exactly N bytes
+    /// on decode).
+    Array,
+}
+
+fn byte_shape(ty: &Type) -> Option<ByteShape> {
+    match ty {
+        Type::Array(a) if is_u8(&a.elem) => Some(ByteShape::Array),
+        Type::Paren(p) => byte_shape(&p.elem),
+        Type::Group(g) => byte_shape(&g.elem),
+        _ => match path_segment(ty) {
+            Some((id, args)) if args.len() == 1 && is_u8(&args[0]) => match id.as_str() {
+                "Vec" => Some(ByteShape::Vec),
+                "VecDeque" => Some(ByteShape::VecDeque),
+                _ => None,
+            },
+            _ => None,
+        },
+    }
+}
+
+/// Where a byte buffer sits in the field type, for the error message's
+/// suggested attribute.
+#[derive(Clone, Copy)]
+enum BytePos {
+    Field,
+    ListElement,
+    MapKey,
+    MapValue,
+}
+
+impl BytePos {
+    fn fory_attr(self) -> &'static str {
+        match self {
+            BytePos::Field => "#[fory(bytes)]",
+            BytePos::ListElement => "#[fory(list(element(bytes)))]",
+            BytePos::MapKey => "#[fory(map(key(bytes)))]",
+            BytePos::MapValue => "#[fory(map(value(bytes)))]",
+        }
+    }
+}
+
+/// The contract leaf for a byte buffer at `pos`, or a compile error when the
+/// Fory encoding selected by `node` would not be BINARY.
+fn binary_leaf(
+    ty: &Type,
+    shape: ByteShape,
+    node: Option<&ForyNode>,
+    pos: BytePos,
+) -> syn::Result<TokenStream2> {
+    let binary = quote!(::aster::rpc::Leaf::primitive("binary"));
+    let bytes = node.is_some_and(|n| n.bytes);
+    let array = node.is_some_and(|n| n.array);
+    match shape {
+        ByteShape::Array => Ok(binary),
+        ByteShape::Vec if bytes => Ok(binary),
+        ByteShape::Vec if array => Err(syn::Error::new_spanned(
+            ty,
+            "`#[fory(array)]` encodes `Vec<u8>` as a Fory UINT8_ARRAY, which has no Aster \
+             contract type. Use `#[fory(bytes)]` to publish it as `binary`",
+        )),
+        ByteShape::Vec => {
+            let opt_out = match pos {
+                BytePos::Field => {
+                    ", or `#[aster(uint8_list)]` to keep it a list and publish it as `list<uint8>`"
+                }
+                _ => "",
+            };
+            Err(syn::Error::new_spanned(
+                ty,
+                format!(
+                    "`Vec<u8>` is published in the Aster contract as `binary` (Python `bytes`, \
+                     TypeScript `Uint8Array`), but Fory serializes an unannotated `Vec<u8>` as \
+                     list<uint8>, so the wire would not match the contract. Add `{}` to encode \
+                     it as Fory binary{opt_out}",
+                    pos.fory_attr()
+                ),
+            ))
+        }
+        ByteShape::VecDeque => Err(syn::Error::new_spanned(
+            ty,
+            match pos {
+                BytePos::Field => {
+                    "Fory can only encode `VecDeque<u8>` as list<uint8>, never as `binary`. Use \
+                     `Vec<u8>` with `#[fory(bytes)]`, or mark the field `#[aster(uint8_list)]` \
+                     to publish it as `list<uint8>`"
+                }
+                _ => {
+                    "Fory can only encode `VecDeque<u8>` as list<uint8>, never as `binary`; \
+                     use `Vec<u8>` with the matching `#[fory(...(bytes))]` config"
+                }
+            },
+        )),
+    }
+}
+
+/// The contract leaf for a container's element / key / value type.
+fn child_leaf(ty: &Type, node: Option<&ForyNode>, pos: BytePos) -> syn::Result<TokenStream2> {
+    match byte_shape(ty) {
+        Some(shape) => binary_leaf(ty, shape, node, pos),
+        None => Ok(leaf_of(ty)),
+    }
+}
+
+/// Analyze a field into (optional, container, leaf, key). `Option<T>` sets
+/// optional; a byte buffer (`Vec<u8>` + `#[fory(bytes)]`, `[u8; N]`) is
+/// `binary`; `Vec`/`VecDeque`/sets/maps become containers; everything else
+/// resolves its leaf via the `WireField` impl.
+fn analyze_field(f: &syn::Field) -> syn::Result<FieldInfo> {
+    let fory = ForyNode::from_attrs(&f.attrs)?;
+    let uint8_list = has_uint8_list_attr(&f.attrs)?;
+    analyze_type(&f.ty, &fory, uint8_list)
+}
+
+fn analyze_type(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<FieldInfo> {
     if let Some((ident, args)) = path_segment(ty) {
         if ident == "Option" {
             if let Some(inner) = args.first() {
-                let mut info = analyze_inner(inner)?;
+                // `Option` is transparent to Fory's field config: the
+                // attributes apply to the inner type.
+                let mut info = analyze_inner(inner, fory, uint8_list)?;
                 info.optional = true;
                 return Ok(info);
             }
         }
     }
-    analyze_inner(ty)
+    analyze_inner(ty, fory, uint8_list)
 }
 
-fn analyze_inner(ty: &Type) -> syn::Result<FieldInfo> {
+fn analyze_inner(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<FieldInfo> {
+    let shape = byte_shape(ty);
+    if uint8_list {
+        return match shape {
+            Some(ByteShape::Vec | ByteShape::VecDeque) if !fory.bytes && !fory.array => {
+                Ok(FieldInfo {
+                    optional: false,
+                    container: 1,
+                    leaf_expr: quote!(::aster::rpc::Leaf::primitive("uint8")),
+                    key_expr: None,
+                    default_ty: None,
+                })
+            }
+            Some(ByteShape::Vec | ByteShape::VecDeque) => Err(syn::Error::new_spanned(
+                ty,
+                "`#[aster(uint8_list)]` publishes the field as `list<uint8>`, which contradicts \
+                 `#[fory(bytes)]` / `#[fory(array)]`; keep exactly one",
+            )),
+            _ => Err(syn::Error::new_spanned(
+                ty,
+                "`#[aster(uint8_list)]` applies only to a `Vec<u8>` / `VecDeque<u8>` field \
+                 (optionally wrapped in `Option`)",
+            )),
+        };
+    }
+    if let Some(shape) = shape {
+        return Ok(FieldInfo {
+            optional: false,
+            container: 0,
+            leaf_expr: binary_leaf(ty, shape, Some(fory), BytePos::Field)?,
+            key_expr: None,
+            default_ty: None,
+        });
+    }
     if let Some((ident, args)) = path_segment(ty) {
         match ident.as_str() {
             "Vec" | "VecDeque" => {
                 let elem = args.first().ok_or_else(|| {
                     syn::Error::new_spanned(ty, "Vec/VecDeque needs an element type")
                 })?;
-                if is_u8(elem) {
-                    return Ok(FieldInfo {
-                        optional: false,
-                        container: 0,
-                        leaf_expr: quote!(::aster::rpc::Leaf::primitive("binary")),
-                        key_expr: None,
-                        default_ty: None,
-                    });
-                }
                 return Ok(FieldInfo {
                     optional: false,
                     container: 1,
-                    leaf_expr: leaf_of(elem),
+                    leaf_expr: child_leaf(elem, fory.element(), BytePos::ListElement)?,
                     key_expr: None,
                     default_ty: None,
                 });
@@ -375,7 +643,7 @@ fn analyze_inner(ty: &Type) -> syn::Result<FieldInfo> {
                 return Ok(FieldInfo {
                     optional: false,
                     container: 2,
-                    leaf_expr: leaf_of(elem),
+                    leaf_expr: child_leaf(elem, fory.element(), BytePos::ListElement)?,
                     key_expr: None,
                     default_ty: None,
                 });
@@ -390,8 +658,8 @@ fn analyze_inner(ty: &Type) -> syn::Result<FieldInfo> {
                 return Ok(FieldInfo {
                     optional: false,
                     container: 3,
-                    leaf_expr: leaf_of(val),
-                    key_expr: Some(leaf_of(key)),
+                    leaf_expr: child_leaf(val, fory.value(), BytePos::MapValue)?,
+                    key_expr: Some(child_leaf(key, fory.key(), BytePos::MapKey)?),
                     default_ty: None,
                 });
             }
@@ -416,22 +684,22 @@ fn leaf_of(ty: &Type) -> TokenStream2 {
 /// The types a field contributes to transitive Fory registration — i.e. the
 /// types we recurse into via `WireField::register_payload`. Mirrors
 /// `analyze_type`'s container unwrapping: `Option<T>` unwraps to `T`'s children;
-/// `Vec<u8>` is binary (none); `Vec`/`VecDeque`/sets yield the element; maps
-/// yield key + value; everything else is the field type itself. Scalars resolve
-/// to the `WireField` no-op, so listing them is harmless.
+/// byte buffers are binary (none); `Vec`/`VecDeque`/sets yield the element;
+/// maps yield key + value; everything else is the field type itself. Scalars
+/// resolve to the `WireField` no-op, so listing them is harmless.
 fn child_types(ty: &Type) -> Vec<Type> {
+    if byte_shape(ty).is_some() {
+        return Vec::new();
+    }
+    let not_bytes = |t: &Type| byte_shape(t).is_none();
     if let Some((ident, args)) = path_segment(ty) {
         match ident.as_str() {
             "Option" => return args.first().map(child_types).unwrap_or_default(),
             "Vec" | "VecDeque" | "HashSet" | "BTreeSet" => {
-                return match args.first() {
-                    Some(elem) if is_u8(elem) => Vec::new(),
-                    Some(elem) => vec![elem.clone()],
-                    None => Vec::new(),
-                };
+                return args.into_iter().take(1).filter(not_bytes).collect();
             }
             "HashMap" | "BTreeMap" => {
-                return args.into_iter().take(2).collect();
+                return args.into_iter().take(2).filter(not_bytes).collect();
             }
             _ => {}
         }
@@ -1331,7 +1599,132 @@ fn client_method(
 
 #[cfg(test)]
 mod tests {
-    use super::is_reserved_namespace;
+    use super::{analyze_field, child_types, is_reserved_namespace, FieldInfo};
+    use syn::parse::Parser;
+
+    /// Analyze one named field written as source, e.g.
+    /// `#[fory(bytes)] data: Vec<u8>`.
+    fn field(src: &str) -> syn::Result<FieldInfo> {
+        let f = syn::Field::parse_named
+            .parse_str(src)
+            .expect("test field must parse");
+        analyze_field(&f)
+    }
+
+    fn leaf(info: &FieldInfo) -> String {
+        info.leaf_expr.to_string()
+    }
+
+    fn err(src: &str) -> String {
+        match field(src) {
+            Ok(_) => panic!("`{src}` should be rejected"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn unannotated_vec_u8_is_a_compile_error_naming_the_fix() {
+        let msg = err("data: Vec<u8>");
+        assert!(msg.contains("#[fory(bytes)]"), "{msg}");
+        assert!(msg.contains("#[aster(uint8_list)]"), "{msg}");
+        // `Option` is transparent: the same rule applies to the inner type.
+        let msg = err("data: Option<Vec<u8>>");
+        assert!(msg.contains("#[fory(bytes)]"), "{msg}");
+        // Fully qualified paths are recognised too.
+        err("data: ::std::vec::Vec<u8>");
+    }
+
+    #[test]
+    fn fory_bytes_vec_u8_is_binary() {
+        for src in [
+            "#[fory(bytes)] data: Vec<u8>",
+            "#[fory(id = 3, bytes)] data: Vec<u8>",
+            "#[fory(id = 3)] #[fory(bytes)] data: Vec<u8>",
+            "#[fory(nullable, bytes)] data: Option<Vec<u8>>",
+        ] {
+            let info = field(src).unwrap();
+            assert_eq!(info.container, 0, "{src}");
+            assert!(leaf(&info).contains("\"binary\""), "{src}");
+            assert!(info.default_ty.is_none(), "{src}");
+        }
+        assert!(
+            field("#[fory(bytes)] data: Option<Vec<u8>>")
+                .unwrap()
+                .optional
+        );
+    }
+
+    #[test]
+    fn fixed_u8_array_is_binary_without_attributes() {
+        // Fory writes `[u8; N]` as BINARY already.
+        let info = field("digest: [u8; 32]").unwrap();
+        assert_eq!(info.container, 0);
+        assert!(leaf(&info).contains("\"binary\""));
+        assert!(child_types(&syn::parse_quote!([u8; 32])).is_empty());
+    }
+
+    #[test]
+    fn uint8_list_opt_out_publishes_list_of_uint8() {
+        for src in [
+            "#[aster(uint8_list)] data: Vec<u8>",
+            "#[aster(uint8_list)] data: VecDeque<u8>",
+            "#[aster(uint8_list)] data: Option<Vec<u8>>",
+        ] {
+            let info = field(src).unwrap();
+            assert_eq!(info.container, 1, "{src}");
+            assert!(leaf(&info).contains("\"uint8\""), "{src}");
+        }
+        assert!(err("#[aster(uint8_list)] #[fory(bytes)] data: Vec<u8>").contains("contradicts"));
+        assert!(err("#[aster(uint8_list)] data: String").contains("applies only"));
+    }
+
+    #[test]
+    fn list_and_map_of_bytes_need_the_nested_fory_config() {
+        let info = field("#[fory(list(element(bytes)))] chunks: Vec<Vec<u8>>").unwrap();
+        assert_eq!(info.container, 1);
+        assert!(leaf(&info).contains("\"binary\""));
+        let msg = err("chunks: Vec<Vec<u8>>");
+        assert!(msg.contains("#[fory(list(element(bytes)))]"), "{msg}");
+        // The opt-out is a top-level field attribute only; nested lists of
+        // lists have no contract shape.
+        assert!(!msg.contains("uint8_list"), "{msg}");
+
+        let info = field("#[fory(map(value(bytes)))] blobs: HashMap<String, Vec<u8>>").unwrap();
+        assert_eq!(info.container, 3);
+        assert!(leaf(&info).contains("\"binary\""));
+        let msg = err("blobs: BTreeMap<String, Vec<u8>>");
+        assert!(msg.contains("#[fory(map(value(bytes)))]"), "{msg}");
+        let msg = err("#[fory(map(value(bytes)))] blobs: HashMap<Vec<u8>, Vec<u8>>");
+        assert!(msg.contains("#[fory(map(key(bytes)))]"), "{msg}");
+
+        let info = field("hashes: Vec<[u8; 32]>").unwrap();
+        assert!(leaf(&info).contains("\"binary\""));
+
+        // Byte buffers never reach `WireField::register_payload`.
+        assert!(child_types(&syn::parse_quote!(Vec<Vec<u8>>)).is_empty());
+        assert_eq!(
+            child_types(&syn::parse_quote!(HashMap<String, Vec<u8>>)).len(),
+            1,
+            "only the String key"
+        );
+    }
+
+    #[test]
+    fn non_binary_byte_encodings_are_rejected() {
+        assert!(err("#[fory(array)] data: Vec<u8>").contains("UINT8_ARRAY"));
+        assert!(err("data: VecDeque<u8>").contains("VecDeque<u8>"));
+    }
+
+    #[test]
+    fn unrelated_fory_and_aster_keys_are_skipped() {
+        let info = field(
+            "#[fory(id = 7, nullable = false, encoding = varint, with = my::Codec)] \
+             #[aster(default = 3)] n: i32",
+        )
+        .unwrap();
+        assert!(info.default_ty.is_some());
+        field("#[fory(tuple(element(index = 0, encoding = fixed)))] t: Vec<String>").unwrap();
+    }
 
     #[test]
     fn reserved_namespace_matches_exact_and_prefixed() {

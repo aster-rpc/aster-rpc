@@ -40,6 +40,7 @@ struct Settings {
     #[aster(default)]
     attrs: BTreeMap<String, String>,
     /// binary fields cannot carry a default in v1 → required
+    #[fory(bytes)]
     blob: Vec<u8>,
 }
 

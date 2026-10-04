@@ -30,9 +30,10 @@ use fory_derive::ForyStruct;
 pub struct EchoRequest {
     pub message: String,
     pub count: i32,
-    // `#[fory(bytes)]` is REQUIRED for interop: without it fory-derive 1.7.6
-    // writes `Vec<u8>` as LIST<UINT8> (type 22) while `AsterType` advertises
-    // `binary` and Python `bytes` / TS `Uint8Array` write BINARY (type 41).
+    // `#[fory(bytes)]` makes fory-derive write BINARY (type 41), matching the
+    // contract's `binary` and Python `bytes` / TS `Uint8Array`. Without it
+    // Fory writes LIST<UINT8> (type 22), so `#[derive(AsterType)]` rejects an
+    // unannotated `Vec<u8>` at compile time.
     #[fory(bytes)]
     pub data: Vec<u8>,
 }

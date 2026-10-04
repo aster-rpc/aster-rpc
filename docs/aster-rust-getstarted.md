@@ -373,8 +373,43 @@ struct EchoResponse { reply: String }
 ```
 
 Field-type mapping: `String`→string, `bool`, `i8/i16/i32/i64`, `u16/u32/u64`,
-`f32/f64`, `Vec<u8>`→binary, `Vec<T>`/`HashSet<T>`→list/set, `HashMap<K,V>`→map,
-`Option<T>`→nullable, and a nested `AsterType` struct → a typed reference.
+`f32/f64`, `Vec<u8>`→binary (needs `#[fory(bytes)]`, see below),
+`Vec<T>`/`HashSet<T>`→list/set, `HashMap<K,V>`→map, `Option<T>`→nullable, and a
+nested `AsterType` struct → a typed reference.
+
+**Byte fields.** A byte buffer is published as `binary`, the type Python
+`bytes` and TypeScript `Uint8Array` use. Fory's Rust derive only writes a
+`Vec<u8>` as binary when the field carries `#[fory(bytes)]`; without it, the
+field goes on the wire as a list of `u8` that other bindings cannot read as
+bytes. `AsterType` therefore refuses to compile an unannotated `Vec<u8>`, so
+the contract and the wire cannot disagree:
+
+```rust
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "files/Chunk")]
+struct Chunk {
+    #[fory(bytes)]
+    data: Vec<u8>,                  // binary
+    #[fory(bytes)]
+    checksum: Option<Vec<u8>>,      // nullable binary (`Option` is transparent)
+    digest: [u8; 32],               // binary; Fory writes `[u8; N]` as binary already
+    #[fory(list(element(bytes)))]
+    parts: Vec<Vec<u8>>,            // list<binary>
+    #[fory(map(value(bytes)))]
+    blobs: HashMap<String, Vec<u8>>, // map<string, binary>
+    #[aster(uint8_list)]
+    levels: Vec<u8>,                // list<uint8>: an explicit opt-out
+}
+```
+
+- `#[aster(uint8_list)]` is the opt-out for a `Vec<u8>` (or `VecDeque<u8>`)
+  that really is a list of small integers. The field stays a Fory list and is
+  published as `list<uint8>`, not `binary`.
+- A `[u8; N]` field decodes only a payload of exactly N bytes. If a peer may
+  send any length, use `#[fory(bytes)] Vec<u8>` and check the length yourself.
+- `VecDeque<u8>` and `#[fory(array)] Vec<u8>` cannot be binary, so they are
+  rejected unless the field is marked `#[aster(uint8_list)]`. Fory 1.7 has no
+  `bytes::Bytes` support, so `Bytes` cannot be a field type.
 
 Nested payload types — a struct field of another payload type, `Vec<Segment>`,
 `Option<Foo>`, `HashMap<String, Bar>`, and so on at any depth — are registered
