@@ -608,16 +608,18 @@ impl GroupFixture {
     ) -> crate::coordination::host::CoordinationConfig {
         use crate::coordination::host::{CoordinationConfig, CoordinationStart};
 
-        self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
-            CoordinationStart::Join {
-                signed_join_permit: self.join_permit_for_senders(
-                    candidate_secret,
-                    candidate_ticket,
-                    senders,
-                ),
-                expected_deployment_profile_code: self.profile(),
-            },
-        ))
+        self.finish(
+            CoordinationConfig::builder()
+                .storage_dir(owner_only(dir))
+                .start_mode(CoordinationStart::Join {
+                    signed_join_permit: self.join_permit_for_senders(
+                        candidate_secret,
+                        candidate_ticket,
+                        senders,
+                    ),
+                    expected_deployment_profile_code: self.profile(),
+                }),
+        )
     }
 
     /// Bind a storage directory and stop, **without** initializing Raft.
@@ -818,12 +820,14 @@ impl GroupFixture {
     ) -> crate::coordination::host::CoordinationConfig {
         use crate::coordination::host::{CoordinationConfig, CoordinationStart};
 
-        self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
-            CoordinationStart::Bootstrap {
-                signed_genesis: self.signed_genesis(),
-                recovery_export_path: None,
-            },
-        ))
+        self.finish(
+            CoordinationConfig::builder()
+                .storage_dir(owner_only(dir))
+                .start_mode(CoordinationStart::Bootstrap {
+                    signed_genesis: self.signed_genesis(),
+                    recovery_export_path: None,
+                }),
+        )
     }
 
     /// A **recovery bootstrap** configuration for voter `index` in `dir`,
@@ -844,12 +848,14 @@ impl GroupFixture {
             self.recovery.is_some(),
             "recovery_config needs a fixture built with recovering()"
         );
-        self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
-            CoordinationStart::Bootstrap {
-                signed_genesis: self.signed_genesis(),
-                recovery_export_path: Some(export.to_path_buf()),
-            },
-        ))
+        self.finish(
+            CoordinationConfig::builder()
+                .storage_dir(owner_only(dir))
+                .start_mode(CoordinationStart::Bootstrap {
+                    signed_genesis: self.signed_genesis(),
+                    recovery_export_path: Some(export.to_path_buf()),
+                }),
+        )
     }
 
     /// An **existing**-store configuration for a directory a previous start
@@ -863,18 +869,20 @@ impl GroupFixture {
     ) -> crate::coordination::host::CoordinationConfig {
         use crate::coordination::host::{CoordinationConfig, CoordinationStart};
 
-        self.finish(CoordinationConfig::builder().storage_dir(dir).start_mode(
-            CoordinationStart::Existing {
-                // The same document. A restart may still have to *propose* it:
-                // a voter that crashed between `Raft::initialize` and the
-                // genesis entry comes back with no administrators and nothing
-                // able to appoint one.
-                signed_genesis: self.signed_genesis(),
-                expected_group_id: self.group_id(),
-                expected_genesis_hash: self.genesis_hash(),
-                expected_deployment_profile_code: self.profile(),
-            },
-        ))
+        self.finish(
+            CoordinationConfig::builder()
+                .storage_dir(owner_only(dir))
+                .start_mode(CoordinationStart::Existing {
+                    // The same document. A restart may still have to *propose* it:
+                    // a voter that crashed between `Raft::initialize` and the
+                    // genesis entry comes back with no administrators and nothing
+                    // able to appoint one.
+                    signed_genesis: self.signed_genesis(),
+                    expected_group_id: self.group_id(),
+                    expected_genesis_hash: self.genesis_hash(),
+                    expected_deployment_profile_code: self.profile(),
+                }),
+        )
     }
 
     fn finish(
@@ -893,6 +901,23 @@ impl GroupFixture {
             .build()
             .expect("a complete fixture configuration")
     }
+}
+
+/// Tighten an existing fixture directory to owner-only.
+///
+/// Production refuses a storage directory that grants write access beyond its
+/// owner. A test's temp directory inherits the process umask, which is 000 in
+/// some CI containers, so the fixture fixes the mode the test asked for rather
+/// than relaxing the production check. A missing directory is left for the
+/// store to create (0700).
+fn owner_only(dir: &std::path::Path) -> &std::path::Path {
+    #[cfg(unix)]
+    if dir.is_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .expect("the fixture can tighten its own temp directory");
+    }
+    dir
 }
 
 /// A 16-byte id from a short label.
