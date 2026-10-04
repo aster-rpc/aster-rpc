@@ -30,6 +30,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
@@ -725,6 +726,46 @@ pub type FrameLimitResolver = std::sync::Arc<dyn Fn(&[u8]) -> FrameLimit + Send 
 /// How many frames may sit between the reader and the dispatch loop.
 pub const FRAME_CHANNEL_DEPTH: usize = 8;
 
+/// How long call N+1's header may wait for call N's writer task to finish
+/// before it is rejected as arriving mid-call.
+///
+/// The writer hands the trailer to QUIC inside `write_all`, and the connection
+/// driver (another task, often another thread) can put it on the wire before
+/// the writer task's poll returns. So a client can read N's trailer, reuse the
+/// stream, and get N+1's header back here while `writer.is_finished()` is
+/// still false. Rejecting on that alone reset legal pooled calls with
+/// `PROTOCOL_VIOLATION` about once in two million under load. A writer that
+/// has written its terminal frame finishes within microseconds; one that is
+/// blocked on flow control does not finish in this window, and that peer is
+/// still rejected, only this much later.
+const EARLY_HEADER_GRACE: Duration = Duration::from_secs(1);
+
+/// Test-only fault injection (feature `test-hooks`). Never on in a shipping
+/// build; the tests that need it enable it explicitly.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static WRITER_EXIT_PAUSE_US: AtomicU64 = AtomicU64::new(0);
+
+    /// Hold the response writer task for `pause` right after it has written a
+    /// call's terminal frame, before it completes. That is a descheduled
+    /// writer made deterministic: the trailer is on its way (the task yields,
+    /// so the connection driver sends it), the peer can start its next call on
+    /// the stream, and the task is still unfinished. Process-global.
+    pub fn set_writer_exit_pause(pause: Duration) {
+        WRITER_EXIT_PAUSE_US.store(pause.as_micros() as u64, Ordering::SeqCst);
+    }
+
+    pub(super) async fn writer_exit_pause() {
+        let us = WRITER_EXIT_PAUSE_US.load(Ordering::SeqCst);
+        if us > 0 {
+            tokio::time::sleep(Duration::from_micros(us)).await;
+        }
+    }
+}
+
 /// Physical response queue depth. The strict item and byte semaphores include
 /// the writer's in-flight item; this mpsc capacity is only the transport for
 /// those already-accounted items.
@@ -1125,6 +1166,8 @@ async fn dispatch_one_call(
                 return false;
             }
             if terminal {
+                #[cfg(feature = "test-hooks")]
+                test_hooks::writer_exit_pause().await;
                 return true;
             }
         }
@@ -1221,6 +1264,29 @@ async fn dispatch_one_call(
                             // N+1's header both ready, biased select happening
                             // to poll the wire first. Anything else is the peer
                             // running ahead.
+                            //
+                            // "Finished" has to allow for the writer task
+                            // still being on its way out: the trailer can reach
+                            // the peer, and N+1's header come back, before the
+                            // task that wrote it completes (EARLY_HEADER_GRACE).
+                            // Wait for it, briefly. Wire reads stop meanwhile,
+                            // but only for the grace period.
+                            if !writer.is_finished() {
+                                if let Ok(written) =
+                                    tokio::time::timeout(EARLY_HEADER_GRACE, &mut writer).await
+                                {
+                                    return match written {
+                                        Ok(true) => {
+                                            cancel_guard.armed = false;
+                                            Ok(CallOutcome::Complete(Some(frame)))
+                                        }
+                                        Ok(false) => Err(anyhow!(
+                                            "binding dropped response channel without trailer"
+                                        )),
+                                        Err(e) => Err(anyhow!("response writer task failed: {e}")),
+                                    };
+                                }
+                            }
                             if !writer.is_finished() {
                                 // Accepting this would stop wire reads while
                                 // the writer is still blocked, so a FLAG_CANCEL
