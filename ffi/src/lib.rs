@@ -157,13 +157,15 @@ pub enum aster_status_t {
     /// attestation chain did not verify, or a grant role did not match its
     /// capability. `aster_last_error_message` says which check failed.
     ASTER_STATUS_VERIFICATION_FAILED = 13,
-    /// Reserved for the R4 auth model (ABI 4.3): the caller presented no
-    /// usable credential. Not returned by any 4.3 function.
+    /// An auth outcome (ABI 4.3, reserved for auth results): the caller was
+    /// not authenticated. Since 4.4: coordination admission answered RPC 16
+    /// (coordination error events).
     ASTER_STATUS_UNAUTHENTICATED = 14,
-    /// The peer's (or local) policy refused the caller (ABI 4.3). Reserved
-    /// for the R4 auth model; today only an expose relay the serving node's
-    /// authorizer denied reports it (`aster_expose_relay_request` error
-    /// events, `ASTER_EVENT_HTTP_RELAY_READY`).
+    /// An auth outcome (ABI 4.3): the peer's (or local) policy refused the
+    /// caller. Reported by an expose relay the serving node's authorizer
+    /// denied (`aster_expose_relay_request` error events,
+    /// `ASTER_EVENT_HTTP_RELAY_READY`) and, since 4.4, by a coordination ACL /
+    /// admin refusal (RPC 7, coordination error events).
     ASTER_STATUS_PERMISSION_DENIED = 15,
     /// Reserved for the R4 auth model (ABI 4.3): the presented credential
     /// has expired. Not returned by any 4.3 function.

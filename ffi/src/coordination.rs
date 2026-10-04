@@ -27,6 +27,7 @@
 //! identity of the node the client was opened on and authorized by the
 //! group's replicated ACL, deny by default.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use aster::binding_support::upcall::codec as ucv1;
@@ -191,6 +192,9 @@ type ResolvedSlot = Mutex<Option<ResolvedMutation>>;
 /// A lease behind a read/write lock: `compare_and_set` reads, `release`
 /// writes (so it waits for an in-flight CAS), `fence` / `status` try-read.
 struct LeaseSlot {
+    /// Set synchronously by close / free / release: no new operation may
+    /// start, even while the deferred take still waits for an in-flight CAS.
+    closed: AtomicBool,
     lease: Arc<tokio::sync::RwLock<Option<CoordinationLease>>>,
 }
 
@@ -217,6 +221,8 @@ type Manager = CoordinationPlacementManager<
 >;
 
 struct ManagerSlot {
+    /// Set synchronously by close / free: no new pass may start.
+    closed: AtomicBool,
     manager: tokio::sync::Mutex<Option<Manager>>,
 }
 
@@ -293,6 +299,13 @@ fn kind_status(kind: CoordinationErrorKind) -> aster_status_t {
             4 => ASTER_STATUS_TIMEOUT,
             5 => ASTER_STATUS_NOT_FOUND,
             7 => ASTER_STATUS_PERMISSION_DENIED,
+            12 => ASTER_STATUS_UNSUPPORTED,
+            // Coordination admission's "unavailable" (no leader / quorum,
+            // admission not ready) reads like lower-layer unavailability.
+            14 => ASTER_STATUS_CONNECTION_REFUSED,
+            // Coordination admission is a finished auth system: its
+            // refusals use the reserved auth codes (D3).
+            16 => ASTER_STATUS_UNAUTHENTICATED,
             _ => ASTER_STATUS_INTERNAL,
         },
         CoordinationErrorKind::Unavailable => ASTER_STATUS_CONNECTION_REFUSED,
@@ -371,6 +384,7 @@ impl ClientState {
             return Err(closed_op());
         }
         let id = LEASES.insert(LeaseSlot {
+            closed: AtomicBool::new(false),
             lease: Arc::new(tokio::sync::RwLock::new(Some(lease))),
         });
         let slot = LEASES.get(id).expect("just inserted");
@@ -386,6 +400,7 @@ impl ClientState {
             return Err(closed_status());
         }
         let id = MANAGERS.insert(ManagerSlot {
+            closed: AtomicBool::new(false),
             manager: tokio::sync::Mutex::new(Some(manager)),
         });
         let slot = MANAGERS.get(id).expect("just inserted");
@@ -408,6 +423,7 @@ impl ClientState {
         }
         for slot in lock(&self.leases).drain(..) {
             let Some(slot) = slot.upgrade() else { continue };
+            slot.closed.store(true, Ordering::SeqCst);
             let busy = match slot.lease.try_write() {
                 Ok(mut g) => {
                     drop(g.take());
@@ -423,6 +439,7 @@ impl ClientState {
         }
         for slot in lock(&self.managers).drain(..) {
             let Some(slot) = slot.upgrade() else { continue };
+            slot.closed.store(true, Ordering::SeqCst);
             let busy = match slot.manager.try_lock() {
                 Ok(mut g) => {
                     drop(g.take());
@@ -561,11 +578,17 @@ pub unsafe extern "C" fn aster_coordination_client_open(
     let aster_node = aster::Node::from_core_node(core.as_ref().clone());
     let handle = bridge.runtime.handle().clone();
     spawn_op_coded(&bridge, user_data, out_operation, async move {
-        let builder = CoordinationClient::builder(aster_node, group).seed_tickets(seeds);
-        let inner = match journal_dir {
-            Some(dir) => Inner::Full(builder.journal_dir(dir).build().map_err(coord_err)?),
-            None => Inner::Read(builder.build_read_only().map_err(coord_err)?),
-        };
+        // The journal open does file I/O and an fsync: off the async workers.
+        let inner = tokio::task::spawn_blocking(move || {
+            let builder = CoordinationClient::builder(aster_node, group).seed_tickets(seeds);
+            Ok::<_, aster::Error>(match journal_dir {
+                Some(dir) => Inner::Full(builder.journal_dir(dir).build()?),
+                None => Inner::Read(builder.build_read_only()?),
+            })
+        })
+        .await
+        .map_err(|e| other_op(format!("journal open task: {e}")))?
+        .map_err(coord_err)?;
         let local = match &inner {
             Inner::Full(c) => c.local_id().map_err(coord_err)?,
             Inner::Read(_) => {
@@ -701,6 +724,8 @@ pub unsafe extern "C" fn aster_coordination_mutate(
     spawn_op_coded(&bridge, user_data, out_operation, async move {
         let resolved = run_mutation(&c, req).await.map_err(coord_err)?;
         let payload = codec::encode_mutation_reply(resolved.reply());
+        #[cfg(feature = "coordination-fixture")]
+        test_hooks::before_track(client).await;
         let id = state.track_resolved(resolved)?;
         Ok(Done::ok(aster_event_kind_t::ASTER_EVENT_COORDINATION_RESOLVED, id).data(payload))
     })
@@ -844,7 +869,9 @@ pub unsafe extern "C" fn aster_coordination_resume(
 /// journal for the next sequence. Consumes the handle (later calls
 /// `NOT_FOUND`). Completes with `ASTER_EVENT_UNIT_RESULT`; on failure the
 /// result stays journaled and is redelivered. `ALREADY_CLOSED` here when
-/// the client was closed.
+/// the client was closed -- the handle is consumed then too (a later
+/// `aster_coordination_resolved_free` is `NOT_FOUND`); the result stays
+/// journaled for the next open.
 #[no_mangle]
 pub unsafe extern "C" fn aster_coordination_resolved_acknowledge(
     runtime: aster_runtime_t,
@@ -1099,6 +1126,7 @@ pub unsafe extern "C" fn aster_coordination_lease_fence(
     try_status!(bridge_for(runtime));
     let slot = try_status!(lease_for(lease));
     let fence = match slot.lease.try_read() {
+        _ if slot.closed.load(Ordering::SeqCst) => None,
         Ok(g) => g.as_ref().and_then(CoordinationLease::fence),
         Err(_) => None,
     };
@@ -1126,6 +1154,7 @@ pub unsafe extern "C" fn aster_coordination_lease_status(
     try_status!(bridge_for(runtime));
     let slot = try_status!(lease_for(lease));
     let status = match slot.lease.try_read() {
+        _ if slot.closed.load(Ordering::SeqCst) => None,
         Ok(g) => g.as_ref().map(CoordinationLease::status),
         Err(_) => None,
     };
@@ -1158,6 +1187,9 @@ pub unsafe extern "C" fn aster_coordination_lease_compare_and_set(
     let value = try_status!(in_slice(&new_value, "new_value")).to_vec();
     // Take the read guard now, so a release (or close) called after this
     // returns waits for the CAS instead of racing it.
+    if slot.closed.load(Ordering::SeqCst) {
+        return closed_status();
+    }
     let guard = match slot.lease.clone().try_read_owned() {
         Ok(g) if g.is_some() => g,
         _ => return closed_status(),
@@ -1177,6 +1209,11 @@ pub unsafe extern "C" fn aster_coordination_lease_compare_and_set(
 
 /// Take the lease out of a consumed handle, after any in-flight CAS.
 async fn take_lease(slot: Arc<LeaseSlot>) -> Result<CoordinationLease, OpError> {
+    // `closed` was set by a client close before this release: the lease is
+    // the close's to drop, not ours to release.
+    if slot.closed.swap(true, Ordering::SeqCst) {
+        return Err(closed_op());
+    }
     slot.lease.write().await.take().ok_or_else(closed_op)
 }
 
@@ -1246,6 +1283,7 @@ pub unsafe extern "C" fn aster_coordination_lease_free(
     try_status!(bridge_for(runtime));
     match LEASES.remove(lease) {
         Some(slot) => {
+            slot.closed.store(true, Ordering::SeqCst);
             if let Ok(mut g) = slot.lease.try_write() {
                 drop(g.take());
             }
@@ -1318,8 +1356,15 @@ pub unsafe extern "C" fn aster_coordination_placement_reconcile(
     let Some(slot) = MANAGERS.get(manager) else {
         return not_found(format!("unknown placement manager {manager}"));
     };
+    if slot.closed.load(Ordering::SeqCst) {
+        return closed_status();
+    }
     spawn_op_coded(&bridge, user_data, out_operation, async move {
         let mut g = slot.manager.lock().await;
+        if slot.closed.load(Ordering::SeqCst) {
+            drop(g.take());
+            return Err(closed_op());
+        }
         let m = g.as_mut().ok_or_else(closed_op)?;
         let report = m.reconcile().await.map_err(coord_err)?;
         Ok(
@@ -1338,11 +1383,123 @@ pub unsafe extern "C" fn aster_coordination_placement_manager_free(
     try_status!(bridge_for(runtime));
     match MANAGERS.remove(manager) {
         Some(slot) => {
+            slot.closed.store(true, Ordering::SeqCst);
             if let Ok(mut g) = slot.manager.try_lock() {
                 drop(g.take());
             }
             OK
         }
         None => not_found(format!("unknown placement manager {manager}")),
+    }
+}
+
+/// Test-only seams (feature `coordination-fixture`, never in a shipping
+/// build): pause a mutation of one client between "resolved and fsynced" and
+/// "handle handed out", so a test can close the client in exactly that
+/// window.
+#[cfg(feature = "coordination-fixture")]
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    use super::aster_coordination_client_t;
+
+    /// An armed gate: the next mutation of its client stops before tracking.
+    pub struct Gate {
+        reached: Mutex<bool>,
+        cv: Condvar,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Gate {
+        /// Wait until the mutation reached the gate.
+        pub fn wait_reached(&self, timeout: Duration) -> bool {
+            let g = self.reached.lock().unwrap();
+            let (g, _) = self.cv.wait_timeout_while(g, timeout, |r| !*r).unwrap();
+            *g
+        }
+        /// Let it continue.
+        pub fn release(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    fn gates() -> &'static Mutex<HashMap<u64, Arc<Gate>>> {
+        static GATES: std::sync::OnceLock<Mutex<HashMap<u64, Arc<Gate>>>> =
+            std::sync::OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm a one-shot gate for `client`'s next mutation.
+    pub fn arm(client: aster_coordination_client_t) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: Mutex::new(false),
+            cv: Condvar::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        gates().lock().unwrap().insert(client, gate.clone());
+        gate
+    }
+
+    pub(crate) async fn before_track(client: aster_coordination_client_t) {
+        let Some(gate) = gates().lock().unwrap().remove(&client) else {
+            return;
+        };
+        *gate.reached.lock().unwrap() = true;
+        gate.cv.notify_all();
+        let permit = gate.release.acquire().await;
+        if let Ok(p) = permit {
+            p.forget();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aster_status_t::*;
+
+    #[test]
+    fn rpc_codes_map_to_the_documented_statuses() {
+        let rpc = |code| kind_status(CoordinationErrorKind::Rpc { code });
+        assert_eq!(rpc(1), ASTER_STATUS_CANCELLED);
+        assert_eq!(rpc(3), ASTER_STATUS_INVALID_ARGUMENT);
+        assert_eq!(rpc(4), ASTER_STATUS_TIMEOUT);
+        assert_eq!(rpc(5), ASTER_STATUS_NOT_FOUND);
+        assert_eq!(rpc(7), ASTER_STATUS_PERMISSION_DENIED);
+        assert_eq!(rpc(12), ASTER_STATUS_UNSUPPORTED);
+        assert_eq!(rpc(14), ASTER_STATUS_CONNECTION_REFUSED);
+        assert_eq!(rpc(16), ASTER_STATUS_UNAUTHENTICATED);
+        for other in [0, 2, 6, 8, 9, 10, 11, 13, 15, 99, -1] {
+            assert_eq!(rpc(other), ASTER_STATUS_INTERNAL, "rpc {other}");
+        }
+        use CoordinationErrorKind as K;
+        assert_eq!(kind_status(K::Unavailable), ASTER_STATUS_CONNECTION_REFUSED);
+        assert_eq!(kind_status(K::Closed), ASTER_STATUS_ALREADY_CLOSED);
+        for k in [K::Invalid, K::AwaitingAck, K::Unresolved] {
+            assert_eq!(kind_status(k), ASTER_STATUS_INVALID_ARGUMENT);
+        }
+        for k in [
+            K::JournalLocked,
+            K::JournalFatal,
+            K::Other,
+            K::Rejected { reason_code: 3 },
+        ] {
+            assert_eq!(kind_status(k), ASTER_STATUS_INTERNAL);
+        }
+        // The kind and the RPC code travel in error_code / flags.
+        let e = coord_err(aster::Error::Rpc {
+            code: 16,
+            message: "who are you".into(),
+            details: Vec::new(),
+        });
+        assert_eq!(e.status, ASTER_STATUS_UNAUTHENTICATED);
+        assert_eq!(
+            e.code,
+            aster_coordination_error_t::ASTER_COORDINATION_ERROR_RPC as i32
+        );
+        assert_eq!(e.flags, 16);
     }
 }

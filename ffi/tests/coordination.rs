@@ -1147,7 +1147,10 @@ fn close_retires_handles_and_keeps_the_delivery_contract() {
             assert_eq!(aster_coordination_client_close(rt, root), OK);
             finish(rt, op)
         };
-        let raced_open = match pending.kind() {
+        // Racy on purpose (a stress case; the deterministic halves are
+        // `close_after_resolution_*` and `resolution_after_close_*`): either
+        // outcome must keep the delivery contract.
+        match pending.kind() {
             E_RESOLVED => {
                 // Resolved before the close: the handle is already inert.
                 let mut op2 = 0;
@@ -1155,7 +1158,6 @@ fn close_retires_handles_and_keeps_the_delivery_contract() {
                     aster_coordination_resolved_acknowledge(rt, pending.ev.handle, 0, &mut op2),
                     ALREADY_CLOSED
                 );
-                true
             }
             E_ERROR => {
                 assert_eq!(
@@ -1163,11 +1165,9 @@ fn close_retires_handles_and_keeps_the_delivery_contract() {
                     aster_coordination_error_t::ASTER_COORDINATION_ERROR_CLOSED as i32
                 );
                 assert_eq!(pending.ev.status, ALREADY_CLOSED as u32);
-                false
             }
             k => panic!("unexpected event {k}"),
-        };
-        let _ = raced_open;
+        }
         // The closed client refuses new work at once.
         let q = codec::encode_read_request(&ReadRequest::GroupStatus);
         assert_eq!(
@@ -1539,7 +1539,11 @@ fn placement_manager_over_foreign_providers() {
         );
         let m = manager();
         assert_eq!(aster_coordination_client_close(rt, root), OK);
-        reconcile(m).expect_error(aster_coordination_error_t::ASTER_COORDINATION_ERROR_CLOSED);
+        let mut op = 0;
+        assert_eq!(
+            aster_coordination_placement_reconcile(rt, m, 0, &mut op),
+            ALREADY_CLOSED
+        );
         assert_eq!(aster_coordination_placement_manager_free(rt, m), OK);
         let mut m2 = 0;
         assert_eq!(
@@ -1640,5 +1644,301 @@ fn concurrent_reads_share_one_client() {
                 1
             );
         }
+    }
+}
+
+// ── close: the deterministic halves ──────────────────────────────────────────
+
+fn grant_req(key: &str, target: u8) -> MutationRequest {
+    MutationRequest::SetGrant {
+        resource: res("ffi.window", key),
+        target_node_id: [target; 32],
+        rights: RIGHT_READ,
+        expected_acl_revision: 0,
+    }
+}
+
+/// Reopen `dir` and require the unacknowledged result to be `expected`.
+unsafe fn reopen_and_redeliver(
+    rt: aster_runtime_t,
+    node: aster_node_t,
+    dir: &std::path::Path,
+    expected: Option<&[u8]>,
+) -> MutationReplyWireV1 {
+    let c = open(rt, node, Some(dir));
+    let mut op = 0;
+    assert_eq!(aster_coordination_unacknowledged(rt, c, 0, &mut op), OK);
+    let again = finish(rt, op).expect(E_RESOLVED);
+    assert_ne!(again.ev.handle, 0, "the result was redelivered");
+    if let Some(expected) = expected {
+        assert_eq!(again.data, expected, "the exact saved reply");
+    }
+    assert_eq!(
+        aster_coordination_resolved_acknowledge(rt, again.ev.handle, 0, &mut op),
+        OK
+    );
+    finish(rt, op).expect(E_UNIT);
+    assert_eq!(aster_coordination_client_free(rt, c), OK);
+    codec::decode_mutation_reply(&again.data).unwrap()
+}
+
+#[test]
+fn close_after_resolution_makes_the_handle_inert_and_redelivers() {
+    unsafe {
+        let Shared { rt, root_node } = *shared();
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(rt, root_node, Some(dir.path()));
+        let ev = mutate(rt, root, &grant_req("after", 0x51)).expect(E_RESOLVED);
+        assert_ne!(ev.ev.handle, 0);
+        assert_eq!(aster_coordination_client_close(rt, root), OK);
+        let mut op = 0;
+        // Consumed even though it fails: a later free is NOT_FOUND.
+        assert_eq!(
+            aster_coordination_resolved_acknowledge(rt, ev.ev.handle, 0, &mut op),
+            ALREADY_CLOSED
+        );
+        assert_eq!(
+            aster_coordination_resolved_free(rt, ev.ev.handle),
+            NOT_FOUND
+        );
+        assert_eq!(aster_coordination_client_free(rt, root), OK);
+        let reply = reopen_and_redeliver(rt, root_node, dir.path(), Some(&ev.data));
+        assert_eq!(reply.outcome_code, 6);
+    }
+}
+
+#[test]
+fn resolution_after_close_is_an_error_and_redelivered() {
+    unsafe {
+        let Shared { rt, root_node } = *shared();
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(rt, root_node, Some(dir.path()));
+        // Hold the mutation between "resolved and fsynced" and "handed out".
+        let gate = aster_transport_ffi::coordination::test_hooks::arm(root);
+        let req = codec::encode_mutation_request(&grant_req("before", 0x52));
+        let mut op = 0;
+        assert_eq!(
+            aster_coordination_mutate(rt, root, bytes(&req), 0, &mut op),
+            OK
+        );
+        assert!(
+            gate.wait_reached(Duration::from_secs(60)),
+            "the mutation resolved"
+        );
+        assert_eq!(aster_coordination_client_close(rt, root), OK);
+        gate.release();
+        let ev = finish(rt, op)
+            .expect_error(aster_coordination_error_t::ASTER_COORDINATION_ERROR_CLOSED);
+        assert_eq!(ev.ev.status, ALREADY_CLOSED as u32);
+        assert_eq!(aster_coordination_client_free(rt, root), OK);
+        let reply = reopen_and_redeliver(rt, root_node, dir.path(), None);
+        assert_eq!(reply.outcome_code, 6);
+        assert_eq!(reply.sequence, 1);
+    }
+}
+
+#[test]
+fn nothing_new_starts_after_close_even_with_a_take_pending() {
+    unsafe {
+        let Shared { rt, root_node } = *shared();
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(rt, root_node, Some(dir.path()));
+        let w_node = start_node(rt, actor_secret());
+        let wdir = tempfile::tempdir().unwrap();
+        let w = open(rt, w_node, Some(wdir.path()));
+        let r = res("ffi.window", "lease");
+        grant(rt, root, &r, local_id(rt, w));
+        let mut op = 0;
+        assert_eq!(
+            aster_coordination_lease_acquire(
+                rt,
+                w,
+                bytes(b"ffi.window"),
+                bytes(b"lease"),
+                10_000,
+                0,
+                0,
+                0,
+                &mut op
+            ),
+            OK
+        );
+        let lease = finish(rt, op).expect(E_LEASE).ev.handle;
+        // A CAS holds the lease's read guard; close must defer its take.
+        let mut cas = 0;
+        assert_eq!(
+            aster_coordination_lease_compare_and_set(rt, lease, 0, bytes(b"v"), 0, &mut cas),
+            OK
+        );
+        assert_eq!(aster_coordination_client_close(rt, w), OK);
+        // Synchronously refused, whether or not the deferred take ran.
+        assert_eq!(
+            aster_coordination_lease_compare_and_set(rt, lease, 0, bytes(b"w"), 0, &mut op),
+            ALREADY_CLOSED
+        );
+        let mut len = 0usize;
+        assert_eq!(
+            aster_coordination_lease_fence(rt, lease, ptr::null_mut(), 0, &mut len),
+            ALREADY_CLOSED
+        );
+        let mut st = 9;
+        assert_eq!(aster_coordination_lease_status(rt, lease, &mut st), OK);
+        assert_eq!(st, aster_lease_status_t::ASTER_LEASE_STATUS_RELEASED as u32);
+        // The CAS that started before the close completes.
+        let first = finish(rt, cas).expect(E_RESULT);
+        assert_eq!(
+            codec::decode_mutation_reply(&first.data)
+                .unwrap()
+                .outcome_code,
+            3
+        );
+        assert_eq!(aster_coordination_lease_release(rt, lease, 0, &mut op), OK);
+        finish(rt, op).expect_error(aster_coordination_error_t::ASTER_COORDINATION_ERROR_CLOSED);
+
+        // A placement pass parked on its policy upcall; close; a new pass is
+        // refused at once.
+        let status =
+            codec::decode_group_status(&read(rt, root, &ReadRequest::GroupStatus)).unwrap();
+        let mut upcalls = 0;
+        assert_eq!(aster_upcalls_new(rt, 0, &mut upcalls), OK);
+        assert_eq!(
+            aster_upcall_set_policy(rt, upcalls, K_POLICY as u32, 30_000, 1),
+            OK
+        );
+        let release = Arc::new(AtomicBool::new(false));
+        let (st2, v, rel) = (
+            status.clone(),
+            status.voters[0].node_id.clone(),
+            release.clone(),
+        );
+        let _foreign = Foreign::start(rt, upcalls, move |kind, _| match kind {
+            K_TOPOLOGY => Reply::Answer(S_OK, view(std::slice::from_ref(&v))),
+            K_POLICY => {
+                while !rel.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Reply::Answer(S_OK, policy(&st2, std::slice::from_ref(&v), &[]))
+            }
+            _ => Reply::Answer(S_UNIMPLEMENTED, vec![]),
+        });
+        let mut m = 0;
+        assert_eq!(
+            aster_coordination_placement_manager_new(rt, root, upcalls, 0, &mut m),
+            OK
+        );
+        let mut pass = 0;
+        assert_eq!(
+            aster_coordination_placement_reconcile(rt, m, 0, &mut pass),
+            OK
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(aster_coordination_client_close(rt, root), OK);
+        assert_eq!(
+            aster_coordination_placement_reconcile(rt, m, 0, &mut op),
+            ALREADY_CLOSED
+        );
+        release.store(true, Ordering::Release);
+        let ev = finish(rt, pass);
+        assert!(ev.kind() == E_RESULT || ev.kind() == E_ERROR);
+        assert_eq!(aster_coordination_placement_manager_free(rt, m), OK);
+        drop(_foreign);
+        assert_eq!(aster_upcalls_free(rt, upcalls), OK);
+        for c in [root, w] {
+            assert_eq!(aster_coordination_client_free(rt, c), OK);
+        }
+    }
+}
+
+// ── placement with the node's own topology ───────────────────────────────────
+
+unsafe fn start_monitoring_node(rt: aster_runtime_t) -> aster_node_t {
+    let mut cfg: aster_config_t = std::mem::zeroed();
+    assert_eq!(aster_config_init(&mut cfg), OK);
+    cfg.relay_mode = aster_relay_mode_t::ASTER_RELAY_MODE_DISABLED as u32;
+    cfg.bind_addr = bytes(b"127.0.0.1:0");
+    cfg.enable_monitoring = 1;
+    let mut op = 0;
+    assert_eq!(aster_node_start(rt, &cfg, 0, 0, &mut op), OK);
+    finish(rt, op)
+        .expect(aster_event_kind_t::ASTER_EVENT_NODE_CREATED as u32)
+        .ev
+        .handle
+}
+
+#[test]
+fn placement_reads_a_node_topology() {
+    unsafe {
+        let Shared { rt, root_node } = *shared();
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(rt, root_node, Some(dir.path()));
+        let status =
+            codec::decode_group_status(&read(rt, root, &ReadRequest::GroupStatus)).unwrap();
+        let voter = status.voters[0].node_id.clone();
+        let mut upcalls = 0;
+        assert_eq!(aster_upcalls_new(rt, 0, &mut upcalls), OK);
+        let (st, v) = (status.clone(), voter.clone());
+        let foreign = Foreign::start(rt, upcalls, move |kind, _| match kind {
+            K_POLICY => Reply::Answer(S_OK, policy(&st, std::slice::from_ref(&v), &[])),
+            _ => Reply::Answer(S_UNIMPLEMENTED, vec![]),
+        });
+        let topo = start_monitoring_node(rt);
+
+        // Not in a swarm: the node has no shared view, the pass fails.
+        let mut m = 0;
+        assert_eq!(
+            aster_coordination_placement_manager_new(rt, root, upcalls, topo, &mut m),
+            OK
+        );
+        let mut op = 0;
+        assert_eq!(
+            aster_coordination_placement_reconcile(rt, m, 0, &mut op),
+            OK
+        );
+        let ev = finish(rt, op);
+        assert_eq!(ev.kind(), E_ERROR, "no shared view: {}", ev.text());
+        assert_eq!(aster_coordination_placement_manager_free(rt, m), OK);
+
+        // Joined (alone): the pass runs on the node's view. The voter is no
+        // vertex of it, so the planner reports missing evidence -- a result.
+        let secret = [0x3c; 32];
+        assert_eq!(
+            aster_topology_enable_shared(
+                rt,
+                topo,
+                secret.as_ptr(),
+                0,
+                aster_bytes_list_t {
+                    items: ptr::null(),
+                    len: 0
+                },
+                0,
+                0,
+                &mut op
+            ),
+            OK
+        );
+        finish(rt, op).expect(E_UNIT);
+        assert_eq!(
+            aster_coordination_placement_manager_new(rt, root, upcalls, topo, &mut m),
+            OK
+        );
+        assert_eq!(
+            aster_coordination_placement_reconcile(rt, m, 0, &mut op),
+            OK
+        );
+        let ev = finish(rt, op).expect(E_RESULT);
+        let report = codec::decode_placement_report(&ev.data).unwrap();
+        assert_eq!(report.policy_revision, 1);
+        assert_eq!(report.current_voters, vec![voter]);
+        assert!(!report.reason.is_empty());
+        assert!(
+            !foreign.kinds().contains(&K_TOPOLOGY),
+            "the node's view, not kind 17"
+        );
+        assert_eq!(aster_coordination_placement_manager_free(rt, m), OK);
+        drop(foreign);
+        assert_eq!(aster_upcalls_free(rt, upcalls), OK);
+        assert_eq!(aster_coordination_client_free(rt, root), OK);
+        assert_eq!(aster_node_free(rt, topo), OK);
     }
 }

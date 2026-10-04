@@ -63,8 +63,11 @@ Requests and results are UCv1 messages `D0`-`DE` (tags exported as
 (the `error_code` of a coordination `ASTER_EVENT_ERROR`: 1 `AWAITING_ACK`, 2
 `UNRESOLVED`, 3 `JOURNAL_LOCKED`, 4 `JOURNAL_FATAL`, 5 `RPC` (`flags` = the RPC
 code), 6 `UNAVAILABLE`, 7 `CLOSED`, 8 `REJECTED` (reserved), 9 `INVALID`, 10
-`OTHER`). No new `aster_status_t`: an ACL refusal (RPC 7) reports
-`PERMISSION_DENIED` (15). Error events may now carry a non-zero `flags`.
+`OTHER`). No new `aster_status_t`; coordination admission uses the reserved
+auth outcomes: RPC 7 (ACL refusal) → `PERMISSION_DENIED` (15), RPC 16 →
+`UNAUTHENTICATED` (14); RPC 14 → `CONNECTION_REFUSED`, 12 → `UNSUPPORTED`.
+Error events may now carry a non-zero `flags`. Codec vectors:
+`conformance/vectors/coordination.json` (`ffi/tests/coordination_vectors.rs`).
 
 ## New in 4.3 (additive)
 
