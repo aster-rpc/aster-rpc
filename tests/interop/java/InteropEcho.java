@@ -264,9 +264,8 @@ public final class InteropEcho {
   static final AtomicInteger HOLD_CANCELLED = new AtomicInteger();
 
   /**
-   * {@code hold}: blocks until cancelled or 60 s. A unary handler is not told about a client cancel
-   * (the binding has no cancellation signal for unary handlers: no CallContext hook, no thread
-   * interrupt), so only the call's DEADLINE is observed, by watching the clock. See the report.
+   * {@code hold}: blocks until cancelled (a client cancel, seen as {@code ctx.isCancelled()}, or
+   * the call's deadline, by watching the clock) or 60 s.
    */
   static final class Hold implements UnaryDispatcher {
     @Override
@@ -279,6 +278,10 @@ public final class InteropEcho {
       Double deadline = ctx.deadline();
       long end = System.nanoTime() + 60_000_000_000L;
       while (System.nanoTime() < end) {
+        if (ctx.isCancelled()) {
+          HOLD_CANCELLED.incrementAndGet();
+          throw new RpcError(StatusCode.CANCELLED, "hold: cancelled");
+        }
         if (deadline != null && System.currentTimeMillis() / 1000.0 >= deadline) {
           HOLD_CANCELLED.incrementAndGet();
           throw new RpcError(StatusCode.DEADLINE_EXCEEDED, "hold: deadline passed");
@@ -520,7 +523,12 @@ public final class InteropEcho {
     registerTypes(codec.fory());
     NodeAddr addr = NodeAddr.fromTicket(ticket);
     try (AsterClient client =
-        AsterClient.builder().config(config()).codec(codec).build().get(30, TimeUnit.SECONDS)) {
+        AsterClient.builder()
+            .config(config())
+            .codec(codec)
+            .consumerAdmission(false)
+            .build()
+            .get(30, TimeUnit.SECONDS)) {
       EchoReply first =
           client
               .<EchoRequest, EchoReply>call(

@@ -83,14 +83,7 @@ EXPOSE_CASES = ("expose_hello", "expose_echo_stream")
 # language. A listed case that FAILs is reported XFAIL and does not fail the
 # run; one that PASSes is XPASS and does (remove the entry). Keep empty unless
 # a binding bug blocks a case, and say which bug.
-EXPECTED_FAIL: dict[tuple[str, str, str, str], str] = {
-    ("rpc", "java", "*", "cancel"):
-        "Java server: unary handlers get no cancellation signal (AsterServer ignores EVENT_CANCELLED; "
-        "CallContext has no hook), so a client cancel never reaches `hold`",
-    ("rpc", "go", "*", "cancel"):
-        "Go server: unary handlers get no cancellable ctx on peer cancel "
-        "(bindings/go/rpc_server.go onCall registers s.cancels only for non-unary calls)",
-}
+EXPECTED_FAIL: dict[tuple[str, str, str, str], str] = {}
 
 ENV = {
     **os.environ,

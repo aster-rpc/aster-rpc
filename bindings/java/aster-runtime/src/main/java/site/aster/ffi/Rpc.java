@@ -71,6 +71,30 @@ public final class Rpc {
       h(
           "aster_rpc_unary",
           FunctionDescriptor.of(I32, I64, I64, PTR, PTR, I32, PTR, PTR, PTR, PTR, PTR, PTR, PTR));
+  private static final MethodHandle UNARY_CANCELLABLE =
+      h(
+          "aster_rpc_unary_cancellable",
+          FunctionDescriptor.of(
+              I32, I64, I64, PTR, I64, PTR, I32, PTR, PTR, PTR, PTR, PTR, PTR, PTR));
+  // Token calls never block: no thread-state transition (critical).
+  private static final MethodHandle CANCEL_TOKEN_NEW =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_cancel_token_new",
+              FunctionDescriptor.of(I32, I64, PTR),
+              Linker.Option.critical(false));
+  private static final MethodHandle CANCEL_TOKEN_CANCEL =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_cancel_token_cancel",
+              FunctionDescriptor.of(I32, I64, I64),
+              Linker.Option.critical(false));
+  private static final MethodHandle CANCEL_TOKEN_RELEASE =
+      IrohLibrary.getInstance()
+          .getHandle(
+              "aster_cancel_token_release",
+              FunctionDescriptor.of(I32, I64, I64),
+              Linker.Option.critical(false));
   private static final MethodHandle OPEN =
       h("aster_rpc_open", FunctionDescriptor.of(I32, I64, I64, U8, PTR, PTR));
   private static final MethodHandle SEND =
@@ -173,17 +197,60 @@ public final class Rpc {
 
   /** One unary call on the connection's pooled streams. Blocks for the round trip. */
   public static UnaryResult unary(long runtime, long connection, Options o, byte[] request) {
+    return unary(runtime, connection, o, request, 0L);
+  }
+
+  /**
+   * {@link #unary} that {@link #cancelToken cancelToken(token)} aborts ({@code
+   * aster_rpc_unary_cancellable}, ABI 4.5): the same pooled single-write path. A cancelled call
+   * returns {@code CANCELLED} and the server's handler sees the cancel. The call consumes {@code
+   * token} ({@code 0} = not cancellable).
+   */
+  public static UnaryResult unary(
+      long runtime, long connection, Options o, byte[] request, long token) {
     boolean small = request.length <= SCRATCH_REQUEST_LIMIT;
     if (o.cacheable() && small) {
-      return unaryIn(runtime, connection, o, request, null);
+      return unaryIn(runtime, connection, o, request, null, token);
     }
     try (Arena arena = Arena.ofConfined()) {
-      return unaryIn(runtime, connection, o, request, arena);
+      return unaryIn(runtime, connection, o, request, arena, token);
+    }
+  }
+
+  /** A cancel token for one {@link #unary(long, long, Options, byte[], long)} call. */
+  public static long newCancelToken(long runtime) {
+    try {
+      MemorySegment out = SCRATCH.get().out.asSlice(56, 8);
+      Dispatch.check((int) CANCEL_TOKEN_NEW.invoke(runtime, out), "aster_cancel_token_new");
+      return out.get(I64, 0);
+    } catch (Throwable t) {
+      throw Dispatch.rethrow(t);
+    }
+  }
+
+  /**
+   * Cancel the call {@code token} was (or will be) passed to: any thread, never blocks, idempotent,
+   * a no-op once the call has returned.
+   */
+  public static void cancelToken(long runtime, long token) {
+    try {
+      int ignored = (int) CANCEL_TOKEN_CANCEL.invoke(runtime, token); // NOT_FOUND: call over
+    } catch (Throwable t) {
+      throw Dispatch.rethrow(t);
+    }
+  }
+
+  /** Free a token that was never passed to a call (a call frees its own). */
+  public static void releaseCancelToken(long runtime, long token) {
+    try {
+      int ignored = (int) CANCEL_TOKEN_RELEASE.invoke(runtime, token);
+    } catch (Throwable t) {
+      throw Dispatch.rethrow(t);
     }
   }
 
   private static UnaryResult unaryIn(
-      long runtime, long connection, Options o, byte[] request, Arena arena) {
+      long runtime, long connection, Options o, byte[] request, Arena arena, long token) {
     try {
       Scratch scratch = SCRATCH.get();
       MemorySegment opts = options(o, arena);
@@ -204,21 +271,37 @@ public final class Rpc {
       MemorySegment stLen = out.asSlice(40, 4);
       MemorySegment stBuf = out.asSlice(48, 8);
       int status =
-          (int)
-              UNARY.invoke(
-                  runtime,
-                  connection,
-                  opts,
-                  req,
-                  request.length,
-                  respPtr,
-                  respLen,
-                  respBuf,
-                  code,
-                  stPtr,
-                  stLen,
-                  stBuf);
-      Dispatch.check(status, "aster_rpc_unary");
+          token == 0
+              ? (int)
+                  UNARY.invoke(
+                      runtime,
+                      connection,
+                      opts,
+                      req,
+                      request.length,
+                      respPtr,
+                      respLen,
+                      respBuf,
+                      code,
+                      stPtr,
+                      stLen,
+                      stBuf)
+              : (int)
+                  UNARY_CANCELLABLE.invoke(
+                      runtime,
+                      connection,
+                      opts,
+                      token,
+                      req,
+                      request.length,
+                      respPtr,
+                      respLen,
+                      respBuf,
+                      code,
+                      stPtr,
+                      stLen,
+                      stBuf);
+      Dispatch.check(status, token == 0 ? "aster_rpc_unary" : "aster_rpc_unary_cancellable");
       byte[] payload = take(runtime, respPtr, respLen, respBuf);
       byte[] st = take(runtime, stPtr, stLen, stBuf);
       return new UnaryResult(code.get(I32, 0), payload, st);

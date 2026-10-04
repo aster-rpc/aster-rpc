@@ -39,14 +39,10 @@ final class InterceptionTest {
   void callOptionsAreImmutableCopies() {
     CallOptions base = CallOptions.DEFAULT;
     CallOptions o =
-        base.withTimeout(Duration.ofSeconds(3))
-            .withIdempotent(true)
-            .withMetadata("k", "v")
-            .withCancellable(true);
+        base.withTimeout(Duration.ofSeconds(3)).withIdempotent(true).withMetadata("k", "v");
     assertNull(base.timeout());
     assertFalse(base.idempotent());
     assertTrue(base.metadata().isEmpty());
-    assertFalse(base.cancellable());
     assertEquals(Duration.ofSeconds(3), o.timeout());
     assertEquals(Map.of("k", "v"), o.metadata());
     assertNull(o.withTimeout(Duration.ZERO).timeout(), "non-positive means no deadline");

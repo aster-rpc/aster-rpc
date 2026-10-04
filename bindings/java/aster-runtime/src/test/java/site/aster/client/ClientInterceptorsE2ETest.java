@@ -53,7 +53,7 @@ import site.aster.server.spi.UnaryDispatcher;
  * Client interceptors (deadline, retry, circuit breaker, user interceptors) on every call pattern,
  * and native unary cancel, against a real {@link AsterServer} over loopback: ordering, retry
  * semantics (idempotent only, bounded), breaker state, deadline propagation, and that cancelling a
- * cancellable call reaches the server handler.
+ * call reaches the server handler while unary calls stay on the pooled fast path.
  */
 final class ClientInterceptorsE2ETest {
 
@@ -70,6 +70,9 @@ final class ClientInterceptorsE2ETest {
 
   /** Handlers of {@code slow} that observed their call being cancelled. */
   static final AtomicInteger SLOW_CANCELLED = new AtomicInteger();
+
+  /** Handlers of {@code slow} that started. */
+  static final AtomicInteger SLOW_ENTERED = new AtomicInteger();
 
   static volatile CountDownLatch slowEntered = new CountDownLatch(1);
   static volatile CountDownLatch slowCancelled = new CountDownLatch(1);
@@ -166,6 +169,7 @@ final class ClientInterceptorsE2ETest {
 
             public byte[] invoke(Object impl, byte[] req, Codec c, CallContext ctx)
                 throws Exception {
+              SLOW_ENTERED.incrementAndGet();
               slowEntered.countDown();
               long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
               while (!ctx.isCancelled() && System.nanoTime() < end) {
@@ -335,6 +339,7 @@ final class ClientInterceptorsE2ETest {
   void reset() {
     CALLS.clear();
     SLOW_CANCELLED.set(0);
+    SLOW_ENTERED.set(0);
     slowEntered = new CountDownLatch(1);
     slowCancelled = new CountDownLatch(1);
   }
@@ -775,16 +780,9 @@ final class ClientInterceptorsE2ETest {
   // ───── native unary cancel ──────────────────────────────────────────────
 
   @Test
-  void cancellingACancellableUnaryCallReachesTheServerHandler() throws Exception {
+  void cancellingAUnaryCallReachesTheServerHandler() throws Exception {
     AsterClient c = client();
-    CompletableFuture<Msg> f =
-        c.call(
-            addr,
-            SVC,
-            "slow",
-            new Msg("", 0),
-            Msg.class,
-            CallOptions.DEFAULT.withCancellable(true));
+    CompletableFuture<Msg> f = c.call(addr, SVC, "slow", new Msg("", 0), Msg.class);
     assertTrue(slowEntered.await(10, TimeUnit.SECONDS), "the handler is running");
     assertTrue(f.cancel(true));
     assertTrue(f.isCancelled());
@@ -793,18 +791,48 @@ final class ClientInterceptorsE2ETest {
     assertEquals(1, SLOW_CANCELLED.get());
   }
 
+  /**
+   * The cancel token aborts pooled-stream calls (ABI 4.5): ten slow calls — eight fill the SHARED
+   * pool, two wait for a stream — are all cancelled, every started handler sees its cancel, and the
+   * pool is whole again afterwards (sixteen concurrent calls on the same connection succeed).
+   */
+  @Test
+  void cancellingMoreCallsThanThePoolHoldsLeavesThePoolUsable() throws Exception {
+    AsterClient c = client();
+    assertEquals(
+        "echo:warm|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("warm", 0), Msg.class)).text());
+    List<CompletableFuture<Msg>> slow = new ArrayList<>();
+    for (int i = 0; i < 10; i++) {
+      slow.add(c.call(addr, SVC, "slow", new Msg("", i), Msg.class));
+    }
+    long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (SLOW_ENTERED.get() < 8 && System.nanoTime() < end) {
+      Thread.sleep(5);
+    }
+    assertTrue(SLOW_ENTERED.get() >= 8, "the pool's eight streams carry slow calls");
+    for (CompletableFuture<Msg> f : slow) {
+      assertTrue(f.cancel(true));
+    }
+    end = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (SLOW_CANCELLED.get() < SLOW_ENTERED.get() && System.nanoTime() < end) {
+      Thread.sleep(5);
+    }
+    assertEquals(SLOW_ENTERED.get(), SLOW_CANCELLED.get(), "every started handler saw its cancel");
+    List<CompletableFuture<Msg>> after = new ArrayList<>();
+    for (int i = 0; i < 16; i++) {
+      after.add(c.call(addr, SVC, "echo", new Msg("a" + i, 0), Msg.class));
+    }
+    for (int i = 0; i < 16; i++) {
+      assertEquals("echo:a" + i + "|", get(after.get(i)).text());
+    }
+  }
+
   @Test
   void cancellingBeforeTheCallOpensDoesNotHangOrLeak() throws Exception {
     AsterClient c = client();
     for (int i = 0; i < 50; i++) {
-      CompletableFuture<Msg> f =
-          c.call(
-              addr,
-              SVC,
-              "echo",
-              new Msg("race", 0),
-              Msg.class,
-              CallOptions.DEFAULT.withCancellable(true));
+      CompletableFuture<Msg> f = c.call(addr, SVC, "echo", new Msg("race", 0), Msg.class);
       f.cancel(true);
       assertTrue(f.isCancelled());
     }
@@ -814,28 +842,12 @@ final class ClientInterceptorsE2ETest {
   }
 
   @Test
-  void aCancellableCallThatCompletesReturnsItsResult() throws Exception {
+  void aCallThatCompletesReturnsItsResult() throws Exception {
     AsterClient c = client();
-    Msg out =
-        get(
-            c.<Msg, Msg>call(
-                addr,
-                SVC,
-                "echo",
-                new Msg("fast", 0),
-                Msg.class,
-                CallOptions.DEFAULT.withCancellable(true)));
+    Msg out = get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("fast", 0), Msg.class));
     assertEquals("echo:fast|", out.text());
-    Throwable t =
-        failure(
-            c.<Msg, Msg>call(
-                addr,
-                SVC,
-                "boom",
-                new Msg("cx", 0),
-                Msg.class,
-                CallOptions.DEFAULT.withCancellable(true)));
-    assertEquals(StatusCode.INTERNAL, ((RpcError) t).code(), "status mapping on the open path");
+    Throwable t = failure(c.<Msg, Msg>call(addr, SVC, "boom", new Msg("cx", 0), Msg.class));
+    assertEquals(StatusCode.INTERNAL, ((RpcError) t).code(), "status mapping");
   }
 
   @Test
@@ -850,7 +862,7 @@ final class ClientInterceptorsE2ETest {
             "flaky",
             new Msg("cr", 999),
             Msg.class,
-            CallOptions.DEFAULT.withIdempotent(true).withCancellable(true));
+            CallOptions.DEFAULT.withIdempotent(true));
     Thread.sleep(300);
     assertTrue(f.cancel(true));
     int atCancel = calls("cr").get();
@@ -882,15 +894,12 @@ final class ClientInterceptorsE2ETest {
     List<CompletableFuture<Msg>> futures = new ArrayList<>();
     for (int i = 0; i < n; i++) {
       CallOptions o = CallOptions.DEFAULT.withIdempotent(true).withTimeout(Duration.ofSeconds(20));
-      if (i % 4 == 0) {
-        o = o.withCancellable(true);
-      }
       futures.add(
           i % 2 == 0
               ? c.<Msg, Msg>call(addr, SVC, "flaky", new Msg("cc" + i, 2), Msg.class, o)
               : c.<Msg, Msg>call(addr, SVC, "echo", new Msg("e" + i, 0), Msg.class, o));
     }
-    // cancel some of the cancellable ones while in flight
+    // cancel some while in flight
     for (int i = 0; i < n; i += 8) {
       futures.get(i).cancel(true);
     }

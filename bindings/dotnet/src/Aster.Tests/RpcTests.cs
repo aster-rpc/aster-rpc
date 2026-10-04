@@ -64,6 +64,7 @@ public class RpcTests : IAsyncLifetime
     private readonly TaskCompletionSource<CancellationToken> _slowCancelled = new();
     private readonly TaskCompletionSource<bool> _hangStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _hangCancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _parkEntered, _parkCancelled;
 
     public static ServiceDefinition InteropEcho(string lang) => ServiceDefinition.Create("InteropEcho", 1)
         .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply
@@ -103,6 +104,13 @@ public class RpcTests : IAsyncLifetime
         {
             _slowCancelled.TrySetResult(ctx.CancellationToken);
             await Task.Delay(TimeSpan.FromSeconds(30), ctx.CancellationToken);
+            return new EchoReply();
+        })
+        .Unary<EchoRequest, EchoReply>("park", async (_, ctx) =>
+        {
+            Interlocked.Increment(ref _parkEntered);
+            try { await Task.Delay(TimeSpan.FromSeconds(30), ctx.CancellationToken); }
+            catch (OperationCanceledException) { Interlocked.Increment(ref _parkCancelled); throw; }
             return new EchoReply();
         })
         .Unary<EchoRequest, EchoReply>("guarded", (req, _) => ValueTask.FromResult(new EchoReply { Message = req.Message }))
@@ -458,6 +466,34 @@ public class RpcTests : IAsyncLifetime
         cts.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call);
         Assert.True(await _hangCancelled.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    [Fact]
+    public async Task Unary_Cancel_Reaches_The_Handler_On_The_Pooled_Path()
+    {
+        // ABI 4.5: a cancellable unary call stays on the pooled fast path with a native cancel
+        // token. Ten calls: eight fill the SHARED pool's streams, two wait for one; cancelling
+        // them all reaches every started handler, and the pool is whole again afterwards.
+        var ctss = Enumerable.Range(0, 10).Select(_ => new CancellationTokenSource()).ToList();
+        var calls = ctss.Select(c => _conn.UnaryAsync<EchoRequest, EchoReply>(
+            "Extra", "park", new EchoRequest(), cancellationToken: c.Token)).ToList();
+        var until = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (Volatile.Read(ref _parkEntered) < 8 && DateTime.UtcNow < until) await Task.Delay(5);
+        Assert.True(Volatile.Read(ref _parkEntered) >= 8, "the pool's eight streams carry parked calls");
+        foreach (var c in ctss) c.Cancel();
+        foreach (var call in calls)
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call.WaitAsync(TimeSpan.FromSeconds(10)));
+        until = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (Volatile.Read(ref _parkCancelled) < Volatile.Read(ref _parkEntered) && DateTime.UtcNow < until)
+            await Task.Delay(5);
+        Assert.Equal(Volatile.Read(ref _parkEntered), Volatile.Read(ref _parkCancelled));
+        foreach (var c in ctss) c.Dispose();
+
+        using var live = new CancellationTokenSource();
+        var after = Enumerable.Range(0, 16).Select(i => _conn.UnaryAsync<EchoRequest, EchoReply>(
+            "InteropEcho", "echo", new EchoRequest { Count = i }, cancellationToken: live.Token)).ToList();
+        var replies = await Task.WhenAll(after).WaitAsync(TimeSpan.FromSeconds(20));
+        for (int i = 0; i < 16; i++) Assert.Equal(i + 1, replies[i].Count);
     }
 
     [Fact]

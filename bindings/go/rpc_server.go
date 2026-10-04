@@ -94,7 +94,7 @@ type AsterServer struct {
 
 	// mu guards cancels and sessions.
 	mu sync.Mutex
-	// cancels: streaming calls' context cancel, fired on CANCELLED.
+	// cancels: each live call's context cancel, fired on CANCELLED.
 	cancels map[uint64]context.CancelFunc
 	// sessions: Rust session_key -> instance record (created on the poll
 	// goroutine ahead of the session's SESSION_CLOSED).
@@ -357,7 +357,7 @@ type inbound struct {
 	request    []byte
 	peer       string
 	session    *sessionRecord
-	ctx        context.Context // streaming: cancellable by CANCELLED
+	ctx        context.Context // cancelled by the call's CANCELLED event
 	cancel     context.CancelFunc
 	firstIsEnd bool
 }
@@ -404,13 +404,13 @@ func (s *AsterServer) onCall(ev *C.aster_dispatch_event_t) {
 		s.mu.Unlock()
 		in.session = rec
 	}
-	if in.method.Pattern != PatternUnary {
-		// Registered here, ahead of the call's CANCELLED event.
-		in.ctx, in.cancel = context.WithCancel(s.ctx)
-		s.mu.Lock()
-		s.cancels[in.callID] = in.cancel
-		s.mu.Unlock()
-	}
+	// Every pattern, unary included: Rust delivers a client's cancel of a
+	// unary call as CANCELLED{PEER} too. Registered here, ahead of the call's
+	// CANCELLED event.
+	in.ctx, in.cancel = context.WithCancel(s.ctx)
+	s.mu.Lock()
+	s.cancels[in.callID] = in.cancel
+	s.mu.Unlock()
 	s.calls.Add(1)
 	go s.serve(in)
 }

@@ -151,10 +151,11 @@ public sealed class AsterClient : IAsyncDisposable
 /// RPC calls over one QUIC connection through the payload-level C ABI client (3.5,
 /// <c>aster_rpc_*</c> / <c>aster_call_*_payload</c>) on Rust's pooled <c>RpcConnection</c>: Rust
 /// builds the stream header, frames, compresses, enforces the deadline and decodes trailers;
-/// .NET passes options and payloads. Unary calls use the pooled streams; a unary call with a
-/// cancellable token, and every streaming call, get their own stream so that cancelling the token
-/// cancels the native call (<c>aster_call_cancel</c>: the server sees the cancel). Blocking
-/// native calls run on the thread pool.
+/// .NET passes options and payloads. Unary calls use the pooled streams, with a native cancel
+/// token when the <see cref="CancellationToken"/> can be cancelled (ABI 4.5,
+/// <c>aster_rpc_unary_cancellable</c>); every streaming call gets its own stream
+/// (<c>aster_call_cancel</c>). Either way cancelling the token cancels the native call and the
+/// server sees the cancel. Blocking native calls run on the thread pool.
 /// </summary>
 public sealed class RpcConnection : IAsyncDisposable
 {
@@ -248,28 +249,35 @@ public sealed class RpcConnection : IAsyncDisposable
     {
         byte[] req = _codec.Encode(request);
         var spec = new CallSpec(service, method, options);
-        byte[] response;
-        if (!cancellationToken.CanBeCanceled)
-        {
-            // Pooled fast path: one blocking native call (header + request in one write).
-            var (code, payload, status) = await Task.Run(() => UnaryNative(spec, req), CancellationToken.None).ConfigureAwait(false);
-            if (code != 0) throw StatusError(code, status);
-            response = payload;
-        }
-        else
+        cancellationToken.ThrowIfCancellationRequested();
+        // Pooled fast path: one blocking native call (header + request in one write). A
+        // cancellable token gets a native cancel token (ABI 4.5), so cancelling it aborts the call
+        // like dropping the Rust future: FLAG_CANCEL + reset, and the server sees the cancel.
+        var (code, response, status) = cancellationToken.CanBeCanceled
+            ? await Task.Run(() => UnaryCancellable(spec, req, cancellationToken), CancellationToken.None).ConfigureAwait(false)
+            : await Task.Run(() => UnaryNative(spec, req, 0), CancellationToken.None).ConfigureAwait(false);
+        if (code != 0)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            // Same wire shape on a dedicated stream, so the token can cancel the native call.
-            await using var call = await PayloadCall.OpenAsync(this, PatternServerStream, spec, cancellationToken).ConfigureAwait(false);
-            call.Send(req, end: true);
-            response = await call.ReadSingleAsync(cancellationToken).ConfigureAwait(false);
+            throw StatusError(code, status);
         }
         if (response.Length == 0)
             throw new RpcError(StatusCode.Internal, "OK trailer with no response frame");
         return _codec.Decode<TResp>(response);
     }
 
-    private unsafe (int Code, byte[] Payload, byte[] Status) UnaryNative(CallSpec spec, byte[] request)
+    private (int Code, byte[] Payload, byte[] Status) UnaryCancellable(CallSpec spec, byte[] request, CancellationToken ct)
+    {
+        int r = Native.aster_cancel_token_new(Rt, out ulong token);
+        if (r != 0) throw CallError(r, "aster_cancel_token_new");
+        ulong rt = Rt;
+        // Runs at once if ct is already cancelled (the call then returns CANCELLED without
+        // sending); a cancel after the call returned is a native no-op (NOT_FOUND).
+        using var reg = ct.UnsafeRegister(_ => Native.aster_cancel_token_cancel(rt, token), null);
+        return UnaryNative(spec, request, token);
+    }
+
+    private unsafe (int Code, byte[] Payload, byte[] Status) UnaryNative(CallSpec spec, byte[] request, ulong token)
     {
         byte* respPtr = null, statusPtr = null;
         uint respLen = 0, statusLen = 0;
@@ -279,10 +287,13 @@ public sealed class RpcConnection : IAsyncDisposable
         fixed (byte* sp = spec.Service, mp = spec.Method, kp = spec.Metadata, rp = request)
         {
             CallOptionsNative o = spec.Native(sp, mp, kp);
-            r = Native.aster_rpc_unary(Rt, Conn, &o, request.Length == 0 ? null : rp, (uint)request.Length,
-                &respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf);
+            r = token == 0
+                ? Native.aster_rpc_unary(Rt, Conn, &o, request.Length == 0 ? null : rp, (uint)request.Length,
+                    &respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+                : Native.aster_rpc_unary_cancellable(Rt, Conn, &o, token, request.Length == 0 ? null : rp, (uint)request.Length,
+                    &respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf);
         }
-        if (r != 0) throw CallError(r, "aster_rpc_unary");
+        if (r != 0) throw CallError(r, token == 0 ? "aster_rpc_unary" : "aster_rpc_unary_cancellable");
         try
         {
             return (code,
