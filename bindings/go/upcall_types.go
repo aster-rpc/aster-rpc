@@ -21,6 +21,12 @@ const (
 	UpcallFencedMutate UpcallKind = 4
 	// UpcallTopologyAdmitted: B8 -> B9 (batched decision).
 	UpcallTopologyAdmitted UpcallKind = 16
+	// UpcallTopologySnapshot: BA -> BB (placement topology source, ABI 4.4).
+	UpcallTopologySnapshot UpcallKind = 17
+	// UpcallPlacementPolicy: BC -> BD (ABI 4.4).
+	UpcallPlacementPolicy UpcallKind = 32
+	// UpcallPlacementProvision: BE -> BF (ABI 4.4).
+	UpcallPlacementProvision UpcallKind = 33
 	// UpcallExposeAuthorize: C0 -> CF (decision).
 	UpcallExposeAuthorize UpcallKind = 48
 	// UpcallExposeHTTP: C4 -> C5; bodies move through the HTTPBodies table.

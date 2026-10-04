@@ -27,11 +27,12 @@ func cStructSizes() map[string]uintptr {
 		"aster_dispatch_event_t":     unsafe.Sizeof(C.aster_dispatch_event_t{}),
 		"aster_call_options_t":       unsafe.Sizeof(C.aster_call_options_t{}),
 		// ABI 4.1 / 4.2
-		"aster_upcall_event_t":            unsafe.Sizeof(C.aster_upcall_event_t{}),
-		"aster_topology_admitted_stats_t": unsafe.Sizeof(C.aster_topology_admitted_stats_t{}),
-		"aster_http_foreign_options_t":    unsafe.Sizeof(C.aster_http_foreign_options_t{}),
-		"aster_route_spec_t":              unsafe.Sizeof(C.aster_route_spec_t{}),
-		"aster_http_relay_options_t":      unsafe.Sizeof(C.aster_http_relay_options_t{}),
+		"aster_upcall_event_t":                unsafe.Sizeof(C.aster_upcall_event_t{}),
+		"aster_topology_admitted_stats_t":     unsafe.Sizeof(C.aster_topology_admitted_stats_t{}),
+		"aster_http_foreign_options_t":        unsafe.Sizeof(C.aster_http_foreign_options_t{}),
+		"aster_route_spec_t":                  unsafe.Sizeof(C.aster_route_spec_t{}),
+		"aster_http_relay_options_t":          unsafe.Sizeof(C.aster_http_relay_options_t{}),
+		"aster_coordination_client_options_t": unsafe.Sizeof(C.aster_coordination_client_options_t{}),
 	}
 }
 
@@ -73,6 +74,16 @@ func relayOptionsOffsets() map[string]uintptr {
 // bodyStatusToStatus is aster_http_body_status_to_status.
 func bodyStatusToStatus(code int32) int32 {
 	return int32(C.aster_http_body_status_to_status(C.int32_t(code)))
+}
+
+// coordinationOptionsOffsets are the aster_coordination_client_options_t offsets.
+func coordinationOptionsOffsets() map[string]uintptr {
+	var o C.aster_coordination_client_options_t
+	return map[string]uintptr{
+		"struct_size": unsafe.Offsetof(o.struct_size), "flags": unsafe.Offsetof(o.flags),
+		"group_id": unsafe.Offsetof(o.group_id), "seed_tickets": unsafe.Offsetof(o.seed_tickets),
+		"journal_dir": unsafe.Offsetof(o.journal_dir),
+	}
 }
 
 // routeSpecOffsets are the aster_route_spec_t offsets.
@@ -137,9 +148,49 @@ func abiEnums() map[string]int64 {
 		"HTTP_BODY_UPLOAD_FAILED":     C.ASTER_HTTP_BODY_UPLOAD_FAILED,
 		"HTTP_BODY_BUFFER_TOO_SMALL":  C.ASTER_HTTP_BODY_BUFFER_TOO_SMALL,
 		"EVENT_HTTP_RELAY_READY":      C.ASTER_EVENT_HTTP_RELAY_READY,
-		"STATUS_UNAUTHENTICATED":      C.ASTER_STATUS_UNAUTHENTICATED,
-		"STATUS_PERMISSION_DENIED":    C.ASTER_STATUS_PERMISSION_DENIED,
-		"STATUS_CREDENTIAL_EXPIRED":   C.ASTER_STATUS_CREDENTIAL_EXPIRED,
+		// ABI 4.4
+		"EVENT_COORDINATION_CLIENT_OPENED":  C.ASTER_EVENT_COORDINATION_CLIENT_OPENED,
+		"EVENT_COORDINATION_RESOLVED":       C.ASTER_EVENT_COORDINATION_RESOLVED,
+		"EVENT_COORDINATION_RESULT":         C.ASTER_EVENT_COORDINATION_RESULT,
+		"EVENT_COORDINATION_LEASE_ACQUIRED": C.ASTER_EVENT_COORDINATION_LEASE_ACQUIRED,
+		"COORDINATION_CLIENT_READ_ONLY":     C.ASTER_COORDINATION_CLIENT_READ_ONLY,
+		"COORDINATION_ERROR_NONE":           C.ASTER_COORDINATION_ERROR_NONE,
+		"COORDINATION_ERROR_AWAITING_ACK":   C.ASTER_COORDINATION_ERROR_AWAITING_ACK,
+		"COORDINATION_ERROR_UNRESOLVED":     C.ASTER_COORDINATION_ERROR_UNRESOLVED,
+		"COORDINATION_ERROR_JOURNAL_LOCKED": C.ASTER_COORDINATION_ERROR_JOURNAL_LOCKED,
+		"COORDINATION_ERROR_JOURNAL_FATAL":  C.ASTER_COORDINATION_ERROR_JOURNAL_FATAL,
+		"COORDINATION_ERROR_RPC":            C.ASTER_COORDINATION_ERROR_RPC,
+		"COORDINATION_ERROR_UNAVAILABLE":    C.ASTER_COORDINATION_ERROR_UNAVAILABLE,
+		"COORDINATION_ERROR_CLOSED":         C.ASTER_COORDINATION_ERROR_CLOSED,
+		"COORDINATION_ERROR_REJECTED":       C.ASTER_COORDINATION_ERROR_REJECTED,
+		"COORDINATION_ERROR_INVALID":        C.ASTER_COORDINATION_ERROR_INVALID,
+		"COORDINATION_ERROR_OTHER":          C.ASTER_COORDINATION_ERROR_OTHER,
+		"MUTATE_ACQUIRE":                    C.ASTER_COORDINATION_MUTATE_ACQUIRE,
+		"MUTATE_RENEW":                      C.ASTER_COORDINATION_MUTATE_RENEW,
+		"MUTATE_COMPARE_AND_SET":            C.ASTER_COORDINATION_MUTATE_COMPARE_AND_SET,
+		"MUTATE_RELEASE":                    C.ASTER_COORDINATION_MUTATE_RELEASE,
+		"MUTATE_RELEASE_WITH_VALUE":         C.ASTER_COORDINATION_MUTATE_RELEASE_WITH_VALUE,
+		"MUTATE_REVOKE":                     C.ASTER_COORDINATION_MUTATE_REVOKE,
+		"MUTATE_SET_GRANT":                  C.ASTER_COORDINATION_MUTATE_SET_GRANT,
+		"MUTATE_SET_ADMIN":                  C.ASTER_COORDINATION_MUTATE_SET_ADMIN,
+		"MUTATE_CHANGE_MEMBERSHIP":          C.ASTER_COORDINATION_MUTATE_CHANGE_MEMBERSHIP,
+		"MUTATE_CANCEL_MEMBERSHIP":          C.ASTER_COORDINATION_MUTATE_CANCEL_MEMBERSHIP,
+		"READ_READ_LINEARIZABLE":            C.ASTER_COORDINATION_READ_READ_LINEARIZABLE,
+		"READ_INSPECT_ACL":                  C.ASTER_COORDINATION_READ_INSPECT_ACL,
+		"READ_INSPECT_ADMINS":               C.ASTER_COORDINATION_READ_INSPECT_ADMINS,
+		"READ_MEMBERSHIP_STATUS":            C.ASTER_COORDINATION_READ_MEMBERSHIP_STATUS,
+		"READ_GROUP_STATUS":                 C.ASTER_COORDINATION_READ_GROUP_STATUS,
+		"READ_PROBE_CLIENT":                 C.ASTER_COORDINATION_READ_PROBE_CLIENT,
+		"READ_AUDIT_STREAM":                 C.ASTER_COORDINATION_READ_AUDIT_STREAM,
+		"READ_RECOVERY_EXPORT":              C.ASTER_COORDINATION_READ_RECOVERY_EXPORT,
+		"TAG_MUTATION_REQUEST":              C.ASTER_COORDINATION_TAG_MUTATION_REQUEST,
+		"TAG_PLACEMENT_REPORT":              C.ASTER_COORDINATION_TAG_PLACEMENT_REPORT,
+		"UPCALL_KIND_TOPOLOGY_SNAPSHOT":     C.ASTER_UPCALL_KIND_TOPOLOGY_SNAPSHOT,
+		"UPCALL_KIND_PLACEMENT_POLICY":      C.ASTER_UPCALL_KIND_PLACEMENT_POLICY,
+		"UPCALL_KIND_PLACEMENT_PROVISION":   C.ASTER_UPCALL_KIND_PLACEMENT_PROVISION,
+		"STATUS_UNAUTHENTICATED":            C.ASTER_STATUS_UNAUTHENTICATED,
+		"STATUS_PERMISSION_DENIED":          C.ASTER_STATUS_PERMISSION_DENIED,
+		"STATUS_CREDENTIAL_EXPIRED":         C.ASTER_STATUS_CREDENTIAL_EXPIRED,
 	}
 }
 

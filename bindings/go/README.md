@@ -5,7 +5,7 @@
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Status (ABI 4.3: upcalls, leases, expose, streaming relay; 2026-10-04)
+## Status (ABI 4.4: upcalls, leases, expose, streaming relay, coordination; 2026-10-04)
 
 **Working at RPC parity for open-gate interop.** Go is in the `tests/interop/`
 matrix (Rust / Python / TypeScript / Java / .NET / Go, 6×6 = 36/36, identical
@@ -155,6 +155,29 @@ whose ABI major differs (4).
   `ErrCredentialExpired`, and a denied buffered `RelayRequest` matches
   `ErrPermissionDenied` too.
 
+- **ABI 4.4 coordination client + placement** (`coordination.go`,
+  `coordination_codec.go`, `coordination_codes.go`, `ucv1_placement.go`):
+  `OpenCoordinationClient(ctx, node, CoordinationOptions{GroupID, SeedTickets,
+  JournalDir, ReadOnly})`. `Mutate` (and `Acquire` / `Renew` /
+  `CompareAndSet` / `ReleaseFence` / `ReleaseWithValue` / `Revoke` /
+  `SetGrant` / `SetAdmin` / `ChangeMembership` / `CancelMembership`) returns a
+  `*ResolvedMutation` you must `Acknowledge` (no new mutation until then);
+  `Unacknowledged` / `Resume` redeliver after a reopen (nil = none). A committed
+  typed rejection is a result (`Reply.Rejected()`), not an error. Reads,
+  `RetireOtherClient`, `RecoveryExportToFile`, `AcquireLease` ->
+  `*CoordinationLease` (a denial is `*LeaseDeniedError`), and
+  `NewPlacementManager(client, upcalls, topologyNode)` with Go providers
+  (`ServePlacementPolicy` / `ServePlacementProvisioner` /
+  `ServeTopologySnapshot`; a provider failure fails the pass). Errors are
+  `*CoordinationError{Kind, RPCCode, Status}`; `errors.Is` matches
+  `ErrCoordinationAwaitingAck` / `JournalLocked` / ... and the mapped status
+  (`ErrPermissionDenied` for an RPC refusal by the replicated ACL). Release and
+  Close wait for an in-flight CompareAndSet (up to its full drive budget): do
+  not model them as prompt. Live tests need the voter fixture binary
+  (`cargo build -p aster-transport-napi --features coordination-fixture --bin
+  aster-coordination-fixture`, or `ASTER_COORDINATION_FIXTURE`); without it they
+  skip.
+
 Fixed in the catch-up: completions that arrived before their operation was
 registered were dropped (calls could hang); `ReadDatagram` rejected the
 `DATAGRAM_RECEIVED` completion; ticket encode/decode and the canonical/contract
@@ -219,6 +242,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `ucv1.go`, `upcall_types.go` | UCv1 upcall payload codec and kind / status tables (plain Go, no cgo) |
 | `upcall.go` | ABI 4.1 `Upcalls`: poll goroutine, per-kind policy, typed serving, owned-operation helper |
 | `lease.go` | ABI 4.1 leases, fenced resource, topology admitted filter, `Node.EnableShared` |
+| `coordination*.go`, `ucv1_placement.go` | ABI 4.4 coordination client, D0-DE codec, outcome / reason codes, placement messages |
 | `relay_stream.go` | ABI 4.3 `Connection.RelayStream` (full-duplex streaming relay, readiness-driven) |
 | `expose.go`, `expose_http.go` | ABI 4.2 expose registry, body table, relay / route requests, `net/http` handler adapter |
 | `dataplane.go` | ABI 3.3 blobs / tags / docs / paths / priority wrappers |

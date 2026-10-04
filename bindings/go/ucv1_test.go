@@ -308,6 +308,48 @@ func ucCodecFor(typ string) *ucCodec {
 				v, err := DecodeExposeRouteGrant(b)
 				return EncodeExposeRouteGrant(v), err
 			}}
+	case "PlacementPolicyRequest":
+		return &ucCodec{
+			func(b []byte) (any, error) { return jm{}, DecodePlacementPolicyRequest(b) },
+			func(b []byte) ([]byte, error) { return EncodePlacementPolicyRequest(), DecodePlacementPolicyRequest(b) }}
+	case "PlacementPolicy":
+		return &ucCodec{
+			func(b []byte) (any, error) {
+				p, err := DecodePlacementPolicy(b)
+				elig := []any{}
+				for _, c := range p.Eligible {
+					var seed any
+					if c.MemberSeed != nil {
+						seed = jseed(*c.MemberSeed)
+					}
+					elig = append(elig, jm{"member_seed": seed, "node_id": hx(c.NodeID)})
+				}
+				return jm{"allow_healthy_rebalance": p.AllowHealthyRebalance, "authority_domain": p.AuthorityDomain,
+					"authority_public_key": hx(p.AuthorityPublicKey), "digest": hx(p.Digest), "eligible": elig,
+					"excluded": hxs(p.Excluded), "minimum_separated_voter_pairs": p.MinimumSeparatedVoterPairs,
+					"pinned_voters": hxs(p.PinnedVoters), "replacement_grace_ms": p.ReplacementGraceMs,
+					"revision": p.Revision, "target_retained_learners": p.TargetRetainedLearners,
+					"target_voters": p.TargetVoters}, err
+			},
+			func(b []byte) ([]byte, error) {
+				p, err := DecodePlacementPolicy(b)
+				return EncodePlacementPolicy(p), err
+			}}
+	case "PlacementProvisionRequest":
+		return &ucCodec{
+			func(b []byte) (any, error) {
+				v, err := DecodeProvisionRequest(b)
+				return jm{"group_id": hx(v.GroupID), "membership_log_id": jlog(v.MembershipLogID), "node_id": hx(v.NodeID),
+					"policy_digest": hx(v.PolicyDigest)}, err
+			},
+			func(b []byte) ([]byte, error) {
+				v, err := DecodeProvisionRequest(b)
+				return EncodeProvisionRequest(v), err
+			}}
+	case "MemberSeed":
+		return &ucCodec{
+			func(b []byte) (any, error) { m, err := DecodeMemberSeed(b); return jseed(m), err },
+			func(b []byte) ([]byte, error) { m, err := DecodeMemberSeed(b); return EncodeMemberSeed(m), err }}
 	case "AdmissionConnectRequest":
 		return &ucCodec{
 			func(b []byte) (any, error) {
@@ -356,10 +398,8 @@ func normalize(t *testing.T, v any) any {
 	return out
 }
 
-// Placement messages are not part of the C ABI (no coordination client).
-var ucUnsupported = map[string]bool{
-	"PlacementPolicyRequest": true, "PlacementPolicy": true, "PlacementProvisionRequest": true, "MemberSeed": true,
-}
+// Every message type of the vectors has a codec (placement since ABI 4.4).
+var ucUnsupported = map[string]bool{}
 
 func TestUCv1_ValidVectors(t *testing.T) {
 	checked := 0
@@ -390,8 +430,8 @@ func TestUCv1_ValidVectors(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != 41 {
-		t.Errorf("checked %d valid vectors, want 41", checked)
+	if checked != 46 {
+		t.Errorf("checked %d valid vectors, want 46", checked)
 	}
 }
 
