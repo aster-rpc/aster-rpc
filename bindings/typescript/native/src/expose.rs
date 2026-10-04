@@ -16,6 +16,9 @@ use std::sync::Mutex;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use aster::binding_support::relay::{
+    relay_streaming, RelayOptions, RelayReader, RelayResponse, RelayUpload,
+};
 use aster::binding_support::upcall::expose::{
     foreign_authorize_fn, foreign_route_policy, BodyError, ForeignHttpHandler, ForeignHttpOptions,
     HttpBodies,
@@ -394,6 +397,198 @@ pub struct RelayHttpResponse {
     pub body: Buffer,
 }
 
+/// Options of `IrohConnection.relayHttpStreaming` (all optional).
+#[napi(object)]
+#[derive(Default)]
+pub struct RelayHttpStreamRequest {
+    /// Default `GET`.
+    pub method: Option<String>,
+    /// Default `/`.
+    pub uri: Option<String>,
+    pub headers: Option<Vec<ExposeHeader>>,
+    /// Largest upload piece and largest read (default 1 MiB, > 0).
+    pub max_chunk: Option<u32>,
+    /// Upload chunks buffered before a write waits (default 8, > 0).
+    pub capacity: Option<u32>,
+}
+
+/// A started streaming exchange: write the request body through `upload`
+/// (then `finish()`) while `response.wait()` runs.
+#[napi(object, object_from_js = false)]
+pub struct RelayHttpStreaming {
+    pub upload: HttpUpload,
+    pub response: HttpRelayResponse,
+}
+
+/// The request body of a streaming relay exchange. There is no
+/// deterministic drop in JavaScript: an upload left unfinished (neither
+/// `finish()` nor `abort()`) keeps the handler's request body open until
+/// the connection idles out (the core aborts it once the object is
+/// garbage-collected, but do not rely on that).
+#[napi]
+pub struct HttpUpload {
+    upload: RelayUpload,
+}
+
+#[napi]
+impl HttpUpload {
+    /// The largest piece one write queues (bigger chunks are split).
+    #[napi(getter)]
+    pub fn max_chunk(&self) -> f64 {
+        self.upload.max_chunk() as f64
+    }
+
+    /// Whether the upload is over: finished, aborted, or the request is
+    /// gone (writes would fail).
+    #[napi(getter)]
+    pub fn closed(&self) -> bool {
+        self.upload.is_closed()
+    }
+
+    /// Queue a chunk (split at `maxChunk`), waiting while the buffer is
+    /// full: awaiting it is the backpressure. `cancelled`: the request is
+    /// gone.
+    #[napi]
+    pub async fn write(&self, chunk: Buffer) -> Result<()> {
+        let upload = self.upload.clone();
+        let data = aster::expose::bytes::Bytes::from(chunk.to_vec());
+        upload.write(data).await.map_err(body_err)
+    }
+
+    /// Queue a chunk (at most `maxChunk` bytes) without waiting; `false`
+    /// when the buffer is full (nothing queued).
+    #[napi]
+    pub fn try_write(&self, chunk: Buffer) -> Result<bool> {
+        self.upload
+            .try_write(aster::expose::bytes::Bytes::from(chunk.to_vec()))
+            .map_err(body_err)
+    }
+
+    /// End the request body cleanly. A second end is `finished`.
+    #[napi]
+    pub fn finish(&self) -> Result<()> {
+        self.upload.finish().map_err(body_err)
+    }
+
+    /// End the request body with an error: the request is reset and the
+    /// handler sees a failed body, never a truncated one. `message` stays
+    /// local.
+    #[napi]
+    pub fn abort(&self, message: Option<String>) -> Result<()> {
+        self.upload
+            .abort(message.as_deref().unwrap_or("aborted"))
+            .map_err(body_err)
+    }
+}
+
+/// A running streaming exchange until its response head is in.
+#[napi]
+pub struct HttpRelayResponse {
+    response: Mutex<Option<RelayResponse>>,
+    cancelled: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// The head of a streamed response and its body reader.
+#[napi(object, object_from_js = false)]
+pub struct HttpRelayHead {
+    pub status: u32,
+    pub headers: Vec<ExposeHeader>,
+    pub body: HttpRelayBody,
+}
+
+#[napi]
+impl HttpRelayResponse {
+    /// The response head and body. Resolves once the upload has finished
+    /// and the head is in; rejects when the exchange failed (refused,
+    /// unknown service, upload aborted, connection lost) or was cancelled.
+    /// Callable once.
+    #[napi]
+    pub async fn wait(&self) -> Result<HttpRelayHead> {
+        let response = self
+            .response
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| {
+                Error::new(
+                    Status::GenericFailure,
+                    "relay exchange cancelled or already awaited",
+                )
+            })?;
+        let cancelled = self.cancelled.clone();
+        // Losing the race drops the `wait` future, which cancels the
+        // exchange (the request is reset).
+        let (head, reader) = tokio::select! {
+            r = response.wait() => r.map_err(|e| to_napi_err(e.into()))?,
+            () = cancelled.notified() => {
+                return Err(Error::new(Status::GenericFailure, "relay exchange cancelled"));
+            }
+        };
+        Ok(HttpRelayHead {
+            status: head.status.into(),
+            headers: headers_out(head.headers),
+            body: HttpRelayBody { reader },
+        })
+    }
+
+    /// Cancel the exchange: the request is reset and `wait()` rejects. No
+    /// effect once the head is in.
+    #[napi]
+    pub fn cancel(&self) {
+        if let Some(r) = self
+            .response
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            r.cancel();
+        }
+        // Reaches a `wait()` that already took the response (or is yet to).
+        self.cancelled.notify_one();
+    }
+}
+
+/// The response body of a streaming relay exchange: `await read()`. A
+/// failed (reset) response rejects with `read` on every read, never a clean
+/// end. `close()` stops it early (the handler's writes are cancelled).
+#[napi]
+pub struct HttpRelayBody {
+    reader: RelayReader,
+}
+
+#[napi]
+impl HttpRelayBody {
+    /// The largest chunk a read returns.
+    #[napi(getter)]
+    pub fn max_chunk(&self) -> f64 {
+        self.reader.max_chunk() as f64
+    }
+
+    #[napi(getter)]
+    pub fn closed(&self) -> bool {
+        self.reader.is_closed()
+    }
+
+    /// The next chunk (at most `max` bytes, and at most `maxChunk`), or
+    /// `null` at the end.
+    #[napi]
+    pub async fn read(&self, max: Option<u32>) -> Result<Option<Buffer>> {
+        let reader = self.reader.clone();
+        let max = max.map_or(65_536, |m| m as usize);
+        Ok(reader
+            .read(max)
+            .await
+            .map_err(body_err)?
+            .map(|b| Buffer::from(b.to_vec())))
+    }
+
+    /// Stop reading; later reads reject `cancelled`. Idempotent.
+    #[napi]
+    pub fn close(&self) {
+        self.reader.close();
+    }
+}
+
 /// A running expose accept loop; `close()` stops it.
 #[napi]
 pub struct ExposeServer {
@@ -499,6 +694,52 @@ impl IrohConnection {
             status,
             headers: headers_out(headers),
             body: resp.into_body().into(),
+        })
+    }
+
+    /// Consumer side: start one HTTP exchange with `serviceId`, streamed
+    /// both ways. Returns the upload and the pending response at once: write
+    /// the request body then `finish()` it while awaiting `response.wait()`.
+    /// The relay sends the whole request body before it reads the response
+    /// head (not full duplex). The exchange runs whether or not `wait()` is
+    /// called.
+    #[napi]
+    pub fn relay_http_streaming(
+        &self,
+        service_id: String,
+        request: Option<RelayHttpStreamRequest>,
+    ) -> Result<RelayHttpStreaming> {
+        let request = request.unwrap_or_default();
+        let headers = headers_in(&request.headers.unwrap_or_default(), "headers")?;
+        let max_chunk = request.max_chunk.map_or(DEFAULT_MAX_CHUNK, |c| c as usize);
+        let capacity = request.capacity.map_or(8, |c| c as usize);
+        if max_chunk == 0 {
+            return Err(invalid("maxChunk must be > 0"));
+        }
+        if capacity == 0 {
+            return Err(invalid("capacity must be > 0"));
+        }
+        let conn = aster::Connection::from_core_connection(self.inner.clone());
+        let runtime = within_runtime_if_available(tokio::runtime::Handle::current);
+        let (upload, response) = relay_streaming(
+            &runtime,
+            &conn,
+            &service_id,
+            request.method.as_deref().unwrap_or("GET"),
+            request.uri.as_deref().unwrap_or("/"),
+            &headers,
+            RelayOptions {
+                max_chunk,
+                upload_capacity: capacity,
+            },
+        )
+        .map_err(|e| to_napi_err(e.into()))?;
+        Ok(RelayHttpStreaming {
+            upload: HttpUpload { upload },
+            response: HttpRelayResponse {
+                response: Mutex::new(Some(response)),
+                cancelled: std::sync::Arc::new(tokio::sync::Notify::new()),
+            },
         })
     }
 

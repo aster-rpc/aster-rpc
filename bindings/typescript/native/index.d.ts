@@ -769,6 +769,76 @@ export declare class HttpBodyHandle {
   abort(message?: string | undefined | null): void
 }
 
+/**
+ * The response body of a streaming relay exchange: `await read()`. A
+ * failed (reset) response rejects with `read` on every read, never a clean
+ * end. `close()` stops it early (the handler's writes are cancelled).
+ */
+export declare class HttpRelayBody {
+  /** The largest chunk a read returns. */
+  get maxChunk(): number
+  get closed(): boolean
+  /**
+   * The next chunk (at most `max` bytes, and at most `maxChunk`), or
+   * `null` at the end.
+   */
+  read(max?: number | undefined | null): Promise<Buffer | null>
+  /** Stop reading; later reads reject `cancelled`. Idempotent. */
+  close(): void
+}
+
+/** A running streaming exchange until its response head is in. */
+export declare class HttpRelayResponse {
+  /**
+   * The response head and body. Resolves once the upload has finished
+   * and the head is in; rejects when the exchange failed (refused,
+   * unknown service, upload aborted, connection lost) or was cancelled.
+   * Callable once.
+   */
+  wait(): Promise<HttpRelayHead>
+  /**
+   * Cancel the exchange: the request is reset and `wait()` rejects. No
+   * effect once the head is in.
+   */
+  cancel(): void
+}
+
+/**
+ * The request body of a streaming relay exchange. There is no
+ * deterministic drop in JavaScript: an upload left unfinished (neither
+ * `finish()` nor `abort()`) keeps the handler's request body open until
+ * the connection idles out (the core aborts it once the object is
+ * garbage-collected, but do not rely on that).
+ */
+export declare class HttpUpload {
+  /** The largest piece one write queues (bigger chunks are split). */
+  get maxChunk(): number
+  /**
+   * Whether the upload is over: finished, aborted, or the request is
+   * gone (writes would fail).
+   */
+  get closed(): boolean
+  /**
+   * Queue a chunk (split at `maxChunk`), waiting while the buffer is
+   * full: awaiting it is the backpressure. `cancelled`: the request is
+   * gone.
+   */
+  write(chunk: Buffer): Promise<void>
+  /**
+   * Queue a chunk (at most `maxChunk` bytes) without waiting; `false`
+   * when the buffer is full (nothing queued).
+   */
+  tryWrite(chunk: Buffer): boolean
+  /** End the request body cleanly. A second end is `finished`. */
+  finish(): void
+  /**
+   * End the request body with an error: the request is reset and the
+   * handler sees a failed body, never a truncated one. `message` stays
+   * local.
+   */
+  abort(message?: string | undefined | null): void
+}
+
 export declare class IrohBiStream {
   /** Take the send stream (can only be called once). */
   takeSend(): IrohSendStream
@@ -791,6 +861,15 @@ export declare class IrohConnection {
    * truncated body.
    */
   relayHttp(serviceId: string, request: RelayHttpRequest): Promise<RelayHttpResponse>
+  /**
+   * Consumer side: start one HTTP exchange with `serviceId`, streamed
+   * both ways. Returns the upload and the pending response at once: write
+   * the request body then `finish()` it while awaiting `response.wait()`.
+   * The relay sends the whole request body before it reads the response
+   * head (not full duplex). The exchange runs whether or not `wait()` is
+   * called.
+   */
+  relayHttpStreaming(serviceId: string, request?: RelayHttpStreamRequest | undefined | null): RelayHttpStreaming
   /**
    * Consumer side: ask the edge at the other end to route `specs` to
    * this node, attaching `metadata` for its route policy. Hold the
@@ -2466,6 +2545,13 @@ export declare function hpkeX25519PublicFromNodeId(nodeId: string): Buffer
  */
 export declare function hpkeX25519SecretFromIdentity(secret: string | Uint8Array): Buffer
 
+/** The head of a streamed response and its body reader. */
+export interface HttpRelayHead {
+  status: number
+  headers: Array<ExposeHeader>
+  body: HttpRelayBody
+}
+
 /** A `[[peers]]` entry selected from `.aster-identity`. */
 export interface IdentityPeer {
   name?: string
@@ -2755,6 +2841,28 @@ export interface RelayHttpResponse {
   status: number
   headers: Array<ExposeHeader>
   body: Buffer
+}
+
+/**
+ * A started streaming exchange: write the request body through `upload`
+ * (then `finish()`) while `response.wait()` runs.
+ */
+export interface RelayHttpStreaming {
+  upload: HttpUpload
+  response: HttpRelayResponse
+}
+
+/** Options of `IrohConnection.relayHttpStreaming` (all optional). */
+export interface RelayHttpStreamRequest {
+  /** Default `GET`. */
+  method?: string
+  /** Default `/`. */
+  uri?: string
+  headers?: Array<ExposeHeader>
+  /** Largest upload piece and largest read (default 1 MiB, > 0). */
+  maxChunk?: number
+  /** Upload chunks buffered before a write waits (default 8, > 0). */
+  capacity?: number
 }
 
 /** The result of `retireLocalWriteAuthority`. */
