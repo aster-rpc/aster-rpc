@@ -318,6 +318,14 @@ _Static_assert(sizeof(aster_route_protocol_t) == 4, "enum size");
 _Static_assert(sizeof(aster_expose_t) == 8 && sizeof(aster_http_bodies_t) == 8 &&
                sizeof(aster_route_registration_t) == 8, "handle size");
 
+/* ABI 4.3: streaming consumer relay */
+LAYOUT(aster_http_relay_options_t, 24);
+OFF(aster_http_relay_options_t, struct_size, 0);
+OFF(aster_http_relay_options_t, flags, 4);
+OFF(aster_http_relay_options_t, max_chunk, 8);
+OFF(aster_http_relay_options_t, upload_capacity, 16);
+OFF(aster_http_relay_options_t, reserved, 20);
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -339,7 +347,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 2); /* 4.2: expose */
+    CHECK(ASTER_ABI_VERSION_MINOR == 3); /* 4.2: expose; 4.3: streaming relay */
     CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
@@ -900,6 +908,170 @@ static void test_expose(void) {
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
+/* A loopback node for the relay round trip. Returns 0 on failure. */
+static aster_node_t relay_node(aster_runtime_t rt, aster_bytes_t *alpn) {
+    aster_config_t c;
+    if (aster_config_init(&c) != ASTER_STATUS_OK) return 0;
+    c.relay_mode = ASTER_RELAY_MODE_DISABLED;
+    c.bind_addr = bstr("127.0.0.1:0");
+    c.alpns = (aster_bytes_list_t){alpn, 1};
+    aster_operation_t op = 0;
+    if (aster_node_start(rt, &c, 0, 0, &op) != ASTER_STATUS_OK) return 0;
+    aster_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    if (!wait_event(rt, op, &ev) || ev.kind != ASTER_EVENT_NODE_CREATED) return 0;
+    return ev.handle;
+}
+
+/* Answer the server's upcalls (kind 48: allow; kind 49: an inline 201
+ * "pong") until `response` has its head. A single thread does both sides:
+ * the relay calls below never block it except with a timeout. */
+static int serve_until_head(aster_runtime_t rt, aster_upcalls_t up, aster_http_response_t response) {
+    /* UCv1 CF Decision(allow) and C5 { 201, no headers, Inline "pong" }. */
+    static const uint8_t allow[] = {0xCF, 0x01, 0x01};
+    static const uint8_t pong[] = {0xC5, 0x01, 0xC9, 0x01, 0x00, 0x0C, 0x00, 0x04, 'p', 'o', 'n', 'g'};
+    for (int i = 0; i < 200; i++) {
+        aster_upcall_event_t ev[4];
+        uint32_t n = aster_upcall_poll(rt, up, ev, 4, 50);
+        for (uint32_t k = 0; k < n; k++) {
+            if (ev[k].kind == ASTER_UPCALL_KIND_EXPOSE_AUTHORIZE) {
+                aster_upcall_respond(rt, up, ev[k].invocation_id, ASTER_UPCALL_STATUS_OK, allow, sizeof allow);
+            } else if (ev[k].kind == ASTER_UPCALL_KIND_EXPOSE_HTTP) {
+                aster_upcall_respond(rt, up, ev[k].invocation_id, ASTER_UPCALL_STATUS_OK, pong, sizeof pong);
+            }
+            aster_upcall_buffer_release(rt, up, ev[k].buffer);
+        }
+        size_t need = 0;
+        int32_t rc = aster_http_response_wait(rt, response, 0, NULL, 0, &need);
+        if (rc != ASTER_HTTP_BODY_TIMEOUT) return rc == ASTER_HTTP_BODY_BUFFER_TOO_SMALL;
+    }
+    return 0;
+}
+
+static void test_relay_stream(void) {
+    printf("[streaming relay 4.3]\n");
+    /* Relay codes continue BodyError's; the reserved auth statuses. */
+    CHECK(ASTER_HTTP_BODY_UNKNOWN_SERVICE == 10 && ASTER_HTTP_BODY_DENIED == 11 &&
+          ASTER_HTTP_BODY_OVERLOADED == 12 && ASTER_HTTP_BODY_RESET == 13 &&
+          ASTER_HTTP_BODY_BAD_HEAD == 14 && ASTER_HTTP_BODY_CONNECTION_CLOSED == 15 &&
+          ASTER_HTTP_BODY_UPLOAD_FAILED == 16 && ASTER_HTTP_BODY_BUFFER_TOO_SMALL == 17);
+    CHECK(ASTER_STATUS_VERIFICATION_FAILED == 13 && ASTER_STATUS_UNAUTHENTICATED == 14 &&
+          ASTER_STATUS_PERMISSION_DENIED == 15 && ASTER_STATUS_CREDENTIAL_EXPIRED == 16);
+    CHECK(strcmp(aster_status_name(ASTER_STATUS_PERMISSION_DENIED), "ASTER_STATUS_PERMISSION_DENIED") == 0);
+    CHECK(aster_http_body_status_to_status(ASTER_HTTP_BODY_DENIED) == ASTER_STATUS_PERMISSION_DENIED);
+    CHECK(aster_http_body_status_to_status(ASTER_HTTP_BODY_UNKNOWN_SERVICE) == ASTER_STATUS_NOT_FOUND);
+    CHECK(ASTER_EVENT_HTTP_RELAY_READY == 109);
+    _Static_assert(sizeof(aster_http_upload_t) == 8 && sizeof(aster_http_response_t) == 8, "handle size");
+
+    aster_http_relay_options_t o;
+    memset(&o, 0xff, sizeof o);
+    CHECK(aster_http_relay_options_init(&o) == ASTER_STATUS_OK);
+    CHECK(o.struct_size == sizeof o && o.flags == 0 && o.max_chunk == 0 && o.upload_capacity == 0);
+
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+    aster_bytes_t alpn = bstr("aster-expose/c-abi-test");
+    aster_node_t server = relay_node(rt, &alpn);
+    aster_node_t client = relay_node(rt, &alpn);
+    CHECK(server != 0 && client != 0);
+
+    /* Server: a foreign HTTP service "app", answered by this thread. */
+    aster_upcalls_t up = 0;
+    aster_http_bodies_t bodies = 0;
+    aster_expose_t ex = 0;
+    aster_operation_t serve_op = 0;
+    CHECK(aster_upcalls_new(rt, 0, &up) == ASTER_STATUS_OK);
+    CHECK(aster_http_bodies_new(rt, &bodies) == ASTER_STATUS_OK);
+    CHECK(aster_expose_new(rt, server, &ex) == ASTER_STATUS_OK);
+    CHECK(aster_expose_http_foreign(rt, ex, up, bodies, bstr("app"), NULL) == ASTER_STATUS_OK);
+    CHECK(aster_expose_serve(rt, server, ex, (aster_bytes_list_t){&alpn, 1}, 0, &serve_op) == ASTER_STATUS_OK);
+
+    /* Client: connect once the server has a loopback address. */
+    uint8_t addr_buf[4096];
+    aster_node_addr_t addr;
+    memset(&addr, 0, sizeof addr);
+    for (int i = 0; i < 100; i++) {
+        CHECK(aster_node_addr_info(rt, server, addr_buf, sizeof addr_buf, &addr) == ASTER_STATUS_OK);
+        if (addr.direct_addresses.len > 0) break;
+        aster_event_t idle[1];
+        aster_poll_events(rt, idle, 1, 50); /* a 50 ms pause (no op of ours is pending) */
+    }
+    CHECK(addr.direct_addresses.len > 0);
+    aster_connect_config_t cc = {sizeof(aster_connect_config_t), 0, addr.endpoint_id, alpn, &addr};
+    aster_operation_t op = 0;
+    CHECK(aster_connect(rt, client, &cc, 0, &op) == ASTER_STATUS_OK);
+    aster_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev) && ev.kind == ASTER_EVENT_CONNECTED);
+    aster_connection_t conn = ev.handle;
+
+    /* C4 { "app", no peer, stream 0, HTTP/1.1, POST, "/up", no headers, Stream }. */
+    const uint8_t c4[] = {0xC4, 0x01, 0x0E, 'a', 'p', 'p', 0xFD, 0x00, 0x02, 0x12, 'P', 'O', 'S', 'T',
+                          0x0E, '/', 'u', 'p', 0x00, 0x0C, 0x01};
+    aster_http_upload_t upload = 0;
+    aster_http_response_t response = 0;
+    CHECK(aster_expose_relay_stream(rt, conn, (aster_bytes_t){c4, sizeof c4}, &o, &upload, &response) ==
+          ASTER_STATUS_OK);
+    CHECK(upload != 0 && response != 0);
+    CHECK(aster_http_upload_write(rt, upload, (const uint8_t *)"ping", 4, 5000) == ASTER_HTTP_BODY_OK);
+    CHECK(aster_http_upload_finish(rt, upload) == ASTER_HTTP_BODY_OK);
+    CHECK(aster_http_upload_finish(rt, upload) == ASTER_HTTP_BODY_FINISHED);
+
+    /* The head: ask for its size, then fetch it (a UCv1 C5, body mode Stream). */
+    CHECK(serve_until_head(rt, up, response));
+    size_t need = 0, got = 0;
+    CHECK(aster_http_response_wait(rt, response, 0, NULL, 0, &need) == ASTER_HTTP_BODY_BUFFER_TOO_SMALL);
+    uint8_t head[256];
+    CHECK(need > 4 && need <= sizeof head);
+    CHECK(aster_http_response_wait(rt, response, 0, head, sizeof head, &got) == ASTER_HTTP_BODY_OK && got == need);
+    CHECK(head[0] == 0xC5 && head[1] == 0x01 && head[2] == 0xC9 && head[3] == 0x01); /* status 201 */
+    CHECK(head[got - 1] == 0x01);                                                /* body mode Stream */
+
+    /* The body, then the sticky clean end. */
+    uint8_t body[64];
+    size_t n = 0;
+    uint32_t eof = 0;
+    char text[64] = {0};
+    size_t total = 0;
+    for (int i = 0; i < 10 && !eof; i++) {
+        CHECK(aster_http_response_read(rt, response, body, sizeof body, 5000, &n, &eof) == ASTER_HTTP_BODY_OK);
+        if (n > 0 && total + n < sizeof text) {
+            memcpy(text + total, body, n);
+            total += n;
+        }
+    }
+    CHECK(eof == 1 && strcmp(text, "pong") == 0);
+    CHECK(aster_http_response_read(rt, response, body, sizeof body, 0, &n, &eof) == ASTER_HTTP_BODY_OK && eof == 1);
+    /* Readiness after the end fires at once: the next read succeeds (EOF). */
+    CHECK(aster_http_response_ready(rt, response, 77, &op) == ASTER_STATUS_OK);
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev) && ev.kind == ASTER_EVENT_HTTP_RELAY_READY && ev.handle == response &&
+          ev.status == ASTER_STATUS_OK && ev.error_code == 0 && ev.user_data == 77);
+    CHECK(aster_http_upload_free(rt, upload) == ASTER_STATUS_OK);
+    CHECK(aster_http_response_free(rt, response) == ASTER_STATUS_OK);
+    CHECK(aster_http_response_free(rt, response) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_http_upload_write(rt, upload, (const uint8_t *)"x", 1, 0) == ASTER_HTTP_BODY_UNKNOWN_HANDLE);
+
+    /* A service the peer does not expose: a stable code, not a message. */
+    const uint8_t nope[] = {0xC4, 0x01, 0x12, 'n', 'o', 'p', 'e', 0xFD, 0x00, 0x02, 0x0E, 'G', 'E', 'T',
+                            0x06, '/', 0x00, 0x0C, 0x01};
+    CHECK(aster_expose_relay_stream(rt, conn, (aster_bytes_t){nope, sizeof nope}, NULL, &upload, &response) ==
+          ASTER_STATUS_OK);
+    CHECK(aster_http_upload_finish(rt, upload) == ASTER_HTTP_BODY_OK);
+    CHECK(aster_http_response_wait(rt, response, 10000, head, sizeof head, &got) ==
+          ASTER_HTTP_BODY_UNKNOWN_SERVICE);
+    CHECK(aster_http_upload_free(rt, upload) == ASTER_STATUS_OK);
+    CHECK(aster_http_response_free(rt, response) == ASTER_STATUS_OK);
+
+    CHECK(aster_expose_free(rt, ex) == ASTER_STATUS_OK);
+    CHECK(aster_node_free(rt, client) == ASTER_STATUS_OK);
+    CHECK(aster_node_free(rt, server) == ASTER_STATUS_OK);
+    CHECK(aster_upcalls_close(rt, up) == ASTER_STATUS_OK);
+    CHECK(aster_upcalls_free(rt, up) == ASTER_STATUS_OK);
+    CHECK(aster_http_bodies_free(rt, bodies) == ASTER_STATUS_OK);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
+}
+
 int main(void) {
     test_abi_version();
     test_enum_values();
@@ -912,6 +1084,7 @@ int main(void) {
     test_dispatch_server();
     test_upcalls();
     test_expose();
+    test_relay_stream();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;

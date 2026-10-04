@@ -22,7 +22,33 @@
 //!
 //!   aster_expose_relay_request(rt, conn, c4)         consumer: buffered request
 //!   aster_expose_request_route(rt, conn, specs, ..)  consumer: ask an edge for routes
+//!
+//!   aster_expose_relay_stream(rt, conn, c4, opts)    consumer: streaming (4.3)
+//!     → upload:   aster_http_upload_{write,try_write,finish,abort,ready,free}
+//!     → response: aster_http_response_{wait,read,ready,close,free}
 //! ```
+//!
+//! # Streaming relay (ABI 4.3)
+//!
+//! Design: `upcall-design.md` §6.4. `aster_expose_relay_stream` sends a `C4`
+//! head (body mode `Stream`) and returns two handles at once; the exchange
+//! runs on the runtime. It is **full duplex**: the head (`C5`, body mode
+//! `Stream`) may arrive while the upload is still being written (an early
+//! `413`), and the upload carries on after it. Freeing the upload unfinished
+//! aborts it (the handler sees a failed body); closing or freeing the
+//! response before the body was read to its end abandons the exchange and
+//! resets an unfinished upload, while a body read to its clean end leaves
+//! the upload to finish. Upload and response calls return
+//! `aster_http_body_status_t` (relay codes 10..=17 extend the body codes);
+//! lifecycle calls (`start`, `ready`, `close`, `free`) return
+//! `aster_status_t`.
+//!
+//! Waiting: `timeout_ms` > 0 blocks the calling thread (never a tokio
+//! runtime thread: `BLOCKING_ON_RUNTIME`); `timeout_ms` = 0 on `wait` /
+//! `read` never blocks and works on any thread (`TIMEOUT` = nothing ready).
+//! A poll loop arms `aster_*_ready` (one-shot `ASTER_EVENT_HTTP_RELAY_READY`
+//! on the completion queue), then calls with `timeout_ms` = 0 /
+//! `try_write` until `TIMEOUT` / not queued, and re-arms.
 //!
 //! # Threading
 //!
@@ -40,18 +66,24 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aster::binding_support::relay::{
+    relay_streaming, RelayOptions, RelayResponse, RelayUpload, ResponseError, TryRead,
+};
 use aster::binding_support::upcall::codec::{self, ExposeHttpResponse, HttpBodyMode, HttpHeader};
 use aster::binding_support::upcall::expose::{
     expose_foreign_http, foreign_authorize_fn, foreign_route_policy, BodyError, ForeignHttpOptions,
     HttpBodies,
 };
+use aster::expose::bytes::Bytes;
 use aster::expose::{
     http, relay_request, request_route, AuthorizeFn, EdgeRouter, Expose, RouteProtocol,
     RouteRegistration, RouteSpec,
 };
 use aster::Connection;
 
-use crate::data::{bridge_for, in_slice, in_string, invalid, not_found, spawn_op, Done};
+use crate::data::{
+    bridge_for, in_slice, in_string, invalid, not_found, spawn_op, spawn_op_coded, Done, OpError,
+};
 use crate::pure::try_status;
 use crate::upcall::{aster_upcalls_t, upcalls_for};
 use crate::{
@@ -112,6 +144,28 @@ pub enum aster_http_body_status_t {
     ASTER_HTTP_BODY_INVALID_TRAILERS = 8,
     /// A blocking call was made on a tokio runtime thread.
     ASTER_HTTP_BODY_BLOCKING_ON_RUNTIME = 9,
+    // 10..=17: streaming consumer relay only (ABI 4.3,
+    // `aster_http_upload_*` / `aster_http_response_*`;
+    // `aster::binding_support::relay::ResponseError::code()`).
+    /// The peer has no exposed service of this id.
+    ASTER_HTTP_BODY_UNKNOWN_SERVICE = 10,
+    /// The service's admission policy refused this node
+    /// (`ASTER_STATUS_PERMISSION_DENIED`).
+    ASTER_HTTP_BODY_DENIED = 11,
+    /// The service is at its concurrent-stream cap; retry later.
+    ASTER_HTTP_BODY_OVERLOADED = 12,
+    /// The peer reset or ended the stream without a response head (its
+    /// handler or relay failed).
+    ASTER_HTTP_BODY_RESET = 13,
+    /// The response head was malformed or too large.
+    ASTER_HTTP_BODY_BAD_HEAD = 14,
+    /// The connection is closed or was lost.
+    ASTER_HTTP_BODY_CONNECTION_CLOSED = 15,
+    /// The upload was aborted (or freed unfinished) before the head.
+    ASTER_HTTP_BODY_UPLOAD_FAILED = 16,
+    /// The head does not fit the buffer: `*out_len` is the size needed;
+    /// retry (the head stays available).
+    ASTER_HTTP_BODY_BUFFER_TOO_SMALL = 17,
     /// A NULL pointer with a non-zero length, a zero `cap`, ...
     ASTER_HTTP_BODY_INVALID_ARGUMENT = -1,
     /// Unknown runtime or `aster_http_bodies_t`.
@@ -142,6 +196,32 @@ pub struct aster_http_foreign_options_t {
     pub max_chunk: u64,
     /// Response chunks queued before a write waits. 0 = default (8).
     pub response_buffer: u32,
+    /// Reserved, must be 0.
+    pub reserved: u32,
+}
+
+/// The request body of a streaming relay (`aster_expose_relay_stream`).
+/// Free with `aster_http_upload_free`, which aborts it if unfinished.
+pub type aster_http_upload_t = u64;
+/// The response of a streaming relay (`aster_expose_relay_stream`): its head,
+/// then its body. Free with `aster_http_response_free`, which abandons the
+/// exchange unless the body was read to its end.
+pub type aster_http_response_t = u64;
+
+/// Options of `aster_expose_relay_stream` (`RelayOptions`). Initialise with
+/// `aster_http_relay_options_init`; `struct_size` must equal
+/// `sizeof(aster_http_relay_options_t)`. 24 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct aster_http_relay_options_t {
+    pub struct_size: u32,
+    /// Reserved, must be 0.
+    pub flags: u32,
+    /// Largest chunk one upload write takes and one response read returns.
+    /// 0 = default (1 MiB).
+    pub max_chunk: u64,
+    /// Upload chunks queued before a write waits. 0 = default (8).
+    pub upload_capacity: u32,
     /// Reserved, must be 0.
     pub reserved: u32,
 }
@@ -177,6 +257,10 @@ static EXPOSES: once_cell::sync::Lazy<HandleRegistry<Expose>> =
 static BODIES: once_cell::sync::Lazy<HandleRegistry<HttpBodies>> =
     once_cell::sync::Lazy::new(HandleRegistry::new);
 static REGISTRATIONS: once_cell::sync::Lazy<HandleRegistry<Mutex<Option<RouteRegistration>>>> =
+    once_cell::sync::Lazy::new(HandleRegistry::new);
+static UPLOADS: once_cell::sync::Lazy<HandleRegistry<RelayUpload>> =
+    once_cell::sync::Lazy::new(HandleRegistry::new);
+static RESPONSES: once_cell::sync::Lazy<HandleRegistry<RelayResponse>> =
     once_cell::sync::Lazy::new(HandleRegistry::new);
 
 fn expose_for(expose: aster_expose_t) -> Result<Arc<Expose>, i32> {
@@ -761,7 +845,11 @@ fn http_version(code: u8) -> http::Version {
 /// body `Inline`, copy out then `aster_buffer_release`) for **any** HTTP
 /// status, including the `5xx` a failing handler maps to. A transport
 /// failure, a refused request or a response that failed mid-body (the peer
-/// aborted it) is `ASTER_EVENT_ERROR`. Streaming relay is not in the C ABI.
+/// aborted it) is `ASTER_EVENT_ERROR`: since ABI 4.3 its `error_code` is the
+/// relay code (`aster_http_body_status_t` 10..=16, e.g. `DENIED`) and its
+/// `status` that code's `aster_status_t` (`aster_http_body_status_to_status`:
+/// `PERMISSION_DENIED`, `NOT_FOUND`, ...). For streaming bodies see
+/// `aster_expose_relay_stream`.
 #[no_mangle]
 pub unsafe extern "C" fn aster_expose_relay_request(
     runtime: aster_runtime_t,
@@ -801,10 +889,10 @@ pub unsafe extern "C" fn aster_expose_relay_request(
     };
     let service_id = req.service_id;
     let conn = Connection::from_core_connection((*core).clone());
-    spawn_op(&bridge, user_data, out_operation, async move {
+    spawn_op_coded(&bridge, user_data, out_operation, async move {
         let resp = relay_request(&conn, &service_id, http_req)
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| relay_op_error(&ResponseError::classify(&e)))?;
         let (parts, body) = resp.into_parts();
         let payload = codec::encode_expose_http_response(&ExposeHttpResponse {
             status: parts.status.as_u16(),
@@ -910,5 +998,574 @@ pub unsafe extern "C" fn aster_route_registration_free(
             OK
         }
         None => not_found(format!("unknown route registration {registration}")),
+    }
+}
+
+// ============================================================================
+// Streaming consumer relay (ABI 4.3)
+// ============================================================================
+
+/// The `aster_status_t` that stands for an `aster_http_body_status_t` code:
+/// `OK` for 0; `PERMISSION_DENIED` for `DENIED`, `NOT_FOUND` for
+/// `UNKNOWN_SERVICE` / `UNKNOWN_STREAM`, `STREAM_RESET` for `RESET` / `READ`,
+/// `ALREADY_CLOSED` for `CONNECTION_CLOSED` / `FINISHED`, `CONNECTION_REFUSED`
+/// for `OVERLOADED`, `CANCELLED` for `CANCELLED` / `UPLOAD_FAILED`,
+/// `TIMEOUT`, `BUFFER_TOO_SMALL`, `INVALID_ARGUMENT` for argument and chunk
+/// / trailer errors, `NOT_FOUND` for an unknown handle, `INTERNAL` otherwise.
+/// Used for the `status` of relay events; exported so a binding maps direct
+/// returns the same way.
+fn body_code_status(code: i32) -> aster_status_t {
+    use aster_status_t as S;
+    match code {
+        0 => S::ASTER_STATUS_OK,
+        1 | 10 => S::ASTER_STATUS_NOT_FOUND,
+        2 | 16 => S::ASTER_STATUS_CANCELLED,
+        4 | 8 | -1 => S::ASTER_STATUS_INVALID_ARGUMENT,
+        5 | 15 => S::ASTER_STATUS_ALREADY_CLOSED,
+        6 => S::ASTER_STATUS_TIMEOUT,
+        7 | 13 => S::ASTER_STATUS_STREAM_RESET,
+        11 => S::ASTER_STATUS_PERMISSION_DENIED,
+        12 => S::ASTER_STATUS_CONNECTION_REFUSED,
+        17 => S::ASTER_STATUS_BUFFER_TOO_SMALL,
+        -2 => S::ASTER_STATUS_NOT_FOUND,
+        _ => S::ASTER_STATUS_INTERNAL,
+    }
+}
+
+/// Map an `aster_http_body_status_t` value (as returned) to the
+/// `aster_status_t` the C ABI uses for it in events (see the mapping on
+/// `ASTER_EVENT_HTTP_RELAY_READY`; `DENIED` → `PERMISSION_DENIED`). Unknown
+/// values map to `INTERNAL`.
+#[no_mangle]
+pub extern "C" fn aster_http_body_status_to_status(code: i32) -> i32 {
+    body_code_status(code) as i32
+}
+
+fn relay_op_error(e: &ResponseError) -> OpError {
+    let code = e.code() as i32;
+    OpError {
+        status: body_code_status(code),
+        code,
+        message: e.to_string(),
+    }
+}
+
+fn relay_code(e: &ResponseError) -> i32 {
+    set_last_error(e.to_string());
+    e.code() as i32
+}
+
+/// Fill `*out` with the defaults (`struct_size` set, every field 0 = its
+/// default).
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_relay_options_init(
+    out: *mut aster_http_relay_options_t,
+) -> i32 {
+    let Some(out) = out.as_mut() else {
+        return invalid("aster_http_relay_options_init: out is NULL");
+    };
+    *out = aster_http_relay_options_t {
+        struct_size: std::mem::size_of::<aster_http_relay_options_t>() as u32,
+        flags: 0,
+        max_chunk: 0,
+        upload_capacity: 0,
+        reserved: 0,
+    };
+    OK
+}
+
+unsafe fn relay_options(opts: *const aster_http_relay_options_t) -> Result<RelayOptions, i32> {
+    let mut o = RelayOptions::default();
+    let Some(c) = opts.as_ref() else {
+        return Ok(o);
+    };
+    let expected = std::mem::size_of::<aster_http_relay_options_t>() as u32;
+    if c.struct_size != expected {
+        return Err(invalid(format!(
+            "aster_http_relay_options_t.struct_size is {}, expected {expected}",
+            c.struct_size
+        )));
+    }
+    if c.flags != 0 || c.reserved != 0 {
+        return Err(invalid(
+            "aster_http_relay_options_t: flags and reserved must be 0",
+        ));
+    }
+    if c.max_chunk != 0 {
+        o.max_chunk = usize::try_from(c.max_chunk)
+            .map_err(|_| invalid("max_chunk does not fit this platform"))?;
+    }
+    if c.upload_capacity != 0 {
+        o.upload_capacity = c.upload_capacity as usize;
+    }
+    Ok(o)
+}
+
+/// Start a **streaming** HTTP exchange with a service the peer exposed on
+/// `connection` and return its two handles at once (the exchange is already
+/// running): write the request body to `*out_upload`, then finish it, while
+/// waiting on / reading `*out_response`. Full duplex: the response head can
+/// arrive before the upload is done (an early `413`), and the upload carries
+/// on after it (see the module docs for the lifetime contract).
+///
+/// `request` is a UCv1 `C4` message whose body mode is `Stream`:
+/// `service_id`, `method`, `uri`, `headers`; `version`, `peer_id` and
+/// `stream_id` are ignored. `opts` NULL = defaults. Returns `aster_status_t`:
+/// `INVALID_ARGUMENT` (nothing sent) for a bad `C4`, an inline body, an empty
+/// or over-long service id, or an invalid method / URI / header;
+/// `NOT_FOUND` for an unknown runtime or connection. Refusals and transport
+/// failures surface later, on the response (`aster_http_response_wait`).
+#[no_mangle]
+pub unsafe extern "C" fn aster_expose_relay_stream(
+    runtime: aster_runtime_t,
+    connection: aster_connection_t,
+    request: aster_bytes_t,
+    opts: *const aster_http_relay_options_t,
+    out_upload: *mut aster_http_upload_t,
+    out_response: *mut aster_http_response_t,
+) -> i32 {
+    if out_upload.is_null() || out_response.is_null() {
+        return invalid("aster_expose_relay_stream: out_upload / out_response is NULL");
+    }
+    *out_upload = 0;
+    *out_response = 0;
+    let bridge = try_status!(bridge_for(runtime));
+    let Some(core) = bridge.connections.get(connection) else {
+        return not_found(format!("unknown connection handle {connection}"));
+    };
+    let raw = try_status!(in_slice(&request, "request"));
+    let req = match codec::decode_expose_http_request(raw) {
+        Ok(r) => r,
+        Err(e) => return invalid(format!("request is not a valid UCv1 C4 message: {e:#}")),
+    };
+    if !matches!(req.body, HttpBodyMode::Stream) {
+        return invalid(
+            "request body mode must be Stream (use aster_expose_relay_request for inline bodies)",
+        );
+    }
+    if req.service_id.is_empty() {
+        return invalid("service_id must be non-empty");
+    }
+    let options = try_status!(relay_options(opts));
+    let conn = Connection::from_core_connection((*core).clone());
+    match relay_streaming(
+        bridge.runtime.handle(),
+        &conn,
+        &req.service_id,
+        &req.method,
+        &req.uri,
+        &req.headers,
+        options,
+    ) {
+        Ok((upload, response)) => {
+            *out_upload = UPLOADS.insert(upload);
+            *out_response = RESPONSES.insert(response);
+            OK
+        }
+        Err(aster::Error::InvalidArgument(msg)) => invalid(msg),
+        Err(e) => set_last_error(format!("{e:#}")),
+    }
+}
+
+/// Resolve the runtime and a relay handle; a failure is a body-status code.
+fn relay_handle<T>(
+    runtime: aster_runtime_t,
+    registry: &HandleRegistry<T>,
+    id: u64,
+    what: &str,
+) -> Result<Arc<T>, i32> {
+    if crate::load_runtime(runtime).is_err() {
+        set_last_error("unknown runtime");
+        return Err(B::ASTER_HTTP_BODY_UNKNOWN_HANDLE as i32);
+    }
+    registry.get(id).ok_or_else(|| {
+        set_last_error(format!("unknown {what} handle {id}"));
+        B::ASTER_HTTP_BODY_UNKNOWN_HANDLE as i32
+    })
+}
+
+fn upload_for(
+    runtime: aster_runtime_t,
+    upload: aster_http_upload_t,
+) -> Result<Arc<RelayUpload>, i32> {
+    relay_handle(runtime, &UPLOADS, upload, "http upload")
+}
+
+fn response_for(
+    runtime: aster_runtime_t,
+    response: aster_http_response_t,
+) -> Result<Arc<RelayResponse>, i32> {
+    relay_handle(runtime, &RESPONSES, response, "http response")
+}
+
+/// Queue one request-body chunk (copied; at most the options' `max_chunk`
+/// bytes, else `CHUNK_TOO_LARGE`), waiting up to `timeout_ms` while the
+/// buffer is full. A timed-out write (`TIMEOUT`) queued nothing.
+/// `CANCELLED`: the request side is gone (the handler stopped reading -- it
+/// may already have answered -- or the exchange failed); stop producing.
+/// `FINISHED` after `finish` / `abort`, including for a write parked when
+/// another thread finished or aborted. Blocking: never on a tokio runtime
+/// thread (`BLOCKING_ON_RUNTIME`), even with `timeout_ms` = 0; use
+/// `aster_http_upload_try_write` to poll. Returns `aster_http_body_status_t`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_upload_write(
+    runtime: aster_runtime_t,
+    upload: aster_http_upload_t,
+    chunk: *const u8,
+    len: usize,
+    timeout_ms: u32,
+) -> i32 {
+    let data = match chunk_in(chunk, len) {
+        Ok(d) => d,
+        Err(c) => return c,
+    };
+    let up = match upload_for(runtime, upload) {
+        Ok(u) => u,
+        Err(c) => return c,
+    };
+    match up.write_blocking(Bytes::from(data), Duration::from_millis(timeout_ms as u64)) {
+        Ok(()) => B::ASTER_HTTP_BODY_OK as i32,
+        Err(e) => body_code(&e),
+    }
+}
+
+/// Queue one chunk if there is room now. On `OK`, `*out_queued` is 1
+/// (queued) or 0 (full: nothing queued; arm `aster_http_upload_ready`).
+/// Never blocks; any thread.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_upload_try_write(
+    runtime: aster_runtime_t,
+    upload: aster_http_upload_t,
+    chunk: *const u8,
+    len: usize,
+    out_queued: *mut u32,
+) -> i32 {
+    if out_queued.is_null() {
+        return body_invalid("aster_http_upload_try_write: out_queued is NULL");
+    }
+    *out_queued = 0;
+    let data = match chunk_in(chunk, len) {
+        Ok(d) => d,
+        Err(c) => return c,
+    };
+    let up = match upload_for(runtime, upload) {
+        Ok(u) => u,
+        Err(c) => return c,
+    };
+    match up.try_write(Bytes::from(data)) {
+        Ok(queued) => {
+            *out_queued = u32::from(queued);
+            B::ASTER_HTTP_BODY_OK as i32
+        }
+        Err(e) => body_code(&e),
+    }
+}
+
+/// End the request body cleanly; queued chunks are still sent. A second
+/// `finish` / `abort` is `FINISHED`. Never blocks.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_upload_finish(
+    runtime: aster_runtime_t,
+    upload: aster_http_upload_t,
+) -> i32 {
+    let up = match upload_for(runtime, upload) {
+        Ok(u) => u,
+        Err(c) => return c,
+    };
+    match up.finish() {
+        Ok(()) => B::ASTER_HTTP_BODY_OK as i32,
+        Err(e) => body_code(&e),
+    }
+}
+
+/// End the request body with an error: queued chunks are discarded and the
+/// request stream is reset, so the handler sees a failed body, never a
+/// truncated one. Before the head, the response then fails with
+/// `UPLOAD_FAILED`. `message` (UTF-8, may be NULL / 0) stays local. Never
+/// blocks.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_upload_abort(
+    runtime: aster_runtime_t,
+    upload: aster_http_upload_t,
+    message: *const u8,
+    len: usize,
+) -> i32 {
+    let raw = match chunk_in(message, len) {
+        Ok(d) => d,
+        Err(c) => return c,
+    };
+    let up = match upload_for(runtime, upload) {
+        Ok(u) => u,
+        Err(c) => return c,
+    };
+    match up.abort(&String::from_utf8_lossy(&raw)) {
+        Ok(()) => B::ASTER_HTTP_BODY_OK as i32,
+        Err(e) => body_code(&e),
+    }
+}
+
+/// Arm a one-shot readiness notification: `ASTER_EVENT_HTTP_RELAY_READY`
+/// (`handle` = `upload`) once `aster_http_upload_try_write` could queue a
+/// chunk (`error_code` 0) or every write would fail (`error_code`
+/// `FINISHED` / `CANCELLED`). Readiness only: another writer may take the
+/// room first. Freeing the upload resolves it. Returns `aster_status_t`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_upload_ready(
+    runtime: aster_runtime_t,
+    upload: aster_http_upload_t,
+    user_data: u64,
+    out_operation: *mut aster_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return invalid("aster_http_upload_ready: out_operation is NULL");
+    }
+    let bridge = try_status!(bridge_for(runtime));
+    let Some(up) = UPLOADS.get(upload) else {
+        return not_found(format!("unknown http upload handle {upload}"));
+    };
+    let up = (*up).clone();
+    spawn_op(&bridge, user_data, out_operation, async move {
+        let code = match up.ready().await {
+            Ok(()) => 0,
+            Err(e) => e.code() as i32,
+        };
+        Ok(ready_event(upload, code))
+    })
+}
+
+fn ready_event(handle: u64, code: i32) -> Done {
+    Done::ok(aster_event_kind_t::ASTER_EVENT_HTTP_RELAY_READY, handle)
+        .status(body_code_status(code))
+        .code(code)
+}
+
+/// Release the upload handle. An upload not yet finished is **aborted**
+/// (the handler sees a failed body, never a truncated one), and a write
+/// parked on another thread returns `FINISHED`. `NOT_FOUND` for an unknown
+/// handle. Returns `aster_status_t`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_upload_free(
+    runtime: aster_runtime_t,
+    upload: aster_http_upload_t,
+) -> i32 {
+    try_status!(bridge_for(runtime));
+    match UPLOADS.remove(upload) {
+        Some(up) => {
+            // Explicit, not left to `Drop`: a parked write or an armed
+            // readiness op may still hold a clone.
+            let _ = up.abort("upload handle freed");
+            OK
+        }
+        None => not_found(format!("unknown http upload handle {upload}")),
+    }
+}
+
+/// The response head, as a UCv1 `C5` message (`ExposeHttpResponse`: status,
+/// headers, body mode `Stream`) copied into `buf`; `*out_len` = its size.
+/// Waits up to `timeout_ms` for it; `timeout_ms` = 0 never blocks (any
+/// thread) and returns `TIMEOUT` while the head is not in. Sticky: every
+/// call after the head returns the same head. `BUFFER_TOO_SMALL`: `*out_len`
+/// is the size needed (`buf` may be NULL with `cap` 0 to ask); retry.
+///
+/// Failures (sticky too): `UNKNOWN_SERVICE`, `DENIED`, `OVERLOADED`,
+/// `RESET`, `BAD_HEAD`, `CONNECTION_CLOSED`, `UPLOAD_FAILED`, `CANCELLED`
+/// (closed / freed before the head); `TIMEOUT` (not sticky: the exchange
+/// keeps running) and `BLOCKING_ON_RUNTIME` for `timeout_ms` > 0 on a
+/// runtime thread. Returns `aster_http_body_status_t`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_response_wait(
+    runtime: aster_runtime_t,
+    response: aster_http_response_t,
+    timeout_ms: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if out_len.is_null() || (buf.is_null() && cap != 0) {
+        return body_invalid("aster_http_response_wait: NULL out_len, or NULL buf with cap > 0");
+    }
+    *out_len = 0;
+    let resp = match response_for(runtime, response) {
+        Ok(r) => r,
+        Err(c) => return c,
+    };
+    let outcome = if timeout_ms == 0 {
+        match resp.try_wait() {
+            Some(o) => o,
+            None => return relay_code(&ResponseError::Timeout),
+        }
+    } else {
+        resp.wait_blocking(Duration::from_millis(timeout_ms as u64))
+    };
+    let head = match outcome {
+        Ok((head, _)) => head,
+        Err(e) => return relay_code(&e),
+    };
+    let c5 = codec::encode_expose_http_response(&ExposeHttpResponse {
+        status: head.status,
+        headers: head.headers,
+        body: HttpBodyMode::Stream,
+    });
+    *out_len = c5.len();
+    if c5.len() > cap {
+        set_last_error(format!(
+            "response head needs {} bytes, buffer has {cap}",
+            c5.len()
+        ));
+        return B::ASTER_HTTP_BODY_BUFFER_TOO_SMALL as i32;
+    }
+    ptr::copy_nonoverlapping(c5.as_ptr(), buf, c5.len());
+    B::ASTER_HTTP_BODY_OK as i32
+}
+
+/// Read up to `cap` bytes of the response body into `buf` (at most
+/// `min(cap, max_chunk)` per call), waiting up to `timeout_ms` -- for the
+/// head first if it is not in yet, then for data. `timeout_ms` = 0 never
+/// blocks (any thread): `TIMEOUT` when nothing is ready. On `OK`, `*out_len`
+/// bytes are in `buf`, or `*out_eof` = 1 at the clean end (`*out_len` 0;
+/// sticky). A timed-out read consumed nothing. Read to the end before
+/// freeing the response, or the exchange counts as abandoned (an unfinished
+/// upload is reset).
+///
+/// Failures: the head's (see `aster_http_response_wait`) before the head;
+/// after it `READ` (the response failed mid-body: sticky, never a clean
+/// end) and `CANCELLED` (closed). `cap` must be > 0. Returns
+/// `aster_http_body_status_t`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_response_read(
+    runtime: aster_runtime_t,
+    response: aster_http_response_t,
+    buf: *mut u8,
+    cap: usize,
+    timeout_ms: u32,
+    out_len: *mut usize,
+    out_eof: *mut u32,
+) -> i32 {
+    if out_len.is_null() || out_eof.is_null() || buf.is_null() || cap == 0 {
+        return body_invalid("aster_http_response_read: NULL out pointer / buffer or zero cap");
+    }
+    *out_len = 0;
+    *out_eof = 0;
+    let resp = match response_for(runtime, response) {
+        Ok(r) => r,
+        Err(c) => return c,
+    };
+    let copy = |chunk: &[u8]| {
+        // A read returns at most `cap`, so this always fits.
+        let n = chunk.len().min(cap);
+        ptr::copy_nonoverlapping(chunk.as_ptr(), buf, n);
+        *out_len = n;
+        B::ASTER_HTTP_BODY_OK as i32
+    };
+    if timeout_ms == 0 {
+        let reader = match resp.try_wait() {
+            Some(Ok((_, reader))) => reader,
+            Some(Err(e)) => return relay_code(&e),
+            None => return relay_code(&ResponseError::Timeout),
+        };
+        return match reader.try_read(cap) {
+            Ok(TryRead::Data(chunk)) => copy(&chunk),
+            Ok(TryRead::End) => {
+                *out_eof = 1;
+                B::ASTER_HTTP_BODY_OK as i32
+            }
+            Ok(TryRead::Pending) => body_code(&BodyError::Timeout),
+            Err(e) => body_code(&e),
+        };
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
+    let reader = match resp.wait_blocking(Duration::from_millis(timeout_ms as u64)) {
+        Ok((_, reader)) => reader,
+        Err(e) => return relay_code(&e),
+    };
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    match reader.read_blocking(cap, left) {
+        Ok(Some(chunk)) => copy(&chunk),
+        Ok(None) => {
+            *out_eof = 1;
+            B::ASTER_HTTP_BODY_OK as i32
+        }
+        Err(e) => body_code(&e),
+    }
+}
+
+/// Arm a one-shot readiness notification: `ASTER_EVENT_HTTP_RELAY_READY`
+/// (`handle` = `response`). Armed before the head is in, it fires when the
+/// head (or the failure) is in -- `error_code` is then what
+/// `aster_http_response_wait` returns. Armed after the head, it fires when
+/// a read with `timeout_ms` = 0 would not return `TIMEOUT` -- `error_code`
+/// 0 for data or the end, else the read's failure. Closing or freeing the
+/// response resolves it. Returns `aster_status_t`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_response_ready(
+    runtime: aster_runtime_t,
+    response: aster_http_response_t,
+    user_data: u64,
+    out_operation: *mut aster_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return invalid("aster_http_response_ready: out_operation is NULL");
+    }
+    let bridge = try_status!(bridge_for(runtime));
+    let Some(resp) = RESPONSES.get(response) else {
+        return not_found(format!("unknown http response handle {response}"));
+    };
+    let resp = (*resp).clone();
+    let armed_after_head = resp.try_wait();
+    spawn_op(&bridge, user_data, out_operation, async move {
+        let code = match armed_after_head {
+            Some(Ok((_, reader))) => match reader.ready().await {
+                Ok(()) => 0,
+                Err(e) => e.code() as i32,
+            },
+            Some(Err(e)) => e.code() as i32,
+            None => {
+                resp.ready().await;
+                match resp.try_wait() {
+                    Some(Ok(_)) => 0,
+                    Some(Err(e)) => e.code() as i32,
+                    None => ResponseError::Cancelled.code() as i32,
+                }
+            }
+        };
+        Ok(ready_event(response, code))
+    })
+}
+
+/// Abandon the exchange, keeping the handle: before the head it is
+/// cancelled (the request is reset; `wait` returns `CANCELLED`); after it
+/// the body is closed (the handler's writes fail, an unfinished upload is
+/// reset unless the body already ended cleanly; reads return `CANCELLED`).
+/// Wakes calls blocked on the response in other threads. Idempotent;
+/// returns `aster_status_t`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_response_close(
+    runtime: aster_runtime_t,
+    response: aster_http_response_t,
+) -> i32 {
+    try_status!(bridge_for(runtime));
+    match RESPONSES.get(response) {
+        Some(resp) => {
+            resp.close();
+            OK
+        }
+        None => not_found(format!("unknown http response handle {response}")),
+    }
+}
+
+/// `aster_http_response_close`, then release the handle. Free the upload
+/// separately. `NOT_FOUND` for an unknown handle. Returns `aster_status_t`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_http_response_free(
+    runtime: aster_runtime_t,
+    response: aster_http_response_t,
+) -> i32 {
+    try_status!(bridge_for(runtime));
+    match RESPONSES.remove(response) {
+        Some(resp) => {
+            resp.close();
+            OK
+        }
+        None => not_found(format!("unknown http response handle {response}")),
     }
 }

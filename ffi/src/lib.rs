@@ -88,8 +88,19 @@ pub mod upcall;
 //   `aster_http_body_*` body I/O over upcall kind 49, and the buffered
 //   consumer `aster_expose_relay_request`; upcall kinds 48-50 are now
 //   issued by the C ABI.
+// - 4.3.0 (additive): streaming consumer relay (`expose.rs`) --
+//   `aster_expose_relay_stream` with `aster_http_upload_*` /
+//   `aster_http_response_*` handles, readiness on the completion queue
+//   (`ASTER_EVENT_HTTP_RELAY_READY`), relay codes 10-17 in
+//   `aster_http_body_status_t`; `aster_status_t` reserves
+//   `UNAUTHENTICATED` / `PERMISSION_DENIED` / `CREDENTIAL_EXPIRED` for the
+//   R4 auth model. Semantic refinements: an `ASTER_EVENT_ERROR` of
+//   `aster_expose_relay_request` now carries a specific `status` (e.g.
+//   `PERMISSION_DENIED` for a denied relay; was always `INTERNAL`) and the
+//   relay code in `error_code` (was -1); a refused http-relay stream is now
+//   reset with a refusal code (wire), no longer dropped silently.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 2;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 3;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -137,6 +148,17 @@ pub enum aster_status_t {
     /// attestation chain did not verify, or a grant role did not match its
     /// capability. `aster_last_error_message` says which check failed.
     ASTER_STATUS_VERIFICATION_FAILED = 13,
+    /// Reserved for the R4 auth model (ABI 4.3): the caller presented no
+    /// usable credential. Not returned by any 4.3 function.
+    ASTER_STATUS_UNAUTHENTICATED = 14,
+    /// The peer's (or local) policy refused the caller (ABI 4.3). Reserved
+    /// for the R4 auth model; today only an expose relay the serving node's
+    /// authorizer denied reports it (`aster_expose_relay_request` error
+    /// events, `ASTER_EVENT_HTTP_RELAY_READY`).
+    ASTER_STATUS_PERMISSION_DENIED = 15,
+    /// Reserved for the R4 auth model (ABI 4.3): the presented credential
+    /// has expired. Not returned by any 4.3 function.
+    ASTER_STATUS_CREDENTIAL_EXPIRED = 16,
 }
 
 /// Relay mode
@@ -279,6 +301,16 @@ pub enum aster_event_kind_t {
     /// `aster_lease_watch`: the lease left `HELD`; `flags` =
     /// `aster_lease_status_t`.
     ASTER_EVENT_LEASE_STATUS = 108,
+
+    // Streaming consumer relay (ABI 4.3, expose.rs)
+    /// `aster_http_upload_ready` / `aster_http_response_ready`: the armed
+    /// handle (`handle`) is ready. `error_code` = the
+    /// `aster_http_body_status_t` its next non-blocking call returns (0:
+    /// it succeeds -- room to write, a head, data or the end), `status` =
+    /// that code as an `aster_status_t` (`PERMISSION_DENIED` for a denied
+    /// relay; see `aster_http_relay_status`). One-shot: re-arm after
+    /// handling.
+    ASTER_EVENT_HTTP_RELAY_READY = 109,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
@@ -733,16 +765,34 @@ impl BridgeRuntime {
     }
 
     fn emit_error(&self, operation: u64, user_data: u64, message: &str) {
+        self.emit_error_coded(
+            operation,
+            user_data,
+            aster_status_t::ASTER_STATUS_INTERNAL,
+            -1,
+            message,
+        );
+    }
+
+    /// An `ASTER_EVENT_ERROR` with a specific `status` and `error_code`.
+    pub(crate) fn emit_error_coded(
+        &self,
+        operation: u64,
+        user_data: u64,
+        status: aster_status_t,
+        error_code: i32,
+        message: &str,
+    ) {
         let data = message.as_bytes().to_vec();
         let (buf_id, _) = self.buffers.insert(data);
         let event = EventInternal::new(
             aster_event_kind_t::ASTER_EVENT_ERROR,
-            aster_status_t::ASTER_STATUS_INTERNAL,
+            status,
             operation,
             0,
             0,
             user_data,
-            -1,
+            error_code,
         )
         .with_buffer(buf_id, message.len());
         self.emit(EventOwned {
@@ -1336,6 +1386,15 @@ pub extern "C" fn aster_status_name(status: i32) -> *const c_char {
         x if x == aster_status_t::ASTER_STATUS_ABI_MISMATCH as i32 => "ASTER_STATUS_ABI_MISMATCH\0",
         x if x == aster_status_t::ASTER_STATUS_VERIFICATION_FAILED as i32 => {
             "ASTER_STATUS_VERIFICATION_FAILED\0"
+        }
+        x if x == aster_status_t::ASTER_STATUS_UNAUTHENTICATED as i32 => {
+            "ASTER_STATUS_UNAUTHENTICATED\0"
+        }
+        x if x == aster_status_t::ASTER_STATUS_PERMISSION_DENIED as i32 => {
+            "ASTER_STATUS_PERMISSION_DENIED\0"
+        }
+        x if x == aster_status_t::ASTER_STATUS_CREDENTIAL_EXPIRED as i32 => {
+            "ASTER_STATUS_CREDENTIAL_EXPIRED\0"
         }
         _ => "ASTER_STATUS_UNKNOWN\0",
     };

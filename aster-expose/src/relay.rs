@@ -135,6 +135,141 @@ impl Drop for ResetOnDrop {
     }
 }
 
+/// Why a consumer-side relay ([`relay_request_streaming`] /
+/// [`relay_request`]) failed before its response head (or, for the buffered
+/// [`relay_request`], while collecting the body). Stable categories a binding
+/// can map to codes without parsing messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RelayFailureKind {
+    /// The peer has no exposed service of this id.
+    UnknownService,
+    /// The service's admission policy refused this peer.
+    Denied,
+    /// The service is at its concurrent-stream cap (retryable).
+    Overloaded,
+    /// The peer reset or ended the stream before a complete response: the
+    /// handler or relay failed (or, for [`relay_request`], the body failed
+    /// partway).
+    Reset,
+    /// The response head was malformed or too large.
+    BadHead,
+    /// The connection is closed or was lost.
+    ConnectionClosed,
+    /// The caller's own request body failed (aborted, dropped unfinished)
+    /// before the response head.
+    UploadFailed,
+}
+
+/// The error of a consumer-side relay: the root of the `anyhow::Error` that
+/// [`relay_request_streaming`] / [`relay_request`] return
+/// (`err.downcast_ref::<RelayFailure>()`). Displays the underlying message
+/// (refusals get a plain description); the underlying error is its source.
+#[derive(Debug)]
+pub struct RelayFailure {
+    kind: RelayFailureKind,
+    message: Option<String>,
+    error: anyhow::Error,
+}
+
+impl RelayFailure {
+    fn wrap(kind: RelayFailureKind, error: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            kind,
+            message: None,
+            error,
+        })
+    }
+
+    /// The failure category.
+    pub fn kind(&self) -> RelayFailureKind {
+        self.kind
+    }
+
+    /// Classify a failure to read the response head (or body) off the wire.
+    fn classify_read(service_id: &str, error: anyhow::Error) -> anyhow::Error {
+        use aster_transport_core::framing::{
+            RESET_CODE_RELAY_DENIED, RESET_CODE_RELAY_OVERLOADED, RESET_CODE_RELAY_UNKNOWN_SERVICE,
+        };
+        use aster_transport_core::stream_io::StreamFailure;
+        let (kind, message) = match StreamFailure::of(&error) {
+            Some(StreamFailure::Reset(code) | StreamFailure::Stopped(code)) => match code {
+                c if c == u64::from(RESET_CODE_RELAY_UNKNOWN_SERVICE) => (
+                    RelayFailureKind::UnknownService,
+                    Some(format!("service '{service_id}' is not exposed by the peer")),
+                ),
+                c if c == u64::from(RESET_CODE_RELAY_DENIED) => (
+                    RelayFailureKind::Denied,
+                    Some(format!("the peer denied access to service '{service_id}'")),
+                ),
+                c if c == u64::from(RESET_CODE_RELAY_OVERLOADED) => (
+                    RelayFailureKind::Overloaded,
+                    Some(format!(
+                        "service '{service_id}' is at its concurrent-stream limit"
+                    )),
+                ),
+                _ => (RelayFailureKind::Reset, None),
+            },
+            Some(StreamFailure::ConnectionLost) => (RelayFailureKind::ConnectionClosed, None),
+            // A clean end of stream before a whole head: the peer gave up.
+            None if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) =>
+            {
+                (RelayFailureKind::Reset, None)
+            }
+            None if error.downcast_ref::<HeadTooLarge>().is_some() => {
+                (RelayFailureKind::BadHead, None)
+            }
+            None => (RelayFailureKind::Reset, None),
+        };
+        anyhow::Error::new(Self {
+            kind,
+            message,
+            error,
+        })
+    }
+
+    /// Classify a failure to open the stream.
+    fn classify_open(error: anyhow::Error) -> anyhow::Error {
+        // Opening only fails on a closed connection (the service id length
+        // is the caller's to check; an over-long id lands here too).
+        Self::wrap(RelayFailureKind::ConnectionClosed, error)
+    }
+}
+
+impl std::fmt::Display for RelayFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.message {
+            Some(m) => f.write_str(m),
+            None => std::fmt::Display::fmt(&self.error, f),
+        }
+    }
+}
+
+impl std::error::Error for RelayFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.message {
+            // A described refusal: the wire error is the cause.
+            Some(_) => Some(self.error.as_ref()),
+            // Transparent: the wrapped error's own cause.
+            None => self.error.source(),
+        }
+    }
+}
+
+/// A length-prefixed head over its limit.
+#[derive(Debug)]
+struct HeadTooLarge(String);
+
+impl std::fmt::Display for HeadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HeadTooLarge {}
+
 /// Flatten a relay/body error into `anyhow` (its `From` doesn't cover the boxed
 /// `dyn Error` directly, so go through `Display`).
 fn relay_anyhow(e: impl Into<RelayError>) -> anyhow::Error {
@@ -154,7 +289,7 @@ async fn read_length_prefixed<R: AsyncRead + Unpin + ?Sized>(
 ) -> Result<Vec<u8>> {
     let len = read_u32_le(r).await? as usize;
     if len > max {
-        bail!("{what} too large: {len} > {max}");
+        return Err(HeadTooLarge(format!("{what} too large: {len} > {max}")).into());
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
@@ -306,9 +441,13 @@ where
     B: Body + Unpin + Send + 'static,
     B::Error: Into<RelayError>,
 {
-    let (send, recv) = conn.open_http_relay(service_id, &[]).await?;
+    let (send, recv) = conn
+        .open_http_relay(service_id, &[])
+        .await
+        .map_err(RelayFailure::classify_open)?;
     let (parts, body) = request.into_parts();
-    let head = codec::encode_request_head(&parts)?;
+    let head = codec::encode_request_head(&parts)
+        .map_err(|e| RelayFailure::wrap(RelayFailureKind::BadHead, e))?;
 
     // Independent halves: a write parked on flow control holds the send
     // half's lock inside `AsterWrite`, which the upload task owns and drops
@@ -325,19 +464,26 @@ where
         w, send, head, body, failed_tx,
     ))));
 
+    let upload_failed = |e| RelayFailure::wrap(RelayFailureKind::UploadFailed, e);
     let head = tokio::select! {
         biased;
         head = read_length_prefixed(&mut r, MAX_HEAD, "response head") => head,
         // The request body failed before the head: the upload has reset the
         // request.
-        Ok(e) = &mut failed_rx => return Err(e),
+        Ok(e) = &mut failed_rx => return Err(upload_failed(e)),
     };
     let head = match head {
         Ok(h) => h,
         // A failed upload makes the server fail too; report the cause.
-        Err(e) => return Err(failed_rx.try_recv().unwrap_or(e)),
+        Err(e) => {
+            return Err(match failed_rx.try_recv() {
+                Ok(cause) => upload_failed(cause),
+                Err(_) => RelayFailure::classify_read(service_id, e),
+            })
+        }
     };
-    let parts = codec::decode_response_head(&head)?;
+    let parts = codec::decode_response_head(&head)
+        .map_err(|e| RelayFailure::wrap(RelayFailureKind::BadHead, e))?;
     Ok(http::Response::from_parts(
         parts,
         RelayBody::new(Box::pin(DuplexRead { read: r, upload })),
@@ -462,7 +608,7 @@ pub async fn relay_request(
     let body = body
         .collect()
         .await
-        .map_err(relay_anyhow)?
+        .map_err(|e| RelayFailure::wrap(RelayFailureKind::Reset, relay_anyhow(e)))?
         .to_bytes()
         .to_vec();
     Ok(http::Response::from_parts(parts, body))
@@ -610,6 +756,41 @@ pub fn expose_local_http(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    /// Head-read failures map to stable kinds; a wrapped error keeps its
+    /// message and chain (`{:#}`) exactly.
+    #[tokio::test]
+    async fn relay_failures_classify_and_stay_transparent() {
+        let kind = |e: &anyhow::Error| e.downcast_ref::<RelayFailure>().unwrap().kind();
+
+        // A bare end of stream before a whole head: the peer gave up.
+        let (mut a, b) = tokio::io::duplex(64);
+        drop(b);
+        let eof = read_length_prefixed(&mut a, 16, "response head")
+            .await
+            .unwrap_err();
+        let text = format!("{eof:#}");
+        let e = RelayFailure::classify_read("svc", eof);
+        assert_eq!(kind(&e), RelayFailureKind::Reset);
+        assert_eq!(format!("{e:#}"), text);
+
+        // An oversized head.
+        let (mut a, mut b) = tokio::io::duplex(64);
+        b.write_all(&100u32.to_le_bytes()).await.unwrap();
+        let big = read_length_prefixed(&mut a, 16, "response head")
+            .await
+            .unwrap_err();
+        assert_eq!(big.to_string(), "response head too large: 100 > 16");
+        let e = RelayFailure::classify_read("svc", big);
+        assert_eq!(kind(&e), RelayFailureKind::BadHead);
+        assert_eq!(e.to_string(), "response head too large: 100 > 16");
+
+        // A contextual error keeps its whole chain.
+        let inner = anyhow::anyhow!("root cause").context("outer");
+        let e = RelayFailure::wrap(RelayFailureKind::UploadFailed, inner);
+        assert_eq!(format!("{e:#}"), "outer: root cause");
+        assert_eq!(kind(&e), RelayFailureKind::UploadFailed);
+    }
 
     /// Streaming echo: drains the request body (so it exercises the streaming
     /// `RelayBody`) and reflects the path + byte count back as a `Full` body.

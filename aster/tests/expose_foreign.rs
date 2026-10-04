@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use aster::binding_support::relay::{relay_streaming, RelayOptions, RelayReader};
+use aster::binding_support::relay::{
+    relay_streaming, RelayOptions, RelayReader, ResponseError, TryRead,
+};
 use aster::binding_support::upcall::codec::{
     self, ExposeHttpRequest, ExposeHttpResponse, ExposeRouteSpec, HttpBodyMode,
 };
@@ -1045,6 +1047,30 @@ fn streaming_handler(log: Log) -> HttpFn {
                 }
                 let _ = ctx.bodies.finish(sid, Vec::new());
             }
+            "/gate" => {
+                // Read nothing until the test logs "open", then count the
+                // whole body and answer with its length.
+                while !log_has(&log, "open") {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut n = 0;
+                loop {
+                    match ctx.bodies.read_blocking(sid, 1 << 20, WAIT) {
+                        Ok(Some(c)) => n += c.len(),
+                        Ok(None) => break,
+                        Err(e) => {
+                            log.lock().unwrap().push(format!("read {} Err", e.code()));
+                            return;
+                        }
+                    }
+                }
+                ctx.respond(
+                    id,
+                    200,
+                    &[("x-len", &n.to_string())],
+                    HttpBodyMode::Inline(Vec::new()),
+                );
+            }
             "/early" => {
                 // Answer at once without reading the body.
                 ctx.respond(id, 413, &[], HttpBodyMode::Inline(b"too big".to_vec()));
@@ -1836,6 +1862,424 @@ async fn relay_cancel_with_a_parked_write_resets_the_request() {
             .any(|x| x.starts_with("read ") && !x.starts_with("read ok"))
     })
     .await;
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+// ── blocking / polling handles and stable codes (C ABI 4.3) ───────────────
+
+use aster::binding_support::relay::{RelayResponse, RelayUpload};
+
+/// Run `f` on a plain OS thread (not a runtime thread, where the blocking
+/// calls refuse to run) and await its result.
+async fn on_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    tokio::time::timeout(WAIT * 3, rx).await.unwrap().unwrap()
+}
+
+fn start(
+    n: &Net,
+    svc: &str,
+    method: &str,
+    uri: &str,
+    options: RelayOptions,
+) -> (RelayUpload, RelayResponse) {
+    relay_streaming(&rt(), &n.conn, svc, method, uri, &[], options).unwrap()
+}
+
+/// Refusals, connection loss and cancellation reach the consumer as
+/// distinct stable codes (not message text), sticky across calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_failures_have_stable_codes() {
+    let log: Log = Arc::default();
+    let (queue, ctx) = setup();
+    let _f = Foreign::start(queue, ctx.clone(), true, streaming_handler(log.clone()));
+    let c = ctx.clone();
+    let deny: aster::expose::AuthorizeFn = Arc::new(|_ctx: PeerContext| {
+        Box::pin(async { Err(anyhow::anyhow!("not you")) })
+            as aster::expose::BoxFut<anyhow::Result<()>>
+    });
+    let n = net(move |e| {
+        expose_foreign_http(e, &c.upcalls, &c.bodies, SVC, ForeignHttpOptions::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        e.expose_http("locked", deny, accept_then_read(tx));
+    })
+    .await;
+
+    for (svc, want) in [("nope", 10), ("locked", 11)] {
+        let (upload, response) = start(&n, svc, "PUT", "/", RelayOptions::default());
+        let _ = upload.write(Bytes::from_static(b"x")).await;
+        let _ = upload.finish();
+        let r = response.clone();
+        let err = on_thread(move || r.wait_blocking(WAIT).unwrap_err()).await;
+        assert_eq!(err.code(), want, "{svc}: {err}");
+        match want {
+            10 => assert!(
+                matches!(err, ResponseError::UnknownService(ref m) if m.contains("not exposed")),
+                "{err}"
+            ),
+            _ => assert!(
+                matches!(err, ResponseError::Denied(ref m) if m.contains("denied")),
+                "{err}"
+            ),
+        }
+        // Sticky, and the same through the non-blocking and async calls.
+        assert_eq!(response.try_wait().unwrap().unwrap_err(), err);
+        let e = response.wait().await.unwrap_err();
+        assert!(matches!(e, aster::Error::Transport(_)), "{e:?}");
+    }
+
+    // Cancelled before the head.
+    let (_upload, response) = start(&n, SVC, "PUT", "/hold", RelayOptions::default());
+    response.cancel();
+    let err = response.try_wait().unwrap().unwrap_err();
+    assert_eq!((err.code(), err), (2, ResponseError::Cancelled));
+    assert!(matches!(
+        response.wait().await,
+        Err(aster::Error::Connection(_))
+    ));
+
+    // The connection goes away while the head is awaited, then a new
+    // exchange on the closed connection.
+    let (_upload, response) = start(&n, SVC, "PUT", "/hold", RelayOptions::default());
+    let r = response.clone();
+    let waiting = tokio::spawn(on_thread(move || r.wait_blocking(WAIT)));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    n.conn.close(0, b"bye".to_vec()).unwrap();
+    let err = waiting.await.unwrap().unwrap_err();
+    assert_eq!(err.code(), 15, "{err}");
+    let (_upload, response) = start(&n, SVC, "GET", "/", RelayOptions::default());
+    let r = response.clone();
+    let err = on_thread(move || r.wait_blocking(WAIT).unwrap_err()).await;
+    assert_eq!(err.code(), 15, "{err}");
+    assert!(matches!(
+        response.wait().await,
+        Err(aster::Error::Connection(_))
+    ));
+    n.shutdown().await;
+}
+
+/// The blocking calls on a binding thread, full duplex: an early answer
+/// while uploading, an abort before the head, closing the response before
+/// its end, and a clean end that leaves the upload to finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_blocking_calls_keep_the_full_duplex_contract() {
+    let log: Log = Arc::default();
+    let (queue, ctx) = setup();
+    let _f = Foreign::start(queue, ctx.clone(), true, streaming_handler(log.clone()));
+    let c = ctx.clone();
+    let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let allow: aster::expose::AuthorizeFn = Arc::new(|_ctx: PeerContext| {
+        Box::pin(async { Ok(()) }) as aster::expose::BoxFut<anyhow::Result<()>>
+    });
+    let n = net(move |e| {
+        expose_foreign_http(e, &c.upcalls, &c.bodies, SVC, ForeignHttpOptions::default());
+        e.expose_http("bg", allow, accept_then_read(seen_tx));
+    })
+    .await;
+
+    // 1. Early 413 while the upload is still being written.
+    let (upload, response) = start(&n, SVC, "PUT", "/early", RelayOptions::default());
+    let writer = {
+        let up = upload.clone();
+        tokio::spawn(on_thread(move || loop {
+            if let Err(e) = up.write_blocking(Bytes::from(vec![9; 64 * 1024]), WAIT) {
+                return e;
+            }
+        }))
+    };
+    let body = on_thread(move || {
+        let (head, reader) = response.wait_blocking(WAIT).unwrap();
+        let mut body = Vec::new();
+        while let Some(c) = reader.read_blocking(1 << 20, WAIT).unwrap() {
+            body.extend_from_slice(&c);
+        }
+        // The end is sticky and clean.
+        assert_eq!(reader.read_blocking(10, WAIT), Ok(None));
+        (head.status, body)
+        // `response` (and with it the reader) drops here.
+    })
+    .await;
+    assert_eq!(body, (413, b"too big".to_vec()));
+    assert_eq!(writer.await.unwrap(), BodyError::Cancelled);
+    drop(upload);
+
+    // 2. Abort before the head: the call fails with UploadFailed and the
+    // handler sees a failed body.
+    log.lock().unwrap().clear();
+    let (upload, response) = start(&n, SVC, "PUT", "/echo", RelayOptions::default());
+    let up = upload.clone();
+    on_thread(move || up.write_blocking(Bytes::from(vec![5; 50_000]), WAIT))
+        .await
+        .unwrap();
+    // (A reset that beats the request head to the server would skip the
+    // handler altogether.)
+    wait_until("handler started", || log_has(&log, "start /echo")).await;
+    let err = on_thread(move || {
+        upload.abort("client gave up").unwrap();
+        assert_eq!(upload.abort("again"), Err(BodyError::Finished));
+        assert_eq!(
+            upload.write_blocking(Bytes::from_static(b"x"), WAIT),
+            Err(BodyError::Finished)
+        );
+        response.wait_blocking(WAIT).unwrap_err()
+    })
+    .await;
+    assert_eq!(err.code(), 16, "{err}");
+    wait_until("handler saw a failed body", || {
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|x| x.starts_with("read ") && !x.starts_with("read ok"))
+    })
+    .await;
+
+    // 3. Closing the response before its end resets the unfinished upload.
+    log.lock().unwrap().clear();
+    let (upload, response) = start(&n, SVC, "POST", "/duplex", RelayOptions::default());
+    let res = on_thread(move || {
+        let (_, reader) = response.wait_blocking(WAIT).unwrap();
+        upload
+            .write_blocking(Bytes::from_static(b"one"), WAIT)
+            .unwrap();
+        let echo = reader.read_blocking(1 << 20, WAIT).unwrap().unwrap();
+        response.close();
+        assert_eq!(reader.read_blocking(10, WAIT), Err(BodyError::Cancelled));
+        let mut res = Ok(());
+        for _ in 0..500 {
+            res = upload.write_blocking(Bytes::from_static(b"more"), WAIT);
+            if res.is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (echo, res)
+    })
+    .await;
+    assert_eq!(res, (Bytes::from_static(b"one"), Err(BodyError::Cancelled)));
+    wait_until("handler saw the reset", || {
+        let l = log.lock().unwrap();
+        l.iter()
+            .any(|x| x.starts_with("read ") && x.contains("Err"))
+            || l.iter().any(|x| x == "duplex write failed")
+    })
+    .await;
+    assert!(!log_has(&log, "duplex done"));
+
+    // 4. A response read to its clean end leaves the upload to finish.
+    const BIG: usize = 4 << 20;
+    let (upload, response) = start(&n, "bg", "PUT", "/", RelayOptions::default());
+    let status = on_thread(move || {
+        upload
+            .write_blocking(Bytes::from_static(b"first"), WAIT)
+            .unwrap();
+        let (head, reader) = response.wait_blocking(WAIT).unwrap();
+        let mut body = Vec::new();
+        while let Some(c) = reader.read_blocking(1 << 20, WAIT).unwrap() {
+            body.extend_from_slice(&c);
+        }
+        assert_eq!(body, b"accepted");
+        drop(reader);
+        drop(response);
+        for piece in vec![4u8; BIG].chunks(upload.max_chunk()) {
+            upload
+                .write_blocking(Bytes::copy_from_slice(piece), WAIT)
+                .unwrap();
+        }
+        upload.finish().unwrap();
+        head.status
+    })
+    .await;
+    assert_eq!(status, 202);
+    let got = tokio::time::timeout(WAIT, seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, Ok(BIG + 5));
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+/// Timed-out blocking calls consume / queue nothing and leave the exchange
+/// running; blocking calls on a runtime thread are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_blocking_timeouts_consume_nothing() {
+    let log: Log = Arc::default();
+    let (_f, ctx, n) = streaming_net(&log).await;
+
+    // Runtime threads are refused, without side effects.
+    let (upload, response) = start(&n, SVC, "PUT", "/gate", RelayOptions::default());
+    assert_eq!(
+        response.wait_blocking(WAIT).unwrap_err(),
+        ResponseError::BlockingOnRuntime
+    );
+    assert_eq!(
+        upload.write_blocking(Bytes::from_static(b"x"), WAIT),
+        Err(BodyError::BlockingOnRuntime)
+    );
+    assert_eq!(
+        upload.write_blocking(Bytes::from(vec![0; (1 << 20) + 1]), WAIT),
+        Err(BodyError::ChunkTooLarge {
+            got: (1 << 20) + 1,
+            max: 1 << 20
+        })
+    );
+    drop((upload, response));
+
+    // Fill every buffer while the handler reads nothing: writes time out
+    // eventually, and a timed-out write queued nothing.
+    let options = RelayOptions {
+        max_chunk: 64 * 1024,
+        upload_capacity: 1,
+    };
+    let (upload, response) = start(&n, SVC, "PUT", "/gate", options);
+    let (up, resp) = (upload.clone(), response.clone());
+    let (written, timeouts) = on_thread(move || {
+        assert_eq!(
+            resp.wait_blocking(Duration::from_millis(50)).unwrap_err(),
+            ResponseError::Timeout
+        );
+        let (mut written, mut timeouts) = (0usize, 0);
+        while timeouts < 3 {
+            match up.write_blocking(Bytes::from(vec![1; 64 * 1024]), Duration::from_millis(100)) {
+                Ok(()) => written += 64 * 1024,
+                Err(BodyError::Timeout) => timeouts += 1,
+                Err(e) => panic!("write failed: {e}"),
+            }
+        }
+        (written, timeouts)
+    })
+    .await;
+    assert!(written > 0 && timeouts == 3, "{written} {timeouts}");
+    log.lock().unwrap().push("open".into());
+    let head = on_thread(move || {
+        upload
+            .write_blocking(Bytes::from_static(b"tail"), WAIT)
+            .unwrap();
+        upload.finish().unwrap();
+        response.wait_blocking(WAIT).unwrap().0
+    })
+    .await;
+    assert_eq!(head.status, 200);
+    let len = (written + 4).to_string().into_bytes();
+    assert!(
+        head.headers.contains(&("x-len".into(), len)),
+        "{head:?} vs {written}"
+    );
+
+    // A timed-out read consumed nothing.
+    let (upload, response) = start(&n, SVC, "POST", "/duplex", RelayOptions::default());
+    let got = on_thread(move || {
+        let (_, reader) = response.wait_blocking(WAIT).unwrap();
+        assert_eq!(
+            reader.read_blocking(100, Duration::from_millis(50)),
+            Err(BodyError::Timeout)
+        );
+        upload
+            .write_blocking(Bytes::from_static(b"abcdef"), WAIT)
+            .unwrap();
+        let mut got = Vec::new();
+        while got.len() < 6 {
+            got.extend_from_slice(&reader.read_blocking(4, WAIT).unwrap().unwrap());
+        }
+        upload.finish().unwrap();
+        assert_eq!(reader.read_blocking(4, WAIT), Ok(None));
+        got
+    })
+    .await;
+    assert_eq!(got, b"abcdef");
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+/// The non-blocking calls plus readiness futures drive a whole exchange,
+/// as a poll loop would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_try_calls_and_readiness_drive_an_exchange() {
+    let log: Log = Arc::default();
+    let (_f, ctx, n) = streaming_net(&log).await;
+    let options = RelayOptions {
+        max_chunk: 64 * 1024,
+        upload_capacity: 1,
+    };
+
+    // Upload readiness: full while the handler is gated, ready once open.
+    let (upload, response) = start(&n, SVC, "PUT", "/gate", options);
+    assert!(response.try_wait().is_none());
+    let mut queued = 0;
+    loop {
+        if upload.try_write(Bytes::from(vec![2; 64 * 1024])).unwrap() {
+            queued += 64 * 1024;
+            continue;
+        }
+        // Full right now; the upload task may still drain into QUIC, so
+        // wait for readiness briefly, else every buffer is full.
+        match tokio::time::timeout(Duration::from_millis(200), upload.ready()).await {
+            Ok(r) => r.unwrap(),
+            Err(_) => break,
+        }
+    }
+    assert!(queued > 0);
+    log.lock().unwrap().push("open".into());
+    tokio::time::timeout(WAIT, upload.ready())
+        .await
+        .unwrap()
+        .unwrap();
+    upload.finish().unwrap();
+    assert_eq!(upload.ready().await, Err(BodyError::Finished));
+    tokio::time::timeout(WAIT, response.ready()).await.unwrap();
+    let (head, _) = response.try_wait().unwrap().unwrap();
+    let len = queued.to_string().into_bytes();
+    assert!(head.headers.contains(&("x-len".into(), len)), "{head:?}");
+
+    // Response readiness + try_read: a whole streamed body, in order.
+    let data: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
+    let (upload, response) = start(&n, SVC, "POST", "/echo", RelayOptions::default());
+    upload.write(Bytes::from(data.clone())).await.unwrap();
+    upload.finish().unwrap();
+    tokio::time::timeout(WAIT, response.ready()).await.unwrap();
+    let (head, reader) = response.try_wait().unwrap().unwrap();
+    assert_eq!(head.status, 200);
+    let mut got = Vec::new();
+    loop {
+        match reader.try_read(5000).unwrap() {
+            TryRead::Data(c) => {
+                assert!(!c.is_empty() && c.len() <= 5000);
+                got.extend_from_slice(&c);
+            }
+            TryRead::End => break,
+            TryRead::Pending => tokio::time::timeout(WAIT, reader.ready())
+                .await
+                .unwrap()
+                .unwrap(),
+        }
+    }
+    assert_eq!(got, data);
+    assert_eq!(reader.try_read(10), Ok(TryRead::End));
+
+    // Readiness resolves on close, and try_read then fails Cancelled.
+    let (upload, response) = start(&n, SVC, "GET", "/forever", RelayOptions::default());
+    upload.finish().unwrap();
+    tokio::time::timeout(WAIT, response.ready()).await.unwrap();
+    let (_, reader) = response.try_wait().unwrap().unwrap();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, reader.read(10)).await.unwrap(),
+        Ok(Some(_))
+    ));
+    response.close();
+    assert_eq!(
+        tokio::time::timeout(WAIT, reader.ready()).await.unwrap(),
+        Err(BodyError::Cancelled)
+    );
+    assert_eq!(reader.try_read(10), Err(BodyError::Cancelled));
+    wait_until("handler write cancelled", || {
+        log_has(&log, &format!("write {}", BodyError::Cancelled.code()))
+    })
+    .await;
+    drop((reader, response));
     wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
     n.shutdown().await;
 }

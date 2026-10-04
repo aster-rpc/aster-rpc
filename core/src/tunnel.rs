@@ -27,7 +27,10 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
 
-use crate::framing::RESET_CODE_TUNNEL_UPSTREAM_ABORTED;
+use crate::framing::{
+    RESET_CODE_RELAY_DENIED, RESET_CODE_RELAY_OVERLOADED, RESET_CODE_RELAY_UNKNOWN_SERVICE,
+    RESET_CODE_TUNNEL_UPSTREAM_ABORTED,
+};
 use crate::stream_io::BoxFut;
 use crate::{CoreConnection, CoreRecvStream, CoreSendStream};
 
@@ -571,8 +574,9 @@ fn parse_open_frame(buf: &[u8]) -> Result<(String, Vec<u8>)> {
     Ok((service_id, metadata))
 }
 
-/// Why an http-relay stream was not admitted. All variants drop the stream
-/// silently — http-relay streams aren't RPC and carry no error-frame contract.
+/// Why an http-relay stream was not admitted. http-relay streams carry no
+/// error-frame contract, so each reason is a distinct stream reset code
+/// (`RESET_CODE_RELAY_*`, see [`handle_http_relay`]).
 #[derive(Debug)]
 enum AdmitReject {
     UnknownService,
@@ -633,21 +637,37 @@ pub async fn handle_http_relay(
         peer_id: peer,
         metadata,
     };
-    match admit(&service_id, &ctx, &registry, &admissions).await {
-        Ok((acceptor, _guard)) => acceptor.accept(conn, send, recv).await,
+    let code = match admit(&service_id, &ctx, &registry, &admissions).await {
+        Ok((acceptor, _guard)) => {
+            acceptor.accept(conn, send, recv).await;
+            return Ok(());
+        }
         Err(AdmitReject::UnknownService) => {
-            tracing::debug!("http-relay: unknown service '{service_id}', dropping stream");
+            tracing::debug!("http-relay: unknown service '{service_id}', refusing stream");
+            RESET_CODE_RELAY_UNKNOWN_SERVICE
         }
         Err(AdmitReject::Denied(msg)) => {
             tracing::debug!("http-relay: authorize denied for '{service_id}': {msg}");
+            RESET_CODE_RELAY_DENIED
         }
         Err(AdmitReject::CapReached(cap)) => {
             tracing::debug!(
-                "http-relay: per-service stream cap {cap} reached for '{service_id}', dropping"
+                "http-relay: per-service stream cap {cap} reached for '{service_id}', refusing"
             );
+            RESET_CODE_RELAY_OVERLOADED
         }
-    }
+    };
+    refuse_relay_stream(&send, &recv, code).await;
     Ok(())
+}
+
+/// Refuse an http-relay stream with `code` in both directions: the consumer's
+/// head read fails with the reset code (it used to see a bare end of stream,
+/// indistinguishable across the refusal reasons) and its upload stops. Either
+/// may fail harmlessly when the peer or connection is already gone.
+async fn refuse_relay_stream(send: &CoreSendStream, recv: &CoreRecvStream, code: u32) {
+    let _ = recv.stop(u64::from(code));
+    let _ = send.reset(code).await;
 }
 
 #[cfg(test)]
