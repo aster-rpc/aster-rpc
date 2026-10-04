@@ -12,6 +12,10 @@
 
 use core::mem::{align_of, offset_of, size_of};
 
+use crate::data::{
+    aster_blob_format_t, aster_blob_status_t, aster_fetch_strategy_t, aster_local_access_t,
+    aster_path_info_t, aster_path_list_t, aster_retire_outcome_t,
+};
 use crate::envelope::{aster_call_header_t, aster_rpc_status_t, aster_stream_header_t};
 use crate::node::{aster_config_t, aster_portmapper_t, aster_trust_mode_t};
 use crate::reactor::aster_reactor_call_t;
@@ -44,6 +48,11 @@ const _: () = assert!(size_of::<aster_doc_query_mode_t>() == 4);
 const _: () = assert!(size_of::<aster_download_policy_mode_t>() == 4);
 const _: () = assert!(size_of::<aster_trust_mode_t>() == 4);
 const _: () = assert!(size_of::<aster_portmapper_t>() == 4);
+const _: () = assert!(size_of::<aster_blob_format_t>() == 4);
+const _: () = assert!(size_of::<aster_fetch_strategy_t>() == 4);
+const _: () = assert!(size_of::<aster_blob_status_t>() == 4);
+const _: () = assert!(size_of::<aster_local_access_t>() == 4);
+const _: () = assert!(size_of::<aster_retire_outcome_t>() == 4);
 
 #[cfg(target_pointer_width = "64")]
 mod lp64 {
@@ -251,5 +260,26 @@ mod lp64 {
         transport_datagram_receive_buffer_size = 256,
         transport_datagram_send_buffer_size = 264,
         storage = 272,
+    });
+
+    // ABI 3.3: connection paths (data.rs).
+    assert_layout!(aster_path_info_t, size = 72, align = 8, {
+        struct_size = 0,
+        path_kind = 4,
+        is_selected = 8,
+        peer_port = 12,
+        _pad = 14,
+        peer_host = 16,
+        relay_url = 32,
+        other = 48,
+        rtt_micros = 64,
+    });
+
+    assert_layout!(aster_path_list_t, size = 32, align = 8, {
+        struct_size = 0,
+        _pad = 4,
+        items = 8,
+        len = 16,
+        storage = 24,
     });
 }

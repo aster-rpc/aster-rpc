@@ -20,6 +20,69 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
 
+## New in 3.3 (additive)
+
+ABI 3.3.0 (tranche F3) brings the data plane to parity with the Rust SDK's
+`aster::Blobs`, `aster::Docs`/`Doc` and `aster::Connection`/`SendStream`.
+Nothing in 3.0–3.2 changed shape; a 3.2 binding keeps working. Source:
+`ffi/src/data.rs`; tests: `ffi/src/data.rs` (encoding, path lowering,
+fingerprint), `ffi/tests/data_plane.rs` (two loopback nodes),
+`ffi/tests/abi_contract_test.c`.
+
+Async functions take `(…, user_data, aster_operation_t* out_operation)`, finish
+on the completion queue, and return `ASTER_STATUS_INVALID_ARGUMENT` (nothing
+started) for malformed ids, unknown enum values / flag bits, or a NULL
+`out_operation`; unknown handles return `ASTER_STATUS_NOT_FOUND`. Ids are 64-hex
+strings unless noted. Failures arrive as `ASTER_EVENT_ERROR` with the message
+as payload.
+
+| Kind | Name | Notes |
+|---|---|---|
+| enum | `aster_blob_format_t` | `RAW`=0, `HASH_SEQ`=1 |
+| enum | `aster_fetch_strategy_t` | `WHOLE`=0, `SPLIT_CHILDREN`=1 (needs `HASH_SEQ`; provider order applies per child) |
+| enum | `aster_blob_status_t` | `NOT_FOUND`=0, `PARTIAL`=1, `COMPLETE`=2 (same codes as `aster_blobs_status`) |
+| enum | `aster_local_access_t` | `WRITE`=1, `READ`=2 (= the fingerprint's access byte) |
+| enum | `aster_retire_outcome_t` | `RETIRED`=0, `BUSY`=1 |
+| enum-value | `ASTER_PATH_KIND_OTHER` = 3 | custom/future transport path |
+| enum-value | `ASTER_EVENT_BLOB_FETCHED`=100, `_DOC_AUTHORITY_REPORT`=101, `_DOC_RETIRE_OUTCOME`=102, `_DOC_OPENED`=103, `_DOC_ENTRY_EXISTS`=104, `_DOC_CONTENT_STATUS`=105, `_STREAM_PRIORITY`=106 | |
+| macro | `ASTER_FETCH_TO_STORE` (1) | `flags` bit: keep the blob in the store, return no bytes |
+| macro | `ASTER_FETCH_REPORT_VERSION` (1), `ASTER_FETCH_REPORT_HEADER_SIZE` (16), `ASTER_FETCH_PROVIDER_RECORD_SIZE` (44), `ASTER_AUTHORITY_FINGERPRINT_SIZE` (32) | |
+| struct | `aster_path_info_t` (72 B) | `struct_size, path_kind, is_selected, peer_port:u16, _pad:u16, peer_host, relay_url, other, rtt_micros` (`UINT64_MAX` = unmeasured); strings live in the list's storage |
+| struct | `aster_path_list_t` (32 B) | `struct_size, _pad, items, len, storage` |
+| function | `aster_blobs_download_hash_from(rt, node, hash, aster_bytes_list_t providers, format, strategy, flags, …)` | `aster::Blobs::download_hash[_to_store]_from`; ordered failover; → `ASTER_EVENT_BLOB_FETCHED` (`flags` = provider count), payload = fetch report v1 + blob bytes (none with `TO_STORE`) |
+| function | `aster_blobs_download_hash(rt, node, hash, provider, format, flags, …)` | single provider; → `ASTER_EVENT_BLOB_DOWNLOADED` with bytes (empty with `TO_STORE`) |
+| function | `aster_blobs_read_range(rt, node, hash, offset, len, …)` | → `ASTER_EVENT_BLOB_READ` |
+| function | `aster_tags_delete_prefix(rt, node, prefix, …)` | → `ASTER_EVENT_TAG_DELETED`, payload u64 count, `flags` = count (saturated); empty prefix = all tags |
+| function | `aster_blobs_gc_run_once(rt, node, …)` | node-wide GC pass → `ASTER_EVENT_UNIT_RESULT` |
+| function | `aster_docs_authority_report(rt, node, namespace_id, …)` | → `ASTER_EVENT_DOC_AUTHORITY_REPORT`: `flags` = access, payload = namespace (32) + fingerprint (32); absent namespace = `ASTER_EVENT_ERROR` |
+| function | `aster_doc_authority_report(rt, node, doc, …)` | same, namespace taken from the open doc; `event.handle` = doc |
+| function | `aster_doc_authority_fingerprint(namespace_id, access, uint8_t out[32])` | sync, pure (`aster::AuthorityFingerprint::of`) |
+| function | `aster_docs_retire_local_write_authority(rt, node, namespace_id, …)` | → `ASTER_EVENT_DOC_RETIRE_OUTCOME`: `flags` = outcome, payload = u32 access, u32 0, u64 open references. BUSY is a success event |
+| function | `aster_doc_shutdown_for_role_swap(rt, doc, budget_ms, …)` | frees the handle now; leave + close under one deadline → `ASTER_EVENT_UNIT_RESULT` |
+| function | `aster_docs_open(rt, node, namespace_id, …)` | → `ASTER_EVENT_DOC_OPENED` (`handle` = doc, `related` = node); absent → same kind, status `NOT_FOUND`, handle 0 |
+| function | `aster_docs_import_write_namespace(rt, node, secret (32 raw bytes), …)` / `aster_docs_import_read_namespace(rt, node, namespace_id, …)` | open-or-import; → `ASTER_EVENT_DOC_OPENED` |
+| function | `aster_doc_set_bytes_durable(rt, doc, author, key, value, …)` | → `ASTER_EVENT_DOC_SET` (payload = content hash hex) |
+| function | `aster_doc_entry_exists(rt, doc, author, key, …)` | tombstones count → `ASTER_EVENT_DOC_ENTRY_EXISTS`, `flags` 1/0 |
+| function | `aster_doc_entry_content_status(rt, doc, content_hash, …)` | → `ASTER_EVENT_DOC_CONTENT_STATUS`: `flags` = blob status, payload = u64 size |
+| function | `aster_connection_paths(rt, conn, aster_path_list_t*)` / `aster_connection_selected_path(…)` | sync; selected = 0 or 1 entries; release with `aster_path_list_release` |
+| function | `aster_path_list_release(aster_path_list_t*)` | frees storage, zeroes; NULL / released = no-op |
+| function | `aster_send_stream_set_priority(rt, stream, int32_t, …)` / `aster_send_stream_priority(rt, stream, …)` | → `ASTER_EVENT_UNIT_RESULT` / `ASTER_EVENT_STREAM_PRIORITY` (payload i32 LE) |
+
+**Fetch report v1** (little-endian): `u8 version (1)`, 3 reserved bytes, `u32 N`
+providers, `u64 bytes_transferred`, then N 44-byte records in first-attempt
+order: 32-byte raw node id, `u32 attempts`, `u32 failures`,
+`u32 completed_requests`. Blob bytes follow the last record. A provider can be
+both failed and served (e.g. across split children). Chosen over a decoded
+`#[repr(C)]` struct because the result already travels as one event payload:
+no second allocation or release call, and every record is fixed-size.
+
+Behaviour change (no signature change): `aster_add_node_addr` now accepts a
+node handle as well as an endpoint handle.
+
+Not exported (Rust-only or not yet needed): `download_collection_from` (use
+`aster_blobs_list_collection` after a `HASH_SEQ` fetch), `Docs::default_author`,
+`read_entry_contents_if_complete`.
+
 ## New in 3.2 (additive)
 
 ABI 3.2.0 puts the C ABI on the `aster` crate (plan D1, tranche F1): nodes start

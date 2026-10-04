@@ -31,4 +31,9 @@ include = [
   "aster_registry_key_kind_t",
   "aster_trust_mode_t",
   "aster_portmapper_t",
+  "aster_blob_format_t",
+  "aster_fetch_strategy_t",
+  "aster_blob_status_t",
+  "aster_local_access_t",
+  "aster_retire_outcome_t",
 ]

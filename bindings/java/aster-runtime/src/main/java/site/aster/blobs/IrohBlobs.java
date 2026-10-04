@@ -12,6 +12,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import site.aster.ffi.DataPlane;
 import site.aster.ffi.IrohEventKind;
 import site.aster.ffi.IrohException;
 import site.aster.ffi.IrohLibrary;
@@ -99,7 +100,7 @@ public class IrohBlobs {
             event -> {
               if (event.kind() == IrohEventKind.BLOB_ADDED) {
                 // Event data contains the blob ID as a hex string
-                byte[] hashBytes = event.data().asByteBuffer().array();
+                byte[] hashBytes = event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
                 String hashHex = new String(hashBytes, StandardCharsets.UTF_8);
                 return BlobId.of(hashHex.trim());
               }
@@ -315,7 +316,7 @@ public class IrohBlobs {
         .thenApply(
             event -> {
               if (event.kind() == IrohEventKind.BLOB_ADDED) {
-                byte[] hashBytes = event.data().asByteBuffer().array();
+                byte[] hashBytes = event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
                 String hashHex = new String(hashBytes, StandardCharsets.UTF_8);
                 return BlobId.of(hashHex.trim());
               }
@@ -418,7 +419,7 @@ public class IrohBlobs {
         .thenApply(
             event -> {
               if (event.kind() == IrohEventKind.BLOB_READ) {
-                byte[] data = event.data().asByteBuffer().array();
+                byte[] data = event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
                 if (event.hasBuffer()) {
                   runtime.releaseBuffer(event.buffer());
                 }
@@ -469,7 +470,7 @@ public class IrohBlobs {
         .thenApply(
             event -> {
               if (event.kind() == IrohEventKind.BLOB_DOWNLOADED) {
-                byte[] hashBytes = event.data().asByteBuffer().array();
+                byte[] hashBytes = event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
                 String hashHex = new String(hashBytes, StandardCharsets.UTF_8);
                 return BlobId.of(hashHex.trim());
               }
@@ -656,7 +657,8 @@ public class IrohBlobs {
             event -> {
               if (event.kind() == IrohEventKind.BLOB_READ) {
                 // Parse JSON: [[name, hash, size], ...]
-                return parseBlobCollection(event.data().asByteBuffer().array());
+                return parseBlobCollection(
+                    event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE));
               }
               throw new IrohException("listCollection failed: unexpected event " + event.kind());
             });
@@ -868,5 +870,92 @@ public class IrohBlobs {
     long localBytes = localBytesSeg.get(ValueLayout.JAVA_LONG, 0);
 
     return new BlobInfo(id, localBytes, isComplete == 1 ? BlobStatus.COMPLETE : BlobStatus.PARTIAL);
+  }
+
+  // ── ABI 3.3 data plane ──────────────────────────────────────────────────
+
+  /**
+   * Download a blob by hash from an <b>ordered</b> list of providers ({@code
+   * aster::Blobs::download_hash_from}). Providers (64-hex node ids) are tried strictly in order,
+   * moving on only when one fails; each attempt asks only for missing ranges. With {@code toStore}
+   * the blob stays in the local store and {@link FetchResult#data()} is empty.
+   *
+   * @return the blob bytes and a {@link FetchReport} of what each provider did
+   */
+  public CompletableFuture<FetchResult> downloadHashFromAsync(
+      BlobId hash,
+      List<String> providers,
+      BlobFormat format,
+      FetchStrategy strategy,
+      boolean toStore) {
+    return DataPlane.blobsDownloadHashFrom(
+            runtime,
+            nodeHandle,
+            hash.hex(),
+            providers,
+            format.code,
+            strategy.code,
+            toStore ? DataPlane.FETCH_TO_STORE : 0)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.BLOB_FETCHED) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return FetchResult.parse(r.data());
+            });
+  }
+
+  /** As {@link #downloadHashFromAsync}, returning the bytes ({@link FetchStrategy#WHOLE}). */
+  public CompletableFuture<FetchResult> downloadHashFromAsync(BlobId hash, List<String> providers) {
+    return downloadHashFromAsync(hash, providers, BlobFormat.RAW, FetchStrategy.WHOLE, false);
+  }
+
+  /**
+   * Download a blob by hash from one provider ({@code aster::Blobs::download_hash}). With {@code
+   * toStore} the blob stays in the store and the result is empty.
+   */
+  public CompletableFuture<byte[]> downloadHashAsync(
+      BlobId hash, String provider, BlobFormat format, boolean toStore) {
+    return DataPlane.blobsDownloadHash(
+            runtime,
+            nodeHandle,
+            hash.hex(),
+            provider,
+            format.code,
+            toStore ? DataPlane.FETCH_TO_STORE : 0)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.BLOB_DOWNLOADED) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return r.data();
+            });
+  }
+
+  /** Read {@code len} bytes at {@code offset} of a locally stored blob. */
+  public CompletableFuture<byte[]> readRangeAsync(BlobId hash, long offset, long len) {
+    return DataPlane.blobsReadRange(runtime, nodeHandle, hash.hex(), offset, len)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.BLOB_READ) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return r.data();
+            });
+  }
+
+  /**
+   * Run exactly one node-wide blob GC pass now ({@code aster::Blobs::gc_run_once}): reclaims every
+   * blob not protected by a tag.
+   */
+  public CompletableFuture<Void> gcRunOnceAsync() {
+    return DataPlane.blobsGcRunOnce(runtime, nodeHandle)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.UNIT_RESULT) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return null;
+            });
   }
 }

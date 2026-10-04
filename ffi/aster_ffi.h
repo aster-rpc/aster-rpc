@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 3
 
-#define ASTER_ABI_VERSION_MINOR 2
+#define ASTER_ABI_VERSION_MINOR 3
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -47,6 +47,37 @@
 #define ASTER_CALL_ERR_STREAM_OPEN_FAILED -13
 
 #define ASTER_CALL_ERR_POOL_CLOSED -14
+
+/**
+ * `flags` bit of the 3.3 blob downloads: leave the blob in the local store
+ * and return no bytes (avoids the whole-blob copy on large blobs).
+ */
+#define ASTER_FETCH_TO_STORE 1
+
+/**
+ * Version byte of the fetch-report encoding (v1, all integers
+ * little-endian): byte 0 version, bytes 1..4 reserved (0), u32 provider
+ * count `N` at 4, u64 bytes transferred at 8, then `N` provider records of
+ * `ASTER_FETCH_PROVIDER_RECORD_SIZE` bytes in first-attempt order: 32-byte
+ * raw node id, u32 attempts, u32 failures, u32 completed_requests. A blob's
+ * bytes, when returned, follow the last record.
+ */
+#define ASTER_FETCH_REPORT_VERSION 1
+
+/**
+ * Size of the fetch-report header (before the provider records).
+ */
+#define ASTER_FETCH_REPORT_HEADER_SIZE 16
+
+/**
+ * Size of one provider record in a fetch report.
+ */
+#define ASTER_FETCH_PROVIDER_RECORD_SIZE 44
+
+/**
+ * Size of an authority fingerprint (BLAKE3).
+ */
+#define ASTER_AUTHORITY_FINGERPRINT_SIZE 32
 
 /**
  * Payloads strictly larger than this many bytes are compressed on send
@@ -244,6 +275,38 @@ typedef enum aster_event_kind_t {
   ASTER_EVENT_UNIT_RESULT = 92,
   ASTER_EVENT_OPERATION_CANCELLED = 98,
   ASTER_EVENT_ERROR = 99,
+  /**
+   * `aster_blobs_download_hash_from`: payload = fetch report v1, then the
+   * blob bytes unless `ASTER_FETCH_TO_STORE`; `flags` = provider count.
+   */
+  ASTER_EVENT_BLOB_FETCHED = 100,
+  /**
+   * `flags` = `aster_local_access_t`; payload = namespace id (32) +
+   * authority fingerprint (32).
+   */
+  ASTER_EVENT_DOC_AUTHORITY_REPORT = 101,
+  /**
+   * `flags` = `aster_retire_outcome_t`; payload = u32 access, u32 reserved,
+   * u64 open references.
+   */
+  ASTER_EVENT_DOC_RETIRE_OUTCOME = 102,
+  /**
+   * `handle` = doc, `related` = node; status NOT_FOUND (handle 0) when
+   * `aster_docs_open` finds no such namespace.
+   */
+  ASTER_EVENT_DOC_OPENED = 103,
+  /**
+   * `flags` = 1 if the entry (or its tombstone) exists, else 0.
+   */
+  ASTER_EVENT_DOC_ENTRY_EXISTS = 104,
+  /**
+   * `flags` = `aster_blob_status_t`; payload = size (u64 LE).
+   */
+  ASTER_EVENT_DOC_CONTENT_STATUS = 105,
+  /**
+   * payload = priority (i32 LE); `flags` = its bit pattern.
+   */
+  ASTER_EVENT_STREAM_PRIORITY = 106,
 } aster_event_kind_t;
 
 /**
@@ -300,6 +363,10 @@ typedef enum aster_path_kind_t {
    * Relay: `relay_url` is populated.
    */
   ASTER_PATH_KIND_RELAY = 2,
+  /**
+   * A custom or future transport (ABI 3.3, `aster_path_info_t.other`).
+   */
+  ASTER_PATH_KIND_OTHER = 3,
 } aster_path_kind_t;
 
 /**
@@ -395,6 +462,66 @@ typedef enum aster_portmapper_t {
   ASTER_PORTMAPPER_ENABLED = 1,
   ASTER_PORTMAPPER_DISABLED = 2,
 } aster_portmapper_t;
+
+/**
+ * Blob wire format (`format` argument of the 3.3 blob downloads).
+ */
+typedef enum aster_blob_format_t {
+  ASTER_BLOB_FORMAT_RAW = 0,
+  /**
+   * A HashSeq (collection).
+   */
+  ASTER_BLOB_FORMAT_HASH_SEQ = 1,
+} aster_blob_format_t;
+
+/**
+ * How a multi-provider fetch decomposes a HashSeq (`aster::FetchStrategy`).
+ * The provider list is walked in order with failover in both variants.
+ */
+typedef enum aster_fetch_strategy_t {
+  /**
+   * One request; providers tried strictly in order.
+   */
+  ASTER_FETCH_STRATEGY_WHOLE = 0,
+  /**
+   * Root, then each child as its own request (up to 32 concurrently); the
+   * order applies per child. Needs `ASTER_BLOB_FORMAT_HASH_SEQ`.
+   */
+  ASTER_FETCH_STRATEGY_SPLIT_CHILDREN = 1,
+} aster_fetch_strategy_t;
+
+/**
+ * Local storage status of a blob (same codes as `aster_blobs_status`).
+ */
+typedef enum aster_blob_status_t {
+  ASTER_BLOB_STATUS_NOT_FOUND = 0,
+  ASTER_BLOB_STATUS_PARTIAL = 1,
+  ASTER_BLOB_STATUS_COMPLETE = 2,
+} aster_blob_status_t;
+
+/**
+ * What access a namespace grants this node (`aster::LocalAccess`). The
+ * values equal the access byte of the authority fingerprint.
+ */
+typedef enum aster_local_access_t {
+  ASTER_LOCAL_ACCESS_WRITE = 1,
+  ASTER_LOCAL_ACCESS_READ = 2,
+} aster_local_access_t;
+
+/**
+ * `event.flags` of `ASTER_EVENT_DOC_RETIRE_OUTCOME` (`aster::RetireOutcome`).
+ */
+typedef enum aster_retire_outcome_t {
+  /**
+   * Retired; payload carries the access now stored.
+   */
+  ASTER_RETIRE_RETIRED = 0,
+  /**
+   * Refused: references to the document are still open; payload carries
+   * how many. Normally fail-closed, not something to retry through.
+   */
+  ASTER_RETIRE_BUSY = 1,
+} aster_retire_outcome_t;
 
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
@@ -572,6 +699,68 @@ typedef struct aster_transport_metrics_t {
 typedef uint64_t aster_call_t;
 
 typedef uint64_t aster_buffer_t;
+
+/**
+ * One network path of a connection (`aster::PathInfo`). Strings point into
+ * the owning `aster_path_list_t`'s storage; `{NULL, 0}` when absent; not
+ * NUL-terminated.
+ */
+typedef struct aster_path_info_t {
+  /**
+   * `sizeof(aster_path_info_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * One of `aster_path_kind_t` (`DIRECT`, `RELAY` or `OTHER`).
+   */
+  uint32_t path_kind;
+  /**
+   * 1 if this path currently carries application data.
+   */
+  uint32_t is_selected;
+  /**
+   * DIRECT: the peer's UDP port.
+   */
+  uint16_t peer_port;
+  uint16_t _pad;
+  /**
+   * DIRECT: the peer's IP address.
+   */
+  struct aster_bytes_t peer_host;
+  /**
+   * RELAY: the relay URL.
+   */
+  struct aster_bytes_t relay_url;
+  /**
+   * OTHER: a description of a custom/future transport.
+   */
+  struct aster_bytes_t other;
+  /**
+   * RTT estimate in microseconds; `UINT64_MAX` when not yet measured.
+   */
+  uint64_t rtt_micros;
+} aster_path_info_t;
+
+/**
+ * A list of paths filled by `aster_connection_paths` /
+ * `aster_connection_selected_path`. Release with `aster_path_list_release`.
+ */
+typedef struct aster_path_list_t {
+  /**
+   * `sizeof(aster_path_list_t)`; written by the library.
+   */
+  uint32_t struct_size;
+  uint32_t _pad;
+  /**
+   * `len` entries, owned by `storage`; NULL when `len == 0`.
+   */
+  const struct aster_path_info_t *items;
+  uintptr_t len;
+  /**
+   * Library-owned backing store; NULL when nothing was allocated.
+   */
+  void *storage;
+} aster_path_list_t;
 
 /**
  * `StreamHeader` (payload of a `FLAG_HEADER` frame), Aster-SPEC §6.9.
@@ -1202,6 +1391,11 @@ int32_t aster_stream_stopped(aster_runtime_t runtime,
                              uint64_t user_data,
                              aster_operation_t *out_operation);
 
+/**
+ * Add a peer address to the address lookup of an endpoint **or node**
+ * (nodes accepted since ABI 3.3), so later dials and blob/doc fetches by
+ * node id can reach it.
+ */
 int32_t aster_add_node_addr(aster_runtime_t runtime,
                             aster_endpoint_t endpoint,
                             struct aster_node_addr_t addr);
@@ -2109,6 +2303,279 @@ int32_t aster_call_unary(aster_runtime_t runtime,
                          const uint8_t **out_trailer_ptr,
                          uint32_t *out_trailer_len,
                          aster_buffer_t *out_trailer_buffer);
+
+/**
+ * Download a blob by hash from an **ordered** list of providers
+ * (`aster::Blobs::download_hash_from` / `download_hash_to_store_from`).
+ *
+ * Providers (64-hex node ids, at least one) are tried strictly in the given
+ * order, moving on only when one fails to connect or transfer; each attempt
+ * asks only for the ranges still missing. Duplicates are legal and are
+ * aggregated in the report. The node must be able to reach each provider
+ * (relay, discovery, or an address added with `aster_add_node_addr`).
+ *
+ * `format`: `aster_blob_format_t`; `strategy`: `aster_fetch_strategy_t`
+ * (`SPLIT_CHILDREN` requires `HASH_SEQ`); `flags`: 0 or
+ * `ASTER_FETCH_TO_STORE`. Bad arguments return
+ * `ASTER_STATUS_INVALID_ARGUMENT` before anything starts.
+ *
+ * Emits `ASTER_EVENT_BLOB_FETCHED` (`handle` = node, `flags` = provider
+ * count); payload = fetch report v1 then, without `ASTER_FETCH_TO_STORE`, the
+ * blob bytes. A failed fetch emits `ASTER_EVENT_ERROR`.
+ */
+int32_t aster_blobs_download_hash_from(aster_runtime_t runtime,
+                                       aster_node_t node,
+                                       struct aster_bytes_t hash_hex,
+                                       struct aster_bytes_list_t providers,
+                                       uint32_t format,
+                                       uint32_t strategy,
+                                       uint32_t flags,
+                                       uint64_t user_data,
+                                       aster_operation_t *out_operation);
+
+/**
+ * Download a blob by hash from one provider (`aster::Blobs::download_hash` /
+ * `download_hash_to_store`). `format`: `aster_blob_format_t`; `flags`: 0 or
+ * `ASTER_FETCH_TO_STORE`.
+ *
+ * Emits `ASTER_EVENT_BLOB_DOWNLOADED` (`handle` = node) with the blob bytes
+ * as payload (empty with `ASTER_FETCH_TO_STORE`).
+ */
+int32_t aster_blobs_download_hash(aster_runtime_t runtime,
+                                  aster_node_t node,
+                                  struct aster_bytes_t hash_hex,
+                                  struct aster_bytes_t provider,
+                                  uint32_t format,
+                                  uint32_t flags,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * Read `len` bytes at `offset` of a blob in the local store
+ * (`aster::Blobs::read_range`). Emits `ASTER_EVENT_BLOB_READ` with the bytes.
+ */
+int32_t aster_blobs_read_range(aster_runtime_t runtime,
+                               aster_node_t node,
+                               struct aster_bytes_t hash_hex,
+                               uint64_t offset,
+                               uint64_t len,
+                               uint64_t user_data,
+                               aster_operation_t *out_operation);
+
+/**
+ * Delete every tag whose name starts with `prefix` (UTF-8;
+ * `aster::Blobs::tag_delete_prefix`). An empty prefix deletes **all** tags.
+ * Emits `ASTER_EVENT_TAG_DELETED`: payload = removed count (u64 LE),
+ * `flags` = the count saturated to u32.
+ */
+int32_t aster_tags_delete_prefix(aster_runtime_t runtime,
+                                 aster_node_t node,
+                                 struct aster_bytes_t prefix,
+                                 uint64_t user_data,
+                                 aster_operation_t *out_operation);
+
+/**
+ * Run exactly one blob GC mark+sweep pass now (`aster::Blobs::gc_run_once`).
+ * Node-wide: reclaims every blob not protected by a tag. Emits
+ * `ASTER_EVENT_UNIT_RESULT` when the pass completes.
+ */
+int32_t aster_blobs_gc_run_once(aster_runtime_t runtime,
+                                aster_node_t node,
+                                uint64_t user_data,
+                                aster_operation_t *out_operation);
+
+/**
+ * Report the authority this node holds over the namespace `namespace_id`
+ * (64 hex) **names** (`aster::Docs::authority_report`) — read back from the
+ * store, so it is the access the node has, not what was requested.
+ *
+ * Emits `ASTER_EVENT_DOC_AUTHORITY_REPORT` (`handle` = node, `flags` =
+ * `aster_local_access_t`); payload = 32-byte namespace id then the 32-byte
+ * authority fingerprint. A namespace not in the local store is an
+ * `ASTER_EVENT_ERROR` ("cannot prove" never looks like "proved read-only").
+ * To gate on an open document use `aster_doc_authority_report`.
+ */
+int32_t aster_docs_authority_report(aster_runtime_t runtime,
+                                    aster_node_t node,
+                                    struct aster_bytes_t namespace_id,
+                                    uint64_t user_data,
+                                    aster_operation_t *out_operation);
+
+/**
+ * As `aster_docs_authority_report`, for the namespace of the open document
+ * `doc` (taken from the document, not from an argument; `aster::Doc::
+ * authority_report`). `node` is the node that opened `doc`.
+ * `event.handle` = doc.
+ */
+int32_t aster_doc_authority_report(aster_runtime_t runtime,
+                                   aster_node_t node,
+                                   uint64_t doc,
+                                   uint64_t user_data,
+                                   aster_operation_t *out_operation);
+
+/**
+ * The authority fingerprint of `(namespace_id, access)` — the value an
+ * authority report carries (`aster::AuthorityFingerprint::of`), so a caller
+ * can derive it from its own grant record. A correlation value, not proof
+ * over secret material. Writes 32 bytes to `out`. Synchronous and pure.
+ */
+int32_t aster_doc_authority_fingerprint(struct aster_bytes_t namespace_id,
+                                        uint32_t access,
+                                        uint8_t *out);
+
+/**
+ * Retire this node's **local** write authority over a namespace, keeping
+ * every entry (`aster::Docs::retire_local_write_authority`). Local only:
+ * revokes nothing cryptographically. Release every reference first
+ * (`aster_doc_shutdown_for_role_swap`), otherwise the outcome is BUSY.
+ *
+ * Emits `ASTER_EVENT_DOC_RETIRE_OUTCOME` (`handle` = node, `flags` =
+ * `aster_retire_outcome_t`); 16-byte payload: u32 access now stored
+ * (`aster_local_access_t`, 0 when BUSY), u32 reserved, u64 open references
+ * (0 when RETIRED). Busy is a successful event, not an error.
+ */
+int32_t aster_docs_retire_local_write_authority(aster_runtime_t runtime,
+                                                aster_node_t node,
+                                                struct aster_bytes_t namespace_id,
+                                                uint64_t user_data,
+                                                aster_operation_t *out_operation);
+
+/**
+ * Release **both** references of the open document `doc` (live sync and
+ * the handle itself) under one deadline of `budget_ms`, so its namespace
+ * can change role (`aster::Doc::shutdown_for_role_swap`). The handle is
+ * freed immediately (as by `aster_doc_free`) and is invalid afterwards;
+ * other handles to the same namespace keep it open. Emits
+ * `ASTER_EVENT_UNIT_RESULT` (`handle` = doc) or `ASTER_EVENT_ERROR`.
+ */
+int32_t aster_doc_shutdown_for_role_swap(aster_runtime_t runtime,
+                                         uint64_t doc,
+                                         uint64_t budget_ms,
+                                         uint64_t user_data,
+                                         aster_operation_t *out_operation);
+
+/**
+ * Reopen a namespace already in the local replica (`aster::Docs::open`).
+ * Emits `ASTER_EVENT_DOC_OPENED`: `handle` = new doc handle, `related` =
+ * node; or, if the namespace is not present, the same kind with status
+ * `ASTER_STATUS_NOT_FOUND` and `handle` = 0.
+ */
+int32_t aster_docs_open(aster_runtime_t runtime,
+                        aster_node_t node,
+                        struct aster_bytes_t namespace_id,
+                        uint64_t user_data,
+                        aster_operation_t *out_operation);
+
+/**
+ * Open-or-import a **writable** namespace from its 32-byte secret (raw
+ * bytes; `aster::Docs::open_or_import_write_namespace`). Idempotent;
+ * upgrades a prior read-only import. Emits `ASTER_EVENT_DOC_OPENED`
+ * (`handle` = doc, `related` = node).
+ */
+int32_t aster_docs_import_write_namespace(aster_runtime_t runtime,
+                                          aster_node_t node,
+                                          struct aster_bytes_t secret,
+                                          uint64_t user_data,
+                                          aster_operation_t *out_operation);
+
+/**
+ * Open-or-import a **read-only** namespace from its id (64 hex;
+ * `aster::Docs::open_or_import_read_namespace`). Idempotent; never narrows
+ * an existing write capability. Emits `ASTER_EVENT_DOC_OPENED`.
+ */
+int32_t aster_docs_import_read_namespace(aster_runtime_t runtime,
+                                         aster_node_t node,
+                                         struct aster_bytes_t namespace_id,
+                                         uint64_t user_data,
+                                         aster_operation_t *out_operation);
+
+/**
+ * Write `key` = `value` as `author` (64 hex) after committing the blob
+ * metadata to disk (`aster::Doc::set_bytes_durable`): the crash-durable
+ * publication boundary (covers a process kill, not power loss). Emits
+ * `ASTER_EVENT_DOC_SET` with the content hash (hex) as payload, like
+ * `aster_doc_set_bytes`.
+ */
+int32_t aster_doc_set_bytes_durable(aster_runtime_t runtime,
+                                    uint64_t doc,
+                                    struct aster_bytes_t author_hex,
+                                    struct aster_bytes_t key,
+                                    struct aster_bytes_t value,
+                                    uint64_t user_data,
+                                    aster_operation_t *out_operation);
+
+/**
+ * Whether an entry exists for exactly `(author, key)` — **including** a
+ * deletion tombstone (`aster::Doc::entry_exists`; `aster_doc_get_exact`
+ * reports a tombstone as absent). Emits `ASTER_EVENT_DOC_ENTRY_EXISTS` with
+ * `flags` = 1 (exists) or 0.
+ */
+int32_t aster_doc_entry_exists(aster_runtime_t runtime,
+                               uint64_t doc,
+                               struct aster_bytes_t author_hex,
+                               struct aster_bytes_t key,
+                               uint64_t user_data,
+                               aster_operation_t *out_operation);
+
+/**
+ * Local storage status of a document entry's value blob
+ * (`aster::Doc::entry_content_status`). Emits `ASTER_EVENT_DOC_CONTENT_STATUS`:
+ * `flags` = `aster_blob_status_t`, payload = size in bytes (u64 LE; 0 when
+ * not found).
+ */
+int32_t aster_doc_entry_content_status(aster_runtime_t runtime,
+                                       uint64_t doc,
+                                       struct aster_bytes_t content_hash_hex,
+                                       uint64_t user_data,
+                                       aster_operation_t *out_operation);
+
+/**
+ * Snapshot every currently open network path of `connection`
+ * (`aster::Connection::paths`): typically a relay path plus a direct one
+ * after holepunching. Synchronous. Fills `*out`; release it with
+ * `aster_path_list_release` (also when `len == 0`).
+ */
+int32_t aster_connection_paths(aster_runtime_t runtime,
+                               aster_connection_t connection,
+                               struct aster_path_list_t *out);
+
+/**
+ * The path currently carrying application data
+ * (`aster::Connection::selected_path`): `*out` holds 0 or 1 entries.
+ * Synchronous; release with `aster_path_list_release`.
+ */
+int32_t aster_connection_selected_path(aster_runtime_t runtime,
+                                       aster_connection_t connection,
+                                       struct aster_path_list_t *out);
+
+/**
+ * Free a path list filled by `aster_connection_paths` /
+ * `aster_connection_selected_path` and zero it (`struct_size` kept). NULL or
+ * an already released list is a no-op.
+ */
+int32_t aster_path_list_release(struct aster_path_list_t *list);
+
+/**
+ * Set the send priority of `stream` (higher is scheduled first when send
+ * streams on one connection compete; default 0; `aster::SendStream::
+ * set_priority`). Emits `ASTER_EVENT_UNIT_RESULT` (`handle` = stream), or
+ * `ASTER_EVENT_ERROR` if the stream is already closed.
+ */
+int32_t aster_send_stream_set_priority(aster_runtime_t runtime,
+                                       aster_send_stream_t stream,
+                                       int32_t priority,
+                                       uint64_t user_data,
+                                       aster_operation_t *out_operation);
+
+/**
+ * The current send priority of `stream`. Emits `ASTER_EVENT_STREAM_PRIORITY`
+ * (`handle` = stream): payload = the priority (i32 LE); `flags` = the same
+ * value's bit pattern.
+ */
+int32_t aster_send_stream_priority(aster_runtime_t runtime,
+                                   aster_send_stream_t stream,
+                                   uint64_t user_data,
+                                   aster_operation_t *out_operation);
 
 /**
  * Encode a StreamHeader to AEv1 bytes.

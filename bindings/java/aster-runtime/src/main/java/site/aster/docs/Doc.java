@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import site.aster.blobs.BlobId;
+import site.aster.ffi.DataPlane;
 import site.aster.ffi.IrohEventKind;
 import site.aster.ffi.IrohException;
 import site.aster.ffi.IrohLibrary;
@@ -25,10 +26,17 @@ public class Doc {
 
   private final IrohRuntime runtime;
   private final long docHandle;
+  // The node that opened this document (0 if unknown); needed by authorityReportAsync.
+  private final long nodeHandle;
 
   public Doc(IrohRuntime runtime, long docHandle) {
+    this(runtime, docHandle, 0L);
+  }
+
+  public Doc(IrohRuntime runtime, long docHandle, long nodeHandle) {
     this.runtime = runtime;
     this.docHandle = docHandle;
+    this.nodeHandle = nodeHandle;
   }
 
   public IrohRuntime runtime() {
@@ -515,5 +523,93 @@ public class Doc {
     }
 
     return entries;
+  }
+
+  // ── ABI 3.3 data plane ──────────────────────────────────────────────────
+
+  /**
+   * Report the authority this node holds over <b>this</b> document's namespace. Needs a document
+   * obtained from {@link Docs} (which records the owning node).
+   */
+  public CompletableFuture<AuthorityReport> authorityReportAsync() {
+    if (nodeHandle == 0) {
+      return CompletableFuture.failedFuture(
+          new IllegalStateException("document has no owning node handle"));
+    }
+    return DataPlane.docAuthorityReport(runtime, nodeHandle, docHandle)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.DOC_AUTHORITY_REPORT) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return AuthorityReport.parse(r.event().flags(), r.data());
+            });
+  }
+
+  /**
+   * Write {@code key = value} after committing the blob metadata to disk: the crash-durable
+   * publication boundary.
+   *
+   * @return the content hash
+   */
+  public CompletableFuture<BlobId> setBytesDurableAsync(AuthorId author, byte[] key, byte[] value) {
+    return DataPlane.docSetBytesDurable(runtime, docHandle, author.hex(), key, value)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.DOC_SET) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return BlobId.of(new String(r.data(), StandardCharsets.UTF_8));
+            });
+  }
+
+  /**
+   * Whether an entry exists for exactly {@code (author, key)}, <b>including</b> a deletion
+   * tombstone.
+   */
+  public CompletableFuture<Boolean> entryExistsAsync(AuthorId author, byte[] key) {
+    return DataPlane.docEntryExists(runtime, docHandle, author.hex(), key)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.DOC_ENTRY_EXISTS) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return r.event().flags() != 0;
+            });
+  }
+
+  /** Local storage status of an entry's value blob, and its size in bytes. */
+  public record ContentStatus(site.aster.blobs.BlobStatus status, long size) {}
+
+  /** Local storage status of the value blob {@code contentHash}. */
+  public CompletableFuture<ContentStatus> entryContentStatusAsync(BlobId contentHash) {
+    return DataPlane.docEntryContentStatus(runtime, docHandle, contentHash.hex())
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.DOC_CONTENT_STATUS) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              long size =
+                  java.nio.ByteBuffer.wrap(r.data())
+                      .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                      .getLong();
+              return new ContentStatus(
+                  site.aster.blobs.BlobStatus.fromCode(r.event().flags()), size);
+            });
+  }
+
+  /**
+   * Release both references of this document (live sync and the handle) under one deadline so its
+   * namespace can change role. The handle is freed immediately; this object is unusable afterwards.
+   */
+  public CompletableFuture<Void> shutdownForRoleSwapAsync(java.time.Duration budget) {
+    return DataPlane.docShutdownForRoleSwap(runtime, docHandle, budget.toMillis())
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.UNIT_RESULT) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return null;
+            });
   }
 }

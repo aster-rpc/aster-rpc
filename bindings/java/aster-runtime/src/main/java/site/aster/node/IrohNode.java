@@ -352,4 +352,17 @@ public class IrohNode implements AutoCloseable {
       String path, java.util.List<byte[]> alpns) {
     return start(AsterConfig.builder().storagePath(path).build(), alpns, null);
   }
+
+  /**
+   * Make {@code addr} reachable from this node (C ABI {@code aster_add_node_addr}, nodes accepted
+   * since ABI 3.3), so later dials and blob/doc fetches by node id can reach it without discovery.
+   */
+  public void addNodeAddr(NodeAddr addr) {
+    site.aster.ffi.DataPlane.addNodeAddr(
+        runtime,
+        nodeHandle,
+        addr.endpointId(),
+        addr.relayUrl(),
+        addr.directAddresses() == null ? java.util.List.of() : addr.directAddresses());
+  }
 }

@@ -17,7 +17,8 @@ fn test_abi_version() {
     // 3.1.0: additive AEv1 envelope + zstd functions (envelope.rs).
     assert_eq!(ASTER_ABI_VERSION_MAJOR, 3);
     // 3.2.0: additive node config, aster_node_start, Gate 0, admission (node.rs).
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 2);
+    // 3.3.0: additive data-plane parity (data.rs).
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 3);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);

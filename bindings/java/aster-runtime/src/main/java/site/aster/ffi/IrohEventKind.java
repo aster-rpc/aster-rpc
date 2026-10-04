@@ -89,7 +89,16 @@ public enum IrohEventKind {
   UNIT_RESULT(92),
 
   OPERATION_CANCELLED(98),
-  ERROR(99);
+  ERROR(99),
+
+  // Data plane (ABI 3.3)
+  BLOB_FETCHED(100),
+  DOC_AUTHORITY_REPORT(101),
+  DOC_RETIRE_OUTCOME(102),
+  DOC_OPENED(103),
+  DOC_ENTRY_EXISTS(104),
+  DOC_CONTENT_STATUS(105),
+  STREAM_PRIORITY(106);
 
   public final int code;
 

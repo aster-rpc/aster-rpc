@@ -21,6 +21,7 @@ use anyhow::Result;
 use aster_transport_core::*;
 
 pub mod call;
+pub mod data;
 pub mod envelope;
 mod layout;
 pub mod node;
@@ -44,8 +45,14 @@ pub mod reactor;
 //   call_header,rpc_status}_{encode,decode,release}` + their structs) and
 //   zstd payload compression (`aster_zstd_maybe_compress`,
 //   `aster_zstd_decompress`); see `envelope.rs`.
+// - 3.2.0 (additive): nodes from `aster_config_t` on `aster::Node`, Gate 0,
+//   admission respond, Prometheus metrics; see `node.rs`.
+// - 3.3.0 (additive): data-plane parity -- multi-provider blob fetch with a
+//   fetch report, ranged reads, tag prefix delete, one-shot GC; docs
+//   authority/retire/open/import/durable/entry_exists/content status;
+//   connection paths and send-stream priority; see `data.rs`.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 3;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 2;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 3;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -197,6 +204,26 @@ pub enum aster_event_kind_t {
     ASTER_EVENT_UNIT_RESULT = 92,
     ASTER_EVENT_OPERATION_CANCELLED = 98,
     ASTER_EVENT_ERROR = 99,
+
+    // Data plane (ABI 3.3, data.rs)
+    /// `aster_blobs_download_hash_from`: payload = fetch report v1, then the
+    /// blob bytes unless `ASTER_FETCH_TO_STORE`; `flags` = provider count.
+    ASTER_EVENT_BLOB_FETCHED = 100,
+    /// `flags` = `aster_local_access_t`; payload = namespace id (32) +
+    /// authority fingerprint (32).
+    ASTER_EVENT_DOC_AUTHORITY_REPORT = 101,
+    /// `flags` = `aster_retire_outcome_t`; payload = u32 access, u32 reserved,
+    /// u64 open references.
+    ASTER_EVENT_DOC_RETIRE_OUTCOME = 102,
+    /// `handle` = doc, `related` = node; status NOT_FOUND (handle 0) when
+    /// `aster_docs_open` finds no such namespace.
+    ASTER_EVENT_DOC_OPENED = 103,
+    /// `flags` = 1 if the entry (or its tombstone) exists, else 0.
+    ASTER_EVENT_DOC_ENTRY_EXISTS = 104,
+    /// `flags` = `aster_blob_status_t`; payload = size (u64 LE).
+    ASTER_EVENT_DOC_CONTENT_STATUS = 105,
+    /// payload = priority (i32 LE); `flags` = its bit pattern.
+    ASTER_EVENT_STREAM_PRIORITY = 106,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
@@ -221,6 +248,8 @@ pub enum aster_path_kind_t {
     ASTER_PATH_KIND_DIRECT = 1,
     /// Relay: `relay_url` is populated.
     ASTER_PATH_KIND_RELAY = 2,
+    /// A custom or future transport (ABI 3.3, `aster_path_info_t.other`).
+    ASTER_PATH_KIND_OTHER = 3,
 }
 
 /// `mode` argument of `aster_doc_share` / `aster_doc_share_with_addr`.
@@ -3241,6 +3270,9 @@ pub unsafe extern "C" fn aster_stream_stopped(
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
+/// Add a peer address to the address lookup of an endpoint **or node**
+/// (nodes accepted since ABI 3.3), so later dials and blob/doc fetches by
+/// node id can reach it.
 #[no_mangle]
 pub unsafe extern "C" fn aster_add_node_addr(
     runtime: aster_runtime_t,
@@ -3251,7 +3283,11 @@ pub unsafe extern "C" fn aster_add_node_addr(
         Ok(b) => b,
         Err(s) => return s as i32,
     };
-    let ep_arc = match bridge.endpoints.get(endpoint) {
+    let ep_arc = match bridge
+        .endpoints
+        .get(endpoint)
+        .or_else(|| bridge.nodes.get(endpoint).map(|n| Arc::new(n.net_client())))
+    {
         Some(e) => e,
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };

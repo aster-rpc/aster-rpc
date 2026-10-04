@@ -76,7 +76,7 @@ public final class RegistryAsync {
               if (event.status() == IrohStatus.NOT_FOUND.code) {
                 return null;
               }
-              byte[] payload = event.data().asByteBuffer().array();
+              byte[] payload = event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
               try {
                 return RegistryMapper.MAPPER.readValue(payload, EndpointLease.class);
               } catch (java.io.IOException e) {
@@ -351,7 +351,7 @@ public final class RegistryAsync {
               if (event.kind() != IrohEventKind.REGISTRY_ACL_LISTED) {
                 throw new IrohException("acl list: unexpected event " + event.kind());
               }
-              byte[] payload = event.data().asByteBuffer().array();
+              byte[] payload = event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
               if (payload.length == 0) {
                 return List.<String>of();
               }

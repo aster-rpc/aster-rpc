@@ -454,4 +454,20 @@ public class IrohConnection extends IrohHandle {
     long bytes = bytesSeg.get(ValueLayout.JAVA_LONG, 0);
     return (int) bytes;
   }
+
+  // ── ABI 3.3 data plane ──────────────────────────────────────────────────
+
+  /** Every currently open network path (typically relay + direct once holepunched). */
+  public java.util.List<PathInfo> paths() {
+    return DataPlane.connectionPaths(runtime, nativeHandle(), false).stream()
+        .map(PathInfo::from)
+        .toList();
+  }
+
+  /** The path currently carrying application data, if any. */
+  public java.util.Optional<PathInfo> selectedPath() {
+    return DataPlane.connectionPaths(runtime, nativeHandle(), true).stream()
+        .map(PathInfo::from)
+        .findFirst();
+  }
 }

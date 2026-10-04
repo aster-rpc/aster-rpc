@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import site.aster.blobs.BlobId;
+import site.aster.ffi.DataPlane;
 import site.aster.ffi.IrohEventKind;
 import site.aster.ffi.IrohException;
 import site.aster.ffi.IrohLibrary;
@@ -138,7 +139,7 @@ public class IrohTags {
                 if (event.status() == IrohStatus.NOT_FOUND.code) {
                   return null;
                 }
-                return parseTagEntry(event.data().asByteBuffer().array());
+                return parseTagEntry(event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE));
               }
               throw new IrohException("get failed: unexpected event " + event.kind());
             });
@@ -229,7 +230,8 @@ public class IrohTags {
               if (event.kind() == IrohEventKind.TAG_LIST) {
                 // event.flags() contains the count
                 // data contains packed tag records
-                return parseTagList(event.data().asByteBuffer().array(), event.flags());
+                return parseTagList(
+                    event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE), event.flags());
               }
               throw new IrohException("listPrefix failed: unexpected event " + event.kind());
             });
@@ -299,5 +301,24 @@ public class IrohTags {
       }
     }
     return parts.toArray(new String[0]);
+  }
+
+  /**
+   * Delete every tag whose name starts with {@code prefix} (ABI 3.3). An empty prefix deletes all
+   * tags.
+   *
+   * @return the number of tags removed
+   */
+  public CompletableFuture<Long> deletePrefixAsync(String prefix) {
+    return DataPlane.tagsDeletePrefix(runtime, nodeHandle, prefix)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.TAG_DELETED) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return java.nio.ByteBuffer.wrap(r.data())
+                  .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                  .getLong();
+            });
   }
 }

@@ -193,7 +193,7 @@ public class IrohGossip {
           .thenApply(
               event -> {
                 if (event.kind() == IrohEventKind.GOSSIP_RECEIVED) {
-                  byte[] data = event.data().asByteBuffer().array();
+                  byte[] data = event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
                   if (event.hasBuffer()) {
                     runtime.releaseBuffer(event.buffer());
                   }

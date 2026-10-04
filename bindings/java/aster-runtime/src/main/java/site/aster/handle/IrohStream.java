@@ -416,4 +416,33 @@ public class IrohStream implements AutoCloseable {
    * @param errorCode QUIC error code (0 if finished cleanly)
    */
   public record StreamTerminated(Reason reason, int errorCode) {}
+
+  // ── ABI 3.3 data plane ──────────────────────────────────────────────────
+
+  /**
+   * Set this stream's send priority (higher is scheduled first when streams on one connection
+   * compete; default 0).
+   */
+  public CompletableFuture<Void> setPriorityAsync(int priority) {
+    return DataPlane.sendStreamSetPriority(runtime, sendHandle, priority)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.UNIT_RESULT) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return null;
+            });
+  }
+
+  /** This stream's current send priority. */
+  public CompletableFuture<Integer> priorityAsync() {
+    return DataPlane.sendStreamPriority(runtime, sendHandle)
+        .thenApply(
+            r -> {
+              if (r.event().kind() != IrohEventKind.STREAM_PRIORITY) {
+                throw new IrohException("unexpected event " + r.event().kind());
+              }
+              return r.event().flags();
+            });
+  }
 }

@@ -212,6 +212,27 @@ OFF(aster_config_t, transport_datagram_receive_buffer_size, 256);
 OFF(aster_config_t, transport_datagram_send_buffer_size, 264);
 OFF(aster_config_t, storage, 272);
 
+/* ABI 3.3: connection paths (data.rs). */
+_Static_assert(sizeof(aster_blob_format_t) == 4, "enum size");
+_Static_assert(sizeof(aster_fetch_strategy_t) == 4, "enum size");
+_Static_assert(sizeof(aster_local_access_t) == 4, "enum size");
+
+LAYOUT(aster_path_info_t, 72);
+OFF(aster_path_info_t, struct_size, 0);
+OFF(aster_path_info_t, path_kind, 4);
+OFF(aster_path_info_t, is_selected, 8);
+OFF(aster_path_info_t, peer_port, 12);
+OFF(aster_path_info_t, peer_host, 16);
+OFF(aster_path_info_t, relay_url, 32);
+OFF(aster_path_info_t, other, 48);
+OFF(aster_path_info_t, rtt_micros, 64);
+
+LAYOUT(aster_path_list_t, 32);
+OFF(aster_path_list_t, struct_size, 0);
+OFF(aster_path_list_t, items, 8);
+OFF(aster_path_list_t, len, 16);
+OFF(aster_path_list_t, storage, 24);
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -234,7 +255,7 @@ static void test_abi_version(void) {
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
     CHECK(ASTER_ABI_VERSION_MAJOR == 3);
-    CHECK(ASTER_ABI_VERSION_MINOR >= 2); /* 3.1 envelope + zstd, 3.2 node config + gate */
+    CHECK(ASTER_ABI_VERSION_MINOR >= 3); /* 3.1 envelope + zstd, 3.2 node config + gate, 3.3 data plane */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
 
@@ -267,6 +288,57 @@ static void test_enum_values(void) {
     CHECK(ASTER_TRANSPORT_ALL == 0xfff);
     CHECK(strcmp(aster_status_name(ASTER_STATUS_ABI_MISMATCH), "ASTER_STATUS_ABI_MISMATCH") == 0);
     CHECK(strcmp(aster_status_name(-999), "ASTER_STATUS_UNKNOWN") == 0);
+    /* 3.3 */
+    CHECK(ASTER_EVENT_BLOB_FETCHED == 100 && ASTER_EVENT_STREAM_PRIORITY == 106);
+    CHECK(ASTER_EVENT_DOC_OPENED == 103);
+    CHECK(ASTER_PATH_KIND_OTHER == 3);
+    CHECK(ASTER_BLOB_FORMAT_HASH_SEQ == 1 && ASTER_FETCH_STRATEGY_SPLIT_CHILDREN == 1);
+    CHECK(ASTER_BLOB_STATUS_COMPLETE == 2);
+    CHECK(ASTER_LOCAL_ACCESS_WRITE == 1 && ASTER_LOCAL_ACCESS_READ == 2);
+    CHECK(ASTER_RETIRE_RETIRED == 0 && ASTER_RETIRE_BUSY == 1);
+    CHECK(ASTER_FETCH_TO_STORE == 1 && ASTER_FETCH_REPORT_VERSION == 1);
+    CHECK(ASTER_FETCH_REPORT_HEADER_SIZE == 16 && ASTER_FETCH_PROVIDER_RECORD_SIZE == 44);
+}
+
+static void test_data_plane(void) {
+    printf("[data plane 3.3]\n");
+    /* Pure: authority fingerprint (namespace 0x11.. , WRITE) is deterministic
+     * and differs by access. */
+    const char *ns = "1111111111111111111111111111111111111111111111111111111111111111";
+    aster_bytes_t nsb = {(const uint8_t *)ns, 64};
+    uint8_t w[32], r[32], w2[32];
+    CHECK(aster_doc_authority_fingerprint(nsb, ASTER_LOCAL_ACCESS_WRITE, w) == ASTER_STATUS_OK);
+    CHECK(aster_doc_authority_fingerprint(nsb, ASTER_LOCAL_ACCESS_WRITE, w2) == ASTER_STATUS_OK);
+    CHECK(aster_doc_authority_fingerprint(nsb, ASTER_LOCAL_ACCESS_READ, r) == ASTER_STATUS_OK);
+    CHECK(memcmp(w, w2, 32) == 0 && memcmp(w, r, 32) != 0);
+    CHECK(aster_doc_authority_fingerprint(nsb, 0, w) == ASTER_STATUS_INVALID_ARGUMENT);
+    aster_bytes_t shortb = {(const uint8_t *)ns, 10};
+    CHECK(aster_doc_authority_fingerprint(shortb, ASTER_LOCAL_ACCESS_READ, w) == ASTER_STATUS_INVALID_ARGUMENT);
+
+    /* Release of an empty / NULL path list is a no-op. */
+    aster_path_list_t pl;
+    memset(&pl, 0, sizeof pl);
+    CHECK(aster_path_list_release(&pl) == ASTER_STATUS_OK);
+    CHECK(aster_path_list_release(NULL) == ASTER_STATUS_OK);
+
+    /* Validation happens before any node lookup. */
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+    aster_operation_t op = 0;
+    aster_bytes_t prov = nsb;
+    aster_bytes_list_t provs = {&prov, 1};
+    CHECK(aster_blobs_download_hash_from(rt, 1, nsb, provs, ASTER_BLOB_FORMAT_RAW,
+                                         ASTER_FETCH_STRATEGY_SPLIT_CHILDREN, 0, 0, &op) ==
+          ASTER_STATUS_INVALID_ARGUMENT);
+    aster_bytes_list_t none = {NULL, 0};
+    CHECK(aster_blobs_download_hash_from(rt, 1, nsb, none, ASTER_BLOB_FORMAT_RAW,
+                                         ASTER_FETCH_STRATEGY_WHOLE, 0, 0, &op) ==
+          ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_blobs_read_range(rt, 424242, nsb, 0, 1, 0, &op) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_connection_paths(rt, 424242, &pl) == ASTER_STATUS_NOT_FOUND);
+    CHECK(pl.len == 0 && pl.storage == NULL && pl.struct_size == sizeof(aster_path_list_t));
+    CHECK(aster_send_stream_priority(rt, 424242, 0, &op) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
 static void test_runtime(void) {
@@ -449,6 +521,7 @@ int main(void) {
     test_envelope();
     test_config();
     test_gate_and_node();
+    test_data_plane();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;
