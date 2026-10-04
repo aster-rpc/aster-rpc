@@ -8,6 +8,12 @@ import java.util.Set;
  * <p>Tracks consecutive failures and opens the circuit when the threshold is reached. After a
  * recovery timeout, the circuit moves to half-open and allows a limited number of probe calls.
  * Success resets to closed; failure reopens immediately.
+ *
+ * <p>Like Python's, this interceptor has no request / response / error hooks: {@code AsterClient}
+ * drives it around every <em>attempt</em> of a unary or client-streaming call ({@link
+ * #beforeCall()}, then {@link #recordSuccess()} or {@link #recordFailure}), so a rejected call
+ * (open circuit) is neither retried nor counted as a failure. Streaming calls that return a handle
+ * do not pass through the breaker.
  */
 public final class CircuitBreakerInterceptor implements Interceptor {
 
@@ -54,8 +60,12 @@ public final class CircuitBreakerInterceptor implements Interceptor {
     return state;
   }
 
-  @Override
-  public synchronized Object onRequest(CallContext ctx, Object request) {
+  /**
+   * Gate before an attempt: throws {@link StatusCode#UNAVAILABLE} while the circuit is open (or
+   * half-open with its probe budget spent), moving open to half-open once the recovery timeout has
+   * elapsed.
+   */
+  public synchronized void beforeCall() {
     long now = System.nanoTime();
 
     if (state == State.OPEN) {
@@ -74,30 +84,29 @@ public final class CircuitBreakerInterceptor implements Interceptor {
       }
       halfOpenCalls++;
     }
-
-    return request;
   }
 
-  @Override
-  public synchronized Object onResponse(CallContext ctx, Object response) {
-    // Success -- reset to closed
+  /** An attempt succeeded: reset to closed. */
+  public synchronized void recordSuccess() {
     failureCount = 0;
     halfOpenCalls = 0;
     state = State.CLOSED;
-    return response;
   }
 
-  @Override
-  public synchronized RpcError onError(CallContext ctx, RpcError error) {
+  /**
+   * An attempt failed with {@code error}. Only {@code UNAVAILABLE}, {@code INTERNAL} and {@code
+   * UNKNOWN} count; a half-open failure reopens immediately.
+   */
+  public synchronized void recordFailure(RpcError error) {
     if (!TRIP_CODES.contains(error.code())) {
-      return error;
+      return;
     }
 
     if (state == State.HALF_OPEN) {
       state = State.OPEN;
       openedAtNanos = System.nanoTime();
       halfOpenCalls = 0;
-      return error;
+      return;
     }
 
     failureCount++;
@@ -105,7 +114,5 @@ public final class CircuitBreakerInterceptor implements Interceptor {
       state = State.OPEN;
       openedAtNanos = System.nanoTime();
     }
-
-    return error;
   }
 }

@@ -5,6 +5,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.Codec;
 import site.aster.ffi.Rpc;
+import site.aster.interceptors.InterceptorChain;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
 
@@ -33,6 +34,10 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   private final long call;
   private final Codec codec;
   private final Class<Resp> responseType;
+
+  /** The client's interceptors and this call's context; {@code null} when it has none. */
+  private final AsterClient.Intercepted intercepted;
+
   private final BlockingQueue<Object> responses = new LinkedBlockingQueue<>();
   private final Thread readerThread;
   private volatile RpcError trailerError;
@@ -44,7 +49,13 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   private volatile boolean cancelRequested = false;
 
   /** Package-private: the request has been sent on {@code call} ({@code aster_rpc_open}). */
-  ServerStreamCall(long runtime, long call, Codec codec, Class<Resp> responseType) {
+  ServerStreamCall(
+      long runtime,
+      long call,
+      Codec codec,
+      Class<Resp> responseType,
+      AsterClient.Intercepted intercepted) {
+    this.intercepted = intercepted;
     this.runtime = runtime;
     this.call = call;
     this.codec = codec;
@@ -59,14 +70,14 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
    * trailer. Throws {@link RpcError} on a non-OK trailer or transport error.
    */
   public Resp recv() throws InterruptedException {
-    return unwrap(responses.take());
+    return deliver(responses.take());
   }
 
   /** Poll with a timeout: {@code null} on expiry OR clean end ({@link #isComplete()} tells). */
   public Resp recvWithTimeout(long timeout, TimeUnit unit) throws InterruptedException {
     Object item = responses.poll(timeout, unit);
     if (item == null) return null;
-    return unwrap(item);
+    return deliver(item);
   }
 
   /** Cancel the call ({@code FLAG_CANCEL} then a reset); the reader ends with {@code CANCELLED}. */
@@ -79,6 +90,30 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
 
   public boolean isComplete() {
     return cleanTrailer;
+  }
+
+  /**
+   * {@link #unwrap} through the client's interceptors: the response interceptors on a response, the
+   * error interceptors (reverse order) on a failure (one that suppresses it ends the stream).
+   */
+  @SuppressWarnings("unchecked")
+  private Resp deliver(Object item) {
+    if (intercepted == null) {
+      return unwrap(item);
+    }
+    Resp response;
+    try {
+      response = unwrap(item);
+    } catch (RpcError e) {
+      RpcError surfaced = InterceptorChain.applyError(intercepted.chain(), intercepted.ctx(), e);
+      if (surfaced == null) {
+        return null;
+      }
+      throw surfaced;
+    }
+    return response == null
+        ? null
+        : (Resp) InterceptorChain.applyResponse(intercepted.chain(), intercepted.ctx(), response);
   }
 
   @SuppressWarnings("unchecked")

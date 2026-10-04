@@ -5,6 +5,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.Codec;
 import site.aster.ffi.Rpc;
+import site.aster.interceptors.InterceptorChain;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
 
@@ -31,6 +32,10 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
   private final long call;
   private final Codec codec;
   private final Class<Resp> responseType;
+
+  /** The client's interceptors and this call's context; {@code null} when it has none. */
+  private final AsterClient.Intercepted intercepted;
+
   private final BlockingQueue<Object> responses = new LinkedBlockingQueue<>();
   private final Thread readerThread;
   private volatile RpcError trailerError;
@@ -43,7 +48,13 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
   private volatile boolean cancelRequested = false;
 
   /** Package-private: {@code call} is an open bidi call ({@code aster_rpc_open}). */
-  BidiCall(long runtime, long call, Codec codec, Class<Resp> responseType) {
+  BidiCall(
+      long runtime,
+      long call,
+      Codec codec,
+      Class<Resp> responseType,
+      AsterClient.Intercepted intercepted) {
+    this.intercepted = intercepted;
     this.runtime = runtime;
     this.call = call;
     this.codec = codec;
@@ -57,7 +68,11 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
    * cancelled, answered) drops the request; {@link #recv} reports why.
    */
   public void send(Req request) {
-    Rpc.send(runtime, call, codec.encode(request), false);
+    Object outgoing =
+        intercepted == null
+            ? request
+            : InterceptorChain.applyRequest(intercepted.chain(), intercepted.ctx(), request);
+    Rpc.send(runtime, call, codec.encode(outgoing), false);
   }
 
   /** Signal end-of-request (an empty end-of-stream frame). Safe to call at most once. */
@@ -82,7 +97,7 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
    * trailer. Throws {@link RpcError} on a non-OK trailer or transport error.
    */
   public Resp recv() throws InterruptedException {
-    return unwrap(responses.take());
+    return deliver(responses.take());
   }
 
   /** Test-only hook: poll for a response with a timeout, returning {@code null} on expiry. */
@@ -91,7 +106,31 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
     if (item == null) {
       return null;
     }
-    return unwrap(item);
+    return deliver(item);
+  }
+
+  /**
+   * {@link #unwrap} through the client's interceptors: the response interceptors on a response, the
+   * error interceptors (reverse order) on a failure (one that suppresses it ends the stream).
+   */
+  @SuppressWarnings("unchecked")
+  private Resp deliver(Object item) {
+    if (intercepted == null) {
+      return unwrap(item);
+    }
+    Resp response;
+    try {
+      response = unwrap(item);
+    } catch (RpcError e) {
+      RpcError surfaced = InterceptorChain.applyError(intercepted.chain(), intercepted.ctx(), e);
+      if (surfaced == null) {
+        return null;
+      }
+      throw surfaced;
+    }
+    return response == null
+        ? null
+        : (Resp) InterceptorChain.applyResponse(intercepted.chain(), intercepted.ctx(), response);
   }
 
   @SuppressWarnings("unchecked")

@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.function.BooleanSupplier;
 
 /**
  * Context for a single RPC call, available to interceptors and handlers.
@@ -68,6 +69,7 @@ public final class CallContext {
   private final InetSocketAddress peerAddr;
   private final String relayUrl;
   private final Duration rtt;
+  private final BooleanSupplier cancellation;
 
   private CallContext(Builder builder) {
     this.service = builder.service;
@@ -85,6 +87,7 @@ public final class CallContext {
     this.peerAddr = builder.peerAddr;
     this.relayUrl = builder.relayUrl;
     this.rtt = builder.rtt;
+    this.cancellation = builder.cancellation;
   }
 
   public String service() {
@@ -163,6 +166,16 @@ public final class CallContext {
   }
 
   /**
+   * Whether the call is over for the caller: the peer cancelled it, its deadline passed, or the
+   * server is stopping. A long-running handler (a unary one has no stream to ask) polls this, or
+   * checks it between work units, to stop producing a result nobody will read. Always {@code false}
+   * for contexts that are not backed by a live call (client-side, tests).
+   */
+  public boolean isCancelled() {
+    return cancellation != null && cancellation.getAsBoolean();
+  }
+
+  /**
    * Returns the number of seconds remaining until the deadline, or {@code null} if no deadline is
    * set.
    */
@@ -200,6 +213,7 @@ public final class CallContext {
     private InetSocketAddress peerAddr;
     private String relayUrl;
     private Duration rtt;
+    private BooleanSupplier cancellation;
 
     private Builder(String service, String method) {
       this.service = service;
@@ -277,6 +291,12 @@ public final class CallContext {
 
     public Builder rtt(Duration rtt) {
       this.rtt = rtt;
+      return this;
+    }
+
+    /** Liveness probe behind {@link CallContext#isCancelled()}. */
+    public Builder cancellation(BooleanSupplier cancellation) {
+      this.cancellation = cancellation;
       return this;
     }
 

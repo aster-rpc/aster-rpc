@@ -552,6 +552,7 @@ public final class AsterServer implements AutoCloseable {
         .peerAddr(peerAddr)
         .relayUrl(relayUrl)
         .rtt(rtt)
+        .cancellation(() -> dispatch.isCancelled(callId))
         .build();
   }
 
