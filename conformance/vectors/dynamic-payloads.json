@@ -1,0 +1,2960 @@
+{
+  "cases": [
+    {
+      "hex": "01ff1e0012104221fc5d883fe21606c1bf2ba813a1ad24404005004015480a0a6869",
+      "name": "inner",
+      "type": "dyn.v1.Inner",
+      "value": {
+        "a": 5,
+        "s": "hi"
+      }
+    },
+    {
+      "hex": "01ff1e0012104221fc5d883fe21606c1bf2ba813a1ad24404005004015480002",
+      "name": "inner zero",
+      "type": "dyn.v1.Inner",
+      "value": {
+        "a": 0,
+        "s": ""
+      }
+    },
+    {
+      "hex": "01ff1e005410b99ef6068879ec1606c1bf2ba817484058232094142202641dd70094132202641dbec04c03c9805ac04c0a52477466480115603048024d0dc04c07ac1131004c0ed16e69804c0530834518480c510d984829056e0848154c979800000000000002c00000c03f2c01ffff01ff80808080804080808080808080020d0705000102feff4a68c3a96c6c6f20e697a5e69cac20f09f9880",
+      "name": "scalars",
+      "type": "dyn.v1.Scalars",
+      "value": {
+        "blob": "AAEC_v8",
+        "flag": true,
+        "large": "1099511627776",
+        "medium": -7,
+        "ratio32": 1.5,
+        "ratio64": -2.25,
+        "small": 300,
+        "text": "héllo 日本 😀",
+        "tiny": -1,
+        "uint": 7,
+        "ulong": "1125899906842624",
+        "ushort": 65535
+      }
+    },
+    {
+      "hex": "01ff1e005410b99ef6068879ec1606c1bf2ba817484058232094142202641dd70094132202641dbec04c03c9805ac04c0a52477466480115603048024d0dc04c07ac1131004c0ed16e69804c0530834518480c510d984829056e0848154c97980000000000001000ffff7f7f008000000080ffffffffffffffffffffffffffffffffffffffffffff0fffffffff0f0002",
+      "name": "scalars extremes",
+      "type": "dyn.v1.Scalars",
+      "value": {
+        "blob": "",
+        "flag": false,
+        "large": "-9223372036854775808",
+        "medium": -2147483648,
+        "ratio32": 3.4028235e+38,
+        "ratio64": 2.2250738585072014e-308,
+        "small": -32768,
+        "text": "",
+        "tiny": -128,
+        "uint": 4294967295,
+        "ulong": "18446744073709551615",
+        "ushort": 0
+      }
+    },
+    {
+      "hex": "01ff1e004d20930e9e004b42e71606c1bf2ba81b39f3439a05c85a1430180937104d0e5a01b01809365580c05a07b0180936b734c056053018093686cc5a1e3018093686b4915a1654b0180936b44a605a15b0180937325e60fdfdfdfdfdfdfd",
+      "name": "optionals all null",
+      "type": "dyn.v1.Optionals",
+      "value": {
+        "maybe_flag": null,
+        "maybe_inner": null,
+        "maybe_int": null,
+        "maybe_list": null,
+        "maybe_long": null,
+        "maybe_ratio": null,
+        "maybe_text": null
+      }
+    },
+    {
+      "hex": "01ff1e004d20930e9e004b42e71606c1bf2ba81b39f3439a05c85a1430180937104d0e5a01b01809365580c05a07b0180936b734c056053018093686cc5a1e3018093686b4915a1654b0180936b44a605a15b0180937325e60ff9a9999999999b93fff00ffffe7888743ff06ff1e0212104221fc5d883fe21606c1bf2ba813a1ad2440400500401548020679ff020c06710672ff0678",
+      "name": "optionals all set",
+      "type": "dyn.v1.Optionals",
+      "value": {
+        "maybe_flag": false,
+        "maybe_inner": {
+          "a": 1,
+          "s": "y"
+        },
+        "maybe_int": 3,
+        "maybe_list": [
+          "q",
+          "r"
+        ],
+        "maybe_long": "-9000000000",
+        "maybe_ratio": 0.1,
+        "maybe_text": "x"
+      }
+    },
+    {
+      "hex": "01ff1e0057809bff17e94941ea1606c1bf2ba81f09cb59053439b24c181454871b40c04c161409d46ce44c1604956034804c167821ad24644c161cadcd34804c1654b40c24804c185478349299064c1650441343a44c185414484e89244817544c069002240203266d696e75732074776f020e6f6e65030c0201d804020c010002081e0212104221fc5d883fe21606c1bf2ba813a1ad24404005004015480202040e74776f020c0affc7afa025020c066106620104011e03066e0812666f7572020c000000000000f03f000000000000e0bf022402066b12066d01020c06780679",
+      "name": "collections",
+      "type": "dyn.v1.Collections",
+      "value": {
+        "by_id": [
+          [
+            -2,
+            "minus two"
+          ],
+          [
+            1,
+            "one"
+          ]
+        ],
+        "counts": [
+          1,
+          -1,
+          300
+        ],
+        "flags": [
+          true,
+          false
+        ],
+        "inners": [
+          {
+            "a": 1,
+            "s": ""
+          },
+          {
+            "a": 2,
+            "s": "two"
+          }
+        ],
+        "longs": [
+          "5",
+          "-5000000000"
+        ],
+        "names": [
+          "a",
+          "b"
+        ],
+        "nested": {
+          "n": {
+            "a": 4,
+            "s": "four"
+          }
+        },
+        "ratios": [
+          1.0,
+          -0.5
+        ],
+        "scores": {
+          "k": 9,
+          "m": -1
+        },
+        "tags": [
+          "x",
+          "y"
+        ]
+      }
+    },
+    {
+      "hex": "01ff1e0057809bff17e94941ea1606c1bf2ba81f09cb59053439b24c181454871b40c04c161409d46ce44c1604956034804c167821ad24644c161cadcd34804c1654b40c24804c185478349299064c1650441343a44c185414484e89244817544c069000000000000000000000",
+      "name": "collections empty",
+      "type": "dyn.v1.Collections",
+      "value": {
+        "by_id": {},
+        "counts": [],
+        "flags": [],
+        "inners": [],
+        "longs": [],
+        "names": [],
+        "nested": {},
+        "ratios": [],
+        "scores": {},
+        "tags": []
+      }
+    },
+    {
+      "hex": "01ff1e0024008a8c23515b17e41606c1bf2ba813349299064c1e951194c04c15ac0122c048167831d1204c1e488273461e0212104221fc5d883fe21606c1bf2ba813a1ad2440400500401548020661064c01081e030606631e03040662",
+      "name": "nested struct metas are shared",
+      "type": "dyn.v1.Nested",
+      "value": {
+        "first": {
+          "a": 1,
+          "s": "a"
+        },
+        "label": "L",
+        "more": [
+          {
+            "a": 3,
+            "s": "c"
+          }
+        ],
+        "second": {
+          "a": 2,
+          "s": "b"
+        }
+      }
+    },
+    {
+      "hex": "01ff1e0012b06f41ddf78266e11606c1bf2ba8163640d300784018141430ac0224ffab0200a90206a7020ca50212a30218a1021e9f02249d022a9b023099023697023c95024293024891024e8f02548d025a8b026089026687026c85027283027881027eff018401fd018a01fb019001f9019601f7019c01f501a201f301a801f101ae01ef01b401ed01ba01eb01c001e901c601e701cc01e501d201e301d801e101de01df01e401dd01ea01db01f001d901f601d701fc01d5018202d3018802d1018e02cf019402cd019a02cb01a002c901a602c701ac02c501b202c301b802c101be02bf01c402bd01ca02bb01d002b901d602b701dc02b501e202b301e802b101ee02af01f402ad01fa02ab018003a9018603a7018c03a5019203a3019803a1019e039f01a4039d01aa039b01b0039901b6039701bc039501c2039301c8039101ce038f01d4038d01da038b01e0038901e6038701ec038501f2038301f8038101fe037f84047d8a047b9004799604779c0475a20473a80471ae046fb4046dba046bc00469c60467cc0465d20463d80461de045fe4045dea045bf00459f60457fc04558205538805518e054f94054d9a054ba00549a60547ac0545b20543b80541be053fc4053dca053bd00539d60537dc0535e20533e80531ee052ff4052dfa052b8006298606278c06259206239806219e061fa4061daa061bb00619b60617bc0615c20613c80611ce060fd4060dda060be00609e60607ec0605f20603f80601fe06008407028a07049007069607089c070aa2070ca8070eae0710b40712ba0714c00716c60718cc071ad2071cd8071ede0720e40722ea0724f00726f60728fc072a82082c88082e8e08309408329a0834a00836a60838ac083ab2083cb8083ebe0840c40842ca0844d00846d60848dc084ae2084ce8084eee0850f40852fa08548009568609588c095a92095c98095e9e0960a40962aa0964b00966b60968bc096ac2096cc8096ece0970d40972da0974e00976e60978ec097af2097cf8097efe098001840a82018a0a8401900a8601960a88019c0a8a01a20a8c01a80a8e01ae0a9001b40a9201ba0a9401c00a9601c60a9801cc0a9a01d20a9c01d80a9e01de0aa001e40aa201ea0aa401f00aa601f60aa801fc0aaa01820bac01880bae018e0bb001940bb2019a0bb401a00bb601a60bb801ac0bba01b20bbc01b80bbe01be0bc001c40bc201ca0bc401d00bc601d60bc801dc0bca01e20bcc01e80bce01ee0bd001f40b242dd201fa0bd401800cd601860cd8018c0cda01920cdc01980cde019e0ce001a40ce201aa0ce401b00ce601b60ce801bc0cea01c20cec01c80cee01ce0cf001d40cf201da0cf401e00cf601e60cf801ec0cfa01f20cfc01f80cfe01fe0c8002840d82028a0d8402900d8602960d88029c0d8a02a20d8c02a80d8e02ae0d9002b40d9202ba0d9402c00d9602c60d9802cc0d9a02d20d9c02d80d9e02de0da002e40da202ea0da402f00da602f60da802fc0daa02820e",
+      "name": "map over one chunk (300 entries)",
+      "type": "dyn.v1.BigMap",
+      "value": {
+        "m": [
+          [
+            -150,
+            0
+          ],
+          [
+            -149,
+            3
+          ],
+          [
+            -148,
+            6
+          ],
+          [
+            -147,
+            9
+          ],
+          [
+            -146,
+            12
+          ],
+          [
+            -145,
+            15
+          ],
+          [
+            -144,
+            18
+          ],
+          [
+            -143,
+            21
+          ],
+          [
+            -142,
+            24
+          ],
+          [
+            -141,
+            27
+          ],
+          [
+            -140,
+            30
+          ],
+          [
+            -139,
+            33
+          ],
+          [
+            -138,
+            36
+          ],
+          [
+            -137,
+            39
+          ],
+          [
+            -136,
+            42
+          ],
+          [
+            -135,
+            45
+          ],
+          [
+            -134,
+            48
+          ],
+          [
+            -133,
+            51
+          ],
+          [
+            -132,
+            54
+          ],
+          [
+            -131,
+            57
+          ],
+          [
+            -130,
+            60
+          ],
+          [
+            -129,
+            63
+          ],
+          [
+            -128,
+            66
+          ],
+          [
+            -127,
+            69
+          ],
+          [
+            -126,
+            72
+          ],
+          [
+            -125,
+            75
+          ],
+          [
+            -124,
+            78
+          ],
+          [
+            -123,
+            81
+          ],
+          [
+            -122,
+            84
+          ],
+          [
+            -121,
+            87
+          ],
+          [
+            -120,
+            90
+          ],
+          [
+            -119,
+            93
+          ],
+          [
+            -118,
+            96
+          ],
+          [
+            -117,
+            99
+          ],
+          [
+            -116,
+            102
+          ],
+          [
+            -115,
+            105
+          ],
+          [
+            -114,
+            108
+          ],
+          [
+            -113,
+            111
+          ],
+          [
+            -112,
+            114
+          ],
+          [
+            -111,
+            117
+          ],
+          [
+            -110,
+            120
+          ],
+          [
+            -109,
+            123
+          ],
+          [
+            -108,
+            126
+          ],
+          [
+            -107,
+            129
+          ],
+          [
+            -106,
+            132
+          ],
+          [
+            -105,
+            135
+          ],
+          [
+            -104,
+            138
+          ],
+          [
+            -103,
+            141
+          ],
+          [
+            -102,
+            144
+          ],
+          [
+            -101,
+            147
+          ],
+          [
+            -100,
+            150
+          ],
+          [
+            -99,
+            153
+          ],
+          [
+            -98,
+            156
+          ],
+          [
+            -97,
+            159
+          ],
+          [
+            -96,
+            162
+          ],
+          [
+            -95,
+            165
+          ],
+          [
+            -94,
+            168
+          ],
+          [
+            -93,
+            171
+          ],
+          [
+            -92,
+            174
+          ],
+          [
+            -91,
+            177
+          ],
+          [
+            -90,
+            180
+          ],
+          [
+            -89,
+            183
+          ],
+          [
+            -88,
+            186
+          ],
+          [
+            -87,
+            189
+          ],
+          [
+            -86,
+            192
+          ],
+          [
+            -85,
+            195
+          ],
+          [
+            -84,
+            198
+          ],
+          [
+            -83,
+            201
+          ],
+          [
+            -82,
+            204
+          ],
+          [
+            -81,
+            207
+          ],
+          [
+            -80,
+            210
+          ],
+          [
+            -79,
+            213
+          ],
+          [
+            -78,
+            216
+          ],
+          [
+            -77,
+            219
+          ],
+          [
+            -76,
+            222
+          ],
+          [
+            -75,
+            225
+          ],
+          [
+            -74,
+            228
+          ],
+          [
+            -73,
+            231
+          ],
+          [
+            -72,
+            234
+          ],
+          [
+            -71,
+            237
+          ],
+          [
+            -70,
+            240
+          ],
+          [
+            -69,
+            243
+          ],
+          [
+            -68,
+            246
+          ],
+          [
+            -67,
+            249
+          ],
+          [
+            -66,
+            252
+          ],
+          [
+            -65,
+            255
+          ],
+          [
+            -64,
+            258
+          ],
+          [
+            -63,
+            261
+          ],
+          [
+            -62,
+            264
+          ],
+          [
+            -61,
+            267
+          ],
+          [
+            -60,
+            270
+          ],
+          [
+            -59,
+            273
+          ],
+          [
+            -58,
+            276
+          ],
+          [
+            -57,
+            279
+          ],
+          [
+            -56,
+            282
+          ],
+          [
+            -55,
+            285
+          ],
+          [
+            -54,
+            288
+          ],
+          [
+            -53,
+            291
+          ],
+          [
+            -52,
+            294
+          ],
+          [
+            -51,
+            297
+          ],
+          [
+            -50,
+            300
+          ],
+          [
+            -49,
+            303
+          ],
+          [
+            -48,
+            306
+          ],
+          [
+            -47,
+            309
+          ],
+          [
+            -46,
+            312
+          ],
+          [
+            -45,
+            315
+          ],
+          [
+            -44,
+            318
+          ],
+          [
+            -43,
+            321
+          ],
+          [
+            -42,
+            324
+          ],
+          [
+            -41,
+            327
+          ],
+          [
+            -40,
+            330
+          ],
+          [
+            -39,
+            333
+          ],
+          [
+            -38,
+            336
+          ],
+          [
+            -37,
+            339
+          ],
+          [
+            -36,
+            342
+          ],
+          [
+            -35,
+            345
+          ],
+          [
+            -34,
+            348
+          ],
+          [
+            -33,
+            351
+          ],
+          [
+            -32,
+            354
+          ],
+          [
+            -31,
+            357
+          ],
+          [
+            -30,
+            360
+          ],
+          [
+            -29,
+            363
+          ],
+          [
+            -28,
+            366
+          ],
+          [
+            -27,
+            369
+          ],
+          [
+            -26,
+            372
+          ],
+          [
+            -25,
+            375
+          ],
+          [
+            -24,
+            378
+          ],
+          [
+            -23,
+            381
+          ],
+          [
+            -22,
+            384
+          ],
+          [
+            -21,
+            387
+          ],
+          [
+            -20,
+            390
+          ],
+          [
+            -19,
+            393
+          ],
+          [
+            -18,
+            396
+          ],
+          [
+            -17,
+            399
+          ],
+          [
+            -16,
+            402
+          ],
+          [
+            -15,
+            405
+          ],
+          [
+            -14,
+            408
+          ],
+          [
+            -13,
+            411
+          ],
+          [
+            -12,
+            414
+          ],
+          [
+            -11,
+            417
+          ],
+          [
+            -10,
+            420
+          ],
+          [
+            -9,
+            423
+          ],
+          [
+            -8,
+            426
+          ],
+          [
+            -7,
+            429
+          ],
+          [
+            -6,
+            432
+          ],
+          [
+            -5,
+            435
+          ],
+          [
+            -4,
+            438
+          ],
+          [
+            -3,
+            441
+          ],
+          [
+            -2,
+            444
+          ],
+          [
+            -1,
+            447
+          ],
+          [
+            0,
+            450
+          ],
+          [
+            1,
+            453
+          ],
+          [
+            2,
+            456
+          ],
+          [
+            3,
+            459
+          ],
+          [
+            4,
+            462
+          ],
+          [
+            5,
+            465
+          ],
+          [
+            6,
+            468
+          ],
+          [
+            7,
+            471
+          ],
+          [
+            8,
+            474
+          ],
+          [
+            9,
+            477
+          ],
+          [
+            10,
+            480
+          ],
+          [
+            11,
+            483
+          ],
+          [
+            12,
+            486
+          ],
+          [
+            13,
+            489
+          ],
+          [
+            14,
+            492
+          ],
+          [
+            15,
+            495
+          ],
+          [
+            16,
+            498
+          ],
+          [
+            17,
+            501
+          ],
+          [
+            18,
+            504
+          ],
+          [
+            19,
+            507
+          ],
+          [
+            20,
+            510
+          ],
+          [
+            21,
+            513
+          ],
+          [
+            22,
+            516
+          ],
+          [
+            23,
+            519
+          ],
+          [
+            24,
+            522
+          ],
+          [
+            25,
+            525
+          ],
+          [
+            26,
+            528
+          ],
+          [
+            27,
+            531
+          ],
+          [
+            28,
+            534
+          ],
+          [
+            29,
+            537
+          ],
+          [
+            30,
+            540
+          ],
+          [
+            31,
+            543
+          ],
+          [
+            32,
+            546
+          ],
+          [
+            33,
+            549
+          ],
+          [
+            34,
+            552
+          ],
+          [
+            35,
+            555
+          ],
+          [
+            36,
+            558
+          ],
+          [
+            37,
+            561
+          ],
+          [
+            38,
+            564
+          ],
+          [
+            39,
+            567
+          ],
+          [
+            40,
+            570
+          ],
+          [
+            41,
+            573
+          ],
+          [
+            42,
+            576
+          ],
+          [
+            43,
+            579
+          ],
+          [
+            44,
+            582
+          ],
+          [
+            45,
+            585
+          ],
+          [
+            46,
+            588
+          ],
+          [
+            47,
+            591
+          ],
+          [
+            48,
+            594
+          ],
+          [
+            49,
+            597
+          ],
+          [
+            50,
+            600
+          ],
+          [
+            51,
+            603
+          ],
+          [
+            52,
+            606
+          ],
+          [
+            53,
+            609
+          ],
+          [
+            54,
+            612
+          ],
+          [
+            55,
+            615
+          ],
+          [
+            56,
+            618
+          ],
+          [
+            57,
+            621
+          ],
+          [
+            58,
+            624
+          ],
+          [
+            59,
+            627
+          ],
+          [
+            60,
+            630
+          ],
+          [
+            61,
+            633
+          ],
+          [
+            62,
+            636
+          ],
+          [
+            63,
+            639
+          ],
+          [
+            64,
+            642
+          ],
+          [
+            65,
+            645
+          ],
+          [
+            66,
+            648
+          ],
+          [
+            67,
+            651
+          ],
+          [
+            68,
+            654
+          ],
+          [
+            69,
+            657
+          ],
+          [
+            70,
+            660
+          ],
+          [
+            71,
+            663
+          ],
+          [
+            72,
+            666
+          ],
+          [
+            73,
+            669
+          ],
+          [
+            74,
+            672
+          ],
+          [
+            75,
+            675
+          ],
+          [
+            76,
+            678
+          ],
+          [
+            77,
+            681
+          ],
+          [
+            78,
+            684
+          ],
+          [
+            79,
+            687
+          ],
+          [
+            80,
+            690
+          ],
+          [
+            81,
+            693
+          ],
+          [
+            82,
+            696
+          ],
+          [
+            83,
+            699
+          ],
+          [
+            84,
+            702
+          ],
+          [
+            85,
+            705
+          ],
+          [
+            86,
+            708
+          ],
+          [
+            87,
+            711
+          ],
+          [
+            88,
+            714
+          ],
+          [
+            89,
+            717
+          ],
+          [
+            90,
+            720
+          ],
+          [
+            91,
+            723
+          ],
+          [
+            92,
+            726
+          ],
+          [
+            93,
+            729
+          ],
+          [
+            94,
+            732
+          ],
+          [
+            95,
+            735
+          ],
+          [
+            96,
+            738
+          ],
+          [
+            97,
+            741
+          ],
+          [
+            98,
+            744
+          ],
+          [
+            99,
+            747
+          ],
+          [
+            100,
+            750
+          ],
+          [
+            101,
+            753
+          ],
+          [
+            102,
+            756
+          ],
+          [
+            103,
+            759
+          ],
+          [
+            104,
+            762
+          ],
+          [
+            105,
+            765
+          ],
+          [
+            106,
+            768
+          ],
+          [
+            107,
+            771
+          ],
+          [
+            108,
+            774
+          ],
+          [
+            109,
+            777
+          ],
+          [
+            110,
+            780
+          ],
+          [
+            111,
+            783
+          ],
+          [
+            112,
+            786
+          ],
+          [
+            113,
+            789
+          ],
+          [
+            114,
+            792
+          ],
+          [
+            115,
+            795
+          ],
+          [
+            116,
+            798
+          ],
+          [
+            117,
+            801
+          ],
+          [
+            118,
+            804
+          ],
+          [
+            119,
+            807
+          ],
+          [
+            120,
+            810
+          ],
+          [
+            121,
+            813
+          ],
+          [
+            122,
+            816
+          ],
+          [
+            123,
+            819
+          ],
+          [
+            124,
+            822
+          ],
+          [
+            125,
+            825
+          ],
+          [
+            126,
+            828
+          ],
+          [
+            127,
+            831
+          ],
+          [
+            128,
+            834
+          ],
+          [
+            129,
+            837
+          ],
+          [
+            130,
+            840
+          ],
+          [
+            131,
+            843
+          ],
+          [
+            132,
+            846
+          ],
+          [
+            133,
+            849
+          ],
+          [
+            134,
+            852
+          ],
+          [
+            135,
+            855
+          ],
+          [
+            136,
+            858
+          ],
+          [
+            137,
+            861
+          ],
+          [
+            138,
+            864
+          ],
+          [
+            139,
+            867
+          ],
+          [
+            140,
+            870
+          ],
+          [
+            141,
+            873
+          ],
+          [
+            142,
+            876
+          ],
+          [
+            143,
+            879
+          ],
+          [
+            144,
+            882
+          ],
+          [
+            145,
+            885
+          ],
+          [
+            146,
+            888
+          ],
+          [
+            147,
+            891
+          ],
+          [
+            148,
+            894
+          ],
+          [
+            149,
+            897
+          ]
+        ]
+      }
+    },
+    {
+      "hex": "01ff1e003bf08b569deda956e71606c1bf2ba81b8c85051739004c14c4134380500111a00ac8305407c90d1136c900500544938a09204815340c204c15ca6099004816544c0690000000000000e03f0180a0abfef96205066e1269646c6500",
+      "name": "declared defaults",
+      "type": "dyn.v1.Defaults",
+      "value": {
+        "enabled": true,
+        "name": "n",
+        "ratio": 0.5,
+        "retries": -3,
+        "since_ms": "1700000000000",
+        "state": "idle",
+        "tags": []
+      }
+    },
+    {
+      "hex": "01ff23000ce080b9c8f0cd7a051606c1bf2ba8134840582200001e02139041c1461c840ae11606c1bf2ba816446a6d9cb84c07d40ba1000e",
+      "name": "union (int case)",
+      "type": "dyn.v1.Scalar",
+      "value": {
+        "_type": "dyn.v1.IntBox",
+        "value": "7"
+      }
+    },
+    {
+      "hex": "01ff1e0019106c4e753fe73de31606c1bf2ba8131dcb192244168401ae804621ba80402150020c00001e02139041c1461c840ae11606c1bf2ba816446a6d9cb84c07d40ba1000201001e0414d098952fc0b80de11606c1bf2ba81a5a22e9b672e04c15d40ba1000e74776fff00001e030101001e050674",
+      "name": "union fields",
+      "type": "dyn.v1.Holder",
+      "value": {
+        "lu": [
+          {
+            "_type": "dyn.v1.IntBox",
+            "value": "1"
+          },
+          {
+            "_type": "dyn.v1.TextBox",
+            "value": "two"
+          }
+        ],
+        "ou": {
+          "_type": "dyn.v1.IntBox",
+          "value": "-1"
+        },
+        "u": {
+          "_type": "dyn.v1.TextBox",
+          "value": "t"
+        }
+      }
+    },
+    {
+      "hex": "01ff1e0019106c4e753fe73de31606c1bf2ba8131dcb192244168401ae804621ba8040215000fd00001e02139041c1461c840ae11606c1bf2ba816446a6d9cb84c07d40ba10000",
+      "name": "union fields, optional null",
+      "type": "dyn.v1.Holder",
+      "value": {
+        "lu": [],
+        "ou": null,
+        "u": {
+          "_type": "dyn.v1.IntBox",
+          "value": "0"
+        }
+      }
+    },
+    {
+      "hex": "01ff1e0018b09a3449f46009e31606c1bf2ba813bc086cc0401908441664ac404619b84002020c0002ff01",
+      "name": "enum fields",
+      "type": "dyn.v1.Paint",
+      "value": {
+        "c": "Blue",
+        "lc": [
+          "Red",
+          "Blue"
+        ],
+        "oc": "Green"
+      }
+    },
+    {
+      "hex": "01ff1a000cc096174f02a636011606c1bf2ba81389cb744001",
+      "name": "enum root",
+      "type": "dyn.v1.Color",
+      "value": "Green"
+    },
+    {
+      "hex": "01ff1e0023a0530eb337c340e31521b3245cf025f4823bbb12428494c04c0589d46cc048290c130050153092900c4006030102031668656c6c6f",
+      "name": "interop EchoRequest",
+      "type": "interop.EchoRequest",
+      "value": {
+        "count": 3,
+        "data": "AQID",
+        "message": "hello"
+      }
+    },
+    {
+      "hex": "01ff1e002a90e16d49bce438e41521b3245cf01e3c10e75621e5b04c0589d46cc048290c130050153092900c4058154891a923b581a608030102031668656c6c6f1272757374",
+      "name": "interop EchoReply",
+      "type": "interop.EchoReply",
+      "value": {
+        "count": 4,
+        "data": "AQID",
+        "message": "hello",
+        "server_lang": "rust"
+      }
+    }
+  ],
+  "description": "Dynamic Fory codec golden vectors (plan D5). Payloads are Fory 1.7.6 xlang with xlang=true, compatible=true, ref=false. `types` is the schema (contract TypeDefs, JSON). Each case: `hex` = the payload of `value` as the given `type`; `value` uses the Aster JSON encoding (int64/uint64 as decimal strings, binary as unpadded base64url, enums by name, unions as {\"_type\": <payload type>, ...}, maps with string keys as objects, other maps as [[key, value], ...]). A conforming dynamic codec must (1) decode `hex` to `value` and (2) encode `value` to exactly `hex` (cases: UTF-8 strings, as Fory Rust writes them; pyfory_cases: pyfory string encoding - LATIN1, else UTF-16 for BMP text, else UTF-8).",
+  "fory_version": "1.7.6",
+  "options": {
+    "compatible": true,
+    "ref": false,
+    "xlang": true
+  },
+  "pyfory_cases": [
+    {
+      "hex": "01ff1e0012104221fc5d883fe21606c1bf2ba813a1ad24404005004015480a086869",
+      "name": "inner latin1",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Inner",
+      "value": {
+        "a": 5,
+        "s": "hi"
+      }
+    },
+    {
+      "hex": "01ff1e005410b99ef6068879ec1606c1bf2ba817484058232094142202641dd70094132202641dbec04c03c9805ac04c0a52477466480115603048024d0dc04c07ac1131004c0ed16e69804c0530834518480c510d984829056e0848154c979800000000000002c00000c03f2c01ffff01ff80808080804080808080808080020d07030001ff10636166e9",
+      "name": "scalars",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Scalars",
+      "value": {
+        "blob": "AAH_",
+        "flag": true,
+        "large": "1099511627776",
+        "medium": -7,
+        "ratio32": 1.5,
+        "ratio64": -2.25,
+        "small": 300,
+        "text": "café",
+        "tiny": -1,
+        "uint": 7,
+        "ulong": "1125899906842624",
+        "ushort": 65535
+      }
+    },
+    {
+      "hex": "01ff1e004d20930e9e004b42e71606c1bf2ba81b39f3439a05c85a1430180937104d0e5a01b01809365580c05a07b0180936b734c056053018093686cc5a1e3018093686b4915a1654b0180936b44a605a15b0180937325e60fdfdfdfdfdfdfd",
+      "name": "optionals all null",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Optionals",
+      "value": {
+        "maybe_flag": null,
+        "maybe_inner": null,
+        "maybe_int": null,
+        "maybe_list": null,
+        "maybe_long": null,
+        "maybe_ratio": null,
+        "maybe_text": null
+      }
+    },
+    {
+      "hex": "01ff1e004d20930e9e004b42e71606c1bf2ba81b39f3439a05c85a1430180937104d0e5a01b01809365580c05a07b0180936b734c056053018093686cc5a1e3018093686b4915a1654b0180936b44a605a15b0180937325e60ff9a9999999999b93fff00ffffe7888743ff06ff1e0212104221fc5d883fe21606c1bf2ba813a1ad2440400500401548020479ff020c04710472ff0478",
+      "name": "optionals all set",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Optionals",
+      "value": {
+        "maybe_flag": false,
+        "maybe_inner": {
+          "a": 1,
+          "s": "y"
+        },
+        "maybe_int": 3,
+        "maybe_list": [
+          "q",
+          "r"
+        ],
+        "maybe_long": "-9000000000",
+        "maybe_ratio": 0.1,
+        "maybe_text": "x"
+      }
+    },
+    {
+      "hex": "01ff1e0057809bff17e94941ea1606c1bf2ba81f09cb59053439b24c181454871b40c04c161409d46ce44c1604956034804c167821ad24644c161cadcd34804c1654b40c24804c185478349299064c1650441343a44c185414484e89244817544c069002240203246d696e75732074776f020c6f6e65030c0201d804020c010002081e0212104221fc5d883fe21606c1bf2ba813a1ad24404005004015480200040c74776f020c0affc7afa025020c046104620104011e03046e0810666f7572020c000000000000f03f000000000000e0bf022402046b12046d01010c0478",
+      "name": "collections",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Collections",
+      "value": {
+        "by_id": [
+          [
+            -2,
+            "minus two"
+          ],
+          [
+            1,
+            "one"
+          ]
+        ],
+        "counts": [
+          1,
+          -1,
+          300
+        ],
+        "flags": [
+          true,
+          false
+        ],
+        "inners": [
+          {
+            "a": 1,
+            "s": ""
+          },
+          {
+            "a": 2,
+            "s": "two"
+          }
+        ],
+        "longs": [
+          "5",
+          "-5000000000"
+        ],
+        "names": [
+          "a",
+          "b"
+        ],
+        "nested": {
+          "n": {
+            "a": 4,
+            "s": "four"
+          }
+        },
+        "ratios": [
+          1.0,
+          -0.5
+        ],
+        "scores": {
+          "k": 9,
+          "m": -1
+        },
+        "tags": [
+          "x"
+        ]
+      }
+    },
+    {
+      "hex": "01ff1e0024008a8c23515b17e41606c1bf2ba813349299064c1e951194c04c15ac0122c048167831d1204c1e488273461e0212104221fc5d883fe21606c1bf2ba813a1ad2440400500401548020461044c01081e030604631e03040462",
+      "name": "nested",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Nested",
+      "value": {
+        "first": {
+          "a": 1,
+          "s": "a"
+        },
+        "label": "L",
+        "more": [
+          {
+            "a": 3,
+            "s": "c"
+          }
+        ],
+        "second": {
+          "a": 2,
+          "s": "b"
+        }
+      }
+    },
+    {
+      "hex": "01ff1e0018b09a3449f46009e31606c1bf2ba813bc086cc0401908441664ac404619b84002020c0002ff01",
+      "name": "enum fields",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Paint",
+      "value": {
+        "c": "Blue",
+        "lc": [
+          "Red",
+          "Blue"
+        ],
+        "oc": "Green"
+      }
+    },
+    {
+      "hex": "01ff1e0018b09a3449f46009e31606c1bf2ba813bc086cc0401908441664ac404619b8400100fd",
+      "name": "enum fields, optional null",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Paint",
+      "value": {
+        "c": "Green",
+        "lc": [],
+        "oc": null
+      }
+    },
+    {
+      "hex": "01ff1e003480d0adc6672b04e71606c1bf2ba813951720c08c068a475c008c0d8aa75c008c048a46fb008c0b8aa6fb00840929e08c08a6475c008c0fa6a75c000000000000ffffff0500000000000080fbffffff00286beefaf2ffffff010000000000010000",
+      "name": "fixed and tagged integers",
+      "producer": "pyfory 1.7.5",
+      "type": "dyn.v1.Fixed",
+      "value": {
+        "fi32": -5,
+        "fi64": "-1099511627776",
+        "fu32": 4000000000,
+        "fu64": "9223372036854775813",
+        "ti64": "-7",
+        "tu64": "1099511627776",
+        "u8": 250
+      }
+    },
+    {
+      "hex": "01ff1e0023a0530eb337c340e31521b3245cf025f4823bbb12428494c04c0589d46cc048290c130050153092900c4006030102031468e96c6c6f",
+      "name": "interop EchoRequest latin1",
+      "producer": "pyfory 1.7.5",
+      "type": "interop.EchoRequest",
+      "value": {
+        "count": 3,
+        "data": "AQID",
+        "message": "héllo"
+      }
+    },
+    {
+      "hex": "01ff1e0023a0530eb337c340e31521b3245cf025f4823bbb12428494c04c0589d46cc048290c130050153092900c40010019e5652c679e8a",
+      "name": "interop EchoRequest utf16",
+      "producer": "pyfory 1.7.5",
+      "type": "interop.EchoRequest",
+      "value": {
+        "count": -1,
+        "data": "",
+        "message": "日本語"
+      }
+    },
+    {
+      "hex": "01ff1e0023a0530eb337c340e31521b3245cf025f4823bbb12428494c04c0589d46cc048290c130050153092900c400001ff1661f09f9880",
+      "name": "interop EchoRequest utf8",
+      "producer": "pyfory 1.7.5",
+      "type": "interop.EchoRequest",
+      "value": {
+        "count": 0,
+        "data": "_w",
+        "message": "a😀"
+      }
+    },
+    {
+      "hex": "01ff1e002a90e16d49bce438e41521b3245cf01e3c10e75621e5b04c0589d46cc048290c130050153092900c4058154891a923b581a60801011468656c6c6f18707974686f6e",
+      "name": "interop EchoReply",
+      "producer": "pyfory 1.7.5",
+      "type": "interop.EchoReply",
+      "value": {
+        "count": 4,
+        "data": "AQ",
+        "message": "hello",
+        "server_lang": "python"
+      }
+    }
+  ],
+  "pyfory_source": "conformance/vectors/dynamic-payloads-pyfory.py",
+  "rust_source": "aster/tests/dynamic_payload_vector.rs",
+  "types": [
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "a",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "s",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "Inner",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "flag",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "bool",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "tiny",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "int8",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "small",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "int16",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "medium",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "large",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "ushort",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "uint16",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "uint",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "var_uint32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "ulong",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "var_uint64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "ratio32",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "float32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "ratio64",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "float64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "text",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "blob",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "binary",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "Scalars",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "maybe_int",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "maybe_long",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "maybe_flag",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "bool",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "maybe_ratio",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "float64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "maybe_text",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "maybe_inner",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "980042d2bf311374d6365f3f1175a0de31a9fc75729e70fd4c9847f5ddbe1064"
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "maybe_list",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "Optionals",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "names",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "counts",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "longs",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint64",
+          "type_ref": ""
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "flags",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "bool",
+          "type_ref": ""
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "ratios",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "float64",
+          "type_ref": ""
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "inners",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "980042d2bf311374d6365f3f1175a0de31a9fc75729e70fd4c9847f5ddbe1064"
+        },
+        {
+          "container": "set",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "tags",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "map",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "string",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "scores",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        },
+        {
+          "container": "map",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "varint32",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "by_id",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "map",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "string",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "nested",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "980042d2bf311374d6365f3f1175a0de31a9fc75729e70fd4c9847f5ddbe1064"
+        }
+      ],
+      "kind": "message",
+      "name": "Collections",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "first",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "980042d2bf311374d6365f3f1175a0de31a9fc75729e70fd4c9847f5ddbe1064"
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "second",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "980042d2bf311374d6365f3f1175a0de31a9fc75729e70fd4c9847f5ddbe1064"
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "more",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "980042d2bf311374d6365f3f1175a0de31a9fc75729e70fd4c9847f5ddbe1064"
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "label",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "Nested",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "map",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "varint32",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "m",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "BigMap",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "name",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "1269646c65",
+          "id": 0,
+          "name": "state",
+          "optional": false,
+          "ref_tracked": false,
+          "required": false,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "01",
+          "id": 0,
+          "name": "enabled",
+          "optional": false,
+          "ref_tracked": false,
+          "required": false,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "bool",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "05",
+          "id": 0,
+          "name": "retries",
+          "optional": false,
+          "ref_tracked": false,
+          "required": false,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "80a0abfef962",
+          "id": 0,
+          "name": "since_ms",
+          "optional": false,
+          "ref_tracked": false,
+          "required": false,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "000000000000e03f",
+          "id": 0,
+          "name": "ratio",
+          "optional": false,
+          "ref_tracked": false,
+          "required": false,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "float64",
+          "type_ref": ""
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "00",
+          "id": 0,
+          "name": "tags",
+          "optional": false,
+          "ref_tracked": false,
+          "required": false,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "Defaults",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "value",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint64",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "IntBox",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "value",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "TextBox",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [],
+      "kind": "union",
+      "name": "Scalar",
+      "package": "dyn.v1",
+      "union_variants": [
+        {
+          "id": 0,
+          "name": "Int",
+          "type_ref": "54f62ecb2253816d3313b68da381b89cc325116d2bdd15e54fa4c8e98618effd"
+        },
+        {
+          "id": 1,
+          "name": "Text",
+          "type_ref": "991b1e0cd4040acac73dbfee3db4cb4aa821bbc6e1fa8a9ac8fee6b41a25efb7"
+        }
+      ]
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "u",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "1e7f90fdb819bdc3bfb3811c519fe50fd2a7f587ea89b38747520d500a63b2e7"
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "ou",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "1e7f90fdb819bdc3bfb3811c519fe50fd2a7f587ea89b38747520d500a63b2e7"
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "lu",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "1e7f90fdb819bdc3bfb3811c519fe50fd2a7f587ea89b38747520d500a63b2e7"
+        }
+      ],
+      "kind": "message",
+      "name": "Holder",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [
+        {
+          "name": "Red",
+          "value": 0
+        },
+        {
+          "name": "Green",
+          "value": 1
+        },
+        {
+          "name": "Blue",
+          "value": 2
+        }
+      ],
+      "fields": [],
+      "kind": "enum",
+      "name": "Color",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "c",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "3f3c40f45b4f308cbefd3f36b59e2644c60cf64898270330e48429fed782b270"
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "oc",
+          "optional": true,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "3f3c40f45b4f308cbefd3f36b59e2644c60cf64898270330e48429fed782b270"
+        },
+        {
+          "container": "list",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "lc",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "ref",
+          "type_primitive": "",
+          "type_ref": "3f3c40f45b4f308cbefd3f36b59e2644c60cf64898270330e48429fed782b270"
+        }
+      ],
+      "kind": "message",
+      "name": "Paint",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "fi32",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "int32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "fi64",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "int64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "fu32",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "uint32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "fu64",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "uint64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "ti64",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "tagged_int64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "tu64",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "tagged_uint64",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "u8",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "uint8",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "Fixed",
+      "package": "dyn.v1",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "message",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "count",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "data",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "binary",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "EchoRequest",
+      "package": "interop",
+      "union_variants": []
+    },
+    {
+      "enum_values": [],
+      "fields": [
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "message",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "count",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "varint32",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "data",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "binary",
+          "type_ref": ""
+        },
+        {
+          "container": "none",
+          "container_key_kind": "primitive",
+          "container_key_primitive": "",
+          "container_key_ref": "",
+          "default_value": "",
+          "id": 0,
+          "name": "server_lang",
+          "optional": false,
+          "ref_tracked": false,
+          "required": true,
+          "self_ref_name": "",
+          "type_kind": "primitive",
+          "type_primitive": "string",
+          "type_ref": ""
+        }
+      ],
+      "kind": "message",
+      "name": "EchoReply",
+      "package": "interop",
+      "union_variants": []
+    }
+  ]
+}
