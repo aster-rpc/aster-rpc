@@ -23,7 +23,7 @@
 
 import { bytesToHex, type ConsumerEnrollmentCredential } from './credentials.js';
 import { admit } from './admission.js';
-import type { MeshEndpointHook } from './hooks.js';
+import type { PeerAdmitter } from './hooks.js';
 import { MAX_ADMISSION_PAYLOAD_SIZE, MAX_SERVICES_IN_ADMISSION, validateHexField } from '../limits.js';
 import type { NonceStore } from './nonce.js';
 import { createPeerAdmission, type PeerAttributeStore } from '../peer-store.js';
@@ -214,7 +214,7 @@ export function consumerCredFromJson(json: string): ConsumerEnrollmentCredential
  *
  * @param requestJson - JSON-serialised ConsumerAdmissionRequest.
  * @param rootPubkey - The server's root public key (hex string, 64 chars).
- * @param hook - MeshEndpointHook; addPeer is called on successful admission.
+ * @param hook - Gate-0 admitter; addPeer is called on successful admission.
  * @param peerNodeId - QUIC peer identity from the connection handshake.
  * @param opts - Additional options (nonceStore, services, registryNamespace, allowUnenrolled, logger).
  * @returns ConsumerAdmissionResponse — always returned, never throws.
@@ -222,7 +222,7 @@ export function consumerCredFromJson(json: string): ConsumerEnrollmentCredential
 export async function handleConsumerAdmissionRpc(
   requestJson: string,
   rootPubkey: string,
-  hook: MeshEndpointHook,
+  hook: PeerAdmitter,
   peerNodeId: string,
   opts: ConsumerAdmissionOpts = {},
 ): Promise<ConsumerAdmissionResponse> {
@@ -342,7 +342,7 @@ export async function handleConsumerAdmissionRpc(
  *
  * @param conn - A QUIC connection with acceptBi() and remoteId() methods.
  * @param rootPubkey - Hex-encoded root public key.
- * @param hook - MeshEndpointHook for peer admission tracking.
+ * @param hook - Gate-0 admitter for peer admission tracking.
  * @param opts - Additional options.
  */
 export async function handleConsumerAdmissionConnection(
@@ -351,7 +351,7 @@ export async function handleConsumerAdmissionConnection(
     remoteId(): string;
   },
   rootPubkey: string,
-  hook: MeshEndpointHook,
+  hook: PeerAdmitter,
   opts: ConsumerAdmissionOpts = {},
 ): Promise<void> {
   const peerNodeId = conn.remoteId();
@@ -428,13 +428,13 @@ export async function handleConsumerAdmissionConnection(
  *
  * @param node - An endpoint/node bound to the consumer admission ALPN, with accept().
  * @param rootPubkey - Hex-encoded root public key.
- * @param hook - MeshEndpointHook allowlist manager.
+ * @param hook - Gate-0 admitter.
  * @param opts - Additional options.
  */
 export async function serveConsumerAdmission(
   node: { accept(): Promise<any> },
   rootPubkey: string,
-  hook: MeshEndpointHook,
+  hook: PeerAdmitter,
   opts: ConsumerAdmissionOpts = {},
 ): Promise<void> {
   const log = opts.logger ?? console;

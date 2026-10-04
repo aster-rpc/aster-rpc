@@ -53,6 +53,68 @@ impl From<CoreTransportSnapshot> for TransportSnapshot {
     }
 }
 
+/// One network path of a connection (`IrohConnection.paths()`).
+#[napi(object)]
+pub struct PathInfo {
+    /// `'direct'` (UDP to `addr`), `'relay'` (via `relayUrl`; the peer's IP
+    /// is not visible) or `'other'` (custom transport, see `other`).
+    #[napi(ts_type = "'direct' | 'relay' | 'other'")]
+    pub kind: String,
+    /// Direct paths: the peer's UDP address.
+    pub addr: Option<PeerAddr>,
+    /// Relay paths: the relay URL.
+    pub relay_url: Option<String>,
+    /// Other transports: a debug description.
+    pub other: Option<String>,
+    /// Whether this path carries application data right now.
+    pub is_selected: bool,
+    /// RTT estimate in microseconds, `null` until measured.
+    pub rtt_micros: Option<f64>,
+}
+
+impl From<aster::PathInfo> for PathInfo {
+    fn from(p: aster::PathInfo) -> Self {
+        let mut out = PathInfo {
+            kind: String::new(),
+            addr: None,
+            relay_url: None,
+            other: None,
+            is_selected: p.is_selected,
+            rtt_micros: p.rtt_micros.map(|v| v as f64),
+        };
+        match p.remote {
+            aster::PathRemote::Direct(sa) => {
+                out.kind = "direct".into();
+                out.addr = Some(PeerAddr {
+                    host: sa.ip().to_string(),
+                    port: sa.port() as u32,
+                });
+            }
+            aster::PathRemote::Relay(url) => {
+                out.kind = "relay".into();
+                out.relay_url = Some(url);
+            }
+            aster::PathRemote::Other(desc) => {
+                out.kind = "other".into();
+                out.other = Some(desc);
+            }
+        }
+        out
+    }
+}
+
+/// How a connection ended (`IrohConnection.closed()`).
+#[napi(object)]
+pub struct ClosedInfo {
+    /// Debug form of the close cause (e.g. `ApplicationClosed(..)`).
+    pub kind: String,
+    /// Application close code, when the peer (or this side) closed with one
+    /// — e.g. a Gate-0 rejection's code.
+    pub code: Option<f64>,
+    /// Application close reason (UTF-8, lossy), or the error text.
+    pub reason: Option<String>,
+}
+
 // ============================================================================
 // IrohConnection
 // ============================================================================
@@ -164,6 +226,39 @@ impl IrohConnection {
     #[napi]
     pub fn transport_snapshot(&self) -> TransportSnapshot {
         TransportSnapshot::from(self.inner.transport_snapshot())
+    }
+
+    /// Every currently open network path (e.g. a relay path plus a direct
+    /// path once holepunching succeeds).
+    #[napi]
+    pub fn paths(&self) -> Vec<PathInfo> {
+        aster::Connection::from_core_connection(self.inner.clone())
+            .paths()
+            .into_iter()
+            .map(PathInfo::from)
+            .collect()
+    }
+
+    /// The path carrying application data right now, or `null`.
+    #[napi]
+    pub fn selected_path(&self) -> Option<PathInfo> {
+        aster::Connection::from_core_connection(self.inner.clone())
+            .selected_path()
+            .map(PathInfo::from)
+    }
+
+    /// Resolve when the connection closes (by either side), with the close
+    /// code and reason — e.g. a peer's Gate-0 rejection.
+    #[napi]
+    pub async fn closed(&self) -> ClosedInfo {
+        let info = self.inner.closed().await;
+        ClosedInfo {
+            kind: info.kind,
+            code: info.code.map(|c| c as f64),
+            reason: info
+                .reason
+                .map(|r| String::from_utf8_lossy(&r).into_owned()),
+        }
     }
 
     /// Close the connection.

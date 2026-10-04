@@ -1,21 +1,171 @@
-//! Blobs module — wraps CoreBlobsClient.
+//! Blobs — the `aster` crate's [`aster::Blobs`] (ranged reads, multi-provider
+//! fetch with a report, store-only downloads, tag prefixes, GC) plus the
+//! transport-core ticket / collection / observe helpers.
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use aster::{BlobFormat, BlobStatus, FetchStrategy, Hash, NodeId};
 use aster_transport_core::CoreBlobsClient;
 
+use crate::config::aster_err;
 use crate::error::to_napi_err;
 
 #[napi]
 pub struct BlobsClient {
     pub(crate) inner: CoreBlobsClient,
+    pub(crate) blobs: aster::Blobs,
 }
 
-impl From<CoreBlobsClient> for BlobsClient {
-    fn from(inner: CoreBlobsClient) -> Self {
-        Self { inner }
+impl BlobsClient {
+    pub(crate) fn new(node: &aster::Node) -> Self {
+        Self {
+            inner: node.core_node().blobs_client(),
+            blobs: node.blobs(),
+        }
     }
+}
+
+fn invalid(msg: impl Into<String>) -> Error {
+    Error::new(Status::InvalidArg, msg.into())
+}
+
+fn format_in(format: Option<&str>) -> Result<BlobFormat> {
+    match format.unwrap_or("raw") {
+        "raw" => Ok(BlobFormat::Raw),
+        "hash_seq" => Ok(BlobFormat::HashSeq),
+        other => Err(invalid(format!(
+            "unknown blob format {other:?} (expected 'raw' or 'hash_seq')"
+        ))),
+    }
+}
+
+fn strategy_in(strategy: Option<&str>) -> Result<FetchStrategy> {
+    match strategy.unwrap_or("whole") {
+        "whole" => Ok(FetchStrategy::Whole),
+        "split_children" => Ok(FetchStrategy::SplitChildren),
+        other => Err(invalid(format!(
+            "unknown fetch strategy {other:?} (expected 'whole' or 'split_children')"
+        ))),
+    }
+}
+
+fn u64_in(what: &str, v: f64) -> Result<u64> {
+    if !v.is_finite() || v < 0.0 || v.fract() != 0.0 || v > 9_007_199_254_740_991.0 {
+        return Err(invalid(format!(
+            "{what} must be a non-negative safe integer"
+        )));
+    }
+    Ok(v as u64)
+}
+
+fn providers_in(from: Vec<String>) -> Vec<NodeId> {
+    from.into_iter().map(NodeId::from_hex).collect()
+}
+
+/// Local storage status of a blob.
+#[napi(object)]
+pub struct BlobStatusInfo {
+    #[napi(ts_type = "'not_found' | 'partial' | 'complete'")]
+    pub state: String,
+    /// Bytes stored (`partial`: known so far, `0` if unknown) or the blob
+    /// size (`complete`). `null` for `not_found`.
+    pub size: Option<f64>,
+}
+
+pub(crate) fn blob_status_out(s: BlobStatus) -> BlobStatusInfo {
+    match s {
+        BlobStatus::NotFound => BlobStatusInfo {
+            state: "not_found".into(),
+            size: None,
+        },
+        BlobStatus::Partial { size } => BlobStatusInfo {
+            state: "partial".into(),
+            size: Some(size as f64),
+        },
+        BlobStatus::Complete { size } => BlobStatusInfo {
+            state: "complete".into(),
+            size: Some(size as f64),
+        },
+    }
+}
+
+/// What one provider did during a multi-provider fetch.
+#[napi(object)]
+pub struct ProviderOutcome {
+    pub node_id: String,
+    /// Requests attempted against this provider (real dials / transfers).
+    pub attempts: u32,
+    /// Attempts that failed to connect or transfer.
+    pub failures: u32,
+    /// Requests this provider carried to completion.
+    pub completed_requests: u32,
+}
+
+/// What a multi-provider fetch did — feed it back into provider ranking.
+#[napi(object)]
+pub struct FetchReport {
+    /// Per-provider outcomes, in first-attempt order (repeats aggregated).
+    pub providers: Vec<ProviderOutcome>,
+    /// Providers actually dialled, in first-attempt order.
+    pub attempted: Vec<String>,
+    /// Providers where at least one request failed.
+    pub failed: Vec<String>,
+    /// Providers that completed at least one request.
+    pub served: Vec<String>,
+    /// Payload bytes pulled off the wire (a transfer metric, not a size).
+    pub bytes_transferred: f64,
+}
+
+impl From<aster::FetchReport> for FetchReport {
+    fn from(r: aster::FetchReport) -> Self {
+        let ids = |it: &mut dyn Iterator<Item = &NodeId>| -> Vec<String> {
+            it.map(|id| id.as_str().to_string()).collect()
+        };
+        Self {
+            attempted: ids(&mut r.attempted()),
+            failed: ids(&mut r.failed()),
+            served: ids(&mut r.served()),
+            bytes_transferred: r.bytes_transferred() as f64,
+            providers: r
+                .providers()
+                .iter()
+                .map(|p| ProviderOutcome {
+                    node_id: p.node_id().as_str().to_string(),
+                    attempts: p.attempts(),
+                    failures: p.failures(),
+                    completed_requests: p.completed_requests(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Options for the multi-provider downloads.
+#[napi(object)]
+#[derive(Default)]
+pub struct FetchOptions {
+    /// `'raw'` (default) or `'hash_seq'`.
+    #[napi(ts_type = "'raw' | 'hash_seq'")]
+    pub format: Option<String>,
+    /// `'whole'` (default) or `'split_children'` (HashSeq only; provider
+    /// order applies per child).
+    #[napi(ts_type = "'whole' | 'split_children'")]
+    pub strategy: Option<String>,
+}
+
+/// Bytes plus the fetch report (`downloadHashFrom`).
+#[napi(object)]
+pub struct FetchResult {
+    pub data: Buffer,
+    pub report: FetchReport,
+}
+
+/// Collection entries plus the fetch report (`downloadCollectionFrom`).
+#[napi(object)]
+pub struct CollectionFetchResult {
+    pub files: Vec<CollectionFile>,
+    pub report: FetchReport,
 }
 
 #[napi]
@@ -191,6 +341,168 @@ impl BlobsClient {
             .map_err(to_napi_err)
     }
 
+    /// Read `len` bytes at `offset` from a blob in the local store.
+    #[napi]
+    pub async fn read_range(&self, hash_hex: String, offset: f64, len: f64) -> Result<Buffer> {
+        let (offset, len) = (u64_in("offset", offset)?, u64_in("len", len)?);
+        Ok(Buffer::from(
+            self.blobs
+                .read_range(&Hash::from_hex(hash_hex), offset, len)
+                .await
+                .map_err(aster_err)?,
+        ))
+    }
+
+    /// The blob's local storage status.
+    #[napi]
+    pub async fn status(&self, hash_hex: String) -> Result<BlobStatusInfo> {
+        Ok(blob_status_out(
+            self.blobs
+                .status(&Hash::from_hex(hash_hex))
+                .await
+                .map_err(aster_err)?,
+        ))
+    }
+
+    /// Download a blob by hash from one peer; returns the bytes.
+    #[napi]
+    pub async fn download_hash(
+        &self,
+        hash_hex: String,
+        from: String,
+        #[napi(ts_arg_type = "'raw' | 'hash_seq'")] format: Option<String>,
+    ) -> Result<Buffer> {
+        let format = format_in(format.as_deref())?;
+        Ok(Buffer::from(
+            self.blobs
+                .download_hash(&Hash::from_hex(hash_hex), &NodeId::from_hex(from), format)
+                .await
+                .map_err(aster_err)?,
+        ))
+    }
+
+    /// Download a blob by hash from one peer into the local store without
+    /// returning the bytes (no whole-blob copy; read it later with
+    /// `readRange`).
+    #[napi]
+    pub async fn download_hash_to_store(
+        &self,
+        hash_hex: String,
+        from: String,
+        #[napi(ts_arg_type = "'raw' | 'hash_seq'")] format: Option<String>,
+    ) -> Result<()> {
+        let format = format_in(format.as_deref())?;
+        self.blobs
+            .download_hash_to_store(&Hash::from_hex(hash_hex), &NodeId::from_hex(from), format)
+            .await
+            .map_err(aster_err)
+    }
+
+    /// Download from an **ordered** provider list (failover in order; each
+    /// attempt fetches only missing ranges). Returns bytes and a report.
+    #[napi]
+    pub async fn download_hash_from(
+        &self,
+        hash_hex: String,
+        providers: Vec<String>,
+        options: Option<FetchOptions>,
+    ) -> Result<FetchResult> {
+        let o = options.unwrap_or_default();
+        let (format, strategy) = (
+            format_in(o.format.as_deref())?,
+            strategy_in(o.strategy.as_deref())?,
+        );
+        let (data, report) = self
+            .blobs
+            .download_hash_from(
+                &Hash::from_hex(hash_hex),
+                &providers_in(providers),
+                format,
+                strategy,
+            )
+            .await
+            .map_err(aster_err)?;
+        Ok(FetchResult {
+            data: Buffer::from(data),
+            report: report.into(),
+        })
+    }
+
+    /// As `downloadHashFrom`, leaving the blob in the store; returns the
+    /// report only.
+    #[napi]
+    pub async fn download_hash_to_store_from(
+        &self,
+        hash_hex: String,
+        providers: Vec<String>,
+        options: Option<FetchOptions>,
+    ) -> Result<FetchReport> {
+        let o = options.unwrap_or_default();
+        let (format, strategy) = (
+            format_in(o.format.as_deref())?,
+            strategy_in(o.strategy.as_deref())?,
+        );
+        Ok(self
+            .blobs
+            .download_hash_to_store_from(
+                &Hash::from_hex(hash_hex),
+                &providers_in(providers),
+                format,
+                strategy,
+            )
+            .await
+            .map_err(aster_err)?
+            .into())
+    }
+
+    /// As `downloadHashFrom` for a collection: its `(name, data)` entries
+    /// plus the report.
+    #[napi]
+    pub async fn download_collection_from(
+        &self,
+        hash_hex: String,
+        providers: Vec<String>,
+        #[napi(ts_arg_type = "'whole' | 'split_children'")] strategy: Option<String>,
+    ) -> Result<CollectionFetchResult> {
+        let strategy = strategy_in(strategy.as_deref())?;
+        let (files, report) = self
+            .blobs
+            .download_collection_from(
+                &Hash::from_hex(hash_hex),
+                &providers_in(providers),
+                strategy,
+            )
+            .await
+            .map_err(aster_err)?;
+        Ok(CollectionFetchResult {
+            files: files
+                .into_iter()
+                .map(|(name, data)| CollectionFile {
+                    name,
+                    data: Buffer::from(data),
+                })
+                .collect(),
+            report: report.into(),
+        })
+    }
+
+    /// Delete every tag whose name starts with `prefix`; returns how many.
+    #[napi]
+    pub async fn tag_delete_prefix(&self, prefix: String) -> Result<f64> {
+        Ok(self
+            .blobs
+            .tag_delete_prefix(prefix)
+            .await
+            .map_err(aster_err)? as f64)
+    }
+
+    /// Run one blob GC mark-and-sweep pass now. Node-wide: every blob not
+    /// protected by a tag (or a live temp tag) is reclaimed.
+    #[napi]
+    pub async fn gc_run_once(&self) -> Result<()> {
+        self.blobs.gc_run_once().await.map_err(aster_err)
+    }
+
     // -- Tags -----------------------------------------------------------------
 
     /// Set a tag.
@@ -239,18 +551,6 @@ impl BlobsClient {
     }
 
     // -- Observability --------------------------------------------------------
-
-    /// Get blob status (complete/partial/missing).
-    #[napi]
-    pub async fn blob_status(&self, hash_hex: String) -> Result<String> {
-        let status = self
-            .inner
-            .clone()
-            .blob_status(hash_hex)
-            .await
-            .map_err(to_napi_err)?;
-        Ok(format!("{:?}", status))
-    }
 
     /// Wait for a blob download to complete.
     #[napi]

@@ -22,7 +22,7 @@
 
 import { RpcError, StatusCode } from '../status.js';
 import { verify, hexToBytes, bytesToHex, loadPublicKey, ATTR_ROLE } from './credentials.js';
-import type { MeshEndpointHook } from './hooks.js';
+import type { PeerAdmitter } from './hooks.js';
 import type { PeerAttributeStore } from '../peer-store.js';
 import { createPeerAdmission } from '../peer-store.js';
 
@@ -284,7 +284,7 @@ export async function handleDelegatedAdmissionConnection(
   conn: AdmissionConnection,
   opts: {
     policy: DelegatedAdmissionPolicy;
-    hook?: MeshEndpointHook;
+    hook?: PeerAdmitter;
     peerStore?: PeerAttributeStore;
   },
 ): Promise<void> {

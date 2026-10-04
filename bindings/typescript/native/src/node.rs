@@ -11,12 +11,14 @@ use napi_derive::napi;
 use aster::binding_support::core::CoreNodeAddr;
 use aster::binding_support::CoreNode;
 
+use std::sync::Arc;
+
+use crate::admission::{AdmissionHub, AdmissionRequests, GatePolicy};
 use crate::blobs::BlobsClient;
 use crate::config::{aster_err, JsAsterConfig};
 use crate::docs::DocsClient;
 use crate::error::to_napi_err;
 use crate::gossip::GossipClient;
-use crate::hooks::NodeHookReceiver;
 use crate::net::IrohConnection;
 
 /// A running Aster node (QUIC endpoint + blobs / docs / gossip).
@@ -26,6 +28,8 @@ use crate::net::IrohConnection;
 #[napi]
 pub struct Node {
     inner: aster::Node,
+    /// Gate 0 / admission state; `None` when hooks are off.
+    admission: Option<Arc<AdmissionHub>>,
 }
 
 impl Node {
@@ -33,6 +37,19 @@ impl Node {
     /// still-core-backed methods below.
     pub(crate) fn core(&self) -> &CoreNode {
         self.inner.core_node()
+    }
+
+    /// The `aster` node (typed blobs / docs / gossip facades).
+    pub(crate) fn aster(&self) -> &aster::Node {
+        &self.inner
+    }
+
+    fn hub(&self) -> Result<&Arc<AdmissionHub>> {
+        self.admission.as_ref().ok_or_else(|| {
+            Error::from_reason(
+                "node has no admission hooks (start it with enableHooks: true or a gate)",
+            )
+        })
     }
 }
 
@@ -43,11 +60,36 @@ impl Node {
     /// A `secretKeyFile` is loaded, or created from `secretKey` / a fresh key
     /// when missing; an explicit `secretKey` that disagrees with an existing
     /// file is an error. `alpns` adds inbound ALPNs beyond blobs/docs/gossip.
-    #[napi(factory)]
-    pub async fn start(config: Option<JsAsterConfig>) -> Result<Node> {
-        let config = config.unwrap_or_default().to_rust()?;
-        let inner = aster::Node::start(config).await.map_err(aster_err)?;
-        Ok(Node { inner })
+    ///
+    /// `gate` attaches a Gate-0 policy (and turns `enableHooks` on): inbound
+    /// admission is then decided in Rust. Without a gate, a node with
+    /// `enableHooks` hands decisions to `admission()`.
+    #[napi(ts_return_type = "Promise<Node>")]
+    pub fn start<'env>(
+        env: &'env Env,
+        config: Option<JsAsterConfig>,
+        gate: Option<&GatePolicy>,
+    ) -> Result<PromiseRaw<'env, Node>> {
+        let mut config = config.unwrap_or_default().to_rust()?;
+        if gate.is_some() {
+            config.enable_hooks = true;
+        }
+        let hooks = config.enable_hooks;
+        let gate = gate.map(|g| GatePolicy {
+            inner: g.inner.clone(),
+        });
+        env.spawn_future(async move {
+            let inner = aster::Node::start(config).await.map_err(aster_err)?;
+            let admission = if hooks {
+                inner
+                    .core_node()
+                    .take_hook_receiver()
+                    .map(|rx| AdmissionHub::spawn(rx, gate.as_ref()))
+            } else {
+                None
+            };
+            Ok(Node { inner, admission })
+        })
     }
 
     /// This node's id (the hex public key of its secret key).
@@ -78,19 +120,27 @@ impl Node {
         Ok(Buffer::from(key.to_bytes().to_vec()))
     }
 
-    /// Whether this node was started with hooks enabled.
+    /// Whether this node was started with admission hooks (`enableHooks` or
+    /// a gate).
     #[napi]
     pub fn has_hooks(&self) -> bool {
-        self.core().has_hooks()
+        self.admission.is_some()
     }
 
-    /// Take the hook receiver (one-shot). `null` if hooks are not enabled or
-    /// it was already taken.
+    /// Attach (`gate`) or detach (`null`) a Gate-0 policy. Applies from the
+    /// next admission decision. Errors on a node without admission hooks.
     #[napi]
-    pub fn take_hook_receiver(&self) -> Option<NodeHookReceiver> {
-        self.core()
-            .take_hook_receiver()
-            .map(NodeHookReceiver::from_core)
+    pub fn set_gate(&self, gate: Option<&GatePolicy>) -> Result<()> {
+        self.hub()?.set_gate(gate);
+        Ok(())
+    }
+
+    /// The admission requests this node raises while no gate is attached —
+    /// iterate with `for await` and `accept()` / `reject(code, reason)` each.
+    /// One iterator per node. Errors on a node without admission hooks.
+    #[napi]
+    pub fn admission(&self) -> Result<AdmissionRequests> {
+        self.hub()?.open()
     }
 
     /// Accept the next incoming connection on a non-builtin ALPN. The ALPN is
@@ -111,19 +161,19 @@ impl Node {
     /// The blobs client for this node.
     #[napi]
     pub fn blobs_client(&self) -> BlobsClient {
-        BlobsClient::from(self.core().blobs_client())
+        BlobsClient::new(&self.inner)
     }
 
     /// The docs client for this node.
     #[napi]
     pub fn docs_client(&self) -> DocsClient {
-        DocsClient::from(self.core().docs_client())
+        DocsClient::from(self.inner.docs())
     }
 
     /// The gossip client for this node.
     #[napi]
     pub fn gossip_client(&self) -> GossipClient {
-        GossipClient::from(self.core().gossip_client())
+        GossipClient::from(self.inner.gossip())
     }
 
     /// Add another local node's address info (in-process peer discovery).

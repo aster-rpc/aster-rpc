@@ -271,12 +271,14 @@ describe('E2E: TS server + TS client over QUIC', () => {
 
     // Default should be 'everything'
     const policy = await doc.getDownloadPolicy();
-    expect(policy).toBe('everything');
+    expect(policy.mode).toBe('everything');
 
     // Set a filtered policy
-    await doc.setDownloadPolicy('nothing_except:prefix1,prefix2');
+    await doc.setDownloadPolicy({ mode: 'nothing_except', prefixes: ['prefix1', Buffer.from('prefix2')] });
     const updated = await doc.getDownloadPolicy();
-    expect(updated).toBe('nothing_except:prefix1,prefix2');
+    expect(updated.mode).toBe('nothing_except');
+    expect(updated.prefixes!.map((p) => Buffer.from(p as Uint8Array).toString())).toEqual(['prefix1', 'prefix2']);
+    await expect(doc.setDownloadPolicy({ mode: 'bogus' as any })).rejects.toThrow(/download policy/);
   });
 
   it.skipIf(!available)('blobs observe snapshot', async () => {
@@ -354,7 +356,8 @@ describe('E2E: TS server + TS client over QUIC', () => {
     const event = await receiver.recv();
     expect(event).toBeDefined();
     expect(event!.kind).toBe('insert_local');
-    expect(event!.author).toBe(authorId);
+    expect(event!.entry!.author).toBe(authorId);
+    expect(Buffer.from(event!.entry!.key).toString()).toBe('test-key');
   });
 
   it.skipIf(!available)('client connects and makes RPC via IrohTransport + createClient', async () => {

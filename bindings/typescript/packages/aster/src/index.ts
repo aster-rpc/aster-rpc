@@ -290,7 +290,45 @@ export {
 export { IrohTransport } from './transport/iroh.js';
 
 // Node + configuration (Rust `aster::Node` / `aster::AsterConfig`)
-export { Node, NodeId, type NodeAddr } from './node.js';
+export { Node, NodeId, type NodeAddr, type NodeStartOptions } from './node.js';
+// Data plane (Rust `aster::{Blobs, Docs, Gossip}` and connection paths)
+export {
+  type BlobFormat,
+  type FetchStrategy,
+  type ShareMode,
+  type LocalAccess,
+  type DownloadPolicyMode,
+  type DocEventKind,
+  type GossipEventKind,
+  authorityFingerprint,
+  defaultAuthorId,
+} from './data-plane.js';
+export type {
+  AdmissionRequests,
+  AuthorityReport,
+  BlobStatusInfo,
+  BlobsClient,
+  CollectionFetchResult,
+  DocEntry,
+  DocEvent,
+  DocEventReceiver,
+  DocHandle,
+  DocsClient,
+  DocWithEvents,
+  DownloadPolicy,
+  FetchOptions,
+  FetchReport,
+  FetchResult,
+  GossipClient,
+  GossipEvent as GossipTopicEvent,
+  GossipTopicHandle,
+  IrohConnection,
+  IrohSendStream,
+  IrohRecvStream,
+  PathInfo,
+  ProviderOutcome,
+  RetireOutcome,
+} from '@aster-rpc/transport';
 export {
   AsterConfig,
   resolveRootPubkey,
@@ -390,15 +428,24 @@ export {
   type AdmitOptions,
 } from './trust/admission.js';
 export {
-  AllowAllPolicy,
-  DenyAllPolicy,
-  MeshEndpointHook,
   PRODUCER_ADMISSION_ALPN,
   CONSUMER_ADMISSION_ALPN,
   DELEGATED_ADMISSION_ALPN,
-  type ConnectionPolicy,
-  type HookDecision,
+  gateAdmitter,
+  type PeerAdmitter,
 } from './trust/hooks.js';
+// Gate 0 (Rust `GatePolicy` / `PeerAdmissionStore`)
+export {
+  GatePolicy,
+  PeerAdmissionStore,
+  type TrustMode,
+  type AdmissionSource,
+  type AdmissionRequest,
+  type AdmitOptions as PeerAdmitOptions,
+  type GateDecision,
+  type GatePolicyOptions,
+  type PeerAdmission,
+} from './gate.js';
 // Nonce store
 export {
   InMemoryNonceStore,

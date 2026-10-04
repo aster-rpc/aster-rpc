@@ -1,16 +1,17 @@
 /**
- * aster/peer-store -- Per-peer admission attribute store.
+ * aster/peer-store -- the admission-record view the frozen credential
+ * handlers (`trust/consumer.ts`, `trust/delegated.ts`) and RPC dispatch use,
+ * backed by the Rust Gate-0 {@link PeerAdmissionStore}.
  *
- * Bridges the gap between admission (where attributes are determined)
- * and RPC dispatch (where attributes are needed for authorization).
+ * There is one store: admitting a peer here admits it into the gate's store,
+ * so it passes Gate 0 on the RPC ALPN; its attributes feed RPC
+ * authorization; expiry is enforced by Rust.
  *
- * Expiry: each admission records the credential's `expiresAt` (epoch
- * seconds). Lookups check expiry and lazily evict stale entries. A
- * background reaper sweeps entries that are never looked up again.
- *
- * Config: ASTER_PEER_TTL_S env var (default 86400 = 24h) sets the
- * server-side upper bound on how long a peer stays admitted.
+ * Config: ASTER_PEER_TTL_S env var (default 86400 = 24h) caps how long a
+ * peer stays admitted.
  */
+
+import { PeerAdmissionStore } from './gate.js';
 
 /** Server-side upper bound on peer admission lifetime (seconds). */
 export const PEER_TTL_S: number = (() => {
@@ -22,12 +23,14 @@ export const PEER_TTL_S: number = (() => {
 
 const _REAPER_INTERVAL_MS = 300_000;
 
-/** Record of a successful peer admission. */
+/** Record of a successful peer admission (credential-handler shape). */
 export interface PeerAdmission {
   endpointId: string;
   handle: string;
   attributes: Map<string, string>;
+  /** Epoch seconds. */
   admittedAt: number;
+  /** Epoch seconds; 0 = no credential expiry (PEER_TTL_S still applies). */
   expiresAt: number;
   /** "consumer_admission" | "aster.admission" */
   admissionPath: string;
@@ -47,76 +50,73 @@ export function createPeerAdmission(
   };
 }
 
-function isExpired(admission: PeerAdmission): boolean {
-  const now = Date.now() / 1000;
-  if (admission.expiresAt > 0 && now > admission.expiresAt) return true;
-  if (now > admission.admittedAt + PEER_TTL_S) return true;
-  return false;
-}
-
 /**
- * In-memory store mapping peer endpointId to admission attributes.
- *
- * Entries are lazily evicted on access when expired. Call startReaper()
- * to enable periodic sweeps of entries that are never accessed.
+ * Admission records over the Rust {@link PeerAdmissionStore}.
  */
 export class PeerAttributeStore {
-  private peers: Map<string, PeerAdmission> = new Map();
+  readonly store: PeerAdmissionStore;
   private reaperTimer: ReturnType<typeof setInterval> | null = null;
 
-  /** Record a successful admission. */
+  constructor(store: PeerAdmissionStore = new PeerAdmissionStore()) {
+    this.store = store;
+  }
+
+  /** Record a successful admission (admits the peer through Gate 0). */
   admit(admission: PeerAdmission): void {
-    this.peers.set(admission.endpointId, admission);
+    const ttlEnd = (admission.admittedAt + PEER_TTL_S) * 1000;
+    const credEnd = admission.expiresAt > 0 ? admission.expiresAt * 1000 : Infinity;
+    this.store.admit(admission.endpointId, {
+      attributes: admission.attributes,
+      expiresAt: Math.max(0, Math.floor(Math.min(ttlEnd, credEnd))),
+      source: admission.admissionPath === 'aster.admission' ? 'attestation' : 'credential',
+    });
   }
 
-  /** Look up admission record for a peer. Returns undefined if expired. */
+  /** The unexpired admission of a peer, if any. */
   get(endpointId: string): PeerAdmission | undefined {
-    const admission = this.peers.get(endpointId);
-    if (!admission) return undefined;
-    if (isExpired(admission)) {
-      this.peers.delete(endpointId);
-      return undefined;
-    }
-    return admission;
+    const a = this.store.get(endpointId);
+    if (!a) return undefined;
+    return {
+      endpointId: a.peer,
+      handle: '',
+      attributes: new Map(Object.entries(a.attributes)),
+      admittedAt: a.admittedAt.getTime() / 1000,
+      expiresAt: a.expiresAt ? a.expiresAt.getTime() / 1000 : 0,
+      admissionPath: a.source === 'attestation' ? 'aster.admission' : 'consumer_admission',
+    };
   }
 
-  /** Remove a peer on disconnect or revocation. */
+  /** Remove a peer (revocation). */
   remove(endpointId: string): void {
-    this.peers.delete(endpointId);
+    this.store.revoke(endpointId);
   }
 
-  /** Get attributes map for a peer, or empty map if expired/not admitted. */
+  /** Attributes of an unexpired admission, or an empty map. */
   getAttributes(endpointId: string): Map<string, string> {
-    const admission = this.get(endpointId);
-    return admission ? new Map(admission.attributes) : new Map();
+    try {
+      return new Map(Object.entries(this.store.attributes(endpointId)));
+    } catch {
+      return new Map(); // not a node id: never admitted
+    }
   }
 
   /** Remove all expired entries. Returns count removed. */
   sweepExpired(): number {
-    let count = 0;
-    for (const [eid, adm] of this.peers) {
-      if (isExpired(adm)) {
-        this.peers.delete(eid);
-        count++;
-      }
-    }
-    return count;
+    return this.store.pruneExpired();
   }
 
   get peerCount(): number {
-    return this.peers.size;
+    return this.store.size;
   }
 
-  /** Start background reaper (call once at server start). */
+  /** Start background pruning (call once at server start). */
   startReaper(): void {
     if (this.reaperTimer != null) return;
     this.reaperTimer = setInterval(() => this.sweepExpired(), _REAPER_INTERVAL_MS);
-    if (typeof this.reaperTimer === 'object' && 'unref' in this.reaperTimer) {
-      (this.reaperTimer as any).unref();
-    }
+    this.reaperTimer.unref?.();
   }
 
-  /** Stop background reaper. */
+  /** Stop background pruning. */
   stopReaper(): void {
     if (this.reaperTimer != null) {
       clearInterval(this.reaperTimer);

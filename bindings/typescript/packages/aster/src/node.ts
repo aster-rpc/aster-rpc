@@ -16,6 +16,7 @@
  */
 
 import type {
+  AdmissionRequests,
   BlobsClient,
   DocsClient,
   GossipClient,
@@ -23,6 +24,7 @@ import type {
   Node as NativeNode,
 } from '@aster-rpc/transport';
 import { type AsterConfig, toNativeConfig } from './config.js';
+import type { AdmissionRequest, GatePolicy } from './gate.js';
 import { loadNative } from './native.js';
 
 /**
@@ -61,6 +63,16 @@ export interface NodeAddr {
   relayUrl?: string;
 }
 
+/** Options for {@link Node.start} beyond the config. @group Node */
+export interface NodeStartOptions {
+  /**
+   * Gate 0: decide inbound admission in Rust with this policy (turns
+   * `enableHooks` on). Without it, a node with `enableHooks` hands each
+   * decision to {@link Node.admission}.
+   */
+  gate?: GatePolicy;
+}
+
 /**
  * A running Aster node. Start one with {@link Node.start}; close it with
  * `close()` or `await using`.
@@ -85,9 +97,9 @@ export class Node implements AsyncDisposable {
    * given config is used — merge {@link AsterConfig.fromEnv} in yourself to
    * honour `ASTER_*` variables.
    */
-  static async start(config: AsterConfig = {}): Promise<Node> {
+  static async start(config: AsterConfig = {}, options: NodeStartOptions = {}): Promise<Node> {
     const native = loadNative();
-    return new Node(await native.Node.start(toNativeConfig(config)));
+    return new Node(await native.Node.start(toNativeConfig(config), options.gate?.native));
   }
 
   /** This node's id. */
@@ -116,9 +128,27 @@ export class Node implements AsyncDisposable {
     return new Uint8Array(this.native.exportSecretKey());
   }
 
-  /** Whether the node was started with admission hooks enabled. */
+  /** Whether the node was started with admission hooks (or a gate). */
   get hasHooks(): boolean {
     return this.native.hasHooks();
+  }
+
+  /**
+   * Attach a Gate-0 policy (`null` detaches it). Applies from the next
+   * admission decision. Needs a node started with hooks or a gate.
+   */
+  setGate(gate: GatePolicy | null): void {
+    this.native.setGate(gate?.native ?? null);
+  }
+
+  /**
+   * Admission requests raised while no gate is attached — iterate with
+   * `for await` and `accept()` / `reject(code, reason)` each. Outbound
+   * dials by this node appear as `direction === 'outbound'`. One iterator
+   * per node; needs a node started with `enableHooks: true`.
+   */
+  admission(): AsyncIterable<AdmissionRequest> & AdmissionRequests {
+    return this.native.admission();
   }
 
   /** Blob store client. */

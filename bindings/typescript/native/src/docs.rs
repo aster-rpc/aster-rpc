@@ -1,521 +1,824 @@
-//! Docs module — wraps CoreDocsClient and CoreDoc.
+//! Docs — wraps the `aster` crate's [`aster::Docs`] / [`aster::Doc`] (plan
+//! D1, T6).
+//!
+//! Keys and values are bytes: keys accept a `string` (UTF-8) or a
+//! `Uint8Array`. Entries, events, policies and authority reports are typed
+//! objects; event subscriptions are `AsyncIterable`s.
+
+use std::time::Duration;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use aster_transport_core::{CoreDoc, CoreDocEvent, CoreDocEventReceiver, CoreDocsClient};
+use aster::{AuthorId, Hash, NamespaceId, NamespaceSecret, NodeId};
 
-use crate::error::to_napi_err;
+use crate::blobs::{blob_status_out, BlobStatusInfo};
+use crate::config::aster_err;
+
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+fn invalid(msg: impl Into<String>) -> Error {
+    Error::new(Status::InvalidArg, msg.into())
+}
+
+pub(crate) fn bytes_in(v: Either<String, Uint8Array>) -> Vec<u8> {
+    match v {
+        Either::A(s) => s.into_bytes(),
+        Either::B(b) => b.to_vec(),
+    }
+}
+
+fn safe(n: u64, what: &str) -> Result<f64> {
+    if n > MAX_SAFE_INTEGER {
+        return Err(Error::from_reason(format!(
+            "{what} exceeds JavaScript safe integer range"
+        )));
+    }
+    Ok(n as f64)
+}
+
+fn limit_in(limit: Option<i64>) -> Result<Option<u64>> {
+    match limit {
+        None => Ok(None),
+        Some(n) if n < 0 => Err(invalid("limit must be non-negative")),
+        Some(n) => Ok(Some(n as u64)),
+    }
+}
+
+/// A 32-byte value given as 64 hex characters or raw bytes.
+fn bytes32(what: &str, v: Either<String, Uint8Array>) -> Result<[u8; 32]> {
+    let raw = match v {
+        Either::A(s) => hex::decode(s.trim())
+            .map_err(|_| invalid(format!("{what} must be 64 hex characters or 32 bytes")))?,
+        Either::B(b) => b.to_vec(),
+    };
+    raw.try_into()
+        .map_err(|_| invalid(format!("{what} must be 64 hex characters or 32 bytes")))
+}
+
+fn namespace_in(v: Either<String, Uint8Array>) -> Result<NamespaceId> {
+    Ok(NamespaceId::from_bytes(bytes32("namespace id", v)?))
+}
+
+fn author(s: String) -> AuthorId {
+    AuthorId::from_hex(s)
+}
+
+fn hash(s: String) -> Hash {
+    Hash::from_hex(s)
+}
+
+// ── Value types ─────────────────────────────────────────────────────────────
+
+/// One document entry (metadata; read the value with `readEntryContent`).
+#[napi(object)]
+pub struct DocEntry {
+    /// Who wrote the entry (author id hex).
+    pub author: String,
+    pub key: Buffer,
+    /// Content hash of the value (hex).
+    pub content_hash: String,
+    /// Value length in bytes.
+    pub content_len: f64,
+    /// Write timestamp, microseconds since the Unix epoch.
+    pub timestamp: f64,
+}
+
+impl From<aster::DocEntry> for DocEntry {
+    fn from(e: aster::DocEntry) -> Self {
+        Self {
+            author: e.author.into_string(),
+            key: Buffer::from(e.key),
+            content_hash: e.content_hash.into_string(),
+            content_len: e.content_len as f64,
+            timestamp: e.timestamp as f64,
+        }
+    }
+}
+
+/// Which remote entries are downloaded automatically.
+#[napi(object)]
+pub struct DownloadPolicy {
+    /// `'everything'` (default), `'nothing_except'` (only `prefixes`) or
+    /// `'everything_except'` (all but `prefixes`).
+    #[napi(ts_type = "'everything' | 'nothing_except' | 'everything_except'")]
+    pub mode: String,
+    /// Key prefixes for the `*_except` modes.
+    #[napi(ts_type = "Array<string | Uint8Array>")]
+    pub prefixes: Option<Vec<Either<String, Uint8Array>>>,
+}
+
+impl DownloadPolicy {
+    fn into_rust(self) -> Result<aster::DownloadPolicy> {
+        let prefixes = || -> Vec<Vec<u8>> {
+            self.prefixes
+                .unwrap_or_default()
+                .into_iter()
+                .map(bytes_in)
+                .collect()
+        };
+        match self.mode.as_str() {
+            "everything" => Ok(aster::DownloadPolicy::Everything),
+            "nothing_except" => Ok(aster::DownloadPolicy::NothingExcept(prefixes())),
+            "everything_except" => Ok(aster::DownloadPolicy::EverythingExcept(prefixes())),
+            other => Err(invalid(format!(
+                "unknown download policy mode {other:?} (expected 'everything', \
+                 'nothing_except' or 'everything_except')"
+            ))),
+        }
+    }
+
+    fn from_rust(p: aster::DownloadPolicy) -> Self {
+        let out = |mode: &str, prefixes: Vec<Vec<u8>>| DownloadPolicy {
+            mode: mode.into(),
+            prefixes: Some(
+                prefixes
+                    .into_iter()
+                    .map(|p| Either::B(Uint8Array::from(p)))
+                    .collect(),
+            ),
+        };
+        match p {
+            aster::DownloadPolicy::Everything => out("everything", Vec::new()),
+            aster::DownloadPolicy::NothingExcept(p) => out("nothing_except", p),
+            aster::DownloadPolicy::EverythingExcept(p) => out("everything_except", p),
+        }
+    }
+}
+
+fn access_out(a: aster::LocalAccess) -> String {
+    match a {
+        aster::LocalAccess::Write => "write".into(),
+        aster::LocalAccess::Read => "read".into(),
+    }
+}
+
+fn access_in(a: &str) -> Result<aster::LocalAccess> {
+    match a {
+        "write" => Ok(aster::LocalAccess::Write),
+        "read" => Ok(aster::LocalAccess::Read),
+        other => Err(invalid(format!(
+            "unknown local access {other:?} (expected 'read' or 'write')"
+        ))),
+    }
+}
+
+fn share_mode_in(mode: &str) -> Result<aster::ShareMode> {
+    match mode {
+        "read" => Ok(aster::ShareMode::Read),
+        "write" => Ok(aster::ShareMode::Write),
+        other => Err(invalid(format!(
+            "unknown share mode {other:?} (expected 'read' or 'write')"
+        ))),
+    }
+}
+
+/// What this node actually holds over a namespace, read back from the store.
+#[napi(object)]
+pub struct AuthorityReport {
+    /// Namespace id (hex).
+    pub namespace: String,
+    /// The access **stored** — never the access requested.
+    #[napi(ts_type = "'read' | 'write'")]
+    pub access: String,
+    /// Correlation fingerprint over `(namespace, access)` (64 hex). See
+    /// `authorityFingerprint`; it is correlation, not evidence.
+    pub fingerprint: String,
+}
+
+impl From<aster::AuthorityReport> for AuthorityReport {
+    fn from(r: aster::AuthorityReport) -> Self {
+        Self {
+            namespace: r.namespace().to_hex(),
+            access: access_out(r.access()),
+            fingerprint: r.fingerprint().to_hex(),
+        }
+    }
+}
+
+/// The result of `retireLocalWriteAuthority`.
+#[napi(object)]
+pub struct RetireOutcome {
+    /// `'retired'`, or `'busy'` when references to the document are still
+    /// open (fail closed: release them, e.g. `shutdownForRoleSwap`, first).
+    #[napi(ts_type = "'retired' | 'busy'")]
+    pub outcome: String,
+    /// For `'retired'`: the access now stored.
+    #[napi(ts_type = "'read' | 'write'")]
+    pub access: Option<String>,
+    /// For `'busy'`: how many references remain.
+    pub handles: Option<f64>,
+}
+
+impl From<aster::RetireOutcome> for RetireOutcome {
+    fn from(o: aster::RetireOutcome) -> Self {
+        match o {
+            aster::RetireOutcome::Retired(a) => Self {
+                outcome: "retired".into(),
+                access: Some(access_out(a)),
+                handles: None,
+            },
+            aster::RetireOutcome::Busy { handles } => Self {
+                outcome: "busy".into(),
+                access: None,
+                handles: Some(handles as f64),
+            },
+        }
+    }
+}
+
+/// The correlation fingerprint of a `(namespace, access)` pair — the value an
+/// `AuthorityReport` carries. BLAKE3 over a versioned domain separator, the
+/// namespace id and one access byte; correlation, not evidence.
+#[napi]
+pub fn authority_fingerprint(
+    namespace: Either<String, Uint8Array>,
+    #[napi(ts_arg_type = "'read' | 'write'")] access: String,
+) -> Result<String> {
+    Ok(aster::AuthorityFingerprint::of(namespace_in(namespace)?, access_in(&access)?).to_hex())
+}
+
+/// The docs default-author id for a node secret key — equal to the node id.
+#[napi]
+pub fn default_author_id(secret_key: Either<String, Uint8Array>) -> Result<String> {
+    let key = aster::SecretKey::from_bytes(bytes32("secret key", secret_key)?);
+    Ok(aster::default_author_id(&key).into_string())
+}
+
+// ── DocsClient ──────────────────────────────────────────────────────────────
 
 #[napi]
 pub struct DocsClient {
-    pub(crate) inner: CoreDocsClient,
+    pub(crate) inner: aster::Docs,
 }
 
-impl From<CoreDocsClient> for DocsClient {
-    fn from(inner: CoreDocsClient) -> Self {
+impl From<aster::Docs> for DocsClient {
+    fn from(inner: aster::Docs) -> Self {
         Self { inner }
     }
 }
 
 #[napi]
 impl DocsClient {
-    /// Create a new document.
+    /// Create a new document with a fresh random namespace.
     #[napi]
     pub async fn create(&self) -> Result<DocHandle> {
-        let doc = self.inner.clone().create().await.map_err(to_napi_err)?;
-        Ok(DocHandle { inner: doc })
+        Ok(self.inner.create().await.map_err(aster_err)?.into())
     }
 
-    /// Join a document by ticket string.
+    /// Create a new random author; returns its id (hex).
+    #[napi]
+    pub async fn create_author(&self) -> Result<String> {
+        Ok(self
+            .inner
+            .create_author()
+            .await
+            .map_err(aster_err)?
+            .into_string())
+    }
+
+    /// The node-wide default author — equal to the node id.
+    #[napi]
+    pub async fn default_author(&self) -> Result<String> {
+        Ok(self
+            .inner
+            .default_author()
+            .await
+            .map_err(aster_err)?
+            .into_string())
+    }
+
+    /// Join a document from a ticket string.
     #[napi]
     pub async fn join(&self, ticket: String) -> Result<DocHandle> {
-        let doc = self.inner.clone().join(ticket).await.map_err(to_napi_err)?;
-        Ok(DocHandle { inner: doc })
+        Ok(self.inner.join(ticket).await.map_err(aster_err)?.into())
     }
 
-    /// Reopen an existing local namespace by public namespace id bytes.
-    /// Returns null if the namespace is not present locally.
+    /// Reopen a namespace already in the local replica (`null` if absent).
     #[napi]
-    pub async fn open_namespace(&self, namespace_id: Buffer) -> Result<Option<DocHandle>> {
-        if namespace_id.len() != 32 {
-            return Err(Error::from_reason("namespace id must be 32 bytes"));
-        }
-        let namespace_id_hex = hex::encode(namespace_id);
-        let doc = self
+    pub async fn open(
+        &self,
+        namespace_id: Either<String, Uint8Array>,
+    ) -> Result<Option<DocHandle>> {
+        let id = namespace_in(namespace_id)?;
+        Ok(self
             .inner
-            .clone()
-            .open(namespace_id_hex)
+            .open(id)
             .await
-            .map_err(to_napi_err)?;
-        Ok(doc.map(|inner| DocHandle { inner }))
+            .map_err(aster_err)?
+            .map(DocHandle::from))
     }
 
-    /// Reopen an existing local namespace by public namespace id hex.
-    /// Returns null if the namespace is not present locally.
+    /// Open-or-import a **read-only** namespace from its public id
+    /// (hex or 32 bytes). Idempotent; never downgrades a write capability.
     #[napi]
-    pub async fn open_namespace_hex(&self, namespace_id_hex: String) -> Result<Option<DocHandle>> {
-        let doc = self
+    pub async fn open_or_import_read_namespace(
+        &self,
+        namespace_id: Either<String, Uint8Array>,
+    ) -> Result<DocHandle> {
+        let id = namespace_in(namespace_id)?;
+        Ok(self
             .inner
-            .clone()
-            .open(namespace_id_hex)
+            .open_or_import_read_namespace(id)
             .await
-            .map_err(to_napi_err)?;
-        Ok(doc.map(|inner| DocHandle { inner }))
+            .map_err(aster_err)?
+            .into())
     }
 
-    /// Open-or-import a read-only namespace by public namespace id bytes.
-    #[napi]
-    pub async fn open_or_import_read_namespace(&self, namespace_id: Buffer) -> Result<DocHandle> {
-        let doc = self
-            .inner
-            .clone()
-            .import_read_namespace(namespace_id.to_vec())
-            .await
-            .map_err(to_napi_err)?;
-        Ok(DocHandle { inner: doc })
-    }
-
-    /// Open-or-import a writable namespace by namespace secret bytes.
+    /// Open-or-import a **writable** namespace from its 32-byte secret (hex
+    /// or bytes). Idempotent; upgrades a prior read-only import.
     #[napi]
     pub async fn open_or_import_write_namespace(
         &self,
-        namespace_secret: Buffer,
+        namespace_secret: Either<String, Uint8Array>,
     ) -> Result<DocHandle> {
-        let doc = self
+        let secret = NamespaceSecret::from_bytes(bytes32("namespace secret", namespace_secret)?);
+        Ok(self
             .inner
-            .clone()
-            .import_write_namespace(namespace_secret.to_vec())
+            .open_or_import_write_namespace(secret)
             .await
-            .map_err(to_napi_err)?;
-        Ok(DocHandle { inner: doc })
+            .map_err(aster_err)?
+            .into())
     }
 
-    /// Create a new author, returning the author ID (hex).
+    /// Retire this node's local write authority over a namespace, keeping
+    /// every entry. Local only. Release every reference first
+    /// (`shutdownForRoleSwap`), or the outcome is `'busy'`.
     #[napi]
-    pub async fn create_author(&self) -> Result<String> {
-        self.inner
-            .clone()
-            .create_author()
+    pub async fn retire_local_write_authority(
+        &self,
+        namespace_id: Either<String, Uint8Array>,
+    ) -> Result<RetireOutcome> {
+        let id = namespace_in(namespace_id)?;
+        Ok(self
+            .inner
+            .retire_local_write_authority(id)
             .await
-            .map_err(to_napi_err)
+            .map_err(aster_err)?
+            .into())
     }
 
-    /// Join a document and subscribe to events.
-    /// Returns [docHandle, eventReceiver].
+    /// The authority this node holds over the namespace `namespaceId` names.
+    /// Errors if the namespace is not in the local store.
+    #[napi]
+    pub async fn authority_report(
+        &self,
+        namespace_id: Either<String, Uint8Array>,
+    ) -> Result<AuthorityReport> {
+        let id = namespace_in(namespace_id)?;
+        Ok(self
+            .inner
+            .authority_report(id)
+            .await
+            .map_err(aster_err)?
+            .into())
+    }
+
+    /// Join a document from a ticket and subscribe to its events atomically.
     #[napi]
     pub async fn join_and_subscribe(&self, ticket: String) -> Result<DocWithEvents> {
-        let (doc, receiver) = self
+        let (doc, events) = self
             .inner
-            .clone()
             .join_and_subscribe(ticket)
             .await
-            .map_err(to_napi_err)?;
-        Ok(DocWithEvents {
-            doc: Some(DocHandle { inner: doc }),
-            events: Some(DocEventReceiver { inner: receiver }),
-        })
+            .map_err(aster_err)?;
+        Ok(DocWithEvents::new(doc, events))
     }
 
-    /// Join a document by namespace id (hex) and peer endpoint id (hex),
-    /// subscribing to events. Mirrors Python's
-    /// ``docs_client.join_and_subscribe_namespace`` so dynamic proxy
-    /// / consumer code can pull the producer's registry doc from just
-    /// the bits returned in the admission response.
+    /// Join a document by namespace id, syncing from `peer`, and subscribe.
     #[napi]
     pub async fn join_and_subscribe_namespace(
         &self,
-        namespace_id_hex: String,
-        peer_node_id_hex: String,
+        namespace_id: Either<String, Uint8Array>,
+        peer: String,
     ) -> Result<DocWithEvents> {
-        let (doc, receiver) = self
+        let id = namespace_in(namespace_id)?;
+        let (doc, events) = self
             .inner
-            .clone()
-            .join_and_subscribe_namespace(namespace_id_hex, peer_node_id_hex)
+            .join_and_subscribe_namespace(id, &NodeId::from_hex(peer))
             .await
-            .map_err(to_napi_err)?;
-        Ok(DocWithEvents {
-            doc: Some(DocHandle { inner: doc }),
-            events: Some(DocEventReceiver { inner: receiver }),
-        })
+            .map_err(aster_err)?;
+        Ok(DocWithEvents::new(doc, events))
     }
 }
 
+// ── DocHandle ───────────────────────────────────────────────────────────────
+
 #[napi]
 pub struct DocHandle {
-    inner: CoreDoc,
+    inner: aster::Doc,
+}
+
+impl From<aster::Doc> for DocHandle {
+    fn from(inner: aster::Doc) -> Self {
+        Self { inner }
+    }
 }
 
 #[napi]
 impl DocHandle {
-    /// Set a key-value pair. Returns the content hash.
+    /// This document's namespace id (hex).
+    #[napi]
+    pub fn doc_id(&self) -> Result<String> {
+        Ok(self.inner.id().map_err(aster_err)?.to_hex())
+    }
+
+    /// The authority this node holds over **this** document.
+    #[napi]
+    pub async fn authority_report(&self) -> Result<AuthorityReport> {
+        Ok(self
+            .inner
+            .authority_report()
+            .await
+            .map_err(aster_err)?
+            .into())
+    }
+
+    /// Write a key/value as `author`; returns the content hash.
     #[napi]
     pub async fn set_bytes(
         &self,
-        author_hex: String,
-        key: String,
-        value: Buffer,
+        author_id: String,
+        key: Either<String, Uint8Array>,
+        value: Uint8Array,
     ) -> Result<String> {
+        Ok(self
+            .inner
+            .set_bytes(&author(author_id), bytes_in(key), value.to_vec())
+            .await
+            .map_err(aster_err)?
+            .into_string())
+    }
+
+    /// Write a key/value after committing its blob metadata to disk — the
+    /// crash-durable publication boundary (survives a hard process kill).
+    #[napi]
+    pub async fn set_bytes_durable(
+        &self,
+        author_id: String,
+        key: Either<String, Uint8Array>,
+        value: Uint8Array,
+    ) -> Result<String> {
+        Ok(self
+            .inner
+            .set_bytes_durable(&author(author_id), bytes_in(key), value.to_vec())
+            .await
+            .map_err(aster_err)?
+            .into_string())
+    }
+
+    /// Delete all of `author`'s entries under `prefix`; returns how many.
+    #[napi]
+    pub async fn del(&self, author_id: String, prefix: Either<String, Uint8Array>) -> Result<f64> {
+        let n = self
+            .inner
+            .del(&author(author_id), bytes_in(prefix))
+            .await
+            .map_err(aster_err)?;
+        safe(n, "delete count")
+    }
+
+    /// The value for an exact `(author, key)`, or `null`.
+    #[napi]
+    pub async fn get_exact(
+        &self,
+        author_id: String,
+        key: Either<String, Uint8Array>,
+    ) -> Result<Option<Buffer>> {
+        Ok(self
+            .inner
+            .get_exact(&author(author_id), bytes_in(key))
+            .await
+            .map_err(aster_err)?
+            .map(Buffer::from))
+    }
+
+    /// Whether an entry exists for `(author, key)`, **including** a deletion
+    /// tombstone (which `getExact` reports as absent).
+    #[napi]
+    pub async fn entry_exists(
+        &self,
+        author_id: String,
+        key: Either<String, Uint8Array>,
+    ) -> Result<bool> {
         self.inner
-            .clone()
-            .set_bytes(author_hex, key.into_bytes(), value.to_vec())
+            .entry_exists(&author(author_id), bytes_in(key))
             .await
-            .map_err(to_napi_err)
+            .map_err(aster_err)
     }
 
-    /// Delete entries for an author whose key starts with the prefix.
-    /// Returns the number of removed entries.
+    /// Entries for an exact key across authors. Ordered by author, so
+    /// `limit` may drop the latest writer — use `queryLatestExact` for the
+    /// current value.
     #[napi]
-    pub async fn del(&self, author_hex: String, prefix: String) -> Result<f64> {
-        let removed = self
+    pub async fn query_key_exact(
+        &self,
+        key: Either<String, Uint8Array>,
+        limit: Option<i64>,
+    ) -> Result<Vec<DocEntry>> {
+        Ok(self
             .inner
-            .clone()
-            .del(author_hex, prefix.into_bytes())
+            .query_key_exact(bytes_in(key), limit_in(limit)?)
             .await
-            .map_err(to_napi_err)?;
-        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-        if removed > MAX_SAFE_INTEGER {
-            return Err(napi::Error::from_reason(
-                "delete count exceeds JavaScript safe integer range",
-            ));
-        }
-        Ok(removed as f64)
-    }
-
-    /// Get a value by author + key (returns None if not found).
-    #[napi]
-    pub async fn get_exact(&self, author_hex: String, key: String) -> Result<Option<Buffer>> {
-        match self
-            .inner
-            .clone()
-            .get_exact(author_hex, key.into_bytes())
-            .await
-        {
-            Ok(Some(data)) => Ok(Some(Buffer::from(data))),
-            Ok(None) => Ok(None),
-            Err(e) => Err(to_napi_err(e)),
-        }
-    }
-
-    /// Share the document, returning a ticket string.
-    #[napi]
-    pub async fn share(&self, mode: String) -> Result<String> {
-        self.inner.clone().share(mode).await.map_err(to_napi_err)
-    }
-
-    /// Get the document ID.
-    #[napi]
-    pub fn doc_id(&self) -> String {
-        self.inner.doc_id()
-    }
-
-    /// Query entries by exact key. Entries are ordered by author id, not timestamp, so
-    /// `limit` truncates by author and may drop the latest writer — use it only to
-    /// enumerate authors. To read a key's current value, use `queryLatestExact`. Omit
-    /// `limit` to read every author's entry.
-    #[napi]
-    pub async fn query_key_exact(&self, key: String, limit: Option<i64>) -> Result<Vec<String>> {
-        let entries = self
-            .inner
-            .clone()
-            .query_key_exact(key.into_bytes(), limit.map(|n| n as u64))
-            .await
-            .map_err(to_napi_err)?;
-        Ok(entries
+            .map_err(aster_err)?
             .into_iter()
-            .map(|e| format!("{}:{}", e.author_id, e.content_hash))
+            .map(DocEntry::from)
             .collect())
     }
 
-    /// Read the single latest entry for an exact key, across all authors. Returns
-    /// `"<author>:<content_hash>"`, or null if the key was never written or its latest
-    /// write was a deletion. Unaffected by how many authors have written the key.
+    /// The latest entry for an exact key (most recent writer), or `null` if
+    /// never written or deleted.
     #[napi]
-    pub async fn query_latest_exact(&self, key: String) -> Result<Option<String>> {
-        let entry = self
+    pub async fn query_latest_exact(
+        &self,
+        key: Either<String, Uint8Array>,
+    ) -> Result<Option<DocEntry>> {
+        Ok(self
             .inner
-            .clone()
-            .query_latest_exact(key.into_bytes())
+            .query_latest_exact(bytes_in(key))
             .await
-            .map_err(to_napi_err)?;
-        Ok(entry.map(|e| format!("{}:{}", e.author_id, e.content_hash)))
+            .map_err(aster_err)?
+            .map(DocEntry::from))
     }
 
-    /// Query entries by key prefix. `limit` caps the result set; omit it for an
-    /// unbounded listing.
+    /// Entries under a key prefix across authors (`limit` optional).
     #[napi]
     pub async fn query_key_prefix(
         &self,
-        prefix: String,
+        prefix: Either<String, Uint8Array>,
         limit: Option<i64>,
-    ) -> Result<Vec<String>> {
-        let entries = self
+    ) -> Result<Vec<DocEntry>> {
+        Ok(self
             .inner
-            .clone()
-            .query_key_prefix(prefix.into_bytes(), limit.map(|n| n as u64))
+            .query_key_prefix(bytes_in(prefix), limit_in(limit)?)
             .await
-            .map_err(to_napi_err)?;
-        Ok(entries
+            .map_err(aster_err)?
             .into_iter()
-            .map(|e| format!("{}:{}", e.author_id, e.content_hash))
+            .map(DocEntry::from)
             .collect())
     }
 
-    /// List the latest entry for each distinct key under a prefix, across all authors.
-    /// Collapses each key to its highest-timestamp entry (omitting keys whose latest
-    /// write was a deletion), so a key written by multiple authors appears once — use
-    /// this for directory-style listings. `limit` caps the number of distinct keys; omit
-    /// it for an unbounded listing.
+    /// The latest entry for each distinct key under a prefix (`limit` caps
+    /// the number of keys).
     #[napi]
     pub async fn query_latest_prefix(
         &self,
-        prefix: String,
+        prefix: Either<String, Uint8Array>,
         limit: Option<i64>,
-    ) -> Result<Vec<String>> {
-        let entries = self
+    ) -> Result<Vec<DocEntry>> {
+        Ok(self
             .inner
-            .clone()
-            .query_latest_prefix(prefix.into_bytes(), limit.map(|n| n as u64))
+            .query_latest_prefix(bytes_in(prefix), limit_in(limit)?)
             .await
-            .map_err(to_napi_err)?;
-        Ok(entries
+            .map_err(aster_err)?
             .into_iter()
-            .map(|e| format!("{}:{}", e.author_id, e.content_hash))
+            .map(DocEntry::from)
             .collect())
     }
 
-    /// Read entry content by content hash.
+    /// Content bytes for a content hash.
     #[napi]
-    pub async fn read_entry_content(&self, content_hash_hex: String) -> Result<Buffer> {
-        let data = self
-            .inner
-            .clone()
-            .read_entry_content(content_hash_hex)
-            .await
-            .map_err(to_napi_err)?;
-        Ok(Buffer::from(data))
+    pub async fn read_entry_content(&self, content_hash: String) -> Result<Buffer> {
+        Ok(Buffer::from(
+            self.inner
+                .read_entry_content(&hash(content_hash))
+                .await
+                .map_err(aster_err)?,
+        ))
     }
 
-    /// Start sync with peers.
+    /// Content for several hashes that are already complete locally;
+    /// missing / partial values are `null` at their index.
+    #[napi]
+    pub async fn read_entry_contents_if_complete(
+        &self,
+        content_hashes: Vec<String>,
+    ) -> Result<Vec<Option<Buffer>>> {
+        let hashes: Vec<Hash> = content_hashes.into_iter().map(hash).collect();
+        Ok(self
+            .inner
+            .read_entry_contents_if_complete(&hashes)
+            .await
+            .map_err(aster_err)?
+            .into_iter()
+            .map(|v| v.map(Buffer::from))
+            .collect())
+    }
+
+    /// Local storage status of an entry's value blob.
+    #[napi]
+    pub async fn entry_content_status(&self, content_hash: String) -> Result<BlobStatusInfo> {
+        Ok(blob_status_out(
+            self.inner
+                .entry_content_status(&hash(content_hash))
+                .await
+                .map_err(aster_err)?,
+        ))
+    }
+
+    /// Share as a ticket (id-only addressing).
+    #[napi]
+    pub async fn share(
+        &self,
+        #[napi(ts_arg_type = "'read' | 'write'")] mode: String,
+    ) -> Result<String> {
+        self.inner
+            .share(share_mode_in(&mode)?)
+            .await
+            .map_err(aster_err)
+    }
+
+    /// Share as a ticket with relay + direct addresses.
+    #[napi]
+    pub async fn share_with_addr(
+        &self,
+        #[napi(ts_arg_type = "'read' | 'write'")] mode: String,
+    ) -> Result<String> {
+        self.inner
+            .share_with_addr(share_mode_in(&mode)?)
+            .await
+            .map_err(aster_err)
+    }
+
+    /// Start syncing with peers (node ids).
     #[napi]
     pub async fn start_sync(&self, peers: Vec<String>) -> Result<()> {
-        self.inner
-            .clone()
-            .start_sync(peers)
-            .await
-            .map_err(to_napi_err)
+        let peers: Vec<NodeId> = peers.into_iter().map(NodeId::from_hex).collect();
+        self.inner.start_sync(&peers).await.map_err(aster_err)
     }
 
-    /// Leave the document (stop syncing).
+    /// Stop syncing this document.
     #[napi]
     pub async fn leave(&self) -> Result<()> {
-        self.inner.clone().leave().await.map_err(to_napi_err)
+        self.inner.leave().await.map_err(aster_err)
     }
 
-    /// Share with full relay+address info.
+    /// Release both of this document's references (live sync + handle) so
+    /// its namespace can change role, within one `budgetMs` deadline. Every
+    /// handle to the document is dead afterwards.
     #[napi]
-    pub async fn share_with_addr(&self, mode: String) -> Result<String> {
+    pub async fn shutdown_for_role_swap(&self, budget_ms: f64) -> Result<()> {
+        if !budget_ms.is_finite() || budget_ms < 0.0 {
+            return Err(invalid("budgetMs must be a non-negative number"));
+        }
         self.inner
             .clone()
-            .share_with_addr(mode)
+            .shutdown_for_role_swap(Duration::from_millis(budget_ms as u64))
             .await
-            .map_err(to_napi_err)
+            .map_err(aster_err)
     }
 
-    /// Subscribe to document events.
+    /// Subscribe to live events (`for await (const ev of events)`).
     #[napi]
     pub async fn subscribe(&self) -> Result<DocEventReceiver> {
-        let receiver = self.inner.clone().subscribe().await.map_err(to_napi_err)?;
-        Ok(DocEventReceiver { inner: receiver })
+        Ok(DocEventReceiver {
+            inner: self.inner.subscribe().await.map_err(aster_err)?,
+        })
     }
 
-    /// Set the download policy for this document.
-    /// Policy: "everything", "nothing_except:<prefix1>,<prefix2>", "everything_except:<prefix1>,<prefix2>"
+    /// Set the download policy.
     #[napi]
-    pub async fn set_download_policy(&self, policy: String) -> Result<()> {
-        let core_policy = parse_download_policy(&policy)?;
+    pub async fn set_download_policy(&self, policy: DownloadPolicy) -> Result<()> {
+        let policy = policy.into_rust()?;
         self.inner
-            .clone()
-            .set_download_policy(core_policy)
+            .set_download_policy(policy)
             .await
-            .map_err(to_napi_err)
+            .map_err(aster_err)
     }
 
-    /// Get the download policy for this document.
+    /// The current download policy.
     #[napi]
-    pub async fn get_download_policy(&self) -> Result<String> {
-        let policy = self
-            .inner
-            .clone()
-            .get_download_policy()
-            .await
-            .map_err(to_napi_err)?;
-        Ok(format_download_policy(&policy))
+    pub async fn get_download_policy(&self) -> Result<DownloadPolicy> {
+        Ok(DownloadPolicy::from_rust(
+            self.inner.get_download_policy().await.map_err(aster_err)?,
+        ))
     }
 }
 
-fn parse_download_policy(s: &str) -> Result<aster_transport_core::CoreDownloadPolicy> {
-    use aster_transport_core::CoreDownloadPolicy;
-    if s == "everything" {
-        Ok(CoreDownloadPolicy::Everything)
-    } else if let Some(rest) = s.strip_prefix("nothing_except:") {
-        let prefixes = rest
-            .split(',')
-            .filter(|p| !p.is_empty())
-            .map(|p| p.as_bytes().to_vec())
-            .collect();
-        Ok(CoreDownloadPolicy::NothingExcept { prefixes })
-    } else if let Some(rest) = s.strip_prefix("everything_except:") {
-        let prefixes = rest
-            .split(',')
-            .filter(|p| !p.is_empty())
-            .map(|p| p.as_bytes().to_vec())
-            .collect();
-        Ok(CoreDownloadPolicy::EverythingExcept { prefixes })
-    } else {
-        Err(napi::Error::from_reason(format!(
-            "invalid download policy: {s}"
-        )))
-    }
-}
+// ── Events ──────────────────────────────────────────────────────────────────
 
-fn format_download_policy(policy: &aster_transport_core::CoreDownloadPolicy) -> String {
-    use aster_transport_core::CoreDownloadPolicy;
-    match policy {
-        CoreDownloadPolicy::Everything => "everything".to_string(),
-        CoreDownloadPolicy::NothingExcept { prefixes } => {
-            let ps: Vec<String> = prefixes
-                .iter()
-                .map(|p| String::from_utf8_lossy(p).to_string())
-                .collect();
-            format!("nothing_except:{}", ps.join(","))
-        }
-        CoreDownloadPolicy::EverythingExcept { prefixes } => {
-            let ps: Vec<String> = prefixes
-                .iter()
-                .map(|p| String::from_utf8_lossy(p).to_string())
-                .collect();
-            format!("everything_except:{}", ps.join(","))
-        }
-    }
-}
-
-// ============================================================================
-// DocEventReceiver
-// ============================================================================
-
-#[napi]
-pub struct DocEventReceiver {
-    inner: CoreDocEventReceiver,
-}
-
-/// A doc event returned from subscribe().
+/// A live document event.
 #[napi(object)]
 pub struct DocEvent {
-    /// Event kind: "insert_local", "insert_remote", "content_ready",
-    /// "pending_content_ready", "neighbor_up", "neighbor_down", "sync_finished"
+    #[napi(
+        ts_type = "'insert_local' | 'insert_remote' | 'content_ready' | 'pending_content_ready' | 'neighbor_up' | 'neighbor_down' | 'sync_finished'"
+    )]
     pub kind: String,
-    /// Author ID (for insert events).
-    pub author: Option<String>,
-    /// Content hash (for insert/content_ready events).
-    pub content_hash: Option<String>,
-    /// Key (for insert events).
-    pub key: Option<Vec<u8>>,
-    /// Peer ID (for neighbor/sync events, or insert_remote sender).
+    /// `insert_local` / `insert_remote`: the entry.
+    pub entry: Option<DocEntry>,
+    /// `insert_remote`: the sending peer; `neighbor_*` / `sync_finished`:
+    /// the peer.
     pub peer: Option<String>,
+    /// `content_ready`: the content hash now available locally.
+    pub hash: Option<String>,
 }
 
-fn core_event_to_js(event: CoreDocEvent) -> DocEvent {
-    match event {
-        CoreDocEvent::InsertLocal { entry } => DocEvent {
-            kind: "insert_local".to_string(),
-            author: Some(entry.author_id),
-            content_hash: Some(entry.content_hash),
-            key: Some(entry.key),
+impl From<aster::DocEvent> for DocEvent {
+    fn from(e: aster::DocEvent) -> Self {
+        let ev = |kind: &str| DocEvent {
+            kind: kind.into(),
+            entry: None,
             peer: None,
-        },
-        CoreDocEvent::InsertRemote { from, entry } => DocEvent {
-            kind: "insert_remote".to_string(),
-            author: Some(entry.author_id),
-            content_hash: Some(entry.content_hash),
-            key: Some(entry.key),
-            peer: Some(from),
-        },
-        CoreDocEvent::ContentReady { hash } => DocEvent {
-            kind: "content_ready".to_string(),
-            author: None,
-            content_hash: Some(hash),
-            key: None,
-            peer: None,
-        },
-        CoreDocEvent::PendingContentReady => DocEvent {
-            kind: "pending_content_ready".to_string(),
-            author: None,
-            content_hash: None,
-            key: None,
-            peer: None,
-        },
-        CoreDocEvent::NeighborUp { peer } => DocEvent {
-            kind: "neighbor_up".to_string(),
-            author: None,
-            content_hash: None,
-            key: None,
-            peer: Some(peer),
-        },
-        CoreDocEvent::NeighborDown { peer } => DocEvent {
-            kind: "neighbor_down".to_string(),
-            author: None,
-            content_hash: None,
-            key: None,
-            peer: Some(peer),
-        },
-        CoreDocEvent::SyncFinished { peer } => DocEvent {
-            kind: "sync_finished".to_string(),
-            author: None,
-            content_hash: None,
-            key: None,
-            peer: Some(peer),
-        },
+            hash: None,
+        };
+        match e {
+            aster::DocEvent::InsertLocal { entry } => DocEvent {
+                entry: Some(entry.into()),
+                ..ev("insert_local")
+            },
+            aster::DocEvent::InsertRemote { from, entry } => DocEvent {
+                entry: Some(entry.into()),
+                peer: Some(from.into_string()),
+                ..ev("insert_remote")
+            },
+            aster::DocEvent::ContentReady { hash } => DocEvent {
+                hash: Some(hash.into_string()),
+                ..ev("content_ready")
+            },
+            aster::DocEvent::PendingContentReady => ev("pending_content_ready"),
+            aster::DocEvent::NeighborUp { peer } => DocEvent {
+                peer: Some(peer.into_string()),
+                ..ev("neighbor_up")
+            },
+            aster::DocEvent::NeighborDown { peer } => DocEvent {
+                peer: Some(peer.into_string()),
+                ..ev("neighbor_down")
+            },
+            aster::DocEvent::SyncFinished { peer } => DocEvent {
+                peer: Some(peer.into_string()),
+                ..ev("sync_finished")
+            },
+        }
+    }
+}
+
+/// A document's live events: `AsyncIterable<DocEvent>` (ends when the
+/// subscription does), or call `recv()` directly.
+#[napi(async_iterator)]
+pub struct DocEventReceiver {
+    inner: aster::DocEvents,
+}
+
+#[napi]
+impl AsyncGenerator for DocEventReceiver {
+    type Yield = DocEvent;
+    type Next = ();
+    type Return = ();
+
+    fn next(
+        &mut self,
+        _value: Option<Self::Next>,
+    ) -> impl std::future::Future<Output = Result<Option<Self::Yield>>> + Send + 'static {
+        let inner = self.inner.clone();
+        async move { Ok(inner.recv().await.map_err(aster_err)?.map(DocEvent::from)) }
     }
 }
 
 #[napi]
 impl DocEventReceiver {
-    /// Receive the next doc event. Returns null when subscription ends.
+    /// The next event, or `null` when the subscription ends.
     #[napi]
     pub async fn recv(&self) -> Result<Option<DocEvent>> {
-        match self.inner.clone().recv().await.map_err(to_napi_err)? {
-            Some(event) => Ok(Some(core_event_to_js(event))),
-            None => Ok(None),
-        }
+        Ok(self
+            .inner
+            .recv()
+            .await
+            .map_err(aster_err)?
+            .map(DocEvent::from))
     }
 }
 
-// ============================================================================
-// DocWithEvents — returned by join_and_subscribe
-// ============================================================================
-
+/// A joined document plus its event subscription (`joinAndSubscribe*`).
 #[napi]
 pub struct DocWithEvents {
     doc: Option<DocHandle>,
     events: Option<DocEventReceiver>,
 }
 
+impl DocWithEvents {
+    fn new(doc: aster::Doc, events: aster::DocEvents) -> Self {
+        Self {
+            doc: Some(doc.into()),
+            events: Some(DocEventReceiver { inner: events }),
+        }
+    }
+}
+
 #[napi]
 impl DocWithEvents {
-    /// Take the doc handle (can only be called once).
+    /// Take the doc handle (once).
     #[napi]
     pub fn take_doc(&mut self) -> Result<DocHandle> {
         self.doc
             .take()
-            .ok_or_else(|| napi::Error::from_reason("doc already taken".to_string()))
+            .ok_or_else(|| Error::from_reason("doc already taken"))
     }
 
-    /// Take the event receiver (can only be called once).
+    /// Take the event receiver (once).
     #[napi]
     pub fn take_events(&mut self) -> Result<DocEventReceiver> {
         self.events
             .take()
-            .ok_or_else(|| napi::Error::from_reason("events already taken".to_string()))
+            .ok_or_else(|| Error::from_reason("events already taken"))
     }
 }

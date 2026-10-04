@@ -24,7 +24,7 @@ import { RpcServer } from './server.js';
 import { handleConsumerAdmissionConnection, performAdmission, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
 import type { ConsumerEnrollmentCredential } from './trust/credentials.js';
 import { handleDelegatedAdmissionConnection, type DelegatedAdmissionPolicy } from './trust/delegated.js';
-import { MeshEndpointHook } from './trust/hooks.js';
+import { gateAdmitter, type PeerAdmitter } from './trust/hooks.js';
 import { PeerAttributeStore } from './peer-store.js';
 import { CapabilityInterceptor } from './interceptors/capability.js';
 import type { Interceptor } from './interceptors/base.js';
@@ -33,7 +33,7 @@ import type { ContractManifest, ManifestMethod, ManifestField } from './contract
 import { getGeneratedMethodFields, getWireShape, registerGenerated, type RegisterGeneratedOptions } from './generated.js';
 import { IrohTransport } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
-import { gate0EndpointConfig } from './gate0.js';
+import { GatePolicy } from './gate.js';
 import { loadNative, tryLoadNative } from './native.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -157,8 +157,9 @@ export class AsterServer {
   private health: HealthServer;
   private _node: Node | null = null;
   private _rpcServer: RpcServer | null = null;
-  private _hook: MeshEndpointHook;
-  private _peerStore: PeerAttributeStore;
+  private _gate: GatePolicy | null = null;
+  private _hook: PeerAdmitter | null = null;
+  private _peerStore: PeerAttributeStore | null = null;
   private _delegationPolicies: Map<string, DelegatedAdmissionPolicy> = new Map();
   private _running = false;
   private _closed = false;
@@ -188,7 +189,6 @@ export class AsterServer {
       port: this.config.healthPort ?? 0,
       host: this.config.healthHost ?? '127.0.0.1',
     });
-    this._peerStore = new PeerAttributeStore();
     if (this.config.allowAllProducers === false) {
       throw new Error(
         'allowAllProducers=false is not supported: producer mesh admission ' +
@@ -197,14 +197,35 @@ export class AsterServer {
       );
     }
     this._allowAllConsumers = opts.allowAllConsumers ?? this.config.allowAllConsumers ?? false;
-    // In dev mode the hook must allow unenrolled peers, otherwise post-admission
-    // RPC connections would be denied (they reach Gate 0 before the peer-store
-    // entry from admission is checked, and the peer wouldn't be there for
-    // ephemeral consumers).
-    this._hook = new MeshEndpointHook(this._allowAllConsumers, this._peerStore);
     this._userInterceptors = opts.interceptors ?? [];
     this._pendingServices = opts.services;
     this._explicitGenerated = opts.generated;
+  }
+
+  /**
+   * The server's Gate-0 policy (Rust `GatePolicy`), built from the trust
+   * settings: `allowAllConsumers` → `'open_dev'`, otherwise `'protected'`
+   * (only the admission ALPNs are open until a peer is admitted). Successful
+   * consumer / delegated admission admits the peer into `gate.store`;
+   * `gate.admit()` / `gate.revoke()` manage peers directly.
+   */
+  get gate(): GatePolicy {
+    if (!this._gate) {
+      this._gate = GatePolicy.fromConfig({ allowAllConsumers: this._allowAllConsumers });
+      this._hook = gateAdmitter(this._gate);
+      this._peerStore = new PeerAttributeStore(this._gate.store);
+    }
+    return this._gate;
+  }
+
+  private get peerStore(): PeerAttributeStore {
+    void this.gate;
+    return this._peerStore!;
+  }
+
+  private get admitter(): PeerAdmitter {
+    void this.gate;
+    return this._hook!;
   }
 
   /**
@@ -276,27 +297,19 @@ export class AsterServer {
     const { setNativeTrustConfigPrimitives } = await import('./trust/config-primitives.js');
     setNativeTrustConfigPrimitives(native);
 
-    // Create node with RPC + admission ALPNs.
-    //
-    // Gate 0 hooks must be enabled whenever any admission gate is active
-    // (allow_all_consumers=false). Without enable_hooks=true, the
-    // before_connect callbacks never fire and the admitted-set is
-    // unenforced — every connection is allowed regardless of admission.
-    //
-    // The whole resolved config reaches the node (relay / bind / storage /
-    // secret key file / transport knobs), so persistent and offline /
-    // loopback-only servers work; Gate 0 settings override it when needed.
-    const gate0Needed = !this._allowAllConsumers;
+    // Create node with RPC + admission ALPNs, gated in Rust by the server's
+    // Gate-0 policy (from the trust settings). The whole resolved config
+    // reaches the node (relay / bind / storage / secret key file / transport
+    // knobs), so persistent and offline / loopback-only servers work.
     this._node = await Node.start({
       ...this.config,
-      ...gate0EndpointConfig(gate0Needed),
       alpns: [
         ...(this.config.alpns ?? []),
         RPC_ALPN,
         ALPN_CONSUMER_ADMISSION,
         ALPN_DELEGATED_ADMISSION,
       ],
-    });
+    }, { gate: this.gate });
 
     // Build service summaries for admission response
     // Encode the server's own node ID as the RPC channel address
@@ -345,7 +358,7 @@ export class AsterServer {
       codec: xlangCodec!,
       interceptors,
       logger: this.logger,
-      peerStore: this._peerStore,
+      peerStore: this.peerStore,
     });
 
     // Publish contracts to registry doc (non-fatal on failure)
@@ -687,17 +700,7 @@ export class AsterServer {
 
     // Enable RPC server connection handling
     this._rpcServer.setServing(true);
-    this._peerStore.startReaper();
-
-    // Spawn the Gate 0 hook loop if hooks are enabled. This polls
-    // before_connect events from iroh and applies the MeshEndpointHook's
-    // allow/deny decisions. Without this, the admitted-set is never
-    // consulted and every connection passes the QUIC handshake.
-    if (this._node.hasHooks) {
-      void this._runGate0().catch(e => {
-        this.logger.error('gate0 hook loop failed', { error: String(e) });
-      });
-    }
+    this.peerStore.startReaper();
 
     // Single accept loop with ALPN routing (matches Python's _accept_loop)
     this._servePromise = this._acceptLoop();
@@ -705,54 +708,6 @@ export class AsterServer {
       await this._servePromise;
     } catch (e) {
       if (!this._closed) throw e;
-    }
-  }
-
-  /**
-   * Run the Gate 0 hook loop.
-   *
-   * Polls after_handshake events from the native receiver and dispatches
-   * each one through MeshEndpointHook.shouldAllow(). After-handshake fires
-   * for **all** connections (inbound and outbound) right after TLS, which
-   * is exactly when we want to enforce the admitted-set check.
-   *
-   * NOTE: We do NOT use before_connect — that fires only for *outgoing*
-   * connections in iroh, so it would miss incoming RPC connections to
-   * the server (which is what we need to gate).
-   *
-   * The native binding uses an event-id + respond-by-id API; this loop
-   * polls events directly and responds via respondAfterHandshake().
-   */
-  private async _runGate0(): Promise<void> {
-    if (!this._node) return;
-    const receiver = this._node.native.takeHookReceiver();
-    if (receiver == null) {
-      this.logger.warn('Gate 0: hooks enabled but no receiver available');
-      return;
-    }
-    this.logger.debug('Gate 0: hook loop started');
-
-    try {
-      while (true) {
-        const event = await receiver.recvAfterHandshake();
-        if (event == null) {
-          this.logger.debug('Gate 0: receiver closed');
-          return;
-        }
-        const alpnBytes = new Uint8Array(event.info.alpn);
-        const peerId = event.info.remoteEndpointId;
-        const allow = this._hook.shouldAllow(peerId, alpnBytes);
-        if (allow) {
-          receiver.respondHandshake(event.eventId, true, undefined, undefined);
-        } else {
-          this.logger.info(
-            `Gate 0 denied ${peerId.slice(0, 12)} on alpn=${new TextDecoder().decode(alpnBytes)}`,
-          );
-          receiver.respondHandshake(event.eventId, false, 403, 'not admitted');
-        }
-      }
-    } catch (e) {
-      this.logger.error('Gate 0 hook loop error', { error: String(e) });
     }
   }
 
@@ -771,6 +726,7 @@ export class AsterServer {
     if (this._admissionAbort) {
       this._admissionAbort.abort();
     }
+    this._peerStore?.stopReaper();
     if (this._rpcServer) {
       await this._rpcServer.close();
     }
@@ -871,14 +827,14 @@ export class AsterServer {
       services: this._serviceSummaries,
       registryNamespace: this._registryNamespace || undefined,
       allowUnenrolled: this._allowAllConsumers,
-      peerStore: this._peerStore,
+      peerStore: this.peerStore,
       logger: this.logger,
     };
     const rootKeyHex = this._resolveRootPubkeyHex();
     await handleConsumerAdmissionConnection(
       adapted,
       rootKeyHex,
-      this._hook,
+      this.admitter,
       opts,
     );
   }
@@ -900,7 +856,7 @@ export class AsterServer {
     if (!policy) return;
     await handleDelegatedAdmissionConnection(
       conn,
-      { policy, hook: this._hook, peerStore: this._peerStore },
+      { policy, hook: this.admitter, peerStore: this.peerStore },
     );
   }
 
@@ -1070,6 +1026,16 @@ function credentialFromPeerEntry(peer: Record<string, unknown>): ConsumerEnrollm
  * existing identity-loader helpers so that `enrollmentCredentialFile:`
  * and `identity:` end up doing the same thing for the same file.
  */
+/** Whether a credential file is the JSON `.cred` form (not `.aster-identity` TOML). */
+function isJsonCredentialFile(filePath: string): boolean {
+  const expanded = filePath.startsWith('~') ? filePath.replace(/^~/, homedir()) : filePath;
+  try {
+    return (readFileSync(expanded, 'utf-8') as string).trimStart().startsWith('{');
+  } catch {
+    return false; // missing: let the loaders report it
+  }
+}
+
 function loadEnrollmentCredential(filePath: string): ConsumerEnrollmentCredential {
   const expanded = filePath.startsWith('~')
     ? filePath.replace(/^~/, homedir())
@@ -1202,6 +1168,7 @@ export class AsterClientWrapper {
       !this._identitySecretKey
       && this._enrollmentCredentialFile
       && !identity
+      && !isJsonCredentialFile(this._enrollmentCredentialFile)
     ) {
       const credIdentity = loadIdentity(
         this._enrollmentCredentialFile,
@@ -1435,7 +1402,7 @@ export class AsterClientWrapper {
           }
           if (!ev) {
             try {
-              const entries: string[] = await doc.queryKeyPrefix('contracts/');
+              const entries = await doc.queryKeyPrefix('contracts/');
               if (entries.length) break;
             } catch {
               /* ignore */
@@ -1480,9 +1447,9 @@ export class AsterClientWrapper {
 
     // Fast path: inline shortcut.
     try {
-      const entries: string[] = await doc.queryKeyExact(manifestKey(summary.contractId));
+      const entries = await doc.queryKeyExact(manifestKey(summary.contractId));
       if (entries.length) {
-        const contentHash = entries[0].split(':').slice(-1)[0];
+        const contentHash = entries[0].contentHash;
         const bytes: Buffer = await doc.readEntryContent(contentHash);
         manifest = manifestFromJson(new TextDecoder().decode(bytes));
       }
@@ -1493,9 +1460,9 @@ export class AsterClientWrapper {
     // Slow path: read ArtifactRef → fetch collection from blobs.
     if (!manifest) {
       try {
-        const entries: string[] = await doc.queryKeyExact(contractKey(summary.contractId));
+        const entries = await doc.queryKeyExact(contractKey(summary.contractId));
         if (entries.length) {
-          const contentHash = entries[0].split(':').slice(-1)[0];
+          const contentHash = entries[0].contentHash;
           const bytes: Buffer = await doc.readEntryContent(contentHash);
           const artifactRef = JSON.parse(new TextDecoder().decode(bytes));
           const collectionHash = artifactRef.collection_hash;
@@ -1547,9 +1514,9 @@ export class AsterClientWrapper {
 
     try {
       const { contractKey } = await import('./registry/keys.js');
-      const entries: string[] = await doc.queryKeyExact(contractKey(contractId));
+      const entries = await doc.queryKeyExact(contractKey(contractId));
       if (!entries.length) return empty;
-      const contentHash = entries[0].split(':').slice(-1)[0];
+      const contentHash = entries[0].contentHash;
       const bytes: Buffer = await doc.readEntryContent(contentHash);
       const artifactRef = JSON.parse(new TextDecoder().decode(bytes));
       const collectionHash = artifactRef.collection_hash;

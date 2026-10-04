@@ -8,6 +8,7 @@
 
 use napi_derive::napi;
 
+mod admission;
 mod blobs;
 mod call;
 mod config;
@@ -17,7 +18,6 @@ mod docs;
 mod envelope;
 mod error;
 mod gossip;
-mod hooks;
 mod net;
 mod node;
 mod reactor;

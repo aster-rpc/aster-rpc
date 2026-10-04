@@ -10,7 +10,7 @@ import { GossipEventType as ET } from './models.js';
 /** Gossip topic handle interface (matches NAPI GossipTopicHandle). */
 interface GossipTopic {
   broadcast(data: Uint8Array): Promise<void>;
-  recv(): Promise<Uint8Array>;
+  recv(): Promise<{ kind: string; data?: Uint8Array | null }>;
 }
 
 /**
@@ -105,8 +105,9 @@ export class RegistryGossip {
   async *listen(): AsyncGenerator<GossipEvent> {
     while (true) {
       try {
-        const data = await this.topic.recv();
-        const text = this.decoder.decode(data);
+        const ev = await this.topic.recv();
+        if (ev.kind !== 'received' || !ev.data) continue; // neighbour / lag events
+        const text = this.decoder.decode(ev.data);
         const event: GossipEvent = JSON.parse(text);
         yield event;
       } catch {
