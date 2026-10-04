@@ -33,6 +33,23 @@ public enum HttpBodyStatus
     InvalidTrailers = 8,
     /// <summary>A blocking call was made on a tokio runtime thread.</summary>
     BlockingOnRuntime = 9,
+    // Relay-only codes (ABI 4.3).
+    /// <summary>The peer has no exposed service of this id.</summary>
+    UnknownService = 10,
+    /// <summary>The service's admission policy refused this node (<see cref="Status.PermissionDenied"/>).</summary>
+    Denied = 11,
+    /// <summary>The service is at its concurrent-stream cap; retry later.</summary>
+    Overloaded = 12,
+    /// <summary>The peer reset or ended the stream without a response head.</summary>
+    Reset = 13,
+    /// <summary>The response head was malformed or too large.</summary>
+    BadHead = 14,
+    /// <summary>The connection is closed or was lost.</summary>
+    ConnectionClosed = 15,
+    /// <summary>The upload was aborted (or freed unfinished) before the head.</summary>
+    UploadFailed = 16,
+    /// <summary>The head does not fit the buffer; <c>*out_len</c> is the size needed.</summary>
+    BufferTooSmall = 17,
     InvalidArgument = -1,
     UnknownHandle = -2,
 }

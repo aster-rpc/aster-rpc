@@ -24,6 +24,12 @@ public enum Status
     AbiMismatch = 12,
     /// <summary>Well-formed input failed a security check (envelope does not open, chain does not verify, ...).</summary>
     VerificationFailed = 13,
+    /// <summary>Reserved for the R4 auth model (ABI 4.3): the caller presented no usable credential. No 4.3 function returns it.</summary>
+    Unauthenticated = 14,
+    /// <summary>The peer's (or local) policy refused the caller (ABI 4.3). Today only an expose relay the serving node's authorizer denied reports it.</summary>
+    PermissionDenied = 15,
+    /// <summary>Reserved for the R4 auth model (ABI 4.3): the presented credential has expired. No 4.3 function returns it.</summary>
+    CredentialExpired = 16,
 }
 
 /// <summary>
@@ -135,6 +141,8 @@ public enum EventKind : uint
     LeaseAcquired = 107,
     /// <summary><c>aster_lease_watch</c>: the lease left HELD; <c>flags</c> = <c>aster_lease_status_t</c>.</summary>
     LeaseStatus = 108,
+    /// <summary>ABI 4.3 <c>aster_http_upload_ready</c> / <c>aster_http_response_ready</c>: <c>handle</c> = the armed handle, <c>error_code</c> = the <c>aster_http_body_status_t</c> its next non-blocking call returns, <c>status</c> = that as an <c>aster_status_t</c>.</summary>
+    HttpRelayReady = 109,
 
     // Errors
     OperationCancelled = 98,

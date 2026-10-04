@@ -554,6 +554,61 @@ public class AbiContractTests
         }
     }
 
+    // ─── ABI 4.3: streaming consumer relay, reserved auth statuses ──────────
+
+    [Fact]
+    public unsafe void Relay_Options_Layout_And_Init_Match_Header()
+    {
+        // aster_http_relay_options_t: 24 bytes.
+        Assert.Equal(24, Marshal.SizeOf<HttpRelayOptionsNative>());
+        Off<HttpRelayOptionsNative>("struct_size", 0);
+        Off<HttpRelayOptionsNative>("flags", 4);
+        Off<HttpRelayOptionsNative>("max_chunk", 8);
+        Off<HttpRelayOptionsNative>("upload_capacity", 16);
+        Off<HttpRelayOptionsNative>("reserved", 20);
+        HttpRelayOptionsNative o = default;
+        Native.Check(Native.aster_http_relay_options_init(&o), "init");
+        Assert.Equal(24u, o.struct_size);
+        Assert.Equal(0ul, o.max_chunk);
+        Assert.Equal(0u, o.upload_capacity);
+    }
+
+    [Fact]
+    public void Relay_Enum_Values_And_Status_Mapping_Match_Header()
+    {
+        Assert.Equal(109u, (uint)EventKind.HttpRelayReady);
+        Assert.Equal(10, (int)Expose.HttpBodyStatus.UnknownService);
+        Assert.Equal(11, (int)Expose.HttpBodyStatus.Denied);
+        Assert.Equal(12, (int)Expose.HttpBodyStatus.Overloaded);
+        Assert.Equal(13, (int)Expose.HttpBodyStatus.Reset);
+        Assert.Equal(14, (int)Expose.HttpBodyStatus.BadHead);
+        Assert.Equal(15, (int)Expose.HttpBodyStatus.ConnectionClosed);
+        Assert.Equal(16, (int)Expose.HttpBodyStatus.UploadFailed);
+        Assert.Equal(17, (int)Expose.HttpBodyStatus.BufferTooSmall);
+        Assert.Equal(14, (int)Status.Unauthenticated);
+        Assert.Equal(15, (int)Status.PermissionDenied);
+        Assert.Equal(16, (int)Status.CredentialExpired);
+        // aster_http_body_status_to_status (RENAME_MAP "New in 4.3").
+        Assert.Equal((int)Status.PermissionDenied, Native.aster_http_body_status_to_status((int)Expose.HttpBodyStatus.Denied));
+        Assert.Equal((int)Status.NotFound, Native.aster_http_body_status_to_status((int)Expose.HttpBodyStatus.UnknownService));
+        Assert.Equal((int)Status.AlreadyClosed, Native.aster_http_body_status_to_status((int)Expose.HttpBodyStatus.ConnectionClosed));
+        Assert.Equal((int)Status.ConnectionRefused, Native.aster_http_body_status_to_status((int)Expose.HttpBodyStatus.Overloaded));
+        Assert.Equal((int)Status.StreamReset, Native.aster_http_body_status_to_status((int)Expose.HttpBodyStatus.Reset));
+        Assert.Equal((int)Status.Internal, Native.aster_http_body_status_to_status(9999));
+        Assert.Contains("PERMISSION_DENIED", System.Runtime.InteropServices.Marshal.PtrToStringUTF8(Native.aster_status_name(15)));
+    }
+
+    private static readonly string[] Abi43Exports =
+    {
+        "aster_http_body_status_to_status", "aster_http_relay_options_init", "aster_expose_relay_stream",
+        "aster_http_upload_write", "aster_http_upload_try_write", "aster_http_upload_finish", "aster_http_upload_abort",
+        "aster_http_upload_ready", "aster_http_upload_free",
+        "aster_http_response_wait", "aster_http_response_read", "aster_http_response_ready", "aster_http_response_close", "aster_http_response_free",
+    };
+
+    [Fact]
+    public void Abi_4_3_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi43Exports);
+
     // ─── Bytes helpers ───────────────────────────────────────────────────────
 
     [Fact]
