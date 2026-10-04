@@ -3,6 +3,7 @@ pub mod attestation;
 pub mod canonical;
 pub mod contract;
 pub mod datagram;
+pub mod dynamic;
 pub mod envelope;
 pub mod framing;
 pub mod grant_record;
