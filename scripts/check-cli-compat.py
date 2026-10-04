@@ -16,7 +16,6 @@ Exits 0 on pass, 1 on fail with a fix-it hint.
 Run manually: python3 scripts/check-cli-compat.py
 Invoked from:
   - .githooks/pre-push
-  - .github/workflows/ci.yml (lint job)
   - .forgejo/workflows/linux.yml (lint job)
 """
 
