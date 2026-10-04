@@ -105,7 +105,13 @@ public enum IrohEventKind {
   LEASE_STATUS(108),
 
   // Streaming consumer relay readiness (ABI 4.3)
-  HTTP_RELAY_READY(109);
+  HTTP_RELAY_READY(109),
+
+  // Coordination client (ABI 4.4)
+  COORDINATION_CLIENT_OPENED(110),
+  COORDINATION_RESOLVED(111),
+  COORDINATION_RESULT(112),
+  COORDINATION_LEASE_ACQUIRED(113);
 
   public final int code;
 

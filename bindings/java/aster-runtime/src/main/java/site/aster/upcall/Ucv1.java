@@ -166,20 +166,21 @@ public final class Ucv1 {
 
   // ── writer / reader ──────────────────────────────────────────────────────
 
-  static final class W {
+  /** UCv1 message writer (also used by {@code site.aster.coordination}). */
+  public static final class W {
     private final ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-    W(int tag) {
+    public W(int tag) {
       out.write(tag);
       out.write(VERSION);
     }
 
-    W u8(int v) {
+    public W u8(int v) {
       out.write(v & 0xff);
       return this;
     }
 
-    W uint(long v) {
+    public W uint(long v) {
       long x = v;
       while ((x & ~0x7FL) != 0) {
         out.write((int) ((x & 0x7F) | 0x80));
@@ -189,37 +190,37 @@ public final class Ucv1 {
       return this;
     }
 
-    W bool(boolean v) {
+    public W bool(boolean v) {
       return u8(v ? 1 : 0);
     }
 
-    W str(String s) {
+    public W str(String s) {
       byte[] b = s.getBytes(StandardCharsets.UTF_8);
       uint(((long) b.length << 2) | 2);
       out.writeBytes(b);
       return this;
     }
 
-    W bytes(byte[] b) {
+    public W bytes(byte[] b) {
       uint(b.length);
       out.writeBytes(b);
       return this;
     }
 
-    W list(int n) {
+    public W list(int n) {
       uint(n);
       return u8(LIST_HEADER);
     }
 
-    W absent() {
+    public W absent() {
       return u8(NULL_FLAG);
     }
 
-    W present() {
+    public W present() {
       return u8(0);
     }
 
-    W strs(List<String> v) {
+    public W strs(List<String> v) {
       list(v.size());
       for (String s : v) {
         str(s);
@@ -227,16 +228,17 @@ public final class Ucv1 {
       return this;
     }
 
-    byte[] done() {
+    public byte[] done() {
       return out.toByteArray();
     }
   }
 
-  static final class R {
+  /** UCv1 message reader. */
+  public static final class R {
     private final byte[] buf;
     private int pos;
 
-    R(byte[] buf, int tag) {
+    public R(byte[] buf, int tag) {
       this.buf = buf;
       if (buf.length == 0) {
         throw new DecodeException("empty payload");
@@ -259,13 +261,13 @@ public final class Ucv1 {
       }
     }
 
-    int u8() {
+    public int u8() {
       need(1);
       return buf[pos++] & 0xff;
     }
 
     /** Unsigned LEB128, minimal, at most 64 bits (returned as a two's-complement long). */
-    long uint() {
+    public long uint() {
       int start = pos;
       long v = 0;
       for (int i = 0; i < 10; i++) {
@@ -284,7 +286,7 @@ public final class Ucv1 {
       throw new DecodeException("varint too long at offset " + start);
     }
 
-    long uintMax(long max, String what) {
+    public long uintMax(long max, String what) {
       long v = uint();
       if (Long.compareUnsigned(v, max) > 0) {
         throw new DecodeException(what + " " + Long.toUnsignedString(v) + " out of range");
@@ -292,7 +294,7 @@ public final class Ucv1 {
       return v;
     }
 
-    boolean bool() {
+    public boolean bool() {
       int b = u8();
       return switch (b) {
         case 0 -> false;
@@ -301,7 +303,7 @@ public final class Ucv1 {
       };
     }
 
-    String str() {
+    public String str() {
       int start = pos;
       long header = uint();
       if ((header & 0b11) != 0b10) {
@@ -327,7 +329,7 @@ public final class Ucv1 {
       }
     }
 
-    byte[] bytes() {
+    public byte[] bytes() {
       long len = uint();
       if (len > buf.length - pos) {
         throw new DecodeException("bytes length " + len + " exceeds payload");
@@ -337,7 +339,7 @@ public final class Ucv1 {
       return b;
     }
 
-    int list() {
+    public int list() {
       long n = uint();
       if (u8() != LIST_HEADER) {
         throw new DecodeException("list element header mismatch");
@@ -348,7 +350,7 @@ public final class Ucv1 {
       return (int) n;
     }
 
-    boolean present() {
+    public boolean present() {
       int b = u8();
       if (b == 0) {
         return true;
@@ -359,7 +361,7 @@ public final class Ucv1 {
       throw new DecodeException("invalid optional marker " + b);
     }
 
-    List<String> strs() {
+    public List<String> strs() {
       int n = list();
       List<String> out = new ArrayList<>(n);
       for (int i = 0; i < n; i++) {
@@ -368,7 +370,7 @@ public final class Ucv1 {
       return List.copyOf(out);
     }
 
-    void end() {
+    public void end() {
       if (pos != buf.length) {
         throw new DecodeException((buf.length - pos) + " trailing bytes");
       }
