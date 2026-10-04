@@ -8,6 +8,9 @@
 //!   echo(interop/EchoRequest) -> interop/EchoReply                (unary)
 //!   generate(interop/EchoRequest) -> stream interop/EchoReply     (server stream)
 //!   ingest(stream interop/EchoRequest) -> interop/EchoReply       (client stream)
+//!   chat(stream interop/EchoRequest) -> stream interop/EchoReply  (bidi)
+//!   hold(interop/EchoRequest) -> interop/EchoReply                (unary, blocks)
+//!   cancelled(interop/EchoRequest) -> interop/EchoReply           (unary)
 //! interop/EchoRequest { message: string, count: varint32, data: binary }
 //! interop/EchoReply   { message: string, count: varint32, data: binary, server_lang: string }
 //! ```
@@ -18,6 +21,28 @@
 //!   `message` and `data`, `count = i`, and `server_lang`.
 //! - `ingest`: one reply with `count` = number of requests received,
 //!   `message` = the last request's message (`""` if none), empty `data`.
+//! - `chat`: for every request, in arrival order, ONE reply is sent right away
+//!   (before the next request is read): `message` and `data` echoed,
+//!   `count` = the request's 0-based position in the stream, `server_lang` set.
+//!   The reply stream ends when the request stream ends.
+//! - `hold`: blocks until the call is cancelled (client cancel, client deadline
+//!   or connection loss) or 60 s pass. Observing the cancellation increments a
+//!   process-wide counter. After 60 s it replies `count = -1`,
+//!   `message = "timeout"` instead (the cancel cases treat that as a failure).
+//! - `cancelled`: replies `count` = the number of `hold` calls that observed
+//!   a cancellation so far, `message = "cancelled"`.
+//!
+//! A second service, `InteropSession v1`, is **session-scoped** (a fresh
+//! instance per `(connection, session id)`; see `interop_echo.rs`):
+//!
+//! ```text
+//! service InteropSession v1 (scope = session)
+//!   add(interop/EchoRequest) -> interop/EchoReply                 (unary)
+//! ```
+//!
+//! `add`: the instance keeps `total` (sum of the requests' `count`, i32 wrap)
+//! and `calls`; it replies `count = total`, `message = "calls=<calls>"`
+//! (after counting this call), `server_lang` set.
 
 #![allow(dead_code)]
 
@@ -57,9 +82,38 @@ pub trait InteropEcho {
 
     #[rpc(client_stream)]
     async fn ingest(&self, reqs: RequestStream<EchoRequest>) -> Result<EchoReply>;
+
+    #[rpc(bidi_stream)]
+    async fn chat(
+        &self,
+        reqs: RequestStream<EchoRequest>,
+        out: ResponseSink<EchoReply>,
+    ) -> Result<()>;
+
+    async fn hold(&self, req: EchoRequest) -> Result<EchoReply>;
+
+    async fn cancelled(&self, req: EchoRequest) -> Result<EchoReply>;
 }
 
 pub struct EchoImpl;
+
+/// `hold` calls that observed a cancellation (process-wide; the matrix runs
+/// one server process per server language and clients take turns).
+static HOLD_CANCELLED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Counts a cancelled `hold`: the handler future is dropped when the call is
+/// cancelled or its deadline passes, which runs this before `disarm`.
+struct HoldGuard {
+    armed: bool,
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            HOLD_CANCELLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 #[async_trait]
 impl InteropEcho for EchoImpl {
@@ -95,6 +149,46 @@ impl InteropEcho for EchoImpl {
         Ok(EchoReply {
             message: last,
             count: n,
+            data: vec![],
+            server_lang: "rust".into(),
+        })
+    }
+
+    async fn chat(
+        &self,
+        mut reqs: RequestStream<EchoRequest>,
+        out: ResponseSink<EchoReply>,
+    ) -> Result<()> {
+        let mut i = 0i32;
+        while let Some(r) = reqs.recv().await? {
+            out.send(&EchoReply {
+                message: r.message,
+                count: i,
+                data: r.data,
+                server_lang: "rust".into(),
+            })
+            .await?;
+            i = i.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    async fn hold(&self, _req: EchoRequest) -> Result<EchoReply> {
+        let mut guard = HoldGuard { armed: true };
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        guard.armed = false;
+        Ok(EchoReply {
+            message: "timeout".into(),
+            count: -1,
+            data: vec![],
+            server_lang: "rust".into(),
+        })
+    }
+
+    async fn cancelled(&self, _req: EchoRequest) -> Result<EchoReply> {
+        Ok(EchoReply {
+            message: "cancelled".into(),
+            count: HOLD_CANCELLED.load(std::sync::atomic::Ordering::SeqCst),
             data: vec![],
             server_lang: "rust".into(),
         })

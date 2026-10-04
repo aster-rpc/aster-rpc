@@ -216,7 +216,7 @@ required-features = ["rpc"]
 [[example]]
 name = "interop_echo"
 path = "../tests/interop/rust/interop_echo.rs"
-required-features = ["rpc"]
+required-features = ["rpc", "expose"]
 
 # Dispatch benchmark load driver (design §6 Step 0). Shares the InteropEcho
 # contract with tests/interop/; driven by benchmarks/dispatch/run.py.
