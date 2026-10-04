@@ -193,7 +193,7 @@ public sealed class RouteRegistration : IDisposable
 }
 
 /// <summary>The consumer side of expose: calls over a connection to a node that exposes services. Needs no <see cref="ExposeRegistry"/>.</summary>
-public static class ExposeClient
+public static partial class ExposeClient
 {
     /// <summary>
     /// Relays one buffered HTTP request to <paramref name="serviceId"/> exposed by the peer on

@@ -7,10 +7,10 @@
 **C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 4.2, 2026-10-04)
+## STATUS (ABI 4.3, 2026-10-04)
 
 - **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
-  `Native.RequiredAbiMinor` = 2; 4.0 removed the reactor, framed calls, the node factories and
+  `Native.RequiredAbiMinor` = 3; 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
@@ -88,6 +88,17 @@
   ABI yet) and `RequestRouteAsync`. HTTP services need an upcall table; a table without an
   authorizer denies (fail-closed default). No new auth surface: the authorizer is the existing kind
   48 decision, Gate 0 is untouched.
+- **Streaming consumer relay (ABI 4.3):** `ExposeClient.RelayStreamAsync` returns an
+  `ExposeStreamResponse` at the head (full duplex; the upload pump keeps running). The native calls
+  are used with timeout 0 and the one-shot `ASTER_EVENT_HTTP_RELAY_READY` events
+  (`aster_http_upload_ready` / `aster_http_response_ready`), so no pool thread blocks. Contract (as in
+  TS): a body-source failure before the head is thrown as the caller's own exception (the request is
+  reset), after the head it faults `Upload`; disposing before the body's clean end resets an unfinished
+  upload; a clean end lets the upload finish (disposal waits for it); an early answer the handler gives
+  without reading makes `Upload` complete `false`. Relay failures are `ExposeRelayException` (stable
+  code in `RelayStatus`, `Status` via `aster_http_body_status_to_status`); a denied relay, streaming or
+  buffered, is `Status.PermissionDenied`. `Unauthenticated` / `CredentialExpired` are reserved for R4
+  and not returned today.
 - **Interop:** joins `tests/interop/` (`tests/interop/dotnet/`), 5×5 matrix all pass.
 - `Bytes.FromArray` (unpinned pointer) is removed; use `fixed` + `Bytes.FromPointer`,
   `Bytes.FromPinned`, or the internal `NativeScope`.
