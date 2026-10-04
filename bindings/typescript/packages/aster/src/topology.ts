@@ -23,6 +23,7 @@ import type {
   Topology as NativeTopology,
   PeerView as NativePeerView,
   ClusterView as NativeClusterView,
+  TopologySnapshot as NativeTopologySnapshot,
 } from '@aster-rpc/transport';
 import type { NodeId } from './node.js';
 
@@ -190,10 +191,23 @@ export class Topology {
   async snapshot(): Promise<TopologySnapshot> {
     const snap = await this.native.snapshot();
     const clusters = Object.freeze(snap.clusters().map(clusterOut));
-    return Object.freeze({
+    const view: TopologySnapshot = Object.freeze({
       clusters,
       clusterOf: (node: NodeId | string) => clusters.find((c) => c.members.includes(node as NodeId)),
       separated: (a: NodeId | string, b: NodeId | string) => snap.separated(a, b),
     });
+    NATIVE_SNAPSHOTS.set(view, snap);
+    return view;
   }
+}
+
+const NATIVE_SNAPSHOTS = new WeakMap<TopologySnapshot, NativeTopologySnapshot>();
+
+/**
+ * The native view behind a snapshot from {@link Topology.snapshot} (used by
+ * the coordination placement planner).
+ * @internal
+ */
+export function nativeTopologySnapshot(snapshot: TopologySnapshot): NativeTopologySnapshot | undefined {
+  return NATIVE_SNAPSHOTS.get(snapshot);
 }

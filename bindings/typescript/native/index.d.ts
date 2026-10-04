@@ -239,6 +239,105 @@ export declare class BlobsClient {
   blobLocalInfo(hashHex: string): Promise<BlobLocalInfo>
 }
 
+/** The full durable, redirecting coordination client. */
+export declare class CoordinationClient {
+  /** The group this client is bound to (hex). */
+  get groupId(): string
+  /** The local actor identity as the group authenticates it (hex). */
+  get localId(): string
+  /** The journal's current client id (hex, 16 bytes). */
+  clientId(): Promise<string>
+  /** The saved result a previous run resolved and nobody acknowledged. */
+  unacknowledged(): Promise<CoordinationResolvedMutation | null>
+  /**
+   * Drive any half-finished request from a previous run to resolution;
+   * `null` when the journal is ready.
+   */
+  resume(): Promise<CoordinationResolvedMutation | null>
+  acquire(resource: CoordinationResourceKey, ttlMs: number): Promise<CoordinationResolvedMutation>
+  renew(fence: CoordinationFence): Promise<CoordinationResolvedMutation>
+  compareAndSet(fence: CoordinationFence, expectedValueRevision: number, newValue: Buffer): Promise<CoordinationResolvedMutation>
+  release(fence: CoordinationFence): Promise<CoordinationResolvedMutation>
+  releaseWithValue(fence: CoordinationFence, expectedValueRevision: number, finalValue: Buffer): Promise<CoordinationResolvedMutation>
+  revoke(resource: CoordinationResourceKey, expectedEpoch?: number | undefined | null): Promise<CoordinationResolvedMutation>
+  setGrant(resource: CoordinationResourceKey, targetNodeId: string, rights: number, expectedAclRevision: number): Promise<CoordinationResolvedMutation>
+  setAdmin(targetNodeId: string, enabled: boolean, expectedAdminRevision: number): Promise<CoordinationResolvedMutation>
+  changeMembership(operationId: string, expectedMembershipLogId: CoordinationLogId | undefined | null, desiredVoters: Array<string>, retainedLearners: Array<string>, memberSeeds: Array<CoordinationMemberSeed>): Promise<CoordinationResolvedMutation>
+  cancelMembership(operationId: string, expectedPhaseCode: number): Promise<CoordinationResolvedMutation>
+  /** Retire one of this actor's **other** client ids. */
+  retireOtherClient(targetClientId: string): Promise<CoordinationRetireReply>
+  /**
+   * One committed acquire; on grant the Rust renew loop and self-limit
+   * take over. Lease transitions are journaled and auto-acknowledged.
+   */
+  acquireLease(resource: CoordinationResourceKey, options?: LeaseOptions | undefined | null): Promise<CoordinationLease | LeaseDenied>
+  /** The read/status surface (shares this client's routing). */
+  reads(): CoordinationReadClient
+  /**
+   * Release the journal: drops every outstanding resolved-mutation and
+   * lease handle this client produced (unacknowledged results stay
+   * journaled for the next open). Idempotent.
+   */
+  close(): void
+  get closed(): boolean
+}
+
+/** A held coordination lease (fenced register, §9.4). */
+export declare class CoordinationLease {
+  get resource(): CoordinationResourceKey
+  /**
+   * The full fence for a protected action, or `null` once this holder
+   * must stop. Ask immediately before each action; never cache it.
+   */
+  fence(): CoordinationFence | null
+  /** The holder's status (`released` once handed back or closed). */
+  get status(): 'held' | 'released' | 'fenced' | 'lost'
+  /** `compare_and_set` under the current fence; journaled and acknowledged. */
+  compareAndSet(expectedValueRevision: number, newValue: Buffer): Promise<CoordinationMutationReply>
+  /** Graceful release through the serializer. Idempotent. */
+  release(): Promise<void>
+  /**
+   * The atomic final handoff: write `finalValue` and release together, or
+   * neither.
+   */
+  releaseWithValue(expectedValueRevision: number, finalValue: Buffer): Promise<CoordinationMutationReply>
+}
+
+/** Linearizable reads and status; no journal, no mutation. */
+export declare class CoordinationReadClient {
+  readLinearizable(resource: CoordinationResourceKey): Promise<CoordinationResourceSnapshot>
+  inspectAcl(resource: CoordinationResourceKey): Promise<CoordinationAclStatus>
+  inspectAdmins(): Promise<CoordinationAdminStatus>
+  membershipStatus(operationId?: string | undefined | null): Promise<CoordinationMembershipStatus>
+  groupStatus(): Promise<CoordinationGroupStatus>
+  probeClient(targetNodeId: string, targetClientId: string): Promise<CoordinationClientProbe>
+  /**
+   * At most `limit` (1..=10 000) retained audit rows strictly after
+   * `after`, ascending.
+   */
+  auditStream(after: CoordinationLogId | undefined | null, limit: number): Promise<Array<CoordinationAuditRecord>>
+  /** The canonical recovery export, verified against its manifest. */
+  recoveryExport(): Promise<CoordinationRecoveryExport>
+  /**
+   * Stream the export into `path` (via `path.partial`, renamed into place
+   * only once the checksum held).
+   */
+  recoveryExportToFile(path: string): Promise<CoordinationExportManifest>
+}
+
+/** A resolved mutation, fsynced `ResolvedAwaitingAck` before it was returned. */
+export declare class CoordinationResolvedMutation {
+  /** The exact reply the journal holds. */
+  get reply(): CoordinationMutationReply
+  /** `false` once acknowledged (or its client closed). */
+  get pending(): boolean
+  /**
+   * The application has durably handled this result: free the journal
+   * for the next sequence.
+   */
+  acknowledge(): Promise<void>
+}
+
 /**
  * A document's live events: `AsyncIterable<DocEvent>` (ends when the
  * subscription does), or call `recv()` directly.
@@ -1304,6 +1403,283 @@ export declare function computeContractIdFromJson(jsonStr: string): string
 
 /** BLAKE3 hash of input bytes -> 32-byte digest. */
 export declare function computeTypeHash(data: Buffer): Buffer
+
+/** One ACL row: a subject and its exact rights bits. */
+export interface CoordinationAclGrant {
+  subjectNodeId: string
+  rights: number
+}
+
+/** The committed ACL of one resource. */
+export interface CoordinationAclStatus {
+  resource: CoordinationResourceKey
+  aclRevision: number
+  grants: Array<CoordinationAclGrant>
+}
+
+/** The delegated administrator set (ROOT is static and not listed). */
+export interface CoordinationAdminStatus {
+  adminRevision: number
+  administrators: Array<string>
+}
+
+/** One retained audit row (§14). */
+export interface CoordinationAuditRecord {
+  logId: CoordinationLogId
+  actorNodeId?: string
+  /**
+   * 1–11 mutation method codes; 100 expire, 101 membership progress, 102
+   * genesis installation.
+   */
+  operationCode: number
+  resource?: CoordinationResourceKey
+  resultCode: number
+  epoch: number
+  valueRevision: number
+}
+
+/**
+ * Open the durable, journaled client bound to `node`'s identity and `group`.
+ * Takes the per-actor/group journal lifetime lock until `close()`.
+ */
+export declare function coordinationClientOpen(node: Node, groupId: string, seedTickets: Array<string> | undefined | null, journalDir: string): CoordinationClient
+
+/** `probe_client` diagnostics — never authority to reassign a sequence. */
+export interface CoordinationClientProbe {
+  targetNodeId: string
+  targetClientId: string
+  exists: boolean
+  lastSequence: number
+  requestHash: string
+  dispositionCode: number
+  retired: boolean
+}
+
+/** A `(code, name)` row of the §5.2 code tables. */
+export interface CoordinationCode {
+  code: number
+  name: string
+}
+
+/** A verified recovery export's manifest. */
+export interface CoordinationExportManifest {
+  totalLen: number
+  blake3Checksum: string
+  appliedLogId?: CoordinationLogId
+}
+
+/** The `(group, resource, epoch, holder)` fact a fenced mutation carries. */
+export interface CoordinationFence {
+  groupId: string
+  resource: CoordinationResourceKey
+  epoch: number
+  holder: string
+}
+
+/**
+ * The `group_status` cut (S4-STATUS-CUT). Advisory fields describe the
+ * answering node; replicated fields are the group's.
+ */
+export interface CoordinationGroupStatus {
+  groupId: string
+  lifecycleCode: number
+  localNodeId: string
+  /** `0` none, `1` learner, `2` voter. */
+  localRoleCode: number
+  leaderNodeId?: string
+  term: number
+  lastLogId?: CoordinationLogId
+  committedLogId?: CoordinationLogId
+  appliedLogId?: CoordinationLogId
+  deploymentProfileCode: number
+  membershipLogId?: CoordinationLogId
+  membershipJoint: boolean
+  voters: Array<string>
+  learners: Array<string>
+  pendingOperationId?: string
+  quorumAvailable?: boolean
+  fatalCode: number
+  auditFloor?: CoordinationLogId
+  genesisHash: string
+  authorityPublicKey: string
+  authorityDomain: string
+  recoveredFrom?: CoordinationRecoveredFrom
+}
+
+/** A Raft log id (`term`, leader, `index`). */
+export interface CoordinationLogId {
+  term: number
+  leaderNodeId: string
+  index: number
+}
+
+/** Canonical seed material for a new member. */
+export interface CoordinationMemberSeed {
+  nodeId: string
+  ticket: string
+  signedJoinPermit?: Buffer
+}
+
+/** One membership intent's status (§5.2). */
+export interface CoordinationMembershipStatus {
+  operationId?: string
+  statusCode: number
+  expectedMembershipLogId?: CoordinationLogId
+  observedMembershipLogId?: CoordinationLogId
+  desiredVoters: Array<string>
+  retainedLearners: Array<string>
+  errorCode: number
+}
+
+/** The exact reply a journaled mutation resolved to (§5.2). */
+export interface CoordinationMutationReply {
+  groupId: string
+  clientId: string
+  sequence: number
+  requestHash: string
+  /** `1` consumed, `2` not consumed. */
+  dispositionCode: number
+  outcomeCode: number
+  /** `0` means none. */
+  reasonCode: number
+  snapshot?: CoordinationResourceSnapshot
+  aclRevision: number
+  adminRevision: number
+  operationId?: string
+  membershipLogId?: CoordinationLogId
+}
+
+/** The §5.2 outcome-code table, straight from the Rust enum. */
+export declare function coordinationOutcomeCodes(): Array<CoordinationCode>
+
+/** One eligible candidate, optionally with its seed material. */
+export interface CoordinationPlacementCandidate {
+  nodeId: string
+  memberSeed?: CoordinationMemberSeed
+}
+
+/** One planning input (the topology snapshot is passed separately). */
+export interface CoordinationPlacementInput {
+  groupId: string
+  genesisHash: string
+  deploymentProfileCode: number
+  membershipLogId?: CoordinationLogId
+  currentVoters: Array<string>
+  currentLearners?: Array<string>
+  activeMembershipIntent?: boolean
+  graceCrossedMembers?: Array<string>
+  policy: CoordinationPlacementPolicy
+}
+
+/**
+ * §7.7.2's pure, deterministic voter placement planner — local advice only.
+ * The membership facts usually come from `groupStatus()`, the topology
+ * snapshot from `node.topology().snapshot()`.
+ */
+export declare function coordinationPlacementPlan(input: CoordinationPlacementInput, topology: TopologySnapshot): CoordinationPlacementRecommendation
+
+/** A complete desired membership, ready for `changeMembership`. */
+export interface CoordinationPlacementPlan {
+  desiredVoters: Array<string>
+  retainedLearners: Array<string>
+  memberSeeds: Array<CoordinationMemberSeed>
+  expectedMembershipLogId?: CoordinationLogId
+  separation: CoordinationSeparationSummary
+}
+
+/** The application-owned placement policy (§7.7.1). */
+export interface CoordinationPlacementPolicy {
+  revision: number
+  /** BLAKE3 of the application's canonical policy record (hex). */
+  digest: string
+  authorityPublicKey: string
+  authorityDomain: string
+  targetVoters: number
+  targetRetainedLearners: number
+  eligible: Array<CoordinationPlacementCandidate>
+  pinnedVoters?: Array<string>
+  excluded?: Array<string>
+  minimumSeparatedVoterPairs?: number
+  replacementGraceMs?: number
+  allowHealthyRebalance?: boolean
+}
+
+/** The planner's answer (§7.7.2). */
+export interface CoordinationPlacementRecommendation {
+  kind: 'stable' | 'degraded' | 'converging' | 'needs_provisioning' | 'insufficient_evidence' | 'invalid_policy' | 'plan'
+  /** `degraded` / `invalid_policy`. */
+  why?: string
+  /** `insufficient_evidence`. */
+  missing?: string
+  /** `stable` / `degraded`. */
+  separation?: CoordinationSeparationSummary
+  /** `needs_provisioning`: the selected NodeIds lacking seed material. */
+  candidates?: Array<string>
+  /** `needs_provisioning`: the selection they belong to. */
+  desiredVoters?: Array<string>
+  retainedLearners?: Array<string>
+  /** `plan`. */
+  plan?: CoordinationPlacementPlan
+}
+
+/** Open the read-only client: linearizable reads and status, no journal. */
+export declare function coordinationReadClientOpen(node: Node, groupId: string, seedTickets?: Array<string> | undefined | null): CoordinationReadClient
+
+/** The §5.2 reason-code table, straight from the Rust enum. */
+export declare function coordinationReasonCodes(): Array<CoordinationCode>
+
+/** Where a group founded by a §13 recovery import came from. */
+export interface CoordinationRecoveredFrom {
+  sourceGroupId: string
+  sourceGenesisHash: string
+  sourceAuthorityPublicKey: string
+  sourceAuthorityDomain: string
+  exportHash: string
+  sourceLastApplied?: CoordinationLogId
+}
+
+/** A recovery export held in memory. */
+export interface CoordinationRecoveryExport {
+  manifest: CoordinationExportManifest
+  body: Buffer
+}
+
+/** An exact resource identity: `namespace` plus raw key bytes. */
+export interface CoordinationResourceKey {
+  namespace: string
+  key: Buffer
+}
+
+/** One resource's committed row at the reply's cut. */
+export interface CoordinationResourceSnapshot {
+  groupId: string
+  resource: CoordinationResourceKey
+  epoch: number
+  holder?: string
+  held: boolean
+  ttlMs: number
+  leaseRevision: number
+  valueRevision: number
+  aclRevision: number
+  value?: Buffer
+  valueRedacted: boolean
+}
+
+/** `retire_client` reply: `(9, 0)` retired, or `(100, reason)`. */
+export interface CoordinationRetireReply {
+  outcomeCode: number
+  reasonCode: number
+}
+
+/** Pairwise separation evidence for a selected voter set. */
+export interface CoordinationSeparationSummary {
+  separatedPairs: number
+  connectedPairs: number
+  unknownPairs: number
+  totalPairs: number
+  representedClusters: number
+  diversityProved: boolean
+}
 
 /**
  * Create a reactor that receives externally-fed connections. Returns the

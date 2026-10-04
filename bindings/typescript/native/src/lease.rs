@@ -105,7 +105,7 @@ fn epoch_in(epoch: i64) -> Result<u64> {
     u64::try_from(epoch).map_err(|_| invalid("epoch must be non-negative"))
 }
 
-fn options_in(o: Option<LeaseOptions>) -> Result<l::LeaseOptions> {
+pub(crate) fn options_in(o: Option<LeaseOptions>) -> Result<l::LeaseOptions> {
     let mut opts = l::LeaseOptions::default();
     if let Some(o) = o {
         if let Some(v) = o.ttl_ms {
@@ -121,7 +121,7 @@ fn options_in(o: Option<LeaseOptions>) -> Result<l::LeaseOptions> {
     Ok(opts)
 }
 
-fn deny_out(r: l::DenyReason) -> String {
+pub(crate) fn deny_out(r: l::DenyReason) -> String {
     match r {
         l::DenyReason::HeldByOther => "held_by_other",
         l::DenyReason::EpochMismatch => "epoch_mismatch",
@@ -133,7 +133,7 @@ fn deny_out(r: l::DenyReason) -> String {
     .into()
 }
 
-fn status_out(s: l::LeaseStatus) -> String {
+pub(crate) fn status_out(s: l::LeaseStatus) -> String {
     match s {
         l::LeaseStatus::Held => "held",
         l::LeaseStatus::Released => "released",

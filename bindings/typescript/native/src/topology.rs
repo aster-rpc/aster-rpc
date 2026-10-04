@@ -289,7 +289,7 @@ impl Topology {
 /// One immutable derived view (see `Topology.snapshot`).
 #[napi]
 pub struct TopologySnapshot {
-    inner: Arc<RsTopologySnapshot>,
+    pub(crate) inner: Arc<RsTopologySnapshot>,
 }
 
 #[napi]

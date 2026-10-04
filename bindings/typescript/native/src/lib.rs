@@ -14,6 +14,7 @@ mod blobs;
 mod call;
 mod config;
 mod contract;
+mod coordination;
 mod crypto;
 mod docs;
 mod envelope;
