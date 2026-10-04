@@ -19,10 +19,10 @@ use aster_transport_core::{CoreConnection, CoreNetClient};
 
 use http_body_util::BodyExt;
 
-use aster_expose::body::{RelayBody, RelayError, ResponseBody};
+use aster_expose::body::{body_channel, RelayBody, RelayError, ResponseBody};
 use aster_expose::relay::{
-    expose_http_on_connection, expose_local_http, relay_request, AuthenticatedPeer, AuthorizeFn,
-    HttpHandler, LocalHttpTarget,
+    expose_http_on_connection, expose_local_http, relay_request, relay_request_streaming,
+    AuthenticatedPeer, AuthorizeFn, HttpHandler, LocalHttpTarget,
 };
 
 const TEST_ALPN: &[u8] = b"aster-test/expose";
@@ -327,6 +327,269 @@ async fn datagram_demux_round_trip() -> Result<()> {
     assert_eq!(
         got.expect("flow 42 received no datagram"),
         b"datagram payload"
+    );
+    Ok(())
+}
+
+// ── a producer that stops mid-body ──────────────────────────────────────────
+//
+// Design doc §6 / upcall-design §6: a body that fails partway must reach the
+// other side as a failed body (the stream is reset), never as a clean finish
+// of a truncated one. QUIC finishes a send half that is merely dropped, so
+// every error path has to reset explicitly.
+
+/// A response body that yields `chunk` and then fails.
+struct FailsAfter {
+    chunk: Option<bytes::Bytes>,
+}
+
+impl http_body::Body for FailsAfter {
+    type Data = bytes::Bytes;
+    type Error = RelayError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, RelayError>>> {
+        std::task::Poll::Ready(Some(match self.chunk.take() {
+            Some(c) => Ok(http_body::Frame::data(c)),
+            None => Err("upstream body failed".into()),
+        }))
+    }
+}
+
+/// Answers `/native` with a native body that errors after one chunk, and
+/// `/channel` with a [`body_channel`] that is aborted after one chunk.
+fn failing_body_handler() -> HttpHandler {
+    Arc::new(|req: http::Request<RelayBody>| {
+        Box::pin(async move {
+            let body: ResponseBody = if req.uri().path() == "/channel" {
+                let (tx, body) = body_channel(4);
+                tokio::spawn(async move {
+                    tx.send(bytes::Bytes::from_static(b"partial")).await.ok();
+                    // Let the chunk reach the wire before the abort.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tx.abort("producer failed");
+                });
+                body.boxed_unsync()
+            } else {
+                FailsAfter {
+                    chunk: Some(bytes::Bytes::from_static(b"partial")),
+                }
+                .boxed_unsync()
+            };
+            Ok(http::Response::builder().status(200).body(body).unwrap())
+        }) as BoxFut<Result<http::Response<ResponseBody>>>
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_body_failing_mid_stream_fails_the_consumer() -> Result<()> {
+    let h = harness().await?;
+    expose_http_on_connection(&h.server_conn, "fail", allow_all(), failing_body_handler());
+
+    for path in ["/native", "/channel"] {
+        // Buffered consumer: the whole exchange fails.
+        let res = timeout(
+            STEP_TIMEOUT,
+            relay_request(&h.client_conn, "fail", post(path, b"")),
+        )
+        .await?;
+        assert!(
+            res.is_err(),
+            "{path}: truncated body accepted: {:?}",
+            res.map(|r| r.body().len())
+        );
+
+        // Streaming consumer: the body fails rather than ending cleanly. (A
+        // reset discards unsent data, so when the body fails at once the reset
+        // may overtake the head too; either way the exchange fails.)
+        let req = http::Request::builder()
+            .uri(path)
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+        let res = timeout(
+            STEP_TIMEOUT,
+            relay_request_streaming(&h.client_conn, "fail", req),
+        )
+        .await?;
+        if let Ok(resp) = res {
+            assert_eq!(resp.status(), 200);
+            let collected = timeout(STEP_TIMEOUT, resp.into_body().collect()).await?;
+            assert!(
+                collected.is_err(),
+                "{path}: streamed body ended cleanly instead of failing"
+            );
+        } else if path == "/channel" {
+            // This producer waits before aborting, so its head is out first.
+            panic!("{path}: head lost: {res:?}", res = res.err());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streamed_response_that_finishes_still_ends_cleanly() -> Result<()> {
+    let h = harness().await?;
+    let handler: HttpHandler = Arc::new(|_req: http::Request<RelayBody>| {
+        Box::pin(async move {
+            let (tx, body) = body_channel(2);
+            tokio::spawn(async move {
+                for i in 0..8u8 {
+                    tx.send(bytes::Bytes::from(vec![i; 4096])).await.ok();
+                }
+                tx.finish();
+            });
+            Ok(http::Response::builder()
+                .status(200)
+                .body(body.boxed_unsync())
+                .unwrap())
+        }) as BoxFut<Result<http::Response<ResponseBody>>>
+    });
+    expose_http_on_connection(&h.server_conn, "ok", allow_all(), handler);
+    let resp = timeout(
+        STEP_TIMEOUT,
+        relay_request(&h.client_conn, "ok", post("/", b"")),
+    )
+    .await??;
+    assert_eq!(resp.body().len(), 8 * 4096);
+    Ok(())
+}
+
+type Seen = std::result::Result<usize, String>;
+
+/// Reports what a handler read of its request body, or -- if the handler is
+/// dropped first (the consumer gave up and the relay cancelled it) -- that it
+/// never saw the body end. Either way, anything but `Ok`.
+struct Report(Option<tokio::sync::oneshot::Sender<Seen>>);
+
+impl Drop for Report {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(Err("handler dropped before the body ended".into()));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_aborted_mid_body_fails_the_handler_read() -> Result<()> {
+    let h = harness().await?;
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Seen>();
+    let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+    // The handler is running (the head is through) -- abort only after that,
+    // so the reset lands mid-body rather than before the request head.
+    let started = Arc::new(tokio::sync::Notify::new());
+    let started_h = started.clone();
+    let handler: HttpHandler = Arc::new(move |req: http::Request<RelayBody>| {
+        let (seen_tx, started) = (seen_tx.clone(), started_h.clone());
+        Box::pin(async move {
+            let mut report = Report(seen_tx.lock().unwrap().take());
+            started.notify_one();
+            let got = req
+                .into_body()
+                .collect()
+                .await
+                .map(|c| c.to_bytes().len())
+                .map_err(|e| e.to_string());
+            if let Some(tx) = report.0.take() {
+                let _ = tx.send(got);
+            }
+            Ok(http::Response::builder()
+                .status(200)
+                .body(
+                    http_body_util::Empty::new()
+                        .map_err(|e: std::convert::Infallible| -> RelayError { match e {} })
+                        .boxed_unsync(),
+                )
+                .unwrap())
+        }) as BoxFut<Result<http::Response<ResponseBody>>>
+    });
+    expose_http_on_connection(&h.server_conn, "up", allow_all(), handler);
+
+    let (tx, body) = body_channel(4);
+    let req = http::Request::builder()
+        .method("PUT")
+        .uri("/upload")
+        .body(body)
+        .unwrap();
+    let pump = tokio::spawn(async move {
+        tx.send(bytes::Bytes::from_static(b"partial")).await.ok();
+        started.notified().await;
+        tx.abort("upload source failed");
+    });
+    let res = timeout(
+        STEP_TIMEOUT,
+        relay_request_streaming(&h.client_conn, "up", req),
+    )
+    .await?;
+    assert!(res.is_err(), "an aborted upload must fail the request");
+    pump.await?;
+
+    let seen = timeout(STEP_TIMEOUT, seen_rx).await??;
+    assert!(
+        seen.is_err(),
+        "the handler read a truncated upload as complete: {seen:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_cancelled_by_the_consumer_fails_the_body_read() -> Result<()> {
+    let h = harness().await?;
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Seen>();
+    let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let started_h = started.clone();
+    // Answers at once and reads the upload on its own task, so the read
+    // outlives the exchange and only the stream's end tells it the outcome.
+    let handler: HttpHandler = Arc::new(move |req: http::Request<RelayBody>| {
+        let (seen_tx, started) = (seen_tx.clone(), started_h.clone());
+        Box::pin(async move {
+            let report = Report(seen_tx.lock().unwrap().take());
+            tokio::spawn(async move {
+                let mut report = report;
+                let got = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes().len())
+                    .map_err(|e| e.to_string());
+                if let Some(tx) = report.0.take() {
+                    let _ = tx.send(got);
+                }
+            });
+            started.notify_one();
+            Ok(http::Response::builder()
+                .status(200)
+                .body(
+                    http_body_util::Empty::new()
+                        .map_err(|e: std::convert::Infallible| -> RelayError { match e {} })
+                        .boxed_unsync(),
+                )
+                .unwrap())
+        }) as BoxFut<Result<http::Response<ResponseBody>>>
+    });
+    expose_http_on_connection(&h.server_conn, "up", allow_all(), handler);
+
+    let (tx, body) = body_channel(4);
+    let req = http::Request::builder()
+        .method("PUT")
+        .uri("/upload")
+        .body(body)
+        .unwrap();
+    tx.send(bytes::Bytes::from_static(b"partial")).await.ok();
+    // The upload never ends; the consumer gives up once the handler runs.
+    let call = relay_request_streaming(&h.client_conn, "up", req);
+    tokio::select! {
+        _ = call => panic!("an unfinished upload cannot complete"),
+        () = started.notified() => {}
+    }
+    drop(tx);
+
+    let seen = timeout(STEP_TIMEOUT, seen_rx).await??;
+    assert!(
+        seen.is_err(),
+        "a cancelled upload was read as complete: {seen:?}"
     );
     Ok(())
 }

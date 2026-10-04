@@ -18,6 +18,15 @@
 //!
 //! gRPC trailers are **V2** (design doc §9) — `[body…until finish]` carries no
 //! trailers frame.
+//!
+//! **Failure is a reset, never a finish.** Because the body is delimited only
+//! by the send side's finish, a producer that stops partway (its body yields an
+//! error, a [`BodySender::abort`](crate::body::BodySender::abort), a size cap)
+//! must not let the send half end normally: QUIC *finishes* a send stream that
+//! is merely dropped, and the peer would read a truncated body as complete.
+//! Both directions therefore reset the send side with
+//! [`RESET_CODE_BODY_ABORTED`] on any error, which the reading side's
+//! [`RelayBody`] surfaces as an `Err` frame instead of a clean end.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -77,6 +86,46 @@ impl AuthenticatedPeer {
 
 /// Bound on the request/response head (the body is unbounded — it streams).
 const MAX_HEAD: usize = 1 << 20; // 1 MiB
+
+/// QUIC application error code an http-relay stream is reset with when its
+/// exchange fails after the stream is open — most importantly when a body
+/// stops partway (the producer errored or aborted, or a size cap tripped), so
+/// the peer sees a failed body rather than a clean, truncated one. ("AX" 00 01;
+/// distinct from the core RPC `RESET_CODE_*` values, which are "AS" 00 xx.)
+pub const RESET_CODE_BODY_ABORTED: u32 = 0x41_58_00_01;
+
+/// Upper bound on waiting for a send half's lock before resetting it. The
+/// lock is free by the time the reset runs (every writer has returned); the
+/// bound only keeps a bug there from parking the stream task forever.
+const RESET_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Reset `send` with [`RESET_CODE_BODY_ABORTED`] after a failed exchange, so
+/// the peer reads an error instead of the implicit finish a dropped QUIC send
+/// half gets. A reset after the peer stopped or the connection closed fails
+/// harmlessly; that is ignored.
+async fn reset_failed(send: &CoreSendStream) {
+    match tokio::time::timeout(RESET_LOCK_WAIT, send.reset(RESET_CODE_BODY_ABORTED)).await {
+        Ok(_) => {}
+        Err(_) => tracing::warn!("http-relay: send half still locked; stream not reset"),
+    }
+}
+
+/// Resets an upload's send half if the request future is dropped before the
+/// upload completed (the caller timed out or cancelled), which would
+/// otherwise finish it and hand the server a truncated request body as
+/// complete. Disarmed once the request is fully sent or reset explicitly.
+struct ResetOnDrop(Option<CoreSendStream>);
+
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        let Some(send) = self.0.take() else { return };
+        // The IO halves drop with the same future, releasing the lock; the
+        // task holds the last clone, so nothing finishes the stream first.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { reset_failed(&send).await });
+        }
+    }
+}
 
 /// Flatten a relay/body error into `anyhow` (its `From` doesn't cover the boxed
 /// `dyn Error` directly, so go through `Display`).
@@ -158,6 +207,12 @@ where
 /// response head, pump the streaming response body back, then finish the send
 /// side. Generic over the byte transport so it is testable without a live
 /// Aster connection.
+///
+/// The send side is finished (`shutdown`) **only** on success. On `Err` — in
+/// particular a response body that fails partway — nothing more is written
+/// and the caller must reset the stream rather than finish or drop it (a
+/// dropped QUIC send half finishes), or the peer reads the truncated body as
+/// complete. [`ServiceAcceptor`] resets with [`RESET_CODE_BODY_ABORTED`].
 pub async fn serve_request<R, W>(
     read: R,
     write: W,
@@ -217,6 +272,12 @@ where
 /// **streaming** body ([`RelayBody`]). One Aster stream per request — no
 /// pooling. The edge uses this to pump the origin's response straight back to
 /// the browser.
+///
+/// If `request`'s body fails partway, or this future is dropped before the
+/// upload is sent, the request stream is reset, so the server's handler sees a
+/// failed request body rather than a truncated one. Likewise a response the
+/// server could not complete arrives as an `Err` from the returned body (or,
+/// if it failed before its head got out, from this call).
 pub async fn relay_request_streaming<B>(
     conn: &CoreConnection,
     service_id: &str,
@@ -230,12 +291,29 @@ where
     let (parts, body) = request.into_parts();
     let head = codec::encode_request_head(&parts)?;
 
+    let mut armed = ResetOnDrop(Some(send.clone()));
     let io = AsterStreamIo::new(recv, send);
     let (mut r, mut w) = tokio::io::split(io);
-    w.write_all(&(head.len() as u32).to_le_bytes()).await?;
-    w.write_all(&head).await?;
-    pump_body(body, &mut w).await?;
-    w.shutdown().await?; // half-close: signals request EOF to the server
+    let sent = async {
+        w.write_all(&(head.len() as u32).to_le_bytes()).await?;
+        w.write_all(&head).await?;
+        pump_body(body, &mut w).await?;
+        w.shutdown().await?; // half-close: signals request EOF to the server
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = sent {
+        // An upload that failed partway must reach the handler as a failed
+        // request body, not a truncated one: reset rather than let the
+        // dropped send half finish. Every write has returned, so `w` holds
+        // no lock on the send half.
+        drop((r, w));
+        if let Some(send) = armed.0.take() {
+            reset_failed(&send).await;
+        }
+        return Err(e);
+    }
+    armed.0 = None; // fully sent and finished
 
     let head = read_length_prefixed(&mut r, MAX_HEAD, "response head").await?;
     let parts = codec::decode_response_head(&head)?;
@@ -292,6 +370,9 @@ impl LocalTunnelAcceptor for ServiceAcceptor {
         recv: CoreRecvStream,
     ) -> BoxFut<()> {
         let handler = self.handler.clone();
+        // Kept outside the IO adapter so a failed exchange can reset the
+        // stream after `serve_request_until` has released its halves.
+        let reset_send = send.clone();
         // The transport-authenticated peer identity — derived here from the verified connection, the
         // only place it can come from, and handed to the handler as a request extension.
         let peer = AuthenticatedPeer::new(conn.remote_id());
@@ -312,6 +393,10 @@ impl LocalTunnelAcceptor for ServiceAcceptor {
             let (r, w) = tokio::io::split(io);
             if let Err(e) = serve_request_until(r, w, &handler, peer, peer_gone).await {
                 tracing::debug!("http-relay serve error: {e}");
+                // Reset, never finish: a response that failed mid-body must
+                // reach the consumer as a failed response, not a truncated
+                // one (the halves are dropped by now, so the lock is free).
+                reset_failed(&reset_send).await;
             }
         })
     }

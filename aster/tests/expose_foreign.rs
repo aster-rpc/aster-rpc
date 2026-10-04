@@ -398,6 +398,79 @@ async fn large_response_streams_through_body_writes() {
     n.shutdown().await;
 }
 
+/// A streamed response that stops partway -- `HttpBodies::abort`, or a write
+/// past `max_response_body` -- reaches the relay consumer as a failed
+/// response: the relay resets the stream instead of finishing it, so the
+/// consumer never takes the truncated body for a complete one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_stopped_mid_body_fails_over_the_relay() {
+    let (queue, ctx) = setup();
+    let _foreign = Foreign::start(
+        queue,
+        ctx.clone(),
+        true,
+        Arc::new(move |ctx, id, req| {
+            ctx.respond(id, 200, &[], HttpBodyMode::Stream);
+            let bodies = &ctx.bodies;
+            if bodies
+                .write_blocking(req.stream_id, vec![1; 600], WAIT)
+                .is_err()
+            {
+                return;
+            }
+            // Give the first chunk time to reach the consumer, so the failure
+            // lands mid-body rather than before the head.
+            std::thread::sleep(Duration::from_millis(50));
+            if req.uri.starts_with("/abort") {
+                let _ = bodies.abort(req.stream_id, "handler failed");
+            } else {
+                // Crosses `max_response_body`: the write fails with
+                // `TooLarge` and the body is aborted.
+                let _ = bodies.write_blocking(req.stream_id, vec![1; 600], WAIT);
+            }
+        }),
+    );
+    let c = ctx.clone();
+    let n = net(move |e| {
+        let options = ForeignHttpOptions {
+            max_response_body: Some(1000),
+            ..Default::default()
+        };
+        expose_foreign_http(e, &c.upcalls, &c.bodies, SVC, options);
+    })
+    .await;
+
+    for path in ["/abort", "/cap"] {
+        let res = tokio::time::timeout(WAIT, relay_request(&n.conn, SVC, get(path)))
+            .await
+            .unwrap();
+        assert!(
+            res.is_err(),
+            "{path}: truncated body accepted: {:?}",
+            res.map(|r| r.body().len())
+        );
+
+        let req = http::Request::builder()
+            .uri(path)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = tokio::time::timeout(WAIT, relay_request_streaming(&n.conn, SVC, req))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let collected = tokio::time::timeout(WAIT, resp.into_body().collect())
+            .await
+            .unwrap();
+        assert!(
+            collected.is_err(),
+            "{path}: streamed body ended cleanly instead of failing"
+        );
+    }
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn head_keeps_headers_and_drops_the_body() {
     let (queue, ctx) = setup();
