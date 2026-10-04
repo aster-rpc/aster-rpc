@@ -31,6 +31,7 @@ func cStructSizes() map[string]uintptr {
 		"aster_topology_admitted_stats_t": unsafe.Sizeof(C.aster_topology_admitted_stats_t{}),
 		"aster_http_foreign_options_t":    unsafe.Sizeof(C.aster_http_foreign_options_t{}),
 		"aster_route_spec_t":              unsafe.Sizeof(C.aster_route_spec_t{}),
+		"aster_http_relay_options_t":      unsafe.Sizeof(C.aster_http_relay_options_t{}),
 	}
 }
 
@@ -57,6 +58,21 @@ func httpForeignOptionsOffsets() map[string]uintptr {
 		"max_chunk":          unsafe.Offsetof(o.max_chunk), "response_buffer": unsafe.Offsetof(o.response_buffer),
 		"reserved": unsafe.Offsetof(o.reserved),
 	}
+}
+
+// relayOptionsOffsets are the aster_http_relay_options_t offsets.
+func relayOptionsOffsets() map[string]uintptr {
+	var o C.aster_http_relay_options_t
+	return map[string]uintptr{
+		"struct_size": unsafe.Offsetof(o.struct_size), "flags": unsafe.Offsetof(o.flags),
+		"max_chunk": unsafe.Offsetof(o.max_chunk), "upload_capacity": unsafe.Offsetof(o.upload_capacity),
+		"reserved": unsafe.Offsetof(o.reserved),
+	}
+}
+
+// bodyStatusToStatus is aster_http_body_status_to_status.
+func bodyStatusToStatus(code int32) int32 {
+	return int32(C.aster_http_body_status_to_status(C.int32_t(code)))
 }
 
 // routeSpecOffsets are the aster_route_spec_t offsets.
@@ -111,6 +127,19 @@ func abiEnums() map[string]int64 {
 		"HOOK_FAILURE_FAIL_OPEN":          C.ASTER_HOOK_FAILURE_FAIL_OPEN,
 		"HOOK_FAILURE_FAIL_CLOSED":        C.ASTER_HOOK_FAILURE_FAIL_CLOSED,
 		"UPCALL_DEFAULT_CAPACITY":         C.ASTER_UPCALL_DEFAULT_CAPACITY,
+		// ABI 4.3
+		"HTTP_BODY_UNKNOWN_SERVICE":   C.ASTER_HTTP_BODY_UNKNOWN_SERVICE,
+		"HTTP_BODY_DENIED":            C.ASTER_HTTP_BODY_DENIED,
+		"HTTP_BODY_OVERLOADED":        C.ASTER_HTTP_BODY_OVERLOADED,
+		"HTTP_BODY_RESET":             C.ASTER_HTTP_BODY_RESET,
+		"HTTP_BODY_BAD_HEAD":          C.ASTER_HTTP_BODY_BAD_HEAD,
+		"HTTP_BODY_CONNECTION_CLOSED": C.ASTER_HTTP_BODY_CONNECTION_CLOSED,
+		"HTTP_BODY_UPLOAD_FAILED":     C.ASTER_HTTP_BODY_UPLOAD_FAILED,
+		"HTTP_BODY_BUFFER_TOO_SMALL":  C.ASTER_HTTP_BODY_BUFFER_TOO_SMALL,
+		"EVENT_HTTP_RELAY_READY":      C.ASTER_EVENT_HTTP_RELAY_READY,
+		"STATUS_UNAUTHENTICATED":      C.ASTER_STATUS_UNAUTHENTICATED,
+		"STATUS_PERMISSION_DENIED":    C.ASTER_STATUS_PERMISSION_DENIED,
+		"STATUS_CREDENTIAL_EXPIRED":   C.ASTER_STATUS_CREDENTIAL_EXPIRED,
 	}
 }
 
