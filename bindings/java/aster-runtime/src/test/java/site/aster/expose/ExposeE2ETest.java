@@ -48,11 +48,11 @@ final class ExposeE2ETest {
   private static final String ALPN = "aster-expose/java-test";
   private static final long T = 30;
 
-  private static <V> V await(CompletableFuture<V> f) throws Exception {
+  static <V> V await(CompletableFuture<V> f) throws Exception {
     return f.get(T, TimeUnit.SECONDS);
   }
 
-  private static byte[] pattern(int n) {
+  static byte[] pattern(int n) {
     byte[] b = new byte[n];
     for (int i = 0; i < n; i++) {
       b[i] = (byte) (i % 251);
@@ -60,7 +60,7 @@ final class ExposeE2ETest {
     return b;
   }
 
-  private static void waitFor(String what, java.util.function.BooleanSupplier cond)
+  static void waitFor(String what, java.util.function.BooleanSupplier cond)
       throws InterruptedException {
     long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(T);
     while (!cond.getAsBoolean()) {
@@ -71,14 +71,14 @@ final class ExposeE2ETest {
     }
   }
 
-  private static IrohNode startNode() throws Exception {
+  static IrohNode startNode() throws Exception {
     AsterConfig cfg = AsterConfig.builder().relayMode("disabled").bindAddr("127.0.0.1:0").build();
     return IrohNode.start(cfg, List.of(ALPN.getBytes(StandardCharsets.UTF_8)), null)
         .get(T, TimeUnit.SECONDS);
   }
 
   /** Two nodes: {@code server} exposes (accept loop owned by expose), {@code client} consumes. */
-  private static final class Rig implements AutoCloseable {
+  static final class Rig implements AutoCloseable {
     final IrohNode server;
     final IrohNode client;
     final Expose expose;
