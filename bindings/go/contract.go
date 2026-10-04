@@ -229,17 +229,22 @@ func (r *typeResolver) field(sf reflect.StructField) (fieldJSON, error) {
 		t = t.Elem()
 		optional = true
 	}
+	tag, err := parseAsterTag(sf)
+	if err != nil {
+		return fieldJSON{}, err
+	}
 	// Fory Go writes a []byte struct field as list<uint8> unless it is
 	// tagged `fory:"type=bytes"` (binary, what every other binding means by
 	// bytes). Make the choice explicit so the contract matches the wire.
 	if isBytes(t) {
 		switch {
 		case foryTypeHint(sf) == "bytes":
-		case sf.Tag.Get("aster") == "uint8_list":
-			return fieldJSON{
+		case tag.uint8List:
+			f := fieldJSON{
 				Name: forygo.SnakeCase(sf.Name), TypeKind: "primitive", TypePrimitive: "uint8",
 				Optional: optional, Container: "list", ContainerKeyKind: "primitive", Required: true,
-			}, nil
+			}
+			return f, tag.applyDefault(&f)
 		default:
 			return fieldJSON{}, fmt.Errorf("[]byte field needs `fory:\"type=bytes\"` (binary, as in the other bindings) " +
 				"or `aster:\"uint8_list\"` with no fory type hint (list<uint8>)")
@@ -280,7 +285,7 @@ func (r *typeResolver) field(sf reflect.StructField) (fieldJSON, error) {
 		}
 		f.ContainerKeyKind, f.ContainerKeyPrimitive, f.ContainerKeyRef = kk, kp, kr
 	}
-	return f, nil
+	return f, tag.applyDefault(&f)
 }
 
 func isBytes(t reflect.Type) bool {
