@@ -48,3 +48,8 @@ pub fn start_reactor_on(
 /// call events, the shared call table, and the ring sink.
 #[cfg(feature = "rpc")]
 pub mod dispatch;
+
+/// Upcalls: Rust asking binding code (foreign `LeaseSerializer`,
+/// `FencedResource`, lease authorizer, topology `admitted` filter, placement
+/// providers, expose authorize, Gate 0) through one event + respond channel.
+pub mod upcall;
