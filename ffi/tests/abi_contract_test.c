@@ -363,7 +363,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 4); /* 4.2: expose; 4.3: streaming relay; 4.4: coordination */
+    CHECK(ASTER_ABI_VERSION_MINOR == 5); /* 4.2: expose; 4.3: streaming relay; 4.4: coordination; 4.5: unary cancel tokens */
     CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
@@ -1181,8 +1181,22 @@ static void test_coordination(void) {
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
+/* ABI 4.5: cancel tokens for aster_rpc_unary_cancellable (no runtime needed). */
+static void test_cancel_tokens(void) {
+    printf("[cancel tokens]\n");
+    aster_cancel_token_t t = 0;
+    CHECK(aster_cancel_token_new(0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_cancel_token_new(0, &t) == ASTER_STATUS_OK && t != 0);
+    CHECK(aster_cancel_token_cancel(0, t) == ASTER_STATUS_OK);
+    CHECK(aster_cancel_token_cancel(0, t) == ASTER_STATUS_OK); /* idempotent */
+    CHECK(aster_cancel_token_release(0, t) == ASTER_STATUS_OK);
+    CHECK(aster_cancel_token_release(0, t) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_cancel_token_cancel(0, t) == ASTER_STATUS_NOT_FOUND);
+}
+
 int main(void) {
     test_abi_version();
+    test_cancel_tokens();
     test_enum_values();
     test_runtime();
     test_envelope();

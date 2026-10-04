@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.4)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.5)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -24,6 +24,109 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 4.5 (additive)
+
+ABI 4.5.0 makes unary calls cancellable **on the pooled fast path**, so a
+binding can cancel every unary call by default at no cost. Before 4.5,
+`aster_rpc_unary` had no handle to cancel: Go and .NET ran a unary call with a
+cancellable context/token through `aster_rpc_open` (a dedicated stream per
+call) and Java made that opt-in (`CallOptions.cancellable`) because it was
+slower. Nothing in 4.4 changed shape. Source: `ffi/src/rpc.rs`. Tests:
+`ffi/tests/dispatch_server.rs` (`unary_cancel_token_*`),
+`ffi/tests/abi_contract_test.c` (`test_cancel_tokens`). Benchmark:
+`benchmarks/dispatch/ffi_unary_bench.rs` (example `ffi_unary_bench`).
+
+| Function | Notes |
+|---|---|
+| `aster_cancel_token_new(rt, *out_token)` | A token (`aster_cancel_token_t`, `u64`, never reused) for **one** call. Never blocks; `runtime` is not consulted. |
+| `aster_rpc_unary_cancellable(rt, conn, opts*, token, req, len, ...)` | `aster_rpc_unary` plus `token` (0 = exactly `aster_rpc_unary`). Same pooled single-write path, same out-parameters and results. Consumes the token on every return path (argument errors too) except when it refuses the token: unknown, or already taken by another call, is `INVALID_ARGUMENT` and leaves it as it was. |
+| `aster_cancel_token_cancel(rt, token)` | Any thread, never blocks, idempotent. Before the call starts: the call returns `CANCELLED` without sending. In flight: the call is abandoned like a dropped Rust future and returns `OK` with `status_code` `CANCELLED` ("call cancelled"). `OK` while the token is live; `NOT_FOUND` once the call has returned (nothing left to cancel). |
+| `aster_cancel_token_release(rt, token)` | Frees a token that was never passed to a call. `NOT_FOUND` if gone. |
+
+**Design.** The call `block_on`s `select!{ biased; token.cancelled() => CANCELLED, unary_with(..) => outcome }`
+on the runtime. Losing the race drops the `unary_with` future *inside* the
+runtime, so `PooledCall`'s drop does what it does for a dropped Rust future:
+it discards the pooled stream and, from a spawned task, writes `FLAG_CANCEL`
+(skipped if the request write was cut off part-way) then resets the send side
+and stops the receive side. The server's reactor turns that into
+`Cancelled{Peer}` for the handler (foreign handlers: an
+`ASTER_DISPATCH_EVENT_CANCELLED` with reason `PEER`). The pool opens a fresh
+stream for the next call; the connection is untouched. A call still waiting
+for a pooled stream (all 8 SHARED streams busy) is dropped from the acquire
+queue the same way. There is no completion event: as for `aster_rpc_unary`,
+the outcome is the out-parameters, so "exactly one outcome" is structural.
+
+**Races.** *Cancel before start:* the token's flag is set first, so a cancel
+that lands before (or while) the call takes the token sticks; the call checks
+the flag before touching the wire. *Cancel vs. completion:* the `select!` polls
+the cancel first; whichever is observed first wins, the other is dropped, and
+the caller gets exactly one outcome (the response or `CANCELLED`). *Lost
+wakeup:* the waiter registers on the `Notify` before reading the flag, and
+`cancel` sets the flag before `notify_waiters`. *Cancel after return:* the call
+removes its token from the table when it returns, so a late cancel finds
+nothing (`NOT_FOUND`); ids come from the shared handle counter and are never
+reused, so a late cancel can never hit another call. *Use-after-free:* the
+table holds `Arc`s and the call holds its own clone; nothing points into
+caller memory after the call returns. *Token reuse:* a `taken` flag gives a
+token to one call; a second concurrent call with it is refused without
+freeing it under the first.
+
+**Cost.** One extra crossing (`aster_cancel_token_new`, an insert into one of
+64 mutex-sharded maps) plus a lookup and a remove in the call, and a `Notify`
+in the `select!`. Measured within noise of `aster_rpc_unary` (below).
+
+**Measurements** (2026-10-04, M3 Max, loopback, release; machine shared with
+other work, load average 15-20; median of 3 interleaved runs of 5 s,
+closed-loop, one connection; SHARED pool = 8 streams):
+
+| client | path | c=1 rps | c=16 rps | c=100 rps |
+|---|---|---:|---:|---:|
+| C ABI (`ffi_unary_bench`, in-process Rust server) | `aster_rpc_unary` | 17,620 | 33,813 | 33,872 |
+| | `aster_rpc_unary_cancellable` (token) | 17,877 | 33,809 | 33,773 |
+| | `aster_rpc_open` + send + recv (pre-4.5 Go/.NET) | 13,192 | 22,739 | 26,556 |
+| | `open-poll` (200 ms recv slices, pre-4.5 Java) | 13,211 | 22,596 | 26,061 |
+| | Rust `RpcConnection::unary_with` (no C ABI) | 17,583 | 34,028 | 33,901 |
+| | Rust `server_stream_with` + read (no C ABI) | 13,085 | 23,810 | 26,831 |
+
+**Where the old gap came from:** the dedicated stream per call, not the C ABI.
+The Rust-native stream-per-call row (`server_stream_with`) is as slow as the
+C ABI `open` path, and the C ABI fast path is as fast as Rust's own
+`unary_with`. So a fresh QUIC bi-stream per call costs 25-33% of throughput
+(and 2.6x the p99 at c=100); the extra crossings, handle registry, boxed reads
+and 200 ms polling of the open path cost at most ~2%. (Which part of the
+per-stream work dominates -- stream open, server accept, per-stream state --
+was not profiled.) Java's earlier "several times slower" was an ad-hoc
+measurement on a loaded machine; measured properly it was 18-34% (below).
+
+Java (`tests/interop/java/InteropEcho.java bench` against the Rust
+`interop_echo` server, fresh server per run, the three variants interleaved;
+"before" = the `bindings-catchup` Java classes, "after" = this change; same
+library):
+
+| Java client | c=1 rps / p99 ms | c=16 rps / p99 ms | c=100 rps / p99 ms |
+|---|---:|---:|---:|
+| before: default (`aster_rpc_unary`, not cancellable) | 14,022 / 0.115 | 31,798 / 0.800 | 31,759 / 3.556 |
+| before: `CallOptions.cancellable(true)` (`aster_rpc_open`) | 10,676 / 0.140 | 20,882 / 1.514 | 26,088 / 7.113 |
+| after: default (cancel token, always cancellable) | 14,236 / 0.112 | 31,729 / 0.795 | 31,743 / 3.557 |
+
+Go (`bindings/go/rpc_unary_bench_test.go`, `ASTER_GO_UNARY_BENCH=1`; Go
+server and client in one process, one cancellable ctx per worker; median of 3):
+
+| Go client | c=1 rps / p99 ms | c=16 rps / p99 ms | c=100 rps / p99 ms |
+|---|---:|---:|---:|
+| `context.Background()` (`aster_rpc_unary`) | 10,869 / 0.173 | 27,719 / 1.174 | 18,905 / 4.898 (*) |
+| cancellable ctx, after (cancel token) | 10,987 / 0.167 | 27,301 / 1.194 | 28,666 / 4.597 |
+| cancellable ctx, before (`aster_rpc_open`) | 8,991 / 0.190 | 19,525 / 1.810 | 25,090 / 9.521 |
+
+(*) Two of the three `Background` runs at c=100 hit a ~1.7 s stall (seen on
+both pooled modes in other runs, never on `aster_rpc_open`, never in the
+Rust-server benchmarks; pre-existing, not investigated). The Go-side cost
+that remains is `context.AfterFunc` (how any cancellable ctx is hooked, as
+the old open path did too): 0-6% at c=16 across runs on this loaded machine,
+5-9% with all workers on ONE shared ctx (its mutex); A/B runs with the
+AfterFunc removed put the token itself at zero, and with `GOGC=off` the gap
+vanished, so it is GC-sensitive Go overhead, not ABI cost.
 
 ## New in 4.4 (additive)
 

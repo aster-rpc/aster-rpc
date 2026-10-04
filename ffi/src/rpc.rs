@@ -207,6 +207,42 @@ pub unsafe extern "C" fn aster_rpc_unary(
     out_status_len: *mut u32,
     out_status_buffer: *mut aster_buffer_t,
 ) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        unary_impl(
+            runtime,
+            connection,
+            options,
+            None,
+            request,
+            request_len,
+            out_resp_ptr,
+            out_resp_len,
+            out_resp_buffer,
+            out_status_code,
+            out_status_ptr,
+            out_status_len,
+            out_status_buffer,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn unary_impl(
+    runtime: aster_runtime_t,
+    connection: aster_connection_t,
+    options: *const aster_call_options_t,
+    cancel: Option<Arc<CancelToken>>,
+    request: *const u8,
+    request_len: u32,
+    out_resp_ptr: *mut *const u8,
+    out_resp_len: *mut u32,
+    out_resp_buffer: *mut aster_buffer_t,
+    out_status_code: *mut i32,
+    out_status_ptr: *mut *const u8,
+    out_status_len: *mut u32,
+    out_status_buffer: *mut aster_buffer_t,
+) -> i32 {
     if out_resp_ptr.is_null()
         || out_resp_len.is_null()
         || out_resp_buffer.is_null()
@@ -235,9 +271,24 @@ pub unsafe extern "C" fn aster_rpc_unary(
         unsafe { std::slice::from_raw_parts(request, request_len as usize).to_vec() }
     };
     let rpc = RpcConnection::from_core_connection((*conn).clone());
-    let result = bridge
-        .runtime
-        .block_on(async move { rpc.unary_with(&header, request, &opts).await });
+    let result = match cancel {
+        None => bridge
+            .runtime
+            .block_on(async move { rpc.unary_with(&header, request, &opts).await }),
+        // Cancelled before it started: nothing goes on the wire.
+        Some(t) if t.is_cancelled() => Err(cancelled_error()),
+        Some(t) => bridge.runtime.block_on(async move {
+            // Cancel wins a tie. Losing drops the call's future here, inside
+            // the runtime, so `PooledCall`'s drop discards the pooled stream
+            // and writes FLAG_CANCEL + reset from a task: exactly what
+            // dropping the future does in Rust.
+            tokio::select! {
+                biased;
+                () = t.cancelled() => Err(cancelled_error()),
+                r = rpc.unary_with(&header, request, &opts) => r,
+            }
+        }),
+    };
     // SAFETY: out pointers checked above.
     unsafe {
         match result {
@@ -265,6 +316,229 @@ pub unsafe extern "C" fn aster_rpc_unary(
         }
     }
     aster_status_t::ASTER_STATUS_OK as i32
+}
+
+fn cancelled_error() -> aster::Error {
+    aster::Error::rpc(StatusCode::Cancelled, "call cancelled")
+}
+
+// ============================================================================
+// Cancellable unary (ABI 4.5)
+// ============================================================================
+
+/// A cancel token for one `aster_rpc_unary_cancellable` call (ABI 4.5).
+/// Opaque, never reused; 0 = none.
+pub type aster_cancel_token_t = u64;
+
+/// One call's cancel signal. `cancel` may run before, during or after the
+/// call; the flag makes a cancel that lands before the call starts stick.
+pub(crate) struct CancelToken {
+    cancelled: AtomicBool,
+    /// Set by the call that took the token (a token serves one call).
+    taken: AtomicBool,
+    notify: Notify,
+}
+
+impl CancelToken {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            taken: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Resolves once cancelled (at once if it already was). The waiter is
+    /// registered before the flag is read, so a concurrent `cancel` (flag,
+    /// then `notify_waiters`) is never missed.
+    async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+type TokenShard = Mutex<std::collections::HashMap<u64, Arc<CancelToken>>>;
+
+/// Live tokens, sharded so concurrent calls rarely meet on a lock: a call
+/// costs one insert (`aster_cancel_token_new`), one lookup and one remove,
+/// each on its own shard's mutex.
+struct TokenTable {
+    shards: Box<[TokenShard]>,
+}
+
+const TOKEN_SHARDS: usize = 64;
+
+impl TokenTable {
+    fn new() -> Self {
+        Self {
+            shards: (0..TOKEN_SHARDS).map(|_| Mutex::default()).collect(),
+        }
+    }
+
+    fn shard(&self, id: u64) -> &TokenShard {
+        &self.shards[(id as usize) % TOKEN_SHARDS]
+    }
+
+    fn insert(&self) -> u64 {
+        let id = crate::next_handle_id();
+        self.shard(id)
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(CancelToken::new()));
+        id
+    }
+
+    fn get(&self, id: u64) -> Option<Arc<CancelToken>> {
+        self.shard(id).lock().unwrap().get(&id).cloned()
+    }
+
+    fn remove(&self, id: u64) -> Option<Arc<CancelToken>> {
+        self.shard(id).lock().unwrap().remove(&id)
+    }
+}
+
+static CANCEL_TOKENS: once_cell::sync::Lazy<TokenTable> =
+    once_cell::sync::Lazy::new(TokenTable::new);
+
+/// A new cancel token for one `aster_rpc_unary_cancellable` call. The call
+/// consumes it (whatever its outcome); a token never passed to a call is
+/// freed with `aster_cancel_token_release`. Never blocks.
+#[no_mangle]
+pub unsafe extern "C" fn aster_cancel_token_new(
+    runtime: aster_runtime_t,
+    out_token: *mut aster_cancel_token_t,
+) -> i32 {
+    let _ = runtime;
+    if out_token.is_null() {
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
+    }
+    // SAFETY: checked non-null.
+    unsafe { ptr::write(out_token, CANCEL_TOKENS.insert()) };
+    aster_status_t::ASTER_STATUS_OK as i32
+}
+
+/// Cancel the call `token` was (or will be) passed to. From any thread,
+/// never blocks, idempotent.
+///
+/// - Before the call starts: the call returns `CANCELLED` without sending.
+/// - While it runs: the call is abandoned like a dropped Rust future -- its
+///   pooled stream is discarded and cancelled (`FLAG_CANCEL`, then a stream
+///   reset), so the server sees the cancel; the connection and its pool stay
+///   usable. The blocked `aster_rpc_unary_cancellable` returns `OK` with
+///   `*out_status_code` = `CANCELLED` (or with the call's own outcome if
+///   that came first: exactly one outcome either way).
+///
+/// `OK` while the token is live; `NOT_FOUND` once its call has returned (or
+/// for a released / unknown token): nothing is left to cancel.
+#[no_mangle]
+pub extern "C" fn aster_cancel_token_cancel(
+    runtime: aster_runtime_t,
+    token: aster_cancel_token_t,
+) -> i32 {
+    let _ = runtime;
+    match CANCEL_TOKENS.get(token) {
+        Some(t) => {
+            t.cancel();
+            aster_status_t::ASTER_STATUS_OK as i32
+        }
+        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
+    }
+}
+
+/// Free a token that was never passed to `aster_rpc_unary_cancellable`
+/// (the call frees its own). `NOT_FOUND` if it is already gone.
+#[no_mangle]
+pub extern "C" fn aster_cancel_token_release(
+    runtime: aster_runtime_t,
+    token: aster_cancel_token_t,
+) -> i32 {
+    let _ = runtime;
+    match CANCEL_TOKENS.remove(token) {
+        Some(_) => aster_status_t::ASTER_STATUS_OK as i32,
+        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
+    }
+}
+
+/// Frees the token when the call returns, on every path.
+struct TokenGuard(aster_cancel_token_t);
+
+impl Drop for TokenGuard {
+    fn drop(&mut self) {
+        CANCEL_TOKENS.remove(self.0);
+    }
+}
+
+/// `aster_rpc_unary` that `aster_cancel_token_cancel(token)` can abort (ABI
+/// 4.5). Same pooled single-write path and results; `token` 0 makes it
+/// exactly `aster_rpc_unary`.
+///
+/// The call consumes `token` on every return path (argument errors too),
+/// except when it refuses the token itself: a token already taken by another
+/// call, or unknown, is `INVALID_ARGUMENT` and stays as it was.
+/// A cancelled call returns `OK` with `*out_status_code` = `CANCELLED` and
+/// the AEv1 status "call cancelled". No completion event is involved: the
+/// outcome is in the out-parameters, as for `aster_rpc_unary`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn aster_rpc_unary_cancellable(
+    runtime: aster_runtime_t,
+    connection: aster_connection_t,
+    options: *const aster_call_options_t,
+    token: aster_cancel_token_t,
+    request: *const u8,
+    request_len: u32,
+    out_resp_ptr: *mut *const u8,
+    out_resp_len: *mut u32,
+    out_resp_buffer: *mut aster_buffer_t,
+    out_status_code: *mut i32,
+    out_status_ptr: *mut *const u8,
+    out_status_len: *mut u32,
+    out_status_buffer: *mut aster_buffer_t,
+) -> i32 {
+    // The guard is armed only once this call owns the token: a call refused
+    // for reusing a token must not free it under the call that owns it.
+    let (cancel, _guard) = if token == 0 {
+        (None, None)
+    } else {
+        match CANCEL_TOKENS.get(token) {
+            Some(t) if !t.taken.swap(true, Ordering::AcqRel) => (Some(t), Some(TokenGuard(token))),
+            Some(_) => return invalid("cancel token already taken by another call"),
+            None => return invalid("unknown cancel token"),
+        }
+    };
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        unary_impl(
+            runtime,
+            connection,
+            options,
+            cancel,
+            request,
+            request_len,
+            out_resp_ptr,
+            out_resp_len,
+            out_resp_buffer,
+            out_status_code,
+            out_status_ptr,
+            out_status_len,
+            out_status_buffer,
+        )
+    }
 }
 
 /// A fresh session id from `connection`'s counter (shared with every client

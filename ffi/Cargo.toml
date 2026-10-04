@@ -50,3 +50,9 @@ required-features = ["coordination-fixture"]
 [[bench]]
 name = "ffi_benchmarks"
 harness = false
+
+# C ABI unary benchmark (fast path vs cancellable vs dedicated stream); see
+# the file header. `cargo run --release -p aster_transport_ffi --example ffi_unary_bench`.
+[[example]]
+name = "ffi_unary_bench"
+path = "../benchmarks/dispatch/ffi_unary_bench.rs"
