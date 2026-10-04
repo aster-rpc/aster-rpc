@@ -52,60 +52,23 @@ fn invalid(msg: impl std::fmt::Display) -> Error {
 
 fn closed() -> Error {
     tagged(
-        "closed",
+        cc::CoordinationErrorKind::Closed.as_str(),
         Status::GenericFailure,
         "the coordination client is closed",
     )
 }
 
-/// Map an `aster` error onto the tagged form. The journal-state refusals are
-/// `InvalidArgument` in Rust; their (stable, contract-worded) messages are
-/// what distinguishes them.
+/// Map an `aster` error onto the tagged form by its structured
+/// [`cc::CoordinationErrorKind`] — never by its message, which passes
+/// through unchanged.
 fn coord_err(e: aster::Error) -> Error {
-    match e {
-        aster::Error::InvalidArgument(msg) => {
-            // The lease adapter flattens inner errors into its own
-            // `InvalidArgument`; recover an embedded RPC status.
-            if let Some(code) = embedded_rpc_code(&msg) {
-                return tagged(
-                    &format!("rpc:{code}"),
-                    Status::GenericFailure,
-                    format!("invalid argument: {msg}"),
-                );
-            }
-            let kind = if msg.contains("awaits acknowledgement") {
-                "awaiting_ack"
-            } else if msg.contains("unresolved on this journal") {
-                "unresolved"
-            } else if msg.contains("journal is fatal") {
-                "journal_fatal"
-            } else if msg.contains("lifetime lock") {
-                "journal_locked"
-            } else {
-                "invalid"
-            };
-            let status = if kind == "invalid" {
-                Status::InvalidArg
-            } else {
-                Status::GenericFailure
-            };
-            tagged(kind, status, format!("invalid argument: {msg}"))
+    match cc::CoordinationErrorKind::of(&e) {
+        cc::CoordinationErrorKind::Rpc { code } => {
+            tagged(&format!("rpc:{code}"), Status::GenericFailure, e)
         }
-        aster::Error::Rpc { code, message, .. } => tagged(
-            &format!("rpc:{code}"),
-            Status::GenericFailure,
-            format!("rpc error [{code}]: {message}"),
-        ),
-        aster::Error::Transport(err) => tagged("unavailable", Status::GenericFailure, err),
-        other => tagged("other", Status::GenericFailure, other),
+        cc::CoordinationErrorKind::Invalid => tagged("invalid", Status::InvalidArg, e),
+        kind => tagged(kind.as_str(), Status::GenericFailure, e),
     }
-}
-
-/// `… rpc error [7]: …` → `7` (the `aster::Error::Rpc` display form).
-fn embedded_rpc_code(msg: &str) -> Option<i32> {
-    let start = msg.find("rpc error [")? + "rpc error [".len();
-    let end = start + msg[start..].find(']')?;
-    msg[start..end].parse().ok()
 }
 
 // ── Scalar conversions ───────────────────────────────────────────────────────

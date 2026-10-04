@@ -24,9 +24,18 @@
 //! **server effect** and durable result **redelivery**; exactly-once
 //! application-side processing additionally requires the application to make
 //! its durable handling and its acknowledgement atomic, which only it can do.
+//!
+//! ## Errors
+//!
+//! Classify a failure with [`CoordinationErrorKind::of`] — awaiting-ack,
+//! unresolved, journal locked/fatal, `Rpc { code }`, unavailable, invalid —
+//! rather than by its message. The journal-state refusals are
+//! [`Error::Coordination`](crate::Error::Coordination); their messages are
+//! unchanged from when they were `InvalidArgument`.
 
 mod driver;
 pub(crate) mod engine;
+mod error;
 pub(crate) mod inbound;
 /// Crate-private on purpose (the third review's capability note): the only
 /// paths that may persist into a journal are the driver — which checks the
@@ -65,8 +74,11 @@ use crate::error::{Error, Result};
 use crate::node::Node;
 use crate::ticket::{Credential, Ticket};
 
+pub use error::{CoordinationError, CoordinationErrorKind};
+
 use driver::{drive, Delivery};
 use engine::{CallFailure, CallOutcome, Engine, SharedEngine};
+use error::refusal;
 use journal::{AckToken, Journal, JournalState};
 
 fn client_error(what: impl Into<String>) -> Error {
@@ -159,6 +171,7 @@ impl CoordinationClientBuilder {
         Ok(CoordinationClient {
             engine,
             journal: Arc::new(Mutex::new(journal)),
+            self_acknowledging: false,
         })
     }
 
@@ -179,6 +192,11 @@ impl CoordinationClientBuilder {
 pub struct CoordinationClient {
     engine: SharedEngine,
     journal: Arc<Mutex<Journal>>,
+    /// The lease path's view of the client (see [`lease`]): each mutation is
+    /// acknowledged under the same journal hold that resolved it, so no
+    /// cancellation point lies between resolution and acknowledgement. Only
+    /// [`self_acknowledging`](Self::self_acknowledging) sets it.
+    self_acknowledging: bool,
 }
 
 /// The read-only client (§3.4).
@@ -203,6 +221,10 @@ pub struct ResolvedMutation {
     /// a stale handle cannot acknowledge a later result (the journal refuses
     /// any token but the current entry's).
     token: AckToken,
+    /// Already acknowledged under the journal hold that resolved it (the
+    /// self-acknowledging lease path); [`acknowledge`](Self::acknowledge)
+    /// is then a no-op.
+    settled: bool,
 }
 
 impl std::fmt::Debug for ResolvedMutation {
@@ -221,17 +243,47 @@ impl ResolvedMutation {
         &self.reply
     }
 
+    /// The reply of a result the self-acknowledging lease path already
+    /// acknowledged.
+    pub(crate) fn into_settled_reply(self) -> MutationReplyWireV1 {
+        debug_assert!(self.settled, "only the lease path's results are settled");
+        self.reply
+    }
+
     /// Acknowledge: the application has durably handled this result. Frees
     /// the journal for the next sequence — by an ordinary acknowledgement, or
     /// by the §10 rotation when the closing corridor resolved it.
     pub async fn acknowledge(self) -> Result<()> {
-        let mut journal = self.client.journal.lock().await;
-        if self.via_retirement {
-            journal.rotate(&self.token, random_id16()?)
-        } else {
-            journal.acknowledge(&self.token)
+        if self.settled {
+            return Ok(());
         }
+        let mut journal = self.client.journal.lock().await;
+        settle(&mut journal, &self.token, self.via_retirement)
     }
+}
+
+/// Acknowledge the entry `token` names: an ordinary acknowledgement, or the
+/// §10 rotation when the closing corridor resolved it.
+fn settle(journal: &mut Journal, token: &AckToken, via_retirement: bool) -> Result<()> {
+    if via_retirement {
+        journal.rotate(token, random_id16()?)
+    } else {
+        journal.acknowledge(token)
+    }
+}
+
+/// Acknowledge a lease transition whose result was fsynced but whose caller
+/// never acknowledged it. Synchronous: no network, so it is safe on a read
+/// path like [`CoordinationClient::unacknowledged`].
+fn settle_resolved_self_acknowledging(journal: &mut Journal) -> Result<()> {
+    if !journal.current_is_self_acknowledging() {
+        return Ok(());
+    }
+    let Some((_, token)) = journal.unacknowledged() else {
+        return Ok(());
+    };
+    let via_retirement = journal.record().retirement_confirmed;
+    settle(journal, &token, via_retirement)
 }
 
 impl CoordinationClient {
@@ -250,7 +302,10 @@ impl CoordinationClient {
     /// any. Call on startup, before any mutation: the §S4-D contract refuses
     /// new sequences until it is taken and acknowledged.
     pub async fn unacknowledged(&self) -> Result<Option<ResolvedMutation>> {
-        let journal = self.journal.lock().await;
+        let mut journal = self.journal.lock().await;
+        // A lease transition's result is the lease path's to acknowledge,
+        // not the application's.
+        settle_resolved_self_acknowledging(&mut journal)?;
         let Some((bytes, token)) = journal.unacknowledged() else {
             return Ok(None);
         };
@@ -265,6 +320,7 @@ impl CoordinationClient {
             reply,
             via_retirement,
             token,
+            settled: false,
         }))
     }
 
@@ -307,13 +363,17 @@ impl CoordinationClient {
     /// like any other.
     pub async fn resume(&self) -> Result<Option<ResolvedMutation>> {
         let mut journal = self.journal.lock().await;
+        // An interrupted lease transition is finished and acknowledged on the
+        // lease path's behalf; it is never handed to the application.
+        self.settle_self_acknowledging(&mut journal).await?;
         match journal.state() {
             JournalState::Ready => Ok(None),
             JournalState::ResolvedAwaitingAck => {
                 drop(journal);
                 self.unacknowledged().await
             }
-            JournalState::FatalJournal => Err(client_error(
+            JournalState::FatalJournal => Err(refusal(
+                CoordinationErrorKind::JournalFatal,
                 "the journal is fatal (§10 reason 18); no further mutation is possible",
             )),
             JournalState::Pending | JournalState::Closing | JournalState::ReplayAfterRetire => {
@@ -330,18 +390,82 @@ impl CoordinationClient {
             reply: delivery.reply,
             via_retirement: delivery.via_retirement,
             token: delivery.token,
+            settled: false,
+        }
+    }
+
+    /// This client as the lease path uses it: every mutation is acknowledged
+    /// under the same journal hold that resolved it (see [`lease`]).
+    pub(crate) fn self_acknowledging(&self) -> Self {
+        Self {
+            self_acknowledging: true,
+            ..self.clone()
+        }
+    }
+
+    /// Finish an entry a self-acknowledging caller began and was cancelled
+    /// out of — the lease renew loop is stopped by aborting its task, which
+    /// can land mid-drive — and acknowledge it on that caller's behalf.
+    ///
+    /// The entry is driven exactly as `resume()` would drive it (same bytes,
+    /// same §10 corridor), so its server effect is unchanged; only the
+    /// acknowledgement the cancelled caller would have given is supplied. A
+    /// drive that fails leaves the entry as it was, and the error surfaces to
+    /// this caller.
+    async fn settle_self_acknowledging(&self, journal: &mut Journal) -> Result<()> {
+        if !journal.current_is_self_acknowledging() {
+            return Ok(());
+        }
+        match journal.state() {
+            JournalState::Ready | JournalState::FatalJournal => Ok(()),
+            JournalState::ResolvedAwaitingAck => settle_resolved_self_acknowledging(journal),
+            JournalState::Pending | JournalState::Closing | JournalState::ReplayAfterRetire => {
+                let delivery = drive(&self.engine, journal).await?;
+                settle(journal, &delivery.token, delivery.via_retirement)
+            }
         }
     }
 
     /// The shared mutation path: journal, then drive (§10).
-    async fn mutate(
+    ///
+    /// One journal hold covers the whole step: settling an interrupted lease
+    /// transition, minting the request under the journal's client id and next
+    /// sequence, journaling it, driving it — and, on the self-acknowledging
+    /// lease path, acknowledging it. There is no await between resolution and
+    /// that acknowledgement, so cancelling a lease transition can strand its
+    /// entry only `Pending`, which the next caller settles.
+    async fn sequenced<F>(
         &self,
         method: &'static str,
-        action: &ActionV1,
-        request: Vec<u8>,
-    ) -> Result<ResolvedMutation> {
-        let request_hash = hash::request_hash(action)
+        action: ActionV1,
+        build: F,
+    ) -> Result<ResolvedMutation>
+    where
+        F: FnOnce(Vec<u8>, Vec<u8>, u64) -> Result<Vec<u8>>,
+    {
+        let request_hash = hash::request_hash(&action)
             .map_err(|_| client_error("the action has no canonical hash"))?;
+        let mut journal = self.journal.lock().await;
+        // An interrupted lease transition that cannot be settled now (its
+        // drive was denied, or nobody answered) blocks this mutation exactly
+        // as any unresolved entry does: the refusal is `Unresolved`, with the
+        // settling failure as its source — never this mutation's own error.
+        if let Err(err) = self.settle_self_acknowledging(&mut journal).await {
+            if CoordinationErrorKind::of(&err) == CoordinationErrorKind::JournalFatal {
+                return Err(err);
+            }
+            return Err(Error::Coordination(CoordinationError::with_source(
+                CoordinationErrorKind::Unresolved,
+                "invalid argument: coordination client: another request is unresolved on \
+                 this journal; resume() first",
+                err,
+            )));
+        }
+        let request = build(
+            self.engine.group.as_bytes().to_vec(),
+            journal.record().client_id.clone(),
+            journal.sequence() + 1,
+        )?;
         // The outbound half of the per-method specification, before anything
         // is journaled: §12.1 leaf bounds, and a fence that names this
         // client's group and actor — a fence minted elsewhere is §4.1-invalid
@@ -353,33 +477,48 @@ impl CoordinationClient {
             &facts,
         )
         .map_err(client_error)?;
-        let mut journal = self.journal.lock().await;
         match journal.state() {
             JournalState::Ready => {
                 let sequence = journal.sequence() + 1;
                 journal.begin(sequence, method, request, request_hash)?;
+                if self.self_acknowledging {
+                    journal.mark_self_acknowledging();
+                }
             }
-            JournalState::Pending if journal.record().request_hash == request_hash.to_vec() => {
-                // The same mutation, called again after an interruption:
-                // continue driving the exact fsynced bytes.
-            }
+            // The same mutation, called again after an interruption: continue
+            // driving the exact fsynced bytes. Never on the lease path — an
+            // identical application entry is the application's to acknowledge.
+            JournalState::Pending
+                if !self.self_acknowledging
+                    && journal.record().request_hash == request_hash.to_vec() => {}
             JournalState::Pending | JournalState::Closing | JournalState::ReplayAfterRetire => {
-                return Err(client_error(
+                return Err(refusal(
+                    CoordinationErrorKind::Unresolved,
                     "another request is unresolved on this journal; resume() first",
                 ));
             }
             JournalState::ResolvedAwaitingAck => {
-                return Err(client_error(
+                return Err(refusal(
+                    CoordinationErrorKind::AwaitingAck,
                     "a resolved result awaits acknowledgement; take unacknowledged() first",
                 ));
             }
             JournalState::FatalJournal => {
-                return Err(client_error(
+                return Err(refusal(
+                    CoordinationErrorKind::JournalFatal,
                     "the journal is fatal (§10 reason 18); no further mutation is possible",
                 ));
             }
         }
         let delivery = drive(&self.engine, &mut journal).await?;
+        if self.self_acknowledging {
+            settle(&mut journal, &delivery.token, delivery.via_retirement)?;
+            drop(journal);
+            return Ok(ResolvedMutation {
+                settled: true,
+                ..self.deliver(delivery)
+            });
+        }
         drop(journal);
         Ok(self.deliver(delivery))
     }
@@ -695,29 +834,6 @@ impl CoordinationClient {
             },
         )
         .await
-    }
-
-    /// Build the request under the journal's own client id and next sequence,
-    /// then run the shared mutation path.
-    async fn sequenced<F>(
-        &self,
-        method: &'static str,
-        action: ActionV1,
-        build: F,
-    ) -> Result<ResolvedMutation>
-    where
-        F: FnOnce(Vec<u8>, Vec<u8>, u64) -> Result<Vec<u8>>,
-    {
-        let (group, client_id, sequence) = {
-            let journal = self.journal.lock().await;
-            (
-                self.engine.group.as_bytes().to_vec(),
-                journal.record().client_id.clone(),
-                journal.sequence() + 1,
-            )
-        };
-        let request = build(group, client_id, sequence)?;
-        self.mutate(method, &action, request).await
     }
 
     /// `retire_client` for one of this actor's **other** client ids —

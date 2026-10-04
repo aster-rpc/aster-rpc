@@ -32,6 +32,7 @@ use crate::coordination::store::wire::{
 use crate::error::{Error, Result};
 
 use super::engine::{CallFailure, CallOutcome, Engine};
+use super::error::{refusal, CoordinationErrorKind};
 use super::journal::{AckToken, Journal, JournalState};
 
 /// Attempts one drive makes before returning with the sequence still open.
@@ -157,10 +158,13 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
             }
         }
     }
-    Err(client_error(format!(
-        "no resolution within {DRIVE_ATTEMPTS} attempts; the sequence remains open and \
-         resumes with the same exact bytes"
-    )))
+    Err(refusal(
+        CoordinationErrorKind::Unavailable,
+        format!(
+            "no resolution within {DRIVE_ATTEMPTS} attempts; the sequence remains open and \
+             resumes with the same exact bytes"
+        ),
+    ))
 }
 
 /// The reply must be a **valid §5.2 answer to this journal's entry** — the
@@ -234,7 +238,8 @@ async fn retire_until_confirmed(engine: &Engine, journal: &mut Journal) -> Resul
                 // created and neither can the delayed original's, so the
                 // original can never commit.
                 journal.fatal()?;
-                return Err(client_error(
+                return Err(refusal(
+                    CoordinationErrorKind::JournalFatal,
                     "retained-session capacity is exhausted; this journal cannot be \
                      closed and no further mutation is possible (§10 reason 18)",
                 ));
@@ -254,7 +259,8 @@ async fn retire_until_confirmed(engine: &Engine, journal: &mut Journal) -> Resul
             Err(_) => tokio::time::sleep(backoff(attempt)).await,
         }
     }
-    Err(client_error(
+    Err(refusal(
+        CoordinationErrorKind::Unavailable,
         "retirement did not confirm within the attempt budget; the journal remains Closing",
     ))
 }
@@ -325,7 +331,8 @@ async fn replay_on_tombstone(engine: &Engine, journal: &mut Journal) -> Result<D
             Err(_) => tokio::time::sleep(backoff(attempt)).await,
         }
     }
-    Err(client_error(
+    Err(refusal(
+        CoordinationErrorKind::Unavailable,
         "the replay did not resolve within the attempt budget; it resumes with the same bytes",
     ))
 }

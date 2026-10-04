@@ -87,57 +87,31 @@ fn invalid(msg: impl std::fmt::Display) -> PyErr {
 
 fn closed() -> PyErr {
     coord_error(
-        "closed",
+        cc::CoordinationErrorKind::Closed.as_str(),
         None,
         "the coordination client is closed".to_string(),
     )
 }
 
-/// Map an `aster` error onto the typed exceptions. The journal-state
-/// refusals are `InvalidArgument` in Rust; their (stable, contract-worded)
-/// messages are what distinguishes them.
+/// Map an `aster` error onto the typed exceptions by its structured
+/// [`cc::CoordinationErrorKind`] -- never by its message, which passes
+/// through unchanged.
 fn coord_err(e: aster::Error) -> PyErr {
-    match e {
-        aster::Error::InvalidArgument(msg) => {
-            // The lease adapter flattens inner errors into its own
-            // `InvalidArgument`; recover an embedded RPC status.
-            if let Some(code) = embedded_rpc_code(&msg) {
-                return coord_error("rpc", Some(code), format!("invalid argument: {msg}"));
-            }
-            let kind = if msg.contains("awaits acknowledgement") {
-                "awaiting_ack"
-            } else if msg.contains("unresolved on this journal") {
-                "unresolved"
-            } else if msg.contains("journal is fatal") {
-                "journal_fatal"
-            } else if msg.contains("lifetime lock") {
-                "journal_locked"
-            } else {
-                "invalid"
-            };
-            coord_error(kind, None, format!("invalid argument: {msg}"))
-        }
-        aster::Error::Rpc { code, message, .. } => {
-            coord_error("rpc", Some(code), format!("rpc error [{code}]: {message}"))
-        }
-        aster::Error::Transport(err) => coord_error("unavailable", None, err.to_string()),
-        other => coord_error("other", None, other.to_string()),
+    match cc::CoordinationErrorKind::of(&e) {
+        cc::CoordinationErrorKind::Rpc { code } => coord_error("rpc", Some(code), e.to_string()),
+        kind => coord_error(kind.as_str(), None, e.to_string()),
     }
-}
-
-/// `... rpc error [7]: ...` -> `7` (the `aster::Error::Rpc` display form).
-fn embedded_rpc_code(msg: &str) -> Option<i32> {
-    let start = msg.find("rpc error [")? + "rpc error [".len();
-    let end = start + msg[start..].find(']')?;
-    msg[start..end].parse().ok()
 }
 
 /// Test hook: the exception `coord_err` maps a synthetic `aster::Error` to
 /// (returned, not raised). `variant` is `invalid_argument`, `rpc`,
-/// `transport` or `connection`.
+/// `transport`, `connection`, or `coordination:<kind>` for a structured
+/// client error (`awaiting_ack`, `unresolved`, `journal_fatal`,
+/// `journal_locked`, `unavailable`, `closed`, or `rpc` with `code`).
 #[pyfunction]
 #[pyo3(name = "_coordination_error_for_testing", signature = (variant, message, code=0))]
 fn error_for_testing(py: Python<'_>, variant: &str, message: String, code: i32) -> Py<PyAny> {
+    use cc::CoordinationErrorKind as K;
     let e = match variant {
         "invalid_argument" => aster::Error::InvalidArgument(message),
         "rpc" => aster::Error::Rpc {
@@ -146,6 +120,19 @@ fn error_for_testing(py: Python<'_>, variant: &str, message: String, code: i32) 
             details: Vec::new(),
         },
         "transport" => aster::Error::Transport(anyhow::anyhow!(message)),
+        structured if structured.starts_with("coordination:") => {
+            let kind = match &structured["coordination:".len()..] {
+                "awaiting_ack" => K::AwaitingAck,
+                "unresolved" => K::Unresolved,
+                "journal_fatal" => K::JournalFatal,
+                "journal_locked" => K::JournalLocked,
+                "unavailable" => K::Unavailable,
+                "closed" => K::Closed,
+                "rpc" => K::Rpc { code },
+                _ => K::Other,
+            };
+            cc::CoordinationError::new(kind, message).into()
+        }
         _ => aster::Error::Connection(message),
     };
     coord_err(e).into_value(py).into_any()
