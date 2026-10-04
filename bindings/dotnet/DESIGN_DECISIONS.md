@@ -7,10 +7,10 @@
 **C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 4.0, 2026-10-04)
+## STATUS (ABI 4.2, 2026-10-04)
 
 - **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
-  `Native.RequiredAbiMinor` = 0; 4.0 removed the reactor, framed calls, the node factories and
+  `Native.RequiredAbiMinor` = 2; 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
@@ -59,6 +59,35 @@
   delete, docs open / import / authority / retire / durable set / entry status, connection
   paths, stream priority. **Pure functions (3.4):** `Aster.Crypto.Ids`, `Hpke`, `Attestation`,
   `Grants` (checked against `conformance/vectors/grants.json`).
+- **Upcalls, leases, topology (ABI 4.1):** `Aster.Upcall.Upcalls` is one table per runtime
+  (`aster_upcalls_*`). A **dedicated poll thread** drains `aster_upcall_poll` (100 ms native wait,
+  woken at once by `aster_upcalls_close`) so blocking polls never occupy a thread-pool thread; each
+  upcall runs as its own `Task` (user code never runs on the poll thread). `CANCEL` events fire the
+  handler's `UpcallContext.Cancellation` (reason in `CancelReason`: timeout / abandoned / shutdown).
+  A handler exception answers `ERROR`, a kind without a handler `UNIMPLEMENTED`; per-kind timeout and
+  failure mode via `SetPolicy`. Event payloads are copied and their buffer released exactly once.
+  Dispose order: close the table (pending Rust waiters fail), join the poll thread, cancel + await
+  running handlers (5 s bound), free the handle; nothing starts after dispose begins. `Ucv1` is the
+  UCv1 codec (leases, fenced, decisions, topology, expose C0/C4-C8, admission; placement is not in
+  the C ABI) and passes every valid and invalid vector of `conformance/vectors/upcalls.json`.
+  `Aster.Lease`: `NativeLeaseSerializer` (`Foreign` over an `ILeaseSerializer`, or `Memory` with an
+  `ILeaseAuthorizer`), `HeldLease` (`CurrentFence()` at send time, `WatchAsync`, `ReleaseAsync` /
+  `DisposeAsync` = graceful release, `Dispose` = free without release), `NativeFencedResource`
+  (`MutateAsync` throws when the outcome is unknown; a write is never failed open).
+  `AdmittedFilterHandle` + `Topology.EnableSharedAsync`. `aster_operation_cancel` only suppresses a
+  completion event: cancelling a .NET token stops the wait, not the Rust-side upcall (it lives to
+  the kind's timeout).
+- **Expose (ABI 4.2):** `Aster.Expose.ExposeRegistry` (`ExposeSocket` with an optional kind-48
+  authorizer, `ExposeHttp` = foreign handler + body table, `ServeRoutePolicy`, `ServeAsync`,
+  `HandleConnection`, `Unexpose`), `HttpBodies` (`aster_http_body_*`; the native calls block with a
+  timeout, so the async wrappers try with timeout 0 and re-poll after 1-8 ms instead of parking a
+  pool thread), `ExposeHttpHandler` (request body as a pull-based `Stream`, response inline or an
+  `IAsyncEnumerable<ReadOnlyMemory<byte>>` written with backpressure and finished with optional
+  trailers; a throwing sequence aborts the body so the consumer sees a failure, never a truncated
+  success), consumer side `ExposeClient.RelayRequestAsync` (buffered; no streaming relay in the C
+  ABI yet) and `RequestRouteAsync`. HTTP services need an upcall table; a table without an
+  authorizer denies (fail-closed default). No new auth surface: the authorizer is the existing kind
+  48 decision, Gate 0 is untouched.
 - **Interop:** joins `tests/interop/` (`tests/interop/dotnet/`), 5×5 matrix all pass.
 - `Bytes.FromArray` (unpinned pointer) is removed; use `fixed` + `Bytes.FromPointer`,
   `Bytes.FromPinned`, or the internal `NativeScope`.

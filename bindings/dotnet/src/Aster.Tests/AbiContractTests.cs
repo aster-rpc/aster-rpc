@@ -467,6 +467,93 @@ public class AbiContractTests
     [Fact]
     public void Abi_4_1_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi41Exports);
 
+    // ─── ABI 4.2: expose ────────────────────────────────────────────────────
+
+    [Fact]
+    public void Expose_Struct_Sizes_And_Offsets_Match_Header()
+    {
+        // aster_http_foreign_options_t: 48 bytes.
+        Assert.Equal(48, Marshal.SizeOf<HttpForeignOptionsNative>());
+        Off<HttpForeignOptionsNative>("struct_size", 0);
+        Off<HttpForeignOptionsNative>("flags", 4);
+        Off<HttpForeignOptionsNative>("inline_request_max", 8);
+        Off<HttpForeignOptionsNative>("max_request_body", 16);
+        Off<HttpForeignOptionsNative>("max_response_body", 24);
+        Off<HttpForeignOptionsNative>("max_chunk", 32);
+        Off<HttpForeignOptionsNative>("response_buffer", 40);
+        Off<HttpForeignOptionsNative>("reserved", 44);
+        // aster_route_spec_t: 40 bytes (LP64).
+        Assert.Equal(40, Marshal.SizeOf<RouteSpecNative>());
+        Off<RouteSpecNative>("host", 0);
+        Off<RouteSpecNative>("service_id", 16);
+        Off<RouteSpecNative>("port", 32);
+        Off<RouteSpecNative>("protocol", 36);
+    }
+
+    [Fact]
+    public unsafe void Http_Foreign_Options_Init_Fills_The_Native_Struct_Size()
+    {
+        HttpForeignOptionsNative o = default;
+        Native.Check(Native.aster_http_foreign_options_init(&o), "init");
+        Assert.Equal(48u, o.struct_size);
+        Assert.Equal(0u, o.flags);
+        Assert.Equal(0u, o.reserved);
+    }
+
+    [Fact]
+    public void Http_Body_Status_Values_Match_Header()
+    {
+        // aster_http_body_status_t: 1..9 are the stable BodyError codes, negatives are argument / handle errors.
+        Assert.Equal(0, (int)Expose.HttpBodyStatus.Ok);
+        Assert.Equal(1, (int)Expose.HttpBodyStatus.UnknownStream);
+        Assert.Equal(2, (int)Expose.HttpBodyStatus.Cancelled);
+        Assert.Equal(3, (int)Expose.HttpBodyStatus.TooLarge);
+        Assert.Equal(4, (int)Expose.HttpBodyStatus.ChunkTooLarge);
+        Assert.Equal(5, (int)Expose.HttpBodyStatus.Finished);
+        Assert.Equal(6, (int)Expose.HttpBodyStatus.Timeout);
+        Assert.Equal(7, (int)Expose.HttpBodyStatus.Read);
+        Assert.Equal(8, (int)Expose.HttpBodyStatus.InvalidTrailers);
+        Assert.Equal(9, (int)Expose.HttpBodyStatus.BlockingOnRuntime);
+        Assert.Equal(-1, (int)Expose.HttpBodyStatus.InvalidArgument);
+        Assert.Equal(-2, (int)Expose.HttpBodyStatus.UnknownHandle);
+        // Route protocols and HTTP versions (UCv1 u8enums).
+        Assert.Equal(0, Upcall.ExposeRouteSpec.ProtocolHttp);
+        Assert.Equal(1, Upcall.ExposeRouteSpec.ProtocolTcp);
+        Assert.Equal(new byte[] { 0, 1, 2, 3, 4 }, Enum.GetValues<Expose.HttpProtocolVersion>().Select(v => (byte)v).Order().ToArray());
+    }
+
+    private static readonly string[] Abi42Exports =
+    {
+        "aster_expose_new", "aster_expose_free", "aster_expose_unexpose", "aster_expose_serve", "aster_expose_handle_connection",
+        "aster_expose_socket", "aster_expose_http_foreign", "aster_expose_route_policy_foreign",
+        "aster_http_bodies_new", "aster_http_bodies_free", "aster_http_bodies_open_count", "aster_http_foreign_options_init",
+        "aster_http_body_read", "aster_http_body_write", "aster_http_body_try_write", "aster_http_body_finish", "aster_http_body_abort",
+        "aster_expose_relay_request", "aster_expose_request_route", "aster_route_registration_free",
+    };
+
+    [Fact]
+    public void Abi_4_2_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi42Exports);
+
+    [Fact]
+    public void Body_Calls_Validate_Arguments_And_Unknown_Handles()
+    {
+        using var rt = new Runtime();
+        unsafe
+        {
+            byte b = 0;
+            UIntPtr n = UIntPtr.Zero;
+            uint eof = 0;
+            // Unknown table -> -2 (these functions do not return aster_status_t).
+            Assert.Equal((int)Expose.HttpBodyStatus.UnknownHandle, Native.aster_http_body_read(rt.Handle, 424_242, 1, &b, (UIntPtr)1, 0, &n, &eof));
+            Assert.Equal((int)Expose.HttpBodyStatus.UnknownHandle, Native.aster_http_body_finish(rt.Handle, 424_242, 1, null, UIntPtr.Zero));
+            using var bodies = Expose.HttpBodies.Create(rt);
+            // Zero cap, NULL buffer with a length: invalid arguments, not a crash.
+            Assert.Equal((int)Expose.HttpBodyStatus.InvalidArgument, Native.aster_http_body_read(rt.Handle, bodies.NativeHandle, 1, &b, UIntPtr.Zero, 0, &n, &eof));
+            Assert.Equal((int)Expose.HttpBodyStatus.InvalidArgument, Native.aster_http_body_write(rt.Handle, bodies.NativeHandle, 1, null, (UIntPtr)4, 0));
+            Assert.Equal(0ul, bodies.OpenCount);
+        }
+    }
+
     // ─── Bytes helpers ───────────────────────────────────────────────────────
 
     [Fact]
