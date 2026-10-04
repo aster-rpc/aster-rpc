@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 3
 
-#define ASTER_ABI_VERSION_MINOR 3
+#define ASTER_ABI_VERSION_MINOR 4
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -140,6 +140,16 @@
 #define ASTER_TRANSPORT_ALL ((1 << 12) - 1)
 
 /**
+ * Size of every raw key / id this module takes or returns.
+ */
+#define ASTER_KEY_SIZE 32
+
+/**
+ * Length of the hex text form of a 32-byte id (without the NUL).
+ */
+#define ASTER_ID_HEX_LEN 64
+
+/**
  * Event-kind discriminator for `aster_reactor_call_t` (spec §7.5).
  * Bindings MUST check `event_kind` before reading any other field — a
  * `ConnectionClosed` event populates only `event_kind`, `connection_id`,
@@ -201,6 +211,13 @@ typedef enum aster_status_t {
    * not match the loaded library's `ASTER_ABI_VERSION_MAJOR`.
    */
   ASTER_STATUS_ABI_MISMATCH = 12,
+  /**
+   * A well-formed input failed a security check (ABI 3.4): an HPKE / grant
+   * envelope did not open (wrong key, context or AAD, corrupt bytes), an
+   * attestation chain did not verify, or a grant role did not match its
+   * capability. `aster_last_error_message` says which check failed.
+   */
+  ASTER_STATUS_VERIFICATION_FAILED = 13,
 } aster_status_t;
 
 /**
@@ -522,6 +539,101 @@ typedef enum aster_retire_outcome_t {
    */
   ASTER_RETIRE_BUSY = 1,
 } aster_retire_outcome_t;
+
+/**
+ * The kind of a 32-byte id, for `aster_id_parse` / `_format` / `_validate`.
+ * Every kind's text form is 64 hex characters.
+ */
+typedef enum aster_id_kind_t {
+  /**
+   * A node / endpoint id: an Ed25519 public key (must be a valid point).
+   */
+  ASTER_ID_NODE_ID = 0,
+  /**
+   * An Ed25519 public key, e.g. an attestation anchor (must be a valid point).
+   */
+  ASTER_ID_PUBLIC_KEY = 1,
+  /**
+   * A node secret key (Ed25519 seed). Any 32 bytes.
+   */
+  ASTER_ID_SECRET_KEY = 2,
+  /**
+   * A BLAKE3 content hash. Any 32 bytes.
+   */
+  ASTER_ID_HASH = 3,
+  /**
+   * A docs namespace id (public). Any 32 bytes.
+   */
+  ASTER_ID_NAMESPACE_ID = 4,
+  /**
+   * A docs namespace secret (write capability). Any 32 bytes.
+   */
+  ASTER_ID_NAMESPACE_SECRET = 5,
+  /**
+   * A docs author id: an Ed25519 public key (must be a valid point).
+   */
+  ASTER_ID_AUTHOR_ID = 6,
+} aster_id_kind_t;
+
+/**
+ * An identity's role within a verified chain (`aster::attestation::Role`).
+ */
+typedef enum aster_attestation_role_t {
+  /**
+   * Not a participant of the chain.
+   */
+  ASTER_ATTESTATION_ROLE_NONE = 0,
+  /**
+   * The leaf node the chain binds (takes precedence if node == anchor).
+   */
+  ASTER_ATTESTATION_ROLE_NODE = 1,
+  /**
+   * The trusted anchor the chain terminates at.
+   */
+  ASTER_ATTESTATION_ROLE_ANCHOR = 2,
+  /**
+   * An intermediate delegating identity.
+   */
+  ASTER_ATTESTATION_ROLE_INTERMEDIATE = 3,
+} aster_attestation_role_t;
+
+/**
+ * `state` of an `aster_grant_record_t`.
+ */
+typedef enum aster_grant_state_t {
+  /**
+   * In force; `envelope` carries the sealed payload.
+   */
+  ASTER_GRANT_STATE_ACTIVE = 0,
+  /**
+   * Withdrawn; `envelope` is empty and `reason` says why.
+   */
+  ASTER_GRANT_STATE_REVOKED = 1,
+} aster_grant_state_t;
+
+/**
+ * What a reconcile loop should do with a grant key (`GrantOutcome`).
+ */
+typedef enum aster_grant_outcome_kind_t {
+  /**
+   * Active and opened: apply or refresh the capability (`payload`).
+   */
+  ASTER_GRANT_OUTCOME_ACTIVE = 0,
+  /**
+   * Explicitly revoked: drop the capability (`reason`, `role`).
+   */
+  ASTER_GRANT_OUTCOME_REVOKED = 1,
+  /**
+   * A record is present but cannot be turned into a capability: drop it
+   * and alert (`reason` = the error).
+   */
+  ASTER_GRANT_OUTCOME_UNOPENABLE = 2,
+  /**
+   * No record. Not revocation (may not have synced yet): keep waiting and
+   * keep any capability already held.
+   */
+  ASTER_GRANT_OUTCOME_ABSENT = 3,
+} aster_grant_outcome_kind_t;
 
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
@@ -866,6 +978,128 @@ typedef struct aster_rpc_status_t {
 } aster_rpc_status_t;
 
 /**
+ * Everything a sealed grant is bound to (`GrantContext`). Sealing and
+ * opening must use an identical context. Every field is borrowed for the
+ * call; strings are UTF-8, not NUL-terminated.
+ */
+typedef struct aster_grant_context_t {
+  /**
+   * `sizeof(aster_grant_context_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * Set to 0.
+   */
+  uint32_t reserved;
+  /**
+   * Versioned application label, e.g. `portal-sync/tree-grant/v1`.
+   */
+  struct aster_bytes_t app;
+  /**
+   * The sealing authority's node id, hex (bound verbatim).
+   */
+  struct aster_bytes_t granter;
+  /**
+   * The recipient's node id, hex (bound verbatim; also the seal key).
+   */
+  struct aster_bytes_t recipient;
+  /**
+   * Opaque bytes naming what the grant unlocks.
+   */
+  struct aster_bytes_t resource;
+  /**
+   * The exact doc key the grant record is written at.
+   */
+  struct aster_bytes_t path;
+  /**
+   * Grant role, e.g. `read` / `write` (free-form for other schemes).
+   */
+  struct aster_bytes_t role;
+} aster_grant_context_t;
+
+/**
+ * The plaintext framing published at a grant key (`GrantRecord`, Fory).
+ */
+typedef struct aster_grant_record_t {
+  /**
+   * `sizeof(aster_grant_record_t)`: set by the caller for encode, written
+   * by the library on decode.
+   */
+  uint32_t struct_size;
+  /**
+   * `aster_grant_state_t`.
+   */
+  uint32_t state;
+  /**
+   * Which context template the envelope was sealed under. Read it before
+   * opening to choose the context; never trial-decrypt. Ignored on encode
+   * of a revoked record (always 1).
+   */
+  int32_t context_version;
+  /**
+   * Set to 0.
+   */
+  uint32_t reserved;
+  /**
+   * The grant role (kept on revoked records for display).
+   */
+  struct aster_bytes_t role;
+  /**
+   * ACTIVE: the sealed envelope (non-empty). REVOKED: empty.
+   */
+  struct aster_bytes_t envelope;
+  /**
+   * REVOKED: the reason (may be empty). ACTIVE: empty.
+   */
+  struct aster_bytes_t reason;
+  /**
+   * Library-owned backing store of a decoded struct; NULL otherwise.
+   */
+  void *storage;
+} aster_grant_record_t;
+
+/**
+ * The result of `aster_grant_reconcile` / `aster_namespace_grant_reconcile`.
+ * Release with `aster_grant_outcome_release` (zeroes the payload).
+ */
+typedef struct aster_grant_outcome_t {
+  /**
+   * `sizeof(aster_grant_outcome_t)`, written by the library.
+   */
+  uint32_t struct_size;
+  /**
+   * `aster_grant_outcome_kind_t`.
+   */
+  uint32_t kind;
+  /**
+   * Namespace reconcile, ACTIVE: `aster_local_access_t` of `payload`
+   * (WRITE = namespace secret, READ = namespace id). Otherwise 0.
+   */
+  uint32_t access;
+  /**
+   * 1 for REVOKED and UNOPENABLE (stop using the capability now), else 0.
+   */
+  uint32_t drops_capability;
+  /**
+   * ACTIVE: the opened payload (raw reconcile: the plaintext; namespace
+   * reconcile: the 32-byte key). Otherwise empty.
+   */
+  struct aster_bytes_t payload;
+  /**
+   * REVOKED: the granter's reason. UNOPENABLE: the error message.
+   */
+  struct aster_bytes_t reason;
+  /**
+   * REVOKED: the role the revoked grant carried.
+   */
+  struct aster_bytes_t role;
+  /**
+   * Library-owned backing store; NULL when nothing is allocated.
+   */
+  void *storage;
+} aster_grant_outcome_t;
+
+/**
  * Node configuration: every knob of `aster::AsterConfig` that a node uses
  * (docs/aster-rust-getstarted.md §2.2). Start from `aster_config_init` (or
  * `aster_config_from_env` / `aster_config_from_toml`), then set fields. See
@@ -987,6 +1221,68 @@ typedef struct aster_config_t {
  * Opaque Gate-0 policy handle (scoped to a runtime).
  */
 typedef uint64_t aster_gate_t;
+
+/**
+ * Policy of a minted attestation edge (`aster::attestation::AttestOptions`).
+ */
+typedef struct aster_attest_options_t {
+  /**
+   * `sizeof(aster_attest_options_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * Set to 0.
+   */
+  uint32_t reserved;
+  /**
+   * Monotonic replay counter (caller-managed; 0 for a first issue).
+   */
+  int64_t epoch;
+  /**
+   * 0 = no lower bound; else unix seconds before which the chain is invalid.
+   */
+  int64_t not_before;
+  /**
+   * 0 = no expiry; else unix seconds after which the chain is invalid.
+   */
+  int64_t not_after;
+} aster_attest_options_t;
+
+/**
+ * The result of a successful `aster_attestation_verify_chain`. Release with
+ * `aster_verified_chain_release`.
+ */
+typedef struct aster_verified_chain_t {
+  /**
+   * `sizeof(aster_verified_chain_t)`, written by the library.
+   */
+  uint32_t struct_size;
+  /**
+   * Number of edges.
+   */
+  uint32_t depth;
+  /**
+   * The node the chain binds (= `expected_node`).
+   */
+  uint8_t node[32];
+  /**
+   * The trusted anchor the chain terminates at.
+   */
+  uint8_t anchor[32];
+  /**
+   * `intermediates_count` consecutive 32-byte public keys, node-ward →
+   * anchor-ward; NULL when there are none (single-edge chain).
+   */
+  const uint8_t *intermediates;
+  /**
+   * Number of 32-byte keys at `intermediates`.
+   */
+  uintptr_t intermediates_count;
+  /**
+   * Library-owned backing store; NULL when there are no intermediates.
+   */
+  void *storage;
+} aster_verified_chain_t;
 
 typedef uint64_t aster_reactor_t;
 
@@ -2705,6 +3001,214 @@ int32_t aster_zstd_maybe_compress(const uint8_t *data,
 int32_t aster_zstd_decompress(const uint8_t *data, uintptr_t len, struct aster_bytes_t *out);
 
 /**
+ * The canonical grant AAD: the domain `aster/sealed-grant/v1` and each context field
+ * (app, granter, recipient, resource, path, role), each prefixed with its
+ * u32 big-endian byte length. Release `*out` with `aster_string_release`.
+ *
+ * # Safety
+ * `context` valid with readable fields; `out` valid.
+ */
+int32_t aster_grant_context_aad(const struct aster_grant_context_t *context,
+                                struct aster_bytes_t *out);
+
+/**
+ * The conventional doc key for a grant record: `<prefix>/grants/<recipient>`
+ * (trailing `/` on `prefix` trimmed). Release `*out` with
+ * `aster_string_release`; not NUL-terminated.
+ *
+ * # Safety
+ * Inputs readable for their lengths; `out` valid.
+ */
+int32_t aster_grant_key(struct aster_bytes_t prefix,
+                        struct aster_bytes_t recipient,
+                        struct aster_bytes_t *out);
+
+/**
+ * The role ↔ capability rule: role `read` requires `can_write == 0`, role
+ * `write` requires `can_write != 0`; any other role (case-sensitive) passes.
+ * Returns OK or `ASTER_STATUS_VERIFICATION_FAILED`.
+ *
+ * # Safety
+ * `role` readable for its length.
+ */
+int32_t aster_grant_check_role(struct aster_bytes_t role, uint32_t can_write);
+
+/**
+ * Seal `plaintext` to `context.recipient`'s identity-derived X25519 key
+ * with the grant AAD. `*out` = the Fory `aster.hpke.Envelope`; release with
+ * `aster_string_release`. `ASTER_STATUS_INVALID_ARGUMENT` if the recipient
+ * is not a valid node id.
+ *
+ * # Safety
+ * `context` valid; `plaintext` readable; `out` valid.
+ */
+int32_t aster_grant_seal(const struct aster_grant_context_t *context,
+                         struct aster_bytes_t plaintext,
+                         struct aster_bytes_t *out);
+
+/**
+ * `aster_grant_seal` to an explicit 32-byte X25519 recipient public key.
+ *
+ * # Safety
+ * `recipient_public_key` readable for 32 bytes; else as `aster_grant_seal`.
+ */
+int32_t aster_grant_seal_to_key(const uint8_t *recipient_public_key,
+                                const struct aster_grant_context_t *context,
+                                struct aster_bytes_t plaintext,
+                                struct aster_bytes_t *out);
+
+/**
+ * Open a grant envelope with the recipient's 32-byte Ed25519 identity
+ * secret under the same context. `*out` = the plaintext (release with
+ * `aster_string_release`). `ASTER_STATUS_VERIFICATION_FAILED` when the
+ * envelope is corrupt or any context field, or the key, differs.
+ *
+ * # Safety
+ * `identity_secret` readable for 32 bytes; `context` valid; `envelope`
+ * readable; `out` valid.
+ */
+int32_t aster_grant_open(const uint8_t *identity_secret,
+                         const struct aster_grant_context_t *context,
+                         struct aster_bytes_t envelope,
+                         struct aster_bytes_t *out);
+
+/**
+ * `aster_grant_open` with an explicit 32-byte X25519 private key.
+ *
+ * # Safety
+ * As `aster_grant_open`.
+ */
+int32_t aster_grant_open_with_key(const uint8_t *recipient_private_key,
+                                  const struct aster_grant_context_t *context,
+                                  struct aster_bytes_t envelope,
+                                  struct aster_bytes_t *out);
+
+/**
+ * Fory-encode a namespace capability (`access` = `aster_local_access_t`,
+ * `key` = 32 bytes). Release `*out` with `aster_string_release`.
+ *
+ * # Safety
+ * `key` readable for 32 bytes; `out` valid.
+ */
+int32_t aster_namespace_capability_encode(uint32_t access,
+                                          const uint8_t *key,
+                                          struct aster_bytes_t *out);
+
+/**
+ * Decode Fory namespace-capability bytes into `*out_access` and 32 bytes at
+ * `out_key`.
+ *
+ * # Safety
+ * `bytes` readable; `out_access` valid; `out_key` writable for 32 bytes.
+ */
+int32_t aster_namespace_capability_decode(struct aster_bytes_t bytes,
+                                          uint32_t *out_access,
+                                          uint8_t *out_key);
+
+/**
+ * Seal a namespace capability after checking the role rule
+ * (`ASTER_STATUS_VERIFICATION_FAILED` if `context.role` does not match).
+ * `*out` = the envelope; release with `aster_string_release`.
+ *
+ * # Safety
+ * `context` valid; `key` readable for 32 bytes; `out` valid.
+ */
+int32_t aster_namespace_grant_seal(const struct aster_grant_context_t *context,
+                                   uint32_t access,
+                                   const uint8_t *key,
+                                   struct aster_bytes_t *out);
+
+/**
+ * Open a namespace-capability grant and re-check the role rule on the
+ * decoded capability. Writes `*out_access` and 32 bytes at `out_key`
+ * (the namespace secret for WRITE, the id for READ).
+ * `ASTER_STATUS_VERIFICATION_FAILED` when it does not open, or the role
+ * does not match the capability.
+ *
+ * # Safety
+ * `identity_secret` readable for 32 bytes; `context` valid; `envelope`
+ * readable; `out_access` valid; `out_key` writable for 32 bytes.
+ */
+int32_t aster_namespace_grant_open(const uint8_t *identity_secret,
+                                   const struct aster_grant_context_t *context,
+                                   struct aster_bytes_t envelope,
+                                   uint32_t *out_access,
+                                   uint8_t *out_key);
+
+/**
+ * Fory-encode a grant record. `record->struct_size` must be
+ * `sizeof(aster_grant_record_t)`; `storage` is ignored. ACTIVE needs a
+ * non-empty envelope (and no reason); REVOKED takes role + reason and no
+ * envelope. Release `*out` with `aster_string_release`.
+ *
+ * # Safety
+ * `record` valid with readable fields; `out` valid.
+ */
+int32_t aster_grant_record_encode(const struct aster_grant_record_t *record,
+                                  struct aster_bytes_t *out);
+
+/**
+ * Decode Fory grant-record bytes. On success `*out` is filled (including
+ * `struct_size`) and must be released with `aster_grant_record_release`;
+ * on failure it is zeroed. Malformed records (bad version / state, active
+ * without envelope, revoked with one) are `ASTER_STATUS_INVALID_ARGUMENT`.
+ *
+ * # Safety
+ * `bytes` readable; `out` valid.
+ */
+int32_t aster_grant_record_decode(struct aster_bytes_t bytes, struct aster_grant_record_t *out);
+
+/**
+ * Free a decoded grant record and zero its pointers. NULL, zeroed or
+ * already released structs are a no-op.
+ *
+ * # Safety
+ * `record` NULL or filled by `aster_grant_record_decode`.
+ */
+int32_t aster_grant_record_release(struct aster_grant_record_t *record);
+
+/**
+ * Decide what to do with the record at `context.path`, opening the raw
+ * payload with the recipient's 32-byte identity secret if it is active.
+ * `record` = NULL when the key has no record (an empty `aster_bytes_t` is a
+ * present-but-empty, hence unopenable, record).
+ *
+ * Every outcome, including a record that fails to open, returns OK with
+ * `out->kind` set; errors are for bad arguments only. Release `*out` with
+ * `aster_grant_outcome_release`.
+ *
+ * # Safety
+ * `identity_secret` readable for 32 bytes; `context` valid; `record` NULL
+ * or valid; `out` valid.
+ */
+int32_t aster_grant_reconcile(const uint8_t *identity_secret,
+                              const struct aster_grant_context_t *context,
+                              const struct aster_bytes_t *record,
+                              struct aster_grant_outcome_t *out);
+
+/**
+ * `aster_grant_reconcile` for namespace-capability grants: ACTIVE carries
+ * `access` and the 32-byte key in `payload`; a role/capability mismatch is
+ * UNOPENABLE.
+ *
+ * # Safety
+ * As `aster_grant_reconcile`.
+ */
+int32_t aster_namespace_grant_reconcile(const uint8_t *identity_secret,
+                                        const struct aster_grant_context_t *context,
+                                        const struct aster_bytes_t *record,
+                                        struct aster_grant_outcome_t *out);
+
+/**
+ * Free an outcome's storage (zeroing the payload first) and zero its
+ * pointers. NULL, zeroed or already released structs are a no-op.
+ *
+ * # Safety
+ * `outcome` NULL or filled by a reconcile function.
+ */
+int32_t aster_grant_outcome_release(struct aster_grant_outcome_t *outcome);
+
+/**
  * Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
  * in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
  * overrides). Never allocates (`storage` is NULL).
@@ -2861,6 +3365,204 @@ int32_t aster_node_metrics_prometheus(aster_runtime_t runtime,
 void aster_probe_reset(void);
 
 int32_t aster_probe_dump_unary_csv(const uint8_t *path_ptr, uint32_t path_len);
+
+/**
+ * Parse a 64-hex-character id (either case, no surrounding whitespace) into
+ * its 32 bytes, checking it is valid for `kind` (`aster_id_kind_t`; Ed25519
+ * kinds must decode to a curve point). Writes 32 bytes to `out`.
+ *
+ * # Safety
+ * `text` must be readable for its length; `out` writable for 32 bytes.
+ */
+int32_t aster_id_parse(uint32_t kind, struct aster_bytes_t text, uint8_t *out);
+
+/**
+ * Format a 32-byte id as 64 lowercase hex characters plus a NUL terminator
+ * into `out` (65 writable bytes). Total for every valid `kind`; does not
+ * validate the bytes (use `aster_id_validate`).
+ *
+ * # Safety
+ * `id` must be readable for 32 bytes; `out` writable for 65 bytes.
+ */
+int32_t aster_id_format(uint32_t kind, const uint8_t *id, uint8_t *out);
+
+/**
+ * Check raw id bytes for `kind`: OK, or `ASTER_STATUS_INVALID_ARGUMENT` (with
+ * the reason in `aster_last_error_message`) if an Ed25519 kind is not a
+ * valid curve point. Every 32-byte value is valid for the other kinds.
+ *
+ * # Safety
+ * `id` must be readable for 32 bytes.
+ */
+int32_t aster_id_validate(uint32_t kind, const uint8_t *id);
+
+/**
+ * The Ed25519 public key (= node id) of a 32-byte node secret key. Total.
+ *
+ * # Safety
+ * `secret_key` readable and `out` writable for 32 bytes.
+ */
+int32_t aster_secret_key_public_key(const uint8_t *secret_key, uint8_t *out);
+
+/**
+ * The public namespace id of a 32-byte namespace secret
+ * (`aster::NamespaceSecret::id`). Total.
+ *
+ * # Safety
+ * `namespace_secret` readable and `out` writable for 32 bytes.
+ */
+int32_t aster_namespace_secret_id(const uint8_t *namespace_secret, uint8_t *out);
+
+/**
+ * Generate a fresh X25519 HPKE keypair (OS CSPRNG). Writes 32 bytes to each
+ * output.
+ *
+ * # Safety
+ * Both outputs must be writable for 32 bytes.
+ */
+int32_t aster_hpke_generate_keypair(uint8_t *out_private_key, uint8_t *out_public_key);
+
+/**
+ * The X25519 HPKE public key of a 32-byte private key.
+ *
+ * # Safety
+ * `private_key` readable and `out` writable for 32 bytes.
+ */
+int32_t aster_hpke_public_key_from_private(const uint8_t *private_key, uint8_t *out);
+
+/**
+ * The X25519 HPKE private key derived from a 32-byte Ed25519 identity
+ * secret (clamped `SHA-512(seed)[..32]`, libsodium
+ * `crypto_sign_ed25519_sk_to_curve25519`). Total.
+ *
+ * # Safety
+ * `identity_secret` readable and `out` writable for 32 bytes.
+ */
+int32_t aster_hpke_x25519_secret_from_identity(const uint8_t *identity_secret, uint8_t *out);
+
+/**
+ * The X25519 HPKE public key derived from a 32-byte Ed25519 identity public
+ * key (Edwards→Montgomery, libsodium `crypto_sign_ed25519_pk_to_curve25519`).
+ * `ASTER_STATUS_INVALID_ARGUMENT` for an off-curve, non-canonical or
+ * small-order key.
+ *
+ * # Safety
+ * `identity_public` readable and `out` writable for 32 bytes.
+ */
+int32_t aster_hpke_x25519_public_from_identity(const uint8_t *identity_public, uint8_t *out);
+
+/**
+ * `aster_hpke_x25519_public_from_identity` for a node id given as 64 hex
+ * characters (the grant recipient key of that node).
+ *
+ * # Safety
+ * `node_id` readable for its length; `out` writable for 32 bytes.
+ */
+int32_t aster_hpke_x25519_public_from_node_id(struct aster_bytes_t node_id, uint8_t *out);
+
+/**
+ * Seal `plaintext` to an X25519 HPKE public key with `aad` as associated
+ * data (HPKE Base, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+ * ChaCha20-Poly1305). `*out` = the Fory `aster.hpke.Envelope` bytes;
+ * release with `aster_string_release`. Randomized.
+ *
+ * # Safety
+ * `recipient_public_key` readable for 32 bytes; byte inputs readable for
+ * their lengths; `out` a valid pointer.
+ */
+int32_t aster_hpke_seal(const uint8_t *recipient_public_key,
+                        struct aster_bytes_t aad,
+                        struct aster_bytes_t plaintext,
+                        struct aster_bytes_t *out);
+
+/**
+ * Open a Fory `aster.hpke.Envelope` with the recipient's X25519 private key
+ * and the same `aad`. `*out` = the plaintext (release with
+ * `aster_string_release`). `ASTER_STATUS_VERIFICATION_FAILED` when the
+ * envelope is corrupt or does not open under this key and AAD.
+ *
+ * # Safety
+ * `recipient_private_key` readable for 32 bytes; byte inputs readable for
+ * their lengths; `out` a valid pointer.
+ */
+int32_t aster_hpke_open(const uint8_t *recipient_private_key,
+                        struct aster_bytes_t aad,
+                        struct aster_bytes_t envelope,
+                        struct aster_bytes_t *out);
+
+/**
+ * Mint a single-edge root↔node attestation chain: the root attests it owns
+ * the node and the node co-signs. Both secrets are 32-byte Ed25519 seeds.
+ * `options` may be NULL (epoch 0, no time bounds). `*out` = the chain's
+ * wire bytes; release with `aster_string_release`.
+ *
+ * # Safety
+ * Secrets readable for 32 bytes; `options` NULL or valid; `out` valid.
+ */
+int32_t aster_attest_root_node(const uint8_t *root_secret,
+                               const uint8_t *node_secret,
+                               const struct aster_attest_options_t *options,
+                               struct aster_bytes_t *out);
+
+/**
+ * Encode chain wire bytes as `aster.attestation.chain.v1:<base64url>` text.
+ * Release `*out` with `aster_string_release`. Not NUL-terminated.
+ *
+ * # Safety
+ * `chain` readable for its length; `out` valid.
+ */
+int32_t aster_attestation_chain_to_text(struct aster_bytes_t chain, struct aster_bytes_t *out);
+
+/**
+ * Decode `aster.attestation.chain.v1:<base64url>` text to chain wire bytes
+ * (not verified). Release `*out` with `aster_string_release`.
+ *
+ * # Safety
+ * `text` readable for its length; `out` valid.
+ */
+int32_t aster_attestation_chain_from_text(struct aster_bytes_t text, struct aster_bytes_t *out);
+
+/**
+ * Verify a chain end to end, offline: size bounds, structure, the leaf
+ * binding to `expected_node`, bridging, the top anchor being one of the
+ * `anchor_count` 32-byte keys at `trusted_anchors`, and every signature.
+ *
+ * On success fills `*out` (release with `aster_verified_chain_release`).
+ * A chain that fails any check returns `ASTER_STATUS_VERIFICATION_FAILED`
+ * with the failed check in `aster_last_error_message`; `*out` is then
+ * zeroed (except `struct_size`).
+ *
+ * # Safety
+ * `chain` readable for its length; `trusted_anchors` readable for
+ * `anchor_count * 32` bytes (may be NULL when 0); `expected_node` readable
+ * for 32 bytes; `out` valid.
+ */
+int32_t aster_attestation_verify_chain(struct aster_bytes_t chain,
+                                       const uint8_t *trusted_anchors,
+                                       uintptr_t anchor_count,
+                                       const uint8_t *expected_node,
+                                       struct aster_verified_chain_t *out);
+
+/**
+ * Free the storage of a verified chain and zero its pointers. A zeroed or
+ * already released struct is a no-op; NULL is a no-op.
+ *
+ * # Safety
+ * `chain` NULL or filled by `aster_attestation_verify_chain`.
+ */
+int32_t aster_verified_chain_release(struct aster_verified_chain_t *chain);
+
+/**
+ * The role (`aster_attestation_role_t`) of the 32-byte public key `id` in a
+ * verified chain; `ASTER_ATTESTATION_ROLE_NONE` if it is not a participant.
+ *
+ * # Safety
+ * `chain` filled by `aster_attestation_verify_chain`; `id` readable for 32
+ * bytes; `out_role` valid.
+ */
+int32_t aster_verified_chain_role_of(const struct aster_verified_chain_t *chain,
+                                     const uint8_t *id,
+                                     uint32_t *out_role);
 
 /**
  * Create a reactor attached to a node. The reactor starts accepting

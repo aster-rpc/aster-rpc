@@ -125,7 +125,7 @@ pub struct aster_rpc_status_t {
     pub storage: *mut c_void,
 }
 
-const EMPTY_BYTES: aster_bytes_t = aster_bytes_t {
+pub(crate) const EMPTY_BYTES: aster_bytes_t = aster_bytes_t {
     ptr: std::ptr::null(),
     len: 0,
 };
@@ -134,17 +134,17 @@ const EMPTY_LIST: aster_bytes_list_t = aster_bytes_list_t {
     len: 0,
 };
 
-fn invalid(msg: impl ToString) -> i32 {
+pub(crate) fn invalid(msg: impl ToString) -> i32 {
     set_last_error(msg);
     aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32
 }
 
-const OK: i32 = aster_status_t::ASTER_STATUS_OK as i32;
+pub(crate) const OK: i32 = aster_status_t::ASTER_STATUS_OK as i32;
 
 // ── input helpers ───────────────────────────────────────────────────────────
 
 /// Borrow a caller buffer. `{NULL, 0}` is empty; `{NULL, n>0}` is invalid.
-unsafe fn in_slice<'a>(ptr: *const u8, len: usize, what: &str) -> Result<&'a [u8], i32> {
+pub(crate) unsafe fn in_slice<'a>(ptr: *const u8, len: usize, what: &str) -> Result<&'a [u8], i32> {
     if len == 0 {
         Ok(&[])
     } else if ptr.is_null() {
@@ -154,7 +154,7 @@ unsafe fn in_slice<'a>(ptr: *const u8, len: usize, what: &str) -> Result<&'a [u8
     }
 }
 
-unsafe fn in_string(b: &aster_bytes_t, what: &str) -> Result<String, i32> {
+pub(crate) unsafe fn in_string(b: &aster_bytes_t, what: &str) -> Result<String, i32> {
     let bytes = in_slice(b.ptr, b.len, what)?;
     std::str::from_utf8(bytes)
         .map(str::to_owned)
@@ -175,7 +175,7 @@ unsafe fn in_list(l: &aster_bytes_list_t, what: &str) -> Result<Vec<String>, i32
         .collect()
 }
 
-fn check_struct_size<T>(got: u32, name: &str) -> Result<(), i32> {
+pub(crate) fn check_struct_size<T>(got: u32, name: &str) -> Result<(), i32> {
     let want = std::mem::size_of::<T>();
     if got as usize != want {
         return Err(invalid(format!(

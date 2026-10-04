@@ -23,9 +23,11 @@ use aster_transport_core::*;
 pub mod call;
 pub mod data;
 pub mod envelope;
+pub mod grants;
 mod layout;
 pub mod node;
 pub mod probe;
+pub mod pure;
 pub mod reactor;
 
 // ============================================================================
@@ -51,8 +53,12 @@ pub mod reactor;
 //   fetch report, ranged reads, tag prefix delete, one-shot GC; docs
 //   authority/retire/open/import/durable/entry_exists/content status;
 //   connection paths and send-stream priority; see `data.rs`.
+// - 3.4.0 (additive): pure functions -- typed id parse/format/validate,
+//   HPKE seal/open + identity-derived X25519 keys, Ed25519 attestation
+//   chains (`pure.rs`); sealed grants, namespace grants, grant records and
+//   reconcile (`grants.rs`); new status `ASTER_STATUS_VERIFICATION_FAILED`.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 3;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 3;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 4;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -93,6 +99,11 @@ pub enum aster_status_t {
     /// `aster_runtime_new` was called with an `expected_abi_major` that does
     /// not match the loaded library's `ASTER_ABI_VERSION_MAJOR`.
     ASTER_STATUS_ABI_MISMATCH = 12,
+    /// A well-formed input failed a security check (ABI 3.4): an HPKE / grant
+    /// envelope did not open (wrong key, context or AAD, corrupt bytes), an
+    /// attestation chain did not verify, or a grant role did not match its
+    /// capability. `aster_last_error_message` says which check failed.
+    ASTER_STATUS_VERIFICATION_FAILED = 13,
 }
 
 /// Relay mode
@@ -1313,6 +1324,9 @@ pub extern "C" fn aster_status_name(status: i32) -> *const c_char {
         }
         x if x == aster_status_t::ASTER_STATUS_STREAM_RESET as i32 => "ASTER_STATUS_STREAM_RESET\0",
         x if x == aster_status_t::ASTER_STATUS_ABI_MISMATCH as i32 => "ASTER_STATUS_ABI_MISMATCH\0",
+        x if x == aster_status_t::ASTER_STATUS_VERIFICATION_FAILED as i32 => {
+            "ASTER_STATUS_VERIFICATION_FAILED\0"
+        }
         _ => "ASTER_STATUS_UNKNOWN\0",
     };
     s.as_ptr() as *const c_char

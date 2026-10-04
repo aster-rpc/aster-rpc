@@ -20,6 +20,58 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
 
+## New in 3.4 (additive)
+
+ABI 3.4.0 (rest of tranche F2) exports the pure functions: typed ids, HPKE,
+ownership attestations and sealed grants. Nothing in 3.0–3.3 changed shape; a
+3.3 binding keeps working. Sources: `ffi/src/pure.rs`, `ffi/src/grants.rs`;
+tests: unit tests in `pure.rs`, `ffi/tests/grant_vectors.rs` (reproduces
+`conformance/vectors/grants.json` through the C functions),
+`ffi/tests/abi_contract_test.c`.
+
+All functions are synchronous and need no runtime. Raw keys / ids are 32-byte
+buffers (`const uint8_t*` in, `uint8_t*` out). Variable inputs are
+`aster_bytes_t` by value (`{NULL,0}` = empty); variable outputs are
+library-owned `aster_bytes_t` freed with `aster_string_release` (`{NULL,0}`
+when empty or on failure). A namespace capability is `(access, key)`:
+`ASTER_LOCAL_ACCESS_WRITE` + namespace secret, or `ASTER_LOCAL_ACCESS_READ` +
+namespace id.
+
+| Kind | Name | Notes |
+|---|---|---|
+| enum-value | `ASTER_STATUS_VERIFICATION_FAILED` = 13 | well-formed input failed a security check: envelope does not open, chain does not verify, role ≠ capability. Malformed input stays `INVALID_ARGUMENT` |
+| enum | `aster_id_kind_t` | `NODE_ID`=0, `PUBLIC_KEY`=1, `SECRET_KEY`=2, `HASH`=3, `NAMESPACE_ID`=4, `NAMESPACE_SECRET`=5, `AUTHOR_ID`=6 |
+| enum | `aster_attestation_role_t` | `NONE`=0, `NODE`=1, `ANCHOR`=2, `INTERMEDIATE`=3 |
+| enum | `aster_grant_state_t` | `ACTIVE`=0, `REVOKED`=1 |
+| enum | `aster_grant_outcome_kind_t` | `ACTIVE`=0, `REVOKED`=1, `UNOPENABLE`=2, `ABSENT`=3 |
+| macro | `ASTER_KEY_SIZE` (32), `ASTER_ID_HEX_LEN` (64) | |
+| struct | `aster_attest_options_t` (32 B) | `struct_size, reserved, epoch:i64, not_before:i64, not_after:i64` |
+| struct | `aster_verified_chain_t` (96 B) | `struct_size, depth, node[32], anchor[32], intermediates (count × 32 bytes), intermediates_count, storage` |
+| struct | `aster_grant_context_t` (104 B) | `struct_size, reserved, app, granter, recipient, resource, path, role` (granter / recipient = node id hex, bound verbatim) |
+| struct | `aster_grant_record_t` (72 B) | `struct_size, state, context_version:i32, reserved, role, envelope, reason, storage` |
+| struct | `aster_grant_outcome_t` (72 B) | `struct_size, kind, access, drops_capability, payload, reason, role, storage` |
+| function | `aster_id_parse(kind, text, out[32])` | exactly 64 hex chars, either case; Ed25519 kinds (`NODE_ID`, `PUBLIC_KEY`, `AUTHOR_ID`) must be a curve point |
+| function | `aster_id_format(kind, id[32], out[65])` | lowercase hex + NUL; does not validate |
+| function | `aster_id_validate(kind, id[32])` | OK / `INVALID_ARGUMENT` |
+| function | `aster_secret_key_public_key(secret[32], out[32])` | Ed25519 public key = node id |
+| function | `aster_namespace_secret_id(secret[32], out[32])` | `aster::NamespaceSecret::id` |
+| function | `aster_hpke_generate_keypair(out_private[32], out_public[32])`, `aster_hpke_public_key_from_private` | X25519 |
+| function | `aster_hpke_seal(public[32], aad, plaintext, out)` / `aster_hpke_open(private[32], aad, envelope, out)` | envelope = Fory `aster.hpke.Envelope`; open failure → `VERIFICATION_FAILED` |
+| function | `aster_hpke_x25519_secret_from_identity`, `aster_hpke_x25519_public_from_identity`, `aster_hpke_x25519_public_from_node_id(node_id hex, out)` | libsodium-compatible Ed25519→X25519; bad public key → `INVALID_ARGUMENT` |
+| function | `aster_attest_root_node(root_secret, node_secret, options or NULL, out)` | chain wire bytes |
+| function | `aster_attestation_chain_to_text` / `_from_text` | `aster.attestation.chain.v1:<base64url>` |
+| function | `aster_attestation_verify_chain(chain, anchors (count × 32), count, expected_node, aster_verified_chain_t*)` | any failed check → `VERIFICATION_FAILED`; release with `aster_verified_chain_release` |
+| function | `aster_verified_chain_role_of(chain, id, uint32_t* role)` | node wins over anchor if equal |
+| function | `aster_grant_context_aad(ctx, out)` | domain `aster/sealed-grant/v1` + 6 fields, each u32-BE length-prefixed |
+| function | `aster_grant_key(prefix, recipient, out)` | `<prefix minus trailing '/'>/grants/<recipient>` |
+| function | `aster_grant_check_role(role, can_write)` | OK / `VERIFICATION_FAILED` |
+| function | `aster_grant_seal(ctx, plaintext, out)`, `aster_grant_seal_to_key(public[32], ctx, plaintext, out)` | identity-derived or explicit X25519 key |
+| function | `aster_grant_open(identity_secret, ctx, envelope, out)`, `aster_grant_open_with_key(x25519_private, ctx, envelope, out)` | any mismatch → `VERIFICATION_FAILED` |
+| function | `aster_namespace_capability_encode(access, key, out)` / `_decode(bytes, uint32_t* access, key_out[32])` | Fory capability bytes |
+| function | `aster_namespace_grant_seal(ctx, access, key, out)` / `aster_namespace_grant_open(identity_secret, ctx, envelope, uint32_t* access, key_out[32])` | role rule checked on both sides |
+| function | `aster_grant_record_encode(const aster_grant_record_t*, out)` / `_decode(bytes, aster_grant_record_t*)` / `_release` | read `context_version` before choosing the context |
+| function | `aster_grant_reconcile(identity_secret, ctx, const aster_bytes_t* record or NULL, aster_grant_outcome_t*)`, `aster_namespace_grant_reconcile(...)` | every outcome returns OK; NULL record = ABSENT; namespace ACTIVE = `access` + 32-byte key in `payload`; release with `aster_grant_outcome_release` (zeroes the payload) |
+
 ## New in 3.3 (additive)
 
 ABI 3.3.0 (tranche F3) brings the data plane to parity with the Rust SDK's

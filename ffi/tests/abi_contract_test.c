@@ -233,6 +233,58 @@ OFF(aster_path_list_t, items, 8);
 OFF(aster_path_list_t, len, 16);
 OFF(aster_path_list_t, storage, 24);
 
+/* ABI 3.4: pure functions (pure.rs, grants.rs). */
+_Static_assert(sizeof(aster_id_kind_t) == 4, "enum size");
+_Static_assert(sizeof(aster_attestation_role_t) == 4, "enum size");
+_Static_assert(sizeof(aster_grant_state_t) == 4, "enum size");
+_Static_assert(sizeof(aster_grant_outcome_kind_t) == 4, "enum size");
+
+LAYOUT(aster_attest_options_t, 32);
+OFF(aster_attest_options_t, struct_size, 0);
+OFF(aster_attest_options_t, reserved, 4);
+OFF(aster_attest_options_t, epoch, 8);
+OFF(aster_attest_options_t, not_before, 16);
+OFF(aster_attest_options_t, not_after, 24);
+
+LAYOUT(aster_verified_chain_t, 96);
+OFF(aster_verified_chain_t, struct_size, 0);
+OFF(aster_verified_chain_t, depth, 4);
+OFF(aster_verified_chain_t, node, 8);
+OFF(aster_verified_chain_t, anchor, 40);
+OFF(aster_verified_chain_t, intermediates, 72);
+OFF(aster_verified_chain_t, intermediates_count, 80);
+OFF(aster_verified_chain_t, storage, 88);
+
+LAYOUT(aster_grant_context_t, 104);
+OFF(aster_grant_context_t, struct_size, 0);
+OFF(aster_grant_context_t, reserved, 4);
+OFF(aster_grant_context_t, app, 8);
+OFF(aster_grant_context_t, granter, 24);
+OFF(aster_grant_context_t, recipient, 40);
+OFF(aster_grant_context_t, resource, 56);
+OFF(aster_grant_context_t, path, 72);
+OFF(aster_grant_context_t, role, 88);
+
+LAYOUT(aster_grant_record_t, 72);
+OFF(aster_grant_record_t, struct_size, 0);
+OFF(aster_grant_record_t, state, 4);
+OFF(aster_grant_record_t, context_version, 8);
+OFF(aster_grant_record_t, reserved, 12);
+OFF(aster_grant_record_t, role, 16);
+OFF(aster_grant_record_t, envelope, 32);
+OFF(aster_grant_record_t, reason, 48);
+OFF(aster_grant_record_t, storage, 64);
+
+LAYOUT(aster_grant_outcome_t, 72);
+OFF(aster_grant_outcome_t, struct_size, 0);
+OFF(aster_grant_outcome_t, kind, 4);
+OFF(aster_grant_outcome_t, access, 8);
+OFF(aster_grant_outcome_t, drops_capability, 12);
+OFF(aster_grant_outcome_t, payload, 16);
+OFF(aster_grant_outcome_t, reason, 32);
+OFF(aster_grant_outcome_t, role, 48);
+OFF(aster_grant_outcome_t, storage, 64);
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -255,7 +307,7 @@ static void test_abi_version(void) {
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
     CHECK(ASTER_ABI_VERSION_MAJOR == 3);
-    CHECK(ASTER_ABI_VERSION_MINOR >= 3); /* 3.1 envelope + zstd, 3.2 node config + gate, 3.3 data plane */
+    CHECK(ASTER_ABI_VERSION_MINOR >= 4); /* 3.1 envelope + zstd, 3.2 node config + gate, 3.3 data plane, 3.4 pure functions */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
 
@@ -298,6 +350,14 @@ static void test_enum_values(void) {
     CHECK(ASTER_RETIRE_RETIRED == 0 && ASTER_RETIRE_BUSY == 1);
     CHECK(ASTER_FETCH_TO_STORE == 1 && ASTER_FETCH_REPORT_VERSION == 1);
     CHECK(ASTER_FETCH_REPORT_HEADER_SIZE == 16 && ASTER_FETCH_PROVIDER_RECORD_SIZE == 44);
+    /* 3.4 */
+    CHECK(ASTER_STATUS_VERIFICATION_FAILED == 13);
+    CHECK(strcmp(aster_status_name(ASTER_STATUS_VERIFICATION_FAILED), "ASTER_STATUS_VERIFICATION_FAILED") == 0);
+    CHECK(ASTER_ID_NODE_ID == 0 && ASTER_ID_HASH == 3 && ASTER_ID_AUTHOR_ID == 6);
+    CHECK(ASTER_ATTESTATION_ROLE_NONE == 0 && ASTER_ATTESTATION_ROLE_INTERMEDIATE == 3);
+    CHECK(ASTER_GRANT_STATE_ACTIVE == 0 && ASTER_GRANT_STATE_REVOKED == 1);
+    CHECK(ASTER_GRANT_OUTCOME_ACTIVE == 0 && ASTER_GRANT_OUTCOME_ABSENT == 3);
+    CHECK(ASTER_KEY_SIZE == 32 && ASTER_ID_HEX_LEN == 64);
 }
 
 static void test_data_plane(void) {
@@ -514,6 +574,101 @@ static void test_gate_and_node(void) {
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
+static aster_bytes_t bstr(const char *s) {
+    aster_bytes_t b = {(const uint8_t *)s, strlen(s)};
+    return b;
+}
+
+static void test_pure_functions(void) {
+    printf("[pure functions 3.4]\n");
+    /* Ids: secret -> public key, hex round-trip, validation. */
+    uint8_t root_sk[32], node_sk[32], root_pk[32], node_pk[32], parsed[32];
+    memset(root_sk, 1, 32);
+    memset(node_sk, 2, 32);
+    CHECK(aster_secret_key_public_key(root_sk, root_pk) == ASTER_STATUS_OK);
+    CHECK(aster_secret_key_public_key(node_sk, node_pk) == ASTER_STATUS_OK);
+    char hex[65];
+    CHECK(aster_id_format(ASTER_ID_NODE_ID, node_pk, (uint8_t *)hex) == ASTER_STATUS_OK);
+    CHECK(hex[64] == 0 && strlen(hex) == 64);
+    CHECK(aster_id_parse(ASTER_ID_NODE_ID, bstr(hex), parsed) == ASTER_STATUS_OK);
+    CHECK(memcmp(parsed, node_pk, 32) == 0);
+    CHECK(aster_id_validate(ASTER_ID_NODE_ID, node_pk) == ASTER_STATUS_OK);
+    CHECK(aster_id_parse(ASTER_ID_HASH, bstr("abc"), parsed) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_id_parse(42, bstr(hex), parsed) == ASTER_STATUS_INVALID_ARGUMENT);
+
+    /* HPKE seal/open. */
+    uint8_t hsk[32], hpk[32];
+    CHECK(aster_hpke_generate_keypair(hsk, hpk) == ASTER_STATUS_OK);
+    aster_bytes_t env = {0}, pt = {0};
+    CHECK(aster_hpke_seal(hpk, bstr("aad"), bstr("secret"), &env) == ASTER_STATUS_OK);
+    CHECK(aster_hpke_open(hsk, bstr("aad"), env, &pt) == ASTER_STATUS_OK);
+    CHECK(pt.len == 6 && memcmp(pt.ptr, "secret", 6) == 0);
+    CHECK(aster_string_release(pt.ptr, pt.len) == ASTER_STATUS_OK);
+    CHECK(aster_hpke_open(hsk, bstr("other"), env, &pt) == ASTER_STATUS_VERIFICATION_FAILED);
+    CHECK(pt.ptr == NULL && pt.len == 0);
+    CHECK(aster_string_release(env.ptr, env.len) == ASTER_STATUS_OK);
+
+    /* Attestation: mint, verify, roles. */
+    aster_bytes_t chain = {0};
+    CHECK(aster_attest_root_node(root_sk, node_sk, NULL, &chain) == ASTER_STATUS_OK);
+    aster_verified_chain_t vc;
+    memset(&vc, 0, sizeof vc);
+    CHECK(aster_attestation_verify_chain(chain, root_pk, 1, node_pk, &vc) == ASTER_STATUS_OK);
+    CHECK(vc.struct_size == sizeof(aster_verified_chain_t) && vc.depth == 1);
+    CHECK(memcmp(vc.node, node_pk, 32) == 0 && memcmp(vc.anchor, root_pk, 32) == 0);
+    uint32_t role = 99;
+    CHECK(aster_verified_chain_role_of(&vc, root_pk, &role) == ASTER_STATUS_OK && role == ASTER_ATTESTATION_ROLE_ANCHOR);
+    CHECK(aster_verified_chain_release(&vc) == ASTER_STATUS_OK);
+    CHECK(aster_attestation_verify_chain(chain, node_pk, 1, node_pk, &vc) == ASTER_STATUS_VERIFICATION_FAILED);
+    CHECK(aster_string_release(chain.ptr, chain.len) == ASTER_STATUS_OK);
+
+    /* Grants: key, AAD, seal -> record -> reconcile, absent. */
+    aster_bytes_t key = {0};
+    CHECK(aster_grant_key(bstr("/app/v1/"), bstr(hex), &key) == ASTER_STATUS_OK);
+    CHECK(key.len == 15 + 64 && memcmp(key.ptr, "/app/v1/grants/", 15) == 0);
+    aster_grant_context_t ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.struct_size = sizeof ctx;
+    ctx.app = bstr("app/v1");
+    ctx.granter = bstr(hex);
+    ctx.recipient = bstr(hex);
+    ctx.resource = bstr("r");
+    ctx.path = key;
+    ctx.role = bstr("read");
+    aster_bytes_t aad = {0};
+    CHECK(aster_grant_context_aad(&ctx, &aad) == ASTER_STATUS_OK);
+    CHECK(aad.len == 7 * 4 + 21 + 6 + 64 + 64 + 1 + key.len + 4);
+    CHECK(aster_string_release(aad.ptr, aad.len) == ASTER_STATUS_OK);
+    CHECK(aster_grant_seal(&ctx, bstr("cap"), &env) == ASTER_STATUS_OK);
+    aster_grant_record_t rec;
+    memset(&rec, 0, sizeof rec);
+    rec.struct_size = sizeof rec;
+    rec.state = ASTER_GRANT_STATE_ACTIVE;
+    rec.context_version = 1;
+    rec.role = ctx.role;
+    rec.envelope = env;
+    aster_bytes_t rec_bytes = {0};
+    CHECK(aster_grant_record_encode(&rec, &rec_bytes) == ASTER_STATUS_OK);
+    aster_grant_outcome_t out;
+    memset(&out, 0, sizeof out);
+    CHECK(aster_grant_reconcile(node_sk, &ctx, &rec_bytes, &out) == ASTER_STATUS_OK);
+    CHECK(out.kind == ASTER_GRANT_OUTCOME_ACTIVE && out.drops_capability == 0);
+    CHECK(out.payload.len == 3 && memcmp(out.payload.ptr, "cap", 3) == 0);
+    CHECK(aster_grant_outcome_release(&out) == ASTER_STATUS_OK && out.storage == NULL);
+    CHECK(aster_grant_reconcile(root_sk, &ctx, &rec_bytes, &out) == ASTER_STATUS_OK);
+    CHECK(out.kind == ASTER_GRANT_OUTCOME_UNOPENABLE && out.drops_capability == 1 && out.reason.len > 0);
+    CHECK(aster_grant_outcome_release(&out) == ASTER_STATUS_OK);
+    CHECK(aster_grant_reconcile(node_sk, &ctx, NULL, &out) == ASTER_STATUS_OK);
+    CHECK(out.kind == ASTER_GRANT_OUTCOME_ABSENT && out.storage == NULL);
+    CHECK(aster_grant_check_role(bstr("read"), 1) == ASTER_STATUS_VERIFICATION_FAILED);
+    CHECK(aster_grant_check_role(bstr("admin"), 1) == ASTER_STATUS_OK);
+    ctx.struct_size = 8;
+    CHECK(aster_grant_seal(&ctx, bstr("cap"), &aad) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_string_release(rec_bytes.ptr, rec_bytes.len) == ASTER_STATUS_OK);
+    CHECK(aster_string_release(env.ptr, env.len) == ASTER_STATUS_OK);
+    CHECK(aster_string_release(key.ptr, key.len) == ASTER_STATUS_OK);
+}
+
 int main(void) {
     test_abi_version();
     test_enum_values();
@@ -522,6 +677,7 @@ int main(void) {
     test_config();
     test_gate_and_node();
     test_data_plane();
+    test_pure_functions();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;

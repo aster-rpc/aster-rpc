@@ -17,7 +17,14 @@ use crate::data::{
     aster_path_info_t, aster_path_list_t, aster_retire_outcome_t,
 };
 use crate::envelope::{aster_call_header_t, aster_rpc_status_t, aster_stream_header_t};
+use crate::grants::{
+    aster_grant_context_t, aster_grant_outcome_kind_t, aster_grant_outcome_t, aster_grant_record_t,
+    aster_grant_state_t,
+};
 use crate::node::{aster_config_t, aster_portmapper_t, aster_trust_mode_t};
+use crate::pure::{
+    aster_attest_options_t, aster_attestation_role_t, aster_id_kind_t, aster_verified_chain_t,
+};
 use crate::reactor::aster_reactor_call_t;
 use crate::*;
 
@@ -53,6 +60,10 @@ const _: () = assert!(size_of::<aster_fetch_strategy_t>() == 4);
 const _: () = assert!(size_of::<aster_blob_status_t>() == 4);
 const _: () = assert!(size_of::<aster_local_access_t>() == 4);
 const _: () = assert!(size_of::<aster_retire_outcome_t>() == 4);
+const _: () = assert!(size_of::<aster_id_kind_t>() == 4);
+const _: () = assert!(size_of::<aster_attestation_role_t>() == 4);
+const _: () = assert!(size_of::<aster_grant_state_t>() == 4);
+const _: () = assert!(size_of::<aster_grant_outcome_kind_t>() == 4);
 
 #[cfg(target_pointer_width = "64")]
 mod lp64 {
@@ -281,5 +292,57 @@ mod lp64 {
         items = 8,
         len = 16,
         storage = 24,
+    });
+    // ABI 3.4: attestation (pure.rs).
+    assert_layout!(aster_attest_options_t, size = 32, align = 8, {
+        struct_size = 0,
+        reserved = 4,
+        epoch = 8,
+        not_before = 16,
+        not_after = 24,
+    });
+
+    assert_layout!(aster_verified_chain_t, size = 96, align = 8, {
+        struct_size = 0,
+        depth = 4,
+        node = 8,
+        anchor = 40,
+        intermediates = 72,
+        intermediates_count = 80,
+        storage = 88,
+    });
+
+    // ABI 3.4: sealed grants (grants.rs).
+    assert_layout!(aster_grant_context_t, size = 104, align = 8, {
+        struct_size = 0,
+        reserved = 4,
+        app = 8,
+        granter = 24,
+        recipient = 40,
+        resource = 56,
+        path = 72,
+        role = 88,
+    });
+
+    assert_layout!(aster_grant_record_t, size = 72, align = 8, {
+        struct_size = 0,
+        state = 4,
+        context_version = 8,
+        reserved = 12,
+        role = 16,
+        envelope = 32,
+        reason = 48,
+        storage = 64,
+    });
+
+    assert_layout!(aster_grant_outcome_t, size = 72, align = 8, {
+        struct_size = 0,
+        kind = 4,
+        access = 8,
+        drops_capability = 12,
+        payload = 16,
+        reason = 32,
+        role = 48,
+        storage = 64,
     });
 }

@@ -15,7 +15,12 @@ public enum IrohStatus {
   CONNECTION_REFUSED(10),
   STREAM_RESET(11),
   /** {@code aster_runtime_new} was called with a different ABI major than the library. */
-  ABI_MISMATCH(12);
+  ABI_MISMATCH(12),
+  /**
+   * A well-formed input failed a security check: an envelope did not open, an attestation chain did
+   * not verify, or a grant role did not match its capability (ABI 3.4).
+   */
+  VERIFICATION_FAILED(13);
 
   public final int code;
 

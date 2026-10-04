@@ -52,6 +52,7 @@ public class IrohException extends RuntimeException {
       case STREAM_RESET -> new site.aster.exception.IrohStreamResetException(message);
       case BUFFER_TOO_SMALL -> new site.aster.exception.IrohBufferTooSmallException(message);
       case ALREADY_CLOSED -> new site.aster.exception.IrohAlreadyClosedException(message);
+      case VERIFICATION_FAILED -> new site.aster.exception.VerificationFailedException(message);
       default -> new IrohException(status, message);
     };
   }
