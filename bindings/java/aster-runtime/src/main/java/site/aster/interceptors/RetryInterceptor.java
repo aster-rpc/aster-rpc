@@ -7,10 +7,14 @@ import java.util.concurrent.ThreadLocalRandom;
  * Retry interceptor providing retry policy hints for client calls.
  *
  * <p>This interceptor does not perform retries itself -- it exposes {@link #shouldRetry} and {@link
- * #backoffSeconds} for the client dispatch loop to consult.
+ * #backoffSeconds} for the client dispatch loop to consult. {@code AsterClient} retries unary and
+ * client-streaming calls only: an attempt is repeated when the call is marked idempotent ({@link
+ * CallOptions#idempotent}), the (post-interceptor) error code is retryable and fewer than {@link
+ * #maxAttempts()} attempts have been made.
  */
 public final class RetryInterceptor implements Interceptor {
 
+  private final int maxAttempts;
   private final Set<StatusCode> retryableCodes;
   private final long initialMs;
   private final long maxMs;
@@ -20,6 +24,7 @@ public final class RetryInterceptor implements Interceptor {
   /**
    * Creates a retry interceptor with the given backoff parameters.
    *
+   * @param maxAttempts maximum attempts including the first (default 3)
    * @param retryableCodes status codes eligible for retry (default: UNAVAILABLE only)
    * @param initialMs initial backoff in milliseconds (default 100)
    * @param maxMs maximum backoff in milliseconds (default 5000)
@@ -27,11 +32,13 @@ public final class RetryInterceptor implements Interceptor {
    * @param jitter jitter factor (0.0 to 1.0) applied to the delay (default 0.2)
    */
   public RetryInterceptor(
+      int maxAttempts,
       Set<StatusCode> retryableCodes,
       long initialMs,
       long maxMs,
       double multiplier,
       double jitter) {
+    this.maxAttempts = Math.max(1, maxAttempts);
     this.retryableCodes = retryableCodes != null ? retryableCodes : Set.of(StatusCode.UNAVAILABLE);
     this.initialMs = initialMs;
     this.maxMs = maxMs;
@@ -41,7 +48,12 @@ public final class RetryInterceptor implements Interceptor {
 
   /** Creates a retry interceptor with default settings. */
   public RetryInterceptor() {
-    this(Set.of(StatusCode.UNAVAILABLE), 100, 5000, 2.0, 0.2);
+    this(3, Set.of(StatusCode.UNAVAILABLE), 100, 5000, 2.0, 0.2);
+  }
+
+  /** Maximum attempts including the first. */
+  public int maxAttempts() {
+    return maxAttempts;
   }
 
   /**

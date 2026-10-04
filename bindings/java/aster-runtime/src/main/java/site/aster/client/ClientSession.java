@@ -55,21 +55,65 @@ public final class ClientSession implements AutoCloseable {
     return connection;
   }
 
+  private volatile String peer;
+
+  /** The remote endpoint id, resolved on first use (the interceptors' {@code ctx.peer()}). */
+  private String peer() {
+    String p = peer;
+    if (p == null) {
+      try {
+        p = connection.remoteId();
+      } catch (RuntimeException e) {
+        p = "";
+      }
+      peer = p;
+    }
+    return p;
+  }
+
+  private AsterClient.ConnSource source() {
+    return () -> connection;
+  }
+
   /** Make a unary call into this session. */
   public <Req, Resp> CompletableFuture<Resp> call(
       String service, String method, Req request, Class<Resp> responseType) {
-    return client.runUnary(connection, sessionId, service, method, request, responseType);
+    return call(service, method, request, responseType, CallOptions.DEFAULT);
+  }
+
+  /** {@link #call(String, String, Object, Class)} with per-call {@link CallOptions}. */
+  public <Req, Resp> CompletableFuture<Resp> call(
+      String service, String method, Req request, Class<Resp> responseType, CallOptions options) {
+    return client.runUnary(
+        source(), peer(), sessionId, service, method, request, responseType, options);
   }
 
   /** Make a server-streaming call into this session. */
   public <Req, Resp> CompletableFuture<List<Resp>> callServerStream(
       String service, String method, Req request, Class<Resp> responseType) {
-    return client.runServerStream(connection, sessionId, service, method, request, responseType);
+    return callServerStream(service, method, request, responseType, CallOptions.DEFAULT);
+  }
+
+  /** {@link #callServerStream(String, String, Object, Class)} with per-call options. */
+  public <Req, Resp> CompletableFuture<List<Resp>> callServerStream(
+      String service, String method, Req request, Class<Resp> responseType, CallOptions options) {
+    return client.runServerStream(
+        source(), peer(), sessionId, service, method, request, responseType, options);
   }
 
   /** Make a client-streaming call into this session. */
   public <Req, Resp> CompletableFuture<Resp> callClientStream(
       String service, String method, Iterable<Req> requests, Class<Resp> responseType) {
+    return callClientStream(service, method, requests, responseType, CallOptions.DEFAULT);
+  }
+
+  /** {@link #callClientStream(String, String, Iterable, Class)} with per-call options. */
+  public <Req, Resp> CompletableFuture<Resp> callClientStream(
+      String service,
+      String method,
+      Iterable<Req> requests,
+      Class<Resp> responseType,
+      CallOptions options) {
     List<Req> materialized = materialize(requests);
     if (materialized.isEmpty()) {
       return CompletableFuture.failedFuture(
@@ -78,7 +122,7 @@ public final class ClientSession implements AutoCloseable {
                   + " the first frame inline with the call to bootstrap the dispatcher"));
     }
     return client.runClientStream(
-        connection, sessionId, service, method, materialized, responseType);
+        source(), peer(), sessionId, service, method, materialized, responseType, options);
   }
 
   /**
@@ -87,6 +131,16 @@ public final class ClientSession implements AutoCloseable {
    */
   public <Req, Resp> CompletableFuture<List<Resp>> callBidiStream(
       String service, String method, Iterable<Req> requests, Class<Resp> responseType) {
+    return callBidiStream(service, method, requests, responseType, CallOptions.DEFAULT);
+  }
+
+  /** {@link #callBidiStream(String, String, Iterable, Class)} with per-call options. */
+  public <Req, Resp> CompletableFuture<List<Resp>> callBidiStream(
+      String service,
+      String method,
+      Iterable<Req> requests,
+      Class<Resp> responseType,
+      CallOptions options) {
     List<Req> materialized = materialize(requests);
     if (materialized.isEmpty()) {
       return CompletableFuture.failedFuture(
@@ -95,13 +149,20 @@ public final class ClientSession implements AutoCloseable {
                   + " the first frame inline with the call to bootstrap the dispatcher"));
     }
     return client.runBidiBuffered(
-        connection, sessionId, service, method, materialized, responseType);
+        source(), peer(), sessionId, service, method, materialized, responseType, options);
   }
 
   /** Open a true interleaved bidi-streaming call into this session. */
   public <Req, Resp> BidiCall<Req, Resp> openBidiStream(
       String service, String method, Class<Resp> responseType) {
-    return client.openBidiStreamOn(connection, sessionId, service, method, responseType);
+    return openBidiStream(service, method, responseType, CallOptions.DEFAULT);
+  }
+
+  /** {@link #openBidiStream(String, String, Class)} with per-call options. */
+  public <Req, Resp> BidiCall<Req, Resp> openBidiStream(
+      String service, String method, Class<Resp> responseType, CallOptions options) {
+    return client.openBidiStreamOn(
+        connection, peer(), sessionId, service, method, responseType, options);
   }
 
   /**

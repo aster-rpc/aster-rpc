@@ -19,9 +19,9 @@ import org.junit.jupiter.api.Test;
  * bytes canonicalizes (through the Rust FFI) to the same bytes, type hash and contract id as the
  * Rust {@code #[aster(default = ...)]} producer.
  *
- * <p>This covers the contract-identity plumbing only. The Java annotation layer has no
- * default-value marker yet: {@link ContractManifestBuilder} always emits {@code required=true}, so
- * a Java service cannot <em>declare</em> defaults (tracked as a gap).
+ * <p>This covers the contract-identity plumbing (a hand-built {@link TypeDef}); {@link
+ * ContractDefaultAnnotationTest} gates the {@code @ContractDefault} annotation layer on the same
+ * vector.
  */
 final class ContractDefaultsVectorTest {
 

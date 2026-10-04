@@ -8,6 +8,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.function.BooleanSupplier;
 import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
 import site.aster.config.AsterConfig;
@@ -16,6 +17,7 @@ import site.aster.ffi.AsterEnvelope;
 import site.aster.ffi.Rpc;
 import site.aster.handle.IrohConnection;
 import site.aster.handle.IrohEndpoint;
+import site.aster.interceptors.CallContext;
 import site.aster.interceptors.Interceptor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
@@ -36,6 +38,15 @@ import site.aster.trust.ConsumerAdmissionWire;
  * unary calls in one native round trip on the connection's pooled streams, streaming calls on
  * dedicated substreams. Rust builds the header, frames, compresses and decodes trailers; this class
  * encodes payloads and maps statuses to {@link RpcError}.
+ *
+ * <p>The builder's {@link Builder#interceptors interceptors} run on every call pattern (see {@link
+ * Interception}): request interceptors before sending, response interceptors on every response,
+ * error interceptors (reverse order) on a failure. Unary and client-streaming calls additionally
+ * run under {@code CircuitBreakerInterceptor} (per attempt) and {@code RetryInterceptor}
+ * (idempotent calls, see {@link CallOptions#idempotent()}), and {@code DeadlineInterceptor} refuses
+ * an expired call; {@link CallOptions#timeout()} is propagated to the server as the remaining
+ * deadline of each attempt. Metadata an interceptor adds to {@code ctx.metadata()} goes out as
+ * request headers. The auth / capability interceptors are frozen and unchanged (plan D3).
  */
 public final class AsterClient implements AutoCloseable {
 
@@ -172,12 +183,43 @@ public final class AsterClient implements AutoCloseable {
     return fallback;
   }
 
+  /** The connection a call runs on; resolved (and so dialled) inside each attempt. */
+  @FunctionalInterface
+  interface ConnSource {
+    IrohConnection get() throws Exception;
+  }
+
+  private ConnSource dial(NodeAddr target) {
+    return () -> {
+      try {
+        return connect(target).get();
+      } catch (java.util.concurrent.ExecutionException e) {
+        throw e.getCause() instanceof Exception ex ? ex : e;
+      }
+    };
+  }
+
   /** Make a unary RPC call against a SHARED-scoped service (sessionId=0). */
   public <Req, Resp> CompletableFuture<Resp> call(
       NodeAddr target, String service, String method, Req request, Class<Resp> responseType) {
-    return connect(target)
-        .thenComposeAsync(
-            conn -> runUnary(conn, 0, service, method, request, responseType), callExecutor);
+    return call(target, service, method, request, responseType, CallOptions.DEFAULT);
+  }
+
+  /**
+   * Make a unary RPC call with per-call {@link CallOptions}: the client's interceptors run around
+   * it (deadline, circuit breaker, retry of idempotent calls, user interceptors; see {@link
+   * Interception}). Cancelling the returned future cancels the native call when {@link
+   * CallOptions#cancellable()}.
+   */
+  public <Req, Resp> CompletableFuture<Resp> call(
+      NodeAddr target,
+      String service,
+      String method,
+      Req request,
+      Class<Resp> responseType,
+      CallOptions options) {
+    return runUnary(
+        dial(target), target.endpointId(), 0, service, method, request, responseType, options);
   }
 
   /**
@@ -202,9 +244,19 @@ public final class AsterClient implements AutoCloseable {
    */
   public <Req, Resp> CompletableFuture<List<Resp>> callServerStream(
       NodeAddr target, String service, String method, Req request, Class<Resp> responseType) {
-    return connect(target)
-        .thenComposeAsync(
-            conn -> runServerStream(conn, 0, service, method, request, responseType), callExecutor);
+    return callServerStream(target, service, method, request, responseType, CallOptions.DEFAULT);
+  }
+
+  /** {@link #callServerStream} with per-call options; cancelling the future cancels the call. */
+  public <Req, Resp> CompletableFuture<List<Resp>> callServerStream(
+      NodeAddr target,
+      String service,
+      String method,
+      Req request,
+      Class<Resp> responseType,
+      CallOptions options) {
+    return runServerStream(
+        dial(target), target.endpointId(), 0, service, method, request, responseType, options);
   }
 
   /**
@@ -216,33 +268,60 @@ public final class AsterClient implements AutoCloseable {
    */
   public <Req, Resp> CompletableFuture<ServerStreamCall<Resp>> openServerStream(
       NodeAddr target, String service, String method, Req request, Class<Resp> responseType) {
+    return openServerStream(target, service, method, request, responseType, CallOptions.DEFAULT);
+  }
+
+  /**
+   * {@link #openServerStream} with per-call options. The request interceptors run on {@code
+   * request} when the call opens; the response interceptors on every {@code recv()}, the error
+   * interceptors on a failing one.
+   */
+  public <Req, Resp> CompletableFuture<ServerStreamCall<Resp>> openServerStream(
+      NodeAddr target,
+      String service,
+      String method,
+      Req request,
+      Class<Resp> responseType,
+      CallOptions options) {
     return connect(target)
         .thenApplyAsync(
-            conn -> openServerStreamOn(conn, 0, service, method, request, responseType),
+            conn ->
+                openServerStreamOn(
+                    conn, target.endpointId(), 0, service, method, request, responseType, options),
             callExecutor);
   }
 
   <Req, Resp> ServerStreamCall<Resp> openServerStreamOn(
       IrohConnection conn,
+      String peer,
       int sessionId,
       String service,
       String method,
       Req request,
-      Class<Resp> responseType) {
+      Class<Resp> responseType,
+      CallOptions options) {
+    CallContext ctx =
+        Interception.context(
+            interceptors, service, method, sessionId, peer, "server_stream", options);
+    Object req = request;
+    if (ctx != null) {
+      req = Interception.request(interceptors, ctx, request);
+    }
     long rt = conn.runtime().nativeHandle();
     long call =
         Rpc.open(
             rt,
             conn.nativeHandle(),
             Rpc.PATTERN_SERVER_STREAM,
-            Rpc.Options.of(service, method, sessionId));
+            streamOptions(service, method, sessionId, ctx, options));
     try {
-      Rpc.send(rt, call, codec.encode(request), true);
+      Rpc.send(rt, call, codec.encode(req), true);
     } catch (Throwable t) {
       Rpc.release(rt, call);
       throw reThrow(t);
     }
-    return new ServerStreamCall<>(rt, call, codec, responseType);
+    return new ServerStreamCall<>(
+        rt, call, codec, responseType, ctx == null ? null : new Intercepted(interceptors, ctx));
   }
 
   /**
@@ -255,6 +334,21 @@ public final class AsterClient implements AutoCloseable {
       String method,
       Iterable<Req> requests,
       Class<Resp> responseType) {
+    return callClientStream(target, service, method, requests, responseType, CallOptions.DEFAULT);
+  }
+
+  /**
+   * {@link #callClientStream} with per-call options. Like unary calls it runs under the full
+   * interceptor lifecycle (breaker, retry of idempotent calls); the request interceptors run on
+   * every request, each attempt.
+   */
+  public <Req, Resp> CompletableFuture<Resp> callClientStream(
+      NodeAddr target,
+      String service,
+      String method,
+      Iterable<Req> requests,
+      Class<Resp> responseType,
+      CallOptions options) {
     List<Req> materialized = materialize(requests);
     if (materialized.isEmpty()) {
       return CompletableFuture.failedFuture(
@@ -262,10 +356,8 @@ public final class AsterClient implements AutoCloseable {
               "callClientStream requires at least one request frame; the wire format delivers"
                   + " the first frame inline with the call to bootstrap the dispatcher"));
     }
-    return connect(target)
-        .thenComposeAsync(
-            conn -> runClientStream(conn, 0, service, method, materialized, responseType),
-            callExecutor);
+    return runClientStream(
+        dial(target), target.endpointId(), 0, service, method, materialized, responseType, options);
   }
 
   /**
@@ -278,6 +370,17 @@ public final class AsterClient implements AutoCloseable {
       String method,
       Iterable<Req> requests,
       Class<Resp> responseType) {
+    return callBidiStream(target, service, method, requests, responseType, CallOptions.DEFAULT);
+  }
+
+  /** {@link #callBidiStream} with per-call options; cancelling the future cancels the call. */
+  public <Req, Resp> CompletableFuture<List<Resp>> callBidiStream(
+      NodeAddr target,
+      String service,
+      String method,
+      Iterable<Req> requests,
+      Class<Resp> responseType,
+      CallOptions options) {
     List<Req> materialized = materialize(requests);
     if (materialized.isEmpty()) {
       return CompletableFuture.failedFuture(
@@ -285,10 +388,8 @@ public final class AsterClient implements AutoCloseable {
               "callBidiStream requires at least one request frame; the wire format delivers"
                   + " the first frame inline with the call to bootstrap the dispatcher"));
     }
-    return connect(target)
-        .thenComposeAsync(
-            conn -> runBidiBuffered(conn, 0, service, method, materialized, responseType),
-            callExecutor);
+    return runBidiBuffered(
+        dial(target), target.endpointId(), 0, service, method, materialized, responseType, options);
   }
 
   /**
@@ -297,54 +398,99 @@ public final class AsterClient implements AutoCloseable {
    */
   public <Req, Resp> CompletableFuture<BidiCall<Req, Resp>> openBidiStream(
       NodeAddr target, String service, String method, Class<Resp> responseType) {
+    return openBidiStream(target, service, method, responseType, CallOptions.DEFAULT);
+  }
+
+  /**
+   * {@link #openBidiStream} with per-call options. The request interceptors run on every {@code
+   * send}, the response interceptors on every {@code recv}, the error interceptors on a failing
+   * one.
+   */
+  public <Req, Resp> CompletableFuture<BidiCall<Req, Resp>> openBidiStream(
+      NodeAddr target,
+      String service,
+      String method,
+      Class<Resp> responseType,
+      CallOptions options) {
     return connect(target)
         .thenApplyAsync(
-            conn -> openBidiStreamOn(conn, 0, service, method, responseType), callExecutor);
+            conn ->
+                openBidiStreamOn(
+                    conn, target.endpointId(), 0, service, method, responseType, options),
+            callExecutor);
   }
 
   <Req, Resp> BidiCall<Req, Resp> openBidiStreamOn(
-      IrohConnection conn, int sessionId, String service, String method, Class<Resp> responseType) {
+      IrohConnection conn,
+      String peer,
+      int sessionId,
+      String service,
+      String method,
+      Class<Resp> responseType,
+      CallOptions options) {
+    CallContext ctx =
+        Interception.context(
+            interceptors, service, method, sessionId, peer, "bidi_stream", options);
     long rt = conn.runtime().nativeHandle();
     long call =
         Rpc.open(
             rt,
             conn.nativeHandle(),
             Rpc.PATTERN_BIDI_STREAM,
-            Rpc.Options.of(service, method, sessionId));
-    return new BidiCall<Req, Resp>(rt, call, codec, responseType);
+            streamOptions(service, method, sessionId, ctx, options));
+    return new BidiCall<Req, Resp>(
+        rt, call, codec, responseType, ctx == null ? null : new Intercepted(interceptors, ctx));
   }
 
+  private static Rpc.Options streamOptions(
+      String service, String method, int sessionId, CallContext ctx, CallOptions options) {
+    return new Rpc.Options(
+        service,
+        method,
+        1,
+        sessionId,
+        Interception.deadlineMs(ctx, options),
+        Interception.metadata(ctx, options));
+  }
+
+  /** A streaming call's interceptor chain and context (see {@link BidiCall}). */
+  record Intercepted(List<Interceptor> chain, CallContext ctx) {}
+
   <Req, Resp> CompletableFuture<Resp> runUnary(
-      IrohConnection conn,
+      ConnSource source,
+      String peer,
       int sessionId,
       String service,
       String method,
       Req request,
-      Class<Resp> responseType) {
-    CompletableFuture<Resp> out = new CompletableFuture<>();
+      Class<Resp> responseType,
+      CallOptions options) {
+    InvocationFuture<Resp> out = new InvocationFuture<>();
+    CallContext ctx =
+        Interception.context(interceptors, service, method, sessionId, peer, "unary", options);
     callExecutor.execute(
         () -> {
+          if (out.isCancelled()) {
+            return;
+          }
           try {
-            byte[] requestBytes = codec.encode(request);
-            long probeT0 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
-            Rpc.UnaryResult result =
-                Rpc.unary(
-                    conn.runtime().nativeHandle(),
-                    conn.nativeHandle(),
-                    Rpc.Options.of(service, method, sessionId),
-                    requestBytes);
-            if (site.aster.probe.AsterProbes.ENABLED) {
-              site.aster.probe.AsterProbes.recordClient(probeT0, System.nanoTime());
-            }
-            if (result.code() != RpcStatus.OK) {
-              throw rpcError(result.status());
-            }
-            if (result.payload().length == 0) {
-              throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
-            }
-            @SuppressWarnings("unchecked")
-            Resp decoded = (Resp) codec.decode(result.payload(), responseType);
-            out.complete(decoded);
+            Resp response =
+                Interception.execute(
+                    interceptors,
+                    ctx,
+                    options,
+                    request,
+                    false,
+                    out::isCancelled,
+                    (req, deadlineMs, metadata) ->
+                        unaryAttempt(
+                            out,
+                            source.get(),
+                            new Rpc.Options(service, method, 1, sessionId, deadlineMs, metadata),
+                            req,
+                            responseType,
+                            options.cancellable()));
+            out.complete(response);
           } catch (Throwable t) {
             out.completeExceptionally(unwrap(t));
           }
@@ -352,97 +498,249 @@ public final class AsterClient implements AutoCloseable {
     return out;
   }
 
-  <Req, Resp> CompletableFuture<List<Resp>> runServerStream(
+  /**
+   * One unary attempt: encode, run on the pooled fast path or a cancellable native call, decode.
+   */
+  private <Resp> Resp unaryAttempt(
+      InvocationFuture<Resp> out,
       IrohConnection conn,
+      Rpc.Options ro,
+      Object request,
+      Class<Resp> responseType,
+      boolean cancellable)
+      throws Exception {
+    byte[] requestBytes = codec.encode(request);
+    long rt = conn.runtime().nativeHandle();
+    byte[] payload;
+    if (cancellable) {
+      payload = cancellableUnary(out, rt, conn.nativeHandle(), ro, requestBytes);
+    } else {
+      long probeT0 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
+      Rpc.UnaryResult result = Rpc.unary(rt, conn.nativeHandle(), ro, requestBytes);
+      if (site.aster.probe.AsterProbes.ENABLED) {
+        site.aster.probe.AsterProbes.recordClient(probeT0, System.nanoTime());
+      }
+      if (result.code() != RpcStatus.OK) {
+        throw rpcError(result.status());
+      }
+      payload = result.payload();
+    }
+    if (payload.length == 0) {
+      throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
+    }
+    @SuppressWarnings("unchecked")
+    Resp decoded = (Resp) codec.decode(payload, responseType);
+    return decoded;
+  }
+
+  /**
+   * The same wire exchange as {@code aster_rpc_unary} (header and request in one write) on a call
+   * of its own opened with the server-stream pattern, so cancelling {@code out} cancels the native
+   * call ({@code FLAG_CANCEL} plus a reset) and the server's handler sees it — as Go and .NET do
+   * for a cancellable context / token.
+   */
+  private byte[] cancellableUnary(
+      InvocationFuture<?> out, long rt, long conn, Rpc.Options ro, byte[] requestBytes) {
+    long call = Rpc.open(rt, conn, Rpc.PATTERN_SERVER_STREAM, ro);
+    InvocationFuture.NativeCall nc = new InvocationFuture.NativeCall(rt, call);
+    out.onCancel(nc::cancel);
+    try {
+      Rpc.send(rt, call, requestBytes, true); // false: the call is over, the trailer says why
+      byte[] payload = null;
+      while (true) {
+        switch (Rpc.recvPolling(rt, call, out::isCancelled)) {
+          case Rpc.Recv.Data d -> {
+            if (payload != null) {
+              throw new RpcError(
+                  StatusCode.INTERNAL, "unary call received more than one response frame");
+            }
+            payload = d.payload();
+          }
+          case Rpc.Recv.Trailer t -> {
+            RpcError e = statusError(t.status());
+            if (e != null) {
+              throw e;
+            }
+            return payload != null ? payload : new byte[0];
+          }
+          case Rpc.Recv.Timeout ignored -> {
+            // recvPolling never returns Timeout
+          }
+        }
+      }
+    } finally {
+      out.clearOnCancel();
+      nc.release();
+    }
+  }
+
+  <Req, Resp> CompletableFuture<List<Resp>> runServerStream(
+      ConnSource source,
+      String peer,
       int sessionId,
       String service,
       String method,
       Req request,
-      Class<Resp> responseType) {
-    CompletableFuture<List<Resp>> out = new CompletableFuture<>();
+      Class<Resp> responseType,
+      CallOptions options) {
+    return runStreaming(
+        source,
+        peer,
+        sessionId,
+        service,
+        method,
+        "server_stream",
+        Rpc.PATTERN_SERVER_STREAM,
+        List.of(request),
+        responseType,
+        options);
+  }
+
+  <Req, Resp> CompletableFuture<List<Resp>> runBidiBuffered(
+      ConnSource source,
+      String peer,
+      int sessionId,
+      String service,
+      String method,
+      List<Req> requests,
+      Class<Resp> responseType,
+      CallOptions options) {
+    return runStreaming(
+        source,
+        peer,
+        sessionId,
+        service,
+        method,
+        "bidi_stream",
+        Rpc.PATTERN_BIDI_STREAM,
+        requests,
+        responseType,
+        options);
+  }
+
+  /**
+   * Server-stream and buffered bidi: no retry or breaker (as in Python), but the request
+   * interceptors see every request, the response interceptors every response and the error
+   * interceptors a failure (one that suppresses it ends the list early); the deadline propagates.
+   */
+  private <Resp> CompletableFuture<List<Resp>> runStreaming(
+      ConnSource source,
+      String peer,
+      int sessionId,
+      String service,
+      String method,
+      String pattern,
+      int nativePattern,
+      List<?> requests,
+      Class<Resp> responseType,
+      CallOptions options) {
+    InvocationFuture<List<Resp>> out = new InvocationFuture<>();
+    CallContext ctx =
+        Interception.context(interceptors, service, method, sessionId, peer, pattern, options);
     callExecutor.execute(
         () -> {
-          long rt = conn.runtime().nativeHandle();
-          long call = 0;
+          if (out.isCancelled()) {
+            return;
+          }
+          List<Resp> collected = new ArrayList<>();
           try {
-            call =
+            List<Object> reqs = new ArrayList<>(requests);
+            if (ctx != null) {
+              reqs = Interception.requestEach(interceptors, ctx, reqs);
+            }
+            IrohConnection conn = source.get();
+            long rt = conn.runtime().nativeHandle();
+            long call =
                 Rpc.open(
                     rt,
                     conn.nativeHandle(),
-                    Rpc.PATTERN_SERVER_STREAM,
-                    Rpc.Options.of(service, method, sessionId));
-            Rpc.send(rt, call, codec.encode(request), true);
-            out.complete(drain(rt, call, responseType));
+                    nativePattern,
+                    streamOptions(service, method, sessionId, ctx, options));
+            InvocationFuture.NativeCall nc = new InvocationFuture.NativeCall(rt, call);
+            out.onCancel(nc::cancel);
+            try {
+              if (nativePattern == Rpc.PATTERN_SERVER_STREAM) {
+                // one request, header and request in one write (send_payloads is not for these)
+                Rpc.send(rt, call, codec.encode(reqs.get(0)), true);
+              } else {
+                sendAll(rt, call, reqs);
+              }
+              drain(rt, call, responseType, collected, ctx, out::isCancelled);
+            } finally {
+              out.clearOnCancel();
+              nc.release();
+            }
+            out.complete(collected);
           } catch (Throwable t) {
-            out.completeExceptionally(unwrap(t));
-          } finally {
-            if (call != 0) Rpc.release(rt, call);
+            Throwable e = Interception.error(interceptors, ctx, t);
+            if (e == null) {
+              out.complete(collected);
+            } else {
+              out.completeExceptionally(unwrap(e));
+            }
           }
         });
     return out;
   }
 
   <Req, Resp> CompletableFuture<Resp> runClientStream(
-      IrohConnection conn,
+      ConnSource source,
+      String peer,
       int sessionId,
       String service,
       String method,
       List<Req> requests,
-      Class<Resp> responseType) {
-    CompletableFuture<Resp> out = new CompletableFuture<>();
+      Class<Resp> responseType,
+      CallOptions options) {
+    InvocationFuture<Resp> out = new InvocationFuture<>();
+    CallContext ctx =
+        Interception.context(
+            interceptors, service, method, sessionId, peer, "client_stream", options);
     callExecutor.execute(
         () -> {
-          long rt = conn.runtime().nativeHandle();
-          long call = 0;
-          try {
-            call =
-                Rpc.open(
-                    rt,
-                    conn.nativeHandle(),
-                    Rpc.PATTERN_CLIENT_STREAM,
-                    Rpc.Options.of(service, method, sessionId));
-            sendAll(rt, call, requests);
-            List<Resp> responses = drain(rt, call, responseType);
-            if (responses.size() != 1) {
-              throw new RpcError(
-                  StatusCode.INTERNAL,
-                  "client-stream call received " + responses.size() + " response frames");
-            }
-            out.complete(responses.get(0));
-          } catch (Throwable t) {
-            out.completeExceptionally(unwrap(t));
-          } finally {
-            if (call != 0) Rpc.release(rt, call);
+          if (out.isCancelled()) {
+            return;
           }
-        });
-    return out;
-  }
-
-  <Req, Resp> CompletableFuture<List<Resp>> runBidiBuffered(
-      IrohConnection conn,
-      int sessionId,
-      String service,
-      String method,
-      List<Req> requests,
-      Class<Resp> responseType) {
-    CompletableFuture<List<Resp>> out = new CompletableFuture<>();
-    callExecutor.execute(
-        () -> {
-          long rt = conn.runtime().nativeHandle();
-          long call = 0;
           try {
-            call =
-                Rpc.open(
-                    rt,
-                    conn.nativeHandle(),
-                    Rpc.PATTERN_BIDI_STREAM,
-                    Rpc.Options.of(service, method, sessionId));
-            sendAll(rt, call, requests);
-            out.complete(drain(rt, call, responseType));
+            Resp response =
+                Interception.execute(
+                    interceptors,
+                    ctx,
+                    options,
+                    requests,
+                    true,
+                    out::isCancelled,
+                    (reqs, deadlineMs, metadata) -> {
+                      IrohConnection conn = source.get();
+                      long rt = conn.runtime().nativeHandle();
+                      long call =
+                          Rpc.open(
+                              rt,
+                              conn.nativeHandle(),
+                              Rpc.PATTERN_CLIENT_STREAM,
+                              new Rpc.Options(service, method, 1, sessionId, deadlineMs, metadata));
+                      InvocationFuture.NativeCall nc = new InvocationFuture.NativeCall(rt, call);
+                      out.onCancel(nc::cancel);
+                      try {
+                        sendAll(rt, call, (List<?>) reqs);
+                        List<Resp> responses = new ArrayList<>();
+                        drain(rt, call, responseType, responses, null, out::isCancelled);
+                        if (responses.size() != 1) {
+                          throw new RpcError(
+                              StatusCode.INTERNAL,
+                              "client-stream call received "
+                                  + responses.size()
+                                  + " response frames");
+                        }
+                        return responses.get(0);
+                      } finally {
+                        out.clearOnCancel();
+                        nc.release();
+                      }
+                    });
+            out.complete(response);
           } catch (Throwable t) {
             out.completeExceptionally(unwrap(t));
-          } finally {
-            if (call != 0) Rpc.release(rt, call);
           }
         });
     return out;
@@ -459,7 +757,7 @@ public final class AsterClient implements AutoCloseable {
    * Send every request in batches (one native call and as few writes as possible per batch), the
    * last ending the request stream; stops if the call is over.
    */
-  private <Req> void sendAll(long rt, long call, List<Req> requests) {
+  private void sendAll(long rt, long call, List<?> requests) {
     int n = requests.size();
     for (int start = 0; start < n; start += SEND_BATCH) {
       int end = Math.min(n, start + SEND_BATCH);
@@ -473,23 +771,36 @@ public final class AsterClient implements AutoCloseable {
     }
   }
 
-  /** Read every response until the trailer; a non-OK trailer throws. */
-  private <Resp> List<Resp> drain(long rt, long call, Class<Resp> responseType) {
-    List<Resp> collected = new ArrayList<>();
+  /**
+   * Read every response until the trailer into {@code into}, applying the response interceptors
+   * when {@code ctx} is set; a non-OK trailer throws. {@code stop} cancels the native call.
+   */
+  private <Resp> void drain(
+      long rt,
+      long call,
+      Class<Resp> responseType,
+      List<Resp> into,
+      CallContext ctx,
+      BooleanSupplier stop) {
     while (true) {
-      Rpc.Recv r = Rpc.recvPolling(rt, call, () -> false); // bounded waits; interrupt cancels
+      Rpc.Recv r = Rpc.recvPolling(rt, call, stop); // bounded waits; interrupt cancels
       switch (r) {
         case Rpc.Recv.Data d -> {
           @SuppressWarnings("unchecked")
           Resp decoded = (Resp) codec.decode(d.payload(), responseType);
-          collected.add(decoded);
+          if (ctx != null) {
+            @SuppressWarnings("unchecked")
+            Resp intercepted = (Resp) Interception.response(interceptors, ctx, decoded);
+            decoded = intercepted;
+          }
+          into.add(decoded);
         }
         case Rpc.Recv.Trailer t -> {
           RpcError e = statusError(t.status());
           if (e != null) {
             throw e;
           }
-          return collected;
+          return;
         }
         case Rpc.Recv.Timeout ignored -> {
           // recvPolling never returns Timeout
