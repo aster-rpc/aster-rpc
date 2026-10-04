@@ -10,6 +10,7 @@
 //! # consumer side
 //! send, recv = await open_relay(conn, "api", b"token")            # raw stream to a socket target
 //! resp = await relay_http(conn, "app", "GET", "/")                # one buffered HTTP exchange
+//! upload, pending = relay_http_streaming(conn, "app", "POST", "/")  # streamed both ways
 //! reg = await request_route(conn, [RouteSpec("a.example", 443)])  # ask an edge for routes
 //! ```
 //!
@@ -26,6 +27,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyMemoryView, PyString, PyTuple};
 use pyo3_async_runtimes::tokio::future_into_py;
 
+use aster::binding_support::relay::{relay_streaming, RelayOptions, RelayReader, RelayUpload};
 use aster::binding_support::upcall::codec::{
     ExposeHttpRequest, ExposeHttpResponse, ExposeRouteSpec, HttpBodyMode, HttpHeader,
 };
@@ -280,6 +282,205 @@ fn relay_http<'py>(
             .map(Bound::unbind)
         })
     })
+}
+
+/// Consumer side: one HTTP exchange with the service `service_id` on
+/// `conn`, streamed both ways. Returns `(HttpUpload, awaitable)` at once:
+/// write the request body through the upload (then `finish()`) while
+/// awaiting the response, an `aster.expose.HttpResponse` whose `body` is an
+/// `HttpRelayBody` to read. The relay sends the whole request body before
+/// it reads the response head (not full duplex: a handler that answers
+/// before reading the body stalls the upload, and the awaitable fails).
+/// The exchange runs whether or not the awaitable is awaited; cancelling
+/// it resets the request.
+/// `aster.expose.relay_http_stream` drives the upload for you.
+#[pyfunction]
+#[pyo3(signature = (
+    conn, service_id, method="GET", uri="/", headers=None, *,
+    max_chunk=DEFAULT_MAX_CHUNK, capacity=8
+))]
+#[allow(clippy::too_many_arguments)]
+fn relay_http_streaming<'py>(
+    py: Python<'py>,
+    conn: &IrohConnection,
+    service_id: String,
+    method: &str,
+    uri: &str,
+    headers: Option<&Bound<'py, PyAny>>,
+    max_chunk: usize,
+    capacity: usize,
+) -> PyResult<(HttpUpload, Bound<'py, PyAny>)> {
+    let headers = match headers.filter(|h| !h.is_none()) {
+        Some(h) => headers_in(h, "headers")?,
+        None => Vec::new(),
+    };
+    let options = RelayOptions {
+        max_chunk: max_chunk.max(1),
+        upload_capacity: capacity.max(1),
+    };
+    let runtime = pyo3_async_runtimes::tokio::get_runtime().handle().clone();
+    let (upload, response) = relay_streaming(
+        &runtime,
+        &conn.sdk(),
+        &service_id,
+        method,
+        uri,
+        &headers,
+        options,
+    )
+    .map_err(aster_err_to_py)?;
+    let pending = future_into_py(py, async move {
+        let (head, reader) = response.wait().await.map_err(aster_err_to_py)?;
+        Python::attach(|py| {
+            let body = Bound::new(py, HttpRelayBody { reader })?;
+            py_value!(py, "aster.expose", "HttpResponse" {
+                status: head.status,
+                headers: headers_out(py, &head.headers)?,
+                body: body,
+            })
+            .map(Bound::unbind)
+        })
+    })?;
+    Ok((HttpUpload { upload }, pending))
+}
+
+/// The request body of a `relay_http_streaming` exchange. Dropping it (or
+/// garbage collection) without `finish()` aborts the request: the handler
+/// sees a failed body, never a truncated one.
+#[pyclass(frozen, module = "aster._aster")]
+pub struct HttpUpload {
+    upload: RelayUpload,
+}
+
+#[pymethods]
+impl HttpUpload {
+    /// The largest piece one write queues (bigger chunks are split).
+    #[getter]
+    fn max_chunk(&self) -> usize {
+        self.upload.max_chunk()
+    }
+
+    /// Whether the upload is over: finished, aborted, or the request is
+    /// gone (writes would fail).
+    #[getter]
+    fn closed(&self) -> bool {
+        self.upload.is_closed()
+    }
+
+    /// Awaitable: queue a chunk, waiting while the buffer is full
+    /// (backpressure). `HttpBodyError` `cancelled`: the request is gone.
+    fn write<'py>(
+        &self,
+        py: Python<'py>,
+        chunk: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let data = bytes_in(chunk)?;
+        let upload = self.upload.clone();
+        future_into_py(
+            py,
+            async move { upload.write(data).await.map_err(body_err) },
+        )
+    }
+
+    /// Queue a chunk (at most `max_chunk` bytes) without waiting: `False`
+    /// when the buffer is full (nothing queued).
+    fn try_write(&self, chunk: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.upload.try_write(bytes_in(chunk)?).map_err(body_err)
+    }
+
+    /// End the request body cleanly.
+    fn finish(&self) -> PyResult<()> {
+        self.upload.finish().map_err(body_err)
+    }
+
+    /// End the request body with an error: the request is reset and the
+    /// handler sees a failed body. `message` stays local.
+    #[pyo3(signature = (message="aborted"))]
+    fn abort(&self, message: &str) -> PyResult<()> {
+        self.upload.abort(message).map_err(body_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("HttpUpload(closed={})", self.upload.is_closed())
+    }
+}
+
+/// The response body of a `relay_http_streaming` exchange: `await read()`
+/// or `async for chunk in body`. A failed (reset) response raises
+/// `HttpBodyError` (`read`) on every read, never a clean end. `close()` /
+/// `aclose()` / `async with` stop it early (the handler's writes are
+/// cancelled); dropping it does the same.
+#[pyclass(frozen, module = "aster._aster")]
+pub struct HttpRelayBody {
+    reader: RelayReader,
+}
+
+#[pymethods]
+impl HttpRelayBody {
+    /// The largest chunk a read returns.
+    #[getter]
+    fn max_chunk(&self) -> usize {
+        self.reader.max_chunk()
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        self.reader.is_closed()
+    }
+
+    /// Awaitable: the next chunk (at most `max` bytes, and at most
+    /// `max_chunk`), or `None` at the end.
+    #[pyo3(signature = (max=65536))]
+    fn read<'py>(&self, py: Python<'py>, max: usize) -> PyResult<Bound<'py, PyAny>> {
+        let reader = self.reader.clone();
+        future_into_py(py, async move {
+            let chunk = reader.read(max).await.map_err(body_err)?;
+            Ok(chunk.map(|c| Python::attach(|py| PyBytes::new(py, &c).unbind())))
+        })
+    }
+
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let reader = self.reader.clone();
+        future_into_py(py, async move {
+            match reader.read(usize::MAX).await.map_err(body_err)? {
+                Some(c) => Ok(Python::attach(|py| PyBytes::new(py, &c).unbind())),
+                None => Err(PyStopAsyncIteration::new_err(())),
+            }
+        })
+    }
+
+    /// Stop reading; later reads raise `HttpBodyError` (`cancelled`).
+    /// Idempotent.
+    fn close(&self) {
+        self.reader.close();
+    }
+
+    /// Awaitable `close()`.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.reader.close();
+        future_into_py(py, async { Ok(()) })
+    }
+
+    fn __aenter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        future_into_py(py, async move { Ok(slf) })
+    }
+
+    #[pyo3(signature = (*_exc))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc: &Bound<'py, PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.aclose(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("HttpRelayBody(closed={})", self.reader.is_closed())
+    }
 }
 
 // ============================================================================
@@ -582,6 +783,10 @@ impl HttpBodyStream {
 // UCv1 <-> Python for expose (used by `crate::upcall`'s codec)
 // ============================================================================
 
+fn bytes_in(obj: &Bound<'_, PyAny>) -> PyResult<aster::expose::bytes::Bytes> {
+    Ok(chunk_in(obj)?.into())
+}
+
 fn chunk_in(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     if let Ok(s) = obj.cast::<PyString>() {
         return Ok(s.to_cow()?.as_bytes().to_vec());
@@ -819,8 +1024,11 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_class::<EdgeRouter>()?;
     m.add_class::<RouteRegistration>()?;
     m.add_class::<HttpBodyStream>()?;
+    m.add_class::<HttpUpload>()?;
+    m.add_class::<HttpRelayBody>()?;
     m.add_function(wrap_pyfunction!(open_relay, m)?)?;
     m.add_function(wrap_pyfunction!(relay_http, m)?)?;
+    m.add_function(wrap_pyfunction!(relay_http_streaming, m)?)?;
     m.add_function(wrap_pyfunction!(request_route, m)?)?;
     Ok(())
 }

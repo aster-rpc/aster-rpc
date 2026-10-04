@@ -30,7 +30,23 @@
  * const stream = await conn.openExposeStream('web');                        // socket target
  * const resp = await relayHttp(conn, 'app', { method: 'POST', body: 'you' }); // HTTP target
  * const reg = await requestRoute(conn, [{ host: 'a.example', port: 443, serviceId: 'app' }]);
+ * const up = await relayHttpStream(conn, 'app', { method: 'PUT', body: chunks() }); // streamed both ways
+ * for await (const chunk of up.body) sink(chunk);
  * ```
+ *
+ * **Streaming consumer** ({@link relayHttpStream}): the request `body` may be
+ * text, bytes or an (async) iterable of chunks, uploaded with backpressure;
+ * the response `body` is an {@link HttpRelayBody} (`read()`, `for await`,
+ * `await response.readBody(limit)`). The relay sends the whole request body
+ * before it reads the response head: it is not full duplex, so a handler that
+ * answers before reading the body (a `413`, say) stalls the upload and the
+ * call fails rather than returning that early answer. If the body iterator
+ * throws, the request is reset (the handler sees a failed body, never a
+ * truncated one) and the iterator's own error rejects the call. A handler can
+ * proxy by returning the relayed response, or its `body`. {@link
+ * relayHttpStreaming} is the low-level form: JavaScript has no deterministic
+ * drop, so an upload you leave unfinished stalls the handler until the
+ * connection idles out.
  *
  * **Authorization** (kind `expose_authorize`) runs once per `(connection,
  * service)`: an error or timeout applies the kind's failure mode
@@ -65,6 +81,9 @@
 import type {
   Expose as NativeExpose,
   HttpBodyHandle as NativeHttpBodyHandle,
+  HttpRelayBody as NativeHttpRelayBody,
+  HttpRelayResponse as NativeHttpRelayResponse,
+  HttpUpload as NativeHttpUpload,
   IrohConnection,
   ExposeHeader as NativeHeader,
   ExposeRouteSpec as NativeRouteSpec,
@@ -111,7 +130,7 @@ export interface HttpHeader {
  */
 export type HttpHeadersInit =
   | Record<string, string | Uint8Array | ReadonlyArray<string | Uint8Array>>
-  | Iterable<readonly [string, string | Uint8Array]>;
+  | Iterable<readonly [string, string | Uint8Array] | HttpHeader>;
 
 /** HTTP version of a request. @group Expose */
 export type HttpVersion = 'HTTP/0.9' | 'HTTP/1.0' | 'HTTP/1.1' | 'HTTP/2' | 'HTTP/3';
@@ -164,7 +183,10 @@ function toHeaders(init: HttpHeadersInit | undefined, what: string): NativeHeade
     out.push({ name: name.toLowerCase(), value: toBuffer(value) });
   };
   if (Symbol.iterator in init) {
-    for (const [name, value] of init as Iterable<readonly [string, string | Uint8Array]>) add(name, value);
+    for (const h of init as Iterable<readonly [string, string | Uint8Array] | HttpHeader>) {
+      if (Array.isArray(h)) add(h[0], h[1]);
+      else add((h as HttpHeader).name, (h as HttpHeader).value);
+    }
   } else {
     for (const [name, value] of Object.entries(init)) {
       if (value === undefined) continue;
@@ -318,7 +340,12 @@ export interface HttpResponse {
 export type HttpHandler = (
   request: HttpRequest,
   ctx: UpcallContext,
-) => Promise<HttpResponse | HttpBodyChunk> | HttpResponse | HttpBodyChunk;
+) =>
+  | Promise<HttpResponse | HttpStreamResponse | HttpBodyChunk | AsyncIterable<HttpBodyChunk>>
+  | HttpResponse
+  | HttpStreamResponse
+  | HttpBodyChunk
+  | AsyncIterable<HttpBodyChunk>;
 
 /** Options of {@link Expose.exposeHttp}. @group Expose */
 export interface ExposeHttpOptions {
@@ -491,6 +518,400 @@ export async function relayHttp(
       return r.headers.find((h) => h.name === n)?.value.toString('utf8');
     },
   };
+}
+
+// -- streaming consumer ---------------------------------------------------------------------
+
+/**
+ * The request body of a streaming relay exchange
+ * ({@link relayHttpStreaming}). Write chunks (awaiting each is the
+ * backpressure), then `finish()`, or `abort()` to reset the request.
+ *
+ * **JavaScript has no deterministic drop: an upload left unfinished (neither
+ * `finish()` nor `abort()`) keeps the handler's request body open and stalls
+ * the handler until the connection idles out.** {@link relayHttpStream}
+ * does this bookkeeping for you.
+ * @group Expose
+ */
+export class HttpUpload {
+  /** @internal */
+  constructor(private readonly native: NativeHttpUpload) {}
+
+  /** The largest piece one write queues (bigger chunks are split). */
+  get maxChunk(): number {
+    return this.native.maxChunk;
+  }
+
+  /** Whether the upload is over: finished, aborted, or the request is gone (writes would fail). */
+  get closed(): boolean {
+    return this.native.closed;
+  }
+
+  /**
+   * Queue a chunk, resolving once it is queued (waits while the buffer is
+   * full). Rejects with an {@link HttpBodyError}: `cancelled` when the
+   * request is gone (stop producing), `finished` after `finish()` / `abort()`.
+   */
+  async write(chunk: HttpBodyChunk): Promise<void> {
+    try {
+      await this.native.write(toBuffer(chunk));
+    } catch (e) {
+      throw bodyError(e);
+    }
+  }
+
+  /** Queue a chunk (at most `maxChunk` bytes) without waiting: `false` when the buffer is full (nothing queued). */
+  tryWrite(chunk: HttpBodyChunk): boolean {
+    try {
+      return this.native.tryWrite(toBuffer(chunk));
+    } catch (e) {
+      throw bodyError(e);
+    }
+  }
+
+  /** End the request body cleanly (queued chunks are still sent). A second end throws `finished`. */
+  finish(): void {
+    try {
+      this.native.finish();
+    } catch (e) {
+      throw bodyError(e);
+    }
+  }
+
+  /** End the request body with an error: the request is reset and the handler sees a failed body, never a truncated one. */
+  abort(message = 'aborted'): void {
+    try {
+      this.native.abort(message);
+    } catch (e) {
+      throw bodyError(e);
+    }
+  }
+}
+
+/**
+ * The response body of a streaming relay exchange: `await read()`, or
+ * `for await (const chunk of body)`. A response that failed partway rejects
+ * with a `read` {@link HttpBodyError} (code 7) on every read, never a clean
+ * end. `close()` stops it early (the handler's further writes are
+ * cancelled); so does `await using`, and leaving a `for await` early.
+ * Returning it (or the whole response) from an {@link HttpHandler} proxies
+ * it.
+ * @group Expose
+ */
+export class HttpRelayBody implements AsyncIterable<Buffer>, AsyncDisposable {
+  /** @internal */
+  constructor(private readonly native: NativeHttpRelayBody) {}
+
+  /** The largest chunk a read returns. */
+  get maxChunk(): number {
+    return this.native.maxChunk;
+  }
+
+  /** Whether `close()` was called. */
+  get closed(): boolean {
+    return this.native.closed;
+  }
+
+  /** The next chunk (at most `max` bytes, and at most `maxChunk`), or `null` at the end (sticky). */
+  async read(max?: number): Promise<Buffer | null> {
+    try {
+      return await this.native.read(max);
+    } catch (e) {
+      throw bodyError(e);
+    }
+  }
+
+  /** Stop reading; later reads reject `cancelled`. Idempotent. */
+  close(): void {
+    this.native.close();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<Buffer, void, undefined> {
+    // Leaving early (break, return, throw in the loop body) closes the
+    // body; a failed or finished response is left as it is (sticky).
+    let over = false;
+    try {
+      for (;;) {
+        const chunk = await this.read();
+        if (chunk === null) {
+          over = true;
+          return;
+        }
+        yield chunk;
+      }
+    } catch (e) {
+      over = true;
+      throw e;
+    } finally {
+      if (!over) this.close();
+    }
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    this.close();
+  }
+}
+
+/**
+ * A streamed response: the head and an {@link HttpRelayBody}. An
+ * {@link HttpHandler} can return it as its own answer to proxy it (the body
+ * streams through without buffering).
+ * @group Expose
+ */
+export class HttpStreamResponse {
+  /** @internal */
+  constructor(
+    readonly status: number,
+    readonly headers: readonly HttpHeader[],
+    readonly body: HttpRelayBody,
+  ) {}
+
+  /** The first value of header `name` (case-insensitive) as text, or `undefined`. */
+  header(name: string): string | undefined {
+    const n = name.toLowerCase();
+    return this.headers.find((h) => h.name === n)?.value.toString('utf8');
+  }
+
+  /**
+   * The whole body. `limit`: reject with `too_large` past that many bytes
+   * (the body is closed first).
+   */
+  async readBody(limit?: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let n = 0;
+    for (;;) {
+      const chunk = await this.body.read();
+      if (chunk === null) return Buffer.concat(chunks);
+      n += chunk.length;
+      if (limit != null && n > limit) {
+        this.body.close();
+        throw tooLarge(limit);
+      }
+      chunks.push(chunk);
+    }
+  }
+}
+
+/** A running streaming exchange until its response head is in. @group Expose */
+export class HttpStreamPending {
+  /** @internal */
+  constructor(private readonly native: NativeHttpRelayResponse) {}
+
+  /**
+   * The response. Resolves once the upload has finished and the head is in
+   * (the relay is not full duplex); rejects when the exchange failed
+   * (refused, unknown service, upload aborted, connection lost) or was
+   * cancelled. Call it once.
+   */
+  async wait(): Promise<HttpStreamResponse> {
+    const head = await this.native.wait();
+    return new HttpStreamResponse(head.status, head.headers, new HttpRelayBody(head.body));
+  }
+
+  /** Cancel the exchange: the request is reset and `wait()` rejects. No effect once the head is in. */
+  cancel(): void {
+    this.native.cancel();
+  }
+}
+
+/** Options of {@link relayHttpStreaming}. @group Expose */
+export interface RelayHttpStreamingOptions {
+  /** Default `GET`. */
+  method?: string;
+  /** Default `/`. */
+  uri?: string;
+  headers?: HttpHeadersInit;
+  /** Largest upload piece and largest read (default 1 MiB, > 0). */
+  maxChunk?: number;
+  /** Upload chunks buffered before a write waits (default 8, > 0). */
+  capacity?: number;
+}
+
+/** Options of {@link relayHttpStream}. @group Expose */
+export interface RelayHttpStreamOptions extends RelayHttpStreamingOptions {
+  /**
+   * The request body: text, bytes, an (async) iterable of chunks, or none.
+   * An iterable is pulled with backpressure.
+   */
+  body?: HttpResponseBody;
+  /**
+   * Abort the call until the response head is in: the request is reset and
+   * the promise rejects with `signal.reason`. (After the head, close the
+   * body yourself.)
+   */
+  signal?: AbortSignal;
+}
+
+/**
+ * Low level: start one HTTP exchange with `serviceId` on `conn`, streamed
+ * both ways. Returns the {@link HttpUpload} to write the request body
+ * through and the {@link HttpStreamPending} response, at once; the exchange
+ * is already running.
+ *
+ * You must drive the upload yourself, concurrently with `response.wait()`:
+ * the relay sends the whole request body before it reads the response head
+ * (it is **not full duplex**: a handler that answers before it has read
+ * the body, a `413` say, stalls the upload, and `wait()` fails rather than
+ * returning that early answer). **JavaScript has no deterministic drop: an
+ * upload left neither finished nor aborted stalls the handler until the
+ * connection idles out**, so `finish()` or `abort()` it on every path, and
+ * `cancel()` the response if you give up. {@link relayHttpStream} does that
+ * bookkeeping.
+ *
+ * Throws at once on an invalid method, URI, header or option.
+ * @group Expose
+ */
+export function relayHttpStreaming(
+  conn: IrohConnection,
+  serviceId: string,
+  options: RelayHttpStreamingOptions = {},
+): { upload: HttpUpload; response: HttpStreamPending } {
+  const started = conn.relayHttpStreaming(serviceId, {
+    method: options.method,
+    uri: options.uri,
+    headers: toHeaders(options.headers, 'headers'),
+    maxChunk: options.maxChunk,
+    capacity: options.capacity,
+  });
+  return { upload: new HttpUpload(started.upload), response: new HttpStreamPending(started.response) };
+}
+
+/** Feeds a request body into an upload; never rejects. */
+class UploadPump {
+  /** The source's own failure (it, not the relay reset it causes, is the better error). */
+  error: unknown = undefined;
+  failed = false;
+  /** `finish()` went through. */
+  clean = false;
+  private iterator: { return?: () => unknown } | undefined;
+  private stopped = false;
+  readonly done: Promise<void>;
+
+  constructor(
+    private readonly upload: HttpUpload,
+    body: HttpResponseBody,
+  ) {
+    this.done = this.run(body);
+  }
+
+  /** Reset the request unless it finished cleanly, and ask the source to stop (not awaited). */
+  stop(): void {
+    if (this.clean) return;
+    this.stopped = true;
+    try {
+      this.upload.abort('relay call abandoned');
+    } catch {
+      /* already over */
+    }
+    const ret = this.iterator?.return;
+    if (typeof ret === 'function') {
+      try {
+        Promise.resolve(ret.call(this.iterator)).catch(() => {});
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+
+  private async run(body: HttpResponseBody): Promise<void> {
+    try {
+      if (body == null) {
+        // no body
+      } else if (isChunk(body)) {
+        await this.upload.write(body);
+      } else if (Symbol.asyncIterator in body) {
+        const it = body[Symbol.asyncIterator]();
+        this.iterator = it;
+        for (;;) {
+          const r = await it.next();
+          if (r.done) break;
+          await this.upload.write(r.value);
+        }
+      } else if (Symbol.iterator in body) {
+        const it = body[Symbol.iterator]();
+        this.iterator = it;
+        for (;;) {
+          const r = it.next();
+          if (r.done) break;
+          await this.upload.write(r.value);
+        }
+      } else {
+        throw new TypeError('a request body must be a string, Uint8Array, an iterable of chunks or undefined');
+      }
+      if (this.stopped) return;
+      this.upload.finish();
+      this.clean = true;
+    } catch (e) {
+      if (!(e instanceof HttpBodyError && (e.kind === 'cancelled' || e.kind === 'finished'))) {
+        // Record before the reset goes out: the relay failure this causes can
+        // only arrive after it.
+        this.error = e;
+        this.failed = true;
+      }
+      this.stop();
+    }
+  }
+}
+
+/**
+ * Consumer side: one HTTP exchange with `serviceId` on `conn`, streamed
+ * both ways. `options.body` may be text, bytes, an (async) iterable of
+ * chunks or nothing; chunks are uploaded with backpressure. Resolves to an
+ * {@link HttpStreamResponse} whose `body` is an {@link HttpRelayBody} to
+ * `read()`, `for await` over, or collect with `await response.readBody()`.
+ *
+ * ```ts
+ * const resp = await relayHttpStream(conn, 'app', { method: 'PUT', uri: '/up', body: chunks() });
+ * for await (const chunk of resp.body) sink(chunk);
+ * ```
+ *
+ * **Not full duplex.** The relay sends the whole request body before it
+ * reads the response head, so the promise resolves only once the upload has
+ * finished; a handler that answers before reading the body (a `413`, say)
+ * stalls the upload and the call fails rather than returning that early
+ * answer. A handler cannot start replying while you are still uploading.
+ *
+ * **Failures never truncate.** If the body iterable throws, the request is
+ * reset (the handler sees a failed body, never a short complete one) and
+ * your iterator's own error rejects the call, not the relay reset it
+ * caused. The upload is aborted on every path that did not finish cleanly,
+ * and `options.signal` (until the head is in) cancels the exchange. A
+ * response that fails partway rejects `read()` with a `read`
+ * {@link HttpBodyError}; closing the body early (`close()`, `await using`,
+ * leaving `for await`) cancels the handler's writes.
+ *
+ * A handler can proxy by returning the relayed response (or just its
+ * `body`) from {@link Expose.exposeHttp}; pass `request.body` as the body to
+ * stream the request through too.
+ * @group Expose
+ */
+export async function relayHttpStream(
+  conn: IrohConnection,
+  serviceId: string,
+  options: RelayHttpStreamOptions = {},
+): Promise<HttpStreamResponse> {
+  const { signal, body, ...rest } = options;
+  signal?.throwIfAborted();
+  const { upload, response } = relayHttpStreaming(conn, serviceId, rest);
+  const pump = new UploadPump(upload, body);
+  const onAbort = () => response.cancel();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    if (signal?.aborted) onAbort();
+    // The head arrives only after the upload has finished, so on success the
+    // pump is over (its source's `return()` is never awaited here).
+    return await response.wait();
+  } catch (e) {
+    response.cancel();
+    pump.stop();
+    if (signal?.aborted) throw signal.reason ?? e;
+    if (pump.failed) throw pump.error;
+    throw e;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    // Never leave the upload open: anything but a clean finish resets it.
+    pump.stop();
+  }
 }
 
 /**
@@ -721,7 +1142,9 @@ function isChunk(v: unknown): v is HttpBodyChunk {
 const RESPONSE_KEYS = new Set(['status', 'headers', 'body', 'trailers']);
 
 function toNativeResponse(answer: unknown, handle: HttpBodyStream, serviceId: string): Streamed {
-  const response: HttpResponse = isChunk(answer) ? { body: answer } : (answer as HttpResponse);
+  // A bare async iterable (a relayed body) is a 200 with that body.
+  const bare = !isChunk(answer) && answer != null && typeof answer === 'object' && Symbol.asyncIterator in answer;
+  const response: HttpResponse = isChunk(answer) || bare ? { body: answer as HttpResponseBody } : (answer as HttpResponse);
   if (response === null || typeof response !== 'object') {
     throw new TypeError(
       `an HTTP handler must return an HttpResponse, string or Uint8Array, not ${response === null ? 'null' : typeof response}`,
@@ -752,8 +1175,11 @@ function toNativeResponse(answer: unknown, handle: HttpBodyStream, serviceId: st
 
 /** The response was never sent: release a body generator that never ran. */
 async function discardBody(body: { return?: unknown }): Promise<void> {
-  // An iterable that is also its own iterator (generators) can be closed.
+  // A relayed body is released with `close()`; an iterable that is also its
+  // own iterator (generators) can be closed with `return()`.
   try {
+    const close = (body as { close?: () => unknown }).close;
+    if (typeof close === 'function') close.call(body);
     const ret = (body as { return?: () => unknown }).return;
     if (typeof ret === 'function') await ret.call(body);
   } catch {

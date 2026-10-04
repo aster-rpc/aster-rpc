@@ -31,6 +31,8 @@ Consumer side, on a connection to that ALPN::
 
     send, recv = await open_relay(conn, "api", metadata=b"token")   # socket target
     resp = await relay_http(conn, "app", "POST", "/", body=b"you")  # HTTP target
+    resp = await relay_http_stream(conn, "app", "PUT", "/", body=chunks())  # streamed
+    async for chunk in resp.body: ...
     reg = await request_route(conn, [RouteSpec("a.example", 443, service_id="app")])
 
 **authorize** runs once per ``(connection, service)`` (kind
@@ -58,6 +60,23 @@ waits a bounded time, then abandons an iterator that ignores it).
 reads return at most that many bytes and ``write`` splits bigger chunks.
 ``HEAD`` responses keep their headers and drop the body. Trailers do not
 cross the relay hop yet (``aster-expose`` V2).
+
+**Streaming consumer** (:func:`relay_http_stream`): the request ``body``
+may be ``bytes`` / ``str`` or an (async) iterable of chunks, uploaded with
+backpressure; the response's ``body`` is an :class:`HttpRelayBody` to
+``await read()``, ``async for`` over, or ``await response.read_body()``.
+The relay sends the whole request body before it reads the response head;
+it is not full duplex, so a handler that answers before reading the body
+(a ``413``, say) stalls the upload and the call fails rather than returning
+that early answer. If the body iterator raises, the request is reset (the handler sees a
+failed body, never a truncated one) and the iterator's exception
+propagates; a response that fails partway raises ``HttpBodyError``
+(``read``) from the read, never a clean end. Close the body early with
+``aclose()`` / ``async with resp.body:`` and the handler's further writes
+are cancelled. Because the body is an async iterable, a handler can proxy
+by returning the relayed :class:`HttpResponse` as its own.
+:func:`relay_http_streaming` is the lower-level form: it returns the
+:class:`HttpUpload` to write yourself plus the response awaitable.
 
 **Route policies** (kind ``expose_route_policy``): ``grant(peer, metadata,
 specs)`` returns the granted :class:`RouteSpec` objects or their indexes
@@ -88,10 +107,13 @@ from ._aster import (
     EdgeRouter,
     Expose,
     HttpBodyStream,
+    HttpRelayBody,
+    HttpUpload,
     NodeId,
     RouteRegistration,
     open_relay,
     relay_http,
+    relay_http_streaming,
     request_route,
 )
 
@@ -105,13 +127,17 @@ __all__ = [
     "HttpBodyError",
     "HttpBodyStream",
     "HttpHandler",
+    "HttpRelayBody",
     "HttpRequest",
     "HttpResponse",
     "RoutePolicy",
     "RouteRegistration",
     "RouteSpec",
+    "HttpUpload",
     "open_relay",
     "relay_http",
+    "relay_http_stream",
+    "relay_http_streaming",
     "request_route",
 ]
 
@@ -209,6 +235,130 @@ class HttpResponse:
             if k == name:
                 return v if isinstance(v, bytes) else str(v).encode()
         return None
+
+    async def read_body(self, limit: Optional[int] = None) -> bytes:
+        """The whole body: ``bytes`` / ``str`` as is, an
+        :class:`HttpRelayBody` (or any async / sync iterable of chunks)
+        drained. ``limit``: raise ``HttpBodyError`` (``too_large``) past
+        that many bytes (a relayed body is closed first)."""
+        body = self.body
+        if body is None:
+            return b""
+        if isinstance(body, str):
+            body = body.encode()
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            data = bytes(body)
+            if limit is not None and len(data) > limit:
+                raise HttpBodyError(f"body exceeds {limit} bytes", "too_large", 3)
+            return data
+        out = bytearray()
+        chunks = body if hasattr(body, "__aiter__") else _aiter_sync(body)
+        try:
+            async for chunk in chunks:
+                out += chunk.encode() if isinstance(chunk, str) else chunk
+                if limit is not None and len(out) > limit:
+                    raise HttpBodyError(f"body exceeds {limit} bytes", "too_large", 3)
+        except HttpBodyError:
+            close = getattr(body, "aclose", None)
+            if close is not None:
+                await close()
+            raise
+        return bytes(out)
+
+
+async def _aiter_sync(it):
+    for chunk in it:
+        yield chunk
+
+
+async def relay_http_stream(
+    conn,
+    service_id: str,
+    method: str = "GET",
+    uri: str = "/",
+    headers: Any = None,
+    body: Body = None,
+    *,
+    max_chunk: int = 1 << 20,
+    capacity: int = 8,
+) -> HttpResponse:
+    """Consumer side: one HTTP exchange with ``service_id`` on ``conn``,
+    streamed both ways (see the module docs). ``body``: ``bytes`` / ``str``
+    / ``None`` or an (async) iterable of chunks. Returns an
+    :class:`HttpResponse` whose ``body`` is an :class:`HttpRelayBody`.
+    ``max_chunk`` bounds each upload piece and each read; ``capacity`` is
+    the number of upload chunks buffered before a write waits."""
+    upload, pending = relay_http_streaming(
+        conn, service_id, method, uri, headers, max_chunk=max_chunk, capacity=capacity
+    )
+    pump = asyncio.ensure_future(_pump_upload(upload, body))
+    try:
+        response = await pending
+    except BaseException:
+        # The upload's own failure (the caller's iterator raising) is the
+        # better error than the reset relay it caused.
+        if not pump.done():
+            pump.cancel()
+        try:
+            await pump
+        except asyncio.CancelledError:
+            pass
+        raise
+    # The relay reads the head only after the whole body, so the upload is
+    # finished; only the iterator's aclose() may still be running. Don't
+    # make the caller wait on it.
+    if pump.done():
+        pump.result()
+    else:
+        pump.add_done_callback(_consume)
+    return response
+
+
+def _consume(task: "asyncio.Future") -> None:
+    if not task.cancelled() and task.exception() is not None:
+        _log.debug("upload pump ended with %r", task.exception())
+
+
+async def _pump_upload(upload: HttpUpload, body: Body) -> None:
+    """Write ``body`` through ``upload``, then finish; abort on any
+    failure (including cancellation) so the request is reset, never
+    finished short."""
+    try:
+        if body is None:
+            pass
+        elif isinstance(body, (bytes, bytearray, memoryview, str)):
+            await upload.write(body)
+        elif hasattr(body, "__aiter__"):
+            async for chunk in body:
+                await upload.write(chunk)
+        else:
+            for chunk in body:
+                await upload.write(chunk)
+        upload.finish()
+    except HttpBodyError as exc:
+        if exc.kind == "cancelled":
+            # The request is gone; the response awaitable reports why.
+            _abort_upload(upload, str(exc))
+            return
+        _abort_upload(upload, str(exc))
+        raise
+    except BaseException as exc:
+        _abort_upload(upload, f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        close = getattr(body, "aclose", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:  # pragma: no cover - best effort
+                pass
+
+
+def _abort_upload(upload: HttpUpload, message: str) -> None:
+    try:
+        upload.abort(message)
+    except HttpBodyError:
+        pass
 
 
 class ExposeAuthorizer(abc.ABC):

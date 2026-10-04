@@ -110,6 +110,14 @@ async fn reset_failed(send: &CoreSendStream) {
     }
 }
 
+/// [`reset_failed`] on a detached task, awaited: the reset still happens if
+/// the caller's future is cancelled while it waits (an exchange dropped
+/// right as its upload fails would otherwise lose the reset and leave the
+/// peer reading a request that never ends).
+async fn reset_failed_detached(send: CoreSendStream) {
+    let _ = tokio::spawn(async move { reset_failed(&send).await }).await;
+}
+
 /// Resets an upload's send half if the request future is dropped before the
 /// upload completed (the caller timed out or cancelled), which would
 /// otherwise finish it and hand the server a truncated request body as
@@ -309,7 +317,7 @@ where
         // no lock on the send half.
         drop((r, w));
         if let Some(send) = armed.0.take() {
-            reset_failed(&send).await;
+            reset_failed_detached(send).await;
         }
         return Err(e);
     }
@@ -396,7 +404,7 @@ impl LocalTunnelAcceptor for ServiceAcceptor {
                 // Reset, never finish: a response that failed mid-body must
                 // reach the consumer as a failed response, not a truncated
                 // one (the halves are dropped by now, so the lock is free).
-                reset_failed(&reset_send).await;
+                reset_failed_detached(reset_send).await;
             }
         })
     }
