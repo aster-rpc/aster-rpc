@@ -355,6 +355,7 @@ dependencies = [
 name = "aster_rs"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
  "aster",
  "aster_transport_core",
  "blake3",

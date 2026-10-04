@@ -12,6 +12,7 @@
 //! - admission.rs: Gate 0 (`GatePolicy`, `PeerAdmissionStore`, `Admission`)
 //! - attestation.rs, grants.rs, lease.rs, topology.rs: plan P7 (values are
 //!   the frozen dataclasses of the matching `aster.*` Python modules)
+//! - coordination.rs: plan P9, the wrapped coordination client
 //! - error.rs: Exception types
 //!
 //! The protocol clients, reactor and bare endpoints still drive the transport
@@ -25,6 +26,7 @@ mod blobs;
 mod call;
 mod config;
 mod contract;
+mod coordination;
 mod crypto;
 mod docs;
 mod error;
@@ -97,6 +99,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     grants::register(py, m)?;
     lease::register(py, m)?;
     topology::register(py, m)?;
+    coordination::register(py, m)?;
 
     Ok(())
 }

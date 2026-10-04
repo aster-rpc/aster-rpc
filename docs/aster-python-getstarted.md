@@ -336,3 +336,96 @@ never evidence of distance. `enable_shared` also takes `position_refresh`
 Not yet in Python (they need the binding upcall mechanism, plan R6): a
 Python-implemented `LeaseSerializer`, `FencedResource` or lease authorizer,
 and the topology `admitted` filter.
+
+## 8. Coordination client
+
+`aster.coordination` wraps the Rust coordination client (it is not
+reimplemented): durable fenced registers, exact ACLs and linearizable reads
+against a coordination group. Journaling, leader redirects, retries and reply
+validation all run in Rust. The voters themselves stay Rust-only; see
+[the coordination walkthrough](aster-coordination-getstarted.md) for how to
+host a group.
+
+```python
+from aster.coordination import (CoordinationClient, CoordinationRights,
+                                ResourceKey, fence_of)
+
+client = await CoordinationClient.connect(
+    node, group_id,
+    seed_tickets=member_tickets,             # Open tickets, routing hints only
+    journal_dir="/var/lib/app/coordination", # persist with the node identity
+)
+async with client:                           # close() releases the journal lock
+    # On startup, before any mutation: redeliver what a previous run resolved.
+    pending = await client.unacknowledged() or await client.resume()
+    if pending:
+        await handle(pending.reply)
+        await pending.acknowledge()
+
+    head = ResourceKey("app.head", b"w-1")   # or ("app.head", "w-1")
+    resolved = await client.acquire(head, ttl=30)
+    await resolved.acknowledge()             # it was fsynced before it returned
+    fence = fence_of(resolved.snapshot)
+    cas = await client.compare_and_set(fence, resolved.snapshot.value_revision, b"v1")
+    if cas.rejected:                         # a typed rejection is still a result
+        log(cas.reason)                      # e.g. "value_revision_mismatch"
+    await cas.acknowledge()
+```
+
+**The delivery contract.** Every mutation (`acquire`, `renew`,
+`compare_and_set`, `release`, `release_with_value`, `revoke`, `set_grant`,
+`set_admin`, `change_membership`, `cancel_membership`) returns a
+`ResolvedMutation` that was fsynced before the awaitable completed. Until you
+`acknowledge()` it, no new mutation is allowed -- across calls and across
+restarts (`CoordinationAwaitingAckError`) -- and `unacknowledged()` /
+`resume()` hand it back. `resolved.reply` is the exact `MutationReply`;
+`outcome`, `reason`, `rejected`, `sequence` and `snapshot` are shortcuts, and
+`rejection()` returns a `CoordinationRejectedError`. One process owns a
+journal at a time (`CoordinationJournalLockedError`).
+
+**Leases.** `acquire_lease(resource, LeaseOptions(...))` does one committed
+acquire; on a grant Rust renews in the background and `lease.fence()` returns
+`None` once the holder must stop. Lease mutations are journaled and
+acknowledged for you:
+
+```python
+outcome = await client.acquire_lease(head, LeaseOptions(ttl=30))
+if outcome.granted:
+    async with outcome.lease as lease:       # released on exit
+        reply = await lease.compare_and_set(expected_revision, b"next")
+        await lease.release_with_value(reply.snapshot.value_revision, b"final")
+else:
+    backoff(outcome.reason, outcome.snapshot)
+```
+
+**Reads and administration.** `client.reads()` (or
+`await CoordinationReadClient.connect(node, group_id, seed_tickets=...)`, which
+has no journal) gives `read_linearizable`, `inspect_acl`, `inspect_admins`,
+`membership_status`, `group_status`, `probe_client`, `recovery_export()` /
+`recovery_export_to_file(path)`, and the audit log as an async iterator:
+
+```python
+async for row in client.reads().audit_stream(after=cursor, page_size=500):
+    ...                                      # ascending AuditRecord rows
+```
+
+Rights are exact bits (`CoordinationRights.READ | ...`, `HOLDER` for a
+register holder) granted per node with `set_grant(resource, node_id, rights,
+expected_acl_revision)`.
+
+**Errors** all derive from `CoordinationError` (`.kind`):
+`CoordinationAwaitingAckError`, `CoordinationUnresolvedError` (call
+`resume()`), `CoordinationJournalFatalError`, `CoordinationJournalLockedError`,
+`CoordinationInvalidArgumentError` (also a `ValueError`), `CoordinationRpcError`
+(`.code`, e.g. 7 for a permission denial), `CoordinationUnavailableError` (safe
+to retry), `CoordinationClosedError`, and `CoordinationRejectedError` (raised by
+the lease helpers on a typed rejection; `.reason`, `.reply`).
+
+**Placement.** `placement_plan(PlacementInput(...), await
+node.topology().snapshot())` is the pure, deterministic voter planner; submit a
+`kind == "plan"` result with
+`await client.change_membership(new_operation_id(), rec.plan)`.
+
+Not yet in Python (it needs the binding upcall mechanism, plan R6): the
+placement *manager* with Python-implemented provisioner, policy and topology
+sources.

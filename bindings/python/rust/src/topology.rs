@@ -265,7 +265,7 @@ impl Topology {
 /// One immutable derived topology view (see `Topology.snapshot()`).
 #[pyclass(frozen, module = "aster._aster")]
 pub struct TopologySnapshot {
-    inner: Arc<RsTopologySnapshot>,
+    pub(crate) inner: Arc<RsTopologySnapshot>,
     clusters: Py<PyTuple>,
 }
 

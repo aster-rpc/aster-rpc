@@ -202,6 +202,30 @@ from .topology import (
     TopologyTiming,
 )
 
+# -- Coordination client (plan P9; the rest lives in aster.coordination) --
+from .coordination import (
+    CoordinationAwaitingAckError,
+    CoordinationClient,
+    CoordinationClosedError,
+    CoordinationError,
+    CoordinationFence,
+    CoordinationInvalidArgumentError,
+    CoordinationJournalFatalError,
+    CoordinationJournalLockedError,
+    CoordinationLease,
+    CoordinationLeaseOutcome,
+    CoordinationReadClient,
+    CoordinationRejectedError,
+    CoordinationRights,
+    CoordinationRpcError,
+    CoordinationUnavailableError,
+    CoordinationUnresolvedError,
+    ResolvedMutation,
+    fence_of,
+    new_operation_id,
+    placement_plan,
+)
+
 # ── Tunneling - handler-side ticket issuance (see aster.tunnel) ──────────────
 from .tunnel import Tcp, Udp, HttpProxy, TunnelHandle, TunnelTarget
 
@@ -404,6 +428,27 @@ __all__ = [
     "Topology",
     "TopologySnapshot",
     "TopologyTiming",
+    # -- Coordination client (plan P9) --
+    "CoordinationAwaitingAckError",
+    "CoordinationClient",
+    "CoordinationClosedError",
+    "CoordinationError",
+    "CoordinationFence",
+    "CoordinationInvalidArgumentError",
+    "CoordinationJournalFatalError",
+    "CoordinationJournalLockedError",
+    "CoordinationLease",
+    "CoordinationLeaseOutcome",
+    "CoordinationReadClient",
+    "CoordinationRejectedError",
+    "CoordinationRights",
+    "CoordinationRpcError",
+    "CoordinationUnavailableError",
+    "CoordinationUnresolvedError",
+    "ResolvedMutation",
+    "fence_of",
+    "new_operation_id",
+    "placement_plan",
     # ── Aster RPC framework ──
     "StatusCode",
     "RpcError",

@@ -52,7 +52,10 @@ fn fence_in(obj: &Bound<'_, PyAny>) -> PyResult<l::Fence> {
     })
 }
 
-fn snapshot_out<'py>(py: Python<'py>, s: l::LeaseSnapshot) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn snapshot_out<'py>(
+    py: Python<'py>,
+    s: l::LeaseSnapshot,
+) -> PyResult<Bound<'py, PyAny>> {
     py_value!(py, "aster.lease", "LeaseSnapshot" {
         resource: s.resource,
         epoch: s.epoch,
@@ -62,7 +65,7 @@ fn snapshot_out<'py>(py: Python<'py>, s: l::LeaseSnapshot) -> PyResult<Bound<'py
     })
 }
 
-fn deny_out(r: l::DenyReason) -> &'static str {
+pub(crate) fn deny_out(r: l::DenyReason) -> &'static str {
     match r {
         l::DenyReason::HeldByOther => "held_by_other",
         l::DenyReason::EpochMismatch => "epoch_mismatch",
@@ -73,7 +76,7 @@ fn deny_out(r: l::DenyReason) -> &'static str {
     }
 }
 
-fn status_out(s: l::LeaseStatus) -> &'static str {
+pub(crate) fn status_out(s: l::LeaseStatus) -> &'static str {
     match s {
         l::LeaseStatus::Held => "held",
         l::LeaseStatus::Released => "released",
@@ -186,7 +189,7 @@ fn op_in(obj: &Bound<'_, PyAny>) -> PyResult<l::LeaseOp> {
 
 /// `LeaseOptions` (or `None` for the defaults), validated as the Rust
 /// holder engine would.
-fn options_in(obj: Option<&Bound<'_, PyAny>>) -> PyResult<l::LeaseOptions> {
+pub(crate) fn options_in(obj: Option<&Bound<'_, PyAny>>) -> PyResult<l::LeaseOptions> {
     let mut opts = l::LeaseOptions::default();
     if let Some(o) = obj.filter(|o| !o.is_none()) {
         opts.ttl = secs_in("ttl", o.getattr("ttl")?.extract()?)?;

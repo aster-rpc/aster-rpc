@@ -214,9 +214,11 @@ The hosting feature remains off by default. Enabling `coordination-client`
 does not start a service, open a voter database, or make the node eligible for
 membership.
 
-V1 hosting and the supported client are Rust-first. The public payloads are
-defined so later language bindings can carry them, but Python, TypeScript, C,
-Java, and Kotlin coordination surfaces are not part of this initial delivery.
+Hosting a voter is Rust-only. The client is available from Rust, and Python
+and TypeScript wrap the same Rust client (`aster.coordination` /
+`CoordinationClient` in `@aster-rpc/aster`) rather than reimplementing it; see
+`docs/aster-python-getstarted.md` and the TypeScript package. C, Java, .NET and
+Go coordination surfaces are not delivered yet.
 
 **Benefit:** ordinary Aster applications and language bindings do not inherit a
 consensus/database stack merely because the SDK supports it.
