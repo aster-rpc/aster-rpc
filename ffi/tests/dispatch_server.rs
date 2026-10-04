@@ -53,6 +53,7 @@ const DROP: u32 = 7;
 const ADMIN: u32 = 8;
 const SMALL: u32 = 9;
 const META: u32 = 10;
+const PARK: u32 = 11;
 const INCR: u32 = 0;
 const FLOOD_AFTER_FULL: usize = 8;
 const FLOOD_FRAME: usize = 64 * 1024;
@@ -85,6 +86,7 @@ fn echo_json() -> String {
         admin,
         small,
         method("meta", MethodPattern::Unary),
+        method("park", MethodPattern::Unary),
     ];
     svc.to_json().unwrap()
 }
@@ -478,6 +480,11 @@ fn handle(srv: Srv, call: Ev, events: mpsc::Receiver<Ev>, observed: Arc<Mutex<Ob
             if call.request == b"fail" {
                 let st = status_aev1(StatusCode::NotFound, "no such thing");
                 assert_eq!(respond(srv, id, &[], Some(&st)), OK);
+            } else if call.request.starts_with(b"race") {
+                // unary_cancel_token_races_with_completion: the client may
+                // have cancelled already.
+                let rc = respond(srv, id, &call.request, None);
+                assert!(rc == OK || rc == NOT_FOUND, "race respond: {rc}");
             } else {
                 assert_eq!(respond(srv, id, &call.request, None), OK);
             }
@@ -596,6 +603,25 @@ fn handle(srv: Srv, call: Ev, events: mpsc::Receiver<Ev>, observed: Arc<Mutex<Ob
             assert_eq!(respond(srv, id, role.as_bytes(), None), OK);
         }
         (ECHO, SMALL) => assert_eq!(respond(srv, id, &call.request, None), OK),
+        (ECHO, PARK) => {
+            // A unary handler that never answers on its own: it waits for the
+            // client's cancel (reason PEER) and records the request's tag.
+            // (Large requests carry a short tag before ':'.)
+            let head = call.request.split(|b| *b == b':').next().unwrap();
+            let tag = String::from_utf8(head.to_vec()).unwrap();
+            note(&observed, format!("park:start:{tag}"));
+            match events.recv_timeout(Duration::from_secs(20)) {
+                // "dl*" calls also carry a deadline that races the cancel.
+                Ok(e) if e.kind == K_CANCELLED && tag.starts_with("dl") => {
+                    assert!(e.reason == R_PEER || e.reason == R_DEADLINE, "{}", e.reason)
+                }
+                Ok(e) if e.kind == K_CANCELLED => assert_eq!(e.reason, R_PEER),
+                other => panic!("park: expected CANCELLED, got {other:?}"),
+            }
+            assert_eq!(aster_dispatch_is_cancelled(srv.rt, srv.server, id), 1);
+            assert_eq!(respond(srv, id, b"late", None), NOT_FOUND);
+            note(&observed, format!("park:cancelled:{tag}"));
+        }
         (COUNTER, INCR) => {
             static COUNTS: Mutex<Option<HashMap<u64, u8>>> = Mutex::new(None);
             let mut counts = COUNTS.lock().unwrap();
@@ -817,6 +843,57 @@ unsafe fn unary(
         assert_eq!(status.code, code);
         Err((code, status.message))
     }
+}
+
+/// Unary through `aster_rpc_unary_cancellable` with `token`: the call's
+/// return code, then `Ok(response)` / `Err((code, message))` when it is `OK`.
+unsafe fn unary_cancellable(
+    rt: aster_runtime_t,
+    conn: aster_connection_t,
+    o: &Opts,
+    token: aster_cancel_token_t,
+    req: &[u8],
+) -> (i32, Result<Vec<u8>, (i32, String)>) {
+    let raw = o.raw();
+    let (mut rp, mut rl, mut rb) = (ptr::null(), 0u32, 0u64);
+    let (mut code, mut sp, mut sl, mut sb) = (0i32, ptr::null(), 0u32, 0u64);
+    let rc = aster_rpc_unary_cancellable(
+        rt,
+        conn,
+        &raw,
+        token,
+        req.as_ptr(),
+        req.len() as u32,
+        &mut rp,
+        &mut rl,
+        &mut rb,
+        &mut code,
+        &mut sp,
+        &mut sl,
+        &mut sb,
+    );
+    if rc != OK {
+        return (rc, Err((-1, String::new())));
+    }
+    let resp = copy(rp, rl);
+    let st = copy(sp, sl);
+    aster_call_buffer_release(rt, rb);
+    aster_call_buffer_release(rt, sb);
+    if code == 0 {
+        assert!(st.is_empty());
+        (rc, Ok(resp))
+    } else {
+        let status = aster::rpc::codec::decode_rpc_status(&st).unwrap();
+        assert_eq!(status.code, code);
+        (rc, Err((code, status.message)))
+    }
+}
+
+fn new_token(rt: aster_runtime_t) -> aster_cancel_token_t {
+    let mut t = 0;
+    assert_eq!(unsafe { aster_cancel_token_new(rt, &mut t) }, OK);
+    assert_ne!(t, 0);
+    t
 }
 
 unsafe fn open(
@@ -1162,6 +1239,446 @@ fn client_cancel_reaches_the_handler_and_ends_the_stream() {
             Ok(b"after".to_vec())
         );
         s.binding.assert_table_drains();
+        teardown(s);
+    }
+}
+
+const CANCELLED_CODE: i32 = 1;
+const DEADLINE_CODE: i32 = 4;
+const UNSUPPORTED: i32 = aster_status_t::ASTER_STATUS_UNSUPPORTED as i32;
+
+/// Cancel-token tests run one at a time and each ends with an empty token
+/// table (the table is process-global).
+static TOKEN_TESTS: Mutex<()> = Mutex::new(());
+
+fn token_test() -> std::sync::MutexGuard<'static, ()> {
+    let g = TOKEN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        rpc::live_cancel_tokens_for_tests(),
+        0,
+        "tokens left by an earlier test"
+    );
+    g
+}
+
+fn assert_tokens_drained() {
+    assert_eq!(
+        rpc::live_cancel_tokens_for_tests(),
+        0,
+        "a cancel token leaked"
+    );
+}
+
+fn parked(o: &Observed, what: &str, tag: &str) -> bool {
+    o.notes.iter().any(|n| *n == format!("park:{what}:{tag}"))
+}
+
+/// ABI 4.5: `aster_cancel_token_cancel` aborts an in-flight pooled unary
+/// call like dropping the Rust future: the blocked call returns CANCELLED,
+/// the handler sees a PEER cancel, and the connection's pool keeps working.
+#[test]
+fn unary_cancel_token_aborts_the_pooled_call() {
+    unsafe {
+        let _serial = token_test();
+        let s = start_server();
+        let rt = s.rt;
+        let (_c, conn) = client(&s);
+
+        // A call that completes: the token is consumed, a late cancel is a
+        // no-op (NOT_FOUND), and so is releasing it.
+        let t = new_token(rt);
+        assert_eq!(
+            unary_cancellable(rt, conn, &echo("echo"), t, b"done"),
+            (OK, Ok(b"done".to_vec()))
+        );
+        assert_eq!(aster_cancel_token_cancel(rt, t), NOT_FOUND);
+        assert_eq!(aster_cancel_token_release(rt, t), NOT_FOUND);
+        // Failures keep their status on the cancellable path.
+        let t = new_token(rt);
+        assert_eq!(
+            unary_cancellable(rt, conn, &echo("echo"), t, b"fail"),
+            (
+                OK,
+                Err((StatusCode::NotFound.as_i32(), "no such thing".into()))
+            )
+        );
+        // Token 0 is the plain fast path.
+        assert_eq!(
+            unary_cancellable(rt, conn, &echo("echo"), 0, b"zero"),
+            (OK, Ok(b"zero".to_vec()))
+        );
+
+        // Cancelled before the call starts: CANCELLED without sending.
+        let t = new_token(rt);
+        assert_eq!(aster_cancel_token_cancel(rt, t), OK);
+        assert_eq!(aster_cancel_token_cancel(rt, t), OK, "idempotent");
+        assert_eq!(
+            unary_cancellable(rt, conn, &echo("park"), t, b"early"),
+            (OK, Err((CANCELLED_CODE, "call cancelled".into())))
+        );
+        assert_eq!(aster_cancel_token_release(rt, t), NOT_FOUND, "consumed");
+
+        // Cancelled in flight, from another thread, while the handler runs.
+        let t = new_token(rt);
+        let observed = s.binding.observed.clone();
+        let canceller = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(20);
+            while !parked(&observed.lock().unwrap(), "start", "a") {
+                assert!(Instant::now() < end, "park never started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(aster_cancel_token_cancel(rt, t), OK);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            unary_cancellable(rt, conn, &echo("park"), t, b"a"),
+            (OK, Err((CANCELLED_CODE, "call cancelled".into())))
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        canceller.join().unwrap();
+        s.binding
+            .until("park a cancelled", |o| parked(o, "cancelled", "a"));
+        assert!(!parked(&s.binding.observed(), "start", "early"));
+        assert_eq!(aster_cancel_token_cancel(rt, t), NOT_FOUND);
+
+        // Fill the SHARED pool (8 streams) and queue two more callers behind
+        // it, then cancel all ten: parked calls, and calls still waiting for
+        // a pooled stream. Every discarded stream gives its slot back.
+        const N: usize = 10;
+        let tokens: Vec<_> = (0..N).map(|_| new_token(rt)).collect();
+        let calls: Vec<_> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                std::thread::spawn(move || {
+                    unary_cancellable(rt, conn, &echo("park"), t, format!("p{i}").as_bytes())
+                })
+            })
+            .collect();
+        s.binding.until("eight parked", |o| {
+            (0..N)
+                .filter(|i| parked(o, "start", &format!("p{i}")))
+                .count()
+                >= 8
+        });
+        for &t in &tokens {
+            assert_eq!(aster_cancel_token_cancel(rt, t), OK);
+        }
+        for c in calls {
+            assert_eq!(
+                c.join().unwrap(),
+                (OK, Err((CANCELLED_CODE, "call cancelled".into())))
+            );
+        }
+        s.binding.until("parked handlers cancelled", |o| {
+            (0..N)
+                .filter(|i| parked(o, "start", &format!("p{i}")))
+                .all(|i| parked(o, "cancelled", &format!("p{i}")))
+        });
+        // The pool is whole again: sixteen calls at once all complete.
+        let calls: Vec<_> = (0..16)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let t = new_token(rt);
+                    let msg = format!("after{i}");
+                    assert_eq!(
+                        unary_cancellable(rt, conn, &echo("echo"), t, msg.as_bytes()),
+                        (OK, Ok(msg.into_bytes()))
+                    );
+                })
+            })
+            .collect();
+        for c in calls {
+            c.join().unwrap();
+        }
+        assert_eq!(
+            unary(rt, conn, &echo("echo"), b"plain"),
+            Ok(b"plain".to_vec())
+        );
+        s.binding.assert_table_drains();
+        assert_tokens_drained();
+        teardown(s);
+    }
+}
+
+/// Cancels racing completion: every call ends with exactly one outcome
+/// (its response or CANCELLED), none hangs, and the connection survives.
+#[test]
+fn unary_cancel_token_races_with_completion() {
+    unsafe {
+        let _serial = token_test();
+        let s = start_server();
+        let rt = s.rt;
+        let (_c, conn) = client(&s);
+        let (mut ok, mut cancelled) = (0, 0);
+        for i in 0..200u64 {
+            let t = new_token(rt);
+            let delay = Duration::from_micros((i * 37) % 400);
+            let canceller = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                aster_cancel_token_cancel(rt, t)
+            });
+            let msg = format!("race{i}");
+            match unary_cancellable(rt, conn, &echo("echo"), t, msg.as_bytes()) {
+                (OK, Ok(r)) => {
+                    assert_eq!(r, msg.as_bytes());
+                    ok += 1;
+                }
+                (OK, Err((CANCELLED_CODE, m))) => {
+                    assert_eq!(m, "call cancelled");
+                    cancelled += 1;
+                }
+                other => panic!("call {i}: {other:?}"),
+            }
+            let rc = canceller.join().unwrap();
+            assert!(rc == OK || rc == NOT_FOUND, "cancel: {rc}");
+            assert_eq!(aster_cancel_token_release(rt, t), NOT_FOUND);
+        }
+        assert_eq!(ok + cancelled, 200);
+        assert_eq!(
+            unary(rt, conn, &echo("echo"), b"after"),
+            Ok(b"after".to_vec())
+        );
+        s.binding.assert_table_drains();
+        assert_tokens_drained();
+        teardown(s);
+    }
+}
+
+#[test]
+fn unary_cancel_token_argument_rules() {
+    unsafe {
+        let _serial = token_test();
+        let s = start_server();
+        let rt = s.rt;
+        let (_c, conn) = client(&s);
+        assert_eq!(aster_cancel_token_new(rt, ptr::null_mut()), INVALID);
+        // Unknown token: refused, nothing sent.
+        assert_eq!(
+            unary_cancellable(rt, conn, &echo("echo"), u64::MAX - 7, b"x").0,
+            INVALID
+        );
+        // A released token is gone.
+        let t = new_token(rt);
+        assert_eq!(aster_cancel_token_release(rt, t), OK);
+        assert_eq!(aster_cancel_token_release(rt, t), NOT_FOUND);
+        assert_eq!(aster_cancel_token_cancel(rt, t), NOT_FOUND);
+        assert_eq!(
+            unary_cancellable(rt, conn, &echo("echo"), t, b"x").0,
+            INVALID
+        );
+        // Argument errors still consume the token.
+        let t = new_token(rt);
+        assert_eq!(
+            unary_cancellable(rt, 0xdead, &echo("echo"), t, b"x").0,
+            NOT_FOUND
+        );
+        assert_eq!(aster_cancel_token_cancel(rt, t), NOT_FOUND);
+        // One token, one call: a second call with a token in use is refused
+        // and leaves the first call cancellable.
+        let t = new_token(rt);
+        let first =
+            std::thread::spawn(move || unary_cancellable(rt, conn, &echo("park"), t, b"owner"));
+        s.binding
+            .until("owner parked", |o| parked(o, "start", "owner"));
+        assert_eq!(
+            unary_cancellable(rt, conn, &echo("echo"), t, b"x").0,
+            INVALID
+        );
+        // Nor can it be released under the call: still cancellable after.
+        assert_eq!(aster_cancel_token_release(rt, t), INVALID);
+        assert_eq!(aster_cancel_token_cancel(rt, t), OK);
+        assert_eq!(
+            first.join().unwrap(),
+            (OK, Err((CANCELLED_CODE, "call cancelled".into())))
+        );
+        s.binding
+            .until("owner cancelled", |o| parked(o, "cancelled", "owner"));
+        s.binding.assert_table_drains();
+        assert_tokens_drained();
+        teardown(s);
+    }
+}
+
+/// Every `park` handler whose tag starts with `prefix` that started has seen
+/// its cancel.
+fn parked_all_cancelled(o: &Observed, prefix: &str) -> bool {
+    let start = format!("park:start:{prefix}");
+    o.notes
+        .iter()
+        .filter_map(|n| n.strip_prefix("park:start:"))
+        .filter(|tag| format!("park:start:{tag}").starts_with(&start))
+        .all(|tag| parked(o, "cancelled", tag))
+}
+
+/// A blocking unary call from a tokio runtime thread is refused
+/// (`UNSUPPORTED`) instead of panicking across `extern "C"`.
+#[test]
+fn unary_from_a_runtime_thread_is_refused() {
+    unsafe {
+        let _serial = token_test();
+        let s = start_server();
+        let rt = s.rt;
+        let (_c, conn) = client(&s);
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let t = new_token(rt);
+        let (plain, cancellable) = tokio_rt.block_on(async {
+            let raw = echo("echo").raw();
+            let (mut rp, mut rl, mut rb) = (ptr::null(), 0u32, 0u64);
+            let (mut code, mut sp, mut sl, mut sb) = (0i32, ptr::null(), 0u32, 0u64);
+            let plain = aster_rpc_unary(
+                rt,
+                conn,
+                &raw,
+                b"x".as_ptr(),
+                1,
+                &mut rp,
+                &mut rl,
+                &mut rb,
+                &mut code,
+                &mut sp,
+                &mut sl,
+                &mut sb,
+            );
+            (plain, unary_cancellable(rt, conn, &echo("echo"), t, b"x").0)
+        });
+        assert_eq!(plain, UNSUPPORTED);
+        assert_eq!(cancellable, UNSUPPORTED);
+        assert_eq!(aster_cancel_token_cancel(rt, t), NOT_FOUND, "consumed");
+        // Off the runtime thread the same calls work.
+        assert_eq!(unary(rt, conn, &echo("echo"), b"ok"), Ok(b"ok".to_vec()));
+        s.binding.assert_table_drains();
+        assert_tokens_drained();
+        teardown(s);
+    }
+}
+
+/// A cancel racing the call's own (client-side) deadline: one outcome,
+/// CANCELLED or DEADLINE_EXCEEDED, and the handler sees the call end.
+#[test]
+fn unary_cancel_token_races_the_deadline() {
+    unsafe {
+        let _serial = token_test();
+        let s = start_server();
+        let rt = s.rt;
+        let (_c, conn) = client(&s);
+        let mut o = echo("park");
+        o.deadline_ms = 150;
+        let (mut cancelled, mut expired) = (0, 0);
+        for i in 0..24u64 {
+            let t = new_token(rt);
+            let delay = Duration::from_millis(130 + (i * 3) % 40);
+            let canceller = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                aster_cancel_token_cancel(rt, t)
+            });
+            match unary_cancellable(rt, conn, &o, t, format!("dl{i}").as_bytes()) {
+                (OK, Err((CANCELLED_CODE, _))) => cancelled += 1,
+                (OK, Err((DEADLINE_CODE, _))) => expired += 1,
+                other => panic!("call {i}: {other:?}"),
+            }
+            let rc = canceller.join().unwrap();
+            assert!(rc == OK || rc == NOT_FOUND, "cancel: {rc}");
+        }
+        assert_eq!(cancelled + expired, 24);
+        s.binding
+            .until("dl handlers ended", |o| parked_all_cancelled(o, "dl"));
+        assert_eq!(
+            unary(rt, conn, &echo("echo"), b"after"),
+            Ok(b"after".to_vec())
+        );
+        s.binding.assert_table_drains();
+        assert_tokens_drained();
+        teardown(s);
+    }
+}
+
+/// Cancels landing while the pool is still opening its first streams (a
+/// fresh connection: the acquire opens a new stream for each call), at
+/// staggered moments from "before the call started" to "parked".
+#[test]
+fn unary_cancel_token_while_the_pool_opens_streams() {
+    unsafe {
+        let _serial = token_test();
+        let s = start_server();
+        let rt = s.rt;
+        for k in 0..6u64 {
+            let (_c, conn) = client(&s);
+            let tokens: Vec<_> = (0..4).map(|_| new_token(rt)).collect();
+            let calls: Vec<_> = tokens
+                .iter()
+                .enumerate()
+                .map(|(j, &t)| {
+                    std::thread::spawn(move || {
+                        unary_cancellable(
+                            rt,
+                            conn,
+                            &echo("park"),
+                            t,
+                            format!("e{k}_{j}").as_bytes(),
+                        )
+                    })
+                })
+                .collect();
+            for (j, &t) in tokens.iter().enumerate() {
+                std::thread::sleep(Duration::from_micros(150 * (j as u64 + k)));
+                assert_eq!(aster_cancel_token_cancel(rt, t), OK);
+            }
+            for c in calls {
+                assert_eq!(
+                    c.join().unwrap(),
+                    (OK, Err((CANCELLED_CODE, "call cancelled".into())))
+                );
+            }
+            // The pool recovers on that connection.
+            assert_eq!(
+                unary(rt, conn, &echo("echo"), b"fresh"),
+                Ok(b"fresh".to_vec())
+            );
+        }
+        s.binding
+            .until("e handlers ended", |o| parked_all_cancelled(o, "e"));
+        s.binding.assert_table_drains();
+        assert_tokens_drained();
+        teardown(s);
+    }
+}
+
+/// Cancels landing while a large request is still being written (the
+/// pooled stream is then torn mid-frame, so the cancel is a reset only).
+#[test]
+fn unary_cancel_token_mid_write_of_a_large_request() {
+    unsafe {
+        let _serial = token_test();
+        let s = start_server();
+        let rt = s.rt;
+        let (_c, conn) = client(&s);
+        for i in 0..8u64 {
+            let mut req = format!("big{i}:").into_bytes();
+            req.resize(8 * 1024 * 1024, b'x');
+            let t = new_token(rt);
+            let delay = Duration::from_micros(400 * i);
+            let canceller = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                aster_cancel_token_cancel(rt, t)
+            });
+            assert_eq!(
+                unary_cancellable(rt, conn, &echo("park"), t, &req),
+                (OK, Err((CANCELLED_CODE, "call cancelled".into())))
+            );
+            assert_eq!(canceller.join().unwrap(), OK);
+            // Each time the connection still serves calls.
+            assert_eq!(
+                unary(rt, conn, &echo("echo"), b"small"),
+                Ok(b"small".to_vec())
+            );
+        }
+        s.binding
+            .until("big handlers ended", |o| parked_all_cancelled(o, "big"));
+        s.binding.assert_table_drains();
+        assert_tokens_drained();
         teardown(s);
     }
 }

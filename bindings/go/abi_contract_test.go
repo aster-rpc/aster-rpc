@@ -152,9 +152,9 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if CoordRPC != 5 || CoordClosed != 7 || CoordOther != 10 || MutateCancelMembership != 10 || ReadRecoveryExport != 8 {
 		t.Error("coordination enums drifted from the header")
 	}
-	// ABI 4.1 .. 4.4 are all in the library.
-	if _, minor, _ := Version(); minor < 4 {
-		t.Errorf("library ABI minor %d, binding needs >= 4", minor)
+	// ABI 4.1 .. 4.5 are all in the library.
+	if _, minor, _ := Version(); minor < 5 {
+		t.Errorf("library ABI minor %d, binding needs >= 5", minor)
 	}
 }
 

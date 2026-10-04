@@ -5,19 +5,19 @@ package aster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 	"testing"
 	"time"
 )
 
-// ABI 4.0: cancellable unary calls run on their own native call
-// (aster_rpc_open), so cancelling ctx stops the native call (streaming
-// handlers also see the peer cancel); every native recv wait is bounded and
-// observes ctx.
+// ABI 4.5: a unary call with a cancellable ctx stays on the pooled fast path
+// with a cancel token, so cancelling ctx aborts the native call and the
+// server's handler sees the cancel; every native recv wait of a streaming call
+// is bounded and observes ctx.
 func TestRPC_CancellableUnaryAndBoundedRecv(t *testing.T) {
-	unaryStarted := make(chan struct{}, 1)
-	releaseUnary := make(chan struct{})
-	unaryDone := make(chan error, 1)
+	unaryStarted := make(chan struct{}, 16)
+	unaryDone := make(chan error, 16)
 	ingestDone := make(chan error, 1)
 	svc := NewService("CancelTest", 1,
 		Unary("echo", func(_ context.Context, r *testEchoRequest) (*testEchoReply, error) {
@@ -25,7 +25,10 @@ func TestRPC_CancellableUnaryAndBoundedRecv(t *testing.T) {
 		}),
 		Unary("block", func(ctx context.Context, _ *testEchoRequest) (*testEchoReply, error) {
 			unaryStarted <- struct{}{}
-			<-releaseUnary
+			select {
+			case <-ctx.Done():
+			case <-time.After(20 * time.Second):
+			}
 			unaryDone <- ctx.Err()
 			return &testEchoReply{Data: []byte{}}, nil
 		}),
@@ -52,7 +55,8 @@ func TestRPC_CancellableUnaryAndBoundedRecv(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Both unary paths work: pooled (ctx that never ends) and per-call.
+	// Both unary variants work: no cancel token (ctx that never ends) and
+	// with one.
 	for _, c := range []context.Context{context.Background(), ctx} {
 		r, err := Call[testEchoRequest, testEchoReply](c, f.conn, "CancelTest", "echo", &testEchoRequest{Message: "x", Data: []byte{}})
 		if err != nil || r.Message != "x" {
@@ -61,9 +65,7 @@ func TestRPC_CancellableUnaryAndBoundedRecv(t *testing.T) {
 	}
 
 	// Unary cancelled mid-flight (the handler is running): returns promptly
-	// with CANCELLED. Rust's server watches peer cancels on streaming calls
-	// only, so the handler runs on; its late answer is dropped and the call
-	// leaves the server's table.
+	// with CANCELLED, and the handler's context ends (the peer cancel).
 	cctx, ccancel := context.WithCancel(ctx)
 	go func() {
 		<-unaryStarted
@@ -78,15 +80,71 @@ func TestRPC_CancellableUnaryAndBoundedRecv(t *testing.T) {
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("cancelled unary took %v", d)
 	}
-	close(releaseUnary)
 	select {
-	case <-unaryDone:
+	case err := <-unaryDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("unary handler ended without seeing the cancel: %v", err)
+		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("unary handler did not finish")
+		t.Fatal("unary handler did not observe the cancel")
 	}
-	// The connection's pooled path still works after the cancelled call.
-	if _, err := Call[testEchoRequest, testEchoReply](context.Background(), f.conn, "CancelTest", "echo", &testEchoRequest{Data: []byte{}}); err != nil {
-		t.Fatalf("echo after cancel: %v", err)
+
+	// Ten cancelled at once: eight on the SHARED pool's streams, two waiting
+	// for one. Every started handler sees its cancel, and the pool is whole
+	// again: sixteen concurrent calls on the connection succeed.
+	cctx, ccancel = context.WithCancel(ctx)
+	errs := make(chan error, 10)
+	for range 10 {
+		go func() {
+			_, err := Call[testEchoRequest, testEchoReply](cctx, f.conn, "CancelTest", "block", &testEchoRequest{Data: []byte{}})
+			errs <- err
+		}()
+	}
+	for range 8 {
+		select {
+		case <-unaryStarted:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the pool's eight streams never all carried a call")
+		}
+	}
+	ccancel()
+	for range 10 {
+		if err := <-errs; !errors.Is(err, context.Canceled) {
+			t.Fatalf("pooled cancel: %v", err)
+		}
+	}
+	for range 8 {
+		select {
+		case err := <-unaryDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("handler: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a parked handler did not observe the cancel")
+		}
+	}
+	// The two queued calls may or may not have started before the cancel.
+	for len(unaryStarted) > 0 {
+		<-unaryStarted
+		if err := <-unaryDone; !errors.Is(err, context.Canceled) {
+			t.Fatalf("late handler: %v", err)
+		}
+	}
+	done := make(chan error, 16)
+	for i := range 16 {
+		go func() {
+			msg := fmt.Sprintf("after%d", i)
+			r, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "CancelTest", "echo", &testEchoRequest{Message: msg, Data: []byte{}})
+			if err == nil && r.Message != msg {
+				err = fmt.Errorf("got %q", r.Message)
+			}
+			done <- err
+		}()
+	}
+	for range 16 {
+		if err := <-done; err != nil {
+			t.Fatalf("echo after cancels: %v", err)
+		}
 	}
 
 	// A server handler blocked pulling client-stream requests observes the

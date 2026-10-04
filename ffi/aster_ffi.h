@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 4
+#define ASTER_ABI_VERSION_MINOR 5
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -2065,6 +2065,12 @@ typedef struct aster_call_options_t {
    */
   int32_t wire_call_id;
 } aster_call_options_t;
+
+/**
+ * A cancel token for one `aster_rpc_unary_cancellable` call (ABI 4.5).
+ * Opaque, never reused; 0 = none.
+ */
+typedef uint64_t aster_cancel_token_t;
 
 /**
  * A server builder (`aster_server_builder_new`); consumed by
@@ -4921,7 +4927,8 @@ int32_t aster_verified_chain_role_of(const struct aster_verified_chain_t *chain,
  *
  * Release non-zero buffers with `aster_call_buffer_release`. Bad options →
  * `INVALID_ARGUMENT`; unknown connection → `NOT_FOUND`. Blocks the calling
- * thread.
+ * thread, which must not be a tokio runtime thread (`UNSUPPORTED`, nothing
+ * sent).
  */
 int32_t aster_rpc_unary(aster_runtime_t runtime,
                         aster_connection_t connection,
@@ -4935,6 +4942,73 @@ int32_t aster_rpc_unary(aster_runtime_t runtime,
                         const uint8_t **out_status_ptr,
                         uint32_t *out_status_len,
                         aster_buffer_t *out_status_buffer);
+
+/**
+ * A new cancel token for one `aster_rpc_unary_cancellable` call. The call
+ * consumes it (whatever its outcome); a token never passed to a call is
+ * freed with `aster_cancel_token_release`. Never blocks. Tokens are
+ * process-global (one table for every runtime): `runtime` is not consulted.
+ */
+int32_t aster_cancel_token_new(aster_runtime_t runtime, aster_cancel_token_t *out_token);
+
+/**
+ * Cancel the call `token` was (or will be) passed to. From any thread,
+ * never blocks, idempotent.
+ *
+ * - Before the call starts: the call returns `CANCELLED` without sending.
+ * - While it runs: the call is abandoned like a dropped Rust future -- its
+ *   pooled stream is discarded and cancelled (`FLAG_CANCEL`, then a stream
+ *   reset), so the server sees the cancel; the connection and its pool stay
+ *   usable. The blocked `aster_rpc_unary_cancellable` returns `OK` with
+ *   `*out_status_code` = `CANCELLED` (or with the call's own outcome if
+ *   that came first: exactly one outcome either way).
+ *
+ * `OK` while the token is live; `NOT_FOUND` once its call has returned (or
+ * for a released / unknown token): nothing is left to cancel.
+ *
+ * Tokens are process-global: `runtime` is not consulted.
+ */
+int32_t aster_cancel_token_cancel(aster_runtime_t runtime, aster_cancel_token_t token);
+
+/**
+ * Free a token that was never passed to `aster_rpc_unary_cancellable`
+ * (the call frees its own). `NOT_FOUND` if it is already gone.
+ * `INVALID_ARGUMENT` while a call holds it: releasing it then would make
+ * that call uncancellable, so the token stays (the call frees it). A
+ * release that wins the race with a starting call makes that call refuse
+ * the token (`INVALID_ARGUMENT`).
+ *
+ * Tokens are process-global: `runtime` is not consulted.
+ */
+int32_t aster_cancel_token_release(aster_runtime_t runtime, aster_cancel_token_t token);
+
+/**
+ * `aster_rpc_unary` that `aster_cancel_token_cancel(token)` can abort (ABI
+ * 4.5). Same pooled single-write path and results; `token` 0 makes it
+ * exactly `aster_rpc_unary`.
+ *
+ * The call consumes `token` on every return path (argument errors too),
+ * except when it refuses the token itself: a token already taken by another
+ * call, or unknown, is `INVALID_ARGUMENT` and stays as it was.
+ * A cancelled call returns `OK` with `*out_status_code` = `CANCELLED` and
+ * the AEv1 status "call cancelled". No completion event is involved: the
+ * outcome is in the out-parameters, as for `aster_rpc_unary`. Like it,
+ * never call it from a tokio runtime thread (`UNSUPPORTED`; the token is
+ * consumed, nothing is sent).
+ */
+int32_t aster_rpc_unary_cancellable(aster_runtime_t runtime,
+                                    aster_connection_t connection,
+                                    const struct aster_call_options_t *options,
+                                    aster_cancel_token_t token,
+                                    const uint8_t *request,
+                                    uint32_t request_len,
+                                    const uint8_t **out_resp_ptr,
+                                    uint32_t *out_resp_len,
+                                    aster_buffer_t *out_resp_buffer,
+                                    int32_t *out_status_code,
+                                    const uint8_t **out_status_ptr,
+                                    uint32_t *out_status_len,
+                                    aster_buffer_t *out_status_buffer);
 
 /**
  * A fresh session id from `connection`'s counter (shared with every client

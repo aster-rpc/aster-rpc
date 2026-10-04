@@ -208,8 +208,8 @@ public final class AsterClient implements AutoCloseable {
   /**
    * Make a unary RPC call with per-call {@link CallOptions}: the client's interceptors run around
    * it (deadline, circuit breaker, retry of idempotent calls, user interceptors; see {@link
-   * Interception}). Cancelling the returned future cancels the native call when {@link
-   * CallOptions#cancellable()}.
+   * Interception}). Cancelling the returned future cancels the native call (the server's handler
+   * sees the cancel); the call still takes the pooled single-round-trip fast path.
    */
   public <Req, Resp> CompletableFuture<Resp> call(
       NodeAddr target,
@@ -488,8 +488,7 @@ public final class AsterClient implements AutoCloseable {
                             source.get(),
                             new Rpc.Options(service, method, 1, sessionId, deadlineMs, metadata),
                             req,
-                            responseType,
-                            options.cancellable()));
+                            responseType));
             out.complete(response);
           } catch (Throwable t) {
             out.completeExceptionally(unwrap(t));
@@ -499,79 +498,47 @@ public final class AsterClient implements AutoCloseable {
   }
 
   /**
-   * One unary attempt: encode, run on the pooled fast path or a cancellable native call, decode.
+   * One unary attempt: encode, run on the pooled fast path, decode. Always cancellable (ABI 4.5):
+   * the call carries a cancel token, and cancelling {@code out} cancels it ({@code
+   * aster_cancel_token_cancel}), which aborts the native call like dropping the Rust future —
+   * {@code FLAG_CANCEL} plus a reset of the pooled stream, so the server's handler sees the cancel.
+   * A cancel before the call starts makes it return {@code CANCELLED} without sending.
    */
   private <Resp> Resp unaryAttempt(
       InvocationFuture<Resp> out,
       IrohConnection conn,
       Rpc.Options ro,
       Object request,
-      Class<Resp> responseType,
-      boolean cancellable)
+      Class<Resp> responseType)
       throws Exception {
     byte[] requestBytes = codec.encode(request);
     long rt = conn.runtime().nativeHandle();
-    byte[] payload;
-    if (cancellable) {
-      payload = cancellableUnary(out, rt, conn.nativeHandle(), ro, requestBytes);
-    } else {
-      long probeT0 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
-      Rpc.UnaryResult result = Rpc.unary(rt, conn.nativeHandle(), ro, requestBytes);
-      if (site.aster.probe.AsterProbes.ENABLED) {
-        site.aster.probe.AsterProbes.recordClient(probeT0, System.nanoTime());
-      }
-      if (result.code() != RpcStatus.OK) {
-        throw rpcError(result.status());
-      }
-      payload = result.payload();
+    long token = Rpc.newCancelToken(rt);
+    // Runs at once if out is already cancelled; a cancel after the call returned is a no-op.
+    out.onCancel(() -> Rpc.cancelToken(rt, token));
+    long probeT0 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
+    Rpc.UnaryResult result;
+    try {
+      result = Rpc.unary(rt, conn.nativeHandle(), ro, requestBytes, token);
+    } catch (Throwable t) {
+      Rpc.releaseCancelToken(rt, token); // in case the native call never took it
+      throw t;
+    } finally {
+      out.clearOnCancel();
     }
+    if (site.aster.probe.AsterProbes.ENABLED) {
+      site.aster.probe.AsterProbes.recordClient(probeT0, System.nanoTime());
+    }
+    if (result.code() != RpcStatus.OK) {
+      throw rpcError(result.status());
+    }
+    byte[] payload = result.payload();
     if (payload.length == 0) {
       throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
     }
     @SuppressWarnings("unchecked")
     Resp decoded = (Resp) codec.decode(payload, responseType);
     return decoded;
-  }
-
-  /**
-   * The same wire exchange as {@code aster_rpc_unary} (header and request in one write) on a call
-   * of its own opened with the server-stream pattern, so cancelling {@code out} cancels the native
-   * call ({@code FLAG_CANCEL} plus a reset) and the server's handler sees it — as Go and .NET do
-   * for a cancellable context / token.
-   */
-  private byte[] cancellableUnary(
-      InvocationFuture<?> out, long rt, long conn, Rpc.Options ro, byte[] requestBytes) {
-    long call = Rpc.open(rt, conn, Rpc.PATTERN_SERVER_STREAM, ro);
-    InvocationFuture.NativeCall nc = new InvocationFuture.NativeCall(rt, call);
-    out.onCancel(nc::cancel);
-    try {
-      Rpc.send(rt, call, requestBytes, true); // false: the call is over, the trailer says why
-      byte[] payload = null;
-      while (true) {
-        switch (Rpc.recvPolling(rt, call, out::isCancelled)) {
-          case Rpc.Recv.Data d -> {
-            if (payload != null) {
-              throw new RpcError(
-                  StatusCode.INTERNAL, "unary call received more than one response frame");
-            }
-            payload = d.payload();
-          }
-          case Rpc.Recv.Trailer t -> {
-            RpcError e = statusError(t.status());
-            if (e != null) {
-              throw e;
-            }
-            return payload != null ? payload : new byte[0];
-          }
-          case Rpc.Recv.Timeout ignored -> {
-            // recvPolling never returns Timeout
-          }
-        }
-      }
-    } finally {
-      out.clearOnCancel();
-      nc.release();
-    }
   }
 
   <Req, Resp> CompletableFuture<List<Resp>> runServerStream(

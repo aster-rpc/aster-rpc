@@ -71,6 +71,17 @@ internal static unsafe partial class Native
         byte* request, uint request_len,
         byte** out_resp_ptr, uint* out_resp_len, ulong* out_resp_buffer,
         int* out_status_code, byte** out_status_ptr, uint* out_status_len, ulong* out_status_buffer);
+    [LibraryImport(NativeLib, EntryPoint = "aster_rpc_unary_cancellable")]
+    public static partial int aster_rpc_unary_cancellable(ulong runtime, ulong connection, CallOptionsNative* options,
+        ulong token, byte* request, uint request_len,
+        byte** out_resp_ptr, uint* out_resp_len, ulong* out_resp_buffer,
+        int* out_status_code, byte** out_status_ptr, uint* out_status_len, ulong* out_status_buffer);
+    [LibraryImport(NativeLib, EntryPoint = "aster_cancel_token_new")]
+    public static partial int aster_cancel_token_new(ulong runtime, out ulong out_token);
+    [LibraryImport(NativeLib, EntryPoint = "aster_cancel_token_cancel")]
+    public static partial int aster_cancel_token_cancel(ulong runtime, ulong token);
+    [LibraryImport(NativeLib, EntryPoint = "aster_cancel_token_release")]
+    public static partial int aster_cancel_token_release(ulong runtime, ulong token);
     [LibraryImport(NativeLib, EntryPoint = "aster_rpc_open")]
     public static partial int aster_rpc_open(ulong runtime, ulong connection, byte pattern, CallOptionsNative* options, out ulong out_call);
     [LibraryImport(NativeLib, EntryPoint = "aster_call_send_payload")]

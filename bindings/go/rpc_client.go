@@ -345,16 +345,37 @@ func (rc *RpcConnection) releaseBuffer(b C.uint64_t) {
 	}
 }
 
-// unary runs aster_rpc_unary (blocking) and returns the response payload or
-// the call's failure.
+// unary runs one pooled unary call (blocking) and returns the response
+// payload or the call's failure. A ctx that can end (ctx.Done() != nil) gets a
+// cancel token (aster_rpc_unary_cancellable, ABI 4.5): ctx ending cancels it,
+// which aborts the native call like dropping the Rust future -- the pooled
+// stream is discarded with FLAG_CANCEL + reset, so the server sees the
+// cancel -- while the call keeps the single-write fast path.
 func (rc *RpcConnection) unary(ctx context.Context, opts nativeOptions, req []byte) ([]byte, error) {
 	p, n := cBytesArg(req)
 	var respPtr, statusPtr *C.uint8_t
 	var respLen, statusLen C.uint32_t
 	var respBuf, statusBuf C.uint64_t
 	var code C.int32_t
-	r := C.aster_rpc_unary(rc.rt(), rc.conv(), opts.ptr(), p, n,
-		&respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+	var r C.int32_t
+	if ctx.Done() == nil {
+		r = C.aster_rpc_unary(rc.rt(), rc.conv(), opts.ptr(), p, n,
+			&respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+	} else {
+		if ctx.Err() != nil {
+			return nil, ctxFailure(ctx)
+		}
+		rt := rc.rt()
+		var token C.aster_cancel_token_t
+		if err := statusError(C.aster_cancel_token_new(rt, &token)); err != nil {
+			return nil, fmt.Errorf("aster_cancel_token_new: %w", err)
+		}
+		// Never blocks; a no-op (NOT_FOUND) once the call has returned.
+		stop := context.AfterFunc(ctx, func() { C.aster_cancel_token_cancel(rt, token) })
+		r = C.aster_rpc_unary_cancellable(rt, rc.conv(), opts.ptr(), token, p, n,
+			&respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+		stop()
+	}
 	if r != C.ASTER_STATUS_OK {
 		if r == C.ASTER_STATUS_NOT_FOUND {
 			return nil, &RpcError{Code: StatusUnavailable, Message: "connection closed"}
@@ -368,7 +389,14 @@ func (rc *RpcConnection) unary(ctx context.Context, opts nativeOptions, req []by
 		}
 		rc.releaseBuffer(statusBuf)
 		rc.releaseBuffer(respBuf)
-		return nil, statusFromBytes(ctx, int32(code), st)
+		err := statusFromBytes(ctx, int32(code), st)
+		// A ctx deadline also fires the cancel (AfterFunc); when that wins
+		// the race with the native deadline timer the status says CANCELLED
+		// -- report the deadline.
+		if errors.Is(err, ErrRpcCancelled) && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, ctxFailure(ctx)
+		}
+		return nil, err
 	}
 	resp := []byte{}
 	if respLen > 0 {
@@ -379,13 +407,10 @@ func (rc *RpcConnection) unary(ctx context.Context, opts nativeOptions, req []by
 	return resp, nil
 }
 
-// Call makes a unary call. With a context that can never end
-// (ctx.Done() == nil) it takes the pooled fast path (aster_rpc_unary: one
-// blocking native call). Otherwise -- like .NET with a cancellable token --
-// it runs the same wire exchange on a call of its own (aster_rpc_open), so
-// cancelling ctx cancels the native call (aster_call_cancel: FLAG_CANCEL +
-// stream reset) and the server sees the cancel. The context's deadline is
-// enforced natively either way.
+// Call makes a unary call on the connection's pooled streams (one blocking
+// native call: header + request in one write). Cancelling ctx cancels the
+// native call and the server sees the cancel (a cancel token, ABI 4.5); the
+// context's deadline is enforced natively.
 func Call[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, opts ...CallOption) (*Resp, error) {
 	o := buildOptions(opts)
 	if ch := rc.chain(o); ch != nil {
@@ -400,39 +425,16 @@ func callUnary[Req, Resp any](ctx context.Context, rc *RpcConnection, service, m
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	var resp []byte
-	if ctx.Done() == nil {
-		nopts, err := lowerOptions(ctx, service, method, o)
-		if err != nil {
-			return nil, err
-		}
-		resp, err = rc.unary(ctx, nopts, payload)
-		nopts.free()
-		if err != nil {
-			return nil, err
-		}
-	} else if resp, err = rc.cancellableUnary(ctx, service, method, o, payload); err != nil {
-		return nil, err
-	}
-	return decodeResponse[Resp](rc.codec, resp)
-}
-
-// cancellableUnary sends header + request on a dedicated stream (opened with
-// the server-stream pattern: the same frames as a unary call, header and
-// request in one write) and reads the single response.
-func (rc *RpcConnection) cancellableUnary(ctx context.Context, service, method string, o *callOptions, payload []byte) ([]byte, error) {
-	if ctx.Err() != nil {
-		return nil, ctxFailure(ctx)
-	}
-	c, err := openCall(ctx, rc, PatternServerStream, service, method, o)
+	nopts, err := lowerOptions(ctx, service, method, o)
 	if err != nil {
 		return nil, err
 	}
-	defer c.release()
-	if err := c.send(payload, true); err != nil && !errors.Is(err, errCallClosed) {
+	resp, err := rc.unary(ctx, nopts, payload)
+	nopts.free()
+	if err != nil {
 		return nil, err
 	}
-	return c.readSingle("unary")
+	return decodeResponse[Resp](rc.codec, resp)
 }
 
 func decodeResponse[Resp any](codec Codec, payload []byte) (*Resp, error) {

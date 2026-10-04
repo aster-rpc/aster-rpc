@@ -108,8 +108,14 @@ pub mod upcall;
 //   results `D2`-`DE`, resolved-mutation and coordination-lease handles,
 //   `aster_coordination_placement_manager_*` over upcall kinds 17/32/33
 //   (now issued by the C ABI); events 110-113.
+// - 4.5.0 (additive): native unary cancel on the pooled fast path (`rpc.rs`)
+//   -- `aster_cancel_token_{new,cancel,release}` and
+//   `aster_rpc_unary_cancellable`: cancelling the token aborts the in-flight
+//   call like dropping the Rust future (FLAG_CANCEL + reset of the pooled
+//   stream; the server sees the cancel; the call returns CANCELLED). See
+//   `ffi/RENAME_MAP.md` "New in 4.5".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 4;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 5;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -509,6 +515,12 @@ pub(crate) struct HandleRegistry<T> {
 /// endpoint (or any other) handle. Functions that accept "endpoint or node"
 /// (`aster_connect`, `aster_accept`, remote info, transport metrics) rely on it.
 static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A fresh id from the shared handle id space (for tables that are not a
+/// `HandleRegistry`, e.g. the sharded cancel-token table).
+pub(crate) fn next_handle_id() -> u64 {
+    NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 impl<T> HandleRegistry<T> {
     pub(crate) fn new() -> Self {
