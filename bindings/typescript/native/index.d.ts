@@ -865,9 +865,10 @@ export declare class IrohConnection {
    * Consumer side: start one HTTP exchange with `serviceId`, streamed
    * both ways. Returns the upload and the pending response at once: write
    * the request body then `finish()` it while awaiting `response.wait()`.
-   * The relay sends the whole request body before it reads the response
-   * head (not full duplex). The exchange runs whether or not `wait()` is
-   * called.
+   * Full duplex: `wait()` resolves as soon as the head is in, possibly
+   * before the upload is done; keep writing after it. Closing the
+   * response body before its end resets an unfinished upload. The
+   * exchange runs whether or not `wait()` is called.
    */
   relayHttpStreaming(serviceId: string, request?: RelayHttpStreamRequest | undefined | null): RelayHttpStreaming
   /**
