@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 0
+#define ASTER_ABI_VERSION_MINOR 1
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -158,6 +158,11 @@
 #define ASTER_TIMEOUT_INFINITE UINT32_MAX
 
 /**
+ * Default `aster_upcalls_new` capacity (queued upcalls before refusal).
+ */
+#define ASTER_UPCALL_DEFAULT_CAPACITY 1024
+
+/**
  * Status codes
  */
 typedef enum aster_status_t {
@@ -297,6 +302,17 @@ typedef enum aster_event_kind_t {
    * payload = priority (i32 LE); `flags` = its bit pattern.
    */
   ASTER_EVENT_STREAM_PRIORITY = 106,
+  /**
+   * `aster_lease_acquire`: payload = UCv1 `TransitionOutcome` (tag `B2`):
+   * granted (`handle` = the new `aster_lease_t`, the payload carries the
+   * fence) or denied (`handle` = 0, reason + snapshot).
+   */
+  ASTER_EVENT_LEASE_ACQUIRED = 107,
+  /**
+   * `aster_lease_watch`: the lease left `HELD`; `flags` =
+   * `aster_lease_status_t`.
+   */
+  ASTER_EVENT_LEASE_STATUS = 108,
 } aster_event_kind_t;
 
 /**
@@ -699,6 +715,127 @@ typedef enum aster_server_option_t {
    */
   ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS = 4,
 } aster_server_option_t;
+
+/**
+ * `aster_upcall_event_t.kind` (= `aster::binding_support::upcall::UpcallKind`).
+ * Request → response UCv1 tags per kind are in the design doc §3.
+ */
+typedef enum aster_upcall_kind_t {
+  /**
+   * Rust stopped waiting for `invocation_id` (`cancel_reason`). Never
+   * answered; drop the work for that id.
+   */
+  ASTER_UPCALL_KIND_CANCEL = 0,
+  /**
+   * `LeaseSerializer::transition`: `B1` → `B2`.
+   */
+  ASTER_UPCALL_KIND_LEASE_TRANSITION = 1,
+  /**
+   * `LeaseSerializer::snapshot`: `B3` → `B4`.
+   */
+  ASTER_UPCALL_KIND_LEASE_SNAPSHOT = 2,
+  /**
+   * Lease authorizer (decision): `B5` → `CF`.
+   */
+  ASTER_UPCALL_KIND_LEASE_AUTHORIZE = 3,
+  /**
+   * `FencedResource::mutate`: `B6` → `B7`.
+   */
+  ASTER_UPCALL_KIND_FENCED_MUTATE = 4,
+  /**
+   * Topology `admitted` filter, batched (decision): `B8` → `B9`.
+   */
+  ASTER_UPCALL_KIND_TOPOLOGY_ADMITTED = 16,
+  /**
+   * Placement topology source: `BA` → `BB` (not issued by the C ABI yet).
+   */
+  ASTER_UPCALL_KIND_TOPOLOGY_SNAPSHOT = 17,
+  /**
+   * Placement policy source: `BC` → `BD` (not issued by the C ABI yet).
+   */
+  ASTER_UPCALL_KIND_PLACEMENT_POLICY = 32,
+  /**
+   * Placement provisioner: `BE` → `BF` (not issued by the C ABI yet).
+   */
+  ASTER_UPCALL_KIND_PLACEMENT_PROVISION = 33,
+  /**
+   * expose authorize (decision): `C0` → `CF` (not issued by the C ABI yet).
+   */
+  ASTER_UPCALL_KIND_EXPOSE_AUTHORIZE = 48,
+  /**
+   * expose HTTP handler (R9): `C4` → `C5` (not issued by the C ABI yet).
+   */
+  ASTER_UPCALL_KIND_EXPOSE_HTTP = 49,
+  /**
+   * expose route policy (R9, decision): `C7` → `C8` (not issued by the
+   * C ABI yet).
+   */
+  ASTER_UPCALL_KIND_EXPOSE_ROUTE_POLICY = 50,
+  /**
+   * Gate 0 connect hook (decision): `C1` → `CF` (not issued by the C ABI yet).
+   */
+  ASTER_UPCALL_KIND_ADMISSION_CONNECT = 64,
+  /**
+   * Gate 0 handshake hook (decision): `C2` → `C3` (not issued by the C ABI yet).
+   */
+  ASTER_UPCALL_KIND_ADMISSION_HANDSHAKE = 65,
+} aster_upcall_kind_t;
+
+/**
+ * `status` of `aster_upcall_respond`. An unknown value reads as `ERROR`.
+ */
+typedef enum aster_upcall_status_t {
+  /**
+   * `payload` is the kind's UCv1 response.
+   */
+  ASTER_UPCALL_STATUS_OK = 0,
+  /**
+   * The handler failed; `payload` is a UTF-8 message.
+   */
+  ASTER_UPCALL_STATUS_ERROR = 1,
+  /**
+   * No handler for this kind (`payload` ignored).
+   */
+  ASTER_UPCALL_STATUS_UNIMPLEMENTED = 2,
+} aster_upcall_status_t;
+
+/**
+ * `aster_upcall_event_t.cancel_reason` (0 on every other kind).
+ */
+typedef enum aster_upcall_cancel_reason_t {
+  ASTER_UPCALL_CANCEL_NONE = 0,
+  /**
+   * The kind's timeout passed.
+   */
+  ASTER_UPCALL_CANCEL_TIMEOUT = 1,
+  /**
+   * The waiting Rust caller gave up (e.g. a dropped acquire).
+   */
+  ASTER_UPCALL_CANCEL_ABANDONED = 2,
+  /**
+   * `aster_upcalls_close` / `aster_upcalls_free` ran.
+   */
+  ASTER_UPCALL_CANCEL_SHUTDOWN = 3,
+} aster_upcall_cancel_reason_t;
+
+/**
+ * Holder-side lease status (`aster_lease_status`, `ASTER_EVENT_LEASE_STATUS`).
+ */
+typedef enum aster_lease_status_t {
+  ASTER_LEASE_STATUS_HELD = 0,
+  /**
+   * Released by this holder.
+   */
+  ASTER_LEASE_STATUS_RELEASED = 1,
+  /**
+   * A renewal was refused (someone holds a newer epoch, or revoked).
+   */
+  ASTER_LEASE_STATUS_FENCED = 2,
+  /**
+   * The self-limit passed without a successful renewal.
+   */
+  ASTER_LEASE_STATUS_LOST = 3,
+} aster_lease_status_t;
 
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
@@ -1467,6 +1604,88 @@ typedef struct aster_dispatch_event_t {
    */
   uint64_t buffer;
 } aster_dispatch_event_t;
+
+/**
+ * An upcall table plus its bounded event queue (`aster_upcalls_new`).
+ */
+typedef uint64_t aster_upcalls_t;
+
+/**
+ * One upcall event, filled by `aster_upcall_poll`. 40 bytes (LP64).
+ *
+ * `payload_ptr` / `payload_len` is the kind's UCv1 request, valid until
+ * `aster_upcall_buffer_release(rt, upcalls, buffer)`; an empty payload is
+ * `{NULL, 0}` with `buffer` 0. `CANCEL` events carry no payload: the reason
+ * is in `cancel_reason` and `invocation_id` names the cancelled upcall.
+ */
+typedef struct aster_upcall_event_t {
+  /**
+   * The id to pass to `aster_upcall_respond`. Unique per table, from 1.
+   */
+  uint64_t invocation_id;
+  /**
+   * `aster_upcall_kind_t`.
+   */
+  uint16_t kind;
+  /**
+   * `CANCEL`: `aster_upcall_cancel_reason_t`; otherwise 0.
+   */
+  uint8_t cancel_reason;
+  uint8_t _p0;
+  uint32_t payload_len;
+  /**
+   * When Rust stops waiting (Unix ms; 0 on `CANCEL`). Informational.
+   */
+  uint64_t deadline_unix_ms;
+  const uint8_t *payload_ptr;
+  /**
+   * Lease for `payload_ptr` (0 = nothing to release).
+   */
+  aster_buffer_t buffer;
+} aster_upcall_event_t;
+
+/**
+ * A lease serializer (`aster_lease_serializer_*_new`).
+ */
+typedef uint64_t aster_lease_serializer_t;
+
+/**
+ * A held lease (`ASTER_EVENT_LEASE_ACQUIRED`).
+ */
+typedef uint64_t aster_lease_t;
+
+/**
+ * A foreign fenced resource (`aster_fenced_resource_foreign_new`).
+ */
+typedef uint64_t aster_fenced_resource_t;
+
+/**
+ * A cached, batched foreign topology admission filter
+ * (`aster_topology_admitted_new`).
+ */
+typedef uint64_t aster_topology_admitted_t;
+
+/**
+ * Counters of a topology admission filter (`aster_topology_admitted_stats`).
+ */
+typedef struct aster_topology_admitted_stats_t {
+  /**
+   * Lookups answered from a fresh entry.
+   */
+  uint64_t hits;
+  /**
+   * Lookups answered from a stale entry (refresh queued).
+   */
+  uint64_t stale;
+  /**
+   * Lookups with no entry (failure-mode answer, resolution queued).
+   */
+  uint64_t misses;
+  /**
+   * Batched upcalls issued.
+   */
+  uint64_t upcalls;
+} aster_topology_admitted_stats_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -3754,6 +3973,324 @@ int32_t aster_dynamic_service_contract_id(const uint8_t *json,
  * Live calls in the server's table (diagnostics / tests).
  */
 uint64_t aster_server_live_calls(aster_server_t server_h);
+
+/**
+ * Create an upcall table with a bounded queue of `capacity` upcalls (0 =
+ * `ASTER_UPCALL_DEFAULT_CAPACITY`). When the queue is full, further
+ * upcalls fail at once (`Overloaded`: decisions take the failure mode,
+ * other kinds error); `CANCEL` events are always queued. Every kind starts
+ * with the default policy: 5 s, fail closed.
+ */
+int32_t aster_upcalls_new(aster_runtime_t runtime, uint32_t capacity, aster_upcalls_t *out_upcalls);
+
+/**
+ * Close the table: pending upcalls fail now (decision kinds take their
+ * failure mode, others error), each gets a `CANCEL` event with reason
+ * `SHUTDOWN`, and new upcalls fail with `Closed`. Queued events stay
+ * drainable; `aster_upcall_respond` keeps returning `NOT_FOUND`. Adapters
+ * built on the table keep their handles but can no longer reach the
+ * binding. Idempotent.
+ */
+int32_t aster_upcalls_close(aster_runtime_t runtime, aster_upcalls_t upcalls);
+
+/**
+ * Close (as `aster_upcalls_close`) and free the handle. Payload buffers not
+ * yet released are freed with it.
+ */
+int32_t aster_upcalls_free(aster_runtime_t runtime, aster_upcalls_t upcalls);
+
+/**
+ * Set the timeout and failure mode (`aster_hook_failure_mode_t`) of one
+ * kind. The failure mode applies to decision kinds (lease authorize,
+ * topology admitted, expose authorize, admission): it is the answer used
+ * when the binding gives none (error, timeout, overload, shutdown,
+ * undecodable answer). `timeout_ms` must be > 0; `CANCEL` is not a kind
+ * that can have a policy.
+ */
+int32_t aster_upcall_set_policy(aster_runtime_t runtime,
+                                aster_upcalls_t upcalls,
+                                uint32_t kind,
+                                uint32_t timeout_ms,
+                                uint32_t failure_mode);
+
+/**
+ * Set the policy of every kind without its own (`aster_upcall_set_policy`).
+ */
+int32_t aster_upcall_set_default_policy(aster_runtime_t runtime,
+                                        aster_upcalls_t upcalls,
+                                        uint32_t timeout_ms,
+                                        uint32_t failure_mode);
+
+/**
+ * Drain up to `max` events into `out`. `timeout_ms` 0 = return at once;
+ * otherwise wait up to that long for the first event (or until the table
+ * is closed). Returns the count (0 on timeout, unknown handle or bad
+ * arguments). Single consumer; blocks the calling thread, so run it off
+ * the runtime's threads (and off virtual-thread carriers when waiting).
+ */
+uint32_t aster_upcall_poll(aster_runtime_t runtime,
+                           aster_upcalls_t upcalls,
+                           struct aster_upcall_event_t *out,
+                           uint32_t max,
+                           uint32_t timeout_ms);
+
+/**
+ * Release an event's payload. 0 is a no-op; an unknown buffer returns
+ * `NOT_FOUND`.
+ */
+int32_t aster_upcall_buffer_release(aster_runtime_t runtime,
+                                    aster_upcalls_t upcalls,
+                                    aster_buffer_t buffer);
+
+/**
+ * Answer upcall `invocation_id` with `status` (`aster_upcall_status_t`) and
+ * `payload` (the kind's UCv1 response for `OK`, a UTF-8 message for
+ * `ERROR`, ignored for `UNIMPLEMENTED`). Copies the payload; never blocks;
+ * any thread, any order. `NOT_FOUND` when the id is not pending (never
+ * issued, answered, cancelled or timed out) -- ignore it. A malformed `OK`
+ * payload is not detected here: the waiting Rust caller sees a decode
+ * error (decision kinds take their failure mode).
+ */
+int32_t aster_upcall_respond(aster_runtime_t runtime,
+                             aster_upcalls_t upcalls,
+                             uint64_t invocation_id,
+                             uint32_t status,
+                             const uint8_t *payload,
+                             uint32_t payload_len);
+
+/**
+ * A lease serializer whose serialization point is the binding: every
+ * transition is a `LEASE_TRANSITION` upcall and every snapshot a
+ * `LEASE_SNAPSHOT` upcall on `upcalls`. A failed upcall is a backend error
+ * (the acquire / renew / release fails; it is never read as a denial).
+ */
+int32_t aster_lease_serializer_foreign_new(aster_runtime_t runtime,
+                                           aster_upcalls_t upcalls,
+                                           aster_lease_serializer_t *out_serializer);
+
+/**
+ * The reference in-memory serializer (`aster::lease::MemorySerializer`:
+ * rows under one lock, expiry on this process's clock). With
+ * `authorizer_upcalls` != 0 every transition is first put to the binding as
+ * a `LEASE_AUTHORIZE` decision; a refusal (or no answer under fail-closed)
+ * is `Denied(Unauthorized)`. 0 = everyone is authorized.
+ */
+int32_t aster_lease_serializer_memory_new(aster_runtime_t runtime,
+                                          aster_upcalls_t authorizer_upcalls,
+                                          aster_lease_serializer_t *out_serializer);
+
+/**
+ * Free a serializer handle. Leases acquired from it keep their own
+ * reference and keep renewing.
+ */
+int32_t aster_lease_serializer_free(aster_runtime_t runtime, aster_lease_serializer_t serializer);
+
+/**
+ * Try to acquire `resource` for `holder` (a hex node id, or any stable
+ * actor name the serializer understands) -- one ACQUIRE at the serializer.
+ *
+ * `ttl_ms` 0 = the defaults (30 s ttl, 10 s renew, 1 s margin); with a ttl,
+ * 0 for `renew_interval_ms` = ttl/3 and 0 for `holder_margin_ms` =
+ * ttl/10 capped at 1 s. Invalid timing is `INVALID_ARGUMENT`.
+ *
+ * Completes with `ASTER_EVENT_LEASE_ACQUIRED`; the payload is the UCv1
+ * `TransitionOutcome` (`B2`): granted (`handle` = a new `aster_lease_t`
+ * that renews in the background until released or freed; the payload
+ * carries the fence) or denied (`handle` = 0; reason + snapshot, the
+ * snapshot's `remaining_ms` is a back-off hint). A serializer failure is
+ * `ASTER_EVENT_ERROR`.
+ */
+int32_t aster_lease_acquire(aster_runtime_t runtime,
+                            aster_lease_serializer_t serializer,
+                            struct aster_bytes_t resource,
+                            struct aster_bytes_t holder,
+                            uint64_t ttl_ms,
+                            uint64_t renew_interval_ms,
+                            uint64_t holder_margin_ms,
+                            uint64_t user_data,
+                            aster_operation_t *out_operation);
+
+/**
+ * The current fence epoch of a held lease, for stamping on a protected
+ * action **at send time** (do not cache it). `ALREADY_CLOSED` once the
+ * holder must stop acting: the lease was fenced, lost, released, or its
+ * self-limit passed.
+ */
+int32_t aster_lease_fence(aster_runtime_t runtime, aster_lease_t lease, uint64_t *out_epoch);
+
+/**
+ * The holder-side status (`aster_lease_status_t`).
+ */
+int32_t aster_lease_status(aster_runtime_t runtime, aster_lease_t lease, uint32_t *out_status);
+
+/**
+ * Complete when the lease leaves `HELD` (fenced, lost or released) with
+ * `ASTER_EVENT_LEASE_STATUS`, `flags` = the new `aster_lease_status_t`.
+ * Completes at once if it already has. If the lease is freed first the
+ * event carries status `ALREADY_CLOSED`. Cancel with
+ * `aster_operation_cancel`.
+ */
+int32_t aster_lease_watch(aster_runtime_t runtime,
+                          aster_lease_t lease,
+                          uint64_t user_data,
+                          aster_operation_t *out_operation);
+
+/**
+ * Graceful release: stop renewing, then RELEASE at the serializer, which
+ * advances the fence (this holder's in-flight writes are rejected from
+ * here on). Consumes the handle (later calls return `NOT_FOUND`).
+ * Completes with `ASTER_EVENT_UNIT_RESULT`, or `ASTER_EVENT_ERROR` if the
+ * serializer failed (the lease then lapses by TTL).
+ */
+int32_t aster_lease_release(aster_runtime_t runtime,
+                            aster_lease_t lease,
+                            uint64_t user_data,
+                            aster_operation_t *out_operation);
+
+/**
+ * Free a lease handle **without** releasing: renewals stop and the lease
+ * lapses at the serializer by TTL. Prefer `aster_lease_release`.
+ */
+int32_t aster_lease_free(aster_runtime_t runtime, aster_lease_t lease);
+
+/**
+ * Advisory snapshot of `resource` at the serializer (stale the moment it
+ * returns; hints only). Completes with `ASTER_EVENT_BYTES_RESULT`, payload
+ * = UCv1 `LeaseSnapshot` (`B4`).
+ */
+int32_t aster_lease_snapshot(aster_runtime_t runtime,
+                             aster_lease_serializer_t serializer,
+                             struct aster_bytes_t resource,
+                             uint64_t user_data,
+                             aster_operation_t *out_operation);
+
+/**
+ * REVOKE `resource` at the serializer on behalf of `authority` (advances
+ * the fence). Completes with `ASTER_EVENT_BYTES_RESULT`, payload = UCv1
+ * `TransitionOutcome` (`B2`: revoked, or denied with a reason).
+ */
+int32_t aster_lease_revoke(aster_runtime_t runtime,
+                           aster_lease_serializer_t serializer,
+                           struct aster_bytes_t resource,
+                           struct aster_bytes_t authority,
+                           uint64_t user_data,
+                           aster_operation_t *out_operation);
+
+/**
+ * A fenced resource implemented by the binding: each mutation is a
+ * `FENCED_MUTATE` upcall that must evaluate the fence rule inside the
+ * resource's own serialization point (the adapter cannot enforce that).
+ */
+int32_t aster_fenced_resource_foreign_new(aster_runtime_t runtime,
+                                          aster_upcalls_t upcalls,
+                                          aster_fenced_resource_t *out_resource);
+
+/**
+ * Free a fenced resource handle.
+ */
+int32_t aster_fenced_resource_free(aster_runtime_t runtime, aster_fenced_resource_t resource);
+
+/**
+ * Apply `op` (opaque bytes) under the fence `(fence_resource, epoch,
+ * fence_holder)` as authenticated `writer`. Completes with
+ * `ASTER_EVENT_BYTES_RESULT`, payload = UCv1 `FencedMutateResponse`
+ * (`B7`: applied with the output bytes, or the fence rejection). Any other
+ * failure (timeout, binding error, closed table) is `ASTER_EVENT_ERROR`
+ * and means the **outcome is unknown** -- a write cannot be failed open.
+ */
+int32_t aster_fenced_mutate(aster_runtime_t runtime,
+                            aster_fenced_resource_t resource,
+                            struct aster_bytes_t fence_resource,
+                            uint64_t epoch,
+                            struct aster_bytes_t fence_holder,
+                            struct aster_bytes_t writer,
+                            struct aster_bytes_t op,
+                            uint64_t user_data,
+                            aster_operation_t *out_operation);
+
+/**
+ * A topology read-time admission filter answered by the binding
+ * (`TOPOLOGY_ADMITTED`, batched). Lookups never block: a fresh cached
+ * answer is served; a stale one is served and refreshed; a miss gets the
+ * kind's failure-mode answer (default: not admitted) and is resolved in
+ * the background. `ttl_ms` (0 = 30 s) is how long an answer is served,
+ * `failure_retry_ms` (0 = 1 s) how long a failed batch's fallback is
+ * cached, `max_batch` (0 = 256) the most ids per upcall.
+ */
+int32_t aster_topology_admitted_new(aster_runtime_t runtime,
+                                    aster_upcalls_t upcalls,
+                                    uint32_t ttl_ms,
+                                    uint32_t failure_retry_ms,
+                                    uint32_t max_batch,
+                                    aster_topology_admitted_t *out_admitted);
+
+/**
+ * Free a filter handle. A swarm it was installed in keeps using it.
+ */
+int32_t aster_topology_admitted_free(aster_runtime_t runtime, aster_topology_admitted_t admitted);
+
+/**
+ * Look `node_id` (64 hex) up exactly as the swarm's filter does (never
+ * blocks; a miss queues a resolution). `*out_admitted` = 1 or 0.
+ */
+int32_t aster_topology_admitted_check(aster_runtime_t runtime,
+                                      aster_topology_admitted_t admitted,
+                                      struct aster_bytes_t node_id,
+                                      uint32_t *out_admitted);
+
+/**
+ * Push an answer for `node_id` (e.g. on revocation); served for `ttl`.
+ */
+int32_t aster_topology_admitted_set(aster_runtime_t runtime,
+                                    aster_topology_admitted_t admitted,
+                                    struct aster_bytes_t node_id,
+                                    uint32_t is_admitted);
+
+/**
+ * Forget `node_id`'s answer (the next lookup re-resolves); an empty
+ * `node_id` forgets every answer.
+ */
+int32_t aster_topology_admitted_invalidate(aster_runtime_t runtime,
+                                           aster_topology_admitted_t admitted,
+                                           struct aster_bytes_t node_id);
+
+/**
+ * Resolve `node_ids` (64 hex each) now with one upcall and cache the
+ * answers (warm the cache before `aster_topology_enable_shared`).
+ * Completes with `ASTER_EVENT_UNIT_RESULT`, or `ASTER_EVENT_ERROR` if the
+ * upcall failed (the fallback is then cached for `failure_retry`).
+ */
+int32_t aster_topology_admitted_prefetch(aster_runtime_t runtime,
+                                         aster_topology_admitted_t admitted,
+                                         struct aster_bytes_list_t node_ids,
+                                         uint64_t user_data,
+                                         aster_operation_t *out_operation);
+
+/**
+ * Copy the filter's counters into `*out`.
+ */
+int32_t aster_topology_admitted_stats(aster_runtime_t runtime,
+                                      aster_topology_admitted_t admitted,
+                                      struct aster_topology_admitted_stats_t *out);
+
+/**
+ * Join a topology swarm (topology v2, `aster::Topology::enable_shared`):
+ * import the shared namespace from its 32-byte `secret`, publish this
+ * node's measurements and derive the swarm-wide cluster view. The node must
+ * run with `enable_monitoring`. `admitted` (0 = none: every holder of the
+ * secret counts) installs a foreign read-time admission filter.
+ * `bootstrap` are extra peers (64-hex node ids) to sync with;
+ * `position_refresh_ms` 0 = 60 s. Completes with
+ * `ASTER_EVENT_UNIT_RESULT` (`handle` = node).
+ */
+int32_t aster_topology_enable_shared(aster_runtime_t runtime,
+                                     aster_node_t node,
+                                     const uint8_t *secret,
+                                     aster_topology_admitted_t admitted,
+                                     struct aster_bytes_list_t bootstrap,
+                                     uint32_t position_refresh_ms,
+                                     uint64_t user_data,
+                                     aster_operation_t *out_operation);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -30,6 +30,7 @@ pub mod probe;
 pub mod pure;
 pub mod rpc;
 pub mod server;
+pub mod upcall;
 
 // ============================================================================
 // ABI Version
@@ -74,8 +75,15 @@ pub mod server;
 //   `_export_secret_key`, `_addr_info`, `aster_endpoint_config_t`).
 //   `aster_accept` on a node now reads the node's aster-ALPN accept queue.
 //   See `ffi/RENAME_MAP.md` "4.0".
+// - 4.1.0 (additive): upcalls (R6/D6) -- `aster_upcalls_*` /
+//   `aster_upcall_{poll,respond,set_policy,set_default_policy,
+//   buffer_release}` carry Rust's questions to foreign code as UCv1
+//   payloads; upcall-backed lease serializer / authorizer / fenced resource
+//   and lease handles (`aster_lease_*`, `aster_fenced_*`), the topology
+//   `admitted` filter (`aster_topology_admitted_*`) and
+//   `aster_topology_enable_shared`; see `upcall.rs`.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 0;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 1;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -256,6 +264,15 @@ pub enum aster_event_kind_t {
     ASTER_EVENT_DOC_CONTENT_STATUS = 105,
     /// payload = priority (i32 LE); `flags` = its bit pattern.
     ASTER_EVENT_STREAM_PRIORITY = 106,
+
+    // Upcall-backed leases (ABI 4.1, upcall.rs)
+    /// `aster_lease_acquire`: payload = UCv1 `TransitionOutcome` (tag `B2`):
+    /// granted (`handle` = the new `aster_lease_t`, the payload carries the
+    /// fence) or denied (`handle` = 0, reason + snapshot).
+    ASTER_EVENT_LEASE_ACQUIRED = 107,
+    /// `aster_lease_watch`: the lease left `HELD`; `flags` =
+    /// `aster_lease_status_t`.
+    ASTER_EVENT_LEASE_STATUS = 108,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and

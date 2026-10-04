@@ -174,12 +174,12 @@ const EMPTY: aster_bytes_t = aster_bytes_t {
     len: 0,
 };
 
-fn invalid(msg: impl ToString) -> i32 {
+pub(crate) fn invalid(msg: impl ToString) -> i32 {
     set_last_error(msg);
     aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32
 }
 
-fn not_found(msg: impl ToString) -> i32 {
+pub(crate) fn not_found(msg: impl ToString) -> i32 {
     set_last_error(msg);
     aster_status_t::ASTER_STATUS_NOT_FOUND as i32
 }
@@ -193,11 +193,11 @@ macro_rules! try_status {
     };
 }
 
-fn bridge_for(runtime: aster_runtime_t) -> Result<Arc<BridgeRuntime>, i32> {
+pub(crate) fn bridge_for(runtime: aster_runtime_t) -> Result<Arc<BridgeRuntime>, i32> {
     load_runtime(runtime).map_err(|s| s as i32)
 }
 
-unsafe fn in_slice<'a>(b: &aster_bytes_t, what: &str) -> Result<&'a [u8], i32> {
+pub(crate) unsafe fn in_slice<'a>(b: &aster_bytes_t, what: &str) -> Result<&'a [u8], i32> {
     if b.len == 0 {
         Ok(&[])
     } else if b.ptr.is_null() {
@@ -210,7 +210,7 @@ unsafe fn in_slice<'a>(b: &aster_bytes_t, what: &str) -> Result<&'a [u8], i32> {
     }
 }
 
-unsafe fn in_string(b: &aster_bytes_t, what: &str) -> Result<String, i32> {
+pub(crate) unsafe fn in_string(b: &aster_bytes_t, what: &str) -> Result<String, i32> {
     let s = in_slice(b, what)?;
     std::str::from_utf8(s)
         .map(str::to_owned)
@@ -218,7 +218,7 @@ unsafe fn in_string(b: &aster_bytes_t, what: &str) -> Result<String, i32> {
 }
 
 /// A 64-char hex id (hash, node id, author, namespace), lower-cased.
-unsafe fn in_hex32(b: &aster_bytes_t, what: &str) -> Result<String, i32> {
+pub(crate) unsafe fn in_hex32(b: &aster_bytes_t, what: &str) -> Result<String, i32> {
     let s = in_slice(b, what)?;
     if s.len() != 64 || !s.iter().all(u8::is_ascii_hexdigit) {
         return Err(invalid(format!("{what}: expected 64 hex characters")));
@@ -239,7 +239,7 @@ unsafe fn in_namespace(b: &aster_bytes_t) -> Result<NamespaceId, i32> {
     NamespaceId::from_hex(&hex).map_err(invalid)
 }
 
-unsafe fn in_node_list(l: &aster_bytes_list_t, what: &str) -> Result<Vec<NodeId>, i32> {
+pub(crate) unsafe fn in_node_list(l: &aster_bytes_list_t, what: &str) -> Result<Vec<NodeId>, i32> {
     if l.len == 0 {
         return Ok(Vec::new());
     }
@@ -328,7 +328,7 @@ pub fn encode_fetch_report(report: &FetchReport, data: &[u8]) -> Vec<u8> {
 }
 
 /// The outcome of one async operation, turned into a completion event.
-struct Done {
+pub(crate) struct Done {
     kind: aster_event_kind_t,
     status: aster_status_t,
     handle: u64,
@@ -338,7 +338,7 @@ struct Done {
 }
 
 impl Done {
-    fn ok(kind: aster_event_kind_t, handle: u64) -> Self {
+    pub(crate) fn ok(kind: aster_event_kind_t, handle: u64) -> Self {
         Done {
             kind,
             status: aster_status_t::ASTER_STATUS_OK,
@@ -348,19 +348,19 @@ impl Done {
             data: None,
         }
     }
-    fn related(mut self, related: u64) -> Self {
+    pub(crate) fn related(mut self, related: u64) -> Self {
         self.related = related;
         self
     }
-    fn flags(mut self, flags: u32) -> Self {
+    pub(crate) fn flags(mut self, flags: u32) -> Self {
         self.flags = flags;
         self
     }
-    fn data(mut self, data: Vec<u8>) -> Self {
+    pub(crate) fn data(mut self, data: Vec<u8>) -> Self {
         self.data = Some(data);
         self
     }
-    fn status(mut self, status: aster_status_t) -> Self {
+    pub(crate) fn status(mut self, status: aster_status_t) -> Self {
         self.status = status;
         self
     }
@@ -369,7 +369,7 @@ impl Done {
 /// Register an operation, write its id to `*out_operation`, and run `fut` on
 /// the runtime; its result becomes one completion event (`ASTER_EVENT_ERROR`
 /// with the message as payload on `Err`).
-unsafe fn spawn_op<F>(
+pub(crate) unsafe fn spawn_op<F>(
     bridge: &Arc<BridgeRuntime>,
     user_data: u64,
     out_operation: *mut aster_operation_t,

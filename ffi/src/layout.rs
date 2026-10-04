@@ -30,6 +30,10 @@ use crate::server::{
     aster_cancel_reason_t, aster_dispatch_event_kind_t, aster_dispatch_event_t,
     aster_method_pattern_t, aster_server_option_t,
 };
+use crate::upcall::{
+    aster_lease_status_t, aster_topology_admitted_stats_t, aster_upcall_cancel_reason_t,
+    aster_upcall_event_t, aster_upcall_kind_t, aster_upcall_status_t,
+};
 use crate::*;
 
 macro_rules! assert_layout {
@@ -72,6 +76,10 @@ const _: () = assert!(size_of::<aster_dispatch_event_kind_t>() == 4);
 const _: () = assert!(size_of::<aster_cancel_reason_t>() == 4);
 const _: () = assert!(size_of::<aster_method_pattern_t>() == 4);
 const _: () = assert!(size_of::<aster_server_option_t>() == 4);
+const _: () = assert!(size_of::<aster_upcall_kind_t>() == 4);
+const _: () = assert!(size_of::<aster_upcall_status_t>() == 4);
+const _: () = assert!(size_of::<aster_upcall_cancel_reason_t>() == 4);
+const _: () = assert!(size_of::<aster_lease_status_t>() == 4);
 
 #[cfg(target_pointer_width = "64")]
 mod lp64 {
@@ -348,5 +356,24 @@ mod lp64 {
         deadline_ms = 60,
         serialization_mode = 64,
         wire_call_id = 68,
+    });
+
+    // ABI 4.1: upcalls (upcall.rs).
+    assert_layout!(aster_upcall_event_t, size = 40, align = 8, {
+        invocation_id = 0,
+        kind = 8,
+        cancel_reason = 10,
+        _p0 = 11,
+        payload_len = 12,
+        deadline_unix_ms = 16,
+        payload_ptr = 24,
+        buffer = 32,
+    });
+
+    assert_layout!(aster_topology_admitted_stats_t, size = 32, align = 8, {
+        hits = 0,
+        stale = 8,
+        misses = 16,
+        upcalls = 24,
     });
 }

@@ -282,6 +282,22 @@ OFF(aster_call_options_t, deadline_ms, 60);
 OFF(aster_call_options_t, serialization_mode, 64);
 OFF(aster_call_options_t, wire_call_id, 68);
 
+/* ABI 4.1: upcalls */
+LAYOUT(aster_upcall_event_t, 40);
+OFF(aster_upcall_event_t, invocation_id, 0);
+OFF(aster_upcall_event_t, kind, 8);
+OFF(aster_upcall_event_t, cancel_reason, 10);
+OFF(aster_upcall_event_t, payload_len, 12);
+OFF(aster_upcall_event_t, deadline_unix_ms, 16);
+OFF(aster_upcall_event_t, payload_ptr, 24);
+OFF(aster_upcall_event_t, buffer, 32);
+
+LAYOUT(aster_topology_admitted_stats_t, 32);
+OFF(aster_topology_admitted_stats_t, hits, 0);
+OFF(aster_topology_admitted_stats_t, stale, 8);
+OFF(aster_topology_admitted_stats_t, misses, 16);
+OFF(aster_topology_admitted_stats_t, upcalls, 24);
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -364,6 +380,17 @@ static void test_enum_values(void) {
     CHECK(ASTER_DISPATCH_FLAG_IROH_AUTHENTICATED == 4);
     CHECK(ASTER_DISPATCH_FLAG_HAS_METADATA == 0x100 && ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES == 0x200);
     CHECK(ASTER_TIMEOUT_INFINITE == 0xffffffffu);
+    /* 4.1 */
+    CHECK(ASTER_EVENT_LEASE_ACQUIRED == 107 && ASTER_EVENT_LEASE_STATUS == 108);
+    CHECK(ASTER_UPCALL_KIND_CANCEL == 0 && ASTER_UPCALL_KIND_LEASE_TRANSITION == 1);
+    CHECK(ASTER_UPCALL_KIND_FENCED_MUTATE == 4 && ASTER_UPCALL_KIND_TOPOLOGY_ADMITTED == 16);
+    CHECK(ASTER_UPCALL_KIND_PLACEMENT_PROVISION == 33 && ASTER_UPCALL_KIND_EXPOSE_AUTHORIZE == 48);
+    CHECK(ASTER_UPCALL_KIND_EXPOSE_HTTP == 49 && ASTER_UPCALL_KIND_EXPOSE_ROUTE_POLICY == 50);
+    CHECK(ASTER_UPCALL_KIND_ADMISSION_HANDSHAKE == 65);
+    CHECK(ASTER_UPCALL_STATUS_OK == 0 && ASTER_UPCALL_STATUS_ERROR == 1 && ASTER_UPCALL_STATUS_UNIMPLEMENTED == 2);
+    CHECK(ASTER_UPCALL_CANCEL_TIMEOUT == 1 && ASTER_UPCALL_CANCEL_SHUTDOWN == 3);
+    CHECK(ASTER_LEASE_STATUS_HELD == 0 && ASTER_LEASE_STATUS_LOST == 3);
+    CHECK(ASTER_UPCALL_DEFAULT_CAPACITY == 1024);
 }
 
 static void test_data_plane(void) {
@@ -742,6 +769,67 @@ static void test_dispatch_server(void) {
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
+static void test_upcalls(void) {
+    printf("[upcalls 4.1]\n");
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+    aster_upcalls_t up = 0;
+    CHECK(aster_upcalls_new(rt, 0, &up) == ASTER_STATUS_OK && up != 0);
+    CHECK(aster_upcall_set_policy(rt, up, ASTER_UPCALL_KIND_LEASE_TRANSITION, 5000,
+                                  ASTER_HOOK_FAILURE_FAIL_CLOSED) == ASTER_STATUS_OK);
+    CHECK(aster_upcall_set_policy(rt, up, ASTER_UPCALL_KIND_CANCEL, 5000, 0) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_upcall_set_default_policy(rt, up, 0, 0) == ASTER_STATUS_INVALID_ARGUMENT);
+
+    aster_upcall_event_t ev[4];
+    CHECK(aster_upcall_poll(rt, up, ev, 4, 0) == 0);
+
+    /* A lease whose serializer is "this program": answer the ACQUIRE by hand. */
+    aster_lease_serializer_t ser = 0;
+    CHECK(aster_lease_serializer_foreign_new(rt, up, &ser) == ASTER_STATUS_OK && ser != 0);
+    aster_operation_t op = 0;
+    CHECK(aster_lease_acquire(rt, ser, bstr("r"), bstr("a"), 0, 0, 0, 9, &op) == ASTER_STATUS_OK);
+    uint32_t n = aster_upcall_poll(rt, up, ev, 4, 5000);
+    CHECK(n == 1);
+    CHECK(ev[0].kind == ASTER_UPCALL_KIND_LEASE_TRANSITION && ev[0].invocation_id != 0);
+    CHECK(ev[0].payload_len > 2 && ev[0].payload_ptr[0] == 0xB1 && ev[0].payload_ptr[1] == 0x01);
+    CHECK(ev[0].deadline_unix_ms > 0 && ev[0].buffer != 0);
+    CHECK(aster_upcall_buffer_release(rt, up, ev[0].buffer) == ASTER_STATUS_OK);
+    CHECK(aster_upcall_buffer_release(rt, up, ev[0].buffer) == ASTER_STATUS_NOT_FOUND);
+    /* UCv1 TransitionOutcome: granted, Fence { "r", epoch 1, "a" }. */
+    const uint8_t granted[] = {0xB2, 0x01, 0x01, 0x06, 'r', 0x01, 0x06, 'a'};
+    CHECK(aster_upcall_respond(rt, up, ev[0].invocation_id, ASTER_UPCALL_STATUS_OK, granted,
+                               sizeof granted) == ASTER_STATUS_OK);
+    CHECK(aster_upcall_respond(rt, up, ev[0].invocation_id, ASTER_UPCALL_STATUS_OK, granted,
+                               sizeof granted) == ASTER_STATUS_NOT_FOUND);
+    aster_event_t done;
+    memset(&done, 0, sizeof done);
+    CHECK(wait_event(rt, op, &done));
+    CHECK(done.kind == ASTER_EVENT_LEASE_ACQUIRED && done.status == ASTER_STATUS_OK);
+    CHECK(done.user_data == 9 && done.handle != 0);
+    CHECK(done.data_len == sizeof granted && memcmp(done.data_ptr, granted, sizeof granted) == 0);
+    if (done.buffer) aster_buffer_release(rt, done.buffer);
+    aster_lease_t lease = done.handle;
+    uint64_t epoch = 0;
+    uint32_t status = 9;
+    CHECK(aster_lease_fence(rt, lease, &epoch) == ASTER_STATUS_OK && epoch == 1);
+    CHECK(aster_lease_status(rt, lease, &status) == ASTER_STATUS_OK && status == ASTER_LEASE_STATUS_HELD);
+    CHECK(aster_lease_free(rt, lease) == ASTER_STATUS_OK);
+    CHECK(aster_lease_free(rt, lease) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_lease_serializer_free(rt, ser) == ASTER_STATUS_OK);
+
+    aster_topology_admitted_t adm = 0;
+    CHECK(aster_topology_admitted_new(rt, up, 0, 0, 0, &adm) == ASTER_STATUS_OK && adm != 0);
+    aster_topology_admitted_stats_t st;
+    memset(&st, 0xff, sizeof st);
+    CHECK(aster_topology_admitted_stats(rt, adm, &st) == ASTER_STATUS_OK && st.hits == 0 && st.upcalls == 0);
+    CHECK(aster_topology_admitted_free(rt, adm) == ASTER_STATUS_OK);
+
+    CHECK(aster_upcalls_close(rt, up) == ASTER_STATUS_OK);
+    CHECK(aster_upcalls_free(rt, up) == ASTER_STATUS_OK);
+    CHECK(aster_upcalls_free(rt, up) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
+}
+
 int main(void) {
     test_abi_version();
     test_enum_values();
@@ -752,6 +840,7 @@ int main(void) {
     test_data_plane();
     test_pure_functions();
     test_dispatch_server();
+    test_upcalls();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;

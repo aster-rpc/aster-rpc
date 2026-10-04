@@ -44,4 +44,8 @@ include = [
   "aster_cancel_reason_t",
   "aster_method_pattern_t",
   "aster_server_option_t",
+  "aster_upcall_kind_t",
+  "aster_upcall_status_t",
+  "aster_upcall_cancel_reason_t",
+  "aster_lease_status_t",
 ]

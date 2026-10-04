@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.0)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.1)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -24,6 +24,92 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 4.1 (additive)
+
+ABI 4.1.0 (tranche F5, upcall part) carries Rust's questions to foreign code:
+the R6 upcall mechanism (`aster::binding_support::upcall`, design
+`docs/_internal/bindings/upcall-design.md` §4) behind a poll/respond pair,
+plus the adapters that turn it into lease, fenced-resource and topology
+extension points. Nothing in 4.0 changed shape; a 4.0 binding keeps working.
+Sources: `ffi/src/upcall.rs`; tests: `ffi/tests/upcalls.rs` (a polling
+"foreign" thread answers through the C functions: foreign serializer with
+background renewals, release/revoke/fenced watch, foreign authorizer and its
+fail-open/fail-closed fallback, timeout cancel + late respond, ERROR /
+UNIMPLEMENTED statuses, fenced mutate incl. outcome-unknown, topology
+admission filter batching/caching, `enable_shared`, close → shutdown cancels,
+queue capacity, argument validation), `ffi/tests/abi_contract_test.c`.
+
+**Upcall table.** One `aster_upcalls_t` per binding runtime wraps an
+`Upcalls` table and a bounded `UpcallQueue`. Payloads are UCv1
+(`conformance/vectors/upcalls.json`); the binding decodes requests and
+encodes responses itself. No function pointers.
+
+| Function | Notes |
+|---|---|
+| `aster_upcalls_new(rt, capacity, *out)` | `capacity` 0 = `ASTER_UPCALL_DEFAULT_CAPACITY` (1024) queued upcalls; beyond it upcalls are refused (`Overloaded`: decisions take the failure mode, other kinds error). `CANCEL` is always queued. |
+| `aster_upcall_poll(rt, u, aster_upcall_event_t *out, max, timeout_ms) -> uint32_t` | Batched drain; `timeout_ms` 0 = non-blocking. Single consumer; blocks the caller. |
+| `aster_upcall_respond(rt, u, invocation_id, status, payload, len)` | `aster_upcall_status_t` (`OK` = UCv1 response, `ERROR` = UTF-8 message, `UNIMPLEMENTED`). Any thread, any order, never blocks. `NOT_FOUND` = not pending (answered, cancelled, timed out) -- ignore. |
+| `aster_upcall_set_policy(rt, u, kind, timeout_ms, failure_mode)` / `aster_upcall_set_default_policy(rt, u, timeout_ms, failure_mode)` | `failure_mode` = `aster_hook_failure_mode_t`; applies to decision kinds. Default 5 s, fail closed. |
+| `aster_upcall_buffer_release(rt, u, buffer)` | Frees an event's payload (0 = no-op). |
+| `aster_upcalls_close(rt, u)` / `aster_upcalls_free(rt, u)` | Pending upcalls fail, each gets `CANCEL` (`SHUTDOWN`); queued events stay drainable until free. |
+
+`aster_upcall_event_t` (40 B): `invocation_id` u64 @0, `kind` u16 @8
+(`aster_upcall_kind_t`), `cancel_reason` u8 @10 (`aster_upcall_cancel_reason_t`,
+`CANCEL` only), `_p0` @11, `payload_len` u32 @12, `deadline_unix_ms` u64 @16,
+`payload_ptr` @24, `buffer` u64 @32. Differs from the design sketch in one
+place: a `CANCEL` event carries its reason in `cancel_reason` and no payload
+(the Rust event's one reason byte), so it needs no buffer release.
+
+**Leases** (`aster_lease_*`):
+
+| Function | Upcalls | Completion |
+|---|---|---|
+| `aster_lease_serializer_foreign_new(rt, u, *out)` | 1 `LEASE_TRANSITION`, 2 `LEASE_SNAPSHOT` | -- |
+| `aster_lease_serializer_memory_new(rt, authorizer_u, *out)` | 3 `LEASE_AUTHORIZE` when `authorizer_u` != 0 (async `AuthorizedSerializer`, no blocking authorizer) | -- |
+| `aster_lease_acquire(rt, ser, resource, holder, ttl_ms, renew_interval_ms, holder_margin_ms, ud, *op)` | via the serializer | `ASTER_EVENT_LEASE_ACQUIRED` (107): payload = UCv1 `TransitionOutcome` (`B2`); `handle` = `aster_lease_t` when granted, 0 when denied |
+| `aster_lease_fence(rt, lease, *epoch)` | -- | sync; `ALREADY_CLOSED` once the holder must stop acting |
+| `aster_lease_status(rt, lease, *status)` / `aster_lease_watch(rt, lease, ud, *op)` | -- | `aster_lease_status_t`; watch completes with `ASTER_EVENT_LEASE_STATUS` (108), `flags` = status, when the lease leaves `HELD` (the "fence-lost event") |
+| `aster_lease_release(rt, lease, ud, *op)` / `aster_lease_free(rt, lease)` | RELEASE / none | `UNIT_RESULT`; free stops renewing without releasing |
+| `aster_lease_snapshot(rt, ser, resource, ud, *op)` / `aster_lease_revoke(rt, ser, resource, authority, ud, *op)` | via the serializer | `BYTES_RESULT`: `B4` / `B2` |
+| `aster_lease_serializer_free(rt, ser)` | -- | leases keep their own reference |
+
+Timing: `ttl_ms` 0 = defaults (30 s / 10 s / 1 s); with a ttl, `renew` 0 =
+ttl/3 and `margin` 0 = ttl/10 capped at 1 s; invalid combinations are
+`INVALID_ARGUMENT` up front.
+
+**Fenced resource.** `aster_fenced_resource_foreign_new(rt, u, *out)` (kind 4)
+and `aster_fenced_mutate(rt, res, fence_resource, epoch, fence_holder, writer,
+op, ud, *op)` → `BYTES_RESULT` with UCv1 `FencedMutateResponse` (`B7`: applied
+output or fence rejection); any other failure is `ASTER_EVENT_ERROR` and means
+**outcome unknown**. `aster_fenced_resource_free`.
+
+**Topology.** `aster_topology_admitted_new(rt, u, ttl_ms, failure_retry_ms,
+max_batch, *out)` (kind 16, cached + batched, never blocks a read);
+`_check`, `_set`, `_invalidate` (empty id = clear), `_prefetch` (`UNIT_RESULT`),
+`_stats` (`aster_topology_admitted_stats_t`, 32 B), `_free`.
+`aster_topology_enable_shared(rt, node, secret[32], admitted (0 = none),
+bootstrap, position_refresh_ms, ud, *op)` joins the topology v2 swarm with the
+filter installed (`UNIT_RESULT`; needs `enable_monitoring`).
+
+**Not exposed (gaps):** placement providers (kinds 17/32/33 -- the C ABI has no
+coordination client), expose authorize / HTTP handler / route policy
+(48/49/50 -- no expose surface in the C ABI; the R9 bytes-level handler is
+not wired through C yet, the kind constants are defined), Gate 0 over upcalls (64/65 -- the 3.2 hook iterators keep serving
+admission), and a read side for the shared topology view (clusters /
+serialized snapshot -- needs `SharedView` parts from core). No typed C decode
+helpers for UCv1: bindings decode against the vectors (Java does,
+`site.aster.upcall.Ucv1`).
+
+**New enums / constants:** `aster_upcall_kind_t`, `aster_upcall_status_t`,
+`aster_upcall_cancel_reason_t`, `aster_lease_status_t`,
+`ASTER_UPCALL_DEFAULT_CAPACITY`, `ASTER_EVENT_LEASE_ACQUIRED` (107),
+`ASTER_EVENT_LEASE_STATUS` (108).
+
+**Bindings:** Java wraps all of it (`site.aster.upcall`, `site.aster.lease`;
+`IrohLibrary` unchanged at major 4). Go and .NET only build against the new
+header (no wrappers yet; .NET `RequiredAbiMinor` stays 0, Go compares the
+library with `ASTER_ABI_VERSION` from the header).
 
 ## 4.0 (removals)
 

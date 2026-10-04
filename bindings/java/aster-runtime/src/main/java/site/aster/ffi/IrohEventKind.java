@@ -98,7 +98,11 @@ public enum IrohEventKind {
   DOC_OPENED(103),
   DOC_ENTRY_EXISTS(104),
   DOC_CONTENT_STATUS(105),
-  STREAM_PRIORITY(106);
+  STREAM_PRIORITY(106),
+
+  // Upcall-backed leases (ABI 4.1)
+  LEASE_ACQUIRED(107),
+  LEASE_STATUS(108);
 
   public final int code;
 
