@@ -90,6 +90,29 @@ class Streamer {
       }
       return { headers: { 'x-len': String(data.length) }, body: back() };
     }
+    if (request.uri.startsWith('/early')) {
+      // Answer without reading the body.
+      return { status: 413, body: 'too big' };
+    }
+    if (request.uri.startsWith('/duplex')) {
+      // Head first, then echo each request chunk as it arrives. The outcome
+      // is logged in `finally`, keyed by uri, so tests can scope to a request.
+      const log = this.log;
+      const uri = request.uri;
+      async function* echo() {
+        let outcome: LogEntry = ['duplex cancelled', uri];
+        try {
+          for await (const chunk of request.handle) yield chunk;
+          outcome = ['duplex done', uri];
+        } catch (e) {
+          outcome = ['duplex failed', e instanceof HttpBodyError ? e.kind : `other:${String(e)}`, uri];
+          throw e;
+        } finally {
+          log.push(outcome);
+        }
+      }
+      return { body: echo() };
+    }
     if (request.uri === '/abort') {
       async function* failing() {
         yield Buffer.alloc(600, 120);
@@ -114,6 +137,11 @@ class Streamer {
 
   started(uri: string): boolean {
     return this.log.some((e) => e[0] === 'start' && e[1] === uri);
+  }
+
+  /** The `/duplex` outcomes of the request for `uri`, in order. */
+  duplex(uri: string): LogEntry[] {
+    return this.log.filter((e) => e[0].startsWith('duplex') && e[e.length - 1] === uri);
   }
 
   /** The failed-body outcomes of the requests for `uri`. */
@@ -401,6 +429,150 @@ describe('streaming consumer relay', () => {
       expect(app.log.filter((e) => e[0] === 'body')).toEqual([]);
     } finally {
       for (const g of gates) g();
+      await p.close();
+    }
+  });
+
+  it('is full duplex: early answers, ping-pong, post-head failures and closing mid-upload', async () => {
+    const app = new Streamer();
+    const p = await pair({ app: app.handle });
+    try {
+      // An early answer arrives while an endless upload is still going; the
+      // upload then stops and its generator is closed.
+      let closed = false;
+      async function* endless() {
+        try {
+          for (;;) yield Buffer.alloc(65536, 117);
+        } finally {
+          closed = true;
+        }
+      }
+      const early = await within(relayHttpStream(p.conn, 'app', { method: 'PUT', uri: '/early', body: endless() }));
+      expect(early.status).toBe(413);
+      expect((await within(early.readBody())).toString()).toBe('too big');
+      await until('upload generator closed', () => closed || undefined);
+
+      // Low-level ping-pong: each echo is read before the next write.
+      {
+        const { upload, response } = relayHttpStreaming(p.conn, 'app', { method: 'POST', uri: '/duplex?pingpong' });
+        const resp = await within(response.wait());
+        expect(resp.status).toBe(200);
+        expect(upload.closed).toBe(false);
+        for (let i = 0; i < 20; i++) {
+          const ping = Buffer.from(`ping ${i}`);
+          await within(upload.write(ping));
+          let echo = Buffer.alloc(0);
+          while (echo.length < ping.length) {
+            const c = await within(resp.body.read());
+            expect(c).not.toBeNull();
+            echo = Buffer.concat([echo, c as Buffer]);
+          }
+          expect(echo.equals(ping)).toBe(true);
+        }
+        upload.finish();
+        expect(await within(resp.body.read())).toBeNull();
+        await until('duplex done', () => app.duplex('/duplex?pingpong').some((e) => e[0] === 'duplex done') || undefined);
+      }
+
+      // The same through relayHttpStream, with a generator driven by the
+      // echoes it gets back.
+      {
+        const replies: Array<() => void> = [];
+        let pending = 0;
+        const gotReply = () =>
+          pending > 0
+            ? (pending--, Promise.resolve())
+            : new Promise<void>((resolve) => {
+                replies.push(() => (pending--, resolve()));
+              });
+        async function* chatty() {
+          for (let i = 0; i < 5; i++) {
+            yield Buffer.from(`msg ${i}`);
+            await within(gotReply());
+          }
+        }
+        const resp = await within(relayHttpStream(p.conn, 'app', { method: 'POST', uri: '/duplex?chatty', body: chatty() }));
+        let got = '';
+        for await (const chunk of resp.body) {
+          got += chunk.toString();
+          pending++;
+          replies.shift()?.();
+        }
+        expect(got).toBe([0, 1, 2, 3, 4].map((i) => `msg ${i}`).join(''));
+      }
+
+      // A body iterator failing after the head: the handler sees a failed
+      // body, the response read fails `read`, and the error is surfaced
+      // through onUploadError (the call had already resolved).
+      {
+        const uri = '/duplex?flaky';
+        const sourceError = new RangeError('source failed after the head');
+        const surfaced: unknown[] = [];
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => (release = resolve));
+        async function* flaky() {
+          yield Buffer.from('one');
+          await released;
+          throw sourceError;
+        }
+        const resp = await within(
+          relayHttpStream(p.conn, 'app', { method: 'POST', uri, body: flaky(), onUploadError: (e) => surfaced.push(e) }),
+        );
+        expect((await within(resp.body.read()))?.toString()).toBe('one');
+        expect(surfaced).toEqual([]);
+        release();
+        const failed = await within(
+          (async () => {
+            try {
+              while ((await resp.body.read()) !== null);
+            } catch (e) {
+              return e;
+            }
+            return undefined;
+          })(),
+        );
+        expect(failed).toBeInstanceOf(HttpBodyError);
+        expect((failed as HttpBodyError).kind).toBe('read');
+        await until('handler saw the failed body', () => app.duplex(uri).some((e) => e[0] === 'duplex failed') || undefined);
+        await until('error surfaced', () => surfaced.length === 1 || undefined);
+        expect(surfaced[0]).toBe(sourceError);
+        expect(app.duplex(uri).some((e) => e[0] === 'duplex done')).toBe(false);
+      }
+
+      // Closing the response mid-upload makes the upload's writes fail
+      // `cancelled`.
+      {
+        const { upload, response } = relayHttpStreaming(p.conn, 'app', { method: 'POST', uri: '/duplex?close' });
+        const resp = await within(response.wait());
+        await upload.write(Buffer.from('x'));
+        expect((await within(resp.body.read()))?.toString()).toBe('x');
+        resp.body.close();
+        await until('upload stopped', () => upload.closed || undefined);
+        const gone = await upload.write(Buffer.from('more')).catch((e: unknown) => e);
+        expect(gone).toBeInstanceOf(HttpBodyError);
+        expect((gone as HttpBodyError).kind).toBe('cancelled');
+      }
+
+      // The same through relayHttpStream: closing the body stops the pump
+      // and closes the source generator.
+      {
+        let sourceClosed = false;
+        async function* steady() {
+          try {
+            for (let i = 0; ; i++) {
+              yield Buffer.from(`s${i}`);
+              await new Promise((r) => setTimeout(r, 5));
+            }
+          } finally {
+            sourceClosed = true;
+          }
+        }
+        const resp = await within(relayHttpStream(p.conn, 'app', { method: 'POST', uri: '/duplex?close2', body: steady() }));
+        expect(await within(resp.body.read())).toBeTruthy();
+        resp.body.close();
+        await until('source generator closed', () => sourceClosed || undefined);
+      }
+    } finally {
       await p.close();
     }
   });

@@ -37,7 +37,7 @@ use http_body::Body;
 use http_body_util::{BodyExt, Full};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use aster_transport_core::stream_io::{AsterStreamIo, BoxFut};
+use aster_transport_core::stream_io::{AsterRead, AsterStreamIo, AsterWrite, BoxFut};
 use aster_transport_core::tunnel::{
     splice_with_failover, LocalTunnelAcceptor, PeerContext, TunnelTarget,
 };
@@ -281,11 +281,22 @@ where
 /// pooling. The edge uses this to pump the origin's response straight back to
 /// the browser.
 ///
-/// If `request`'s body fails partway, or this future is dropped before the
-/// upload is sent, the request stream is reset, so the server's handler sees a
-/// failed request body rather than a truncated one. Likewise a response the
-/// server could not complete arrives as an `Err` from the returned body (or,
-/// if it failed before its head got out, from this call).
+/// **Full duplex.** The request body uploads on its own task while this call
+/// waits for the response head, so a handler may answer before it has read
+/// the body (an early `413` or `401`, or a bidirectional stream) and the
+/// response is returned at once while the upload carries on. The upload stops
+/// when it completes, when it fails, when the server stops reading, or when
+/// the returned body is dropped *before* its end (abandoning the exchange);
+/// a response that ends cleanly leaves the upload to finish on its own.
+///
+/// **Failure is a reset, never a finish.** If the request body fails, or the
+/// exchange is abandoned (this future dropped, or the response body dropped)
+/// before the upload completed, the request stream is reset, so the handler
+/// sees a failed request body rather than a truncated one. An upload failure
+/// before the response head is this call's `Err`; after the head it only
+/// resets the request (the handler decides what its response does). A
+/// response the server could not complete arrives as an `Err` from the
+/// returned body (or, if it failed before its head got out, from this call).
 pub async fn relay_request_streaming<B>(
     conn: &CoreConnection,
     service_id: &str,
@@ -299,36 +310,142 @@ where
     let (parts, body) = request.into_parts();
     let head = codec::encode_request_head(&parts)?;
 
-    let mut armed = ResetOnDrop(Some(send.clone()));
-    let io = AsterStreamIo::new(recv, send);
-    let (mut r, mut w) = tokio::io::split(io);
-    let sent = async {
-        w.write_all(&(head.len() as u32).to_le_bytes()).await?;
-        w.write_all(&head).await?;
-        pump_body(body, &mut w).await?;
-        w.shutdown().await?; // half-close: signals request EOF to the server
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    if let Err(e) = sent {
-        // An upload that failed partway must reach the handler as a failed
-        // request body, not a truncated one: reset rather than let the
-        // dropped send half finish. Every write has returned, so `w` holds
-        // no lock on the send half.
-        drop((r, w));
-        if let Some(send) = armed.0.take() {
-            reset_failed_detached(send).await;
-        }
-        return Err(e);
-    }
-    armed.0 = None; // fully sent and finished
+    // Independent halves: a write parked on flow control holds the send
+    // half's lock inside `AsterWrite`, which the upload task owns and drops
+    // before it resets; the response side never shares it.
+    let (mut r, w) = AsterStreamIo::new(recv, send.clone()).into_halves();
+    // Box to `Bytes` frames so the upload task is `Send` whatever `B::Data`
+    // and `B::Error` are (a pass-through when `Data` is already `Bytes`).
+    let body: ResponseBody = body
+        .map_frame(|f| f.map_data(|mut d| d.copy_to_bytes(d.remaining())))
+        .map_err(Into::into)
+        .boxed_unsync();
+    let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel();
+    let upload = AbortOnDrop(Some(tokio::spawn(upload_request(
+        w, send, head, body, failed_tx,
+    ))));
 
-    let head = read_length_prefixed(&mut r, MAX_HEAD, "response head").await?;
+    let head = tokio::select! {
+        biased;
+        head = read_length_prefixed(&mut r, MAX_HEAD, "response head") => head,
+        // The request body failed before the head: the upload has reset the
+        // request.
+        Ok(e) = &mut failed_rx => return Err(e),
+    };
+    let head = match head {
+        Ok(h) => h,
+        // A failed upload makes the server fail too; report the cause.
+        Err(e) => return Err(failed_rx.try_recv().unwrap_or(e)),
+    };
     let parts = codec::decode_response_head(&head)?;
     Ok(http::Response::from_parts(
         parts,
-        RelayBody::new(Box::pin(r)),
+        RelayBody::new(Box::pin(DuplexRead { read: r, upload })),
     ))
+}
+
+/// The request upload of [`relay_request_streaming`], on its own task: head,
+/// body, then finish. On any failure -- or if the task is aborted because the
+/// exchange was abandoned -- the request stream is reset, never finished.
+///
+/// Only a failure of the request body itself is reported on `failed` (and
+/// fails the exchange if the head is not in yet). A write the server
+/// refused -- it stopped reading, typically because it already answered --
+/// is not: the response head (or its error) decides the exchange.
+async fn upload_request(
+    mut w: AsterWrite,
+    send: CoreSendStream,
+    head: Vec<u8>,
+    body: ResponseBody,
+    failed: tokio::sync::oneshot::Sender<anyhow::Error>,
+) {
+    let mut armed = ResetOnDrop(Some(send));
+    let mut body = body;
+    // Err(Some(e)): the body failed; Err(None): a write was refused.
+    let sent = async {
+        let wrote = async {
+            w.write_all(&(head.len() as u32).to_le_bytes()).await?;
+            w.write_all(&head).await
+        };
+        wrote.await.map_err(|e| (None, e.into()))?;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| (Some(()), relay_anyhow(e)))?;
+            if let Ok(data) = frame.into_data() {
+                if !data.is_empty() {
+                    w.write_all(&data).await.map_err(|e| (None, e.into()))?;
+                }
+            }
+        }
+        // Half-close: signals request EOF to the server.
+        w.shutdown().await.map_err(|e| (None, e.into()))
+    }
+    .await;
+    match sent {
+        Ok(()) => armed.0 = None, // fully sent and finished
+        Err((source, e)) => {
+            tracing::debug!("http-relay upload ended early: {e}");
+            // Report before resetting: the reset makes the server fail its
+            // response, and the caller must see this cause, not that one.
+            if source.is_some() {
+                let _ = failed.send(e);
+            }
+            // Drop the write half and the body first: a write that failed
+            // while parked would otherwise keep the send half's lock, and a
+            // channel body's sender learns the request is gone.
+            drop(w);
+            drop(body);
+            if let Some(send) = armed.0.take() {
+                reset_failed_detached(send).await;
+            }
+        }
+    }
+}
+
+/// Aborts a task when dropped, unless [`detach`](Self::detach)ed.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    /// Let the task run to its own end.
+    fn detach(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// The response side of a full-duplex exchange. Dropping it before the
+/// response's clean end abandons the exchange and resets an unfinished
+/// upload; once the response has ended cleanly the upload is detached and
+/// runs to its own end (finish, body failure, or the server stopping it), as
+/// a completed response does not cancel the request body.
+struct DuplexRead {
+    read: AsterRead,
+    upload: AbortOnDrop,
+}
+
+impl AsyncRead for DuplexRead {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let res = std::pin::Pin::new(&mut this.read).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = res {
+            if buf.filled().len() == before && buf.remaining() > 0 {
+                // Clean end of the response: detach the upload.
+                this.upload.detach();
+            }
+        }
+        res
+    }
 }
 
 /// Buffered convenience over [`relay_request_streaming`]: send a `Vec<u8>` body

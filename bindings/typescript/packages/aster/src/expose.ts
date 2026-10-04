@@ -37,16 +37,19 @@
  * **Streaming consumer** ({@link relayHttpStream}): the request `body` may be
  * text, bytes or an (async) iterable of chunks, uploaded with backpressure;
  * the response `body` is an {@link HttpRelayBody} (`read()`, `for await`,
- * `await response.readBody(limit)`). The relay sends the whole request body
- * before it reads the response head: it is not full duplex, so a handler that
- * answers before reading the body (a `413`, say) stalls the upload and the
- * call fails rather than returning that early answer. If the body iterator
- * throws, the request is reset (the handler sees a failed body, never a
- * truncated one) and the iterator's own error rejects the call. A handler can
- * proxy by returning the relayed response, or its `body`. {@link
- * relayHttpStreaming} is the low-level form: JavaScript has no deterministic
- * drop, so an upload you leave unfinished stalls the handler until the
- * connection idles out.
+ * `await response.readBody(limit)`). The exchange is full duplex: the call
+ * resolves as soon as the response head is in, possibly before the body is
+ * uploaded (an early `413`, or a handler that streams back as it reads), and
+ * the upload carries on in the background until it is done, the handler stops
+ * reading, or you close the response body before its end (which resets an
+ * unfinished upload; a response that has ended cleanly leaves the upload to
+ * finish). If the body iterator throws, the request is reset (the handler
+ * sees a failed body, never a truncated one); before the head the iterator's
+ * own error rejects the call, after it the error goes to `onUploadError`
+ * (default `console.warn`). A handler can proxy by returning the relayed
+ * response, or its `body`. {@link relayHttpStreaming} is the low-level form:
+ * JavaScript has no deterministic drop, so an upload you leave unfinished
+ * stalls the handler until the connection idles out.
  *
  * **Authorization** (kind `expose_authorize`) runs once per `(connection,
  * service)`: an error or timeout applies the kind's failure mode
@@ -698,10 +701,10 @@ export class HttpStreamPending {
   constructor(private readonly native: NativeHttpRelayResponse) {}
 
   /**
-   * The response. Resolves once the upload has finished and the head is in
-   * (the relay is not full duplex); rejects when the exchange failed
-   * (refused, unknown service, upload aborted, connection lost) or was
-   * cancelled. Call it once.
+   * The response. Resolves as soon as the head is in, possibly while the
+   * upload is still going (full duplex; keep writing); rejects when the
+   * exchange failed before the head (refused, unknown service, upload
+   * aborted, connection lost) or was cancelled. Call it once.
    */
   async wait(): Promise<HttpStreamResponse> {
     const head = await this.native.wait();
@@ -740,6 +743,15 @@ export interface RelayHttpStreamOptions extends RelayHttpStreamingOptions {
    * body yourself.)
    */
   signal?: AbortSignal;
+  /**
+   * Called when the request body source fails (or an upload write fails
+   * unexpectedly) after the head has been returned, when the call can no
+   * longer reject. The request has been reset by then. Defaults to a
+   * `console.warn`. Not called for failures before the head (those reject the
+   * call), nor when the upload simply ends because the handler stopped
+   * reading or the response body was closed. Must not throw.
+   */
+  onUploadError?: (error: unknown) => void;
 }
 
 /**
@@ -749,10 +761,11 @@ export interface RelayHttpStreamOptions extends RelayHttpStreamingOptions {
  * is already running.
  *
  * You must drive the upload yourself, concurrently with `response.wait()`:
- * the relay sends the whole request body before it reads the response head
- * (it is **not full duplex**: a handler that answers before it has read
- * the body, a `413` say, stalls the upload, and `wait()` fails rather than
- * returning that early answer). **JavaScript has no deterministic drop: an
+ * the exchange is full duplex, so `wait()` resolves as soon as the head is
+ * in, possibly mid-upload, and you keep writing after it. A write refused
+ * because the server stopped reading rejects `cancelled`; closing the
+ * response body before its end resets an unfinished upload (a response that
+ * ended cleanly leaves it to finish). **JavaScript has no deterministic drop: an
  * upload left neither finished nor aborted stalls the handler until the
  * connection idles out**, so `finish()` or `abort()` it on every path, and
  * `cancel()` the response if you give up. {@link relayHttpStream} does that
@@ -865,17 +878,22 @@ class UploadPump {
  * for await (const chunk of resp.body) sink(chunk);
  * ```
  *
- * **Not full duplex.** The relay sends the whole request body before it
- * reads the response head, so the promise resolves only once the upload has
- * finished; a handler that answers before reading the body (a `413`, say)
- * stalls the upload and the call fails rather than returning that early
- * answer. A handler cannot start replying while you are still uploading.
+ * **Full duplex.** The promise resolves as soon as the response head is in,
+ * possibly while the body is still uploading (an early `413`, or a handler
+ * that echoes as it reads); the upload keeps running in the background. It
+ * ends when the source is exhausted, when the handler stops reading (the
+ * source is then closed), or when you close the response body before its end
+ * (`close()`, `await using`, leaving `for await` early), which resets an
+ * unfinished upload; a response that has ended cleanly leaves the upload to
+ * finish. `options.signal` covers the call only until the head: after it the
+ * upload continues, and closing the body is how you stop it.
  *
  * **Failures never truncate.** If the body iterable throws, the request is
- * reset (the handler sees a failed body, never a short complete one) and
- * your iterator's own error rejects the call, not the relay reset it
- * caused. The upload is aborted on every path that did not finish cleanly,
- * and `options.signal` (until the head is in) cancels the exchange. A
+ * reset (the handler sees a failed body, never a short complete one). Before
+ * the head, your iterator's own error rejects the call, not the relay reset
+ * it caused. After the head the call has already resolved, so the error is
+ * passed to `options.onUploadError` (default: `console.warn`) instead. The
+ * upload is aborted on every path that did not finish cleanly. A
  * response that fails partway rejects `read()` with a `read`
  * {@link HttpBodyError}; closing the body early (`close()`, `await using`,
  * leaving `for await`) cancels the handler's writes.
@@ -890,17 +908,32 @@ export async function relayHttpStream(
   serviceId: string,
   options: RelayHttpStreamOptions = {},
 ): Promise<HttpStreamResponse> {
-  const { signal, body, ...rest } = options;
+  const { signal, body, onUploadError, ...rest } = options;
   signal?.throwIfAborted();
   const { upload, response } = relayHttpStreaming(conn, serviceId, rest);
   const pump = new UploadPump(upload, body);
   const onAbort = () => response.cancel();
   signal?.addEventListener('abort', onAbort, { once: true });
+  let headIn = false;
   try {
     if (signal?.aborted) onAbort();
-    // The head arrives only after the upload has finished, so on success the
-    // pump is over (its source's `return()` is never awaited here).
-    return await response.wait();
+    // Full duplex: the head can arrive while the upload is still going. The
+    // pump then carries on in the background (its source's `return()` is
+    // never awaited here); closing the response body resets the request, and
+    // the pump's next write fails and stops it.
+    const resp = await response.wait();
+    headIn = true;
+    // The call can no longer reject: report a source failure instead. (The
+    // pump never rejects; this chain is the only reference it needs.)
+    void pump.done.then(() => {
+      if (!pump.failed) return;
+      try {
+        (onUploadError ?? warnUploadError)(pump.error);
+      } catch {
+        /* a throwing callback must not become an unhandled rejection */
+      }
+    });
+    return resp;
   } catch (e) {
     response.cancel();
     pump.stop();
@@ -910,8 +943,14 @@ export async function relayHttpStream(
   } finally {
     signal?.removeEventListener('abort', onAbort);
     // Never leave the upload open: anything but a clean finish resets it.
-    pump.stop();
+    // Once the head is in, the upload is left running (it is over by itself
+    // when the handler stops reading or the body is closed).
+    if (!headIn) pump.stop();
   }
+}
+
+function warnUploadError(e: unknown): void {
+  console.warn(`aster.expose: request body failed after the response head: ${e instanceof Error ? e.message : String(e)}`);
 }
 
 /**

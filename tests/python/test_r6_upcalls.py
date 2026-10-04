@@ -1257,6 +1257,26 @@ class Streamer(HttpHandler):
                     yield data[i : i + 7000]
 
             return HttpResponse(200, [("x-len", str(len(data)))], back())
+        if request.uri == "/early":
+            # Answer without reading the body.
+            return HttpResponse(413, (), b"too big")
+        if request.uri == "/duplex":
+            # Head first, then echo each request chunk as it arrives.
+            log = self.log
+
+            async def echo():
+                outcome = ("duplex cancelled",)
+                try:
+                    async for chunk in request.body:
+                        yield chunk
+                    outcome = ("duplex done",)
+                except HttpBodyError as exc:
+                    outcome = ("duplex failed", exc.kind)
+                    raise
+                finally:
+                    log.append(outcome)
+
+            return HttpResponse(200, (), echo())
         if request.uri == "/abort":
 
             async def failing():
@@ -1486,6 +1506,125 @@ async def test_relay_http_stream_response_proxies_through_a_handler():
         await rt.aclose()
         for n in (origin, edge, client):
             await n.shutdown()
+
+
+@pytest.mark.network
+@pytest.mark.timeout(90)
+async def test_relay_http_stream_is_full_duplex():
+    rt = UpcallRuntime(policies={"expose_http": UpcallPolicy(timeout=10.0)})
+    app = Streamer(rt)
+    host, peer, serving, conn = await _stream_pair(rt, ("app", app))
+    try:
+        # An early answer arrives while an endless upload is still going;
+        # the upload then stops (the handler is gone) and its iterator is
+        # closed.
+        closed = asyncio.Event()
+
+        async def endless():
+            try:
+                while True:
+                    yield b"u" * 65536
+            finally:
+                closed.set()
+
+        resp = await asyncio.wait_for(
+            relay_http_stream(conn, "app", "PUT", "/early", body=endless()), 15
+        )
+        assert resp.status == 413 and await resp.read_body() == b"too big"
+        await asyncio.wait_for(closed.wait(), 15)
+
+        # Ping-pong: each echo comes back before the next chunk is written.
+        upload_h, pending = relay_http_streaming(conn, "app", "POST", "/duplex")
+        resp = await asyncio.wait_for(pending, 15)
+        assert resp.status == 200 and not upload_h.closed
+        for i in range(20):
+            ping = f"ping {i}".encode()
+            await upload_h.write(ping)
+            echo = b""
+            while len(echo) < len(ping):
+                echo += await asyncio.wait_for(resp.body.read(), 15)
+            assert echo == ping
+        upload_h.finish()
+        assert await asyncio.wait_for(resp.body.read(), 15) is None
+        await _until("duplex done", lambda: ("duplex done",) in app.log)
+
+        # The same through relay_http_stream with a generator driven by the
+        # echoes it gets back.
+        replies: asyncio.Queue = asyncio.Queue()
+
+        async def chatty():
+            for i in range(5):
+                yield f"msg {i}".encode()
+                await asyncio.wait_for(replies.get(), 15)
+
+        resp = await asyncio.wait_for(
+            relay_http_stream(conn, "app", "POST", "/duplex", body=chatty()), 15
+        )
+        got = b""
+        async for chunk in resp.body:
+            got += chunk
+            replies.put_nowait(chunk)
+        assert got == b"".join(f"msg {i}".encode() for i in range(5))
+
+        # A body iterator failing after the head resets the request: the
+        # handler's read fails and so does the response; the error is
+        # logged since the call has already returned.
+        n = len([e for e in app.log if e[0] == "duplex failed"])
+
+        async def flaky():
+            yield b"one"
+            await asyncio.wait_for(replies.get(), 15)
+            raise KeyError("source failed after the head")
+
+        import logging
+
+        warnings: list = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                warnings.append(record.getMessage())
+
+        capture = Capture(level=logging.WARNING)
+        expose_log = logging.getLogger("aster.expose")
+        expose_log.addHandler(capture)
+        try:
+            resp = await asyncio.wait_for(
+                relay_http_stream(conn, "app", "POST", "/duplex", body=flaky()), 15
+            )
+            assert await resp.body.read() == b"one"
+            replies.put_nowait(b"one")
+            with pytest.raises(HttpBodyError) as failed:
+                while await asyncio.wait_for(resp.body.read(), 15) is not None:
+                    pass
+            assert failed.value.kind == "read"
+            await _until(
+                "handler saw the failed body",
+                lambda: len([e for e in app.log if e[0] == "duplex failed"]) == n + 1,
+            )
+            await _until(
+                "failure logged",
+                lambda: any("source failed after the head" in w for w in warnings),
+            )
+        finally:
+            expose_log.removeHandler(capture)
+        last = len(app.log) - 1 - app.log[::-1].index(("start", "/duplex"))
+        assert ("duplex done",) not in app.log[last:]
+
+        # Closing the response mid-upload stops the upload.
+        upload_h, pending = relay_http_streaming(conn, "app", "POST", "/duplex")
+        resp = await asyncio.wait_for(pending, 15)
+        await upload_h.write(b"x")
+        assert await asyncio.wait_for(resp.body.read(), 15) == b"x"
+        await resp.body.aclose()
+        await _until("upload stopped", lambda: upload_h.closed)
+        with pytest.raises(HttpBodyError) as gone:
+            await upload_h.write(b"more")
+        assert gone.value.kind == "cancelled"
+    finally:
+        serving.cancel()
+        await rt.aclose()
+        for n_ in (host, peer):
+            await n_.shutdown()
 
 
 def test_body_handle_detached_and_http_codec_values():
