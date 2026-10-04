@@ -125,6 +125,8 @@ type Upcalls struct {
 	pollDone  chan struct{}
 	handlerWG sync.WaitGroup
 	cancels   atomic.Int64
+
+	http httpRegistry // foreign HTTP services served on this table (expose_http.go)
 }
 
 // NewUpcalls creates a table queueing at most capacity upcalls (0 =
