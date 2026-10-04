@@ -1,23 +1,34 @@
 """Cross-binding interop smoke: the Python side of ``tests/interop/``.
 
-Shared contract (must stay identical to ``tests/interop/rust/interop_echo.rs``
-and ``tests/interop/ts/src/``)::
+Shared contract (must stay identical to ``tests/interop/rust/contract.rs``,
+which documents every method's semantics, and to the other languages)::
 
     service InteropEcho v1
       echo(interop/EchoRequest) -> interop/EchoReply                (unary)
       generate(interop/EchoRequest) -> stream interop/EchoReply     (server stream)
       ingest(stream interop/EchoRequest) -> interop/EchoReply       (client stream)
+      chat(stream interop/EchoRequest) -> stream interop/EchoReply  (bidi)
+      hold(interop/EchoRequest) -> interop/EchoReply                (unary, blocks)
+      cancelled(interop/EchoRequest) -> interop/EchoReply           (unary)
+    service InteropSession v1 (scope = session)
+      add(interop/EchoRequest) -> interop/EchoReply                 (unary)
     interop/EchoRequest { message: string, count: varint32, data: binary }
     interop/EchoReply   { message: string, count: varint32, data: binary, server_lang: string }
+
+Expose mini-matrix: ``expose-server`` serves HTTP service ``interop-http`` on
+ALPN ``aster-expose/interop/1`` (``GET /hello``, ``POST /echo``, header
+``x-server-lang``); ``expose-client <ticket>`` is a streaming-relay consumer.
 
 Usage (from the repo root, after ``scripts/build.sh``)::
 
     uv run --no-sync python tests/interop/python/interop_echo.py contract
     uv run --no-sync python tests/interop/python/interop_echo.py server
     uv run --no-sync python tests/interop/python/interop_echo.py client <aster1-ticket>
+    uv run --no-sync python tests/interop/python/interop_echo.py expose-server
+    uv run --no-sync python tests/interop/python/interop_echo.py expose-client <aster1-ticket>
 
 Output protocol (parsed by ``tests/interop/run.py``): ``CONTRACT_ID <hex>``,
-``ADDRESS <aster1...>`` (server), ``CASE <name> OK|FAIL ...`` (client).
+``SESSION_CONTRACT_ID <hex>``, ``ADDRESS <aster1...>`` (server), ``CASE <name> OK|FAIL ...`` (client).
 Open gate, relay disabled, loopback bind: works offline.
 """
 
@@ -34,18 +45,29 @@ from aster import (
     AsterConfig,
     AsterServer,
     AsterTicket,
-    client_stream,
+    HttpHandler,
+    HttpResponse,
+    IrohTransport,
     Node,
     NodeAddr,
     RPC_ALPN,
+    RpcError,
+    StatusCode,
+    bidi_stream,
+    client_stream,
     create_client,
     net_client,
+    relay_http_stream,
     rpc,
     server_stream,
     service,
     wire_type,
 )
 from aster.contract.identity import contract_id_from_service
+from aster.transport.iroh import next_session_id
+
+EXPOSE_ALPN = b"aster-expose/interop/1"
+EXPOSE_SERVICE = "interop-http"
 
 
 @wire_type("interop/EchoRequest")
@@ -89,6 +111,46 @@ class InteropEcho:
             n += 1
             last = r.message
         return EchoReply(message=last, count=_wrap_i32(n), data=b"", server_lang="python")
+
+    @bidi_stream()
+    async def chat(self, reqs: AsyncIterator[EchoRequest]) -> AsyncIterator[EchoReply]:
+        i = 0
+        async for r in reqs:
+            yield EchoReply(message=r.message, count=_wrap_i32(i), data=r.data, server_lang="python")
+            i += 1
+
+    @rpc()
+    async def hold(self, req: EchoRequest) -> EchoReply:
+        global _HOLD_CANCELLED
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            _HOLD_CANCELLED += 1
+            raise
+        return EchoReply(message="timeout", count=-1, data=b"", server_lang="python")
+
+    @rpc()
+    async def cancelled(self, req: EchoRequest) -> EchoReply:
+        return EchoReply(message="cancelled", count=_HOLD_CANCELLED, data=b"", server_lang="python")
+
+
+# `hold` calls that observed a cancellation (process-wide).
+_HOLD_CANCELLED = 0
+
+
+@service(name="InteropSession", version=1, scoped="session")
+class InteropSession:
+    """One instance per (connection, session id)."""
+
+    def __init__(self, peer=None) -> None:
+        self.total = 0
+        self.calls = 0
+
+    @rpc()
+    async def add(self, req: EchoRequest) -> EchoReply:
+        self.total = _wrap_i32(self.total + req.count)
+        self.calls += 1
+        return EchoReply(message=f"calls={self.calls}", count=self.total, data=b"", server_lang="python")
 
 
 def _wrap_i32(v: int) -> int:
@@ -149,6 +211,107 @@ async def _ingest_case(client) -> str:
     return reply.server_lang
 
 
+async def _chat_case(client) -> str:
+    """``chat``, interleaved: send ``c<i>``, read its reply, three times; then
+    end the request stream and expect the response stream to end."""
+    lang = ""
+    async with client.chat() as ch:
+        for i in range(3):
+            req = EchoRequest(message=f"c{i}", count=100 + i, data=bytes([i, 9]))
+            await ch.send(req)
+            r = await ch.recv()
+            if r is None:
+                raise AssertionError(f"stream ended before reply {i}")
+            if r.count != i or r.message != req.message or bytes(r.data) != req.data:
+                raise AssertionError(f"reply {i} mismatch: {r!r}")
+            lang = r.server_lang
+        await ch.close()
+        extra = await ch.recv()
+        if extra is not None:
+            raise AssertionError(f"unexpected extra reply {extra!r}")
+    if not lang:
+        raise AssertionError("empty server_lang")
+    return lang
+
+
+async def _cancelled_count(client) -> int:
+    return (await asyncio.wait_for(client.cancelled(EchoRequest(message="probe")), 10)).count
+
+
+async def _expect_server_cancel(client, want: int) -> None:
+    seen = 0
+    for _ in range(50):
+        seen = await _cancelled_count(client)
+        if seen >= want:
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"server never observed the cancellation (count {seen}, want {want})")
+
+
+async def _deadline_case(client) -> str:
+    """``hold`` with a 1 s deadline (the smallest every client can express):
+    DEADLINE_EXCEEDED, and the server observes a cancellation."""
+    before = await _cancelled_count(client)
+    try:
+        r = await asyncio.wait_for(client.hold(EchoRequest(message="hold"), timeout=1), 15)
+    except RpcError as exc:
+        if exc.code != StatusCode.DEADLINE_EXCEEDED:
+            raise AssertionError(f"expected DEADLINE_EXCEEDED, got {exc!r}") from exc
+    else:
+        raise AssertionError(f"hold returned {r!r} instead of an error")
+    await _expect_server_cancel(client, before + 1)
+    return "python"
+
+
+async def _cancel_case(client) -> str:
+    """``hold`` cancelled by the client after 300 ms: the server observes it."""
+    before = await _cancelled_count(client)
+    try:
+        r = await asyncio.wait_for(client.hold(EchoRequest(message="hold")), 0.3)
+    except asyncio.TimeoutError:
+        pass
+    else:
+        raise AssertionError(f"hold returned {r!r} before the client cancelled it")
+    await _expect_server_cancel(client, before + 1)
+    return "python"
+
+
+_SESSION_CODEC = None
+
+
+def _session_codec():
+    """One codec for both session clients (types registered once)."""
+    global _SESSION_CODEC
+    if _SESSION_CODEC is None:
+        from aster.codec import ForyCodec
+        from aster.rpc_types import SerializationMode
+
+        _SESSION_CODEC = ForyCodec(mode=SerializationMode.XLANG, types=[EchoRequest, EchoReply])
+    return _SESSION_CODEC
+
+
+async def _session_case(conn) -> str:
+    """Two sessions on one connection: state persists per session and is
+    isolated between them."""
+    codec = _session_codec()
+    sessions = []
+    for _ in range(2):
+        transport = IrohTransport(connection=conn, codec=codec, session_id=next_session_id(conn))
+        sessions.append(create_client(InteropSession, transport=transport, codec=codec))
+    a, b = sessions
+    steps = [(a, 5, 5, "calls=1"), (a, 7, 12, "calls=2"), (b, 1, 1, "calls=1"),
+             (a, 0, 12, "calls=3"), (b, 10, 11, "calls=2")]
+    lang = ""
+    for i, (s, add, total, calls) in enumerate(steps):
+        r = await asyncio.wait_for(s.add(EchoRequest(message="add", count=add)), 15)
+        if r.count != total or r.message != calls:
+            raise AssertionError(f"step {i}: got total {r.count} {r.message!r}, want total {total} {calls!r}")
+        lang = r.server_lang
+    if not lang:
+        raise AssertionError("empty server_lang")
+    return lang
+
+
 async def _wait_stdin_eof() -> None:
     loop = asyncio.get_running_loop()
     while await loop.run_in_executor(None, sys.stdin.readline):
@@ -157,7 +320,7 @@ async def _wait_stdin_eof() -> None:
 
 async def serve() -> None:
     config = AsterConfig.from_env().replace(relay_mode="disabled", bind_addr="127.0.0.1:0")
-    srv = AsterServer(services=[InteropEcho()], config=config, allow_all_consumers=True)
+    srv = AsterServer(services=[InteropEcho(), InteropSession], config=config, allow_all_consumers=True)
     await srv.start()
     for _ in range(100):
         if srv.node.node_addr_info().direct_addresses:
@@ -194,10 +357,119 @@ async def run_client(ticket_str: str) -> bool:
         except Exception as exc:  # noqa: BLE001
             all_ok = False
             print(f"CASE {name} FAIL {type(exc).__name__}: {exc}", flush=True)
-    for name, coro in (("server_stream", _stream_case(client)), ("client_stream", _ingest_case(client))):
+    for name, coro in (
+        ("server_stream", _stream_case(client)),
+        ("client_stream", _ingest_case(client)),
+        ("bidi", _chat_case(client)),
+        ("deadline", _deadline_case(client)),
+        ("cancel", _cancel_case(client)),
+        ("session", _session_case(conn)),
+    ):
         try:
-            server_lang = await asyncio.wait_for(coro, 15)
+            server_lang = await asyncio.wait_for(coro, 30)
             print(f"CASE {name} OK server_lang={server_lang}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            all_ok = False
+            print(f"CASE {name} FAIL {type(exc).__name__}: {exc}", flush=True)
+    conn.close(0, b"done")
+    await node.close()
+    return all_ok
+
+
+class _ExposeApp(HttpHandler):
+    async def handle(self, request):
+        headers = [("x-server-lang", "python")]
+        if request.method == "GET" and request.uri == "/hello":
+            return HttpResponse(200, headers, "hello from python")
+        if request.method == "POST" and request.uri == "/echo":
+
+            async def echo():
+                if isinstance(request.body, (bytes, bytearray)):
+                    yield bytes(request.body)
+                else:
+                    async for chunk in request.body:
+                        yield bytes(chunk)
+
+            return HttpResponse(200, headers, echo())
+        return HttpResponse(404, headers, b"")
+
+
+async def expose_serve() -> None:
+    config = AsterConfig(alpns=(EXPOSE_ALPN,), relay_mode="disabled", bind_addr="127.0.0.1:0")
+    node = await Node.start(config)
+    expose = node.expose()
+    expose.expose_http(EXPOSE_SERVICE, _ExposeApp())  # no authorizer: admits every peer
+    serving = asyncio.ensure_future(expose.serve([EXPOSE_ALPN]))
+    info = node.node_addr_info()
+    for _ in range(100):
+        if info.direct_addresses:
+            break
+        await asyncio.sleep(0.05)
+        info = node.node_addr_info()
+    ticket = AsterTicket(endpoint_id=info.endpoint_id, direct_addrs=list(info.direct_addresses))
+    print(f"ADDRESS {ticket.to_string()}", flush=True)
+    try:
+        await _wait_stdin_eof()
+    finally:
+        serving.cancel()
+        await node.shutdown()
+
+
+async def _expose_hello(conn) -> str:
+    resp = await relay_http_stream(conn, EXPOSE_SERVICE, "GET", "/hello")
+    lang = (resp.header("x-server-lang") or b"").decode()
+    body = await resp.read_body()
+    if resp.status != 200:
+        raise AssertionError(f"status {resp.status}")
+    if not lang or body != f"hello from {lang}".encode():
+        raise AssertionError(f"lang {lang!r} body {body!r}")
+    return lang
+
+
+async def _expose_echo(conn) -> str:
+    """Three-chunk streamed upload, read back interleaved with the upload."""
+    chunks = [bytes([ord("a") + i]) * (4000 + i) for i in range(3)]
+    gate = [asyncio.Event() for _ in chunks]
+
+    async def upload():
+        for i, c in enumerate(chunks):
+            yield c
+            # Hold the next chunk until the response has produced this one.
+            await asyncio.wait_for(gate[i].wait(), 10)
+
+    resp = await relay_http_stream(conn, EXPOSE_SERVICE, "POST", "/echo", body=upload())
+    if resp.status != 200:
+        raise AssertionError(f"status {resp.status}")
+    lang = (resp.header("x-server-lang") or b"").decode()
+    if not lang:
+        raise AssertionError("missing x-server-lang header")
+    got = bytearray()
+    sent = 0
+    while (chunk := await resp.body.read()) is not None:
+        got += chunk
+        while sent < len(chunks) and len(got) >= sum(len(c) for c in chunks[: sent + 1]):
+            gate[sent].set()
+            sent += 1
+    if bytes(got) != b"".join(chunks):
+        raise AssertionError(f"echo mismatch (len {len(got)} vs {sum(len(c) for c in chunks)})")
+    return lang
+
+
+async def expose_client(ticket_str: str) -> bool:
+    cfg = AsterConfig(alpns=(EXPOSE_ALPN,), relay_mode="disabled", bind_addr="127.0.0.1:0")
+    node = await Node.start(cfg)
+    try:
+        t = AsterTicket.from_string(ticket_str)
+        addr = NodeAddr(endpoint_id=t.endpoint_id, relay_url=None, direct_addresses=t.direct_addrs)
+        conn = await asyncio.wait_for(net_client(node).connect_node_addr(addr, EXPOSE_ALPN), 15)
+    except Exception as exc:  # noqa: BLE001
+        print(f"CASE connect FAIL {type(exc).__name__}: {exc}", flush=True)
+        await node.close()
+        return False
+    all_ok = True
+    for name, coro in (("expose_hello", _expose_hello(conn)), ("expose_echo_stream", _expose_echo(conn))):
+        try:
+            print(f"CASE {name} OK server_lang={await asyncio.wait_for(coro, 20)}", flush=True)
         except Exception as exc:  # noqa: BLE001
             all_ok = False
             print(f"CASE {name} FAIL {type(exc).__name__}: {exc}", flush=True)
@@ -208,7 +480,13 @@ async def run_client(ticket_str: str) -> bool:
 
 def main() -> int:
     print(f"CONTRACT_ID {contract_id_from_service(InteropEcho)}", flush=True)
+    print(f"SESSION_CONTRACT_ID {contract_id_from_service(InteropSession)}", flush=True)
     args = sys.argv[1:]
+    if args == ["expose-server"]:
+        asyncio.run(expose_serve())
+        return 0
+    if len(args) == 2 and args[0] == "expose-client":
+        return 0 if asyncio.run(expose_client(args[1])) else 1
     if args == ["contract"]:
         return 0
     if args == ["server"]:
@@ -216,7 +494,7 @@ def main() -> int:
         return 0
     if len(args) == 2 and args[0] == "client":
         return 0 if asyncio.run(run_client(args[1])) else 1
-    print("usage: interop_echo.py contract | server | client <aster1-ticket>", file=sys.stderr)
+    print("usage: interop_echo.py contract | server | client <ticket> | expose-server | expose-client <ticket>", file=sys.stderr)
     return 2
 
 

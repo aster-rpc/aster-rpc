@@ -1,25 +1,43 @@
 #!/usr/bin/env python3
-"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript x Java x .NET x Go, open gate, unary + streaming.
+"""Cross-binding interop matrix -- Rust x Python x TypeScript x Java x .NET x Go, open gate.
 
-Builds what is needed, checks that all languages derive the same
-``contract_id`` for the shared ``InteropEcho`` contract, then runs every
-server x client cell (same-language cells included) and prints a matrix.
+Builds what is needed, checks that all languages derive the same contract ids
+for the shared ``InteropEcho`` and ``InteropSession`` contracts, then runs two
+matrices and reports **per-case** results (a failing case is named, not just
+its cell):
+
+* RPC matrix: every server x client cell (same-language cells included). Each
+  client runs ``RPC_CASES``: unary (small, zstd, long_string), server_stream,
+  client_stream, bidi (interleaved ``chat``), deadline and cancel (``hold``
+  blocks; the client gets DEADLINE_EXCEEDED / CANCELLED and the server must
+  observe the cancellation) and session (state persists per session, isolated
+  between sessions).
+* Expose matrix: every language serves an HTTP handler through expose; the
+  Rust and Python streaming-relay consumers call each one (``EXPOSE_CASES``).
 
 Usage (from anywhere)::
 
-    python3 tests/interop/run.py                 # build Rust example + FFI lib + Java + .NET + Go + TS dist/codegen, run matrix
+    python3 tests/interop/run.py                 # build everything, run both matrices
     python3 tests/interop/run.py --native        # also rebuild the Python + TS native modules
     python3 tests/interop/run.py --no-build      # just run
     python3 tests/interop/run.py --servers rust --clients python,ts
+    python3 tests/interop/run.py --no-expose     # RPC matrix only
+    python3 tests/interop/run.py --require-all   # a missing toolchain is an error, not a skipped leg
 
 Cargo goes through ``$ASTER_CARGO_LAUNCHER`` when set (e.g. the Kache
 launcher). Needs: cargo, uv (with the Python extension built), bun, node,
 mvn + java 22+ (Java runs ``java/InteropEcho.java`` against
-``libaster_transport_ffi`` via ``IROH_LIB_PATH``), the .NET 9 SDK (``dotnet/``
-is built against the same debug ``libaster_transport_ffi``), Go 1.25+ (``go/``
-is built with cgo against the same library and ``ffi/aster_ffi.h``).
-Everything is loopback-only with relays disabled, so it works offline.
-Exit status is non-zero if any contract id disagrees or any cell fails.
+``libaster_transport_ffi`` via ``IROH_LIB_PATH``; Maven runs offline unless
+``--mvn-online``), the .NET 9 SDK (``dotnet/`` is built against the same debug
+``libaster_transport_ffi``), Go 1.25+ (``go/`` is built with cgo against the
+same library and ``ffi/aster_ffi.h``). Everything is loopback-only with relays
+disabled, so it works offline. Exit status is non-zero if any contract id
+disagrees, any case fails unexpectedly, or an expected failure starts passing.
+
+Program protocol (every language): ``<prog> contract | server | client <ticket>
+| expose-server | expose-client <ticket>``; stdout lines ``CONTRACT_ID <hex>``,
+``SESSION_CONTRACT_ID <hex>``, ``ADDRESS <aster1...>`` (servers) and
+``CASE <name> OK|FAIL <detail>`` (clients). Servers run until stdin closes.
 """
 
 from __future__ import annotations
@@ -43,13 +61,29 @@ JAVA_DIR = REPO / "bindings/java"
 DOTNET_DIR = HERE / "dotnet"
 GO_DIR = HERE / "go"
 LANGS = ("rust", "python", "ts", "java", "dotnet", "go")
+# Languages that can consume an exposed service (the streaming relay): the
+# expose matrix is every language serving x these consuming.
+EXPOSE_CLIENTS = ("rust", "python")
 # Java, .NET and Go join the default matrix only where their toolchains are
-# installed (the Forgejo runner has none of them); name them in
-# --servers/--clients to require them.
+# installed; name them in --servers/--clients (or pass --require-all) to
+# require them.
 OPTIONAL_TOOLS = {"java": ("java", "mvn"), "dotnet": ("dotnet",), "go": ("go",)}
 DEFAULT_LANGS = tuple(
     lang for lang in LANGS if all(shutil.which(t) for t in OPTIONAL_TOOLS.get(lang, ()))
 )
+
+RPC_CASES = (
+    "small", "zstd", "long_string",
+    "server_stream", "client_stream",
+    "bidi", "deadline", "cancel", "session",
+)
+EXPOSE_CASES = ("expose_hello", "expose_echo_stream")
+
+# Known binding bugs: (matrix, server, client, case) -> reason; "*" matches any
+# language. A listed case that FAILs is reported XFAIL and does not fail the
+# run; one that PASSes is XPASS and does (remove the entry). Keep empty unless
+# a binding bug blocks a case, and say which bug.
+EXPECTED_FAIL: dict[tuple[str, str, str, str], str] = {}
 
 ENV = {
     **os.environ,
@@ -58,6 +92,8 @@ ENV = {
     "ASTER_LOG_LEVEL": os.environ.get("ASTER_LOG_LEVEL", "warn"),
     "PYTHONUNBUFFERED": "1",
 }
+
+CLIENT_TIMEOUT = 180  # seconds for one client run (all cases)
 
 
 def target_dir() -> Path:
@@ -78,6 +114,7 @@ def ffi_lib() -> Path:
 ENV["IROH_LIB_PATH"] = str(ffi_lib())
 
 _java_cp: str | None = None
+_mvn_offline = True
 
 
 def java_classpath() -> str:
@@ -86,13 +123,13 @@ def java_classpath() -> str:
     if _java_cp is None:
         out = HERE / ".java-classpath.txt"
         subprocess.run(
-            ["mvn", "-o", "-q", "-pl", "aster-runtime", "dependency:build-classpath",
-             f"-Dmdep.outputFile={out}"],
+            ["mvn", *(["-o"] if _mvn_offline else []), "-q", "-pl", "aster-runtime",
+             "dependency:build-classpath", f"-Dmdep.outputFile={out}"],
             cwd=JAVA_DIR, env=ENV, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        deps = [p for p in out.read_text().strip().split(":") if p and "/site/aster/" not in p]
+        deps = [p for p in out.read_text().strip().split(os.pathsep) if p and "/site/aster/" not in p]
         local = [str(JAVA_DIR / m / "target/classes") for m in ("aster-runtime", "aster-annotations")]
-        _java_cp = ":".join(local + deps)
+        _java_cp = os.pathsep.join(local + deps)
     return _java_cp
 
 
@@ -127,13 +164,14 @@ def build(native: bool, langs: set[str]) -> None:
         run_step("ts native", [*launcher, "bun", "run", "build"], REPO / "bindings/typescript/native")
     run_step(
         "rust interop_echo",
-        [*launcher, "cargo", "build", "-p", "aster", "--features", "rpc", "--example", "interop_echo"],
+        [*launcher, "cargo", "build", "-p", "aster", "--features", "rpc,expose", "--example", "interop_echo"],
         REPO,
     )
     if langs & {"java", "dotnet", "go"}:
         run_step("ffi cdylib", [*launcher, "cargo", "build", "-p", "aster_transport_ffi", "--lib"], REPO)
     if "java" in langs:
-        run_step("java aster-runtime", ["mvn", "-B", "-q", "-o", "-pl", "aster-runtime", "-am", "compile"],
+        run_step("java aster-runtime",
+                 ["mvn", "-B", "-q", *(["-o"] if _mvn_offline else []), "-pl", "aster-runtime", "-am", "compile"],
                  JAVA_DIR)
     if "dotnet" in langs:
         # Pin the native library to the debug build above (the .NET project would
@@ -160,23 +198,30 @@ def build(native: bool, langs: set[str]) -> None:
     )
 
 
-def contract_ids(langs: list[str]) -> dict[str, str]:
-    out: dict[str, str] = {}
+def contract_ids(langs: list[str]) -> dict[str, tuple[str, str]]:
+    """lang -> (InteropEcho id, InteropSession id)."""
+    out: dict[str, tuple[str, str]] = {}
     for lang in langs:
         cmd, cwd = command(lang, "contract")
-        res = subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, timeout=120)
-        cid = next(
-            (ln.split()[1] for ln in res.stdout.splitlines() if ln.startswith("CONTRACT_ID ")),
-            f"<error: exit {res.returncode}: {res.stderr.strip()[-200:]}>",
-        )
-        out[lang] = cid
+        try:
+            res = subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            out[lang] = ("<error: contract timed out>",) * 2
+            continue
+        found = {}
+        for ln in res.stdout.splitlines():
+            parts = ln.split()
+            if len(parts) == 2 and parts[0] in ("CONTRACT_ID", "SESSION_CONTRACT_ID"):
+                found[parts[0]] = parts[1]
+        err = f"<error: exit {res.returncode}: {res.stderr.strip()[-200:]}>"
+        out[lang] = (found.get("CONTRACT_ID", err), found.get("SESSION_CONTRACT_ID", err))
     return out
 
 
 class Server:
-    def __init__(self, lang: str) -> None:
+    def __init__(self, lang: str, mode: str = "server") -> None:
         self.lang = lang
-        cmd, cwd = command(lang, "server")
+        cmd, cwd = command(lang, mode)
         self.proc = subprocess.Popen(
             cmd, cwd=cwd, env=ENV, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -213,26 +258,168 @@ class Server:
             self.proc.wait()
 
 
-def run_client(lang: str, ticket: str) -> tuple[bool, list[str]]:
-    cmd, cwd = command(lang, "client", ticket)
+# One cell's per-case results: case -> (ok, detail), in the order reported.
+CaseResults = dict[str, tuple[bool, str]]
+
+
+def run_client(lang: str, mode: str, ticket: str, expected: tuple[str, ...]) -> CaseResults:
+    cmd, cwd = command(lang, mode, ticket)
+    results: CaseResults = {}
     try:
-        res = subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        return False, ["client timed out after 120s"]
-    cases = [ln for ln in res.stdout.splitlines() if ln.startswith("CASE ")]
-    ok = res.returncode == 0 and bool(cases) and all(" OK " in f"{c} " for c in cases)
-    if not cases:
-        cases = [f"no CASE output (exit {res.returncode}): {res.stderr.strip()[-400:]}"]
-    return ok, cases
+        res = subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, timeout=CLIENT_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        _parse_cases(out, results)
+        for case in expected:
+            results.setdefault(case, (False, f"client timed out after {CLIENT_TIMEOUT}s"))
+        return results
+    _parse_cases(res.stdout, results)
+    if "connect" in results and not results["connect"][0]:
+        # Connect failure: every case is a failure of the same cause.
+        detail = results["connect"][1]
+        return {case: (False, f"connect failed: {detail}") for case in expected}
+    tail = res.stderr.strip()[-400:]
+    for case in expected:
+        results.setdefault(case, (False, f"no CASE line (client exit {res.returncode}): {tail}"))
+    return {case: results[case] for case in expected}
+
+
+def _parse_cases(stdout: str, results: CaseResults) -> None:
+    for ln in stdout.splitlines():
+        if not ln.startswith("CASE "):
+            continue
+        parts = ln.split(" ", 3)
+        if len(parts) < 3:
+            continue
+        results[parts[1]] = (parts[2] == "OK", parts[3] if len(parts) > 3 else "")
+
+
+def classify(matrix: str, server: str, client: str, case: str, ok: bool) -> str:
+    """PASS / FAIL / XFAIL (expected failure) / XPASS (expected failure that passed)."""
+    reason = None
+    for s in (server, "*"):
+        for c in (client, "*"):
+            reason = reason or EXPECTED_FAIL.get((matrix, s, c, case))
+    if reason is None:
+        return "PASS" if ok else "FAIL"
+    return "XPASS" if ok else "XFAIL"
+
+
+def run_matrix(
+    matrix: str, servers: list[str], clients: list[str], server_mode: str, client_mode: str,
+    expected: tuple[str, ...],
+) -> dict[tuple[str, str], dict[str, str]]:
+    """(server, client) -> case -> status; prints per-cell progress."""
+    out: dict[tuple[str, str], dict[str, str]] = {}
+    details: dict[tuple[str, str, str], str] = {}
+    for s in servers:
+        srv = Server(s, server_mode)
+        try:
+            ticket = srv.address()
+            if ticket is None:
+                reason = f"{s} {server_mode} did not print ADDRESS; stderr tail: {' | '.join(srv.stderr[-5:])}"
+                for c in clients:
+                    out[(s, c)] = {case: "FAIL" for case in expected}
+                    for case in expected:
+                        details[(s, c, case)] = reason
+                    print(f"[{matrix}] server={s:<6} client={c:<6} FAIL (server did not start)", flush=True)
+                continue
+            for c in clients:
+                print(f"[{matrix}] server={s:<6} client={c:<6} ...", end=" ", flush=True)
+                results = run_client(c, client_mode, ticket, expected)
+                status = {}
+                for case, (ok, detail) in results.items():
+                    status[case] = classify(matrix, s, c, case, ok)
+                    details[(s, c, case)] = detail
+                out[(s, c)] = status
+                bad = [k for k, v in status.items() if v in ("FAIL", "XPASS")]
+                print(f"{sum(v in ('PASS', 'XFAIL') for v in status.values())}/{len(status)}"
+                      + (f"  failing: {', '.join(bad)}" if bad else ""), flush=True)
+        finally:
+            srv.stop()
+    _DETAILS.update({(matrix, *k): v for k, v in details.items()})
+    return out
+
+
+_DETAILS: dict[tuple[str, str, str, str], str] = {}
+
+
+def report(matrix: str, title: str, servers: list[str], clients: list[str], cases: tuple[str, ...],
+           results: dict[tuple[str, str], dict[str, str]]) -> bool:
+    """Print the cell matrix and the per-case table; return True if all green."""
+    print(f"\n{title}: cells (cases passed / total)")
+    w = 9
+    print("server \\ client ".ljust(16) + "".join(f"{c:<{w}}" for c in clients))
+    for s in servers:
+        row = ""
+        for c in clients:
+            st = results.get((s, c), {})
+            good = sum(v in ("PASS", "XFAIL") for v in st.values())
+            row += f"{good}/{len(cases):<{w - 2}}"
+        print(f"{s:<16}{row}")
+
+    print(f"\n{title}: per-case (rows server>client, '.' pass, 'F' FAIL, 'x' expected fail, 'P' unexpected pass)")
+    name_w = max(len(c) for c in cases)
+    print(" " * 18 + " ".join(c[:6].ljust(6) for c in cases))
+    sym = {"PASS": ".", "FAIL": "F", "XFAIL": "x", "XPASS": "P"}
+    for s in servers:
+        for c in clients:
+            st = results.get((s, c), {})
+            cells = " ".join(sym.get(st.get(case, "FAIL"), "F").ljust(6) for case in cases)
+            print(f"{s + '>' + c:<18}{cells}")
+    del name_w
+
+    ok = True
+    problems = [(k, case, v) for k, st in results.items() for case, v in st.items() if v in ("FAIL", "XPASS")]
+    xfails = [(k, case) for k, st in results.items() for case, v in st.items() if v == "XFAIL"]
+    if xfails:
+        print(f"\n{title}: expected failures")
+        for (s, c), case in xfails:
+            print(f"  server={s} client={c} case={case}: {_reason(matrix, s, c, case)}")
+    if problems:
+        ok = False
+        print(f"\n{title}: failures")
+        for (s, c), case, v in problems:
+            detail = _DETAILS.get((matrix, s, c, case), "")
+            note = " (expected failure now passes: remove it from EXPECTED_FAIL)" if v == "XPASS" else ""
+            print(f"  server={s} client={c} case={case}{note}: {detail}")
+    total_cells = len(results)
+    good_cells = sum(all(v in ("PASS", "XFAIL") for v in st.values()) for st in results.values())
+    total_cases = sum(len(st) for st in results.values())
+    good_cases = sum(v in ("PASS", "XFAIL") for st in results.values() for v in st.values())
+    print(f"\n{title}: {good_cells}/{total_cells} cells, {good_cases}/{total_cases} cases passed")
+    return ok
+
+
+def _reason(matrix: str, s: str, c: str, case: str) -> str:
+    for ss in (s, "*"):
+        for cc in (c, "*"):
+            if (matrix, ss, cc, case) in EXPECTED_FAIL:
+                return EXPECTED_FAIL[(matrix, ss, cc, case)]
+    return ""
 
 
 def main() -> int:
+    global _mvn_offline
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-build", action="store_true", help="skip all build steps")
     ap.add_argument("--native", action="store_true", help="also rebuild the Python and TS native modules")
     ap.add_argument("--servers", default=",".join(DEFAULT_LANGS))
     ap.add_argument("--clients", default=",".join(DEFAULT_LANGS))
+    ap.add_argument("--no-expose", action="store_true", help="skip the expose/relay matrix")
+    ap.add_argument("--no-rpc", action="store_true", help="skip the RPC matrix")
+    ap.add_argument("--require-all", action="store_true",
+                    help="all six languages are required: a missing toolchain is an error")
+    ap.add_argument("--mvn-online", action="store_true", help="let Maven resolve dependencies (default: offline)")
     args = ap.parse_args()
+    _mvn_offline = not args.mvn_online
+
+    if args.require_all:
+        missing = [f"{lang} ({'/'.join(t)})" for lang, t in OPTIONAL_TOOLS.items() if lang not in DEFAULT_LANGS]
+        if missing:
+            sys.exit(f"--require-all: toolchain missing for: {', '.join(missing)}")
+        if args.servers == ",".join(DEFAULT_LANGS) and args.clients == ",".join(DEFAULT_LANGS):
+            pass  # defaults already cover every language
     servers = [s for s in args.servers.split(",") if s]
     clients = [c for c in args.clients.split(",") if c]
     for lang, tools in OPTIONAL_TOOLS.items():
@@ -244,48 +431,23 @@ def main() -> int:
 
     failed = False
     ids = contract_ids(sorted(set(servers) | set(clients), key=LANGS.index))
-    print("\ncontract_id (InteropEcho v1):")
-    for lang, cid in ids.items():
-        print(f"  {lang:<7} {cid}")
-    if len(set(ids.values())) != 1:
-        print("  MISMATCH: contract ids differ across languages")
-        failed = True
-    else:
-        print("  all agree")
+    for idx, label in enumerate(("InteropEcho v1", "InteropSession v1 (session-scoped)")):
+        print(f"\ncontract_id ({label}):")
+        for lang, cids in ids.items():
+            print(f"  {lang:<7} {cids[idx]}")
+        if len({cids[idx] for cids in ids.values()}) != 1:
+            print("  MISMATCH: contract ids differ across languages")
+            failed = True
+        else:
+            print("  all agree")
 
-    results: dict[tuple[str, str], tuple[bool, list[str]]] = {}
-    for s in servers:
-        srv = Server(s)
-        try:
-            ticket = srv.address()
-            if ticket is None:
-                detail = f"{s} server did not print ADDRESS; stderr tail: {' | '.join(srv.stderr[-5:])}"
-                for c in clients:
-                    results[(s, c)] = (False, [detail])
-                continue
-            for c in clients:
-                print(f"[run] server={s:<6} client={c:<6} ...", end=" ", flush=True)
-                results[(s, c)] = run_client(c, ticket)
-                print("PASS" if results[(s, c)][0] else "FAIL", flush=True)
-        finally:
-            srv.stop()
-
-    w = 8
-    print("\nserver \\ client " + "".join(f"{c:<{w}}" for c in clients))
-    for s in servers:
-        row = "".join(f"{('PASS' if results[(s, c)][0] else 'FAIL'):<{w}}" for c in clients)
-        print(f"{s:<16}{row}")
-
-    fails = [(k, v[1]) for k, v in results.items() if not v[0]]
-    if fails:
-        failed = True
-        print("\nfailures:")
-        for (s, c), lines in fails:
-            print(f"  server={s} client={c}")
-            for ln in lines:
-                print(f"    {ln}")
-    total = len(results)
-    print(f"\n{total - len(fails)}/{total} cells passed")
+    if not args.no_rpc:
+        rpc = run_matrix("rpc", servers, clients, "server", "client", RPC_CASES)
+        failed |= not report("rpc", "RPC matrix", servers, clients, RPC_CASES, rpc)
+    if not args.no_expose:
+        ex_clients = [c for c in clients if c in EXPOSE_CLIENTS]
+        expose = run_matrix("expose", servers, ex_clients, "expose-server", "expose-client", EXPOSE_CASES)
+        failed |= not report("expose", "Expose matrix", servers, ex_clients, EXPOSE_CASES, expose)
     return 1 if failed else 0
 
 
