@@ -3,8 +3,8 @@
 //! Enabled by the `binding-support` feature. The language bindings (PyO3
 //! `bindings/python/rust`, NAPI `bindings/typescript/native`, the C ABI `ffi/`)
 //! wrap the `aster` crate (plan D1), but still drive a few transport-core
-//! pieces directly: the reactor ring, the client-call pool, tunnels and the raw
-//! admission hook channels. This module is the one sanctioned way to reach them
+//! pieces directly: the dispatch ring, the client-call pool, tunnels and the
+//! raw admission hook channels. This module is the one sanctioned way to reach them
 //! from `aster` handles, so a binding never has to construct core objects in
 //! parallel to the facade.
 //!
@@ -17,8 +17,9 @@
 //! | `rpc::RpcConnection` (`rpc`) | `core_connection()` / `from_core_connection(..)` | [`CoreConnection`] |
 //!
 //! The transport core is re-exported as [`core`] so a binding links exactly
-//! the version `aster` was built against; [`reactor`], [`pool`], [`tunnel`]
-//! and [`ring`] are re-exported for the hot paths.
+//! the version `aster` was built against; [`pool`], [`tunnel`] and [`ring`]
+//! are re-exported for the hot paths. Foreign services are served through
+//! `dispatch` (the `aster::rpc::Server` reactor), never a binding-owned one.
 //!
 //! Binding profile (see `aster/Cargo.toml`): `default` + `rpc` +
 //! `binding-support`, plus `metrics`, and optionally `coordination-client` /
@@ -26,23 +27,10 @@
 
 /// The transport core this `aster` build links.
 pub use aster_transport_core as core;
-pub use aster_transport_core::{pool, reactor, ring, tunnel};
+pub use aster_transport_core::{pool, ring, tunnel};
 pub use aster_transport_core::{
     CoreConnection, CoreEndpointConfig, CoreHookReceiver, CoreNode, CoreRecvStream, CoreSendStream,
 };
-
-use crate::Node;
-
-/// Start the transport-core reactor (the SPSC ring the Python and C ABI
-/// bindings poll) for `node` on `runtime`. Equivalent to
-/// [`reactor::start_reactor_on`] with the node's core handle.
-pub fn start_reactor_on(
-    runtime: &tokio::runtime::Handle,
-    node: &Node,
-    channel_capacity: usize,
-) -> reactor::ReactorHandle {
-    reactor::start_reactor_on(runtime, node.core_node().clone(), channel_capacity)
-}
 
 /// Foreign (binding-implemented) services served by `aster::rpc::Server`:
 /// call events, the shared call table, and the ring sink.

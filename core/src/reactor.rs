@@ -22,11 +22,11 @@
 //!   the stream stays open between calls).
 //!
 //! Two reactor entry shapes:
-//! - `start_reactor` / `start_reactor_on`: owns the accept loop (pulls from
-//!   `node.accept_aster()`). Good for standalone Server use.
+//! - `start_reactor_with_limits`: owns the accept loop (pulls from
+//!   `node.accept_aster()`). `aster::rpc::Server::serve` uses it.
 //! - `create_reactor`: returns a handle + feeder. The caller owns the accept
-//!   loop and feeds RPC connections via `ReactorFeeder::feed`. Good for
-//!   AsterServer integration where the accept loop dispatches by ALPN.
+//!   loop and feeds RPC connections via `ReactorFeeder::feed`
+//!   (`aster::expose` and the transport-level tests).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -83,16 +83,87 @@ pub struct IncomingCall {
     /// until `FLAG_END_STREAM` or QUIC EOF closes the channel.
     pub request_receiver: mpsc::Receiver<RequestFrame>,
     /// Set to `true` by the reactor when a `FLAG_CANCEL` frame arrives on
-    /// the wire OR when the QUIC stream errors mid-call. The binding can
-    /// poll this from a long-running streaming dispatcher (typically via
-    /// `aster_reactor_check_cancelled`) to stop early instead of running
-    /// to natural completion. Cleared/destroyed when the call ends.
+    /// the wire OR when the QUIC stream errors mid-call. A long-running
+    /// handler can poll this to stop early instead of running to natural
+    /// completion.
     pub cancelled: Arc<AtomicBool>,
-    /// Signalled (`notify_waiters`) right after `cancelled` is set, so a
-    /// consumer can await a cancellation instead of polling the flag. A
-    /// waiter must enable its `Notified` future and then re-check
-    /// `cancelled` before awaiting, since `notify_waiters` stores no permit.
-    pub cancel_notify: Arc<Notify>,
+    /// Fired right after `cancelled` is set: wakes `notified()` waiters and
+    /// runs the consumer's [`CancelHook`], if one is installed. A waiter must
+    /// enable its `Notified` future and then re-check `cancelled` before
+    /// awaiting, since `notify_waiters` stores no permit.
+    pub cancel_notify: Arc<CancelSignal>,
+}
+
+/// Synchronous cancellation callback, run by [`CancelSignal`] on the task
+/// that observed the cancel. Must not block.
+pub trait CancelHook: Send + Sync {
+    fn cancelled(&self);
+}
+
+enum HookSlot {
+    Empty,
+    Set(std::sync::Weak<dyn CancelHook>),
+    Fired,
+}
+
+/// A call's cancellation signal: a [`Notify`] for awaiting it (via `Deref`),
+/// plus at most one [`CancelHook`] for consumers that must react without a
+/// waiter of their own -- one task per call is what this avoids.
+pub struct CancelSignal {
+    notify: Notify,
+    hook: std::sync::Mutex<HookSlot>,
+}
+
+impl Default for CancelSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelSignal {
+    pub fn new() -> Self {
+        CancelSignal {
+            notify: Notify::new(),
+            hook: std::sync::Mutex::new(HookSlot::Empty),
+        }
+    }
+
+    /// Run `hook` once when the call is cancelled -- immediately, on this
+    /// thread, if it already was. Replaces a hook installed earlier. Held
+    /// weakly: a hook whose owner is gone is skipped. Never runs for a call
+    /// that completes (the signal is simply dropped).
+    pub fn on_cancel(&self, hook: std::sync::Weak<dyn CancelHook>) {
+        let mut slot = self.hook.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*slot, HookSlot::Fired) {
+            drop(slot);
+            if let Some(h) = hook.upgrade() {
+                h.cancelled();
+            }
+        } else {
+            *slot = HookSlot::Set(hook);
+        }
+    }
+
+    /// Wake the waiters, then run the hook (once).
+    fn fire(&self) {
+        self.notify.notify_waiters();
+        let prev = std::mem::replace(
+            &mut *self.hook.lock().unwrap_or_else(|e| e.into_inner()),
+            HookSlot::Fired,
+        );
+        if let HookSlot::Set(hook) = prev {
+            if let Some(h) = hook.upgrade() {
+                h.cancelled();
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for CancelSignal {
+    type Target = Notify;
+    fn deref(&self) -> &Notify {
+        &self.notify
+    }
 }
 
 /// One additional request frame delivered to the binding's per-call
@@ -428,37 +499,21 @@ pub struct ReactorHandle {
     event_rx: mpsc::Receiver<ReactorEvent>,
     /// Non-rpc accept queue. Populated by `accept_loop` when a connection
     /// negotiates an ALPN other than `aster/1` (e.g. `aster.consumer_admission`).
-    /// Bindings drain this via [`next_non_rpc`] and dispatch to the right
-    /// per-ALPN handler. Always present — `start_reactor*` wires it even when no
-    /// non-rpc ALPNs are registered; stays empty in that case.
+    /// Always present -- `start_reactor_with_limits` wires it even when no
+    /// non-rpc ALPNs are registered; stays empty in that case, and in
+    /// `create_reactor` mode, where the caller owns the accept loop.
     non_rpc_rx: mpsc::Receiver<(Vec<u8>, CoreConnection)>,
 }
 
 impl ReactorHandle {
-    /// Pull the next event (call or connection-closed). Bindings that
-    /// need to reap per-connection state on disconnect should consume
-    /// from this API.
+    /// Pull the next event (call or connection-closed).
     pub async fn next_event(&mut self) -> Option<ReactorEvent> {
         self.event_rx.recv().await
     }
 
-    /// Pull the next non-rpc aster-ALPN connection from the reactor's internal
-    /// dispatch channel. Returns `(alpn, connection)` — the alpn is whichever
-    /// non-`aster/1` protocol the peer negotiated (e.g. `aster.consumer_admission`,
-    /// `aster.producer_admission`). Returns `None` when the reactor is shut down.
-    ///
-    /// Intended for server bindings that register custom ALPNs on the node and
-    /// want to multiplex admission / registry / manifest handlers alongside the
-    /// RPC pipeline owned by the reactor. The binding is responsible for
-    /// dispatching the connection to the right handler based on the alpn bytes.
-    pub async fn next_non_rpc(&mut self) -> Option<(Vec<u8>, CoreConnection)> {
-        self.non_rpc_rx.recv().await
-    }
-
-    /// Consume this handle and split it into its two independent receivers. The
-    /// FFI layer needs this so a background pump task can own the RPC event
-    /// stream while the non-rpc receiver is retained in reactor state for
-    /// synchronous long-poll access.
+    /// Split this handle into its two independent receivers: the RPC event
+    /// stream and the non-rpc `(alpn, connection)` queue, so each can be
+    /// drained by its own task (as `aster::rpc::Server::serve` does).
     pub fn into_parts(
         self,
     ) -> (
@@ -466,32 +521,6 @@ impl ReactorHandle {
         mpsc::Receiver<(Vec<u8>, CoreConnection)>,
     ) {
         (self.event_rx, self.non_rpc_rx)
-    }
-
-    /// Back-compat convenience: pull the next **Call** event,
-    /// silently draining (and logging at debug) any
-    /// `ConnectionClosed` events that arrive. Existing FFI consumers
-    /// that don't yet track connection lifecycle can continue to use
-    /// this shape unchanged.
-    pub async fn next_call(&mut self) -> Option<IncomingCall> {
-        loop {
-            match self.event_rx.recv().await {
-                Some(ReactorEvent::Call(c)) => return Some(c),
-                Some(ReactorEvent::ConnectionClosed {
-                    peer_id,
-                    connection_id,
-                    ..
-                }) => {
-                    tracing::debug!(
-                        peer = %peer_id,
-                        connection_id = connection_id,
-                        "ConnectionClosed event dropped by next_call (binding has not migrated to next_event)"
-                    );
-                    continue;
-                }
-                None => return None,
-            }
-        }
     }
 }
 
@@ -542,15 +571,11 @@ pub fn create_reactor(
     )
 }
 
-/// Start a reactor that owns the accept loop.
-pub fn start_reactor(node: CoreNode, channel_capacity: usize) -> ReactorHandle {
-    start_reactor_with_limits(node, channel_capacity, None)
-}
-
-/// As [`start_reactor`], with a per-method body-frame cap resolver.
+/// Start a reactor that owns the accept loop, with an optional per-method
+/// body-frame cap resolver.
 ///
 /// This is the production accept path -- `Server::serve` goes through it -- so
-/// without this entry point a service could declare method limits that nothing
+/// without the resolver a service could declare method limits that nothing
 /// ever installed. `None` keeps the pre-existing global limit for every
 /// service.
 pub fn start_reactor_with_limits(
@@ -561,31 +586,6 @@ pub fn start_reactor_with_limits(
     let (event_tx, event_rx) = mpsc::channel(channel_capacity);
     let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
     tokio::spawn(accept_loop(node, event_tx, non_rpc_tx, resolve));
-    ReactorHandle {
-        event_rx,
-        non_rpc_rx,
-    }
-}
-
-/// Same as `start_reactor` but takes an explicit runtime handle.
-pub fn start_reactor_on(
-    handle: &tokio::runtime::Handle,
-    node: CoreNode,
-    channel_capacity: usize,
-) -> ReactorHandle {
-    start_reactor_on_with_limits(handle, node, channel_capacity, None)
-}
-
-/// As [`start_reactor_on`], with a per-method body-frame cap resolver.
-pub fn start_reactor_on_with_limits(
-    handle: &tokio::runtime::Handle,
-    node: CoreNode,
-    channel_capacity: usize,
-    resolve: Option<FrameLimitResolver>,
-) -> ReactorHandle {
-    let (event_tx, event_rx) = mpsc::channel(channel_capacity);
-    let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
-    handle.spawn(accept_loop(node, event_tx, non_rpc_tx, resolve));
     ReactorHandle {
         event_rx,
         non_rpc_rx,
@@ -765,11 +765,6 @@ pub mod test_hooks {
         }
     }
 }
-
-/// Physical response queue depth. The strict item and byte semaphores include
-/// the writer's in-flight item; this mpsc capacity is only the transport for
-/// those already-accounted items.
-pub const RESPONSE_CHANNEL_DEPTH: usize = RESPONSE_ITEM_LIMIT;
 
 /// Test-only counters so a test can assert on what the reader actually did --
 /// how many resolver calls it made and how many body bytes it materialized --
@@ -965,7 +960,7 @@ async fn handle_stream_inner(
 /// while armed, or when fired explicitly.
 struct CancelOnDrop {
     cancelled: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    signal: Arc<CancelSignal>,
     armed: bool,
 }
 
@@ -973,7 +968,7 @@ impl CancelOnDrop {
     fn fire(&mut self) {
         self.armed = false;
         self.cancelled.store(true, Ordering::Release);
-        self.notify.notify_waiters();
+        self.signal.fire();
     }
 }
 
@@ -1146,14 +1141,14 @@ async fn dispatch_one_call(
     let (resp_tx, mut resp_rx) = response_channel();
     let (req_tx, req_rx) = mpsc::channel(FRAME_CHANNEL_DEPTH);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_notify = Arc::new(Notify::new());
+    let cancel_notify = Arc::new(CancelSignal::new());
     // Any exit from here that is not a completed call -- `FLAG_CANCEL`, a
     // failed write, a framing violation, a dropped response channel -- marks
     // the call cancelled and wakes whoever waits on it. Disarmed only once
     // the terminal frame has been written.
     let mut cancel_guard = CancelOnDrop {
         cancelled: cancelled.clone(),
-        notify: cancel_notify.clone(),
+        signal: cancel_notify.clone(),
         armed: true,
     };
 
@@ -1441,5 +1436,59 @@ async fn dispatch_one_call(
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cancel_signal_tests {
+    use super::{CancelHook, CancelSignal};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Weak};
+
+    #[derive(Default)]
+    struct Count(AtomicUsize);
+
+    impl CancelHook for Count {
+        fn cancelled(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn hook(c: &Arc<Count>) -> Weak<dyn CancelHook> {
+        Arc::downgrade(c) as Weak<Count>
+    }
+
+    #[test]
+    fn a_hook_runs_once_on_fire() {
+        let sig = CancelSignal::new();
+        let c = Arc::new(Count::default());
+        sig.on_cancel(hook(&c));
+        sig.fire();
+        sig.fire();
+        assert_eq!(c.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_hook_installed_after_the_fire_runs_immediately() {
+        let sig = CancelSignal::new();
+        sig.fire();
+        let c = Arc::new(Count::default());
+        sig.on_cancel(hook(&c));
+        assert_eq!(c.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_unfired_signal_never_runs_its_hook_and_a_dropped_owner_is_skipped() {
+        let c = Arc::new(Count::default());
+        {
+            let sig = CancelSignal::new();
+            sig.on_cancel(hook(&c));
+        }
+        assert_eq!(c.0.load(Ordering::SeqCst), 0);
+        let sig = CancelSignal::new();
+        let gone = Arc::new(Count::default());
+        sig.on_cancel(hook(&gone));
+        drop(gone);
+        sig.fire(); // no owner: nothing to run, no panic
     }
 }

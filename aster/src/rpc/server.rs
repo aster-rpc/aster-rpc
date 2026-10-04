@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use fory_core::Fory;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::Notify;
 use tokio::time::Instant;
 use tracing::{Instrument, Level};
 
@@ -31,8 +30,8 @@ use aster_transport_core::framing::{
     FLAG_TRAILER,
 };
 use aster_transport_core::reactor::{
-    self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame, ResponseReserveError,
-    ResponseSender,
+    self, CancelSignal, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame,
+    ResponseReserveError, ResponseSender,
 };
 use aster_transport_core::{CoreConnection, CoreNode};
 
@@ -896,10 +895,23 @@ impl Dispatcher {
             peer = parts.peer_id.as_str(),
         );
         let method = header.method.clone();
+        // A peer cancel (or the stream failing under the call) drops the
+        // handler, as a deadline does, whatever the pattern: a unary handler
+        // has no send to fail, so it would otherwise run to completion.
+        let peer_cancel = peer_cancelled(parts.cancel_notify.clone(), parts.cancelled.clone());
         let Some(at) = deadline else {
-            svc.dispatch(&method, Call::new(parts, header, attributes, None, obs))
-                .instrument(span)
-                .await;
+            let handler = svc
+                .dispatch(&method, Call::new(parts, header, attributes, None, obs))
+                .instrument(span.clone());
+            tokio::select! {
+                biased;
+                () = handler => {}
+                () = peer_cancel => {
+                    span.in_scope(|| {
+                        tracing::debug!(target: DISPATCH, "peer cancelled; handler dropped")
+                    });
+                }
+            }
             return;
         };
         let cancelled = parts.cancelled.clone();
@@ -914,6 +926,12 @@ impl Dispatcher {
         tokio::select! {
             biased;
             () = handler => {}
+            () = peer_cancel => {
+                // No trailer: the peer is not listening for one (§6.0).
+                deadline_span.in_scope(|| {
+                    tracing::debug!(target: DISPATCH, "peer cancelled; handler dropped")
+                });
+            }
             _ = fired => {
                 // The handler future is dropped when this arm wins, which
                 // cancels it. Flag the call too, for anything it spawned.
@@ -1099,9 +1117,10 @@ pub struct CallParts {
     /// The connection itself, when the transport has one. Only foreign
     /// (binding) calls use it, to give handlers tunnels and addresses.
     pub connection: Option<CoreConnection>,
-    /// Signalled when `cancelled` is set, so a waiter need not poll it.
-    /// `None` for transports that only set the flag.
-    pub cancel_notify: Option<Arc<Notify>>,
+    /// Fired when `cancelled` is set, so a waiter need not poll it (and a
+    /// foreign call can hook it without a task). `None` for transports that
+    /// only set the flag.
+    pub cancel_notify: Option<Arc<CancelSignal>>,
 }
 
 impl CallParts {
@@ -1411,6 +1430,21 @@ pub(crate) fn reject_now(sender: ResponseSender, status: &RpcStatus) {
         }
         Err(_) => {}
     }
+}
+
+/// Resolves when the transport cancels the call (flag set, signal fired);
+/// never for a transport without a signal.
+async fn peer_cancelled(signal: Option<Arc<CancelSignal>>, cancelled: Arc<AtomicBool>) {
+    let Some(signal) = signal else {
+        return std::future::pending().await;
+    };
+    let notified = signal.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    notified.await;
 }
 
 /// Send a trailer-only error response (no data frame) before a [`Call`] exists.
