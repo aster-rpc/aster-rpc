@@ -6,7 +6,8 @@ import java.lang.foreign.ValueLayout;
 /** Top-level exception for all FFI-level errors. */
 public class IrohException extends RuntimeException {
   private final IrohStatus status;
-  private final int errorCode;
+  private int errorCode;
+  private int eventFlags;
 
   public IrohException(IrohStatus status, String message) {
     super(message);
@@ -32,6 +33,18 @@ public class IrohException extends RuntimeException {
 
   public int errorCode() {
     return errorCode;
+  }
+
+  /** The {@code flags} of the failing event (e.g. the RPC status of a coordination error). */
+  public int eventFlags() {
+    return eventFlags;
+  }
+
+  /** Record the failing event's {@code error_code} and {@code flags}; returns this. */
+  public IrohException withEvent(int errorCode, int flags) {
+    this.errorCode = errorCode;
+    this.eventFlags = flags;
+    return this;
   }
 
   /**
