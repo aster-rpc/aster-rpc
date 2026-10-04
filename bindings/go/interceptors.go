@@ -717,6 +717,16 @@ func (cb *CircuitBreakerInterceptor) beforeCall() error {
 	return nil
 }
 
+// BeforeCall is the gate a client call passes before it is sent: nil when the
+// call may proceed, else the UNAVAILABLE error of an open (or half-open and
+// busy) breaker. Every BeforeCall that returns nil must be followed by
+// RecordSuccess or RecordFailure for that call.
+func (cb *CircuitBreakerInterceptor) BeforeCall() error {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.beforeCall()
+}
+
 // RecordSuccess resets the breaker to closed.
 func (cb *CircuitBreakerInterceptor) RecordSuccess() {
 	cb.mu.Lock()
@@ -738,6 +748,12 @@ func (cb *CircuitBreakerInterceptor) recordFailure(err *RpcError) {
 	switch err.Code {
 	case StatusUnavailable, StatusInternal, StatusUnknown:
 	default:
+		// Not a verdict on the service's health, but the call is over: give
+		// back its half-open probe slot, or the breaker would stay half-open
+		// and refuse every later call (the Python reference leaks it).
+		if cb.state == circuitHalfOpen && cb.halfOpenCalls > 0 {
+			cb.halfOpenCalls--
+		}
 		return
 	}
 

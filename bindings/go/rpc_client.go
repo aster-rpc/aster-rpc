@@ -30,9 +30,11 @@ import (
 type CallOption func(*callOptions)
 
 type callOptions struct {
-	metadata  []MetadataEntry
-	sessionID uint32
-	version   int32
+	metadata     []MetadataEntry
+	sessionID    uint32
+	version      int32
+	interceptors []Interceptor
+	idempotent   *bool
 }
 
 // WithMetadata adds a request-metadata pair to the stream header.
@@ -65,6 +67,42 @@ func buildOptions(opts []CallOption) *callOptions {
 	return o
 }
 
+// WithInterceptors adds interceptors to this call, after the client's own
+// (see WithClientInterceptors for the semantics).
+func WithInterceptors(ics ...Interceptor) CallOption {
+	return func(o *callOptions) { o.interceptors = append(o.interceptors, ics...) }
+}
+
+// WithIdempotent overrides whether the call is idempotent (and so may be
+// retried by a RetryInterceptor). The default is the Idempotent flag of the
+// method in a Service registered with AsterClient.RegisterService, else false.
+func WithIdempotent(idempotent bool) CallOption {
+	return func(o *callOptions) { o.idempotent = &idempotent }
+}
+
+// ClientOption configures an AsterClient or RpcConnection.
+type ClientOption func(*clientOptions)
+
+type clientOptions struct {
+	interceptors []Interceptor
+}
+
+// WithClientInterceptors sets the interceptors applied to every call of the
+// client (see client_interceptors.go for the semantics: OnRequest in order,
+// OnResponse in order, OnError in reverse; the deadline, retry and circuit
+// breaker interceptors act on unary and client-streaming calls).
+func WithClientInterceptors(ics ...Interceptor) ClientOption {
+	return func(o *clientOptions) { o.interceptors = append(o.interceptors, ics...) }
+}
+
+func buildClientOptions(opts []ClientOption) *clientOptions {
+	o := &clientOptions{}
+	for _, f := range opts {
+		f(o)
+	}
+	return o
+}
+
 // AsterClient is an RPC client: a node, a codec and a cache of RpcConnections.
 //
 //	client, err := aster.StartClient(ctx, cfg)
@@ -75,30 +113,41 @@ func buildOptions(opts []CallOption) *callOptions {
 // Calls go straight to aster/1 (open gate); consumer admission is not
 // performed.
 type AsterClient struct {
-	node     *Node
-	ownsNode bool
-	codec    Codec
+	node         *Node
+	ownsNode     bool
+	codec        Codec
+	interceptors []Interceptor
 
-	mu    sync.Mutex
-	conns map[string]*RpcConnection
+	mu       sync.Mutex
+	conns    map[string]*RpcConnection
+	services map[string]*Service
 }
 
 // StartClient starts a client node (adds aster/1 to cfg.ALPNs).
-func StartClient(ctx context.Context, cfg AsterConfig) (*AsterClient, error) {
+func StartClient(ctx context.Context, cfg AsterConfig, opts ...ClientOption) (*AsterClient, error) {
 	node, err := StartNode(ctx, cfg, NodeOptions{ExtraALPNs: []string{AsterALPN}})
 	if err != nil {
 		return nil, err
 	}
-	return &AsterClient{node: node, ownsNode: true, codec: NewForyCodec(), conns: map[string]*RpcConnection{}}, nil
+	c := newClient(node, NewForyCodec(), opts)
+	c.ownsNode = true
+	return c, nil
+}
+
+func newClient(node *Node, codec Codec, opts []ClientOption) *AsterClient {
+	return &AsterClient{
+		node: node, codec: codec, interceptors: buildClientOptions(opts).interceptors,
+		conns: map[string]*RpcConnection{}, services: map[string]*Service{},
+	}
 }
 
 // NewClient is a client on an existing node, which the caller keeps owning.
 // A nil codec means a new ForyCodec.
-func NewClient(node *Node, codec Codec) *AsterClient {
+func NewClient(node *Node, codec Codec, opts ...ClientOption) *AsterClient {
 	if codec == nil {
 		codec = NewForyCodec()
 	}
-	return &AsterClient{node: node, codec: codec, conns: map[string]*RpcConnection{}}
+	return newClient(node, codec, opts)
 }
 
 // Node is the client's node.
@@ -108,8 +157,13 @@ func (c *AsterClient) Node() *Node { return c.node }
 func (c *AsterClient) Codec() Codec { return c.codec }
 
 // RegisterService registers the request/response types of svc with the
-// client's ForyCodec (WireTyped types are also registered on first use).
+// client's ForyCodec (WireTyped types are also registered on first use). It
+// also tells the client each method's Idempotent flag, which decides whether
+// a RetryInterceptor may retry a call (override per call with WithIdempotent).
 func (c *AsterClient) RegisterService(svc *Service) error {
+	c.mu.Lock()
+	c.services[svc.Name] = svc
+	c.mu.Unlock()
 	if fc, ok := c.codec.(*ForyCodec); ok {
 		return svc.RegisterTypes(fc)
 	}
@@ -128,7 +182,7 @@ func (c *AsterClient) Connect(ctx context.Context, addr *NodeAddr) (*RpcConnecti
 	if err != nil {
 		return nil, err
 	}
-	rc := &RpcConnection{conn: conn, codec: c.codec}
+	rc := &RpcConnection{conn: conn, codec: c.codec, interceptors: c.interceptors, client: c}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if prev, ok := c.conns[addr.EndpointID]; ok {
@@ -169,16 +223,18 @@ func (c *AsterClient) Close() error {
 // connection's pooled streams, streaming calls get their own. Safe for
 // concurrent calls.
 type RpcConnection struct {
-	conn  *Connection
-	codec Codec
+	conn         *Connection
+	codec        Codec
+	interceptors []Interceptor
+	client       *AsterClient // idempotency lookup; nil for NewRpcConnection
 }
 
 // NewRpcConnection wraps an aster/1 connection.
-func NewRpcConnection(conn *Connection, codec Codec) *RpcConnection {
+func NewRpcConnection(conn *Connection, codec Codec, opts ...ClientOption) *RpcConnection {
 	if codec == nil {
 		codec = NewForyCodec()
 	}
-	return &RpcConnection{conn: conn, codec: codec}
+	return &RpcConnection{conn: conn, codec: codec, interceptors: buildClientOptions(opts).interceptors}
 }
 
 // Connection is the underlying QUIC connection.
@@ -331,11 +387,19 @@ func (rc *RpcConnection) unary(ctx context.Context, opts nativeOptions, req []by
 // stream reset) and the server sees the cancel. The context's deadline is
 // enforced natively either way.
 func Call[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, opts ...CallOption) (*Resp, error) {
+	o := buildOptions(opts)
+	if ch := rc.chain(o); ch != nil {
+		return callUnaryIntercepted[Req, Resp](ctx, rc, ch, service, method, req, o)
+	}
+	return callUnary[Req, Resp](ctx, rc, service, method, req, o)
+}
+
+// callUnary is one unary attempt, without interceptors.
+func callUnary[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, o *callOptions) (*Resp, error) {
 	payload, err := rc.codec.Encode(req)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	o := buildOptions(opts)
 	var resp []byte
 	if ctx.Done() == nil {
 		nopts, err := lowerOptions(ctx, service, method, o)
@@ -529,13 +593,22 @@ func (c *rpcCall) recv() ([]byte, error) {
 // error (transport, decode, or a non-OK trailer as *RpcError) is the last
 // element. Breaking out early cancels the call.
 func CallServerStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, opts ...CallOption) iter.Seq2[*Resp, error] {
+	o := buildOptions(opts)
+	if ch := rc.chain(o); ch != nil {
+		return callServerStreamIntercepted[Req, Resp](ctx, rc, ch, service, method, req, o)
+	}
+	return callServerStream[Req, Resp](ctx, rc, service, method, req, o)
+}
+
+// callServerStream is a server-streaming call without interceptors.
+func callServerStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, o *callOptions) iter.Seq2[*Resp, error] {
 	return func(yield func(*Resp, error) bool) {
 		payload, err := rc.codec.Encode(req)
 		if err != nil {
 			yield(nil, fmt.Errorf("encode request: %w", err))
 			return
 		}
-		c, err := openCall(ctx, rc, PatternServerStream, service, method, buildOptions(opts))
+		c, err := openCall(ctx, rc, PatternServerStream, service, method, o)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -565,7 +638,16 @@ func CallServerStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 // CallClientStream makes a client-streaming call: every request from reqs
 // (each sent as it is produced), then one response.
 func CallClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, reqs iter.Seq[*Req], opts ...CallOption) (*Resp, error) {
-	c, err := openCall(ctx, rc, PatternClientStream, service, method, buildOptions(opts))
+	o := buildOptions(opts)
+	if ch := rc.chain(o); ch != nil {
+		return callClientStreamIntercepted[Req, Resp](ctx, rc, ch, service, method, reqs, o)
+	}
+	return callClientStream[Req, Resp](ctx, rc, service, method, reqs, o)
+}
+
+// callClientStream is one client-streaming attempt, without interceptors.
+func callClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, reqs iter.Seq[*Req], o *callOptions) (*Resp, error) {
+	c, err := openCall(ctx, rc, PatternClientStream, service, method, o)
 	if err != nil {
 		return nil, err
 	}
@@ -609,20 +691,32 @@ func CallClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 type BidiCall[Req, Resp any] struct {
 	c     *rpcCall
 	codec Codec
+	ic    *bidiIntercept // nil without interceptors
 }
 
 // OpenBidiStream opens a bidi-streaming call. Cancelling ctx cancels it.
 func OpenBidiStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, opts ...CallOption) (*BidiCall[Req, Resp], error) {
-	c, err := openCall(ctx, rc, PatternBidiStream, service, method, buildOptions(opts))
+	o := buildOptions(opts)
+	c, err := openCall(ctx, rc, PatternBidiStream, service, method, o)
 	if err != nil {
 		return nil, err
 	}
-	return &BidiCall[Req, Resp]{c: c, codec: rc.codec}, nil
+	b := &BidiCall[Req, Resp]{c: c, codec: rc.codec}
+	if ch := rc.chain(o); ch != nil {
+		b.ic = ch.newBidi(ctx, rc, service, method, o)
+	}
+	return b, nil
 }
 
 // Send sends one request immediately. After the call is over it returns an
 // error matching io.ErrClosedPipe; Recv then returns the trailer's outcome.
 func (b *BidiCall[Req, Resp]) Send(req *Req) error {
+	if b.ic != nil {
+		var err error
+		if req, err = interceptRequest(b.ic, req); err != nil {
+			return err
+		}
+	}
 	payload, err := b.codec.Encode(req)
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
@@ -649,9 +743,16 @@ func (b *BidiCall[Req, Resp]) CloseSend() error {
 func (b *BidiCall[Req, Resp]) Recv() (*Resp, error) {
 	p, err := b.c.recv()
 	if err != nil {
+		if b.ic != nil && err != io.EOF {
+			return nil, b.ic.failed(err)
+		}
 		return nil, err
 	}
-	return decodeResponse[Resp](b.codec, p)
+	resp, err := decodeResponse[Resp](b.codec, p)
+	if b.ic != nil {
+		return interceptResponse(b.ic, resp, err)
+	}
+	return resp, err
 }
 
 // Cancel cancels the call (FLAG_CANCEL + stream reset).
