@@ -394,6 +394,7 @@ public class ExposeTests
                 {
                     yield return chunk;
                     started.TrySetResult();
+                    await Task.Yield();
                 }
             }
             finally { stopped.TrySetResult(); }

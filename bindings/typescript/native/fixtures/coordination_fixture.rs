@@ -74,7 +74,7 @@ async fn main() {
     let mut servers: Vec<AsterServer> = Vec::with_capacity(voters);
     for index in 0..voters {
         let store = dir.join(format!("voter-{index}"));
-        std::fs::create_dir_all(&store).expect("a voter directory");
+        create_owner_only_dir(&store);
         let server = AsterServer::builder()
             .config(fixture.aster_config(index))
             .builtin_coordination(fixture.config(&store, index))
@@ -136,4 +136,21 @@ async fn main() {
     for server in servers {
         server.shutdown().await;
     }
+}
+
+/// Create `path` (and any missing parents) owner-only.
+///
+/// `create_dir_all` requests `0777` and the process umask subtracts from it, so
+/// under a `0` umask (a container default) the store would be `0777`, which the
+/// production open policy rightly refuses. Request `0700` explicitly instead of
+/// depending on the host.
+fn create_owner_only_dir(path: &std::path::Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path).expect("an owner-only directory");
 }

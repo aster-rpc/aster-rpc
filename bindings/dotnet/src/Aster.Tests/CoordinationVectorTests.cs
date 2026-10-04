@@ -78,7 +78,7 @@ public class CoordinationVectorTests
         Assert.Equal(CoordinationCodec.TagCoordinationFence, (byte)tags["CoordinationFence"]);
         Assert.Equal(CoordinationCodec.TagPlacementReport, (byte)tags["PlacementReport"]);
         foreach (var op in doc.GetProperty("mutation_ops").EnumerateArray())
-            Assert.NotNull(op.GetProperty("code").GetInt32());
+            _ = op.GetProperty("code").GetInt32(); // throws if absent or not an int
     }
 
     [Fact]

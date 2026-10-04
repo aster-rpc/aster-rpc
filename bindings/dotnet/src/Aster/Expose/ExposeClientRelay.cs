@@ -24,6 +24,18 @@ public static partial class ExposeClient
         IReadOnlyList<HttpHeader>? headers, Stream? body, ExposeRelayOptions? options = null, CancellationToken cancellationToken = default)
         => RelayStreamAsync(connection, serviceId, method, uri, headers, body == null ? null : FromStream(body), options, cancellationToken);
 
+    // `&` on locals is not allowed in async methods (CS9123); the native call lives in this synchronous helper.
+    private static unsafe (ulong Upload, ulong Response) StartRelay(Runtime rt, Connection connection, byte[] c4, ExposeRelayOptions? options)
+    {
+        using var scope = new NativeScope();
+        HttpRelayOptionsNative o = default;
+        Native.Check(Native.aster_http_relay_options_init(&o), "aster_http_relay_options_init");
+        if (options != null) { o.max_chunk = options.MaxChunk; o.upload_capacity = options.UploadCapacity; }
+        ulong up = 0, resp = 0;
+        Native.Check(Native.aster_expose_relay_stream(rt.Handle, connection.Handle.Value, scope.Bytes(c4), &o, &up, &resp), "aster_expose_relay_stream");
+        return (up, resp);
+    }
+
     /// <summary>
     /// Starts a <b>streaming</b> HTTP exchange with <paramref name="serviceId"/> exposed by the peer on
     /// <paramref name="connection"/> and returns as soon as the response head is in (full duplex: the head,
@@ -44,29 +56,18 @@ public static partial class ExposeClient
         byte[] c4 = Ucv1.EncodeExposeHttpRequest(new ExposeHttpRequestWire(serviceId, null, 0, (byte)HttpProtocolVersion.Http11, method, uri,
             headers ?? Array.Empty<HttpHeader>(), HttpBody.Stream));
         var rt = connection.Runtime;
-        ulong upload, response;
-        unsafe
-        {
-            using var scope = new NativeScope();
-            HttpRelayOptionsNative o = default;
-            Native.Check(Native.aster_http_relay_options_init(&o), "aster_http_relay_options_init");
-            if (options != null) { o.max_chunk = options.MaxChunk; o.upload_capacity = options.UploadCapacity; }
-            ulong up = 0, resp = 0;
-            Native.Check(Native.aster_expose_relay_stream(rt.Handle, connection.Handle.Value, scope.Bytes(c4), &o, &up, &resp), "aster_expose_relay_stream");
-            upload = up;
-            response = resp;
-        }
+        (ulong upload, ulong response) = StartRelay(rt, connection, c4, options);
         var relay = new ExposeStreamResponse(rt, upload, response, options?.MaxChunk ?? 0, body);
         try
         {
             await relay.AwaitHeadAsync(cancellationToken).ConfigureAwait(false);
             return relay;
         }
-        catch (ExposeRelayException e) when (relay.SourceError is { } src)
+        catch (ExposeRelayException) when (relay.SourceError is { } src)
         {
             await relay.AbandonAsync().ConfigureAwait(false);
             ExceptionDispatchInfo.Capture(src).Throw();
-            throw e; // unreachable
+            throw; // unreachable
         }
         catch
         {
