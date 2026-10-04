@@ -5,7 +5,7 @@
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Status (ABI 4.0, dynamic dispatch, 2026-10-04)
+## Status (ABI 4.2: upcalls, leases, expose; 2026-10-04)
 
 **Working at RPC parity for open-gate interop.** Go is in the `tests/interop/`
 matrix (Rust / Python / TypeScript / Java / .NET / Go, 6×6 = 36/36, identical
@@ -104,6 +104,43 @@ whose ABI major differs (4).
   `GrantOpen`, namespace grants, `GrantRecord`, `ReconcileGrant`);
   `conformance/vectors/grants.json` passes.
 
+- **ABI 4.1 upcalls, leases, topology** (`upcall.go`, `lease.go`, `ucv1.go`):
+  Rust asks Go a question as an event and Go answers by id. `NewUpcalls(rt,
+  capacity)` owns one poll goroutine (`aster_upcall_poll`, 100 ms slices) and
+  runs each upcall on its own goroutine; the handler's `context.Context` is
+  cancelled on a CANCEL event (timeout / abandoned / shutdown) and on `Close`.
+  `SetPolicy(kind, timeout, FailureModeOpen|Closed)` / `SetDefaultPolicy`
+  (default 5 s, fail closed; decision kinds take the failure mode when Go
+  gives no answer). Handlers: `HandleKind` (raw UCv1), `ServeLeaseSerializer`,
+  `ServeLeaseAuthorizer`, `ServeFencedResource`, `ServeAdmittedFilter`,
+  `ServeExposeAuthorize`, `ServeRoutePolicy`; an error answers ERROR,
+  `ErrUpcallUnimplemented` answers UNIMPLEMENTED, a panic answers ERROR.
+  `NewForeignLeaseSerializer` / `NewMemoryLeaseSerializer` (+ Go authorizer)
+  give `Acquire` -> `*Lease` (`Fence`, `Status`, `Watch`, `Release`, `Close`;
+  a refusal is `*LeaseDeniedError`, `errors.Is(ErrLeaseDenied)`),
+  `Snapshot`, `Revoke`; `NewForeignFencedResource` (`Mutate`;
+  `ErrMutationOutcomeUnknown` when it cannot answer); `NewAdmittedFilter`
+  (cached, batched; `IsAdmitted` / `Set` / `Invalidate` / `Prefetch` /
+  `Stats`) and `Node.EnableShared`. `aster_operation_cancel` does not stop a
+  native operation, so an `Acquire` whose context ends is not cancelled
+  natively: a lease granted late is released in the background. The UCv1 codec
+  (`Encode*` / `Decode*`, `ErrUCv1`, plain Go, no cgo) passes every
+  `conformance/vectors/upcalls.json` case. Not in the C ABI: placement.
+- **ABI 4.2 expose** (`expose.go`, `expose_http.go`): `NewExpose(node)`;
+  `Serve(alpns...)` (owns the node's accept loop) or `HandleConnection`;
+  `ExposeSocket(id, addr, authorizerUpcalls)` (nil authorizer admits every
+  peer: only for a gated node); `ExposeHTTP(up, bodies, id, http.Handler,
+  opts)` serves relayed requests with a `net/http` handler (small bodies
+  inline in one round trip; `Flush`, a large body or a declared `Trailer`
+  streams with backpressure; `ExposeInfoFrom(ctx)` gives the peer id; a panic
+  is a 500, `http.ErrAbortHandler` aborts the stream); `ExposeRoutePolicy`;
+  `Unexpose`. `HTTPBodies` is the body table (`Read` / `Write` / `TryWrite` /
+  `Finish` / `Abort`, `*BodyError` with `ErrBody*` sentinels). Consumer side:
+  `Connection.RelayRequest` / `RelayHTTP` (buffered) and `RequestRoute`. Close
+  the upcall table before the runtime, and `Unexpose` services that must stop
+  before closing the registry. The `ExposeInfo` / handler behaviour follows
+  `docs/_internal/bindings/upcall-design.md` section 6.
+
 Fixed in the catch-up: completions that arrived before their operation was
 registered were dropped (calls could hang); `ReadDatagram` rejected the
 `DATAGRAM_RECEIVED` completion; ticket encode/decode and the canonical/contract
@@ -165,6 +202,10 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `rpc_service.go` | `Service` / `NewSessionService`, `Unary` / `ServerStream` / `ClientStream` / `BidiStream`, `Requires`, `CallInfo`, `DynamicServiceJSON` |
 | `rpc_server.go` | `AsterServer` — dispatch events → typed handlers, sessions, cancellation, RpcStatus |
 | `rpc_client.go` | `AsterClient`, `RpcConnection`, `Call*` functions, `BidiCall` (`aster_rpc_*`) |
+| `ucv1.go`, `upcall_types.go` | UCv1 upcall payload codec and kind / status tables (plain Go, no cgo) |
+| `upcall.go` | ABI 4.1 `Upcalls`: poll goroutine, per-kind policy, typed serving, owned-operation helper |
+| `lease.go` | ABI 4.1 leases, fenced resource, topology admitted filter, `Node.EnableShared` |
+| `expose.go`, `expose_http.go` | ABI 4.2 expose registry, body table, relay / route requests, `net/http` handler adapter |
 | `dataplane.go` | ABI 3.3 blobs / tags / docs / paths / priority wrappers |
 | `pure.go`, `grants.go` | ABI 3.4 ids, HPKE, attestation, sealed grants |
 | `types.go` | Event types and event kind constants (`//go:build !cgo`) |
@@ -177,6 +218,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `cq_fake.go` | Goroutine-safe fake CQ for unit testing (`//go:build !cgo`) |
 | `cq_test.go` | 8 CQ state machine unit tests (`//go:build !cgo`) |
 | `abi_contract_test.go` + `abi_layout.go` | ABI contract tests — header struct sizes, ABI version, status names, node-backed endpoint (`//go:build cgo`) |
+| `ucv1_test.go`, `upcall_test.go`, `expose_test.go` | UCv1 vectors, upcall / lease / fenced / topology flows, expose flows (`-race -count=20` clean) |
 | `hostile_race_test.go` | 7 hostile race integration tests (`//go:build cgo`) |
 | `soak_test.go` | 2 soak/leak tests (`//go:build cgo`) |
 | `rpc_test.go`, `node_test.go`, `dataplane_test.go`, `vectors_test.go` | RPC (4 patterns, errors, deadlines, gate, interceptors, QUEUE_FULL), config/node/gate/admission, data plane, conformance vectors |
