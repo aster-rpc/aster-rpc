@@ -201,17 +201,20 @@ class _PlainConn:
 
 
 def _build_ctx(conn):
+    """A server-side CallContext for a call that arrived on ``conn``."""
     from types import SimpleNamespace
 
-    from aster.wire import StreamHeader
-    from aster.server import ConnectionContext, Server
-    from aster.service import MethodInfo
+    from aster._dispatch import ServerCallContext
 
-    fake_server = SimpleNamespace(_gate=None)
-    header = StreamHeader(service="Svc", method="M")
-    method_info = MethodInfo(name="M", pattern="unary")
-    conn_ctx = ConnectionContext(connection=conn, server=fake_server)  # type: ignore[arg-type]
-    return Server._build_call_context(fake_server, header, method_info, conn_ctx)  # type: ignore[arg-type]
+    call = SimpleNamespace(
+        wire_call_id=0, call_id=1, session_key=0, peer="peer", deadline_secs=0,
+        connection=lambda: conn,
+    )
+    method = SimpleNamespace(
+        service=SimpleNamespace(name="Svc"), name="M", streaming=False,
+        pattern="unary", idempotent=False,
+    )
+    return ServerCallContext(call, method, None)  # type: ignore[arg-type]
 
 
 def test_call_context_attaches_tunnel_handle_for_iroh_connection():

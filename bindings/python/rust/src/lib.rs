@@ -13,9 +13,11 @@
 //! - attestation.rs, grants.rs, lease.rs, topology.rs: plan P7 (values are
 //!   the frozen dataclasses of the matching `aster.*` Python modules)
 //! - coordination.rs: plan P9, the wrapped coordination client
+//! - rpc.rs: plan P4, `DispatchServer` / `ServerCall` (Python services on
+//!   `aster::rpc` dynamic dispatch) and `RpcClient` (pooled `RpcConnection`)
 //! - error.rs: Exception types
 //!
-//! The protocol clients, reactor and bare endpoints still drive the transport
+//! The protocol clients and bare endpoints still drive the transport
 //! core, reached from `aster` handles via `aster::binding_support`.
 
 use pyo3::prelude::*;
@@ -23,7 +25,6 @@ use pyo3::prelude::*;
 mod admission;
 mod attestation;
 mod blobs;
-mod call;
 mod config;
 mod contract;
 mod coordination;
@@ -38,6 +39,7 @@ mod lease;
 mod monitor;
 mod net;
 mod node;
+mod rpc;
 mod ticket;
 mod topology;
 mod wire;
@@ -85,7 +87,6 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     config::register(py, m)?;
     node::register(py, m)?;
     net::register(py, m)?;
-    call::register(py, m)?;
     blobs::register(py, m)?;
     docs::register(py, m)?;
     gossip::register(py, m)?;
@@ -100,6 +101,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     lease::register(py, m)?;
     topology::register(py, m)?;
     coordination::register(py, m)?;
+    rpc::register(py, m)?;
 
     Ok(())
 }

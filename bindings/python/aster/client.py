@@ -473,6 +473,10 @@ def create_client(
         if connection is None:
             raise ClientError("create_client requires either connection or transport")
         transport = IrohTransport(connection=connection, codec=codec)
+    bind = getattr(transport, "bind_service", None)
+    if bind is not None:
+        # The header carries the service's own version (not always 1).
+        bind(service_info.name, service_info.version)
 
     # Create client class dynamically
     client_cls = _generate_client_class(service_info)

@@ -11,7 +11,7 @@
 //!         ...
 //!
 //! The protocol clients (`blobs_client(node)`, `docs_client(node)`,
-//! `gossip_client(node)`, `net_client(node)`) and the RPC reactor still drive
+//! `gossip_client(node)`, `net_client(node)`) still drive
 //! the transport-core node, reached through `aster::binding_support`.
 
 use pyo3::prelude::*;
@@ -38,7 +38,7 @@ pub struct Node {
 }
 
 impl Node {
-    /// The transport-core node, for the protocol clients and the reactor.
+    /// The transport-core node, for the protocol clients.
     pub(crate) fn inner(&self) -> &CoreNode {
         self.inner.core_node()
     }

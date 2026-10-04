@@ -295,7 +295,7 @@ class ServiceContract:
                 response_type=resp_hash,
                 idempotent=method_info.idempotent,
                 default_timeout=timeout,
-                requires=None,
+                requires=_normalize_requires(getattr(method_info, "requires", None)),
             ))
 
         # Sort methods by NFC-normalized name
@@ -307,8 +307,27 @@ class ServiceContract:
             methods=method_defs,
             serialization_modes=ser_modes,
             scoped=scoped,
-            requires=None,
+            requires=_normalize_requires(getattr(service_info, "requires", None)),
+            producer_language="python" if "native" in ser_modes else "",
         )
+
+
+def _normalize_requires(req: Any) -> "CapabilityRequirement | None":
+    """A ``requires=`` value (requirement, role string or str enum) as a
+    ``CapabilityRequirement``. The contract commits to it: the server's
+    Gate 3 (in Rust) enforces exactly what the ``contract_id`` hashes."""
+    import enum as _enum
+
+    if req is None or isinstance(req, CapabilityRequirement):
+        if req is not None:
+            roles = [str(r.value) if isinstance(r, _enum.Enum) else str(r) for r in req.roles]
+            return CapabilityRequirement(kind=CapabilityKind(int(req.kind)), roles=roles)
+        return None
+    if isinstance(req, _enum.Enum):
+        return CapabilityRequirement(kind=CapabilityKind.ROLE, roles=[str(req.value)])
+    if isinstance(req, str):
+        return CapabilityRequirement(kind=CapabilityKind.ROLE, roles=[req])
+    return None
 
 
 def _resolve_type_hash(tp: type | None, type_hashes: dict[str, bytes]) -> bytes:

@@ -125,6 +125,48 @@ credential's attributes and expiry (capped by `ASTER_PEER_TTL_S`, default 24
 hours), and RPC handlers read those attributes from the same store.
 `server.gate.revoke(peer_id)` shuts the peer out of new connections.
 
+### How RPC is served
+
+The Python process runs only your handlers. Everything before a handler runs
+in Rust (`aster::rpc::Server` with dynamic dispatch):
+
+- **Registration.** At start, each `@service` class is lowered to a
+  `DynamicService` (`aster._lowering.lower(cls)`): name, version, scope,
+  methods and patterns, type hashes from the type-graph walker, `requires=`,
+  `idempotent=` and `timeout=`. Rust derives the contract from it, so
+  `aster._lowering.contract_id(cls)` equals `contract_id_from_service(cls)`.
+  The contract id commits to `requires=`, which Rust enforces.
+- **Pre-dispatch.** Rust decodes the header and looks up the service and
+  method. It checks the serialization mode and applies the session rules
+  (per-connection sessions, graveyard, `max_sessions_per_connection`). It
+  then runs Gate 3 (`requires=`, checked against the attributes your gate
+  recorded for the caller) and arms the deadline. A refused call never
+  reaches Python.
+- **Deadlines.** The effective deadline is the minimum of the caller's
+  deadline, the method's `timeout=` and the server's handler cap (300 s,
+  `AsterServer(handler_timeout=...)`, `<= 0` for none). Rust sends
+  `DEADLINE_EXCEEDED` and cancels the handler task. No server-side
+  `DeadlineInterceptor` is needed; the client half of `DeadlineInterceptor`
+  is unchanged.
+- **Errors.** An `RpcError` raised by a handler reaches the caller as-is
+  (code, message, details). A request payload that does not decode fails with
+  `INVALID_ARGUMENT`. Any other exception fails with `INTERNAL` and its
+  message. Unknown services fail with `NOT_FOUND`, and unknown methods with
+  `UNIMPLEMENTED`.
+- **Sessions.** A `scoped="session"` class is instantiated as
+  `cls(peer=...)` on a session's first call. Its `close()` runs when the
+  connection closes.
+- **Interceptors** run in Python as before: request, handler, response, and
+  for streams also error.
+- **Baseline services.** The node also serves `aster.ops.NodeInfo`, from
+  Rust.
+
+Clients (`create_client`, `AsterClient.client`, the proxies) call through the
+pooled Rust `RpcConnection` (`aster._aster.RpcClient`). A unary call is one
+native crossing. Streamed responses are read ahead in Rust and handed over in
+batches. Session ids come from the connection's shared counter, so Python and
+Rust clients on one connection never collide.
+
 ## 5. Gate 0: connection-level admission
 
 Gate 0 runs in Rust (the `aster` crate's `GatePolicy` and

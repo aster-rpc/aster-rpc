@@ -9,8 +9,8 @@ measurement, in the same schema as ``driver.rs``. Orchestrated by
         [--duration S] [--warmup S] [--concurrency 1,10,50,100] \\
         [--stream-frames 100,10000] [--client-stream 10000] [--skip-streams]
 
-Unary goes through the binding's pooled fast path (``create_client`` ->
-``AsterCall.unary_fast_path``). The request is the same as the Rust driver's:
+Unary goes through the binding's client (``create_client`` -> the native
+``RpcClient``, i.e. the pooled Rust ``RpcConnection``, since P4). The request is the same as the Rust driver's:
 ``EchoRequest(message="bench", count=1, data=64 x 0xab)``.
 """
 
@@ -27,7 +27,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests/interop/python"))
 
-from aster import RPC_ALPN, AsterTicket, EndpointConfig, IrohNode, NodeAddr, create_client, net_client  # noqa: E402
+from aster import RPC_ALPN, AsterConfig, AsterTicket, Node, NodeAddr, create_client, net_client  # noqa: E402
 from interop_echo import EchoRequest, InteropEcho  # noqa: E402
 
 
@@ -90,8 +90,8 @@ async def main() -> int:
     args = ap.parse_args()
     ints = lambda s: [int(x) for x in s.split(",") if x]  # noqa: E731
 
-    cfg = EndpointConfig(alpns=[RPC_ALPN], relay_mode="disabled", bind_addr="127.0.0.1:0")
-    node = await IrohNode.memory_with_alpns([RPC_ALPN], cfg)
+    cfg = AsterConfig(alpns=(RPC_ALPN,), relay_mode="disabled", bind_addr="127.0.0.1:0")
+    node = await Node.start(cfg)
     t = AsterTicket.from_string(args.ticket)
     addr = NodeAddr(endpoint_id=t.endpoint_id, relay_url=None, direct_addresses=t.direct_addrs)
     conn = await asyncio.wait_for(net_client(node).connect_node_addr(addr, RPC_ALPN), 20)

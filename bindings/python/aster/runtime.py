@@ -174,16 +174,18 @@ class AsterServer:
         nonce_store: Any | None = None,
         registry_namespace: str = "",
         max_sessions_per_connection: int | None = None,
+        handler_timeout: float | None = None,
     ) -> None:
         """Create an Aster RPC server.
 
-        .. note:: **Interceptors are not wired by default.** The server ships
-           with interceptors for rate limiting, deadline enforcement, auth,
-           capability checks, circuit breaking, metrics, audit logging, and
-           retry hints -- but none are active unless you pass them via the
-           ``interceptors`` parameter. For production use, wire at minimum
-           ``DeadlineInterceptor`` and ``RateLimitInterceptor``. All
-           interceptors live in ``aster.interceptors``.
+        .. note:: **Interceptors are not wired by default.** Deadlines
+           (caller deadline, method ``timeout``, ``handler_timeout``) and
+           ``requires=`` (Gate 3) are enforced by the Rust dispatcher. The
+           other interceptors -- rate limiting, auth, circuit breaking,
+           metrics, audit logging, retry hints -- are active only when you
+           pass them via the ``interceptors`` parameter; for production use,
+           wire at least ``RateLimitInterceptor``. All interceptors live in
+           ``aster.interceptors``.
 
         Args:
             services: List of ``@service``-decorated class instances to serve.
@@ -203,6 +205,9 @@ class AsterServer:
                 (open gate). Overrides ``config.allow_all_consumers``.
             gate: Optional :class:`aster.GatePolicy` to use as Gate 0
                 instead of the one derived from ``allow_all_consumers``.
+            handler_timeout: Cap on any handler, in seconds (default 300;
+                ``<= 0`` = no cap). Enforced in Rust together with the
+                caller's deadline and each method's ``timeout``.
             allow_all_producers: Must be ``True`` (the default). Producer
                 mesh admission (``aster.producer_admission``) is not
                 supported; ``False`` raises ``NotImplementedError``.
@@ -288,11 +293,9 @@ class AsterServer:
         self._services_in: list = list(services)
         self._channel_name = channel_name
         self._codec = codec
-        from aster.interceptors.deadline import DeadlineInterceptor
-        if interceptors is not None:
-            self._interceptors = list(interceptors)
-        else:
-            self._interceptors = [DeadlineInterceptor()]
+        # Deadlines are enforced by the Rust dispatcher (design sec. 2.4), so
+        # there is no server-side deadline interceptor by default.
+        self._interceptors = list(interceptors) if interceptors is not None else []
         self._nonce_store = nonce_store
 
         # Gate 0 (Rust): admits/rejects every inbound connection. Its store
@@ -306,6 +309,7 @@ class AsterServer:
         )
         self._registry_namespace = registry_namespace
         self._max_sessions_per_connection = max_sessions_per_connection
+        self._handler_timeout = handler_timeout
 
         # Populated by start()
         self._started: bool = False
@@ -440,33 +444,11 @@ class AsterServer:
         # so consumers can discover full contract metadata.
         await self._publish_contracts()
 
-        # ── Gate 3: capability interceptor & default-deny warning ────────
+        # ── Gate 3 & default-deny warning ────────────────────────────────
         #
-        # Build a service_name -> ServiceInfo map for the CapabilityInterceptor
-        # and check whether any service has authorization configured.
-        from .interceptors.capability import CapabilityInterceptor
-
-        svc_map: dict[str, Any] = {}
-        any_has_requires = False
-        for svc in self._services_in:
-            svc_cls = svc if inspect.isclass(svc) else type(svc)
-            info = getattr(svc_cls, "__aster_service_info__", None)
-            if info is not None:
-                svc_map[info.name] = info
-                if info.requires is not None:
-                    any_has_requires = True
-                for mi in info.methods.values():
-                    if mi.requires is not None:
-                        any_has_requires = True
-
-        # Auto-wire the CapabilityInterceptor when trust is configured
-        # (Gate 0 enabled) or when any service declares requires.
-        has_auth_interceptor = any(
-            isinstance(i, CapabilityInterceptor) for i in self._interceptors
-        )
-        if (not self._allow_all_consumers or any_has_requires) and not has_auth_interceptor:
-            # Prepend so capability is checked before application interceptors.
-            self._interceptors.insert(0, CapabilityInterceptor(svc_map))
+        # Gate 3 (`requires=`) is enforced by the Rust dispatcher against the
+        # attributes the gate recorded for the caller, so no Python
+        # capability interceptor is wired.
 
         # S12.2: default-deny startup warning.
         # When Gate 0 is disabled (allow_all_consumers=True), any service
@@ -511,6 +493,8 @@ class AsterServer:
             owns_endpoint=False,
             gate=self._gate,
             node=self._node,
+            on_non_rpc=self._on_non_rpc,
+            handler_timeout=self._handler_timeout,
         )
         if self._max_sessions_per_connection is not None:
             server_kwargs["max_sessions_per_connection"] = self._max_sessions_per_connection
@@ -755,19 +739,12 @@ class AsterServer:
 
         subtasks: list[asyncio.Task] = []
 
-        # Reactor is the only dispatch path (spec Sec. 6). Create it
-        # unconditionally and feed every RPC connection through it.
-        from aster._aster import create_reactor
-        reactor_handle, self._reactor_feeder = create_reactor(256)
+        # Rust accepts every connection on the node: `aster/1` calls are
+        # dispatched to the Python handlers, other ALPNs (consumer
+        # admission) arrive through `_on_non_rpc`.
+        self._server.start()
         subtasks.append(
-            asyncio.create_task(
-                self._reactor_dispatch_loop(reactor_handle),
-                name="aster-reactor-dispatch",
-            )
-        )
-
-        subtasks.append(
-            asyncio.create_task(self._accept_loop(), name="aster-accept")
+            asyncio.create_task(self._server.serve(), name="aster-dispatch")
         )
 
         # Auto-register endpoints with @aster for published services.
@@ -794,80 +771,28 @@ class AsterServer:
         self._serve_task = asyncio.create_task(_wait_all(), name="aster-server-serve")
         return self._serve_task
 
-    async def _accept_loop(self) -> None:
-        """Pull from ``node.accept_aster()`` and dispatch per ALPN."""
-        assert self._node is not None
-        assert self._server is not None
-        services_snapshot = list(self._service_summaries)
+    def _on_non_rpc(self, alpn: bytes, conn: Any) -> None:
+        """A connection on a non-RPC ALPN, handed over by the Rust acceptor."""
+        if alpn == ALPN_CONSUMER_ADMISSION:
+            # Always handle consumer admission -- even when
+            # allow_all_consumers=True the consumer needs the services list
+            # from the admission response.
+            services_snapshot = list(self._service_summaries)
+            asyncio.ensure_future(
+                handle_consumer_admission_connection(
+                    conn,
+                    root_pubkey=self._root_pubkey or b"\x00" * 32,
+                    gate=self._gate,
+                    nonce_store=self._nonce_store,
+                    services_getter=lambda: services_snapshot,
+                    registry_namespace_getter=lambda: self._registry_namespace,
+                    allow_unenrolled=self._allow_all_consumers,
+                )
+            )
+            return
         try:
-            while True:
-                try:
-                    alpn, conn = await self._node.accept_aster()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("AsterServer: accept_aster failed: %s", exc)
-                    continue
-
-                if alpn == RPC_ALPN:
-                    self._reactor_feeder.feed(conn)
-                elif alpn == ALPN_CONSUMER_ADMISSION:
-                    # Always handle consumer admission -- even when
-                    # allow_all_consumers=True the consumer needs the
-                    # services list from the admission response.
-                    asyncio.create_task(
-                        handle_consumer_admission_connection(
-                            conn,
-                            root_pubkey=self._root_pubkey or b"\x00" * 32,
-                            gate=self._gate,
-                            nonce_store=self._nonce_store,
-                            services_getter=lambda: services_snapshot,
-                            registry_namespace_getter=lambda: self._registry_namespace,
-                            allow_unenrolled=self._allow_all_consumers,
-                        ),
-                        name="aster-consumer-admission-conn",
-                    )
-                else:
-                    try:
-                        conn.close(0, b"unexpected alpn")
-                    except Exception:  # noqa: BLE001
-                        pass
-        except asyncio.CancelledError:
-            pass
-
-    async def _reactor_dispatch_loop(self, reactor_handle: Any) -> None:
-        """Pull reactor events and dispatch calls / reap closed connections."""
-        assert self._server is not None
-        try:
-            while True:
-                event = await reactor_handle.next_event()
-                if event is None:
-                    break
-                if event.kind == "call":
-                    response_sender = event.take_sender()
-                    if response_sender is None:
-                        continue
-                    request_receiver = event.take_request_receiver()
-                    cancel_flag = event.cancel_flag
-                    asyncio.create_task(
-                        self._server._dispatch_reactor_call(
-                            event.call_id,
-                            event.header_payload or b"",
-                            event.header_flags,
-                            event.request_payload or b"",
-                            event.request_flags,
-                            event.peer_id,
-                            event.connection_id,
-                            response_sender,
-                            request_receiver,
-                            cancel_flag,
-                        )
-                    )
-                elif event.kind == "connection_closed":
-                    self._server._on_reactor_connection_closed(
-                        event.connection_id, event.peer_id,
-                    )
-        except asyncio.CancelledError:
+            conn.close(0, b"unexpected alpn")
+        except Exception:  # noqa: BLE001
             pass
 
     async def drain(self, grace_period: float = 10.0) -> None:
@@ -890,6 +815,8 @@ class AsterServer:
             return
         self._closed = True
 
+        if self._server is not None and self._server._dispatcher is not None:
+            self._server._dispatcher.close()
         for t in self._subtasks:
             t.cancel()
         if self._serve_task is not None:
@@ -1182,13 +1109,11 @@ class AsterServer:
         """
         if self._server is None:
             return {}
-        out: dict[int, dict[str, int]] = {}
-        for conn_id, state in self._server._connection_sessions.items():
-            out[conn_id] = {
-                "active_session_count": len(state.active_sessions),
-                "last_opened_session_id": state.last_opened_session_id,
-            }
-        return out
+        if self._server._dispatcher is None:
+            return {}
+        # Session state lives in Rust; the dispatcher mirrors it from the
+        # session lifecycle events.
+        return self._server._dispatcher.connection_snapshot()
 
     # Back-compat alias -- used in tests
     @property
@@ -1442,12 +1367,6 @@ class AsterClient:
         # may run outside an event loop.
         self._rpc_conn_lock: asyncio.Lock | None = None
         self._clients: list[ServiceClient] = []
-        # Per-connection monotonic sessionId counter. Keyed by rpc_addr
-        # (same key as `_rpc_conns`) so each cached IrohConnection gets
-        # its own namespace. Counter starts at 0; `_next_session_id`
-        # returns `++counter`, so the first allocated id is 1 (spec §6:
-        # 0 is reserved for the SHARED pool).
-        self._session_id_counters: dict[str, int] = {}
         self._connected: bool = False
         self._closed: bool = False
         self._reconnect_attempts: int = 0
@@ -1510,7 +1429,6 @@ class AsterClient:
         services list. Uses exponential backoff on repeated failures.
         """
         self._rpc_conns.clear()
-        self._session_id_counters.clear()
         self._clients.clear()
         self._connected = False
 
@@ -1626,15 +1544,16 @@ class AsterClient:
             return conn
 
     def _next_session_id(self, rpc_addr_b64: str) -> int:
-        """Allocate a fresh monotonic sessionId for the connection
-        cached under `rpc_addr_b64`. Counter starts at 0; returned ids
-        start at 1 (spec §6: sessionId==0 is reserved for the SHARED
-        pool). Reset whenever the underlying connection is replaced
-        (e.g. after `reconnect`).
-        """
-        current = self._session_id_counters.get(rpc_addr_b64, 0) + 1
-        self._session_id_counters[rpc_addr_b64] = current
-        return current
+        """A fresh sessionId (never 0, which is the SHARED pool) for the
+        connection cached under `rpc_addr_b64`, from the connection's shared
+        counter in core: Python and Rust clients on one connection never
+        collide, and a replaced connection (e.g. after `reconnect`) starts
+        over."""
+        conn = self._rpc_conns.get(rpc_addr_b64)
+        if conn is None:
+            raise RuntimeError(f"no RPC connection for {rpc_addr_b64[:16]!r}")
+        from aster.transport.iroh import next_session_id
+        return next_session_id(conn)
 
     async def _ensure_registry_doc(self) -> Any | None:
         """Join the producer's registry doc lazily. Only called from dynamic

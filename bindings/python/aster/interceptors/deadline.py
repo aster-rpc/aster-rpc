@@ -1,9 +1,13 @@
-"""Deadline enforcement interceptor.
+"""Deadline interceptor (client side).
 
 Spec reference: S6.8.1
 
-Validates deadlines on receipt (with configurable clock-skew tolerance)
-and enforces them during call execution.
+On the client, ``timeout_seconds`` bounds each attempt and ``on_request``
+refuses to send a call whose deadline has already passed (with a
+configurable clock-skew tolerance). Servers no longer need it: the Rust
+dispatcher enforces the caller's deadline, the method ``timeout`` and the
+server's handler cap, sends ``DEADLINE_EXCEEDED`` and cancels the handler
+(plan P4). Wiring it on a server still works and only adds the receipt check.
 """
 
 from __future__ import annotations

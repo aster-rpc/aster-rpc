@@ -230,3 +230,12 @@ _RPC_ERROR_TYPES: dict[StatusCode, type[RpcError]] = {
     StatusCode.UNAUTHENTICATED: UnauthenticatedError,
     StatusCode.CONTRACT_VIOLATION: ContractViolationError,
 }
+
+def _from_wire(code: int, message: str = "", details: dict[str, str] | None = None) -> RpcError:
+    """The ``RpcError`` for a status received on the wire (used by the
+    native client). Codes this binding does not know become ``UNKNOWN``."""
+    try:
+        status = StatusCode(code)
+    except ValueError:
+        status = StatusCode.UNKNOWN
+    return RpcError.from_status(status, message, details or None)
