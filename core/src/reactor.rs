@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::framing::{FLAG_CANCEL, FLAG_END_STREAM, FLAG_HEADER};
 use crate::{CoreClosedInfo, CoreConnection, CoreNode, CoreRecvStream, CoreSendStream};
@@ -87,6 +87,11 @@ pub struct IncomingCall {
     /// `aster_reactor_check_cancelled`) to stop early instead of running
     /// to natural completion. Cleared/destroyed when the call ends.
     pub cancelled: Arc<AtomicBool>,
+    /// Signalled (`notify_waiters`) right after `cancelled` is set, so a
+    /// consumer can await a cancellation instead of polling the flag. A
+    /// waiter must enable its `Notified` future and then re-check
+    /// `cancelled` before awaiting, since `notify_waiters` stores no permit.
+    pub cancel_notify: Arc<Notify>,
 }
 
 /// One additional request frame delivered to the binding's per-call
@@ -621,6 +626,33 @@ async fn accept_loop(
     }
 }
 
+/// Set once, when a connection's accept loop ends (the connection is gone).
+/// Shared by every call on the connection, so a call can learn the peer left
+/// without each one registering on the transport's own close future, which
+/// takes the connection-state lock every stream on it contends for.
+#[derive(Default)]
+struct ConnectionGone {
+    gone: AtomicBool,
+    notify: Notify,
+}
+
+impl ConnectionGone {
+    fn set(&self) {
+        self.gone.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.gone.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 async fn connection_loop(
     conn: CoreConnection,
     event_tx: mpsc::Sender<ReactorEvent>,
@@ -628,6 +660,7 @@ async fn connection_loop(
 ) {
     let peer_id = conn.remote_id();
     let connection_id = next_connection_id();
+    let gone = Arc::new(ConnectionGone::default());
 
     // `accept_aster_bi` transparently dispatches `FLAG_TUNNEL` streams
     // via the per-connection tunnel registry, so the reactor only ever
@@ -637,14 +670,18 @@ async fn connection_loop(
         let peer = peer_id.clone();
         let conn_clone = conn.clone();
         let res = resolve.clone();
+        let gone = gone.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_stream_inner(send, recv, peer, connection_id, conn_clone, tx, res).await
+                handle_stream_inner(send, recv, peer, connection_id, conn_clone, tx, res, gone)
+                    .await
             {
                 tracing::debug!("reactor stream error: {e}");
             }
         });
     }
+
+    gone.set();
 
     // Connection closed or accept_bi returned an error — emit a
     // ConnectionClosed event so the binding can reap per-connection
@@ -821,6 +858,7 @@ async fn read_all_frames(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_inner(
     send: CoreSendStream,
     recv: CoreRecvStream,
@@ -829,6 +867,7 @@ async fn handle_stream_inner(
     connection: CoreConnection,
     call_tx: mpsc::Sender<ReactorEvent>,
     resolve: Option<FrameLimitResolver>,
+    gone: Arc<ConnectionGone>,
 ) -> Result<()> {
     let stream_id = next_stream_id();
 
@@ -845,6 +884,7 @@ async fn handle_stream_inner(
         connection,
         stream_id,
         call_tx,
+        &gone,
     )
     .await;
 
@@ -852,6 +892,30 @@ async fn handle_stream_inner(
     // on EOF; for misbehaving peers we cut it off here.
     reader_handle.abort();
     result
+}
+
+/// Marks a call cancelled -- flag first, then the notify -- when dropped
+/// while armed, or when fired explicitly.
+struct CancelOnDrop {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn fire(&mut self) {
+        self.armed = false;
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.fire();
+        }
+    }
 }
 
 /// Outcome of dispatching one call through `dispatch_one_call`.
@@ -907,6 +971,7 @@ async fn dispatch_stream(
     connection: CoreConnection,
     stream_id: u64,
     call_tx: mpsc::Sender<ReactorEvent>,
+    gone: &ConnectionGone,
 ) -> Result<()> {
     // Call N+1's header, when the previous call had already read it off the
     // wire while finishing its output.
@@ -943,6 +1008,7 @@ async fn dispatch_stream(
             &connection,
             stream_id,
             &call_tx,
+            gone,
             header.payload,
             header.flags,
             first_req.payload,
@@ -975,6 +1041,7 @@ async fn dispatch_one_call(
     connection: &CoreConnection,
     stream_id: u64,
     call_tx: &mpsc::Sender<ReactorEvent>,
+    gone: &ConnectionGone,
     header_payload: Vec<u8>,
     header_flags: u8,
     first_request_payload: Vec<u8>,
@@ -997,6 +1064,16 @@ async fn dispatch_one_call(
     let (resp_tx, mut resp_rx) = response_channel();
     let (req_tx, req_rx) = mpsc::channel(FRAME_CHANNEL_DEPTH);
     let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_notify = Arc::new(Notify::new());
+    // Any exit from here that is not a completed call -- `FLAG_CANCEL`, a
+    // failed write, a framing violation, a dropped response channel -- marks
+    // the call cancelled and wakes whoever waits on it. Disarmed only once
+    // the terminal frame has been written.
+    let mut cancel_guard = CancelOnDrop {
+        cancelled: cancelled.clone(),
+        notify: cancel_notify.clone(),
+        armed: true,
+    };
 
     // No `request_done` flag any more: the wire branch is unconditionally
     // enabled, so there is nothing to gate. Whether the request stream has
@@ -1018,6 +1095,7 @@ async fn dispatch_one_call(
             response_sender: resp_tx,
             request_receiver: req_rx,
             cancelled: cancelled.clone(),
+            cancel_notify: cancel_notify.clone(),
         }))
         .await
         .map_err(|_| anyhow!("reactor channel closed"))?;
@@ -1087,7 +1165,7 @@ async fn dispatch_one_call(
                             // closed channel: `SendError` in Rust, NOT_FOUND
                             // from the C ABI. One mechanism, no per-binding
                             // cancellation plumbing.
-                            cancelled.store(true, Ordering::Release);
+                            cancel_guard.fire();
                             // Close the handler's input.
                             drop(req_tx_opt.take());
                             // Abort the writer and AWAIT it, so `resp_rx` is
@@ -1213,7 +1291,24 @@ async fn dispatch_one_call(
                         drop(req_tx_opt.take());
                         // Let the writer flush whatever the binding already
                         // queued (often the trailer) before we report EOF.
-                        let _ = (&mut writer).await;
+                        //
+                        // EOF is also what a lost connection looks like from
+                        // here. Then a handler that is not producing would
+                        // keep the writer -- and this call -- alive until its
+                        // deadline, never learning the peer is gone. Racing
+                        // the connection's close turns that into a cancel.
+                        tokio::select! {
+                            biased;
+                            written = &mut writer => {
+                                if let Ok(true) = written {
+                                    cancel_guard.armed = false;
+                                }
+                            }
+                            () = gone.wait() => {
+                                writer.abort();
+                                let _ = (&mut writer).await;
+                            }
+                        }
                         return Ok(CallOutcome::StreamEof);
                     }
                 }
@@ -1228,7 +1323,10 @@ async fn dispatch_one_call(
             // we return cleanly from dispatch_stream.
             written = &mut writer => {
                 return match written {
-                    Ok(true) => Ok(CallOutcome::Complete(pending_header.take())),
+                    Ok(true) => {
+                        cancel_guard.armed = false;
+                        Ok(CallOutcome::Complete(pending_header.take()))
+                    }
                     Ok(false) => Err(anyhow!(
                         "binding dropped response channel without trailer"
                     )),
