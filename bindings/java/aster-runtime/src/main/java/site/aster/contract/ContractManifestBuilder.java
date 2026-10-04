@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import site.aster.annotations.ContractDefault;
 import site.aster.server.spi.FieldMetadata;
 import site.aster.server.spi.MethodDescriptor;
 import site.aster.server.spi.MethodDispatcher;
@@ -314,7 +315,12 @@ public final class ContractManifestBuilder {
     List<Map<String, Object>> out = new ArrayList<>();
     if (cls.isRecord()) {
       for (RecordComponent rc : cls.getRecordComponents()) {
-        out.add(fieldDict(rc.getName(), rc.getGenericType(), meta.fields()));
+        out.add(
+            fieldDict(
+                rc.getName(),
+                rc.getGenericType(),
+                rc.getAnnotation(ContractDefault.class),
+                meta.fields()));
       }
       return out;
     }
@@ -322,23 +328,33 @@ public final class ContractManifestBuilder {
       if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.isSynthetic()) {
         continue;
       }
-      out.add(fieldDict(f.getName(), f.getGenericType(), meta.fields()));
+      out.add(
+          fieldDict(
+              f.getName(),
+              f.getGenericType(),
+              f.getAnnotation(ContractDefault.class),
+              meta.fields()));
     }
     return out;
   }
 
   private static Map<String, Object> fieldDict(
-      String name, Type t, Map<String, FieldMetadata> fieldMeta) {
+      String name, Type t, ContractDefault contractDefault, Map<String, FieldMetadata> fieldMeta) {
     Map<String, Object> info = classify(t);
     Map<String, Object> dict = new LinkedHashMap<>();
     dict.put("name", name);
     dict.put("kind", info.get("kind"));
     dict.put("nullable", info.getOrDefault("nullable", false));
-    // Records always provide all fields at construction time — every record field is "required"
-    // from the manifest's perspective; scalar defaults would need metadata we don't introspect.
-    dict.put("required", true);
-    dict.put("default_value", null);
-    dict.put("default_kind", "none");
+    // A field is optional in the manifest only if it declares a contract default
+    // (@ContractDefault); a plain Java initializer / record component is "required".
+    if (contractDefault == null) {
+      dict.put("required", true);
+      dict.put("default_value", null);
+      dict.put("default_kind", "none");
+    } else {
+      dict.put("required", false);
+      putContractDefault(dict, info, contractDefault);
+    }
     FieldMetadata fm = fieldMeta.getOrDefault(name, FieldMetadata.EMPTY);
     dict.put("description", fm.description());
     dict.put("tags", fm.tags());
@@ -361,6 +377,37 @@ public final class ContractManifestBuilder {
     }
     dict.put("properties", Map.of());
     return dict;
+  }
+
+  /** {@code default_value} / {@code default_kind} of a contract default (already validated). */
+  private static void putContractDefault(
+      Map<String, Object> dict, Map<String, Object> info, ContractDefault cd) {
+    switch (String.valueOf(info.get("kind"))) {
+      case "list" -> {
+        dict.put("default_value", List.of());
+        dict.put("default_kind", "empty_list");
+      }
+      case "map" -> {
+        dict.put("default_value", Map.of());
+        dict.put("default_kind", "empty_map");
+      }
+      case "bool" -> {
+        dict.put("default_value", Boolean.parseBoolean(cd.value()));
+        dict.put("default_kind", "value");
+      }
+      case "int" -> {
+        dict.put("default_value", Long.parseLong(cd.value()));
+        dict.put("default_kind", "value");
+      }
+      case "float" -> {
+        dict.put("default_value", Double.parseDouble(cd.value()));
+        dict.put("default_kind", "value");
+      }
+      default -> {
+        dict.put("default_value", cd.value());
+        dict.put("default_kind", "value");
+      }
+    }
   }
 
   private static Map<String, Object> classify(Type t) {

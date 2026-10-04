@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import site.aster.annotations.ContractDefault;
 
 /**
  * Turn a {@link TypeGraphWalker.TypeGraph} into a map of {@link TypeDef}s with resolved {@code
@@ -258,20 +259,31 @@ public final class ContractIdentityResolver {
     List<FieldDef> fields = new ArrayList<>();
     int idx = 1;
     for (RecordOrClassField f : fieldsOf(cls)) {
-      fields.add(buildFieldDef(f.name(), idx, f.type(), backEdges, typeHashes, sccMembers));
+      fields.add(
+          buildFieldDef(
+              id.name(),
+              f.name(),
+              idx,
+              f.type(),
+              f.contractDefault(),
+              backEdges,
+              typeHashes,
+              sccMembers));
       idx++;
     }
     return new TypeDef(
         TypeDefKind.MESSAGE, id.packageName(), id.name(), fields, List.of(), List.of());
   }
 
-  private record RecordOrClassField(String name, Type type) {}
+  private record RecordOrClassField(String name, Type type, ContractDefault contractDefault) {}
 
   private static List<RecordOrClassField> fieldsOf(Class<?> cls) {
     List<RecordOrClassField> out = new ArrayList<>();
     if (cls.isRecord()) {
       for (RecordComponent rc : cls.getRecordComponents()) {
-        out.add(new RecordOrClassField(rc.getName(), rc.getGenericType()));
+        out.add(
+            new RecordOrClassField(
+                rc.getName(), rc.getGenericType(), rc.getAnnotation(ContractDefault.class)));
       }
       return out;
     }
@@ -279,15 +291,19 @@ public final class ContractIdentityResolver {
       if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.isSynthetic()) {
         continue;
       }
-      out.add(new RecordOrClassField(f.getName(), f.getGenericType()));
+      out.add(
+          new RecordOrClassField(
+              f.getName(), f.getGenericType(), f.getAnnotation(ContractDefault.class)));
     }
     return out;
   }
 
   static FieldDef buildFieldDef(
+      String owner,
       String name,
       int id,
       Type t,
+      ContractDefault contractDefault,
       Set<String> backEdges,
       Map<String, String> typeHashes,
       Set<String> sccMembers) {
@@ -329,6 +345,17 @@ public final class ContractIdentityResolver {
 
     ResolvedType resolved = resolveType(valueType, backEdges, typeHashes, sccMembers);
 
+    // §11.3.2.3: required=false plus the canonical default bytes iff the field declares a contract
+    // default; a plain Java initializer / record component is never one.
+    boolean required = true;
+    String defaultValue = "";
+    if (contractDefault != null) {
+      required = false;
+      defaultValue =
+          ContractDefaults.lower(
+              owner, name, contractDefault, container, resolved.kind, resolved.primitive);
+    }
+
     return new FieldDef(
         id,
         name,
@@ -342,8 +369,8 @@ public final class ContractIdentityResolver {
         containerKeyKind,
         containerKeyPrimitive,
         containerKeyRef,
-        true,
-        "");
+        required,
+        defaultValue);
   }
 
   private record ResolvedType(
