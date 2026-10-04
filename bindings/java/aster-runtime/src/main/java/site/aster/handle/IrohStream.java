@@ -64,6 +64,22 @@ public class IrohStream implements AutoCloseable {
   private final ConcurrentHashMap<Long, CompletableFuture<byte[]>> pendingReads =
       new ConcurrentHashMap<>();
 
+  /** Guards {@link #pendingReads} and {@link #earlyFrames}; see {@link #readAsync}. */
+  private final Object readLock = new Object();
+
+  /**
+   * Frames whose {@code FRAME_RECEIVED} arrived before {@link #readAsync} registered its future
+   * (the op id is only known once {@code aster_stream_read} returns). Bounded: frames that no read
+   * ever claims (Publisher-only consumers) must not accumulate.
+   */
+  private final java.util.Map<Long, byte[]> earlyFrames =
+      new java.util.LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(java.util.Map.Entry<Long, byte[]> eldest) {
+          return size() > 64;
+        }
+      };
+
   IrohStream(IrohRuntime runtime, long handle) {
     this(runtime, handle, 0);
   }
@@ -158,7 +174,13 @@ public class IrohStream implements AutoCloseable {
               }
               // Complete any pending readAsync future keyed by this op_id
               long opId = event.operation();
-              CompletableFuture<byte[]> readFuture = pendingReads.remove(opId);
+              CompletableFuture<byte[]> readFuture;
+              synchronized (readLock) {
+                readFuture = pendingReads.remove(opId);
+                if (readFuture == null && payload != null) {
+                  earlyFrames.put(opId, payload);
+                }
+              }
               if (readFuture != null && payload != null) {
                 readFuture.complete(payload);
               }
@@ -211,6 +233,14 @@ public class IrohStream implements AutoCloseable {
 
     long messageId = nextMessageId.incrementAndGet();
 
+    // Track by message_id so the SEND_COMPLETED handler can complete it. The message id is ours, so
+    // the future must be in place *before* the native write starts: a fast write can have its
+    // SEND_COMPLETED polled before this method returns, and an unregistered completion is dropped.
+    // Note: We do NOT register with registry - SEND_COMPLETED goes to inbound handlers
+    // via pendingSends, not to registry.complete().
+    CompletableFuture<Void> sendFuture = new CompletableFuture<>();
+    pendingSends.put(messageId, sendFuture);
+
     // Build aster_bytes_t payload struct inline
     var payloadSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
     var payloadCopy = alloc.allocate(payload.length);
@@ -226,20 +256,14 @@ public class IrohStream implements AutoCloseable {
           (int)
               streamWrite.invoke(runtime.nativeHandle(), sendHandle, payloadSeg, messageId, opSeg);
       if (status != 0) {
+        pendingSends.remove(messageId);
         throw new IrohException(
             IrohStatus.fromCode(status), "aster_stream_write failed: " + status);
       }
     } catch (Throwable t) {
+      pendingSends.remove(messageId);
       throw new IrohException("aster_stream_write threw: " + t.getMessage());
     }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-
-    // Track by message_id so the SEND_COMPLETED handler can complete it.
-    // Note: We do NOT register with registry - SEND_COMPLETED goes to inbound handlers
-    // via pendingSends, not to registry.complete().
-    CompletableFuture<Void> sendFuture = new CompletableFuture<>();
-    pendingSends.put(messageId, sendFuture);
 
     return sendFuture;
   }
@@ -309,8 +333,18 @@ public class IrohStream implements AutoCloseable {
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
     CompletableFuture<byte[]> readFuture = new CompletableFuture<>();
     runtime.registry().register(opId);
-    // Track so FRAME_RECEIVED handler can complete this future with the frame bytes
-    pendingReads.put(opId, readFuture);
+    // Track so FRAME_RECEIVED handler can complete this future with the frame bytes. The frame may
+    // already have been polled (a fast read, or this thread descheduled): claim it if so.
+    byte[] early;
+    synchronized (readLock) {
+      early = earlyFrames.remove(opId);
+      if (early == null) {
+        pendingReads.put(opId, readFuture);
+      }
+    }
+    if (early != null) {
+      readFuture.complete(early);
+    }
     return readFuture;
   }
 
