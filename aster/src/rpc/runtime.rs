@@ -72,6 +72,7 @@ pub struct AsterServerBuilder {
     session_appliers: Vec<Box<dyn FnOnce(Server) -> Server + Send>>,
     extra_alpns: Vec<Vec<u8>>,
     max_sessions_per_connection: Option<usize>,
+    handler_timeout: Option<Option<std::time::Duration>>,
     // Non-RPC ALPN handlers; the ALPN is also registered on the node.
     routes: Vec<(Vec<u8>, AlpnHandler)>,
     // Baseline `aster.ops.NodeInfo` (default ON; inverted so Default works).
@@ -174,6 +175,13 @@ impl AsterServerBuilder {
     /// [`Server::max_sessions_per_connection`](super::server::Server::max_sessions_per_connection).
     pub fn max_sessions_per_connection(mut self, max: usize) -> Self {
         self.max_sessions_per_connection = Some(max);
+        self
+    }
+
+    /// Cap how long any handler may run (`None` = no cap). See
+    /// [`Server::handler_timeout`](super::server::Server::handler_timeout).
+    pub fn handler_timeout(mut self, max: Option<std::time::Duration>) -> Self {
+        self.handler_timeout = Some(max);
         self
     }
 
@@ -423,6 +431,9 @@ impl AsterServerBuilder {
         }
         if let Some(max) = self.max_sessions_per_connection {
             server = server.max_sessions_per_connection(max);
+        }
+        if let Some(max) = self.handler_timeout {
+            server = server.handler_timeout(max);
         }
         for svc in self.services {
             server = server.register_arc(svc);

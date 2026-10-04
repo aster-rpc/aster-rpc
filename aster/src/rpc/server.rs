@@ -17,9 +17,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fory_core::Fory;
 use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
 
 use aster_transport_core::contract::evaluate_capability;
 use aster_transport_core::framing::{
@@ -36,6 +38,7 @@ use super::auth::{AttributeStore, AuthContext, Authenticator, CapabilityRequirem
 use super::codec::{
     decode_stream_header, encode_rpc_status, RpcStatus, SerializationMode, StreamHeader,
 };
+use super::deadline::DeadlineQueue;
 use super::sessions::{
     check_shared, missing_session, ServiceKey, SessionFactory, SessionStore,
     DEFAULT_MAX_SESSIONS_PER_CONNECTION,
@@ -106,6 +109,15 @@ pub trait ServiceDispatch: Send + Sync + 'static {
     fn iroh_only(&self) -> bool {
         false
     }
+    /// A default server-side timeout for `method`. `None` (default) = no
+    /// method default. The handler's effective deadline is the minimum of the
+    /// caller's `StreamHeader.deadline`, this, and the server's
+    /// [`handler_timeout`](Server::handler_timeout); when it passes, the
+    /// handler is cancelled (its future dropped) and the caller receives
+    /// `DEADLINE_EXCEEDED`.
+    fn method_timeout(&self, _method: &str) -> Option<Duration> {
+        None
+    }
     /// Handle one call. `method` is `StreamHeader.method` (guaranteed to be in
     /// [`methods`](ServiceDispatch::methods) when that table is non-empty). The
     /// handler MUST terminate the call by consuming `call` via [`Call::respond`]
@@ -140,7 +152,14 @@ pub struct Server {
     authenticator: Option<Arc<dyn Authenticator>>,
     routes: AlpnRoutes,
     max_sessions_per_connection: usize,
+    handler_timeout: Option<Duration>,
+    /// One timer facility per server, shared by every dispatcher it hands out.
+    deadlines: DeadlineQueue,
 }
+
+/// The default cap on how long any handler may run: Python's
+/// `MAX_HANDLER_TIMEOUT_S`. See [`Server::handler_timeout`].
+pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl Server {
     /// Create a server over `node`. The node must have been started with the
@@ -155,7 +174,24 @@ impl Server {
             authenticator: None,
             routes: HashMap::new(),
             max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            deadlines: DeadlineQueue::default(),
         }
+    }
+
+    /// The longest any handler may run, whatever the caller asked for
+    /// (default [`DEFAULT_HANDLER_TIMEOUT`], 300 s, matching the Python
+    /// server). A call's effective deadline is the minimum of this, the
+    /// caller's relative `StreamHeader.deadline` (measured from receipt), and
+    /// the method's [`method_timeout`](ServiceDispatch::method_timeout). When
+    /// it passes, the handler's future is dropped, [`Call::is_cancelled`]
+    /// turns true, and the caller gets a `DEADLINE_EXCEEDED` trailer.
+    ///
+    /// `None` removes the cap, so only caller and method deadlines apply. Use
+    /// that for services with legitimately unbounded streams.
+    pub fn handler_timeout(mut self, max: Option<Duration>) -> Self {
+        self.handler_timeout = max;
+        self
     }
 
     /// Cap the number of **active** sessions one connection may hold
@@ -307,6 +343,8 @@ impl Server {
             sessions: Arc::new(SessionStore::new(self.max_sessions_per_connection)),
             attributes: self.attributes.clone(),
             authenticator: self.authenticator.clone(),
+            handler_timeout: self.handler_timeout,
+            deadlines: self.deadlines.clone(),
         }
     }
 
@@ -392,6 +430,8 @@ pub struct Dispatcher {
     sessions: Arc<SessionStore>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
+    handler_timeout: Option<Duration>,
+    deadlines: DeadlineQueue,
 }
 
 impl Dispatcher {
@@ -558,12 +598,25 @@ impl Dispatcher {
             },
         };
 
+        // The deadline clock starts at receipt (the header carries relative
+        // seconds; Aster-SPEC §6.8).
+        let deadline = [
+            self.handler_timeout,
+            (header.deadline > 0).then(|| Duration::from_secs(header.deadline as u64)),
+            meta.method_timeout(&header.method),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|t| Instant::now() + t);
+
         let routed = Routed {
             header,
             key,
             meta,
             target,
             attributes: HashMap::new(),
+            deadline,
         };
         if self.authenticator.is_some() {
             return Route::Authenticate(routed);
@@ -601,6 +654,7 @@ impl Dispatcher {
             header,
             target,
             attributes,
+            deadline,
             ..
         } = routed;
         let svc = match target {
@@ -632,8 +686,28 @@ impl Dispatcher {
         }
 
         let method = header.method.clone();
-        svc.dispatch(&method, Call::new(parts, header, attributes))
-            .await;
+        let Some(at) = deadline else {
+            svc.dispatch(&method, Call::new(parts, header, attributes, None))
+                .await;
+            return;
+        };
+        let cancelled = parts.cancelled.clone();
+        let sender = parts.response_sender.clone();
+        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+        let _guard = self.deadlines.register(at, move || {
+            let _ = fire.send(());
+        });
+        let handler = svc.dispatch(&method, Call::new(parts, header, attributes, Some(at)));
+        tokio::select! {
+            biased;
+            () = handler => {}
+            _ = fired => {
+                // The handler future is dropped when this arm wins, which
+                // cancels it. Flag the call too, for anything it spawned.
+                cancelled.store(true, Ordering::Release);
+                emit_trailer(&sender, StatusCode::DeadlineExceeded, "deadline exceeded").await;
+            }
+        }
     }
 
     /// The async half of routing when an [`Authenticator`] is configured: run
@@ -892,12 +966,18 @@ pub struct Routed {
     meta: Arc<dyn ServiceDispatch>,
     target: Target,
     attributes: HashMap<String, String>,
+    deadline: Option<Instant>,
 }
 
 impl Routed {
     /// The decoded request header.
     pub fn header(&self) -> &StreamHeader {
         &self.header
+    }
+
+    /// When the handler will be cancelled with `DEADLINE_EXCEEDED`, if ever.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 }
 
@@ -1029,10 +1109,16 @@ pub struct Call {
     /// there are *additional* frames to forward; if the first frame already ended
     /// the stream, the channel is never closed, so we must not block reading it.
     first_is_end: bool,
+    deadline: Option<Instant>,
 }
 
 impl Call {
-    fn new(inner: CallParts, header: StreamHeader, attributes: HashMap<String, String>) -> Self {
+    fn new(
+        inner: CallParts,
+        header: StreamHeader,
+        attributes: HashMap<String, String>,
+        deadline: Option<Instant>,
+    ) -> Self {
         let CallParts {
             peer_id,
             provenance,
@@ -1054,7 +1140,16 @@ impl Call {
             first_request: Some(request_payload),
             request_receiver: Some(request_receiver),
             first_is_end,
+            deadline,
         }
+    }
+
+    /// When the server will cancel this call with `DEADLINE_EXCEEDED`: the
+    /// minimum of the caller's header deadline, the method's
+    /// [`method_timeout`](ServiceDispatch::method_timeout) and the server's
+    /// [`handler_timeout`](Server::handler_timeout). `None` = no deadline.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 
     /// The decoded request header.

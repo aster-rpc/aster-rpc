@@ -26,6 +26,7 @@ pub mod baseline;
 pub mod client;
 pub mod codec;
 pub mod contract;
+mod deadline;
 pub mod empty;
 pub mod interceptor;
 pub mod lease;
@@ -65,7 +66,7 @@ pub use publish::{
 pub use runtime::{AsterServer, AsterServerBuilder};
 pub use server::{
     AlpnHandler, Call, CallParts, Dispatcher, HttpTransport, PeerProvenance, Route, Routed, Server,
-    ServerHandle, ServiceDispatch, RPC_ALPN,
+    ServerHandle, ServiceDispatch, DEFAULT_HANDLER_TIMEOUT, RPC_ALPN,
 };
 
 /// Reactor frame types, re-exported so a non-Iroh transport can build

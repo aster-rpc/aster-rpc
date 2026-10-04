@@ -99,7 +99,7 @@ impl RpcConnection {
         // the server; the client enforces it via the per-attempt timeout).
         let mut h = header.clone();
         if let Some(d) = self.pipeline.deadline {
-            h.deadline = d.as_secs().min(i16::MAX as u64) as i16;
+            h.deadline = super::codec::deadline_header_secs(d);
         }
         let ctx = CallContext {
             service: h.service.clone(),

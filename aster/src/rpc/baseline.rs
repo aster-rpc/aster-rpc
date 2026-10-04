@@ -511,6 +511,9 @@ impl<D: ServiceDispatch> ServiceDispatch for RequireGuard<D> {
     fn method_requires(&self, method: &str) -> Option<CapabilityRequirement> {
         self.inner.method_requires(method)
     }
+    fn method_timeout(&self, method: &str) -> Option<std::time::Duration> {
+        self.inner.method_timeout(method)
+    }
     async fn dispatch(&self, method: &str, call: Call) {
         self.inner.dispatch(method, call).await
     }
