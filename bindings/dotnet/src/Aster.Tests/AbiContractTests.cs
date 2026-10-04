@@ -1,4 +1,6 @@
 using System;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using Aster;
 
@@ -366,6 +368,104 @@ public class AbiContractTests
             Marshal.FreeHGlobal(mem);
         }
     }
+
+    // ─── ABI 4.1: upcalls, lease, fenced resource, topology ─────────────────
+
+    [Fact]
+    public void Upcall_Struct_Sizes_And_Offsets_Match_Header()
+    {
+        // aster_upcall_event_t (ffi/src/layout.rs; same as Java Upcalls.EVENT_LAYOUT): 40 bytes.
+        Assert.Equal(40, Marshal.SizeOf<UpcallEventNative>());
+        Assert.Equal(40, System.Runtime.CompilerServices.Unsafe.SizeOf<UpcallEventNative>());
+        Assert.Equal(Upcall.Upcalls.EventSize, Marshal.SizeOf<UpcallEventNative>());
+        Off<UpcallEventNative>("invocation_id", 0);
+        Off<UpcallEventNative>("kind", 8);
+        Off<UpcallEventNative>("cancel_reason", 10);
+        Off<UpcallEventNative>("_p0", 11);
+        Off<UpcallEventNative>("payload_len", 12);
+        Off<UpcallEventNative>("deadline_unix_ms", 16);
+        Off<UpcallEventNative>("payload_ptr", 24);
+        Off<UpcallEventNative>("buffer", 32);
+        // aster_topology_admitted_stats_t: 4 x u64.
+        Assert.Equal(32, Marshal.SizeOf<TopologyAdmittedStatsNative>());
+        Off<TopologyAdmittedStatsNative>("hits", 0);
+        Off<TopologyAdmittedStatsNative>("stale", 8);
+        Off<TopologyAdmittedStatsNative>("misses", 16);
+        Off<TopologyAdmittedStatsNative>("upcalls", 24);
+    }
+
+    [Fact]
+    public void Upcall_Enum_Values_Match_Header()
+    {
+        // aster_upcall_kind_t: codes never change.
+        Assert.Equal(0, (int)Upcall.UpcallKind.Cancel);
+        Assert.Equal(1, (int)Upcall.UpcallKind.LeaseTransition);
+        Assert.Equal(2, (int)Upcall.UpcallKind.LeaseSnapshot);
+        Assert.Equal(3, (int)Upcall.UpcallKind.LeaseAuthorize);
+        Assert.Equal(4, (int)Upcall.UpcallKind.FencedMutate);
+        Assert.Equal(16, (int)Upcall.UpcallKind.TopologyAdmitted);
+        Assert.Equal(17, (int)Upcall.UpcallKind.TopologySnapshot);
+        Assert.Equal(32, (int)Upcall.UpcallKind.PlacementPolicy);
+        Assert.Equal(33, (int)Upcall.UpcallKind.PlacementProvision);
+        Assert.Equal(48, (int)Upcall.UpcallKind.ExposeAuthorize);
+        Assert.Equal(49, (int)Upcall.UpcallKind.ExposeHttp);
+        Assert.Equal(50, (int)Upcall.UpcallKind.ExposeRoutePolicy);
+        Assert.Equal(64, (int)Upcall.UpcallKind.AdmissionConnect);
+        Assert.Equal(65, (int)Upcall.UpcallKind.AdmissionHandshake);
+        // aster_upcall_status_t / aster_upcall_cancel_reason_t.
+        Assert.Equal(0u, (uint)Upcall.UpcallStatus.Ok);
+        Assert.Equal(1u, (uint)Upcall.UpcallStatus.Error);
+        Assert.Equal(2u, (uint)Upcall.UpcallStatus.Unimplemented);
+        Assert.Equal(0, (byte)Upcall.UpcallCancelReason.None);
+        Assert.Equal(1, (byte)Upcall.UpcallCancelReason.Timeout);
+        Assert.Equal(2, (byte)Upcall.UpcallCancelReason.Abandoned);
+        Assert.Equal(3, (byte)Upcall.UpcallCancelReason.Shutdown);
+        // aster_lease_status_t, ASTER_EVENT_LEASE_*, aster_hook_failure_mode_t, ASTER_UPCALL_DEFAULT_CAPACITY.
+        Assert.Equal(0u, (uint)Lease.LeaseStatus.Held);
+        Assert.Equal(1u, (uint)Lease.LeaseStatus.Released);
+        Assert.Equal(2u, (uint)Lease.LeaseStatus.Fenced);
+        Assert.Equal(3u, (uint)Lease.LeaseStatus.Lost);
+        Assert.Equal(107u, (uint)EventKind.LeaseAcquired);
+        Assert.Equal(108u, (uint)EventKind.LeaseStatus);
+        Assert.Equal(0u, (uint)HookFailureMode.FailOpen);
+        Assert.Equal(1u, (uint)HookFailureMode.FailClosed);
+        Assert.Equal(1024, Upcall.Upcalls.DefaultCapacity);
+        // UCv1 enum bytes (design §3): deny reasons and fence rejections.
+        Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6 }, Enum.GetValues<Lease.DenyReason>().Select(r => (byte)r).Order().ToArray());
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, Enum.GetValues<Lease.FenceRejectionReason>().Select(r => (byte)r).Order().ToArray());
+    }
+
+    /// <summary>The 4.1 exports: declared in the header, present in the library, and declared in <see cref="Native"/>.</summary>
+    private static readonly string[] Abi41Exports =
+    {
+        "aster_upcalls_new", "aster_upcalls_close", "aster_upcalls_free", "aster_upcall_set_policy", "aster_upcall_set_default_policy",
+        "aster_upcall_poll", "aster_upcall_buffer_release", "aster_upcall_respond",
+        "aster_lease_serializer_foreign_new", "aster_lease_serializer_memory_new", "aster_lease_serializer_free",
+        "aster_lease_acquire", "aster_lease_fence", "aster_lease_status", "aster_lease_watch", "aster_lease_release",
+        "aster_lease_free", "aster_lease_snapshot", "aster_lease_revoke",
+        "aster_fenced_resource_foreign_new", "aster_fenced_resource_free", "aster_fenced_mutate",
+        "aster_topology_admitted_new", "aster_topology_admitted_free", "aster_topology_admitted_check", "aster_topology_admitted_set",
+        "aster_topology_admitted_invalidate", "aster_topology_admitted_prefetch", "aster_topology_admitted_stats", "aster_topology_enable_shared",
+    };
+
+    internal static void AssertExports(string[] names)
+    {
+        string? header = null;
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "ffi", "aster_ffi.h"))) dir = dir.Parent;
+        if (dir != null) header = File.ReadAllText(Path.Combine(dir.FullName, "ffi", "aster_ffi.h"));
+
+        Assert.True(NativeLibrary.TryLoad("libaster_transport_ffi", typeof(Native).Assembly, null, out IntPtr lib), "native library");
+        foreach (string name in names)
+        {
+            Assert.True(typeof(Native).GetMethod(name, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static) != null, $"Native.{name} is not declared");
+            Assert.True(NativeLibrary.TryGetExport(lib, name, out _), $"{name} is not exported by the native library");
+            if (header != null) Assert.Matches($@"\b{name}\(", header);
+        }
+    }
+
+    [Fact]
+    public void Abi_4_1_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi41Exports);
 
     // ─── Bytes helpers ───────────────────────────────────────────────────────
 

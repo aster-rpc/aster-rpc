@@ -130,6 +130,12 @@ public enum EventKind : uint
     DocContentStatus = 105,
     StreamPriority = 106,
 
+    // ABI 4.1 leases.
+    /// <summary><c>aster_lease_acquire</c>: payload = UCv1 <c>TransitionOutcome</c>, <c>handle</c> = the lease (0 when denied).</summary>
+    LeaseAcquired = 107,
+    /// <summary><c>aster_lease_watch</c>: the lease left HELD; <c>flags</c> = <c>aster_lease_status_t</c>.</summary>
+    LeaseStatus = 108,
+
     // Errors
     OperationCancelled = 98,
     Error = 99,
