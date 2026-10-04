@@ -1,0 +1,257 @@
+/**
+ * T4.0: the native `DispatchServer` prototype (dynamic-dispatch-design.md
+ * §4.3) — JS handlers answering by call id, Rust routing — for every event
+ * delivery variant (TSFN per event, TSFN batched, ring + await, ring + poll).
+ *
+ * Unary, server-stream (with backpressure), client-stream, deadline cancel
+ * and peer cancel (connection closed mid-stream), each ending with an empty
+ * call table: whatever happened to a call, Rust must have let go of it.
+ *
+ * The client is the TS `IrohTransport` over a real QUIC connection, with an
+ * identity codec: payloads are opaque bytes to the server.
+ */
+
+import { randomBytes } from 'node:crypto';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import {
+  DISPATCH_DELIVERIES,
+  DispatchEventKind,
+  DispatchFlags,
+  DispatchLoop,
+  finishCall,
+  respondCall,
+  sendFrame,
+  submitWithBackpressure,
+  type DispatchEvent,
+  type DynamicServiceSpec,
+  type NativeDispatchServer,
+} from '../../../bindings/typescript/packages/aster/src/dispatch-server.ts';
+import { tryLoadNative } from '../../../bindings/typescript/packages/aster/src/native.ts';
+import { IrohTransport } from '../../../bindings/typescript/packages/aster/src/transport/iroh.ts';
+import { RpcError, StatusCode } from '../../../bindings/typescript/packages/aster/src/status.ts';
+
+const native = tryLoadNative() as any;
+const hasDispatch = !!native?.DispatchServer;
+
+const OFFLINE = { relayMode: 'disabled', bindAddr: '127.0.0.1:0', logLevel: 'warn' } as const;
+const RPC_ALPN = Buffer.from('aster/1');
+const h = (b: string) => b.repeat(32);
+
+const ECHO_SERVICE: DynamicServiceSpec = {
+  name: 'test.Echo',
+  version: 1,
+  methods: [
+    { name: 'echo', pattern: 'unary', request: { hash: h('a1') }, response: { hash: h('b2') } },
+    // A 64 KiB frame limit also sizes the response queue's byte budget
+    // (eight maximum frames), so the stream below outruns it.
+    {
+      name: 'count',
+      pattern: 'server_stream',
+      request: { hash: h('a1') },
+      response: { hash: h('b2') },
+      limits: { max_frame_size: 64 * 1024 },
+    },
+    { name: 'sum', pattern: 'client_stream', request: { hash: h('a1') }, response: { hash: h('b2') } },
+    {
+      name: 'slow',
+      pattern: 'server_stream',
+      request: { hash: h('a1') },
+      response: { hash: h('b2') },
+      default_timeout: 0.3,
+    },
+    { name: 'hang', pattern: 'server_stream', request: { hash: h('a1') }, response: { hash: h('b2') } },
+  ],
+};
+const [ECHO, COUNT, SUM, SLOW, HANG] = [0, 1, 2, 3, 4];
+
+/** Opaque bytes in and out. */
+const BYTES = { encode: (x: unknown) => x as Uint8Array, decode: (x: Uint8Array) => x };
+
+/** Times a stream send found the response queue full (backpressure path). */
+let queueFullHits = 0;
+
+const u32 = (n: number) => {
+  const b = Buffer.alloc(4);
+  b.writeUInt32LE(n);
+  return b;
+};
+
+interface Fixture {
+  loop: DispatchLoop;
+  cancelled: Map<number, number>; // callId -> reason
+  waiters: Map<number, () => void>;
+  hangStarted: Promise<number>;
+}
+
+function handlers(fx: { cancelled: Map<number, number>; waiters: Map<number, () => void> }) {
+  let hangStarted!: (id: number) => void;
+  const started = new Promise<number>((r) => (hangStarted = r));
+  const waitCancel = (id: number) =>
+    new Promise<void>((r) => (fx.cancelled.has(id) ? r() : fx.waiters.set(id, r)));
+
+  const serve = async (ev: DispatchEvent, srv: NativeDispatchServer) => {
+    const id = ev.callId;
+    const req = ev.request!;
+    switch (ev.methodIdx) {
+      case ECHO: {
+        await respondCall(srv, id, Buffer.concat([Buffer.from('echo:'), req]));
+        return;
+      }
+      case COUNT: {
+        // n incompressible 4 KiB frames. The client stalls after the first,
+        // so QUIC flow control backs up into the response queue (256 items)
+        // and the QUEUE_FULL -> waitWritable -> retry path runs.
+        const n = req.readUInt32LE(0);
+        for (let i = 0; i < n; i++) {
+          const frame = randomBytes(4 * 1024);
+          frame.writeUInt32LE(i);
+          let r = srv.send(id, frame);
+          if (r > 0) {
+            queueFullHits++;
+            r = await submitWithBackpressure(srv, id, () => srv.send(id, frame));
+          }
+          if (r !== 0) return;
+        }
+        await finishCall(srv, id);
+        return;
+      }
+      case SUM: {
+        let total = 0;
+        let items = 0;
+        if (req.length) {
+          total += req.readUInt32LE(0);
+          items++;
+        }
+        if (!(ev.flags & DispatchFlags.FirstIsEnd)) {
+          for (let b = await srv.recv(id); b !== null; b = await srv.recv(id)) {
+            total += b.readUInt32LE(0);
+            items++;
+          }
+        }
+        await respondCall(srv, id, Buffer.from(`${items}:${total}`));
+        return;
+      }
+      case SLOW:
+      case HANG: {
+        await sendFrame(srv, id, Buffer.from('first'));
+        if (ev.methodIdx === HANG) hangStarted(id);
+        await waitCancel(id);
+        // The call is over: every further op reports it gone.
+        expect(srv.isCancelled(id)).toBe(true);
+        expect(srv.send(id, Buffer.from('late'))).toBeLessThan(0);
+        return;
+      }
+    }
+  };
+  return { serve, started };
+}
+
+async function startFixture(delivery: (typeof DISPATCH_DELIVERIES)[number]): Promise<Fixture> {
+  const cancelled = new Map<number, number>();
+  const waiters = new Map<number, () => void>();
+  const { serve, started } = handlers({ cancelled, waiters });
+  const loop = await DispatchLoop.start({
+    config: OFFLINE as any,
+    services: [ECHO_SERVICE],
+    delivery,
+    builtinNodeInfo: false,
+    onCall: (ev, srv) => {
+      serve(ev, srv).catch((e) => srv.respond(ev.callId, Buffer.alloc(0), StatusCode.INTERNAL, String(e)));
+    },
+    onEvent: (ev) => {
+      if (ev.kind === DispatchEventKind.Cancelled) {
+        cancelled.set(ev.callId, ev.reason);
+        waiters.get(ev.callId)?.();
+      }
+    },
+  });
+  return { loop, cancelled, waiters, hangStarted: started };
+}
+
+async function connect(address: string) {
+  const node = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
+  const t = native.asterTicketFromString(address);
+  const conn = await node.connectNodeAddr(t.endpointId, RPC_ALPN, t.directAddrs, undefined);
+  return { node, conn, transport: new IrohTransport(conn, BYTES as any) };
+}
+
+async function until(cond: () => boolean, ms = 5000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error('timed out waiting');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+describe.skipIf(!hasDispatch).each(DISPATCH_DELIVERIES)('DispatchServer (%s)', (delivery) => {
+  let fx: Fixture;
+  let client: Awaited<ReturnType<typeof connect>>;
+
+  beforeAll(async () => {
+    fx = await startFixture(delivery);
+    client = await connect(fx.loop.address);
+  });
+
+  afterAll(async () => {
+    try { client?.conn.close(0, 'done'); } catch { /* ignore */ }
+    await client?.node.close();
+    await fx?.loop.close();
+  });
+
+  it('unary: concurrent calls answered by call id', async () => {
+    const replies = await Promise.all(
+      Array.from({ length: 64 }, (_, i) => client.transport.unary('test.Echo', 'echo', Buffer.from(`m${i}`))),
+    );
+    replies.forEach((r, i) => expect(Buffer.from(r as Uint8Array).toString()).toBe(`echo:m${i}`));
+    await until(() => fx.loop.native.liveCalls() === 0);
+  });
+
+  it('server stream: frames in order, through response backpressure', async () => {
+    queueFullHits = 0;
+    const n = 2000; // 8 MiB: past the QUIC windows plus the response queue
+    let i = 0;
+    for await (const f of client.transport.serverStream('test.Echo', 'count', u32(n))) {
+      expect(Buffer.from(f as Uint8Array).readUInt32LE(0)).toBe(i++);
+      if (i === 1) await new Promise((r) => setTimeout(r, 300));
+    }
+    expect(i).toBe(n);
+    expect(queueFullHits).toBeGreaterThan(0);
+    await until(() => fx.loop.native.liveCalls() === 0);
+  });
+
+  it('client stream: first request on the event, the rest via recv', async () => {
+    async function* reqs() {
+      for (let i = 1; i <= 100; i++) yield u32(i);
+    }
+    const r = await client.transport.clientStream('test.Echo', 'sum', reqs());
+    expect(Buffer.from(r as Uint8Array).toString()).toBe('100:5050');
+    await until(() => fx.loop.native.liveCalls() === 0);
+  });
+
+  it('deadline: DEADLINE_EXCEEDED to the peer, Cancelled(deadline) to the handler', async () => {
+    const seen: Uint8Array[] = [];
+    let err: unknown;
+    try {
+      for await (const f of client.transport.serverStream('test.Echo', 'slow', u32(0))) seen.push(f as Uint8Array);
+    } catch (e) {
+      err = e;
+    }
+    expect(seen.length).toBe(1);
+    expect(err).toBeInstanceOf(RpcError);
+    expect((err as RpcError).code).toBe(StatusCode.DEADLINE_EXCEEDED);
+    await until(() => [...fx.cancelled.values()].includes(2));
+    await until(() => fx.loop.native.liveCalls() === 0);
+  });
+
+  it('peer cancel: connection closed mid-stream cancels the handler', async () => {
+    const other = await connect(fx.loop.address);
+    const it = other.transport.serverStream('test.Echo', 'hang', u32(0))[Symbol.asyncIterator]();
+    const first = await it.next();
+    expect(Buffer.from(first.value as Uint8Array).toString()).toBe('first');
+    const id = await fx.hangStarted;
+    other.conn.close(0, 'bye');
+    await until(() => fx.cancelled.get(id) === 1);
+    await until(() => fx.loop.native.liveCalls() === 0);
+    await other.node.close();
+  });
+});

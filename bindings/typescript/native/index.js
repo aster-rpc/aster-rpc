@@ -584,6 +584,7 @@ module.exports.CoordinationClient = nativeBinding.CoordinationClient
 module.exports.CoordinationLease = nativeBinding.CoordinationLease
 module.exports.CoordinationReadClient = nativeBinding.CoordinationReadClient
 module.exports.CoordinationResolvedMutation = nativeBinding.CoordinationResolvedMutation
+module.exports.DispatchServer = nativeBinding.DispatchServer
 module.exports.DocEventReceiver = nativeBinding.DocEventReceiver
 module.exports.DocHandle = nativeBinding.DocHandle
 module.exports.DocsClient = nativeBinding.DocsClient

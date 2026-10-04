@@ -339,6 +339,93 @@ export declare class CoordinationResolvedMutation {
 }
 
 /**
+ * An RPC server whose services are implemented in JS (T4.0 prototype).
+ *
+ * Start with `DispatchServer.start(config, servicesJson, options, onEvents)`.
+ * Every response operation is keyed by the event's `callId` and is
+ * non-blocking except `recv` and `waitWritable`.
+ *
+ * Submit results (`respond` / `send` / `finish`): `0` sent; `> 0` the
+ * response queue is full — nothing was sent, `await waitWritable(callId, n)`
+ * and retry the same operation; `-1` closed (peer gone); `-2` no such call;
+ * `-3` too large; `-4` invalid (empty stream payload, second reservation).
+ */
+export declare class DispatchServer {
+  /**
+   * Start a node serving `servicesJson` (one `DynamicService` JSON
+   * document per service, design §1.5; array index = `serviceIdx`).
+   *
+   * `onEvents` receives every event for the TSFN deliveries and is
+   * required for them; it must not throw. With `delivery: "ring"` pass
+   * nothing and pull with `nextBatch` / `pollBatch`.
+   */
+  static start(config: AsterConfig | undefined | null, servicesJson: string[], options?: DispatchServerOptions | undefined | null, onEvents?: ((events: DispatchEvent[]) => void) | undefined | null): Promise<DispatchServer>
+  /** This server's `aster1…` ticket. */
+  get address(): string
+  /** Number of live calls in the call table (0 once every call ended). */
+  liveCalls(): number
+  /**
+   * Diagnostics: `[liveCalls, queued, flag, tsfnCalls, tsfnCallbacks,
+   * tsfnFailures, lastFailureStatus, watchdogRescues]`. TSFN: `queued` = events waiting in
+   * the T-b queue, `flag` = a T-b call is outstanding. Ring: `queued` =
+   * events in the ring (-1 while a `nextBatch` holds it), `flag` = the
+   * pump stopped.
+   */
+  debugState(): Array<number>
+  /**
+   * Diagnostics: queue one extra T-b drain call (no-op for other
+   * deliveries).
+   */
+  debugNudge(): void
+  /**
+   * R1: resolve with the next batch (at most `max`, default 256), waiting
+   * until there is one. Resolves `[]` once the server is closed.
+   */
+  nextBatch(max?: number | undefined | null): Promise<DispatchEvent[]>
+  /**
+   * R2: take whatever is ready now (at most `max`, default 256), without
+   * waiting. Returns `[]` while a `nextBatch` is pending.
+   */
+  pollBatch(max?: number | undefined | null): DispatchEvent[]
+  /**
+   * Unary / client-stream: one terminal response (data frame, omitted when
+   * `payload` is empty, plus trailer). `code` defaults to OK.
+   */
+  respond(callId: number, payload: Uint8Array, code?: number | undefined | null, message?: string | undefined | null): number
+  /** Server-stream / bidi: one data frame (`payload` must not be empty). */
+  send(callId: number, payload: Uint8Array): number
+  /** End a stream with the trailer. `code` defaults to OK. */
+  finish(callId: number, code?: number | undefined | null, message?: string | undefined | null): number
+  /**
+   * After a submit returned `n > 0`: resolve `true` once `n` bytes of
+   * response capacity are held (the retry will not be full), `false` if
+   * the call ended first.
+   */
+  waitWritable(callId: number, requiredLen: number): Promise<boolean>
+  /**
+   * Client-stream / bidi: the next request payload after the one in the
+   * call event; `null` at the end of the request stream (or for an
+   * unknown call).
+   */
+  recv(callId: number): Promise<Buffer | null>
+  /**
+   * Whether the call was cancelled (peer, stream failure, deadline). An
+   * unknown call reads as cancelled.
+   */
+  isCancelled(callId: number): boolean
+  /**
+   * End the call with `INTERNAL "handler dropped call"` unless it already
+   * ended.
+   */
+  abandon(callId: number): void
+  /**
+   * Stop serving and shut the node down. Releases the event callback and
+   * resolves any pending `nextBatch` with `[]`.
+   */
+  close(): Promise<void>
+}
+
+/**
  * A document's live events: `AsyncIterable<DocEvent>` (ends when the
  * subscription does), or call `recv()` directly.
  *
@@ -1725,6 +1812,55 @@ export declare function decompressPayload(data: Uint8Array, limit?: number | und
 
 /** The docs default-author id for a node secret key — equal to the node id. */
 export declare function defaultAuthorId(secretKey: string | Uint8Array): string
+
+/**
+ * One dispatch event, flattened for JS. Fields that do not apply to the
+ * event's `kind` are `0` (numbers) or absent.
+ */
+export interface DispatchEvent {
+  /**
+   * 1 call, 2 cancelled, 3 response-writable, 4 response-closed,
+   * 5 session-closed, 6 connection-closed.
+   */
+  kind: number
+  /** Correlation key for every response operation (per server, from 1). */
+  callId: number
+  /** Index of the service in the `services` array passed to `start`. */
+  serviceIdx: number
+  /** Index of the method in the service's `methods`. */
+  methodIdx: number
+  /** `FIRST_IS_END` (1) | `NEW_SESSION` (2) | `IROH_AUTHENTICATED` (4). */
+  flags: number
+  /** 0 = shared service; otherwise the Rust-assigned session key. */
+  sessionKey: number
+  /** Connection id (0 without one, e.g. HTTP). */
+  connectionId: number
+  /** Absolute deadline, Unix ms; 0 = none. */
+  deadlineMs: number
+  /** For `cancelled`: 1 peer, 2 deadline. */
+  reason: number
+  /**
+   * Peer endpoint id (or authenticator principal); calls and
+   * connection-closed only.
+   */
+  peer?: string
+  /** The first request payload, already decompressed; calls only. */
+  request?: Buffer
+}
+
+/** Options for [`DispatchServer::start`]. */
+export interface DispatchServerOptions {
+  /**
+   * `"tsfn"` (default; one TSFN call per event), `"tsfn-batched"` (TSFN,
+   * coalesced while JS is busy) or `"ring"` (pull with `nextBatch` /
+   * `pollBatch`; no `onEvents`).
+   */
+  delivery?: string
+  /** Ring capacity in events (`"ring"` only; default 4096). */
+  ringCapacity?: number
+  /** Serve the baseline `aster.ops.NodeInfo` service (default true). */
+  builtinNodeInfo?: boolean
+}
 
 /** One document entry (metadata; read the value with `readEntryContent`). */
 export interface DocEntry {

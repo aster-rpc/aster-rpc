@@ -26,6 +26,7 @@ mod lease;
 mod net;
 mod node;
 mod reactor;
+mod rpc;
 mod ticket;
 mod topology;
 
