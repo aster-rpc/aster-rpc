@@ -24,14 +24,26 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::codec::RpcStatus;
+use super::foreign::ForeignSession;
 use super::server::ServiceDispatch;
 use super::status::StatusCode;
 
 /// `(service, version)`.
 pub(crate) type ServiceKey = (String, i32);
 
+/// One live session: a native per-session instance, or the Rust-side record
+/// of a foreign (binding-implemented) session, whose state lives in the
+/// binding under its `session_key`. Both kinds share one per-connection
+/// table, so the graveyard and the cap span every service on a connection,
+/// as in Python and Java.
+#[derive(Clone)]
+pub(crate) enum SessionInstance {
+    Native(Arc<dyn ServiceDispatch>),
+    Foreign(Arc<ForeignSession>),
+}
+
 /// Builds a fresh per-session instance of a session-scoped service.
-pub(crate) type SessionFactory = Arc<dyn Fn() -> Arc<dyn ServiceDispatch> + Send + Sync>;
+pub(crate) type SessionFactory = Arc<dyn Fn() -> SessionInstance + Send + Sync>;
 
 /// Default cap on active sessions per connection (`max_sessions_per_connection`).
 pub const DEFAULT_MAX_SESSIONS_PER_CONNECTION: usize = 1024;
@@ -63,7 +75,7 @@ struct ConnectionState {
     /// Highest session id ever opened on this connection. Ids at or below it
     /// that are not active belong to closed sessions (the graveyard).
     last_opened: i32,
-    active: HashMap<(i32, ServiceKey), Arc<dyn ServiceDispatch>>,
+    active: HashMap<(i32, ServiceKey), SessionInstance>,
 }
 
 /// `(principal, service, version, aster-session-id)`.
@@ -73,7 +85,7 @@ type HttpKey = (String, String, i32, String);
 pub(crate) struct SessionStore {
     max_per_connection: usize,
     connections: Mutex<HashMap<u64, ConnectionState>>,
-    http: Mutex<HashMap<HttpKey, Arc<dyn ServiceDispatch>>>,
+    http: Mutex<HashMap<HttpKey, SessionInstance>>,
 }
 
 impl SessionStore {
@@ -97,7 +109,7 @@ impl SessionStore {
         service: &ServiceKey,
         session_id: i32,
         factory: &SessionFactory,
-    ) -> Result<Arc<dyn ServiceDispatch>, SessionError> {
+    ) -> Result<SessionInstance, SessionError> {
         let mut conns = self.connections.lock().unwrap();
         let state = conns.entry(connection_id).or_default();
         let key = (session_id, service.clone());
@@ -132,7 +144,7 @@ impl SessionStore {
         service: &ServiceKey,
         session_id: &str,
         factory: &SessionFactory,
-    ) -> Arc<dyn ServiceDispatch> {
+    ) -> SessionInstance {
         let key = (
             principal.to_string(),
             service.0.clone(),

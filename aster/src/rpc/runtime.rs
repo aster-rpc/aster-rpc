@@ -86,6 +86,11 @@ pub struct AsterServerBuilder {
     // `aster.coordination.*` services and requires a persistent identity.
     #[cfg(feature = "coordination")]
     coordination: Option<crate::coordination::host::CoordinationConfig>,
+    // Foreign (binding) services and where their calls go.
+    #[cfg(feature = "binding-support")]
+    dynamic_services: Vec<super::dynamic::DynamicService>,
+    #[cfg(feature = "binding-support")]
+    dispatch_sink: Option<Arc<dyn super::foreign::DispatchSink>>,
 }
 
 impl AsterServerBuilder {
@@ -169,6 +174,27 @@ impl AsterServerBuilder {
         self.session_appliers
             .push(Box::new(move |s| s.register_session(factory)));
         self
+    }
+
+    /// Deliver foreign calls and lifecycle events to `sink` (binding support).
+    /// Required when any [`dynamic_service`](Self::dynamic_service) is
+    /// registered. See [`Server::dispatch_sink`](super::server::Server::dispatch_sink).
+    #[cfg(feature = "binding-support")]
+    pub fn dispatch_sink(mut self, sink: Arc<dyn super::foreign::DispatchSink>) -> Self {
+        self.dispatch_sink = Some(sink);
+        self
+    }
+
+    /// Serve a foreign (binding-implemented) service alongside the native and
+    /// baseline ones. Validates `svc` now; a `(name, version)` collision with
+    /// another service fails [`start`](Self::start). The service's
+    /// `service_idx` in [`ForeignCall`](crate::binding_support::dispatch::ForeignCall)
+    /// is its position among `dynamic_service` calls.
+    #[cfg(feature = "binding-support")]
+    pub fn dynamic_service(mut self, svc: super::dynamic::DynamicService) -> Result<Self> {
+        svc.validate()?;
+        self.dynamic_services.push(svc);
+        Ok(self)
     }
 
     /// Cap active sessions per connection. See
@@ -332,10 +358,22 @@ impl AsterServerBuilder {
         #[cfg(not(feature = "coordination"))]
         let hosts_coordination = false;
 
+        #[cfg(feature = "binding-support")]
+        let has_foreign = !self.dynamic_services.is_empty();
+        #[cfg(not(feature = "binding-support"))]
+        let has_foreign = false;
+        #[cfg(feature = "binding-support")]
+        if has_foreign && self.dispatch_sink.is_none() {
+            return Err(Error::InvalidArgument(
+                "dynamic_service requires a dispatch_sink".into(),
+            ));
+        }
+
         if self.services.is_empty()
             && self.disable_node_info
             && !self.enable_topology
             && !hosts_coordination
+            && !has_foreign
         {
             return Err(Error::InvalidArgument(
                 "AsterServer requires at least one service (or an enabled baseline service)".into(),
@@ -494,12 +532,31 @@ impl AsterServerBuilder {
         for apply in self.session_appliers {
             server = apply(server);
         }
+        // Foreign services last, so a collision with any native or baseline
+        // service is refused here rather than silently shadowed.
+        #[cfg(feature = "binding-support")]
+        {
+            if let Some(sink) = self.dispatch_sink {
+                server = server.dispatch_sink(sink);
+            }
+            for svc in self.dynamic_services {
+                server = match server.dynamic_service(svc) {
+                    Ok(server) => server,
+                    Err(err) => {
+                        node.shutdown().await;
+                        return Err(err);
+                    }
+                };
+            }
+        }
         for (alpn, handler) in self.routes {
             server = server.route_alpn_arc(alpn, handler);
         }
         // Grab the shareable dispatcher before `serve()` consumes the server, so
         // an HTTP transport can drive the same services.
         let dispatcher = server.dispatcher();
+        #[cfg(feature = "binding-support")]
+        let call_table = server.call_table();
         let handle = server.serve();
         let http = self.http.map(|t| t.serve(dispatcher.clone()));
 
@@ -548,6 +605,8 @@ impl AsterServerBuilder {
             dispatcher,
             http,
             identity_handle,
+            #[cfg(feature = "binding-support")]
+            call_table,
             #[cfg(feature = "coordination")]
             coordination,
         })
@@ -595,6 +654,9 @@ pub struct AsterServer {
     /// Live identity served by the baseline `aster.ops.NodeInfo` service
     /// (`None` when the baseline service was disabled).
     identity_handle: Option<NodeIdentityHandle>,
+    /// The table foreign calls are answered through (binding support).
+    #[cfg(feature = "binding-support")]
+    call_table: super::foreign::CallTable,
     /// The voter runtime, when this server hosts coordination.
     ///
     /// Owned here because §3.3 requires it: "AsterServer owns the
@@ -628,6 +690,15 @@ impl AsterServer {
     /// ```
     pub fn node_identity(&self) -> Option<NodeIdentityHandle> {
         self.identity_handle.clone()
+    }
+
+    /// The table through which the binding answers foreign calls
+    /// ([`CallTable`](crate::binding_support::dispatch::CallTable)). Empty
+    /// unless [`dynamic_service`](AsterServerBuilder::dynamic_service)s are
+    /// registered.
+    #[cfg(feature = "binding-support")]
+    pub fn call_table(&self) -> super::foreign::CallTable {
+        self.call_table.clone()
     }
 
     /// This server's connectable address as an `aster1…` ticket. Hand it to a

@@ -29,6 +29,7 @@ pub mod contract;
 mod deadline;
 pub mod dynamic;
 pub mod empty;
+pub(crate) mod foreign;
 pub mod interceptor;
 pub mod lease;
 pub mod projection;
