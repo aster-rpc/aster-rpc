@@ -269,6 +269,7 @@ dependencies = [
  "openraft",
  "portable-pty",
  "redb 4.1.0",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
