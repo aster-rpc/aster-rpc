@@ -26,12 +26,14 @@ pub mod baseline;
 pub mod client;
 pub mod codec;
 pub mod contract;
+mod deadline;
 pub mod empty;
 pub mod interceptor;
 pub mod lease;
 pub mod projection;
 pub mod runtime;
 pub mod server;
+mod sessions;
 pub mod status;
 pub mod streaming;
 
@@ -63,14 +65,15 @@ pub use publish::{
 };
 pub use runtime::{AsterServer, AsterServerBuilder};
 pub use server::{
-    AlpnHandler, Call, CallParts, Dispatcher, HttpTransport, PeerProvenance, Server, ServerHandle,
-    ServiceDispatch, RPC_ALPN,
+    AlpnHandler, Call, CallParts, Dispatcher, HttpTransport, PeerProvenance, Route, Routed, Server,
+    ServerHandle, ServiceDispatch, DEFAULT_HANDLER_TIMEOUT, RPC_ALPN,
 };
 
 /// Reactor frame types, re-exported so a non-Iroh transport can build
 /// [`CallParts`] (wire request frames into `request_receiver`, drain
 /// `OutgoingFrame`s from `response_sender`).
 pub use aster_transport_core::reactor::{OutgoingFrame, RequestFrame};
+pub use sessions::DEFAULT_MAX_SESSIONS_PER_CONNECTION;
 pub use status::{status_from_error, StatusCode};
 pub use streaming::{BidiCall, MessageStream, RequestStream, ResponseSink};
 

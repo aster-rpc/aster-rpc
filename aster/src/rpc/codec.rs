@@ -47,6 +47,15 @@ fn dec(e: EnvelopeError) -> CodecError {
 
 // ── Envelope encode / decode ────────────────────────────────────────────────────
 
+/// Encode a caller's time budget as `StreamHeader.deadline`: whole seconds,
+/// rounded **up** and clamped to `i16::MAX`. Rounding up keeps the server's
+/// deadline (which starts at receipt) from firing before the caller's own.
+/// A zero budget stays 0, which means "no deadline" on the wire.
+pub fn deadline_header_secs(budget: std::time::Duration) -> i16 {
+    let secs = budget.as_secs() + u64::from(budget.subsec_nanos() > 0);
+    secs.min(i16::MAX as u64) as i16
+}
+
 /// Serialize a [`StreamHeader`] (frame payload for `FLAG_HEADER`).
 pub fn encode_stream_header(h: &StreamHeader) -> Result<Vec<u8>> {
     envelope::encode_stream_header(h).map_err(enc)
@@ -94,6 +103,16 @@ mod tests {
             metadata_values: vec!["abc".into()],
             session_id: 0,
         }
+    }
+
+    #[test]
+    fn deadline_header_secs_rounds_up_and_clamps() {
+        use std::time::Duration;
+        assert_eq!(deadline_header_secs(Duration::ZERO), 0);
+        assert_eq!(deadline_header_secs(Duration::from_millis(1)), 1);
+        assert_eq!(deadline_header_secs(Duration::from_millis(1500)), 2);
+        assert_eq!(deadline_header_secs(Duration::from_secs(30)), 30);
+        assert_eq!(deadline_header_secs(Duration::from_secs(1 << 40)), i16::MAX);
     }
 
     fn sample_call_header() -> CallHeader {

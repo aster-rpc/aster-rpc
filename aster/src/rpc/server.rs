@@ -17,9 +17,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fory_core::Fory;
 use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
 
 use aster_transport_core::contract::evaluate_capability;
 use aster_transport_core::framing::{
@@ -27,13 +29,19 @@ use aster_transport_core::framing::{
     FLAG_TRAILER,
 };
 use aster_transport_core::reactor::{
-    self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame, ResponseSender,
+    self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame, ResponseReserveError,
+    ResponseSender,
 };
 use aster_transport_core::CoreNode;
 
 use super::auth::{AttributeStore, AuthContext, Authenticator, CapabilityRequirement};
 use super::codec::{
     decode_stream_header, encode_rpc_status, RpcStatus, SerializationMode, StreamHeader,
+};
+use super::deadline::DeadlineQueue;
+use super::sessions::{
+    check_shared, missing_session, ServiceKey, SessionFactory, SessionStore,
+    DEFAULT_MAX_SESSIONS_PER_CONNECTION,
 };
 use super::status::StatusCode;
 use super::streaming::{RequestStream, ResponseSink};
@@ -101,6 +109,15 @@ pub trait ServiceDispatch: Send + Sync + 'static {
     fn iroh_only(&self) -> bool {
         false
     }
+    /// A default server-side timeout for `method`. `None` (default) = no
+    /// method default. The handler's effective deadline is the minimum of the
+    /// caller's `StreamHeader.deadline`, this, and the server's
+    /// [`handler_timeout`](Server::handler_timeout); when it passes, the
+    /// handler is cancelled (its future dropped) and the caller receives
+    /// `DEADLINE_EXCEEDED`.
+    fn method_timeout(&self, _method: &str) -> Option<Duration> {
+        None
+    }
     /// Handle one call. `method` is `StreamHeader.method` (guaranteed to be in
     /// [`methods`](ServiceDispatch::methods) when that table is non-empty). The
     /// handler MUST terminate the call by consuming `call` via [`Call::respond`]
@@ -109,14 +126,9 @@ pub trait ServiceDispatch: Send + Sync + 'static {
     async fn dispatch(&self, method: &str, call: Call);
 }
 
-type Registry = HashMap<(String, i32), Arc<dyn ServiceDispatch>>;
+type Registry = HashMap<ServiceKey, Arc<dyn ServiceDispatch>>;
 
-/// Builds a fresh per-session instance of a session-scoped service.
-type SessionFactory = Arc<dyn Fn() -> Arc<dyn ServiceDispatch> + Send + Sync>;
-
-type SessionFactories = HashMap<(String, i32), SessionFactory>;
-/// Per-session instances, keyed by `(service, version, session-id)`.
-type SessionTable = std::sync::RwLock<HashMap<(String, i32, String), Arc<dyn ServiceDispatch>>>;
+type SessionFactories = HashMap<ServiceKey, SessionFactory>;
 
 /// Handler for an inbound connection on a non-`aster/1` ALPN. Invoked once per
 /// accepted connection from the reactor's single accept loop, so it **must not
@@ -139,7 +151,15 @@ pub struct Server {
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
     routes: AlpnRoutes,
+    max_sessions_per_connection: usize,
+    handler_timeout: Option<Duration>,
+    /// One timer facility per server, shared by every dispatcher it hands out.
+    deadlines: DeadlineQueue,
 }
+
+/// The default cap on how long any handler may run: Python's
+/// `MAX_HANDLER_TIMEOUT_S`. See [`Server::handler_timeout`].
+pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl Server {
     /// Create a server over `node`. The node must have been started with the
@@ -153,7 +173,34 @@ impl Server {
             attributes: AttributeStore::new(),
             authenticator: None,
             routes: HashMap::new(),
+            max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            deadlines: DeadlineQueue::default(),
         }
+    }
+
+    /// The longest any handler may run, whatever the caller asked for
+    /// (default [`DEFAULT_HANDLER_TIMEOUT`], 300 s, matching the Python
+    /// server). A call's effective deadline is the minimum of this, the
+    /// caller's relative `StreamHeader.deadline` (measured from receipt), and
+    /// the method's [`method_timeout`](ServiceDispatch::method_timeout). When
+    /// it passes, the handler's future is dropped, [`Call::is_cancelled`]
+    /// turns true, and the caller gets a `DEADLINE_EXCEEDED` trailer.
+    ///
+    /// `None` removes the cap, so only caller and method deadlines apply. Use
+    /// that for services with legitimately unbounded streams.
+    pub fn handler_timeout(mut self, max: Option<Duration>) -> Self {
+        self.handler_timeout = max;
+        self
+    }
+
+    /// Cap the number of **active** sessions one connection may hold
+    /// (Aster-multiplexed-streams §7.5; default 1024). A call that would open
+    /// one more is refused with `RESOURCE_EXHAUSTED`. Applies to
+    /// connection-scoped (Iroh) sessions; HTTP-scoped sessions are not capped.
+    pub fn max_sessions_per_connection(mut self, max: usize) -> Self {
+        self.max_sessions_per_connection = max;
+        self
     }
 
     /// Attach a pre-dispatch [`Authenticator`] (builder-style). It runs on every
@@ -188,13 +235,27 @@ impl Server {
     }
 
     /// Register a **session-scoped** service: `factory` builds a fresh instance
-    /// per session, keyed by the caller's session id (the `aster-session-id`
-    /// header, or `StreamHeader.session_id`). State on the instance is private to
-    /// that session — the analogue of Python's `scoped="session"` services. A
-    /// call with no session id is rejected with `INVALID_ARGUMENT`.
+    /// per session. State on the instance is private to that session — the
+    /// analogue of Python's `scoped="session"` services.
     ///
-    /// (Reaping today: instances are dropped when [`end_session`] is called or,
-    /// on Iroh, when the owning connection closes; an idle TTL is a follow-up.)
+    /// Over Iroh a session is identified by `(connection, StreamHeader.session_id)`
+    /// and follows Aster-multiplexed-streams §7.5 exactly as Python and Java do:
+    ///
+    /// - a call with `session_id == 0` is refused with `FAILED_PRECONDITION`;
+    /// - a new id above the connection's highest opened id creates an instance,
+    ///   unless the connection already holds
+    ///   [`max_sessions_per_connection`](Server::max_sessions_per_connection)
+    ///   active sessions (`RESOURCE_EXHAUSTED`);
+    /// - an id at or below that high-water mark that is not active is
+    ///   `NOT_FOUND`;
+    /// - every session on a connection is dropped when the connection closes.
+    ///
+    /// Another connection presenting the same id gets its own instance, never
+    /// this one. Over HTTP-style transports, which have no connection id, the
+    /// `aster-session-id` header (or a non-zero `session_id`) names the
+    /// session, scoped to the caller's principal (the [`Authenticator`]
+    /// principal, else the transport's peer id); those instances have no cap
+    /// and live until [`end_session`].
     ///
     /// [`end_session`]: Dispatcher::end_session
     pub fn register_session<S, F>(mut self, factory: F) -> Self
@@ -279,9 +340,11 @@ impl Server {
             services: Arc::new(self.services.clone()),
             session_probes: Arc::new(self.session_probes.clone()),
             session_factories: Arc::new(self.session_factories.clone()),
-            sessions: Arc::new(SessionTable::default()),
+            sessions: Arc::new(SessionStore::new(self.max_sessions_per_connection)),
             attributes: self.attributes.clone(),
             authenticator: self.authenticator.clone(),
+            handler_timeout: self.handler_timeout,
+            deadlines: self.deadlines.clone(),
         }
     }
 
@@ -298,12 +361,30 @@ impl Server {
         // RPC pipeline: dispatch each `aster/1` call.
         let rpc_join = tokio::spawn(async move {
             while let Some(ev) = event_rx.recv().await {
-                if let ReactorEvent::Call(call) = ev {
-                    let dispatcher = dispatcher.clone();
-                    tokio::spawn(async move { dispatcher.dispatch_call(call).await });
+                match ev {
+                    ReactorEvent::Call(call) => {
+                        // Route inline: decoding, lookup, session resolution
+                        // and Gate 3 are synchronous, so a refused call costs
+                        // no task. Only calls that reach a handler (or an
+                        // authenticator) are spawned. Routing here also orders
+                        // every session lookup before the connection's
+                        // `ConnectionClosed`, which this same loop handles.
+                        let parts = CallParts::from_incoming(call);
+                        match dispatcher.route(&parts) {
+                            Route::Reject(status) => reject_now(parts.response_sender, &status),
+                            route => {
+                                let dispatcher = dispatcher.clone();
+                                tokio::spawn(
+                                    async move { dispatcher.complete(route, parts).await },
+                                );
+                            }
+                        }
+                    }
+                    // §7.5: a connection's sessions die with it.
+                    ReactorEvent::ConnectionClosed { connection_id, .. } => {
+                        dispatcher.close_connection(connection_id);
+                    }
                 }
-                // ConnectionClosed: per-connection session / attribute reaping
-                // lands with session-scoped services (a later step).
             }
         });
 
@@ -346,9 +427,11 @@ pub struct Dispatcher {
     session_probes: Arc<Registry>,
     session_factories: Arc<SessionFactories>,
     /// Live per-session instances, shared across clones of this dispatcher.
-    sessions: Arc<SessionTable>,
+    sessions: Arc<SessionStore>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
+    handler_timeout: Option<Duration>,
+    deadlines: DeadlineQueue,
 }
 
 impl Dispatcher {
@@ -394,16 +477,276 @@ impl Dispatcher {
     /// parts itself (peer id, header + request payloads, a response-frame
     /// channel) and calls this. Same gating and handler invocation as
     /// [`dispatch_call`](Dispatcher::dispatch_call).
+    ///
+    /// Equivalent to [`route`](Dispatcher::route) followed by
+    /// [`complete`](Dispatcher::complete); resolves when the handler returns.
     pub async fn dispatch_parts(&self, parts: CallParts) {
-        handle_call(
-            self.services.clone(),
-            self.session_factories.clone(),
-            self.sessions.clone(),
-            self.attributes.clone(),
-            self.authenticator.clone(),
-            parts,
-        )
-        .await;
+        let route = self.route(&parts);
+        self.complete(route, parts).await;
+    }
+
+    /// Decide, synchronously, what happens to a call: decode the header, look
+    /// up the service, check `iroh_only`, the method and the serialization
+    /// mode, resolve the session (§7.5), then run Gate 3. Nothing here awaits
+    /// and no handler runs; pass the result to [`complete`](Dispatcher::complete).
+    ///
+    /// Checks run in that order and the first failure wins (see
+    /// `conformance/scenarios/error-mapping.yaml`). With an [`Authenticator`]
+    /// configured, Gate 3 (and the lookup of an HTTP-scoped session, which is
+    /// keyed by the authenticated principal) moves to `complete`, and the
+    /// result is [`Route::Authenticate`].
+    pub fn route(&self, parts: &CallParts) -> Route {
+        let header = match decode_stream_header(&parts.header_payload) {
+            Ok(h) => h,
+            // Aster-SPEC §6.5 and the Python server: a header that does not
+            // decode is the caller's error, not ours.
+            Err(_) => {
+                return Route::Reject(RpcStatus::error(
+                    StatusCode::InvalidArgument,
+                    "malformed stream header",
+                ))
+            }
+        };
+        if header.service.is_empty() {
+            return Route::Reject(RpcStatus::error(
+                StatusCode::InvalidArgument,
+                "missing service name",
+            ));
+        }
+
+        let key = (header.service.clone(), header.version);
+        let (meta, factory) = if let Some(s) = self.services.get(&key) {
+            (s.clone(), None)
+        } else if let (Some(probe), Some(f)) = (
+            self.session_probes.get(&key),
+            self.session_factories.get(&key),
+        ) {
+            // Session-scoped: gate on the metadata probe; the instance is
+            // resolved below, after the cheap checks.
+            (probe.clone(), Some(f.clone()))
+        } else {
+            return Route::Reject(not_found(&header));
+        };
+
+        // Provenance BEFORE method routing and before any handler runs. A
+        // service that declares `iroh_only` must never see a call whose peer id
+        // the transport could not vouch for, and it must not have to remember
+        // to check. `NotFound` rather than `PermissionDenied`: over an
+        // unauthenticated transport the service's existence is itself not
+        // something to confirm.
+        if meta.iroh_only() && !parts.provenance.is_authenticated() {
+            return Route::Reject(not_found(&header));
+        }
+
+        let methods = meta.methods();
+        if !methods.is_empty() && !methods.iter().any(|m| *m == header.method) {
+            return Route::Reject(RpcStatus::error(
+                StatusCode::Unimplemented,
+                format!(
+                    "method '{}.{}' not implemented",
+                    header.service, header.method
+                ),
+            ));
+        }
+
+        // Rust speaks XLANG on the wire only (JSON is intentionally unsupported).
+        if header.serialization_mode != SerializationMode::Xlang.as_i8() {
+            return Route::Reject(RpcStatus::error(
+                StatusCode::InvalidArgument,
+                format!(
+                    "unsupported serialization mode: {}",
+                    header.serialization_mode
+                ),
+            ));
+        }
+
+        let target = match factory {
+            // SHARED service: one instance for everyone, and no session id.
+            None => match check_shared(&header.service, header.session_id) {
+                Ok(()) => Target::Ready(meta.clone()),
+                Err(e) => return Route::Reject(e.status()),
+            },
+            Some(factory) => match parts.connection_id {
+                // §7.5: keyed by (connection, session id), never by the id
+                // alone. Resolved here, before any authenticator, so that this
+                // runs in the serve loop ahead of the connection's
+                // `ConnectionClosed` and can never resurrect a reaped entry.
+                Some(conn) if header.session_id != 0 => {
+                    match self
+                        .sessions
+                        .resolve_connection(conn, &key, header.session_id, &factory)
+                    {
+                        Ok(inst) => Target::Ready(inst),
+                        Err(e) => return Route::Reject(e.status()),
+                    }
+                }
+                Some(_) => return Route::Reject(missing_session(&header.service).status()),
+                // No connection (HTTP): string id, scoped to the caller's
+                // principal, which an authenticator may still change.
+                None => match http_session_id(&header) {
+                    None => return Route::Reject(missing_session(&header.service).status()),
+                    Some(sid) if self.authenticator.is_some() => {
+                        Target::HttpSession { factory, sid }
+                    }
+                    Some(sid) => Target::Ready(self.sessions.resolve_http(
+                        &parts.peer_id,
+                        &key,
+                        &sid,
+                        &factory,
+                    )),
+                },
+            },
+        };
+
+        // The deadline clock starts at receipt (the header carries relative
+        // seconds; Aster-SPEC §6.8).
+        let deadline = [
+            self.handler_timeout,
+            (header.deadline > 0).then(|| Duration::from_secs(header.deadline as u64)),
+            meta.method_timeout(&header.method),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|t| Instant::now() + t);
+
+        let routed = Routed {
+            header,
+            key,
+            meta,
+            target,
+            attributes: HashMap::new(),
+            deadline,
+        };
+        if self.authenticator.is_some() {
+            return Route::Authenticate(routed);
+        }
+        let attributes = self.attributes.get(&parts.peer_id);
+        if let Err(status) = gate3(&*routed.meta, &routed.header, &attributes) {
+            return Route::Reject(status);
+        }
+        Route::Dispatch(Routed {
+            attributes,
+            ..routed
+        })
+    }
+
+    /// Finish a call routed by [`route`](Dispatcher::route): send the refusal
+    /// trailer, or run the authenticator and Gate 3 if still pending, then
+    /// inflate the first request frame and run the handler. Resolves when the
+    /// handler returns.
+    pub async fn complete(&self, route: Route, mut parts: CallParts) {
+        let routed = match route {
+            Route::Reject(status) => {
+                emit_rpc_status(&parts.response_sender, &status).await;
+                return;
+            }
+            Route::Dispatch(routed) => routed,
+            Route::Authenticate(routed) => match self.authenticate(routed, &mut parts).await {
+                Ok(routed) => routed,
+                Err(status) => {
+                    emit_rpc_status(&parts.response_sender, &status).await;
+                    return;
+                }
+            },
+        };
+        let Routed {
+            header,
+            target,
+            attributes,
+            deadline,
+            ..
+        } = routed;
+        let svc = match target {
+            Target::Ready(svc) => svc,
+            // `authenticate` resolves every HTTP session before returning.
+            Target::HttpSession { .. } => unreachable!("HTTP session left unresolved"),
+        };
+
+        // §5.6: inflate a compressed first request frame once, after the gates
+        // (an unauthorised caller costs no decompression), so handlers see the
+        // logical payload. Later client-stream / bidi frames are inflated as
+        // they are read.
+        if parts.request_flags & FLAG_COMPRESSED != 0 {
+            match decompress(&parts.request_payload) {
+                Ok(p) => {
+                    parts.request_payload = p;
+                    parts.request_flags &= !FLAG_COMPRESSED;
+                }
+                Err(e) => {
+                    emit_trailer(
+                        &parts.response_sender,
+                        StatusCode::InvalidArgument,
+                        &format!("request payload: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        let method = header.method.clone();
+        let Some(at) = deadline else {
+            svc.dispatch(&method, Call::new(parts, header, attributes, None))
+                .await;
+            return;
+        };
+        let cancelled = parts.cancelled.clone();
+        let sender = parts.response_sender.clone();
+        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+        let _guard = self.deadlines.register(at, move || {
+            let _ = fire.send(());
+        });
+        let handler = svc.dispatch(&method, Call::new(parts, header, attributes, Some(at)));
+        tokio::select! {
+            biased;
+            () = handler => {}
+            _ = fired => {
+                // The handler future is dropped when this arm wins, which
+                // cancels it. Flag the call too, for anything it spawned.
+                cancelled.store(true, Ordering::Release);
+                emit_trailer(&sender, StatusCode::DeadlineExceeded, "deadline exceeded").await;
+            }
+        }
+    }
+
+    /// The async half of routing when an [`Authenticator`] is configured: run
+    /// it, merge its attributes (enrollment wins on key collision), apply its
+    /// principal, run Gate 3, and resolve an HTTP-scoped session under the
+    /// resulting principal.
+    async fn authenticate(
+        &self,
+        mut routed: Routed,
+        parts: &mut CallParts,
+    ) -> std::result::Result<Routed, RpcStatus> {
+        let mut attrs = self.attributes.get(&parts.peer_id);
+        if let Some(auth) = self.authenticator.as_ref() {
+            let ctx = AuthContext {
+                peer_id: parts.peer_id.clone(),
+                service: routed.header.service.clone(),
+                method: routed.header.method.clone(),
+                session_id: routed.header.session_id,
+                metadata: metadata_map(&routed.header),
+            };
+            let outcome = auth.authenticate(&ctx).await?;
+            if let Some(principal) = outcome.principal {
+                parts.peer_id = principal;
+            }
+            for (k, v) in outcome.attributes {
+                attrs.entry(k).or_insert(v);
+            }
+        }
+        gate3(&*routed.meta, &routed.header, &attrs)?;
+        if let Target::HttpSession { factory, sid } = &routed.target {
+            routed.target = Target::Ready(self.sessions.resolve_http(
+                &parts.peer_id,
+                &routed.key,
+                sid,
+                factory,
+            ));
+        }
+        routed.attributes = attrs;
+        Ok(routed)
     }
 
     /// The Gate-3 [`AttributeStore`] this dispatcher checks. A transport's auth
@@ -413,13 +756,22 @@ impl Dispatcher {
         &self.attributes
     }
 
-    /// Drop all session-scoped instances for `session_id` (e.g. on session
-    /// close). Subsequent calls with that id create fresh instances.
+    /// Drop the HTTP-scoped session instances named `session_id` (the
+    /// `aster-session-id` string), for every principal. Subsequent calls with
+    /// that id create fresh instances. Connection-scoped (Iroh) sessions are
+    /// not affected; they end with their connection
+    /// ([`close_connection`](Dispatcher::close_connection)).
     pub fn end_session(&self, session_id: &str) {
-        self.sessions
-            .write()
-            .unwrap()
-            .retain(|(_, _, sid), _| sid != session_id);
+        self.sessions.end_http_session(session_id);
+    }
+
+    /// Reap every session opened on `connection_id`, along with that
+    /// connection's graveyard and session count (§7.5). [`Server::serve`] does
+    /// this on the reactor's `ConnectionClosed`; a transport that assigns its
+    /// own connection ids (see [`CallParts::with_connection_id`]) calls it when
+    /// a connection ends. Returns the number of sessions dropped.
+    pub fn close_connection(&self, connection_id: u64) -> usize {
+        self.sessions.close_connection(connection_id)
     }
 }
 
@@ -493,6 +845,12 @@ pub struct CallParts {
     pub response_sender: ResponseSender,
     pub request_receiver: Receiver<RequestFrame>,
     pub cancelled: Arc<AtomicBool>,
+    /// The connection the call arrived on, when the transport has one. Session
+    /// scoping depends on it: `Some` gives connection-scoped sessions (§7.5),
+    /// `None` gives HTTP-style principal-scoped sessions. Set by
+    /// [`from_incoming`](CallParts::from_incoming), or
+    /// [`with_connection_id`](CallParts::with_connection_id).
+    pub connection_id: Option<u64>,
 }
 
 impl CallParts {
@@ -518,7 +876,18 @@ impl CallParts {
             response_sender,
             request_receiver,
             cancelled,
+            connection_id: None,
         }
+    }
+
+    /// Mark the call as arriving on connection `connection_id`, so
+    /// session-scoped services key their instances by `(connection, session
+    /// id)` (§7.5). The transport must then call
+    /// [`Dispatcher::close_connection`] when that connection ends, or its
+    /// sessions are never reaped. Ids must be unique among live connections.
+    pub fn with_connection_id(mut self, connection_id: u64) -> Self {
+        self.connection_id = Some(connection_id);
+        self
     }
 
     /// Extract the dispatch-relevant parts from a reactor [`IncomingCall`],
@@ -537,6 +906,7 @@ impl CallParts {
             response_sender: call.response_sender,
             request_receiver: call.request_receiver,
             cancelled: call.cancelled,
+            connection_id: Some(call.connection_id),
         }
     }
 }
@@ -564,187 +934,119 @@ impl ServerHandle {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_call(
-    services: Arc<Registry>,
-    session_factories: Arc<SessionFactories>,
-    sessions: Arc<SessionTable>,
-    attributes: AttributeStore,
-    authenticator: Option<Arc<dyn Authenticator>>,
-    mut call: CallParts,
-) {
-    // Pre-dispatch gating, mirroring `bindings/python/aster/server.py`:
-    // missing service → INVALID_ARGUMENT, unknown (service, version) → NOT_FOUND,
-    // unknown method → UNIMPLEMENTED, unsupported serialization mode →
-    // INVALID_ARGUMENT, capability denied → PERMISSION_DENIED (Aster-SPEC §6.5).
-    let header = match decode_stream_header(&call.header_payload) {
-        Ok(h) => h,
-        Err(_) => {
-            emit_trailer(
-                &call.response_sender,
-                StatusCode::Internal,
-                "malformed stream header",
-            )
-            .await;
-            return;
-        }
-    };
+/// The outcome of [`Dispatcher::route`].
+pub enum Route {
+    /// Every gate passed: run the handler ([`Dispatcher::complete`]).
+    Dispatch(Routed),
+    /// The synchronous gates passed, but the configured [`Authenticator`]
+    /// must run before Gate 3; [`Dispatcher::complete`] does both.
+    Authenticate(Routed),
+    /// Refused before any handler: send this status as a trailer-only
+    /// response.
+    Reject(RpcStatus),
+}
 
-    if header.service.is_empty() {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::InvalidArgument,
-            "missing service name",
-        )
-        .await;
-        return;
-    }
-
-    let key = (header.service.clone(), header.version);
-    let svc = if let Some(s) = services.get(&key) {
-        // SHARED service: one instance for everyone.
-        s.clone()
-    } else if let Some(factory) = session_factories.get(&key) {
-        // SESSION-scoped service: an instance per session id.
-        let sid = session_key(&header);
-        if sid.is_empty() {
-            emit_trailer(
-                &call.response_sender,
-                StatusCode::InvalidArgument,
-                &format!(
-                    "service '{}' v{} is session-scoped; an aster-session-id is required",
-                    header.service, header.version
-                ),
-            )
-            .await;
-            return;
-        }
-        get_or_create_session(&sessions, &key, &sid, factory)
-    } else {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::NotFound,
-            &format!("service '{}' v{} not found", header.service, header.version),
-        )
-        .await;
-        return;
-    };
-
-    // Provenance BEFORE method routing and before any handler runs. A service
-    // that declares `iroh_only` must never see a call whose peer id the
-    // transport could not vouch for, and it must not have to remember to check.
-    // `NotFound` rather than `PermissionDenied`: over an unauthenticated
-    // transport the service's existence is itself not something to confirm.
-    if svc.iroh_only() && !call.provenance.is_authenticated() {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::NotFound,
-            &format!("service '{}' v{} not found", header.service, header.version),
-        )
-        .await;
-        return;
-    }
-
-    let methods = svc.methods();
-    if !methods.is_empty() && !methods.iter().any(|m| *m == header.method) {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::Unimplemented,
-            &format!(
-                "method '{}.{}' not implemented",
-                header.service, header.method
-            ),
-        )
-        .await;
-        return;
-    }
-
-    // Rust speaks XLANG on the wire only (JSON is intentionally unsupported).
-    if header.serialization_mode != SerializationMode::Xlang.as_i8() {
-        emit_trailer(
-            &call.response_sender,
-            StatusCode::InvalidArgument,
-            &format!(
-                "unsupported serialization mode: {}",
-                header.serialization_mode
-            ),
-        )
-        .await;
-        return;
-    }
-
-    // Enrollment-derived attributes for this peer (from the application's store).
-    let mut attrs = attributes.get(&call.peer_id);
-
-    // Pre-dispatch auth hook: may reject, override the principal, and contribute
-    // attributes — merged additively, **enrollment wins on key collision**.
-    if let Some(auth) = authenticator.as_ref() {
-        let ctx = AuthContext {
-            peer_id: call.peer_id.clone(),
-            service: header.service.clone(),
-            method: header.method.clone(),
-            session_id: header.session_id,
-            metadata: metadata_map(&header),
-        };
-        match auth.authenticate(&ctx).await {
-            Ok(outcome) => {
-                if let Some(principal) = outcome.principal {
-                    call.peer_id = principal;
-                }
-                for (k, v) in outcome.attributes {
-                    attrs.entry(k).or_insert(v);
-                }
-            }
-            Err(status) => {
-                emit_rpc_status(&call.response_sender, &status).await;
-                return;
-            }
+impl Route {
+    /// The refusal status, if the call was rejected.
+    pub fn rejection(&self) -> Option<&RpcStatus> {
+        match self {
+            Route::Reject(s) => Some(s),
+            _ => None,
         }
     }
+}
 
-    // Gate 3: per-call capability check against the resolved attributes.
-    // Service-level requirement first, then method-level — both must pass.
-    for req in [svc.service_requires(), svc.method_requires(&header.method)]
-        .into_iter()
-        .flatten()
+/// A call that passed routing: its decoded header and resolved target.
+/// Opaque; hand it back to [`Dispatcher::complete`].
+pub struct Routed {
+    header: StreamHeader,
+    key: ServiceKey,
+    /// The registered instance (SHARED) or metadata probe (SESSION) the gates
+    /// consult.
+    meta: Arc<dyn ServiceDispatch>,
+    target: Target,
+    attributes: HashMap<String, String>,
+    deadline: Option<Instant>,
+}
+
+impl Routed {
+    /// The decoded request header.
+    pub fn header(&self) -> &StreamHeader {
+        &self.header
+    }
+
+    /// When the handler will be cancelled with `DEADLINE_EXCEEDED`, if ever.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+}
+
+enum Target {
+    /// The instance that will handle the call.
+    Ready(Arc<dyn ServiceDispatch>),
+    /// An HTTP-scoped session whose instance depends on the principal the
+    /// authenticator resolves.
+    HttpSession {
+        factory: SessionFactory,
+        sid: String,
+    },
+}
+
+fn not_found(header: &StreamHeader) -> RpcStatus {
+    RpcStatus::error(
+        StatusCode::NotFound,
+        format!("service '{}' v{} not found", header.service, header.version),
+    )
+}
+
+/// Gate 3: the service-level requirement, then the method-level one; both must
+/// pass against the caller's resolved attributes.
+fn gate3(
+    meta: &dyn ServiceDispatch,
+    header: &StreamHeader,
+    attrs: &HashMap<String, String>,
+) -> std::result::Result<(), RpcStatus> {
+    for req in [
+        meta.service_requires(),
+        meta.method_requires(&header.method),
+    ]
+    .into_iter()
+    .flatten()
     {
-        if !evaluate_capability(&req, &attrs) {
-            emit_trailer(
-                &call.response_sender,
+        if !evaluate_capability(&req, attrs) {
+            return Err(RpcStatus::error(
                 StatusCode::PermissionDenied,
-                &format!(
+                format!(
                     "capability check failed for '{}.{}'",
                     header.service, header.method
                 ),
-            )
-            .await;
-            return;
+            ));
         }
     }
+    Ok(())
+}
 
-    // §5.6: inflate a compressed first request frame once, after the gates (an
-    // unauthorised caller costs no decompression), so handlers see the logical
-    // payload. Later client-stream / bidi frames are inflated as they are read.
-    if call.request_flags & FLAG_COMPRESSED != 0 {
-        match decompress(&call.request_payload) {
-            Ok(p) => {
-                call.request_payload = p;
-                call.request_flags &= !FLAG_COMPRESSED;
-            }
-            Err(e) => {
-                emit_trailer(
-                    &call.response_sender,
-                    StatusCode::InvalidArgument,
-                    &format!("request payload: {e}"),
-                )
-                .await;
-                return;
-            }
+/// Send a refusal trailer without spawning when the response queue has room
+/// (it always does for a fresh call); fall back to a task only if it is full.
+fn reject_now(sender: ResponseSender, status: &RpcStatus) {
+    let Ok(bytes) = encode_rpc_status(status) else {
+        return;
+    };
+    let Ok(frame) = encode_frame(&bytes, FLAG_TRAILER) else {
+        return;
+    };
+    let frame = OutgoingFrame::Trailer(frame);
+    match sender.try_reserve(frame.encoded_len()) {
+        Ok(permit) => {
+            let _ = permit.send(frame);
         }
+        Err(ResponseReserveError::Full) => {
+            tokio::spawn(async move {
+                let _ = sender.send(frame).await;
+            });
+        }
+        Err(_) => {}
     }
-
-    let method = header.method.clone();
-    svc.dispatch(&method, Call::new(call, header, attrs)).await;
 }
 
 /// Send a trailer-only error response (no data frame) before a [`Call`] exists.
@@ -775,34 +1077,15 @@ fn metadata_map(h: &StreamHeader) -> HashMap<String, String> {
         .collect()
 }
 
-/// The session id for a call: the `aster-session-id` metadata header (HTTP), or
-/// the numeric `StreamHeader.session_id` (Iroh) when non-zero. Empty = none.
-fn session_key(h: &StreamHeader) -> String {
+/// The session id of an HTTP-style call (no connection id): the
+/// `aster-session-id` metadata header, else a non-zero `StreamHeader.session_id`.
+fn http_session_id(h: &StreamHeader) -> Option<String> {
     for (k, v) in h.metadata_keys.iter().zip(h.metadata_values.iter()) {
         if k == "aster-session-id" && !v.is_empty() {
-            return v.clone();
+            return Some(v.clone());
         }
     }
-    if h.session_id != 0 {
-        return h.session_id.to_string();
-    }
-    String::new()
-}
-
-/// Get (or lazily create) the per-session instance for `(service, session-id)`.
-fn get_or_create_session(
-    sessions: &SessionTable,
-    key: &(String, i32),
-    sid: &str,
-    factory: &SessionFactory,
-) -> Arc<dyn ServiceDispatch> {
-    let full = (key.0.clone(), key.1, sid.to_string());
-    if let Some(inst) = sessions.read().unwrap().get(&full) {
-        return inst.clone();
-    }
-    let mut guard = sessions.write().unwrap();
-    // Re-check under the write lock (another call may have created it).
-    guard.entry(full).or_insert_with(|| factory()).clone()
+    (h.session_id != 0).then(|| h.session_id.to_string())
 }
 
 /// Per-call server context: request input, response output, and the decoded
@@ -826,10 +1109,16 @@ pub struct Call {
     /// there are *additional* frames to forward; if the first frame already ended
     /// the stream, the channel is never closed, so we must not block reading it.
     first_is_end: bool,
+    deadline: Option<Instant>,
 }
 
 impl Call {
-    fn new(inner: CallParts, header: StreamHeader, attributes: HashMap<String, String>) -> Self {
+    fn new(
+        inner: CallParts,
+        header: StreamHeader,
+        attributes: HashMap<String, String>,
+        deadline: Option<Instant>,
+    ) -> Self {
         let CallParts {
             peer_id,
             provenance,
@@ -851,7 +1140,16 @@ impl Call {
             first_request: Some(request_payload),
             request_receiver: Some(request_receiver),
             first_is_end,
+            deadline,
         }
+    }
+
+    /// When the server will cancel this call with `DEADLINE_EXCEEDED`: the
+    /// minimum of the caller's header deadline, the method's
+    /// [`method_timeout`](ServiceDispatch::method_timeout) and the server's
+    /// [`handler_timeout`](Server::handler_timeout). `None` = no deadline.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 
     /// The decoded request header.

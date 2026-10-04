@@ -376,7 +376,7 @@ impl CoordinationNetwork {
             service: RAFT_SERVICE.to_string(),
             method: method.to_string(),
             version: RAFT_VERSION,
-            deadline: option.hard_ttl().as_secs().min(i16::MAX as u64) as i16,
+            deadline: crate::rpc::codec::deadline_header_secs(option.hard_ttl()),
             ..Default::default()
         };
 
@@ -725,7 +725,7 @@ impl CoordinationNetwork {
             // a snapshot transfer had no deadline at all while
             // `install_snapshot_timeout` was configured at 30 s and enforced
             // nowhere.
-            deadline: option.hard_ttl().as_secs().min(i16::MAX as u64) as i16,
+            deadline: crate::rpc::codec::deadline_header_secs(option.hard_ttl()),
             ..Default::default()
         };
 

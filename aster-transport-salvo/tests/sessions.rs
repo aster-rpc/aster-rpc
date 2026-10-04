@@ -1,6 +1,8 @@
 //! Session-scoped services over HTTP: `register_session` gives each
 //! `aster-session-id` its own service instance (private state). Different
 //! session ids are independent; the same id shares state; no id is rejected.
+//! HTTP has no connection id, so these sessions are scoped to the caller's
+//! principal (here the remote address) rather than to a connection.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -80,10 +82,11 @@ async fn session_scoped_instances() {
     // A keeps its own state.
     assert_eq!(incr(&service, Some("A")).await.0, vec![vec![3u8]]);
 
-    // No session id → INVALID_ARGUMENT (session-scoped service requires one).
+    // No session id → FAILED_PRECONDITION, the same scope-mismatch status as
+    // a session-scoped call with `sessionId == 0` over Iroh (§7.5).
     let (data, status) = incr(&service, None).await;
     assert!(data.is_empty());
-    assert_eq!(status.code, StatusCode::InvalidArgument.as_i32());
+    assert_eq!(status.code, StatusCode::FailedPrecondition.as_i32());
 
     node.shutdown().await;
 }
