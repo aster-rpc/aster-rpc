@@ -46,90 +46,6 @@ export declare class AdmissionRequests {
   close(): Promise<void>
 }
 
-/**
- * Client-side per-call handle. Wraps either a pool-backed stream
- * (unary) or a dedicated streaming substream (server/client/bidi).
- */
-export declare class AsterCall {
-  /**
-   * Acquire a call handle from the connection's per-connection
-   * multiplexed-stream pool. `sessionId == 0` selects the SHARED
-   * pool; any non-zero value selects the session pool keyed by that
-   * id. Throws a `StreamAcquireError`-tagged error on pool/quic
-   * failure — parse the message prefix for the reason.
-   */
-  static acquire(conn: IrohConnection, sessionId: number): Promise<AsterCall>
-  /**
-   * Acquire a **streaming** call handle. Unlike `acquire`, this
-   * bypasses the per-connection pool and opens a dedicated
-   * multiplexed substream via `open_bi` — per
-   * `ffi_spec/Aster-multiplexed-streams.md` §3 line 65, "streaming
-   * substreams don't count against any pool." Use this for
-   * server-stream / client-stream / bidi calls; use `acquire` for
-   * unary.
-   *
-   * `sessionId` is not used by this entry point — the binding
-   * carries the session id in the `StreamHeader` it sends itself.
-   */
-  static acquireStreaming(conn: IrohConnection): Promise<AsterCall>
-  /**
-   * **Unary fast-path** (spec §8). Collapses the full
-   * acquire → send header → send request → recv response →
-   * recv trailer → release sequence into ONE napi round-trip.
-   *
-   * `requestPair` is a single buffer holding the already-framed
-   * StreamHeader frame concatenated with the already-framed
-   * request frame (`[4B LE len][1B flags][payload]` twice). The
-   * Rust side writes the whole buffer in one `write_all` so Quinn
-   * sees one logical write, then reads frames from the same
-   * pooled stream until a `FLAG_TRAILER` frame appears. The first
-   * non-row-schema data frame is returned as the response; any
-   * extra data frames are ignored (unary contract).
-   *
-   * Why: v1 `IrohTransport.unary` does ~10 napi round-trips per
-   * unary call (openBi + 2 writeFrames + finish + 2x readFrame
-   * with 3 internal read_exact each). On macOS arm64 each hop is
-   * ~30-50 µs, so ~0.4 ms of the per-call budget is pure
-   * napi-boundary overhead. This method reduces it to ONE hop.
-   * Java already uses the equivalent FFI fast path via
-   * `ffi::aster_call_unary` and sees ~3k req/s vs TS's ~1k.
-   *
-   * On acquire failure the error carries the same
-   * `StreamAcquireError:<REASON>:` prefix as `AsterCall.acquire`.
-   * On transport failure the pool slot is discarded (poisoned)
-   * so parked waiters wake with a retry signal.
-   */
-  static unaryFastPath(conn: IrohConnection, sessionId: number, requestPair: Buffer): Promise<UnaryFastPathResult>
-  /**
-   * Write a pre-framed byte slice onto the call's send side.
-   * `frameBytes` must already include the 4-byte LE length prefix,
-   * the 1-byte flags, and the payload.
-   */
-  sendFrame(frameBytes: Buffer): Promise<void>
-  /**
-   * Pull the next frame on the recv side. Returns a `RecvFrameResult`
-   * where `kind` discriminates OK / end-of-stream / timeout. On EOS or
-   * timeout the payload is empty and flags is 0. `timeoutMs == 0`
-   * blocks indefinitely.
-   */
-  recvFrame(timeoutMs?: number | undefined | null): Promise<RecvFrameResult>
-  /**
-   * Success path. Drops the pool handle so its RAII return-to-pool
-   * fires. After release, send/recv on this call throw
-   * `call already terminated`.
-   *
-   * MUST NOT be called while a concurrent `sendFrame` or `recvFrame`
-   * is in flight on this call — matches the Python contract.
-   */
-  release(): void
-  /**
-   * Error path. Poisons the pool handle so the underlying stream is
-   * dropped (not returned to the pool) and the pool slot is freed.
-   * Parked waiters on the same key are woken with a retry signal.
-   */
-  discard(): void
-}
-
 export declare class BlobsClient {
   /** Add bytes to the blob store, returning the hash hex string. */
   addBytes(data: Buffer): Promise<string>
@@ -239,6 +155,52 @@ export declare class BlobsClient {
   blobLocalInfo(hashHex: string): Promise<BlobLocalInfo>
 }
 
+/**
+ * A cancellation handle for one unary call (wired to an `AbortSignal` by
+ * the JS side). Cancelling a call that already finished does nothing.
+ */
+export declare class CancelToken {
+  constructor()
+  /** Cancel the call this token was passed to. */
+  cancel(): void
+  get cancelled(): boolean
+}
+
+/**
+ * One open streaming call. Dropping it (garbage collection) before it ends
+ * cancels it.
+ */
+export declare class ClientCall {
+  /** Send one request payload (flushed at once). */
+  send(payload: Uint8Array): Promise<void>
+  /**
+   * Send several request payloads in as few writes as possible; `last`
+   * ends the request stream with the final one.
+   */
+  sendMany(payloads: Array<Uint8Array>, last: boolean): Promise<void>
+  /**
+   * End the request stream (idempotent). Fails with `INVALID_ARGUMENT`
+   * (and cancels) when no request was sent.
+   */
+  finish(): Promise<void>
+  /**
+   * The next response payload; `null` at the OK trailer. Rejects with
+   * the call's status on a non-OK trailer, deadline, cancel or lost
+   * connection.
+   */
+  next(): Promise<Buffer | null>
+  /**
+   * Client-streaming: the single response (await after `finish`, or
+   * earlier: it resolves as soon as the server answers).
+   */
+  response(): Promise<Buffer>
+  /**
+   * Cancel the call (`FLAG_CANCEL`, then reset). Pending and later
+   * operations reject with `CANCELLED`. A no-op once the call ended.
+   */
+  cancel(): Promise<void>
+}
+
 /** The full durable, redirecting coordination client. */
 export declare class CoordinationClient {
   /** The group this client is bound to (hex). */
@@ -339,11 +301,12 @@ export declare class CoordinationResolvedMutation {
 }
 
 /**
- * An RPC server whose services are implemented in JS (T4.0 prototype).
+ * An RPC server whose services are implemented in JS.
  *
- * Start with `DispatchServer.start(config, servicesJson, options, onEvents)`.
- * Every response operation is keyed by the event's `callId` and is
- * non-blocking except `recv` and `waitWritable`.
+ * Start with `DispatchServer.serve(node, servicesJson, options, onEvents)`
+ * (or `start(config, …)` for a server with its own node). Every response
+ * operation is keyed by the event's `callId` and is non-blocking except
+ * `recv` and `waitWritable`.
  *
  * Submit results (`respond` / `send` / `finish`): `0` sent; `> 0` the
  * response queue is full — nothing was sent, `await waitWritable(callId, n)`
@@ -352,38 +315,74 @@ export declare class CoordinationResolvedMutation {
  */
 export declare class DispatchServer {
   /**
-   * Start a node serving `servicesJson` (one `DynamicService` JSON
-   * document per service, design §1.5; array index = `serviceIdx`).
+   * Serve `servicesJson` (one `DynamicService` JSON document per service,
+   * design §1.5; array index = `serviceIdx`) on `node`, which must have
+   * been started with `aster/1` among its ALPNs. Rust takes over the
+   * node's accept loop: non-RPC ALPNs no Rust handler claims arrive as
+   * `kind` 7 events. `close()` stops serving; the node stays up.
    *
    * `onEvents` receives every event for the TSFN deliveries and is
    * required for them; it must not throw. With `delivery: "ring"` pass
    * nothing and pull with `nextBatch` / `pollBatch`.
+   *
+   * `gateAttributes`: Gate 3 also reads each caller's attributes from
+   * this gate's admission store (live; merged under `setPeerAttributes`).
+   * Costs one task per call, so pass it only when a service declares
+   * `requires`.
+   */
+  static serve(node: Node, servicesJson: string[], options?: DispatchServerOptions | undefined | null, onEvents?: ((events: DispatchEvent[]) => void) | undefined | null, gateAttributes?: GatePolicy | undefined | null): Promise<DispatchServer>
+  /**
+   * Start a node from `config` and serve `servicesJson` on it (see
+   * `serve`). `close()` shuts the node down too.
    */
   static start(config: AsterConfig | undefined | null, servicesJson: string[], options?: DispatchServerOptions | undefined | null, onEvents?: ((events: DispatchEvent[]) => void) | undefined | null): Promise<DispatchServer>
-  /** This server's `aster1…` ticket. */
+  /** This server's `aster1…` ticket (`start` only; `""` for `serve`). */
   get address(): string
   /** Number of live calls in the call table (0 once every call ended). */
   liveCalls(): number
   /**
+   * Attribute bridge (design §2.6): set the attributes Gate 3 checks
+   * `requires` against for `peer` (hex node id). `null` / empty clears
+   * the entry. Fed by the frozen credential admission.
+   */
+  setPeerAttributes(peer: string, attributes?: Record<string, string> | undefined | null): void
+  /** The attributes Gate 3 currently sees for `peer`. */
+  peerAttributes(peer: string): Record<string, string>
+  /**
+   * Take a non-RPC connection (`kind` 7 event) by its `connectionId`.
+   * `null` if already taken or unknown.
+   */
+  takeConnection(connectionId: number): IrohConnection | null
+  /**
+   * The selected QUIC path of an `aster/1` connection (by the call
+   * event's `connectionId`); `null` once it closed.
+   */
+  transportSnapshot(connectionId: number): TransportSnapshot | null
+  /**
+   * The `aster/1` connection a call arrived on (tunnels, path info);
+   * `null` once it closed.
+   */
+  connection(connectionId: number): IrohConnection | null
+  /**
    * Diagnostics: `[liveCalls, queued, flag, tsfnCalls, tsfnCallbacks,
-   * tsfnFailures, lastFailureStatus, watchdogRescues]`. TSFN: `queued` = events waiting in
-   * the T-b queue, `flag` = a T-b call is outstanding. Ring: `queued` =
-   * events in the ring (-1 while a `nextBatch` holds it), `flag` = the
-   * pump stopped.
+   * tsfnFailures, lastFailureStatus, watchdogRescues]`. TSFN: `queued` =
+   * events waiting in the batched queue, `flag` = a batched call is
+   * outstanding. Ring: `queued` = events in the ring (-1 while a
+   * `nextBatch` holds it), `flag` = the pump stopped.
    */
   debugState(): Array<number>
   /**
-   * Diagnostics: queue one extra T-b drain call (no-op for other
+   * Diagnostics: queue one extra batched drain call (no-op for other
    * deliveries).
    */
   debugNudge(): void
   /**
-   * R1: resolve with the next batch (at most `max`, default 256), waiting
+   * Resolve with the next batch (at most `max`, default 256), waiting
    * until there is one. Resolves `[]` once the server is closed.
    */
   nextBatch(max?: number | undefined | null): Promise<DispatchEvent[]>
   /**
-   * R2: take whatever is ready now (at most `max`, default 256), without
+   * Take whatever is ready now (at most `max`, default 256), without
    * waiting. Returns `[]` while a `nextBatch` is pending.
    */
   pollBatch(max?: number | undefined | null): DispatchEvent[]
@@ -391,11 +390,11 @@ export declare class DispatchServer {
    * Unary / client-stream: one terminal response (data frame, omitted when
    * `payload` is empty, plus trailer). `code` defaults to OK.
    */
-  respond(callId: number, payload: Uint8Array, code?: number | undefined | null, message?: string | undefined | null): number
+  respond(callId: number, payload: Uint8Array, code?: number | undefined | null, message?: string | undefined | null, details?: Record<string, string> | undefined | null): number
   /** Server-stream / bidi: one data frame (`payload` must not be empty). */
   send(callId: number, payload: Uint8Array): number
   /** End a stream with the trailer. `code` defaults to OK. */
-  finish(callId: number, code?: number | undefined | null, message?: string | undefined | null): number
+  finish(callId: number, code?: number | undefined | null, message?: string | undefined | null, details?: Record<string, string> | undefined | null): number
   /**
    * After a submit returned `n > 0`: resolve `true` once `n` bytes of
    * response capacity are held (the retry will not be full), `false` if
@@ -409,6 +408,20 @@ export declare class DispatchServer {
    */
   recv(callId: number): Promise<Buffer | null>
   /**
+   * Client-stream / bidi: the next request payloads, waiting for the
+   * first and then taking (without waiting) any others already received,
+   * up to `max` (default 64). `[]` at the end of the request stream (or
+   * for an unknown call). One crossing for a burst of requests.
+   */
+  recvBatch(callId: number, max?: number | undefined | null): Promise<Buffer[]>
+  /** The call's header metadata (also on the event when non-empty). */
+  metadata(callId: number): Record<string, string>
+  /**
+   * The caller's attributes as Gate 3 saw them (also on the event when
+   * non-empty).
+   */
+  attributes(callId: number): Record<string, string>
+  /**
    * Whether the call was cancelled (peer, stream failure, deadline). An
    * unknown call reads as cancelled.
    */
@@ -419,8 +432,9 @@ export declare class DispatchServer {
    */
   abandon(callId: number): void
   /**
-   * Stop serving and shut the node down. Releases the event callback and
-   * resolves any pending `nextBatch` with `[]`.
+   * Stop serving (and, for `start`, shut the node down). Releases the
+   * event callback and resolves any pending `nextBatch` with `[]`.
+   * Untaken non-RPC connections are closed.
    */
   close(): Promise<void>
 }
@@ -973,120 +987,40 @@ export declare class PolicyDoc {
 }
 
 /**
- * Sync cancel flag wrapping the reactor's per-call `Arc<AtomicBool>`.
- * Streaming dispatchers poll this between iterations to stop early when
- * the peer sends `FLAG_CANCEL` or the QUIC stream errors mid-call.
+ * A client over one `aster/1` connection: pooled unary calls, streaming
+ * calls and session ids from the connection's shared counter.
  */
-export declare class ReactorCancelFlag {
-  get isCancelled(): boolean
-}
-
-/**
- * Event surfaced by [`ReactorHandle::nextEvent`]. `kind` is
- * `"call"` or `"connection_closed"`. Call-specific fields are
- * only populated on `call`; `close*` fields only on `connection_closed`.
- */
-export declare class ReactorEvent {
-  /** `"call"` or `"connection_closed"`. */
-  get kind(): string
-  get connectionId(): bigint
-  get peerId(): string
-  get callId(): bigint
-  get headerPayload(): Buffer | null
-  get headerFlags(): number
-  get requestPayload(): Buffer | null
-  get requestFlags(): number
+export declare class RpcConnection {
   /**
-   * Take the response sender out of this Call event. May be called
-   * once; returns `null` on subsequent calls or for non-Call events.
+   * Wrap a connection dialled on `aster/1`. Clients on the same
+   * connection share its stream pool and session-id counter.
    */
-  takeSender(): ReactorResponseSender | null
+  constructor(connection: IrohConnection)
   /**
-   * Take the request receiver out of this Call event. May be called
-   * once; returns `null` on subsequent calls or for non-Call events.
-   * Only client-streaming and bidi dispatchers need this.
+   * A fresh session id from the connection's counter (shared with every
+   * client on the connection, Rust included, so ids never collide).
    */
-  takeRequestReceiver(): ReactorRequestReceiver | null
+  nextSessionId(): number
+  /** Unary calls on the wire at once (the SHARED pool's stream count). */
+  get sharedPoolSize(): number
+  /** Change the SHARED pool size (minimum 1; connection-wide). */
+  setSharedPoolSize(size: number): void
   /**
-   * Take the cancel flag (returns a fresh handle sharing the same
-   * atomic). Streaming dispatchers poll it to stop early on
-   * `FLAG_CANCEL` or stream reset.
+   * Unary call on the pooled path. `deadlineMs` 0 = none; `metadata` is
+   * a flat `[key, value, …]` list; `serializationMode` 0 xlang, 1
+   * native, 2 row. Resolves with the response payload (empty when the
+   * handler responded with nothing).
    */
-  takeCancelFlag(): ReactorCancelFlag | null
-  get closeKind(): string | null
-  get closeCode(): bigint | null
-  get closeReason(): Buffer | null
-}
-
-/**
- * Pushes accepted connections into a reactor created via `createReactor`.
- * Used when the caller owns the accept loop and dispatches by ALPN before
- * forwarding the RPC connections.
- */
-export declare class ReactorFeeder {
-  feed(conn: IrohConnection): void
-}
-
-/**
- * Consumer handle for a running reactor. Bindings poll [`nextEvent`] in
- * a loop to drain calls and connection-closed signals.
- */
-export declare class ReactorHandle {
+  unary(service: string, method: string, version: number, sessionId: number, deadlineMs: number, metadata: Array<string> | undefined | null, serializationMode: number | undefined | null, callId: number | undefined | null, request: Uint8Array, cancel?: CancelToken | undefined | null): Promise<Buffer>
+  /** Open a server-streaming call; `request` goes out with the header. */
+  serverStream(service: string, method: string, version: number, sessionId: number, deadlineMs: number, metadata: Array<string> | undefined | null, serializationMode: number | undefined | null, callId: number | undefined | null, request: Uint8Array): Promise<ClientCall>
   /**
-   * Pull the next reactor event. Returns `null` when the reactor has
-   * shut down and no more events will arrive.
+   * Open a client-streaming call: `send` requests, then await
+   * `response()`.
    */
-  nextEvent(): Promise<ReactorEvent | null>
-}
-
-/**
- * Result of [`createReactor`]. napi classes can't be returned by value
- * through an `#[napi(object)]` field, so we wrap the pair in a small
- * holder with `takeHandle` / `takeFeeder` accessors — each may be called
- * exactly once.
- */
-export declare class ReactorPair {
-  takeHandle(): ReactorHandle
-  takeFeeder(): ReactorFeeder
-}
-
-/**
- * Per-call additional-request-frame stream. The first request frame
- * arrives inline on the [`ReactorEvent`]; this wrapper yields every
- * frame after that until the stream ends or a `FLAG_END_STREAM` frame
- * arrives. Only client-streaming and bidi dispatchers need this.
- */
-export declare class ReactorRequestReceiver {
-  /**
-   * Await the next request frame. `done: true` means the peer has
-   * finished sending and the channel is closed.
-   */
-  recv(): Promise<ReactorRequestFrame>
-}
-
-/**
- * Per-call response sender surfaced to the binding's dispatcher. Carries
- * the unbounded channel that the reactor drains to write frames to the
- * wire. For unary calls use [`submit`] (single write of frame+trailer);
- * for streaming calls call [`sendFrame`] for each frame and [`sendTrailer`]
- * to terminate.
- */
-export declare class ReactorResponseSender {
-  /**
-   * Unary fast-path: one Frame + one Trailer, atomically. After this
-   * call the sender is consumed and further submits fail.
-   */
-  submit(responseFrame: Buffer, trailerFrame: Buffer): Promise<void>
-  /**
-   * Streaming: send one response data frame. The sender stays open for
-   * further `sendFrame` / `sendTrailer` calls.
-   */
-  sendFrame(frame: Buffer): Promise<void>
-  /**
-   * Streaming terminator: send the trailer frame and consume the sender.
-   * Further sends fail.
-   */
-  sendTrailer(trailerFrame: Buffer): Promise<void>
+  clientStream(service: string, method: string, version: number, sessionId: number, deadlineMs: number, metadata: Array<string> | undefined | null, serializationMode: number | undefined | null, callId: number | undefined | null): Promise<ClientCall>
+  /** Open a bidirectional call: `send` and `next` concurrently. */
+  bidi(service: string, method: string, version: number, sessionId: number, deadlineMs: number, metadata: Array<string> | undefined | null, serializationMode: number | undefined | null, callId: number | undefined | null): Promise<ClientCall>
 }
 
 /** This node's topology view. Obtain with `node.topology()`. */
@@ -1768,13 +1702,6 @@ export interface CoordinationSeparationSummary {
   diversityProved: boolean
 }
 
-/**
- * Create a reactor that receives externally-fed connections. Returns the
- * handle for event polling and the feeder for pushing accepted connections,
- * bundled in a [`ReactorPair`] for take-once extraction.
- */
-export declare function createReactor(channelCapacity: number): ReactorPair
-
 /** Decode AEv1 bytes to a `CallHeader`. Throws on any malformed input. */
 export declare function decodeCallHeader(data: Uint8Array): NativeCallHeader
 
@@ -1820,7 +1747,7 @@ export declare function defaultAuthorId(secretKey: string | Uint8Array): string
 export interface DispatchEvent {
   /**
    * 1 call, 2 cancelled, 3 response-writable, 4 response-closed,
-   * 5 session-closed, 6 connection-closed.
+   * 5 session-closed, 6 connection-closed, 7 non-RPC connection.
    */
   kind: number
   /** Correlation key for every response operation (per server, from 1). */
@@ -1829,16 +1756,26 @@ export interface DispatchEvent {
   serviceIdx: number
   /** Index of the method in the service's `methods`. */
   methodIdx: number
-  /** `FIRST_IS_END` (1) | `NEW_SESSION` (2) | `IROH_AUTHENTICATED` (4). */
+  /**
+   * `FIRST_IS_END` (1) | `NEW_SESSION` (2) | `IROH_AUTHENTICATED` (4) |
+   * `HAS_METADATA` (0x100) | `HAS_ATTRIBUTES` (0x200).
+   */
   flags: number
   /** 0 = shared service; otherwise the Rust-assigned session key. */
   sessionKey: number
-  /** Connection id (0 without one, e.g. HTTP). */
+  /**
+   * Connection id (0 without one, e.g. HTTP). For `kind` 7, the handle
+   * for `takeConnection`.
+   */
   connectionId: number
   /** Absolute deadline, Unix ms; 0 = none. */
   deadlineMs: number
-  /** For `cancelled`: 1 peer, 2 deadline. */
+  /** For `cancelled`: 1 peer, 2 deadline, 3 corrupt request frame. */
   reason: number
+  /** `StreamHeader.call_id` (request id for logs); calls only. */
+  wireCallId: number
+  /** `StreamHeader.session_id` (the client's session id); calls only. */
+  sessionId: number
   /**
    * Peer endpoint id (or authenticator principal); calls and
    * connection-closed only.
@@ -1846,20 +1783,35 @@ export interface DispatchEvent {
   peer?: string
   /** The first request payload, already decompressed; calls only. */
   request?: Buffer
+  /** Call metadata (header), when non-empty. */
+  metadata?: Record<string, string>
+  /** The caller's Gate-3 attributes as Rust saw them, when non-empty. */
+  attributes?: Record<string, string>
+  /** The ALPN of a non-RPC connection (`kind` 7). */
+  alpn?: string
 }
 
-/** Options for [`DispatchServer::start`]. */
+/** Options for [`DispatchServer::serve`] / [`DispatchServer::start`]. */
 export interface DispatchServerOptions {
   /**
-   * `"tsfn"` (default; one TSFN call per event), `"tsfn-batched"` (TSFN,
-   * coalesced while JS is busy) or `"ring"` (pull with `nextBatch` /
-   * `pollBatch`; no `onEvents`).
+   * `"tsfn-batched"` (default; TSFN, coalesced while JS is busy),
+   * `"tsfn"` (one TSFN call per event) or `"ring"` (pull with
+   * `nextBatch` / `pollBatch`; no `onEvents`).
    */
   delivery?: string
   /** Ring capacity in events (`"ring"` only; default 4096). */
   ringCapacity?: number
   /** Serve the baseline `aster.ops.NodeInfo` service (default true). */
   builtinNodeInfo?: boolean
+  /** Serve the baseline `aster.net.Topology` service (default false). */
+  builtinTopology?: boolean
+  /** Cap on concurrently open sessions per connection (default 1024). */
+  maxSessionsPerConnection?: number
+  /**
+   * Cap on any handler, ms (default 300 000; 0 = no cap). A call's
+   * deadline is `min(header deadline, method timeout, this)`.
+   */
+  handlerTimeoutMs?: number
 }
 
 /** One document entry (metadata; read the value with `readEntryContent`). */
@@ -1899,6 +1851,13 @@ export interface DownloadPolicy {
   /** Key prefixes for the `*_except` modes. */
   prefixes?: Array<string | Uint8Array>
 }
+
+/**
+ * The contract id Rust derives from a `DynamicService` JSON document
+ * (validates it too). Equal to what the server publishes and what
+ * `computeContractIdFromJson` gives for the equivalent `ServiceContract`.
+ */
+export declare function dynamicServiceContractId(json: string): string
 
 /** Encode a `CallHeader` to AEv1 bytes. */
 export declare function encodeCallHeader(h: NativeCallHeader): Buffer
@@ -2408,40 +2367,11 @@ export interface ProviderOutcome {
 }
 
 /**
- * Result of [`ReactorRequestReceiver::recv`]. `payload` is empty and
- * `flags` is `0` when the stream has finished (i.e. when the Python
- * equivalent would return `None`); callers should also check `done`.
- */
-export interface ReactorRequestFrame {
-  payload: Buffer
-  flags: number
-  done: boolean
-}
-
-/**
  * Decide what to do with the record at `ctx.path` (`null` = no record),
  * opening it with the identity secret when active. `payload` selects a raw
  * (`'raw'`, default) or namespace-capability (`'namespace'`) payload.
  */
 export declare function reconcileGrant(identitySecret: string | Uint8Array, ctx: GrantContext, record?: Uint8Array | undefined | null, payload?: 'raw' | 'namespace'): GrantOutcome
-
-export const RECV_KIND_END_OF_STREAM: number
-
-/** Exported kind-tag constants for TS consumers. */
-export const RECV_KIND_OK: number
-
-export const RECV_KIND_TIMEOUT: number
-
-/**
- * Result of a `recvFrame` call, returned as a JS object. `kind` is one
- * of `RECV_OK` / `RECV_END_OF_STREAM` / `RECV_TIMEOUT`; on EOS or timeout
- * `payload` is empty and `flags` is `0`.
- */
-export interface RecvFrameResult {
-  payload: Buffer
-  flags: number
-  kind: number
-}
 
 /** The result of `retireLocalWriteAuthority`. */
 export interface RetireOutcome {
@@ -2455,6 +2385,9 @@ export interface RetireOutcome {
   /** For `'busy'`: how many references remain. */
   handles?: number
 }
+
+/** The prefix of a failed call's error message (JSON status follows). */
+export declare function rpcErrorPrefix(): string
 
 /**
  * Seal `plaintext` to `ctx.recipient`'s identity-derived HPKE key; returns
@@ -2491,12 +2424,6 @@ export declare function secretKeyReadFile(path: string): string | null
  * directories created). Refuses to overwrite an existing file.
  */
 export declare function secretKeyWriteFile(path: string, secretKey: string): void
-
-/**
- * Start a reactor that owns its own accept loop on the given node.
- * Suitable when the server only serves the Aster ALPN.
- */
-export declare function startReactor(node: Node, channelCapacity: number): ReactorHandle
 
 /** Options for `Topology.enableShared`. */
 export interface TopologySwarmOptions {
@@ -2560,24 +2487,6 @@ export interface TunnelTargetJs {
   kind: string
   host: string
   port: number
-}
-
-/**
- * Result of `AsterCall.unaryFastPath`. Mirrors `aster_call_unary`'s
- * C-ABI out params in a JS-friendly shape.
- *
- * - `response` is the first non-row-schema data frame's payload, or
- *   an empty buffer when the dispatcher skipped straight to the
- *   trailer (typical for error trailers).
- * - `responseFlags` is the flags byte on that data frame, or `0`
- *   when `response` is empty.
- * - `trailer` is the trailer frame's payload (an encoded
- *   `RpcStatus`). Empty means "clean OK trailer".
- */
-export interface UnaryFastPathResult {
-  response: Buffer
-  responseFlags: number
-  trailer: Buffer
 }
 
 /**

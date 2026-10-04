@@ -136,7 +136,7 @@ impl From<CoreConnection> for IrohConnection {
 
 impl IrohConnection {
     /// Borrow a clone of the underlying `CoreConnection` for sibling
-    /// modules (reactor, call) that need direct access to the core pool
+    /// modules (the RPC client) that need direct access to the core pool
     /// surface without going through the `napi`-decorated methods.
     pub(crate) fn core_clone(&self) -> CoreConnection {
         self.inner.clone()

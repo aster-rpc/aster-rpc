@@ -19,14 +19,13 @@ import { createLogger, type AsterLogger } from './logging.js';
 import { HealthServer } from './health.js';
 import { DEFAULT_BACKOFF, RpcPattern, RpcScope, type ExponentialBackoff } from './types.js';
 import { createXlangCodec, getXlangForyAndType } from './xlang.js';
-import { RpcServer } from './server.js';
+import { RpcServer } from './dispatch.js';
 
 import { handleConsumerAdmissionConnection, performAdmission, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
 import type { ConsumerEnrollmentCredential } from './trust/credentials.js';
 import { handleDelegatedAdmissionConnection, type DelegatedAdmissionPolicy } from './trust/delegated.js';
 import { gateAdmitter, type PeerAdmitter } from './trust/hooks.js';
 import { PeerAttributeStore } from './peer-store.js';
-import { CapabilityInterceptor } from './interceptors/capability.js';
 import type { Interceptor } from './interceptors/base.js';
 import { buildTypeGraph, canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
 import type { ContractManifest, ManifestMethod, ManifestField } from './contract/manifest.js';
@@ -330,8 +329,10 @@ export class AsterServer {
       });
     }
 
-    // Auto-wire CapabilityInterceptor if any service declares requires=
-    const interceptors: Interceptor[] = [...(this._userInterceptors as Interceptor[])];
+    // `requires` is enforced in Rust (Gate 3). When a service declares one,
+    // Gate 3 reads each caller's attributes live from the gate's admission
+    // store (the frozen credential admission writes them there, design
+    // §2.6); otherwise calls skip that lookup.
     let anyHasRequires = false;
     for (const info of this.registry.getAllServices()) {
       if (info.requires) anyHasRequires = true;
@@ -339,30 +340,29 @@ export class AsterServer {
         if (mi.requires) anyHasRequires = true;
       }
     }
-    const hasCapInterceptor = interceptors.some(i => i instanceof CapabilityInterceptor);
-    if ((!this._allowAllConsumers || anyHasRequires) && !hasCapInterceptor) {
-      const cap = new CapabilityInterceptor();
-      // Register requirements from service/method declarations
-      for (const info of this.registry.getAllServices()) {
-        for (const [methodName, mi] of info.methods.entries()) {
-          const req = mi.requires ?? info.requires;
-          if (req) cap.setRequirement(info.name, methodName, req);
-        }
-      }
-      interceptors.unshift(cap);
-    }
 
-    // Create the RPC server with Fory XLANG codec.
+    // Serve through `aster::rpc::Server` on the node (Rust owns accept,
+    // routing, sessions, deadlines); the frozen admission ALPNs come back
+    // as non-RPC connections.
+    const peerStore = this.peerStore;
     this._rpcServer = new RpcServer({
       registry: this.registry,
-      codec: xlangCodec!,
-      interceptors,
+      codec: xlangCodec ?? createXlangCodec(),
+      interceptors: [...(this._userInterceptors as Interceptor[])],
       logger: this.logger,
-      peerStore: this.peerStore,
+      gateAttributes: anyHasRequires ? this.gate : undefined,
+      peerAttributes: (peer) => {
+        const m = peerStore.getAttributes(peer);
+        return m.size ? Object.fromEntries(m) : undefined;
+      },
+      onNonRpc: (alpn, conn) => this._routeNonRpc(alpn, conn),
     });
 
     // Publish contracts to registry doc (non-fatal on failure)
     await this._publishContracts();
+
+    // Serve once the admission summaries carry their contract ids.
+    await this._rpcServer.start(this._node);
 
     await this.health.start();
     this._running = true;
@@ -697,13 +697,10 @@ export class AsterServer {
 
     // Install signal handlers for graceful shutdown
     this._installSignalHandlers();
-
-    // Enable RPC server connection handling
-    this._rpcServer.setServing(true);
     this.peerStore.startReaper();
 
-    // Single accept loop with ALPN routing (matches Python's _accept_loop)
-    this._servePromise = this._acceptLoop();
+    // Rust serves from start(); this resolves once close() stops it.
+    this._servePromise = this._rpcServer.waitUntilStopped();
     try {
       await this._servePromise;
     } catch (e) {
@@ -776,44 +773,25 @@ export class AsterServer {
   // ── Admission loop ──────────────────────────────────────────────────────
 
   /**
-   * Single accept loop with ALPN-based routing.
-   *
-   * All aster ALPNs (RPC, consumer admission, delegated admission) are
-   * multiplexed through one channel. This loop reads the ALPN tag and
-   * dispatches to the correct handler — matching Python's `_accept_loop`.
+   * Non-RPC connections Rust hands back (design §2.6): the frozen consumer
+   * and delegated admission handlers (D3).
    */
-  private async _acceptLoop(): Promise<void> {
-    if (!this._node) return;
-
-    while (this._running && !this._closed) {
-      try {
-        // Accept next connection — ALPN tag is on the connection
-        const conn = await this._node.native.acceptAster();
-        const alpn: string = conn.alpn() ?? '';
-
-        if (alpn === RPC_ALPN) {
-          // RPC connection — dispatch to RpcServer
-          this._rpcServer!.handleConnection(conn).catch(e => {
-            this.logger.error('rpc connection error', { error: String(e) });
-          });
-        } else if (alpn === ALPN_CONSUMER_ADMISSION) {
-          // Consumer admission
-          this._handleAdmission(conn).catch(e => {
-            this.logger.error('admission error', { error: String(e) });
-          });
-        } else if (alpn === ALPN_DELEGATED_ADMISSION) {
-          // Delegated admission
-          this._handleDelegatedAdmission(conn).catch(e => {
-            this.logger.error('delegated admission error', { error: String(e) });
-          });
-        } else {
-          this.logger.warn(`unknown ALPN: ${alpn}`);
-          try { conn.close(400, 'unknown ALPN'); } catch { /* ignore */ }
-        }
-      } catch (e) {
-        if (this._closed) return;
-        this.logger.error('accept error', { error: String(e) });
-      }
+  private _routeNonRpc(alpn: string, conn: any): void {
+    if (this._closed) {
+      try { conn.close(0, 'server shutdown'); } catch { /* ignore */ }
+      return;
+    }
+    if (alpn === ALPN_CONSUMER_ADMISSION) {
+      this._handleAdmission(conn).catch(e => {
+        this.logger.error('admission error', { error: String(e) });
+      });
+    } else if (alpn === ALPN_DELEGATED_ADMISSION) {
+      this._handleDelegatedAdmission(conn).catch(e => {
+        this.logger.error('delegated admission error', { error: String(e) });
+      });
+    } else {
+      this.logger.warn(`unknown ALPN: ${alpn}`);
+      try { conn.close(400, 'unknown ALPN'); } catch { /* ignore */ }
     }
   }
 
@@ -1356,10 +1334,10 @@ export class AsterClientWrapper {
     }
     if (summary && (summary.pattern === 'session' || summary.pattern === 'stream')) {
       return new SessionProxyClient(
-        serviceName, this._node, this.transport, this._codec, hintTypes,
+        serviceName, this._node, this.transport, this._codec, hintTypes, summary.version ?? 1,
       ) as any;
     }
-    return new ProxyClient(serviceName, this.transport, hintTypes);
+    return new ProxyClient(serviceName, this.transport, hintTypes, summary?.version ?? 1);
   }
 
   /**
@@ -1736,6 +1714,7 @@ export class ProxyClient {
     // inside the codec so Fory can detect the wire tag. Populated by
     // `AsterClientWrapper.proxy()` from manifest-synthesised types.
     private readonly _hintTypes?: Map<string, new (init?: any) => any>,
+    private readonly _version: number = 1,
   ) {
     return new Proxy(this, {
       get(target, prop: string) {
@@ -1754,7 +1733,7 @@ export class ProxyClient {
           return undefined;
         }
         const hintType = target._hintTypes?.get(prop);
-        return _proxyMethod(target.serviceName, prop, target.transport, hintType);
+        return _proxyMethod(target.serviceName, prop, target.transport, hintType, target._version);
       },
     });
   }
@@ -1766,6 +1745,7 @@ function _proxyMethod(
   methodName: string,
   transport: AsterTransport,
   hintType?: new (init?: any) => any,
+  version = 1,
 ) {
   // The callable: detects async iterables for client streaming, else unary
   const fn = async (payload?: unknown) => {
@@ -1774,7 +1754,7 @@ function _proxyMethod(
       const wrapped = hintType
         ? _wrapAsyncIterable(payload as AsyncIterable<unknown>, hintType)
         : (payload as AsyncIterable<unknown>);
-      return transport.clientStream(serviceName, methodName, wrapped);
+      return transport.clientStream(serviceName, methodName, wrapped, { version });
     }
     // Default: unary. If the user accidentally calls a server-streaming
     // method via `await proxy.method(...)`, the underlying transport will
@@ -1782,7 +1762,7 @@ function _proxyMethod(
     // frames". Catch that and re-raise with an actionable hint pointing
     // at `proxy.method.stream(...)` / `.bidi()`.
     try {
-      return await transport.unary(serviceName, methodName, payload ?? {}, { hintType });
+      return await transport.unary(serviceName, methodName, payload ?? {}, { hintType, version });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('multiple response frames')) {
@@ -1801,7 +1781,7 @@ function _proxyMethod(
 
   // .stream() — server streaming
   fn.stream = (payload?: unknown): AsyncIterable<unknown> => {
-    return transport.serverStream(serviceName, methodName, payload ?? {}, { hintType });
+    return transport.serverStream(serviceName, methodName, payload ?? {}, { hintType, version });
   };
 
   // .bidi() — bidirectional streaming. Returns a lazy wrapper so callers
@@ -1809,7 +1789,7 @@ function _proxyMethod(
   // mirrors Python's _ProxyBidiChannel behaviour. Opening eagerly here
   // would force every call site to handle the connect failure synchronously.
   fn.bidi = (): ProxyBidiChannel => {
-    return new ProxyBidiChannel(serviceName, methodName, transport, hintType);
+    return new ProxyBidiChannel(serviceName, methodName, transport, hintType, version);
   };
 
   return fn;
@@ -1840,11 +1820,12 @@ export class ProxyBidiChannel {
     private readonly methodName: string,
     private readonly transport: AsterTransport,
     private readonly _hintType?: new (init?: any) => any,
+    private readonly _version: number = 1,
   ) {}
 
   async open(): Promise<void> {
     if (this._channel) return;
-    this._channel = this.transport.bidiStream(this.serviceName, this.methodName);
+    this._channel = this.transport.bidiStream(this.serviceName, this.methodName, { version: this._version });
   }
 
   async send(payload: unknown): Promise<void> {
@@ -1865,7 +1846,7 @@ export class ProxyBidiChannel {
     if (!this._channel) {
       // Open on the fly so `for await` after `await ch.send()` (which
       // already opened) and `for await` without an explicit open both work.
-      this._channel = this.transport.bidiStream(this.serviceName, this.methodName);
+      this._channel = this.transport.bidiStream(this.serviceName, this.methodName, { version: this._version });
     }
     return this._channel[Symbol.asyncIterator]();
   }
@@ -1893,7 +1874,6 @@ export class ProxyBidiChannel {
 class SessionProxyClient {
   private readonly _sessionTransport: AsterTransport;
   private _closed = false;
-  private static _sessionIdCounter = 0;
   private readonly _hintTypes?: Map<string, new (init?: any) => any>;
 
   constructor(
@@ -1902,27 +1882,23 @@ class SessionProxyClient {
     transport: AsterTransport,
     codec?: any,
     hintTypes?: Map<string, new (init?: any) => any>,
+    private readonly _version: number = 1,
   ) {
     this._hintTypes = hintTypes;
-    // Reach through the v1 transport to get its underlying QUIC
-    // connection. We build a fresh transport on the same connection
-    // but pinned to a freshly-allocated sessionId, so each outbound
-    // call carries `StreamHeader.sessionId=N` without disturbing
-    // other callers of the original transport.
-    const conn = (transport as any).conn ?? (transport as any)._conn;
-    if (!conn) {
+    // A transport on the same connection pinned to a fresh session id from
+    // the connection's shared counter (core), so ids never collide with
+    // other clients on it; every call carries `StreamHeader.sessionId=N`.
+    if (!(transport instanceof IrohTransport)) {
       throw new RpcError(
         StatusCode.UNAVAILABLE,
-        'SessionProxyClient: v1 transport did not expose its connection',
+        'SessionProxyClient: needs an IrohTransport',
       );
     }
-    const sessionId = ++SessionProxyClient._sessionIdCounter;
-    // Reuse the parent transport's codec so manifest-synthesised types
-    // (registered via DynamicTypeFactory at proxy() time) are visible on
-    // this session's stream header frames too. Fall back to the raw
-    // codec on the transport when one isn't supplied explicitly.
-    const activeCodec = codec ?? (transport as any).codec ?? createXlangCodec();
-    this._sessionTransport = new IrohTransport(conn, activeCodec, { sessionId });
+    const activeCodec = codec ?? transport.codec ?? createXlangCodec();
+    this._sessionTransport = new IrohTransport(transport.conn, activeCodec, {
+      sessionId: transport.native.nextSessionId(),
+      rpc: transport.native,
+    });
 
     return new Proxy(this, {
       get(target, prop: string) {
@@ -1949,14 +1925,11 @@ class SessionProxyClient {
         self.serviceName,
         methodName,
         payload ?? {},
-        { hintType },
+        { hintType, version: self._version },
       );
     };
     fn.bidi = (): ProxyBidiChannel => {
-      throw new RpcError(
-        StatusCode.UNIMPLEMENTED,
-        'session proxy bidi not yet implemented',
-      ) as any;
+      return new ProxyBidiChannel(self.serviceName, methodName, self._sessionTransport, hintType, self._version);
     };
     return fn;
   }
@@ -1969,7 +1942,7 @@ class SessionProxyClient {
     if (this._closed) {
       throw new RpcError(StatusCode.FAILED_PRECONDITION, 'SessionProxyClient is closed');
     }
-    return await this._sessionTransport.unary(this.serviceName, method, request, { hintType });
+    return await this._sessionTransport.unary(this.serviceName, method, request, { hintType, version: this._version });
   }
 
   /**

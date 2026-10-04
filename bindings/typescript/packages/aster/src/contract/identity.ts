@@ -289,32 +289,11 @@ export function decodeTypeDefBytes(bytes: Uint8Array): CanonicalTypeDef {
  * Builds the ServiceContract from service info and computes its ID.
  */
 export function contractIdFromService(serviceClass: new (...args: any[]) => any): string {
-  // Build a minimal ServiceContract from service info
   const info = (serviceClass as any)[Symbol.for('aster.service_info')];
   if (!info) {
     throw new TypeError(`${serviceClass.name} is not decorated with @Service`);
   }
-  const contract: ServiceContract = {
-    name: info.name,
-    version: info.version,
-    methods: [],
-    serializationModes: canonicalSerializationModes(info.serializationModes),
-    // Accept both the canonical 'session' value and the legacy 'stream' alias.
-    scoped: (info.scoped === 'session' || info.scoped === 'stream') ? 1 : 0,
-    requires: undefined,
-  };
-  for (const [, m] of info.methods as Map<string, any>) {
-    contract.methods.push({
-      name: m.name,
-      pattern: m.pattern === 'server_stream' ? 1 : m.pattern === 'client_stream' ? 2 : m.pattern === 'bidi_stream' ? 3 : 0,
-      requestType: new Uint8Array(32),
-      responseType: new Uint8Array(32),
-      idempotent: m.idempotent ?? false,
-      defaultTimeout: 0,
-      requires: undefined,
-    });
-  }
-  return contractIdFromJson(contract);
+  return contractIdFromJson(fromServiceInfo(info));
 }
 
 /**
@@ -363,10 +342,12 @@ export function fromServiceInfo(info: {
     name: string;
     pattern: string;
     idempotent?: boolean;
+    timeout?: number;
+    requires?: { kind: string; roles: string[] } | string;
     requestTypeHash?: Uint8Array;
     responseTypeHash?: Uint8Array;
   }>;
-  requires?: { kind: string; roles: string[] };
+  requires?: { kind: string; roles: string[] } | string;
   serializationModes?: readonly (number | string)[];
 }): ServiceContract {
   const contract: ServiceContract = {
@@ -376,7 +357,7 @@ export function fromServiceInfo(info: {
     serializationModes: canonicalSerializationModes(info.serializationModes),
     // Accept both the canonical 'session' value and the legacy 'stream' alias.
     scoped: (info.scoped === 'session' || info.scoped === 'stream') ? 1 : 0,
-    requires: info.requires ? { kind: info.requires.kind === 'any_of' ? 1 : 2, roles: info.requires.roles } : undefined,
+    requires: capabilityOf(info.requires),
   };
   for (const [, m] of info.methods) {
     contract.methods.push({
@@ -385,9 +366,31 @@ export function fromServiceInfo(info: {
       requestType: m.requestTypeHash ?? new Uint8Array(32),
       responseType: m.responseTypeHash ?? new Uint8Array(32),
       idempotent: m.idempotent ?? false,
-      defaultTimeout: 0,
-      requires: undefined,
+      // Seconds as float64, 0 = unset (what Rust's `DynamicService` and the
+      // Python lowering commit to).
+      defaultTimeout: m.timeout && m.timeout > 0 ? Number(m.timeout) : 0,
+      requires: capabilityOf(m.requires),
     });
   }
   return contract;
+}
+
+/**
+ * A `requires=` declaration as a contract {@link CapabilityRequirement}: a
+ * role string is one role of kind `role`. Part of the contract id, as in
+ * Rust and Python.
+ */
+function capabilityOf(
+  req: { kind: string | number; roles: string[] } | string | undefined | null,
+): CapabilityRequirement | undefined {
+  if (req == null) return undefined;
+  if (typeof req === 'string') return { kind: CapabilityKind.ROLE, roles: [req] };
+  const kind = typeof req.kind === 'number'
+    ? req.kind
+    : req.kind === 'role' ? CapabilityKind.ROLE
+      : req.kind === 'any_of' ? CapabilityKind.ANY_OF
+        : req.kind === 'all_of' ? CapabilityKind.ALL_OF
+          : undefined;
+  if (kind === undefined) throw new TypeError(`unknown capability kind ${JSON.stringify(req.kind)}`);
+  return { kind, roles: req.roles.map(String) };
 }

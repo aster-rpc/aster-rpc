@@ -20,6 +20,9 @@ import type { RpcPattern } from '../types.js';
  */
 const _callContextStorage = new AsyncLocalStorage<CallContext>();
 
+/** The `signal` of a context that is not attached to a dispatched call. */
+const NEVER_ABORTED: AbortSignal = new AbortController().signal;
+
 /** Peer's UDP socket address when the selected QUIC path is direct. */
 export interface PeerAddr {
   host: string;
@@ -37,28 +40,23 @@ export class CallContext {
   sessionId: string | undefined;
   peer: string | undefined;
   metadata: Record<string, string>;
-  attributes: Record<string, string>;
+  private _attributes: Record<string, string>;
+  /** Server side: resolves `attributes` on first access when the call carried none. */
+  protected _attributesLoader?: () => Record<string, string> | undefined;
   deadline: number | undefined; // Unix seconds
   isStreaming: boolean;
   pattern: RpcPattern | undefined;
   idempotent: boolean;
   attempt: number;
+  private _peerAddr: PeerAddr | undefined;
+  private _relayUrl: string | undefined;
+  private _rttMicros: number | undefined;
   /**
-   * Peer's UDP `{ host, port }` when the selected QUIC path is direct.
-   * `undefined` when the call is being relayed.
+   * Server side: reads the connection's selected path on first access to
+   * `peerAddr` / `relayUrl` / `rttMicros` (one native call, only when
+   * asked for).
    */
-  peerAddr: PeerAddr | undefined;
-  /**
-   * Relay server URL when the selected path goes through a relay.
-   * `undefined` for direct paths. The peer's own IP is not visible
-   * through a relay path.
-   */
-  relayUrl: string | undefined;
-  /**
-   * Round-trip-time for the selected path in microseconds, or
-   * `undefined` if not yet measured.
-   */
-  rttMicros: number | undefined;
+  protected _transport?: () => { peerAddr?: PeerAddr | null; relayUrl?: string | null; rttMicros?: number | null } | null | undefined;
 
   constructor(init: {
     service: string;
@@ -83,15 +81,96 @@ export class CallContext {
     this.sessionId = init.sessionId;
     this.peer = init.peer;
     this.metadata = init.metadata ?? {};
-    this.attributes = init.attributes ?? {};
+    this._attributes = init.attributes ?? {};
     this.deadline = init.deadline;
     this.isStreaming = init.isStreaming ?? false;
     this.pattern = init.pattern;
     this.idempotent = init.idempotent ?? false;
     this.attempt = init.attempt ?? 1;
-    this.peerAddr = init.peerAddr;
-    this.relayUrl = init.relayUrl;
-    this.rttMicros = init.rttMicros;
+    this._peerAddr = init.peerAddr;
+    this._relayUrl = init.relayUrl;
+    this._rttMicros = init.rttMicros;
+  }
+
+  /** The caller's attributes (admission / Gate 3), e.g. `aster.role`. */
+  get attributes(): Record<string, string> {
+    const load = this._attributesLoader;
+    if (load) {
+      this._attributesLoader = undefined;
+      try {
+        const a = load();
+        if (a) this._attributes = a;
+      } catch { /* keep empty */ }
+    }
+    return this._attributes;
+  }
+  set attributes(v: Record<string, string>) {
+    this._attributesLoader = undefined;
+    this._attributes = v;
+  }
+
+  private _loadTransport(): void {
+    const load = this._transport;
+    if (!load) return;
+    this._transport = undefined;
+    try {
+      const snap = load();
+      if (snap) {
+        if (snap.peerAddr) this._peerAddr = { host: snap.peerAddr.host, port: snap.peerAddr.port };
+        this._relayUrl = snap.relayUrl ?? undefined;
+        this._rttMicros = snap.rttMicros ?? undefined;
+      }
+    } catch { /* connection gone */ }
+  }
+
+  /**
+   * Peer's UDP `{ host, port }` when the selected QUIC path is direct.
+   * `undefined` when the call is being relayed.
+   */
+  get peerAddr(): PeerAddr | undefined {
+    this._loadTransport();
+    return this._peerAddr;
+  }
+  set peerAddr(v: PeerAddr | undefined) {
+    this._loadTransport();
+    this._peerAddr = v;
+  }
+
+  /**
+   * Relay server URL when the selected path goes through a relay.
+   * `undefined` for direct paths. The peer's own IP is not visible
+   * through a relay path.
+   */
+  get relayUrl(): string | undefined {
+    this._loadTransport();
+    return this._relayUrl;
+  }
+  set relayUrl(v: string | undefined) {
+    this._loadTransport();
+    this._relayUrl = v;
+  }
+
+  /**
+   * Round-trip-time for the selected path in microseconds, or
+   * `undefined` if not yet measured.
+   */
+  get rttMicros(): number | undefined {
+    this._loadTransport();
+    return this._rttMicros;
+  }
+  set rttMicros(v: number | undefined) {
+    this._loadTransport();
+    this._rttMicros = v;
+  }
+
+  /**
+   * Aborted when the call is cancelled on the server: the peer cancelled or
+   * went away, or the deadline (enforced by Rust) passed. Pass it to work
+   * the handler starts (`fetch`, timers, child calls). Outside a dispatched
+   * call it never aborts.
+   */
+  get signal(): AbortSignal {
+    return NEVER_ABORTED;
   }
 
   /** Seconds until deadline, or undefined if no deadline set. */

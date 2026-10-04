@@ -1,204 +1,241 @@
 /**
- * IrohTransport — Transport implementation over real QUIC streams.
+ * IrohTransport -- the client over a real `aster/1` QUIC connection.
  *
- * Each RPC call opens a bidirectional QUIC stream, sends the StreamHeader
- * frame, then performs the appropriate read/write sequence for the pattern.
+ * A thin layer over the native `RpcConnection` (`aster::rpc::RpcConnection`,
+ * design `dynamic-dispatch-design.md` §3): Rust builds the header, frames,
+ * compresses, pools unary streams, enforces the deadline and decodes the
+ * trailer. This class only encodes/decodes payloads with the codec, maps a
+ * failed call to an `RpcError`, and wires `AbortSignal`s to cancellation.
  *
- * Requires NAPI-RS native bindings (@aster-rpc/transport).
+ * Requires the NAPI-RS addon (`@aster-rpc/transport`).
  */
 
+import type {
+  IrohConnection,
+  RpcConnection as NativeRpcConnection,
+  ClientCall,
+} from '@aster-rpc/transport';
 import type { Codec } from '../codec.js';
 import { createXlangCodec } from '../xlang.js';
-import {
-  writeFrame,
-  writePayloadFrame,
-  readFrame,
-  encodeFrame,
-  encodePayloadFrame,
-  payloadOf,
-  HEADER,
-  TRAILER,
-  END_STREAM,
-} from '../framing.js';
-import { encodeStreamHeader, decodeRpcStatus } from '../protocol.js';
 import { StatusCode, RpcError } from '../status.js';
-import type { AsterTransport, CallOptions } from './base.js';
-import type { BidiChannel } from './base.js';
-import { tryLoadNative, type NativeAddon } from '../native.js';
+import type { AsterTransport, BidiChannel, CallOptions } from './base.js';
+import { loadNative } from '../native.js';
 
-// Lazy handle to the napi AsterCall class. Cached on first access so
-// the unary hot path doesn't re-resolve the native addon every call.
-// Falls back to `null` if the addon isn't loadable — the caller keeps
-// the old openBi path as a safety net.
-let _nativeAsterCall: NativeAddon['AsterCall'] | null | undefined = undefined;
-function getNativeAsterCall(): NativeAddon['AsterCall'] | null {
-  if (_nativeAsterCall !== undefined) return _nativeAsterCall;
-  _nativeAsterCall = tryLoadNative()?.AsterCall ?? null;
-  return _nativeAsterCall;
+/** The message prefix of a native call failure (JSON status follows). */
+const STATUS_PREFIX = 'aster-rpc-status:';
+
+/** Native call failure → `RpcError`; anything else as before T4. */
+export function mapTransportError(e: unknown): RpcError {
+  if (e instanceof RpcError) return e;
+  const msg = e instanceof Error ? e.message : String(e);
+  const at = msg.indexOf(STATUS_PREFIX);
+  if (at >= 0) {
+    try {
+      const st = JSON.parse(msg.slice(at + STATUS_PREFIX.length)) as {
+        code: number;
+        message: string;
+        details?: Record<string, string>;
+      };
+      const details = st.details && Object.keys(st.details).length ? st.details : undefined;
+      return RpcError.fromStatus(st.code as StatusCode, st.message, details);
+    } catch {
+      /* fall through */
+    }
+  }
+  const lower = msg.toLowerCase();
+  if (['reset', 'connection closed', 'connection lost'].some((kw) => lower.includes(kw))) {
+    return new RpcError(StatusCode.UNAVAILABLE, `stream reset: ${msg}`);
+  }
+  return new RpcError(StatusCode.UNKNOWN, msg);
 }
 
-/** QUIC connection interface (matches NAPI IrohConnection). */
-interface QuicConnection {
-  openBi(): Promise<{ takeSend(): QuicSendStream; takeRecv(): QuicRecvStream }>;
-  close(code: number, reason: string): void;
+function metadataList(metadata?: Record<string, string>): string[] | undefined {
+  if (!metadata) return undefined;
+  let out: string[] | undefined;
+  for (const k in metadata) {
+    (out ??= []).push(k, String(metadata[k]));
+  }
+  return out;
 }
 
-/** QUIC send stream interface (matches NAPI IrohSendStream). */
-interface QuicSendStream {
-  writeAll(data: Uint8Array): Promise<void>;
-  finish(): Promise<void>;
+function deadlineMs(opts?: CallOptions): number {
+  const s = opts?.deadlineSecs;
+  return s && s > 0 ? s * 1000 : 0;
 }
 
-/** QUIC recv stream interface (matches NAPI IrohRecvStream). */
-interface QuicRecvStream {
-  readExact(n: number): Promise<Uint8Array>;
+function cancelledError(): RpcError {
+  return RpcError.fromStatus(StatusCode.CANCELLED, 'call cancelled');
 }
 
-function buildMetadata(metadata?: Record<string, string>): [string[], string[]] {
-  if (!metadata || Object.keys(metadata).length === 0) return [[], []];
-  const keys = Object.keys(metadata);
-  return [keys, keys.map(k => metadata[k]!)];
+/** The native `RpcConnection` for `connection` (one per connection). */
+const _rpcByConn = new WeakMap<object, NativeRpcConnection>();
+function rpcOf(connection: object): NativeRpcConnection {
+  let rpc = _rpcByConn.get(connection);
+  if (!rpc) {
+    rpc = new (loadNative().RpcConnection)(connection as IrohConnection);
+    _rpcByConn.set(connection, rpc);
+  }
+  return rpc;
+}
+
+/** Up to this many encoded requests queue behind an in-flight write. */
+const MAX_PENDING_REQUESTS = 1024;
+
+/**
+ * Writes a request stream with at most one native write in flight; requests
+ * produced meanwhile go out together in the next write (`sendMany`).
+ */
+class RequestPump {
+  private pending: Uint8Array[] = [];
+  private inflight: Promise<void> | null = null;
+  private error: unknown = undefined;
+
+  constructor(private readonly call: ClientCall) {}
+
+  async push(payload: Uint8Array): Promise<void> {
+    if (this.error !== undefined) throw this.error;
+    this.pending.push(payload);
+    if (!this.inflight) this.inflight = this.run();
+    else if (this.pending.length >= MAX_PENDING_REQUESTS) await this.inflight;
+  }
+
+  private async run(): Promise<void> {
+    try {
+      while (this.pending.length) {
+        const batch = this.pending;
+        this.pending = [];
+        if (batch.length === 1) await this.call.send(batch[0]!);
+        else await this.call.sendMany(batch, false);
+      }
+    } catch (e) {
+      this.error = e;
+    } finally {
+      this.inflight = null;
+    }
+  }
+
+  async flush(): Promise<void> {
+    while (this.inflight) await this.inflight;
+    if (this.error !== undefined) throw this.error;
+  }
 }
 
 /**
- * Transport implementation using Iroh QUIC streams.
+ * Transport over one `aster/1` connection (`IrohConnection`).
  */
 export class IrohTransport implements AsterTransport {
-  private conn: QuicConnection;
-  private codec: Codec;
-  private readonly sessionId: number;
+  readonly conn: IrohConnection;
+  readonly codec: Codec;
+  /** Session id stamped on every call (0 = shared). */
+  readonly sessionId: number;
+  private readonly rpc: NativeRpcConnection;
 
   constructor(
-    connection: QuicConnection,
+    connection: IrohConnection | object,
     codec?: Codec,
-    options?: { sessionId?: number },
+    options?: { sessionId?: number; rpc?: NativeRpcConnection },
   ) {
-    this.conn = connection;
+    this.conn = connection as IrohConnection;
     this.codec = codec ?? createXlangCodec();
     this.sessionId = options?.sessionId ?? 0;
+    this.rpc = options?.rpc ?? rpcOf(connection);
   }
 
-  async unary(
-    service: string,
-    method: string,
-    request: unknown,
-    opts?: CallOptions,
-  ): Promise<unknown> {
-    // Fast path: one napi round-trip through `AsterCall.unaryFastPath`
-    // (mirrors `ffi::aster_call_unary`). Replaces the ~10-hop
-    // openBi → 2x writeFrame → finish → 2x readFrame sequence with a
-    // single native call that does acquire + write_all + recv-loop +
-    // release on the Rust side. Falls back to the legacy path if the
-    // native addon isn't loadable.
-    const fast = getNativeAsterCall();
-    if (fast && typeof fast.unaryFastPath === 'function') {
-      try {
-        // Build the header and request frames separately, then
-        // concatenate into a single buffer so Quinn sees one logical
-        // write on the server side. The request carries
-        // `FLAG_END_STREAM` so the core dispatch loop knows the
-        // request phase is done and can start responding.
-        const headerFrame = encodeFrame(this.headerBytes(service, method, opts), HEADER);
-        const requestFrame = encodePayloadFrame(
-          this.codec.encode(request, opts?.hintType),
-          END_STREAM,
-        );
-        const requestPair = new Uint8Array(
-          headerFrame.byteLength + requestFrame.byteLength,
-        );
-        requestPair.set(headerFrame, 0);
-        requestPair.set(requestFrame, headerFrame.byteLength);
+  /** The native pooled client this transport calls through. */
+  get native(): NativeRpcConnection {
+    return this.rpc;
+  }
 
-        // The fast path needs the real napi connection; structural
-        // test doubles make it throw and fall back to the openBi path.
-        const result = await fast.unaryFastPath(
-          this.conn as unknown as InstanceType<NativeAddon['IrohConnection']>,
-          this.sessionId,
-          Buffer.from(requestPair.buffer, requestPair.byteOffset, requestPair.byteLength),
-        );
+  /**
+   * A transport on the same connection pinned to a session: a fresh id from
+   * the connection's shared counter (or `sessionId`). Calls on a
+   * session-scoped service through it reach one server-side instance.
+   */
+  openSession(sessionId?: number): IrohTransport {
+    return new IrohTransport(this.conn, this.codec, {
+      sessionId: sessionId ?? this.rpc.nextSessionId(),
+      rpc: this.rpc,
+    });
+  }
 
-        // Trailer: empty means clean OK; non-empty carries an RpcStatus.
-        if (result.trailer && result.trailer.byteLength > 0) {
-          this.checkTrailer(result.trailer);
-        }
-        // Response body: empty means the dispatcher only sent a
-        // trailer (error case). For OK-with-empty-response, checkTrailer
-        // already passed and we return undefined.
-        if (!result.response || result.response.byteLength === 0) {
-          return undefined;
-        }
-        return this.codec.decode(payloadOf(result.response, result.responseFlags));
-      } catch (e) {
-        throw mapTransportError(e);
-      }
+  async unary(service: string, method: string, request: unknown, opts?: CallOptions): Promise<unknown> {
+    const payload = this.codec.encode(request, opts?.hintType);
+    const signal = opts?.signal;
+    let token: InstanceType<ReturnType<typeof loadNative>['CancelToken']> | undefined;
+    let onAbort: (() => void) | undefined;
+    if (signal) {
+      if (signal.aborted) throw cancelledError();
+      token = new (loadNative().CancelToken)();
+      const t = token;
+      onAbort = () => t.cancel();
+      signal.addEventListener('abort', onAbort, { once: true });
     }
-
-    // Legacy fallback path — kept only for environments where the
-    // native addon isn't resolvable. Functionally identical to the
-    // pre-fast-path implementation.
-    const bi = await this.conn.openBi();
-    const send = bi.takeSend();
-    const recv = bi.takeRecv();
-
+    let response: Buffer;
     try {
-      // Write StreamHeader
-      await this.writeHeader(send, service, method, opts);
+      response = await this.rpc.unary(
+        service,
+        method,
+        opts?.version ?? 1,
+        opts?.sessionId ?? this.sessionId,
+        deadlineMs(opts),
+        metadataList(opts?.metadata),
+        opts?.serializationMode,
+        opts?.callId,
+        payload,
+        token,
+      );
+    } catch (e) {
+      throw mapTransportError(e);
+    } finally {
+      if (onAbort) signal!.removeEventListener('abort', onAbort);
+    }
+    // An OK call with no response frame (the handler returned nothing).
+    if (response.byteLength === 0) return undefined;
+    return this.codec.decode(response);
+  }
 
-      // Write request
-      await writePayloadFrame(send, this.codec.encode(request, opts?.hintType));
-      await send.finish();
-
-      // Read response frames
-      let response: unknown = undefined;
-      while (true) {
-        const frame = await readFrame(recv, 0);
-        if (!frame) throw new RpcError(StatusCode.UNAVAILABLE, 'stream ended before response');
-        const [data, flags] = frame;
-
-        if (flags & TRAILER) {
-          this.checkTrailer(data);
-          break;
-        }
-
-        response = this.codec.decode(payloadOf(data, flags));
-      }
-
-      return response;
+  async *serverStream(service: string, method: string, request: unknown, opts?: CallOptions): AsyncIterable<unknown> {
+    const payload = this.codec.encode(request, opts?.hintType);
+    const signal = opts?.signal;
+    if (signal?.aborted) throw cancelledError();
+    let call: ClientCall;
+    try {
+      call = await this.rpc.serverStream(
+        service,
+        method,
+        opts?.version ?? 1,
+        opts?.sessionId ?? this.sessionId,
+        deadlineMs(opts),
+        metadataList(opts?.metadata),
+        opts?.serializationMode,
+        opts?.callId,
+        payload,
+      );
     } catch (e) {
       throw mapTransportError(e);
     }
-  }
-
-  async *serverStream(
-    service: string,
-    method: string,
-    request: unknown,
-    opts?: CallOptions,
-  ): AsyncIterable<unknown> {
-    const bi = await this.conn.openBi();
-    const send = bi.takeSend();
-    const recv = bi.takeRecv();
-
+    const onAbort = () => void call.cancel();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    let done = false;
     try {
-      await this.writeHeader(send, service, method, opts);
-
-      await writePayloadFrame(send, this.codec.encode(request, opts?.hintType));
-      await send.finish();
-
       while (true) {
-        const frame = await readFrame(recv, 0);
-        if (!frame) throw new RpcError(StatusCode.UNAVAILABLE, 'stream ended before trailer');
-        const [data, flags] = frame;
-
-        if (flags & TRAILER) {
-          this.checkTrailer(data);
-          break;
+        let item: Buffer | null;
+        try {
+          item = await call.next();
+        } catch (e) {
+          done = true;
+          throw mapTransportError(e);
         }
-
-        yield this.codec.decode(payloadOf(data, flags));
+        if (item === null) {
+          done = true;
+          return;
+        }
+        yield this.codec.decode(item);
       }
-    } catch (e) {
-      throw mapTransportError(e);
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      // The consumer stopped early (break / throw): cancel the call.
+      if (!done) void call.cancel();
     }
   }
 
@@ -208,167 +245,162 @@ export class IrohTransport implements AsterTransport {
     requests: AsyncIterable<unknown>,
     opts?: CallOptions,
   ): Promise<unknown> {
-    const bi = await this.conn.openBi();
-    const send = bi.takeSend();
-    const recv = bi.takeRecv();
-
+    const signal = opts?.signal;
+    if (signal?.aborted) throw cancelledError();
+    let call: ClientCall;
     try {
-      await this.writeHeader(send, service, method, opts);
-
-      for await (const req of requests) {
-        await writePayloadFrame(send, this.codec.encode(req, opts?.hintType));
-      }
-      await send.finish();
-
-      // Read single response + trailer
-      let response: unknown = undefined;
-      while (true) {
-        const frame = await readFrame(recv, 0);
-        if (!frame) throw new RpcError(StatusCode.UNAVAILABLE, 'stream ended before response');
-        const [data, flags] = frame;
-
-        if (flags & TRAILER) {
-          this.checkTrailer(data);
-          break;
-        }
-
-        response = this.codec.decode(payloadOf(data, flags));
-      }
-
-      return response;
+      call = await this.rpc.clientStream(
+        service,
+        method,
+        opts?.version ?? 1,
+        opts?.sessionId ?? this.sessionId,
+        deadlineMs(opts),
+        metadataList(opts?.metadata),
+        opts?.serializationMode,
+        opts?.callId,
+      );
     } catch (e) {
       throw mapTransportError(e);
     }
+    const onAbort = () => void call.cancel();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    // Resolves as soon as the server answers (possibly early, with an error).
+    const response = call.response();
+    response.catch(() => {});
+    try {
+      const pump = new RequestPump(call);
+      try {
+        for await (const req of requests) await pump.push(this.codec.encode(req, opts?.hintType));
+        await pump.flush();
+        await call.finish();
+      } catch (sendErr) {
+        const native = String((sendErr as Error)?.message ?? sendErr).includes(STATUS_PREFIX);
+        if (!native) {
+          // A local failure (encode, or the request source threw): cancel.
+          void call.cancel();
+          throw sendErr;
+        }
+        // The call ended under the send: the response carries its status.
+        try {
+          await response;
+        } catch (e) {
+          throw mapTransportError(e);
+        }
+        throw mapTransportError(sendErr);
+      }
+      let out: Buffer;
+      try {
+        out = await response;
+      } catch (e) {
+        throw mapTransportError(e);
+      }
+      return out.byteLength ? this.codec.decode(out) : undefined;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+    }
   }
 
-  bidiStream(
-    service: string,
-    method: string,
-    opts?: CallOptions,
-  ): BidiChannel {
+  bidiStream(service: string, method: string, opts?: CallOptions): BidiChannel {
     const codec = this.codec;
-    const conn = this.conn;
-    const writeHeader = this.writeHeader.bind(this);
-    const checkTrailer = this.checkTrailer.bind(this);
-
-    // Open the stream eagerly but return a channel object
-    let sendStream: QuicSendStream | undefined;
-    let recvStream: QuicRecvStream | undefined;
-    let streamReady: Promise<void>;
-    let receiveDone = false;
-
-    streamReady = (async () => {
-      const bi = await conn.openBi();
-      sendStream = bi.takeSend();
-      recvStream = bi.takeRecv();
-      await writeHeader(sendStream, service, method, opts);
-    })();
-
-    const channel: BidiChannel = {
-      async send(msg: unknown): Promise<void> {
-        await streamReady;
-        await writePayloadFrame(sendStream!, codec.encode(msg, opts?.hintType));
-      },
-
-      async *[Symbol.asyncIterator](): AsyncIterator<unknown> {
-        await streamReady;
-        while (!receiveDone) {
-          try {
-            const frame = await readFrame(recvStream!, 0);
-            if (!frame) { receiveDone = true; return; }
-            const [data, flags] = frame;
-            if (flags & TRAILER) {
-              checkTrailer(data);
-              receiveDone = true;
-              return;
-            }
-            yield codec.decode(payloadOf(data, flags));
-          } catch (e) {
-            receiveDone = true;
-            throw mapTransportError(e);
-          }
+    const signal = opts?.signal;
+    const ready: Promise<ClientCall> = this.rpc
+      .bidi(
+        service,
+        method,
+        opts?.version ?? 1,
+        opts?.sessionId ?? this.sessionId,
+        deadlineMs(opts),
+        metadataList(opts?.metadata),
+        opts?.serializationMode,
+        opts?.callId,
+      )
+      .then((call) => {
+        if (signal) {
+          if (signal.aborted) void call.cancel();
+          else signal.addEventListener('abort', () => void call.cancel(), { once: true });
         }
-      },
+        return call;
+      });
+    ready.catch(() => {});
+    const open = async (): Promise<ClientCall> => {
+      try {
+        return await ready;
+      } catch (e) {
+        throw mapTransportError(e);
+      }
+    };
+    let trailer: [StatusCode, string] | null = null;
+    let finished = false;
 
-      async close(): Promise<void> {
-        await streamReady;
-        await sendStream!.finish();
-      },
-
-      async waitForTrailer(): Promise<[StatusCode, string]> {
-        await streamReady;
-        // Drain remaining frames until trailer
-        while (!receiveDone) {
-          const frame = await readFrame(recvStream!, 0);
-          if (!frame) return [StatusCode.OK, ''];
-          const [data, flags] = frame;
-          if (flags & TRAILER) {
-            if (data.length === 0) return [StatusCode.OK, ''];
-            const status = decodeRpcStatus(data);
-            return [status.code as StatusCode, status.message];
-          }
+    const next = async (): Promise<IteratorResult<unknown>> => {
+      if (trailer) return { done: true, value: undefined };
+      const call = await open();
+      try {
+        const item = await call.next();
+        if (item === null) {
+          trailer = [StatusCode.OK, ''];
+          return { done: true, value: undefined };
         }
-        return [StatusCode.OK, ''];
-      },
+        return { done: false, value: codec.decode(item) };
+      } catch (e) {
+        const err = mapTransportError(e);
+        trailer = [err.code, err.message];
+        throw err;
+      }
     };
 
-    return channel;
+    return {
+      async send(msg: unknown): Promise<void> {
+        const call = await open();
+        try {
+          await call.send(codec.encode(msg, opts?.hintType));
+        } catch (e) {
+          throw mapTransportError(e);
+        }
+      },
+      [Symbol.asyncIterator](): AsyncIterator<unknown> {
+        return {
+          next,
+          async return(): Promise<IteratorResult<unknown>> {
+            // The consumer stopped reading before the end: cancel.
+            if (!trailer) {
+              trailer = [StatusCode.CANCELLED, 'call cancelled'];
+              void (await open()).cancel();
+            }
+            return { done: true, value: undefined };
+          },
+        };
+      },
+      async close(): Promise<void> {
+        if (finished) return;
+        finished = true;
+        const call = await open();
+        try {
+          await call.finish();
+        } catch (e) {
+          throw mapTransportError(e);
+        }
+      },
+      async waitForTrailer(): Promise<[StatusCode, string]> {
+        try {
+          while (!(await next()).done) { /* drain */ }
+        } catch {
+          /* recorded in `trailer` */
+        }
+        return trailer ?? [StatusCode.OK, ''];
+      },
+      async cancel(): Promise<void> {
+        trailer ??= [StatusCode.CANCELLED, 'call cancelled'];
+        await (await open()).cancel();
+      },
+    };
   }
 
   async close(): Promise<void> {
-    this.conn.close(0, 'normal close');
-  }
-
-  // -- Helpers ----------------------------------------------------------------
-
-  private async writeHeader(
-    send: QuicSendStream,
-    service: string,
-    method: string,
-    opts?: CallOptions,
-  ): Promise<void> {
-    await writeFrame(send, this.headerBytes(service, method, opts), HEADER);
-  }
-
-  /** AEv1-encoded StreamHeader for one call (Aster-SPEC §6.9). */
-  private headerBytes(service: string, method: string, opts?: CallOptions): Uint8Array {
-    const [keys, values] = buildMetadata(opts?.metadata);
-    return encodeStreamHeader({
-      service,
-      method,
-      version: 1,
-      callId: opts?.callId ?? 0,
-      deadline: opts?.deadlineSecs ?? 0,
-      serializationMode: opts?.serializationMode ?? 0,
-      metadataKeys: keys,
-      metadataValues: values,
-      sessionId: this.sessionId,
-    });
-  }
-
-  private checkTrailer(data: Uint8Array): void {
-    if (data.length === 0) return; // empty trailer = OK
-    const status = decodeRpcStatus(data);
-    if (status.code !== StatusCode.OK) {
-      throw RpcError.fromStatus(
-        status.code as any,
-        status.message,
-        status.details,
-      );
+    try {
+      this.conn.close(0, 'normal close');
+    } catch {
+      /* already closed */
     }
   }
-}
-
-const RESET_KEYWORDS = ['reset', 'connection closed', 'connection lost'];
-
-function mapTransportError(e: unknown): RpcError {
-  if (e instanceof RpcError) return e;
-  if (e instanceof Error) {
-    const msg = e.message.toLowerCase();
-    if (RESET_KEYWORDS.some(kw => msg.includes(kw))) {
-      return new RpcError(StatusCode.UNAVAILABLE, `stream reset: ${e.message}`);
-    }
-  }
-  if (e instanceof Error) return new RpcError(StatusCode.UNKNOWN, e.message);
-  return new RpcError(StatusCode.UNKNOWN, String(e));
 }

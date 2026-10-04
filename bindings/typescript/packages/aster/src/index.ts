@@ -71,9 +71,6 @@ export {
   CANCEL,
   END_STREAM,
   FramingError,
-  writeFrame,
-  writePayloadFrame,
-  readFrame,
   encodeFrame,
   encodePayloadFrame,
   decodeFrame,
@@ -222,7 +219,6 @@ export {
   type Interceptor,
   type PeerAddr,
 } from './interceptors/base.js';
-export { DeadlineInterceptor } from './interceptors/deadline.js';
 export { MetricsInterceptor } from './interceptors/metrics.js';
 export { RetryInterceptor } from './interceptors/retry.js';
 export { RateLimitInterceptor, type RateLimitOptions } from './interceptors/rate-limit.js';
@@ -597,8 +593,29 @@ export {
 // Connection & Admission Metrics (from metrics.ts)
 export { ConnectionMetrics, AdmissionMetrics } from './metrics.js';
 
-// RPC Server (QUIC accept loop)
-export { RpcServer, type ServerOptions } from './server.js';
+// RPC server on `aster::rpc::Server` (dynamic dispatch, design §4.3)
+export { RpcServer, type ServerOptions } from './dispatch.js';
+export {
+  DispatchLoop,
+  DispatchEventKind,
+  DispatchFlags,
+  CancelReason as DispatchCancelReason,
+  SubmitResult,
+  DEFAULT_DISPATCH_DELIVERY,
+  DISPATCH_DELIVERIES,
+  type DispatchDelivery,
+  type DispatchLoopOptions,
+  type DispatchServerTuning,
+} from './dispatch-server.js';
+export {
+  lowerService,
+  lowerServiceJson,
+  dynamicContractId,
+  normalizeRequirement,
+  type DynamicServiceSpec,
+  type DynamicMethodSpec,
+  type ServiceLike,
+} from './lowering.js';
 
 // Registry
 export {

@@ -1,21 +1,22 @@
 /**
- * dispatch-server.ts -- T4.0 prototype: JS services on `aster::rpc::Server`
- * through the native `DispatchServer` (dynamic-dispatch-design.md §4.3).
+ * dispatch-server.ts -- the event loop under JS services on
+ * `aster::rpc::Server` through the native `DispatchServer`
+ * (dynamic-dispatch-design.md §4.3).
  *
  * Rust routes every call (gates, sessions, deadlines, frame limits) and hands
- * JS one event per call; JS answers by `callId`. This module drives the four
- * event-delivery variants that T4.0 benchmarks
+ * JS one event per call; JS answers by `callId`. This module drives the
+ * event-delivery variants measured in T4.0
  * (`docs/_internal/bindings/t4-dispatch-benchmark.md`):
  *
- * | delivery | variant | how events arrive |
- * |---|---|---|
- * | `tsfn` | T-a | Rust calls a threadsafe function once per event |
- * | `tsfn-batched` | T-b | Rust coalesces events while JS is busy, one TSFN call per batch |
- * | `ring-await` | R1 | SPSC ring; JS loops on `await nextBatch()` |
- * | `ring-poll` | R2 | SPSC ring; sync `pollBatch()` from `setImmediate`, parking on `nextBatch()` when empty |
+ * | delivery | how events arrive |
+ * |---|---|
+ * | `tsfn-batched` (default) | Rust coalesces events while JS is busy, one threadsafe-function call per batch |
+ * | `tsfn` | Rust calls a threadsafe function once per event |
+ * | `ring` / `ring-await` | SPSC ring; JS loops on `await nextBatch()` |
+ * | `ring-poll` | SPSC ring; sync `pollBatch()` from `setImmediate`, parking on `nextBatch()` when empty |
  *
- * Not wired into `AsterServer` yet: that is T4 proper (after R3d), which
- * adds the decorator lowering, interceptors and `dispatch.ts`.
+ * `dispatch.ts` builds the handler table, `CallContext` and interceptors on
+ * top of it; `RpcServer` / `AsterServer` use that.
  */
 
 import type {
@@ -24,12 +25,17 @@ import type {
   DispatchServer as NativeDispatchServer,
 } from '@aster-rpc/transport';
 import { loadNative } from './native.js';
+import type { DynamicServiceSpec } from './lowering.js';
 
 export type { DispatchEvent };
 export type { NativeDispatchServer };
+export type { DynamicServiceSpec, DynamicMethodSpec } from './lowering.js';
 
-/** How events reach JS (see the module doc). */
-export type DispatchDelivery = 'tsfn' | 'tsfn-batched' | 'ring-await' | 'ring-poll';
+/** How events reach JS (see the module doc). `ring` = `ring-await`. */
+export type DispatchDelivery = 'tsfn' | 'tsfn-batched' | 'ring' | 'ring-await' | 'ring-poll';
+
+/** The default delivery (T4.0 decision). */
+export const DEFAULT_DISPATCH_DELIVERY: DispatchDelivery = 'tsfn-batched';
 
 export const DISPATCH_DELIVERIES: readonly DispatchDelivery[] = [
   'tsfn',
@@ -46,6 +52,15 @@ export const DispatchEventKind = {
   ResponseClosed: 4,
   SessionClosed: 5,
   ConnectionClosed: 6,
+  /** A connection on a non-RPC ALPN no Rust handler claimed (`alpn`); take it with `takeConnection(connectionId)`. */
+  NonRpc: 7,
+} as const;
+
+/** `DispatchEvent.reason` for `Cancelled`. */
+export const CancelReason = {
+  Peer: 1,
+  Deadline: 2,
+  InvalidRequest: 3,
 } as const;
 
 /** `DispatchEvent.flags` bits. */
@@ -53,6 +68,10 @@ export const DispatchFlags = {
   FirstIsEnd: 1,
   NewSession: 2,
   IrohAuthenticated: 4,
+  /** The event carries `metadata`. */
+  HasMetadata: 0x100,
+  /** The event carries `attributes`. */
+  HasAttributes: 0x200,
 } as const;
 
 /** Results of the native `respond` / `send` / `finish` (`> 0` = queue full, bytes needed). */
@@ -64,40 +83,30 @@ export const SubmitResult = {
   Invalid: -4,
 } as const;
 
-/** One method in a `DynamicService` registration (design §1.5). */
-export interface DynamicMethodSpec {
-  name: string;
-  pattern: 'unary' | 'server_stream' | 'client_stream' | 'bidi_stream';
-  request: { hash: string; display?: string };
-  response: { hash: string; display?: string };
-  idempotent?: boolean;
-  default_timeout?: number | null;
-  requires?: unknown;
-  limits?: { max_frame_size?: number };
+/** Native server options passed through to `DispatchServer.serve/start`. */
+export interface DispatchServerTuning {
+  /** Serve the baseline `aster.ops.NodeInfo` (default true). */
+  builtinNodeInfo?: boolean;
+  /** Serve the baseline `aster.net.Topology` (default false). */
+  builtinTopology?: boolean;
+  /** Cap on concurrently open sessions per connection (default 1024). */
+  maxSessionsPerConnection?: number;
+  /** Cap on any handler in ms (Rust default 300 000; 0 = none). */
+  handlerTimeoutMs?: number;
+  /** Ring capacity (ring deliveries). */
+  ringCapacity?: number;
 }
 
-/** The JSON registration form of a `DynamicService` (design §1.5). */
-export interface DynamicServiceSpec {
-  name: string;
-  version: number;
-  scope?: 'shared' | 'session';
-  requires?: unknown;
-  serialization_modes?: string[];
-  producer_language?: string;
-  iroh_only?: boolean;
-  methods: DynamicMethodSpec[];
-  type_defs?: unknown[];
-  manifest_json?: string | null;
-}
-
-export interface DispatchLoopOptions {
+export interface DispatchLoopOptions extends DispatchServerTuning {
+  /** Serve on this native node (started with `aster/1`). Else a node is started from `config`. */
+  node?: unknown;
+  /** With `node`: Gate 3 also reads attributes from this native `GatePolicy`'s store. */
+  gateAttributes?: unknown;
   config?: AsterConfig;
   services: DynamicServiceSpec[];
   delivery?: DispatchDelivery;
   /** Max events per pull (ring variants). Default 256. */
   batchMax?: number;
-  /** Serve the baseline `aster.ops.NodeInfo` (default true). */
-  builtinNodeInfo?: boolean;
   /** Called synchronously for every call event. Must not throw (a throw abandons the call). */
   onCall: (call: DispatchEvent, server: NativeDispatchServer) => void;
   /** Every other event (cancelled, session/connection closed, ...). */
@@ -113,14 +122,14 @@ export class DispatchLoop {
     readonly delivery: DispatchDelivery,
   ) {}
 
-  /** The server's `aster1…` ticket. */
+  /** The server's `aster1…` ticket (own-node servers only; `''` when serving on a caller's node). */
   get address(): string {
     return this.native.address;
   }
 
   static async start(opts: DispatchLoopOptions): Promise<DispatchLoop> {
     const native = loadNative();
-    const delivery = opts.delivery ?? 'tsfn-batched';
+    const delivery: DispatchDelivery = opts.delivery === 'ring' ? 'ring-await' : (opts.delivery ?? DEFAULT_DISPATCH_DELIVERY);
     const batchMax = opts.batchMax ?? 256;
     const json = opts.services.map((s) => JSON.stringify(s));
     let loop: DispatchLoop | undefined;
@@ -146,13 +155,19 @@ export class DispatchLoop {
         }
       }
     };
-    const common = { builtinNodeInfo: opts.builtinNodeInfo ?? true };
-    let srv: NativeDispatchServer;
-    if (delivery === 'tsfn' || delivery === 'tsfn-batched') {
-      srv = await native.DispatchServer.start(opts.config, json, { ...common, delivery }, handle);
-    } else {
-      srv = await native.DispatchServer.start(opts.config, json, { ...common, delivery: 'ring' });
-    }
+    const common = {
+      builtinNodeInfo: opts.builtinNodeInfo ?? true,
+      builtinTopology: opts.builtinTopology,
+      maxSessionsPerConnection: opts.maxSessionsPerConnection,
+      handlerTimeoutMs: opts.handlerTimeoutMs,
+      ringCapacity: opts.ringCapacity,
+    };
+    const tsfn = delivery === 'tsfn' || delivery === 'tsfn-batched';
+    const nativeOpts = { ...common, delivery: tsfn ? delivery : 'ring' };
+    const onEvents = tsfn ? handle : undefined;
+    const srv: NativeDispatchServer = opts.node
+      ? await native.DispatchServer.serve(opts.node as any, json, nativeOpts, onEvents, opts.gateAttributes as any)
+      : await native.DispatchServer.start(opts.config, json, nativeOpts, onEvents);
     loop = new DispatchLoop(srv, delivery);
     if (delivery === 'ring-await') loop.runAwait(handle, batchMax);
     else if (delivery === 'ring-poll') loop.runPoll(handle, batchMax);

@@ -4,8 +4,6 @@ import { resolve } from 'node:path';
 import {
   encodeFrame,
   decodeFrame,
-  writeFrame,
-  readFrame,
   FramingError,
   COMPRESSED,
   TRAILER,
@@ -28,43 +26,6 @@ function fromHex(h: string): Uint8Array {
     bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
   }
   return bytes;
-}
-
-/** In-memory send stream for testing. */
-class MemSendStream {
-  chunks: Uint8Array[] = [];
-  async writeAll(data: Uint8Array): Promise<void> {
-    this.chunks.push(new Uint8Array(data));
-  }
-  get bytes(): Uint8Array {
-    const total = this.chunks.reduce((s, c) => s + c.byteLength, 0);
-    const buf = new Uint8Array(total);
-    let offset = 0;
-    for (const c of this.chunks) {
-      buf.set(c, offset);
-      offset += c.byteLength;
-    }
-    return buf;
-  }
-}
-
-/** In-memory recv stream for testing. */
-class MemRecvStream {
-  private data: Uint8Array;
-  private pos = 0;
-
-  constructor(data: Uint8Array) {
-    this.data = data;
-  }
-
-  async readExact(n: number): Promise<Uint8Array> {
-    if (this.pos + n > this.data.byteLength) {
-      throw new Error('EOF');
-    }
-    const slice = this.data.subarray(this.pos, this.pos + n);
-    this.pos += n;
-    return slice;
-  }
 }
 
 // -- Flag constants -----------------------------------------------------------
@@ -169,64 +130,6 @@ describe('encodeFrame / decodeFrame', () => {
   });
 });
 
-// -- writeFrame / readFrame (stream-based) ------------------------------------
-
-describe('writeFrame / readFrame', () => {
-  it('round-trips through in-memory streams', async () => {
-    const send = new MemSendStream();
-    const payload = new TextEncoder().encode('Aster RPC');
-    await writeFrame(send, payload, HEADER);
-
-    const recv = new MemRecvStream(send.bytes);
-    const result = await readFrame(recv, 0); // timeout=0 disables
-    expect(result).not.toBeNull();
-    const [decoded, flags] = result!;
-    expect(new TextDecoder().decode(decoded)).toBe('Aster RPC');
-    expect(flags).toBe(HEADER);
-  });
-
-  it('returns null on empty stream (EOF)', async () => {
-    const recv = new MemRecvStream(new Uint8Array(0));
-    const result = await readFrame(recv, 0);
-    expect(result).toBeNull();
-  });
-
-  it('rejects zero-length payload without TRAILER/CANCEL', async () => {
-    await expect(
-      writeFrame(new MemSendStream(), new Uint8Array(0), 0),
-    ).rejects.toThrow('empty payload only allowed with TRAILER, CANCEL or END_STREAM');
-  });
-
-  it('allows empty payload with TRAILER', async () => {
-    const send = new MemSendStream();
-    await writeFrame(send, new Uint8Array(0), TRAILER);
-    expect(send.bytes.byteLength).toBe(5); // 4 length + 1 flags
-  });
-
-  it('allows empty payload with CANCEL', async () => {
-    const send = new MemSendStream();
-    await writeFrame(send, new Uint8Array(0), CANCEL);
-    expect(send.bytes.byteLength).toBe(5);
-  });
-
-  it('reads multiple frames sequentially', async () => {
-    const send = new MemSendStream();
-    await writeFrame(send, new TextEncoder().encode('one'), 0);
-    await writeFrame(send, new TextEncoder().encode('two'), 0);
-    await writeFrame(send, new Uint8Array(0), TRAILER);
-
-    const recv = new MemRecvStream(send.bytes);
-    const r1 = await readFrame(recv, 0);
-    const r2 = await readFrame(recv, 0);
-    const r3 = await readFrame(recv, 0);
-
-    expect(new TextDecoder().decode(r1![0])).toBe('one');
-    expect(new TextDecoder().decode(r2![0])).toBe('two');
-    expect(r3![0].byteLength).toBe(0);
-    expect(r3![1]).toBe(TRAILER);
-  });
-});
-
 // -- Error cases --------------------------------------------------------------
 
 describe('error handling', () => {
@@ -240,11 +143,5 @@ describe('error handling', () => {
     // Length says 5 bytes but only 2 follow
     const wire = new Uint8Array([5, 0, 0, 0, 0, 1]);
     expect(() => decodeFrame(wire)).toThrow('incomplete frame');
-  });
-
-  it('readFrame rejects zero-length in wire', async () => {
-    const wire = new Uint8Array([0, 0, 0, 0]);
-    const recv = new MemRecvStream(wire);
-    await expect(readFrame(recv, 0)).rejects.toThrow('zero-length frame');
   });
 });

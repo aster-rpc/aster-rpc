@@ -5,7 +5,6 @@ import {
   applyResponseInterceptors,
   applyErrorInterceptors,
   normalizeError,
-  DeadlineInterceptor,
   MetricsInterceptor,
   RetryInterceptor,
   RateLimitInterceptor,
@@ -90,31 +89,6 @@ describe('normalizeError', () => {
     const err = normalizeError(new Error('oops'));
     expect(err.code).toBe(StatusCode.UNKNOWN);
     expect(err.message).toContain('oops');
-  });
-});
-
-// -- DeadlineInterceptor ------------------------------------------------------
-
-describe('DeadlineInterceptor', () => {
-  it('passes non-expired deadline', async () => {
-    const di = new DeadlineInterceptor();
-    const c = ctx({ deadline: Date.now() / 1000 + 60 });
-    const result = await di.onRequest(c, 'req');
-    expect(result).toBe('req');
-  });
-
-  it('rejects expired deadline', async () => {
-    const di = new DeadlineInterceptor();
-    const c = ctx({ deadline: Date.now() / 1000 - 10 });
-    await expect(di.onRequest(c, 'req')).rejects.toThrow('deadline');
-  });
-
-  it('computes timeout seconds', () => {
-    const di = new DeadlineInterceptor();
-    const c = ctx({ deadline: Date.now() / 1000 + 5 });
-    const t = di.timeoutSeconds(c);
-    expect(t).toBeGreaterThan(3);
-    expect(t).toBeLessThanOrEqual(5);
   });
 });
 

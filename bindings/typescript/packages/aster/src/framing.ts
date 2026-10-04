@@ -13,25 +13,13 @@
  *
  * Frame encode/decode and zstd payload compression are Rust core
  * (`core/src/framing.rs`) via the NAPI addon -- one implementation for every
- * binding, on Node and Bun alike. Only the async stream I/O (reading the
- * length prefix and body off a QUIC stream) lives here, until RPC moves
- * onto native dispatch (plan T4).
+ * binding, on Node and Bun alike. The RPC paths no longer frame in JS: since
+ * T4 the server is `aster::rpc::Server` and the client `RpcConnection`, so the
+ * stream I/O helpers are gone. What is left is the pure codec, kept for
+ * tooling and the conformance vectors.
  */
 
-import { MAX_FRAME_SIZE, DEFAULT_FRAME_READ_TIMEOUT_S } from './limits.js';
 import { loadNative } from './native.js';
-
-// -- Stream protocol abstractions ---------------------------------------------
-
-/** Minimal async send-stream interface (matches IrohSendStream from NAPI). */
-export interface SendStream {
-  writeAll(data: Uint8Array): Promise<void>;
-}
-
-/** Minimal async recv-stream interface (matches IrohRecvStream from NAPI). */
-export interface RecvStream {
-  readExact(n: number): Promise<Uint8Array>;
-}
 
 // -- Flag constants (values pinned by Aster-SPEC §6.1; equal core's) ----------
 
@@ -72,7 +60,6 @@ function bytes(b: Uint8Array): Uint8Array {
   return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
 }
 
-const LENGTH_SIZE = 4;
 
 // -- Byte-level encode/decode (Rust core) ---------------------------------------
 
@@ -122,107 +109,4 @@ export function payloadOf(payload: Uint8Array, flags: number): Uint8Array {
 
 function toBuffer(b: Uint8Array): Buffer {
   return Buffer.isBuffer(b) ? b : Buffer.from(b.buffer, b.byteOffset, b.byteLength);
-}
-
-// -- Stream I/O ----------------------------------------------------------------
-
-/**
- * Write one frame with the payload unchanged (envelope / control frames).
- */
-export async function writeFrame(
-  stream: SendStream,
-  payload: Uint8Array,
-  flags = 0,
-): Promise<void> {
-  await stream.writeAll(encodeFrame(payload, flags));
-}
-
-/**
- * Write one data frame, compressing the payload per Aster-SPEC §5.6.
- */
-export async function writePayloadFrame(
-  stream: SendStream,
-  payload: Uint8Array,
-  flags = 0,
-): Promise<void> {
-  await stream.writeAll(encodePayloadFrame(payload, flags));
-}
-
-/**
- * Read a single frame from a receive stream. The payload is returned as
- * sent; pass it through {@link payloadOf} to undo compression.
- *
- * @param stream - The QUIC receive stream.
- * @param timeoutS - Read timeout in seconds. Defaults to
- *   DEFAULT_FRAME_READ_TIMEOUT_S; pass 0 to disable.
- * @returns A [payload, flags] tuple, or null if the stream has ended cleanly.
- * @throws FramingError on wire-format violations (zero length, oversized frame).
- */
-export async function readFrame(
-  stream: RecvStream,
-  timeoutS?: number,
-): Promise<FrameResult | null> {
-  const timeout = timeoutS ?? DEFAULT_FRAME_READ_TIMEOUT_S;
-  const effectiveTimeout = timeout > 0 ? timeout * 1000 : undefined;
-
-  let lengthBytes: Uint8Array;
-  try {
-    lengthBytes = await withTimeout(
-      stream.readExact(LENGTH_SIZE),
-      effectiveTimeout,
-      'frame read timed out waiting for length header',
-    );
-  } catch (e) {
-    if (e instanceof FramingError) throw e;
-    // Stream ended or was reset -- treat as clean EOF
-    return null;
-  }
-  if (lengthBytes.byteLength < LENGTH_SIZE) return null;
-
-  const view = new DataView(lengthBytes.buffer, lengthBytes.byteOffset, lengthBytes.byteLength);
-  const frameBodyLen = view.getUint32(0, true);
-  if (frameBodyLen === 0) {
-    throw new FramingError('received zero-length frame');
-  }
-  if (frameBodyLen > MAX_FRAME_SIZE) {
-    throw new FramingError(`frame size ${frameBodyLen} exceeds maximum ${MAX_FRAME_SIZE}`);
-  }
-
-  let body: Uint8Array;
-  try {
-    body = await withTimeout(
-      stream.readExact(frameBodyLen),
-      effectiveTimeout,
-      `frame read timed out waiting for ${frameBodyLen} bytes of body`,
-    );
-  } catch (e) {
-    if (e instanceof FramingError) throw e;
-    throw new FramingError(`incomplete frame: expected ${frameBodyLen} bytes`);
-  }
-  if (body.byteLength < frameBodyLen) {
-    throw new FramingError(
-      `incomplete frame: expected ${frameBodyLen} bytes, got ${body.byteLength}`,
-    );
-  }
-  return [body.subarray(1), body[0]!];
-}
-
-/** Wrap a promise with a timeout. */
-async function withTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs: number | undefined,
-  message: string,
-): Promise<T> {
-  if (timeoutMs === undefined) return promise;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new FramingError(message)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }

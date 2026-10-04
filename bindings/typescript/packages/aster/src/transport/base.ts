@@ -12,9 +12,16 @@ import type { StatusCode } from '../status.js';
 /** Options for a single RPC call. */
 export interface CallOptions {
   metadata?: Record<string, string>;
+  /** Total call budget in seconds (fractions allowed); enforced client-side, sent rounded up. */
   deadlineSecs?: number;
   serializationMode?: number;
   callId?: number;
+  /** Service version (`StreamHeader.version`). Typed clients set it from `@Service`; default 1. */
+  version?: number;
+  /** Session id for session-scoped services (0 = shared). Overrides the transport's. */
+  sessionId?: number;
+  /** Abort the call: the client cancels it on the wire and the call rejects with `CANCELLED`. */
+  signal?: AbortSignal;
   /** Hint type for serialization: the request class constructor (e.g. StatusRequest).
    *  Used by ForyCodec to convert plain object literals to typed instances before
    *  encoding, enabling cross-language wire compatibility. */
@@ -76,4 +83,7 @@ export interface BidiChannel {
 
   /** Wait for the trailing status frame. */
   waitForTrailer(): Promise<[code: StatusCode, message: string]>;
+
+  /** Cancel the call (optional; transports over real streams implement it). */
+  cancel?(): Promise<void>;
 }

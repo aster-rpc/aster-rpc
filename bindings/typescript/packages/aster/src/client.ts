@@ -131,6 +131,7 @@ export function createClient<T extends new (...args: any[]) => any>(
         }
 
         const opts: CallOptions = {
+          version: serviceInfo.version,
           ...callOpts,
           metadata: { ...options?.metadata, ...callOpts?.metadata },
           hintType: methodInfo.requestType,

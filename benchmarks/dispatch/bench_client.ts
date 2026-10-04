@@ -11,8 +11,9 @@
  *   bun run benchmarks/dispatch/bench_client.ts <aster1-ticket> [--duration S] [--warmup S]
  *       [--concurrency 1,10,50,100] [--stream-frames 100,10000] [--client-stream 10000] [--skip-streams]
  *
- * Unary goes through the binding's pooled fast path (`IrohTransport.unary` ->
- * `AsterCall.unaryFastPath`). Request: EchoRequest{message:"bench", count:1, data: 64 x 0xab}.
+ * Unary goes through the binding's pooled path (`IrohTransport.unary` ->
+ * native `RpcConnection.unary`, i.e. `aster::rpc::RpcConnection`).
+ * Request: EchoRequest{message:"bench", count:1, data: 64 x 0xab}.
  */
 
 import {

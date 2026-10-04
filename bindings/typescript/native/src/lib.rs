@@ -1,8 +1,10 @@
 //! NAPI-RS bindings for Aster transport.
 //!
-//! Wraps the `aster` crate (`Node`, `AsterConfig`, identity files — plan D1)
-//! and, through `aster::binding_support`, the transport-core pieces the
-//! binding still drives directly (reactor, call pool, tunnels, hooks).
+//! Wraps the `aster` crate (`Node`, `AsterConfig`, identity files — plan D1).
+//! RPC goes through `aster::rpc` (`rpc.rs`: `DispatchServer` on
+//! `aster::rpc::Server`; `rpc_client.rs`: `RpcConnection`); the transport-core
+//! pieces the binding still drives directly (tunnels, hooks) come through
+//! `aster::binding_support`.
 
 #![allow(dead_code)] // NAPI exports are called from JavaScript, not Rust tests.
 
@@ -11,7 +13,6 @@ use napi_derive::napi;
 mod admission;
 mod attestation;
 mod blobs;
-mod call;
 mod config;
 mod contract;
 mod coordination;
@@ -25,8 +26,8 @@ mod keys;
 mod lease;
 mod net;
 mod node;
-mod reactor;
 mod rpc;
+mod rpc_client;
 mod ticket;
 mod topology;
 

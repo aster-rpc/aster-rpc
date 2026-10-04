@@ -239,12 +239,6 @@ export { CallContext } from './interceptors/base.js';
 export { type Interceptor } from './interceptors/base.js';
 
 /**
- * Enforce and propagate call deadlines.
- * @group Interceptors
- */
-export { DeadlineInterceptor } from './interceptors/deadline.js';
-
-/**
  * Token-based authentication.
  * @group Interceptors
  */

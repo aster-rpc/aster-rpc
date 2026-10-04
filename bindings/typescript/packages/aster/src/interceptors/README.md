@@ -3,21 +3,21 @@
 Interceptors are middleware that run before and after every RPC call. They
 can validate, transform, or reject requests and responses.
 
-**Default:** `DeadlineInterceptor` is wired in by default on `RpcServer`.
-Pass `interceptors: [...]` to override (an empty array disables all defaults).
+**Default:** none. Deadlines are enforced by the Rust server (a call's budget is
+`min(client deadline, method timeout, handler timeout)`; when it passes, the
+client gets `DEADLINE_EXCEEDED` and the handler's `ctx.signal` aborts), and
+`requires` is enforced by Rust Gate 3.
 
 ## Wiring interceptors
 
 ```typescript
 import { RpcServer } from 'aster';
-import { DeadlineInterceptor } from 'aster/interceptors/deadline';
 import { RateLimitInterceptor } from 'aster/interceptors/rate-limit';
 import { MetricsInterceptor } from 'aster/interceptors/metrics';
 
 const server = new RpcServer({
   registry,
   interceptors: [
-    new DeadlineInterceptor(),
     new RateLimitInterceptor({ perPeerRps: 1000 }),
     new MetricsInterceptor(),
   ],
@@ -25,16 +25,6 @@ const server = new RpcServer({
 ```
 
 ## Available interceptors
-
-### DeadlineInterceptor (default)
-
-Rejects requests whose deadline has already expired on receipt, accounting
-for clock skew. Complements the handler-level deadline enforcement
-(`MAX_HANDLER_TIMEOUT_S`) which caps execution time.
-
-```typescript
-new DeadlineInterceptor(skewToleranceMs?: number)  // default 5000
-```
 
 ### RateLimitInterceptor
 

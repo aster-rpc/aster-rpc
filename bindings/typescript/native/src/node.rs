@@ -35,7 +35,7 @@ pub struct Node {
 }
 
 impl Node {
-    /// The transport-core node, for sibling modules (reactor) and the
+    /// The transport-core node, for sibling modules and the
     /// still-core-backed methods below.
     pub(crate) fn core(&self) -> &CoreNode {
         self.inner.core_node()
