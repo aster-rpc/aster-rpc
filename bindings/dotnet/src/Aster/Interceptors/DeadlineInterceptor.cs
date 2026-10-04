@@ -2,7 +2,9 @@ namespace Aster.Interceptors;
 
 /// <summary>
 /// Validates and enforces call deadlines with configurable clock-skew tolerance.
-/// Spec reference: S6.8.1
+/// Spec reference: S6.8.1. On the client it bounds every attempt of a call to the time left of
+/// the original deadline (the remaining time is what the native call is given, so retries do not
+/// extend it) and refuses to send a call whose deadline has passed.
 /// </summary>
 public class DeadlineInterceptor : IInterceptor
 {
@@ -20,26 +22,34 @@ public class DeadlineInterceptor : IInterceptor
 
     public object OnRequest(CallContext ctx, object request)
     {
-        if (ctx.Deadline is not null)
-        {
-            long nowEpochMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            long deadlineEpochMs = (long)(ctx.Deadline.Value * 1000);
-
-            // Reject on receipt if expired beyond skew tolerance (S6.8.1)
-            if (nowEpochMs > deadlineEpochMs + _skewToleranceMs)
-            {
-                throw new RpcError(
-                    StatusCode.DeadlineExceeded,
-                    $"deadline already expired on receipt (now={nowEpochMs}, deadline={deadlineEpochMs}, skew_tolerance={_skewToleranceMs}ms)");
-            }
-
-            // Standard expiry check (no tolerance)
-            if (ctx.IsExpired)
-            {
-                throw new RpcError(StatusCode.DeadlineExceeded, "deadline exceeded");
-            }
-        }
+        CheckDeadline(ctx);
         return request;
+    }
+
+    /// <summary>
+    /// Throws <see cref="StatusCode.DeadlineExceeded"/> if the call's deadline has passed (beyond
+    /// the skew tolerance on receipt, or at all). The client runs it before every attempt, also
+    /// for client-streaming and bidi calls that have no single request to hook.
+    /// </summary>
+    public void CheckDeadline(CallContext ctx)
+    {
+        if (ctx.Deadline is null) return;
+        long nowEpochMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        long deadlineEpochMs = (long)(ctx.Deadline.Value * 1000);
+
+        // Reject on receipt if expired beyond skew tolerance (S6.8.1)
+        if (nowEpochMs > deadlineEpochMs + _skewToleranceMs)
+        {
+            throw new RpcError(
+                StatusCode.DeadlineExceeded,
+                $"deadline already expired on receipt (now={nowEpochMs}, deadline={deadlineEpochMs}, skew_tolerance={_skewToleranceMs}ms)");
+        }
+
+        // Standard expiry check (no tolerance)
+        if (ctx.IsExpired)
+        {
+            throw new RpcError(StatusCode.DeadlineExceeded, "deadline exceeded");
+        }
     }
 
     /// <summary>

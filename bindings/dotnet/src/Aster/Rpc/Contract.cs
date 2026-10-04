@@ -37,6 +37,33 @@ public sealed class WireNameAttribute(string name) : Attribute
 }
 
 /// <summary>
+/// Declares that a field's construction default is <b>part of the contract</b> (the counterpart of
+/// Rust's <c>#[aster(default = ...)]</c> and Python's <c>contract_default()</c>): the field is
+/// published as <c>required = false</c> plus the canonical default bytes, and the contract id
+/// changes with the default. A plain initializer (<c>public string Name { get; set; } = "";</c>)
+/// does <i>not</i> enter the contract: the field stays <c>required</c>. Fory payload bytes are
+/// unaffected.
+/// <code>
+/// [WireType("defaults.v1/Settings")]
+/// public class Settings
+/// {
+///     public string Name { get; set; } = "";                   // required
+///     [ContractDefault] public string State { get; set; } = "idle";
+///     [ContractDefault] public int Retries { get; set; } = -3;
+///     [ContractDefault] public List&lt;string&gt; Tags { get; set; } = new();
+/// }
+/// </code>
+/// The default is the value a freshly constructed instance holds (the type needs a public
+/// parameterless constructor, as Fory requires anyway). Supported (§11.3.2.3): <c>string</c>,
+/// <c>bool</c>, <c>int</c> (varint32), <c>long</c> (varint64), <c>double</c> (float64; finite,
+/// not subnormal), nullable forms of those with a non-null value, and the <i>empty</i>
+/// list / set / map. Anything else throws <see cref="NotSupportedException"/> when the contract
+/// is computed.
+/// </summary>
+[AttributeUsage(AttributeTargets.Property | AttributeTargets.Field, Inherited = false)]
+public sealed class ContractDefaultAttribute : Attribute;
+
+/// <summary>
 /// Contract identity (Aster-ContractIdentity §11.3): builds the <c>TypeDef</c> /
 /// <c>ServiceContract</c> JSON from a <see cref="ServiceDefinition"/> and lets Rust canonicalize
 /// and hash it (<c>aster_canonical_bytes</c>, <c>aster_blake3_hex</c>, <c>aster_contract_id</c>);
@@ -191,6 +218,7 @@ public static class ContractBuilder
         private readonly Dictionary<Type, string> _hashes = new();
         private readonly HashSet<Type> _inProgress = new();
         private readonly NullabilityInfoContext _nullability = new();
+        private readonly Dictionary<Type, object> _defaultInstances = new();
 
         public string Hash(Type type)
         {
@@ -277,6 +305,13 @@ public static class ContractBuilder
             }
 
             var (kind, primitive, typeRef) = Leaf(valueType);
+            bool required = true;
+            string defaultHex = "";
+            if (member.GetCustomAttribute<ContractDefaultAttribute>() != null)
+            {
+                required = false;
+                defaultHex = Convert.ToHexString(LowerDefault(member, container, kind, primitive)).ToLowerInvariant();
+            }
             w.WriteStartObject();
             w.WriteNumber("id", 0);
             w.WriteString("name", member.GetCustomAttribute<WireNameAttribute>()?.Name ?? SnakeCase(member.Name));
@@ -300,9 +335,84 @@ public static class ContractBuilder
                 w.WriteString("container_key_primitive", "");
                 w.WriteString("container_key_ref", "");
             }
-            w.WriteBoolean("required", true);
-            w.WriteString("default_value", "");
+            w.WriteBoolean("required", required);
+            w.WriteString("default_value", defaultHex);
             w.WriteEndObject();
+        }
+
+        /// <summary>
+        /// <c>FieldDef.default_value</c> for a <see cref="ContractDefaultAttribute"/> field: the
+        /// canonical encoding of the default-constructed value (§11.3.2.3 lowering table).
+        /// </summary>
+        private byte[] LowerDefault(MemberInfo member, string container, string kind, string primitive)
+        {
+            Type owner = member.ReflectedType ?? member.DeclaringType!;
+            string where = $"{owner.Name}.{member.Name}";
+            if (!_defaultInstances.TryGetValue(owner, out var instance))
+            {
+                try { instance = Activator.CreateInstance(owner)!; }
+                catch (Exception e) when (e is MissingMethodException or TargetInvocationException)
+                {
+                    throw new NotSupportedException($"{where}: [ContractDefault] needs a public parameterless constructor on {owner.Name}", e);
+                }
+                _defaultInstances[owner] = instance;
+            }
+            object? value = member is PropertyInfo p ? p.GetValue(instance) : ((FieldInfo)member).GetValue(instance);
+
+            if (container != "none")
+            {
+                if (value is not IEnumerable items || items.GetEnumerator().MoveNext())
+                    throw new NotSupportedException($"{where}: a list/set/map contract default must be the empty container (§11.3.2.3 rule 2)");
+                return [0x00];
+            }
+            if (value is null)
+                throw new NotSupportedException($"{where}: a null contract default is not expressible in v1; drop [ContractDefault] to keep the field required (§11.3.2.3)");
+            if (kind != "primitive")
+                throw new NotSupportedException($"{where}: only scalar fields may carry a contract default (§11.3.2.3 rule 3)");
+            switch (primitive)
+            {
+                case "string":
+                {
+                    byte[] utf8 = Encoding.UTF8.GetBytes((string)value);
+                    return [.. UVarint(((ulong)utf8.Length << 2) | 2), .. utf8];
+                }
+                case "bool":
+                    return [(bool)value ? (byte)1 : (byte)0];
+                case "varint32":
+                {
+                    int v = (int)value;
+                    return UVarint((uint)((v << 1) ^ (v >> 31)));
+                }
+                case "varint64":
+                {
+                    long v = (long)value;
+                    return UVarint((ulong)((v << 1) ^ (v >> 63)));
+                }
+                case "float64":
+                {
+                    double d = (double)value;
+                    if (!double.IsFinite(d)) throw new NotSupportedException($"{where}: float contract default must be finite");
+                    if (d != 0.0 && Math.Abs(d) < 2.2250738585072014e-308) throw new NotSupportedException($"{where}: float contract default must not be subnormal");
+                    if (d == 0.0) d = 0.0; // normalise -0.0
+                    byte[] le = new byte[8];
+                    System.Buffers.Binary.BinaryPrimitives.WriteDoubleLittleEndian(le, d);
+                    return le;
+                }
+                default:
+                    throw new NotSupportedException($"{where}: contract defaults for wire type '{primitive}' are reserved in v1 (§11.3.2.3); supported: string, bool, int, long, double, empty containers");
+            }
+        }
+
+        private static byte[] UVarint(ulong n)
+        {
+            var o = new List<byte>(10);
+            while (true)
+            {
+                byte b = (byte)(n & 0x7F);
+                n >>= 7;
+                if (n != 0) o.Add((byte)(b | 0x80));
+                else { o.Add(b); return [.. o]; }
+            }
         }
 
         private (string Kind, string Primitive, string Ref) Leaf(Type t)

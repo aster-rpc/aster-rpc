@@ -22,6 +22,12 @@ public sealed record CallOptions
     /// </summary>
     public TimeSpan? Deadline { get; init; }
 
+    /// <summary>
+    /// True if the method is safe to retry (<see cref="ServiceDefinition"/>'s <c>idempotent</c>); a
+    /// <see cref="RetryInterceptor"/> retries only idempotent calls.
+    /// </summary>
+    public bool Idempotent { get; init; }
+
     /// <summary>Request metadata (stream header).</summary>
     public IReadOnlyList<KeyValuePair<string, string>>? Metadata { get; init; }
 
@@ -50,6 +56,16 @@ public sealed record CallOptions
 /// EchoReply reply = await conn.UnaryAsync&lt;EchoRequest, EchoReply&gt;("InteropEcho", "echo", request);
 /// </code>
 /// Calls go straight to <c>aster/1</c> (open gate); consumer admission is not performed.
+/// <para>
+/// <b>Interceptors.</b> Pass client interceptors (<see cref="DeadlineInterceptor"/>,
+/// <see cref="RetryInterceptor"/>, <see cref="CircuitBreakerInterceptor"/>, your own
+/// <see cref="IInterceptor"/>s) to <see cref="StartAsync"/> / <see cref="Create"/>; every
+/// connection of the client applies them to all four call patterns (the semantics are those of
+/// Python's client: retry and the breaker wrap unary and client-streaming calls, the hooks see
+/// every message of every pattern). A circuit breaker is stateful and shared by every call of
+/// the client: to isolate peers or services use <see cref="RpcConnection.WithInterceptors"/>
+/// for one breaker per target.
+/// </para>
 /// </summary>
 public sealed class AsterClient : IAsyncDisposable
 {
@@ -57,24 +73,32 @@ public sealed class AsterClient : IAsyncDisposable
     private readonly bool _ownsNode;
     private readonly ConcurrentDictionary<string, Task<RpcConnection>> _connections = new();
 
-    private AsterClient(Node node, ICodec codec, bool ownsNode)
+    private readonly ClientInterceptors _interceptors;
+
+    private AsterClient(Node node, ICodec codec, bool ownsNode, IEnumerable<IInterceptor>? interceptors)
     {
         _node = node;
         Codec = codec;
         _ownsNode = ownsNode;
+        _interceptors = interceptors is null ? ClientInterceptors.None : new ClientInterceptors(interceptors);
     }
 
     /// <summary>Starts a client node (adds the <c>aster/1</c> ALPN to <paramref name="config"/>).</summary>
-    public static async Task<AsterClient> StartAsync(AsterConfig? config = null, ICodec? codec = null, CancellationToken cancellationToken = default)
+    public static async Task<AsterClient> StartAsync(AsterConfig? config = null, ICodec? codec = null,
+        IEnumerable<IInterceptor>? interceptors = null, CancellationToken cancellationToken = default)
     {
         var node = await Node.StartAsync(config, null, [AsterServer.AsterAlpn], cancellationToken).ConfigureAwait(false);
-        return new AsterClient(node, codec ?? new ForyCodec(), ownsNode: true);
+        return new AsterClient(node, codec ?? new ForyCodec(), ownsNode: true, interceptors);
     }
 
     /// <summary>A client on an existing node (which the caller keeps owning).</summary>
-    public static AsterClient Create(Node node, ICodec? codec = null) => new(node, codec ?? new ForyCodec(), ownsNode: false);
+    public static AsterClient Create(Node node, ICodec? codec = null, IEnumerable<IInterceptor>? interceptors = null)
+        => new(node, codec ?? new ForyCodec(), ownsNode: false, interceptors);
 
     public Node Node => _node;
+
+    /// <summary>The client interceptors, in the order they run.</summary>
+    public IReadOnlyList<IInterceptor> Interceptors => _interceptors.All;
 
     public ICodec Codec { get; }
 
@@ -107,7 +131,7 @@ public sealed class AsterClient : IAsyncDisposable
     private async Task<RpcConnection> ConnectCore(NodeAddrInfo addr, CancellationToken ct)
     {
         var conn = await _node.ConnectAsync(addr, AsterServer.AsterAlpn, ct).ConfigureAwait(false);
-        return new RpcConnection(conn, Codec);
+        return new RpcConnection(conn, Codec, _interceptors);
     }
 
     public async ValueTask DisposeAsync()
@@ -141,14 +165,35 @@ public sealed class RpcConnection : IAsyncDisposable
 
     private readonly Connection _connection;
     private readonly ICodec _codec;
+    private readonly ClientInterceptors _interceptors;
+    private readonly bool _ownsConnection;
 
-    internal RpcConnection(Connection connection, ICodec codec)
+    internal RpcConnection(Connection connection, ICodec codec, ClientInterceptors interceptors, bool ownsConnection = true)
     {
         _connection = connection;
         _codec = codec;
+        _interceptors = interceptors;
+        _ownsConnection = ownsConnection;
     }
 
     public Connection Connection => _connection;
+
+    /// <summary>The interceptors applied to this connection's calls, in the order they run.</summary>
+    public IReadOnlyList<IInterceptor> Interceptors => _interceptors.All;
+
+    /// <summary>
+    /// A view of this connection with its own interceptors (replacing, not adding to, the
+    /// client's): it shares the QUIC connection, so disposing the view does nothing. Use it for a
+    /// circuit breaker (stateful) per service or per peer.
+    /// </summary>
+    public RpcConnection WithInterceptors(IEnumerable<IInterceptor> interceptors)
+        => new(_connection, _codec, new ClientInterceptors(interceptors), ownsConnection: false);
+
+    private string? Peer()
+    {
+        try { return _connection.RemoteId(); }
+        catch (IrohException) { return null; }
+    }
 
     private ulong Rt => _connection.Runtime.Handle;
     private ulong Conn => _connection.Handle.Value;
@@ -188,8 +233,18 @@ public sealed class RpcConnection : IAsyncDisposable
     }
 
     /// <summary>A unary call.</summary>
-    public async Task<TResp> UnaryAsync<TReq, TResp>(string service, string method, TReq request,
+    public Task<TResp> UnaryAsync<TReq, TResp>(string service, string method, TReq request,
         CallOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        if (_interceptors.IsEmpty)
+            return UnaryCore<TReq, TResp>(service, method, request, options, cancellationToken);
+        var ctx = _interceptors.NewContext(service, method, options, "unary", Peer());
+        return _interceptors.RunAsync(ctx, request, options, hookRequest: true,
+            (r, o) => UnaryCore<TReq, TResp>(service, method, r, o, cancellationToken), cancellationToken);
+    }
+
+    private async Task<TResp> UnaryCore<TReq, TResp>(string service, string method, TReq request,
+        CallOptions? options, CancellationToken cancellationToken)
     {
         byte[] req = _codec.Encode(request);
         var spec = new CallSpec(service, method, options);
@@ -242,8 +297,18 @@ public sealed class RpcConnection : IAsyncDisposable
     }
 
     /// <summary>A server-streaming call: one request, a stream of responses.</summary>
-    public async IAsyncEnumerable<TResp> ServerStreamAsync<TReq, TResp>(string service, string method, TReq request,
-        CallOptions? options = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<TResp> ServerStreamAsync<TReq, TResp>(string service, string method, TReq request,
+        CallOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        if (_interceptors.IsEmpty)
+            return ServerStreamCore<TReq, TResp>(service, method, request, options, cancellationToken);
+        var ctx = _interceptors.NewContext(service, method, options, "server_stream", Peer());
+        return _interceptors.ServerStreamAsync<TReq, TResp>(ctx, request, options,
+            (r, o, ct) => ServerStreamCore<TReq, TResp>(service, method, r, o, ct), cancellationToken);
+    }
+
+    private async IAsyncEnumerable<TResp> ServerStreamCore<TReq, TResp>(string service, string method, TReq request,
+        CallOptions? options, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         await using var call = await PayloadCall.OpenAsync(this, PatternServerStream, new CallSpec(service, method, options), cancellationToken)
             .ConfigureAwait(false);
@@ -253,8 +318,19 @@ public sealed class RpcConnection : IAsyncDisposable
     }
 
     /// <summary>A client-streaming call: a stream of requests, one response.</summary>
-    public async Task<TResp> ClientStreamAsync<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
+    public Task<TResp> ClientStreamAsync<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
         CallOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        if (_interceptors.IsEmpty)
+            return ClientStreamCore<TReq, TResp>(service, method, requests, options, cancellationToken);
+        var ctx = _interceptors.NewContext(service, method, options, "client_stream", Peer());
+        return _interceptors.RunAsync<object?, TResp>(ctx, null, options, hookRequest: false,
+            (_, o) => ClientStreamCore<TReq, TResp>(service, method, _interceptors.HookRequests(requests, ctx), o, cancellationToken),
+            cancellationToken);
+    }
+
+    private async Task<TResp> ClientStreamCore<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
+        CallOptions? options, CancellationToken cancellationToken)
     {
         await using var call = await PayloadCall.OpenAsync(this, PatternClientStream, new CallSpec(service, method, options), cancellationToken)
             .ConfigureAwait(false);
@@ -271,8 +347,26 @@ public sealed class RpcConnection : IAsyncDisposable
         => ClientStreamAsync<TReq, TResp>(service, method, requests.ToAsyncEnumerable(), options, cancellationToken);
 
     /// <summary>A bidi-streaming call: requests are sent concurrently with reading responses.</summary>
-    public async IAsyncEnumerable<TResp> BidiStreamAsync<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
-        CallOptions? options = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<TResp> BidiStreamAsync<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
+        CallOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        if (_interceptors.IsEmpty)
+            return BidiStreamCore<TReq, TResp>(service, method, requests, options, cancellationToken);
+        return BidiStreamIntercepted<TReq, TResp>(service, method, requests, options, cancellationToken);
+    }
+
+    private async IAsyncEnumerable<TResp> BidiStreamIntercepted<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
+        CallOptions? options, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var ctx = _interceptors.NewContext(service, method, options, "bidi_stream", Peer());
+        var o = _interceptors.StartStreaming(ctx, options);
+        var source = BidiStreamCore<TReq, TResp>(service, method, _interceptors.HookRequests(requests, ctx), o, cancellationToken);
+        await foreach (var item in _interceptors.Guard(source, ctx, cancellationToken).ConfigureAwait(false))
+            yield return item;
+    }
+
+    private async IAsyncEnumerable<TResp> BidiStreamCore<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
+        CallOptions? options, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         await using var call = await PayloadCall.OpenAsync(this, PatternBidiStream, new CallSpec(service, method, options), cancellationToken)
             .ConfigureAwait(false);
@@ -293,6 +387,7 @@ public sealed class RpcConnection : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
+        if (!_ownsConnection) return ValueTask.CompletedTask;
         try { _connection.Close(); }
         catch (IrohException) { /* already closed */ }
         return ValueTask.CompletedTask;

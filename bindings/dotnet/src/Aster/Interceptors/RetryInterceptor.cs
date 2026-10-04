@@ -1,9 +1,9 @@
 namespace Aster.Interceptors;
 
 /// <summary>
-/// Provides retry policy hints for client calls.
-/// Does not retry automatically -- exposes ShouldRetry and BackoffSeconds
-/// for the call loop to consult.
+/// Retry policy for client calls: the client call loop (unary and client-streaming only, like
+/// Python) consults ShouldRetry and BackoffSeconds
+/// between attempts. Retries only idempotent calls (CallOptions.Idempotent) on retryable codes.
 /// </summary>
 public class RetryInterceptor : IInterceptor
 {
@@ -19,7 +19,7 @@ public class RetryInterceptor : IInterceptor
     private readonly double _multiplier;
     private readonly double _jitter;
 
-    private static readonly Random Rng = new();
+    private static Random Rng => Random.Shared;
 
     /// <param name="maxAttempts">Maximum number of attempts (including the first). Defaults to 3.</param>
     /// <param name="retryableCodes">Status codes considered retryable. Defaults to {Unavailable}.</param>
