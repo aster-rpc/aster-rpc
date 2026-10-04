@@ -16,7 +16,13 @@ gossip = ["dep:iroh-gossip"]
 attestation = ["aster_transport_core/attestation"]
 # Rust-native RPC (envelope + payload codec, dispatch, client stub). Off by
 # default so Step-1 consumers don't compile Fory. See docs/_internal/aster-rust.md.
-rpc = ["dep:fory-core", "dep:fory-derive", "dep:async-trait", "dep:aster-macros"]
+rpc = [
+    "dep:fory-core",
+    "dep:fory-derive",
+    "dep:async-trait",
+    "dep:aster-macros",
+    "dep:serde",
+]
 # Coordination (§15 Slice 0). Two features, deliberately:
 #
 #   coordination-client  the wire contract and client stub only. Enabling it
@@ -91,6 +97,9 @@ fory-derive = { version = "=1.7.6", optional = true }
 # Ergonomic async trait for the RPC service dispatcher (the `#[aster::service]`
 # macro will generate impls of it). Gated by the `rpc` feature.
 async-trait = { version = "0.1", optional = true }
+# `rpc::dynamic`: a binding registers a `DynamicService` as JSON (C ABI) or
+# builds one in Rust; the serde form is the registration schema.
+serde = { version = "1", features = ["derive"], optional = true }
 # Proc-macros: #[derive(AsterType)] (and later #[aster::service]). Gated by `rpc`.
 aster-macros = { path = "../aster-macros", version = "=0.3.0", registry = "aster", optional = true }
 # Canonical action hashing (§5.2.1): BLAKE3 over the domain-separated encoded

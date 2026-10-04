@@ -1,0 +1,3648 @@
+{
+  "cases": [
+    {
+      "expected_contract_id": "ac4495d03d0fe1ee8249e725b8aff0b66fdaecc0e76b27e26149225d1ccba68f",
+      "name": "contract-identity: minimal unary service",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "response": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          }
+        ],
+        "name": "Echo",
+        "scope": "shared",
+        "serialization_modes": [],
+        "version": 1
+      },
+      "source": "contract-identity.json (+ empty producer_language)"
+    },
+    {
+      "expected_contract_id": "bb4e859ac2a8d9865f4c0fa7766c0197fdf830d925ca7753a34fe0ffe757c20e",
+      "name": "contract-identity: service with capability requirement",
+      "service": {
+        "methods": [
+          {
+            "default_timeout": 30000.0,
+            "idempotent": true,
+            "name": "get_record",
+            "pattern": "unary",
+            "request": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "requires": {
+              "kind": "any_of",
+              "roles": [
+                "reader",
+                "ai-reader"
+              ]
+            },
+            "response": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          }
+        ],
+        "name": "DataService",
+        "scope": "shared",
+        "serialization_modes": [],
+        "version": 1
+      },
+      "source": "contract-identity.json (+ empty producer_language)"
+    },
+    {
+      "expected_contract_id": "9b37cf43f3135e50905f8d9c0feed7530c06e7f7190c50f072e07f76116b5e05",
+      "name": "contract-identity: multi-method streaming service",
+      "service": {
+        "methods": [
+          {
+            "idempotent": true,
+            "name": "query",
+            "pattern": "unary",
+            "request": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "response": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          },
+          {
+            "default_timeout": 60000.0,
+            "name": "watch",
+            "pattern": "server_stream",
+            "request": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "response": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          },
+          {
+            "name": "upload",
+            "pattern": "client_stream",
+            "request": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "response": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          }
+        ],
+        "name": "Analytics",
+        "scope": "shared",
+        "serialization_modes": [],
+        "version": 2
+      },
+      "source": "contract-identity.json (+ empty producer_language)"
+    },
+    {
+      "expected_contract_id": "3f767eaa700b1c92ea6098b32d8c98e2f4ccabe1b6e614c459660abb366fa847",
+      "name": "contract-identity: session-scoped service",
+      "service": {
+        "methods": [
+          {
+            "default_timeout": 5000.0,
+            "name": "send_message",
+            "pattern": "unary",
+            "request": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "response": {
+              "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          }
+        ],
+        "name": "ChatRoom",
+        "scope": "session",
+        "serialization_modes": [],
+        "version": 1
+      },
+      "source": "contract-identity.json (+ empty producer_language)"
+    },
+    {
+      "expected_contract_id": "06fa57d4f8674809d6dbfa54749234758bae9989b174ac098f06c96c8acaa53d",
+      "name": "contract-defaults: Defaults v1",
+      "service": {
+        "methods": [
+          {
+            "name": "put",
+            "pattern": "unary",
+            "request": {
+              "display": "defaults.v1/Settings",
+              "hash": "c6e81a7d0e67179e6e40fe7fe6197557824e8d0e75eff9895756e176356a1b3f"
+            },
+            "response": {
+              "display": "defaults.v1/Settings",
+              "hash": "c6e81a7d0e67179e6e40fe7fe6197557824e8d0e75eff9895756e176356a1b3f"
+            }
+          }
+        ],
+        "name": "Defaults",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "name",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "1269646c65",
+                "id": 0,
+                "name": "state",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "02",
+                "id": 0,
+                "name": "note",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "01",
+                "id": 0,
+                "name": "enabled",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "bool",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "05",
+                "id": 0,
+                "name": "retries",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "80a0abfef962",
+                "id": 0,
+                "name": "since_ms",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint64",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "000000000000e03f",
+                "id": 0,
+                "name": "ratio",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "float64",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "0678",
+                "id": 0,
+                "name": "label",
+                "optional": true,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "list",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "00",
+                "id": 0,
+                "name": "tags",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "map",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "string",
+                "container_key_ref": "",
+                "default_value": "00",
+                "id": 0,
+                "name": "attrs",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "blob",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "Settings",
+            "package": "defaults.v1",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      },
+      "source": "contract-defaults.json"
+    },
+    {
+      "expected_contract_id": "c5aa690b04f415990755ae87a2a608b14f41cf07306117028942b461af081c77",
+      "name": "interop: InteropEcho v1",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      },
+      "source": "tests/interop/rust/contract.rs"
+    },
+    {
+      "expected_contract_id": "67721f4a79c0fc1c3a66fe10575d1c11ba5e007873cdac209fb4941a71c7f864",
+      "name": "mission-control: MissionControl v1",
+      "service": {
+        "methods": [
+          {
+            "name": "getStatus",
+            "pattern": "unary",
+            "request": {
+              "display": "mission/StatusRequest",
+              "hash": "c07e2ac3df1fa1914d97c7cfac33d9d867d0710bacc60ea81b7f93f62d92e7ce"
+            },
+            "response": {
+              "display": "mission/StatusResponse",
+              "hash": "6b15e69ea7fab389b3f853df58120ac71304cb9ab16749f6aca374ce348753b2"
+            }
+          },
+          {
+            "name": "submitLog",
+            "pattern": "unary",
+            "request": {
+              "display": "mission/LogEntry",
+              "hash": "073da48b884e6a49f3352b35d8dea12841834ab0e167e5a5149c6c463881f7b3"
+            },
+            "response": {
+              "display": "mission/SubmitLogResult",
+              "hash": "518979579675203341847750c3b8733b058bc35ed55baa695aed49d87db81f49"
+            }
+          },
+          {
+            "name": "tailLogs",
+            "pattern": "server_stream",
+            "request": {
+              "display": "mission/TailRequest",
+              "hash": "598a60c1a2779cbd1e252dde0214bc45d96fb706ae89069d8c46d81552927383"
+            },
+            "response": {
+              "display": "mission/LogEntry",
+              "hash": "073da48b884e6a49f3352b35d8dea12841834ab0e167e5a5149c6c463881f7b3"
+            }
+          },
+          {
+            "name": "ingestMetrics",
+            "pattern": "client_stream",
+            "request": {
+              "display": "mission/MetricPoint",
+              "hash": "a63bba9a0cb7300d4569e3767df9862dbddb6d01b30579856af4c43470877bfc"
+            },
+            "response": {
+              "display": "mission/IngestResult",
+              "hash": "53532146037fc8ba1c03f0a6ad8f022d88ae67680795b76222ac28236b367fe5"
+            }
+          },
+          {
+            "name": "runCommand",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "mission/Command",
+              "hash": "55b79e2056cbb1104040ca2294a477e1ab38b708686a732ccb870870a731ffa2"
+            },
+            "response": {
+              "display": "mission/CommandResult",
+              "hash": "db7d45bbbe8c2605c28a18d9a3cd42ddbe5e35c2d622e23afc3d6123c2093a9e"
+            }
+          }
+        ],
+        "name": "MissionControl",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "agent_id",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "StatusRequest",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "agent_id",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "status",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "uptime_secs",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint64",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "StatusResponse",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "timestamp",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "float64",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "level",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "agent_id",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "LogEntry",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "accepted",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "bool",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "SubmitLogResult",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "agent_id",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "level",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "TailRequest",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "name",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "value",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "float64",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "timestamp",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "float64",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "MetricPoint",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "accepted",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "dropped",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "IngestResult",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "command",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "Command",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "stdout",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "stderr",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "exit_code",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "CommandResult",
+            "package": "mission",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      },
+      "source": "examples/rust/mission-control (#[aster::service] equivalent)"
+    },
+    {
+      "expected_contract_id": "13439efe42fb7cf790c59cc72d00a7e32633773e6309649c0b62272ab0a852bb",
+      "name": "mission-control: MissionControl v2 with per-method requires",
+      "service": {
+        "methods": [
+          {
+            "idempotent": true,
+            "name": "getStatus",
+            "pattern": "unary",
+            "request": {
+              "display": "mission/StatusRequest",
+              "hash": "c07e2ac3df1fa1914d97c7cfac33d9d867d0710bacc60ea81b7f93f62d92e7ce"
+            },
+            "requires": {
+              "kind": "role",
+              "roles": [
+                "status"
+              ]
+            },
+            "response": {
+              "display": "mission/StatusResponse",
+              "hash": "6b15e69ea7fab389b3f853df58120ac71304cb9ab16749f6aca374ce348753b2"
+            }
+          },
+          {
+            "name": "submitLog",
+            "pattern": "unary",
+            "request": {
+              "display": "mission/LogEntry",
+              "hash": "073da48b884e6a49f3352b35d8dea12841834ab0e167e5a5149c6c463881f7b3"
+            },
+            "response": {
+              "display": "mission/SubmitLogResult",
+              "hash": "518979579675203341847750c3b8733b058bc35ed55baa695aed49d87db81f49"
+            }
+          },
+          {
+            "name": "tailLogs",
+            "pattern": "server_stream",
+            "request": {
+              "display": "mission/TailRequest",
+              "hash": "598a60c1a2779cbd1e252dde0214bc45d96fb706ae89069d8c46d81552927383"
+            },
+            "requires": {
+              "kind": "any_of",
+              "roles": [
+                "logs",
+                "admin"
+              ]
+            },
+            "response": {
+              "display": "mission/LogEntry",
+              "hash": "073da48b884e6a49f3352b35d8dea12841834ab0e167e5a5149c6c463881f7b3"
+            }
+          },
+          {
+            "name": "ingestMetrics",
+            "pattern": "client_stream",
+            "request": {
+              "display": "mission/MetricPoint",
+              "hash": "a63bba9a0cb7300d4569e3767df9862dbddb6d01b30579856af4c43470877bfc"
+            },
+            "requires": {
+              "kind": "role",
+              "roles": [
+                "ingest"
+              ]
+            },
+            "response": {
+              "display": "mission/IngestResult",
+              "hash": "53532146037fc8ba1c03f0a6ad8f022d88ae67680795b76222ac28236b367fe5"
+            }
+          }
+        ],
+        "name": "MissionControl",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "version": 2
+      },
+      "source": "examples/python/mission_control/services_auth.py shape (#[aster::service] equivalent)"
+    },
+    {
+      "expected_contract_id": "6f828113b1ebfae8360d12dbc822265bc793c6365ae044372712609047fd8b3a",
+      "name": "mission-control: AgentSession v1 (session scope, service requires, timeouts)",
+      "service": {
+        "methods": [
+          {
+            "default_timeout": 30.0,
+            "name": "register",
+            "pattern": "unary",
+            "request": {
+              "display": "mission/Heartbeat",
+              "hash": "fe247ebbbc370f5a21ed4654e4e4551493bb27339700500f03133529cd5cc63a"
+            },
+            "response": {
+              "display": "mission/Assignment",
+              "hash": "a815466495bea18ea0c0955881ceea6c84280c55e589f235ba5eb4bd83daff3c"
+            }
+          },
+          {
+            "default_timeout": 2.5,
+            "idempotent": true,
+            "name": "heartbeat",
+            "pattern": "unary",
+            "request": {
+              "display": "mission/Heartbeat",
+              "hash": "fe247ebbbc370f5a21ed4654e4e4551493bb27339700500f03133529cd5cc63a"
+            },
+            "response": {
+              "display": "mission/Assignment",
+              "hash": "a815466495bea18ea0c0955881ceea6c84280c55e589f235ba5eb4bd83daff3c"
+            }
+          },
+          {
+            "name": "runCommand",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "mission/Command",
+              "hash": "55b79e2056cbb1104040ca2294a477e1ab38b708686a732ccb870870a731ffa2"
+            },
+            "requires": {
+              "kind": "role",
+              "roles": [
+                "admin"
+              ]
+            },
+            "response": {
+              "display": "mission/CommandResult",
+              "hash": "db7d45bbbe8c2605c28a18d9a3cd42ddbe5e35c2d622e23afc3d6123c2093a9e"
+            }
+          }
+        ],
+        "name": "AgentSession",
+        "requires": {
+          "kind": "any_of",
+          "roles": [
+            "agent",
+            "admin"
+          ]
+        },
+        "scope": "session",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "agent_id",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "list",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "capabilities",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "ref",
+                "type_primitive": "",
+                "type_ref": "999ffcea8f7567ff6c3a18f26e66ae592a357764f5f1eae3eafbda35d3c5051e"
+              },
+              {
+                "container": "map",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "string",
+                "container_key_ref": "",
+                "default_value": "00",
+                "id": 0,
+                "name": "labels",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "Heartbeat",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "name",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "02",
+                "id": 0,
+                "name": "level",
+                "optional": false,
+                "ref_tracked": false,
+                "required": false,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "Capability",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "task_id",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "command",
+                "optional": true,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "Assignment",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "command",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "Command",
+            "package": "mission",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "stdout",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "stderr",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "exit_code",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "CommandResult",
+            "package": "mission",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      },
+      "source": "examples/python/mission_control/services.py shape"
+    },
+    {
+      "expected_contract_id": "e03c9d799f03cb6118f46c26f4593159ec9254904c8d5a195008ba7185501a2e",
+      "name": "non-contract fields and native mode",
+      "service": {
+        "iroh_only": true,
+        "methods": [
+          {
+            "name": "upload",
+            "pattern": "client_stream",
+            "request": {
+              "display": "mission/MetricPoint",
+              "hash": "a63bba9a0cb7300d4569e3767df9862dbddb6d01b30579856af4c43470877bfc"
+            },
+            "response": {
+              "display": "mission/IngestResult",
+              "hash": "53532146037fc8ba1c03f0a6ad8f022d88ae67680795b76222ac28236b367fe5"
+            }
+          },
+          {
+            "default_timeout": 0.25,
+            "limits": {
+              "max_frame_size": 65536
+            },
+            "name": "drain",
+            "pattern": "unary",
+            "request": {
+              "display": "mission/StatusRequest",
+              "hash": "c07e2ac3df1fa1914d97c7cfac33d9d867d0710bacc60ea81b7f93f62d92e7ce"
+            },
+            "response": {
+              "display": "mission/StatusResponse",
+              "hash": "6b15e69ea7fab389b3f853df58120ac71304cb9ab16749f6aca374ce348753b2"
+            }
+          }
+        ],
+        "name": "ops.Fleet",
+        "producer_language": "typescript",
+        "requires": {
+          "kind": "all_of",
+          "roles": [
+            "ops",
+            "oncall"
+          ]
+        },
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang",
+          "native"
+        ],
+        "version": 3
+      },
+      "source": "synthetic"
+    }
+  ],
+  "description": "DynamicService registration JSON (dynamic-dispatch-design.md §1.5) -> expected contract_id. contract_id = BLAKE3(canonical_xlang_bytes(ServiceContract)), with the contract derived from the service (§1.2). Every binding's decorator lowering must produce a service with the same contract_id; `invalid` services must be refused with the given error code (`schema` = does not parse).",
+  "invalid": [
+    {
+      "error": "schema",
+      "name": "unknown key",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "requiers": null,
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "schema",
+      "name": "unknown serialization mode",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "json"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "reserved_namespace",
+      "name": "reserved namespace",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "aster.ops.Fleet",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "not_normalized",
+      "name": "service name not NFC",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "Café",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "duplicate_method",
+      "name": "duplicate method name",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "echo",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "malformed_hash",
+      "name": "uppercase hash",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "malformed_hash",
+      "name": "short hash",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "00"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "bad_timeout",
+      "name": "negative timeout",
+      "service": {
+        "methods": [
+          {
+            "default_timeout": -1.0,
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "bad_frame_limit",
+      "name": "frame limit above MAX_FRAME_SIZE",
+      "service": {
+        "methods": [
+          {
+            "limits": {
+              "max_frame_size": 16777217
+            },
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "producer_language",
+      "name": "native without producer_language",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "native"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "producer_language",
+      "name": "producer_language without native",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "producer_language": "python",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    },
+    {
+      "error": "unreachable_type_def",
+      "name": "type_def not reachable from any method",
+      "service": {
+        "methods": [
+          {
+            "name": "echo",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "generate",
+            "pattern": "server_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "ingest",
+            "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          }
+        ],
+        "name": "InteropEcho",
+        "scope": "shared",
+        "serialization_modes": [
+          "xlang"
+        ],
+        "type_defs": [
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoRequest",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "message",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "count",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "data",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "binary",
+                "type_ref": ""
+              },
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "server_lang",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "EchoReply",
+            "package": "interop",
+            "union_variants": []
+          },
+          {
+            "enum_values": [],
+            "fields": [
+              {
+                "container": "none",
+                "container_key_kind": "primitive",
+                "container_key_primitive": "",
+                "container_key_ref": "",
+                "default_value": "",
+                "id": 0,
+                "name": "command",
+                "optional": false,
+                "ref_tracked": false,
+                "required": true,
+                "self_ref_name": "",
+                "type_kind": "primitive",
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "kind": "message",
+            "name": "Command",
+            "package": "mission",
+            "union_variants": []
+          }
+        ],
+        "version": 1
+      }
+    }
+  ],
+  "rust_source": "aster/tests/dynamic_service_vector.rs"
+}

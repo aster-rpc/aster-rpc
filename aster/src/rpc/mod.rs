@@ -27,6 +27,7 @@ pub mod client;
 pub mod codec;
 pub mod contract;
 mod deadline;
+pub mod dynamic;
 pub mod empty;
 pub mod interceptor;
 pub mod lease;
@@ -56,6 +57,7 @@ pub use contract::{
     PayloadRegistry, ScalarDefault, ScopeKind, ServiceContract, TypeDef, UnionVariantDef,
     WireField,
 };
+pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationError};
 pub use empty::Empty;
 pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
 pub use projection::{Projection, ProjectionRegistry};
