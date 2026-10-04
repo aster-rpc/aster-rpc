@@ -87,8 +87,8 @@ for path in (repo / "bindings/java").rglob("pom.xml"):
     path.write_text(path.read_text().replace(f"<version>{old}-SNAPSHOT</version>",
                                              f"<version>{new}-SNAPSHOT</version>"))
 
-dotnet = repo / ".github/workflows/build-dotnet.yml"
-dotnet.write_text(dotnet.read_text().replace(f'BASE="{old}"', f'BASE="{new}"'))
+# The .NET package has no version of its own: ffi-bindings.yml packs it at the
+# derived Aster version (scripts/release/version.sh).
 PY
 
 cat > "$repo/VERSION" <<EOF
@@ -109,7 +109,7 @@ git -C "$repo" add VERSION Cargo.toml Cargo.lock pyproject.toml uv.lock \
   bindings/typescript/native/package.json \
   bindings/typescript/packages/aster/package.json bindings/typescript/bun.lock \
   cli/pyproject.toml \
-  bindings/java .github/workflows/build-dotnet.yml
+  bindings/java
 git -C "$repo" commit -m "chore(release): version base $new"
 
 actual="$("$repo/scripts/release/version.sh")"
