@@ -159,14 +159,35 @@ where
 /// side. Generic over the byte transport so it is testable without a live
 /// Aster connection.
 pub async fn serve_request<R, W>(
-    mut read: R,
-    mut write: W,
+    read: R,
+    write: W,
     handler: &HttpHandler,
     peer: AuthenticatedPeer,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
+{
+    serve_request_until(read, write, handler, peer, std::future::pending()).await
+}
+
+/// As [`serve_request`], but gives up waiting for the handler's response head
+/// when `peer_gone` resolves: the handler future is **dropped** (so a foreign
+/// handler's upcall is cancelled as abandoned) and the exchange fails. Once
+/// the head is out, a vanished peer surfaces as a write error on the body
+/// pump, which drops the response body the same way. [`ServiceAcceptor`]
+/// passes "the peer stopped reading this stream, or the connection closed".
+pub async fn serve_request_until<R, W, G>(
+    mut read: R,
+    mut write: W,
+    handler: &HttpHandler,
+    peer: AuthenticatedPeer,
+    peer_gone: G,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    G: std::future::Future<Output = ()>,
 {
     let head = read_length_prefixed(&mut read, MAX_HEAD, "request head").await?;
     let parts = codec::decode_request_head(&head)?;
@@ -175,7 +196,12 @@ where
     // so it overwrites (never merges with) anything a peer might have tried to smuggle in the head.
     request.extensions_mut().insert(peer);
 
-    let response = handler(request).await?;
+    // `peer_gone` is consumed by the select, so it is dropped before any
+    // response byte is written (the stream watcher may hold the send half).
+    let response = tokio::select! {
+        r = handler(request) => r?,
+        () = peer_gone => bail!("peer went away before the response head"),
+    };
     let (parts, body) = response.into_parts();
     let head = codec::encode_response_head(&parts)?;
 
@@ -269,10 +295,22 @@ impl LocalTunnelAcceptor for ServiceAcceptor {
         // The transport-authenticated peer identity — derived here from the verified connection, the
         // only place it can come from, and handed to the handler as a request extension.
         let peer = AuthenticatedPeer::new(conn.remote_id());
+        // Watches for the consumer abandoning the request while the handler
+        // works on it: STOP_SENDING on our send half (the consumer dropped its
+        // receive side) or the connection closing. `stopped()` holds the send
+        // half's lock, which is safe only because nothing writes before the
+        // response head and `serve_request_until` drops this before writing.
+        let watch_send = send.clone();
+        let peer_gone = async move {
+            tokio::select! {
+                _ = watch_send.stopped() => {}
+                _ = conn.closed() => {}
+            }
+        };
         Box::pin(async move {
             let io = AsterStreamIo::new(recv, send);
             let (r, w) = tokio::io::split(io);
-            if let Err(e) = serve_request(r, w, &handler, peer).await {
+            if let Err(e) = serve_request_until(r, w, &handler, peer, peer_gone).await {
                 tracing::debug!("http-relay serve error: {e}");
             }
         })
@@ -535,6 +573,51 @@ mod tests {
         // ...even though the forged header did ride along in the request untouched.
         assert_eq!(resp.headers().get("x-hdr-peer").unwrap(), "attacker-peer");
         srv.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_gone_drops_the_pending_handler() {
+        // A handler that never answers; it flags when its future is dropped.
+        struct Flag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = dropped.clone();
+        let handler: HttpHandler = Arc::new(move |_req| {
+            let flag = Flag(d.clone());
+            Box::pin(async move {
+                let _flag = flag;
+                std::future::pending::<Result<http::Response<ResponseBody>>>().await
+            }) as BoxFut<Result<http::Response<ResponseBody>>>
+        });
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server);
+        let (gone_tx, gone_rx) = tokio::sync::oneshot::channel::<()>();
+        let srv = tokio::spawn(async move {
+            let gone = async move {
+                let _ = gone_rx.await;
+            };
+            serve_request_until(sr, sw, &handler, AuthenticatedPeer::new("p".into()), gone).await
+        });
+        let (_cr, mut cw) = tokio::io::split(client);
+        let parts = http::Request::builder()
+            .uri("/slow")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        write_request(&mut cw, &parts, b"").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        gone_tx.send(()).unwrap();
+        let res = srv.await.unwrap();
+        assert!(res.is_err(), "the exchange fails when the peer is gone");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
