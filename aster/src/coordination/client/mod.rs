@@ -24,9 +24,18 @@
 //! **server effect** and durable result **redelivery**; exactly-once
 //! application-side processing additionally requires the application to make
 //! its durable handling and its acknowledgement atomic, which only it can do.
+//!
+//! ## Errors
+//!
+//! Classify a failure with [`CoordinationErrorKind::of`] — awaiting-ack,
+//! unresolved, journal locked/fatal, `Rpc { code }`, unavailable, invalid —
+//! rather than by its message. The journal-state refusals are
+//! [`Error::Coordination`](crate::Error::Coordination); their messages are
+//! unchanged from when they were `InvalidArgument`.
 
 mod driver;
 pub(crate) mod engine;
+mod error;
 pub(crate) mod inbound;
 /// Crate-private on purpose (the third review's capability note): the only
 /// paths that may persist into a journal are the driver — which checks the
@@ -65,8 +74,11 @@ use crate::error::{Error, Result};
 use crate::node::Node;
 use crate::ticket::{Credential, Ticket};
 
+pub use error::{CoordinationError, CoordinationErrorKind};
+
 use driver::{drive, Delivery};
 use engine::{CallFailure, CallOutcome, Engine, SharedEngine};
+use error::refusal;
 use journal::{AckToken, Journal, JournalState};
 
 fn client_error(what: impl Into<String>) -> Error {
@@ -360,7 +372,8 @@ impl CoordinationClient {
                 drop(journal);
                 self.unacknowledged().await
             }
-            JournalState::FatalJournal => Err(client_error(
+            JournalState::FatalJournal => Err(refusal(
+                CoordinationErrorKind::JournalFatal,
                 "the journal is fatal (§10 reason 18); no further mutation is possible",
             )),
             JournalState::Pending | JournalState::Closing | JournalState::ReplayAfterRetire => {
@@ -465,17 +478,20 @@ impl CoordinationClient {
                 if !self.self_acknowledging
                     && journal.record().request_hash == request_hash.to_vec() => {}
             JournalState::Pending | JournalState::Closing | JournalState::ReplayAfterRetire => {
-                return Err(client_error(
+                return Err(refusal(
+                    CoordinationErrorKind::Unresolved,
                     "another request is unresolved on this journal; resume() first",
                 ));
             }
             JournalState::ResolvedAwaitingAck => {
-                return Err(client_error(
+                return Err(refusal(
+                    CoordinationErrorKind::AwaitingAck,
                     "a resolved result awaits acknowledgement; take unacknowledged() first",
                 ));
             }
             JournalState::FatalJournal => {
-                return Err(client_error(
+                return Err(refusal(
+                    CoordinationErrorKind::JournalFatal,
                     "the journal is fatal (§10 reason 18); no further mutation is possible",
                 ));
             }

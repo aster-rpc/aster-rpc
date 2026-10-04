@@ -57,10 +57,30 @@ use crate::coordination::reason::{Outcome, Reason};
 use crate::coordination::store::wire::MutationReplyWireV1;
 use crate::error::{Error, Result};
 
-use super::CoordinationClient;
+use super::{CoordinationClient, CoordinationError, CoordinationErrorKind};
 
 fn client_error(what: impl Into<String>) -> Error {
     Error::InvalidArgument(format!("coordination lease: {}", what.into()))
+}
+
+/// A failure out of the core lease holder. When it is the client's own error
+/// (carried through the serializer by [`ClientBackend`]), its kind survives:
+/// an RPC denial stays `Rpc { code }`, a blocked journal stays `Unresolved`,
+/// and so on — under the same `coordination lease: …` message as before. The
+/// core's own failures (option validation, an unexpected outcome) remain
+/// `InvalidArgument`.
+fn lease_error(err: anyhow::Error) -> Error {
+    match err.downcast::<Error>() {
+        Ok(inner) => match CoordinationErrorKind::of(&inner) {
+            CoordinationErrorKind::Invalid => client_error(inner.to_string()),
+            kind => Error::Coordination(CoordinationError::with_source(
+                kind,
+                format!("invalid argument: coordination lease: {inner}"),
+                inner,
+            )),
+        },
+        Err(other) => client_error(format!("{other}")),
+    }
 }
 
 /// The live backend: one committed Store mutation per lease transition.
@@ -123,7 +143,7 @@ impl CoordinationBackend for ClientBackend {
             }
             LeaseOp::Revoke { .. } => self.client.revoke(Self::wire_key(resource), None).await,
         }
-        .map_err(|err| anyhow::anyhow!("{err}"))?;
+        .map_err(anyhow::Error::new)?;
 
         // See the module docs: the self-acknowledging client acknowledged
         // this transition under the journal hold that resolved it — periodic
@@ -155,7 +175,7 @@ impl CoordinationBackend for ClientBackend {
             .reads()
             .read_linearizable(Self::wire_key(resource))
             .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
+            .map_err(anyhow::Error::new)?;
         Ok(ResourceObservation {
             epoch: reply.snapshot.epoch,
             held: reply.snapshot.held,
@@ -212,7 +232,7 @@ impl CoordinationLease {
         let encoded = adapter::encode(&client.group(), &key);
         let outcome = LeaseHandle::acquire(serializer, &encoded, &hex::encode(local), options)
             .await
-            .map_err(|err| client_error(format!("{err}")))?;
+            .map_err(lease_error)?;
         Ok(match outcome {
             CoreAcquireOutcome::Granted(handle) => LeaseAcquireOutcome::Granted(Self {
                 handle,
@@ -263,10 +283,7 @@ impl CoordinationLease {
 
     /// Graceful release through the serializer's own transition.
     pub async fn release(self) -> Result<()> {
-        self.handle
-            .release()
-            .await
-            .map_err(|err| client_error(format!("{err}")))
+        self.handle.release().await.map_err(lease_error)
     }
 
     /// §9.4's atomic final handoff: consume the renewal engine through
@@ -294,5 +311,58 @@ impl CoordinationLease {
             .release_with_value(fence, expected_value_revision, final_value)
             .await?;
         Ok(resolved.into_settled_reply())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An error carried through the core holder keeps its kind and its
+    /// historical message; the core's own failures stay `InvalidArgument`.
+    #[test]
+    fn a_lease_failure_keeps_the_kind_underneath() {
+        let denied = lease_error(anyhow::Error::new(Error::Rpc {
+            code: 7,
+            message: "permission denied".into(),
+            details: Vec::new(),
+        }));
+        assert_eq!(
+            CoordinationErrorKind::of(&denied),
+            CoordinationErrorKind::Rpc { code: 7 }
+        );
+        assert_eq!(
+            denied.to_string(),
+            "invalid argument: coordination lease: rpc error [7]: permission denied"
+        );
+
+        let blocked = lease_error(anyhow::Error::new(super::super::error::refusal(
+            CoordinationErrorKind::Unresolved,
+            "another request is unresolved on this journal; resume() first",
+        )));
+        assert_eq!(
+            CoordinationErrorKind::of(&blocked),
+            CoordinationErrorKind::Unresolved
+        );
+        assert_eq!(
+            blocked.to_string(),
+            "invalid argument: coordination lease: invalid argument: coordination client: \
+             another request is unresolved on this journal; resume() first"
+        );
+
+        let offline = lease_error(anyhow::Error::new(Error::Transport(anyhow::anyhow!(
+            "no member answered"
+        ))));
+        assert_eq!(
+            CoordinationErrorKind::of(&offline),
+            CoordinationErrorKind::Unavailable
+        );
+
+        let core = lease_error(anyhow::anyhow!("lease ttl must be non-zero"));
+        assert!(matches!(core, Error::InvalidArgument(_)), "{core:?}");
+        assert_eq!(
+            core.to_string(),
+            "invalid argument: coordination lease: lease ttl must be non-zero"
+        );
     }
 }

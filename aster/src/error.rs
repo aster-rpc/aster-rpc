@@ -42,6 +42,16 @@ pub enum Error {
         details: Vec<(String, String)>,
     },
 
+    /// A coordination client failure with a structured kind (the
+    /// `coordination-client` feature): journal-state refusals, and lease
+    /// failures that keep the kind of the error underneath. Match on
+    /// [`CoordinationErrorKind::of`](crate::coordination::client::CoordinationErrorKind::of),
+    /// which also classifies the plain `Rpc`/`Transport`/`InvalidArgument`
+    /// errors the client returns.
+    #[cfg(feature = "coordination-client")]
+    #[error(transparent)]
+    Coordination(#[from] crate::coordination::client::CoordinationError),
+
     /// Any other failure propagated from the transport core.
     #[error(transparent)]
     Transport(#[from] anyhow::Error),

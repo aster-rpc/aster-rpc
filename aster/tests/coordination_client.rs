@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use aster::coordination::client::CoordinationClient;
+use aster::coordination::client::{CoordinationClient, CoordinationErrorKind};
 use aster::coordination::contract::ResourceKeyV1;
 use aster::coordination::ids::CoordinationGroupId;
 use aster::coordination::model::limits::{
@@ -145,9 +145,32 @@ async fn a_resolved_result_survives_a_client_restart_until_acknowledged() {
 
         // A second mutation while unacknowledged is refused by contract.
         let refused = worker.acquire(resource(b"other"), 30_000).await;
-        assert!(
-            refused.is_err(),
-            "no new sequence until the application acknowledges"
+        let Err(refused) = refused else {
+            panic!("no new sequence until the application acknowledges")
+        };
+        assert_eq!(
+            CoordinationErrorKind::of(&refused),
+            CoordinationErrorKind::AwaitingAck,
+            "{refused}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "invalid argument: coordination client: a resolved result awaits \
+             acknowledgement; take unacknowledged() first",
+            "the message is unchanged by the structured kind"
+        );
+        // A second client over the same journal is refused by its lifetime
+        // lock, typed.
+        let locked = CoordinationClient::builder(worker_node.clone(), group(&fixture))
+            .seed_tickets([voter_ticket(&fixture, 0)])
+            .journal_dir(journal_dir.path())
+            .build()
+            .map(drop)
+            .expect_err("one journal, one owner");
+        assert_eq!(
+            CoordinationErrorKind::of(&locked),
+            CoordinationErrorKind::JournalLocked,
+            "{locked}"
         );
         // The process dies here: the handle drops unacknowledged.
         drop(resolved);
@@ -1337,6 +1360,11 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
         format!("{err}").contains("no resolution"),
         "the driver classifies the foreign reply as not-this-entry's and \
          exhausts — it never reaches the journal: {err}"
+    );
+    assert_eq!(
+        CoordinationErrorKind::of(&err),
+        CoordinationErrorKind::Unavailable,
+        "an exhausted attempt budget is typed, not message-matched: {err:?}"
     );
     assert!(
         within("unacknowledged", client.unacknowledged())

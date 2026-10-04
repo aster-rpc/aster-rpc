@@ -45,6 +45,8 @@ use crate::coordination::contract::payload_fory;
 use crate::coordination::ids::CoordinationGroupId;
 use crate::error::{Error, Result};
 
+use super::error::{CoordinationError, CoordinationErrorKind};
+
 /// The journal schema version this build reads and writes.
 pub const JOURNAL_FORMAT_VERSION: u32 = 1;
 
@@ -471,9 +473,11 @@ impl Journal {
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(journal_error(
-                    "another process holds this actor/group journal's lifetime lock",
-                ))
+                return Err(Error::Coordination(CoordinationError::new(
+                    CoordinationErrorKind::JournalLocked,
+                    "invalid argument: coordination client journal: another process holds \
+                     this actor/group journal's lifetime lock",
+                )))
             }
             Err(std::fs::TryLockError::Error(source)) => {
                 return Err(io_error("locking", &lock_path, source))
