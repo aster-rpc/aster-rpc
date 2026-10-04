@@ -1499,7 +1499,6 @@ fn inline_response_over_the_cap_is_a_502() {
 /// consumer sees a **failed** response. Until the expose abort fix lands the
 /// consumer gets a clean, truncated finish instead.
 #[test]
-#[ignore = "needs expose-abort-fix"]
 fn aborted_streamed_response_fails_the_consumer() {
     let rig = Rig::http(None, |ctx, id, req| {
         ctx.respond_http(id, 200, &[], None);
@@ -1512,7 +1511,6 @@ fn aborted_streamed_response_fails_the_consumer() {
 }
 
 #[test]
-#[ignore = "needs expose-abort-fix"]
 fn response_over_the_cap_fails_the_consumer() {
     let rig = Rig::http(opts(|o| o.max_response_body = 1500), |ctx, id, req| {
         ctx.respond_http(id, 200, &[], None);

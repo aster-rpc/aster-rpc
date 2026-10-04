@@ -1129,18 +1129,12 @@ async def test_expose_http_handler_by_upcall():
         assert resp.status == 500 and b"exploded" not in resp.body
         assert (await _relay(conn, "GET", "/bad")).status == 500
 
-        # A failure after a streamed head aborts the body. Per the design the
-        # consumer should see a failed response; today the relay hop drops
-        # its send half on a body error, which QUIC turns into a clean finish
-        # (aster-expose `serve_request_until`), so a buffered consumer gets the
-        # truncated body. Accept either until that is fixed in core.
-        try:
-            r = await _relay(conn, "GET", "/midway")
-            assert r.body == b"partial"
-        except AssertionError:
-            raise
-        except Exception:
-            pass
+        # A failure after a streamed head aborts the body: the relay resets
+        # the stream, so the consumer sees a failed response, never the
+        # truncated body as if it were complete.
+        with pytest.raises(Exception) as failed:
+            await _relay(conn, "GET", "/midway")
+        assert not isinstance(failed.value, (AssertionError, asyncio.TimeoutError))
 
         # No answer before the kind's timeout: 504, and the handler task is
         # cancelled.
