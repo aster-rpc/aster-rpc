@@ -328,3 +328,133 @@ async fn echo_fixture_sanity() -> Result<()> {
     assert_eq!(buf, b"ping");
     Ok(())
 }
+
+// ----------------------------------------------------------------------------
+// Failure propagation across the splice
+// ----------------------------------------------------------------------------
+
+/// Accept one connection, run `script` against it, then drop it.
+async fn spawn_scripted_upstream<F, Fut>(script: F) -> Result<std::net::SocketAddr>
+where
+    F: FnOnce(TcpStream) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        if let Ok((sock, _)) = listener.accept().await {
+            script(sock).await;
+        }
+    });
+    Ok(addr)
+}
+
+/// An upstream that writes part of a response and then resets (RST, not FIN)
+/// must surface to the QUIC consumer as a reset stream. Dropping the QUIC send
+/// half finishes it, so without an explicit reset the consumer would read the
+/// partial bytes as a complete response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_upstream_reset_resets_quic_stream() -> Result<()> {
+    let (client_conn, _server, _client, _accept, _reactor, server_conns) = setup_pair().await?;
+    let server_conn = wait_for_one_server_conn(&server_conns).await?;
+
+    let addr = spawn_scripted_upstream(|mut sock| async move {
+        sock.write_all(b"partial response").await.unwrap();
+        sock.flush().await.unwrap();
+        // Give the splice time to forward the bytes before the RST discards
+        // anything still queued.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        #[allow(deprecated)] // zero linger (RST on close) is the point
+        sock.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(sock);
+    })
+    .await?;
+    let ticket =
+        server_conn.authorize_tunnel(vec![TunnelTarget::Tcp { addr }], Duration::from_secs(10))?;
+
+    let (send, recv) = timeout(STEP_TIMEOUT, client_conn.open_tunnel(ticket)).await??;
+    send.write_all(b"request".to_vec()).await?;
+    let drained = timeout(STEP_TIMEOUT, recv.read_to_end(64 * 1024)).await?;
+    assert!(
+        drained.is_err(),
+        "a reset upstream must reset the QUIC stream, got clean end: {drained:?}"
+    );
+    Ok(())
+}
+
+/// A clean upstream close (FIN) still ends the QUIC stream cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_upstream_clean_close_finishes_quic_stream() -> Result<()> {
+    let (client_conn, _server, _client, _accept, _reactor, server_conns) = setup_pair().await?;
+    let server_conn = wait_for_one_server_conn(&server_conns).await?;
+
+    let addr = spawn_scripted_upstream(|mut sock| async move {
+        sock.write_all(b"whole response").await.unwrap();
+        sock.shutdown().await.unwrap();
+    })
+    .await?;
+    let ticket =
+        server_conn.authorize_tunnel(vec![TunnelTarget::Tcp { addr }], Duration::from_secs(10))?;
+
+    let (send, recv) = timeout(STEP_TIMEOUT, client_conn.open_tunnel(ticket)).await??;
+    send.write_all(b"request".to_vec()).await?;
+    let body = timeout(STEP_TIMEOUT, recv.read_to_end(64 * 1024)).await??;
+    assert_eq!(body, b"whole response");
+    Ok(())
+}
+
+/// Run a tunnel to an upstream that reports how its read side ended, after the
+/// consumer either resets or finishes its send half.
+async fn upstream_read_outcome(reset_instead_of_finish: bool) -> Result<std::io::Result<usize>> {
+    let (client_conn, _server, _client, _accept, _reactor, server_conns) = setup_pair().await?;
+    let server_conn = wait_for_one_server_conn(&server_conns).await?;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let addr = spawn_scripted_upstream(|mut sock| async move {
+        let mut buf = [0u8; 64];
+        // Consume the request, then report how the stream ends.
+        let first = sock.read(&mut buf).await;
+        assert!(matches!(first, Ok(n) if n > 0), "request: {first:?}");
+        let end = loop {
+            match sock.read(&mut buf).await {
+                Ok(0) => break Ok(0),
+                Ok(_) => continue,
+                Err(e) => break Err(e),
+            }
+        };
+        let _ = tx.send(end);
+    })
+    .await?;
+    let ticket =
+        server_conn.authorize_tunnel(vec![TunnelTarget::Tcp { addr }], Duration::from_secs(10))?;
+
+    let (send, _recv) = timeout(STEP_TIMEOUT, client_conn.open_tunnel(ticket)).await??;
+    send.write_all(b"request".to_vec()).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    if reset_instead_of_finish {
+        send.reset(0x4153_00ff).await?;
+    } else {
+        send.finish().await?;
+    }
+    Ok(timeout(STEP_TIMEOUT, rx).await??)
+}
+
+/// QUIC to TCP: a reset QUIC stream aborts the upstream (RST) rather than
+/// sending a clean FIN that reads as an end-of-request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_quic_reset_aborts_upstream_tcp() -> Result<()> {
+    let end = upstream_read_outcome(true).await?;
+    assert!(
+        end.is_err(),
+        "reset must reach the upstream as RST: {end:?}"
+    );
+    Ok(())
+}
+
+/// QUIC to TCP: a finished QUIC stream is still a clean FIN upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_quic_finish_closes_upstream_tcp_cleanly() -> Result<()> {
+    let end = upstream_read_outcome(false).await?;
+    assert!(matches!(end, Ok(0)), "finish must be a clean EOF: {end:?}");
+    Ok(())
+}

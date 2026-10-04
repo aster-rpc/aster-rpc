@@ -42,6 +42,16 @@ pub const RESET_CODE_CANCELLED: u32 = 0x41_53_00_01; // "AS" 00 01
 /// stability rule: changing it is a wire-visible change.
 pub const RESET_CODE_PROTOCOL_VIOLATION: u32 = 0x41_53_00_02; // "AS" 00 02
 
+/// QUIC application error code for a tunnel stream torn down because its
+/// **upstream failed**: the backend TCP read errored (connection reset or any
+/// error other than a clean EOF) while the response was in flight.
+///
+/// Dropping a QUIC send half finishes it, so without an explicit reset the
+/// consumer would read the truncated response as a complete one. A clean
+/// upstream EOF is still a QUIC finish. Same stability rule as the other
+/// codes: changing it is a wire-visible change.
+pub const RESET_CODE_TUNNEL_UPSTREAM_ABORTED: u32 = 0x41_53_00_03; // "AS" 00 03
+
 /// Maximum frame body size: 16 MiB.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
