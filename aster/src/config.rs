@@ -180,6 +180,26 @@ pub struct AsterConfig {
     /// Path to a `.aster-identity` file.
     pub identity_file: Option<PathBuf>,
 
+    /// Port of the health/readiness/metrics HTTP listener (`aster::health`,
+    /// feature `health`). `0` (the default) means disabled unless
+    /// [`health_enabled`](Self::health_enabled) is `Some(true)`, in which case
+    /// an ephemeral port is bound. See [`is_health_enabled`](Self::is_health_enabled).
+    ///
+    /// Env: `ASTER_HEALTH_PORT`; TOML: `[health] port` (the keys the Python/TS
+    /// bindings read).
+    pub health_port: u16,
+    /// Bind host of the health listener. Default `127.0.0.1` (localhost only);
+    /// use `0.0.0.0` for Kubernetes pod probes.
+    ///
+    /// Env: `ASTER_HEALTH_HOST`; TOML: `[health] host`.
+    pub health_host: String,
+    /// Force the health listener on (`Some(true)`) or off (`Some(false)`).
+    /// `None` (the default) enables it exactly when `health_port != 0` — the
+    /// Python/TS rule.
+    ///
+    /// Env: `ASTER_HEALTH_ENABLED`; TOML: `[health] enabled`.
+    pub health_enabled: Option<bool>,
+
     /// Extra ALPNs the node accepts inbound connections on, in addition to the
     /// built-in blobs/docs/gossip protocols. Merged (deduplicated) with the
     /// list passed to [`Node::start_with_alpns`](crate::Node::start_with_alpns).
@@ -371,6 +391,18 @@ impl AsterConfig {
             }
         }
 
+        if let Some(health) = toml_section(raw, "health", label)? {
+            if let Some(value) = toml_u16(health, "port", label)? {
+                self.health_port = value;
+            }
+            if let Some(value) = toml_string(health, "host", label)? {
+                self.health_host = value;
+            }
+            if let Some(value) = toml_bool(health, "enabled", label)? {
+                self.health_enabled = Some(value);
+            }
+        }
+
         Ok(())
     }
 
@@ -544,7 +576,31 @@ impl AsterConfig {
             self.log_mask = value;
         }
 
+        if let Some(value) = env_u16("ASTER_HEALTH_PORT")? {
+            self.health_port = value;
+        }
+        if let Some(value) = env_string("ASTER_HEALTH_HOST") {
+            self.health_host = value;
+        }
+        if let Some(value) = env_bool("ASTER_HEALTH_ENABLED")? {
+            self.health_enabled = Some(value);
+        }
+
         Ok(())
+    }
+
+    /// Whether the health listener should run: [`health_enabled`](Self::health_enabled)
+    /// when set, else `health_port != 0`.
+    pub fn is_health_enabled(&self) -> bool {
+        self.health_enabled.unwrap_or(self.health_port != 0)
+    }
+
+    /// The health listener's bind config, or `None` when disabled (see
+    /// [`is_health_enabled`](Self::is_health_enabled)).
+    #[cfg(feature = "health")]
+    pub fn health_config(&self) -> Option<crate::health::HealthConfig> {
+        self.is_health_enabled()
+            .then(|| crate::health::HealthConfig::new(self.health_host.clone(), self.health_port))
     }
 
     /// Resolve the root public key from `root_pubkey` or `root_pubkey_file`.
@@ -817,6 +873,9 @@ impl Default for AsterConfig {
             log_level: "info".into(),
             log_mask: true,
             identity_file: None,
+            health_port: 0,
+            health_host: "127.0.0.1".into(),
+            health_enabled: None,
             alpns: Vec::new(),
         }
     }
@@ -1077,6 +1136,26 @@ impl AsterConfigBuilder {
     /// [`secret_key_file`](Self::secret_key_file).
     pub fn identity_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.identity_file = Some(path.into());
+        self
+    }
+
+    /// Force the health/metrics HTTP listener on or off (see
+    /// [`AsterConfig::health_enabled`]). On with port `0` binds an ephemeral
+    /// port.
+    pub fn health(mut self, enabled: bool) -> Self {
+        self.config.health_enabled = Some(enabled);
+        self
+    }
+
+    /// Health listener port; non-zero enables it (see [`AsterConfig::health_port`]).
+    pub fn health_port(mut self, port: u16) -> Self {
+        self.config.health_port = port;
+        self
+    }
+
+    /// Health listener bind host (default `127.0.0.1`).
+    pub fn health_host(mut self, host: impl Into<String>) -> Self {
+        self.config.health_host = host.into();
         self
     }
 
@@ -1565,6 +1644,9 @@ mod tests {
         "ASTER_RELAY_URLS",
         "ASTER_SECRET_KEY_FILE",
         "ASTER_GC_INTERVAL_MS",
+        "ASTER_HEALTH_PORT",
+        "ASTER_HEALTH_HOST",
+        "ASTER_HEALTH_ENABLED",
     ];
 
     pub(super) fn env_lock() -> &'static Mutex<()> {
@@ -2110,6 +2192,74 @@ mod binding_knob_tests {
         env::set_var("ASTER_PORTMAPPER_CONFIG", "sometimes");
         let err = AsterConfig::from_env().unwrap_err().to_string();
         assert!(err.contains("ASTER_PORTMAPPER_CONFIG"), "{err}");
+    }
+
+    #[test]
+    fn health_keys_from_toml_env_and_builder() {
+        let _lock = lock_env();
+        let _env = super::tests_env_guard();
+
+        // Defaults: disabled, localhost.
+        let cfg = AsterConfig::default();
+        assert_eq!(cfg.health_port, 0);
+        assert_eq!(cfg.health_host, "127.0.0.1");
+        assert_eq!(cfg.health_enabled, None);
+        assert!(!cfg.is_health_enabled());
+
+        // TOML `[health]` (the keys the Python/TS bindings read).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        fs::write(&path, "[health]\nport = 8080\nhost = \"0.0.0.0\"\n").unwrap();
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.health_port, 8080);
+        assert_eq!(cfg.health_host, "0.0.0.0");
+        assert!(cfg.is_health_enabled(), "non-zero port enables");
+
+        // Env overrides TOML; `enabled = false` wins over a port.
+        env::set_var("ASTER_HEALTH_PORT", "9090");
+        env::set_var("ASTER_HEALTH_HOST", "::1");
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.health_port, 9090);
+        assert_eq!(cfg.health_host, "::1");
+        env::set_var("ASTER_HEALTH_ENABLED", "false");
+        let cfg = AsterConfig::from_env().unwrap();
+        assert_eq!(cfg.health_enabled, Some(false));
+        assert!(!cfg.is_health_enabled());
+        env::remove_var("ASTER_HEALTH_ENABLED");
+
+        // Enabled with port 0 = ephemeral.
+        fs::write(&path, "[health]\nenabled = true\n").unwrap();
+        env::remove_var("ASTER_HEALTH_PORT");
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.health_port, 0);
+        assert!(cfg.is_health_enabled());
+
+        // Bad values are errors, not silently disabled.
+        env::set_var("ASTER_HEALTH_PORT", "70000");
+        let err = AsterConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("ASTER_HEALTH_PORT"), "{err}");
+        env::remove_var("ASTER_HEALTH_PORT");
+        fs::write(&path, "[health]\nport = 65536\n").unwrap();
+        let err = AsterConfig::from_file(&path).unwrap_err().to_string();
+        assert!(err.contains("port"), "{err}");
+
+        // Builder.
+        let cfg = AsterConfig::builder()
+            .health_port(8081)
+            .health_host("0.0.0.0")
+            .build();
+        assert!(cfg.is_health_enabled());
+        let cfg = cfg.into_builder().health(false).build();
+        assert!(!cfg.is_health_enabled());
+        #[cfg(feature = "health")]
+        {
+            assert_eq!(cfg.health_config(), None);
+            let on = cfg.into_builder().health(true).build();
+            assert_eq!(
+                on.health_config(),
+                Some(crate::health::HealthConfig::new("0.0.0.0", 8081))
+            );
+        }
     }
 
     #[test]
