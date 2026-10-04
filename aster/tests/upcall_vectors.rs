@@ -12,7 +12,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aster::binding_support::upcall::codec::{self, HandshakeDecision, TopologyViewParts};
+use aster::binding_support::upcall::codec::{
+    self, ExposeHttpRequest, ExposeHttpResponse, ExposeRouteSpec, HandshakeDecision, HttpBodyMode,
+    TopologyViewParts,
+};
 use aster::binding_support::upcall::{CancelReason, UpcallKind, UpcallStatus};
 use aster::lease::{DenyReason, Fence, FenceRejection, LeaseOp, LeaseSnapshot, TransitionOutcome};
 use aster::topology::ClusterView;
@@ -416,6 +419,230 @@ fn other_cases() -> Vec<Case> {
     ]
 }
 
+fn hdrs(v: &[(&str, &[u8])]) -> Vec<codec::HttpHeader> {
+    v.iter().map(|(n, x)| (n.to_string(), x.to_vec())).collect()
+}
+
+fn http_get() -> ExposeHttpRequest {
+    ExposeHttpRequest {
+        service_id: "app".into(),
+        peer_id: Some(h(0xaa)),
+        stream_id: 7,
+        version: 2,
+        method: "GET".into(),
+        uri: "/greet?x=1".into(),
+        headers: hdrs(&[("host", b"app.local"), ("accept", b"*/*")]),
+        body: HttpBodyMode::Stream,
+    }
+}
+
+fn http_post() -> ExposeHttpRequest {
+    ExposeHttpRequest {
+        service_id: "app".into(),
+        peer_id: None,
+        stream_id: 300,
+        version: 3,
+        method: "POST".into(),
+        uri: "/upload".into(),
+        headers: hdrs(&[("content-length", b"5"), ("x-bin", &[0xff, 0x00])]),
+        body: HttpBodyMode::Inline(b"hello".to_vec()),
+    }
+}
+
+fn route_specs(protocol_b: u8) -> Vec<ExposeRouteSpec> {
+    vec![
+        ExposeRouteSpec {
+            host: "a.example".into(),
+            port: 443,
+            protocol: 0,
+            service_id: "web".into(),
+        },
+        ExposeRouteSpec {
+            host: String::new(),
+            port: 5432,
+            protocol: protocol_b,
+            service_id: "db".into(),
+        },
+    ]
+}
+
+/// R9 expose HTTP payloads (kinds 49, 50). Appended after the R6 cases.
+fn expose_http_cases() -> Vec<Case> {
+    let rt_req = |b: &[u8]| {
+        codec::encode_expose_http_request(&codec::decode_expose_http_request(b).unwrap())
+    };
+    let rt_resp = |b: &[u8]| {
+        codec::encode_expose_http_response(&codec::decode_expose_http_response(b).unwrap())
+    };
+    let rt_trailers = |b: &[u8]| {
+        codec::encode_expose_http_trailers(&codec::decode_expose_http_trailers(b).unwrap())
+    };
+    let rt_grant =
+        |b: &[u8]| codec::encode_expose_route_grant(&codec::decode_expose_route_grant(b).unwrap());
+    vec![
+        Case {
+            name: "expose http request: GET, streamed body",
+            ty: "ExposeHttpRequest",
+            value: json!({"service_id": "app", "peer_id": h(0xaa), "stream_id": 7, "version": 2,
+                "method": "GET", "uri": "/greet?x=1",
+                "headers": [{"name": "host", "value": "app.local"}, {"name": "accept", "value": "*/*"}],
+                "body": "stream"}),
+            bytes: codec::encode_expose_http_request(&http_get()),
+            reencode: rt_req,
+        },
+        Case {
+            name: "expose http request: POST inline, no peer, HTTP/2, binary header",
+            ty: "ExposeHttpRequest",
+            value: json!({"service_id": "app", "peer_id": null, "stream_id": 300, "version": 3,
+                "method": "POST", "uri": "/upload",
+                "headers": [{"name": "content-length", "value": "5"}, {"name": "x-bin", "value_hex": "ff00"}],
+                "body": {"inline": "hello"}}),
+            bytes: codec::encode_expose_http_request(&http_post()),
+            reencode: rt_req,
+        },
+        Case {
+            name: "expose http response: inline, repeated header",
+            ty: "ExposeHttpResponse",
+            value: json!({"status": 200, "headers": [
+                {"name": "content-type", "value": "text/plain"},
+                {"name": "set-cookie", "value": "a=1"}, {"name": "set-cookie", "value": "b=2"}],
+                "body": {"inline": "hi"}}),
+            bytes: codec::encode_expose_http_response(&ExposeHttpResponse {
+                status: 200,
+                headers: hdrs(&[
+                    ("content-type", b"text/plain"),
+                    ("set-cookie", b"a=1"),
+                    ("set-cookie", b"b=2"),
+                ]),
+                body: HttpBodyMode::Inline(b"hi".to_vec()),
+            }),
+            reencode: rt_resp,
+        },
+        Case {
+            name: "expose http response: streamed, no headers",
+            ty: "ExposeHttpResponse",
+            value: json!({"status": 404, "headers": [], "body": "stream"}),
+            bytes: codec::encode_expose_http_response(&ExposeHttpResponse {
+                status: 404,
+                headers: Vec::new(),
+                body: HttpBodyMode::Stream,
+            }),
+            reencode: rt_resp,
+        },
+        Case {
+            name: "expose http trailers",
+            ty: "ExposeHttpTrailers",
+            value: json!([{"name": "grpc-status", "value": "0"}, {"name": "grpc-message", "value": "ok"}]),
+            bytes: codec::encode_expose_http_trailers(&hdrs(&[
+                ("grpc-status", b"0"),
+                ("grpc-message", b"ok"),
+            ])),
+            reencode: rt_trailers,
+        },
+        Case {
+            name: "expose http trailers: empty",
+            ty: "ExposeHttpTrailers",
+            value: json!([]),
+            bytes: codec::encode_expose_http_trailers(&[]),
+            reencode: rt_trailers,
+        },
+        Case {
+            name: "expose route policy request",
+            ty: "ExposeRoutePolicyRequest",
+            value: json!({"peer_id": h(0xaa), "metadata_hex": "746f6b", "specs": [
+                {"host": "a.example", "port": 443, "protocol": "http", "service_id": "web"},
+                {"host": "", "port": 5432, "protocol": "tcp", "service_id": "db"}]}),
+            bytes: codec::encode_expose_route_policy_request(&h(0xaa), b"tok", &route_specs(1)),
+            reencode: |b| {
+                let (p, m, s) = codec::decode_expose_route_policy_request(b).unwrap();
+                codec::encode_expose_route_policy_request(&p, &m, &s)
+            },
+        },
+        Case {
+            name: "expose route grant",
+            ty: "ExposeRouteGrant",
+            value: json!({"granted": [1]}),
+            bytes: codec::encode_expose_route_grant(&[1]),
+            reencode: rt_grant,
+        },
+        Case {
+            name: "expose route grant: none",
+            ty: "ExposeRouteGrant",
+            value: json!({"granted": []}),
+            bytes: codec::encode_expose_route_grant(&[]),
+            reencode: rt_grant,
+        },
+    ]
+}
+
+/// Malformed R9 payloads, built from the (non-validating) encoders.
+fn expose_http_invalid() -> Vec<(&'static str, &'static str, String)> {
+    let mut v5 = http_get();
+    v5.version = 5;
+    let mut no_method = http_get();
+    no_method.method.clear();
+    let resp = |status: u16, name: &str, body: HttpBodyMode| {
+        codec::encode_expose_http_response(&ExposeHttpResponse {
+            status,
+            headers: hdrs(&[(name, b"x")]),
+            body,
+        })
+    };
+    let mut bad_mode = resp(200, "x", HttpBodyMode::Stream);
+    *bad_mode.last_mut().unwrap() = 0x02;
+    vec![
+        (
+            "unknown HTTP version",
+            "ExposeHttpRequest",
+            hex::encode(codec::encode_expose_http_request(&v5)),
+        ),
+        (
+            "empty method",
+            "ExposeHttpRequest",
+            hex::encode(codec::encode_expose_http_request(&no_method)),
+        ),
+        (
+            "uppercase header name",
+            "ExposeHttpResponse",
+            hex::encode(resp(200, "X-Up", HttpBodyMode::Stream)),
+        ),
+        (
+            "empty header name",
+            "ExposeHttpResponse",
+            hex::encode(resp(200, "", HttpBodyMode::Stream)),
+        ),
+        (
+            "status below 100",
+            "ExposeHttpResponse",
+            hex::encode(resp(99, "x", HttpBodyMode::Stream)),
+        ),
+        (
+            "status above 999",
+            "ExposeHttpResponse",
+            hex::encode(resp(1000, "x", HttpBodyMode::Stream)),
+        ),
+        (
+            "unknown body mode",
+            "ExposeHttpResponse",
+            hex::encode(&bad_mode),
+        ),
+        (
+            "unknown route protocol",
+            "ExposeRoutePolicyRequest",
+            hex::encode(codec::encode_expose_route_policy_request(
+                "p",
+                b"",
+                &route_specs(2),
+            )),
+        ),
+        (
+            "route grant not ascending",
+            "ExposeRouteGrant",
+            hex::encode(codec::encode_expose_route_grant(&[1, 0])),
+        ),
+    ]
+}
+
 #[cfg(feature = "coordination-client")]
 fn placement_cases() -> Vec<Case> {
     use std::collections::{BTreeMap, BTreeSet};
@@ -595,6 +822,9 @@ fn invalid() -> Vec<(&'static str, &'static str, String)> {
             "b901050c01".into(),
         ),
     ]
+    .into_iter()
+    .chain(expose_http_invalid())
+    .collect()
 }
 
 fn decode_by_type(ty: &str, b: &[u8]) -> anyhow::Result<()> {
@@ -606,6 +836,10 @@ fn decode_by_type(ty: &str, b: &[u8]) -> anyhow::Result<()> {
         "FencedMutateResponse" => codec::decode_fenced_mutate_response(b).map(drop),
         "AdmissionHandshakeResponse" => codec::decode_admission_handshake_response(b).map(drop),
         "TopologyAdmittedResponse" => codec::decode_topology_admitted_response(b).map(drop),
+        "ExposeHttpRequest" => codec::decode_expose_http_request(b).map(drop),
+        "ExposeHttpResponse" => codec::decode_expose_http_response(b).map(drop),
+        "ExposeRoutePolicyRequest" => codec::decode_expose_route_policy_request(b).map(drop),
+        "ExposeRouteGrant" => codec::decode_expose_route_grant(b).map(drop),
         other => panic!("no decoder for {other}"),
     }
 }
@@ -614,6 +848,7 @@ fn render() -> Value {
     let mut cases: Vec<Case> = lease_cases();
     cases.extend(other_cases());
     cases.extend(placement_cases());
+    cases.extend(expose_http_cases());
     let kinds: Vec<Value> = UpcallKind::ALL
         .iter()
         .map(|k| json!({"code": k.code(), "name": k.name(), "decision": k.is_decision()}))
@@ -694,6 +929,7 @@ fn upcall_vectors() {
     let mut cases = lease_cases();
     cases.extend(other_cases());
     cases.extend(placement_cases());
+    cases.extend(expose_http_cases());
     for c in &cases {
         assert_eq!((c.reencode)(&c.bytes), c.bytes, "{} round trip", c.name);
     }
