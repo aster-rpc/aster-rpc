@@ -815,6 +815,32 @@ pub mod ingress_metrics {
 /// *n*'s limit, and with an unbounded channel it read them as fast as the peer
 /// could send regardless of whether dispatch was keeping up. A bounded channel
 /// alone fixes only the second.
+/// The reader stopped on `err`. If the peer **reset** its send side, that is a
+/// cancellation (it abandoned the call): forward a synthetic `FLAG_CANCEL` so
+/// dispatch cancels the call in flight.
+///
+/// A client cancels by writing `FLAG_CANCEL` and then resetting. A reset lets
+/// QUIC discard data not yet read, so the cancel frame itself is often lost --
+/// and before this, the reset read like a clean EOF: the dispatch loop then
+/// waited on the writer, and a handler that was not producing (an unanswered
+/// unary, a client stream waiting for input) never learnt of the cancel.
+async fn forward_reset_as_cancel(err: &anyhow::Error, frame_tx: &mpsc::Sender<WireFrame>) {
+    let reset = err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<iroh::endpoint::ReadError>(),
+            Some(iroh::endpoint::ReadError::Reset(_))
+        )
+    });
+    if reset {
+        let _ = frame_tx
+            .send(WireFrame {
+                payload: Vec::new(),
+                flags: FLAG_CANCEL,
+            })
+            .await;
+    }
+}
+
 async fn read_all_frames(
     recv: CoreRecvStream,
     frame_tx: mpsc::Sender<WireFrame>,
@@ -827,7 +853,7 @@ async fn read_all_frames(
             .await
         {
             Ok(f) => f,
-            Err(_) => return,
+            Err(e) => return forward_reset_as_cancel(&e, &frame_tx).await,
         };
 
         // Transport validity first. A frame without FLAG_HEADER is not a call
@@ -893,7 +919,7 @@ async fn read_all_frames(
                         break; // next iteration reads a header again
                     }
                 }
-                Err(_) => return,
+                Err(e) => return forward_reset_as_cancel(&e, &frame_tx).await,
             }
         }
     }
@@ -1030,6 +1056,12 @@ async fn dispatch_stream(
             },
         };
         if header.flags & FLAG_HEADER == 0 {
+            if header.flags & FLAG_CANCEL != 0 {
+                // A cancel between calls: the client gave up on a call that
+                // completed as it cancelled, or reset an idle stream. Nothing
+                // is in flight; the stream is poisoned, so just end it.
+                return Ok(());
+            }
             return Err(anyhow!(
                 "expected StreamHeader (FLAG_HEADER), got flags={:#x}",
                 header.flags
@@ -1040,6 +1072,15 @@ async fn dispatch_stream(
             Some(f) => f,
             None => return Err(anyhow!("eof after stream header")),
         };
+        if first_req.flags & FLAG_CANCEL != 0 {
+            // Cancelled before the first request: there is no call to
+            // dispatch (nothing was delivered). Poison the stream as for any
+            // cancel.
+            send.reset(crate::framing::RESET_CODE_CANCELLED)
+                .await
+                .context("poisoning a cancelled stream")?;
+            return Ok(());
+        }
 
         let outcome = dispatch_one_call(
             &send,
