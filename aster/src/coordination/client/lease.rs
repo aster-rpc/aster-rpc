@@ -26,6 +26,20 @@
 //! delivery contract for a mutation uses [`super::CoordinationClient`]
 //! directly. The two APIs share one journal, so a lease transition still
 //! cannot interleave with an unacknowledged application mutation.
+//!
+//! ## Ending a lease mid-renewal
+//!
+//! The core holder stops its renew loop by aborting the task, which can land
+//! while a renewal is mid-drive. The lease path therefore runs through
+//! [`CoordinationClient::self_acknowledging`](super::CoordinationClient): the
+//! acknowledgement happens under the same journal hold as the resolution, so
+//! an abort can strand a renewal only `Pending`, and the journal remembers (in
+//! memory) that the entry is the lease path's. The next mutation on the client
+//! — the release that caused the abort, a later lease, or an application
+//! mutation after the lease was dropped — first drives that renewal to its
+//! resolution with the exact journaled bytes and acknowledges it, then
+//! proceeds. `release`, `release_with_value` and drop never leave the journal
+//! blocked; after a process restart the entry is redelivered like any other.
 
 use std::sync::Arc;
 
@@ -111,14 +125,10 @@ impl CoordinationBackend for ClientBackend {
         }
         .map_err(|err| anyhow::anyhow!("{err}"))?;
 
-        let reply = resolved.reply().clone();
-        // See the module docs: the adapter path acknowledges each resolved
-        // transition — periodic and self-correcting, with the server effect
-        // still exactly-once.
-        resolved
-            .acknowledge()
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        // See the module docs: the self-acknowledging client acknowledged
+        // this transition under the journal hold that resolved it — periodic
+        // and self-correcting, with the server effect still exactly-once.
+        let reply = resolved.into_settled_reply();
 
         let outcome = Outcome::from_code(reply.outcome_code).unwrap_or(Outcome::Rejected);
         let reason = Reason::from_code(reply.reason_code).unwrap_or(Reason::None);
@@ -186,6 +196,9 @@ impl CoordinationLease {
         resource: ResourceKeyV1,
         options: LeaseOptions,
     ) -> Result<LeaseAcquireOutcome> {
+        // Every transition this lease makes — renewals, the release, its
+        // register mutations — is acknowledged by the lease path itself.
+        let client = client.self_acknowledging();
         let key = ResourceKey::new(&resource.namespace, resource.key.clone())
             .map_err(|_| client_error("the resource key is not a valid §4.2 identity"))?;
         let local = client.local_id()?;
@@ -245,9 +258,7 @@ impl CoordinationLease {
             .client
             .compare_and_set(fence, expected_value_revision, new_value)
             .await?;
-        let reply = resolved.reply().clone();
-        resolved.acknowledge().await?;
-        Ok(reply)
+        Ok(resolved.into_settled_reply())
     }
 
     /// Graceful release through the serializer's own transition.
@@ -282,8 +293,6 @@ impl CoordinationLease {
             .client
             .release_with_value(fence, expected_value_revision, final_value)
             .await?;
-        let reply = resolved.reply().clone();
-        resolved.acknowledge().await?;
-        Ok(reply)
+        Ok(resolved.into_settled_reply())
     }
 }

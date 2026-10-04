@@ -176,6 +176,12 @@ pub struct Journal {
     /// Held for the journal's lifetime; dropping releases it.
     _lock: File,
     record: ClientJournalV1,
+    /// The entry a self-acknowledging caller (the lease path) began, if it is
+    /// still the current one. **In memory only**: it lets the next caller in
+    /// this process settle an entry whose own caller was cancelled mid-drive,
+    /// rather than refusing on it. After a restart the entry is redelivered
+    /// like any other — the durable contract is unchanged.
+    self_acknowledging: Option<AckToken>,
     #[cfg(any(test, feature = "coordination-testing"))]
     crash: Option<CrashHook>,
 }
@@ -516,6 +522,7 @@ impl Journal {
             dir,
             _lock: lock,
             record,
+            self_acknowledging: None,
             #[cfg(any(test, feature = "coordination-testing"))]
             crash: None,
         })
@@ -668,6 +675,21 @@ impl Journal {
                 self.token_of_current(),
             )
         })
+    }
+
+    /// Mark the entry just begun as one its caller acknowledges itself — the
+    /// lease path's periodic transitions (see `client::lease`). In memory
+    /// only; nothing durable changes.
+    pub(crate) fn mark_self_acknowledging(&mut self) {
+        self.self_acknowledging = Some(self.token_of_current());
+    }
+
+    /// Whether the current, not yet settled entry is one a self-acknowledging
+    /// caller began in this process — so a later caller may finish it on that
+    /// caller's behalf instead of refusing on it.
+    pub(crate) fn current_is_self_acknowledging(&self) -> bool {
+        self.state() != JournalState::Ready
+            && self.self_acknowledging.as_ref() == Some(&self.token_of_current())
     }
 
     /// The identity of the record's current entry — what an acknowledgement

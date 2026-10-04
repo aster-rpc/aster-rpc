@@ -522,6 +522,142 @@ async fn an_abandoned_lease_expires_and_a_successor_acquires() {
     voter.shutdown().await;
 }
 
+/// **Ending a lease never strands the shared journal** (bindings P9 finding).
+///
+/// `release()`, `release_with_value()` and dropping the lease all stop the
+/// core renew loop by aborting its task. With a renewal mid-mutation at that
+/// moment, the journal used to be left `Pending`, the release itself failed
+/// with "another request is unresolved", and every later mutation failed
+/// until `resume()`. A 20 ms renew interval puts a renewal in flight at
+/// nearly every ending; this failed most cycles before the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ending_a_lease_mid_renewal_leaves_the_journal_free() {
+    use aster::coordination::client::lease::{CoordinationLease, LeaseAcquireOutcome};
+    use aster_transport_core::lease::LeaseOptions;
+
+    const CYCLES: usize = 40;
+
+    let fixture = GroupFixture::new("client.leaserace", 0xE6, 1);
+    let dir = tempfile::tempdir().expect("a directory");
+    let voter = start_voter(&fixture, 0, dir.path()).await;
+
+    let root_node = client_node([0xE6 ^ 0xFF; 32], &fixture, &voter).await;
+    let root_journal = tempfile::tempdir().expect("a directory");
+    let root = CoordinationClient::builder(root_node, group(&fixture))
+        .seed_tickets([voter_ticket(&fixture, 0)])
+        .journal_dir(root_journal.path())
+        .build()
+        .expect("the ROOT client builds");
+    let holder_secret = [0xE6 ^ 0x41; 32];
+    let subject = ed25519_dalek::SigningKey::from_bytes(&holder_secret)
+        .verifying_key()
+        .to_bytes();
+    let granted = within(
+        "grant",
+        root.set_grant(
+            resource(b"race"),
+            subject,
+            RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW | RIGHT_MUTATE | RIGHT_RELEASE,
+            0,
+        ),
+    )
+    .await
+    .expect("ROOT grants");
+    within("ack", granted.acknowledge()).await.expect("ack");
+
+    let holder_node = client_node(holder_secret, &fixture, &voter).await;
+    let holder_journal = tempfile::tempdir().expect("a directory");
+    let holder = CoordinationClient::builder(holder_node, group(&fixture))
+        .seed_tickets([voter_ticket(&fixture, 0)])
+        .journal_dir(holder_journal.path())
+        .build()
+        .expect("the holder client builds");
+
+    // The §12.1 minimum TTL, renewing as fast as the loop will go.
+    let options = LeaseOptions {
+        ttl: Duration::from_millis(5_000),
+        renew_interval: Duration::from_millis(20),
+        holder_margin: Duration::from_millis(1_000),
+    };
+
+    let mut failures = Vec::new();
+    for cycle in 0..CYCLES {
+        let lease = match within(
+            "acquire",
+            CoordinationLease::acquire(holder.clone(), resource(b"race"), options),
+        )
+        .await
+        {
+            Ok(LeaseAcquireOutcome::Granted(lease)) => lease,
+            Ok(LeaseAcquireOutcome::Denied(reason, snapshot)) => {
+                panic!("cycle {cycle}: the acquire must grant, got {reason:?} over {snapshot:?}")
+            }
+            Err(err) => panic!("cycle {cycle}: the acquire failed: {err}"),
+        };
+        // Let a few renewals run, and land the ending at a varying phase of
+        // the renew cadence.
+        tokio::time::sleep(Duration::from_millis(30 + (cycle as u64 * 7) % 40)).await;
+        let fence = lease.fence().expect("a fresh lease presents its fence");
+        let ended: aster::Result<()> = match cycle % 3 {
+            0 => within("release", lease.release()).await,
+            1 => {
+                let current = within("read", holder.reads().read_linearizable(resource(b"race")))
+                    .await
+                    .expect("the read answers");
+                within(
+                    "release_with_value",
+                    lease.release_with_value(
+                        current.snapshot.value_revision,
+                        format!("cycle {cycle}").into_bytes(),
+                    ),
+                )
+                .await
+                .map(|reply| assert_eq!(reply.outcome_code, 4, "cycle {cycle}: {reply:?}"))
+            }
+            // Dropped mid-renewal: the application's own next mutation — a
+            // release under the fence it captured — must still go through.
+            _ => {
+                drop(lease);
+                match within("app release", holder.release(fence.clone())).await {
+                    Ok(released) => {
+                        assert_eq!(released.reply().outcome_code, 4, "cycle {cycle}");
+                        within("ack", released.acknowledge()).await
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        };
+        if let Err(err) = ended {
+            failures.push(format!("cycle {cycle}: {err}"));
+            // Recover — settle the stranded entry, then release by hand — so
+            // the next cycle measures its own ending.
+            if let Ok(Some(redelivered)) = within("resume", holder.resume()).await {
+                let _ = within("ack", redelivered.acknowledge()).await;
+            }
+            if let Ok(released) = within("recovery release", holder.release(fence)).await {
+                let _ = within("ack", released.acknowledge()).await;
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {CYCLES} lease endings stranded the journal:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    // Nothing is left behind for the application.
+    assert!(within("unacknowledged", holder.unacknowledged())
+        .await
+        .expect("the journal reads")
+        .is_none());
+    assert!(within("resume", holder.resume())
+        .await
+        .expect("the journal resumes")
+        .is_none());
+
+    voter.shutdown().await;
+}
+
 /// **The streamed recovery export is exact and incremental** (the reopen's
 /// blocker 5). The body is written straight into a caller-supplied `File`
 /// writer — never assembled by the client — and the file's bytes match the
