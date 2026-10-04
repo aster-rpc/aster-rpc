@@ -2,22 +2,24 @@ package site.aster.config;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Base64;
+import java.util.ArrayList;
 import java.util.List;
 import org.tomlj.Toml;
 import org.tomlj.TomlParseResult;
 import org.tomlj.TomlTable;
 
 /**
- * Unified configuration for AsterServer.
+ * Unified configuration for {@code AsterServer} / {@code AsterClient} / {@code IrohNode}.
  *
- * <p>Three-layer resolution (later wins):
+ * <p>Three-layer resolution (later wins): built-in defaults, an {@code aster.toml} file, then
+ * {@code ASTER_*} environment variables, then builder calls.
  *
- * <ol>
- *   <li>Built-in defaults (ephemeral key, in-memory store, all gates open).
- *   <li>TOML config file ({@code aster.toml}) -- requires a TOML library (future).
- *   <li>{@code ASTER_*} environment variables.
- * </ol>
+ * <p>The <b>node knobs</b> (relay, secret key / key file, storage, GC, bind address, hooks,
+ * discovery, monitoring, transports, portmapper, proxy, QUIC tuning; table in {@code
+ * docs/aster-rust-getstarted.md} §2.2) are resolved by the Rust {@code aster::AsterConfig} through
+ * the C ABI ({@code aster_config_from_env} / {@code aster_config_from_toml}), so Java reads env and
+ * TOML exactly like Rust, Python and TypeScript. Nodes start through {@code aster_node_start}. The
+ * trust, connect and logging fields are still read here.
  *
  * <p>Usage:
  *
@@ -25,10 +27,11 @@ import org.tomlj.TomlTable;
  * // From env only (the common case for containers):
  * AsterConfig config = AsterConfig.fromEnv();
  *
- * // Inline (testing):
+ * // Inline (testing): loopback only, relays off.
  * AsterConfig config = AsterConfig.builder()
+ *     .relayMode("disabled")
+ *     .bindAddr("127.0.0.1:0")
  *     .allowAllConsumers(true)
- *     .storagePath("/var/lib/aster")
  *     .build();
  * }</pre>
  */
@@ -48,9 +51,26 @@ public final class AsterConfig {
   // ── Storage ────────────────────────────────────────────────────────────
   private String storagePath;
 
-  // ── Network ────────────────────────────────────────────────────────────
+  // ── Network (node knobs; see class docs) ───────────────────────────────
   private byte[] secretKey;
+  private String secretKeyFile;
   private String relayMode;
+  private List<String> relayUrls = List.of();
+  private long gcIntervalMs;
+  private String hookFailureMode = "fail_open";
+  private List<byte[]> alpns = List.of();
+  private Long transportMaxConcurrentBidiStreams;
+  private Long transportMaxConcurrentUniStreams;
+  private Long transportStreamReceiveWindow;
+  private Long transportReceiveWindow;
+  private Long transportSendWindow;
+  private Long transportMaxIdleTimeoutMs;
+  private Long transportKeepAliveIntervalMs;
+  private Integer transportInitialMtu;
+  private Long transportDatagramReceiveBufferSize;
+  private Long transportDatagramSendBufferSize;
+  private Boolean transportSendFairness;
+  private Boolean transportEnableSegmentationOffload;
   private String bindAddr;
   private boolean enableMonitoring;
   private boolean enableHooks;
@@ -134,6 +154,99 @@ public final class AsterConfig {
     return localDiscovery;
   }
 
+  public String secretKeyFile() {
+    return secretKeyFile;
+  }
+
+  /** Relay URLs for {@code relayMode("custom")} (a non-empty list alone also selects custom). */
+  public List<String> relayUrls() {
+    return relayUrls;
+  }
+
+  /** Blob GC interval in ms; 0 = no GC. */
+  public long gcIntervalMs() {
+    return gcIntervalMs;
+  }
+
+  /** {@code "fail_open"} (default) or {@code "fail_closed"}. */
+  public String hookFailureMode() {
+    return hookFailureMode;
+  }
+
+  /** Extra inbound ALPNs the node registers. */
+  public List<byte[]> alpns() {
+    return alpns;
+  }
+
+  public boolean clearIpTransports() {
+    return clearIpTransports;
+  }
+
+  public boolean clearRelayTransports() {
+    return clearRelayTransports;
+  }
+
+  /** {@code null} (transport default), {@code "enabled"} or {@code "disabled"}. */
+  public String portmapperConfig() {
+    return portmapperConfig;
+  }
+
+  public String proxyUrl() {
+    return proxyUrl;
+  }
+
+  public boolean proxyFromEnv() {
+    return proxyFromEnv;
+  }
+
+  public Long transportMaxConcurrentBidiStreams() {
+    return transportMaxConcurrentBidiStreams;
+  }
+
+  public Long transportMaxConcurrentUniStreams() {
+    return transportMaxConcurrentUniStreams;
+  }
+
+  public Long transportStreamReceiveWindow() {
+    return transportStreamReceiveWindow;
+  }
+
+  public Long transportReceiveWindow() {
+    return transportReceiveWindow;
+  }
+
+  public Long transportSendWindow() {
+    return transportSendWindow;
+  }
+
+  public Long transportMaxIdleTimeoutMs() {
+    return transportMaxIdleTimeoutMs;
+  }
+
+  public Long transportKeepAliveIntervalMs() {
+    return transportKeepAliveIntervalMs;
+  }
+
+  public Integer transportInitialMtu() {
+    return transportInitialMtu;
+  }
+
+  public Long transportDatagramReceiveBufferSize() {
+    return transportDatagramReceiveBufferSize;
+  }
+
+  public Long transportDatagramSendBufferSize() {
+    return transportDatagramSendBufferSize;
+  }
+
+  public Boolean transportSendFairness() {
+    return transportSendFairness;
+  }
+
+  public Boolean transportEnableSegmentationOffload() {
+    return transportEnableSegmentationOffload;
+  }
+
   public String logFormat() {
     return logFormat;
   }
@@ -152,14 +265,23 @@ public final class AsterConfig {
 
   // ── Factory ────────────────────────────────────────────────────────────
 
-  /** Build config from {@code ASTER_*} environment variables only. */
+  /**
+   * Build config from {@code ASTER_*} environment variables only. Node knobs are resolved by the
+   * Rust config ({@code aster_config_from_env}); a malformed value throws.
+   */
   public static AsterConfig fromEnv() {
-    return builder().applyEnv().build();
+    return site.aster.ffi.NativeConfig.applyEnv(builder()).applyEnv().build();
   }
 
-  /** Build config from a TOML file, with env-var overrides (env wins). */
+  /**
+   * Build config from a TOML file, with env-var overrides (env wins). Node knobs are resolved by
+   * the Rust config ({@code aster_config_from_toml}); a malformed file throws.
+   */
   public static AsterConfig fromFile(Path path) {
-    return builder().applyToml(path).applyEnv().build();
+    return site.aster.ffi.NativeConfig.applyToml(path, builder())
+        .applyToml(path)
+        .applyEnv()
+        .build();
   }
 
   /** Build config from a TOML file, with env-var overrides (env wins). */
@@ -173,11 +295,25 @@ public final class AsterConfig {
 
   // ── Conversion ─────────────────────────────────────────────────────────
 
-  /** Convert network fields to an {@link EndpointConfig} for the FFI layer. */
+  /**
+   * Convert network fields to an {@link EndpointConfig} for the deprecated endpoint FFI path.
+   *
+   * @deprecated nodes start from the full config via {@code aster_node_start} ({@link
+   *     site.aster.ffi.NativeConfig}); removed with ABI 4.0.
+   */
+  @Deprecated
   public EndpointConfig toEndpointConfig() {
     EndpointConfig ec = new EndpointConfig();
     if (secretKey != null) ec.secretKey(secretKey);
-    if (relayMode != null) ec.relayMode(relayMode.equals("disabled") ? 0 : 1);
+    if (relayMode != null) {
+      ec.relayMode(
+          switch (relayMode) {
+            case "disabled" -> 2;
+            case "staging" -> 3;
+            case "default" -> 0;
+            default -> 1;
+          });
+    }
     if (bindAddr != null) ec.bindAddr(bindAddr);
     ec.enableDiscovery(localDiscovery);
     ec.enableHooks(enableHooks);
@@ -256,8 +392,143 @@ public final class AsterConfig {
       return this;
     }
 
+    /**
+     * {@code "default"}, {@code "disabled"}, {@code "staging"}, {@code "custom"} (with {@link
+     * #relayUrls}) or a bare relay URL (means custom).
+     */
     public Builder relayMode(String mode) {
       c.relayMode = mode;
+      return this;
+    }
+
+    public Builder relayUrls(List<String> urls) {
+      c.relayUrls = urls == null ? List.of() : List.copyOf(urls);
+      return this;
+    }
+
+    /** Secret key file (64 hex chars): loaded if present, else created at node start. */
+    public Builder secretKeyFile(String path) {
+      c.secretKeyFile = path;
+      return this;
+    }
+
+    /** Blob GC interval in ms; 0 disables GC. */
+    public Builder gcIntervalMs(long ms) {
+      c.gcIntervalMs = ms;
+      return this;
+    }
+
+    /** {@code "fail_open"} or {@code "fail_closed"}: what a hook timeout means. */
+    public Builder hookFailureMode(String mode) {
+      c.hookFailureMode = mode;
+      return this;
+    }
+
+    /** Replace the extra inbound ALPN list. */
+    public Builder alpns(List<byte[]> alpns) {
+      c.alpns = alpns == null ? List.of() : List.copyOf(alpns);
+      return this;
+    }
+
+    /** Add one extra inbound ALPN. */
+    public Builder alpn(byte[] alpn) {
+      List<byte[]> next = new ArrayList<>(c.alpns);
+      next.add(alpn);
+      c.alpns = List.copyOf(next);
+      return this;
+    }
+
+    /** Relay-only. */
+    public Builder clearIpTransports(boolean v) {
+      c.clearIpTransports = v;
+      return this;
+    }
+
+    /** Direct-only. */
+    public Builder clearRelayTransports(boolean v) {
+      c.clearRelayTransports = v;
+      return this;
+    }
+
+    /** Enable (default) or disable the UPnP / NAT-PMP / PCP portmapper. */
+    public Builder portmapper(boolean enabled) {
+      c.portmapperConfig = enabled ? "enabled" : "disabled";
+      return this;
+    }
+
+    /** {@code null}, {@code "enabled"} or {@code "disabled"}. */
+    public Builder portmapperConfig(String value) {
+      c.portmapperConfig = value;
+      return this;
+    }
+
+    public Builder proxyUrl(String url) {
+      c.proxyUrl = url;
+      return this;
+    }
+
+    public Builder proxyFromEnv(boolean v) {
+      c.proxyFromEnv = v;
+      return this;
+    }
+
+    public Builder transportMaxConcurrentBidiStreams(Long n) {
+      c.transportMaxConcurrentBidiStreams = n;
+      return this;
+    }
+
+    public Builder transportMaxConcurrentUniStreams(Long n) {
+      c.transportMaxConcurrentUniStreams = n;
+      return this;
+    }
+
+    public Builder transportStreamReceiveWindow(Long bytes) {
+      c.transportStreamReceiveWindow = bytes;
+      return this;
+    }
+
+    public Builder transportReceiveWindow(Long bytes) {
+      c.transportReceiveWindow = bytes;
+      return this;
+    }
+
+    public Builder transportSendWindow(Long bytes) {
+      c.transportSendWindow = bytes;
+      return this;
+    }
+
+    public Builder transportMaxIdleTimeoutMs(Long ms) {
+      c.transportMaxIdleTimeoutMs = ms;
+      return this;
+    }
+
+    public Builder transportKeepAliveIntervalMs(Long ms) {
+      c.transportKeepAliveIntervalMs = ms;
+      return this;
+    }
+
+    public Builder transportInitialMtu(Integer bytes) {
+      c.transportInitialMtu = bytes;
+      return this;
+    }
+
+    public Builder transportDatagramReceiveBufferSize(Long bytes) {
+      c.transportDatagramReceiveBufferSize = bytes;
+      return this;
+    }
+
+    public Builder transportDatagramSendBufferSize(Long bytes) {
+      c.transportDatagramSendBufferSize = bytes;
+      return this;
+    }
+
+    public Builder transportSendFairness(Boolean v) {
+      c.transportSendFairness = v;
+      return this;
+    }
+
+    public Builder transportEnableSegmentationOffload(Boolean v) {
+      c.transportEnableSegmentationOffload = v;
       return this;
     }
 
@@ -309,7 +580,9 @@ public final class AsterConfig {
     }
 
     /**
-     * Apply values from an {@code aster.toml} file. Call before {@link #applyEnv()} so env wins.
+     * Apply the trust / connect / logging values of an {@code aster.toml} file. Call before {@link
+     * #applyEnv()} so env wins. Node knobs ({@code [network]}, {@code [storage]}, {@code
+     * [identity]}) are read by {@link AsterConfig#fromFile} through the Rust config.
      */
     public Builder applyToml(Path path) {
       try {
@@ -334,33 +607,6 @@ public final class AsterConfig {
           tomlString(connect, "endpoint_addr", v -> c.endpointAddr = v);
         }
 
-        // [storage]
-        TomlTable storage = toml.getTable("storage");
-        if (storage != null) {
-          tomlString(storage, "path", v -> c.storagePath = v);
-        }
-
-        // [network]
-        TomlTable network = toml.getTable("network");
-        if (network != null) {
-          tomlString(network, "relay_mode", v -> c.relayMode = v);
-          tomlString(network, "bind_addr", v -> c.bindAddr = v);
-          tomlString(network, "portmapper_config", v -> c.portmapperConfig = v);
-          tomlString(network, "proxy_url", v -> c.proxyUrl = v);
-          tomlBool(network, "enable_monitoring", v -> c.enableMonitoring = v);
-          tomlBool(network, "enable_hooks", v -> c.enableHooks = v);
-          tomlBool(network, "clear_ip_transports", v -> c.clearIpTransports = v);
-          tomlBool(network, "clear_relay_transports", v -> c.clearRelayTransports = v);
-          tomlBool(network, "proxy_from_env", v -> c.proxyFromEnv = v);
-          tomlBool(network, "local_discovery", v -> c.localDiscovery = v);
-          if (network.contains("hook_timeout_ms")) {
-            c.hookTimeoutMs = network.getLong("hook_timeout_ms").intValue();
-          }
-          if (network.contains("secret_key")) {
-            c.secretKey = Base64.getDecoder().decode(network.getString("secret_key"));
-          }
-        }
-
         // [logging]
         TomlTable logging = toml.getTable("logging");
         if (logging != null) {
@@ -375,37 +621,34 @@ public final class AsterConfig {
       return this;
     }
 
-    /** Apply {@code ASTER_*} environment variables (overrides any prior builder calls). */
+    /**
+     * Apply the trust / connect / logging {@code ASTER_*} variables (overrides prior builder
+     * calls). Node knobs ({@code ASTER_RELAY_MODE}, {@code ASTER_BIND_ADDR}, ...) are read by
+     * {@link #applyNodeEnv()} / {@link AsterConfig#fromEnv} through the Rust config.
+     */
     public Builder applyEnv() {
       envString("ASTER_ROOT_PUBKEY_FILE", v -> c.rootPubkeyFile = v);
       envString("ASTER_ENROLLMENT_CREDENTIAL", v -> c.enrollmentCredentialFile = v);
       envString("ASTER_ENROLLMENT_CREDENTIAL_IID", v -> c.enrollmentCredentialIid = v);
       envString("ASTER_ENDPOINT_ADDR", v -> c.endpointAddr = v);
-      envString("ASTER_STORAGE_PATH", v -> c.storagePath = v.isEmpty() ? null : v);
-      envString("ASTER_RELAY_MODE", v -> c.relayMode = v.isEmpty() ? null : v);
-      envString("ASTER_BIND_ADDR", v -> c.bindAddr = v.isEmpty() ? null : v);
-      envString("ASTER_PORTMAPPER_CONFIG", v -> c.portmapperConfig = v.isEmpty() ? null : v);
-      envString("ASTER_PROXY_URL", v -> c.proxyUrl = v.isEmpty() ? null : v);
-      envString("ASTER_IDENTITY_FILE", v -> c.identityFile = v);
       envString("ASTER_LOG_FORMAT", v -> c.logFormat = v.toLowerCase());
       envString("ASTER_LOG_LEVEL", v -> c.logLevel = v.toLowerCase());
 
       envBool("ASTER_ALLOW_ALL_CONSUMERS", v -> c.allowAllConsumers = v);
       envBool("ASTER_ALLOW_ALL_PRODUCERS", v -> c.allowAllProducers = v);
-      envBool("ASTER_ENABLE_MONITORING", v -> c.enableMonitoring = v);
-      envBool("ASTER_ENABLE_HOOKS", v -> c.enableHooks = v);
-      envBool("ASTER_CLEAR_IP_TRANSPORTS", v -> c.clearIpTransports = v);
-      envBool("ASTER_CLEAR_RELAY_TRANSPORTS", v -> c.clearRelayTransports = v);
-      envBool("ASTER_PROXY_FROM_ENV", v -> c.proxyFromEnv = v);
-      envBool("ASTER_LOCAL_DISCOVERY", v -> c.localDiscovery = v);
       envBool("ASTER_LOG_MASK", v -> c.logMask = v);
 
-      envInt("ASTER_HOOK_TIMEOUT_MS", v -> c.hookTimeoutMs = v);
-
       envBytes("ASTER_ROOT_PUBKEY", v -> c.rootPubkey = v);
-      envBase64("ASTER_SECRET_KEY", v -> c.secretKey = v);
 
       return this;
+    }
+
+    /**
+     * Replace every node knob with the values the Rust config resolves from the {@code ASTER_*}
+     * environment ({@code aster_config_from_env}; unset variables give the defaults).
+     */
+    public Builder applyNodeEnv() {
+      return site.aster.ffi.NativeConfig.applyEnv(this);
     }
 
     public AsterConfig build() {
@@ -427,27 +670,10 @@ public final class AsterConfig {
       else if (List.of("false", "0", "no", "off").contains(v)) setter.accept(false);
     }
 
-    private static void envInt(String key, java.util.function.Consumer<Integer> setter) {
-      String v = System.getenv(key);
-      if (v != null) {
-        try {
-          setter.accept(Integer.parseInt(v.trim()));
-        } catch (NumberFormatException ignored) {
-        }
-      }
-    }
-
     private static void envBytes(String key, java.util.function.Consumer<byte[]> setter) {
       String v = System.getenv(key);
       if (v != null && !v.isBlank()) {
         setter.accept(hexToBytes(v.trim()));
-      }
-    }
-
-    private static void envBase64(String key, java.util.function.Consumer<byte[]> setter) {
-      String v = System.getenv(key);
-      if (v != null && !v.isBlank()) {
-        setter.accept(Base64.getDecoder().decode(v.trim()));
       }
     }
 

@@ -310,6 +310,7 @@ name = "aster-transport-napi"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "aster",
  "aster_transport_core",
  "hex",
  "napi",
@@ -317,6 +318,7 @@ dependencies = [
  "napi-derive",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -351,6 +353,7 @@ dependencies = [
 name = "aster_rs"
 version = "0.3.0"
 dependencies = [
+ "aster",
  "aster_transport_core",
  "blake3",
  "ed25519-dalek 3.0.0-rc.0",
@@ -405,6 +408,7 @@ name = "aster_transport_ffi"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "aster",
  "aster_transport_core",
  "base64 0.22.1",
  "criterion",
@@ -3584,6 +3588,8 @@ dependencies = [
  "napi-sys",
  "nohash-hasher",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

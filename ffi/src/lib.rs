@@ -23,6 +23,7 @@ use aster_transport_core::*;
 pub mod call;
 pub mod envelope;
 mod layout;
+pub mod node;
 pub mod probe;
 pub mod reactor;
 
@@ -44,7 +45,7 @@ pub mod reactor;
 //   zstd payload compression (`aster_zstd_maybe_compress`,
 //   `aster_zstd_decompress`); see `envelope.rs`.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 3;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 1;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 2;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -380,20 +381,23 @@ fn get_last_error() -> *const c_char {
 // ============================================================================
 
 pub(crate) struct HandleRegistry<T> {
-    next_id: AtomicU64,
     items: RwLock<HashMap<u64, Arc<T>>>,
 }
+
+/// One id space for every handle registry, so a node handle can never equal an
+/// endpoint (or any other) handle. Functions that accept "endpoint or node"
+/// (`aster_connect`, `aster_accept`, remote info, transport metrics) rely on it.
+static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl<T> HandleRegistry<T> {
     pub(crate) fn new() -> Self {
         Self {
-            next_id: AtomicU64::new(1),
             items: RwLock::new(HashMap::new()),
         }
     }
 
     pub(crate) fn insert(&self, value: T) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
         let arc = Arc::new(value);
         self.items.write().unwrap().insert(id, arc);
         id
@@ -581,6 +585,10 @@ pub(crate) struct BridgeRuntime {
     // Hook invocation registry (Phase 1b)
     hook_invocations: HandleRegistry<HookInvocationState>,
 
+    // ABI 3.2: Gate-0 policies and the gate slot of each hooked node.
+    gates: HandleRegistry<node::GateEntry>,
+    node_gates: node::NodeGates,
+
     // Doc event receiver registry (Phase 1c.4)
     doc_event_receivers: HandleRegistry<aster_transport_core::CoreDocEventReceiver>,
 
@@ -656,6 +664,8 @@ impl BridgeRuntime {
             gossip_topics: HandleRegistry::new(),
             operations: HandleRegistry::new(),
             hook_invocations: HandleRegistry::new(),
+            gates: HandleRegistry::new(),
+            node_gates: Mutex::new(HashMap::new()),
             doc_event_receivers: HandleRegistry::new(),
             buffers: BufferRegistry::new(),
             endpoint_secret_keys: Mutex::new(HashMap::new()),
@@ -1283,6 +1293,10 @@ pub extern "C" fn aster_status_name(status: i32) -> *const c_char {
 // C FFI Functions - Node
 // ============================================================================
 
+/// Create an in-memory node with default endpoint settings.
+///
+/// **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
+/// `aster_config_t`.
 #[no_mangle]
 pub unsafe extern "C" fn aster_node_memory(
     runtime: aster_runtime_t,
@@ -1331,6 +1345,10 @@ pub unsafe extern "C" fn aster_node_memory(
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
+/// Create a persistent node at `path` with default endpoint settings.
+///
+/// **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
+/// `aster_config_t`.
 #[no_mangle]
 pub unsafe extern "C" fn aster_node_persistent(
     runtime: aster_runtime_t,
@@ -1418,6 +1436,7 @@ pub unsafe extern "C" fn aster_node_close(
         }
 
         node_arc.close().await;
+        node::forget_node(&bridge2, node);
         bridge2.nodes.remove(node);
         bridge2.emit_simple(
             aster_event_kind_t::ASTER_EVENT_CLOSED,
@@ -1496,67 +1515,7 @@ pub unsafe extern "C" fn aster_node_addr_info(
     };
 
     let addr = node_arc.node_addr_info();
-
-    // Pack into scratch buffer: endpoint_id, relay_url, direct_addresses
-    let mut offset = 0;
-
-    // endpoint_id
-    if offset + addr.endpoint_id.len() + 1 > buf_capacity {
-        return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
-    }
-    let ep_id_offset = offset;
-    unsafe {
-        ptr::copy_nonoverlapping(
-            addr.endpoint_id.as_ptr(),
-            out_buf.add(offset),
-            addr.endpoint_id.len(),
-        );
-    }
-    offset += addr.endpoint_id.len();
-    unsafe {
-        *out_buf.add(offset) = 0;
-    }
-    offset += 1;
-
-    // relay_url
-    let relay_offset = if let Some(ref url) = addr.relay_url {
-        if offset + url.len() + 1 > buf_capacity {
-            return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
-        }
-        let rel_off = offset;
-        unsafe {
-            ptr::copy_nonoverlapping(url.as_ptr(), out_buf.add(offset), url.len());
-        }
-        offset += url.len();
-        unsafe {
-            *out_buf.add(offset) = 0;
-        }
-        Some(rel_off)
-    } else {
-        unsafe {
-            *out_buf.add(offset) = 0;
-        }
-        None
-    };
-
-    *out_addr = aster_node_addr_t {
-        endpoint_id: aster_bytes_t {
-            ptr: unsafe { out_buf.add(ep_id_offset) },
-            len: addr.endpoint_id.len(),
-        },
-        relay_url: aster_bytes_t {
-            ptr: relay_offset
-                .map(|o| unsafe { out_buf.add(o) })
-                .unwrap_or(ptr::null_mut()),
-            len: addr.relay_url.as_ref().map(|s| s.len()).unwrap_or(0),
-        },
-        direct_addresses: aster_bytes_list_t {
-            items: ptr::null(),
-            len: 0,
-        },
-    };
-
-    aster_status_t::ASTER_STATUS_OK as i32
+    pack_node_addr(&addr, out_buf, buf_capacity, out_addr)
 }
 
 #[no_mangle]
@@ -1599,10 +1558,145 @@ pub unsafe extern "C" fn aster_node_export_secret_key(
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
+/// Pack `addr` into the caller's scratch buffer and point `*out_addr` into it:
+/// NUL-terminated endpoint id, relay URL and direct addresses, then an aligned
+/// `aster_bytes_t` array for the direct addresses. Shared by
+/// `aster_node_addr_info` and `aster_endpoint_addr_info`.
+unsafe fn pack_node_addr(
+    addr: &CoreNodeAddr,
+    out_buf: *mut u8,
+    buf_capacity: usize,
+    out_addr: *mut aster_node_addr_t,
+) -> i32 {
+    if out_buf.is_null() {
+        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
+    }
+
+    // Pack into scratch buffer: endpoint_id, relay_url, direct_addresses
+    let mut offset = 0;
+
+    // endpoint_id
+    if offset + addr.endpoint_id.len() + 1 > buf_capacity {
+        return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
+    }
+    let ep_id_offset = offset;
+    unsafe {
+        ptr::copy_nonoverlapping(
+            addr.endpoint_id.as_ptr(),
+            out_buf.add(offset),
+            addr.endpoint_id.len(),
+        );
+    }
+    offset += addr.endpoint_id.len();
+    unsafe {
+        *out_buf.add(offset) = 0;
+    }
+    offset += 1;
+
+    // relay_url
+    let relay_offset = if let Some(ref url) = addr.relay_url {
+        if offset + url.len() + 1 > buf_capacity {
+            return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
+        }
+        let rel_off = offset;
+        unsafe {
+            ptr::copy_nonoverlapping(url.as_ptr(), out_buf.add(offset), url.len());
+        }
+        offset += url.len();
+        unsafe {
+            *out_buf.add(offset) = 0;
+        }
+        offset += 1;
+        Some(rel_off)
+    } else {
+        unsafe {
+            *out_buf.add(offset) = 0;
+        }
+        offset += 1;
+        None
+    };
+
+    // direct_addresses - pack as additional null-terminated strings
+    let mut addr_offsets = Vec::new();
+    for direct_addr in &addr.direct_addresses {
+        if offset + direct_addr.len() + 1 > buf_capacity {
+            return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
+        }
+        let addr_off = offset;
+        unsafe {
+            ptr::copy_nonoverlapping(direct_addr.as_ptr(), out_buf.add(offset), direct_addr.len());
+        }
+        offset += direct_addr.len();
+        unsafe {
+            *out_buf.add(offset) = 0;
+        }
+        offset += 1;
+        addr_offsets.push(addr_off);
+    }
+
+    // Create the bytes list for direct addresses
+    let direct_addrs_ptr: *const aster_bytes_t = if addr_offsets.is_empty() {
+        ptr::null()
+    } else {
+        // Allocate space for the list at the end, aligned for `aster_bytes_t`
+        // (the packed strings before it leave `offset` at an arbitrary byte
+        // boundary; writing the structs there unaligned is UB).
+        let pad = out_buf
+            .wrapping_add(offset)
+            .align_offset(std::mem::align_of::<aster_bytes_t>());
+        let list_offset = offset.saturating_add(pad);
+        offset =
+            list_offset.saturating_add(addr_offsets.len() * std::mem::size_of::<aster_bytes_t>());
+        if offset > buf_capacity {
+            return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
+        }
+
+        for (i, &addr_off) in addr_offsets.iter().enumerate() {
+            let item_ptr = unsafe {
+                out_buf
+                    .add(list_offset)
+                    .add(i * std::mem::size_of::<aster_bytes_t>())
+                    as *mut aster_bytes_t
+            };
+            let addr_len = addr.direct_addresses[i].len();
+            unsafe {
+                *item_ptr = aster_bytes_t {
+                    ptr: out_buf.add(addr_off),
+                    len: addr_len,
+                };
+            }
+        }
+        unsafe { out_buf.add(list_offset) as *const aster_bytes_t }
+    };
+
+    *out_addr = aster_node_addr_t {
+        endpoint_id: aster_bytes_t {
+            ptr: unsafe { out_buf.add(ep_id_offset) },
+            len: addr.endpoint_id.len(),
+        },
+        relay_url: aster_bytes_t {
+            ptr: relay_offset
+                .map(|o| unsafe { out_buf.add(o) })
+                .unwrap_or(ptr::null_mut()),
+            len: addr.relay_url.as_ref().map(|s| s.len()).unwrap_or(0),
+        },
+        direct_addresses: aster_bytes_list_t {
+            items: direct_addrs_ptr,
+            len: addr.direct_addresses.len(),
+        },
+    };
+
+    aster_status_t::ASTER_STATUS_OK as i32
+}
+
 // ============================================================================
 // C FFI Functions - Endpoint
 // ============================================================================
 
+/// Create a bare endpoint (no blobs/docs/gossip).
+///
+/// **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start`; a node
+/// covers every endpoint use (connect, accept, hooks, metrics).
 #[no_mangle]
 pub unsafe extern "C" fn aster_endpoint_create(
     runtime: aster_runtime_t,
@@ -1731,62 +1825,9 @@ pub unsafe extern "C" fn aster_endpoint_create(
                     0,
                 );
 
-                // Spawn background tasks to drain hook events and emit them to the queue.
+                // Drain hook events onto the completion queue.
                 if let Some(receiver) = hook_receiver {
-                    let CoreHookReceiver {
-                        before_connect_rx,
-                        after_handshake_rx,
-                    } = receiver;
-
-                    // before_connect drainer
-                    let bridge3 = bridge2.clone();
-                    tokio::spawn(async move {
-                        let mut rx = before_connect_rx;
-                        while let Some((info, reply_tx)) = rx.recv().await {
-                            let state = HookInvocationState {
-                                sender: std::sync::Mutex::new(Some(HookSender::BeforeConnect(
-                                    reply_tx,
-                                ))),
-                            };
-                            let invocation_id = bridge3.hook_invocations.insert(state);
-                            let payload = encode_hook_connect_payload(&info);
-                            let event = EventInternal::new(
-                                aster_event_kind_t::ASTER_EVENT_HOOK_BEFORE_CONNECT,
-                                aster_status_t::ASTER_STATUS_OK,
-                                0,
-                                handle,
-                                invocation_id,
-                                user_data,
-                                0,
-                            );
-                            bridge3.emit_with_data(event, payload);
-                        }
-                    });
-
-                    // after_handshake drainer
-                    let bridge4 = bridge2.clone();
-                    tokio::spawn(async move {
-                        let mut rx = after_handshake_rx;
-                        while let Some((info, reply_tx)) = rx.recv().await {
-                            let state = HookInvocationState {
-                                sender: std::sync::Mutex::new(Some(HookSender::AfterConnect(
-                                    reply_tx,
-                                ))),
-                            };
-                            let invocation_id = bridge4.hook_invocations.insert(state);
-                            let payload = encode_hook_handshake_payload(&info);
-                            let event = EventInternal::new(
-                                aster_event_kind_t::ASTER_EVENT_HOOK_AFTER_CONNECT,
-                                aster_status_t::ASTER_STATUS_OK,
-                                0,
-                                handle,
-                                invocation_id,
-                                user_data,
-                                0,
-                            );
-                            bridge4.emit_with_data(event, payload);
-                        }
-                    });
+                    node::spawn_hook_drainers(&bridge2, handle, user_data, receiver, None);
                 }
             }
             Err(e) => {
@@ -1963,122 +2004,7 @@ pub unsafe extern "C" fn aster_endpoint_addr_info(
     };
 
     let addr = ep_arc.endpoint_addr_info();
-
-    // Pack into scratch buffer: endpoint_id, relay_url, direct_addresses
-    let mut offset = 0;
-
-    // endpoint_id
-    if offset + addr.endpoint_id.len() + 1 > buf_capacity {
-        return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
-    }
-    let ep_id_offset = offset;
-    unsafe {
-        ptr::copy_nonoverlapping(
-            addr.endpoint_id.as_ptr(),
-            out_buf.add(offset),
-            addr.endpoint_id.len(),
-        );
-    }
-    offset += addr.endpoint_id.len();
-    unsafe {
-        *out_buf.add(offset) = 0;
-    }
-    offset += 1;
-
-    // relay_url
-    let relay_offset = if let Some(ref url) = addr.relay_url {
-        if offset + url.len() + 1 > buf_capacity {
-            return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
-        }
-        let rel_off = offset;
-        unsafe {
-            ptr::copy_nonoverlapping(url.as_ptr(), out_buf.add(offset), url.len());
-        }
-        offset += url.len();
-        unsafe {
-            *out_buf.add(offset) = 0;
-        }
-        offset += 1;
-        Some(rel_off)
-    } else {
-        unsafe {
-            *out_buf.add(offset) = 0;
-        }
-        offset += 1;
-        None
-    };
-
-    // direct_addresses - pack as additional null-terminated strings
-    let mut addr_offsets = Vec::new();
-    for direct_addr in &addr.direct_addresses {
-        if offset + direct_addr.len() + 1 > buf_capacity {
-            return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
-        }
-        let addr_off = offset;
-        unsafe {
-            ptr::copy_nonoverlapping(direct_addr.as_ptr(), out_buf.add(offset), direct_addr.len());
-        }
-        offset += direct_addr.len();
-        unsafe {
-            *out_buf.add(offset) = 0;
-        }
-        offset += 1;
-        addr_offsets.push(addr_off);
-    }
-
-    // Create the bytes list for direct addresses
-    let direct_addrs_ptr: *const aster_bytes_t = if addr_offsets.is_empty() {
-        ptr::null()
-    } else {
-        // Allocate space for the list at the end, aligned for `aster_bytes_t`
-        // (the packed strings before it leave `offset` at an arbitrary byte
-        // boundary; writing the structs there unaligned is UB).
-        let pad = out_buf
-            .wrapping_add(offset)
-            .align_offset(std::mem::align_of::<aster_bytes_t>());
-        let list_offset = offset.saturating_add(pad);
-        offset =
-            list_offset.saturating_add(addr_offsets.len() * std::mem::size_of::<aster_bytes_t>());
-        if offset > buf_capacity {
-            return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
-        }
-
-        for (i, &addr_off) in addr_offsets.iter().enumerate() {
-            let item_ptr = unsafe {
-                out_buf
-                    .add(list_offset)
-                    .add(i * std::mem::size_of::<aster_bytes_t>())
-                    as *mut aster_bytes_t
-            };
-            let addr_len = addr.direct_addresses[i].len();
-            unsafe {
-                *item_ptr = aster_bytes_t {
-                    ptr: out_buf.add(addr_off),
-                    len: addr_len,
-                };
-            }
-        }
-        unsafe { out_buf.add(list_offset) as *const aster_bytes_t }
-    };
-
-    *out_addr = aster_node_addr_t {
-        endpoint_id: aster_bytes_t {
-            ptr: unsafe { out_buf.add(ep_id_offset) },
-            len: addr.endpoint_id.len(),
-        },
-        relay_url: aster_bytes_t {
-            ptr: relay_offset
-                .map(|o| unsafe { out_buf.add(o) })
-                .unwrap_or(ptr::null_mut()),
-            len: addr.relay_url.as_ref().map(|s| s.len()).unwrap_or(0),
-        },
-        direct_addresses: aster_bytes_list_t {
-            items: direct_addrs_ptr,
-            len: addr.direct_addresses.len(),
-        },
-    };
-
-    aster_status_t::ASTER_STATUS_OK as i32
+    pack_node_addr(&addr, out_buf, buf_capacity, out_addr)
 }
 
 #[no_mangle]
@@ -2293,6 +2219,9 @@ pub unsafe extern "C" fn aster_accept(
 
 /// Create an in-memory node with blobs/docs/gossip + custom aster ALPNs.
 /// Emits ASTER_EVENT_NODE_CREATED on success.
+///
+/// **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
+/// `aster_config_t`.
 #[no_mangle]
 pub unsafe extern "C" fn aster_node_memory_with_alpns(
     runtime: aster_runtime_t,
@@ -3387,6 +3316,7 @@ pub unsafe extern "C" fn aster_node_free(runtime: aster_runtime_t, node: aster_n
         Err(s) => return s as i32,
     };
 
+    node::forget_node(&bridge, node);
     if bridge.nodes.remove(node).is_some() {
         aster_status_t::ASTER_STATUS_OK as i32
     } else {
@@ -6464,6 +6394,7 @@ pub unsafe extern "C" fn aster_hook_before_connect_respond(
 }
 
 /// Respond to a pending after_connect hook invocation (always accepts).
+/// `aster_admission_respond` can also reject with a code and reason.
 ///
 /// Calling this consumes the invocation; a second call returns NOT_FOUND.
 #[no_mangle]

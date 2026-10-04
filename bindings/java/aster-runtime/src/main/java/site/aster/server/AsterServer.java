@@ -987,12 +987,9 @@ public final class AsterServer implements AutoCloseable {
     public CompletableFuture<AsterServer> build() {
       List<byte[]> alpnBytes = alpns.stream().map(s -> s.getBytes(StandardCharsets.UTF_8)).toList();
 
-      CompletableFuture<IrohNode> nodeFuture;
-      if (config != null && config.storagePath() != null && !config.storagePath().isBlank()) {
-        nodeFuture = IrohNode.persistentWithAlpns(config.storagePath(), alpnBytes);
-      } else {
-        nodeFuture = IrohNode.memoryWithAlpns(alpnBytes);
-      }
+      // aster_node_start with the full config: relay mode, bind address, secret key / key
+      // file, storage, transports (ABI 3.2). The RPC + admission ALPNs are added on top.
+      CompletableFuture<IrohNode> nodeFuture = IrohNode.start(config, alpnBytes, null);
 
       Builder self = this;
       return nodeFuture

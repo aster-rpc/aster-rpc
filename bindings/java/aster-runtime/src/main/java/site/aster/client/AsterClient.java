@@ -66,6 +66,9 @@ public final class AsterClient implements AutoCloseable {
    */
   private final Map<String, NodeAddr> admittedRpcAddr = new ConcurrentHashMap<>();
 
+  /** False: dial {@code aster/1} directly, without the consumer-admission handshake. */
+  private final boolean consumerAdmission;
+
   private AsterClient(Builder b, IrohEndpoint endpoint) {
     this.endpoint = endpoint;
     this.codec = b.codec != null ? b.codec : new ForyCodec();
@@ -74,6 +77,7 @@ public final class AsterClient implements AutoCloseable {
     this.admissionCredentialJson =
         b.admissionCredentialJson == null ? "" : b.admissionCredentialJson;
     this.admissionIidToken = b.admissionIidToken == null ? "" : b.admissionIidToken;
+    this.consumerAdmission = b.consumerAdmission;
   }
 
   /** The underlying endpoint's node id (hex). */
@@ -133,6 +137,9 @@ public final class AsterClient implements AutoCloseable {
    * {@link StatusCode#PERMISSION_DENIED}.
    */
   CompletableFuture<NodeAddr> admit(NodeAddr target) {
+    if (!consumerAdmission) {
+      return CompletableFuture.completedFuture(target);
+    }
     String targetKey = target.endpointId();
     NodeAddr cached = admittedRpcAddr.get(targetKey);
     if (cached != null) {
@@ -613,8 +620,19 @@ public final class AsterClient implements AutoCloseable {
     private byte[] secretKey;
     String admissionCredentialJson = "";
     String admissionIidToken = "";
+    boolean consumerAdmission = true;
 
     private Builder() {}
+
+    /**
+     * Whether to run the {@code aster.consumer_admission} handshake before the first call to a peer
+     * (default true). Set false to dial {@code aster/1} directly — e.g. an open-gate Rust {@code
+     * AsterServer}, which serves no consumer-admission ALPN.
+     */
+    public Builder consumerAdmission(boolean enabled) {
+      this.consumerAdmission = enabled;
+      return this;
+    }
 
     public Builder config(AsterConfig config) {
       this.config = config;
@@ -680,16 +698,30 @@ public final class AsterClient implements AutoCloseable {
       return this;
     }
 
+    /**
+     * Start the client's node ({@code aster_node_start}) from {@link #config} — relay mode, bind
+     * address, secret key / key file, transports — and build the client on it.
+     */
     public CompletableFuture<AsterClient> build() {
       site.aster.handle.IrohRuntime runtime = site.aster.handle.IrohRuntime.create();
-      site.aster.config.EndpointConfig endpointConfig =
-          new site.aster.config.EndpointConfig()
-              .alpns(List.of(AsterServer.ASTER_ALPN, ConsumerAdmissionHandler.ALPN_STRING));
-      if (secretKey != null && secretKey.length > 0) {
-        endpointConfig.secretKey(secretKey);
-      }
+      AsterConfig nodeConfig = config;
+      byte[] key = secretKey != null && secretKey.length > 0 ? secretKey : null;
+      List<byte[]> alpns =
+          List.of(
+              AsterServer.ASTER_ALPN.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+              ConsumerAdmissionHandler.ALPN_STRING.getBytes(
+                  java.nio.charset.StandardCharsets.UTF_8));
       Builder self = this;
-      return runtime.endpointCreateAsync(endpointConfig).thenApply(ep -> new AsterClient(self, ep));
+      return CompletableFuture.supplyAsync(
+          () -> {
+            try {
+              long node = site.aster.ffi.NativeConfig.startNode(runtime, nodeConfig, alpns, 0, key);
+              return new AsterClient(self, site.aster.handle.IrohEndpoint.ofNode(runtime, node));
+            } catch (RuntimeException e) {
+              runtime.close();
+              throw e;
+            }
+          });
     }
   }
 }

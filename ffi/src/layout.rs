@@ -13,6 +13,7 @@
 use core::mem::{align_of, offset_of, size_of};
 
 use crate::envelope::{aster_call_header_t, aster_rpc_status_t, aster_stream_header_t};
+use crate::node::{aster_config_t, aster_portmapper_t, aster_trust_mode_t};
 use crate::reactor::aster_reactor_call_t;
 use crate::*;
 
@@ -41,6 +42,8 @@ const _: () = assert!(size_of::<aster_doc_share_mode_t>() == 4);
 const _: () = assert!(size_of::<aster_registry_key_kind_t>() == 4);
 const _: () = assert!(size_of::<aster_doc_query_mode_t>() == 4);
 const _: () = assert!(size_of::<aster_download_policy_mode_t>() == 4);
+const _: () = assert!(size_of::<aster_trust_mode_t>() == 4);
+const _: () = assert!(size_of::<aster_portmapper_t>() == 4);
 
 #[cfg(target_pointer_width = "64")]
 mod lp64 {
@@ -210,5 +213,43 @@ mod lp64 {
         detail_keys = 24,
         detail_values = 40,
         storage = 56,
+    });
+
+    // ABI 3.2: node configuration (node.rs).
+    assert_layout!(aster_config_t, size = 280, align = 8, {
+        struct_size = 0,
+        relay_mode = 4,
+        relay_urls = 8,
+        secret_key = 24,
+        secret_key_file = 40,
+        storage_path = 56,
+        gc_interval_ms = 72,
+        bind_addr = 80,
+        alpns = 96,
+        identity_file = 112,
+        proxy_url = 128,
+        hook_timeout_ms = 144,
+        hook_failure_mode = 152,
+        enable_hooks = 156,
+        enable_monitoring = 160,
+        local_discovery = 164,
+        clear_ip_transports = 168,
+        clear_relay_transports = 172,
+        portmapper = 176,
+        proxy_from_env = 180,
+        transport_set = 184,
+        transport_initial_mtu = 188,
+        transport_send_fairness = 192,
+        transport_enable_segmentation_offload = 196,
+        transport_max_concurrent_bidi_streams = 200,
+        transport_max_concurrent_uni_streams = 208,
+        transport_stream_receive_window = 216,
+        transport_receive_window = 224,
+        transport_send_window = 232,
+        transport_max_idle_timeout_ms = 240,
+        transport_keep_alive_interval_ms = 248,
+        transport_datagram_receive_buffer_size = 256,
+        transport_datagram_send_buffer_size = 264,
+        storage = 272,
     });
 }

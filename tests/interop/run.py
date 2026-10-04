@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript, open gate, unary + streaming.
+"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript x Java, open gate, unary + streaming.
 
-Builds what is needed, checks that all three languages derive the same
+Builds what is needed, checks that all languages derive the same
 ``contract_id`` for the shared ``InteropEcho`` contract, then runs every
 server x client cell (same-language cells included) and prints a matrix.
 
 Usage (from anywhere)::
 
-    python3 tests/interop/run.py                 # build Rust example + TS dist/codegen, run matrix
+    python3 tests/interop/run.py                 # build Rust example + FFI lib + Java + TS dist/codegen, run matrix
     python3 tests/interop/run.py --native        # also rebuild the Python + TS native modules
     python3 tests/interop/run.py --no-build      # just run
     python3 tests/interop/run.py --servers rust --clients python,ts
 
 Cargo goes through ``$ASTER_CARGO_LAUNCHER`` when set (e.g. the Kache
-launcher). Needs: cargo, uv (with the Python extension built), bun, node.
+launcher). Needs: cargo, uv (with the Python extension built), bun, node,
+mvn + java 22+ (Java runs ``java/InteropEcho.java`` against
+``libaster_transport_ffi`` via ``IROH_LIB_PATH``).
 Everything is loopback-only with relays disabled, so it works offline.
 Exit status is non-zero if any contract id disagrees or any cell fails.
 """
@@ -24,6 +26,7 @@ import argparse
 import os
 import queue
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -34,7 +37,13 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 TS_DIR = HERE / "ts"
 TS_PKG = REPO / "bindings/typescript/packages/aster"
-LANGS = ("rust", "python", "ts")
+JAVA_DIR = REPO / "bindings/java"
+LANGS = ("rust", "python", "ts", "java")
+# Java joins the default matrix only where a JDK and Maven are installed (the
+# Forgejo runner has neither); name it in --servers/--clients to require it.
+DEFAULT_LANGS = tuple(
+    lang for lang in LANGS if lang != "java" or (shutil.which("java") and shutil.which("mvn"))
+)
 
 ENV = {
     **os.environ,
@@ -45,9 +54,40 @@ ENV = {
 }
 
 
+def target_dir() -> Path:
+    return Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target"))
+
+
 def rust_bin() -> Path:
-    target = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target"))
-    return target / "debug/examples/interop_echo"
+    return target_dir() / "debug/examples/interop_echo"
+
+
+def ffi_lib() -> Path:
+    name = "libaster_transport_ffi.dylib" if sys.platform == "darwin" else "libaster_transport_ffi.so"
+    return target_dir() / "debug" / name
+
+
+# The Java leg loads the freshly built debug FFI library explicitly (the Java
+# loader would otherwise prefer a possibly stale target/release copy).
+ENV["IROH_LIB_PATH"] = str(ffi_lib())
+
+_java_cp: str | None = None
+
+
+def java_classpath() -> str:
+    """aster-runtime classes + their Maven dependencies."""
+    global _java_cp
+    if _java_cp is None:
+        out = HERE / ".java-classpath.txt"
+        subprocess.run(
+            ["mvn", "-o", "-q", "-pl", "aster-runtime", "dependency:build-classpath",
+             f"-Dmdep.outputFile={out}"],
+            cwd=JAVA_DIR, env=ENV, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deps = [p for p in out.read_text().strip().split(":") if p and "/site/aster/" not in p]
+        local = [str(JAVA_DIR / m / "target/classes") for m in ("aster-runtime", "aster-annotations")]
+        _java_cp = ":".join(local + deps)
+    return _java_cp
 
 
 def command(lang: str, *args: str) -> tuple[list[str], Path]:
@@ -57,6 +97,9 @@ def command(lang: str, *args: str) -> tuple[list[str], Path]:
         return ["uv", "run", "--no-sync", "python", str(HERE / "python/interop_echo.py"), *args], REPO
     if lang == "ts":
         return ["bun", "run", "interop_echo.ts", *args], TS_DIR
+    if lang == "java":
+        return ["java", "--enable-native-access=ALL-UNNAMED", "-cp", java_classpath(),
+                str(HERE / "java/InteropEcho.java"), *args], REPO
     raise ValueError(lang)
 
 
@@ -67,7 +110,7 @@ def run_step(desc: str, cmd: list[str], cwd: Path) -> None:
         sys.exit(f"[build] {desc} failed (exit {res.returncode})")
 
 
-def build(native: bool) -> None:
+def build(native: bool, langs: set[str]) -> None:
     launcher = shlex.split(os.environ.get("ASTER_CARGO_LAUNCHER", ""))
     if native:
         run_step("python native", [*launcher, "./scripts/build.sh"], REPO)
@@ -77,6 +120,10 @@ def build(native: bool) -> None:
         [*launcher, "cargo", "build", "-p", "aster", "--features", "rpc", "--example", "interop_echo"],
         REPO,
     )
+    if "java" in langs:
+        run_step("ffi cdylib", [*launcher, "cargo", "build", "-p", "aster_transport_ffi", "--lib"], REPO)
+        run_step("java aster-runtime", ["mvn", "-B", "-q", "-o", "-pl", "aster-runtime", "-am", "compile"],
+                 JAVA_DIR)
     run_step("ts package (tsc)", ["bun", "run", "build"], TS_PKG)
     run_step(
         "ts aster-gen",
@@ -155,14 +202,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-build", action="store_true", help="skip all build steps")
     ap.add_argument("--native", action="store_true", help="also rebuild the Python and TS native modules")
-    ap.add_argument("--servers", default=",".join(LANGS))
-    ap.add_argument("--clients", default=",".join(LANGS))
+    ap.add_argument("--servers", default=",".join(DEFAULT_LANGS))
+    ap.add_argument("--clients", default=",".join(DEFAULT_LANGS))
     args = ap.parse_args()
     servers = [s for s in args.servers.split(",") if s]
     clients = [c for c in args.clients.split(",") if c]
+    if "java" not in DEFAULT_LANGS:
+        print("[note] java/mvn not on PATH: Java leg skipped by default", flush=True)
 
     if not args.no_build:
-        build(args.native)
+        build(args.native, set(servers) | set(clients))
 
     failed = False
     ids = contract_ids(sorted(set(servers) | set(clients), key=LANGS.index))

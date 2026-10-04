@@ -55,7 +55,7 @@ packages = {
 # in lockstep with the package versions stamped above; Cargo uses the path in a
 # checkout and the version from the target registry in a published `.crate`.
 versioned_path_dependencies = {
-    "ffi/Cargo.toml": ["aster_transport_core"],
+    "ffi/Cargo.toml": ["aster", "aster_transport_core"],
     "aster/Cargo.toml": ["aster_transport_core", "aster-expose", "aster-macros"],
     "aster-expose/Cargo.toml": ["aster_transport_core"],
     "aster-transport-salvo/Cargo.toml": ["aster", "aster_transport_core"],

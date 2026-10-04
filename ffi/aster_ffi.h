@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 3
 
-#define ASTER_ABI_VERSION_MINOR 1
+#define ASTER_ABI_VERSION_MINOR 2
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -78,6 +78,35 @@
  * Envelope format version (second byte of every envelope).
  */
 #define ASTER_ENVELOPE_VERSION 1
+
+#define ASTER_TRANSPORT_MAX_CONCURRENT_BIDI_STREAMS (1 << 0)
+
+#define ASTER_TRANSPORT_MAX_CONCURRENT_UNI_STREAMS (1 << 1)
+
+#define ASTER_TRANSPORT_STREAM_RECEIVE_WINDOW (1 << 2)
+
+#define ASTER_TRANSPORT_RECEIVE_WINDOW (1 << 3)
+
+#define ASTER_TRANSPORT_SEND_WINDOW (1 << 4)
+
+#define ASTER_TRANSPORT_MAX_IDLE_TIMEOUT_MS (1 << 5)
+
+#define ASTER_TRANSPORT_KEEP_ALIVE_INTERVAL_MS (1 << 6)
+
+#define ASTER_TRANSPORT_INITIAL_MTU (1 << 7)
+
+#define ASTER_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_SIZE (1 << 8)
+
+#define ASTER_TRANSPORT_DATAGRAM_SEND_BUFFER_SIZE (1 << 9)
+
+#define ASTER_TRANSPORT_SEND_FAIRNESS (1 << 10)
+
+#define ASTER_TRANSPORT_ENABLE_SEGMENTATION_OFFLOAD (1 << 11)
+
+/**
+ * Every defined `ASTER_TRANSPORT_*` bit. Other bits are rejected.
+ */
+#define ASTER_TRANSPORT_ALL ((1 << 12) - 1)
 
 /**
  * Event-kind discriminator for `aster_reactor_call_t` (spec §7.5).
@@ -340,6 +369,32 @@ typedef enum aster_registry_key_kind_t {
    */
   ASTER_REGISTRY_KEY_ACL = 5,
 } aster_registry_key_kind_t;
+
+/**
+ * Gate-0 trust posture (`aster_gate_set_trust_mode`).
+ */
+typedef enum aster_trust_mode_t {
+  /**
+   * Unknown peers may use only the admission ALPNs (default).
+   */
+  ASTER_TRUST_MODE_PROTECTED = 0,
+  /**
+   * Local/dev: unknown peers may use any ALPN.
+   */
+  ASTER_TRUST_MODE_OPEN_DEV = 1,
+} aster_trust_mode_t;
+
+/**
+ * `aster_config_t.portmapper`.
+ */
+typedef enum aster_portmapper_t {
+  /**
+   * Not set: the transport default (enabled).
+   */
+  ASTER_PORTMAPPER_DEFAULT = 0,
+  ASTER_PORTMAPPER_ENABLED = 1,
+  ASTER_PORTMAPPER_DISABLED = 2,
+} aster_portmapper_t;
 
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
@@ -621,6 +676,129 @@ typedef struct aster_rpc_status_t {
   void *storage;
 } aster_rpc_status_t;
 
+/**
+ * Node configuration: every knob of `aster::AsterConfig` that a node uses
+ * (docs/aster-rust-getstarted.md §2.2). Start from `aster_config_init` (or
+ * `aster_config_from_env` / `aster_config_from_toml`), then set fields. See
+ * the module docs for ownership.
+ */
+typedef struct aster_config_t {
+  /**
+   * `sizeof(aster_config_t)`; checked by every function that reads it.
+   */
+  uint32_t struct_size;
+  /**
+   * One of `aster_relay_mode_t`. `ASTER_RELAY_MODE_CUSTOM` needs
+   * `relay_urls`; non-empty `relay_urls` with `DEFAULT` selects `CUSTOM`.
+   */
+  uint32_t relay_mode;
+  /**
+   * Relay URLs (UTF-8) for `ASTER_RELAY_MODE_CUSTOM`.
+   */
+  struct aster_bytes_list_t relay_urls;
+  /**
+   * Inline secret key: exactly 32 raw bytes, or empty for none.
+   */
+  struct aster_bytes_t secret_key;
+  /**
+   * Secret key file (64 hex chars): loaded if it exists, else created from
+   * `secret_key` or a fresh key (mode 0600) at start.
+   */
+  struct aster_bytes_t secret_key_file;
+  /**
+   * Persistent data directory; empty = in-memory node.
+   */
+  struct aster_bytes_t storage_path;
+  /**
+   * Blob GC interval in ms; 0 = no GC.
+   */
+  uint64_t gc_interval_ms;
+  /**
+   * Local bind address, e.g. `127.0.0.1:0`; empty = transport default.
+   */
+  struct aster_bytes_t bind_addr;
+  /**
+   * Extra inbound ALPNs (e.g. `aster/1`) next to blobs/docs/gossip.
+   */
+  struct aster_bytes_list_t alpns;
+  /**
+   * `.aster-identity` credential file (carried for round-trips; not used
+   * by `aster_node_start`).
+   */
+  struct aster_bytes_t identity_file;
+  /**
+   * HTTP/SOCKS proxy URL; empty = none.
+   */
+  struct aster_bytes_t proxy_url;
+  /**
+   * Admission hook timeout in ms; 0 = default (5000).
+   */
+  uint64_t hook_timeout_ms;
+  /**
+   * One of `aster_hook_failure_mode_t`.
+   */
+  uint32_t hook_failure_mode;
+  /**
+   * 1 = raise admission events (forced on when a gate is attached).
+   */
+  uint32_t enable_hooks;
+  uint32_t enable_monitoring;
+  /**
+   * mDNS local discovery.
+   */
+  uint32_t local_discovery;
+  /**
+   * 1 = relay-only.
+   */
+  uint32_t clear_ip_transports;
+  /**
+   * 1 = direct-only.
+   */
+  uint32_t clear_relay_transports;
+  /**
+   * One of `aster_portmapper_t`.
+   */
+  uint32_t portmapper;
+  /**
+   * 1 = read `HTTP(S)_PROXY`.
+   */
+  uint32_t proxy_from_env;
+  /**
+   * Bitmask of `ASTER_TRANSPORT_*`: which `transport_*` fields are set.
+   */
+  uint32_t transport_set;
+  /**
+   * Initial QUIC MTU (≤ 65535).
+   */
+  uint32_t transport_initial_mtu;
+  /**
+   * Bool (0/1).
+   */
+  uint32_t transport_send_fairness;
+  /**
+   * Bool (0/1).
+   */
+  uint32_t transport_enable_segmentation_offload;
+  uint64_t transport_max_concurrent_bidi_streams;
+  uint64_t transport_max_concurrent_uni_streams;
+  uint64_t transport_stream_receive_window;
+  uint64_t transport_receive_window;
+  uint64_t transport_send_window;
+  uint64_t transport_max_idle_timeout_ms;
+  uint64_t transport_keep_alive_interval_ms;
+  uint64_t transport_datagram_receive_buffer_size;
+  uint64_t transport_datagram_send_buffer_size;
+  /**
+   * Library-owned storage of a filled config; NULL for caller-built ones.
+   */
+  void *storage;
+} aster_config_t;
+
+/**
+ * Opaque Gate-0 policy handle (scoped to a runtime).
+ */
+typedef uint64_t aster_gate_t;
+
 typedef uint64_t aster_reactor_t;
 
 /**
@@ -798,10 +976,22 @@ uintptr_t aster_last_error_message(uint8_t *buffer, uintptr_t capacity);
  */
 const char *aster_status_name(int32_t status);
 
+/**
+ * Create an in-memory node with default endpoint settings.
+ *
+ * **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
+ * `aster_config_t`.
+ */
 int32_t aster_node_memory(aster_runtime_t runtime,
                           uint64_t user_data,
                           aster_operation_t *out_operation);
 
+/**
+ * Create a persistent node at `path` with default endpoint settings.
+ *
+ * **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
+ * `aster_config_t`.
+ */
 int32_t aster_node_persistent(aster_runtime_t runtime,
                               struct aster_bytes_t path,
                               uint64_t user_data,
@@ -830,6 +1020,12 @@ int32_t aster_node_export_secret_key(aster_runtime_t runtime,
                                      uintptr_t capacity,
                                      uintptr_t *out_len);
 
+/**
+ * Create a bare endpoint (no blobs/docs/gossip).
+ *
+ * **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start`; a node
+ * covers every endpoint use (connect, accept, hooks, metrics).
+ */
 int32_t aster_endpoint_create(aster_runtime_t runtime,
                               const struct aster_endpoint_config_t *config,
                               uint64_t user_data,
@@ -876,6 +1072,9 @@ int32_t aster_accept(aster_runtime_t runtime,
 /**
  * Create an in-memory node with blobs/docs/gossip + custom aster ALPNs.
  * Emits ASTER_EVENT_NODE_CREATED on success.
+ *
+ * **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
+ * `aster_config_t`.
  */
 int32_t aster_node_memory_with_alpns(aster_runtime_t runtime,
                                      const uint8_t *const *alpns,
@@ -1464,6 +1663,7 @@ int32_t aster_hook_before_connect_respond(aster_runtime_t runtime,
 
 /**
  * Respond to a pending after_connect hook invocation (always accepts).
+ * `aster_admission_respond` can also reject with a code and reason.
  *
  * Calling this consumes the invocation; a second call returns NOT_FOUND.
  */
@@ -2036,6 +2236,160 @@ int32_t aster_zstd_maybe_compress(const uint8_t *data,
  * `out` must be a valid pointer.
  */
 int32_t aster_zstd_decompress(const uint8_t *data, uintptr_t len, struct aster_bytes_t *out);
+
+/**
+ * Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
+ * in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
+ * overrides). Never allocates (`storage` is NULL).
+ */
+int32_t aster_config_init(struct aster_config_t *out);
+
+/**
+ * Fill `*out` from the `ASTER_*` environment over the defaults
+ * (`AsterConfig::from_env`; variables in docs/aster-rust-getstarted.md §2.2).
+ * Release with `aster_config_release`. A malformed variable returns
+ * `ASTER_STATUS_INVALID_ARGUMENT` (with the last-error message) and leaves
+ * `*out` zeroed.
+ */
+int32_t aster_config_from_env(struct aster_config_t *out);
+
+/**
+ * Fill `*out` from an `aster.toml` file, then overlay the `ASTER_*`
+ * environment (`AsterConfig::from_file`: defaults < file < env). `path` is
+ * UTF-8. Release with `aster_config_release`. An unreadable or malformed file
+ * returns `ASTER_STATUS_INVALID_ARGUMENT` and leaves `*out` zeroed.
+ */
+int32_t aster_config_from_toml(struct aster_bytes_t path, struct aster_config_t *out);
+
+/**
+ * Free the storage of a config filled by `aster_config_from_env` /
+ * `aster_config_from_toml` and zero its pointers. No-op when `storage` is
+ * NULL (caller-built or `aster_config_init` configs). Call once per filled
+ * struct.
+ */
+int32_t aster_config_release(struct aster_config_t *config);
+
+/**
+ * Create a Gate-0 policy: PROTECTED, admission ALPNs =
+ * `aster.producer_admission`, `aster.consumer_admission`, `aster.admission`,
+ * reject code 403 with reason "peer not admitted", no admitted peers.
+ * Free with `aster_gate_free`.
+ */
+int32_t aster_gate_new(aster_runtime_t runtime, aster_gate_t *out_gate);
+
+/**
+ * Free a gate handle. Nodes it is attached to keep using it until detached
+ * or closed.
+ */
+int32_t aster_gate_free(aster_runtime_t runtime, aster_gate_t gate);
+
+/**
+ * Set the trust mode (`aster_trust_mode_t`).
+ */
+int32_t aster_gate_set_trust_mode(aster_runtime_t runtime, aster_gate_t gate, uint32_t mode);
+
+/**
+ * Replace the always-open admission ALPN set (may be empty: then no ALPN is
+ * open to un-admitted peers in PROTECTED mode).
+ */
+int32_t aster_gate_set_admission_alpns(aster_runtime_t runtime,
+                                       aster_gate_t gate,
+                                       struct aster_bytes_list_t alpns);
+
+/**
+ * Set the QUIC application close code and reason used when the gate rejects
+ * a peer (defaults 403 / "peer not admitted").
+ */
+int32_t aster_gate_set_reject(aster_runtime_t runtime,
+                              aster_gate_t gate,
+                              uint32_t code,
+                              struct aster_bytes_t reason);
+
+/**
+ * Admit `peer` (64-hex node id, manual source, no expiry).
+ */
+int32_t aster_gate_admit(aster_runtime_t runtime, aster_gate_t gate, struct aster_bytes_t peer);
+
+/**
+ * Revoke `peer`'s admission. Revoking an unknown peer is OK. Existing
+ * connections are not closed; new ones are gated.
+ */
+int32_t aster_gate_revoke(aster_runtime_t runtime, aster_gate_t gate, struct aster_bytes_t peer);
+
+/**
+ * `*out_admitted` = 1 if `peer` holds an unexpired admission, else 0.
+ */
+int32_t aster_gate_is_admitted(aster_runtime_t runtime,
+                               aster_gate_t gate,
+                               struct aster_bytes_t peer,
+                               uint32_t *out_admitted);
+
+/**
+ * Evaluate the gate for `(peer, alpn)` without connecting: `*out_decision` is
+ * `ASTER_HOOK_DECISION_ALLOW` or `ASTER_HOOK_DECISION_DENY`. For callers that
+ * answer admission events themselves.
+ */
+int32_t aster_gate_should_allow(aster_runtime_t runtime,
+                                aster_gate_t gate,
+                                struct aster_bytes_t peer,
+                                struct aster_bytes_t alpn,
+                                uint32_t *out_decision);
+
+/**
+ * Answer an admission event (`ASTER_EVENT_HOOK_AFTER_CONNECT` or
+ * `ASTER_EVENT_HOOK_BEFORE_CONNECT`, from a node or an endpoint).
+ *
+ * `decision` is `ASTER_HOOK_DECISION_ALLOW` or `ASTER_HOOK_DECISION_DENY`.
+ * On DENY of an inbound (after-connect) invocation the connection is closed
+ * with `reject_code` and `reason` (borrowed for the call; may be empty); both
+ * are ignored for ALLOW and for outbound (before-connect) invocations.
+ * Consumes the invocation: a second call returns `ASTER_STATUS_NOT_FOUND`.
+ * Answering after the hook timeout is OK (the failure mode already applied).
+ */
+int32_t aster_admission_respond(aster_runtime_t runtime,
+                                aster_hook_invocation_t invocation,
+                                uint32_t decision,
+                                uint32_t reject_code,
+                                struct aster_bytes_t reason);
+
+/**
+ * Start a node from `config` via `aster::Node::start` (NULL = defaults).
+ *
+ * Async: emits `ASTER_EVENT_NODE_CREATED` (`event.handle` = node) or
+ * `ASTER_EVENT_ERROR` (message in the event data) on the completion queue.
+ * The config is validated and copied before this returns, so the caller may
+ * release it right away; a malformed config returns
+ * `ASTER_STATUS_INVALID_ARGUMENT` and starts nothing.
+ *
+ * `gate` (0 = none) attaches a Gate-0 policy (see `aster_node_set_gate`) and
+ * forces `enable_hooks` on. With hooks on and no gate, admission events are
+ * raised for the caller to answer with `aster_admission_respond`.
+ *
+ * Replaces `aster_node_memory`, `aster_node_memory_with_alpns`,
+ * `aster_node_persistent` and `aster_endpoint_create` for new code.
+ */
+int32_t aster_node_start(aster_runtime_t runtime,
+                         const struct aster_config_t *config,
+                         aster_gate_t gate,
+                         uint64_t user_data,
+                         aster_operation_t *out_operation);
+
+/**
+ * Attach (`gate` ≠ 0) or detach (`gate` = 0) a Gate-0 policy on a node
+ * started by `aster_node_start` with hooks enabled (or with a gate). Takes
+ * effect for the next admission decision. Returns
+ * `ASTER_STATUS_UNSUPPORTED` for nodes without admission hooks.
+ */
+int32_t aster_node_set_gate(aster_runtime_t runtime, aster_node_t node, aster_gate_t gate);
+
+/**
+ * Transport metrics of a node in Prometheus text format
+ * (`aster::Node::metrics_prometheus`). `*out` is library-owned; free with
+ * `aster_string_release(out->ptr, out->len)`.
+ */
+int32_t aster_node_metrics_prometheus(aster_runtime_t runtime,
+                                      aster_node_t node,
+                                      struct aster_bytes_t *out);
 
 void aster_probe_reset(void);
 

@@ -29,4 +29,6 @@ include = [
   "aster_download_policy_mode_t",
   "aster_doc_share_mode_t",
   "aster_registry_key_kind_t",
+  "aster_trust_mode_t",
+  "aster_portmapper_t",
 ]

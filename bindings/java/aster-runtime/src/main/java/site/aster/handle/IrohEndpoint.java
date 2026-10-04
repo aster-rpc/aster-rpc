@@ -10,9 +10,25 @@ public class IrohEndpoint extends IrohHandle {
 
   private final IrohRuntime runtime;
 
+  /** True when {@code handle} is an {@code aster_node_t} (started by {@code aster_node_start}). */
+  private final boolean nodeBacked;
+
   IrohEndpoint(IrohRuntime runtime, long handle) {
+    this(runtime, handle, false);
+  }
+
+  private IrohEndpoint(IrohRuntime runtime, long handle, boolean nodeBacked) {
     super(handle);
     this.runtime = runtime;
+    this.nodeBacked = nodeBacked;
+  }
+
+  /**
+   * View a node (from {@code aster_node_start}) as an endpoint: connect/accept work on node handles
+   * directly; id, address, secret key and close use the node functions. Closing it closes the node.
+   */
+  public static IrohEndpoint ofNode(IrohRuntime runtime, long nodeHandle) {
+    return new IrohEndpoint(runtime, nodeHandle, true);
   }
 
   @Override
@@ -48,7 +64,10 @@ public class IrohEndpoint extends IrohHandle {
     var bufSeg = alloc.allocate(64);
     var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    int status = lib.endpointId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
+    int status =
+        nodeBacked
+            ? lib.nodeId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg)
+            : lib.endpointId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
     if (status != 0) {
       throw new IrohException(IrohStatus.fromCode(status), "aster_endpoint_id failed: " + status);
     }
@@ -80,7 +99,9 @@ public class IrohEndpoint extends IrohHandle {
     MemorySegment addrSeg = alloc.allocate(48);
 
     int status =
-        lib.endpointAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg);
+        nodeBacked
+            ? lib.nodeAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg)
+            : lib.endpointAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg);
     if (status != 0) {
       throw new IrohException(
           IrohStatus.fromCode(status), "aster_endpoint_addr_info failed: " + status);
@@ -310,7 +331,7 @@ public class IrohEndpoint extends IrohHandle {
 
     var endpointClose =
         lib.getHandle(
-            "aster_endpoint_close",
+            nodeBacked ? "aster_node_close" : "aster_endpoint_close",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -363,7 +384,7 @@ public class IrohEndpoint extends IrohHandle {
 
     var exportSecretKey =
         lib.getHandle(
-            "aster_endpoint_export_secret_key",
+            nodeBacked ? "aster_node_export_secret_key" : "aster_endpoint_export_secret_key",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,

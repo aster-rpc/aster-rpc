@@ -2923,4 +2923,247 @@ public final class IrohLibrary implements SymbolLookup {
       throw new AssertionError(t);
     }
   }
+
+  // --- ABI 3.2: node config, aster_node_start, Gate 0, admission (ffi/src/node.rs) ---
+
+  /**
+   * aster_config_t (ABI 3.2). Total 280 bytes; offsets pinned by ffi/src/layout.rs. Built and read
+   * by {@link NativeConfig}.
+   */
+  public static final MemoryLayout ASTER_CONFIG =
+      MemoryLayout.structLayout(
+          ValueLayout.JAVA_INT.withName("struct_size"), // 0
+          ValueLayout.JAVA_INT.withName("relay_mode"), // 4
+          ASTER_BYTES_LIST.withName("relay_urls"), // 8
+          ASTER_BYTES.withName("secret_key"), // 24
+          ASTER_BYTES.withName("secret_key_file"), // 40
+          ASTER_BYTES.withName("storage_path"), // 56
+          ValueLayout.JAVA_LONG.withName("gc_interval_ms"), // 72
+          ASTER_BYTES.withName("bind_addr"), // 80
+          ASTER_BYTES_LIST.withName("alpns"), // 96
+          ASTER_BYTES.withName("identity_file"), // 112
+          ASTER_BYTES.withName("proxy_url"), // 128
+          ValueLayout.JAVA_LONG.withName("hook_timeout_ms"), // 144
+          ValueLayout.JAVA_INT.withName("hook_failure_mode"), // 152
+          ValueLayout.JAVA_INT.withName("enable_hooks"), // 156
+          ValueLayout.JAVA_INT.withName("enable_monitoring"), // 160
+          ValueLayout.JAVA_INT.withName("local_discovery"), // 164
+          ValueLayout.JAVA_INT.withName("clear_ip_transports"), // 168
+          ValueLayout.JAVA_INT.withName("clear_relay_transports"), // 172
+          ValueLayout.JAVA_INT.withName("portmapper"), // 176
+          ValueLayout.JAVA_INT.withName("proxy_from_env"), // 180
+          ValueLayout.JAVA_INT.withName("transport_set"), // 184
+          ValueLayout.JAVA_INT.withName("transport_initial_mtu"), // 188
+          ValueLayout.JAVA_INT.withName("transport_send_fairness"), // 192
+          ValueLayout.JAVA_INT.withName("transport_enable_segmentation_offload"), // 196
+          ValueLayout.JAVA_LONG.withName("transport_max_concurrent_bidi_streams"), // 200
+          ValueLayout.JAVA_LONG.withName("transport_max_concurrent_uni_streams"), // 208
+          ValueLayout.JAVA_LONG.withName("transport_stream_receive_window"), // 216
+          ValueLayout.JAVA_LONG.withName("transport_receive_window"), // 224
+          ValueLayout.JAVA_LONG.withName("transport_send_window"), // 232
+          ValueLayout.JAVA_LONG.withName("transport_max_idle_timeout_ms"), // 240
+          ValueLayout.JAVA_LONG.withName("transport_keep_alive_interval_ms"), // 248
+          ValueLayout.JAVA_LONG.withName("transport_datagram_receive_buffer_size"), // 256
+          ValueLayout.JAVA_LONG.withName("transport_datagram_send_buffer_size"), // 264
+          ValueLayout.ADDRESS.withName("storage") // 272
+          );
+
+  private int call(String name, FunctionDescriptor desc, Object... args) {
+    try {
+      return (int) getHandle(name, desc).invokeWithArguments(args);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  private static final FunctionDescriptor INT_ADDR =
+      FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS);
+
+  /** {@code aster_config_init(aster_config_t *out)}. */
+  public int configInit(MemorySegment config) {
+    return call("aster_config_init", INT_ADDR, config);
+  }
+
+  /** {@code aster_config_from_env(aster_config_t *out)}; release with {@link #configRelease}. */
+  public int configFromEnv(MemorySegment config) {
+    return call("aster_config_from_env", INT_ADDR, config);
+  }
+
+  /**
+   * {@code aster_config_from_toml(aster_bytes_t path, aster_config_t *out)}: file, then env.
+   * Release with {@link #configRelease}.
+   */
+  public int configFromToml(MemorySegment pathBytes, MemorySegment config) {
+    return call(
+        "aster_config_from_toml",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ASTER_BYTES, ValueLayout.ADDRESS),
+        pathBytes,
+        config);
+  }
+
+  /** {@code aster_config_release(aster_config_t *config)}. */
+  public int configRelease(MemorySegment config) {
+    return call("aster_config_release", INT_ADDR, config);
+  }
+
+  /**
+   * {@code aster_node_start(runtime, const aster_config_t *config, aster_gate_t gate, uint64_t
+   * user_data, aster_operation_t *out_operation)}. Emits NODE_CREATED or ERROR.
+   */
+  public int nodeStartAsync(
+      long runtimeHandle, MemorySegment config, long gate, MemorySegment outOpId) {
+    return call(
+        "aster_node_start",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.ADDRESS,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.ADDRESS),
+        runtimeHandle,
+        config,
+        gate,
+        0L,
+        outOpId);
+  }
+
+  /** {@code aster_node_set_gate(runtime, node, gate)}; gate 0 detaches. */
+  public int nodeSetGate(long runtimeHandle, long nodeHandle, long gate) {
+    return call(
+        "aster_node_set_gate",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG),
+        runtimeHandle,
+        nodeHandle,
+        gate);
+  }
+
+  /**
+   * {@code aster_node_metrics_prometheus(runtime, node, aster_bytes_t *out)}; free {@code out} with
+   * {@link #stringRelease}.
+   */
+  public int nodeMetricsPrometheus(long runtimeHandle, long nodeHandle, MemorySegment outBytes) {
+    return call(
+        "aster_node_metrics_prometheus",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.ADDRESS),
+        runtimeHandle,
+        nodeHandle,
+        outBytes);
+  }
+
+  /** {@code aster_gate_new(runtime, aster_gate_t *out_gate)}. */
+  public int gateNew(long runtimeHandle, MemorySegment outGate) {
+    return call(
+        "aster_gate_new",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS),
+        runtimeHandle,
+        outGate);
+  }
+
+  /** {@code aster_gate_free(runtime, gate)}. */
+  public int gateFree(long runtimeHandle, long gate) {
+    return call(
+        "aster_gate_free",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG),
+        runtimeHandle,
+        gate);
+  }
+
+  /** {@code aster_gate_set_trust_mode(runtime, gate, aster_trust_mode_t mode)}. */
+  public int gateSetTrustMode(long runtimeHandle, long gate, int mode) {
+    return call(
+        "aster_gate_set_trust_mode",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_INT),
+        runtimeHandle,
+        gate,
+        mode);
+  }
+
+  /** {@code aster_gate_set_admission_alpns(runtime, gate, aster_bytes_list_t alpns)}. */
+  public int gateSetAdmissionAlpns(long runtimeHandle, long gate, MemorySegment alpnList) {
+    return call(
+        "aster_gate_set_admission_alpns",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ASTER_BYTES_LIST),
+        runtimeHandle,
+        gate,
+        alpnList);
+  }
+
+  /** {@code aster_gate_set_reject(runtime, gate, uint32_t code, aster_bytes_t reason)}. */
+  public int gateSetReject(long runtimeHandle, long gate, int code, MemorySegment reason) {
+    return call(
+        "aster_gate_set_reject",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_INT,
+            ASTER_BYTES),
+        runtimeHandle,
+        gate,
+        code,
+        reason);
+  }
+
+  /** {@code aster_gate_admit} / {@code aster_gate_revoke}(runtime, gate, aster_bytes_t peer). */
+  public int gatePeerOp(String fn, long runtimeHandle, long gate, MemorySegment peer) {
+    return call(
+        fn,
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ASTER_BYTES),
+        runtimeHandle,
+        gate,
+        peer);
+  }
+
+  /** {@code aster_gate_is_admitted(runtime, gate, aster_bytes_t peer, uint32_t *out)}. */
+  public int gateIsAdmitted(long runtimeHandle, long gate, MemorySegment peer, MemorySegment out) {
+    return call(
+        "aster_gate_is_admitted",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG,
+            ASTER_BYTES,
+            ValueLayout.ADDRESS),
+        runtimeHandle,
+        gate,
+        peer,
+        out);
+  }
+
+  /**
+   * {@code aster_admission_respond(runtime, invocation, uint32_t decision, uint32_t reject_code,
+   * aster_bytes_t reason)}.
+   */
+  public int admissionRespond(
+      long runtimeHandle, long invocation, int decision, int rejectCode, MemorySegment reason) {
+    return call(
+        "aster_admission_respond",
+        FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_INT,
+            ASTER_BYTES),
+        runtimeHandle,
+        invocation,
+        decision,
+        rejectCode,
+        reason);
+  }
 }

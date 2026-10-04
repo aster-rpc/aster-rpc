@@ -1,6 +1,6 @@
-// The Java side of the InteropEcho contract (tests/interop/), used by the
-// dispatch benchmark (benchmarks/dispatch/run.py). Not yet part of the
-// tests/interop/run.py matrix (no contract-id/codegen leg for Java).
+// The Java side of the InteropEcho contract (tests/interop/): a leg of the
+// tests/interop/run.py matrix (contract / server / client) and the Java side
+// of the dispatch benchmark (benchmarks/dispatch/run.py).
 //
 // Contract (must match tests/interop/rust/contract.rs):
 //
@@ -12,13 +12,16 @@
 // Single-file source program (JEP 330), no build step of its own:
 //
 //   java --enable-native-access=ALL-UNNAMED -cp <aster-runtime classpath> \
-//       tests/interop/java/InteropEcho.java server
+//       tests/interop/java/InteropEcho.java contract | server | client <aster1-ticket>
 //   java ... InteropEcho.java bench <aster1-ticket> [--duration S] [--warmup S]
 //       [--concurrency 1,10,50,100] [--stream-frames 100,10000] [--client-stream 10000]
 //
-// IROH_LIB_PATH must point at the release libaster_transport_ffi. `server`
-// prints ADDRESS <aster1...> and serves until stdin closes; `bench` prints
-// RESULT {json} lines in the schema of benchmarks/dispatch/driver.rs.
+// IROH_LIB_PATH points at libaster_transport_ffi (ABI >= 3.2). Every mode
+// prints CONTRACT_ID <hex> first; `server` prints ADDRESS <aster1...> and
+// serves until stdin closes (loopback, relays off, via aster_node_start);
+// `client` prints CASE <name> OK|FAIL lines (same cases as the other
+// languages); `bench` prints RESULT {json} lines in the schema of
+// benchmarks/dispatch/driver.rs.
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -34,11 +37,13 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.apache.fory.BaseFory;
 import org.apache.fory.Fory;
 import site.aster.annotations.Scope;
+import site.aster.annotations.WireType;
 import site.aster.client.AsterClient;
 import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
 import site.aster.codec.ForyTags;
 import site.aster.config.AsterConfig;
+import site.aster.contract.ContractManifestBuilder;
 import site.aster.interceptors.CallContext;
 import site.aster.node.NodeAddr;
 import site.aster.server.AsterServer;
@@ -60,6 +65,7 @@ public final class InteropEcho {
   static final String REPLY_TAG = "interop/EchoReply";
 
   /** interop/EchoRequest { message: string, count: varint32, data: binary }. */
+  @WireType(REQ_TAG)
   public static final class EchoRequest {
     public String message = "";
     public int count;
@@ -74,12 +80,16 @@ public final class InteropEcho {
     }
   }
 
-  /** interop/EchoReply { message, count, data, server_lang }. */
+  /**
+   * interop/EchoReply { message, count, data, server_lang }. The field is spelled server_lang (not
+   * serverLang) because the contract hashes field names verbatim.
+   */
+  @WireType(REPLY_TAG)
   public static final class EchoReply {
     public String message = "";
     public int count;
     public byte[] data = new byte[0];
-    public String serverLang = "";
+    public String server_lang = "";
 
     public EchoReply() {}
 
@@ -87,7 +97,7 @@ public final class InteropEcho {
       this.message = message;
       this.count = count;
       this.data = data;
-      this.serverLang = serverLang;
+      this.server_lang = serverLang;
     }
   }
 
@@ -129,7 +139,8 @@ public final class InteropEcho {
 
     @Override
     public Map<String, Class<?>> responseClasses() {
-      return Map.of("echo", EchoReply.class, "ingest", EchoReply.class);
+      return Map.of(
+          "echo", EchoReply.class, "generate", EchoReply.class, "ingest", EchoReply.class);
     }
 
     @Override
@@ -438,13 +449,144 @@ public final class InteropEcho {
     System.exit(0);
   }
 
+  // ---- interop matrix client ----------------------------------------------
+
+  /** The shared cases. Must match cases() in the Rust, Python and TS drivers. */
+  static List<Map.Entry<String, EchoRequest>> cases() {
+    byte[] zdata = new byte[20_000];
+    for (int i = 0; i < zdata.length; i++) {
+      zdata[i] = (byte) (i % 251);
+    }
+    return List.of(
+        Map.entry("small", new EchoRequest("hello from java", 41, new byte[] {0, 1, 2, (byte) 255})),
+        Map.entry("zstd", new EchoRequest("héllo ✓ ".repeat(200), -123_456, zdata)),
+        Map.entry("long_string", new EchoRequest("x".repeat(5000), Integer.MAX_VALUE - 1, new byte[0])));
+  }
+
+  static String check(EchoRequest req, EchoReply reply) {
+    if (!req.message.equals(reply.message)) {
+      throw new IllegalStateException(
+          "message mismatch (len " + reply.message.length() + " vs " + req.message.length() + ")");
+    }
+    if (reply.count != req.count + 1) {
+      throw new IllegalStateException("count " + reply.count + " != " + (req.count + 1));
+    }
+    if (!Arrays.equals(req.data, reply.data)) {
+      throw new IllegalStateException(
+          "data mismatch (len " + reply.data.length + " vs " + req.data.length + ")");
+    }
+    if (reply.server_lang == null || reply.server_lang.isEmpty()) {
+      throw new IllegalStateException("empty server_lang");
+    }
+    return reply.server_lang;
+  }
+
+  interface Case {
+    String run() throws Exception;
+  }
+
+  static boolean runCase(String name, Case c) {
+    try {
+      System.out.println("CASE " + name + " OK server_lang=" + c.run());
+      return true;
+    } catch (Exception e) {
+      Throwable t = e instanceof java.util.concurrent.ExecutionException && e.getCause() != null
+          ? e.getCause()
+          : e;
+      System.out.println("CASE " + name + " FAIL " + t.getClass().getSimpleName() + ": " + t.getMessage());
+      return false;
+    } finally {
+      System.out.flush();
+    }
+  }
+
+  static void client(String ticket) throws Exception {
+    ForyCodec codec = new ForyCodec();
+    registerTypes(codec.fory());
+    NodeAddr addr = NodeAddr.fromTicket(ticket);
+    boolean ok = true;
+    // Open gate, aster/1 directly (like the other languages' matrix clients): a Rust
+    // AsterServer serves no consumer-admission ALPN.
+    try (AsterClient client =
+        AsterClient.builder()
+            .config(config())
+            .codec(codec)
+            .consumerAdmission(false)
+            .build()
+            .get(30, TimeUnit.SECONDS)) {
+      for (Map.Entry<String, EchoRequest> e : cases()) {
+        EchoRequest req = e.getValue();
+        ok &=
+            runCase(
+                e.getKey(),
+                () ->
+                    check(
+                        req,
+                        client
+                            .<EchoRequest, EchoReply>call(
+                                addr, "InteropEcho", "echo", req, EchoReply.class)
+                            .get(15, TimeUnit.SECONDS)));
+      }
+      ok &=
+          runCase(
+              "server_stream",
+              () -> {
+                EchoRequest req = new EchoRequest("stream", 3, new byte[] {7, 8, 9});
+                List<EchoReply> got =
+                    client
+                        .<EchoRequest, EchoReply>callServerStream(
+                            addr, "InteropEcho", "generate", req, EchoReply.class)
+                        .get(15, TimeUnit.SECONDS);
+                if (got.size() != 3) {
+                  throw new IllegalStateException(got.size() + " replies != 3");
+                }
+                for (int i = 0; i < 3; i++) {
+                  EchoReply r = got.get(i);
+                  if (r.count != i || !r.message.equals(req.message) || !Arrays.equals(r.data, req.data)) {
+                    throw new IllegalStateException("reply " + i + " mismatch");
+                  }
+                }
+                return got.get(0).server_lang;
+              });
+      ok &=
+          runCase(
+              "client_stream",
+              () -> {
+                List<EchoRequest> reqs = new ArrayList<>();
+                for (int i = 0; i < 3; i++) {
+                  reqs.add(new EchoRequest("m" + i, i, new byte[] {(byte) i}));
+                }
+                EchoReply r =
+                    client
+                        .<EchoRequest, EchoReply>callClientStream(
+                            addr, "InteropEcho", "ingest", reqs, EchoReply.class)
+                        .get(15, TimeUnit.SECONDS);
+                if (r.count != 3 || !r.message.equals("m2")) {
+                  throw new IllegalStateException("reply mismatch: " + r.count + " " + r.message);
+                }
+                if (r.server_lang == null || r.server_lang.isEmpty()) {
+                  throw new IllegalStateException("empty server_lang");
+                }
+                return r.server_lang;
+              });
+    }
+    System.exit(ok ? 0 : 1);
+  }
+
   public static void main(String[] args) throws Exception {
-    if (args.length >= 1 && args[0].equals("server")) {
+    System.out.println("CONTRACT_ID " + ContractManifestBuilder.computeContractId(new Dispatcher()));
+    System.out.flush();
+    if (args.length == 1 && args[0].equals("contract")) {
+      System.exit(0);
+    } else if (args.length >= 1 && args[0].equals("server")) {
       serve();
+    } else if (args.length == 2 && args[0].equals("client")) {
+      client(args[1]);
     } else if (args.length >= 2 && args[0].equals("bench")) {
       bench(args);
     } else {
-      System.err.println("usage: InteropEcho.java server | bench <aster1-ticket> [options]");
+      System.err.println(
+          "usage: InteropEcho.java contract | server | client <aster1-ticket> | bench <aster1-ticket> [options]");
       System.exit(2);
     }
   }

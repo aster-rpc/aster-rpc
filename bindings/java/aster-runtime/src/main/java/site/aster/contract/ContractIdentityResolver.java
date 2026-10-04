@@ -360,10 +360,13 @@ public final class ContractIdentityResolver {
     m.put(Byte.class, "int8");
     m.put(short.class, "int16");
     m.put(Short.class, "int16");
-    m.put(int.class, "int32");
-    m.put(Integer.class, "int32");
-    m.put(long.class, "int64");
-    m.put(Long.class, "int64");
+    // Fory xlang writes Java int/long compressed (number compression is on by default), i.e.
+    // as varint32 / varint64 -- the same primitive Rust i32/i64 and Python int map to
+    // (conformance/vectors/contract-defaults.json). "int32"/"int64" are the fixed-width encodings.
+    m.put(int.class, "varint32");
+    m.put(Integer.class, "varint32");
+    m.put(long.class, "varint64");
+    m.put(Long.class, "varint64");
     m.put(float.class, "float32");
     m.put(Float.class, "float32");
     m.put(double.class, "float64");

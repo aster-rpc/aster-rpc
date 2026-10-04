@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x changelog
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -19,6 +19,52 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 3.2 (additive)
+
+ABI 3.2.0 puts the C ABI on the `aster` crate (plan D1, tranche F1): nodes start
+from an `aster::AsterConfig` through `aster::Node::start`, and Gate 0 /
+admission decisions come from the Rust `GatePolicy`. Nothing in 3.0/3.1 changed
+shape; a 3.1 binding keeps working. Source: `ffi/src/node.rs`; tests:
+`ffi/src/node.rs` (config round-trip / env / TOML), `ffi/tests/node_start.rs`,
+`ffi/tests/abi_contract_test.c`.
+
+| Kind | Name | Notes |
+|---|---|---|
+| struct | `aster_config_t` (280 B) | `struct_size, relay_mode, relay_urls, secret_key (32 raw bytes or empty), secret_key_file, storage_path, gc_interval_ms, bind_addr, alpns, identity_file, proxy_url, hook_timeout_ms (0 = 5000), hook_failure_mode, enable_hooks, enable_monitoring, local_discovery, clear_ip_transports, clear_relay_transports, portmapper, proxy_from_env, transport_set, transport_initial_mtu, transport_send_fairness, transport_enable_segmentation_offload, transport_max_concurrent_{bidi,uni}_streams, transport_{stream_receive,receive,send}_window, transport_max_idle_timeout_ms, transport_keep_alive_interval_ms, transport_datagram_{receive,send}_buffer_size, storage` |
+| enum | `aster_portmapper_t` | `DEFAULT`=0 (unset), `ENABLED`=1, `DISABLED`=2 |
+| enum | `aster_trust_mode_t` | `PROTECTED`=0 (default), `OPEN_DEV`=1 |
+| macro | `ASTER_TRANSPORT_*` (bits 0..11), `ASTER_TRANSPORT_ALL` | presence bits of `aster_config_t.transport_set`; unknown bits rejected |
+| type | `aster_gate_t` | `uint64_t` handle, runtime-scoped |
+| function | `aster_config_init(aster_config_t*)` | Rust defaults; never allocates (`storage == NULL`) |
+| function | `aster_config_from_env(aster_config_t*)` | `AsterConfig::from_env`; release with `aster_config_release` |
+| function | `aster_config_from_toml(aster_bytes_t path, aster_config_t*)` | `AsterConfig::from_file` (file, then `ASTER_*` env); release with `aster_config_release` |
+| function | `aster_config_release(aster_config_t*)` | frees `storage`, zeroes pointers; no-op when `storage == NULL` |
+| function | `aster_node_start(rt, const aster_config_t*, aster_gate_t gate, user_data, out_op)` | async → `ASTER_EVENT_NODE_CREATED` / `ASTER_EVENT_ERROR`; config validated + copied before return (bad config → `INVALID_ARGUMENT`, nothing started); `gate` ≠ 0 forces hooks on |
+| function | `aster_node_set_gate(rt, node, gate)` | attach/detach (0); `UNSUPPORTED` for nodes without hooks |
+| function | `aster_node_metrics_prometheus(rt, node, aster_bytes_t* out)` | free with `aster_string_release` |
+| function | `aster_gate_new`, `aster_gate_free`, `aster_gate_set_trust_mode`, `aster_gate_set_admission_alpns`, `aster_gate_set_reject(code, reason)`, `aster_gate_admit`, `aster_gate_revoke`, `aster_gate_is_admitted`, `aster_gate_should_allow` | peers are 64-hex node ids (case-insensitive) |
+| function | `aster_admission_respond(rt, invocation, decision, reject_code, reason)` | answers `ASTER_EVENT_HOOK_{BEFORE,AFTER}_CONNECT` from nodes and endpoints; DENY of an inbound invocation closes with `reject_code`/`reason` |
+
+Admission events on nodes: a node started with `enable_hooks` and no gate raises
+the same `ASTER_EVENT_HOOK_BEFORE_CONNECT` / `ASTER_EVENT_HOOK_AFTER_CONNECT`
+events as an endpoint (`event.handle` = node, `event.related` = invocation,
+`event.user_data` = the start call's `user_data`, same payload encoding). With a
+gate attached, inbound peers are decided in Rust (admitted / admission ALPN /
+`OPEN_DEV` → accept, else close with the gate's code + reason) and outbound
+dials are allowed, without events.
+
+Behaviour fixes in 3.2 (no signature change): `aster_node_addr_info` now fills
+`direct_addresses` (it always returned an empty list); `aster_endpoint_addr_info`
+returns `INVALID_ARGUMENT` for a NULL scratch buffer. Handle ids are now unique across
+all handle kinds within the process (one counter), so a function taking "endpoint
+or node" can no longer confuse an endpoint with a node of the same number.
+
+**Deprecated (removal in 4.0):** `aster_node_memory`, `aster_node_memory_with_alpns`,
+`aster_node_persistent`, `aster_endpoint_create` (and with it the
+endpoint-only `aster_endpoint_*` functions and `aster_endpoint_config_t`). Use
+`aster_node_start`; `aster_connect`, `aster_accept`, remote info and transport
+metrics already take node handles.
 
 ## New in 3.1 (additive)
 

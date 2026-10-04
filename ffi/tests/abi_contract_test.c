@@ -175,6 +175,43 @@ OFF(aster_rpc_status_t, detail_keys, 24);
 OFF(aster_rpc_status_t, detail_values, 40);
 OFF(aster_rpc_status_t, storage, 56);
 
+/* ABI 3.2: node configuration. */
+LAYOUT(aster_config_t, 280);
+OFF(aster_config_t, struct_size, 0);
+OFF(aster_config_t, relay_mode, 4);
+OFF(aster_config_t, relay_urls, 8);
+OFF(aster_config_t, secret_key, 24);
+OFF(aster_config_t, secret_key_file, 40);
+OFF(aster_config_t, storage_path, 56);
+OFF(aster_config_t, gc_interval_ms, 72);
+OFF(aster_config_t, bind_addr, 80);
+OFF(aster_config_t, alpns, 96);
+OFF(aster_config_t, identity_file, 112);
+OFF(aster_config_t, proxy_url, 128);
+OFF(aster_config_t, hook_timeout_ms, 144);
+OFF(aster_config_t, hook_failure_mode, 152);
+OFF(aster_config_t, enable_hooks, 156);
+OFF(aster_config_t, enable_monitoring, 160);
+OFF(aster_config_t, local_discovery, 164);
+OFF(aster_config_t, clear_ip_transports, 168);
+OFF(aster_config_t, clear_relay_transports, 172);
+OFF(aster_config_t, portmapper, 176);
+OFF(aster_config_t, proxy_from_env, 180);
+OFF(aster_config_t, transport_set, 184);
+OFF(aster_config_t, transport_initial_mtu, 188);
+OFF(aster_config_t, transport_send_fairness, 192);
+OFF(aster_config_t, transport_enable_segmentation_offload, 196);
+OFF(aster_config_t, transport_max_concurrent_bidi_streams, 200);
+OFF(aster_config_t, transport_max_concurrent_uni_streams, 208);
+OFF(aster_config_t, transport_stream_receive_window, 216);
+OFF(aster_config_t, transport_receive_window, 224);
+OFF(aster_config_t, transport_send_window, 232);
+OFF(aster_config_t, transport_max_idle_timeout_ms, 240);
+OFF(aster_config_t, transport_keep_alive_interval_ms, 248);
+OFF(aster_config_t, transport_datagram_receive_buffer_size, 256);
+OFF(aster_config_t, transport_datagram_send_buffer_size, 264);
+OFF(aster_config_t, storage, 272);
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -197,7 +234,7 @@ static void test_abi_version(void) {
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
     CHECK(ASTER_ABI_VERSION_MAJOR == 3);
-    CHECK(ASTER_ABI_VERSION_MINOR >= 1); /* envelope + zstd */
+    CHECK(ASTER_ABI_VERSION_MINOR >= 2); /* 3.1 envelope + zstd, 3.2 node config + gate */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
 
@@ -224,6 +261,10 @@ static void test_enum_values(void) {
     CHECK(ASTER_REGISTRY_KEY_ACL == 5);
     CHECK(ASTER_REACTOR_EVENT_CALL == 0);
     CHECK(ASTER_REACTOR_EVENT_RESPONSE_CLOSED == 3);
+    CHECK(ASTER_TRUST_MODE_PROTECTED == 0 && ASTER_TRUST_MODE_OPEN_DEV == 1);
+    CHECK(ASTER_PORTMAPPER_DEFAULT == 0 && ASTER_PORTMAPPER_DISABLED == 2);
+    CHECK(ASTER_TRANSPORT_INITIAL_MTU == (1 << 7));
+    CHECK(ASTER_TRANSPORT_ALL == 0xfff);
     CHECK(strcmp(aster_status_name(ASTER_STATUS_ABI_MISMATCH), "ASTER_STATUS_ABI_MISMATCH") == 0);
     CHECK(strcmp(aster_status_name(-999), "ASTER_STATUS_UNKNOWN") == 0);
 }
@@ -318,11 +359,96 @@ static void test_envelope(void) {
     CHECK(aster_string_release(c.ptr, c.len) == ASTER_STATUS_OK);
 }
 
+static void test_config(void) {
+    printf("[config]\n");
+    aster_config_t c;
+    memset(&c, 0xab, sizeof c);
+    CHECK(aster_config_init(&c) == ASTER_STATUS_OK);
+    CHECK(c.struct_size == sizeof(aster_config_t));
+    CHECK(c.storage == NULL);
+    CHECK(c.relay_mode == ASTER_RELAY_MODE_DEFAULT);
+    CHECK(c.hook_timeout_ms == 5000);
+    CHECK(c.hook_failure_mode == ASTER_HOOK_FAILURE_FAIL_OPEN);
+    CHECK(c.transport_set == 0 && c.bind_addr.ptr == NULL && c.alpns.len == 0);
+    CHECK(aster_config_release(&c) == ASTER_STATUS_OK);
+
+    aster_config_t f;
+    aster_bytes_t missing = {(const uint8_t *)"/nonexistent/aster.toml", 23};
+    CHECK(aster_config_from_toml(missing, &f) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(f.storage == NULL);
+    CHECK(aster_config_init(NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+}
+
+static int wait_event(aster_runtime_t rt, aster_operation_t op, aster_event_t *out) {
+    for (int i = 0; i < 300; i++) {
+        aster_event_t ev[8];
+        size_t n = aster_poll_events(rt, ev, 8, 100);
+        for (size_t k = 0; k < n; k++) {
+            if (ev[k].operation == op) {
+                *out = ev[k];
+                return 1;
+            }
+            if (ev[k].buffer) aster_buffer_release(rt, ev[k].buffer);
+        }
+    }
+    return 0;
+}
+
+static void test_gate_and_node(void) {
+    printf("[gate + node start]\n");
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+
+    aster_gate_t gate = 0;
+    CHECK(aster_gate_new(rt, &gate) == ASTER_STATUS_OK && gate != 0);
+    const char *peer = "abababababababababababababababababababababababababababababababab";
+    aster_bytes_t p = {(const uint8_t *)peer, 64};
+    uint32_t admitted = 9;
+    CHECK(aster_gate_is_admitted(rt, gate, p, &admitted) == ASTER_STATUS_OK && admitted == 0);
+    CHECK(aster_gate_admit(rt, gate, p) == ASTER_STATUS_OK);
+    CHECK(aster_gate_is_admitted(rt, gate, p, &admitted) == ASTER_STATUS_OK && admitted == 1);
+    CHECK(aster_gate_revoke(rt, gate, p) == ASTER_STATUS_OK);
+    CHECK(aster_gate_is_admitted(rt, gate, p, &admitted) == ASTER_STATUS_OK && admitted == 0);
+    aster_bytes_t reason = {(const uint8_t *)"blocked", 7};
+    CHECK(aster_gate_set_reject(rt, gate, 451, reason) == ASTER_STATUS_OK);
+    CHECK(aster_gate_set_trust_mode(rt, gate, 5) == ASTER_STATUS_INVALID_ARGUMENT);
+
+    aster_config_t c;
+    CHECK(aster_config_init(&c) == ASTER_STATUS_OK);
+    c.relay_mode = ASTER_RELAY_MODE_DISABLED;
+    c.bind_addr = (aster_bytes_t){(const uint8_t *)"127.0.0.1:0", 11};
+    aster_bytes_t alpn = {(const uint8_t *)"aster/1", 7};
+    c.alpns = (aster_bytes_list_t){&alpn, 1};
+    aster_operation_t op = 0;
+    CHECK(aster_node_start(rt, &c, gate, 42, &op) == ASTER_STATUS_OK);
+    aster_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev));
+    CHECK(ev.kind == ASTER_EVENT_NODE_CREATED && ev.user_data == 42 && ev.handle != 0);
+    aster_node_t node = ev.handle;
+
+    aster_bytes_t text = {0};
+    CHECK(aster_node_metrics_prometheus(rt, node, &text) == ASTER_STATUS_OK);
+    CHECK(text.ptr != NULL && strstr((const char *)text.ptr, "iroh_send_ipv4") != NULL);
+    CHECK(aster_string_release(text.ptr, text.len) == ASTER_STATUS_OK);
+    CHECK(aster_node_set_gate(rt, node, 0) == ASTER_STATUS_OK);
+    CHECK(aster_node_set_gate(rt, node, gate) == ASTER_STATUS_OK);
+
+    CHECK(aster_admission_respond(rt, 987654, ASTER_HOOK_DECISION_DENY, 403, reason) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_admission_respond(rt, 987654, 7, 0, reason) == ASTER_STATUS_INVALID_ARGUMENT);
+
+    CHECK(aster_node_free(rt, node) == ASTER_STATUS_OK);
+    CHECK(aster_gate_free(rt, gate) == ASTER_STATUS_OK);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
+}
+
 int main(void) {
     test_abi_version();
     test_enum_values();
     test_runtime();
     test_envelope();
+    test_config();
+    test_gate_and_node();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;
