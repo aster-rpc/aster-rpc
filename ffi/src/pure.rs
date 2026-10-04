@@ -861,6 +861,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "reads the wall clock; Miri isolation forbids CLOCK_REALTIME"
+    )]
     fn attestation_mint_verify_role() {
         unsafe {
             let (root, node) = ([1u8; 32], [2u8; 32]);

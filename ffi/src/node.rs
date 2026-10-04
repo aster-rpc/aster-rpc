@@ -1455,6 +1455,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "touches the filesystem; Miri isolation forbids mkdir")]
     fn config_from_toml_fills_every_section() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
