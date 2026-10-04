@@ -5,7 +5,7 @@
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Status (ABI 4.2: upcalls, leases, expose; 2026-10-04)
+## Status (ABI 4.3: upcalls, leases, expose, streaming relay; 2026-10-04)
 
 **Working at RPC parity for open-gate interop.** Go is in the `tests/interop/`
 matrix (Rust / Python / TypeScript / Java / .NET / Go, 6×6 = 36/36, identical
@@ -141,6 +141,20 @@ whose ABI major differs (4).
   before closing the registry. The `ExposeInfo` / handler behaviour follows
   `docs/_internal/bindings/upcall-design.md` section 6.
 
+- **ABI 4.3 streaming consumer relay** (`relay_stream.go`):
+  `Connection.RelayStream(ctx, RelayStreamRequest{ServiceID, Method, URI,
+  Headers, Body io.Reader, OnUploadError})` returns at the response head
+  (`RelayResponse.Body` is an `io.ReadCloser`) while the upload keeps
+  running. A body-source failure before the head is the call's error; after
+  it, `OnUploadError` hears it. `Body.Close` before EOF abandons the exchange
+  and resets an unfinished upload; after a clean EOF the upload finishes. ctx
+  covers the whole exchange; a source that is an `io.Closer` is closed on
+  abandon. Refusals are `ErrRelayDenied` (also `ErrPermissionDenied`),
+  `ErrRelayUnknownService` (also `ErrNotFound`), `ErrRelayOverloaded`, ...;
+  statuses 14-16 now have `ErrUnauthenticated` / `ErrPermissionDenied` /
+  `ErrCredentialExpired`, and a denied buffered `RelayRequest` matches
+  `ErrPermissionDenied` too.
+
 Fixed in the catch-up: completions that arrived before their operation was
 registered were dropped (calls could hang); `ReadDatagram` rejected the
 `DATAGRAM_RECEIVED` completion; ticket encode/decode and the canonical/contract
@@ -205,6 +219,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `ucv1.go`, `upcall_types.go` | UCv1 upcall payload codec and kind / status tables (plain Go, no cgo) |
 | `upcall.go` | ABI 4.1 `Upcalls`: poll goroutine, per-kind policy, typed serving, owned-operation helper |
 | `lease.go` | ABI 4.1 leases, fenced resource, topology admitted filter, `Node.EnableShared` |
+| `relay_stream.go` | ABI 4.3 `Connection.RelayStream` (full-duplex streaming relay, readiness-driven) |
 | `expose.go`, `expose_http.go` | ABI 4.2 expose registry, body table, relay / route requests, `net/http` handler adapter |
 | `dataplane.go` | ABI 3.3 blobs / tags / docs / paths / priority wrappers |
 | `pure.go`, `grants.go` | ABI 3.4 ids, HPKE, attestation, sealed grants |

@@ -33,6 +33,7 @@ func TestABI_StructSizes(t *testing.T) {
 		"aster_topology_admitted_stats_t": 32,
 		"aster_http_foreign_options_t":    48,
 		"aster_route_spec_t":              40,
+		"aster_http_relay_options_t":      24, // ABI 4.3
 	}
 	got := cStructSizes()
 	for name, w := range want {
@@ -75,6 +76,8 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	pin("aster_http_foreign_options_t", httpForeignOptionsOffsets(), map[string]uintptr{
 		"struct_size": 0, "flags": 4, "inline_request_max": 8, "max_request_body": 16,
 		"max_response_body": 24, "max_chunk": 32, "response_buffer": 40, "reserved": 44})
+	pin("aster_http_relay_options_t", relayOptionsOffsets(), map[string]uintptr{
+		"struct_size": 0, "flags": 4, "max_chunk": 8, "upload_capacity": 16, "reserved": 20})
 	pin("aster_route_spec_t", routeSpecOffsets(), map[string]uintptr{
 		"host": 0, "service_id": 16, "port": 32, "protocol": 36})
 
@@ -91,6 +94,10 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		"HTTP_BODY_CHUNK_TOO_LARGE": 4, "HTTP_BODY_FINISHED": 5, "HTTP_BODY_TIMEOUT": 6, "HTTP_BODY_READ": 7,
 		"HTTP_BODY_INVALID_TRAILERS": 8, "HTTP_BODY_BLOCKING_ON_RUNTIME": 9,
 		"HTTP_BODY_INVALID_ARGUMENT": -1, "HTTP_BODY_UNKNOWN_HANDLE": -2,
+		"HTTP_BODY_UNKNOWN_SERVICE": 10, "HTTP_BODY_DENIED": 11, "HTTP_BODY_OVERLOADED": 12, "HTTP_BODY_RESET": 13,
+		"HTTP_BODY_BAD_HEAD": 14, "HTTP_BODY_CONNECTION_CLOSED": 15, "HTTP_BODY_UPLOAD_FAILED": 16,
+		"HTTP_BODY_BUFFER_TOO_SMALL": 17, "EVENT_HTTP_RELAY_READY": 109,
+		"STATUS_UNAUTHENTICATED": 14, "STATUS_PERMISSION_DENIED": 15, "STATUS_CREDENTIAL_EXPIRED": 16,
 		"HOOK_FAILURE_FAIL_OPEN": 0, "HOOK_FAILURE_FAIL_CLOSED": 1, "UPCALL_DEFAULT_CAPACITY": 1024,
 	}
 	got := abiEnums()
@@ -108,9 +115,26 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		CancelShutdown != 3 {
 		t.Error("upcall_types.go drifted from the header")
 	}
-	// ABI 4.1 + 4.2 are both in the library.
-	if _, minor, _ := Version(); minor < 2 {
-		t.Errorf("library ABI minor %d, binding needs >= 2", minor)
+	// Relay codes map to the aster_status_t sentinels (ABI 4.3).
+	for code, want := range map[int32]int32{
+		10: ASTER_STATUS_NOT_FOUND, 11: ASTER_STATUS_PERMISSION_DENIED, 2: ASTER_STATUS_CANCELLED,
+		6: ASTER_STATUS_TIMEOUT, 999: ASTER_STATUS_INTERNAL,
+	} {
+		if got := bodyStatusToStatus(code); got != want {
+			t.Errorf("aster_http_body_status_to_status(%d) = %d, want %d", code, got, want)
+		}
+	}
+	if !errors.Is(wrapError(ASTER_STATUS_PERMISSION_DENIED), ErrPermissionDenied) ||
+		!errors.Is(wrapError(ASTER_STATUS_UNAUTHENTICATED), ErrUnauthenticated) ||
+		!errors.Is(wrapError(ASTER_STATUS_CREDENTIAL_EXPIRED), ErrCredentialExpired) {
+		t.Error("auth statuses 14..16 do not map to their sentinels")
+	}
+	if !errors.Is(&BodyError{Code: 11}, ErrPermissionDenied) || !errors.Is(&BodyError{Code: 11}, ErrRelayDenied) {
+		t.Error("relay DENIED does not match ErrPermissionDenied")
+	}
+	// ABI 4.1 + 4.2 + 4.3 are all in the library.
+	if _, minor, _ := Version(); minor < 3 {
+		t.Errorf("library ABI minor %d, binding needs >= 3", minor)
 	}
 }
 

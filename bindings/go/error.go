@@ -86,6 +86,12 @@ func errorFromStatus(code C.int) *IrohError {
 		return errorf(c, "stream reset")
 	case ASTER_STATUS_ABI_MISMATCH:
 		return errorf(c, "ABI version mismatch")
+	case ASTER_STATUS_UNAUTHENTICATED:
+		return errorf(c, "unauthenticated")
+	case ASTER_STATUS_PERMISSION_DENIED:
+		return errorf(c, "permission denied")
+	case ASTER_STATUS_CREDENTIAL_EXPIRED:
+		return errorf(c, "credential expired")
 	case ASTER_STATUS_VERIFICATION_FAILED:
 		return errorf(c, "verification failed")
 	default:
@@ -110,6 +116,13 @@ var (
 	// ErrVerificationFailed: well-formed input failed a security check (an
 	// envelope does not open, a chain does not verify, role != capability).
 	ErrVerificationFailed = errors.New("verification failed")
+	// ErrUnauthenticated, ErrPermissionDenied and ErrCredentialExpired are
+	// the auth statuses (ABI 4.3). Only a denied expose relay produces one
+	// today (ErrPermissionDenied); the others are reserved for the R4 auth
+	// model.
+	ErrUnauthenticated   = errors.New("unauthenticated")
+	ErrPermissionDenied  = errors.New("permission denied")
+	ErrCredentialExpired = errors.New("credential expired")
 )
 
 // statusToError maps status codes to sentinel errors for errors.Is matching.
@@ -127,6 +140,9 @@ var statusToError = map[int32]error{
 	ASTER_STATUS_STREAM_RESET:        ErrStreamReset,
 	ASTER_STATUS_ABI_MISMATCH:        ErrABIMismatch,
 	ASTER_STATUS_VERIFICATION_FAILED: ErrVerificationFailed,
+	ASTER_STATUS_UNAUTHENTICATED:     ErrUnauthenticated,
+	ASTER_STATUS_PERMISSION_DENIED:   ErrPermissionDenied,
+	ASTER_STATUS_CREDENTIAL_EXPIRED:  ErrCredentialExpired,
 }
 
 // Is returns true if target is a matching sentinel error.

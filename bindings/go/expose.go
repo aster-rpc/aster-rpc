@@ -55,16 +55,37 @@ var (
 	ErrBodyInvalidTrailers = errors.New("http body: invalid trailers")
 	// ErrBodyBlockingOnRuntime: a blocking call made on a runtime thread.
 	ErrBodyBlockingOnRuntime = errors.New("http body: blocking call on a runtime thread")
+
+	// Relay failures (ABI 4.3, codes 10..16), also reported by a streaming
+	// relay's head and body. Each also matches the aster_status_t it maps to
+	// (aster_http_body_status_to_status): ErrRelayUnknownService is
+	// ErrNotFound, ErrRelayDenied is ErrPermissionDenied.
+
+	// ErrRelayUnknownService: the peer does not expose the service.
+	ErrRelayUnknownService = errors.New("relay: unknown service")
+	// ErrRelayDenied: the peer's authorizer refused the request.
+	ErrRelayDenied = errors.New("relay: denied")
+	// ErrRelayOverloaded: the service is at its per-service stream cap.
+	ErrRelayOverloaded = errors.New("relay: overloaded")
+	// ErrRelayReset: the peer reset the stream.
+	ErrRelayReset = errors.New("relay: stream reset")
+	// ErrRelayBadHead: the peer's response head was malformed.
+	ErrRelayBadHead = errors.New("relay: bad response head")
+	// ErrRelayConnectionClosed: the connection ended.
+	ErrRelayConnectionClosed = errors.New("relay: connection closed")
+	// ErrRelayUploadFailed: the request body failed before the response head.
+	ErrRelayUploadFailed = errors.New("relay: upload failed")
 )
 
 var bodyErrors = map[int]error{
 	1: ErrBodyUnknownStream, 2: ErrBodyCancelled, 3: ErrBodyTooLarge, 4: ErrBodyChunkTooLarge,
 	5: ErrBodyFinished, 6: ErrBodyTimeout, 7: ErrBodyRead, 8: ErrBodyInvalidTrailers,
-	9: ErrBodyBlockingOnRuntime,
+	9: ErrBodyBlockingOnRuntime, 10: ErrRelayUnknownService, 11: ErrRelayDenied, 12: ErrRelayOverloaded,
+	13: ErrRelayReset, 14: ErrRelayBadHead, 15: ErrRelayConnectionClosed, 16: ErrRelayUploadFailed,
 }
 
-// BodyError is a failed aster_http_body_* call; Code is the stable BodyError
-// code 1..9.
+// BodyError is a failed aster_http_body_* (or relay) call; Code is the
+// stable aster_http_body_status_t code 1..17.
 type BodyError struct {
 	Op   string
 	Code int
@@ -82,14 +103,19 @@ func (e *BodyError) Is(target error) bool {
 	if s, ok := bodyErrors[e.Code]; ok && s == target {
 		return true
 	}
-	return e.Code == 6 && target == ErrTimeout
+	if e.Code == 6 && target == ErrTimeout {
+		return true
+	}
+	// The aster_status_t the C ABI maps the code to (DENIED -> PERMISSION_DENIED, ...).
+	st := int32(C.aster_http_body_status_to_status(C.int32_t(e.Code)))
+	return st != ASTER_STATUS_INTERNAL && statusToError[st] == target
 }
 
 func bodyStatus(op string, st C.int32_t) error {
 	switch {
 	case st == 0:
 		return nil
-	case st >= 1 && st <= 9:
+	case st >= 1 && st <= 17:
 		return &BodyError{Op: op, Code: int(st)}
 	case st == C.ASTER_HTTP_BODY_INVALID_ARGUMENT:
 		return fmt.Errorf("%s: %w", op, ErrInvalidArgument)
