@@ -64,7 +64,7 @@ health = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 # is already in the graph through the transport core; the upcall adapters
 # implement its traits). It exposes
 # `#[doc(hidden)]` accessors from the facade types to the transport-core
-# handles a binding still drives directly (reactor ring, client-call pool,
+# handles a binding still drives directly (dispatch ring, client-call pool,
 # tunnels, raw hook receiver) -- `aster::binding_support`. Not a stable API;
 # no Rust application should enable it.
 #

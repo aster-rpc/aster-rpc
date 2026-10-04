@@ -22,11 +22,11 @@
 //!   the stream stays open between calls).
 //!
 //! Two reactor entry shapes:
-//! - `start_reactor` / `start_reactor_on`: owns the accept loop (pulls from
-//!   `node.accept_aster()`). Good for standalone Server use.
+//! - `start_reactor_with_limits`: owns the accept loop (pulls from
+//!   `node.accept_aster()`). `aster::rpc::Server::serve` uses it.
 //! - `create_reactor`: returns a handle + feeder. The caller owns the accept
-//!   loop and feeds RPC connections via `ReactorFeeder::feed`. Good for
-//!   AsterServer integration where the accept loop dispatches by ALPN.
+//!   loop and feeds RPC connections via `ReactorFeeder::feed`
+//!   (`aster::expose` and the transport-level tests).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -428,37 +428,21 @@ pub struct ReactorHandle {
     event_rx: mpsc::Receiver<ReactorEvent>,
     /// Non-rpc accept queue. Populated by `accept_loop` when a connection
     /// negotiates an ALPN other than `aster/1` (e.g. `aster.consumer_admission`).
-    /// Bindings drain this via [`next_non_rpc`] and dispatch to the right
-    /// per-ALPN handler. Always present — `start_reactor*` wires it even when no
-    /// non-rpc ALPNs are registered; stays empty in that case.
+    /// Always present -- `start_reactor_with_limits` wires it even when no
+    /// non-rpc ALPNs are registered; stays empty in that case, and in
+    /// `create_reactor` mode, where the caller owns the accept loop.
     non_rpc_rx: mpsc::Receiver<(Vec<u8>, CoreConnection)>,
 }
 
 impl ReactorHandle {
-    /// Pull the next event (call or connection-closed). Bindings that
-    /// need to reap per-connection state on disconnect should consume
-    /// from this API.
+    /// Pull the next event (call or connection-closed).
     pub async fn next_event(&mut self) -> Option<ReactorEvent> {
         self.event_rx.recv().await
     }
 
-    /// Pull the next non-rpc aster-ALPN connection from the reactor's internal
-    /// dispatch channel. Returns `(alpn, connection)` — the alpn is whichever
-    /// non-`aster/1` protocol the peer negotiated (e.g. `aster.consumer_admission`,
-    /// `aster.producer_admission`). Returns `None` when the reactor is shut down.
-    ///
-    /// Intended for server bindings that register custom ALPNs on the node and
-    /// want to multiplex admission / registry / manifest handlers alongside the
-    /// RPC pipeline owned by the reactor. The binding is responsible for
-    /// dispatching the connection to the right handler based on the alpn bytes.
-    pub async fn next_non_rpc(&mut self) -> Option<(Vec<u8>, CoreConnection)> {
-        self.non_rpc_rx.recv().await
-    }
-
-    /// Consume this handle and split it into its two independent receivers. The
-    /// FFI layer needs this so a background pump task can own the RPC event
-    /// stream while the non-rpc receiver is retained in reactor state for
-    /// synchronous long-poll access.
+    /// Split this handle into its two independent receivers: the RPC event
+    /// stream and the non-rpc `(alpn, connection)` queue, so each can be
+    /// drained by its own task (as `aster::rpc::Server::serve` does).
     pub fn into_parts(
         self,
     ) -> (
@@ -466,32 +450,6 @@ impl ReactorHandle {
         mpsc::Receiver<(Vec<u8>, CoreConnection)>,
     ) {
         (self.event_rx, self.non_rpc_rx)
-    }
-
-    /// Back-compat convenience: pull the next **Call** event,
-    /// silently draining (and logging at debug) any
-    /// `ConnectionClosed` events that arrive. Existing FFI consumers
-    /// that don't yet track connection lifecycle can continue to use
-    /// this shape unchanged.
-    pub async fn next_call(&mut self) -> Option<IncomingCall> {
-        loop {
-            match self.event_rx.recv().await {
-                Some(ReactorEvent::Call(c)) => return Some(c),
-                Some(ReactorEvent::ConnectionClosed {
-                    peer_id,
-                    connection_id,
-                    ..
-                }) => {
-                    tracing::debug!(
-                        peer = %peer_id,
-                        connection_id = connection_id,
-                        "ConnectionClosed event dropped by next_call (binding has not migrated to next_event)"
-                    );
-                    continue;
-                }
-                None => return None,
-            }
-        }
     }
 }
 
@@ -542,15 +500,11 @@ pub fn create_reactor(
     )
 }
 
-/// Start a reactor that owns the accept loop.
-pub fn start_reactor(node: CoreNode, channel_capacity: usize) -> ReactorHandle {
-    start_reactor_with_limits(node, channel_capacity, None)
-}
-
-/// As [`start_reactor`], with a per-method body-frame cap resolver.
+/// Start a reactor that owns the accept loop, with an optional per-method
+/// body-frame cap resolver.
 ///
 /// This is the production accept path -- `Server::serve` goes through it -- so
-/// without this entry point a service could declare method limits that nothing
+/// without the resolver a service could declare method limits that nothing
 /// ever installed. `None` keeps the pre-existing global limit for every
 /// service.
 pub fn start_reactor_with_limits(
@@ -561,31 +515,6 @@ pub fn start_reactor_with_limits(
     let (event_tx, event_rx) = mpsc::channel(channel_capacity);
     let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
     tokio::spawn(accept_loop(node, event_tx, non_rpc_tx, resolve));
-    ReactorHandle {
-        event_rx,
-        non_rpc_rx,
-    }
-}
-
-/// Same as `start_reactor` but takes an explicit runtime handle.
-pub fn start_reactor_on(
-    handle: &tokio::runtime::Handle,
-    node: CoreNode,
-    channel_capacity: usize,
-) -> ReactorHandle {
-    start_reactor_on_with_limits(handle, node, channel_capacity, None)
-}
-
-/// As [`start_reactor_on`], with a per-method body-frame cap resolver.
-pub fn start_reactor_on_with_limits(
-    handle: &tokio::runtime::Handle,
-    node: CoreNode,
-    channel_capacity: usize,
-    resolve: Option<FrameLimitResolver>,
-) -> ReactorHandle {
-    let (event_tx, event_rx) = mpsc::channel(channel_capacity);
-    let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
-    handle.spawn(accept_loop(node, event_tx, non_rpc_tx, resolve));
     ReactorHandle {
         event_rx,
         non_rpc_rx,
@@ -765,11 +694,6 @@ pub mod test_hooks {
         }
     }
 }
-
-/// Physical response queue depth. The strict item and byte semaphores include
-/// the writer's in-flight item; this mpsc capacity is only the transport for
-/// those already-accounted items.
-pub const RESPONSE_CHANNEL_DEPTH: usize = RESPONSE_ITEM_LIMIT;
 
 /// Test-only counters so a test can assert on what the reader actually did --
 /// how many resolver calls it made and how many body bytes it materialized --
