@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -608,6 +609,103 @@ public class AbiContractTests
 
     [Fact]
     public void Abi_4_3_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi43Exports);
+
+    // ─── ABI 4.4: coordination client + placement ───────────────────────────
+
+    [Fact]
+    public unsafe void Coordination_Options_Layout_And_Init_Match_Header()
+    {
+        // aster_coordination_client_options_t: 48 bytes (LP64).
+        Assert.Equal(48, Marshal.SizeOf<CoordinationClientOptionsNative>());
+        Off<CoordinationClientOptionsNative>("struct_size", 0);
+        Off<CoordinationClientOptionsNative>("flags", 4);
+        Off<CoordinationClientOptionsNative>("group_id", 8);
+        Off<CoordinationClientOptionsNative>("seed_tickets", 16);
+        Off<CoordinationClientOptionsNative>("journal_dir", 32);
+        CoordinationClientOptionsNative o = default;
+        Native.Check(Native.aster_coordination_client_options_init(&o), "init");
+        Assert.Equal(48u, o.struct_size);
+        Assert.Equal(0u, o.flags);
+        Assert.Equal(1u, Native.CoordinationClientReadOnly);
+    }
+
+    [Fact]
+    public void Coordination_Enum_Values_Match_Header()
+    {
+        Assert.Equal(110u, (uint)EventKind.CoordinationClientOpened);
+        Assert.Equal(111u, (uint)EventKind.CoordinationResolved);
+        Assert.Equal(112u, (uint)EventKind.CoordinationResult);
+        Assert.Equal(113u, (uint)EventKind.CoordinationLeaseAcquired);
+        // aster_coordination_error_t (the error_code of a coordination ERROR event).
+        Assert.Equal(1, (int)Coordination.CoordinationErrorKind.AwaitingAck);
+        Assert.Equal(2, (int)Coordination.CoordinationErrorKind.Unresolved);
+        Assert.Equal(3, (int)Coordination.CoordinationErrorKind.JournalLocked);
+        Assert.Equal(4, (int)Coordination.CoordinationErrorKind.JournalFatal);
+        Assert.Equal(5, (int)Coordination.CoordinationErrorKind.Rpc);
+        Assert.Equal(6, (int)Coordination.CoordinationErrorKind.Unavailable);
+        Assert.Equal(7, (int)Coordination.CoordinationErrorKind.Closed);
+        Assert.Equal(8, (int)Coordination.CoordinationErrorKind.Rejected);
+        Assert.Equal(9, (int)Coordination.CoordinationErrorKind.Invalid);
+        Assert.Equal(10, (int)Coordination.CoordinationErrorKind.Other);
+        // aster_coordination_mutation_op_t / aster_coordination_read_op_t: the op byte right after tag and version.
+        var key = new Coordination.ResourceKey("n", "k");
+        var fence = new Coordination.CoordFence(new byte[32], key, 1, new byte[32]);
+        byte[] id16 = new byte[16], id32 = new byte[32];
+        Coordination.MutationRequest[] muts =
+        {
+            new Coordination.MutationRequest.Acquire(key, 1), new Coordination.MutationRequest.Renew(fence),
+            new Coordination.MutationRequest.CompareAndSet(fence, 0, []), new Coordination.MutationRequest.Release(fence),
+            new Coordination.MutationRequest.ReleaseWithValue(fence, 0, []), new Coordination.MutationRequest.Revoke(key, null),
+            new Coordination.MutationRequest.SetGrant(key, id32, 1, 0), new Coordination.MutationRequest.SetAdmin(id32, true, 0),
+            new Coordination.MutationRequest.ChangeMembership(id16, null, [], [], []), new Coordination.MutationRequest.CancelMembership(id16, 0),
+        };
+        for (int i = 0; i < muts.Length; i++) Assert.Equal((byte)(i + 1), Coordination.CoordinationCodec.EncodeMutationRequest(muts[i])[2]);
+        Coordination.ReadRequest[] reads =
+        {
+            new Coordination.ReadRequest.ReadLinearizable(key), new Coordination.ReadRequest.InspectAcl(key), new Coordination.ReadRequest.InspectAdmins(),
+            new Coordination.ReadRequest.MembershipStatus(null), new Coordination.ReadRequest.GroupStatus(), new Coordination.ReadRequest.ProbeClient(id32, id16),
+            new Coordination.ReadRequest.AuditStream(null, 1), new Coordination.ReadRequest.RecoveryExport(),
+        };
+        for (int i = 0; i < reads.Length; i++) Assert.Equal((byte)(i + 1), Coordination.CoordinationCodec.EncodeReadRequest(reads[i])[2]);
+    }
+
+    [Fact]
+    public void Coordination_Tags_Match_Header_Defines()
+    {
+        string? header = null;
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "ffi", "aster_ffi.h"))) dir = dir.Parent;
+        if (dir != null) header = File.ReadAllText(Path.Combine(dir.FullName, "ffi", "aster_ffi.h"));
+        if (header == null) return;
+        var expected = new Dictionary<string, byte>
+        {
+            ["MUTATION_REQUEST"] = Coordination.CoordinationCodec.TagMutationRequest, ["READ_REQUEST"] = Coordination.CoordinationCodec.TagReadRequest,
+            ["MUTATION_REPLY"] = Coordination.CoordinationCodec.TagMutationReply, ["READ_REPLY"] = Coordination.CoordinationCodec.TagReadReply,
+            ["ACL_STATUS"] = Coordination.CoordinationCodec.TagAclStatus, ["ADMIN_STATUS"] = Coordination.CoordinationCodec.TagAdminStatus,
+            ["MEMBERSHIP_STATUS"] = Coordination.CoordinationCodec.TagMembershipStatus, ["GROUP_STATUS"] = Coordination.CoordinationCodec.TagGroupStatus,
+            ["CLIENT_PROBE"] = Coordination.CoordinationCodec.TagClientProbe, ["AUDIT_RECORDS"] = Coordination.CoordinationCodec.TagAuditRecords,
+            ["RECOVERY_EXPORT"] = Coordination.CoordinationCodec.TagRecoveryExport, ["RECOVERY_EXPORT_MANIFEST"] = Coordination.CoordinationCodec.TagRecoveryExportManifest,
+            ["RETIRE_REPLY"] = Coordination.CoordinationCodec.TagRetireReply, ["COORDINATION_FENCE"] = Coordination.CoordinationCodec.TagCoordinationFence,
+            ["PLACEMENT_REPORT"] = Coordination.CoordinationCodec.TagPlacementReport,
+        };
+        foreach (var (name, tag) in expected)
+            Assert.Matches($@"#define ASTER_COORDINATION_TAG_{name}\s+{tag}\b", header);
+    }
+
+    private static readonly string[] Abi44Exports =
+    {
+        "aster_coordination_client_options_init", "aster_coordination_client_open", "aster_coordination_client_close", "aster_coordination_client_free",
+        "aster_coordination_client_ids", "aster_coordination_client_id", "aster_coordination_mutate", "aster_coordination_unacknowledged",
+        "aster_coordination_resume", "aster_coordination_resolved_acknowledge", "aster_coordination_resolved_free",
+        "aster_coordination_retire_other_client", "aster_coordination_read", "aster_coordination_recovery_export_to_file",
+        "aster_coordination_lease_acquire", "aster_coordination_lease_fence", "aster_coordination_lease_status",
+        "aster_coordination_lease_compare_and_set", "aster_coordination_lease_release", "aster_coordination_lease_release_with_value",
+        "aster_coordination_lease_free", "aster_coordination_placement_manager_new", "aster_coordination_placement_reconcile",
+        "aster_coordination_placement_manager_free",
+    };
+
+    [Fact]
+    public void Abi_4_4_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi44Exports);
 
     // ─── Bytes helpers ───────────────────────────────────────────────────────
 
