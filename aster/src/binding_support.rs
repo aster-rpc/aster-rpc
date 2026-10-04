@@ -43,3 +43,8 @@ pub fn start_reactor_on(
 ) -> reactor::ReactorHandle {
     reactor::start_reactor_on(runtime, node.core_node().clone(), channel_capacity)
 }
+
+/// Foreign (binding-implemented) services served by `aster::rpc::Server`:
+/// call events, the shared call table, and the ring sink.
+#[cfg(feature = "rpc")]
+pub mod dispatch;

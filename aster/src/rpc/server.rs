@@ -16,11 +16,12 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use fory_core::Fory;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use aster_transport_core::contract::evaluate_capability;
@@ -32,15 +33,17 @@ use aster_transport_core::reactor::{
     self, IncomingCall, OutgoingFrame, ReactorEvent, RequestFrame, ResponseReserveError,
     ResponseSender,
 };
-use aster_transport_core::CoreNode;
+use aster_transport_core::{CoreConnection, CoreNode};
 
 use super::auth::{AttributeStore, AuthContext, Authenticator, CapabilityRequirement};
 use super::codec::{
     decode_stream_header, encode_rpc_status, RpcStatus, SerializationMode, StreamHeader,
 };
 use super::deadline::DeadlineQueue;
+use super::dynamic::DynamicService;
+use super::foreign::{DispatchEvent, DispatchSink, Foreign, ForeignService, ForeignSession};
 use super::sessions::{
-    check_shared, missing_session, ServiceKey, SessionFactory, SessionStore,
+    check_shared, missing_session, ServiceKey, SessionFactory, SessionInstance, SessionStore,
     DEFAULT_MAX_SESSIONS_PER_CONNECTION,
 };
 use super::status::StatusCode;
@@ -155,6 +158,12 @@ pub struct Server {
     handler_timeout: Option<Duration>,
     /// One timer facility per server, shared by every dispatcher it hands out.
     deadlines: DeadlineQueue,
+    /// Foreign (binding-implemented) services, in registration order.
+    foreign_specs: Vec<DynamicService>,
+    dispatch_sink: Option<Arc<dyn DispatchSink>>,
+    /// Built from the two fields above on first use and shared by every
+    /// dispatcher, so all transports see one call table.
+    foreign: OnceLock<Arc<Foreign>>,
 }
 
 /// The default cap on how long any handler may run: Python's
@@ -176,7 +185,64 @@ impl Server {
             max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             deadlines: DeadlineQueue::default(),
+            foreign_specs: Vec::new(),
+            dispatch_sink: None,
+            foreign: OnceLock::new(),
         }
+    }
+
+    /// Where foreign calls and lifecycle events go (binding support). Set
+    /// this before [`dispatcher`](Server::dispatcher) or
+    /// [`serve`](Server::serve). With a sink, connection closes
+    /// ([`DispatchEvent::ConnectionClosed`]) and connections on non-RPC
+    /// ALPNs that no [`route_alpn`](Server::route_alpn) handler claims
+    /// ([`DispatchEvent::NonRpc`]) are delivered too.
+    #[cfg(feature = "binding-support")]
+    pub fn dispatch_sink(mut self, sink: Arc<dyn DispatchSink>) -> Self {
+        self.dispatch_sink = Some(sink);
+        self.foreign = OnceLock::new();
+        self
+    }
+
+    /// Serve a foreign (binding-implemented) service: calls that pass the
+    /// gates are delivered to the [`dispatch_sink`](Server::dispatch_sink)
+    /// with `service_idx` = the number of foreign services registered before
+    /// this one. Validates `svc`, and refuses a `(name, version)` that is
+    /// already registered, so register native services first.
+    #[cfg(feature = "binding-support")]
+    pub fn dynamic_service(mut self, svc: DynamicService) -> Result<Self> {
+        svc.validate()?;
+        let key = svc.key();
+        if self.services.contains_key(&key)
+            || self.session_factories.contains_key(&key)
+            || self.foreign_specs.iter().any(|s| s.key() == key)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "service '{}' v{} is already registered",
+                key.0, key.1
+            )));
+        }
+        self.foreign_specs.push(svc);
+        self.foreign = OnceLock::new();
+        Ok(self)
+    }
+
+    /// The table through which the binding answers foreign calls. Every
+    /// dispatcher of this server shares it.
+    #[cfg(feature = "binding-support")]
+    pub fn call_table(&self) -> super::foreign::CallTable {
+        self.foreign().table.clone()
+    }
+
+    fn foreign(&self) -> Arc<Foreign> {
+        self.foreign
+            .get_or_init(|| {
+                Arc::new(Foreign::new(
+                    self.foreign_specs.clone(),
+                    self.dispatch_sink.clone(),
+                ))
+            })
+            .clone()
     }
 
     /// The longest any handler may run, whatever the caller asked for
@@ -263,14 +329,14 @@ impl Server {
         S: ServiceDispatch,
         F: Fn() -> S + Send + Sync + 'static,
     {
-        let factory: SessionFactory =
-            Arc::new(move || Arc::new(factory()) as Arc<dyn ServiceDispatch>);
         // One instance read for its constant metadata: name, version, and --
         // since the frame-limit resolver runs before any session exists -- the
         // declared per-method frame caps. Keeping it means session-scoped
         // services get their limits installed like any other; without it they
         // silently kept the 16 MiB default.
-        let probe = factory();
+        let probe: Arc<dyn ServiceDispatch> = Arc::new(factory());
+        let factory: SessionFactory =
+            Arc::new(move || SessionInstance::Native(Arc::new(factory())));
         let key = (probe.name().to_string(), probe.version());
         self.session_probes.insert(key.clone(), probe);
         self.session_factories.insert(key, factory);
@@ -345,6 +411,7 @@ impl Server {
             authenticator: self.authenticator.clone(),
             handler_timeout: self.handler_timeout,
             deadlines: self.deadlines.clone(),
+            foreign: self.foreign(),
         }
     }
 
@@ -355,6 +422,7 @@ impl Server {
     pub fn serve(self) -> ServerHandle {
         let dispatcher = self.dispatcher();
         let resolver = dispatcher.frame_limit_resolver();
+        let foreign = dispatcher.foreign.clone();
         let handle = reactor::start_reactor_with_limits(self.core, 256, Some(resolver));
         let (mut event_rx, mut non_rpc_rx) = handle.into_parts();
 
@@ -372,6 +440,11 @@ impl Server {
                         let parts = CallParts::from_incoming(call);
                         match dispatcher.route(&parts) {
                             Route::Reject(status) => reject_now(parts.response_sender, &status),
+                            // Foreign fast path: delivered from this loop,
+                            // no task per call.
+                            Route::Dispatch(routed) if routed.is_foreign() => {
+                                dispatcher.deliver_foreign(routed, parts);
+                            }
                             route => {
                                 let dispatcher = dispatcher.clone();
                                 tokio::spawn(
@@ -381,8 +454,23 @@ impl Server {
                         }
                     }
                     // §7.5: a connection's sessions die with it.
-                    ReactorEvent::ConnectionClosed { connection_id, .. } => {
+                    // Foreign sessions report `SessionClosed` as they are
+                    // dropped here, ahead of the `ConnectionClosed` below.
+                    ReactorEvent::ConnectionClosed {
+                        connection_id,
+                        peer_id,
+                        ..
+                    } => {
                         dispatcher.close_connection(connection_id);
+                        if dispatcher.foreign.has_sink {
+                            dispatcher
+                                .foreign
+                                .sink
+                                .deliver(DispatchEvent::ConnectionClosed {
+                                    connection_id,
+                                    peer_id: Arc::from(peer_id),
+                                });
+                        }
                     }
                 }
             }
@@ -396,6 +484,12 @@ impl Server {
             while let Some((alpn, core)) = non_rpc_rx.recv().await {
                 match routes.get(&alpn) {
                     Some(handler) => handler(Connection::new(core)),
+                    // Unclaimed, but a binding is listening: its handlers
+                    // (e.g. frozen consumer admission) take it.
+                    None if foreign.has_sink => foreign.sink.deliver(DispatchEvent::NonRpc {
+                        alpn,
+                        connection: core,
+                    }),
                     // No handler for this ALPN: drop `core`, which closes the
                     // connection. The peer observes a closed connection.
                     None => drop(core),
@@ -432,6 +526,8 @@ pub struct Dispatcher {
     authenticator: Option<Arc<dyn Authenticator>>,
     handler_timeout: Option<Duration>,
     deadlines: DeadlineQueue,
+    /// Foreign services, the sink and the shared call table.
+    foreign: Arc<Foreign>,
 }
 
 impl Dispatcher {
@@ -448,14 +544,22 @@ impl Dispatcher {
         // registry does not contain them. Consulting only that registry left
         // every session-scoped service on the 16 MiB default.
         let probes = self.session_probes.clone();
+        // Foreign services answer from their `MethodLimits`, shared and
+        // session-scoped alike.
+        let foreign = self.foreign.clone();
         Arc::new(move |header: &[u8]| match decode_stream_header(header) {
             // Undecodable header: reject the stream rather than fall back to a
             // generous default and read a body behind it.
             Err(_) => reactor::FrameLimit::Reject,
             Ok(h) => {
                 let key = (h.service.clone(), h.version);
-                let svc = services.get(&key).or_else(|| probes.get(&key));
-                match svc.and_then(|s| s.max_frame_size(&h.method)) {
+                let cap = match services.get(&key).or_else(|| probes.get(&key)) {
+                    Some(s) => s.max_frame_size(&h.method),
+                    None => foreign
+                        .service(&key)
+                        .and_then(|s| s.max_frame_size(&h.method)),
+                };
+                match cap {
                     None => reactor::FrameLimit::Default,
                     Some(n) => reactor::FrameLimit::Limit(n),
                 }
@@ -515,15 +619,21 @@ impl Dispatcher {
         }
 
         let key = (header.service.clone(), header.version);
-        let (meta, factory) = if let Some(s) = self.services.get(&key) {
-            (s.clone(), None)
+        let (meta, factory, foreign) = if let Some(s) = self.services.get(&key) {
+            (s.clone(), None, None)
         } else if let (Some(probe), Some(f)) = (
             self.session_probes.get(&key),
             self.session_factories.get(&key),
         ) {
             // Session-scoped: gate on the metadata probe; the instance is
             // resolved below, after the cheap checks.
-            (probe.clone(), Some(f.clone()))
+            (probe.clone(), Some(f.clone()), None)
+        } else if let Some(svc) = self.foreign.service(&key) {
+            (
+                svc.clone() as Arc<dyn ServiceDispatch>,
+                self.foreign.factory(&key).cloned(),
+                Some(svc.clone()),
+            )
         } else {
             return Route::Reject(not_found(&header));
         };
@@ -538,19 +648,36 @@ impl Dispatcher {
             return Route::Reject(not_found(&header));
         }
 
-        let methods = meta.methods();
-        if !methods.is_empty() && !methods.iter().any(|m| *m == header.method) {
-            return Route::Reject(RpcStatus::error(
+        let unimplemented = || {
+            Route::Reject(RpcStatus::error(
                 StatusCode::Unimplemented,
                 format!(
                     "method '{}.{}' not implemented",
                     header.service, header.method
                 ),
-            ));
-        }
+            ))
+        };
+        let method_idx = match &foreign {
+            Some(svc) => match svc.method_index(&header.method) {
+                Some(idx) => idx,
+                None => return unimplemented(),
+            },
+            None => {
+                let methods = meta.methods();
+                if !methods.is_empty() && !methods.iter().any(|m| *m == header.method) {
+                    return unimplemented();
+                }
+                0
+            }
+        };
 
-        // Rust speaks XLANG on the wire only (JSON is intentionally unsupported).
-        if header.serialization_mode != SerializationMode::Xlang.as_i8() {
+        // Rust services speak XLANG on the wire only (JSON is intentionally
+        // unsupported); a foreign service accepts the modes it declared.
+        let mode_ok = match &foreign {
+            Some(svc) => svc.accepts_wire_mode(header.serialization_mode),
+            None => header.serialization_mode == SerializationMode::Xlang.as_i8(),
+        };
+        if !mode_ok {
             return Route::Reject(RpcStatus::error(
                 StatusCode::InvalidArgument,
                 format!(
@@ -563,7 +690,13 @@ impl Dispatcher {
         let target = match factory {
             // SHARED service: one instance for everyone, and no session id.
             None => match check_shared(&header.service, header.session_id) {
-                Ok(()) => Target::Ready(meta.clone()),
+                Ok(()) => match &foreign {
+                    Some(svc) => Target::Foreign {
+                        svc: svc.clone(),
+                        session: None,
+                    },
+                    None => Target::Ready(meta.clone()),
+                },
                 Err(e) => return Route::Reject(e.status()),
             },
             Some(factory) => match parts.connection_id {
@@ -576,7 +709,7 @@ impl Dispatcher {
                         .sessions
                         .resolve_connection(conn, &key, header.session_id, &factory)
                     {
-                        Ok(inst) => Target::Ready(inst),
+                        Ok(inst) => target_of(inst, &foreign),
                         Err(e) => return Route::Reject(e.status()),
                     }
                 }
@@ -588,12 +721,11 @@ impl Dispatcher {
                     Some(sid) if self.authenticator.is_some() => {
                         Target::HttpSession { factory, sid }
                     }
-                    Some(sid) => Target::Ready(self.sessions.resolve_http(
-                        &parts.peer_id,
-                        &key,
-                        &sid,
-                        &factory,
-                    )),
+                    Some(sid) => target_of(
+                        self.sessions
+                            .resolve_http(&parts.peer_id, &key, &sid, &factory),
+                        &foreign,
+                    ),
                 },
             },
         };
@@ -614,6 +746,8 @@ impl Dispatcher {
             header,
             key,
             meta,
+            foreign,
+            method_idx,
             target,
             attributes: HashMap::new(),
             deadline,
@@ -650,6 +784,10 @@ impl Dispatcher {
                 }
             },
         };
+        if routed.is_foreign() {
+            self.deliver_foreign(routed, parts);
+            return;
+        }
         let Routed {
             header,
             target,
@@ -659,6 +797,7 @@ impl Dispatcher {
         } = routed;
         let svc = match target {
             Target::Ready(svc) => svc,
+            Target::Foreign { .. } => unreachable!("foreign target delivered above"),
             // `authenticate` resolves every HTTP session before returning.
             Target::HttpSession { .. } => unreachable!("HTTP session left unresolved"),
         };
@@ -738,15 +877,43 @@ impl Dispatcher {
         }
         gate3(&*routed.meta, &routed.header, &attrs)?;
         if let Target::HttpSession { factory, sid } = &routed.target {
-            routed.target = Target::Ready(self.sessions.resolve_http(
-                &parts.peer_id,
-                &routed.key,
-                sid,
-                factory,
-            ));
+            routed.target = target_of(
+                self.sessions
+                    .resolve_http(&parts.peer_id, &routed.key, sid, factory),
+                &routed.foreign,
+            );
         }
         routed.attributes = attrs;
         Ok(routed)
+    }
+
+    /// Hand a routed foreign call to the binding (synchronous; see
+    /// `Foreign::deliver`).
+    fn deliver_foreign(&self, routed: Routed, parts: CallParts) {
+        let Routed {
+            header,
+            method_idx,
+            target,
+            attributes,
+            deadline,
+            ..
+        } = routed;
+        let (svc, session) = match target {
+            Target::Foreign { svc, session } => (svc, session),
+            _ => unreachable!("deliver_foreign on a native target"),
+        };
+        self.foreign.deliver(
+            super::foreign::Delivery {
+                svc,
+                method_idx,
+                session,
+                header,
+                attributes,
+                deadline,
+                parts,
+            },
+            &self.deadlines,
+        );
     }
 
     /// The Gate-3 [`AttributeStore`] this dispatcher checks. A transport's auth
@@ -851,6 +1018,12 @@ pub struct CallParts {
     /// [`from_incoming`](CallParts::from_incoming), or
     /// [`with_connection_id`](CallParts::with_connection_id).
     pub connection_id: Option<u64>,
+    /// The connection itself, when the transport has one. Only foreign
+    /// (binding) calls use it, to give handlers tunnels and addresses.
+    pub connection: Option<CoreConnection>,
+    /// Signalled when `cancelled` is set, so a waiter need not poll it.
+    /// `None` for transports that only set the flag.
+    pub cancel_notify: Option<Arc<Notify>>,
 }
 
 impl CallParts {
@@ -877,6 +1050,8 @@ impl CallParts {
             request_receiver,
             cancelled,
             connection_id: None,
+            connection: None,
+            cancel_notify: None,
         }
     }
 
@@ -891,7 +1066,7 @@ impl CallParts {
     }
 
     /// Extract the dispatch-relevant parts from a reactor [`IncomingCall`],
-    /// dropping the `CoreConnection` and the ids the dispatcher doesn't use.
+    /// dropping the ids the dispatcher doesn't use.
     ///
     /// This is the one path that may claim [`PeerProvenance::IrohAuthenticated`],
     /// because it is the one path whose peer id came from a completed iroh
@@ -907,6 +1082,8 @@ impl CallParts {
             request_receiver: call.request_receiver,
             cancelled: call.cancelled,
             connection_id: Some(call.connection_id),
+            connection: Some(call.connection),
+            cancel_notify: Some(call.cancel_notify),
         }
     }
 }
@@ -964,6 +1141,10 @@ pub struct Routed {
     /// The registered instance (SHARED) or metadata probe (SESSION) the gates
     /// consult.
     meta: Arc<dyn ServiceDispatch>,
+    /// Set for a foreign service (then `meta` is the same object).
+    foreign: Option<Arc<ForeignService>>,
+    /// The foreign method's index; `0` for native services.
+    method_idx: u32,
     target: Target,
     attributes: HashMap<String, String>,
     deadline: Option<Instant>,
@@ -979,17 +1160,41 @@ impl Routed {
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
+
+    /// Whether the call goes to a foreign (binding-implemented) service.
+    pub fn is_foreign(&self) -> bool {
+        self.foreign.is_some()
+    }
 }
 
 enum Target {
     /// The instance that will handle the call.
     Ready(Arc<dyn ServiceDispatch>),
+    /// A foreign service, and its session for a session-scoped one.
+    Foreign {
+        svc: Arc<ForeignService>,
+        session: Option<Arc<ForeignSession>>,
+    },
     /// An HTTP-scoped session whose instance depends on the principal the
     /// authenticator resolves.
     HttpSession {
         factory: SessionFactory,
         sid: String,
     },
+}
+
+/// The target for a resolved session instance.
+fn target_of(inst: SessionInstance, foreign: &Option<Arc<ForeignService>>) -> Target {
+    match (inst, foreign) {
+        (SessionInstance::Native(inst), _) => Target::Ready(inst),
+        (SessionInstance::Foreign(session), Some(svc)) => Target::Foreign {
+            svc: svc.clone(),
+            session: Some(session),
+        },
+        (SessionInstance::Foreign(_), None) => {
+            unreachable!("foreign session for a native service")
+        }
+    }
 }
 
 fn not_found(header: &StreamHeader) -> RpcStatus {
@@ -1028,7 +1233,7 @@ fn gate3(
 
 /// Send a refusal trailer without spawning when the response queue has room
 /// (it always does for a fresh call); fall back to a task only if it is full.
-fn reject_now(sender: ResponseSender, status: &RpcStatus) {
+pub(crate) fn reject_now(sender: ResponseSender, status: &RpcStatus) {
     let Ok(bytes) = encode_rpc_status(status) else {
         return;
     };
