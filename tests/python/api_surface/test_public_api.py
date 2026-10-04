@@ -113,6 +113,30 @@ _CLASS_NAMES = [
     "ConnectRequest",
     "NamespaceCapability",
     "HpkeEnvelope",
+    # Plan P7: attestation, sealed grants, leases, topology
+    "AttestationChain",
+    "VerifiedChain",
+    "GrantContext",
+    "GrantOutcome",
+    "GrantRecord",
+    "PolicyDoc",
+    "AcquireOutcome",
+    "Fence",
+    "GrantorSerializer",
+    "Lease",
+    "LeaseGrantorServer",
+    "LeaseOp",
+    "LeaseOptions",
+    "LeaseRowState",
+    "LeaseSnapshot",
+    "LeaseTransition",
+    "MemorySerializer",
+    "TransitionOutcome",
+    "ClusterView",
+    "PeerView",
+    "Topology",
+    "TopologySnapshot",
+    "TopologyTiming",
 ]
 
 @pytest.mark.parametrize("name", _CLASS_NAMES)
@@ -161,10 +185,39 @@ def test_iroh_node_is_gone():
         "hpke_public_key_from_private",
         "hpke_seal",
         "hpke_open",
+        "hpke_x25519_secret_from_identity",
+        "hpke_x25519_public_from_identity",
+        "hpke_x25519_public_from_node_id",
+        "attest_root_node",
+        "attestation_public_key",
+        "verify_chain",
+        "check_grant_role",
+        "grant_aad",
+        "grant_key",
+        "open_grant",
+        "open_grant_with_key",
+        "open_namespace_grant",
+        "reconcile_grant",
+        "reconcile_namespace_grant",
+        "seal_grant",
+        "seal_grant_to_key",
+        "seal_namespace_grant",
+        "check_fence",
+        "lease_transition",
     ],
 )
 def test_trust_config_primitive_function_is_callable(name):
     assert callable(getattr(ap, name))
+
+
+def test_p7_errors_are_exceptions():
+    assert issubclass(ap.AttestationError, Exception)
+    assert issubclass(ap.FenceRejectedError, Exception)
+
+
+def test_p7_node_methods():
+    for name in ("topology", "lease_grantor", "serve_lease_grantor"):
+        assert callable(getattr(ap.Node, name))
 
 
 # ---------------------------------------------------------------------------

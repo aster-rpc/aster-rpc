@@ -133,6 +133,10 @@ try:
         hpke_public_key_from_private,
         hpke_seal,
         hpke_open,
+        # HPKE keys derived from node identities
+        hpke_x25519_secret_from_identity,
+        hpke_x25519_public_from_identity,
+        hpke_x25519_public_from_node_id,
     )
 except ImportError as e:
     raise ImportError(
@@ -144,6 +148,59 @@ except ImportError as e:
 DocDownloadPolicy = DownloadPolicy
 
 from .config import AsterConfig
+
+# -- Attestation, sealed grants, leases, topology (plan P7) --
+from .attestation import (
+    AttestationChain,
+    AttestationError,
+    VerifiedChain,
+    attest_root_node,
+    attestation_public_key,
+    verify_chain,
+)
+from .grants import (
+    GRANT_AAD_DOMAIN,
+    GRANT_RECORD_VERSION,
+    GrantContext,
+    GrantOutcome,
+    GrantRecord,
+    PolicyDoc,
+    check_grant_role,
+    grant_aad,
+    grant_key,
+    open_grant,
+    open_grant_with_key,
+    open_namespace_grant,
+    reconcile_grant,
+    reconcile_namespace_grant,
+    seal_grant,
+    seal_grant_to_key,
+    seal_namespace_grant,
+)
+from .lease import (
+    AcquireOutcome,
+    Fence,
+    FenceRejectedError,
+    GrantorSerializer,
+    Lease,
+    LeaseGrantorServer,
+    LeaseOp,
+    LeaseOptions,
+    LeaseRowState,
+    LeaseSnapshot,
+    LeaseTransition,
+    MemorySerializer,
+    TransitionOutcome,
+    check_fence,
+    lease_transition,
+)
+from .topology import (
+    ClusterView,
+    PeerView,
+    Topology,
+    TopologySnapshot,
+    TopologyTiming,
+)
 
 # ── Tunneling - handler-side ticket issuance (see aster.tunnel) ──────────────
 from .tunnel import Tcp, Udp, HttpProxy, TunnelHandle, TunnelTarget
@@ -300,6 +357,53 @@ __all__ = [
     "hpke_public_key_from_private",
     "hpke_seal",
     "hpke_open",
+    "hpke_x25519_secret_from_identity",
+    "hpke_x25519_public_from_identity",
+    "hpke_x25519_public_from_node_id",
+    # -- Attestation, sealed grants, leases, topology (plan P7) --
+    "AttestationChain",
+    "AttestationError",
+    "VerifiedChain",
+    "attest_root_node",
+    "attestation_public_key",
+    "verify_chain",
+    "GRANT_AAD_DOMAIN",
+    "GRANT_RECORD_VERSION",
+    "GrantContext",
+    "GrantOutcome",
+    "GrantRecord",
+    "PolicyDoc",
+    "check_grant_role",
+    "grant_aad",
+    "grant_key",
+    "open_grant",
+    "open_grant_with_key",
+    "open_namespace_grant",
+    "reconcile_grant",
+    "reconcile_namespace_grant",
+    "seal_grant",
+    "seal_grant_to_key",
+    "seal_namespace_grant",
+    "AcquireOutcome",
+    "Fence",
+    "FenceRejectedError",
+    "GrantorSerializer",
+    "Lease",
+    "LeaseGrantorServer",
+    "LeaseOp",
+    "LeaseOptions",
+    "LeaseRowState",
+    "LeaseSnapshot",
+    "LeaseTransition",
+    "MemorySerializer",
+    "TransitionOutcome",
+    "check_fence",
+    "lease_transition",
+    "ClusterView",
+    "PeerView",
+    "Topology",
+    "TopologySnapshot",
+    "TopologyTiming",
     # ── Aster RPC framework ──
     "StatusCode",
     "RpcError",

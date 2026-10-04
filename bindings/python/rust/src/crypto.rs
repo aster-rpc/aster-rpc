@@ -76,8 +76,8 @@ fn ed25519_verify(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 }
 
 #[pyclass(name = "NamespaceCapability")]
-struct PyNamespaceCapability {
-    inner: CoreNamespaceCapability,
+pub(crate) struct PyNamespaceCapability {
+    pub(crate) inner: CoreNamespaceCapability,
 }
 
 #[pymethods]
@@ -288,6 +288,40 @@ fn hpke_open(
     Ok(PyBytesResult(payload.into_secret()))
 }
 
+// -- Identity-derived X25519 HPKE keys (aster::crypto) -----------------------
+
+/// The X25519 HPKE private key derived from an Ed25519 node identity secret
+/// (`SecretKey`, 32 bytes or 64 hex): clamped `SHA-512(seed)[..32]`, as
+/// libsodium `crypto_sign_ed25519_sk_to_curve25519`. Use with `hpke_open`.
+#[pyfunction]
+fn hpke_x25519_secret_from_identity(secret: &Bound<'_, PyAny>) -> PyResult<PyBytesResult> {
+    let secret = crate::keys::secret_in("identity secret", secret)?;
+    Ok(PyBytesResult(
+        aster::crypto::hpke_x25519_secret_from_identity(&secret).to_vec(),
+    ))
+}
+
+/// The X25519 HPKE public key derived from an Ed25519 identity public key
+/// (`PublicKey`, `NodeId`, 32 bytes or 64 hex) -- the Edwards->Montgomery
+/// map. Raises `ValueError` for an invalid Ed25519 key (off-curve,
+/// non-canonical, small-order). Use with `hpke_seal`.
+#[pyfunction]
+fn hpke_x25519_public_from_identity(public_key: &Bound<'_, PyAny>) -> PyResult<PyBytesResult> {
+    let public = crate::keys::public_in("identity public key", public_key)?;
+    let key = aster::crypto::hpke_x25519_public_from_identity(&public)
+        .map_err(crate::error::aster_err_to_py)?;
+    Ok(PyBytesResult(key.to_vec()))
+}
+
+/// `hpke_x25519_public_from_identity` for a node id (`NodeId` or 64 hex).
+#[pyfunction]
+fn hpke_x25519_public_from_node_id(node_id: &Bound<'_, PyAny>) -> PyResult<PyBytesResult> {
+    let id = aster::NodeId::from_hex(crate::keys::node_hex(node_id)?);
+    let key = aster::crypto::hpke_x25519_public_from_node_id(&id)
+        .map_err(crate::error::aster_err_to_py)?;
+    Ok(PyBytesResult(key.to_vec()))
+}
+
 pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNamespaceCapability>()?;
     m.add_class::<PyHpkeEnvelope>()?;
@@ -303,5 +337,8 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(hpke_public_key_from_private, m)?)?;
     m.add_function(wrap_pyfunction!(hpke_seal, m)?)?;
     m.add_function(wrap_pyfunction!(hpke_open, m)?)?;
+    m.add_function(wrap_pyfunction!(hpke_x25519_secret_from_identity, m)?)?;
+    m.add_function(wrap_pyfunction!(hpke_x25519_public_from_identity, m)?)?;
+    m.add_function(wrap_pyfunction!(hpke_x25519_public_from_node_id, m)?)?;
     Ok(())
 }

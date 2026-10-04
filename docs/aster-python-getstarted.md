@@ -227,3 +227,112 @@ Network: `IrohConnection.paths()` lists every open `PathInfo` (`kind`
 `rtt_micros`) and `selected_path()` returns the one carrying data.
 `IrohSendStream.set_priority(n)` / `priority()` order send streams on one
 connection (higher first, default 0).
+
+## 7. Attestation, sealed grants, leases and topology
+
+These wrap the Rust SDK's `attestation`, `crypto`, `grants`, `lease` and
+`topology` modules; every wire-defining rule runs in Rust. Value types are
+frozen dataclasses (vary one with `dataclasses.replace`); durations are
+seconds. Key arguments take a `SecretKey` / `PublicKey` / `NodeId`, 32 bytes,
+or 64 hex characters.
+
+**Attestation** -- a portable, offline-verifiable proof that a root identity
+owns a node:
+
+```python
+from aster import AttestationChain, attest_root_node, verify_chain
+
+chain = attest_root_node(root_secret, node.secret_key(), epoch=1)
+text = chain.to_text()                       # "aster.attestation.chain.v1:..."
+v = verify_chain(AttestationChain.from_text(text), [root_id], node.id)
+v.depth, v.role_of(root_id)                  # 1, "anchor"
+```
+
+`not_before` / `not_after` take unix seconds or a `datetime`; failures raise
+`AttestationError`.
+
+**HPKE keys from identities** -- `hpke_x25519_public_from_node_id(peer_id)`
+gives the recipient key for `hpke_seal`; the peer opens with
+`hpke_x25519_secret_from_identity(node.secret_key())` and `hpke_open`.
+Nothing extra to publish; rotating the key means rotating the node identity.
+
+**Sealed grants** -- a root writes one record per recipient into a replicated
+policy doc, sealed to the recipient's identity key and bound to a
+`GrantContext` (app, granter, recipient, resource, path, role):
+
+```python
+from aster import (GrantContext, GrantRecord, NamespaceCapability, PolicyDoc,
+                   docs_client, grant_key, reconcile_namespace_grant,
+                   seal_namespace_grant)
+
+ctx = GrantContext(app="myapp/grant/v1", granter=root.id, recipient=member_id,
+                   resource=bytes.fromhex(ns_id),
+                   path=grant_key("/myapp/v1", member_id), role="write")
+record = GrantRecord.active("write", 1, seal_namespace_grant(ctx, capability))
+await doc.set_bytes(root_author, ctx.path.encode(), record.encode())
+
+# on the member
+policy = await PolicyDoc.import_read_only(docs_client(node), ns_id, root_author)
+outcome = reconcile_namespace_grant(
+    node.secret_key(), ctx, await policy.fetch_grant("/myapp/v1", node.id))
+match outcome.kind:
+    case "active": use(outcome.value)          # a NamespaceCapability
+    case "revoked" | "unopenable": drop()       # outcome.drops_capability
+    case "absent": pass                         # not revocation: keep waiting
+```
+
+`PolicyDoc` reads only the pinned author's records (`get`, `list_prefix`,
+`fetch_grant`, `subscribe` + `is_policy_write`) -- HPKE Base has no sender
+authenticity, so this is what makes grants trustworthy. Revoke by writing
+`GrantRecord.revoked(role, reason)`, never by deleting the key. Also:
+`seal_grant` / `open_grant` (raw payloads), `seal_grant_to_key` /
+`open_grant_with_key` (explicit X25519 keys), `grant_aad`, `check_grant_role`,
+`reconcile_grant`. Grant failures raise `ValueError`.
+
+**Fenced leases** -- a single owner per resource. The grant is a CAS plus a
+TTL; correctness comes from the fence every protected action carries:
+
+```python
+from aster import LeaseOptions, MemorySerializer
+
+ser = MemorySerializer()
+outcome = await ser.acquire("tree/42", node.id, LeaseOptions(ttl=30))
+if outcome.granted:
+    async with outcome.lease as lease:          # released on exit
+        fence = lease.fence()                   # take at send time; None = stop
+        if fence:
+            ser.mutate_fenced(fence, node.id, write)   # FenceRejectedError if stale
+else:
+    backoff(outcome.reason, outcome.snapshot.remaining)
+```
+
+The lease renews in Rust; `lease.status` is `"held"` / `"released"` /
+`"fenced"` / `"lost"`, and `async for s in lease.status_changes()` ends after
+the first terminal status. `stop_renewing()` hands back the fence for one
+final operation without releasing. A designated grantor serves leases over
+RPC: `server = grantor.serve_lease_grantor(MemorySerializer())` on a node
+started with `alpns=[b"aster/1"]` (it owns that node's RPC accept loop), and
+clients use `ser = await node.lease_grantor(grantor_id)` -- every grant is
+bound to the caller's authenticated identity, and `revoke` needs the
+`operator` role unless `open_revoke=True`. `lease_transition(row, expired, op,
+resource)` and `check_fence(row, fence, writer)` are the pure rules for a
+resource that is its own serialization point.
+
+**Topology** -- `node.topology()` on a node started with
+`enable_monitoring=True`:
+
+```python
+topo = node.topology()
+topo.peers(), topo.peer(peer_id)                # v1: PeerView (level, rtt_us, ...)
+await topo.enable_shared(secret, bootstrap=[root_id])
+snap = await topo.snapshot()                    # v2: one consistent view
+snap.clusters, snap.cluster_of(peer_id), snap.separated(a, b)
+```
+
+`separated` answers `"unknown"` / `"connected"` / `"separated"`; `unknown` is
+never evidence of distance. `enable_shared` also takes `position_refresh`
+(seconds) and `timing=TopologyTiming(...)`.
+
+Not yet in Python (they need the binding upcall mechanism, plan R6): a
+Python-implemented `LeaseSerializer`, `FencedResource` or lease authorizer,
+and the topology `admitted` filter.

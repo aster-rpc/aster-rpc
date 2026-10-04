@@ -10,6 +10,8 @@
 //! - gossip.rs: GossipClient, GossipTopicHandle wrappers
 //! - monitor.rs: Phase 1b monitoring utilities
 //! - admission.rs: Gate 0 (`GatePolicy`, `PeerAdmissionStore`, `Admission`)
+//! - attestation.rs, grants.rs, lease.rs, topology.rs: plan P7 (values are
+//!   the frozen dataclasses of the matching `aster.*` Python modules)
 //! - error.rs: Exception types
 //!
 //! The protocol clients, reactor and bare endpoints still drive the transport
@@ -18,6 +20,7 @@
 use pyo3::prelude::*;
 
 mod admission;
+mod attestation;
 mod blobs;
 mod call;
 mod config;
@@ -26,11 +29,15 @@ mod crypto;
 mod docs;
 mod error;
 mod gossip;
+mod grants;
 mod ids;
+mod keys;
+mod lease;
 mod monitor;
 mod net;
 mod node;
 mod ticket;
+mod topology;
 mod wire;
 
 /// Wrapper to convert Vec<u8> to Python bytes via IntoPyObject.
@@ -86,6 +93,10 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ticket::register(py, m)?;
     crypto::register(py, m)?;
     wire::register(py, m)?;
+    attestation::register(py, m)?;
+    grants::register(py, m)?;
+    lease::register(py, m)?;
+    topology::register(py, m)?;
 
     Ok(())
 }

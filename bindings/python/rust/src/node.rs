@@ -24,8 +24,10 @@ use crate::admission::{spawn_gate_drainer, Admission, GatePolicy};
 use crate::config::NativeAsterConfig;
 use crate::ensure_tokio_runtime;
 use crate::error::{aster_err_to_py, err_to_py};
-use crate::ids::{NodeId, SecretKey};
+use crate::ids::{NodeId, NodeIdArg, SecretKey};
+use crate::lease::{GrantorSerializer, LeaseGrantorServer, MemorySerializer};
 use crate::net::{IrohConnection, NodeAddr};
+use crate::topology::Topology;
 
 /// A running Aster node (blobs + docs + gossip, plus any extra ALPNs).
 #[pyclass(module = "aster._aster")]
@@ -200,6 +202,60 @@ impl Node {
     /// Teach this node how to reach `other` directly (tests / local setups).
     fn add_node_addr(&self, other: &Node) -> PyResult<()> {
         self.inner.add_peer(&other.inner).map_err(aster_err_to_py)
+    }
+
+    /// This node's topology view (v1 per-peer proximity; v2 shared swarm).
+    /// Populates only when the node runs with `enable_monitoring=True`.
+    fn topology(&self) -> Topology {
+        Topology::from(self.inner.topology())
+    }
+
+    /// A lease backend on the designated grantor `grantor_id`
+    /// (`aster.lease.Grantor` over RPC). Every op is bound to this node's
+    /// authenticated identity. The grantor must be dialable (discovery or
+    /// `add_node_addr`). Awaitable `GrantorSerializer`.
+    fn lease_grantor<'py>(
+        &self,
+        py: Python<'py>,
+        grantor_id: NodeIdArg,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let node = self.inner.clone();
+        future_into_py(py, async move {
+            let conn = node
+                .rpc_connect(&aster::NodeId::from_hex(grantor_id.0))
+                .await
+                .map_err(aster_err_to_py)?;
+            let self_id = node.id().into_string();
+            Ok(GrantorSerializer::new(
+                aster::rpc::lease::GrantorSerializer::new(conn, self_id.clone()),
+                self_id,
+            ))
+        })
+    }
+
+    /// Serve `aster.lease.Grantor` over `serializer` (a `MemorySerializer`)
+    /// on this node, making it a designated grantor. Start the node with
+    /// `alpns=[b"aster/1"]`. This owns the node's RPC accept loop -- don't
+    /// also run an RPC server on it. `open_revoke=True` lets any admitted
+    /// caller revoke (default: the `operator` role only). Returns a
+    /// `LeaseGrantorServer`; `close()` stops serving.
+    #[pyo3(signature = (serializer, *, open_revoke=false))]
+    fn serve_lease_grantor(
+        &self,
+        serializer: PyRef<'_, MemorySerializer>,
+        open_revoke: bool,
+    ) -> LeaseGrantorServer {
+        let mut grantor =
+            aster::rpc::lease::LeaseGrantor::new(std::sync::Arc::new(serializer.inner.clone()));
+        if open_revoke {
+            grantor = grantor.revoke_requires(None);
+        }
+        let server = aster::rpc::Server::new(&self.inner).register(grantor);
+        // `serve` spawns its loops on the current Tokio runtime.
+        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
+        LeaseGrantorServer {
+            handle: std::sync::Mutex::new(Some(server.serve())),
+        }
     }
 
     /// Transport metrics in Prometheus text exposition format.

@@ -161,7 +161,7 @@ fn event_to_py(py: Python<'_>, ev: aster::DocEvent) -> PyResult<DocEvent> {
 /// (`None` when the subscription ends).
 #[pyclass(frozen)]
 pub struct DocEventReceiver {
-    inner: aster::DocEvents,
+    pub(crate) inner: aster::DocEvents,
 }
 
 #[pymethods]
@@ -493,10 +493,10 @@ impl RetireOutcome {
 
 #[pyclass]
 pub struct DocsClient {
-    inner: aster::Docs,
+    pub(crate) inner: aster::Docs,
 }
 
-fn handle(doc: aster::Doc) -> DocHandle {
+pub(crate) fn handle(doc: aster::Doc) -> DocHandle {
     DocHandle { inner: doc }
 }
 
@@ -693,7 +693,7 @@ impl DocsClient {
 
 #[pyclass]
 pub struct DocHandle {
-    inner: aster::Doc,
+    pub(crate) inner: aster::Doc,
 }
 
 impl DocHandle {
