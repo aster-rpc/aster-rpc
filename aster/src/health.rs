@@ -18,8 +18,16 @@
 //! [`Node::metrics_prometheus`].
 //!
 //! State lives in a [`HealthState`] (clone-cheap, all setters `&self`). The
-//! counters in [`HealthMetrics`] are recorded by whoever observes the events —
-//! a binding's server loop, an interceptor, admission logic — and read back with
+//! counters in [`HealthMetrics`] are recorded by whoever observes the events.
+//! An [`AsterServer`](crate::rpc::AsterServer) with a health listener feeds
+//! them itself: its RPC server counts every call (started, then completed OK
+//! or failed by its final status, refusals included), an RPC stream per call
+//! in flight, and each `aster/1` connection from its first call until it
+//! closes ([`Server::health_state`](crate::rpc::Server::health_state)); the
+//! handle from `AsterServer::take_admission` counts Gate 0 accepts and rejects
+//! as the consumer admission series ([`Admission::with_health`](crate::Admission::with_health)).
+//! Anything else -- a binding's own loop, an interceptor -- records on
+//! [`HealthState::metrics`] directly. Everything is read back with
 //! [`HealthState::snapshot`] or the rendered [`prometheus_text`](HealthState::prometheus_text)
 //! / [`metrics_json`](HealthState::metrics_json), so a binding can scrape the
 //! same state into its own stack without the HTTP listener.
@@ -61,6 +69,7 @@ use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::error::{Error, Result};
+use crate::log_targets::HEALTH;
 use crate::node::Node;
 
 /// Default bind host: localhost only. Use `0.0.0.0` for pod probes.
@@ -683,13 +692,18 @@ async fn accept_loop(listener: TcpListener, state: HealthState, mut stop: onesho
             _ = &mut stop => break,
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accepted = listener.accept() => {
-                let Ok((stream, _peer)) = accepted else {
-                    // Transient accept errors (EMFILE, ECONNABORTED): back off
-                    // briefly rather than spinning.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
+                let (stream, _peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        // Transient accept errors (EMFILE, ECONNABORTED): back
+                        // off briefly rather than spinning.
+                        tracing::debug!(target: HEALTH, error = %e, "health listener accept failed");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
                 };
                 if conns.len() >= MAX_CONNECTIONS {
+                    tracing::debug!(target: HEALTH, "health listener at its connection limit; closing");
                     drop(stream);
                     continue;
                 }
@@ -704,7 +718,9 @@ async fn accept_loop(listener: TcpListener, state: HealthState, mut stop: onesho
                         .timer(TokioTimer::new())
                         .header_read_timeout(HEADER_READ_TIMEOUT)
                         .keep_alive(false);
-                    let _ = builder.serve_connection(TokioIo::new(stream), service).await;
+                    if let Err(e) = builder.serve_connection(TokioIo::new(stream), service).await {
+                        tracing::debug!(target: HEALTH, error = %e, "health connection failed");
+                    }
                 });
             }
         }
@@ -770,6 +786,7 @@ impl HealthServer {
             .map_err(|e| Error::Connection(format!("health server local_addr: {e}")))?;
         let (stop_tx, stop_rx) = oneshot::channel();
         let task = tokio::spawn(accept_loop(listener, state.clone(), stop_rx));
+        tracing::info!(target: HEALTH, %addr, "health listener started");
         Ok(HealthServer {
             state,
             addr,
@@ -811,6 +828,7 @@ impl HealthServer {
         let task = self.task.lock().ok().and_then(|mut t| t.take());
         if let Some(task) = task {
             let _ = task.await;
+            tracing::info!(target: HEALTH, addr = %self.addr, "health listener stopped");
         }
     }
 }

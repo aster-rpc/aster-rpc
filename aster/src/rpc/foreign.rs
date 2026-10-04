@@ -41,9 +41,14 @@ use super::codec::{encode_rpc_status, RpcStatus, SerializationMode, StreamHeader
 use super::contract::{MethodPattern, ScopeKind};
 use super::deadline::{DeadlineGuard, DeadlineQueue};
 use super::dynamic::DynamicService;
-use super::server::{next_request_frame, reject_now, Call, CallParts, ServiceDispatch};
+use super::observe::{CallInfo, CallObs};
+use super::server::{
+    corrupt_frame_status, next_request_frame, reject_now, warn_corrupt_frame, Call, CallParts,
+    NextFrame, ServiceDispatch,
+};
 use super::sessions::{ServiceKey, SessionFactory, SessionInstance};
 use super::status::StatusCode;
+use crate::log_targets::FOREIGN;
 
 // ── flags ───────────────────────────────────────────────────────────────────
 
@@ -71,6 +76,10 @@ pub enum CancelReason {
     Peer,
     /// The call's deadline passed. Rust has already sent `DEADLINE_EXCEEDED`.
     Deadline,
+    /// A request frame after the first was corrupt (it did not inflate).
+    /// Rust has already sent `INVALID_ARGUMENT`; [`CallRef::recv`] returned
+    /// `None`.
+    InvalidRequest,
 }
 
 /// Everything a [`DispatchSink`] receives.
@@ -441,6 +450,7 @@ impl Foreign {
             attributes,
             deadline,
             parts,
+            obs,
         } = d;
         let CallParts {
             peer_id,
@@ -462,13 +472,19 @@ impl Foreign {
             match decompress(&request_payload) {
                 Ok(p) => request_payload = p,
                 Err(e) => {
-                    reject_now(
-                        response_sender,
-                        &RpcStatus::error(
-                            StatusCode::InvalidArgument,
-                            format!("request payload: {e}"),
-                        ),
+                    let status = corrupt_frame_status(&e);
+                    warn_corrupt_frame(&header, &peer_id, 0, &e);
+                    let mut obs = obs;
+                    obs.finish(
+                        StatusCode::InvalidArgument,
+                        CallInfo {
+                            service: &header.service,
+                            method: &header.method,
+                            call_id: header.call_id,
+                            peer: &peer_id,
+                        },
                     );
+                    reject_now(response_sender, &status);
                     return;
                 }
             }
@@ -496,13 +512,21 @@ impl Foreign {
             None => 0,
         };
 
+        let peer_id: Arc<str> = Arc::from(peer_id);
+        let header = Arc::new(header);
         let state = self.table.insert(|call_id, table| CallState {
             call_id,
             sender: response_sender,
             cancelled,
             first_is_end,
             requests: tokio::sync::Mutex::new((!first_is_end).then_some(request_receiver)),
-            inner: Mutex::new(CallInner::default()),
+            frames_read: AtomicU64::new(0),
+            inner: Mutex::new(CallInner {
+                obs: Some(obs),
+                ..CallInner::default()
+            }),
+            header: header.clone(),
+            peer: peer_id.clone(),
             table,
         });
         let call_id = state.call_id;
@@ -511,6 +535,17 @@ impl Foreign {
         // is delivered, so a `Cancelled` can never overtake its `Call`.
         let armed = state.clone();
 
+        tracing::trace!(
+            target: FOREIGN,
+            call_id,
+            service = header.service.as_str(),
+            method = header.method.as_str(),
+            service_idx = svc.idx,
+            method_idx,
+            session_key,
+            peer = &*peer_id,
+            "foreign call delivered"
+        );
         self.sink.deliver(DispatchEvent::Call(ForeignCall {
             call_id,
             service_idx: svc.idx,
@@ -521,9 +556,9 @@ impl Foreign {
             connection_id: connection_id.unwrap_or(0),
             wire_call_id: header.call_id,
             deadline_unix_ms,
-            peer_id: Arc::from(peer_id),
+            peer_id,
             request: request_payload,
-            header: Arc::new(header),
+            header,
             attributes: if attributes.is_empty() {
                 empty_attributes()
             } else {
@@ -564,6 +599,7 @@ pub(crate) struct Delivery {
     pub(crate) attributes: HashMap<String, String>,
     pub(crate) deadline: Option<Instant>,
     pub(crate) parts: CallParts,
+    pub(crate) obs: CallObs,
 }
 
 fn unix_ms(at: Instant) -> u64 {
@@ -796,7 +832,12 @@ pub(crate) struct CallState {
     cancelled: Arc<AtomicBool>,
     first_is_end: bool,
     requests: tokio::sync::Mutex<Option<Receiver<RequestFrame>>>,
+    /// Request frames read after the first (for the corrupt-frame log).
+    frames_read: AtomicU64,
     inner: Mutex<CallInner>,
+    /// The call's header and peer (shared with the [`ForeignCall`]), for logs.
+    header: Arc<StreamHeader>,
+    peer: Arc<str>,
     table: Weak<TableInner>,
 }
 
@@ -805,6 +846,8 @@ struct CallInner {
     /// Set once a terminal frame was queued or the call otherwise ended.
     /// Every operation after that is `NotFound`.
     terminal: bool,
+    /// The call's telemetry; taken when it turns terminal.
+    obs: Option<CallObs>,
     /// At most one capacity reservation (single producer per call).
     reservation: Option<Reservation>,
     deadline: Option<DeadlineGuard>,
@@ -838,8 +881,28 @@ impl CallState {
         }
     }
 
+    /// Record the call's final status (telemetry; the first one wins).
+    fn observe_end(&self, obs: Option<CallObs>, code: StatusCode) {
+        if let Some(mut obs) = obs {
+            obs.finish(
+                code,
+                CallInfo {
+                    service: &self.header.service,
+                    method: &self.header.method,
+                    call_id: self.header.call_id,
+                    peer: &self.peer,
+                },
+            );
+        }
+    }
+
     /// Queue one frame under the call's single-producer reservation rules.
-    fn submit(&self, frame: OutgoingFrame, terminal: bool) -> Result<(), SubmitError> {
+    /// `terminal` is the status of a terminal frame, `None` for a data frame.
+    fn submit(
+        &self,
+        frame: OutgoingFrame,
+        terminal: Option<StatusCode>,
+    ) -> Result<(), SubmitError> {
         let len = frame.encoded_len();
         let mut inner = self.inner.lock().unwrap();
         if inner.terminal {
@@ -874,32 +937,50 @@ impl CallState {
         if permit.send(frame).is_err() {
             return Err(SubmitError::Invalid);
         }
-        if terminal {
+        if let Some(code) = terminal {
             inner.terminal = true;
             let guard = inner.deadline.take();
+            let obs = inner.obs.take();
             drop(inner);
             drop(guard);
             self.remove();
+            self.observe_end(obs, code);
         }
         Ok(())
     }
 
     /// End an unfinished call: mark it terminal, wake a parked reservation,
     /// optionally queue `trailer`, drop it from the table, and report
-    /// `cancel`. A no-op for a call that already ended.
-    fn end(&self, cancel: Option<CancelReason>, trailer: Option<&RpcStatus>) {
-        let (reservation, guard) = {
+    /// `cancel`. A no-op for a call that already ended; returns whether this
+    /// ended it.
+    fn end(&self, cancel: Option<CancelReason>, trailer: Option<&RpcStatus>) -> bool {
+        let (reservation, guard, obs) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.terminal {
-                return;
+                return false;
             }
             inner.terminal = true;
-            (inner.reservation.take(), inner.deadline.take())
+            (
+                inner.reservation.take(),
+                inner.deadline.take(),
+                inner.obs.take(),
+            )
         };
         drop(guard);
         if cancel.is_some() {
             self.cancelled.store(true, Ordering::Release);
         }
+        if let Some(reason) = cancel {
+            tracing::debug!(target: FOREIGN, call_id = self.call_id, ?reason, "foreign call cancelled");
+        }
+        let code = match (trailer, cancel) {
+            (Some(status), _) => status.status_code(),
+            (None, Some(CancelReason::Deadline)) => StatusCode::DeadlineExceeded,
+            (None, Some(CancelReason::InvalidRequest)) => StatusCode::InvalidArgument,
+            // A peer cancel, or the response channel closed under the call.
+            (None, _) => StatusCode::Cancelled,
+        };
+        self.observe_end(obs, code);
         let had_reservation = match reservation {
             Some(Reservation::Pending { cancel, .. }) => {
                 let _ = cancel.send(());
@@ -927,6 +1008,7 @@ impl CallState {
                 reason,
             });
         }
+        true
     }
 
     /// Best-effort trailer outside the producer's control: immediate when
@@ -1040,7 +1122,10 @@ impl CallRef {
             b.extend_from_slice(&trailer);
             b
         };
-        self.0.submit(OutgoingFrame::CompleteUnary(buf), true)
+        self.0.submit(
+            OutgoingFrame::CompleteUnary(buf),
+            Some(status.status_code()),
+        )
     }
 
     /// One stream data frame (server-stream / bidi). `payload` must not be
@@ -1050,13 +1135,14 @@ impl CallRef {
             return Err(SubmitError::Invalid);
         }
         let frame = encode_data_frame(payload)?;
-        self.0.submit(OutgoingFrame::Frame(frame), false)
+        self.0.submit(OutgoingFrame::Frame(frame), None)
     }
 
     /// The terminal trailer.
     pub fn try_finish(&self, status: &RpcStatus) -> Result<(), SubmitError> {
         let frame = encode_status_frame(status)?;
-        self.0.submit(OutgoingFrame::Trailer(frame), true)
+        self.0
+            .submit(OutgoingFrame::Trailer(frame), Some(status.status_code()))
     }
 
     /// After [`SubmitError::QueueFull`]: wait in the background for
@@ -1108,14 +1194,30 @@ impl CallRef {
     /// The next request payload after the first (client-stream / bidi),
     /// decompressed; `None` at the end of the request stream. Single
     /// consumer.
+    ///
+    /// A frame that does not inflate fails the call: Rust sends
+    /// `INVALID_ARGUMENT`, logs a warning, delivers
+    /// [`DispatchEvent::Cancelled`] with [`CancelReason::InvalidRequest`],
+    /// and this returns `None`.
     pub async fn recv(&self) -> Option<Vec<u8>> {
         if self.0.first_is_end {
             return None;
         }
         let mut rx = self.0.requests.lock().await;
-        match rx.as_mut() {
-            Some(rx) => next_request_frame(rx).await,
-            None => None,
+        let next = next_request_frame(rx.as_mut()?).await;
+        let frame = self.0.frames_read.fetch_add(1, Ordering::Relaxed) + 1;
+        match next {
+            NextFrame::Frame(p) => Some(p),
+            NextFrame::End => None,
+            NextFrame::Corrupt(err) => {
+                drop(rx);
+                warn_corrupt_frame(&self.0.header, &self.0.peer, frame, &err);
+                self.0.end(
+                    Some(CancelReason::InvalidRequest),
+                    Some(&corrupt_frame_status(&err)),
+                );
+                None
+            }
         }
     }
 
@@ -1132,13 +1234,20 @@ impl CallRef {
     /// End the call with `INTERNAL "handler dropped call"` unless it already
     /// ended. What dropping a [`CallHandle`] does.
     pub fn abandon(&self) {
-        self.0.end(
+        let ended = self.0.end(
             None,
             Some(&RpcStatus::error(
                 StatusCode::Internal,
                 "handler dropped call",
             )),
         );
+        if ended {
+            tracing::debug!(
+                target: FOREIGN,
+                call_id = self.0.call_id,
+                "foreign call abandoned by its handler"
+            );
+        }
     }
 }
 

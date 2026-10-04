@@ -512,6 +512,11 @@ impl AsterServerBuilder {
 
         let attributes = self.attributes.unwrap_or_default();
         let mut server = Server::new(&node).attributes(attributes.clone());
+        // The health listener's counters are fed by this server's dispatch.
+        #[cfg(feature = "health")]
+        if let Some(health) = &health {
+            server = server.health_state(health.state().clone());
+        }
         if let Some(auth) = self.authenticator {
             server = server.authenticator_arc(auth);
         }
@@ -650,6 +655,11 @@ impl AsterServerBuilder {
         if let Some(health) = &health {
             health.set_ready(true);
         }
+        tracing::info!(
+            target: crate::log_targets::SERVER,
+            node_id = node.id().as_str(),
+            "aster server started"
+        );
 
         Ok(AsterServer {
             node,
@@ -798,8 +808,16 @@ impl AsterServer {
 
     /// Take the admission handle (one-shot) for Gate-0 connection gating.
     /// Returns `None` unless built with [`hooks(true)`](AsterServerBuilder::hooks).
+    /// With a health listener, its accept/reject decisions are counted in the
+    /// `/metrics` admission series (see `Admission::with_health`).
     pub fn take_admission(&self) -> Option<crate::admission::Admission> {
-        self.node.take_admission()
+        let admission = self.node.take_admission()?;
+        #[cfg(feature = "health")]
+        let admission = match &self.health {
+            Some(health) => admission.with_health(health.state().clone()),
+            None => admission,
+        };
+        Some(admission)
     }
 
     /// Blob store client backed by this server's node.
@@ -853,6 +871,11 @@ impl AsterServer {
     /// does the transport stop — a node torn down first would leave a peer's
     /// in-flight call reaching a Raft that is going away.
     pub async fn shutdown(self) {
+        tracing::info!(
+            target: crate::log_targets::SERVER,
+            node_id = self.node.id().as_str(),
+            "aster server shutting down"
+        );
         // Probes see not-ready first, and the port is released before the
         // node goes away.
         #[cfg(feature = "health")]

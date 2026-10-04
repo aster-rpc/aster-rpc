@@ -14,7 +14,7 @@
 //! | client-stream  | many (`recv_request` to `None`)      | [`Call::respond`]            |
 //! | bidi           | many (concurrent with sends)         | N× `send` + `finish`         |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -23,6 +23,7 @@ use fory_core::Fory;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Notify;
 use tokio::time::Instant;
+use tracing::{Instrument, Level};
 
 use aster_transport_core::contract::evaluate_capability;
 use aster_transport_core::framing::{
@@ -42,6 +43,7 @@ use super::codec::{
 use super::deadline::DeadlineQueue;
 use super::dynamic::DynamicService;
 use super::foreign::{DispatchEvent, DispatchSink, Foreign, ForeignService, ForeignSession};
+use super::observe::{CallInfo, CallObs, Telemetry};
 use super::sessions::{
     check_shared, missing_session, ServiceKey, SessionFactory, SessionInstance, SessionStore,
     DEFAULT_MAX_SESSIONS_PER_CONNECTION,
@@ -49,6 +51,7 @@ use super::sessions::{
 use super::status::StatusCode;
 use super::streaming::{RequestStream, ResponseSink};
 use crate::error::{Error, Result};
+use crate::log_targets::{DISPATCH, SERVER};
 use crate::net::Connection;
 use crate::Node;
 
@@ -164,6 +167,8 @@ pub struct Server {
     /// Built from the two fields above on first use and shared by every
     /// dispatcher, so all transports see one call table.
     foreign: OnceLock<Arc<Foreign>>,
+    /// Health counters fed by dispatch (see [`Server::health_state`]).
+    telemetry: Telemetry,
 }
 
 /// The default cap on how long any handler may run: Python's
@@ -188,7 +193,22 @@ impl Server {
             foreign_specs: Vec::new(),
             dispatch_sink: None,
             foreign: OnceLock::new(),
+            telemetry: Telemetry::default(),
         }
+    }
+
+    /// Feed `state`'s [`HealthMetrics`](crate::health::HealthMetrics) from
+    /// this server: every call counts as an RPC started and completed (OK or
+    /// failed, by its final status) and as an RPC stream while in flight,
+    /// whichever transport delivered it; [`serve`](Server::serve) also counts
+    /// each `aster/1` connection from its first call until it closes.
+    /// [`AsterServer`](crate::rpc::AsterServer) does this for its health
+    /// listener. Set before [`dispatcher`](Server::dispatcher) or
+    /// [`serve`](Server::serve).
+    #[cfg(feature = "health")]
+    pub fn health_state(mut self, state: crate::health::HealthState) -> Self {
+        self.telemetry.health = Some(state);
+        self
     }
 
     /// Where foreign calls and lifecycle events go (binding support). Set
@@ -412,6 +432,7 @@ impl Server {
             handler_timeout: self.handler_timeout,
             deadlines: self.deadlines.clone(),
             foreign: self.foreign(),
+            telemetry: self.telemetry.clone(),
         }
     }
 
@@ -428,9 +449,20 @@ impl Server {
 
         // RPC pipeline: dispatch each `aster/1` call.
         let rpc_join = tokio::spawn(async move {
+            tracing::debug!(target: SERVER, "rpc serve loop started");
+            // Connections seen so far, for the health connection counters.
+            // The reactor reports closes only, so a connection counts as open
+            // from its first call. Only kept when a health state is attached;
+            // this loop is its only user, so it needs no lock.
+            let track_connections = dispatcher.telemetry.has_health();
+            let mut open_connections: HashSet<u64> = HashSet::new();
             while let Some(ev) = event_rx.recv().await {
                 match ev {
                     ReactorEvent::Call(call) => {
+                        let obs = dispatcher.telemetry.start_call();
+                        if track_connections && open_connections.insert(call.connection_id) {
+                            dispatcher.telemetry.connection_opened();
+                        }
                         // Route inline: decoding, lookup, session resolution
                         // and Gate 3 are synchronous, so a refused call costs
                         // no task. Only calls that reach a handler (or an
@@ -439,17 +471,20 @@ impl Server {
                         // `ConnectionClosed`, which this same loop handles.
                         let parts = CallParts::from_incoming(call);
                         match dispatcher.route(&parts) {
-                            Route::Reject(status) => reject_now(parts.response_sender, &status),
+                            Route::Reject(status) => {
+                                finish_refused(obs, &parts, &status);
+                                reject_now(parts.response_sender, &status);
+                            }
                             // Foreign fast path: delivered from this loop,
                             // no task per call.
                             Route::Dispatch(routed) if routed.is_foreign() => {
-                                dispatcher.deliver_foreign(routed, parts);
+                                dispatcher.deliver_foreign(routed, parts, obs);
                             }
                             route => {
                                 let dispatcher = dispatcher.clone();
-                                tokio::spawn(
-                                    async move { dispatcher.complete(route, parts).await },
-                                );
+                                tokio::spawn(async move {
+                                    dispatcher.complete_observed(route, parts, obs).await
+                                });
                             }
                         }
                     }
@@ -461,7 +496,17 @@ impl Server {
                         peer_id,
                         ..
                     } => {
-                        dispatcher.close_connection(connection_id);
+                        let reaped = dispatcher.close_connection(connection_id);
+                        if track_connections && open_connections.remove(&connection_id) {
+                            dispatcher.telemetry.connection_closed();
+                        }
+                        tracing::debug!(
+                            target: SERVER,
+                            connection_id,
+                            peer = peer_id.as_str(),
+                            sessions_reaped = reaped,
+                            "connection closed"
+                        );
                         if dispatcher.foreign.has_sink {
                             dispatcher
                                 .foreign
@@ -474,6 +519,7 @@ impl Server {
                     }
                 }
             }
+            tracing::debug!(target: SERVER, "rpc serve loop ended");
         });
 
         // Non-RPC fan-out: route every other ALPN to its handler. Always
@@ -492,7 +538,14 @@ impl Server {
                     }),
                     // No handler for this ALPN: drop `core`, which closes the
                     // connection. The peer observes a closed connection.
-                    None => drop(core),
+                    None => {
+                        tracing::debug!(
+                            target: SERVER,
+                            alpn = %String::from_utf8_lossy(&alpn),
+                            "no handler for ALPN; connection dropped"
+                        );
+                        drop(core)
+                    }
                 }
             }
         });
@@ -528,6 +581,7 @@ pub struct Dispatcher {
     deadlines: DeadlineQueue,
     /// Foreign services, the sink and the shared call table.
     foreign: Arc<Foreign>,
+    telemetry: Telemetry,
 }
 
 impl Dispatcher {
@@ -769,9 +823,17 @@ impl Dispatcher {
     /// trailer, or run the authenticator and Gate 3 if still pending, then
     /// inflate the first request frame and run the handler. Resolves when the
     /// handler returns.
-    pub async fn complete(&self, route: Route, mut parts: CallParts) {
+    pub async fn complete(&self, route: Route, parts: CallParts) {
+        let obs = self.telemetry.start_call();
+        self.complete_observed(route, parts, obs).await;
+    }
+
+    /// [`complete`](Dispatcher::complete) for a call whose telemetry the
+    /// caller already started.
+    async fn complete_observed(&self, route: Route, mut parts: CallParts, obs: CallObs) {
         let routed = match route {
             Route::Reject(status) => {
+                finish_refused(obs, &parts, &status);
                 emit_rpc_status(&parts.response_sender, &status).await;
                 return;
             }
@@ -779,13 +841,14 @@ impl Dispatcher {
             Route::Authenticate(routed) => match self.authenticate(routed, &mut parts).await {
                 Ok(routed) => routed,
                 Err(status) => {
+                    finish_refused(obs, &parts, &status);
                     emit_rpc_status(&parts.response_sender, &status).await;
                     return;
                 }
             },
         };
         if routed.is_foreign() {
-            self.deliver_foreign(routed, parts);
+            self.deliver_foreign(routed, parts, obs);
             return;
         }
         let Routed {
@@ -813,20 +876,29 @@ impl Dispatcher {
                     parts.request_flags &= !FLAG_COMPRESSED;
                 }
                 Err(e) => {
-                    emit_trailer(
-                        &parts.response_sender,
-                        StatusCode::InvalidArgument,
-                        &format!("request payload: {e}"),
-                    )
-                    .await;
+                    let status = corrupt_frame_status(&e);
+                    warn_corrupt_frame(&header, &parts.peer_id, 0, &e);
+                    finish_refused(obs, &parts, &status);
+                    emit_rpc_status(&parts.response_sender, &status).await;
                     return;
                 }
             }
         }
 
+        // One `rpc` span per native call, so a handler's own events carry the
+        // call's identity. Disabled (the common case): no span, no wrapper.
+        let span = tracing::debug_span!(
+            target: DISPATCH,
+            "rpc",
+            service = header.service.as_str(),
+            method = header.method.as_str(),
+            call_id = header.call_id,
+            peer = parts.peer_id.as_str(),
+        );
         let method = header.method.clone();
         let Some(at) = deadline else {
-            svc.dispatch(&method, Call::new(parts, header, attributes, None))
+            svc.dispatch(&method, Call::new(parts, header, attributes, None, obs))
+                .instrument(span)
                 .await;
             return;
         };
@@ -836,7 +908,9 @@ impl Dispatcher {
         let _guard = self.deadlines.register(at, move || {
             let _ = fire.send(());
         });
-        let handler = svc.dispatch(&method, Call::new(parts, header, attributes, Some(at)));
+        let handler = svc.dispatch(&method, Call::new(parts, header, attributes, Some(at), obs));
+        let deadline_span = span.clone();
+        let handler = handler.instrument(span);
         tokio::select! {
             biased;
             () = handler => {}
@@ -844,6 +918,9 @@ impl Dispatcher {
                 // The handler future is dropped when this arm wins, which
                 // cancels it. Flag the call too, for anything it spawned.
                 cancelled.store(true, Ordering::Release);
+                deadline_span.in_scope(|| {
+                    tracing::debug!(target: DISPATCH, "deadline exceeded; handler cancelled")
+                });
                 emit_trailer(&sender, StatusCode::DeadlineExceeded, "deadline exceeded").await;
             }
         }
@@ -889,7 +966,7 @@ impl Dispatcher {
 
     /// Hand a routed foreign call to the binding (synchronous; see
     /// `Foreign::deliver`).
-    fn deliver_foreign(&self, routed: Routed, parts: CallParts) {
+    fn deliver_foreign(&self, routed: Routed, parts: CallParts, obs: CallObs) {
         let Routed {
             header,
             method_idx,
@@ -911,6 +988,7 @@ impl Dispatcher {
                 attributes,
                 deadline,
                 parts,
+                obs,
             },
             &self.deadlines,
         );
@@ -1231,6 +1309,87 @@ fn gate3(
     Ok(())
 }
 
+/// Finish the telemetry of a call refused before any handler ran. The header
+/// is decoded again only when the refusal is actually logged.
+pub(crate) fn finish_refused(mut obs: CallObs, parts: &CallParts, status: &RpcStatus) {
+    let code = status.status_code();
+    if !tracing::enabled!(target: DISPATCH, Level::DEBUG) {
+        obs.finish(code, CallInfo::default());
+        return;
+    }
+    let header = decode_stream_header(&parts.header_payload).ok();
+    let (service, method, call_id) = header.as_ref().map_or(("", "", 0), |h| {
+        (h.service.as_str(), h.method.as_str(), h.call_id)
+    });
+    tracing::debug!(
+        target: DISPATCH,
+        service,
+        method,
+        call_id,
+        peer = parts.peer_id.as_str(),
+        status = ?code,
+        message = status.message.as_str(),
+        "rpc refused"
+    );
+    obs.finish(
+        code,
+        CallInfo {
+            service,
+            method,
+            call_id,
+            peer: &parts.peer_id,
+        },
+    );
+}
+
+/// The status a call fails with when one of its request frames does not
+/// inflate: the caller sent bytes that are not a valid frame payload, so it
+/// is the caller's error, exactly as for a first frame (§5.6).
+pub(crate) fn corrupt_frame_status(err: &impl std::fmt::Display) -> RpcStatus {
+    RpcStatus::error(
+        StatusCode::InvalidArgument,
+        format!("request payload: {err}"),
+    )
+}
+
+/// Log a corrupt request frame. `frame` is its position in the request
+/// stream (0 = the first frame, delivered with the header).
+pub(crate) fn warn_corrupt_frame(
+    header: &StreamHeader,
+    peer: &str,
+    frame: u64,
+    err: &dyn std::fmt::Display,
+) {
+    warn_corrupt(
+        &header.service,
+        &header.method,
+        header.call_id,
+        peer,
+        frame,
+        err,
+    );
+}
+
+fn warn_corrupt(
+    service: &str,
+    method: &str,
+    call_id: i32,
+    peer: &str,
+    frame: u64,
+    err: &dyn std::fmt::Display,
+) {
+    tracing::warn!(
+        target: DISPATCH,
+        service,
+        method,
+        call_id,
+        peer,
+        frame,
+        error = %err,
+        "corrupt request frame; failing the call with INVALID_ARGUMENT"
+    );
+}
+
 /// Send a refusal trailer without spawning when the response queue has room
 /// (it always does for a fresh call); fall back to a task only if it is full.
 pub(crate) fn reject_now(sender: ResponseSender, status: &RpcStatus) {
@@ -1315,6 +1474,35 @@ pub struct Call {
     /// the stream, the channel is never closed, so we must not block reading it.
     first_is_end: bool,
     deadline: Option<Instant>,
+    /// Request frames read after the first (for the corrupt-frame log).
+    frames_read: u64,
+    /// The terminal status this call sent, or that the server sent for it (a
+    /// corrupt request frame); first one wins.
+    sent: Option<StatusCode>,
+    obs: CallObs,
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        let code = match self.sent {
+            Some(code) => code,
+            None if self.deadline.is_some_and(|at| Instant::now() >= at) => {
+                StatusCode::DeadlineExceeded
+            }
+            None if self.is_cancelled() => StatusCode::Cancelled,
+            // Dropped without a trailer: the peer sees the stream end.
+            None => StatusCode::Internal,
+        };
+        self.obs.finish(
+            code,
+            CallInfo {
+                service: &self.header.service,
+                method: &self.header.method,
+                call_id: self.header.call_id,
+                peer: &self.peer_id,
+            },
+        );
+    }
 }
 
 impl Call {
@@ -1323,6 +1511,7 @@ impl Call {
         header: StreamHeader,
         attributes: HashMap<String, String>,
         deadline: Option<Instant>,
+        obs: CallObs,
     ) -> Self {
         let CallParts {
             peer_id,
@@ -1346,6 +1535,9 @@ impl Call {
             request_receiver: Some(request_receiver),
             first_is_end,
             deadline,
+            frames_read: 0,
+            sent: None,
+            obs,
         }
     }
 
@@ -1408,9 +1600,27 @@ impl Call {
         if self.first_is_end {
             return None;
         }
-        match &mut self.request_receiver {
-            Some(rx) => next_request_frame(rx).await,
-            None => None,
+        let rx = self.request_receiver.as_mut()?;
+        match next_request_frame(rx).await {
+            NextFrame::Frame(p) => {
+                self.frames_read += 1;
+                Some(p)
+            }
+            NextFrame::End => None,
+            // The caller sent a frame that is not a valid payload. Fail the
+            // call here, as for a corrupt first frame, rather than let the
+            // handler mistake it for the end of the stream and answer OK:
+            // the trailer goes out first, so anything the handler sends after
+            // finds the stream finished.
+            NextFrame::Corrupt(err) => {
+                self.frames_read += 1;
+                warn_corrupt_frame(&self.header, &self.peer_id, self.frames_read, &err);
+                let status = corrupt_frame_status(&err);
+                self.sent.get_or_insert(StatusCode::InvalidArgument);
+                self.cancelled.store(true, Ordering::Release);
+                emit_rpc_status(&self.response_sender, &status).await;
+                None
+            }
         }
     }
 
@@ -1432,7 +1642,8 @@ impl Call {
     /// terminal trailer, in a single write. An empty `payload` sends the trailer
     /// only (a data frame can't carry an empty payload) — the client observes an
     /// empty response with the given status.
-    pub async fn respond(self, payload: Vec<u8>, status: &RpcStatus) -> Result<()> {
+    pub async fn respond(mut self, payload: Vec<u8>, status: &RpcStatus) -> Result<()> {
+        self.sent.get_or_insert(status.status_code());
         let trailer = encode_frame(&encode_rpc_status(status)?, FLAG_TRAILER)?;
         let buf = if payload.is_empty() {
             trailer
@@ -1449,7 +1660,8 @@ impl Call {
 
     /// Finish a streaming call with the terminal trailer (status). Use after the
     /// last [`send`](Call::send), or on its own to fail a call before any data.
-    pub async fn finish(self, status: &RpcStatus) -> Result<()> {
+    pub async fn finish(mut self, status: &RpcStatus) -> Result<()> {
+        self.sent.get_or_insert(status.status_code());
         let frame = encode_frame(&encode_rpc_status(status)?, FLAG_TRAILER)?;
         self.response_sender
             .send(OutgoingFrame::Trailer(frame))
@@ -1467,27 +1679,78 @@ impl Call {
     /// Take the inbound request side as a typed [`RequestStream`] (client-stream /
     /// bidi), leaving the response side intact. Used by generated dispatchers.
     pub fn take_requests<T>(&mut self, fory: Arc<Fory>) -> RequestStream<T> {
+        let failer = CallFailer {
+            sender: self.response_sender.clone(),
+            cancelled: self.cancelled.clone(),
+            service: self.header.service.clone(),
+            method: self.header.method.clone(),
+            call_id: self.header.call_id,
+            peer: self.peer_id.clone(),
+        };
         RequestStream::new(
             self.first_request.take(),
             self.request_receiver.take(),
             self.first_is_end,
             fory,
+            failer,
         )
     }
 }
 
+/// One read from a call's request stream after the first frame.
+pub(crate) enum NextFrame {
+    /// The next request payload, inflated.
+    Frame(Vec<u8>),
+    /// The request stream ended (or the transport broke).
+    End,
+    /// The frame did not inflate (corrupt, or over the 16 MiB bomb limit).
+    /// The channel is closed; no further frames are accepted. The caller
+    /// fails the call with [`corrupt_frame_status`].
+    Corrupt(String),
+}
+
 /// Read the next client-stream / bidi request frame, inflating it if it is
-/// `FLAG_COMPRESSED`. A frame that fails to inflate (corrupt, or over the
-/// 16 MiB bomb limit) ends the request stream: the reader sees `None`, as on a
-/// transport break, and no further frames are accepted.
-pub(crate) async fn next_request_frame(rx: &mut Receiver<RequestFrame>) -> Option<Vec<u8>> {
-    let f = rx.recv().await?;
+/// `FLAG_COMPRESSED`.
+pub(crate) async fn next_request_frame(rx: &mut Receiver<RequestFrame>) -> NextFrame {
+    let Some(f) = rx.recv().await else {
+        return NextFrame::End;
+    };
     match payload_of(f.payload, f.flags) {
-        Ok(p) => Some(p),
-        Err(_) => {
+        Ok(p) => NextFrame::Frame(p),
+        Err(e) => {
             rx.close();
-            None
+            NextFrame::Corrupt(e.to_string())
         }
+    }
+}
+
+/// Everything a detached request reader ([`RequestStream`]) needs to fail
+/// its call when a request frame is corrupt: the server sends the
+/// `INVALID_ARGUMENT` trailer itself, so the caller sees the failure whatever
+/// the handler then does with the error.
+pub(crate) struct CallFailer {
+    sender: ResponseSender,
+    cancelled: Arc<AtomicBool>,
+    service: String,
+    method: String,
+    call_id: i32,
+    peer: String,
+}
+
+impl CallFailer {
+    /// Log, flag the call over, and send `status` as its trailer. Later
+    /// response writes find the stream finished.
+    pub(crate) async fn fail(&self, frame: u64, err: &str, status: &RpcStatus) {
+        warn_corrupt(
+            &self.service,
+            &self.method,
+            self.call_id,
+            &self.peer,
+            frame,
+            &err,
+        );
+        self.cancelled.store(true, Ordering::Release);
+        emit_rpc_status(&self.sender, status).await;
     }
 }
 

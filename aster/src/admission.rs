@@ -9,6 +9,7 @@
 //! **outbound** dials.
 
 use crate::id::NodeId;
+use crate::log_targets::ADMISSION;
 use aster_transport_core::{
     trust::{
         AdmissionSource, GateDecision, GatePolicy, PeerAdmission, ALPN_CONSUMER_ADMISSION,
@@ -126,13 +127,36 @@ impl Gate0 {
 }
 
 /// Admission handle. Not clonable — there is a single decision stream per node.
+///
+/// Every decision is logged under the `aster::admission` target: inbound
+/// accepts at debug, inbound rejects at info, outbound connect decisions at
+/// debug.
 pub struct Admission {
     rx: CoreHookReceiver,
+    #[cfg(feature = "health")]
+    health: Option<crate::health::HealthState>,
 }
 
 impl Admission {
     pub(crate) fn new(rx: CoreHookReceiver) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            #[cfg(feature = "health")]
+            health: None,
+        }
+    }
+
+    /// Count this handle's inbound (Gate 0) decisions in `state`'s
+    /// [`HealthMetrics`](crate::health::HealthMetrics):
+    /// [`HandshakeRequest::accept`] records an admit (with the time since the
+    /// request arrived as its duration), [`HandshakeRequest::reject`] a deny.
+    /// They are reported as the `consumer` admission series. An
+    /// [`AsterServer`](crate::rpc::AsterServer) with a health listener does
+    /// this in `take_admission`.
+    #[cfg(feature = "health")]
+    pub fn with_health(mut self, state: crate::health::HealthState) -> Self {
+        self.health = Some(state);
+        self
     }
 
     /// Binding support: wrap a raw transport-core hook receiver. Not part of
@@ -140,7 +164,7 @@ impl Admission {
     #[cfg(feature = "binding-support")]
     #[doc(hidden)]
     pub fn from_core_receiver(rx: CoreHookReceiver) -> Self {
-        Self { rx }
+        Self::new(rx)
     }
 
     /// Binding support: unwrap into the raw transport-core hook receiver (the
@@ -163,7 +187,13 @@ impl Admission {
     /// when the node is closing. This is the config-doc / Gate 0 boundary.
     pub async fn next_handshake(&mut self) -> Option<HandshakeRequest> {
         let (info, reply) = self.rx.after_handshake_rx.recv().await?;
-        Some(HandshakeRequest::new(info, reply))
+        #[cfg_attr(not(feature = "health"), allow(unused_mut))]
+        let mut req = HandshakeRequest::new(info, reply);
+        #[cfg(feature = "health")]
+        {
+            req.health = self.health.clone();
+        }
+        Some(req)
     }
 }
 
@@ -187,11 +217,23 @@ impl ConnectRequest {
 
     /// Allow the connection.
     pub fn accept(self) {
+        tracing::debug!(
+            target: ADMISSION,
+            peer = self.peer.as_str(),
+            alpn = %String::from_utf8_lossy(&self.alpn),
+            "outbound connect allowed"
+        );
         let _ = self.reply.send(true);
     }
 
     /// Block the connection.
     pub fn reject(self) {
+        tracing::debug!(
+            target: ADMISSION,
+            peer = self.peer.as_str(),
+            alpn = %String::from_utf8_lossy(&self.alpn),
+            "outbound connect blocked"
+        );
         let _ = self.reply.send(false);
     }
 }
@@ -205,6 +247,11 @@ pub struct HandshakeRequest {
     /// Whether the connection is still alive at decision time.
     pub is_alive: bool,
     reply: oneshot::Sender<CoreAfterHandshakeDecision>,
+    /// When the request arrived, for the admission duration.
+    #[cfg(feature = "health")]
+    received: std::time::Instant,
+    #[cfg(feature = "health")]
+    health: Option<crate::health::HealthState>,
 }
 
 impl HandshakeRequest {
@@ -217,19 +264,47 @@ impl HandshakeRequest {
             alpn: info.alpn,
             is_alive: info.is_alive,
             reply,
+            #[cfg(feature = "health")]
+            received: std::time::Instant::now(),
+            #[cfg(feature = "health")]
+            health: None,
         }
     }
 
     /// Admit the peer.
     pub fn accept(self) {
+        tracing::debug!(
+            target: ADMISSION,
+            peer = self.peer.as_str(),
+            alpn = %String::from_utf8_lossy(&self.alpn),
+            "gate 0: peer accepted"
+        );
+        #[cfg(feature = "health")]
+        if let Some(h) = &self.health {
+            h.metrics()
+                .record_consumer_admit(self.received.elapsed().as_secs_f64() * 1000.0);
+        }
         let _ = self.reply.send(CoreAfterHandshakeDecision::Accept);
     }
 
     /// Reject the peer, closing the connection with `code` and `reason`.
     pub fn reject(self, code: u32, reason: impl Into<Vec<u8>>) {
+        let reason = reason.into();
+        tracing::info!(
+            target: ADMISSION,
+            peer = self.peer.as_str(),
+            alpn = %String::from_utf8_lossy(&self.alpn),
+            code,
+            reason = %String::from_utf8_lossy(&reason),
+            "gate 0: peer rejected"
+        );
+        #[cfg(feature = "health")]
+        if let Some(h) = &self.health {
+            h.metrics().record_consumer_deny();
+        }
         let _ = self.reply.send(CoreAfterHandshakeDecision::Reject {
             error_code: code,
-            reason: reason.into(),
+            reason,
         });
     }
 }

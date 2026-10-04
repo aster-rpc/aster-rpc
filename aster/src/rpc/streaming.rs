@@ -16,6 +16,9 @@ use aster_transport_core::framing::encode_payload_frame;
 use aster_transport_core::reactor::{OutgoingFrame, RequestFrame, ResponseSender};
 
 use super::client::{BidiSink, ResponseStream};
+use super::codec::RpcStatus;
+use super::server::{corrupt_frame_status, next_request_frame, CallFailer, NextFrame};
+use super::status::{status_to_error, StatusCode};
 use crate::error::{Error, Result};
 
 fn encode_err(e: impl std::fmt::Display) -> Error {
@@ -96,12 +99,23 @@ impl<T: Serializer<Target = T>> BidiCall<T> {
 }
 
 /// Server-side input stream of decoded requests (client-stream / bidi). Pull
-/// with [`recv`](RequestStream::recv) until it returns `None`.
+/// with [`recv`](RequestStream::recv) until it returns `Ok(None)`.
+///
+/// A request that is not a valid payload -- a frame that does not inflate, or
+/// bytes that do not decode as `T` -- fails the call: the server sends
+/// `INVALID_ARGUMENT` to the caller itself, logs a warning (target
+/// `aster::rpc::dispatch`), and `recv` returns that status as
+/// [`Error::Rpc`]. The stream ends there; later `recv`s return `Ok(None)`
+/// and later responses find the call finished.
 pub struct RequestStream<T> {
     first: Option<Vec<u8>>,
     rx: Option<Receiver<RequestFrame>>,
     first_is_end: bool,
     fory: Arc<Fory>,
+    failer: CallFailer,
+    /// Requests read so far (for the corrupt-frame log).
+    read: u64,
+    failed: bool,
     _t: PhantomData<fn() -> T>,
 }
 
@@ -111,38 +125,76 @@ impl<T> RequestStream<T> {
         rx: Option<Receiver<RequestFrame>>,
         first_is_end: bool,
         fory: Arc<Fory>,
+        failer: CallFailer,
     ) -> Self {
         Self {
             first,
             rx,
             first_is_end,
             fory,
+            failer,
+            read: 0,
+            failed: false,
             _t: PhantomData,
         }
     }
 
-    async fn recv_bytes(&mut self) -> Option<Vec<u8>> {
+    async fn recv_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.failed {
+            return Ok(None);
+        }
         if let Some(first) = self.first.take() {
-            return Some(first);
+            return Ok(Some(first));
         }
         if self.first_is_end {
-            return None;
+            return Ok(None);
         }
-        match &mut self.rx {
-            Some(rx) => super::server::next_request_frame(rx).await,
-            None => None,
+        let Some(rx) = &mut self.rx else {
+            return Ok(None);
+        };
+        match next_request_frame(rx).await {
+            NextFrame::Frame(p) => Ok(Some(p)),
+            NextFrame::End => Ok(None),
+            NextFrame::Corrupt(err) => {
+                let status = corrupt_frame_status(&err);
+                Err(self.fail(self.read, &err, status).await)
+            }
         }
+    }
+
+    /// Fail the call with `status` (sent by the server) and return it as the
+    /// handler's error.
+    async fn fail(&mut self, frame: u64, err: &str, status: RpcStatus) -> Error {
+        self.failed = true;
+        if let Some(rx) = &mut self.rx {
+            rx.close();
+        }
+        self.failer.fail(frame, err, &status).await;
+        status_to_error(status)
     }
 }
 
 impl<T: Serializer<Target = T>> RequestStream<T> {
-    /// Receive and decode the next request, or `None` at end of stream.
+    /// Receive and decode the next request, or `None` at end of stream. A
+    /// corrupt request fails the call (see the type docs) and returns
+    /// `Err(Error::Rpc { code: INVALID_ARGUMENT, .. })`.
     pub async fn recv(&mut self) -> Result<Option<T>> {
-        match self.recv_bytes().await {
-            Some(bytes) => Ok(Some(
-                self.fory.deserialize::<T>(&bytes).map_err(decode_err)?,
-            )),
-            None => Ok(None),
+        let Some(bytes) = self.recv_bytes().await? else {
+            return Ok(None);
+        };
+        // This request's index in the stream (0 = the first frame).
+        let frame = self.read;
+        self.read += 1;
+        match self.fory.deserialize::<T>(&bytes) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                let err = e.to_string();
+                let status = RpcStatus::error(
+                    StatusCode::InvalidArgument,
+                    format!("request decode: {err}"),
+                );
+                Err(self.fail(frame, &err, status).await)
+            }
         }
     }
 }
