@@ -28,6 +28,11 @@ func TestABI_StructSizes(t *testing.T) {
 		"aster_transport_metrics_t":  136,
 		"aster_dispatch_event_t":     104,
 		"aster_call_options_t":       72,
+		// ABI 4.1 / 4.2 (ffi/src/layout.rs)
+		"aster_upcall_event_t":            40,
+		"aster_topology_admitted_stats_t": 32,
+		"aster_http_foreign_options_t":    48,
+		"aster_route_spec_t":              40,
 	}
 	got := cStructSizes()
 	for name, w := range want {
@@ -43,6 +48,69 @@ func TestABI_StructSizes(t *testing.T) {
 		if off != wantOff[name] {
 			t.Errorf("offsetof(aster_dispatch_event_t, %s) = %d, want %d", name, off, wantOff[name])
 		}
+	}
+}
+
+// ABI 4.1 / 4.2 field offsets and enum values (pinned in ffi/src/layout.rs
+// and the header); the plain-Go mirrors in upcall_types.go and the UCv1
+// vectors must agree with them.
+func TestABI_UpcallAndExposeLayouts(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("pinned offsets are for LP64")
+	}
+	pin := func(what string, got, want map[string]uintptr) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Errorf("%s: %d offsets checked, want %d", what, len(got), len(want))
+		}
+		for f, off := range want {
+			if got[f] != off {
+				t.Errorf("offsetof(%s, %s) = %d, want %d", what, f, got[f], off)
+			}
+		}
+	}
+	pin("aster_upcall_event_t", upcallEventOffsets(), map[string]uintptr{
+		"invocation_id": 0, "kind": 8, "cancel_reason": 10, "payload_len": 12,
+		"deadline_unix_ms": 16, "payload_ptr": 24, "buffer": 32})
+	pin("aster_http_foreign_options_t", httpForeignOptionsOffsets(), map[string]uintptr{
+		"struct_size": 0, "flags": 4, "inline_request_max": 8, "max_request_body": 16,
+		"max_response_body": 24, "max_chunk": 32, "response_buffer": 40, "reserved": 44})
+	pin("aster_route_spec_t", routeSpecOffsets(), map[string]uintptr{
+		"host": 0, "service_id": 16, "port": 32, "protocol": 36})
+
+	want := map[string]int64{
+		"UPCALL_KIND_CANCEL": 0, "UPCALL_KIND_LEASE_TRANSITION": 1, "UPCALL_KIND_LEASE_SNAPSHOT": 2,
+		"UPCALL_KIND_LEASE_AUTHORIZE": 3, "UPCALL_KIND_FENCED_MUTATE": 4, "UPCALL_KIND_TOPOLOGY_ADMITTED": 16,
+		"UPCALL_KIND_EXPOSE_AUTHORIZE": 48, "UPCALL_KIND_EXPOSE_HTTP": 49, "UPCALL_KIND_EXPOSE_ROUTE_POLICY": 50,
+		"UPCALL_KIND_ADMISSION_CONNECT": 64, "UPCALL_KIND_ADMISSION_HANDSHAKE": 65,
+		"UPCALL_STATUS_OK": 0, "UPCALL_STATUS_ERROR": 1, "UPCALL_STATUS_UNIMPLEMENTED": 2,
+		"UPCALL_CANCEL_NONE": 0, "UPCALL_CANCEL_TIMEOUT": 1, "UPCALL_CANCEL_ABANDONED": 2, "UPCALL_CANCEL_SHUTDOWN": 3,
+		"LEASE_STATUS_HELD": 0, "LEASE_STATUS_RELEASED": 1, "LEASE_STATUS_FENCED": 2, "LEASE_STATUS_LOST": 3,
+		"EVENT_LEASE_ACQUIRED": 107, "EVENT_LEASE_STATUS": 108,
+		"HTTP_BODY_OK": 0, "HTTP_BODY_UNKNOWN_STREAM": 1, "HTTP_BODY_CANCELLED": 2, "HTTP_BODY_TOO_LARGE": 3,
+		"HTTP_BODY_CHUNK_TOO_LARGE": 4, "HTTP_BODY_FINISHED": 5, "HTTP_BODY_TIMEOUT": 6, "HTTP_BODY_READ": 7,
+		"HTTP_BODY_INVALID_TRAILERS": 8, "HTTP_BODY_BLOCKING_ON_RUNTIME": 9,
+		"HTTP_BODY_INVALID_ARGUMENT": -1, "HTTP_BODY_UNKNOWN_HANDLE": -2,
+		"HOOK_FAILURE_FAIL_OPEN": 0, "HOOK_FAILURE_FAIL_CLOSED": 1, "UPCALL_DEFAULT_CAPACITY": 1024,
+	}
+	got := abiEnums()
+	for name, w := range want {
+		if got[name] != w {
+			t.Errorf("%s = %d, want %d", name, got[name], w)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("%d enums read from the header, %d pinned", len(got), len(want))
+	}
+	// The plain-Go mirrors.
+	if UpcallExposeHTTP != 49 || UpcallExposeAuthorize != 48 || UpcallExposeRoutePolicy != 50 ||
+		UpcallLeaseTransition != 1 || UpcallTopologyAdmitted != 16 || UpcallStatusUnimplemented != 2 ||
+		CancelShutdown != 3 {
+		t.Error("upcall_types.go drifted from the header")
+	}
+	// ABI 4.1 + 4.2 are both in the library.
+	if _, minor, _ := Version(); minor < 2 {
+		t.Errorf("library ABI minor %d, binding needs >= 2", minor)
 	}
 }
 
