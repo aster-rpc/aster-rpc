@@ -51,7 +51,7 @@ pub const ENVELOPE_VERSION: u8 = 0x01;
 /// Payload serialization mode carried in [`StreamHeader::serialization_mode`].
 ///
 /// JSON (`3`) is retired across all bindings; `Native`/`Row` are reserved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i8)]
 pub enum SerializationMode {
     Xlang = 0,

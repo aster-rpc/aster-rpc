@@ -82,7 +82,7 @@ pub enum ScopeKind {
 
 // ── Structs ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldDef {
     /// Caller-supplied field ID is accepted on input for backwards compat but
     /// is NOT trusted during canonicalization. `write_type_def` re-derives IDs
@@ -123,13 +123,13 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnumValueDef {
     pub name: String,
     pub value: i32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnionVariantDef {
     pub name: String,
     pub id: i32,
@@ -137,7 +137,7 @@ pub struct UnionVariantDef {
     pub type_ref: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeDef {
     pub kind: TypeDefKind,
     pub package: String,
@@ -150,7 +150,7 @@ pub struct TypeDef {
     pub union_variants: Vec<UnionVariantDef>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityRequirement {
     pub kind: CapabilityKind,
     pub roles: Vec<String>,
