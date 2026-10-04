@@ -32,16 +32,30 @@ Resources are a :class:`ResourceKey` or a ``(namespace, key)`` tuple (a ``str``
 key is UTF-8). Node ids are accepted as :class:`aster.NodeId`, 32 bytes or 64
 hex characters, and returned as :class:`aster.NodeId`. Durations are seconds.
 
-Not wrapped yet (needs the binding upcall mechanism, plan R6): the placement
-*manager* with Python-implemented provisioner / policy / topology sources. The
-pure planner is :func:`placement_plan`.
+Placement: :func:`placement_plan` is the pure section 7.7.2 planner;
+:class:`PlacementManager` runs the section 7.7.3 reconciliation in Rust beside an
+administrator client, with the application's providers in Python (served by
+upcall, ``aster.upcalls``)::
+
+    manager = PlacementManager(
+        admin_client,
+        topology=node.topology(),        # or a TopologySource returning a TopologyView
+        policy=MyPolicySource(),         # or a fixed PlacementPolicy
+        provisioner=MyProvisioner(),     # async def provision(request) -> MemberSeed
+    )
+    report = await manager.reconcile()   # PlacementReport
+
+A provider that raises or times out stops that pass
+(:class:`aster.upcalls.UpcallError`); membership only ever changes through the
+client's durable journal.
 """
 
 from __future__ import annotations
 
+import abc
 import os
 from dataclasses import dataclass
-from typing import Dict, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 from ._aster import (
     AuditStream,
@@ -50,10 +64,16 @@ from ._aster import (
     CoordinationReadClient,
     NodeId,
     ResolvedMutation,
+    Topology,
     TopologySnapshot,
     _coordination_placement_plan,
+    _PlacementManager,
 )
 from .lease import DenyReason, LeaseSnapshot
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .topology import TopologyView
+    from .upcalls import UpcallRuntime
 
 __all__ = [
     "AclGrant",
@@ -89,9 +109,14 @@ __all__ = [
     "MutationReply",
     "PlacementCandidate",
     "PlacementInput",
+    "PlacementManager",
     "PlacementPlan",
     "PlacementPolicy",
+    "PlacementPolicySource",
+    "PlacementProvisioner",
     "PlacementRecommendation",
+    "PlacementReport",
+    "ProvisionRequest",
     "RecoveredFrom",
     "RecoveryExport",
     "ResolvedMutation",
@@ -99,6 +124,7 @@ __all__ = [
     "ResourceSnapshot",
     "RetireReply",
     "SeparationSummary",
+    "TopologySource",
     "fence_of",
     "new_operation_id",
     "placement_plan",
@@ -627,3 +653,126 @@ def placement_plan(
     Submit a ``plan`` with :meth:`CoordinationClient.change_membership` and a
     fresh :func:`new_operation_id`."""
     return _coordination_placement_plan(input, topology)
+
+
+# -- Placement manager (providers in Python, served by upcall) -------------------
+
+
+@dataclass(frozen=True)
+class ProvisionRequest:
+    """The idempotency tuple one provisioning call is keyed by (section
+    7.7.3 step 4): the same tuple must yield the same candidate -- the call
+    may repeat after a timeout."""
+
+    group_id: str
+    #: The policy digest (hex) the pass planned against.
+    policy_digest: str
+    membership_log_id: Optional[LogId]
+    #: The node to start (or find) a Join candidate for.
+    node_id: NodeId
+
+
+@dataclass(frozen=True)
+class PlacementReport:
+    """What one :meth:`PlacementManager.reconcile` pass observed and did."""
+
+    policy_revision: int
+    policy_digest: str
+    membership_log_id: Optional[LogId]
+    current_voters: Tuple[NodeId, ...]
+    current_learners: Tuple[NodeId, ...]
+    selected_voters: Tuple[NodeId, ...]
+    selected_learners: Tuple[NodeId, ...]
+    #: Members absent across the full replacement grace (as planned on).
+    grace_crossed_members: Tuple[NodeId, ...]
+    separation: Optional[SeparationSummary]
+    #: The submitted membership operation (hex) when a plan was accepted.
+    pending_operation_id: Optional[str]
+    reason: str
+
+
+class PlacementProvisioner(abc.ABC):
+    """Start (or find) a persistent-identity Join candidate for
+    ``request.node_id`` and return its seed (canonical ticket + signed join
+    permit). Idempotent per request tuple. The signing authority stays
+    outside Aster."""
+
+    @abc.abstractmethod
+    async def provision(self, request: ProvisionRequest) -> MemberSeed:
+        ...
+
+
+class PlacementPolicySource(abc.ABC):
+    """The application-owned policy, read on every observation (twice per
+    pass: planning and the pre-submit recheck). May be sync or async; the
+    Rust side waits on it synchronously (one upcall per read)."""
+
+    @abc.abstractmethod
+    def policy(self) -> PlacementPolicy:
+        ...
+
+
+class TopologySource(abc.ABC):
+    """One atomic topology observation, as a
+    :class:`aster.topology.TopologyView`. Pass the node's own ``Topology``
+    instead to use the live view directly."""
+
+    @abc.abstractmethod
+    async def snapshot(self) -> "TopologyView":
+        ...
+
+
+class PlacementManager:
+    """Section 7.7.3's placement manager, run in Rust beside an
+    administrator ``client``: deliver any journalled retry, observe (status
+    cut, one topology snapshot, the policy, the replacement grace), plan,
+    provision missing seeds, re-observe, and submit only if nothing moved --
+    through the client's durable journal (the manager acknowledges what it
+    submits).
+
+    ``topology``: the node's ``Topology`` or a :class:`TopologySource`.
+    ``policy``: a fixed :class:`PlacementPolicy` or a
+    :class:`PlacementPolicySource`. ``provisioner``: a
+    :class:`PlacementProvisioner` (``None``: a pass needing one fails).
+    Upcall policies: ``topology_snapshot``, ``placement_policy``,
+    ``placement_provision``.
+    """
+
+    def __init__(
+        self,
+        client: CoordinationClient,
+        *,
+        topology: Union[Topology, TopologySource],
+        policy: Union[PlacementPolicy, PlacementPolicySource],
+        provisioner: Optional[PlacementProvisioner] = None,
+        runtime: Optional["UpcallRuntime"] = None,
+    ) -> None:
+        self.topology = topology
+        self.policy = policy
+        self.provisioner = provisioner
+        self.upcall_runtime = runtime
+        self._native = _PlacementManager(
+            client,
+            self,
+            topology=topology if isinstance(topology, Topology) else None,
+            policy=policy if isinstance(policy, PlacementPolicy) else None,
+        )
+
+    async def reconcile(self) -> PlacementReport:
+        """Run one full reconciliation (passes are serialized)."""
+        return await self._native.reconcile()
+
+    # Upcall handlers (``aster.upcalls`` role ``placement``).
+
+    def _topology_snapshot(self) -> Any:
+        return self.topology.snapshot()
+
+    def _placement_policy(self) -> Any:
+        source = self.policy
+        fn = getattr(source, "policy", None)
+        return fn() if callable(fn) else source()
+
+    def _provision(self, request: ProvisionRequest) -> Any:
+        if self.provisioner is None:
+            raise RuntimeError("this PlacementManager has no provisioner")
+        return self.provisioner.provision(request)

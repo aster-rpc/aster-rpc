@@ -12,9 +12,15 @@
 //! - admission.rs: Gate 0 (`GatePolicy`, `PeerAdmissionStore`, `Admission`)
 //! - attestation.rs, grants.rs, lease.rs, topology.rs: plan P7 (values are
 //!   the frozen dataclasses of the matching `aster.*` Python modules)
-//! - coordination.rs: plan P9, the wrapped coordination client
+//! - coordination.rs: plan P9, the wrapped coordination client (+ the
+//!   placement manager with Python providers)
+//! - upcall.rs: plan R6, the upcall runtime (Rust asking Python: foreign
+//!   lease serializers / fenced resources / authorizers, the topology
+//!   `admitted` filter, placement providers, expose authorize, Gate 0)
 //! - rpc.rs: plan P4, `DispatchServer` / `ServerCall` (Python services on
 //!   `aster::rpc` dynamic dispatch) and `RpcClient` (pooled `RpcConnection`)
+//! - expose.rs: `Expose` (socket targets) + `relay_request`, minimal, for
+//!   the R6 expose authorize hook
 //! - error.rs: Exception types
 //!
 //! The protocol clients and bare endpoints still drive the transport
@@ -31,6 +37,7 @@ mod coordination;
 mod crypto;
 mod docs;
 mod error;
+mod expose;
 mod gossip;
 mod grants;
 mod ids;
@@ -42,6 +49,7 @@ mod node;
 mod rpc;
 mod ticket;
 mod topology;
+mod upcall;
 mod wire;
 
 /// Wrapper to convert Vec<u8> to Python bytes via IntoPyObject.
@@ -102,6 +110,8 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     topology::register(py, m)?;
     coordination::register(py, m)?;
     rpc::register(py, m)?;
+    upcall::register(py, m)?;
+    expose::register(py, m)?;
 
     Ok(())
 }

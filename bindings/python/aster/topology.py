@@ -12,20 +12,48 @@ the swarm-wide cluster view::
     snap = await topo.snapshot()                         # v2: one consistent view
     snap.clusters; snap.separated(a, b)                  # "unknown" | "connected" | "separated"
 
-The read-time ``admitted`` filter of ``enable_shared`` (a Python callback)
-waits on the binding upcall mechanism (plan R6); every holder of the secret
-counts. Durations are seconds.
+Without an ``admitted`` filter every holder of the secret counts. With one,
+records whose author it rejects (and vertices it rejects) are ignored::
+
+    flt = AdmittedFilter(lambda node_id: node_id in allowed)   # or async def
+    await flt.prefetch(known_ids)                              # optional warm-up
+    await topo.enable_shared(secret, admitted=flt)
+    flt.set(revoked_id, False)                                 # push a revocation
+
+The filter is consulted synchronously on Rust's read path (every view
+derivation, at most once a second), so it never waits for Python: it answers
+from a cache filled by **batched** upcalls into your predicate (sync or
+async, it makes no difference to Rust). A fresh entry is a hit; a stale one
+(older than ``ttl``) answers the cached value and is refreshed in the
+background; an unknown id gets the ``topology_admitted`` failure-mode answer
+(fail-closed: filtered) until its batch is answered -- in practice a new
+producer counts from the next view (~1 s). A revocation takes effect after
+``ttl`` unless you push it with :meth:`AdmittedFilter.set` /
+:meth:`AdmittedFilter.invalidate`. A failed batch caches the fallback for
+``failure_retry`` and never overwrites a real cached answer.
+
+A placement :class:`aster.coordination.TopologySource` returns a
+:class:`TopologyView` (the serialized form of a view);
+:meth:`TopologySnapshot.from_view` builds the same snapshot Rust does.
+Durations are seconds.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
+import inspect
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple
 
-from ._aster import NodeId, Topology, TopologySnapshot
+from ._aster import NodeId, Topology, TopologySnapshot, _AdmittedFilter
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .upcalls import UpcallRuntime
 
 __all__ = [
+    "AdmittedCacheStats",
+    "AdmittedFilter",
     "ClusterView",
     "LadderLevel",
     "PeerView",
@@ -33,6 +61,7 @@ __all__ = [
     "Topology",
     "TopologySnapshot",
     "TopologyTiming",
+    "TopologyView",
 ]
 
 #: Locality ladder level; lower is closer.
@@ -116,3 +145,103 @@ class TopologyTiming:
     max_skew: Optional[float] = None
     separation_coverage: Optional[int] = None
     witness_r: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class TopologyView:
+    """A serialized shared view -- what a placement ``TopologySource``
+    returns: the clusters, the corroborated far pairs (node id pairs, any
+    order), and the separation coverage the reader required."""
+
+    clusters: Tuple[ClusterView, ...] = ()
+    far_pairs: Tuple[Tuple[NodeId, NodeId], ...] = ()
+    separation_coverage: int = 0
+
+
+@dataclass(frozen=True)
+class AdmittedCacheStats:
+    """:class:`AdmittedFilter` counters."""
+
+    #: Lookups answered from a fresh entry.
+    hits: int
+    #: Lookups answered from a stale entry (refresh queued).
+    stale: int
+    #: Lookups with no entry (failure-mode answer, resolution queued).
+    misses: int
+    #: Batched upcalls issued.
+    upcalls: int
+
+
+class AdmittedFilter:
+    """The read-time topology admission filter for ``enable_shared``,
+    answered by ``predicate`` -- ``(NodeId) -> bool | Awaitable[bool]``, or
+    an object with ``admitted_batch(node_ids) -> Sequence[bool]`` (sync or
+    async) to answer a whole batch at once. Cache semantics: see the module
+    docstring. ``ttl`` / ``failure_retry`` are seconds; ``max_batch`` caps
+    ids per upcall."""
+
+    def __init__(
+        self,
+        predicate: Any,
+        *,
+        ttl: float = 30.0,
+        failure_retry: float = 1.0,
+        max_batch: int = 256,
+        runtime: Optional["UpcallRuntime"] = None,
+    ) -> None:
+        self.predicate = predicate
+        self.upcall_runtime = runtime
+        self._native = _AdmittedFilter(
+            self, ttl=ttl, failure_retry=failure_retry, max_batch=max_batch
+        )
+
+    async def _admitted_batch(self, node_ids: Tuple[NodeId, ...]) -> Tuple[bool, ...]:
+        batch = getattr(self.predicate, "admitted_batch", None)
+        if callable(batch):
+            answers = batch(node_ids)
+            if inspect.isawaitable(answers):
+                answers = await answers
+            return tuple(answers)
+        answers = [self.predicate(n) for n in node_ids]
+        pending = [a for a in answers if inspect.isawaitable(a)]
+        if pending:
+            done = iter(await asyncio.gather(*pending))
+            answers = [next(done) if inspect.isawaitable(a) else a for a in answers]
+        return tuple(answers)
+
+    def is_admitted(self, node_id) -> bool:
+        """Look ``node_id`` up exactly as Rust's read path does (never
+        waits; a miss queues a resolution)."""
+        return self._native.is_admitted(node_id)
+
+    async def prefetch(self, node_ids: Iterable) -> None:
+        """Resolve ``node_ids`` now with one upcall and cache the answers;
+        raises :class:`aster.upcalls.UpcallError` if the batch failed."""
+        await self._native.prefetch(list(node_ids))
+
+    def set(self, node_id, admitted: bool) -> None:
+        """Push an answer (e.g. on revocation); served for ``ttl``."""
+        self._native.set(node_id, bool(admitted))
+
+    def invalidate(self, node_id) -> None:
+        """Forget ``node_id``; the next lookup re-resolves."""
+        self._native.invalidate(node_id)
+
+    def clear(self) -> None:
+        """Forget every id."""
+        self._native.clear()
+
+    def stats(self) -> AdmittedCacheStats:
+        return AdmittedCacheStats(*self._native.stats())
+
+
+def _as_admitted_filter(obj: Any) -> _AdmittedFilter:
+    # Called by ``Topology.enable_shared(admitted=...)``.
+    if isinstance(obj, AdmittedFilter):
+        return obj._native
+    if not callable(obj) and not callable(getattr(obj, "admitted_batch", None)):
+        raise TypeError(
+            "admitted must be an AdmittedFilter, a predicate (NodeId) -> bool, or an "
+            "object with admitted_batch()"
+        )
+    return AdmittedFilter(obj)._native

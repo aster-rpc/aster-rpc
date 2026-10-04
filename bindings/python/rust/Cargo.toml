@@ -13,8 +13,9 @@ crate-type = ["cdylib"]
 # The `aster` crate is the binding's backend (plan D1): Node, AsterConfig and
 # its env/TOML loaders, typed ids, the secret-key file. Binding profile =
 # default + rpc + metrics + binding-support + coordination-client (plan D7:
-# the coordination client is wrapped, never ported; see aster/Cargo.toml).
-aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support", "coordination-client"] }
+# the coordination client is wrapped, never ported; see aster/Cargo.toml)
+# + expose (socket targets with a Python authorize hook by upcall, R6).
+aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support", "coordination-client", "expose"] }
 # Transport core, still driven directly for the reactor ring, client-call
 # pool, tunnels and bare endpoints (reached from `aster` handles through
 # `aster::binding_support`).
@@ -30,6 +31,7 @@ serde_json  = "1"
 # Common dependencies
 tokio       = { workspace = true }
 anyhow      = { workspace = true }
+async-trait = "0.1"
 hex         = "0.4"
 
 # Crypto primitives (exposed to Python, replacing cryptography + blake3 packages)

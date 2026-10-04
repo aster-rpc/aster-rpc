@@ -28,7 +28,16 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from aster import AsterConfig, LeaseOptions, Node, TopologyTiming
+from aster import (
+    AsterConfig,
+    ClusterView,
+    LeaseOptions,
+    Node,
+    NodeId,
+    TopologyTiming,
+    TopologyView,
+    UpcallError,
+)
 from aster.coordination import (
     CoordinationAwaitingAckError,
     CoordinationClient,
@@ -40,9 +49,14 @@ from aster.coordination import (
     CoordinationRights,
     CoordinationRpcError,
     CoordinationUnresolvedError,
+    MemberSeed,
     PlacementCandidate,
     PlacementInput,
+    PlacementManager,
     PlacementPolicy,
+    PlacementProvisioner,
+    PlacementReport,
+    ProvisionRequest,
     ResourceKey,
     fence_of,
     placement_plan,
@@ -471,3 +485,124 @@ async def test_plans_placement_from_the_live_status_cut(group):
         assert rec.kind in ("stable", "degraded")
     finally:
         await monitor.shutdown()
+
+
+# -- Placement manager with Python providers (plan R6 upcalls) -------------------
+
+
+class _Policy:
+    def __init__(self, policy):
+        self.value = policy
+        self.reads = 0
+
+    def policy(self):
+        self.reads += 1
+        return self.value
+
+
+class _Topo:
+    def __init__(self, view):
+        self.view = view
+        self.snapshots = 0
+
+    async def snapshot(self):
+        self.snapshots += 1
+        return self.view
+
+
+def _policy_for(status, **kw) -> PlacementPolicy:
+    fields = dict(
+        revision=1,
+        digest="44" * 32,
+        authority_public_key=status.authority_public_key,
+        authority_domain=status.authority_domain,
+        target_voters=3,
+        eligible=tuple(PlacementCandidate(v) for v in status.voters),
+    )
+    fields.update(kw)
+    return PlacementPolicy(**fields)
+
+
+def _one_cluster(ids) -> TopologyView:
+    ids = tuple(sorted(ids, key=str))
+    return TopologyView(
+        clusters=(ClusterView(members=ids, bridge=ids[0], witnesses=ids[:1]),),
+        separation_coverage=1,
+    )
+
+
+async def test_placement_manager_reconciles_with_python_providers(group):
+    status = await group.root.reads().group_status()
+    policy = _Policy(_policy_for(status))
+    topo = _Topo(_one_cluster(status.voters))
+    manager = PlacementManager(group.root, topology=topo, policy=policy)
+    report = await asyncio.wait_for(manager.reconcile(), 60)
+    assert isinstance(report, PlacementReport)
+    assert report.policy_revision == 1 and report.policy_digest == "44" * 32
+    assert set(report.current_voters) == set(status.voters)
+    assert report.pending_operation_id is None
+    assert report.reason
+    assert policy.reads >= 1 and topo.snapshots >= 1
+
+    # A fixed policy and the node's own topology: the live view is read
+    # directly (here: not joined, so the pass stops with that error).
+    fixed = PlacementManager(
+        group.root, topology=group.root_node.topology(), policy=_policy_for(status)
+    )
+    with pytest.raises(CoordinationInvalidArgumentError, match="enable_shared"):
+        await asyncio.wait_for(fixed.reconcile(), 60)
+
+
+async def test_placement_manager_provider_failures_stop_the_pass(group):
+    status = await group.root.reads().group_status()
+    newcomer = NodeId(os.urandom(32).hex())
+    voters = tuple(status.voters)
+    # One voter excluded, a seedless newcomer eligible: the plan needs a
+    # provisioned seed for the newcomer.
+    policy = _policy_for(
+        status,
+        eligible=tuple(PlacementCandidate(v) for v in voters) + (PlacementCandidate(newcomer),),
+        excluded=(voters[0],),
+    )
+    view = _one_cluster(voters + (newcomer,))
+    asked = []
+
+    class Refusing(PlacementProvisioner):
+        async def provision(self, request):
+            asked.append(request)
+            raise RuntimeError("no capacity")
+
+    manager = PlacementManager(
+        group.root, topology=_Topo(view), policy=_Policy(policy), provisioner=Refusing()
+    )
+    with pytest.raises(UpcallError) as e:
+        await asyncio.wait_for(manager.reconcile(), 60)
+    assert e.value.kind == "foreign" and "no capacity" in str(e.value)
+    assert len(asked) == 1
+    req = asked[0]
+    assert isinstance(req, ProvisionRequest)
+    assert req.group_id == group.group_id and req.policy_digest == "44" * 32
+    assert req.node_id == newcomer
+    assert req.membership_log_id == status.membership_log_id
+
+    class Wrong(PlacementProvisioner):
+        async def provision(self, request):
+            return MemberSeed(NodeId("ee" * 32), "aster1ticket")
+
+    # A seed for a different node is refused before anything is submitted.
+    wrong = PlacementManager(
+        group.root, topology=_Topo(view), policy=_Policy(policy), provisioner=Wrong()
+    )
+    with pytest.raises(CoordinationInvalidArgumentError):
+        await asyncio.wait_for(wrong.reconcile(), 60)
+    after = await group.root.reads().group_status()
+    assert set(after.voters) == set(status.voters) and after.pending_operation_id is None
+
+    class BrokenTopology:
+        async def snapshot(self):
+            raise OSError("topology service down")
+
+    broken = PlacementManager(group.root, topology=BrokenTopology(), policy=_Policy(policy))
+    with pytest.raises(UpcallError) as e:
+        await asyncio.wait_for(broken.reconcile(), 60)
+    assert e.value.kind == "foreign"

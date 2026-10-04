@@ -828,8 +828,12 @@ impl From<CoreConnection> for IrohConnection {
 }
 
 impl IrohConnection {
+    pub(crate) fn core(&self) -> &CoreConnection {
+        &self.inner
+    }
+
     /// The `aster` SDK view of this connection.
-    fn sdk(&self) -> aster::Connection {
+    pub(crate) fn sdk(&self) -> aster::Connection {
         aster::Connection::from_core_connection(self.inner.clone())
     }
 

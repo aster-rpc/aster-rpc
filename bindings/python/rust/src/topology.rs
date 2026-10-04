@@ -8,8 +8,9 @@
 //! `PeerView` / `ClusterView` / `TopologyTiming` are the frozen dataclasses
 //! of `aster.topology`; durations are seconds.
 //!
-//! Deferred (needs the R6 upcall mechanism): a Python `admitted` read-time
-//! filter for `enable_shared`.
+//! The read-time `admitted` filter of `enable_shared` may be Python (plan
+//! R6): [`AdmittedFilter`] wraps `ForeignAdmittedFn`, a cache answered by
+//! batched upcalls, so the Rust read path never waits on Python.
 
 use std::sync::Arc;
 
@@ -23,6 +24,8 @@ use aster::topology::{
     TopologySwarmOptions,
 };
 use aster::{NamespaceSecret, NodeId};
+
+use aster::binding_support::upcall::topology::{AdmittedCacheOptions, ForeignAdmittedFn};
 
 use crate::error::aster_err_to_py;
 use crate::keys::{key32, node_hex, node_id_out, py_value, secs_in};
@@ -45,7 +48,7 @@ fn verdict_out(v: SeparationVerdict) -> &'static str {
     }
 }
 
-fn ids_out<'py>(py: Python<'py>, ids: &[String]) -> PyResult<Bound<'py, PyTuple>> {
+pub(crate) fn ids_out<'py>(py: Python<'py>, ids: &[String]) -> PyResult<Bound<'py, PyTuple>> {
     PyTuple::new(py, ids.iter().map(|h| node_id_out(h.clone())))
 }
 
@@ -72,7 +75,7 @@ fn peer_out<'py>(py: Python<'py>, p: RsPeerView) -> PyResult<Bound<'py, PyAny>> 
     })
 }
 
-fn cluster_out<'py>(py: Python<'py>, c: &RsClusterView) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn cluster_out<'py>(py: Python<'py>, c: &RsClusterView) -> PyResult<Bound<'py, PyAny>> {
     py_value!(py, "aster.topology", "ClusterView" {
         members: ids_out(py, &c.members)?,
         bridge: node_id_out(c.bridge.clone()),
@@ -80,7 +83,10 @@ fn cluster_out<'py>(py: Python<'py>, c: &RsClusterView) -> PyResult<Bound<'py, P
     })
 }
 
-fn clusters_out<'py>(py: Python<'py>, cs: &[RsClusterView]) -> PyResult<Bound<'py, PyTuple>> {
+pub(crate) fn clusters_out<'py>(
+    py: Python<'py>,
+    cs: &[RsClusterView],
+) -> PyResult<Bound<'py, PyTuple>> {
     let items = cs
         .iter()
         .map(|c| cluster_out(py, c))
@@ -128,6 +134,12 @@ pub struct Topology {
     inner: RsTopology,
 }
 
+impl Topology {
+    pub(crate) fn inner(&self) -> &RsTopology {
+        &self.inner
+    }
+}
+
 impl From<RsTopology> for Topology {
     fn from(inner: RsTopology) -> Self {
         Self { inner }
@@ -169,8 +181,12 @@ impl Topology {
     /// bytes or 64 hex, normally delivered in a sealed grant) and start
     /// publishing this node's measurements. `bootstrap`: peers to sync with
     /// beyond connected ones; `position_refresh`: heartbeat seconds (default
-    /// 60); `timing`: a `TopologyTiming`. Awaitable.
-    #[pyo3(signature = (secret, *, bootstrap=None, position_refresh=None, timing=None))]
+    /// 60); `timing`: a `TopologyTiming`; `admitted`: the read-time
+    /// admission filter -- an `aster.topology.AdmittedFilter`, or a
+    /// predicate `(NodeId) -> bool | Awaitable[bool]` wrapped in one with
+    /// default cache options (records whose author it rejects, and vertices
+    /// it rejects, are ignored). Awaitable.
+    #[pyo3(signature = (secret, *, bootstrap=None, position_refresh=None, timing=None, admitted=None))]
     fn enable_shared<'py>(
         &self,
         py: Python<'py>,
@@ -178,6 +194,7 @@ impl Topology {
         bootstrap: Option<Vec<Bound<'py, PyAny>>>,
         position_refresh: Option<f64>,
         timing: Option<&Bound<'py, PyAny>>,
+        admitted: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let secret = NamespaceSecret::from_bytes(key32("namespace secret", secret)?);
         let mut opts = TopologySwarmOptions::default();
@@ -189,6 +206,9 @@ impl Topology {
         }
         if let Some(t) = timing.filter(|t| !t.is_none()) {
             opts.timing = timing_in(t)?;
+        }
+        if let Some(a) = admitted.filter(|a| !a.is_none()) {
+            opts.admitted = Some(admitted_in(a)?.admitted_fn());
         }
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -271,6 +291,20 @@ pub struct TopologySnapshot {
 
 #[pymethods]
 impl TopologySnapshot {
+    /// A snapshot built from a serialized view (`aster.topology.TopologyView`:
+    /// clusters, corroborated far pairs, separation coverage), answering
+    /// `cluster_of` / `separated` by the same rules as a live view -- what a
+    /// Python placement `TopologySource` returns.
+    #[staticmethod]
+    fn from_view(py: Python<'_>, view: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let snap = Arc::new(crate::upcall::view_in(view)?.into_snapshot());
+        let clusters = clusters_out(py, snap.clusters())?.unbind();
+        Ok(TopologySnapshot {
+            inner: snap,
+            clusters,
+        })
+    }
+
     /// The clusters of this view (tuple of `ClusterView`).
     #[getter]
     fn clusters(&self, py: Python<'_>) -> Py<PyTuple> {
@@ -304,8 +338,106 @@ impl TopologySnapshot {
     }
 }
 
+/// `obj` as the native filter: an `_AdmittedFilter`, or anything
+/// `aster.topology._as_admitted_filter` turns into one.
+fn admitted_in(obj: &Bound<'_, PyAny>) -> PyResult<ForeignAdmittedFn> {
+    if let Ok(f) = obj.cast::<AdmittedFilter>() {
+        return Ok(f.get().inner.clone());
+    }
+    let native = obj
+        .py()
+        .import("aster.topology")?
+        .getattr("_as_admitted_filter")?
+        .call1((obj,))?;
+    Ok(native.cast::<AdmittedFilter>()?.get().inner.clone())
+}
+
+/// The native half of `aster.topology.AdmittedFilter`: a cached, batched
+/// read-time admission filter answered by Python (`ForeignAdmittedFn`).
+#[pyclass(frozen, module = "aster._aster", name = "_AdmittedFilter")]
+pub struct AdmittedFilter {
+    inner: ForeignAdmittedFn,
+}
+
+#[pymethods]
+impl AdmittedFilter {
+    /// Bind `handler` (an `aster.topology.AdmittedFilter`) as the
+    /// `topology_admitted` upcall handler. `ttl` / `failure_retry` are
+    /// seconds.
+    #[new]
+    #[pyo3(signature = (handler, *, ttl=30.0, failure_retry=1.0, max_batch=256))]
+    fn new(
+        handler: &Bound<'_, PyAny>,
+        ttl: f64,
+        failure_retry: f64,
+        max_batch: usize,
+    ) -> PyResult<Self> {
+        let opts = AdmittedCacheOptions {
+            ttl: secs_in("ttl", ttl)?,
+            failure_retry: secs_in("failure_retry", failure_retry)?,
+            max_batch,
+        };
+        let upcalls = crate::upcall::bind(handler, "topology_admitted")?;
+        // The refresher task spawns on construction.
+        let _guard = crate::upcall::tokio_guard();
+        Ok(Self {
+            inner: ForeignAdmittedFn::new(upcalls, opts),
+        })
+    }
+
+    /// Look one id up exactly as the read path does (never waits).
+    fn is_admitted(&self, node_id: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self.inner.is_admitted(&node_hex(node_id)?))
+    }
+
+    /// Resolve `node_ids` now with one upcall and cache the answers.
+    /// Awaitable; raises `aster.upcalls.UpcallError` when the batch failed
+    /// (the failure-mode answer is then cached for `failure_retry`).
+    fn prefetch<'py>(
+        &self,
+        py: Python<'py>,
+        node_ids: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ids = node_ids
+            .iter()
+            .map(node_hex)
+            .collect::<PyResult<Vec<_>>>()?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .prefetch(&ids)
+                .await
+                .map_err(|e| crate::upcall::upcall_err(&e))
+        })
+    }
+
+    /// Push an answer (e.g. on revocation); served for `ttl`.
+    fn set(&self, node_id: &Bound<'_, PyAny>, admitted: bool) -> PyResult<()> {
+        self.inner.set(&node_hex(node_id)?, admitted);
+        Ok(())
+    }
+
+    /// Forget one id; the next lookup misses and re-resolves.
+    fn invalidate(&self, node_id: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner.invalidate(&node_hex(node_id)?);
+        Ok(())
+    }
+
+    /// Forget every id.
+    fn clear(&self) {
+        self.inner.clear();
+    }
+
+    /// `(hits, stale, misses, upcalls)`.
+    fn stats(&self) -> (u64, u64, u64, u64) {
+        let s = self.inner.stats();
+        (s.hits, s.stale, s.misses, s.upcalls)
+    }
+}
+
 pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Topology>()?;
     m.add_class::<TopologySnapshot>()?;
+    m.add_class::<AdmittedFilter>()?;
     Ok(())
 }

@@ -216,6 +216,24 @@ this node's own dials (otherwise they are allowed). A request left unanswered
 falls back to `hook_failure_mode` after `hook_timeout_ms`. The iterator ends
 when the node closes.
 
+Or hand the decisions to an `AdmissionHandler` served over the upcall channel
+(section 9) instead of iterating:
+
+```python
+from aster import AdmissionHandler
+
+class Allow(AdmissionHandler):
+    async def handshake(self, peer, alpn, is_alive):
+        return allowed(peer, alpn) or (4031, b"not on the list")  # True / False / (code, reason)
+    # async def connect(self, peer, alpn) -> bool   (outbound; default: allow)
+
+node = await Node.start(AsterConfig(enable_hooks=True))
+node.serve_admission(Allow())
+```
+
+A handler that raises or misses the `admission_handshake` timeout gets that
+kind's failure mode (fail-closed: `403 "hook unavailable"`).
+
 ## 6. Blobs, docs and the network layer
 
 These wrap the Rust SDK's `Blobs`, `Docs`/`Doc` and `Connection`. Every hash
@@ -375,9 +393,48 @@ snap.clusters, snap.cluster_of(peer_id), snap.separated(a, b)
 never evidence of distance. `enable_shared` also takes `position_refresh`
 (seconds) and `timing=TopologyTiming(...)`.
 
-Not yet in Python (they need the binding upcall mechanism, plan R6): a
-Python-implemented `LeaseSerializer`, `FencedResource` or lease authorizer,
-and the topology `admitted` filter.
+**Python-implemented lease pieces** (served over upcalls, section 9):
+
+```python
+from aster import FencedResource, FenceRejectedError, LeaseAuthorizer, LeaseSerializer
+
+class RowStore(LeaseSerializer):                 # your own serialization point
+    async def transition(self, resource, op):     # one CAS, e.g. lease_transition(row, ...)
+        ...
+    async def snapshot(self, resource):
+        ...
+
+outcome = await RowStore().acquire("tree/42", node.id, LeaseOptions(ttl=30))  # Rust engine, Python CAS
+server = grantor.serve_lease_grantor(RowStore())  # or back a designated grantor
+
+class Admins(LeaseAuthorizer):
+    async def authorize(self, op):                 # False -> denied / unauthorized
+        return op.actor in admins
+MemorySerializer().set_authorizer(Admins())      # a plain (op) -> bool works too
+
+class Register(FencedResource):
+    async def mutate(self, fence, writer, op):    # check_fence(...) inside your lock
+        ...                                        # return output bytes, or raise FenceRejectedError
+```
+
+A serializer or fenced-resource failure is never guessed into an outcome:
+the Rust caller gets an error (`UpcallError`; for a fenced mutation with no
+answer `FenceOutcomeUnknownError` -- the write may or may not have happened).
+A failed authorizer applies the `lease_authorize` failure mode (fail-closed).
+
+**Topology `admitted` filter.** `enable_shared(secret, admitted=...)` takes a
+predicate `(NodeId) -> bool` (sync or `async def`), an object with
+`admitted_batch(node_ids)`, or an `AdmittedFilter(predicate, ttl=30,
+failure_retry=1, max_batch=256)`. Rust consults it synchronously on its read
+path, so it never waits for Python: answers come from a cache filled by
+batched upcalls. A fresh entry is a hit; a stale one (older than `ttl`) is
+served and refreshed in the background; an unknown id gets the
+`topology_admitted` failure-mode answer (fail-closed: filtered) until its
+batch is answered -- a new producer typically counts from the next view
+(~1 s). `flt.set(id, False)` / `flt.invalidate(id)` push a revocation
+immediately (otherwise it lands after `ttl`); `await flt.prefetch(ids)`
+warms the cache; a failed batch caches the fallback for `failure_retry` and
+never overwrites a real answer.
 
 ## 8. Coordination client
 
@@ -468,6 +525,99 @@ node.topology().snapshot())` is the pure, deterministic voter planner; submit a
 `kind == "plan"` result with
 `await client.change_membership(new_operation_id(), rec.plan)`.
 
-Not yet in Python (it needs the binding upcall mechanism, plan R6): the
-placement *manager* with Python-implemented provisioner, policy and topology
-sources.
+**Placement manager.** `PlacementManager(client, topology=..., policy=...,
+provisioner=...)` runs the section 7.7.3 reconcile loop in Rust beside an
+administrator client; each source may be Python (section 9):
+
+```python
+from aster.coordination import (
+    PlacementManager, PlacementPolicySource, PlacementProvisioner, TopologySource,
+)
+
+class Seeds(PlacementProvisioner):
+    async def provision(self, request):          # ProvisionRequest -> MemberSeed
+        return await start_candidate(request.node_id)
+
+manager = PlacementManager(
+    client,
+    topology=node.topology(),        # or a TopologySource: async def snapshot() -> TopologyView
+    policy=my_policy,                # a PlacementPolicy, or a PlacementPolicySource: def policy()
+    provisioner=Seeds(),
+)
+report = await manager.reconcile()   # PlacementReport
+```
+
+A provider failure stops that pass with `UpcallError` (nothing is submitted).
+
+## 9. Python extension points (upcalls)
+
+Rust calls into Python for the pieces above (lease serializer, authorizer,
+fenced resource, topology filter, placement providers, Gate 0 handler) and
+for expose (below). It works the same way for all of them: Rust emits a typed
+event, an asyncio pump task on your event loop decodes it in Rust into the
+usual `aster` dataclasses, runs your method (`async def` or plain) as its own
+task and answers by id. You never handle bytes. Bind these objects from async
+code, and keep that loop running while Rust may ask.
+
+```python
+from aster import UpcallPolicy, UpcallRuntime
+from aster.upcalls import set_runtime
+
+rt = UpcallRuntime(default_policy=UpcallPolicy(timeout=2.0))
+rt.set_policy("lease_authorize", UpcallPolicy(timeout=0.5, failure_mode="fail_open"))
+set_runtime(rt)          # this loop's default; or set `upcall_runtime = rt` on one object
+...
+await rt.aclose()        # pending upcalls fail; decisions fall back
+```
+
+Each kind has a timeout (default 5 s). The yes/no kinds (`lease_authorize`,
+`topology_admitted`, `expose_authorize`, `expose_route_policy`,
+`admission_connect`, `admission_handshake`) also have a failure mode applied
+when there is no usable answer (exception, timeout, full queue, wrong type):
+`"fail_closed"` (default) or `"fail_open"`. Other kinds surface the failure
+to the Rust caller as `UpcallError` (`.kind`: `timeout`, `overloaded`,
+`closed`, `foreign`, `unimplemented`, `decode`). When Rust stops waiting, your
+task is cancelled (`asyncio.CancelledError`) and a late answer is dropped.
+
+**Expose.** `node.expose()` publishes local services to peers:
+
+```python
+from aster import EdgeRouter, ExposeAuthorizer, HttpHandler, HttpResponse, RoutePolicy
+
+class Team(ExposeAuthorizer):
+    async def authorize(self, service_id, peer, metadata):   # once per (connection, service)
+        return peer in team
+
+class Hello(HttpHandler):
+    async def handle(self, request):                       # HttpRequest
+        name = await request.read_body()                     # bytes, inline or streamed
+        return HttpResponse(200, [("content-type", "text/plain")], b"hi " + name)
+
+expose = node.expose()
+expose.expose_socket("db", "127.0.0.1:5432", authorize=Team())   # raw L4 splice
+expose.expose_http("app", Hello(), authorize=Team())             # Python handler
+await expose.serve([b"aster-expose/app"])                       # or expose.handle(conn)
+
+# consumer side, on a connection to that ALPN
+send, recv = await open_relay(conn, "db", b"token")
+resp = await relay_http(conn, "app", "POST", "/", body=b"you")   # HttpResponse
+```
+
+Each HTTP request is one `expose_http` upcall. `request.body` is `bytes` when
+the request declared a body of at most `inline_request_max` (64 KiB), else an
+`HttpBodyStream` (`await read()`, `async for`), pulled from the wire only as
+you read. Return an `HttpResponse` (or `bytes` / `str` for a 200) whose body
+is `bytes` / `str` (sent with the head) or an (async) iterable of chunks
+(streamed after the head with backpressure, then finished with `trailers`).
+The kind's timeout bounds the time to the response head only -- raise it for
+long-polling handlers. A handler that raises answers `500` (the message is
+logged, never sent), a timeout `504`, no handler `501`; `max_request_body` /
+`max_response_body` cap bodies (`413` / `502`). If the consumer leaves before
+the head, the handler task is cancelled.
+
+An edge accepts route registrations with `expose.serve_routes(EdgeRouter(),
+policy)`, where a `RoutePolicy`'s `async def grant(peer, metadata, specs)`
+returns the granted `RouteSpec`s (or indexes; `True` = all). With no usable
+answer, fail-closed grants nothing. Origins ask with `reg = await
+request_route(conn, [RouteSpec("a.example", 443, service_id="app")], b"token")`
+and hold `reg` while the routes should stay live.

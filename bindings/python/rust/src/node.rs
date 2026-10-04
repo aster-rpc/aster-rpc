@@ -25,7 +25,7 @@ use crate::config::NativeAsterConfig;
 use crate::ensure_tokio_runtime;
 use crate::error::{aster_err_to_py, err_to_py};
 use crate::ids::{NodeId, NodeIdArg, SecretKey};
-use crate::lease::{GrantorSerializer, LeaseGrantorServer, MemorySerializer};
+use crate::lease::{GrantorSerializer, LeaseGrantorServer};
 use crate::net::{IrohConnection, NodeAddr};
 use crate::topology::Topology;
 
@@ -188,6 +188,43 @@ impl Node {
         ))
     }
 
+    /// Decide Gate 0 in Python over the upcall channel instead of the
+    /// `admission()` iterator: `handler` is an `aster.AdmissionHandler`
+    /// (`async def connect(peer, alpn) -> bool`, `async def handshake(peer,
+    /// alpn, is_alive) -> bool | (code, reason)`; a missing method answers
+    /// `unimplemented`, so that kind's failure mode decides). Each request
+    /// is its own asyncio task; no answer applies the `admission_connect` /
+    /// `admission_handshake` upcall policy (fail-closed: a handshake rejects
+    /// with `403 "hook unavailable"`). Keep that policy's timeout below the
+    /// node's hook timeout. Needs `enable_hooks=True` and no `gate`; takes
+    /// the node's admission (the iterator is then unavailable).
+    fn serve_admission(&self, handler: &Bound<'_, PyAny>) -> PyResult<()> {
+        if self.gate.is_some() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "admission is decided by the attached gate",
+            ));
+        }
+        if !self.inner().has_hooks() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "admission needs a node started with enable_hooks=True",
+            ));
+        }
+        let upcalls = crate::upcall::bind(handler, "admission")?;
+        let admission = self.inner.take_admission().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("admission was already taken")
+        })?;
+        let _guard = crate::upcall::tokio_guard();
+        aster::binding_support::upcall::admission::serve_admission(admission, upcalls);
+        Ok(())
+    }
+
+    /// This node's expose registry (`aster.Expose`): expose local sockets
+    /// to peers, with an optional Python authorize hook.
+    fn expose(&self) -> crate::expose::Expose {
+        let _guard = crate::upcall::tokio_guard();
+        crate::expose::Expose::new(self.inner.clone())
+    }
+
     /// The attached `GatePolicy`, if any.
     #[getter]
     fn gate(&self, py: Python<'_>) -> Option<Py<GatePolicy>> {
@@ -233,8 +270,9 @@ impl Node {
         })
     }
 
-    /// Serve `aster.lease.Grantor` over `serializer` (a `MemorySerializer`)
-    /// on this node, making it a designated grantor. Start the node with
+    /// Serve `aster.lease.Grantor` over `serializer` (a `MemorySerializer`,
+    /// with its authorizer if set, or a Python `aster.lease.LeaseSerializer`
+    /// answered by upcall) on this node, making it a designated grantor. Start the node with
     /// `alpns=[b"aster/1"]`. This owns the node's RPC accept loop -- don't
     /// also run an RPC server on it. `open_revoke=True` lets any admitted
     /// caller revoke (default: the `operator` role only). Returns a
@@ -242,20 +280,20 @@ impl Node {
     #[pyo3(signature = (serializer, *, open_revoke=false))]
     fn serve_lease_grantor(
         &self,
-        serializer: PyRef<'_, MemorySerializer>,
+        serializer: &Bound<'_, PyAny>,
         open_revoke: bool,
-    ) -> LeaseGrantorServer {
+    ) -> PyResult<LeaseGrantorServer> {
         let mut grantor =
-            aster::rpc::lease::LeaseGrantor::new(std::sync::Arc::new(serializer.inner.clone()));
+            aster::rpc::lease::LeaseGrantor::new(crate::lease::foreign_serializer(serializer)?);
         if open_revoke {
             grantor = grantor.revoke_requires(None);
         }
         let server = aster::rpc::Server::new(&self.inner).register(grantor);
         // `serve` spawns its loops on the current Tokio runtime.
         let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-        LeaseGrantorServer {
+        Ok(LeaseGrantorServer {
             handle: std::sync::Mutex::new(Some(server.serve())),
-        }
+        })
     }
 
     /// Transport metrics in Prometheus text exposition format.

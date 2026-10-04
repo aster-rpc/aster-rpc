@@ -13,9 +13,11 @@
 //! leases) are tracked by their client, so `close()` releases the journal's
 //! lifetime lock deterministically instead of waiting for Python GC.
 //!
-//! Not wrapped (needs the R6 upcall mechanism): the placement manager's
-//! Python-implemented `PlacementProvisioner` / `PlacementPolicySource` /
-//! `TopologySource`. The pure planner is `_coordination_placement_plan`.
+//! The placement manager ([`PlacementManager`]) runs in Rust with Python
+//! providers answered by upcall (plan R6): a `PlacementProvisioner`, a
+//! `PlacementPolicySource` (or a fixed `PlacementPolicy`) and a
+//! `TopologySource` (or the node's own `Topology`). The pure planner is
+//! `_coordination_placement_plan`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -96,7 +98,7 @@ fn closed() -> PyErr {
 /// Map an `aster` error onto the typed exceptions by its structured
 /// [`cc::CoordinationErrorKind`] -- never by its message, which passes
 /// through unchanged.
-fn coord_err(e: aster::Error) -> PyErr {
+pub(crate) fn coord_err(e: aster::Error) -> PyErr {
     match cc::CoordinationErrorKind::of(&e) {
         cc::CoordinationErrorKind::Rpc { code } => coord_error("rpc", Some(code), e.to_string()),
         kind => coord_error(kind.as_str(), None, e.to_string()),
@@ -190,7 +192,7 @@ fn id_bytes(obj: &Bound<'_, PyAny>) -> Option<Vec<u8>> {
         .and_then(|s| hex::decode(s.trim()).ok())
 }
 
-fn id32(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<[u8; 32]> {
+pub(crate) fn id32(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<[u8; 32]> {
     id_bytes(obj)
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
         .ok_or_else(|| invalid(format!("{what} must be 64 hex characters or 32 bytes")))
@@ -202,11 +204,11 @@ fn id16(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<[u8; 16]> {
         .ok_or_else(|| invalid(format!("{what} must be 32 hex characters or 16 bytes")))
 }
 
-fn node_id_in(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<CoordinationNodeId> {
+pub(crate) fn node_id_in(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<CoordinationNodeId> {
     id32(obj, what).map(CoordinationNodeId::from_array)
 }
 
-fn group_in(obj: &Bound<'_, PyAny>) -> PyResult<CoordinationGroupId> {
+pub(crate) fn group_in(obj: &Bound<'_, PyAny>) -> PyResult<CoordinationGroupId> {
     id32(obj, "group id").map(CoordinationGroupId::from_array)
 }
 
@@ -280,7 +282,7 @@ fn fence_in(obj: &Bound<'_, PyAny>) -> PyResult<FenceV1> {
     })
 }
 
-fn log_in(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<LogIdV1>> {
+pub(crate) fn log_in(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<LogIdV1>> {
     let Some(obj) = obj.filter(|o| !o.is_none()) else {
         return Ok(None);
     };
@@ -295,7 +297,7 @@ fn log_in(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<LogIdV1>> {
     }))
 }
 
-fn seed_in(obj: &Bound<'_, PyAny>) -> PyResult<MemberSeedV1> {
+pub(crate) fn seed_in(obj: &Bound<'_, PyAny>) -> PyResult<MemberSeedV1> {
     Ok(MemberSeedV1 {
         node_id: id32(
             &attr_of(obj, "node_id", "member seed")?,
@@ -336,7 +338,7 @@ fn wire_node_ids(ids: Vec<[u8; 32]>) -> Vec<NodeIdV1> {
 // Value conversion: wire -> Python
 // ============================================================================
 
-fn nid(v: &[u8]) -> NodeId {
+pub(crate) fn nid(v: &[u8]) -> NodeId {
     node_id_out(hex::encode(v))
 }
 
@@ -352,7 +354,7 @@ fn nids<'py>(py: Python<'py>, v: &[NodeIdV1]) -> PyResult<Bound<'py, PyTuple>> {
     PyTuple::new(py, v.iter().map(|n| nid(&n.node_id)))
 }
 
-fn hex_ids<'py, 'a>(
+pub(crate) fn hex_ids<'py, 'a>(
     py: Python<'py>,
     v: impl IntoIterator<Item = &'a CoordinationNodeId>,
 ) -> PyResult<Bound<'py, PyTuple>> {
@@ -394,7 +396,7 @@ fn resource_out<'py>(py: Python<'py>, r: &ResourceKeyV1) -> PyResult<Bound<'py, 
     })
 }
 
-fn log_out<'py>(py: Python<'py>, l: &LogIdV1) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn log_out<'py>(py: Python<'py>, l: &LogIdV1) -> PyResult<Bound<'py, PyAny>> {
     py_value!(py, "aster.coordination", "LogId" {
         term: l.term,
         leader_node_id: nid(&l.leader_node_id),
@@ -402,7 +404,10 @@ fn log_out<'py>(py: Python<'py>, l: &LogIdV1) -> PyResult<Bound<'py, PyAny>> {
     })
 }
 
-fn opt_log_out<'py>(py: Python<'py>, l: &Option<LogIdV1>) -> PyResult<Option<Bound<'py, PyAny>>> {
+pub(crate) fn opt_log_out<'py>(
+    py: Python<'py>,
+    l: &Option<LogIdV1>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
     l.as_ref().map(|l| log_out(py, l)).transpose()
 }
 
@@ -537,7 +542,7 @@ fn manifest_out<'py>(
     })
 }
 
-fn seed_out<'py>(py: Python<'py>, s: &MemberSeedV1) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn seed_out<'py>(py: Python<'py>, s: &MemberSeedV1) -> PyResult<Bound<'py, PyAny>> {
     py_value!(py, "aster.coordination", "MemberSeed" {
         node_id: nid(&s.node_id),
         ticket: s.ticket.clone(),
@@ -691,6 +696,11 @@ pub struct CoordinationClient {
 }
 
 impl CoordinationClient {
+    /// The wrapped client (shares the journal), or `CoordinationClosedError`.
+    pub(crate) fn inner_client(&self) -> PyResult<cc::CoordinationClient> {
+        self.state.client()
+    }
+
     /// One journaled mutation resolving to a tracked `ResolvedMutation`.
     fn mutate<'py, F, Fut>(&self, py: Python<'py>, f: F) -> PyResult<Bound<'py, PyAny>>
     where
@@ -1634,7 +1644,7 @@ impl AuditStream {
 // Pure placement planner
 // ============================================================================
 
-fn policy_in(p: &Bound<'_, PyAny>) -> PyResult<pl::PlacementPolicy> {
+pub(crate) fn policy_in(p: &Bound<'_, PyAny>) -> PyResult<pl::PlacementPolicy> {
     let mut eligible = BTreeMap::new();
     for c in attr_of(p, "eligible", "policy")?
         .try_iter()
@@ -1694,7 +1704,41 @@ fn policy_in(p: &Bound<'_, PyAny>) -> PyResult<pl::PlacementPolicy> {
     })
 }
 
-fn separation_out<'py>(py: Python<'py>, s: &pl::SeparationSummary) -> PyResult<Bound<'py, PyAny>> {
+/// A `PlacementPolicy` dataclass (the inverse of [`policy_in`]).
+pub(crate) fn policy_out<'py>(
+    py: Python<'py>,
+    p: &pl::PlacementPolicy,
+) -> PyResult<Bound<'py, PyAny>> {
+    let eligible = p
+        .eligible
+        .values()
+        .map(|c| {
+            py_value!(py, "aster.coordination", "PlacementCandidate" {
+                node_id: node_id_out(c.node_id.to_hex()),
+                member_seed: c.member_seed.as_ref().map(|s| seed_out(py, s)).transpose()?,
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    py_value!(py, "aster.coordination", "PlacementPolicy" {
+        revision: p.revision,
+        digest: hex::encode(p.digest),
+        authority_public_key: hex::encode(p.authority_public_key),
+        authority_domain: p.authority_domain.clone(),
+        target_voters: p.target_voters,
+        eligible: PyTuple::new(py, eligible)?,
+        target_retained_learners: p.target_retained_learners,
+        pinned_voters: hex_ids(py, &p.pinned_voters)?,
+        excluded: hex_ids(py, &p.excluded)?,
+        minimum_separated_voter_pairs: p.minimum_separated_voter_pairs,
+        replacement_grace: p.replacement_grace.as_secs_f64(),
+        allow_healthy_rebalance: p.allow_healthy_rebalance,
+    })
+}
+
+pub(crate) fn separation_out<'py>(
+    py: Python<'py>,
+    s: &pl::SeparationSummary,
+) -> PyResult<Bound<'py, PyAny>> {
     py_value!(py, "aster.coordination", "SeparationSummary" {
         separated_pairs: s.separated_pairs,
         connected_pairs: s.connected_pairs,
@@ -1799,6 +1843,132 @@ fn placement_plan<'py>(
     }
 }
 
+// ============================================================================
+// Placement manager (Python providers by upcall)
+// ============================================================================
+
+use aster::binding_support::upcall::placement::{
+    ForeignPlacementPolicySource, ForeignPlacementProvisioner,
+};
+use aster::binding_support::upcall::topology::ForeignTopologySource;
+use aster::coordination::client::manager as mgr;
+
+/// The manager's topology: the node's own view, or a Python source.
+enum TopoSource {
+    Native(aster::topology::Topology),
+    Foreign(ForeignTopologySource),
+}
+
+#[async_trait::async_trait]
+impl mgr::TopologySource for TopoSource {
+    async fn snapshot(&self) -> aster::Result<aster::topology::TopologySnapshot> {
+        match self {
+            TopoSource::Native(t) => mgr::TopologySource::snapshot(t).await,
+            TopoSource::Foreign(f) => mgr::TopologySource::snapshot(f).await,
+        }
+    }
+}
+
+/// The manager's policy: fixed, or read from Python on every observation.
+enum PolicySource {
+    Fixed(pl::PlacementPolicy),
+    Foreign(ForeignPlacementPolicySource),
+}
+
+impl mgr::PlacementPolicySource for PolicySource {
+    fn policy(&self) -> aster::Result<pl::PlacementPolicy> {
+        match self {
+            PolicySource::Fixed(p) => Ok(p.clone()),
+            PolicySource::Foreign(f) => f.policy(),
+        }
+    }
+}
+
+type Manager =
+    mgr::CoordinationPlacementManager<TopoSource, PolicySource, ForeignPlacementProvisioner>;
+
+fn placement_err(e: aster::Error) -> PyErr {
+    crate::upcall::aster_to_py(e, coord_err)
+}
+
+fn report_out<'py>(py: Python<'py>, r: &pl::PlacementReport) -> PyResult<Bound<'py, PyAny>> {
+    py_value!(py, "aster.coordination", "PlacementReport" {
+        policy_revision: r.policy_revision,
+        policy_digest: hex::encode(r.policy_digest),
+        membership_log_id: opt_log_out(py, &r.membership_log_id)?,
+        current_voters: hex_ids(py, &r.current_voters)?,
+        current_learners: hex_ids(py, &r.current_learners)?,
+        selected_voters: hex_ids(py, &r.selected_voters)?,
+        selected_learners: hex_ids(py, &r.selected_learners)?,
+        grace_crossed_members: hex_ids(py, &r.grace_crossed_members)?,
+        separation: r.separation.as_ref().map(|s| separation_out(py, s)).transpose()?,
+        pending_operation_id: r.pending_operation_id.map(hex::encode),
+        reason: r.reason.clone(),
+    })
+}
+
+/// The native half of `aster.coordination.PlacementManager` (section
+/// 7.7.3): reconciles membership through the client's durable journal,
+/// with the providers in Python.
+#[pyclass(frozen, module = "aster._aster", name = "_PlacementManager")]
+pub struct PlacementManager {
+    inner: Arc<tokio::sync::Mutex<Manager>>,
+}
+
+#[pymethods]
+impl PlacementManager {
+    /// `handler`: the `aster.coordination.PlacementManager` (bound as the
+    /// placement upcall handler). `topology`: a native `Topology` to use
+    /// directly, or `None` to ask `handler` (kind `topology_snapshot`).
+    /// `policy`: a fixed `PlacementPolicy`, or `None` to ask `handler`
+    /// on every observation (kind `placement_policy`).
+    #[new]
+    #[pyo3(signature = (client, handler, *, topology=None, policy=None))]
+    fn new(
+        client: &Bound<'_, CoordinationClient>,
+        handler: &Bound<'_, PyAny>,
+        topology: Option<&Bound<'_, crate::topology::Topology>>,
+        policy: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let client = client.get().inner_client()?;
+        let upcalls = crate::upcall::bind(handler, "placement")?;
+        let topo = match topology {
+            Some(t) => TopoSource::Native(t.get().inner().clone()),
+            None => TopoSource::Foreign(ForeignTopologySource::new(upcalls.clone())),
+        };
+        let policy = match policy.filter(|p| !p.is_none()) {
+            Some(p) => PolicySource::Fixed(policy_in(p)?),
+            None => PolicySource::Foreign(ForeignPlacementPolicySource::new(upcalls.clone())),
+        };
+        Ok(Self {
+            inner: Arc::new(tokio::sync::Mutex::new(
+                mgr::CoordinationPlacementManager::new(
+                    client,
+                    topo,
+                    policy,
+                    ForeignPlacementProvisioner::new(upcalls),
+                ),
+            )),
+        })
+    }
+
+    /// Run one reconciliation (awaitable `PlacementReport`). Passes are
+    /// serialized. A provider failure (an exception, a timeout) stops the
+    /// pass: `aster.upcalls.UpcallError`.
+    fn reconcile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let report = inner
+                .lock()
+                .await
+                .reconcile()
+                .await
+                .map_err(placement_err)?;
+            to_py(|py| report_out(py, &report))
+        })
+    }
+}
+
 pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CoordinationClient>()?;
     m.add_class::<CoordinationReadClient>()?;
@@ -1808,6 +1978,7 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(reason_codes, m)?)?;
     m.add_function(wrap_pyfunction!(outcome_codes, m)?)?;
     m.add_function(wrap_pyfunction!(placement_plan, m)?)?;
+    m.add_class::<PlacementManager>()?;
     m.add_function(wrap_pyfunction!(error_for_testing, m)?)?;
     Ok(())
 }

@@ -14,8 +14,12 @@
 //! frozen dataclasses of `aster.lease`, built here by keyword; durations are
 //! seconds (`float`).
 //!
-//! Deferred (needs the R6 upcall mechanism): a Python `LeaseSerializer`
-//! backend, a Python `FencedResource`, and a lease authorizer callback.
+//! Python-implemented extension points (plan R6, `aster.upcalls`): a Python
+//! `LeaseSerializer` backend ([`ForeignLeaseSerializer`]), a Python
+//! `FencedResource` ([`ForeignFencedResource`]) and a Python lease
+//! authorizer (`MemorySerializer.set_authorizer`) are served by upcall: Rust
+//! emits a typed event, the `aster.upcalls` pump runs the Python coroutine
+//! and answers by id.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,16 +28,21 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use tokio::sync::watch;
 
 use aster::lease as l;
-use aster::lease::LeaseSerializer as _;
+
+use aster::binding_support::upcall::lease::{
+    AuthorizedSerializer, ForeignFencedResource as RsForeignFencedResource, ForeignLeaseAuthorizer,
+    ForeignLeaseSerializer as RsForeignLeaseSerializer,
+};
 
 use crate::error::err_to_py;
 use crate::keys::{actor_in as node_hex, invalid, py_value, secs_in};
+use crate::upcall::{anyhow_to_py, upcall_err_class};
 
 // ============================================================================
 // Value conversion
 // ============================================================================
 
-fn fence_out<'py>(py: Python<'py>, f: l::Fence) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn fence_out<'py>(py: Python<'py>, f: l::Fence) -> PyResult<Bound<'py, PyAny>> {
     py_value!(py, "aster.lease", "Fence" {
         resource: f.resource,
         epoch: f.epoch,
@@ -41,7 +50,7 @@ fn fence_out<'py>(py: Python<'py>, f: l::Fence) -> PyResult<Bound<'py, PyAny>> {
     })
 }
 
-fn fence_in(obj: &Bound<'_, PyAny>) -> PyResult<l::Fence> {
+pub(crate) fn fence_in(obj: &Bound<'_, PyAny>) -> PyResult<l::Fence> {
     Ok(l::Fence {
         resource: obj.getattr("resource")?.extract()?,
         epoch: obj
@@ -85,7 +94,10 @@ pub(crate) fn status_out(s: l::LeaseStatus) -> &'static str {
     }
 }
 
-fn outcome_out<'py>(py: Python<'py>, o: l::TransitionOutcome) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn outcome_out<'py>(
+    py: Python<'py>,
+    o: l::TransitionOutcome,
+) -> PyResult<Bound<'py, PyAny>> {
     let (kind, fence, deny, snap) = match o {
         l::TransitionOutcome::Granted(f) => ("granted", Some(fence_out(py, f)?), None, None),
         l::TransitionOutcome::Renewed => ("renewed", None, None, None),
@@ -106,7 +118,10 @@ fn outcome_out<'py>(py: Python<'py>, o: l::TransitionOutcome) -> PyResult<Bound<
     })
 }
 
-fn rejection_out<'py>(py: Python<'py>, r: l::FenceRejection) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn rejection_out<'py>(
+    py: Python<'py>,
+    r: l::FenceRejection,
+) -> PyResult<Bound<'py, PyAny>> {
     let message = r.to_string();
     let (kind, carried, current) = match r {
         l::FenceRejection::StaleEpoch { carried, current } => {
@@ -152,7 +167,7 @@ fn row_out<'py>(py: Python<'py>, r: l::RowState) -> PyResult<Bound<'py, PyAny>> 
     })
 }
 
-fn op_in(obj: &Bound<'_, PyAny>) -> PyResult<l::LeaseOp> {
+pub(crate) fn op_in(obj: &Bound<'_, PyAny>) -> PyResult<l::LeaseOp> {
     let kind: String = obj.getattr("kind")?.extract()?;
     let actor = node_hex(&obj.getattr("actor")?)?;
     let epoch = || -> PyResult<u64> {
@@ -184,6 +199,123 @@ fn op_in(obj: &Bound<'_, PyAny>) -> PyResult<l::LeaseOp> {
         },
         "revoke" => l::LeaseOp::Revoke { authority: actor },
         other => return Err(invalid(format!("unknown lease op {other:?}"))),
+    })
+}
+
+pub(crate) fn op_out<'py>(py: Python<'py>, op: &l::LeaseOp) -> PyResult<Bound<'py, PyAny>> {
+    match op {
+        l::LeaseOp::Acquire { candidate, ttl } => py_value!(py, "aster.lease", "LeaseOp" {
+            kind: "acquire",
+            actor: candidate.clone(),
+            ttl: ttl.as_secs_f64(),
+        }),
+        l::LeaseOp::Renew { holder, epoch } => py_value!(py, "aster.lease", "LeaseOp" {
+            kind: "renew",
+            actor: holder.clone(),
+            epoch: *epoch,
+        }),
+        l::LeaseOp::Release { holder, epoch } => py_value!(py, "aster.lease", "LeaseOp" {
+            kind: "release",
+            actor: holder.clone(),
+            epoch: *epoch,
+        }),
+        l::LeaseOp::Revoke { authority } => py_value!(py, "aster.lease", "LeaseOp" {
+            kind: "revoke",
+            actor: authority.clone(),
+        }),
+    }
+}
+
+pub(crate) fn deny_in(s: &str) -> PyResult<l::DenyReason> {
+    Ok(match s {
+        "held_by_other" => l::DenyReason::HeldByOther,
+        "epoch_mismatch" => l::DenyReason::EpochMismatch,
+        "not_holder" => l::DenyReason::NotHolder,
+        "expired" => l::DenyReason::Expired,
+        "not_held" => l::DenyReason::NotHeld,
+        "unauthorized" => l::DenyReason::Unauthorized,
+        other => return Err(invalid(format!("unknown deny reason {other:?}"))),
+    })
+}
+
+/// A `LeaseSnapshot` (`remaining` in seconds or `None`).
+pub(crate) fn snapshot_in(obj: &Bound<'_, PyAny>) -> PyResult<l::LeaseSnapshot> {
+    let holder = obj.getattr("holder")?;
+    let remaining = obj.getattr("remaining")?;
+    Ok(l::LeaseSnapshot {
+        resource: obj
+            .getattr("resource")?
+            .extract()
+            .map_err(|_| invalid("LeaseSnapshot.resource must be a str"))?,
+        epoch: obj
+            .getattr("epoch")?
+            .extract()
+            .map_err(|_| invalid("LeaseSnapshot.epoch must be a non-negative int"))?,
+        holder: if holder.is_none() {
+            None
+        } else {
+            Some(node_hex(&holder)?)
+        },
+        held: obj.getattr("held")?.is_truthy()?,
+        remaining: if remaining.is_none() {
+            None
+        } else {
+            Some(secs_in("LeaseSnapshot.remaining", remaining.extract()?)?)
+        },
+    })
+}
+
+/// A `TransitionOutcome` dataclass.
+pub(crate) fn outcome_in(obj: &Bound<'_, PyAny>) -> PyResult<l::TransitionOutcome> {
+    let kind: String = obj
+        .getattr("kind")?
+        .extract()
+        .map_err(|_| invalid("TransitionOutcome.kind must be a str"))?;
+    let need = |attr: &str| -> PyResult<Bound<'_, PyAny>> {
+        let v = obj.getattr(attr)?;
+        if v.is_none() {
+            return Err(invalid(format!("a {kind} TransitionOutcome needs {attr}")));
+        }
+        Ok(v)
+    };
+    Ok(match kind.as_str() {
+        "granted" => l::TransitionOutcome::Granted(fence_in(&need("fence")?)?),
+        "renewed" => l::TransitionOutcome::Renewed,
+        "released" => l::TransitionOutcome::Released,
+        "revoked" => l::TransitionOutcome::Revoked,
+        "denied" => l::TransitionOutcome::Denied(
+            deny_in(&need("deny_reason")?.extract::<String>()?)?,
+            snapshot_in(&need("snapshot")?)?,
+        ),
+        other => return Err(invalid(format!("unknown TransitionOutcome kind {other:?}"))),
+    })
+}
+
+/// A `FenceRejectedError` (its `kind`, `carried`, `current`).
+pub(crate) fn rejection_in(obj: &Bound<'_, PyAny>) -> PyResult<l::FenceRejection> {
+    let kind: String = obj.getattr("kind")?.extract()?;
+    let epochs = || -> PyResult<(u64, u64)> {
+        let carried = obj.getattr("carried")?;
+        let current = obj.getattr("current")?;
+        if carried.is_none() || current.is_none() {
+            return Err(invalid(format!(
+                "a {kind} FenceRejectedError needs carried and current"
+            )));
+        }
+        Ok((carried.extract()?, current.extract()?))
+    };
+    Ok(match kind.as_str() {
+        "stale_epoch" => {
+            let (carried, current) = epochs()?;
+            l::FenceRejection::StaleEpoch { carried, current }
+        }
+        "future_epoch" => {
+            let (carried, current) = epochs()?;
+            l::FenceRejection::FutureEpoch { carried, current }
+        }
+        "not_holder" => l::FenceRejection::NotHolder,
+        "not_held" => l::FenceRejection::NotHeld,
+        other => return Err(invalid(format!("unknown fence rejection {other:?}"))),
     })
 }
 
@@ -263,6 +395,12 @@ fn check_fence<'py>(
 // Acquire
 // ============================================================================
 
+/// A serializer error: an upcall failure raises `aster.upcalls.UpcallError`,
+/// anything else `IrohError`.
+fn lease_err(e: anyhow::Error) -> PyErr {
+    anyhow_to_py(e, err_to_py)
+}
+
 async fn acquire(
     serializer: Arc<dyn l::LeaseSerializer>,
     resource: String,
@@ -271,7 +409,7 @@ async fn acquire(
 ) -> PyResult<Py<PyAny>> {
     let outcome = l::LeaseHandle::acquire(serializer, &resource, &holder, opts)
         .await
-        .map_err(err_to_py)?;
+        .map_err(lease_err)?;
     Python::attach(|py| {
         let v = match outcome {
             l::AcquireOutcome::Granted(handle) => {
@@ -294,7 +432,7 @@ async fn acquire(
 }
 
 async fn snapshot_of(serializer: &dyn l::LeaseSerializer, resource: &str) -> PyResult<Py<PyAny>> {
-    let s = serializer.snapshot(resource).await.map_err(err_to_py)?;
+    let s = serializer.snapshot(resource).await.map_err(lease_err)?;
     Python::attach(|py| snapshot_out(py, s).map(Bound::unbind))
 }
 
@@ -305,7 +443,7 @@ async fn revoke_at(
 ) -> PyResult<Py<PyAny>> {
     let o = l::revoke(serializer, resource, authority)
         .await
-        .map_err(err_to_py)?;
+        .map_err(lease_err)?;
     Python::attach(|py| outcome_out(py, o).map(Bound::unbind))
 }
 
@@ -319,6 +457,25 @@ async fn revoke_at(
 #[pyclass(frozen, module = "aster._aster")]
 pub struct MemorySerializer {
     pub(crate) inner: l::MemorySerializer,
+    /// The Python authorizer, asked (by upcall, asynchronously) before every
+    /// transition started through this object.
+    authorizer: Mutex<Option<ForeignLeaseAuthorizer>>,
+}
+
+impl MemorySerializer {
+    /// The serializer every entry point uses: the store itself, or the
+    /// store behind the Python authorizer.
+    pub(crate) fn serializer(&self) -> Arc<dyn l::LeaseSerializer> {
+        let auth = self
+            .authorizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match auth {
+            Some(a) => Arc::new(AuthorizedSerializer::new(self.inner.clone(), a)),
+            None => Arc::new(self.inner.clone()),
+        }
+    }
 }
 
 #[pymethods]
@@ -327,7 +484,27 @@ impl MemorySerializer {
     fn new() -> Self {
         Self {
             inner: l::MemorySerializer::new(),
+            authorizer: Mutex::new(None),
         }
+    }
+
+    /// Install a Python lease authorizer (an `aster.lease.LeaseAuthorizer`:
+    /// `async def authorize(op) -> bool`, or any callable returning a bool
+    /// or an awaitable of one), or remove it with `None`. Refused ops are
+    /// `denied` with `unauthorized`; no answer applies the
+    /// `lease_authorize` upcall policy (fail-closed by default). Applies to
+    /// operations started after the call (a held lease keeps the
+    /// serializer it was acquired through, renewals included).
+    fn set_authorizer(&self, authorizer: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let auth = match authorizer.filter(|a| !a.is_none()) {
+            Some(a) => Some(ForeignLeaseAuthorizer::new(crate::upcall::bind(
+                a,
+                "lease_authorizer",
+            )?)),
+            None => None,
+        };
+        *self.authorizer.lock().unwrap_or_else(|e| e.into_inner()) = auth;
+        Ok(())
     }
 
     /// One ACQUIRE CAS for `holder` (any actor string -- usually a node id).
@@ -343,8 +520,7 @@ impl MemorySerializer {
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = options_in(options)?;
         let holder = node_hex(holder)?;
-        let ser: Arc<dyn l::LeaseSerializer> = Arc::new(self.inner.clone());
-        future_into_py(py, acquire(ser, resource, holder, opts))
+        future_into_py(py, acquire(self.serializer(), resource, holder, opts))
     }
 
     /// Advisory snapshot of `resource` (awaitable `LeaseSnapshot`).
@@ -354,7 +530,8 @@ impl MemorySerializer {
     }
 
     /// Apply one raw transition (the state machine under this serializer's
-    /// lock). Prefer `acquire` + the lease; this is for tooling and tests.
+    /// lock, after the authorizer). Prefer `acquire` + the lease; this is
+    /// for tooling and tests.
     fn transition<'py>(
         &self,
         py: Python<'py>,
@@ -362,9 +539,9 @@ impl MemorySerializer {
         op: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let op = op_in(op)?;
-        let ser = self.inner.clone();
+        let ser = self.serializer();
         future_into_py(py, async move {
-            let o = ser.transition(&resource, op).await.map_err(err_to_py)?;
+            let o = ser.transition(&resource, op).await.map_err(lease_err)?;
             Python::attach(|py| outcome_out(py, o).map(Bound::unbind))
         })
     }
@@ -377,11 +554,10 @@ impl MemorySerializer {
         authority: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let authority = node_hex(authority)?;
-        let ser = self.inner.clone();
-        future_into_py(
-            py,
-            async move { revoke_at(&ser, &resource, &authority).await },
-        )
+        let ser = self.serializer();
+        future_into_py(py, async move {
+            revoke_at(ser.as_ref(), &resource, &authority).await
+        })
     }
 
     /// Simulate a serializer restart: fence fields survive, held rows get a
@@ -516,7 +692,7 @@ impl Lease {
         let h = self.take();
         future_into_py(py, async move {
             if let Some(h) = h {
-                h.release().await.map_err(err_to_py)?;
+                h.release().await.map_err(lease_err)?;
             }
             Ok(if ret { Some(false) } else { None })
         })
@@ -692,6 +868,119 @@ impl LeaseGrantorServer {
     }
 }
 
+// ============================================================================
+// Python-implemented serializers and fenced resources (upcalls)
+// ============================================================================
+
+/// `obj` (a Python `LeaseSerializer`) as a Rust lease backend.
+pub(crate) fn foreign_serializer(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn l::LeaseSerializer>> {
+    if let Ok(m) = obj.cast::<MemorySerializer>() {
+        return Ok(m.get().serializer());
+    }
+    if let Ok(g) = obj.cast::<GrantorSerializer>() {
+        return Ok(g.get().inner.clone());
+    }
+    Ok(Arc::new(RsForeignLeaseSerializer::new(
+        crate::upcall::bind(obj, "lease_serializer")?,
+    )))
+}
+
+/// ACQUIRE through a Python serializer (backs `LeaseSerializer.acquire`):
+/// the `LeaseHandle` and its renewals run in Rust, every transition is an
+/// upcall into `obj`.
+#[pyfunction]
+#[pyo3(name = "_foreign_lease_acquire", signature = (serializer, resource, holder, options=None))]
+fn foreign_lease_acquire<'py>(
+    py: Python<'py>,
+    serializer: &Bound<'py, PyAny>,
+    resource: String,
+    holder: &Bound<'py, PyAny>,
+    options: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let opts = options_in(options)?;
+    let holder = node_hex(holder)?;
+    let ser = foreign_serializer(serializer)?;
+    future_into_py(py, acquire(ser, resource, holder, opts))
+}
+
+/// REVOKE through a Python serializer.
+#[pyfunction]
+#[pyo3(name = "_foreign_lease_revoke")]
+fn foreign_lease_revoke<'py>(
+    py: Python<'py>,
+    serializer: &Bound<'py, PyAny>,
+    resource: String,
+    authority: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let authority = node_hex(authority)?;
+    let ser = foreign_serializer(serializer)?;
+    future_into_py(py, async move {
+        revoke_at(ser.as_ref(), &resource, &authority).await
+    })
+}
+
+/// One transition through Rust's `LeaseSerializer` view of `serializer`
+/// (round trip: Rust encodes, the Python method answers, Rust decodes).
+#[pyfunction]
+#[pyo3(name = "_foreign_lease_transition")]
+fn foreign_lease_transition<'py>(
+    py: Python<'py>,
+    serializer: &Bound<'py, PyAny>,
+    resource: String,
+    op: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let op = op_in(op)?;
+    let ser = foreign_serializer(serializer)?;
+    future_into_py(py, async move {
+        let o = ser.transition(&resource, op).await.map_err(lease_err)?;
+        Python::attach(|py| outcome_out(py, o).map(Bound::unbind))
+    })
+}
+
+/// One snapshot through Rust's view of `serializer`.
+#[pyfunction]
+#[pyo3(name = "_foreign_lease_snapshot")]
+fn foreign_lease_snapshot<'py>(
+    py: Python<'py>,
+    serializer: &Bound<'py, PyAny>,
+    resource: String,
+) -> PyResult<Bound<'py, PyAny>> {
+    let ser = foreign_serializer(serializer)?;
+    future_into_py(
+        py,
+        async move { snapshot_of(ser.as_ref(), &resource).await },
+    )
+}
+
+/// `FencedResource::mutate` on a Python resource, through Rust
+/// (`ForeignFencedResource`): returns the output bytes, raises
+/// `FenceRejectedError` when the resource refused the fence, or
+/// `aster.upcalls.FenceOutcomeUnknownError` when there was no answer (the
+/// write may or may not have happened).
+#[pyfunction]
+#[pyo3(name = "_foreign_fenced_mutate")]
+fn foreign_fenced_mutate<'py>(
+    py: Python<'py>,
+    resource: &Bound<'py, PyAny>,
+    fence: &Bound<'py, PyAny>,
+    writer: &Bound<'py, PyAny>,
+    op: Vec<u8>,
+) -> PyResult<Bound<'py, PyAny>> {
+    use l::FencedResource as _;
+    let fence = fence_in(fence)?;
+    let writer = node_hex(writer)?;
+    let res = RsForeignFencedResource::new(crate::upcall::bind(resource, "fenced_resource")?);
+    future_into_py(py, async move {
+        match res.mutate(&fence, &writer, op).await {
+            Ok(Ok(out)) => Ok(crate::PyBytesResult(out)),
+            Ok(Err(e)) => Err(upcall_err_class(&e, "FenceOutcomeUnknownError")),
+            Err(rejection) => Err(Python::attach(|py| {
+                rejection_out(py, rejection).map(PyErr::from_value)
+            })?),
+        }
+    })
+}
+
 pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MemorySerializer>()?;
     m.add_class::<GrantorSerializer>()?;
@@ -700,5 +989,10 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_class::<LeaseGrantorServer>()?;
     m.add_function(wrap_pyfunction!(lease_transition, m)?)?;
     m.add_function(wrap_pyfunction!(check_fence, m)?)?;
+    m.add_function(wrap_pyfunction!(foreign_lease_acquire, m)?)?;
+    m.add_function(wrap_pyfunction!(foreign_lease_revoke, m)?)?;
+    m.add_function(wrap_pyfunction!(foreign_lease_transition, m)?)?;
+    m.add_function(wrap_pyfunction!(foreign_lease_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(foreign_fenced_mutate, m)?)?;
     Ok(())
 }
