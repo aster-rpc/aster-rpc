@@ -14,16 +14,15 @@ import site.aster.server.AsterServer;
  * §12.4 merge gate: a bounded response channel must still deliver a long server stream, and the
  * Java side must survive backpressure without pinning a carrier thread.
  *
- * <p>The reactor's per-call response channel is bounded, so a producer faster than the peer's
- * reader eventually fills it. Native code never blocks on that — it reserves capacity first and
- * returns {@code QUEUE_FULL} without copying the frame — and {@code Reactor} retries outside the
- * downcall after an asynchronous native capacity reservation wakes it through the reactor poll
- * ring.
+ * <p>Each call's response channel is bounded, so a producer faster than the peer's reader
+ * eventually fills it. Native code never blocks on that — {@code aster_dispatch_send} returns
+ * {@code QUEUE_FULL} with the exact length — and {@code Dispatch} reserves it and retries outside
+ * the downcall once the {@code RESPONSE_WRITABLE} event arrives through the dispatch poll.
  *
- * <p>The deterministic retry state-machine test lives beside {@code Reactor}; the warmed JMH gate
- * records real native capacity handoffs. This integration test owns the complementary property: the
- * bounded end-to-end stream still completes, in order, with nothing dropped. It intentionally does
- * not infer that the native queue filled from scheduler timing in one cold call.
+ * <p>The deterministic retry state-machine test is {@code DispatchContractTest}; the warmed JMH
+ * gate records real native capacity handoffs. This integration test owns the complementary
+ * property: the bounded end-to-end stream still completes, in order, with nothing dropped. It
+ * intentionally does not infer that the native queue filled from scheduler timing in one cold call.
  */
 final class ServerStreamBackpressureTest {
 

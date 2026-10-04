@@ -23,7 +23,7 @@ import org.junit.jupiter.api.Test;
  *
  * <p>Requires the native {@code libaster_transport_ffi} to be loadable. Fails with an
  * initialization error in environments without the lib built — same behavior as {@code
- * AbiContractTest} and {@code ReactorContractTest}.
+ * AbiContractTest} and {@code DispatchContractTest}.
  */
 final class ContractIdentityTest {
 

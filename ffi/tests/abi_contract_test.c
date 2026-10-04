@@ -285,6 +285,39 @@ OFF(aster_grant_outcome_t, reason, 32);
 OFF(aster_grant_outcome_t, role, 48);
 OFF(aster_grant_outcome_t, storage, 64);
 
+
+/* ABI 3.5: dynamic dispatch */
+LAYOUT(aster_dispatch_event_t, 104);
+OFF(aster_dispatch_event_t, kind, 0);
+OFF(aster_dispatch_event_t, pattern, 1);
+OFF(aster_dispatch_event_t, reason, 2);
+OFF(aster_dispatch_event_t, flags, 4);
+OFF(aster_dispatch_event_t, call_id, 8);
+OFF(aster_dispatch_event_t, service_idx, 16);
+OFF(aster_dispatch_event_t, method_idx, 20);
+OFF(aster_dispatch_event_t, session_key, 24);
+OFF(aster_dispatch_event_t, connection_id, 32);
+OFF(aster_dispatch_event_t, connection_handle, 40);
+OFF(aster_dispatch_event_t, deadline_unix_ms, 48);
+OFF(aster_dispatch_event_t, wire_call_id, 56);
+OFF(aster_dispatch_event_t, session_id, 60);
+OFF(aster_dispatch_event_t, request_ptr, 64);
+OFF(aster_dispatch_event_t, request_len, 72);
+OFF(aster_dispatch_event_t, peer_ptr, 80);
+OFF(aster_dispatch_event_t, peer_len, 88);
+OFF(aster_dispatch_event_t, buffer, 96);
+
+LAYOUT(aster_call_options_t, 72);
+OFF(aster_call_options_t, struct_size, 0);
+OFF(aster_call_options_t, version, 4);
+OFF(aster_call_options_t, service, 8);
+OFF(aster_call_options_t, method, 24);
+OFF(aster_call_options_t, metadata, 40);
+OFF(aster_call_options_t, session_id, 56);
+OFF(aster_call_options_t, deadline_ms, 60);
+OFF(aster_call_options_t, serialization_mode, 64);
+OFF(aster_call_options_t, wire_call_id, 68);
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -307,7 +340,7 @@ static void test_abi_version(void) {
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
     CHECK(ASTER_ABI_VERSION_MAJOR == 3);
-    CHECK(ASTER_ABI_VERSION_MINOR >= 4); /* 3.1 envelope + zstd, 3.2 node config + gate, 3.3 data plane, 3.4 pure functions */
+    CHECK(ASTER_ABI_VERSION_MINOR >= 5); /* 3.1 envelope + zstd, 3.2 node config + gate, 3.3 data plane, 3.4 pure functions, 3.5 dynamic dispatch */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
 
@@ -358,6 +391,18 @@ static void test_enum_values(void) {
     CHECK(ASTER_GRANT_STATE_ACTIVE == 0 && ASTER_GRANT_STATE_REVOKED == 1);
     CHECK(ASTER_GRANT_OUTCOME_ACTIVE == 0 && ASTER_GRANT_OUTCOME_ABSENT == 3);
     CHECK(ASTER_KEY_SIZE == 32 && ASTER_ID_HEX_LEN == 64);
+    /* 3.5 */
+    CHECK(ASTER_DISPATCH_EVENT_CALL == 0 && ASTER_DISPATCH_EVENT_CANCELLED == 1);
+    CHECK(ASTER_DISPATCH_EVENT_RESPONSE_WRITABLE == 2 && ASTER_DISPATCH_EVENT_RESPONSE_CLOSED == 3);
+    CHECK(ASTER_DISPATCH_EVENT_SESSION_CLOSED == 4 && ASTER_DISPATCH_EVENT_CONNECTION_CLOSED == 5);
+    CHECK(ASTER_DISPATCH_EVENT_NON_RPC == 6);
+    CHECK(ASTER_CANCEL_REASON_PEER == 0 && ASTER_CANCEL_REASON_DEADLINE == 1 && ASTER_CANCEL_REASON_INVALID_REQUEST == 2);
+    CHECK(ASTER_METHOD_PATTERN_UNARY == 0 && ASTER_METHOD_PATTERN_BIDI_STREAM == 3);
+    CHECK(ASTER_SERVER_OPTION_BUILTIN_NODE_INFO == 1 && ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS == 4);
+    CHECK(ASTER_DISPATCH_FLAG_FIRST_IS_END == 1 && ASTER_DISPATCH_FLAG_NEW_SESSION == 2);
+    CHECK(ASTER_DISPATCH_FLAG_IROH_AUTHENTICATED == 4);
+    CHECK(ASTER_DISPATCH_FLAG_HAS_METADATA == 0x100 && ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES == 0x200);
+    CHECK(ASTER_TIMEOUT_INFINITE == 0xffffffffu);
 }
 
 static void test_data_plane(void) {
@@ -669,6 +714,66 @@ static void test_pure_functions(void) {
     CHECK(aster_string_release(key.ptr, key.len) == ASTER_STATUS_OK);
 }
 
+static void test_dispatch_server(void) {
+    printf("[dispatch server (3.5)]\n");
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+    aster_config_t c;
+    CHECK(aster_config_init(&c) == ASTER_STATUS_OK);
+    c.relay_mode = ASTER_RELAY_MODE_DISABLED;
+    c.bind_addr = (aster_bytes_t){(const uint8_t *)"127.0.0.1:0", 11};
+    aster_bytes_t alpn = {(const uint8_t *)"aster/1", 7};
+    c.alpns = (aster_bytes_list_t){&alpn, 1};
+    aster_operation_t op = 0;
+    CHECK(aster_node_start(rt, &c, 0, 7, &op) == ASTER_STATUS_OK);
+    aster_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev));
+    CHECK(ev.kind == ASTER_EVENT_NODE_CREATED && ev.handle != 0);
+    aster_node_t node = ev.handle;
+
+    static const char json[] =
+        "{\"name\":\"c.Echo\",\"version\":1,\"methods\":[{\"name\":\"echo\","
+        "\"pattern\":\"unary\",\"request\":{\"hash\":"
+        "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},"
+        "\"response\":{\"hash\":"
+        "\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}";
+    aster_bytes_t cid = {0};
+    CHECK(aster_dynamic_service_contract_id((const uint8_t *)json, sizeof json - 1, &cid) == ASTER_STATUS_OK);
+    CHECK(cid.len == 64);
+    CHECK(aster_string_release(cid.ptr, cid.len) == ASTER_STATUS_OK);
+
+    aster_server_builder_t b = 0;
+    CHECK(aster_server_builder_new(rt, node, &b) == ASTER_STATUS_OK && b != 0);
+    uint32_t idx = 99;
+    CHECK(aster_server_add_service_json(b, (const uint8_t *)json, sizeof json - 1, &idx) == ASTER_STATUS_OK && idx == 0);
+    CHECK(aster_server_add_service_json(b, (const uint8_t *)"{}", 2, &idx) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_server_set_option(b, ASTER_SERVER_OPTION_MAX_SESSIONS_PER_CONNECTION, 16) == ASTER_STATUS_OK);
+    CHECK(aster_server_set_option(b, 77, 1) == ASTER_STATUS_INVALID_ARGUMENT);
+    aster_server_t srv = 0;
+    CHECK(aster_server_start(rt, b, 32, &srv) == ASTER_STATUS_OK && srv != 0);
+    CHECK(aster_server_start(rt, b, 32, &srv) == ASTER_STATUS_NOT_FOUND);
+
+    aster_dispatch_event_t events[4];
+    CHECK(aster_server_poll(rt, srv, events, 4, 0) == 0);
+    uint64_t required = 0;
+    CHECK(aster_dispatch_respond(rt, srv, 1, NULL, 0, NULL, 0, &required) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_dispatch_send(rt, srv, 1, (const uint8_t *)"x", 1, &required) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_dispatch_is_cancelled(rt, srv, 1) == 1);
+    CHECK(aster_dispatch_buffer_release(rt, srv, 0) == ASTER_STATUS_OK);
+    CHECK(aster_server_live_calls(srv) == 0);
+    CHECK(aster_server_destroy(rt, srv) == ASTER_STATUS_OK);
+    CHECK(aster_server_destroy(rt, srv) == ASTER_STATUS_NOT_FOUND);
+
+    aster_call_options_t o;
+    memset(&o, 0, sizeof o);
+    o.struct_size = sizeof o;
+    aster_call_t call = 0;
+    CHECK(aster_rpc_open(rt, 424242, ASTER_METHOD_PATTERN_BIDI_STREAM, &o, &call) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_call_cancel(rt, 424242) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
+}
+
 int main(void) {
     test_abi_version();
     test_enum_values();
@@ -678,6 +783,7 @@ int main(void) {
     test_gate_and_node();
     test_data_plane();
     test_pure_functions();
+    test_dispatch_server();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;

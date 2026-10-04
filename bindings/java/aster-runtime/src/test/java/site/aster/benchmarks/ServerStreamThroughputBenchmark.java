@@ -81,7 +81,7 @@ public class ServerStreamThroughputBenchmark {
             .get(30, TimeUnit.SECONDS);
     client = AsterClient.builder().codec(codec()).build().get(30, TimeUnit.SECONDS);
     serverAddr = server.node().nodeAddr();
-    site.aster.ffi.Reactor.resetQueueFullStats();
+    site.aster.ffi.Dispatch.resetQueueFullStats();
     OPS.reset();
   }
 
@@ -93,11 +93,13 @@ public class ServerStreamThroughputBenchmark {
         "[gate] frames="
             + frames
             + " QUEUE_FULL="
-            + site.aster.ffi.Reactor.queueFullHits()
+            + site.aster.ffi.Dispatch.queueFullHits()
             + " ops="
             + OPS.sum()
             + " eventsPerOp="
-            + (OPS.sum() == 0 ? 0.0 : (double) site.aster.ffi.Reactor.queueFullHits() / OPS.sum()));
+            + (OPS.sum() == 0
+                ? 0.0
+                : (double) site.aster.ffi.Dispatch.queueFullHits() / OPS.sum()));
   }
 
   @TearDown

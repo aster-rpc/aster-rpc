@@ -178,6 +178,19 @@ public final class IrohLibrary implements SymbolLookup {
     return Linker.nativeLinker().downcallHandle(symbol, desc);
   }
 
+  /**
+   * As {@link #getHandle(String, FunctionDescriptor)}, with linker options. {@code
+   * Linker.Option.critical(true)} suits short, never-blocking functions (the {@code
+   * aster_dispatch_*} response operations): no thread-state transition, and heap segments ({@code
+   * MemorySegment.ofArray}) may be passed directly, so the payload is not copied twice.
+   */
+  public MethodHandle getHandle(String name, FunctionDescriptor desc, Linker.Option... options) {
+    MemorySegment symbol =
+        impl.find(name)
+            .orElseThrow(() -> new UnsatisfiedLinkError("aster symbol not found: " + name));
+    return Linker.nativeLinker().downcallHandle(symbol, desc, options);
+  }
+
   // --- Version ---
 
   /**
@@ -390,29 +403,6 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, nodeHandle, 0L, outOpId);
-    } catch (Throwable t) {
-      throw new AssertionError(t);
-    }
-  }
-
-  /**
-   * Long-poll the reactor for the next non-rpc aster-ALPN connection. Emits {@code
-   * ASTER_EVENT_ASTER_ACCEPTED} on arrival: event.handle = connection handle, event.data = ALPN
-   * bytes. See {@code aster_reactor_accept_non_rpc} in the C header.
-   */
-  public int asterReactorAcceptNonRpc(
-      long runtimeHandle, long reactorHandle, long userData, MemorySegment outOpId) {
-    try {
-      return (int)
-          getHandle(
-                  "aster_reactor_accept_non_rpc",
-                  FunctionDescriptor.of(
-                      ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG, // runtime
-                      ValueLayout.JAVA_LONG, // reactor
-                      ValueLayout.JAVA_LONG, // user_data
-                      ValueLayout.ADDRESS)) // out_operation
-              .invoke(runtimeHandle, reactorHandle, userData, outOpId);
     } catch (Throwable t) {
       throw new AssertionError(t);
     }

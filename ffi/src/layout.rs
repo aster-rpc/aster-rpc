@@ -26,6 +26,11 @@ use crate::pure::{
     aster_attest_options_t, aster_attestation_role_t, aster_id_kind_t, aster_verified_chain_t,
 };
 use crate::reactor::aster_reactor_call_t;
+use crate::rpc::aster_call_options_t;
+use crate::server::{
+    aster_cancel_reason_t, aster_dispatch_event_kind_t, aster_dispatch_event_t,
+    aster_method_pattern_t, aster_server_option_t,
+};
 use crate::*;
 
 macro_rules! assert_layout {
@@ -64,6 +69,10 @@ const _: () = assert!(size_of::<aster_id_kind_t>() == 4);
 const _: () = assert!(size_of::<aster_attestation_role_t>() == 4);
 const _: () = assert!(size_of::<aster_grant_state_t>() == 4);
 const _: () = assert!(size_of::<aster_grant_outcome_kind_t>() == 4);
+const _: () = assert!(size_of::<aster_dispatch_event_kind_t>() == 4);
+const _: () = assert!(size_of::<aster_cancel_reason_t>() == 4);
+const _: () = assert!(size_of::<aster_method_pattern_t>() == 4);
+const _: () = assert!(size_of::<aster_server_option_t>() == 4);
 
 #[cfg(target_pointer_width = "64")]
 mod lp64 {
@@ -344,5 +353,39 @@ mod lp64 {
         reason = 32,
         role = 48,
         storage = 64,
+    });
+
+    // ABI 3.5: dynamic dispatch.
+    assert_layout!(aster_dispatch_event_t, size = 104, align = 8, {
+        kind = 0,
+        pattern = 1,
+        reason = 2,
+        flags = 4,
+        call_id = 8,
+        service_idx = 16,
+        method_idx = 20,
+        session_key = 24,
+        connection_id = 32,
+        connection_handle = 40,
+        deadline_unix_ms = 48,
+        wire_call_id = 56,
+        session_id = 60,
+        request_ptr = 64,
+        request_len = 72,
+        peer_ptr = 80,
+        peer_len = 88,
+        buffer = 96,
+    });
+
+    assert_layout!(aster_call_options_t, size = 72, align = 8, {
+        struct_size = 0,
+        version = 4,
+        service = 8,
+        method = 24,
+        metadata = 40,
+        session_id = 56,
+        deadline_ms = 60,
+        serialization_mode = 64,
+        wire_call_id = 68,
     });
 }

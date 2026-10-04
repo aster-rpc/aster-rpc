@@ -29,6 +29,8 @@ pub mod node;
 pub mod probe;
 pub mod pure;
 pub mod reactor;
+pub mod rpc;
+pub mod server;
 
 // ============================================================================
 // ABI Version
@@ -57,8 +59,15 @@ pub mod reactor;
 //   HPKE seal/open + identity-derived X25519 keys, Ed25519 attestation
 //   chains (`pure.rs`); sealed grants, namespace grants, grant records and
 //   reconcile (`grants.rs`); new status `ASTER_STATUS_VERIFICATION_FAILED`.
+// - 3.5.0 (additive): dynamic dispatch -- `aster_server_*` serves
+//   JSON-registered services through `aster::rpc::Server` (Gate 3, sessions,
+//   deadlines, frame limits, baseline services in Rust) and the binding
+//   answers by call id with `aster_dispatch_*` (`server.rs`); payload-level
+//   client `aster_rpc_unary` / `aster_rpc_open` / `aster_call_*_payload`
+//   over the pooled `RpcConnection` (`rpc.rs`). The `aster_reactor_*` and
+//   framed `aster_call_*` functions stay until 4.0.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 3;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 4;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 5;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

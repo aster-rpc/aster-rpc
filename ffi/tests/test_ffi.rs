@@ -19,7 +19,9 @@ fn test_abi_version() {
     // 3.2.0: additive node config, aster_node_start, Gate 0, admission (node.rs).
     // 3.3.0: additive data-plane parity (data.rs).
     // 3.4.0: additive pure functions: ids, HPKE, attestation, grants.
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 4);
+    // 3.5.0: additive dynamic dispatch: aster_server_* / aster_dispatch_* /
+    // aster_rpc_* (server.rs, rpc.rs).
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 5);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);

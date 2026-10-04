@@ -925,6 +925,28 @@ impl RequestSink {
         self.send_flags(payload, FLAG_END_STREAM).await
     }
 
+    /// Send several request payloads, framed into as few writes as possible
+    /// (batches of up to 64 KiB); `last` ends the request stream with the
+    /// final one. For callers that already hold the requests (bindings'
+    /// buffered client-stream / bidi calls). An empty `payloads` is a no-op
+    /// unless `last`, which then [`finish`](RequestSink::finish)es.
+    pub async fn send_many(&self, payloads: Vec<Vec<u8>>, last: bool) -> Result<()> {
+        if payloads.is_empty() {
+            return if last { self.finish().await } else { Ok(()) };
+        }
+        let n = payloads.len();
+        let mut batch = Vec::new();
+        for (i, p) in payloads.into_iter().enumerate() {
+            let end = last && i + 1 == n;
+            let flags = if end { FLAG_END_STREAM } else { 0 };
+            batch.extend_from_slice(&encode_payload_frame(&p, flags)?);
+            if i + 1 == n || batch.len() >= WRITE_BATCH {
+                self.send_framed(std::mem::take(&mut batch), end).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn send_flags(&self, payload: Vec<u8>, flags: u8) -> Result<()> {
         let frame = encode_payload_frame(&payload, flags)?;
         self.send_framed(frame, flags & FLAG_END_STREAM != 0).await

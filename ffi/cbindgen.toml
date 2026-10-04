@@ -40,4 +40,8 @@ include = [
   "aster_attestation_role_t",
   "aster_grant_state_t",
   "aster_grant_outcome_kind_t",
+  "aster_dispatch_event_kind_t",
+  "aster_cancel_reason_t",
+  "aster_method_pattern_t",
+  "aster_server_option_t",
 ]

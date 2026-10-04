@@ -2,7 +2,7 @@ package site.aster.server.spi;
 
 /**
  * Source of request frames on a streaming dispatch. The dispatcher pulls already-framed payload
- * bytes; the runtime is responsible for reading from the reactor and demuxing into this queue.
+ * bytes; the runtime pulls them from the dispatch server ({@code aster_dispatch_recv}).
  *
  * <p>All methods are blocking. Not required to be thread-safe.
  */

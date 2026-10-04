@@ -6,10 +6,12 @@ import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -21,17 +23,15 @@ import site.aster.annotations.Scope;
 import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
 import site.aster.config.AsterConfig;
+import site.aster.contract.ContractManifestBuilder;
 import site.aster.ffi.AsterEnvelope;
+import site.aster.ffi.Dispatch;
 import site.aster.ffi.IrohException;
-import site.aster.ffi.Reactor;
 import site.aster.interceptors.CallContext;
 import site.aster.interceptors.Interceptor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
 import site.aster.node.IrohNode;
-import site.aster.server.session.InMemorySessionRegistry;
-import site.aster.server.session.SessionKey;
-import site.aster.server.session.SessionRegistry;
 import site.aster.server.spi.BidiStreamDispatcher;
 import site.aster.server.spi.ClientStreamDispatcher;
 import site.aster.server.spi.MethodDispatcher;
@@ -40,98 +40,90 @@ import site.aster.server.spi.ServiceDescriptor;
 import site.aster.server.spi.ServiceDispatcher;
 import site.aster.server.spi.UnaryDispatcher;
 import site.aster.server.wire.RpcStatus;
-import site.aster.server.wire.StreamHeader;
 
 /**
- * High-level Aster RPC server. Discovers {@link ServiceDispatcher}s via {@link ServiceLoader},
- * binds each to a user-supplied instance (or per-session factory), decodes incoming {@link
- * StreamHeader} frames from the reactor's poll loop, resolves the right method dispatcher, runs the
- * interceptor chain, and dispatches by sealed {@link MethodDispatcher} subtype.
+ * High-level Aster RPC server on dynamic dispatch (C ABI 3.5, {@code aster_server_*}).
  *
- * <p>Manifest submission (via {@code RegistryAsync.publishAsync}) is not yet hooked; the manifest
- * is built at startup and exposed via {@link #manifest()} but not actually published. Hook dispatch
- * ({@code ASTER_EVENT_HOOK_*} → user callbacks) is likewise deferred.
+ * <p>Discovers {@link ServiceDispatcher}s via {@link ServiceLoader} and binds each to a user
+ * instance (SHARED) or a per-session factory (SESSION). Each service is lowered to its JSON
+ * registration form ({@link ContractManifestBuilder#dynamicService}) and served by Rust's {@code
+ * aster::rpc::Server}: Rust decodes headers, routes, enforces {@code @Requires} (Gate 3), keeps
+ * sessions per connection with the §7.5 graveyard and cap, enforces deadlines and per-method frame
+ * limits, and serves {@code aster.ops.NodeInfo}. This class drains the dispatch events on one
+ * platform thread, runs each call on a virtual thread (client-stream / bidi on a platform thread,
+ * since their request pulls block in native code), runs the interceptor chain, and answers by call
+ * id with payloads and {@code RpcStatus}.
+ *
+ * <p>Manifest submission runs at {@link Builder#build()} (non-fatal); hook dispatch is not wired.
  */
 public final class AsterServer implements AutoCloseable {
 
   public static final String ASTER_ALPN = "aster/1";
   public static final String CONSUMER_ADMISSION_ALPN = "aster.consumer_admission";
   private static final int DEFAULT_RING_CAPACITY = 256;
-  private static final int DEFAULT_POLL_BATCH = 32;
+  private static final int DEFAULT_POLL_BATCH = 64;
   private static final int POLL_TIMEOUT_MS = 100;
 
   /**
    * Default per-connection session cap (spec §7.5 / §9 — {@code
-   * aster.transport.max_sessions_per_connection}). Sized to be generous for normal use but small
-   * enough that a single connection cannot OOM the server. Configurable via {@link
+   * aster.transport.max_sessions_per_connection}). Enforced in Rust; configurable via {@link
    * Builder#maxSessionsPerConnection}.
    */
   static final int DEFAULT_MAX_SESSIONS_PER_CONNECTION = 1024;
 
   private final IrohNode node;
-  private final Reactor reactor;
+  private final Dispatch dispatch;
   private final Codec codec;
-
-  /** AEv1 encoding of {@code RpcStatus.ok()}, computed once (it never changes). */
-  private volatile byte[] okTrailerBytesCache;
-
   private final Map<String, RegisteredService> services;
-  private final SessionRegistry sessionRegistry;
+
+  /** {@code service_idx} → service (registration order). */
+  private final RegisteredService[] byIndex;
+
   private final List<Interceptor> interceptors;
   private final AsterConfig config;
-  private final int maxSessionsPerConnection;
   private final List<ServiceDescriptor> manifest;
   private final AtomicBoolean running = new AtomicBoolean(true);
   private final Thread pollThread;
   private final ExecutorService callExecutor;
   private final ExecutorService streamingExecutor;
   private final site.aster.trust.ConsumerAdmissionHandler admissionHandler;
-  private final Thread nonRpcAcceptThread;
 
-  /**
-   * 64-char hex doc-id of the registry doc created by {@link
-   * site.aster.contract.ContractPublisher}, advertised in consumer-admission responses. Empty until
-   * {@link Builder#build()}'s post-construction publish step completes; blank-supplier behaviour
-   * otherwise.
-   */
+  /** 64-char hex doc-id of the registry doc created by the contract publisher; empty until then. */
   private volatile String registryNamespace = "";
 
   /** Populated by {@link site.aster.contract.ContractPublisher} after publication. */
   private final Map<String, String> publishedContractIds = new ConcurrentHashMap<>();
 
   /**
-   * Per-connection session state (spec §7.5). Mutated only from the poll thread; the dispatcher
-   * threads read the resolved session instance via {@link SessionRegistry} so they don't need to
-   * touch this map. Concurrent-hash-map is overkill for the current single-poll-thread design but
-   * costs us nothing and keeps the door open for multi-poller futures.
+   * Session instances by Rust's {@code session_key}. Created on the poll thread on a session's
+   * first call and dropped on {@code SESSION_CLOSED}, so a call can never resurrect a reaped
+   * session (the ring delivers a session's calls before its close).
    */
-  private final Map<Long, ConnectionState> connections = new ConcurrentHashMap<>();
+  private final Map<Long, Object> sessions = new ConcurrentHashMap<>();
+
+  /** Test-only per-connection view (see {@link #debugConnectionSnapshot()}); poll thread writes. */
+  private final Map<Long, ConnectionView> connections = new ConcurrentHashMap<>();
+
+  private final Map<Long, Long> sessionConnection = new HashMap<>();
 
   /**
-   * Per-peer admission attributes merged into every {@link CallContext#attributes()} built for
-   * calls from that peer. Populated by the admission / auth layer (dev mode leaves it empty,
-   * auth-mode populates {@code aster.role} from validated credentials); consumed by the {@link
-   * site.aster.interceptors.CapabilityInterceptor}. Key is {@code AsterCall#peerId()}, which is
-   * stable for the lifetime of a QUIC connection.
+   * Per-peer admission attributes. Mirrored into Rust's attribute store (Gate 3 reads it) and
+   * merged into every {@link CallContext#attributes()} for calls from that peer.
    */
   private final Map<String, Map<String, String>> peerAttributes = new ConcurrentHashMap<>();
 
-  private AsterServer(Builder b, IrohNode node, Reactor reactor) {
+  private AsterServer(Builder b, IrohNode node, Dispatch dispatch, RegisteredService[] byIndex) {
     this.node = node;
-    this.reactor = reactor;
+    this.dispatch = dispatch;
     this.codec = b.codec != null ? b.codec : new ForyCodec();
     this.services = Map.copyOf(b.services);
-    this.sessionRegistry = b.sessionRegistry;
+    this.byIndex = byIndex;
     this.interceptors = List.copyOf(b.interceptors);
     this.config = b.config;
-    this.maxSessionsPerConnection = b.maxSessionsPerConnection;
     this.manifest = buildManifest(this.services.values());
     this.callExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    // Streaming dispatchers (client-stream / bidi) call ReactorRequestStream.receive ->
-    // Reactor.recvFrame -> runtime.block_on(rx.recv()). block_on parks the calling thread,
-    // and on a virtual thread that pins the carrier for up to ~POLL_TIMEOUT_MS per recv.
-    // Hop streaming dispatchers to a platform-thread executor instead so the carriers stay
-    // free for unary / server-stream work running on the VT executor.
+    // Client-stream / bidi handlers pull requests through aster_dispatch_recv, a blocking native
+    // call that would pin a virtual thread's carrier: they run on platform threads.
     this.streamingExecutor =
         Executors.newCachedThreadPool(
             r -> {
@@ -139,106 +131,33 @@ public final class AsterServer implements AutoCloseable {
               t.setDaemon(true);
               return t;
             });
-    this.pollThread =
-        Thread.ofPlatform().daemon(true).name("aster-server-poll").start(this::pollLoop);
-    // Consumer admission (open-gate): serve the service summaries for every
-    // consumer that opens the aster.consumer_admission ALPN. Auth-mode credential
-    // verification is tracked as tasks #14/#15.
+    // Consumer admission (open-gate): serves the service summaries on the
+    // aster.consumer_admission ALPN, which Rust hands over as NON_RPC events.
     this.admissionHandler =
         new site.aster.trust.ConsumerAdmissionHandler(
             this::buildServiceSummaries,
             () -> registryNamespace,
             this::setPeerAttributes,
             () -> this.config == null || this.config.allowAllConsumers());
-    this.nonRpcAcceptThread =
-        Thread.ofPlatform()
-            .daemon(true)
-            .name("aster-server-non-rpc-accept")
-            .start(this::nonRpcAcceptLoop);
-  }
-
-  /**
-   * Drives the reactor's non-rpc accept queue: for each aster-ALPN connection negotiated with an
-   * ALPN other than {@code aster/1}, dispatch to the appropriate per-ALPN handler. This is the
-   * Java-side mirror of Python's {@code _accept_loop} in {@code runtime.py} (lines 837-894), scoped
-   * to the ALPNs Java currently supports (consumer admission today; producer admission / manifest
-   * serving are follow-up tasks).
-   */
-  private void nonRpcAcceptLoop() {
-    site.aster.ffi.IrohLibrary lib = site.aster.ffi.IrohLibrary.getInstance();
-    long runtimeHandle = node.runtime().nativeHandle();
-    long reactorHandle = reactor.handle();
-    while (running.get()) {
-      try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
-        java.lang.foreign.MemorySegment opSeg =
-            arena.allocate(java.lang.foreign.ValueLayout.JAVA_LONG);
-        int status = lib.asterReactorAcceptNonRpc(runtimeHandle, reactorHandle, 0L, opSeg);
-        if (status != 0) {
-          // Reactor shut down or error — exit quietly.
-          return;
-        }
-        long opId = opSeg.get(java.lang.foreign.ValueLayout.JAVA_LONG, 0);
-        java.util.concurrent.CompletableFuture<site.aster.event.IrohEvent> fut =
-            node.runtime().registry().register(opId);
-        site.aster.event.IrohEvent event;
-        try {
-          event = fut.get();
-        } catch (Exception e) {
-          if (!running.get()) {
-            return;
-          }
-          continue;
-        }
-        if (event.kind() != site.aster.ffi.IrohEventKind.ASTER_ACCEPTED) {
-          continue;
-        }
-        long connHandle = event.handle();
-        byte[] alpnBytes = new byte[0];
-        if (event.dataLen() > 0) {
-          alpnBytes =
-              event
-                  .data()
-                  .asSlice(0, event.dataLen())
-                  .toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
-          if (event.hasBuffer()) {
-            node.runtime().releaseBuffer(event.buffer());
-          }
-        }
-        site.aster.handle.IrohConnection conn =
-            new site.aster.handle.IrohConnection(node.runtime(), connHandle);
-        if (site.aster.trust.ConsumerAdmissionHandler.matches(alpnBytes)) {
-          admissionHandler.onConnection(conn);
-        } else {
-          conn.close();
-        }
-      } catch (Exception e) {
-        if (!running.get()) {
-          return;
-        }
-      }
-    }
+    this.pollThread =
+        Thread.ofPlatform().daemon(true).name("aster-server-poll").start(this::pollLoop);
   }
 
   private List<site.aster.registry.ServiceSummary> buildServiceSummaries() {
-    // Populate channels["rpc"] with the server's own node addr (base64). Consumers use this
-    // to dial the RPC endpoint via the aster/1 ALPN without going through the admission peer
-    // again — mirrors Python's ServiceSummary population in runtime.py:397.
+    // channels["rpc"] = this node's address, so consumers dial aster/1 directly (Python's
+    // ServiceSummary in runtime.py does the same).
     String rpcAddr = node.nodeAddr().toBase64();
     List<site.aster.registry.ServiceSummary> out = new ArrayList<>();
     for (RegisteredService rs : services.values()) {
       var summary = new site.aster.registry.ServiceSummary();
       summary.name = rs.descriptor.name();
       summary.version = rs.descriptor.version();
-      // Prefer the cached contract_id populated by ContractPublisher. Fall back to computing it
-      // on demand when publication is disabled or hasn't completed (e.g. tests that instantiate
-      // AsterServer without going through the public Builder.build() path).
       String cid = publishedContractIds.get(rs.descriptor.name());
       if (cid == null || cid.isEmpty()) {
-        cid = contractId(rs.descriptor.name());
+        cid = rs.contractId;
       }
       summary.contractId = cid == null ? "" : cid;
       summary.pattern = rs.descriptor.scope() == Scope.SHARED ? "shared" : "session";
-      // Payloads are Fory XLANG only; JSON (mode 3) is retired (Aster-SPEC §5.1).
       summary.serializationModes = List.of("xlang");
       summary.channels.put("rpc", rpcAddr);
       out.add(summary);
@@ -246,17 +165,12 @@ public final class AsterServer implements AutoCloseable {
     return List.copyOf(out);
   }
 
-  /**
-   * 64-char hex doc-id of the registry doc that hosts this server's published contract manifests.
-   * Empty until {@link Builder#build()} finishes its publication step, or when the server was
-   * instantiated without publication. Consumers use this (via the admission response) to {@code
-   * join_and_subscribe_namespace} and fetch manifests by {@code contract_id}.
-   */
+  /** 64-char hex doc-id of the registry doc hosting this server's manifests; empty until set. */
   public String registryNamespace() {
     return registryNamespace;
   }
 
-  void setPublicationResult(String namespace, java.util.Map<String, String> contractIds) {
+  void setPublicationResult(String namespace, Map<String, String> contractIds) {
     this.registryNamespace = namespace == null ? "" : namespace;
     this.publishedContractIds.putAll(contractIds);
   }
@@ -274,22 +188,17 @@ public final class AsterServer implements AutoCloseable {
     return config;
   }
 
-  /** Immutable snapshot of the discovered service descriptors — one per registered service. */
   /**
-   * <strong>TEST-ONLY</strong>. Snapshot of per-connection state for assertions in tier-2 chaos
-   * tests. Maps {@code connectionId} to {@code (activeSessionCount, lastOpenedSessionId)}.
-   * Production code MUST NOT read this — it exists so tests can verify reap semantics (connection
-   * entries dropped on close, sessions counted correctly) without reflecting into private fields.
-   * Mirrors the TypeScript {@code AsterServer2.debugConnectionSnapshot}.
+   * <strong>TEST-ONLY</strong>. Per-connection session view, {@code connectionId → (active
+   * sessions, highest opened session id)}, rebuilt from the dispatch events (the authoritative
+   * state, graveyard and cap, lives in Rust). Entries are dropped on connection close.
    */
   public Map<Long, ConnectionSnapshot> debugConnectionSnapshot() {
-    Map<Long, ConnectionSnapshot> out = new java.util.HashMap<>();
-    for (Map.Entry<Long, ConnectionState> e : connections.entrySet()) {
-      ConnectionState state = e.getValue();
-      synchronized (state) {
-        out.put(
-            e.getKey(),
-            new ConnectionSnapshot(state.activeSessions.size(), state.lastOpenedSessionId));
+    Map<Long, ConnectionSnapshot> out = new HashMap<>();
+    for (Map.Entry<Long, ConnectionView> e : connections.entrySet()) {
+      ConnectionView v = e.getValue();
+      synchronized (v) {
+        out.put(e.getKey(), new ConnectionSnapshot(v.active.size(), v.lastOpened));
       }
     }
     return out;
@@ -298,18 +207,18 @@ public final class AsterServer implements AutoCloseable {
   /** Test-only snapshot record; see {@link #debugConnectionSnapshot()}. */
   public record ConnectionSnapshot(int activeSessionCount, int lastOpenedSessionId) {}
 
+  private static final class ConnectionView {
+    final Set<Long> active = new HashSet<>();
+    int lastOpened;
+  }
+
   public List<ServiceDescriptor> manifest() {
     return manifest;
   }
 
-  /**
-   * Live view of the registered {@link ServiceDispatcher}s keyed by service name. Intended for
-   * wiring {@link site.aster.interceptors.CapabilityInterceptor} so it can look up the service- and
-   * method-level {@code @Requires} at call time without each caller maintaining its own map.
-   */
-  public Map<String, site.aster.server.spi.ServiceDispatcher> serviceDispatchers() {
-    java.util.LinkedHashMap<String, site.aster.server.spi.ServiceDispatcher> out =
-        new java.util.LinkedHashMap<>();
+  /** Live view of the registered {@link ServiceDispatcher}s keyed by service name. */
+  public Map<String, ServiceDispatcher> serviceDispatchers() {
+    LinkedHashMap<String, ServiceDispatcher> out = new LinkedHashMap<>();
     for (Map.Entry<String, RegisteredService> e : services.entrySet()) {
       out.put(e.getKey(), e.getValue().dispatcher());
     }
@@ -317,10 +226,9 @@ public final class AsterServer implements AutoCloseable {
   }
 
   /**
-   * Attach admission attributes (e.g. {@code aster.role} → comma-separated capability list) to
-   * every subsequent call from {@code peerId}. Called by the auth / admission layer after a peer
-   * passes credential validation; merged into {@link CallContext#attributes()} before interceptors
-   * run. Pass {@code null} or an empty map to clear.
+   * Attach admission attributes (e.g. {@code aster.role}) to every subsequent call from {@code
+   * peerId}: Rust's Gate 3 checks {@code @Requires} against them, and they are merged into {@link
+   * CallContext#attributes()}. Pass {@code null} or an empty map to clear.
    */
   public void setPeerAttributes(String peerId, Map<String, String> attributes) {
     if (peerId == null) {
@@ -328,41 +236,36 @@ public final class AsterServer implements AutoCloseable {
     }
     if (attributes == null || attributes.isEmpty()) {
       peerAttributes.remove(peerId);
+      dispatch.setPeerAttributes(peerId, Map.of());
       return;
     }
     peerAttributes.put(peerId, Map.copyOf(attributes));
+    dispatch.setPeerAttributes(peerId, attributes);
   }
 
-  /** Drop any cached admission attributes for {@code peerId}. */
+  /** Drop any admission attributes for {@code peerId}. */
   public void clearPeerAttributes(String peerId) {
-    if (peerId != null) {
-      peerAttributes.remove(peerId);
-    }
+    setPeerAttributes(peerId, null);
   }
 
-  /**
-   * Build and return the canonical {@link site.aster.contract.ContractManifest} JSON for one
-   * registered service. Walks the service's type graph, computes each TypeDef's BLAKE3 hash via the
-   * Rust FFI, derives {@code contract_id} via the Rust canonicalizer, and assembles the full
-   * manifest (methods, field schemas, metadata).
-   *
-   * <p>Returns {@code null} if no service with {@code serviceName} is registered on this server.
-   */
+  /** The canonical {@link site.aster.contract.ContractManifest} JSON for one service. */
   public String manifestJson(String serviceName) {
     RegisteredService rs = services.get(serviceName);
     if (rs == null) {
       return null;
     }
-    return site.aster.contract.ContractManifestBuilder.build(rs.dispatcher()).toJson();
+    return ContractManifestBuilder.build(rs.dispatcher()).toJson();
   }
 
-  /** Compute only the {@code contract_id} for a registered service; {@code null} if unknown. */
+  /** The {@code contract_id} of a registered service; {@code null} if unknown. */
   public String contractId(String serviceName) {
     RegisteredService rs = services.get(serviceName);
-    if (rs == null) {
-      return null;
-    }
-    return site.aster.contract.ContractManifestBuilder.computeContractId(rs.dispatcher());
+    return rs == null ? null : rs.contractId;
+  }
+
+  /** Live calls in Rust's call table (diagnostics / tests). */
+  public long liveCalls() {
+    return dispatch.liveCalls();
   }
 
   @Override
@@ -384,405 +287,243 @@ public final class AsterServer implements AutoCloseable {
       Thread.currentThread().interrupt();
     }
     admissionHandler.close();
-    sessionRegistry.clear();
+    for (Object instance : sessions.values()) {
+      closeIfAutoCloseable(instance);
+    }
+    sessions.clear();
     connections.clear();
-    reactor.close();
+    dispatch.close();
     node.close();
   }
 
   // ───── Poll loop ─────────────────────────────────────────────────────────
 
+  /** One call, copied out of its event on the poll thread. */
+  private record Inbound(
+      long callId,
+      RegisteredService service,
+      int methodIdx,
+      int flags,
+      Object instance,
+      long deadlineUnixMs,
+      int sessionId,
+      byte[] request,
+      String peer,
+      long connectionHandle) {}
+
   private void pollLoop() {
-    long callSize = Reactor.CALL_LAYOUT.byteSize();
+    long size = Dispatch.EVENT_LAYOUT.byteSize();
     try (Arena arena = Arena.ofConfined()) {
-      MemorySegment callBuffer = arena.allocate(Reactor.CALL_LAYOUT, DEFAULT_POLL_BATCH);
+      MemorySegment events = arena.allocate(Dispatch.EVENT_LAYOUT, DEFAULT_POLL_BATCH);
       while (running.get()) {
-        int count = reactor.poll(callBuffer, DEFAULT_POLL_BATCH, POLL_TIMEOUT_MS);
+        int count = dispatch.poll(events, DEFAULT_POLL_BATCH, POLL_TIMEOUT_MS);
         for (int i = 0; i < count; i++) {
-          MemorySegment slot = callBuffer.asSlice(i * callSize, callSize);
-          byte eventKind = slot.get(ValueLayout.JAVA_BYTE, Reactor.OFFSET_EVENT_KIND);
-          if (eventKind == Reactor.EVENT_KIND_CONNECTION_CLOSED) {
-            handleConnectionClosed(slot);
-            continue;
+          MemorySegment ev = events.asSlice(i * size, size);
+          try {
+            onEvent(ev);
+          } catch (RuntimeException e) {
+            System.err.println("aster-server-poll: event failed: " + e);
           }
-          if (eventKind == Reactor.EVENT_KIND_RESPONSE_WRITABLE
-              || eventKind == Reactor.EVENT_KIND_RESPONSE_CLOSED) {
-            reactor.handleResponseCapacityEvent(
-                eventKind, slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_CALL_ID));
-            continue;
-          }
-          if (eventKind != Reactor.EVENT_KIND_CALL) {
-            System.err.println("unknown reactor event kind: " + eventKind);
-            continue;
-          }
-          AsterCall call = extractCall(slot);
-          long headerBuf = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_HEADER_BUFFER);
-          long requestBuf = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_REQUEST_BUFFER);
-          long peerBuf = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_PEER_BUFFER);
-          reactor.bufferRelease(headerBuf);
-          reactor.bufferRelease(requestBuf);
-          reactor.bufferRelease(peerBuf);
-          callExecutor.execute(() -> dispatchCall(call));
         }
       }
     }
   }
 
-  /**
-   * Reap per-connection state on connection close (spec §7.5). Drops the session graveyard +
-   * counter for this {@code connectionId}; the {@link SessionRegistry} drops every session instance
-   * keyed on it. Runs on the poll thread.
-   */
-  private void handleConnectionClosed(MemorySegment slot) {
-    long connectionId = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_CONNECTION_ID);
-    long peerBuf = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_PEER_BUFFER);
-    reactor.bufferRelease(peerBuf);
-    connections.remove(connectionId);
-    sessionRegistry.onConnectionClosed(connectionId);
+  private void onEvent(MemorySegment ev) {
+    byte kind = ev.get(ValueLayout.JAVA_BYTE, Dispatch.OFFSET_KIND);
+    switch (kind) {
+      case Dispatch.EVENT_CALL -> onCall(ev);
+      case Dispatch.EVENT_RESPONSE_WRITABLE, Dispatch.EVENT_RESPONSE_CLOSED ->
+          dispatch.handleCapacityEvent(
+              kind, ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CALL_ID));
+      case Dispatch.EVENT_CANCELLED -> {
+        // Rust already answered (deadline / corrupt request) or there is nobody to answer (peer
+        // cancel); handlers see it through isCancelled() and GONE results.
+      }
+      case Dispatch.EVENT_SESSION_CLOSED -> {
+        long key = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_SESSION_KEY);
+        closeIfAutoCloseable(sessions.remove(key));
+        Long conn = sessionConnection.remove(key);
+        ConnectionView view = conn == null ? null : connections.get(conn);
+        if (view != null) {
+          synchronized (view) {
+            view.active.remove(key);
+          }
+        }
+      }
+      case Dispatch.EVENT_CONNECTION_CLOSED -> {
+        connections.remove(ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CONNECTION_ID));
+        dispatch.bufferRelease(ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_BUFFER));
+      }
+      case Dispatch.EVENT_NON_RPC -> onNonRpc(ev);
+      default -> System.err.println("aster-server-poll: unknown dispatch event kind " + kind);
+    }
   }
 
-  private AsterCall extractCall(MemorySegment slot) {
-    long callId = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_CALL_ID);
-    long connectionId = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_CONNECTION_ID);
-    long streamId = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_STREAM_ID);
-    MemorySegment headerPtr = slot.get(ValueLayout.ADDRESS, Reactor.OFFSET_HEADER_PTR);
-    int headerLen = slot.get(ValueLayout.JAVA_INT, Reactor.OFFSET_HEADER_LEN);
-    byte headerFlags = slot.get(ValueLayout.JAVA_BYTE, Reactor.OFFSET_HEADER_FLAGS);
-    MemorySegment requestPtr = slot.get(ValueLayout.ADDRESS, Reactor.OFFSET_REQUEST_PTR);
-    int requestLen = slot.get(ValueLayout.JAVA_INT, Reactor.OFFSET_REQUEST_LEN);
-    byte requestFlags = slot.get(ValueLayout.JAVA_BYTE, Reactor.OFFSET_REQUEST_FLAGS);
-    MemorySegment peerPtr = slot.get(ValueLayout.ADDRESS, Reactor.OFFSET_PEER_PTR);
-    int peerLen = slot.get(ValueLayout.JAVA_INT, Reactor.OFFSET_PEER_LEN);
-    long connectionHandle = slot.get(ValueLayout.JAVA_LONG, Reactor.OFFSET_CONNECTION_HANDLE);
+  private void onCall(MemorySegment ev) {
+    long callId = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CALL_ID);
+    int serviceIdx = ev.get(ValueLayout.JAVA_INT, Dispatch.OFFSET_SERVICE_IDX);
+    int methodIdx = ev.get(ValueLayout.JAVA_INT, Dispatch.OFFSET_METHOD_IDX);
+    int flags = ev.get(ValueLayout.JAVA_INT, Dispatch.OFFSET_FLAGS);
+    long sessionKey = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_SESSION_KEY);
+    int sessionId = ev.get(ValueLayout.JAVA_INT, Dispatch.OFFSET_SESSION_ID);
+    long connectionId = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CONNECTION_ID);
+    long connectionHandle = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CONNECTION_HANDLE);
+    long deadline = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_DEADLINE_UNIX_MS);
+    byte[] request = bytes(ev, Dispatch.OFFSET_REQUEST_PTR, Dispatch.OFFSET_REQUEST_LEN);
+    String peer =
+        new String(
+            bytes(ev, Dispatch.OFFSET_PEER_PTR, Dispatch.OFFSET_PEER_LEN), StandardCharsets.UTF_8);
+    dispatch.bufferRelease(ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_BUFFER));
 
-    byte[] header =
-        headerLen > 0
-            ? headerPtr.reinterpret(headerLen).toArray(ValueLayout.JAVA_BYTE)
-            : new byte[0];
-    byte[] request =
-        requestLen > 0
-            ? requestPtr.reinterpret(requestLen).toArray(ValueLayout.JAVA_BYTE)
-            : new byte[0];
-    String peerId =
-        peerLen > 0
-            ? new String(
-                peerPtr.reinterpret(peerLen).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8)
-            : "";
-    return new AsterCall(
-        callId,
-        connectionId,
-        streamId,
-        header,
-        headerFlags,
-        request,
-        requestFlags,
-        peerId,
-        connectionHandle);
+    RegisteredService svc = serviceIdx < byIndex.length ? byIndex[serviceIdx] : null;
+    if (svc == null || methodIdx < 0 || methodIdx >= svc.methods.length) {
+      fail(callId, StatusCode.UNIMPLEMENTED, "no handler for service " + serviceIdx, null);
+      return;
+    }
+    Object instance = svc.sharedInstance;
+    if (sessionKey != 0) {
+      // Rust allocated the key and decided the session may exist (graveyard, cap): here it only
+      // needs an instance. Created on this thread, ahead of the session's SESSION_CLOSED.
+      instance = sessions.computeIfAbsent(sessionKey, k -> svc.factory.apply(peer));
+      if ((flags & Dispatch.FLAG_NEW_SESSION) != 0) {
+        trackSession(connectionId, sessionKey, sessionId);
+      }
+    }
+    Inbound call =
+        new Inbound(
+            callId,
+            svc,
+            methodIdx,
+            flags,
+            instance,
+            deadline,
+            sessionId,
+            request,
+            peer,
+            connectionHandle);
+    callExecutor.execute(() -> dispatchCall(call));
+  }
+
+  private void trackSession(long connectionId, long sessionKey, int sessionId) {
+    ConnectionView view = connections.computeIfAbsent(connectionId, id -> new ConnectionView());
+    synchronized (view) {
+      view.active.add(sessionKey);
+      view.lastOpened = Math.max(view.lastOpened, sessionId);
+    }
+    sessionConnection.put(sessionKey, connectionId);
+  }
+
+  private void onNonRpc(MemorySegment ev) {
+    byte[] alpn = bytes(ev, Dispatch.OFFSET_REQUEST_PTR, Dispatch.OFFSET_REQUEST_LEN);
+    dispatch.bufferRelease(ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_BUFFER));
+    long handle = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CONNECTION_HANDLE);
+    // Owned by us: the wrapper frees it.
+    site.aster.handle.IrohConnection conn =
+        new site.aster.handle.IrohConnection(node.runtime(), handle);
+    if (site.aster.trust.ConsumerAdmissionHandler.matches(alpn)) {
+      admissionHandler.onConnection(conn);
+    } else {
+      conn.close();
+    }
+  }
+
+  private static byte[] bytes(MemorySegment ev, long ptrOffset, long lenOffset) {
+    int len = ev.get(ValueLayout.JAVA_INT, lenOffset);
+    if (len == 0) {
+      return new byte[0];
+    }
+    return ev.get(ValueLayout.ADDRESS, ptrOffset).reinterpret(len).toArray(ValueLayout.JAVA_BYTE);
   }
 
   // ───── Dispatch ──────────────────────────────────────────────────────────
 
-  private void dispatchCall(AsterCall inbound) {
-    long callId = inbound.callId();
+  private void dispatchCall(Inbound call) {
+    long callId = call.callId();
     long probeT2 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
     try {
-      StreamHeader header = decodeStreamHeader(inbound.header());
-      if (header.serializationMode() != StreamHeader.SERIALIZATION_XLANG) {
-        // JSON (3) is retired and NATIVE / ROW are reserved (Aster-SPEC §5.1).
-        submitErrorTrailer(
-            callId,
-            StatusCode.INVALID_ARGUMENT,
-            "unsupported serialization mode: " + header.serializationMode());
-        return;
-      }
-      // Decompress the inline first request frame once, so handlers and interceptors see the
-      // logical payload (Aster-SPEC §5.6).
-      AsterCall call = withLogicalRequest(inbound);
+      MethodDispatcher method = call.service().methods[call.methodIdx()];
+      CallContext ctx = buildCallContext(call, method);
       long probeT3 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
-      RegisteredService svc = services.get(header.service());
-      if (svc == null) {
-        submitErrorTrailer(
-            callId, StatusCode.UNIMPLEMENTED, "unknown service: " + header.service());
-        return;
-      }
-      MethodDispatcher method = svc.dispatcher.methods().get(header.method());
-      if (method == null) {
-        submitErrorTrailer(
-            callId,
-            StatusCode.UNIMPLEMENTED,
-            "unknown method: " + header.service() + "/" + header.method());
-        return;
-      }
-      Object instance;
-      try {
-        instance = resolveInstance(svc, call, header);
-      } catch (SessionNotFoundException e) {
-        submitErrorTrailer(callId, StatusCode.NOT_FOUND, e.getMessage());
-        return;
-      } catch (SessionLimitException e) {
-        submitErrorTrailer(callId, StatusCode.RESOURCE_EXHAUSTED, e.getMessage());
-        return;
-      } catch (SessionScopeMismatchException e) {
-        submitErrorTrailer(callId, StatusCode.FAILED_PRECONDITION, e.getMessage());
-        return;
-      }
-      CallContext ctx = buildCallContext(header, method, call);
 
-      // Run the server-side interceptor chain's onRequest hook. Capability-style gates
-      // (and the dev-mode metadata-to-attributes shim used by Mission Control auth tests)
-      // throw RpcError here; any other Exception is surfaced as INTERNAL. The call's raw
-      // request bytes are passed as the opaque request value — user interceptors that
-      // need the decoded payload should hook in a higher layer.
+      // Server interceptors run pre-dispatch with the raw request (Gate 3 already ran in Rust).
       if (!interceptors.isEmpty()) {
-        try {
-          site.aster.interceptors.InterceptorChain.applyRequest(interceptors, ctx, call.request());
-        } catch (RpcError e) {
-          submitErrorTrailer(callId, e.code(), e.rpcMessage());
-          return;
-        } catch (Exception e) {
-          submitErrorTrailer(
-              callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
-          return;
-        }
+        site.aster.interceptors.InterceptorChain.applyRequest(interceptors, ctx, call.request());
       }
-
-      // Trampoline streaming dispatchers (client-stream / bidi) onto a platform-thread
-      // executor so their blocking Reactor.recvFrame calls don't pin a virtual-thread
-      // carrier. Unary + server-stream stay on the VT executor (they don't block on
-      // recvFrame and benefit from cheap VT fanout).
       if (Thread.currentThread().isVirtual()
           && (method instanceof ClientStreamDispatcher || method instanceof BidiStreamDispatcher)) {
-        final MethodDispatcher pinnedMethod = method;
-        final Object pinnedInstance = instance;
-        final CallContext pinnedCtx = ctx;
-        streamingExecutor.execute(
-            () -> runDispatch(call, pinnedMethod, pinnedInstance, pinnedCtx, probeT2, probeT3));
+        streamingExecutor.execute(() -> runDispatch(call, method, ctx, probeT2, probeT3));
         return;
       }
-
-      runDispatch(call, method, instance, ctx, probeT2, probeT3);
-    } catch (RpcError e) {
-      submitErrorTrailer(callId, e.code(), e.rpcMessage());
-    } catch (Exception e) {
-      submitErrorTrailer(
-          callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
+      runDispatch(call, method, ctx, probeT2, probeT3);
+    } catch (Throwable t) {
+      failWith(callId, t);
     }
   }
 
   private void runDispatch(
-      AsterCall call,
-      MethodDispatcher method,
-      Object instance,
-      CallContext ctx,
-      long probeT2,
-      long probeT3) {
+      Inbound call, MethodDispatcher method, CallContext ctx, long probeT2, long probeT3) {
     long callId = call.callId();
-    Codec callCodec = codec;
-    byte[] okTrailer = okTrailerBytes();
+    Object instance = call.instance();
     try {
       switch (method) {
         case UnaryDispatcher u -> {
           long probeT4 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
-          byte[] responseBytes = u.invoke(instance, call.request(), callCodec, ctx);
+          byte[] response = u.invoke(instance, call.request(), codec, ctx);
           long probeT5 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
-          byte[] responseFrame = AsterFraming.encodePayloadFrame(responseBytes, (byte) 0);
-          byte[] trailerFrame = AsterFraming.encodeFrame(okTrailer, AsterFraming.FLAG_TRAILER);
-          submitResponse(callId, new CallResponse(responseFrame, trailerFrame));
+          dispatch.respond(callId, response, null);
           if (site.aster.probe.AsterProbes.ENABLED) {
-            long probeT6 = System.nanoTime();
-            site.aster.probe.AsterProbes.recordServer(probeT2, probeT3, probeT4, probeT5, probeT6);
+            site.aster.probe.AsterProbes.recordServer(
+                probeT2, probeT3, probeT4, probeT5, System.nanoTime());
           }
         }
         case ServerStreamDispatcher s -> {
-          ReactorResponseStream out = new ReactorResponseStream(reactor, callId);
+          DispatchResponseStream out = new DispatchResponseStream(dispatch, callId);
           try {
-            s.invoke(instance, call.request(), callCodec, ctx, out);
+            s.invoke(instance, call.request(), codec, ctx, out);
             out.complete();
           } catch (Throwable t) {
             out.fail(t);
           }
         }
         case ClientStreamDispatcher c -> {
-          ReactorRequestStream in = new ReactorRequestStream(reactor, callId, call.request());
-          try {
-            byte[] responseBytes = c.invoke(instance, in, callCodec, ctx);
-            byte[] responseFrame = AsterFraming.encodePayloadFrame(responseBytes, (byte) 0);
-            byte[] trailerFrame = AsterFraming.encodeFrame(okTrailer, AsterFraming.FLAG_TRAILER);
-            submitResponse(callId, new CallResponse(responseFrame, trailerFrame));
-          } catch (RpcError e) {
-            submitErrorTrailer(callId, e.code(), e.rpcMessage());
-          } catch (Exception e) {
-            submitErrorTrailer(
-                callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
-          }
+          DispatchRequestStream in = new DispatchRequestStream(dispatch, callId, call.request());
+          byte[] response = c.invoke(instance, in, codec, ctx);
+          dispatch.respond(callId, response, null);
         }
         case BidiStreamDispatcher b -> {
-          ReactorRequestStream in = new ReactorRequestStream(reactor, callId, call.request());
-          ReactorResponseStream out = new ReactorResponseStream(reactor, callId);
+          DispatchRequestStream in = new DispatchRequestStream(dispatch, callId, call.request());
+          DispatchResponseStream out = new DispatchResponseStream(dispatch, callId);
           try {
-            b.invoke(instance, in, callCodec, ctx, out);
+            b.invoke(instance, in, codec, ctx, out);
             out.complete();
           } catch (Throwable t) {
             out.fail(t);
           }
         }
       }
-    } catch (RpcError e) {
-      submitErrorTrailer(callId, e.code(), e.rpcMessage());
-    } catch (Exception e) {
-      submitErrorTrailer(
-          callId, StatusCode.INTERNAL, e.getMessage() == null ? "error" : e.getMessage());
+    } catch (Throwable t) {
+      failWith(callId, t);
     }
   }
 
-  /**
-   * Resolve the service instance for an inbound call (multiplexed-streams spec §6 / §7.5).
-   *
-   * <ul>
-   *   <li>SHARED service + sessionId == 0 → return the singleton.
-   *   <li>SHARED service + sessionId != 0 → scope mismatch (peer expected a session-bound service
-   *       at this name).
-   *   <li>SESSION service + sessionId == 0 → scope mismatch (peer should have allocated a sessionId
-   *       and sent it on the StreamHeader).
-   *   <li>SESSION service + sessionId &gt; lastOpenedSessionId → create the session if the cap
-   *       allows; bump {@code lastOpenedSessionId} to {@code sessionId}.
-   *   <li>SESSION service + sessionId &lt;= lastOpenedSessionId but not in the active map →
-   *       graveyard hit, NOT_FOUND.
-   *   <li>SESSION service + sessionId already in the active map → return the existing instance.
-   * </ul>
-   */
-  private Object resolveInstance(RegisteredService svc, AsterCall call, StreamHeader header) {
-    int sessionId = header.sessionId();
-    boolean isSessionScope = svc.descriptor.scope() == Scope.SESSION;
-
-    if (!isSessionScope) {
-      if (sessionId != 0) {
-        throw new SessionScopeMismatchException(
-            "service '"
-                + svc.descriptor.name()
-                + "' is SHARED but call carried sessionId="
-                + sessionId);
-      }
-      return svc.sharedInstance;
-    }
-
-    if (sessionId == 0) {
-      throw new SessionScopeMismatchException(
-          "service '"
-              + svc.descriptor.name()
-              + "' is SESSION-scoped; call must carry a non-zero sessionId");
-    }
-
-    ConnectionState state =
-        connections.computeIfAbsent(
-            call.connectionId(), id -> new ConnectionState(maxSessionsPerConnection));
-    SessionKey key = new SessionKey(call.connectionId(), sessionId, svc.descriptor.implClass());
-
-    // Single-poll-thread invariant means computeIfAbsent on the connections map is sequential per
-    // connection; the synchronized block here guards against the race where multiple service
-    // classes on the same sessionId race in (rare but possible if a future change parallelises
-    // the poll loop).
-    synchronized (state) {
-      if (state.activeSessions.contains(key)) {
-        return sessionRegistry.getOrCreate(key, call.peerId(), svc.factory);
-      }
-      if (sessionId <= state.lastOpenedSessionId) {
-        throw new SessionNotFoundException(
-            "session " + sessionId + " was previously opened on this connection and is now closed");
-      }
-      // Spec §7.5: cap counts active sessions only — a fresh sessionId > lastOpenedSessionId
-      // beyond the cap is rejected with RESOURCE_EXHAUSTED *without* bumping the graveyard
-      // counter, so a subsequent retry with the same id surfaces RESOURCE_EXHAUSTED again
-      // rather than NOT_FOUND.
-      if (state.activeSessions.size() >= state.maxSessions) {
-        throw new SessionLimitException(
-            "connection has reached max_sessions_per_connection=" + state.maxSessions);
-      }
-      state.lastOpenedSessionId = sessionId;
-      state.activeSessions.add(key);
-    }
-    return sessionRegistry.getOrCreate(key, call.peerId(), svc.factory);
-  }
-
-  // ───── Per-connection state + typed errors ───────────────────────────────
-
-  /**
-   * Per-connection session state (spec §7.5). Holds the active session key set, the monotonic
-   * graveyard counter, and the per-connection cap. Mutated under {@code synchronized(this)} from
-   * the poll thread.
-   */
-  private static final class ConnectionState {
-    final java.util.Set<SessionKey> activeSessions = new java.util.HashSet<>();
-    int lastOpenedSessionId;
-    final int maxSessions;
-
-    ConnectionState(int maxSessions) {
-      this.maxSessions = maxSessions;
-    }
-  }
-
-  /** Thrown when a peer references a sessionId that has already been closed. */
-  private static final class SessionNotFoundException extends RuntimeException {
-    SessionNotFoundException(String message) {
-      super(message);
-    }
-  }
-
-  /** Thrown when a peer's open_session would exceed {@code max_sessions_per_connection}. */
-  private static final class SessionLimitException extends RuntimeException {
-    SessionLimitException(String message) {
-      super(message);
-    }
-  }
-
-  /** Thrown when a SHARED call carries a sessionId or a SESSION call carries sessionId=0. */
-  private static final class SessionScopeMismatchException extends RuntimeException {
-    SessionScopeMismatchException(String message) {
-      super(message);
-    }
-  }
-
-  /** Decode the AEv1 StreamHeader (Aster-SPEC §6.9); malformed bytes throw. */
-  private static StreamHeader decodeStreamHeader(byte[] bytes) {
-    return AsterEnvelope.decodeStreamHeader(bytes);
-  }
-
-  /** {@code call} with its inline request payload decompressed if it arrived compressed. */
-  private static AsterCall withLogicalRequest(AsterCall call) {
-    if ((call.requestFlags() & AsterFraming.FLAG_COMPRESSED) == 0) {
-      return call;
-    }
-    return new AsterCall(
-        call.callId(),
-        call.connectionId(),
-        call.streamId(),
-        call.header(),
-        call.headerFlags(),
-        AsterFraming.payloadOf(call.request(), call.requestFlags()),
-        (byte) (call.requestFlags() & ~AsterFraming.FLAG_COMPRESSED),
-        call.peerId(),
-        call.connectionHandle());
-  }
-
-  private CallContext buildCallContext(
-      StreamHeader header, MethodDispatcher method, AsterCall call) {
-    Map<String, String> metadata = new HashMap<>();
-    List<String> keys = header.metadataKeys();
-    List<String> vals = header.metadataValues();
-    int n = Math.min(keys.size(), vals.size());
-    for (int i = 0; i < n; i++) {
-      metadata.put(keys.get(i), vals.get(i));
-    }
+  private CallContext buildCallContext(Inbound call, MethodDispatcher method) {
+    long callId = call.callId();
+    int flags = call.flags();
+    Map<String, String> metadata =
+        (flags & Dispatch.FLAG_HAS_METADATA) != 0
+            ? new HashMap<>(dispatch.metadata(callId))
+            : new HashMap<>();
     Map<String, String> attributes = new HashMap<>();
-    Map<String, String> peerAttrs = peerAttributes.get(call.peerId());
+    Map<String, String> peerAttrs = peerAttributes.get(call.peer());
     if (peerAttrs != null) {
       attributes.putAll(peerAttrs);
     }
+    if ((flags & Dispatch.FLAG_HAS_ATTRIBUTES) != 0 && peerAttrs == null) {
+      attributes.putAll(dispatch.attributes(callId));
+    }
 
-    // Pull the selected QUIC path snapshot via the borrowed connection
-    // handle the reactor put on the call slot. The reactor owns its
-    // lifetime — we call the static FFI helper to avoid constructing a
-    // transient IrohConnection wrapper (whose Cleaner would log noise).
+    // Selected QUIC path of the borrowed connection handle (owned by the server; not freed here).
     java.net.InetSocketAddress peerAddr = null;
     String relayUrl = null;
     java.time.Duration rtt = null;
@@ -795,55 +536,67 @@ public final class AsterServer implements AutoCloseable {
         relayUrl = snap.relayUrl();
         rtt = snap.rtt();
       } catch (RuntimeException ignored) {
-        // Connection may have closed between dispatch and snapshot.
+        // The connection may have closed since.
       }
     }
-
-    return CallContext.builder(header.service(), header.method())
-        .peer(call.peerId())
+    var d = method.descriptor();
+    return CallContext.builder(call.service().descriptor.name(), d.name())
+        .peer(call.peer())
         .metadata(metadata)
         .attributes(attributes)
-        .deadlineFromRelativeSecs(header.deadline())
-        .streaming(method.descriptor().streaming().name().endsWith("STREAM"))
-        .pattern(method.descriptor().streaming().name().toLowerCase())
-        .idempotent(method.descriptor().idempotent())
+        .deadline(call.deadlineUnixMs() > 0 ? call.deadlineUnixMs() / 1000.0 : null)
+        .sessionId(call.sessionId() == 0 ? null : Integer.toString(call.sessionId()))
+        .streaming(d.streaming().name().endsWith("STREAM"))
+        .pattern(d.streaming().name().toLowerCase())
+        .idempotent(d.idempotent())
         .peerAddr(peerAddr)
         .relayUrl(relayUrl)
         .rtt(rtt)
         .build();
   }
 
-  private void submitResponse(long callId, CallResponse response) {
-    try (Arena arena = Arena.ofConfined()) {
-      MemorySegment respSeg = MemorySegment.NULL;
-      MemorySegment trailerSeg = MemorySegment.NULL;
-      if (response.responseFrame().length > 0) {
-        respSeg = arena.allocate(ValueLayout.JAVA_BYTE, response.responseFrame().length);
-        respSeg.copyFrom(MemorySegment.ofArray(response.responseFrame()));
-      }
-      if (response.trailerFrame().length > 0) {
-        trailerSeg = arena.allocate(ValueLayout.JAVA_BYTE, response.trailerFrame().length);
-        trailerSeg.copyFrom(MemorySegment.ofArray(response.trailerFrame()));
-      }
-      reactor.submit(callId, respSeg, trailerSeg);
+  /** Answer a call with the error {@code t} maps to (a no-op when the call is already over). */
+  private void failWith(long callId, Throwable t) {
+    if (t instanceof RpcError e) {
+      fail(callId, e.code(), e.rpcMessage(), e.details());
+    } else {
+      fail(
+          callId,
+          StatusCode.INTERNAL,
+          t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage(),
+          null);
     }
   }
 
-  private byte[] okTrailerBytes() {
-    byte[] cached = okTrailerBytesCache;
-    if (cached == null) {
-      cached = AsterEnvelope.encodeRpcStatus(RpcStatus.ok());
-      okTrailerBytesCache = cached;
+  private void fail(long callId, StatusCode code, String message, Map<String, String> details) {
+    try {
+      dispatch.respond(callId, null, statusBytes(code, message, details));
+    } catch (IrohException ignored) {
+      // The call ended under us.
     }
-    return cached;
   }
 
-  private void submitErrorTrailer(long callId, StatusCode code, String message) {
-    RpcStatus status =
-        new RpcStatus(code.value(), message == null ? "" : message, List.of(), List.of());
-    byte[] trailerPayload = AsterEnvelope.encodeRpcStatus(status);
-    byte[] trailerFrame = AsterFraming.encodeFrame(trailerPayload, AsterFraming.FLAG_TRAILER);
-    submitResponse(callId, new CallResponse(new byte[0], trailerFrame));
+  static byte[] statusBytes(StatusCode code, String message, Map<String, String> details) {
+    List<String> keys = new ArrayList<>();
+    List<String> values = new ArrayList<>();
+    if (details != null) {
+      for (Map.Entry<String, String> e : details.entrySet()) {
+        keys.add(e.getKey());
+        values.add(e.getValue() == null ? "" : e.getValue());
+      }
+    }
+    return AsterEnvelope.encodeRpcStatus(
+        new RpcStatus(code.value(), message == null ? "" : message, keys, values));
+  }
+
+  private static void closeIfAutoCloseable(Object instance) {
+    if (instance instanceof AutoCloseable closeable) {
+      try {
+        closeable.close();
+      } catch (Exception ignored) {
+        // close hooks must not break the poll loop
+      }
+    }
   }
 
   // ───── Manifest ──────────────────────────────────────────────────────────
@@ -867,7 +620,6 @@ public final class AsterServer implements AutoCloseable {
     private AsterConfig config;
     private Codec codec;
     private final Map<String, RegisteredService> services = new LinkedHashMap<>();
-    private SessionRegistry sessionRegistry = new InMemorySessionRegistry();
     private List<Interceptor> interceptors = List.of();
     private List<String> alpns = List.of(ASTER_ALPN, CONSUMER_ADMISSION_ALPN);
     private int ringCapacity = DEFAULT_RING_CAPACITY;
@@ -882,11 +634,6 @@ public final class AsterServer implements AutoCloseable {
 
     public Builder codec(Codec codec) {
       this.codec = codec;
-      return this;
-    }
-
-    public Builder sessionRegistry(SessionRegistry registry) {
-      this.sessionRegistry = registry;
       return this;
     }
 
@@ -913,8 +660,8 @@ public final class AsterServer implements AutoCloseable {
 
     /**
      * Maximum number of active sessions per inbound QUIC connection (spec §7.5 / §9). When the cap
-     * is reached, further session-create requests from that connection fail with
-     * RESOURCE_EXHAUSTED. Default {@link #DEFAULT_MAX_SESSIONS_PER_CONNECTION}.
+     * is reached, Rust refuses further session-create calls from that connection with {@code
+     * RESOURCE_EXHAUSTED}. Default {@link #DEFAULT_MAX_SESSIONS_PER_CONNECTION}.
      */
     public Builder maxSessionsPerConnection(int max) {
       if (max < 1) {
@@ -924,20 +671,12 @@ public final class AsterServer implements AutoCloseable {
       return this;
     }
 
-    /**
-     * Register a SHARED-scope service instance. The dispatcher for its class must be on the
-     * classpath.
-     */
+    /** Register a SHARED-scope service instance (its generated dispatcher must be on the path). */
     public Builder service(Object instance) {
       return service(instance, findDispatcherFor(instance.getClass()));
     }
 
-    /**
-     * Register a SHARED-scope service instance with an explicit {@link ServiceDispatcher}. Use this
-     * when you want to bypass {@link java.util.ServiceLoader} discovery — typically for auth-mode /
-     * test dispatchers that intentionally aren't published via {@code META-INF/services} to avoid
-     * clashing with a default dispatcher for the same impl class.
-     */
+    /** Register a SHARED-scope service instance with an explicit {@link ServiceDispatcher}. */
     public Builder service(Object instance, ServiceDispatcher dispatcher) {
       if (dispatcher.descriptor().scope() != Scope.SHARED) {
         throw new IllegalArgumentException(
@@ -945,20 +684,16 @@ public final class AsterServer implements AutoCloseable {
                 + dispatcher.descriptor().scope());
       }
       services.put(
-          dispatcher.descriptor().name(),
-          new RegisteredService(dispatcher.descriptor(), dispatcher, instance, null));
+          dispatcher.descriptor().name(), RegisteredService.of(dispatcher, instance, null));
       return this;
     }
 
-    /** Register a SESSION-scope service class with a per-peer factory. */
+    /** Register a SESSION-scope service class with a per-session factory (given the peer id). */
     public Builder sessionService(Class<?> implClass, Function<String, Object> factory) {
       return sessionService(implClass, factory, findDispatcherFor(implClass));
     }
 
-    /**
-     * Register a SESSION-scope service with an explicit {@link ServiceDispatcher}; see {@link
-     * #service(Object, ServiceDispatcher)} for when to prefer the explicit form.
-     */
+    /** Register a SESSION-scope service with an explicit {@link ServiceDispatcher}. */
     public Builder sessionService(
         Class<?> implClass, Function<String, Object> factory, ServiceDispatcher dispatcher) {
       if (dispatcher.descriptor().scope() != Scope.SESSION) {
@@ -966,9 +701,7 @@ public final class AsterServer implements AutoCloseable {
             "sessionService() requires a SESSION-scope service; got "
                 + dispatcher.descriptor().scope());
       }
-      services.put(
-          dispatcher.descriptor().name(),
-          new RegisteredService(dispatcher.descriptor(), dispatcher, null, factory));
+      services.put(dispatcher.descriptor().name(), RegisteredService.of(dispatcher, null, factory));
       return this;
     }
 
@@ -986,32 +719,24 @@ public final class AsterServer implements AutoCloseable {
 
     public CompletableFuture<AsterServer> build() {
       List<byte[]> alpnBytes = alpns.stream().map(s -> s.getBytes(StandardCharsets.UTF_8)).toList();
-
-      // aster_node_start with the full config: relay mode, bind address, secret key / key
-      // file, storage, transports (ABI 3.2). The RPC + admission ALPNs are added on top.
+      // aster_node_start with the full config (ABI 3.2), plus the RPC + admission ALPNs.
       CompletableFuture<IrohNode> nodeFuture = IrohNode.start(config, alpnBytes, null);
-
       Builder self = this;
       return nodeFuture
           .thenApply(
               node -> {
                 try {
-                  Reactor reactor =
-                      new Reactor(node.runtime().nativeHandle(), node.nodeHandle(), ringCapacity);
-                  return new AsterServer(self, node, reactor);
-                } catch (Exception e) {
+                  return self.serve(node);
+                } catch (RuntimeException e) {
                   node.close();
-                  throw new IrohException("Failed to create reactor: " + e.getMessage());
+                  throw new IrohException("Failed to start the dispatch server: " + e.getMessage());
                 }
               })
           .thenCompose(
               server -> {
-                // Publish each registered service's contract collection into a fresh registry
-                // doc. Mirrors Python's AsterServer._publish_contracts so the same consumer-side
-                // tooling (aster contract gen-client, registry shell) works against Java
-                // producers. Non-fatal: on failure we still return the server so local-only use
-                // cases (e.g. tests without docs backing) continue to work.
-                List<site.aster.server.spi.ServiceDispatcher> dispatchers = new ArrayList<>();
+                // Publish each service's contract collection into a fresh registry doc (Python's
+                // AsterServer._publish_contracts). Non-fatal.
+                List<ServiceDispatcher> dispatchers = new ArrayList<>();
                 for (RegisteredService rs : server.services.values()) {
                   dispatchers.add(rs.dispatcher);
                 }
@@ -1025,22 +750,54 @@ public final class AsterServer implements AutoCloseable {
                             server.setPublicationResult(
                                 published.registryNamespace(), published.contractIds());
                           } else if (err != null) {
-                            // Non-fatal: publication is an extra. Tests that spin up without
-                            // docs backing still get a working server.
                             System.err.println(
                                 "AsterServer: contract publication failed (non-fatal): " + err);
-                            err.printStackTrace(System.err);
                           }
                           return server;
                         });
               });
     }
+
+    /** Register every service with Rust and start serving on {@code node}. */
+    private AsterServer serve(IrohNode node) {
+      long rt = node.runtime().nativeHandle();
+      RegisteredService[] byIndex = new RegisteredService[services.size()];
+      try (Dispatch.Builder b = new Dispatch.Builder(rt, node.nodeHandle())) {
+        for (RegisteredService rs : services.values()) {
+          int idx = b.addServiceJson(rs.spec.json());
+          byIndex[idx] = rs;
+        }
+        b.option(Dispatch.OPTION_MAX_SESSIONS_PER_CONNECTION, maxSessionsPerConnection);
+        Dispatch dispatch = b.start(ringCapacity);
+        return new AsterServer(this, node, dispatch, byIndex);
+      }
+    }
   }
 
-  /** Internal binding of a dispatcher to its instance (SHARED) or factory (SESSION). */
+  /**
+   * A dispatcher bound to its instance (SHARED) or factory (SESSION), with its JSON registration
+   * form and its method dispatchers in {@code method_idx} order.
+   */
   private record RegisteredService(
       ServiceDescriptor descriptor,
       ServiceDispatcher dispatcher,
       Object sharedInstance,
-      Function<String, Object> factory) {}
+      Function<String, Object> factory,
+      ContractManifestBuilder.DynamicServiceSpec spec,
+      MethodDispatcher[] methods,
+      String contractId) {
+
+    static RegisteredService of(
+        ServiceDispatcher dispatcher, Object instance, Function<String, Object> factory) {
+      ContractManifestBuilder.DynamicServiceSpec spec =
+          ContractManifestBuilder.dynamicService(dispatcher);
+      Map<String, MethodDispatcher> byName = dispatcher.methods();
+      MethodDispatcher[] methods = new MethodDispatcher[spec.methodNames().size()];
+      for (int i = 0; i < methods.length; i++) {
+        methods[i] = byName.get(spec.methodNames().get(i));
+      }
+      return new RegisteredService(
+          dispatcher.descriptor(), dispatcher, instance, factory, spec, methods, spec.contractId());
+    }
+  }
 }

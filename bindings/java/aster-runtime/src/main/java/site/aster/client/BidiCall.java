@@ -4,23 +4,13 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.Codec;
-import site.aster.ffi.AsterCall;
-import site.aster.ffi.AsterEnvelope;
+import site.aster.ffi.Rpc;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
-import site.aster.server.AsterFraming;
-import site.aster.server.wire.RpcStatus;
 
 /**
  * True interleaved bidi-streaming call. Use when the server emits responses while the client is
- * still sending requests (ping-pong patterns, server-driven backpressure, request-response loops).
- *
- * <p>Wraps an {@link AsterCall} handle from the multiplexed-stream pool: the StreamHeader has
- * already been written by {@link AsterClient#openBidiStream}, and this object drives the
- * request/response frame traffic. On {@link #close}, the underlying stream is released back to the
- * pool (on a clean trailer) or discarded (on any error path).
- *
- * <p>Lifecycle:
+ * still sending requests (ping-pong patterns, request-response loops).
  *
  * <pre>{@code
  * BidiCall<Command, CommandResult> call =
@@ -37,7 +27,8 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
 
   private static final Object END_SENTINEL = new Object();
 
-  private final AsterCall call;
+  private final long runtime;
+  private final long call;
   private final Codec codec;
   private final Class<Resp> responseType;
   private final BlockingQueue<Object> responses = new LinkedBlockingQueue<>();
@@ -46,50 +37,48 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
   private volatile Throwable readerFault;
   private volatile boolean completed = false;
   private volatile boolean cleanTrailer = false;
+  private volatile boolean closed = false;
 
-  /**
-   * Package-private constructor. The caller MUST have already written the StreamHeader frame on
-   * {@code call} before handing it over.
-   */
-  BidiCall(AsterCall call, Codec codec, Class<Resp> responseType) {
+  /** Package-private: {@code call} is an open bidi call ({@code aster_rpc_open}). */
+  BidiCall(long runtime, long call, Codec codec, Class<Resp> responseType) {
+    this.runtime = runtime;
     this.call = call;
     this.codec = codec;
     this.responseType = responseType;
-    this.readerThread = Thread.ofVirtual().name("aster-bidi-reader").start(this::readLoop);
-  }
-
-  /** Send one request frame. Blocks until the underlying QUIC write completes. */
-  public void send(Req request) {
-    byte[] reqBytes = codec.encode(request);
-    byte[] frame = AsterFraming.encodePayloadFrame(reqBytes, (byte) 0);
-    call.sendFrame(frame);
+    this.readerThread =
+        Thread.ofPlatform().daemon(true).name("aster-bidi-reader").start(this::readLoop);
   }
 
   /**
-   * Signal end-of-request. Sends an empty frame with {@link AsterFraming#FLAG_END_STREAM} so the
-   * server's reader closes its per-call request channel. Safe to call at most once.
+   * Send one request. Blocks until the QUIC write completes. A call that is already over (failed,
+   * cancelled, answered) drops the request; {@link #recv} reports why.
    */
+  public void send(Req request) {
+    Rpc.send(runtime, call, codec.encode(request), false);
+  }
+
+  /** Signal end-of-request (an empty end-of-stream frame). Safe to call at most once. */
   public void complete() {
     if (completed) return;
     completed = true;
-    call.sendFrame(AsterFraming.encodeFrame(new byte[0], AsterFraming.FLAG_END_STREAM));
+    Rpc.send(runtime, call, new byte[0], true);
   }
 
   /**
-   * Cancel the call. Sends a {@code FLAG_CANCEL} frame; the caller should still drain {@link #recv}
-   * until it returns {@code null} to pick up any trailing responses + the trailer.
+   * Cancel the call ({@code FLAG_CANCEL} then a reset); {@link #recv} ends with {@code CANCELLED}.
    */
   public void cancel() {
-    call.sendFrame(AsterFraming.encodeFrame(new byte[0], AsterFraming.FLAG_CANCEL));
+    if (!closed) {
+      Rpc.cancel(runtime, call);
+    }
   }
 
   /**
-   * Block until the next response frame arrives or the stream ends. Returns {@code null} on a clean
-   * OK trailer. Throws {@link RpcError} on a non-OK trailer or transport error.
+   * Block until the next response arrives or the stream ends. Returns {@code null} on a clean OK
+   * trailer. Throws {@link RpcError} on a non-OK trailer or transport error.
    */
   public Resp recv() throws InterruptedException {
-    Object item = responses.take();
-    return unwrap(item);
+    return unwrap(responses.take());
   }
 
   /** Test-only hook: poll for a response with a timeout, returning {@code null} on expiry. */
@@ -104,6 +93,7 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
   @SuppressWarnings("unchecked")
   private Resp unwrap(Object item) {
     if (item == END_SENTINEL) {
+      responses.offer(END_SENTINEL); // keep later recv() calls terminal
       if (readerFault != null) {
         throw new RpcError(
             StatusCode.INTERNAL,
@@ -120,40 +110,19 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
   private void readLoop() {
     try {
       while (true) {
-        AsterCall.RecvFrame frame = call.recvFrame(0);
-        if (frame instanceof AsterCall.RecvFrame.EndOfStream) {
-          readerFault = new IllegalStateException("stream ended before trailer");
-          responses.offer(END_SENTINEL);
-          return;
-        }
-        if (frame instanceof AsterCall.RecvFrame.Timeout) {
-          // timeout_ms=0 blocks indefinitely — unreachable in practice.
-          continue;
-        }
-        AsterCall.RecvFrame.Ok ok = (AsterCall.RecvFrame.Ok) frame;
-        byte flags = ok.flags();
-        if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
-          RpcStatus status =
-              ok.payload().length == 0
-                  ? RpcStatus.ok()
-                  : AsterEnvelope.decodeRpcStatus(ok.payload());
-          if (status.code() != RpcStatus.OK) {
-            trailerError =
-                new RpcError(
-                    StatusCode.fromValue(status.code()),
-                    status.message() == null ? "" : status.message());
-          } else {
+        Rpc.Recv r = Rpc.recv(runtime, call, Rpc.TIMEOUT_INFINITE);
+        if (r instanceof Rpc.Recv.Data d) {
+          responses.offer(codec.decode(d.payload(), responseType));
+        } else if (r instanceof Rpc.Recv.Trailer t) {
+          RpcError e = AsterClient.statusError(t.status());
+          if (e == null) {
             cleanTrailer = true;
+          } else {
+            trailerError = e;
           }
           responses.offer(END_SENTINEL);
           return;
         }
-        if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
-          continue;
-        }
-        Object decoded =
-            codec.decode(AsterFraming.payloadOf(ok.payload(), ok.flags()), responseType);
-        responses.offer(decoded);
       }
     } catch (Throwable t) {
       readerFault = t;
@@ -161,13 +130,15 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
     }
   }
 
-  /**
-   * Close the call. Releases the underlying stream back to the pool on a clean trailer; discards it
-   * on any error path so the pool slot is freed without poisoning the next call that might reuse
-   * the stream. Idempotent.
-   */
+  /** Close the call: cancels it if it has not ended, then frees it. Idempotent. */
   @Override
   public void close() {
+    if (closed) {
+      return;
+    }
+    if (!cleanTrailer && trailerError == null) {
+      Rpc.cancel(runtime, call);
+    }
     if (readerThread.isAlive()) {
       try {
         readerThread.join(2_000);
@@ -175,10 +146,7 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
         Thread.currentThread().interrupt();
       }
     }
-    if (cleanTrailer && trailerError == null && readerFault == null) {
-      call.release();
-    } else {
-      call.discard();
-    }
+    closed = true;
+    Rpc.release(runtime, call);
   }
 }

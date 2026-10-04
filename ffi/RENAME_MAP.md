@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x changelog
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x changelog (current: 3.5)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -19,6 +19,84 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 3.5 (additive)
+
+ABI 3.5.0 (tranche F4, additive part) serves bindings' RPC services through
+`aster::rpc::Server` (design `docs/_internal/bindings/dynamic-dispatch-design.md`
+§4.4, as built) and adds a payload-level client over the pooled
+`RpcConnection`. Nothing in 3.0–3.4 changed shape; a 3.4 binding keeps working
+(Go and .NET still use `aster_reactor_*` and the framed `aster_call_*`, which
+stay until 4.0). Sources: `ffi/src/server.rs`, `ffi/src/rpc.rs`; tests:
+`ffi/tests/dispatch_server.rs` (all four patterns, sessions, peer cancel,
+deadlines, `QUEUE_FULL`/reserve, abandon, Gate 3 + attribute bridge, frame
+limits, connection close, non-RPC ALPN, argument validation -- every call
+through the C functions), unit tests in `server.rs`,
+`ffi/tests/abi_contract_test.c`.
+
+**Server.** A binding registers each service as its JSON registration form
+(`DynamicService`, design §1.5); Rust decodes headers, routes, runs Gate 3
+(`requires`, against an attribute store the binding feeds), keeps sessions per
+connection (§7.5 graveyard and cap), enforces deadlines (`min(header, method
+default_timeout, handler cap)`) and per-method frame limits (closing the
+"no frame-limit resolver" gap of `aster_reactor_create`), serves the baseline
+`aster.ops.NodeInfo` (and optionally `aster.net.Topology`), and delivers each
+call that passed as one `CALL` event. Calls are answered by `call_id` with
+payloads and AEv1 `RpcStatus` bytes -- Rust frames, compresses and encodes.
+Response operations never block: `QUEUE_FULL` returns the exact
+`required_len`; `aster_dispatch_reserve` it and retry on
+`RESPONSE_WRITABLE` (the retry cannot be full again). `call_id`s are allocated
+by the server's call table (from 1); a detached call stays there until a
+terminal operation, abandon, peer cancel or its deadline.
+
+**k/v list** (metadata, attributes, `aster_call_options_t.metadata`): `u32 LE
+count`, then per entry `u32 LE key_len`, key, `u32 LE value_len`, value
+(UTF-8); empty = no entries.
+
+| Kind | Name | Notes |
+|---|---|---|
+| type | `aster_server_builder_t`, `aster_server_t` | `uint64_t` handles |
+| enum | `aster_dispatch_event_kind_t` | `CALL`=0, `CANCELLED`=1, `RESPONSE_WRITABLE`=2, `RESPONSE_CLOSED`=3, `SESSION_CLOSED`=4, `CONNECTION_CLOSED`=5, `NON_RPC`=6 |
+| enum | `aster_cancel_reason_t` | `PEER`=0 (no trailer), `DEADLINE`=1 (Rust sent `DEADLINE_EXCEEDED`), `INVALID_REQUEST`=2 (Rust sent `INVALID_ARGUMENT`) |
+| enum | `aster_method_pattern_t` | `UNARY`=0, `SERVER_STREAM`=1, `CLIENT_STREAM`=2, `BIDI_STREAM`=3 |
+| enum | `aster_server_option_t` | `BUILTIN_NODE_INFO`=1 (0/1, default 1), `BUILTIN_TOPOLOGY`=2 (0/1, default 0), `MAX_SESSIONS_PER_CONNECTION`=3 (default 1024), `HANDLER_TIMEOUT_MS`=4 (default 300000; 0 = no cap) |
+| macro | `ASTER_DISPATCH_FLAG_FIRST_IS_END` (1), `_NEW_SESSION` (2), `_IROH_AUTHENTICATED` (4), `_HAS_METADATA` (0x100), `_HAS_ATTRIBUTES` (0x200) | `aster_dispatch_event_t.flags` |
+| macro | `ASTER_TIMEOUT_INFINITE` (`0xffffffff`) | `timeout_ms` of `aster_dispatch_recv` / `aster_call_recv_payload` |
+| struct | `aster_dispatch_event_t` (104 B) | `kind:u8, pattern:u8, reason:u8, _p0, flags:u32, call_id, service_idx:u32, method_idx:u32, session_key, connection_id, connection_handle, deadline_unix_ms:i64, wire_call_id:i32, session_id:u32, request_ptr, request_len:u32, _p2, peer_ptr, peer_len:u32, _p3, buffer`. `request` + `peer` live in one lease, `buffer`. `CALL`: `connection_handle` is borrowed (same for every call of the connection; freed by the server on close). `NON_RPC`: `request` = the ALPN, `connection_handle` is **owned** (free with `aster_connection_free`) |
+| struct | `aster_call_options_t` (72 B) | `struct_size, version:i32, service, method, metadata (k/v list), session_id:u32, deadline_ms:u32, serialization_mode:i32 (0 XLANG, 1 NATIVE, 2 ROW), wire_call_id:i32`. The deadline is enforced client-side and sent as whole seconds, rounded up |
+| function | `aster_server_builder_new(rt, node, out)` | over a node from `aster_node_start` (`aster/1` among its ALPNs); Gate 0 stays the node's |
+| function | `aster_server_add_service_json(builder, json, len, uint32_t* out_idx)` | parsed + validated (`DynamicService::from_json`; unknown keys refused); duplicate `(name, version)` → `INVALID_ARGUMENT`; `out_idx` = `service_idx` |
+| function | `aster_server_set_option(builder, key, value)` | unknown key / bad value → `INVALID_ARGUMENT` |
+| function | `aster_server_start(rt, builder, ring_capacity, out)` | consumes the builder; ring rounded up to a power of two (0 = 256); a collision with a baseline service → `INVALID_ARGUMENT` |
+| function | `aster_server_builder_free(builder)` | for a builder never started |
+| function | `aster_server_poll(rt, server, events, max, timeout_ms)` | returns the count; `timeout_ms` 0 = no wait; single consumer; parks on a condvar (no spinning) |
+| function | `aster_dispatch_respond(rt, server, call_id, payload, len, status_aev1, status_len, uint64_t* out_required_len)` | terminal data + trailer in one write (unary / client-stream); NULL status = OK; `QUEUE_FULL` / `NOT_FOUND` (call over) / `ALREADY_CLOSED` (connection gone) / `INVALID_ARGUMENT` (malformed status, too large) |
+| function | `aster_dispatch_send(…, call_id, payload, len, out_required_len)` | one data frame; payload non-empty |
+| function | `aster_dispatch_finish(…, call_id, status_aev1, len, out_required_len)` | trailer; NULL = OK |
+| function | `aster_dispatch_reserve(…, call_id, required_len)` / `aster_dispatch_cancel_reservation(…, call_id)` | one reservation per call (a second → `INVALID_ARGUMENT`) |
+| function | `aster_dispatch_recv(…, call_id, timeout_ms, out_ptr, out_len, uint64_t* out_buffer)` | next request payload, decompressed: `OK` + buffer ≠ 0 = payload, `OK` + buffer 0 = end of stream, `TIMEOUT`, `NOT_FOUND` = call over. Blocks |
+| function | `aster_dispatch_is_cancelled(…, call_id)` | 0 live; 1 cancelled, finished or unknown |
+| function | `aster_dispatch_metadata` / `aster_dispatch_attributes(…, call_id, out_ptr, out_len, out_buffer)` | k/v lists (attributes = what Gate 3 saw, sorted) |
+| function | `aster_dispatch_abandon(…, call_id)` | `INTERNAL "handler dropped call"` unless already ended (`NOT_FOUND`) |
+| function | `aster_dispatch_buffer_release(rt, server, buffer)` | event / recv / metadata leases; 0 = no-op |
+| function | `aster_server_set_peer_attributes(server, peer, len, kv, kv_len)` | attribute bridge (design §2.6): what Gate 3 sees for a peer; empty clears |
+| function | `aster_server_live_calls(server)` | diagnostics |
+| function | `aster_server_destroy(rt, server)` | stops serving; queued events' calls are abandoned; does not close the node |
+| function | `aster_dynamic_service_contract_id(json, len, aster_bytes_t* out)` | `contract_id` of a JSON registration form (free with `aster_string_release`) |
+| function | `aster_rpc_unary(rt, conn, const aster_call_options_t*, req, len, out_resp_ptr, out_resp_len, out_resp_buffer, int32_t* out_status_code, out_status_ptr, out_status_len, out_status_buffer)` | pooled; one write of header + request. Returns `OK` once the call is over: code 0 + response, or the failure's code + AEv1 status (deadline → `DEADLINE_EXCEEDED`, lost connection / pool timeout → `UNAVAILABLE`). Buffers released with `aster_call_buffer_release` |
+| function | `aster_rpc_open(rt, conn, uint8_t pattern, opts, aster_call_t* out)` | server-, client- or bidi-stream; server-stream sends header + request together on the first send |
+| function | `aster_call_send_payload(rt, call, payload, len, uint8_t end_stream)` | empty + end = finish; `ALREADY_CLOSED` when the call is over (the trailer says why) |
+| function | `aster_call_send_payloads(rt, call, const aster_bytes_t* payloads, count, end_stream)` | client-stream / bidi: several payloads framed into as few writes as possible (64 KiB batches) |
+| function | `aster_call_recv_payload(rt, call, timeout_ms, out_ptr, out_len, out_buffer, uint8_t* out_is_trailer)` | payload, or the trailer = AEv1 `RpcStatus` (code 0 on success; client-side failures included); `TIMEOUT` resumes the same read; after the trailer `ALREADY_CLOSED` |
+| function | `aster_call_cancel(rt, call)` | `FLAG_CANCEL` + reset; a blocked recv returns `CANCELLED` |
+| function | `aster_connection_next_session_id(rt, conn, uint32_t* out)` | from the connection's shared core counter (Rust and binding clients never collide) |
+
+Behaviour change (no signature change): `aster_call_release` / `aster_call_discard`
+also free `aster_rpc_open` calls (an unfinished one is cancelled).
+
+**Deprecated (removal in 4.0, with .NET and Go ported):**
+`aster_reactor_{create,destroy,poll,submit,submit_frame,submit_trailer,recv_frame,check_cancelled,buffer_release,reserve_response_capacity,cancel_response_reservation,accept_non_rpc}`,
+`aster_reactor_call_t`, and the framed `aster_call_{acquire,acquire_streaming,send_frame,recv_frame,unary}`.
 
 ## New in 3.4 (additive)
 

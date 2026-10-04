@@ -7,19 +7,11 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 import site.aster.ffi.*;
 
 public class IrohConnection extends IrohHandle {
 
   private final IrohRuntime runtime;
-
-  /**
-   * Monotonic per-connection session-id allocator (spec §6). Starts at 0. {@link #nextSessionId()}
-   * returns {@code counter.incrementAndGet()}, so the first session is {@code 1}, the second {@code
-   * 2}, and so on — {@code 0} is reserved for the SHARED (stateless) pool.
-   */
-  private final AtomicInteger sessionIdAllocator = new AtomicInteger(0);
 
   public IrohConnection(IrohRuntime runtime, long handle) {
     super(handle);
@@ -27,12 +19,12 @@ public class IrohConnection extends IrohHandle {
   }
 
   /**
-   * Allocate the next session id on this connection. Guaranteed monotonic and non-zero. The spec
-   * requires a {@code u32}; Java's signed {@code int} gives 2^31 - 1 values before wraparound,
-   * which is well beyond any realistic workload.
+   * Allocate the next session id on this connection from the connection's shared counter in Rust
+   * ({@code aster_connection_next_session_id}), so every client on the connection — Java or Rust —
+   * gets distinct, monotonic, non-zero ids.
    */
   public int nextSessionId() {
-    return sessionIdAllocator.incrementAndGet();
+    return site.aster.ffi.Rpc.nextSessionId(runtime.nativeHandle(), nativeHandle());
   }
 
   @Override
@@ -348,9 +340,9 @@ public class IrohConnection extends IrohHandle {
 
   /**
    * Snapshot the selected QUIC path for an {@code aster_connection_t} handle directly. Used by
-   * callers that hold a borrowed handle (e.g. {@link
-   * site.aster.server.AsterCall#connectionHandle()} delivered by the reactor) and don't want to
-   * construct a transient {@link IrohConnection} wrapper just to read the snapshot.
+   * callers that hold a borrowed handle (e.g. the {@code connection_handle} of a dispatch {@code
+   * CALL} event) and don't want to construct a transient {@link IrohConnection} wrapper just to
+   * read the snapshot.
    */
   public static TransportSnapshot transportSnapshot(IrohRuntime runtime, long connectionHandle) {
     var lib = IrohLibrary.getInstance();

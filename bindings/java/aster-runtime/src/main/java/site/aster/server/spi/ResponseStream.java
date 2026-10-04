@@ -2,7 +2,7 @@ package site.aster.server.spi;
 
 /**
  * Sink for response frames on a streaming dispatch. The dispatcher pushes already-encoded bytes;
- * the runtime is responsible for framing and submission to the reactor.
+ * the runtime submits them to the dispatch server, which frames them.
  *
  * <p>All methods are blocking. Generated dispatcher code runs on a virtual thread, so blocking is
  * cheap. Implementations MUST be safe for sequential single-threaded use by one dispatcher at a

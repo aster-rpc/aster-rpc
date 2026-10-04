@@ -91,6 +91,60 @@ public final class ContractManifestBuilder {
       byte[] manifestJsonBytes,
       ContractManifest manifest) {}
 
+  /**
+   * A service lowered to the dynamic-dispatch registration form (design §1.5): the JSON {@code
+   * aster_server_add_service_json} takes, the method names in {@code method_idx} order, and the
+   * contract id Java computed for the same contract (Rust derives the same id from the JSON).
+   */
+  public record DynamicServiceSpec(String json, List<String> methodNames, String contractId) {}
+
+  /**
+   * Lower {@code dispatcher} to its JSON registration form: name, version, scope, service and
+   * method {@code requires}, and per method the pattern, request / response type hashes (from
+   * {@link TypeGraphWalker}) and idempotency. Methods are listed in NFC name order, the order the
+   * contract commits to; {@link DynamicServiceSpec#methodNames()} maps a {@code method_idx} back.
+   */
+  public static DynamicServiceSpec dynamicService(ServiceDispatcher dispatcher) {
+    CompileResult cr = compile(dispatcher);
+    ServiceContract c = cr.contract();
+    Map<String, Object> svc = new LinkedHashMap<>();
+    svc.put("name", c.name());
+    svc.put("version", c.version());
+    svc.put("scope", c.scoped().wire());
+    if (c.requires() != null) {
+      svc.put("requires", requirementJson(c.requires()));
+    }
+    svc.put("serialization_modes", c.serializationModes());
+    List<Map<String, Object>> methods = new ArrayList<>();
+    List<String> names = new ArrayList<>();
+    for (MethodDef m : c.methods()) {
+      Map<String, Object> md = new LinkedHashMap<>();
+      md.put("name", m.name());
+      md.put("pattern", m.pattern().wire());
+      md.put("request", Map.of("hash", m.requestType()));
+      md.put("response", Map.of("hash", m.responseType()));
+      md.put("idempotent", m.idempotent());
+      if (m.defaultTimeout() > 0.0) {
+        md.put("default_timeout", m.defaultTimeout());
+      }
+      if (m.requires() != null) {
+        md.put("requires", requirementJson(m.requires()));
+      }
+      methods.add(md);
+      names.add(m.name());
+    }
+    svc.put("methods", methods);
+    return new DynamicServiceSpec(
+        ContractJson.toJson(svc), List.copyOf(names), cr.manifest().contractId());
+  }
+
+  private static Map<String, Object> requirementJson(CapabilityRequirement r) {
+    Map<String, Object> out = new LinkedHashMap<>();
+    out.put("kind", r.kind().wire());
+    out.put("roles", r.roles());
+    return out;
+  }
+
   private record CompileResult(
       ContractManifest manifest,
       ServiceContract contract,

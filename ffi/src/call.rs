@@ -440,6 +440,10 @@ pub unsafe extern "C" fn aster_call_recv_frame(
 #[no_mangle]
 pub unsafe extern "C" fn aster_call_release(runtime: aster_runtime_t, call: aster_call_t) -> i32 {
     let _ = runtime;
+    // ABI 3.5: also frees `aster_rpc_open` calls (cancelling unfinished ones).
+    if crate::rpc::release(call) {
+        return aster_status_t::ASTER_STATUS_OK as i32;
+    }
     match CALLS.remove(call) {
         Some(state) => {
             // Drop the stream. For Pooled, RAII returns the stream to
@@ -465,6 +469,10 @@ pub unsafe extern "C" fn aster_call_release(runtime: aster_runtime_t, call: aste
 #[no_mangle]
 pub unsafe extern "C" fn aster_call_discard(runtime: aster_runtime_t, call: aster_call_t) -> i32 {
     let _ = runtime;
+    // ABI 3.5: an `aster_rpc_open` call is freed exactly as by release.
+    if crate::rpc::release(call) {
+        return aster_status_t::ASTER_STATUS_OK as i32;
+    }
     match CALLS.remove(call) {
         Some(state) => {
             if let Some(stream) = state.stream.lock().unwrap().take() {

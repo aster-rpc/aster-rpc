@@ -678,6 +678,50 @@ impl AsterServerBuilder {
     }
 }
 
+/// Binding support: the baseline services [`AsterServerBuilder`] registers,
+/// for bindings that serve on a node they started themselves (the C ABI's
+/// `aster_server_*`), through [`Server::new`]. Not part of the stable API.
+#[cfg(feature = "binding-support")]
+impl Server {
+    /// Serve `aster.ops.NodeInfo` for `node` (what
+    /// [`AsterServerBuilder::builtin_node_info`] does), optionally behind a
+    /// service-wide requirement. Returns the handle that updates the served
+    /// identity live.
+    #[doc(hidden)]
+    pub fn with_builtin_node_info(
+        self,
+        node: &Node,
+        identity: NodeIdentity,
+        requires: Option<CapabilityRequirement>,
+    ) -> (Self, NodeIdentityHandle) {
+        let mut identity = identity;
+        identity.node_id = node.id().to_string();
+        let handle = NodeIdentityHandle::new(identity);
+        let server = self.register_arc(Arc::new(RequireGuard {
+            inner: NodeInfoServer::new(LiveNodeInfo {
+                handle: handle.clone(),
+            }),
+            requires,
+        }));
+        (server, handle)
+    }
+
+    /// Serve `aster.net.Topology` for `node` (what
+    /// [`AsterServerBuilder::builtin_topology`] does). Its views stay empty
+    /// unless the node was started with monitoring.
+    #[doc(hidden)]
+    pub fn with_builtin_topology(
+        self,
+        node: &Node,
+        requires: Option<CapabilityRequirement>,
+    ) -> Self {
+        self.register_arc(Arc::new(RequireGuard {
+            inner: TopologyServer::new(LiveTopology { core: node.core() }),
+            requires,
+        }))
+    }
+}
+
 /// Run the §7.2 start corridor for a configured voter.
 ///
 /// A free function rather than an inline block so the one identity failure has

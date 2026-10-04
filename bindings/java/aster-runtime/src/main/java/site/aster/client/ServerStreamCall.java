@@ -4,25 +4,17 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.Codec;
-import site.aster.ffi.AsterCall;
-import site.aster.ffi.AsterEnvelope;
+import site.aster.ffi.Rpc;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
-import site.aster.server.AsterFraming;
-import site.aster.server.wire.RpcStatus;
 
 /**
- * Incremental server-streaming call. The client has already sent its single request (with {@link
- * AsterFraming#FLAG_END_STREAM}) and now reads response frames one at a time via {@link #recv()}
- * until the server writes a trailer.
+ * Incremental server-streaming call. The client has already sent its single request and now reads
+ * responses one at a time via {@link #recv()} until the trailer.
  *
- * <p>Contrast with {@link AsterClient#callServerStream} which buffers the full response list into a
- * {@link java.util.concurrent.CompletableFuture} and is only usable for FINITE streams that
- * terminate with a trailer. Use this class when the server produces an open-ended stream (e.g. a
- * log tail) and the caller wants to break out after a few entries without waiting for a trailer
- * that may never arrive.
- *
- * <p>Lifecycle:
+ * <p>Contrast with {@link AsterClient#callServerStream}, which buffers the whole list and only
+ * suits FINITE streams. Use this class for open-ended streams (e.g. a log tail) where the caller
+ * stops early.
  *
  * <pre>{@code
  * try (ServerStreamCall<LogEntry> call =
@@ -30,14 +22,15 @@ import site.aster.server.wire.RpcStatus;
  *                             new TailRequest("", "info"), LogEntry.class).get()) {
  *   LogEntry entry = call.recv();           // block for first entry
  *   // ...decide to stop early...
- * }   // close() discards the underlying stream; reader thread unwinds
+ * }   // close() cancels the call if it has not ended
  * }</pre>
  */
 public final class ServerStreamCall<Resp> implements AutoCloseable {
 
   private static final Object END_SENTINEL = new Object();
 
-  private final AsterCall call;
+  private final long runtime;
+  private final long call;
   private final Codec codec;
   private final Class<Resp> responseType;
   private final BlockingQueue<Object> responses = new LinkedBlockingQueue<>();
@@ -45,50 +38,41 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   private volatile RpcError trailerError;
   private volatile Throwable readerFault;
   private volatile boolean cleanTrailer = false;
+  private volatile boolean closed = false;
 
-  /**
-   * Package-private constructor. The caller MUST have already written the StreamHeader and the
-   * single request frame (with {@link AsterFraming#FLAG_END_STREAM}) on {@code call}.
-   */
-  ServerStreamCall(AsterCall call, Codec codec, Class<Resp> responseType) {
+  /** Package-private: the request has been sent on {@code call} ({@code aster_rpc_open}). */
+  ServerStreamCall(long runtime, long call, Codec codec, Class<Resp> responseType) {
+    this.runtime = runtime;
     this.call = call;
     this.codec = codec;
     this.responseType = responseType;
-    this.readerThread = Thread.ofVirtual().name("aster-server-stream-reader").start(this::readLoop);
+    // The read blocks in native code: a platform thread keeps virtual-thread carriers free.
+    this.readerThread =
+        Thread.ofPlatform().daemon(true).name("aster-server-stream-reader").start(this::readLoop);
   }
 
   /**
-   * Block until the next response frame arrives or the stream ends. Returns {@code null} on a clean
-   * OK trailer. Throws {@link RpcError} on a non-OK trailer or transport error.
+   * Block until the next response arrives or the stream ends. Returns {@code null} on a clean OK
+   * trailer. Throws {@link RpcError} on a non-OK trailer or transport error.
    */
   public Resp recv() throws InterruptedException {
     return unwrap(responses.take());
   }
 
-  /**
-   * Poll for a response with a timeout. Returns {@code null} on expiry OR on clean end-of-stream;
-   * callers distinguish the two via {@link #isComplete()} after a null return.
-   */
+  /** Poll with a timeout: {@code null} on expiry OR clean end ({@link #isComplete()} tells). */
   public Resp recvWithTimeout(long timeout, TimeUnit unit) throws InterruptedException {
     Object item = responses.poll(timeout, unit);
     if (item == null) return null;
     return unwrap(item);
   }
 
-  /**
-   * Send a {@link AsterFraming#FLAG_CANCEL} frame. Spec §5.6 leaves handling up to the server — in
-   * particular, the Python server ignores CANCEL on non-session streams. {@link #close} drops the
-   * stream regardless, which is the portable way to stop an open-ended server stream.
-   */
+  /** Cancel the call ({@code FLAG_CANCEL} then a reset); the reader ends with {@code CANCELLED}. */
   public void cancel() {
-    try {
-      call.sendFrame(AsterFraming.encodeFrame(new byte[0], AsterFraming.FLAG_CANCEL));
-    } catch (Throwable ignored) {
-      // best-effort; close() will poison the stream either way
+    if (!closed) {
+      Rpc.cancel(runtime, call);
     }
   }
 
-  /** True once the reader has observed a clean OK trailer. */
   public boolean isComplete() {
     return cleanTrailer;
   }
@@ -96,6 +80,7 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   @SuppressWarnings("unchecked")
   private Resp unwrap(Object item) {
     if (item == END_SENTINEL) {
+      responses.offer(END_SENTINEL); // keep later recv() calls terminal
       if (readerFault != null) {
         throw new RpcError(
             StatusCode.INTERNAL,
@@ -112,61 +97,34 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   private void readLoop() {
     try {
       while (true) {
-        AsterCall.RecvFrame frame = call.recvFrame(0);
-        if (frame instanceof AsterCall.RecvFrame.EndOfStream) {
-          readerFault = new IllegalStateException("stream ended before trailer");
-          responses.offer(END_SENTINEL);
-          return;
-        }
-        if (frame instanceof AsterCall.RecvFrame.Timeout) {
-          // timeout_ms=0 blocks indefinitely — unreachable in practice.
-          continue;
-        }
-        AsterCall.RecvFrame.Ok ok = (AsterCall.RecvFrame.Ok) frame;
-        byte flags = ok.flags();
-        if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
-          RpcStatus status =
-              ok.payload().length == 0
-                  ? RpcStatus.ok()
-                  : AsterEnvelope.decodeRpcStatus(ok.payload());
-          if (status.code() != RpcStatus.OK) {
-            trailerError =
-                new RpcError(
-                    StatusCode.fromValue(status.code()),
-                    status.message() == null ? "" : status.message());
-          } else {
+        Rpc.Recv r = Rpc.recv(runtime, call, Rpc.TIMEOUT_INFINITE);
+        if (r instanceof Rpc.Recv.Data d) {
+          responses.offer(codec.decode(d.payload(), responseType));
+        } else if (r instanceof Rpc.Recv.Trailer t) {
+          RpcError e = AsterClient.statusError(t.status());
+          if (e == null) {
             cleanTrailer = true;
+          } else {
+            trailerError = e;
           }
           responses.offer(END_SENTINEL);
           return;
         }
-        if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
-          continue;
-        }
-        Object decoded =
-            codec.decode(AsterFraming.payloadOf(ok.payload(), ok.flags()), responseType);
-        responses.offer(decoded);
       }
     } catch (Throwable t) {
-      // Normal when close() discards the stream underneath us — swallow so the shutdown path
-      // stays clean.
       readerFault = t;
       responses.offer(END_SENTINEL);
     }
   }
 
-  /**
-   * Close the call. Returns the underlying stream to the pool on a clean trailer; discards it on
-   * any error/early-exit path so the pool slot is freed. Discarding also tears down the QUIC
-   * stream, which is what actually stops an open-ended server generator (CANCEL alone isn't enough
-   * — see spec §5.6 / Python server).
-   */
+  /** Close the call: cancels it if it has not ended, then frees it. Idempotent. */
   @Override
   public void close() {
-    if (!cleanTrailer) {
-      // Early exit path: discard first so the reader's next recvFrame unblocks with an error,
-      // then join the thread so it doesn't outlive us.
-      call.discard();
+    if (closed) {
+      return;
+    }
+    if (!cleanTrailer && trailerError == null) {
+      Rpc.cancel(runtime, call);
     }
     if (readerThread.isAlive()) {
       try {
@@ -175,8 +133,7 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
         Thread.currentThread().interrupt();
       }
     }
-    if (cleanTrailer && trailerError == null && readerFault == null) {
-      call.release();
-    }
+    closed = true;
+    Rpc.release(runtime, call);
   }
 }

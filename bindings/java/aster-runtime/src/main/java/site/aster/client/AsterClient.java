@@ -12,8 +12,8 @@ import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
 import site.aster.config.AsterConfig;
 import site.aster.config.AsterIdentity;
-import site.aster.ffi.AsterCall;
 import site.aster.ffi.AsterEnvelope;
+import site.aster.ffi.Rpc;
 import site.aster.handle.IrohConnection;
 import site.aster.handle.IrohEndpoint;
 import site.aster.interceptors.Interceptor;
@@ -21,10 +21,8 @@ import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
 import site.aster.node.NodeAddr;
 import site.aster.registry.ServiceSummary;
-import site.aster.server.AsterFraming;
 import site.aster.server.AsterServer;
 import site.aster.server.wire.RpcStatus;
-import site.aster.server.wire.StreamHeader;
 import site.aster.trust.ConsumerAdmissionClient;
 import site.aster.trust.ConsumerAdmissionHandler;
 import site.aster.trust.ConsumerAdmissionWire;
@@ -34,11 +32,10 @@ import site.aster.trust.ConsumerAdmissionWire;
  * connection cache keyed by peer id, a {@link Codec} for request/response serialization, and an
  * interceptor chain.
  *
- * <p>All outbound calls flow through the multiplexed-streams primitive ({@code aster_call_*}): each
- * call acquires a handle from the connection's per-connection pool (spec §8), sends framed request
- * bytes, drains the response frames through the trailer, and releases the handle so the underlying
- * stream returns to the pool. The framing state machine lives in {@code core}; this class is a thin
- * shim.
+ * <p>All outbound calls go through Rust's pooled {@code RpcConnection} (C ABI 3.5, {@link Rpc}):
+ * unary calls in one native round trip on the connection's pooled streams, streaming calls on
+ * dedicated substreams. Rust builds the header, frames, compresses and decodes trailers; this class
+ * encodes payloads and maps statuses to {@link RpcError}.
  */
 public final class AsterClient implements AutoCloseable {
 
@@ -232,21 +229,25 @@ public final class AsterClient implements AutoCloseable {
       String method,
       Req request,
       Class<Resp> responseType) {
-    AsterCall call = acquireStreamingOn(conn);
+    long rt = conn.runtime().nativeHandle();
+    long call =
+        Rpc.open(
+            rt,
+            conn.nativeHandle(),
+            Rpc.PATTERN_SERVER_STREAM,
+            Rpc.Options.of(service, method, sessionId));
     try {
-      sendStreamHeader(call, sessionId, service, method);
-      byte[] reqBytes = codec.encode(request);
-      call.sendFrame(AsterFraming.encodePayloadFrame(reqBytes, AsterFraming.FLAG_END_STREAM));
+      Rpc.send(rt, call, codec.encode(request), true);
     } catch (Throwable t) {
-      call.discard();
+      Rpc.release(rt, call);
       throw reThrow(t);
     }
-    return new ServerStreamCall<>(call, codec, responseType);
+    return new ServerStreamCall<>(rt, call, codec, responseType);
   }
 
   /**
-   * Make a client-streaming RPC call: N request frames out (last marked with {@link
-   * AsterFraming#FLAG_END_STREAM}), one response frame in, then a {@code TRAILER}. Buffered shape.
+   * Make a client-streaming RPC call: N requests out (the last ends the request stream), one
+   * response in, then the trailer. Buffered shape.
    */
   public <Req, Resp> CompletableFuture<Resp> callClientStream(
       NodeAddr target,
@@ -303,14 +304,14 @@ public final class AsterClient implements AutoCloseable {
 
   <Req, Resp> BidiCall<Req, Resp> openBidiStreamOn(
       IrohConnection conn, int sessionId, String service, String method, Class<Resp> responseType) {
-    AsterCall call = acquireStreamingOn(conn);
-    try {
-      sendStreamHeader(call, sessionId, service, method);
-    } catch (Throwable t) {
-      call.discard();
-      throw reThrow(t);
-    }
-    return new BidiCall<Req, Resp>(call, codec, responseType);
+    long rt = conn.runtime().nativeHandle();
+    long call =
+        Rpc.open(
+            rt,
+            conn.nativeHandle(),
+            Rpc.PATTERN_BIDI_STREAM,
+            Rpc.Options.of(service, method, sessionId));
+    return new BidiCall<Req, Resp>(rt, call, codec, responseType);
   }
 
   <Req, Resp> CompletableFuture<Resp> runUnary(
@@ -324,43 +325,25 @@ public final class AsterClient implements AutoCloseable {
     callExecutor.execute(
         () -> {
           try {
-            byte[] headerBytes =
-                AsterEnvelope.encodeStreamHeader(buildStreamHeader(sessionId, service, method));
-            byte[] headerFrame = AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER);
             byte[] requestBytes = codec.encode(request);
-            byte[] requestFrame =
-                AsterFraming.encodePayloadFrame(requestBytes, AsterFraming.FLAG_END_STREAM);
-            byte[] requestPair = new byte[headerFrame.length + requestFrame.length];
-            System.arraycopy(headerFrame, 0, requestPair, 0, headerFrame.length);
-            System.arraycopy(requestFrame, 0, requestPair, headerFrame.length, requestFrame.length);
-
             long probeT0 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
-            AsterCall.UnaryResult result =
-                AsterCall.unary(
-                    conn.runtime().nativeHandle(), conn.nativeHandle(), sessionId, requestPair);
+            Rpc.UnaryResult result =
+                Rpc.unary(
+                    conn.runtime().nativeHandle(),
+                    conn.nativeHandle(),
+                    Rpc.Options.of(service, method, sessionId),
+                    requestBytes);
             if (site.aster.probe.AsterProbes.ENABLED) {
               site.aster.probe.AsterProbes.recordClient(probeT0, System.nanoTime());
             }
-
-            // Decode trailer first; non-OK status surfaces as RpcError.
-            RpcStatus status =
-                result.trailerPayload().length == 0
-                    ? RpcStatus.ok()
-                    : AsterEnvelope.decodeRpcStatus(result.trailerPayload());
-            if (status.code() != RpcStatus.OK) {
-              throw new RpcError(
-                  StatusCode.fromValue(status.code()),
-                  status.message() == null ? "" : status.message());
+            if (result.code() != RpcStatus.OK) {
+              throw rpcError(result.status());
             }
-            if (result.responsePayload() == null) {
+            if (result.payload().length == 0) {
               throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
             }
             @SuppressWarnings("unchecked")
-            Resp decoded =
-                (Resp)
-                    codec.decode(
-                        AsterFraming.payloadOf(result.responsePayload(), result.responseFlags()),
-                        responseType);
+            Resp decoded = (Resp) codec.decode(result.payload(), responseType);
             out.complete(decoded);
           } catch (Throwable t) {
             out.completeExceptionally(unwrap(t));
@@ -379,20 +362,21 @@ public final class AsterClient implements AutoCloseable {
     CompletableFuture<List<Resp>> out = new CompletableFuture<>();
     callExecutor.execute(
         () -> {
-          AsterCall call = null;
+          long rt = conn.runtime().nativeHandle();
+          long call = 0;
           try {
-            call = acquireStreamingOn(conn);
-            sendStreamHeader(call, sessionId, service, method);
-            byte[] requestBytes = codec.encode(request);
-            call.sendFrame(
-                AsterFraming.encodePayloadFrame(requestBytes, AsterFraming.FLAG_END_STREAM));
-            List<Resp> collected = drainStreaming(call, responseType);
-            call.release();
-            call = null;
-            out.complete(collected);
+            call =
+                Rpc.open(
+                    rt,
+                    conn.nativeHandle(),
+                    Rpc.PATTERN_SERVER_STREAM,
+                    Rpc.Options.of(service, method, sessionId));
+            Rpc.send(rt, call, codec.encode(request), true);
+            out.complete(drain(rt, call, responseType));
           } catch (Throwable t) {
-            if (call != null) call.discard();
             out.completeExceptionally(unwrap(t));
+          } finally {
+            if (call != 0) Rpc.release(rt, call);
           }
         });
     return out;
@@ -408,22 +392,27 @@ public final class AsterClient implements AutoCloseable {
     CompletableFuture<Resp> out = new CompletableFuture<>();
     callExecutor.execute(
         () -> {
-          AsterCall call = null;
+          long rt = conn.runtime().nativeHandle();
+          long call = 0;
           try {
-            call = acquireStreamingOn(conn);
-            sendStreamHeader(call, sessionId, service, method);
-            for (int i = 0; i < requests.size(); i++) {
-              byte[] reqBytes = codec.encode(requests.get(i));
-              byte flags = (i == requests.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
-              call.sendFrame(AsterFraming.encodePayloadFrame(reqBytes, flags));
+            call =
+                Rpc.open(
+                    rt,
+                    conn.nativeHandle(),
+                    Rpc.PATTERN_CLIENT_STREAM,
+                    Rpc.Options.of(service, method, sessionId));
+            sendAll(rt, call, requests);
+            List<Resp> responses = drain(rt, call, responseType);
+            if (responses.size() != 1) {
+              throw new RpcError(
+                  StatusCode.INTERNAL,
+                  "client-stream call received " + responses.size() + " response frames");
             }
-            UnaryResult<Resp> result = drainUnary(call, responseType);
-            call.release();
-            call = null;
-            out.complete(result.value());
+            out.complete(responses.get(0));
           } catch (Throwable t) {
-            if (call != null) call.discard();
             out.completeExceptionally(unwrap(t));
+          } finally {
+            if (call != 0) Rpc.release(rt, call);
           }
         });
     return out;
@@ -439,22 +428,21 @@ public final class AsterClient implements AutoCloseable {
     CompletableFuture<List<Resp>> out = new CompletableFuture<>();
     callExecutor.execute(
         () -> {
-          AsterCall call = null;
+          long rt = conn.runtime().nativeHandle();
+          long call = 0;
           try {
-            call = acquireStreamingOn(conn);
-            sendStreamHeader(call, sessionId, service, method);
-            for (int i = 0; i < requests.size(); i++) {
-              byte[] reqBytes = codec.encode(requests.get(i));
-              byte flags = (i == requests.size() - 1) ? AsterFraming.FLAG_END_STREAM : 0;
-              call.sendFrame(AsterFraming.encodePayloadFrame(reqBytes, flags));
-            }
-            List<Resp> collected = drainStreaming(call, responseType);
-            call.release();
-            call = null;
-            out.complete(collected);
+            call =
+                Rpc.open(
+                    rt,
+                    conn.nativeHandle(),
+                    Rpc.PATTERN_BIDI_STREAM,
+                    Rpc.Options.of(service, method, sessionId));
+            sendAll(rt, call, requests);
+            out.complete(drain(rt, call, responseType));
           } catch (Throwable t) {
-            if (call != null) call.discard();
             out.completeExceptionally(unwrap(t));
+          } finally {
+            if (call != 0) Rpc.release(rt, call);
           }
         });
     return out;
@@ -464,119 +452,72 @@ public final class AsterClient implements AutoCloseable {
   // Shared helpers
   // -------------------------------------------------------------------------
 
-  private AsterCall acquireOn(IrohConnection conn, int sessionId) {
-    // Spec §6: sessionId == 0 selects the SHARED pool for stateless calls; non-zero acquires
-    // from (or lazily creates) the per-session pool keyed on this id.
-    return AsterCall.acquire(conn.runtime().nativeHandle(), conn.nativeHandle(), sessionId);
-  }
+  /** Requests per {@link Rpc#sendMany} batch (bounds the native copy). */
+  private static final int SEND_BATCH = 256;
 
   /**
-   * Acquire a call handle for a <strong>streaming</strong> RPC pattern (server-stream,
-   * client-stream, bidi). Bypasses the per-connection multiplexed-stream pool entirely and opens a
-   * dedicated substream — per {@code ffi_spec/Aster-multiplexed-streams.md} §3 line 65, "streaming
-   * substreams don't count against any pool." Without this bypass, a streaming call would hold a
-   * pool slot and block concurrent unary calls on the same session (spec §4.4). The session id
-   * still ships in the {@code StreamHeader}; only pool accounting is bypassed.
+   * Send every request in batches (one native call and as few writes as possible per batch), the
+   * last ending the request stream; stops if the call is over.
    */
-  private AsterCall acquireStreamingOn(IrohConnection conn) {
-    return AsterCall.acquireStreaming(conn.runtime().nativeHandle(), conn.nativeHandle());
-  }
-
-  private void sendStreamHeader(AsterCall call, int sessionId, String service, String method) {
-    byte[] headerBytes =
-        AsterEnvelope.encodeStreamHeader(buildStreamHeader(sessionId, service, method));
-    call.sendFrame(AsterFraming.encodeFrame(headerBytes, AsterFraming.FLAG_HEADER));
-  }
-
-  private static StreamHeader buildStreamHeader(int sessionId, String service, String method) {
-    return new StreamHeader(
-        service,
-        method,
-        1,
-        0,
-        (short) 0,
-        StreamHeader.SERIALIZATION_XLANG,
-        List.of(),
-        List.of(),
-        sessionId);
-  }
-
-  /** Record-style holder for drainUnary — lets us distinguish "empty OK" from "no frame". */
-  private record UnaryResult<T>(T value) {}
-
-  private <Resp> UnaryResult<Resp> drainUnary(AsterCall call, Class<Resp> responseType) {
-    byte[] responsePayload = null;
-    int frameCount = 0;
-    while (true) {
-      AsterCall.RecvFrame frame = call.recvFrame(0);
-      if (frame instanceof AsterCall.RecvFrame.EndOfStream) {
-        throw new RpcError(StatusCode.INTERNAL, "stream ended before trailer");
+  private <Req> void sendAll(long rt, long call, List<Req> requests) {
+    int n = requests.size();
+    for (int start = 0; start < n; start += SEND_BATCH) {
+      int end = Math.min(n, start + SEND_BATCH);
+      List<byte[]> batch = new ArrayList<>(end - start);
+      for (int i = start; i < end; i++) {
+        batch.add(codec.encode(requests.get(i)));
       }
-      if (frame instanceof AsterCall.RecvFrame.Timeout) {
-        // timeout_ms=0 means block indefinitely in the FFI contract, so this
-        // branch is unreachable in practice; treat as a transport error.
-        throw new RpcError(StatusCode.INTERNAL, "unexpected recv timeout");
+      if (!Rpc.sendMany(rt, call, batch, end == n)) {
+        return; // the trailer says why
       }
-      AsterCall.RecvFrame.Ok ok = (AsterCall.RecvFrame.Ok) frame;
-      byte flags = ok.flags();
-      if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
-        RpcStatus status =
-            ok.payload().length == 0 ? RpcStatus.ok() : AsterEnvelope.decodeRpcStatus(ok.payload());
-        if (status.code() != RpcStatus.OK) {
-          throw new RpcError(
-              StatusCode.fromValue(status.code()),
-              status.message() == null ? "" : status.message());
-        }
-        if (responsePayload == null) {
-          throw new RpcError(StatusCode.INTERNAL, "OK trailer with no response frame");
-        }
-        if (frameCount > 1) {
-          throw new RpcError(
-              StatusCode.INTERNAL, "unary call received " + frameCount + " response frames");
-        }
-        @SuppressWarnings("unchecked")
-        Resp decoded = (Resp) codec.decode(responsePayload, responseType);
-        return new UnaryResult<>(decoded);
-      }
-      if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
-        // skip row-schema frames (no row-mode support yet)
-        continue;
-      }
-      responsePayload = AsterFraming.payloadOf(ok.payload(), ok.flags());
-      frameCount++;
     }
   }
 
-  private <Resp> List<Resp> drainStreaming(AsterCall call, Class<Resp> responseType) {
+  /** Read every response until the trailer; a non-OK trailer throws. */
+  private <Resp> List<Resp> drain(long rt, long call, Class<Resp> responseType) {
     List<Resp> collected = new ArrayList<>();
     while (true) {
-      AsterCall.RecvFrame frame = call.recvFrame(0);
-      if (frame instanceof AsterCall.RecvFrame.EndOfStream) {
-        throw new RpcError(StatusCode.INTERNAL, "stream ended before trailer");
-      }
-      if (frame instanceof AsterCall.RecvFrame.Timeout) {
-        throw new RpcError(StatusCode.INTERNAL, "unexpected recv timeout");
-      }
-      AsterCall.RecvFrame.Ok ok = (AsterCall.RecvFrame.Ok) frame;
-      byte flags = ok.flags();
-      if ((flags & AsterFraming.FLAG_TRAILER) != 0) {
-        RpcStatus status =
-            ok.payload().length == 0 ? RpcStatus.ok() : AsterEnvelope.decodeRpcStatus(ok.payload());
-        if (status.code() != RpcStatus.OK) {
-          throw new RpcError(
-              StatusCode.fromValue(status.code()),
-              status.message() == null ? "" : status.message());
+      Rpc.Recv r = Rpc.recv(rt, call, Rpc.TIMEOUT_INFINITE);
+      switch (r) {
+        case Rpc.Recv.Data d -> {
+          @SuppressWarnings("unchecked")
+          Resp decoded = (Resp) codec.decode(d.payload(), responseType);
+          collected.add(decoded);
         }
-        return collected;
+        case Rpc.Recv.Trailer t -> {
+          RpcError e = statusError(t.status());
+          if (e != null) {
+            throw e;
+          }
+          return collected;
+        }
+        case Rpc.Recv.Timeout ignored -> {
+          // TIMEOUT_INFINITE: unreachable
+        }
       }
-      if ((flags & AsterFraming.FLAG_ROW_SCHEMA) != 0) {
-        continue;
-      }
-      @SuppressWarnings("unchecked")
-      Resp decoded =
-          (Resp) codec.decode(AsterFraming.payloadOf(ok.payload(), ok.flags()), responseType);
-      collected.add(decoded);
     }
+  }
+
+  /** The {@link RpcError} of a non-OK AEv1 status; {@code null} for OK. */
+  static RpcError statusError(byte[] status) {
+    if (status.length == 0) {
+      return new RpcError(StatusCode.INTERNAL, "call already over");
+    }
+    RpcStatus st = AsterEnvelope.decodeRpcStatus(status);
+    if (st.code() == RpcStatus.OK) {
+      return null;
+    }
+    Map<String, String> details = new java.util.LinkedHashMap<>();
+    for (int i = 0; i < Math.min(st.detailKeys().size(), st.detailValues().size()); i++) {
+      details.put(st.detailKeys().get(i), st.detailValues().get(i));
+    }
+    return new RpcError(
+        StatusCode.fromValue(st.code()), st.message() == null ? "" : st.message(), details);
+  }
+
+  private static RpcError rpcError(byte[] status) {
+    RpcError e = statusError(status);
+    return e != null ? e : new RpcError(StatusCode.UNKNOWN, "non-OK call with an OK status");
   }
 
   private static <T> List<T> materialize(Iterable<T> items) {

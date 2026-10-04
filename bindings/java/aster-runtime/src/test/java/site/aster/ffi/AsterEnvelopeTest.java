@@ -20,7 +20,6 @@ import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
 import org.junit.jupiter.api.Test;
-import site.aster.server.AsterFraming;
 import site.aster.server.wire.CallHeader;
 import site.aster.server.wire.RpcStatus;
 import site.aster.server.wire.StreamHeader;
@@ -31,6 +30,9 @@ import site.aster.server.wire.StreamHeader;
  * conformance/vectors/compression.json}.
  */
 final class AsterEnvelopeTest {
+
+  /** Frame flag: the payload is zstd-compressed (Aster-SPEC §5.6). */
+  private static final byte FLAG_COMPRESSED = 0x01;
 
   private static final HexFormat HEX = HexFormat.of();
   private static final ObjectMapper JSON = new ObjectMapper();
@@ -195,7 +197,7 @@ final class AsterEnvelopeTest {
       byte[] flags = new byte[1];
       byte[] body = frameBody(HEX.parseHex(v.get("frame_hex").asText()), flags);
       assertEquals(v.get("flags").asInt(), flags[0] & 0xff);
-      byte[] got = AsterFraming.payloadOf(body, flags[0]);
+      byte[] got = (flags[0] & FLAG_COMPRESSED) != 0 ? AsterEnvelope.decompress(body) : body;
       int len = v.get("payload_length").asInt();
       assertArrayEquals(payload(v.get("payload_rule").asText(), len), got, v.get("name").asText());
     }
@@ -226,15 +228,10 @@ final class AsterEnvelopeTest {
       byte[] p = payload(v.get("payload_rule").asText(), v.get("payload_length").asInt());
       byte[] wantFlags = new byte[1];
       frameBody(HEX.parseHex(v.get("expected_frame_hex").asText()), wantFlags);
-      boolean wantCompressed = (wantFlags[0] & AsterFraming.FLAG_COMPRESSED) != 0;
+      boolean wantCompressed = (wantFlags[0] & FLAG_COMPRESSED) != 0;
 
       byte[] c = AsterEnvelope.maybeCompress(p, threshold);
       assertEquals(wantCompressed, c != null, name);
-      // Framing helper: same decision, and the receiver recovers the payload.
-      byte[] gotFlags = new byte[1];
-      byte[] body = frameBody(AsterFraming.encodePayloadFrame(p, (byte) 0), gotFlags);
-      assertEquals(wantCompressed, (gotFlags[0] & AsterFraming.FLAG_COMPRESSED) != 0, name);
-      assertArrayEquals(p, AsterFraming.payloadOf(body, gotFlags[0]), name);
       if (c != null) {
         assertTrue(c.length < p.length, name);
         assertArrayEquals(p, AsterEnvelope.decompress(c), name);

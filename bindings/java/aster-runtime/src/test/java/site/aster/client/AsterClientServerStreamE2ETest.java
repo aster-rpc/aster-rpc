@@ -10,10 +10,10 @@ import site.aster.node.NodeAddr;
 import site.aster.server.AsterServer;
 
 /**
- * End-to-end Java-to-Java server-streaming smoke test. Proves the reactor's new multi-frame submit
- * path ({@code aster_reactor_submit_frame} + {@code aster_reactor_submit_trailer}) wired through
- * {@link site.aster.server.ReactorResponseStream} delivers N response frames plus a trailer over a
- * single QUIC bi-stream, and that the client's {@code callServerStream} assembles them in order.
+ * End-to-end Java-to-Java server-streaming smoke test. Proves the dispatch path ({@code
+ * aster_dispatch_send} + {@code aster_dispatch_finish}, via {@code DispatchResponseStream})
+ * delivers N responses plus a trailer, and that the client's {@code callServerStream} assembles
+ * them in order.
  */
 final class AsterClientServerStreamE2ETest {
 

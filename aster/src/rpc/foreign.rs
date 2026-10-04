@@ -514,6 +514,11 @@ impl Foreign {
 
         let peer_id: Arc<str> = Arc::from(peer_id);
         let header = Arc::new(header);
+        let attributes = if attributes.is_empty() {
+            empty_attributes()
+        } else {
+            Arc::new(PeerAttributes::from_map(attributes))
+        };
         let state = self.table.insert(|call_id, table| CallState {
             call_id,
             sender: response_sender,
@@ -527,6 +532,7 @@ impl Foreign {
             }),
             header: header.clone(),
             peer: peer_id.clone(),
+            attributes: attributes.clone(),
             table,
         });
         let call_id = state.call_id;
@@ -559,11 +565,7 @@ impl Foreign {
             peer_id,
             request: request_payload,
             header,
-            attributes: if attributes.is_empty() {
-                empty_attributes()
-            } else {
-                Arc::new(PeerAttributes::from_map(attributes))
-            },
+            attributes,
             connection,
             handle: CallHandle {
                 call: Some(CallRef(state)),
@@ -838,6 +840,9 @@ pub(crate) struct CallState {
     /// The call's header and peer (shared with the [`ForeignCall`]), for logs.
     header: Arc<StreamHeader>,
     peer: Arc<str>,
+    /// The caller's attributes (shared with the [`ForeignCall`]), so bindings
+    /// that answer by id can read them later ([`CallRef::attributes`]).
+    attributes: Arc<PeerAttributes>,
     table: Weak<TableInner>,
 }
 
@@ -1109,6 +1114,22 @@ pub struct CallRef(Arc<CallState>);
 impl CallRef {
     pub fn call_id(&self) -> u64 {
         self.0.call_id
+    }
+
+    /// The call's decoded header (the same as [`ForeignCall::header`]), for
+    /// bindings that answer by id and read metadata lazily.
+    pub fn header(&self) -> &Arc<StreamHeader> {
+        &self.0.header
+    }
+
+    /// The caller's peer id (the same as [`ForeignCall::peer_id`]).
+    pub fn peer(&self) -> &Arc<str> {
+        &self.0.peer
+    }
+
+    /// The caller's attributes (the same as [`ForeignCall::attributes`]).
+    pub fn attributes(&self) -> &Arc<PeerAttributes> {
+        &self.0.attributes
     }
 
     /// Single-shot terminal response: one data frame (omitted when `payload`
