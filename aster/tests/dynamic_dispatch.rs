@@ -47,6 +47,7 @@ const SLOW: u32 = 6;
 const DROP: u32 = 7;
 const ADMIN: u32 = 8;
 const SMALL: u32 = 9;
+const PARK: u32 = 10;
 
 // test.Counter methods.
 const INCR: u32 = 0;
@@ -83,6 +84,7 @@ fn echo_service() -> DynamicService {
         method("drop", MethodPattern::Unary),
         admin,
         small,
+        method("park", MethodPattern::Unary),
     ];
     svc
 }
@@ -419,6 +421,23 @@ fn handle(
             assert_eq!(table.try_send(id, b"late"), Err(SubmitError::NotFound));
             note(&observed, "hang:cancelled");
         }
+        (ECHO, PARK) => {
+            // A unary call that waits for its cancel instead of answering.
+            note(&observed, "park:started");
+            match events.recv_timeout(Duration::from_secs(20)) {
+                Ok(DispatchEvent::Cancelled { reason, .. }) => {
+                    assert_eq!(reason, CancelReason::Peer)
+                }
+                other => panic!("expected Cancelled{{Peer}}, got {other:?}"),
+            }
+            assert!(table.is_cancelled(id));
+            // No trailer after a peer cancel; the call is gone.
+            assert_eq!(
+                table.try_respond(id, b"late", &ok),
+                Err(SubmitError::NotFound)
+            );
+            note(&observed, "park:cancelled");
+        }
         (ECHO, SLOW) => {
             assert!(deadline_unix_ms > 0, "method default_timeout -> deadline");
             match events.recv_timeout(Duration::from_secs(20)) {
@@ -705,6 +724,80 @@ async fn peer_cancel_reaches_a_streaming_handler() {
         .await
         .unwrap();
     assert_eq!(out, b"after");
+    binding.assert_table_drains().await;
+    drop(binding);
+    srv.shutdown().await;
+}
+
+/// A client cancel reaches a unary handler as `Cancelled{Peer}` (the reactor's
+/// cancel signal, no task per call); the stream is poisoned, the connection
+/// lives on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_cancel_reaches_a_unary_handler() {
+    let Setup { srv, binding } = start().await;
+    let (_client, conn) = client(&srv).await;
+
+    let (send, _recv) = within(conn.core_connection().open_streaming_substream())
+        .await
+        .unwrap();
+    let hdr = aster::rpc::encode_stream_header(&echo("park")).unwrap();
+    send.write_all(encode_frame(&hdr, FLAG_HEADER).unwrap())
+        .await
+        .unwrap();
+    send.write_all(encode_frame(&[1], FLAG_END_STREAM).unwrap())
+        .await
+        .unwrap();
+    binding
+        .until("park started", |o| {
+            o.notes.iter().any(|n| n == "park:started")
+        })
+        .await;
+    send.write_all(encode_frame(&[], FLAG_CANCEL).unwrap())
+        .await
+        .unwrap();
+
+    binding
+        .until("park cancelled", |o| {
+            o.notes.iter().any(|n| n == "park:cancelled")
+        })
+        .await;
+    assert!(binding
+        .observed()
+        .cancelled
+        .iter()
+        .any(|(_, r, m)| *r == CancelReason::Peer && *m == PARK));
+    binding.assert_table_drains().await;
+
+    // The connection survives the cancel.
+    let out = within(conn.unary(&echo("echo"), b"after".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(out, b"after");
+    binding.assert_table_drains().await;
+    drop(binding);
+    srv.shutdown().await;
+}
+
+/// A unary call in flight when the whole peer goes away is cancelled too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_close_cancels_an_in_flight_unary_call() {
+    let Setup { srv, binding } = start().await;
+    let (client, conn) = client(&srv).await;
+
+    let pending = tokio::spawn(async move { conn.unary(&echo("park"), vec![1]).await });
+    binding
+        .until("park started", |o| {
+            o.notes.iter().any(|n| n == "park:started")
+        })
+        .await;
+    client.shutdown().await;
+    let _ = pending.await;
+
+    binding
+        .until("park cancelled", |o| {
+            o.notes.iter().any(|n| n == "park:cancelled") && !o.connections_closed.is_empty()
+        })
+        .await;
     binding.assert_table_drains().await;
     drop(binding);
     srv.shutdown().await;

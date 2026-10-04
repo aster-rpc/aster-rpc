@@ -44,6 +44,31 @@ async fn wait_cancelled(call: &Call) {
     }
 }
 
+/// Counts once when dropped, unless disarmed: the handler noticed the cancel
+/// itself, or the server dropped it on the cancel (as it does for a peer
+/// cancel or a deadline).
+struct CountOnDrop<'a> {
+    counter: &'a AtomicUsize,
+    armed: bool,
+}
+
+impl<'a> CountOnDrop<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        Self {
+            counter,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for CountOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ServiceDispatch for Svc {
     fn name(&self) -> &str {
@@ -54,7 +79,8 @@ impl ServiceDispatch for Svc {
     }
     fn methods(&self) -> &[&str] {
         &[
-            "echo", "empty", "fail", "meta", "hang", "count", "forever", "sum", "hold", "chat",
+            "echo", "empty", "fail", "meta", "hang", "park", "count", "forever", "sum", "hold",
+            "chat",
         ]
     }
     async fn dispatch(&self, method: &str, mut call: Call) {
@@ -90,8 +116,14 @@ impl ServiceDispatch for Svc {
             }
             "hang" => {
                 // Never answers; reports the cancel when it arrives.
+                let _cancelled = CountOnDrop::new(&self.seen.cancelled);
                 wait_cancelled(&call).await;
-                self.seen.cancelled.fetch_add(1, Ordering::SeqCst);
+            }
+            "park" => {
+                // Never answers and never looks at the cancel flag: only the
+                // server dropping it ends it.
+                let _cancelled = CountOnDrop::new(&self.seen.cancelled);
+                std::future::pending::<()>().await;
             }
             "count" => {
                 let n = call.recv_request().await.map(|r| r[0]).unwrap_or(0);
@@ -104,9 +136,10 @@ impl ServiceDispatch for Svc {
             }
             "forever" => {
                 let _ = call.recv_request().await;
+                // Stopped by a refused send, the flag, or being dropped.
+                let _stopped = CountOnDrop::new(&self.seen.producer_stopped);
                 loop {
                     if call.is_cancelled() || call.send(vec![1; 32]).await.is_err() {
-                        self.seen.producer_stopped.fetch_add(1, Ordering::SeqCst);
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -123,6 +156,7 @@ impl ServiceDispatch for Svc {
             }
             "hold" => {
                 self.seen.hold_started.fetch_add(1, Ordering::SeqCst);
+                let mut cancelled = CountOnDrop::new(&self.seen.cancelled);
                 // Read requests until the stream ends or the call is cancelled.
                 loop {
                     match tokio::time::timeout(Duration::from_millis(5), call.recv_request()).await
@@ -133,31 +167,30 @@ impl ServiceDispatch for Svc {
                         Err(_) => {}
                     }
                 }
-                if call.is_cancelled() {
-                    self.seen.cancelled.fetch_add(1, Ordering::SeqCst);
-                } else {
+                if !call.is_cancelled() {
+                    cancelled.armed = false;
                     let _ = call.respond(vec![9], &RpcStatus::ok()).await;
                 }
             }
             "chat" => {
+                let mut cancelled = CountOnDrop::new(&self.seen.cancelled);
                 loop {
                     match tokio::time::timeout(Duration::from_millis(5), call.recv_request()).await
                     {
                         Ok(Some(req)) => {
                             if call.send(req).await.is_err() {
+                                cancelled.armed = call.is_cancelled();
                                 return;
                             }
                         }
                         // A cancel also closes the request stream.
                         Ok(None) if !call.is_cancelled() => break,
-                        Ok(None) | Err(_) if call.is_cancelled() => {
-                            self.seen.cancelled.fetch_add(1, Ordering::SeqCst);
-                            return;
-                        }
+                        Ok(None) | Err(_) if call.is_cancelled() => return,
                         Ok(None) => break,
                         Err(_) => {}
                     }
                 }
+                cancelled.armed = false;
                 let _ = call.finish(&RpcStatus::ok()).await;
             }
             _ => {}
@@ -444,6 +477,31 @@ async fn a_dropped_unary_future_cancels_and_does_not_poison_the_pool() {
             vec![i]
         );
     }
+    f.shutdown().await;
+}
+
+/// A client cancel ends a unary handler that never polls the flag: the server
+/// drops its future, as it does on a deadline (the server's own deadline is
+/// 300 s here, so only the cancel can end it within the test).
+#[tokio::test]
+async fn a_client_cancel_drops_a_unary_handler() {
+    let f = Fixture::new().await;
+    f.conn.set_shared_pool_size(1);
+    let park = h("park");
+    let fut = f.conn.unary(&park, vec![1]);
+    assert!(tokio::time::timeout(Duration::from_millis(200), fut)
+        .await
+        .is_err());
+    let seen = f.seen.clone();
+    eventually("the handler is dropped on the cancel", || {
+        seen.cancelled.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // The stream is clean for the next call.
+    assert_eq!(
+        within(f.conn.unary(&h("echo"), vec![7])).await.unwrap(),
+        vec![7]
+    );
     f.shutdown().await;
 }
 

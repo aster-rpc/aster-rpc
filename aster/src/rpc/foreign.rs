@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc::Receiver, oneshot, Notify};
+use tokio::sync::{mpsc::Receiver, oneshot};
 use tokio::time::Instant;
 
 use aster_transport_core::framing::{
@@ -32,7 +32,7 @@ use aster_transport_core::framing::{
     MAX_FRAME_SIZE,
 };
 use aster_transport_core::reactor::{
-    OutgoingFrame, RequestFrame, ResponsePermit, ResponseReserveError, ResponseSender,
+    CancelHook, OutgoingFrame, RequestFrame, ResponsePermit, ResponseReserveError, ResponseSender,
 };
 use aster_transport_core::CoreConnection;
 
@@ -71,7 +71,8 @@ pub const FLAG_IROH_AUTHENTICATED: u32 = 0x4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CancelReason {
-    /// The peer sent `FLAG_CANCEL`, or the stream failed under the call.
+    /// The peer sent `FLAG_CANCEL`, or the stream or connection failed under
+    /// the call.
     /// No trailer is sent (spec §6.0).
     Peer,
     /// The call's deadline passed. Rust has already sent `DEADLINE_EXCEEDED`.
@@ -88,8 +89,10 @@ pub enum DispatchEvent {
     /// A call that passed every gate. Answer it through
     /// [`ForeignCall::handle`] or the [`CallTable`].
     Call(ForeignCall),
-    /// The call ended without the binding finishing it. Delivered for
-    /// streaming patterns on peer cancel, and for every pattern on deadline.
+    /// The call ended without the binding finishing it: on peer cancel (or
+    /// the stream or connection failing under the call) and on deadline, for
+    /// every pattern. Over a transport without a cancel signal (HTTP), peer
+    /// cancels are only seen for streaming patterns.
     /// Later response operations return [`SubmitError::NotFound`].
     Cancelled { call_id: u64, reason: CancelReason },
     /// A [`reserve`](CallTable::reserve) completed: retry the exact operation
@@ -438,9 +441,9 @@ impl Foreign {
     }
 
     /// Hand one routed call to the binding: inflate the first frame, enter
-    /// the call in the table, arm its deadline and (streaming patterns) its
-    /// cancel watcher, then deliver. Synchronous: runs inline in the serve
-    /// loop, so the foreign fast path spawns nothing for a unary call.
+    /// the call in the table, deliver, then arm its deadline and its cancel
+    /// hook. Synchronous: runs inline in the serve loop, so the foreign fast
+    /// path spawns nothing per call.
     pub(crate) fn deliver(&self, d: Delivery, deadlines: &DeadlineQueue) {
         let Delivery {
             svc,
@@ -584,10 +587,21 @@ impl Foreign {
                 }));
             }
         }
-        if pattern != MethodPattern::Unary && !armed.inner.lock().unwrap().terminal {
-            self.table
-                .runtime()
-                .spawn(watch_cancel(armed, cancel_notify));
+        match cancel_notify {
+            // The reactor fires the hook on the task that saw the cancel, so
+            // every pattern -- unary included -- is covered without a task
+            // per call. A call already over ignores it (`end` is a no-op).
+            Some(signal) => {
+                let hook: Weak<dyn CancelHook> = Arc::downgrade(&armed) as Weak<CallState>;
+                signal.on_cancel(hook);
+            }
+            // A transport without a signal (HTTP): watch the response channel
+            // for streaming calls, where the handler outlives the request.
+            None => {
+                if pattern != MethodPattern::Unary && !armed.inner.lock().unwrap().terminal {
+                    self.table.runtime().spawn(watch_closed(armed));
+                }
+            }
         }
     }
 }
@@ -612,26 +626,21 @@ fn unix_ms(at: Instant) -> u64 {
         .max(1)
 }
 
-/// Streaming calls only: turn a peer cancel (or the response channel
-/// closing under an unfinished call) into [`DispatchEvent::Cancelled`].
-async fn watch_cancel(state: Arc<CallState>, notify: Option<Arc<Notify>>) {
-    match notify {
-        Some(notify) => {
-            let notified = notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if !state.cancelled.load(Ordering::Acquire) {
-                tokio::select! {
-                    _ = notified => {}
-                    _ = state.sender.closed() => {}
-                }
-            }
-        }
-        None => state.sender.closed().await,
-    }
+/// Streaming calls on a transport without a cancel signal: turn the response
+/// channel closing under an unfinished call into [`DispatchEvent::Cancelled`].
+async fn watch_closed(state: Arc<CallState>) {
+    state.sender.closed().await;
     // A finished call also closes the channel (the writer drops it after the
     // trailer); `end` ignores calls that are already terminal.
     state.end(Some(CancelReason::Peer), None);
+}
+
+/// A peer cancel, a failed stream or a lost connection (the reactor's cancel
+/// signal) ends the call with [`DispatchEvent::Cancelled`] `{Peer}`.
+impl CancelHook for CallState {
+    fn cancelled(&self) {
+        self.end(Some(CancelReason::Peer), None);
+    }
 }
 
 // ── call table ──────────────────────────────────────────────────────────────
