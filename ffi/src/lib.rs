@@ -308,8 +308,8 @@ pub enum aster_event_kind_t {
     /// `aster_http_body_status_t` its next non-blocking call returns (0:
     /// it succeeds -- room to write, a head, data or the end), `status` =
     /// that code as an `aster_status_t` (`PERMISSION_DENIED` for a denied
-    /// relay; see `aster_http_relay_status`). One-shot: re-arm after
-    /// handling.
+    /// relay; see `aster_http_body_status_to_status`). One-shot: re-arm
+    /// after handling.
     ASTER_EVENT_HTTP_RELAY_READY = 109,
 }
 

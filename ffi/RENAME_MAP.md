@@ -60,7 +60,13 @@ for the R4 auth model; only a denied relay reports `PERMISSION_DENIED` today);
 relay code in `error_code` (was `INTERNAL` / `-1`). On the wire, a serving
 node now resets a refused http-relay stream with `0x41530004` (unknown
 service), `0x41530005` (denied) or `0x41530006` (stream cap) instead of
-dropping it silently; consumers of any version still see a failure.
+dropping it silently. Shared core, so it reaches Python / TS too:
+`RelayResponse::wait` now reports a lost / closed connection as
+`aster::Error::Connection` (was `Transport`), so Python's streaming relay
+raises `ConnectionError` (was `IrohError`) for it; refusal messages now
+describe the refusal ("service 'x' is not exposed by the peer", "the peer
+denied access to service 'x'", "... is at its concurrent-stream limit")
+instead of a bare end-of-stream error.
 
 ## New in 4.2 (additive)
 
