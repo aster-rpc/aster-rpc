@@ -426,18 +426,17 @@ fn send_parked(srv: Srv, id: u64, payload: &[u8], events: &mpsc::Receiver<Ev>) -
 }
 
 /// `Some(payload)`, or `None` at the end of the request stream / call.
+///
+/// Polls with a short finite timeout, retrying on TIMEOUT, so every
+/// streaming test also covers the finite-timeout path (which once panicked
+/// by building its timer outside the runtime).
 fn recv(srv: Srv, id: u64) -> Option<Vec<u8>> {
     let (mut p, mut l, mut b) = (ptr::null(), 0u32, 0u64);
-    let rc = unsafe {
-        aster_dispatch_recv(
-            srv.rt,
-            srv.server,
-            id,
-            ASTER_TIMEOUT_INFINITE,
-            &mut p,
-            &mut l,
-            &mut b,
-        )
+    let rc = loop {
+        let rc = unsafe { aster_dispatch_recv(srv.rt, srv.server, id, 20, &mut p, &mut l, &mut b) };
+        if rc != aster_status_t::ASTER_STATUS_TIMEOUT as i32 {
+            break rc;
+        }
     };
     if rc != OK || b == 0 {
         return None;

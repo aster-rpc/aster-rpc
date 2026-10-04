@@ -1103,12 +1103,14 @@ pub unsafe extern "C" fn aster_dispatch_recv(
     } else if timeout_ms == ASTER_TIMEOUT_INFINITE {
         Some(state.rt.block_on(call.recv()))
     } else {
+        // The timer must be created inside the runtime: `timeout()` registers
+        // with the runtime's time driver when constructed, so building it
+        // outside `block_on` panics ("there is no reactor running").
         state
             .rt
-            .block_on(tokio::time::timeout(
-                Duration::from_millis(timeout_ms as u64),
-                call.recv(),
-            ))
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(timeout_ms as u64), call.recv()).await
+            })
             .ok()
     };
     // SAFETY: out pointers checked non-null.
