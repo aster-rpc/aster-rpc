@@ -18,12 +18,15 @@
 //!   [`cancel`](RelayResponse::cancel) it. Dropping it (or a `wait` future)
 //!   before the head is in cancels the exchange and resets the request.
 //!
-//! The relay sends the whole request body before it reads the response
-//! head, so the binding must drive the upload while it waits for the
-//! response (the head arrives only once the upload has finished). It is
-//! not full duplex: a handler that answers before draining the request body
-//! (a 413, say) stalls the upload, and the consumer gets an error rather
-//! than that early response. Bindings should document this.
+//! The exchange is **full duplex**: the response head can arrive while the
+//! upload is still going (an early `413`, or a handler streaming back as it
+//! reads), and the upload carries on after it. The upload ends when the
+//! binding finishes or aborts it, when the handler stops reading (writes
+//! then fail [`BodyError::Cancelled`]), or when the response body is
+//! dropped or [`close`](RelayReader::close)d *before its end* -- which
+//! abandons the exchange and resets an unfinished upload. A response that
+//! ends cleanly does not cancel the upload. An upload that fails before the head fails
+//! [`wait`](RelayResponse::wait); after the head it only resets the request.
 //!
 //! Errors are [`BodyError`]s, sharing the server side's stable codes: a
 //! failed (reset) response reads as [`BodyError::Read`] on every later read
@@ -74,6 +77,9 @@ pub struct RelayHead {
 /// [`RelayResponse`]: drive the upload (write, then finish) while waiting
 /// on the response. An invalid method, URI or header is
 /// [`Error::InvalidArgument`] and nothing is sent.
+///
+/// [`RelayResponse::wait`] can resolve before the upload is done; keep
+/// driving the upload after it.
 pub fn relay_streaming(
     runtime: &tokio::runtime::Handle,
     conn: &Connection,
@@ -125,8 +131,9 @@ pub struct RelayResponse {
 }
 
 impl RelayResponse {
-    /// The response head and its body reader. Resolves once the upload has
-    /// finished and the head is in; an exchange that failed (refused,
+    /// The response head and its body reader. Resolves as soon as the head
+    /// is in, whether or not the upload has finished; an exchange that
+    /// failed (refused,
     /// unknown service, upload aborted, connection lost) or was
     /// [`cancel`](Self::cancel)led is an `Err`. Dropping this future
     /// cancels the exchange.
@@ -406,7 +413,9 @@ impl RelayReader {
     }
 
     /// Stop reading: the response stream is dropped (the handler's further
-    /// writes fail `Cancelled`) and every later read fails `Cancelled`.
+    /// writes fail `Cancelled`), an unfinished upload is reset (unless the
+    /// response already ended cleanly), and every later read fails
+    /// `Cancelled`.
     /// Idempotent.
     pub fn close(&self) {
         self.inner.closed.set();

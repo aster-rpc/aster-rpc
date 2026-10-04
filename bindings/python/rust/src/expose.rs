@@ -288,11 +288,12 @@ fn relay_http<'py>(
 /// `conn`, streamed both ways. Returns `(HttpUpload, awaitable)` at once:
 /// write the request body through the upload (then `finish()`) while
 /// awaiting the response, an `aster.expose.HttpResponse` whose `body` is an
-/// `HttpRelayBody` to read. The relay sends the whole request body before
-/// it reads the response head (not full duplex: a handler that answers
-/// before reading the body stalls the upload, and the awaitable fails).
-/// The exchange runs whether or not the awaitable is awaited; cancelling
-/// it resets the request.
+/// `HttpRelayBody` to read. Full duplex: the awaitable resolves as soon as
+/// the head is in, possibly before the upload is done; keep writing after
+/// it. Closing the response body before its end resets an unfinished
+/// upload. The exchange
+/// runs whether or not the awaitable is awaited; cancelling it resets the
+/// request.
 /// `aster.expose.relay_http_stream` drives the upload for you.
 #[pyfunction]
 #[pyo3(signature = (

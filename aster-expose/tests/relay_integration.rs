@@ -578,10 +578,12 @@ async fn upload_cancelled_by_the_consumer_fails_the_body_read() -> Result<()> {
         .body(body)
         .unwrap();
     tx.send(bytes::Bytes::from_static(b"partial")).await.ok();
-    // The upload never ends; the consumer gives up once the handler runs.
+    // The upload never ends; the consumer gives up once the handler runs --
+    // by dropping the call, or (full duplex: the head can arrive while the
+    // upload is still open) by dropping the response unread.
     let call = relay_request_streaming(&h.client_conn, "up", req);
     tokio::select! {
-        _ = call => panic!("an unfinished upload cannot complete"),
+        resp = call => drop(resp?),
         () = started.notified() => {}
     }
     drop(tx);

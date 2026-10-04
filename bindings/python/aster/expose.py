@@ -65,12 +65,15 @@ cross the relay hop yet (``aster-expose`` V2).
 may be ``bytes`` / ``str`` or an (async) iterable of chunks, uploaded with
 backpressure; the response's ``body`` is an :class:`HttpRelayBody` to
 ``await read()``, ``async for`` over, or ``await response.read_body()``.
-The relay sends the whole request body before it reads the response head;
-it is not full duplex, so a handler that answers before reading the body
-(a ``413``, say) stalls the upload and the call fails rather than returning
-that early answer. If the body iterator raises, the request is reset (the handler sees a
-failed body, never a truncated one) and the iterator's exception
-propagates; a response that fails partway raises ``HttpBodyError``
+The exchange is full duplex: the call returns as soon as the response head
+is in -- possibly before the body is uploaded (an early ``413``, or a
+handler that streams back as it reads) -- and the upload carries on in the
+background until it is done, the handler stops reading, or you close the
+response body before its end (which resets an unfinished upload; a
+response that has ended cleanly leaves the upload to finish). If the body iterator
+raises, the request is reset (the handler sees a failed body, never a
+truncated one); before the head the iterator's exception propagates from
+the call, after it the error is logged (``aster.expose``). A response that fails partway raises ``HttpBodyError``
 (``read``) from the read, never a clean end. Close the body early with
 ``aclose()`` / ``async with resp.body:`` and the handler's further writes
 are cancelled. Because the body is an async iterable, a handler can proxy
@@ -304,19 +307,25 @@ async def relay_http_stream(
         except asyncio.CancelledError:
             pass
         raise
-    # The relay reads the head only after the whole body, so the upload is
-    # finished; only the iterator's aclose() may still be running. Don't
-    # make the caller wait on it.
+    # Full duplex: the head can arrive while the upload is still going. It
+    # carries on in the background (held here: asyncio keeps only weak
+    # references to tasks); closing the response body stops it.
     if pump.done():
         pump.result()
     else:
-        pump.add_done_callback(_consume)
+        _PUMPS.add(pump)
+        pump.add_done_callback(_pump_done)
     return response
 
 
-def _consume(task: "asyncio.Future") -> None:
+#: Upload pumps still running after their response head arrived.
+_PUMPS: "set[asyncio.Future]" = set()
+
+
+def _pump_done(task: "asyncio.Future") -> None:
+    _PUMPS.discard(task)
     if not task.cancelled() and task.exception() is not None:
-        _log.debug("upload pump ended with %r", task.exception())
+        _log.warning("request body failed after the response head: %r", task.exception())
 
 
 async def _pump_upload(upload: HttpUpload, body: Body) -> None:
