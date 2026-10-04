@@ -441,11 +441,33 @@ export {
   type UpcallContext,
   type UpcallStats,
 } from './upcalls.js';
-// Expose (Rust `aster::expose`): socket targets with JavaScript authorization
+// Expose (Rust `aster::expose`): socket targets, JavaScript HTTP handlers and
+// edge route policies, with JavaScript authorization
 export {
+  EdgeRouter,
   Expose,
+  HttpBodyError,
+  HttpBodyStream,
+  HttpRequest,
+  RouteRegistration,
+  relayHttp,
+  requestRoute,
+  type EdgeRoute,
   type ExposeAuthorizer,
   type ExposeAuthorizeRequest,
+  type ExposeHttpOptions,
+  type HttpBodyChunk,
+  type HttpHandler,
+  type HttpHeader,
+  type HttpHeadersInit,
+  type HttpResponse,
+  type HttpResponseBody,
+  type HttpVersion,
+  type RelayHttpRequest,
+  type RelayedHttpResponse,
+  type RoutePolicy,
+  type RoutePolicyRequest,
+  type RouteSpec,
 } from './expose.js';
 // Data plane (Rust `aster::{Blobs, Docs, Gossip}` and connection paths)
 export {

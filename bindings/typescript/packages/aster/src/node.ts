@@ -284,8 +284,9 @@ export class Node implements AsyncDisposable {
   }
 
   /**
-   * A fresh exposure registry (see {@link Expose}); its authorizers answer
-   * on `options.upcalls` or a private table.
+   * A fresh exposure registry (see {@link Expose}); its authorizers, HTTP
+   * handlers and route policies answer on `options.upcalls` or a private
+   * table.
    */
   expose(options: { upcalls?: Upcalls } = {}): Expose {
     return new Expose(this.native.expose(), options.upcalls);

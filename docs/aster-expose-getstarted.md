@@ -230,6 +230,23 @@ Bindings use the same API through the `aster` crate, with concrete types only:
 - **Consumer** — `relay_request` (buffered) or `relay_request_streaming` with
   a `body_channel` body, as above.
 
+In TypeScript (`@aster-rpc/aster`) the foreign handler, route policy and
+consumer calls are wired as `Expose.exposeHttp`, `Expose.serveRoutes`,
+`relayHttp` and `requestRoute` (buffered relay only); bodies are `Buffer`s or
+async iterables, and a streamed `write` resolves when the chunk is queued:
+
+```ts
+const expose = host.expose();
+expose.exposeHttp('web', async (req) => {
+  const body = await req.readBody();            // Buffer; `for await (const c of req.body)` streams
+  return { status: 200, headers: { 'content-type': 'text/plain' }, body: `got ${body.length} bytes` };
+}, { authorize: ({ peer }) => allowed.has(peer) });
+expose.serveRoutes(new EdgeRouter(), ({ specs }) => specs.filter((s) => s.host.endsWith('.example')));
+host.serveExpose(expose, [ALPN]);
+
+const resp = await relayHttp(conn, 'web', { method: 'POST', body: 'hello' });
+```
+
 ---
 
 ## 3. Register routes with an edge

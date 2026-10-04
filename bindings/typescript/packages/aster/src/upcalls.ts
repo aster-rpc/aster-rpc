@@ -6,8 +6,9 @@
  * ({@link ForeignFencedResource}), the lease authorizer
  * (`MemorySerializer.setAuthorizer`), the topology `admitted` filter
  * ({@link AdmittedFilter}), the placement manager's providers
- * ({@link PlacementManager}), expose authorization (`Expose.exposeSocket`)
- * and Gate 0 (`node.serveAdmissionUpcalls`). Rust cannot call a JavaScript
+ * ({@link PlacementManager}), expose authorization (`Expose.exposeSocket`),
+ * expose HTTP handlers (`Expose.exposeHttp`), edge route policies
+ * (`Expose.serveRoutes`) and Gate 0 (`node.serveAdmissionUpcalls`). Rust cannot call a JavaScript
  * function directly, so each of them is an *upcall*: Rust emits a typed
  * event into an {@link Upcalls} table, the table runs your (async) handler
  * and answers by id.
@@ -59,6 +60,7 @@ export const UPCALL_KINDS = Object.freeze({
   placement_provision: 33,
   expose_authorize: 48,
   expose_http: 49,
+  expose_route_policy: 50,
   admission_connect: 64,
   admission_handshake: 65,
 } as const);
@@ -131,6 +133,18 @@ export interface UpcallStats {
   /** Handlers currently running. */
   running: number;
 }
+
+/**
+ * A raw handler's answer may carry a hook run once its answer was
+ * delivered (`true`) or dropped (`false`: Rust stopped waiting first), e.g.
+ * an HTTP handler's streamed body, which may only be written after the
+ * response head went out.
+ * @internal
+ */
+export const AFTER_RESPOND: unique symbol = Symbol('aster.upcall.afterRespond');
+
+/** @internal */
+export type AfterRespond = (delivered: boolean) => void | Promise<void>;
 
 /**
  * A raw handler: gets the decoded native request object, returns the
@@ -250,9 +264,9 @@ export class Upcalls implements Disposable {
     };
   }
 
-  private respond(id: number, status: number, payload?: Buffer): void {
-    // `false` = nobody waits any more (cancelled / timed out): ignore.
-    this.native.respond(id, status, payload);
+  /** `false` = nobody waits any more (cancelled / timed out): ignore. */
+  private respond(id: number, status: number, payload?: Buffer): boolean {
+    return this.native.respond(id, status, payload);
   }
 
   private onEvents(events: NativeUpcallEvent[]): void {
@@ -289,10 +303,10 @@ export class Upcalls implements Disposable {
       signal: ctrl.signal,
       deadline: new Date(ev.deadlineUnixMs),
     };
-    const done = (status: number, payload?: Buffer) => {
+    const done = (status: number, payload?: Buffer): boolean => {
       if (this.running.get(id) === ctrl) this.running.delete(id);
-      if (ctrl.signal.aborted) return;
-      this.respond(id, status, payload);
+      if (ctrl.signal.aborted) return false;
+      return this.respond(id, status, payload);
     };
     let result: unknown;
     try {
@@ -310,7 +324,14 @@ export class Upcalls implements Disposable {
           done(UPCALL_STATUS.error, Buffer.from(`invalid ${NAMES[ev.kind]} answer: ${errorMessage(e)}`));
           return;
         }
-        done(UPCALL_STATUS.ok, bytes);
+        const delivered = done(UPCALL_STATUS.ok, bytes);
+        const after = (value as { [AFTER_RESPOND]?: AfterRespond } | null | undefined)?.[AFTER_RESPOND];
+        if (typeof after === 'function') {
+          // Never let the hook's failure escape: its owner reports it.
+          Promise.resolve()
+            .then(() => after(delivered))
+            .catch(() => {});
+        }
       },
       (e: unknown) => done(UPCALL_STATUS.error, Buffer.from(errorMessage(e))),
     );

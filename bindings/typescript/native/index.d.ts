@@ -587,6 +587,18 @@ export declare class DocWithEvents {
 }
 
 /**
+ * An edge's `(host, port) -> origin route` table, filled by
+ * `Expose.serveRoutes` as peers register routes.
+ */
+export declare class EdgeRouter {
+  constructor()
+  /** The live route for `(host, port)` (then `(host, 0)`), or `null`. */
+  lookup(host: string, port?: number | undefined | null): EdgeRouteInfo | null
+  /** Drop the route for `(host, port)`. */
+  unregister(host: string, port?: number | undefined | null): void
+}
+
+/**
  * A node-wide exposure registry (`node.expose()`). Register services, then
  * `node.serveExpose(expose, alpns)`.
  */
@@ -598,6 +610,21 @@ export declare class Expose {
    * the kind's failure mode (fail-closed by default).
    */
   exposeSocket(serviceId: string, addr: string, upcalls: Upcalls): void
+  /**
+   * Expose a JavaScript HTTP handler as `serviceId` (R9): one kind-49
+   * upcall per request on `upcalls`, bodies through its body table.
+   * `authorize` (`true`): ask the kind-48 authorizer on `upcalls`;
+   * `false` admits every peer that reaches the ALPN.
+   */
+  exposeHttp(serviceId: string, upcalls: Upcalls, authorize: boolean, options?: ExposeHttpOptions | undefined | null): void
+  /**
+   * Act as an edge: accept route registrations from peers into
+   * `router`. `policy` (`true`): ask the kind-50 route policy on
+   * `upcalls` (no usable answer applies its failure mode: fail-closed
+   * grants nothing, fail-open everything); `false` grants every
+   * requested route.
+   */
+  serveRoutes(router: EdgeRouter, upcalls: Upcalls, policy: boolean): void
   /** Stop exposing `serviceId`. */
   unexpose(serviceId: string): void
 }
@@ -710,6 +737,38 @@ export declare class GrantorSerializer {
   revoke(resource: string): Promise<TransitionOutcome>
 }
 
+/**
+ * One HTTP exchange's body handle: read the request body, write the
+ * response body. Everything async here is a napi async function: nothing
+ * blocks the JavaScript thread.
+ */
+export declare class HttpBodyHandle {
+  get streamId(): number
+  /**
+   * The next request-body chunk (at most `max` bytes and at most the
+   * handler's `maxChunk`), or `null` at the end.
+   */
+  read(max?: number | undefined | null): Promise<Buffer | null>
+  /**
+   * Queue a response-body chunk (split at `maxChunk`), waiting while the
+   * queue is full: awaiting it is the backpressure. Write after the
+   * response head went out.
+   */
+  write(chunk: Buffer): Promise<void>
+  /**
+   * Queue a chunk (at most `maxChunk` bytes) without waiting; `false`
+   * when the queue is full (nothing queued).
+   */
+  tryWrite(chunk: Buffer): boolean
+  /** End the response body, optionally with trailers. */
+  finish(trailers?: Array<ExposeHeader> | undefined | null): void
+  /**
+   * Abort the response: the consumer sees a failed (reset) response, not
+   * a truncated one.
+   */
+  abort(message?: string | undefined | null): void
+}
+
 export declare class IrohBiStream {
   /** Take the send stream (can only be called once). */
   takeSend(): IrohSendStream
@@ -725,6 +784,19 @@ export declare class IrohConnection {
    * unauthorized stream is closed by the peer.
    */
   openExposeStream(serviceId: string, metadata?: Buffer | undefined | null): Promise<IrohBiStream>
+  /**
+   * Consumer side: relay one buffered HTTP request to the HTTP service
+   * `serviceId` and collect the response. Trailers do not cross the
+   * relay hop yet. A response that fails mid-body is an error, not a
+   * truncated body.
+   */
+  relayHttp(serviceId: string, request: RelayHttpRequest): Promise<RelayHttpResponse>
+  /**
+   * Consumer side: ask the edge at the other end to route `specs` to
+   * this node, attaching `metadata` for its route policy. Hold the
+   * registration for the routes to stay live.
+   */
+  requestRoute(specs: Array<ExposeRouteSpec>, metadata?: Buffer | undefined | null): Promise<RouteRegistration>
   /** The ALPN this connection was accepted on (set by acceptAster). */
   alpn(): string | null
   /** Open a bidirectional QUIC stream. Returns [sendStream, recvStream]. */
@@ -1092,6 +1164,18 @@ export declare class PolicyDoc {
 }
 
 /**
+ * A live route registration (`requestRoute`): the routes stay bound while
+ * it is open. `close()` ends it; dropping it does too.
+ */
+export declare class RouteRegistration {
+  /** The requested routes the edge granted. */
+  get granted(): Array<ExposeRouteSpec>
+  get closed(): boolean
+  /** End the registration (the edge evicts the routes). Idempotent. */
+  close(): Promise<void>
+}
+
+/**
  * A client over one `aster/1` connection: pooled unary calls, streaming
  * calls and session ids from the connection's shared counter.
  */
@@ -1196,6 +1280,11 @@ export declare class TopologySnapshot {
  * then (it does not keep the process alive).
  */
 export declare class Upcalls {
+  /**
+   * The body handle of the HTTP exchange `streamId` (a kind-49
+   * request's `streamId`); `maxChunk` is the handler's.
+   */
+  httpBody(streamId: number, maxChunk?: number | undefined | null): HttpBodyHandle
   /**
    * A table delivering to `onEvents` (called on the JavaScript thread
    * with each drained batch).
@@ -2075,6 +2164,14 @@ export interface DownloadPolicy {
  */
 export declare function dynamicServiceContractId(json: string): string
 
+/** A live route: where requests for `(host, port)` go. */
+export interface EdgeRouteInfo {
+  serviceId: string
+  protocol: string
+  /** The origin node (hex node id). */
+  nodeId: string
+}
+
 /** Encode a `CallHeader` to AEv1 bytes. */
 export declare function encodeCallHeader(h: NativeCallHeader): Buffer
 
@@ -2094,6 +2191,49 @@ export declare function encodeRpcStatus(s: NativeRpcStatus): Buffer
 
 /** Encode a `StreamHeader` to AEv1 bytes. */
 export declare function encodeStreamHeader(h: NativeStreamHeader): Buffer
+
+/**
+ * One HTTP header (or trailer): `name` is lowercase and non-empty; `value`
+ * is raw bytes.
+ */
+export interface ExposeHeader {
+  name: string
+  value: Buffer
+}
+
+/** Options of `Expose.exposeHttp` (all optional). */
+export interface ExposeHttpOptions {
+  /**
+   * A request with a declared `content-length` of at most this many bytes
+   * arrives inline; larger ones stream (default 65 536).
+   */
+  inlineRequestMax?: number
+  /**
+   * Cap on the request body: a declared length over it is a `413`
+   * without an upcall (default none).
+   */
+  maxRequestBody?: number
+  /**
+   * Cap on the response body: inline over it is a `502`, streamed is
+   * aborted (default none).
+   */
+  maxResponseBody?: number
+  /**
+   * Largest single body chunk: reads return at most this many bytes and
+   * `write` splits bigger chunks (default 1 MiB, must be > 0).
+   */
+  maxChunk?: number
+  /** Response chunks queued before `write` waits (default 8). */
+  responseBuffer?: number
+}
+
+/** A route an edge binds for a peer (`protocol`: `"http"` or `"tcp"`). */
+export interface ExposeRouteSpec {
+  host: string
+  port: number
+  protocol: string
+  serviceId: string
+}
 
 /**
  * The fencing token stamped on every protected action. `holder` is the hex
@@ -2602,6 +2742,21 @@ export interface ProviderOutcome {
  */
 export declare function reconcileGrant(identitySecret: string | Uint8Array, ctx: GrantContext, record?: Uint8Array | undefined | null, payload?: 'raw' | 'namespace'): GrantOutcome
 
+/** A buffered HTTP request for `IrohConnection.relayHttp`. */
+export interface RelayHttpRequest {
+  method?: string
+  uri?: string
+  headers?: Array<ExposeHeader>
+  body?: Buffer
+}
+
+/** The collected response of `IrohConnection.relayHttp`. */
+export interface RelayHttpResponse {
+  status: number
+  headers: Array<ExposeHeader>
+  body: Buffer
+}
+
 /** The result of `retireLocalWriteAuthority`. */
 export interface RetireOutcome {
   /**
@@ -2746,13 +2901,13 @@ export interface UpcallAdmissionHandshakeResponse {
  * `conformance/vectors/upcalls.json`, e.g. `"LeaseTransitionRequest"`).
  * Throws on any non-canonical input.
  */
-export declare function upcallCodecDecode(typeName: string, bytes: Buffer): UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse
+export declare function upcallCodecDecode(typeName: string, bytes: Buffer): UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse
 
 /**
  * Encode `value` as the UCv1 message of type `typeName` (the inverse of
  * `upcallCodecDecode`).
  */
-export declare function upcallCodecEncode(typeName: string, value: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse): Buffer
+export declare function upcallCodecEncode(typeName: string, value: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse): Buffer
 
 /** A yes/no answer (kinds 3, 48, 64). */
 export interface UpcallDecision {
@@ -2774,7 +2929,7 @@ export interface UpcallEventJs {
   /** When Rust stops waiting (Unix ms; 0 on a cancellation). */
   deadlineUnixMs: number
   cancelReason?: number
-  request?: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse
+  request?: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse
   /** Set when the request could not be decoded (answer it with an error). */
   error?: string
 }
@@ -2784,6 +2939,44 @@ export interface UpcallExposeAuthorizeRequest {
   serviceId: string
   peerId: string
   metadata: Buffer
+}
+
+/**
+ * expose HTTP handler request (kind 49). `body` is the whole inline body,
+ * or absent when it streams through the exchange's body handle
+ * (`streamId`; `Upcalls.httpBody`). `version`: `"HTTP/0.9"` ... `"HTTP/3"`.
+ */
+export interface UpcallExposeHttpRequest {
+  serviceId: string
+  peerId?: string
+  streamId: number
+  version: string
+  method: string
+  uri: string
+  headers: Array<ExposeHeader>
+  body?: Buffer
+}
+
+/**
+ * expose HTTP handler answer (kind 49). `body`: the inline body, or absent
+ * for a body the handler then writes through the body handle.
+ */
+export interface UpcallExposeHttpResponse {
+  status: number
+  headers: Array<ExposeHeader>
+  body?: Buffer
+}
+
+/** Edge route policy answer (kind 50): indexes into the request's `specs`. */
+export interface UpcallExposeRouteGrant {
+  granted: Array<number>
+}
+
+/** Edge route policy request (kind 50). */
+export interface UpcallExposeRoutePolicyRequest {
+  peerId: string
+  metadata: Buffer
+  specs: Array<ExposeRouteSpec>
 }
 
 /** `FencedResource::mutate` request (kind 4). */

@@ -60,6 +60,26 @@ function seedJson(s: Obj | null | undefined): unknown {
   };
 }
 
+const HTTP_VERSIONS = ['HTTP/0.9', 'HTTP/1.0', 'HTTP/1.1', 'HTTP/2', 'HTTP/3'];
+
+/** Header values render as `value` (UTF-8) or `value_hex`. */
+function headersJson(headers: Obj[]): unknown {
+  return headers.map((h) => {
+    const v = Buffer.from(h.value);
+    const text = new TextDecoder('utf-8', { fatal: true });
+    try {
+      return { name: h.name, value: text.decode(v) };
+    } catch {
+      return { name: h.name, value_hex: hex(v) };
+    }
+  });
+}
+
+/** `body` absent = streamed through the exchange's body handle. */
+function bodyJson(body: Buffer | undefined | null): unknown {
+  return body == null ? 'stream' : { inline: Buffer.from(body).toString('utf8') };
+}
+
 /** The binding's native object form → the vectors' JSON rendering. */
 function toVectorJson(type: string, v: Obj): unknown {
   switch (type) {
@@ -133,6 +153,29 @@ function toVectorJson(type: string, v: Obj): unknown {
       return seedJson(v);
     case 'ExposeAuthorizeRequest':
       return { service_id: v.serviceId, peer_id: v.peerId, metadata_hex: hex(v.metadata) };
+    case 'ExposeHttpRequest':
+      return {
+        body: bodyJson(v.body),
+        headers: headersJson(v.headers),
+        method: v.method,
+        peer_id: nul(v.peerId),
+        service_id: v.serviceId,
+        stream_id: v.streamId,
+        uri: v.uri,
+        version: HTTP_VERSIONS.indexOf(v.version),
+      };
+    case 'ExposeHttpResponse':
+      return { body: bodyJson(v.body), headers: headersJson(v.headers), status: v.status };
+    case 'ExposeHttpTrailers':
+      return headersJson(v as unknown as Obj[]);
+    case 'ExposeRoutePolicyRequest':
+      return {
+        metadata_hex: hex(v.metadata),
+        peer_id: v.peerId,
+        specs: v.specs.map((s: Obj) => ({ host: s.host, port: s.port, protocol: s.protocol, service_id: s.serviceId })),
+      };
+    case 'ExposeRouteGrant':
+      return { granted: v.granted };
     case 'AdmissionConnectRequest':
       return { peer: v.peer, alpn: Buffer.from(v.alpn).toString('utf8') };
     case 'AdmissionHandshakeRequest':
@@ -179,4 +222,23 @@ describe('R6 upcall vectors (UCv1)', () => {
       expect(() => upcallCodecDecode(c.type, Buffer.from(c.hex, 'hex'))).toThrow(/upcall codec/);
     });
   }
+
+  it('R9 encoders normalise what JavaScript hands them', () => {
+    // Header names are lowercased, a missing body is a streamed one, grants are sorted and de-duplicated.
+    const resp = upcallCodecEncode('ExposeHttpResponse', {
+      status: 204,
+      headers: [{ name: 'X-A', value: Buffer.from('b') }],
+    } as never);
+    const back = upcallCodecDecode('ExposeHttpResponse', resp) as Obj;
+    expect(back.headers.map((h: Obj) => [h.name, Buffer.from(h.value).toString()])).toEqual([['x-a', 'b']]);
+    expect(back.body == null).toBe(true);
+    const grant = upcallCodecEncode('ExposeRouteGrant', { granted: [2, 0, 2] });
+    expect((upcallCodecDecode('ExposeRouteGrant', grant) as Obj).granted).toEqual([0, 2]);
+    for (const status of [99, 1000]) {
+      expect(() => upcallCodecEncode('ExposeHttpResponse', { status, headers: [], body: Buffer.alloc(0) } as never)).toThrow();
+    }
+    expect(() =>
+      upcallCodecEncode('ExposeHttpResponse', { status: 200, headers: [{ name: '', value: Buffer.alloc(0) }] } as never),
+    ).toThrow();
+  });
 });

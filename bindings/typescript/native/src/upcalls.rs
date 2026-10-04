@@ -71,7 +71,7 @@ pub(crate) fn kind_in(code: u32) -> Result<UpcallKind> {
 }
 
 /// The UCv1 message type of a kind's request (`None`: no request payload
-/// type — `cancel`, and `expose_http` until R9).
+/// type — `cancel`).
 fn request_type(kind: UpcallKind) -> Option<&'static str> {
     Some(match kind {
         UpcallKind::LeaseTransition => "LeaseTransitionRequest",
@@ -83,6 +83,8 @@ fn request_type(kind: UpcallKind) -> Option<&'static str> {
         UpcallKind::PlacementPolicy => "PlacementPolicyRequest",
         UpcallKind::PlacementProvision => "PlacementProvisionRequest",
         UpcallKind::ExposeAuthorize => "ExposeAuthorizeRequest",
+        UpcallKind::ExposeHttp => "ExposeHttpRequest",
+        UpcallKind::ExposeRoutePolicy => "ExposeRoutePolicyRequest",
         UpcallKind::AdmissionConnect => "AdmissionConnectRequest",
         UpcallKind::AdmissionHandshake => "AdmissionHandshakeRequest",
         _ => return None,
@@ -102,6 +104,8 @@ fn response_type(kind: UpcallKind) -> Option<&'static str> {
         UpcallKind::TopologySnapshot => "TopologySnapshot",
         UpcallKind::PlacementPolicy => "PlacementPolicy",
         UpcallKind::PlacementProvision => "MemberSeed",
+        UpcallKind::ExposeHttp => "ExposeHttpResponse",
+        UpcallKind::ExposeRoutePolicy => "ExposeRouteGrant",
         UpcallKind::AdmissionHandshake => "AdmissionHandshakeResponse",
         _ => return None,
     })
@@ -267,6 +271,61 @@ pub struct UpcallExposeAuthorizeRequest {
     pub metadata: Buffer,
 }
 
+/// One HTTP header (or trailer): `name` is lowercase and non-empty; `value`
+/// is raw bytes.
+#[napi(object)]
+pub struct ExposeHeader {
+    pub name: String,
+    pub value: Buffer,
+}
+
+/// A route an edge binds for a peer (`protocol`: `"http"` or `"tcp"`).
+#[napi(object)]
+pub struct ExposeRouteSpec {
+    pub host: String,
+    pub port: u32,
+    pub protocol: String,
+    pub service_id: String,
+}
+
+/// expose HTTP handler request (kind 49). `body` is the whole inline body,
+/// or absent when it streams through the exchange's body handle
+/// (`streamId`; `Upcalls.httpBody`). `version`: `"HTTP/0.9"` ... `"HTTP/3"`.
+#[napi(object)]
+pub struct UpcallExposeHttpRequest {
+    pub service_id: String,
+    pub peer_id: Option<String>,
+    pub stream_id: f64,
+    pub version: String,
+    pub method: String,
+    pub uri: String,
+    pub headers: Vec<ExposeHeader>,
+    pub body: Option<Buffer>,
+}
+
+/// expose HTTP handler answer (kind 49). `body`: the inline body, or absent
+/// for a body the handler then writes through the body handle.
+#[napi(object)]
+pub struct UpcallExposeHttpResponse {
+    pub status: u32,
+    pub headers: Vec<ExposeHeader>,
+    pub body: Option<Buffer>,
+}
+
+/// Edge route policy request (kind 50).
+#[napi(object)]
+pub struct UpcallExposeRoutePolicyRequest {
+    pub peer_id: String,
+    pub metadata: Buffer,
+    pub specs: Vec<ExposeRouteSpec>,
+}
+
+/// Edge route policy answer (kind 50): indexes into the request's `specs`.
+#[napi(object)]
+pub struct UpcallExposeRouteGrant {
+    pub granted: Vec<u32>,
+}
+
 /// Gate 0 outbound connect request (kind 64).
 #[napi(object)]
 pub struct UpcallAdmissionConnectRequest {
@@ -309,6 +368,11 @@ pub enum UpcallValue {
     PlacementProvisionRequest(UpcallPlacementProvisionRequest),
     MemberSeed(CoordinationMemberSeed),
     ExposeAuthorizeRequest(UpcallExposeAuthorizeRequest),
+    ExposeHttpRequest(UpcallExposeHttpRequest),
+    ExposeHttpResponse(UpcallExposeHttpResponse),
+    ExposeHttpTrailers(Vec<ExposeHeader>),
+    ExposeRoutePolicyRequest(UpcallExposeRoutePolicyRequest),
+    ExposeRouteGrant(UpcallExposeRouteGrant),
     AdmissionConnectRequest(UpcallAdmissionConnectRequest),
     AdmissionHandshakeRequest(UpcallAdmissionHandshakeRequest),
     AdmissionHandshakeResponse(UpcallAdmissionHandshakeResponse),
@@ -344,6 +408,11 @@ impl ToNapiValue for UpcallValue {
                 V::PlacementProvisionRequest(v) => ToNapiValue::to_napi_value(env, v),
                 V::MemberSeed(v) => ToNapiValue::to_napi_value(env, v),
                 V::ExposeAuthorizeRequest(v) => ToNapiValue::to_napi_value(env, v),
+                V::ExposeHttpRequest(v) => ToNapiValue::to_napi_value(env, v),
+                V::ExposeHttpResponse(v) => ToNapiValue::to_napi_value(env, v),
+                V::ExposeHttpTrailers(v) => ToNapiValue::to_napi_value(env, v),
+                V::ExposeRoutePolicyRequest(v) => ToNapiValue::to_napi_value(env, v),
+                V::ExposeRouteGrant(v) => ToNapiValue::to_napi_value(env, v),
                 V::AdmissionConnectRequest(v) => ToNapiValue::to_napi_value(env, v),
                 V::AdmissionHandshakeRequest(v) => ToNapiValue::to_napi_value(env, v),
                 V::AdmissionHandshakeResponse(v) => ToNapiValue::to_napi_value(env, v),
@@ -422,6 +491,102 @@ fn provision_in(p: &UpcallPlacementProvisionRequest) -> Result<ProvisionRequest>
         policy_digest: hex32(&p.policy_digest, "policyDigest")?,
         membership_log_id: opt_log_in(&p.membership_log_id)?,
         node_id: CoordinationNodeId::from_array(hex32(&p.node_id, "nodeId")?),
+    })
+}
+
+const HTTP_VERSIONS: [&str; 5] = ["HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3"];
+
+pub(crate) fn headers_out(h: Vec<codec::HttpHeader>) -> Vec<ExposeHeader> {
+    h.into_iter()
+        .map(|(name, value)| ExposeHeader {
+            name,
+            value: value.into(),
+        })
+        .collect()
+}
+
+/// Header names are lowercased; an empty name is refused.
+pub(crate) fn headers_in(h: &[ExposeHeader], what: &str) -> Result<Vec<codec::HttpHeader>> {
+    h.iter()
+        .map(|h| {
+            if h.name.is_empty() {
+                return Err(invalid(format!("{what}: empty header name")));
+            }
+            Ok((h.name.to_ascii_lowercase(), h.value.to_vec()))
+        })
+        .collect()
+}
+
+fn body_out(b: codec::HttpBodyMode) -> Option<Buffer> {
+    match b {
+        codec::HttpBodyMode::Inline(v) => Some(v.into()),
+        codec::HttpBodyMode::Stream => None,
+    }
+}
+
+fn body_in(b: &Option<Buffer>) -> codec::HttpBodyMode {
+    match b {
+        Some(b) => codec::HttpBodyMode::Inline(b.to_vec()),
+        None => codec::HttpBodyMode::Stream,
+    }
+}
+
+fn protocol_in(p: &str) -> Result<u8> {
+    match p {
+        "http" => Ok(0),
+        "tcp" => Ok(1),
+        other => Err(invalid(format!(
+            "route protocol must be http or tcp, got {other:?}"
+        ))),
+    }
+}
+
+fn port_in(p: u32) -> Result<u16> {
+    u16::try_from(p).map_err(|_| invalid("route port must be 0..=65535"))
+}
+
+pub(crate) fn route_spec_to_core(s: &ExposeRouteSpec) -> Result<aster::expose::RouteSpec> {
+    use aster::expose::RouteProtocol;
+    Ok(aster::expose::RouteSpec {
+        host: s.host.clone(),
+        port: port_in(s.port)?,
+        protocol: if protocol_in(&s.protocol)? == 1 {
+            RouteProtocol::Tcp
+        } else {
+            RouteProtocol::Http
+        },
+        service_id: s.service_id.clone(),
+    })
+}
+
+pub(crate) fn route_spec_from_core(s: &aster::expose::RouteSpec) -> ExposeRouteSpec {
+    ExposeRouteSpec {
+        host: s.host.clone(),
+        port: s.port.into(),
+        protocol: match s.protocol {
+            aster::expose::RouteProtocol::Http => "http",
+            aster::expose::RouteProtocol::Tcp => "tcp",
+        }
+        .into(),
+        service_id: s.service_id.clone(),
+    }
+}
+
+fn route_spec_out(s: codec::ExposeRouteSpec) -> ExposeRouteSpec {
+    ExposeRouteSpec {
+        host: s.host,
+        port: s.port.into(),
+        protocol: if s.protocol == 1 { "tcp" } else { "http" }.into(),
+        service_id: s.service_id,
+    }
+}
+
+fn route_spec_in(s: &ExposeRouteSpec) -> Result<codec::ExposeRouteSpec> {
+    Ok(codec::ExposeRouteSpec {
+        host: s.host.clone(),
+        port: port_in(s.port)?,
+        protocol: protocol_in(&s.protocol)?,
+        service_id: s.service_id.clone(),
     })
 }
 
@@ -517,6 +682,45 @@ pub(crate) fn decode_value(ty: &str, b: &[u8]) -> Result<UpcallValue> {
                 metadata: metadata.into(),
             })
         }
+        "ExposeHttpRequest" => {
+            let r = codec::decode_expose_http_request(b).map_err(codec_err)?;
+            if r.stream_id > MAX_SAFE_INTEGER {
+                return Err(invalid("stream_id past 2^53"));
+            }
+            V::ExposeHttpRequest(UpcallExposeHttpRequest {
+                service_id: r.service_id,
+                peer_id: r.peer_id,
+                stream_id: r.stream_id as f64,
+                version: HTTP_VERSIONS[r.version as usize].into(),
+                method: r.method,
+                uri: r.uri,
+                headers: headers_out(r.headers),
+                body: body_out(r.body),
+            })
+        }
+        "ExposeHttpResponse" => {
+            let r = codec::decode_expose_http_response(b).map_err(codec_err)?;
+            V::ExposeHttpResponse(UpcallExposeHttpResponse {
+                status: r.status.into(),
+                headers: headers_out(r.headers),
+                body: body_out(r.body),
+            })
+        }
+        "ExposeHttpTrailers" => V::ExposeHttpTrailers(headers_out(
+            codec::decode_expose_http_trailers(b).map_err(codec_err)?,
+        )),
+        "ExposeRoutePolicyRequest" => {
+            let (peer_id, metadata, specs) =
+                codec::decode_expose_route_policy_request(b).map_err(codec_err)?;
+            V::ExposeRoutePolicyRequest(UpcallExposeRoutePolicyRequest {
+                peer_id,
+                metadata: metadata.into(),
+                specs: specs.into_iter().map(route_spec_out).collect(),
+            })
+        }
+        "ExposeRouteGrant" => V::ExposeRouteGrant(UpcallExposeRouteGrant {
+            granted: codec::decode_expose_route_grant(b).map_err(codec_err)?,
+        }),
         "AdmissionConnectRequest" => {
             let (peer, alpn) = codec::decode_admission_connect_request(b).map_err(codec_err)?;
             V::AdmissionConnectRequest(UpcallAdmissionConnectRequest {
@@ -641,6 +845,66 @@ pub(crate) fn encode_value(env: &Env, ty: &str, v: &Unknown) -> Result<Vec<u8>> 
             let r: UpcallExposeAuthorizeRequest = from_js(env, v)?;
             codec::encode_expose_authorize_request(&r.service_id, &r.peer_id, &r.metadata)
         }
+        "ExposeHttpRequest" => {
+            let r: UpcallExposeHttpRequest = from_js(env, v)?;
+            if r.method.is_empty() {
+                return Err(invalid("HTTP method must be non-empty"));
+            }
+            let version = HTTP_VERSIONS
+                .iter()
+                .position(|x| *x == r.version)
+                .ok_or_else(|| invalid(format!("HTTP version must be one of {HTTP_VERSIONS:?}")))?;
+            if !r.stream_id.is_finite()
+                || r.stream_id < 0.0
+                || r.stream_id.fract() != 0.0
+                || r.stream_id > MAX_SAFE_INTEGER as f64
+            {
+                return Err(invalid("streamId must be a non-negative safe integer"));
+            }
+            codec::encode_expose_http_request(&codec::ExposeHttpRequest {
+                service_id: r.service_id,
+                peer_id: r.peer_id,
+                stream_id: r.stream_id as u64,
+                version: version as u8,
+                method: r.method,
+                uri: r.uri,
+                headers: headers_in(&r.headers, "headers")?,
+                body: body_in(&r.body),
+            })
+        }
+        "ExposeHttpResponse" => {
+            let r: UpcallExposeHttpResponse = from_js(env, v)?;
+            if !(100..=999).contains(&r.status) {
+                return Err(invalid(format!(
+                    "HTTP status must be 100..=999, got {}",
+                    r.status
+                )));
+            }
+            codec::encode_expose_http_response(&codec::ExposeHttpResponse {
+                status: r.status as u16,
+                headers: headers_in(&r.headers, "headers")?,
+                body: body_in(&r.body),
+            })
+        }
+        "ExposeHttpTrailers" => {
+            let t: Vec<ExposeHeader> = from_js(env, v)?;
+            codec::encode_expose_http_trailers(&headers_in(&t, "trailers")?)
+        }
+        "ExposeRoutePolicyRequest" => {
+            let r: UpcallExposeRoutePolicyRequest = from_js(env, v)?;
+            let specs = r
+                .specs
+                .iter()
+                .map(route_spec_in)
+                .collect::<Result<Vec<_>>>()?;
+            codec::encode_expose_route_policy_request(&r.peer_id, &r.metadata, &specs)
+        }
+        "ExposeRouteGrant" => {
+            let mut g: UpcallExposeRouteGrant = from_js(env, v)?;
+            g.granted.sort_unstable();
+            g.granted.dedup();
+            codec::encode_expose_route_grant(&g.granted)
+        }
         "AdmissionConnectRequest" => {
             let r: UpcallAdmissionConnectRequest = from_js(env, v)?;
             codec::encode_admission_connect_request(&r.peer, &r.alpn)
@@ -670,7 +934,7 @@ pub(crate) fn encode_value(env: &Env, ty: &str, v: &Unknown) -> Result<Vec<u8>> 
 /// `conformance/vectors/upcalls.json`, e.g. `"LeaseTransitionRequest"`).
 /// Throws on any non-canonical input.
 #[napi(
-    ts_return_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
+    ts_return_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
 )]
 pub fn upcall_codec_decode(type_name: String, bytes: Buffer) -> Result<UpcallValue> {
     decode_value(&type_name, &bytes)
@@ -683,7 +947,7 @@ pub fn upcall_codec_encode(
     env: Env,
     type_name: String,
     #[napi(
-        ts_arg_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
+        ts_arg_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
     )]
     value: Unknown,
 ) -> Result<Buffer> {
@@ -702,7 +966,7 @@ pub struct UpcallEventJs {
     pub deadline_unix_ms: f64,
     pub cancel_reason: Option<u32>,
     #[napi(
-        ts_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
+        ts_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
     )]
     pub request: Option<UpcallValue>,
     /// Set when the request could not be decoded (answer it with an error).
@@ -885,6 +1149,8 @@ pub struct UpcallStats {
 pub struct Upcalls {
     inner: RsUpcalls,
     sink: Arc<TsfnUpcallSink>,
+    /// The body handles of expose HTTP exchanges (R9) served on this table.
+    pub(crate) bodies: aster::binding_support::upcall::expose::HttpBodies,
 }
 
 impl Upcalls {
@@ -943,6 +1209,7 @@ impl Upcalls {
         Ok(Self {
             inner: RsUpcalls::new(sink.clone()),
             sink,
+            bodies: aster::binding_support::upcall::expose::HttpBodies::new(),
         })
     }
 
