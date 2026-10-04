@@ -13,17 +13,17 @@ import asyncio
 import pathlib
 import sys
 
-from aster import IrohNode, blobs_client
+from aster import Node, blobs_client
 
 
 async def main(path: str) -> None:
     file_path = pathlib.Path(path)
     data = file_path.read_bytes()
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     blobs = blobs_client(node)
 
-    # Store as a Collection (HashSeq) — this is what sendme expects
+    # Store as a Collection (HashSeq) -- this is what sendme expects
     collection_hash = await blobs.add_bytes_as_collection(file_path.name, data)
     ticket = blobs.create_collection_ticket(collection_hash)
 

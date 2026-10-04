@@ -18,7 +18,7 @@ import pytest
 pytestmark = pytest.mark.iroh_primitives
 import pytest_asyncio
 
-from aster import IrohNode, gossip_client, GossipTopicHandle
+from aster import Node, gossip_client, GossipTopicHandle
 
 
 TOPIC = bytes(32)  # 32 zero bytes as topic ID
@@ -58,9 +58,9 @@ def decode_chat_message(data: bytes) -> dict:
 
 @pytest_asyncio.fixture
 async def node_pair():
-    """Create two IrohNodes for gossip testing."""
-    node1 = await IrohNode.memory()
-    node2 = await IrohNode.memory()
+    """Create two Nodes for gossip testing."""
+    node1 = await Node.start()
+    node2 = await Node.start()
     yield node1, node2
     await node1.shutdown()
     await node2.shutdown()

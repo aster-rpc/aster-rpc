@@ -10,7 +10,13 @@ name    = "_aster"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Core transport layer - the authoritative backend for all Python bindings
+# The `aster` crate is the binding's backend (plan D1): Node, AsterConfig and
+# its env/TOML loaders, typed ids, the secret-key file. Binding profile =
+# default + rpc + metrics + binding-support (see aster/Cargo.toml).
+aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support"] }
+# Transport core, still driven directly for the reactor ring, client-call
+# pool, tunnels and bare endpoints (reached from `aster` handles through
+# `aster::binding_support`).
 aster_transport_core = { path = "../../../core", version = "=0.3.0" }
 
 # Python FFI

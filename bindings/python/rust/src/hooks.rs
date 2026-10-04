@@ -256,7 +256,7 @@ impl HookManager {
 // =============================================================================
 //
 // The receiver above is a stub. This is the real thing, consumed by
-// IrohNode.take_hook_receiver() when built with enable_hooks=true.
+// Node.take_hook_receiver() when built with enable_hooks=true.
 //
 // Design:
 //   * A background tokio task auto-accepts every `before_connect` request
@@ -335,7 +335,7 @@ type AfterHandshakeRx = Arc<
     >,
 >;
 
-/// Node-level hook receiver. Obtained via `IrohNode.take_hook_receiver()`.
+/// Node-level hook receiver. Obtained via `Node.take_hook_receiver()`.
 /// Call `recv()` in a loop to drain after-handshake events and make Gate 0
 /// decisions; `before_connect` is auto-accepted in the background task.
 #[pyclass]

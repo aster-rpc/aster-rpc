@@ -66,7 +66,12 @@ def test_specific_errors_are_iroh_error_subclasses():
 # ---------------------------------------------------------------------------
 
 _CLASS_NAMES = [
-    "IrohNode",
+    "Node",
+    "AsterConfig",
+    "SecretKey",
+    "PublicKey",
+    "NodeId",
+    "Hash",
     "BlobsClient",
     "BlobStatusResult",
     "BlobObserveResult",
@@ -123,8 +128,16 @@ def test_is_callable(name):
     assert callable(obj), f"{name} is not callable"
 
 
-def test_load_endpoint_config_is_callable():
-    assert callable(ap.load_endpoint_config)
+def test_aster_config_loaders_are_callable():
+    assert callable(ap.AsterConfig.from_env)
+    assert callable(ap.AsterConfig.from_file)
+    assert callable(ap.Node.start)
+
+
+def test_iroh_node_is_gone():
+    # Replaced by aster.Node over aster::Node (plan P1).
+    assert not hasattr(ap, "IrohNode")
+    assert not hasattr(ap, "load_endpoint_config")
 
 
 @pytest.mark.parametrize(

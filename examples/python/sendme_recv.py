@@ -10,11 +10,11 @@ import asyncio
 import pathlib
 import sys
 
-from aster import IrohNode, blobs_client
+from aster import Node, blobs_client
 
 
 async def main(ticket: str, output: str | None) -> None:
-    node = await IrohNode.memory()
+    node = await Node.start()
     blobs = blobs_client(node)
 
     try:

@@ -8,7 +8,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use aster_transport_core::{CoreGossipClient, CoreGossipTopic};
 
 use crate::error::err_to_py;
-use crate::node::IrohNode;
+use crate::node::Node;
 use crate::PyBytesResult;
 
 // ============================================================================
@@ -107,9 +107,9 @@ impl GossipClient {
 // Factory function
 // ============================================================================
 
-/// Extract a GossipClient from an IrohNode.
+/// Extract a GossipClient from a Node.
 #[pyfunction]
-pub fn gossip_client(node: &IrohNode) -> GossipClient {
+pub fn gossip_client(node: &Node) -> GossipClient {
     GossipClient::from(node.inner().gossip_client())
 }
 

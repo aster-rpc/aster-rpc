@@ -35,8 +35,7 @@ from aster import (
     AsterServer,
     AsterTicket,
     client_stream,
-    EndpointConfig,
-    IrohNode,
+    Node,
     NodeAddr,
     RPC_ALPN,
     create_client,
@@ -157,9 +156,7 @@ async def _wait_stdin_eof() -> None:
 
 
 async def serve() -> None:
-    config = AsterConfig.from_env()
-    config.relay_mode = "disabled"
-    config.bind_addr = "127.0.0.1:0"
+    config = AsterConfig.from_env().replace(relay_mode="disabled", bind_addr="127.0.0.1:0")
     srv = AsterServer(services=[InteropEcho()], config=config, allow_all_consumers=True)
     await srv.start()
     for _ in range(100):
@@ -176,8 +173,8 @@ async def serve() -> None:
 
 
 async def run_client(ticket_str: str) -> bool:
-    cfg = EndpointConfig(alpns=[RPC_ALPN], relay_mode="disabled", bind_addr="127.0.0.1:0")
-    node = await IrohNode.memory_with_alpns([RPC_ALPN], cfg)
+    cfg = AsterConfig(alpns=(RPC_ALPN,), relay_mode="disabled", bind_addr="127.0.0.1:0")
+    node = await Node.start(cfg)
     try:
         t = AsterTicket.from_string(ticket_str)
         addr = NodeAddr(endpoint_id=t.endpoint_id, relay_url=None, direct_addresses=t.direct_addrs)

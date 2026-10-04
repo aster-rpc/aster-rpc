@@ -285,9 +285,9 @@ class FastService: ...
 Content-addressed blob storage with BLAKE3 hashing.
 
 ```python
-from aster import IrohNode, blobs_client
+from aster import AsterConfig, Node, blobs_client
 
-node = await IrohNode.persistent(".aster-data")  # or IrohNode.memory() for ephemeral
+node = await Node.start(AsterConfig(storage_path=".aster-data", secret_key_file=".aster-data/node.key"))  # or Node.start() for in-memory
 blobs = blobs_client(node)
 
 # Store and retrieve
@@ -320,9 +320,9 @@ data = await blobs.download_blob(ticket)
 Replicated key-value store with conflict-free merging.
 
 ```python
-from aster import IrohNode, docs_client
+from aster import AsterConfig, Node, docs_client
 
-node = await IrohNode.persistent(".aster-data")
+node = await Node.start(AsterConfig(storage_path=".aster-data", secret_key_file=".aster-data/node.key"))
 docs = docs_client(node)
 
 # Create a document and author
@@ -371,10 +371,10 @@ await doc.set_download_policy("nothing_except", [b"important/"])
 Ephemeral topic-based broadcast. No persistence.
 
 ```python
-from aster import IrohNode, gossip_client
+from aster import AsterConfig, Node, gossip_client
 import os
 
-node = await IrohNode.persistent(".aster-data")
+node = await Node.start(AsterConfig(storage_path=".aster-data", secret_key_file=".aster-data/node.key"))
 gossip = gossip_client(node)
 
 # Subscribe to a topic (32-byte identifier)

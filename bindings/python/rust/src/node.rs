@@ -1,112 +1,135 @@
-//! Node module - wraps CoreNode from aster_transport_core.
+//! `Node` -- a running `aster::Node`, built from an `AsterConfig`.
 //!
-//! Phase 2: Now wraps aster_transport_core::CoreNode instead of iroh types directly.
+//! Python usage (see `docs/aster-python-getstarted.md`)::
+//!
+//!     node = await Node.start(AsterConfig(storage_path="/var/lib/app"))
+//!     ...
+//!     await node.shutdown()
+//!
+//!     # or, closed on exit:
+//!     async with await Node.start(config) as node:
+//!         ...
+//!
+//! The protocol clients (`blobs_client(node)`, `docs_client(node)`,
+//! `gossip_client(node)`, `net_client(node)`) and the RPC reactor still drive
+//! the transport-core node, reached through `aster::binding_support`.
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use aster_transport_core::CoreNode;
+use aster::binding_support::CoreNode;
 
+use crate::config::NativeAsterConfig;
 use crate::ensure_tokio_runtime;
-use crate::error::err_to_py;
+use crate::error::{aster_err_to_py, err_to_py};
 use crate::hooks::NodeHookReceiver;
-use crate::net::{EndpointConfig, IrohConnection, NodeAddr};
+use crate::ids::{NodeId, SecretKey};
+use crate::net::{IrohConnection, NodeAddr};
 
-/// IrohNode – wrapper for CoreNode with all protocols enabled.
-#[pyclass]
-pub struct IrohNode {
-    pub(crate) inner: CoreNode,
+/// A running Aster node (blobs + docs + gossip, plus any extra ALPNs).
+#[pyclass(module = "aster._aster")]
+pub struct Node {
+    pub(crate) inner: aster::Node,
 }
 
-impl IrohNode {
-    /// Get the inner CoreNode for use by other modules.
+impl Node {
+    /// The transport-core node, for the protocol clients and the reactor.
     pub(crate) fn inner(&self) -> &CoreNode {
-        &self.inner
+        self.inner.core_node()
     }
+}
+
+/// Accept `None`, a `NativeAsterConfig`, or anything with a `_native()`
+/// method returning one (the Python `aster.AsterConfig` dataclass).
+fn extract_config(config: Option<&Bound<'_, PyAny>>) -> PyResult<aster::AsterConfig> {
+    let Some(obj) = config.filter(|c| !c.is_none()) else {
+        return Ok(aster::AsterConfig::default());
+    };
+    if let Ok(native) = obj.cast::<NativeAsterConfig>() {
+        return Ok(native.get().inner.clone());
+    }
+    if obj.hasattr("_native")? {
+        let native = obj.call_method0("_native")?;
+        if let Ok(native) = native.cast::<NativeAsterConfig>() {
+            return Ok(native.get().inner.clone());
+        }
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "Node.start: config must be an aster.AsterConfig",
+    ))
 }
 
 #[pymethods]
-impl IrohNode {
-    /// Create an in-memory Iroh node with all protocols.
+impl Node {
+    /// Start a node from `config` (an `aster.AsterConfig`; default: an
+    /// in-memory node with default relays). `alpns` adds inbound ALPNs on top
+    /// of `config.alpns`; poll them with `accept_aster()`.
+    ///
+    /// The node is persistent when `config.storage_path` is set. A
+    /// `config.secret_key_file` is loaded, or created (mode 0600) from
+    /// `config.secret_key` or a fresh key; a malformed file, or one that
+    /// disagrees with `secret_key`, raises `ValueError`.
     #[staticmethod]
-    fn memory<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        ensure_tokio_runtime();
-        future_into_py(py, async move {
-            CoreNode::memory()
-                .await
-                .map(IrohNode::from)
-                .map_err(err_to_py)
-        })
-    }
-
-    /// Create a persistent Iroh node backed by an FsStore at the given path.
-    #[staticmethod]
-    fn persistent<'py>(py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        ensure_tokio_runtime();
-        future_into_py(py, async move {
-            CoreNode::persistent(path)
-                .await
-                .map(IrohNode::from)
-                .map_err(err_to_py)
-        })
-    }
-
-    /// Create an in-memory Iroh node that serves blobs + docs + gossip AND
-    /// accepts connections on each entry in `aster_alpns` (custom Aster
-    /// protocols). Poll incoming aster-ALPN connections via `accept_aster()`.
-    /// `endpoint_config` (optional) applies the same `enable_hooks` /
-    /// `enable_monitoring` / `secret_key` / `relay_mode` / `bind_addr`
-    /// surface as `create_endpoint_with_config`.
-    #[staticmethod]
-    #[pyo3(signature = (aster_alpns, endpoint_config=None))]
-    fn memory_with_alpns<'py>(
+    #[pyo3(signature = (config=None, *, alpns=None))]
+    fn start<'py>(
         py: Python<'py>,
-        aster_alpns: Vec<Vec<u8>>,
-        endpoint_config: Option<&EndpointConfig>,
+        config: Option<&Bound<'py, PyAny>>,
+        alpns: Option<Vec<Vec<u8>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_tokio_runtime();
-        let core_cfg = endpoint_config
-            .map(EndpointConfig::to_core_config)
-            .transpose()?;
+        let config = extract_config(config)?;
+        let alpns = alpns.unwrap_or_default();
         future_into_py(py, async move {
-            CoreNode::memory_with_alpns(aster_alpns, core_cfg)
+            aster::Node::start_with_alpns(config, alpns)
                 .await
-                .map(IrohNode::from)
-                .map_err(err_to_py)
+                .map(|inner| Node { inner })
+                .map_err(aster_err_to_py)
         })
     }
 
-    /// Persistent (FsStore-backed) counterpart to `memory_with_alpns`.
-    #[staticmethod]
-    #[pyo3(signature = (path, aster_alpns, endpoint_config=None))]
-    fn persistent_with_alpns<'py>(
-        py: Python<'py>,
-        path: String,
-        aster_alpns: Vec<Vec<u8>>,
-        endpoint_config: Option<&EndpointConfig>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        ensure_tokio_runtime();
-        let core_cfg = endpoint_config
-            .map(EndpointConfig::to_core_config)
-            .transpose()?;
-        future_into_py(py, async move {
-            CoreNode::persistent_with_alpns(path, aster_alpns, core_cfg)
-                .await
-                .map(IrohNode::from)
-                .map_err(err_to_py)
-        })
+    /// This node's id.
+    #[getter]
+    fn id(&self) -> NodeId {
+        NodeId::from_trusted_hex(self.inner.id().into_string())
     }
 
-    /// Await the next incoming aster-ALPN connection. Returns
-    /// `(bytes, IrohConnection)` tuple. Raises when the node closes.
+    /// This node's id as a hex string (same value as `str(node.id)`).
+    fn node_id(&self) -> String {
+        self.inner.id().into_string()
+    }
+
+    /// Return the node's address info (debug format).
+    fn node_addr(&self) -> String {
+        format!("{:?}", self.inner().node_addr_info())
+    }
+
+    /// Return the node's structured address info.
+    fn node_addr_info(&self) -> NodeAddr {
+        NodeAddr::from(self.inner().node_addr_info())
+    }
+
+    /// The node's secret key (restore the identity via
+    /// `AsterConfig(secret_key=...)` or persist it with `write_file`).
+    fn secret_key(&self) -> PyResult<SecretKey> {
+        self.inner
+            .export_secret_key()
+            .map(|inner| SecretKey { inner })
+            .map_err(aster_err_to_py)
+    }
+
+    /// The node's secret key as 32 raw bytes.
+    fn export_secret_key<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner().export_secret_key())
+    }
+
+    /// Await the next incoming connection on a custom ALPN. Returns
+    /// `(alpn: bytes, IrohConnection)`. Raises when the node closes.
     fn accept_aster<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let node = self.inner.clone();
+        let node = self.inner().clone();
         future_into_py(py, async move {
             let (alpn, conn) = node.accept_aster().await.map_err(err_to_py)?;
             let conn_wrapper = IrohConnection::from(conn);
-            // Wrap the alpn bytes in a Python `bytes` object (Vec<u8> would
-            // otherwise come across as list[int]).
             Python::attach(|py| {
                 let alpn_bytes: Py<PyAny> = PyBytes::new(py, &alpn).into();
                 let conn_py: Py<PyAny> = Py::new(py, conn_wrapper)?.into_any();
@@ -116,11 +139,10 @@ impl IrohNode {
         })
     }
 
-    /// Take this node's Phase 1b hook receiver (one-shot). Returns `None`
-    /// if hooks weren't enabled at construction or the receiver was taken.
-    /// Must be awaited because the receiver spawns a background tokio task.
+    /// Take this node's admission hook receiver (one-shot). `None` unless the
+    /// node was started with `enable_hooks=True`, or if already taken.
     fn take_hook_receiver<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let node = self.inner.clone();
+        let node = self.inner().clone();
         future_into_py(py, async move {
             match node.take_hook_receiver() {
                 Some(core_rx) => Ok(Some(NodeHookReceiver::from_core(core_rx))),
@@ -129,73 +151,63 @@ impl IrohNode {
         })
     }
 
-    /// Whether this node was built with `enable_hooks=true`.
+    /// Whether this node was started with `enable_hooks=True`.
     fn has_hooks(&self) -> bool {
-        self.inner.has_hooks()
+        self.inner().has_hooks()
     }
 
-    /// Return this node's EndpointId as a hex string.
-    fn node_id(&self) -> String {
-        self.inner.node_id()
+    /// Teach this node how to reach `other` directly (tests / local setups).
+    fn add_node_addr(&self, other: &Node) -> PyResult<()> {
+        self.inner.add_peer(&other.inner).map_err(aster_err_to_py)
     }
 
-    /// Return the node's address info (debug format).
-    fn node_addr(&self) -> String {
-        format!("{:?}", self.inner.node_addr_info())
+    /// Transport metrics in Prometheus text exposition format.
+    fn transport_metrics_prometheus(&self) -> String {
+        self.inner.metrics_prometheus()
     }
 
-    /// Return the node's structured address info.
-    fn node_addr_info(&self) -> NodeAddr {
-        let addr = self.inner.node_addr_info();
-        NodeAddr {
-            endpoint_id: addr.endpoint_id,
-            relay_url: addr.relay_url,
-            direct_addresses: addr.direct_addresses,
-        }
-    }
-
-    /// Gracefully shut down the node.
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Gracefully shut down the node (flushes persistent state first).
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let node = self.inner.clone();
         future_into_py(py, async move {
-            node.close().await;
+            node.shutdown().await;
             Ok(())
         })
     }
 
-    /// Alias for close() — gracefully shut down the node.
-    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.close(py)
+    /// Alias for `shutdown()`.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.shutdown(py)
     }
 
-    /// Add another node's address info so this node can connect to it.
-    /// Used for peer discovery in testing/local scenarios.
-    fn add_node_addr(&self, other: &IrohNode) -> PyResult<()> {
-        self.inner.add_node_addr(&other.inner).map_err(err_to_py)
+    fn __aenter__<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let obj: Py<PyAny> = slf.into_any().unbind();
+        future_into_py(py, async move { Ok(obj) })
     }
 
-    /// Export the node's secret key as 32 bytes.
-    fn export_secret_key(&self) -> Vec<u8> {
-        self.inner.export_secret_key()
+    #[pyo3(signature = (_exc_type=None, _exc=None, _tb=None))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Option<Bound<'py, PyAny>>,
+        _exc: Option<Bound<'py, PyAny>>,
+        _tb: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let node = self.inner.clone();
+        future_into_py(py, async move {
+            node.shutdown().await;
+            Ok(false)
+        })
     }
 
-    /// Export all transport-level metrics in Prometheus text exposition format.
-    ///
-    /// Covers socket I/O, path counts, holepunching, relay, and net report
-    /// counters. Merge with Aster RPC metrics for a single scrape target.
-    fn transport_metrics_prometheus(&self) -> String {
-        self.inner.transport_metrics_prometheus()
-    }
-}
-
-impl From<CoreNode> for IrohNode {
-    fn from(inner: CoreNode) -> Self {
-        Self { inner }
+    fn __repr__(&self) -> String {
+        format!("Node(id='{}')", self.inner.id())
     }
 }
 
 /// Register the node types with the Python module
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<IrohNode>()?;
+    m.add_class::<Node>()?;
     Ok(())
 }

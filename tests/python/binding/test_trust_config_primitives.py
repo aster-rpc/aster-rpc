@@ -49,7 +49,7 @@ def test_hpke_envelope_round_trip_with_associated_data():
 
 @pytest.mark.asyncio
 async def test_ticket_free_namespace_import_open_helpers():
-    node = await aster.IrohNode.memory()
+    node = await aster.Node.start()
     try:
         docs = aster.docs_client(node)
         secret = bytes([0x55]) * 32

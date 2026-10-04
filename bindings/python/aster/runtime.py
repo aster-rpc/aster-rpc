@@ -6,7 +6,8 @@ Thin composition over the existing low-level primitives
 :func:`aster.client.create_client`) to give application code a one-line,
 declarative producer/consumer experience.
 
-The ``AsterServer`` builds a single ``IrohNode`` serving blobs + docs +
+The ``AsterServer`` starts a single :class:`aster.Node` (``aster::Node``,
+configured by :class:`aster.AsterConfig`) serving blobs + docs +
 gossip + aster RPC + admission ALPNs on one endpoint, one node ID. Gate 0
 (connection-level admission hook, trust spec §3.3) is automatically wired
 when any admission flag is active.
@@ -50,10 +51,8 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 from . import (
-    IrohNode,
-    EndpointConfig,
+    Node,
     NodeAddr,
-    create_endpoint_with_config,
     net_client,
     blobs_client,
     docs_client,
@@ -144,7 +143,7 @@ class AdmissionDeniedError(PermissionError):
 class AsterServer:
     """High-level, declarative producer.
 
-    Builds a single :class:`IrohNode` that serves blobs + docs + gossip
+    Starts a single :class:`aster.Node` that serves blobs + docs + gossip
     (iroh built-in protocols) alongside aster RPC (``aster/1``) and any
     enabled admission ALPNs -- all on **one endpoint, one node ID**.
 
@@ -167,7 +166,6 @@ class AsterServer:
         root_pubkey: bytes | None = None,
         allow_all_consumers: bool | None = None,
         allow_all_producers: bool | None = None,
-        endpoint_config: EndpointConfig | None = None,
         # Internal wiring:
         channel_name: str = "rpc",
         codec: Any | None = None,
@@ -192,7 +190,9 @@ class AsterServer:
                 At least one is required.
             config: Optional :class:`AsterConfig` for trust, storage, and
                 networking settings. If omitted, settings are loaded from
-                environment variables and defaults.
+                environment variables and defaults. With ``storage_path``
+                set the node is persistent; its key is kept in
+                ``secret_key_file`` (default ``<storage_path>/node.key``).
             peer: Optional peer name for this server (used in config lookup
                 and identity file resolution).
             identity: Path to ``.aster-identity`` file (default: auto-detected
@@ -205,7 +205,6 @@ class AsterServer:
                 mesh admission (``aster.producer_admission``) is not
                 supported; ``False`` raises ``NotImplementedError``.
                 Overrides ``config.allow_all_producers``.
-            endpoint_config: Low-level iroh endpoint configuration.
 
         Example::
 
@@ -227,8 +226,7 @@ class AsterServer:
         if config is None:
             config = AsterConfig.from_env()
         if identity is not None:
-            config.identity_file = identity
-        self._config = config
+            config = config.replace(identity_file=identity)
 
         # Inline overrides win over config.
         self._allow_all_consumers = (
@@ -255,13 +253,12 @@ class AsterServer:
         if peer_entry and not root_pubkey:
             # Root pubkey comes from the credential in the identity file.
             root_pubkey = bytes.fromhex(peer_entry["root_pubkey"])
-        if secret_key_from_identity and not config.secret_key:
-            import base64 as _b64
-            config.secret_key = secret_key_from_identity
+        config = _with_node_identity(config, secret_key_from_identity)
+        self._config = config
 
         # Resolve root public key: inline > identity file > config file > ephemeral.
         # The root private key is NEVER on a running node (trust spec §1.1).
-        pub = config.resolve_root_pubkey()
+        pub, ephemeral = _resolve_root_pubkey(config)
         self._root_pubkey = root_pubkey if root_pubkey is not None else pub
 
         # Dev mode: if using an ephemeral root key (no explicit pubkey file),
@@ -269,7 +266,7 @@ class AsterServer:
         # credential files. In production (explicit root_pubkey_file),
         # the default allow_all_consumers=False requires credentials.
         if (
-            config._ephemeral_privkey is not None
+            ephemeral
             and allow_all_consumers is None
             and config.root_pubkey_file is None
         ):
@@ -287,7 +284,6 @@ class AsterServer:
             )
 
         self._services_in: list = list(services)
-        self._endpoint_config_template = endpoint_config or config.to_endpoint_config()
         self._channel_name = channel_name
         self._codec = codec
         from aster.interceptors.deadline import DeadlineInterceptor
@@ -306,7 +302,7 @@ class AsterServer:
 
         # Populated by start()
         self._started: bool = False
-        self._node: IrohNode | None = None
+        self._node: Node | None = None
         self._service_summaries: list[ServiceSummary] = []
         self._server: Server | None = None
         # Lazy caches for .blobs / .docs / .gossip
@@ -355,12 +351,20 @@ class AsterServer:
                 self._nonce_store = InMemoryNonceStore()
             gate0_needed = True
 
-        # Build EndpointConfig so hooks (Gate 0) are installed when needed.
-        ep_cfg = _build_node_endpoint_config(
-            self._endpoint_config_template, enable_hooks=gate0_needed
+        # Gate 0 needs the admission hooks installed, failing closed.
+        node_config = self._config.replace(
+            alpns=tuple(aster_alpns) + tuple(self._config.alpns),
         )
-
-        self._node = await IrohNode.memory_with_alpns(aster_alpns, ep_cfg)
+        if gate0_needed:
+            node_config = node_config.replace(
+                enable_hooks=True, hook_failure_mode="fail_closed"
+            )
+        self._node = await Node.start(node_config)
+        logger.debug(
+            "Producer node: %s",
+            f"persistent at {node_config.storage_path}"
+            if node_config.storage_path else "in-memory",
+        )
         addr_b64 = base64.b64encode(
             self._node.node_addr_info().to_bytes()
         ).decode()
@@ -1245,8 +1249,8 @@ class AsterServer:
     # ── Iroh protocol clients (lazy) ─────────────────────────────────────────
 
     @property
-    def node(self) -> IrohNode:
-        """The underlying ``IrohNode`` (escape hatch for direct iroh access)."""
+    def node(self) -> Node:
+        """The underlying :class:`aster.Node` (escape hatch for direct access)."""
         self._require_started()
         assert self._node is not None
         return self._node
@@ -1361,8 +1365,7 @@ class AsterClient:
         if config is None:
             config = AsterConfig.from_env()
         if identity is not None:
-            config.identity_file = identity
-        self._config = config
+            config = config.replace(identity_file=identity)
         self._peer_name = peer
 
         # Load identity file if present (.aster-identity).
@@ -1405,8 +1408,8 @@ class AsterClient:
                 # auto-loaded -- they'll need to pass `identity=` too.
                 pass
 
-        if secret_key_from_identity and not config.secret_key:
-            config.secret_key = secret_key_from_identity
+        config = _with_node_identity(config, secret_key_from_identity)
+        self._config = config
         if peer_entry and not root_pubkey:
             root_pubkey = bytes.fromhex(peer_entry["root_pubkey"])
 
@@ -1420,7 +1423,7 @@ class AsterClient:
         self._endpoint_addr_in = addr
 
         # Root pubkey (for optional response validation).
-        pub = config.resolve_root_pubkey()
+        pub, _ephemeral = _resolve_root_pubkey(config)
         self._root_pubkey = root_pubkey if root_pubkey is not None else pub
 
         # Enrollment credential: identity file peer > inline > config > None.
@@ -1488,24 +1491,17 @@ class AsterClient:
         if self._connected:
             return
 
-        # Build a full IrohNode so the consumer can join registry docs
-        # and fetch blobs. Use persistent storage when configured -- this
-        # preserves the node identity, joined docs, and downloaded blobs
-        # across restarts.
-        ep_cfg = self._config.to_endpoint_config()
-        ep_config = _clone_config_with_alpns(
-            ep_cfg, [ALPN_CONSUMER_ADMISSION, RPC_ALPN]
+        # Start a full node so the consumer can join registry docs and
+        # fetch blobs. With storage_path set it is persistent: the node key
+        # (secret_key_file), joined docs and downloaded blobs survive
+        # restarts.
+        node_config = self._config.replace(
+            alpns=(ALPN_CONSUMER_ADMISSION, RPC_ALPN) + tuple(self._config.alpns),
         )
-        storage = self._config.storage_path
-        if storage:
-            self._node = await IrohNode.persistent_with_alpns(
-                storage, [ALPN_CONSUMER_ADMISSION, RPC_ALPN], ep_config
-            )
-            logger.debug("Consumer node: persistent at %s", storage)
+        self._node = await Node.start(node_config)
+        if node_config.storage_path:
+            logger.debug("Consumer node: persistent at %s", node_config.storage_path)
         else:
-            self._node = await IrohNode.memory_with_alpns(
-                [ALPN_CONSUMER_ADMISSION, RPC_ALPN], ep_config
-            )
             logger.debug("Consumer node: in-memory (set ASTER_STORAGE_PATH for persistence)")
         self._ep = net_client(self._node)
 
@@ -2520,89 +2516,54 @@ def _resolve_relay_addr(relay_url: str) -> str | None:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _build_node_endpoint_config(
-    template: EndpointConfig | None,
-    *,
-    enable_hooks: bool = False,
-) -> EndpointConfig | None:
-    """Build an EndpointConfig for IrohNode.memory_with_alpns.
+def _with_node_identity(config: AsterConfig, identity_key: bytes | None) -> AsterConfig:
+    """Fold the node key into ``config``.
 
-    Copies user-provided template fields and optionally force-enables hooks.
-    Returns None when no template and no hooks are needed (caller passes None
-    to the Rust side for the default presets::N0 path).
+    - A ``[node] secret_key`` from ``.aster-identity`` is used when the config
+      has no ``secret_key`` of its own (an explicit ``secret_key_file`` must
+      then hold the same key -- ``Node.start`` raises ``ValueError`` if not).
+    - A persistent node (``storage_path``) without any configured key gets
+      ``secret_key_file = <storage_path>/node.key`` so its identity survives
+      restarts.
     """
-    if template is None and not enable_hooks:
-        return None
-    kwargs: dict[str, Any] = {"alpns": []}  # Router sets ALPNs
-    if template is not None:
-        for attr in (
-            "relay_mode", "secret_key", "enable_monitoring",
-            "enable_hooks", "hook_timeout_ms", "hook_failure_mode", "bind_addr",
-            "clear_ip_transports", "clear_relay_transports", "portmapper_config",
-            "proxy_url", "proxy_from_env", "enable_local_discovery", "data_dir",
-            "transport_max_concurrent_bidi_streams",
-            "transport_max_concurrent_uni_streams",
-            "transport_stream_receive_window",
-            "transport_receive_window",
-            "transport_send_window",
-            "transport_max_idle_timeout_ms",
-            "transport_keep_alive_interval_ms",
-            "transport_initial_mtu",
-            "transport_datagram_receive_buffer_size",
-            "transport_datagram_send_buffer_size",
-            "transport_send_fairness",
-            "transport_enable_segmentation_offload",
-        ):
-            if hasattr(template, attr):
-                val = getattr(template, attr)
-                if val is not None:
-                    kwargs[attr] = val
-    if enable_hooks:
-        kwargs["enable_hooks"] = True
-        kwargs["hook_failure_mode"] = "fail_closed"
-    return EndpointConfig(**kwargs)
-
-
-def _clone_config_with_alpns(
-    template: EndpointConfig | None, alpns: Iterable[bytes]
-) -> EndpointConfig:
-    """Return a new EndpointConfig with ``alpns`` (preserving template options)."""
-    merged: list[bytes] = []
-    seen: set[bytes] = set()
-    for a in alpns:
-        if a not in seen:
-            seen.add(a)
-            merged.append(a)
-    if template is None:
-        return EndpointConfig(alpns=merged)
-    for a in list(template.alpns):
-        if a not in seen:
-            seen.add(a)
-            merged.append(a)
-    kwargs: dict[str, Any] = {"alpns": merged}
-    for attr in (
-        "relay_mode", "secret_key", "enable_monitoring", "enable_hooks",
-        "hook_timeout_ms", "hook_failure_mode", "bind_addr", "clear_ip_transports",
-        "clear_relay_transports", "portmapper_config", "proxy_url",
-        "proxy_from_env", "enable_local_discovery", "data_dir",
-        "transport_max_concurrent_bidi_streams",
-        "transport_max_concurrent_uni_streams",
-        "transport_stream_receive_window",
-        "transport_receive_window",
-        "transport_send_window",
-        "transport_max_idle_timeout_ms",
-        "transport_keep_alive_interval_ms",
-        "transport_initial_mtu",
-        "transport_datagram_receive_buffer_size",
-        "transport_datagram_send_buffer_size",
-        "transport_send_fairness",
-        "transport_enable_segmentation_offload",
+    if identity_key and config.secret_key is None:
+        config = config.replace(secret_key=identity_key)
+    if (
+        config.storage_path
+        and config.secret_key is None
+        and config.secret_key_file is None
     ):
-        if hasattr(template, attr):
-            val = getattr(template, attr)
-            if val is not None:
-                kwargs[attr] = val
-    return EndpointConfig(**kwargs)
+        config = config.replace(
+            secret_key_file=os.path.join(config.storage_path, "node.key")
+        )
+    return config
+
+
+def _resolve_root_pubkey(config: AsterConfig) -> tuple[bytes | None, bool]:
+    """Resolve the root public key; ``(key, ephemeral)``.
+
+    Inline ``root_pubkey`` / ``root_pubkey_file`` are resolved by Rust. With
+    neither, and an admission gate configured, a transient root key pair is
+    generated (dev mode; the private half is discarded -- the root private
+    key never lives on a running node, trust spec section 1.1).
+    """
+    pub = config.resolve_root_pubkey()
+    if pub is not None:
+        return pub, False
+    if config.root_pubkey_file:
+        logger.warning(
+            "Root pubkey file %s not found", config.root_pubkey_file
+        )
+    if not config.allow_all_consumers or not config.allow_all_producers:
+        from .trust.signing import generate_root_keypair
+
+        _priv, pub = generate_root_keypair()
+        logger.info(
+            "Generated ephemeral root key "
+            "(set ASTER_ROOT_PUBKEY_FILE for production)"
+        )
+        return pub, True
+    return None, False
 
 
 def _credential_from_peer_entry(peer: dict) -> ConsumerEnrollmentCredential:

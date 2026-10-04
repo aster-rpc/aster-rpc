@@ -59,8 +59,8 @@ versioned_path_dependencies = {
     "aster/Cargo.toml": ["aster_transport_core", "aster-expose", "aster-macros"],
     "aster-expose/Cargo.toml": ["aster_transport_core"],
     "aster-transport-salvo/Cargo.toml": ["aster", "aster_transport_core"],
-    "bindings/python/rust/Cargo.toml": ["aster_transport_core"],
-    "bindings/typescript/native/Cargo.toml": ["aster_transport_core"],
+    "bindings/python/rust/Cargo.toml": ["aster", "aster_transport_core"],
+    "bindings/typescript/native/Cargo.toml": ["aster", "aster_transport_core"],
 }
 
 package_block_re = re.compile(

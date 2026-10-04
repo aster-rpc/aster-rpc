@@ -8,18 +8,17 @@ Commands:
       Refuses to overwrite existing files.
 
   aster keygen producer [--out PATH]
-      Generate a stable ed25519 producer node key.
-      Derives the iroh NodeId and writes a JSON file with
-      ``secret_key`` (hex) and ``node_id`` (string).
-      Uses a temporary iroh endpoint to derive the NodeId.
+      Generate a stable producer node key as a **secret key file**: the
+      32-byte key as 64 hex characters (mode 0600) -- the one node-key format
+      shared by the Rust SDK and every binding. Use it as
+      ``AsterConfig(secret_key_file=PATH)`` / ``ASTER_SECRET_KEY_FILE`` /
+      ``[network] secret_key_file``. Prints the derived NodeId.
 
-No network access required for root keygen.
-Producer keygen starts a transient local endpoint to derive the NodeId.
+No network access required.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
@@ -108,21 +107,9 @@ def _keygen_root(args) -> int:
     return 0
 
 
-async def _derive_node_id(secret_bytes: bytes) -> str:
-    """Start a transient iroh endpoint to derive the NodeId from a secret key."""
-    from aster import create_endpoint_with_config, EndpointConfig
-
-    ep = await create_endpoint_with_config(
-        EndpointConfig(secret_key=list(secret_bytes), alpns=[b"_keygen"])
-    )
-    node_id = ep.endpoint_id()
-    await ep.close()
-    return node_id
-
-
 def _keygen_producer(args) -> int:
-    """Generate a stable producer node key and derive its iroh NodeId."""
-    import secrets as _secrets
+    """Generate a stable producer node key file and print its NodeId."""
+    from aster import SecretKey
 
     out_path = os.path.expanduser(args.out)
 
@@ -131,32 +118,19 @@ def _keygen_producer(args) -> int:
         print("Use a different path or remove the existing file.", file=sys.stderr)
         return 1
 
-    secret_bytes = _secrets.token_bytes(32)
-
-    print("Deriving NodeId (starting transient endpoint)...")
+    key = SecretKey.generate()
     try:
-        node_id = asyncio.run(_derive_node_id(secret_bytes))
-    except Exception as exc:
-        print(f"Error: could not derive NodeId: {exc}", file=sys.stderr)
+        key.write_file(out_path)
+    except ValueError as exc:
+        print(f"Error: could not write key file: {exc}", file=sys.stderr)
         return 1
-
-    out_dir = os.path.dirname(out_path) or "."
-    os.makedirs(out_dir, exist_ok=True)
-
-    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump({"secret_key": secret_bytes.hex(), "node_id": node_id}, f, indent=2)
-            f.write("\n")
-    except BaseException:
-        try:
-            os.unlink(out_path)
-        except OSError:
-            pass
-        raise
+    node_id = str(key.node_id())
 
     print(f"Producer key written to: {out_path}")
     print(f"  node_id : {node_id}")
+    print()
+    print("Use it as the node identity:")
+    print(f"  ASTER_SECRET_KEY_FILE={out_path}")
     print()
     print("Next step -- sign an enrollment token for this producer:")
     print(f"  aster authorize --root-key <root.key> --producer-id {node_id} --out enrollment.token")
@@ -189,7 +163,7 @@ def register_keygen_subparser(subparsers) -> None:
         "--out",
         default=os.path.expanduser("~/.aster/node.key"),
         metavar="PATH",
-        help="Output path for the key JSON (default: ~/.aster/node.key)",
+        help="Output path for the 64-hex secret key file (default: ~/.aster/node.key)",
     )
 
 

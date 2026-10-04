@@ -370,7 +370,7 @@ class PeerConnection:
         #
         # 3. Fall back to ephemeral identity (dev mode).
         config = AsterConfig.from_env()
-        config.storage_path = None
+        config = config.replace(storage_path=None)
 
         if self._rcan_path:
             # Look for .aster-identity alongside the credential file.
@@ -381,12 +381,12 @@ class PeerConnection:
             paired = os.path.join(cred_dir, ".aster-identity")
             if not config.identity_file or not os.path.exists(config.identity_file):
                 if os.path.exists(paired):
-                    config.identity_file = paired
+                    config = config.replace(identity_file=paired)
         else:
             # No credential -- use root key or ephemeral
-            config.identity_file = "/dev/null/.aster-identity"
+            config = config.replace(identity_file="/dev/null/.aster-identity")
             root_secret = _load_root_secret_key(config)
-            config.secret_key = root_secret
+            config = config.replace(secret_key=root_secret)
 
         self._aster_client = AsterClient(
             config=config,

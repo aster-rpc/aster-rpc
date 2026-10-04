@@ -2,7 +2,7 @@
 
 import asyncio
 from aster import (
-    IrohNode,
+    Node,
     BlobsClient,
     DocsClient,
     GossipClient,
@@ -15,7 +15,7 @@ from aster import (
 
 
 async def main() -> None:
-    node: IrohNode = await IrohNode.memory()
+    node: Node = await Node.start()
     node_id: str = node.node_id()
     addr: str = node.node_addr()
 

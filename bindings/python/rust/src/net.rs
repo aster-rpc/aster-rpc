@@ -19,7 +19,7 @@ use aster_transport_core::{
 };
 
 use crate::error::err_to_py;
-use crate::node::IrohNode;
+use crate::node::Node;
 use crate::PyBytesResult;
 
 // ============================================================================
@@ -1076,7 +1076,7 @@ impl NetClient {
         })
     }
 
-    /// Accept one incoming connection (only works on bare endpoints, not IrohNode).
+    /// Accept one incoming connection (only works on bare endpoints, not a Node).
     fn accept<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
         future_into_py(py, async move {
@@ -1164,9 +1164,9 @@ impl NetClient {
 // Factory functions
 // ============================================================================
 
-/// Get a NetClient backed by an IrohNode's endpoint.
+/// Get a NetClient backed by a Node's endpoint.
 #[pyfunction]
-pub fn net_client(node: &IrohNode) -> NetClient {
+pub fn net_client(node: &Node) -> NetClient {
     NetClient::from(node.inner().net_client())
 }
 
@@ -1601,14 +1601,11 @@ impl ReactorFeeder {
 }
 
 #[pyfunction]
-fn start_reactor(node: &crate::node::IrohNode, channel_capacity: usize) -> ReactorHandle {
+fn start_reactor(node: &crate::node::Node, channel_capacity: usize) -> ReactorHandle {
     crate::ensure_tokio_runtime();
     let rt_handle = pyo3_async_runtimes::tokio::get_runtime().handle().clone();
-    let core_handle = aster_transport_core::reactor::start_reactor_on(
-        &rt_handle,
-        node.inner().clone(),
-        channel_capacity,
-    );
+    let core_handle =
+        aster::binding_support::start_reactor_on(&rt_handle, &node.inner, channel_capacity);
     ReactorHandle {
         inner: Arc::new(tokio::sync::Mutex::new(core_handle)),
     }

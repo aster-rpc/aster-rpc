@@ -261,10 +261,10 @@ async def test_e2e_admission_returns_services_and_ticket():
     Node A: starts a consumer admission endpoint; publishes a fake service.
     Node B: presents a policy credential; receives services[] + registry_namespace.
     """
-    from aster import IrohNode, docs_client, create_endpoint_with_config, EndpointConfig
+    from aster import Node, docs_client, create_endpoint_with_config, EndpointConfig
 
     # ── Node A setup ──────────────────────────────────────────────────────────
-    node_a = await IrohNode.memory()
+    node_a = await Node.start()
     dc_a = docs_client(node_a)
     doc_a = await dc_a.create()
     author_a = await dc_a.create_author()
@@ -330,7 +330,7 @@ async def test_e2e_admission_returns_services_and_ticket():
     assert resp_b.reason == ""
 
     # Node B joins registry doc using the ticket
-    node_b = await IrohNode.memory()
+    node_b = await Node.start()
     node_b.add_node_addr(node_a)
     node_a.add_node_addr(node_b)
     dc_b = docs_client(node_b)

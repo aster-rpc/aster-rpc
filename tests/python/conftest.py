@@ -2,7 +2,7 @@
 import pytest
 import pytest_asyncio
 
-from aster import IrohNode, create_endpoint
+from aster import Node, create_endpoint
 
 
 ALPN = b"test/echo/1"
@@ -23,17 +23,17 @@ def pytest_collection_modifyitems(items):
 
 @pytest_asyncio.fixture
 async def node():
-    """Single in-memory IrohNode, shut down after test."""
-    n = await IrohNode.memory()
+    """Single in-memory Node, shut down after test."""
+    n = await Node.start()
     yield n
     await n.shutdown()
 
 
 @pytest_asyncio.fixture
 async def node_pair():
-    """Two IrohNodes with addresses exchanged, shut down after test."""
-    n1 = await IrohNode.memory()
-    n2 = await IrohNode.memory()
+    """Two Nodes with addresses exchanged, shut down after test."""
+    n1 = await Node.start()
+    n2 = await Node.start()
     n1.add_node_addr(n2)
     n2.add_node_addr(n1)
     yield n1, n2

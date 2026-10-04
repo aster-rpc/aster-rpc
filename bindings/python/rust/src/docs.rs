@@ -10,7 +10,7 @@ use aster_transport_core::{
 };
 
 use crate::error::err_to_py;
-use crate::node::IrohNode;
+use crate::node::Node;
 use crate::PyBytesResult;
 
 // ============================================================================
@@ -605,9 +605,9 @@ impl DocHandle {
 // Factory function
 // ============================================================================
 
-/// Extract a DocsClient from an IrohNode.
+/// Extract a DocsClient from a Node.
 #[pyfunction]
-pub fn docs_client(node: &IrohNode) -> DocsClient {
+pub fn docs_client(node: &Node) -> DocsClient {
     DocsClient::from(node.inner().docs_client())
 }
 

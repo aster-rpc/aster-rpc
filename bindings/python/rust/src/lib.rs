@@ -1,8 +1,9 @@
-//! aster - Python bindings for iroh using aster_transport_core.
+//! aster - Python bindings over the `aster` crate (plan D1).
 //!
-//! Phase 2: This module is now registration-only.
-//! All actual wrapper logic has been moved to individual modules:
-//! - node.rs: IrohNode wrapper
+//! This module is registration-only; the wrappers live in submodules:
+//! - node.rs: `Node` over `aster::Node`
+//! - config.rs: `NativeAsterConfig` over `aster::AsterConfig`
+//! - ids.rs: `SecretKey`, `PublicKey`, `NodeId`, `Hash`
 //! - net.rs: NetClient, IrohConnection, streams, monitoring types
 //! - blobs.rs: BlobsClient wrapper
 //! - docs.rs: DocsClient, DocHandle wrappers
@@ -11,18 +12,21 @@
 //! - hooks.rs: Phase 1b hooks utilities
 //! - error.rs: Exception types
 //!
-//! All wrappers now use aster_transport_core as the backend.
+//! The protocol clients, reactor and bare endpoints still drive the transport
+//! core, reached from `aster` handles via `aster::binding_support`.
 
 use pyo3::prelude::*;
 
 mod blobs;
 mod call;
+mod config;
 mod contract;
 mod crypto;
 mod docs;
 mod error;
 mod gossip;
 mod hooks;
+mod ids;
 mod monitor;
 mod net;
 mod node;
@@ -68,6 +72,8 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(py, m)?;
 
     // Register all module types
+    ids::register(py, m)?;
+    config::register(py, m)?;
     node::register(py, m)?;
     net::register(py, m)?;
     call::register(py, m)?;

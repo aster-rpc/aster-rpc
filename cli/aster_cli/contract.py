@@ -518,7 +518,7 @@ def _call_command(args: argparse.Namespace) -> int:
         from aster.config import AsterConfig
 
         config = AsterConfig.from_env()
-        config.storage_path = None
+        config = config.replace(storage_path=None)
 
         if rcan_path:
             # Look for the .aster-identity file alongside the credential
@@ -529,11 +529,11 @@ def _call_command(args: argparse.Namespace) -> int:
             paired = _os.path.join(cred_dir, ".aster-identity")
             if not config.identity_file or not _os.path.exists(config.identity_file):
                 if _os.path.exists(paired):
-                    config.identity_file = paired
+                    config = config.replace(identity_file=paired)
         else:
             # No credential -- skip identity file lookup so we don't
             # accidentally use stale CWD .aster-identity in dev mode
-            config.identity_file = "/dev/null/.aster-identity"
+            config = config.replace(identity_file="/dev/null/.aster-identity")
 
         client = AsterClient(
             config=config,
@@ -703,15 +703,15 @@ async def _fetch_manifests_from_node(ticket: str, rcan_path: str | None = None) 
     import os as _os
 
     config = AsterConfig.from_env()
-    config.storage_path = None
+    config = config.replace(storage_path=None)
     if rcan_path:
         cred_dir = _os.path.dirname(_os.path.abspath(rcan_path))
         paired = _os.path.join(cred_dir, ".aster-identity")
         if not config.identity_file or not _os.path.exists(config.identity_file):
             if _os.path.exists(paired):
-                config.identity_file = paired
+                config = config.replace(identity_file=paired)
     else:
-        config.identity_file = "/dev/null/.aster-identity"
+        config = config.replace(identity_file="/dev/null/.aster-identity")
 
     client = AsterClient(
         config=config,

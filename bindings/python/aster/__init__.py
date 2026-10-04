@@ -11,8 +11,11 @@ This package provides:
 
 Common entry points (all importable from the top-level ``aster`` package):
 
-    from aster import IrohNode, create_endpoint_with_config, EndpointConfig
+    from aster import Node, AsterConfig, SecretKey
     from aster import Server, create_client, service, rpc
+
+    async with await Node.start(AsterConfig(storage_path="/var/lib/app")) as node:
+        ...
 
 Sub-modules are also available directly::
 
@@ -60,8 +63,12 @@ try:
         DocNotFound,
         ConnectionError,
         TicketError,
-        # Core node
-        IrohNode,
+        # Core node + typed ids
+        Node,
+        SecretKey,
+        PublicKey,
+        NodeId,
+        Hash,
         # Blobs
         BlobsClient,
         BlobStatusResult,
@@ -121,7 +128,7 @@ except ImportError as e:
         "Please build the extension with 'maturin develop' first."
     ) from e
 
-from .config import load_endpoint_config, AsterConfig
+from .config import AsterConfig
 
 # ── Tunneling - handler-side ticket issuance (see aster.tunnel) ──────────────
 from .tunnel import Tcp, Udp, HttpProxy, TunnelHandle, TunnelTarget
@@ -215,7 +222,11 @@ __all__ = [
     "DocNotFound",
     "ConnectionError",
     "TicketError",
-    "IrohNode",
+    "Node",
+    "SecretKey",
+    "PublicKey",
+    "NodeId",
+    "Hash",
     "BlobsClient",
     "BlobStatusResult",
     "BlobObserveResult",
@@ -244,7 +255,6 @@ __all__ = [
     "net_client",
     "create_endpoint",
     "create_endpoint_with_config",
-    "load_endpoint_config",
     "HookConnectInfo",
     "HookHandshakeInfo",
     "HookDecision",

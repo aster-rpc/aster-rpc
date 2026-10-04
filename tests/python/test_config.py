@@ -1,365 +1,483 @@
-"""Tests for load_endpoint_config: TOML file + ASTER_* env var loading."""
+"""AsterConfig: keyword / env / TOML loading through the Rust ``aster::AsterConfig``.
+
+Covers every knob in the ``docs/aster-rust-getstarted.md`` section 2.2 table:
+each one set by keyword, by ``ASTER_*`` env and by ``aster.toml`` must arrive
+in the Rust config unchanged (``_native().to_dict()``), and the Python
+dataclass must mirror it.
+"""
 
 import base64
+import dataclasses
+import json
 import os
 import textwrap
+
 import pytest
 
-from aster import AsterConfig, load_endpoint_config, EndpointConfig
+from aster import AsterConfig, PublicKey, SecretKey
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch, tmp_path):
+    for key in list(os.environ):
+        if key.startswith("ASTER_"):
+            monkeypatch.delenv(key, raising=False)
+    # Keep a stray ./.aster-identity from being auto-detected.
+    monkeypatch.chdir(tmp_path)
 
-def _write_toml(tmp_path, content: str):
-    p = tmp_path / "aster.toml"
+
+def _write(tmp_path, name: str, content: str):
+    p = tmp_path / name
     p.write_text(textwrap.dedent(content))
     return p
 
 
-def _b64(b: bytes) -> str:
-    return base64.b64encode(b).decode()
+KEY = bytes(range(32))
+PUB = bytes(range(32, 64))
+
+# Every knob, with a non-default value: (field, python value, env value, toml line).
+KNOBS = [
+    ("relay_mode", "disabled", "disabled", 'relay_mode = "disabled"'),
+    ("secret_key", KEY, KEY.hex(), f'secret_key = "{KEY.hex()}"'),
+    ("secret_key_file", "/keys/node.key", "/keys/node.key", 'secret_key_file = "/keys/node.key"'),
+    ("bind_addr", "0.0.0.0:9000", "0.0.0.0:9000", 'bind_addr = "0.0.0.0:9000"'),
+    ("local_discovery", True, "true", "local_discovery = true"),
+    ("enable_monitoring", True, "1", "enable_monitoring = true"),
+    ("enable_hooks", True, "yes", "enable_hooks = true"),
+    ("hook_timeout_ms", 1234, "1234", "hook_timeout_ms = 1234"),
+    ("hook_failure_mode", "fail_closed", "fail_closed", 'hook_failure_mode = "fail_closed"'),
+    ("clear_ip_transports", True, "true", "clear_ip_transports = true"),
+    ("clear_relay_transports", True, "true", "clear_relay_transports = true"),
+    ("portmapper_config", "disabled", "disabled", 'portmapper_config = "disabled"'),
+    ("proxy_url", "http://proxy:3128", "http://proxy:3128", 'proxy_url = "http://proxy:3128"'),
+    ("proxy_from_env", True, "on", "proxy_from_env = true"),
+    ("transport_max_concurrent_bidi_streams", 11, "11", "transport_max_concurrent_bidi_streams = 11"),
+    ("transport_max_concurrent_uni_streams", 12, "12", "transport_max_concurrent_uni_streams = 12"),
+    ("transport_stream_receive_window", 13, "13", "transport_stream_receive_window = 13"),
+    ("transport_receive_window", 14, "14", "transport_receive_window = 14"),
+    ("transport_send_window", 15, "15", "transport_send_window = 15"),
+    ("transport_max_idle_timeout_ms", 16, "16", "transport_max_idle_timeout_ms = 16"),
+    ("transport_keep_alive_interval_ms", 17, "17", "transport_keep_alive_interval_ms = 17"),
+    ("transport_initial_mtu", 1400, "1400", "transport_initial_mtu = 1400"),
+    ("transport_datagram_receive_buffer_size", 19, "19", "transport_datagram_receive_buffer_size = 19"),
+    ("transport_datagram_send_buffer_size", 20, "20", "transport_datagram_send_buffer_size = 20"),
+    ("transport_send_fairness", False, "false", "transport_send_fairness = false"),
+    ("transport_enable_segmentation_offload", False, "0", "transport_enable_segmentation_offload = false"),
+]
+# Non-[network] knobs: (field, python value, env var, env value, section, toml line).
+OTHER_KNOBS = [
+    ("storage_path", "/var/lib/aster", "ASTER_STORAGE_PATH", "/var/lib/aster", "storage", 'path = "/var/lib/aster"'),
+    ("gc_interval_ms", 60000, "ASTER_GC_INTERVAL_MS", "60000", "storage", "gc_interval_ms = 60000"),
+    ("identity_file", "/creds/.aster-identity", "ASTER_IDENTITY_FILE", "/creds/.aster-identity", "identity", 'file = "/creds/.aster-identity"'),
+    ("root_pubkey", PUB, "ASTER_ROOT_PUBKEY", PUB.hex(), "trust", f'root_pubkey = "{PUB.hex()}"'),
+    ("root_pubkey_file", "/keys/root.pub", "ASTER_ROOT_PUBKEY_FILE", "/keys/root.pub", "trust", 'root_pubkey_file = "/keys/root.pub"'),
+    ("enrollment_credential_file", "/c.cred", "ASTER_ENROLLMENT_CREDENTIAL", "/c.cred", "trust", 'enrollment_credential = "/c.cred"'),
+    ("allow_all_consumers", True, "ASTER_ALLOW_ALL_CONSUMERS", "true", "trust", "allow_all_consumers = true"),
+    ("endpoint_addr", "aster1xyz", "ASTER_ENDPOINT_ADDR", "aster1xyz", "connect", 'endpoint_addr = "aster1xyz"'),
+    ("log_format", "json", "ASTER_LOG_FORMAT", "JSON", "logging", 'format = "json"'),
+    ("log_level", "debug", "ASTER_LOG_LEVEL", "debug", "logging", 'level = "debug"'),
+    ("log_mask", False, "ASTER_LOG_MASK", "false", "logging", "mask = false"),
+]
+
+
+def _rust(cfg: AsterConfig) -> dict:
+    """The Rust config's view, with lists as tuples (the dataclass spelling)."""
+    return {
+        k: tuple(v) if isinstance(v, list) else v
+        for k, v in cfg._native().to_dict().items()
+    }
 
 
 # ---------------------------------------------------------------------------
-# Defaults
+# Defaults / dataclass behaviour
 # ---------------------------------------------------------------------------
 
-def test_defaults_no_args():
-    cfg = load_endpoint_config()
-    assert cfg.alpns == []
-    assert cfg.relay_mode is None
-    assert cfg.secret_key is None
-    assert cfg.enable_monitoring is False
-    assert cfg.enable_hooks is False
+def test_defaults_match_rust_defaults():
+    cfg = AsterConfig()
+    assert cfg == AsterConfig.from_env()
+    assert cfg.to_dict() == _rust(cfg)
+    assert cfg.relay_mode == "default"
+    assert cfg.relay_urls == ()
+    assert cfg.storage_path is None and not cfg.is_persistent
+    assert cfg.secret_key is None and cfg.secret_key_file is None
     assert cfg.hook_timeout_ms == 5000
     assert cfg.hook_failure_mode == "fail_open"
-    assert cfg.bind_addr is None
-    assert cfg.clear_ip_transports is False
-    assert cfg.clear_relay_transports is False
-    assert cfg.portmapper_config is None
-    assert cfg.proxy_url is None
-    assert cfg.proxy_from_env is False
-    assert cfg.transport_receive_window is None
-    assert cfg.transport_send_window is None
-    assert cfg.transport_initial_mtu is None
-    assert cfg.transport_enable_segmentation_offload is None
+    assert cfg.allow_all_consumers is False
+    assert cfg.allow_all_producers is True
+    assert cfg.log_format == "text" and cfg.log_level == "info" and cfg.log_mask is True
+
+
+def test_frozen_and_replace():
+    cfg = AsterConfig()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.storage_path = "/x"  # type: ignore[misc]
+    new = cfg.replace(storage_path="/x", enable_hooks=True)
+    assert new.storage_path == "/x" and new.enable_hooks is True
+    assert cfg.storage_path is None
+    assert new._sources["storage_path"] == "code"
+    with pytest.raises(ValueError):
+        cfg.replace(hook_failure_mode="sometimes")
+
+
+def test_unknown_field_rejected():
+    with pytest.raises(TypeError):
+        AsterConfig(no_such_knob=1)  # type: ignore[call-arg]
+
+
+def test_secret_key_not_in_repr():
+    cfg = AsterConfig(secret_key=KEY)
+    assert KEY.hex() not in repr(cfg)
+    assert "secret_key=" not in repr(cfg)
+
+
+def test_typed_keys_accepted_and_normalised():
+    sk = SecretKey.from_bytes(KEY)
+    cfg = AsterConfig(secret_key=sk, root_pubkey=PublicKey.from_bytes(PUB))
+    assert cfg.secret_key == KEY and cfg.root_pubkey == PUB
+    assert AsterConfig(secret_key=KEY.hex(), root_pubkey=PUB.hex()) == cfg
 
 
 # ---------------------------------------------------------------------------
-# TOML loading
+# Every knob: kwargs / env / TOML -> Rust
 # ---------------------------------------------------------------------------
 
-def test_toml_basic(tmp_path):
-    p = _write_toml(tmp_path, """
-        alpns = ["myproto/1", "myproto/2"]
-        relay_mode = "default"
-        bind_addr = "0.0.0.0:9000"
-        portmapper_config = "disabled"
-        enable_monitoring = true
-        hook_timeout_ms = 2000
-        hook_failure_mode = "fail_closed"
-        transport_receive_window = 8000000
-        transport_send_window = 8000000
-        transport_initial_mtu = 1452
-        transport_enable_segmentation_offload = false
-    """)
-    cfg = load_endpoint_config(p)
-    assert cfg.alpns == [b"myproto/1", b"myproto/2"]
-    assert cfg.relay_mode == "default"
-    assert cfg.bind_addr == "0.0.0.0:9000"
-    assert cfg.portmapper_config == "disabled"
-    assert cfg.enable_monitoring is True
-    assert cfg.hook_timeout_ms == 2000
-    assert cfg.hook_failure_mode == "fail_closed"
-    assert cfg.transport_receive_window == 8000000
-    assert cfg.transport_send_window == 8000000
-    assert cfg.transport_initial_mtu == 1452
-    assert cfg.transport_enable_segmentation_offload is False
+@pytest.mark.parametrize("field,value,_env,_toml", KNOBS, ids=[k[0] for k in KNOBS])
+def test_kwarg_roundtrip(field, value, _env, _toml):
+    cfg = AsterConfig(**{field: value})
+    assert getattr(cfg, field) == value
+    assert _rust(cfg)[field] == value
+    assert cfg.to_dict() == _rust(cfg)
+
+
+def test_all_kwargs_together_roundtrip():
+    kwargs = {k[0]: k[1] for k in KNOBS}
+    kwargs.update({k[0]: k[1] for k in OTHER_KNOBS})
+    kwargs["alpns"] = (b"my/1", b"my/2")
+    cfg = AsterConfig(**kwargs)
+    rust = _rust(cfg)
+    for field, value in kwargs.items():
+        assert rust[field] == value, field
+    # Rebuilding from the Rust view is the identity.
+    assert AsterConfig(**cfg.to_dict()) == cfg
+
+
+@pytest.mark.parametrize("field,value,env,_toml", KNOBS, ids=[k[0] for k in KNOBS])
+def test_env_roundtrip(monkeypatch, field, value, env, _toml):
+    monkeypatch.setenv(f"ASTER_{field.upper()}", env)
+    cfg = AsterConfig.from_env()
+    assert getattr(cfg, field) == value
+    assert _rust(cfg)[field] == value
+    assert cfg._sources[field] == f"ASTER_{field.upper()}"
+
+
+@pytest.mark.parametrize(
+    "field,value,var,env,_s,_t", OTHER_KNOBS, ids=[k[0] for k in OTHER_KNOBS]
+)
+def test_env_roundtrip_other_sections(monkeypatch, field, value, var, env, _s, _t):
+    monkeypatch.setenv(var, env)
+    cfg = AsterConfig.from_env()
+    assert getattr(cfg, field) == value
+    assert cfg._sources[field] == var
+
+
+@pytest.mark.parametrize("field,value,_env,toml", KNOBS, ids=[k[0] for k in KNOBS])
+def test_toml_roundtrip(tmp_path, field, value, _env, toml):
+    p = _write(tmp_path, "aster.toml", f"[network]\n{toml}\n")
+    cfg = AsterConfig.from_file(p)
+    assert getattr(cfg, field) == value
+    assert _rust(cfg)[field] == value
+    assert cfg._sources[field] == f"{p} [network]"
+
+
+@pytest.mark.parametrize(
+    "field,value,_v,_e,section,toml", OTHER_KNOBS, ids=[k[0] for k in OTHER_KNOBS]
+)
+def test_toml_roundtrip_other_sections(tmp_path, field, value, _v, _e, section, toml):
+    p = _write(tmp_path, "aster.toml", f"[{section}]\n{toml}\n")
+    cfg = AsterConfig.from_file(p)
+    assert getattr(cfg, field) == value
+    assert cfg._sources[field] == f"{p} [{section}]"
 
-
-def test_toml_secret_key(tmp_path):
-    key = bytes(range(32))
-    p = _write_toml(tmp_path, f'secret_key = "{_b64(key)}"')
-    cfg = load_endpoint_config(p)
-    assert cfg.secret_key == key
-
-
-def test_toml_secret_key_null(tmp_path):
-    p = _write_toml(tmp_path, "")
-    cfg = load_endpoint_config(p)
-    assert cfg.secret_key is None
-
-
-def test_toml_bool_fields(tmp_path):
-    p = _write_toml(tmp_path, """
-        clear_ip_transports = true
-        clear_relay_transports = false
-        proxy_from_env = true
-        enable_hooks = true
-    """)
-    cfg = load_endpoint_config(p)
-    assert cfg.clear_ip_transports is True
-    assert cfg.clear_relay_transports is False
-    assert cfg.proxy_from_env is True
-    assert cfg.enable_hooks is True
-
-
-def test_toml_proxy_url(tmp_path):
-    p = _write_toml(tmp_path, 'proxy_url = "http://proxy.corp:8080"')
-    cfg = load_endpoint_config(p)
-    assert cfg.proxy_url == "http://proxy.corp:8080"
-
-
-def test_toml_file_not_found():
-    with pytest.raises(FileNotFoundError):
-        load_endpoint_config("/nonexistent/aster.toml")
-
-
-def test_toml_malformed(tmp_path):
-    p = tmp_path / "bad.toml"
-    p.write_text("this is not = valid = toml = !!!")
-    import sys
-    if sys.version_info >= (3, 11):
-        import tomllib
-    else:
-        import tomli as tomllib
-    with pytest.raises(tomllib.TOMLDecodeError):
-        load_endpoint_config(p)
-
-
-def test_toml_invalid_alpns(tmp_path):
-    p = _write_toml(tmp_path, "alpns = 42")
-    with pytest.raises(ValueError, match="alpns"):
-        load_endpoint_config(p)
-
-
-def test_toml_invalid_bool_field(tmp_path):
-    p = _write_toml(tmp_path, 'enable_monitoring = "yes"')
-    with pytest.raises(ValueError, match="enable_monitoring"):
-        load_endpoint_config(p)
-
-
-def test_toml_invalid_hook_timeout(tmp_path):
-    p = _write_toml(tmp_path, "hook_timeout_ms = -1")
-    with pytest.raises(ValueError, match="hook_timeout_ms"):
-        load_endpoint_config(p)
-
-
-def test_toml_invalid_transport_int(tmp_path):
-    p = _write_toml(tmp_path, "transport_receive_window = -1")
-    with pytest.raises(ValueError, match="transport_receive_window"):
-        load_endpoint_config(p)
-
-
-def test_toml_invalid_secret_key(tmp_path):
-    p = _write_toml(tmp_path, 'secret_key = "not-valid-base64!!!"')
-    with pytest.raises(ValueError, match="secret_key"):
-        load_endpoint_config(p)
-
-
-# ---------------------------------------------------------------------------
-# Environment variable overrides
-# ---------------------------------------------------------------------------
-
-def test_env_alpns(monkeypatch):
-    monkeypatch.setenv("ASTER_ALPNS", "proto/1,proto/2")
-    cfg = load_endpoint_config()
-    assert cfg.alpns == [b"proto/1", b"proto/2"]
-
-
-def test_env_alpns_single(monkeypatch):
-    monkeypatch.setenv("ASTER_ALPNS", "myproto/1")
-    cfg = load_endpoint_config()
-    assert cfg.alpns == [b"myproto/1"]
-
-
-def test_env_relay_mode(monkeypatch):
-    monkeypatch.setenv("ASTER_RELAY_MODE", "disabled")
-    cfg = load_endpoint_config()
-    assert cfg.relay_mode == "disabled"
-
-
-def test_env_secret_key(monkeypatch):
-    key = bytes(range(32))
-    monkeypatch.setenv("ASTER_SECRET_KEY", _b64(key))
-    cfg = load_endpoint_config()
-    assert cfg.secret_key == key
-
-
-def test_env_secret_key_invalid(monkeypatch):
-    monkeypatch.setenv("ASTER_SECRET_KEY", "!!not-base64!!")
-    with pytest.raises(ValueError, match="ASTER_SECRET_KEY"):
-        load_endpoint_config()
-
-
-def test_env_secret_key_empty_clears(monkeypatch, tmp_path):
-    key = bytes(range(32))
-    p = _write_toml(tmp_path, f'secret_key = "{_b64(key)}"')
-    monkeypatch.setenv("ASTER_SECRET_KEY", "")
-    cfg = load_endpoint_config(p)
-    assert cfg.secret_key is None
-
-
-def test_env_bool_true_variants(monkeypatch):
-    for val in ("true", "True", "TRUE", "1", "yes", "on"):
-        monkeypatch.setenv("ASTER_ENABLE_MONITORING", val)
-        cfg = load_endpoint_config()
-        assert cfg.enable_monitoring is True, f"failed for {val!r}"
-
-
-def test_env_bool_false_variants(monkeypatch):
-    for val in ("false", "False", "FALSE", "0", "no", "off"):
-        monkeypatch.setenv("ASTER_ENABLE_MONITORING", val)
-        cfg = load_endpoint_config()
-        assert cfg.enable_monitoring is False, f"failed for {val!r}"
-
-
-def test_env_bool_invalid(monkeypatch):
-    monkeypatch.setenv("ASTER_ENABLE_MONITORING", "maybe")
-    with pytest.raises(ValueError, match="ASTER_ENABLE_MONITORING"):
-        load_endpoint_config()
-
-
-def test_env_bind_addr(monkeypatch):
-    monkeypatch.setenv("ASTER_BIND_ADDR", "127.0.0.1:0")
-    cfg = load_endpoint_config()
-    assert cfg.bind_addr == "127.0.0.1:0"
-
-
-def test_env_bind_addr_empty_clears(monkeypatch, tmp_path):
-    p = _write_toml(tmp_path, 'bind_addr = "0.0.0.0:9000"')
-    monkeypatch.setenv("ASTER_BIND_ADDR", "")
-    cfg = load_endpoint_config(p)
-    assert cfg.bind_addr is None
-
-
-def test_env_hook_timeout_ms(monkeypatch):
-    monkeypatch.setenv("ASTER_HOOK_TIMEOUT_MS", "1000")
-    cfg = load_endpoint_config()
-    assert cfg.hook_timeout_ms == 1000
-
-
-def test_env_hook_failure_mode(monkeypatch):
-    monkeypatch.setenv("ASTER_HOOK_FAILURE_MODE", "fail-closed")
-    cfg = load_endpoint_config()
-    assert cfg.hook_failure_mode == "fail_closed"
-
-
-def test_env_hook_timeout_invalid(monkeypatch):
-    monkeypatch.setenv("ASTER_HOOK_TIMEOUT_MS", "fast")
-    with pytest.raises(ValueError, match="ASTER_HOOK_TIMEOUT_MS"):
-        load_endpoint_config()
-
-
-def test_hook_failure_mode_invalid(tmp_path):
-    p = _write_toml(tmp_path, 'hook_failure_mode = "maybe"')
-    with pytest.raises(ValueError, match="hook_failure_mode"):
-        load_endpoint_config(p)
-
-
-def test_env_clear_ip_transports(monkeypatch):
-    monkeypatch.setenv("ASTER_CLEAR_IP_TRANSPORTS", "true")
-    cfg = load_endpoint_config()
-    assert cfg.clear_ip_transports is True
-
-
-def test_env_portmapper_config(monkeypatch):
-    monkeypatch.setenv("ASTER_PORTMAPPER_CONFIG", "disabled")
-    cfg = load_endpoint_config()
-    assert cfg.portmapper_config == "disabled"
-
-
-def test_env_proxy_url(monkeypatch):
-    monkeypatch.setenv("ASTER_PROXY_URL", "socks5://localhost:1080")
-    cfg = load_endpoint_config()
-    assert cfg.proxy_url == "socks5://localhost:1080"
-
-
-def test_env_proxy_from_env(monkeypatch):
-    monkeypatch.setenv("ASTER_PROXY_FROM_ENV", "1")
-    cfg = load_endpoint_config()
-    assert cfg.proxy_from_env is True
-
-
-def test_env_transport_fields(monkeypatch):
-    int_fields = {
-        "transport_max_concurrent_bidi_streams": 512,
-        "transport_max_concurrent_uni_streams": 128,
-        "transport_stream_receive_window": 2_000_000,
-        "transport_receive_window": 8_000_000,
-        "transport_send_window": 8_000_000,
-        "transport_max_idle_timeout_ms": 60_000,
-        "transport_keep_alive_interval_ms": 10_000,
-        "transport_initial_mtu": 1452,
-        "transport_datagram_receive_buffer_size": 1_000_000,
-        "transport_datagram_send_buffer_size": 1_000_000,
-    }
-    bool_fields = {
-        "transport_send_fairness": True,
-        "transport_enable_segmentation_offload": False,
-    }
-    for field, value in int_fields.items():
-        monkeypatch.setenv(f"ASTER_{field.upper()}", str(value))
-    for field, value in bool_fields.items():
-        monkeypatch.setenv(f"ASTER_{field.upper()}", str(value).lower())
-
-    cfg = load_endpoint_config()
-    for field, value in int_fields.items():
-        assert getattr(cfg, field) == value
-    for field, value in bool_fields.items():
-        assert getattr(cfg, field) is value
-
-    app_cfg = AsterConfig.from_env()
-    for field, value in int_fields.items():
-        assert getattr(app_cfg, field) == value
-    for field, value in bool_fields.items():
-        assert getattr(app_cfg, field) is value
-
-
-def test_env_transport_int_empty_clears(monkeypatch, tmp_path):
-    p = _write_toml(tmp_path, "transport_receive_window = 8000000")
-    monkeypatch.setenv("ASTER_TRANSPORT_RECEIVE_WINDOW", "")
-    cfg = load_endpoint_config(p)
-    assert cfg.transport_receive_window is None
-
-
-def test_env_transport_int_invalid(monkeypatch):
-    monkeypatch.setenv("ASTER_TRANSPORT_RECEIVE_WINDOW", "large")
-    with pytest.raises(ValueError, match="ASTER_TRANSPORT_RECEIVE_WINDOW"):
-        load_endpoint_config()
-
-
-# ---------------------------------------------------------------------------
-# Env overrides file (precedence)
-# ---------------------------------------------------------------------------
 
 def test_env_overrides_file(tmp_path, monkeypatch):
-    p = _write_toml(tmp_path, """
-        relay_mode = "default"
-        bind_addr = "0.0.0.0:9000"
-        portmapper_config = "enabled"
+    p = _write(tmp_path, "aster.toml", """
+        [network]
+        bind_addr = "0.0.0.0:1"
+        enable_hooks = true
+        [storage]
+        path = "/from/file"
     """)
-    monkeypatch.setenv("ASTER_RELAY_MODE", "disabled")
-    monkeypatch.setenv("ASTER_BIND_ADDR", "127.0.0.1:0")
-    cfg = load_endpoint_config(p)
-    assert cfg.relay_mode == "disabled"       # env wins
-    assert cfg.bind_addr == "127.0.0.1:0"     # env wins
-    assert cfg.portmapper_config == "enabled"  # file value preserved
+    monkeypatch.setenv("ASTER_BIND_ADDR", "0.0.0.0:2")
+    cfg = AsterConfig.from_file(p)
+    assert cfg.bind_addr == "0.0.0.0:2"
+    assert cfg.enable_hooks is True
+    assert cfg.storage_path == "/from/file"
+    assert cfg._sources["bind_addr"] == "ASTER_BIND_ADDR"
+    assert cfg._sources["enable_hooks"].endswith("[network]")
+    assert cfg._sources["storage_path"].endswith("[storage]")
 
 
-def test_env_alpns_overrides_file(tmp_path, monkeypatch):
-    p = _write_toml(tmp_path, 'alpns = ["file-proto/1"]')
-    monkeypatch.setenv("ASTER_ALPNS", "env-proto/1,env-proto/2")
-    cfg = load_endpoint_config(p)
-    assert cfg.alpns == [b"env-proto/1", b"env-proto/2"]
+def test_gc_interval_zero_disables(monkeypatch):
+    monkeypatch.setenv("ASTER_GC_INTERVAL_MS", "0")
+    assert AsterConfig.from_env().gc_interval_ms is None
+    assert AsterConfig(gc_interval_ms=0).gc_interval_ms is None
 
 
-def test_env_secret_key_overrides_file(tmp_path, monkeypatch):
-    file_key = bytes(range(32))
-    env_key = bytes(reversed(range(32)))
-    p = _write_toml(tmp_path, f'secret_key = "{_b64(file_key)}"')
-    monkeypatch.setenv("ASTER_SECRET_KEY", _b64(env_key))
-    cfg = load_endpoint_config(p)
-    assert cfg.secret_key == env_key
+# ---------------------------------------------------------------------------
+# Relay mode
+# ---------------------------------------------------------------------------
+
+def test_relay_urls_select_custom():
+    cfg = AsterConfig(relay_urls=["https://r1.example", "https://r2.example"])
+    assert cfg.relay_mode == "custom"
+    assert cfg.relay_urls == ("https://r1.example", "https://r2.example")
+    assert AsterConfig(relay_mode="custom", relay_urls=["https://r1.example"]).relay_mode == "custom"
+
+
+def test_relay_bare_url_is_custom():
+    cfg = AsterConfig(relay_mode="https://relay.example")
+    assert cfg.relay_mode == "custom"
+    assert cfg.relay_urls == ("https://relay.example",)
+
+
+def test_relay_conflicts_rejected():
+    with pytest.raises(ValueError):
+        AsterConfig(relay_mode="disabled", relay_urls=["https://r.example"])
+    with pytest.raises(ValueError):
+        AsterConfig(relay_mode="custom")
+
+
+def test_relay_urls_env_and_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASTER_RELAY_URLS", "https://a.example, https://b.example")
+    cfg = AsterConfig.from_env()
+    assert cfg.relay_mode == "custom"
+    assert cfg.relay_urls == ("https://a.example", "https://b.example")
+    monkeypatch.delenv("ASTER_RELAY_URLS")
+    p = _write(tmp_path, "aster.toml", """
+        [network]
+        relay_urls = ["https://c.example"]
+    """)
+    assert AsterConfig.from_file(p).relay_urls == ("https://c.example",)
+
+
+# ---------------------------------------------------------------------------
+# Secret key spellings and errors
+# ---------------------------------------------------------------------------
+
+def test_secret_key_env_hex_or_base64(monkeypatch):
+    monkeypatch.setenv("ASTER_SECRET_KEY", base64.b64encode(KEY).decode())
+    assert AsterConfig.from_env().secret_key == KEY
+    monkeypatch.setenv("ASTER_SECRET_KEY", KEY.hex())
+    assert AsterConfig.from_env().secret_key == KEY
+
+
+def test_secret_key_env_empty_clears_file_value(tmp_path, monkeypatch):
+    p = _write(tmp_path, "aster.toml", f'[network]\nsecret_key = "{KEY.hex()}"\n')
+    monkeypatch.setenv("ASTER_SECRET_KEY", "")
+    assert AsterConfig.from_file(p).secret_key is None
+
+
+@pytest.mark.parametrize(
+    "var,value",
+    [
+        ("ASTER_SECRET_KEY", "not-a-key!!"),
+        ("ASTER_ENABLE_HOOKS", "maybe"),
+        ("ASTER_HOOK_TIMEOUT_MS", "soon"),
+        ("ASTER_HOOK_FAILURE_MODE", "sometimes"),
+        ("ASTER_PORTMAPPER_CONFIG", "auto"),
+        ("ASTER_TRANSPORT_INITIAL_MTU", "99999999"),
+        ("ASTER_ROOT_PUBKEY", "abcd"),
+        ("ASTER_RELAY_MODE", "staging"),
+    ],
+)
+def test_env_invalid_values(monkeypatch, var, value):
+    monkeypatch.setenv(var, value)
+    if var == "ASTER_RELAY_MODE":
+        monkeypatch.setenv("ASTER_RELAY_URLS", "https://r.example")
+    with pytest.raises(ValueError, match=var.split("_", 1)[0]):
+        AsterConfig.from_env()
+
+
+def test_kwarg_invalid_values():
+    with pytest.raises(ValueError):
+        AsterConfig(secret_key=b"short")
+    with pytest.raises(ValueError):
+        AsterConfig(portmapper_config="auto")
+    with pytest.raises(TypeError):
+        AsterConfig(enable_hooks="yes")  # type: ignore[arg-type]
+    with pytest.raises(OverflowError):
+        AsterConfig(transport_initial_mtu=1 << 20)
+
+
+def test_toml_errors(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        AsterConfig.from_file(tmp_path / "missing.toml")
+    bad = _write(tmp_path, "bad.toml", "[network\nbind_addr = 1\n")
+    with pytest.raises(ValueError, match="invalid TOML"):
+        AsterConfig.from_file(bad)
+    wrong_type = _write(tmp_path, "wrong.toml", '[network]\nenable_hooks = "yes"\n')
+    with pytest.raises(ValueError, match="enable_hooks"):
+        AsterConfig.from_file(wrong_type)
+
+
+# ---------------------------------------------------------------------------
+# Root public key resolution (Rust)
+# ---------------------------------------------------------------------------
+
+def test_root_pubkey_file_hex_and_json(tmp_path):
+    hex_file = _write(tmp_path, "root.pub", PUB.hex() + "\n")
+    assert AsterConfig(root_pubkey_file=str(hex_file)).resolve_root_pubkey() == PUB
+    json_file = _write(tmp_path, "root.json", json.dumps({"public_key": PUB.hex()}))
+    assert AsterConfig(root_pubkey_file=str(json_file)).resolve_root_pubkey() == PUB
+    missing = AsterConfig(root_pubkey_file=str(tmp_path / "nope"))
+    assert missing.resolve_root_pubkey() is None
+
+
+def test_root_pubkey_inline_and_file_must_agree(tmp_path):
+    f = _write(tmp_path, "root.pub", PUB.hex())
+    assert AsterConfig(root_pubkey=PUB, root_pubkey_file=str(f)).resolve_root_pubkey() == PUB
+    with pytest.raises(ValueError, match="one deployment has one"):
+        AsterConfig(root_pubkey=bytes(32), root_pubkey_file=str(f)).resolve_root_pubkey()
+
+
+def test_root_pubkey_file_malformed(tmp_path):
+    f = _write(tmp_path, "root.pub", "zz")
+    with pytest.raises(ValueError):
+        AsterConfig(root_pubkey_file=str(f)).resolve_root_pubkey()
+
+
+# ---------------------------------------------------------------------------
+# Secret key file (the one node-key format)
+# ---------------------------------------------------------------------------
+
+def test_secret_key_file_created_then_reloaded(tmp_path):
+    path = tmp_path / "keys" / "node.key"
+    cfg = AsterConfig(secret_key_file=str(path))
+    key = cfg.resolve_secret_key()
+    assert key is not None
+    text = path.read_text()
+    assert text == key.to_hex() + "\n" and len(key.to_hex()) == 64
+    if os.name == "posix":
+        assert (path.stat().st_mode & 0o777) == 0o600
+    # Second resolve reuses the file.
+    assert cfg.resolve_secret_key() == key
+    assert SecretKey.read_file(str(path)) == key
+
+
+def test_secret_key_file_written_from_inline_key(tmp_path):
+    path = tmp_path / "node.key"
+    cfg = AsterConfig(secret_key=KEY, secret_key_file=str(path))
+    assert cfg.resolve_secret_key().to_bytes() == KEY
+    assert path.read_text().strip() == KEY.hex()
+
+
+def test_secret_key_file_conflict_with_inline_key(tmp_path):
+    path = tmp_path / "node.key"
+    SecretKey.from_bytes(KEY).write_file(str(path))
+    cfg = AsterConfig(secret_key=bytes(32), secret_key_file=str(path))
+    with pytest.raises(ValueError, match="different keys"):
+        cfg.resolve_secret_key()
+
+
+def test_secret_key_file_malformed(tmp_path):
+    path = _write(tmp_path, "node.key", json.dumps({"secret_key": KEY.hex()}))
+    with pytest.raises(ValueError, match="secret key file"):
+        AsterConfig(secret_key_file=str(path)).resolve_secret_key()
+
+
+def test_secret_key_api(tmp_path):
+    k = SecretKey.generate()
+    assert repr(k) == "SecretKey(<redacted>)"
+    assert SecretKey.from_hex(k.to_hex()) == k
+    assert SecretKey.from_bytes(k.to_bytes()) == k
+    assert k.public_key().node_id() == k.node_id()
+    path = tmp_path / "k.key"
+    k.write_file(str(path))
+    with pytest.raises(ValueError):
+        k.write_file(str(path))  # never overwrites
+    assert SecretKey.load_or_generate(str(path)) == k
+    assert SecretKey.read_file_if_exists(str(tmp_path / "none")) is None
+    fresh = SecretKey.load_or_generate(str(tmp_path / "fresh.key"))
+    assert SecretKey.read_file(str(tmp_path / "fresh.key")) == fresh
+
+
+def test_keygen_producer_writes_key_file(tmp_path, capsys):
+    from aster_cli.keygen import _keygen_producer
+
+    class Args:
+        out = str(tmp_path / "node.key")
+
+    assert _keygen_producer(Args()) == 0
+    key = SecretKey.read_file(Args.out)
+    assert str(key.node_id()) in capsys.readouterr().out
+    assert _keygen_producer(Args()) == 1  # refuses to overwrite
+
+
+# ---------------------------------------------------------------------------
+# .aster-identity credential file
+# ---------------------------------------------------------------------------
+
+def _identity(tmp_path, secret: str):
+    return _write(tmp_path, ".aster-identity", f"""
+        [node]
+        secret_key = "{secret}"
+
+        [[peers]]
+        name = "edge"
+        role = "producer"
+        root_pubkey = "{PUB.hex()}"
+
+        [[peers]]
+        name = "app"
+        role = "consumer"
+        root_pubkey = "{PUB.hex()}"
+        nonce = "{'00' * 32}"
+    """)
+
+
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+def test_load_identity_secret_key_and_peer(tmp_path, encoding):
+    secret = base64.b64encode(KEY).decode() if encoding == "base64" else KEY.hex()
+    path = _identity(tmp_path, secret)
+    cfg = AsterConfig(identity_file=str(path))
+    assert cfg.resolve_identity_path() == str(path)
+    key, peer = cfg.load_identity(role="consumer")
+    assert key == KEY
+    assert peer["name"] == "app" and peer["nonce"] == "00" * 32
+    _, peer = cfg.load_identity(peer_name="edge")
+    assert peer["role"] == "producer"
+    _, peer = cfg.load_identity()
+    assert peer["name"] == "edge"
+
+
+def test_load_identity_autodetects_cwd(tmp_path):
+    _identity(tmp_path, KEY.hex())
+    key, _ = AsterConfig().load_identity()
+    assert key == KEY
+
+
+def test_load_identity_missing(tmp_path):
+    cfg = AsterConfig(identity_file=str(tmp_path / "none"))
+    assert cfg.load_identity() == (None, None)
+
+
+def test_load_identity_malformed_key(tmp_path):
+    path = _identity(tmp_path, "nope")
+    with pytest.raises(ValueError):
+        AsterConfig(identity_file=str(path)).load_identity()
+
+
+# ---------------------------------------------------------------------------
+# print_config
+# ---------------------------------------------------------------------------
+
+def test_print_config_masks_and_reports_sources(monkeypatch, capsys):
+    monkeypatch.setenv("ASTER_SECRET_KEY", KEY.hex())
+    cfg = AsterConfig.from_env()
+    text = cfg.print_config()
+    assert KEY.hex() not in text
+    assert "****..." + KEY.hex()[-8:] in text
+    assert "ASTER_SECRET_KEY" in text
+    data = json.loads(cfg.print_config(json=True))
+    assert data["network"]["secret_key"]["source"] == "ASTER_SECRET_KEY"
+    assert data["storage"]["path"]["source"] == "default"

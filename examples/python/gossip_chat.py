@@ -18,10 +18,10 @@ Usage (two-node local demo):
 import asyncio
 import json
 import os
-from aster import IrohNode, gossip_client
+from aster import Node, gossip_client
 
 
-TOPIC = bytes(32)  # 32 zero bytes — must match the Rust peer's TopicId
+TOPIC = bytes(32)  # 32 zero bytes -- must match the Rust peer's TopicId
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +76,8 @@ async def main():
     # Create two in-memory nodes for a local demo.
     # To interop with a Rust peer, you would instead create a single node
     # and use the Rust peer's EndpointId as a bootstrap peer.
-    node1 = await IrohNode.memory()
-    node2 = await IrohNode.memory()
+    node1 = await Node.start()
+    node2 = await Node.start()
 
     # Exchange addresses for peer discovery (in-process shortcut).
     node1.add_node_addr(node2)

@@ -1,13 +1,13 @@
 import pytest
 
 pytestmark = pytest.mark.iroh_primitives
-from aster._aster import DocEntry, IrohNode, docs_client
+from aster._aster import DocEntry, Node, docs_client
 
 
 @pytest.mark.asyncio
 async def test_create_doc_and_author():
     """Create a doc and author, verify IDs are returned."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -22,7 +22,7 @@ async def test_create_doc_and_author():
 @pytest.mark.asyncio
 async def test_set_get_bytes():
     """Set a key and get it back."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -38,7 +38,7 @@ async def test_set_get_bytes():
 @pytest.mark.asyncio
 async def test_del_exact_key_removes_value():
     """Deleting an exact key removes the author's current value."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -56,7 +56,7 @@ async def test_del_exact_key_removes_value():
 @pytest.mark.asyncio
 async def test_del_prefix_removes_matching_author_entries_only():
     """Prefix deletion prunes one author's matching entries without touching others."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -82,7 +82,7 @@ async def test_del_prefix_removes_matching_author_entries_only():
 @pytest.mark.asyncio
 async def test_get_missing_key():
     """Getting a non-existent key returns None."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -97,8 +97,8 @@ async def test_get_missing_key():
 @pytest.mark.asyncio
 async def test_share_and_join():
     """Share a doc from node1, join from node2, verify data syncs."""
-    node1 = await IrohNode.memory()
-    node2 = await IrohNode.memory()
+    node1 = await Node.start()
+    node2 = await Node.start()
 
     # Exchange addresses for peer discovery
     node1.add_node_addr(node2)
@@ -132,7 +132,7 @@ async def test_share_and_join():
 @pytest.mark.asyncio
 async def test_query_key_exact_returns_entry():
     """Write an entry and retrieve it via query_key_exact."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -157,7 +157,7 @@ async def test_query_key_exact_returns_entry():
 @pytest.mark.asyncio
 async def test_query_key_exact_missing_returns_empty():
     """query_key_exact returns empty list for a key that was never written."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -171,7 +171,7 @@ async def test_query_key_exact_missing_returns_empty():
 @pytest.mark.asyncio
 async def test_query_key_exact_multiple_authors():
     """Two authors writing the same key both appear in query_key_exact."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -193,7 +193,7 @@ async def test_query_key_exact_multiple_authors():
 @pytest.mark.asyncio
 async def test_query_key_prefix_returns_matching_entries():
     """query_key_prefix returns all entries whose key starts with the prefix."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -215,7 +215,7 @@ async def test_query_key_prefix_returns_matching_entries():
 @pytest.mark.asyncio
 async def test_query_key_prefix_is_unbounded_by_default():
     """A prefix query is a listing: it returns every matching key, not a small cap."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -233,7 +233,7 @@ async def test_query_key_prefix_is_unbounded_by_default():
 @pytest.mark.asyncio
 async def test_query_key_prefix_respects_caller_limit():
     """A caller-supplied limit caps the result set (e.g. for pagination)."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -251,7 +251,7 @@ async def test_query_key_prefix_respects_caller_limit():
 @pytest.mark.asyncio
 async def test_query_latest_exact_returns_newest_across_authors():
     """query_latest_exact returns the highest-timestamp entry regardless of author count."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -272,7 +272,7 @@ async def test_query_latest_exact_returns_newest_across_authors():
 @pytest.mark.asyncio
 async def test_query_latest_exact_missing_returns_none():
     """query_latest_exact returns None for a key that was never written."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -284,7 +284,7 @@ async def test_query_latest_exact_missing_returns_none():
 @pytest.mark.asyncio
 async def test_query_latest_prefix_dedupes_keys_across_authors():
     """query_latest_prefix returns one entry per key (the latest), not one per author."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -312,7 +312,7 @@ async def test_query_latest_prefix_dedupes_keys_across_authors():
 @pytest.mark.asyncio
 async def test_query_key_prefix_no_match_returns_empty():
     """query_key_prefix returns empty list when no keys match the prefix."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -329,7 +329,7 @@ async def test_query_key_prefix_no_match_returns_empty():
 @pytest.mark.asyncio
 async def test_read_entry_content_roundtrip():
     """Write an entry, query it, then read its content via content_hash."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -351,7 +351,7 @@ async def test_read_entry_content_roundtrip():
 @pytest.mark.asyncio
 async def test_query_and_filter_by_author():
     """Write with two authors, query by key, then filter by author."""
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
 
     doc = await dc.create()
@@ -385,9 +385,9 @@ async def test_query_and_filter_by_author():
 @pytest.mark.asyncio
 async def test_start_sync_empty_peers_does_not_raise():
     """start_sync with no peers is a valid no-op -- doc enters sync mode."""
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
 
@@ -400,9 +400,9 @@ async def test_start_sync_empty_peers_does_not_raise():
 @pytest.mark.asyncio
 async def test_leave_after_start_sync_does_not_raise():
     """start_sync followed by leave completes without error."""
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
 
@@ -415,9 +415,9 @@ async def test_leave_after_start_sync_does_not_raise():
 @pytest.mark.asyncio
 async def test_leave_without_sync_does_not_raise():
     """leave on a doc that was never synced completes without error."""
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
 
@@ -435,9 +435,9 @@ async def test_leave_without_sync_does_not_raise():
 async def test_subscribe_receives_insert_local_event():
     """subscribe() delivers an insert_local event after set_bytes."""
     import asyncio
-    from aster import IrohNode, DocEvent, docs_client
+    from aster import Node, DocEvent, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
     author = await dc.create_author()
@@ -462,9 +462,9 @@ async def test_subscribe_receives_insert_local_event():
 async def test_subscribe_insert_local_entry_fields():
     """insert_local event contains correct author, content_hash, and size."""
     import asyncio
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
     author = await dc.create_author()
@@ -490,9 +490,9 @@ async def test_subscribe_insert_local_entry_fields():
 async def test_subscribe_multiple_events_in_order():
     """Multiple writes produce multiple insert_local events in order."""
     import asyncio
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
     author = await dc.create_author()
@@ -523,9 +523,9 @@ async def test_subscribe_multiple_events_in_order():
 @pytest.mark.asyncio
 async def test_set_download_policy_everything_does_not_raise():
     """set_download_policy(everything) is a valid no-op."""
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
 
@@ -537,9 +537,9 @@ async def test_set_download_policy_everything_does_not_raise():
 @pytest.mark.asyncio
 async def test_download_policy_roundtrip():
     """set then get download policy returns the same mode and prefixes."""
-    from aster import IrohNode, DocDownloadPolicy, docs_client
+    from aster import Node, DocDownloadPolicy, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
 
@@ -558,9 +558,9 @@ async def test_download_policy_roundtrip():
 @pytest.mark.asyncio
 async def test_download_policy_everything_except():
     """everything_except policy round-trips correctly."""
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
 
@@ -581,9 +581,9 @@ async def test_download_policy_everything_except():
 @pytest.mark.asyncio
 async def test_share_with_addr_returns_ticket():
     """share_with_addr returns a valid ticket string starting with 'doc'."""
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
 
@@ -597,9 +597,9 @@ async def test_share_with_addr_returns_ticket():
 @pytest.mark.asyncio
 async def test_share_with_addr_read_mode():
     """share_with_addr(read) produces a read-only ticket."""
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node = await IrohNode.memory()
+    node = await Node.start()
     dc = docs_client(node)
     doc = await dc.create()
 
@@ -619,10 +619,10 @@ async def test_share_with_addr_read_mode():
 async def test_join_and_subscribe_returns_doc_and_receiver():
     """join_and_subscribe returns a (DocHandle, DocEventReceiver) tuple."""
     import asyncio
-    from aster import IrohNode, DocHandle, DocEventReceiver, docs_client
+    from aster import Node, DocHandle, DocEventReceiver, docs_client
 
-    node1 = await IrohNode.memory()
-    node2 = await IrohNode.memory()
+    node1 = await Node.start()
+    node2 = await Node.start()
 
     node1.add_node_addr(node2)
     node2.add_node_addr(node1)
@@ -649,10 +649,10 @@ async def test_join_and_subscribe_returns_doc_and_receiver():
 async def test_join_and_subscribe_receives_event_after_write():
     """Events from the remote writer appear via join_and_subscribe receiver."""
     import asyncio
-    from aster import IrohNode, docs_client
+    from aster import Node, docs_client
 
-    node1 = await IrohNode.memory()
-    node2 = await IrohNode.memory()
+    node1 = await Node.start()
+    node2 = await Node.start()
 
     node1.add_node_addr(node2)
     node2.add_node_addr(node1)

@@ -10,7 +10,7 @@ use aster_transport_core::{
 };
 
 use crate::error::err_to_py;
-use crate::node::IrohNode;
+use crate::node::Node;
 use crate::PyBytesResult;
 
 // ============================================================================
@@ -416,9 +416,9 @@ impl BlobsClient {
     }
 }
 
-/// Create a BlobsClient from an IrohNode.
+/// Create a BlobsClient from a Node.
 #[pyfunction]
-pub fn blobs_client(node: &IrohNode) -> BlobsClient {
+pub fn blobs_client(node: &Node) -> BlobsClient {
     BlobsClient::from(node.inner().blobs_client())
 }
 

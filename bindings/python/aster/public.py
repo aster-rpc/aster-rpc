@@ -110,6 +110,7 @@ from aster.codec import contract_default, wire_type
 from aster.status import RpcError, StatusCode, ContractViolationError
 from aster.rpc_types import SerializationMode
 from aster.config import AsterConfig
+from aster._aster import Node, SecretKey, PublicKey, NodeId
 from aster.capabilities import any_of, all_of
 from aster.interceptors import (
     CallContext,
@@ -128,6 +129,11 @@ __all__ = [
     "AsterServer",
     "AsterClient",
     "AsterConfig",
+    # Node + identity
+    "Node",
+    "SecretKey",
+    "PublicKey",
+    "NodeId",
     # Decorators
     "service",
     "rpc",
