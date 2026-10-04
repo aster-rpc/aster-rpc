@@ -261,12 +261,11 @@ async def test_mutations_are_resolved_and_acknowledged(group):
 
 async def test_a_lease_renews_in_rust_mutates_and_hands_off(group):
     worker = group.worker
-    # Renewals land ~3 s, 6 s, 9 s after the grant, well clear of the lease
-    # operations below (~7 s): stopping the Rust renew loop while a renewal
-    # is mid-flight leaves the shared journal unresolved (a Rust-side race,
-    # reported with P9), which this test is not about.
+    # Renewing every 0.1 s on purpose: the compare-and-set and the final
+    # handoff below land while renewals are in flight, and ending the lease
+    # mid-renewal must not strand the shared journal.
     outcome = await worker.acquire_lease(
-        res("lease"), LeaseOptions(ttl=6.0, renew_interval=3.0, holder_margin=0.5)
+        res("lease"), LeaseOptions(ttl=6.0, renew_interval=0.1, holder_margin=0.5)
     )
     assert outcome.granted, outcome.reason
     lease = outcome.lease

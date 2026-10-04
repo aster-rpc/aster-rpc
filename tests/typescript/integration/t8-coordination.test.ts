@@ -204,7 +204,10 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
   });
 
   it('a lease renews in Rust, mutates under its fence, and hands off atomically', async () => {
-    const outcome = await worker.acquireLease(res('lease'), { ttlMs: 6_000, renewIntervalMs: 500, holderMarginMs: 500 });
+    // Renewing every 100 ms on purpose: the compare-and-set and the final
+    // handoff below land while renewals are in flight, and ending the lease
+    // mid-renewal must not strand the shared journal.
+    const outcome = await worker.acquireLease(res('lease'), { ttlMs: 6_000, renewIntervalMs: 100, holderMarginMs: 500 });
     if (!outcome.granted) throw new Error(`expected a grant, got ${outcome.reason}`);
     const lease = outcome.lease;
     expect(lease.status).toBe('held');
@@ -225,8 +228,7 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
     }
     rival.close();
 
-    // Outlive the TTL: the renew loop keeps it (renewing every 0.5 s leaves
-    // a ~5 s self-limit cushion for a loaded machine).
+    // Outlive the TTL: the renew loop keeps it.
     await new Promise((r) => setTimeout(r, 7_000));
     expect(lease.status).toBe('held');
     expect(lease.fence()?.epoch).toBe(first!.epoch);
