@@ -193,6 +193,9 @@ struct RtInner {
     /// The expose HTTP body-handle table (R9), one per runtime: every
     /// `expose_http` handler bound here streams bodies through it.
     bodies: HttpBodies,
+    /// `max_chunk` of the `expose_http` handler bound on each channel
+    /// (what `HttpBodyStream.write` splits at).
+    chunk_limits: Mutex<HashMap<u64, usize>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -247,6 +250,11 @@ impl UpcallRuntime {
             .ok_or_else(|| invalid(format!("no upcall channel {channel}")))
     }
 
+    /// Record `channel`'s `expose_http` chunk limit.
+    pub(crate) fn set_max_chunk(&self, channel: u64, max_chunk: usize) {
+        lock(&self.inner.chunk_limits).insert(channel, max_chunk);
+    }
+
     /// The runtime's expose HTTP body-handle table.
     pub(crate) fn bodies(&self) -> HttpBodies {
         self.inner.bodies.clone()
@@ -285,6 +293,7 @@ impl UpcallRuntime {
                 closed: AtomicBool::new(false),
                 cursor: AtomicU64::new(0),
                 bodies: HttpBodies::new(),
+                chunk_limits: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -425,7 +434,11 @@ impl UpcallRuntime {
             let args: Bound<'_, PyAny> = if ev.kind == UpcallKind::Cancel {
                 cancel_name(&ev).into_pyobject(py)?.into_any()
             } else {
-                match decode_request(py, ev.kind, &ev.payload, &self.inner.bodies) {
+                let max_chunk = lock(&self.inner.chunk_limits)
+                    .get(&channel)
+                    .copied()
+                    .unwrap_or(crate::expose::DEFAULT_MAX_CHUNK);
+                match decode_request(py, ev.kind, &ev.payload, &self.inner.bodies, max_chunk) {
                     Ok(t) => t.into_any(),
                     Err(e) => {
                         let _ = upcalls.respond(
@@ -528,7 +541,11 @@ pub(crate) fn bind(obj: &Bound<'_, PyAny>, role: &str) -> PyResult<Upcalls> {
 }
 
 /// As [`bind`], plus the runtime's HTTP body table (expose HTTP handlers).
-pub(crate) fn bind_http(obj: &Bound<'_, PyAny>, role: &str) -> PyResult<(Upcalls, HttpBodies)> {
+pub(crate) fn bind_http(
+    obj: &Bound<'_, PyAny>,
+    role: &str,
+    max_chunk: usize,
+) -> PyResult<(Upcalls, HttpBodies)> {
     let py = obj.py();
     let bound = py
         .import("aster.upcalls")?
@@ -536,6 +553,7 @@ pub(crate) fn bind_http(obj: &Bound<'_, PyAny>, role: &str) -> PyResult<(Upcalls
         .call1((obj, role))?;
     let (rt, channel): (Bound<'_, UpcallRuntime>, u64) = bound.extract()?;
     let rt = rt.get();
+    rt.set_max_chunk(channel, max_chunk);
     Ok((rt.upcalls(channel)?, rt.bodies()))
 }
 
@@ -749,9 +767,10 @@ fn decode_request<'py>(
     kind: UpcallKind,
     b: &[u8],
     bodies: &HttpBodies,
+    max_chunk: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (req, _) = types_of(kind).ok_or_else(|| invalid(format!("no codec for {kind}")))?;
-    decode_type_with(py, req, b, Some(bodies))
+    decode_type_with(py, req, b, Some((bodies, max_chunk)))
 }
 
 fn encode_response(kind: UpcallKind, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
@@ -771,14 +790,18 @@ fn decode_type_with<'py>(
     py: Python<'py>,
     ty: &str,
     b: &[u8],
-    bodies: Option<&HttpBodies>,
+    bodies: Option<(&HttpBodies, usize)>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::expose as ex;
     let t = |v: Vec<Bound<'py, PyAny>>| tuple(py, v).map(Bound::into_any);
     match ty {
         "ExposeHttpRequest" => {
             let req = codec::decode_expose_http_request(b).map_err(cerr)?;
-            t(vec![ex::http_request_out(py, req, bodies.cloned())?])
+            t(vec![ex::http_request_out(
+                py,
+                req,
+                bodies.map(|(b, m)| (b.clone(), m)),
+            )?])
         }
         "ExposeHttpResponse" => {
             ex::http_response_out(py, codec::decode_expose_http_response(b).map_err(cerr)?)

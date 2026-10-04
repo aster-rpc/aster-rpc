@@ -1417,3 +1417,150 @@ def test_placement_values_round_trip_through_ucv1():
     assert up.ucv1_decode("MemberSeed", up.ucv1_encode("MemberSeed", seed)) == seed
     req = ProvisionRequest("33" * 32, "11" * 32, LogId(2, NodeId("01" * 32), 130), NodeId("02" * 32))
     assert up.ucv1_decode("PlacementProvisionRequest", up.ucv1_encode("PlacementProvisionRequest", (req,))) == (req,)
+
+
+@pytest.mark.network
+@pytest.mark.timeout(60)
+async def test_expose_http_max_chunk_is_configurable():
+    host = await Node.start(_offline(), alpns=[HTTP_ALPN])
+    peer = await Node.start(_offline())
+    rt = UpcallRuntime()
+    sizes = []
+
+    async def handler(request):
+        if request.uri == "/up":
+            while True:
+                chunk = await request.handle.read(1 << 20)
+                if chunk is None:
+                    break
+                sizes.append(len(chunk))
+            return HttpResponse(200, (), str(sum(sizes)))
+        # One write of the whole body: write() splits it at max_chunk.
+        async def one():
+            yield BIG
+
+        return HttpResponse(200, (), one())
+
+    try:
+        for n in (host, peer):
+            await _ready(n)
+        peer.add_node_addr(host)
+        expose = host.expose()
+        for bad in (0, -1):
+            with pytest.raises((ValueError, OverflowError)):
+                expose.expose_http("bad", handler, max_chunk=bad)
+        expose.expose_http("app", handler, max_chunk=1000, response_buffer=2)
+        serving = asyncio.ensure_future(expose.serve([HTTP_ALPN]))
+        conn = await asyncio.wait_for(net_client(peer).connect(host.node_id(), HTTP_ALPN), 10)
+
+        # A large streamed response through a small max_chunk arrives intact.
+        resp = await _relay(conn, "GET", "/down")
+        assert resp.status == 200 and resp.body == BIG
+
+        # A request-body read returns at most max_chunk bytes.
+        resp = await _relay(conn, "PUT", "/up", body=BIG)
+        assert resp.body == str(len(BIG)).encode()
+        assert sizes and max(sizes) <= 1000 and sum(sizes) == len(BIG)
+        serving.cancel()
+    finally:
+        await rt.aclose()
+        for n in (host, peer):
+            await n.shutdown()
+
+
+@pytest.mark.network
+@pytest.mark.timeout(60)
+async def test_runtime_close_cancels_streamed_responses():
+    host = await Node.start(_offline(), alpns=[HTTP_ALPN])
+    peer = await Node.start(_offline())
+    rt = UpcallRuntime(close_grace=0.5)
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    stubborn = asyncio.Event()
+    stop = False
+
+    async def forever():
+        started.set()
+        try:
+            while True:
+                yield b"x" * 1000
+                await asyncio.sleep(0.01)
+        finally:
+            finished.set()
+
+    class Stubborn:
+        """An iterator that never gives way: it swallows cancellation, and
+        its aclose() hangs until the test lets go."""
+
+        def __aiter__(self):
+            started.set()
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(0.01)
+            return b"y" * 100
+
+        async def aclose(self):
+            stubborn.set()
+            try:
+                while not stop:
+                    try:
+                        await asyncio.sleep(0.01)
+                    except asyncio.CancelledError:
+                        pass
+            finally:
+                finished.set()
+
+    def ignores_cancel():
+        return Stubborn()
+
+    class Streams(HttpHandler):
+        def __init__(self, runtime, make):
+            self.upcall_runtime = runtime
+            self.make = make
+
+        async def handle(self, request):
+            return HttpResponse(200, (), self.make())
+
+    rt2 = UpcallRuntime(close_grace=0.3)
+    try:
+        for n in (host, peer):
+            await _ready(n)
+        peer.add_node_addr(host)
+        expose = host.expose()
+        expose.expose_http("app", Streams(rt, forever))
+        expose.expose_http("stubborn", Streams(rt2, ignores_cancel))
+        serving = asyncio.ensure_future(expose.serve([HTTP_ALPN]))
+        conn = await asyncio.wait_for(net_client(peer).connect(host.node_id(), HTTP_ALPN), 10)
+
+        consumer = asyncio.ensure_future(relay_http(conn, "app", "GET", "/"))
+        await asyncio.wait_for(started.wait(), 10)
+        await asyncio.sleep(0.2)  # the head is out and the pump is writing
+        assert not finished.is_set()
+        rt.close()
+        await asyncio.wait_for(finished.wait(), 3)  # the generator's finally ran
+        await asyncio.wait_for(rt.aclose(), 3)
+        consumer.cancel()
+
+        # An iterator that ignores cancellation: aclose() is bounded.
+        started.clear()
+        finished.clear()
+        consumer = asyncio.ensure_future(relay_http(conn, "stubborn", "GET", "/"))
+        try:
+            await asyncio.wait_for(started.wait(), 10)
+            await asyncio.sleep(0.2)
+            t0 = time.monotonic()
+            await asyncio.wait_for(rt2.aclose(), 3)
+            assert time.monotonic() - t0 < 2.5
+            assert stubborn.is_set() and not finished.is_set()
+        finally:
+            stop = True
+            await asyncio.wait_for(finished.wait(), 5)
+            consumer.cancel()
+        serving.cancel()
+    finally:
+        stop = True
+        await rt.aclose()
+        await rt2.aclose()
+        for n in (host, peer):
+            await n.shutdown()

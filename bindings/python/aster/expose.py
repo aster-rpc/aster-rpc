@@ -50,7 +50,12 @@ response *head* only; raise it for long-polling handlers. A handler that
 raises answers ``500`` (the message is logged, never sent), a timeout
 ``504``, an unusable value ``502``; an exception while streaming aborts the
 response (the consumer sees a reset, not a truncated body). When the
-consumer goes away before the head, the handler task is cancelled.
+consumer goes away before the head, the handler task is cancelled; so are
+in-flight handlers and streamed bodies when the upcall runtime closes (your
+iterator sees ``CancelledError`` or ``aclose()``; ``aclose()`` of the runtime
+waits a bounded time, then abandons an iterator that ignores it).
+``expose_http(max_chunk=...)`` (default 1 MiB) sets the largest body chunk:
+reads return at most that many bytes and ``write`` splits bigger chunks.
 ``HEAD`` responses keep their headers and drop the body. Trailers do not
 cross the relay hop yet (``aster-expose`` V2).
 

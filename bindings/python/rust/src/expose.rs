@@ -40,9 +40,9 @@ use crate::keys::{invalid, node_hex, node_id_out, py_value};
 use crate::net::{IrohConnection, IrohRecvStream, IrohSendStream};
 use crate::upcall::{bytes_out, items, raw_bytes, str_in};
 
-/// Largest single response-body write (`ForeignHttpOptions::max_chunk`);
+/// Default largest single body chunk (`ForeignHttpOptions::max_chunk`);
 /// [`HttpBodyStream::write`] splits bigger chunks.
-const MAX_CHUNK: usize = 1 << 20;
+pub(crate) const DEFAULT_MAX_CHUNK: usize = 1 << 20;
 
 /// UCv1 HTTP version codes, by index.
 const HTTP_VERSIONS: [&str; 5] = ["HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3"];
@@ -104,11 +104,15 @@ impl Expose {
     /// a declared body of at most `inline_request_max` bytes arrive inline;
     /// larger ones stream (`request.body` is an `HttpBodyStream`).
     /// `max_request_body` / `max_response_body` cap bodies (`413` / `502`);
-    /// `response_buffer` is how many 1 MiB chunks a streamed response
-    /// queues before `write` waits.
+    /// `response_buffer` is how many `max_chunk`-sized chunks a streamed
+    /// response queues before `write` waits. `max_chunk` (default 1 MiB,
+    /// must be > 0) is the largest single body chunk: reads return at most
+    /// that many bytes and `write` splits bigger chunks. A handler object
+    /// exposed twice shares one `max_chunk` (the last call wins).
     #[pyo3(signature = (
         service_id, handler, *, authorize=None, inline_request_max=65536,
-        max_request_body=None, max_response_body=None, response_buffer=8
+        max_request_body=None, max_response_body=None, response_buffer=8,
+        max_chunk=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn expose_http(
@@ -120,9 +124,14 @@ impl Expose {
         max_request_body: Option<u64>,
         max_response_body: Option<u64>,
         response_buffer: usize,
+        max_chunk: Option<usize>,
     ) -> PyResult<()> {
         if handler.is_none() {
             return Err(invalid("expose_http needs a handler"));
+        }
+        let max_chunk = max_chunk.unwrap_or(DEFAULT_MAX_CHUNK);
+        if max_chunk == 0 {
+            return Err(invalid("max_chunk must be > 0"));
         }
         let auth = match authorize.filter(|a| !a.is_none()) {
             Some(a) => {
@@ -130,12 +139,12 @@ impl Expose {
             }
             None => allow_all(),
         };
-        let (upcalls, bodies) = crate::upcall::bind_http(handler, "expose_http")?;
+        let (upcalls, bodies) = crate::upcall::bind_http(handler, "expose_http", max_chunk)?;
         let options = ForeignHttpOptions {
             inline_request_max,
             max_request_body,
             max_response_body,
-            max_chunk: MAX_CHUNK,
+            max_chunk,
             response_buffer: response_buffer.max(1),
         };
         let h = ForeignHttpHandler::new(upcalls, bodies, service_id, options);
@@ -458,6 +467,8 @@ fn body_err(e: BodyError) -> PyErr {
 pub struct HttpBodyStream {
     bodies: Option<HttpBodies>,
     stream_id: u64,
+    /// The exchange handler's `max_chunk`.
+    max_chunk: usize,
 }
 
 impl HttpBodyStream {
@@ -482,7 +493,7 @@ impl HttpBodyStream {
     }
 
     /// Awaitable: the next request-body chunk (at most `max` bytes, and at
-    /// most 1 MiB), or `None` at the end.
+    /// most the handler's `max_chunk`), or `None` at the end.
     #[pyo3(signature = (max=65536))]
     fn read<'py>(&self, py: Python<'py>, max: usize) -> PyResult<Bound<'py, PyAny>> {
         let bodies = self.table()?;
@@ -500,8 +511,9 @@ impl HttpBodyStream {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let bodies = self.table()?;
         let id = self.stream_id;
+        let max_chunk = self.max_chunk;
         future_into_py(py, async move {
-            match bodies.read(id, MAX_CHUNK).await.map_err(body_err)? {
+            match bodies.read(id, max_chunk).await.map_err(body_err)? {
                 Some(c) => Ok(Python::attach(|py| PyBytes::new(py, &c).unbind())),
                 None => Err(PyStopAsyncIteration::new_err(())),
             }
@@ -518,15 +530,16 @@ impl HttpBodyStream {
         let bodies = self.table()?;
         let id = self.stream_id;
         let data = chunk_in(chunk)?;
+        let max_chunk = self.max_chunk;
         future_into_py(py, async move {
-            for piece in data.chunks(MAX_CHUNK) {
+            for piece in data.chunks(max_chunk) {
                 bodies.write(id, piece.to_vec()).await.map_err(body_err)?;
             }
             Ok(())
         })
     }
 
-    /// Queue a chunk (at most 1 MiB) without waiting: `False` when the
+    /// Queue a chunk (at most `max_chunk` bytes) without waiting: `False` when the
     /// queue is full (nothing queued).
     fn try_write(&self, chunk: &Bound<'_, PyAny>) -> PyResult<bool> {
         self.table()?
@@ -644,13 +657,18 @@ fn version_in(obj: &Bound<'_, PyAny>) -> PyResult<u8> {
 pub(crate) fn http_request_out<'py>(
     py: Python<'py>,
     req: ExposeHttpRequest,
-    bodies: Option<HttpBodies>,
+    bodies: Option<(HttpBodies, usize)>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let (bodies, max_chunk) = match bodies {
+        Some((b, m)) => (Some(b), m),
+        None => (None, DEFAULT_MAX_CHUNK),
+    };
     let handle = Bound::new(
         py,
         HttpBodyStream {
             bodies,
             stream_id: req.stream_id,
+            max_chunk,
         },
     )?
     .into_any();

@@ -55,7 +55,7 @@ import inspect
 import logging
 import weakref
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, Literal, Optional, Set, Tuple
 
 from ._aster import _UpcallRuntime, _upcall_decode, _upcall_encode, _upcall_kinds
 
@@ -230,7 +230,9 @@ class UpcallRuntime:
     """The pump plus per-kind policies. One per event loop is the norm
     (:func:`get_runtime`); it starts its pump task on first use and serves
     on that loop. ``capacity`` bounds each bound object's queue (a full one
-    refuses: ``overloaded``); ``batch`` is how many events one wake drains.
+    refuses: ``overloaded``); ``batch`` is how many events one wake drains;
+    ``close_grace`` is how long :meth:`aclose` waits (seconds) for cancelled
+    handler and response-streaming tasks to finish.
     """
 
     def __init__(
@@ -240,7 +242,10 @@ class UpcallRuntime:
         default_policy: Optional[UpcallPolicy] = None,
         policies: Optional[Dict[str, UpcallPolicy]] = None,
         batch: int = 64,
+        close_grace: float = 2.0,
     ) -> None:
+        self._close_grace = float(close_grace)
+        self._streams: Set[asyncio.Task] = set()
         self._native = _UpcallRuntime(capacity)
         self._batch = max(1, int(batch))
         self._handlers: Dict[int, Dict[str, Callable]] = {}
@@ -300,13 +305,33 @@ class UpcallRuntime:
 
     def close(self) -> None:
         """Stop: pending upcalls fail (decisions fall back to their failure
-        mode), running handlers are cancelled, later upcalls fail at once.
-        Idempotent."""
+        mode), running handlers and in-flight streamed HTTP responses are
+        cancelled (a user's async iterator sees ``CancelledError`` or
+        ``aclose()``), later upcalls fail at once. Idempotent. Cancellation
+        is requested, not forced: a user iterator that swallows it keeps
+        running; :meth:`aclose` waits at most ``close_grace`` seconds for the
+        cancelled tasks, then abandons them (they cannot write any more, the
+        exchanges being closed)."""
         self._native.close()
+        self._cancel_tasks()
+
+    def _cancel_tasks(self) -> list:
+        tasks = [*self._tasks.values(), *self._streams]
+        current = asyncio.current_task() if self._loop is not None else None
+        for task in tasks:
+            if task is not current:
+                task.cancel()
+        self._tasks.clear()
+        return tasks
 
     async def aclose(self) -> None:
-        """:meth:`close`, then wait for the pump to finish."""
+        """:meth:`close`, then wait for the pump to finish and for the
+        cancelled tasks (at most ``close_grace`` seconds in all; then the
+        rest are abandoned)."""
         self.close()
+        tasks = [t for t in (*self._streams,) if t is not asyncio.current_task()]
+        if tasks:
+            await asyncio.wait(tasks, timeout=self._close_grace)
         pump = self._pump
         if pump is not None and not pump.done() and pump is not asyncio.current_task():
             try:
@@ -375,9 +400,7 @@ class UpcallRuntime:
                     return
         finally:
             native.close()
-            for task in list(self._tasks.values()):
-                task.cancel()
-            self._tasks.clear()
+            self._cancel_tasks()
 
     async def _serve(self, channel: int, iid: int, kind: str, fn: Callable, args) -> None:
         native = self._native
@@ -408,7 +431,14 @@ class UpcallRuntime:
             # Respond first, then write: a streamed body follows the head.
             from .expose import _stream_response
 
-            await _stream_response(value, args[0])
+            task = asyncio.current_task()
+            if self.closed:
+                return
+            self._streams.add(task)
+            try:
+                await _stream_response(value, args[0])
+            finally:
+                self._streams.discard(task)
 
 
 def _is_fence_rejection(exc: BaseException) -> bool:

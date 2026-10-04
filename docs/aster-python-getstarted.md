@@ -612,8 +612,13 @@ is `bytes` / `str` (sent with the head) or an (async) iterable of chunks
 The kind's timeout bounds the time to the response head only -- raise it for
 long-polling handlers. A handler that raises answers `500` (the message is
 logged, never sent), a timeout `504`, no handler `501`; `max_request_body` /
-`max_response_body` cap bodies (`413` / `502`). If the consumer leaves before
-the head, the handler task is cancelled.
+`max_response_body` cap bodies (`413` / `502`), and `max_chunk` (default
+1 MiB, must be > 0) sets the largest body chunk: reads return at most that
+many bytes and writes of bigger chunks are split. If the consumer leaves
+before the head, the handler task is cancelled. Closing the `UpcallRuntime`
+cancels in-flight handlers and streamed responses too (your iterator sees
+`CancelledError` or `aclose()`); `aclose()` waits at most `close_grace`
+seconds (default 2), then abandons an iterator that ignores cancellation.
 
 An edge accepts route registrations with `expose.serve_routes(EdgeRouter(),
 policy)`, where a `RoutePolicy`'s `async def grant(peer, metadata, specs)`
