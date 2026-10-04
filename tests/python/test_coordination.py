@@ -83,11 +83,16 @@ def test_top_level_exports():
 @pytest.mark.parametrize(
     "variant,message,cls,kind",
     [
-        ("invalid_argument", "a resolved result awaits acknowledgement", CoordinationAwaitingAckError, "awaiting_ack"),
-        ("invalid_argument", "a request is unresolved on this journal", CoordinationUnresolvedError, "unresolved"),
-        ("invalid_argument", "the journal is fatal", CoordinationJournalFatalError, "journal_fatal"),
-        ("invalid_argument", "the lifetime lock is held", CoordinationJournalLockedError, "journal_locked"),
+        ("coordination:awaiting_ack", "held", CoordinationAwaitingAckError, "awaiting_ack"),
+        ("coordination:unresolved", "held", CoordinationUnresolvedError, "unresolved"),
+        ("coordination:journal_fatal", "held", CoordinationJournalFatalError, "journal_fatal"),
+        ("coordination:journal_locked", "held", CoordinationJournalLockedError, "journal_locked"),
+        ("coordination:unavailable", "budget spent", CoordinationUnavailableError, "unavailable"),
+        ("coordination:closed", "closed", CoordinationClosedError, "closed"),
         ("invalid_argument", "bad hex", CoordinationInvalidArgumentError, "invalid"),
+        # The kind is structural: a message that merely mentions a journal
+        # state is not that state.
+        ("invalid_argument", "a resolved result awaits acknowledgement", CoordinationInvalidArgumentError, "invalid"),
         ("rpc", "permission denied", CoordinationRpcError, "rpc"),
         ("transport", "no member answered", CoordinationUnavailableError, "unavailable"),
         ("connection", "something else", CoordinationError, "other"),
@@ -101,12 +106,15 @@ def test_rust_errors_map_to_typed_classes(variant, message, cls, kind):
     assert message in str(e)
 
 
-def test_rpc_errors_carry_their_code_even_when_flattened():
+def test_rpc_errors_carry_their_code_even_through_a_lease():
     direct = _coordination_error_for_testing("rpc", "denied", 7)
     assert isinstance(direct, CoordinationRpcError) and direct.code == 7
-    # The lease adapter flattens the inner error into InvalidArgument text.
-    flat = _coordination_error_for_testing("invalid_argument", "lease: rpc error [5]: gone")
-    assert isinstance(flat, CoordinationRpcError) and flat.code == 5
+    # A lease failure keeps the structured kind of the RPC error underneath.
+    wrapped = _coordination_error_for_testing(
+        "coordination:rpc", "invalid argument: coordination lease: rpc error [5]: gone", 5
+    )
+    assert isinstance(wrapped, CoordinationRpcError) and wrapped.code == 5
+    assert "coordination lease: rpc error [5]: gone" in str(wrapped)
 
 
 def test_invalid_argument_is_also_a_value_error():
