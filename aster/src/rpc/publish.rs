@@ -8,8 +8,10 @@
 //! downloads it, and checks `blake3(contract.bin) == contract_id`.
 
 use aster_transport_core::contract::{
-    build_contract_collection, compute_contract_id, ContractManifest, ServiceContract, TypeDef,
+    build_contract_collection, compute_contract_id, compute_type_hash, decode_type_def_bytes,
+    ContractManifest, ServiceContract, TypeDef,
 };
+use aster_transport_core::dynamic::DynContract;
 use aster_transport_core::registry::{contract_key, manifest_key, version_key, ArtifactRef};
 
 use crate::blobs::Blobs;
@@ -27,12 +29,24 @@ pub struct PublishedContract {
 }
 
 /// A contract fetched from the registry and **verified** against its id —
-/// returning this value means `blake3(contract.bin) == contract_id` and the
-/// manifest's self-reported id matched. Verification failures are errors.
+/// returning this value means `blake3(contract.bin) == contract_id`, the
+/// manifest's self-reported id matched, and every `types/{hash}.bin` hashed to
+/// its name. Verification failures are errors.
 #[derive(Debug, Clone)]
 pub struct FetchedContract {
     pub contract_id: String,
     pub manifest: ContractManifest,
+    /// The contract's payload `TypeDef`s (`types/{hash}.bin`).
+    pub type_defs: Vec<TypeDef>,
+}
+
+impl FetchedContract {
+    /// The contract bound to the dynamic Fory codec, ready for a
+    /// [`DynamicClient`](super::DynamicClient).
+    pub fn dyn_contract(&self) -> Result<DynContract> {
+        DynContract::from_manifest(&self.manifest, self.type_defs.clone())
+            .map_err(|e| Error::InvalidArgument(format!("contract types: {e}")))
+    }
 }
 
 /// Publish `sc` (+ its `type_defs`) into the `registry` doc: build + upload the
@@ -141,9 +155,31 @@ pub async fn fetch_and_verify_contract(
         )));
     }
 
+    // Payload types: each blob must hash to its name.
+    let mut type_defs = Vec::new();
+    for (name, bytes) in &entries {
+        let Some(hash) = name
+            .strip_prefix("types/")
+            .and_then(|n| n.strip_suffix(".bin"))
+        else {
+            continue;
+        };
+        let actual = hex::encode(compute_type_hash(bytes));
+        if !actual.eq_ignore_ascii_case(hash) {
+            return Err(Error::Transport(anyhow::anyhow!(
+                "type integrity check failed: blake3({name}) = {actual}"
+            )));
+        }
+        type_defs.push(
+            decode_type_def_bytes(bytes)
+                .map_err(|e| Error::Transport(anyhow::anyhow!("{name}: {e}")))?,
+        );
+    }
+
     Ok(FetchedContract {
         contract_id,
         manifest,
+        type_defs,
     })
 }
 

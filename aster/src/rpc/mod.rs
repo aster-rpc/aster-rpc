@@ -34,6 +34,7 @@ pub mod interceptor;
 pub mod lease;
 mod observe;
 pub mod projection;
+pub mod proxy;
 pub mod runtime;
 pub mod server;
 mod sessions;
@@ -65,6 +66,7 @@ pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationE
 pub use empty::Empty;
 pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
 pub use projection::{Projection, ProjectionRegistry};
+pub use proxy::{DynContract, DynResponseStream, DynValue, DynamicClient};
 #[cfg(all(feature = "docs", feature = "blobs"))]
 pub use publish::{
     fetch_and_verify_contract, publish_contract, FetchedContract, PublishedContract,

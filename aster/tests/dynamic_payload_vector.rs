@@ -292,13 +292,15 @@ fn typed_fory() -> Fory {
     f
 }
 
-/// One typed case: its name, wire type, typed bytes, and a check that typed
-/// decoding of (dynamic) bytes gives the original value back.
+/// Typed decoding of (dynamic) bytes gives the original value back.
+type TypedCheck = Box<dyn Fn(&Fory, &[u8])>;
+
+/// One typed case: its name, wire type, typed bytes, and its [`TypedCheck`].
 struct Case {
     name: &'static str,
     type_name: &'static str,
     bytes: Vec<u8>,
-    check: Box<dyn Fn(&Fory, &[u8])>,
+    check: TypedCheck,
 }
 
 fn case<T>(f: &Fory, name: &'static str, type_name: &'static str, v: T) -> Case
