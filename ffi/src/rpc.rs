@@ -190,7 +190,8 @@ unsafe fn lease_out(
 ///
 /// Release non-zero buffers with `aster_call_buffer_release`. Bad options →
 /// `INVALID_ARGUMENT`; unknown connection → `NOT_FOUND`. Blocks the calling
-/// thread.
+/// thread, which must not be a tokio runtime thread (`UNSUPPORTED`, nothing
+/// sent).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn aster_rpc_unary(
@@ -252,6 +253,12 @@ unsafe fn unary_impl(
         || out_status_buffer.is_null()
     {
         return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
+    }
+    // A blocking `block_on` from a tokio worker would panic across
+    // `extern "C"` (as `expose.rs`'s `BLOCKING_ON_RUNTIME`).
+    if tokio::runtime::Handle::try_current().is_ok() {
+        set_last_error("blocking unary call on a tokio runtime thread");
+        return aster_status_t::ASTER_STATUS_UNSUPPORTED as i32;
     }
     let bridge = match load_runtime(runtime) {
         Ok(b) => b,
@@ -410,6 +417,16 @@ impl TokenTable {
     fn remove(&self, id: u64) -> Option<Arc<CancelToken>> {
         self.shard(id).lock().unwrap().remove(&id)
     }
+
+    fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
+    }
+}
+
+/// Test support: the number of live cancel tokens (process-wide).
+#[doc(hidden)]
+pub fn live_cancel_tokens_for_tests() -> usize {
+    CANCEL_TOKENS.len()
 }
 
 static CANCEL_TOKENS: once_cell::sync::Lazy<TokenTable> =
@@ -417,7 +434,8 @@ static CANCEL_TOKENS: once_cell::sync::Lazy<TokenTable> =
 
 /// A new cancel token for one `aster_rpc_unary_cancellable` call. The call
 /// consumes it (whatever its outcome); a token never passed to a call is
-/// freed with `aster_cancel_token_release`. Never blocks.
+/// freed with `aster_cancel_token_release`. Never blocks. Tokens are
+/// process-global (one table for every runtime): `runtime` is not consulted.
 #[no_mangle]
 pub unsafe extern "C" fn aster_cancel_token_new(
     runtime: aster_runtime_t,
@@ -445,6 +463,8 @@ pub unsafe extern "C" fn aster_cancel_token_new(
 ///
 /// `OK` while the token is live; `NOT_FOUND` once its call has returned (or
 /// for a released / unknown token): nothing is left to cancel.
+///
+/// Tokens are process-global: `runtime` is not consulted.
 #[no_mangle]
 pub extern "C" fn aster_cancel_token_cancel(
     runtime: aster_runtime_t,
@@ -462,12 +482,25 @@ pub extern "C" fn aster_cancel_token_cancel(
 
 /// Free a token that was never passed to `aster_rpc_unary_cancellable`
 /// (the call frees its own). `NOT_FOUND` if it is already gone.
+/// `INVALID_ARGUMENT` while a call holds it: releasing it then would make
+/// that call uncancellable, so the token stays (the call frees it). A
+/// release that wins the race with a starting call makes that call refuse
+/// the token (`INVALID_ARGUMENT`).
+///
+/// Tokens are process-global: `runtime` is not consulted.
 #[no_mangle]
 pub extern "C" fn aster_cancel_token_release(
     runtime: aster_runtime_t,
     token: aster_cancel_token_t,
 ) -> i32 {
     let _ = runtime;
+    let Some(t) = CANCEL_TOKENS.get(token) else {
+        return aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
+    };
+    // Claim it the way a call does: whoever sets `taken` first owns it.
+    if t.taken.swap(true, Ordering::AcqRel) {
+        return invalid("cancel token is in use by a call (the call frees it)");
+    }
     match CANCEL_TOKENS.remove(token) {
         Some(_) => aster_status_t::ASTER_STATUS_OK as i32,
         None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
@@ -492,7 +525,9 @@ impl Drop for TokenGuard {
 /// call, or unknown, is `INVALID_ARGUMENT` and stays as it was.
 /// A cancelled call returns `OK` with `*out_status_code` = `CANCELLED` and
 /// the AEv1 status "call cancelled". No completion event is involved: the
-/// outcome is in the out-parameters, as for `aster_rpc_unary`.
+/// outcome is in the out-parameters, as for `aster_rpc_unary`. Like it,
+/// never call it from a tokio runtime thread (`UNSUPPORTED`; the token is
+/// consumed, nothing is sent).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn aster_rpc_unary_cancellable(

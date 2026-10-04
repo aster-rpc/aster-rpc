@@ -270,6 +270,21 @@ struct Run {
     errors: usize,
     secs: f64,
     lats: Vec<u64>,
+    /// Process CPU time (user + system, client and in-process server) per
+    /// call, in microseconds.
+    cpu_us_per_call: f64,
+}
+
+/// Process CPU time (user + system) in microseconds.
+fn cpu_us() -> f64 {
+    // SAFETY: plain getrusage into a zeroed struct.
+    let ru = unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru
+    };
+    let tv = |t: libc::timeval| t.tv_sec as f64 * 1e6 + t.tv_usec as f64;
+    tv(ru.ru_utime) + tv(ru.ru_stime)
 }
 
 fn run(c: Client, t: &Arc<Target>, mode: &str, conc: usize, secs: f64) -> Run {
@@ -296,6 +311,7 @@ fn run(c: Client, t: &Arc<Target>, mode: &str, conc: usize, secs: f64) -> Run {
         })
         .collect();
     start.wait();
+    let cpu0 = cpu_us();
     let t0 = Instant::now();
     std::thread::sleep(Duration::from_secs_f64(secs));
     stop.store(true, Ordering::Relaxed);
@@ -307,9 +323,11 @@ fn run(c: Client, t: &Arc<Target>, mode: &str, conc: usize, secs: f64) -> Run {
         errors += e;
     }
     let secs = t0.elapsed().as_secs_f64();
+    let cpu = cpu_us() - cpu0;
     lats.sort_unstable();
     Run {
         calls: lats.len(),
+        cpu_us_per_call: cpu / lats.len().max(1) as f64,
         errors,
         secs,
         lats,
@@ -460,7 +478,7 @@ fn main() {
     }
 
     // (mode, conc) -> per-run (rps, p50, p99)
-    type Cell = ((String, usize), Vec<(f64, f64, f64)>);
+    type Cell = ((String, usize), Vec<(f64, f64, f64, f64)>);
     let mut table: Vec<Cell> = Vec::new();
     for r in 0..args.runs {
         for &conc in &args.concurrency {
@@ -469,33 +487,39 @@ fn main() {
                 let rps = res.calls as f64 / res.secs;
                 let (p50, p99) = (pct(&res.lats, 0.5), pct(&res.lats, 0.99));
                 println!(
-                    "RESULT {{\"kind\":\"ffi_unary\",\"run\":{r},\"mode\":\"{m}\",\"conc\":{conc},\"calls\":{},\"errors\":{},\"secs\":{:.3},\"rps\":{rps:.1},\"p50_ms\":{p50:.3},\"p90_ms\":{:.3},\"p99_ms\":{p99:.3},\"max_ms\":{:.3}}}",
+                    "RESULT {{\"kind\":\"ffi_unary\",\"run\":{r},\"mode\":\"{m}\",\"conc\":{conc},\"calls\":{},\"errors\":{},\"secs\":{:.3},\"rps\":{rps:.1},\"p50_ms\":{p50:.3},\"p90_ms\":{:.3},\"p99_ms\":{p99:.3},\"max_ms\":{:.3},\"cpu_us_per_call\":{:.1}}}",
                     res.calls,
                     res.errors,
                     res.secs,
                     pct(&res.lats, 0.9),
                     pct(&res.lats, 1.0),
+                    res.cpu_us_per_call,
                 );
                 let key = (m.clone(), conc);
                 match table.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, v)) => v.push((rps, p50, p99)),
-                    None => table.push((key, vec![(rps, p50, p99)])),
+                    Some((_, v)) => v.push((rps, p50, p99, res.cpu_us_per_call)),
+                    None => table.push((key, vec![(rps, p50, p99, res.cpu_us_per_call)])),
                 }
             }
         }
     }
-    println!("\n| mode | conc | rps (median) | p50 ms | p99 ms | rps min..max |");
-    println!("|---|---:|---:|---:|---:|---|");
+    println!("\n| mode | conc | rps (median) | rps min..max | p50 ms | p99 ms | CPU us/call (min..max) |");
+    println!("|---|---:|---:|---|---:|---:|---|");
     for ((m, conc), v) in &table {
         let rps: Vec<f64> = v.iter().map(|x| x.0).collect();
         let (lo, hi) = rps
             .iter()
             .fold((f64::MAX, 0f64), |(l, h), &x| (l.min(x), h.max(x)));
+        let cpu: Vec<f64> = v.iter().map(|x| x.3).collect();
+        let (clo, chi) = cpu
+            .iter()
+            .fold((f64::MAX, 0f64), |(l, h), &x| (l.min(x), h.max(x)));
         println!(
-            "| {m} | {conc} | {:.0} | {:.3} | {:.3} | {lo:.0}..{hi:.0} |",
+            "| {m} | {conc} | {:.0} | {lo:.0}..{hi:.0} | {:.3} | {:.3} | {:.1} ({clo:.1}..{chi:.1}) |",
             median(rps.clone()),
             median(v.iter().map(|x| x.1).collect()),
             median(v.iter().map(|x| x.2).collect()),
+            median(cpu.clone()),
         );
     }
     unsafe { aster_runtime_close(rt) };

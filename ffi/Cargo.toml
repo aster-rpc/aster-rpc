@@ -34,6 +34,8 @@ base64 = "0.22"
 loom = "0.7"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+# getrusage: per-call CPU time in the ffi_unary_bench example.
+libc = { workspace = true }
 
 [features]
 # Test-only: `tests/coordination.rs` hosts a real voter group in process

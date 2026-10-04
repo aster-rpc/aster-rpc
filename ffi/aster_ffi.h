@@ -4927,7 +4927,8 @@ int32_t aster_verified_chain_role_of(const struct aster_verified_chain_t *chain,
  *
  * Release non-zero buffers with `aster_call_buffer_release`. Bad options →
  * `INVALID_ARGUMENT`; unknown connection → `NOT_FOUND`. Blocks the calling
- * thread.
+ * thread, which must not be a tokio runtime thread (`UNSUPPORTED`, nothing
+ * sent).
  */
 int32_t aster_rpc_unary(aster_runtime_t runtime,
                         aster_connection_t connection,
@@ -4945,7 +4946,8 @@ int32_t aster_rpc_unary(aster_runtime_t runtime,
 /**
  * A new cancel token for one `aster_rpc_unary_cancellable` call. The call
  * consumes it (whatever its outcome); a token never passed to a call is
- * freed with `aster_cancel_token_release`. Never blocks.
+ * freed with `aster_cancel_token_release`. Never blocks. Tokens are
+ * process-global (one table for every runtime): `runtime` is not consulted.
  */
 int32_t aster_cancel_token_new(aster_runtime_t runtime, aster_cancel_token_t *out_token);
 
@@ -4963,12 +4965,20 @@ int32_t aster_cancel_token_new(aster_runtime_t runtime, aster_cancel_token_t *ou
  *
  * `OK` while the token is live; `NOT_FOUND` once its call has returned (or
  * for a released / unknown token): nothing is left to cancel.
+ *
+ * Tokens are process-global: `runtime` is not consulted.
  */
 int32_t aster_cancel_token_cancel(aster_runtime_t runtime, aster_cancel_token_t token);
 
 /**
  * Free a token that was never passed to `aster_rpc_unary_cancellable`
  * (the call frees its own). `NOT_FOUND` if it is already gone.
+ * `INVALID_ARGUMENT` while a call holds it: releasing it then would make
+ * that call uncancellable, so the token stays (the call frees it). A
+ * release that wins the race with a starting call makes that call refuse
+ * the token (`INVALID_ARGUMENT`).
+ *
+ * Tokens are process-global: `runtime` is not consulted.
  */
 int32_t aster_cancel_token_release(aster_runtime_t runtime, aster_cancel_token_t token);
 
@@ -4982,7 +4992,9 @@ int32_t aster_cancel_token_release(aster_runtime_t runtime, aster_cancel_token_t
  * call, or unknown, is `INVALID_ARGUMENT` and stays as it was.
  * A cancelled call returns `OK` with `*out_status_code` = `CANCELLED` and
  * the AEv1 status "call cancelled". No completion event is involved: the
- * outcome is in the out-parameters, as for `aster_rpc_unary`.
+ * outcome is in the out-parameters, as for `aster_rpc_unary`. Like it,
+ * never call it from a tokio runtime thread (`UNSUPPORTED`; the token is
+ * consumed, nothing is sent).
  */
 int32_t aster_rpc_unary_cancellable(aster_runtime_t runtime,
                                     aster_connection_t connection,

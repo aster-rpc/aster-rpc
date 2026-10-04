@@ -42,7 +42,9 @@ slower. Nothing in 4.4 changed shape. Source: `ffi/src/rpc.rs`. Tests:
 | `aster_cancel_token_new(rt, *out_token)` | A token (`aster_cancel_token_t`, `u64`, never reused) for **one** call. Never blocks; `runtime` is not consulted. |
 | `aster_rpc_unary_cancellable(rt, conn, opts*, token, req, len, ...)` | `aster_rpc_unary` plus `token` (0 = exactly `aster_rpc_unary`). Same pooled single-write path, same out-parameters and results. Consumes the token on every return path (argument errors too) except when it refuses the token: unknown, or already taken by another call, is `INVALID_ARGUMENT` and leaves it as it was. |
 | `aster_cancel_token_cancel(rt, token)` | Any thread, never blocks, idempotent. Before the call starts: the call returns `CANCELLED` without sending. In flight: the call is abandoned like a dropped Rust future and returns `OK` with `status_code` `CANCELLED` ("call cancelled"). `OK` while the token is live; `NOT_FOUND` once the call has returned (nothing left to cancel). |
-| `aster_cancel_token_release(rt, token)` | Frees a token that was never passed to a call. `NOT_FOUND` if gone. |
+| `aster_cancel_token_release(rt, token)` | Frees a token that was never passed to a call. `NOT_FOUND` if gone; `INVALID_ARGUMENT` while a call holds it (releasing it would make that call uncancellable; the call frees it). A release that wins the race with a starting call makes that call refuse the token. |
+
+Tokens are process-global (one table for all runtimes); the token functions ignore `runtime`. `aster_rpc_unary` and `aster_rpc_unary_cancellable` called from a tokio runtime thread return `UNSUPPORTED` (nothing sent; a token is consumed) instead of panicking across `extern "C"`.
 
 **Design.** The call `block_on`s `select!{ biased; token.cancelled() => CANCELLED, unary_with(..) => outcome }`
 on the runtime. Losing the race drops the `unary_with` future *inside* the
@@ -70,63 +72,77 @@ reused, so a late cancel can never hit another call. *Use-after-free:* the
 table holds `Arc`s and the call holds its own clone; nothing points into
 caller memory after the call returns. *Token reuse:* a `taken` flag gives a
 token to one call; a second concurrent call with it is refused without
-freeing it under the first.
+freeing it under the first, and so is a release while a call holds it.
 
 **Cost.** One extra crossing (`aster_cancel_token_new`, an insert into one of
 64 mutex-sharded maps) plus a lookup and a remove in the call, and a `Notify`
-in the `select!`. Measured within noise of `aster_rpc_unary` (below).
+in the `select!`.
+
+**Claim, and what supports it:** *no regression detectable at c=1 (run-to-run
+noise is >= 1.5%); off the critical path at c >= 16.* Only the c=1 rows are
+evidence about the token's cost: at c >= 16 every pooled mode is bound by the
+SHARED pool (8 streams), so callers queue for a stream and a few hundred ns
+per call cannot show in throughput. Per-call CPU time (C ABI) and allocations
+(Go) are the c-independent check.
 
 **Measurements** (2026-10-04, M3 Max, loopback, release; machine shared with
-other work, load average 15-20; median of 3 interleaved runs of 5 s,
-closed-loop, one connection; SHARED pool = 8 streams):
+other agents, load average 15-40; closed loop, one connection; median and
+min..max over interleaved runs of 5 s).
 
-| client | path | c=1 rps | c=16 rps | c=100 rps |
-|---|---|---:|---:|---:|
-| C ABI (`ffi_unary_bench`, in-process Rust server) | `aster_rpc_unary` | 17,620 | 33,813 | 33,872 |
-| | `aster_rpc_unary_cancellable` (token) | 17,877 | 33,809 | 33,773 |
-| | `aster_rpc_open` + send + recv (pre-4.5 Go/.NET) | 13,192 | 22,739 | 26,556 |
-| | `open-poll` (200 ms recv slices, pre-4.5 Java) | 13,211 | 22,596 | 26,061 |
-| | Rust `RpcConnection::unary_with` (no C ABI) | 17,583 | 34,028 | 33,901 |
-| | Rust `server_stream_with` + read (no C ABI) | 13,085 | 23,810 | 26,831 |
+C ABI (`ffi_unary_bench`, in-process Rust server; 5 runs; CPU = process
+user+system time per call, client and server together):
+
+| path | c=1 rps (min..max) | c=1 CPU us/call | c=16 rps (min..max) | c=100 rps (min..max) | c=100 p99 ms |
+|---|---:|---:|---:|---:|---:|
+| `aster_rpc_unary` | 17,333 (16,535..17,688) | 65.3 (63.9..65.5) | 34,512 (34,162..36,252) | 34,037 (33,967..34,457) | 3.33 |
+| `aster_rpc_unary_cancellable` | 17,413 (17,131..17,910) | 64.2 (63.6..65.5) | 34,311 (32,833..37,426) | 34,112 (33,906..34,403) | 3.31 |
+| `aster_rpc_open` + send + recv (pre-4.5 Go/.NET) | 13,569 (13,233..14,319) | 107.7 (105.2..110.2) | 22,676 (22,513..24,087) | 26,652 (26,374..26,797) | 8.74 |
+
+An earlier 3-run session also measured the decomposition (median rps at
+c=1/16/100): Rust `RpcConnection::unary_with` without the C ABI
+17,583 / 34,028 / 33,901; Rust `server_stream_with` + read 13,085 / 23,810 /
+26,831; the C ABI open path with 200 ms recv slices (pre-4.5 Java)
+13,211 / 22,596 / 26,061.
 
 **Where the old gap came from:** the dedicated stream per call, not the C ABI.
 The Rust-native stream-per-call row (`server_stream_with`) is as slow as the
 C ABI `open` path, and the C ABI fast path is as fast as Rust's own
-`unary_with`. So a fresh QUIC bi-stream per call costs 25-33% of throughput
-(and 2.6x the p99 at c=100); the extra crossings, handle registry, boxed reads
-and 200 ms polling of the open path cost at most ~2%. (Which part of the
-per-stream work dominates -- stream open, server accept, per-stream state --
-was not profiled.) Java's earlier "several times slower" was an ad-hoc
-measurement on a loaded machine; measured properly it was 18-34% (below).
+`unary_with`. A fresh QUIC bi-stream per call costs ~22% of throughput at c=1
+and 1.65x the CPU per call (the c >= 16 open-path numbers are not comparable:
+that path is not pool-bound); the extra crossings, handle registry, boxed
+reads and 200 ms polling cost at most ~2%. (Which part of the per-stream work
+dominates was not profiled.) Java's earlier "several times slower" was an
+ad-hoc measurement on a loaded machine; measured properly it was 18-34%.
 
 Java (`tests/interop/java/InteropEcho.java bench` against the Rust
-`interop_echo` server, fresh server per run, the three variants interleaved;
+`interop_echo` server, fresh server per run, 3 runs, the variants interleaved;
 "before" = the `bindings-catchup` Java classes, "after" = this change; same
-library):
+library). rps median (min..max):
 
-| Java client | c=1 rps / p99 ms | c=16 rps / p99 ms | c=100 rps / p99 ms |
+| Java client | c=1 | c=16 (pool-bound) | c=100 (pool-bound) |
 |---|---:|---:|---:|
-| before: default (`aster_rpc_unary`, not cancellable) | 14,022 / 0.115 | 31,798 / 0.800 | 31,759 / 3.556 |
-| before: `CallOptions.cancellable(true)` (`aster_rpc_open`) | 10,676 / 0.140 | 20,882 / 1.514 | 26,088 / 7.113 |
-| after: default (cancel token, always cancellable) | 14,236 / 0.112 | 31,729 / 0.795 | 31,743 / 3.557 |
+| before: default (`aster_rpc_unary`, not cancellable) | 14,022 (13,967..14,178) | 31,798 (31,413..31,836) | 31,759 (31,291..32,238) |
+| before: `CallOptions.cancellable(true)` (`aster_rpc_open`) | 10,676 (10,654..10,915) | 20,882 (20,811..21,076) | 26,088 (25,846..26,352) |
+| after: default (cancel token, always cancellable) | 14,236 (13,789..14,464) | 31,729 (31,713..32,030) | 31,743 (31,505..31,816) |
 
-Go (`bindings/go/rpc_unary_bench_test.go`, `ASTER_GO_UNARY_BENCH=1`; Go
-server and client in one process, one cancellable ctx per worker; median of 3):
+Go (`bindings/go/rpc_unary_bench_test.go`, `ASTER_GO_UNARY_BENCH=1`; Go server
+and client in one process, one cancellable ctx per worker; 3 runs). rps
+median (min..max); allocations per call (client + server, one process):
+`Background` 36.9 allocs / 2,889 B, token 37.4 / 2,648 B, open 36.0 / 2,385 B.
 
-| Go client | c=1 rps / p99 ms | c=16 rps / p99 ms | c=100 rps / p99 ms |
+| Go client | c=1 | c=16 (pool-bound) | c=100 (pool-bound) |
 |---|---:|---:|---:|
-| `context.Background()` (`aster_rpc_unary`) | 10,869 / 0.173 | 27,719 / 1.174 | 18,905 / 4.898 (*) |
-| cancellable ctx, after (cancel token) | 10,987 / 0.167 | 27,301 / 1.194 | 28,666 / 4.597 |
-| cancellable ctx, before (`aster_rpc_open`) | 8,991 / 0.190 | 19,525 / 1.810 | 25,090 / 9.521 |
+| `context.Background()` (`aster_rpc_unary`) | 10,869 (10,857..11,669) | 27,719 (25,633..27,786) | stall-distorted (*): 18,905 (18,767..22,144) |
+| cancellable ctx, after (cancel token) | 10,987 (10,948..11,611) | 27,301 (23,807..27,323) | 28,666 (27,823..28,939) |
+| cancellable ctx, before (`aster_rpc_open`) | 8,991 (8,737..9,458) | 19,525 (19,202..19,890) | 25,090 (24,801..25,330) |
 
-(*) Two of the three `Background` runs at c=100 hit a ~1.7 s stall (seen on
-both pooled modes in other runs, never on `aster_rpc_open`, never in the
-Rust-server benchmarks; pre-existing, not investigated). The Go-side cost
-that remains is `context.AfterFunc` (how any cancellable ctx is hooked, as
-the old open path did too): 0-6% at c=16 across runs on this loaded machine,
-5-9% with all workers on ONE shared ctx (its mutex); A/B runs with the
+(*) Every `Background` run at c=100 in that session hit the Go-process stall
+(~1.7 s, see the plan's progress log): those numbers say nothing about the
+path. The remaining Go-side cost is `context.AfterFunc` (how any cancellable
+ctx is hooked; the old open path used it too): 0-6% at c=16 across sessions,
+5-9% with all workers on ONE shared ctx (its mutex); an A/B with the
 AfterFunc removed put the token itself at zero, and with `GOGC=off` the gap
-vanished, so it is GC-sensitive Go overhead, not ABI cost.
+vanished.
 
 ## New in 4.4 (additive)
 
