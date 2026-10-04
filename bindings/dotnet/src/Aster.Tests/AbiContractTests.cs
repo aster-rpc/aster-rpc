@@ -1,4 +1,6 @@
 using System;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using Aster;
 
@@ -364,6 +366,191 @@ public class AbiContractTests
         finally
         {
             Marshal.FreeHGlobal(mem);
+        }
+    }
+
+    // ─── ABI 4.1: upcalls, lease, fenced resource, topology ─────────────────
+
+    [Fact]
+    public void Upcall_Struct_Sizes_And_Offsets_Match_Header()
+    {
+        // aster_upcall_event_t (ffi/src/layout.rs; same as Java Upcalls.EVENT_LAYOUT): 40 bytes.
+        Assert.Equal(40, Marshal.SizeOf<UpcallEventNative>());
+        Assert.Equal(40, System.Runtime.CompilerServices.Unsafe.SizeOf<UpcallEventNative>());
+        Assert.Equal(Upcall.Upcalls.EventSize, Marshal.SizeOf<UpcallEventNative>());
+        Off<UpcallEventNative>("invocation_id", 0);
+        Off<UpcallEventNative>("kind", 8);
+        Off<UpcallEventNative>("cancel_reason", 10);
+        Off<UpcallEventNative>("_p0", 11);
+        Off<UpcallEventNative>("payload_len", 12);
+        Off<UpcallEventNative>("deadline_unix_ms", 16);
+        Off<UpcallEventNative>("payload_ptr", 24);
+        Off<UpcallEventNative>("buffer", 32);
+        // aster_topology_admitted_stats_t: 4 x u64.
+        Assert.Equal(32, Marshal.SizeOf<TopologyAdmittedStatsNative>());
+        Off<TopologyAdmittedStatsNative>("hits", 0);
+        Off<TopologyAdmittedStatsNative>("stale", 8);
+        Off<TopologyAdmittedStatsNative>("misses", 16);
+        Off<TopologyAdmittedStatsNative>("upcalls", 24);
+    }
+
+    [Fact]
+    public void Upcall_Enum_Values_Match_Header()
+    {
+        // aster_upcall_kind_t: codes never change.
+        Assert.Equal(0, (int)Upcall.UpcallKind.Cancel);
+        Assert.Equal(1, (int)Upcall.UpcallKind.LeaseTransition);
+        Assert.Equal(2, (int)Upcall.UpcallKind.LeaseSnapshot);
+        Assert.Equal(3, (int)Upcall.UpcallKind.LeaseAuthorize);
+        Assert.Equal(4, (int)Upcall.UpcallKind.FencedMutate);
+        Assert.Equal(16, (int)Upcall.UpcallKind.TopologyAdmitted);
+        Assert.Equal(17, (int)Upcall.UpcallKind.TopologySnapshot);
+        Assert.Equal(32, (int)Upcall.UpcallKind.PlacementPolicy);
+        Assert.Equal(33, (int)Upcall.UpcallKind.PlacementProvision);
+        Assert.Equal(48, (int)Upcall.UpcallKind.ExposeAuthorize);
+        Assert.Equal(49, (int)Upcall.UpcallKind.ExposeHttp);
+        Assert.Equal(50, (int)Upcall.UpcallKind.ExposeRoutePolicy);
+        Assert.Equal(64, (int)Upcall.UpcallKind.AdmissionConnect);
+        Assert.Equal(65, (int)Upcall.UpcallKind.AdmissionHandshake);
+        // aster_upcall_status_t / aster_upcall_cancel_reason_t.
+        Assert.Equal(0u, (uint)Upcall.UpcallStatus.Ok);
+        Assert.Equal(1u, (uint)Upcall.UpcallStatus.Error);
+        Assert.Equal(2u, (uint)Upcall.UpcallStatus.Unimplemented);
+        Assert.Equal(0, (byte)Upcall.UpcallCancelReason.None);
+        Assert.Equal(1, (byte)Upcall.UpcallCancelReason.Timeout);
+        Assert.Equal(2, (byte)Upcall.UpcallCancelReason.Abandoned);
+        Assert.Equal(3, (byte)Upcall.UpcallCancelReason.Shutdown);
+        // aster_lease_status_t, ASTER_EVENT_LEASE_*, aster_hook_failure_mode_t, ASTER_UPCALL_DEFAULT_CAPACITY.
+        Assert.Equal(0u, (uint)Lease.LeaseStatus.Held);
+        Assert.Equal(1u, (uint)Lease.LeaseStatus.Released);
+        Assert.Equal(2u, (uint)Lease.LeaseStatus.Fenced);
+        Assert.Equal(3u, (uint)Lease.LeaseStatus.Lost);
+        Assert.Equal(107u, (uint)EventKind.LeaseAcquired);
+        Assert.Equal(108u, (uint)EventKind.LeaseStatus);
+        Assert.Equal(0u, (uint)HookFailureMode.FailOpen);
+        Assert.Equal(1u, (uint)HookFailureMode.FailClosed);
+        Assert.Equal(1024, Upcall.Upcalls.DefaultCapacity);
+        // UCv1 enum bytes (design §3): deny reasons and fence rejections.
+        Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6 }, Enum.GetValues<Lease.DenyReason>().Select(r => (byte)r).Order().ToArray());
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, Enum.GetValues<Lease.FenceRejectionReason>().Select(r => (byte)r).Order().ToArray());
+    }
+
+    /// <summary>The 4.1 exports: declared in the header, present in the library, and declared in <see cref="Native"/>.</summary>
+    private static readonly string[] Abi41Exports =
+    {
+        "aster_upcalls_new", "aster_upcalls_close", "aster_upcalls_free", "aster_upcall_set_policy", "aster_upcall_set_default_policy",
+        "aster_upcall_poll", "aster_upcall_buffer_release", "aster_upcall_respond",
+        "aster_lease_serializer_foreign_new", "aster_lease_serializer_memory_new", "aster_lease_serializer_free",
+        "aster_lease_acquire", "aster_lease_fence", "aster_lease_status", "aster_lease_watch", "aster_lease_release",
+        "aster_lease_free", "aster_lease_snapshot", "aster_lease_revoke",
+        "aster_fenced_resource_foreign_new", "aster_fenced_resource_free", "aster_fenced_mutate",
+        "aster_topology_admitted_new", "aster_topology_admitted_free", "aster_topology_admitted_check", "aster_topology_admitted_set",
+        "aster_topology_admitted_invalidate", "aster_topology_admitted_prefetch", "aster_topology_admitted_stats", "aster_topology_enable_shared",
+    };
+
+    internal static void AssertExports(string[] names)
+    {
+        string? header = null;
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "ffi", "aster_ffi.h"))) dir = dir.Parent;
+        if (dir != null) header = File.ReadAllText(Path.Combine(dir.FullName, "ffi", "aster_ffi.h"));
+
+        Assert.True(NativeLibrary.TryLoad("libaster_transport_ffi", typeof(Native).Assembly, null, out IntPtr lib), "native library");
+        foreach (string name in names)
+        {
+            Assert.True(typeof(Native).GetMethod(name, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static) != null, $"Native.{name} is not declared");
+            Assert.True(NativeLibrary.TryGetExport(lib, name, out _), $"{name} is not exported by the native library");
+            if (header != null) Assert.Matches($@"\b{name}\(", header);
+        }
+    }
+
+    [Fact]
+    public void Abi_4_1_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi41Exports);
+
+    // ─── ABI 4.2: expose ────────────────────────────────────────────────────
+
+    [Fact]
+    public void Expose_Struct_Sizes_And_Offsets_Match_Header()
+    {
+        // aster_http_foreign_options_t: 48 bytes.
+        Assert.Equal(48, Marshal.SizeOf<HttpForeignOptionsNative>());
+        Off<HttpForeignOptionsNative>("struct_size", 0);
+        Off<HttpForeignOptionsNative>("flags", 4);
+        Off<HttpForeignOptionsNative>("inline_request_max", 8);
+        Off<HttpForeignOptionsNative>("max_request_body", 16);
+        Off<HttpForeignOptionsNative>("max_response_body", 24);
+        Off<HttpForeignOptionsNative>("max_chunk", 32);
+        Off<HttpForeignOptionsNative>("response_buffer", 40);
+        Off<HttpForeignOptionsNative>("reserved", 44);
+        // aster_route_spec_t: 40 bytes (LP64).
+        Assert.Equal(40, Marshal.SizeOf<RouteSpecNative>());
+        Off<RouteSpecNative>("host", 0);
+        Off<RouteSpecNative>("service_id", 16);
+        Off<RouteSpecNative>("port", 32);
+        Off<RouteSpecNative>("protocol", 36);
+    }
+
+    [Fact]
+    public unsafe void Http_Foreign_Options_Init_Fills_The_Native_Struct_Size()
+    {
+        HttpForeignOptionsNative o = default;
+        Native.Check(Native.aster_http_foreign_options_init(&o), "init");
+        Assert.Equal(48u, o.struct_size);
+        Assert.Equal(0u, o.flags);
+        Assert.Equal(0u, o.reserved);
+    }
+
+    [Fact]
+    public void Http_Body_Status_Values_Match_Header()
+    {
+        // aster_http_body_status_t: 1..9 are the stable BodyError codes, negatives are argument / handle errors.
+        Assert.Equal(0, (int)Expose.HttpBodyStatus.Ok);
+        Assert.Equal(1, (int)Expose.HttpBodyStatus.UnknownStream);
+        Assert.Equal(2, (int)Expose.HttpBodyStatus.Cancelled);
+        Assert.Equal(3, (int)Expose.HttpBodyStatus.TooLarge);
+        Assert.Equal(4, (int)Expose.HttpBodyStatus.ChunkTooLarge);
+        Assert.Equal(5, (int)Expose.HttpBodyStatus.Finished);
+        Assert.Equal(6, (int)Expose.HttpBodyStatus.Timeout);
+        Assert.Equal(7, (int)Expose.HttpBodyStatus.Read);
+        Assert.Equal(8, (int)Expose.HttpBodyStatus.InvalidTrailers);
+        Assert.Equal(9, (int)Expose.HttpBodyStatus.BlockingOnRuntime);
+        Assert.Equal(-1, (int)Expose.HttpBodyStatus.InvalidArgument);
+        Assert.Equal(-2, (int)Expose.HttpBodyStatus.UnknownHandle);
+        // Route protocols and HTTP versions (UCv1 u8enums).
+        Assert.Equal(0, Upcall.ExposeRouteSpec.ProtocolHttp);
+        Assert.Equal(1, Upcall.ExposeRouteSpec.ProtocolTcp);
+        Assert.Equal(new byte[] { 0, 1, 2, 3, 4 }, Enum.GetValues<Expose.HttpProtocolVersion>().Select(v => (byte)v).Order().ToArray());
+    }
+
+    private static readonly string[] Abi42Exports =
+    {
+        "aster_expose_new", "aster_expose_free", "aster_expose_unexpose", "aster_expose_serve", "aster_expose_handle_connection",
+        "aster_expose_socket", "aster_expose_http_foreign", "aster_expose_route_policy_foreign",
+        "aster_http_bodies_new", "aster_http_bodies_free", "aster_http_bodies_open_count", "aster_http_foreign_options_init",
+        "aster_http_body_read", "aster_http_body_write", "aster_http_body_try_write", "aster_http_body_finish", "aster_http_body_abort",
+        "aster_expose_relay_request", "aster_expose_request_route", "aster_route_registration_free",
+    };
+
+    [Fact]
+    public void Abi_4_2_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi42Exports);
+
+    [Fact]
+    public void Body_Calls_Validate_Arguments_And_Unknown_Handles()
+    {
+        using var rt = new Runtime();
+        unsafe
+        {
+            byte b = 0;
+            UIntPtr n = UIntPtr.Zero;
+            uint eof = 0;
+            // Unknown table -> -2 (these functions do not return aster_status_t).
+            Assert.Equal((int)Expose.HttpBodyStatus.UnknownHandle, Native.aster_http_body_read(rt.Handle, 424_242, 1, &b, (UIntPtr)1, 0, &n, &eof));
+            Assert.Equal((int)Expose.HttpBodyStatus.UnknownHandle, Native.aster_http_body_finish(rt.Handle, 424_242, 1, null, UIntPtr.Zero));
+            using var bodies = Expose.HttpBodies.Create(rt);
+            // Zero cap, NULL buffer with a length: invalid arguments, not a crash.
+            Assert.Equal((int)Expose.HttpBodyStatus.InvalidArgument, Native.aster_http_body_read(rt.Handle, bodies.NativeHandle, 1, &b, UIntPtr.Zero, 0, &n, &eof));
+            Assert.Equal((int)Expose.HttpBodyStatus.InvalidArgument, Native.aster_http_body_write(rt.Handle, bodies.NativeHandle, 1, null, (UIntPtr)4, 0));
+            Assert.Equal(0ul, bodies.OpenCount);
         }
     }
 
