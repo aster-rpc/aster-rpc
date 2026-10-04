@@ -144,6 +144,16 @@ public enum EventKind : uint
     /// <summary>ABI 4.3 <c>aster_http_upload_ready</c> / <c>aster_http_response_ready</c>: <c>handle</c> = the armed handle, <c>error_code</c> = the <c>aster_http_body_status_t</c> its next non-blocking call returns, <c>status</c> = that as an <c>aster_status_t</c>.</summary>
     HttpRelayReady = 109,
 
+    // ABI 4.4 coordination.
+    /// <summary><c>aster_coordination_client_open</c>: <c>handle</c> = the client.</summary>
+    CoordinationClientOpened = 110,
+    /// <summary>A resolved mutation: <c>handle</c> = the resolved-result handle (0 = none), payload = UCv1 <c>D2</c>.</summary>
+    CoordinationResolved = 111,
+    /// <summary>A coordination read / result: payload by operation (<c>D2</c>-<c>DE</c>).</summary>
+    CoordinationResult = 112,
+    /// <summary><c>aster_coordination_lease_acquire</c>: granted = <c>handle</c> + <c>DD</c>, denied = handle 0 + UCv1 <c>B2</c>.</summary>
+    CoordinationLeaseAcquired = 113,
+
     // Errors
     OperationCancelled = 98,
     Error = 99,

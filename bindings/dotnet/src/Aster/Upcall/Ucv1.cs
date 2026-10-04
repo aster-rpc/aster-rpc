@@ -133,7 +133,7 @@ public static class Ucv1
 
     // ── writer / reader ──────────────────────────────────────────────────────
 
-    private sealed class W
+    internal sealed class W
     {
         private readonly List<byte> _out = new();
 
@@ -175,7 +175,7 @@ public static class Ucv1
         public byte[] Done() => _out.ToArray();
     }
 
-    private sealed class R
+    internal sealed class R
     {
         private readonly byte[] _buf;
         private int _pos;

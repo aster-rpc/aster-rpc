@@ -7,10 +7,10 @@
 **C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 4.3, 2026-10-04)
+## STATUS (ABI 4.4, 2026-10-04)
 
 - **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
-  `Native.RequiredAbiMinor` = 3; 4.0 removed the reactor, framed calls, the node factories and
+  `Native.RequiredAbiMinor` = 4; 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
@@ -99,6 +99,18 @@
   code in `RelayStatus`, `Status` via `aster_http_body_status_to_status`); a denied relay, streaming or
   buffered, is `Status.PermissionDenied`. `Unauthenticated` / `CredentialExpired` are reserved for R4
   and not returned today.
+- **Coordination client + placement (ABI 4.4):** `Aster.Coordination` wraps the Rust client (journal, routing, validation and the
+  delivery contract stay in Rust). `CoordinationCodec` is the UCv1 D0-DE / BC-BF codec (every vector in `coordination.json` and the
+  placement cases of `upcalls.json`). `CoordinationClient.OpenAsync` (durable with a journal dir, or read-only), typed mutations returning a
+  `ResolvedMutation` that must be `AcknowledgeAsync`'d before the next (`Dispose` leaves it journaled), `UnacknowledgedAsync` /
+  `ResumeAsync`, reads, `AcquireLeaseAsync` (`CoordinationLease`: release and client close are **not prompt**, they wait for an in-flight CAS and the
+  journal lock stays held until it ends, so a reopen right after close may see `JournalLocked`), `PlacementManager` + `Upcalls.ServePlacement`
+  (kinds 32 / 33, 17 unless a topology node is given; a provider failure fails the pass, never open). Failures are `CoordinationException`
+  (`Kind` from `error_code`, `RpcCode` from `flags`, coarse `Status`: RPC 7 = `PermissionDenied`, 16 = `Unauthenticated`); a committed typed
+  rejection is a result (`MutationReply.IsRejected`). `aster_operation_cancel` only suppresses the event: cancelling a token never aborts a started
+  coordination operation (recover with `UnacknowledgedAsync`). ROOT administers the group but holds no lease/read rights itself: actors need a grant
+  (the live tests use workers granted by the ROOT client). Live tests use the TS suite's `aster-coordination-fixture` (build it with
+  `cargo build -p aster-transport-napi --features coordination-fixture --bin aster-coordination-fixture`, or set `ASTER_COORDINATION_FIXTURE`); they skip when it is absent.
 - **Interop:** joins `tests/interop/` (`tests/interop/dotnet/`), 5×5 matrix all pass.
 - `Bytes.FromArray` (unpinned pointer) is removed; use `fixed` + `Bytes.FromPointer`,
   `Bytes.FromPinned`, or the internal `NativeScope`.
