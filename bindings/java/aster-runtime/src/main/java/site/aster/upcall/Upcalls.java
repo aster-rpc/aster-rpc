@@ -90,6 +90,59 @@ public final class Upcalls implements AutoCloseable {
     byte[] handle(byte[] request, long deadlineUnixMs) throws Exception;
   }
 
+  /**
+   * A handler that answers for itself, for kinds whose answer is not the end of the work (the
+   * {@code expose_http} head is answered first, then the body streams). It must call {@link
+   * Invocation#respond} once, or throw (which answers {@code ERROR} while Rust still waits).
+   */
+  @FunctionalInterface
+  public interface InvocationHandler {
+    void handle(Invocation invocation) throws Exception;
+  }
+
+  /**
+   * One upcall in flight. When Rust stops waiting before the handler answers, the handler's thread
+   * is interrupted and {@link #cancelReason()} says why.
+   */
+  public static final class Invocation {
+    private final Upcalls table;
+    private final Event event;
+    private volatile int cancelReason;
+
+    Invocation(Upcalls table, Event event) {
+      this.table = table;
+      this.event = event;
+    }
+
+    public long id() {
+      return event.invocationId();
+    }
+
+    public byte[] payload() {
+      return event.payload();
+    }
+
+    public long deadlineUnixMs() {
+      return event.deadlineUnixMs();
+    }
+
+    /** {@link #CANCEL_TIMEOUT}, {@link #CANCEL_ABANDONED}, {@link #CANCEL_SHUTDOWN}, or 0. */
+    public int cancelReason() {
+      return cancelReason;
+    }
+
+    public boolean isCancelled() {
+      return cancelReason != 0;
+    }
+
+    /** Answer; false when Rust no longer waits (see {@link Upcalls#respond}). */
+    public boolean respond(int status, byte[] payload) {
+      return table.respond(event.invocationId(), status, payload);
+    }
+  }
+
+  private record Running(FutureTask<Void> task, Invocation invocation) {}
+
   /** One drained upcall event (payload copied, native buffer released). */
   public record Event(
       long invocationId, int kind, int cancelReason, long deadlineUnixMs, byte[] payload) {}
@@ -117,8 +170,8 @@ public final class Upcalls implements AutoCloseable {
 
   private final IrohRuntime runtime;
   private final long handle;
-  private final Map<Integer, Handler> handlers = new ConcurrentHashMap<>();
-  private final Map<Long, FutureTask<Void>> inFlight = new ConcurrentHashMap<>();
+  private final Map<Integer, InvocationHandler> handlers = new ConcurrentHashMap<>();
+  private final Map<Long, Running> inFlight = new ConcurrentHashMap<>();
   private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
   private final Arena arena = Arena.ofShared();
   private final MemorySegment events;
@@ -200,10 +253,28 @@ public final class Upcalls implements AutoCloseable {
 
   /** Register a raw handler for {@code kind} (replaces any earlier one). */
   public Upcalls handle(UpcallKind kind, Handler h) {
+    return handleInvocation(
+        kind,
+        inv -> {
+          byte[] out = h.handle(inv.payload(), inv.deadlineUnixMs());
+          if (!Thread.currentThread().isInterrupted()) {
+            inv.respond(STATUS_OK, out == null ? new byte[0] : out);
+          }
+        });
+  }
+
+  /** Register a handler that answers for itself (replaces any earlier one for the kind). */
+  public Upcalls handleInvocation(UpcallKind kind, InvocationHandler h) {
     if (kind == UpcallKind.CANCEL) {
       throw new IllegalArgumentException("CANCEL is not answerable");
     }
     handlers.put(kind.code, h);
+    return this;
+  }
+
+  /** Remove the handler of {@code kind}; later upcalls of it answer {@code UNIMPLEMENTED}. */
+  public Upcalls removeHandler(UpcallKind kind) {
+    handlers.remove(kind.code);
     return this;
   }
 
@@ -308,43 +379,44 @@ public final class Upcalls implements AutoCloseable {
   private void dispatch(Event ev) {
     if (ev.kind() == UpcallKind.CANCEL.code) {
       cancels.incrementAndGet();
-      FutureTask<Void> task = inFlight.remove(ev.invocationId());
-      if (task != null) {
-        task.cancel(true);
+      Running r = inFlight.remove(ev.invocationId());
+      if (r != null) {
+        r.invocation().cancelReason = Math.max(1, ev.cancelReason());
+        r.task().cancel(true);
       }
       return;
     }
-    Handler h = handlers.get(ev.kind());
+    InvocationHandler h = handlers.get(ev.kind());
     if (h == null) {
       respond(ev.invocationId(), STATUS_UNIMPLEMENTED, new byte[0]);
       return;
     }
     long id = ev.invocationId();
-    FutureTask<Void>[] self = new FutureTask[1];
+    Invocation inv = new Invocation(this, ev);
+    Running[] self = new Running[1];
     FutureTask<Void> task =
         new FutureTask<>(
             () -> {
               try {
-                byte[] out = h.handle(ev.payload(), ev.deadlineUnixMs());
-                if (!Thread.currentThread().isInterrupted()) {
-                  respond(id, STATUS_OK, out == null ? new byte[0] : out);
-                }
+                h.handle(inv);
               } catch (InterruptedException e) {
                 // cancelled by Rust: nobody is waiting
               } catch (Throwable t) {
-                String msg = t.getMessage() == null ? t.toString() : t.getMessage();
-                respond(id, STATUS_ERROR, msg.getBytes(StandardCharsets.UTF_8));
+                if (!inv.isCancelled()) {
+                  String msg = t.getMessage() == null ? t.toString() : t.getMessage();
+                  respond(id, STATUS_ERROR, msg.getBytes(StandardCharsets.UTF_8));
+                }
               } finally {
                 inFlight.remove(id, self[0]);
               }
               return null;
             });
-    self[0] = task;
-    inFlight.put(id, task);
+    self[0] = new Running(task, inv);
+    inFlight.put(id, self[0]);
     try {
       workers.execute(task);
     } catch (RuntimeException rejected) {
-      inFlight.remove(id, task);
+      inFlight.remove(id, self[0]);
       respond(id, STATUS_ERROR, "upcalls closed".getBytes(StandardCharsets.UTF_8));
     }
   }
@@ -403,7 +475,7 @@ public final class Upcalls implements AutoCloseable {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
-    inFlight.values().forEach(t -> t.cancel(true));
+    inFlight.values().forEach(r -> r.task().cancel(true));
     workers.shutdownNow();
     try {
       workers.awaitTermination(2, TimeUnit.SECONDS);
