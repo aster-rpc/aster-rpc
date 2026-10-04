@@ -20,7 +20,13 @@ public enum IrohStatus {
    * A well-formed input failed a security check: an envelope did not open, an attestation chain did
    * not verify, or a grant role did not match its capability (ABI 3.4).
    */
-  VERIFICATION_FAILED(13);
+  VERIFICATION_FAILED(13),
+  /** Reserved for the auth design (ABI 4.3). */
+  UNAUTHENTICATED(14),
+  /** A policy refused the caller, e.g. a denied relay request (ABI 4.3). */
+  PERMISSION_DENIED(15),
+  /** Reserved for the auth design (ABI 4.3). */
+  CREDENTIAL_EXPIRED(16);
 
   public final int code;
 

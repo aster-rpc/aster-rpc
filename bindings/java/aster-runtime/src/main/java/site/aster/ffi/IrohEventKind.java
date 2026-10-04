@@ -102,7 +102,10 @@ public enum IrohEventKind {
 
   // Upcall-backed leases (ABI 4.1)
   LEASE_ACQUIRED(107),
-  LEASE_STATUS(108);
+  LEASE_STATUS(108),
+
+  // Streaming consumer relay readiness (ABI 4.3)
+  HTTP_RELAY_READY(109);
 
   public final int code;
 

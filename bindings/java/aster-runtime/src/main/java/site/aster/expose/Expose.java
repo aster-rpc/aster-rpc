@@ -165,6 +165,11 @@ public final class Expose implements AutoCloseable {
       UpcallNative.handle(
           "aster_expose_request_route", FunctionDescriptor.of(I, J, J, A, J, B, J, A));
 
+  private static final MethodHandle RELAY_OPTIONS_INIT =
+      UpcallNative.handle("aster_http_relay_options_init", FunctionDescriptor.of(I, A));
+  private static final MethodHandle RELAY_STREAM =
+      UpcallNative.handle("aster_expose_relay_stream", FunctionDescriptor.of(I, J, J, B, A, A, A));
+
   private record HttpService(HttpHandler handler, long maxChunk) {}
 
   private final IrohNode node;
@@ -586,6 +591,225 @@ public final class Expose implements AutoCloseable {
           }
         });
     return out;
+  }
+
+  /** The two ends of a streaming relay (see {@link #relayStreaming}). */
+  public record RelayCall(RelayUpload upload, CompletableFuture<RelayResponse> response) {}
+
+  /**
+   * Start a <b>streaming</b> HTTP exchange with the service {@code serviceId} the peer exposed on
+   * {@code connection} and return both ends at once: write the request body to {@code upload} and
+   * {@link RelayUpload#finish} it while {@code response} completes with the head (full duplex: the
+   * head can arrive before the upload is done, an early 413, and the upload carries on after it).
+   * You own both: close the upload (an unfinished one is aborted) and the response. A refusal or
+   * transport failure fails {@code response} with an {@link IrohException}: {@code
+   * PERMISSION_DENIED} for a denied relay, {@code NOT_FOUND} for an unknown service, and so on.
+   * Cancelling {@code response} before the head stops the wait and frees its handle. Synchronous
+   * argument errors throw.
+   */
+  public static RelayCall relayStreaming(
+      IrohConnection connection,
+      String serviceId,
+      String method,
+      String uri,
+      List<HttpHeader> headers,
+      RelayOptions options) {
+    IrohRuntime rt = connection.runtime();
+    RelayOptions o = options == null ? RelayOptions.defaults() : options;
+    List<HttpHeader> lower = new ArrayList<>(headers.size());
+    for (HttpHeader h : headers) {
+      lower.add(new HttpHeader(h.name().toLowerCase(Locale.ROOT), h.value()));
+    }
+    byte[] c4 =
+        Ucv1.encodeExposeHttpRequest(
+            new ExposeHttpRequest(
+                serviceId,
+                null,
+                0,
+                HttpVersion.HTTP_1_1.code,
+                method,
+                uri,
+                lower,
+                HttpBody.STREAM));
+    long upload;
+    long response;
+    try (Arena a = Arena.ofConfined()) {
+      MemorySegment opts = a.allocate(RelayOptions.LAYOUT);
+      UpcallNative.check((int) RELAY_OPTIONS_INIT.invoke(opts), "aster_http_relay_options_init");
+      opts.set(ValueLayout.JAVA_LONG, 8, o.maxChunk());
+      opts.set(ValueLayout.JAVA_INT, 16, o.uploadCapacity());
+      MemorySegment outUp = a.allocate(J);
+      MemorySegment outResp = a.allocate(J);
+      UpcallNative.check(
+          (int)
+              RELAY_STREAM.invoke(
+                  rt.nativeHandle(),
+                  connection.nativeHandle(),
+                  DataPlane.bytes(a, c4),
+                  opts,
+                  outUp,
+                  outResp),
+          "aster_expose_relay_stream");
+      upload = outUp.get(J, 0);
+      response = outResp.get(J, 0);
+    } catch (Throwable t) {
+      throw UpcallNative.rethrow(t);
+    }
+    long maxChunk = o.effectiveMaxChunk();
+    CompletableFuture<RelayResponse> head = new CompletableFuture<>();
+    Thread.ofVirtual()
+        .name("aster-relay-head-" + response)
+        .start(
+            () -> {
+              try {
+                RelayResponse r =
+                    RelayResponse.awaitHead(rt, response, maxChunk, head::isCancelled);
+                if (!head.complete(r)) {
+                  r.close();
+                }
+              } catch (InterruptedException e) {
+                head.cancel(false);
+              } catch (Throwable t) {
+                head.completeExceptionally(t);
+              }
+            });
+    return new RelayCall(new RelayUpload(rt, upload, maxChunk), head);
+  }
+
+  /**
+   * A full-duplex streaming relay with the request body fed from {@code body} ({@code null}: no
+   * body), which is closed when the upload ends. The returned future completes as soon as the
+   * response <b>head</b> is in, possibly before the body is uploaded; the upload carries on in the
+   * background (on a virtual thread) until it is done, the handler stops reading, or the response
+   * is closed before its body ended (which resets an unfinished upload; a body read to its clean
+   * end leaves the upload to finish).
+   *
+   * <p>If {@code body} throws, the request is reset (the handler sees a failed body, never a
+   * truncated one): before the head that exception fails the future; after it, it is logged under
+   * {@code aster.expose} (the response itself is already in hand). Any other failure is the
+   * relay's: see {@link #relayStreaming}. Cancelling the future before the head abandons the
+   * exchange.
+   */
+  public static CompletableFuture<RelayResponse> relayStream(
+      IrohConnection connection,
+      String serviceId,
+      String method,
+      String uri,
+      List<HttpHeader> headers,
+      java.io.InputStream body,
+      RelayOptions options) {
+    RelayCall call;
+    try {
+      call = relayStreaming(connection, serviceId, method, uri, headers, options);
+    } catch (RuntimeException e) {
+      closeQuietly(body);
+      return CompletableFuture.failedFuture(e);
+    }
+    java.util.concurrent.atomic.AtomicReference<Throwable> sourceFailure =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    AtomicBoolean headIn = new AtomicBoolean();
+    AtomicBoolean pumpDone = new AtomicBoolean();
+    Thread pump =
+        Thread.ofVirtual()
+            .name("aster-relay-upload")
+            .unstarted(
+                () -> {
+                  try {
+                    pumpUpload(call.upload(), body, sourceFailure, headIn);
+                  } finally {
+                    pumpDone.set(true);
+                  }
+                });
+    CompletableFuture<RelayResponse> out = new CompletableFuture<>();
+    call.response()
+        .whenComplete(
+            (r, err) -> {
+              if (err == null) {
+                headIn.set(true);
+                r.onAbandon(
+                    () -> {
+                      if (!pumpDone.get()) {
+                        pump.interrupt();
+                      }
+                    });
+                if (!out.complete(r)) {
+                  r.close();
+                }
+                return;
+              }
+              Throwable cause = sourceFailure.get();
+              out.completeExceptionally(cause != null ? cause : err);
+              pump.interrupt();
+            });
+    out.whenComplete(
+        (r, err) -> {
+          if (out.isCancelled()) {
+            call.response().cancel(false);
+            pump.interrupt();
+          }
+        });
+    pump.start();
+    return out;
+  }
+
+  private static void pumpUpload(
+      RelayUpload upload,
+      java.io.InputStream body,
+      java.util.concurrent.atomic.AtomicReference<Throwable> sourceFailure,
+      AtomicBoolean headIn) {
+    try {
+      if (body != null) {
+        byte[] buf = new byte[64 * 1024];
+        int n;
+        while ((n = body.read(buf)) >= 0) {
+          if (n > 0) {
+            upload.write(buf, 0, n, null);
+          }
+        }
+      }
+      upload.finish();
+    } catch (HttpBodyException e) {
+      if (e.exchangeOver()) {
+        // The handler stopped reading (it may have answered already), or the exchange ended.
+        LOG.log(System.Logger.Level.DEBUG, "relay upload ended: {0}", e.toString());
+      } else {
+        LOG.log(System.Logger.Level.WARNING, "relay upload failed: {0}", e.toString());
+        abortQuietly(upload, "upload failed");
+      }
+    } catch (InterruptedIOException e) {
+      abortQuietly(upload, "cancelled");
+    } catch (Throwable t) {
+      // The caller's own body source failed.
+      sourceFailure.set(t);
+      abortQuietly(upload, "request body source failed");
+      if (headIn.get()) {
+        LOG.log(
+            System.Logger.Level.WARNING,
+            "relay request body failed after the response head: " + t,
+            t);
+      }
+    } finally {
+      closeQuietly(body);
+      upload.close();
+    }
+  }
+
+  private static void abortQuietly(RelayUpload upload, String message) {
+    try {
+      upload.abort(message);
+    } catch (Exception ignored) {
+      // already over
+    }
+  }
+
+  private static void closeQuietly(java.io.Closeable c) {
+    if (c != null) {
+      try {
+        c.close();
+      } catch (Exception ignored) {
+        // best effort
+      }
+    }
   }
 
   // -- lifecycle -----------------------------------------------------------------------------

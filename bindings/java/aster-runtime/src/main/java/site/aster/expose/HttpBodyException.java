@@ -24,6 +24,21 @@ public final class HttpBodyException extends IOException {
     READ(7),
     INVALID_TRAILERS(8),
     BLOCKING_ON_RUNTIME(9),
+    /** Relay: the peer has no exposed service of this id. */
+    UNKNOWN_SERVICE(10),
+    /** Relay: the service's admission policy refused this node. */
+    DENIED(11),
+    /** Relay: the service is at its concurrent-stream cap; retry later. */
+    OVERLOADED(12),
+    /** Relay: the peer reset or ended the stream without a response head. */
+    RESET(13),
+    /** Relay: the response head was malformed or too large. */
+    BAD_HEAD(14),
+    /** Relay: the connection is closed or was lost. */
+    CONNECTION_CLOSED(15),
+    /** Relay: the upload was aborted (or freed unfinished) before the head. */
+    UPLOAD_FAILED(16),
+    BUFFER_TOO_SMALL(17),
     INVALID_ARGUMENT(-1),
     UNKNOWN_HANDLE(-2),
     /** A status this binding does not know (a newer library). */

@@ -358,7 +358,7 @@ public final class HttpBodies implements AutoCloseable {
 
   // -- helpers -------------------------------------------------------------------------------
 
-  private static long deadline(Duration timeout) {
+  static long deadline(Duration timeout) {
     if (timeout == null) {
       return Long.MAX_VALUE;
     }
@@ -368,7 +368,7 @@ public final class HttpBodies implements AutoCloseable {
   }
 
   /** Park with back-off; throws when interrupted or past {@code deadline}. */
-  private static long awaitRetry(long park, long deadline) throws IOException {
+  static long awaitRetry(long park, long deadline) throws IOException {
     if (Thread.currentThread().isInterrupted()) {
       throw new InterruptedIOException("body call interrupted");
     }
@@ -380,7 +380,7 @@ public final class HttpBodies implements AutoCloseable {
     return next;
   }
 
-  private static HttpBodyException failure(int rc, String fn) {
+  static HttpBodyException failure(int rc, String fn) {
     return new HttpBodyException(rc, fn + " failed (" + rc + "): " + DataPlane.lastError());
   }
 }

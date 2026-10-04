@@ -53,6 +53,7 @@ public class IrohException extends RuntimeException {
       case BUFFER_TOO_SMALL -> new site.aster.exception.IrohBufferTooSmallException(message);
       case ALREADY_CLOSED -> new site.aster.exception.IrohAlreadyClosedException(message);
       case VERIFICATION_FAILED -> new site.aster.exception.VerificationFailedException(message);
+      case PERMISSION_DENIED -> new site.aster.exception.PermissionDeniedException(message);
       default -> new IrohException(status, message);
     };
   }
