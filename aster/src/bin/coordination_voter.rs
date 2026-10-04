@@ -65,7 +65,7 @@ async fn main() {
     // take the second path or §7.2's binding check never runs — and the whole
     // point of restarting it is that the binding survived a kill.
     let returning = storage.exists();
-    std::fs::create_dir_all(&storage).expect("a storage directory");
+    create_owner_only_dir(&storage);
 
     let server = AsterServer::builder()
         .config(fixture.aster_config(index))
@@ -201,4 +201,21 @@ fn publish(dir: &Path, name: &str, body: &str) {
     let temp = dir.join(format!(".{name}.tmp"));
     std::fs::write(&temp, body).expect("write a control file");
     std::fs::rename(&temp, &final_path).expect("publish a control file");
+}
+
+/// Create `path` (and any missing parents) owner-only.
+///
+/// `create_dir_all` requests `0777` and the process umask subtracts from it, so
+/// under a `0` umask (a container default) the store would be `0777`, which the
+/// production open policy rightly refuses. Request `0700` explicitly instead of
+/// depending on the host.
+fn create_owner_only_dir(path: &std::path::Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path).expect("an owner-only directory");
 }

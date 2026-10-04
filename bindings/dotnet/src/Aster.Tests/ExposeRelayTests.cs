@@ -288,7 +288,8 @@ public class ExposeRelayTests
     /// <summary>A body source that parks until released (or cancelled, when it honours the token).</summary>
     private sealed class StallingStream(Task release, bool honourCancellation, bool stallFirst = false) : Stream
     {
-        public int Reads;
+        private int _reads;
+        public int Reads => Volatile.Read(ref _reads);
         public volatile bool Cancelled;
         public override bool CanRead => true;
         public override bool CanSeek => false;
@@ -302,7 +303,7 @@ public class ExposeRelayTests
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
         {
-            if (stallFirst || Interlocked.Increment(ref Reads) > 1)
+            if (stallFirst || Interlocked.Increment(ref _reads) > 1)
             {
                 try { await (honourCancellation ? release.WaitAsync(ct) : release).ConfigureAwait(false); }
                 catch (OperationCanceledException) { Cancelled = true; throw; }
@@ -342,7 +343,7 @@ public class ExposeRelayTests
         var never = new TaskCompletionSource(); // never released
         var src = new StallingStream(never.Task, honourCancellation: true);
         var resp = await ExposeClient.RelayStreamAsync(rig.Conn, ExposeRig.Svc, "POST", "/duplex", null, src).WaitAsync(T);
-        await Eventually(() => Volatile.Read(ref src.Reads) >= 2, "source parked");
+        await Eventually(() => src.Reads >= 2, "source parked");
         await resp.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); // before the end: abandon
         Assert.True(src.Cancelled, "the pump's token reached the stream read");
         Assert.False(await resp.Upload.WaitAsync(T));
@@ -359,6 +360,6 @@ public class ExposeRelayTests
         await resp.DisposeAsync();
         await resp.DisposeAsync();
         resp.Dispose();
-        await Assert.ThrowsAsync<ObjectDisposedException>(async () => await resp.Body.ReadAsync(new byte[4]));
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () => await resp.Body.ReadExactlyAsync(new byte[4]));
     }
 }

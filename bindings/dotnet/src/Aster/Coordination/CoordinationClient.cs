@@ -177,6 +177,30 @@ public sealed class CoordinationClient : IAsyncDisposable, IDisposable
     internal Runtime Runtime => _runtime;
     internal ulong NativeHandle => Live;
 
+    // `&`/`fixed` on locals is not allowed in async methods (CS9123), so the native calls live in these
+    // synchronous helpers.
+    private static unsafe ulong StartOpen(Runtime rt, Node node, CoordinationClientOptions options)
+    {
+        using var scope = new NativeScope();
+        CoordinationClientOptionsNative o = default;
+        Native.Check(Native.aster_coordination_client_options_init(&o), "aster_coordination_client_options_init");
+        o.flags = options.ReadOnly ? Native.CoordinationClientReadOnly : 0;
+        o.group_id = (IntPtr)scope.Ptr(options.GroupId);
+        o.seed_tickets = scope.Utf8List(options.SeedTickets);
+        o.journal_dir = scope.Utf8(options.ReadOnly ? null : options.JournalDir);
+        Native.Check(Native.aster_coordination_client_open(rt.Handle, node.Handle.Value, &o, 0, out ulong op), "aster_coordination_client_open");
+        return op;
+    }
+
+    private static unsafe (byte[] Group, byte[] Local) ReadIds(Runtime rt, ulong handle)
+    {
+        byte[] group = new byte[32], local = new byte[32];
+        fixed (byte* g = group)
+        fixed (byte* l = local)
+            Native.Check(Native.aster_coordination_client_ids(rt.Handle, handle, g, l), "aster_coordination_client_ids");
+        return (group, local);
+    }
+
     /// <summary>
     /// Opens a client on <paramref name="node"/>. A durable client takes the journal lifetime lock: a second open over the
     /// same journal fails with <see cref="CoordinationErrorKind.JournalLocked"/>.
@@ -188,26 +212,9 @@ public sealed class CoordinationClient : IAsyncDisposable, IDisposable
         if (options.GroupId.Length != 32) throw new ArgumentException("GroupId must be 32 bytes", nameof(options));
         if (!options.ReadOnly && string.IsNullOrEmpty(options.JournalDir)) throw new ArgumentException("JournalDir is required for a durable client", nameof(options));
         var rt = node.Runtime;
-        ulong op;
-        unsafe
-        {
-            using var scope = new NativeScope();
-            CoordinationClientOptionsNative o = default;
-            Native.Check(Native.aster_coordination_client_options_init(&o), "aster_coordination_client_options_init");
-            o.flags = options.ReadOnly ? Native.CoordinationClientReadOnly : 0;
-            o.group_id = (IntPtr)scope.Ptr(options.GroupId);
-            o.seed_tickets = scope.Utf8List(options.SeedTickets);
-            o.journal_dir = scope.Utf8(options.ReadOnly ? null : options.JournalDir);
-            Native.Check(Native.aster_coordination_client_open(rt.Handle, node.Handle.Value, &o, 0, out op), "aster_coordination_client_open");
-        }
+        ulong op = StartOpen(rt, node, options);
         var (ev, _) = await CoordOps.AwaitAsync(rt, op, EventKind.CoordinationClientOpened, "aster_coordination_client_open", cancellationToken).ConfigureAwait(false);
-        byte[] group = new byte[32], local = new byte[32];
-        unsafe
-        {
-            fixed (byte* g = group)
-            fixed (byte* l = local)
-                Native.Check(Native.aster_coordination_client_ids(rt.Handle, ev.handle, g, l), "aster_coordination_client_ids");
-        }
+        (byte[] group, byte[] local) = ReadIds(rt, ev.handle);
         return new CoordinationClient(rt, ev.handle, options.ReadOnly, group, local);
     }
 

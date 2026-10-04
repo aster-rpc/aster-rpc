@@ -137,7 +137,7 @@ crate_version = "1.0.1"
 [upstream.fory]
 registry = "crates-io"
 crates = ["fory-core", "fory-derive"]
-version = "1.3.0"
+version = "1.7.6"
 
 # Unmodified crates.io source republished with dependency metadata pointing at
 # the Aster registry. The commits identify the code provenance; publication

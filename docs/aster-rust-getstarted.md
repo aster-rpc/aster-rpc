@@ -42,8 +42,8 @@ To define **typed RPC payloads** you also need the Apache Fory derive in scope
 crates must be direct dependencies):
 
 ```toml
-fory-core   = "=1.3.0"
-fory-derive = "=1.3.0"
+fory-core   = "=1.7.6"
+fory-derive = "=1.7.6"
 ```
 
 ---

@@ -100,7 +100,7 @@ Use the facade for interfaces shared across independently released libraries.
 
 ## Fory payloads
 
-Aster currently uses the unmodified `fory-core` and `fory-derive` 1.3.0 crates
+Aster currently uses the unmodified `fory-core` and `fory-derive` 1.7.6 crates
 from crates.io. They are visible under `aster::native`, but Fory's derive macros
 emit an absolute `::fory_core` path. A crate deriving payload types must
 therefore list both packages directly:
@@ -108,8 +108,8 @@ therefore list both packages directly:
 ```toml
 [dependencies]
 aster = { version = "0.3", registry = "aster", features = ["rpc"] }
-fory-core = "=1.3.0"
-fory-derive = "=1.3.0"
+fory-core = "=1.7.6"
+fory-derive = "=1.7.6"
 ```
 
 This is a proc-macro name-resolution requirement, not a second Fory runtime.

@@ -22,8 +22,8 @@ aster = { version = "0.3", registry = "aster", features = ["rpc"] }
 aster-transport-salvo = { version = "0.3", registry = "aster" }
 
 # Typed payloads (as in the core guide):
-fory-core   = "=1.3.0"
-fory-derive = "=1.3.0"
+fory-core   = "=1.7.6"
+fory-derive = "=1.7.6"
 
 # Only if you serve the browser JSON projection (see §5):
 serde      = { version = "1", features = ["derive"] }

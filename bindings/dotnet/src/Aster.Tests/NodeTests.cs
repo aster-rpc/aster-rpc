@@ -162,7 +162,7 @@ public class NodeTests
     }
 
     [Fact]
-    public async Task Gate_Policy_Admit_Revoke()
+    public void Gate_Policy_Admit_Revoke()
     {
         using var gate = Gate.Create().SetReject(4403, "go away");
         string peer = Ids.NodeId(Ids.GenerateSecretKey());

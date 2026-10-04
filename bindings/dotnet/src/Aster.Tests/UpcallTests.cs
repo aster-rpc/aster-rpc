@@ -568,8 +568,38 @@ public class UpcallTests
         Assert.True(ok >= 1);
     }
 
+    // Pointers and `&` are not usable in an async method, so the synchronous native driving lives here.
+    private static unsafe ulong DriveAuthorizeRequest(Runtime rt, ulong table, ulong ser, NativeScope scope)
+    {
+        Native.Check(Native.aster_lease_acquire(rt.Handle, ser, scope.Utf8("db"), scope.Utf8("alice"), 0, 0, 0, 0, out ulong op), "acquire");
+
+        UpcallEventNative ev = default;
+        uint n = 0;
+        var end = DateTime.UtcNow + T;
+        while (n == 0 && DateTime.UtcNow < end) n = Native.aster_upcall_poll(rt.Handle, table, &ev, 1, 100);
+        Assert.Equal(1u, n);
+        Assert.Equal((ushort)UpcallKind.LeaseAuthorize, ev.kind);
+        Assert.Equal(0, ev.cancel_reason);
+        Assert.Equal(Ucv1.TagLeaseAuthorizeRequest, *(byte*)ev.payload_ptr);
+        Assert.NotEqual(0ul, ev.buffer);
+
+        Assert.Equal(0, Native.aster_upcall_buffer_release(rt.Handle, table, ev.buffer));
+        // A second release of the same buffer is refused, never a double free.
+        Assert.Equal((int)Status.NotFound, Native.aster_upcall_buffer_release(rt.Handle, table, ev.buffer));
+        // 0 is a no-op.
+        Assert.Equal(0, Native.aster_upcall_buffer_release(rt.Handle, table, 0));
+
+        byte[] allow = Ucv1.EncodeDecision(true);
+        fixed (byte* p = allow)
+        {
+            Assert.Equal(0, Native.aster_upcall_respond(rt.Handle, table, ev.invocation_id, (uint)UpcallStatus.Ok, p, (uint)allow.Length));
+            Assert.Equal((int)Status.NotFound, Native.aster_upcall_respond(rt.Handle, table, ev.invocation_id, (uint)UpcallStatus.Ok, p, (uint)allow.Length));
+        }
+        return op;
+    }
+
     [Fact]
-    public unsafe void Raw_Poll_Releases_Each_Buffer_Exactly_Once_And_Respond_Is_Idempotent()
+    public async Task Raw_Poll_Releases_Each_Buffer_Exactly_Once_And_Respond_Is_Idempotent()
     {
         using var rt = new Runtime();
         // Drive the C ABI directly (no managed poll loop): memory serializer + authorizer upcalls.
@@ -578,31 +608,8 @@ public class UpcallTests
         try
         {
             using var scope = new NativeScope();
-            Native.Check(Native.aster_lease_acquire(rt.Handle, ser, scope.Utf8("db"), scope.Utf8("alice"), 0, 0, 0, 0, out ulong op), "acquire");
-
-            UpcallEventNative ev = default;
-            uint n = 0;
-            var end = DateTime.UtcNow + T;
-            while (n == 0 && DateTime.UtcNow < end) n = Native.aster_upcall_poll(rt.Handle, table, &ev, 1, 100);
-            Assert.Equal(1u, n);
-            Assert.Equal((ushort)UpcallKind.LeaseAuthorize, ev.kind);
-            Assert.Equal(0, ev.cancel_reason);
-            Assert.Equal(Ucv1.TagLeaseAuthorizeRequest, *(byte*)ev.payload_ptr);
-            Assert.NotEqual(0ul, ev.buffer);
-
-            Assert.Equal(0, Native.aster_upcall_buffer_release(rt.Handle, table, ev.buffer));
-            // A second release of the same buffer is refused, never a double free.
-            Assert.Equal((int)Status.NotFound, Native.aster_upcall_buffer_release(rt.Handle, table, ev.buffer));
-            // 0 is a no-op.
-            Assert.Equal(0, Native.aster_upcall_buffer_release(rt.Handle, table, 0));
-
-            byte[] allow = Ucv1.EncodeDecision(true);
-            fixed (byte* p = allow)
-            {
-                Assert.Equal(0, Native.aster_upcall_respond(rt.Handle, table, ev.invocation_id, (uint)UpcallStatus.Ok, p, (uint)allow.Length));
-                Assert.Equal((int)Status.NotFound, Native.aster_upcall_respond(rt.Handle, table, ev.invocation_id, (uint)UpcallStatus.Ok, p, (uint)allow.Length));
-            }
-            var done = rt.WaitForAsync(op).WaitAsync(T).GetAwaiter().GetResult();
+            ulong op = DriveAuthorizeRequest(rt, table, ser, scope);
+            var done = await rt.WaitForAsync(op).WaitAsync(T);
             Assert.Equal((uint)EventKind.LeaseAcquired, done.kind);
             ulong lease = done.handle;
             EventError.TakePayload(rt, in done);

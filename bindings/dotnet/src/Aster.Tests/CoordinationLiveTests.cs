@@ -47,10 +47,19 @@ public sealed class CoordinationFixture : IAsyncLifetime
     public string Ticket { get; private set; } = "";
     public Node Root { get; private set; } = null!;
 
+    // Directory.CreateDirectory(path) requests 0777 minus the umask; a container
+    // with umask 000 would hand the voter a world-writable store, which the
+    // production open policy refuses. Ask for 0700 explicitly.
+    private static void CreateOwnerOnly(string path)
+    {
+        if (OperatingSystem.IsWindows()) Directory.CreateDirectory(path);
+        else Directory.CreateDirectory(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
     public string NewJournalDir()
     {
         string d = Path.Combine(_dir, "journal-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(d);
+        CreateOwnerOnly(d);
         return d;
     }
 
@@ -65,7 +74,7 @@ public sealed class CoordinationFixture : IAsyncLifetime
         string? bin = BinaryPath();
         if (bin == null) return;
         _dir = Path.Combine(Path.GetTempPath(), "aster-dotnet-coord-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(_dir);
+        CreateOwnerOnly(_dir);
         _proc = Process.Start(new ProcessStartInfo(bin, $"\"{_dir}\" 1 0xC7")
         {
             RedirectStandardOutput = true,
