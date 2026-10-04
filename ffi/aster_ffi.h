@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 1
+#define ASTER_ABI_VERSION_MINOR 2
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -759,16 +759,17 @@ typedef enum aster_upcall_kind_t {
    */
   ASTER_UPCALL_KIND_PLACEMENT_PROVISION = 33,
   /**
-   * expose authorize (decision): `C0` → `CF` (not issued by the C ABI yet).
+   * expose authorize (decision): `C0` → `CF` (ABI 4.2, `expose.rs`).
    */
   ASTER_UPCALL_KIND_EXPOSE_AUTHORIZE = 48,
   /**
-   * expose HTTP handler (R9): `C4` → `C5` (not issued by the C ABI yet).
+   * expose HTTP handler (R9): `C4` → `C5` (ABI 4.2, `expose.rs`); bodies
+   * move through `aster_http_body_*` by the request's `stream_id`.
    */
   ASTER_UPCALL_KIND_EXPOSE_HTTP = 49,
   /**
-   * expose route policy (R9, decision): `C7` → `C8` (not issued by the
-   * C ABI yet).
+   * expose route policy (R9, decision): `C7` → `C8` (ABI 4.2,
+   * `expose.rs`).
    */
   ASTER_UPCALL_KIND_EXPOSE_ROUTE_POLICY = 50,
   /**
@@ -836,6 +837,74 @@ typedef enum aster_lease_status_t {
    */
   ASTER_LEASE_STATUS_LOST = 3,
 } aster_lease_status_t;
+
+/**
+ * Return codes of `aster_http_body_*`: `0` OK, `1..=9` are
+ * `aster::binding_support::upcall::expose::BodyError::code()` (stable),
+ * negative values are argument / handle errors (these functions do not
+ * return `aster_status_t`: its small positive values would collide with the
+ * body codes). `aster_last_error_message` carries the detail.
+ */
+typedef enum aster_http_body_status_t {
+  /**
+   * Done. For `read`: bytes in `buf` (`*out_len`) or, with `*out_eof` = 1,
+   * the end of the request body.
+   */
+  ASTER_HTTP_BODY_OK = 0,
+  /**
+   * No open exchange has this `stream_id`: never issued, or already over.
+   */
+  ASTER_HTTP_BODY_UNKNOWN_STREAM = 1,
+  /**
+   * The peer went away or the request was abandoned: stop producing.
+   */
+  ASTER_HTTP_BODY_CANCELLED = 2,
+  /**
+   * A body went over its cap (`max_request_body` for a read: answer `413`;
+   * `max_response_body` for a write: the response was aborted).
+   */
+  ASTER_HTTP_BODY_TOO_LARGE = 3,
+  /**
+   * One write was larger than the options' `max_chunk`; split it.
+   */
+  ASTER_HTTP_BODY_CHUNK_TOO_LARGE = 4,
+  /**
+   * The response body was already finished or aborted (or it was inline).
+   */
+  ASTER_HTTP_BODY_FINISHED = 5,
+  /**
+   * The blocking call timed out; nothing was consumed or queued.
+   */
+  ASTER_HTTP_BODY_TIMEOUT = 6,
+  /**
+   * Reading the request body off the wire failed.
+   */
+  ASTER_HTTP_BODY_READ = 7,
+  /**
+   * `finish` trailers were not a valid `C6` message / header fields.
+   */
+  ASTER_HTTP_BODY_INVALID_TRAILERS = 8,
+  /**
+   * A blocking call was made on a tokio runtime thread.
+   */
+  ASTER_HTTP_BODY_BLOCKING_ON_RUNTIME = 9,
+  /**
+   * A NULL pointer with a non-zero length, a zero `cap`, ...
+   */
+  ASTER_HTTP_BODY_INVALID_ARGUMENT = -1,
+  /**
+   * Unknown runtime or `aster_http_bodies_t`.
+   */
+  ASTER_HTTP_BODY_UNKNOWN_HANDLE = -2,
+} aster_http_body_status_t;
+
+/**
+ * `aster_route_spec_t.protocol`.
+ */
+typedef enum aster_route_protocol_t {
+  ASTER_ROUTE_PROTOCOL_HTTP = 0,
+  ASTER_ROUTE_PROTOCOL_TCP = 1,
+} aster_route_protocol_t;
 
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
@@ -1157,6 +1226,100 @@ typedef struct aster_rpc_status_t {
    */
   void *storage;
 } aster_rpc_status_t;
+
+/**
+ * An expose registry on a node (`aster_expose_new`): the services published
+ * to peers, plus the reactor that dispatches their inbound relay streams.
+ */
+typedef uint64_t aster_expose_t;
+
+/**
+ * An upcall table plus its bounded event queue (`aster_upcalls_new`).
+ */
+typedef uint64_t aster_upcalls_t;
+
+/**
+ * A body-handle table for foreign HTTP exchanges (`aster_http_bodies_new`),
+ * one per binding runtime, shared by every foreign HTTP service.
+ *
+ * Kept separate from `aster_upcalls_t` (rather than folded into it) because
+ * it is a different Rust object with its own lifetime and a different
+ * thread-use (handler threads call it, not the poll thread), several
+ * `aster_upcalls_t` tables may share one, and keeping it out leaves the 4.1
+ * upcall surface untouched.
+ */
+typedef uint64_t aster_http_bodies_t;
+
+/**
+ * Options of `aster_expose_http_foreign` (`ForeignHttpOptions`). Initialise
+ * with `aster_http_foreign_options_init`; `struct_size` must equal
+ * `sizeof(aster_http_foreign_options_t)`. 48 bytes.
+ */
+typedef struct aster_http_foreign_options_t {
+  uint32_t struct_size;
+  /**
+   * Reserved, must be 0.
+   */
+  uint32_t flags;
+  /**
+   * A request whose `content-length` is at most this travels inline in the
+   * `C4` upcall. 0 = default (64 KiB).
+   */
+  uint64_t inline_request_max;
+  /**
+   * Cap on the request body: a declared length over it is answered `413`
+   * without an upcall, a streamed body that grows past it fails the read
+   * with `ASTER_HTTP_BODY_TOO_LARGE`. 0 = unbounded.
+   */
+  uint64_t max_request_body;
+  /**
+   * Cap on the response body: an inline body over it becomes `502`, a
+   * streamed one is aborted by the write that crosses it. 0 = unbounded.
+   */
+  uint64_t max_response_body;
+  /**
+   * Largest single body write and most one read returns. 0 = default
+   * (1 MiB).
+   */
+  uint64_t max_chunk;
+  /**
+   * Response chunks queued before a write waits. 0 = default (8).
+   */
+  uint32_t response_buffer;
+  /**
+   * Reserved, must be 0.
+   */
+  uint32_t reserved;
+} aster_http_foreign_options_t;
+
+/**
+ * One route for `aster_expose_request_route` (`RouteSpec`). 40 bytes (LP64).
+ */
+typedef struct aster_route_spec_t {
+  /**
+   * Host / SNI to match; empty = any.
+   */
+  struct aster_bytes_t host;
+  /**
+   * Origin-side service id (what was exposed with `aster_expose_*`).
+   */
+  struct aster_bytes_t service_id;
+  /**
+   * Edge-facing port; 0 = the listener's default.
+   */
+  uint32_t port;
+  /**
+   * 0 = http, 1 = tcp (`aster_route_protocol_t` values).
+   */
+  uint32_t protocol;
+} aster_route_spec_t;
+
+/**
+ * A live route registration (`ASTER_EVENT_BYTES_RESULT` of
+ * `aster_expose_request_route`): the edge keeps the granted routes while it
+ * is held.
+ */
+typedef uint64_t aster_route_registration_t;
 
 /**
  * Everything a sealed grant is bound to (`GrantContext`). Sealing and
@@ -1604,11 +1767,6 @@ typedef struct aster_dispatch_event_t {
    */
   uint64_t buffer;
 } aster_dispatch_event_t;
-
-/**
- * An upcall table plus its bounded event queue (`aster_upcalls_new`).
- */
-typedef uint64_t aster_upcalls_t;
 
 /**
  * One upcall event, filled by `aster_upcall_poll`. 40 bytes (LP64).
@@ -3101,6 +3259,245 @@ int32_t aster_zstd_maybe_compress(const uint8_t *data,
  * `out` must be a valid pointer.
  */
 int32_t aster_zstd_decompress(const uint8_t *data, uintptr_t len, struct aster_bytes_t *out);
+
+/**
+ * Create an expose registry for `node` (which is validated; the registry is
+ * independent of it and only binds to connections you feed it). Register
+ * services with `aster_expose_socket` / `aster_expose_http_foreign`, then
+ * deliver connections with `aster_expose_serve` or
+ * `aster_expose_handle_connection`. The node must have been started with the
+ * ALPN(s) the consumers connect on.
+ */
+int32_t aster_expose_new(aster_runtime_t runtime, aster_node_t node, aster_expose_t *out_expose);
+
+/**
+ * Free the handle. Services registered on it keep serving connections that
+ * were already fed to it, so `aster_expose_unexpose` first if they must stop.
+ */
+int32_t aster_expose_free(aster_runtime_t runtime, aster_expose_t expose);
+
+/**
+ * Stop exposing `service_id` (idempotent: an id that was never exposed is
+ * `OK`). Streams already being served finish.
+ */
+int32_t aster_expose_unexpose(aster_runtime_t runtime,
+                              aster_expose_t expose,
+                              struct aster_bytes_t service_id);
+
+/**
+ * Feed one inbound connection (from `aster_accept` / `aster_node_accept_aster`)
+ * to the registry, so its relay streams reach the exposed services. Call once
+ * per connection, before the peer opens streams on it; the connection handle
+ * stays usable and owned by the binding.
+ */
+int32_t aster_expose_handle_connection(aster_runtime_t runtime,
+                                       aster_expose_t expose,
+                                       aster_connection_t connection);
+
+/**
+ * Own the node's accept loop for expose: accept inbound connections of
+ * `node` and feed each whose ALPN is in `alpns` (empty list = every ALPN) to
+ * `expose`; others are dropped. Runs until the node closes, then completes
+ * with `ASTER_EVENT_ERROR` (the accept error). Do not combine with
+ * `aster_accept` / `aster_node_accept_aster` on the same node: they drain
+ * the same queue (use `aster_expose_handle_connection` there). Cancel with
+ * `aster_operation_cancel` only suppresses the completion event; close the
+ * node to stop the loop.
+ */
+int32_t aster_expose_serve(aster_runtime_t runtime,
+                           aster_node_t node,
+                           aster_expose_t expose,
+                           struct aster_bytes_list_t alpns,
+                           uint64_t user_data,
+                           aster_operation_t *out_operation);
+
+/**
+ * Expose a raw L4 splice to `addr` (`"ip:port"`, a loopback server the
+ * binding runs in its own language) under `service_id`, node-wide.
+ *
+ * `authorizer_upcalls` != 0 puts every `(connection, service)` admission to
+ * the binding as an `EXPOSE_AUTHORIZE` decision (kind 48, `C0` → `CF`; no
+ * answer follows the kind's failure mode, fail-closed by default).
+ * `authorizer_upcalls` = 0 admits **every** peer that reaches the node's
+ * ALPN: only do that when the node itself is access-controlled (Gate 0).
+ * Re-registering an id replaces it.
+ */
+int32_t aster_expose_socket(aster_runtime_t runtime,
+                            aster_expose_t expose,
+                            struct aster_bytes_t service_id,
+                            struct aster_bytes_t addr,
+                            aster_upcalls_t authorizer_upcalls);
+
+/**
+ * Create a body-handle table (one per binding runtime).
+ */
+int32_t aster_http_bodies_new(aster_runtime_t runtime, aster_http_bodies_t *out_bodies);
+
+/**
+ * Free the table. Services registered with it keep their own reference and
+ * keep working; the binding just cannot reach their bodies any more.
+ */
+int32_t aster_http_bodies_free(aster_runtime_t runtime, aster_http_bodies_t bodies);
+
+/**
+ * Number of open exchanges (for leak checks and tests).
+ */
+int32_t aster_http_bodies_open_count(aster_runtime_t runtime,
+                                     aster_http_bodies_t bodies,
+                                     uint64_t *out_count);
+
+/**
+ * Fill `*out` with the defaults (`struct_size` set, every limit at its
+ * default).
+ */
+int32_t aster_http_foreign_options_init(struct aster_http_foreign_options_t *out);
+
+/**
+ * Expose `service_id` with both halves foreign: admission is an
+ * `EXPOSE_AUTHORIZE` decision (kind 48, `C0` → `CF`) and each request one
+ * `EXPOSE_HTTP` upcall (kind 49, `C4` → `C5`) on `upcalls`, with bodies moved
+ * through `bodies` by the request's `stream_id` (`aster_http_body_*`). See
+ * design §6 for the exchange, limits, cancellation and failure statuses
+ * (`ERROR` → 500, `UNIMPLEMENTED` → 501, bad `C5` → 502, overload / closed →
+ * 503, timeout → 504; configure the kind's timeout with
+ * `aster_upcall_set_policy`, default 5 s covers the response head only).
+ * `opts` NULL = defaults. Re-registering an id replaces it.
+ */
+int32_t aster_expose_http_foreign(aster_runtime_t runtime,
+                                  aster_expose_t expose,
+                                  aster_upcalls_t upcalls,
+                                  aster_http_bodies_t bodies,
+                                  struct aster_bytes_t service_id,
+                                  const struct aster_http_foreign_options_t *opts);
+
+/**
+ * Accept route registrations (act as an edge) node-wide, granting what the
+ * binding decides: each request is one `EXPOSE_ROUTE_POLICY` upcall (kind
+ * 50, `C7` → `C8`: the indexes of the granted specs, strictly ascending; an
+ * index out of range is a malformed answer). With no usable answer the
+ * kind's failure mode applies to the whole request: fail-closed (default)
+ * grants nothing, fail-open grants every route. The routes land in an
+ * internal `EdgeRouter` (the C ABI has no public edge listener).
+ */
+int32_t aster_expose_route_policy_foreign(aster_runtime_t runtime,
+                                          aster_expose_t expose,
+                                          aster_upcalls_t upcalls);
+
+/**
+ * Read up to `cap` bytes of the request body of exchange `stream_id` into
+ * `buf` (a read returns at most `min(cap, max_chunk)`), waiting up to
+ * `timeout_ms` (0 = return at once with `ASTER_HTTP_BODY_TIMEOUT` when no
+ * data is ready). On `OK`: `*out_len` bytes were written to `buf`, and
+ * `*out_eof` = 1 means the body ended (`*out_len` is then 0); a short
+ * non-EOF read is normal. A timed-out read consumes nothing. Pull-based
+ * backpressure: Rust reads the QUIC stream only when this is called.
+ *
+ * Returns an `aster_http_body_status_t`. Never call it from a tokio runtime
+ * thread (`BLOCKING_ON_RUNTIME`); `cap` must be > 0.
+ */
+int32_t aster_http_body_read(aster_runtime_t runtime,
+                             aster_http_bodies_t bodies,
+                             uint64_t stream_id,
+                             uint8_t *buf,
+                             uintptr_t cap,
+                             uint32_t timeout_ms,
+                             uintptr_t *out_len,
+                             uint32_t *out_eof);
+
+/**
+ * Queue one response-body chunk (copied; at most the options' `max_chunk`
+ * bytes), waiting up to `timeout_ms` while the buffer is full. A timed-out
+ * write queued nothing. `CANCELLED` means the peer is gone: stop producing.
+ * Respond with the `C5` head (body mode `Stream`) first; writes made before
+ * it are queued up to `response_buffer` chunks. Blocking: see
+ * `aster_http_body_read` for the thread rule.
+ */
+int32_t aster_http_body_write(aster_runtime_t runtime,
+                              aster_http_bodies_t bodies,
+                              uint64_t stream_id,
+                              const uint8_t *chunk,
+                              uintptr_t len,
+                              uint32_t timeout_ms);
+
+/**
+ * Queue one chunk if there is room now. On `OK`, `*out_queued` is 1 (queued)
+ * or 0 (the buffer is full: nothing queued, try again later). Never blocks.
+ */
+int32_t aster_http_body_try_write(aster_runtime_t runtime,
+                                  aster_http_bodies_t bodies,
+                                  uint64_t stream_id,
+                                  const uint8_t *chunk,
+                                  uintptr_t len,
+                                  uint32_t *out_queued);
+
+/**
+ * End the response body cleanly. `trailers` / `len` is an optional UCv1 `C6`
+ * message (`headers:list<Header>`; NULL / 0 = none); a malformed one is
+ * `INVALID_TRAILERS` and leaves the body open. Queued chunks are still
+ * delivered. (The relay hop does not carry trailers yet; an in-process
+ * consumer sees them.) Never blocks.
+ */
+int32_t aster_http_body_finish(aster_runtime_t runtime,
+                               aster_http_bodies_t bodies,
+                               uint64_t stream_id,
+                               const uint8_t *trailers,
+                               uintptr_t len);
+
+/**
+ * End the response body with an error: queued chunks are discarded and the
+ * relay resets the stream, so the consumer sees a failed response, never a
+ * silently truncated one. `message` (UTF-8, may be NULL / 0) is logged, not
+ * sent. Never blocks.
+ */
+int32_t aster_http_body_abort(aster_runtime_t runtime,
+                              aster_http_bodies_t bodies,
+                              uint64_t stream_id,
+                              const uint8_t *message,
+                              uintptr_t len);
+
+/**
+ * Relay one buffered HTTP request to a service the peer exposed on
+ * `connection`, and collect the whole response (the consumer needs no
+ * `aster_expose_t`).
+ *
+ * `request` is a UCv1 `C4` message (`ExposeHttpRequest`) with body mode
+ * `Inline`: `service_id` names the peer's exposed service, `version` /
+ * `method` / `uri` / `headers` / `body` are the request; `peer_id` (leave
+ * absent) and `stream_id` (leave 0) are ignored. Completes with
+ * `ASTER_EVENT_BYTES_RESULT`, payload = UCv1 `C5` (`ExposeHttpResponse`,
+ * body `Inline`, copy out then `aster_buffer_release`) for **any** HTTP
+ * status, including the `5xx` a failing handler maps to. A transport
+ * failure, a refused request or a response that failed mid-body (the peer
+ * aborted it) is `ASTER_EVENT_ERROR`. Streaming relay is not in the C ABI.
+ */
+int32_t aster_expose_relay_request(aster_runtime_t runtime,
+                                   aster_connection_t connection,
+                                   struct aster_bytes_t request,
+                                   uint64_t user_data,
+                                   aster_operation_t *out_operation);
+
+/**
+ * Ask `connection`'s peer (an edge serving `aster_expose_route_policy_foreign`)
+ * to route `specs` to us, attaching `metadata` for its policy. Completes with
+ * `ASTER_EVENT_BYTES_RESULT`: payload = UCv1 `C8` (indexes into `specs` the
+ * peer granted, ascending), `handle` = an `aster_route_registration_t` that
+ * keeps the routes live until `aster_route_registration_free`. A refusal of
+ * the whole request is `ASTER_EVENT_ERROR`.
+ */
+int32_t aster_expose_request_route(aster_runtime_t runtime,
+                                   aster_connection_t connection,
+                                   const struct aster_route_spec_t *specs,
+                                   uintptr_t spec_count,
+                                   struct aster_bytes_t metadata,
+                                   uint64_t user_data,
+                                   aster_operation_t *out_operation);
+
+/**
+ * End a route registration: the edge evicts its routes. `NOT_FOUND` for an
+ * unknown or already freed handle.
+ */
+int32_t aster_route_registration_free(aster_runtime_t runtime,
+                                      aster_route_registration_t registration);
 
 /**
  * The canonical grant AAD: the domain `aster/sealed-grant/v1` and each context field

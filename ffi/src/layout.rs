@@ -17,6 +17,10 @@ use crate::data::{
     aster_path_info_t, aster_path_list_t, aster_retire_outcome_t,
 };
 use crate::envelope::{aster_call_header_t, aster_rpc_status_t, aster_stream_header_t};
+use crate::expose::{
+    aster_http_body_status_t, aster_http_foreign_options_t, aster_route_protocol_t,
+    aster_route_spec_t,
+};
 use crate::grants::{
     aster_grant_context_t, aster_grant_outcome_kind_t, aster_grant_outcome_t, aster_grant_record_t,
     aster_grant_state_t,
@@ -80,6 +84,8 @@ const _: () = assert!(size_of::<aster_upcall_kind_t>() == 4);
 const _: () = assert!(size_of::<aster_upcall_status_t>() == 4);
 const _: () = assert!(size_of::<aster_upcall_cancel_reason_t>() == 4);
 const _: () = assert!(size_of::<aster_lease_status_t>() == 4);
+const _: () = assert!(size_of::<aster_http_body_status_t>() == 4);
+const _: () = assert!(size_of::<aster_route_protocol_t>() == 4);
 
 #[cfg(target_pointer_width = "64")]
 mod lp64 {
@@ -375,5 +381,24 @@ mod lp64 {
         stale = 8,
         misses = 16,
         upcalls = 24,
+    });
+
+    // ABI 4.2: expose (expose.rs).
+    assert_layout!(aster_http_foreign_options_t, size = 48, align = 8, {
+        struct_size = 0,
+        flags = 4,
+        inline_request_max = 8,
+        max_request_body = 16,
+        max_response_body = 24,
+        max_chunk = 32,
+        response_buffer = 40,
+        reserved = 44,
+    });
+
+    assert_layout!(aster_route_spec_t, size = 40, align = 8, {
+        host = 0,
+        service_id = 16,
+        port = 32,
+        protocol = 36,
     });
 }

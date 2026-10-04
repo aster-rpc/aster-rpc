@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.1)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.2)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -24,6 +24,117 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 4.2 (additive)
+
+ABI 4.2.0 (tranche F5, expose part) puts the R9 expose surface on the C ABI:
+publish a local service to Aster peers (a loopback socket, or an HTTP handler
+the binding answers by upcall) and relay HTTP to a peer's exposed service.
+Upcall kinds 48 / 49 / 50 are now issued by the C ABI. Nothing in 4.1 changed
+shape; a 4.1 binding keeps working. Sources: `ffi/src/expose.rs`; tests:
+`ffi/tests/expose.rs` (a polling "foreign" thread decodes `C0` / `C4` / `C7`
+and encodes `C5` / `C6` / `C8` / `CF` by hand, checked against
+`conformance/vectors/upcalls.json`; real QUIC between two nodes: inline and
+streamed request/response with backpressure, authorize deny and failure mode,
+route policy grant / deny / malformed / fail-open, 500 / 501 / 502 / 504,
+`ChunkTooLarge` / `TooLarge` / 413 / 502 limits, consumer cancel before and
+after the head, socket targets, argument validation, `BlockingOnRuntime`) and
+`ffi/tests/abi_contract_test.c`. Design: `docs/_internal/bindings/upcall-design.md`
+§4 and §6.
+
+**Expose handle** (`aster_expose_t`; needs the `expose` feature of `aster`,
+now enabled by this crate):
+
+| Function | Notes |
+|---|---|
+| `aster_expose_new(rt, node, *out)` / `aster_expose_free(rt, expose)` | A registry plus its reactor. The node is only validated; the registry binds to connections you feed it. Free drops the handle; connections already fed keep their services (`unexpose` first to stop them). |
+| `aster_expose_unexpose(rt, expose, service_id)` | Idempotent. |
+| `aster_expose_serve(rt, node, expose, alpns, ud, *op)` | Accept loop (`Node::serve_expose`): feeds connections whose ALPN is in `alpns` (empty = all) until the node closes, then completes with `ASTER_EVENT_ERROR`. Do not combine with `aster_accept` / `aster_node_accept_aster` on the node. |
+| `aster_expose_handle_connection(rt, expose, conn)` | The composable primitive for a binding's own accept loop (`aster_accept`). The connection handle stays the binding's. |
+| `aster_expose_socket(rt, expose, service_id, "ip:port", authorizer_upcalls)` | L4 splice to a loopback server. `authorizer_upcalls` != 0: kind 48 (`C0` -> `CF`) per `(connection, service)`, failure mode applies. 0 admits **every** peer on the node's ALPN (as `aster_lease_serializer_memory_new(.., 0, ..)` authorizes everyone). |
+| `aster_expose_http_foreign(rt, expose, upcalls, bodies, service_id, opts*)` | Kind 48 admission + kind 49 per request (`C4` -> `C5`), bodies by `stream_id`. `opts` NULL = defaults. Failures become `500` (`ERROR`), `501` (`UNIMPLEMENTED`), `502` (bad `C5`, inline body over the cap), `503`, `504` (timeout of the kind-49 policy; head only). |
+| `aster_expose_route_policy_foreign(rt, expose, upcalls)` | `serve_routes` with kind 50 (`C7` -> `C8`); granted routes land in an internal `EdgeRouter` (the C ABI has no public edge listener). |
+
+**Body table: separate `aster_http_bodies_t`, not folded into
+`aster_upcalls_t`.** `HttpBodies` is its own Rust object (one per runtime,
+shared by every foreign service, independent of any upcall table); handler
+threads call it while the poll thread owns the queue; and keeping it out
+leaves the whole 4.1 upcall surface untouched. `aster_http_bodies_new(rt, *out)`,
+`aster_http_bodies_free`, `aster_http_bodies_open_count(rt, bodies, *u64)`
+(leak checks).
+
+`aster_http_foreign_options_t` (48 B): `struct_size` u32 @0 (must equal
+`sizeof`), `flags` u32 @4 (0), `inline_request_max` u64 @8, `max_request_body`
+u64 @16, `max_response_body` u64 @24, `max_chunk` u64 @32, `response_buffer`
+u32 @40, `reserved` u32 @44 (0). Every field 0 = the Rust default (64 KiB / no
+cap / no cap / 1 MiB / 8), so "never inline" is not expressible (use 1 to
+inline only empty bodies); `aster_http_foreign_options_init(*out)` fills it.
+
+**Body I/O** (`aster_http_body_*`, each takes `rt` first like every other C
+call, which the sketch omitted). Returns `aster_http_body_status_t`: `0` OK,
+`1..9` = `BodyError::code()` (stable): `UNKNOWN_STREAM` 1, `CANCELLED` 2,
+`TOO_LARGE` 3, `CHUNK_TOO_LARGE` 4, `FINISHED` 5, `TIMEOUT` 6, `READ` 7,
+`INVALID_TRAILERS` 8, `BLOCKING_ON_RUNTIME` 9. **These do not use
+`aster_status_t`** (its 1 and 2 would collide with body codes 1 and 2), so
+argument errors are `INVALID_ARGUMENT` -1 (NULL pointer with a length, zero
+`cap`) and `UNKNOWN_HANDLE` -2 (unknown runtime or bodies table), detail in
+`aster_last_error_message`.
+
+| Function | Notes |
+|---|---|
+| `aster_http_body_read(rt, bodies, stream_id, buf, cap, timeout_ms, *out_len, *out_eof)` | `read_blocking`; at most `min(cap, max_chunk)` bytes. `*out_eof` = 1 (and `*out_len` 0) ends the body; short reads are normal. `timeout_ms` 0 polls once. A timeout consumes nothing. |
+| `aster_http_body_write(rt, bodies, stream_id, ptr, len, timeout_ms)` | `write_blocking`; waits while the buffer is full. A timeout queues nothing. |
+| `aster_http_body_try_write(rt, bodies, stream_id, ptr, len, *out_queued)` | `try_write`; `*out_queued` 0 = full, nothing queued. |
+| `aster_http_body_finish(rt, bodies, stream_id, trailers, len)` | `trailers` = optional UCv1 `C6` (NULL / 0 = none); a malformed one is `INVALID_TRAILERS` and leaves the body open. |
+| `aster_http_body_abort(rt, bodies, stream_id, msg, len)` | Logged, not sent; the relay resets the stream. |
+
+`read` and `write` block and must not run on a tokio runtime thread (a
+binding's own handler / poll threads are fine): the Rust `BlockingOnRuntime`
+guard returns `BLOCKING_ON_RUNTIME` (9). `try_write`, `finish` and `abort`
+never block.
+
+**Consumer side:**
+
+| Function | Notes |
+|---|---|
+| `aster_expose_relay_request(rt, conn, c4, ud, *op)` | Buffered `relay_request`. The request is a UCv1 `C4` with an `Inline` body (`service_id` names the peer's service; `peer_id` and `stream_id` are ignored); completes with `ASTER_EVENT_BYTES_RESULT`, payload = `C5` (inline body, release with `aster_buffer_release`), for any HTTP status. Transport failure, refusal (authorize deny) or a response that failed mid-body = `ASTER_EVENT_ERROR`. |
+| `aster_expose_request_route(rt, conn, aster_route_spec_t *specs, n, metadata, ud, *op)` / `aster_route_registration_free(rt, reg)` | Needed to drive a remote edge's route policy: `BYTES_RESULT`, payload = `C8` (indexes of the granted specs), `handle` = `aster_route_registration_t`, which keeps the routes live. `aster_route_spec_t` (40 B): `host` @0, `service_id` @16, `port` u32 @32, `protocol` u32 @36 (`aster_route_protocol_t`). |
+
+**Choices and gaps (smallest reasonable reading of the sketch):**
+
+- Streaming `relay_request_streaming` is **not** in the C ABI: it needs a
+  sender handle for the upload and a frame-reader handle for the response
+  (two new handle kinds, frame/trailer events); the buffered call covers the
+  need and this fits no existing stream-handle pattern cleanly. Follow-up.
+- The raw L4 consumer of an `aster_expose_socket` service (`open_http_relay`
+  speaking a protocol raw) is not in the C ABI either; a socket target is
+  reachable from other Aster consumers. The tests prove the splice by the
+  target's accept.
+- The request-side `C4` for `aster_expose_relay_request` is reused instead of
+  a new struct, so a binding needs no extra codec; `version` selects the
+  `http` version, HEAD / trailers behave as in design §6.
+- `Cancelled` from a body call is what a call parked in `write`
+  (buffer full) gets when the consumer goes away (the mid-stream test floods
+  the buffer to hit that); a call made after the
+  relay has already torn the exchange down finds no handle and returns
+  `UNKNOWN_STREAM`. Both mean "stop"; the design text promises `Cancelled`
+  for "the next write", which the Rust implementation does not always give.
+- An `abort` (and a `max_response_body` crossing) reaches a remote consumer
+  as a clean truncated finish until the aster-expose abort fix lands
+  (design §6: the consumer sees a failed response). The two tests that
+  pin the documented behaviour are `#[ignore = "needs expose-abort-fix"]` in
+  `ffi/tests/expose.rs`.
+- `aster_expose_free` / `aster_http_bodies_free` do not tear down services or
+  open exchanges that already hold their own references.
+
+**New enums / constants:** `aster_http_body_status_t`, `aster_route_protocol_t`;
+`ASTER_ABI_VERSION_MINOR` = 2. The `aster_upcall_kind_t` comments for 48-50 no
+longer say "not issued by the C ABI".
+
+**Bindings:** nothing wired in Java, Go or .NET (they build against the new
+header; .NET `RequiredAbiMinor` stays 0, Go compares the library with the
+header's `ASTER_ABI_VERSION`). Java / .NET / Go decode `C4` and encode `C5`
+against `upcalls.json`, as for the 4.1 kinds.
 
 ## New in 4.1 (additive)
 
@@ -94,8 +205,7 @@ filter installed (`UNIT_RESULT`; needs `enable_monitoring`).
 
 **Not exposed (gaps):** placement providers (kinds 17/32/33 -- the C ABI has no
 coordination client), expose authorize / HTTP handler / route policy
-(48/49/50 -- no expose surface in the C ABI; the R9 bytes-level handler is
-not wired through C yet, the kind constants are defined), Gate 0 over upcalls (64/65 -- the 3.2 hook iterators keep serving
+(48/49/50 -- wired in 4.2, see "New in 4.2"), Gate 0 over upcalls (64/65 -- the 3.2 hook iterators keep serving
 admission), and a read side for the shared topology view (clusters /
 serialized snapshot -- needs `SharedView` parts from core). No typed C decode
 helpers for UCv1: bindings decode against the vectors (Java does,

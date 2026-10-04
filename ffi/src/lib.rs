@@ -23,6 +23,7 @@ use aster_transport_core::*;
 pub mod call;
 pub mod data;
 pub mod envelope;
+pub mod expose;
 pub mod grants;
 mod layout;
 pub mod node;
@@ -82,8 +83,13 @@ pub mod upcall;
 //   and lease handles (`aster_lease_*`, `aster_fenced_*`), the topology
 //   `admitted` filter (`aster_topology_admitted_*`) and
 //   `aster_topology_enable_shared`; see `upcall.rs`.
+// - 4.2.0 (additive): expose (`expose.rs`) -- `aster_expose_*` handle,
+//   socket and foreign HTTP targets, foreign route policy, the
+//   `aster_http_body_*` body I/O over upcall kind 49, and the buffered
+//   consumer `aster_expose_relay_request`; upcall kinds 48-50 are now
+//   issued by the C ABI.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 1;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 2;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

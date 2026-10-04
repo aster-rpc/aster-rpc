@@ -298,6 +298,26 @@ OFF(aster_topology_admitted_stats_t, stale, 8);
 OFF(aster_topology_admitted_stats_t, misses, 16);
 OFF(aster_topology_admitted_stats_t, upcalls, 24);
 
+/* ABI 4.2: expose */
+LAYOUT(aster_http_foreign_options_t, 48);
+OFF(aster_http_foreign_options_t, struct_size, 0);
+OFF(aster_http_foreign_options_t, flags, 4);
+OFF(aster_http_foreign_options_t, inline_request_max, 8);
+OFF(aster_http_foreign_options_t, max_request_body, 16);
+OFF(aster_http_foreign_options_t, max_response_body, 24);
+OFF(aster_http_foreign_options_t, max_chunk, 32);
+OFF(aster_http_foreign_options_t, response_buffer, 40);
+OFF(aster_http_foreign_options_t, reserved, 44);
+LAYOUT(aster_route_spec_t, 40);
+OFF(aster_route_spec_t, host, 0);
+OFF(aster_route_spec_t, service_id, 16);
+OFF(aster_route_spec_t, port, 32);
+OFF(aster_route_spec_t, protocol, 36);
+_Static_assert(sizeof(aster_http_body_status_t) == 4, "enum size");
+_Static_assert(sizeof(aster_route_protocol_t) == 4, "enum size");
+_Static_assert(sizeof(aster_expose_t) == 8 && sizeof(aster_http_bodies_t) == 8 &&
+               sizeof(aster_route_registration_t) == 8, "handle size");
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -319,6 +339,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
+    CHECK(ASTER_ABI_VERSION_MINOR == 2); /* 4.2: expose */
     CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
@@ -830,6 +851,55 @@ static void test_upcalls(void) {
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
+static void test_expose(void) {
+    printf("[expose 4.2]\n");
+    /* BodyError::code() is the stable ABI value of each body status. */
+    CHECK(ASTER_HTTP_BODY_OK == 0 && ASTER_HTTP_BODY_UNKNOWN_STREAM == 1 &&
+          ASTER_HTTP_BODY_CANCELLED == 2 && ASTER_HTTP_BODY_TOO_LARGE == 3 &&
+          ASTER_HTTP_BODY_CHUNK_TOO_LARGE == 4 && ASTER_HTTP_BODY_FINISHED == 5 &&
+          ASTER_HTTP_BODY_TIMEOUT == 6 && ASTER_HTTP_BODY_READ == 7 &&
+          ASTER_HTTP_BODY_INVALID_TRAILERS == 8 && ASTER_HTTP_BODY_BLOCKING_ON_RUNTIME == 9);
+    CHECK(ASTER_HTTP_BODY_INVALID_ARGUMENT == -1 && ASTER_HTTP_BODY_UNKNOWN_HANDLE == -2);
+    CHECK(ASTER_ROUTE_PROTOCOL_HTTP == 0 && ASTER_ROUTE_PROTOCOL_TCP == 1);
+    CHECK(ASTER_UPCALL_KIND_EXPOSE_AUTHORIZE == 48 && ASTER_UPCALL_KIND_EXPOSE_HTTP == 49 &&
+          ASTER_UPCALL_KIND_EXPOSE_ROUTE_POLICY == 50);
+
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+    aster_http_foreign_options_t o;
+    memset(&o, 0xff, sizeof o);
+    CHECK(aster_http_foreign_options_init(&o) == ASTER_STATUS_OK);
+    CHECK(o.struct_size == sizeof o && o.flags == 0 && o.max_chunk == 0 && o.response_buffer == 0);
+
+    aster_http_bodies_t bodies = 0;
+    CHECK(aster_http_bodies_new(rt, &bodies) == ASTER_STATUS_OK && bodies != 0);
+    uint64_t open = 9;
+    CHECK(aster_http_bodies_open_count(rt, bodies, &open) == ASTER_STATUS_OK && open == 0);
+    uint8_t buf[16];
+    size_t got = 7;
+    uint32_t flag = 7;
+    /* No exchange: UnknownStream; bad arguments are negative, not aster_status_t. */
+    CHECK(aster_http_body_read(rt, bodies, 99, buf, sizeof buf, 0, &got, &flag) ==
+          ASTER_HTTP_BODY_UNKNOWN_STREAM);
+    CHECK(got == 0 && flag == 0);
+    CHECK(aster_http_body_read(rt, bodies, 99, buf, 0, 0, &got, &flag) == ASTER_HTTP_BODY_INVALID_ARGUMENT);
+    CHECK(aster_http_body_write(rt, bodies, 99, (const uint8_t *)"x", 1, 10) == ASTER_HTTP_BODY_UNKNOWN_STREAM);
+    CHECK(aster_http_body_write(rt, bodies, 99, NULL, 1, 10) == ASTER_HTTP_BODY_INVALID_ARGUMENT);
+    CHECK(aster_http_body_try_write(rt, bodies, 99, (const uint8_t *)"x", 1, &flag) == ASTER_HTTP_BODY_UNKNOWN_STREAM);
+    CHECK(aster_http_body_finish(rt, bodies, 99, NULL, 0) == ASTER_HTTP_BODY_UNKNOWN_STREAM);
+    CHECK(aster_http_body_abort(rt, bodies, 99, (const uint8_t *)"no", 2) == ASTER_HTTP_BODY_UNKNOWN_STREAM);
+    CHECK(aster_http_body_finish(rt, 424242, 1, NULL, 0) == ASTER_HTTP_BODY_UNKNOWN_HANDLE);
+
+    aster_expose_t ex = 5;
+    CHECK(aster_expose_new(rt, 424242, &ex) == ASTER_STATUS_NOT_FOUND && ex == 0);
+    CHECK(aster_expose_free(rt, 424242) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_expose_unexpose(rt, 424242, bstr("svc")) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_route_registration_free(rt, 424242) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_http_bodies_free(rt, bodies) == ASTER_STATUS_OK);
+    CHECK(aster_http_bodies_free(rt, bodies) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
+}
+
 int main(void) {
     test_abi_version();
     test_enum_values();
@@ -841,6 +911,7 @@ int main(void) {
     test_pure_functions();
     test_dispatch_server();
     test_upcalls();
+    test_expose();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;

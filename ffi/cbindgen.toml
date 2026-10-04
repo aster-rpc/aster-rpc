@@ -48,4 +48,6 @@ include = [
   "aster_upcall_status_t",
   "aster_upcall_cancel_reason_t",
   "aster_lease_status_t",
+  "aster_http_body_status_t",
+  "aster_route_protocol_t",
 ]

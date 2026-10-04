@@ -16,7 +16,7 @@ fn test_abi_version() {
     // node factories and bare endpoints (see RENAME_MAP.md "4.0").
     // 4.1.0: upcalls (additive, RENAME_MAP.md "New in 4.1").
     assert_eq!(ASTER_ABI_VERSION_MAJOR, 4);
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 1);
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 2);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);

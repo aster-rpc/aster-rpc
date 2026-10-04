@@ -30,10 +30,11 @@
 //!   `aster_topology_enable_shared`, which installs it as the swarm's
 //!   read-time `admitted` filter.
 //!
+//! Expose (kinds 48/49/50) is wired in `expose.rs` since ABI 4.2.
+//!
 //! Not in the C ABI (yet): placement providers (kinds 17/32/33 -- the C ABI
-//! has no coordination client), expose authorize (kind 48 -- no expose
-//! surface) and Gate 0 over upcalls (kinds 64/65 -- the 3.2 hook iterators
-//! serve admission).
+//! has no coordination client) and Gate 0 over upcalls (kinds 64/65 -- the
+//! 3.2 hook iterators serve admission).
 //!
 //! # Threading
 //!
@@ -115,12 +116,13 @@ pub enum aster_upcall_kind_t {
     ASTER_UPCALL_KIND_PLACEMENT_POLICY = 32,
     /// Placement provisioner: `BE` → `BF` (not issued by the C ABI yet).
     ASTER_UPCALL_KIND_PLACEMENT_PROVISION = 33,
-    /// expose authorize (decision): `C0` → `CF` (not issued by the C ABI yet).
+    /// expose authorize (decision): `C0` → `CF` (ABI 4.2, `expose.rs`).
     ASTER_UPCALL_KIND_EXPOSE_AUTHORIZE = 48,
-    /// expose HTTP handler (R9): `C4` → `C5` (not issued by the C ABI yet).
+    /// expose HTTP handler (R9): `C4` → `C5` (ABI 4.2, `expose.rs`); bodies
+    /// move through `aster_http_body_*` by the request's `stream_id`.
     ASTER_UPCALL_KIND_EXPOSE_HTTP = 49,
-    /// expose route policy (R9, decision): `C7` → `C8` (not issued by the
-    /// C ABI yet).
+    /// expose route policy (R9, decision): `C7` → `C8` (ABI 4.2,
+    /// `expose.rs`).
     ASTER_UPCALL_KIND_EXPOSE_ROUTE_POLICY = 50,
     /// Gate 0 connect hook (decision): `C1` → `CF` (not issued by the C ABI yet).
     ASTER_UPCALL_KIND_ADMISSION_CONNECT = 64,
@@ -212,7 +214,7 @@ pub struct aster_topology_admitted_stats_t {
 // ============================================================================
 
 pub(crate) struct UpcallsState {
-    upcalls: Upcalls,
+    pub(crate) upcalls: Upcalls,
     queue: Arc<UpcallQueue>,
     buffers: BufferRegistry,
     /// Serializes consumers (`aster_upcall_poll` is single-consumer).
@@ -240,7 +242,7 @@ static FENCED: once_cell::sync::Lazy<HandleRegistry<ForeignFencedResource>> =
 static ADMITTED: once_cell::sync::Lazy<HandleRegistry<ForeignAdmittedFn>> =
     once_cell::sync::Lazy::new(HandleRegistry::new);
 
-fn upcalls_for(upcalls: aster_upcalls_t) -> Result<Arc<UpcallsState>, i32> {
+pub(crate) fn upcalls_for(upcalls: aster_upcalls_t) -> Result<Arc<UpcallsState>, i32> {
     UPCALLS
         .get(upcalls)
         .ok_or_else(|| not_found(format!("unknown upcalls handle {upcalls}")))
