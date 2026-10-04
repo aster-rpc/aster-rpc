@@ -55,6 +55,11 @@ coordination-testing = ["coordination"]
 discovery = []
 hooks = []
 metrics = []
+# `aster::health`: the /healthz, /readyz, /metrics HTTP listener (the Rust home
+# of the Python/TS `HealthServer`), started by `AsterServer` from the
+# `[health]` config. hyper / hyper-util / http-body-util are already in the
+# graph through iroh's HTTP client; this only enables hyper's `server` half.
+health = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 # Language-binding support (PyO3, NAPI, C ABI). Adds no dependency: it exposes
 # `#[doc(hidden)]` accessors from the facade types to the transport-core
 # handles a binding still drives directly (reactor ring, client-call pool,
@@ -66,7 +71,8 @@ metrics = []
 #   default (blobs, docs, gossip, attestation) + rpc + metrics + binding-support
 #
 # and, only once the binding surfaces them, `coordination-client` (wrap the
-# coordination client, never port it) and `expose` (HTTP-over-Aster).
+# coordination client, never port it), `expose` (HTTP-over-Aster) and `health`
+# (serve /healthz, /readyz, /metrics from Rust).
 # `coordination`, `coordination-testing` and `expose-edge` are Rust-only (D7)
 # and never belong in a binding.
 binding-support = []
@@ -89,6 +95,11 @@ http = { version = "1", optional = true }
 # The streaming-relay body trait bound (`relay_request_streaming`). Gated by the
 # `expose` feature; matches the version `aster-expose` uses.
 http-body = { version = "1", optional = true }
+# The `health` feature's HTTP/1.1 listener. Same versions iroh's HTTP client
+# already resolves; only hyper's `server` feature is new code.
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 # RPC codec (Apache Fory Rust crate). Gated by the `rpc` feature. Pinned to the
 # same version as core's attestation feature. The `#[derive(ForyStruct)]` macro
 # emits `::fory_core::` paths, so both crates are direct deps.

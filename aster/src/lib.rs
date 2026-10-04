@@ -85,6 +85,8 @@ mod docs;
 pub mod expose;
 #[cfg(feature = "gossip")]
 mod gossip;
+#[cfg(feature = "health")]
+pub mod health;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 
