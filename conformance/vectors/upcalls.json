@@ -1,0 +1,624 @@
+{
+  "cancel_reasons": [
+    {
+      "code": 1,
+      "name": "timeout"
+    },
+    {
+      "code": 2,
+      "name": "abandoned"
+    },
+    {
+      "code": 3,
+      "name": "shutdown"
+    }
+  ],
+  "description": "Aster upcall payloads, format UCv1 (docs/_internal/bindings/upcall-design.md section 3). An upcall event is {invocation_id:u64, kind:u16, deadline_unix_ms:u64, payload}; the binding answers respond(invocation_id, status:u32, payload).",
+  "format": {
+    "bool": "0x00 | 0x01",
+    "bytes": "varint(len) then raw bytes",
+    "durations": "whole milliseconds as uint",
+    "list<T>": "varint(count) 0x0C then each T",
+    "opt<T>": "0xFD absent | 0x00 then T",
+    "prefix": "tag:u8 version:u8 (0x01)",
+    "rules": "every field present, fixed order, no trailing bytes",
+    "sets": "lists in strictly ascending byte order, no duplicates",
+    "string": "varint((utf8_len << 2) | 2) then UTF-8 bytes",
+    "u8enum": "one raw byte",
+    "uint": "LEB128 varint, minimal length, range-checked to the field width"
+  },
+  "invalid": [
+    {
+      "hex": "",
+      "name": "empty",
+      "type": "LeaseSnapshotRequest"
+    },
+    {
+      "hex": "cf0101",
+      "name": "wrong tag (decision bytes)",
+      "type": "LeaseSnapshotRequest"
+    },
+    {
+      "hex": "b3020672",
+      "name": "unsupported version",
+      "type": "LeaseSnapshotRequest"
+    },
+    {
+      "hex": "b301067200",
+      "name": "trailing byte",
+      "type": "LeaseSnapshotRequest"
+    },
+    {
+      "hex": "b301860072",
+      "name": "non-minimal string header",
+      "type": "LeaseSnapshotRequest"
+    },
+    {
+      "hex": "cf0102",
+      "name": "bad bool byte",
+      "type": "Decision"
+    },
+    {
+      "hex": "b50109",
+      "name": "unknown lease op",
+      "type": "LeaseAuthorizeRequest"
+    },
+    {
+      "hex": "b20109",
+      "name": "unknown outcome",
+      "type": "TransitionOutcome"
+    },
+    {
+      "hex": "b201011e747265652f3432870002",
+      "name": "non-minimal epoch varint",
+      "type": "TransitionOutcome"
+    },
+    {
+      "hex": "b70101020100",
+      "name": "not_holder with epochs",
+      "type": "FencedMutateResponse"
+    },
+    {
+      "hex": "c30101000178",
+      "name": "accept with a reason",
+      "type": "AdmissionHandshakeResponse"
+    },
+    {
+      "hex": "b901050c01",
+      "name": "list count beyond payload",
+      "type": "TopologyAdmittedResponse"
+    }
+  ],
+  "kinds": [
+    {
+      "code": 0,
+      "decision": false,
+      "name": "cancel"
+    },
+    {
+      "code": 1,
+      "decision": false,
+      "name": "lease_transition"
+    },
+    {
+      "code": 2,
+      "decision": false,
+      "name": "lease_snapshot"
+    },
+    {
+      "code": 3,
+      "decision": true,
+      "name": "lease_authorize"
+    },
+    {
+      "code": 4,
+      "decision": false,
+      "name": "fenced_mutate"
+    },
+    {
+      "code": 16,
+      "decision": true,
+      "name": "topology_admitted"
+    },
+    {
+      "code": 17,
+      "decision": false,
+      "name": "topology_snapshot"
+    },
+    {
+      "code": 32,
+      "decision": false,
+      "name": "placement_policy"
+    },
+    {
+      "code": 33,
+      "decision": false,
+      "name": "placement_provision"
+    },
+    {
+      "code": 48,
+      "decision": true,
+      "name": "expose_authorize"
+    },
+    {
+      "code": 49,
+      "decision": false,
+      "name": "expose_http"
+    },
+    {
+      "code": 64,
+      "decision": true,
+      "name": "admission_connect"
+    },
+    {
+      "code": 65,
+      "decision": true,
+      "name": "admission_handshake"
+    }
+  ],
+  "statuses": [
+    {
+      "code": 0,
+      "name": "ok",
+      "payload": "the kind's UCv1 response"
+    },
+    {
+      "code": 1,
+      "name": "error",
+      "payload": "UTF-8 message"
+    },
+    {
+      "code": 2,
+      "name": "unimplemented",
+      "payload": "ignored"
+    }
+  ],
+  "valid": [
+    {
+      "hex": "b1011e747265652f343201820261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161904e",
+      "name": "lease transition: acquire",
+      "type": "LeaseTransitionRequest",
+      "value": {
+        "op": {
+          "acquire": {
+            "candidate": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ttl_ms": 10000
+          }
+        },
+        "resource": "tree/42"
+      }
+    },
+    {
+      "hex": "b1011e747265652f34320282026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616107",
+      "name": "lease transition: renew",
+      "type": "LeaseTransitionRequest",
+      "value": {
+        "op": {
+          "renew": {
+            "epoch": 7,
+            "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        },
+        "resource": "tree/42"
+      }
+    },
+    {
+      "hex": "b1011e747265652f343203820261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161ac02",
+      "name": "lease transition: release (multi-byte epoch)",
+      "type": "LeaseTransitionRequest",
+      "value": {
+        "op": {
+          "release": {
+            "epoch": 300,
+            "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        },
+        "resource": "tree/42"
+      }
+    },
+    {
+      "hex": "b1011e747265652f34320412726f6f74",
+      "name": "lease transition: revoke",
+      "type": "LeaseTransitionRequest",
+      "value": {
+        "op": {
+          "revoke": {
+            "authority": "root"
+          }
+        },
+        "resource": "tree/42"
+      }
+    },
+    {
+      "hex": "b201011e747265652f343207820261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "name": "outcome: granted",
+      "type": "TransitionOutcome",
+      "value": {
+        "granted": {
+          "epoch": 7,
+          "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resource": "tree/42"
+        }
+      }
+    },
+    {
+      "hex": "b20102",
+      "name": "outcome: renewed",
+      "type": "TransitionOutcome",
+      "value": "renewed"
+    },
+    {
+      "hex": "b20103",
+      "name": "outcome: released",
+      "type": "TransitionOutcome",
+      "value": "released"
+    },
+    {
+      "hex": "b20104",
+      "name": "outcome: revoked",
+      "type": "TransitionOutcome",
+      "value": "revoked"
+    },
+    {
+      "hex": "b20105011e747265652f3432070082026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616101009423",
+      "name": "outcome: denied held_by_other",
+      "type": "TransitionOutcome",
+      "value": {
+        "denied": {
+          "reason": "held_by_other",
+          "snapshot": {
+            "epoch": 7,
+            "held": true,
+            "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "remaining_ms": 4500,
+            "resource": "tree/42"
+          }
+        }
+      }
+    },
+    {
+      "hex": "b2010506126672656500fd00fd",
+      "name": "outcome: denied unauthorized (free row)",
+      "type": "TransitionOutcome",
+      "value": {
+        "denied": {
+          "reason": "unauthorized",
+          "snapshot": {
+            "epoch": 0,
+            "held": false,
+            "holder": null,
+            "remaining_ms": null,
+            "resource": "free"
+          }
+        }
+      }
+    },
+    {
+      "hex": "b3011e747265652f3432",
+      "name": "snapshot request",
+      "type": "LeaseSnapshotRequest",
+      "value": {
+        "resource": "tree/42"
+      }
+    },
+    {
+      "hex": "b4011e747265652f3432070082026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616101009423",
+      "name": "snapshot: held",
+      "type": "LeaseSnapshot",
+      "value": {
+        "epoch": 7,
+        "held": true,
+        "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "remaining_ms": 4500,
+        "resource": "tree/42"
+      }
+    },
+    {
+      "hex": "b401126672656500fd00fd",
+      "name": "snapshot: free",
+      "type": "LeaseSnapshot",
+      "value": {
+        "epoch": 0,
+        "held": false,
+        "holder": null,
+        "remaining_ms": null,
+        "resource": "free"
+      }
+    },
+    {
+      "hex": "b50101820261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161904e",
+      "name": "authorize: acquire",
+      "type": "LeaseAuthorizeRequest",
+      "value": {
+        "op": {
+          "acquire": {
+            "candidate": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ttl_ms": 10000
+          }
+        }
+      }
+    },
+    {
+      "hex": "b6011e747265652f34320782026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616182026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616103010203",
+      "name": "fenced mutate request",
+      "type": "FencedMutateRequest",
+      "value": {
+        "fence": {
+          "epoch": 7,
+          "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resource": "tree/42"
+        },
+        "op_hex": "010203",
+        "writer": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "hex": "b70100026f6b",
+      "name": "fenced mutate: applied",
+      "type": "FencedMutateResponse",
+      "value": {
+        "applied": {
+          "output_hex": "6f6b"
+        }
+      }
+    },
+    {
+      "hex": "b70101010607",
+      "name": "fenced mutate: stale epoch",
+      "type": "FencedMutateResponse",
+      "value": {
+        "rejected": {
+          "carried": 6,
+          "current": 7,
+          "reason": "stale_epoch"
+        }
+      }
+    },
+    {
+      "hex": "b70101020000",
+      "name": "fenced mutate: not holder",
+      "type": "FencedMutateResponse",
+      "value": {
+        "rejected": {
+          "carried": 0,
+          "current": 0,
+          "reason": "not_holder"
+        }
+      }
+    },
+    {
+      "hex": "b70101030000",
+      "name": "fenced mutate: not held",
+      "type": "FencedMutateResponse",
+      "value": {
+        "rejected": {
+          "carried": 0,
+          "current": 0,
+          "reason": "not_held"
+        }
+      }
+    },
+    {
+      "hex": "b70101040907",
+      "name": "fenced mutate: future epoch",
+      "type": "FencedMutateResponse",
+      "value": {
+        "rejected": {
+          "carried": 9,
+          "current": 7,
+          "reason": "future_epoch"
+        }
+      }
+    },
+    {
+      "hex": "cf0101",
+      "name": "decision: allow",
+      "type": "Decision",
+      "value": true
+    },
+    {
+      "hex": "cf0100",
+      "name": "decision: deny",
+      "type": "Decision",
+      "value": false
+    },
+    {
+      "hex": "b801020c820230613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061820230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062",
+      "name": "topology admitted request",
+      "type": "TopologyAdmittedRequest",
+      "value": {
+        "node_ids": [
+          "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+          "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+        ]
+      }
+    },
+    {
+      "hex": "b801000c",
+      "name": "topology admitted request: empty",
+      "type": "TopologyAdmittedRequest",
+      "value": {
+        "node_ids": []
+      }
+    },
+    {
+      "hex": "b901020c0100",
+      "name": "topology admitted response",
+      "type": "TopologyAdmittedResponse",
+      "value": {
+        "admitted": [
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "hex": "ba01",
+      "name": "topology snapshot request",
+      "type": "TopologySnapshotRequest",
+      "value": {}
+    },
+    {
+      "hex": "bb01020c020c820230613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061820230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062820230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062010c820230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062306230623062010c820230633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063820230633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063010c820230633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063010c82023061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306182023063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306330633063306301",
+      "name": "topology snapshot: two clusters",
+      "type": "TopologySnapshot",
+      "value": {
+        "clusters": [
+          {
+            "bridge": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            "members": [
+              "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+              "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+            ],
+            "witnesses": [
+              "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+            ]
+          },
+          {
+            "bridge": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+            "members": [
+              "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+            ],
+            "witnesses": [
+              "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+            ]
+          }
+        ],
+        "far_pairs": [
+          [
+            "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+            "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+          ]
+        ],
+        "separation_coverage": 1
+      }
+    },
+    {
+      "hex": "c001267369676e616c696e6782026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616103746f6b",
+      "name": "expose authorize request",
+      "type": "ExposeAuthorizeRequest",
+      "value": {
+        "metadata_hex": "746f6b",
+        "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "service_id": "signaling"
+      }
+    },
+    {
+      "hex": "c1018202616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610761737465722f31",
+      "name": "admission connect request",
+      "type": "AdmissionConnectRequest",
+      "value": {
+        "alpn": "aster/1",
+        "peer": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "hex": "c2018202616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610761737465722f3101",
+      "name": "admission handshake request",
+      "type": "AdmissionHandshakeRequest",
+      "value": {
+        "alpn": "aster/1",
+        "is_alive": true,
+        "peer": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "hex": "c301010000",
+      "name": "admission handshake: accept",
+      "type": "AdmissionHandshakeResponse",
+      "value": {
+        "accept": true,
+        "code": 0,
+        "reason": ""
+      }
+    },
+    {
+      "hex": "c3010093030664656e696564",
+      "name": "admission handshake: reject",
+      "type": "AdmissionHandshakeResponse",
+      "value": {
+        "accept": false,
+        "code": 403,
+        "reason": "denied"
+      }
+    },
+    {
+      "hex": "bc01",
+      "name": "placement policy request",
+      "type": "PlacementPolicyRequest",
+      "value": {}
+    },
+    {
+      "hex": "bd01032011111111111111111111111111111111111111111111111111111111111111112022222222222222222222222222222222222222222222222222222222222222222e6578616d706c652e6f72670301020c20010101010101010101010101010101010101010101010101010101010101010100200101010101010101010101010101010101010101010101010101010101010101326173746572317469636b65740002dead200202020202020202020202020202020202020202020202020202020202020202fd010c200101010101010101010101010101010101010101010101010101010101010101010c20030303030303030303030303030303030303030303030303030303030303030301c0cf2400",
+      "name": "placement policy",
+      "type": "PlacementPolicy",
+      "value": {
+        "allow_healthy_rebalance": false,
+        "authority_domain": "example.org",
+        "authority_public_key": "2222222222222222222222222222222222222222222222222222222222222222",
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "eligible": [
+          {
+            "member_seed": {
+              "node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+              "signed_join_permit": "dead",
+              "ticket": "aster1ticket"
+            },
+            "node_id": "0101010101010101010101010101010101010101010101010101010101010101"
+          },
+          {
+            "member_seed": null,
+            "node_id": "0202020202020202020202020202020202020202020202020202020202020202"
+          }
+        ],
+        "excluded": [
+          "0303030303030303030303030303030303030303030303030303030303030303"
+        ],
+        "minimum_separated_voter_pairs": 1,
+        "pinned_voters": [
+          "0101010101010101010101010101010101010101010101010101010101010101"
+        ],
+        "replacement_grace_ms": 600000,
+        "revision": 3,
+        "target_retained_learners": 1,
+        "target_voters": 3
+      }
+    },
+    {
+      "hex": "be0120333333333333333333333333333333333333333333333333333333333333333320111111111111111111111111111111111111111111111111111111111111111100022001010101010101010101010101010101010101010101010101010101010101018201200202020202020202020202020202020202020202020202020202020202020202",
+      "name": "provision request",
+      "type": "PlacementProvisionRequest",
+      "value": {
+        "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "membership_log_id": {
+          "index": 130,
+          "leader_node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+          "term": 2
+        },
+        "node_id": "0202020202020202020202020202020202020202020202020202020202020202",
+        "policy_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      }
+    },
+    {
+      "hex": "be01203333333333333333333333333333333333333333333333333333333333333333201111111111111111111111111111111111111111111111111111111111111111fd200202020202020202020202020202020202020202020202020202020202020202",
+      "name": "provision request: no log id",
+      "type": "PlacementProvisionRequest",
+      "value": {
+        "group_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "membership_log_id": null,
+        "node_id": "0202020202020202020202020202020202020202020202020202020202020202",
+        "policy_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      }
+    },
+    {
+      "hex": "bf01200101010101010101010101010101010101010101010101010101010101010101326173746572317469636b65740002dead",
+      "name": "member seed",
+      "type": "MemberSeed",
+      "value": {
+        "node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+        "signed_join_permit": "dead",
+        "ticket": "aster1ticket"
+      }
+    }
+  ]
+}
