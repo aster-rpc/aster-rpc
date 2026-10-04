@@ -121,37 +121,26 @@ fn run_soak_cycle(runtime: aster_runtime_t, metrics: &Arc<SoakMetrics>) -> bool 
     drain_all_events(runtime);
 
     // Create an in-memory node with aster ALPN
-    let alpns = [b"aster".as_ptr()];
-    let alpn_lens = [5];
 
     let mut node_op: aster_operation_t = 0;
-    let status = unsafe {
-        aster_node_memory_with_alpns(
-            runtime,
-            alpns.as_ptr(),
-            alpn_lens.as_ptr(),
-            1,
-            0,
-            &mut node_op,
-        )
-    };
+    let status = unsafe { common::node_start_with_alpns(runtime, &[b"aster"], 0, &mut node_op) };
 
     if status != aster_status_t::ASTER_STATUS_OK as i32 {
         return false;
     }
 
     // Poll until node creation is confirmed (not a fixed sleep)
-    let node_created = poll_for_event(runtime, aster_event_kind_t::ASTER_EVENT_NODE_CREATED, 2000);
-    if !node_created {
+    let Some(node) = poll_for_event(runtime, aster_event_kind_t::ASTER_EVENT_NODE_CREATED, 2000)
+    else {
         // Node creation timed out — treat as error, don't track as pending
         return false;
-    }
+    };
     // NOTE: Node creation is an internal operation — we do NOT call record_submit()
     // for it, so we do NOT call record_complete() either.
 
     // Submit accept (will hang since no peer connects)
     let mut accept_op: aster_operation_t = 0;
-    let status = unsafe { aster_node_accept_aster(runtime, 1, 0, &mut accept_op) };
+    let status = unsafe { aster_node_accept_aster(runtime, node, 0, &mut accept_op) };
     if status != aster_status_t::ASTER_STATUS_OK as i32 {
         return false;
     }
@@ -194,10 +183,11 @@ fn run_soak_cycle(runtime: aster_runtime_t, metrics: &Arc<SoakMetrics>) -> bool 
 
     // Close the node
     let mut close_op: aster_operation_t = 0;
-    let status = unsafe { aster_node_close(runtime, 1, 0, &mut close_op) };
+    let status = unsafe { aster_node_close(runtime, node, 0, &mut close_op) };
     if status == aster_status_t::ASTER_STATUS_OK as i32 {
         // Wait for close to complete
-        let closed = poll_for_event(runtime, aster_event_kind_t::ASTER_EVENT_CLOSED, 2000);
+        let closed =
+            poll_for_event(runtime, aster_event_kind_t::ASTER_EVENT_CLOSED, 2000).is_some();
         if !closed {
             // Close didn't complete in time, but don't fail the cycle — node may be gone
         }
@@ -222,18 +212,23 @@ fn drain_all_events(runtime: aster_runtime_t) {
 
 // Poll for a specific event kind within a timeout (in ms).
 // Returns true if the event was found, false on timeout.
-fn poll_for_event(runtime: aster_runtime_t, kind: aster_event_kind_t, timeout_ms: u32) -> bool {
+/// The handle of the first `kind` event within `timeout_ms`.
+fn poll_for_event(
+    runtime: aster_runtime_t,
+    kind: aster_event_kind_t,
+    timeout_ms: u32,
+) -> Option<u64> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
     loop {
         if std::time::Instant::now() >= deadline {
-            return false;
+            return None;
         }
         // SAFETY: zeroed() is unsafe but we own this memory and poll_events writes to it
         let mut events = unsafe { [std::mem::zeroed::<aster_event_t>(); 4] };
         let count = unsafe { aster_poll_events(runtime, events.as_mut_ptr(), 4, 50) };
         for ev in events.iter().take(count) {
             if ev.kind == kind as u32 {
-                return true;
+                return Some(ev.handle);
             }
         }
     }

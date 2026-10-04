@@ -85,7 +85,7 @@ public class ConformanceTests
         {
             Index = 0,
             Op = "endpoint_created",
-            Kind = 3, // EndpointCreated
+            Kind = 1, // NodeCreated (ABI 4.0: an endpoint is a node from aster_node_start)
             Handle = 1,
             TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - startTime
         });

@@ -199,122 +199,53 @@ func (n *Node) Close() error {
 
 // ─── Factory methods ─────────────────────────────────────────────────────────
 
-// Memory creates an in-memory node with all protocols enabled.
+// Memory creates an in-memory node with all protocols enabled, on a runtime
+// of its own.
 //
-// Deprecated: ABI 3.2 deprecates aster_node_memory* / aster_node_persistent
-// (removed in 4.0). Use StartNode.
+// A convenience wrapper over StartNode (ABI 4.0 removed aster_node_memory*
+// and aster_node_persistent); prefer StartNode, which also takes the full
+// AsterConfig and a Gate. Close frees the node and leaves its runtime
+// running (Node.Runtime().Close() stops it).
 func Memory(ctx context.Context) (*Node, error) {
 	return MemoryWithAlpns(ctx, nil)
 }
 
-// MemoryWithAlpns creates an in-memory node that accepts connections on the given ALPNs.
-//
-// Deprecated: use StartNode with AsterConfig.ALPNs.
+// MemoryWithAlpns creates an in-memory node that accepts connections on the
+// given ALPNs. See Memory.
 func MemoryWithAlpns(ctx context.Context, alpns []string) (*Node, error) {
-	runtime, err := NewRuntime(ctx, DefaultRuntimeConfig())
-	if err != nil {
-		return nil, fmt.Errorf("create runtime: %w", err)
-	}
-	return createNode(ctx, runtime, alpns, "", false)
+	return createNode(ctx, alpns, "")
 }
 
 // Persistent creates a persistent node at the given path with all protocols.
-//
-// Deprecated: use StartNode with AsterConfig.StoragePath.
+// See Memory.
 func Persistent(ctx context.Context, path string) (*Node, error) {
 	return PersistentWithAlpns(ctx, path, nil)
 }
 
-// PersistentWithAlpns creates a persistent node at path that accepts connections on the given ALPNs.
-//
-// Deprecated: use StartNode.
+// PersistentWithAlpns creates a persistent node at path that accepts
+// connections on the given ALPNs. See Memory.
 func PersistentWithAlpns(ctx context.Context, path string, alpns []string) (*Node, error) {
+	if path == "" {
+		return nil, fmt.Errorf("persistent node: empty path: %w", ErrInvalidArgument)
+	}
+	return createNode(ctx, alpns, path)
+}
+
+func createNode(ctx context.Context, alpns []string, path string) (*Node, error) {
 	runtime, err := NewRuntime(ctx, DefaultRuntimeConfig())
 	if err != nil {
 		return nil, fmt.Errorf("create runtime: %w", err)
 	}
-	return createNode(ctx, runtime, alpns, path, true)
-}
-
-func createNode(ctx context.Context, runtime *Runtime, alpns []string, path string, persistent bool) (*Node, error) {
-	var opID C.aster_operation_t
-
-	var r C.int32_t
-	if persistent {
-		pathBytes := []byte(path)
-		cBuf := C.malloc(C.size_t(len(pathBytes)))
-		C.memcpy(cBuf, unsafe.Pointer(&pathBytes[0]), C.size_t(len(pathBytes)))
-		bytes := C.struct_aster_bytes_t{
-			ptr: (*C.uint8_t)(cBuf),
-			len: C.uintptr_t(len(pathBytes)),
-		}
-		r = C.aster_node_persistent(
-			C.uint64_t(runtime.handle),
-			bytes,
-			0,
-			&opID,
-		)
-	} else if len(alpns) == 0 {
-		r = C.aster_node_memory(
-			C.uint64_t(runtime.handle),
-			0,
-			&opID,
-		)
-	} else {
-		// Build arrays of pointers and lengths for the ALPN strings.
-		// Each alpnBuf holds the C-allocated copy of one ALPN string.
-		alpnPtrs := make([]*C.uint8_t, len(alpns))
-		alpnLens := make([]C.uintptr_t, len(alpns))
-		alpnBuf := make([][]byte, len(alpns)) // keep alive until after FFI call
-		for i, alpn := range alpns {
-			b := []byte(alpn)
-			alpnBuf[i] = b
-			// Allocate C memory and copy the string bytes.
-			// This satisfies Go's cgo pointer rules: we pass C-allocated memory to C.
-			cBuf := C.malloc(C.size_t(len(b)))
-			C.memcpy(cBuf, unsafe.Pointer(&b[0]), C.size_t(len(b)))
-			alpnPtrs[i] = (*C.uint8_t)(cBuf)
-			alpnLens[i] = C.uintptr_t(len(b))
-		}
-
-		r = C.aster_node_memory_with_alpns(
-			C.uint64_t(runtime.handle),
-			(**C.uint8_t)(unsafe.Pointer(&alpnPtrs[0])),
-			(*C.uintptr_t)(unsafe.Pointer(&alpnLens[0])),
-			C.uintptr_t(len(alpns)),
-			0,
-			&opID,
-		)
-
-		// Free the C-allocated ALPN buffers.
-		for i := range alpnPtrs {
-			C.free(unsafe.Pointer(alpnPtrs[i]))
-		}
-	}
-
-	if r != 0 {
-		runtime.Close()
-		return nil, fmt.Errorf("node create: %w", Error(r))
-	}
-
-	ev, err := runtime.Poll(ctx, uint64(opID))
+	cfg := DefaultConfig()
+	cfg.ALPNs = alpns
+	cfg.StoragePath = path
+	node, err := startNodeOn(ctx, runtime, cfg, NodeOptions{})
 	if err != nil {
 		runtime.Close()
-		return nil, fmt.Errorf("node create poll: %w", err)
+		return nil, fmt.Errorf("node create: %w", err)
 	}
-	if ev.Kind != ASTER_EVENT_NODE_CREATED {
-		runtime.Close()
-		return nil, fmt.Errorf("node create: unexpected event %d", ev.Kind)
-	}
-
-	node := &Node{
-		handle:      ev.Handle,
-		runtime:     runtime,
-		connections: make(chan AcceptedAster, 64),
-	}
-
-	runtime.registerAcceptHandler(node.handle, node)
-
+	// Legacy shape: Close frees the handle and leaves the runtime running.
+	node.ownsRuntime = false
 	return node, nil
 }
 

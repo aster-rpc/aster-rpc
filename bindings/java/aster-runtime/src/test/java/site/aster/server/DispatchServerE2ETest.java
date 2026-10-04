@@ -165,8 +165,47 @@ final class DispatchServerE2ETest {
               return c.encode(new Msg(ctx.attributes().getOrDefault("aster.role", ""), 0));
             }
           };
+      ServerStreamDispatcher silent =
+          new ServerStreamDispatcher() {
+            public MethodDescriptor descriptor() {
+              return desc("silent", StreamingKind.SERVER_STREAM, null);
+            }
+
+            public void invoke(
+                Object impl, byte[] req, Codec c, CallContext ctx, ResponseStream out)
+                throws Exception {
+              long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+              while (!out.isCancelled() && System.nanoTime() < end) {
+                Thread.sleep(10);
+              }
+              if (out.isCancelled()) {
+                SILENT_CANCELLED.incrementAndGet();
+              }
+            }
+          };
+      BidiStreamDispatcher hold =
+          new BidiStreamDispatcher() {
+            public MethodDescriptor descriptor() {
+              return desc("hold", StreamingKind.BIDI_STREAM, null);
+            }
+
+            public void invoke(
+                Object impl, RequestStream in, Codec c, CallContext ctx, ResponseStream out)
+                throws Exception {
+              in.receive(); // the first payload arrives with the CALL event
+              HOLD_ENTERED.countDown();
+              try {
+                byte[] next = in.receive(); // blocks until the peer cancels
+                HOLD_OUTCOME.complete(next == null ? "end" : "data");
+              } catch (java.util.concurrent.CancellationException e) {
+                HOLD_OUTCOME.complete("cancelled");
+                throw e;
+              }
+            }
+          };
       return Map.of(
-          "echo", echo, "fail", fail, "count", count, "sum", sum, "chat", chat, "admin", admin);
+          "echo", echo, "fail", fail, "count", count, "sum", sum, "chat", chat, "admin", admin,
+          "silent", silent, "hold", hold);
     }
 
     @Override
@@ -202,6 +241,14 @@ final class DispatchServerE2ETest {
       register(fory);
     }
   }
+
+  /** Count of "silent" handlers that ended because their call was cancelled. */
+  static final AtomicInteger SILENT_CANCELLED = new AtomicInteger();
+
+  static final java.util.concurrent.CountDownLatch HOLD_ENTERED =
+      new java.util.concurrent.CountDownLatch(1);
+  static final java.util.concurrent.CompletableFuture<String> HOLD_OUTCOME =
+      new java.util.concurrent.CompletableFuture<>();
 
   static AsterServer server;
   static AsterClient client;
@@ -359,6 +406,102 @@ final class DispatchServerE2ETest {
     assertEquals(
         ContractManifestBuilder.dynamicService(new Shared()).contractId(),
         server.contractId("test.Dispatch"));
+  }
+
+  /**
+   * A handler blocked in {@code Dispatch.recv} (bounded native waits, no infinite timeout) is
+   * released when the peer cancels: the request stream ends ({@code null}, the call is over) or
+   * {@code receive} throws {@link java.util.concurrent.CancellationException}.
+   */
+  @Test
+  void handlerBlockedInRecvIsReleasedByPeerCancel() throws Exception {
+    try (BidiCall<Msg, Msg> call =
+        get(client.<Msg, Msg>openBidiStream(addr, "test.Dispatch", "hold", Msg.class))) {
+      call.send(new Msg("first", 0));
+      assertTrue(HOLD_ENTERED.await(10, TimeUnit.SECONDS), "handler reached its second receive");
+      Thread.sleep(300); // let it sit in more than one recv slice
+      call.cancel();
+      String outcome = HOLD_OUTCOME.get(5, TimeUnit.SECONDS);
+      assertTrue(outcome.equals("cancelled") || outcome.equals("end"), outcome);
+      RpcError e =
+          assertInstanceOf(
+              RpcError.class,
+              org.junit.jupiter.api.Assertions.assertThrows(RpcError.class, call::recv));
+      assertEquals(StatusCode.CANCELLED, e.code());
+    }
+    waitForNoLiveCalls();
+  }
+
+  /** Closing an open-ended server stream stops the reader's bounded-wait loop promptly. */
+  @Test
+  void closingAWaitingServerStreamStopsTheReader() throws Exception {
+    int cancelledBefore = SILENT_CANCELLED.get();
+    var call =
+        get(
+            client.<Msg, Msg>openServerStream(
+                addr, "test.Dispatch", "silent", new Msg("", 0), Msg.class));
+    assertNull(call.recvWithTimeout(300, TimeUnit.MILLISECONDS), "nothing arrives");
+    long t0 = System.nanoTime();
+    call.close();
+    assertTrue(
+        System.nanoTime() - t0 < TimeUnit.SECONDS.toNanos(3), "close does not wait on the reader");
+    long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (SILENT_CANCELLED.get() == cancelledBefore && System.nanoTime() < end) {
+      Thread.sleep(10);
+    }
+    assertTrue(SILENT_CANCELLED.get() > cancelledBefore, "the handler saw the cancel");
+    waitForNoLiveCalls();
+  }
+
+  /**
+   * {@link site.aster.ffi.Rpc#recvPolling} observes its own cancellation between bounded waits: an
+   * interrupted reader, or one whose stop condition turns true, cancels the native call and returns
+   * the {@code CANCELLED} trailer.
+   */
+  @Test
+  void recvPollingObservesInterruptAndStop() throws Exception {
+    var conn = get(client.connect(addr));
+    long rt = conn.runtime().nativeHandle();
+    for (boolean viaInterrupt : new boolean[] {true, false}) {
+      long call =
+          site.aster.ffi.Rpc.open(
+              rt,
+              conn.nativeHandle(),
+              site.aster.ffi.Rpc.PATTERN_SERVER_STREAM,
+              site.aster.ffi.Rpc.Options.of("test.Dispatch", "silent", 0));
+      try {
+        site.aster.ffi.Rpc.send(rt, call, client.codec().encode(new Msg("", 0)), true);
+        final long c = call;
+        var stop = new java.util.concurrent.atomic.AtomicBoolean();
+        var result = new java.util.concurrent.CompletableFuture<site.aster.ffi.Rpc.Recv>();
+        Thread reader =
+            new Thread(
+                () -> {
+                  try {
+                    result.complete(site.aster.ffi.Rpc.recvPolling(rt, c, stop::get));
+                  } catch (Throwable t) {
+                    result.completeExceptionally(t);
+                  }
+                });
+        reader.start();
+        Thread.sleep(300);
+        assertTrue(!result.isDone(), "still waiting");
+        if (viaInterrupt) {
+          reader.interrupt();
+        } else {
+          stop.set(true);
+        }
+        var r = result.get(5, TimeUnit.SECONDS);
+        var trailer = assertInstanceOf(site.aster.ffi.Rpc.Recv.Trailer.class, r);
+        assertEquals(
+            site.aster.server.wire.RpcStatus.CANCELLED,
+            site.aster.ffi.AsterEnvelope.decodeRpcStatus(trailer.status()).code(),
+            "via interrupt=" + viaInterrupt);
+      } finally {
+        site.aster.ffi.Rpc.release(rt, call);
+      }
+    }
+    waitForNoLiveCalls();
   }
 
   static void waitForNoLiveCalls() throws InterruptedException {

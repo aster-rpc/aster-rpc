@@ -56,7 +56,11 @@ const (
 	serverOptionHandlerTimeoutMs         = C.ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS
 )
 
-const timeoutInfinite = C.ASTER_TIMEOUT_INFINITE
+// recvSliceMs bounds each blocking aster_dispatch_recv /
+// aster_call_recv_payload wait: callers loop on TIMEOUT and check their
+// context (and the call's cancellation) between slices, so a wait never
+// outlives the context that started it.
+const recvSliceMs = 200
 
 // errCallGone: the call is over (answered, cancelled, deadline, connection
 // lost); nothing more can be sent on it.

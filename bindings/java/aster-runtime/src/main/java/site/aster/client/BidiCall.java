@@ -39,6 +39,9 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
   private volatile boolean cleanTrailer = false;
   private volatile boolean closed = false;
 
+  /** Set by {@link #cancel} / {@link #close}; the reader observes it between bounded waits. */
+  private volatile boolean cancelRequested = false;
+
   /** Package-private: {@code call} is an open bidi call ({@code aster_rpc_open}). */
   BidiCall(long runtime, long call, Codec codec, Class<Resp> responseType) {
     this.runtime = runtime;
@@ -69,6 +72,7 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
    */
   public void cancel() {
     if (!closed) {
+      cancelRequested = true;
       Rpc.cancel(runtime, call);
     }
   }
@@ -110,7 +114,7 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
   private void readLoop() {
     try {
       while (true) {
-        Rpc.Recv r = Rpc.recv(runtime, call, Rpc.TIMEOUT_INFINITE);
+        Rpc.Recv r = Rpc.recvPolling(runtime, call, () -> cancelRequested);
         if (r instanceof Rpc.Recv.Data d) {
           responses.offer(codec.decode(d.payload(), responseType));
         } else if (r instanceof Rpc.Recv.Trailer t) {
@@ -137,6 +141,7 @@ public final class BidiCall<Req, Resp> implements AutoCloseable {
       return;
     }
     if (!cleanTrailer && trailerError == null) {
+      cancelRequested = true;
       Rpc.cancel(runtime, call);
     }
     if (readerThread.isAlive()) {

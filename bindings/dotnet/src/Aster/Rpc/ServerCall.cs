@@ -58,14 +58,13 @@ internal sealed class ServerCall
         {
             token.ThrowIfCancellationRequested();
             // Buffered payloads are taken without a thread hop; only an empty queue waits, off the
-            // caller's thread. The wait has no timeout: it ends with the next payload, the end of
-            // the request stream, or the call (cancel, deadline, lost connection, server stop);
-            // a cancelled handler stops waiting at once.
-            // (A finite aster_dispatch_recv timeout panics in ABI 3.5.0: the timer is built
-            // outside the runtime context.)
+            // caller's thread, in bounded aster_dispatch_recv slices that re-check the handler's
+            // token, so a cancelled handler stops waiting at once and frees the waiting thread
+            // within one slice. The call itself ending (cancel, deadline, lost connection, server
+            // stop) ends the wait immediately.
             var status = _dispatch.Recv(_callId, 0, out byte[] payload);
             if (status == DispatchServer.RecvStatus.Timeout)
-                (status, payload) = await Task.Run(WaitForRequest, CancellationToken.None).WaitAsync(token).ConfigureAwait(false);
+                (status, payload) = await Task.Run(() => WaitForRequest(token), CancellationToken.None).WaitAsync(token).ConfigureAwait(false);
             switch (status)
             {
                 case DispatchServer.RecvStatus.EndOfStream:
@@ -81,10 +80,17 @@ internal sealed class ServerCall
         }
     }
 
-    private (DispatchServer.RecvStatus, byte[]) WaitForRequest()
+    /// <summary>Slice of one blocking <c>aster_dispatch_recv</c> wait (ms).</summary>
+    internal const uint RecvSliceMs = 200;
+
+    private (DispatchServer.RecvStatus, byte[]) WaitForRequest(CancellationToken token)
     {
-        var s = _dispatch.Recv(_callId, Native.TimeoutInfinite, out var p);
-        return (s, p);
+        while (true)
+        {
+            var s = _dispatch.Recv(_callId, RecvSliceMs, out var p);
+            if (s != DispatchServer.RecvStatus.Timeout || token.IsCancellationRequested)
+                return (s, p);
+        }
     }
 
     /// <summary>Sends one streaming response message; throws <see cref="OperationCanceledException"/> once the call is over.</summary>

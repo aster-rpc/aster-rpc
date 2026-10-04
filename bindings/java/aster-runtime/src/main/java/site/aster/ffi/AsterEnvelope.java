@@ -50,9 +50,6 @@ public final class AsterEnvelope {
   /** First byte of an encoded RpcStatus. */
   public static final byte TAG_RPC_STATUS = (byte) 0xA3;
 
-  /** Minimum ABI minor (with major 3) that exports these functions. */
-  public static final int REQUIRED_ABI_MINOR = 1;
-
   // ─── Layouts (ffi/aster_ffi.h) ─────────────────────────────────────────────
 
   private static final MemoryLayout BYTES = IrohLibrary.ASTER_BYTES;
@@ -169,18 +166,8 @@ public final class AsterEnvelope {
                     ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
 
     private static IrohLibrary lib() {
-      IrohLibrary lib = IrohLibrary.getInstance();
-      if (lib.abiVersionMinor() < REQUIRED_ABI_MINOR) {
-        throw new UnsatisfiedLinkError(
-            "aster native library ABI "
-                + lib.abiVersionMajor()
-                + "."
-                + lib.abiVersionMinor()
-                + " lacks the AEv1 envelope functions (need 3."
-                + REQUIRED_ABI_MINOR
-                + "+)");
-      }
-      return lib;
+      // Every ABI 4.x library exports the AEv1 functions; the major is checked at load.
+      return IrohLibrary.getInstance();
     }
 
     private static MethodHandle encode(String name) {

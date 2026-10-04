@@ -1,9 +1,14 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x changelog (current: 3.5)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.0)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
 every symbol, pass `ASTER_ABI_VERSION_MAJOR` (3) to `aster_runtime_new`, and
 should check `aster_abi_version() >> 16 == 3` at load.
+
+**ABI 4.0** (see "4.0 (removals)" below) removed the reactor, the framed
+`aster_call_*` client, the 3.2-deprecated node factories and bare endpoints.
+The 3.x sections and the rename table still name those symbols as a record of
+3.x; they no longer exist.
 
 Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 (`libaster_transport_ffi.{so,dylib}`, `aster_transport_ffi.dll`).
@@ -20,14 +25,67 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
 
+## 4.0 (removals)
+
+ABI 4.0.0 removes what 3.2 and 3.5 deprecated, now that Java, .NET and Go are
+on `aster_node_start` and the 3.5 dispatch server / payload client. Nothing
+was added or reshaped: a 3.5 binding that used none of the functions below
+only has to pass `ASTER_ABI_VERSION_MAJOR` (4) to `aster_runtime_new` and
+check `aster_abi_version() >> 16 == 4`. Every remaining struct layout is
+unchanged.
+
+**Removed:**
+
+| Kind | Name | Use instead |
+|---|---|---|
+| functions | `aster_reactor_{create,destroy,poll,submit,submit_frame,submit_trailer,recv_frame,check_cancelled,buffer_release,reserve_response_capacity,cancel_response_reservation,accept_non_rpc}` | `aster_server_*` / `aster_dispatch_*` (3.5); non-RPC ALPNs arrive as `ASTER_DISPATCH_EVENT_NON_RPC` |
+| types / constants | `aster_reactor_t`, `aster_reactor_call_t` (112 B), `ASTER_REACTOR_EVENT_{CALL,CONNECTION_CLOSED,RESPONSE_WRITABLE,RESPONSE_CLOSED}`, `ASTER_RECV_FRAME_{OK,END_OF_STREAM,TIMEOUT}` | `aster_dispatch_event_t`, `aster_dispatch_event_kind_t` |
+| functions | `aster_call_acquire`, `aster_call_acquire_streaming`, `aster_call_send_frame`, `aster_call_recv_frame`, `aster_call_unary` | `aster_rpc_unary`, `aster_rpc_open` + `aster_call_{send_payload,send_payloads,recv_payload,cancel}` (3.5) |
+| constants | `ASTER_CALL_RECV_{OK,END_OF_STREAM,TIMEOUT}`, `ASTER_CALL_ERR_{POOL_FULL,QUIC_LIMIT_REACHED,PEER_STREAM_LIMIT_TOO_LOW,STREAM_OPEN_FAILED,POOL_CLOSED}` | payload-client statuses / AEv1 trailer codes |
+| functions | `aster_node_memory`, `aster_node_memory_with_alpns`, `aster_node_persistent` | `aster_node_start` with an `aster_config_t` (`alpns`, `storage_path`) |
+| functions | `aster_endpoint_create`, `aster_endpoint_close`, `aster_endpoint_free`, `aster_endpoint_id`, `aster_endpoint_export_secret_key`, `aster_endpoint_addr_info` | a node: `aster_node_start`, `aster_node_close`, `aster_node_free`, `aster_node_id`, `aster_node_export_secret_key`, `aster_node_addr_info` |
+| struct | `aster_endpoint_config_t` (152 B) | `aster_config_t` (relay mode/URLs, secret key, ALPNs, hooks, bind address, transports, portmapper, proxy, storage) |
+
+There are no bare endpoints any more: a node started with only custom ALPNs is
+the replacement.
+
+**Kept:** `aster_call_release` / `aster_call_discard` (free an `aster_rpc_open`
+call; an unfinished one is cancelled -- the two are now identical) and
+`aster_call_buffer_release` (leases from `aster_rpc_unary` /
+`aster_call_recv_payload`). `aster_endpoint_remote_info`,
+`aster_endpoint_remote_info_list`, `aster_endpoint_transport_metrics`,
+`aster_add_node_addr` and `aster_connect` keep their names and take node handles
+(`aster_endpoint_t` stays as a typedef for them). `ASTER_EVENT_ENDPOINT_CREATED`
+(3) / `ASTER_EVENT_ENDPOINT_CREATE_FAILED` (4) stay in `aster_event_kind_t` as
+reserved values and are never emitted.
+
+**Behaviour change:** `aster_accept(rt, node, user_data, out_op)` on a node now
+takes the next connection from the node's aster-ALPN accept queue (the queue
+`aster_node_accept_aster` reads; connections on the node's configured ALPNs
+that passed Gate 0) and emits `ASTER_EVENT_CONNECTION_ACCEPTED` (`handle` =
+connection, `related` = node, no payload). Before 4.0 it called the endpoint's
+accept directly and raced the node's router. Unknown handle -> `NOT_FOUND`.
+
+**Bindings:** Java (`IrohLibrary.EXPECTED_ABI_MAJOR`), .NET
+(`Native.AbiVersionMajor`) and Go (`C.ASTER_ABI_VERSION_MAJOR` from the header)
+expect 4. Java and Go now wait in `aster_dispatch_recv` /
+`aster_call_recv_payload` with finite timeouts and check their own cancellation
+between slices instead of `ASTER_TIMEOUT_INFINITE`.
+
+Sources: `ffi/src/call.rs` (what is left of the call family), `ffi/src/lib.rs`
+(`aster_accept`); `ffi/src/reactor.rs` and its tests (`reactor_test.rs`,
+`reactor_cancel_lifecycle.rs`, `cancel_state_cleanup.rs`) were deleted. Tests:
+`ffi/tests/node_start.rs` (`accept_on_node_reads_the_alpn_queue`),
+`ffi/tests/abi_contract_test.c`.
+
 ## New in 3.5 (additive)
 
 ABI 3.5.0 (tranche F4, additive part) serves bindings' RPC services through
 `aster::rpc::Server` (design `docs/_internal/bindings/dynamic-dispatch-design.md`
 §4.4, as built) and adds a payload-level client over the pooled
 `RpcConnection`. Nothing in 3.0–3.4 changed shape; a 3.4 binding keeps working
-(Go and .NET still use `aster_reactor_*` and the framed `aster_call_*`, which
-stay until 4.0). Sources: `ffi/src/server.rs`, `ffi/src/rpc.rs`; tests:
+(at the time Go and .NET still used `aster_reactor_*` and the framed
+`aster_call_*`; both were removed in 4.0). Sources: `ffi/src/server.rs`, `ffi/src/rpc.rs`; tests:
 `ffi/tests/dispatch_server.rs` (all four patterns, sessions, peer cancel,
 deadlines, `QUEUE_FULL`/reserve, abandon, Gate 3 + attribute bridge, frame
 limits, connection close, non-RPC ALPN, argument validation -- every call
@@ -94,7 +152,7 @@ count`, then per entry `u32 LE key_len`, key, `u32 LE value_len`, value
 Behaviour change (no signature change): `aster_call_release` / `aster_call_discard`
 also free `aster_rpc_open` calls (an unfinished one is cancelled).
 
-**Deprecated (removal in 4.0, with .NET and Go ported):**
+**Deprecated in 3.5, removed in 4.0:**
 `aster_reactor_{create,destroy,poll,submit,submit_frame,submit_trailer,recv_frame,check_cancelled,buffer_release,reserve_response_capacity,cancel_response_reservation,accept_non_rpc}`,
 `aster_reactor_call_t`, and the framed `aster_call_{acquire,acquire_streaming,send_frame,recv_frame,unary}`.
 
@@ -253,7 +311,7 @@ returns `INVALID_ARGUMENT` for a NULL scratch buffer. Handle ids are now unique 
 all handle kinds within the process (one counter), so a function taking "endpoint
 or node" can no longer confuse an endpoint with a node of the same number.
 
-**Deprecated (removal in 4.0):** `aster_node_memory`, `aster_node_memory_with_alpns`,
+**Deprecated in 3.2, removed in 4.0:** `aster_node_memory`, `aster_node_memory_with_alpns`,
 `aster_node_persistent`, `aster_endpoint_create` (and with it the
 endpoint-only `aster_endpoint_*` functions and `aster_endpoint_config_t`). Use
 `aster_node_start`; `aster_connect`, `aster_accept`, remote info and transport

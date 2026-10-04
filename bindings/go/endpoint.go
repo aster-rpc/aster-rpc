@@ -31,23 +31,26 @@ const (
 	HookFailClosed uint32 = C.ASTER_HOOK_FAILURE_FAIL_CLOSED
 )
 
-// EndpointConfig configures an endpoint. Fields map 1:1 onto
-// aster_endpoint_config_t.
+// EndpointConfig configures an Endpoint.
+//
+// ABI 4.0 removed bare endpoints (aster_endpoint_create and
+// aster_endpoint_config_t): an Endpoint is now a node started by
+// aster_node_start, and these fields are mapped onto AsterConfig.
 type EndpointConfig struct {
-	RelayMode            uint32
+	RelayMode            uint32 // RelayMode* constant
 	SecretKey            []byte
 	ALPNs                []string
 	RelayURLs            []string
-	EnableDiscovery      bool
+	EnableDiscovery      bool // -> AsterConfig.LocalDiscovery
 	EnableHooks          bool
 	HookTimeoutMs        uint64
 	BindAddr             string
 	ClearIPTransports    bool
 	ClearRelayTransports bool
-	PortMapperConfig     uint32
+	PortMapperConfig     uint32 // 0 = default, 1 = disabled
 	ProxyURL             string
 	ProxyFromEnv         bool
-	DataDir              string
+	DataDir              string // -> AsterConfig.StoragePath ("" = in memory)
 	HookFailureMode      uint32
 }
 
@@ -60,135 +63,79 @@ func DefaultEndpointConfig() EndpointConfig {
 	}
 }
 
-// toC fills a header-typed aster_endpoint_config_t. Pointed-to payloads live
-// in the arena (C memory) so the struct satisfies cgo pointer rules.
-func (cfg *EndpointConfig) toC(a *cArena) C.aster_endpoint_config_t {
-	return C.aster_endpoint_config_t{
-		struct_size:            C.uint32_t(unsafe.Sizeof(C.aster_endpoint_config_t{})),
-		relay_mode:             C.uint32_t(cfg.RelayMode),
-		secret_key:             a.bytes(cfg.SecretKey),
-		alpns:                  a.list(cfg.ALPNs),
-		relay_urls:             a.list(cfg.RelayURLs),
-		enable_discovery:       boolToUint32(cfg.EnableDiscovery),
-		enable_hooks:           boolToUint32(cfg.EnableHooks),
-		hook_timeout_ms:        C.uint64_t(cfg.HookTimeoutMs),
-		bind_addr:              a.str(cfg.BindAddr),
-		clear_ip_transports:    boolToUint32(cfg.ClearIPTransports),
-		clear_relay_transports: boolToUint32(cfg.ClearRelayTransports),
-		portmapper_config:      C.uint32_t(cfg.PortMapperConfig),
-		proxy_url:              a.str(cfg.ProxyURL),
-		proxy_from_env:         boolToUint32(cfg.ProxyFromEnv),
-		data_dir_utf8:          a.str(cfg.DataDir),
-		hook_failure_mode:      C.uint32_t(cfg.HookFailureMode),
+// toAsterConfig maps the endpoint knobs onto a node config.
+func (cfg *EndpointConfig) toAsterConfig() (AsterConfig, error) {
+	c := DefaultConfig()
+	switch cfg.RelayMode {
+	case RelayModeDefault:
+		c.RelayMode = ""
+	case RelayModeCustom:
+		c.RelayMode = "custom"
+	case RelayModeDisabled:
+		c.RelayMode = "disabled"
+	case RelayModeStaging:
+		c.RelayMode = "staging"
+	default:
+		return c, fmt.Errorf("endpoint config: relay mode %d: %w", cfg.RelayMode, ErrInvalidArgument)
 	}
+	c.RelayURLs = cfg.RelayURLs
+	c.SecretKey = cfg.SecretKey
+	c.ALPNs = cfg.ALPNs
+	c.LocalDiscovery = cfg.EnableDiscovery
+	c.EnableHooks = cfg.EnableHooks
+	c.HookTimeoutMs = cfg.HookTimeoutMs
+	c.HookFailureMode = cfg.HookFailureMode
+	c.BindAddr = cfg.BindAddr
+	c.ClearIPTransports = cfg.ClearIPTransports
+	c.ClearRelayTransports = cfg.ClearRelayTransports
+	if cfg.PortMapperConfig == 1 {
+		c.Portmapper = PortmapperDisabled
+	}
+	c.ProxyURL = cfg.ProxyURL
+	c.ProxyFromEnv = cfg.ProxyFromEnv
+	c.StoragePath = cfg.DataDir
+	c.EnableMonitoring = true // bare endpoints always had monitoring on
+	return c, nil
 }
 
-// Endpoint is a network endpoint that can connect to remote nodes
-// and accept incoming connections.
+// Endpoint connects to remote nodes and accepts incoming connections on its
+// ALPNs. Since ABI 4.0 it is a view of a node (see EndpointConfig); Node
+// returns it for the rest of the node API.
 type Endpoint struct {
 	handle  uint64
 	runtime *Runtime
+	node    *Node
 }
 
-// Handle returns the raw endpoint handle.
+// Handle returns the raw handle (a node handle).
 func (e *Endpoint) Handle() uint64 {
 	return e.handle
 }
 
-// NewEndpoint creates a new endpoint using the given runtime and config.
-//
-// Deprecated: ABI 3.2 deprecates aster_endpoint_create (removed in 4.0). Use
-// StartNode; Node.Connect / Node.Accept cover the endpoint calls.
+// Node returns the node behind this endpoint.
+func (e *Endpoint) Node() *Node { return e.node }
+
+// NewEndpoint starts a node on runtime configured from cfg and returns it as
+// an Endpoint. The endpoint holds a reference to runtime until Close.
 func NewEndpoint(ctx context.Context, runtime *Runtime, cfg EndpointConfig) (*Endpoint, error) {
-	var a cArena
-	defer a.free()
-	configC := cfg.toC(&a)
-
-	var opID C.aster_operation_t
-	r := C.aster_endpoint_create(
-		C.uint64_t(runtime.handle),
-		&configC,
-		0,
-		&opID,
-	)
-	if r != 0 {
-		return nil, fmt.Errorf("aster_endpoint_create: %w", Error(r))
-	}
-
-	ev, err := runtime.Poll(ctx, uint64(opID))
+	acfg, err := cfg.toAsterConfig()
 	if err != nil {
-		return nil, fmt.Errorf("endpoint create poll: %w", err)
+		return nil, err
 	}
-	if ev.Kind != ASTER_EVENT_ENDPOINT_CREATED {
-		return nil, fmt.Errorf("endpoint create: unexpected event %d", ev.Kind)
+	node, err := StartNode(ctx, acfg, NodeOptions{Runtime: runtime})
+	if err != nil {
+		return nil, fmt.Errorf("endpoint create: %w", err)
 	}
-
-	return &Endpoint{
-		handle:  ev.Handle,
-		runtime: runtime,
-	}, nil
+	return &Endpoint{handle: node.handle, runtime: node.runtime, node: node}, nil
 }
 
 // NodeID returns this endpoint's node identifier as a hex string.
-func (e *Endpoint) NodeID() (string, error) {
-	var buf [64]byte
-	var outLen C.uintptr_t
-
-	r := C.aster_endpoint_id(
-		C.uint64_t(e.runtime.handle),
-		C.uint64_t(e.handle),
-		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
-		64,
-		&outLen,
-	)
-	if r != 0 {
-		return "", fmt.Errorf("aster_endpoint_id: %w", Error(r))
-	}
-	if outLen == 0 {
-		return "", nil
-	}
-	return string(buf[:int(outLen)]), nil // already hex text
-}
+func (e *Endpoint) NodeID() (string, error) { return e.node.NodeID() }
 
 // ConnectNodeAddr connects to a remote node using the given NodeAddr and ALPN.
 // This allows direct peer connections without requiring address lookup.
 func (e *Endpoint) ConnectNodeAddr(ctx context.Context, addr *NodeAddr, alpn string) (*Connection, error) {
-	var a cArena
-	defer a.free()
-
-	nodeAddrC := (*C.aster_node_addr_t)(a.alloc(unsafe.Sizeof(C.aster_node_addr_t{})))
-	nodeAddrC.endpoint_id = a.str(addr.EndpointID)
-	nodeAddrC.relay_url = a.str(addr.RelayURL)
-	nodeAddrC.direct_addresses = a.list(addr.DirectAddresses)
-
-	config := (*C.aster_connect_config_t)(a.alloc(unsafe.Sizeof(C.aster_connect_config_t{})))
-	config.struct_size = C.uint32_t(unsafe.Sizeof(C.aster_connect_config_t{}))
-	config.flags = 0
-	config.node_id = a.str(addr.EndpointID)
-	config.alpn = a.str(alpn)
-	config.addr = nodeAddrC
-
-	var opID C.aster_operation_t
-	r := C.aster_connect(
-		C.uint64_t(e.runtime.handle),
-		C.uint64_t(e.handle),
-		config,
-		0,
-		&opID,
-	)
-	if r != 0 {
-		return nil, fmt.Errorf("aster_connect: %w", Error(r))
-	}
-
-	ev, err := e.runtime.Poll(ctx, uint64(opID))
-	if err != nil {
-		return nil, fmt.Errorf("connect poll: %w", err)
-	}
-	if ev.Kind != ASTER_EVENT_CONNECTED {
-		return nil, fmt.Errorf("connect: unexpected event %d", ev.Kind)
-	}
-
-	return &Connection{handle: ev.Handle, runtime: e.runtime}, nil
+	return connectCore(ctx, e.runtime, e.handle, addr, alpn)
 }
 
 // Connect connects to a remote node identified by nodeIDHex using the given ALPN.
@@ -206,154 +153,34 @@ func (e *Endpoint) Connect(ctx context.Context, nodeIDHex, alpn string) (*Connec
 	}
 
 	var opID C.aster_operation_t
-	r := C.aster_connect(
-		C.uint64_t(e.runtime.handle),
-		C.uint64_t(e.handle),
-		&config,
-		0,
-		&opID,
-	)
-	if r != 0 {
-		return nil, fmt.Errorf("aster_connect: %w", Error(r))
+	if err := wrapStatus("aster_connect", C.aster_connect(C.uint64_t(e.runtime.handle), C.uint64_t(e.handle), &config, 0, &opID)); err != nil {
+		return nil, err
 	}
-
-	ev, err := e.runtime.Poll(ctx, uint64(opID))
+	ev, err := e.runtime.await(ctx, uint64(opID))
 	if err != nil {
-		return nil, fmt.Errorf("connect poll: %w", err)
+		return nil, fmt.Errorf("connect %s: %w", alpn, err)
 	}
 	if ev.Kind != ASTER_EVENT_CONNECTED {
-		return nil, fmt.Errorf("connect: unexpected event %d", ev.Kind)
+		return nil, e.runtime.eventError(ev, "aster_connect")
 	}
-
+	e.runtime.releaseEventBuffer(ev)
 	return &Connection{handle: ev.Handle, runtime: e.runtime}, nil
 }
 
-// Accept accepts an incoming connection.
-func (e *Endpoint) Accept(ctx context.Context) (*Connection, error) {
-	var opID C.aster_operation_t
-	r := C.aster_accept(
-		C.uint64_t(e.runtime.handle),
-		C.uint64_t(e.handle),
-		0,
-		&opID,
-	)
-	if r != 0 {
-		return nil, fmt.Errorf("aster_accept: %w", Error(r))
-	}
+// Accept accepts the next incoming connection on one of the endpoint's ALPNs.
+func (e *Endpoint) Accept(ctx context.Context) (*Connection, error) { return e.node.Accept(ctx) }
 
-	ev, err := e.runtime.Poll(ctx, uint64(opID))
-	if err != nil {
-		return nil, fmt.Errorf("accept poll: %w", err)
-	}
-	if ev.Kind != ASTER_EVENT_CONNECTION_ACCEPTED {
-		return nil, fmt.Errorf("accept: unexpected event %d", ev.Kind)
-	}
-
-	return &Connection{handle: ev.Handle, runtime: e.runtime}, nil
-}
-
-// Close closes the endpoint.
+// Close closes the endpoint (its node) and releases the runtime reference.
 func (e *Endpoint) Close(ctx context.Context) error {
-	var opID C.aster_operation_t
-	r := C.aster_endpoint_close(
-		C.uint64_t(e.runtime.handle),
-		C.uint64_t(e.handle),
-		0,
-		&opID,
-	)
-	if r != 0 {
-		return fmt.Errorf("aster_endpoint_close: %w", Error(r))
-	}
-
-	ev, err := e.runtime.Poll(ctx, uint64(opID))
-	if err != nil {
-		return fmt.Errorf("endpoint close poll: %w", err)
-	}
-	if ev.Kind != ASTER_EVENT_CLOSED {
-		return fmt.Errorf("endpoint close: unexpected event %d", ev.Kind)
-	}
-	return nil
+	_ = ctx
+	return e.node.Close()
 }
 
 // AddrInfo returns the structured address of this endpoint.
-func (e *Endpoint) AddrInfo() (*NodeAddr, error) {
-	var addrBuf [4096]byte
-	var addr C.aster_node_addr_t
-
-	r := C.aster_endpoint_addr_info(
-		C.uint64_t(e.runtime.handle),
-		C.uint64_t(e.handle),
-		(*C.uint8_t)(unsafe.Pointer(&addrBuf[0])),
-		4096,
-		&addr,
-	)
-	if r != 0 {
-		return nil, fmt.Errorf("aster_endpoint_addr_info: %w", Error(r))
-	}
-
-	nodeAddr := &NodeAddr{
-		DirectAddresses: []string{},
-	}
-
-	// Read endpoint_id.len from out_addr struct to know the actual length
-	idLen := uintptr(addr.endpoint_id.len)
-	if idLen > 0 {
-		// endpoint_id bytes are at the start of addrBuf
-		nodeAddr.EndpointID = string(addrBuf[:idLen])
-	}
-
-	// Read relay_url from out_addr struct
-	relayLen := uintptr(addr.relay_url.len)
-	if relayLen > 0 {
-		// We need to find where relay_url starts in the buffer.
-		// It comes after: endpoint_id (idLen bytes) + 1 null byte
-		relayStart := idLen + 1
-		if int(relayStart+relayLen) <= len(addrBuf) {
-			nodeAddr.RelayURL = string(addrBuf[relayStart : relayStart+relayLen])
-		}
-	}
-
-	// Read direct_addresses list from out_addr struct
-	daListLen := uintptr(addr.direct_addresses.len)
-	if daListLen > 0 && addr.direct_addresses.items != nil {
-		// The aster_bytes_t array is at the end of the buffer.
-		// Each aster_bytes_t is 16 bytes (ptr + len).
-		// We need to figure out where this array starts.
-		// The array is placed after all the direct_address strings.
-		// We can't easily compute this, so we read from the struct directly.
-		daItems := unsafe.Slice(addr.direct_addresses.items, daListLen)
-		for i := 0; i < int(daListLen); i++ {
-			item := daItems[i]
-			if item.ptr != nil && item.len > 0 {
-				nodeAddr.DirectAddresses = append(nodeAddr.DirectAddresses,
-					C.GoStringN((*C.char)(unsafe.Pointer(item.ptr)), C.int(item.len)))
-			}
-		}
-	}
-
-	return nodeAddr, nil
-}
+func (e *Endpoint) AddrInfo() (*NodeAddr, error) { return e.node.NodeAddr() }
 
 // ExportSecretKey exports this endpoint's 32-byte secret key seed.
-func (e *Endpoint) ExportSecretKey() ([]byte, error) {
-	var buf [32]byte
-	var outLen C.uintptr_t
-
-	r := C.aster_endpoint_export_secret_key(
-		C.uint64_t(e.runtime.handle),
-		C.uint64_t(e.handle),
-		(*C.uint8_t)(unsafe.Pointer(&buf[0])),
-		32,
-		&outLen,
-	)
-	if r != 0 {
-		return nil, fmt.Errorf("aster_endpoint_export_secret_key: %w", Error(r))
-	}
-	if outLen == 0 {
-		return nil, nil
-	}
-	return buf[:outLen], nil
-}
+func (e *Endpoint) ExportSecretKey() ([]byte, error) { return e.node.ExportSecretKey() }
 
 // boolToUint32 converts a bool to uint32 (0 or 1).
 func boolToUint32(b bool) C.uint32_t {

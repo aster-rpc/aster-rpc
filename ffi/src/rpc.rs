@@ -38,7 +38,7 @@ use crate::{
     load_runtime, set_last_error, HandleRegistry,
 };
 
-// The call handle type is shared with the framed `aster_call_*` family.
+// The call handle type and buffer leases live in `call.rs`.
 use crate::call::{aster_call_t, CALL_BUFFERS};
 
 /// Per-call options for `aster_rpc_unary` / `aster_rpc_open`. 72 bytes
@@ -179,8 +179,8 @@ unsafe fn lease_out(
 // Unary
 // ============================================================================
 
-/// One unary call on `connection`'s pooled streams (the Rust form of
-/// `aster_call_unary`): one write of header + request, read to the trailer.
+/// One unary call on `connection`'s pooled streams: one write of header +
+/// request, read to the trailer.
 ///
 /// Returns `OK` once the call is over, whatever its outcome:
 /// - `*out_status_code == 0`: `*out_resp_*` is the response (`{NULL,0}`

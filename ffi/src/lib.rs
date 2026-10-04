@@ -28,7 +28,6 @@ mod layout;
 pub mod node;
 pub mod probe;
 pub mod pure;
-pub mod reactor;
 pub mod rpc;
 pub mod server;
 
@@ -64,10 +63,19 @@ pub mod server;
 //   deadlines, frame limits, baseline services in Rust) and the binding
 //   answers by call id with `aster_dispatch_*` (`server.rs`); payload-level
 //   client `aster_rpc_unary` / `aster_rpc_open` / `aster_call_*_payload`
-//   over the pooled `RpcConnection` (`rpc.rs`). The `aster_reactor_*` and
-//   framed `aster_call_*` functions stay until 4.0.
-pub const ASTER_ABI_VERSION_MAJOR: u32 = 3;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 5;
+//   over the pooled `RpcConnection` (`rpc.rs`).
+// - 4.0.0: removals only -- the reactor (`aster_reactor_*`,
+//   `aster_reactor_call_t`, `ASTER_REACTOR_EVENT_*`, `ASTER_RECV_FRAME_*`),
+//   the framed client calls (`aster_call_{acquire,acquire_streaming,
+//   send_frame,recv_frame,unary}`, `ASTER_CALL_RECV_*`, `ASTER_CALL_ERR_*`),
+//   the 3.2-deprecated node factories (`aster_node_memory`,
+//   `aster_node_memory_with_alpns`, `aster_node_persistent`) and bare
+//   endpoints (`aster_endpoint_create`, `_close`, `_free`, `_id`,
+//   `_export_secret_key`, `_addr_info`, `aster_endpoint_config_t`).
+//   `aster_accept` on a node now reads the node's aster-ALPN accept queue.
+//   See `ffi/RENAME_MAP.md` "4.0".
+pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 0;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -80,6 +88,8 @@ pub const ASTER_ABI_VERSION: u32 =
 
 /// Opaque handle types
 pub type aster_runtime_t = u64;
+/// Since ABI 4.0 there are no bare endpoints: functions taking an
+/// `aster_endpoint_t` take a node handle (`aster_node_t`).
 pub type aster_endpoint_t = u64;
 pub type aster_connection_t = u64;
 pub type aster_send_stream_t = u64;
@@ -142,7 +152,9 @@ pub enum aster_event_kind_t {
     // Lifecycle
     ASTER_EVENT_NODE_CREATED = 1,
     ASTER_EVENT_NODE_CREATE_FAILED = 2,
+    /// Not emitted since ABI 4.0 (`aster_endpoint_create` removed); value reserved.
     ASTER_EVENT_ENDPOINT_CREATED = 3,
+    /// Not emitted since ABI 4.0; value reserved.
     ASTER_EVENT_ENDPOINT_CREATE_FAILED = 4,
     ASTER_EVENT_CLOSED = 5,
 
@@ -317,30 +329,6 @@ pub struct aster_runtime_config_t {
     pub worker_threads: u32,
     pub event_queue_capacity: u32,
     pub reserved: u32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct aster_endpoint_config_t {
-    pub struct_size: u32,
-    /// One of `aster_relay_mode_t`. Unknown values are rejected.
-    pub relay_mode: u32,
-    pub secret_key: aster_bytes_t,
-    pub alpns: aster_bytes_list_t,
-    pub relay_urls: aster_bytes_list_t,
-    pub enable_discovery: u32,
-    pub enable_hooks: u32,    // Phase 1b: 0=disabled, 1=enabled
-    pub hook_timeout_ms: u64, // Phase 1b: 0 = use default (5000ms)
-    // Phase 1d: endpoint builder gaps
-    pub bind_addr: aster_bytes_t, // socket addr string; empty = use default
-    pub clear_ip_transports: u32, // 1 = relay-only mode
-    pub clear_relay_transports: u32, // 1 = direct-IP-only mode
-    pub portmapper_config: u32,   // 0 = enabled (default), 1 = disabled
-    pub proxy_url: aster_bytes_t, // HTTP/SOCKS proxy URL string; empty = none
-    pub proxy_from_env: u32,      // 1 = read HTTP_PROXY/HTTPS_PROXY from env
-    pub data_dir_utf8: aster_bytes_t, // Node data directory; empty = no persistent state
-    /// One of `aster_hook_failure_mode_t` (default 0 = fail-open).
-    pub hook_failure_mode: u32,
 }
 
 #[repr(C)]
@@ -615,7 +603,6 @@ pub(crate) struct BridgeRuntime {
 
     // Handle registries
     pub(crate) nodes: HandleRegistry<CoreNode>,
-    endpoints: HandleRegistry<CoreNetClient>,
     pub(crate) connections: HandleRegistry<CoreConnection>,
     send_streams: HandleRegistry<CoreSendStream>,
     recv_streams: HandleRegistry<CoreRecvStream>,
@@ -643,9 +630,6 @@ pub(crate) struct BridgeRuntime {
 
     // Buffer registry
     buffers: BufferRegistry,
-
-    // Endpoint secret keys: keyed by endpoint handle, stores the 32-byte secret key seed
-    endpoint_secret_keys: Mutex<HashMap<aster_endpoint_t, Vec<u8>>>,
 
     // Registry resolution state (§11.9): persistent round-robin counters + monotonic
     // lease_seq cache, shared across every aster_registry_resolve call so rotation
@@ -702,7 +686,6 @@ impl BridgeRuntime {
             events_tx,
             events_rx: Mutex::new(events_rx),
             nodes: HandleRegistry::new(),
-            endpoints: HandleRegistry::new(),
             connections: HandleRegistry::new(),
             send_streams: HandleRegistry::new(),
             recv_streams: HandleRegistry::new(),
@@ -717,7 +700,6 @@ impl BridgeRuntime {
             node_gates: Mutex::new(HashMap::new()),
             doc_event_receivers: HandleRegistry::new(),
             buffers: BufferRegistry::new(),
-            endpoint_secret_keys: Mutex::new(HashMap::new()),
             registry_state: aster_transport_core::registry::ResolveState::new(),
             registry_acls: Mutex::new(HashMap::new()),
         })
@@ -857,10 +839,6 @@ unsafe fn read_bytes_opt(b: &aster_bytes_t) -> Option<Vec<u8>> {
     } else {
         Some(slice::from_raw_parts(b.ptr, b.len).to_vec())
     }
-}
-
-unsafe fn read_string_opt(b: &aster_bytes_t) -> Option<String> {
-    read_bytes_opt(b).and_then(|v| String::from_utf8(v).ok())
 }
 
 unsafe fn read_string(b: &aster_bytes_t) -> Result<String, i32> {
@@ -1308,7 +1286,7 @@ pub unsafe extern "C" fn aster_last_error_message(buffer: *mut u8, capacity: usi
 
 /// Static, NUL-terminated name for an `aster_status_t` value (passed as the
 /// raw `int32_t` that every function returns). Unknown values (including the
-/// negative `ASTER_CALL_ERR_*` sub-codes) yield `"ASTER_STATUS_UNKNOWN"`.
+/// negative ones) yield `"ASTER_STATUS_UNKNOWN"`.
 #[no_mangle]
 pub extern "C" fn aster_status_name(status: i32) -> *const c_char {
     let s = match status {
@@ -1344,116 +1322,6 @@ pub extern "C" fn aster_status_name(status: i32) -> *const c_char {
 // ============================================================================
 // C FFI Functions - Node
 // ============================================================================
-
-/// Create an in-memory node with default endpoint settings.
-///
-/// **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
-/// `aster_config_t`.
-#[no_mangle]
-pub unsafe extern "C" fn aster_node_memory(
-    runtime: aster_runtime_t,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if out_operation.is_null() {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    let (op_id, cancelled) = bridge.new_operation();
-    unsafe {
-        *out_operation = op_id;
-    }
-
-    let bridge2 = bridge.clone();
-    bridge.runtime.spawn(async move {
-        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
-            return;
-        }
-
-        match CoreNode::memory().await {
-            Ok(node) => {
-                let handle = bridge2.nodes.insert(node);
-                bridge2.emit_simple(
-                    aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
-                    aster_status_t::ASTER_STATUS_OK,
-                    op_id,
-                    handle,
-                    0,
-                    user_data,
-                    0,
-                );
-            }
-            Err(e) => {
-                bridge2.emit_error(op_id, user_data, &e.to_string());
-            }
-        }
-    });
-
-    aster_status_t::ASTER_STATUS_OK as i32
-}
-
-/// Create a persistent node at `path` with default endpoint settings.
-///
-/// **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
-/// `aster_config_t`.
-#[no_mangle]
-pub unsafe extern "C" fn aster_node_persistent(
-    runtime: aster_runtime_t,
-    path: aster_bytes_t,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if out_operation.is_null() {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    let path_str = match unsafe { read_string(&path) } {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    let (op_id, cancelled) = bridge.new_operation();
-    unsafe {
-        *out_operation = op_id;
-    }
-
-    let bridge2 = bridge.clone();
-    bridge.runtime.spawn(async move {
-        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
-            return;
-        }
-
-        match CoreNode::persistent(path_str).await {
-            Ok(node) => {
-                let handle = bridge2.nodes.insert(node);
-                bridge2.emit_simple(
-                    aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
-                    aster_status_t::ASTER_STATUS_OK,
-                    op_id,
-                    handle,
-                    0,
-                    user_data,
-                    0,
-                );
-            }
-            Err(e) => {
-                bridge2.emit_error(op_id, user_data, &e.to_string());
-            }
-        }
-    });
-
-    aster_status_t::ASTER_STATUS_OK as i32
-}
 
 #[no_mangle]
 pub unsafe extern "C" fn aster_node_close(
@@ -1745,320 +1613,6 @@ unsafe fn pack_node_addr(
 // C FFI Functions - Endpoint
 // ============================================================================
 
-/// Create a bare endpoint (no blobs/docs/gossip).
-///
-/// **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start`; a node
-/// covers every endpoint use (connect, accept, hooks, metrics).
-#[no_mangle]
-pub unsafe extern "C" fn aster_endpoint_create(
-    runtime: aster_runtime_t,
-    config: *const aster_endpoint_config_t,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if config.is_null() || out_operation.is_null() {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let expected_struct_size = std::mem::size_of::<aster_endpoint_config_t>() as u32;
-    let actual_struct_size = unsafe { (*config).struct_size };
-    if actual_struct_size != expected_struct_size {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    let cfg = unsafe { *config };
-
-    let enable_hooks = cfg.enable_hooks != 0;
-    let hook_timeout_ms = if cfg.hook_timeout_ms > 0 {
-        cfg.hook_timeout_ms
-    } else {
-        5000
-    };
-    let hook_failure_mode = match cfg.hook_failure_mode {
-        0 => aster_transport_core::trust::HookFailureMode::FailOpen,
-        1 => aster_transport_core::trust::HookFailureMode::FailClosed,
-        _ => return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
-    };
-
-    // Extract secret_key before building core_config so we can store it later
-    let secret_key = unsafe { read_bytes_opt(&cfg.secret_key) };
-
-    let core_config = CoreEndpointConfig {
-        relay_mode: match cfg.relay_mode {
-            0 => None,
-            1 => Some("custom".to_string()),
-            2 => Some("disabled".to_string()),
-            3 => Some("staging".to_string()),
-            _ => return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
-        },
-        relay_urls: unsafe { read_string_list(&cfg.relay_urls) },
-        alpns: if cfg.alpns.items.is_null() || cfg.alpns.len == 0 {
-            Vec::new()
-        } else {
-            unsafe {
-                slice::from_raw_parts(cfg.alpns.items, cfg.alpns.len)
-                    .iter()
-                    .map(|b| read_bytes(b))
-                    .collect()
-            }
-        },
-        secret_key: secret_key.clone(),
-        enable_discovery: cfg.enable_discovery != 0,
-        enable_monitoring: true, // Always enable monitoring for FFI endpoints
-        enable_hooks,
-        hook_timeout_ms,
-        hook_failure_mode,
-        // Phase 1d fields: read from the C struct (added in aster_endpoint_config_t).
-        bind_addr: unsafe { read_string_opt(&cfg.bind_addr) },
-        clear_ip_transports: cfg.clear_ip_transports != 0,
-        clear_relay_transports: cfg.clear_relay_transports != 0,
-        portmapper_config: match cfg.portmapper_config {
-            0 => None, // 0 = enabled (default) → let build_endpoint_config use its default
-            1 => Some("disabled".to_string()),
-            _ => None,
-        },
-        proxy_url: unsafe { read_string_opt(&cfg.proxy_url) },
-        proxy_from_env: cfg.proxy_from_env != 0,
-        transport_max_concurrent_bidi_streams: None,
-        transport_max_concurrent_uni_streams: None,
-        transport_stream_receive_window: None,
-        transport_receive_window: None,
-        transport_send_window: None,
-        transport_max_idle_timeout_ms: None,
-        transport_keep_alive_interval_ms: None,
-        transport_initial_mtu: None,
-        transport_datagram_receive_buffer_size: None,
-        transport_datagram_send_buffer_size: None,
-        transport_send_fairness: None,
-        transport_enable_segmentation_offload: None,
-        data_dir: unsafe { read_string_opt(&cfg.data_dir_utf8) },
-    };
-
-    let (op_id, cancelled) = bridge.new_operation();
-    unsafe {
-        *out_operation = op_id;
-    }
-
-    let bridge2 = bridge.clone();
-    bridge.runtime.spawn(async move {
-        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
-            return;
-        }
-
-        match CoreNetClient::create_with_config(core_config).await {
-            Ok(endpoint) => {
-                // Take the hook receiver before inserting endpoint into the registry.
-                let hook_receiver = if enable_hooks {
-                    endpoint.take_hook_receiver()
-                } else {
-                    None
-                };
-
-                let handle = bridge2.endpoints.insert(endpoint);
-
-                // Store the secret key seed for later export via aster_endpoint_export_secret_key
-                if let Some(ref key) = secret_key {
-                    let mut keys = bridge2.endpoint_secret_keys.lock().unwrap();
-                    keys.insert(handle, key.clone());
-                }
-
-                bridge2.emit_simple(
-                    aster_event_kind_t::ASTER_EVENT_ENDPOINT_CREATED,
-                    aster_status_t::ASTER_STATUS_OK,
-                    op_id,
-                    handle,
-                    0,
-                    user_data,
-                    0,
-                );
-
-                // Drain hook events onto the completion queue.
-                if let Some(receiver) = hook_receiver {
-                    node::spawn_hook_drainers(&bridge2, handle, user_data, receiver, None);
-                }
-            }
-            Err(e) => {
-                bridge2.emit_error(op_id, user_data, &e.to_string());
-            }
-        }
-    });
-
-    aster_status_t::ASTER_STATUS_OK as i32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn aster_endpoint_close(
-    runtime: aster_runtime_t,
-    endpoint: aster_endpoint_t,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if out_operation.is_null() {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    let ep_arc = match bridge.endpoints.get(endpoint) {
-        Some(e) => e,
-        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
-    };
-
-    let (op_id, cancelled) = bridge.new_operation();
-    unsafe {
-        *out_operation = op_id;
-    }
-
-    let bridge2 = bridge.clone();
-    bridge.runtime.spawn(async move {
-        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
-            return;
-        }
-
-        ep_arc.close().await;
-        bridge2.endpoints.remove(endpoint);
-
-        // Remove the secret key from the registry
-        bridge2
-            .endpoint_secret_keys
-            .lock()
-            .unwrap()
-            .remove(&endpoint);
-
-        bridge2.emit_simple(
-            aster_event_kind_t::ASTER_EVENT_CLOSED,
-            aster_status_t::ASTER_STATUS_OK,
-            op_id,
-            endpoint,
-            0,
-            user_data,
-            0,
-        );
-    });
-
-    aster_status_t::ASTER_STATUS_OK as i32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn aster_endpoint_id(
-    runtime: aster_runtime_t,
-    endpoint: aster_endpoint_t,
-    out_buf: *mut u8,
-    capacity: usize,
-    out_len: *mut usize,
-) -> i32 {
-    if out_len.is_null() {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    let ep_arc = match bridge.endpoints.get(endpoint) {
-        Some(e) => e,
-        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
-    };
-
-    let id = ep_arc.endpoint_id();
-    let len = id.len();
-
-    *out_len = len;
-
-    if capacity < len {
-        return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
-    }
-
-    if !out_buf.is_null() && len > 0 {
-        unsafe {
-            ptr::copy_nonoverlapping(id.as_ptr(), out_buf, len);
-        }
-    }
-
-    aster_status_t::ASTER_STATUS_OK as i32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn aster_endpoint_export_secret_key(
-    runtime: aster_runtime_t,
-    endpoint: aster_endpoint_t,
-    out_buf: *mut u8,
-    capacity: usize,
-    out_len: *mut usize,
-) -> i32 {
-    if out_len.is_null() {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    // Check endpoint exists to return NOT_FOUND (keys are removed when endpoint is closed)
-    let _ep = match bridge.endpoints.get(endpoint) {
-        Some(e) => e,
-        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
-    };
-
-    let keys = bridge.endpoint_secret_keys.lock().unwrap();
-    let key = match keys.get(&endpoint) {
-        Some(k) => k,
-        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
-    };
-
-    let len = key.len();
-
-    *out_len = len;
-
-    if capacity < len {
-        return aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32;
-    }
-
-    if !out_buf.is_null() && len > 0 {
-        unsafe {
-            ptr::copy_nonoverlapping(key.as_ptr(), out_buf, len);
-        }
-    }
-
-    aster_status_t::ASTER_STATUS_OK as i32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn aster_endpoint_addr_info(
-    runtime: aster_runtime_t,
-    endpoint: aster_endpoint_t,
-    out_buf: *mut u8,
-    buf_capacity: usize,
-    out_addr: *mut aster_node_addr_t,
-) -> i32 {
-    if out_addr.is_null() {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    let ep_arc = match bridge.endpoints.get(endpoint) {
-        Some(e) => e,
-        None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
-    };
-
-    let addr = ep_arc.endpoint_addr_info();
-    pack_node_addr(&addr, out_buf, buf_capacity, out_addr)
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn aster_stream_stop(
     runtime: aster_runtime_t,
@@ -2104,14 +1658,10 @@ pub unsafe extern "C" fn aster_connect(
         Err(s) => return s as i32,
     };
 
-    // Try to get as endpoint first, then as node
-    let ep_arc = bridge.endpoints.get(endpoint_or_node).or_else(|| {
-        bridge
-            .nodes
-            .get(endpoint_or_node)
-            .map(|n| n.net_client())
-            .map(Arc::new)
-    });
+    let ep_arc = bridge
+        .nodes
+        .get(endpoint_or_node)
+        .map(|n| Arc::new(n.net_client()));
 
     let ep = match ep_arc {
         Some(e) => e,
@@ -2203,10 +1753,18 @@ pub unsafe extern "C" fn aster_connect(
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
+/// Accept the next inbound connection of a node (`aster_node_start`).
+///
+/// Since ABI 4.0 this takes the connection from the node's aster-ALPN accept
+/// queue (the same queue `aster_node_accept_aster` reads: connections on the
+/// node's configured ALPNs that the router hands over) and emits
+/// `ASTER_EVENT_CONNECTION_ACCEPTED` with `handle` = connection, `related` =
+/// node. Before 4.0 it called the endpoint's accept directly, racing the
+/// node's router. Unknown handle -> `NOT_FOUND`.
 #[no_mangle]
 pub unsafe extern "C" fn aster_accept(
     runtime: aster_runtime_t,
-    endpoint_or_node: u64,
+    node: aster_node_t,
     user_data: u64,
     out_operation: *mut aster_operation_t,
 ) -> i32 {
@@ -2219,16 +1777,8 @@ pub unsafe extern "C" fn aster_accept(
         Err(s) => return s as i32,
     };
 
-    let ep_arc = bridge.endpoints.get(endpoint_or_node).or_else(|| {
-        bridge
-            .nodes
-            .get(endpoint_or_node)
-            .map(|n| n.net_client())
-            .map(Arc::new)
-    });
-
-    let ep = match ep_arc {
-        Some(e) => e,
+    let node_arc = match bridge.nodes.get(node) {
+        Some(n) => n,
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
@@ -2243,15 +1793,15 @@ pub unsafe extern "C" fn aster_accept(
             return;
         }
 
-        match ep.accept().await {
-            Ok(conn) => {
+        match node_arc.accept_aster().await {
+            Ok((_alpn, conn)) => {
                 let handle = bridge2.connections.insert(conn);
                 bridge2.emit_simple(
                     aster_event_kind_t::ASTER_EVENT_CONNECTION_ACCEPTED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
                     handle,
-                    endpoint_or_node,
+                    node,
                     user_data,
                     0,
                 );
@@ -2268,71 +1818,6 @@ pub unsafe extern "C" fn aster_accept(
 // ============================================================================
 // Phase 1e: Unified Aster Node — custom ALPNs on the shared iroh Router
 // ============================================================================
-
-/// Create an in-memory node with blobs/docs/gossip + custom aster ALPNs.
-/// Emits ASTER_EVENT_NODE_CREATED on success.
-///
-/// **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
-/// `aster_config_t`.
-#[no_mangle]
-pub unsafe extern "C" fn aster_node_memory_with_alpns(
-    runtime: aster_runtime_t,
-    alpns: *const *const u8,
-    alpn_lens: *const usize,
-    alpn_count: usize,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if out_operation.is_null() {
-        return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
-    }
-
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    // Extract ALPN byte slices.
-    let aster_alpns: Vec<Vec<u8>> = (0..alpn_count)
-        .map(|i| unsafe {
-            let ptr = *alpns.add(i);
-            let len = *alpn_lens.add(i);
-            std::slice::from_raw_parts(ptr, len).to_vec()
-        })
-        .collect();
-
-    let (op_id, cancelled) = bridge.new_operation();
-    unsafe {
-        *out_operation = op_id;
-    }
-
-    let bridge2 = bridge.clone();
-    bridge.runtime.spawn(async move {
-        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
-            return;
-        }
-
-        match aster_transport_core::CoreNode::memory_with_alpns(aster_alpns, None).await {
-            Ok(node) => {
-                let handle = bridge2.nodes.insert(node);
-                bridge2.emit_simple(
-                    aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
-                    aster_status_t::ASTER_STATUS_OK,
-                    op_id,
-                    handle,
-                    0,
-                    user_data,
-                    0,
-                );
-            }
-            Err(e) => {
-                bridge2.emit_error(op_id, user_data, &e.to_string());
-            }
-        }
-    });
-
-    aster_status_t::ASTER_STATUS_OK as i32
-}
 
 /// Pull the next incoming aster-ALPN connection from the node's queue.
 /// Long-poll: spawns a tokio task, emits ASTER_EVENT_ASTER_ACCEPTED when a
@@ -3293,9 +2778,8 @@ pub unsafe extern "C" fn aster_stream_stopped(
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
-/// Add a peer address to the address lookup of an endpoint **or node**
-/// (nodes accepted since ABI 3.3), so later dials and blob/doc fetches by
-/// node id can reach it.
+/// Add a peer address to the address lookup of a node, so later dials and
+/// blob/doc fetches by node id can reach it.
 #[no_mangle]
 pub unsafe extern "C" fn aster_add_node_addr(
     runtime: aster_runtime_t,
@@ -3306,11 +2790,7 @@ pub unsafe extern "C" fn aster_add_node_addr(
         Ok(b) => b,
         Err(s) => return s as i32,
     };
-    let ep_arc = match bridge
-        .endpoints
-        .get(endpoint)
-        .or_else(|| bridge.nodes.get(endpoint).map(|n| Arc::new(n.net_client())))
-    {
+    let ep_arc = match bridge.nodes.get(endpoint).map(|n| Arc::new(n.net_client())) {
         Some(e) => e,
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
@@ -3377,23 +2857,6 @@ pub unsafe extern "C" fn aster_node_free(runtime: aster_runtime_t, node: aster_n
 
     node::forget_node(&bridge, node);
     if bridge.nodes.remove(node).is_some() {
-        aster_status_t::ASTER_STATUS_OK as i32
-    } else {
-        aster_status_t::ASTER_STATUS_NOT_FOUND as i32
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn aster_endpoint_free(
-    runtime: aster_runtime_t,
-    endpoint: aster_endpoint_t,
-) -> i32 {
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
-    };
-
-    if bridge.endpoints.remove(endpoint).is_some() {
         aster_status_t::ASTER_STATUS_OK as i32
     } else {
         aster_status_t::ASTER_STATUS_NOT_FOUND as i32
@@ -6136,12 +5599,10 @@ pub unsafe extern "C" fn aster_endpoint_remote_info(
         Err(s) => return s as i32,
     };
 
-    let ep_arc = bridge.endpoints.get(endpoint_or_node).or_else(|| {
-        bridge
-            .nodes
-            .get(endpoint_or_node)
-            .map(|n| Arc::new(n.net_client()))
-    });
+    let ep_arc = bridge
+        .nodes
+        .get(endpoint_or_node)
+        .map(|n| Arc::new(n.net_client()));
 
     let ep = match ep_arc {
         Some(e) => e,
@@ -6221,12 +5682,10 @@ pub unsafe extern "C" fn aster_endpoint_remote_info_list(
         Err(s) => return s as i32,
     };
 
-    let ep_arc = bridge.endpoints.get(endpoint_or_node).or_else(|| {
-        bridge
-            .nodes
-            .get(endpoint_or_node)
-            .map(|n| Arc::new(n.net_client()))
-    });
+    let ep_arc = bridge
+        .nodes
+        .get(endpoint_or_node)
+        .map(|n| Arc::new(n.net_client()));
 
     let ep = match ep_arc {
         Some(e) => e,
@@ -6562,12 +6021,10 @@ pub unsafe extern "C" fn aster_endpoint_transport_metrics(
         Err(s) => return s as i32,
     };
 
-    let ep_arc = bridge.endpoints.get(endpoint_or_node).or_else(|| {
-        bridge
-            .nodes
-            .get(endpoint_or_node)
-            .map(|n| Arc::new(n.net_client()))
-    });
+    let ep_arc = bridge
+        .nodes
+        .get(endpoint_or_node)
+        .map(|n| Arc::new(n.net_client()));
 
     let client = match ep_arc {
         Some(c) => c,
@@ -7051,35 +6508,52 @@ pub fn run_soak_test(duration_secs: u64) {
         }
     }
 
+    fn poll_for_handle(
+        runtime: aster_runtime_t,
+        kind: aster_event_kind_t,
+        timeout_ms: u32,
+    ) -> Option<u64> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        while Instant::now() < deadline {
+            let mut events = unsafe { [std::mem::zeroed::<aster_event_t>(); 4] };
+            let count = unsafe { aster_poll_events(runtime, events.as_mut_ptr(), 4, 50) };
+            if let Some(ev) = events.iter().take(count).find(|ev| ev.kind == kind as u32) {
+                return Some(ev.handle);
+            }
+        }
+        None
+    }
+
     fn run_soak_cycle(runtime: aster_runtime_t, metrics: &Arc<SoakMetrics>) -> bool {
         drain_all_events(runtime);
 
-        let alpns = [b"aster".as_ptr()];
-        let alpn_lens = [5];
+        let alpns = [aster_bytes_t {
+            ptr: b"aster".as_ptr(),
+            len: 5,
+        }];
+        let mut cfg: node::aster_config_t = unsafe { std::mem::zeroed() };
+        if unsafe { node::aster_config_init(&mut cfg) } != aster_status_t::ASTER_STATUS_OK as i32 {
+            return false;
+        }
+        cfg.alpns = aster_bytes_list_t {
+            items: alpns.as_ptr(),
+            len: alpns.len(),
+        };
 
         let mut node_op: aster_operation_t = 0;
-        let status = unsafe {
-            aster_node_memory_with_alpns(
-                runtime,
-                alpns.as_ptr(),
-                alpn_lens.as_ptr(),
-                1,
-                0,
-                &mut node_op,
-            )
-        };
+        let status = unsafe { node::aster_node_start(runtime, &cfg, 0, 0, &mut node_op) };
         if status != aster_status_t::ASTER_STATUS_OK as i32 {
             return false;
         }
 
-        let node_created =
-            poll_for_event(runtime, aster_event_kind_t::ASTER_EVENT_NODE_CREATED, 2000);
-        if !node_created {
+        let Some(node) =
+            poll_for_handle(runtime, aster_event_kind_t::ASTER_EVENT_NODE_CREATED, 2000)
+        else {
             return false;
-        }
+        };
 
         let mut accept_op: aster_operation_t = 0;
-        let status = unsafe { aster_node_accept_aster(runtime, 1, 0, &mut accept_op) };
+        let status = unsafe { aster_node_accept_aster(runtime, node, 0, &mut accept_op) };
         if status != aster_status_t::ASTER_STATUS_OK as i32 {
             return false;
         }
@@ -7109,7 +6583,7 @@ pub fn run_soak_test(duration_secs: u64) {
         }
 
         let mut close_op: aster_operation_t = 0;
-        let status = unsafe { aster_node_close(runtime, 1, 0, &mut close_op) };
+        let status = unsafe { aster_node_close(runtime, node, 0, &mut close_op) };
         if status == aster_status_t::ASTER_STATUS_OK as i32 {
             let _closed = poll_for_event(runtime, aster_event_kind_t::ASTER_EVENT_CLOSED, 2000);
         }

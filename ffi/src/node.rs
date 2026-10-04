@@ -4,8 +4,8 @@
 //! an [`aster::AsterConfig`] through [`aster::Node::start`], so the C ABI, the
 //! Rust SDK and the other bindings resolve configuration (env / TOML / secret
 //! key file) the same way. The started node is an ordinary `aster_node_t`:
-//! every existing node function (blobs, docs, gossip, tags, reactor,
-//! `aster_node_accept_aster`, `aster_connect`-free paths) works on it.
+//! every node function (blobs, docs, gossip, tags, `aster_server_*`,
+//! `aster_node_accept_aster`, `aster_accept`, `aster_connect`) works on it.
 //!
 //! # `aster_config_t` ownership
 //!
@@ -1024,8 +1024,9 @@ pub unsafe extern "C" fn aster_admission_respond(
 /// forces `enable_hooks` on. With hooks on and no gate, admission events are
 /// raised for the caller to answer with `aster_admission_respond`.
 ///
-/// Replaces `aster_node_memory`, `aster_node_memory_with_alpns`,
-/// `aster_node_persistent` and `aster_endpoint_create` for new code.
+/// The only way to create a node or endpoint since ABI 4.0 (the
+/// `aster_node_memory*` / `aster_node_persistent` / `aster_endpoint_create`
+/// factories were removed).
 #[no_mangle]
 pub unsafe extern "C" fn aster_node_start(
     runtime: aster_runtime_t,

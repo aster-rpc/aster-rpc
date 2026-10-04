@@ -4,7 +4,6 @@ import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
-import site.aster.config.EndpointConfig;
 import site.aster.event.IrohEvent;
 import site.aster.ffi.*;
 import site.aster.tracker.LeakTracker;
@@ -131,53 +130,6 @@ public class IrohRuntime implements AutoCloseable {
   /** Returns the operation registry for direct use. */
   public OperationRegistry operations() {
     return registry;
-  }
-
-  /**
-   * Create a new endpoint asynchronously.
-   *
-   * @param config the endpoint configuration
-   * @return a future that completes with a new IrohEndpoint
-   */
-  public CompletableFuture<IrohEndpoint> endpointCreateAsync(EndpointConfig config) {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-
-    MemorySegment configSeg = config.toNative(alloc);
-
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    var endpointCreate =
-        lib.getHandle(
-            "aster_endpoint_create",
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_INT,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS));
-
-    try {
-      int status = (int) endpointCreate.invoke(handle, configSeg, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_endpoint_create failed: " + status);
-      }
-    } catch (Throwable t) {
-      throw new IrohException("aster_endpoint_create threw: " + t.getMessage());
-    }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    CompletableFuture<IrohEvent> opFuture = registry.register(opId);
-
-    return opFuture.thenApply(
-        event -> {
-          if (event.kind() == IrohEventKind.ENDPOINT_CREATED) {
-            return new IrohEndpoint(this, event.handle());
-          }
-          throw new IrohException("endpoint create failed: unexpected event " + event.kind());
-        });
   }
 
   @Override

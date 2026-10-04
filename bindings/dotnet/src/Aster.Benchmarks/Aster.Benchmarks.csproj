@@ -6,9 +6,6 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <!-- These projects deliberately keep exercising the endpoint API that ABI 3.2
-         deprecated (aster_endpoint_create, removed in 4.0). -->
-    <NoWarn>$(NoWarn);CS0618</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

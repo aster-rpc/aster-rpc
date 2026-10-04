@@ -559,6 +559,9 @@ public final class AsterServer implements AutoCloseable {
   private void failWith(long callId, Throwable t) {
     if (t instanceof RpcError e) {
       fail(callId, e.code(), e.rpcMessage(), e.details());
+    } else if (t instanceof java.util.concurrent.CancellationException) {
+      // Dispatch.recv observed the call's (or the handler thread's) cancellation.
+      fail(callId, StatusCode.CANCELLED, t.getMessage(), null);
     } else {
       fail(
           callId,

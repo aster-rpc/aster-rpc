@@ -31,11 +31,11 @@ public class NodeTests
     }
 
     [Fact]
-    public void Abi_Is_At_Least_3_4()
+    public void Abi_Is_4_x()
     {
         var (major, minor, _) = Runtime.Version;
-        Assert.Equal(3, major);
-        Assert.True(minor >= (int)Native.RequiredAbiMinor, $"native library ABI 3.{minor} < 3.{Native.RequiredAbiMinor}");
+        Assert.Equal(4, major);
+        Assert.True(minor >= (int)Native.RequiredAbiMinor, $"native library ABI 4.{minor} < 4.{Native.RequiredAbiMinor}");
     }
 
     [Fact]
@@ -253,10 +253,30 @@ public class NodeTests
     }
 
     [Fact]
-    [Obsolete("exercises the deprecated factory")]
-    public async Task Deprecated_MemoryWithAlpns_Still_Works()
+    public async Task Endpoint_Is_A_Node_Handle()
     {
-        using var node = await Node.MemoryWithAlpnsAsync([AsterServer.AsterAlpn]);
-        Assert.Equal(64, node.NodeId().Length);
+        // ABI 4.0 removed bare endpoints: Endpoint.CreateAsync starts a node, so the node
+        // functions accept its handle and report the same id.
+        using var runtime = new Runtime();
+        var ep = await Endpoint.CreateAsync(runtime, new EndpointConfigBuilder().Alpn("ep-node").EnableDiscovery(false));
+        IntPtr buf = System.Runtime.InteropServices.Marshal.AllocHGlobal(65);
+        try
+        {
+            Native.Check(Native.aster_node_id(runtime.Handle, ep.Handle.Value, buf, (UIntPtr)65, out UIntPtr len), "aster_node_id");
+            Assert.Equal(ep.NodeId(), System.Runtime.InteropServices.Marshal.PtrToStringUTF8(buf, (int)len));
+        }
+        finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(buf); }
+        await ep.CloseAsync();
+    }
+
+    [Fact]
+    public void EndpointConfigBuilder_Maps_To_AsterConfig()
+    {
+        var cfg = new EndpointConfigBuilder().Alpn("a").Alpns(["b"]).SetRelayMode(RelayMode.Disabled)
+            .EnableDiscovery(false).ToAsterConfig();
+        Assert.Equal(new[] { "a", "b" }, cfg.Alpns);
+        Assert.Equal("disabled", cfg.RelayMode);
+        Assert.False(cfg.LocalDiscovery);
+        Assert.Null(new EndpointConfigBuilder().ToAsterConfig().RelayMode);
     }
 }

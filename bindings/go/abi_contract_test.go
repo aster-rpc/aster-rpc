@@ -3,8 +3,10 @@
 package aster
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -16,7 +18,6 @@ func TestABI_StructSizes(t *testing.T) {
 	want := map[string]uintptr{
 		"aster_event_t":              80,
 		"aster_runtime_config_t":     16,
-		"aster_endpoint_config_t":    152,
 		"aster_connect_config_t":     48,
 		"aster_node_addr_t":          48,
 		"aster_bytes_t":              16,
@@ -50,8 +51,8 @@ func TestABI_VersionMatchesHeader(t *testing.T) {
 	if got := major<<16 | minor<<8 | patch; got != headerABIVersion {
 		t.Errorf("library ABI %#x != header ASTER_ABI_VERSION %#x", got, headerABIVersion)
 	}
-	if major != 3 || ABIVersionMajor != 3 {
-		t.Errorf("expected ABI major 3, lib=%d binding=%d", major, ABIVersionMajor)
+	if major != 4 || ABIVersionMajor != 4 {
+		t.Errorf("expected ABI major 4, lib=%d binding=%d", major, ABIVersionMajor)
 	}
 	if err := CheckABI(); err != nil {
 		t.Fatal(err)
@@ -70,9 +71,9 @@ func TestABI_StatusName(t *testing.T) {
 	}
 }
 
-// Endpoint creation used to send a hand-built config with struct_size=56,
-// which the library rejects; this exercises the header-typed config.
-func TestABI_EndpointCreateUsesHeaderLayout(t *testing.T) {
+// ABI 4.0: an Endpoint is a node started by aster_node_start (bare
+// endpoints were removed); id, address and secret key come from the node.
+func TestABI_EndpointIsNodeBacked(t *testing.T) {
 	rt, err := NewRuntime(t.Context(), DefaultRuntimeConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -89,5 +90,68 @@ func TestABI_EndpointCreateUsesHeaderLayout(t *testing.T) {
 	id, err := ep.NodeID()
 	if err != nil || len(id) != 64 {
 		t.Fatalf("NodeID = %q, %v (want 64 hex chars)", id, err)
+	}
+	if ep.Node() == nil || ep.Node().Handle() != ep.Handle() {
+		t.Fatal("endpoint is not a view of its node")
+	}
+	addr, err := ep.AddrInfo()
+	if err != nil || addr.EndpointID != id {
+		t.Fatalf("AddrInfo = %+v, %v", addr, err)
+	}
+	if err := ep.Close(t.Context()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// ABI 4.0: two endpoints talk on a custom ALPN; Accept takes the connection
+// from the node's ALPN queue (aster_accept on a node handle).
+func TestEndpoint_ConnectAccept(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	rt, err := NewRuntime(ctx, DefaultRuntimeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	cfg := DefaultEndpointConfig()
+	cfg.RelayMode = RelayModeDisabled
+	cfg.EnableDiscovery = false
+	cfg.BindAddr = "127.0.0.1:0"
+	cfg.ALPNs = []string{"go/ep-test"}
+	server, err := NewEndpoint(ctx, rt, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close(ctx)
+	client, err := NewEndpoint(ctx, rt, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close(ctx)
+	addr, err := server.AddrInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan *Connection, 1)
+	go func() {
+		c, err := server.Accept(ctx)
+		if err != nil {
+			t.Errorf("Accept: %v", err)
+		}
+		accepted <- c
+	}()
+	conn, err := client.ConnectNodeAddr(ctx, addr, "go/ep-test")
+	if err != nil {
+		t.Fatalf("ConnectNodeAddr: %v", err)
+	}
+	defer conn.Close("done")
+	select {
+	case c := <-accepted:
+		if c == nil {
+			t.Fatal("no accepted connection")
+		}
+		defer c.Close("done")
+	case <-ctx.Done():
+		t.Fatal("accept timed out")
 	}
 }

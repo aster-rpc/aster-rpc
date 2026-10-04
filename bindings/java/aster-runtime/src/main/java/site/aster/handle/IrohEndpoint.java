@@ -10,25 +10,19 @@ public class IrohEndpoint extends IrohHandle {
 
   private final IrohRuntime runtime;
 
-  /** True when {@code handle} is an {@code aster_node_t} (started by {@code aster_node_start}). */
-  private final boolean nodeBacked;
-
-  IrohEndpoint(IrohRuntime runtime, long handle) {
-    this(runtime, handle, false);
-  }
-
-  private IrohEndpoint(IrohRuntime runtime, long handle, boolean nodeBacked) {
-    super(handle);
+  private IrohEndpoint(IrohRuntime runtime, long nodeHandle) {
+    super(nodeHandle);
     this.runtime = runtime;
-    this.nodeBacked = nodeBacked;
   }
 
   /**
-   * View a node (from {@code aster_node_start}) as an endpoint: connect/accept work on node handles
-   * directly; id, address, secret key and close use the node functions. Closing it closes the node.
+   * View a node (from {@code aster_node_start}) as an endpoint. ABI 4.0 removed bare endpoints, so
+   * every endpoint is node-backed: connect/accept take the node handle directly (accept pulls from
+   * the node's ALPN accept queue); id, address, secret key and close use the node functions.
+   * Closing it closes the node.
    */
   public static IrohEndpoint ofNode(IrohRuntime runtime, long nodeHandle) {
-    return new IrohEndpoint(runtime, nodeHandle, true);
+    return new IrohEndpoint(runtime, nodeHandle);
   }
 
   @Override
@@ -39,7 +33,7 @@ public class IrohEndpoint extends IrohHandle {
   /** Cleaner cannot call async FFI. This is a no-op; explicit {@link #close()} must be called. */
   @Override
   protected void freeNative(long handle) {
-    // Cannot call async aster_endpoint_close from Cleaner.
+    // Cannot call async aster_node_close from Cleaner.
     // Explicit close() is required.
     System.err.println("IrohEndpoint: close() not called, handle " + handle + " leaked");
   }
@@ -51,7 +45,7 @@ public class IrohEndpoint extends IrohHandle {
   /**
    * Get this endpoint's node ID as a 64-char hex string.
    *
-   * <p>The FFI {@code aster_endpoint_id} returns an already-hex-encoded ASCII buffer (Rust's {@code
+   * <p>The FFI {@code aster_node_id} returns an already-hex-encoded ASCII buffer (Rust's {@code
    * NodeId::to_string()}); the Java wrapper decodes those bytes as UTF-8 rather than hex-encoding
    * them again. Re-hexing was a latent bug that doubled the length to 128 chars.
    */
@@ -64,12 +58,9 @@ public class IrohEndpoint extends IrohHandle {
     var bufSeg = alloc.allocate(64);
     var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    int status =
-        nodeBacked
-            ? lib.nodeId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg)
-            : lib.endpointId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
+    int status = lib.nodeId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
     if (status != 0) {
-      throw new IrohException(IrohStatus.fromCode(status), "aster_endpoint_id failed: " + status);
+      throw new IrohException(IrohStatus.fromCode(status), "aster_node_id failed: " + status);
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -98,13 +89,10 @@ public class IrohEndpoint extends IrohHandle {
     // Use explicit size to ensure proper allocation
     MemorySegment addrSeg = alloc.allocate(48);
 
-    int status =
-        nodeBacked
-            ? lib.nodeAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg)
-            : lib.endpointAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg);
+    int status = lib.nodeAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg);
     if (status != 0) {
       throw new IrohException(
-          IrohStatus.fromCode(status), "aster_endpoint_addr_info failed: " + status);
+          IrohStatus.fromCode(status), "aster_node_addr_info failed: " + status);
     }
 
     String endpointId = readIrohBytes(addrSeg.asSlice(0, 16));
@@ -331,7 +319,7 @@ public class IrohEndpoint extends IrohHandle {
 
     var endpointClose =
         lib.getHandle(
-            nodeBacked ? "aster_node_close" : "aster_endpoint_close",
+            "aster_node_close",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -343,11 +331,10 @@ public class IrohEndpoint extends IrohHandle {
       // runtime, endpoint, user_data, out_operation
       int status = (int) endpointClose.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
       if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_endpoint_close failed: " + status);
+        throw new IrohException(IrohStatus.fromCode(status), "aster_node_close failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("aster_endpoint_close threw: " + t.getMessage());
+      throw new IrohException("aster_node_close threw: " + t.getMessage());
     }
 
     long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
@@ -384,7 +371,7 @@ public class IrohEndpoint extends IrohHandle {
 
     var exportSecretKey =
         lib.getHandle(
-            nodeBacked ? "aster_node_export_secret_key" : "aster_endpoint_export_secret_key",
+            "aster_node_export_secret_key",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_LONG,
@@ -398,10 +385,10 @@ public class IrohEndpoint extends IrohHandle {
           (int) exportSecretKey.invoke(runtime.nativeHandle(), nativeHandle(), bufSeg, 32L, lenSeg);
       if (status != 0) {
         throw new IrohException(
-            IrohStatus.fromCode(status), "aster_endpoint_export_secret_key failed: " + status);
+            IrohStatus.fromCode(status), "aster_node_export_secret_key failed: " + status);
       }
     } catch (Throwable t) {
-      throw new IrohException("aster_endpoint_export_secret_key threw: " + t.getMessage());
+      throw new IrohException("aster_node_export_secret_key threw: " + t.getMessage());
     }
 
     int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);

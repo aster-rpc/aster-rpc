@@ -166,55 +166,55 @@ pub fn default_runtime_config() -> aster_transport_ffi::aster_runtime_config_t {
     }
 }
 
-/// Helper to create an empty endpoint config
-#[cfg(test)]
-pub fn empty_endpoint_config() -> aster_transport_ffi::aster_endpoint_config_t {
-    aster_transport_ffi::aster_endpoint_config_t {
-        struct_size: std::mem::size_of::<aster_transport_ffi::aster_endpoint_config_t>() as u32,
-        relay_mode: aster_transport_ffi::aster_relay_mode_t::ASTER_RELAY_MODE_DEFAULT as u32,
-        secret_key: aster_transport_ffi::aster_bytes_t {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        alpns: aster_transport_ffi::aster_bytes_list_t {
-            items: std::ptr::null(),
-            len: 0,
-        },
-        relay_urls: aster_transport_ffi::aster_bytes_list_t {
-            items: std::ptr::null(),
-            len: 0,
-        },
-        enable_discovery: 0,
-        enable_hooks: 0,
-        hook_timeout_ms: 0,
-        bind_addr: aster_transport_ffi::aster_bytes_t {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        clear_ip_transports: 0,
-        clear_relay_transports: 0,
-        portmapper_config: 0,
-        proxy_url: aster_transport_ffi::aster_bytes_t {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        proxy_from_env: 0,
-        data_dir_utf8: aster_transport_ffi::aster_bytes_t {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
-        hook_failure_mode:
-            aster_transport_ffi::aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_OPEN as u32,
-    }
+/// Start an in-memory node (`aster_node_start`) serving `alpns`, relays off,
+/// bound to loopback. Returns the status; the node arrives as
+/// `ASTER_EVENT_NODE_CREATED` for `*out_op`. The config is copied before
+/// `aster_node_start` returns, so the locals here may go away.
+pub unsafe fn node_start_with_alpns(
+    runtime: aster_runtime_t,
+    alpns: &[&[u8]],
+    user_data: u64,
+    out_op: *mut aster_operation_t,
+) -> i32 {
+    node_start_with(runtime, alpns, false, user_data, out_op)
 }
 
-/// Helper to create an endpoint config with hooks enabled
-#[cfg(test)]
-pub fn hooks_endpoint_config() -> aster_transport_ffi::aster_endpoint_config_t {
-    let mut cfg = empty_endpoint_config();
-    cfg.enable_hooks = 1;
-    cfg.hook_timeout_ms = 2000;
-    cfg.hook_failure_mode =
-        aster_transport_ffi::aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_CLOSED as u32;
-    cfg
+/// As `node_start_with_alpns`, optionally with admission hooks on.
+pub unsafe fn node_start_with(
+    runtime: aster_runtime_t,
+    alpns: &[&[u8]],
+    enable_hooks: bool,
+    user_data: u64,
+    out_op: *mut aster_operation_t,
+) -> i32 {
+    use aster_transport_ffi::node::{aster_config_init, aster_config_t, aster_node_start};
+    use aster_transport_ffi::{aster_bytes_list_t, aster_bytes_t, aster_relay_mode_t};
+    let items: Vec<aster_bytes_t> = alpns
+        .iter()
+        .map(|a| aster_bytes_t {
+            ptr: a.as_ptr(),
+            len: a.len(),
+        })
+        .collect();
+    let bind = b"127.0.0.1:0";
+    let mut cfg: aster_config_t = std::mem::zeroed();
+    assert_eq!(aster_config_init(&mut cfg), 0);
+    cfg.relay_mode = aster_relay_mode_t::ASTER_RELAY_MODE_DISABLED as u32;
+    cfg.bind_addr = aster_bytes_t {
+        ptr: bind.as_ptr(),
+        len: bind.len(),
+    };
+    cfg.alpns = aster_bytes_list_t {
+        items: items.as_ptr(),
+        len: items.len(),
+    };
+    cfg.enable_hooks = u32::from(enable_hooks);
+    aster_node_start(runtime, &cfg, 0, user_data, out_op)
+}
+
+/// Start an in-memory node serving `alpns` and wait for it.
+pub unsafe fn start_node(runtime: aster_runtime_t, alpns: &[&[u8]]) -> u64 {
+    let mut op = 0;
+    assert_eq!(node_start_with_alpns(runtime, alpns, 0, &mut op), 0);
+    wait_for_successful_operation(runtime, op, aster_event_kind_t::ASTER_EVENT_NODE_CREATED).handle
 }

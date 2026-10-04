@@ -529,3 +529,43 @@ fn hooked_node_without_gate_raises_events_and_accepts() {
     }
     drop(tokio);
 }
+
+/// ABI 4.0: `aster_accept` on a node takes the connection from the node's
+/// aster-ALPN accept queue (it used to race the router on the endpoint) and
+/// reports it as `CONNECTION_ACCEPTED` with `related` = the node.
+#[test]
+fn accept_on_node_reads_the_alpn_queue() {
+    let tokio = tokio::runtime::Runtime::new().unwrap();
+    unsafe {
+        let rt = runtime();
+        let lb = loopback();
+        let server = start(rt, &lb.cfg, 0);
+        let server_addr = addr(rt, server);
+        let client = client(&tokio);
+
+        let mut op = 0;
+        assert_eq!(aster_accept(rt, server, 9, &mut op), 0);
+        let closed = dial(&tokio, &client, server_addr, Duration::from_millis(500));
+        assert_eq!(closed, None, "accepted connection stays open");
+        let ev = common::wait_for_successful_operation(
+            rt,
+            op,
+            aster_event_kind_t::ASTER_EVENT_CONNECTION_ACCEPTED,
+        );
+        assert_eq!(ev.related, server);
+        assert_eq!(ev.user_data, 9);
+        assert_ne!(ev.handle, 0);
+        assert_eq!(aster_connection_free(rt, ev.handle), 0);
+
+        // Unknown handle.
+        let mut op2 = 0;
+        assert_eq!(
+            aster_accept(rt, 0xdead_beef, 0, &mut op2),
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+
+        tokio.block_on(client.shutdown());
+        close(rt, server);
+        aster_runtime_close(rt);
+    }
+}

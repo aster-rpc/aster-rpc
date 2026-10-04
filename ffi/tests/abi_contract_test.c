@@ -46,24 +46,6 @@ OFF(aster_runtime_config_t, worker_threads, 4);
 OFF(aster_runtime_config_t, event_queue_capacity, 8);
 OFF(aster_runtime_config_t, reserved, 12);
 
-LAYOUT(aster_endpoint_config_t, 152);
-OFF(aster_endpoint_config_t, struct_size, 0);
-OFF(aster_endpoint_config_t, relay_mode, 4);
-OFF(aster_endpoint_config_t, secret_key, 8);
-OFF(aster_endpoint_config_t, alpns, 24);
-OFF(aster_endpoint_config_t, relay_urls, 40);
-OFF(aster_endpoint_config_t, enable_discovery, 56);
-OFF(aster_endpoint_config_t, enable_hooks, 60);
-OFF(aster_endpoint_config_t, hook_timeout_ms, 64);
-OFF(aster_endpoint_config_t, bind_addr, 72);
-OFF(aster_endpoint_config_t, clear_ip_transports, 88);
-OFF(aster_endpoint_config_t, clear_relay_transports, 92);
-OFF(aster_endpoint_config_t, portmapper_config, 96);
-OFF(aster_endpoint_config_t, proxy_url, 104);
-OFF(aster_endpoint_config_t, proxy_from_env, 120);
-OFF(aster_endpoint_config_t, data_dir_utf8, 128);
-OFF(aster_endpoint_config_t, hook_failure_mode, 144);
-
 LAYOUT(aster_connect_config_t, 48);
 OFF(aster_connect_config_t, struct_size, 0);
 OFF(aster_connect_config_t, flags, 4);
@@ -121,24 +103,6 @@ LAYOUT(aster_transport_metrics_t, 136);
 OFF(aster_transport_metrics_t, struct_size, 0);
 OFF(aster_transport_metrics_t, send_ipv4, 8);
 OFF(aster_transport_metrics_t, net_reports_full, 128);
-
-LAYOUT(aster_reactor_call_t, 112);
-OFF(aster_reactor_call_t, event_kind, 0);
-OFF(aster_reactor_call_t, call_id, 8);
-OFF(aster_reactor_call_t, connection_id, 16);
-OFF(aster_reactor_call_t, stream_id, 24);
-OFF(aster_reactor_call_t, header_ptr, 32);
-OFF(aster_reactor_call_t, header_len, 40);
-OFF(aster_reactor_call_t, header_flags, 44);
-OFF(aster_reactor_call_t, request_ptr, 48);
-OFF(aster_reactor_call_t, request_len, 56);
-OFF(aster_reactor_call_t, request_flags, 60);
-OFF(aster_reactor_call_t, peer_ptr, 64);
-OFF(aster_reactor_call_t, peer_len, 72);
-OFF(aster_reactor_call_t, header_buffer, 80);
-OFF(aster_reactor_call_t, request_buffer, 88);
-OFF(aster_reactor_call_t, peer_buffer, 96);
-OFF(aster_reactor_call_t, connection_handle, 104);
 
 /* ABI 3.1: AEv1 envelope structs. */
 LAYOUT(aster_stream_header_t, 96);
@@ -339,8 +303,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 3);
-    CHECK(ASTER_ABI_VERSION_MINOR >= 5); /* 3.1 envelope + zstd, 3.2 node config + gate, 3.3 data plane, 3.4 pure functions, 3.5 dynamic dispatch */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
 
@@ -365,8 +328,6 @@ static void test_enum_values(void) {
     CHECK(ASTER_DOWNLOAD_POLICY_EVERYTHING_EXCEPT == 2);
     CHECK(ASTER_DOC_SHARE_WRITE == 1);
     CHECK(ASTER_REGISTRY_KEY_ACL == 5);
-    CHECK(ASTER_REACTOR_EVENT_CALL == 0);
-    CHECK(ASTER_REACTOR_EVENT_RESPONSE_CLOSED == 3);
     CHECK(ASTER_TRUST_MODE_PROTECTED == 0 && ASTER_TRUST_MODE_OPEN_DEV == 1);
     CHECK(ASTER_PORTMAPPER_DEFAULT == 0 && ASTER_PORTMAPPER_DISABLED == 2);
     CHECK(ASTER_TRANSPORT_INITIAL_MTU == (1 << 7));
@@ -771,6 +732,13 @@ static void test_dispatch_server(void) {
     aster_call_t call = 0;
     CHECK(aster_rpc_open(rt, 424242, ASTER_METHOD_PATTERN_BIDI_STREAM, &o, &call) == ASTER_STATUS_NOT_FOUND);
     CHECK(aster_call_cancel(rt, 424242) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_call_release(rt, 424242) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_call_discard(rt, 424242) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_call_buffer_release(rt, 0) == ASTER_STATUS_OK);
+    /* 4.0: aster_accept takes a node handle. */
+    aster_operation_t accept_op = 0;
+    CHECK(aster_accept(rt, 424242, 0, &accept_op) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_accept(rt, 424242, 0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 

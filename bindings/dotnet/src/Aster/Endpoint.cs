@@ -7,23 +7,12 @@ using System.Threading.Tasks;
 
 namespace Aster;
 
-internal sealed class NativePointer : IDisposable
-{
-    private readonly IntPtr _ptr;
-    public NativePointer(IntPtr ptr) { _ptr = ptr; }
-    public void Dispose() { Marshal.FreeHGlobal(_ptr); }
-}
-
-internal sealed class GCHandleRef : IDisposable
-{
-    private readonly GCHandle _handle;
-    public GCHandleRef(GCHandle handle) { _handle = handle; }
-    public void Dispose() { _handle.Free(); }
-}
-
 /// <summary>
-/// Represents an iroh endpoint, which is a local QUIC endpoint capable of
-/// connecting to remote peers or accepting connections from them.
+/// A connect/accept view of a node: the endpoint-shaped API (id, connect, accept, close) over a
+/// node started with <c>aster_node_start</c>. ABI 4.0 removed bare endpoints
+/// (<c>aster_endpoint_create</c>), so <see cref="CreateAsync(Runtime, EndpointConfigBuilder, CancellationToken)"/>
+/// starts an in-memory node on <paramref name="runtime"/> with the builder's ALPNs; closing the
+/// endpoint closes that node. Use <see cref="Node.StartAsync"/> for the full configuration.
 /// </summary>
 public sealed class Endpoint : IDisposable
 {
@@ -37,102 +26,28 @@ public sealed class Endpoint : IDisposable
         _handle = handle;
     }
 
-    /// <summary>The native endpoint handle.</summary>
+    /// <summary>The native handle (an <c>aster_node_t</c>).</summary>
     public EndpointHandle Handle => _handle;
 
     /// <summary>The runtime that owns this endpoint.</summary>
     public Runtime Runtime => _runtime;
 
     /// <summary>
-    /// Creates a new endpoint with the given builder.
-    /// Deprecated with ABI 3.2 (removed in 4.0): use <see cref="Node.StartAsync"/>.
-    /// All config data is allocated in native memory and remains valid across the async call.
+    /// Starts an in-memory node on <paramref name="runtime"/> (<c>aster_node_start</c>) that accepts
+    /// the builder's ALPNs. The runtime is not owned: dispose the endpoint before the runtime.
     /// </summary>
-    [Obsolete("Deprecated with ABI 3.2 (aster_endpoint_create, removed in 4.0): use Node.StartAsync(AsterConfig).")]
     public static async Task<Endpoint> CreateAsync(Runtime runtime, EndpointConfigBuilder builder, CancellationToken cancellationToken = default)
     {
-        var (configPtr, cleanup) = BuildNativeConfig(builder);
-        try
-        {
-            int r = Native.aster_endpoint_create(runtime.Handle, configPtr, user_data: 0, out ulong opId);
-            if (r != 0)
-                throw IrohException.FromStatus(r, "aster_endpoint_create");
-
-            Event ev = await runtime.WaitForAsync(opId, cancellationToken);
-            if (ev.kind != (uint)EventKind.EndpointCreated)
-                throw new IrohException($"endpoint create: unexpected event {(EventKind)ev.kind}");
-
-            return new Endpoint(runtime, new EndpointHandle(ev.handle));
-        }
-        finally
-        {
-            // Cleanup is disposed by NativePointer handles which free the native memory.
-            foreach (var c in cleanup) c.Dispose();
-        }
+        ulong opId = Node.BeginStart(runtime, builder.ToAsterConfig(), gate: null, extraAlpns: null);
+        Event ev = await runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
+        if (ev.kind != (uint)EventKind.NodeCreated)
+            throw EventError.From(runtime, ev, "aster_node_start");
+        return new Endpoint(runtime, new EndpointHandle(ev.handle));
     }
 
-    /// <summary>Creates a new endpoint with default config.</summary>
-    [Obsolete("Deprecated with ABI 3.2 (aster_endpoint_create, removed in 4.0): use Node.StartAsync(AsterConfig).")]
+    /// <summary>Creates an endpoint with the default builder.</summary>
     public static Task<Endpoint> CreateAsync(Runtime runtime, CancellationToken cancellationToken = default)
         => CreateAsync(runtime, new EndpointConfigBuilder(), cancellationToken);
-
-    /// <summary>
-    /// Allocates EndpointConfig in native memory with all nested data pinned.
-    /// Returns (configPtr, cleanup handles). Caller must free configPtr and invoke cleanup.
-    /// </summary>
-    private static (IntPtr configPtr, List<IDisposable> cleanup) BuildNativeConfig(EndpointConfigBuilder builder)
-    {
-        var cleanup = new List<IDisposable>();
-
-        // Build alpns array in native memory.
-        int alpnCount = builder.AlpnCount;
-        IntPtr alpnsArrayPtr = alpnCount > 0
-            ? Marshal.AllocHGlobal(Marshal.SizeOf<Bytes>() * alpnCount)
-            : IntPtr.Zero;
-        if (alpnCount > 0) cleanup.Add(new NativePointer(alpnsArrayPtr));
-
-        // Pin each ALPN and write into the native array.
-        var pinnedAlpns = new List<GCHandle>();
-        var alpnBytes = new List<byte[]>();
-        IntPtr current = alpnsArrayPtr;
-        int bytesStructSize = Marshal.SizeOf<Bytes>();
-        foreach (var (alpnPtr, alpnLen) in builder.EnumerateAlpns())
-        {
-            var handle = GCHandle.Alloc(alpnPtr, GCHandleType.Pinned);
-            pinnedAlpns.Add(handle);
-            alpnBytes.Add(alpnPtr);
-            Marshal.StructureToPtr(new Bytes { ptr = handle.AddrOfPinnedObject(), len = (UIntPtr)alpnLen }, current, fDeleteOld: false);
-            current = IntPtr.Add(current, bytesStructSize);
-        }
-        foreach (var h in pinnedAlpns) cleanup.Add(new GCHandleRef(h));
-
-        // Build the config struct in native memory.
-        IntPtr configPtr = Marshal.AllocHGlobal(Marshal.SizeOf<EndpointConfig>());
-        cleanup.Add(new NativePointer(configPtr));
-
-        var config = new EndpointConfig
-        {
-            struct_size = (uint)Marshal.SizeOf<EndpointConfig>(),
-            relay_mode = (uint)builder.RelayModeValue,
-            secret_key = default,
-            alpns = new BytesList { items = alpnsArrayPtr, len = (UIntPtr)alpnCount },
-            relay_urls = BytesList.Empty,
-            enable_discovery = builder.EnableDiscoveryValue ? 1u : 0u,
-            enable_hooks = 0,
-            hook_timeout_ms = 0,
-            bind_addr = default,
-            clear_ip_transports = 0,
-            clear_relay_transports = 0,
-            portmapper_config = 0,
-            proxy_url = default,
-            proxy_from_env = 0,
-            data_dir_utf8 = default,
-            hook_failure_mode = (uint)HookFailureMode.FailOpen,
-        };
-        Marshal.StructureToPtr(config, configPtr, fDeleteOld: false);
-
-        return (configPtr, cleanup);
-    }
 
     /// <summary>Gets this endpoint's node ID as a hex string.</summary>
     public string NodeId()
@@ -140,9 +55,9 @@ public sealed class Endpoint : IDisposable
         IntPtr buf = Marshal.AllocHGlobal(65);
         try
         {
-            int r = Native.aster_endpoint_id(_runtime.Handle, _handle.Value, buf, (UIntPtr)65, out UIntPtr len);
+            int r = Native.aster_node_id(_runtime.Handle, _handle.Value, buf, (UIntPtr)65, out UIntPtr len);
             if (r != 0)
-                throw IrohException.FromStatus(r, "aster_endpoint_id");
+                throw IrohException.FromStatus(r, "aster_node_id");
             if (len == UIntPtr.Zero)
                 return string.Empty;
             byte[] bytes = new byte[(int)len];
@@ -152,12 +67,12 @@ public sealed class Endpoint : IDisposable
         finally { Marshal.FreeHGlobal(buf); }
     }
 
-    /// <summary>Closes this endpoint asynchronously.</summary>
+    /// <summary>Closes this endpoint (and its node) asynchronously.</summary>
     public async Task CloseAsync(CancellationToken cancellationToken = default)
     {
-        int r = Native.aster_endpoint_close(_runtime.Handle, _handle.Value, user_data: 0, out ulong opId);
+        int r = Native.aster_node_close(_runtime.Handle, _handle.Value, user_data: 0, out ulong opId);
         if (r != 0)
-            throw IrohException.FromStatus(r, "aster_endpoint_close");
+            throw IrohException.FromStatus(r, "aster_node_close");
 
         await _runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
         _disposed = true;

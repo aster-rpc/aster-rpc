@@ -573,20 +573,30 @@ func (c *serverCall) requests(ctx context.Context) iter.Seq2[[]byte, error] {
 				yield(nil, err)
 				return
 			}
-			// Blocks until a payload, the end of the request stream, or the
-			// call / connection is over. (A finite timeout would let ctx
-			// interrupt the wait, but aster_dispatch_recv with 0 <
-			// timeout < INFINITE builds its timer outside the Tokio runtime
-			// and panics as of ABI 3.5.0.)
-			st, payload, err := c.ds.recv(c.callID, timeoutInfinite)
+			// Bounded wait: a payload, the end of the request stream, the
+			// call / connection being over, or TIMEOUT -- then ctx (cancelled
+			// on a peer cancel / deadline, or by the server stopping) and the
+			// call's state are checked before waiting again.
+			st, payload, err := c.ds.recv(c.callID, recvSliceMs)
 			if err != nil {
 				yield(nil, &RpcError{Code: StatusInternal, Message: err.Error()})
 				return
 			}
 			switch st {
 			case recvEnd:
+				// Rust also ends the request stream when the peer cancels
+				// (FLAG_CANCEL / reset): that is not a clean end.
+				if ctx.Err() != nil {
+					yield(nil, ctx.Err())
+				} else if c.ds.isCancelled(c.callID) {
+					yield(nil, errCallGone)
+				}
 				return
 			case recvTimeout:
+				if c.ds.isCancelled(c.callID) {
+					yield(nil, errCallGone)
+					return
+				}
 				continue
 			case recvGone:
 				yield(nil, errCallGone)

@@ -198,7 +198,7 @@ public final class IrohLibrary implements SymbolLookup {
    * refuses a mismatch with {@link IrohStatus#ABI_MISMATCH}; also checked when the library is
    * loaded.
    */
-  public static final int EXPECTED_ABI_MAJOR = 3;
+  public static final int EXPECTED_ABI_MAJOR = 4;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {
@@ -246,39 +246,6 @@ public final class IrohLibrary implements SymbolLookup {
 
   // --- Node identity ---
 
-  /**
-   * Get the node ID (bytes) for an endpoint.
-   *
-   * @param runtimeHandle the runtime handle
-   * @param endpointHandle the endpoint handle
-   * @param outBuf the output buffer to write the node ID into
-   * @param capacity the capacity of the output buffer
-   * @param outLen where to write the actual node ID length
-   * @return status code (0 = OK)
-   */
-  public int endpointId(
-      long runtimeHandle,
-      long endpointHandle,
-      MemorySegment outBuf,
-      long capacity,
-      MemorySegment outLen) {
-    try {
-      return (int)
-          getHandle(
-                  "aster_endpoint_id",
-                  FunctionDescriptor.of(
-                      ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS))
-              .invoke(runtimeHandle, endpointHandle, outBuf, capacity, outLen);
-    } catch (Throwable t) {
-      throw new AssertionError(t);
-    }
-  }
-
   public SegmentAllocator allocator() {
     return allocator;
   }
@@ -294,94 +261,6 @@ public final class IrohLibrary implements SymbolLookup {
   }
 
   // --- Node async FFI (iroh_node_*) ---
-
-  /**
-   * Create a memory-backed node asynchronously.
-   *
-   * @param runtimeHandle the runtime handle
-   * @param outOpId where to write the operation id
-   * @return status code (0 = OK)
-   */
-  public int nodeMemoryAsync(long runtimeHandle, MemorySegment outOpId) {
-    try {
-      return (int)
-          getHandle(
-                  "aster_node_memory",
-                  FunctionDescriptor.of(
-                      ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS))
-              .invoke(runtimeHandle, 0L, outOpId);
-    } catch (Throwable t) {
-      throw new AssertionError(t);
-    }
-  }
-
-  /**
-   * Create a persistent node asynchronously.
-   *
-   * @param runtimeHandle the runtime handle
-   * @param pathBytes the path bytes (valid for duration of call)
-   * @param pathLen the length of the path in bytes (excluding null terminator)
-   * @param outOpId where to write the operation id
-   * @return status code (0 = OK)
-   */
-  public int nodePersistentAsync(
-      long runtimeHandle, MemorySegment pathBytes, long pathLen, MemorySegment outOpId) {
-    try {
-      // Build aster_bytes_t { ptr, len } struct on the stack/inline in the arena
-      MemorySegment pathIrohBytes = allocator.allocate(ASTER_BYTES); // 16 bytes
-      pathIrohBytes.set(ValueLayout.ADDRESS, 0, pathBytes);
-      pathIrohBytes.set(ValueLayout.JAVA_LONG, 8, pathLen);
-      return (int)
-          getHandle(
-                  "aster_node_persistent",
-                  FunctionDescriptor.of(
-                      ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG,
-                      ASTER_BYTES, // path: aster_bytes_t { ptr, len }
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS))
-              .invoke(runtimeHandle, pathIrohBytes, 0L, outOpId);
-    } catch (Throwable t) {
-      throw new AssertionError(t);
-    }
-  }
-
-  /**
-   * Create a memory-backed node with custom ALPNs asynchronously.
-   *
-   * @param runtimeHandle the runtime handle
-   * @param alpnItemsPtr pointer to array of alpn byte arrays
-   * @param alpnLensPtr pointer to array of alpn lengths
-   * @param alpnCount number of ALPNs
-   * @param outOpId where to write the operation id
-   * @return status code (0 = OK)
-   */
-  public int nodeMemoryWithAlpnsAsync(
-      long runtimeHandle,
-      MemorySegment alpnItemsPtr,
-      MemorySegment alpnLensPtr,
-      long alpnCount,
-      MemorySegment outOpId) {
-    try {
-      return (int)
-          getHandle(
-                  "aster_node_memory_with_alpns",
-                  FunctionDescriptor.of(
-                      ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS))
-              .invoke(runtimeHandle, alpnItemsPtr, alpnLensPtr, alpnCount, 0L, outOpId);
-    } catch (Throwable t) {
-      throw new AssertionError(t);
-    }
-  }
 
   /**
    * Accept an incoming aster connection on a node.
@@ -527,39 +406,6 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, nodeHandle, outBuf, bufCapacity, outAddrSegment);
-    } catch (Throwable t) {
-      throw new AssertionError(t);
-    }
-  }
-
-  /**
-   * Get the bound address info for an endpoint.
-   *
-   * @param runtimeHandle the runtime handle
-   * @param endpointHandle the endpoint handle
-   * @param outBuf output buffer for string data (relay URL, direct addresses)
-   * @param bufCapacity buffer capacity
-   * @param outAddrSegment output segment for the aster_node_addr_t struct
-   * @return status code (0 = OK)
-   */
-  public int endpointAddrInfo(
-      long runtimeHandle,
-      long endpointHandle,
-      MemorySegment outBuf,
-      long bufCapacity,
-      MemorySegment outAddrSegment) {
-    try {
-      return (int)
-          getHandle(
-                  "aster_endpoint_addr_info",
-                  FunctionDescriptor.of(
-                      ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS))
-              .invoke(runtimeHandle, endpointHandle, outBuf, bufCapacity, outAddrSegment);
     } catch (Throwable t) {
       throw new AssertionError(t);
     }
@@ -2224,37 +2070,6 @@ public final class IrohLibrary implements SymbolLookup {
           ValueLayout.JAVA_INT.withName("worker_threads"), // 4
           ValueLayout.JAVA_INT.withName("event_queue_capacity"), // 8
           ValueLayout.JAVA_INT.withName("reserved") // 12
-          );
-
-  /**
-   * aster_endpoint_config_t: struct_size, relay_mode, secret_key, alpns, relay_urls,
-   * enable_discovery, enable_hooks, hook_timeout_ms, bind_addr, clear_ip_transports,
-   * clear_relay_transports, portmapper_config, proxy_url, proxy_from_env, data_dir_utf8,
-   * hook_failure_mode.
-   *
-   * <p>Total: 152 bytes. Matches Rust aster_endpoint_config_t exactly.
-   */
-  public static final MemoryLayout ASTER_ENDPOINT_CONFIG =
-      MemoryLayout.structLayout(
-          ValueLayout.JAVA_INT.withName("struct_size"), // 0
-          ValueLayout.JAVA_INT.withName("relay_mode"), // 4
-          ASTER_BYTES.withName("secret_key"), // 8  (ptr+len = 16 bytes)
-          ASTER_BYTES_LIST.withName("alpns"), // 24 (items+len = 16 bytes)
-          ASTER_BYTES_LIST.withName("relay_urls"), // 40 (items+len = 16 bytes)
-          ValueLayout.JAVA_INT.withName("enable_discovery"), // 56
-          ValueLayout.JAVA_INT.withName("enable_hooks"), // 60
-          ValueLayout.JAVA_LONG.withName("hook_timeout_ms"), // 64
-          ASTER_BYTES.withName("bind_addr"), // 72 (ptr+len = 16 bytes)
-          ValueLayout.JAVA_INT.withName("clear_ip_transports"), // 88
-          ValueLayout.JAVA_INT.withName("clear_relay_transports"), // 92
-          ValueLayout.JAVA_INT.withName("portmapper_config"), // 96
-          MemoryLayout.paddingLayout(4), // 4 bytes padding → proxy_url at 104 (8-byte aligned)
-          ASTER_BYTES.withName("proxy_url"), // 104 (ptr+len = 16 bytes)
-          ValueLayout.JAVA_INT.withName("proxy_from_env"), // 120
-          MemoryLayout.paddingLayout(4), // 4 bytes padding → data_dir_utf8 at 128 (8-byte aligned)
-          ASTER_BYTES.withName("data_dir_utf8"), // 128 (ptr+len = 16 bytes)
-          ValueLayout.JAVA_INT.withName("hook_failure_mode"), // 144
-          MemoryLayout.paddingLayout(4) // 4 bytes tail padding → total 152
           );
 
   /**

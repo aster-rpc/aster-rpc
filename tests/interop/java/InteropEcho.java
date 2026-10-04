@@ -16,7 +16,7 @@
 //   java ... InteropEcho.java bench <aster1-ticket> [--duration S] [--warmup S]
 //       [--concurrency 1,10,50,100] [--stream-frames 100,10000] [--client-stream 10000]
 //
-// IROH_LIB_PATH points at libaster_transport_ffi (ABI >= 3.2). Every mode
+// IROH_LIB_PATH points at libaster_transport_ffi (ABI 4.x). Every mode
 // prints CONTRACT_ID <hex> first; `server` prints ADDRESS <aster1...> and
 // serves until stdin closes (loopback, relays off, via aster_node_start);
 // `client` prints CASE <name> OK|FAIL lines (same cases as the other

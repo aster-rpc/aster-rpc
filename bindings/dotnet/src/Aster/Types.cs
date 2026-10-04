@@ -38,7 +38,9 @@ public enum EventKind : uint
     // Lifecycle
     NodeCreated = 1,
     NodeCreateFailed = 2,
+    /// <summary>Reserved: never emitted since ABI 4.0 removed <c>aster_endpoint_create</c>.</summary>
     EndpointCreated = 3,
+    /// <summary>Reserved: never emitted since ABI 4.0.</summary>
     EndpointCreateFailed = 4,
     Closed = 5,
 
@@ -226,7 +228,7 @@ public enum HookFailureMode : uint
     FailClosed = 1,
 }
 
-/// <summary>Strongly-typed wrapper for a native endpoint handle.</summary>
+/// <summary>Strongly-typed wrapper for an <see cref="Endpoint"/> handle (a node handle since ABI 4.0).</summary>
 public readonly record struct EndpointHandle(ulong Value);
 
 /// <summary>Strongly-typed wrapper for a native connection handle.</summary>
@@ -240,41 +242,6 @@ public readonly record struct RecvStreamHandle(ulong Value);
 
 /// <summary>Strongly-typed wrapper for a native node handle.</summary>
 public readonly record struct NodeHandle(ulong Value);
-
-/// <summary>
-/// Runtime configuration for creating an endpoint.
-/// Must match aster_endpoint_config_t in the C header exactly (152 bytes on 64-bit).
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-public struct EndpointConfig
-{
-    public uint struct_size;
-    public uint relay_mode;
-    public Bytes secret_key;
-    public BytesList alpns;
-    public BytesList relay_urls;
-    public uint enable_discovery;
-    public uint enable_hooks;
-    public ulong hook_timeout_ms;
-    public Bytes bind_addr;
-    public uint clear_ip_transports;
-    public uint clear_relay_transports;
-    public uint portmapper_config;
-    public Bytes proxy_url;
-    public uint proxy_from_env;
-    public Bytes data_dir_utf8;
-    public uint hook_failure_mode;
-
-    public static EndpointConfig Default => new()
-    {
-        struct_size = (uint)Marshal.SizeOf<EndpointConfig>(),
-        relay_mode = 0,
-        secret_key = default,
-        alpns = default,
-        relay_urls = default,
-        enable_discovery = 1,
-    };
-}
 
 /// <summary>
 /// A list of Bytes structures.

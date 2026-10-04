@@ -25,7 +25,7 @@
 //! ## Note
 //!
 //! These tests require two in-memory nodes with compatible ALPNS to communicate.
-//! The aster ALPN protocol is used for in-memory connections via `aster_node_memory_with_alpns`
+//! The aster ALPN protocol is used for in-memory connections via `aster_node_start`
 //! and `aster_node_accept_aster` / `aster_connect`.
 
 use std::ptr;
@@ -64,18 +64,9 @@ fn test_accept_submit_then_close() {
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create an in-memory node with aster ALPN
-        let alpns = [b"aster".as_ptr()];
-        let alpn_lens = [5];
 
         let mut node_op: aster_operation_t = 0;
-        let status = aster_node_memory_with_alpns(
-            runtime,
-            alpns.as_ptr(),
-            alpn_lens.as_ptr(),
-            1,
-            0,
-            &mut node_op,
-        );
+        let status = common::node_start_with_alpns(runtime, &[b"aster"], 0, &mut node_op);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Wait for node creation
@@ -129,18 +120,9 @@ fn test_cancel_races_poll() {
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create an in-memory node
-        let alpns = [b"aster".as_ptr()];
-        let alpn_lens = [5];
 
         let mut node_op: aster_operation_t = 0;
-        let status = aster_node_memory_with_alpns(
-            runtime,
-            alpns.as_ptr(),
-            alpn_lens.as_ptr(),
-            1,
-            0,
-            &mut node_op,
-        );
+        let status = common::node_start_with_alpns(runtime, &[b"aster"], 0, &mut node_op);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Wait for node creation
@@ -197,18 +179,9 @@ fn test_handle_close_after_submit() {
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create a node
-        let alpns = [b"aster".as_ptr()];
-        let alpn_lens = [5];
 
         let mut node_op: aster_operation_t = 0;
-        let status = aster_node_memory_with_alpns(
-            runtime,
-            alpns.as_ptr(),
-            alpn_lens.as_ptr(),
-            1,
-            0,
-            &mut node_op,
-        );
+        let status = common::node_start_with_alpns(runtime, &[b"aster"], 0, &mut node_op);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         let node = wait_for_node_creation(runtime, node_op);
@@ -253,18 +226,9 @@ fn test_many_outstanding_on_cq() {
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create a node
-        let alpns = [b"aster".as_ptr()];
-        let alpn_lens = [5];
 
         let mut node_op: aster_operation_t = 0;
-        let status = aster_node_memory_with_alpns(
-            runtime,
-            alpns.as_ptr(),
-            alpn_lens.as_ptr(),
-            1,
-            0,
-            &mut node_op,
-        );
+        let status = common::node_start_with_alpns(runtime, &[b"aster"], 0, &mut node_op);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let node = wait_for_node_creation(runtime, node_op);
 
@@ -346,8 +310,8 @@ fn test_peer_disconnect_mid_read() {
     // verify the accept got an error.
     //
     // Full implementation would be:
-    // 1. Node A: aster_node_memory_with_alpns(["aster"])
-    // 2. Node B: aster_node_memory_with_alpns(["aster"])
+    // 1. Node A: aster_node_start(["aster"])
+    // 2. Node B: aster_node_start(["aster"])
     // 3. Node A: submit accept
     // 4. Node B: connect to Node A
     // 5. Node A: accept completes, get connection handle
@@ -361,18 +325,8 @@ fn test_peer_disconnect_mid_read() {
         let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
-        let alpns = [b"aster".as_ptr()];
-        let alpn_lens = [5];
-
         let mut node_op: aster_operation_t = 0;
-        let status = aster_node_memory_with_alpns(
-            runtime,
-            alpns.as_ptr(),
-            alpn_lens.as_ptr(),
-            1,
-            0,
-            &mut node_op,
-        );
+        let status = common::node_start_with_alpns(runtime, &[b"aster"], 0, &mut node_op);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let node = wait_for_node_creation(runtime, node_op);
 
@@ -428,18 +382,9 @@ fn test_batch_completion_delivery() {
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         // Create node
-        let alpns = [b"aster".as_ptr()];
-        let alpn_lens = [5];
 
         let mut node_op: aster_operation_t = 0;
-        let status = aster_node_memory_with_alpns(
-            runtime,
-            alpns.as_ptr(),
-            alpn_lens.as_ptr(),
-            1,
-            0,
-            &mut node_op,
-        );
+        let status = common::node_start_with_alpns(runtime, &[b"aster"], 0, &mut node_op);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let node = wait_for_node_creation(runtime, node_op);
 
@@ -513,17 +458,7 @@ fn test_many_nodes_share_runtime_cq() {
         let mut node_ops = [0u64; N];
 
         for (i, slot) in node_ops.iter_mut().enumerate().take(N) {
-            let alpns = [b"aster".as_ptr()];
-            let alpn_lens = [5];
-
-            let status = aster_node_memory_with_alpns(
-                runtime,
-                alpns.as_ptr(),
-                alpn_lens.as_ptr(),
-                1,
-                i as u64,
-                slot,
-            );
+            let status = common::node_start_with_alpns(runtime, &[b"aster"], i as u64, slot);
             assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         }
 

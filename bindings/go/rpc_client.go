@@ -323,53 +323,52 @@ func (rc *RpcConnection) unary(ctx context.Context, opts nativeOptions, req []by
 	return resp, nil
 }
 
-// Call makes a unary call on the connection's pooled streams. The context's
-// deadline is enforced natively; cancelling ctx stops waiting (the native
-// unary call has no cancel handle and runs to its deadline or completion).
+// Call makes a unary call. With a context that can never end
+// (ctx.Done() == nil) it takes the pooled fast path (aster_rpc_unary: one
+// blocking native call). Otherwise -- like .NET with a cancellable token --
+// it runs the same wire exchange on a call of its own (aster_rpc_open), so
+// cancelling ctx cancels the native call (aster_call_cancel: FLAG_CANCEL +
+// stream reset) and the server sees the cancel. The context's deadline is
+// enforced natively either way.
 func Call[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, opts ...CallOption) (*Resp, error) {
 	payload, err := rc.codec.Encode(req)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	nopts, err := lowerOptions(ctx, service, method, buildOptions(opts))
-	if err != nil {
-		return nil, err
-	}
+	o := buildOptions(opts)
 	var resp []byte
 	if ctx.Done() == nil {
+		nopts, err := lowerOptions(ctx, service, method, o)
+		if err != nil {
+			return nil, err
+		}
 		resp, err = rc.unary(ctx, nopts, payload)
 		nopts.free()
-	} else {
-		type result struct {
-			resp []byte
-			err  error
+		if err != nil {
+			return nil, err
 		}
-		done := make(chan result, 1)
-		go func() {
-			r, e := rc.unary(ctx, nopts, payload)
-			nopts.free()
-			done <- result{r, e}
-		}()
-		select {
-		case r := <-done:
-			resp, err = r.resp, r.err
-		case <-ctx.Done():
-			select {
-			case r := <-done: // finished at the same moment: prefer its outcome
-				resp, err = r.resp, r.err
-			default:
-				code := StatusCancelled
-				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-					code = StatusDeadlineExceeded
-				}
-				return nil, ctxError(ctx, &RpcError{Code: code, Message: ctx.Err().Error()})
-			}
-		}
-	}
-	if err != nil {
+	} else if resp, err = rc.cancellableUnary(ctx, service, method, o, payload); err != nil {
 		return nil, err
 	}
 	return decodeResponse[Resp](rc.codec, resp)
+}
+
+// cancellableUnary sends header + request on a dedicated stream (opened with
+// the server-stream pattern: the same frames as a unary call, header and
+// request in one write) and reads the single response.
+func (rc *RpcConnection) cancellableUnary(ctx context.Context, service, method string, o *callOptions, payload []byte) ([]byte, error) {
+	if ctx.Err() != nil {
+		return nil, ctxFailure(ctx)
+	}
+	c, err := openCall(ctx, rc, PatternServerStream, service, method, o)
+	if err != nil {
+		return nil, err
+	}
+	defer c.release()
+	if err := c.send(payload, true); err != nil && !errors.Is(err, errCallClosed) {
+		return nil, err
+	}
+	return c.readSingle("unary")
 }
 
 func decodeResponse[Resp any](codec Codec, payload []byte) (*Resp, error) {
@@ -414,6 +413,35 @@ func openCall(ctx context.Context, rc *RpcConnection, pattern MethodPattern, ser
 	return c, nil
 }
 
+// ctxFailure is the error for a call whose context ended.
+func ctxFailure(ctx context.Context) error {
+	code := StatusCancelled
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		code = StatusDeadlineExceeded
+	}
+	return ctxError(ctx, &RpcError{Code: code, Message: ctx.Err().Error()})
+}
+
+// readSingle reads the one response of a unary / client-stream call.
+func (c *rpcCall) readSingle(kind string) ([]byte, error) {
+	var last []byte
+	count := 0
+	for {
+		b, err := c.recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		last, count = b, count+1
+	}
+	if count != 1 {
+		return nil, &RpcError{Code: StatusInternal, Message: fmt.Sprintf("%s call received %d response frames", kind, count)}
+	}
+	return last, nil
+}
+
 // cancel cancels the call (no-op once it is over or released).
 func (c *rpcCall) cancel() { C.aster_call_cancel(c.rc.rt(), c.h) }
 
@@ -443,19 +471,36 @@ func (c *rpcCall) send(payload []byte, end bool) error {
 }
 
 // recv returns the next response payload, or (nil, io.EOF) at an OK
-// trailer, or the trailer's error.
+// trailer, or the trailer's error. Each native wait is bounded
+// (recvSliceMs); between slices the call's context is checked, so a recv
+// returns once ctx ends even if the native cancel has not woken it.
 func (c *rpcCall) recv() ([]byte, error) {
 	var ptr *C.uint8_t
 	var n C.uint32_t
 	var buf C.uint64_t
 	var trailer C.uint8_t
-	r := C.aster_call_recv_payload(c.rc.rt(), c.h, C.ASTER_TIMEOUT_INFINITE, &ptr, &n, &buf, &trailer)
-	switch r {
-	case C.ASTER_STATUS_OK:
-	case C.ASTER_STATUS_ALREADY_CLOSED, C.ASTER_STATUS_NOT_FOUND:
-		return nil, io.EOF
-	default:
-		return nil, fmt.Errorf("aster_call_recv_payload: %w", statusError(r))
+	for {
+		r := C.aster_call_recv_payload(c.rc.rt(), c.h, recvSliceMs, &ptr, &n, &buf, &trailer)
+		if r == C.ASTER_STATUS_TIMEOUT {
+			if c.ctx.Err() != nil {
+				c.cancel()
+				return nil, ctxFailure(c.ctx)
+			}
+			continue
+		}
+		switch r {
+		case C.ASTER_STATUS_OK:
+		case C.ASTER_STATUS_ALREADY_CLOSED, C.ASTER_STATUS_NOT_FOUND:
+			return nil, io.EOF
+		case C.ASTER_STATUS_CANCELLED:
+			if c.ctx.Err() != nil {
+				return nil, ctxFailure(c.ctx)
+			}
+			return nil, &RpcError{Code: StatusCancelled, Message: "call cancelled"}
+		default:
+			return nil, fmt.Errorf("aster_call_recv_payload: %w", statusError(r))
+		}
+		break
 	}
 	var b []byte
 	if n > 0 {
@@ -464,6 +509,12 @@ func (c *rpcCall) recv() ([]byte, error) {
 	c.rc.releaseBuffer(buf)
 	if trailer != 0 {
 		if err := statusFromBytes(c.ctx, 0, b); err != nil {
+			// A ctx deadline also fires the native cancel (AfterFunc); when
+			// that wins the race with the native deadline timer the trailer
+			// says CANCELLED -- report the deadline.
+			if errors.Is(err, ErrRpcCancelled) && errors.Is(c.ctx.Err(), context.DeadlineExceeded) {
+				return nil, ctxFailure(c.ctx)
+			}
 			return nil, err
 		}
 		return nil, io.EOF
@@ -533,25 +584,21 @@ func CallClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 			return nil, err
 		}
 	}
+	if !closed && ctx.Err() != nil {
+		// The context ended while requests were produced: cancel rather than
+		// half-close, so the server sees a cancel, not a clean end of stream
+		// (the AfterFunc cancel may not have run yet).
+		c.cancel()
+		return nil, ctxFailure(ctx)
+	}
 	if !closed {
 		if err := c.send(nil, true); err != nil && !errors.Is(err, errCallClosed) {
 			return nil, err
 		}
 	}
-	var last []byte
-	count := 0
-	for {
-		b, err := c.recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		last, count = b, count+1
-	}
-	if count != 1 {
-		return nil, &RpcError{Code: StatusInternal, Message: fmt.Sprintf("client-stream call received %d response frames", count)}
+	last, err := c.readSingle("client-stream")
+	if err != nil {
+		return nil, err
 	}
 	return decodeResponse[Resp](rc.codec, last)
 }
@@ -635,6 +682,11 @@ func CallBidiStream[Req, Resp any](ctx context.Context, rc *RpcConnection, servi
 					sendErr <- err
 					return
 				}
+			}
+			if ctx.Err() != nil { // ended while producing: cancel, don't half-close
+				b.Cancel()
+				sendErr <- nil
+				return
 			}
 			sendErr <- b.CloseSend()
 		}()

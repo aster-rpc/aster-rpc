@@ -3,12 +3,13 @@ using System.Runtime.InteropServices;
 
 namespace Aster;
 
-// P/Invoke declarations for the C ABI 3.1 – 3.5 additions (ffi/RENAME_MAP.md "New in 3.x").
+// P/Invoke declarations for the C ABI 3.1 – 3.5 additions (ffi/RENAME_MAP.md "New in 3.x"),
+// all part of ABI 4.0.
 // Struct mirrors live in NativeStructs.cs; their sizes are pinned by AbiContractTests.
 internal static unsafe partial class Native
 {
-    /// <summary>Minimum ABI minor for everything declared in this file.</summary>
-    public const uint RequiredAbiMinor = 5;
+    /// <summary>Minimum ABI minor (of <see cref="AbiVersionMajor"/>) for everything this binding declares.</summary>
+    public const uint RequiredAbiMinor = 0;
 
     // ─── 3.1: AEv1 envelope + zstd ──────────────────────────────────────────
 

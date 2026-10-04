@@ -51,10 +51,12 @@ final class DispatchResponseStream implements ResponseStream {
     byte[] status =
         t instanceof RpcError rpc
             ? AsterServer.statusBytes(rpc.code(), rpc.rpcMessage(), rpc.details())
-            : AsterServer.statusBytes(
-                StatusCode.INTERNAL,
-                t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage(),
-                null);
+            : t instanceof java.util.concurrent.CancellationException
+                ? AsterServer.statusBytes(StatusCode.CANCELLED, t.getMessage(), null)
+                : AsterServer.statusBytes(
+                    StatusCode.INTERNAL,
+                    t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage(),
+                    null);
     dispatch.finish(callId, status);
   }
 

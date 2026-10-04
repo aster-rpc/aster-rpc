@@ -63,7 +63,7 @@ public sealed class Node : IDisposable, IAsyncDisposable
         }
     }
 
-    private static unsafe ulong BeginStart(Runtime runtime, AsterConfig config, Gate? gate, IEnumerable<string>? extraAlpns)
+    internal static unsafe ulong BeginStart(Runtime runtime, AsterConfig config, Gate? gate, IEnumerable<string>? extraAlpns)
     {
         using var scope = new NativeScope();
         ConfigNative native = config.ToNative(scope, extraAlpns);
@@ -259,11 +259,6 @@ public sealed class Node : IDisposable, IAsyncDisposable
             _admissions.Writer.TryComplete();
         }
     }
-
-    /// <summary>Creates an in-memory node with the given ALPNs.</summary>
-    [Obsolete("Deprecated with ABI 3.2 (removed in 4.0): use Node.StartAsync(new AsterConfig { Alpns = ... }).")]
-    public static Task<Node> MemoryWithAlpnsAsync(string[] alpns, CancellationToken cancellationToken = default)
-        => StartAsync(new AsterConfig { Alpns = alpns }, cancellationToken: cancellationToken);
 }
 
 /// <summary>A peer address: endpoint id, optional relay URL, and direct <c>ip:port</c> addresses.</summary>

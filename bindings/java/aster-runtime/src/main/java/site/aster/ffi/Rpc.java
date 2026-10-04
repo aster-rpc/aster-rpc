@@ -49,8 +49,14 @@ public final class Rpc {
   public static final int PATTERN_CLIENT_STREAM = 2;
   public static final int PATTERN_BIDI_STREAM = 3;
 
-  /** {@code ASTER_TIMEOUT_INFINITE}. */
-  public static final int TIMEOUT_INFINITE = -1;
+  /**
+   * Slice for {@link #recvPolling}: native reads never wait longer than this before the binding
+   * re-checks its own cancellation (no {@code ASTER_TIMEOUT_INFINITE} waits).
+   */
+  public static final int POLL_SLICE_MS = 200;
+
+  /** After a binding-side cancel, how long to wait for the trailer before synthesizing one. */
+  static final long CANCEL_GRACE_MS = 5_000;
 
   private static final ValueLayout.OfInt I32 = ValueLayout.JAVA_INT;
   private static final ValueLayout.OfLong I64 = ValueLayout.JAVA_LONG;
@@ -325,6 +331,41 @@ public final class Rpc {
     } catch (Throwable t) {
       throw Dispatch.rethrow(t);
     }
+  }
+
+  /**
+   * The next response payload or the trailer, read in bounded {@link #POLL_SLICE_MS} slices.
+   * Between slices, if the current thread is interrupted or {@code stop} returns true, the call is
+   * cancelled natively ({@code aster_call_cancel}) and reading continues until the {@code
+   * CANCELLED} trailer arrives (synthesized if it does not within {@link #CANCEL_GRACE_MS}). The
+   * thread's interrupt flag is left as found.
+   */
+  public static Recv recvPolling(long runtime, long call, java.util.function.BooleanSupplier stop) {
+    long cancelledAt = 0;
+    while (true) {
+      Recv r = recv(runtime, call, POLL_SLICE_MS);
+      if (!(r instanceof Recv.Timeout)) {
+        return r;
+      }
+      if (cancelledAt == 0) {
+        if (Thread.currentThread().isInterrupted() || stop.getAsBoolean()) {
+          cancel(runtime, call);
+          cancelledAt = System.nanoTime();
+        }
+      } else if (System.nanoTime() - cancelledAt > CANCEL_GRACE_MS * 1_000_000L) {
+        return new Recv.Trailer(cancelledStatus());
+      }
+    }
+  }
+
+  /** AEv1 {@code RpcStatus{CANCELLED}} for a call the binding cancelled. */
+  static byte[] cancelledStatus() {
+    return AsterEnvelope.encodeRpcStatus(
+        new site.aster.server.wire.RpcStatus(
+            site.aster.server.wire.RpcStatus.CANCELLED,
+            "cancelled by the caller",
+            List.of(),
+            List.of()));
   }
 
   /** Cancel: {@code FLAG_CANCEL} then a reset; a blocked {@link #recv} returns the trailer. */

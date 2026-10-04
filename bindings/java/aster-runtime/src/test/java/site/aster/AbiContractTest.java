@@ -68,31 +68,6 @@ public class AbiContractTest {
   }
 
   @Test
-  public void testEndpointConfigSize() {
-    assertEquals(152, IrohLibrary.ASTER_ENDPOINT_CONFIG.byteSize());
-  }
-
-  @Test
-  public void testEndpointConfigFieldOffsets() {
-    assertEquals(0, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "struct_size"));
-    assertEquals(4, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "relay_mode"));
-    assertEquals(8, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "secret_key"));
-    assertEquals(24, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "alpns"));
-    assertEquals(40, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "relay_urls"));
-    assertEquals(56, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "enable_discovery"));
-    assertEquals(60, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "enable_hooks"));
-    assertEquals(64, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "hook_timeout_ms"));
-    assertEquals(72, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "bind_addr"));
-    assertEquals(88, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "clear_ip_transports"));
-    assertEquals(92, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "clear_relay_transports"));
-    assertEquals(96, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "portmapper_config"));
-    assertEquals(104, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "proxy_url"));
-    assertEquals(120, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "proxy_from_env"));
-    assertEquals(128, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "data_dir_utf8"));
-    assertEquals(144, offsetOf(IrohLibrary.ASTER_ENDPOINT_CONFIG, "hook_failure_mode"));
-  }
-
-  @Test
   public void testOtherStructLayouts() {
     // Must match ffi/src/layout.rs and ffi/tests/abi_contract_test.c.
     assertEquals(16, IrohLibrary.ASTER_BYTES_LIST.byteSize());

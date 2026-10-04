@@ -12,9 +12,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define ASTER_ABI_VERSION_MAJOR 3
+#define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 5
+#define ASTER_ABI_VERSION_MINOR 0
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -23,30 +23,6 @@
  * This is the value `aster_abi_version()` returns.
  */
 #define ASTER_ABI_VERSION (((ASTER_ABI_VERSION_MAJOR << 16) | (ASTER_ABI_VERSION_MINOR << 8)) | ASTER_ABI_VERSION_PATCH)
-
-/**
- * Result codes returned by `aster_call_recv_frame`. Mirrors the
- * `aster_reactor_recv_frame` triplet for consistency across surfaces.
- */
-#define ASTER_CALL_RECV_OK 0
-
-#define ASTER_CALL_RECV_END_OF_STREAM 1
-
-#define ASTER_CALL_RECV_TIMEOUT 2
-
-/**
- * Acquire-error subcodes returned by `aster_call_acquire` as negative
- * values. Bindings can map these to typed exceptions per spec §5.
- */
-#define ASTER_CALL_ERR_POOL_FULL -10
-
-#define ASTER_CALL_ERR_QUIC_LIMIT_REACHED -11
-
-#define ASTER_CALL_ERR_PEER_STREAM_LIMIT_TOO_LOW -12
-
-#define ASTER_CALL_ERR_STREAM_OPEN_FAILED -13
-
-#define ASTER_CALL_ERR_POOL_CLOSED -14
 
 /**
  * `flags` bit of the 3.3 blob downloads: leave the blob in the local store
@@ -150,47 +126,6 @@
 #define ASTER_ID_HEX_LEN 64
 
 /**
- * Event-kind discriminator for `aster_reactor_call_t` (spec §7.5).
- * Bindings MUST check `event_kind` before reading any other field — a
- * `ConnectionClosed` event populates only `event_kind`, `connection_id`,
- * `peer_*` (peer_id of the closed connection); all other fields are zero
- * or NULL.
- */
-#define ASTER_REACTOR_EVENT_CALL 0
-
-#define ASTER_REACTOR_EVENT_CONNECTION_CLOSED 1
-
-/**
- * A previously-full response channel has reserved capacity for `call_id`.
- * No payload buffers are present; the binding must retry the same submit.
- */
-#define ASTER_REACTOR_EVENT_RESPONSE_WRITABLE 2
-
-/**
- * A pending response-capacity reservation closed before becoming writable.
- * No payload buffers are present; the binding must stop producing this call.
- */
-#define ASTER_REACTOR_EVENT_RESPONSE_CLOSED 3
-
-/**
- * Result codes returned by `aster_reactor_recv_frame` in addition to the
- * usual `aster_status_t` codes for error cases.
- */
-#define ASTER_RECV_FRAME_OK 0
-
-/**
- * Per-call request channel was closed cleanly (peer signalled END_STREAM
- * or its recv stream EOF'd). No frame was written; the binding should
- * stop calling recv_frame for this call_id.
- */
-#define ASTER_RECV_FRAME_END_OF_STREAM 1
-
-/**
- * Timeout expired with no frame available. The binding may retry.
- */
-#define ASTER_RECV_FRAME_TIMEOUT 2
-
-/**
  * `aster_dispatch_event_t.flags`: the first request frame ended the request
  * stream; `aster_dispatch_recv` has nothing more.
  */
@@ -259,7 +194,13 @@ typedef enum aster_event_kind_t {
   ASTER_EVENT_NONE = 0,
   ASTER_EVENT_NODE_CREATED = 1,
   ASTER_EVENT_NODE_CREATE_FAILED = 2,
+  /**
+   * Not emitted since ABI 4.0 (`aster_endpoint_create` removed); value reserved.
+   */
   ASTER_EVENT_ENDPOINT_CREATED = 3,
+  /**
+   * Not emitted since ABI 4.0; value reserved.
+   */
   ASTER_EVENT_ENDPOINT_CREATE_FAILED = 4,
   ASTER_EVENT_CLOSED = 5,
   ASTER_EVENT_CONNECTED = 10,
@@ -800,12 +741,12 @@ typedef struct aster_event_t {
 
 typedef uint64_t aster_operation_t;
 
+typedef uint64_t aster_node_t;
+
 typedef struct aster_bytes_t {
   const uint8_t *ptr;
   uintptr_t len;
 } aster_bytes_t;
-
-typedef uint64_t aster_node_t;
 
 typedef struct aster_bytes_list_t {
   const struct aster_bytes_t *items;
@@ -817,33 +758,6 @@ typedef struct aster_node_addr_t {
   struct aster_bytes_t relay_url;
   struct aster_bytes_list_t direct_addresses;
 } aster_node_addr_t;
-
-typedef struct aster_endpoint_config_t {
-  uint32_t struct_size;
-  /**
-   * One of `aster_relay_mode_t`. Unknown values are rejected.
-   */
-  uint32_t relay_mode;
-  struct aster_bytes_t secret_key;
-  struct aster_bytes_list_t alpns;
-  struct aster_bytes_list_t relay_urls;
-  uint32_t enable_discovery;
-  uint32_t enable_hooks;
-  uint64_t hook_timeout_ms;
-  struct aster_bytes_t bind_addr;
-  uint32_t clear_ip_transports;
-  uint32_t clear_relay_transports;
-  uint32_t portmapper_config;
-  struct aster_bytes_t proxy_url;
-  uint32_t proxy_from_env;
-  struct aster_bytes_t data_dir_utf8;
-  /**
-   * One of `aster_hook_failure_mode_t` (default 0 = fail-open).
-   */
-  uint32_t hook_failure_mode;
-} aster_endpoint_config_t;
-
-typedef uint64_t aster_endpoint_t;
 
 typedef uint64_t aster_recv_stream_t;
 
@@ -858,6 +772,12 @@ typedef struct aster_connect_config_t {
 typedef uint64_t aster_connection_t;
 
 typedef uint64_t aster_send_stream_t;
+
+/**
+ * Since ABI 4.0 there are no bare endpoints: functions taking an
+ * `aster_endpoint_t` take a node handle (`aster_node_t`).
+ */
+typedef uint64_t aster_endpoint_t;
 
 typedef struct aster_remote_info_t {
   uint32_t struct_size;
@@ -1408,104 +1328,6 @@ typedef struct aster_verified_chain_t {
   void *storage;
 } aster_verified_chain_t;
 
-typedef uint64_t aster_reactor_t;
-
-/**
- * C-visible event descriptor returned by aster_reactor_poll.
- *
- * Despite the historical `aster_reactor_call_t` name, this struct carries
- * inbound calls, connection-close notifications, and response-capacity
- * notifications. Capacity notifications populate only `event_kind` and
- * `call_id`; every pointer and buffer id is zero. Bindings MUST branch on
- * `event_kind` before reading the remaining fields.
- */
-typedef struct aster_reactor_call_t {
-  /**
-   * Event-kind discriminator. See `ASTER_REACTOR_EVENT_*` constants.
-   */
-  uint8_t event_kind;
-  /**
-   * Reactor-assigned call ID (for submit correlation). Zero on
-   * ConnectionClosed events.
-   */
-  uint64_t call_id;
-  /**
-   * Reactor-assigned unique ID for the QUIC connection this event
-   * belongs to (spec §7.5). Same id is reused across every call from
-   * this connection and emitted with the terminal ConnectionClosed
-   * event so the binding can drop per-connection state. A peer that
-   * disconnects and reconnects gets a fresh `connection_id`.
-   */
-  uint64_t connection_id;
-  /**
-   * Reactor-assigned unique ID for the QUIC bi-stream this call arrived
-   * on. Multiplexed streams (spec §6) carry many calls per bi-stream,
-   * so DO NOT key per-session state on `stream_id` — use
-   * `(connection_id, StreamHeader.sessionId)` from the binding-decoded
-   * header instead. Zero on ConnectionClosed events.
-   */
-  uint64_t stream_id;
-  /**
-   * Pointer to header payload bytes (owned by buffer registry).
-   * NULL on ConnectionClosed events.
-   */
-  const uint8_t *header_ptr;
-  /**
-   * Length of header payload. Zero on ConnectionClosed events.
-   */
-  uint32_t header_len;
-  /**
-   * Header frame flags. Zero on ConnectionClosed events.
-   */
-  uint8_t header_flags;
-  /**
-   * Pointer to request payload bytes (owned by buffer registry).
-   * NULL on ConnectionClosed events.
-   */
-  const uint8_t *request_ptr;
-  /**
-   * Length of request payload. Zero on ConnectionClosed events.
-   */
-  uint32_t request_len;
-  /**
-   * Request frame flags. Zero on ConnectionClosed events.
-   */
-  uint8_t request_flags;
-  /**
-   * Pointer to peer ID string (UTF-8, not null-terminated, owned by
-   * buffer registry). Populated on both Call and ConnectionClosed.
-   */
-  const uint8_t *peer_ptr;
-  /**
-   * Length of peer ID string. Populated on both Call and
-   * ConnectionClosed.
-   */
-  uint32_t peer_len;
-  /**
-   * Buffer ID for the header payload (release after processing). Zero
-   * on ConnectionClosed events.
-   */
-  uint64_t header_buffer;
-  /**
-   * Buffer ID for the request payload. Zero on ConnectionClosed events.
-   */
-  uint64_t request_buffer;
-  /**
-   * Buffer ID for the peer ID string. Populated on both Call and
-   * ConnectionClosed.
-   */
-  uint64_t peer_buffer;
-  /**
-   * Borrowed `aster_connection_t` handle for the QUIC connection this
-   * event arrived on. Populated on both Call and ConnectionClosed.
-   * Same handle for every event from the same `connection_id`; freed
-   * internally by the reactor when ConnectionClosed is consumed.
-   * Bindings MUST NOT call `aster_connection_free` on this handle —
-   * the reactor owns its lifetime.
-   */
-  uint64_t connection_handle;
-} aster_reactor_call_t;
-
 /**
  * Per-call options for `aster_rpc_unary` / `aster_rpc_open`. 72 bytes
  * (LP64). Set `struct_size = sizeof(aster_call_options_t)`.
@@ -1721,30 +1543,9 @@ uintptr_t aster_last_error_message(uint8_t *buffer, uintptr_t capacity);
 /**
  * Static, NUL-terminated name for an `aster_status_t` value (passed as the
  * raw `int32_t` that every function returns). Unknown values (including the
- * negative `ASTER_CALL_ERR_*` sub-codes) yield `"ASTER_STATUS_UNKNOWN"`.
+ * negative ones) yield `"ASTER_STATUS_UNKNOWN"`.
  */
 const char *aster_status_name(int32_t status);
-
-/**
- * Create an in-memory node with default endpoint settings.
- *
- * **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
- * `aster_config_t`.
- */
-int32_t aster_node_memory(aster_runtime_t runtime,
-                          uint64_t user_data,
-                          aster_operation_t *out_operation);
-
-/**
- * Create a persistent node at `path` with default endpoint settings.
- *
- * **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
- * `aster_config_t`.
- */
-int32_t aster_node_persistent(aster_runtime_t runtime,
-                              struct aster_bytes_t path,
-                              uint64_t user_data,
-                              aster_operation_t *out_operation);
 
 int32_t aster_node_close(aster_runtime_t runtime,
                          aster_node_t node,
@@ -1769,40 +1570,6 @@ int32_t aster_node_export_secret_key(aster_runtime_t runtime,
                                      uintptr_t capacity,
                                      uintptr_t *out_len);
 
-/**
- * Create a bare endpoint (no blobs/docs/gossip).
- *
- * **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start`; a node
- * covers every endpoint use (connect, accept, hooks, metrics).
- */
-int32_t aster_endpoint_create(aster_runtime_t runtime,
-                              const struct aster_endpoint_config_t *config,
-                              uint64_t user_data,
-                              aster_operation_t *out_operation);
-
-int32_t aster_endpoint_close(aster_runtime_t runtime,
-                             aster_endpoint_t endpoint,
-                             uint64_t user_data,
-                             aster_operation_t *out_operation);
-
-int32_t aster_endpoint_id(aster_runtime_t runtime,
-                          aster_endpoint_t endpoint,
-                          uint8_t *out_buf,
-                          uintptr_t capacity,
-                          uintptr_t *out_len);
-
-int32_t aster_endpoint_export_secret_key(aster_runtime_t runtime,
-                                         aster_endpoint_t endpoint,
-                                         uint8_t *out_buf,
-                                         uintptr_t capacity,
-                                         uintptr_t *out_len);
-
-int32_t aster_endpoint_addr_info(aster_runtime_t runtime,
-                                 aster_endpoint_t endpoint,
-                                 uint8_t *out_buf,
-                                 uintptr_t buf_capacity,
-                                 struct aster_node_addr_t *out_addr);
-
 int32_t aster_stream_stop(aster_runtime_t runtime,
                           aster_recv_stream_t recv_stream,
                           uint32_t error_code);
@@ -1813,24 +1580,20 @@ int32_t aster_connect(aster_runtime_t runtime,
                       uint64_t user_data,
                       aster_operation_t *out_operation);
 
+/**
+ * Accept the next inbound connection of a node (`aster_node_start`).
+ *
+ * Since ABI 4.0 this takes the connection from the node's aster-ALPN accept
+ * queue (the same queue `aster_node_accept_aster` reads: connections on the
+ * node's configured ALPNs that the router hands over) and emits
+ * `ASTER_EVENT_CONNECTION_ACCEPTED` with `handle` = connection, `related` =
+ * node. Before 4.0 it called the endpoint's accept directly, racing the
+ * node's router. Unknown handle -> `NOT_FOUND`.
+ */
 int32_t aster_accept(aster_runtime_t runtime,
-                     uint64_t endpoint_or_node,
+                     aster_node_t node,
                      uint64_t user_data,
                      aster_operation_t *out_operation);
-
-/**
- * Create an in-memory node with blobs/docs/gossip + custom aster ALPNs.
- * Emits ASTER_EVENT_NODE_CREATED on success.
- *
- * **Deprecated (ABI 3.2, removed in 4.0):** use `aster_node_start` with an
- * `aster_config_t`.
- */
-int32_t aster_node_memory_with_alpns(aster_runtime_t runtime,
-                                     const uint8_t *const *alpns,
-                                     const uintptr_t *alpn_lens,
-                                     uintptr_t alpn_count,
-                                     uint64_t user_data,
-                                     aster_operation_t *out_operation);
 
 /**
  * Pull the next incoming aster-ALPN connection from the node's queue.
@@ -1952,17 +1715,14 @@ int32_t aster_stream_stopped(aster_runtime_t runtime,
                              aster_operation_t *out_operation);
 
 /**
- * Add a peer address to the address lookup of an endpoint **or node**
- * (nodes accepted since ABI 3.3), so later dials and blob/doc fetches by
- * node id can reach it.
+ * Add a peer address to the address lookup of a node, so later dials and
+ * blob/doc fetches by node id can reach it.
  */
 int32_t aster_add_node_addr(aster_runtime_t runtime,
                             aster_endpoint_t endpoint,
                             struct aster_node_addr_t addr);
 
 int32_t aster_node_free(aster_runtime_t runtime, aster_node_t node);
-
-int32_t aster_endpoint_free(aster_runtime_t runtime, aster_endpoint_t endpoint);
 
 int32_t aster_connection_free(aster_runtime_t runtime, aster_connection_t connection);
 
@@ -2705,164 +2465,23 @@ int32_t aster_registry_acl_list_writers(aster_runtime_t runtime,
                                         aster_operation_t *out_operation);
 
 /**
- * Acquire a call handle from the connection's per-connection
- * multiplexed-stream pool. `session_id == 0` selects the SHARED
- * pool; non-zero selects the session pool keyed by that id.
- *
- * Blocks (on the FFI thread, via `block_on`) up to the pool's
- * configured `stream_acquire_timeout`. On success, writes a non-zero
- * call handle to `*out_call`. On failure, returns one of the
- * `ASTER_CALL_ERR_*` codes (negative) or an `aster_status_t` code.
- */
-int32_t aster_call_acquire(aster_runtime_t runtime,
-                           aster_connection_t connection,
-                           uint32_t session_id,
-                           aster_call_t *out_call);
-
-/**
- * Acquire a **streaming** call handle. Unlike `aster_call_acquire`,
- * this bypasses the per-connection pool entirely and opens a
- * dedicated multiplexed substream via `CoreConnection::open_bi` —
- * per `ffi_spec/Aster-multiplexed-streams.md` §3 line 65, "streaming
- * substreams don't count against any pool." Use this for
- * server-stream / client-stream / bidi calls.
- *
- * The substream is bounded only by the QUIC `max_concurrent_streams`
- * ceiling. It is closed on `aster_call_release` or `aster_call_discard`.
- *
- * `session_id` is not used by this entry point — the binding carries
- * the session id in the `StreamHeader` it sends itself. Kept out of
- * the signature to make the "no pool involvement" intent unambiguous.
- */
-int32_t aster_call_acquire_streaming(aster_runtime_t runtime,
-                                     aster_connection_t connection,
-                                     aster_call_t *out_call);
-
-/**
- * Push a frame on a call's request side.
- *
- * `frame_ptr` / `frame_len` point to already-framed bytes (including
- * the 4-byte little-endian length prefix and 1-byte flags). The
- * binding is responsible for framing — this matches
- * `aster_reactor_submit_frame`'s contract.
- *
- * Blocks on the FFI thread until the underlying QUIC `write_all`
- * completes.
- */
-int32_t aster_call_send_frame(aster_runtime_t runtime,
-                              aster_call_t call,
-                              const uint8_t *frame_ptr,
-                              uint32_t frame_len);
-
-/**
- * Pull the next response frame on a call. Blocks up to `timeout_ms`
- * waiting for the next frame on the recv side.
- *
- * On `ASTER_CALL_RECV_OK` (return value 0), writes:
- * - `*out_payload_ptr` — pointer to payload bytes (owned by
- *   `CALL_BUFFERS`; release via `aster_call_buffer_release`).
- * - `*out_payload_len` — payload length in bytes.
- * - `*out_flags` — frame flags byte. Bindings inspect `FLAG_TRAILER`
- *   to detect end-of-call.
- * - `*out_buffer_id` — buffer registry id for releasing the payload.
- *
- * On `ASTER_CALL_RECV_TIMEOUT` (return value 2), no out parameters
- * are touched and the call remains valid for further recv attempts.
- *
- * On `ASTER_CALL_RECV_END_OF_STREAM` (return value 1), the underlying
- * QUIC recv side has closed; further recvs will keep returning EOF.
- * The binding should release/discard the call.
- *
- * Negative return values are `aster_status_t` error codes.
- */
-int32_t aster_call_recv_frame(aster_runtime_t runtime,
-                              aster_call_t call,
-                              uint32_t timeout_ms,
-                              const uint8_t **out_payload_ptr,
-                              uint32_t *out_payload_len,
-                              uint8_t *out_flags,
-                              aster_buffer_t *out_buffer_id);
-
-/**
- * Release a call on the success path. The underlying multiplexed
- * stream returns to the connection's pool (LIFO) for reuse by the
- * next acquire.
- *
- * MUST be called only when no concurrent `send_frame` / `recv_frame`
- * is in flight on this call. Calling release with leftover unread
- * bytes on the recv side would corrupt the next call that reuses
- * the stream — the binding MUST drain to the trailer first.
+ * Free a call from `aster_rpc_open`. An unfinished call is cancelled
+ * (`FLAG_CANCEL` + reset). Returns `NOT_FOUND` for an unknown or already
+ * freed handle. Must not race another operation on the same call.
  */
 int32_t aster_call_release(aster_runtime_t runtime, aster_call_t call);
 
 /**
- * Discard a call on the error path. The underlying multiplexed
- * stream is dropped (not returned to the pool); the pool slot is
- * freed and any blocked waiter is woken to either reuse a freed
- * slot or surface the same transport error.
- *
- * Use this when:
- * - A `send_frame` or `recv_frame` returned an error.
- * - The call was cancelled mid-flight (FLAG_CANCEL).
- * - The recv side returned `ASTER_CALL_RECV_END_OF_STREAM` before
- *   the trailer was seen.
+ * Identical to `aster_call_release` (kept for bindings that distinguish the
+ * error path; since 4.0 there is no pooled stream to poison).
  */
 int32_t aster_call_discard(aster_runtime_t runtime, aster_call_t call);
 
 /**
- * Release a buffer obtained from `aster_call_recv_frame`. Each
- * buffer id returned by recv MUST be released exactly once.
+ * Release a buffer lease from `aster_rpc_unary` / `aster_call_recv_payload`.
+ * Each non-zero buffer id must be released exactly once; 0 is a no-op.
  */
 int32_t aster_call_buffer_release(aster_runtime_t runtime, aster_buffer_t buffer);
-
-/**
- * Unary fast-path (spec §8). Collapses
- * `acquire` + `send_frame(header)` + `send_frame(request)` +
- * `recv_frame(response)` + `recv_frame(trailer)` + `release` into a
- * single FFI entry point and a single `block_on`. Bindings whose
- * hot-path is dominated by FFI roundtrips (e.g. Java FFM, where every
- * `block_on` parks a platform thread) see ~5-6× fewer FFI hops per
- * unary call.
- *
- * `request_pair_ptr` / `request_pair_len` is a single buffer holding
- * the already-framed StreamHeader frame *concatenated with* the
- * already-framed request frame:
- *
- * ```text
- *   [4B LE len][1B FLAG_HEADER][header_payload]
- *   [4B LE len][1B request_flags][request_payload]
- * ```
- *
- * The Rust side writes the whole buffer in one `write_all` so Quinn's
- * flow control sees one logical write.
- *
- * On success, populates four sets of out parameters:
- * - `out_response_*` — the FIRST non-row-schema response frame on the
- *   stream, or zero-length if the dispatcher only sent a trailer.
- * - `out_trailer_*` — the trailer frame's payload (an encoded
- *   `RpcStatus`). Always populated on success; zero-length if the
- *   dispatcher sent an empty OK trailer.
- *
- * Each populated payload comes with its own buffer id; bindings MUST
- * call `aster_call_buffer_release` for every non-zero buffer id
- * returned. Skipped row-schema frames are released internally.
- *
- * On error returns the appropriate `ASTER_CALL_ERR_*` (acquire failure)
- * or `ASTER_STATUS_INTERNAL` (transport / framing failure); no out
- * parameters are populated. The pool slot is freed on every error path.
- */
-int32_t aster_call_unary(aster_runtime_t runtime,
-                         aster_connection_t connection,
-                         uint32_t session_id,
-                         const uint8_t *request_pair_ptr,
-                         uint32_t request_pair_len,
-                         const uint8_t **out_response_ptr,
-                         uint32_t *out_response_len,
-                         uint8_t *out_response_flags,
-                         aster_buffer_t *out_response_buffer,
-                         const uint8_t **out_trailer_ptr,
-                         uint32_t *out_trailer_len,
-                         aster_buffer_t *out_trailer_buffer);
 
 /**
  * Download a blob by hash from an **ordered** list of providers
@@ -3600,8 +3219,9 @@ int32_t aster_admission_respond(aster_runtime_t runtime,
  * forces `enable_hooks` on. With hooks on and no gate, admission events are
  * raised for the caller to answer with `aster_admission_respond`.
  *
- * Replaces `aster_node_memory`, `aster_node_memory_with_alpns`,
- * `aster_node_persistent` and `aster_endpoint_create` for new code.
+ * The only way to create a node or endpoint since ABI 4.0 (the
+ * `aster_node_memory*` / `aster_node_persistent` / `aster_endpoint_create`
+ * factories were removed).
  */
 int32_t aster_node_start(aster_runtime_t runtime,
                          const struct aster_config_t *config,
@@ -3829,208 +3449,8 @@ int32_t aster_verified_chain_role_of(const struct aster_verified_chain_t *chain,
                                      uint32_t *out_role);
 
 /**
- * Create a reactor attached to a node. The reactor starts accepting
- * connections and delivering calls via the SPSC ring.
- *
- * `ring_capacity` is rounded up to the next power of two.
- * `out_reactor` receives the reactor handle on success.
- */
-int32_t aster_reactor_create(aster_runtime_t runtime,
-                             aster_node_t node,
-                             uint32_t ring_capacity,
-                             aster_reactor_t *out_reactor);
-
-/**
- * Destroy a reactor. Stops the pump task and releases resources.
- */
-int32_t aster_reactor_destroy(aster_runtime_t runtime, aster_reactor_t reactor);
-
-/**
- * Long-poll for the next non-rpc aster-ALPN connection accepted by the reactor.
- * Fires `ASTER_EVENT_ASTER_ACCEPTED` when a connection arrives, with the same
- * payload shape as `aster_node_accept_aster`: `event.handle` = connection handle,
- * `event.data_ptr/len` = ALPN bytes, `event.buffer` = lease to release via
- * `aster_buffer_release`. Returns `ASTER_STATUS_OK` on successful dispatch of the
- * async wait; the caller awaits completion via the usual operation registry.
- *
- * When the reactor is shut down (its non_rpc sender dropped) the async task
- * emits an error event instead of blocking forever.
- */
-int32_t aster_reactor_accept_non_rpc(aster_runtime_t runtime,
-                                     aster_reactor_t reactor,
-                                     uint64_t user_data,
-                                     aster_operation_t *out_operation);
-
-/**
- * Poll for incoming calls. Drains up to `max_calls` from the ring buffer
- * into the caller-provided `out_calls` array. Returns the number of calls
- * written.
- *
- * If `timeout_ms` is 0, returns immediately (non-blocking).
- * If `timeout_ms` > 0, blocks up to that duration waiting for at least one call.
- *
- * The caller must release each call's buffers via `aster_buffer_release` after
- * processing (using the reactor's buffer registry, not the runtime's).
- */
-uint32_t aster_reactor_poll(aster_runtime_t runtime,
-                            aster_reactor_t reactor,
-                            struct aster_reactor_call_t *out_calls,
-                            uint32_t max_calls,
-                            uint32_t timeout_ms);
-
-/**
- * Begin an asynchronous reservation after a submit returned `QUEUE_FULL`.
- *
- * `encoded_len` is the exact combined framed-byte length of the failed submit.
- * This call itself never blocks. Once Tokio owns that byte charge, one item
- * slot, and queue capacity, `aster_reactor_poll` emits
- * `ASTER_REACTOR_EVENT_RESPONSE_WRITABLE` for the call. The binding then retries
- * the exact submit; that retry consumes the held combined permit and therefore
- * cannot return `QUEUE_FULL`. If cancellation or disconnect closes the channel
- * first, poll emits
- * `ASTER_REACTOR_EVENT_RESPONSE_CLOSED` instead.
- *
- * Only one reservation may be pending per call, matching the ABI's
- * single-producer-per-call rule.
- */
-int32_t aster_reactor_reserve_response_capacity(aster_runtime_t runtime,
-                                                aster_reactor_t reactor,
-                                                uint64_t call_id,
-                                                uint64_t encoded_len);
-
-/**
- * Cancel a response-capacity wait whose binding thread was interrupted.
- * Drops either the pending reservation request or an already-held permit.
- */
-int32_t aster_reactor_cancel_response_reservation(aster_runtime_t runtime,
-                                                  aster_reactor_t reactor,
-                                                  uint64_t call_id);
-
-/**
- * Submit a unary response (single response frame + trailer) in one FFI call.
- *
- * This is a convenience wrapper over `aster_reactor_submit_frame` plus
- * `aster_reactor_submit_trailer`. For server-streaming or bidi, call
- * `submit_frame` N times and then `submit_trailer` once.
- *
- * After a successful call, `call_id` is no longer valid.
- *
- * BACKPRESSURE: the per-call response channel is bounded, so this may return
- * `ASTER_STATUS_QUEUE_FULL`. Nothing was copied, sent, or removed; the caller
- * retains its buffers and MUST retry the exact submit. This function never
- * blocks. A binding may use bounded backoff, or call
- * `aster_reactor_reserve_response_capacity` and wait for the corresponding
- * reactor-poll notification before retrying. A caller that ignores
- * `ASTER_STATUS_QUEUE_FULL` drops its own response frame.
- */
-int32_t aster_reactor_submit(aster_runtime_t runtime,
-                             aster_reactor_t reactor,
-                             uint64_t call_id,
-                             const uint8_t *response_ptr,
-                             uint32_t response_len,
-                             const uint8_t *trailer_ptr,
-                             uint32_t trailer_len);
-
-/**
- * Submit one streaming response frame for a call. May be called multiple
- * times per call; each call enqueues one Frame on the reactor's mpsc channel.
- * The call_id remains valid until `aster_reactor_submit_trailer` is called.
- *
- * May return `ASTER_STATUS_QUEUE_FULL`; see `aster_reactor_submit` for the
- * exact-retry and asynchronous-reservation contract. Never blocks.
- *
- * `frame_ptr`/`frame_len` point to already-framed bytes (including the 4-byte
- * length prefix and 1-byte flags). The binding is responsible for framing.
- */
-int32_t aster_reactor_submit_frame(aster_runtime_t runtime,
-                                   aster_reactor_t reactor,
-                                   uint64_t call_id,
-                                   const uint8_t *frame_ptr,
-                                   uint32_t frame_len);
-
-/**
- * Submit the trailer for a call and close the stream. After this call, the
- * `call_id` is no longer valid after a SUCCESSFUL call; on `QUEUE_FULL` it
- * remains valid and must be retried. The trailer payload may be empty — the
- * reactor still finishes the send side cleanly.
- *
- * May return `ASTER_STATUS_QUEUE_FULL`; see `aster_reactor_submit` for the
- * exact-retry and asynchronous-reservation contract. Terminal state is
- * removed only after capacity is owned, so a retry cannot turn into a
- * truncated stream.
- */
-int32_t aster_reactor_submit_trailer(aster_runtime_t runtime,
-                                     aster_reactor_t reactor,
-                                     uint64_t call_id,
-                                     const uint8_t *trailer_ptr,
-                                     uint32_t trailer_len);
-
-/**
- * Pull the next ADDITIONAL request frame for a client-streaming or
- * bidi-streaming call. Blocks up to `timeout_ms` waiting for a frame.
- *
- * On `ASTER_RECV_FRAME_OK` (return value 0), the function writes:
- * - `*out_payload_ptr`: pointer to payload bytes (owned by the reactor's
- *   buffer registry — must be released via `aster_reactor_buffer_release`)
- * - `*out_payload_len`: payload length in bytes
- * - `*out_flags`: frame flags byte (peer may set `FLAG_END_STREAM` here on
- *   the last frame; the binding may use that as a hint but is not required
- *   to — the reactor will also surface end-of-stream as
- *   `ASTER_RECV_FRAME_END_OF_STREAM` on the next call)
- * - `*out_buffer_id`: registry id for releasing the payload buffer
- *
- * On `ASTER_RECV_FRAME_END_OF_STREAM` (return value 1) or
- * `ASTER_RECV_FRAME_TIMEOUT` (return value 2), no out parameters are
- * touched and the call_id remains valid for further recv attempts (in the
- * timeout case) or is now drained (end-of-stream case — further calls
- * will continue to return end-of-stream).
- *
- * Negative return values are `aster_status_t` error codes (e.g.
- * `ASTER_STATUS_NOT_FOUND` if the call_id is unknown).
- *
- * The first request frame is delivered inline via `aster_reactor_poll`'s
- * `request_ptr` / `request_len` / `request_flags` fields. This function
- * is for SUBSEQUENT frames only.
- */
-int32_t aster_reactor_recv_frame(aster_runtime_t runtime,
-                                 aster_reactor_t reactor,
-                                 uint64_t call_id,
-                                 uint32_t timeout_ms,
-                                 const uint8_t **out_payload_ptr,
-                                 uint32_t *out_payload_len,
-                                 uint8_t *out_flags,
-                                 uint64_t *out_buffer_id);
-
-/**
- * Check whether the given call has been cancelled by the peer (or by a
- * stream-level error). Streaming dispatchers should poll this from any
- * long-running emit loop and stop early when it returns 1.
- *
- * Returns:
- *   0 — call is alive (no cancellation observed yet)
- *   1 — call has been cancelled (peer sent FLAG_CANCEL or stream errored)
- *   ASTER_STATUS_NOT_FOUND (2) — the call_id is unknown: already completed, or
- *       cancelled and reaped. A caller MUST treat this as terminal and stop,
- *       exactly as it treats 1. It is NOT "alive".
- *  other `aster_status_t` codes — error. Note these are POSITIVE values; an
- *       earlier version of this comment said error codes are <0, which led
- *       callers to test `status == 1` and read NOT_FOUND as "keep going".
- */
-int32_t aster_reactor_check_cancelled(aster_runtime_t runtime,
-                                      aster_reactor_t reactor,
-                                      uint64_t call_id);
-
-/**
- * Release a buffer obtained from a reactor call descriptor.
- * Each buffer ID from aster_reactor_call_t must be released exactly once.
- */
-int32_t aster_reactor_buffer_release(aster_runtime_t runtime,
-                                     aster_reactor_t reactor,
-                                     uint64_t buffer);
-
-/**
- * One unary call on `connection`'s pooled streams (the Rust form of
- * `aster_call_unary`): one write of header + request, read to the trailer.
+ * One unary call on `connection`'s pooled streams: one write of header +
+ * request, read to the trailer.
  *
  * Returns `OK` once the call is over, whatever its outcome:
  * - `*out_status_code == 0`: `*out_resp_*` is the response (`{NULL,0}`

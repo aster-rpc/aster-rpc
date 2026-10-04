@@ -113,8 +113,11 @@ public final class Dispatch implements AutoCloseable {
   public static final int OPTION_MAX_SESSIONS_PER_CONNECTION = 3;
   public static final int OPTION_HANDLER_TIMEOUT_MS = 4;
 
-  /** {@code ASTER_TIMEOUT_INFINITE}. */
-  public static final int TIMEOUT_INFINITE = -1;
+  /**
+   * Slice for {@link #recv}: a native wait never exceeds this before the handler's own cancellation
+   * (call cancelled / over, thread interrupted) is re-checked. No {@code ASTER_TIMEOUT_INFINITE}.
+   */
+  public static final int RECV_SLICE_MS = 200;
 
   // ── method handles ───────────────────────────────────────────────────────
 
@@ -379,16 +382,44 @@ public final class Dispatch implements AutoCloseable {
 
   /**
    * The next request payload after the first (client-stream / bidi); {@code null} at the end of the
-   * request stream or when the call is over. Blocks: run it off virtual threads.
+   * request stream or when the call is over. Blocks in bounded {@link #RECV_SLICE_MS} native waits:
+   * between them it throws {@link java.util.concurrent.CancellationException} if the call was
+   * cancelled (peer cancel, deadline, server stopping) or the thread was interrupted (the interrupt
+   * flag is kept). Run it off virtual threads.
    */
   public byte[] recv(long callId) {
+    while (true) {
+      byte[] next = recvSlice(callId, RECV_SLICE_MS);
+      if (next != TIMED_OUT) {
+        return next;
+      }
+      if (Thread.currentThread().isInterrupted()) {
+        throw new java.util.concurrent.CancellationException(
+            "call " + callId + ": handler thread interrupted");
+      }
+      if (isCancelled(callId)) {
+        throw new java.util.concurrent.CancellationException("call " + callId + " was cancelled");
+      }
+    }
+  }
+
+  /** Sentinel for a {@link #recvSlice} that timed out. */
+  private static final byte[] TIMED_OUT = new byte[0];
+
+  /**
+   * One {@code aster_dispatch_recv} with a finite timeout: the payload, {@code null} at end of
+   * stream / call over, or {@link #TIMED_OUT}.
+   */
+  private byte[] recvSlice(long callId, int timeoutMs) {
     try {
       MemorySegment out = RECV_SCRATCH.get();
       MemorySegment ptr = out.asSlice(0, 8);
       MemorySegment len = out.asSlice(8, 4);
       MemorySegment buf = out.asSlice(16, 8);
-      int status =
-          (int) RECV.invoke(runtimeHandle, handle, callId, TIMEOUT_INFINITE, ptr, len, buf);
+      int status = (int) RECV.invoke(runtimeHandle, handle, callId, timeoutMs, ptr, len, buf);
+      if (status == IrohStatus.TIMEOUT.code) {
+        return TIMED_OUT;
+      }
       if (status == IrohStatus.NOT_FOUND.code) {
         return null;
       }

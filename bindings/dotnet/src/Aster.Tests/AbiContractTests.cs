@@ -69,13 +69,6 @@ public class AbiContractTests
     }
 
     [Fact]
-    public void EndpointConfig_Size_Matches_C_Header()
-    {
-        // aster_endpoint_config_t = 152 bytes (ffi/src/layout.rs)
-        Assert.Equal(152, Marshal.SizeOf<EndpointConfig>());
-    }
-
-    [Fact]
     public void ConnectConfig_Size_Matches_C_Header()
     {
         // struct iroh_connect_config_t {
@@ -143,29 +136,6 @@ public class AbiContractTests
         Assert.Equal(80, size);
     }
 
-    [Fact]
-    public void EndpointConfig_Field_Offsets_By_Size()
-    {
-        // Offsets pinned by ffi/src/layout.rs (aster_endpoint_config_t).
-        Assert.Equal(152, Marshal.SizeOf<EndpointConfig>());
-        Off<EndpointConfig>("struct_size", 0);
-        Off<EndpointConfig>("relay_mode", 4);
-        Off<EndpointConfig>("secret_key", 8);
-        Off<EndpointConfig>("alpns", 24);
-        Off<EndpointConfig>("relay_urls", 40);
-        Off<EndpointConfig>("enable_discovery", 56);
-        Off<EndpointConfig>("enable_hooks", 60);
-        Off<EndpointConfig>("hook_timeout_ms", 64);
-        Off<EndpointConfig>("bind_addr", 72);
-        Off<EndpointConfig>("clear_ip_transports", 88);
-        Off<EndpointConfig>("clear_relay_transports", 92);
-        Off<EndpointConfig>("portmapper_config", 96);
-        Off<EndpointConfig>("proxy_url", 104);
-        Off<EndpointConfig>("proxy_from_env", 120);
-        Off<EndpointConfig>("data_dir_utf8", 128);
-        Off<EndpointConfig>("hook_failure_mode", 144);
-    }
-
     private static void Off<T>(string field, int expected)
         => Assert.Equal(expected, (int)Marshal.OffsetOf<T>(field));
 
@@ -178,7 +148,6 @@ public class AbiContractTests
         Assert.Equal(80, Marshal.SizeOf<Event>());
         Assert.Equal(80, System.Runtime.CompilerServices.Unsafe.SizeOf<Event>());
         Assert.Equal(16, Marshal.SizeOf<RuntimeConfig>());
-        Assert.Equal(152, Marshal.SizeOf<EndpointConfig>());
         Assert.Equal(48, Marshal.SizeOf<ConnectConfig>());
         Assert.Equal(48, Marshal.SizeOf<NodeAddr>());
         Assert.Equal(16, Marshal.SizeOf<Bytes>());
@@ -348,7 +317,7 @@ public class AbiContractTests
     public void Runtime_Version_Is_Consistent()
     {
         var (major, minor, patch) = Runtime.Version;
-        Assert.Equal(3, major); // ASTER_ABI_VERSION_MAJOR this binding targets
+        Assert.Equal(4, major); // ASTER_ABI_VERSION_MAJOR this binding targets
         Assert.True(major >= 0);
         Assert.True(minor >= 0);
         Assert.True(patch >= 0);
@@ -396,33 +365,6 @@ public class AbiContractTests
         {
             Marshal.FreeHGlobal(mem);
         }
-    }
-
-    [Fact]
-    public void EndpointConfig_Default_Has_Correct_StructSize()
-    {
-        var cfg = new EndpointConfig
-        {
-            struct_size = (uint)Marshal.SizeOf<EndpointConfig>(),
-            relay_mode = 0,
-            secret_key = default,
-            alpns = default,
-            relay_urls = default,
-            enable_discovery = 1,
-            enable_hooks = 0,
-            hook_timeout_ms = 0,
-            bind_addr = default,
-            clear_ip_transports = 0,
-            clear_relay_transports = 0,
-            portmapper_config = 0,
-            proxy_url = default,
-            proxy_from_env = 0,
-            data_dir_utf8 = default,
-        };
-
-        Assert.Equal(152u, cfg.struct_size);
-        Assert.Equal(0u, cfg.relay_mode);
-        Assert.Equal(1u, cfg.enable_discovery);
     }
 
     // ─── Bytes helpers ───────────────────────────────────────────────────────

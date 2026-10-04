@@ -477,7 +477,7 @@ public final class AsterClient implements AutoCloseable {
   private <Resp> List<Resp> drain(long rt, long call, Class<Resp> responseType) {
     List<Resp> collected = new ArrayList<>();
     while (true) {
-      Rpc.Recv r = Rpc.recv(rt, call, Rpc.TIMEOUT_INFINITE);
+      Rpc.Recv r = Rpc.recvPolling(rt, call, () -> false); // bounded waits; interrupt cancels
       switch (r) {
         case Rpc.Recv.Data d -> {
           @SuppressWarnings("unchecked")
@@ -492,7 +492,7 @@ public final class AsterClient implements AutoCloseable {
           return collected;
         }
         case Rpc.Recv.Timeout ignored -> {
-          // TIMEOUT_INFINITE: unreachable
+          // recvPolling never returns Timeout
         }
       }
     }

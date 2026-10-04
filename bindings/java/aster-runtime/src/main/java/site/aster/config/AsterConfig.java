@@ -295,36 +295,6 @@ public final class AsterConfig {
 
   // ── Conversion ─────────────────────────────────────────────────────────
 
-  /**
-   * Convert network fields to an {@link EndpointConfig} for the deprecated endpoint FFI path.
-   *
-   * @deprecated nodes start from the full config via {@code aster_node_start} ({@link
-   *     site.aster.ffi.NativeConfig}); removed with ABI 4.0.
-   */
-  @Deprecated
-  public EndpointConfig toEndpointConfig() {
-    EndpointConfig ec = new EndpointConfig();
-    if (secretKey != null) ec.secretKey(secretKey);
-    if (relayMode != null) {
-      ec.relayMode(
-          switch (relayMode) {
-            case "disabled" -> 2;
-            case "staging" -> 3;
-            case "default" -> 0;
-            default -> 1;
-          });
-    }
-    if (bindAddr != null) ec.bindAddr(bindAddr);
-    ec.enableDiscovery(localDiscovery);
-    ec.enableHooks(enableHooks);
-    ec.hookTimeoutMs(hookTimeoutMs);
-    ec.clearIpTransports(clearIpTransports);
-    ec.clearRelayTransports(clearRelayTransports);
-    if (proxyUrl != null) ec.proxyUrl(proxyUrl);
-    ec.proxyFromEnv(proxyFromEnv);
-    return ec;
-  }
-
   /** Resolve the root public key from rootPubkey, rootPubkeyFile, or null. */
   public byte[] resolveRootPubkey() {
     if (rootPubkey != null) return rootPubkey;

@@ -12,16 +12,10 @@ mod common;
 
 #[test]
 fn test_abi_version() {
-    // 3.0.0: single `aster_` prefix, packed `aster_abi_version()`,
-    // `aster_runtime_new(expected_abi_major, ...)`.
-    // 3.1.0: additive AEv1 envelope + zstd functions (envelope.rs).
-    assert_eq!(ASTER_ABI_VERSION_MAJOR, 3);
-    // 3.2.0: additive node config, aster_node_start, Gate 0, admission (node.rs).
-    // 3.3.0: additive data-plane parity (data.rs).
-    // 3.4.0: additive pure functions: ids, HPKE, attestation, grants.
-    // 3.5.0: additive dynamic dispatch: aster_server_* / aster_dispatch_* /
-    // aster_rpc_* (server.rs, rpc.rs).
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 5);
+    // 4.0.0: removals only -- reactor, framed aster_call_*, the 3.2-deprecated
+    // node factories and bare endpoints (see RENAME_MAP.md "4.0").
+    assert_eq!(ASTER_ABI_VERSION_MAJOR, 4);
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 0);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);
@@ -254,26 +248,24 @@ fn test_operation_cancel() {
 }
 
 #[test]
-fn test_node_memory_creation() {
+fn test_node_start_memory_creation() {
     unsafe {
         let mut runtime: aster_runtime_t = 0;
         let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
         let mut operation: aster_operation_t = 0;
-        let status = aster_node_memory(runtime, 42, &mut operation);
-
+        let status = common::node_start_with_alpns(runtime, &[], 42, &mut operation);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         assert!(operation != 0, "Operation handle should be non-zero");
 
-        // Wait for event
-        std::thread::sleep(Duration::from_millis(100));
-
-        let mut events = [std::mem::zeroed(); 1];
-        let count = aster_poll_events(runtime, events.as_mut_ptr(), 1, 100);
-
-        // Poll completed without panicking/crashing.
-        let _ = count;
+        let ev = common::wait_for_successful_operation(
+            runtime,
+            operation,
+            aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
+        );
+        assert_eq!(ev.user_data, 42);
+        assert_ne!(ev.handle, 0);
 
         aster_runtime_close(runtime);
     }
@@ -354,10 +346,6 @@ fn test_free_functions_on_invalid_handles() {
             aster_status_t::ASTER_STATUS_NOT_FOUND as i32
         );
         assert_eq!(
-            aster_endpoint_free(runtime, 999999),
-            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
-        );
-        assert_eq!(
             aster_connection_free(runtime, 999999),
             aster_status_t::ASTER_STATUS_NOT_FOUND as i32
         );
@@ -377,68 +365,6 @@ fn test_free_functions_on_invalid_handles() {
             aster_gossip_topic_free(runtime, 999999),
             aster_status_t::ASTER_STATUS_NOT_FOUND as i32
         );
-
-        aster_runtime_close(runtime);
-    }
-}
-
-#[test]
-fn test_endpoint_create_invalid_config() {
-    unsafe {
-        let mut runtime: aster_runtime_t = 0;
-        let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime);
-        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
-
-        let mut operation: aster_operation_t = 0;
-
-        // Null config
-        let status = aster_endpoint_create(runtime, ptr::null(), 0, &mut operation);
-        assert_eq!(status, aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32);
-
-        // Null out_operation
-        let config = aster_endpoint_config_t {
-            struct_size: std::mem::size_of::<aster_endpoint_config_t>() as u32,
-            relay_mode: 0,
-            secret_key: aster_bytes_t {
-                ptr: ptr::null(),
-                len: 0,
-            },
-            alpns: aster_bytes_list_t {
-                items: ptr::null(),
-                len: 0,
-            },
-            relay_urls: aster_bytes_list_t {
-                items: ptr::null(),
-                len: 0,
-            },
-            enable_discovery: 0,
-            enable_hooks: 0,
-            hook_timeout_ms: 0,
-            bind_addr: aster_bytes_t {
-                ptr: ptr::null(),
-                len: 0,
-            },
-            clear_ip_transports: 0,
-            clear_relay_transports: 0,
-            portmapper_config: 0,
-            proxy_url: aster_bytes_t {
-                ptr: ptr::null(),
-                len: 0,
-            },
-            proxy_from_env: 0,
-            data_dir_utf8: aster_bytes_t {
-                ptr: ptr::null(),
-                len: 0,
-            },
-            hook_failure_mode: aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_OPEN as u32,
-        };
-        let status = aster_endpoint_create(runtime, &config, 0, ptr::null_mut());
-        assert_eq!(status, aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32);
-
-        let mut short_config = config;
-        short_config.struct_size = 0;
-        let status = aster_endpoint_create(runtime, &short_config, 0, &mut operation);
-        assert_eq!(status, aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32);
 
         aster_runtime_close(runtime);
     }
@@ -786,18 +712,6 @@ fn test_remote_info_struct_size() {
 // ============================================================================
 // Phase 1b: Hook Tests
 // ============================================================================
-
-#[test]
-fn test_hook_endpoint_config_fields() {
-    // Verify hooks fields are accessible in the config struct.
-    let config = common::hooks_endpoint_config();
-    assert_eq!(config.enable_hooks, 1);
-    assert_eq!(config.hook_timeout_ms, 2000);
-    assert_eq!(
-        config.hook_failure_mode,
-        aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_CLOSED as u32
-    );
-}
 
 #[test]
 fn test_hook_before_connect_respond_invalid_runtime() {
@@ -1549,19 +1463,18 @@ fn test_docs_join_and_subscribe_unknown_node_returns_not_found() {
 }
 
 #[test]
-fn test_hook_endpoint_config_with_hooks_creates_operation() {
-    // Verify that aster_endpoint_create with enable_hooks=1 accepts the config
-    // and returns a valid operation handle. The actual hook drainer is async
-    // and tested end-to-end through the Python layer.
+fn test_hook_node_with_hooks_creates_operation() {
+    // Verify that aster_node_start with enable_hooks=1 accepts the config
+    // and returns a valid operation handle. Hook events end to end are
+    // covered by `node_start.rs`.
     unsafe {
         let config = common::default_runtime_config();
         let mut runtime: aster_runtime_t = 0;
         let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut runtime);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
-        let ep_config = common::hooks_endpoint_config();
         let mut operation: aster_operation_t = 0;
-        let status = aster_endpoint_create(runtime, &ep_config, 0, &mut operation);
+        let status = common::node_start_with(runtime, &[b"hooks-test"], true, 0, &mut operation);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         assert!(operation != 0, "Operation handle should be non-zero");
 
@@ -1773,7 +1686,7 @@ fn test_blobs_local_info_unknown_node_returns_not_found() {
 }
 
 #[test]
-fn test_endpoint_addr_info_direct_address_list_is_aligned() {
+fn test_node_addr_info_direct_address_list_is_aligned() {
     // Regression: the `aster_bytes_t` array for `direct_addresses` is packed
     // after variable-length strings in the caller's buffer and used to be
     // written at an unaligned offset (UB; debug builds abort with
@@ -1784,23 +1697,14 @@ fn test_endpoint_addr_info_direct_address_list_is_aligned() {
         let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut runtime);
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
 
-        let ep_config = common::empty_endpoint_config();
-        let mut operation: aster_operation_t = 0;
-        let status = aster_endpoint_create(runtime, &ep_config, 0, &mut operation);
-        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
-        let created = common::wait_for_successful_operation(
-            runtime,
-            operation,
-            aster_event_kind_t::ASTER_EVENT_ENDPOINT_CREATED,
-        );
-        let endpoint = created.handle;
+        let endpoint = common::start_node(runtime, &[b"addr-test"]);
 
         let mut storage = vec![0u64; 1024];
         let base = storage.as_mut_ptr() as *mut u8;
         let mut saw_direct = false;
         for shift in 0..std::mem::align_of::<aster_bytes_t>() {
             let mut out: aster_node_addr_t = std::mem::zeroed();
-            let status = aster_endpoint_addr_info(
+            let status = aster_node_addr_info(
                 runtime,
                 endpoint,
                 base.add(shift),
@@ -1825,7 +1729,7 @@ fn test_endpoint_addr_info_direct_address_list_is_aligned() {
             }
         }
         if !saw_direct {
-            eprintln!("note: endpoint reported no direct addresses; list alignment not exercised");
+            eprintln!("note: node reported no direct addresses; list alignment not exercised");
         }
 
         aster_runtime_close(runtime);

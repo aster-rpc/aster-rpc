@@ -2,15 +2,15 @@
 
 **Package:** `github.com/aster-rpc/aster-go`
 **Target:** Go 1.25+ (Fory Go 1.7.6 requires it)
-**ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 3.x (`aster_*` symbols)
+**ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Status (ABI 3.5 dynamic dispatch, 2026-10-04)
+## Status (ABI 4.0, dynamic dispatch, 2026-10-04)
 
 **Working at RPC parity for open-gate interop.** Go is in the `tests/interop/`
 matrix (Rust / Python / TypeScript / Java / .NET / Go, 6×6 = 36/36, identical
 `InteropEcho` contract id `c5aa690b…`). The binding refuses a native library
-whose ABI major differs (3).
+whose ABI major differs (4).
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
   safe for concurrent use (a pool of Fory instances, no global lock). Payload types implement `aster.WireTyped`
@@ -33,8 +33,12 @@ whose ABI major differs (3).
   binding-level `[trust]` / `[connect]` / `[logging]` keys. `StartNode(ctx, cfg,
   NodeOptions{Gate, ExtraALPNs})` uses `aster_node_start`; `Node.Ticket`,
   `Connect`, `Accept`, `AddNodeAddr`, `SetGate`, `MetricsPrometheus`, `Docs()`.
-  The old `Memory*` / `Persistent*` / `NewEndpoint` factories are deprecated (ABI 4.0
-  removes them).
+  `Memory*` / `Persistent*` are convenience wrappers over `aster_node_start`
+  (ABI 4.0 removed `aster_node_memory*` / `aster_node_persistent`). ABI 4.0
+  also removed bare endpoints: `NewEndpoint` starts a node from the
+  `EndpointConfig` (mapped onto `AsterConfig`) and `Endpoint` is a view of it
+  (`Endpoint.Node()`); `Accept` uses `aster_accept`, which takes connections
+  from the node's ALPN queue.
 - **Gate 0:** `NewGate` (`aster_gate_*`: trust mode, admission ALPNs, reject
   code/reason, admit/revoke/is-admitted/should-allow). Without a gate, a node
   with `EnableHooks` delivers `*AdmissionRequest`s on `Node.Admissions()`;
@@ -67,8 +71,16 @@ whose ABI major differs (3).
   `CallServerStream`, `CallClientStream`, `CallBidiStream`, `OpenBidiStream`
   (`Send` / `CloseSend` / `Recv`) over the pooled `aster::rpc::RpcConnection`
   (`aster_rpc_unary`, `aster_rpc_open`, `aster_call_*_payload`). The ctx
-  deadline is enforced natively; cancelling ctx cancels streaming calls
-  natively (`aster_call_cancel`). Requests of client-stream / bidi calls are
+  deadline is enforced natively. A unary call with a ctx that can end
+  (`ctx.Done() != nil`) runs on its own native call (`aster_rpc_open`, as
+  .NET does for a cancellable token) so cancelling ctx cancels it natively
+  (`aster_call_cancel`: the stream is reset; Rust's server watches for peer
+  cancels on streaming calls only, so a unary handler runs on and its answer
+  is dropped); a ctx that
+  never ends uses the pooled `aster_rpc_unary` fast path. Streaming calls are
+  cancelled the same way. Every native receive wait (client
+  `aster_call_recv_payload`, server `aster_dispatch_recv`) is bounded (200 ms
+  slices) and re-checks the context between slices. Requests of client-stream / bidi calls are
   sent as the iterator yields them (ping-pong works). Sessions:
   `RpcConnection.NewSessionID` (the connection's shared counter) +
   `WithSession`; `WithMetadata`, `WithVersion`. Consumer admission is not
@@ -104,14 +116,8 @@ Known gaps:
 
 - Client interceptors are not wired; no `go generate` codegen yet; no
   consumer-admission handler (`OnNonRPC` hands the connection over).
-- Unary cancellation (other than the deadline) stops waiting but cannot
-  cancel the native call: `aster_rpc_unary` has no call handle.
 - A client-stream call with no request is refused by the Rust client
   (`INVALID_ARGUMENT`).
-- A client-stream / bidi handler blocked waiting for the next request is not
-  woken by its context (`aster_dispatch_recv` runs with
-  `ASTER_TIMEOUT_INFINITE`: a finite timeout panics in ABI 3.5.0); it returns
-  when the request stream ends or the connection closes.
 - `hostile_race_test.go` / `TestSoak_Short` have no peer and only check "no
   crash"; `TestSoak_Runs` (30 min) is skipped unless `ASTER_GO_SOAK=1`.
 
@@ -164,13 +170,13 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `types.go` | Event types and event kind constants (`//go:build !cgo`) |
 | `error.go` | Typed errors with `errors.Is`/`errors.As` support (`//go:build cgo`) |
 | `runtime.go` | `Runtime` type — poller goroutine, event dispatch, sync FFI helpers |
-| `node.go` | `Node` type — address, secret key, close; deprecated memory/persistent factories |
-| `endpoint.go` | `Endpoint` type — create, connect, accept, close |
+| `node.go` | `Node` type — address, secret key, close; `Memory*` / `Persistent*` wrappers over `StartNode` |
+| `endpoint.go` | `Endpoint` — a node-backed view (ABI 4.0): connect, accept, close, remote info, metrics |
 | `connection.go` | `Connection` type — bi/uni streams, datagrams |
 | `stream.go` | `SendStream` / `RecvStream` types — write/read/finish |
 | `cq_fake.go` | Goroutine-safe fake CQ for unit testing (`//go:build !cgo`) |
 | `cq_test.go` | 8 CQ state machine unit tests (`//go:build !cgo`) |
-| `abi_contract_test.go` + `abi_layout.go` | ABI contract tests — header struct sizes, ABI version, status names, endpoint config layout (`//go:build cgo`) |
+| `abi_contract_test.go` + `abi_layout.go` | ABI contract tests — header struct sizes, ABI version, status names, node-backed endpoint (`//go:build cgo`) |
 | `hostile_race_test.go` | 7 hostile race integration tests (`//go:build cgo`) |
 | `soak_test.go` | 2 soak/leak tests (`//go:build cgo`) |
 | `rpc_test.go`, `node_test.go`, `dataplane_test.go`, `vectors_test.go` | RPC (4 patterns, errors, deadlines, gate, interceptors, QUEUE_FULL), config/node/gate/admission, data plane, conformance vectors |

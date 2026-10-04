@@ -129,21 +129,20 @@ fn bench_cq_drain_batched(c: &mut Criterion) {
 
 fn bench_operation_submit_cancel(c: &mut Criterion) {
     let runtime = create_test_runtime();
-    let alpns = [b"test".as_ptr()];
-    let alpn_lens = [4];
+    let alpns = [aster_bytes_t {
+        ptr: b"test".as_ptr(),
+        len: 4,
+    }];
+    let mut cfg: node::aster_config_t = unsafe { std::mem::zeroed() };
+    unsafe { node::aster_config_init(&mut cfg) };
+    cfg.alpns = aster_bytes_list_t {
+        items: alpns.as_ptr(),
+        len: alpns.len(),
+    };
 
     // Create a node
     let mut node_op: aster_operation_t = 0;
-    let _status = unsafe {
-        aster_node_memory_with_alpns(
-            runtime,
-            alpns.as_ptr(),
-            alpn_lens.as_ptr(),
-            1,
-            0,
-            &mut node_op,
-        )
-    };
+    let _status = unsafe { node::aster_node_start(runtime, &cfg, 0, 0, &mut node_op) };
     // Wait for node to be created
     std::thread::sleep(std::time::Duration::from_millis(50));
 

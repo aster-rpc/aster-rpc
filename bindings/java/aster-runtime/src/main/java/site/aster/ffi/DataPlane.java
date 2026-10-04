@@ -32,9 +32,6 @@ public final class DataPlane {
   /** A finished operation: the event and a copy of its payload. */
   public record Result(IrohEvent event, byte[] data) {}
 
-  /** C ABI 3.3 minor version; functions here need a library at least this new. */
-  public static final int MIN_ABI_MINOR = 3;
-
   /** {@code ASTER_FETCH_TO_STORE}. */
   public static final int FETCH_TO_STORE = 1;
 

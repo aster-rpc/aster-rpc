@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 namespace Aster;
 
 /// <summary>
-/// Low-level P/Invoke declarations for the Aster C ABI (<c>ffi/aster_ffi.h</c>, ABI 3.x).
+/// Low-level P/Invoke declarations for the Aster C ABI (<c>ffi/aster_ffi.h</c>, ABI 4.x).
 ///
 /// Every declaration here mirrors the header prototype exactly: <c>uintptr_t</c> maps to
 /// <see cref="UIntPtr"/>, <c>aster_bytes_t</c> / <c>aster_bytes_list_t</c> passed by value map
@@ -17,7 +17,7 @@ internal static partial class Native
     private const string NativeLib = "libaster_transport_ffi";
 
     /// <summary>ABI major this binding is written against (<c>ASTER_ABI_VERSION_MAJOR</c>).</summary>
-    public const uint AbiVersionMajor = 3;
+    public const uint AbiVersionMajor = 4;
 
     // ─── Version / status ───────────────────────────────────────────────────
 
@@ -56,14 +56,6 @@ internal static partial class Native
 
     // ─── Node ───────────────────────────────────────────────────────────────
 
-    [LibraryImport(NativeLib, EntryPoint = "aster_node_memory")]
-    public static partial int aster_node_memory(ulong runtime, ulong user_data, out ulong out_operation);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_node_memory_with_alpns")]
-    public static unsafe partial int aster_node_memory_with_alpns(
-        ulong runtime, byte** alpns, UIntPtr* alpn_lens, UIntPtr alpn_count,
-        ulong user_data, out ulong out_operation);
-
     [LibraryImport(NativeLib, EntryPoint = "aster_node_id")]
     public static partial int aster_node_id(ulong runtime, ulong node, IntPtr out_buf, UIntPtr capacity, out UIntPtr out_len);
 
@@ -73,16 +65,7 @@ internal static partial class Native
     [LibraryImport(NativeLib, EntryPoint = "aster_node_free")]
     public static partial int aster_node_free(ulong runtime, ulong node);
 
-    // ─── Endpoint ───────────────────────────────────────────────────────────
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_endpoint_create")]
-    public static partial int aster_endpoint_create(ulong runtime, IntPtr config, ulong user_data, out ulong out_operation);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_endpoint_close")]
-    public static partial int aster_endpoint_close(ulong runtime, ulong endpoint, ulong user_data, out ulong out_operation);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_endpoint_id")]
-    public static partial int aster_endpoint_id(ulong runtime, ulong endpoint, IntPtr out_buf, UIntPtr capacity, out UIntPtr out_len);
+    // ─── Address book ───────────────────────────────────────────────────────────
 
     [LibraryImport(NativeLib, EntryPoint = "aster_add_node_addr")]
     public static partial int aster_add_node_addr(ulong runtime, ulong endpoint, NodeAddr addr);

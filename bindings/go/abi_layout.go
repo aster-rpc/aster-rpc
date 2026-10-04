@@ -16,7 +16,6 @@ func cStructSizes() map[string]uintptr {
 	return map[string]uintptr{
 		"aster_event_t":              unsafe.Sizeof(C.aster_event_t{}),
 		"aster_runtime_config_t":     unsafe.Sizeof(C.aster_runtime_config_t{}),
-		"aster_endpoint_config_t":    unsafe.Sizeof(C.aster_endpoint_config_t{}),
 		"aster_connect_config_t":     unsafe.Sizeof(C.aster_connect_config_t{}),
 		"aster_node_addr_t":          unsafe.Sizeof(C.aster_node_addr_t{}),
 		"aster_bytes_t":              unsafe.Sizeof(C.aster_bytes_t{}),

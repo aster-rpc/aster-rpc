@@ -63,7 +63,6 @@ final class AsterEnvelopeTest {
 
   @Test
   void layoutsMatchHeader() {
-    assertTrue(IrohLibrary.getInstance().abiVersionMinor() >= AsterEnvelope.REQUIRED_ABI_MINOR);
     assertEquals(96, AsterEnvelope.STREAM_HEADER.byteSize());
     assertEquals(16, off(AsterEnvelope.STREAM_HEADER, "deadline"));
     assertEquals(18, off(AsterEnvelope.STREAM_HEADER, "serialization_mode"));

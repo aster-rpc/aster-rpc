@@ -24,9 +24,6 @@ public final class NativeCall {
 
   private NativeCall() {}
 
-  /** Minimum ABI minor (with major 3) that exports the pure functions. */
-  public static final int PURE_ABI_MINOR = 4;
-
   /** Size of every raw key / id. */
   public static final int KEY_SIZE = 32;
 
@@ -40,22 +37,9 @@ public final class NativeCall {
               FunctionDescriptor.of(
                   ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
 
-  /** Resolve a 3.4 function, failing clearly on an older library. */
+  /** Resolve a pure function (every ABI 4.x library exports them; the major is checked at load). */
   public static MethodHandle handle(String name, FunctionDescriptor desc) {
-    IrohLibrary lib = IrohLibrary.getInstance();
-    if (lib.abiVersionMinor() < PURE_ABI_MINOR) {
-      throw new UnsatisfiedLinkError(
-          "aster native library ABI "
-              + lib.abiVersionMajor()
-              + "."
-              + lib.abiVersionMinor()
-              + " lacks "
-              + name
-              + " (need 3."
-              + PURE_ABI_MINOR
-              + "+)");
-    }
-    return lib.getHandle(name, desc);
+    return IrohLibrary.getInstance().getHandle(name, desc);
   }
 
   /** {@code int f(args...)}. */

@@ -4,12 +4,14 @@
 **Target:** .NET 9+
 **ABI contract:** Rust FFI via source-generated P/Invoke (`LibraryImport`)
 **Native library:** `libaster_transport_ffi.{dylib,so}` / `aster_transport_ffi.dll` from `target/release` (falls back to `target/debug`; override with `-p:NativeLibraryPath=...`)
-**C header:** `ffi/aster_ffi.h`, ABI 3.x (`aster_*` symbols; `aster_runtime_new(3, ...)`)
+**C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 3.5 dynamic dispatch, 2026-10-04)
+## STATUS (ABI 4.0, 2026-10-04)
 
-- **ABI:** needs `libaster_transport_ffi` ABI >= 3.5 (`Native.RequiredAbiMinor`). Struct
+- **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
+  `Native.RequiredAbiMinor` = 0; 4.0 removed the reactor, framed calls, the node factories and
+  bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
 - **Codec:** Apache.Fory **1.7.6** (`ForyCodec`: `ThreadSafeFory`, compatible on, ref tracking
@@ -29,7 +31,10 @@
   `AsterConfig` is a record with `FromEnv()` / `FromToml()` resolved by the Rust
   `aster::AsterConfig`. Gate 0 (`Gate`), admission events (`Node.Admissions` +
   `AdmissionRequest.Allow/Deny`), tickets (`AsterTicket`), Prometheus metrics.
-  `Node.MemoryWithAlpnsAsync` and `Endpoint.CreateAsync` are `[Obsolete]` (removed in ABI 4.0).
+  `Node.MemoryWithAlpnsAsync` is gone (use `StartAsync`). `Endpoint` is a connect/accept view
+  of a node: since ABI 4.0 has no bare endpoints, `Endpoint.CreateAsync(runtime, builder)` starts
+  an in-memory node on that runtime with the builder's ALPNs (`aster_node_start`) and uses the
+  node functions; `aster_accept` on a node takes from its ALPN accept queue.
 - **RPC (ABI 3.5, F4):** `AsterServer` serves through Rust's `aster::rpc::Server`
   (`aster_server_*` / `aster_dispatch_*`, wrapped by the internal `DispatchServer`). Each
   `ServiceDefinition` registers its JSON registration form (`RegistrationJson`; Rust derives the
@@ -47,9 +52,9 @@
   `aster_rpc_open` + `aster_call_{send,recv}_payload(s)` for streaming; a unary call with a
   cancellable token runs on its own stream so the token cancels the native call
   (`aster_call_cancel`). Rust surfaces a client cancel to the server handler for streaming calls
-  only (it does not watch unary streams). The deprecated `aster_reactor_*` and framed
-  `aster_call_{acquire,acquire_streaming,send_frame,recv_frame,unary}` are no longer used
-  (`Reactor.cs` is gone).
+  only (it does not watch unary streams). Blocking request reads (`aster_dispatch_recv`) wait
+  in bounded slices that re-check the handler token. *Historical:* the old `Reactor.cs` path
+  over `aster_reactor_*` and framed `aster_call_*` (both removed in ABI 4.0) is gone.
 - **Data plane (3.3):** blobs read-range / provider fetch with report / GC / status, tag prefix
   delete, docs open / import / authority / retire / durable set / entry status, connection
   paths, stream priority. **Pure functions (3.4):** `Aster.Crypto.Ids`, `Hpke`, `Attestation`,
@@ -201,15 +206,14 @@ public async ValueTask DisposeAsync()
 
 ---
 
-### 6. Endpoint Configuration — 152-Byte Struct
+### 6. ABI Struct Layouts
 
-**Decision:** `EndpointConfig` mirrors `aster_endpoint_config_t` field-for-field with
-`LayoutKind.Sequential`; the size (152) and every offset are asserted in
-`AbiContractTests` against the numbers pinned in `ffi/src/layout.rs`. The last
-field, `hook_failure_mode` @144, was previously missing (struct was 144 bytes).
-All other ABI structs (`Event` 80, `RuntimeConfig` 16, `ConnectConfig` 48,
-`NodeAddr` 48, `Bytes`/`BytesList` 16, `DispatchEventNative` 104, `CallOptionsNative` 72) are checked the
-same way. Never hand-compute offsets — add a field to the struct and a
+*Historical:* `EndpointConfig` mirrored `aster_endpoint_config_t` (152 bytes); ABI 4.0
+removed that struct with bare endpoints, and `EndpointConfigBuilder` now maps onto
+`AsterConfig`.
+The ABI structs (`Event` 80, `RuntimeConfig` 16, `ConnectConfig` 48,
+`NodeAddr` 48, `Bytes`/`BytesList` 16, `DispatchEventNative` 104, `CallOptionsNative` 72) have their size and
+offsets asserted in `AbiContractTests` against `ffi/src/layout.rs`. Never hand-compute offsets — add a field to the struct and a
 `Marshal.OffsetOf` assertion instead.
 
 ---
@@ -221,7 +225,7 @@ same way. Never hand-compute offsets — add a field to the struct and a
 **Critical values:**
 ```csharp
 EventKind.None = 0
-EventKind.EndpointCreated = 3
+EventKind.EndpointCreated = 3   // reserved, never emitted since ABI 4.0
 EventKind.Closed = 5
 EventKind.Connected = 10
 EventKind.ConnectionAccepted = 12

@@ -1,12 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 
 namespace Aster;
 
 /// <summary>
-/// Builder for EndpointConfig with a fluent API.
+/// Fluent configuration for <see cref="Endpoint.CreateAsync(Runtime, EndpointConfigBuilder, System.Threading.CancellationToken)"/>
+/// (an in-memory node accepting these ALPNs).
 /// </summary>
 public sealed class EndpointConfigBuilder
 {
@@ -25,12 +27,18 @@ public sealed class EndpointConfigBuilder
     public EndpointConfigBuilder SecretKey(byte[] sk) { _secretKey = sk; return this; }
     public EndpointConfigBuilder EnableDiscovery(bool enabled) { _enableDiscovery = enabled; return this; }
 
-    internal int AlpnCount => _alpns.Count;
-    internal RelayMode RelayModeValue => _relayMode;
-    internal bool EnableDiscoveryValue => _enableDiscovery;
-
-    internal IEnumerable<(byte[] Bytes, int Len)> EnumerateAlpns()
+    /// <summary>The <see cref="AsterConfig"/> of the in-memory node an endpoint starts (ABI 4.0).</summary>
+    internal AsterConfig ToAsterConfig() => new()
     {
-        foreach (var b in _alpns) yield return (b, b.Length);
-    }
+        RelayMode = _relayMode switch
+        {
+            RelayMode.Disabled => "disabled",
+            RelayMode.Staging => "staging",
+            RelayMode.Custom => "custom",
+            _ => null,
+        },
+        SecretKey = _secretKey,
+        Alpns = _alpns.Select(a => Encoding.UTF8.GetString(a)).ToArray(),
+        LocalDiscovery = _enableDiscovery,
+    };
 }

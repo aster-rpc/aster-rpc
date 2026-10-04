@@ -25,7 +25,6 @@ use crate::node::{aster_config_t, aster_portmapper_t, aster_trust_mode_t};
 use crate::pure::{
     aster_attest_options_t, aster_attestation_role_t, aster_id_kind_t, aster_verified_chain_t,
 };
-use crate::reactor::aster_reactor_call_t;
 use crate::rpc::aster_call_options_t;
 use crate::server::{
     aster_cancel_reason_t, aster_dispatch_event_kind_t, aster_dispatch_event_t,
@@ -86,25 +85,6 @@ mod lp64 {
         worker_threads = 4,
         event_queue_capacity = 8,
         reserved = 12,
-    });
-
-    assert_layout!(aster_endpoint_config_t, size = 152, align = 8, {
-        struct_size = 0,
-        relay_mode = 4,
-        secret_key = 8,
-        alpns = 24,
-        relay_urls = 40,
-        enable_discovery = 56,
-        enable_hooks = 60,
-        hook_timeout_ms = 64,
-        bind_addr = 72,
-        clear_ip_transports = 88,
-        clear_relay_transports = 92,
-        portmapper_config = 96,
-        proxy_url = 104,
-        proxy_from_env = 120,
-        data_dir_utf8 = 128,
-        hook_failure_mode = 144,
     });
 
     assert_layout!(aster_connect_config_t, size = 48, align = 8, {
@@ -185,25 +165,6 @@ mod lp64 {
         relay_home_change = 112,
         net_reports = 120,
         net_reports_full = 128,
-    });
-
-    assert_layout!(aster_reactor_call_t, size = 112, align = 8, {
-        event_kind = 0,
-        call_id = 8,
-        connection_id = 16,
-        stream_id = 24,
-        header_ptr = 32,
-        header_len = 40,
-        header_flags = 44,
-        request_ptr = 48,
-        request_len = 56,
-        request_flags = 60,
-        peer_ptr = 64,
-        peer_len = 72,
-        header_buffer = 80,
-        request_buffer = 88,
-        peer_buffer = 96,
-        connection_handle = 104,
     });
 
     // ABI 3.1: AEv1 envelope structs (envelope.rs).

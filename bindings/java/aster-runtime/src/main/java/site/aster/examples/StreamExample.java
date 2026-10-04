@@ -2,11 +2,11 @@ package site.aster.examples;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import site.aster.config.EndpointConfig;
 import site.aster.handle.IrohConnection;
 import site.aster.handle.IrohEndpoint;
 import site.aster.handle.IrohRuntime;
 import site.aster.handle.IrohStream;
+import site.aster.node.IrohNode;
 import site.aster.node.NodeAddr;
 
 /** Test bidirectional streams: OpenBi, Write, Read between two endpoints. */
@@ -31,10 +31,13 @@ public class StreamExample {
     // Create runtime A and endpoint A (listener)
     System.out.println("1. Creating endpoint A (listener)...");
 
-    IrohRuntime runtimeA = IrohRuntime.create();
-    EndpointConfig configA = new EndpointConfig().alpns(java.util.List.of(ALPN));
-    IrohEndpoint endpointA =
-        runtimeA.endpointCreateAsync(configA).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    // ABI 4.0: endpoints are views of nodes started with aster_node_start.
+    IrohNode nodeA =
+        IrohNode.memoryWithAlpns(
+                java.util.List.of(ALPN.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+            .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    IrohRuntime runtimeA = nodeA.runtime();
+    IrohEndpoint endpointA = IrohEndpoint.ofNode(runtimeA, nodeA.nodeHandle());
 
     String epAID = endpointA.nodeId();
     System.out.printf("   Endpoint A created!%n%n", epAID);
@@ -42,10 +45,13 @@ public class StreamExample {
     // Create runtime B and endpoint B (dialer)
     System.out.println("2. Creating endpoint B (dialer)...");
 
-    IrohRuntime runtimeB = IrohRuntime.create();
-    EndpointConfig configB = new EndpointConfig().alpns(java.util.List.of(ALPN));
-    IrohEndpoint endpointB =
-        runtimeB.endpointCreateAsync(configB).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    // ABI 4.0: endpoints are views of nodes started with aster_node_start.
+    IrohNode nodeB =
+        IrohNode.memoryWithAlpns(
+                java.util.List.of(ALPN.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+            .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    IrohRuntime runtimeB = nodeB.runtime();
+    IrohEndpoint endpointB = IrohEndpoint.ofNode(runtimeB, nodeB.nodeHandle());
 
     String epBID = endpointB.nodeId();
     System.out.printf("   Endpoint B created!%n%n", epBID);

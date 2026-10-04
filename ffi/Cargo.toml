@@ -12,16 +12,6 @@ crate-type = ["rlib", "cdylib"]
 name = "soak_test_runner"
 path = "src/bin/soak_test_runner/main.rs"
 
-[[test]]
-name = "reactor_cancel_lifecycle"
-path = "tests/reactor_cancel_lifecycle.rs"
-required-features = ["test-hooks"]
-
-[features]
-# Exposes `reactor::debug_call_state_len` for the live-reactor cleanup test.
-# Never on in a shipping build; the test that needs it enables it explicitly.
-test-hooks = []
-
 [dependencies]
 aster_transport_core = { path = "../core", version = "=0.3.0" }
 # Plan D1: the C ABI wraps the `aster` crate (node + config + Gate 0 since ABI

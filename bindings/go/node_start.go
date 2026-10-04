@@ -211,7 +211,7 @@ func (n *Node) AddNodeAddr(addr *NodeAddr) error {
 }
 
 // Accept accepts the next inbound connection on one of the node's ALPNs
-// that is not served by a reactor.
+// (aster_accept takes it from the node's ALPN accept queue).
 func (n *Node) Accept(ctx context.Context) (*Connection, error) {
 	var op C.aster_operation_t
 	if err := wrapStatus("aster_accept", C.aster_accept(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), 0, &op)); err != nil {
