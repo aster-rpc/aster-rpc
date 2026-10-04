@@ -1,0 +1,143 @@
+# Aster conformance scenario: server-side error mapping
+#
+# Pins which status a server returns for each way a call can fail before, or
+# instead of, a normal handler response (dynamic-dispatch-design.md section 2.7,
+# Aster-SPEC section 6.5, session rules from Aster-multiplexed-streams section
+# 7.5). Every binding's server must produce these codes.
+#
+# Status: descriptive. No runner consumes conformance/scenarios/ yet. The Rust
+# server enforces this table in aster/tests/rpc_error_mapping.rs (one test per
+# row marked `rust_test`); the interop matrix (tests/interop/) is the intended
+# cross-binding runner.
+#
+# Rows are listed in the order the server checks them, so the first matching
+# row wins when a call fails several checks at once. Session lookup runs after
+# the serialization-mode check and before the capability (Gate 3) check.
+
+name: error-mapping
+description: Status codes for routing, gating, session, payload and handler failures
+
+service:
+  name: ErrorMapping
+  version: 1
+  scope: shared
+  methods:
+    - name: echo
+      pattern: unary
+    - name: guarded
+      pattern: unary
+      requires: { role: "admin" }
+    - name: sleeps
+      pattern: unary
+    - name: raises
+      pattern: unary
+
+session_service:
+  name: ErrorMappingSession
+  version: 1
+  scope: session
+  methods:
+    - name: echo
+      pattern: unary
+
+rows:
+  - source: malformed stream header
+    trigger: header frame payload is not a decodable StreamHeader
+    expected_status: INVALID_ARGUMENT
+    note: was INTERNAL in the Rust server before R3a
+    rust_test: malformed_header
+
+  - source: missing service name
+    trigger: { service: "" }
+    expected_status: INVALID_ARGUMENT
+    rust_test: missing_service
+
+  - source: unknown service
+    trigger: { service: "NoSuchService", version: 1 }
+    expected_status: NOT_FOUND
+    rust_test: unknown_service
+
+  - source: unknown version
+    trigger: { service: ErrorMapping, version: 2 }
+    expected_status: NOT_FOUND
+    rust_test: unknown_version
+
+  - source: iroh_only service over a non-iroh transport
+    trigger: peer provenance is not an iroh handshake
+    expected_status: NOT_FOUND
+    note: NOT_FOUND rather than PERMISSION_DENIED; existence is not confirmed
+    rust_test: iroh_only_over_other_transport
+
+  - source: unknown method
+    trigger: { service: ErrorMapping, method: nope }
+    expected_status: UNIMPLEMENTED
+    rust_test: unknown_method
+
+  - source: unsupported serialization mode
+    trigger: { serialization_mode: 3 }
+    expected_status: INVALID_ARGUMENT
+    rust_test: unsupported_mode
+
+  - source: SHARED service called with a session id
+    trigger: { service: ErrorMapping, session_id: 7 }
+    expected_status: FAILED_PRECONDITION
+    rust_test: shared_with_session_id
+
+  - source: SESSION service called without a session id
+    trigger: { service: ErrorMappingSession, session_id: 0 }
+    expected_status: FAILED_PRECONDITION
+    note: the HTTP transport's missing aster-session-id maps here too (was INVALID_ARGUMENT)
+    rust_test: session_without_session_id
+
+  - source: session id at or below the connection's last opened id, not active
+    trigger: open session 5, then call session 3 on the same connection
+    expected_status: NOT_FOUND
+    rust_test: session_graveyard
+
+  - source: new session over max_sessions_per_connection
+    trigger: cap 1; open session 1, then call session 2 on the same connection
+    expected_status: RESOURCE_EXHAUSTED
+    note: last_opened is not bumped, so a retry is RESOURCE_EXHAUSTED again
+    rust_test: session_cap
+
+  - source: capability (Gate 3) check failed
+    trigger: { method: guarded } from a peer without role=admin
+    expected_status: PERMISSION_DENIED
+    rust_test: capability_denied
+
+  - source: compressed first request frame does not inflate
+    trigger: request frame with FLAG_COMPRESSED and a non-zstd payload
+    expected_status: INVALID_ARGUMENT
+    rust_test: bad_compressed_request
+
+  - source: deadline exceeded
+    trigger: { method: sleeps, deadline: 1 } where the handler never returns
+    expected_status: DEADLINE_EXCEEDED
+    note: >
+      Effective timeout is min(header deadline, method default timeout,
+      server maximum handler timeout). The handler is cancelled.
+    rust_test: deadline_exceeded
+
+  - source: peer cancelled the call
+    trigger: client sends FLAG_CANCEL or resets the stream
+    expected_status: none
+    note: no trailer is sent (Aster-SPEC section 6.0)
+
+  - source: handler raised the binding's RpcError(code, message, details)
+    trigger: { method: raises }
+    expected_status: passed through unchanged
+    rust_test: handler_status_passes_through
+
+  - source: request payload failed to decode in the binding
+    expected_status: INVALID_ARGUMENT
+
+  - source: any other handler exception
+    expected_status: INTERNAL
+    note: message included unless the server redacts internal errors
+
+  - source: call handle dropped or abandoned without a trailer
+    expected_status: INTERNAL
+    note: >
+      Foreign (binding) dispatch sends INTERNAL "handler dropped call". A native
+      Rust handler that drops its Call without a trailer ends the stream instead,
+      and the client reports a missing trailer.
