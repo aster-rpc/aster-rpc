@@ -13,17 +13,6 @@
     <name>Aster Parent</name>
     <description>Aster Java multi-module parent</description>
 
-    <distributionManagement>
-        <repository>
-            <id>github</id>
-            <url>https://maven.pkg.github.com/aster-rpc/aster-rpc-internal</url>
-        </repository>
-        <snapshotRepository>
-            <id>github</id>
-            <url>https://maven.pkg.github.com/aster-rpc/aster-rpc-internal</url>
-        </snapshotRepository>
-    </distributionManagement>
-
     <modules>
         <module>aster-annotations</module>
         <module>aster-codegen-core</module>

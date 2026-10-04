@@ -3,9 +3,8 @@
 #
 #   scripts/release/publish-generic-package.sh <package> <version> <file>...
 #
-# Used for development builds (`<package>/dev-<run>`, matched by the owner's
-# package cleanup rule) and for tagged releases (`<package>/<semver>`, never
-# matched by it). A file already present with the same SHA-256 is skipped; one
+# Used only for tagged releases (`<package>/<semver>`); publishing happens on
+# versioned release tags, never on branch pushes. A file already present with the same SHA-256 is skipped; one
 # present with a different SHA-256 fails the run rather than being replaced, so
 # a published version is immutable. Forgejo's own digests are re-read after
 # upload, so a 2xx response is not the only evidence.
