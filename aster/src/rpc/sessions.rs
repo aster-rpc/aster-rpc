@@ -27,6 +27,7 @@ use super::codec::RpcStatus;
 use super::foreign::ForeignSession;
 use super::server::ServiceDispatch;
 use super::status::StatusCode;
+use crate::log_targets::SESSION;
 
 /// `(service, version)`.
 pub(crate) type ServiceKey = (String, i32);
@@ -133,6 +134,15 @@ impl SessionStore {
         let inst = factory();
         state.last_opened = session_id;
         state.active.insert(key, inst.clone());
+        tracing::debug!(
+            target: SESSION,
+            connection_id,
+            session_id,
+            service = service.0.as_str(),
+            version = service.1,
+            active = state.active.len(),
+            "session opened"
+        );
         Ok(inst)
     }
 
@@ -155,7 +165,17 @@ impl SessionStore {
             .lock()
             .unwrap()
             .entry(key)
-            .or_insert_with(|| factory())
+            .or_insert_with(|| {
+                tracing::debug!(
+                    target: SESSION,
+                    principal,
+                    session_id,
+                    service = service.0.as_str(),
+                    version = service.1,
+                    "http session opened"
+                );
+                factory()
+            })
             .clone()
     }
 
@@ -164,7 +184,16 @@ impl SessionStore {
     pub(crate) fn close_connection(&self, connection_id: u64) -> usize {
         let state = self.connections.lock().unwrap().remove(&connection_id);
         // Instances (and any `Drop` they run) are released outside the lock.
-        state.map_or(0, |s| s.active.len())
+        let reaped = state.map_or(0, |s| s.active.len());
+        if reaped > 0 {
+            tracing::debug!(
+                target: SESSION,
+                connection_id,
+                reaped,
+                "sessions reaped with their connection"
+            );
+        }
+        reaped
     }
 
     /// Drop every HTTP-scoped instance for `session_id`, for any principal.
@@ -178,6 +207,12 @@ impl SessionStore {
                 .collect();
             keys.into_iter().filter_map(|k| http.remove(&k)).collect()
         };
+        tracing::debug!(
+            target: SESSION,
+            session_id,
+            ended = removed.len(),
+            "http session ended"
+        );
         drop(removed);
     }
 }

@@ -152,6 +152,10 @@ iroh-gossip = { workspace = true, optional = true }
 iroh-tickets = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# Structured logging (R10). The facade only: no subscriber is installed here --
+# the application picks one (see docs/aster-rust-getstarted.md "Logging"). Same
+# version core and iroh already use, so this adds no crate to the graph.
+tracing = "0.1"
 thiserror = "2"
 hex = "0.4"
 base64 = "0.22"

@@ -26,7 +26,9 @@ use aster::rpc::{
     RpcStatus, ScopeKind, ServiceDispatch, StatusCode, StreamHeader, TypeRef, ROLE_ATTRIBUTE,
 };
 use aster::{AsterConfig, Error, Node, RelayMode};
-use aster_transport_core::framing::{encode_frame, FLAG_CANCEL, FLAG_END_STREAM, FLAG_HEADER};
+use aster_transport_core::framing::{
+    encode_frame, FLAG_CANCEL, FLAG_COMPRESSED, FLAG_END_STREAM, FLAG_HEADER, FLAG_TRAILER,
+};
 use tokio::time::timeout;
 
 // ── the services ────────────────────────────────────────────────────────────
@@ -334,10 +336,15 @@ fn handle(
         (ECHO, SUM) => {
             assert_eq!(flags & FLAG_FIRST_IS_END, 0);
             let mut total: u32 = request.iter().map(|b| *b as u32).sum();
-            while let Some(more) = rt.block_on(table.recv(id)).unwrap() {
+            while let Some(more) = rt.block_on(table.recv(id)).unwrap_or(None) {
                 total += more.iter().map(|b| *b as u32).sum::<u32>();
             }
-            table.try_respond(id, &total.to_le_bytes(), &ok).unwrap();
+            match table.try_respond(id, &total.to_le_bytes(), &ok) {
+                Ok(()) => {}
+                // A corrupt request frame: Rust already failed the call.
+                Err(SubmitError::NotFound) => note(&observed, format!("sum:ended:{total}")),
+                Err(e) => panic!("sum: {e}"),
+            }
         }
         (ECHO, CHAT) => {
             let mut next = Some(request);
@@ -699,6 +706,59 @@ async fn peer_cancel_reaches_a_streaming_handler() {
         .unwrap();
     assert_eq!(out, b"after");
     binding.assert_table_drains().await;
+    drop(binding);
+    srv.shutdown().await;
+}
+
+/// R10: a later request frame that does not inflate fails the call with
+/// `INVALID_ARGUMENT` (sent by Rust), and the binding learns it through
+/// `recv` ending and `Cancelled { InvalidRequest }`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corrupt_later_request_frame_fails_the_call() {
+    let Setup { srv, binding } = start().await;
+    let (_client, conn) = client(&srv).await;
+
+    let (send, recv) = within(conn.core_connection().open_streaming_substream())
+        .await
+        .unwrap();
+    let hdr = aster::rpc::encode_stream_header(&echo("sum")).unwrap();
+    send.write_all(encode_frame(&hdr, FLAG_HEADER).unwrap())
+        .await
+        .unwrap();
+    send.write_all(encode_frame(&[1, 2], 0).unwrap())
+        .await
+        .unwrap();
+    send.write_all(encode_frame(b"not zstd", FLAG_COMPRESSED).unwrap())
+        .await
+        .unwrap();
+    // The only frame back is the trailer.
+    let len = within(recv.read_exact(4)).await.unwrap();
+    let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+    let body = within(recv.read_exact(len)).await.unwrap();
+    assert_ne!(body[0] & FLAG_TRAILER, 0, "trailer, not data");
+    let status = aster::rpc::codec::decode_rpc_status(&body[1..]).unwrap();
+    assert_eq!(
+        status.code,
+        StatusCode::InvalidArgument.as_i32(),
+        "{status:?}"
+    );
+    assert!(status.message.starts_with("request payload:"), "{status:?}");
+
+    binding
+        .until("sum ended", |o| o.notes.iter().any(|n| n == "sum:ended:3"))
+        .await;
+    assert!(binding
+        .observed()
+        .cancelled
+        .iter()
+        .any(|(_, r, m)| *r == CancelReason::InvalidRequest && *m == SUM));
+    binding.assert_table_drains().await;
+
+    // The connection survives.
+    let out = within(conn.unary(&echo("echo"), b"after".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(out, b"after");
     drop(binding);
     srv.shutdown().await;
 }

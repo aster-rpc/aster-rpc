@@ -69,6 +69,7 @@ mod error;
 pub mod grants;
 mod id;
 pub mod lease;
+pub mod log_targets;
 pub mod native;
 mod net;
 mod node;
