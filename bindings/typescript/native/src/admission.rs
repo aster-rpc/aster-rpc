@@ -7,7 +7,10 @@
 //! admission without calling into JavaScript; a node started with
 //! `enableHooks` and no gate hands each decision to `node.admission()`, an
 //! `AsyncIterable` of [`AdmissionRequest`]s answered with `accept()` /
-//! `reject(code, reason)`.
+//! `reject(code, reason)` — or, instead of the iterator, by upcalls
+//! (`node.serveAdmissionUpcalls(upcalls)`, kinds 64 / 65: one queue and one
+//! respond path shared with the other JavaScript extension points; the
+//! upcall policy's failure mode decides when JavaScript gives no answer).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 use aster::binding_support::core::{
     CoreAfterHandshakeDecision, CoreHookConnectInfo, CoreHookHandshakeInfo,
 };
+use aster::binding_support::upcall::{self as up, codec as ucodec, UpcallKind};
 use aster::binding_support::CoreHookReceiver;
 use aster::{
     AdmissionSource, GateDecision as RsGateDecision, GatePolicy as RsGatePolicy,
@@ -464,7 +468,51 @@ struct Pending {
 pub(crate) struct AdmissionHub {
     gate: RwLock<Option<Arc<RwLock<RsGatePolicy>>>>,
     listener: Mutex<Option<mpsc::UnboundedSender<Pending>>>,
+    /// Answer by upcall instead of the iterator.
+    upcalls: RwLock<Option<up::Upcalls>>,
     taken: AtomicBool,
+}
+
+/// Answer one admission request by upcall. Gives up (cancelling the upcall)
+/// if the node stops waiting first.
+async fn answer_by_upcall(upcalls: up::Upcalls, p: Pending) {
+    match p.reply {
+        Reply::Outbound(mut tx) => {
+            let call = upcalls.call(
+                UpcallKind::AdmissionConnect,
+                ucodec::encode_admission_connect_request(&p.peer, &p.alpn),
+            );
+            let answer = tokio::select! {
+                a = call => a,
+                _ = tx.closed() => return,
+            };
+            let allow = upcalls.decide(
+                UpcallKind::AdmissionConnect,
+                answer,
+                ucodec::decode_decision,
+            );
+            let _ = tx.send(allow);
+        }
+        Reply::Inbound(mut tx) => {
+            let call = upcalls.call(
+                UpcallKind::AdmissionHandshake,
+                ucodec::encode_admission_handshake_request(&p.peer, &p.alpn, p.is_alive),
+            );
+            let answer = tokio::select! {
+                a = call => a,
+                _ = tx.closed() => return,
+            };
+            let _ = tx.send(match up::admission::handshake_decision(&upcalls, answer) {
+                ucodec::HandshakeDecision::Accept => CoreAfterHandshakeDecision::Accept,
+                ucodec::HandshakeDecision::Reject { code, reason } => {
+                    CoreAfterHandshakeDecision::Reject {
+                        error_code: code,
+                        reason,
+                    }
+                }
+            });
+        }
+    }
 }
 
 impl AdmissionHub {
@@ -476,6 +524,7 @@ impl AdmissionHub {
         let hub = Arc::new(Self {
             gate: RwLock::new(gate.map(|g| g.inner.clone())),
             listener: Mutex::new(None),
+            upcalls: RwLock::new(None),
             taken: AtomicBool::new(false),
         });
         let CoreHookReceiver {
@@ -511,6 +560,15 @@ impl AdmissionHub {
     }
 
     fn forward(&self, pending: Pending) {
+        let upcalls = self
+            .upcalls
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(upcalls) = upcalls {
+            tokio::spawn(answer_by_upcall(upcalls, pending));
+            return;
+        }
         let mut guard = self.listener.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = guard.as_ref() {
             if tx.send(pending).is_err() {
@@ -561,11 +619,22 @@ impl AdmissionHub {
         });
     }
 
+    /// Answer admission by upcall from now on (instead of the iterator).
+    pub(crate) fn serve_upcalls(&self, upcalls: up::Upcalls) -> Result<()> {
+        if self.taken.swap(true, Ordering::SeqCst) {
+            return Err(Error::from_reason(
+                "admission is already being answered on this node (admission() or serveAdmissionUpcalls())",
+            ));
+        }
+        *self.upcalls.write().unwrap_or_else(|e| e.into_inner()) = Some(upcalls);
+        Ok(())
+    }
+
     /// Open the (one) admission iterator.
     pub(crate) fn open(&self) -> Result<AdmissionRequests> {
         if self.taken.swap(true, Ordering::SeqCst) {
             return Err(Error::from_reason(
-                "admission() was already called on this node (one iterator per node)",
+                "admission is already being answered on this node (admission() or serveAdmissionUpcalls(); one per node)",
             ));
         }
         let (tx, rx) = mpsc::unbounded_channel();

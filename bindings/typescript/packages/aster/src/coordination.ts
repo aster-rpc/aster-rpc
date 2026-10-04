@@ -28,9 +28,10 @@
  * redeliver it. A typed rejection (`outcome === 'rejected'`) is still a
  * resolved result and must be acknowledged too.
  *
- * Not wrapped yet (needs the binding upcall mechanism): the placement
- * *manager* with JavaScript-implemented provisioner / policy / topology
- * sources. The pure planner is {@link placementPlan}.
+ * Placement: the pure planner is {@link placementPlan}; the §7.7.3 manager
+ * is {@link PlacementManager}, whose policy source, provisioner and
+ * (optionally) topology source are JavaScript objects driven by Rust over
+ * upcalls.
  */
 
 import type {
@@ -47,7 +48,8 @@ import type {
 import { loadNative } from './native.js';
 import type { Node, NodeId } from './node.js';
 import type { DenyReason, LeaseOptions, LeaseSnapshot, LeaseStatus } from './lease.js';
-import { nativeTopologySnapshot, type TopologySnapshot } from './topology.js';
+import { nativeTopologySnapshot, Topology, type ClusterView, type TopologySnapshot } from './topology.js';
+import { adapterTable, type UpcallContext, type Upcalls } from './upcalls.js';
 
 // ── Codes ────────────────────────────────────────────────────────────────────
 
@@ -1017,4 +1019,201 @@ export function newOperationId(): string {
   const b = new Uint8Array(16);
   globalThis.crypto.getRandomValues(b);
   return Buffer.from(b).toString('hex');
+}
+
+// ── Placement manager (JavaScript providers over upcalls) ────────────────────
+
+/**
+ * The application's verified placement policy record, re-read at every
+ * observation (a changed revision / digest between planning and submission
+ * discards the plan). Rust reads it synchronously on a worker thread, so
+ * answer promptly.
+ * @group Coordination
+ */
+export interface PlacementPolicySource {
+  policy(ctx: UpcallContext): Promise<PlacementPolicy> | PlacementPolicy;
+}
+
+/** The idempotency tuple of one provisioning call (§7.7.3 step 4). @group Coordination */
+export interface ProvisionRequest {
+  groupId: string;
+  /** Hex. */
+  policyDigest: string;
+  membershipLogId?: LogId;
+  /** The candidate to provision (hex). */
+  nodeId: string;
+}
+
+/**
+ * The application's provisioner: start (or find) a persistent-identity Join
+ * candidate for `request.nodeId` and return its seed. The same tuple may
+ * arrive again (after a timeout); return the same candidate.
+ * @group Coordination
+ */
+export interface PlacementProvisioner {
+  provision(request: ProvisionRequest, ctx: UpcallContext): Promise<MemberSeed> | MemberSeed;
+}
+
+/** A serialized shared topology view (what a {@link TopologySource} returns). @group Coordination */
+export interface TopologyView {
+  clusters: ClusterView[];
+  /** Corroborated far pairs (hex ids). */
+  farPairs?: Array<[string, string]>;
+  /** Separation-coverage rule the view was derived under (default 0). */
+  separationCoverage?: number;
+}
+
+/** One atomic topology observation per call. @group Coordination */
+export interface TopologySource {
+  snapshot(ctx: UpcallContext): Promise<TopologyView> | TopologyView;
+}
+
+/** What one reconciliation pass did (§7.7.3). @group Coordination */
+export interface PlacementReport {
+  policyRevision: number;
+  /** Hex; all zeros when no policy was read. */
+  policyDigest: string;
+  membershipLogId?: LogId;
+  currentVoters: string[];
+  currentLearners: string[];
+  selectedVoters: string[];
+  selectedLearners: string[];
+  graceCrossedMembers: string[];
+  separation?: SeparationSummary;
+  /** The membership operation this pass submitted or found pending (hex). */
+  pendingOperationId?: string;
+  reason: string;
+}
+
+/** Options for {@link PlacementManager}. @group Coordination */
+export interface PlacementManagerOptions {
+  policy: PlacementPolicySource;
+  provisioner: PlacementProvisioner;
+  /** The node's own view (`node.topology()`, after `enableShared`) or a JavaScript source. */
+  topology: Topology | TopologySource;
+  /** The table to answer on (default: a private one, closed by `close()`). */
+  upcalls?: Upcalls;
+}
+
+function seedOut(s: MemberSeed): { nodeId: string; ticket: string; signedJoinPermit?: Buffer } {
+  return {
+    nodeId: s.nodeId,
+    ticket: s.ticket,
+    ...(s.signedJoinPermit ? { signedJoinPermit: bytesIn(s.signedJoinPermit) } : {}),
+  };
+}
+
+function policyOut(p: PlacementPolicy) {
+  return {
+    ...p,
+    eligible: p.eligible.map((c) => ({ nodeId: c.nodeId, ...(c.memberSeed ? { memberSeed: seedOut(c.memberSeed) } : {}) })),
+  };
+}
+
+/**
+ * §7.7.3's placement manager. Runs **beside an application administrator**
+ * (its client needs the administrator predicate to submit): each
+ * {@link reconcile} delivers any journalled retry first, reads one
+ * linearizable status cut, takes one topology snapshot, plans, provisions
+ * missing seeds through your provisioner, then re-observes and submits only
+ * if nothing moved. Membership changes only through the client's durable
+ * journal. Your providers run over upcalls; one that throws or times out
+ * rejects that pass.
+ * @group Coordination
+ */
+export class PlacementManager implements Disposable {
+  /** @internal */
+  readonly native: import('@aster-rpc/transport').CoordinationPlacementManager;
+  private readonly table: Upcalls;
+  private readonly owned: boolean;
+  private readonly removers: Array<() => void> = [];
+
+  constructor(client: CoordinationClient, options: PlacementManagerOptions) {
+    const { upcalls, owned } = adapterTable(options.upcalls);
+    this.table = upcalls;
+    this.owned = owned;
+    try {
+      this.removers.push(
+        upcalls.handle('placement_policy', (async (_req: unknown, ctx: UpcallContext) =>
+          policyOut(await options.policy.policy(ctx))) as never),
+        upcalls.handle('placement_provision', (async (
+          req: { groupId: string; policyDigest: string; membershipLogId?: LogId | null; nodeId: string },
+          ctx: UpcallContext,
+        ) =>
+          seedOut(
+            await options.provisioner.provision(
+              {
+                groupId: req.groupId,
+                policyDigest: req.policyDigest,
+                ...(req.membershipLogId ? { membershipLogId: req.membershipLogId } : {}),
+                nodeId: req.nodeId,
+              },
+              ctx,
+            ),
+          )) as never),
+      );
+      const topology = options.topology;
+      if (!(topology instanceof Topology)) {
+        this.removers.push(
+          upcalls.handle('topology_snapshot', (async (_req: unknown, ctx: UpcallContext) => {
+            const v = await topology.snapshot(ctx);
+            return {
+              clusters: v.clusters.map((c) => ({ members: [...c.members], bridge: c.bridge, witnesses: [...c.witnesses] })),
+              farPairs: (v.farPairs ?? []).map(([a, b]) => [a, b]),
+              separationCoverage: v.separationCoverage ?? 0,
+            };
+          }) as never),
+        );
+      }
+      this.native = callSync(
+        () =>
+          new (loadNative().CoordinationPlacementManager)(
+            client.native,
+            upcalls.native,
+            topology instanceof Topology ? topology.native : undefined,
+          ),
+      );
+    } catch (e) {
+      this.close();
+      throw e;
+    }
+  }
+
+  /** The table the providers answer on. */
+  get upcalls(): Upcalls {
+    return this.table;
+  }
+
+  /** Run one full reconciliation pass (passes are serialized). */
+  async reconcile(): Promise<PlacementReport> {
+    let r;
+    try {
+      r = await this.native.reconcile();
+    } catch (e) {
+      throw coordinationError(e);
+    }
+    return {
+      policyRevision: r.policyRevision,
+      policyDigest: r.policyDigest,
+      ...(r.membershipLogId ? { membershipLogId: r.membershipLogId } : {}),
+      currentVoters: r.currentVoters,
+      currentLearners: r.currentLearners,
+      selectedVoters: r.selectedVoters,
+      selectedLearners: r.selectedLearners,
+      graceCrossedMembers: r.graceCrossedMembers,
+      ...(r.separation ? { separation: r.separation } : {}),
+      ...(r.pendingOperationId ? { pendingOperationId: r.pendingOperationId } : {}),
+      reason: r.reason,
+    };
+  }
+
+  /** Remove the provider handlers (and close a private table). */
+  close(): void {
+    for (const r of this.removers.splice(0)) r();
+    if (this.owned) this.table.close();
+  }
+
+  [Symbol.dispose](): void {
+    this.close();
+  }
 }

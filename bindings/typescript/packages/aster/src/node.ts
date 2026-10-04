@@ -24,10 +24,12 @@ import type {
   Node as NativeNode,
 } from '@aster-rpc/transport';
 import { type AsterConfig, toNativeConfig } from './config.js';
-import type { AdmissionRequest, GatePolicy } from './gate.js';
-import { GrantorSerializer, type MemorySerializer } from './lease.js';
+import { Expose } from './expose.js';
+import type { AdmissionHooks, AdmissionRequest, GatePolicy } from './gate.js';
+import { ForeignLeaseSerializer, GrantorSerializer, type MemorySerializer } from './lease.js';
 import { loadNative } from './native.js';
 import { Topology } from './topology.js';
+import { adapterTable, type UpcallContext, type Upcalls } from './upcalls.js';
 
 /**
  * A node id: the node's Ed25519 public key as 64 lowercase hex characters.
@@ -159,6 +161,59 @@ export class Node implements AsyncDisposable {
     return this.native.admission();
   }
 
+  /**
+   * Answer this node's admission requests with `hooks` over upcalls (kinds
+   * `admission_handshake` / `admission_connect`) — the alternative to
+   * {@link admission}; one or the other per node. An attached gate still
+   * decides first. Without an answer (error, timeout) the upcall policy's
+   * failure mode decides (fail-closed by default: a handshake is rejected
+   * with `403 "hook unavailable"`); keep its timeout below the node's
+   * `hookTimeoutMs`. Outbound dials are allowed unless `hooks.connect`
+   * says otherwise. `close()` on the result removes the hooks (later
+   * requests then get the failure mode).
+   */
+  serveAdmission(hooks: AdmissionHooks, options: { upcalls?: Upcalls } = {}): { readonly upcalls: Upcalls; close(): void } {
+    const { upcalls, owned } = adapterTable(options.upcalls);
+    const removers: Array<() => void> = [];
+    const close = () => {
+      for (const r of removers.splice(0)) r();
+      if (owned) upcalls.close();
+    };
+    try {
+      removers.push(
+        upcalls.handle('admission_handshake', (async (
+          req: { peer: string; alpn: Buffer; isAlive: boolean },
+          ctx: UpcallContext,
+        ) => {
+          const answer = await hooks.handshake(
+            { peer: req.peer as NodeId, alpn: req.alpn.toString('utf8'), alpnBytes: new Uint8Array(req.alpn), isAlive: req.isAlive },
+            ctx,
+          );
+          if (answer === true) return { accept: true };
+          if (answer === false || answer == null) return { accept: false };
+          return {
+            accept: false,
+            ...(answer.code != null ? { code: answer.code } : {}),
+            ...(answer.reason != null ? { reason: Buffer.from(answer.reason) } : {}),
+          };
+        }) as never),
+        upcalls.handle('admission_connect', (async (req: { peer: string; alpn: Buffer }, ctx: UpcallContext) => ({
+          allowed: hooks.connect
+            ? (await hooks.connect(
+                { peer: req.peer as NodeId, alpn: req.alpn.toString('utf8'), alpnBytes: new Uint8Array(req.alpn) },
+                ctx,
+              )) === true
+            : true,
+        })) as never),
+      );
+      this.native.serveAdmissionUpcalls(upcalls.native);
+    } catch (e) {
+      close();
+      throw e;
+    }
+    return { upcalls, close };
+  }
+
   /** Blob store client. */
   blobs(): BlobsClient {
     return this.native.blobsClient();
@@ -219,10 +274,31 @@ export class Node implements AsyncDisposable {
    * Returns a handle whose `close()` stops serving.
    */
   serveLeaseGrantor(
-    serializer: MemorySerializer,
+    serializer: MemorySerializer | ForeignLeaseSerializer,
     options: LeaseGrantorOptions = {},
   ): { close(): void } {
+    if (serializer instanceof ForeignLeaseSerializer) {
+      return this.native.serveForeignLeaseGrantor(serializer.native, options);
+    }
     return this.native.serveLeaseGrantor(serializer.native, options);
+  }
+
+  /**
+   * A fresh exposure registry (see {@link Expose}); its authorizers answer
+   * on `options.upcalls` or a private table.
+   */
+  expose(options: { upcalls?: Upcalls } = {}): Expose {
+    return new Expose(this.native.expose(), options.upcalls);
+  }
+
+  /**
+   * Own this node's accept loop for expose: inbound connections on one of
+   * `alpns` (start the node with them in `alpns`) are fed to `expose`.
+   * Don't also run an RPC server on the node. `close()` stops accepting.
+   * Consumers open a stream with `connection.openExposeStream(serviceId)`.
+   */
+  serveExpose(expose: Expose, alpns: string[]): { close(): void } {
+    return this.native.serveExpose(expose.native, alpns);
   }
 
   /** Whether `close()` has been called. */

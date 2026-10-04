@@ -265,6 +265,22 @@ export declare class CoordinationLease {
   releaseWithValue(expectedValueRevision: number, finalValue: Buffer): Promise<CoordinationMutationReply>
 }
 
+/**
+ * §7.7.3's placement manager over a durable client. The policy source and
+ * provisioner are JavaScript (upcall kinds 32 / 33 on `upcalls`); the
+ * topology is the node's own view (`topology`) or JavaScript (kind 17).
+ * Runs beside an administrator: it changes membership only through the
+ * client's durable journal.
+ */
+export declare class CoordinationPlacementManager {
+  constructor(client: CoordinationClient, upcalls: Upcalls, topology?: Topology | undefined | null)
+  /**
+   * Run one full reconciliation pass. Passes are serialized; a provider
+   * failure (JavaScript error, timeout) rejects the pass.
+   */
+  reconcile(): Promise<CoordinationPlacementReport>
+}
+
 /** Linearizable reads and status; no journal, no mutation. */
 export declare class CoordinationReadClient {
   readLinearizable(resource: CoordinationResourceKey): Promise<CoordinationResourceSnapshot>
@@ -571,6 +587,58 @@ export declare class DocWithEvents {
 }
 
 /**
+ * A node-wide exposure registry (`node.expose()`). Register services, then
+ * `node.serveExpose(expose, alpns)`.
+ */
+export declare class Expose {
+  /**
+   * Expose a raw L4 splice to the loopback `addr` (`"127.0.0.1:8080"`)
+   * as `serviceId`. Each `(connection, service)` is authorized once by
+   * the JavaScript authorizer on `upcalls` (kind 48); no answer applies
+   * the kind's failure mode (fail-closed by default).
+   */
+  exposeSocket(serviceId: string, addr: string, upcalls: Upcalls): void
+  /** Stop exposing `serviceId`. */
+  unexpose(serviceId: string): void
+}
+
+/** A running expose accept loop; `close()` stops it. */
+export declare class ExposeServer {
+  /** Stop accepting (idempotent). Open relays finish on their own. */
+  close(): void
+}
+
+/**
+ * A `FencedResource` implemented in JavaScript (upcall kind 4): the
+ * JavaScript side must evaluate the fence rule atomically with the write.
+ */
+export declare class ForeignFencedResource {
+  constructor(upcalls: Upcalls)
+  /** Perform `op` under `fence` for `writer` (the authenticated peer). */
+  mutate(fence: Fence, writer: string, op: Buffer): Promise<FencedMutateOutcome>
+}
+
+/**
+ * A lease backend implemented in JavaScript: every `transition` /
+ * `snapshot` is an upcall (kinds 1 / 2) whose answer is the backend's
+ * serialization point. With `authorize`, each transition first asks the
+ * JavaScript authorizer (kind 3, asynchronously) and a refusal answers
+ * `denied: unauthorized`. A failed upcall is an error, never a guessed
+ * outcome.
+ */
+export declare class ForeignLeaseSerializer {
+  constructor(upcalls: Upcalls, authorize?: boolean | undefined | null)
+  /** One ACQUIRE CAS for `holder`; the handle renews through JavaScript. */
+  acquire(resource: string, holder: string, options?: LeaseOptions | undefined | null): Promise<LeaseHandle | LeaseDenied>
+  /** Advisory snapshot of `resource` (an upcall). */
+  snapshot(resource: string): Promise<LeaseSnapshot>
+  /** Apply one raw transition through the backend. */
+  transition(resource: string, op: LeaseOp): Promise<TransitionOutcome>
+  /** REVOKE `resource` as `authority`. */
+  revoke(resource: string, authority: string): Promise<TransitionOutcome>
+}
+
+/**
  * Gate-0 policy (the Rust `GatePolicy`): admission ALPNs are open to
  * everyone; any other ALPN needs an admitted peer (or `'open_dev'` mode);
  * rejected peers are closed with the reject code and reason.
@@ -650,6 +718,13 @@ export declare class IrohBiStream {
 }
 
 export declare class IrohConnection {
+  /**
+   * Consumer side of expose: open a raw relay stream to the peer's
+   * exposed `serviceId` (a socket target), attaching `metadata` for its
+   * authorizer. Bytes written are spliced to the target's TCP socket; an
+   * unauthorized stream is closed by the peer.
+   */
+  openExposeStream(serviceId: string, metadata?: Buffer | undefined | null): Promise<IrohBiStream>
   /** The ALPN this connection was accepted on (set by acceptAster). */
   alpn(): string | null
   /** Open a bidirectional QUIC stream. Returns [sendStream, recvStream]. */
@@ -815,6 +890,14 @@ export declare class MemorySerializer {
   /** REVOKE `resource` as `authority`: advances the fence unconditionally. */
   revoke(resource: string, authority: string): Promise<TransitionOutcome>
   /**
+   * Ask JavaScript (upcall kind 3 on `upcalls`) before every transition;
+   * `null` removes the hook. No answer (error, timeout) applies the kind's
+   * failure mode (fail-closed by default -> `denied: unauthorized`). The
+   * hook is synchronous in Rust: each transition waits for the answer on
+   * a Tokio worker (never the JavaScript thread).
+   */
+  setAuthorizer(upcalls?: Upcalls | undefined | null): void
+  /**
    * Simulate a serializer restart: fence fields survive, held rows get a
    * full fresh TTL, the fence never advances.
    */
@@ -835,6 +918,15 @@ export declare class MemorySerializer {
  * persistent store before tearing down).
  */
 export declare class Node {
+  /** A fresh exposure registry. */
+  expose(): Expose
+  /**
+   * Own this node's accept loop for expose: every inbound connection on
+   * one of `alpns` (all, when empty) is fed to `expose`. Start the node
+   * with those ALPNs in `alpns`; don't also run an RPC server or
+   * `acceptAster` loop on it.
+   */
+  serveExpose(expose: Expose, alpns: Array<string>): ExposeServer
   /**
    * Start a node from `config` (in-memory unless `storagePath` is set).
    *
@@ -878,6 +970,14 @@ export declare class Node {
    * One iterator per node. Errors on a node without admission hooks.
    */
   admission(): AdmissionRequests
+  /**
+   * Answer this node's admission requests by upcall (kinds 64 outbound
+   * connect / 65 inbound after-handshake on `upcalls`) instead of the
+   * `admission()` iterator — one or the other per node. A gate still
+   * decides first while attached. Keep the upcall timeout below the
+   * node's `hookTimeoutMs` so the upcall failure mode decides.
+   */
+  serveAdmissionUpcalls(upcalls: Upcalls): void
   /**
    * Accept the next incoming connection on a non-builtin ALPN. The ALPN is
    * readable as `conn.alpn()`.
@@ -924,6 +1024,11 @@ export declare class Node {
    * an RPC server on the same node.
    */
   serveLeaseGrantor(serializer: MemorySerializer, options?: LeaseGrantorOptions | undefined | null): LeaseGrantorServer
+  /**
+   * As `serveLeaseGrantor`, over a JavaScript-implemented backend: every
+   * remote transition becomes an upcall into it.
+   */
+  serveForeignLeaseGrantor(serializer: ForeignLeaseSerializer, options?: LeaseGrantorOptions | undefined | null): LeaseGrantorServer
 }
 
 /**
@@ -1033,9 +1138,10 @@ export declare class Topology {
   peer(nodeId: string): PeerView | null
   /**
    * Join the topology swarm keyed by the shared namespace `secret` (hex or
-   * 32 bytes, normally delivered in a sealed grant).
+   * 32 bytes, normally delivered in a sealed grant). `admitted`, when
+   * given, filters record authors and vertices at read time.
    */
-  enableShared(secret: string | Uint8Array, options?: TopologySwarmOptions | undefined | null): Promise<void>
+  enableShared(secret: string | Uint8Array, options?: TopologySwarmOptions | undefined | null, admitted?: TopologyAdmittedFilter | undefined | null): Promise<void>
   /** The derived clusters of the joined swarm. */
   clusters(): Promise<Array<ClusterView>>
   /** The cluster containing this node, or `null` while it is not a vertex. */
@@ -1046,12 +1152,84 @@ export declare class Topology {
   snapshot(): Promise<TopologySnapshot>
 }
 
+/**
+ * A JavaScript topology `admitted` filter (upcall kind 16). The Rust
+ * filter is synchronous and runs inside every shared-view derivation, so it
+ * never waits for JavaScript: it answers from a cache — a fresh hit
+ * directly, a stale entry (older than `ttlMs`) with the cached answer while
+ * a refresh is queued, a miss with the kind's failure-mode answer
+ * (fail-closed: filtered) while the id is queued. Queued ids are resolved
+ * in batched upcalls. A failed batch caches the fallback for
+ * `failureRetryMs`. Push revocations with `set` / `invalidate` to apply
+ * them at the next view; warm the cache with `prefetch` before
+ * `enableShared`.
+ */
+export declare class TopologyAdmittedFilter {
+  constructor(upcalls: Upcalls, options?: AdmittedCacheOptionsJs | undefined | null)
+  /**
+   * The answer the filter gives `nodeId` right now (counts as a lookup;
+   * a miss or stale entry queues a refresh).
+   */
+  isAdmitted(nodeId: string): boolean
+  /** Resolve `nodeIds` now with one upcall and cache the answers. */
+  prefetch(nodeIds: Array<string>): Promise<void>
+  /** Push an answer (e.g. on revocation); served for `ttlMs`. */
+  set(nodeId: string, admitted: boolean): void
+  /** Forget one id; the next lookup misses and re-resolves. */
+  invalidate(nodeId: string): void
+  /** Forget every id. */
+  clear(): void
+  stats(): AdmittedCacheStatsJs
+}
+
 /** One immutable derived view (see `Topology.snapshot`). */
 export declare class TopologySnapshot {
   /** The clusters of this view. */
   clusters(): Array<ClusterView>
   /** Separation verdict between two nodes, from this view. */
   separated(a: string, b: string): 'unknown' | 'connected' | 'separated'
+}
+
+/**
+ * One upcall table: Rust's adapters issue events into it, JavaScript
+ * answers with `respond`. Close it when done — the callback is held until
+ * then (it does not keep the process alive).
+ */
+export declare class Upcalls {
+  /**
+   * A table delivering to `onEvents` (called on the JavaScript thread
+   * with each drained batch).
+   */
+  constructor(onEvents: (events: UpcallEventJs[]) => void, options?: UpcallsOptions | undefined | null)
+  /**
+   * Set the policy of kind `kind` (an `upcallKinds()` code). Applies to
+   * upcalls issued afterwards.
+   */
+  setPolicy(kind: number, policy: UpcallPolicyJs): void
+  /**
+   * Set the policy for kinds without their own (default 5 000 ms,
+   * fail-closed).
+   */
+  setDefaultPolicy(policy: UpcallPolicyJs): void
+  /** The policy kind `kind` runs under. */
+  policy(kind: number): UpcallPolicyJs
+  /**
+   * Answer `invocationId`: `status` 0 OK (`payload` = the kind's UCv1
+   * response), 1 error (`payload` = UTF-8 message), 2 unimplemented.
+   * Returns `false` when nothing waits for the id any more (answered,
+   * cancelled, timed out) — ignore it. Never blocks.
+   */
+  respond(invocationId: number, status: number, payload?: Buffer | undefined | null): boolean
+  /**
+   * Fail every pending upcall (`Closed`; decisions fall back) and refuse
+   * later ones, then release the callback. Idempotent.
+   */
+  close(): void
+  get closed(): boolean
+  /** Upcalls waiting for an answer. */
+  get pendingCount(): number
+  /** Delivery counters. */
+  stats(): UpcallStats
 }
 
 /** Options for `admit(peer, options)`. */
@@ -1076,6 +1254,24 @@ export interface AdmitOptions {
    * other string for an application-defined source (`'custom:<name>'`).
    */
   source?: 'manual' | 'credential' | 'attestation' | 'root_policy_doc' | 'workload_identity' | (string & {})
+}
+
+/**
+ * Cache tuning for [`TopologyAdmittedFilter`] (defaults: ttl 30 000 ms,
+ * failure retry 1 000 ms, 256 ids per upcall).
+ */
+export interface AdmittedCacheOptionsJs {
+  ttlMs?: number
+  failureRetryMs?: number
+  maxBatch?: number
+}
+
+/** Lookup counters of a [`TopologyAdmittedFilter`]. */
+export interface AdmittedCacheStatsJs {
+  hits: number
+  stale: number
+  misses: number
+  upcalls: number
 }
 
 /**
@@ -1643,6 +1839,26 @@ export interface CoordinationPlacementRecommendation {
   plan?: CoordinationPlacementPlan
 }
 
+/** What one reconciliation pass did (§7.7.3). */
+export interface CoordinationPlacementReport {
+  policyRevision: number
+  /** Hex; all zeros on the paths where no policy was read. */
+  policyDigest: string
+  membershipLogId?: CoordinationLogId
+  currentVoters: Array<string>
+  currentLearners: Array<string>
+  selectedVoters: Array<string>
+  selectedLearners: Array<string>
+  graceCrossedMembers: Array<string>
+  separation?: CoordinationSeparationSummary
+  /**
+   * Hex operation id of the membership change this pass submitted (or
+   * found pending).
+   */
+  pendingOperationId?: string
+  reason: string
+}
+
 /** Open the read-only client: linearizable reads and status, no journal. */
 export declare function coordinationReadClientOpen(node: Node, groupId: string, seedTickets?: Array<string> | undefined | null): CoordinationReadClient
 
@@ -1887,6 +2103,19 @@ export interface Fence {
   resource: string
   epoch: number
   holder: string
+}
+
+/** The result of a fenced mutation through a JavaScript resource. */
+export interface FencedMutateOutcome {
+  /**
+   * `applied`: the resource ran the op (`output`). `rejected`: the fence
+   * was refused (`rejection`). `unknown`: no answer (`error`) -- the
+   * write may or may not have happened.
+   */
+  kind: 'applied' | 'rejected' | 'unknown'
+  output?: Buffer
+  rejection?: FenceRejection
+  error?: string
 }
 
 /**
@@ -2487,6 +2716,188 @@ export interface TunnelTargetJs {
   kind: string
   host: string
   port: number
+}
+
+/** Gate 0 outbound connect request (kind 64). */
+export interface UpcallAdmissionConnectRequest {
+  peer: string
+  alpn: Buffer
+}
+
+/** Gate 0 inbound after-handshake request (kind 65). */
+export interface UpcallAdmissionHandshakeRequest {
+  peer: string
+  alpn: Buffer
+  isAlive: boolean
+}
+
+/**
+ * Gate 0 after-handshake answer (kind 65). `code` / `reason` are ignored
+ * when accepting (decoded as `0` / empty).
+ */
+export interface UpcallAdmissionHandshakeResponse {
+  accept: boolean
+  code?: number
+  reason?: Buffer
+}
+
+/**
+ * Decode the UCv1 message `bytes` of type `typeName` (a type name of
+ * `conformance/vectors/upcalls.json`, e.g. `"LeaseTransitionRequest"`).
+ * Throws on any non-canonical input.
+ */
+export declare function upcallCodecDecode(typeName: string, bytes: Buffer): UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse
+
+/**
+ * Encode `value` as the UCv1 message of type `typeName` (the inverse of
+ * `upcallCodecDecode`).
+ */
+export declare function upcallCodecEncode(typeName: string, value: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse): Buffer
+
+/** A yes/no answer (kinds 3, 48, 64). */
+export interface UpcallDecision {
+  allowed: boolean
+}
+
+/** A request message without fields (kinds 17, 32). */
+export interface UpcallEmpty {
+
+}
+
+/**
+ * One upcall for JavaScript. `kind` 0 is a cancellation of
+ * `invocationId` (`cancelReason`: 1 timeout, 2 abandoned, 3 shutdown).
+ */
+export interface UpcallEventJs {
+  invocationId: number
+  kind: number
+  /** When Rust stops waiting (Unix ms; 0 on a cancellation). */
+  deadlineUnixMs: number
+  cancelReason?: number
+  request?: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse
+  /** Set when the request could not be decoded (answer it with an error). */
+  error?: string
+}
+
+/** expose `AuthorizeFn` request (kind 48). */
+export interface UpcallExposeAuthorizeRequest {
+  serviceId: string
+  peerId: string
+  metadata: Buffer
+}
+
+/** `FencedResource::mutate` request (kind 4). */
+export interface UpcallFencedMutateRequest {
+  fence: Fence
+  /** The authenticated writer (hex node id). */
+  writer: string
+  op: Buffer
+}
+
+/**
+ * `FencedResource::mutate` answer (kind 4): `applied` with `output`, or a
+ * fence rejection (`carried` / `current` epochs for `stale_epoch` /
+ * `future_epoch`).
+ */
+export interface UpcallFencedMutateResponse {
+  kind: 'applied' | 'stale_epoch' | 'not_holder' | 'not_held' | 'future_epoch'
+  output?: Buffer
+  carried?: number
+  current?: number
+}
+
+/** One row of the kind table. */
+export interface UpcallKindInfo {
+  code: number
+  name: string
+  /** A yes/no decision kind (the failure mode applies). */
+  decision: boolean
+  /** The UCv1 request message type, if any. */
+  requestType?: string
+  /** The UCv1 OK-response message type, if any. */
+  responseType?: string
+}
+
+/** Every upcall kind, straight from the Rust enum. */
+export declare function upcallKinds(): Array<UpcallKindInfo>
+
+/** Lease authorizer request (kind 3). */
+export interface UpcallLeaseAuthorizeRequest {
+  op: LeaseOp
+}
+
+/** `LeaseSerializer::snapshot` request (kind 2). */
+export interface UpcallLeaseSnapshotRequest {
+  resource: string
+}
+
+/** `LeaseSerializer::transition` request (kind 1). */
+export interface UpcallLeaseTransitionRequest {
+  resource: string
+  op: LeaseOp
+}
+
+/**
+ * `PlacementProvisioner::provision` request (kind 33): the idempotency
+ * tuple — the same tuple must yield the same candidate.
+ */
+export interface UpcallPlacementProvisionRequest {
+  groupId: string
+  policyDigest: string
+  membershipLogId?: CoordinationLogId
+  nodeId: string
+}
+
+/**
+ * Timeout and failure mode for one kind (the failure mode applies to the
+ * decision kinds only).
+ */
+export interface UpcallPolicyJs {
+  timeoutMs: number
+  failureMode: 'fail_open' | 'fail_closed'
+}
+
+/** Options for `new Upcalls(onEvents, options)`. */
+export interface UpcallsOptions {
+  /**
+   * Most upcalls queued for JavaScript and not yet drained; further
+   * upcalls are refused (`Overloaded`: decisions fall back to their
+   * failure mode, other kinds fail). Default 1024.
+   */
+  capacity?: number
+}
+
+/** Delivery counters. */
+export interface UpcallStats {
+  delivered: number
+  refused: number
+  tsfnCalls: number
+  tsfnCallbacks: number
+  tsfnFailures: number
+  watchdogRescues: number
+  /** Events queued and not yet drained. */
+  queued: number
+  /** Upcalls waiting for an answer. */
+  pending: number
+}
+
+/** Topology `admitted` batch request (kind 16). */
+export interface UpcallTopologyAdmittedRequest {
+  /** Lowercase hex node ids. */
+  nodeIds: Array<string>
+}
+
+/** Topology `admitted` batch answer: one flag per requested id, in order. */
+export interface UpcallTopologyAdmittedResponse {
+  admitted: Array<boolean>
+}
+
+/** A serialized shared topology view (kind 17's answer). */
+export interface UpcallTopologyView {
+  clusters: Array<ClusterView>
+  /** Corroborated far pairs (hex ids). */
+  farPairs: Array<[string, string]>
+  separationCoverage: number
 }
 
 /**

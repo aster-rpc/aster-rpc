@@ -20,6 +20,7 @@ mod crypto;
 mod docs;
 mod envelope;
 mod error;
+mod expose;
 mod gossip;
 mod grants;
 mod keys;
@@ -30,6 +31,7 @@ mod rpc;
 mod rpc_client;
 mod ticket;
 mod topology;
+mod upcalls;
 
 /// Exact version embedded by the shared Rust core build.
 #[napi]

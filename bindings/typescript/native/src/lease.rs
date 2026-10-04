@@ -10,8 +10,11 @@
 //! [`lease_check_fence`] / [`lease_transition`] let a JavaScript-owned
 //! resource apply the same rules inside its own serialization point.
 //!
-//! Deferred (needs the R6 upcall mechanism): a JavaScript `LeaseSerializer`
-//! backend, a JavaScript `FencedResource`, and a lease authorizer callback.
+//! JavaScript-implemented extension points (R6 upcalls, `crate::upcalls`):
+//! [`ForeignLeaseSerializer`] (a JavaScript lease backend, optionally behind
+//! a JavaScript authorizer), [`ForeignFencedResource`] (a JavaScript resource
+//! enforcing the fence) and `MemorySerializer.setAuthorizer` (a JavaScript
+//! authorization hook).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,8 +26,11 @@ use tokio::sync::watch;
 use aster::lease as l;
 use aster::lease::LeaseSerializer as _;
 
+use aster::binding_support::upcall as up;
+
 use crate::error::to_napi_err;
 use crate::keys::invalid;
+use crate::upcalls::Upcalls;
 
 // ── Value types ──────────────────────────────────────────────────────────────
 
@@ -49,7 +55,7 @@ impl From<l::Fence> for Fence {
 }
 
 impl Fence {
-    fn to_rust(&self) -> Result<l::Fence> {
+    pub(crate) fn to_rust(&self) -> Result<l::Fence> {
         Ok(l::Fence {
             resource: self.resource.clone(),
             epoch: epoch_in(self.epoch)?,
@@ -78,6 +84,21 @@ impl From<l::LeaseSnapshot> for LeaseSnapshot {
             held: s.held,
             remaining_ms: s.remaining.map(|d| d.as_secs_f64() * 1000.0),
         }
+    }
+}
+
+impl LeaseSnapshot {
+    pub(crate) fn to_rust(&self) -> Result<l::LeaseSnapshot> {
+        Ok(l::LeaseSnapshot {
+            resource: self.resource.clone(),
+            epoch: epoch_in(self.epoch)?,
+            holder: self.holder.clone(),
+            held: self.held,
+            remaining: self
+                .remaining_ms
+                .map(|ms| ms_in("remainingMs", ms))
+                .transpose()?,
+        })
     }
 }
 
@@ -119,6 +140,18 @@ pub(crate) fn options_in(o: Option<LeaseOptions>) -> Result<l::LeaseOptions> {
         }
     }
     Ok(opts)
+}
+
+pub(crate) fn deny_in(r: &str) -> Result<l::DenyReason> {
+    Ok(match r {
+        "held_by_other" => l::DenyReason::HeldByOther,
+        "epoch_mismatch" => l::DenyReason::EpochMismatch,
+        "not_holder" => l::DenyReason::NotHolder,
+        "expired" => l::DenyReason::Expired,
+        "not_held" => l::DenyReason::NotHeld,
+        "unauthorized" => l::DenyReason::Unauthorized,
+        other => return Err(invalid(format!("unknown deny reason {other:?}"))),
+    })
 }
 
 pub(crate) fn deny_out(r: l::DenyReason) -> String {
@@ -221,7 +254,31 @@ pub struct LeaseOp {
 }
 
 impl LeaseOp {
-    fn to_rust(&self) -> Result<l::LeaseOp> {
+    pub(crate) fn from_rust(op: &l::LeaseOp) -> Self {
+        let (kind, actor, epoch, ttl_ms) = match op {
+            l::LeaseOp::Acquire { candidate, ttl } => (
+                "acquire",
+                candidate.clone(),
+                None,
+                Some(ttl.as_secs_f64() * 1000.0),
+            ),
+            l::LeaseOp::Renew { holder, epoch } => {
+                ("renew", holder.clone(), Some(*epoch as i64), None)
+            }
+            l::LeaseOp::Release { holder, epoch } => {
+                ("release", holder.clone(), Some(*epoch as i64), None)
+            }
+            l::LeaseOp::Revoke { authority } => ("revoke", authority.clone(), None, None),
+        };
+        Self {
+            kind: kind.into(),
+            actor,
+            epoch,
+            ttl_ms,
+        }
+    }
+
+    pub(crate) fn to_rust(&self) -> Result<l::LeaseOp> {
         let epoch = || {
             self.epoch
                 .ok_or_else(|| invalid(format!("{} needs an epoch", self.kind)))
@@ -265,6 +322,34 @@ pub struct TransitionOutcome {
     pub deny_reason: Option<String>,
     /// `denied`: the row after the decision (a backoff hint).
     pub snapshot: Option<LeaseSnapshot>,
+}
+
+impl TransitionOutcome {
+    pub(crate) fn to_rust(&self) -> Result<l::TransitionOutcome> {
+        Ok(match self.kind.as_str() {
+            "granted" => l::TransitionOutcome::Granted(
+                self.fence
+                    .as_ref()
+                    .ok_or_else(|| invalid("a granted outcome needs its fence"))?
+                    .to_rust()?,
+            ),
+            "renewed" => l::TransitionOutcome::Renewed,
+            "released" => l::TransitionOutcome::Released,
+            "revoked" => l::TransitionOutcome::Revoked,
+            "denied" => l::TransitionOutcome::Denied(
+                deny_in(
+                    self.deny_reason
+                        .as_deref()
+                        .ok_or_else(|| invalid("a denied outcome needs its denyReason"))?,
+                )?,
+                self.snapshot
+                    .as_ref()
+                    .ok_or_else(|| invalid("a denied outcome needs its snapshot"))?
+                    .to_rust()?,
+            ),
+            other => return Err(invalid(format!("unknown transition outcome {other:?}"))),
+        })
+    }
 }
 
 impl From<l::TransitionOutcome> for TransitionOutcome {
@@ -366,7 +451,7 @@ pub struct LeaseDenied {
     pub snapshot: LeaseSnapshot,
 }
 
-async fn acquire(
+pub(crate) async fn acquire(
     serializer: Arc<dyn l::LeaseSerializer>,
     resource: String,
     holder: String,
@@ -454,6 +539,21 @@ impl MemorySerializer {
             .into())
     }
 
+    /// Ask JavaScript (upcall kind 3 on `upcalls`) before every transition;
+    /// `null` removes the hook. No answer (error, timeout) applies the kind's
+    /// failure mode (fail-closed by default -> `denied: unauthorized`). The
+    /// hook is synchronous in Rust: each transition waits for the answer on
+    /// a Tokio worker (never the JavaScript thread).
+    #[napi]
+    pub fn set_authorizer(&self, upcalls: Option<&Upcalls>) {
+        match upcalls {
+            Some(u) => self
+                .inner
+                .set_authorizer(up::lease::ForeignLeaseAuthorizer::new(u.table()).authorizer()),
+            None => self.inner.set_authorizer(Arc::new(|_: &l::LeaseOp| true)),
+        }
+    }
+
     /// Simulate a serializer restart: fence fields survive, held rows get a
     /// full fresh TTL, the fence never advances.
     #[napi]
@@ -477,6 +577,146 @@ impl MemorySerializer {
             Ok(called) => called.map(|_| None),
             Err(rejection) => Ok(Some(rejection.into())),
         }
+    }
+}
+
+/// A lease backend implemented in JavaScript: every `transition` /
+/// `snapshot` is an upcall (kinds 1 / 2) whose answer is the backend's
+/// serialization point. With `authorize`, each transition first asks the
+/// JavaScript authorizer (kind 3, asynchronously) and a refusal answers
+/// `denied: unauthorized`. A failed upcall is an error, never a guessed
+/// outcome.
+#[napi]
+pub struct ForeignLeaseSerializer {
+    pub(crate) inner: Arc<dyn l::LeaseSerializer>,
+}
+
+#[napi]
+impl ForeignLeaseSerializer {
+    #[napi(constructor)]
+    pub fn new(upcalls: &Upcalls, authorize: Option<bool>) -> Self {
+        let u = upcalls.table();
+        let serializer = up::lease::ForeignLeaseSerializer::new(u.clone());
+        let inner: Arc<dyn l::LeaseSerializer> = if authorize.unwrap_or(false) {
+            Arc::new(up::lease::AuthorizedSerializer::new(
+                serializer,
+                up::lease::ForeignLeaseAuthorizer::new(u),
+            ))
+        } else {
+            Arc::new(serializer)
+        };
+        Self { inner }
+    }
+
+    /// One ACQUIRE CAS for `holder`; the handle renews through JavaScript.
+    #[napi]
+    pub async fn acquire(
+        &self,
+        resource: String,
+        holder: String,
+        options: Option<LeaseOptions>,
+    ) -> Result<Either<LeaseHandle, LeaseDenied>> {
+        let opts = options_in(options)?;
+        acquire(self.inner.clone(), resource, holder, opts).await
+    }
+
+    /// Advisory snapshot of `resource` (an upcall).
+    #[napi]
+    pub async fn snapshot(&self, resource: String) -> Result<LeaseSnapshot> {
+        Ok(self
+            .inner
+            .snapshot(&resource)
+            .await
+            .map_err(to_napi_err)?
+            .into())
+    }
+
+    /// Apply one raw transition through the backend.
+    #[napi]
+    pub async fn transition(&self, resource: String, op: LeaseOp) -> Result<TransitionOutcome> {
+        let op = op.to_rust()?;
+        Ok(self
+            .inner
+            .transition(&resource, op)
+            .await
+            .map_err(to_napi_err)?
+            .into())
+    }
+
+    /// REVOKE `resource` as `authority`.
+    #[napi]
+    pub async fn revoke(&self, resource: String, authority: String) -> Result<TransitionOutcome> {
+        Ok(l::revoke(self.inner.as_ref(), &resource, &authority)
+            .await
+            .map_err(to_napi_err)?
+            .into())
+    }
+}
+
+/// The result of a fenced mutation through a JavaScript resource.
+#[napi(object)]
+pub struct FencedMutateOutcome {
+    /// `applied`: the resource ran the op (`output`). `rejected`: the fence
+    /// was refused (`rejection`). `unknown`: no answer (`error`) -- the
+    /// write may or may not have happened.
+    #[napi(ts_type = "'applied' | 'rejected' | 'unknown'")]
+    pub kind: String,
+    pub output: Option<Buffer>,
+    pub rejection: Option<FenceRejection>,
+    pub error: Option<String>,
+}
+
+/// A `FencedResource` implemented in JavaScript (upcall kind 4): the
+/// JavaScript side must evaluate the fence rule atomically with the write.
+#[napi]
+pub struct ForeignFencedResource {
+    inner: up::lease::ForeignFencedResource,
+}
+
+#[napi]
+impl ForeignFencedResource {
+    #[napi(constructor)]
+    pub fn new(upcalls: &Upcalls) -> Self {
+        Self {
+            inner: up::lease::ForeignFencedResource::new(upcalls.table()),
+        }
+    }
+
+    /// Perform `op` under `fence` for `writer` (the authenticated peer).
+    #[napi]
+    pub async fn mutate(
+        &self,
+        fence: Fence,
+        writer: String,
+        op: Buffer,
+    ) -> Result<FencedMutateOutcome> {
+        use l::FencedResource as _;
+        let fence = fence.to_rust()?;
+        let empty = FencedMutateOutcome {
+            kind: String::new(),
+            output: None,
+            rejection: None,
+            error: None,
+        };
+        Ok(
+            match self.inner.mutate(&fence, &writer, op.to_vec()).await {
+                Ok(Ok(output)) => FencedMutateOutcome {
+                    kind: "applied".into(),
+                    output: Some(output.into()),
+                    ..empty
+                },
+                Ok(Err(e)) => FencedMutateOutcome {
+                    kind: "unknown".into(),
+                    error: Some(e.to_string()),
+                    ..empty
+                },
+                Err(r) => FencedMutateOutcome {
+                    kind: "rejected".into(),
+                    rejection: Some(r.into()),
+                    ..empty
+                },
+            },
+        )
     }
 }
 

@@ -260,3 +260,32 @@ export class GatePolicy {
     };
   }
 }
+
+/** An admission request answered by {@link AdmissionHooks}. @group Trust */
+export interface AdmissionHookRequest {
+  peer: import('./node.js').NodeId;
+  /** UTF-8 (lossy) ALPN. */
+  alpn: string;
+  alpnBytes: Uint8Array;
+}
+
+/** A rejection with a close code / reason (default 403, empty). @group Trust */
+export interface AdmissionRejection {
+  accept: false;
+  code?: number;
+  reason?: string | Uint8Array;
+}
+
+/**
+ * Gate 0 decided in JavaScript over upcalls (`node.serveAdmission(hooks)`).
+ * @group Trust
+ */
+export interface AdmissionHooks {
+  /** An inbound peer finished its handshake: admit (`true`) or reject. */
+  handshake(
+    request: AdmissionHookRequest & { isAlive: boolean },
+    ctx: import('./upcalls.js').UpcallContext,
+  ): Promise<boolean | AdmissionRejection> | boolean | AdmissionRejection;
+  /** This node is dialling `peer` (default: allow). */
+  connect?(request: AdmissionHookRequest, ctx: import('./upcalls.js').UpcallContext): Promise<boolean> | boolean;
+}

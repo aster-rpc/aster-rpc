@@ -19,7 +19,7 @@ use crate::config::{aster_err, JsAsterConfig};
 use crate::docs::DocsClient;
 use crate::error::to_napi_err;
 use crate::gossip::GossipClient;
-use crate::lease::{GrantorSerializer, MemorySerializer};
+use crate::lease::{ForeignLeaseSerializer, GrantorSerializer, MemorySerializer};
 use crate::net::IrohConnection;
 use crate::topology::Topology;
 
@@ -143,6 +143,16 @@ impl Node {
     #[napi]
     pub fn admission(&self) -> Result<AdmissionRequests> {
         self.hub()?.open()
+    }
+
+    /// Answer this node's admission requests by upcall (kinds 64 outbound
+    /// connect / 65 inbound after-handshake on `upcalls`) instead of the
+    /// `admission()` iterator — one or the other per node. A gate still
+    /// decides first while attached. Keep the upcall timeout below the
+    /// node's `hookTimeoutMs` so the upcall failure mode decides.
+    #[napi]
+    pub fn serve_admission_upcalls(&self, upcalls: &crate::upcalls::Upcalls) -> Result<()> {
+        self.hub()?.serve_upcalls(upcalls.table())
     }
 
     /// Accept the next incoming connection on a non-builtin ALPN. The ALPN is
@@ -269,7 +279,28 @@ impl Node {
         serializer: &MemorySerializer,
         options: Option<LeaseGrantorOptions>,
     ) -> LeaseGrantorServer {
-        let mut grantor = aster::rpc::lease::LeaseGrantor::new(Arc::new(serializer.inner.clone()));
+        self.serve_grantor(Arc::new(serializer.inner.clone()), options)
+    }
+
+    /// As `serveLeaseGrantor`, over a JavaScript-implemented backend: every
+    /// remote transition becomes an upcall into it.
+    #[napi]
+    pub fn serve_foreign_lease_grantor(
+        &self,
+        serializer: &ForeignLeaseSerializer,
+        options: Option<LeaseGrantorOptions>,
+    ) -> LeaseGrantorServer {
+        self.serve_grantor(serializer.inner.clone(), options)
+    }
+}
+
+impl Node {
+    fn serve_grantor(
+        &self,
+        serializer: Arc<dyn aster::lease::LeaseSerializer>,
+        options: Option<LeaseGrantorOptions>,
+    ) -> LeaseGrantorServer {
+        let mut grantor = aster::rpc::lease::LeaseGrantor::new(serializer);
         if options.and_then(|o| o.open_revoke).unwrap_or(false) {
             grantor = grantor.revoke_requires(None);
         }

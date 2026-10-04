@@ -5,8 +5,10 @@
 //! (`enableShared(secret, options)`, `clusters()`, `myCluster()`,
 //! `separated(a, b)`, `snapshot()`).
 //!
-//! Deferred (needs the R6 upcall mechanism): a JavaScript `admitted`
-//! read-time filter (`AdmittedFn`) for `enableShared`.
+//! The read-time `admitted` filter of `enableShared` can be JavaScript:
+//! [`TopologyAdmittedFilter`] answers the synchronous Rust `AdmittedFn` from
+//! a cache filled by batched upcalls (kind 16) — see its docs for the
+//! sync / cache semantics.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +23,11 @@ use aster::topology::{
 };
 use aster::{NamespaceSecret, NodeId};
 
+use aster::binding_support::upcall::topology::{AdmittedCacheOptions, ForeignAdmittedFn};
+
 use crate::config::aster_err;
 use crate::keys::{invalid, key32};
+use crate::upcalls::Upcalls;
 
 fn level_out(l: LadderLevel) -> String {
     match l {
@@ -195,7 +200,7 @@ fn swarm_options_in(o: Option<TopologySwarmOptions>) -> Result<RsSwarmOptions> {
 /// This node's topology view. Obtain with `node.topology()`.
 #[napi]
 pub struct Topology {
-    inner: RsTopology,
+    pub(crate) inner: RsTopology,
 }
 
 impl From<RsTopology> for Topology {
@@ -227,19 +232,21 @@ impl Topology {
     }
 
     /// Join the topology swarm keyed by the shared namespace `secret` (hex or
-    /// 32 bytes, normally delivered in a sealed grant).
-    #[napi]
-    pub async fn enable_shared(
+    /// 32 bytes, normally delivered in a sealed grant). `admitted`, when
+    /// given, filters record authors and vertices at read time.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn enable_shared<'env>(
         &self,
+        env: &'env Env,
         secret: Either<String, Uint8Array>,
         options: Option<TopologySwarmOptions>,
-    ) -> Result<()> {
+        admitted: Option<&TopologyAdmittedFilter>,
+    ) -> Result<PromiseRaw<'env, ()>> {
         let secret = NamespaceSecret::from_bytes(key32("namespace secret", &secret)?);
-        let opts = swarm_options_in(options)?;
-        self.inner
-            .enable_shared(&secret, opts)
-            .await
-            .map_err(aster_err)
+        let mut opts = swarm_options_in(options)?;
+        opts.admitted = admitted.map(|f| f.inner.admitted_fn());
+        let inner = self.inner.clone();
+        env.spawn_future(async move { inner.enable_shared(&secret, opts).await.map_err(aster_err) })
     }
 
     /// The derived clusters of the joined swarm.
@@ -309,5 +316,106 @@ impl TopologySnapshot {
     #[napi(ts_return_type = "'unknown' | 'connected' | 'separated'")]
     pub fn separated(&self, a: String, b: String) -> String {
         verdict_out(self.inner.separated_hex(&a, &b))
+    }
+}
+
+/// Cache tuning for [`TopologyAdmittedFilter`] (defaults: ttl 30 000 ms,
+/// failure retry 1 000 ms, 256 ids per upcall).
+#[napi(object)]
+pub struct AdmittedCacheOptionsJs {
+    pub ttl_ms: Option<f64>,
+    pub failure_retry_ms: Option<f64>,
+    pub max_batch: Option<u32>,
+}
+
+/// Lookup counters of a [`TopologyAdmittedFilter`].
+#[napi(object)]
+pub struct AdmittedCacheStatsJs {
+    pub hits: f64,
+    pub stale: f64,
+    pub misses: f64,
+    pub upcalls: f64,
+}
+
+/// A JavaScript topology `admitted` filter (upcall kind 16). The Rust
+/// filter is synchronous and runs inside every shared-view derivation, so it
+/// never waits for JavaScript: it answers from a cache — a fresh hit
+/// directly, a stale entry (older than `ttlMs`) with the cached answer while
+/// a refresh is queued, a miss with the kind's failure-mode answer
+/// (fail-closed: filtered) while the id is queued. Queued ids are resolved
+/// in batched upcalls. A failed batch caches the fallback for
+/// `failureRetryMs`. Push revocations with `set` / `invalidate` to apply
+/// them at the next view; warm the cache with `prefetch` before
+/// `enableShared`.
+#[napi]
+pub struct TopologyAdmittedFilter {
+    inner: ForeignAdmittedFn,
+}
+
+#[napi]
+impl TopologyAdmittedFilter {
+    #[napi(constructor)]
+    pub fn new(upcalls: &Upcalls, options: Option<AdmittedCacheOptionsJs>) -> Result<Self> {
+        let mut opts = AdmittedCacheOptions::default();
+        if let Some(o) = options {
+            if let Some(v) = o.ttl_ms {
+                opts.ttl = ms_in("ttlMs", v)?;
+            }
+            if let Some(v) = o.failure_retry_ms {
+                opts.failure_retry = ms_in("failureRetryMs", v)?;
+            }
+            if let Some(v) = o.max_batch {
+                opts.max_batch = v.max(1) as usize;
+            }
+        }
+        let u = upcalls.table();
+        // `ForeignAdmittedFn::new` spawns its refresher task.
+        let inner = within_runtime_if_available(move || ForeignAdmittedFn::new(u, opts));
+        Ok(Self { inner })
+    }
+
+    /// The answer the filter gives `nodeId` right now (counts as a lookup;
+    /// a miss or stale entry queues a refresh).
+    #[napi]
+    pub fn is_admitted(&self, node_id: String) -> bool {
+        self.inner.is_admitted(&node_id)
+    }
+
+    /// Resolve `nodeIds` now with one upcall and cache the answers.
+    #[napi]
+    pub async fn prefetch(&self, node_ids: Vec<String>) -> Result<()> {
+        self.inner
+            .prefetch(&node_ids)
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    /// Push an answer (e.g. on revocation); served for `ttlMs`.
+    #[napi]
+    pub fn set(&self, node_id: String, admitted: bool) {
+        self.inner.set(&node_id, admitted);
+    }
+
+    /// Forget one id; the next lookup misses and re-resolves.
+    #[napi]
+    pub fn invalidate(&self, node_id: String) {
+        self.inner.invalidate(&node_id);
+    }
+
+    /// Forget every id.
+    #[napi]
+    pub fn clear(&self) {
+        self.inner.clear();
+    }
+
+    #[napi]
+    pub fn stats(&self) -> AdmittedCacheStatsJs {
+        let s = self.inner.stats();
+        AdmittedCacheStatsJs {
+            hits: s.hits as f64,
+            stale: s.stale as f64,
+            misses: s.misses as f64,
+            upcalls: s.upcalls as f64,
+        }
     }
 }

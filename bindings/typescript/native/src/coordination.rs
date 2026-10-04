@@ -13,9 +13,10 @@
 //! `invalid`, `rpc:<code>`, `unavailable` or `closed`), which the TypeScript
 //! layer turns into typed error classes.
 //!
-//! Not wrapped (needs the R6 upcall mechanism): the placement manager's
-//! JavaScript-implemented `PlacementProvisioner` / `PlacementPolicySource` /
-//! `TopologySource`. The pure planner is exposed as `coordinationPlacementPlan`.
+//! Placement: the pure planner is `coordinationPlacementPlan`; the §7.7.3
+//! manager is `CoordinationPlacementManager`, whose provisioner and policy
+//! source (and optionally topology source) are JavaScript objects answered
+//! over R6 upcalls (`crate::upcalls`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -34,9 +35,13 @@ use aster::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
 use aster::coordination::reason::{Outcome, Reason};
 use aster::coordination::store::wire as w;
 
+use aster::binding_support::upcall as up;
+use aster::coordination::client::manager as mgr;
+
 use crate::lease::{deny_out, options_in, status_out, LeaseDenied, LeaseOptions};
 use crate::node::Node;
-use crate::topology::TopologySnapshot;
+use crate::topology::{Topology, TopologySnapshot};
+use crate::upcalls::Upcalls;
 
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
@@ -184,7 +189,7 @@ pub struct CoordinationLogId {
 }
 
 impl CoordinationLogId {
-    fn to_wire(&self) -> Result<LogIdV1> {
+    pub(crate) fn to_wire(&self) -> Result<LogIdV1> {
         Ok(LogIdV1 {
             term: u64_in(self.term, "logId.term")?,
             leader_node_id: id32(&self.leader_node_id, "logId.leaderNodeId")?.to_vec(),
@@ -192,7 +197,7 @@ impl CoordinationLogId {
         })
     }
 
-    fn from_wire(l: &LogIdV1) -> Result<Self> {
+    pub(crate) fn from_wire(l: &LogIdV1) -> Result<Self> {
         Ok(Self {
             term: n(l.term, "log term")?,
             leader_node_id: hex::encode(&l.leader_node_id),
@@ -200,12 +205,12 @@ impl CoordinationLogId {
         })
     }
 
-    fn opt(l: &Option<LogIdV1>) -> Result<Option<Self>> {
+    pub(crate) fn opt(l: &Option<LogIdV1>) -> Result<Option<Self>> {
         l.as_ref().map(Self::from_wire).transpose()
     }
 }
 
-fn opt_log_in(l: &Option<CoordinationLogId>) -> Result<Option<LogIdV1>> {
+pub(crate) fn opt_log_in(l: &Option<CoordinationLogId>) -> Result<Option<LogIdV1>> {
     l.as_ref().map(CoordinationLogId::to_wire).transpose()
 }
 
@@ -472,7 +477,7 @@ pub struct CoordinationMemberSeed {
 }
 
 impl CoordinationMemberSeed {
-    fn to_wire(&self) -> Result<MemberSeedV1> {
+    pub(crate) fn to_wire(&self) -> Result<MemberSeedV1> {
         Ok(MemberSeedV1 {
             node_id: id32(&self.node_id, "memberSeed.nodeId")?.to_vec(),
             ticket: self.ticket.clone(),
@@ -480,7 +485,7 @@ impl CoordinationMemberSeed {
         })
     }
 
-    fn from_wire(s: &MemberSeedV1) -> Self {
+    pub(crate) fn from_wire(s: &MemberSeedV1) -> Self {
         Self {
             node_id: hex::encode(&s.node_id),
             ticket: s.ticket.clone(),
@@ -1334,15 +1339,8 @@ fn ids_out(v: &[CoordinationNodeId]) -> Vec<String> {
     v.iter().map(|id| id.to_hex()).collect()
 }
 
-/// §7.7.2's pure, deterministic voter placement planner — local advice only.
-/// The membership facts usually come from `groupStatus()`, the topology
-/// snapshot from `node.topology().snapshot()`.
-#[napi]
-pub fn coordination_placement_plan(
-    input: CoordinationPlacementInput,
-    topology: &TopologySnapshot,
-) -> Result<CoordinationPlacementRecommendation> {
-    let p = &input.policy;
+/// The policy record as the planner / manager reads it.
+pub(crate) fn policy_in(p: &CoordinationPlacementPolicy) -> Result<pl::PlacementPolicy> {
     let mut eligible = BTreeMap::new();
     for c in &p.eligible {
         let node_id = node_id_in(&c.node_id, "policy.eligible[].nodeId")?;
@@ -1358,7 +1356,7 @@ pub fn coordination_placement_plan(
             },
         );
     }
-    let policy = pl::PlacementPolicy {
+    Ok(pl::PlacementPolicy {
         revision: u64_in(p.revision, "policy.revision")?,
         digest: id32(&p.digest, "policy.digest")?,
         authority_public_key: id32(&p.authority_public_key, "policy.authorityPublicKey")?,
@@ -1380,7 +1378,50 @@ pub fn coordination_placement_plan(
             "policy.replacementGraceMs",
         )?),
         allow_healthy_rebalance: p.allow_healthy_rebalance.unwrap_or(false),
-    };
+    })
+}
+
+/// The policy record back as its JavaScript shape.
+pub(crate) fn policy_out(p: &pl::PlacementPolicy) -> Result<CoordinationPlacementPolicy> {
+    let ids = |s: &BTreeSet<CoordinationNodeId>| s.iter().map(|id| id.to_hex()).collect();
+    Ok(CoordinationPlacementPolicy {
+        revision: n(p.revision, "policy revision")?,
+        digest: hex::encode(p.digest),
+        authority_public_key: hex::encode(p.authority_public_key),
+        authority_domain: p.authority_domain.clone(),
+        target_voters: p.target_voters.into(),
+        target_retained_learners: p.target_retained_learners.into(),
+        eligible: p
+            .eligible
+            .values()
+            .map(|c| CoordinationPlacementCandidate {
+                node_id: c.node_id.to_hex(),
+                member_seed: c
+                    .member_seed
+                    .as_ref()
+                    .map(CoordinationMemberSeed::from_wire),
+            })
+            .collect(),
+        pinned_voters: Some(ids(&p.pinned_voters)),
+        excluded: Some(ids(&p.excluded)),
+        minimum_separated_voter_pairs: Some(p.minimum_separated_voter_pairs.into()),
+        replacement_grace_ms: Some(n(
+            p.replacement_grace.as_millis().min(u64::MAX as u128) as u64,
+            "replacement grace",
+        )?),
+        allow_healthy_rebalance: Some(p.allow_healthy_rebalance),
+    })
+}
+
+/// §7.7.2's pure, deterministic voter placement planner — local advice only.
+/// The membership facts usually come from `groupStatus()`, the topology
+/// snapshot from `node.topology().snapshot()`.
+#[napi]
+pub fn coordination_placement_plan(
+    input: CoordinationPlacementInput,
+    topology: &TopologySnapshot,
+) -> Result<CoordinationPlacementRecommendation> {
+    let policy = policy_in(&input.policy)?;
     let plan_input = pl::PlacementInput {
         group_id: group_in(&input.group_id)?,
         genesis_hash: id32(&input.genesis_hash, "genesisHash")?,
@@ -1476,5 +1517,111 @@ fn empty_recommendation() -> CoordinationPlacementRecommendation {
         desired_voters: None,
         retained_learners: None,
         plan: None,
+    }
+}
+
+// ── Placement manager (JavaScript providers over upcalls) ────────────────────
+
+/// What one reconciliation pass did (§7.7.3).
+#[napi(object)]
+pub struct CoordinationPlacementReport {
+    pub policy_revision: f64,
+    /// Hex; all zeros on the paths where no policy was read.
+    pub policy_digest: String,
+    pub membership_log_id: Option<CoordinationLogId>,
+    pub current_voters: Vec<String>,
+    pub current_learners: Vec<String>,
+    pub selected_voters: Vec<String>,
+    pub selected_learners: Vec<String>,
+    pub grace_crossed_members: Vec<String>,
+    pub separation: Option<CoordinationSeparationSummary>,
+    /// Hex operation id of the membership change this pass submitted (or
+    /// found pending).
+    pub pending_operation_id: Option<String>,
+    pub reason: String,
+}
+
+impl CoordinationPlacementReport {
+    fn from_rust(r: &pl::PlacementReport) -> Result<Self> {
+        Ok(Self {
+            policy_revision: n(r.policy_revision, "policy revision")?,
+            policy_digest: hex::encode(r.policy_digest),
+            membership_log_id: CoordinationLogId::opt(&r.membership_log_id)?,
+            current_voters: ids_out(&r.current_voters),
+            current_learners: ids_out(&r.current_learners),
+            selected_voters: ids_out(&r.selected_voters),
+            selected_learners: ids_out(&r.selected_learners),
+            grace_crossed_members: ids_out(&r.grace_crossed_members),
+            separation: r.separation.as_ref().map(Into::into),
+            pending_operation_id: r.pending_operation_id.map(hex::encode),
+            reason: r.reason.clone(),
+        })
+    }
+}
+
+/// The manager's topology: the node's own shared view, or a JavaScript
+/// `TopologySource` (kind 17).
+enum ManagerTopology {
+    Node(aster::topology::Topology),
+    Foreign(up::topology::ForeignTopologySource),
+}
+
+#[async_trait::async_trait]
+impl mgr::TopologySource for ManagerTopology {
+    async fn snapshot(&self) -> aster::Result<aster::topology::TopologySnapshot> {
+        match self {
+            ManagerTopology::Node(t) => mgr::TopologySource::snapshot(t).await,
+            ManagerTopology::Foreign(f) => mgr::TopologySource::snapshot(f).await,
+        }
+    }
+}
+
+type Manager = mgr::CoordinationPlacementManager<
+    ManagerTopology,
+    up::placement::ForeignPlacementPolicySource,
+    up::placement::ForeignPlacementProvisioner,
+>;
+
+/// §7.7.3's placement manager over a durable client. The policy source and
+/// provisioner are JavaScript (upcall kinds 32 / 33 on `upcalls`); the
+/// topology is the node's own view (`topology`) or JavaScript (kind 17).
+/// Runs beside an administrator: it changes membership only through the
+/// client's durable journal.
+#[napi]
+pub struct CoordinationPlacementManager {
+    inner: Arc<tokio::sync::Mutex<Manager>>,
+}
+
+#[napi]
+impl CoordinationPlacementManager {
+    #[napi(constructor)]
+    pub fn new(
+        client: &CoordinationClient,
+        upcalls: &Upcalls,
+        topology: Option<&Topology>,
+    ) -> Result<Self> {
+        let u = upcalls.table();
+        let topology = match topology {
+            Some(t) => ManagerTopology::Node(t.inner.clone()),
+            None => ManagerTopology::Foreign(up::topology::ForeignTopologySource::new(u.clone())),
+        };
+        let manager = mgr::CoordinationPlacementManager::new(
+            client.c()?,
+            topology,
+            up::placement::ForeignPlacementPolicySource::new(u.clone()),
+            up::placement::ForeignPlacementProvisioner::new(u),
+        );
+        Ok(Self {
+            inner: Arc::new(tokio::sync::Mutex::new(manager)),
+        })
+    }
+
+    /// Run one full reconciliation pass. Passes are serialized; a provider
+    /// failure (JavaScript error, timeout) rejects the pass.
+    #[napi]
+    pub async fn reconcile(&self) -> Result<CoordinationPlacementReport> {
+        let mut manager = self.inner.clone().lock_owned().await;
+        let report = manager.reconcile().await.map_err(coord_err)?;
+        CoordinationPlacementReport::from_rust(&report)
     }
 }

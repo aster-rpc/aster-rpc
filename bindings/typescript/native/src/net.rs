@@ -396,8 +396,8 @@ fn parse_socket_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
 
 #[napi]
 pub struct IrohBiStream {
-    send: Option<IrohSendStream>,
-    recv: Option<IrohRecvStream>,
+    pub(crate) send: Option<IrohSendStream>,
+    pub(crate) recv: Option<IrohRecvStream>,
 }
 
 #[napi]

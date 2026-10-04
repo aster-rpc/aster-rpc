@@ -342,6 +342,14 @@ export {
   type LeaseTransition,
   type LeaseSerializer,
   type FenceRejectionKind,
+  ForeignLeaseSerializer,
+  ForeignFencedResource,
+  FencedOutcomeUnknownError,
+  type LeaseBackend,
+  type LeaseAuthorizer,
+  type LeaseAuthorizerFn,
+  type FencedResource,
+  type ForeignLeaseSerializerOptions,
 } from './lease.js';
 // Coordination client (Rust `aster::coordination::client`, wrapped — plan T8)
 export {
@@ -394,6 +402,14 @@ export {
   type PlacementInput,
   type PlacementPlan,
   type PlacementRecommendation,
+  PlacementManager,
+  type PlacementManagerOptions,
+  type PlacementPolicySource,
+  type PlacementProvisioner,
+  type ProvisionRequest,
+  type TopologySource,
+  type TopologyView,
+  type PlacementReport,
 } from './coordination.js';
 export {
   Topology,
@@ -404,7 +420,33 @@ export {
   type TopologySnapshot,
   type TopologyTiming,
   type TopologySwarmOptions,
+  AdmittedFilter,
+  type AdmittedFilterFn,
+  type AdmittedFilterOptions,
+  type AdmittedFilterStats,
 } from './topology.js';
+// Upcalls: Rust extension points implemented in JavaScript (plan R6)
+export {
+  Upcalls,
+  UpcallCancelledError,
+  UPCALL_KINDS,
+  UPCALL_STATUS,
+  upcallCodecDecode,
+  upcallCodecEncode,
+  type UpcallKindName,
+  type UpcallCancelReason,
+  type UpcallFailureMode,
+  type UpcallPolicy,
+  type UpcallsOptions,
+  type UpcallContext,
+  type UpcallStats,
+} from './upcalls.js';
+// Expose (Rust `aster::expose`): socket targets with JavaScript authorization
+export {
+  Expose,
+  type ExposeAuthorizer,
+  type ExposeAuthorizeRequest,
+} from './expose.js';
 // Data plane (Rust `aster::{Blobs, Docs, Gossip}` and connection paths)
 export {
   type BlobFormat,
@@ -559,6 +601,9 @@ export {
   type GateDecision,
   type GatePolicyOptions,
   type PeerAdmission,
+  type AdmissionHooks,
+  type AdmissionHookRequest,
+  type AdmissionRejection,
 } from './gate.js';
 // Nonce store
 export {
