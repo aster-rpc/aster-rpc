@@ -611,16 +611,131 @@ async fn peer_abort_cancels_the_upcall_and_closes_the_body() {
         .find(|e| e.invocation_id == invocation)
         .unwrap();
     assert_eq!(cancel.cancel_reason(), Some(CancelReason::Abandoned));
-    // The body handle is gone too; a late answer is ignored.
+    // The body handle is gone too, and every body call on the cancelled
+    // exchange says so with `Cancelled` (never `UnknownStream`); a late answer
+    // is ignored.
     assert_eq!(ctx.bodies.open_count(), 0);
     assert_eq!(
         ctx.bodies.write(stream_id, b"late".to_vec()).await,
+        Err(BodyError::Cancelled)
+    );
+    assert_eq!(
+        ctx.bodies.try_write(stream_id, b"late".to_vec()),
+        Err(BodyError::Cancelled)
+    );
+    assert_eq!(
+        ctx.bodies.read(stream_id, 16).await,
+        Err(BodyError::Cancelled)
+    );
+    assert_eq!(
+        ctx.bodies.finish(stream_id, Vec::new()),
+        Err(BodyError::Cancelled)
+    );
+    // The binding has now been told; the id is retired.
+    assert_eq!(
+        ctx.bodies.abort(stream_id, "late"),
         Err(BodyError::UnknownStream(stream_id))
+    );
+    // An id that never existed is still unknown.
+    assert_eq!(
+        ctx.bodies.write(9_999_999, b"x".to_vec()).await,
+        Err(BodyError::UnknownStream(9_999_999))
     );
     assert!(ctx
         .upcalls
         .respond(invocation, UpcallStatus::Ok, Vec::new())
         .is_err());
+    n.shutdown().await;
+}
+
+/// After the head, the consumer vanishes and the relay tears the exchange
+/// down. A write that arrives only afterwards (the handler was idle) gets
+/// `Cancelled`, not `UnknownStream`; so do reads and a finish. A handler that
+/// already finished its response keeps getting `UnknownStream`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_after_peer_gone_teardown_is_cancelled() {
+    let (queue, ctx) = setup();
+    let parked: Arc<Mutex<Vec<u64>>> = Arc::default();
+    let p = parked.clone();
+    let _foreign = Foreign::start(
+        queue,
+        ctx.clone(),
+        true,
+        Arc::new(move |ctx, id, req| {
+            ctx.respond(id, 200, &[], HttpBodyMode::Stream);
+            if req.uri.starts_with("/done") {
+                // Completes normally: the entry goes away with the response.
+                let _ = ctx.bodies.write_blocking(req.stream_id, vec![1; 8], WAIT);
+                let _ = ctx.bodies.finish(req.stream_id, Vec::new());
+            }
+            // The streaming handler goes idle without writing again.
+            p.lock().unwrap().push(req.stream_id);
+        }),
+    );
+    let c = ctx.clone();
+    let n = net(move |e| {
+        expose_foreign_http(e, &c.upcalls, &c.bodies, SVC, ForeignHttpOptions::default());
+    })
+    .await;
+
+    // A response that finishes cleanly.
+    let done = relay_request(&n.conn, SVC, get("/done")).await.unwrap();
+    assert_eq!(done.body().len(), 8);
+    wait_until("both handlers parked", || parked.lock().unwrap().len() == 1).await;
+    let finished_id = parked.lock().unwrap()[0];
+    wait_until("exchange closed", || ctx.bodies.open_count() == 0).await;
+    assert_eq!(
+        ctx.bodies.write(finished_id, b"x".to_vec()).await,
+        Err(BodyError::UnknownStream(finished_id)),
+        "a finished exchange stays unknown"
+    );
+
+    // A streaming response whose consumer then goes away.
+    let req = http::Request::builder()
+        .uri("/idle")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = tokio::time::timeout(WAIT, relay_request_streaming(&n.conn, SVC, req))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    wait_until("idle handler parked", || parked.lock().unwrap().len() == 2).await;
+    let stream_id = parked.lock().unwrap()[1];
+    drop(resp);
+    n.conn.close(0, b"bye").unwrap();
+    // The relay notices the vanished peer when it next writes a body frame, so
+    // probe writes (the first may still be accepted into the buffer) prompt
+    // the teardown.
+    for _ in 0..100 {
+        if ctx.bodies.open_count() == 0 {
+            break;
+        }
+        let _ = ctx.bodies.try_write(stream_id, b"probe".to_vec());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(ctx.bodies.open_count(), 0, "exchange never torn down");
+
+    assert_eq!(
+        ctx.bodies.write(stream_id, b"late".to_vec()).await,
+        Err(BodyError::Cancelled)
+    );
+    assert_eq!(
+        ctx.bodies.try_write(stream_id, b"late".to_vec()),
+        Err(BodyError::Cancelled)
+    );
+    assert_eq!(
+        ctx.bodies.read(stream_id, 16).await,
+        Err(BodyError::Cancelled)
+    );
+    assert_eq!(
+        ctx.bodies.finish(stream_id, Vec::new()),
+        Err(BodyError::Cancelled)
+    );
+    assert_eq!(
+        ctx.bodies.abort(stream_id, "late"),
+        Err(BodyError::UnknownStream(stream_id))
+    );
     n.shutdown().await;
 }
 

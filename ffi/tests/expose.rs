@@ -1590,10 +1590,7 @@ fn consumer_cancel_before_the_head_cancels_the_upcall() {
     rig.wait_for("late answers", |_| late.lock().unwrap().len() == 2);
     let late = late.lock().unwrap().clone();
     assert_eq!(late[0], NOT_FOUND, "late respond");
-    assert!(
-        late[1] == B_CANCELLED || late[1] == B_UNKNOWN_STREAM,
-        "{late:?}"
-    );
+    assert_eq!(late[1], B_CANCELLED, "a write after the teardown: {late:?}");
     rig.wait_for("exchange to close", |r| r.ctx().open_count() == 0);
 }
 

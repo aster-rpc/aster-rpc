@@ -28,7 +28,11 @@
 //! response head; the upcall is then cancelled like any abandoned waiter
 //! (`Cancel{abandoned}`), and the exchange's body handle closes, so pending
 //! reads and writes fail with [`BodyError::Cancelled`]. After the head, a
-//! vanished peer surfaces at the next write. The kind's [`UpcallPolicy`]
+//! vanished peer surfaces at the next write. Once the relay has torn an
+//! unfinished exchange down (peer gone, abandoned, upcall timed out), every
+//! later read, write, finish or abort on it also returns `Cancelled`; the
+//! last [`CANCELLED_MEMORY`] such ids are remembered, and a `finish` / `abort`
+//! retires its id. The kind's [`UpcallPolicy`]
 //! timeout bounds the time to the response head (default 5 s; raise it for
 //! long-polling handlers), not the body.
 //!
@@ -36,7 +40,7 @@
 //! [`Expose::expose_http`]: crate::expose::Expose::expose_http
 //! [`Expose::serve_routes`]: crate::expose::Expose::serve_routes
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -166,11 +170,14 @@ pub fn foreign_route_policy(upcalls: Upcalls) -> RoutePolicy {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BodyError {
     /// No open exchange has this id: never issued, or already over (the
-    /// response was inline or finished and the relay is done with it).
+    /// response was inline or finished and the relay is done with it, or a
+    /// cancellation old enough to be forgotten).
     #[error("unknown or finished body stream {0}")]
     UnknownStream(u64),
     /// The exchange was cancelled: the peer went away or the request was
-    /// abandoned.
+    /// abandoned, whether the call was parked at the time or arrived after
+    /// the relay tore the exchange down (within [`CANCELLED_MEMORY`] recent
+    /// cancellations).
     #[error("HTTP exchange cancelled")]
     Cancelled,
     /// A body went over its configured size cap. A request body over the
@@ -295,9 +302,49 @@ struct Exchange {
     runtime: tokio::runtime::Handle,
 }
 
+/// How many recently cancelled stream ids an [`HttpBodies`] remembers (see
+/// [`BodyError::Cancelled`]). Older ones are forgotten and report
+/// [`BodyError::UnknownStream`].
+pub const CANCELLED_MEMORY: usize = 1024;
+
+/// A bounded, insertion-ordered set of stream ids whose exchange the relay
+/// closed (peer gone, request abandoned) before the binding finished or
+/// aborted the response. Lets a body call that arrives after the teardown
+/// report `Cancelled` instead of `UnknownStream`.
+#[derive(Default)]
+struct Cancelled {
+    ids: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl Cancelled {
+    fn insert(&mut self, id: u64) {
+        if self.ids.insert(id) {
+            self.order.push_back(id);
+            while self.order.len() > CANCELLED_MEMORY {
+                if let Some(old) = self.order.pop_front() {
+                    self.ids.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    /// Forget `id`.
+    fn take(&mut self, id: u64) {
+        if self.ids.remove(&id) {
+            self.order.retain(|i| *i != id);
+        }
+    }
+}
+
 #[derive(Default)]
 struct BodiesInner {
     exchanges: Mutex<HashMap<u64, Arc<Exchange>>>,
+    cancelled: Mutex<Cancelled>,
     next_id: AtomicU64,
 }
 
@@ -328,15 +375,26 @@ impl std::fmt::Debug for HttpBodies {
 }
 
 /// Closes an exchange when the Rust side is done with it (response sent,
-/// handler dropped, peer gone).
+/// handler dropped, peer gone). Unless [`complete`](Self::complete) was
+/// called, a close that finds the response still unfinished counts as a
+/// cancellation: the binding's later body calls report `Cancelled`.
 struct ExchangeGuard {
     bodies: HttpBodies,
     id: u64,
+    completed: bool,
+}
+
+impl ExchangeGuard {
+    /// The exchange ended normally (inline / HEAD / refused response): later
+    /// body calls are `UnknownStream`, not `Cancelled`.
+    fn complete(&mut self) {
+        self.completed = true;
+    }
 }
 
 impl Drop for ExchangeGuard {
     fn drop(&mut self) {
-        self.bodies.close(self.id);
+        self.bodies.close(self.id, !self.completed);
     }
 }
 
@@ -375,26 +433,44 @@ impl HttpBodies {
             ExchangeGuard {
                 bodies: self.clone(),
                 id,
+                completed: false,
             },
         )
     }
 
-    fn close(&self, id: u64) {
+    /// Remove an exchange. `cancelled` says the relay is tearing it down
+    /// rather than finishing it; if the binding had not yet finished or
+    /// aborted the response, the id is remembered (bounded) so its later body
+    /// calls report `Cancelled`.
+    fn close(&self, id: u64, cancelled: bool) {
         let removed = self.inner.exchanges.lock().unwrap().remove(&id);
         if let Some(ex) = removed {
             ex.gone.set();
-            ex.response.lock().unwrap().take();
+            let unfinished = ex.response.lock().unwrap().take().is_some();
+            if cancelled && unfinished {
+                self.inner.cancelled.lock().unwrap().insert(id);
+            }
         }
     }
 
     fn get(&self, id: u64) -> Result<Arc<Exchange>, BodyError> {
-        self.inner
-            .exchanges
-            .lock()
-            .unwrap()
-            .get(&id)
-            .cloned()
-            .ok_or(BodyError::UnknownStream(id))
+        if let Some(ex) = self.inner.exchanges.lock().unwrap().get(&id) {
+            return Ok(ex.clone());
+        }
+        if self.inner.cancelled.lock().unwrap().contains(id) {
+            return Err(BodyError::Cancelled);
+        }
+        Err(BodyError::UnknownStream(id))
+    }
+
+    /// [`get`](Self::get) for `finish` / `abort`: a cancelled id answers
+    /// `Cancelled` once, then is retired (the binding has been told).
+    fn get_to_end(&self, id: u64) -> Result<Arc<Exchange>, BodyError> {
+        let r = self.get(id);
+        if r.is_err() {
+            self.inner.cancelled.lock().unwrap().take(id);
+        }
+        r
     }
 
     /// Read the next request-body chunk of at most `max` bytes (clamped to
@@ -553,7 +629,7 @@ impl HttpBodies {
     /// the relay hop until it carries them -- design V2 -- but visible to an
     /// in-process consumer). Queued chunks are still delivered.
     pub fn finish(&self, stream_id: u64, trailers: Vec<HttpHeader>) -> Result<(), BodyError> {
-        let ex = self.get(stream_id)?;
+        let ex = self.get_to_end(stream_id)?;
         let trailers = if trailers.is_empty() {
             None
         } else {
@@ -576,7 +652,7 @@ impl HttpBodies {
     /// the relay resets the stream, so the consumer sees a failed response,
     /// never a silently truncated one. `message` is logged, not sent.
     pub fn abort(&self, stream_id: u64, message: &str) -> Result<(), BodyError> {
-        let ex = self.get(stream_id)?;
+        let ex = self.get_to_end(stream_id)?;
         let tx = ex
             .response
             .lock()
@@ -694,7 +770,7 @@ impl ForeignHttpHandler {
         };
 
         let (tx, rx) = body_channel(o.response_buffer);
-        let (stream_id, guard) = self.inner.bodies.open(request_body, tx, o);
+        let (stream_id, mut guard) = self.inner.bodies.open(request_body, tx, o);
         let payload = codec::encode_expose_http_request(&ExposeHttpRequest {
             service_id: self.inner.service_id.clone(),
             peer_id,
@@ -731,10 +807,12 @@ impl ForeignHttpHandler {
         } = resp;
         let (Ok(status), Ok(headers)) = (StatusCode::from_u16(status), header_map(&headers)) else {
             tracing::debug!(target: UPCALL, service = %self.inner.service_id, "expose_http: invalid response head");
+            guard.complete();
             return status_only(StatusCode::BAD_GATEWAY);
         };
         let body: ResponseBody = if parts.method == Method::HEAD {
             // No body on a HEAD response; `guard` drops and closes the handle.
+            guard.complete();
             empty_body()
         } else {
             match body {
@@ -742,8 +820,10 @@ impl ForeignHttpHandler {
                     if o.max_response_body
                         .is_some_and(|limit| bytes.len() as u64 > limit)
                     {
+                        guard.complete();
                         return status_only(StatusCode::BAD_GATEWAY);
                     }
+                    guard.complete();
                     Full::new(Bytes::from(bytes))
                         .map_err(|e: Infallible| -> RelayError { match e {} })
                         .boxed_unsync()
@@ -865,4 +945,69 @@ fn upcall_failure(service_id: &str, e: UpcallError) -> http::Response<ResponseBo
     // The foreign message is logged, never sent to the remote peer.
     tracing::debug!(target: UPCALL, service = %service_id, error = %e, %status, "expose_http upcall failed");
     status_only(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Open an exchange the way the handler does and drop its guard, as the
+    /// relay does when it tears the exchange down.
+    fn open_and_cancel(bodies: &HttpBodies) -> u64 {
+        let (tx, _rx) = body_channel(1);
+        let (id, guard) = bodies.open(None, tx, ForeignHttpOptions::default());
+        drop(guard);
+        id
+    }
+
+    #[tokio::test]
+    async fn cancelled_ids_are_remembered_within_a_bound() {
+        let bodies = HttpBodies::new();
+        let first = open_and_cancel(&bodies);
+        assert_eq!(
+            bodies.write(first, vec![1]).await,
+            Err(BodyError::Cancelled)
+        );
+
+        for _ in 0..CANCELLED_MEMORY {
+            open_and_cancel(&bodies);
+        }
+        // The oldest id fell out of the bounded memory; the newest is kept.
+        assert_eq!(
+            bodies.write(first, vec![1]).await,
+            Err(BodyError::UnknownStream(first))
+        );
+        let newest = first + CANCELLED_MEMORY as u64;
+        assert_eq!(
+            bodies.write(newest, vec![1]).await,
+            Err(BodyError::Cancelled)
+        );
+        assert!(bodies.inner.cancelled.lock().unwrap().ids.len() <= CANCELLED_MEMORY);
+        assert!(bodies.inner.cancelled.lock().unwrap().order.len() <= CANCELLED_MEMORY);
+    }
+
+    #[tokio::test]
+    async fn finish_retires_a_cancelled_id() {
+        let bodies = HttpBodies::new();
+        let id = open_and_cancel(&bodies);
+        assert_eq!(bodies.finish(id, Vec::new()), Err(BodyError::Cancelled));
+        assert_eq!(
+            bodies.finish(id, Vec::new()),
+            Err(BodyError::UnknownStream(id))
+        );
+        assert!(bodies.inner.cancelled.lock().unwrap().ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_finished_exchange_is_not_remembered_as_cancelled() {
+        let bodies = HttpBodies::new();
+        let (tx, _rx) = body_channel(1);
+        let (id, guard) = bodies.open(None, tx, ForeignHttpOptions::default());
+        bodies.finish(id, Vec::new()).unwrap();
+        drop(guard);
+        assert_eq!(
+            bodies.write(id, vec![1]).await,
+            Err(BodyError::UnknownStream(id))
+        );
+    }
 }
