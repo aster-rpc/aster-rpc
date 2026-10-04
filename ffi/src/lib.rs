@@ -21,6 +21,8 @@ use anyhow::Result;
 use aster_transport_core::*;
 
 pub mod call;
+pub mod coordination;
+pub mod coordination_codec;
 pub mod data;
 pub mod envelope;
 pub mod expose;
@@ -99,8 +101,15 @@ pub mod upcall;
 //   `PERMISSION_DENIED` for a denied relay; was always `INTERNAL`) and the
 //   relay code in `error_code` (was -1); a refused http-relay stream is now
 //   reset with a refusal code (wire), no longer dropped silently.
+// - 4.4.0 (additive): coordination client + placement (`coordination.rs`,
+//   design `docs/_internal/bindings/coordination-abi-design.md`) --
+//   `aster_coordination_client_*` (durable journaled client or read-only),
+//   `aster_coordination_{mutate,read}` with UCv1 requests `D0` / `D1` and
+//   results `D2`-`DE`, resolved-mutation and coordination-lease handles,
+//   `aster_coordination_placement_manager_*` over upcall kinds 17/32/33
+//   (now issued by the C ABI); events 110-113.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 3;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 4;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -311,6 +320,24 @@ pub enum aster_event_kind_t {
     /// relay; see `aster_http_body_status_to_status`). One-shot: re-arm
     /// after handling.
     ASTER_EVENT_HTTP_RELAY_READY = 109,
+
+    // Coordination client (ABI 4.4, coordination.rs)
+    /// `aster_coordination_client_open`: `handle` = the new
+    /// `aster_coordination_client_t`.
+    ASTER_EVENT_COORDINATION_CLIENT_OPENED = 110,
+    /// `aster_coordination_mutate` / `_unacknowledged` / `_resume`:
+    /// `handle` = a new `aster_coordination_resolved_t` (0 = nothing to
+    /// deliver; then no payload), payload = UCv1 `MutationReply` (`D2`).
+    ASTER_EVENT_COORDINATION_RESOLVED = 111,
+    /// `aster_coordination_read`, `_retire_other_client`,
+    /// `_recovery_export_to_file`, `_lease_compare_and_set`,
+    /// `_lease_release_with_value`, `_placement_reconcile`: payload = the
+    /// UCv1 result (`D2`-`DE`, see the call).
+    ASTER_EVENT_COORDINATION_RESULT = 112,
+    /// `aster_coordination_lease_acquire`: granted -- `handle` = a new
+    /// `aster_coordination_lease_t`, payload = `DD` (the fence); denied --
+    /// `handle` = 0, payload = UCv1 `B2` (denied, reason + snapshot).
+    ASTER_EVENT_COORDINATION_LEASE_ACQUIRED = 113,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
@@ -783,6 +810,19 @@ impl BridgeRuntime {
         error_code: i32,
         message: &str,
     ) {
+        self.emit_error_flagged(operation, user_data, status, error_code, 0, message);
+    }
+
+    /// An `ASTER_EVENT_ERROR` with `status`, `error_code` and `flags`.
+    pub(crate) fn emit_error_flagged(
+        &self,
+        operation: u64,
+        user_data: u64,
+        status: aster_status_t,
+        error_code: i32,
+        flags: u32,
+        message: &str,
+    ) {
         let data = message.as_bytes().to_vec();
         let (buf_id, _) = self.buffers.insert(data);
         let event = EventInternal::new(
@@ -795,6 +835,8 @@ impl BridgeRuntime {
             error_code,
         )
         .with_buffer(buf_id, message.len());
+        let mut event = event;
+        event.flags = flags;
         self.emit(EventOwned {
             event,
             payload: None,

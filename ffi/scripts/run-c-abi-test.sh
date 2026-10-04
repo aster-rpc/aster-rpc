@@ -38,4 +38,4 @@ ${CC:-cc} -std=c11 -Wall -Wextra -Werror \
   "$ffi_dir/tests/abi_contract_test.c" \
   -L "$lib_dir" -laster_transport_ffi -Wl,-rpath,"$lib_dir"
 
-"$out_dir/abi_contract_test"
+ASTER_ABI_TEST_DIR="$out_dir" "$out_dir/abi_contract_test"

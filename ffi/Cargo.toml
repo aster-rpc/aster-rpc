@@ -16,8 +16,10 @@ path = "src/bin/soak_test_runner/main.rs"
 aster_transport_core = { path = "../core", version = "=0.3.0" }
 # Plan D1: the C ABI wraps the `aster` crate (node + config + Gate 0 since ABI
 # 3.2). Binding profile: default + rpc + metrics + binding-support, plus
-# `expose` since ABI 4.2 (the binding profile's "once the binding surfaces it").
-aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support", "expose"] }
+# `expose` since ABI 4.2 and `coordination-client` since ABI 4.4 (the binding
+# profile's "once the binding surfaces it"; the client only, never the voter).
+aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support", "expose", "coordination-client"] }
+async-trait = "0.1"
 iroh = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -31,6 +33,19 @@ base64 = "0.22"
 [dev-dependencies]
 loom = "0.7"
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[features]
+# Test-only: `tests/coordination.rs` hosts a real voter group in process
+# (`aster/coordination-testing`; D7: the voter is Rust-only). A feature, not a
+# dev-dependency, so a workspace `--all-targets` build does not unify the voter
+# into every crate's test graph (same as the NAPI `coordination-fixture`).
+#   cargo test -p aster_transport_ffi --features coordination-fixture --test coordination
+coordination-fixture = ["aster/coordination-testing"]
+
+[[test]]
+name = "coordination"
+required-features = ["coordination-fixture"]
 
 [[bench]]
 name = "ffi_benchmarks"

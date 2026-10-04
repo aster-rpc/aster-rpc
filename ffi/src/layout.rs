@@ -12,6 +12,10 @@
 
 use core::mem::{align_of, offset_of, size_of};
 
+use crate::coordination::{
+    aster_coordination_client_options_t, aster_coordination_error_t,
+    aster_coordination_mutation_op_t, aster_coordination_read_op_t,
+};
 use crate::data::{
     aster_blob_format_t, aster_blob_status_t, aster_fetch_strategy_t, aster_local_access_t,
     aster_path_info_t, aster_path_list_t, aster_retire_outcome_t,
@@ -86,6 +90,9 @@ const _: () = assert!(size_of::<aster_upcall_cancel_reason_t>() == 4);
 const _: () = assert!(size_of::<aster_lease_status_t>() == 4);
 const _: () = assert!(size_of::<aster_http_body_status_t>() == 4);
 const _: () = assert!(size_of::<aster_route_protocol_t>() == 4);
+const _: () = assert!(size_of::<aster_coordination_error_t>() == 4);
+const _: () = assert!(size_of::<aster_coordination_mutation_op_t>() == 4);
+const _: () = assert!(size_of::<aster_coordination_read_op_t>() == 4);
 
 #[cfg(target_pointer_width = "64")]
 mod lp64 {
@@ -409,5 +416,14 @@ mod lp64 {
         max_chunk = 8,
         upload_capacity = 16,
         reserved = 20,
+    });
+
+    // ABI 4.4: coordination client (coordination.rs).
+    assert_layout!(aster_coordination_client_options_t, size = 48, align = 8, {
+        struct_size = 0,
+        flags = 4,
+        group_id = 8,
+        seed_tickets = 16,
+        journal_dir = 32,
     });
 }

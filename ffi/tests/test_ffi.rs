@@ -15,9 +15,10 @@ fn test_abi_version() {
     // 4.0.0: removals only -- reactor, framed aster_call_*, the 3.2-deprecated
     // node factories and bare endpoints (see RENAME_MAP.md "4.0").
     // 4.1.0: upcalls (additive, RENAME_MAP.md "New in 4.1").
-    // 4.2.0: expose; 4.3.0: streaming consumer relay (both additive).
+    // 4.2.0: expose; 4.3.0: streaming consumer relay; 4.4.0: coordination
+    // client + placement (all additive).
     assert_eq!(ASTER_ABI_VERSION_MAJOR, 4);
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 3);
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 4);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);
