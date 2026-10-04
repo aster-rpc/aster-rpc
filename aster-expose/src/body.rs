@@ -171,6 +171,13 @@ impl BodySender {
         self.tx.is_closed()
     }
 
+    /// Resolves once a [`try_send`](Self::try_send) could queue a chunk
+    /// (`Ok`), or with `Err` when the reading side is gone. Readiness only:
+    /// another sender may take the room first.
+    pub async fn writable(&self) -> Result<(), BodyClosed> {
+        self.tx.reserve().await.map(drop).map_err(|_| BodyClosed)
+    }
+
     /// Resolves when the reading side is gone.
     pub async fn closed(&self) {
         self.tx.closed().await

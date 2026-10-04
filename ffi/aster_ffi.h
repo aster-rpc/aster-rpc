@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 2
+#define ASTER_ABI_VERSION_MINOR 3
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -190,6 +190,23 @@ typedef enum aster_status_t {
    * capability. `aster_last_error_message` says which check failed.
    */
   ASTER_STATUS_VERIFICATION_FAILED = 13,
+  /**
+   * Reserved for the R4 auth model (ABI 4.3): the caller presented no
+   * usable credential. Not returned by any 4.3 function.
+   */
+  ASTER_STATUS_UNAUTHENTICATED = 14,
+  /**
+   * The peer's (or local) policy refused the caller (ABI 4.3). Reserved
+   * for the R4 auth model; today only an expose relay the serving node's
+   * authorizer denied reports it (`aster_expose_relay_request` error
+   * events, `ASTER_EVENT_HTTP_RELAY_READY`).
+   */
+  ASTER_STATUS_PERMISSION_DENIED = 15,
+  /**
+   * Reserved for the R4 auth model (ABI 4.3): the presented credential
+   * has expired. Not returned by any 4.3 function.
+   */
+  ASTER_STATUS_CREDENTIAL_EXPIRED = 16,
 } aster_status_t;
 
 /**
@@ -313,6 +330,16 @@ typedef enum aster_event_kind_t {
    * `aster_lease_status_t`.
    */
   ASTER_EVENT_LEASE_STATUS = 108,
+  /**
+   * `aster_http_upload_ready` / `aster_http_response_ready`: the armed
+   * handle (`handle`) is ready. `error_code` = the
+   * `aster_http_body_status_t` its next non-blocking call returns (0:
+   * it succeeds -- room to write, a head, data or the end), `status` =
+   * that code as an `aster_status_t` (`PERMISSION_DENIED` for a denied
+   * relay; see `aster_http_body_status_to_status`). One-shot: re-arm
+   * after handling.
+   */
+  ASTER_EVENT_HTTP_RELAY_READY = 109,
 } aster_event_kind_t;
 
 /**
@@ -889,6 +916,41 @@ typedef enum aster_http_body_status_t {
    */
   ASTER_HTTP_BODY_BLOCKING_ON_RUNTIME = 9,
   /**
+   * The peer has no exposed service of this id.
+   */
+  ASTER_HTTP_BODY_UNKNOWN_SERVICE = 10,
+  /**
+   * The service's admission policy refused this node
+   * (`ASTER_STATUS_PERMISSION_DENIED`).
+   */
+  ASTER_HTTP_BODY_DENIED = 11,
+  /**
+   * The service is at its concurrent-stream cap; retry later.
+   */
+  ASTER_HTTP_BODY_OVERLOADED = 12,
+  /**
+   * The peer reset or ended the stream without a response head (its
+   * handler or relay failed).
+   */
+  ASTER_HTTP_BODY_RESET = 13,
+  /**
+   * The response head was malformed or too large.
+   */
+  ASTER_HTTP_BODY_BAD_HEAD = 14,
+  /**
+   * The connection is closed or was lost.
+   */
+  ASTER_HTTP_BODY_CONNECTION_CLOSED = 15,
+  /**
+   * The upload was aborted (or freed unfinished) before the head.
+   */
+  ASTER_HTTP_BODY_UPLOAD_FAILED = 16,
+  /**
+   * The head does not fit the buffer: `*out_len` is the size needed;
+   * retry (the head stays available).
+   */
+  ASTER_HTTP_BODY_BUFFER_TOO_SMALL = 17,
+  /**
    * A NULL pointer with a non-zero length, a zero `cap`, ...
    */
   ASTER_HTTP_BODY_INVALID_ARGUMENT = -1,
@@ -1320,6 +1382,45 @@ typedef struct aster_route_spec_t {
  * is held.
  */
 typedef uint64_t aster_route_registration_t;
+
+/**
+ * Options of `aster_expose_relay_stream` (`RelayOptions`). Initialise with
+ * `aster_http_relay_options_init`; `struct_size` must equal
+ * `sizeof(aster_http_relay_options_t)`. 24 bytes.
+ */
+typedef struct aster_http_relay_options_t {
+  uint32_t struct_size;
+  /**
+   * Reserved, must be 0.
+   */
+  uint32_t flags;
+  /**
+   * Largest chunk one upload write takes and one response read returns.
+   * 0 = default (1 MiB).
+   */
+  uint64_t max_chunk;
+  /**
+   * Upload chunks queued before a write waits. 0 = default (8).
+   */
+  uint32_t upload_capacity;
+  /**
+   * Reserved, must be 0.
+   */
+  uint32_t reserved;
+} aster_http_relay_options_t;
+
+/**
+ * The request body of a streaming relay (`aster_expose_relay_stream`).
+ * Free with `aster_http_upload_free`, which aborts it if unfinished.
+ */
+typedef uint64_t aster_http_upload_t;
+
+/**
+ * The response of a streaming relay (`aster_expose_relay_stream`): its head,
+ * then its body. Free with `aster_http_response_free`, which abandons the
+ * exchange unless the body was read to its end.
+ */
+typedef uint64_t aster_http_response_t;
 
 /**
  * Everything a sealed grant is bound to (`GrantContext`). Sealing and
@@ -3468,7 +3569,11 @@ int32_t aster_http_body_abort(aster_runtime_t runtime,
  * body `Inline`, copy out then `aster_buffer_release`) for **any** HTTP
  * status, including the `5xx` a failing handler maps to. A transport
  * failure, a refused request or a response that failed mid-body (the peer
- * aborted it) is `ASTER_EVENT_ERROR`. Streaming relay is not in the C ABI.
+ * aborted it) is `ASTER_EVENT_ERROR`: since ABI 4.3 its `error_code` is the
+ * relay code (`aster_http_body_status_t` 10..=16, e.g. `DENIED`) and its
+ * `status` that code's `aster_status_t` (`aster_http_body_status_to_status`:
+ * `PERMISSION_DENIED`, `NOT_FOUND`, ...). For streaming bodies see
+ * `aster_expose_relay_stream`.
  */
 int32_t aster_expose_relay_request(aster_runtime_t runtime,
                                    aster_connection_t connection,
@@ -3498,6 +3603,183 @@ int32_t aster_expose_request_route(aster_runtime_t runtime,
  */
 int32_t aster_route_registration_free(aster_runtime_t runtime,
                                       aster_route_registration_t registration);
+
+/**
+ * Map an `aster_http_body_status_t` value (as returned) to the
+ * `aster_status_t` the C ABI uses for it in events (see the mapping on
+ * `ASTER_EVENT_HTTP_RELAY_READY`; `DENIED` → `PERMISSION_DENIED`). Unknown
+ * values map to `INTERNAL`.
+ */
+int32_t aster_http_body_status_to_status(int32_t code);
+
+/**
+ * Fill `*out` with the defaults (`struct_size` set, every field 0 = its
+ * default).
+ */
+int32_t aster_http_relay_options_init(struct aster_http_relay_options_t *out);
+
+/**
+ * Start a **streaming** HTTP exchange with a service the peer exposed on
+ * `connection` and return its two handles at once (the exchange is already
+ * running): write the request body to `*out_upload`, then finish it, while
+ * waiting on / reading `*out_response`. Full duplex: the response head can
+ * arrive before the upload is done (an early `413`), and the upload carries
+ * on after it (see the module docs for the lifetime contract).
+ *
+ * `request` is a UCv1 `C4` message whose body mode is `Stream`:
+ * `service_id`, `method`, `uri`, `headers`; `version`, `peer_id` and
+ * `stream_id` are ignored. `opts` NULL = defaults. Returns `aster_status_t`:
+ * `INVALID_ARGUMENT` (nothing sent) for a bad `C4`, an inline body, an empty
+ * or over-long service id, or an invalid method / URI / header;
+ * `NOT_FOUND` for an unknown runtime or connection. Refusals and transport
+ * failures surface later, on the response (`aster_http_response_wait`).
+ */
+int32_t aster_expose_relay_stream(aster_runtime_t runtime,
+                                  aster_connection_t connection,
+                                  struct aster_bytes_t request,
+                                  const struct aster_http_relay_options_t *opts,
+                                  aster_http_upload_t *out_upload,
+                                  aster_http_response_t *out_response);
+
+/**
+ * Queue one request-body chunk (copied; at most the options' `max_chunk`
+ * bytes, else `CHUNK_TOO_LARGE`), waiting up to `timeout_ms` while the
+ * buffer is full. A timed-out write (`TIMEOUT`) queued nothing.
+ * `CANCELLED`: the request side is gone (the handler stopped reading -- it
+ * may already have answered -- or the exchange failed); stop producing.
+ * `FINISHED` after `finish` / `abort`, including for a write parked when
+ * another thread finished or aborted. Blocking: never on a tokio runtime
+ * thread (`BLOCKING_ON_RUNTIME`), even with `timeout_ms` = 0; use
+ * `aster_http_upload_try_write` to poll. Returns `aster_http_body_status_t`.
+ */
+int32_t aster_http_upload_write(aster_runtime_t runtime,
+                                aster_http_upload_t upload,
+                                const uint8_t *chunk,
+                                uintptr_t len,
+                                uint32_t timeout_ms);
+
+/**
+ * Queue one chunk if there is room now. On `OK`, `*out_queued` is 1
+ * (queued) or 0 (full: nothing queued; arm `aster_http_upload_ready`).
+ * Never blocks; any thread.
+ */
+int32_t aster_http_upload_try_write(aster_runtime_t runtime,
+                                    aster_http_upload_t upload,
+                                    const uint8_t *chunk,
+                                    uintptr_t len,
+                                    uint32_t *out_queued);
+
+/**
+ * End the request body cleanly; queued chunks are still sent. A second
+ * `finish` / `abort` is `FINISHED`. Never blocks.
+ */
+int32_t aster_http_upload_finish(aster_runtime_t runtime, aster_http_upload_t upload);
+
+/**
+ * End the request body with an error: queued chunks are discarded and the
+ * request stream is reset, so the handler sees a failed body, never a
+ * truncated one. Before the head, the response then fails with
+ * `UPLOAD_FAILED`. `message` (UTF-8, may be NULL / 0) stays local. Never
+ * blocks.
+ */
+int32_t aster_http_upload_abort(aster_runtime_t runtime,
+                                aster_http_upload_t upload,
+                                const uint8_t *message,
+                                uintptr_t len);
+
+/**
+ * Arm a one-shot readiness notification: `ASTER_EVENT_HTTP_RELAY_READY`
+ * (`handle` = `upload`) once `aster_http_upload_try_write` could queue a
+ * chunk (`error_code` 0) or every write would fail (`error_code`
+ * `FINISHED` / `CANCELLED`). Readiness only: another writer may take the
+ * room first. Freeing the upload resolves it. Returns `aster_status_t`.
+ */
+int32_t aster_http_upload_ready(aster_runtime_t runtime,
+                                aster_http_upload_t upload,
+                                uint64_t user_data,
+                                aster_operation_t *out_operation);
+
+/**
+ * Release the upload handle. An upload not yet finished is **aborted**
+ * (the handler sees a failed body, never a truncated one), and a write
+ * parked on another thread returns `FINISHED`. `NOT_FOUND` for an unknown
+ * handle. Returns `aster_status_t`.
+ */
+int32_t aster_http_upload_free(aster_runtime_t runtime, aster_http_upload_t upload);
+
+/**
+ * The response head, as a UCv1 `C5` message (`ExposeHttpResponse`: status,
+ * headers, body mode `Stream`) copied into `buf`; `*out_len` = its size.
+ * Waits up to `timeout_ms` for it; `timeout_ms` = 0 never blocks (any
+ * thread) and returns `TIMEOUT` while the head is not in. Sticky: every
+ * call after the head returns the same head. `BUFFER_TOO_SMALL`: `*out_len`
+ * is the size needed (`buf` may be NULL with `cap` 0 to ask); retry.
+ *
+ * Failures (sticky too): `UNKNOWN_SERVICE`, `DENIED`, `OVERLOADED`,
+ * `RESET`, `BAD_HEAD`, `CONNECTION_CLOSED`, `UPLOAD_FAILED`, `CANCELLED`
+ * (closed / freed before the head); `TIMEOUT` (not sticky: the exchange
+ * keeps running) and `BLOCKING_ON_RUNTIME` for `timeout_ms` > 0 on a
+ * runtime thread. Returns `aster_http_body_status_t`.
+ */
+int32_t aster_http_response_wait(aster_runtime_t runtime,
+                                 aster_http_response_t response,
+                                 uint32_t timeout_ms,
+                                 uint8_t *buf,
+                                 uintptr_t cap,
+                                 uintptr_t *out_len);
+
+/**
+ * Read up to `cap` bytes of the response body into `buf` (at most
+ * `min(cap, max_chunk)` per call), waiting up to `timeout_ms` -- for the
+ * head first if it is not in yet, then for data. `timeout_ms` = 0 never
+ * blocks (any thread): `TIMEOUT` when nothing is ready. On `OK`, `*out_len`
+ * bytes are in `buf`, or `*out_eof` = 1 at the clean end (`*out_len` 0;
+ * sticky). A timed-out read consumed nothing. Read to the end before
+ * freeing the response, or the exchange counts as abandoned (an unfinished
+ * upload is reset).
+ *
+ * Failures: the head's (see `aster_http_response_wait`) before the head;
+ * after it `READ` (the response failed mid-body: sticky, never a clean
+ * end) and `CANCELLED` (closed). `cap` must be > 0. Returns
+ * `aster_http_body_status_t`.
+ */
+int32_t aster_http_response_read(aster_runtime_t runtime,
+                                 aster_http_response_t response,
+                                 uint8_t *buf,
+                                 uintptr_t cap,
+                                 uint32_t timeout_ms,
+                                 uintptr_t *out_len,
+                                 uint32_t *out_eof);
+
+/**
+ * Arm a one-shot readiness notification: `ASTER_EVENT_HTTP_RELAY_READY`
+ * (`handle` = `response`). Armed before the head is in, it fires when the
+ * head (or the failure) is in -- `error_code` is then what
+ * `aster_http_response_wait` returns. Armed after the head, it fires when
+ * a read with `timeout_ms` = 0 would not return `TIMEOUT` -- `error_code`
+ * 0 for data or the end, else the read's failure. Closing or freeing the
+ * response resolves it. Returns `aster_status_t`.
+ */
+int32_t aster_http_response_ready(aster_runtime_t runtime,
+                                  aster_http_response_t response,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * Abandon the exchange, keeping the handle: before the head it is
+ * cancelled (the request is reset; `wait` returns `CANCELLED`); after it
+ * the body is closed (the handler's writes fail, an unfinished upload is
+ * reset unless the body already ended cleanly; reads return `CANCELLED`).
+ * Wakes calls blocked on the response in other threads. Idempotent;
+ * returns `aster_status_t`.
+ */
+int32_t aster_http_response_close(aster_runtime_t runtime, aster_http_response_t response);
+
+/**
+ * `aster_http_response_close`, then release the handle. Free the upload
+ * separately. `NOT_FOUND` for an unknown handle. Returns `aster_status_t`.
+ */
+int32_t aster_http_response_free(aster_runtime_t runtime, aster_http_response_t response);
 
 /**
  * The canonical grant AAD: the domain `aster/sealed-grant/v1` and each context field

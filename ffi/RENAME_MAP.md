@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.2)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.3)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -24,6 +24,49 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 4.3 (additive)
+
+ABI 4.3.0 (tranche F5, last part) adds the **streaming consumer relay**:
+relay HTTP to a peer's exposed service with a streamed request body and a
+streamed response, full duplex. Nothing in 4.2 changed shape; a 4.2 binding
+keeps working. Sources: `ffi/src/expose.rs` (core:
+`aster::binding_support::relay`). Tests: `ffi/tests/expose.rs` (`relay_stream_*`:
+round trip, stable failure codes, full-duplex lifetime contract, timeouts and
+runtime-thread rule, a readiness-driven poll loop, argument validation) and
+`ffi/tests/abi_contract_test.c` (`test_relay_stream`, a C-only round trip).
+Design: `docs/_internal/bindings/upcall-design.md` §6.4.
+
+| Function | Notes |
+|---|---|
+| `aster_http_relay_options_init(*out)` | `aster_http_relay_options_t` (24 bytes): `max_chunk` (0 = 1 MiB), `upload_capacity` (0 = 8). |
+| `aster_expose_relay_stream(rt, conn, c4, opts*, *upload, *response)` | `C4` with body mode `Stream`; returns `aster_http_upload_t` + `aster_http_response_t` at once, the exchange already running. `aster_status_t`. |
+| `aster_http_upload_write(rt, up, buf, len, timeout_ms)` / `_try_write(.., *queued)` / `_finish(rt, up)` / `_abort(rt, up, msg, len)` | `aster_http_body_status_t`, as the 4.2 body calls. A write takes at most `max_chunk`; a timed-out write queued nothing; `finish` / `abort` wake a parked write (`FINISHED`). |
+| `aster_http_response_wait(rt, resp, timeout_ms, buf, cap, *len)` | The head as UCv1 `C5` (body mode `Stream`), sticky. `BUFFER_TOO_SMALL` (17) sets `*len`. |
+| `aster_http_response_read(rt, resp, buf, cap, timeout_ms, *len, *eof)` | Waits for the head first if needed. `timeout_ms` 0 never blocks (any thread; `TIMEOUT` = nothing ready). |
+| `aster_http_upload_ready` / `aster_http_response_ready(rt, h, user_data, *op)` | One-shot `ASTER_EVENT_HTTP_RELAY_READY` (109): `error_code` = the next non-blocking call's result, `status` = its `aster_status_t`. |
+| `aster_http_response_close(rt, resp)` / `aster_http_upload_free` / `aster_http_response_free` | `close`/`free` the response before its end abandons the exchange (an unfinished upload is reset); freeing an unfinished upload aborts it. |
+| `aster_http_body_status_to_status(code)` | Body/relay code → `aster_status_t` (`DENIED` → `PERMISSION_DENIED`, `UNKNOWN_SERVICE` → `NOT_FOUND`, `RESET`/`READ` → `STREAM_RESET`, `CONNECTION_CLOSED`/`FINISHED` → `ALREADY_CLOSED`, `OVERLOADED` → `CONNECTION_REFUSED`, ...). |
+
+**New values:** `aster_http_body_status_t` 10 `UNKNOWN_SERVICE`, 11 `DENIED`,
+12 `OVERLOADED`, 13 `RESET`, 14 `BAD_HEAD`, 15 `CONNECTION_CLOSED`, 16
+`UPLOAD_FAILED`, 17 `BUFFER_TOO_SMALL` (relay calls only); `aster_status_t` 14
+`UNAUTHENTICATED`, 15 `PERMISSION_DENIED`, 16 `CREDENTIAL_EXPIRED` (reserved
+for the R4 auth model; only a denied relay reports `PERMISSION_DENIED` today);
+`aster_event_kind_t` 109 `ASTER_EVENT_HTTP_RELAY_READY`.
+
+**Semantic changes (changelog):** an `ASTER_EVENT_ERROR` of
+`aster_expose_relay_request` now has `status` from the mapping above and the
+relay code in `error_code` (was `INTERNAL` / `-1`). On the wire, a serving
+node now resets a refused http-relay stream with `0x41530004` (unknown
+service), `0x41530005` (denied) or `0x41530006` (stream cap) instead of
+dropping it silently. Shared core, so it reaches Python / TS too:
+`RelayResponse::wait` now reports a lost / closed connection as
+`aster::Error::Connection` (was `Transport`), so Python's streaming relay
+raises `ConnectionError` (was `IrohError`) for it; refusal messages now
+describe the refusal ("service 'x' is not exposed by the peer", "the peer
+denied access to service 'x'", "... is at its concurrent-stream limit")
+instead of a bare end-of-stream error.
 
 ## New in 4.2 (additive)
 

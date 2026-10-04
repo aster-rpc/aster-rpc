@@ -52,6 +52,25 @@ pub const RESET_CODE_PROTOCOL_VIOLATION: u32 = 0x41_53_00_02; // "AS" 00 02
 /// codes: changing it is a wire-visible change.
 pub const RESET_CODE_TUNNEL_UPSTREAM_ABORTED: u32 = 0x41_53_00_03; // "AS" 00 03
 
+/// QUIC application error code an http-relay stream is reset (and stopped)
+/// with when the peer has **no exposed service** of the requested id.
+///
+/// Before these refusal codes a refused stream was dropped silently, so the
+/// consumer read a bare end-of-stream and could not tell an unknown service
+/// from a denied or overloaded one. Same stability rule as the other codes.
+pub const RESET_CODE_RELAY_UNKNOWN_SERVICE: u32 = 0x41_53_00_04; // "AS" 00 04
+
+/// QUIC application error code an http-relay stream is reset (and stopped)
+/// with when the service's admission policy (`authorize`) **denied** the
+/// `(connection, service)` pair. Carries no reason: the policy's message
+/// stays on the serving side.
+pub const RESET_CODE_RELAY_DENIED: u32 = 0x41_53_00_05; // "AS" 00 05
+
+/// QUIC application error code an http-relay stream is reset (and stopped)
+/// with when the service is at its **per-service concurrent-stream cap**.
+/// Retryable once streams finish.
+pub const RESET_CODE_RELAY_OVERLOADED: u32 = 0x41_53_00_06; // "AS" 00 06
+
 /// Maximum frame body size: 16 MiB.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 

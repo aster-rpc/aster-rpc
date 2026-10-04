@@ -65,8 +65,8 @@ pub use aster_expose::control::{
     EdgeRouter, RoutePolicy, RouteProtocol, RouteRegistration, RouteSpec,
 };
 pub use aster_expose::relay::{
-    tower_handler, AuthenticatedPeer, AuthorizeFn, HttpHandler, LocalHttpTarget, ServiceAcceptor,
-    SocketAcceptor,
+    tower_handler, AuthenticatedPeer, AuthorizeFn, HttpHandler, LocalHttpTarget, RelayFailure,
+    RelayFailureKind, ServiceAcceptor, SocketAcceptor,
 };
 /// Boxed future alias used in [`AuthorizeFn`] / [`HttpHandler`] signatures.
 pub use aster_transport_core::stream_io::BoxFut;

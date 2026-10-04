@@ -335,6 +335,8 @@ pub(crate) struct Done {
     related: u64,
     flags: u32,
     data: Option<Vec<u8>>,
+    /// `error_code` of the event; `None`: derived from `status`.
+    code: Option<i32>,
 }
 
 impl Done {
@@ -346,6 +348,7 @@ impl Done {
             related: 0,
             flags: 0,
             data: None,
+            code: None,
         }
     }
     pub(crate) fn related(mut self, related: u64) -> Self {
@@ -364,6 +367,29 @@ impl Done {
         self.status = status;
         self
     }
+    /// Set the event's `error_code` explicitly.
+    pub(crate) fn code(mut self, code: i32) -> Self {
+        self.code = Some(code);
+        self
+    }
+}
+
+/// A failed operation with a specific status: `ASTER_EVENT_ERROR` with
+/// `status`, `error_code` and the message as payload.
+pub(crate) struct OpError {
+    pub(crate) status: aster_status_t,
+    pub(crate) code: i32,
+    pub(crate) message: String,
+}
+
+impl From<String> for OpError {
+    fn from(message: String) -> Self {
+        OpError {
+            status: aster_status_t::ASTER_STATUS_INTERNAL,
+            code: -1,
+            message,
+        }
+    }
 }
 
 /// Register an operation, write its id to `*out_operation`, and run `fut` on
@@ -378,6 +404,21 @@ pub(crate) unsafe fn spawn_op<F>(
 where
     F: Future<Output = Result<Done, String>> + Send + 'static,
 {
+    spawn_op_coded(bridge, user_data, out_operation, async move {
+        fut.await.map_err(OpError::from)
+    })
+}
+
+/// [`spawn_op`] whose failures carry their own status ([`OpError`]).
+pub(crate) unsafe fn spawn_op_coded<F>(
+    bridge: &Arc<BridgeRuntime>,
+    user_data: u64,
+    out_operation: *mut aster_operation_t,
+    fut: F,
+) -> i32
+where
+    F: Future<Output = Result<Done, OpError>> + Send + 'static,
+{
     let (op_id, cancelled) = bridge.new_operation();
     *out_operation = op_id;
     let b = bridge.clone();
@@ -387,11 +428,13 @@ where
         }
         match fut.await {
             Ok(d) => {
-                let code = if d.status == aster_status_t::ASTER_STATUS_OK {
-                    0
-                } else {
-                    d.status as i32
-                };
+                let code = d
+                    .code
+                    .unwrap_or(if d.status == aster_status_t::ASTER_STATUS_OK {
+                        0
+                    } else {
+                        d.status as i32
+                    });
                 let mut ev = EventInternal::new(
                     d.kind, d.status, op_id, d.handle, d.related, user_data, code,
                 );
@@ -404,7 +447,7 @@ where
                     }),
                 }
             }
-            Err(msg) => b.emit_error(op_id, user_data, &msg),
+            Err(e) => b.emit_error_coded(op_id, user_data, e.status, e.code, &e.message),
         }
     });
     OK

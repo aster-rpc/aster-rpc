@@ -18,8 +18,8 @@ use crate::data::{
 };
 use crate::envelope::{aster_call_header_t, aster_rpc_status_t, aster_stream_header_t};
 use crate::expose::{
-    aster_http_body_status_t, aster_http_foreign_options_t, aster_route_protocol_t,
-    aster_route_spec_t,
+    aster_http_body_status_t, aster_http_foreign_options_t, aster_http_relay_options_t,
+    aster_route_protocol_t, aster_route_spec_t,
 };
 use crate::grants::{
     aster_grant_context_t, aster_grant_outcome_kind_t, aster_grant_outcome_t, aster_grant_record_t,
@@ -400,5 +400,14 @@ mod lp64 {
         service_id = 16,
         port = 32,
         protocol = 36,
+    });
+
+    // ABI 4.3: streaming consumer relay (expose.rs).
+    assert_layout!(aster_http_relay_options_t, size = 24, align = 8, {
+        struct_size = 0,
+        flags = 4,
+        max_chunk = 8,
+        upload_capacity = 16,
+        reserved = 20,
     });
 }

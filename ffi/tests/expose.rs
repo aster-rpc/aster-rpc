@@ -1982,3 +1982,979 @@ fn body_calls_validate_and_refuse_runtime_threads() {
         assert_eq!(c.finish(99, None), B_UNKNOWN_STREAM);
     });
 }
+
+// ============================================================================
+// Streaming consumer relay (ABI 4.3)
+// ============================================================================
+
+const B_UNKNOWN_SERVICE: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_UNKNOWN_SERVICE as i32;
+const B_DENIED: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_DENIED as i32;
+const B_CONNECTION_CLOSED: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_CONNECTION_CLOSED as i32;
+const B_UPLOAD_FAILED: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_UPLOAD_FAILED as i32;
+const B_BUFFER_TOO_SMALL: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_BUFFER_TOO_SMALL as i32;
+const B_INVALID: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_INVALID_ARGUMENT as i32;
+const B_READ: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_READ as i32;
+const B_RESET: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_RESET as i32;
+const B_UNKNOWN_HANDLE: i32 = aster_http_body_status_t::ASTER_HTTP_BODY_UNKNOWN_HANDLE as i32;
+const K_READY: u32 = aster_event_kind_t::ASTER_EVENT_HTTP_RELAY_READY as u32;
+
+/// What the relay handler saw, plus the `/gate` latch.
+#[derive(Default)]
+struct RelayLog {
+    lines: Mutex<Vec<String>>,
+    gate: AtomicBool,
+}
+
+impl RelayLog {
+    fn push(&self, line: String) {
+        self.lines.lock().unwrap().push(line);
+    }
+    fn has(&self, pred: impl Fn(&str) -> bool) -> bool {
+        self.lines.lock().unwrap().iter().any(|l| pred(l))
+    }
+}
+
+/// `/echo`: read the whole body, stream it back. `/early`: 413 without
+/// reading. `/duplex`: echo each chunk as it arrives. `/gate`: read nothing
+/// until the gate opens, then answer the body's length. `/forever`: write
+/// until a write fails.
+fn relay_handler(log: Arc<RelayLog>) -> impl Fn(Ctx, u64, Req) + Send + Sync + 'static {
+    move |ctx, id, req| {
+        let sid = req.stream_id;
+        log.push(format!("start {}", req.uri));
+        match req.uri.as_str() {
+            "/echo" => match ctx.read_all(sid, 64 * 1024) {
+                Ok(body) => {
+                    ctx.respond_http(id, 200, &[("x-len", &body.len().to_string())], None);
+                    for piece in body.chunks(7000) {
+                        if ctx.write(sid, piece, 20_000) != B_OK {
+                            return;
+                        }
+                    }
+                    ctx.finish(sid, None);
+                }
+                Err(rc) => log.push(format!("read err {rc}")),
+            },
+            "/early" => ctx.respond_http(id, 413, &[], Some(b"too big")),
+            "/duplex" => {
+                ctx.respond_http(id, 200, &[], None);
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match ctx.read(sid, &mut buf, 20_000) {
+                        Ok(Some(n)) => {
+                            if ctx.write(sid, &buf[..n], 20_000) != B_OK {
+                                log.push("duplex write failed".into());
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            ctx.finish(sid, None);
+                            log.push("duplex done".into());
+                            return;
+                        }
+                        Err(rc) => {
+                            log.push(format!("read err {rc}"));
+                            ctx.abort(sid, "request failed");
+                            return;
+                        }
+                    }
+                }
+            }
+            "/gate" => {
+                while !log.gate.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                match ctx.read_all(sid, 1 << 20) {
+                    Ok(body) => {
+                        ctx.respond_http(id, 200, &[("x-len", &body.len().to_string())], Some(b""))
+                    }
+                    Err(rc) => log.push(format!("read err {rc}")),
+                }
+            }
+            "/forever" => {
+                ctx.respond_http(id, 200, &[], None);
+                loop {
+                    let rc = ctx.write(sid, &[1u8; 16 * 1024], 20_000);
+                    if rc != B_OK && rc != B_TIMEOUT {
+                        log.push(format!("write {rc}"));
+                        return;
+                    }
+                }
+            }
+            _ => ctx.respond_http(id, 404, &[], Some(b"")),
+        }
+    }
+}
+
+fn relay_rig() -> (Rig, Arc<RelayLog>) {
+    let log = Arc::new(RelayLog::default());
+    (Rig::http(None, relay_handler(log.clone())), log)
+}
+
+/// A streamed `C4` (body mode `Stream`).
+fn stream_req(service: &str, method: &str, uri: &str) -> Vec<u8> {
+    enc_c4(&Req {
+        service_id: service.into(),
+        peer_id: None,
+        stream_id: 0,
+        version: 2,
+        method: method.into(),
+        uri: uri.into(),
+        headers: hdrs(&[("x-test", "1")]),
+        body: None,
+    })
+}
+
+fn relay_opts(max_chunk: u64, capacity: u32) -> aster_http_relay_options_t {
+    let mut o: aster_http_relay_options_t = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { aster_http_relay_options_init(&mut o) }, OK);
+    o.max_chunk = max_chunk;
+    o.upload_capacity = capacity;
+    o
+}
+
+/// One streaming exchange's two handles (plain integers: `Copy`, so a
+/// writer thread and a reader thread can share them).
+#[derive(Clone, Copy)]
+struct Relay {
+    rt: aster_runtime_t,
+    up: aster_http_upload_t,
+    resp: aster_http_response_t,
+}
+
+impl Rig {
+    fn stream(&self, c4: &[u8], opts: Option<aster_http_relay_options_t>) -> Relay {
+        let (mut up, mut resp) = (0, 0);
+        let rc = unsafe {
+            aster_expose_relay_stream(
+                self.rt,
+                self.conn,
+                bytes(c4),
+                opts.as_ref().map_or(ptr::null(), |o| o as *const _),
+                &mut up,
+                &mut resp,
+            )
+        };
+        assert_eq!(rc, OK, "{}", last_error());
+        assert!(up != 0 && resp != 0);
+        Relay {
+            rt: self.rt,
+            up,
+            resp,
+        }
+    }
+}
+
+fn last_error() -> String {
+    let mut buf = [0u8; 512];
+    let n = unsafe { aster_last_error_message(buf.as_mut_ptr(), buf.len()) };
+    String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
+}
+
+impl Relay {
+    fn write(&self, data: &[u8], timeout_ms: u32) -> i32 {
+        unsafe { aster_http_upload_write(self.rt, self.up, data.as_ptr(), data.len(), timeout_ms) }
+    }
+    fn try_write(&self, data: &[u8]) -> (i32, u32) {
+        let mut q = 7;
+        let rc = unsafe {
+            aster_http_upload_try_write(self.rt, self.up, data.as_ptr(), data.len(), &mut q)
+        };
+        (rc, q)
+    }
+    fn finish(&self) -> i32 {
+        unsafe { aster_http_upload_finish(self.rt, self.up) }
+    }
+    fn abort(&self) -> i32 {
+        let m = b"client gave up";
+        unsafe { aster_http_upload_abort(self.rt, self.up, m.as_ptr(), m.len()) }
+    }
+    /// The head with the `BUFFER_TOO_SMALL` retry: ask for the size first.
+    fn wait(&self, timeout_ms: u32) -> Result<Resp, i32> {
+        let mut need = 0usize;
+        let rc = unsafe {
+            aster_http_response_wait(
+                self.rt,
+                self.resp,
+                timeout_ms,
+                ptr::null_mut(),
+                0,
+                &mut need,
+            )
+        };
+        if rc != B_BUFFER_TOO_SMALL {
+            assert_ne!(rc, B_OK, "a head never fits an empty buffer");
+            return Err(rc);
+        }
+        let mut buf = vec![0u8; need];
+        let mut n = 0usize;
+        let rc = unsafe {
+            aster_http_response_wait(self.rt, self.resp, 0, buf.as_mut_ptr(), buf.len(), &mut n)
+        };
+        assert_eq!((rc, n), (B_OK, need));
+        Ok(dec_c5(&buf))
+    }
+    /// One read: `Ok(Some(bytes))`, `Ok(None)` = end.
+    fn read(&self, cap: usize, timeout_ms: u32) -> Result<Option<Vec<u8>>, i32> {
+        let mut buf = vec![0u8; cap];
+        let (mut n, mut eof) = (0usize, 0u32);
+        let rc = unsafe {
+            aster_http_response_read(
+                self.rt,
+                self.resp,
+                buf.as_mut_ptr(),
+                cap,
+                timeout_ms,
+                &mut n,
+                &mut eof,
+            )
+        };
+        match (rc, eof) {
+            (B_OK, 1) => {
+                assert_eq!(n, 0);
+                Ok(None)
+            }
+            (B_OK, _) => {
+                assert!(n > 0 && n <= cap);
+                buf.truncate(n);
+                Ok(Some(buf))
+            }
+            (rc, _) => Err(rc),
+        }
+    }
+    fn read_all(&self, cap: usize) -> Result<Vec<u8>, i32> {
+        let mut out = Vec::new();
+        while let Some(c) = self.read(cap, 20_000)? {
+            out.extend_from_slice(&c);
+        }
+        Ok(out)
+    }
+    fn upload_ready(&self) -> aster_operation_t {
+        let mut op = 0;
+        assert_eq!(
+            unsafe { aster_http_upload_ready(self.rt, self.up, 11, &mut op) },
+            OK
+        );
+        op
+    }
+    fn response_ready(&self) -> aster_operation_t {
+        let mut op = 0;
+        assert_eq!(
+            unsafe { aster_http_response_ready(self.rt, self.resp, 12, &mut op) },
+            OK
+        );
+        op
+    }
+    fn close(&self) -> i32 {
+        unsafe { aster_http_response_close(self.rt, self.resp) }
+    }
+    fn free(&self) {
+        unsafe {
+            assert_eq!(aster_http_upload_free(self.rt, self.up), OK);
+            assert_eq!(aster_http_response_free(self.rt, self.resp), OK);
+            assert_eq!(aster_http_upload_free(self.rt, self.up), NOT_FOUND);
+            assert_eq!(aster_http_response_free(self.rt, self.resp), NOT_FOUND);
+        }
+    }
+}
+
+/// A readiness event: `(handle, status, error_code)`.
+unsafe fn ready_event(rt: aster_runtime_t, op: aster_operation_t) -> (u64, u32, i32) {
+    let ev = finish(rt, op).ev;
+    assert_eq!(ev.kind, K_READY, "kind {} status {}", ev.kind, ev.status);
+    (ev.handle, ev.status, ev.error_code)
+}
+
+/// The completion events of several operations, in `ops` order, however
+/// they interleave (`common::wait_for_operation` drops events for other
+/// operations).
+unsafe fn wait_for_ops(rt: aster_runtime_t, ops: &[aster_operation_t]) -> Vec<aster_event_t> {
+    let mut found: Vec<Option<aster_event_t>> = vec![None; ops.len()];
+    let end = Instant::now() + WAIT;
+    while found.iter().any(Option::is_none) {
+        assert!(Instant::now() < end, "operations {ops:?} did not complete");
+        let mut events: [aster_event_t; 8] = std::mem::zeroed();
+        let n = aster_poll_events(rt, events.as_mut_ptr(), events.len(), 100);
+        for ev in events.iter().take(n) {
+            if ev.buffer != 0 {
+                aster_buffer_release(rt, ev.buffer);
+            }
+            if let Some(i) = ops.iter().position(|op| *op == ev.operation) {
+                found[i] = Some(*ev);
+            }
+        }
+    }
+    found.into_iter().map(Option::unwrap).collect()
+}
+
+fn header<'a>(r: &'a Resp, name: &str) -> Option<&'a [u8]> {
+    r.headers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_slice())
+}
+
+#[test]
+fn relay_stream_round_trip() {
+    let (rig, _log) = relay_rig();
+    let relay = rig.stream(
+        &stream_req(SVC, "POST", "/echo"),
+        Some(relay_opts(64 * 1024, 2)),
+    );
+    let data = pattern(3 * 1024 * 1024 + 17);
+    // A writer thread pushes the body in max_chunk pieces under
+    // backpressure; this thread reads the response.
+    let writer = {
+        let data = data.clone();
+        std::thread::spawn(move || {
+            assert_eq!(relay.write(&[0u8; 64 * 1024 + 1], 1000), B_CHUNK_TOO_LARGE);
+            for piece in data.chunks(64 * 1024) {
+                assert_eq!(relay.write(piece, 20_000), B_OK);
+            }
+            assert_eq!(relay.finish(), B_OK);
+            assert_eq!(relay.finish(), B_FINISHED);
+            assert_eq!(relay.write(b"x", 1000), B_FINISHED);
+        })
+    };
+    let head = relay.wait(20_000).unwrap();
+    assert_eq!(head.status, 200);
+    assert_eq!(head.body, None, "body mode Stream");
+    let len = data.len().to_string();
+    assert_eq!(header(&head, "x-len"), Some(len.as_bytes()));
+    // Sticky: the head again, without waiting.
+    assert_eq!(relay.wait(0).unwrap(), head);
+    // A non-empty but short buffer: BUFFER_TOO_SMALL with the size needed,
+    // nothing written.
+    let mut need = 0usize;
+    assert_eq!(
+        unsafe { aster_http_response_wait(rig.rt, relay.resp, 0, ptr::null_mut(), 0, &mut need) },
+        B_BUFFER_TOO_SMALL
+    );
+    let mut short = vec![0xAAu8; need - 1];
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe {
+            aster_http_response_wait(
+                rig.rt,
+                relay.resp,
+                0,
+                short.as_mut_ptr(),
+                short.len(),
+                &mut n,
+            )
+        },
+        B_BUFFER_TOO_SMALL
+    );
+    assert_eq!(n, need);
+    assert!(short.iter().all(|b| *b == 0xAA));
+    assert_eq!(relay.read_all(10_000).unwrap(), data);
+    assert_eq!(relay.read(10, 1000), Ok(None), "the end is sticky");
+    assert_eq!(relay.read(10, 0), Ok(None));
+    writer.join().unwrap();
+    relay.free();
+    rig.wait_for("exchange to close", |r| r.ctx().open_count() == 0);
+
+    // An empty upload.
+    let relay = rig.stream(&stream_req(SVC, "POST", "/echo"), None);
+    assert_eq!(relay.finish(), B_OK);
+    assert_eq!(relay.wait(20_000).unwrap().status, 200);
+    assert_eq!(relay.read(100, 20_000), Ok(None));
+    relay.free();
+}
+
+#[test]
+fn relay_stream_failures_have_stable_codes() {
+    let (rig, log) = relay_rig();
+    let to_status = |code: i32| aster_http_body_status_to_status(code);
+
+    // Unknown service.
+    let relay = rig.stream(&stream_req("nope", "PUT", "/"), None);
+    let _ = relay.write(b"x", 1000);
+    let _ = relay.finish();
+    assert_eq!(relay.wait(20_000), Err(B_UNKNOWN_SERVICE));
+    assert!(last_error().contains("not exposed"), "{}", last_error());
+    assert_eq!(relay.wait(0), Err(B_UNKNOWN_SERVICE), "sticky");
+    assert_eq!(relay.read(10, 0), Err(B_UNKNOWN_SERVICE));
+    assert_eq!(
+        to_status(B_UNKNOWN_SERVICE),
+        aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+    );
+    relay.free();
+
+    // Denied: the code, its reserved status, and the readiness event.
+    rig.set_allow(false);
+    let relay = rig.stream(&stream_req(SVC, "PUT", "/echo"), None);
+    let op = relay.response_ready();
+    let _ = relay.finish();
+    let (handle, status, code) = unsafe { ready_event(rig.rt, op) };
+    assert_eq!(handle, relay.resp);
+    assert_eq!(code, B_DENIED);
+    assert_eq!(
+        status,
+        aster_status_t::ASTER_STATUS_PERMISSION_DENIED as u32
+    );
+    assert_eq!(relay.wait(20_000), Err(B_DENIED));
+    relay.free();
+    // The buffered relay reports a denial the same way.
+    let ev = rig.relay(&enc_c4(&request("GET", "/", &[], Some(b""))));
+    assert!(ev.is_error());
+    assert_eq!(
+        (ev.ev.status, ev.ev.error_code),
+        (
+            aster_status_t::ASTER_STATUS_PERMISSION_DENIED as u32,
+            B_DENIED
+        )
+    );
+    rig.set_allow(true);
+
+    // An upload aborted before the head.
+    let relay = rig.stream(&stream_req(SVC, "PUT", "/echo"), None);
+    assert_eq!(relay.write(&[5u8; 50_000], 20_000), B_OK);
+    rig.wait_for("handler started", |_| log.has(|l| l == "start /echo"));
+    assert_eq!(relay.abort(), B_OK);
+    assert_eq!(relay.abort(), B_FINISHED);
+    assert_eq!(relay.wait(20_000), Err(B_UPLOAD_FAILED));
+    rig.wait_for("handler saw a failed body", |_| {
+        log.has(|l| l.starts_with("read err"))
+    });
+    relay.free();
+
+    // Closed before the head: cancelled, and the close wakes a waiter.
+    let relay = rig.stream(&stream_req(SVC, "PUT", "/gate"), None);
+    let waiter = std::thread::spawn(move || relay.wait(20_000));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(relay.close(), OK);
+    assert_eq!(relay.close(), OK, "idempotent");
+    assert_eq!(waiter.join().unwrap(), Err(B_CANCELLED));
+    assert_eq!(relay.wait(0), Err(B_CANCELLED));
+    relay.free();
+
+    // The connection goes away while the head is awaited (closing it also
+    // frees its handle, so no new relay can start on it).
+    let relay = rig.stream(&stream_req(SVC, "PUT", "/gate"), None);
+    let waiter = std::thread::spawn(move || relay.wait(20_000));
+    std::thread::sleep(Duration::from_millis(100));
+    unsafe {
+        assert_eq!(
+            aster_connection_close(rig.rt, rig.conn, 0, bytes(b"bye")),
+            OK
+        );
+    }
+    assert_eq!(waiter.join().unwrap(), Err(B_CONNECTION_CLOSED));
+    assert_eq!(
+        to_status(B_CONNECTION_CLOSED),
+        aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32
+    );
+    relay.free();
+    log.gate.store(true, Ordering::Release);
+}
+
+#[test]
+fn relay_stream_keeps_the_full_duplex_contract() {
+    let (rig, log) = relay_rig();
+
+    // An early 413 while the upload is still going; the upload then fails
+    // CANCELLED once the handler side is gone.
+    let relay = rig.stream(&stream_req(SVC, "PUT", "/early"), None);
+    let writer = std::thread::spawn(move || loop {
+        let rc = relay.write(&[9u8; 64 * 1024], 20_000);
+        if rc != B_OK {
+            return rc;
+        }
+    });
+    let head = relay.wait(20_000).unwrap();
+    assert_eq!(head.status, 413);
+    assert_eq!(relay.read_all(1 << 20).unwrap(), b"too big");
+    assert_eq!(unsafe { aster_http_response_free(rig.rt, relay.resp) }, OK);
+    assert_eq!(writer.join().unwrap(), B_CANCELLED);
+    assert_eq!(unsafe { aster_http_upload_free(rig.rt, relay.up) }, OK);
+
+    // Freeing the response before its end resets the unfinished upload.
+    log.lines.lock().unwrap().clear();
+    let relay = rig.stream(&stream_req(SVC, "POST", "/duplex"), None);
+    relay.wait(20_000).unwrap();
+    assert_eq!(relay.write(b"one", 20_000), B_OK);
+    assert_eq!(relay.read(1 << 20, 20_000), Ok(Some(b"one".to_vec())));
+    assert_eq!(unsafe { aster_http_response_free(rig.rt, relay.resp) }, OK);
+    let mut rc = B_OK;
+    for _ in 0..500 {
+        rc = relay.write(b"more", 20_000);
+        if rc != B_OK {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(rc, B_CANCELLED);
+    rig.wait_for("handler saw the reset", |_| {
+        log.has(|l| l.starts_with("read err") || l == "duplex write failed")
+    });
+    assert!(!log.has(|l| l == "duplex done"));
+    assert_eq!(unsafe { aster_http_upload_free(rig.rt, relay.up) }, OK);
+
+    // Freeing the upload unfinished aborts it: the handler sees a failed body
+    // (a write parked at the time: `relay_stream_wakes_a_parked_write`).
+    log.lines.lock().unwrap().clear();
+    let relay = rig.stream(&stream_req(SVC, "POST", "/duplex"), None);
+    relay.wait(20_000).unwrap();
+    assert_eq!(relay.write(b"two", 20_000), B_OK);
+    assert_eq!(relay.read(1 << 20, 20_000), Ok(Some(b"two".to_vec())));
+    assert_eq!(unsafe { aster_http_upload_free(rig.rt, relay.up) }, OK);
+    rig.wait_for("handler saw the abort", |_| {
+        log.has(|l| l.starts_with("read err"))
+    });
+    // The handler aborts its response in turn: a failed read, never a
+    // clean end.
+    let rc = loop {
+        match relay.read(1 << 20, 20_000) {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("an aborted exchange ended cleanly"),
+            Err(rc) => break rc,
+        }
+    };
+    assert_eq!(rc, B_READ);
+    assert_eq!(unsafe { aster_http_response_free(rig.rt, relay.resp) }, OK);
+
+    // A body read to its clean end, then freed, leaves the upload to finish.
+    log.lines.lock().unwrap().clear();
+    let relay = rig.stream(&stream_req(SVC, "POST", "/duplex"), None);
+    relay.wait(20_000).unwrap();
+    assert_eq!(relay.write(b"three", 20_000), B_OK);
+    assert_eq!(relay.finish(), B_OK);
+    assert_eq!(relay.read_all(1 << 20).unwrap(), b"three");
+    relay.free();
+    rig.wait_for("handler done", |_| log.has(|l| l == "duplex done"));
+    rig.wait_for("exchanges closed", |r| r.ctx().open_count() == 0);
+}
+
+#[test]
+fn relay_stream_timeouts_and_thread_rules() {
+    let (rig, log) = relay_rig();
+    let relay = rig.stream(
+        &stream_req(SVC, "PUT", "/gate"),
+        Some(relay_opts(64 * 1024, 1)),
+    );
+    // Nothing is in yet: a zero timeout never waits; a timed-out wait
+    // leaves the exchange running.
+    assert_eq!(relay.wait(0), Err(B_TIMEOUT));
+    assert_eq!(relay.read(10, 0), Err(B_TIMEOUT));
+    assert_eq!(relay.wait(50), Err(B_TIMEOUT));
+
+    // Blocking calls on a runtime thread are refused; zero-timeout and
+    // non-blocking calls work there.
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    tokio_rt.block_on(async {
+        assert_eq!(relay.wait(10), Err(B_BLOCKING_ON_RUNTIME));
+        assert_eq!(relay.read(10, 10), Err(B_BLOCKING_ON_RUNTIME));
+        assert_eq!(relay.write(b"x", 10), B_BLOCKING_ON_RUNTIME);
+        assert_eq!(relay.wait(0), Err(B_TIMEOUT));
+        assert_eq!(relay.read(10, 0), Err(B_TIMEOUT));
+        assert_eq!(relay.try_write(b"").0, B_OK);
+    });
+
+    // Fill every buffer while the handler reads nothing: writes time out,
+    // and a timed-out write queued nothing.
+    let (mut written, mut timeouts) = (0usize, 0);
+    while timeouts < 3 {
+        match relay.write(&[1u8; 64 * 1024], 100) {
+            B_OK => written += 64 * 1024,
+            B_TIMEOUT => timeouts += 1,
+            rc => panic!("write failed: {rc}"),
+        }
+    }
+    assert!(written > 0);
+    assert_eq!(
+        relay.try_write(&[1u8; 10]),
+        (B_OK, 0),
+        "full: nothing queued"
+    );
+    log.gate.store(true, Ordering::Release);
+    assert_eq!(relay.write(b"tail", 20_000), B_OK);
+    assert_eq!(relay.finish(), B_OK);
+    let head = relay.wait(20_000).unwrap();
+    let len = (written + 4).to_string();
+    assert_eq!(header(&head, "x-len"), Some(len.as_bytes()));
+    relay.free();
+
+    // A timed-out read consumed nothing.
+    let relay = rig.stream(&stream_req(SVC, "POST", "/duplex"), None);
+    relay.wait(20_000).unwrap();
+    assert_eq!(relay.read(100, 50), Err(B_TIMEOUT));
+    assert_eq!(relay.write(b"abcdef", 20_000), B_OK);
+    let mut got = Vec::new();
+    while got.len() < 6 {
+        got.extend_from_slice(&relay.read(4, 20_000).unwrap().unwrap());
+    }
+    assert_eq!(got, b"abcdef");
+    assert_eq!(relay.finish(), B_OK);
+    assert_eq!(relay.read(4, 20_000), Ok(None));
+    relay.free();
+}
+
+/// A poll loop: non-blocking calls only, woken by readiness events on the
+/// completion queue.
+#[test]
+fn relay_stream_poll_loop_with_readiness_events() {
+    let (rig, log) = relay_rig();
+    let relay = rig.stream(
+        &stream_req(SVC, "POST", "/echo"),
+        Some(relay_opts(16 * 1024, 1)),
+    );
+    let data = pattern(400_000);
+
+    // Upload with try_write; when full, arm upload readiness.
+    let mut off = 0;
+    let mut waits = 0;
+    while off < data.len() {
+        let end = (off + 16 * 1024).min(data.len());
+        match relay.try_write(&data[off..end]) {
+            (B_OK, 1) => off = end,
+            (B_OK, 0) => {
+                waits += 1;
+                let (handle, status, code) = unsafe { ready_event(rig.rt, relay.upload_ready()) };
+                assert_eq!((handle, status, code), (relay.up, 0, 0));
+            }
+            other => panic!("try_write: {other:?}"),
+        }
+    }
+    assert_eq!(relay.finish(), B_OK);
+    let (_, status, code) = unsafe { ready_event(rig.rt, relay.upload_ready()) };
+    assert_eq!(code, B_FINISHED);
+    assert_eq!(status, aster_status_t::ASTER_STATUS_ALREADY_CLOSED as u32);
+    let _ = waits;
+
+    // The head, then the body, each on a readiness event.
+    let (handle, status, code) = unsafe { ready_event(rig.rt, relay.response_ready()) };
+    assert_eq!((handle, status, code), (relay.resp, 0, 0));
+    assert_eq!(relay.wait(0).unwrap().status, 200);
+    let mut got = Vec::new();
+    loop {
+        match relay.read(5000, 0) {
+            Ok(Some(c)) => got.extend_from_slice(&c),
+            Ok(None) => break,
+            Err(B_TIMEOUT) => {
+                let (_, status, code) = unsafe { ready_event(rig.rt, relay.response_ready()) };
+                assert_eq!((status, code), (0, 0));
+            }
+            Err(rc) => panic!("read: {rc}"),
+        }
+    }
+    assert_eq!(got, data);
+
+    relay.free();
+
+    // Armed readiness ops resolve when their handles are freed: the
+    // response before its head (CANCELLED), the upload while full
+    // (FINISHED: freeing aborted it).
+    let relay = rig.stream(
+        &stream_req(SVC, "PUT", "/gate"),
+        Some(relay_opts(16 * 1024, 1)),
+    );
+    let response_op = relay.response_ready();
+    while relay.try_write(&[3u8; 16 * 1024]) == (B_OK, 1) {}
+    let upload_op = relay.upload_ready();
+    std::thread::sleep(Duration::from_millis(50));
+    relay.free();
+    // Both complete, in either order.
+    let evs = unsafe { wait_for_ops(rig.rt, &[response_op, upload_op]) };
+    assert_eq!(evs[0].kind, K_READY);
+    assert_eq!(
+        (evs[0].status, evs[0].error_code),
+        (aster_status_t::ASTER_STATUS_CANCELLED as u32, B_CANCELLED)
+    );
+    // Room may have opened up before the free; never a hang.
+    assert_eq!(evs[1].kind, K_READY);
+    let code = evs[1].error_code;
+    assert!(code == B_OK || code == B_FINISHED, "{code}");
+    log.gate.store(true, Ordering::Release);
+}
+
+#[test]
+fn relay_stream_validates_its_arguments() {
+    let rig = Rig::bare(true);
+    let good = stream_req(SVC, "GET", "/");
+    let (mut up, mut resp) = (5u64, 5u64);
+    unsafe {
+        let mut o: aster_http_relay_options_t = std::mem::zeroed();
+        assert_eq!(aster_http_relay_options_init(&mut o), OK);
+        assert_eq!(o.struct_size as usize, std::mem::size_of_val(&o));
+        assert_eq!(
+            (o.flags, o.max_chunk, o.upload_capacity, o.reserved),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(aster_http_relay_options_init(ptr::null_mut()), INVALID);
+
+        let start =
+            |c4: &[u8], o: *const aster_http_relay_options_t, up: *mut u64, resp: *mut u64| {
+                aster_expose_relay_stream(rig.rt, rig.conn, bytes(c4), o, up, resp)
+            };
+        assert_eq!(
+            start(&good, ptr::null(), ptr::null_mut(), &mut resp),
+            INVALID
+        );
+        assert_eq!(start(&good, ptr::null(), &mut up, ptr::null_mut()), INVALID);
+        assert_eq!(
+            aster_expose_relay_stream(
+                rig.rt,
+                424_242,
+                bytes(&good),
+                ptr::null(),
+                &mut up,
+                &mut resp
+            ),
+            NOT_FOUND
+        );
+        assert_eq!((up, resp), (0, 0), "outputs zeroed on failure");
+        assert_eq!(
+            start(b"\xC4\x01garbage", ptr::null(), &mut up, &mut resp),
+            INVALID
+        );
+        let inline = enc_c4(&request("GET", "/", &[], Some(b"x")));
+        assert_eq!(start(&inline, ptr::null(), &mut up, &mut resp), INVALID);
+        assert_eq!(
+            start(&stream_req("", "GET", "/"), ptr::null(), &mut up, &mut resp),
+            INVALID
+        );
+        assert_eq!(
+            start(
+                &stream_req(SVC, "BAD METHOD", "/"),
+                ptr::null(),
+                &mut up,
+                &mut resp
+            ),
+            INVALID
+        );
+        let mut bad = o;
+        bad.struct_size = 8;
+        assert_eq!(start(&good, &bad, &mut up, &mut resp), INVALID);
+        let mut bad = o;
+        bad.flags = 1;
+        assert_eq!(start(&good, &bad, &mut up, &mut resp), INVALID);
+
+        // Unknown handles: body calls say UNKNOWN_HANDLE, lifecycle calls
+        // NOT_FOUND.
+        let (mut n, mut eof, mut q) = (0usize, 0u32, 0u32);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            aster_http_upload_write(rig.rt, 99, b"x".as_ptr(), 1, 0),
+            B_UNKNOWN_HANDLE
+        );
+        assert_eq!(
+            aster_http_upload_write(424_242, 99, b"x".as_ptr(), 1, 0),
+            B_UNKNOWN_HANDLE
+        );
+        assert_eq!(
+            aster_http_upload_try_write(rig.rt, 99, b"x".as_ptr(), 1, &mut q),
+            B_UNKNOWN_HANDLE
+        );
+        assert_eq!(aster_http_upload_finish(rig.rt, 99), B_UNKNOWN_HANDLE);
+        assert_eq!(
+            aster_http_upload_abort(rig.rt, 99, ptr::null(), 0),
+            B_UNKNOWN_HANDLE
+        );
+        assert_eq!(
+            aster_http_response_wait(rig.rt, 99, 0, buf.as_mut_ptr(), 8, &mut n),
+            B_UNKNOWN_HANDLE
+        );
+        assert_eq!(
+            aster_http_response_read(rig.rt, 99, buf.as_mut_ptr(), 8, 0, &mut n, &mut eof),
+            B_UNKNOWN_HANDLE
+        );
+        let mut op = 0;
+        assert_eq!(aster_http_upload_ready(rig.rt, 99, 0, &mut op), NOT_FOUND);
+        assert_eq!(aster_http_response_ready(rig.rt, 99, 0, &mut op), NOT_FOUND);
+        assert_eq!(aster_http_response_close(rig.rt, 99), NOT_FOUND);
+        assert_eq!(aster_http_upload_free(rig.rt, 99), NOT_FOUND);
+        assert_eq!(aster_http_response_free(rig.rt, 99), NOT_FOUND);
+
+        // Pointer checks on live handles.
+        assert_eq!(start(&good, ptr::null(), &mut up, &mut resp), OK);
+        assert_eq!(
+            aster_http_upload_write(rig.rt, up, ptr::null(), 3, 0),
+            B_INVALID
+        );
+        assert_eq!(
+            aster_http_upload_try_write(rig.rt, up, b"x".as_ptr(), 1, ptr::null_mut()),
+            B_INVALID
+        );
+        assert_eq!(
+            aster_http_upload_abort(rig.rt, up, ptr::null(), 3),
+            B_INVALID
+        );
+        assert_eq!(
+            aster_http_response_wait(rig.rt, resp, 0, ptr::null_mut(), 8, &mut n),
+            B_INVALID
+        );
+        assert_eq!(
+            aster_http_response_wait(rig.rt, resp, 0, buf.as_mut_ptr(), 8, ptr::null_mut()),
+            B_INVALID
+        );
+        assert_eq!(
+            aster_http_response_read(rig.rt, resp, buf.as_mut_ptr(), 0, 0, &mut n, &mut eof),
+            B_INVALID
+        );
+        assert_eq!(
+            aster_http_response_read(rig.rt, resp, ptr::null_mut(), 8, 0, &mut n, &mut eof),
+            B_INVALID
+        );
+        assert_eq!(
+            aster_http_upload_ready(rig.rt, up, 0, ptr::null_mut()),
+            INVALID
+        );
+        assert_eq!(
+            aster_http_response_ready(rig.rt, resp, 0, ptr::null_mut()),
+            INVALID
+        );
+        assert_eq!(aster_http_upload_free(rig.rt, up), OK);
+        assert_eq!(aster_http_response_free(rig.rt, resp), OK);
+
+        // The status mapping.
+        let s = |c: i32| aster_http_body_status_to_status(c);
+        assert_eq!(s(0), OK);
+        assert_eq!(
+            s(B_DENIED),
+            aster_status_t::ASTER_STATUS_PERMISSION_DENIED as i32
+        );
+        assert_eq!(
+            s(B_CANCELLED),
+            aster_status_t::ASTER_STATUS_CANCELLED as i32
+        );
+        assert_eq!(s(B_TIMEOUT), aster_status_t::ASTER_STATUS_TIMEOUT as i32);
+        assert_eq!(
+            s(B_BUFFER_TOO_SMALL),
+            aster_status_t::ASTER_STATUS_BUFFER_TOO_SMALL as i32
+        );
+        assert_eq!(s(1000), aster_status_t::ASTER_STATUS_INTERNAL as i32);
+    }
+}
+
+/// A write parked on a full upload is woken by `finish`, `abort` or
+/// `aster_http_upload_free` from another thread: it returns FINISHED and its
+/// chunk is never sent.
+#[test]
+fn relay_stream_wakes_a_parked_write() {
+    for case in ["finish", "abort", "free"] {
+        let (rig, log) = relay_rig();
+        let relay = rig.stream(
+            &stream_req(SVC, "PUT", "/gate"),
+            Some(relay_opts(64 * 1024, 1)),
+        );
+        // Fill every buffer while the handler reads nothing.
+        let (mut written, mut timeouts) = (0usize, 0);
+        while timeouts < 3 {
+            match relay.write(&[1u8; 64 * 1024], 100) {
+                B_OK => written += 64 * 1024,
+                B_TIMEOUT => timeouts += 1,
+                rc => panic!("{case}: write failed: {rc}"),
+            }
+        }
+        assert!(written > 0);
+        // Thread A parks in a blocking write; this thread is B.
+        let parked = std::thread::spawn(move || relay.write(&[7u8; 64 * 1024], 20_000));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!parked.is_finished(), "{case}: the write should be parked");
+        match case {
+            "finish" => assert_eq!(relay.finish(), B_OK),
+            "abort" => assert_eq!(relay.abort(), B_OK),
+            _ => assert_eq!(unsafe { aster_http_upload_free(rig.rt, relay.up) }, OK),
+        }
+        assert_eq!(parked.join().unwrap(), B_FINISHED, "{case}");
+        log.gate.store(true, Ordering::Release);
+        match case {
+            "finish" => {
+                // The handler counted exactly what was queued before.
+                let head = relay.wait(20_000).unwrap();
+                let len = written.to_string();
+                assert_eq!(header(&head, "x-len"), Some(len.as_bytes()), "{case}");
+            }
+            _ => {
+                assert_eq!(relay.wait(20_000), Err(B_UPLOAD_FAILED), "{case}");
+                rig.wait_for("handler saw the aborted body", |_| {
+                    log.has(|l| l.starts_with("read err"))
+                });
+            }
+        }
+        if case != "free" {
+            assert_eq!(unsafe { aster_http_upload_free(rig.rt, relay.up) }, OK);
+        }
+        assert_eq!(unsafe { aster_http_response_free(rig.rt, relay.resp) }, OK);
+        rig.wait_for("exchanges closed", |r| r.ctx().open_count() == 0);
+    }
+}
+
+/// A peer that fails before its head (here: a request head over the relay's
+/// 1 MiB limit) resets the stream: RESET (13).
+#[test]
+fn relay_stream_reset_before_the_head() {
+    let (rig, _log) = relay_rig();
+    let big = "a".repeat((1 << 20) + 1024);
+    let c4 = enc_c4(&Req {
+        service_id: SVC.into(),
+        peer_id: None,
+        stream_id: 0,
+        version: 2,
+        method: "POST".into(),
+        uri: "/echo".into(),
+        headers: hdrs(&[("x-big", &big)]),
+        body: None,
+    });
+    let relay = rig.stream(&c4, None);
+    assert_eq!(relay.finish(), B_OK);
+    assert_eq!(relay.wait(20_000), Err(B_RESET), "{}", last_error());
+    assert_eq!(
+        aster_http_body_status_to_status(B_RESET),
+        aster_status_t::ASTER_STATUS_STREAM_RESET as i32
+    );
+    relay.free();
+}
+
+/// Several threads blocked on one response handle all get the head; a
+/// readiness op armed after the head while another thread is inside a
+/// blocking read fires only once a non-blocking read would succeed.
+#[test]
+fn relay_stream_concurrent_waiters_and_readiness_beside_a_blocked_read() {
+    let (rig, log) = relay_rig();
+    let relay = rig.stream(&stream_req(SVC, "PUT", "/gate"), None);
+    let waiters: Vec<_> = (0..2)
+        .map(|_| std::thread::spawn(move || relay.wait(20_000)))
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(relay.write(b"abc", 20_000), B_OK);
+    assert_eq!(relay.finish(), B_OK);
+    log.gate.store(true, Ordering::Release);
+    let heads: Vec<_> = waiters
+        .into_iter()
+        .map(|w| w.join().unwrap().unwrap())
+        .collect();
+    assert_eq!(heads[0], heads[1]);
+    assert_eq!(header(&heads[0], "x-len"), Some(&b"3"[..]));
+    relay.free();
+
+    let relay = rig.stream(&stream_req(SVC, "POST", "/duplex"), None);
+    relay.wait(20_000).unwrap();
+    let reader = std::thread::spawn(move || relay.read(1 << 20, 20_000));
+    std::thread::sleep(Duration::from_millis(100));
+    let op = relay.response_ready();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(relay.write(b"x", 20_000), B_OK);
+    // The blocked read takes the data ...
+    assert_eq!(reader.join().unwrap(), Ok(Some(b"x".to_vec())));
+    // ... so nothing is ready yet: the op must not fire.
+    unsafe {
+        let mut events: [aster_event_t; 8] = std::mem::zeroed();
+        let n = aster_poll_events(rig.rt, events.as_mut_ptr(), events.len(), 300);
+        for ev in events.iter().take(n) {
+            assert_ne!(ev.operation, op, "readiness fired with nothing to read");
+            if ev.buffer != 0 {
+                aster_buffer_release(rig.rt, ev.buffer);
+            }
+        }
+    }
+    // The end makes the next read succeed (EOF): now it fires.
+    assert_eq!(relay.finish(), B_OK);
+    let ev = unsafe { wait_for_ops(rig.rt, &[op]) }.remove(0);
+    assert_eq!((ev.kind, ev.status, ev.error_code), (K_READY, 0, 0));
+    assert_eq!(relay.read(10, 0), Ok(None));
+    relay.free();
+}

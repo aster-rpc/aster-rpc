@@ -63,8 +63,92 @@ impl ChunkWrite for CoreSendStream {
 /// `ReadBuf` is smaller — any surplus is buffered in `leftover`.
 const READ_CHUNK: usize = 16 * 1024;
 
+/// How a stream operation failed at the QUIC level, recovered from an error
+/// chain with [`StreamFailure::of`] / [`StreamFailure::of_io`]. Lets a caller
+/// above the `AsyncRead` / `AsyncWrite` adapters act on the peer's reset code
+/// (or a lost connection) without matching message text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamFailure {
+    /// The peer reset its send side (our read failed) with this code.
+    Reset(u64),
+    /// The peer stopped reading (our write failed) with this code.
+    Stopped(u64),
+    /// The connection is gone (closed by either side, timed out, ...).
+    ConnectionLost,
+}
+
+impl StreamFailure {
+    /// The QUIC failure behind `err`, if any: walks the chain, including the
+    /// [`io::Error`]s these adapters return.
+    pub fn of(err: &anyhow::Error) -> Option<Self> {
+        err.chain().find_map(Self::of_cause)
+    }
+
+    /// As [`of`](Self::of), for an [`io::Error`] (e.g. from
+    /// [`AsterRead`] / [`AsterWrite`]).
+    pub fn of_io(err: &io::Error) -> Option<Self> {
+        Self::of_cause(err)
+    }
+
+    fn of_cause(cause: &(dyn std::error::Error + 'static)) -> Option<Self> {
+        use iroh::endpoint::{ConnectionError, ReadError, ReadExactError, WriteError};
+        if let Some(e) = cause.downcast_ref::<StreamIoError>() {
+            return Some(e.failure);
+        }
+        if let Some(e) = cause.downcast_ref::<io::Error>() {
+            return e.get_ref().and_then(|inner| Self::of_cause(inner));
+        }
+        let read = |e: &ReadError| match e {
+            ReadError::Reset(code) => Some(Self::Reset(code.into_inner())),
+            ReadError::ConnectionLost(_) => Some(Self::ConnectionLost),
+            _ => None,
+        };
+        if let Some(e) = cause.downcast_ref::<ReadError>() {
+            return read(e);
+        }
+        if let Some(ReadExactError::ReadError(e)) = cause.downcast_ref::<ReadExactError>() {
+            return read(e);
+        }
+        if let Some(e) = cause.downcast_ref::<WriteError>() {
+            return match e {
+                WriteError::Stopped(code) => Some(Self::Stopped(code.into_inner())),
+                WriteError::ConnectionLost(_) => Some(Self::ConnectionLost),
+                _ => None,
+            };
+        }
+        if cause.downcast_ref::<ConnectionError>().is_some() {
+            return Some(Self::ConnectionLost);
+        }
+        None
+    }
+}
+
+/// The payload of an adapter [`io::Error`] whose cause is a [`StreamFailure`]:
+/// the original message (unchanged text) plus the typed failure.
+#[derive(Debug)]
+struct StreamIoError {
+    failure: StreamFailure,
+    message: String,
+}
+
+impl std::fmt::Display for StreamIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamIoError {}
+
+/// An adapter error: same `Other` kind and message as before, but a QUIC
+/// reset / stop / connection loss stays recoverable ([`StreamFailure::of_io`]).
 fn other(e: anyhow::Error) -> io::Error {
-    io::Error::other(e.to_string())
+    match StreamFailure::of(&e) {
+        Some(failure) => io::Error::other(StreamIoError {
+            failure,
+            message: e.to_string(),
+        }),
+        None => io::Error::other(e.to_string()),
+    }
 }
 
 /// A `Send`-but-not-`Sync` in-flight future kept across polls. Wrapped in a
@@ -428,5 +512,50 @@ mod tests {
         io.shutdown().await.unwrap();
         assert_eq!(&*w.sink.lock().unwrap(), b"abcdef");
         assert!(*w.finished.lock().unwrap());
+    }
+
+    /// A read half that fails with a fixed QUIC error.
+    struct FailingRead(fn() -> anyhow::Error);
+
+    impl ChunkRead for FailingRead {
+        fn read_chunk(&self, _max_len: usize) -> BoxFut<Result<Option<Vec<u8>>>> {
+            let e = (self.0)();
+            Box::pin(async move { Err(e) })
+        }
+    }
+
+    /// The adapters keep a QUIC reset code (and a lost connection)
+    /// recoverable through the `io::Error` -> `anyhow` chain, with the
+    /// message unchanged; other errors stay plain.
+    #[tokio::test]
+    async fn stream_failure_survives_the_io_adapter() {
+        use iroh::endpoint::{ReadError, VarInt, WriteError};
+        type Case = (fn() -> anyhow::Error, Option<StreamFailure>);
+        let cases: [Case; 4] = [
+            (
+                || ReadError::Reset(VarInt::from_u32(0x4153_0004)).into(),
+                Some(StreamFailure::Reset(0x4153_0004)),
+            ),
+            (
+                || WriteError::Stopped(VarInt::from_u32(9)).into(),
+                Some(StreamFailure::Stopped(9)),
+            ),
+            (
+                || anyhow::Error::from(ReadError::ClosedStream).context("reading"),
+                None,
+            ),
+            (|| anyhow::anyhow!("boom"), None),
+        ];
+        for (make, want) in cases {
+            let mut r = AsterRead::new(FailingRead(make));
+            let mut buf = [0u8; 4];
+            let err = r.read_exact(&mut buf).await.unwrap_err();
+            assert_eq!(err.to_string(), make().to_string());
+            assert_eq!(StreamFailure::of_io(&err), want);
+            // Through `?` into anyhow, as callers above the adapter see it.
+            let any: anyhow::Error = err.into();
+            assert_eq!(StreamFailure::of(&any), want);
+            assert_eq!(StreamFailure::of(&make()), want);
+        }
     }
 }
