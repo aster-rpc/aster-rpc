@@ -285,6 +285,71 @@ public class ExposeRelayTests
         await rig.WaitClosed();
     }
 
+    /// <summary>A body source that parks until released (or cancelled, when it honours the token).</summary>
+    private sealed class StallingStream(Task release, bool honourCancellation, bool stallFirst = false) : Stream
+    {
+        public int Reads;
+        public volatile bool Cancelled;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            if (stallFirst || Interlocked.Increment(ref Reads) > 1)
+            {
+                try { await (honourCancellation ? release.WaitAsync(ct) : release).ConfigureAwait(false); }
+                catch (OperationCanceledException) { Cancelled = true; throw; }
+                return 0;
+            }
+            buffer.Span[0] = 7; // one byte first, then park
+            return 1;
+        }
+    }
+
+    [Fact]
+    public async Task Dispose_After_A_Clean_End_Returns_Promptly_Even_With_A_Stalled_Source()
+    {
+        var (rig, _) = await Setup();
+        await using var _r = rig;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // The handler answers without reading: the response ends cleanly while the source is parked (ignoring cancellation).
+        var src = new StallingStream(release.Task, honourCancellation: false, stallFirst: true);
+        var resp = await ExposeClient.RelayStreamAsync(rig.Conn, ExposeRig.Svc, "PUT", "/early", null, src).WaitAsync(T);
+        Assert.Equal("too big", Encoding.UTF8.GetString(await ReadAll(resp.Body)));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await resp.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        resp.Dispose(); // sync dispose does not block either
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"dispose took {sw.Elapsed}");
+        Assert.False(resp.Upload.IsCompleted); // the pump keeps running in the background
+        // The source eventually ends: the pump finishes the upload, reports it on Upload, and releases its handle.
+        release.SetResult();
+        await resp.Upload.WaitAsync(T); // the source ended: the (already answered) upload finishes without error
+        await rig.WaitClosed();
+    }
+
+    [Fact]
+    public async Task Cancellation_Reaches_A_Source_Parked_In_ReadAsync()
+    {
+        var (rig, h) = await Setup();
+        await using var _r = rig;
+        var never = new TaskCompletionSource(); // never released
+        var src = new StallingStream(never.Task, honourCancellation: true);
+        var resp = await ExposeClient.RelayStreamAsync(rig.Conn, ExposeRig.Svc, "POST", "/duplex", null, src).WaitAsync(T);
+        await Eventually(() => Volatile.Read(ref src.Reads) >= 2, "source parked");
+        await resp.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); // before the end: abandon
+        Assert.True(src.Cancelled, "the pump's token reached the stream read");
+        Assert.False(await resp.Upload.WaitAsync(T));
+        await Eventually(() => h.Has(l => l == "read err"), "handler saw the reset");
+        await rig.WaitClosed();
+    }
+
     [Fact]
     public async Task Disposal_Is_Idempotent_And_Reads_After_Dispose_Fail()
     {

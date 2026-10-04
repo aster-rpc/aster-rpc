@@ -49,7 +49,7 @@ public sealed class ExposeRelayException : IrohException
 ///
 /// <para>Lifetime contract (full duplex): disposing before the body was read to its clean end abandons the
 /// exchange and resets an unfinished upload (the handler sees a failed body, never a truncated one); a body
-/// read to its clean end lets the upload finish (disposal then waits for it). A failure of the upload after the
+/// read to its clean end lets the upload finish (in the background; disposal returns at once and the pump frees the upload handle when it ends, so await <see cref="Upload"/> to observe it). A failure of the upload after the
 /// head is reported through <see cref="Upload"/>, never thrown by the call that already returned.</para>
 /// </summary>
 public sealed class ExposeStreamResponse : IAsyncDisposable, IDisposable
@@ -72,7 +72,7 @@ public sealed class ExposeStreamResponse : IAsyncDisposable, IDisposable
         _upload = upload;
         _response = response;
         _maxChunk = (int)Math.Min(maxChunk == 0 ? 1 << 20 : maxChunk, int.MaxValue);
-        _pump = Task.Run(() => PumpAsync(source));
+        _pump = Task.Run(() => RunPumpAsync(source));
         Body = new BodyStream(this);
     }
 
@@ -201,6 +201,24 @@ public sealed class ExposeStreamResponse : IAsyncDisposable, IDisposable
 
     // ── upload ───────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The pump owns the upload handle and its cancellation source: both are released when it ends, however
+    /// late. Cancellation reaches the body source through the enumerator / <c>Stream.ReadAsync</c> token; a
+    /// source that ignores it keeps the pump (never <see cref="Dispose"/>) alive.
+    /// </summary>
+    private async Task<bool> RunPumpAsync(IAsyncEnumerable<ReadOnlyMemory<byte>>? source)
+    {
+        try
+        {
+            return await PumpAsync(source).ConfigureAwait(false);
+        }
+        finally
+        {
+            Native.aster_http_upload_free(_runtime.Handle, _upload); // aborts it if unfinished
+            _pumpCts.Dispose();
+        }
+    }
+
     private async Task<bool> PumpAsync(IAsyncEnumerable<ReadOnlyMemory<byte>>? source)
     {
         var ct = _pumpCts.Token;
@@ -271,19 +289,19 @@ public sealed class ExposeStreamResponse : IAsyncDisposable, IDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         if (_eof && !forceAbandon)
         {
-            // A body read to its clean end leaves the upload to finish.
-            try { await _pump.ConfigureAwait(false); } catch (Exception) { /* reported through Upload */ }
+            // A body read to its clean end leaves the upload to finish -- in the background: the pump owns
+            // the upload handle and frees it when it ends (its outcome stays on Upload), so disposal never
+            // waits on a stalled body source.
+            Native.aster_http_response_free(_runtime.Handle, _response);
+            return;
         }
-        else
-        {
-            // Closing the response resets an unfinished upload (the handler sees a failed body).
-            Native.aster_http_response_close(_runtime.Handle, _response);
-            _pumpCts.Cancel();
-            try { await _pump.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); } catch (Exception) { }
-        }
+        // Closing the response resets an unfinished upload (the handler sees a failed body).
+        Native.aster_http_response_close(_runtime.Handle, _response);
+        try { _pumpCts.Cancel(); } catch (ObjectDisposedException) { /* the pump already ended */ }
+        // A bounded courtesy wait; a source that ignores cancellation keeps the pump (not this call) alive,
+        // and the pump frees the upload handle when it finally ends.
+        try { await _pump.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); } catch (Exception) { }
         Native.aster_http_response_free(_runtime.Handle, _response);
-        Native.aster_http_upload_free(_runtime.Handle, _upload);
-        _pumpCts.Dispose();
     }
 
     private sealed class BodyStream(ExposeStreamResponse owner) : Stream

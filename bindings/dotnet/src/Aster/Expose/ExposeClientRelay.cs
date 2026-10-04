@@ -22,7 +22,7 @@ public static partial class ExposeClient
     /// <summary>Streaming relay with a <see cref="Stream"/> request body (null = no body).</summary>
     public static Task<ExposeStreamResponse> RelayStreamAsync(Connection connection, string serviceId, string method, string uri,
         IReadOnlyList<HttpHeader>? headers, Stream? body, ExposeRelayOptions? options = null, CancellationToken cancellationToken = default)
-        => RelayStreamAsync(connection, serviceId, method, uri, headers, body == null ? null : FromStream(body, cancellationToken), options, cancellationToken);
+        => RelayStreamAsync(connection, serviceId, method, uri, headers, body == null ? null : FromStream(body), options, cancellationToken);
 
     /// <summary>
     /// Starts a <b>streaming</b> HTTP exchange with <paramref name="serviceId"/> exposed by the peer on

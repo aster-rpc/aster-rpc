@@ -94,7 +94,7 @@
   (`aster_http_upload_ready` / `aster_http_response_ready`), so no pool thread blocks. Contract (as in
   TS): a body-source failure before the head is thrown as the caller's own exception (the request is
   reset), after the head it faults `Upload`; disposing before the body's clean end resets an unfinished
-  upload; a clean end lets the upload finish (disposal waits for it); an early answer the handler gives
+  upload; a clean end lets the upload finish in the background (the pump owns the upload handle and frees it when it ends; disposal never waits on a stalled source, and a source that ignores its token keeps only the pump alive); an early answer the handler gives
   without reading makes `Upload` complete `false`. Relay failures are `ExposeRelayException` (stable
   code in `RelayStatus`, `Status` via `aster_http_body_status_to_status`); a denied relay, streaming or
   buffered, is `Status.PermissionDenied`. `Unauthenticated` / `CredentialExpired` are reserved for R4
