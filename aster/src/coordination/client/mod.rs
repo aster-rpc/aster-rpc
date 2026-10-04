@@ -446,7 +446,21 @@ impl CoordinationClient {
         let request_hash = hash::request_hash(&action)
             .map_err(|_| client_error("the action has no canonical hash"))?;
         let mut journal = self.journal.lock().await;
-        self.settle_self_acknowledging(&mut journal).await?;
+        // An interrupted lease transition that cannot be settled now (its
+        // drive was denied, or nobody answered) blocks this mutation exactly
+        // as any unresolved entry does: the refusal is `Unresolved`, with the
+        // settling failure as its source — never this mutation's own error.
+        if let Err(err) = self.settle_self_acknowledging(&mut journal).await {
+            if CoordinationErrorKind::of(&err) == CoordinationErrorKind::JournalFatal {
+                return Err(err);
+            }
+            return Err(Error::Coordination(CoordinationError::with_source(
+                CoordinationErrorKind::Unresolved,
+                "invalid argument: coordination client: another request is unresolved on \
+                 this journal; resume() first",
+                err,
+            )));
+        }
         let request = build(
             self.engine.group.as_bytes().to_vec(),
             journal.record().client_id.clone(),
