@@ -13,8 +13,8 @@ import { ServiceRegistry } from './service.js';
 import { LocalTransport } from './transport/local.js';
 import { createClient, type AsterClient as ClientProxy } from './client.js';
 import type { AsterTransport } from './transport/base.js';
-import type { AsterConfig } from './config.js';
-import { configFromEnv } from './config.js';
+import { AsterConfig, loadIdentity, parseToml, resolveRootPubkey } from './config.js';
+import { Node } from './node.js';
 import { createLogger, type AsterLogger } from './logging.js';
 import { HealthServer } from './health.js';
 import { DEFAULT_BACKOFF, RpcPattern, RpcScope, type ExponentialBackoff } from './types.js';
@@ -23,7 +23,6 @@ import { RpcServer } from './server.js';
 
 import { handleConsumerAdmissionConnection, performAdmission, type ConsumerAdmissionOpts, type ServiceSummary } from './trust/consumer.js';
 import type { ConsumerEnrollmentCredential } from './trust/credentials.js';
-import { loadIdentity, parseSimpleToml } from './config.js';
 import { handleDelegatedAdmissionConnection, type DelegatedAdmissionPolicy } from './trust/delegated.js';
 import { MeshEndpointHook } from './trust/hooks.js';
 import { PeerAttributeStore } from './peer-store.js';
@@ -35,9 +34,7 @@ import { getGeneratedMethodFields, getWireShape, registerGenerated, type Registe
 import { IrohTransport } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
 import { gate0EndpointConfig } from './gate0.js';
-import { loadNative, tryLoadNative, type NativeAddon } from './native.js';
-
-type NativeIrohNode = InstanceType<NativeAddon['IrohNode']>;
+import { loadNative, tryLoadNative } from './native.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -158,7 +155,7 @@ export class AsterServer {
   readonly config: AsterConfig;
   readonly logger: AsterLogger;
   private health: HealthServer;
-  private _node: NativeIrohNode | null = null;
+  private _node: Node | null = null;
   private _rpcServer: RpcServer | null = null;
   private _hook: MeshEndpointHook;
   private _peerStore: PeerAttributeStore;
@@ -176,7 +173,8 @@ export class AsterServer {
   private _admissionAbort: AbortController | null = null;
 
   constructor(opts: AsterServerOptions) {
-    this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
+    // Rust loaders (ASTER_* env); fields set in code win.
+    this.config = { ...AsterConfig.fromEnv(), ...opts.config };
     if (opts.identity) {
       this.config.identityFile = opts.identity;
     }
@@ -187,8 +185,8 @@ export class AsterServer {
     });
     this.registry = new ServiceRegistry();
     this.health = new HealthServer({
-      port: this.config.healthPort,
-      host: this.config.healthHost,
+      port: this.config.healthPort ?? 0,
+      host: this.config.healthHost ?? '127.0.0.1',
     });
     this._peerStore = new PeerAttributeStore();
     if (this.config.allowAllProducers === false) {
@@ -198,7 +196,7 @@ export class AsterServer {
         'Leave allowAllProducers at its default (true).',
       );
     }
-    this._allowAllConsumers = opts.allowAllConsumers ?? this.config.allowAllConsumers;
+    this._allowAllConsumers = opts.allowAllConsumers ?? this.config.allowAllConsumers ?? false;
     // In dev mode the hook must allow unenrolled peers, otherwise post-admission
     // RPC connections would be denied (they reach Gate 0 before the peer-store
     // entry from admission is checked, and the peer wouldn't be there for
@@ -210,7 +208,7 @@ export class AsterServer {
   }
 
   /**
-   * Create the IrohNode and prepare for serving. Idempotent.
+   * Start the node and prepare for serving. Idempotent.
    *
    * On first call, auto-imports `aster-rpc.generated.js` from the
    * working directory (unless `generated` was passed explicitly),
@@ -284,28 +282,25 @@ export class AsterServer {
     // (allow_all_consumers=false). Without enable_hooks=true, the
     // before_connect callbacks never fire and the admitted-set is
     // unenforced — every connection is allowed regardless of admission.
-    const alpns = [
-      Buffer.from(RPC_ALPN),
-      Buffer.from(ALPN_CONSUMER_ADMISSION),
-      Buffer.from(ALPN_DELEGATED_ADMISSION),
-    ];
+    //
+    // The whole resolved config reaches the node (relay / bind / storage /
+    // secret key file / transport knobs), so persistent and offline /
+    // loopback-only servers work; Gate 0 settings override it when needed.
     const gate0Needed = !this._allowAllConsumers;
-    // Network settings from the resolved config (ASTER_RELAY_MODE,
-    // ASTER_BIND_ADDR, [network] in TOML) must reach the endpoint, or an
-    // offline / loopback-only server is impossible.
-    const networkConfig = {
-      ...(this.config.relayMode ? { relayMode: this.config.relayMode } : {}),
-      ...(this.config.bindAddr ? { bindAddr: this.config.bindAddr } : {}),
-    };
-    const gate0Config = gate0EndpointConfig(gate0Needed);
-    const endpointConfig = gate0Config || Object.keys(networkConfig).length > 0
-      ? { ...gate0Config, ...networkConfig }
-      : undefined;
-    this._node = await native.IrohNode.memoryWithAlpns(alpns, endpointConfig);
+    this._node = await Node.start({
+      ...this.config,
+      ...gate0EndpointConfig(gate0Needed),
+      alpns: [
+        ...(this.config.alpns ?? []),
+        RPC_ALPN,
+        ALPN_CONSUMER_ADMISSION,
+        ALPN_DELEGATED_ADMISSION,
+      ],
+    });
 
     // Build service summaries for admission response
     // Encode the server's own node ID as the RPC channel address
-    const nodeId = this._node.nodeId();
+    const nodeId = this._node.id;
     const rpcAddr = Buffer.from(nodeId).toString('base64');
     this._serviceSummaries = [];
     for (const info of this.registry.getAllServices()) {
@@ -378,8 +373,8 @@ export class AsterServer {
    */
   private async _publishContracts(): Promise<void> {
     try {
-      const dc = this._node!.docsClient();
-      const bc = this._node!.blobsClient();
+      const dc = this._node!.docs();
+      const bc = this._node!.blobs();
 
       // Step 1: Create registry doc and author
       const registryDoc = await dc.create();
@@ -698,7 +693,7 @@ export class AsterServer {
     // before_connect events from iroh and applies the MeshEndpointHook's
     // allow/deny decisions. Without this, the admitted-set is never
     // consulted and every connection passes the QUIC handshake.
-    if (this._node.hasHooks?.()) {
+    if (this._node.hasHooks) {
       void this._runGate0().catch(e => {
         this.logger.error('gate0 hook loop failed', { error: String(e) });
       });
@@ -730,7 +725,7 @@ export class AsterServer {
    */
   private async _runGate0(): Promise<void> {
     if (!this._node) return;
-    const receiver = this._node.takeHookReceiver();
+    const receiver = this._node.native.takeHookReceiver();
     if (receiver == null) {
       this.logger.warn('Gate 0: hooks enabled but no receiver available');
       return;
@@ -795,20 +790,20 @@ export class AsterServer {
         // Carry the direct addresses: a ticket with none is only dialable via
         // relay/discovery, so a relay-less (LAN / loopback) client hangs.
         const info: any = {
-          endpointId: this._node.nodeId(),
+          endpointId: this._node.id,
           relayAddr: undefined,
-          directAddrs: this._node.directAddresses?.() ?? [],
+          directAddrs: this._node.directAddresses(),
         };
         return native.asterTicketToString(info);
       }
     } catch { /* fallback */ }
-    return this._node.nodeId();
+    return this._node.id;
   }
 
   /** Hex endpoint ID of this server's node. */
   get endpointId(): string {
     if (!this._node) throw new Error('Server not started');
-    return this._node.nodeId();
+    return this._node.id;
   }
 
   /** Whether the server is running. */
@@ -837,7 +832,7 @@ export class AsterServer {
     while (this._running && !this._closed) {
       try {
         // Accept next connection — ALPN tag is on the connection
-        const conn = await this._node.acceptAster();
+        const conn = await this._node.native.acceptAster();
         const alpn: string = conn.alpn() ?? '';
 
         if (alpn === RPC_ALPN) {
@@ -889,18 +884,13 @@ export class AsterServer {
   }
 
   private _resolveRootPubkeyHex(): string {
-    if (this.config.rootPubkey) return Buffer.from(this.config.rootPubkey).toString('hex');
-    if (this.config.rootPubkeyFile) {
-      try {
-        const expanded = this.config.rootPubkeyFile.replace(/^~/, process.env.HOME ?? '');
-        const raw = readFileSync(expanded, 'utf-8').trim();
-        if (raw.startsWith('{')) {
-          try { return JSON.parse(raw).public_key; } catch { /* fall through */ }
-        }
-        return raw;
-      } catch { return ''; }
+    // Rust `AsterConfig::resolve_root_pubkey` (inline key and/or key file).
+    try {
+      return resolveRootPubkey(this.config) ?? '';
+    } catch (e) {
+      this.logger.error('root public key could not be resolved', { error: String(e) });
+      return '';
     }
-    return '';
   }
 
   // ── Delegated admission ─────────────────────────────────────────────────
@@ -970,7 +960,7 @@ export class AsterServer {
 
     // Endpoint
     try {
-      const nodeId = this._node?.nodeId?.();
+      const nodeId = this._node?.id;
       if (nodeId) {
         const short = nodeId.slice(0, 16) + '\u2026';
         w(`    ${D}node id:${R}   ${W}${short}${R}  ${D}(this node's keypair fingerprint)${R}\n`);
@@ -1035,7 +1025,7 @@ function loadRawConsumerPeer(
   const path = filePath ?? join(process.cwd(), '.aster-identity');
   if (!existsSync(path)) return null;
   try {
-    const data = parseSimpleToml(readFileSync(path, 'utf-8'));
+    const data = parseToml(readFileSync(path, 'utf-8'));
     const peers = (data.peers ?? []) as Record<string, unknown>[];
     if (peerName) {
       return peers.find(p => p.name === peerName) ?? null;
@@ -1102,7 +1092,7 @@ function loadEnrollmentCredential(filePath: string): ConsumerEnrollmentCredentia
   }
 
   // TOML path -- reuse the identity helpers so behaviour matches `identity:`
-  const data = parseSimpleToml(text);
+  const data = parseToml(text);
   const peers = (data.peers ?? []) as Record<string, unknown>[];
   const consumerPeer = peers.find(p => p.role === 'consumer') ?? peers[0];
   if (!consumerPeer) {
@@ -1129,12 +1119,13 @@ export class AsterClientWrapper {
   private _connected = false;
   private _gossipTopic = '';
   private _address: string | undefined;
-  private _node: NativeIrohNode | null = null;
+  private _node: Node | null = null;
   private _services: ServiceSummary[] = [];
   private _registryNamespace = '';
   private _inlineCredential: ConsumerEnrollmentCredential | null = null;
   private _enrollmentCredentialFile: string | undefined;
-  private _identitySecretKey: Uint8Array | null = null;
+  /** `[node] secret_key` (hex) from the `.aster-identity` credential file. */
+  private _identitySecretKey: string | null = null;
   private readonly _generated?: {
     SERVICES: readonly any[];
     WIRE_TYPES: readonly any[];
@@ -1168,7 +1159,7 @@ export class AsterClientWrapper {
   private _dynamicRegisteredTags: Set<string> = new Set();
 
   constructor(opts: AsterClientOptions) {
-    this.config = { ...configFromEnv(), ...opts.config } as AsterConfig;
+    this.config = { ...AsterConfig.fromEnv(), ...opts.config };
     if (opts.identity) {
       this.config.identityFile = opts.identity;
     }
@@ -1186,7 +1177,7 @@ export class AsterClientWrapper {
     // which would corrupt the signed-attribute set on the credential.
     const identity = loadIdentity(this.config.identityFile, opts.peer, 'consumer');
     if (identity) {
-      this._identitySecretKey = identity.secretKey;
+      this._identitySecretKey = identity.secretKey ?? null;
       if (!opts.enrollmentCredentialFile) {
         const rawPeer = loadRawConsumerPeer(this.config.identityFile, opts.peer);
         if (rawPeer) {
@@ -1217,7 +1208,7 @@ export class AsterClientWrapper {
         opts.peer,
         'consumer',
       );
-      if (credIdentity) {
+      if (credIdentity?.secretKey) {
         this._identitySecretKey = credIdentity.secretKey;
       }
     }
@@ -1268,17 +1259,14 @@ export class AsterClientWrapper {
     const { setNativeTrustConfigPrimitives } = await import('./trust/config-primitives.js');
     setNativeTrustConfigPrimitives(native);
 
-    // Create an in-memory client node. When an identity file provided a
-    // secret key, pass it through so the client's endpoint id matches the
-    // credential's enrolled endpoint_id.
-    if (this._identitySecretKey) {
-      this._node = await native.IrohNode.memoryWithAlpns(
-        [Buffer.from(ALPN_CONSUMER_ADMISSION), Buffer.from(RPC_ALPN)],
-        { secretKey: Buffer.from(this._identitySecretKey) },
-      );
-    } else {
-      this._node = await native.IrohNode.memory();
-    }
+    // Start the client node from the resolved config. When an identity file
+    // provided a secret key, it pins the node key so the client's endpoint id
+    // matches the credential's enrolled endpoint_id (a `secretKeyFile` that
+    // holds a different key is a conflict and fails the start).
+    this._node = await Node.start({
+      ...this.config,
+      ...(this._identitySecretKey ? { secretKey: this._identitySecretKey } : {}),
+    });
 
     // Parse the address to get the endpoint ID and optional address hints.
     //
@@ -1308,13 +1296,8 @@ export class AsterClientWrapper {
     const directAddrs = allDirectAddrs.length ? allDirectAddrs : undefined;
 
     // Helper: connect using full address info when available, else bare endpoint ID
-    const doConnect = (alpn: Buffer) => {
-      if (directAddrs) {
-        // No relay URL — iroh's connect_node_addr handles direct addresses
-        return this._node!.connectNodeAddr(endpointId, alpn, directAddrs, undefined);
-      }
-      return this._node!.connect(endpointId, alpn);
-    };
+    const doConnect = (alpn: Buffer) =>
+      this._node!.connect({ nodeId: endpointId, directAddresses: directAddrs }, alpn);
 
     // Build credential: inline peer entry > credential file > null (open-gate).
     let credential: ConsumerEnrollmentCredential | null = this._inlineCredential;
@@ -1333,7 +1316,7 @@ export class AsterClientWrapper {
     if (!admissionResponse.admitted) {
       let ourEndpointId = '';
       try {
-        ourEndpointId = this._node?.nodeId?.() ?? '';
+        ourEndpointId = this._node?.id ?? '';
       } catch { /* ignore */ }
       throw new AdmissionDeniedError({
         hadCredential: credential != null,
@@ -1425,7 +1408,7 @@ export class AsterClientWrapper {
 
     this._registryJoinPromise = (async () => {
       try {
-        const dc = this._node!.docsClient();
+        const dc = this._node!.docs();
         const result = await dc.joinAndSubscribeNamespace(
           this._registryNamespace,
           this._remoteEndpointId,
@@ -1518,7 +1501,7 @@ export class AsterClientWrapper {
           const collectionHash = artifactRef.collection_hash;
           if (collectionHash) {
             const { fetchContract } = await import('./contract/publication.js');
-            const blobs = this._node!.blobsClient();
+            const blobs = this._node!.blobs();
             manifest = await fetchContract(blobs, collectionHash);
           }
         }
@@ -1572,7 +1555,7 @@ export class AsterClientWrapper {
       const collectionHash = artifactRef.collection_hash;
       if (!collectionHash) return empty;
 
-      const blobs = this._node!.blobsClient();
+      const blobs = this._node!.blobs();
 
       // The contract collection was produced on the remote peer; its
       // HashSeq + child blobs aren't yet in our local store. Pull the
@@ -1736,10 +1719,15 @@ export class AsterClientWrapper {
     }
   }
 
-  /** Close the client and underlying transport. */
+  /** Close the client, its transport and its node. */
   async close(): Promise<void> {
     this._connected = false;
-    await this.transport.close();
+    if (this.transport) await this.transport.close();
+    if (this._node) {
+      const node = this._node;
+      this._node = null;
+      try { await node.close(); } catch { /* ignore */ }
+    }
   }
 }
 

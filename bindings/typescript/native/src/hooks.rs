@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use aster_transport_core::{CoreAfterHandshakeDecision, CoreHookReceiver};
 
 /// Hook receiver for connection-level gating.
-/// Call `takeHookReceiver()` on IrohNode to get this.
+/// Call `takeHookReceiver()` on a `Node` to get this.
 #[napi]
 pub struct NodeHookReceiver {
     pub(crate) inner: Mutex<Option<CoreHookReceiver>>,

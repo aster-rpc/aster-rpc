@@ -103,7 +103,7 @@ async function main(): Promise<number> {
   const { fory, Type } = getXlangForyAndType();
   const codec = createXlangCodec(fory, Type);
   registerGenerated({ SERVICES, WIRE_TYPES, buildAllTypes: BUILD_ALL_TYPES, codec, fory, Type } as any);
-  const node = await native.IrohNode.memoryWithAlpns([RPC_ALPN], { relayMode: 'disabled', bindAddr: '127.0.0.1:0' });
+  const node = await native.Node.start({ alpns: [RPC_ALPN], relayMode: 'disabled', bindAddr: '127.0.0.1:0' });
   const t = native.asterTicketFromString(ticket);
   const conn = await node.connectNodeAddr(t.endpointId, RPC_ALPN, t.directAddrs, undefined);
   const client: any = createClient(InteropEcho, new IrohTransport(conn, codec));

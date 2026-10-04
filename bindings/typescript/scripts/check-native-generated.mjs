@@ -45,7 +45,7 @@ for (const file of generated) {
 }
 
 const dts = readFileSync(join(nativeDir, 'index.d.ts'), 'utf8');
-for (const symbol of ['export declare class IrohNode', 'export declare function version']) {
+for (const symbol of ['export declare class Node', 'export declare function version']) {
   if (!dts.includes(symbol)) fail(`index.d.ts is missing \`${symbol}\``);
 }
 

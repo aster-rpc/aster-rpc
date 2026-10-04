@@ -14,7 +14,7 @@ use napi_derive::napi;
 use aster_transport_core::reactor as core_reactor;
 
 use crate::net::IrohConnection;
-use crate::node::IrohNode;
+use crate::node::Node;
 
 // ============================================================================
 // ReactorResponseSender
@@ -430,12 +430,12 @@ impl ReactorPair {
 /// Start a reactor that owns its own accept loop on the given node.
 /// Suitable when the server only serves the Aster ALPN.
 #[napi]
-pub fn start_reactor(node: &IrohNode, channel_capacity: u32) -> ReactorHandle {
+pub fn start_reactor(node: &Node, channel_capacity: u32) -> ReactorHandle {
     // napi v3 no longer enters the Tokio runtime around synchronous exports
     // (v2 did), so resolve napi's runtime handle explicitly.
     let rt_handle = within_runtime_if_available(tokio::runtime::Handle::current);
     let core_handle =
-        core_reactor::start_reactor_on(&rt_handle, node.core_clone(), channel_capacity as usize);
+        core_reactor::start_reactor_on(&rt_handle, node.core().clone(), channel_capacity as usize);
     ReactorHandle {
         inner: Arc::new(tokio::sync::Mutex::new(core_handle)),
     }

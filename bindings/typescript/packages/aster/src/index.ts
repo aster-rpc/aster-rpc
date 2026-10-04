@@ -289,22 +289,23 @@ export {
 // Transport implementations
 export { IrohTransport } from './transport/iroh.js';
 
-// Configuration
+// Node + configuration (Rust `aster::Node` / `aster::AsterConfig`)
+export { Node, NodeId, type NodeAddr } from './node.js';
 export {
-  configFromEnv,
-  configFromFile,
-  loadEndpointConfig,
+  AsterConfig,
   resolveRootPubkey,
-  toEndpointConfig,
   loadIdentity,
-  loadIdentityFile,
-  findPeer,
   getProducerTokens,
-  parseSimpleToml,
   printConfig,
-  type AsterConfig,
-  type IdentityData,
+  type AsterIdentity,
+  type IdentityPeer,
+  type RelayModeName,
+  type HookFailureMode,
+  type LogFormat,
+  type LogLevel,
+  type KeyMaterial,
 } from './config.js';
+export { SecretKey } from './secret-key.js';
 
 // Logging
 export {

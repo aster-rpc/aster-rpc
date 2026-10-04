@@ -346,75 +346,6 @@ export declare class IrohConnection {
   openTunnel(ticket: Buffer): Promise<IrohBiStream>
 }
 
-/**
- * IrohNode — a peer-to-peer Iroh node with all protocols enabled.
- *
- * Create via `IrohNode.memory()` or `IrohNode.persistent(path)`.
- */
-export declare class IrohNode {
-  /** Create an in-memory Iroh node with all protocols. */
-  static memory(): Promise<IrohNode>
-  /** Create a persistent Iroh node backed by FsStore at the given path. */
-  static persistent(path: string): Promise<IrohNode>
-  /** Return this node's EndpointId as a hex string. */
-  nodeId(): string
-  /** Return the node's address info (debug format). */
-  nodeAddr(): string
-  /**
-   * Direct socket addresses (`"ip:port"`) this node currently advertises.
-   * Empty until the endpoint has bound and discovered its local addresses.
-   * Used to put dialable material into `aster1` tickets.
-   */
-  directAddresses(): Array<string>
-  /** Export the node's secret key as 32 bytes. */
-  exportSecretKey(): Array<number>
-  /**
-   * Create an in-memory node with custom ALPNs.
-   *
-   * `config` is optional; pass `undefined` for core defaults. To enable
-   * Gate 0 hooks (required for `allow_all_consumers=false` admission),
-   * set `enableHooks: true`.
-   */
-  static memoryWithAlpns(alpns: Array<Buffer>, config?: EndpointConfig | undefined | null): Promise<IrohNode>
-  /**
-   * Create a persistent node with custom ALPNs.
-   *
-   * `config` is optional; pass `undefined` for core defaults.
-   */
-  static persistentWithAlpns(path: string, alpns: Array<Buffer>, config?: EndpointConfig | undefined | null): Promise<IrohNode>
-  /** Whether this node was built with hooks enabled. */
-  hasHooks(): boolean
-  /** Take the hook receiver (one-shot). Returns null if hooks not enabled. */
-  takeHookReceiver(): NodeHookReceiver | null
-  /**
-   * Accept the next incoming aster-ALPN connection.
-   * The ALPN tag is stored on the returned connection (call `conn.alpn()` to read it).
-   */
-  acceptAster(): Promise<IrohConnection>
-  /** Get the blobs client for this node. */
-  blobsClient(): BlobsClient
-  /** Get the docs client for this node. */
-  docsClient(): DocsClient
-  /** Get the gossip client for this node. */
-  gossipClient(): GossipClient
-  /** Add another node's address info for peer discovery. */
-  addNodeAddr(other: IrohNode): void
-  /**
-   * Connect to a remote node by its endpoint ID (hex) and ALPN.
-   * Returns an IrohConnection for sending/receiving streams.
-   */
-  connect(nodeId: string, alpn: Buffer): Promise<IrohConnection>
-  /**
-   * Connect to a remote node using full address info (endpoint ID + relay + direct addrs).
-   * This is needed when nodes can't discover each other via relay (e.g. local connections).
-   */
-  connectNodeAddr(endpointId: string, alpn: Buffer, directAddrs?: Array<string> | undefined | null, relayUrl?: string | undefined | null): Promise<IrohConnection>
-  /** Gracefully shut down the node. */
-  close(): Promise<void>
-  /** Export all transport-level metrics in Prometheus text exposition format. */
-  transportMetricsPrometheus(): string
-}
-
 export declare class IrohRecvStream {
   /** Read exactly n bytes. */
   readExact(n: number): Promise<Buffer>
@@ -438,8 +369,74 @@ export declare class IrohSendStream {
 }
 
 /**
+ * A running Aster node (QUIC endpoint + blobs / docs / gossip).
+ *
+ * Create one with `Node.start(config)`; always `close()` it (it flushes the
+ * persistent store before tearing down).
+ */
+export declare class Node {
+  /**
+   * Start a node from `config` (in-memory unless `storagePath` is set).
+   *
+   * A `secretKeyFile` is loaded, or created from `secretKey` / a fresh key
+   * when missing; an explicit `secretKey` that disagrees with an existing
+   * file is an error. `alpns` adds inbound ALPNs beyond blobs/docs/gossip.
+   */
+  static start(config?: AsterConfig | undefined | null): Promise<Node>
+  /** This node's id (the hex public key of its secret key). */
+  nodeId(): string
+  /** The node's address info (debug format). */
+  nodeAddr(): string
+  /**
+   * Direct socket addresses (`"ip:port"`) this node currently advertises.
+   * Empty until the endpoint has bound and discovered its local addresses.
+   * Used to put dialable material into `aster1` tickets.
+   */
+  directAddresses(): Array<string>
+  /**
+   * The node's secret key (32 bytes). Persist it (or use `secretKeyFile`)
+   * for a restart-stable identity — the store does not keep it.
+   */
+  exportSecretKey(): Buffer
+  /** Whether this node was started with hooks enabled. */
+  hasHooks(): boolean
+  /**
+   * Take the hook receiver (one-shot). `null` if hooks are not enabled or
+   * it was already taken.
+   */
+  takeHookReceiver(): NodeHookReceiver | null
+  /**
+   * Accept the next incoming connection on a non-builtin ALPN. The ALPN is
+   * readable as `conn.alpn()`.
+   */
+  acceptAster(): Promise<IrohConnection>
+  /** The blobs client for this node. */
+  blobsClient(): BlobsClient
+  /** The docs client for this node. */
+  docsClient(): DocsClient
+  /** The gossip client for this node. */
+  gossipClient(): GossipClient
+  /** Add another local node's address info (in-process peer discovery). */
+  addNodeAddr(other: Node): void
+  /** Connect to a node by id (hex) on `alpn`, relying on discovery. */
+  connect(nodeId: string, alpn: Buffer): Promise<IrohConnection>
+  /**
+   * Connect using full address info (id + direct addresses + relay URL) —
+   * needed when the peer is not discoverable (LAN / loopback, no relay).
+   */
+  connectNodeAddr(endpointId: string, alpn: Buffer, directAddrs?: Array<string> | undefined | null, relayUrl?: string | undefined | null): Promise<IrohConnection>
+  /**
+   * Shut the node down cleanly (flushes persistent state first).
+   * Closes the shared node: every handle to it stops working.
+   */
+  close(): Promise<void>
+  /** Transport metrics in Prometheus text exposition format. */
+  metricsPrometheus(): string
+}
+
+/**
  * Hook receiver for connection-level gating.
- * Call `takeHookReceiver()` on IrohNode to get this.
+ * Call `takeHookReceiver()` on a `Node` to get this.
  */
 export declare class NodeHookReceiver {
   /** Check if the receiver is available. */
@@ -572,6 +569,171 @@ export declare class ReactorResponseSender {
    * Further sends fail.
    */
   sendTrailer(trailerFrame: Buffer): Promise<void>
+}
+
+/**
+ * Node / server / client configuration.
+ *
+ * All fields are optional; omitted fields take the Rust defaults. Resolution
+ * order when loading: defaults < `aster.toml` (`AsterConfig.fromFile`) <
+ * `ASTER_*` environment (`AsterConfig.fromEnv`, and `fromFile` overlays it
+ * too) < fields set in code.
+ */
+export interface AsterConfig {
+  /**
+   * Deployment root public key, 64 hex characters. `ASTER_ROOT_PUBKEY`,
+   * `[trust] root_pubkey`.
+   */
+  rootPubkey?: string
+  /**
+   * File holding the root public key (hex or `{"public_key": "<hex>"}`).
+   * `ASTER_ROOT_PUBKEY_FILE`, `[trust] root_pubkey_file`.
+   */
+  rootPubkeyFile?: string
+  /**
+   * Enrollment credential file. `ASTER_ENROLLMENT_CREDENTIAL`,
+   * `[trust] enrollment_credential`.
+   */
+  enrollmentCredentialFile?: string
+  /** Cloud instance identity document token. `ASTER_ENROLLMENT_CREDENTIAL_IID`. */
+  enrollmentCredentialIid?: string
+  /** Skip the consumer admission gate (dev mode). `ASTER_ALLOW_ALL_CONSUMERS`. */
+  allowAllConsumers?: boolean
+  /** Skip the producer admission gate. `ASTER_ALLOW_ALL_PRODUCERS`. */
+  allowAllProducers?: boolean
+  /** Producer address for consumer-side dialing. `ASTER_ENDPOINT_ADDR`. */
+  endpointAddr?: string
+  /**
+   * Persistent node directory; in-memory when unset. `ASTER_STORAGE_PATH`,
+   * `[storage] path`.
+   */
+  storagePath?: string
+  /**
+   * Blob GC interval in milliseconds; `0` / unset disables GC.
+   * `ASTER_GC_INTERVAL_MS`, `[storage] gc_interval_ms`.
+   */
+  gcIntervalMs?: number | bigint
+  /**
+   * Node secret key, 64 hex characters. `ASTER_SECRET_KEY`,
+   * `[network] secret_key` (which also accept base64).
+   */
+  secretKey?: string
+  /**
+   * Secret key file (64 hex characters), loaded or created at start.
+   * `ASTER_SECRET_KEY_FILE`, `[network] secret_key_file`.
+   */
+  secretKeyFile?: string
+  /** `.aster-identity` credential file. `ASTER_IDENTITY_FILE`, `[identity] file`. */
+  identityFile?: string
+  /**
+   * `"default"`, `"staging"`, `"disabled"` or `"custom"` (a bare URL means
+   * custom with that URL). `ASTER_RELAY_MODE`, `[network] relay_mode`.
+   */
+  relayMode?: string
+  /**
+   * Custom relay URLs (selects `"custom"`). `ASTER_RELAY_URLS`,
+   * `[network] relay_urls`.
+   */
+  relayUrls?: Array<string>
+  /** Local bind address, e.g. `"0.0.0.0:9000"`. `ASTER_BIND_ADDR`. */
+  bindAddr?: string
+  /** mDNS local discovery. `ASTER_LOCAL_DISCOVERY`. */
+  localDiscovery?: boolean
+  /** Connection monitoring / remote-info tracking. `ASTER_ENABLE_MONITORING`. */
+  enableMonitoring?: boolean
+  /** Admission hooks (Gate 0). `ASTER_ENABLE_HOOKS`. */
+  enableHooks?: boolean
+  /** Hook decision timeout in ms (default 5000). `ASTER_HOOK_TIMEOUT_MS`. */
+  hookTimeoutMs?: number | bigint
+  /** `"fail_open"` (default) or `"fail_closed"`. `ASTER_HOOK_FAILURE_MODE`. */
+  hookFailureMode?: string
+  /** Relay-only: disable direct IP transports. `ASTER_CLEAR_IP_TRANSPORTS`. */
+  clearIpTransports?: boolean
+  /** Direct-only: disable relay transports. `ASTER_CLEAR_RELAY_TRANSPORTS`. */
+  clearRelayTransports?: boolean
+  /**
+   * UPnP / NAT-PMP port mapping; unset = default (enabled).
+   * `ASTER_PORTMAPPER_CONFIG` (`enabled` / `disabled`).
+   */
+  portmapper?: boolean
+  /** HTTP/SOCKS proxy URL. `ASTER_PROXY_URL`. */
+  proxyUrl?: string
+  /** Read the proxy from `HTTP(S)_PROXY`. `ASTER_PROXY_FROM_ENV`. */
+  proxyFromEnv?: boolean
+  /** Maximum concurrent incoming bidirectional streams. */
+  transportMaxConcurrentBidiStreams?: number | bigint
+  /** Maximum concurrent incoming unidirectional streams. */
+  transportMaxConcurrentUniStreams?: number | bigint
+  /** Per-stream receive window in bytes. */
+  transportStreamReceiveWindow?: number | bigint
+  /** Per-connection receive window in bytes. */
+  transportReceiveWindow?: number | bigint
+  /** Send window in bytes. */
+  transportSendWindow?: number | bigint
+  /** Idle timeout in milliseconds. */
+  transportMaxIdleTimeoutMs?: number | bigint
+  /** Keep-alive interval in milliseconds. */
+  transportKeepAliveIntervalMs?: number | bigint
+  /** Initial UDP payload size before MTU discovery (u16). */
+  transportInitialMtu?: number
+  /** Incoming datagram buffer in bytes; `0` disables incoming datagrams. */
+  transportDatagramReceiveBufferSize?: number | bigint
+  /** Outgoing datagram buffer in bytes. */
+  transportDatagramSendBufferSize?: number | bigint
+  /** Fair scheduling across send streams at the same priority. */
+  transportSendFairness?: boolean
+  /** UDP generic segmentation offload when supported. */
+  transportEnableSegmentationOffload?: boolean
+  /**
+   * Extra inbound ALPNs (merged with the built-in protocols). Not loaded
+   * from env / TOML.
+   */
+  alpns?: Array<Buffer>
+  /** `"text"` or `"json"`. `ASTER_LOG_FORMAT`, `[logging] format`. */
+  logFormat?: string
+  /** `"debug"`, `"info"`, `"warning"`, `"error"`. `ASTER_LOG_LEVEL`. */
+  logLevel?: string
+  /** Mask sensitive fields in logs. `ASTER_LOG_MASK`. */
+  logMask?: boolean
+  /** Health HTTP port; `0` disables. `ASTER_HEALTH_PORT`, `[health] port`. */
+  healthPort?: number
+  /** Health HTTP host. `ASTER_HEALTH_HOST`, `[health] host`. */
+  healthHost?: string
+}
+
+/**
+ * Defaults overlaid with `ASTER_*` environment variables (the Rust
+ * `AsterConfig::from_env` loader). Every field is filled in.
+ */
+export declare function asterConfigFromEnv(): AsterConfig
+
+/**
+ * Defaults < `aster.toml` at `path` < `ASTER_*` environment (the Rust
+ * `AsterConfig::from_file` loader). Every field is filled in.
+ */
+export declare function asterConfigFromFile(path: string): AsterConfig
+
+/**
+ * Normalise a config through Rust: validates every field and returns it
+ * with defaults filled in (`fromEnv`-shaped). Does not read env or files.
+ */
+export declare function asterConfigResolve(config: AsterConfig): AsterConfig
+
+/**
+ * The deployment root public key (hex) from `rootPubkey` / `rootPubkeyFile`
+ * (Rust `AsterConfig::resolve_root_pubkey`): both are read and must agree; a
+ * missing file falls back to `rootPubkey`; a malformed one is an error.
+ */
+export declare function asterConfigResolveRootPubkey(config: AsterConfig): string | null
+
+/** `[node] secret_key` plus the selected peer from `.aster-identity`. */
+export interface AsterIdentity {
+  /** The file that was loaded. */
+  path: string
+  /** `[node] secret_key` as 64 hex characters, if present. */
+  secretKey?: string
+  /** The selected peer, if any matched. */
+  peer?: IdentityPeer
 }
 
 /** Decode an AsterTicket from compact binary wire format. */
@@ -740,68 +902,6 @@ export declare function encodeRpcStatus(s: NativeRpcStatus): Buffer
 /** Encode a `StreamHeader` to AEv1 bytes. */
 export declare function encodeStreamHeader(h: NativeStreamHeader): Buffer
 
-/**
- * Endpoint configuration for `IrohNode.memoryWithAlpns` / `persistentWithAlpns`.
- *
- * Mirrors `bindings/python/rust/src/net.rs::EndpointConfig` so the same
- * surface is available across PyO3 and NAPI bindings. All fields are
- * optional with sensible defaults; pass `undefined` to use core defaults.
- */
-export interface EndpointConfig {
-  /** Relay mode: `"default"`, `"disabled"`, or `"staging"`. */
-  relayMode?: string
-  /** Optional 32-byte secret key for the endpoint identity. */
-  secretKey?: Buffer
-  /** Enable connection monitoring / remote-info tracking (Phase 1b). */
-  enableMonitoring?: boolean
-  /** Enable endpoint hooks (before_connect / after_handshake callbacks). */
-  enableHooks?: boolean
-  /** Timeout in ms for hook replies (default 5000). */
-  hookTimeoutMs?: number
-  /** Post-handshake hook fallback mode: `"fail_open"` (default) or `"fail_closed"`. */
-  hookFailureMode?: string
-  /** Bind address e.g. `"0.0.0.0:9000"`, `"127.0.0.1:0"`, `"[::]:0"`. */
-  bindAddr?: string
-  /** Relay-only mode: disable all direct IP (UDP/QUIC) transports. */
-  clearIpTransports?: boolean
-  /** Direct IP-only mode: disable all relay transports. */
-  clearRelayTransports?: boolean
-  /** Portmapper (UPnP/NAT-PMP): `"enabled"` (default) or `"disabled"`. */
-  portmapperConfig?: string
-  /** HTTP/SOCKS proxy URL for relay/HTTPS traffic e.g. `"http://proxy:8080"`. */
-  proxyUrl?: string
-  /** Read proxy from `HTTP_PROXY` / `HTTPS_PROXY` environment variables. */
-  proxyFromEnv?: boolean
-  /** Maximum number of incoming bidirectional QUIC streams. */
-  transportMaxConcurrentBidiStreams?: number
-  /** Maximum number of incoming unidirectional QUIC streams. */
-  transportMaxConcurrentUniStreams?: number
-  /** Per-stream QUIC receive window in bytes. */
-  transportStreamReceiveWindow?: number
-  /** Per-connection QUIC receive window in bytes. */
-  transportReceiveWindow?: number
-  /** QUIC send window in bytes. */
-  transportSendWindow?: number
-  /** QUIC idle timeout in milliseconds. */
-  transportMaxIdleTimeoutMs?: number
-  /** QUIC keep-alive interval in milliseconds. */
-  transportKeepAliveIntervalMs?: number
-  /** Initial QUIC UDP payload size before MTU discovery. */
-  transportInitialMtu?: number
-  /** Incoming QUIC application datagram buffer in bytes. Zero disables incoming datagrams. */
-  transportDatagramReceiveBufferSize?: number
-  /** Outgoing QUIC application datagram buffer in bytes. */
-  transportDatagramSendBufferSize?: number
-  /** Whether to use fair scheduling across send streams at the same priority. */
-  transportSendFairness?: boolean
-  /** Whether to use UDP generic segmentation offload when supported. */
-  transportEnableSegmentationOffload?: boolean
-  /** Enable mDNS local network discovery (default: false). */
-  enableLocalDiscovery?: boolean
-  /** Node data directory for persistent state; empty = no persistent state. */
-  dataDir?: string
-}
-
 /** Frame flag: per-call header in a session stream (payload is a `CallHeader`). */
 export const FLAG_CALL: number
 
@@ -878,6 +978,32 @@ export declare function hpkePublicKeyFromPrivate(privateKey: Buffer): Buffer
 
 export declare function hpkeSeal(recipientPublicKey: Buffer, associatedData: Buffer, plaintext: Buffer): HpkeEnvelopeObject
 
+/** A `[[peers]]` entry selected from `.aster-identity`. */
+export interface IdentityPeer {
+  name?: string
+  role?: string
+  /** Root public key (hex). */
+  rootPubkey?: string
+  /** `type` in TOML, e.g. `"policy"`. */
+  credentialType?: string
+  expiresAt?: number
+  endpointId?: string
+  signature?: string
+  /** Peer attributes; `aster.role` / `aster.name` synthesized when absent. */
+  attributes: Record<string, string>
+  /** Published-service metadata (service name → JSON values). */
+  publishedServices: any
+}
+
+/**
+ * Load a `.aster-identity` file (Rust `AsterConfig::load_identity`).
+ *
+ * `path` defaults to `./.aster-identity`. Peer selection: `peerName` wins,
+ * else the first peer with `role`, else the first peer. Returns `null` when
+ * the file does not exist; a malformed file is an error.
+ */
+export declare function loadAsterIdentity(path?: string | undefined | null, peerName?: string | undefined | null, role?: string | undefined | null): AsterIdentity | null
+
 /** Largest size a compressed payload may expand to, bytes. */
 export const MAX_DECOMPRESSED_SIZE: number
 
@@ -934,6 +1060,14 @@ export interface NativeStreamHeader {
 }
 
 /**
+ * Parse TOML text into plain JS values (tables → objects, arrays → arrays).
+ * Used by the frozen credential readers that need the raw `[[peers]]`
+ * entries (signed attributes must not be rewritten). Datetimes become
+ * RFC 3339 strings.
+ */
+export declare function parseToml(text: string): any
+
+/**
  * The logical payload of a received frame: decompressed (with the 16 MiB
  * cap) if `flags` carries `FLAG_COMPRESSED`, otherwise a copy of `payload`.
  */
@@ -973,11 +1107,35 @@ export interface RecvFrameResult {
   kind: number
 }
 
+/** Generate a fresh 32-byte node secret key (OS CSPRNG), as 64 hex characters. */
+export declare function secretKeyGenerate(): string
+
+/**
+ * Load the secret key file at `path`, creating it with a fresh key first if
+ * it does not exist. Returns the key as 64 hex characters.
+ */
+export declare function secretKeyLoadOrGenerate(path: string): string
+
+/** The public key / `NodeId` (hex) of a secret key (hex). */
+export declare function secretKeyPublic(secretKey: string): string
+
+/**
+ * Read a secret key file (64 hex characters). Returns `null` when the file
+ * does not exist; a malformed file is an error.
+ */
+export declare function secretKeyReadFile(path: string): string | null
+
+/**
+ * Write `secretKey` (64 hex) to a new secret key file (mode 0600, parent
+ * directories created). Refuses to overwrite an existing file.
+ */
+export declare function secretKeyWriteFile(path: string, secretKey: string): void
+
 /**
  * Start a reactor that owns its own accept loop on the given node.
  * Suitable when the server only serves the Aster ALPN.
  */
-export declare function startReactor(node: IrohNode, channelCapacity: number): ReactorHandle
+export declare function startReactor(node: Node, channelCapacity: number): ReactorHandle
 
 /**
  * Selected QUIC path snapshot exposed to JS. `peerAddr` and `relayUrl`

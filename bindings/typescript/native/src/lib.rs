@@ -1,8 +1,8 @@
 //! NAPI-RS bindings for Aster transport.
 //!
-//! Wraps `aster_transport_core` to expose Iroh P2P networking to
-//! Node.js/Bun/Deno via NAPI. Mirrors the PyO3 bindings in
-//! `bindings/python/rust/src/`.
+//! Wraps the `aster` crate (`Node`, `AsterConfig`, identity files — plan D1)
+//! and, through `aster::binding_support`, the transport-core pieces the
+//! binding still drives directly (reactor, call pool, tunnels, hooks).
 
 #![allow(dead_code)] // NAPI exports are called from JavaScript, not Rust tests.
 
@@ -10,6 +10,7 @@ use napi_derive::napi;
 
 mod blobs;
 mod call;
+mod config;
 mod contract;
 mod crypto;
 mod docs;

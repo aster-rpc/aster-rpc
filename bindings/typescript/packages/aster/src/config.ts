@@ -1,316 +1,296 @@
 /**
- * AsterConfig — configuration resolution.
+ * AsterConfig — node / server / client configuration.
  *
- * Three-layer resolution order:
- * 1. Built-in defaults
- * 2. Config file (aster.config.ts, aster.toml, .asterrc)
- * 3. Environment variables (ASTER_* prefix, always win)
+ * A typed options object lowered onto the Rust `aster::AsterConfig`. Loading
+ * is done by the Rust loaders (plan D1), so env / TOML semantics are the same
+ * in every binding (`docs/aster-rust-getstarted.md` §2.2):
+ *
+ *   defaults < `aster.toml` ({@link AsterConfig.fromFile}) <
+ *   `ASTER_*` env ({@link AsterConfig.fromEnv}) < fields set in code
+ *
+ * @example
+ * ```ts
+ * await using node = await Node.start({
+ *   ...AsterConfig.fromEnv(),
+ *   storagePath: '/var/lib/my-app',
+ *   secretKeyFile: '/var/lib/my-app/node.key',
+ * });
+ * ```
  */
 
+import type {
+  AsterConfig as NativeAsterConfig,
+  AsterIdentity as NativeAsterIdentity,
+} from '@aster-rpc/transport';
+import { loadNative } from './native.js';
+
+/** Relay selection. A bare relay URL is also accepted (means `custom`). */
+export type RelayModeName = 'default' | 'staging' | 'disabled' | 'custom';
+/** What a Gate 0 hook does when the host does not answer in time. */
+export type HookFailureMode = 'fail_open' | 'fail_closed';
+/** Log output format. */
+export type LogFormat = 'text' | 'json';
+/** Log level. */
+export type LogLevel = 'debug' | 'info' | 'warning' | 'error';
+/** A 32-byte key: 64 hex characters or the raw bytes. */
+export type KeyMaterial = string | Uint8Array;
+
 /**
- * Aster configuration.
+ * Aster configuration. Every field is optional; omitted fields take the Rust
+ * defaults. The loaders return every field filled in (keys as hex strings).
+ *
+ * The `u64` knobs accept `number` or `bigint`; loaders return a `number`
+ * unless the value exceeds `Number.MAX_SAFE_INTEGER`.
+ *
  * @group Server and Client
  */
-
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-
 export interface AsterConfig {
-  // Trust
-  rootPubkey?: Uint8Array;
+  // ── Trust ──────────────────────────────────────────────────────────────
+  /** Deployment root public key. `ASTER_ROOT_PUBKEY`, `[trust] root_pubkey`. */
+  rootPubkey?: KeyMaterial;
+  /** File with the root public key (hex or `{"public_key": "<hex>"}`). */
   rootPubkeyFile?: string;
+  /** Enrollment credential file. `ASTER_ENROLLMENT_CREDENTIAL`. */
   enrollmentCredentialFile?: string;
-  allowAllConsumers: boolean;
+  /** Cloud instance identity token. `ASTER_ENROLLMENT_CREDENTIAL_IID`. */
+  enrollmentCredentialIid?: string;
+  /** Skip the consumer admission gate (dev mode). `ASTER_ALLOW_ALL_CONSUMERS`. */
+  allowAllConsumers?: boolean;
   /**
-   * Kept for config-schema parity with the Rust `AsterConfig`. Producer mesh
-   * admission is not supported by the TypeScript binding, so only `true` is
-   * accepted; `AsterServer` throws on `false`.
+   * Kept for schema parity with Rust. Producer mesh admission is not
+   * supported by the TypeScript binding: `AsterServer` throws on `false`.
    */
-  allowAllProducers: boolean;
+  allowAllProducers?: boolean;
 
-  // Connect
+  // ── Connect ────────────────────────────────────────────────────────────
+  /** Producer address for consumer-side dialing. `ASTER_ENDPOINT_ADDR`. */
   endpointAddr?: string;
 
-  // Storage
+  // ── Storage ────────────────────────────────────────────────────────────
+  /** Persistent node directory; in-memory when unset. `ASTER_STORAGE_PATH`. */
   storagePath?: string;
+  /** Blob GC interval (ms); `0` / unset = no GC. `ASTER_GC_INTERVAL_MS`. */
+  gcIntervalMs?: number | bigint;
 
-  // Health
-  healthPort: number;
-  healthHost: string;
-
-  // Network
-  secretKey?: Uint8Array;
-  relayMode?: string;
-  bindAddr?: string;
-  enableMonitoring: boolean;
-  enableHooks: boolean;
-  hookTimeoutMs: number;
-
-  // Logging
-  logFormat: 'json' | 'text';
-  logLevel: 'debug' | 'info' | 'warning' | 'error';
-  logMask: boolean;
-
-  // Identity
+  // ── Identity ───────────────────────────────────────────────────────────
+  /** Node secret key. `ASTER_SECRET_KEY`, `[network] secret_key`. */
+  secretKey?: KeyMaterial;
+  /**
+   * Node **secret key file** (64 hex characters) — the one on-disk identity
+   * format shared with Rust and every binding. Loaded at start if it exists
+   * (an explicit `secretKey` that disagrees is an error), otherwise created
+   * (mode 0600) from `secretKey` or a fresh key. `ASTER_SECRET_KEY_FILE`.
+   */
+  secretKeyFile?: string;
+  /** `.aster-identity` credential file. `ASTER_IDENTITY_FILE`, `[identity] file`. */
   identityFile?: string;
+
+  // ── Network ────────────────────────────────────────────────────────────
+  /** `ASTER_RELAY_MODE`, `[network] relay_mode`. */
+  relayMode?: RelayModeName | (string & {});
+  /** Custom relay URLs (implies `custom`). `ASTER_RELAY_URLS`. */
+  relayUrls?: string[];
+  /** Local bind address, e.g. `"0.0.0.0:9000"`. `ASTER_BIND_ADDR`. */
+  bindAddr?: string;
+  /** mDNS local discovery. `ASTER_LOCAL_DISCOVERY`. */
+  localDiscovery?: boolean;
+  /** Connection monitoring. `ASTER_ENABLE_MONITORING`. */
+  enableMonitoring?: boolean;
+  /** Admission hooks (Gate 0). `ASTER_ENABLE_HOOKS`. */
+  enableHooks?: boolean;
+  /** Hook decision timeout (ms, default 5000). `ASTER_HOOK_TIMEOUT_MS`. */
+  hookTimeoutMs?: number | bigint;
+  /** `ASTER_HOOK_FAILURE_MODE`. */
+  hookFailureMode?: HookFailureMode;
+  /** Relay-only. `ASTER_CLEAR_IP_TRANSPORTS`. */
+  clearIpTransports?: boolean;
+  /** Direct-only. `ASTER_CLEAR_RELAY_TRANSPORTS`. */
+  clearRelayTransports?: boolean;
+  /** UPnP / NAT-PMP port mapping; unset = enabled. `ASTER_PORTMAPPER_CONFIG`. */
+  portmapper?: boolean;
+  /** HTTP/SOCKS proxy URL. `ASTER_PROXY_URL`. */
+  proxyUrl?: string;
+  /** Use `HTTP(S)_PROXY`. `ASTER_PROXY_FROM_ENV`. */
+  proxyFromEnv?: boolean;
+
+  // ── QUIC transport (`ASTER_TRANSPORT_*`, `[network] transport_*`) ────────
+  transportMaxConcurrentBidiStreams?: number | bigint;
+  transportMaxConcurrentUniStreams?: number | bigint;
+  /** Per-stream receive window (bytes). */
+  transportStreamReceiveWindow?: number | bigint;
+  /** Per-connection receive window (bytes). */
+  transportReceiveWindow?: number | bigint;
+  /** Send window (bytes). */
+  transportSendWindow?: number | bigint;
+  transportMaxIdleTimeoutMs?: number | bigint;
+  transportKeepAliveIntervalMs?: number | bigint;
+  /** Initial UDP payload size (u16). */
+  transportInitialMtu?: number;
+  /** Incoming datagram buffer (bytes); `0` disables incoming datagrams. */
+  transportDatagramReceiveBufferSize?: number | bigint;
+  transportDatagramSendBufferSize?: number | bigint;
+  transportSendFairness?: boolean;
+  transportEnableSegmentationOffload?: boolean;
+  /** Extra inbound ALPNs beyond blobs / docs / gossip. Not loaded from env. */
+  alpns?: Array<string | Uint8Array>;
+
+  // ── Logging ────────────────────────────────────────────────────────────
+  /** `ASTER_LOG_FORMAT`, `[logging] format`. */
+  logFormat?: LogFormat;
+  /** `ASTER_LOG_LEVEL`, `[logging] level`. */
+  logLevel?: LogLevel;
+  /** Mask sensitive fields. `ASTER_LOG_MASK`. */
+  logMask?: boolean;
+
+  // ── Health (TypeScript binding only) ───────────────────────────────────
+  /** Health HTTP port; `0` disables. `ASTER_HEALTH_PORT`, `[health] port`. */
+  healthPort?: number;
+  /** Health HTTP host. `ASTER_HEALTH_HOST`, `[health] host`. */
+  healthHost?: string;
 }
 
-function envBool(key: string, fallback: boolean): boolean {
-  const v = process.env[key]?.toLowerCase();
-  if (!v) return fallback;
-  return ['true', '1', 'yes', 'on'].includes(v);
+function keyHex(value: KeyMaterial | undefined): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return typeof value === 'string' ? value : Buffer.from(value).toString('hex');
 }
 
-function envInt(key: string, fallback: number): number {
-  const v = process.env[key];
-  if (!v) return fallback;
-  const n = parseInt(v, 10);
-  return isNaN(n) ? fallback : n;
+/** Lower an {@link AsterConfig} to the native object shape. @internal */
+export function toNativeConfig(config: AsterConfig = {}): NativeAsterConfig {
+  const { rootPubkey, secretKey, alpns, ...rest } = config;
+  const out: NativeAsterConfig = {};
+  for (const [k, v] of Object.entries(rest)) {
+    if (v !== undefined && v !== null) (out as Record<string, unknown>)[k] = v;
+  }
+  const root = keyHex(rootPubkey);
+  if (root !== undefined) out.rootPubkey = root;
+  const secret = keyHex(secretKey);
+  if (secret !== undefined) out.secretKey = secret;
+  if (alpns) {
+    out.alpns = alpns.map((a) => (typeof a === 'string' ? Buffer.from(a) : Buffer.from(a)));
+  }
+  return out;
 }
 
-function envString(key: string): string | undefined {
-  return process.env[key] || undefined;
-}
-
-function envBytes(key: string): Uint8Array | undefined {
-  const hex = process.env[key];
-  if (!hex) return undefined;
-  return new Uint8Array(Buffer.from(hex, 'hex'));
-}
-
-/** Load config from environment variables with built-in defaults. */
-export function configFromEnv(): AsterConfig {
-  return {
-    rootPubkey: envBytes('ASTER_ROOT_PUBKEY'),
-    rootPubkeyFile: envString('ASTER_ROOT_PUBKEY_FILE'),
-    enrollmentCredentialFile: envString('ASTER_ENROLLMENT_CREDENTIAL'),
-    allowAllConsumers: envBool('ASTER_ALLOW_ALL_CONSUMERS', false),
-    allowAllProducers: envBool('ASTER_ALLOW_ALL_PRODUCERS', true),
-    endpointAddr: envString('ASTER_ENDPOINT_ADDR'),
-    storagePath: envString('ASTER_STORAGE_PATH'),
-    healthPort: envInt('ASTER_HEALTH_PORT', 0),
-    healthHost: envString('ASTER_HEALTH_HOST') ?? '127.0.0.1',
-    secretKey: envBytes('ASTER_SECRET_KEY'),
-    relayMode: envString('ASTER_RELAY_MODE'),
-    bindAddr: envString('ASTER_BIND_ADDR'),
-    enableMonitoring: envBool('ASTER_ENABLE_MONITORING', false),
-    enableHooks: envBool('ASTER_ENABLE_HOOKS', false),
-    hookTimeoutMs: envInt('ASTER_HOOK_TIMEOUT_MS', 5000),
-    logFormat: (envString('ASTER_LOG_FORMAT') ?? 'text') as 'json' | 'text',
-    logLevel: (envString('ASTER_LOG_LEVEL') ?? 'info') as any,
-    logMask: envBool('ASTER_LOG_MASK', true),
-    identityFile: envString('ASTER_IDENTITY_FILE'),
-  };
+function fromNative(native: NativeAsterConfig): AsterConfig {
+  const out: AsterConfig = {};
+  for (const [k, v] of Object.entries(native)) {
+    if (v !== undefined && v !== null) (out as Record<string, unknown>)[k] = v;
+  }
+  return out;
 }
 
 /**
- * Load config from a TOML file, then overlay env vars.
- *
- * Supports aster.toml with sections: [trust], [connect], [storage],
- * [network], [logging], [health].
+ * Loaders for {@link AsterConfig}, backed by the Rust `aster::AsterConfig`.
+ * @group Server and Client
  */
-export function configFromFile(filePath: string): AsterConfig {
-  const text = readFileSync(filePath, 'utf-8');
-  const toml = parseSimpleToml(text);
-  const base = configFromEnv(); // env always wins
-
-  // Merge TOML values (only if env didn't set them)
-  const trust = toml.trust as Record<string, unknown> | undefined;
-  if (trust) {
-    if (!base.rootPubkey && trust.root_pubkey) {
-      base.rootPubkey = new Uint8Array(Buffer.from(trust.root_pubkey as string, 'hex'));
-    }
-    if (!base.rootPubkeyFile && trust.root_pubkey_file) {
-      base.rootPubkeyFile = trust.root_pubkey_file as string;
-    }
-    if (!base.enrollmentCredentialFile && trust.enrollment_credential) {
-      base.enrollmentCredentialFile = trust.enrollment_credential as string;
-    }
-    if (trust.allow_all_consumers !== undefined && !process.env.ASTER_ALLOW_ALL_CONSUMERS) {
-      base.allowAllConsumers = !!trust.allow_all_consumers;
-    }
-    if (trust.allow_all_producers !== undefined && !process.env.ASTER_ALLOW_ALL_PRODUCERS) {
-      base.allowAllProducers = !!trust.allow_all_producers;
-    }
-  }
-
-  const connect = toml.connect as Record<string, unknown> | undefined;
-  if (connect) {
-    if (!base.endpointAddr && connect.endpoint_addr) {
-      base.endpointAddr = connect.endpoint_addr as string;
-    }
-  }
-
-  const storage = toml.storage as Record<string, unknown> | undefined;
-  if (storage) {
-    if (!base.storagePath && storage.path) {
-      base.storagePath = storage.path as string;
-    }
-  }
-
-  const network = toml.network as Record<string, unknown> | undefined;
-  if (network) {
-    if (!base.secretKey && network.secret_key) {
-      base.secretKey = new Uint8Array(Buffer.from(network.secret_key as string, 'base64'));
-    }
-    if (!base.relayMode && network.relay_mode) {
-      base.relayMode = network.relay_mode as string;
-    }
-    if (!base.bindAddr && network.bind_addr) {
-      base.bindAddr = network.bind_addr as string;
-    }
-    if (network.enable_monitoring !== undefined && !process.env.ASTER_ENABLE_MONITORING) {
-      base.enableMonitoring = !!network.enable_monitoring;
-    }
-    if (network.enable_hooks !== undefined && !process.env.ASTER_ENABLE_HOOKS) {
-      base.enableHooks = !!network.enable_hooks;
-    }
-    if (network.hook_timeout_ms !== undefined && !process.env.ASTER_HOOK_TIMEOUT_MS) {
-      base.hookTimeoutMs = network.hook_timeout_ms as number;
-    }
-  }
-
-  const logging = toml.logging as Record<string, unknown> | undefined;
-  if (logging) {
-    if (!process.env.ASTER_LOG_FORMAT && logging.format) {
-      base.logFormat = logging.format as 'json' | 'text';
-    }
-    if (!process.env.ASTER_LOG_LEVEL && logging.level) {
-      base.logLevel = logging.level as any;
-    }
-    if (!process.env.ASTER_LOG_MASK && logging.mask !== undefined) {
-      base.logMask = !!logging.mask;
-    }
-  }
-
-  const health = toml.health as Record<string, unknown> | undefined;
-  if (health) {
-    if (!process.env.ASTER_HEALTH_PORT && health.port !== undefined) {
-      base.healthPort = health.port as number;
-    }
-    if (!process.env.ASTER_HEALTH_HOST && health.host) {
-      base.healthHost = health.host as string;
-    }
-  }
-
-  return base;
-}
-
-/** Parsed identity data from a .aster-identity TOML file. */
-export interface IdentityData {
-  node: Record<string, unknown>;
-  peers: Record<string, unknown>[];
-  published_services: Record<string, Record<string, unknown>>;
-}
+export const AsterConfig = {
+  /** Defaults overlaid with `ASTER_*` environment variables. */
+  fromEnv(): AsterConfig {
+    return fromNative(loadNative().asterConfigFromEnv());
+  },
+  /** Defaults < the `aster.toml` at `path` < `ASTER_*` environment. */
+  fromFile(path: string): AsterConfig {
+    return fromNative(loadNative().asterConfigFromFile(path));
+  },
+  /**
+   * Validate `config` in Rust and return it with every default filled in.
+   * Reads neither env nor files.
+   */
+  resolve(config: AsterConfig = {}): AsterConfig {
+    return fromNative(loadNative().asterConfigResolve(toNativeConfig(config)));
+  },
+};
 
 /**
- * Load and parse an .aster-identity TOML file.
- *
- * Synthesizes ``aster.role`` and ``aster.name`` into each peer's
- * ``attributes`` from the top-level ``role`` and ``name`` fields.
- * Merges the top-level ``[published_services.*]`` into each peer's
- * ``published_services`` so callers always see a complete peer dict.
- *
- * Returns the full parsed identity or null if the file doesn't exist.
+ * The deployment root public key (hex) from `rootPubkey` / `rootPubkeyFile`
+ * (Rust `AsterConfig::resolve_root_pubkey`). Both are read and must agree; a
+ * missing file falls back to `rootPubkey`; a malformed file throws.
  */
-export function loadIdentityFile(
-  filePath?: string,
-): IdentityData | null {
-  const path = filePath ?? join(process.cwd(), '.aster-identity');
-  if (!existsSync(path)) return null;
+export function resolveRootPubkey(config: AsterConfig): string | undefined {
+  return loadNative().asterConfigResolveRootPubkey(toNativeConfig(config)) ?? undefined;
+}
 
-  try {
-    const text = readFileSync(path, 'utf-8');
-    const data = parseSimpleToml(text);
+// ── .aster-identity credential files (frozen auth, plan D3) ─────────────────
 
-    const node = (data.node ?? {}) as Record<string, unknown>;
-    const peers = (data.peers ?? []) as Record<string, unknown>[];
-    const publishedServices = (data.published_services ?? {}) as Record<string, Record<string, unknown>>;
+/** A `[[peers]]` entry selected from `.aster-identity`. */
+export interface IdentityPeer {
+  name?: string;
+  role?: string;
+  /** Root public key (hex). */
+  rootPubkey?: string;
+  /** `type` in TOML, e.g. `"policy"`. */
+  credentialType?: string;
+  expiresAt?: number;
+  endpointId?: string;
+  signature?: string;
+  /** Attributes; `aster.role` / `aster.name` synthesized when absent. */
+  attributes: Record<string, string>;
+  /** Published-service metadata (service name → fields). */
+  publishedServices: Record<string, Record<string, unknown>>;
+}
 
-    // Synthesize aster.role / aster.name into attributes, merge published_services
-    for (const peer of peers) {
-      const attrs = (peer.attributes ?? {}) as Record<string, unknown>;
-      if (!('aster.role' in attrs) && peer.role) {
-        attrs['aster.role'] = peer.role;
-      }
-      if (!('aster.name' in attrs) && peer.name) {
-        attrs['aster.name'] = peer.name;
-      }
-      peer.attributes = attrs;
-
-      // Each peer gets the top-level published_services as default
-      if (!peer.published_services) {
-        peer.published_services = publishedServices;
-      }
-    }
-
-    return { node, peers, published_services: publishedServices };
-  } catch {
-    return null;
-  }
+/** `[node] secret_key` and the selected peer from `.aster-identity`. */
+export interface AsterIdentity {
+  /** The file that was loaded. */
+  path: string;
+  /** `[node] secret_key` as 64 hex characters, if present. */
+  secretKey?: string;
+  /** The selected peer, if any. */
+  peer?: IdentityPeer;
 }
 
 /**
- * Load identity from a .aster-identity TOML file.
+ * Load a `.aster-identity` credential file (Rust `AsterConfig::load_identity`).
  *
- * Returns secretKey + matching peer, or null if not found.
- * This is the simple convenience wrapper; use loadIdentityFile()
- * for full access to published_services and all peers.
+ * `path` defaults to `./.aster-identity`. Peer selection: `peerName` wins,
+ * else the first peer with `role`, else the first peer. Returns `null` when
+ * the file does not exist; a malformed file throws.
  */
 export function loadIdentity(
-  filePath?: string,
+  path?: string,
   peerName?: string,
   role?: string,
-): { secretKey: Uint8Array; peer: Record<string, unknown> } | null {
-  const identity = loadIdentityFile(filePath);
-  if (!identity) return null;
-
-  const node = identity.node;
-  if (!node?.secret_key) return null;
-  const secretKey = new Uint8Array(Buffer.from(node.secret_key as string, 'base64'));
-
-  // Find matching peer
-  let peer: Record<string, unknown> | undefined;
-  if (peerName) {
-    peer = identity.peers.find(p => p.name === peerName);
-  } else if (role) {
-    peer = identity.peers.find(p => p.role === role);
-  } else {
-    peer = identity.peers[0];
+): AsterIdentity | null {
+  const raw: NativeAsterIdentity | null = loadNative().loadAsterIdentity(path, peerName, role);
+  if (!raw) return null;
+  const out: AsterIdentity = { path: raw.path };
+  if (raw.secretKey) out.secretKey = raw.secretKey;
+  if (raw.peer) {
+    const p = raw.peer;
+    const peer: IdentityPeer = {
+      attributes: { ...p.attributes },
+      publishedServices: (p.publishedServices ?? {}) as Record<string, Record<string, unknown>>,
+    };
+    if (p.name != null) peer.name = p.name;
+    if (p.role != null) peer.role = p.role;
+    if (p.rootPubkey != null) peer.rootPubkey = p.rootPubkey;
+    if (p.credentialType != null) peer.credentialType = p.credentialType;
+    if (p.expiresAt != null) peer.expiresAt = p.expiresAt;
+    if (p.endpointId != null) peer.endpointId = p.endpointId;
+    if (p.signature != null) peer.signature = p.signature;
+    out.peer = peer;
   }
-
-  return { secretKey, peer: peer ?? {} };
+  return out;
 }
 
 /**
- * Find a peer entry by name or role from parsed identity data.
+ * Parse TOML text with the Rust `toml` crate into plain values. Used by the
+ * frozen credential readers, which need the raw `[[peers]]` entries.
+ * @internal
  */
-export function findPeer(
-  identity: IdentityData,
-  name?: string,
-  role?: string,
-): Record<string, unknown> | undefined {
-  for (const peer of identity.peers) {
-    if (name !== undefined && peer.name === name) return peer;
-    if (name === undefined && role !== undefined && peer.role === role) return peer;
-  }
-  return undefined;
+export function parseToml(text: string): Record<string, unknown> {
+  return loadNative().parseToml(text) as Record<string, unknown>;
 }
 
 /**
- * Extract producer tokens from a peer's published_services.
- *
- * Returns a map of service name to token data (entries that
- * have a ``producer_token`` field).
+ * Producer tokens in a peer's published services: service name → entry, for
+ * entries that carry a `producer_token`.
  */
 export function getProducerTokens(
-  peer: Record<string, unknown>,
+  peer: Pick<IdentityPeer, 'publishedServices'>,
 ): Record<string, Record<string, unknown>> {
-  const published = peer.published_services as Record<string, Record<string, unknown>> | undefined;
-  if (!published || typeof published !== 'object') return {};
-
   const tokens: Record<string, Record<string, unknown>> = {};
-  for (const [svcName, entry] of Object.entries(published)) {
+  for (const [svcName, entry] of Object.entries(peer.publishedServices ?? {})) {
     if (entry && typeof entry === 'object' && entry.producer_token) {
       tokens[svcName] = entry;
     }
@@ -318,204 +298,27 @@ export function getProducerTokens(
   return tokens;
 }
 
-/**
- * Minimal TOML parser for config files.
- * Handles sections (including dotted like [a.b]), array-of-tables,
- * strings, numbers, booleans, inline tables, and simple arrays.
- * Not a full TOML parser.
- */
-export function parseSimpleToml(text: string): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  let currentSection: Record<string, unknown> = result;
-
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-
-    // Array of tables [[name]]
-    const arrayMatch = trimmed.match(/^\[\[([^\]]+)\]\]$/);
-    if (arrayMatch) {
-      const name = arrayMatch[1]!;
-      if (!Array.isArray(result[name])) result[name] = [];
-      const entry: Record<string, unknown> = {};
-      (result[name] as Record<string, unknown>[]).push(entry);
-      currentSection = entry;
-      continue;
-    }
-
-    // Section header [name] or [name.subkey]
-    const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
-    if (sectionMatch) {
-      const name = sectionMatch[1]!;
-      const dotIdx = name.indexOf('.');
-      if (dotIdx !== -1) {
-        // Dotted section: [parent.child] → result.parent.child = {}
-        const parent = name.slice(0, dotIdx);
-        const child = name.slice(dotIdx + 1);
-        if (!result[parent] || typeof result[parent] !== 'object' || Array.isArray(result[parent])) {
-          result[parent] = {};
-        }
-        const parentObj = result[parent] as Record<string, unknown>;
-        parentObj[child] = parentObj[child] ?? {};
-        currentSection = parentObj[child] as Record<string, unknown>;
-      } else {
-        result[name] = result[name] ?? {};
-        currentSection = result[name] as Record<string, unknown>;
-      }
-      continue;
-    }
-
-    // Key = value
-    const kvMatch = trimmed.match(/^(\w+)\s*=\s*(.+)$/);
-    if (kvMatch) {
-      const [, key, rawValue] = kvMatch;
-      currentSection[key!] = parseTomlValue(rawValue!.trim());
-    }
-  }
-
-  return result;
-}
-
-function splitTopLevel(s: string, sep: string): string[] {
-  const out: string[] = [];
-  let depth = 0;
-  let inStr: string | null = null;
-  let buf = '';
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i]!;
-    if (inStr) {
-      if (ch === inStr) inStr = null;
-      buf += ch;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      inStr = ch;
-      buf += ch;
-      continue;
-    }
-    if (ch === '{' || ch === '[') depth++;
-    else if (ch === '}' || ch === ']') depth--;
-    if (ch === sep && depth === 0) {
-      out.push(buf);
-      buf = '';
-      continue;
-    }
-    buf += ch;
-  }
-  if (buf.length > 0) out.push(buf);
-  return out;
-}
-
-function findTopLevelEquals(s: string): number {
-  let inStr: string | null = null;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i]!;
-    if (inStr) {
-      if (ch === inStr) inStr = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      inStr = ch;
-      continue;
-    }
-    if (ch === '=') return i;
-  }
-  return -1;
-}
-
-function parseTomlValue(raw: string): unknown {
-  // Quoted string
-  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
-    return raw.slice(1, -1);
-  }
-  // Boolean
-  if (raw === 'true') return true;
-  if (raw === 'false') return false;
-  // Number
-  const num = Number(raw);
-  if (!isNaN(num) && raw !== '') return num;
-  // Inline table { key = "val", ... }
-  if (raw.startsWith('{') && raw.endsWith('}')) {
-    const inner = raw.slice(1, -1).trim();
-    if (!inner) return {};
-    const obj: Record<string, unknown> = {};
-    for (const pair of splitTopLevel(inner, ',')) {
-      const eqIdx = findTopLevelEquals(pair);
-      if (eqIdx === -1) continue;
-      const k = pair.slice(0, eqIdx).trim().replace(/^["']|["']$/g, '');
-      const v = pair.slice(eqIdx + 1).trim();
-      obj[k] = parseTomlValue(v);
-    }
-    return obj;
-  }
-  // Array (simple flat arrays)
-  if (raw.startsWith('[') && raw.endsWith(']')) {
-    const inner = raw.slice(1, -1).trim();
-    if (!inner) return [];
-    return inner.split(',').map(v => parseTomlValue(v.trim()));
-  }
-  return raw;
-}
-
-/**
- * Load endpoint config from a file path (alias for configFromFile).
- */
-export function loadEndpointConfig(filePath: string): AsterConfig {
-  return configFromFile(filePath);
-}
-
-/**
- * Resolve the root public key from config (raw bytes or from file).
- * Returns undefined if neither is set.
- */
-export function resolveRootPubkey(config: AsterConfig): Uint8Array | undefined {
-  if (config.rootPubkey) return config.rootPubkey;
-  if (config.rootPubkeyFile) {
-    try {
-      const raw = readFileSync(config.rootPubkeyFile, 'utf-8').trim();
-      // Support both raw hex and JSON {"public_key": "hex"} format
-      let hex = raw;
-      if (raw.startsWith('{')) {
-        try { hex = JSON.parse(raw).public_key; } catch { /* fall through */ }
-      }
-      return new Uint8Array(Buffer.from(hex, 'hex'));
-    } catch { return undefined; }
-  }
-  return undefined;
-}
-
-/**
- * Convert AsterConfig to an endpoint-specific config subset.
- * Returns the config fields relevant to network endpoint setup.
- */
-export function toEndpointConfig(config: AsterConfig): Record<string, unknown> {
-  return {
-    secretKey: config.secretKey,
-    bindAddr: config.bindAddr,
-    relayMode: config.relayMode,
-    storagePath: config.storagePath,
-  };
-}
-
-/** Print resolved config (masks sensitive values). */
+/** Print a resolved config (sensitive values masked). */
 export function printConfig(config: AsterConfig): void {
-  const mask = (v: unknown) => v ? '****' : '<not set>';
+  const mask = (v: unknown) => (v ? '****' : '<not set>');
+  const root = keyHex(config.rootPubkey);
   console.log(`  [trust]`);
-  console.log(`    root_pubkey             : ${config.rootPubkey ? `${Buffer.from(config.rootPubkey).toString('hex').slice(0, 8)}...` : '<not set>'}`);
-  console.log(`    allow_all_consumers     : ${config.allowAllConsumers}`);
-  console.log(`    allow_all_producers     : ${config.allowAllProducers}`);
+  console.log(`    root_pubkey             : ${root ? `${root.slice(0, 8)}...` : '<not set>'}`);
+  console.log(`    allow_all_consumers     : ${config.allowAllConsumers ?? false}`);
+  console.log(`    allow_all_producers     : ${config.allowAllProducers ?? true}`);
   console.log(`  [connect]`);
   console.log(`    endpoint_addr           : ${config.endpointAddr ?? '<not set>'}`);
   console.log(`  [network]`);
   console.log(`    secret_key              : ${mask(config.secretKey)}`);
+  console.log(`    secret_key_file         : ${config.secretKeyFile ?? '<not set>'}`);
   console.log(`    relay_mode              : ${config.relayMode ?? '<default>'}`);
   console.log(`    bind_addr               : ${config.bindAddr ?? '<any>'}`);
   console.log(`  [storage]`);
   console.log(`    path                    : ${config.storagePath ?? '<in-memory>'}`);
   console.log(`  [logging]`);
-  console.log(`    format                  : ${config.logFormat}`);
-  console.log(`    level                   : ${config.logLevel}`);
+  console.log(`    format                  : ${config.logFormat ?? 'text'}`);
+  console.log(`    level                   : ${config.logLevel ?? 'info'}`);
   console.log(`  [health]`);
   console.log(`    port                    : ${config.healthPort || 'disabled'}`);
-  console.log(`    host                    : ${config.healthHost}`);
+  console.log(`    host                    : ${config.healthHost ?? '127.0.0.1'}`);
 }

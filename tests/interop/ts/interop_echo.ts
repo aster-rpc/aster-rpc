@@ -108,7 +108,8 @@ async function serve(): Promise<void> {
 async function runClient(ticket: string): Promise<boolean> {
   const native = loadNative();
   const codec = registerAll();
-  const node = await native.IrohNode.memoryWithAlpns([RPC_ALPN], {
+  const node = await native.Node.start({
+    alpns: [RPC_ALPN],
     relayMode: 'disabled',
     bindAddr: '127.0.0.1:0',
   });

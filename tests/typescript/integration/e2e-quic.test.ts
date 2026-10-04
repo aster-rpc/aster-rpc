@@ -4,7 +4,7 @@
  * Requires the NAPI-RS native addon to be built:
  *   cd native && npx napi build --release --platform
  *
- * Creates two IrohNodes (in-memory), connects them, runs an RPC server
+ * Creates two Nodes (in-memory), connects them, runs an RPC server
  * on one, and calls it from the other via IrohTransport.
  */
 
@@ -151,8 +151,8 @@ describe('E2E: TS server + TS client over QUIC', () => {
     const RPC_ALPN = Buffer.from('aster/1');
 
     // Create two in-memory nodes with aster ALPN
-    serverNode = await native.IrohNode.memoryWithAlpns([RPC_ALPN]);
-    clientNode = await native.IrohNode.memory();
+    serverNode = await native.Node.start({ alpns: [RPC_ALPN] });
+    clientNode = await native.Node.start();
 
     // Add peer addresses so they can find each other
     clientNode.addNodeAddr(serverNode);

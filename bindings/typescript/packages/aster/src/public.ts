@@ -101,10 +101,23 @@ export { ProxyClient } from './runtime.js';
 export { AdmissionDeniedError } from './runtime.js';
 
 /**
- * Unified server/client configuration.
+ * Unified node/server/client configuration (`AsterConfig.fromEnv()` /
+ * `AsterConfig.fromFile(path)` use the Rust loaders).
  * @group Server and Client
  */
-export type { AsterConfig } from './config.js';
+export { AsterConfig } from './config.js';
+
+/**
+ * A running Aster node: `await using node = await Node.start(config)`.
+ * @group Node
+ */
+export { Node, NodeId, type NodeAddr } from './node.js';
+
+/**
+ * Node secret keys and secret key files (64 hex characters).
+ * @group Node
+ */
+export { SecretKey } from './secret-key.js';
 
 /**
  * Mark a class as an Aster RPC service.

@@ -12,11 +12,17 @@ crate-type = ["cdylib"]
 
 [dependencies]
 aster_transport_core = { path = "../../../core", version = "=0.3.0" }
-napi = { version = "3", default-features = false, features = ["async", "napi9"] }
+# Plan D1: the binding wraps the `aster` crate (Node, AsterConfig, identity
+# files); core stays a direct dependency for the reactor ring, call pool and
+# tunnels, reached through `aster::binding_support`. Binding profile:
+# default + rpc + metrics + binding-support (see aster/Cargo.toml).
+aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support"] }
+napi = { version = "3", default-features = false, features = ["async", "napi9", "serde-json"] }
 napi-derive = { version = "3", features = ["type-def"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde_json = "1"
+toml = "0.8"
 hex = "0.4"
 
 [build-dependencies]
