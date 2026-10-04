@@ -161,17 +161,16 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub(crate) fn is_noop(&self) -> bool {
-        self.interceptors.is_empty()
-            && self.retry.is_none()
-            && self.circuit_breaker.is_none()
-            && self.deadline.is_none()
+    /// No interceptors, retry or circuit breaker: a call only needs the
+    /// transport (plus a deadline, which the caller applies).
+    pub(crate) fn is_passthrough(&self) -> bool {
+        self.interceptors.is_empty() && self.retry.is_none() && self.circuit_breaker.is_none()
     }
 
     /// Run a unary call through the pipeline. `invoke` performs one transport
     /// round-trip for the (interceptor-transformed) request bytes. Each attempt
     /// re-runs `on_request` on the *original* request with the current
-    /// `ctx.attempt`, applies the deadline, then runs `on_response`; any failure
+    /// `ctx.attempt`, applies `ctx.deadline`, then runs `on_response`; any failure
     /// in that sequence (request/invoke/deadline/response) is routed through
     /// `on_error` and considered for retry, and updates the circuit breaker.
     pub(crate) async fn run_unary<F, Fut>(
@@ -243,7 +242,7 @@ impl Pipeline {
         }
 
         let fut = invoke(req);
-        let resp = match self.deadline {
+        let resp = match ctx.deadline {
             Some(d) => match tokio::time::timeout(d, fut).await {
                 Ok(r) => r?,
                 Err(_) => {

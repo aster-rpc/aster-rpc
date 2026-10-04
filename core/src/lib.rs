@@ -2301,6 +2301,10 @@ pub struct CoreConnection {
     /// is admitted for + the per-service concurrent-stream cap. Dropped
     /// with the connection (mass-revoke), like `tunnels`.
     admissions: Arc<AdmissionState>,
+    /// Last client session id handed out on this connection
+    /// (`next_session_id`). Shared by every clone, so a Rust client and a
+    /// binding client on the same connection never pick the same id.
+    session_ids: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl CoreConnection {
@@ -2329,7 +2333,27 @@ impl CoreConnection {
             // per-connection regardless.
             local_targets: Arc::new(LocalTargetRegistry::new()),
             admissions: Arc::new(AdmissionState::new(DEFAULT_MAX_STREAMS_PER_SERVICE)),
+            session_ids: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    /// Allocate a client session id for this connection: 1, 2, 3, ... in
+    /// order, never reused. The counter is per connection and shared by every
+    /// clone of it, so every client on the connection (Rust or a binding) draws
+    /// from one sequence -- which the server needs, since it treats an id at
+    /// or below the highest it has seen as a closed session (spec
+    /// Aster-session-scoped-services.md, the graveyard rule).
+    ///
+    /// The wire carries the id as an `i32`, so ids stop at `i32::MAX`; after
+    /// that this returns `None`.
+    pub fn next_session_id(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        self.session_ids
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
+                (last < i32::MAX as u32).then_some(last + 1)
+            })
+            .ok()
+            .map(|last| last + 1)
     }
 
     /// Replace this connection's L7 acceptor map with a node-shared one, so a

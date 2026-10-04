@@ -44,6 +44,9 @@ rand_core = { version = "0.9", features = ["os_rng"] }
 # Test-only ingress counters (see reactor::ingress_metrics). Never on in a
 # shipping build; the tests that need them enable them explicitly.
 ingress-metrics = []
+# Test-only fault injection (see reactor::test_hooks). Never on in a shipping
+# build; the tests that need it enable it explicitly.
+test-hooks = []
 # Ownership-attestation chain. Apache Fory is now a core dependency because
 # simple trust-config primitives also use Fory XLANG.
 attestation = ["dep:thiserror", "dep:base64"]

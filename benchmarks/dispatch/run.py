@@ -3,9 +3,10 @@
 
 Starts each ``InteropEcho`` server (``tests/interop/`` Rust/Python/TS, plus
 ``tests/interop/java/InteropEcho.java``), drives it with its own-language
-client and with the Rust load driver (``driver.rs``, pooled and unpooled
-unary), repeats every configuration ``--runs`` times (fresh server per run,
-runs interleaved across configurations), and reports the median of each
+client and with the Rust load driver (``driver.rs``: the raw pooled path and
+``RpcConnection::unary``, pooled since R3d), repeats every configuration
+``--runs`` times (fresh server per run, runs interleaved across
+configurations), and reports the median of each
 metric. Results go to ``--out`` (JSON, raw runs + medians) and stdout
 (markdown tables).
 
@@ -295,7 +296,7 @@ def tables(res: dict) -> str:
 def client_label(server: str, client: str) -> str:
     if client == "own":
         return {"rust": "rust (pooled)", "python": "python", "ts": "ts (bun)", "java": "java"}[server]
-    return {"rust": "rust driver (pooled)", "rust-rpc": "rust driver (RpcConnection, unpooled)"}[client]
+    return {"rust": "rust driver (pooled)", "rust-rpc": "rust driver (RpcConnection)"}[client]
 
 
 def main() -> int:

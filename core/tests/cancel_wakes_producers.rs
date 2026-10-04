@@ -478,3 +478,56 @@ async fn a_framing_violation_resets_with_its_own_code_and_spares_the_connection(
     accept.abort();
     Ok(())
 }
+
+/// A client that resets its send side has abandoned the call: that is a
+/// cancel, even when no `FLAG_CANCEL` frame arrives.
+///
+/// Clients cancel by writing `FLAG_CANCEL` and then resetting, and a reset lets
+/// QUIC discard data the server has not read yet -- the cancel frame included.
+/// The reader used to treat the reset like a clean EOF, so a handler that was
+/// not producing (here: a unary call that never answers) was never told.
+#[tokio::test]
+async fn a_request_side_reset_cancels_the_call_in_flight() -> Result<()> {
+    let (conn, _server, _client, pair) = setup().await?;
+    let ReactorPair { handle, accept } = pair;
+
+    let observed = Arc::new(AtomicUsize::new(0));
+    let observed_c = observed.clone();
+    let server_task = tokio::spawn(async move {
+        let mut reactor = handle;
+        if let Some(ReactorEvent::Call(call)) = reactor.next_event().await {
+            // Never answers; waits for the cancel.
+            let notified = call.cancel_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !call.cancelled.load(Ordering::Acquire) {
+                notified.await;
+            }
+            observed_c.store(1, Ordering::SeqCst);
+            // Keep the call alive until the test is done with it.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+
+    let (send, _recv) = conn.open_streaming_substream().await?;
+    let mut pair = encode_frame(b"hdr", FLAG_HEADER)?;
+    pair.extend(encode_frame(b"req", FLAG_END_STREAM)?);
+    send.write_all(pair).await?;
+    // Let the call reach the handler, then abandon it with a bare reset.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send.reset(RESET_CODE_CANCELLED).await?;
+
+    let started = Instant::now();
+    while observed.load(Ordering::SeqCst) == 0 && started.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        1,
+        "the handler was never told its caller reset the stream"
+    );
+
+    server_task.abort();
+    accept.abort();
+    Ok(())
+}

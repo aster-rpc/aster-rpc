@@ -18,8 +18,10 @@
 //!   `write_all` of header+request, read frames to the trailer, return the
 //!   stream to the pool. This is what `ffi::aster_call_unary`, Python
 //!   `AsterCall.unary_fast_path` and the TS `unaryFastPath` do.
-//! - `rpc`: `aster::rpc::RpcConnection::unary` (generated client stub). Opens a
-//!   fresh bi-stream per call (not pooled; see dynamic-dispatch-design §0.3).
+//! - `rpc`: `aster::rpc::RpcConnection::unary` (generated client stub). Since
+//!   R3d this runs on the same SHARED pool as `pooled` (one write, read to the
+//!   trailer, release); before R3d it opened a fresh bi-stream per call
+//!   (dynamic-dispatch-design §0.3), which is what perf-baseline-r3 measured.
 //!
 //! Streaming always uses the generated client (`generate` / `ingest`), which
 //! opens a dedicated substream per call, like every binding.

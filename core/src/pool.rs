@@ -183,8 +183,53 @@ impl<T> Drop for StreamHandle<T> {
 /// re-enter the acquire fast path to open a fresh stream against the
 /// remaining deadline.
 enum WakeSignal<T> {
-    Handoff(T),
-    Retry,
+    Handoff(InTransit<T>),
+    Retry(RetryToken<T>),
+}
+
+/// A released stream on its way to a waiter.
+///
+/// A waiter's receiver can be dropped *after* the stream was sent into it --
+/// its `acquire` timed out at that instant, or the caller dropped the acquire
+/// future (a deadline, a `select!`). The stream then dies inside the channel.
+/// Carried bare, that leaked its slot: `open_count` never came down, and a pool
+/// that lost all its slots this way blocked every caller until `PoolFull`.
+/// Dropped undelivered, this returns the stream to the pool instead.
+struct InTransit<T> {
+    stream: Option<T>,
+    pool: Arc<PoolInner<T>>,
+    key: PoolKey,
+}
+
+impl<T> InTransit<T> {
+    fn take(mut self) -> T {
+        self.stream.take().expect("in-transit stream is taken once")
+    }
+}
+
+impl<T> Drop for InTransit<T> {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            self.pool.release(&self.key, stream);
+        }
+    }
+}
+
+/// A reserved slot whose stream is still being opened. Dropped armed -- the
+/// factory failed, or the acquire future was dropped mid-open -- it frees the
+/// slot (and wakes a waiter), so a cancelled acquire does not leak it.
+struct SlotReservation<'a, T> {
+    pool: &'a Arc<PoolInner<T>>,
+    key: &'a PoolKey,
+    armed: bool,
+}
+
+impl<T> Drop for SlotReservation<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.drop_slot(self.key);
+        }
+    }
 }
 
 /// A sub-pool for one routing key (SHARED or a specific session).
@@ -240,7 +285,8 @@ impl<T> PoolInner<T> {
     /// Return a stream to its sub-pool. If any waiters are registered,
     /// hand the stream off to the oldest live waiter (FIFO); otherwise
     /// push onto the free LIFO stack.
-    fn release(&self, key: &PoolKey, stream: T) {
+    fn release(self: &Arc<Self>, key: &PoolKey, stream: T) {
+        let max = self.max_size_for(key);
         let mut subs = self.subs.lock().unwrap();
         let sub = match subs.get_mut(key) {
             Some(s) => s,
@@ -249,19 +295,33 @@ impl<T> PoolInner<T> {
                 return;
             }
         };
+        sub.max_size = max;
         // Try to hand off to a live waiter. Senders whose receivers
         // have been dropped (timed-out waiters) cannot accept the value
         // and are popped out of the way.
         let mut pending = stream;
         while let Some(tx) = sub.waiters.pop_front() {
-            match tx.send(WakeSignal::Handoff(pending)) {
+            let transit = InTransit {
+                stream: Some(pending),
+                pool: self.clone(),
+                key: key.clone(),
+            };
+            match tx.send(WakeSignal::Handoff(transit)) {
                 Ok(()) => return,
                 Err(WakeSignal::Handoff(returned)) => {
-                    pending = returned;
+                    pending = returned.take();
                     continue;
                 }
-                Err(WakeSignal::Retry) => unreachable!("we sent Handoff"),
+                Err(WakeSignal::Retry(_)) => unreachable!("we sent Handoff"),
             }
+        }
+        if sub.open_count > sub.max_size {
+            // The pool was shrunk while this stream was out: close it
+            // rather than keep more streams than the new bound.
+            sub.open_count -= 1;
+            drop(subs);
+            drop(pending);
+            return;
         }
         sub.free.push(pending);
     }
@@ -275,19 +335,61 @@ impl<T> PoolInner<T> {
     /// poisons every in-flight stream) would leave waiters asleep and
     /// timing out with a misleading `PoolFull` error even though the
     /// pool is actually empty.
-    fn drop_slot(&self, key: &PoolKey) {
+    fn drop_slot(self: &Arc<Self>, key: &PoolKey) {
         let mut subs = self.subs.lock().unwrap();
         let sub = match subs.get_mut(key) {
             Some(s) => s,
             None => return,
         };
         sub.open_count = sub.open_count.saturating_sub(1);
-        // Wake one waiter so it can claim the freed slot. Skip dead
-        // waiters (timed-out receivers) the same way `release` does.
+        self.wake_one(sub, key);
+    }
+
+    /// Wake the oldest live waiter with `Retry` (a slot is free). Skips
+    /// dead waiters (timed-out receivers) the same way `release` does.
+    fn wake_one(self: &Arc<Self>, sub: &mut SubPool<T>, key: &PoolKey) {
         while let Some(tx) = sub.waiters.pop_front() {
-            if tx.send(WakeSignal::Retry).is_ok() {
-                break;
+            let token = RetryToken {
+                pool: Some(self.clone()),
+                key: key.clone(),
+            };
+            match tx.send(WakeSignal::Retry(token)) {
+                Ok(()) => break,
+                // Called under the lock: defuse, or its drop re-locks.
+                Err(WakeSignal::Retry(token)) => token.consume(),
+                Err(WakeSignal::Handoff(_)) => unreachable!("we sent Retry"),
             }
+        }
+    }
+
+    /// [`wake_one`](Self::wake_one) for a token that was never received.
+    fn pass_on_retry(self: &Arc<Self>, key: &PoolKey) {
+        let mut subs = self.subs.lock().unwrap();
+        if let Some(sub) = subs.get_mut(key) {
+            self.wake_one(sub, key);
+        }
+    }
+}
+
+/// The `Retry` wake-up: "a slot is free". Like [`InTransit`], it must not be
+/// lost with a receiver dropped after the send -- the freed slot would sit
+/// unclaimed while the next waiter slept on to `PoolFull`. Dropped unconsumed,
+/// it passes the wake-up on.
+struct RetryToken<T> {
+    pool: Option<Arc<PoolInner<T>>>,
+    key: PoolKey,
+}
+
+impl<T> RetryToken<T> {
+    fn consume(mut self) {
+        self.pool = None;
+    }
+}
+
+impl<T> Drop for RetryToken<T> {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.pass_on_retry(&self.key);
         }
     }
 }
@@ -358,6 +460,44 @@ impl<T: Send + 'static> StreamPool<T> {
     /// Current configured pool config.
     pub fn config(&self) -> &PoolConfig {
         &self.inner.config
+    }
+
+    /// The SHARED pool's current bound: `config().shared_pool_size`, unless
+    /// [`apply_quic_ceiling`](Self::apply_quic_ceiling) clamped it or
+    /// [`set_shared_pool_size`](Self::set_shared_pool_size) changed it.
+    pub fn shared_pool_size(&self) -> usize {
+        *self.inner.effective_shared_size.lock().unwrap()
+    }
+
+    /// Change the SHARED pool's bound at runtime (minimum 1). Growing wakes
+    /// queued waiters into the new slots at once; shrinking closes idle
+    /// surplus streams now and busy ones as they are released.
+    pub fn set_shared_pool_size(&self, size: usize) {
+        let size = size.max(1);
+        *self.inner.effective_shared_size.lock().unwrap() = size;
+        let mut closed = Vec::new();
+        {
+            let mut subs = self.inner.subs.lock().unwrap();
+            if let Some(sub) = subs.get_mut(&None) {
+                sub.max_size = size;
+                while sub.open_count > size {
+                    match sub.free.pop() {
+                        Some(stream) => {
+                            sub.open_count -= 1;
+                            closed.push(stream);
+                        }
+                        None => break,
+                    }
+                }
+                for _ in sub.open_count..size {
+                    if sub.waiters.is_empty() {
+                        break;
+                    }
+                    self.inner.wake_one(sub, &None);
+                }
+            }
+        }
+        drop(closed);
     }
 
     /// Current number of open streams (free + busy) for a key. Zero if
@@ -433,16 +573,23 @@ impl<T: Send + 'static> StreamPool<T> {
             match phase1 {
                 Phase1::Ready(stream) => return Ok(self.wrap(key, stream)),
                 Phase1::OpenNew => {
-                    return match (self.inner.factory)().await {
+                    // On a factory error, or if this future is dropped
+                    // while the stream is opening, the reservation frees
+                    // the slot (and `drop_slot` wakes a waiter with
+                    // `Retry`, so the slot doesn't sit idle).
+                    let mut reservation = SlotReservation {
+                        pool: &self.inner,
+                        key: &key,
+                        armed: true,
+                    };
+                    let opened = (self.inner.factory)().await;
+                    if opened.is_ok() {
+                        reservation.armed = false;
+                    }
+                    drop(reservation);
+                    return match opened {
                         Ok(stream) => Ok(self.wrap(key, stream)),
-                        Err(err) => {
-                            // Release the reserved slot and surface
-                            // the error. `drop_slot` also wakes a
-                            // waiter with `Retry` so the slot doesn't
-                            // sit idle.
-                            self.inner.drop_slot(&key);
-                            Err(AcquireError::StreamOpenFailed(err))
-                        }
+                        Err(err) => Err(AcquireError::StreamOpenFailed(err)),
                     };
                 }
                 Phase1::Wait(rx) => {
@@ -454,9 +601,10 @@ impl<T: Send + 'static> StreamPool<T> {
                     let remaining = deadline - now;
                     match timeout(remaining, rx).await {
                         Ok(Ok(WakeSignal::Handoff(stream))) => {
-                            return Ok(self.wrap(key, stream));
+                            return Ok(self.wrap(key, stream.take()));
                         }
-                        Ok(Ok(WakeSignal::Retry)) => {
+                        Ok(Ok(WakeSignal::Retry(token))) => {
+                            token.consume();
                             // A slot was freed. Loop to re-enter the
                             // fast path against the tracked deadline.
                             continue;
@@ -690,6 +838,129 @@ mod tests {
         // SHARED still works freely.
         let _a = pool.acquire(None).await.unwrap();
         let _b = pool.acquire(None).await.unwrap();
+    }
+
+    // ---- Cancellation safety -----------------------------------------
+    //
+    // A caller's acquire future can be dropped at any await: a deadline, a
+    // `select!`, a dropped task. None of those may leak a slot.
+
+    #[tokio::test]
+    async fn an_acquire_dropped_while_opening_frees_its_slot() {
+        let factory: StreamFactory<FakeStream> = Arc::new(|| {
+            Box::pin(async {
+                sleep(Duration::from_secs(60)).await;
+                Ok(FakeStream { id: 0 })
+            })
+        });
+        let pool = StreamPool::new(cfg(1, 1, 5000), factory);
+        let opening = tokio::time::timeout(Duration::from_millis(20), pool.acquire(None)).await;
+        assert!(opening.is_err(), "the factory never finishes");
+        assert_eq!(
+            pool.open_count(&None),
+            0,
+            "the reserved slot leaked with the dropped acquire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_handed_to_a_waiter_that_then_goes_away_returns_to_the_pool() {
+        let (pool, counter) = make_pool(cfg(1, 1, 5000));
+        let held = pool.acquire(None).await.unwrap();
+
+        // Register a waiter, then stop polling it.
+        let mut waiter = Box::pin(pool.acquire(None));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), waiter.as_mut())
+                .await
+                .is_err(),
+            "the pool is full, so the second acquire waits"
+        );
+        // The release hands the stream to that waiter's channel...
+        drop(held);
+        // ...and the waiter is dropped without ever receiving it.
+        drop(waiter);
+
+        assert_eq!(pool.open_count(&None), 1);
+        assert_eq!(
+            pool.free_count(&None),
+            1,
+            "the stream died in the dropped waiter's channel"
+        );
+        let again = tokio::time::timeout(Duration::from_millis(500), pool.acquire(None))
+            .await
+            .expect("the slot is usable again")
+            .unwrap();
+        assert_eq!(again.get().id, 0);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retry_wake_up_lost_with_its_waiter_is_passed_on() {
+        let (pool, _counter) = make_pool(cfg(1, 1, 5000));
+        let held = pool.acquire(None).await.unwrap();
+
+        let mut first = Box::pin(pool.acquire(None));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), first.as_mut())
+                .await
+                .is_err()
+        );
+        let pool2 = pool.clone();
+        let second = tokio::spawn(async move { pool2.acquire(None).await });
+        sleep(Duration::from_millis(20)).await;
+
+        // Discard frees the slot and wakes `first` -- which then goes away.
+        held.discard();
+        drop(first);
+
+        let got = tokio::time::timeout(Duration::from_millis(1000), second)
+            .await
+            .expect("the second waiter must be woken, not left to time out")
+            .unwrap();
+        assert!(got.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_shared_bound_can_grow_and_shrink_at_runtime() {
+        let (pool, counter) = make_pool(cfg(1, 1, 5000));
+        assert_eq!(pool.shared_pool_size(), 1);
+        let a = pool.acquire(None).await.unwrap();
+
+        // A waiter queued behind the bound is admitted when it grows.
+        let pool2 = pool.clone();
+        let waiter = tokio::spawn(async move { pool2.acquire(None).await });
+        sleep(Duration::from_millis(20)).await;
+        pool.set_shared_pool_size(3);
+        let b = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("growing the bound admits the waiter")
+            .unwrap()
+            .unwrap();
+        let c = pool.acquire(None).await.unwrap();
+        assert_eq!(pool.open_count(&None), 3);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+
+        // Shrink while all three are busy: they close as they come back.
+        pool.set_shared_pool_size(1);
+        drop(a);
+        drop(b);
+        assert_eq!(pool.open_count(&None), 1);
+        assert_eq!(pool.free_count(&None), 0);
+        drop(c);
+        assert_eq!(pool.open_count(&None), 1);
+        assert_eq!(pool.free_count(&None), 1);
+
+        // Idle surplus closes at once.
+        pool.set_shared_pool_size(4);
+        let x = pool.acquire(None).await.unwrap();
+        let y = pool.acquire(None).await.unwrap();
+        drop(x);
+        drop(y);
+        assert_eq!(pool.free_count(&None), 2);
+        pool.set_shared_pool_size(1);
+        assert_eq!(pool.open_count(&None), 1);
+        assert_eq!(pool.free_count(&None), 1);
     }
 
     // ---- Pure clamp_pool_size tests ---------------------------------
