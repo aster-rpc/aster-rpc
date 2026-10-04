@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	forygo "github.com/apache/fory/go/fory"
 )
@@ -66,31 +67,69 @@ func (RawBytesCodec) Decode(payload []byte, dest any) error {
 // xlang, compatible (schema evolution), no reference tracking. Struct types
 // are registered by name ("namespace/Name" -> Fory namespace + type name),
 // either explicitly with Register or automatically for WireTyped values.
-// Safe for concurrent use.
+//
+// Safe for concurrent use without a global lock: a Fory instance is not
+// thread-safe, so a codec from NewForyCodec keeps a pool of identically
+// configured instances, each catching up on registrations (replayed in
+// order) when it is taken from the pool. A codec from NewForyCodecFrom, or
+// one whose Fory() was taken, serializes through that single instance under
+// a mutex.
 type ForyCodec struct {
-	mu         sync.Mutex
-	fory       *forygo.Fory
+	mu         sync.Mutex   // serializes registration
+	fory       *forygo.Fory // registration target; the instance in single mode
 	registered map[reflect.Type]string
+	order      []foryReg // registrations in order, replayed on pooled instances
+	// snap is the read-side copy of (registered, order), replaced on every
+	// registration, so encode/decode never take a lock.
+	snap atomic.Pointer[regSnapshot]
+
+	newFory func() *forygo.Fory // nil: single-instance mode
+	single  atomic.Bool
+	singleM sync.Mutex
+	pool    sync.Pool // *pooledFory
+}
+
+type regSnapshot struct {
+	registered map[reflect.Type]struct{}
+	order      []foryReg
+}
+
+type foryReg struct {
+	t    reflect.Type
+	name string
+}
+
+type pooledFory struct {
+	f *forygo.Fory
+	n int // registrations applied
 }
 
 // NewForyCodec returns a Fory codec configured like every other binding:
 // xlang=true, compatible=true, ref tracking off.
 func NewForyCodec() *ForyCodec {
-	return &ForyCodec{
-		fory:       forygo.New(forygo.WithXlang(true), forygo.WithCompatible(true), forygo.WithTrackRef(false)),
-		registered: make(map[reflect.Type]string),
+	newFory := func() *forygo.Fory {
+		return forygo.New(forygo.WithXlang(true), forygo.WithCompatible(true), forygo.WithTrackRef(false))
 	}
+	return &ForyCodec{fory: newFory(), newFory: newFory, registered: make(map[reflect.Type]string)}
 }
 
 // NewForyCodecFrom wraps an externally-built Fory instance (the caller is
-// responsible for its xlang/compatible settings).
+// responsible for its xlang/compatible settings). Payloads go through that
+// one instance, serialized by a mutex.
 func NewForyCodecFrom(fory *forygo.Fory) *ForyCodec {
-	return &ForyCodec{fory: fory, registered: make(map[reflect.Type]string)}
+	c := &ForyCodec{fory: fory, registered: make(map[reflect.Type]string)}
+	c.single.Store(true)
+	return c
 }
 
 // Fory returns the underlying Fory instance. It is not thread-safe: use it
-// only for registration before the codec is shared.
-func (c *ForyCodec) Fory() *forygo.Fory { return c.fory }
+// only for registration before the codec is shared. Taking it switches the
+// codec to that single instance (registrations made on it directly are not
+// known to the pool).
+func (c *ForyCodec) Fory() *forygo.Fory {
+	c.single.Store(true)
+	return c.fory
+}
 
 func (c *ForyCodec) Mode() string { return "xlang" }
 
@@ -114,10 +153,19 @@ func (c *ForyCodec) registerLocked(t reflect.Type, tag string) error {
 		}
 		return fmt.Errorf("aster: %v already registered as %q", t, prev)
 	}
-	if err := c.fory.RegisterStructByName(t, foryName(tag)); err != nil {
+	c.singleM.Lock()
+	err := c.fory.RegisterStructByName(t, foryName(tag))
+	c.singleM.Unlock()
+	if err != nil {
 		return fmt.Errorf("aster: register %v as %q: %w", t, tag, err)
 	}
 	c.registered[t] = tag
+	c.order = append(c.order, foryReg{t, foryName(tag)})
+	snap := &regSnapshot{registered: make(map[reflect.Type]struct{}, len(c.registered)), order: c.order[:len(c.order):len(c.order)]}
+	for k := range c.registered {
+		snap.registered[k] = struct{}{}
+	}
+	c.snap.Store(snap)
 	return nil
 }
 
@@ -162,18 +210,58 @@ func (c *ForyCodec) registerGraph(t reflect.Type, seen map[reflect.Type]bool) er
 	return nil
 }
 
+// ensureRegistered registers v's type graph on first use.
+func (c *ForyCodec) ensureRegistered(v any) error {
+	t := structType(v)
+	if t == nil {
+		return nil
+	}
+	if snap := c.snap.Load(); snap != nil {
+		if _, ok := snap.registered[t]; ok {
+			return nil
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.registerGraph(t, map[reflect.Type]bool{})
+}
+
+// with runs fn on a Fory instance: a pooled one brought up to date with the
+// registrations, or the single instance under its mutex.
+func (c *ForyCodec) with(fn func(*forygo.Fory) error) error {
+	if c.newFory == nil || c.single.Load() {
+		c.singleM.Lock()
+		defer c.singleM.Unlock()
+		return fn(c.fory)
+	}
+	p, _ := c.pool.Get().(*pooledFory)
+	if p == nil {
+		p = &pooledFory{f: c.newFory()}
+	}
+	var pending []foryReg
+	if snap := c.snap.Load(); snap != nil && p.n < len(snap.order) {
+		pending = snap.order[p.n:]
+	}
+	for _, r := range pending {
+		if err := p.f.RegisterStructByName(r.t, r.name); err != nil {
+			return fmt.Errorf("aster: register %v on a pooled Fory: %w", r.t, err)
+		}
+		p.n++
+	}
+	err := fn(p.f)
+	if err != nil {
+		p.f.Reset()
+	}
+	c.pool.Put(p)
+	return err
+}
+
 func (c *ForyCodec) Encode(value any) ([]byte, error) {
 	if value == nil {
 		return []byte{}, nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if t := structType(value); t != nil {
-		if _, ok := c.registered[t]; !ok {
-			if err := c.registerGraph(t, map[reflect.Type]bool{}); err != nil {
-				return nil, err
-			}
-		}
+	if err := c.ensureRegistered(value); err != nil {
+		return nil, err
 	}
 	if rv := reflect.ValueOf(value); rv.Kind() == reflect.Struct {
 		// Fory serializes structs through a pointer.
@@ -181,11 +269,16 @@ func (c *ForyCodec) Encode(value any) ([]byte, error) {
 		p.Elem().Set(rv)
 		value = p.Interface()
 	}
-	b, err := c.fory.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	return append([]byte(nil), b...), nil
+	var out []byte
+	err := c.with(func(f *forygo.Fory) error {
+		b, err := f.Marshal(value)
+		if err != nil {
+			return err
+		}
+		out = append([]byte(nil), b...) // the instance reuses its buffer
+		return nil
+	})
+	return out, err
 }
 
 func (c *ForyCodec) Decode(payload []byte, dest any) error {
@@ -197,16 +290,10 @@ func (c *ForyCodec) Decode(payload []byte, dest any) error {
 		}
 		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if t := structType(dest); t != nil {
-		if _, ok := c.registered[t]; !ok {
-			if err := c.registerGraph(t, map[reflect.Type]bool{}); err != nil {
-				return err
-			}
-		}
+	if err := c.ensureRegistered(dest); err != nil {
+		return err
 	}
-	return c.fory.Unmarshal(payload, dest)
+	return c.with(func(f *forygo.Fory) error { return f.Unmarshal(payload, dest) })
 }
 
 // foryName maps "namespace/Name" to Fory's "namespace.Name" (Fory splits the

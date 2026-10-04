@@ -30,17 +30,19 @@ import (
 // (binary; untagged, Fory Go writes list<uint8>) or `aster:"uint8_list"`
 // (list<uint8>). Field names are Fory's snake_case of the Go name.
 
-// ServiceContractJSON returns the ServiceContract JSON handed to aster_contract_id.
+// ServiceContractJSON returns the ServiceContract JSON handed to
+// aster_contract_id. Service.ContractID uses the registration form
+// (DynamicServiceJSON); both give the same id.
 func ServiceContractJSON(svc *Service) (string, error) {
 	r := newTypeResolver()
 	type methodJSON struct {
-		Name           string  `json:"name"`
-		Pattern        string  `json:"pattern"`
-		RequestType    string  `json:"request_type"`
-		ResponseType   string  `json:"response_type"`
-		Idempotent     bool    `json:"idempotent"`
-		DefaultTimeout float64 `json:"default_timeout"`
-		Requires       *string `json:"requires"`
+		Name           string       `json:"name"`
+		Pattern        string       `json:"pattern"`
+		RequestType    string       `json:"request_type"`
+		ResponseType   string       `json:"response_type"`
+		Idempotent     bool         `json:"idempotent"`
+		DefaultTimeout float64      `json:"default_timeout"`
+		Requires       *Requirement `json:"requires"`
 	}
 	methods := make([]*Method, 0, len(svc.methods))
 	for _, m := range svc.methods {
@@ -60,7 +62,7 @@ func ServiceContractJSON(svc *Service) (string, error) {
 		}
 		out = append(out, methodJSON{
 			Name: m.Name, Pattern: m.Pattern.String(), RequestType: req, ResponseType: resp,
-			Idempotent: m.Idempotent,
+			Idempotent: m.Idempotent, DefaultTimeout: m.Timeout.Seconds(), Requires: m.Requires,
 		})
 	}
 	scope := "shared"
@@ -73,9 +75,9 @@ func ServiceContractJSON(svc *Service) (string, error) {
 		Methods            []methodJSON `json:"methods"`
 		SerializationModes []string     `json:"serialization_modes"`
 		Scoped             string       `json:"scoped"`
-		Requires           *string      `json:"requires"`
+		Requires           *Requirement `json:"requires"`
 		ProducerLanguage   string       `json:"producer_language"`
-	}{svc.Name, svc.Version, out, []string{"xlang"}, scope, nil, ""})
+	}{svc.Name, svc.Version, out, []string{"xlang"}, scope, svc.Requires, ""})
 	return string(b), err
 }
 

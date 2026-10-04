@@ -25,13 +25,23 @@ func cStructSizes() map[string]uintptr {
 		"aster_connection_info_t":    unsafe.Sizeof(C.aster_connection_info_t{}),
 		"aster_transport_snapshot_t": unsafe.Sizeof(C.aster_transport_snapshot_t{}),
 		"aster_transport_metrics_t":  unsafe.Sizeof(C.aster_transport_metrics_t{}),
-		"aster_reactor_call_t":       unsafe.Sizeof(C.aster_reactor_call_t{}),
+		"aster_dispatch_event_t":     unsafe.Sizeof(C.aster_dispatch_event_t{}),
+		"aster_call_options_t":       unsafe.Sizeof(C.aster_call_options_t{}),
 	}
 }
 
-// reactorCallEventKindOffset is offsetof(aster_reactor_call_t, event_kind).
-func reactorCallEventKindOffset() uintptr {
-	return unsafe.Offsetof(C.aster_reactor_call_t{}.event_kind)
+// dispatchEventOffsets are the aster_dispatch_event_t field offsets the
+// binding reads (pinned in ffi/src/layout.rs).
+func dispatchEventOffsets() map[string]uintptr {
+	var e C.aster_dispatch_event_t
+	return map[string]uintptr{
+		"kind": unsafe.Offsetof(e.kind), "flags": unsafe.Offsetof(e.flags),
+		"call_id": unsafe.Offsetof(e.call_id), "session_key": unsafe.Offsetof(e.session_key),
+		"connection_handle": unsafe.Offsetof(e.connection_handle),
+		"deadline_unix_ms":  unsafe.Offsetof(e.deadline_unix_ms),
+		"session_id":        unsafe.Offsetof(e.session_id), "request_ptr": unsafe.Offsetof(e.request_ptr),
+		"peer_ptr": unsafe.Offsetof(e.peer_ptr), "buffer": unsafe.Offsetof(e.buffer),
+	}
 }
 
 // headerABIVersion is ASTER_ABI_VERSION from the header this binding was built against.

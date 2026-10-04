@@ -2,16 +2,26 @@
 
 package aster
 
+/*
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "aster_ffi.h"
+*/
+import "C"
+
 import (
 	"context"
 	"errors"
 	"fmt"
 	"iter"
 	"log"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 // ServerOptions configure StartServer.
@@ -28,21 +38,37 @@ type ServerOptions struct {
 	Gate *Gate
 	// Interceptors run OnRequest (with the raw first request payload) before
 	// every handler; an error rejects the call (an *RpcError keeps its code).
+	// Gate 3 (Requires) already ran in Rust.
 	Interceptors []Interceptor
-	// RingCapacity sizes the reactor ring (default 256).
+	// RingCapacity sizes the dispatch event ring (default 256).
 	RingCapacity uint32
+	// HandlerTimeout caps every call (Rust ends it with DEADLINE_EXCEEDED).
+	// 0 = Rust's default (300 s); negative = no cap.
+	HandlerTimeout time.Duration
+	// MaxSessionsPerConnection caps session-scoped sessions per connection
+	// (default 1024; enforced in Rust: RESOURCE_EXHAUSTED).
+	MaxSessionsPerConnection int
+	// DisableNodeInfo stops serving the baseline aster.ops.NodeInfo service.
+	DisableNodeInfo bool
+	// Topology serves the baseline aster.net.Topology service.
+	Topology bool
 	// OnConnectionClosed, if set, runs on the poll goroutine when a peer
 	// connection closes (drop per-connection state). Must not block.
 	OnConnectionClosed func(connectionID uint64, peerID string)
-	// Logger receives submit failures (default: the standard logger).
+	// OnNonRPC, if set, receives (on its own goroutine) every accepted
+	// connection on an ALPN other than aster/1 (e.g. the consumer-admission
+	// ALPN); the handler owns conn and must Close it. Default: closed.
+	OnNonRPC func(alpn string, conn *Connection)
+	// Logger receives response failures (default: the standard logger).
 	Logger *log.Logger
 }
 
-// AsterServer serves Services over aster/1: it starts a Node from an
-// AsterConfig, attaches a reactor and dispatches calls to typed handlers.
-// Every call ends with exactly one AEv1 RpcStatus trailer: a handler error
-// becomes its *RpcError code, a context deadline DEADLINE_EXCEEDED, anything
-// else INTERNAL.
+// AsterServer serves Services over aster/1 through Rust's aster::rpc::Server
+// (ABI 3.5 dynamic dispatch): Rust decodes headers, routes, enforces Gate 3
+// (Requires), sessions, deadlines and frame limits, and serves NodeInfo; Go
+// runs the handlers. Every call ends with exactly one AEv1 RpcStatus: a
+// handler error becomes its *RpcError code, a context deadline
+// DEADLINE_EXCEEDED, anything else INTERNAL.
 //
 //	srv, err := aster.StartServer(ctx, aster.ServerOptions{Config: cfg, Services: []*aster.Service{svc}})
 //	defer srv.Close()
@@ -51,11 +77,12 @@ type AsterServer struct {
 	node      *Node
 	gate      *Gate
 	ownedGate bool
-	reactor   *Reactor
+	ds        *dispatchServer
 	codec     Codec
-	services  map[string]*Service
+	byIndex   []*Service // service_idx -> service
 	icpts     []Interceptor
 	onClosed  func(uint64, string)
+	onNonRPC  func(string, *Connection)
 	logger    *log.Logger
 
 	ctx     context.Context
@@ -64,26 +91,45 @@ type AsterServer struct {
 	calls   sync.WaitGroup
 	closing atomic.Bool
 	closeMu sync.Mutex
+
+	// mu guards cancels and sessions.
+	mu sync.Mutex
+	// cancels: streaming calls' context cancel, fired on CANCELLED.
+	cancels map[uint64]context.CancelFunc
+	// sessions: Rust session_key -> instance record (created on the poll
+	// goroutine ahead of the session's SESSION_CLOSED).
+	sessions map[uint64]*sessionRecord
+	// peers caches the peer id per connection (poll goroutine only).
+	peers map[uint64]string
 }
+
+const pollBatch = 64
 
 // StartServer starts a node and serves opts.Services on it.
 func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) {
-	services := make(map[string]*Service, len(opts.Services))
+	seen := make(map[string]bool, len(opts.Services))
+	jsons := make([]string, 0, len(opts.Services))
 	for _, s := range opts.Services {
-		if _, dup := services[s.Name]; dup {
-			return nil, fmt.Errorf("service %s registered twice: %w", s.Name, ErrInvalidArgument)
+		key := s.Name + "@" + strconv.Itoa(int(s.Version))
+		if seen[key] {
+			return nil, fmt.Errorf("service %s v%d registered twice: %w", s.Name, s.Version, ErrInvalidArgument)
 		}
-		if s.Scope != ScopeShared {
-			return nil, fmt.Errorf("service %s: session-scoped services are not served by the Go binding yet: %w", s.Name, ErrUnsupported)
+		seen[key] = true
+		if s.Scope == ScopeSession && s.newSession == nil {
+			return nil, fmt.Errorf("service %s: session-scoped services need a factory (NewSessionService): %w", s.Name, ErrInvalidArgument)
 		}
-		services[s.Name] = s
+		s.lower()
+		if s.contractEr != nil {
+			return nil, fmt.Errorf("service %s: %w", s.Name, s.contractEr)
+		}
+		jsons = append(jsons, s.dynJSON)
 	}
 	codec := opts.Codec
 	if codec == nil {
 		codec = NewForyCodec()
 	}
 	if fc, ok := codec.(*ForyCodec); ok {
-		for _, s := range services {
+		for _, s := range opts.Services {
 			if err := s.RegisterTypes(fc); err != nil {
 				return nil, err
 			}
@@ -116,7 +162,22 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	if err != nil {
 		return fail(err)
 	}
-	reactor, err := NewReactor(node.runtime, node, opts.RingCapacity)
+	settings := serverSettings{
+		disableNodeInfo: opts.DisableNodeInfo,
+		topology:        opts.Topology,
+		ringCapacity:    opts.RingCapacity,
+	}
+	if opts.MaxSessionsPerConnection > 0 {
+		settings.maxSessionsPerConnection = uint64(opts.MaxSessionsPerConnection)
+	}
+	switch {
+	case opts.HandlerTimeout < 0:
+		settings.setHandlerTimeout, settings.handlerTimeoutMs = true, 0
+	case opts.HandlerTimeout > 0:
+		settings.setHandlerTimeout = true
+		settings.handlerTimeoutMs = uint64(max(opts.HandlerTimeout.Milliseconds(), 1))
+	}
+	ds, err := startDispatchServer(node, jsons, settings)
 	if err != nil {
 		_ = node.Close()
 		return fail(err)
@@ -127,9 +188,12 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	}
 	sctx, cancel := context.WithCancel(context.Background())
 	s := &AsterServer{
-		node: node, gate: gate, ownedGate: owned, reactor: reactor, codec: codec,
-		services: services, icpts: opts.Interceptors, onClosed: opts.OnConnectionClosed,
+		node: node, gate: gate, ownedGate: owned, ds: ds, codec: codec,
+		byIndex: append([]*Service(nil), opts.Services...), icpts: opts.Interceptors,
+		onClosed: opts.OnConnectionClosed, onNonRPC: opts.OnNonRPC,
 		logger: logger, ctx: sctx, cancel: cancel,
+		cancels: map[uint64]context.CancelFunc{}, sessions: map[uint64]*sessionRecord{},
+		peers: map[uint64]string{},
 	}
 	s.pollWG.Add(1)
 	go s.pollLoop()
@@ -152,8 +216,28 @@ func (s *AsterServer) Ticket(ctx context.Context) (string, error) {
 	return s.node.Ticket(ctx, 5*time.Second)
 }
 
+// SetPeerAttributes sets the attributes Gate 3 checks Requires against for
+// calls from peer (64-hex node id), and that handlers see in
+// CallInfo.Attributes. Empty or nil clears them.
+func (s *AsterServer) SetPeerAttributes(peer string, attributes map[string]string) error {
+	entries := make([]MetadataEntry, 0, len(attributes))
+	for k, v := range attributes {
+		entries = append(entries, MetadataEntry{k, v})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	return s.ds.setPeerAttributes(peer, encodeKV(entries))
+}
+
+// LiveCalls is the number of calls in Rust's call table (diagnostics).
+func (s *AsterServer) LiveCalls() uint64 { return s.ds.liveCalls() }
+
+// QueueFullHits counts responses that hit a full response queue and waited
+// for capacity.
+func (s *AsterServer) QueueFullHits() uint64 { return s.ds.queueFullHits.Load() }
+
 // Close stops dispatching, cancels in-flight handlers (their contexts end),
-// waits for them, then closes the reactor, node and owned gate.
+// waits for them, then destroys the dispatch server and closes the node and
+// owned gate. Session instances still open are closed.
 func (s *AsterServer) Close() error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
@@ -162,8 +246,27 @@ func (s *AsterServer) Close() error {
 	}
 	s.cancel()
 	s.pollWG.Wait()
-	s.calls.Wait()
-	err := errors.Join(s.reactor.Close(), s.node.Close())
+	// A client-stream / bidi handler blocked on its next request returns
+	// once the connection closes, so bound the wait before tearing down.
+	callsDone := make(chan struct{})
+	go func() { s.calls.Wait(); close(callsDone) }()
+	select {
+	case <-callsDone:
+	case <-time.After(2 * time.Second):
+	}
+	err := s.ds.destroy()
+	s.mu.Lock()
+	sessions := s.sessions
+	s.sessions = map[uint64]*sessionRecord{}
+	s.mu.Unlock()
+	for _, rec := range sessions {
+		rec.close()
+	}
+	err = errors.Join(err, s.node.Close())
+	select { // the closed connections end any remaining request waits
+	case <-callsDone:
+	case <-time.After(2 * time.Second):
+	}
 	if s.ownedGate {
 		err = errors.Join(err, s.gate.Close())
 	}
@@ -172,97 +275,201 @@ func (s *AsterServer) Close() error {
 
 func (s *AsterServer) pollLoop() {
 	defer s.pollWG.Done()
+	buf := (*C.aster_dispatch_event_t)(C.calloc(pollBatch, C.size_t(unsafe.Sizeof(C.aster_dispatch_event_t{}))))
+	if buf == nil {
+		panic("aster: calloc failed")
+	}
+	defer C.free(unsafe.Pointer(buf))
 	for !s.closing.Load() {
-		// Poll also wakes handlers blocked on a QUEUE_FULL submit.
-		calls, err := s.reactor.Poll(32, 100)
-		if err != nil {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		for _, c := range calls {
-			switch c.Kind {
-			case ReactorEventConnectionClosed:
-				if s.onClosed != nil {
-					s.onClosed(c.ConnectionID, c.PeerID)
-				}
-			case ReactorEventCall:
-				s.calls.Add(1)
-				go s.dispatch(c)
-			}
+		for _, ev := range s.ds.poll(buf, pollBatch, 100) {
+			s.onEvent(&ev)
 		}
 	}
 }
 
-func (s *AsterServer) dispatch(in ReactorCall) {
-	defer s.calls.Done()
-	fail := func(st RpcStatus) {
-		if err := s.submitTrailer(in.CallID, st); err != nil {
-			s.logger.Printf("aster: trailer for call %d failed: %v", in.CallID, err)
+func (s *AsterServer) onEvent(ev *C.aster_dispatch_event_t) {
+	switch ev.kind {
+	case dispatchEventCall:
+		s.onCall(ev)
+	case dispatchEventResponseWritable:
+		s.ds.capacityEvent(uint64(ev.call_id), true)
+	case dispatchEventResponseClosed:
+		s.ds.capacityEvent(uint64(ev.call_id), false)
+	case dispatchEventCancelled:
+		// Peer cancel (no trailer), deadline / corrupt request (Rust already
+		// answered): end the handler's context.
+		s.mu.Lock()
+		cancel := s.cancels[uint64(ev.call_id)]
+		s.mu.Unlock()
+		if cancel != nil {
+			cancel()
 		}
+	case dispatchEventSessionClosed:
+		s.mu.Lock()
+		rec := s.sessions[uint64(ev.session_key)]
+		delete(s.sessions, uint64(ev.session_key))
+		s.mu.Unlock()
+		if rec != nil {
+			go rec.close()
+		}
+	case dispatchEventConnectionClosed:
+		connID := uint64(ev.connection_id)
+		peer := s.peers[connID]
+		if peer == "" {
+			peer = cString(ev.peer_ptr, ev.peer_len)
+		}
+		delete(s.peers, connID)
+		s.ds.releaseBuffer(ev.buffer)
+		if s.onClosed != nil {
+			s.onClosed(connID, peer)
+		}
+	case dispatchEventNonRPC:
+		alpn := cString(ev.request_ptr, ev.request_len)
+		s.ds.releaseBuffer(ev.buffer)
+		conn := &Connection{handle: uint64(ev.connection_handle), runtime: s.node.runtime}
+		if s.onNonRPC == nil {
+			_ = conn.Close("")
+			return
+		}
+		go s.onNonRPC(alpn, conn)
+	default:
+		// A newer minor ABI's event kind: release what it carries.
+		s.ds.releaseBuffer(ev.buffer)
 	}
-	header, err := DecodeStreamHeader(in.Header)
-	if err != nil {
-		fail(RpcStatus{Code: StatusInvalidArgument, Message: "malformed stream header: " + err.Error()})
-		return
+}
+
+func cString(p *C.uint8_t, n C.uint32_t) string {
+	if p == nil || n == 0 {
+		return ""
 	}
-	if header.SerializationMode != XlangMode {
-		fail(RpcStatus{Code: StatusInvalidArgument, Message: fmt.Sprintf("unsupported serialization mode: %d", header.SerializationMode)})
-		return
+	return C.GoStringN((*C.char)(unsafe.Pointer(p)), C.int(n))
+}
+
+// inbound is one CALL event, copied out on the poll goroutine.
+type inbound struct {
+	callID     uint64
+	svc        *Service
+	method     *Method
+	flags      uint32
+	connID     uint64
+	sessionID  int32
+	deadline   time.Time
+	request    []byte
+	peer       string
+	session    *sessionRecord
+	ctx        context.Context // streaming: cancellable by CANCELLED
+	cancel     context.CancelFunc
+	firstIsEnd bool
+}
+
+func (s *AsterServer) onCall(ev *C.aster_dispatch_event_t) {
+	in := inbound{
+		callID:    uint64(ev.call_id),
+		flags:     uint32(ev.flags),
+		connID:    uint64(ev.connection_id),
+		sessionID: int32(ev.session_id),
 	}
-	svc, ok := s.services[header.Service]
+	in.firstIsEnd = in.flags&dispatchFlagFirstIsEnd != 0
+	if ev.request_len > 0 {
+		in.request = C.GoBytes(unsafe.Pointer(ev.request_ptr), C.int(ev.request_len))
+	}
+	peer, ok := s.peers[in.connID]
 	if !ok {
-		fail(RpcStatus{Code: StatusUnimplemented, Message: "unknown service: " + header.Service})
-		return
+		peer = cString(ev.peer_ptr, ev.peer_len)
+		s.peers[in.connID] = peer
 	}
-	method, ok := svc.methods[header.Method]
-	if !ok {
-		fail(RpcStatus{Code: StatusUnimplemented, Message: fmt.Sprintf("unknown method: %s/%s", header.Service, header.Method)})
-		return
-	}
-	if header.SessionID != 0 {
-		fail(RpcStatus{Code: StatusFailedPrecondition, Message: fmt.Sprintf(
-			"service %s is shared-scoped but the call carries session %d", header.Service, header.SessionID)})
-		return
+	in.peer = peer
+	s.ds.releaseBuffer(ev.buffer)
+	if d := int64(ev.deadline_unix_ms); d > 0 {
+		in.deadline = time.UnixMilli(d)
 	}
 
-	ctx, cancel := context.WithCancel(s.ctx)
-	defer cancel()
-	info := &CallInfo{
-		Service: header.Service, Method: header.Method, Pattern: method.Pattern,
-		PeerID: in.PeerID, ConnectionID: in.ConnectionID, SessionID: header.SessionID,
-		Metadata: header.Metadata,
+	svcIdx, methodIdx := int(ev.service_idx), int(ev.method_idx)
+	if svcIdx >= len(s.byIndex) || methodIdx >= len(s.byIndex[svcIdx].order) {
+		st, _ := EncodeRpcStatus(RpcStatus{Code: StatusUnimplemented, Message: fmt.Sprintf("no handler for service %d method %d", svcIdx, methodIdx)})
+		_ = s.ds.respond(s.ctx, in.callID, nil, st)
+		return
 	}
-	if header.Deadline > 0 {
-		info.Deadline = time.Now().Add(time.Duration(header.Deadline) * time.Second)
+	in.svc = s.byIndex[svcIdx]
+	in.method = in.svc.order[methodIdx]
+	if key := uint64(ev.session_key); key != 0 {
+		s.mu.Lock()
+		rec := s.sessions[key]
+		if rec == nil {
+			rec = &sessionRecord{factory: in.svc.newSession, info: SessionInfo{
+				Service: in.svc.Name, PeerID: peer, ConnectionID: in.connID, SessionID: in.sessionID,
+			}}
+			s.sessions[key] = rec
+		}
+		s.mu.Unlock()
+		in.session = rec
+	}
+	if in.method.Pattern != PatternUnary {
+		// Registered here, ahead of the call's CANCELLED event.
+		in.ctx, in.cancel = context.WithCancel(s.ctx)
+		s.mu.Lock()
+		s.cancels[in.callID] = in.cancel
+		s.mu.Unlock()
+	}
+	s.calls.Add(1)
+	go s.serve(in)
+}
+
+func (s *AsterServer) serve(in inbound) {
+	defer s.calls.Done()
+	ctx := in.ctx
+	if ctx == nil {
+		ctx = s.ctx
+	} else {
+		defer func() {
+			s.mu.Lock()
+			delete(s.cancels, in.callID)
+			s.mu.Unlock()
+			in.cancel()
+		}()
+	}
+	info := &CallInfo{
+		Service: in.svc.Name, Method: in.method.Name, Pattern: in.method.Pattern,
+		PeerID: in.peer, ConnectionID: in.connID, SessionID: in.sessionID, CallID: in.callID,
+		Deadline: in.deadline, IrohAuthenticated: in.flags&dispatchFlagIrohAuthenticated != 0,
+	}
+	if in.flags&dispatchFlagHasMetadata != 0 {
+		info.Metadata = s.ds.kvOut(in.callID, false)
+	}
+	if in.flags&dispatchFlagHasAttributes != 0 {
+		info.Attributes = s.ds.kvOut(in.callID, true)
+	}
+	if !in.deadline.IsZero() {
 		var dcancel context.CancelFunc
-		ctx, dcancel = context.WithDeadline(ctx, info.Deadline)
+		ctx, dcancel = context.WithDeadline(ctx, in.deadline)
 		defer dcancel()
 	}
 	ctx = context.WithValue(ctx, callInfoKey{}, info)
 
 	call := &serverCall{
-		reactor: s.reactor, callID: in.CallID, first: in.Request, firstFlags: in.RequestFlags,
-		codec: s.codec, base: s.ctx,
+		ds: s.ds, callID: in.callID, first: in.request, firstIsEnd: in.firstIsEnd,
+		streaming: in.method.Pattern == PatternServerStream || in.method.Pattern == PatternBidiStream,
+		codec:     s.codec, base: s.ctx,
 	}
-	err = s.intercept(info, method, in, call)
+	err := s.intercept(info, in.method, call)
 	if err == nil {
-		err = invokeRecover(ctx, method, call)
+		err = invokeRecover(ctx, in.method, in.session, call)
 	}
 	if err == nil {
 		return // the method completed the call
 	}
 	st := StatusFromError(err)
-	if ctx.Err() == context.DeadlineExceeded && s.ctx.Err() == nil {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && s.ctx.Err() == nil {
 		st = RpcStatus{Code: StatusDeadlineExceeded, Message: "deadline exceeded"}
 	} else if s.ctx.Err() != nil && st.Code == StatusCancelled {
 		st = RpcStatus{Code: StatusUnavailable, Message: "server shutting down"}
 	}
-	if err := call.complete(st); err != nil {
-		s.logger.Printf("aster: trailer for call %d failed: %v", in.CallID, err)
+	if err := call.complete(st); err != nil && !errors.Is(err, errCallGone) {
+		s.logger.Printf("aster: trailer for call %d failed: %v", in.callID, err)
 	}
 }
 
-func (s *AsterServer) intercept(info *CallInfo, m *Method, in ReactorCall, call *serverCall) error {
+func (s *AsterServer) intercept(info *CallInfo, m *Method, call *serverCall) error {
 	if len(s.icpts) == 0 {
 		return nil
 	}
@@ -270,77 +477,95 @@ func (s *AsterServer) intercept(info *CallInfo, m *Method, in ReactorCall, call 
 	for _, e := range info.Metadata {
 		md[e.Key] = e.Value
 	}
+	attrs := make(map[string]string, len(info.Attributes))
+	for _, e := range info.Attributes {
+		attrs[e.Key] = e.Value
+	}
 	cc := &CallContext{
-		Service: info.Service, Method: info.Method, CallID: strconv.FormatUint(in.CallID, 10),
-		Peer: info.PeerID, Metadata: md, IsStreaming: m.Pattern != PatternUnary,
+		Service: info.Service, Method: info.Method, CallID: strconv.FormatUint(info.CallID, 10),
+		Peer: info.PeerID, Metadata: md, Attributes: attrs, IsStreaming: m.Pattern != PatternUnary,
 		Pattern: m.Pattern.String(), Idempotent: m.Idempotent,
+	}
+	if info.SessionID != 0 {
+		cc.SessionID = strconv.Itoa(int(info.SessionID))
 	}
 	if !info.Deadline.IsZero() {
 		d := info.Deadline
 		cc.Deadline = &d
 	}
-	first, err := call.firstPayload()
-	if err != nil {
-		return err
-	}
-	_, err = ApplyRequestInterceptors(s.icpts, cc, first)
+	_, err := ApplyRequestInterceptors(s.icpts, cc, call.first)
 	return err
 }
 
-func (s *AsterServer) submitTrailer(callID uint64, st RpcStatus) error {
-	frame, err := trailerFrame(st)
-	if err != nil {
-		return err
-	}
-	return s.reactor.SubmitTrailer(s.ctx, callID, frame)
+// sessionRecord holds one session's instance; the factory runs on the
+// session's first call (on that call's goroutine).
+type sessionRecord struct {
+	mu      sync.Mutex
+	factory func(SessionInfo) any
+	info    SessionInfo
+	inst    any
+	made    bool
+	closed  bool
 }
 
-// serverCall is one inbound call: the inline first request and the response
-// side. Every exit path ends it with exactly one RpcStatus trailer.
+func (r *sessionRecord) get() (any, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, &RpcError{Code: StatusNotFound, Message: "session closed"}
+	}
+	if !r.made {
+		r.made = true // a panicking factory is not retried
+		r.inst = r.factory(r.info)
+	}
+	return r.inst, nil
+}
+
+func (r *sessionRecord) close() {
+	r.mu.Lock()
+	r.closed = true
+	inst, made := r.inst, r.made
+	r.inst = nil
+	r.mu.Unlock()
+	if made && inst != nil {
+		closeInstance(inst)
+	}
+}
+
+// serverCall is one inbound call: the first request payload (already
+// decompressed by Rust) and the response side. Every exit path ends it with
+// exactly one RpcStatus.
 type serverCall struct {
-	reactor    *Reactor
+	ds         *dispatchServer
 	callID     uint64
 	first      []byte
-	firstFlags byte
+	firstIsEnd bool
+	streaming  bool // server-stream / bidi: the trailer is a finish
 	codec      Codec
 	// base is the server context: QUEUE_FULL waits end when the server stops.
 	base      context.Context
 	completed atomic.Bool
 }
 
-const serverRecvPollMs = 100
-
-func (c *serverCall) firstPayload() ([]byte, error) {
-	p, err := PayloadOf(c.first, c.firstFlags)
-	if err != nil {
-		return nil, &RpcError{Code: StatusInvalidArgument, Message: "decompress request: " + err.Error()}
-	}
-	return p, nil
-}
-
 func (c *serverCall) decodeFirst(dest any) error {
-	p, err := c.firstPayload()
-	if err != nil {
-		return err
-	}
-	if err := c.codec.Decode(p, dest); err != nil {
+	if err := c.codec.Decode(c.first, dest); err != nil {
 		return &RpcError{Code: StatusInvalidArgument, Message: "decode request: " + err.Error()}
 	}
 	return nil
 }
 
 // requests yields every request payload of a client-stream / bidi call: the
-// inline first frame, then frames pulled from the reactor until END_STREAM.
-// An empty inline frame (a client that sent no messages) is skipped.
+// first (from the CALL event), then payloads pulled from Rust until the end
+// of the request stream. An empty first payload (a client that sent no
+// messages) is skipped.
 func (c *serverCall) requests(ctx context.Context) iter.Seq2[[]byte, error] {
 	return func(yield func([]byte, error) bool) {
 		if len(c.first) > 0 {
-			p, err := c.firstPayload()
-			if !yield(p, err) || err != nil {
+			if !yield(c.first, nil) {
 				return
 			}
 		}
-		if c.firstFlags&FlagEndStream != 0 {
+		if c.firstIsEnd {
 			return
 		}
 		for {
@@ -348,28 +573,26 @@ func (c *serverCall) requests(ctx context.Context) iter.Seq2[[]byte, error] {
 				yield(nil, err)
 				return
 			}
-			st, payload, flags, err := c.reactor.RecvFrame(c.callID, serverRecvPollMs)
+			// Blocks until a payload, the end of the request stream, or the
+			// call / connection is over. (A finite timeout would let ctx
+			// interrupt the wait, but aster_dispatch_recv with 0 <
+			// timeout < INFINITE builds its timer outside the Tokio runtime
+			// and panics as of ABI 3.5.0.)
+			st, payload, err := c.ds.recv(c.callID, timeoutInfinite)
 			if err != nil {
-				yield(nil, &RpcError{Code: StatusCancelled, Message: err.Error()})
+				yield(nil, &RpcError{Code: StatusInternal, Message: err.Error()})
 				return
 			}
 			switch st {
-			case RecvEndOfStream:
+			case recvEnd:
 				return
-			case RecvTimeout:
+			case recvTimeout:
 				continue
+			case recvGone:
+				yield(nil, errCallGone)
+				return
 			}
-			if len(payload) > 0 {
-				p, err := PayloadOf(payload, flags)
-				if err != nil {
-					yield(nil, &RpcError{Code: StatusInvalidArgument, Message: "decompress request: " + err.Error()})
-					return
-				}
-				if !yield(p, nil) {
-					return
-				}
-			}
-			if flags&FlagEndStream != 0 {
+			if !yield(payload, nil) {
 				return
 			}
 		}
@@ -377,9 +600,6 @@ func (c *serverCall) requests(ctx context.Context) iter.Seq2[[]byte, error] {
 }
 
 func (c *serverCall) send(ctx context.Context, v any) error {
-	if c.reactor.IsCancelled(c.callID) {
-		return &RpcError{Code: StatusCancelled, Message: "call cancelled by the peer"}
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -387,15 +607,14 @@ func (c *serverCall) send(ctx context.Context, v any) error {
 	if err != nil {
 		return fmt.Errorf("encode response: %w", err)
 	}
-	frame, err := EncodePayloadFrame(payload, 0)
-	if err != nil {
-		return err
+	if len(payload) == 0 {
+		return fmt.Errorf("encode response: empty payload: %w", ErrInvalidArgument)
 	}
-	return c.reactor.SubmitFrame(ctx, c.callID, frame)
+	return c.ds.send(c.base, c.callID, payload)
 }
 
-// completeUnary sends the single response and the OK trailer in one submit.
-func (c *serverCall) completeUnary(v any) error {
+// respond sends the single response with an OK status (unary / client-stream).
+func (c *serverCall) respond(v any) error {
 	if c.completed.Swap(true) {
 		return fmt.Errorf("call %d already completed", c.callID)
 	}
@@ -404,16 +623,10 @@ func (c *serverCall) completeUnary(v any) error {
 		c.completed.Store(false)
 		return fmt.Errorf("encode response: %w", err)
 	}
-	frame, err := EncodePayloadFrame(payload, 0)
-	if err != nil {
-		c.completed.Store(false)
+	if err := c.ds.respond(c.base, c.callID, payload, nil); err != nil && !errors.Is(err, errCallGone) {
 		return err
 	}
-	trailer, err := trailerFrame(RpcStatus{Code: StatusOK})
-	if err != nil {
-		return err
-	}
-	return c.reactor.SubmitContext(c.base, c.callID, ReactorResponse{ResponseFrame: frame, TrailerFrame: trailer})
+	return nil
 }
 
 // complete ends the call with st (no-op once completed).
@@ -421,19 +634,34 @@ func (c *serverCall) complete(st RpcStatus) error {
 	if c.completed.Swap(true) {
 		return nil
 	}
-	frame, err := trailerFrame(st)
-	if err != nil {
-		return err
+	var status []byte
+	if st.Code != StatusOK {
+		var err error
+		if status, err = EncodeRpcStatus(st); err != nil {
+			c.ds.abandon(c.callID)
+			return err
+		}
 	}
-	return c.reactor.SubmitTrailer(c.base, c.callID, frame)
+	if c.streaming {
+		return c.ds.finish(c.base, c.callID, status)
+	}
+	return c.ds.respond(c.base, c.callID, nil, status)
 }
 
-// invokeRecover runs the handler, turning a panic into an INTERNAL error.
-func invokeRecover(ctx context.Context, m *Method, call *serverCall) (err error) {
+// invokeRecover resolves the session instance and runs the handler, turning
+// a panic into an INTERNAL error.
+func invokeRecover(ctx context.Context, m *Method, session *sessionRecord, call *serverCall) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = &RpcError{Code: StatusInternal, Message: fmt.Sprintf("handler panic: %v", r)}
 		}
 	}()
+	if session != nil {
+		inst, err := session.get()
+		if err != nil {
+			return err
+		}
+		ctx = context.WithValue(ctx, sessionKey{}, inst)
+	}
 	return m.invoke(ctx, call)
 }

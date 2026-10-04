@@ -1,146 +1,135 @@
 //go:build cgo
 
-// AsterServer echo example: server accepts Aster RPC, echoes request back.
+// AsterServer echo example: a typed service served through Rust dynamic
+// dispatch (ABI 3.5), called over the pooled RPC client.
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"iter"
 	"os"
 	"time"
 
 	aster "aster-ffi"
 )
 
+type EchoRequest struct {
+	Message string
+}
+
+func (EchoRequest) AsterWireType() string { return "example/EchoRequest" }
+
+type EchoReply struct {
+	Message string
+	Seq     int32
+}
+
+func (EchoReply) AsterWireType() string { return "example/EchoReply" }
+
+func fail(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "   FAIL: "+format+"\n", args...)
+	os.Exit(1)
+}
+
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	fmt.Println("=== AsterServer Echo Example ===")
 
-	// 0. Compute contract_id via the Rust FFI
+	svc := aster.NewService("EchoService", 1,
+		aster.Unary("echo", func(ctx context.Context, r *EchoRequest) (*EchoReply, error) {
+			info, _ := aster.CallInfoFromContext(ctx)
+			fmt.Printf("   Server: %s from %s...\n", info.Method, info.PeerID[:8])
+			return &EchoReply{Message: r.Message}, nil
+		}),
+		aster.BidiStream("chat", func(_ context.Context, reqs iter.Seq2[*EchoRequest, error], send func(*EchoReply) error) error {
+			var n int32
+			for r, err := range reqs {
+				if err != nil {
+					return err
+				}
+				n++
+				if err := send(&EchoReply{Message: r.Message, Seq: n}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}),
+	)
+
+	// 0. Contract id, computed in Rust from the registration JSON.
 	fmt.Println("\n0. Computing contract_id via Rust FFI...")
-	contractJSON := `{"name": "EchoService", "version": 1, "methods": [], "serialization_modes": ["xlang"], "scoped": "shared", "requires": null, "producer_language": ""}`
-	contractID, err := aster.ComputeContractID(contractJSON)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error computing contract_id: %v\n", err)
-		os.Exit(1)
+	contractID, err := svc.ContractID()
+	if err != nil || len(contractID) != 64 {
+		fail("contract id %q: %v", contractID, err)
 	}
-	fmt.Printf("   contract_id: %s\n", contractID)
-	if len(contractID) != 64 {
-		fmt.Fprintf(os.Stderr, "   FAIL: Expected 64-char hex, got %d chars\n", len(contractID))
-		os.Exit(1)
-	}
-	fmt.Println("   PASS: Got valid 64-char hex contract_id.")
+	fmt.Printf("   contract_id: %s\n   PASS\n", contractID)
 
-	// 1. Start the echo server
-	fmt.Println("\n1. Starting AsterServer (echo handler)...")
-	server, err := aster.NewServer(ctx, aster.ServerConfig{
-		Handler: func(call aster.ReactorCall) aster.ReactorResponse {
-			fmt.Printf("   Server received call from %s...: header=%d bytes, request=%d bytes\n",
-				call.PeerID[:min(8, len(call.PeerID))],
-				len(call.Header),
-				len(call.Request))
-			// Echo the request back
-			return aster.ReactorResponse{ResponseFrame: call.Request}
-		},
-	})
+	// 1. Start the server (open gate, loopback).
+	fmt.Println("\n1. Starting AsterServer...")
+	cfg := aster.DefaultConfig()
+	cfg.RelayMode, cfg.BindAddr, cfg.AllowAllConsumers = "disabled", "127.0.0.1:0", true
+	srv, err := aster.StartServer(ctx, aster.ServerOptions{Config: cfg, Services: []*aster.Service{svc}})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating server: %v\n", err)
-		os.Exit(1)
+		fail("StartServer: %v", err)
 	}
-	defer server.Close()
+	defer srv.Close()
+	ticket, err := srv.Ticket(ctx)
+	if err != nil {
+		fail("ticket: %v", err)
+	}
+	nodeID, _ := srv.NodeID()
+	fmt.Printf("   Server started! Node ID: %s...\n", nodeID[:16])
 
-	nodeID, _ := server.NodeID()
-	fmt.Printf("   Server started! Node ID: %s...\n", nodeID[:min(16, len(nodeID))])
-
-	// 2. Create a client endpoint
-	fmt.Println("\n2. Creating client endpoint...")
-	clientRuntime, err := aster.NewRuntime(ctx, aster.DefaultRuntimeConfig())
+	// 2. Client.
+	fmt.Println("\n2. Connecting a client...")
+	ccfg := aster.DefaultConfig()
+	ccfg.RelayMode, ccfg.BindAddr = "disabled", "127.0.0.1:0"
+	cl, err := aster.StartClient(ctx, ccfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		fail("StartClient: %v", err)
 	}
-	defer clientRuntime.Close()
-
-	clientEndpoint, err := aster.NewEndpoint(ctx, clientRuntime, aster.EndpointConfig{
-		ALPNs: []string{aster.AsterALPN},
-	})
+	defer cl.Close()
+	conn, err := cl.ConnectTicket(ctx, ticket)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		fail("connect: %v", err)
 	}
-	defer clientEndpoint.Close(ctx)
-	fmt.Println("   Client endpoint created.")
-
-	// 3. Connect client to server
-	fmt.Println("\n3. Connecting client to server...")
-	serverAddr, err := server.Node().NodeAddr()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	conn, err := clientEndpoint.ConnectNodeAddr(ctx, serverAddr, aster.AsterALPN)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close("done")
 	fmt.Println("   Connected!")
 
-	// 4. Open stream and send Aster-framed RPC
-	fmt.Println("\n4. Opening stream and sending RPC...")
-	send, recv, err := conn.OpenBi(ctx)
+	// 3. Unary.
+	fmt.Println("\n3. Unary echo...")
+	reply, err := aster.Call[EchoRequest, EchoReply](ctx, conn, "EchoService", "echo", &EchoRequest{Message: "Hello, Aster!"})
+	if err != nil || reply.Message != "Hello, Aster!" {
+		fail("echo: %v %+v", err, reply)
+	}
+	fmt.Printf("   Received: %q\n   PASS\n", reply.Message)
+
+	// 4. Bidi ping-pong: each request waits for the previous reply.
+	fmt.Println("\n4. Bidi ping-pong...")
+	b, err := aster.OpenBidiStream[EchoRequest, EchoReply](ctx, conn, "EchoService", "chat")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		fail("open bidi: %v", err)
 	}
-	defer send.Close()
-	defer recv.Close()
-
-	headerPayload := []byte("EchoService.echo")
-	requestPayload := []byte("Hello, Aster!")
-
-	headerFrame := aster.EncodeFrame(headerPayload, aster.FlagHeader)
-	requestFrame := aster.EncodeFrame(requestPayload, 0)
-
-	combined := append(headerFrame, requestFrame...)
-	if err := send.Write(ctx, combined); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	defer b.Close()
+	for i, msg := range []string{"ping", "pong", "done"} {
+		if err := b.Send(&EchoRequest{Message: msg}); err != nil {
+			fail("send: %v", err)
+		}
+		r, err := b.Recv()
+		if err != nil || r.Message != msg || r.Seq != int32(i+1) {
+			fail("recv: %v %+v", err, r)
+		}
+		fmt.Printf("   %s -> %s #%d\n", msg, r.Message, r.Seq)
 	}
-	if err := send.Finish(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	if err := b.CloseSend(); err != nil {
+		fail("close send: %v", err)
 	}
-	fmt.Println("   Sent header + request.")
-
-	// 5. Read the response
-	fmt.Println("\n5. Reading response...")
-	response, err := recv.Read(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	if _, err := b.Recv(); err == nil {
+		fail("expected the end of the stream")
 	}
-	fmt.Printf("   Received %d bytes: %s\n", len(response), string(response))
+	fmt.Println("   PASS")
 
-	if bytes.Equal(response, requestPayload) {
-		fmt.Println("   PASS: Response matches echoed payload!")
-	} else {
-		fmt.Fprintf(os.Stderr, "   FAIL: Expected %d bytes, got %d bytes.\n",
-			len(requestPayload), len(response))
-		os.Exit(1)
-	}
-
-	// 6. Cleanup
-	fmt.Println("\n6. Cleaning up...")
 	fmt.Println("\n=== SUCCESS: AsterServer echo round-trip works! ===")
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

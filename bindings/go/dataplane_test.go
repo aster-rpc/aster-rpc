@@ -236,7 +236,7 @@ func TestRPC_QueueFullBackpressure(t *testing.T) {
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	for attempt := 0; attempt < 4 && f.srv.reactor.QueueFullHits() == 0; attempt++ {
+	for attempt := 0; attempt < 4 && f.srv.QueueFullHits() == 0; attempt++ {
 		var n int32
 		for r, err := range CallServerStream[testEchoRequest, testEchoReply](ctx, f.conn, "Flood", "flood", &testEchoRequest{Data: []byte{}}) {
 			if err != nil {
@@ -254,7 +254,7 @@ func TestRPC_QueueFullBackpressure(t *testing.T) {
 			t.Fatalf("%d items, want %d", n, items)
 		}
 	}
-	if f.srv.reactor.QueueFullHits() == 0 {
+	if f.srv.QueueFullHits() == 0 {
 		t.Fatal("expected at least one QUEUE_FULL")
 	}
 }

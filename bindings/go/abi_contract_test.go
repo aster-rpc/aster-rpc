@@ -25,7 +25,8 @@ func TestABI_StructSizes(t *testing.T) {
 		"aster_connection_info_t":    56,
 		"aster_transport_snapshot_t": 56,
 		"aster_transport_metrics_t":  136,
-		"aster_reactor_call_t":       112,
+		"aster_dispatch_event_t":     104,
+		"aster_call_options_t":       72,
 	}
 	got := cStructSizes()
 	for name, w := range want {
@@ -33,8 +34,14 @@ func TestABI_StructSizes(t *testing.T) {
 			t.Errorf("sizeof(%s) = %d, want %d", name, got[name], w)
 		}
 	}
-	if off := reactorCallEventKindOffset(); off != 0 {
-		t.Errorf("offsetof(aster_reactor_call_t, event_kind) = %d, want 0", off)
+	wantOff := map[string]uintptr{
+		"kind": 0, "flags": 4, "call_id": 8, "session_key": 24, "connection_handle": 40,
+		"deadline_unix_ms": 48, "session_id": 60, "request_ptr": 64, "peer_ptr": 80, "buffer": 96,
+	}
+	for name, off := range dispatchEventOffsets() {
+		if off != wantOff[name] {
+			t.Errorf("offsetof(aster_dispatch_event_t, %s) = %d, want %d", name, off, wantOff[name])
+		}
 	}
 }
 

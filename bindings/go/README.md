@@ -5,7 +5,7 @@
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 3.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Status (ABI 3.4 catch-up, 2026-10-04)
+## Status (ABI 3.5 dynamic dispatch, 2026-10-04)
 
 **Working at RPC parity for open-gate interop.** Go is in the `tests/interop/`
 matrix (Rust / Python / TypeScript / Java / .NET / Go, 6×6 = 36/36, identical
@@ -13,7 +13,7 @@ matrix (Rust / Python / TypeScript / Java / .NET / Go, 6×6 = 36/36, identical
 whose ABI major differs (3).
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
-  safe for concurrent use. Payload types implement `aster.WireTyped`
+  safe for concurrent use (a pool of Fory instances, no global lock). Payload types implement `aster.WireTyped`
   (`AsterWireType() string { return "namespace/Name" }`) and are registered by
   name automatically. **`[]byte` fields must be tagged `fory:"type=bytes"`**:
   untagged, Fory Go writes them as `list<uint8>`, not the `binary` every other
@@ -39,20 +39,39 @@ whose ABI major differs (3).
   code/reason, admit/revoke/is-admitted/should-allow). Without a gate, a node
   with `EnableHooks` delivers `*AdmissionRequest`s on `Node.Admissions()`;
   answer with `Allow()` / `Deny(code, reason)` (`aster_admission_respond`).
-- **Server:** `StartServer(ctx, ServerOptions{Config, Services, Gate,
-  Interceptors})` serves `Unary`, `ServerStream`, `ClientStream` and
-  `BidiStream` methods (generic, `context.Context` first, streams as
-  `iter.Seq2[*Req, error]` + `send func(*Resp) error`). Header deadlines become
-  context deadlines; every call ends with exactly one AEv1 `RpcStatus` trailer
-  (`*RpcError` keeps its code, deadline → `DEADLINE_EXCEEDED`, panics and other
-  errors → `INTERNAL`). The default gate is `TrustOpenDev` when
-  `AllowAllConsumers` is set, else `TrustProtected`. QUEUE_FULL is handled by
-  reserving response capacity (exercised by `TestRPC_QueueFullBackpressure`).
+- **Server (ABI 3.5 dynamic dispatch):** `StartServer(ctx, ServerOptions{Config,
+  Services, Gate, Interceptors, ...})` registers each service as its JSON
+  registration form (`DynamicServiceJSON`; contract id from
+  `aster_dynamic_service_contract_id`) with `aster_server_*`; Rust's
+  `aster::rpc::Server` decodes headers, routes, enforces Gate 3 (`Requires`),
+  sessions (graveyard, per-connection cap), deadlines
+  (`min(header, method Timeout, HandlerTimeout)`) and per-method
+  `MaxFrameSize`, and serves `aster.ops.NodeInfo` (`DisableNodeInfo`,
+  `Topology`). Go drains `aster_server_poll` on one goroutine, runs each call
+  on its own goroutine and answers by call id (`aster_dispatch_respond` /
+  `send` / `finish`; QUEUE_FULL reserves capacity and parks until
+  `RESPONSE_WRITABLE`). Methods: `Unary`, `ServerStream`, `ClientStream`,
+  `BidiStream` (generic, `context.Context` first, streams as
+  `iter.Seq2[*Req, error]` + `send func(*Resp) error`); options `Idempotent`,
+  `Timeout`, `MaxFrameSize`, `Requires(RequireRole/AnyOf/AllOf)`. The handler
+  context carries the call deadline and ends on a peer cancel (streaming) or
+  deadline. Session-scoped services: `NewSessionService(name, v, factory,
+  ...)`, instance via `Session[T](ctx)`, closed (`io.Closer`) when the
+  session ends. `SetPeerAttributes` feeds Gate 3 (attribute bridge);
+  `CallInfo.Attributes` / `Metadata` are read lazily from Rust.
+  `OnConnectionClosed`, `OnNonRPC` (accepted non-`aster/1` ALPN connections,
+  owned by the callback). Every call ends with exactly one AEv1 `RpcStatus`
+  (`*RpcError` keeps its code, deadline → `DEADLINE_EXCEEDED`, panics and
+  other errors → `INTERNAL`).
 - **Client:** `StartClient` / `NewClient`, `ConnectTicket`; `Call`,
-  `CallServerStream`, `CallClientStream`, `CallBidiStream` (generic package
-  functions; the deadline comes from `ctx`, rounded up to whole seconds;
-  `WithMetadata`, `WithSessionID`). Unary uses the pooled `aster_call_unary`
-  fast path, streaming calls a dedicated substream. Consumer admission is not
+  `CallServerStream`, `CallClientStream`, `CallBidiStream`, `OpenBidiStream`
+  (`Send` / `CloseSend` / `Recv`) over the pooled `aster::rpc::RpcConnection`
+  (`aster_rpc_unary`, `aster_rpc_open`, `aster_call_*_payload`). The ctx
+  deadline is enforced natively; cancelling ctx cancels streaming calls
+  natively (`aster_call_cancel`). Requests of client-stream / bidi calls are
+  sent as the iterator yields them (ping-pong works). Sessions:
+  `RpcConnection.NewSessionID` (the connection's shared counter) +
+  `WithSession`; `WithMetadata`, `WithVersion`. Consumer admission is not
   performed (open gate / admitted peers only, as for .NET and Java).
 - **Errors:** `errors.Is` against `ErrNotFound`, `ErrInvalidArgument`,
   `ErrVerificationFailed`, ... (status codes) and `ErrRpcNotFound`,
@@ -83,11 +102,16 @@ unnamed; `Node` had no `Docs()`.
 
 Known gaps:
 
-- Session-scoped services are not served (`StartServer` rejects them); client
-  interceptors are not wired; no `go generate` codegen yet.
-- Unary cancellation stops waiting but does not cancel the native call.
-- `CallBidiStream` waits for the request iterator to finish before returning.
-- The payload codec serialises through one Fory instance under a mutex.
+- Client interceptors are not wired; no `go generate` codegen yet; no
+  consumer-admission handler (`OnNonRPC` hands the connection over).
+- Unary cancellation (other than the deadline) stops waiting but cannot
+  cancel the native call: `aster_rpc_unary` has no call handle.
+- A client-stream call with no request is refused by the Rust client
+  (`INVALID_ARGUMENT`).
+- A client-stream / bidi handler blocked waiting for the next request is not
+  woken by its context (`aster_dispatch_recv` runs with
+  `ASTER_TIMEOUT_INFINITE`: a finite timeout panics in ABI 3.5.0); it returns
+  when the request stream ends or the connection closes.
 - `hostile_race_test.go` / `TestSoak_Short` have no peer and only check "no
   crash"; `TestSoak_Runs` (30 min) is skipped unless `ASTER_GO_SOAK=1`.
 
@@ -104,7 +128,7 @@ export DYLD_LIBRARY_PATH="$(pwd)/../../target/debug"   # LD_LIBRARY_PATH on Linu
 
 go vet ./...
 go test ./...                       # all cgo tests (RPC, node, vectors, data plane)
-go run ./cmd/aster_server_test      # legacy raw reactor echo
+go run ./cmd/aster_server_test      # typed server + client echo, bidi ping-pong
 
 # Pure-Go unit tests (no native library)
 CGO_ENABLED=0 go test ./...
@@ -122,19 +146,19 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | File | Purpose |
 |------|---------|
 | `go.mod` | Module definition |
-| `iroh.go` | Status / event-kind / reactor-event constants from `aster_ffi.h` (`//go:build cgo`) |
+| `iroh.go` | Status / event-kind constants from `aster_ffi.h` (`//go:build cgo`) |
 | `cmem.go` | C-memory arena + `aster_bytes_t` helpers for building FFI structs |
-| `reactor.go` | `Reactor` — poll (event kinds), submit with QUEUE_FULL capacity reservation |
-| `server.go` | `Server` — raw reactor poll loop + byte-level handler (legacy; use `AsterServer`) |
+| `dispatch.go` | ABI 3.5 `aster_server_*` / `aster_dispatch_*` wrapper: poll, respond/send/finish with QUEUE_FULL reservation, recv, k/v lists |
+| `server.go` | ALPN, frame flags, `EncodeFrame` |
 | `config.go` | `AsterConfig` ↔ `aster_config_t`, `ConfigFromEnv` / `ConfigFromTOML` |
 | `node_start.go` | `StartNode`, admission requests, connect/accept/ticket helpers |
 | `gate.go` | `Gate` — Gate-0 policy (`aster_gate_*`) |
 | `envelope.go` | AEv1 envelope, zstd, framing (via the C ABI) |
 | `codec.go` | `Codec`, `ForyCodec` (Fory 1.7.6), `WireTyped` |
 | `contract.go` | Contract identity: TypeDef / ServiceContract JSON → Rust hash |
-| `rpc_service.go` | `Service`, `Unary` / `ServerStream` / `ClientStream` / `BidiStream`, `CallInfo` |
-| `rpc_server.go` | `AsterServer` — typed dispatch, deadlines, RpcStatus trailers |
-| `rpc_client.go` | `AsterClient`, `RpcConnection`, `Call*` functions |
+| `rpc_service.go` | `Service` / `NewSessionService`, `Unary` / `ServerStream` / `ClientStream` / `BidiStream`, `Requires`, `CallInfo`, `DynamicServiceJSON` |
+| `rpc_server.go` | `AsterServer` — dispatch events → typed handlers, sessions, cancellation, RpcStatus |
+| `rpc_client.go` | `AsterClient`, `RpcConnection`, `Call*` functions, `BidiCall` (`aster_rpc_*`) |
 | `dataplane.go` | ABI 3.3 blobs / tags / docs / paths / priority wrappers |
 | `pure.go`, `grants.go` | ABI 3.4 ids, HPKE, attestation, sealed grants |
 | `types.go` | Event types and event kind constants (`//go:build !cgo`) |

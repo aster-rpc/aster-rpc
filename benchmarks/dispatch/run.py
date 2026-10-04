@@ -49,7 +49,11 @@ REPO = HERE.parents[1]
 INTEROP = REPO / "tests/interop"
 JAVA_DIR = REPO / "bindings/java"
 TARGET = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target"))
-SERVERS = ("rust", "python", "ts", "java")
+SERVERS = ("rust", "python", "ts", "java", "go")
+# The Go server: tests/interop/go built with cgo against the release FFI
+# library (see go_build); ASTER_BENCH_GO_BIN overrides it (e.g. to compare
+# two builds). Driven by the Rust clients only (no Go bench client).
+GO_BIN = Path(os.environ.get("ASTER_BENCH_GO_BIN", TARGET / "release/interop_echo_go"))
 CLIENTS = ("own", "rust", "rust-rpc")
 
 ENV = {
@@ -77,12 +81,23 @@ def build() -> None:
         *launcher, "cargo", "build", "--release", "-p", "aster", "--features", "rpc,binding-support",
         "--example", "interop_echo", "--example", "dispatch_driver",
     ])
+    go_build()
     pkg = REPO / "bindings/typescript/packages/aster"
     sh("ts package (tsc)", ["bun", "run", "build"], pkg)
     sh("ts aster-gen", ["node", str(pkg / "dist/cli/gen.js"), "-p", "tsconfig.json", "-o", "aster-rpc.generated.ts"],
        INTEROP / "ts")
     sh("java modules", ["mvn", "-P", "fast", "-o", "-q", "-pl", "aster-examples-mission-control", "-am", "package",
                         "-DskipTests"], JAVA_DIR)
+
+
+def go_build() -> None:
+    lib_dir = TARGET / "release"
+    env = {**ENV, "CGO_ENABLED": "1", "CGO_CFLAGS": f"-I{REPO / 'ffi'}",
+           "CGO_LDFLAGS": f"-L{lib_dir} -laster_transport_ffi -Wl,-rpath,{lib_dir}"}
+    cmd = ["go", "build", "-o", str(TARGET / "release/interop_echo_go"), "."]
+    print(f"[build] go interop_echo: {shlex.join(cmd)}", flush=True)
+    if subprocess.run(cmd, cwd=INTEROP / "go", env=env).returncode != 0:
+        sys.exit("[build] go interop_echo failed")
 
 
 _java_cp: str | None = None
@@ -118,13 +133,15 @@ def server_cmd(lang: str) -> tuple[list[str], Path]:
         return ["bun", "run", "interop_echo.ts", "server"], INTEROP / "ts"
     if lang == "java":
         return java_cmd("server"), REPO
+    if lang == "go":
+        return [str(GO_BIN), "server"], REPO
     raise ValueError(lang)
 
 
 def client_cmd(server: str, client: str, ticket: str, opts: list[str]) -> tuple[list[str], Path]:
     driver = str(TARGET / "release/examples/dispatch_driver")
     online = ["--online"] if server == "java" else []
-    if client == "rust" or (client == "own" and server == "rust"):
+    if client == "rust" or (client == "own" and server in ("rust", "go")):
         return [driver, ticket, *opts, *online], REPO
     if client == "rust-rpc":
         return [driver, ticket, "--mode", "rpc", "--skip-streams", *opts, *online], REPO
@@ -295,7 +312,8 @@ def tables(res: dict) -> str:
 
 def client_label(server: str, client: str) -> str:
     if client == "own":
-        return {"rust": "rust (pooled)", "python": "python", "ts": "ts (bun)", "java": "java"}[server]
+        return {"rust": "rust (pooled)", "python": "python", "ts": "ts (bun)", "java": "java",
+                "go": "rust driver (pooled)"}[server]
     return {"rust": "rust driver (pooled)", "rust-rpc": "rust driver (RpcConnection)"}[client]
 
 
@@ -315,7 +333,7 @@ def main() -> int:
         build()
     servers = [s for s in args.servers.split(",") if s]
     clients = [c for c in args.clients.split(",") if c]
-    plan = [(s, c) for s in servers for c in clients if not (s == "rust" and c == "rust")]
+    plan = [(s, c) for s in servers for c in clients if not (s in ("rust", "go") and c == "rust")]
     opts = ["--duration", str(args.duration), "--warmup", str(args.warmup), "--concurrency", args.concurrency]
 
     info = machine_info()

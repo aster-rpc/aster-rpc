@@ -6,6 +6,7 @@ package aster
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "aster_ffi.h"
 */
@@ -15,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"math"
 	"sync"
@@ -23,12 +25,14 @@ import (
 )
 
 // CallOption configures one RPC call. The deadline comes from the context:
-// it is sent rounded up to whole seconds (max 32767 s).
+// Rust enforces it client-side (DEADLINE_EXCEEDED) and sends it rounded up
+// to whole seconds.
 type CallOption func(*callOptions)
 
 type callOptions struct {
 	metadata  []MetadataEntry
-	sessionID int32
+	sessionID uint32
+	version   int32
 }
 
 // WithMetadata adds a request-metadata pair to the stream header.
@@ -36,9 +40,29 @@ func WithMetadata(key, value string) CallOption {
 	return func(o *callOptions) { o.metadata = append(o.metadata, MetadataEntry{key, value}) }
 }
 
-// WithSessionID targets a session of a session-scoped service (0 = shared).
-func WithSessionID(id int32) CallOption {
+// WithSession targets a session of a session-scoped service: id comes from
+// RpcConnection.NewSessionID (0 = shared). The server creates the session on
+// the first call carrying it.
+func WithSession(id uint32) CallOption {
 	return func(o *callOptions) { o.sessionID = id }
+}
+
+// WithSessionID is WithSession with the wire's int32 type.
+func WithSessionID(id int32) CallOption {
+	return func(o *callOptions) { o.sessionID = uint32(id) }
+}
+
+// WithVersion sets the service version (default 1).
+func WithVersion(v int32) CallOption {
+	return func(o *callOptions) { o.version = v }
+}
+
+func buildOptions(opts []CallOption) *callOptions {
+	o := &callOptions{version: 1}
+	for _, f := range opts {
+		f(o)
+	}
+	return o
 }
 
 // AsterClient is an RPC client: a node, a codec and a cache of RpcConnections.
@@ -140,9 +164,10 @@ func (c *AsterClient) Close() error {
 	return err
 }
 
-// RpcConnection carries RPC calls over one QUIC connection through the C ABI
-// multiplexed-stream pool (aster_call_*): unary calls use the pooled fast
-// path, streaming calls a dedicated substream. Safe for concurrent calls.
+// RpcConnection carries RPC calls over one QUIC connection through Rust's
+// pooled aster::rpc::RpcConnection (aster_rpc_*): unary calls share the
+// connection's pooled streams, streaming calls get their own. Safe for
+// concurrent calls.
 type RpcConnection struct {
 	conn  *Connection
 	codec Codec
@@ -165,397 +190,470 @@ func (rc *RpcConnection) Close() error { return rc.conn.Close("") }
 func (rc *RpcConnection) rt() C.uint64_t   { return C.uint64_t(rc.conn.runtime.handle) }
 func (rc *RpcConnection) conv() C.uint64_t { return C.uint64_t(rc.conn.handle) }
 
-func deadlineSeconds(ctx context.Context) int16 {
-	d, ok := ctx.Deadline()
-	if !ok {
-		return 0
+// NewSessionID returns a fresh session id from the connection's shared
+// counter (aster_connection_next_session_id: Rust and binding clients on the
+// connection never collide). Pass it with WithSession.
+func (rc *RpcConnection) NewSessionID() (uint32, error) {
+	var id C.uint32_t
+	if err := statusError(C.aster_connection_next_session_id(rc.rt(), rc.conv(), &id)); err != nil {
+		return 0, fmt.Errorf("aster_connection_next_session_id: %w", err)
 	}
-	secs := math.Ceil(time.Until(d).Seconds())
-	switch {
-	case secs < 1:
-		return 1
-	case secs > math.MaxInt16:
-		return math.MaxInt16
-	}
-	return int16(secs)
+	return uint32(id), nil
 }
 
-func headerFrame(ctx context.Context, service, method string, o *callOptions) ([]byte, error) {
-	b, err := EncodeStreamHeader(StreamHeader{
-		Service: service, Method: method, Version: 1,
-		Deadline: deadlineSeconds(ctx), Metadata: o.metadata, SessionID: o.sessionID,
-	})
+// nativeOptions is an aster_call_options_t plus its strings in one C
+// allocation (the struct holds pointers, so it cannot live in Go memory).
+type nativeOptions struct {
+	p unsafe.Pointer
+}
+
+func (n nativeOptions) ptr() *C.aster_call_options_t { return (*C.aster_call_options_t)(n.p) }
+func (n nativeOptions) free()                        { C.free(n.p) }
+
+// lowerOptions builds the native options; the deadline is the time left on
+// ctx (rounded up to whole ms), and an expired ctx fails here.
+func lowerOptions(ctx context.Context, service, method string, o *callOptions) (nativeOptions, error) {
+	var deadlineMs uint32
+	if d, ok := ctx.Deadline(); ok {
+		left := time.Until(d)
+		if left <= 0 {
+			return nativeOptions{}, ctxError(ctx, &RpcError{Code: StatusDeadlineExceeded, Message: "deadline exceeded before the call"})
+		}
+		ms := math.Ceil(float64(left) / float64(time.Millisecond))
+		deadlineMs = uint32(min(ms, math.MaxUint32-1))
+	}
+	md := encodeKV(o.metadata)
+	size := unsafe.Sizeof(C.aster_call_options_t{})
+	total := size + uintptr(len(service)+len(method)+len(md))
+	p := C.calloc(1, C.size_t(total))
+	if p == nil {
+		panic("aster: calloc failed")
+	}
+	opts := (*C.aster_call_options_t)(p)
+	opts.struct_size = C.uint32_t(size)
+	opts.version = C.int32_t(o.version)
+	opts.session_id = C.uint32_t(o.sessionID)
+	opts.deadline_ms = C.uint32_t(deadlineMs)
+	off := size
+	put := func(b []byte) C.struct_aster_bytes_t {
+		if len(b) == 0 {
+			return C.struct_aster_bytes_t{}
+		}
+		dst := unsafe.Add(p, off)
+		C.memcpy(dst, unsafe.Pointer(&b[0]), C.size_t(len(b)))
+		off += uintptr(len(b))
+		return C.struct_aster_bytes_t{ptr: (*C.uint8_t)(dst), len: C.uintptr_t(len(b))}
+	}
+	opts.service = put([]byte(service))
+	opts.method = put([]byte(method))
+	opts.metadata = put(md)
+	return nativeOptions{p}, nil
+}
+
+// ctxError joins a CANCELLED / DEADLINE_EXCEEDED status with ctx's error
+// when ctx ended, so errors.Is matches both (ErrRpcDeadlineExceeded and
+// context.DeadlineExceeded).
+func ctxError(ctx context.Context, err *RpcError) error {
+	if ce := ctx.Err(); ce != nil && (err.Code == StatusCancelled || err.Code == StatusDeadlineExceeded) {
+		return fmt.Errorf("%w: %w", err, ce)
+	}
+	// The native timer (armed from ctx's deadline, rounded up to ms) can
+	// fire before Go's own context timer has marked ctx done.
+	if d, ok := ctx.Deadline(); ok && err.Code == StatusDeadlineExceeded && !time.Now().Before(d) {
+		return fmt.Errorf("%w: %w", err, context.DeadlineExceeded)
+	}
+	return err
+}
+
+// statusFromBytes decodes an AEv1 RpcStatus; code 0 is nil.
+func statusFromBytes(ctx context.Context, code int32, b []byte) error {
+	if code == 0 && len(b) == 0 {
+		return nil
+	}
+	st, err := DecodeRpcStatus(b)
 	if err != nil {
-		return nil, err
+		if code == 0 {
+			return &RpcError{Code: StatusInternal, Message: "malformed trailer: " + err.Error()}
+		}
+		st = RpcStatus{Code: StatusCode(code), Message: "malformed status: " + err.Error()}
 	}
-	return EncodeFrame(b, FlagHeader), nil
+	if st.Code == StatusOK {
+		return nil
+	}
+	return ctxError(ctx, st.Err().(*RpcError))
 }
 
-func buildOptions(opts []CallOption) *callOptions {
-	o := &callOptions{}
-	for _, f := range opts {
-		f(o)
+func (rc *RpcConnection) releaseBuffer(b C.uint64_t) {
+	if b != 0 {
+		C.aster_call_buffer_release(rc.rt(), b)
 	}
-	return o
 }
 
-// callError maps aster_call_* failures (ASTER_CALL_ERR_* or a status).
-func callError(code C.int32_t, what string) error {
-	switch code {
-	case C.ASTER_CALL_ERR_POOL_FULL:
-		return &RpcError{Code: StatusResourceExhausted, Message: what + ": stream pool full"}
-	case C.ASTER_CALL_ERR_QUIC_LIMIT_REACHED:
-		return &RpcError{Code: StatusResourceExhausted, Message: what + ": QUIC stream limit reached"}
-	case C.ASTER_CALL_ERR_PEER_STREAM_LIMIT_TOO_LOW:
-		return &RpcError{Code: StatusResourceExhausted, Message: what + ": peer stream limit too low"}
-	case C.ASTER_CALL_ERR_STREAM_OPEN_FAILED:
-		return &RpcError{Code: StatusUnavailable, Message: what + ": stream open failed: " + lastErrorMessage()}
-	case C.ASTER_CALL_ERR_POOL_CLOSED:
-		return &RpcError{Code: StatusUnavailable, Message: what + ": stream pool closed"}
+// unary runs aster_rpc_unary (blocking) and returns the response payload or
+// the call's failure.
+func (rc *RpcConnection) unary(ctx context.Context, opts nativeOptions, req []byte) ([]byte, error) {
+	p, n := cBytesArg(req)
+	var respPtr, statusPtr *C.uint8_t
+	var respLen, statusLen C.uint32_t
+	var respBuf, statusBuf C.uint64_t
+	var code C.int32_t
+	r := C.aster_rpc_unary(rc.rt(), rc.conv(), opts.ptr(), p, n,
+		&respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+	if r != C.ASTER_STATUS_OK {
+		if r == C.ASTER_STATUS_NOT_FOUND {
+			return nil, &RpcError{Code: StatusUnavailable, Message: "connection closed"}
+		}
+		return nil, fmt.Errorf("aster_rpc_unary: %w", statusError(r))
 	}
-	return &RpcError{Code: StatusUnavailable, Message: fmt.Sprintf("%s: %v", what, statusError(code))}
+	if code != 0 {
+		var st []byte
+		if statusLen > 0 {
+			st = C.GoBytes(unsafe.Pointer(statusPtr), C.int(statusLen))
+		}
+		rc.releaseBuffer(statusBuf)
+		rc.releaseBuffer(respBuf)
+		return nil, statusFromBytes(ctx, int32(code), st)
+	}
+	resp := []byte{}
+	if respLen > 0 {
+		resp = C.GoBytes(unsafe.Pointer(respPtr), C.int(respLen))
+	}
+	rc.releaseBuffer(respBuf)
+	rc.releaseBuffer(statusBuf)
+	return resp, nil
 }
 
-// Call makes a unary call. Cancelling ctx stops waiting (the native call
-// runs to completion or to the transport deadline).
+// Call makes a unary call on the connection's pooled streams. The context's
+// deadline is enforced natively; cancelling ctx stops waiting (the native
+// unary call has no cancel handle and runs to its deadline or completion).
 func Call[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, opts ...CallOption) (*Resp, error) {
-	o := buildOptions(opts)
 	payload, err := rc.codec.Encode(req)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	pair, err := headerFrame(ctx, service, method, o)
+	nopts, err := lowerOptions(ctx, service, method, buildOptions(opts))
 	if err != nil {
 		return nil, err
 	}
-	body, err := EncodePayloadFrame(payload, FlagEndStream)
+	var resp []byte
+	if ctx.Done() == nil {
+		resp, err = rc.unary(ctx, nopts, payload)
+		nopts.free()
+	} else {
+		type result struct {
+			resp []byte
+			err  error
+		}
+		done := make(chan result, 1)
+		go func() {
+			r, e := rc.unary(ctx, nopts, payload)
+			nopts.free()
+			done <- result{r, e}
+		}()
+		select {
+		case r := <-done:
+			resp, err = r.resp, r.err
+		case <-ctx.Done():
+			select {
+			case r := <-done: // finished at the same moment: prefer its outcome
+				resp, err = r.resp, r.err
+			default:
+				code := StatusCancelled
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					code = StatusDeadlineExceeded
+				}
+				return nil, ctxError(ctx, &RpcError{Code: code, Message: ctx.Err().Error()})
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	pair = append(pair, body...)
-
-	type result struct {
-		resp    []byte
-		flags   byte
-		hasResp bool
-		trailer []byte
-		err     error
-	}
-	done := make(chan result, 1)
-	go func() {
-		var r result
-		r.resp, r.flags, r.hasResp, r.trailer, r.err = rc.unaryNative(pair, uint32(o.sessionID))
-		done <- r
-	}()
-	var r result
-	select {
-	case r = <-done:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	if r.err != nil {
-		return nil, r.err
-	}
-	if err := trailerStatus(r.trailer); err != nil {
-		return nil, err
-	}
-	if !r.hasResp {
-		return nil, &RpcError{Code: StatusInternal, Message: "OK trailer with no response frame"}
-	}
-	return decodeResponse[Resp](rc.codec, r.resp, r.flags)
+	return decodeResponse[Resp](rc.codec, resp)
 }
 
-func trailerStatus(trailer []byte) error {
-	if len(trailer) == 0 {
-		return nil
-	}
-	st, err := DecodeRpcStatus(trailer)
-	if err != nil {
-		return &RpcError{Code: StatusInternal, Message: "malformed trailer: " + err.Error()}
-	}
-	return st.Err()
-}
-
-func decodeResponse[Resp any](codec Codec, payload []byte, flags byte) (*Resp, error) {
-	p, err := PayloadOf(payload, flags)
-	if err != nil {
-		return nil, &RpcError{Code: StatusInternal, Message: "decompress response: " + err.Error()}
-	}
+func decodeResponse[Resp any](codec Codec, payload []byte) (*Resp, error) {
 	resp := new(Resp)
-	if err := codec.Decode(p, resp); err != nil {
+	if err := codec.Decode(payload, resp); err != nil {
 		return nil, &RpcError{Code: StatusInternal, Message: "decode response: " + err.Error()}
 	}
 	return resp, nil
 }
 
-func (rc *RpcConnection) unaryNative(pair []byte, sessionID uint32) (resp []byte, flags byte, hasResp bool, trailer []byte, err error) {
-	in := C.CBytes(pair)
-	defer C.free(in)
-	var respPtr, trailerPtr *C.uint8_t
-	var respLen, trailerLen C.uint32_t
-	var respFlags C.uint8_t
-	var respBuf, trailerBuf C.uint64_t
-	r := C.aster_call_unary(rc.rt(), rc.conv(), C.uint32_t(sessionID), (*C.uint8_t)(in), C.uint32_t(len(pair)),
-		&respPtr, &respLen, &respFlags, &respBuf, &trailerPtr, &trailerLen, &trailerBuf)
-	if r != 0 {
-		return nil, 0, false, nil, callError(r, "aster_call_unary")
-	}
-	if respBuf != 0 || respLen > 0 {
-		hasResp = true
-		resp = C.GoBytes(unsafe.Pointer(respPtr), C.int(respLen))
-		flags = byte(respFlags)
-	}
-	if trailerLen > 0 {
-		trailer = C.GoBytes(unsafe.Pointer(trailerPtr), C.int(trailerLen))
-	}
-	if respBuf != 0 {
-		C.aster_call_buffer_release(rc.rt(), respBuf)
-	}
-	if trailerBuf != 0 {
-		C.aster_call_buffer_release(rc.rt(), trailerBuf)
-	}
-	return resp, flags, hasResp, trailer, nil
-}
-
 // ─── Streaming ──────────────────────────────────────────────────────────────
 
-const clientRecvPollMs = 100
+// errCallClosed: the call is over; its trailer says why.
+var errCallClosed = errors.New("aster: call is over")
 
-// streamingCall is one call on a dedicated substream (aster_call_acquire_streaming).
-type streamingCall struct {
-	rc        *RpcConnection
-	call      C.uint64_t
-	succeeded bool
-	once      sync.Once
+// rpcCall is one aster_rpc_open call. Cancelling its context cancels it
+// natively (aster_call_cancel: FLAG_CANCEL + stream reset), which also wakes
+// a blocked recv.
+type rpcCall struct {
+	rc   *RpcConnection
+	ctx  context.Context
+	h    C.aster_call_t
+	stop func() bool
+	once sync.Once
 }
 
-func openStreaming(ctx context.Context, rc *RpcConnection, service, method string, o *callOptions) (*streamingCall, error) {
-	header, err := headerFrame(ctx, service, method, o)
+func openCall(ctx context.Context, rc *RpcConnection, pattern MethodPattern, service, method string, o *callOptions) (*rpcCall, error) {
+	nopts, err := lowerOptions(ctx, service, method, o)
 	if err != nil {
 		return nil, err
 	}
+	defer nopts.free()
 	var h C.aster_call_t
-	if r := C.aster_call_acquire_streaming(rc.rt(), rc.conv(), &h); r != 0 {
-		return nil, callError(r, "aster_call_acquire_streaming")
-	}
-	sc := &streamingCall{rc: rc, call: C.uint64_t(h)}
-	if err := sc.sendFrame(header); err != nil {
-		sc.close()
-		return nil, err
-	}
-	return sc, nil
-}
-
-func (sc *streamingCall) sendFrame(frame []byte) error {
-	p := C.CBytes(frame)
-	defer C.free(p)
-	if r := C.aster_call_send_frame(sc.rc.rt(), sc.call, (*C.uint8_t)(p), C.uint32_t(len(frame))); r != 0 {
-		return callError(r, "aster_call_send_frame")
-	}
-	return nil
-}
-
-func (sc *streamingCall) send(v any, end bool) error {
-	payload, err := sc.rc.codec.Encode(v)
-	if err != nil {
-		return fmt.Errorf("encode request: %w", err)
-	}
-	var flags byte
-	if end {
-		flags = FlagEndStream
-	}
-	frame, err := EncodePayloadFrame(payload, flags)
-	if err != nil {
-		return err
-	}
-	return sc.sendFrame(frame)
-}
-
-// sendAll sends every request; the last frame carries END_STREAM (an empty
-// END_STREAM frame when there are none).
-func sendAll[Req any](ctx context.Context, sc *streamingCall, reqs iter.Seq[*Req]) error {
-	var pending *Req
-	have := false
-	for r := range reqs {
-		if err := ctx.Err(); err != nil {
-			return err
+	if err := statusError(C.aster_rpc_open(rc.rt(), rc.conv(), C.uint8_t(pattern), nopts.ptr(), &h)); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, &RpcError{Code: StatusUnavailable, Message: "connection closed"}
 		}
-		if have {
-			if err := sc.send(pending, false); err != nil {
-				return err
-			}
-		}
-		pending, have = r, true
+		return nil, fmt.Errorf("aster_rpc_open: %w", err)
 	}
-	if have {
-		return sc.send(pending, true)
-	}
-	return sc.sendFrame(EncodeFrame(nil, FlagEndStream))
+	c := &rpcCall{rc: rc, ctx: ctx, h: h}
+	c.stop = context.AfterFunc(ctx, c.cancel)
+	return c, nil
 }
 
-// responses yields response payloads until the trailer; a non-OK trailer
-// is yielded as an *RpcError.
-func (sc *streamingCall) responses(ctx context.Context) iter.Seq2[[]byte, error] {
-	return func(yield func([]byte, error) bool) {
-		for {
-			if err := ctx.Err(); err != nil {
-				yield(nil, err)
-				return
-			}
-			var ptr *C.uint8_t
-			var n C.uint32_t
-			var flags C.uint8_t
-			var buf C.uint64_t
-			r := C.aster_call_recv_frame(sc.rc.rt(), sc.call, clientRecvPollMs, &ptr, &n, &flags, &buf)
-			if r < 0 {
-				yield(nil, callError(r, "aster_call_recv_frame"))
-				return
-			}
-			switch r {
-			case C.ASTER_CALL_RECV_TIMEOUT:
-				continue
-			case C.ASTER_CALL_RECV_END_OF_STREAM:
-				yield(nil, &RpcError{Code: StatusUnavailable, Message: "stream ended before trailer"})
-				return
-			}
-			var payload []byte
-			if n > 0 {
-				payload = C.GoBytes(unsafe.Pointer(ptr), C.int(n))
-			}
-			if buf != 0 {
-				C.aster_call_buffer_release(sc.rc.rt(), buf)
-			}
-			f := byte(flags)
-			if f&FlagTrailer != 0 {
-				if err := trailerStatus(payload); err != nil {
-					yield(nil, err)
-					return
-				}
-				sc.succeeded = true
-				return
-			}
-			if f&FlagRowSchema != 0 {
-				continue
-			}
-			p, err := PayloadOf(payload, f)
-			if err != nil {
-				yield(nil, &RpcError{Code: StatusInternal, Message: "decompress response: " + err.Error()})
-				return
-			}
-			if !yield(p, nil) {
-				return
-			}
-		}
-	}
-}
+// cancel cancels the call (no-op once it is over or released).
+func (c *rpcCall) cancel() { C.aster_call_cancel(c.rc.rt(), c.h) }
 
-// close releases the substream after a clean trailer, else discards it.
-func (sc *streamingCall) close() {
-	sc.once.Do(func() {
-		if sc.succeeded {
-			C.aster_call_release(sc.rc.rt(), sc.call)
-		} else {
-			C.aster_call_discard(sc.rc.rt(), sc.call)
-		}
+// release frees the call, cancelling it if unfinished.
+func (c *rpcCall) release() {
+	c.once.Do(func() {
+		c.stop()
+		C.aster_call_release(c.rc.rt(), c.h)
 	})
+}
+
+// send sends one request payload; errCallClosed when the call is over.
+func (c *rpcCall) send(payload []byte, end bool) error {
+	p, n := cBytesArg(payload)
+	var e C.uint8_t
+	if end {
+		e = 1
+	}
+	switch r := C.aster_call_send_payload(c.rc.rt(), c.h, p, n, e); r {
+	case C.ASTER_STATUS_OK:
+		return nil
+	case C.ASTER_STATUS_ALREADY_CLOSED, C.ASTER_STATUS_NOT_FOUND:
+		return errCallClosed
+	default:
+		return fmt.Errorf("aster_call_send_payload: %w", statusError(r))
+	}
+}
+
+// recv returns the next response payload, or (nil, io.EOF) at an OK
+// trailer, or the trailer's error.
+func (c *rpcCall) recv() ([]byte, error) {
+	var ptr *C.uint8_t
+	var n C.uint32_t
+	var buf C.uint64_t
+	var trailer C.uint8_t
+	r := C.aster_call_recv_payload(c.rc.rt(), c.h, C.ASTER_TIMEOUT_INFINITE, &ptr, &n, &buf, &trailer)
+	switch r {
+	case C.ASTER_STATUS_OK:
+	case C.ASTER_STATUS_ALREADY_CLOSED, C.ASTER_STATUS_NOT_FOUND:
+		return nil, io.EOF
+	default:
+		return nil, fmt.Errorf("aster_call_recv_payload: %w", statusError(r))
+	}
+	var b []byte
+	if n > 0 {
+		b = C.GoBytes(unsafe.Pointer(ptr), C.int(n))
+	}
+	c.rc.releaseBuffer(buf)
+	if trailer != 0 {
+		if err := statusFromBytes(c.ctx, 0, b); err != nil {
+			return nil, err
+		}
+		return nil, io.EOF
+	}
+	if b == nil {
+		b = []byte{}
+	}
+	return b, nil
 }
 
 // CallServerStream makes a server-streaming call; range over the result. An
 // error (transport, decode, or a non-OK trailer as *RpcError) is the last
-// element. Breaking out early discards the substream.
+// element. Breaking out early cancels the call.
 func CallServerStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, opts ...CallOption) iter.Seq2[*Resp, error] {
 	return func(yield func(*Resp, error) bool) {
-		sc, err := openStreaming(ctx, rc, service, method, buildOptions(opts))
+		payload, err := rc.codec.Encode(req)
+		if err != nil {
+			yield(nil, fmt.Errorf("encode request: %w", err))
+			return
+		}
+		c, err := openCall(ctx, rc, PatternServerStream, service, method, buildOptions(opts))
 		if err != nil {
 			yield(nil, err)
 			return
 		}
-		defer sc.close()
-		if err := sc.send(req, true); err != nil {
+		defer c.release()
+		if err := c.send(payload, true); err != nil && !errors.Is(err, errCallClosed) {
 			yield(nil, err)
 			return
 		}
-		for payload, err := range sc.responses(ctx) {
+		for {
+			b, err := c.recv()
+			if err == io.EOF {
+				return
+			}
 			if err != nil {
 				yield(nil, err)
 				return
 			}
-			resp := new(Resp)
-			if err := rc.codec.Decode(payload, resp); err != nil {
-				yield(nil, &RpcError{Code: StatusInternal, Message: "decode response: " + err.Error()})
-				return
-			}
-			if !yield(resp, nil) {
+			resp, err := decodeResponse[Resp](rc.codec, b)
+			if !yield(resp, err) || err != nil {
 				return
 			}
 		}
 	}
 }
 
-// CallClientStream makes a client-streaming call: every request from reqs,
-// then one response.
+// CallClientStream makes a client-streaming call: every request from reqs
+// (each sent as it is produced), then one response.
 func CallClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, reqs iter.Seq[*Req], opts ...CallOption) (*Resp, error) {
-	sc, err := openStreaming(ctx, rc, service, method, buildOptions(opts))
+	c, err := openCall(ctx, rc, PatternClientStream, service, method, buildOptions(opts))
 	if err != nil {
 		return nil, err
 	}
-	defer sc.close()
-	if err := sendAll(ctx, sc, reqs); err != nil {
-		return nil, err
+	defer c.release()
+	closed := false
+	for r := range reqs {
+		payload, err := rc.codec.Encode(r)
+		if err != nil {
+			return nil, fmt.Errorf("encode request: %w", err)
+		}
+		if err := c.send(payload, false); err != nil {
+			if errors.Is(err, errCallClosed) {
+				closed = true // the trailer says why
+				break
+			}
+			return nil, err
+		}
+	}
+	if !closed {
+		if err := c.send(nil, true); err != nil && !errors.Is(err, errCallClosed) {
+			return nil, err
+		}
 	}
 	var last []byte
 	count := 0
-	for payload, err := range sc.responses(ctx) {
+	for {
+		b, err := c.recv()
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
 			return nil, err
 		}
-		last, count = payload, count+1
+		last, count = b, count+1
 	}
-	if count == 0 {
-		return nil, &RpcError{Code: StatusInternal, Message: "OK trailer with no response frame"}
-	}
-	if count > 1 {
-		sc.succeeded = false
+	if count != 1 {
 		return nil, &RpcError{Code: StatusInternal, Message: fmt.Sprintf("client-stream call received %d response frames", count)}
 	}
-	return decodeResponse[Resp](rc.codec, last, 0)
+	return decodeResponse[Resp](rc.codec, last)
 }
 
-// CallBidiStream makes a bidi-streaming call: requests are sent on a
-// goroutine while responses are yielded. A send error ends the iteration
-// unless the server already ended the call.
+// BidiCall is an open bidi-streaming call: Send and Recv may run on
+// different goroutines (one sender, one receiver). Close it when done
+// (an unfinished call is cancelled).
+type BidiCall[Req, Resp any] struct {
+	c     *rpcCall
+	codec Codec
+}
+
+// OpenBidiStream opens a bidi-streaming call. Cancelling ctx cancels it.
+func OpenBidiStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, opts ...CallOption) (*BidiCall[Req, Resp], error) {
+	c, err := openCall(ctx, rc, PatternBidiStream, service, method, buildOptions(opts))
+	if err != nil {
+		return nil, err
+	}
+	return &BidiCall[Req, Resp]{c: c, codec: rc.codec}, nil
+}
+
+// Send sends one request immediately. After the call is over it returns an
+// error matching io.ErrClosedPipe; Recv then returns the trailer's outcome.
+func (b *BidiCall[Req, Resp]) Send(req *Req) error {
+	payload, err := b.codec.Encode(req)
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
+	if err := b.c.send(payload, false); err != nil {
+		if errors.Is(err, errCallClosed) {
+			return io.ErrClosedPipe
+		}
+		return err
+	}
+	return nil
+}
+
+// CloseSend ends the request stream.
+func (b *BidiCall[Req, Resp]) CloseSend() error {
+	if err := b.c.send(nil, true); err != nil && !errors.Is(err, errCallClosed) {
+		return err
+	}
+	return nil
+}
+
+// Recv returns the next response; io.EOF once the call ended OK, else the
+// trailer's error (*RpcError).
+func (b *BidiCall[Req, Resp]) Recv() (*Resp, error) {
+	p, err := b.c.recv()
+	if err != nil {
+		return nil, err
+	}
+	return decodeResponse[Resp](b.codec, p)
+}
+
+// Cancel cancels the call (FLAG_CANCEL + stream reset).
+func (b *BidiCall[Req, Resp]) Cancel() { b.c.cancel() }
+
+// Close releases the call, cancelling it if unfinished.
+func (b *BidiCall[Req, Resp]) Close() { b.c.release() }
+
+// CallBidiStream makes a bidi-streaming call: each request from reqs is
+// sent as soon as the iterator yields it (on its own goroutine) while
+// responses are yielded, so ping-pong protocols work. A send failure ends
+// the request side; the trailer reports the outcome. Breaking out early
+// cancels the call.
 func CallBidiStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, reqs iter.Seq[*Req], opts ...CallOption) iter.Seq2[*Resp, error] {
 	return func(yield func(*Resp, error) bool) {
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		sc, err := openStreaming(ctx, rc, service, method, buildOptions(opts))
+		b, err := OpenBidiStream[Req, Resp](ctx, rc, service, method, opts...)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
 		sendErr := make(chan error, 1)
-		go func() { sendErr <- sendAll(ctx, sc, reqs) }()
-		defer func() {
-			cancel()
-			<-sendErr
-			sc.close()
+		go func() {
+			for r := range reqs {
+				if err := b.Send(r); err != nil {
+					if errors.Is(err, io.ErrClosedPipe) {
+						err = nil
+					}
+					sendErr <- err
+					return
+				}
+			}
+			sendErr <- b.CloseSend()
 		}()
-		for payload, err := range sc.responses(ctx) {
+		// Release cancels an unfinished call, which fails a pending Send.
+		defer b.Close()
+		for {
+			resp, err := b.Recv()
+			if err == io.EOF {
+				return
+			}
 			if err != nil {
 				select {
 				case serr := <-sendErr:
-					sendErr <- serr
-					if serr != nil && !errors.Is(serr, context.Canceled) {
+					if serr != nil {
 						err = errors.Join(err, serr)
 					}
 				default:
 				}
 				yield(nil, err)
-				return
-			}
-			resp := new(Resp)
-			if err := rc.codec.Decode(payload, resp); err != nil {
-				yield(nil, &RpcError{Code: StatusInternal, Message: "decode response: " + err.Error()})
 				return
 			}
 			if !yield(resp, nil) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math/rand"
 	"reflect"
 	"slices"
 	"strings"
@@ -139,7 +140,7 @@ func TestRPC_AllPatterns(t *testing.T) {
 		return nil
 	})
 	svc := interopService()
-	svc.methods[bidi.Name] = bidi
+	svc.addMethod(bidi)
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -183,9 +184,9 @@ func TestRPC_AllPatterns(t *testing.T) {
 	if err != nil || r.Count != 4 || r.Message != "m3" {
 		t.Fatalf("client stream: %v %+v", err, r)
 	}
-	r, err = CallClientStream[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "ingest", reqs(0))
-	if err != nil || r.Count != 0 {
-		t.Fatalf("empty client stream: %v %+v", err, r)
+	// Rust's client refuses a client-stream call with no request.
+	if _, err = CallClientStream[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "ingest", reqs(0)); !errors.Is(err, ErrRpcInvalidArgument) {
+		t.Fatalf("empty client stream: %v", err)
 	}
 
 	// Bidi.
@@ -248,7 +249,7 @@ func TestRPC_ErrorsAndTrailers(t *testing.T) {
 	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Errs", "nope", req); !errors.Is(err, ErrRpcUnimplemented) {
 		t.Fatalf("unknown method: %v", err)
 	}
-	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Nope", "x", req); !errors.Is(err, ErrRpcUnimplemented) {
+	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Nope", "x", req); !errors.Is(err, ErrRpcNotFound) {
 		t.Fatalf("unknown service: %v", err)
 	}
 
@@ -290,26 +291,297 @@ func TestRPC_ErrorsAndTrailers(t *testing.T) {
 	}
 }
 
+// Rust enforces the method's default timeout: the client (no deadline of
+// its own) gets DEADLINE_EXCEEDED and the handler's context ends.
 func TestRPC_DeadlineExceededTrailer(t *testing.T) {
+	handlerErr := make(chan error, 1)
 	svc := NewService("D", 1, Unary("wait", func(ctx context.Context, _ *testEchoRequest) (*testEchoReply, error) {
 		<-ctx.Done()
+		handlerErr <- ctx.Err()
 		return nil, ctx.Err()
-	}))
+	}, Timeout(500*time.Millisecond)))
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
-	// Hand-built header with a 1 s deadline; wait for the trailer without a
-	// client-side context deadline.
-	h, _ := EncodeStreamHeader(StreamHeader{Service: "D", Method: "wait", Version: 1, Deadline: 1})
-	codec := NewForyCodec()
-	payload, _ := codec.Encode(&testEchoRequest{Data: []byte{}})
-	body, _ := EncodePayloadFrame(payload, FlagEndStream)
-	pair := append(EncodeFrame(h, FlagHeader), body...)
-	_, _, _, trailer, err := f.conn.unaryNative(pair, 0)
+	start := time.Now()
+	_, err := Call[testEchoRequest, testEchoReply](context.Background(), f.conn, "D", "wait", &testEchoRequest{Data: []byte{}})
+	if !errors.Is(err, ErrRpcDeadlineExceeded) {
+		t.Fatalf("got %v, want DEADLINE_EXCEEDED", err)
+	}
+	if d := time.Since(start); d < 400*time.Millisecond || d > 10*time.Second {
+		t.Fatalf("took %v", d)
+	}
+	if err := <-handlerErr; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("handler ctx: %v", err)
+	}
+	// A client deadline is enforced natively and matches both sentinels.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err = Call[testEchoRequest, testEchoReply](ctx, f.conn, "D", "wait", &testEchoRequest{Data: []byte{}})
+	if !errors.Is(err, ErrRpcDeadlineExceeded) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("client deadline: %v", err)
+	}
+}
+
+func TestContract_DynamicJSONMatchesServiceContract(t *testing.T) {
+	svc := NewService("Guarded", 2,
+		Unary("a", func(context.Context, *testEchoRequest) (*testEchoReply, error) { return nil, nil },
+			Requires(RequireAnyOf("admin", "ops")), Timeout(1500*time.Millisecond), Idempotent(), MaxFrameSize(4096)),
+		ServerStream("b", func(context.Context, *testEchoRequest, func(*testEchoReply) error) error { return nil }),
+	).WithRequires(RequireRole("user"))
+	dyn, err := svc.ContractID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := DecodeRpcStatus(trailer)
-	if err != nil || st.Code != StatusDeadlineExceeded {
-		t.Fatalf("trailer %+v %v", st, err)
+	js, err := ServiceContractJSON(svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := ComputeContractID(js)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dyn != string(legacy) {
+		t.Fatalf("dynamic %s != contract %s", dyn, legacy)
+	}
+	sess := NewSessionService("S", 1, func(SessionInfo) any { return nil },
+		Unary("x", func(context.Context, *testEchoRequest) (*testEchoReply, error) { return nil, nil }))
+	dyn, _ = sess.ContractID()
+	js, _ = ServiceContractJSON(sess)
+	legacy, _ = ComputeContractID(js)
+	if dyn != string(legacy) {
+		t.Fatalf("session: dynamic %s != contract %s", dyn, legacy)
+	}
+}
+
+type counter struct {
+	n      int32
+	closed chan struct{}
+}
+
+func (c *counter) Close() error { c.closed <- struct{}{}; return nil }
+
+func TestRPC_SessionScoped(t *testing.T) {
+	closed := make(chan struct{}, 2)
+	var made atomic.Int32
+	svc := NewSessionService("Counter", 1, func(info SessionInfo) any {
+		made.Add(1)
+		if info.SessionID == 0 || info.PeerID == "" {
+			t.Errorf("session info %+v", info)
+		}
+		return &counter{closed: closed}
+	},
+		Unary("add", func(ctx context.Context, r *testEchoRequest) (*testEchoReply, error) {
+			c, ok := Session[*counter](ctx)
+			if !ok {
+				return nil, errors.New("no session")
+			}
+			c.n += r.Count
+			return &testEchoReply{Count: c.n, Data: []byte{}}, nil
+		}),
+	)
+	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc, interopService()}})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	add := func(sid uint32, n int32) (int32, error) {
+		r, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Counter", "add", &testEchoRequest{Count: n, Data: []byte{}}, WithSession(sid))
+		if err != nil {
+			return 0, err
+		}
+		return r.Count, nil
+	}
+	s1, err := f.conn.NewSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, _ := f.conn.NewSessionID()
+	if s1 == 0 || s2 == s1 {
+		t.Fatalf("session ids %d %d", s1, s2)
+	}
+	for i, want := range []int32{1, 3, 6} {
+		if got, err := add(s1, int32(i+1)); err != nil || got != want {
+			t.Fatalf("s1 add: %d %v (want %d)", got, err, want)
+		}
+	}
+	if got, err := add(s2, 10); err != nil || got != 10 {
+		t.Fatalf("s2 add: %d %v", got, err)
+	}
+	if made.Load() != 2 {
+		t.Fatalf("%d instances", made.Load())
+	}
+	// Rust's session rules: a session service without a session, and a
+	// shared service with one, are FAILED_PRECONDITION.
+	if _, err := add(0, 1); !errors.Is(err, ErrRpcFailedPrecondition) {
+		t.Fatalf("no session: %v", err)
+	}
+	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "echo", &testEchoRequest{Data: []byte{}}, WithSession(s1)); !errors.Is(err, ErrRpcFailedPrecondition) {
+		t.Fatalf("shared with session: %v", err)
+	}
+	// Closing the connection reaps the sessions: instances are closed.
+	_ = f.conn.Close()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("session instance not closed after the connection closed")
+	}
+}
+
+func TestRPC_RequiresAndAttributes(t *testing.T) {
+	seen := make(chan []MetadataEntry, 1)
+	svc := NewService("Admin", 1,
+		Unary("op", func(ctx context.Context, _ *testEchoRequest) (*testEchoReply, error) {
+			info, _ := CallInfoFromContext(ctx)
+			seen <- info.Attributes
+			return &testEchoReply{Data: []byte{}}, nil
+		}, Requires(RequireRole("admin"))),
+	)
+	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req := &testEchoRequest{Data: []byte{}}
+	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Admin", "op", req); !errors.Is(err, ErrRpcPermissionDenied) {
+		t.Fatalf("without role: %v", err)
+	}
+	peer, _ := f.cl.Node().NodeID()
+	if err := f.srv.SetPeerAttributes(peer, map[string]string{"aster.role": "admin", "team": "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Admin", "op", req); err != nil {
+		t.Fatalf("with role: %v", err)
+	}
+	if attrs := <-seen; len(attrs) != 2 || attrs[0].Key != "aster.role" {
+		t.Fatalf("attributes %v", attrs)
+	}
+}
+
+func TestRPC_CancelAndBidiPingPong(t *testing.T) {
+	handlerDone := make(chan error, 1)
+	svc := NewService("Chat", 1,
+		BidiStream("echo", func(ctx context.Context, reqs iter.Seq2[*testEchoRequest, error], send func(*testEchoReply) error) error {
+			for r, err := range reqs {
+				if err != nil {
+					return err
+				}
+				if err := send(&testEchoReply{Message: r.Message, Data: []byte{}}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}),
+		ServerStream("forever", func(ctx context.Context, _ *testEchoRequest, send func(*testEchoReply) error) error {
+			<-ctx.Done()
+			handlerDone <- ctx.Err()
+			return ctx.Err()
+		}),
+	)
+	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Ping-pong through the iterator API: the next request is produced only
+	// after the previous reply arrived (requests are sent as yielded).
+	replies := make(chan string, 1)
+	reqs := func(yield func(*testEchoRequest) bool) {
+		for i := 0; i < 3; i++ {
+			if !yield(&testEchoRequest{Message: fmt.Sprintf("p%d", i), Data: []byte{}}) {
+				return
+			}
+			select {
+			case <-replies:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+	var got []string
+	for r, err := range CallBidiStream[testEchoRequest, testEchoReply](ctx, f.conn, "Chat", "echo", reqs) {
+		if err != nil {
+			t.Fatalf("bidi: %v", err)
+		}
+		got = append(got, r.Message)
+		replies <- r.Message
+	}
+	if !slices.Equal(got, []string{"p0", "p1", "p2"}) {
+		t.Fatalf("bidi %v", got)
+	}
+
+	// Cancelling the client context cancels the call natively: the server
+	// handler's context ends (peer cancel) and the client sees CANCELLED.
+	cctx, ccancel := context.WithCancel(ctx)
+	time.AfterFunc(300*time.Millisecond, ccancel)
+	var streamErr error
+	for _, err := range CallServerStream[testEchoRequest, testEchoReply](cctx, f.conn, "Chat", "forever", &testEchoRequest{Data: []byte{}}) {
+		streamErr = err
+	}
+	if !errors.Is(streamErr, context.Canceled) {
+		t.Fatalf("client: %v", streamErr)
+	}
+	select {
+	case err := <-handlerDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("handler ctx: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server handler not cancelled")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for f.srv.LiveCalls() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := f.srv.LiveCalls(); n != 0 {
+		t.Fatalf("%d live calls left", n)
+	}
+}
+
+func TestRPC_FrameLimitAndConnectionEvents(t *testing.T) {
+	closedCh := make(chan string, 1)
+	nonRPC := make(chan string, 1)
+	svc := NewService("Small", 1, Unary("put", func(context.Context, *testEchoRequest) (*testEchoReply, error) {
+		return &testEchoReply{Data: []byte{}}, nil
+	}, MaxFrameSize(1024)))
+	f := newRPCFixture(t, ServerOptions{
+		Services:           []*Service{svc},
+		OnConnectionClosed: func(_ uint64, peer string) { closedCh <- peer },
+		OnNonRPC: func(alpn string, conn *Connection) {
+			nonRPC <- alpn
+			_ = conn.Close("")
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Small", "put", &testEchoRequest{Data: []byte{1}}); err != nil {
+		t.Fatalf("small: %v", err)
+	}
+	big := make([]byte, 64<<10)
+	rand.New(rand.NewSource(1)).Read(big)
+	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Small", "put", &testEchoRequest{Data: big}); err == nil {
+		t.Fatal("expected the frame limit to reject a 64 KiB request")
+	}
+	// A non-RPC ALPN connection is handed over as NON_RPC.
+	addr, err := f.srv.Node().NodeAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn, err := f.cl.Node().Connect(ctx, addr, ConsumerAdmissionALPN); err == nil {
+		select {
+		case alpn := <-nonRPC:
+			if alpn != ConsumerAdmissionALPN {
+				t.Fatalf("alpn %q", alpn)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("no NON_RPC event")
+		}
+		_ = conn.Close("")
+	} else {
+		t.Fatalf("connect admission alpn: %v", err)
+	}
+	peer, _ := f.cl.Node().NodeID()
+	_ = f.conn.Close()
+	select {
+	case p := <-closedCh:
+		if p != peer {
+			t.Fatalf("closed peer %q != %q", p, peer)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no CONNECTION_CLOSED")
 	}
 }
 
@@ -408,4 +680,45 @@ func TestRPC_ConcurrentUnary(t *testing.T) {
 func reflectField(v any, name string) reflect.StructField {
 	f, _ := reflect.TypeOf(v).FieldByName(name)
 	return f
+}
+
+// The codec pools Fory instances: concurrent encode/decode with types
+// registered lazily while instances are in use.
+func TestForyCodec_ConcurrentPool(t *testing.T) {
+	c := NewForyCodec()
+	errs := make(chan error, 32)
+	for g := 0; g < 32; g++ {
+		go func(g int) {
+			for i := 0; i < 200; i++ {
+				var err error
+				if (g+i)%2 == 0 {
+					var b []byte
+					if b, err = c.Encode(&testEchoRequest{Message: fmt.Sprint(i), Count: int32(i), Data: []byte{byte(i)}}); err == nil {
+						var r testEchoRequest
+						if err = c.Decode(b, &r); err == nil && (r.Count != int32(i) || r.Message != fmt.Sprint(i)) {
+							err = fmt.Errorf("round trip %+v", r)
+						}
+					}
+				} else {
+					var b []byte
+					if b, err = c.Encode(&testEchoReply{ServerLang: "go", Count: int32(g), Data: []byte{}}); err == nil {
+						var r testEchoReply
+						if err = c.Decode(b, &r); err == nil && (r.Count != int32(g) || r.ServerLang != "go") {
+							err = fmt.Errorf("round trip %+v", r)
+						}
+					}
+				}
+				if err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- nil
+		}(g)
+	}
+	for g := 0; g < 32; g++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
 }
