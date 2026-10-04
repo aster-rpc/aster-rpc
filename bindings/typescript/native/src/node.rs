@@ -19,7 +19,9 @@ use crate::config::{aster_err, JsAsterConfig};
 use crate::docs::DocsClient;
 use crate::error::to_napi_err;
 use crate::gossip::GossipClient;
+use crate::lease::{GrantorSerializer, MemorySerializer};
 use crate::net::IrohConnection;
+use crate::topology::Topology;
 
 /// A running Aster node (QUIC endpoint + blobs / docs / gossip).
 ///
@@ -230,5 +232,76 @@ impl Node {
     #[napi]
     pub fn metrics_prometheus(&self) -> String {
         self.inner.metrics_prometheus()
+    }
+
+    /// This node's topology view (v1 peers; v2 shared swarm). Populates only
+    /// when the node runs with `enableMonitoring`.
+    #[napi]
+    pub fn topology(&self) -> Topology {
+        Topology::from(self.inner.topology())
+    }
+
+    /// A lease backend on the designated grantor `grantorId`
+    /// (`aster.lease.Grantor` over RPC). Every op is bound to this node's
+    /// authenticated identity. The grantor must be dialable (discovery or
+    /// `addNodeAddr`).
+    #[napi]
+    pub async fn lease_grantor(&self, grantor_id: String) -> Result<GrantorSerializer> {
+        let conn = self
+            .inner
+            .rpc_connect(&aster::NodeId::from_hex(grantor_id))
+            .await
+            .map_err(aster_err)?;
+        let self_id = self.inner.id().into_string();
+        Ok(GrantorSerializer::new(
+            aster::rpc::lease::GrantorSerializer::new(conn, self_id.clone()),
+            self_id,
+        ))
+    }
+
+    /// Serve `aster.lease.Grantor` over `serializer` on this node — making it
+    /// a designated grantor. The node must be started with the `aster/1`
+    /// ALPN in `alpns`, and this owns its RPC accept loop: do not also run
+    /// an RPC server on the same node.
+    #[napi]
+    pub fn serve_lease_grantor(
+        &self,
+        serializer: &MemorySerializer,
+        options: Option<LeaseGrantorOptions>,
+    ) -> LeaseGrantorServer {
+        let mut grantor = aster::rpc::lease::LeaseGrantor::new(Arc::new(serializer.inner.clone()));
+        if options.and_then(|o| o.open_revoke).unwrap_or(false) {
+            grantor = grantor.revoke_requires(None);
+        }
+        // napi v3 does not enter the Tokio runtime around synchronous exports.
+        let server = aster::rpc::Server::new(&self.inner).register(grantor);
+        let handle = within_runtime_if_available(move || server.serve());
+        LeaseGrantorServer {
+            handle: std::sync::Mutex::new(Some(handle)),
+        }
+    }
+}
+
+/// Options for `node.serveLeaseGrantor`.
+#[napi(object)]
+pub struct LeaseGrantorOptions {
+    /// Let any admitted caller `revoke` (default: the `operator` role only).
+    pub open_revoke: Option<bool>,
+}
+
+/// A running lease grantor; `close()` stops serving.
+#[napi]
+pub struct LeaseGrantorServer {
+    handle: std::sync::Mutex<Option<aster::rpc::ServerHandle>>,
+}
+
+#[napi]
+impl LeaseGrantorServer {
+    /// Stop serving (idempotent).
+    #[napi]
+    pub fn close(&self) {
+        if let Some(h) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            h.abort();
+        }
     }
 }

@@ -290,7 +290,73 @@ export {
 export { IrohTransport } from './transport/iroh.js';
 
 // Node + configuration (Rust `aster::Node` / `aster::AsterConfig`)
-export { Node, NodeId, type NodeAddr, type NodeStartOptions } from './node.js';
+export { Node, NodeId, type NodeAddr, type NodeStartOptions, type LeaseGrantorOptions } from './node.js';
+// Attestation, identity-derived HPKE keys, sealed grants, leases, topology (plan T7)
+export {
+  AttestationChain,
+  AttestationError,
+  VerifiedChain,
+  attestRootNode,
+  verifyChain,
+  attestationPublicKey,
+  type AttestOptions,
+  type AttestationRole,
+} from './attestation.js';
+export {
+  hpkeX25519SecretFromIdentity,
+  hpkeX25519PublicFromIdentity,
+  hpkeX25519PublicFromNodeId,
+} from './crypto.js';
+export {
+  GRANT_AAD_DOMAIN,
+  GRANT_RECORD_VERSION,
+  GrantRecord,
+  PolicyDoc,
+  grantAad,
+  sealGrant,
+  openGrant,
+  sealGrantToKey,
+  openGrantWithKey,
+  sealNamespaceGrant,
+  openNamespaceGrant,
+  checkGrantRole,
+  grantKey,
+  reconcileGrant,
+  reconcileNamespaceGrant,
+  type GrantContext,
+  type GrantOutcome,
+  type GrantState,
+} from './grants.js';
+export {
+  Lease,
+  MemorySerializer,
+  GrantorSerializer,
+  FenceRejectedError,
+  leaseTransition,
+  checkFence,
+  type Fence,
+  type LeaseSnapshot,
+  type LeaseOptions,
+  type LeaseStatus,
+  type DenyReason,
+  type AcquireOutcome,
+  type TransitionOutcome,
+  type LeaseRowState,
+  type LeaseOp,
+  type LeaseTransition,
+  type LeaseSerializer,
+  type FenceRejectionKind,
+} from './lease.js';
+export {
+  Topology,
+  type LadderLevel,
+  type SeparationVerdict,
+  type PeerView,
+  type ClusterView,
+  type TopologySnapshot,
+  type TopologyTiming,
+  type TopologySwarmOptions,
+} from './topology.js';
 // Data plane (Rust `aster::{Blobs, Docs, Gossip}` and connection paths)
 export {
   type BlobFormat,

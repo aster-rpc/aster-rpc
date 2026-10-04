@@ -424,6 +424,24 @@ export declare class GossipTopicHandle {
   recv(): Promise<GossipEvent>
 }
 
+/**
+ * A remote designated grantor (`aster.lease.Grantor`) as a lease backend.
+ * Every op is bound to this node's authenticated identity.
+ */
+export declare class GrantorSerializer {
+  /** This node's id — the only holder the grantor binds our calls to. */
+  get selfId(): string
+  /** ACQUIRE `resource` at the grantor as this node. */
+  acquire(resource: string, options?: LeaseOptions | undefined | null): Promise<LeaseHandle | LeaseDenied>
+  /** Advisory snapshot (`inspect`). */
+  snapshot(resource: string): Promise<LeaseSnapshot>
+  /**
+   * REVOKE `resource` as this node (the grantor gates it, by default on
+   * the `operator` role).
+   */
+  revoke(resource: string): Promise<TransitionOutcome>
+}
+
 export declare class IrohBiStream {
   /** Take the send stream (can only be called once). */
   takeSend(): IrohSendStream
@@ -524,6 +542,92 @@ export declare class IrohSendStream {
   priority(): Promise<number>
 }
 
+/** A running lease grantor; `close()` stops serving. */
+export declare class LeaseGrantorServer {
+  /** Stop serving (idempotent). */
+  close(): void
+}
+
+/**
+ * A held lease: background renewals in Rust, fence access gated by the
+ * self-limit. Dropping it stops renewing without releasing (the lease then
+ * lapses by TTL); `release()` hands off cleanly.
+ */
+export declare class LeaseHandle {
+  get resource(): string
+  get epoch(): number
+  get holder(): string
+  get status(): 'held' | 'released' | 'fenced' | 'lost'
+  /**
+   * The fence for a protected action, or `null` once the holder must stop
+   * (not held, or past the self-limit). Take it at send time; never cache.
+   */
+  fence(): Fence | null
+  /**
+   * Status changes from now on (`AsyncIterable`): yields each new status
+   * and ends after the first terminal one (`released` / `fenced` /
+   * `lost`). If the lease is already terminal, yields that and ends.
+   */
+  statusChanges(): LeaseStatusStream
+  /**
+   * Graceful release: stop renewing, then RELEASE at the serializer
+   * (advances the fence). Idempotent; later calls are no-ops.
+   */
+  release(): Promise<void>
+  /**
+   * Stop renewing and hand back the fence for one final operation,
+   * **without** releasing at the serializer. `null` when the fence is no
+   * longer usable (or the handle was already released).
+   */
+  stopRenewing(): Fence | null
+}
+
+/**
+ * `AsyncIterable` of lease status changes (see `statusChanges()`).
+ *
+ * This type implements JavaScript's async iterable protocol.
+ * It can be used with `for await...of` loops.
+ *
+ * @see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols
+ */
+export declare class LeaseStatusStream {
+  [Symbol.asyncIterator](): AsyncGenerator<string, void, undefined>
+}
+
+/**
+ * The reference in-memory lease serializer (also what a designated grantor
+ * serves). Expiry runs on this process's clock.
+ */
+export declare class MemorySerializer {
+  constructor()
+  /**
+   * One ACQUIRE CAS for `holder` (any actor string — usually a node id).
+   * Resolves to a `LeaseHandle` on grant, else a `LeaseDenied`.
+   */
+  acquire(resource: string, holder: string, options?: LeaseOptions | undefined | null): Promise<LeaseHandle | LeaseDenied>
+  /** Advisory snapshot of `resource`. */
+  snapshot(resource: string): Promise<LeaseSnapshot>
+  /**
+   * Apply one raw transition (the state machine under this serializer's
+   * lock). Prefer `acquire` + the handle; this is for tooling and tests.
+   */
+  transition(resource: string, op: LeaseOp): Promise<TransitionOutcome>
+  /** REVOKE `resource` as `authority`: advances the fence unconditionally. */
+  revoke(resource: string, authority: string): Promise<TransitionOutcome>
+  /**
+   * Simulate a serializer restart: fence fields survive, held rows get a
+   * full fresh TTL, the fence never advances.
+   */
+  restart(): void
+  /**
+   * Run `fn` under the serializer's lock iff the fence rule passes for
+   * `writer` (the authenticated peer). Returns `null` after running it,
+   * or the rejection without running it. `fn` must be synchronous and
+   * must not call back into this serializer.
+   */
+  mutateFenced(fence: Fence, writer: string, f: () => unknown): FenceRejection | null
+}
+
 /**
  * A running Aster node (QUIC endpoint + blobs / docs / gossip).
  *
@@ -601,6 +705,25 @@ export declare class Node {
   close(): Promise<void>
   /** Transport metrics in Prometheus text exposition format. */
   metricsPrometheus(): string
+  /**
+   * This node's topology view (v1 peers; v2 shared swarm). Populates only
+   * when the node runs with `enableMonitoring`.
+   */
+  topology(): Topology
+  /**
+   * A lease backend on the designated grantor `grantorId`
+   * (`aster.lease.Grantor` over RPC). Every op is bound to this node's
+   * authenticated identity. The grantor must be dialable (discovery or
+   * `addNodeAddr`).
+   */
+  leaseGrantor(grantorId: string): Promise<GrantorSerializer>
+  /**
+   * Serve `aster.lease.Grantor` over `serializer` on this node — making it
+   * a designated grantor. The node must be started with the `aster/1`
+   * ALPN in `alpns`, and this owns its RPC accept loop: do not also run
+   * an RPC server on the same node.
+   */
+  serveLeaseGrantor(serializer: MemorySerializer, options?: LeaseGrantorOptions | undefined | null): LeaseGrantorServer
 }
 
 /**
@@ -632,6 +755,35 @@ export declare class PeerAdmissionStore {
   get size(): number
   /** Remove expired records; returns how many were removed. */
   pruneExpired(): number
+}
+
+/**
+ * A replicated doc read through a **pinned author**: only records the
+ * pinned author (the root's node id) wrote are visible. This is what makes
+ * sealed grants trustworthy — HPKE Base has no sender authenticity.
+ */
+export declare class PolicyDoc {
+  /** Import `namespace` read-only (idempotent) and pin `author`. */
+  static importReadOnly(docs: DocsClient, namespace: string | Uint8Array, author: string): Promise<PolicyDoc>
+  /** Wrap an already-opened doc with a pinned author. */
+  static wrap(doc: DocHandle, author: string): PolicyDoc
+  /** The pinned author (hex) all reads are scoped to. */
+  get author(): string
+  /** The underlying doc (e.g. to start sync or share). */
+  doc(): DocHandle
+  /** The pinned author's record at `key`, or `null`. */
+  get(key: string | Uint8Array): Promise<Buffer | null>
+  /** The pinned author's entries under `prefix`. */
+  listPrefix(prefix: string | Uint8Array): Promise<Array<DocEntry>>
+  /** Live doc events; keep only `isPolicyWrite(ev)` ones. */
+  subscribe(): Promise<DocEventReceiver>
+  /** Whether `event` is an insert authored by the pinned author. */
+  isPolicyWrite(event: DocEvent): boolean
+  /**
+   * The raw grant record addressed to `recipient` under
+   * `<prefix>/grants/<recipient>`, or `null`.
+   */
+  fetchGrant(prefix: string, recipient: string): Promise<Buffer | null>
 }
 
 /**
@@ -749,6 +901,37 @@ export declare class ReactorResponseSender {
    * Further sends fail.
    */
   sendTrailer(trailerFrame: Buffer): Promise<void>
+}
+
+/** This node's topology view. Obtain with `node.topology()`. */
+export declare class Topology {
+  /** Whether the node runs with monitoring (the view's prerequisite). */
+  get hasMonitoring(): boolean
+  /** Every known peer's view, including recently disconnected ones. */
+  peers(): Array<PeerView>
+  /** One peer's view, or `null` (unknown, never sampled, or no monitoring). */
+  peer(nodeId: string): PeerView | null
+  /**
+   * Join the topology swarm keyed by the shared namespace `secret` (hex or
+   * 32 bytes, normally delivered in a sealed grant).
+   */
+  enableShared(secret: string | Uint8Array, options?: TopologySwarmOptions | undefined | null): Promise<void>
+  /** The derived clusters of the joined swarm. */
+  clusters(): Promise<Array<ClusterView>>
+  /** The cluster containing this node, or `null` while it is not a vertex. */
+  myCluster(): Promise<ClusterView | null>
+  /** Separation verdict for two nodes. */
+  separated(a: string, b: string): Promise<'unknown' | 'connected' | 'separated'>
+  /** One immutable observation: every answer comes from the same view. */
+  snapshot(): Promise<TopologySnapshot>
+}
+
+/** One immutable derived view (see `Topology.snapshot`). */
+export declare class TopologySnapshot {
+  /** The clusters of this view. */
+  clusters(): Array<ClusterView>
+  /** Separation verdict between two nodes, from this view. */
+  separated(a: string, b: string): 'unknown' | 'connected' | 'separated'
 }
 
 /** Options for `admit(peer, options)`. */
@@ -971,6 +1154,40 @@ export interface AsterTicketInfo {
 /** Encode an AsterTicket to `aster1<base58>` string. */
 export declare function asterTicketToString(info: AsterTicketInfo): string
 
+/** Decode `aster.attestation.chain.v1:<base64url>` text into chain bytes. */
+export declare function attestationChainFromText(text: string): Buffer
+
+/** Encode chain bytes as `aster.attestation.chain.v1:<base64url>` text. */
+export declare function attestationChainToText(chain: Uint8Array): string
+
+/**
+ * The Ed25519 public key (64 hex) of a 32-byte secret — the identity an
+ * attestation edge signs as.
+ */
+export declare function attestationPublicKey(secret: string | Uint8Array): string
+
+/**
+ * Verify `chain` offline against `trustedAnchors`, bound to `expectedNode`.
+ * Throws describing the first failure.
+ */
+export declare function attestationVerifyChain(chain: Uint8Array, trustedAnchors: Array<string | Uint8Array>, expectedNode: string | Uint8Array): VerifiedChain
+
+/** Policy options for a minted attestation edge (all default 0). */
+export interface AttestOptions {
+  /** Monotonic replay counter (caller-managed). */
+  epoch?: number
+  /** 0 = no lower bound; else unix seconds before which the chain is invalid. */
+  notBefore?: number
+  /** 0 = no expiry; else unix seconds after which the chain is invalid. */
+  notAfter?: number
+}
+
+/**
+ * Mint a single-edge root↔node attestation chain (wire bytes). Both
+ * secrets are 32-byte Ed25519 seeds (hex or bytes).
+ */
+export declare function attestRootNode(rootSecret: string | Uint8Array, nodeSecret: string | Uint8Array, options?: AttestOptions | undefined | null): Buffer
+
 /**
  * The correlation fingerprint of a `(namespace, access)` pair — the value an
  * `AuthorityReport` carries. BLAKE3 over a versioned domain separator, the
@@ -1032,6 +1249,9 @@ export declare function canonicalJson(jsonStr: string): Buffer
 /** Compute canonical signing bytes from credential JSON. */
 export declare function canonicalSigningBytesFromJson(jsonStr: string): Buffer
 
+/** The role ↔ capability rule; throws when `role` does not fit. */
+export declare function checkGrantRole(role: string, canWrite: boolean): void
+
 /** How a connection ended (`IrohConnection.closed()`). */
 export interface ClosedInfo {
   /** Debug form of the close cause (e.g. `ApplicationClosed(..)`). */
@@ -1043,6 +1263,15 @@ export interface ClosedInfo {
   code?: number
   /** Application close reason (UTF-8, lossy), or the error text. */
   reason?: string
+}
+
+/** One derived cluster of the shared swarm view (topology v2). */
+export interface ClusterView {
+  /** Sorted node ids (admitted and live members only). */
+  members: Array<string>
+  bridge: string
+  /** Top members by bridge score (includes the bridge). */
+  witnesses: Array<string>
 }
 
 /** A single entry in a collection. */
@@ -1179,6 +1408,29 @@ export declare function encodeRpcStatus(s: NativeRpcStatus): Buffer
 /** Encode a `StreamHeader` to AEv1 bytes. */
 export declare function encodeStreamHeader(h: NativeStreamHeader): Buffer
 
+/**
+ * The fencing token stamped on every protected action. `holder` is the hex
+ * node id the epoch was issued to — never a bearer token on its own.
+ */
+export interface Fence {
+  resource: string
+  epoch: number
+  holder: string
+}
+
+/**
+ * Why a protected action was rejected at the resource. Never routine:
+ * surface it loudly, never retry silently.
+ */
+export interface FenceRejection {
+  kind: 'stale_epoch' | 'not_holder' | 'not_held' | 'future_epoch'
+  /** Carried epoch (`stale_epoch` / `future_epoch`). */
+  carried?: number
+  /** The row's current epoch (`stale_epoch` / `future_epoch`). */
+  current?: number
+  message: string
+}
+
 /** Options for the multi-provider downloads. */
 export interface FetchOptions {
   /** `'raw'` (default) or `'hash_seq'`. */
@@ -1267,6 +1519,71 @@ export interface GossipEvent {
   peer?: string
 }
 
+/** The canonical grant AAD for `ctx`. */
+export declare function grantAad(ctx: GrantContext): Buffer
+
+/**
+ * Everything a sealed grant is bound to. Sealing and opening must use an
+ * identical context; `granter` / `recipient` are node ids (64 hex), bound
+ * into the AAD verbatim.
+ */
+export interface GrantContext {
+  /** Versioned application label, e.g. `"portal-sync/tree-grant/v1"`. */
+  app: string
+  /** The sealing authority (root) node id. */
+  granter: string
+  /** The one node this grant is addressed to. */
+  recipient: string
+  /** What the sealed capability unlocks — caller-chosen opaque bytes. */
+  resource: Uint8Array
+  /** The exact doc key the grant record is written at. */
+  path: string
+  /** Grant role, e.g. `"read"` / `"write"` (free-form for other schemes). */
+  role: string
+}
+
+/** The conventional grant doc key, `<prefix>/grants/<recipient>`. */
+export declare function grantKey(prefix: string, recipient: string): string
+
+/**
+ * A reconcile decision. `kind`: `'active'` (apply; `plaintext` or
+ * `capability` set), `'revoked'` (drop; `reason`, `role`), `'unopenable'`
+ * (drop and alert; `error`), `'absent'` (keep waiting — not revocation).
+ */
+export interface GrantOutcome {
+  kind: 'active' | 'revoked' | 'unopenable' | 'absent'
+  /** Raw payload (`payload: 'raw'`, active only). */
+  plaintext?: Buffer
+  /** Namespace capability Fory bytes (`payload: 'namespace'`, active only). */
+  capability?: Buffer
+  reason?: string
+  role?: string
+  error?: string
+  /** True for `revoked` / `unopenable`. */
+  dropsCapability: boolean
+}
+
+/** Decode grant record bytes (validates version and state/envelope rules). */
+export declare function grantRecordDecode(bytes: Uint8Array): GrantRecordObject
+
+/**
+ * Encode a grant record (Fory XLANG). An active record needs an envelope;
+ * a revoked one must have none.
+ */
+export declare function grantRecordEncode(record: GrantRecordObject): Buffer
+
+/** The plaintext framing a sealed grant is published in. */
+export interface GrantRecordObject {
+  state: 'active' | 'revoked'
+  /** Which context template the envelope was sealed under. */
+  contextVersion: number
+  role: string
+  /** The Fory-encoded HPKE envelope; empty when revoked. */
+  envelope: Uint8Array
+  /** Revocation reason; empty on active records. */
+  reason: string
+}
+
 export declare function hpkeEnvelopeAlg(): string
 
 export declare function hpkeEnvelopeDecode(data: Buffer): HpkeEnvelopeObject
@@ -1292,6 +1609,23 @@ export declare function hpkePublicKeyFromPrivate(privateKey: Buffer): Buffer
 
 export declare function hpkeSeal(recipientPublicKey: Buffer, associatedData: Buffer, plaintext: Buffer): HpkeEnvelopeObject
 
+/**
+ * The X25519 HPKE public key derived from an Ed25519 node identity public
+ * key (hex or 32 bytes) — the Edwards→Montgomery map. Throws for an invalid
+ * Ed25519 key (off-curve, non-canonical, small-order).
+ */
+export declare function hpkeX25519PublicFromIdentity(publicKey: string | Uint8Array): Buffer
+
+/** [`hpke_x25519_public_from_identity`] for a node id (64 hex). */
+export declare function hpkeX25519PublicFromNodeId(nodeId: string): Buffer
+
+/**
+ * The X25519 HPKE private key derived from an Ed25519 node identity secret
+ * (hex or 32 bytes): clamped `SHA-512(seed)[..32]`, as libsodium
+ * `crypto_sign_ed25519_sk_to_curve25519`.
+ */
+export declare function hpkeX25519SecretFromIdentity(secret: string | Uint8Array): Buffer
+
 /** A `[[peers]]` entry selected from `.aster-identity`. */
 export interface IdentityPeer {
   name?: string
@@ -1307,6 +1641,86 @@ export interface IdentityPeer {
   attributes: Record<string, string>
   /** Published-service metadata (service name → JSON values). */
   publishedServices: any
+}
+
+/**
+ * The fence rule against `row`: `null` when `writer` (the authenticated
+ * peer) may act with `fence`, else the rejection.
+ */
+export declare function leaseCheckFence(row: LeaseRowState, fence: Fence, writer: string): FenceRejection | null
+
+/**
+ * An acquire refused by the serializer (typically `held_by_other`). Back
+ * off (jittered exponential; `snapshot.remainingMs` is a hint).
+ */
+export interface LeaseDenied {
+  reason: 'held_by_other' | 'epoch_mismatch' | 'not_holder' | 'expired' | 'not_held' | 'unauthorized'
+  snapshot: LeaseSnapshot
+}
+
+/** Options for `node.serveLeaseGrantor`. */
+export interface LeaseGrantorOptions {
+  /** Let any admitted caller `revoke` (default: the `operator` role only). */
+  openRevoke?: boolean
+}
+
+/**
+ * A requested transition. `actor` is the candidate (`acquire`), holder
+ * (`renew` / `release`) or authority (`revoke`).
+ */
+export interface LeaseOp {
+  kind: 'acquire' | 'renew' | 'release' | 'revoke'
+  actor: string
+  /** `renew` / `release`. */
+  epoch?: number
+  /** `acquire`. */
+  ttlMs?: number
+}
+
+/** Holder-side timing (defaults: ttl 30 000, renew 10 000, margin 1 000 ms). */
+export interface LeaseOptions {
+  /** Serializer-side expiry interval, ms. */
+  ttlMs?: number
+  /** Renew cadence, ms (must fit inside `ttlMs - holderMarginMs`). */
+  renewIntervalMs?: number
+  /** Subtracted from `ttlMs` for the holder's self-limit, ms. */
+  holderMarginMs?: number
+}
+
+/** The durable fence fields of a serializer row. */
+export interface LeaseRowState {
+  epoch: number
+  holder?: string
+  held: boolean
+  ttlMs: number
+}
+
+/** Advisory view of a serializer row (may be stale the moment it returns). */
+export interface LeaseSnapshot {
+  resource: string
+  epoch: number
+  holder?: string
+  held: boolean
+  /** Serializer-local hint of ms until expiry; absent when free. */
+  remainingMs?: number
+}
+
+/**
+ * The normative lease state machine as a pure function: apply `op` to
+ * `row` (`expired` judged on the backend's own clock).
+ */
+export declare function leaseTransition(row: LeaseRowState, expired: boolean, op: LeaseOp, resource: string): LeaseTransition
+
+/**
+ * What the pure state machine decided: `apply` (store `next` in one CAS,
+ * restart the expiry anchor when `resetGrant`) or `deny`.
+ */
+export interface LeaseTransition {
+  kind: 'apply' | 'deny'
+  next?: LeaseRowState
+  outcome?: TransitionOutcome
+  resetGrant?: boolean
+  denyReason?: 'held_by_other' | 'epoch_mismatch' | 'not_holder' | 'expired' | 'not_held' | 'unauthorized'
 }
 
 /**
@@ -1374,6 +1788,18 @@ export interface NativeStreamHeader {
 }
 
 /**
+ * Open an envelope with the recipient's identity secret (hex or 32 bytes)
+ * under the same context.
+ */
+export declare function openGrant(identitySecret: string | Uint8Array, ctx: GrantContext, envelope: Uint8Array): Buffer
+
+/** Open with an explicit 32-byte X25519 private key. */
+export declare function openGrantWithKey(recipientPrivateKey: Uint8Array, ctx: GrantContext, envelope: Uint8Array): Buffer
+
+/** Open a namespace-capability grant; returns the capability's Fory bytes. */
+export declare function openNamespaceGrant(identitySecret: string | Uint8Array, ctx: GrantContext, envelope: Uint8Array): Buffer
+
+/**
  * Parse TOML text into plain JS values (tables → objects, arrays → arrays).
  * Used by the frozen credential readers that need the raw `[[peers]]`
  * entries (signed attributes must not be rewritten). Datetimes become
@@ -1424,6 +1850,40 @@ export interface PeerAdmission {
   source: string
 }
 
+/** One peer's proximity view (topology v1). */
+export interface PeerView {
+  nodeId: string
+  /** Locality ladder level; lower is closer. */
+  level: 'same_host' | 'same_lan' | 'same_site' | 'same_region' | 'far'
+  /** The ladder rank, 0 (`same_host`) … 4 (`far`). */
+  levelRank: number
+  /** The signal that justified the level. */
+  levelReason: string
+  /** Smoothed RTT, µs; absent until measured. */
+  rttUs?: number
+  /** EWMA of |ΔRTT|, µs; absent until two samples exist. */
+  jitterUs?: number
+  /** Smoothed loss, parts per million of sent datagrams. */
+  lossPpm: number
+  /** Observed goodput (both directions), bits/s. */
+  throughputBps: number
+  /** cwnd/RTT ceiling estimate, bits/s. */
+  cwndCeilingBps: number
+  /** The selected path is direct (not relayed). */
+  direct: boolean
+  relayUrl?: string
+  /** The selected path's remote `ip:port` when direct. */
+  remoteAddr?: string
+  congestionEvents: number
+  samples: number
+  /** Confidence 0 … 0.99 (grows with samples, decays with staleness). */
+  confidence: number
+  lastMeasuredUnixMs: number
+  /** Since when RTT has held under the cluster threshold; 0 = not held. */
+  clusterHeldSinceUnixMs: number
+  isConnected: boolean
+}
+
 /** What one provider did during a multi-provider fetch. */
 export interface ProviderOutcome {
   nodeId: string
@@ -1445,6 +1905,13 @@ export interface ReactorRequestFrame {
   flags: number
   done: boolean
 }
+
+/**
+ * Decide what to do with the record at `ctx.path` (`null` = no record),
+ * opening it with the identity secret when active. `payload` selects a raw
+ * (`'raw'`, default) or namespace-capability (`'namespace'`) payload.
+ */
+export declare function reconcileGrant(identitySecret: string | Uint8Array, ctx: GrantContext, record?: Uint8Array | undefined | null, payload?: 'raw' | 'namespace'): GrantOutcome
 
 export const RECV_KIND_END_OF_STREAM: number
 
@@ -1477,6 +1944,18 @@ export interface RetireOutcome {
   handles?: number
 }
 
+/**
+ * Seal `plaintext` to `ctx.recipient`'s identity-derived HPKE key; returns
+ * the Fory-encoded envelope.
+ */
+export declare function sealGrant(ctx: GrantContext, plaintext: Uint8Array): Buffer
+
+/** Seal to an explicit 32-byte X25519 recipient public key. */
+export declare function sealGrantToKey(recipientPublicKey: Uint8Array, ctx: GrantContext, plaintext: Uint8Array): Buffer
+
+/** Seal a namespace capability (its Fory bytes) after the role check. */
+export declare function sealNamespaceGrant(ctx: GrantContext, capability: Uint8Array): Buffer
+
 /** Generate a fresh 32-byte node secret key (OS CSPRNG), as 64 hex characters. */
 export declare function secretKeyGenerate(): string
 
@@ -1506,6 +1985,36 @@ export declare function secretKeyWriteFile(path: string, secretKey: string): voi
  * Suitable when the server only serves the Aster ALPN.
  */
 export declare function startReactor(node: Node, channelCapacity: number): ReactorHandle
+
+/** Options for `Topology.enableShared`. */
+export interface TopologySwarmOptions {
+  /** Peers (node ids) to start doc sync with, beyond connected peers. */
+  bootstrap?: Array<string>
+  /** Heartbeat cadence for this node's records, ms (default 60 000). */
+  positionRefreshMs?: number
+  timing?: TopologyTiming
+}
+
+/** Reader timing / coverage rules (defaults are the design doc's). */
+export interface TopologyTiming {
+  minHoldMs?: number
+  livenessTtlMs?: number
+  edgeTtlMs?: number
+  maxSkewMs?: number
+  separationCoverage?: number
+  witnessR?: number
+}
+
+/** The result of a transition at a serializer. */
+export interface TransitionOutcome {
+  kind: 'granted' | 'renewed' | 'released' | 'revoked' | 'denied'
+  /** `granted`: the issued fence. */
+  fence?: Fence
+  /** `denied`: why. */
+  denyReason?: 'held_by_other' | 'epoch_mismatch' | 'not_holder' | 'expired' | 'not_held' | 'unauthorized'
+  /** `denied`: the row after the decision (a backoff hint). */
+  snapshot?: LeaseSnapshot
+}
 
 /**
  * Selected QUIC path snapshot exposed to JS. `peerAddr` and `relayUrl`
@@ -1557,6 +2066,21 @@ export interface UnaryFastPathResult {
   response: Buffer
   responseFlags: number
   trailer: Buffer
+}
+
+/**
+ * A successfully verified chain. Ids are 64-hex Ed25519 public keys
+ * (node-level identities, not docs authors).
+ */
+export interface VerifiedChain {
+  /** The node the chain binds to (== the expected node). */
+  node: string
+  /** The trusted anchor the chain terminates at. */
+  anchor: string
+  /** Intermediates between node and anchor, node-ward first. */
+  intermediates: Array<string>
+  /** Number of edges. */
+  depth: number
 }
 
 /** Exact version embedded by the shared Rust core build. */

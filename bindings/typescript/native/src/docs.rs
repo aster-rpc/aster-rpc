@@ -406,7 +406,7 @@ impl DocsClient {
 
 #[napi]
 pub struct DocHandle {
-    inner: aster::Doc,
+    pub(crate) inner: aster::Doc,
 }
 
 impl From<aster::Doc> for DocHandle {
@@ -757,6 +757,12 @@ impl From<aster::DocEvent> for DocEvent {
 #[napi(async_iterator)]
 pub struct DocEventReceiver {
     inner: aster::DocEvents,
+}
+
+impl From<aster::DocEvents> for DocEventReceiver {
+    fn from(inner: aster::DocEvents) -> Self {
+        Self { inner }
+    }
 }
 
 #[napi]

@@ -25,7 +25,9 @@ import type {
 } from '@aster-rpc/transport';
 import { type AsterConfig, toNativeConfig } from './config.js';
 import type { AdmissionRequest, GatePolicy } from './gate.js';
+import { GrantorSerializer, type MemorySerializer } from './lease.js';
 import { loadNative } from './native.js';
+import { Topology } from './topology.js';
 
 /**
  * A node id: the node's Ed25519 public key as 64 lowercase hex characters.
@@ -61,6 +63,12 @@ export interface NodeAddr {
   /** `"ip:port"` socket addresses. */
   directAddresses?: string[];
   relayUrl?: string;
+}
+
+/** Options for {@link Node.serveLeaseGrantor}. @group Lease */
+export interface LeaseGrantorOptions {
+  /** Let any admitted caller `revoke` (default: only the `operator` role). */
+  openRevoke?: boolean;
 }
 
 /** Options for {@link Node.start} beyond the config. @group Node */
@@ -185,6 +193,36 @@ export class Node implements AsyncDisposable {
   /** Transport metrics in Prometheus text exposition format. */
   metricsPrometheus(): string {
     return this.native.metricsPrometheus();
+  }
+
+  /**
+   * This node's topology view (v1 per-peer proximity; v2 shared swarm).
+   * Populates only when the node runs with `enableMonitoring: true`.
+   */
+  topology(): Topology {
+    return new Topology(this.native.topology());
+  }
+
+  /**
+   * A lease backend on the designated grantor `grantor` (an
+   * `aster.lease.Grantor` service reached over RPC). The grantor must be
+   * dialable by id (discovery, or its address added beforehand).
+   */
+  async leaseGrantor(grantor: NodeId | string): Promise<GrantorSerializer> {
+    return new GrantorSerializer(await this.native.leaseGrantor(grantor));
+  }
+
+  /**
+   * Serve `aster.lease.Grantor` over `serializer`, making this node a
+   * designated grantor. Start the node with `alpns: ['aster/1']`. This owns
+   * the node's RPC accept loop — don't also run an RPC server on it.
+   * Returns a handle whose `close()` stops serving.
+   */
+  serveLeaseGrantor(
+    serializer: MemorySerializer,
+    options: LeaseGrantorOptions = {},
+  ): { close(): void } {
+    return this.native.serveLeaseGrantor(serializer.native, options);
   }
 
   /** Whether `close()` has been called. */

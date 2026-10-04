@@ -168,3 +168,35 @@ pub fn hpke_envelope_decode(data: Buffer) -> Result<HpkeEnvelopeObject> {
     let envelope = HpkeEnvelope::decode_fory(&data).map_err(to_napi_err)?;
     Ok(envelope.into())
 }
+
+// ── Identity-derived X25519 HPKE keys (aster::crypto) ───────────────────────
+
+/// The X25519 HPKE private key derived from an Ed25519 node identity secret
+/// (hex or 32 bytes): clamped `SHA-512(seed)[..32]`, as libsodium
+/// `crypto_sign_ed25519_sk_to_curve25519`.
+#[napi]
+pub fn hpke_x25519_secret_from_identity(secret: Either<String, Uint8Array>) -> Result<Buffer> {
+    let secret = crate::keys::secret_in("identity secret", &secret)?;
+    Ok(Buffer::from(
+        aster::crypto::hpke_x25519_secret_from_identity(&secret).to_vec(),
+    ))
+}
+
+/// The X25519 HPKE public key derived from an Ed25519 node identity public
+/// key (hex or 32 bytes) — the Edwards→Montgomery map. Throws for an invalid
+/// Ed25519 key (off-curve, non-canonical, small-order).
+#[napi]
+pub fn hpke_x25519_public_from_identity(public_key: Either<String, Uint8Array>) -> Result<Buffer> {
+    let public = crate::keys::public_in("identity public key", &public_key)?;
+    let key = aster::crypto::hpke_x25519_public_from_identity(&public)
+        .map_err(crate::config::aster_err)?;
+    Ok(Buffer::from(key.to_vec()))
+}
+
+/// [`hpke_x25519_public_from_identity`] for a node id (64 hex).
+#[napi]
+pub fn hpke_x25519_public_from_node_id(node_id: String) -> Result<Buffer> {
+    let key = aster::crypto::hpke_x25519_public_from_node_id(&aster::NodeId::from_hex(node_id))
+        .map_err(crate::config::aster_err)?;
+    Ok(Buffer::from(key.to_vec()))
+}

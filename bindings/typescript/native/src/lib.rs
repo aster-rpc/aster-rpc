@@ -9,6 +9,7 @@
 use napi_derive::napi;
 
 mod admission;
+mod attestation;
 mod blobs;
 mod call;
 mod config;
@@ -18,10 +19,14 @@ mod docs;
 mod envelope;
 mod error;
 mod gossip;
+mod grants;
+mod keys;
+mod lease;
 mod net;
 mod node;
 mod reactor;
 mod ticket;
+mod topology;
 
 /// Exact version embedded by the shared Rust core build.
 #[napi]
