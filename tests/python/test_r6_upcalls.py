@@ -42,8 +42,10 @@ from aster import (
     HttpBodyError,
     HttpBodyStream,
     HttpHandler,
+    HttpRelayBody,
     HttpRequest,
     HttpResponse,
+    HttpUpload,
     RoutePolicy,
     RouteSpec,
     Fence,
@@ -72,6 +74,8 @@ from aster import (
     net_client,
     open_relay,
     relay_http,
+    relay_http_stream,
+    relay_http_streaming,
     request_route,
 )
 from aster import upcalls as up
@@ -1212,6 +1216,275 @@ async def test_expose_http_unimplemented_handler_is_501():
     finally:
         await rt.aclose()
         for n in (host, peer):
+            await n.shutdown()
+
+
+class Streamer(HttpHandler):
+    """Handler side of the streaming-relay tests: records what each request
+    body did and how the response writes ended."""
+
+    def __init__(self, rt):
+        self.upcall_runtime = rt
+        self.log = []
+        self.started = asyncio.Event()
+
+    async def handle(self, request):
+        self.log.append(("start", request.uri))
+        self.started.set()
+        if request.uri == "/echo":
+            try:
+                data = await request.read_body()
+            except HttpBodyError as exc:
+                # Sticky: a retry fails too rather than ending cleanly. (The
+                # task may be cancelled meanwhile; log the outcome either way.)
+                again = "cancelled while retrying"
+                try:
+                    await request.body.read()
+                    again = "ok"
+                except HttpBodyError as exc2:
+                    again = exc2.kind
+                finally:
+                    self.log.append(("body failed", exc.kind, again))
+                raise
+            except asyncio.CancelledError:
+                # The consumer reset before the head: the task is cancelled.
+                self.log.append(("body failed", "task cancelled", "task cancelled"))
+                raise
+            self.log.append(("body", len(data)))
+
+            async def back():
+                for i in range(0, len(data), 7000):
+                    yield data[i : i + 7000]
+
+            return HttpResponse(200, [("x-len", str(len(data)))], back())
+        if request.uri == "/abort":
+
+            async def failing():
+                yield b"x" * 600
+                await asyncio.sleep(0.05)
+                raise RuntimeError("origin failed mid-body")
+
+            return HttpResponse(200, (), failing())
+        if request.uri == "/forever":
+            log = self.log
+
+            async def endless():
+                try:
+                    while True:
+                        yield b"y" * 16384
+                finally:
+                    log.append(("forever closed",))
+
+            return HttpResponse(200, (), endless())
+        return HttpResponse(404, (), b"")
+
+
+async def _stream_pair(rt, *handlers):
+    host = await Node.start(_offline(), alpns=[HTTP_ALPN])
+    peer = await Node.start(_offline())
+    for n in (host, peer):
+        await _ready(n)
+    peer.add_node_addr(host)
+    expose = host.expose()
+    for name, h in handlers:
+        expose.expose_http(name, h)
+    serving = asyncio.ensure_future(expose.serve([HTTP_ALPN]))
+    conn = await asyncio.wait_for(net_client(peer).connect(host.node_id(), HTTP_ALPN), 10)
+    return host, peer, serving, conn
+
+
+@pytest.mark.network
+@pytest.mark.timeout(90)
+async def test_relay_http_stream_both_ways():
+    rt = UpcallRuntime()
+    app = Streamer(rt)
+    host, peer, serving, conn = await _stream_pair(rt, ("app", app))
+    try:
+        # Async-generator upload; bounded reads of the streamed response.
+        async def upload():
+            for i in range(0, len(BIG), 30_000):
+                yield BIG[i : i + 30_000]
+
+        resp = await asyncio.wait_for(
+            relay_http_stream(conn, "app", "PUT", "/echo", body=upload(), max_chunk=16384), 15
+        )
+        assert resp.status == 200 and resp.header("x-len") == str(len(BIG)).encode()
+        assert isinstance(resp.body, HttpRelayBody) and resp.body.max_chunk == 16384
+        got = bytearray()
+        while (chunk := await resp.body.read(5000)) is not None:
+            assert 0 < len(chunk) <= 5000
+            got += chunk
+        assert bytes(got) == BIG
+        assert await resp.body.read() is None  # the end is sticky
+        assert ("body", len(BIG)) in app.log
+
+        # bytes, a sync iterable of mixed chunks, and no body; read_body().
+        for body, want in ((b"abc", b"abc"), ([b"a", "b", bytearray(b"c")], b"abc"), (None, b"")):
+            resp = await asyncio.wait_for(relay_http_stream(conn, "app", "POST", "/echo", body=body), 15)
+            assert await resp.read_body() == want
+        resp = await asyncio.wait_for(relay_http_stream(conn, "app", "POST", "/echo", body=BIG), 15)
+        with pytest.raises(HttpBodyError) as big:
+            await resp.read_body(limit=1000)
+        assert big.value.kind == "too_large" and resp.body.closed
+
+        # async for over the body.
+        resp = await asyncio.wait_for(relay_http_stream(conn, "app", "POST", "/echo", body=BIG), 15)
+        assert b"".join([c async for c in resp.body]) == BIG
+
+        # The low-level form: write the upload yourself.
+        upload_h, pending = relay_http_streaming(conn, "app", "POST", "/echo", {"x-a": "1"})
+        assert isinstance(upload_h, HttpUpload) and not upload_h.closed
+        await upload_h.write(b"hello ")
+        assert upload_h.try_write("world") in (True, False)
+        upload_h.finish()
+        assert upload_h.closed
+        with pytest.raises(HttpBodyError) as done:
+            upload_h.finish()
+        assert done.value.kind == "finished"
+        resp = await asyncio.wait_for(pending, 15)
+        assert (await resp.read_body()).startswith(b"hello ")
+
+        with pytest.raises(ValueError):
+            relay_http_streaming(conn, "app", "BAD METHOD", "/")
+    finally:
+        serving.cancel()
+        await rt.aclose()
+        for n in (host, peer):
+            await n.shutdown()
+
+
+@pytest.mark.network
+@pytest.mark.timeout(90)
+async def test_relay_http_stream_failures_never_truncate():
+    rt = UpcallRuntime(policies={"expose_http": UpcallPolicy(timeout=10.0)})
+    app = Streamer(rt)
+    host, peer, serving, conn = await _stream_pair(rt, ("app", app))
+    try:
+
+        def body_failures():
+            return [e for e in app.log if e[0] == "body failed"]
+
+        # The upload iterator raising: its own exception propagates, and the
+        # handler sees a failed request body (sticky), not a short one.
+        async def broken():
+            yield b"z" * 50_000
+            await asyncio.wait_for(app.started.wait(), 10)
+            raise KeyError("upload source failed")
+
+        with pytest.raises(KeyError):
+            await asyncio.wait_for(relay_http_stream(conn, "app", "PUT", "/echo", body=broken()), 15)
+        await _until("handler saw the failed body", lambda: len(body_failures()) == 1)
+        assert body_failures()[0][2] in (body_failures()[0][1], "cancelled while retrying")
+
+        # An upload dropped without finish() aborts too.
+        app.started.clear()
+        upload_h, pending = relay_http_streaming(conn, "app", "PUT", "/echo")
+        await upload_h.write(b"z" * 50_000)
+        await asyncio.wait_for(app.started.wait(), 10)
+        del upload_h
+        with pytest.raises(Exception) as dropped:
+            await asyncio.wait_for(pending, 15)
+        assert not isinstance(dropped.value, asyncio.TimeoutError)
+        await _until("dropped upload failed the body", lambda: len(body_failures()) == 2)
+
+        # Cancelling the call mid-upload resets the request.
+        app.started.clear()
+
+        async def slow():
+            yield b"z" * 50_000
+            await asyncio.sleep(30)
+            yield b"never"
+
+        call = asyncio.ensure_future(relay_http_stream(conn, "app", "PUT", "/echo", body=slow()))
+        await asyncio.wait_for(app.started.wait(), 10)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        await _until("cancelled call failed the body", lambda: len(body_failures()) == 3)
+
+        # Low level: cancelling only the response awaitable resets the
+        # request too, even with the upload handle still alive.
+        app.started.clear()
+        upload_h, pending = relay_http_streaming(conn, "app", "PUT", "/echo")
+        await upload_h.write(b"z" * 50_000)
+        await asyncio.wait_for(app.started.wait(), 10)
+        pending.cancel()
+        await _until("cancelled awaitable failed the body", lambda: len(body_failures()) == 4)
+        await _until("upload sees the reset", lambda: upload_h.closed)
+        with pytest.raises(HttpBodyError) as gone:
+            await upload_h.write(b"more")
+        assert gone.value.kind in ("cancelled", "finished")
+
+        # An unknown service fails the call, never hangs the upload.
+        with pytest.raises(Exception) as unknown:
+            await asyncio.wait_for(relay_http_stream(conn, "nope", "PUT", "/", body=BIG), 15)
+        assert not isinstance(unknown.value, (asyncio.TimeoutError, HttpBodyError))
+
+        # A response that fails partway raises from the read, every time.
+        resp = await asyncio.wait_for(relay_http_stream(conn, "app", "GET", "/abort"), 15)
+        with pytest.raises(HttpBodyError) as failed:
+            async for _ in resp.body:
+                pass
+        assert failed.value.kind == "read" and failed.value.code == 7
+        with pytest.raises(HttpBodyError):
+            await resp.body.read()
+
+        # Closing the body early stops the handler's stream.
+        resp = await asyncio.wait_for(relay_http_stream(conn, "app", "GET", "/forever"), 15)
+        async with resp.body as body:
+            assert await body.read(100)
+        with pytest.raises(HttpBodyError) as closed:
+            await resp.body.read()
+        assert closed.value.kind == "cancelled"
+        await _until("handler stream closed", lambda: ("forever closed",) in app.log)
+        # No handler ever took a failed upload for a complete (short) one.
+        assert not [e for e in app.log if e[0] == "body"]
+    finally:
+        serving.cancel()
+        await rt.aclose()
+        for n in (host, peer):
+            await n.shutdown()
+
+
+@pytest.mark.network
+@pytest.mark.timeout(90)
+async def test_relay_http_stream_response_proxies_through_a_handler():
+    """An edge handler returns the relayed response as its own: bodies
+    stream client -> edge -> origin and back without buffering."""
+    rt = UpcallRuntime()
+    origin = await Node.start(_offline(), alpns=[HTTP_ALPN])
+    edge = await Node.start(_offline(), alpns=[HTTP_ALPN])
+    client = await Node.start(_offline())
+    serving = []
+    try:
+        for n in (origin, edge, client):
+            await _ready(n)
+        edge.add_node_addr(origin)
+        client.add_node_addr(edge)
+        origin_expose = origin.expose()
+        origin_expose.expose_http("app", Streamer(rt))
+        serving.append(asyncio.ensure_future(origin_expose.serve([HTTP_ALPN])))
+        upstream = await asyncio.wait_for(
+            net_client(edge).connect(origin.node_id(), HTTP_ALPN), 10
+        )
+
+        async def proxy(request):
+            return await relay_http_stream(
+                upstream, "app", request.method, request.uri, body=request.body
+            )
+
+        edge_expose = edge.expose()
+        edge_expose.expose_http("proxy", proxy)
+        serving.append(asyncio.ensure_future(edge_expose.serve([HTTP_ALPN])))
+        conn = await asyncio.wait_for(net_client(client).connect(edge.node_id(), HTTP_ALPN), 10)
+        resp = await asyncio.wait_for(relay_http_stream(conn, "proxy", "PUT", "/echo", body=BIG), 15)
+        assert resp.status == 200 and resp.header("x-len") == str(len(BIG)).encode()
+        assert await resp.read_body() == BIG
+    finally:
+        for t in serving:
+            t.cancel()
+        await rt.aclose()
+        for n in (origin, edge, client):
             await n.shutdown()
 
 

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use aster::binding_support::relay::{relay_streaming, RelayOptions, RelayReader};
 use aster::binding_support::upcall::codec::{
     self, ExposeHttpRequest, ExposeHttpResponse, ExposeRouteSpec, HttpBodyMode,
 };
@@ -985,4 +986,455 @@ async fn route_policy_grants_the_answered_subset() {
 
     stop.store(true, Ordering::Relaxed);
     thread.join().unwrap();
+}
+
+// ── consumer-side streaming relay (binding_support::relay) ─────────────────
+
+/// What the foreign handler saw, per request: `start <uri>`, then the
+/// request-body outcome and (for `/forever`) how its writes ended.
+type Log = Arc<Mutex<Vec<String>>>;
+
+fn log_has(log: &Log, line: &str) -> bool {
+    log.lock().unwrap().iter().any(|l| l == line)
+}
+
+/// `/echo` (`/hold`: after a pause): read the whole request body, then
+/// stream it back in 7000-byte writes. `/abort`: one chunk, then abort.
+/// `/forever`: write until a write fails.
+fn streaming_handler(log: Log) -> HttpFn {
+    Arc::new(move |ctx, id, req| {
+        log.lock().unwrap().push(format!("start {}", req.uri));
+        let sid = req.stream_id;
+        match req.uri.as_str() {
+            "/echo" | "/hold" => {
+                if req.uri == "/hold" {
+                    // Let the upload back up before reading any of it.
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                let mut body = Vec::new();
+                loop {
+                    match ctx.bodies.read_blocking(sid, 64 * 1024, WAIT) {
+                        Ok(Some(c)) => body.extend_from_slice(&c),
+                        Ok(None) => break,
+                        Err(e) => {
+                            // Sticky: a retry fails too, never a clean end.
+                            let again = ctx.bodies.read_blocking(sid, 64 * 1024, WAIT);
+                            let again = again.map_err(|e| e.code());
+                            log.lock()
+                                .unwrap()
+                                .push(format!("read {} {again:?}", e.code()));
+                            return;
+                        }
+                    }
+                }
+                log.lock().unwrap().push(format!("read ok {}", body.len()));
+                ctx.respond(
+                    id,
+                    200,
+                    &[("x-len", &body.len().to_string())],
+                    HttpBodyMode::Stream,
+                );
+                for piece in body.chunks(7000) {
+                    if ctx
+                        .bodies
+                        .write_blocking(sid, piece.to_vec(), WAIT)
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = ctx.bodies.finish(sid, Vec::new());
+            }
+            "/abort" => {
+                ctx.respond(id, 200, &[], HttpBodyMode::Stream);
+                let _ = ctx.bodies.write_blocking(sid, vec![7; 600], WAIT);
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = ctx.bodies.abort(sid, "handler failed");
+            }
+            "/forever" => {
+                ctx.respond(id, 200, &[], HttpBodyMode::Stream);
+                loop {
+                    if let Err(e) = ctx.bodies.write_blocking(sid, vec![1; 16 * 1024], WAIT) {
+                        log.lock().unwrap().push(format!("write {}", e.code()));
+                        return;
+                    }
+                }
+            }
+            _ => ctx.respond(id, 404, &[], HttpBodyMode::Inline(Vec::new())),
+        }
+    })
+}
+
+async fn streaming_net(log: &Log) -> (Foreign, Ctx, Net) {
+    let (queue, ctx) = setup();
+    let foreign = Foreign::start(queue, ctx.clone(), true, streaming_handler(log.clone()));
+    let c = ctx.clone();
+    let n = net(move |e| {
+        expose_foreign_http(e, &c.upcalls, &c.bodies, SVC, ForeignHttpOptions::default());
+    })
+    .await;
+    (foreign, ctx, n)
+}
+
+fn rt() -> tokio::runtime::Handle {
+    tokio::runtime::Handle::current()
+}
+
+async fn read_all(reader: &RelayReader, max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(c) = tokio::time::timeout(WAIT, reader.read(max))
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        assert!(!c.is_empty() && c.len() <= max);
+        out.extend_from_slice(&c);
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_streaming_uploads_and_reads_in_bounded_chunks() {
+    let log: Log = Arc::default();
+    let (_f, ctx, n) = streaming_net(&log).await;
+    let options = RelayOptions {
+        max_chunk: 64 * 1024,
+        upload_capacity: 2,
+    };
+    let data: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+    let (upload, response) = relay_streaming(
+        &rt(),
+        &n.conn,
+        SVC,
+        "POST",
+        "/echo",
+        &[("x-a".into(), b"1".to_vec())],
+        options,
+    )
+    .unwrap();
+    let response = tokio::spawn(response.wait());
+    // One big write is split into max_chunk pieces under backpressure.
+    tokio::time::timeout(WAIT, upload.write(Bytes::from(data.clone())))
+        .await
+        .unwrap()
+        .unwrap();
+    upload.finish().unwrap();
+    assert_eq!(upload.finish(), Err(BodyError::Finished));
+    assert_eq!(
+        upload.write(Bytes::from_static(b"x")).await,
+        Err(BodyError::Finished)
+    );
+
+    let (head, reader) = tokio::time::timeout(WAIT, response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.status, 200);
+    assert!(head
+        .headers
+        .contains(&("x-len".into(), data.len().to_string().into_bytes())));
+    assert_eq!(read_all(&reader, 10_000).await, data);
+    // The end is sticky and clean.
+    assert_eq!(reader.read(10).await, Ok(None));
+    assert!(log_has(&log, &format!("read ok {}", data.len())));
+
+    // An empty upload.
+    let (upload, response) = relay_streaming(
+        &rt(),
+        &n.conn,
+        SVC,
+        "POST",
+        "/echo",
+        &[],
+        RelayOptions::default(),
+    )
+    .unwrap();
+    upload.finish().unwrap();
+    let (head, reader) = tokio::time::timeout(WAIT, response.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.status, 200);
+    assert_eq!(reader.read(100).await, Ok(None));
+
+    // A bad request never reaches the wire.
+    assert!(matches!(
+        relay_streaming(
+            &rt(),
+            &n.conn,
+            SVC,
+            "BAD METHOD",
+            "/",
+            &[],
+            RelayOptions::default()
+        ),
+        Err(aster::Error::InvalidArgument(_))
+    ));
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+/// An upload that ends badly -- aborted, every handle dropped without
+/// finish, or the response future dropped mid-upload -- reaches the handler
+/// as a failed request body, never a clean (truncated) one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_streaming_failed_uploads_fail_the_request_body() {
+    let log: Log = Arc::default();
+    let (_f, ctx, n) = streaming_net(&log).await;
+    // "abort-and-cancel" fails the upload and cancels the exchange at once
+    // (as a binding's cancelled call does): the relay is torn down while
+    // it handles the failed upload, and the reset must survive that.
+    let cases = ["abort", "drop", "drop-future"]
+        .into_iter()
+        .chain(std::iter::repeat_n("abort-and-cancel", 20));
+    for case in cases {
+        log.lock().unwrap().clear();
+        let (upload, response) = relay_streaming(
+            &rt(),
+            &n.conn,
+            SVC,
+            "PUT",
+            "/echo",
+            &[],
+            RelayOptions::default(),
+        )
+        .unwrap();
+        // The exchange runs without anyone waiting on it.
+        upload.write(Bytes::from(vec![5; 50_000])).await.unwrap();
+        wait_until("handler started", || log_has(&log, "start /echo")).await;
+        match case {
+            "abort" => {
+                upload.abort("client gave up").unwrap();
+                assert_eq!(upload.abort("again"), Err(BodyError::Finished));
+                let res = tokio::time::timeout(WAIT, response.wait()).await.unwrap();
+                assert!(res.is_err(), "{case}: response after an aborted upload");
+            }
+            "drop" => {
+                drop(upload);
+                let res = tokio::time::timeout(WAIT, response.wait()).await.unwrap();
+                assert!(res.is_err(), "{case}: response after a dropped upload");
+            }
+            "abort-and-cancel" => {
+                upload.abort("caller cancelled").unwrap();
+                response.cancel();
+                drop(response);
+            }
+            _ => {
+                // Never waited on, then dropped: the exchange is cancelled.
+                drop(response);
+                // The request side is gone: writes now fail Cancelled.
+                let mut res = Ok(());
+                for _ in 0..200 {
+                    res = upload.write(Bytes::from_static(b"more")).await;
+                    if res.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(res, Err(BodyError::Cancelled), "{case}");
+                assert!(upload.is_closed());
+            }
+        }
+        wait_until(&format!("{case}: handler saw a failed body"), || {
+            let l = log.lock().unwrap();
+            l.iter()
+                .any(|x| x.starts_with("read ") && !x.starts_with("read ok") && x.contains("Err"))
+        })
+        .await;
+    }
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_streaming_aborted_response_fails_every_read() {
+    let log: Log = Arc::default();
+    let (_f, ctx, n) = streaming_net(&log).await;
+    let (upload, response) = relay_streaming(
+        &rt(),
+        &n.conn,
+        SVC,
+        "GET",
+        "/abort",
+        &[],
+        RelayOptions::default(),
+    )
+    .unwrap();
+    upload.finish().unwrap();
+    let (head, reader) = tokio::time::timeout(WAIT, response.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.status, 200);
+    let mut got = 0;
+    let err = loop {
+        match tokio::time::timeout(WAIT, reader.read(1 << 20))
+            .await
+            .unwrap()
+        {
+            Ok(Some(c)) => got += c.len(),
+            Ok(None) => panic!("aborted response ended cleanly after {got} bytes"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err.code(), 7, "{err:?}");
+    // Sticky: a retry never turns the failure into a clean end.
+    assert_eq!(reader.read(10).await.unwrap_err().code(), 7);
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_streaming_close_stops_the_handler() {
+    let log: Log = Arc::default();
+    let (_f, ctx, n) = streaming_net(&log).await;
+    let (upload, response) = relay_streaming(
+        &rt(),
+        &n.conn,
+        SVC,
+        "GET",
+        "/forever",
+        &[],
+        RelayOptions::default(),
+    )
+    .unwrap();
+    upload.finish().unwrap();
+    let (_, reader) = tokio::time::timeout(WAIT, response.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reader.read(1000).await.unwrap().is_some());
+
+    // A read parked on the wire is woken by close.
+    let parked = {
+        let r = reader.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = r.read(1 << 20).await {
+                    return e;
+                }
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    reader.close();
+    assert!(reader.is_closed());
+    let e = tokio::time::timeout(WAIT, parked).await.unwrap().unwrap();
+    assert_eq!(e, BodyError::Cancelled);
+    assert_eq!(reader.read(10).await, Err(BodyError::Cancelled));
+    wait_until("handler write cancelled", || {
+        log_has(&log, &format!("write {}", BodyError::Cancelled.code()))
+    })
+    .await;
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_streaming_dropped_reader_stops_the_handler() {
+    let log: Log = Arc::default();
+    let (_f, ctx, n) = streaming_net(&log).await;
+    let (upload, response) = relay_streaming(
+        &rt(),
+        &n.conn,
+        SVC,
+        "GET",
+        "/forever",
+        &[],
+        RelayOptions::default(),
+    )
+    .unwrap();
+    upload.finish().unwrap();
+    let (_, reader) = tokio::time::timeout(WAIT, response.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reader.read(1000).await.unwrap().is_some());
+    drop(reader);
+    wait_until("handler write cancelled", || {
+        log_has(&log, &format!("write {}", BodyError::Cancelled.code()))
+    })
+    .await;
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_streaming_try_write_and_finish_barrier() {
+    let log: Log = Arc::default();
+    let (_f, ctx, n) = streaming_net(&log).await;
+    let options = RelayOptions {
+        max_chunk: 1000,
+        upload_capacity: 2,
+    };
+    let (upload, response) =
+        relay_streaming(&rt(), &n.conn, SVC, "PUT", "/hold", &[], options).unwrap();
+    assert_eq!(
+        upload.try_write(Bytes::from(vec![0; 1001])),
+        Err(BodyError::ChunkTooLarge {
+            got: 1001,
+            max: 1000
+        })
+    );
+    // try_write never waits: once the buffer is full it says so.
+    let (mut queued, mut saw_full) = (0, false);
+    for _ in 0..10_000 {
+        match upload.try_write(Bytes::from(vec![1; 1000])).unwrap() {
+            true => queued += 1000,
+            false => {
+                saw_full = true;
+                break;
+            }
+        }
+    }
+    assert!(queued > 0 && saw_full, "queued {queued}, full {saw_full}");
+
+    // A split write blocked on backpressure stops at finish(): the pieces
+    // it had not queued yet are dropped and it reports Finished.
+    let writer = {
+        let up = upload.clone();
+        tokio::spawn(async move { up.write(Bytes::from(vec![2; 32 << 20])).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    upload.finish().unwrap();
+    assert_eq!(
+        tokio::time::timeout(WAIT, writer).await.unwrap().unwrap(),
+        Err(BodyError::Finished)
+    );
+    let (head, reader) = tokio::time::timeout(WAIT, response.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.status, 200);
+    let got = read_all(&reader, 1 << 20).await.len();
+    assert!(
+        got >= queued && got < queued + (32 << 20),
+        "{got} vs {queued}"
+    );
+    wait_until("exchanges closed", || ctx.bodies.open_count() == 0).await;
+    n.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_streaming_unknown_service_fails_the_response() {
+    let log: Log = Arc::default();
+    let (_f, _ctx, n) = streaming_net(&log).await;
+    let (upload, response) = relay_streaming(
+        &rt(),
+        &n.conn,
+        "nope",
+        "POST",
+        "/",
+        &[],
+        RelayOptions::default(),
+    )
+    .unwrap();
+    let _ = upload.write(Bytes::from_static(b"x")).await;
+    let _ = upload.finish();
+    assert!(tokio::time::timeout(WAIT, response.wait())
+        .await
+        .unwrap()
+        .is_err());
+    n.shutdown().await;
 }

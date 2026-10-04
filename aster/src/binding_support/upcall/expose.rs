@@ -291,6 +291,9 @@ struct RequestReader {
     body: Option<RequestBody>,
     pending: Bytes,
     total: u64,
+    /// Sticky failure: a read after a failed one fails the same way rather
+    /// than reporting a clean end of a truncated body.
+    failed: Option<BodyError>,
 }
 
 struct Exchange {
@@ -420,6 +423,7 @@ impl HttpBodies {
                 body,
                 pending: Bytes::new(),
                 total: 0,
+                failed: None,
             }),
             response: Mutex::new(Some(response)),
             written: AtomicU64::new(0),
@@ -443,13 +447,17 @@ impl HttpBodies {
     /// aborted the response, the id is remembered (bounded) so its later body
     /// calls report `Cancelled`.
     fn close(&self, id: u64, cancelled: bool) {
-        let removed = self.inner.exchanges.lock().unwrap().remove(&id);
-        if let Some(ex) = removed {
-            ex.gone.set();
+        // Hold the table lock throughout, so a concurrent lookup sees the
+        // exchange or its tombstone, never neither (`UnknownStream` for a
+        // call racing the teardown). Lock order: exchanges, response,
+        // cancelled; nothing takes them the other way round.
+        let mut exchanges = self.inner.exchanges.lock().unwrap();
+        if let Some(ex) = exchanges.remove(&id) {
             let unfinished = ex.response.lock().unwrap().take().is_some();
             if cancelled && unfinished {
                 self.inner.cancelled.lock().unwrap().insert(id);
             }
+            ex.gone.set();
         }
     }
 
@@ -489,6 +497,9 @@ impl HttpBodies {
             if ex.gone.is_set() {
                 return Err(BodyError::Cancelled);
             }
+            if let Some(e) = &rd.failed {
+                return Err(e.clone());
+            }
             if !rd.pending.is_empty() {
                 let n = max.min(rd.pending.len());
                 return Ok(Some(rd.pending.split_to(n).to_vec()));
@@ -507,7 +518,7 @@ impl HttpBodies {
                 }
                 Some(Err(e)) => {
                     rd.body = None;
-                    return Err(BodyError::Read(e.to_string()));
+                    rd.failed = Some(BodyError::Read(e.to_string()));
                 }
                 Some(Ok(frame)) => {
                     // Request trailers are not carried by the relay; skip any.
@@ -516,7 +527,8 @@ impl HttpBodies {
                         if let Some(limit) = ex.options.max_request_body {
                             if rd.total > limit {
                                 rd.body = None;
-                                return Err(BodyError::TooLarge(limit));
+                                rd.failed = Some(BodyError::TooLarge(limit));
+                                continue;
                             }
                         }
                         rd.pending = data;
@@ -558,7 +570,17 @@ impl HttpBodies {
         }
         let tx = {
             let mut slot = ex.response.lock().unwrap();
-            let tx = slot.as_ref().ok_or(BodyError::Finished)?.clone();
+            let Some(tx) = slot.as_ref().cloned() else {
+                // Taken by `finish` / `abort`, or by a teardown that raced
+                // this call after the lookup.
+                return Err(
+                    if self.inner.cancelled.lock().unwrap().contains(stream_id) {
+                        BodyError::Cancelled
+                    } else {
+                        BodyError::Finished
+                    },
+                );
+            };
             let total = ex.written.fetch_add(len as u64, Ordering::AcqRel) + len as u64;
             if let Some(limit) = ex.options.max_response_body {
                 if total > limit {
