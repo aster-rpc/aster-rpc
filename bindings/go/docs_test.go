@@ -26,9 +26,9 @@ func TestDocID(t *testing.T) {
 
 func TestQueryMode(t *testing.T) {
 	tests := []struct {
-		mode    QueryMode
-		value   uint32
-		name    string
+		mode  QueryMode
+		value uint32
+		name  string
 	}{
 		{QUERY_MODE_KEY_EXACT, 0, "KEY_EXACT"},
 		{QUERY_MODE_KEY_PREFIX, 1, "KEY_PREFIX"},

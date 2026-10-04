@@ -65,9 +65,7 @@ const (
 	ASTER_EVENT_GOSSIP_NEIGHBOR_DOWN  EventKind = 54
 	ASTER_EVENT_GOSSIP_LAGGED         EventKind = 55
 	// Datagrams
-	// TODO(iroh): ASTER_EVENT_DATAGRAM_RECEIVED (60) is never emitted by any FFI function.
-	// aster_connection_read_datagram emits ASTER_EVENT_BYTES_RESULT (91) instead.
-	// Consider removing DATAGRAM_RECEIVED from this enum or clarifying its intended use.
+	// aster_connection_read_datagram completes with ASTER_EVENT_DATAGRAM_RECEIVED.
 	ASTER_EVENT_DATAGRAM_RECEIVED EventKind = 60
 	// Aster custom-ALPN
 	ASTER_EVENT_ASTER_ACCEPTED EventKind = 65
@@ -87,6 +85,14 @@ const (
 	ASTER_EVENT_UNIT_RESULT         EventKind = 92
 	ASTER_EVENT_OPERATION_CANCELLED EventKind = 98
 	ASTER_EVENT_ERROR               EventKind = 99
+	// ABI 3.3 data plane
+	ASTER_EVENT_BLOB_FETCHED         EventKind = 100
+	ASTER_EVENT_DOC_AUTHORITY_REPORT EventKind = 101
+	ASTER_EVENT_DOC_RETIRE_OUTCOME   EventKind = 102
+	ASTER_EVENT_DOC_OPENED           EventKind = 103
+	ASTER_EVENT_DOC_ENTRY_EXISTS     EventKind = 104
+	ASTER_EVENT_DOC_CONTENT_STATUS   EventKind = 105
+	ASTER_EVENT_STREAM_PRIORITY      EventKind = 106
 )
 
 // Event represents an event emitted by the Rust completion queue.

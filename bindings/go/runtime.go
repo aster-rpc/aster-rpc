@@ -86,8 +86,22 @@ type Runtime struct {
 	mu sync.Mutex
 
 	// acceptHandlers maps node handle to the Node that owns its accept loop.
-	// Only accessed by the poller goroutine.
 	acceptHandlers map[uint64]*Node
+
+	// inbound maps a node/endpoint handle to a handler for events that are not
+	// tied to an operation (admission hooks). Guarded by mu.
+	inbound map[uint64]func(*Event)
+
+	// pending holds completions that arrived before their operation was
+	// registered (an op can complete before Register runs). Guarded by mu.
+	pending map[uint64]*Event
+
+	// abandoned holds cancelled operations whose late completion is dropped.
+	abandoned map[uint64]struct{}
+
+	// refs counts owners (nodes, gates) sharing this runtime; the runtime is
+	// closed when the last one releases it.
+	refs atomic.Int32
 
 	pollCh chan struct{} // wakes the poller
 
@@ -118,8 +132,12 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		handle:         uint64(handle),
 		ops:            make(map[uint64]chan<- *Event),
 		acceptHandlers: make(map[uint64]*Node),
+		inbound:        make(map[uint64]func(*Event)),
+		pending:        make(map[uint64]*Event),
+		abandoned:      make(map[uint64]struct{}),
 		pollCh:         make(chan struct{}, 1),
 	}
+	runtime.refs.Store(1)
 
 	runtime.wg.Add(1)
 	go runtime.pollLoop()
@@ -148,6 +166,10 @@ func (r *Runtime) Close() error {
 		close(ch)
 		delete(r.ops, op)
 	}
+	for op, ev := range r.pending {
+		r.releaseEventBuffer(ev)
+		delete(r.pending, op)
+	}
 	r.mu.Unlock()
 
 	err := C.aster_runtime_close(C.uint64_t(r.handle))
@@ -158,19 +180,114 @@ func (r *Runtime) Close() error {
 	return nil
 }
 
-// Register adds ch as the event sink for op. The channel is closed
-// when the operation reaches a terminal state.
+// retain adds an owner to the runtime (see release).
+func (r *Runtime) retain() *Runtime {
+	r.refs.Add(1)
+	return r
+}
+
+// release drops an owner; the last release closes the runtime.
+func (r *Runtime) release() error {
+	if r.refs.Add(-1) == 0 {
+		return r.Close()
+	}
+	return nil
+}
+
+// Handle returns the native runtime handle.
+func (r *Runtime) Handle() uint64 { return r.handle }
+
+// Register adds ch as the event sink for op. The channel should be buffered:
+// the completion is delivered without blocking. A completion that arrived
+// before Register is delivered immediately.
 func (r *Runtime) Register(op uint64, ch chan<- *Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if ev, ok := r.pending[op]; ok {
+		delete(r.pending, op)
+		select {
+		case ch <- ev:
+		default:
+		}
+		return
+	}
 	r.ops[op] = ch
 }
 
-// Unregister removes the channel for op. Returns the channel if it was registered.
+// Unregister removes the channel for op and forgets an undelivered completion.
 func (r *Runtime) Unregister(op uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.ops, op)
+	if ev, ok := r.pending[op]; ok {
+		delete(r.pending, op)
+		r.releaseEventBuffer(ev)
+	}
+}
+
+// registerInbound routes operation-less events (admission hooks) raised for
+// handle to fn, which runs on the poller goroutine and must not block.
+func (r *Runtime) registerInbound(handle uint64, fn func(*Event)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inbound[handle] = fn
+}
+
+func (r *Runtime) unregisterInbound(handle uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.inbound, handle)
+}
+
+func (r *Runtime) releaseEventBuffer(ev *Event) {
+	if ev != nil && ev.Buffer != 0 {
+		C.aster_buffer_release(C.uint64_t(r.handle), C.uint64_t(ev.Buffer))
+		ev.Buffer = 0
+	}
+}
+
+// takePayload copies an event's payload into Go memory and releases its
+// native buffer.
+func (r *Runtime) takePayload(ev *Event) []byte {
+	data := cDataToGoBytes(ev.DataPtr, ev.DataLen)
+	r.releaseEventBuffer(ev)
+	ev.DataPtr, ev.DataLen = nil, 0
+	return data
+}
+
+// eventError turns an unexpected completion (usually ASTER_EVENT_ERROR) into
+// an error carrying the native message and status, releasing its buffer.
+func (r *Runtime) eventError(ev *Event, what string) error {
+	detail := string(r.takePayload(ev))
+	status := int32(ev.Status)
+	if status == 0 {
+		status = int32(ev.ErrorCode)
+	}
+	if status == 0 {
+		status = ASTER_STATUS_INTERNAL
+	}
+	msg := fmt.Sprintf("%s: event %d", what, ev.Kind)
+	if detail != "" {
+		msg += ": " + detail
+	}
+	return &irohErrorWithSentinel{errorf(status, "%s", msg), statusToError[status]}
+}
+
+// await submits nothing; it waits for the completion of op (already
+// started) and cancels the native operation if ctx ends first.
+func (r *Runtime) await(ctx context.Context, op uint64) (*Event, error) {
+	ch := make(chan *Event, 1)
+	r.Register(op, ch)
+	select {
+	case ev, ok := <-ch:
+		if !ok || ev == nil {
+			return nil, fmt.Errorf("runtime closed: %w", ErrAlreadyClosed)
+		}
+		return ev, nil
+	case <-ctx.Done():
+		_ = r.Cancel(op)
+		return nil, ctx.Err()
+	}
 }
 
 // pollLoop runs the background event poller. It exits when r.closed is true.
@@ -223,6 +340,18 @@ func (r *Runtime) dispatchBatch(events []C.aster_event_t) {
 			Flags:     uint32(ev.flags),
 		}
 
+		// Admission hooks are not tied to an operation: route by handle.
+		if goEv.Kind == ASTER_EVENT_HOOK_BEFORE_CONNECT || goEv.Kind == ASTER_EVENT_HOOK_AFTER_CONNECT {
+			r.mu.Lock()
+			fn, ok := r.inbound[goEv.Handle]
+			r.mu.Unlock()
+			if ok {
+				fn(goEv)
+			}
+			r.releaseEventBuffer(goEv)
+			continue
+		}
+
 		// Check if this is an inbound accept event routed to a registered Node.
 		if goEv.Kind == ASTER_EVENT_ASTER_ACCEPTED {
 			r.mu.Lock()
@@ -235,10 +364,17 @@ func (r *Runtime) dispatchBatch(events []C.aster_event_t) {
 		}
 
 		// Normal op-based dispatch.
+		op := uint64(ev.operation)
 		r.mu.Lock()
-		ch, ok := r.ops[uint64(ev.operation)]
+		ch, ok := r.ops[op]
 		if ok {
-			delete(r.ops, uint64(ev.operation))
+			delete(r.ops, op)
+		} else if _, gone := r.abandoned[op]; gone {
+			delete(r.abandoned, op)
+			r.releaseEventBuffer(goEv)
+		} else if op != 0 && goEv.Kind != ASTER_EVENT_OPERATION_CANCELLED {
+			// Completed before anyone registered: keep it for Register.
+			r.pending[op] = goEv
 		}
 		r.mu.Unlock()
 
@@ -249,7 +385,8 @@ func (r *Runtime) dispatchBatch(events []C.aster_event_t) {
 		select {
 		case ch <- goEv:
 		default:
-			// Channel full or closed; drop the event.
+			// Channel full; drop the event.
+			r.releaseEventBuffer(goEv)
 		}
 	}
 }
@@ -277,7 +414,10 @@ func (r *Runtime) Poll(ctx context.Context, op uint64) (*Event, error) {
 	defer r.Unregister(op)
 
 	select {
-	case ev := <-ch:
+	case ev, ok := <-ch:
+		if !ok || ev == nil {
+			return nil, fmt.Errorf("runtime closed: %w", ErrAlreadyClosed)
+		}
 		return ev, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -289,6 +429,7 @@ func (r *Runtime) Cancel(op uint64) error {
 	r.Unregister(op) // Remove channel so cancelled event doesn't get dispatched.
 	r.mu.Lock()
 	delete(r.ops, op)
+	r.abandoned[op] = struct{}{}
 	r.mu.Unlock()
 
 	err := C.aster_operation_cancel(C.uint64_t(r.handle), C.uint64_t(op))

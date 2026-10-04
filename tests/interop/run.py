@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript x Java x .NET, open gate, unary + streaming.
+"""Cross-binding RPC interop smoke -- Rust x Python x TypeScript x Java x .NET x Go, open gate, unary + streaming.
 
 Builds what is needed, checks that all languages derive the same
 ``contract_id`` for the shared ``InteropEcho`` contract, then runs every
@@ -7,7 +7,7 @@ server x client cell (same-language cells included) and prints a matrix.
 
 Usage (from anywhere)::
 
-    python3 tests/interop/run.py                 # build Rust example + FFI lib + Java + .NET + TS dist/codegen, run matrix
+    python3 tests/interop/run.py                 # build Rust example + FFI lib + Java + .NET + Go + TS dist/codegen, run matrix
     python3 tests/interop/run.py --native        # also rebuild the Python + TS native modules
     python3 tests/interop/run.py --no-build      # just run
     python3 tests/interop/run.py --servers rust --clients python,ts
@@ -16,7 +16,8 @@ Cargo goes through ``$ASTER_CARGO_LAUNCHER`` when set (e.g. the Kache
 launcher). Needs: cargo, uv (with the Python extension built), bun, node,
 mvn + java 22+ (Java runs ``java/InteropEcho.java`` against
 ``libaster_transport_ffi`` via ``IROH_LIB_PATH``), the .NET 9 SDK (``dotnet/``
-is built against the same debug ``libaster_transport_ffi``).
+is built against the same debug ``libaster_transport_ffi``), Go 1.25+ (``go/``
+is built with cgo against the same library and ``ffi/aster_ffi.h``).
 Everything is loopback-only with relays disabled, so it works offline.
 Exit status is non-zero if any contract id disagrees or any cell fails.
 """
@@ -40,11 +41,12 @@ TS_DIR = HERE / "ts"
 TS_PKG = REPO / "bindings/typescript/packages/aster"
 JAVA_DIR = REPO / "bindings/java"
 DOTNET_DIR = HERE / "dotnet"
-LANGS = ("rust", "python", "ts", "java", "dotnet")
-# Java and .NET join the default matrix only where their toolchains are
-# installed (the Forgejo runner has neither); name them in --servers/--clients
-# to require them.
-OPTIONAL_TOOLS = {"java": ("java", "mvn"), "dotnet": ("dotnet",)}
+GO_DIR = HERE / "go"
+LANGS = ("rust", "python", "ts", "java", "dotnet", "go")
+# Java, .NET and Go join the default matrix only where their toolchains are
+# installed (the Forgejo runner has none of them); name them in
+# --servers/--clients to require them.
+OPTIONAL_TOOLS = {"java": ("java", "mvn"), "dotnet": ("dotnet",), "go": ("go",)}
 DEFAULT_LANGS = tuple(
     lang for lang in LANGS if all(shutil.which(t) for t in OPTIONAL_TOOLS.get(lang, ()))
 )
@@ -106,12 +108,14 @@ def command(lang: str, *args: str) -> tuple[list[str], Path]:
                 str(HERE / "java/InteropEcho.java"), *args], REPO
     if lang == "dotnet":
         return ["dotnet", str(DOTNET_DIR / "bin/Release/net9.0/InteropEcho.dll"), *args], REPO
+    if lang == "go":
+        return [str(GO_DIR / "interop_echo"), *args], REPO
     raise ValueError(lang)
 
 
-def run_step(desc: str, cmd: list[str], cwd: Path) -> None:
+def run_step(desc: str, cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     print(f"[build] {desc}: {shlex.join(cmd)}", flush=True)
-    res = subprocess.run(cmd, cwd=cwd, env=ENV)
+    res = subprocess.run(cmd, cwd=cwd, env=env or ENV)
     if res.returncode != 0:
         sys.exit(f"[build] {desc} failed (exit {res.returncode})")
 
@@ -126,7 +130,7 @@ def build(native: bool, langs: set[str]) -> None:
         [*launcher, "cargo", "build", "-p", "aster", "--features", "rpc", "--example", "interop_echo"],
         REPO,
     )
-    if langs & {"java", "dotnet"}:
+    if langs & {"java", "dotnet", "go"}:
         run_step("ffi cdylib", [*launcher, "cargo", "build", "-p", "aster_transport_ffi", "--lib"], REPO)
     if "java" in langs:
         run_step("java aster-runtime", ["mvn", "-B", "-q", "-o", "-pl", "aster-runtime", "-am", "compile"],
@@ -137,6 +141,17 @@ def build(native: bool, langs: set[str]) -> None:
         run_step("dotnet InteropEcho",
                  ["dotnet", "build", "-c", "Release", "--nologo", "-v", "q",
                   f"-p:NativeLibraryPath={ffi_lib().parent}", str(DOTNET_DIR)], REPO)
+    if "go" in langs:
+        # cgo against the debug FFI library above; the rpath lets the binary
+        # find it at run time without DYLD/LD_LIBRARY_PATH.
+        lib_dir = ffi_lib().parent
+        go_env = {
+            **ENV,
+            "CGO_ENABLED": "1",
+            "CGO_CFLAGS": f"-I{REPO / 'ffi'}",
+            "CGO_LDFLAGS": f"-L{lib_dir} -laster_transport_ffi -Wl,-rpath,{lib_dir}",
+        }
+        run_step("go interop_echo", ["go", "build", "-o", str(GO_DIR / "interop_echo"), "."], GO_DIR, go_env)
     run_step("ts package (tsc)", ["bun", "run", "build"], TS_PKG)
     run_step(
         "ts aster-gen",

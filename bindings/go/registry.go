@@ -75,14 +75,14 @@ type ServiceSummary struct {
 // ArtifactRef is the docs pointer to an immutable Iroh collection. Stored at
 // "contracts/{contract_id}" in the registry doc.
 type ArtifactRef struct {
-	ContractID          string `json:"contract_id"`
-	CollectionHash      string `json:"collection_hash"`
-	ProviderEndpointID  string `json:"provider_endpoint_id,omitempty"`
-	RelayURL            string `json:"relay_url,omitempty"`
-	Ticket              string `json:"ticket,omitempty"`
-	PublishedBy         string `json:"published_by"`
-	PublishedAtEpochMs  int64  `json:"published_at_epoch_ms"`
-	CollectionFormat    string `json:"collection_format"`
+	ContractID         string `json:"contract_id"`
+	CollectionHash     string `json:"collection_hash"`
+	ProviderEndpointID string `json:"provider_endpoint_id,omitempty"`
+	RelayURL           string `json:"relay_url,omitempty"`
+	Ticket             string `json:"ticket,omitempty"`
+	PublishedBy        string `json:"published_by"`
+	PublishedAtEpochMs int64  `json:"published_at_epoch_ms"`
+	CollectionFormat   string `json:"collection_format"`
 }
 
 // ToJSON serializes the ArtifactRef as a compact JSON string.

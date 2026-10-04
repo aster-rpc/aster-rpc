@@ -9,8 +9,8 @@ import "sync"
 // without requiring the native FFI library.
 // It is safe for concurrent use from multiple goroutines.
 type FakeCQ struct {
-	mu    sync.Mutex
-	ops   map[uint64]chan *Event
+	mu     sync.Mutex
+	ops    map[uint64]chan *Event
 	closed bool
 	nextOp uint64
 }

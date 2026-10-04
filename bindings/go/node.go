@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -50,6 +51,10 @@ type Node struct {
 	connections chan AcceptedAster
 	mu          sync.RWMutex
 	closed      bool
+
+	// ownsRuntime: started by StartNode; Close releases the runtime reference.
+	ownsRuntime bool
+	admissions  chan *AdmissionRequest
 }
 
 // Connections returns a channel that emits AcceptedAster for each
@@ -162,22 +167,49 @@ func (n *Node) Close() error {
 
 	// Remove accept handler so no new connections arrive.
 	n.runtime.removeAcceptHandler(n.handle)
-
-	r := C.aster_node_free(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle))
-	if r != 0 {
-		return fmt.Errorf("aster_node_free: %w", Error(r))
+	if n.admissions != nil {
+		n.runtime.unregisterInbound(n.handle)
+		n.mu.Lock()
+		close(n.admissions)
+		n.mu.Unlock()
 	}
-	return nil
+
+	if !n.ownsRuntime {
+		// Legacy factories: free the handle; the runtime is left running.
+		r := C.aster_node_free(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle))
+		if r != 0 {
+			return fmt.Errorf("aster_node_free: %w", Error(r))
+		}
+		return nil
+	}
+
+	// Graceful close, bounded; then drop our runtime reference.
+	var op C.aster_operation_t
+	if C.aster_node_close(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), 0, &op) == 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if ev, err := n.runtime.await(ctx, uint64(op)); err == nil {
+			n.runtime.releaseEventBuffer(ev)
+		}
+		cancel()
+	} else {
+		C.aster_node_free(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle))
+	}
+	return n.runtime.release()
 }
 
 // ─── Factory methods ─────────────────────────────────────────────────────────
 
 // Memory creates an in-memory node with all protocols enabled.
+//
+// Deprecated: ABI 3.2 deprecates aster_node_memory* / aster_node_persistent
+// (removed in 4.0). Use StartNode.
 func Memory(ctx context.Context) (*Node, error) {
 	return MemoryWithAlpns(ctx, nil)
 }
 
 // MemoryWithAlpns creates an in-memory node that accepts connections on the given ALPNs.
+//
+// Deprecated: use StartNode with AsterConfig.ALPNs.
 func MemoryWithAlpns(ctx context.Context, alpns []string) (*Node, error) {
 	runtime, err := NewRuntime(ctx, DefaultRuntimeConfig())
 	if err != nil {
@@ -187,11 +219,15 @@ func MemoryWithAlpns(ctx context.Context, alpns []string) (*Node, error) {
 }
 
 // Persistent creates a persistent node at the given path with all protocols.
+//
+// Deprecated: use StartNode with AsterConfig.StoragePath.
 func Persistent(ctx context.Context, path string) (*Node, error) {
 	return PersistentWithAlpns(ctx, path, nil)
 }
 
 // PersistentWithAlpns creates a persistent node at path that accepts connections on the given ALPNs.
+//
+// Deprecated: use StartNode.
 func PersistentWithAlpns(ctx context.Context, path string, alpns []string) (*Node, error) {
 	runtime, err := NewRuntime(ctx, DefaultRuntimeConfig())
 	if err != nil {

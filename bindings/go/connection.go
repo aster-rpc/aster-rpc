@@ -162,8 +162,10 @@ func (c *Connection) ReadDatagram(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read datagram poll: %w", err)
 	}
-	if ev.Kind != ASTER_EVENT_BYTES_RESULT {
-		return nil, fmt.Errorf("read datagram: unexpected event %d", ev.Kind)
+	// The library completes reads with ASTER_EVENT_DATAGRAM_RECEIVED (older
+	// builds used ASTER_EVENT_BYTES_RESULT).
+	if ev.Kind != ASTER_EVENT_DATAGRAM_RECEIVED && ev.Kind != ASTER_EVENT_BYTES_RESULT {
+		return nil, c.runtime.eventError(ev, "read datagram")
 	}
 
 	data := cDataToGoBytes(ev.DataPtr, ev.DataLen)

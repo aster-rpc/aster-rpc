@@ -33,16 +33,16 @@ type GossipPeer struct {
 
 // GossipMessage represents a message received from gossip.
 type GossipMessage struct {
-	Content  []byte
-	Topic    string
-	PeerID   string
+	Content   []byte
+	Topic     string
+	PeerID    string
 	Timestamp uint64
 }
 
 // Gossip provides gossip protocol operations.
 // Get an instance via Node.Gossip().
 type Gossip struct {
-	node     *Node
+	node    *Node
 	runtime *Runtime
 }
 
@@ -221,8 +221,8 @@ func parseGossipMessage(dataPtr unsafe.Pointer, dataLen int) (*GossipMessage, er
 
 	return &GossipMessage{
 		Content:   content,
-		Topic:    topic,
-		PeerID:   peerID,
+		Topic:     topic,
+		PeerID:    peerID,
 		Timestamp: timestamp,
 	}, nil
 }

@@ -1,49 +1,95 @@
 # Aster Go FFI Bindings
 
 **Package:** `github.com/aster-rpc/aster-go`
-**Target:** Go 1.23+
+**Target:** Go 1.25+ (Fory Go 1.7.6 requires it)
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 3.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Status (ABI 3.0 port)
+## Status (ABI 3.4 catch-up, 2026-10-04)
 
-**PARTIAL — compiles and vets clean; reactor server path works end to end;
-not production-ready.**
+**Working at RPC parity for open-gate interop.** Go is in the `tests/interop/`
+matrix (Rust / Python / TypeScript / Java / .NET / Go, 6×6 = 36/36, identical
+`InteropEcho` contract id `c5aa690b…`). The binding refuses a native library
+whose ABI major differs (3).
 
-- Ported to the ABI 3.0 rename (`aster_*`, `aster_ffi.h`). `NewRuntime` checks
-  `aster_abi_version()` and passes `ASTER_ABI_VERSION_MAJOR` to
-  `aster_runtime_new`. Status / event-kind / reactor-event / relay-mode /
-  hook-decision / doc-query-mode constants come from the header via cgo
-  (`iroh.go`, `endpoint.go`, `reactor.go`); `types.go` mirrors them for `!cgo`.
-- All FFI structs are built with the cgo-generated header types
-  (`C.aster_endpoint_config_t`, `C.aster_connect_config_t`,
-  `C.aster_node_addr_t`, `C.aster_reactor_call_t`, ...) and
-  `unsafe.Sizeof`; no hand-computed offsets remain (`cmem.go` owns the C
-  allocations for config payloads).
-- Reactor: `Poll` branches on `event_kind` (call / connection-closed /
-  response-writable / response-closed). Submits that return `QUEUE_FULL` use
-  `aster_reactor_reserve_response_capacity` and wait for the capacity event
-  delivered by `Poll`, then retry the exact submit (same contract as Java).
-  `Server` surfaces submit errors (`ServerConfig.OnSubmitError`, default: log)
-  and connection closes (`ServerConfig.OnConnectionClosed`).
-- `cmd/aster_server_test` (client + reactor server echo round trip) passes.
+- **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
+  safe for concurrent use. Payload types implement `aster.WireTyped`
+  (`AsterWireType() string { return "namespace/Name" }`) and are registered by
+  name automatically. **`[]byte` fields must be tagged `fory:"type=bytes"`**:
+  untagged, Fory Go writes them as `list<uint8>`, not the `binary` every other
+  binding uses (the contract builder refuses an untagged `[]byte`; use
+  `aster:"uint8_list"` to mean `list<uint8>`).
+- **Envelope / compression:** AEv1 `StreamHeader` / `CallHeader` / `RpcStatus`
+  and zstd come from the C ABI (`EncodeStreamHeader`, `DecodeRpcStatus`,
+  `ZstdMaybeCompress`, `EncodePayloadFrame`, ...); `conformance/vectors/
+  envelope.json` and `compression.json` pass.
+- **Contract ids:** `Service.ContractID()` builds the TypeDef / ServiceContract
+  JSON from Go types and lets Rust canonicalise and hash it
+  (`aster_canonical_bytes`, `aster_blake3_hex`, `aster_contract_id`).
+  `int32` → `varint32`, `int64`/`int` → `varint64`, `uint32` → `var_uint32`
+  (a `fory:"encoding=fixed"` tag selects the fixed forms), pointers are optional.
+- **Node:** `AsterConfig` mirrors `aster_config_t`; `ConfigFromEnv()` /
+  `ConfigFromTOML(path)` resolve through Rust `aster::AsterConfig` plus the
+  binding-level `[trust]` / `[connect]` / `[logging]` keys. `StartNode(ctx, cfg,
+  NodeOptions{Gate, ExtraALPNs})` uses `aster_node_start`; `Node.Ticket`,
+  `Connect`, `Accept`, `AddNodeAddr`, `SetGate`, `MetricsPrometheus`, `Docs()`.
+  The old `Memory*` / `Persistent*` / `NewEndpoint` factories are deprecated (ABI 4.0
+  removes them).
+- **Gate 0:** `NewGate` (`aster_gate_*`: trust mode, admission ALPNs, reject
+  code/reason, admit/revoke/is-admitted/should-allow). Without a gate, a node
+  with `EnableHooks` delivers `*AdmissionRequest`s on `Node.Admissions()`;
+  answer with `Allow()` / `Deny(code, reason)` (`aster_admission_respond`).
+- **Server:** `StartServer(ctx, ServerOptions{Config, Services, Gate,
+  Interceptors})` serves `Unary`, `ServerStream`, `ClientStream` and
+  `BidiStream` methods (generic, `context.Context` first, streams as
+  `iter.Seq2[*Req, error]` + `send func(*Resp) error`). Header deadlines become
+  context deadlines; every call ends with exactly one AEv1 `RpcStatus` trailer
+  (`*RpcError` keeps its code, deadline → `DEADLINE_EXCEEDED`, panics and other
+  errors → `INTERNAL`). The default gate is `TrustOpenDev` when
+  `AllowAllConsumers` is set, else `TrustProtected`. QUEUE_FULL is handled by
+  reserving response capacity (exercised by `TestRPC_QueueFullBackpressure`).
+- **Client:** `StartClient` / `NewClient`, `ConnectTicket`; `Call`,
+  `CallServerStream`, `CallClientStream`, `CallBidiStream` (generic package
+  functions; the deadline comes from `ctx`, rounded up to whole seconds;
+  `WithMetadata`, `WithSessionID`). Unary uses the pooled `aster_call_unary`
+  fast path, streaming calls a dedicated substream. Consumer admission is not
+  performed (open gate / admitted peers only, as for .NET and Java).
+- **Errors:** `errors.Is` against `ErrNotFound`, `ErrInvalidArgument`,
+  `ErrVerificationFailed`, ... (status codes) and `ErrRpcNotFound`,
+  `ErrRpcUnimplemented`, ... (RPC codes); `errors.As` to `*RpcError` /
+  `*IrohError`. Native failures carry `aster_last_error_message`.
+- **ABI 3.3 data plane:** `Blobs.DownloadHashFrom` (+ `FetchReport`),
+  `DownloadHash`, `ReadRange`, `GCRunOnce`; `Tags.DeletePrefix`;
+  `Docs.AuthorityReport` / `Open` / `ImportWriteNamespace` /
+  `ImportReadNamespace` / `RetireLocalWriteAuthority`; `Doc.AuthorityReport` /
+  `SetBytesDurable` / `EntryExists` / `EntryContentStatus` /
+  `ShutdownForRoleSwap`; `AuthorityFingerprint`; `Connection.Paths` /
+  `SelectedPath`; `SendStream.SetPriority` / `Priority`. Streams also adapt to
+  `io.Reader` / `io.WriteCloser` (`RecvStream.Reader`, `SendStream.Writer`).
+- **ABI 3.4 pure functions:** typed ids (`ParseID`, `FormatID`, `ValidateID`,
+  `SecretKeyPublicKey`, `NamespaceSecretID`), HPKE (`HPKESeal` / `HPKEOpen`,
+  identity-derived X25519), attestation (`AttestRootNode`,
+  `VerifyAttestationChain`, text form), sealed grants (`GrantSeal` /
+  `GrantOpen`, namespace grants, `GrantRecord`, `ReconcileGrant`);
+  `conformance/vectors/grants.json` passes.
 
-Known issues:
+Fixed in the catch-up: completions that arrived before their operation was
+registered were dropped (calls could hang); `ReadDatagram` rejected the
+`DATAGRAM_RECEIVED` completion; ticket encode/decode and the canonical/contract
+helpers panicked on empty input and used fixed buffers; the hand-rolled ticket
+JSON parser mis-read `null`; the two blob-collection tests built invalid JSON /
+expected no error for invalid JSON; status 13 (`VERIFICATION_FAILED`) was
+unnamed; `Node` had no `Docs()`.
 
-- `Endpoint.AddrInfo` (used by `cmd/testnode`, `cmd/stream_test`,
-  `cmd/datagram_test`) aborts on a debug build of the native library:
-  `aster_endpoint_addr_info` writes the `aster_bytes_t` direct-address array
-  at an unaligned offset in the caller's buffer (Rust-side bug, `ffi/src/lib.rs`).
-- Pre-existing pure-Go parser test failures unrelated to the ABI:
-  `TestParseBlobCollectionJSON` (test builds invalid JSON),
-  `TestParseBlobCollectionJSON_invalid` (test expects no error for invalid
-  JSON), `TestParseTicketJSON` (hand-rolled ticket JSON parser mis-handles
-  `null`).
-- `hostile_race_test.go` / `TestSoak_Short` have no peer, so they only check
-  "no crash"; they are not meaningful coverage. `TestSoak_Runs` (30 min) is
-  skipped unless `ASTER_GO_SOAK=1`.
-- No session / multiplexed-stream (spec §6) support in `Server`; streaming
-  handlers are not wired (only `Reactor.SubmitFrame/SubmitTrailer`).
+Known gaps:
+
+- Session-scoped services are not served (`StartServer` rejects them); client
+  interceptors are not wired; no `go generate` codegen yet.
+- Unary cancellation stops waiting but does not cancel the native call.
+- `CallBidiStream` waits for the request iterator to finish before returning.
+- The payload codec serialises through one Fory instance under a mutex.
+- `hostile_race_test.go` / `TestSoak_Short` have no peer and only check "no
+  crash"; `TestSoak_Runs` (30 min) is skipped unless `ASTER_GO_SOAK=1`.
 
 ## Build
 
@@ -57,12 +103,19 @@ export CGO_LDFLAGS="-L$(pwd)/../../target/debug -laster_transport_ffi"
 export DYLD_LIBRARY_PATH="$(pwd)/../../target/debug"   # LD_LIBRARY_PATH on Linux
 
 go vet ./...
-go test ./...                       # cgo tests
-go run ./cmd/aster_server_test      # end-to-end reactor echo
+go test ./...                       # all cgo tests (RPC, node, vectors, data plane)
+go run ./cmd/aster_server_test      # legacy raw reactor echo
 
 # Pure-Go unit tests (no native library)
 CGO_ENABLED=0 go test ./...
 ```
+
+cgo does not track changes to `ffi/aster_ffi.h` in Go's build cache: after an
+ABI bump run `go test -a ...` once (a stale header shows up as
+`TestABI_VersionMatchesHeader` failing).
+
+The interop leg lives in `tests/interop/go/` (its own module, `replace`d onto
+this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 
 ## Source Files
 
@@ -72,11 +125,22 @@ CGO_ENABLED=0 go test ./...
 | `iroh.go` | Status / event-kind / reactor-event constants from `aster_ffi.h` (`//go:build cgo`) |
 | `cmem.go` | C-memory arena + `aster_bytes_t` helpers for building FFI structs |
 | `reactor.go` | `Reactor` — poll (event kinds), submit with QUEUE_FULL capacity reservation |
-| `server.go` | `Server` — reactor poll loop + handler dispatch |
+| `server.go` | `Server` — raw reactor poll loop + byte-level handler (legacy; use `AsterServer`) |
+| `config.go` | `AsterConfig` ↔ `aster_config_t`, `ConfigFromEnv` / `ConfigFromTOML` |
+| `node_start.go` | `StartNode`, admission requests, connect/accept/ticket helpers |
+| `gate.go` | `Gate` — Gate-0 policy (`aster_gate_*`) |
+| `envelope.go` | AEv1 envelope, zstd, framing (via the C ABI) |
+| `codec.go` | `Codec`, `ForyCodec` (Fory 1.7.6), `WireTyped` |
+| `contract.go` | Contract identity: TypeDef / ServiceContract JSON → Rust hash |
+| `rpc_service.go` | `Service`, `Unary` / `ServerStream` / `ClientStream` / `BidiStream`, `CallInfo` |
+| `rpc_server.go` | `AsterServer` — typed dispatch, deadlines, RpcStatus trailers |
+| `rpc_client.go` | `AsterClient`, `RpcConnection`, `Call*` functions |
+| `dataplane.go` | ABI 3.3 blobs / tags / docs / paths / priority wrappers |
+| `pure.go`, `grants.go` | ABI 3.4 ids, HPKE, attestation, sealed grants |
 | `types.go` | Event types and event kind constants (`//go:build !cgo`) |
 | `error.go` | Typed errors with `errors.Is`/`errors.As` support (`//go:build cgo`) |
 | `runtime.go` | `Runtime` type — poller goroutine, event dispatch, sync FFI helpers |
-| `node.go` | `Node` type — memory/persistent creation, connection channel |
+| `node.go` | `Node` type — address, secret key, close; deprecated memory/persistent factories |
 | `endpoint.go` | `Endpoint` type — create, connect, accept, close |
 | `connection.go` | `Connection` type — bi/uni streams, datagrams |
 | `stream.go` | `SendStream` / `RecvStream` types — write/read/finish |
@@ -85,6 +149,7 @@ CGO_ENABLED=0 go test ./...
 | `abi_contract_test.go` + `abi_layout.go` | ABI contract tests — header struct sizes, ABI version, status names, endpoint config layout (`//go:build cgo`) |
 | `hostile_race_test.go` | 7 hostile race integration tests (`//go:build cgo`) |
 | `soak_test.go` | 2 soak/leak tests (`//go:build cgo`) |
+| `rpc_test.go`, `node_test.go`, `dataplane_test.go`, `vectors_test.go` | RPC (4 patterns, errors, deadlines, gate, interceptors, QUEUE_FULL), config/node/gate/admission, data plane, conformance vectors |
 
 ## Architecture
 

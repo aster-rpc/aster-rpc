@@ -233,3 +233,57 @@ func (r *RecvStream) Close() error {
 	return nil
 }
 
+// Writer adapts the stream to io.WriteCloser: Write blocks until the data is
+// written (bounded by ctx), Close finishes the stream.
+func (s *SendStream) Writer(ctx context.Context) io.WriteCloser {
+	return &streamWriter{ctx: ctx, s: s}
+}
+
+type streamWriter struct {
+	ctx context.Context
+	s   *SendStream
+}
+
+func (w *streamWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := w.s.Write(w.ctx, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (w *streamWriter) Close() error { return w.s.Finish(w.ctx) }
+
+// Reader adapts the stream to io.Reader (io.EOF once the peer finishes).
+func (r *RecvStream) Reader(ctx context.Context) io.Reader {
+	return &streamReader{ctx: ctx, r: r}
+}
+
+type streamReader struct {
+	ctx  context.Context
+	r    *RecvStream
+	buf  []byte
+	done bool
+}
+
+func (sr *streamReader) Read(p []byte) (int, error) {
+	for len(sr.buf) == 0 {
+		if sr.done {
+			return 0, io.EOF
+		}
+		data, err := sr.r.Read(sr.ctx)
+		if errors.Is(err, io.EOF) {
+			sr.done = true
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		sr.buf = data
+	}
+	n := copy(p, sr.buf)
+	sr.buf = sr.buf[n:]
+	return n, nil
+}

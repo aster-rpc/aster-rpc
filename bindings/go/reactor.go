@@ -333,3 +333,48 @@ func (r *Reactor) Close() error {
 	}
 	return nil
 }
+
+// RecvStatus is the outcome of Reactor.RecvFrame.
+type RecvStatus int
+
+const (
+	RecvOK          RecvStatus = C.ASTER_RECV_FRAME_OK
+	RecvEndOfStream RecvStatus = C.ASTER_RECV_FRAME_END_OF_STREAM
+	RecvTimeout     RecvStatus = C.ASTER_RECV_FRAME_TIMEOUT
+)
+
+// RecvFrame pulls the next additional request frame of a client-stream /
+// bidi call (the first arrives inline in Poll), blocking up to timeoutMs.
+// The payload is copied and the native buffer released.
+func (r *Reactor) RecvFrame(callID uint64, timeoutMs uint32) (RecvStatus, []byte, byte, error) {
+	var ptr *C.uint8_t
+	var n C.uint32_t
+	var flags C.uint8_t
+	var buf C.uint64_t
+	s := C.aster_reactor_recv_frame(C.uint64_t(r.runtimeHandle), C.uint64_t(r.handle), C.uint64_t(callID),
+		C.uint32_t(timeoutMs), &ptr, &n, &flags, &buf)
+	if s < 0 {
+		return 0, nil, 0, fmt.Errorf("aster_reactor_recv_frame: %w", Error(C.int(-s)))
+	}
+	if s != C.ASTER_RECV_FRAME_OK {
+		if s == C.ASTER_RECV_FRAME_END_OF_STREAM || s == C.ASTER_RECV_FRAME_TIMEOUT {
+			return RecvStatus(s), nil, 0, nil
+		}
+		return 0, nil, 0, fmt.Errorf("aster_reactor_recv_frame: %w", Error(C.int(s)))
+	}
+	var payload []byte
+	if ptr != nil && n > 0 {
+		payload = C.GoBytes(unsafe.Pointer(ptr), C.int(n))
+	} else {
+		payload = []byte{}
+	}
+	r.releaseBuffer(buf)
+	return RecvOK, payload, byte(flags), nil
+}
+
+// IsCancelled reports whether the call was cancelled by the peer, or is no
+// longer known to the reactor (completed or reaped): both are terminal.
+func (r *Reactor) IsCancelled(callID uint64) bool {
+	s := C.aster_reactor_check_cancelled(C.uint64_t(r.runtimeHandle), C.uint64_t(r.handle), C.uint64_t(callID))
+	return s != 0
+}

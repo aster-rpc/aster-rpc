@@ -4,6 +4,7 @@ package aster
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -104,7 +105,9 @@ func TestBlobInfo(t *testing.T) {
 
 func TestParseBlobCollectionJSON(t *testing.T) {
 	// JSON format: [[name, hash, size], ...]
-	jsonStr := `[["file1.txt","` + "a1b2c3d4e5f6" + string(make([]byte, 52)) + `",1024],["file2.txt","` + "f6e5d4c3b2a1" + string(make([]byte, 52)) + `",2048]]`
+	hash1 := "a1b2c3d4e5f6" + strings.Repeat("0", 52)
+	hash2 := "f6e5d4c3b2a1" + strings.Repeat("0", 52)
+	jsonStr := `[["file1.txt","` + hash1 + `",1024],["file2.txt","` + hash2 + `",2048]]`
 
 	collection, err := parseBlobCollectionJSON(jsonStr)
 	if err != nil {
@@ -122,6 +125,9 @@ func TestParseBlobCollectionJSON(t *testing.T) {
 		t.Errorf("expected size 1024, got %d", collection.Entries[0].Size)
 	}
 
+	if collection.Entries[0].Hash != BlobID(hash1) {
+		t.Errorf("expected hash %s, got %s", hash1, collection.Entries[0].Hash)
+	}
 	if collection.Entries[1].Name != "file2.txt" {
 		t.Errorf("expected file2.txt, got %s", collection.Entries[1].Name)
 	}
@@ -141,10 +147,9 @@ func TestParseBlobCollectionJSON_empty(t *testing.T) {
 }
 
 func TestParseBlobCollectionJSON_invalid(t *testing.T) {
-	// Invalid JSON should return empty collection, not error
-	_, err := parseBlobCollectionJSON(`not json`)
-	if err != nil {
-		t.Fatalf("expected no error for invalid json, got %v", err)
+	// Malformed JSON from the native side is an error, not an empty collection.
+	if _, err := parseBlobCollectionJSON(`not json`); err == nil {
+		t.Fatal("expected an error for invalid json")
 	}
 }
 
@@ -171,7 +176,9 @@ func TestBlobIDType(t *testing.T) {
 
 // BenchmarkBlobCollectionParse benchmarks JSON parsing for collections.
 func BenchmarkBlobCollectionParse(b *testing.B) {
-	jsonStr := `[["file1.txt","` + "a1b2c3d4e5f6" + string(make([]byte, 52)) + `",1024],["file2.txt","` + "f6e5d4c3b2a1" + string(make([]byte, 52)) + `",2048]]`
+	hash1 := "a1b2c3d4e5f6" + strings.Repeat("0", 52)
+	hash2 := "f6e5d4c3b2a1" + strings.Repeat("0", 52)
+	jsonStr := `[["file1.txt","` + hash1 + `",1024],["file2.txt","` + hash2 + `",2048]]`
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

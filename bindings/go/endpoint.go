@@ -96,6 +96,9 @@ func (e *Endpoint) Handle() uint64 {
 }
 
 // NewEndpoint creates a new endpoint using the given runtime and config.
+//
+// Deprecated: ABI 3.2 deprecates aster_endpoint_create (removed in 4.0). Use
+// StartNode; Node.Connect / Node.Accept cover the endpoint calls.
 func NewEndpoint(ctx context.Context, runtime *Runtime, cfg EndpointConfig) (*Endpoint, error) {
 	var a cArena
 	defer a.free()

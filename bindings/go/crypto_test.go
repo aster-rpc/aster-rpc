@@ -86,7 +86,7 @@ func TestParseTicketJSONWithRelay(t *testing.T) {
 
 func TestTicketContent(t *testing.T) {
 	content := &TicketContent{
-		EndpointID:      "test123",
+		EndpointID:     "test123",
 		RelayAddr:      "relay.example.com:443",
 		DirectAddrs:    []string{"1.2.3.4:5678", "5.6.7.8:9012"},
 		CredentialType: "TestCredential",

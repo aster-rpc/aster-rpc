@@ -28,7 +28,7 @@ type BlobStatus uint32
 const (
 	BLOB_STATUS_NOT_FOUND BlobStatus = 0
 	BLOB_STATUS_PARTIAL   BlobStatus = 1
-	BLOB_STATUS_COMPLETE BlobStatus = 2
+	BLOB_STATUS_COMPLETE  BlobStatus = 2
 )
 
 // String returns a human-readable string for the blob status.
@@ -50,7 +50,7 @@ type BlobFormat uint32
 
 // Blob format constants.
 const (
-	BLOB_FORMAT_RAW     BlobFormat = 0
+	BLOB_FORMAT_RAW      BlobFormat = 0
 	BLOB_FORMAT_HASH_SEQ BlobFormat = 1
 )
 
@@ -79,7 +79,7 @@ type BlobInfo struct {
 // Blobs provides blob storage operations for an Iroh node.
 // Get an instance via Node.Blobs().
 type Blobs struct {
-	node     *Node
+	node    *Node
 	runtime *Runtime
 }
 

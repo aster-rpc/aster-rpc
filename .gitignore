@@ -283,6 +283,7 @@ bindings/dotnet/**/bin/
 bindings/dotnet/**/obj/
 tests/interop/dotnet/bin/
 tests/interop/dotnet/obj/
+tests/interop/go/interop_echo
 
 # JMH benchmark result snapshots -- local run artifacts, not source.
 **/jmh-result*.text
@@ -295,3 +296,4 @@ bindings/java/aster-runtime/src/main/resources/native/
 
 # Self-hosted runner secrets (PAT) — never commit
 .github/runner/.env
+bindings/go/testnode

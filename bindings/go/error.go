@@ -14,6 +14,8 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"strings"
+	"unsafe"
 )
 
 // IrohError is the base error type returned by all FFI operations.
@@ -84,6 +86,8 @@ func errorFromStatus(code C.int) *IrohError {
 		return errorf(c, "stream reset")
 	case ASTER_STATUS_ABI_MISMATCH:
 		return errorf(c, "ABI version mismatch")
+	case ASTER_STATUS_VERIFICATION_FAILED:
+		return errorf(c, "verification failed")
 	default:
 		return errorf(c, "unknown status %d", c)
 	}
@@ -103,22 +107,26 @@ var (
 	ErrConnectionRefused = errors.New("connection refused")
 	ErrStreamReset       = errors.New("stream reset")
 	ErrABIMismatch       = errors.New("ABI version mismatch")
+	// ErrVerificationFailed: well-formed input failed a security check (an
+	// envelope does not open, a chain does not verify, role != capability).
+	ErrVerificationFailed = errors.New("verification failed")
 )
 
 // statusToError maps status codes to sentinel errors for errors.Is matching.
 var statusToError = map[int32]error{
-	ASTER_STATUS_INVALID_ARGUMENT:   ErrInvalidArgument,
-	ASTER_STATUS_NOT_FOUND:          ErrNotFound,
-	ASTER_STATUS_ALREADY_CLOSED:     ErrAlreadyClosed,
-	ASTER_STATUS_QUEUE_FULL:         ErrQueueFull,
-	ASTER_STATUS_BUFFER_TOO_SMALL:   ErrBufferTooSmall,
-	ASTER_STATUS_UNSUPPORTED:        ErrUnsupported,
-	ASTER_STATUS_INTERNAL:           ErrInternal,
-	ASTER_STATUS_TIMEOUT:            ErrTimeout,
-	ASTER_STATUS_CANCELLED:          ErrCancelled,
-	ASTER_STATUS_CONNECTION_REFUSED: ErrConnectionRefused,
-	ASTER_STATUS_STREAM_RESET:       ErrStreamReset,
-	ASTER_STATUS_ABI_MISMATCH:       ErrABIMismatch,
+	ASTER_STATUS_INVALID_ARGUMENT:    ErrInvalidArgument,
+	ASTER_STATUS_NOT_FOUND:           ErrNotFound,
+	ASTER_STATUS_ALREADY_CLOSED:      ErrAlreadyClosed,
+	ASTER_STATUS_QUEUE_FULL:          ErrQueueFull,
+	ASTER_STATUS_BUFFER_TOO_SMALL:    ErrBufferTooSmall,
+	ASTER_STATUS_UNSUPPORTED:         ErrUnsupported,
+	ASTER_STATUS_INTERNAL:            ErrInternal,
+	ASTER_STATUS_TIMEOUT:             ErrTimeout,
+	ASTER_STATUS_CANCELLED:           ErrCancelled,
+	ASTER_STATUS_CONNECTION_REFUSED:  ErrConnectionRefused,
+	ASTER_STATUS_STREAM_RESET:        ErrStreamReset,
+	ASTER_STATUS_ABI_MISMATCH:        ErrABIMismatch,
+	ASTER_STATUS_VERIFICATION_FAILED: ErrVerificationFailed,
 }
 
 // Is returns true if target is a matching sentinel error.
@@ -167,4 +175,30 @@ func (e *irohErrorWithSentinel) As(target any) bool {
 		return true
 	}
 	return false
+}
+
+// statusError converts a non-OK status from a synchronous FFI call into an
+// error carrying the library's last-error message (if any). Returns nil for OK.
+func statusError(code C.int32_t) error {
+	if code == 0 {
+		return nil
+	}
+	base := errorFromStatus(C.int(code))
+	if msg := lastErrorMessage(); msg != "" {
+		base = errorf(base.code, "%s: %s", base.message, msg)
+	}
+	return &irohErrorWithSentinel{base, statusToError[int32(code)]}
+}
+
+// lastErrorMessage reads the calling thread's last-error message.
+func lastErrorMessage() string {
+	var buf [1024]byte
+	n := C.aster_last_error_message((*C.uint8_t)(unsafe.Pointer(&buf[0])), C.uintptr_t(len(buf)))
+	if n == 0 {
+		return ""
+	}
+	if int(n) > len(buf) {
+		n = C.uintptr_t(len(buf))
+	}
+	return strings.TrimRight(string(buf[:n]), "\x00")
 }

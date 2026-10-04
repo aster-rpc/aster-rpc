@@ -21,12 +21,12 @@ import (
 
 type soakMetrics struct {
 	cyclesCompleted atomic.Int64
-	opsSubmitted  atomic.Int64
-	opsCompleted atomic.Int64
-	opsCancelled atomic.Int64
-	opsErrored  atomic.Int64
-	maxPendingOps  atomic.Int64
-	currentPending atomic.Int64
+	opsSubmitted    atomic.Int64
+	opsCompleted    atomic.Int64
+	opsCancelled    atomic.Int64
+	opsErrored      atomic.Int64
+	maxPendingOps   atomic.Int64
+	currentPending  atomic.Int64
 }
 
 func (m *soakMetrics) recordSubmit() {

@@ -74,15 +74,55 @@ func (c StatusCode) String() string {
 // RpcError
 // ---------------------------------------------------------------------------
 
-// RpcError is the error type returned when an RPC call fails.
+// RpcError is the error type returned when an RPC call fails (a non-OK
+// RpcStatus trailer) and the error a handler returns to choose the trailer
+// code. Match codes with errors.Is against the Err* sentinels below
+// (errors.Is(err, aster.ErrRpcNotFound)) or extract it with errors.As.
 type RpcError struct {
 	Code    StatusCode
 	Message string
+	// Details are the RpcStatus detail pairs (may be nil).
+	Details map[string]string
 }
 
 func (e *RpcError) Error() string {
 	return fmt.Sprintf("[%s] %s", e.Code, e.Message)
 }
+
+// Is reports whether target is an *RpcError with the same code and either
+// the same or an empty message (so a code-only sentinel matches any message).
+func (e *RpcError) Is(target error) bool {
+	t, ok := target.(*RpcError)
+	if !ok {
+		return false
+	}
+	return t.Code == e.Code && (t.Message == "" || t.Message == e.Message)
+}
+
+// NewRpcError returns an *RpcError with a formatted message.
+func NewRpcError(code StatusCode, format string, args ...any) *RpcError {
+	return &RpcError{Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
+// Code-only sentinels for errors.Is.
+var (
+	ErrRpcCancelled          = &RpcError{Code: StatusCancelled}
+	ErrRpcUnknown            = &RpcError{Code: StatusUnknown}
+	ErrRpcInvalidArgument    = &RpcError{Code: StatusInvalidArgument}
+	ErrRpcDeadlineExceeded   = &RpcError{Code: StatusDeadlineExceeded}
+	ErrRpcNotFound           = &RpcError{Code: StatusNotFound}
+	ErrRpcAlreadyExists      = &RpcError{Code: StatusAlreadyExists}
+	ErrRpcPermissionDenied   = &RpcError{Code: StatusPermissionDenied}
+	ErrRpcResourceExhausted  = &RpcError{Code: StatusResourceExhausted}
+	ErrRpcFailedPrecondition = &RpcError{Code: StatusFailedPrecondition}
+	ErrRpcAborted            = &RpcError{Code: StatusAborted}
+	ErrRpcOutOfRange         = &RpcError{Code: StatusOutOfRange}
+	ErrRpcUnimplemented      = &RpcError{Code: StatusUnimplemented}
+	ErrRpcInternal           = &RpcError{Code: StatusInternal}
+	ErrRpcUnavailable        = &RpcError{Code: StatusUnavailable}
+	ErrRpcDataLoss           = &RpcError{Code: StatusDataLoss}
+	ErrRpcUnauthenticated    = &RpcError{Code: StatusUnauthenticated}
+)
 
 // ---------------------------------------------------------------------------
 // CallContext
@@ -90,18 +130,18 @@ func (e *RpcError) Error() string {
 
 // CallContext carries per-call metadata through the interceptor chain.
 type CallContext struct {
-	Service    string
-	Method     string
-	CallID     string
-	SessionID  string
-	Peer       string
-	Metadata   map[string]string
-	Attributes map[string]string
-	Deadline   *time.Time
+	Service     string
+	Method      string
+	CallID      string
+	SessionID   string
+	Peer        string
+	Metadata    map[string]string
+	Attributes  map[string]string
+	Deadline    *time.Time
 	IsStreaming bool
-	Pattern    string
-	Idempotent bool
-	Attempt    int
+	Pattern     string
+	Idempotent  bool
+	Attempt     int
 }
 
 // RemainingSeconds returns the seconds until the deadline, or nil if no
@@ -362,8 +402,8 @@ func (a *AuthInterceptor) OnRequest(ctx *CallContext, request any) (any, error) 
 // tokenBucket is a simple token-bucket rate limiter.
 type tokenBucket struct {
 	mu         sync.Mutex
-	rate       float64   // tokens per second
-	capacity   float64   // max burst
+	rate       float64 // tokens per second
+	capacity   float64 // max burst
 	tokens     float64
 	lastRefill time.Time
 }
@@ -624,15 +664,15 @@ const (
 // threshold is reached.
 type CircuitBreakerInterceptor struct {
 	BaseInterceptor
-	FailureThreshold  int     // failures before opening (default 3)
-	RecoveryTimeout   float64 // seconds before transitioning to half-open (default 5.0)
-	HalfOpenMaxCalls  int     // max calls allowed in half-open state (default 1)
+	FailureThreshold int     // failures before opening (default 3)
+	RecoveryTimeout  float64 // seconds before transitioning to half-open (default 5.0)
+	HalfOpenMaxCalls int     // max calls allowed in half-open state (default 1)
 
-	mu             sync.Mutex
-	state          string
-	failureCount   int
-	openedAt       time.Time
-	halfOpenCalls  int
+	mu            sync.Mutex
+	state         string
+	failureCount  int
+	openedAt      time.Time
+	halfOpenCalls int
 }
 
 // NewCircuitBreakerInterceptor creates a CircuitBreakerInterceptor with
