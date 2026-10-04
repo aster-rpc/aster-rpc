@@ -335,7 +335,6 @@ impl NodeId {
         }
     }
 }
-
 /// Extract a secret key from `SecretKey` or 32 raw bytes.
 pub(crate) fn extract_secret_key(obj: &Bound<'_, PyAny>) -> PyResult<aster::SecretKey> {
     if let Ok(k) = obj.cast::<SecretKey>() {
@@ -370,6 +369,45 @@ pub(crate) fn extract_public_key(obj: &Bound<'_, PyAny>) -> PyResult<aster::Publ
     Err(PyValueError::new_err(
         "root_pubkey must be a PublicKey, 32 bytes, or 64 hex characters",
     ))
+}
+
+/// A node id argument: a `NodeId` or a 64-hex string (normalized to
+/// lowercase; anything else raises `ValueError`).
+pub(crate) struct NodeIdArg(pub String);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for NodeIdArg {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(id) = obj.cast::<NodeId>() {
+            return Ok(Self(id.get().hex.clone()));
+        }
+        let s: String = obj
+            .extract()
+            .map_err(|_| PyValueError::new_err("expected a NodeId or a 64-hex node id string"))?;
+        Ok(Self(normalize_hex32(&s, "node id")?))
+    }
+}
+
+/// A hex id argument for the data-plane APIs: a `Hash`, a `NodeId`, or a hex
+/// string passed through unchanged (the Rust side validates it).
+pub(crate) struct HexArg(pub String);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for HexArg {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(h) = obj.cast::<Hash>() {
+            return Ok(Self(h.get().hex.clone()));
+        }
+        if let Ok(id) = obj.cast::<NodeId>() {
+            return Ok(Self(id.get().hex.clone()));
+        }
+        let s: String = obj
+            .extract()
+            .map_err(|_| PyValueError::new_err("expected a Hash, a NodeId, or a hex string"))?;
+        Ok(Self(s))
+    }
 }
 
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {

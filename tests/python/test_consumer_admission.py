@@ -30,7 +30,7 @@ from aster.trust.consumer import (
     handle_consumer_admission_rpc,
 )
 from aster.trust.credentials import ConsumerEnrollmentCredential
-from aster.trust.hooks import MeshEndpointHook
+from aster import GatePolicy
 from aster.trust.nonces import InMemoryNonceStore
 from aster.trust.signing import generate_root_keypair, sign_credential
 
@@ -148,7 +148,7 @@ def test_request_roundtrip():
 @pytest.mark.asyncio
 async def test_handle_rpc_policy_admitted():
     cred, priv_raw, pub_raw = _make_policy_cred()
-    hook = MeshEndpointHook()
+    gate = GatePolicy()
     svc = ServiceSummary("Svc", 1, "a" * 64, {})
 
     req = ConsumerAdmissionRequest(
@@ -157,13 +157,13 @@ async def test_handle_rpc_policy_admitted():
     resp = await handle_consumer_admission_rpc(
         req.to_json(),
         root_pubkey=pub_raw,
-        hook=hook,
-        peer_node_id="peer_abc",
+        gate=gate,
+        peer_node_id=("ab"*32),
         services=[svc],
         registry_namespace="ticket_xyz",
     )
     assert resp.admitted is True
-    assert "peer_abc" in hook.admitted
+    assert gate.is_admitted("ab"*32)
     assert len(resp.services) == 1
     assert resp.services[0].name == "Svc"
     assert resp.registry_namespace == "ticket_xyz"
@@ -173,26 +173,26 @@ async def test_handle_rpc_policy_admitted():
 @pytest.mark.asyncio
 async def test_handle_rpc_ott_admitted_and_nonce_consumed():
     cred, _, pub_raw = _make_ott_cred()
-    hook = MeshEndpointHook()
+    gate = GatePolicy()
     nonce_store = InMemoryNonceStore()
 
     req = ConsumerAdmissionRequest(credential_json=consumer_cred_to_json(cred))
     resp = await handle_consumer_admission_rpc(
         req.to_json(),
         root_pubkey=pub_raw,
-        hook=hook,
-        peer_node_id="peer_ott",
+        gate=gate,
+        peer_node_id=("0c"*32),
         nonce_store=nonce_store,
     )
     assert resp.admitted is True
-    assert "peer_ott" in hook.admitted
+    assert gate.is_admitted("0c"*32)
 
     # Replay must be denied
     resp2 = await handle_consumer_admission_rpc(
         req.to_json(),
         root_pubkey=pub_raw,
-        hook=hook,
-        peer_node_id="peer_ott",
+        gate=gate,
+        peer_node_id=("0c"*32),
         nonce_store=nonce_store,
     )
     assert resp2.admitted is False
@@ -203,28 +203,28 @@ async def test_handle_rpc_ott_admitted_and_nonce_consumed():
 async def test_handle_rpc_bad_signature_denied():
     cred, _, pub_raw = _make_policy_cred()
     cred.signature = b"\x00" * 64   # corrupt signature
-    hook = MeshEndpointHook()
+    gate = GatePolicy()
 
     req = ConsumerAdmissionRequest(credential_json=consumer_cred_to_json(cred))
     resp = await handle_consumer_admission_rpc(
         req.to_json(),
         root_pubkey=pub_raw,
-        hook=hook,
-        peer_node_id="bad_peer",
+        gate=gate,
+        peer_node_id=("bd"*32),
     )
     assert resp.admitted is False
-    assert "bad_peer" not in hook.admitted
+    assert not gate.is_admitted("bd"*32)
     assert resp.reason == ""
 
 
 @pytest.mark.asyncio
 async def test_handle_rpc_malformed_request_denied():
-    hook = MeshEndpointHook()
+    gate = GatePolicy()
     resp = await handle_consumer_admission_rpc(
         "not_valid_json",
         root_pubkey=b"\x00" * 32,
-        hook=hook,
-        peer_node_id="bad_peer",
+        gate=gate,
+        peer_node_id=("bd"*32),
     )
     assert resp.admitted is False
 
@@ -234,14 +234,14 @@ async def test_handle_rpc_expired_credential_denied():
     cred, priv_raw, pub_raw = _make_policy_cred()
     cred.expires_at = int(time.time()) - 1   # expired
     cred.signature = sign_credential(cred, priv_raw)
-    hook = MeshEndpointHook()
+    gate = GatePolicy()
 
     req = ConsumerAdmissionRequest(credential_json=consumer_cred_to_json(cred))
     resp = await handle_consumer_admission_rpc(
         req.to_json(),
         root_pubkey=pub_raw,
-        hook=hook,
-        peer_node_id="expired_peer",
+        gate=gate,
+        peer_node_id=("e0"*32),
     )
     assert resp.admitted is False
     assert resp.reason == ""
@@ -270,7 +270,7 @@ async def test_e2e_admission_returns_services_and_ticket():
     author_a = await dc_a.create_author()
 
     priv_raw, pub_raw = generate_root_keypair()
-    hook_a = MeshEndpointHook()
+    gate_a = GatePolicy()
 
     services_a = [ServiceSummary("GreetService", 1, "a" * 64, {})]
 
@@ -293,7 +293,7 @@ async def test_e2e_admission_returns_services_and_ticket():
         resp = await handle_consumer_admission_rpc(
             raw.decode(),
             root_pubkey=pub_raw,
-            hook=hook_a,
+            gate=gate_a,
             peer_node_id=peer_id,
             services=services_a,
             registry_namespace=ticket_a,
@@ -351,7 +351,7 @@ async def test_e2e_admission_denied_with_wrong_key():
     priv_b, pub_b = generate_root_keypair()   # client uses a different key
     cred_b, _, _ = _make_policy_cred(priv_raw=priv_b, pub_raw=pub_b)
 
-    hook_a = MeshEndpointHook()
+    gate_a = GatePolicy()
     ep_a = await create_endpoint_with_config(EndpointConfig(alpns=[CONSUMER_ALPN]))
     ep_a_addr = ep_a.endpoint_addr_info()
 
@@ -365,7 +365,7 @@ async def test_e2e_admission_denied_with_wrong_key():
         resp = await handle_consumer_admission_rpc(
             raw.decode(),
             root_pubkey=server_pub,   # different from client's pub_b
-            hook=hook_a,
+            gate=gate_a,
             peer_node_id=peer_id,
         )
         await send.write_all(resp.to_json().encode())
@@ -390,7 +390,7 @@ async def test_e2e_admission_denied_with_wrong_key():
 
     assert resp_b.admitted is False
     assert resp_b.reason == ""
-    assert hook_a.admitted == set()
+    assert len(gate_a.store) == 0
 
     await ep_a.close()
     await ep_b.close()

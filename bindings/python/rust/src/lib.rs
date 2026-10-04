@@ -9,7 +9,7 @@
 //! - docs.rs: DocsClient, DocHandle wrappers
 //! - gossip.rs: GossipClient, GossipTopicHandle wrappers
 //! - monitor.rs: Phase 1b monitoring utilities
-//! - hooks.rs: Phase 1b hooks utilities
+//! - admission.rs: Gate 0 (`GatePolicy`, `PeerAdmissionStore`, `Admission`)
 //! - error.rs: Exception types
 //!
 //! The protocol clients, reactor and bare endpoints still drive the transport
@@ -17,6 +17,7 @@
 
 use pyo3::prelude::*;
 
+mod admission;
 mod blobs;
 mod call;
 mod config;
@@ -25,7 +26,6 @@ mod crypto;
 mod docs;
 mod error;
 mod gossip;
-mod hooks;
 mod ids;
 mod monitor;
 mod net;
@@ -80,7 +80,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     blobs::register(py, m)?;
     docs::register(py, m)?;
     gossip::register(py, m)?;
-    hooks::register(py, m)?;
+    admission::register(py, m)?;
     monitor::register(py, m)?;
     contract::register(py, m)?;
     ticket::register(py, m)?;

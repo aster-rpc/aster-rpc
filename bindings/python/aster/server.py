@@ -44,7 +44,7 @@ from aster.service import ServiceRegistry, ServiceInfo, MethodInfo
 
 if TYPE_CHECKING:
     import aster
-    from aster.peer_store import PeerAttributeStore
+    from aster._aster import GatePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +269,7 @@ class Server:
         max_sessions_per_connection: int = 1024,
         registry: ServiceRegistry | None = None,
         owns_endpoint: bool = True,
-        peer_store: "PeerAttributeStore | None" = None,
+        gate: "GatePolicy | None" = None,
         node: Any = None,
     ) -> None:
         """Initialize the server.
@@ -290,7 +290,8 @@ class Server:
         """
         self._endpoint = endpoint
         self._owns_endpoint = owns_endpoint
-        self._peer_store = peer_store
+        # Gate 0 policy whose store holds per-peer admission attributes.
+        self._gate = gate
         self._node = node
         from aster.interceptors.deadline import DeadlineInterceptor
         if interceptors is not None:
@@ -607,8 +608,8 @@ class Server:
                 idempotent=method_info.idempotent,
                 call_id=header.call_id,
                 attributes=(
-                    self._peer_store.get_attributes(peer_id)
-                    if self._peer_store and peer_id else {}
+                    self._gate.attributes(peer_id)
+                    if self._gate is not None and peer_id else {}
                 ),
                 peer_addr=peer_addr,
                 relay_url=relay_url,
@@ -663,8 +664,8 @@ class Server:
                 idempotent=method_info.idempotent,
                 call_id=header.call_id,
                 attributes=(
-                    self._peer_store.get_attributes(peer_id)
-                    if self._peer_store and peer_id else {}
+                    self._gate.attributes(peer_id)
+                    if self._gate is not None and peer_id else {}
                 ),
                 peer_addr=peer_addr,
                 relay_url=relay_url,
@@ -906,8 +907,8 @@ class Server:
 
         # Look up admission attributes for this peer
         attributes = {}
-        if self._peer_store is not None and peer:
-            attributes = self._peer_store.get_attributes(peer)
+        if self._gate is not None and peer:
+            attributes = self._gate.attributes(peer)
 
         peer_addr, relay_url, rtt_micros = _connection_transport_snapshot(ctx.connection)
 

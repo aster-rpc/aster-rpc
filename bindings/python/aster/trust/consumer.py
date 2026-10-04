@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -35,11 +37,39 @@ from .admission import admit
 from .credentials import ConsumerEnrollmentCredential
 
 if TYPE_CHECKING:
-    from .hooks import MeshEndpointHook
+    from aster._aster import GatePolicy
     from .nonces import NonceStoreProtocol
     from ..registry.models import ServiceSummary
 
 logger = logging.getLogger(__name__)
+
+PEER_TTL_S: float = float(os.environ.get("ASTER_PEER_TTL_S", "86400"))
+"""Server-side upper bound on a peer admission's lifetime (seconds), applied
+whatever the credential's own expiry; the sooner of the two wins."""
+
+
+def _admit_peer(
+    gate: "GatePolicy | None",
+    peer_node_id: str,
+    attributes: "dict[str, str] | None" = None,
+    credential_expires_at: float = 0.0,
+) -> None:
+    """Admit a peer into the Rust Gate-0 store (``GatePolicy.admit``).
+
+    Gate 0 then lets its connections through, and the RPC server reads the
+    admission attributes from the same store.
+    """
+    if gate is None:
+        return
+    expires_at = time.time() + PEER_TTL_S
+    if credential_expires_at and credential_expires_at > 0:
+        expires_at = min(expires_at, float(credential_expires_at))
+    gate.admit(
+        peer_node_id,
+        attributes=dict(attributes or {}),
+        expires_at=expires_at,
+        source="credential",
+    )
 
 
 # ── Wire types ────────────────────────────────────────────────────────────────
@@ -188,7 +218,7 @@ def consumer_cred_from_json(s: str | bytes) -> ConsumerEnrollmentCredential:
 async def handle_consumer_admission_rpc(
     request_json: str,
     root_pubkey: bytes,
-    hook: "MeshEndpointHook",
+    gate: "GatePolicy | None",
     peer_node_id: str,
     nonce_store: "NonceStoreProtocol | None" = None,
     services: "list[ServiceSummary] | None" = None,
@@ -201,8 +231,9 @@ async def handle_consumer_admission_rpc(
         request_json:     JSON-serialised ``ConsumerAdmissionRequest``.
         root_pubkey:      The server's root public key (32 bytes) used to
                           verify the credential's signature.
-        hook:             ``MeshEndpointHook`` -- ``add_peer`` is called on
-                          successful admission.
+        gate:             ``GatePolicy`` -- the peer is admitted into its
+                          store on success (with the credential attributes
+                          and expiry), so Gate 0 lets it through.
         peer_node_id:     QUIC peer identity from the connection handshake.
         nonce_store:      Required when accepting OTT credentials.
         services:         List of ``ServiceSummary`` to include in the response.
@@ -232,8 +263,7 @@ async def handle_consumer_admission_rpc(
 
     # Dev mode / open gate: empty credential → auto-admit.
     if not req.credential_json and allow_unenrolled:
-        if hook is not None:
-            hook.add_peer(peer_node_id)
+        _admit_peer(gate, peer_node_id)
         _adm.record_consumer_admit()
         logger.info("consumer admission: auto-admitted %s (open gate)", peer_node_id)
         return ConsumerAdmissionResponse(
@@ -273,8 +303,7 @@ async def handle_consumer_admission_rpc(
         logger.info("consumer admission: denied %s", peer_node_id)
         return _denied
 
-    if hook is not None:
-        hook.add_peer(peer_node_id)
+    _admit_peer(gate, peer_node_id, result.attributes, cred.expires_at)
     _adm.record_consumer_admit()
     logger.info("consumer admission: admitted %s (expires_at=%d)", peer_node_id, cred.expires_at)
 
@@ -295,12 +324,11 @@ async def handle_consumer_admission_rpc(
 async def handle_consumer_admission_connection(
     conn: object,
     root_pubkey: bytes,
-    hook: "MeshEndpointHook",
+    gate: "GatePolicy | None",
     nonce_store: "NonceStoreProtocol | None" = None,
     services_getter: "Callable[[], list[ServiceSummary]] | None" = None,
     registry_namespace_getter: "Callable[[], str] | None" = None,
     allow_unenrolled: bool = False,
-    peer_store: "Any | None" = None,
 ) -> None:
     """Handle one consumer admission connection: read request, write response."""
     peer_node_id = conn.remote_id()
@@ -318,23 +346,12 @@ async def handle_consumer_admission_connection(
             raw.decode(),
             root_pubkey=root_pubkey,
             allow_unenrolled=allow_unenrolled,
-            hook=hook,
+            gate=gate,
             peer_node_id=peer_node_id,
             nonce_store=nonce_store,
             services=services,
             registry_namespace=namespace,
         )
-
-        # Store admission attributes for the RPC dispatch path
-        if peer_store is not None and response.admitted:
-            from aster.peer_store import PeerAdmission
-            peer_store.admit(PeerAdmission(
-                endpoint_id=peer_node_id,
-                handle=response.attributes.get("aster.name", ""),
-                attributes=response.attributes,
-                expires_at=getattr(response, "_credential_expires_at", 0.0),
-                admission_path="consumer_admission",
-            ))
 
         await send.write_all(response.to_json().encode())
         await send.finish()

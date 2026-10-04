@@ -1,9 +1,11 @@
 """
 aster.trust -- Trust Foundations.
 
-Provides offline root-key authorization, enrollment credentials, and Gate 0
-connection-level admission filtering. (Producer mesh, mesh gossip, mesh
-bootstrap and clock-drift detection have been removed.)
+Provides offline root-key authorization and enrollment credentials. Gate 0
+(connection-level admission) is the Rust implementation: ``aster.GatePolicy``,
+``aster.PeerAdmissionStore``, ``aster.TrustMode`` and ``Node.admission()``.
+(Producer mesh, mesh gossip, mesh bootstrap and clock-drift detection have
+been removed.)
 
 Spec references:
   Aster-trust-spec.md §2.2, §2.4, §2.9, §3.1, §3.2, §3.3
@@ -15,7 +17,6 @@ Quick start::
         EnrollmentCredential,
         ConsumerEnrollmentCredential,
         AdmissionResult,
-        MeshEndpointHook,
         ALPN_PRODUCER_ADMISSION,
         ALPN_CONSUMER_ADMISSION,
         ALPN_DELEGATED_ADMISSION,
@@ -40,11 +41,10 @@ from .credentials import (
     ConsumerEnrollmentCredential,
     EnrollmentCredential,
 )
-from .hooks import (
+from aster._aster import (
     ALPN_CONSUMER_ADMISSION,
     ALPN_DELEGATED_ADMISSION,
     ALPN_PRODUCER_ADMISSION,
-    MeshEndpointHook,
 )
 from .iid import IIDBackend, MockIIDBackend, get_iid_backend
 from .nonces import InMemoryNonceStore, NonceStore
@@ -81,8 +81,7 @@ __all__ = [
     # Nonces
     "NonceStore",
     "InMemoryNonceStore",
-    # Hooks
-    "MeshEndpointHook",
+    # Admission ALPNs (always open through Gate 0)
     "ALPN_PRODUCER_ADMISSION",
     "ALPN_CONSUMER_ADMISSION",
     "ALPN_DELEGATED_ADMISSION",

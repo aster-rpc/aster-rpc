@@ -4,8 +4,8 @@ End-to-end tests for Gate 0 (connection-level admission hook).
 Spec reference: Aster-trust-spec.md section 3.3.
 
 Gate 0 is the QUIC connection-level admission gate.  When enabled on
-AsterServer (allow_all_consumers=False), a MeshEndpointHook runs in a
-background loop that checks every incoming connection:
+AsterServer (allow_all_consumers=False), the Rust GatePolicy attached to
+the node checks every incoming connection:
 
   - Admission ALPNs (aster.consumer_admission, aster.producer_admission)
     are ALWAYS allowed through so new peers can present credentials.
@@ -39,7 +39,7 @@ from aster import (
     wire_type,
 )
 from aster.runtime import RPC_ALPN
-from aster.trust.hooks import ALPN_CONSUMER_ADMISSION, MeshEndpointHook
+from aster import ALPN_CONSUMER_ADMISSION, TrustMode
 from aster.trust.credentials import ConsumerEnrollmentCredential
 from aster.trust.consumer import (
     ConsumerAdmissionRequest,
@@ -301,6 +301,22 @@ async def test_admission_then_rpc_manual_flow():
             assert isinstance(resp, PingResponse)
             assert resp.payload == "pong:manual"
             await client.close()
+
+            # The credential admitted the peer into the Rust Gate-0 store,
+            # bounded by the credential's expiry.
+            peer = ep.endpoint_id()
+            assert srv.gate.trust_mode == TrustMode.PROTECTED
+            assert srv.gate.is_admitted(peer)
+            record = srv.gate.store.get(peer)
+            assert record.source == "credential"
+            assert record.expires_at <= cred.expires_at
+
+            # Revoking closes the gate for new connections.
+            srv.gate.revoke(peer)
+            conn_denied = await ep.connect_node_addr(server_addr, RPC_ALPN)
+            closed = await asyncio.wait_for(conn_denied.closed(), timeout=10)
+            assert closed["code"] == 403
+            assert closed["reason"] == b"peer not admitted"
         finally:
             await ep.close()
 

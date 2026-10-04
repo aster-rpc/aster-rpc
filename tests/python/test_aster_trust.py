@@ -9,7 +9,6 @@ Covers:
 - Policy credential with nonce → rejected as malformed
 - Policy credential: reusable within expiry
 - IID verification (mocked): matching claims → True; mismatched → False
-- MeshEndpointHook: admission ALPN always allowed; unenrolled denied; admitted allowed
 - CLI: keygen produces valid ed25519 pair; sign output verifies
 - LocalTransport bypass: CallContext.peer is None, attributes == {}
 - Auth interceptor: peer is None → allow (in-process trust)
@@ -33,7 +32,6 @@ from aster.trust import (
     ConsumerEnrollmentCredential,
     EnrollmentCredential,
     InMemoryNonceStore,
-    MeshEndpointHook,
     MockIIDBackend,
     admit,
     check_offline,
@@ -42,7 +40,6 @@ from aster.trust import (
     sign_credential,
     verify_signature,
 )
-from aster.trust.hooks import _ADMISSION_ALPNS
 
 
 # Private imports for testing (public API removed -- Rust core is authoritative)
@@ -490,44 +487,6 @@ async def test_file_nonce_store_missing_file_is_fresh():
         store = NonceStore(Path(d) / "subdir" / "nonces.json")
         nonce = secrets.token_bytes(32)
         assert await store.consume(nonce) is True
-
-
-# ── MeshEndpointHook ──────────────────────────────────────────────────────────
-
-
-def test_mesh_hook_admission_alpn_always_allowed():
-    hook = MeshEndpointHook(allow_unenrolled=False)
-    for alpn in [ALPN_PRODUCER_ADMISSION, ALPN_CONSUMER_ADMISSION, ALPN_DELEGATED_ADMISSION]:
-        assert hook.should_allow("unknown_peer", alpn) is True
-
-
-def test_mesh_hook_rejects_unenrolled_on_normal_alpn():
-    hook = MeshEndpointHook(allow_unenrolled=False)
-    assert hook.should_allow("unknown_peer", b"aster/1") is False
-
-
-def test_mesh_hook_allows_admitted_peer():
-    hook = MeshEndpointHook(allow_unenrolled=False)
-    hook.add_peer("trusted_ep")
-    assert hook.should_allow("trusted_ep", b"aster/1") is True
-
-
-def test_mesh_hook_removes_peer():
-    hook = MeshEndpointHook(allow_unenrolled=False)
-    hook.add_peer("ep1")
-    hook.remove_peer("ep1")
-    assert hook.should_allow("ep1", b"aster/1") is False
-
-
-def test_mesh_hook_allow_unenrolled_mode():
-    hook = MeshEndpointHook(allow_unenrolled=True)
-    assert hook.should_allow("any_peer", b"aster/1") is True
-
-
-def test_mesh_hook_admission_alpns_in_frozenset():
-    assert ALPN_PRODUCER_ADMISSION in _ADMISSION_ALPNS
-    assert ALPN_CONSUMER_ADMISSION in _ADMISSION_ALPNS
-    assert ALPN_DELEGATED_ADMISSION in _ADMISSION_ALPNS
 
 
 # ── CLI: keygen ───────────────────────────────────────────────────────────────

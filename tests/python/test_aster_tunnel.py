@@ -207,7 +207,7 @@ def _build_ctx(conn):
     from aster.server import ConnectionContext, Server
     from aster.service import MethodInfo
 
-    fake_server = SimpleNamespace(_peer_store=None)
+    fake_server = SimpleNamespace(_gate=None)
     header = StreamHeader(service="Svc", method="M")
     method_info = MethodInfo(name="M", pattern="unary")
     conn_ctx = ConnectionContext(connection=conn, server=fake_server)  # type: ignore[arg-type]

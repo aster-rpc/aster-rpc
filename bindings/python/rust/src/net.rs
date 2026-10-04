@@ -490,6 +490,59 @@ impl<'py> IntoPyObject<'py> for ClosedResult {
 }
 
 // ============================================================================
+// PathInfo
+// ============================================================================
+
+/// One network path of a connection at one instant (`IrohConnection.paths()`).
+///
+/// `kind` is `"direct"` (then `addr` is the peer's `ip:port`), `"relay"`
+/// (then `relay_url` is set; the peer's own IP is not visible) or `"other"`
+/// (a custom transport; `addr` holds its description).
+#[pyclass(frozen, skip_from_py_object, module = "aster._aster")]
+#[derive(Clone)]
+pub struct PathInfo {
+    #[pyo3(get)]
+    pub kind: &'static str,
+    #[pyo3(get)]
+    pub addr: Option<String>,
+    #[pyo3(get)]
+    pub relay_url: Option<String>,
+    /// Whether this path carries application data right now.
+    #[pyo3(get)]
+    pub is_selected: bool,
+    /// RTT estimate in microseconds, `None` until measured.
+    #[pyo3(get)]
+    pub rtt_micros: Option<u64>,
+}
+
+impl From<aster::PathInfo> for PathInfo {
+    fn from(p: aster::PathInfo) -> Self {
+        let (kind, addr, relay_url) = match p.remote {
+            aster::PathRemote::Direct(a) => ("direct", Some(a.to_string()), None),
+            aster::PathRemote::Relay(url) => ("relay", None, Some(url)),
+            aster::PathRemote::Other(d) => ("other", Some(d), None),
+        };
+        Self {
+            kind,
+            addr,
+            relay_url,
+            is_selected: p.is_selected,
+            rtt_micros: p.rtt_micros,
+        }
+    }
+}
+
+#[pymethods]
+impl PathInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "PathInfo(kind='{}', addr={:?}, relay_url={:?}, is_selected={}, rtt_micros={:?})",
+            self.kind, self.addr, self.relay_url, self.is_selected, self.rtt_micros
+        )
+    }
+}
+
+// ============================================================================
 // Phase 1g: Transport Metrics
 // ============================================================================
 
@@ -777,6 +830,11 @@ impl From<CoreConnection> for IrohConnection {
 }
 
 impl IrohConnection {
+    /// The `aster` SDK view of this connection.
+    fn sdk(&self) -> aster::Connection {
+        aster::Connection::from_core_connection(self.inner.clone())
+    }
+
     /// Borrow a clone of the underlying `CoreConnection` for sibling
     /// modules (e.g. `call.rs`) that need to call core APIs directly.
     pub(crate) fn core_clone(&self) -> CoreConnection {
@@ -907,6 +965,18 @@ impl IrohConnection {
     /// Return information about this connection.
     fn connection_info(&self) -> ConnectionInfo {
         ConnectionInfo::from(self.inner.connection_info())
+    }
+
+    /// Every currently open network path (typically a relay path, plus a
+    /// direct one once holepunching succeeds).
+    fn paths(&self) -> Vec<PathInfo> {
+        self.sdk().paths().into_iter().map(PathInfo::from).collect()
+    }
+
+    /// The path carrying application data right now, or `None` (no path
+    /// selected yet, or the connection is gone).
+    fn selected_path(&self) -> Option<PathInfo> {
+        self.sdk().selected_path().map(PathInfo::from)
     }
 
     /// Snapshot of the currently selected network path. Cheap; safe to
@@ -1634,6 +1704,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EndpointConfig>()?;
     m.add_class::<ConnectionInfo>()?;
     m.add_class::<TransportSnapshot>()?;
+    m.add_class::<PathInfo>()?;
     m.add_class::<RemoteInfo>()?;
     m.add_class::<TransportMetrics>()?;
     m.add_class::<NetClient>()?;

@@ -9,8 +9,8 @@ declarative producer/consumer experience.
 The ``AsterServer`` starts a single :class:`aster.Node` (``aster::Node``,
 configured by :class:`aster.AsterConfig`) serving blobs + docs +
 gossip + aster RPC + admission ALPNs on one endpoint, one node ID. Gate 0
-(connection-level admission hook, trust spec §3.3) is automatically wired
-when any admission flag is active.
+(connection-level admission, trust spec section 3.3) is the Rust
+``GatePolicy`` attached to the node (``AsterServer.gate``).
 
 Example (producer)::
 
@@ -51,8 +51,10 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 from . import (
+    GatePolicy,
     Node,
     NodeAddr,
+    TrustMode,
     net_client,
     blobs_client,
     docs_client,
@@ -71,10 +73,7 @@ from .trust.consumer import (
     handle_consumer_admission_connection,
 )
 from .trust.credentials import ConsumerEnrollmentCredential
-from .trust.hooks import (
-    ALPN_CONSUMER_ADMISSION,
-    MeshEndpointHook,
-)
+from ._aster import ALPN_CONSUMER_ADMISSION
 from .trust.nonces import InMemoryNonceStore
 from .trust.signing import sign_credential
 
@@ -147,12 +146,13 @@ class AsterServer:
     (iroh built-in protocols) alongside aster RPC (``aster/1``) and any
     enabled admission ALPNs -- all on **one endpoint, one node ID**.
 
-    When consumer admission is active (``allow_all_consumers=False``),
-    the node is built with
-    ``enable_hooks=True`` and a background task runs the Gate 0
-    connection-level hook loop (``MeshEndpointHook.run_hook_loop``), which
-    gates *all* protocols (blobs, docs, gossip, aster/1, admission) at the
-    QUIC handshake layer.
+    Gate 0 is the Rust ``GatePolicy`` attached to the node (``self.gate``):
+    every inbound connection on *every* protocol (blobs, docs, gossip,
+    aster/1) is admitted or rejected in Rust at the QUIC handshake. With
+    consumer admission active (``allow_all_consumers=False``) the gate is
+    ``PROTECTED``: only the admission ALPN is open until the peer presents a
+    valid credential, which admits it into the gate's store. With
+    ``allow_all_consumers=True`` it is ``OPEN_DEV``.
     """
 
     def __init__(
@@ -170,7 +170,7 @@ class AsterServer:
         channel_name: str = "rpc",
         codec: Any | None = None,
         interceptors: list[Any] | None = None,
-        hook: MeshEndpointHook | None = None,
+        gate: GatePolicy | None = None,
         nonce_store: Any | None = None,
         registry_namespace: str = "",
         max_sessions_per_connection: int | None = None,
@@ -201,6 +201,8 @@ class AsterServer:
                 Overrides ``config.root_pubkey`` if both are set.
             allow_all_consumers: If ``True``, skip consumer admission
                 (open gate). Overrides ``config.allow_all_consumers``.
+            gate: Optional :class:`aster.GatePolicy` to use as Gate 0
+                instead of the one derived from ``allow_all_consumers``.
             allow_all_producers: Must be ``True`` (the default). Producer
                 mesh admission (``aster.producer_admission``) is not
                 supported; ``False`` raises ``NotImplementedError``.
@@ -291,12 +293,17 @@ class AsterServer:
             self._interceptors = list(interceptors)
         else:
             self._interceptors = [DeadlineInterceptor()]
-        self._hook = hook
         self._nonce_store = nonce_store
 
-        # Admission → dispatch bridge: stores per-peer attributes
-        from aster.peer_store import PeerAttributeStore
-        self._peer_store = PeerAttributeStore()
+        # Gate 0 (Rust): admits/rejects every inbound connection. Its store
+        # also carries the per-peer admission attributes the RPC server reads.
+        self._gate: GatePolicy = (
+            gate
+            if gate is not None
+            else GatePolicy(
+                TrustMode.OPEN_DEV if self._allow_all_consumers else TrustMode.PROTECTED
+            )
+        )
         self._registry_namespace = registry_namespace
         self._max_sessions_per_connection = max_sessions_per_connection
 
@@ -343,23 +350,17 @@ class AsterServer:
         # Consumer admission is ALWAYS registered -- even in open-gate mode
         # the consumer uses it to discover services.
         aster_alpns: list[bytes] = [RPC_ALPN, ALPN_CONSUMER_ADMISSION]
-        gate0_needed = False
-        if not self._allow_all_consumers:
-            if self._hook is None:
-                self._hook = MeshEndpointHook(peer_store=self._peer_store)
-            if self._nonce_store is None:
-                self._nonce_store = InMemoryNonceStore()
-            gate0_needed = True
+        if not self._allow_all_consumers and self._nonce_store is None:
+            self._nonce_store = InMemoryNonceStore()
 
-        # Gate 0 needs the admission hooks installed, failing closed.
+        # Gate 0 runs in Rust on the node's admission hooks, failing closed
+        # when protected.
         node_config = self._config.replace(
             alpns=tuple(aster_alpns) + tuple(self._config.alpns),
         )
-        if gate0_needed:
-            node_config = node_config.replace(
-                enable_hooks=True, hook_failure_mode="fail_closed"
-            )
-        self._node = await Node.start(node_config)
+        if self._gate.trust_mode == TrustMode.PROTECTED:
+            node_config = node_config.replace(hook_failure_mode="fail_closed")
+        self._node = await Node.start(node_config, gate=self._gate)
         logger.debug(
             "Producer node: %s",
             f"persistent at {node_config.storage_path}"
@@ -508,7 +509,7 @@ class AsterServer:
             codec=self._codec,
             interceptors=self._interceptors,
             owns_endpoint=False,
-            peer_store=self._peer_store,
+            gate=self._gate,
             node=self._node,
         )
         if self._max_sessions_per_connection is not None:
@@ -740,7 +741,7 @@ class AsterServer:
             logger.warning("Contract publication failed (non-fatal): %s", exc)
 
     def serve(self) -> asyncio.Task:
-        """Spawn the accept loop (+ Gate 0 hook loop); return an aggregate task.
+        """Spawn the accept loop; return an aggregate task. (Gate 0 runs in Rust.)
 
         ``await server.serve()`` blocks until cancellation. The second call
         returns the same task (idempotent).
@@ -753,18 +754,6 @@ class AsterServer:
         assert self._node is not None
 
         subtasks: list[asyncio.Task] = []
-
-        # Gate 0 hook loop: drain the after-handshake channel, apply the
-        # MeshEndpointHook allowlist for every connection. before_connect is
-        # auto-accepted inside NodeHookReceiver (the peer's endpoint ID
-        # isn't authenticated at that stage).
-        if self._hook is not None and self._node.has_hooks():
-            self._hook_loop_task = asyncio.create_task(
-                self._run_gate0(), name="aster-gate0"
-            )
-            subtasks.append(self._hook_loop_task)
-
-        self._peer_store.start_reaper()
 
         # Reactor is the only dispatch path (spec Sec. 6). Create it
         # unconditionally and feed every RPC connection through it.
@@ -805,16 +794,6 @@ class AsterServer:
         self._serve_task = asyncio.create_task(_wait_all(), name="aster-server-serve")
         return self._serve_task
 
-    async def _run_gate0(self) -> None:
-        """Take the hook receiver from the node and run the hook loop."""
-        assert self._node is not None
-        assert self._hook is not None
-        receiver = await self._node.take_hook_receiver()
-        if receiver is None:
-            logger.warning("AsterServer: hooks enabled but no receiver available")
-            return
-        await self._hook.run_hook_loop(receiver)
-
     async def _accept_loop(self) -> None:
         """Pull from ``node.accept_aster()`` and dispatch per ALPN."""
         assert self._node is not None
@@ -840,12 +819,11 @@ class AsterServer:
                         handle_consumer_admission_connection(
                             conn,
                             root_pubkey=self._root_pubkey or b"\x00" * 32,
-                            hook=self._hook,
+                            gate=self._gate,
                             nonce_store=self._nonce_store,
                             services_getter=lambda: services_snapshot,
                             registry_namespace_getter=lambda: self._registry_namespace,
                             allow_unenrolled=self._allow_all_consumers,
-                            peer_store=self._peer_store,
                         ),
                         name="aster-consumer-admission-conn",
                     )
@@ -1247,6 +1225,15 @@ class AsterServer:
         return self._root_pubkey
 
     # ── Iroh protocol clients (lazy) ─────────────────────────────────────────
+
+    @property
+    def gate(self) -> GatePolicy:
+        """This server's Gate 0 policy (``aster.GatePolicy``).
+
+        ``gate.admit(peer)`` / ``gate.revoke(peer)`` change who may connect;
+        changes apply to new connections.
+        """
+        return self._gate
 
     @property
     def node(self) -> Node:
