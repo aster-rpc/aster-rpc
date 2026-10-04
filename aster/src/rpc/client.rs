@@ -61,6 +61,10 @@ use crate::error::{Error, Result};
 /// the frame; the reset still goes out once the lock frees.
 const CANCEL_WRITE_GRACE: Duration = Duration::from_millis(250);
 
+/// Target size of one write when a call's requests are all known up front
+/// (`client_stream` with a `Vec`): frames are batched up to this many bytes.
+const WRITE_BATCH: usize = 64 * 1024;
+
 /// Per-call options for the `*_with` / `*_open` methods. `Default` is "no
 /// options": the header is sent as given.
 ///
@@ -410,12 +414,16 @@ impl RpcConnection {
             ));
         }
         let (sink, response) = self.client_stream_open(header, options).await?;
+        // All requests are known up front, so frame them into batches of up
+        // to WRITE_BATCH bytes: one write per batch rather than per message.
         let n = requests.len();
+        let mut batch = Vec::new();
         for (i, req) in requests.into_iter().enumerate() {
-            if i + 1 == n {
-                sink.send_last(req).await?;
-            } else {
-                sink.send(req).await?;
+            let last = i + 1 == n;
+            let flags = if last { FLAG_END_STREAM } else { 0 };
+            batch.extend_from_slice(&encode_payload_frame(&req, flags)?);
+            if last || batch.len() >= WRITE_BATCH {
+                sink.send_framed(std::mem::take(&mut batch), last).await?;
             }
         }
         response.await
@@ -914,20 +922,27 @@ impl RequestSink {
     /// Send the last request: the payload frame carries `FLAG_END_STREAM`, so
     /// this both sends and [`finish`](RequestSink::finish)es in one write.
     pub async fn send_last(&self, payload: Vec<u8>) -> Result<()> {
-        self.send_flags(payload, FLAG_END_STREAM).await?;
-        self.finished.store(true, Ordering::Release);
-        Ok(())
+        self.send_flags(payload, FLAG_END_STREAM).await
     }
 
     async fn send_flags(&self, payload: Vec<u8>, flags: u8) -> Result<()> {
+        let frame = encode_payload_frame(&payload, flags)?;
+        self.send_framed(frame, flags & FLAG_END_STREAM != 0).await
+    }
+
+    /// Write already-framed request frames (one or more) in one write; `last`
+    /// when they end the request stream.
+    async fn send_framed(&self, frames: Vec<u8>, last: bool) -> Result<()> {
         if self.finished.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument(
                 "request stream already finished".into(),
             ));
         }
-        let frame = encode_payload_frame(&payload, flags)?;
-        self.ctl.write_timed(frame).await?;
+        self.ctl.write_timed(frames).await?;
         self.sent_any.store(true, Ordering::Release);
+        if last {
+            self.finished.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
