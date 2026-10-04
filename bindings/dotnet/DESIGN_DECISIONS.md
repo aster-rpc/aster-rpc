@@ -7,10 +7,10 @@
 **C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 4.4, 2026-10-04)
+## STATUS (ABI 4.5, 2026-10-04)
 
 - **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
-  `Native.RequiredAbiMinor` = 4; 4.0 removed the reactor, framed calls, the node factories and
+  `Native.RequiredAbiMinor` = 5 for the 4.5 cancel tokens; 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
@@ -50,9 +50,10 @@
   `Builder.SessionFactory`, state in `ServerCallContext.Session`; ids from
   `RpcConnection.NextSessionId`). The client (`RpcConnection`) uses `aster_rpc_unary` (pooled) and
   `aster_rpc_open` + `aster_call_{send,recv}_payload(s)` for streaming; a unary call with a
-  cancellable token runs on its own stream so the token cancels the native call
-  (`aster_call_cancel`). Rust surfaces a client cancel to the server handler for streaming calls
-  only (it does not watch unary streams). Blocking request reads (`aster_dispatch_recv`) wait
+  cancellable token stays on the pooled path with a native cancel token
+  (`aster_rpc_unary_cancellable`, ABI 4.5), so cancelling the token aborts the native call;
+  streaming calls are cancelled with `aster_call_cancel`. Rust surfaces a client cancel to the
+  server handler for every pattern, unary included. Blocking request reads (`aster_dispatch_recv`) wait
   in bounded slices that re-check the handler token. *Historical:* the old `Reactor.cs` path
   over `aster_reactor_*` and framed `aster_call_*` (both removed in ABI 4.0) is gone.
 - **Data plane (3.3):** blobs read-range / provider fetch with report / GC / status, tag prefix

@@ -87,14 +87,15 @@ whose ABI major differs (4).
   `CallServerStream`, `CallClientStream`, `CallBidiStream`, `OpenBidiStream`
   (`Send` / `CloseSend` / `Recv`) over the pooled `aster::rpc::RpcConnection`
   (`aster_rpc_unary`, `aster_rpc_open`, `aster_call_*_payload`). The ctx
-  deadline is enforced natively. A unary call with a ctx that can end
-  (`ctx.Done() != nil`) runs on its own native call (`aster_rpc_open`, as
-  .NET does for a cancellable token) so cancelling ctx cancels it natively
-  (`aster_call_cancel`: the stream is reset; Rust's server watches for peer
-  cancels on streaming calls only, so a unary handler runs on and its answer
-  is dropped); a ctx that
-  never ends uses the pooled `aster_rpc_unary` fast path. Streaming calls are
-  cancelled the same way. Every native receive wait (client
+  deadline is enforced natively. Every unary call takes the pooled
+  single-write fast path; a ctx that can end (`ctx.Done() != nil`) adds a
+  cancel token (ABI 4.5, `aster_rpc_unary_cancellable`), so cancelling ctx
+  aborts the native call (the pooled stream is discarded with `FLAG_CANCEL` +
+  reset and the server's handler sees the cancel). Streaming calls run on
+  their own stream (`aster_rpc_open`) and are cancelled with
+  `aster_call_cancel`. **Server handlers:** every handler's `ctx` (unary
+  included) ends when the client cancels, when the Rust-side deadline passes,
+  and when the handler returns. Every native receive wait (client
   `aster_call_recv_payload`, server `aster_dispatch_recv`) is bounded (200 ms
   slices) and re-checks the context between slices. Requests of client-stream / bidi calls are
   sent as the iterator yields them (ping-pong works). Sessions:

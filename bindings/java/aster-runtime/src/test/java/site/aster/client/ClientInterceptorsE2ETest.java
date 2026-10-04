@@ -832,13 +832,25 @@ final class ClientInterceptorsE2ETest {
   void cancellingBeforeTheCallOpensDoesNotHangOrLeak() throws Exception {
     AsterClient c = client();
     for (int i = 0; i < 50; i++) {
-      CompletableFuture<Msg> f = c.call(addr, SVC, "echo", new Msg("race", 0), Msg.class);
+      CompletableFuture<Msg> f = c.call(addr, SVC, "slow", new Msg("race", i), Msg.class);
       f.cancel(true);
       assertTrue(f.isCancelled());
     }
-    // the client still works
-    assertEquals(
-        "echo:ok|", get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("ok", 0), Msg.class)).text());
+    // No server handler is left running: every slow call that reached the server saw its cancel
+    // (a leaked native call would hold its handler for 30 s).
+    long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (SLOW_CANCELLED.get() < SLOW_ENTERED.get() && System.nanoTime() < end) {
+      Thread.sleep(5);
+    }
+    assertEquals(SLOW_ENTERED.get(), SLOW_CANCELLED.get(), "every started handler saw its cancel");
+    // ... and no pooled stream is held: more calls than the pool's eight streams run at once.
+    List<CompletableFuture<Msg>> after = new ArrayList<>();
+    for (int i = 0; i < 16; i++) {
+      after.add(c.call(addr, SVC, "echo", new Msg("ok" + i, 0), Msg.class));
+    }
+    for (int i = 0; i < 16; i++) {
+      assertEquals("echo:ok" + i + "|", get(after.get(i)).text());
+    }
   }
 
   @Test
