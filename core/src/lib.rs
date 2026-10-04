@@ -6,6 +6,7 @@ pub mod datagram;
 pub mod envelope;
 pub mod framing;
 pub mod grant_record;
+pub mod grants;
 pub mod hpke_envelope;
 pub mod lease;
 pub mod namespace;

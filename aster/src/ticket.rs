@@ -4,9 +4,10 @@
 
 use crate::error::{Error, Result};
 use crate::id::{NamespaceId, NodeAddr, NodeId};
-use aster_transport_core::ticket::{AsterTicket as CoreTicket, TicketCredential};
-use std::net::{IpAddr, SocketAddr};
-use url::{Host, Url};
+use aster_transport_core::ticket::{
+    self as core_ticket, AsterTicket as CoreTicket, TicketCredential,
+};
+use std::net::SocketAddr;
 
 /// The credential a ticket may carry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,37 +158,18 @@ impl Ticket {
     pub fn to_node_addr(&self) -> Result<NodeAddr> {
         Ok(NodeAddr {
             node_id: self.node_id(),
-            relay_url: self.inner.relay.map(|s| socket_to_relay_url(&s)),
+            relay_url: self
+                .inner
+                .relay
+                .map(|s| core_ticket::socket_to_relay_url(&s)),
             direct_addresses: self.direct_addresses(),
         })
     }
 }
 
-/// Reconstruct a relay URL from the socket address stored in a ticket. The
-/// compact format keeps relay as IP:port; `https://<ip>:<port>` is the dialable
-/// form iroh parses back into a relay address (IPv6 is bracketed by
-/// `SocketAddr`'s `Display`).
-fn socket_to_relay_url(addr: &SocketAddr) -> String {
-    format!("https://{addr}")
-}
-
-/// Extract the IP:port from a peer's relay URL for storage in the compact
-/// ticket. Returns `Ok(None)` for a DNS-hostname relay (which has no IP to
-/// store — it is left to discovery-by-id), and `Err` only if the URL is
-/// malformed.
+/// Extract the IP:port from a peer's relay URL for the compact ticket (the
+/// rule lives in core — `aster_transport_core::ticket::relay_url_to_socket`).
+/// `Ok(None)` for a DNS-hostname relay; `InvalidArgument` if malformed.
 fn relay_url_to_socket(url: &str) -> Result<Option<SocketAddr>> {
-    let parsed = Url::parse(url)
-        .map_err(|e| Error::InvalidArgument(format!("bad relay url {url:?}: {e}")))?;
-    let ip = match parsed.host() {
-        Some(Host::Ipv4(ip)) => IpAddr::V4(ip),
-        Some(Host::Ipv6(ip)) => IpAddr::V6(ip),
-        // A hostname relay can't fit the compact IP slot; defer to discovery.
-        Some(Host::Domain(_)) | None => return Ok(None),
-    };
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        Error::InvalidArgument(format!(
-            "relay url {url:?} has no port and no known default"
-        ))
-    })?;
-    Ok(Some(SocketAddr::new(ip, port)))
+    core_ticket::relay_url_to_socket(url).map_err(|e| Error::InvalidArgument(e.to_string()))
 }

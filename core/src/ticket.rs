@@ -338,6 +338,38 @@ impl AsterTicket {
 }
 
 // ============================================================================
+// Relay folding (URL <-> compact socket slot)
+// ============================================================================
+
+/// Extract the IP:port from a peer's relay URL for storage in the compact
+/// ticket's relay slot. Returns `Ok(None)` for a DNS-hostname relay (no IP to
+/// store — it is left to discovery-by-id), and `Err` only if the URL is
+/// malformed or names an IP host with no port and no scheme default.
+/// Vectors: `conformance/vectors/ticket.json`.
+pub fn relay_url_to_socket(url: &str) -> Result<Option<SocketAddr>> {
+    use std::net::IpAddr;
+    use url::{Host, Url};
+
+    let parsed = Url::parse(url).map_err(|e| anyhow!("bad relay url {url:?}: {e}"))?;
+    let ip = match parsed.host() {
+        Some(Host::Ipv4(ip)) => IpAddr::V4(ip),
+        Some(Host::Ipv6(ip)) => IpAddr::V6(ip),
+        // A hostname relay can't fit the compact IP slot; defer to discovery.
+        Some(Host::Domain(_)) | None => return Ok(None),
+    };
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("relay url {url:?} has no port and no known default"))?;
+    Ok(Some(SocketAddr::new(ip, port)))
+}
+
+/// Reconstruct a dialable relay URL from the socket address stored in a
+/// ticket: `https://<ip>:<port>` (IPv6 bracketed, as `SocketAddr` displays).
+pub fn socket_to_relay_url(addr: &SocketAddr) -> String {
+    format!("https://{addr}")
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

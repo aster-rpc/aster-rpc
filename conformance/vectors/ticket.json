@@ -1,0 +1,95 @@
+{
+  "description": "Aster ticket relay folding. The compact ticket stores the relay as an IP socket address, not a URL. relay_url_to_socket: parse the URL (WHATWG), take an IPv4/IPv6 host and the explicit port or the scheme's default; a DNS-hostname relay yields null (dropped from the ticket, left to discovery-by-id); an unparseable URL is an error, as is an IP host with no explicit port under a scheme with no default port (a non-special scheme such as foo://1.2.3.4 has an opaque, i.e. hostname, host and so yields null). socket_to_relay_url: \"https://\" + the socket address (IPv6 bracketed).",
+  "relay_url_to_socket": [
+    {
+      "socket": "1.2.3.4:7842",
+      "url": "https://1.2.3.4:7842"
+    },
+    {
+      "socket": "1.2.3.4:7842",
+      "url": "https://1.2.3.4:7842/"
+    },
+    {
+      "socket": "1.2.3.4:443",
+      "url": "https://1.2.3.4"
+    },
+    {
+      "socket": "1.2.3.4:80",
+      "url": "http://1.2.3.4"
+    },
+    {
+      "socket": "1.2.3.4:1",
+      "url": "HTTPS://1.2.3.4:1"
+    },
+    {
+      "socket": "1.2.3.4:443",
+      "url": "https://1.2.3.4:443/path?q=1"
+    },
+    {
+      "socket": "[::1]:3340",
+      "url": "https://[::1]:3340"
+    },
+    {
+      "socket": "[2001:db8::1]:443",
+      "url": "https://[2001:db8::1]"
+    },
+    {
+      "socket": "[::ffff:1.2.3.4]:5",
+      "url": "https://[::ffff:1.2.3.4]:5"
+    },
+    {
+      "socket": null,
+      "url": "https://relay.example.com"
+    },
+    {
+      "socket": null,
+      "url": "https://relay.example.com:8443/"
+    },
+    {
+      "socket": null,
+      "url": "https://localhost:3340"
+    },
+    {
+      "error": true,
+      "url": "not a url"
+    },
+    {
+      "error": true,
+      "url": ""
+    },
+    {
+      "socket": null,
+      "url": "foo://1.2.3.4"
+    },
+    {
+      "error": true,
+      "url": "foo://[::1]"
+    },
+    {
+      "socket": "[::1]:9",
+      "url": "foo://[::1]:9"
+    }
+  ],
+  "socket_to_relay_url": [
+    {
+      "socket": "1.2.3.4:7842",
+      "url": "https://1.2.3.4:7842"
+    },
+    {
+      "socket": "1.2.3.4:443",
+      "url": "https://1.2.3.4:443"
+    },
+    {
+      "socket": "0.0.0.0:0",
+      "url": "https://0.0.0.0:0"
+    },
+    {
+      "socket": "[::1]:3340",
+      "url": "https://[::1]:3340"
+    },
+    {
+      "socket": "[2001:db8::1]:443",
+      "url": "https://[2001:db8::1]:443"
+    }
+  ]
+}
