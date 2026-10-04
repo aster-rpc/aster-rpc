@@ -49,3 +49,24 @@ pub enum Error {
 
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(feature = "rpc")]
+impl Error {
+    /// An [`Error::Rpc`] with `code` and `message` and no details.
+    pub fn rpc(code: crate::rpc::StatusCode, message: impl Into<String>) -> Self {
+        Error::Rpc {
+            code: code.as_i32(),
+            message: message.into(),
+            details: Vec::new(),
+        }
+    }
+
+    /// The status code of an [`Error::Rpc`] (unrecognised codes map to
+    /// `Unknown`); `None` for every other variant.
+    pub fn rpc_code(&self) -> Option<crate::rpc::StatusCode> {
+        match self {
+            Error::Rpc { code, .. } => Some(crate::rpc::StatusCode::from_i32(*code)),
+            _ => None,
+        }
+    }
+}

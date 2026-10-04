@@ -47,7 +47,9 @@ pub use auth::{
     require_all_of, require_any_of, require_role, AttributeStore, AuthContext, AuthOutcome,
     Authenticator, CapabilityKind, CapabilityRequirement, ROLE_ATTRIBUTE,
 };
-pub use client::{BidiSink, ResponseStream, RpcConnection};
+pub use client::{
+    BidiSink, CallOptions, RequestSink, ResponseFuture, ResponseStream, RpcConnection, RpcSession,
+};
 pub use codec::{
     decode_rpc_status, encode_stream_header, new_payload_fory, CallHeader, CodecError, RpcStatus,
     SerializationMode, StreamHeader,
