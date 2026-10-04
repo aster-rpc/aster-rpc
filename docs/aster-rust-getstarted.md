@@ -189,6 +189,18 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `proxy_from_env(b)` | `ASTER_PROXY_FROM_ENV` | `[network] proxy_from_env` | `HTTP(S)_PROXY` |
 | `transport_<knob>(v)` | `ASTER_TRANSPORT_<KNOB>` | `[network] transport_<knob>` | `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`, `stream_receive_window`, `receive_window`, `send_window`, `max_idle_timeout_ms`, `keep_alive_interval_ms`, `initial_mtu`, `datagram_receive_buffer_size`, `datagram_send_buffer_size`, `send_fairness`, `enable_segmentation_offload` |
 | `identity_file(p)` | `ASTER_IDENTITY_FILE` | `[identity] file` | `.aster-identity` credential file |
+| `health_port(p)` | `ASTER_HEALTH_PORT` | `[health] port` | health/metrics HTTP port; `0` (default) = disabled unless `health(true)` |
+| `health_host(h)` | `ASTER_HEALTH_HOST` | `[health] host` | default `127.0.0.1`; `0.0.0.0` for pod probes |
+| `health(b)` | `ASTER_HEALTH_ENABLED` | `[health] enabled` | force on (port `0` → ephemeral) or off; unset = on iff port ≠ 0 |
+
+The `[health]` keys start the `aster::health` HTTP listener (feature `health`)
+automatically under `AsterServer`; with a bare `Node`, call
+`aster::health::HealthServer::start(&node, cfg.health_config().unwrap())`. It
+serves the same routes as the Python/TS `HealthServer`: `GET /healthz`
+(liveness), `GET /readyz` (readiness, `HealthState::set_ready`), `GET /metrics`
+(JSON; Prometheus text when the `Accept` header asks for `text/plain` /
+OpenMetrics or with `?format=prometheus`) and `GET /metrics/prometheus` (the
+`aster_*` series plus, with `metrics`, `Node::metrics_prometheus`).
 
 The ALPNs are exported as `aster::RPC_ALPN` and `aster::alpns::{RPC,
 CONSUMER_ADMISSION, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,

@@ -86,9 +86,24 @@ pub struct AsterServerBuilder {
     // `aster.coordination.*` services and requires a persistent identity.
     #[cfg(feature = "coordination")]
     coordination: Option<crate::coordination::host::CoordinationConfig>,
+    // Health listener override; `None` defers to the config's `[health]` keys.
+    #[cfg(feature = "health")]
+    health: Option<crate::health::HealthConfig>,
 }
 
 impl AsterServerBuilder {
+    /// Serve `/healthz`, `/readyz` and `/metrics` on `config.host:config.port`
+    /// (see [`crate::health`]), overriding the config's `[health]` keys. Without
+    /// this, the listener starts when [`AsterConfig::is_health_enabled`].
+    ///
+    /// The server reports **ready** once its services are being served, and
+    /// not ready from the start of [`shutdown`](AsterServer::shutdown).
+    #[cfg(feature = "health")]
+    pub fn health(mut self, config: crate::health::HealthConfig) -> Self {
+        self.health = Some(config);
+        self
+    }
+
     /// Add a service to serve (chainable; call once per service). Optional as
     /// long as the baseline `aster.ops.NodeInfo` service is enabled (the
     /// default); with [`builtin_node_info(false)`](Self::builtin_node_info),
@@ -422,7 +437,40 @@ impl AsterServerBuilder {
             }
         }
 
+        // Health listener: an explicit `.health(..)` wins, else the config's
+        // `[health]` keys. Refuse a config that asks for one this build cannot
+        // serve rather than silently running without probes.
+        #[cfg(feature = "health")]
+        let health_config = self.health.or_else(|| config.health_config());
+        #[cfg(not(feature = "health"))]
+        if config.is_health_enabled() {
+            return Err(Error::InvalidArgument(
+                "the health listener is enabled ([health] / ASTER_HEALTH_*) but aster was \
+                 built without the `health` feature"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "health")]
+        let service_count = u32::try_from(self.services.len()).unwrap_or(u32::MAX);
+
         let node = Node::start_with_alpns(config, alpns).await?;
+
+        // Bound before serving so a port conflict fails the start cleanly. It
+        // answers not-ready until everything below is up.
+        #[cfg(feature = "health")]
+        let health = match health_config {
+            None => None,
+            Some(cfg) => match crate::health::HealthServer::start(&node, cfg).await {
+                Ok(health) => {
+                    health.state().set_services(service_count);
+                    Some(health)
+                }
+                Err(err) => {
+                    node.shutdown().await;
+                    return Err(err);
+                }
+            },
+        };
 
         let attributes = self.attributes.unwrap_or_default();
         let mut server = Server::new(&node).attributes(attributes.clone());
@@ -541,6 +589,11 @@ impl AsterServerBuilder {
             }
         };
 
+        #[cfg(feature = "health")]
+        if let Some(health) = &health {
+            health.set_ready(true);
+        }
+
         Ok(AsterServer {
             node,
             handle,
@@ -550,6 +603,8 @@ impl AsterServerBuilder {
             identity_handle,
             #[cfg(feature = "coordination")]
             coordination,
+            #[cfg(feature = "health")]
+            health,
         })
     }
 }
@@ -603,9 +658,21 @@ pub struct AsterServer {
     /// serves.
     #[cfg(feature = "coordination")]
     coordination: Option<crate::coordination::runtime::owner::CoordinationRuntime>,
+    /// The health/metrics HTTP listener, when enabled.
+    #[cfg(feature = "health")]
+    health: Option<crate::health::HealthServer>,
 }
 
 impl AsterServer {
+    /// The health/readiness/metrics HTTP listener, when enabled by the config's
+    /// `[health]` keys or [`AsterServerBuilder::health`]. Use its
+    /// [`state`](crate::health::HealthServer::state) to toggle readiness and
+    /// record counters.
+    #[cfg(feature = "health")]
+    pub fn health(&self) -> Option<&crate::health::HealthServer> {
+        self.health.as_ref()
+    }
+
     /// Start configuring a server.
     pub fn builder() -> AsterServerBuilder {
         AsterServerBuilder::default()
@@ -715,6 +782,13 @@ impl AsterServer {
     /// does the transport stop — a node torn down first would leave a peer's
     /// in-flight call reaching a Raft that is going away.
     pub async fn shutdown(self) {
+        // Probes see not-ready first, and the port is released before the
+        // node goes away.
+        #[cfg(feature = "health")]
+        if let Some(health) = &self.health {
+            health.set_ready(false);
+            health.shutdown().await;
+        }
         // Moved out rather than taken through `&mut`, so this compiles
         // identically with and without the feature.
         #[cfg(feature = "coordination")]
