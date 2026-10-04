@@ -28,6 +28,22 @@ whose ABI major differs (4).
   (`aster_canonical_bytes`, `aster_blake3_hex`, `aster_contract_id`).
   `int32` → `varint32`, `int64`/`int` → `varint64`, `uint32` → `var_uint32`
   (a `fory:"encoding=fixed"` tag selects the fixed forms), pointers are optional.
+  **Contract defaults** (spec 11.3.2.3): `aster:"default=VALUE"` (or a bare
+  `aster:"default"` for the Go zero value / empty container) marks a field
+  `required = false` with the canonical default, so the contract id matches
+  Rust / Python / TS (`conformance/vectors/contract-defaults.json` passes).
+  Supported: string, bool, int32, int64/int, float64 and empty containers;
+  other types are an error when the contract is built (see `contract_default.go`).
+- **Client interceptors:** `StartClient(ctx, cfg, WithClientInterceptors(...))`
+  (or per call `WithInterceptors`) takes the same `Interceptor`s as the server,
+  with the Python client's semantics (`client_interceptors.go`): request hooks
+  in order, response hooks in order, error hooks in reverse; unary and
+  client-streaming calls also go through the retry loop (`CircuitBreakerInterceptor`
+  gate and outcome, `RetryInterceptor` for idempotent calls on retryable codes
+  with backoff bounded by the context, `DeadlineInterceptor` refusing an expired
+  call; the context deadline is what is sent natively); server-stream and bidi
+  get the hooks only. `AsterClient.RegisterService` supplies each method's
+  idempotent flag; `WithIdempotent` overrides it.
 - **Node:** `AsterConfig` mirrors `aster_config_t`; `ConfigFromEnv()` /
   `ConfigFromTOML(path)` resolve through Rust `aster::AsterConfig` plus the
   binding-level `[trust]` / `[connect]` / `[logging]` keys. `StartNode(ctx, cfg,
@@ -188,7 +204,7 @@ unnamed; `Node` had no `Docs()`.
 
 Known gaps:
 
-- Client interceptors are not wired; no `go generate` codegen yet; no
+- No `go generate` codegen yet; no
   consumer-admission handler (`OnNonRPC` hands the connection over).
 - A client-stream call with no request is refused by the Rust client
   (`INVALID_ARGUMENT`).
