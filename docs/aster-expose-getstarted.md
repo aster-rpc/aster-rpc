@@ -196,7 +196,39 @@ let resp = relay_request(
 ```
 
 `relay_request` is the buffered convenience; [`relay::relay_request_streaming`]
-returns a streaming response body for large/long-lived responses.
+returns a streaming response body for large/long-lived responses. To stream
+the *request* body from code that is not itself an `http_body::Body`, use a
+channel body:
+
+```rust
+use aster_expose::body::body_channel;
+
+let (tx, body) = body_channel(8); // at most 8 chunks queued; send() waits when full
+let req = http::Request::builder().method("POST").uri("/upload").body(body)?;
+tokio::spawn(async move {
+    for chunk in chunks { tx.send(chunk).await?; }
+    tx.finish(); // or tx.abort("...") to fail the upload
+    anyhow::Ok(())
+});
+let resp = relay_request_streaming(&conn, "web", req).await?;
+```
+
+### From a language binding (Python, TypeScript, C ABI)
+
+Bindings use the same API through the `aster` crate, with concrete types only:
+
+- **Socket target** — run the HTTP server in your language and expose its
+  loopback address with `expose_socket(service_id, authorize, addr)`; Aster
+  splices raw bytes, so any protocol works.
+- **Foreign handler** — `aster::binding_support::upcall::expose` provides a
+  `ForeignHttpHandler` (a `tower::Service` / `HttpHandler`) that sends each
+  request to the binding as one upcall and streams bodies through
+  `HttpBodies` handles, plus `foreign_authorize_fn` and `foreign_route_policy`
+  so the admission policy and an edge's route policy can be written in the
+  binding's language too. Upcall failures become `5xx`; a peer that goes away
+  cancels the upcall. Spec: `docs/_internal/bindings/upcall-design.md` §6.
+- **Consumer** — `relay_request` (buffered) or `relay_request_streaming` with
+  a `body_channel` body, as above.
 
 ---
 

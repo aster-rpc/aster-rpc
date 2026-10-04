@@ -81,7 +81,14 @@ binding-support = ["dep:async-trait"]
 # Expose local HTTP services over Aster (the `aster-expose` L7 relay). Off by
 # default so non-expose consumers don't pull in http/tower. See
 # docs/aster-expose-getstarted.md.
-expose = ["dep:aster-expose", "dep:http", "dep:http-body"]
+expose = [
+    "dep:aster-expose",
+    "dep:http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:tower",
+]
 # Adds the public reverse-proxy edge (Salvo + TLS/ACME). Pulls in the Salvo
 # fork; only needed to run a public HTTPS listener, not to expose a service.
 expose-edge = ["expose", "aster-expose/edge"]
@@ -97,6 +104,11 @@ http = { version = "1", optional = true }
 # The streaming-relay body trait bound (`relay_request_streaming`). Gated by the
 # `expose` feature; matches the version `aster-expose` uses.
 http-body = { version = "1", optional = true }
+# The foreign (upcall) HTTP handler's bodies and its `tower::Service` impl
+# (`binding_support::upcall::expose`). Same versions `aster-expose` resolves,
+# so nothing new enters the graph. Gated by the `expose` feature.
+bytes = { workspace = true, optional = true }
+tower = { version = "0.5", optional = true }
 # The `health` feature's HTTP/1.1 listener. Same versions iroh's HTTP client
 # already resolves; only hyper's `server` feature is new code.
 hyper = { version = "1", features = ["server", "http1"], optional = true }

@@ -55,6 +55,11 @@ pub mod tag {
     pub const ADMISSION_CONNECT_REQUEST: u8 = 0xC1;
     pub const ADMISSION_HANDSHAKE_REQUEST: u8 = 0xC2;
     pub const ADMISSION_HANDSHAKE_RESPONSE: u8 = 0xC3;
+    pub const EXPOSE_HTTP_REQUEST: u8 = 0xC4;
+    pub const EXPOSE_HTTP_RESPONSE: u8 = 0xC5;
+    pub const EXPOSE_HTTP_TRAILERS: u8 = 0xC6;
+    pub const EXPOSE_ROUTE_POLICY_REQUEST: u8 = 0xC7;
+    pub const EXPOSE_ROUTE_GRANT: u8 = 0xC8;
     pub const DECISION: u8 = 0xCF;
 }
 
@@ -665,6 +670,266 @@ pub fn decode_expose_authorize_request(buf: &[u8]) -> Result<(String, String, Ve
     let mut r = R::new(buf, tag::EXPOSE_AUTHORIZE_REQUEST)?;
     let v = (r.str()?, r.str()?, r.bytes()?);
     r.end()?;
+    Ok(v)
+}
+
+// ── expose HTTP (R9) ───────────────────────────────────────────────────────
+
+/// One HTTP header field: `(name, value)`. The name is lowercase (HTTP
+/// names are case-insensitive, so UCv1 fixes one spelling); the value is raw
+/// bytes (header values need not be UTF-8). A repeated name is one entry per
+/// value, in order.
+pub type HttpHeader = (String, Vec<u8>);
+
+/// Highest HTTP version code: `0` HTTP/0.9, `1` HTTP/1.0, `2` HTTP/1.1,
+/// `3` HTTP/2, `4` HTTP/3 (the `aster-expose` head codec's codes).
+pub const HTTP_VERSION_MAX: u8 = 4;
+
+/// Where a message body travels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HttpBodyMode {
+    /// The whole body is in the message (possibly empty). Wire: `0 body:bytes`.
+    Inline(Vec<u8>),
+    /// The body streams through the exchange's body handle (`stream_id`):
+    /// the binding reads the request body / writes the response body in
+    /// chunks, then finishes it. Wire: `1`.
+    Stream,
+}
+
+/// Kind 49 `expose_http` request: one HTTP request for a foreign handler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExposeHttpRequest {
+    /// The exposed service the request arrived for.
+    pub service_id: String,
+    /// The transport-authenticated peer (`AuthenticatedPeer`), when the
+    /// request came over the relay; absent otherwise. Handlers that
+    /// attribute requests must refuse an absent peer.
+    pub peer_id: Option<String>,
+    /// The exchange's body handle: read the request body and write the
+    /// response body with it. Unique per body table, never reused.
+    pub stream_id: u64,
+    /// HTTP version code (`0..=`[`HTTP_VERSION_MAX`]).
+    pub version: u8,
+    pub method: String,
+    /// The request target as received (path and query; absolute form when
+    /// the client sent one).
+    pub uri: String,
+    pub headers: Vec<HttpHeader>,
+    pub body: HttpBodyMode,
+}
+
+/// Kind 49 `expose_http` response: the response head, and the body inline
+/// or streamed through `stream_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExposeHttpResponse {
+    /// `100..=999`.
+    pub status: u16,
+    pub headers: Vec<HttpHeader>,
+    pub body: HttpBodyMode,
+}
+
+/// A route spec as the edge's route policy sees it (`aster-expose`
+/// `RouteSpec`; `protocol` `0` http, `1` tcp).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExposeRouteSpec {
+    pub host: String,
+    pub port: u16,
+    pub protocol: u8,
+    pub service_id: String,
+}
+
+const BODY_INLINE: u8 = 0;
+const BODY_STREAM: u8 = 1;
+
+fn put_headers(w: &mut W, headers: &[HttpHeader]) {
+    w.list(headers.len());
+    for (name, value) in headers {
+        w.str(name).bytes(value);
+    }
+}
+
+fn get_headers(r: &mut R<'_>) -> Result<Vec<HttpHeader>> {
+    let n = r.list()?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        ensure!(
+            !name.is_empty() && !name.bytes().any(|b| b.is_ascii_uppercase()),
+            "UCv1: header name {name:?} must be non-empty and lowercase"
+        );
+        out.push((name, r.bytes()?));
+    }
+    Ok(out)
+}
+
+fn put_body(w: &mut W, body: &HttpBodyMode) {
+    match body {
+        HttpBodyMode::Inline(b) => {
+            w.u8(BODY_INLINE).bytes(b);
+        }
+        HttpBodyMode::Stream => {
+            w.u8(BODY_STREAM);
+        }
+    }
+}
+
+fn get_body(r: &mut R<'_>) -> Result<HttpBodyMode> {
+    match r.u8()? {
+        BODY_INLINE => Ok(HttpBodyMode::Inline(r.bytes()?)),
+        BODY_STREAM => Ok(HttpBodyMode::Stream),
+        other => bail!("UCv1: unknown body mode {other}"),
+    }
+}
+
+/// `service_id:string peer_id:opt<string> stream_id:uint version:u8enum
+/// method:string uri:string headers:list<Header> body:Body`, where
+/// `Header := name:string value:bytes` and `Body := 0 bytes | 1`.
+pub fn encode_expose_http_request(req: &ExposeHttpRequest) -> Vec<u8> {
+    let mut w = W::new(tag::EXPOSE_HTTP_REQUEST);
+    w.str(&req.service_id)
+        .opt(req.peer_id.as_deref(), |w, p| {
+            w.str(p);
+        })
+        .uint(req.stream_id)
+        .u8(req.version)
+        .str(&req.method)
+        .str(&req.uri);
+    put_headers(&mut w, &req.headers);
+    put_body(&mut w, &req.body);
+    w.done()
+}
+
+pub fn decode_expose_http_request(buf: &[u8]) -> Result<ExposeHttpRequest> {
+    let mut r = R::new(buf, tag::EXPOSE_HTTP_REQUEST)?;
+    let service_id = r.str()?;
+    let peer_id = r.opt(|r| r.str())?;
+    let stream_id = r.uint()?;
+    let version = r.u8()?;
+    ensure!(
+        version <= HTTP_VERSION_MAX,
+        "UCv1: unknown HTTP version {version}"
+    );
+    let method = r.str()?;
+    ensure!(!method.is_empty(), "UCv1: empty HTTP method");
+    let uri = r.str()?;
+    let headers = get_headers(&mut r)?;
+    let body = get_body(&mut r)?;
+    r.end()?;
+    Ok(ExposeHttpRequest {
+        service_id,
+        peer_id,
+        stream_id,
+        version,
+        method,
+        uri,
+        headers,
+        body,
+    })
+}
+
+/// `status:uint(100..=999) headers:list<Header> body:Body`.
+pub fn encode_expose_http_response(resp: &ExposeHttpResponse) -> Vec<u8> {
+    let mut w = W::new(tag::EXPOSE_HTTP_RESPONSE);
+    w.uint(resp.status as u64);
+    put_headers(&mut w, &resp.headers);
+    put_body(&mut w, &resp.body);
+    w.done()
+}
+
+pub fn decode_expose_http_response(buf: &[u8]) -> Result<ExposeHttpResponse> {
+    let mut r = R::new(buf, tag::EXPOSE_HTTP_RESPONSE)?;
+    let status = r.uint_max(999, "HTTP status")? as u16;
+    ensure!(status >= 100, "UCv1: HTTP status {status} below 100");
+    let headers = get_headers(&mut r)?;
+    let body = get_body(&mut r)?;
+    r.end()?;
+    Ok(ExposeHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Trailers that end a streamed body: `headers:list<Header>`.
+pub fn encode_expose_http_trailers(trailers: &[HttpHeader]) -> Vec<u8> {
+    let mut w = W::new(tag::EXPOSE_HTTP_TRAILERS);
+    put_headers(&mut w, trailers);
+    w.done()
+}
+
+pub fn decode_expose_http_trailers(buf: &[u8]) -> Result<Vec<HttpHeader>> {
+    let mut r = R::new(buf, tag::EXPOSE_HTTP_TRAILERS)?;
+    let v = get_headers(&mut r)?;
+    r.end()?;
+    Ok(v)
+}
+
+/// Kind 50 `expose_route_policy` request: `peer_id:string metadata:bytes
+/// specs:list<{host:string port:uint(u16) protocol:u8enum
+/// service_id:string}>`. Answered with an [`encode_expose_route_grant`].
+pub fn encode_expose_route_policy_request(
+    peer_id: &str,
+    metadata: &[u8],
+    specs: &[ExposeRouteSpec],
+) -> Vec<u8> {
+    let mut w = W::new(tag::EXPOSE_ROUTE_POLICY_REQUEST);
+    w.str(peer_id).bytes(metadata).list(specs.len());
+    for s in specs {
+        w.str(&s.host)
+            .uint(s.port as u64)
+            .u8(s.protocol)
+            .str(&s.service_id);
+    }
+    w.done()
+}
+
+pub fn decode_expose_route_policy_request(
+    buf: &[u8],
+) -> Result<(String, Vec<u8>, Vec<ExposeRouteSpec>)> {
+    let mut r = R::new(buf, tag::EXPOSE_ROUTE_POLICY_REQUEST)?;
+    let peer_id = r.str()?;
+    let metadata = r.bytes()?;
+    let n = r.list()?;
+    let mut specs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let host = r.str()?;
+        let port = r.uint_max(u16::MAX as u64, "port")? as u16;
+        let protocol = r.u8()?;
+        ensure!(protocol <= 1, "UCv1: unknown route protocol {protocol}");
+        specs.push(ExposeRouteSpec {
+            host,
+            port,
+            protocol,
+            service_id: r.str()?,
+        });
+    }
+    r.end()?;
+    Ok((peer_id, metadata, specs))
+}
+
+/// The granted subset of a route request: `granted:list<uint(u32)>`,
+/// indexes into the request's `specs`, strictly ascending.
+pub fn encode_expose_route_grant(granted: &[u32]) -> Vec<u8> {
+    let mut w = W::new(tag::EXPOSE_ROUTE_GRANT);
+    w.list(granted.len());
+    for i in granted {
+        w.uint(*i as u64);
+    }
+    w.done()
+}
+
+pub fn decode_expose_route_grant(buf: &[u8]) -> Result<Vec<u32>> {
+    let mut r = R::new(buf, tag::EXPOSE_ROUTE_GRANT)?;
+    let n = r.list()?;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(r.uint_max(u32::MAX as u64, "route index")? as u32);
+    }
+    r.end()?;
+    ensure!(
+        v.windows(2).all(|w| w[0] < w[1]),
+        "UCv1: granted route indexes not strictly ascending"
+    );
     Ok(v)
 }
 

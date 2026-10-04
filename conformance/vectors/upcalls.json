@@ -87,6 +87,51 @@
       "hex": "b901050c01",
       "name": "list count beyond payload",
       "type": "TopologyAdmittedResponse"
+    },
+    {
+      "hex": "c4010e6170700082026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616107050e4745542a2f67726565743f783d31020c12686f7374096170702e6c6f63616c1a616363657074032a2f2a01",
+      "name": "unknown HTTP version",
+      "type": "ExposeHttpRequest"
+    },
+    {
+      "hex": "c4010e617070008202616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610702022a2f67726565743f783d31020c12686f7374096170702e6c6f63616c1a616363657074032a2f2a01",
+      "name": "empty method",
+      "type": "ExposeHttpRequest"
+    },
+    {
+      "hex": "c501c801010c12582d5570017801",
+      "name": "uppercase header name",
+      "type": "ExposeHttpResponse"
+    },
+    {
+      "hex": "c501c801010c02017801",
+      "name": "empty header name",
+      "type": "ExposeHttpResponse"
+    },
+    {
+      "hex": "c50163010c0678017801",
+      "name": "status below 100",
+      "type": "ExposeHttpResponse"
+    },
+    {
+      "hex": "c501e807010c0678017801",
+      "name": "status above 999",
+      "type": "ExposeHttpResponse"
+    },
+    {
+      "hex": "c501c801010c0678017802",
+      "name": "unknown body mode",
+      "type": "ExposeHttpResponse"
+    },
+    {
+      "hex": "c701067000020c26612e6578616d706c65bb03000e77656202b82a020a6462",
+      "name": "unknown route protocol",
+      "type": "ExposeRoutePolicyRequest"
+    },
+    {
+      "hex": "c801020c0100",
+      "name": "route grant not ascending",
+      "type": "ExposeRouteGrant"
     }
   ],
   "kinds": [
@@ -144,6 +189,11 @@
       "code": 49,
       "decision": false,
       "name": "expose_http"
+    },
+    {
+      "code": 50,
+      "decision": true,
+      "name": "expose_route_policy"
     },
     {
       "code": 64,
@@ -618,6 +668,153 @@
         "node_id": "0101010101010101010101010101010101010101010101010101010101010101",
         "signed_join_permit": "dead",
         "ticket": "aster1ticket"
+      }
+    },
+    {
+      "hex": "c4010e6170700082026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616107020e4745542a2f67726565743f783d31020c12686f7374096170702e6c6f63616c1a616363657074032a2f2a01",
+      "name": "expose http request: GET, streamed body",
+      "type": "ExposeHttpRequest",
+      "value": {
+        "body": "stream",
+        "headers": [
+          {
+            "name": "host",
+            "value": "app.local"
+          },
+          {
+            "name": "accept",
+            "value": "*/*"
+          }
+        ],
+        "method": "GET",
+        "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "service_id": "app",
+        "stream_id": 7,
+        "uri": "/greet?x=1",
+        "version": 2
+      }
+    },
+    {
+      "hex": "c4010e617070fdac020312504f53541e2f75706c6f6164020c3a636f6e74656e742d6c656e677468013516782d62696e02ff00000568656c6c6f",
+      "name": "expose http request: POST inline, no peer, HTTP/2, binary header",
+      "type": "ExposeHttpRequest",
+      "value": {
+        "body": {
+          "inline": "hello"
+        },
+        "headers": [
+          {
+            "name": "content-length",
+            "value": "5"
+          },
+          {
+            "name": "x-bin",
+            "value_hex": "ff00"
+          }
+        ],
+        "method": "POST",
+        "peer_id": null,
+        "service_id": "app",
+        "stream_id": 300,
+        "uri": "/upload",
+        "version": 3
+      }
+    },
+    {
+      "hex": "c501c801030c32636f6e74656e742d747970650a746578742f706c61696e2a7365742d636f6f6b696503613d312a7365742d636f6f6b696503623d3200026869",
+      "name": "expose http response: inline, repeated header",
+      "type": "ExposeHttpResponse",
+      "value": {
+        "body": {
+          "inline": "hi"
+        },
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "text/plain"
+          },
+          {
+            "name": "set-cookie",
+            "value": "a=1"
+          },
+          {
+            "name": "set-cookie",
+            "value": "b=2"
+          }
+        ],
+        "status": 200
+      }
+    },
+    {
+      "hex": "c5019403000c01",
+      "name": "expose http response: streamed, no headers",
+      "type": "ExposeHttpResponse",
+      "value": {
+        "body": "stream",
+        "headers": [],
+        "status": 404
+      }
+    },
+    {
+      "hex": "c601020c2e677270632d737461747573013032677270632d6d657373616765026f6b",
+      "name": "expose http trailers",
+      "type": "ExposeHttpTrailers",
+      "value": [
+        {
+          "name": "grpc-status",
+          "value": "0"
+        },
+        {
+          "name": "grpc-message",
+          "value": "ok"
+        }
+      ]
+    },
+    {
+      "hex": "c601000c",
+      "name": "expose http trailers: empty",
+      "type": "ExposeHttpTrailers",
+      "value": []
+    },
+    {
+      "hex": "c70182026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616103746f6b020c26612e6578616d706c65bb03000e77656202b82a010a6462",
+      "name": "expose route policy request",
+      "type": "ExposeRoutePolicyRequest",
+      "value": {
+        "metadata_hex": "746f6b",
+        "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "specs": [
+          {
+            "host": "a.example",
+            "port": 443,
+            "protocol": "http",
+            "service_id": "web"
+          },
+          {
+            "host": "",
+            "port": 5432,
+            "protocol": "tcp",
+            "service_id": "db"
+          }
+        ]
+      }
+    },
+    {
+      "hex": "c801010c01",
+      "name": "expose route grant",
+      "type": "ExposeRouteGrant",
+      "value": {
+        "granted": [
+          1
+        ]
+      }
+    },
+    {
+      "hex": "c801000c",
+      "name": "expose route grant: none",
+      "type": "ExposeRouteGrant",
+      "value": {
+        "granted": []
       }
     }
   ]

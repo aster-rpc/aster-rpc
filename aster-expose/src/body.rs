@@ -79,10 +79,208 @@ impl Body for RelayBody {
     }
 }
 
+// ── channel body ────────────────────────────────────────────────────────────
+
+/// Shared end-of-body state: an abort error wins over everything queued;
+/// trailers follow the last data chunk.
+#[derive(Default)]
+struct ChannelEnd {
+    abort: Option<String>,
+    trailers: Option<http::HeaderMap>,
+}
+
+/// A body fed chunk by chunk through a [`BodySender`] — the plain, non-generic
+/// way to produce a streaming body from code that is not itself a [`Body`]
+/// (a language binding writing a response, or a consumer streaming an upload
+/// into [`relay_request_streaming`](crate::relay::relay_request_streaming)).
+/// Bounded: at most `capacity` chunks wait, so a fast writer is held back
+/// (awaits) until the reader catches up.
+pub struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    end: std::sync::Arc<std::sync::Mutex<ChannelEnd>>,
+    done: bool,
+}
+
+/// The write half of a [`body_channel`]. Clone-cheap; the body ends cleanly
+/// once every clone is dropped or [`finish`](Self::finish)ed.
+#[derive(Clone)]
+pub struct BodySender {
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+    end: std::sync::Arc<std::sync::Mutex<ChannelEnd>>,
+}
+
+/// The reading side went away (the peer is gone or the body was dropped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyClosed;
+
+impl std::fmt::Display for BodyClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("body reader is gone")
+    }
+}
+
+impl std::error::Error for BodyClosed {}
+
+/// A bounded streaming body and its writer. `capacity` (>= 1) chunks may be
+/// queued before [`BodySender::send`] waits.
+pub fn body_channel(capacity: usize) -> (BodySender, ChannelBody) {
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
+    let end = std::sync::Arc::new(std::sync::Mutex::new(ChannelEnd::default()));
+    (
+        BodySender {
+            tx,
+            end: end.clone(),
+        },
+        ChannelBody {
+            rx,
+            end,
+            done: false,
+        },
+    )
+}
+
+impl BodySender {
+    /// Queue one chunk, waiting while `capacity` chunks are already queued
+    /// (backpressure). Empty chunks are skipped.
+    pub async fn send(&self, chunk: Bytes) -> Result<(), BodyClosed> {
+        if chunk.is_empty() {
+            return if self.tx.is_closed() {
+                Err(BodyClosed)
+            } else {
+                Ok(())
+            };
+        }
+        self.tx.send(chunk).await.map_err(|_| BodyClosed)
+    }
+
+    /// Queue one chunk if there is room now; `Ok(false)` when full.
+    pub fn try_send(&self, chunk: Bytes) -> Result<bool, BodyClosed> {
+        use tokio::sync::mpsc::error::TrySendError;
+        if chunk.is_empty() {
+            return Ok(true);
+        }
+        match self.tx.try_send(chunk) {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Closed(_)) => Err(BodyClosed),
+        }
+    }
+
+    /// Whether the reading side is gone.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Resolves when the reading side is gone.
+    pub async fn closed(&self) {
+        self.tx.closed().await
+    }
+
+    /// End the body cleanly (equivalent to dropping this sender).
+    pub fn finish(self) {}
+
+    /// End the body with trailers, delivered after the queued chunks. (The
+    /// Aster relay hop does not carry trailers yet -- design V2 -- so over
+    /// the relay they are dropped; an in-process reader sees them.)
+    pub fn finish_with_trailers(self, trailers: http::HeaderMap) {
+        self.end.lock().unwrap_or_else(|e| e.into_inner()).trailers = Some(trailers);
+    }
+
+    /// End the body with an error, discarding anything still queued: the
+    /// reader sees a failed (truncated) body rather than a clean end, so the
+    /// relay resets the stream instead of finishing it.
+    pub fn abort(self, message: impl Into<String>) {
+        self.end.lock().unwrap_or_else(|e| e.into_inner()).abort = Some(message.into());
+    }
+}
+
+impl Body for ChannelBody {
+    type Data = Bytes;
+    type Error = RelayError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, RelayError>>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        let take_abort = |end: &std::sync::Mutex<ChannelEnd>| {
+            end.lock().unwrap_or_else(|e| e.into_inner()).abort.take()
+        };
+        if let Some(msg) = take_abort(&this.end) {
+            this.done = true;
+            return Poll::Ready(Some(Err(msg.into())));
+        }
+        match this.rx.poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
+            Poll::Ready(None) => {
+                this.done = true;
+                // Every sender is gone; an abort set just before the last
+                // drop still wins.
+                if let Some(msg) = take_abort(&this.end) {
+                    return Poll::Ready(Some(Err(msg.into())));
+                }
+                let trailers = this
+                    .end
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .trailers
+                    .take();
+                Poll::Ready(trailers.map(|t| Ok(Frame::trailers(t))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn channel_body_streams_then_trailers() {
+        let (tx, body) = body_channel(2);
+        let writer = tokio::spawn(async move {
+            for i in 0..5u8 {
+                tx.send(Bytes::from(vec![i; 3])).await.unwrap();
+            }
+            let mut t = http::HeaderMap::new();
+            t.insert("grpc-status", "0".parse().unwrap());
+            tx.finish_with_trailers(t);
+        });
+        let collected = body.collect().await.unwrap();
+        let trailers = collected.trailers().cloned().unwrap();
+        assert_eq!(trailers["grpc-status"], "0");
+        assert_eq!(collected.to_bytes().len(), 15);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_body_backpressure_and_abort() {
+        let (tx, mut body) = body_channel(1);
+        assert!(tx.try_send(Bytes::from_static(b"a")).unwrap());
+        // Full: the second chunk waits for the reader.
+        assert!(!tx.try_send(Bytes::from_static(b"b")).unwrap());
+        tx.abort("handler failed");
+        // The abort wins over the queued chunk.
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_sender_sees_a_dropped_reader() {
+        let (tx, body) = body_channel(1);
+        drop(body);
+        assert!(tx.is_closed());
+        assert_eq!(tx.send(Bytes::from_static(b"x")).await, Err(BodyClosed));
+    }
 
     #[tokio::test]
     async fn streams_until_eof_across_chunks() {

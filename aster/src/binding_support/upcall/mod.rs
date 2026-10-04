@@ -89,9 +89,13 @@ pub enum UpcallKind {
     PlacementProvision = 33,
     /// expose `AuthorizeFn` -> bool decision.
     ExposeAuthorize = 48,
-    /// Reserved for R9: the bytes-level expose `HttpHandler` (request head
-    /// + body handle -> response head + body handle). No adapter yet.
+    /// The bytes-level expose `HttpHandler` (R9): request head (+ inline
+    /// body or a body handle) -> response head (+ inline body or a body
+    /// handle). Bodies stream through `expose::HttpBodies`, not upcalls.
     ExposeHttp = 49,
+    /// expose `RoutePolicy` (an edge's `serve_routes`): requested route
+    /// specs -> the granted subset.
+    ExposeRoutePolicy = 50,
     /// Gate 0 outbound connect hook -> bool decision.
     AdmissionConnect = 64,
     /// Gate 0 inbound after-handshake hook -> accept, or reject with
@@ -101,7 +105,7 @@ pub enum UpcallKind {
 
 impl UpcallKind {
     /// Every kind, in code order.
-    pub const ALL: [UpcallKind; 13] = [
+    pub const ALL: [UpcallKind; 14] = [
         UpcallKind::Cancel,
         UpcallKind::LeaseTransition,
         UpcallKind::LeaseSnapshot,
@@ -113,6 +117,7 @@ impl UpcallKind {
         UpcallKind::PlacementProvision,
         UpcallKind::ExposeAuthorize,
         UpcallKind::ExposeHttp,
+        UpcallKind::ExposeRoutePolicy,
         UpcallKind::AdmissionConnect,
         UpcallKind::AdmissionHandshake,
     ];
@@ -141,6 +146,7 @@ impl UpcallKind {
             UpcallKind::PlacementProvision => "placement_provision",
             UpcallKind::ExposeAuthorize => "expose_authorize",
             UpcallKind::ExposeHttp => "expose_http",
+            UpcallKind::ExposeRoutePolicy => "expose_route_policy",
             UpcallKind::AdmissionConnect => "admission_connect",
             UpcallKind::AdmissionHandshake => "admission_handshake",
         }
@@ -155,6 +161,7 @@ impl UpcallKind {
             UpcallKind::LeaseAuthorize
                 | UpcallKind::TopologyAdmitted
                 | UpcallKind::ExposeAuthorize
+                | UpcallKind::ExposeRoutePolicy
                 | UpcallKind::AdmissionConnect
                 | UpcallKind::AdmissionHandshake
         )
