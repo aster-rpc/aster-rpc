@@ -49,7 +49,14 @@ pub use aster_transport_core::trust::HookFailureMode;
 
 use crate::log_targets::UPCALL;
 
+pub mod admission;
 pub mod codec;
+#[cfg(feature = "expose")]
+pub mod expose;
+pub mod lease;
+#[cfg(feature = "coordination-client")]
+pub mod placement;
+pub mod topology;
 
 // ── kinds and statuses ──────────────────────────────────────────────────────
 

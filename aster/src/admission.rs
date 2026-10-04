@@ -187,14 +187,44 @@ impl Admission {
     /// when the node is closing. This is the config-doc / Gate 0 boundary.
     pub async fn next_handshake(&mut self) -> Option<HandshakeRequest> {
         let (info, reply) = self.rx.after_handshake_rx.recv().await?;
+        Some(self.handshake(info, reply))
+    }
+
+    fn handshake(
+        &self,
+        info: CoreHookHandshakeInfo,
+        reply: oneshot::Sender<CoreAfterHandshakeDecision>,
+    ) -> HandshakeRequest {
         #[cfg_attr(not(feature = "health"), allow(unused_mut))]
         let mut req = HandshakeRequest::new(info, reply);
         #[cfg(feature = "health")]
         {
             req.health = self.health.clone();
         }
-        Some(req)
+        req
     }
+
+    /// The next request of either kind, or `None` once both channels have
+    /// closed (the upcall bridge, `binding_support::upcall::admission`).
+    #[cfg(feature = "binding-support")]
+    pub(crate) async fn next_any(&mut self) -> Option<AnyAdmissionRequest> {
+        let handshake = tokio::select! {
+            Some((info, reply)) = self.rx.before_connect_rx.recv() => {
+                return Some(AnyAdmissionRequest::Connect(ConnectRequest::new(info, reply)));
+            }
+            Some(raw) = self.rx.after_handshake_rx.recv() => raw,
+            else => return None,
+        };
+        let (info, reply) = handshake;
+        Some(AnyAdmissionRequest::Handshake(self.handshake(info, reply)))
+    }
+}
+
+/// Either admission request ([`Admission::next_any`]).
+#[cfg(feature = "binding-support")]
+pub(crate) enum AnyAdmissionRequest {
+    Connect(ConnectRequest),
+    Handshake(HandshakeRequest),
 }
 
 /// A pending outbound-connect decision.
