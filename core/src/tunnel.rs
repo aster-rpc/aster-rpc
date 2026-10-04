@@ -23,9 +23,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
 
+use crate::framing::RESET_CODE_TUNNEL_UPSTREAM_ABORTED;
 use crate::stream_io::BoxFut;
 use crate::{CoreConnection, CoreRecvStream, CoreSendStream};
 
@@ -280,7 +282,18 @@ pub async fn splice_with_failover(
 }
 
 /// Splice a redeemed bidi QUIC stream to an already-connected TCP
-/// socket. Returns when either direction EOFs or errors.
+/// socket. Returns when both directions have ended.
+///
+/// Failures propagate as failures, not clean ends, in both directions:
+///
+/// - TCP read error: the QUIC send half is **reset** with
+///   [`RESET_CODE_TUNNEL_UPSTREAM_ABORTED`] (dropping it would finish it, and
+///   the consumer would take the truncated response for a complete one). A
+///   clean TCP EOF is a QUIC finish.
+/// - QUIC receive error (the consumer reset its send half, or the connection
+///   died): the TCP socket is closed with `SO_LINGER 0`, so the upstream sees
+///   a connection reset rather than an end-of-request FIN, and the QUIC send
+///   half is reset too. A clean QUIC finish is a TCP FIN.
 async fn splice_tcp_stream(
     quic_send: CoreSendStream,
     quic_recv: CoreRecvStream,
@@ -288,9 +301,10 @@ async fn splice_tcp_stream(
 ) -> Result<()> {
     let _ = tcp.set_nodelay(true);
     let (tcp_read, tcp_write) = tcp.into_split();
+    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let q_to_t = tokio::spawn(pump_recv_to_writer(quic_recv, tcp_write));
-    let t_to_q = tokio::spawn(pump_reader_to_send(tcp_read, quic_send));
+    let q_to_t = tokio::spawn(pump_recv_to_writer(quic_recv, tcp_write, abort_tx));
+    let t_to_q = tokio::spawn(pump_reader_to_send(tcp_read, quic_send, abort_rx));
 
     let _ = tokio::join!(q_to_t, t_to_q);
     Ok(())
@@ -298,33 +312,68 @@ async fn splice_tcp_stream(
 
 const TUNNEL_PUMP_BUF: usize = 16 * 1024;
 
-async fn pump_recv_to_writer<W>(recv: CoreRecvStream, mut writer: W) -> Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
+/// QUIC to TCP. A clean end shuts the write half down (FIN). A QUIC receive
+/// error aborts the socket instead: `SO_LINGER 0` plus `forget` (so dropping
+/// the write half does not send a FIN first) makes the close, when the other
+/// pump drops the read half, a reset. `abort` tells that pump to stop.
+async fn pump_recv_to_writer(
+    recv: CoreRecvStream,
+    mut writer: OwnedWriteHalf,
+    abort: tokio::sync::oneshot::Sender<()>,
+) -> Result<()> {
     loop {
-        match recv.read(TUNNEL_PUMP_BUF).await? {
-            Some(chunk) if !chunk.is_empty() => {
+        match recv.read(TUNNEL_PUMP_BUF).await {
+            Ok(Some(chunk)) if !chunk.is_empty() => {
                 if writer.write_all(&chunk).await.is_err() {
                     break;
                 }
             }
-            _ => break,
+            Ok(_) => break,
+            Err(e) => {
+                tracing::debug!("tunnel splice: QUIC receive failed, resetting upstream: {e}");
+                // tokio deprecates `set_linger` because a non-zero linger blocks
+                // the thread on drop; a zero linger (abortive close) does not.
+                #[allow(deprecated)]
+                let _ = writer.as_ref().set_linger(Some(Duration::ZERO));
+                writer.forget();
+                let _ = abort.send(());
+                return Ok(());
+            }
         }
     }
     let _ = writer.shutdown().await;
     Ok(())
 }
 
-async fn pump_reader_to_send<R>(mut reader: R, send: CoreSendStream) -> Result<()>
+/// TCP to QUIC. EOF finishes the send half; a read error (or an `abort` from
+/// the other pump) resets it with [`RESET_CODE_TUNNEL_UPSTREAM_ABORTED`].
+async fn pump_reader_to_send<R>(
+    mut reader: R,
+    send: CoreSendStream,
+    mut abort: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()>
 where
     R: AsyncReadExt + Unpin,
 {
     let mut buf = vec![0u8; TUNNEL_PUMP_BUF];
     loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+        let read = tokio::select! {
+            r = reader.read(&mut buf) => r,
+            // An `Err` (sender dropped unsent) is the normal QUIC-to-TCP end;
+            // only an explicit abort resets.
+            Ok(()) = &mut abort => {
+                let _ = send.reset(RESET_CODE_TUNNEL_UPSTREAM_ABORTED).await;
+                return Ok(());
+            }
+        };
+        let n = match read {
+            Ok(0) => break,
             Ok(n) => n,
+            Err(e) => {
+                tracing::debug!("tunnel splice: upstream read failed, resetting stream: {e}");
+                let _ = send.reset(RESET_CODE_TUNNEL_UPSTREAM_ABORTED).await;
+                return Ok(());
+            }
         };
         if send.write_all(buf[..n].to_vec()).await.is_err() {
             break;
