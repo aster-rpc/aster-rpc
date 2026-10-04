@@ -8,11 +8,20 @@
 //     echo(interop/EchoRequest) -> interop/EchoReply                (unary)
 //     generate(interop/EchoRequest) -> stream interop/EchoReply     (server stream)
 //     ingest(stream interop/EchoRequest) -> interop/EchoReply       (client stream)
+//     chat(stream interop/EchoRequest) -> stream interop/EchoReply  (bidi)
+//     hold(interop/EchoRequest) -> interop/EchoReply                (unary, blocks)
+//     cancelled(interop/EchoRequest) -> interop/EchoReply           (unary)
+//   service InteropSession v1 (session-scoped): add(interop/EchoRequest) -> interop/EchoReply
+//
+// Expose mini-matrix: `expose-server` serves HTTP service interop-http on ALPN
+// aster-expose/interop/1 (GET /hello, POST /echo, header x-server-lang); see
+// tests/interop/rust/interop_echo.rs.
 //
 // Single-file source program (JEP 330), no build step of its own:
 //
 //   java --enable-native-access=ALL-UNNAMED -cp <aster-runtime classpath> \
 //       tests/interop/java/InteropEcho.java contract | server | client <aster1-ticket>
+//   java ... InteropEcho.java expose-server
 //   java ... InteropEcho.java bench <aster1-ticket> [--duration S] [--warmup S]
 //       [--concurrency 1,10,50,100] [--stream-frames 100,10000] [--client-stream 10000]
 //
@@ -33,6 +42,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.fory.BaseFory;
 import org.apache.fory.Fory;
@@ -44,7 +54,18 @@ import site.aster.codec.ForyCodec;
 import site.aster.codec.ForyTags;
 import site.aster.config.AsterConfig;
 import site.aster.contract.ContractManifestBuilder;
+import site.aster.client.BidiCall;
+import site.aster.client.ClientSession;
+import site.aster.client.ServerStreamCall;
+import site.aster.expose.Expose;
+import site.aster.expose.HttpResponse;
+import site.aster.ffi.Rpc;
+import site.aster.handle.IrohConnection;
 import site.aster.interceptors.CallContext;
+import site.aster.interceptors.RpcError;
+import site.aster.interceptors.StatusCode;
+import site.aster.node.IrohNode;
+import site.aster.server.spi.BidiStreamDispatcher;
 import site.aster.node.NodeAddr;
 import site.aster.server.AsterServer;
 import site.aster.server.spi.ClientStreamDispatcher;
@@ -128,19 +149,27 @@ public final class InteropEcho {
 
     @Override
     public Map<String, MethodDispatcher> methods() {
-      return Map.of("echo", new Echo(), "generate", new Generate(), "ingest", new Ingest());
+      return Map.of(
+          "echo", new Echo(),
+          "generate", new Generate(),
+          "ingest", new Ingest(),
+          "chat", new Chat(),
+          "hold", new Hold(),
+          "cancelled", new Cancelled());
     }
 
     @Override
     public Map<String, Class<?>> requestClasses() {
       return Map.of(
-          "echo", EchoRequest.class, "generate", EchoRequest.class, "ingest", EchoRequest.class);
+          "echo", EchoRequest.class, "generate", EchoRequest.class, "ingest", EchoRequest.class,
+          "chat", EchoRequest.class, "hold", EchoRequest.class, "cancelled", EchoRequest.class);
     }
 
     @Override
     public Map<String, Class<?>> responseClasses() {
       return Map.of(
-          "echo", EchoReply.class, "generate", EchoReply.class, "ingest", EchoReply.class);
+          "echo", EchoReply.class, "generate", EchoReply.class, "ingest", EchoReply.class,
+          "chat", EchoReply.class, "hold", EchoReply.class, "cancelled", EchoReply.class);
     }
 
     @Override
@@ -208,6 +237,136 @@ public final class InteropEcho {
     }
   }
 
+  /** {@code chat}: one reply per request, sent right away; count = the request's position. */
+  static final class Chat implements BidiStreamDispatcher {
+    @Override
+    public MethodDescriptor descriptor() {
+      return desc("chat", StreamingKind.BIDI_STREAM);
+    }
+
+    @Override
+    public void invoke(
+        Object impl, RequestStream in, Codec codec, CallContext ctx, ResponseStream out)
+        throws Exception {
+      int i = 0;
+      while (true) {
+        byte[] payload = in.receive();
+        if (payload == null) {
+          break;
+        }
+        EchoRequest r = (EchoRequest) codec.decode(payload, EchoRequest.class);
+        out.send(codec.encode(new EchoReply(r.message, i++, r.data, "java")));
+      }
+    }
+  }
+
+  /** {@code hold} calls that observed a cancellation (process-wide). */
+  static final AtomicInteger HOLD_CANCELLED = new AtomicInteger();
+
+  /**
+   * {@code hold}: blocks until cancelled or 60 s. A unary handler is not told about a client cancel
+   * (the binding has no cancellation signal for unary handlers: no CallContext hook, no thread
+   * interrupt), so only the call's DEADLINE is observed, by watching the clock. See the report.
+   */
+  static final class Hold implements UnaryDispatcher {
+    @Override
+    public MethodDescriptor descriptor() {
+      return desc("hold", StreamingKind.UNARY);
+    }
+
+    @Override
+    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
+      Double deadline = ctx.deadline();
+      long end = System.nanoTime() + 60_000_000_000L;
+      while (System.nanoTime() < end) {
+        if (deadline != null && System.currentTimeMillis() / 1000.0 >= deadline) {
+          HOLD_CANCELLED.incrementAndGet();
+          throw new RpcError(StatusCode.DEADLINE_EXCEEDED, "hold: deadline passed");
+        }
+        try {
+          Thread.sleep(20);
+        } catch (InterruptedException e) {
+          HOLD_CANCELLED.incrementAndGet();
+          Thread.currentThread().interrupt();
+          throw new RpcError(StatusCode.CANCELLED, "hold: interrupted");
+        }
+      }
+      return codec.encode(new EchoReply("timeout", -1, new byte[0], "java"));
+    }
+  }
+
+  static final class Cancelled implements UnaryDispatcher {
+    @Override
+    public MethodDescriptor descriptor() {
+      return desc("cancelled", StreamingKind.UNARY);
+    }
+
+    @Override
+    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
+      return codec.encode(new EchoReply("cancelled", HOLD_CANCELLED.get(), new byte[0], "java"));
+    }
+  }
+
+  // ---- session-scoped InteropSession --------------------------------------
+
+  /** One instance per (connection, session id). */
+  public static final class SessionImpl {
+    int total;
+    int calls;
+  }
+
+  static final class SessionDispatcher implements ServiceDispatcher {
+    private final ServiceDescriptor descriptor =
+        new ServiceDescriptor("InteropSession", 1, Scope.SESSION, SessionImpl.class);
+
+    @Override
+    public ServiceDescriptor descriptor() {
+      return descriptor;
+    }
+
+    @Override
+    public Map<String, MethodDispatcher> methods() {
+      return Map.of("add", new Add());
+    }
+
+    @Override
+    public Map<String, Class<?>> requestClasses() {
+      return Map.of("add", EchoRequest.class);
+    }
+
+    @Override
+    public Map<String, Class<?>> responseClasses() {
+      return Map.of("add", EchoReply.class);
+    }
+
+    @Override
+    public void registerTypes(Fory fory) {
+      InteropEcho.registerTypes(fory);
+    }
+  }
+
+  static final class Add implements UnaryDispatcher {
+    @Override
+    public MethodDescriptor descriptor() {
+      return desc("add", StreamingKind.UNARY);
+    }
+
+    @Override
+    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
+      SessionImpl s = (SessionImpl) impl;
+      EchoRequest r = (EchoRequest) codec.decode(requestBytes, EchoRequest.class);
+      int total;
+      int calls;
+      synchronized (s) {
+        s.total += r.count;
+        s.calls++;
+        total = s.total;
+        calls = s.calls;
+      }
+      return codec.encode(new EchoReply("calls=" + calls, total, new byte[0], "java"));
+    }
+  }
+
   static AsterConfig config() {
     return AsterConfig.builder()
         .relayMode("disabled")
@@ -224,6 +383,7 @@ public final class InteropEcho {
             .config(config())
             .codec(codec)
             .service(new Impl(), new Dispatcher())
+            .sessionService(SessionImpl.class, peer -> new SessionImpl(), new SessionDispatcher())
             .build()
             .get(30, TimeUnit.SECONDS);
     NodeAddr addr = server.node().nodeAddr();
@@ -569,17 +729,187 @@ public final class InteropEcho {
                 }
                 return r.server_lang;
               });
+      ok &= runCase("bidi", () -> chatCase(client, addr));
+      ok &= runCase("deadline", () -> deadlineCase(client, addr, codec));
+      ok &= runCase("cancel", () -> cancelCase(client, addr));
+      ok &= runCase("session", () -> sessionCase(client, addr));
     }
     System.exit(ok ? 0 : 1);
   }
 
+  static int cancelledCount(AsterClient client, NodeAddr addr) throws Exception {
+    return client
+        .<EchoRequest, EchoReply>call(
+            addr, "InteropEcho", "cancelled", new EchoRequest("probe", 0, new byte[0]), EchoReply.class)
+        .get(10, TimeUnit.SECONDS)
+        .count;
+  }
+
+  static void expectServerCancel(AsterClient client, NodeAddr addr, int want) throws Exception {
+    int seen = 0;
+    for (int i = 0; i < 50; i++) {
+      seen = cancelledCount(client, addr);
+      if (seen >= want) {
+        return;
+      }
+      Thread.sleep(100);
+    }
+    throw new IllegalStateException(
+        "server never observed the cancellation (count " + seen + ", want " + want + ")");
+  }
+
+  static String chatCase(AsterClient client, NodeAddr addr) throws Exception {
+    String lang = "";
+    try (BidiCall<EchoRequest, EchoReply> call =
+        client.<EchoRequest, EchoReply>openBidiStream(addr, "InteropEcho", "chat", EchoReply.class)
+            .get(15, TimeUnit.SECONDS)) {
+      for (int i = 0; i < 3; i++) {
+        EchoRequest req = new EchoRequest("c" + i, 100 + i, new byte[] {(byte) i, 9});
+        call.send(req);
+        EchoReply r = call.recv();
+        if (r == null) {
+          throw new IllegalStateException("stream ended before reply " + i);
+        }
+        if (r.count != i || !r.message.equals(req.message) || !Arrays.equals(r.data, req.data)) {
+          throw new IllegalStateException("reply " + i + " mismatch");
+        }
+        lang = r.server_lang;
+      }
+      call.complete();
+      if (call.recv() != null) {
+        throw new IllegalStateException("unexpected extra reply");
+      }
+    }
+    if (lang.isEmpty()) {
+      throw new IllegalStateException("empty server_lang");
+    }
+    return lang;
+  }
+
+  /** {@code hold} with a 1 s deadline: DEADLINE_EXCEEDED, and the server observes it. */
+  static String deadlineCase(AsterClient client, NodeAddr addr, ForyCodec codec) throws Exception {
+    int before = cancelledCount(client, addr);
+    IrohConnection conn = client.connect(addr).get(15, TimeUnit.SECONDS);
+    Rpc.UnaryResult res =
+        Rpc.unary(
+            conn.runtime().nativeHandle(),
+            conn.nativeHandle(),
+            new Rpc.Options("InteropEcho", "hold", 1, 0, 1000, Map.of()),
+            codec.encode(new EchoRequest("hold", 0, new byte[0])));
+    if (res.code() != StatusCode.DEADLINE_EXCEEDED.value()) {
+      throw new IllegalStateException("expected DEADLINE_EXCEEDED, got code " + res.code());
+    }
+    expectServerCancel(client, addr, before + 1);
+    return "java";
+  }
+
+  /** {@code hold} cancelled by the client after 300 ms: the server observes it. */
+  static String cancelCase(AsterClient client, NodeAddr addr) throws Exception {
+    int before = cancelledCount(client, addr);
+    try (ServerStreamCall<EchoReply> call =
+        client
+            .<EchoRequest, EchoReply>openServerStream(
+                addr, "InteropEcho", "hold", new EchoRequest("hold", 0, new byte[0]), EchoReply.class)
+            .get(15, TimeUnit.SECONDS)) {
+      Thread.sleep(300);
+      call.cancel();
+      try {
+        EchoReply r = call.recv();
+        throw new IllegalStateException("hold returned " + r + " instead of CANCELLED");
+      } catch (RpcError e) {
+        if (e.code() != StatusCode.CANCELLED) {
+          throw new IllegalStateException("expected CANCELLED, got " + e.code());
+        }
+      }
+    }
+    expectServerCancel(client, addr, before + 1);
+    return "java";
+  }
+
+  /** Two sessions: state persists per session and is isolated between them. */
+  static String sessionCase(AsterClient client, NodeAddr addr) throws Exception {
+    ClientSession a = client.openSession(addr).get(15, TimeUnit.SECONDS);
+    ClientSession b = client.openSession(addr).get(15, TimeUnit.SECONDS);
+    Object[][] steps = {
+      {a, 5, 5, "calls=1"}, {a, 7, 12, "calls=2"}, {b, 1, 1, "calls=1"},
+      {a, 0, 12, "calls=3"}, {b, 10, 11, "calls=2"},
+    };
+    String lang = "";
+    for (int i = 0; i < steps.length; i++) {
+      ClientSession s = (ClientSession) steps[i][0];
+      EchoReply r =
+          s.<EchoRequest, EchoReply>call(
+                  "InteropSession",
+                  "add",
+                  new EchoRequest("add", (Integer) steps[i][1], new byte[0]),
+                  EchoReply.class)
+              .get(15, TimeUnit.SECONDS);
+      if (r.count != (Integer) steps[i][2] || !r.message.equals(steps[i][3])) {
+        throw new IllegalStateException(
+            "step " + i + ": got total " + r.count + " " + r.message + ", want total "
+                + steps[i][2] + " " + steps[i][3]);
+      }
+      lang = r.server_lang;
+    }
+    return lang;
+  }
+
+  // ---- expose mini-matrix (server only) -----------------------------------
+
+  static final byte[] EXPOSE_ALPN = "aster-expose/interop/1".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+  static void exposeServe() throws Exception {
+    IrohNode node = IrohNode.start(config(), List.of(EXPOSE_ALPN), null).get(30, TimeUnit.SECONDS);
+    Expose expose = Expose.create(node);
+    expose.exposeHttp(
+        "interop-http",
+        req -> {
+          if (req.method().equals("GET") && req.uri().equals("/hello")) {
+            return HttpResponse.text(200, "hello from java").header("x-server-lang", "java");
+          }
+          if (req.method().equals("POST") && req.uri().equals("/echo")) {
+            return HttpResponse.streaming(
+                    200,
+                    out -> {
+                      byte[] buf = new byte[8192];
+                      int n;
+                      while ((n = req.body().read(buf)) >= 0) {
+                        out.write(buf, 0, n);
+                      }
+                    })
+                .header("x-server-lang", "java");
+          }
+          return HttpResponse.of(404, new byte[0]).header("x-server-lang", "java");
+        },
+        null);
+    expose.serve(List.of(EXPOSE_ALPN));
+    NodeAddr addr = node.nodeAddr();
+    for (int i = 0; i < 100 && addr.directAddresses().isEmpty(); i++) {
+      Thread.sleep(50);
+      addr = node.nodeAddr();
+    }
+    System.out.println("ADDRESS " + addr.toTicket());
+    System.out.flush();
+    BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in));
+    while (stdin.readLine() != null) {
+      // serve until stdin closes
+    }
+    expose.close();
+    node.close();
+    System.exit(0);
+  }
+
   public static void main(String[] args) throws Exception {
     System.out.println("CONTRACT_ID " + ContractManifestBuilder.computeContractId(new Dispatcher()));
+    System.out.println(
+        "SESSION_CONTRACT_ID " + ContractManifestBuilder.computeContractId(new SessionDispatcher()));
     System.out.flush();
     if (args.length == 1 && args[0].equals("contract")) {
       System.exit(0);
     } else if (args.length >= 1 && args[0].equals("server")) {
       serve();
+    } else if (args.length == 1 && args[0].equals("expose-server")) {
+      exposeServe();
     } else if (args.length == 2 && args[0].equals("client")) {
       client(args[1]);
     } else if (args.length >= 2 && args[0].equals("bench")) {

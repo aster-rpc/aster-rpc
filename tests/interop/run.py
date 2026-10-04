@@ -83,7 +83,14 @@ EXPOSE_CASES = ("expose_hello", "expose_echo_stream")
 # language. A listed case that FAILs is reported XFAIL and does not fail the
 # run; one that PASSes is XPASS and does (remove the entry). Keep empty unless
 # a binding bug blocks a case, and say which bug.
-EXPECTED_FAIL: dict[tuple[str, str, str, str], str] = {}
+EXPECTED_FAIL: dict[tuple[str, str, str, str], str] = {
+    ("rpc", "java", "*", "cancel"):
+        "Java server: unary handlers get no cancellation signal (AsterServer ignores EVENT_CANCELLED; "
+        "CallContext has no hook), so a client cancel never reaches `hold`",
+    ("rpc", "go", "*", "cancel"):
+        "Go server: unary handlers get no cancellable ctx on peer cancel "
+        "(bindings/go/rpc_server.go onCall registers s.cancels only for non-unary calls)",
+}
 
 ENV = {
     **os.environ,
@@ -358,16 +365,13 @@ def report(matrix: str, title: str, servers: list[str], clients: list[str], case
             row += f"{good}/{len(cases):<{w - 2}}"
         print(f"{s:<16}{row}")
 
-    print(f"\n{title}: per-case (rows server>client, '.' pass, 'F' FAIL, 'x' expected fail, 'P' unexpected pass)")
+    print(f"\n{title}: per case (cells passed / total; failing cells are server>client)")
     name_w = max(len(c) for c in cases)
-    print(" " * 18 + " ".join(c[:6].ljust(6) for c in cases))
-    sym = {"PASS": ".", "FAIL": "F", "XFAIL": "x", "XPASS": "P"}
-    for s in servers:
-        for c in clients:
-            st = results.get((s, c), {})
-            cells = " ".join(sym.get(st.get(case, "FAIL"), "F").ljust(6) for case in cases)
-            print(f"{s + '>' + c:<18}{cells}")
-    del name_w
+    for case in cases:
+        sts = {k: st.get(case, "FAIL") for k, st in results.items()}
+        good = sum(v in ("PASS", "XFAIL") for v in sts.values())
+        bad = [f"{s}>{c}" + ("(xfail)" if v == "XFAIL" else "") for (s, c), v in sts.items() if v != "PASS"]
+        print(f"  {case:<{name_w}}  {good}/{len(sts)}" + (f"  not passing: {', '.join(bad)}" if bad else ""))
 
     ok = True
     problems = [(k, case, v) for k, st in results.items() for case, v in st.items() if v in ("FAIL", "XPASS")]
@@ -418,8 +422,6 @@ def main() -> int:
         missing = [f"{lang} ({'/'.join(t)})" for lang, t in OPTIONAL_TOOLS.items() if lang not in DEFAULT_LANGS]
         if missing:
             sys.exit(f"--require-all: toolchain missing for: {', '.join(missing)}")
-        if args.servers == ",".join(DEFAULT_LANGS) and args.clients == ",".join(DEFAULT_LANGS):
-            pass  # defaults already cover every language
     servers = [s for s in args.servers.split(",") if s]
     clients = [c for c in args.clients.split(",") if c]
     for lang, tools in OPTIONAL_TOOLS.items():

@@ -9,7 +9,10 @@
  *   bun run interop_echo.ts server            # ASTER_RELAY_MODE=disabled ASTER_BIND_ADDR=127.0.0.1:0
  *   bun run interop_echo.ts client <aster1…>
  *
- * Output protocol (parsed by tests/interop/run.py): `CONTRACT_ID <hex>`,
+ *   bun run interop_echo.ts expose-server     # expose mini-matrix: HTTP service `interop-http`
+ *
+ * Contract and semantics: tests/interop/rust/contract.rs. Output protocol (parsed
+ * by tests/interop/run.py): `CONTRACT_ID <hex>`, `SESSION_CONTRACT_ID <hex>`,
  * `ADDRESS <aster1…>` (server), `CASE <name> OK|FAIL …` (client).
  */
 
@@ -25,13 +28,18 @@ import {
   fromServiceInfo,
   setNativeContract,
   i32,
+  Node,
+  RpcError,
+  StatusCode,
 } from '@aster-rpc/aster';
 import { loadNative } from '@aster-rpc/aster/native.js';
 import { SERVICES, WIRE_TYPES, BUILD_ALL_TYPES } from './aster-rpc.generated.ts';
-import { InteropEcho } from './src/service.ts';
+import { InteropEcho, InteropSession } from './src/service.ts';
 import { EchoRequest, EchoReply } from './src/types.ts';
 
 const RPC_ALPN = Buffer.from('aster/1');
+const EXPOSE_ALPN = 'aster-expose/interop/1';
+const EXPOSE_SERVICE = 'interop-http';
 
 /** The shared cases. Must match `cases()` in the Rust and Python drivers. */
 function cases(clientLang: string): [string, EchoRequest][] {
@@ -70,9 +78,9 @@ function registerAll() {
   return codec;
 }
 
-function contractId(): string {
+function contractId(cls: any = InteropEcho): string {
   setNativeContract(loadNative() as any);
-  return contractIdFromContract(fromServiceInfo(getServiceInfo(InteropEcho) as any));
+  return contractIdFromContract(fromServiceInfo(getServiceInfo(cls) as any));
 }
 
 async function waitStdinEof(): Promise<void> {
@@ -87,7 +95,7 @@ async function serve(): Promise<void> {
   process.env.ASTER_RELAY_MODE ??= 'disabled';
   process.env.ASTER_BIND_ADDR ??= '127.0.0.1:0';
   const server = new AsterServer({
-    services: [new InteropEcho()],
+    services: [new InteropEcho(), new InteropSession()],
     allowAllConsumers: true,
     generated,
     config: { logLevel: 'warn' } as any,
@@ -135,12 +143,17 @@ async function runClient(ticket: string): Promise<boolean> {
       console.log(`CASE ${name} FAIL ${String(e).split('\n')[0]}`);
     }
   }
+  const transport = new IrohTransport(conn, codec);
   for (const [name, run] of [
     ['server_stream', () => streamCase(client)],
     ['client_stream', () => ingestCase(client)],
+    ['bidi', () => chatCase(client)],
+    ['deadline', () => deadlineCase(client)],
+    ['cancel', () => cancelCase(client)],
+    ['session', () => sessionCase(transport)],
   ] as [string, () => Promise<string>][]) {
     try {
-      console.log(`CASE ${name} OK server_lang=${await withTimeout(run(), 15_000)}`);
+      console.log(`CASE ${name} OK server_lang=${await withTimeout(run(), 30_000)}`);
     } catch (e) {
       allOk = false;
       console.log(`CASE ${name} FAIL ${String(e).split('\n')[0]}`);
@@ -179,6 +192,128 @@ async function ingestCase(client: any): Promise<string> {
   return reply.server_lang;
 }
 
+/** `chat`, interleaved: send c<i>, read its reply, three times; then end the requests and expect the stream to end. */
+async function chatCase(client: any): Promise<string> {
+  const ch = client.chat();
+  const it = ch[Symbol.asyncIterator]();
+  let lang = '';
+  for (let i = 0; i < 3; i++) {
+    const req = new EchoRequest({ message: `c${i}`, count: i32(100 + i), data: new Uint8Array([i, 9]) });
+    await ch.send(req);
+    const step = await it.next();
+    if (step.done) throw new Error(`stream ended before reply ${i}`);
+    const r = step.value as EchoReply;
+    if (r.count !== i || r.message !== req.message || Buffer.compare(Buffer.from(r.data), Buffer.from(req.data)) !== 0) {
+      throw new Error(`reply ${i} mismatch: ${JSON.stringify(r)}`);
+    }
+    lang = r.server_lang;
+  }
+  await ch.close();
+  const end = await it.next();
+  if (!end.done) throw new Error(`unexpected extra reply ${JSON.stringify(end.value)}`);
+  if (!lang) throw new Error('empty server_lang');
+  return lang;
+}
+
+const probe = () => new EchoRequest({ message: 'probe' });
+
+async function cancelledCount(client: any): Promise<number> {
+  return ((await withTimeout(client.cancelled(probe()), 10_000)) as EchoReply).count;
+}
+
+async function expectServerCancel(client: any, want: number): Promise<void> {
+  let seen = 0;
+  for (let i = 0; i < 50; i++) {
+    seen = await cancelledCount(client);
+    if (seen >= want) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`server never observed the cancellation (count ${seen}, want ${want})`);
+}
+
+/** `hold` with a 1 s deadline: DEADLINE_EXCEEDED, and the server observes a cancellation. */
+async function deadlineCase(client: any): Promise<string> {
+  const before = await cancelledCount(client);
+  let r: unknown;
+  try {
+    r = await withTimeout(client.hold(new EchoRequest({ message: 'hold' }), { deadlineSecs: 1 }), 15_000);
+  } catch (e) {
+    if (!(e instanceof RpcError) || e.code !== StatusCode.DEADLINE_EXCEEDED) {
+      throw new Error(`expected DEADLINE_EXCEEDED, got ${String(e)}`);
+    }
+    await expectServerCancel(client, before + 1);
+    return 'ts';
+  }
+  throw new Error(`hold returned ${JSON.stringify(r)} instead of an error`);
+}
+
+/** `hold` cancelled by the client (AbortSignal) after 300 ms: the server observes it. */
+async function cancelCase(client: any): Promise<string> {
+  const before = await cancelledCount(client);
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 300);
+  let r: unknown;
+  try {
+    r = await withTimeout(client.hold(new EchoRequest({ message: 'hold' }), { signal: ac.signal }), 15_000);
+  } catch (e) {
+    if (!(e instanceof RpcError) || e.code !== StatusCode.CANCELLED) {
+      throw new Error(`expected CANCELLED, got ${String(e)}`);
+    }
+    await expectServerCancel(client, before + 1);
+    return 'ts';
+  }
+  throw new Error(`hold returned ${JSON.stringify(r)} before the client cancelled it`);
+}
+
+/** Two sessions on one connection: state persists per session, isolated between them. */
+async function sessionCase(transport: IrohTransport): Promise<string> {
+  const a: any = createClient(InteropSession, transport.openSession());
+  const b: any = createClient(InteropSession, transport.openSession());
+  const steps: [any, number, number, string][] = [
+    [a, 5, 5, 'calls=1'], [a, 7, 12, 'calls=2'], [b, 1, 1, 'calls=1'], [a, 0, 12, 'calls=3'], [b, 10, 11, 'calls=2'],
+  ];
+  let lang = '';
+  for (const [i, [s, add, total, calls]] of steps.entries()) {
+    const r = (await s.add(new EchoRequest({ message: 'add', count: i32(add) }))) as EchoReply;
+    if (r.count !== total || r.message !== calls) {
+      throw new Error(`step ${i}: got total ${r.count} ${r.message}, want total ${total} ${calls}`);
+    }
+    lang = r.server_lang;
+  }
+  if (!lang) throw new Error('empty server_lang');
+  return lang;
+}
+
+/** Expose mini-matrix server: `GET /hello`, `POST /echo` (request body streamed back). */
+async function exposeServe(): Promise<void> {
+  const node = await Node.start({ alpns: [EXPOSE_ALPN], relayMode: 'disabled', bindAddr: '127.0.0.1:0' } as any);
+  const expose = node.expose();
+  const headers = { 'x-server-lang': 'ts' };
+  expose.exposeHttp(EXPOSE_SERVICE, async (req: any) => {
+    if (req.method === 'GET' && req.uri === '/hello') return { status: 200, headers, body: 'hello from ts' };
+    if (req.method === 'POST' && req.uri === '/echo') {
+      async function* echo() {
+        if (Buffer.isBuffer(req.body)) yield req.body;
+        else for await (const c of req.body) yield c;
+      }
+      return { status: 200, headers, body: echo() };
+    }
+    return { status: 404, headers, body: '' };
+  });
+  node.serveExpose(expose, [EXPOSE_ALPN]);
+  for (let i = 0; i < 100 && !node.directAddresses().length; i++) await new Promise((r) => setTimeout(r, 50));
+  const native = loadNative();
+  const ticket = native.asterTicketToString({
+    endpointId: node.id,
+    relayAddr: undefined,
+    directAddrs: node.directAddresses(),
+  } as any);
+  console.log(`ADDRESS ${ticket}`);
+  await waitStdinEof();
+  await node.close();
+  process.exit(0);
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     p,
@@ -192,14 +327,17 @@ const mode = process.argv[2];
 if (mode !== 'server') registerAll();
 else registerGenerated({ ...generated });
 console.log(`CONTRACT_ID ${contractId()}`);
+console.log(`SESSION_CONTRACT_ID ${contractId(InteropSession)}`);
 
 if (mode === 'contract') {
   process.exit(0);
 } else if (mode === 'server') {
   await serve();
+} else if (mode === 'expose-server') {
+  await exposeServe();
 } else if (mode === 'client' && process.argv[3]) {
   process.exit((await runClient(process.argv[3])) ? 0 : 1);
 } else {
-  console.error('usage: interop_echo.ts contract | server | client <aster1-ticket>');
+  console.error('usage: interop_echo.ts contract | server | client <aster1-ticket> | expose-server');
   process.exit(2);
 }
