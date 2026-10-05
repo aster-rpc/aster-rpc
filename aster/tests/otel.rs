@@ -61,6 +61,7 @@ fn child() {
             "pass_through_then_hidden" => case_pass_through_then_hidden().await,
             "init_after_server_start" => case_init_after_server_start().await,
             "shutdown_then_reinit" => case_shutdown_then_reinit().await,
+            "log_bridge_trace_ids" => case_log_bridge_trace_ids().await,
             #[cfg(feature = "binding-support")]
             "foreign_spans" => foreign::case_foreign_spans().await,
             other => panic!("unknown case {other}"),
@@ -184,8 +185,9 @@ fn value(t: &TestExporters, metric: &str, want: &[(&str, &str)]) -> f64 {
 
 // ── services ────────────────────────────────────────────────────────────────
 
-/// `test.Echo`: `unary` echoes, `fails` answers NOT_FOUND, `meta` answers
-/// with the metadata the handler sees (`k=v` lines).
+/// `test.Echo`: `unary` echoes, `fails` answers NOT_FOUND, `log` emits one
+/// `tracing` event from the handler and echoes, `meta` answers with the
+/// metadata the handler sees (`k=v` lines).
 struct Echo;
 
 #[async_trait::async_trait]
@@ -197,7 +199,7 @@ impl ServiceDispatch for Echo {
         1
     }
     fn methods(&self) -> &[&str] {
-        &["unary", "fails", "meta"]
+        &["unary", "fails", "log", "meta"]
     }
     async fn dispatch(&self, method: &str, mut call: Call) {
         let req = call.recv_request().await.unwrap_or_default();
@@ -209,6 +211,10 @@ impl ServiceDispatch for Echo {
                 let _ = call
                     .finish(&RpcStatus::error(StatusCode::NotFound, "nope"))
                     .await;
+            }
+            "log" => {
+                tracing::info!(target: "aster::test::handler", order = "example-1", "handler-log");
+                let _ = call.respond(req, &RpcStatus::ok()).await;
             }
             _ => {
                 let h = call.header();
@@ -390,6 +396,53 @@ async fn case_names_and_attributes() {
         1
     );
     aster_otel::shutdown().unwrap();
+}
+
+/// O4: a `tracing` event a handler emits inside its call's `rpc` span reaches
+/// the binding log bridge with that server span's trace id and span id, the
+/// call id, and the call's service and method (design §3.1).
+async fn case_log_bridge_trace_ids() {
+    let t = TestExporters::new();
+    let mut cfg = test_cfg(&t);
+    cfg.log_bridge = Some(true);
+    cfg.log_filter = Some("warn,aster=info".into());
+    let _h = aster_otel::init(cfg).unwrap();
+    let mut drain = aster_otel::bridge::drain().unwrap();
+    let (_server, _client, _handle, conn) = echo_server().await;
+
+    let resp = within(conn.unary(&header("test.Echo", "log"), vec![7]))
+        .await
+        .unwrap();
+    assert_eq!(resp, [7]);
+
+    let mut rec = None;
+    for _ in 0..100 {
+        rec = drain
+            .try_drain(256)
+            .into_iter()
+            .find(|r| r.message == "handler-log");
+        if rec.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let rec = rec.expect("the handler's record reached the bridge");
+    let spans = spans_named(&t, "test.Echo/log", 2).await;
+    let server = of_kind(&spans, SpanKind::Server);
+    assert!(rec.has_trace() && rec.in_call(), "{rec:?}");
+    assert_eq!(
+        TraceId::from_bytes(rec.trace_id),
+        server.span_context.trace_id()
+    );
+    assert_eq!(
+        SpanId::from_bytes(rec.span_id),
+        server.span_context.span_id()
+    );
+    assert_eq!(attr(server, "aster.call_id"), Some(rec.call_id.to_string()));
+    assert_eq!(rec.field("rpc.service"), Some("test.Echo"));
+    assert_eq!(rec.field("rpc.method"), Some("log"));
+    assert_eq!(rec.field("order"), Some("example-1"));
+    assert_eq!(rec.target, "aster::test::handler");
 }
 
 /// Client → Relay (node B) → Echo (node A): one trace, each span the parent
@@ -675,6 +728,11 @@ mod foreign {
 #[test]
 fn instrument_and_span_names_and_attributes() {
     run("names_and_attributes");
+}
+
+#[test]
+fn handler_logs_reach_the_bridge_with_the_server_span_ids() {
+    run("log_bridge_trace_ids");
 }
 
 #[test]
