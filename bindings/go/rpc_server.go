@@ -95,7 +95,7 @@ type AsterServer struct {
 	// mu guards cancels and sessions.
 	mu sync.Mutex
 	// cancels: each live call's context cancel, fired on CANCELLED.
-	cancels map[uint64]context.CancelFunc
+	cancels map[uint64]callCancel
 	// sessions: Rust session_key -> instance record (created on the poll
 	// goroutine ahead of the session's SESSION_CLOSED).
 	sessions map[uint64]*sessionRecord
@@ -192,7 +192,7 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		byIndex: append([]*Service(nil), opts.Services...), icpts: opts.Interceptors,
 		onClosed: opts.OnConnectionClosed, onNonRPC: opts.OnNonRPC,
 		logger: logger, ctx: sctx, cancel: cancel,
-		cancels: map[uint64]context.CancelFunc{}, sessions: map[uint64]*sessionRecord{},
+		cancels: map[uint64]callCancel{}, sessions: map[uint64]*sessionRecord{},
 		peers: map[uint64]string{},
 	}
 	s.pollWG.Add(1)
@@ -299,11 +299,19 @@ func (s *AsterServer) onEvent(ev *C.aster_dispatch_event_t) {
 		// Peer cancel (no trailer), deadline / corrupt request (Rust already
 		// answered): end the handler's context.
 		s.mu.Lock()
-		cancel := s.cancels[uint64(ev.call_id)]
+		cc, ok := s.cancels[uint64(ev.call_id)]
 		s.mu.Unlock()
-		if cancel != nil {
-			cancel()
+		if !ok {
+			break
 		}
+		if ev.reason == C.ASTER_CANCEL_REASON_DEADLINE && !cc.deadline.IsZero() {
+			// The handler's context carries the same deadline: let it end
+			// that way (ctx.Err() == DeadlineExceeded, not Canceled), with
+			// a backstop should the local clock lag Rust's.
+			time.AfterFunc(time.Until(cc.deadline)+deadlineCancelGrace, cc.cancel)
+			break
+		}
+		cc.cancel()
 	case dispatchEventSessionClosed:
 		s.mu.Lock()
 		rec := s.sessions[uint64(ev.session_key)]
@@ -408,12 +416,27 @@ func (s *AsterServer) onCall(ev *C.aster_dispatch_event_t) {
 	// unary call as CANCELLED{PEER} too. Registered here, ahead of the call's
 	// CANCELLED event.
 	in.ctx, in.cancel = context.WithCancel(s.ctx)
+	if !in.deadline.IsZero() {
+		cctx, ccancel := in.ctx, in.cancel
+		dctx, dcancel := context.WithDeadline(cctx, in.deadline)
+		in.ctx, in.cancel = dctx, func() { dcancel(); ccancel() }
+	}
 	s.mu.Lock()
-	s.cancels[in.callID] = in.cancel
+	s.cancels[in.callID] = callCancel{cancel: in.cancel, deadline: in.deadline}
 	s.mu.Unlock()
 	s.calls.Add(1)
 	go s.serve(in)
 }
+
+// callCancel ends one live call's handler context.
+type callCancel struct {
+	cancel   context.CancelFunc
+	deadline time.Time
+}
+
+// deadlineCancelGrace: how long after its deadline a call cancelled by Rust
+// for DEADLINE waits for its own context deadline before being cancelled.
+const deadlineCancelGrace = 250 * time.Millisecond
 
 func (s *AsterServer) serve(in inbound) {
 	defer s.calls.Done()
