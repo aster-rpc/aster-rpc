@@ -21,6 +21,8 @@
 //!   `aster::rpc` dynamic dispatch) and `RpcClient` (pooled `RpcConnection`)
 //! - expose.rs: `Expose` (socket targets) + `relay_request`, minimal, for
 //!   the R6 expose authorize hook
+//! - observability.rs: `aster-otel` pipeline, log bridge drain, instruments,
+//!   spans and the `HealthServer` ops listener (observability O6)
 //! - error.rs: Exception types
 //!
 //! The protocol clients and bare endpoints still drive the transport
@@ -46,6 +48,7 @@ mod lease;
 mod monitor;
 mod net;
 mod node;
+mod observability;
 mod rpc;
 mod ticket;
 mod topology;
@@ -113,6 +116,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     coordination::register(py, m)?;
     rpc::register(py, m)?;
     upcall::register(py, m)?;
+    observability::register(py, m)?;
     expose::register(py, m)?;
 
     Ok(())

@@ -67,6 +67,9 @@ pub(crate) const FIELDS: &[&str] = &[
     "log_format",
     "log_level",
     "log_mask",
+    "health_port",
+    "health_host",
+    "health_enabled",
     "identity_file",
     "alpns",
 ];
@@ -255,6 +258,9 @@ fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult
         "log_format" => c.log_format = v.extract::<String>()?.trim().to_ascii_lowercase(),
         "log_level" => c.log_level = v.extract::<String>()?.trim().to_ascii_lowercase(),
         "log_mask" => c.log_mask = strict_bool(key, v)?,
+        "health_port" => c.health_port = v.extract()?,
+        "health_host" => c.health_host = opt_str(v)?.unwrap_or_else(|| "127.0.0.1".to_string()),
+        "health_enabled" => c.health_enabled = opt_bool(key, v)?,
         "identity_file" => c.identity_file = opt_path(v)?,
         "alpns" => {
             let mut out: Vec<Vec<u8>> = Vec::new();
@@ -473,6 +479,9 @@ impl NativeAsterConfig {
         d.set_item("log_format", c.log_format.clone())?;
         d.set_item("log_level", c.log_level.clone())?;
         d.set_item("log_mask", c.log_mask)?;
+        d.set_item("health_port", c.health_port)?;
+        d.set_item("health_host", c.health_host.clone())?;
+        d.set_item("health_enabled", c.health_enabled)?;
         d.set_item("identity_file", path_str(&c.identity_file))?;
         let alpns = PyList::empty(py);
         for a in &c.alpns {

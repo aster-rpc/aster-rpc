@@ -296,11 +296,6 @@ impl Node {
         })
     }
 
-    /// Transport metrics in Prometheus text exposition format.
-    fn transport_metrics_prometheus(&self) -> String {
-        self.inner.metrics_prometheus()
-    }
-
     /// Gracefully shut down the node (flushes persistent state first).
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let node = self.inner.clone();

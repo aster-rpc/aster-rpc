@@ -12,15 +12,20 @@ crate-type = ["cdylib"]
 [dependencies]
 # The `aster` crate is the binding's backend (plan D1): Node, AsterConfig and
 # its env/TOML loaders, typed ids, the secret-key file. Binding profile =
-# default + rpc + metrics + binding-support + coordination-client (plan D7:
+# default + rpc + binding-support + coordination-client (plan D7:
 # the coordination client is wrapped, never ported; see aster/Cargo.toml)
-# + expose (socket targets with a Python authorize hook by upcall, R6).
-aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support", "coordination-client", "expose"] }
+# + expose (socket targets with a Python authorize hook by upcall, R6)
+# + otel + health (observability O6: the built-in RPC metrics and spans, the
+# ops listener, all over the Rust pipeline in `aster-otel`).
+aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "binding-support", "coordination-client", "expose", "otel", "health"] }
 # Transport core, still driven directly for the reactor ring, client-call
 # pool, tunnels and bare endpoints (reached from `aster` handles through
 # `aster::binding_support`).
 aster_transport_core = { path = "../../../core", version = "=0.3.0" }
-aster-otel = { path = "../../../aster-otel", version = "=0.3.0" }
+# The observability pipeline (init, log bridge, instruments, spans). `otlp-logs`
+# is the application-log appender (path B, design 3.4); `prometheus` is the
+# pull reader `health` already requires.
+aster-otel = { path = "../../../aster-otel", version = "=0.3.0", features = ["otlp-logs", "prometheus"] }
 
 # Python FFI
 pyo3        = { workspace = true }
