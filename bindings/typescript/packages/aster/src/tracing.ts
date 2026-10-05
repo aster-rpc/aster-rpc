@@ -37,6 +37,54 @@ export interface TraceContext {
 
 const carrier = new AsyncLocalStorage<TraceContext>();
 
+/**
+ * Inbound baggage of a call whose server span is not exported (no trace
+ * context to hang it on): `currentBaggage()` still sees it.
+ */
+const baggageOnly = new AsyncLocalStorage<Readonly<Record<string, string>>>();
+
+/** The baggage of the running context, with or without a trace id. */
+function activeBaggage(): Readonly<Record<string, string>> | undefined {
+  return carrier.getStore()?.baggage ?? baggageOnly.getStore();
+}
+
+/** Parse a W3C `baggage` header (properties after `;` are dropped). @internal */
+export function parseBaggage(value: string | null | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!value) return out;
+  for (const member of value.split(',')) {
+    const pair = member.split(';', 1)[0]!;
+    const i = pair.indexOf('=');
+    if (i <= 0) continue;
+    const k = pair.slice(0, i).trim();
+    if (!k) continue;
+    try {
+      out[decodeURIComponent(k)] = decodeURIComponent(pair.slice(i + 1).trim());
+    } catch {
+      // A member with a bad escape is skipped.
+    }
+  }
+  return out;
+}
+
+/**
+ * Run `fn` as an inbound call: the server span's `traceparent` (when it is
+ * exported) and the caller's `baggage` header (off the dispatch event; Rust
+ * hides the reserved keys from metadata) become the current context. Baggage
+ * is visible whether or not the span is exported. @internal
+ */
+export function withInboundTrace<T>(
+  traceparent: string | null | undefined,
+  baggage: string | null | undefined,
+  fn: () => T,
+): T {
+  const members = baggage ? parseBaggage(baggage) : undefined;
+  const hasMembers = members !== undefined && Object.keys(members).length > 0;
+  const ctx = parseTraceparent(traceparent, hasMembers ? members : undefined);
+  if (ctx) return carrier.run(ctx, fn);
+  return hasMembers ? baggageOnly.run(members, fn) : fn();
+}
+
 const TRACEPARENT_RE = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
 
 /** Parse a W3C `traceparent` (version 00). `undefined` when malformed. @group Tracing */
@@ -75,7 +123,7 @@ export function currentSpanId(): string | undefined {
 
 /** Baggage of the current context (empty when none). @group Tracing */
 export function currentBaggage(): Readonly<Record<string, string>> {
-  return carrier.getStore()?.baggage ?? {};
+  return activeBaggage() ?? {};
 }
 
 /** The current context as a `traceparent`, if any. @group Tracing */
@@ -107,10 +155,11 @@ export function withTraceContext<T>(
  */
 export function traceMetadata(): Record<string, string> {
   const c = carrier.getStore();
-  if (!c) return {};
-  const out: Record<string, string> = { traceparent: formatTraceparent(c) };
-  if (c.baggage) {
-    const members = Object.entries(c.baggage).map(
+  const out: Record<string, string> = {};
+  if (c) out.traceparent = formatTraceparent(c);
+  const baggage = c?.baggage ?? baggageOnly.getStore();
+  if (baggage) {
+    const members = Object.entries(baggage).map(
       ([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`,
     );
     if (members.length) out.baggage = members.join(',');
@@ -212,9 +261,8 @@ export function span(name: string, options: SpanOptions = {}): Span {
     currentTraceparent() ?? null,
     stringify(options.attributes),
   );
-  const cur = carrier.getStore();
   const tp = native.spanContext(handle);
-  const parsed = tp ? parseTraceparent(tp, cur?.baggage) : undefined;
+  const parsed = tp ? parseTraceparent(tp, activeBaggage()) : undefined;
   return new Span(handle, parsed);
 }
 

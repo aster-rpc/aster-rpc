@@ -33,6 +33,13 @@ export interface InstrumentOptions {
   autoAttrs?: string[];
   /** Series limit override; `0`/unset = the SDK default (2000). Not active yet. */
   cardinalityLimit?: number;
+  /**
+   * Histograms only: explicit bucket upper bounds, finite and strictly
+   * increasing. Unset: a histogram with unit `'s'` gets the RPC duration
+   * buckets (0.005 .. 10 s, like `aster.rpc.server.duration`); any other
+   * unit gets the SDK default, which is millisecond-scaled.
+   */
+  boundaries?: number[];
 }
 
 /** Attribute values are stringified. @group Metrics */
@@ -99,6 +106,7 @@ abstract class Instrument {
       this.options.unit,
       this.options.autoAttrs,
       this.options.cardinalityLimit,
+      this.options.boundaries,
     );
     return this.#handle;
   }

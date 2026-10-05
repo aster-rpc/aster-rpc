@@ -28,6 +28,11 @@ text), or call :func:`prometheus_text` in-process.
 Prometheus text appends the unit to the name (``unit="s"`` renders
 ``..._seconds``) and ``_total`` to counters.
 
+Histogram buckets: a histogram in seconds (``unit="s"``) gets the RPC duration
+buckets (0.005 .. 10 s, like ``aster.rpc.server.duration``); pass
+``boundaries=[...]`` (finite, strictly increasing) for others. Any other unit
+without ``boundaries`` gets the SDK default, which is millisecond-scaled.
+
 ``auto_attrs`` (attribute keys merged in from the call being handled) and
 ``cardinality_limit`` are accepted and recorded, but have no effect yet.
 """
@@ -74,8 +79,10 @@ class _Instrument:
         *,
         auto_attrs: Sequence[str] = (),
         cardinality_limit: int = 0,
+        boundaries: Sequence[float] | None = None,
     ) -> None:
         self.name = name
+        self.boundaries = tuple(float(b) for b in boundaries) if boundaries else ()
         self.description = description
         self.unit = unit
         self.auto_attrs = tuple(auto_attrs)
@@ -91,6 +98,7 @@ class _Instrument:
             self.unit,
             list(self.auto_attrs),
             self.cardinality_limit,
+            list(self.boundaries) or None,
         )
 
     def _record(self, fn: Callable[..., None], value: Any, attrs: Attrs) -> None:
@@ -157,8 +165,18 @@ def up_down_counter(name: str, description: str = "", unit: str = "", *, auto_at
     return UpDownCounter(name, description, unit, auto_attrs=auto_attrs, cardinality_limit=cardinality_limit)
 
 
-def histogram(name: str, description: str = "", unit: str = "", *, auto_attrs: Sequence[str] = (), cardinality_limit: int = 0) -> Histogram:
-    return Histogram(name, description, unit, auto_attrs=auto_attrs, cardinality_limit=cardinality_limit)
+def histogram(
+    name: str,
+    description: str = "",
+    unit: str = "",
+    *,
+    boundaries: Sequence[float] | None = None,
+    auto_attrs: Sequence[str] = (),
+    cardinality_limit: int = 0,
+) -> Histogram:
+    return Histogram(
+        name, description, unit, boundaries=boundaries, auto_attrs=auto_attrs, cardinality_limit=cardinality_limit
+    )
 
 
 def gauge(name: str, description: str = "", unit: str = "", *, auto_attrs: Sequence[str] = (), cardinality_limit: int = 0) -> Gauge:

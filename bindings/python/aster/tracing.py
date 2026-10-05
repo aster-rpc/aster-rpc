@@ -63,12 +63,19 @@ _KINDS = {
     "internal": 0, "server": 1, "client": 2, "producer": 3, "consumer": 4,
 }
 
-# (traceparent, baggage) of the current context, or None.
-_carrier: contextvars.ContextVar[tuple[str, Mapping[str, str]] | None] = contextvars.ContextVar(
+# (traceparent, baggage) of the current context, or None. The traceparent is
+# None for a call that carries inbound baggage but whose server span is not
+# exported.
+_carrier: contextvars.ContextVar[tuple[str | None, Mapping[str, str]] | None] = contextvars.ContextVar(
     "aster_trace_context", default=None
 )
 
 _NO_BAGGAGE: Mapping[str, str] = {}
+
+# W3C baggage limits (Rust enforces them when it strips the header; this is
+# for the pass-through path, where the header stays in metadata).
+_BAGGAGE_MAX_BYTES = 8192
+_BAGGAGE_MAX_MEMBERS = 64
 
 
 def current_traceparent() -> str | None:
@@ -80,13 +87,13 @@ def current_traceparent() -> str | None:
 def current_trace_id() -> str | None:
     """The current trace id (32 lowercase hex characters), or None."""
     c = _carrier.get()
-    return c[0][3:35] if c else None
+    return c[0][3:35] if c and c[0] else None
 
 
 def current_span_id() -> str | None:
     """The current span id (16 lowercase hex characters), or None."""
     c = _carrier.get()
-    return c[0][36:52] if c else None
+    return c[0][36:52] if c and c[0] else None
 
 
 def current_baggage() -> dict[str, str]:
@@ -151,7 +158,8 @@ def inject(metadata: Mapping[str, str] | None) -> Mapping[str, str] | None:
     if c is None or (metadata and "traceparent" in metadata):
         return metadata
     out = dict(metadata) if metadata else {}
-    out["traceparent"] = c[0]
+    if c[0]:
+        out["traceparent"] = c[0]
     if c[1] and "baggage" not in out:
         out["baggage"] = _format_baggage(c[1])
     return out
@@ -170,14 +178,20 @@ class _CallScope:
     def __enter__(self) -> None:
         call = self._call
         tp = call.trace_parent
-        if tp is None:
+        # Inbound baggage comes off the call (Rust strips the reserved keys
+        # from metadata), whether or not the call's span is exported.
+        raw = call.baggage
+        if raw is None and tp is None and call.has_metadata():
+            # No tracing pipeline: trace keys pass through as plain metadata.
+            raw = call.metadata().get("baggage")
+            if raw and (len(raw) > _BAGGAGE_MAX_BYTES or raw.count(",") >= _BAGGAGE_MAX_MEMBERS):
+                raw = None
+        baggage = _parse_baggage(raw) if raw else _NO_BAGGAGE
+        if tp is None and not baggage:
             if _carrier.get() is None:
                 return
             value = None
         else:
-            baggage = _NO_BAGGAGE
-            if call.has_metadata():
-                baggage = _parse_baggage(call.metadata().get("baggage"))
             value = (tp, baggage)
         self._token = _carrier.set(value)
 

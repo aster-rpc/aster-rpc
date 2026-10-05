@@ -29,7 +29,8 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use aster::binding_support::dispatch::{
-    CallHandle, CancelReason, DispatchEvent, PeerAttributes, RingConsumer, RingSink, SubmitError,
+    CallHandle, CancelReason, DispatchEvent, InboundTrace, PeerAttributes, RingConsumer, RingSink,
+    SubmitError,
 };
 use aster::binding_support::CoreConnection;
 use aster::rpc::baseline::{NodeIdentity, NodeInfo, NodeInfoServer};
@@ -333,6 +334,7 @@ fn event_to_py(py: Python<'_>, ev: DispatchEvent) -> PyResult<Option<Bound<'_, P
                     trace_parent: call.trace_context.as_ref().map(|c| {
                         crate::observability::call_traceparent(c.trace_id, c.span_id, c.trace_flags)
                     }),
+                    inbound_trace: call.inbound_trace,
                     handle: call.handle,
                 },
             )?
@@ -428,6 +430,8 @@ pub struct ServerCall {
     /// W3C `traceparent` of the call's server span (set when the span is
     /// exported; the parent of binding spans and the source of log trace ids).
     trace_parent: Option<String>,
+    /// Inbound W3C `baggage` / `tracestate` (hidden from the metadata).
+    inbound_trace: Option<InboundTrace>,
     handle: CallHandle,
 }
 
@@ -437,6 +441,24 @@ impl ServerCall {
     #[getter]
     fn trace_parent(&self) -> Option<String> {
         self.trace_parent.clone()
+    }
+
+    /// The caller's raw W3C `baggage` header (within the 8192-byte / 64-member
+    /// limits), or `None`. Set whether or not the call's span is exported; the
+    /// reserved keys are not in `metadata()`.
+    #[getter]
+    fn baggage(&self) -> Option<String> {
+        self.inbound_trace
+            .as_ref()
+            .and_then(|t| t.baggage.as_deref().map(str::to_owned))
+    }
+
+    /// The caller's raw W3C `tracestate` header, or `None`.
+    #[getter]
+    fn tracestate(&self) -> Option<String> {
+        self.inbound_trace
+            .as_ref()
+            .and_then(|t| t.tracestate.as_deref().map(str::to_owned))
     }
 
     /// Single-shot terminal response (unary, client-stream): one data frame

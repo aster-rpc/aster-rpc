@@ -82,6 +82,9 @@ pub const FLAG_HAS_ATTRIBUTES: u32 = 0x200;
 /// `flags` bit: the event carries `traceparent` (the call's server span is
 /// exported; design §5.2).
 pub const FLAG_HAS_TRACE: u32 = 0x400;
+/// `flags` bit: the event carries `baggage` and/or `tracestate` (the caller's
+/// W3C headers, hidden from `metadata`), whether or not the span is exported.
+pub const FLAG_HAS_INBOUND_TRACE: u32 = 0x800;
 
 /// One dispatch event, flattened for JS. Fields that do not apply to the
 /// event's `kind` are `0` (numbers) or absent.
@@ -97,7 +100,8 @@ pub struct JsDispatchEvent {
     /// Index of the method in the service's `methods`.
     pub method_idx: u32,
     /// `FIRST_IS_END` (1) | `NEW_SESSION` (2) | `IROH_AUTHENTICATED` (4) |
-    /// `HAS_METADATA` (0x100) | `HAS_ATTRIBUTES` (0x200).
+    /// `HAS_METADATA` (0x100) | `HAS_ATTRIBUTES` (0x200) | `HAS_TRACE` (0x400) |
+    /// `HAS_INBOUND_TRACE` (0x800).
     pub flags: u32,
     /// 0 = shared service; otherwise the Rust-assigned session key.
     pub session_key: i64,
@@ -126,6 +130,12 @@ pub struct JsDispatchEvent {
     /// W3C `traceparent` of the call's server span, when it is exported
     /// (`flags & HAS_TRACE`). Binding spans and logs parent on it.
     pub traceparent: Option<String>,
+    /// The caller's raw W3C `baggage` header (within the 8192-byte / 64-member
+    /// limits), when sent (`flags & HAS_INBOUND_TRACE`). Present whether or
+    /// not the call's span is exported; it is not in `metadata`.
+    pub baggage: Option<String>,
+    /// The caller's raw W3C `tracestate` header, when sent.
+    pub tracestate: Option<String>,
 }
 
 /// An event with every JS-irrelevant part dropped (call handle detached).
@@ -148,6 +158,8 @@ struct Ev {
     attributes: Option<Vec<(String, String)>>,
     alpn: Option<String>,
     traceparent: Option<String>,
+    baggage: Option<String>,
+    tracestate: Option<String>,
 }
 
 impl Ev {
@@ -170,6 +182,8 @@ impl Ev {
             attributes: None,
             alpn: None,
             traceparent: None,
+            baggage: None,
+            tracestate: None,
         }
     }
 
@@ -193,6 +207,8 @@ impl Ev {
             attributes: self.attributes.map(|m| m.into_iter().collect()),
             alpn: self.alpn,
             traceparent: self.traceparent,
+            baggage: self.baggage,
+            tracestate: self.tracestate,
         }
     }
 }
@@ -250,6 +266,16 @@ impl Shared {
                     }
                     .traceparent()
                 });
+                let (baggage, tracestate) = match &call.inbound_trace {
+                    Some(t) => {
+                        flags |= FLAG_HAS_INBOUND_TRACE;
+                        (
+                            t.baggage.as_deref().map(str::to_owned),
+                            t.tracestate.as_deref().map(str::to_owned),
+                        )
+                    }
+                    None => (None, None),
+                };
                 Ev {
                     kind: EVENT_CALL,
                     call_id: call.handle.detach(),
@@ -268,6 +294,8 @@ impl Shared {
                     attributes,
                     alpn: None,
                     traceparent,
+                    baggage,
+                    tracestate,
                 }
             }
             DispatchEvent::Cancelled { call_id, reason } => Ev {

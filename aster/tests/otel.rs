@@ -655,9 +655,12 @@ mod foreign {
     }
 
     /// What the binding saw of each call, in arrival order.
+    /// (inbound trace, span exported, metadata keys)
+    type SeenCall = (Option<InboundTrace>, bool, Vec<String>);
+
     #[derive(Default)]
     struct Seen {
-        calls: Mutex<Vec<(Option<InboundTrace>, bool, Vec<String>)>>,
+        calls: Mutex<Vec<SeenCall>>,
     }
 
     impl DispatchSink for Seen {
@@ -724,10 +727,10 @@ mod foreign {
         assert_eq!(calls.len(), 5);
         let (inbound, traced, keys) = &calls[0];
         let inbound = inbound.as_ref().unwrap();
-        assert_eq!(
-            inbound.baggage.as_deref(),
-            Some("tenant=acme,flag=1;prop=x")
-        );
+        // The client's propagator re-serialises the members in map order.
+        let mut members: Vec<&str> = inbound.baggage.as_deref().unwrap().split(',').collect();
+        members.sort_unstable();
+        assert_eq!(members, ["flag=1;prop=x", "tenant=acme"]);
         assert_eq!(inbound.tracestate.as_deref(), Some("vendor=a"));
         assert!(*traced);
         assert_eq!(keys, &["x-user"], "reserved keys hidden from metadata");

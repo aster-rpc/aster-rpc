@@ -439,8 +439,11 @@ fn log_emit(
 /// Declare an instrument (`kind`: 1 counter, 2 up-down counter, 3 histogram,
 /// 4 gauge) and return its handle. A name already declared with a different
 /// kind, or breaking the OTel naming rules, raises `ValueError`.
+/// `boundaries` (histograms only): explicit bucket upper bounds, finite and
+/// strictly increasing; none = the RPC seconds buckets for unit `s`, else the
+/// SDK default.
 #[pyfunction]
-#[pyo3(signature = (kind, name, description="", unit="", auto_attrs=None, cardinality_limit=0))]
+#[pyo3(signature = (kind, name, description="", unit="", auto_attrs=None, cardinality_limit=0, boundaries=None))]
 fn instrument_new(
     kind: u32,
     name: String,
@@ -448,6 +451,7 @@ fn instrument_new(
     unit: &str,
     auto_attrs: Option<Vec<String>>,
     cardinality_limit: u32,
+    boundaries: Option<Vec<f64>>,
 ) -> PyResult<u64> {
     let kind = InstrumentKind::from_u32(kind)
         .ok_or_else(|| PyValueError::new_err(format!("unknown instrument kind {kind}")))?;
@@ -458,6 +462,7 @@ fn instrument_new(
         unit: unit.to_owned(),
         auto_attrs: auto_attrs.unwrap_or_default(),
         cardinality_limit,
+        boundaries: boundaries.unwrap_or_default(),
     })
     .map_err(otel_err)
 }

@@ -2205,7 +2205,8 @@ export interface DispatchEvent {
   methodIdx: number
   /**
    * `FIRST_IS_END` (1) | `NEW_SESSION` (2) | `IROH_AUTHENTICATED` (4) |
-   * `HAS_METADATA` (0x100) | `HAS_ATTRIBUTES` (0x200).
+   * `HAS_METADATA` (0x100) | `HAS_ATTRIBUTES` (0x200) | `HAS_TRACE` (0x400) |
+   * `HAS_INBOUND_TRACE` (0x800).
    */
   flags: number
   /** 0 = shared service; otherwise the Rust-assigned session key. */
@@ -2241,6 +2242,14 @@ export interface DispatchEvent {
    * (`flags & HAS_TRACE`). Binding spans and logs parent on it.
    */
   traceparent?: string
+  /**
+   * The caller's raw W3C `baggage` header (within the 8192-byte / 64-member
+   * limits), when sent (`flags & HAS_INBOUND_TRACE`). Present whether or
+   * not the call's span is exported; it is not in `metadata`.
+   */
+  baggage?: string
+  /** The caller's raw W3C `tracestate` header, when sent. */
+  tracestate?: string
 }
 
 /** Options for [`DispatchServer::serve`] / [`DispatchServer::start`]. */
@@ -2318,14 +2327,6 @@ export interface EdgeRouteInfo {
   /** The origin node (hex node id). */
   nodeId: string
 }
-
-/**
- * Test hook: emit `count` Rust events on target `aster::o7test` from a
- * background thread, `intervalUs` apart, at `level` (1 error .. 5 trace,
- * default 3). Messages are `<prefix> <i>`. Returns at once; watch
- * `logStats().testEmitted`. Not part of the public API.
- */
-export declare function emitTestLogs(count: number, intervalUs?: number | undefined | null, level?: number | undefined | null, prefix?: string | undefined | null): void
 
 /** Encode a `CallHeader` to AEv1 bytes. */
 export declare function encodeCallHeader(h: NativeCallHeader): Buffer
@@ -2660,8 +2661,11 @@ export declare function instrumentFree(handle: number): boolean
  * Declare an instrument on the global meter (scope `aster.app`). `kind`: 1
  * counter (u64), 2 up-down counter (i64), 3 histogram (f64), 4 gauge (f64).
  * Returns its handle. A name that exists with another kind fails.
+ * `boundaries` (histograms only): bucket upper bounds, finite and strictly
+ * increasing; none = the RPC seconds buckets for unit `s`, else the SDK
+ * default.
  */
-export declare function instrumentNew(kind: number, name: string, description?: string | undefined | null, unit?: string | undefined | null, autoAttrs?: Array<string> | undefined | null, cardinalityLimit?: number | undefined | null): number
+export declare function instrumentNew(kind: number, name: string, description?: string | undefined | null, unit?: string | undefined | null, autoAttrs?: Array<string> | undefined | null, cardinalityLimit?: number | undefined | null, boundaries?: Array<number> | undefined | null): number
 
 /**
  * The fence rule against `row`: `null` when `writer` (the authenticated
@@ -2836,8 +2840,6 @@ export interface LogStats {
   auditDropped: number
   /** Records waiting in the Rust queue. */
   pending: number
-  /** Records `emitTestLogs` has emitted so far (process-wide). */
-  testEmitted: number
 }
 
 /** Largest size a compressed payload may expand to, bytes. */

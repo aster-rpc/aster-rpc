@@ -1035,12 +1035,15 @@ fn dispatch_carries_trace_context_and_rpc_unary_records_client_metrics() {
             flags & ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE != 0,
             "flags {flags:#x}"
         );
+        // The client's propagator may re-serialise the members in map order.
+        assert_eq!(inbound.len(), 2, "{inbound:?}");
+        assert_eq!(inbound[0].0, "baggage");
+        let mut members: Vec<&str> = inbound[0].1.split(',').collect();
+        members.sort_unstable();
+        assert_eq!(members, ["flag=1", "tenant=acme"]);
         assert_eq!(
-            inbound,
-            [
-                ("baggage".to_string(), "tenant=acme,flag=1".to_string()),
-                ("tracestate".to_string(), "vendor=a".to_string())
-            ]
+            inbound[1],
+            ("tracestate".to_string(), "vendor=a".to_string())
         );
         assert_eq!(
             metadata,
