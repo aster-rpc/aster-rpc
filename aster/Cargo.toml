@@ -240,7 +240,7 @@ tempfile = "3"
 # drop them (attribution rules) — the record encoders live in core.
 aster_transport_core = { path = "../core", version = "=0.3.0", registry = "aster" }
 # Real PTY for the `shell` example (allocate a tty, spawn $SHELL, resize ioctl).
-portable-pty = "0.8"
+portable-pty = "0.9"
 # Local terminal raw mode + size for the interactive `shell` client.
 crossterm = "0.27"
 # For implementing the RPC ServiceDispatch trait in tests (mirrors the macro).

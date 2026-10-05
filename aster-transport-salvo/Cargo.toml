@@ -46,12 +46,12 @@ fory-derive = "=1.7.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Real TLS client for the HTTPS handshake test (rustls, accept self-signed).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Install a process-level crypto provider in the test (multiple rustls stacks
 # present — salvo + reqwest + wtransport — so it can't auto-select). Prod doesn't
 # need this.
 rustls = "0.23"
 # Real WebTransport client for the H3/WT handshake test (same crate portal uses).
-wtransport = { version = "0.6", features = ["quinn", "dangerous-configuration"] }
+wtransport = { version = "0.7", features = ["quinn", "dangerous-configuration"] }
 # Decode PEM to DER in cert tests (x509-parser is a normal dep above).
 pem = "3"
