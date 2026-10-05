@@ -25,6 +25,11 @@
 #      exact pins live in one crate and `aster` uses the API it re-exports.
 #      The binding profile without `otel` stays SDK-free like rule 1.
 #
+#   6. `health` implies `otel` (O3, design §6 / Q15): `/metrics` is the OTel
+#      Prometheus pull reader, so `health` alone must bring aster-otel with its
+#      `prometheus` feature. Bindings that do not serve health or telemetry
+#      (today's profile, below) stay SDK-free.
+#
 # Usage: ./scripts/check-otel-deps.sh
 
 set -euo pipefail
@@ -42,7 +47,8 @@ tree() { cargo tree --locked -e normal "$@"; }
 
 # ── 1. No OTel SDK in aster's default and rpc-only graphs ───────────────────
 
-for label in "default" "rpc" "rpc,binding-support,metrics"; do
+for label in "default" "rpc" "rpc,binding-support,metrics" \
+    "rpc,binding-support,metrics,expose,coordination-client"; do
     if [[ "$label" == "default" ]]; then
         out=$(tree -p aster)
     else
@@ -66,6 +72,16 @@ if grep -Eq '(opentelemetry[a-z_-]*|tracing-opentelemetry) v' <<<"$direct"; then
     fail "aster depends on an OpenTelemetry crate directly; use aster-otel's re-exports"
 fi
 pass "aster's 'otel' feature reaches OpenTelemetry only through aster-otel"
+
+# ── 6. health implies otel, with the Prometheus pull reader ─────────────────
+
+out=$(tree -p aster --no-default-features --features health)
+for needle in 'aster-otel v' 'opentelemetry_sdk v' 'opentelemetry-prometheus v'; do
+    if ! grep -q "$needle" <<<"$out"; then
+        fail "aster's 'health' feature does not bring '${needle% v}' (health must imply otel + prometheus)"
+    fi
+done
+pass "aster's 'health' feature implies otel with the Prometheus pull reader"
 
 # ── 2 + 3 + 4. aster-otel's own graph ───────────────────────────────────────
 
