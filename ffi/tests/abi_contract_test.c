@@ -916,14 +916,17 @@ static void test_upcalls(void) {
     CHECK(aster_upcall_set_default_policy(rt, up, 0, 0) == ASTER_STATUS_INVALID_ARGUMENT);
 
     aster_upcall_event_t ev[4];
-    CHECK(aster_upcall_poll(rt, up, ev, 4, 0) == 0);
+    uint32_t n = 7;
+    CHECK(aster_upcall_poll(rt, up, ev, 4, 0, &n) == ASTER_STATUS_OK && n == 0);
+    CHECK(aster_upcall_poll(rt, up, ev, 4, 0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_upcall_poll(rt, up + 424242, ev, 4, 0, &n) == ASTER_STATUS_NOT_FOUND && n == 0);
 
     /* A lease whose serializer is "this program": answer the ACQUIRE by hand. */
     aster_lease_serializer_t ser = 0;
     CHECK(aster_lease_serializer_foreign_new(rt, up, &ser) == ASTER_STATUS_OK && ser != 0);
     aster_operation_t op = 0;
     CHECK(aster_lease_acquire(rt, ser, bstr("r"), bstr("a"), 0, 0, 0, 9, &op) == ASTER_STATUS_OK);
-    uint32_t n = aster_upcall_poll(rt, up, ev, 4, 5000);
+    CHECK(aster_upcall_poll(rt, up, ev, 4, 5000, &n) == ASTER_STATUS_OK);
     CHECK(n == 1);
     CHECK(ev[0].kind == ASTER_UPCALL_KIND_LEASE_TRANSITION && ev[0].invocation_id != 0);
     CHECK(ev[0].payload_len > 2 && ev[0].payload_ptr[0] == 0xB1 && ev[0].payload_ptr[1] == 0x01);
@@ -1038,7 +1041,8 @@ static int serve_until_head(aster_runtime_t rt, aster_upcalls_t up, aster_http_r
     static const uint8_t pong[] = {0xC5, 0x01, 0xC9, 0x01, 0x00, 0x0C, 0x00, 0x04, 'p', 'o', 'n', 'g'};
     for (int i = 0; i < 200; i++) {
         aster_upcall_event_t ev[4];
-        uint32_t n = aster_upcall_poll(rt, up, ev, 4, 50);
+        uint32_t n = 0;
+        if (aster_upcall_poll(rt, up, ev, 4, 50, &n) != ASTER_STATUS_OK) n = 0;
         for (uint32_t k = 0; k < n; k++) {
             if (ev[k].kind == ASTER_UPCALL_KIND_EXPOSE_AUTHORIZE) {
                 aster_upcall_respond(rt, up, ev[k].invocation_id, ASTER_UPCALL_STATUS_OK, allow, sizeof allow);
@@ -1284,8 +1288,11 @@ static void test_observability(void) {
     CHECK(aster_observability_flush(2000) == ASTER_STATUS_OK);
 
     aster_log_record_t recs[4];
-    CHECK(aster_log_poll(recs, 8, 4, 0) == 0); /* wrong stride */
-    CHECK(aster_log_poll(recs, sizeof recs[0], 4, 0) == 0); /* nothing queued */
+    uint32_t nrecs = 7;
+    CHECK(aster_log_poll(recs, 8, 4, 0, &nrecs) == ASTER_STATUS_INVALID_ARGUMENT && nrecs == 0); /* wrong stride */
+    CHECK(aster_log_poll(recs, sizeof recs[0], 4, 0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+    nrecs = 7;
+    CHECK(aster_log_poll(recs, sizeof recs[0], 4, 0, &nrecs) == ASTER_STATUS_OK && nrecs == 0); /* nothing queued */
     CHECK(aster_log_set_filter((const uint8_t *)"warn", 4) == ASTER_STATUS_OK);
     CHECK(aster_log_set_filter((const uint8_t *)"[[", 2) == ASTER_STATUS_INVALID_ARGUMENT);
     uint64_t dropped = 99;

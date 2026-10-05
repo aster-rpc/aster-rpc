@@ -51,7 +51,12 @@ the running pipeline's (the message names the settings), or a second
 concurrent `aster_log_poll`.
 
 **Behaviour on misuse:** `aster_upcall_poll` called on a tokio runtime thread
-returns 0 with last error `ASTER_STATUS_UNSUPPORTED: ...` (it blocks).
+returns `ASTER_STATUS_UNSUPPORTED` (it blocks).
+
+**Poll signatures (4.6):** `aster_log_poll` and `aster_upcall_poll` return an
+`int32_t` status with the count in `uint32_t *out_count` (always written; 0 on
+any non-OK status; 0 with `OK` on timeout). Bindings read the status code and
+never parse the last-error message.
 
 **Built-ins on the C ABI paths:** with a pipeline running, `aster_server_*`
 dispatch records the `aster.rpc.server.*` instruments and the server span,
@@ -75,7 +80,7 @@ value is replaced by the client span's (design §5.4).
 | Item | Notes |
 |---|---|
 | `aster_log_record_t` (96 bytes, no `struct_size`) | `level` (`aster_log_level_t` 1..5), `flags` (`ASTER_LOG_FLAG_HAS_TRACE` 1, `_IN_CALL` 2, `_SYNTHETIC` 4, `_AUDIT` 8), `timestamp_unix_ns`, `trace_id[16]`, `span_id[8]`, `call_id`, `target`, `message`, `fields` (k/v: event fields, `rpc.service`, `rpc.method`, `aster.peer`, `thread.name`). |
-| `aster_log_poll(out*, record_size, max, timeout_ms)` → count | `record_size` must be `sizeof(aster_log_record_t)`. One poller per process (a concurrent second poll: 0, last error `ASTER_STATUS_ALREADY_EXISTS: ...`). Refused on a tokio thread (`ASTER_STATUS_UNSUPPORTED: ...`). Marks the calling thread as a log drain (no feedback). Audit records first, then FIFO; a synthetic drop report leads a batch at most once a second. Pointers are valid until the next poll or `aster_log_close` (one arena per batch). 0 with `ASTER_STATUS_NOT_FOUND: ...` once the bridge is closed or not open. |
+| `aster_log_poll(out*, record_size, max, timeout_ms, uint32_t *out_count)` → status | `record_size` must be `sizeof(aster_log_record_t)` (else `INVALID_ARGUMENT`; so are NULL `out` / `out_count` and `max` 0). One poller per process (a concurrent second poll: `ALREADY_EXISTS`). Refused on a tokio thread (`UNSUPPORTED`). Marks the calling thread as a log drain (no feedback). Audit records first, then FIFO; a synthetic drop report leads a batch at most once a second. Pointers are valid until the next poll or `aster_log_close` (one arena per batch). `NOT_FOUND` once the bridge is closed or not open; `OK` with `*out_count` 0 on timeout. |
 | `aster_log_close()` | Closes the bridge, wakes a waiting poll; a later init with `LOG_BRIDGE` reopens. |
 | `aster_log_dropped(u64* out)` | General records dropped (queue full) since process start. |
 | `aster_log_set_filter(directives, len)` | `EnvFilter` reload; `INVALID_ARGUMENT` on a parse error, `NOT_FOUND` without a bridge. `aster::audit=info` stays on unless named. |
@@ -454,7 +459,7 @@ encodes responses itself. No function pointers.
 | Function | Notes |
 |---|---|
 | `aster_upcalls_new(rt, capacity, *out)` | `capacity` 0 = `ASTER_UPCALL_DEFAULT_CAPACITY` (1024) queued upcalls; beyond it upcalls are refused (`Overloaded`: decisions take the failure mode, other kinds error). `CANCEL` is always queued. |
-| `aster_upcall_poll(rt, u, aster_upcall_event_t *out, max, timeout_ms) -> uint32_t` | Batched drain; `timeout_ms` 0 = non-blocking. Single consumer; blocks the caller. |
+| `aster_upcall_poll(rt, u, aster_upcall_event_t *out, max, timeout_ms, uint32_t *out_count) -> int32_t` | Batched drain; `timeout_ms` 0 = non-blocking. Single consumer; blocks the caller. Status: `NOT_FOUND` (unknown runtime or upcalls handle), `INVALID_ARGUMENT` (NULL `out` / `out_count`, `max` 0), `UNSUPPORTED` (tokio thread). Timeout is `OK` with `*out_count` 0. |
 | `aster_upcall_respond(rt, u, invocation_id, status, payload, len)` | `aster_upcall_status_t` (`OK` = UCv1 response, `ERROR` = UTF-8 message, `UNIMPLEMENTED`). Any thread, any order, never blocks. `NOT_FOUND` = not pending (answered, cancelled, timed out) -- ignore. |
 | `aster_upcall_set_policy(rt, u, kind, timeout_ms, failure_mode)` / `aster_upcall_set_default_policy(rt, u, timeout_ms, failure_mode)` | `failure_mode` = `aster_hook_failure_mode_t`; applies to decision kinds. Default 5 s, fail closed. |
 | `aster_upcall_buffer_release(rt, u, buffer)` | Frees an event's payload (0 = no-op). |

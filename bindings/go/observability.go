@@ -18,7 +18,6 @@ import (
 	"os"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -380,22 +379,28 @@ func (p *logPoller) run() {
 	lastCheck := time.Now()
 	for !p.closing.Load() {
 		start := time.Now()
-		n := int(C.aster_log_poll(&recs[0], C.uint32_t(size), logBatch, logPollMs))
+		var cn C.uint32_t
+		st := C.aster_log_poll(&recs[0], C.uint32_t(size), logBatch, logPollMs, &cn)
+		n := int(cn)
 		for i := 0; i < n; i++ {
 			rec := readLogRecord(&recs[i])
 			deliverLog(currentLogger(), &rec)
 		}
-		if n == 0 && time.Since(start) < logPollMs*time.Millisecond/2 {
-			// An early empty return is a refusal or a closed bridge, not a
-			// timeout: stop for the fatal ones, never spin on the rest.
-			msg := lastErrorMessage()
-			if strings.HasPrefix(msg, "ASTER_STATUS_NOT_FOUND") || strings.HasPrefix(msg, "ASTER_STATUS_ALREADY_EXISTS") ||
-				strings.HasPrefix(msg, "ASTER_STATUS_INVALID_ARGUMENT") || strings.HasPrefix(msg, "ASTER_STATUS_UNSUPPORTED") {
-				if !p.closing.Load() && !strings.HasPrefix(msg, "ASTER_STATUS_NOT_FOUND") {
-					currentLogger().Warn("aster: log poller stopped", "reason", msg)
-				}
-				return
+		switch st {
+		case C.ASTER_STATUS_OK:
+			// An early empty OK is not a timeout: never spin.
+			if n == 0 && time.Since(start) < logPollMs*time.Millisecond/2 {
+				time.Sleep(10 * time.Millisecond)
 			}
+		case C.ASTER_STATUS_NOT_FOUND:
+			// The bridge is closed or not open.
+			return
+		case C.ASTER_STATUS_ALREADY_EXISTS, C.ASTER_STATUS_INVALID_ARGUMENT, C.ASTER_STATUS_UNSUPPORTED:
+			if !p.closing.Load() {
+				currentLogger().Warn("aster: log poller stopped", "reason", statusError(st))
+			}
+			return
+		default:
 			time.Sleep(10 * time.Millisecond)
 		}
 		if time.Since(lastCheck) >= levelRecheck {

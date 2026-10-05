@@ -56,6 +56,10 @@ fn child() {
         "prometheus_reinit" => case_prometheus_reinit(),
         #[cfg(feature = "prometheus")]
         "prometheus_disabled" => case_prometheus_disabled(),
+        #[cfg(feature = "prometheus")]
+        "prometheus_reinit_no_provider" => case_prometheus_reinit_no_provider(),
+        #[cfg(feature = "prometheus")]
+        "prometheus_late_keeps_values" => case_prometheus_late_keeps_values(),
         other => panic!("unknown case {other}"),
     }
     println!("case-ok");
@@ -277,23 +281,22 @@ fn case_prometheus_implicit() {
     );
 }
 
-/// A pipeline without a pull reader (test exporters only) gets one under a
-/// new generation; the push reader keeps exporting and the first handle
-/// keeps counting against the same pipeline.
+/// A pipeline that records metrics already has the pull reader (every meter
+/// provider is built with it), so joining it keeps the generation and the
+/// push reader keeps exporting.
 #[cfg(feature = "prometheus")]
 fn case_prometheus_reinit() {
     let t = TestExporters::new();
     let h = aster_otel::init(with_test_exporters(&t)).unwrap();
     let g1 = aster_otel::generation();
-    assert!(aster_otel::render_prometheus().is_none());
+    assert!(
+        aster_otel::render_prometheus().is_some(),
+        "the reader comes with the provider"
+    );
     // Joins whatever config is running (this one differs from `h`'s).
     let h2 = aster_otel::init_with_prometheus(ObservabilityConfig::default()).unwrap();
-    assert_eq!(
-        aster_otel::generation(),
-        g1 + 1,
-        "re-init bumps the generation"
-    );
-    assert_eq!(h2.generation(), g1 + 1);
+    assert_eq!(aster_otel::generation(), g1, "no provider rebuild");
+    assert_eq!(h2.generation(), g1);
     probe_counter(5);
     let text = aster_otel::render_prometheus().expect("pull reader");
     assert!(text.contains("probe_requests_total"), "{text}");
@@ -301,7 +304,7 @@ fn case_prometheus_reinit() {
     let pts = t.metric_points("probe.requests");
     assert_eq!(pts.len(), 1, "push reader still exports: {pts:?}");
     assert_eq!(pts[0].value, 5.0);
-    // The original config still joins after the re-init.
+    // The original config still joins.
     let h3 = aster_otel::init(with_test_exporters(&t)).unwrap();
     drop(h);
     drop(h3);
@@ -311,7 +314,73 @@ fn case_prometheus_reinit() {
     );
     drop(h2);
     assert!(aster_otel::render_prometheus().is_none());
-    assert_eq!(aster_otel::generation(), g1 + 2, "shut down once");
+    assert_eq!(aster_otel::generation(), g1 + 1, "shut down once");
+}
+
+/// A pipeline with no metrics exporter has no meter provider (nothing was
+/// recorded); joining with the pull reader builds one under a new generation.
+#[cfg(feature = "prometheus")]
+fn case_prometheus_reinit_no_provider() {
+    let h = aster_otel::init(ObservabilityConfig {
+        from_env: false,
+        traces_exporter: Some(vec![]),
+        metrics_exporter: Some(vec![]),
+        ..Default::default()
+    })
+    .unwrap();
+    let g1 = aster_otel::generation();
+    assert!(aster_otel::render_prometheus().is_none());
+    let h2 = aster_otel::init_with_prometheus(ObservabilityConfig::default()).unwrap();
+    assert_eq!(aster_otel::generation(), g1 + 1);
+    assert_eq!(h2.generation(), g1 + 1);
+    probe_counter(5);
+    let text = aster_otel::render_prometheus().expect("pull reader");
+    assert!(text.contains("probe_requests_total"), "{text}");
+    drop(h);
+    drop(h2);
+    assert!(aster_otel::render_prometheus().is_none());
+}
+
+/// Values recorded before the pull reader starts are still there when it
+/// does: a binding instrument, an instrument off the global meter, and the
+/// push reader's copy too.
+#[cfg(feature = "prometheus")]
+fn case_prometheus_late_keeps_values() {
+    use aster_otel::instruments::{self, InstrumentDesc, InstrumentKind, Measurement};
+
+    let t = TestExporters::new();
+    let h = aster_otel::init(with_test_exporters(&t)).unwrap();
+    let bound = instruments::instrument_new(InstrumentDesc {
+        kind: InstrumentKind::CounterU64,
+        name: "probe.bound".into(),
+        description: String::new(),
+        unit: String::new(),
+        auto_attrs: vec![],
+        cardinality_limit: 0,
+        boundaries: vec![],
+    })
+    .unwrap();
+    instruments::record(bound, Measurement::U64(4), 0, &[], 0).unwrap();
+    probe_counter(5);
+
+    // The pull reader joins late (what a health listener does).
+    let h2 = aster_otel::init_with_prometheus(ObservabilityConfig::default()).unwrap();
+    // More after the join, on the same instruments.
+    instruments::record(bound, Measurement::U64(1), 0, &[], 0).unwrap();
+    probe_counter(2);
+
+    let text = aster_otel::render_prometheus().expect("pull reader");
+    let value = |name: &str| -> f64 {
+        text.lines()
+            .find(|l| l.starts_with(name) && !l.starts_with('#'))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+    };
+    assert_eq!(value("probe_bound_total"), 5.0, "{text}");
+    assert_eq!(value("probe_requests_total"), 7.0, "{text}");
+    drop(h);
+    drop(h2);
 }
 
 /// `OTEL_SDK_DISABLED` wins: a no-op handle and no reader.
@@ -373,8 +442,20 @@ fn init_with_prometheus_starts_a_pipeline_with_the_pull_reader() {
 
 #[cfg(feature = "prometheus")]
 #[test]
-fn init_with_prometheus_reinits_a_pipeline_without_one() {
+fn init_with_prometheus_joins_a_pipeline_that_already_has_the_reader() {
     run("prometheus_reinit", &[]);
+}
+
+#[cfg(feature = "prometheus")]
+#[test]
+fn init_with_prometheus_builds_a_provider_for_a_pipeline_without_one() {
+    run("prometheus_reinit_no_provider", &[]);
+}
+
+#[cfg(feature = "prometheus")]
+#[test]
+fn a_late_pull_reader_keeps_values_recorded_before_it_started() {
+    run("prometheus_late_keeps_values", &[]);
 }
 
 #[cfg(feature = "prometheus")]

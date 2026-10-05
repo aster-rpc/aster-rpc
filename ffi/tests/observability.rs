@@ -29,6 +29,7 @@ mod common;
 const OK: i32 = aster_status_t::ASTER_STATUS_OK as i32;
 const INVALID: i32 = aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
 const NOT_FOUND: i32 = aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
+const UNSUPPORTED: i32 = aster_status_t::ASTER_STATUS_UNSUPPORTED as i32;
 const EXISTS: i32 = aster_status_t::ASTER_STATUS_ALREADY_EXISTS as i32;
 const CLOSED: i32 = aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32;
 const RPC_ALPN: &[u8] = b"aster/1";
@@ -145,14 +146,27 @@ unsafe fn copy(p: *const u8, n: u32) -> Vec<u8> {
     }
 }
 
-/// Poll once (on this thread) and copy the batch out.
+/// Poll once (on this thread); any status except OK / NOT_FOUND fails.
 fn poll(max: u32, timeout_ms: u32) -> Vec<Rec> {
+    let (st, recs) = poll_st(max, timeout_ms);
+    assert!(
+        st == OK || st == NOT_FOUND,
+        "aster_log_poll status {st}: {}",
+        last_error()
+    );
+    recs
+}
+
+/// Poll once (on this thread) and copy the batch out, with the status.
+fn poll_st(max: u32, timeout_ms: u32) -> (i32, Vec<Rec>) {
     let mut out: Vec<aster_log_record_t> = Vec::with_capacity(max as usize);
     // SAFETY: room for `max` records.
-    let n = unsafe { aster_log_poll(out.as_mut_ptr(), REC, max, timeout_ms) };
+    let mut n = 0u32;
+    let st = unsafe { aster_log_poll(out.as_mut_ptr(), REC, max, timeout_ms, &mut n) };
     // SAFETY: `n` records were written.
     unsafe { out.set_len(n as usize) };
-    out.iter()
+    let recs = out
+        .iter()
         .map(|r| unsafe {
             Rec {
                 level: r.level,
@@ -162,7 +176,8 @@ fn poll(max: u32, timeout_ms: u32) -> Vec<Rec> {
                 fields: decode_kv(&copy(r.fields_ptr, r.fields_len)),
             }
         })
-        .collect()
+        .collect();
+    (st, recs)
 }
 
 /// Poll until `n` records with target `target` arrived (or 10 s).
@@ -241,10 +256,22 @@ fn log_poll_order_drops_audit_and_refusals() {
     // Stride and argument checks.
     let mut one: [std::mem::MaybeUninit<aster_log_record_t>; 1] = [std::mem::MaybeUninit::uninit()];
     let out = one.as_mut_ptr().cast::<aster_log_record_t>();
-    assert_eq!(unsafe { aster_log_poll(out, REC - 8, 1, 0) }, 0);
-    assert!(last_error().starts_with("ASTER_STATUS_INVALID_ARGUMENT"));
-    assert_eq!(unsafe { aster_log_poll(ptr::null_mut(), REC, 1, 0) }, 0);
-    assert_eq!(unsafe { aster_log_poll(out, REC, 0, 0) }, 0);
+    let mut n = 7u32;
+    assert_eq!(
+        unsafe { aster_log_poll(out, REC - 8, 1, 0, &mut n) },
+        INVALID
+    );
+    assert_eq!(n, 0);
+    assert!(last_error().contains("record_size"));
+    assert_eq!(
+        unsafe { aster_log_poll(ptr::null_mut(), REC, 1, 0, &mut n) },
+        INVALID
+    );
+    assert_eq!(unsafe { aster_log_poll(out, REC, 0, 0, &mut n) }, INVALID);
+    assert_eq!(
+        unsafe { aster_log_poll(out, REC, 1, 0, ptr::null_mut()) },
+        INVALID
+    );
 
     // FIFO with fields.
     on_thread(|| {
@@ -315,12 +342,9 @@ fn log_poll_order_drops_audit_and_refusals() {
         std::thread::yield_now();
     }
     std::thread::sleep(Duration::from_millis(200));
-    assert!(poll(8, 0).is_empty());
-    assert!(
-        last_error().starts_with("ASTER_STATUS_ALREADY_EXISTS"),
-        "{}",
-        last_error()
-    );
+    let (st, recs) = poll_st(8, 0);
+    assert_eq!(st, EXISTS, "{}", last_error());
+    assert!(recs.is_empty());
     on_thread(|| tracing::warn!(target: "obs_test", "wake"));
     let woke = poller.join().unwrap();
     assert_eq!(woke.len(), 1);
@@ -331,11 +355,17 @@ fn log_poll_order_drops_audit_and_refusals() {
         .build()
         .unwrap();
     rt.block_on(async {
-        assert_eq!(unsafe { aster_log_poll(out, REC, 1, 0) }, 0);
-        assert!(last_error().starts_with("ASTER_STATUS_UNSUPPORTED"));
+        let mut n = 7u32;
+        assert_eq!(
+            unsafe { aster_log_poll(out, REC, 1, 0, &mut n) },
+            UNSUPPORTED
+        );
+        assert_eq!(n, 0);
         let mut ev: std::mem::MaybeUninit<aster_upcall_event_t> = std::mem::MaybeUninit::uninit();
-        assert_eq!(unsafe { aster_upcall_poll(1, 1, ev.as_mut_ptr(), 1, 0) }, 0);
-        assert!(last_error().starts_with("ASTER_STATUS_UNSUPPORTED"));
+        assert_eq!(
+            unsafe { aster_upcall_poll(1, 1, ev.as_mut_ptr(), 1, 0, &mut n) },
+            UNSUPPORTED
+        );
     });
 
     // Filter reload.
@@ -355,8 +385,9 @@ fn log_poll_order_drops_audit_and_refusals() {
     assert_eq!(aster_log_close(), OK);
     assert!(poller.join().unwrap().is_empty());
     assert!(start.elapsed() < Duration::from_secs(5));
-    assert!(poll(8, 0).is_empty());
-    assert!(last_error().starts_with("ASTER_STATUS_NOT_FOUND"));
+    let (st, recs) = poll_st(8, 0);
+    assert_eq!(st, NOT_FOUND, "{}", last_error());
+    assert!(recs.is_empty());
     assert_eq!(
         unsafe { aster_log_set_filter(f.as_ptr(), f.len() as u32) },
         NOT_FOUND

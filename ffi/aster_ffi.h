@@ -5222,33 +5222,34 @@ int32_t aster_observability_shutdown(uint32_t timeout_ms);
 
 /**
  * Take up to `max` Rust log records into `out`, waiting up to `timeout_ms`
- * for the first (0 = return at once). Returns the count: 0 on timeout,
- * once the bridge is closed or not open (last error
- * `ASTER_STATUS_NOT_FOUND: ...`), or on refusal. Audit records come first,
- * then the rest in FIFO order; a synthetic drop report (`ASTER_LOG_FLAG_SYNTHETIC`)
- * leads a batch at most once a second.
+ * for the first (0 = return at once). The count goes to `*out_count`
+ * (always written, 0 on any non-OK status): 0 with `OK` on timeout.
+ * Audit records come first, then the rest in FIFO order; a synthetic drop
+ * report (`ASTER_LOG_FLAG_SYNTHETIC`) leads a batch at most once a second.
  *
- * Rules: `record_size` must equal `sizeof(aster_log_record_t)` (the array
- * stride); otherwise 0 and `ASTER_STATUS_INVALID_ARGUMENT: ...`. **One poller
- * per process**: a concurrent second call returns 0 with last error
- * `ASTER_STATUS_ALREADY_EXISTS: ...` (it would free the batch the first is
- * reading). Refused on a tokio runtime thread (`ASTER_STATUS_UNSUPPORTED: ...`):
- * run it on a dedicated thread, which this call marks as a log drain (events
- * it emits never reach the bridge, so a logger that calls back into Aster
- * cannot feed its own queue). The returned pointers stay valid until the
- * next `aster_log_poll` or `aster_log_close`.
+ * Statuses: `NOT_FOUND` once the bridge is closed or not open;
+ * `INVALID_ARGUMENT` for a NULL `out` / `out_count`, `max` 0 or a wrong
+ * `record_size` (must equal `sizeof(aster_log_record_t)`, the array stride);
+ * `ALREADY_EXISTS` for a concurrent second call (**one poller per process**:
+ * it would free the batch the first is reading); `UNSUPPORTED` on a tokio
+ * runtime thread: run it on a dedicated thread, which this call marks as a
+ * log drain (events it emits never reach the bridge, so a logger that calls
+ * back into Aster cannot feed its own queue). The returned pointers stay
+ * valid until the next `aster_log_poll` or `aster_log_close`.
  *
  * # Safety
- * `out` must have room for `max` records of `record_size` bytes.
+ * `out` must have room for `max` records of `record_size` bytes;
+ * `out_count` must be writable.
  */
-uint32_t aster_log_poll(struct aster_log_record_t *out,
-                        uint32_t record_size,
-                        uint32_t max,
-                        uint32_t timeout_ms);
+int32_t aster_log_poll(struct aster_log_record_t *out,
+                       uint32_t record_size,
+                       uint32_t max,
+                       uint32_t timeout_ms,
+                       uint32_t *out_count);
 
 /**
  * Close the log bridge: Rust events stop being queued, a waiting
- * `aster_log_poll` wakes (and gets what was still queued, then 0), and the
+ * `aster_log_poll` wakes (and gets what was still queued, then `NOT_FOUND`), and the
  * last batch's arena is freed when no poll is running. A later
  * `aster_observability_init` with `ASTER_OBSERVABILITY_LOG_BRIDGE` opens a
  * new bridge. `OK` also when no bridge is open.
@@ -6146,17 +6147,22 @@ int32_t aster_upcall_set_default_policy(aster_runtime_t runtime,
 /**
  * Drain up to `max` events into `out`. `timeout_ms` 0 = return at once;
  * otherwise wait up to that long for the first event (or until the table
- * is closed). Returns the count (0 on timeout, unknown handle or bad
- * arguments). Single consumer; blocks the calling thread, so run it off
- * the runtime's threads (and off virtual-thread carriers when waiting).
- * Since 4.6 a call from a tokio runtime thread is refused (0, last error
- * `ASTER_STATUS_UNSUPPORTED: ...`), like `aster_log_poll`.
+ * is closed). The count goes to `*out_count` (always written, 0 on any
+ * non-OK status; 0 with `OK` on timeout). Statuses: `NOT_FOUND` for an
+ * unknown runtime or upcalls handle, `INVALID_ARGUMENT` for NULL `out` /
+ * `out_count` or `max` 0, `UNSUPPORTED` from a tokio runtime thread (like
+ * `aster_log_poll`). Single consumer; blocks the calling thread, so run it
+ * off the runtime's threads (and off virtual-thread carriers when waiting).
+ *
+ * # Safety
+ * `out` must have room for `max` events; `out_count` must be writable.
  */
-uint32_t aster_upcall_poll(aster_runtime_t runtime,
-                           aster_upcalls_t upcalls,
-                           struct aster_upcall_event_t *out,
-                           uint32_t max,
-                           uint32_t timeout_ms);
+int32_t aster_upcall_poll(aster_runtime_t runtime,
+                          aster_upcalls_t upcalls,
+                          struct aster_upcall_event_t *out,
+                          uint32_t max,
+                          uint32_t timeout_ms,
+                          uint32_t *out_count);
 
 /**
  * Release an event's payload. 0 is a no-op; an unknown buffer returns

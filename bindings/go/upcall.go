@@ -225,10 +225,12 @@ func (u *Upcalls) pollLoop() {
 	var events [upcallBatch]C.aster_upcall_event_t
 	for !u.closing.Load() && !u.rt.closed.Load() {
 		t0 := time.Now()
-		n := int(C.aster_upcall_poll(u.rtH(), C.uint64_t(u.handle), &events[0], upcallBatch, upcallWaitMs))
-		if n == 0 {
-			// A healthy poll waited; an instant 0 means a bad handle or a
-			// closed runtime. Do not spin.
+		var cn C.uint32_t
+		st := C.aster_upcall_poll(u.rtH(), C.uint64_t(u.handle), &events[0], upcallBatch, upcallWaitMs, &cn)
+		n := int(cn)
+		if st != C.ASTER_STATUS_OK || n == 0 {
+			// A healthy poll waited; a refusal (bad handle, closed runtime)
+			// or an instant 0 must not spin.
 			if time.Since(t0) < minPollTime {
 				time.Sleep(minPollTime)
 			}

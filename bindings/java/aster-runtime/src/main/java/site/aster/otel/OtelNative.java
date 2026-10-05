@@ -71,7 +71,7 @@ final class OtelNative {
   static final MethodHandle OBSERVABILITY_SHUTDOWN =
       h("aster_observability_shutdown", FunctionDescriptor.of(I32, I32));
   static final MethodHandle LOG_POLL =
-      h("aster_log_poll", FunctionDescriptor.of(I32, PTR, I32, I32, I32));
+      h("aster_log_poll", FunctionDescriptor.of(I32, PTR, I32, I32, I32, PTR));
   static final MethodHandle LOG_CLOSE = h("aster_log_close", FunctionDescriptor.of(I32));
   static final MethodHandle LOG_DROPPED = h("aster_log_dropped", FunctionDescriptor.of(I32, PTR));
   static final MethodHandle LOG_SET_FILTER =

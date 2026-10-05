@@ -543,22 +543,18 @@ fn test_cfg(t: &TestExporters) -> ObservabilityConfig {
     }
 }
 
-/// An application initialised OTel first, with no Prometheus reader (here:
-/// in-memory exporters only). The listener re-inits the meter provider under
-/// a new generation; both the pull reader and the push exporter see the
-/// calls, and the application's handle still counts.
+/// An application initialised OTel first, with push exporters only (here:
+/// in-memory). Its meter provider already carries the pull reader, so the
+/// listener joins without a rebuild; both the pull reader and the push
+/// exporter see the calls, and the application's handle still counts.
 async fn case_after_init_without_reader() {
     let t = TestExporters::new();
     let app = aster_otel::init(test_cfg(&t)).unwrap();
     let g = aster_otel::generation();
-    assert!(aster_otel::render_prometheus().is_none());
+    assert!(aster_otel::render_prometheus().is_some());
 
     let srv = probe_server().await;
-    assert_eq!(
-        aster_otel::generation(),
-        g + 1,
-        "re-init under a new generation"
-    );
+    assert_eq!(aster_otel::generation(), g, "no provider rebuild");
     let (client, s) = traffic(&srv).await;
     assert_eq!(completed(&s, "ok", "OK"), Some(3.0));
     aster_otel::flush(Duration::from_secs(10)).unwrap();
@@ -718,7 +714,7 @@ fn health_before_any_init_serves_rpc_series() {
 }
 
 #[test]
-fn health_after_an_init_without_prometheus_reinits_and_serves() {
+fn health_after_an_init_with_push_exporters_joins_and_serves() {
     run("after_init_without_reader");
 }
 

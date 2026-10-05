@@ -1283,7 +1283,9 @@ impl Foreign {
         let thread = std::thread::spawn(move || {
             let mut events: [aster_upcall_event_t; 8] = unsafe { std::mem::zeroed() };
             while !s.load(Ordering::Acquire) {
-                let n = unsafe { aster_upcall_poll(rt, upcalls, events.as_mut_ptr(), 8, 50) };
+                let mut n = 0u32;
+                let _ =
+                    unsafe { aster_upcall_poll(rt, upcalls, events.as_mut_ptr(), 8, 50, &mut n) };
                 for ev in events.iter().take(n as usize) {
                     let payload = if ev.payload_len == 0 {
                         Vec::new()

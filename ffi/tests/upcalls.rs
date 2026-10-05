@@ -150,7 +150,9 @@ impl Foreign {
         let thread = std::thread::spawn(move || {
             let mut events: [aster_upcall_event_t; 8] = unsafe { std::mem::zeroed() };
             while !s.load(Ordering::Acquire) {
-                let n = unsafe { aster_upcall_poll(rt, upcalls, events.as_mut_ptr(), 8, 50) };
+                let mut n = 0u32;
+                let _ =
+                    unsafe { aster_upcall_poll(rt, upcalls, events.as_mut_ptr(), 8, 50, &mut n) };
                 for ev in events.iter().take(n as usize) {
                     let payload = if ev.payload_len == 0 {
                         Vec::new()
@@ -477,7 +479,12 @@ fn authorizer_failure_mode_applies_without_an_answer() {
 
         // Withdrawn events never reach a late poller.
         let mut events: [aster_upcall_event_t; 4] = std::mem::zeroed();
-        assert_eq!(aster_upcall_poll(rt, u, events.as_mut_ptr(), 4, 0), 0);
+        let mut n = 7u32;
+        assert_eq!(
+            aster_upcall_poll(rt, u, events.as_mut_ptr(), 4, 0, &mut n),
+            OK
+        );
+        assert_eq!(n, 0);
         assert_eq!(aster_runtime_close(rt), OK);
     }
 }
@@ -818,11 +825,24 @@ fn argument_validation() {
         assert_eq!(aster_upcall_set_default_policy(rt, u, 0, 0), INVALID);
         // Poll / respond / buffers.
         let mut ev: aster_upcall_event_t = std::mem::zeroed();
-        assert_eq!(aster_upcall_poll(rt, u, ptr::null_mut(), 1, 0), 0);
-        assert_eq!(aster_upcall_poll(rt, u, &mut ev, 0, 0), 0);
-        assert_eq!(aster_upcall_poll(rt, 424242, &mut ev, 1, 0), 0);
+        let mut n = 7u32;
+        assert_eq!(
+            aster_upcall_poll(rt, u, ptr::null_mut(), 1, 0, &mut n),
+            INVALID
+        );
+        assert_eq!(aster_upcall_poll(rt, u, &mut ev, 0, 0, &mut n), INVALID);
+        assert_eq!(
+            aster_upcall_poll(rt, u, &mut ev, 1, 0, ptr::null_mut()),
+            INVALID
+        );
+        assert_eq!(
+            aster_upcall_poll(rt, 424242, &mut ev, 1, 0, &mut n),
+            NOT_FOUND
+        );
+        assert_eq!(n, 0);
         let started = Instant::now();
-        assert_eq!(aster_upcall_poll(rt, u, &mut ev, 1, 50), 0);
+        assert_eq!(aster_upcall_poll(rt, u, &mut ev, 1, 50, &mut n), OK);
+        assert_eq!(n, 0);
         assert!(started.elapsed() >= Duration::from_millis(40));
         assert_eq!(
             aster_upcall_respond(rt, u, 1, S_OK, ptr::null(), 3),

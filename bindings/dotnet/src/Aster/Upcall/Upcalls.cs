@@ -285,11 +285,17 @@ public sealed class Upcalls : IAsyncDisposable, IDisposable
     {
         while (Volatile.Read(ref _closing) == 0)
         {
-            uint n;
+            uint n = 0;
             try
             {
                 // Blocks up to PollTimeoutMs; wakes at once when the table is closed.
-                n = Native.aster_upcall_poll(_runtime.Handle, _handle, (UpcallEventNative*)_events, Batch, PollTimeoutMs);
+                int status = Native.aster_upcall_poll(_runtime.Handle, _handle, (UpcallEventNative*)_events, Batch, PollTimeoutMs, &n);
+                if (status != (int)Status.OK)
+                {
+                    n = 0;
+                    if (Volatile.Read(ref _closing) != 0) return;
+                    Thread.Sleep(10); // refused (unknown handle, ...): do not spin
+                }
             }
             catch (Exception ex)
             {
