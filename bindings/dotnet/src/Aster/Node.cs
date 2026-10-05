@@ -186,6 +186,13 @@ public sealed class Node : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Prometheus text exposition of the process's metrics (<c>aster_metrics_prometheus</c>: the same
+    /// text <c>/metrics</c> serves). The pipeline is process-wide, so this is not specific to the node.
+    /// Null while no <see cref="Health.HealthServer"/> has given the pipeline a pull reader.
+    /// </summary>
+    public string? MetricsPrometheus() => Observability.AsterObservability.MetricsText();
+
+    /// <summary>
     /// Admission events for a node started with <see cref="AsterConfig.EnableHooks"/> and no
     /// gate. Every request must be answered (<see cref="AdmissionRequest.Allow"/> /
     /// <see cref="AdmissionRequest.Deny"/>), otherwise the hook times out and the configured

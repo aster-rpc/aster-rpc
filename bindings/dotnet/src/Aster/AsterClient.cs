@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Aster.Codec;
 using Aster.Interceptors;
+using Aster.Observability;
 using Aster.Rpc;
 
 namespace Aster;
@@ -87,13 +88,17 @@ public sealed class AsterClient : IAsyncDisposable
     public static async Task<AsterClient> StartAsync(AsterConfig? config = null, ICodec? codec = null,
         IEnumerable<IInterceptor>? interceptors = null, CancellationToken cancellationToken = default)
     {
+        AsterObservability.EnsureStarted();
         var node = await Node.StartAsync(config, null, [AsterServer.AsterAlpn], cancellationToken).ConfigureAwait(false);
         return new AsterClient(node, codec ?? new ForyCodec(), ownsNode: true, interceptors);
     }
 
     /// <summary>A client on an existing node (which the caller keeps owning).</summary>
     public static AsterClient Create(Node node, ICodec? codec = null, IEnumerable<IInterceptor>? interceptors = null)
-        => new(node, codec ?? new ForyCodec(), ownsNode: false, interceptors);
+    {
+        AsterObservability.EnsureStarted();
+        return new(node, codec ?? new ForyCodec(), ownsNode: false, interceptors);
+    }
 
     public Node Node => _node;
 
@@ -216,7 +221,9 @@ public sealed class RpcConnection : IAsyncDisposable
     {
         public readonly byte[] Service = Encoding.UTF8.GetBytes(service);
         public readonly byte[] Method = Encoding.UTF8.GetBytes(method);
-        public readonly byte[] Metadata = options?.Metadata is { Count: > 0 } md ? KvList.Encode(md) : Array.Empty<byte>();
+        // The current Activity (any source) is the parent of the call: traceparent / baggage go out as
+        // call metadata and the Rust client span nests under it (design §5.4).
+        public readonly byte[] Metadata = Tracing.Inject(options?.Metadata) is { Count: > 0 } md ? KvList.Encode(md) : Array.Empty<byte>();
         public readonly uint SessionId = unchecked((uint)(options?.SessionId ?? 0));
         public readonly uint DeadlineMs = options?.DeadlineMs ?? 0;
         public readonly int Version = options?.Version ?? 1;

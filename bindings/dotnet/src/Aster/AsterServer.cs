@@ -1,13 +1,16 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Aster.Codec;
+using Aster.Health;
 using Aster.Interceptors;
+using Aster.Observability;
 using Aster.Rpc;
 
 namespace Aster;
@@ -43,6 +46,7 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
     private readonly Node _node;
     private readonly Gate? _ownedGate;
     private readonly DispatchServer _dispatch;
+    private readonly HealthServer? _health;
     private readonly ICodec _codec;
     private readonly Dictionary<string, ServiceDefinition> _services;
     private readonly ServiceDefinition[] _byIndex;
@@ -66,7 +70,7 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
 
     private static readonly IReadOnlyDictionary<string, string> NoAttributes = new Dictionary<string, string>();
 
-    private AsterServer(Node node, Gate? ownedGate, Gate gate, DispatchServer dispatch, ICodec codec,
+    private AsterServer(Node node, Gate? ownedGate, Gate gate, DispatchServer dispatch, HealthServer? health, ICodec codec,
         Dictionary<string, ServiceDefinition> services, ServiceDefinition[] byIndex, IReadOnlyList<IInterceptor> interceptors)
     {
         _interceptors = interceptors;
@@ -74,6 +78,7 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
         _ownedGate = ownedGate;
         Gate = gate;
         _dispatch = dispatch;
+        _health = health;
         _codec = codec;
         _services = services;
         _byIndex = byIndex;
@@ -92,6 +97,8 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
             if (!services.TryAdd(s.Name, s))
                 throw new ArgumentException($"service {s.Name} registered twice");
 
+        AsterObservability.EnsureStarted();
+
         ICodec codec = options.Codec ?? new ForyCodec();
         if (codec is ForyCodec fory)
             foreach (var m in services.Values.SelectMany(s => s.Methods.Values))
@@ -103,24 +110,29 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
             .SetTrustMode(config.AllowAllConsumers ? TrustMode.OpenDev : TrustMode.Protected)
             .SetAdmissionAlpns([ConsumerAdmissionAlpn]));
         Node? node = null;
+        HealthServer? health = null;
         try
         {
             node = await Node.StartAsync(config, gate, [AsterAlpn, ConsumerAdmissionAlpn], cancellationToken).ConfigureAwait(false);
             var byIndex = new ServiceDefinition[services.Count];
+            if (options.Health is { } healthOptions)
+                health = await HealthServer.StartAsync(node, healthOptions).ConfigureAwait(false);
             DispatchServer dispatch;
             using (var builder = new DispatchServer.Builder(node.Runtime.Handle, node.Handle.Value))
             {
                 foreach (var s in services.Values)
                     byIndex[builder.AddServiceJson(s.RegistrationJson)] = s;
+                if (health is not null) builder.AttachHealth(health.Handle);
                 builder.Option(DispatchServerOption.MaxSessionsPerConnection, (ulong)options.MaxSessionsPerConnection);
                 if (options.HandlerTimeout is { } cap)
                     builder.Option(DispatchServerOption.HandlerTimeoutMs, cap <= TimeSpan.Zero ? 0 : (ulong)Math.Ceiling(cap.TotalMilliseconds));
                 dispatch = builder.Start(options.RingCapacity);
             }
-            return new AsterServer(node, ownedGate, gate, dispatch, codec, services, byIndex, options.Interceptors.ToList());
+            return new AsterServer(node, ownedGate, gate, dispatch, health, codec, services, byIndex, options.Interceptors.ToList());
         }
         catch
         {
+            health?.Dispose();
             node?.Dispose();
             ownedGate?.Dispose();
             throw;
@@ -129,6 +141,9 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
 
     /// <summary>The server's node.</summary>
     public Node Node => _node;
+
+    /// <summary>The ops listener started from <see cref="AsterServerOptions.Health"/>, or null.</summary>
+    public HealthServer? Health => _health;
 
     /// <summary>The Gate-0 policy guarding the node (admit peers here unless dev mode is on).</summary>
     public Gate Gate { get; }
@@ -321,9 +336,13 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
     private async Task DispatchAsync(Inbound inbound)
     {
         ServerCall? call = null;
+        // The handler runs inside an Activity parented on the Rust server span, so Activity.Current
+        // (and everything .NET instruments off it) joins the call's trace.
+        Activity? activity = null;
         try
         {
             var flags = inbound.Flags;
+            activity = Tracing.StartInbound(_dispatch, inbound.CallId, flags, inbound.Service.Name, inbound.Method.Name);
             IReadOnlyList<KeyValuePair<string, string>> metadata = (flags & DispatchFlags.HasMetadata) != 0
                 ? _dispatch.Metadata(inbound.CallId)
                 : Array.Empty<KeyValuePair<string, string>>();
@@ -347,6 +366,7 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
         }
         catch (Exception e)
         {
+            activity?.RecordException(e);
             try
             {
                 if (call != null)
@@ -358,6 +378,7 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
         }
         finally
         {
+            activity?.Dispose();
             if (call is { Completed: false }) call.Abandon();
             _live.TryRemove(inbound.CallId, out _);
             Interlocked.Decrement(ref _inFlight);
@@ -419,6 +440,7 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
         for (int i = 0; i < 50 && Volatile.Read(ref _inFlight) > 0; i++)
             await Task.Delay(20).ConfigureAwait(false);
         _dispatch.Dispose();
+        _health?.Dispose();
         foreach (var state in _sessions.Values) DisposeSession(state);
         _sessions.Clear();
         await _node.DisposeAsync().ConfigureAwait(false);
@@ -461,6 +483,12 @@ public sealed class AsterServerOptions
     /// <c>RESOURCE_EXHAUSTED</c> from Rust. Default 1024.
     /// </summary>
     public int MaxSessionsPerConnection { get; init; } = 1024;
+
+    /// <summary>
+    /// Starts the ops listener (<c>/healthz</c>, <c>/readyz</c>, <c>/metrics</c>) on the server's node and
+    /// attaches it: ready after a successful start, not ready first on dispose. Null = no listener.
+    /// </summary>
+    public HealthOptions? Health { get; init; }
 
     /// <summary>Cap on any handler's run time (null = Rust's default, 300 s; zero = no cap).</summary>
     public TimeSpan? HandlerTimeout { get; init; }

@@ -40,6 +40,10 @@ internal enum DispatchFlags : uint
     IrohAuthenticated = 0x4,
     HasMetadata = 0x100,
     HasAttributes = 0x200,
+    /// <summary>The server span is exported: <c>aster_dispatch_trace_context</c> has its context (ABI 4.6).</summary>
+    HasTrace = 0x400,
+    /// <summary>The call carried baggage / tracestate: <c>aster_dispatch_inbound_trace</c> (ABI 4.6).</summary>
+    HasInboundTrace = 0x800,
 }
 
 /// <summary><c>aster_server_option_t</c>.</summary>
@@ -113,6 +117,13 @@ internal sealed class DispatchServer : IDisposable
         public Builder Option(DispatchServerOption key, ulong value)
         {
             Native.Check(Native.aster_server_set_option(_handle, (uint)key, value), "aster_server_set_option");
+            return this;
+        }
+
+        /// <summary>Attaches an ops listener (<c>aster_server_attach_health</c>): ready after a successful start.</summary>
+        public Builder AttachHealth(ulong health)
+        {
+            Native.Check(Native.aster_server_attach_health(_handle, health), "aster_server_attach_health");
             return this;
         }
 
@@ -325,6 +336,38 @@ internal sealed class DispatchServer : IDisposable
             : Native.aster_dispatch_metadata(_runtime, _handle, callId, &ptr, &len, &buffer);
         if (r == (int)Status.NotFound) return Array.Empty<KeyValuePair<string, string>>();
         if (r != 0) throw IrohException.FromStatus(r, attributes ? "aster_dispatch_attributes" : "aster_dispatch_metadata");
+        try { return KvList.Decode(new ReadOnlySpan<byte>(ptr, (int)len)); }
+        finally { BufferRelease(buffer); }
+    }
+
+    /// <summary>
+    /// The Rust server span of a live call as an <see cref="System.Diagnostics.ActivityContext"/> (parent of the
+    /// handler's activity). False when the call is over or its span is not exported (all-zero context).
+    /// </summary>
+    public unsafe bool TryTraceContext(ulong callId, out System.Diagnostics.ActivityContext context, string? traceState = null)
+    {
+        context = default;
+        if (_disposed) return false;
+        SpanContextNative c = default;
+        if (Native.aster_dispatch_trace_context(_runtime, _handle, callId, &c) != 0) return false;
+        var raw = new ReadOnlySpan<byte>(c.trace_id, 16);
+        if (raw.IndexOfAnyExcept((byte)0) < 0) return false;
+        var traceId = System.Diagnostics.ActivityTraceId.CreateFromBytes(raw);
+        var spanId = System.Diagnostics.ActivitySpanId.CreateFromBytes(new ReadOnlySpan<byte>(c.span_id, 8));
+        context = new System.Diagnostics.ActivityContext(traceId, spanId, (System.Diagnostics.ActivityTraceFlags)(c.trace_flags & 1), traceState, isRemote: false);
+        return true;
+    }
+
+    /// <summary>The call's inbound W3C <c>baggage</c> and <c>tracestate</c> (keys of that name; empty when none or the call is over).</summary>
+    public unsafe IReadOnlyList<KeyValuePair<string, string>> InboundTrace(ulong callId)
+    {
+        if (_disposed) return Array.Empty<KeyValuePair<string, string>>();
+        byte* ptr = null;
+        uint len = 0;
+        ulong buffer = 0;
+        int r = Native.aster_dispatch_inbound_trace(_runtime, _handle, callId, &ptr, &len, &buffer);
+        if (r == (int)Status.NotFound) return Array.Empty<KeyValuePair<string, string>>();
+        if (r != 0) throw IrohException.FromStatus(r, "aster_dispatch_inbound_trace");
         try { return KvList.Decode(new ReadOnlySpan<byte>(ptr, (int)len)); }
         finally { BufferRelease(buffer); }
     }

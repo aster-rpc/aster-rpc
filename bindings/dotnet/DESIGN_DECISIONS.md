@@ -7,10 +7,10 @@
 **C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 4.5, 2026-10-04)
+## STATUS (ABI 4.6, 2026-10-05)
 
 - **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
-  `Native.RequiredAbiMinor` = 5 for the 4.5 cancel tokens; 4.0 removed the reactor, framed calls, the node factories and
+  `Native.RequiredAbiMinor` = 6 for the 4.6 observability and health functions (4.5 added the cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
@@ -30,7 +30,7 @@
 - **Node:** `Node.StartAsync(AsterConfig, Gate?, extraAlpns)` on `aster_node_start`;
   `AsterConfig` is a record with `FromEnv()` / `FromToml()` resolved by the Rust
   `aster::AsterConfig`. Gate 0 (`Gate`), admission events (`Node.Admissions` +
-  `AdmissionRequest.Allow/Deny`), tickets (`AsterTicket`), Prometheus metrics.
+  `AdmissionRequest.Allow/Deny`), tickets (`AsterTicket`), Prometheus metrics (`Node.MetricsPrometheus()` / `AsterObservability.MetricsText()`, from `aster_metrics_prometheus`; null until an ops listener gave the pipeline a pull reader).
   `Node.MemoryWithAlpnsAsync` is gone (use `StartAsync`). `Endpoint` is a connect/accept view
   of a node: since ABI 4.0 has no bare endpoints, `Endpoint.CreateAsync(runtime, builder)` starts
   an in-memory node on that runtime with the builder's ALPNs (`aster_node_start`) and uses the
@@ -112,6 +112,36 @@
   coordination operation (recover with `UnacknowledgedAsync`). ROOT administers the group but holds no lease/read rights itself: actors need a grant
   (the live tests use workers granted by the ROOT client). Live tests use the TS suite's `aster-coordination-fixture` (build it with
   `cargo build -p aster-transport-napi --features coordination-fixture --bin aster-coordination-fixture`, or set `ASTER_COORDINATION_FIXTURE`); they skip when it is absent.
+- **Observability and health (ABI 4.6, O9; design `docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md`):**
+  everything runs in Rust (`aster-otel`); the binding starts it and bridges. `Aster.Observability`:
+  - `AsterObservability.Init(ObservabilityOptions)` / `Flush` / `Shutdown` / `MetricsText()` over
+    `aster_observability_*`. Each `Init` that succeeds holds one reference; `Shutdown` drops all of them. A different
+    configuration than the running pipeline's throws `IrohException` with `Status.AlreadyExists` (17, new). `AsterServer` and `AsterClient`
+    start call `EnsureStarted()` (log bridge + Activity bridge, exporters only when `OTEL_*` asks), so call `Init` first to configure.
+    The C ABI cannot force a signal off against the environment: `Traces/Metrics/OtlpLogs = true` sets the flag, null or false leaves it to `OTEL_*` (`FromEnv`) or off.
+  - **ILogger bridge** (`AsterLogging`): a background `aster-log-poll` thread runs `aster_log_poll` (256 per batch, 250 ms wait, single poller)
+    and logs each record on an `ILogger` of category target-with-dots (`aster.rpc.dispatch`) after an `IsEnabled` check, inside a scope
+    with `TraceId` / `SpanId` (the keys `ActivityTrackingOptions` uses), `aster.call_id`, `aster.audit`; state = the event fields + `aster.origin=rust` + `{OriginalFormat}`.
+    `AsterLogging.UseLoggerFactory(factory)` sets the factory (none: Warning and above to stderr). Level sync: `SyncLevel()` pushes `warn,aster=<lowest enabled level>` through
+    `aster_log_set_filter`; the thread re-checks every 5 s; an explicit `LogFilter` or `ASTER_LOG` pins it. *Deviation:* no `IOptionsMonitor<LoggerFilterOptions>.OnChange` hook
+    (that needs `Microsoft.Extensions.Options`; the package reference is `Microsoft.Extensions.Logging.Abstractions` only), so the 5 s re-check and `SyncLevel()` are the sync paths.
+  - **Metrics:** `Metrics.Counter/UpDownCounter/Histogram(boundaries)/Gauge`, `Metrics.Attributes(...)` (`aster_attrset_*`). Instruments declare lazily and
+    re-declare when a pipeline shutdown freed their handle (`NOT_FOUND`). `autoAttrs` / `cardinalityLimit` are accepted, with no effect yet (as in every binding).
+    `Metrics` holds no .NET `System.Diagnostics.Metrics` bridge. The old `MetricsInterceptor` is deleted (the built-ins record in Rust).
+  - **Activity bridge** (design §5.3, decision Q9): source `ActivitySource("Aster")` (`Tracing.Source`). *Inbound:* the handler runs inside an `Activity`
+    (`<service>/<method> handler`, kind Internal) whose parent is the Rust server span (`aster_dispatch_trace_context`, `ASTER_DISPATCH_FLAG_HAS_TRACE`) and whose
+    baggage is the inbound W3C `baggage` (`aster_dispatch_inbound_trace`); so HttpClient, ASP.NET Core, EF Core and `Tracing.StartSpan` children join the trace.
+    A call with baggage but no exported span gets a baggage-only carrier (source `Aster.Carrier`, never exported; outbound calls then send `baggage` without `traceparent`).
+    *Export:* an `ActivityListener` on source `Aster` (registered by `Init`, removed by `Shutdown`) reports each stopped, recorded activity with `aster_span_record`
+    (ids, times, kind, status, tags, events; links are not carried). `Sample` returns `AllDataAndRecorded` only when the parent is sampled (a root is offered to Rust's sampler),
+    else `PropagationData`. *Outbound:* every client call reads `Activity.Current` (any source) and sends `traceparent` + `baggage` as call metadata (`Tracing.Inject`); Rust
+    parents its client span on it. *One export path:* the OpenTelemetry .NET SDK must not subscribe to source `Aster`; when another listener records an Aster activity whose in-process
+    parent is unsampled, the bridge skips it and warns once (a bare remote parent cannot be told apart, so the rule stays: do not subscribe).
+    `Tracing.WithTraceContext(traceparent, baggage)` continues a trace that arrived another way; `Activity.RecordException` is an extension in `Tracing`.
+  - **`Aster.Health`:** `HealthServer.Start(node, HealthOptions)` over `aster_health_*` (`/healthz`, `/readyz` with `Check(name)`, `/metrics`);
+    `AsterServerOptions.Health` starts one on the server's node and attaches it (`aster_server_attach_health`: ready after start, not ready first on dispose; the server owns and stops it).
+    The .NET `AsterConfig` has no health fields, so the listener is configured through `HealthOptions` (127.0.0.1 and an ephemeral port by default).
+  - Tests: `ObservabilityTests` (xUnit, `-warnaserror`): end to end against a loopback OTLP/HTTP receiver that decodes the exported spans.
 - **Interop:** joins `tests/interop/` (`tests/interop/dotnet/`), 5×5 matrix all pass.
 - `Bytes.FromArray` (unpinned pointer) is removed; use `fixed` + `Bytes.FromPointer`,
   `Bytes.FromPinned`, or the internal `NativeScope`.
