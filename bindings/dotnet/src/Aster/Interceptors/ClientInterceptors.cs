@@ -85,6 +85,23 @@ internal sealed class ClientInterceptors
         return o;
     }
 
+    /// <summary>Consult every breaker; if one refuses, give back the slots the others took.</summary>
+    private void Admit()
+    {
+        for (int i = 0; i < _breakers.Length; i++)
+        {
+            try
+            {
+                _breakers[i].BeforeCall();
+            }
+            catch
+            {
+                for (int j = 0; j < i; j++) _breakers[j].ReleaseProbe();
+                throw;
+            }
+        }
+    }
+
     private void CheckDeadlines(CallContext ctx)
     {
         foreach (var d in _deadlines) d.CheckDeadline(ctx);
@@ -101,7 +118,7 @@ internal sealed class ClientInterceptors
         {
             ct.ThrowIfCancellationRequested();
             ctx.Attempt = attempt;
-            foreach (var b in _breakers) b.BeforeCall();
+            Admit();
 
             try
             {
@@ -113,7 +130,13 @@ internal sealed class ClientInterceptors
                 foreach (var b in _breakers) b.RecordSuccess();
                 return response;
             }
-            catch (Exception ex) when (!IsCallerCancellation(ex, ct))
+            catch (Exception ex) when (IsCallerCancellation(ex, ct))
+            {
+                // No verdict on the peer: give back any half-open probe slot.
+                foreach (var b in _breakers) b.ReleaseProbe();
+                throw;
+            }
+            catch (Exception ex)
             {
                 RpcError error = Normalize(ex);
                 foreach (var b in _breakers) b.RecordFailure(error);

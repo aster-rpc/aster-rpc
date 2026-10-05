@@ -100,6 +100,22 @@ public class CircuitBreakerInterceptor : IInterceptor
     }
 
     /// <summary>
+    /// Give back a half-open probe slot taken by <see cref="BeforeCall"/> for a call whose outcome
+    /// says nothing about the peer's health (refused by another breaker, or cancelled by the
+    /// caller). Without it the breaker stays half-open with no free slot and refuses every later call.
+    /// </summary>
+    public void ReleaseProbe()
+    {
+        lock (_gate) ReleaseProbeLocked();
+    }
+
+    private void ReleaseProbeLocked()
+    {
+        if (_state == StateHalfOpen && _halfOpenCalls > 0)
+            _halfOpenCalls--;
+    }
+
+    /// <summary>
     /// Record a failed call -- may trip the circuit to open. Only Unavailable, Internal and
     /// Unknown count. A half-open probe that fails with any other code frees its probe slot (the
     /// peer answered, so it neither closes nor re-opens the circuit) instead of leaving the
@@ -111,8 +127,7 @@ public class CircuitBreakerInterceptor : IInterceptor
         {
             if (!TrippingCodes.Contains(error.Code))
             {
-                if (_state == StateHalfOpen && _halfOpenCalls > 0)
-                    _halfOpenCalls--;
+                ReleaseProbeLocked();
                 return;
             }
 

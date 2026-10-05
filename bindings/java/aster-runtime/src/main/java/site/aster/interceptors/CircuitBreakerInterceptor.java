@@ -94,11 +94,23 @@ public final class CircuitBreakerInterceptor implements Interceptor {
   }
 
   /**
+   * Gives back a half-open probe slot taken by {@link #beforeCall()} for a call whose outcome says
+   * nothing about the peer's health (refused by another breaker, or cancelled by the caller).
+   * Without it the breaker stays half-open with no free slot and refuses every later call.
+   */
+  public synchronized void releaseProbe() {
+    if (state == State.HALF_OPEN && halfOpenCalls > 0) {
+      halfOpenCalls--;
+    }
+  }
+
+  /**
    * An attempt failed with {@code error}. Only {@code UNAVAILABLE}, {@code INTERNAL} and {@code
    * UNKNOWN} count; a half-open failure reopens immediately.
    */
   public synchronized void recordFailure(RpcError error) {
     if (!TRIP_CODES.contains(error.code())) {
+      releaseProbe(); // not a verdict on the peer, but the call is over
       return;
     }
 

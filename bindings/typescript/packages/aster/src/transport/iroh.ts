@@ -10,7 +10,7 @@
  * Requires the NAPI-RS addon (`@aster-rpc/transport`).
  */
 
-import { currentTraceparent, traceMetadata } from '../tracing.js';
+import { traceMetadata } from '../tracing.js';
 import type {
   IrohConnection,
   RpcConnection as NativeRpcConnection,
@@ -53,9 +53,7 @@ export function mapTransportError(e: unknown): RpcError {
 function metadataList(metadata?: Record<string, string>): string[] | undefined {
   // The current trace context rides along as `traceparent` / `baggage`
   // (Rust parents the client span on it); explicit metadata wins.
-  const trace = currentTraceparent() ? traceMetadata() : undefined;
-  if (!metadata && !trace) return undefined;
-  const merged = trace ? { ...trace, ...metadata } : metadata!;
+  const merged = { ...traceMetadata(), ...metadata };
   let out: string[] | undefined;
   for (const k in merged) {
     (out ??= []).push(k, String(merged[k]));
@@ -219,6 +217,11 @@ export class IrohTransport implements AsterTransport {
     } catch (e) {
       throw mapTransportError(e);
     }
+    // The signal may have fired while the native call was opening.
+    if (signal?.aborted) {
+      void call.cancel();
+      throw cancelledError();
+    }
     const onAbort = () => void call.cancel();
     signal?.addEventListener('abort', onAbort, { once: true });
     let done = false;
@@ -266,6 +269,11 @@ export class IrohTransport implements AsterTransport {
       );
     } catch (e) {
       throw mapTransportError(e);
+    }
+    // The signal may have fired while the native call was opening.
+    if (signal?.aborted) {
+      void call.cancel();
+      throw cancelledError();
     }
     const onAbort = () => void call.cancel();
     signal?.addEventListener('abort', onAbort, { once: true });

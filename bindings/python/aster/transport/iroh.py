@@ -17,6 +17,7 @@ Rust clients on one connection never collide.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from aster.codec import ForyCodec, ForyConfig
@@ -265,6 +266,7 @@ class IrohBidiChannel(BidiChannel):
         self._stream: Any = None
         self._buffer: list[bytes] = []
         self._sent_end_stream = False
+        self._open_lock = asyncio.Lock()
         self._last_trailer: tuple[int, str] | None = None
 
     async def __aenter__(self) -> "IrohBidiChannel":
@@ -280,18 +282,26 @@ class IrohBidiChannel(BidiChannel):
                 pass
 
     async def _ensure_open(self) -> None:
-        if self._stream is not None:
-            return
-        t = self._transport
-        self._sink, self._stream = await t._client.bidi_open(
-            self._service,
-            self._method,
-            version=t._version_of(self._service),
-            session_id=t._session_id,
-            deadline=float(self._deadline_secs),
-            serialization_mode=self._serialization_mode,
-            metadata=_metadata(self._metadata),
-        )
+        async with self._open_lock:
+            if self._stream is not None:
+                return
+            t = self._transport
+            sink, stream = await t._client.bidi_open(
+                self._service,
+                self._method,
+                version=t._version_of(self._service),
+                session_id=t._session_id,
+                deadline=float(self._deadline_secs),
+                serialization_mode=self._serialization_mode,
+                metadata=_metadata(self._metadata),
+            )
+            self._sink, self._stream = sink, stream
+            if self._sent_end_stream:
+                # close() ran before the call opened: end the empty request side.
+                try:
+                    await sink.finish()
+                except Exception:
+                    pass
 
     async def send(self, msg: Any) -> None:
         if self._sent_end_stream:

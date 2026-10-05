@@ -227,8 +227,13 @@ func retryLoop[T any](ctx context.Context, ch *callChain, cc *CallContext, o *ca
 	for n := 1; ; n++ {
 		cc.Attempt = n
 		cc.Metadata = metaMap(o.metadata)
-		for _, b := range ch.breakers {
+		for i, b := range ch.breakers {
 			if err := b.BeforeCall(); err != nil {
+				// The call never leaves: give back the slots the earlier
+				// breakers took.
+				for _, a := range ch.breakers[:i] {
+					a.ReleaseProbe()
+				}
 				return nil, err
 			}
 		}

@@ -123,9 +123,7 @@ final class Interception {
         throw new CancellationException("call cancelled");
       }
       ctx.setAttempt(n);
-      for (CircuitBreakerInterceptor b : breakers) {
-        b.beforeCall();
-      }
+      admit(breakers);
       try {
         Object current =
             perItem
@@ -139,6 +137,10 @@ final class Interception {
         return response;
       } catch (Throwable t) {
         if (cancelled.getAsBoolean()) {
+          // No verdict on the peer: give back any half-open probe slot.
+          for (CircuitBreakerInterceptor b : breakers) {
+            b.releaseProbe();
+          }
           throw t;
         }
         RpcError error = normalize(t);
@@ -165,6 +167,20 @@ final class Interception {
       }
     }
     throw last != null ? last : new RpcError(StatusCode.INTERNAL, "call failed");
+  }
+
+  /** Consult every breaker; if one refuses, give back the slots the others took. */
+  private static void admit(List<CircuitBreakerInterceptor> breakers) {
+    for (int i = 0; i < breakers.size(); i++) {
+      try {
+        breakers.get(i).beforeCall();
+      } catch (RuntimeException e) {
+        for (int j = 0; j < i; j++) {
+          breakers.get(j).releaseProbe();
+        }
+        throw e;
+      }
+    }
   }
 
   /** Request interceptors in order. */

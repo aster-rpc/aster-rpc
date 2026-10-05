@@ -720,7 +720,7 @@ func (cb *CircuitBreakerInterceptor) beforeCall() error {
 // BeforeCall is the gate a client call passes before it is sent: nil when the
 // call may proceed, else the UNAVAILABLE error of an open (or half-open and
 // busy) breaker. Every BeforeCall that returns nil must be followed by
-// RecordSuccess or RecordFailure for that call.
+// RecordSuccess, RecordFailure or ReleaseProbe for that call.
 func (cb *CircuitBreakerInterceptor) BeforeCall() error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -736,6 +736,22 @@ func (cb *CircuitBreakerInterceptor) RecordSuccess() {
 	cb.state = circuitClosed
 }
 
+// ReleaseProbe gives back a half-open probe slot taken by BeforeCall for a
+// call whose outcome says nothing about the peer's health (one refused by
+// another breaker, or cancelled by the caller). Without it the breaker stays
+// half-open with no free slot and refuses every later call.
+func (cb *CircuitBreakerInterceptor) ReleaseProbe() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.releaseProbe()
+}
+
+func (cb *CircuitBreakerInterceptor) releaseProbe() {
+	if cb.state == circuitHalfOpen && cb.halfOpenCalls > 0 {
+		cb.halfOpenCalls--
+	}
+}
+
 // RecordFailure records a failure and may trip the breaker open.
 func (cb *CircuitBreakerInterceptor) RecordFailure(err *RpcError) {
 	cb.mu.Lock()
@@ -749,11 +765,8 @@ func (cb *CircuitBreakerInterceptor) recordFailure(err *RpcError) {
 	case StatusUnavailable, StatusInternal, StatusUnknown:
 	default:
 		// Not a verdict on the service's health, but the call is over: give
-		// back its half-open probe slot, or the breaker would stay half-open
-		// and refuse every later call (the Python reference leaks it).
-		if cb.state == circuitHalfOpen && cb.halfOpenCalls > 0 {
-			cb.halfOpenCalls--
-		}
+		// back its half-open probe slot.
+		cb.releaseProbe()
 		return
 	}
 
