@@ -29,6 +29,15 @@ pub enum Error {
     LogDrainBusy,
     /// The operation needs a crate feature this build lacks.
     Unsupported(&'static str),
+    /// An argument to a binding-facing call (instrument, attribute set, span)
+    /// is invalid. The message names the problem, never a value that could be
+    /// a secret.
+    InvalidArgument(String),
+    /// No live handle of this kind (`"instrument"`, `"attribute set"`,
+    /// `"span"`): never issued, freed, or cleared by a pipeline shutdown.
+    NotFound(&'static str),
+    /// A bounded table is full (the live-span table, §2.4).
+    QueueFull(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -47,6 +56,9 @@ impl fmt::Display for Error {
                 f.write_str("a log drain is already active (one consumer per process)")
             }
             Error::Unsupported(what) => write!(f, "unsupported in this build: {what}"),
+            Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
+            Error::NotFound(what) => write!(f, "no such {what} handle"),
+            Error::QueueFull(what) => write!(f, "{what} is full"),
         }
     }
 }

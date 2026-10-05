@@ -26,6 +26,12 @@
 //!   accounting, an audit channel and a reentrancy guard. Opened by `init`
 //!   with [`ObservabilityConfig::log_bridge`].
 //!
+//! * O5: what the C ABI 4.6 wraps for every binding: [`instruments`]
+//!   (binding-declared counters, histograms, gauges and interned attribute
+//!   sets by handle, design §4.2), [`spans`] (binding spans by handle and
+//!   finished spans the binding recorded, §5.3) and [`TraceContext`] with its
+//!   W3C `traceparent` codec (§5.1).
+//!
 //! There is one global `tracing` subscriber, installed by whichever of
 //! [`init_stderr_from_env`] and [`init`] runs first; every layer in it sits
 //! behind `reload`, so the other fills its slot instead of competing for the
@@ -41,7 +47,10 @@ mod error;
 mod fork;
 #[cfg(feature = "otlp")]
 mod http;
+pub mod instruments;
 mod pipeline;
+mod propagation;
+pub mod spans;
 mod subscriber;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -62,6 +71,7 @@ pub use pipeline::{
 };
 #[cfg(feature = "prometheus")]
 pub use pipeline::{init_with_prometheus, render_prometheus, PROMETHEUS_TEXT_CONTENT_TYPE};
+pub use propagation::{TraceContext, TRACEPARENT_LEN};
 pub use subscriber::{
     init_stderr_from_env, layers, StderrInit, SubscriberStatus, DEFAULT_FILTER, ENV_FILTER,
     ENV_STDERR,

@@ -560,6 +560,11 @@ pub fn shutdown() -> Result<()> {
 
 fn teardown(a: Active) -> Result<()> {
     crate::bridge::close();
+    // Binding handles do not outlive the pipeline (§2.4, §7.1): open spans
+    // end (exported by the provider below as it shuts down), and instrument
+    // and attribute set handles are freed.
+    crate::spans::end_all();
+    crate::instruments::clear();
     if let Some(s) = subscriber::slots() {
         let _ = s.spans.reload(SlotFilter::off());
         #[cfg(feature = "otlp-logs")]
@@ -723,6 +728,7 @@ fn build_providers(
     let mut tb = SdkTracerProvider::builder()
         .with_resource(resource.clone())
         .with_sampler(sampler(c.sampler))
+        .with_id_generator(crate::spans::AsterIdGenerator::default())
         .with_span_limits(SpanLimits {
             max_attributes_per_span: c.span_max_attributes,
             max_events_per_span: c.span_max_events,

@@ -19,8 +19,8 @@
 //!   `aster.log.records_dropped` / `aster.log.audit_dropped` counters (§4.1),
 //!   and one synthetic WARN record (target [`DROP_REPORT_TARGET`]) at most once
 //!   per [`DROP_REPORT_INTERVAL`] from the drain. An audit drop also marks the
-//!   audit path [`audit_degraded`] for [`AUDIT_DEGRADED_WINDOW`] (§3.5; the
-//!   ops readiness check that reads it is not wired yet).
+//!   audit path [`audit_degraded`] for [`AUDIT_DEGRADED_WINDOW`] (§3.5;
+//!   `aster::ops` fails readiness on it).
 //! * **No feedback.** Events emitted on a thread inside [`suppress`] (every
 //!   [`LogDrain`] poll is) or on a thread marked with [`mark_drain_thread`] never
 //!   reach the queue, nor do events under an OTel telemetry-suppressed context
@@ -257,9 +257,16 @@ pub fn audit_dropped_total() -> u64 {
     AUDIT_DROPPED.load(Ordering::Relaxed)
 }
 
+/// Whether a bridge was ever opened in this process. The `aster.log.*`
+/// counters report only then (so pipelines without a bridge do not grow two
+/// always-zero series), and so does the ops `audit` readiness check.
+pub fn ever_opened() -> bool {
+    EVER_OPENED.load(Ordering::Relaxed)
+}
+
 /// True for [`AUDIT_DEGRADED_WINDOW`] after an audit record was dropped: the
-/// readiness signal of design §3.5 (`/readyz` fails until a drop-free window
-/// passes). Not wired into `aster::ops` yet.
+/// readiness signal of design §3.5 (`aster::ops` fails `/readyz` through its
+/// `audit` check until a drop-free window passes).
 pub fn audit_degraded() -> bool {
     let last = LAST_AUDIT_DROP.load(Ordering::Relaxed);
     if last == 0 {
@@ -273,13 +280,6 @@ fn note_audit_drop() {
     AUDIT_DROPPED.fetch_add(1, Ordering::Relaxed);
     let now = anchor().elapsed().as_millis() as u64 + 1;
     LAST_AUDIT_DROP.store(now, Ordering::Relaxed);
-}
-
-/// Whether a bridge was ever opened in this process (the `aster.log.*`
-/// counters report only then, so pipelines without a bridge do not grow two
-/// always-zero series).
-pub(crate) fn ever_opened() -> bool {
-    EVER_OPENED.load(Ordering::Relaxed)
 }
 
 /// Register the `aster.log.*` counters (§4.1) on a freshly built meter
