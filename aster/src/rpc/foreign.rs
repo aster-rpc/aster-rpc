@@ -222,6 +222,18 @@ fn empty_attributes() -> Arc<PeerAttributes> {
     EMPTY.get_or_init(Default::default).clone()
 }
 
+/// The server span of a foreign call, as plain bytes (design §5.2): what a
+/// binding parents its handler's spans and logs on. Present only when the
+/// call's span is exported (feature `otel`, a tracer provider installed, the
+/// span sampled or recorded).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct CallTraceContext {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    /// W3C trace flags; bit 0 = sampled.
+    pub trace_flags: u8,
+}
+
 /// One call delivered to the binding.
 pub struct ForeignCall {
     /// The [`CallTable`] key for every response operation. Unique per server.
@@ -256,6 +268,9 @@ pub struct ForeignCall {
     /// Owning handle: dropping it unanswered sends `INTERNAL "handler dropped
     /// call"`. Bindings that answer by id call [`CallHandle::detach`].
     pub handle: CallHandle,
+    /// The call's server span context, when it is exported (see
+    /// [`CallTraceContext`]).
+    pub trace_context: Option<CallTraceContext>,
 }
 
 impl fmt::Debug for ForeignCall {
@@ -525,6 +540,7 @@ impl Foreign {
         // For the delivery event only: the entry's `CallObs` owns the span,
         // which ends when the call does.
         let span = obs.span().clone();
+        let trace_context = obs.trace_context();
         let state = self.table.insert(|call_id, table| CallState {
             call_id,
             sender: response_sender,
@@ -539,6 +555,7 @@ impl Foreign {
             header: header.clone(),
             peer: peer_id.clone(),
             attributes: attributes.clone(),
+            trace_context,
             table,
         });
         let call_id = state.call_id;
@@ -579,6 +596,7 @@ impl Foreign {
             handle: CallHandle {
                 call: Some(CallRef(state)),
             },
+            trace_context,
         }));
 
         if let Some(at) = deadline {
@@ -858,6 +876,8 @@ pub(crate) struct CallState {
     /// The caller's attributes (shared with the [`ForeignCall`]), so bindings
     /// that answer by id can read them later ([`CallRef::attributes`]).
     attributes: Arc<PeerAttributes>,
+    /// The server span's context (shared with the [`ForeignCall`]).
+    trace_context: Option<CallTraceContext>,
     table: Weak<TableInner>,
 }
 
@@ -1152,6 +1172,12 @@ impl CallRef {
     /// The caller's attributes (the same as [`ForeignCall::attributes`]).
     pub fn attributes(&self) -> &Arc<PeerAttributes> {
         &self.0.attributes
+    }
+
+    /// The call's server span context (the same as
+    /// [`ForeignCall::trace_context`]).
+    pub fn trace_context(&self) -> Option<CallTraceContext> {
+        self.0.trace_context
     }
 
     /// Single-shot terminal response: one data frame (omitted when `payload`

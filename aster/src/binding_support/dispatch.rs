@@ -21,8 +21,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
 pub use crate::rpc::foreign::{
-    CallHandle, CallRef, CallTable, CancelReason, DispatchEvent, DispatchSink, ForeignCall,
-    PeerAttributes, SubmitError, FLAG_FIRST_IS_END, FLAG_IROH_AUTHENTICATED, FLAG_NEW_SESSION,
+    CallHandle, CallRef, CallTable, CallTraceContext, CancelReason, DispatchEvent, DispatchSink,
+    ForeignCall, PeerAttributes, SubmitError, FLAG_FIRST_IS_END, FLAG_IROH_AUTHENTICATED,
+    FLAG_NEW_SESSION,
 };
 
 use super::ring;

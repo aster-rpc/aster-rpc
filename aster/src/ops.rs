@@ -8,7 +8,7 @@
 //! | Route | Response |
 //! |---|---|
 //! | `GET /healthz` | `200 {"status":"ok","uptime_s":…}`, `503 {"status":"unhealthy",…}` once [`set_healthy(false)`](HealthState::set_healthy) |
-//! | `GET /readyz` | `200 {"status":"ready","services":n,"registry":b,"checks":{name:bool}}` when ready, else `503` with `"status":"not_ready"`. Ready = healthy, [`set_ready(true)`](HealthState::set_ready), and every named [`check`](HealthState::check) passing |
+//! | `GET /readyz` | `200 {"status":"ready","services":n,"registry":b,"checks":{name:bool}}` when ready, else `503` with `"status":"not_ready"`. Ready = healthy, [`set_ready(true)`](HealthState::set_ready), every named [`check`](HealthState::check) passing, and (once a binding log bridge is open) the built-in [`audit`](AUDIT_CHECK) check: no `aster::audit` record dropped in the last 30 s |
 //! | `GET /metrics` | Prometheus text exposition ([`PROMETHEUS_CONTENT_TYPE`]) from the OpenTelemetry pull reader: the built-in `aster.*` instruments, any custom ones, `process.uptime` and `target_info` |
 //! | anything else | `404 {"error":"not found"}`; non-`GET`/`HEAD` → `405` |
 //!
@@ -235,11 +235,13 @@ impl HealthState {
         self.inner.ready.store(ready, Ordering::Relaxed);
     }
 
-    /// Current readiness: healthy, the ready flag, and every check.
+    /// Current readiness: healthy, the ready flag, every check, and the
+    /// built-in `audit` check (see [`snapshot`](Self::snapshot)).
     pub fn is_ready(&self) -> bool {
         self.is_healthy()
             && self.inner.ready.load(Ordering::Relaxed)
             && self.lock_checks().values().all(ReadinessCheck::is_ok)
+            && audit_check().unwrap_or(true)
     }
 
     /// The named readiness check `name`, created **failing** on first use (a
@@ -285,13 +287,25 @@ impl HealthState {
         self.inner.started.elapsed()
     }
 
-    /// Copy every flag and check.
+    /// Copy every flag and check. Once a binding log bridge has been opened
+    /// in this process, the checks include the built-in `audit` check (design
+    /// §3.5): it fails for 30 s after an `aster::audit` record was dropped
+    /// (`aster_otel::bridge::audit_degraded`), so `/readyz` answers 503 and
+    /// operators can alert on it. A check the application named `audit` is
+    /// combined with it (both must pass).
     pub fn snapshot(&self) -> HealthSnapshot {
-        let checks: Vec<(String, bool)> = self
+        let mut checks: BTreeMap<String, bool> = self
             .lock_checks()
             .iter()
             .map(|(k, c)| (k.clone(), c.is_ok()))
             .collect();
+        if let Some(ok) = audit_check() {
+            checks
+                .entry(AUDIT_CHECK.to_owned())
+                .and_modify(|v| *v &= ok)
+                .or_insert(ok);
+        }
+        let checks: Vec<(String, bool)> = checks.into_iter().collect();
         let healthy = self.is_healthy();
         HealthSnapshot {
             uptime_s: self.uptime().as_secs_f64(),
@@ -314,6 +328,15 @@ impl HealthState {
     pub fn readyz_json(&self) -> String {
         readyz_value(&self.snapshot()).to_string()
     }
+}
+
+/// The name of the built-in audit readiness check (design §3.5).
+pub const AUDIT_CHECK: &str = "audit";
+
+/// The audit check: `None` until a log bridge has been opened in this
+/// process, then whether no audit record was dropped in the last 30 s.
+fn audit_check() -> Option<bool> {
+    aster_otel::bridge::ever_opened().then(|| !aster_otel::bridge::audit_degraded())
 }
 
 fn round1(v: f64) -> f64 {

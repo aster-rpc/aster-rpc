@@ -621,6 +621,19 @@ fn span_status(span: &Span, code: StatusCode) {
 }
 
 /// An OTel event on `span` (no attributes).
+/// The OTel span context behind `span`, when it is valid.
+pub(crate) fn span_trace_context(span: &Span) -> Option<crate::rpc::foreign::CallTraceContext> {
+    let cx = span.context();
+    let otel_span = cx.span();
+    let sc = otel_span.span_context();
+    sc.is_valid()
+        .then(|| crate::rpc::foreign::CallTraceContext {
+            trace_id: sc.trace_id().to_bytes(),
+            span_id: sc.span_id().to_bytes(),
+            trace_flags: sc.trace_flags().to_u8(),
+        })
+}
+
 pub(crate) fn span_event(span: &Span, name: &'static str) {
     if !span.is_disabled() {
         span.add_event(name, Vec::new());

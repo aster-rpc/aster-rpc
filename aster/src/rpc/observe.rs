@@ -193,6 +193,16 @@ impl CallObs {
         &self.span
     }
 
+    /// The OTel context of the call's span when it is exported (sampled or
+    /// recorded), for a foreign call's binding (design §5.2).
+    pub(crate) fn trace_context(&self) -> Option<super::foreign::CallTraceContext> {
+        #[cfg(feature = "otel")]
+        if self.otel.is_some() && !self.span.is_disabled() {
+            return otel::span_trace_context(&self.span);
+        }
+        None
+    }
+
     /// Add an OTel event to the span (cancel and deadline, design §5.2).
     pub(crate) fn event(&self, name: &'static str) {
         #[cfg(feature = "otel")]

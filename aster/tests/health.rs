@@ -60,6 +60,7 @@ fn child() {
             "after_init_without_reader" => case_after_init_without_reader().await,
             "after_init_with_reader" => case_after_init_with_reader().await,
             "gate0" => case_gate0().await,
+            "audit_readiness" => case_audit_readiness(),
             other => panic!("unknown case {other}"),
         }
     });
@@ -660,7 +661,51 @@ async fn case_gate0() {
     srv.shutdown().await;
 }
 
+/// Design §3.5: once a log bridge is open, `/readyz` carries an `audit`
+/// check, and a dropped `aster::audit` record fails readiness.
+fn case_audit_readiness() {
+    let state = aster::ops::HealthState::new(None);
+    state.set_ready(true);
+    assert!(state.is_ready());
+    assert!(
+        state.snapshot().checks.is_empty(),
+        "no audit check before a bridge is opened"
+    );
+    let handle = aster_otel::init(ObservabilityConfig {
+        from_env: false,
+        traces_exporter: Some(vec![]),
+        log_bridge: Some(true),
+        log_filter: Some("warn".into()),
+        log_audit_queue: Some(1),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(state.snapshot().checks, [("audit".to_string(), true)]);
+    assert!(state.is_ready());
+    // Nobody drains: the second record overflows the one-slot audit channel.
+    for n in 0..2 {
+        tracing::info!(target: "aster::audit", n, "synthetic audit record");
+    }
+    assert!(aster_otel::bridge::audit_dropped_total() >= 1);
+    let snap = state.snapshot();
+    assert!(!snap.ready);
+    assert_eq!(snap.checks, [("audit".to_string(), false)]);
+    assert!(!state.is_ready());
+    let resp = aster::ops::route(&state, &hyper_get("/readyz"));
+    assert_eq!(resp.status(), 503);
+    drop(handle);
+}
+
+fn hyper_get(path: &str) -> hyper::Request<()> {
+    hyper::Request::get(path).body(()).unwrap()
+}
+
 // ── tests (parent side) ─────────────────────────────────────────────────────
+
+#[test]
+fn audit_drop_fails_readiness() {
+    run("audit_readiness");
+}
 
 #[test]
 fn endpoints_readiness_checks_and_shutdown() {
