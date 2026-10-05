@@ -116,8 +116,8 @@ crate_version = "0.101.0"
 [forks.salvo]
 repo = "https://forge.emrul.dev/Aster/salvo.git"
 upstream_base = "v1.0.0"
-tag = "v1.0.0-aster.2"  # also aster-salvo-2026-10-03.2
-commit = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+tag = "v1.0.0-aster.3"  # also aster-salvo-2026-10-05
+commit = "e9b48e52fdf87c3fcae9b4788f53142fd0994415"
 branch = "main"
 crates = ["salvo", "salvo_core", "salvo_macros", "salvo-http3", "h3", "h3-quinn", "h3-datagram"]
 registry_crates = [
@@ -128,7 +128,7 @@ registry_crates = [
   "salvo-serde-util", "salvo-serve-static", "salvo-session", "salvo-tus",
   "salvo_core", "salvo_extra", "salvo_macros",
 ]
-crate_version = "1.0.1"
+crate_version = "1.0.2"
 
 # Fory is part of Aster's supported native surface, but this release carries
 # the unmodified crates.io packages. Do not mirror third-party source merely to
@@ -229,11 +229,11 @@ iroh-util    = { git = "https://forge.emrul.dev/Aster/iroh-util.git",  rev = "af
 # salvo-http3 internally and [patch.crates-io] does not cross workspaces, so
 # every source-tree bootstrap root re-declares the whole family at the same rev:
 salvo_patch_crates_io = """
-salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "e9b48e52fdf87c3fcae9b4788f53142fd0994415" }
+salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "e9b48e52fdf87c3fcae9b4788f53142fd0994415" }
+salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "e9b48e52fdf87c3fcae9b4788f53142fd0994415" }
+salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "e9b48e52fdf87c3fcae9b4788f53142fd0994415" }
+h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "e9b48e52fdf87c3fcae9b4788f53142fd0994415" }
+h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "e9b48e52fdf87c3fcae9b4788f53142fd0994415" }
+h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "e9b48e52fdf87c3fcae9b4788f53142fd0994415" }
 """
