@@ -548,6 +548,12 @@ impl<T> HandleRegistry<T> {
     pub(crate) fn count(&self) -> usize {
         self.items.read().unwrap().len()
     }
+
+    /// Drop every entry (outside the lock).
+    pub(crate) fn clear(&self) {
+        let items = std::mem::take(&mut *self.items.write().unwrap_or_else(|e| e.into_inner()));
+        drop(items);
+    }
 }
 
 // ============================================================================
@@ -628,12 +634,14 @@ impl EventInternal {
     }
 }
 
-/// EventOwned wraps EventInternal with its data payload for crossing thread boundary
-/// This is Send-safe because EventInternal has no raw pointers
+/// An event queued for `aster_poll_events`. Send-safe: `EventInternal` has
+/// no raw pointers. A payload lives only in the `BufferRegistry` under
+/// `event.buffer_id`, which keeps `aster_event_t.data_ptr` valid until
+/// `aster_buffer_release`. (The queue used to carry a second reference that
+/// polling `mem::forget`-ed, leaking every payload.)
 #[derive(Default)]
 struct EventOwned {
     event: EventInternal,
-    payload: Option<Arc<[u8]>>,
 }
 
 // ============================================================================
@@ -667,6 +675,11 @@ impl BufferRegistry {
 
     pub(crate) fn release(&self, id: u64) -> bool {
         self.buffers.write().unwrap().remove(&id).is_some()
+    }
+
+    fn clear(&self) {
+        let buffers = std::mem::take(&mut *self.buffers.write().unwrap_or_else(|e| e.into_inner()));
+        drop(buffers);
     }
 }
 
@@ -735,20 +748,57 @@ pub(crate) struct BridgeRuntime {
     // Per-doc RegistryAcl, keyed by doc handle. Lazily created in open mode on first
     // touch via `registry_acl_for_doc`.
     registry_acls: Mutex<HashMap<u64, Arc<aster_transport_core::registry::RegistryAcl>>>,
+
+    // Signalled when `runtime` has finished shutting down.
+    teardown: Arc<RuntimeTeardown>,
 }
 
 impl Drop for BridgeRuntime {
     fn drop(&mut self) {
         // SAFETY: `runtime` is never touched again after this.
         let runtime = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
+        let teardown = self.teardown.clone();
         if tokio::runtime::Handle::try_current().is_ok() {
             // Inside an async context -- possibly a worker of this very
             // runtime, which a blocking drop would wait on forever. Hand the
             // drop to a detached OS thread; it completes once the current
             // task returns to the scheduler.
-            std::thread::spawn(move || drop(runtime));
+            std::thread::spawn(move || {
+                drop(runtime);
+                teardown.finish();
+            });
         } else {
             drop(runtime);
+            teardown.finish();
+        }
+    }
+}
+
+/// Set once a `BridgeRuntime`'s tokio runtime has fully shut down (worker
+/// threads joined), which can be after `aster_runtime_close` returned: tasks
+/// still holding the bridge keep it alive, and the final drop may run on a
+/// detached thread (see `Drop for BridgeRuntime`).
+#[derive(Default)]
+struct RuntimeTeardown {
+    done: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl RuntimeTeardown {
+    fn finish(&self) {
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
+        }
+        self.cv.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> bool {
+        let Ok(done) = self.done.lock() else {
+            return false;
+        };
+        match self.cv.wait_timeout_while(done, timeout, |done| !*done) {
+            Ok((done, _)) => *done,
+            Err(_) => false,
         }
     }
 }
@@ -798,7 +848,35 @@ impl BridgeRuntime {
             buffers: BufferRegistry::new(),
             registry_state: aster_transport_core::registry::ResolveState::new(),
             registry_acls: Mutex::new(HashMap::new()),
+            teardown: Arc::new(RuntimeTeardown::default()),
         })
+    }
+
+    /// Drop every handle the host still holds, for `aster_runtime_close`.
+    /// Once the runtime handle is gone no call can reach them, and they can
+    /// keep the bridge alive forever through a cycle: an unfreed connection
+    /// keeps its endpoint, whose hook senders keep the hook drainer tasks,
+    /// which hold the bridge (and with it this runtime and its threads).
+    fn release_handles(&self) {
+        // Dropping endpoints and streams may need the runtime's context.
+        let _context = self.runtime.enter();
+        // Pending hook replies first: dropping a sender settles the hook.
+        self.hook_invocations.clear();
+        self.operations.clear();
+        self.doc_event_receivers.clear();
+        self.gossip_topics.clear();
+        self.gossip_clients.clear();
+        self.docs.clear();
+        self.docs_clients.clear();
+        self.blobs_clients.clear();
+        self.send_streams.clear();
+        self.recv_streams.clear();
+        self.connections.clear();
+        std::mem::take(&mut *self.node_gates.lock().unwrap_or_else(|e| e.into_inner()));
+        self.gates.clear();
+        self.nodes.clear();
+        std::mem::take(&mut *self.registry_acls.lock().unwrap_or_else(|e| e.into_inner()));
+        self.buffers.clear();
     }
 
     fn emit(&self, event: EventOwned) {
@@ -851,10 +929,7 @@ impl BridgeRuntime {
         .with_buffer(buf_id, message.len());
         let mut event = event;
         event.flags = flags;
-        self.emit(EventOwned {
-            event,
-            payload: None,
-        });
+        self.emit(EventOwned { event });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -871,19 +946,13 @@ impl BridgeRuntime {
         let event = EventInternal::new(
             kind, status, operation, handle, related, user_data, error_code,
         );
-        self.emit(EventOwned {
-            event,
-            payload: None,
-        });
+        self.emit(EventOwned { event });
     }
 
     fn emit_with_data(&self, event: EventInternal, data: Vec<u8>) {
         let (buf_id, arc) = self.buffers.insert(data);
         let event = event.with_buffer(buf_id, arc.len());
-        self.emit(EventOwned {
-            event,
-            payload: Some(arc),
-        });
+        self.emit(EventOwned { event });
     }
 
     fn new_operation(&self) -> (u64, Arc<std::sync::atomic::AtomicBool>) {
@@ -1159,19 +1228,43 @@ pub unsafe extern "C" fn aster_runtime_new(
 
 #[no_mangle]
 pub unsafe extern "C" fn aster_runtime_close(runtime: aster_runtime_t) -> i32 {
+    match close_runtime(runtime) {
+        Ok(_) => aster_status_t::ASTER_STATUS_OK as i32,
+        Err(status) => status as i32,
+    }
+}
+
+/// Unregister `runtime` and drop the registry's reference. In-flight tasks
+/// may still hold clones; whichever reference is last shuts the runtime down
+/// safely (see `Drop for BridgeRuntime`). Returns its teardown signal.
+fn close_runtime(runtime: aster_runtime_t) -> Result<Arc<RuntimeTeardown>, aster_status_t> {
     let arc = match runtimes().lock() {
         Ok(mut guard) => match guard.remove(&runtime) {
             Some(arc) => arc,
-            None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
+            None => return Err(aster_status_t::ASTER_STATUS_NOT_FOUND),
         },
-        Err(_) => return aster_status_t::ASTER_STATUS_INTERNAL as i32,
+        Err(_) => return Err(aster_status_t::ASTER_STATUS_INTERNAL),
     };
-
-    // In-flight tasks may still hold clones; whichever reference is last
-    // shuts the runtime down safely (see `Drop for BridgeRuntime`).
+    arc.release_handles();
+    let teardown = arc.teardown.clone();
     drop(arc);
+    Ok(teardown)
+}
 
-    aster_status_t::ASTER_STATUS_OK as i32
+/// Rust-only, not part of the C ABI: `aster_runtime_close`, then wait up to
+/// `timeout` for the runtime's worker threads to finish shutting down.
+/// Returns `ASTER_STATUS_TIMEOUT` if they have not by then (the shutdown
+/// still completes in the background).
+///
+/// For tests: a test process that exits while a closed runtime is still
+/// tearing down on its detached drop thread trips LeakSanitizer.
+#[doc(hidden)]
+pub fn aster_runtime_close_and_wait(runtime: aster_runtime_t, timeout: Duration) -> i32 {
+    match close_runtime(runtime) {
+        Ok(teardown) if teardown.wait(timeout) => aster_status_t::ASTER_STATUS_OK as i32,
+        Ok(_) => aster_status_t::ASTER_STATUS_TIMEOUT as i32,
+        Err(status) => status as i32,
+    }
 }
 
 // ============================================================================
@@ -1250,7 +1343,6 @@ pub unsafe extern "C" fn aster_poll_events(
         unsafe {
             ptr::write(out_events.add(written), ev);
         }
-        std::mem::forget(event_owned.payload);
         written += 1;
     } else {
         return 0;
@@ -1263,7 +1355,6 @@ pub unsafe extern "C" fn aster_poll_events(
                 unsafe {
                     ptr::write(out_events.add(written), ev);
                 }
-                std::mem::forget(event_owned.payload);
                 written += 1;
             }
             Err(_) => break,
@@ -4214,10 +4305,7 @@ pub unsafe extern "C" fn aster_tags_delete(
                     0,
                 );
                 event.flags = count as u32;
-                bridge2.emit(EventOwned {
-                    event,
-                    payload: None,
-                });
+                bridge2.emit(EventOwned { event });
             }
             Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
         }
@@ -7709,6 +7797,7 @@ mod runtime_drop_tests {
             unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, std::ptr::null(), &mut handle) };
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let bridge = load_runtime(handle).expect("runtime");
+        let teardown = bridge.teardown.clone();
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -7731,5 +7820,65 @@ mod runtime_drop_tests {
         done_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("last runtime reference dropped on its own worker panicked");
+        // The detached drop thread finishes the shutdown (and the test
+        // process does not exit with it still running under LSan).
+        assert!(
+            teardown.wait(std::time::Duration::from_secs(10)),
+            "runtime dropped on its own worker never finished shutting down"
+        );
+    }
+}
+
+#[cfg(test)]
+mod event_buffer_tests {
+    use super::*;
+
+    /// A polled event's payload is freed by `aster_buffer_release`: polling
+    /// must not keep (or leak) a reference of its own. Regression for the
+    /// `mem::forget(payload)` in `aster_poll_events` that LSan reported in
+    /// every test binary that read an event payload.
+    #[test]
+    fn released_event_payload_is_freed() {
+        let mut handle: aster_runtime_t = 0;
+        let status =
+            unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, std::ptr::null(), &mut handle) };
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
+        let bridge = load_runtime(handle).expect("runtime");
+
+        let event = EventInternal::new(
+            aster_event_kind_t::ASTER_EVENT_BYTES_RESULT,
+            aster_status_t::ASTER_STATUS_OK,
+            1,
+            0,
+            0,
+            7,
+            0,
+        );
+        bridge.emit_with_data(event, b"payload".to_vec());
+
+        let mut out = std::mem::MaybeUninit::<aster_event_t>::uninit();
+        let n = unsafe { aster_poll_events(handle, out.as_mut_ptr(), 1, 1000) };
+        assert_eq!(n, 1);
+        let ev = unsafe { out.assume_init() };
+        assert_eq!(ev.user_data, 7);
+        assert_ne!(ev.buffer, 0);
+        let data = unsafe { std::slice::from_raw_parts(ev.data_ptr, ev.data_len) };
+        assert_eq!(data, b"payload");
+
+        let weak = Arc::downgrade(&bridge.buffers.get(ev.buffer).expect("buffer"));
+        assert_eq!(
+            unsafe { aster_buffer_release(handle, ev.buffer) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "event payload still referenced after aster_buffer_release"
+        );
+
+        drop(bridge);
+        assert_eq!(
+            unsafe { aster_runtime_close(handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
     }
 }

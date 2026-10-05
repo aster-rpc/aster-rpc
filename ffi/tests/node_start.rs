@@ -22,6 +22,12 @@ fn bytes(b: &[u8]) -> aster_bytes_t {
     }
 }
 
+/// Close `rt` and wait for its worker threads: the process must not exit
+/// mid-shutdown (LSan reports the scheduler's cores as leaked).
+fn close_runtime(rt: aster_runtime_t) {
+    assert_eq!(aster_runtime_close_and_wait(rt, Duration::from_secs(10)), 0);
+}
+
 unsafe fn runtime() -> aster_runtime_t {
     let mut rt = 0;
     assert_eq!(
@@ -202,7 +208,7 @@ fn node_start_loopback_and_metrics() {
             aster_status_t::ASTER_STATUS_UNSUPPORTED as i32
         );
         close(rt, node);
-        aster_runtime_close(rt);
+        close_runtime(rt);
     }
 }
 
@@ -232,7 +238,7 @@ fn node_start_rejects_bad_config_synchronously() {
             aster_node_start(rt, &lb.cfg, 424_242, 0, &mut op),
             aster_status_t::ASTER_STATUS_NOT_FOUND as i32
         );
-        aster_runtime_close(rt);
+        close_runtime(rt);
     }
 }
 
@@ -274,7 +280,7 @@ fn node_start_with_key_file_and_storage_keeps_identity() {
         let ev = common::wait_for_operation(rt, op);
         assert_eq!(ev.kind, aster_event_kind_t::ASTER_EVENT_ERROR as u32);
         aster_buffer_release(rt, ev.buffer);
-        aster_runtime_close(rt);
+        close_runtime(rt);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -384,7 +390,7 @@ fn gate_admit_revoke_and_settings() {
             aster_gate_free(rt, gate),
             aster_status_t::ASTER_STATUS_NOT_FOUND as i32
         );
-        aster_runtime_close(rt);
+        close_runtime(rt);
     }
 }
 
@@ -483,7 +489,10 @@ fn gate_on_node_rejects_with_code_then_admits() {
         tokio.block_on(client.shutdown());
         close(rt, server);
         aster_gate_free(rt, gate);
-        aster_runtime_close(rt);
+        // The ASTER_ACCEPTED connection is deliberately never freed: closing
+        // the runtime must release it, or it keeps the endpoint, the hook
+        // drainers and so the whole runtime alive (close_runtime times out).
+        close_runtime(rt);
     }
 }
 
@@ -525,7 +534,7 @@ fn hooked_node_without_gate_raises_events_and_accepts() {
             "accepted peer stays connected"
         );
         close(rt, server);
-        aster_runtime_close(rt);
+        close_runtime(rt);
     }
     drop(tokio);
 }
@@ -566,6 +575,6 @@ fn accept_on_node_reads_the_alpn_queue() {
 
         tokio.block_on(client.shutdown());
         close(rt, server);
-        aster_runtime_close(rt);
+        close_runtime(rt);
     }
 }
