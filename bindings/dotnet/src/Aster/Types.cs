@@ -30,6 +30,8 @@ public enum Status
     PermissionDenied = 15,
     /// <summary>Reserved for the R4 auth model (ABI 4.3): the presented credential has expired. No 4.3 function returns it.</summary>
     CredentialExpired = 16,
+    /// <summary>ABI 4.6: <c>aster_observability_init</c> with a configuration that differs from the running pipeline's, or a second concurrent <c>aster_log_poll</c>.</summary>
+    AlreadyExists = 17,
 }
 
 /// <summary>
