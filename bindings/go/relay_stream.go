@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -216,7 +215,7 @@ func (x *relayExchange) reportUploadErr(err error) {
 	if x.onUploadErr != nil {
 		x.onUploadErr(err)
 	} else {
-		log.Printf("aster: relay request body failed after the response head: %v", err)
+		currentLogger().Warn("aster: relay request body failed after the response head", "error", err)
 	}
 }
 

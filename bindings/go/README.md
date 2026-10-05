@@ -49,13 +49,47 @@ whose ABI major differs (4).
   binding-level `[trust]` / `[connect]` / `[logging]` keys. `StartNode(ctx, cfg,
   NodeOptions{Gate, ExtraALPNs})` uses `aster_node_start`; `Node.Ticket`,
   `Connect`, `Accept`, `AddNodeAddr`, `SetGate`, `Docs()`. (ABI 4.6 removed
-  `aster_node_metrics_prometheus`; metrics come back with observability in O10.)
+  `aster_node_metrics_prometheus`; `MetricsPrometheus()` replaces it, see
+  Observability below.)
   `Memory*` / `Persistent*` are convenience wrappers over `aster_node_start`
   (ABI 4.0 removed `aster_node_memory*` / `aster_node_persistent`). ABI 4.0
   also removed bare endpoints: `NewEndpoint` starts a node from the
   `EndpointConfig` (mapped onto `AsterConfig`) and `Endpoint` is a view of it
   (`Endpoint.Node()`); `Accept` uses `aster_accept`, which takes connections
   from the node's ALPN queue.
+- **Observability (ABI 4.6):** the pipeline (OpenTelemetry SDK, exporters, log
+  bridge, Prometheus renderer) lives in Rust; the binding starts it and wraps the
+  rest. `InitObservability(ObservabilityConfig{...})` (before the first server;
+  otherwise `StartServer` / `StartHealth` run the implicit environment-only
+  start) and `ShutdownObservability`. Floor: the library must be ABI 4.6 or newer
+  (`ABIMinorRequired`, checked by `CheckABI` / `NewRuntime`).
+  - *Logs:* Rust `tracing` events reach `log/slog`. One goroutine on a locked OS
+    thread polls `aster_log_poll`; `SetLogger(*slog.Logger)` picks the
+    destination (default `slog.Default()`), and the Rust filter follows the
+    logger's level (`SyncLogLevel`, re-checked every 5 s; `LogFilter` / `ASTER_LOG`
+    pin it). Records carry `logger`, `aster_origin=rust`, `trace_id`, `span_id`,
+    `aster_call_id` and the event's fields (`rpc.service`, `rpc.method`, ...);
+    TRACE is `aster.LevelTrace` (-8). `NewTraceHandler(h)` wraps your own handler
+    to add `trace_id` / `span_id` from the `context.Context` of
+    `logger.InfoContext(ctx, ...)`.
+  - *Trace context:* inside a handler `ctx` holds the call's server span and the
+    caller's W3C baggage (`CurrentTraceID`, `CurrentSpanID`, `CurrentBaggage`,
+    `SpanContextFromContext`). `StartSpan(ctx, name)` / `WithSpan` start spans in
+    the Rust tracer under it; calls made with that `ctx` send `traceparent` and
+    `baggage`. `WithTraceContext(ctx, traceparent, baggage)` continues a trace
+    from an HTTP header or a queue message. Never put secrets in baggage: values
+    end up in log lines.
+  - *Metrics:* `NewCounter`, `NewUpDownCounter`, `NewHistogram`, `NewGauge`
+    (scope `aster.app`; `Add` / `Record(ctx, v, attrs...)`, `NewAttrSet` to intern
+    attributes). They share the exporter and `/metrics` with the built-in
+    `aster.*` metrics. `MetricsPrometheus()` returns the text (needs the
+    Prometheus pull reader: a `HealthServer`, or `OTEL_METRICS_EXPORTER=prometheus`).
+  - *Health:* `StartHealth(node, &HealthConfig{...})` or
+    `ServerOptions{Health: &HealthConfig{}}` serves `/healthz`, `/readyz` and
+    `/metrics` (127.0.0.1 unless `Host` says otherwise); a server-attached listener
+    is ready once the server serves and not ready first on `Close`.
+    `SetReady`, `SetHealthy`, `SetCheck(name, ok)`, `Addr`, `Stop`.
+  - `MetricsInterceptor` is gone: the built-in metrics record in Rust.
 - **Gate 0:** `NewGate` (`aster_gate_*`: trust mode, admission ALPNs, reject
   code/reason, admit/revoke/is-admitted/should-allow). Without a gate, a node
   with `EnableHooks` delivers `*AdmissionRequest`s on `Node.Admissions()`;
@@ -257,6 +291,9 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `codec.go` | `Codec`, `ForyCodec` (Fory 1.7.6), `WireTyped` |
 | `contract.go` | Contract identity: TypeDef / ServiceContract JSON → Rust hash |
 | `rpc_service.go` | `Service` / `NewSessionService`, `Unary` / `ServerStream` / `ClientStream` / `BidiStream`, `Requires`, `CallInfo`, `DynamicServiceJSON` |
+| `observability_pure.go` | Observability, plain Go (no cgo): attribute and `traceparent` / baggage codecs, `context.Context` carrier, `TraceHandler`, Rust-record-to-slog mapping |
+| `observability.go`, `metrics.go`, `tracing.go`, `health.go` | ABI 4.6 pipeline init / shutdown and the log poller; metric instruments; spans; `HealthServer` |
+| `abi_trace.go` | `aster_trace_context_*` wrappers (test support: pin the Go codec to the library) |
 | `rpc_server.go` | `AsterServer` — dispatch events → typed handlers, sessions, cancellation, RpcStatus |
 | `rpc_client.go` | `AsterClient`, `RpcConnection`, `Call*` functions, `BidiCall` (`aster_rpc_*`) |
 | `ucv1.go`, `upcall_types.go` | UCv1 upcall payload codec and kind / status tables (plain Go, no cgo) |
@@ -278,6 +315,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `cq_test.go` | 8 CQ state machine unit tests (`//go:build !cgo`) |
 | `abi_contract_test.go` + `abi_layout.go` | ABI contract tests — header struct sizes, ABI version, status names, node-backed endpoint (`//go:build cgo`) |
 | `ucv1_test.go`, `upcall_test.go`, `expose_test.go` | UCv1 vectors, upcall / lease / fenced / topology flows, expose flows (`-race -count=20` clean) |
+| `observability_pure_test.go`, `observability_test.go` | 8 pure observability cases (also `CGO_ENABLED=0`) and 10 against the library: logs with trace ids, spans parented from dispatch, baggage, Prometheus text, health endpoints, shutdown / re-init |
 | `hostile_race_test.go` | 7 hostile race integration tests (`//go:build cgo`) |
 | `soak_test.go` | 2 soak/leak tests (`//go:build cgo`) |
 | `rpc_test.go`, `node_test.go`, `dataplane_test.go`, `vectors_test.go` | RPC (4 patterns, errors, deadlines, gate, interceptors, QUEUE_FULL), config/node/gate/admission, data plane, conformance vectors |
