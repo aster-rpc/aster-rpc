@@ -57,7 +57,7 @@ packages = {
 # checkout and the version from the target registry in a published `.crate`.
 versioned_path_dependencies = {
     "ffi/Cargo.toml": ["aster", "aster_transport_core", "aster-otel"],
-    "aster/Cargo.toml": ["aster_transport_core", "aster-expose", "aster-macros"],
+    "aster/Cargo.toml": ["aster_transport_core", "aster-expose", "aster-macros", "aster-otel"],
     "aster-expose/Cargo.toml": ["aster_transport_core"],
     "aster-transport-salvo/Cargo.toml": ["aster", "aster_transport_core"],
     "bindings/python/rust/Cargo.toml": ["aster", "aster_transport_core", "aster-otel"],
@@ -116,6 +116,22 @@ for relative, expected_name in packages.items():
                     f"(or ={version}), found {current}"
                 )
         text = dependency_re.sub(rf"\g<1>={version}\g<3>", text)
+
+    # A path dependency on another stamped crate that is missing from
+    # versioned_path_dependencies keeps "=<baseline>" and fails to resolve
+    # against the stamped package; name it here instead of in Cargo.
+    stamped_names = "|".join(re.escape(name) for name in packages.values())
+    leftover_re = re.compile(
+        rf'(?m)^\s*({stamped_names})\s*=\s*\{{[^\n]*\bpath\s*=[^\n]*'
+        rf'\bversion\s*=\s*"={re.escape(baseline)}"'
+    )
+    if baseline != version:
+        leftover = sorted({m.group(1) for m in leftover_re.finditer(text)})
+        if leftover:
+            raise SystemExit(
+                f"{relative}: path dependencies still pinned to ={baseline}: "
+                f"{', '.join(leftover)}; add them to versioned_path_dependencies"
+            )
 
     path.write_text(text)
 
