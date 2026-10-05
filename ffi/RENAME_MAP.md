@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.5)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.6)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -24,6 +24,94 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 4.6 (observability and health; one removal)
+
+ABI 4.6.0 exposes the Rust-owned OpenTelemetry pipeline (`aster-otel`) and
+the ops listener (`aster::ops`) to Java, .NET and Go. Design:
+`docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md` §7. Sources:
+`ffi/src/observability.rs`, `ffi/src/health.rs`, `ffi/src/server.rs`. Tests:
+`ffi/tests/observability.rs`, `ffi/tests/health.rs`,
+`ffi/tests/abi_contract_test.c` (`test_observability`, `test_health`), the
+`ffi/src/layout.rs` assertions, and the Miri / sanitizer jobs for the pure
+parts (`observability::tests`: the log arena, the codecs). Everything below
+except the health and dispatch functions is process-global (no `runtime`).
+k/v lists use the metadata encoding; attribute values are strings (Q13).
+
+**Removed (pre-release, decision Q12; no deprecation step):**
+`aster_node_metrics_prometheus(rt, node, out)`. Use `aster_metrics_prometheus(out)`:
+the transport counters are now `aster_transport_bytes_total` /
+`aster_transport_connections` in the OTel scrape, next to every other
+instrument. It needs the Prometheus pull reader (a running
+`aster_health_start` listener, or the `prometheus` metrics exporter).
+
+**New status:** `ASTER_STATUS_ALREADY_EXISTS = 17` (`aster_status_name`
+knows it): `aster_observability_init` with a configuration that differs from
+the running pipeline's (the message names the settings), or a second
+concurrent `aster_log_poll`.
+
+**Behaviour on misuse:** `aster_upcall_poll` called on a tokio runtime thread
+returns 0 with last error `ASTER_STATUS_UNSUPPORTED: ...` (it blocks).
+
+**Built-ins on the C ABI paths:** with a pipeline running, `aster_server_*`
+dispatch records the `aster.rpc.server.*` instruments and the server span,
+and `aster_rpc_unary` / `aster_rpc_unary_cancellable` / `aster_rpc_open`
+record `aster.rpc.client.*` and a client span. A `traceparent` the binding
+writes into `aster_call_options_t.metadata` (from
+`aster_trace_context_format`) parents the client span, and the outgoing
+value is replaced by the client span's (design §5.4).
+
+### Pipeline (§7.1)
+
+| Item | Notes |
+|---|---|
+| `aster_observability_config_t` (128 bytes) | `struct_size`, `flags` (`ASTER_OBSERVABILITY_FROM_ENV` 1, `_TRACES` 2, `_METRICS` 4, `_OTLP_LOGS` 8, `_LOG_BRIDGE` 16), `service_name`, `otlp_endpoint`, `otlp_headers` (k/v; secret, never logged), `resource_attrs` (k/v), `log_filter`, `extra_toml` (`[observability]` table; the header line is optional), `trace_sample_ratio` (< 0 = env/default), `protocol` (`aster_otel_protocol_t`), `log_queue_capacity`, `binding` (`aster_binding_kind_t`). A signal flag set = export it over OTLP; clear = env decides with `FROM_ENV`, else off. Unknown flag bits are `INVALID_ARGUMENT`. |
+| `aster_observability_init(cfg*)` | NULL = env only. Start or join (refcount + 1). Different config: `ALREADY_EXISTS`. `LOG_BRIDGE` is additive (opens the bridge on a running pipeline). Runs off any tokio thread internally, so it may be called from one. |
+| `aster_observability_flush(timeout_ms)` | `TIMEOUT` past the limit; no pipeline: `OK`. |
+| `aster_observability_shutdown(timeout_ms)` | Releases one init reference; the last reference anywhere (a health listener holds one too) shuts down: providers flush and stop, the log bridge closes, live spans end, instrument and attribute set handles are freed. `ALREADY_CLOSED` when the C ABI holds no reference. |
+
+### Logs (§7.2)
+
+| Item | Notes |
+|---|---|
+| `aster_log_record_t` (96 bytes, no `struct_size`) | `level` (`aster_log_level_t` 1..5), `flags` (`ASTER_LOG_FLAG_HAS_TRACE` 1, `_IN_CALL` 2, `_SYNTHETIC` 4, `_AUDIT` 8), `timestamp_unix_ns`, `trace_id[16]`, `span_id[8]`, `call_id`, `target`, `message`, `fields` (k/v: event fields, `rpc.service`, `rpc.method`, `aster.peer`, `thread.name`). |
+| `aster_log_poll(out*, record_size, max, timeout_ms)` → count | `record_size` must be `sizeof(aster_log_record_t)`. One poller per process (a concurrent second poll: 0, last error `ASTER_STATUS_ALREADY_EXISTS: ...`). Refused on a tokio thread (`ASTER_STATUS_UNSUPPORTED: ...`). Marks the calling thread as a log drain (no feedback). Audit records first, then FIFO; a synthetic drop report leads a batch at most once a second. Pointers are valid until the next poll or `aster_log_close` (one arena per batch). 0 with `ASTER_STATUS_NOT_FOUND: ...` once the bridge is closed or not open. |
+| `aster_log_close()` | Closes the bridge, wakes a waiting poll; a later init with `LOG_BRIDGE` reopens. |
+| `aster_log_dropped(u64* out)` | General records dropped (queue full) since process start. |
+| `aster_log_set_filter(directives, len)` | `EnvFilter` reload; `INVALID_ARGUMENT` on a parse error, `NOT_FOUND` without a bridge. `aster::audit=info` stays on unless named. |
+| `aster_log_emit_t` (72 bytes), `aster_log_emit(rec*)` | Path B: an application record into the Rust OTel logs SDK (`level` 0 = INFO, `logger`, `message`, `fields`, optional `context`). `OK` and not exported without an OTLP logs exporter. |
+
+### Metrics (§7.3)
+
+| Item | Notes |
+|---|---|
+| `aster_instrument_desc_t` (80 bytes), `aster_instrument_kind_t` | `COUNTER_U64` 1, `UP_DOWN_I64` 2, `HISTOGRAM_F64` 3, `GAUGE_F64` 4. `name` (OTel rules), `description`, `unit`, `auto_attrs` (key list; kept, merging lands with the per-call extractor cache in O6+), `cardinality_limit` (kept; the SDK default 2000 applies in 4.6). |
+| `aster_instrument_new(desc*, *out)` / `aster_instrument_free(h)` | Scope `aster.app`. Records into whichever pipeline runs at record time (a handle declared before init works after it). A name already declared with another kind: `INVALID_ARGUMENT`. |
+| `aster_attrset_new(kv, len, *out)` / `aster_attrset_free(h)` | Interned attribute set: build once, record many times. |
+| `aster_metric_add_u64` / `_add_i64` / `aster_metric_record_f64(h, v, set, kv, kv_len, call_id)` | `set` 0 = none; `kv` appended. Wrong kind for the value type: `INVALID_ARGUMENT`. No I/O, no runtime call; a short SDK lock. `call_id` reserved for `auto_attrs`. |
+| `aster_metrics_prometheus(aster_bytes_t* out)` | Prometheus text 0.0.4 of the whole pipeline (what `/metrics` serves); `NOT_FOUND` without a pull reader. Free with `aster_string_release`. |
+
+### Spans and trace context (§7.4)
+
+| Item | Notes |
+|---|---|
+| `aster_span_context_t` (32 bytes) | `trace_id[16]`, `span_id[8]`, `trace_flags`, `is_remote`. All-zero = none. |
+| `ASTER_DISPATCH_FLAG_HAS_TRACE` (0x400), `aster_dispatch_trace_context(rt, server, call_id, *out)` | The call's server span context while the call is live (`NOT_FOUND` after); all-zero with `OK` when its span is not exported. |
+| `aster_span_start(name, kind, parent*, kv, kv_len, *out)` | `aster_span_kind_t` 0..4; `parent` NULL = root. At most 65 536 live spans (`QUEUE_FULL`). A no-op span (all-zero context) without a pipeline. |
+| `aster_span_set_attributes`, `aster_span_add_event`, `aster_span_set_status(s, code 0/1/2, msg)`, `aster_span_record_error(s, type, msg)`, `aster_span_context(s, *out)`, `aster_span_end(s)` | `end` frees the handle; shutdown ends spans still open. |
+| `aster_span_record_t` (152 bytes), `aster_span_record(rec*)` | A finished span with the binding's own ids and times (.NET `Activity` bridge). `events`: `u32 count`, then per event `u32 len` + name, `u64 unix_nanos`, `u32 len` + k/v list. Not exported when its sampled flag is clear. `INVALID_ARGUMENT` for all-zero ids, a parent from another trace, end < start. |
+| `aster_trace_context_format(ctx*, buf, cap, *out_len)` / `aster_trace_context_parse(s, len, *out)` | W3C `traceparent` (55 bytes, version 00, lowercase); `BUFFER_TOO_SMALL` with `*out_len` = 55; parse marks the result remote. |
+
+### Health (§7.5)
+
+| Item | Notes |
+|---|---|
+| `aster_health_config_t` (24 bytes), `aster_health_t` | `struct_size`, `port` (0 = ephemeral), `host` (empty = `127.0.0.1`). |
+| `aster_health_start(rt, node, cfg*, *out)` | `cfg` NULL = the node's `AsterConfig` (`ASTER_HEALTH_*`, `[health]`; `INVALID_ARGUMENT` when disabled there). Joins or starts the pipeline with the Prometheus pull reader. Blocks until bound; refused on a tokio thread. |
+| `aster_server_attach_health(builder, h)` | Before `aster_server_start`: a successful start sets ready (and the service count); `aster_server_destroy` sets not ready first. |
+| `aster_health_set_ready(h, bool)`, `aster_health_set_healthy(h, bool)`, `aster_health_check_set(h, name, bool)` | Named checks are created failing; `/readyz` needs all of them. Once a log bridge is open, `/readyz` also carries the built-in `audit` check (fails for 30 s after a dropped audit record). |
+| `aster_health_addr(h, aster_bytes_t* out)` | `"ip:port"`; free with `aster_string_release`. |
+| `aster_health_stop(rt, h)` | Port free on return; releases the listener's pipeline reference. |
 
 ## New in 4.5 (additive)
 
@@ -695,7 +783,7 @@ shape; a 3.1 binding keeps working. Source: `ffi/src/node.rs`; tests:
 | function | `aster_config_release(aster_config_t*)` | frees `storage`, zeroes pointers; no-op when `storage == NULL` |
 | function | `aster_node_start(rt, const aster_config_t*, aster_gate_t gate, user_data, out_op)` | async → `ASTER_EVENT_NODE_CREATED` / `ASTER_EVENT_ERROR`; config validated + copied before return (bad config → `INVALID_ARGUMENT`, nothing started); `gate` ≠ 0 forces hooks on |
 | function | `aster_node_set_gate(rt, node, gate)` | attach/detach (0); `UNSUPPORTED` for nodes without hooks |
-| function | `aster_node_metrics_prometheus(rt, node, aster_bytes_t* out)` | free with `aster_string_release` |
+| function | ~~`aster_node_metrics_prometheus(rt, node, aster_bytes_t* out)`~~ | **removed in 4.6**: use `aster_metrics_prometheus` |
 | function | `aster_gate_new`, `aster_gate_free`, `aster_gate_set_trust_mode`, `aster_gate_set_admission_alpns`, `aster_gate_set_reject(code, reason)`, `aster_gate_admit`, `aster_gate_revoke`, `aster_gate_is_admitted`, `aster_gate_should_allow` | peers are 64-hex node ids (case-insensitive) |
 | function | `aster_admission_respond(rt, invocation, decision, reject_code, reason)` | answers `ASTER_EVENT_HOOK_{BEFORE,AFTER}_CONNECT` from nodes and endpoints; DENY of an inbound invocation closes with `reject_code`/`reason` |
 

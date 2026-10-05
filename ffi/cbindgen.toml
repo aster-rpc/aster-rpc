@@ -53,4 +53,9 @@ include = [
   "aster_coordination_error_t",
   "aster_coordination_mutation_op_t",
   "aster_coordination_read_op_t",
+  "aster_binding_kind_t",
+  "aster_otel_protocol_t",
+  "aster_log_level_t",
+  "aster_instrument_kind_t",
+  "aster_span_kind_t",
 ]

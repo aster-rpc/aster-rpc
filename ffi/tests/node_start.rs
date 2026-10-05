@@ -185,21 +185,14 @@ unsafe fn next_admission(rt: aster_runtime_t) -> aster_event_t {
 }
 
 #[test]
-fn node_start_loopback_and_metrics() {
+fn node_start_loopback() {
+    // Transport metrics moved to the OTel pipeline in 4.6
+    // (`aster_metrics_prometheus`, tests/health.rs and tests/observability.rs).
     unsafe {
         let rt = runtime();
         let lb = loopback();
         let node = start(rt, &lb.cfg, 0);
         assert_eq!(node_id(rt, node).len(), 64);
-        let mut text: aster_bytes_t = std::mem::zeroed();
-        assert_eq!(aster_node_metrics_prometheus(rt, node, &mut text), 0);
-        let s = std::str::from_utf8(std::slice::from_raw_parts(text.ptr, text.len)).unwrap();
-        assert!(s.contains("# TYPE iroh_send_ipv4 counter"), "{s}");
-        assert_eq!(aster_string_release(text.ptr, text.len), 0);
-        assert_eq!(
-            aster_node_metrics_prometheus(rt, 999_999, &mut text),
-            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
-        );
         // Without hooks a node can't take a gate.
         let mut gate = 0;
         assert_eq!(aster_gate_new(rt, &mut gate), 0);

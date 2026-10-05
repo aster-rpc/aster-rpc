@@ -30,6 +30,10 @@
 #      `prometheus` feature. Bindings that do not serve health or telemetry
 #      (today's profile, below) stay SDK-free.
 #
+#   7. The C ABI (`aster_transport_ffi`, ABI 4.6) links the pipeline through
+#      aster-otel with OTLP logs and the Prometheus reader, at the pinned
+#      versions, and still without aws-lc or OpenSSL.
+#
 # Usage: ./scripts/check-otel-deps.sh
 
 set -euo pipefail
@@ -110,5 +114,22 @@ for label in "default" "all-features"; do
     done
     pass "pinned OpenTelemetry versions resolve in aster-otel's '$label' graph"
 done
+
+# ── 7. the C ABI profile ────────────────────────────────────────────────────
+
+out=$(tree -p aster_transport_ffi)
+for needle in 'aster-otel v' 'opentelemetry_sdk v0.33.0' 'opentelemetry-prometheus v0.33.0' \
+    'opentelemetry-appender-tracing v0.33.0'; do
+    if ! grep -q "$needle" <<<"$out"; then
+        fail "the C ABI graph lacks '$needle' (ABI 4.6 observability)"
+    fi
+done
+for crate_name in aws-lc-rs aws-lc-sys openssl openssl-sys native-tls; do
+    if grep -q "\\b${crate_name} v" <<<"$out"; then
+        echo "$out" | grep -n "${crate_name} v" || true
+        fail "'$crate_name' is in the C ABI graph; OTLP TLS must stay on rustls + ring"
+    fi
+done
+pass "the C ABI links the pinned pipeline, without aws-lc / OpenSSL"
 
 echo -e "\n${GREEN}Observability dependency gate passed.${RESET}"

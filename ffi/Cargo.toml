@@ -14,12 +14,17 @@ path = "src/bin/soak_test_runner/main.rs"
 
 [dependencies]
 aster_transport_core = { path = "../core", version = "=0.3.0" }
-aster-otel = { path = "../aster-otel", version = "=0.3.0" }
+# Observability (ABI 4.6, design OBSERVABILITY_HEALTH_DESIGN.md §2.1/§7): the
+# binding profile's exporters -- OTLP over http/protobuf, OTLP logs (path B,
+# `aster_log_emit`) and the Prometheus pull reader (`aster_metrics_prometheus`).
+aster-otel = { path = "../aster-otel", version = "=0.3.0", features = ["otlp", "otlp-logs", "prometheus"] }
 # Plan D1: the C ABI wraps the `aster` crate (node + config + Gate 0 since ABI
 # 3.2). Binding profile: default + rpc + metrics + binding-support, plus
-# `expose` since ABI 4.2 and `coordination-client` since ABI 4.4 (the binding
-# profile's "once the binding surfaces it"; the client only, never the voter).
-aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support", "expose", "coordination-client"] }
+# `expose` since ABI 4.2, `coordination-client` since ABI 4.4 (the binding
+# profile's "once the binding surfaces it"; the client only, never the voter),
+# and `otel` + `health` since ABI 4.6 (built-in metrics and spans, the ops
+# listener behind `aster_health_*`).
+aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support", "expose", "coordination-client", "otel", "health"] }
 async-trait = "0.1"
 iroh = { workspace = true }
 tokio = { workspace = true }
@@ -32,6 +37,10 @@ base64 = "0.22"
 # Note: aster_ffi.h is regenerated externally with cbindgen; not a build dep.
 
 [dev-dependencies]
+# In-memory exporters for tests/observability.rs.
+aster-otel = { path = "../aster-otel", version = "=0.3.0", features = ["testing"] }
+# Rust events for the log bridge cases.
+tracing = "0.1"
 loom = "0.7"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"

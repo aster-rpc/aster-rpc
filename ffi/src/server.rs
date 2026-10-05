@@ -15,6 +15,12 @@
 //!   aster_server_destroy(server)
 //! ```
 //!
+//! Since 4.6, `aster_server_attach_health(builder, health)` ties an ops
+//! listener's readiness to the server (ready once serving, not ready first on
+//! destroy), and a call whose server span is exported carries
+//! `ASTER_DISPATCH_FLAG_HAS_TRACE`: `aster_dispatch_trace_context` returns
+//! the span's context for the binding's handler spans and logs.
+//!
 //! Rust does all framing, compression and status encoding: the binding sees
 //! request payloads (already decompressed) and passes response payloads plus
 //! AEv1 `RpcStatus` bytes (`NULL` = OK). Every call in a `CALL` event is
@@ -31,12 +37,15 @@ use std::time::Duration;
 use aster::binding_support::dispatch::{
     CallTable, CancelReason, DispatchEvent, ForeignCall, RingConsumer, RingSink, SubmitError,
 };
+use aster::ops::HealthState;
 use aster::rpc::{
     decode_rpc_status, AttributeStore, DynamicService, MethodPattern, RpcStatus, Server,
     ServerHandle,
 };
 use aster_transport_core::{CoreConnection, CoreNode};
 
+use crate::health::aster_health_t;
+use crate::observability::aster_span_context_t;
 use crate::{
     aster_buffer_t, aster_bytes_t, aster_node_t, aster_runtime_t, aster_status_t, load_runtime,
     set_last_error, BridgeRuntime, HandleRegistry,
@@ -127,6 +136,9 @@ pub const ASTER_DISPATCH_FLAG_IROH_AUTHENTICATED: u32 = 0x4;
 pub const ASTER_DISPATCH_FLAG_HAS_METADATA: u32 = 0x100;
 /// The caller has attributes (`aster_dispatch_attributes`).
 pub const ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES: u32 = 0x200;
+/// ABI 4.6: the call's server span is exported; its context is available
+/// from `aster_dispatch_trace_context`.
+pub const ASTER_DISPATCH_FLAG_HAS_TRACE: u32 = 0x400;
 
 /// `timeout_ms` value for "wait without a limit" (`aster_dispatch_recv`,
 /// `aster_call_recv_payload`).
@@ -222,6 +234,7 @@ struct BuilderSpec {
     topology: bool,
     max_sessions: Option<usize>,
     handler_timeout: Option<Option<Duration>>,
+    health: Option<HealthState>,
 }
 
 pub(crate) struct BuilderState {
@@ -318,6 +331,8 @@ pub(crate) struct ServerState {
     leases: Leases,
     handle: Mutex<Option<ServerHandle>>,
     rt: tokio::runtime::Handle,
+    /// An attached ops listener's state (`aster_server_attach_health`).
+    health: Option<HealthState>,
 }
 
 pub(crate) static BUILDERS: once_cell::sync::Lazy<HandleRegistry<BuilderState>> =
@@ -436,6 +451,7 @@ pub unsafe extern "C" fn aster_server_builder_new(
             topology: false,
             max_sessions: None,
             handler_timeout: None,
+            health: None,
         })),
     });
     // SAFETY: checked non-null above.
@@ -602,6 +618,7 @@ pub unsafe extern "C" fn aster_server_start(
     if spec.topology {
         server = server.with_builtin_topology(&node, None);
     }
+    let services = spec.services.len() as u32;
     for svc in spec.services {
         server = match server.dynamic_service(svc) {
             Ok(s) => s,
@@ -621,9 +638,43 @@ pub unsafe extern "C" fn aster_server_start(
         leases: Leases::new(),
         handle: Mutex::new(Some(handle)),
         rt: rt.clone(),
+        health: spec.health.clone(),
     });
+    // Ready once serving (design §6), as `AsterServer` does.
+    if let Some(h) = &spec.health {
+        h.set_services(services);
+        h.set_ready(true);
+    }
     // SAFETY: checked non-null.
     unsafe { ptr::write(out_server, id) };
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// Attach an ops listener (`aster_health_start`) to a server before
+/// `aster_server_start`: a successful start sets it ready (and reports the
+/// registered service count), `aster_server_destroy` sets it not ready first.
+/// The built-in metrics record without it; this ties readiness only.
+/// `NOT_FOUND` for an unknown builder or listener; `ALREADY_CLOSED` for a
+/// builder already started.
+#[no_mangle]
+pub extern "C" fn aster_server_attach_health(
+    builder: aster_server_builder_t,
+    health: aster_health_t,
+) -> i32 {
+    let Some(state) = BUILDERS.get(builder) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let Some(entry) = crate::health::attachable(health) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let mut spec = state.spec.lock().unwrap();
+    let Some(spec) = spec.as_mut() else {
+        return fail(
+            aster_status_t::ASTER_STATUS_ALREADY_CLOSED,
+            "builder already started",
+        );
+    };
+    spec.health = Some(entry.state());
     status(aster_status_t::ASTER_STATUS_OK)
 }
 
@@ -645,6 +696,10 @@ pub extern "C" fn aster_server_destroy(runtime: aster_runtime_t, server: aster_s
     let Some(state) = SERVERS.remove(server) else {
         return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
     };
+    // Not ready first (design §6): probes stop routing before calls fail.
+    if let Some(h) = &state.health {
+        h.set_ready(false);
+    }
     if let Some(handle) = state.handle.lock().unwrap().take() {
         handle.abort();
     }
@@ -844,10 +899,14 @@ fn lower_call(
         attributes,
         connection,
         handle,
+        trace_context,
         ..
     } = call;
     // Answered by id from now on.
     handle.detach();
+    if trace_context.is_some() {
+        flags |= ASTER_DISPATCH_FLAG_HAS_TRACE;
+    }
     if !header.metadata_keys.is_empty() {
         flags |= ASTER_DISPATCH_FLAG_HAS_METADATA;
     }
@@ -1221,6 +1280,46 @@ unsafe fn kv_out(
         ptr::write(out_len, rl);
         ptr::write(out_buffer, id);
     }
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// The server span context of a live call (design §5.2), for the binding's
+/// handler spans and logs: set with `ASTER_DISPATCH_FLAG_HAS_TRACE` on its
+/// `CALL` event. A call whose span is not exported gets an all-zero context
+/// (`OK`). `NOT_FOUND` once the call is over or for an unknown server.
+#[no_mangle]
+pub unsafe extern "C" fn aster_dispatch_trace_context(
+    runtime: aster_runtime_t,
+    server_h: aster_server_t,
+    call_id: u64,
+    out: *mut aster_span_context_t,
+) -> i32 {
+    if out.is_null() {
+        return status(aster_status_t::ASTER_STATUS_INVALID_ARGUMENT);
+    }
+    if let Err(s) = load_runtime(runtime) {
+        return status(s);
+    }
+    let state = match server(server_h) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let Some(call) = state.table.get(call_id) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let cx = call
+        .trace_context()
+        .map(|t| aster_span_context_t {
+            trace_id: t.trace_id,
+            span_id: t.span_id,
+            trace_flags: t.trace_flags,
+            is_remote: 0,
+            _p0: 0,
+            _p1: 0,
+        })
+        .unwrap_or_default();
+    // SAFETY: checked non-null.
+    unsafe { ptr::write(out, cx) };
     status(aster_status_t::ASTER_STATUS_OK)
 }
 

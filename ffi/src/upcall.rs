@@ -394,6 +394,8 @@ pub unsafe extern "C" fn aster_upcall_set_default_policy(
 /// is closed). Returns the count (0 on timeout, unknown handle or bad
 /// arguments). Single consumer; blocks the calling thread, so run it off
 /// the runtime's threads (and off virtual-thread carriers when waiting).
+/// Since 4.6 a call from a tokio runtime thread is refused (0, last error
+/// `ASTER_STATUS_UNSUPPORTED: ...`), like `aster_log_poll`.
 #[no_mangle]
 pub unsafe extern "C" fn aster_upcall_poll(
     runtime: aster_runtime_t,
@@ -402,6 +404,13 @@ pub unsafe extern "C" fn aster_upcall_poll(
     max: u32,
     timeout_ms: u32,
 ) -> u32 {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        set_last_error(
+            "ASTER_STATUS_UNSUPPORTED: aster_upcall_poll blocks; call it from a dedicated \
+             thread, not a tokio runtime thread",
+        );
+        return 0;
+    }
     if out.is_null() || max == 0 || load_ok(runtime).is_none() {
         return 0;
     }

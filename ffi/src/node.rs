@@ -50,7 +50,7 @@ use aster::{
 use aster_transport_core::{CoreAfterHandshakeDecision, CoreHookReceiver, CoreNode};
 
 use crate::{
-    alloc_string, aster_bytes_list_t, aster_bytes_t, aster_event_kind_t, aster_hook_decision_t,
+    aster_bytes_list_t, aster_bytes_t, aster_event_kind_t, aster_hook_decision_t,
     aster_hook_failure_mode_t, aster_hook_invocation_t, aster_node_t, aster_operation_t,
     aster_relay_mode_t, aster_runtime_t, aster_status_t, check_cancelled,
     encode_hook_connect_payload, encode_hook_handshake_payload, load_runtime, set_last_error,
@@ -1062,6 +1062,8 @@ pub unsafe extern "C" fn aster_node_start(
             return;
         }
         let hooks = cfg.enable_hooks;
+        // `aster_health_start` with a NULL config serves this.
+        let health = cfg.health_config();
         match aster::Node::start(cfg).await {
             Ok(node) => {
                 let core: CoreNode = node.core_node().clone();
@@ -1071,6 +1073,7 @@ pub unsafe extern "C" fn aster_node_start(
                     None
                 };
                 let handle = bridge2.nodes.insert(core);
+                crate::health::remember_node_config(handle, health);
                 let slot = receiver.as_ref().map(|_| Arc::new(RwLock::new(gate_entry)));
                 if let Some(slot) = &slot {
                     bridge2
@@ -1135,29 +1138,9 @@ pub unsafe extern "C" fn aster_node_set_gate(
     }
 }
 
-/// Transport metrics of a node in Prometheus text format
-/// (`aster::Node::metrics_prometheus`). `*out` is library-owned; free with
-/// `aster_string_release(out->ptr, out->len)`.
-#[no_mangle]
-pub unsafe extern "C" fn aster_node_metrics_prometheus(
-    runtime: aster_runtime_t,
-    node: aster_node_t,
-    out: *mut aster_bytes_t,
-) -> i32 {
-    if out.is_null() {
-        return invalid("aster_node_metrics_prometheus: out is NULL");
-    }
-    let bridge = try_status!(bridge_for(runtime));
-    let Some(core) = bridge.nodes.get(node) else {
-        return aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
-    };
-    let text = aster::Node::from_core_node(core.as_ref().clone()).metrics_prometheus();
-    *out = alloc_string(text);
-    aster_status_t::ASTER_STATUS_OK as i32
-}
-
 /// Remove the gate slot of a node being freed/closed.
 pub(crate) fn forget_node(bridge: &BridgeRuntime, node: aster_node_t) {
+    crate::health::forget_node_config(node);
     bridge
         .node_gates
         .lock()

@@ -27,8 +27,10 @@ pub mod data;
 pub mod envelope;
 pub mod expose;
 pub mod grants;
+pub mod health;
 mod layout;
 pub mod node;
+pub mod observability;
 pub mod probe;
 pub mod pure;
 pub mod rpc;
@@ -114,8 +116,25 @@ pub mod upcall;
 //   call like dropping the Rust future (FLAG_CANCEL + reset of the pooled
 //   stream; the server sees the cancel; the call returns CANCELLED). See
 //   `ffi/RENAME_MAP.md` "New in 4.5".
+// - 4.6.0 (observability and health, design
+//   `docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md` §7):
+//   `aster_observability_{init,flush,shutdown}` over the Rust-owned OTel
+//   pipeline; the log bridge poll (`aster_log_{poll,close,dropped,
+//   set_filter,emit}`); binding instruments and attribute sets
+//   (`aster_instrument_*`, `aster_attrset_*`, `aster_metric_*`) and
+//   `aster_metrics_prometheus`; binding spans (`aster_span_*`,
+//   `aster_span_record`), `aster_dispatch_trace_context` with
+//   `ASTER_DISPATCH_FLAG_HAS_TRACE`, and the `traceparent` codec
+//   (`aster_trace_context_{format,parse}`); the ops listener
+//   (`aster_health_*`, `aster_server_attach_health`); new status
+//   `ASTER_STATUS_ALREADY_EXISTS` (17). Built-in metrics and spans now record
+//   on the C ABI paths (server dispatch, `aster_rpc_unary` client calls).
+//   Removed outright (pre-release, decision Q12):
+//   `aster_node_metrics_prometheus`, replaced by `aster_metrics_prometheus`.
+//   Behaviour on misuse: `aster_upcall_poll` refuses a tokio runtime thread.
+//   See `ffi/RENAME_MAP.md` "New in 4.6".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 5;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 6;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -176,6 +195,10 @@ pub enum aster_status_t {
     /// Reserved for the R4 auth model (ABI 4.3): the presented credential
     /// has expired. Not returned by any 4.3 function.
     ASTER_STATUS_CREDENTIAL_EXPIRED = 16,
+    /// ABI 4.6: the thing already exists in a form that cannot be joined --
+    /// `aster_observability_init` with a configuration that differs from the
+    /// running pipeline's, or a second concurrent `aster_log_poll`.
+    ASTER_STATUS_ALREADY_EXISTS = 17,
 }
 
 /// Relay mode
@@ -1545,6 +1568,9 @@ pub extern "C" fn aster_status_name(status: i32) -> *const c_char {
         }
         x if x == aster_status_t::ASTER_STATUS_CREDENTIAL_EXPIRED as i32 => {
             "ASTER_STATUS_CREDENTIAL_EXPIRED\0"
+        }
+        x if x == aster_status_t::ASTER_STATUS_ALREADY_EXISTS as i32 => {
+            "ASTER_STATUS_ALREADY_EXISTS\0"
         }
         _ => "ASTER_STATUS_UNKNOWN\0",
     };

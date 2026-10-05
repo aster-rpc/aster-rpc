@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 5
+#define ASTER_ABI_VERSION_MINOR 6
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -197,6 +197,55 @@
 #define ASTER_TRANSPORT_ALL ((1 << 12) - 1)
 
 /**
+ * `flags`: apply `OTEL_*` / `ASTER_*` env under the explicit fields.
+ */
+#define ASTER_OBSERVABILITY_FROM_ENV 1
+
+/**
+ * `flags`: export traces over OTLP. Clear: env decides (with `FROM_ENV`),
+ * else no trace export.
+ */
+#define ASTER_OBSERVABILITY_TRACES 2
+
+/**
+ * `flags`: export metrics over OTLP. Clear: env decides (with `FROM_ENV`),
+ * else no metric push export (a health listener still adds the Prometheus
+ * pull reader).
+ */
+#define ASTER_OBSERVABILITY_METRICS 4
+
+/**
+ * `flags`: export Rust log records over OTLP (path A). Clear: env decides
+ * (with `FROM_ENV`), else off.
+ */
+#define ASTER_OBSERVABILITY_OTLP_LOGS 8
+
+/**
+ * `flags`: open the log bridge queue for `aster_log_poll`.
+ */
+#define ASTER_OBSERVABILITY_LOG_BRIDGE 16
+
+/**
+ * `aster_log_record_t.flags`: `trace_id` / `span_id` are valid.
+ */
+#define ASTER_LOG_FLAG_HAS_TRACE 1
+
+/**
+ * `call_id` is valid (the record was emitted inside a call's `rpc` span).
+ */
+#define ASTER_LOG_FLAG_IN_CALL 2
+
+/**
+ * Made by the bridge itself (the drop report, target `aster::log`).
+ */
+#define ASTER_LOG_FLAG_SYNTHETIC 4
+
+/**
+ * Target `aster::audit` (an audit record).
+ */
+#define ASTER_LOG_FLAG_AUDIT 8
+
+/**
  * Size of every raw key / id this module takes or returns.
  */
 #define ASTER_KEY_SIZE 32
@@ -231,6 +280,12 @@
  * The caller has attributes (`aster_dispatch_attributes`).
  */
 #define ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES 512
+
+/**
+ * ABI 4.6: the call's server span is exported; its context is available
+ * from `aster_dispatch_trace_context`.
+ */
+#define ASTER_DISPATCH_FLAG_HAS_TRACE 1024
 
 /**
  * `timeout_ms` value for "wait without a limit" (`aster_dispatch_recv`,
@@ -290,6 +345,12 @@ typedef enum aster_status_t {
    * has expired. Not returned by any 4.3 function.
    */
   ASTER_STATUS_CREDENTIAL_EXPIRED = 16,
+  /**
+   * ABI 4.6: the thing already exists in a form that cannot be joined --
+   * `aster_observability_init` with a configuration that differs from the
+   * running pipeline's, or a second concurrent `aster_log_poll`.
+   */
+  ASTER_STATUS_ALREADY_EXISTS = 17,
 } aster_status_t;
 
 /**
@@ -1211,6 +1272,79 @@ typedef enum aster_coordination_read_op_t {
   ASTER_COORDINATION_READ_RECOVERY_EXPORT = 8,
 } aster_coordination_read_op_t;
 
+/**
+ * `aster_observability_config_t.binding`: the `aster.binding` resource
+ * attribute.
+ */
+typedef enum aster_binding_kind_t {
+  ASTER_BINDING_UNKNOWN = 0,
+  ASTER_BINDING_RUST = 1,
+  ASTER_BINDING_PYTHON = 2,
+  ASTER_BINDING_TYPESCRIPT = 3,
+  ASTER_BINDING_JAVA = 4,
+  ASTER_BINDING_DOTNET = 5,
+  ASTER_BINDING_GO = 6,
+} aster_binding_kind_t;
+
+/**
+ * `aster_observability_config_t.protocol`.
+ */
+typedef enum aster_otel_protocol_t {
+  /**
+   * `OTEL_EXPORTER_OTLP_PROTOCOL`, else `http/protobuf`.
+   */
+  ASTER_OTEL_PROTOCOL_DEFAULT = 0,
+  ASTER_OTEL_PROTOCOL_HTTP_PROTOBUF = 1,
+  /**
+   * Refused at init (this build exports over http/protobuf only).
+   */
+  ASTER_OTEL_PROTOCOL_GRPC = 2,
+} aster_otel_protocol_t;
+
+/**
+ * `aster_log_record_t.level`.
+ */
+typedef enum aster_log_level_t {
+  ASTER_LOG_ERROR = 1,
+  ASTER_LOG_WARN = 2,
+  ASTER_LOG_INFO = 3,
+  ASTER_LOG_DEBUG = 4,
+  ASTER_LOG_TRACE = 5,
+} aster_log_level_t;
+
+/**
+ * `aster_instrument_desc_t.kind`.
+ */
+typedef enum aster_instrument_kind_t {
+  /**
+   * `aster_metric_add_u64`.
+   */
+  ASTER_INSTRUMENT_COUNTER_U64 = 1,
+  /**
+   * `aster_metric_add_i64`.
+   */
+  ASTER_INSTRUMENT_UP_DOWN_I64 = 2,
+  /**
+   * `aster_metric_record_f64`.
+   */
+  ASTER_INSTRUMENT_HISTOGRAM_F64 = 3,
+  /**
+   * `aster_metric_record_f64` (last value).
+   */
+  ASTER_INSTRUMENT_GAUGE_F64 = 4,
+} aster_instrument_kind_t;
+
+/**
+ * Span kind.
+ */
+typedef enum aster_span_kind_t {
+  ASTER_SPAN_INTERNAL = 0,
+  ASTER_SPAN_SERVER = 1,
+  ASTER_SPAN_CLIENT = 2,
+  ASTER_SPAN_PRODUCER = 3,
+  ASTER_SPAN_CONSUMER = 4,
+} aster_span_kind_t;
+
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
   uint32_t worker_threads;
@@ -1837,6 +1971,30 @@ typedef struct aster_grant_outcome_t {
 } aster_grant_outcome_t;
 
 /**
+ * Where `aster_health_start` listens. 24 bytes (LP64).
+ */
+typedef struct aster_health_config_t {
+  /**
+   * `sizeof(aster_health_config_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * TCP port; 0 = an ephemeral port (read it with `aster_health_addr`).
+   */
+  uint16_t port;
+  uint16_t _p;
+  /**
+   * Bind host (UTF-8); empty = `127.0.0.1`. Pods need `0.0.0.0`.
+   */
+  struct aster_bytes_t host;
+} aster_health_config_t;
+
+/**
+ * A running ops listener (`aster_health_start`).
+ */
+typedef uint64_t aster_health_t;
+
+/**
  * Node configuration: every knob of `aster::AsterConfig` that a node uses
  * (docs/aster-rust-getstarted.md §2.2). Start from `aster_config_init` (or
  * `aster_config_from_env` / `aster_config_from_toml`), then set fields. See
@@ -1958,6 +2116,262 @@ typedef struct aster_config_t {
  * Opaque Gate-0 policy handle (scoped to a runtime).
  */
 typedef uint64_t aster_gate_t;
+
+/**
+ * Pipeline configuration for `aster_observability_init`. 128 bytes (LP64).
+ * Explicit fields beat `OTEL_*` / `ASTER_*` env (applied only with
+ * `ASTER_OBSERVABILITY_FROM_ENV`), which beats `extra_toml`, which beats the
+ * defaults. Empty strings and lists = not set.
+ */
+typedef struct aster_observability_config_t {
+  /**
+   * `sizeof(aster_observability_config_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * `ASTER_OBSERVABILITY_*`.
+   */
+  uint32_t flags;
+  /**
+   * `service.name`.
+   */
+  struct aster_bytes_t service_name;
+  /**
+   * OTLP base URL (`/v1/<signal>` is appended).
+   */
+  struct aster_bytes_t otlp_endpoint;
+  /**
+   * OTLP request headers as a k/v list. Secret: never logged or echoed.
+   */
+  struct aster_bytes_t otlp_headers;
+  /**
+   * Extra resource attributes as a k/v list.
+   */
+  struct aster_bytes_t resource_attrs;
+  /**
+   * `EnvFilter` directives for Rust events; empty = `ASTER_LOG` / default.
+   */
+  struct aster_bytes_t log_filter;
+  /**
+   * An `[observability]` TOML table (the header line may be omitted):
+   * extractors, baggage, limits, exporters.
+   */
+  struct aster_bytes_t extra_toml;
+  /**
+   * Parent-based trace-id-ratio sampler in `[0, 1]`; `< 0` = the sampler
+   * from env / default.
+   */
+  double trace_sample_ratio;
+  /**
+   * `aster_otel_protocol_t`.
+   */
+  uint32_t protocol;
+  /**
+   * Bound of the log bridge queue; 0 = default (8192).
+   */
+  uint32_t log_queue_capacity;
+  /**
+   * `aster_binding_kind_t`.
+   */
+  uint32_t binding;
+  uint32_t _reserved;
+} aster_observability_config_t;
+
+/**
+ * One Rust log record, filled by `aster_log_poll`. 96 bytes (LP64). No
+ * `struct_size`: the caller states the array stride to `aster_log_poll`.
+ * The pointers stay valid until the next `aster_log_poll` or
+ * `aster_log_close` (one arena per batch).
+ */
+typedef struct aster_log_record_t {
+  /**
+   * `aster_log_level_t`.
+   */
+  uint8_t level;
+  /**
+   * `ASTER_LOG_FLAG_*`.
+   */
+  uint8_t flags;
+  uint16_t _p0;
+  uint32_t _p1;
+  /**
+   * Wall clock when the event was recorded.
+   */
+  int64_t timestamp_unix_ns;
+  /**
+   * Valid with `ASTER_LOG_FLAG_HAS_TRACE`, else zero.
+   */
+  uint8_t trace_id[16];
+  /**
+   * Valid with `ASTER_LOG_FLAG_HAS_TRACE`, else zero.
+   */
+  uint8_t span_id[8];
+  /**
+   * The call's id (`aster_dispatch_event_t.call_id` for a dispatched
+   * call) with `ASTER_LOG_FLAG_IN_CALL`, else 0.
+   */
+  uint64_t call_id;
+  /**
+   * The `tracing` target (`aster::rpc::dispatch`; logger name `a.b.c`).
+   */
+  const uint8_t *target_ptr;
+  uint32_t target_len;
+  uint32_t _p2;
+  /**
+   * The message.
+   */
+  const uint8_t *message_ptr;
+  uint32_t message_len;
+  uint32_t _p3;
+  /**
+   * k/v list: the event's fields, then `rpc.service`, `rpc.method`,
+   * `aster.peer` of the enclosing call and `thread.name`.
+   */
+  const uint8_t *fields_ptr;
+  uint32_t fields_len;
+  uint32_t _p4;
+} aster_log_record_t;
+
+/**
+ * A span context. 32 bytes. All-zero `trace_id` = none.
+ */
+typedef struct aster_span_context_t {
+  uint8_t trace_id[16];
+  uint8_t span_id[8];
+  /**
+   * W3C trace flags; bit 0 = sampled.
+   */
+  uint8_t trace_flags;
+  /**
+   * 1 when the context came from another process.
+   */
+  uint8_t is_remote;
+  uint16_t _p0;
+  uint32_t _p1;
+} aster_span_context_t;
+
+/**
+ * An application log record for `aster_log_emit`. 72 bytes (LP64).
+ */
+typedef struct aster_log_emit_t {
+  /**
+   * `sizeof(aster_log_emit_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * `aster_log_level_t`; 0 = INFO.
+   */
+  uint8_t level;
+  uint8_t _p[3];
+  /**
+   * 0 = now.
+   */
+  int64_t timestamp_unix_ns;
+  /**
+   * The binding's logger name.
+   */
+  struct aster_bytes_t logger;
+  struct aster_bytes_t message;
+  /**
+   * k/v list of attributes.
+   */
+  struct aster_bytes_t fields;
+  /**
+   * The trace context to attach; NULL = none.
+   */
+  const struct aster_span_context_t *context;
+} aster_log_emit_t;
+
+/**
+ * An instrument to declare. 80 bytes (LP64).
+ */
+typedef struct aster_instrument_desc_t {
+  /**
+   * `sizeof(aster_instrument_desc_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * `aster_instrument_kind_t`.
+   */
+  uint32_t kind;
+  /**
+   * OTel instrument name (ASCII letter first, then letters, digits, `_`,
+   * `.`, `-`, `/`; at most 255).
+   */
+  struct aster_bytes_t name;
+  struct aster_bytes_t description;
+  /**
+   * UCUM unit; empty = none.
+   */
+  struct aster_bytes_t unit;
+  /**
+   * Attribute keys taken from the current call when a record passes its
+   * `call_id`, as a list (`u32 LE count`, then `u32 LE len` + key ...).
+   * Kept; merging lands with the per-call extractor cache (O6+).
+   */
+  struct aster_bytes_t auto_attrs;
+  /**
+   * Series limit; 0 = default (2000). Kept; 4.6 applies the default.
+   */
+  uint32_t cardinality_limit;
+  uint32_t _p;
+} aster_instrument_desc_t;
+
+/**
+ * A binding-declared instrument (`aster_instrument_new`).
+ */
+typedef uint64_t aster_instrument_t;
+
+/**
+ * An interned attribute set (`aster_attrset_new`).
+ */
+typedef uint64_t aster_attrset_t;
+
+/**
+ * A binding span (`aster_span_start`).
+ */
+typedef uint64_t aster_span_t;
+
+/**
+ * A finished span whose ids, times and content the binding owns (the .NET
+ * `Activity` bridge, design §5.3). 152 bytes (LP64).
+ */
+typedef struct aster_span_record_t {
+  /**
+   * Trace id, span id and flags of the finished span. A clear sampled
+   * flag means it is not exported.
+   */
+  struct aster_span_context_t context;
+  /**
+   * All-zero `trace_id` = root; otherwise it must share `context.trace_id`.
+   */
+  struct aster_span_context_t parent;
+  uint64_t start_unix_nanos;
+  uint64_t end_unix_nanos;
+  /**
+   * `aster_span_kind_t`.
+   */
+  uint32_t kind;
+  /**
+   * 0 unset, 1 ok, 2 error.
+   */
+  uint32_t status_code;
+  struct aster_bytes_t name;
+  struct aster_bytes_t status_message;
+  /**
+   * k/v list of attributes.
+   */
+  const uint8_t *kv;
+  uint32_t kv_len;
+  uint32_t _p0;
+  /**
+   * Events: `u32 LE count`, then per event `u32 LE len` + name,
+   * `u64 LE unix_nanos`, `u32 LE len` + a k/v list of its attributes.
+   */
+  const uint8_t *events;
+  uint32_t events_len;
+  uint32_t _p1;
+} aster_span_record_t;
 
 /**
  * Policy of a minted attestation edge (`aster::attestation::AttestOptions`).
@@ -4559,6 +4973,63 @@ int32_t aster_namespace_grant_reconcile(const uint8_t *identity_secret,
 int32_t aster_grant_outcome_release(struct aster_grant_outcome_t *outcome);
 
 /**
+ * Start an ops listener for `node` (a node from `aster_node_start`). `cfg`
+ * NULL = the node's `AsterConfig` (`ASTER_HEALTH_PORT` / `_HOST` /
+ * `_ENABLED`, `[health]`); `INVALID_ARGUMENT` when that config has health
+ * disabled. Joins the running observability pipeline, or starts one from
+ * the environment, with the Prometheus pull reader. The state starts healthy
+ * and not ready: attach it to a server (`aster_server_attach_health`) or set
+ * it with `aster_health_set_ready`. Blocks until bound; refused on a tokio
+ * runtime thread (`UNSUPPORTED`).
+ *
+ * # Safety
+ * `cfg` is NULL or points to a valid `aster_health_config_t` whose `host`
+ * is readable; `out` is writable.
+ */
+int32_t aster_health_start(aster_runtime_t rt,
+                           aster_node_t node,
+                           const struct aster_health_config_t *cfg,
+                           aster_health_t *out);
+
+/**
+ * Set the ready flag (`/readyz`). A server the listener is attached to sets
+ * it on a successful `aster_server_start` and clears it first in
+ * `aster_server_destroy`; this stays available for the binding's own gating.
+ */
+int32_t aster_health_set_ready(aster_health_t h, bool ready);
+
+/**
+ * Set liveness (`/healthz`; unhealthy also fails `/readyz`).
+ */
+int32_t aster_health_set_healthy(aster_health_t h, bool healthy);
+
+/**
+ * Set the named readiness check `name` (created failing on first use; every
+ * check must pass for `/readyz`, which lists them under `checks`).
+ *
+ * # Safety
+ * `name` is readable for the call.
+ */
+int32_t aster_health_check_set(aster_health_t h, struct aster_bytes_t name, bool ok);
+
+/**
+ * The bound address as `"ip:port"` (the real port after port 0).
+ * `*out` is library-owned; free with `aster_string_release(out->ptr,
+ * out->len)`.
+ *
+ * # Safety
+ * `out` is writable.
+ */
+int32_t aster_health_addr(aster_health_t h, struct aster_bytes_t *out);
+
+/**
+ * Stop the listener and free the handle; the port is free on return.
+ * Releases the listener's observability reference. Refused on a tokio
+ * runtime thread (`UNSUPPORTED`).
+ */
+int32_t aster_health_stop(aster_runtime_t rt, aster_health_t h);
+
+/**
  * Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
  * in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
  * overrides). Never allocates (`storage` is NULL).
@@ -4705,13 +5176,296 @@ int32_t aster_node_start(aster_runtime_t runtime,
 int32_t aster_node_set_gate(aster_runtime_t runtime, aster_node_t node, aster_gate_t gate);
 
 /**
- * Transport metrics of a node in Prometheus text format
- * (`aster::Node::metrics_prometheus`). `*out` is library-owned; free with
- * `aster_string_release(out->ptr, out->len)`.
+ * Start the observability pipeline, or join the running one (refcount + 1).
+ * `cfg` NULL = env only (`OTEL_*` / `ASTER_*`). A different configuration
+ * than the running pipeline's returns `ASTER_STATUS_ALREADY_EXISTS` (the
+ * message names the differing settings); `ASTER_OBSERVABILITY_LOG_BRIDGE`
+ * is additive and opens the bridge on a running pipeline. Each `OK` must be
+ * matched by one `aster_observability_shutdown`.
+ *
+ * # Safety
+ * `cfg` is NULL or points to a valid `aster_observability_config_t` whose
+ * byte fields are readable for the call.
  */
-int32_t aster_node_metrics_prometheus(aster_runtime_t runtime,
-                                      aster_node_t node,
-                                      struct aster_bytes_t *out);
+int32_t aster_observability_init(const struct aster_observability_config_t *cfg);
+
+/**
+ * Flush every signal of the running pipeline, waiting at most `timeout_ms`
+ * (`ASTER_STATUS_TIMEOUT` otherwise). No pipeline: `OK`.
+ */
+int32_t aster_observability_flush(uint32_t timeout_ms);
+
+/**
+ * Release one reference taken by `aster_observability_init`. The last
+ * reference (counting other holders, such as a health listener) shuts the
+ * pipeline down: providers flush and stop, the log bridge closes, every live
+ * `aster_span_t` ends and every instrument / attribute set handle is freed.
+ * Waits at most `timeout_ms` (`ASTER_STATUS_TIMEOUT`; the shutdown then
+ * completes in the background). No reference left: `ALREADY_CLOSED`.
+ */
+int32_t aster_observability_shutdown(uint32_t timeout_ms);
+
+/**
+ * Take up to `max` Rust log records into `out`, waiting up to `timeout_ms`
+ * for the first (0 = return at once). Returns the count: 0 on timeout,
+ * once the bridge is closed or not open (last error
+ * `ASTER_STATUS_NOT_FOUND: ...`), or on refusal. Audit records come first,
+ * then the rest in FIFO order; a synthetic drop report (`ASTER_LOG_FLAG_SYNTHETIC`)
+ * leads a batch at most once a second.
+ *
+ * Rules: `record_size` must equal `sizeof(aster_log_record_t)` (the array
+ * stride); otherwise 0 and `ASTER_STATUS_INVALID_ARGUMENT: ...`. **One poller
+ * per process**: a concurrent second call returns 0 with last error
+ * `ASTER_STATUS_ALREADY_EXISTS: ...` (it would free the batch the first is
+ * reading). Refused on a tokio runtime thread (`ASTER_STATUS_UNSUPPORTED: ...`):
+ * run it on a dedicated thread, which this call marks as a log drain (events
+ * it emits never reach the bridge, so a logger that calls back into Aster
+ * cannot feed its own queue). The returned pointers stay valid until the
+ * next `aster_log_poll` or `aster_log_close`.
+ *
+ * # Safety
+ * `out` must have room for `max` records of `record_size` bytes.
+ */
+uint32_t aster_log_poll(struct aster_log_record_t *out,
+                        uint32_t record_size,
+                        uint32_t max,
+                        uint32_t timeout_ms);
+
+/**
+ * Close the log bridge: Rust events stop being queued, a waiting
+ * `aster_log_poll` wakes (and gets what was still queued, then 0), and the
+ * last batch's arena is freed when no poll is running. A later
+ * `aster_observability_init` with `ASTER_OBSERVABILITY_LOG_BRIDGE` opens a
+ * new bridge. `OK` also when no bridge is open.
+ */
+int32_t aster_log_close(void);
+
+/**
+ * General (non-audit) Rust log records dropped because the bridge queue
+ * was full, since the process started (also metric
+ * `aster.log.records_dropped`).
+ *
+ * # Safety
+ * `out_total` is NULL or writable.
+ */
+int32_t aster_log_dropped(uint64_t *out_total);
+
+/**
+ * Replace the bridge's filter (`EnvFilter` directives, as `ASTER_LOG`; the
+ * binding's level sync). `INVALID_ARGUMENT` on a parse error, `NOT_FOUND`
+ * when no bridge is open.
+ *
+ * # Safety
+ * `directives` points to `len` readable bytes (or is NULL with `len` 0).
+ */
+int32_t aster_log_set_filter(const uint8_t *directives, uint32_t len);
+
+/**
+ * Path B (design §3.4): write an application log record into the Rust OTel
+ * logs SDK (exported over OTLP when log export is on; `OK` and nothing
+ * exported otherwise). Never blocks; emits no Rust event, so it cannot
+ * reach the log bridge.
+ *
+ * # Safety
+ * `rec` points to a valid `aster_log_emit_t` whose byte fields and
+ * `context` are readable for the call.
+ */
+int32_t aster_log_emit(const struct aster_log_emit_t *rec);
+
+/**
+ * Declare an instrument (scope `aster.app`). It records into whichever
+ * pipeline is running at record time (a no-op without one). A name already
+ * declared with another kind, or one breaking the OTel naming rules, is
+ * `INVALID_ARGUMENT`. Free with `aster_instrument_free`; a pipeline
+ * shutdown frees every handle.
+ *
+ * # Safety
+ * `d` points to a valid `aster_instrument_desc_t` whose byte fields are
+ * readable for the call; `out` is writable.
+ */
+int32_t aster_instrument_new(const struct aster_instrument_desc_t *d, aster_instrument_t *out);
+
+/**
+ * Free an instrument handle (`NOT_FOUND` if unknown).
+ */
+int32_t aster_instrument_free(aster_instrument_t h);
+
+/**
+ * Intern an attribute set from a k/v list, to pass to `aster_metric_*`
+ * without re-encoding (build once, record many times).
+ *
+ * # Safety
+ * `kv` points to `kv_len` readable bytes; `out` is writable.
+ */
+int32_t aster_attrset_new(const uint8_t *kv, uint32_t kv_len, aster_attrset_t *out);
+
+/**
+ * Free an attribute set handle (`NOT_FOUND` if unknown).
+ */
+int32_t aster_attrset_free(aster_attrset_t h);
+
+/**
+ * Add `v` to a `COUNTER_U64` instrument with the attributes of `set` (0 =
+ * none) followed by the k/v list `kv`. Never blocks on I/O and never calls
+ * into the runtime (a short SDK lock; a new series takes it for writing).
+ * `call_id` is reserved for `auto_attrs` (0 = none).
+ *
+ * # Safety
+ * `kv` points to `kv_len` readable bytes (or is NULL with `kv_len` 0).
+ */
+int32_t aster_metric_add_u64(aster_instrument_t h,
+                             uint64_t v,
+                             aster_attrset_t set,
+                             const uint8_t *kv,
+                             uint32_t kv_len,
+                             uint64_t call_id);
+
+/**
+ * Add `v` to an `UP_DOWN_I64` instrument (see `aster_metric_add_u64`).
+ *
+ * # Safety
+ * As `aster_metric_add_u64`.
+ */
+int32_t aster_metric_add_i64(aster_instrument_t h,
+                             int64_t v,
+                             aster_attrset_t set,
+                             const uint8_t *kv,
+                             uint32_t kv_len,
+                             uint64_t call_id);
+
+/**
+ * Record `v` on a `HISTOGRAM_F64` or `GAUGE_F64` instrument (see
+ * `aster_metric_add_u64`).
+ *
+ * # Safety
+ * As `aster_metric_add_u64`.
+ */
+int32_t aster_metric_record_f64(aster_instrument_t h,
+                                double v,
+                                aster_attrset_t set,
+                                const uint8_t *kv,
+                                uint32_t kv_len,
+                                uint64_t call_id);
+
+/**
+ * The running pipeline's metrics as Prometheus text (format 0.0.4): the
+ * built-in `aster.*` instruments, binding instruments, `process.uptime`,
+ * `target_info` -- what a health listener's `/metrics` serves, without
+ * HTTP. Needs the Prometheus pull reader: a running health listener
+ * (`aster_health_start`), or `OTEL_METRICS_EXPORTER=prometheus` /
+ * `metrics_exporter = "prometheus"` in `extra_toml`; otherwise `NOT_FOUND`.
+ * `*out` is library-owned; free with `aster_string_release(out->ptr,
+ * out->len)`. Replaces `aster_node_metrics_prometheus` (removed in 4.6).
+ *
+ * # Safety
+ * `out` is writable.
+ */
+int32_t aster_metrics_prometheus(struct aster_bytes_t *out);
+
+/**
+ * Start a span in the Rust tracer (scope `aster.app`), exported with
+ * Aster's own spans and sharing their sampling. `parent` NULL (or an
+ * all-zero context) = a root. `kv` = string attributes. Without a pipeline
+ * the span is a no-op (its context is all-zero). At most 65 536 live spans
+ * (`QUEUE_FULL` beyond); a pipeline shutdown ends the ones still open.
+ *
+ * # Safety
+ * `name` and `kv` are readable for the call; `parent` is NULL or readable;
+ * `out` is writable.
+ */
+int32_t aster_span_start(struct aster_bytes_t name,
+                         uint32_t kind,
+                         const struct aster_span_context_t *parent,
+                         const uint8_t *kv,
+                         uint32_t kv_len,
+                         aster_span_t *out);
+
+/**
+ * Add string attributes to a live span.
+ *
+ * # Safety
+ * `kv` points to `kv_len` readable bytes.
+ */
+int32_t aster_span_set_attributes(aster_span_t s, const uint8_t *kv, uint32_t kv_len);
+
+/**
+ * Add an event (timestamped now) to a live span.
+ *
+ * # Safety
+ * `name` and `kv` are readable for the call.
+ */
+int32_t aster_span_add_event(aster_span_t s,
+                             struct aster_bytes_t name,
+                             const uint8_t *kv,
+                             uint32_t kv_len);
+
+/**
+ * Set a live span's status: `code` 0 unset, 1 ok, 2 error (with `message`).
+ *
+ * # Safety
+ * `message` is readable for the call.
+ */
+int32_t aster_span_set_status(aster_span_t s, uint32_t code, struct aster_bytes_t message);
+
+/**
+ * Record an error on a live span: an `exception` event with
+ * `exception.type` / `exception.message`, and status error.
+ *
+ * # Safety
+ * `error_type` and `message` are readable for the call.
+ */
+int32_t aster_span_record_error(aster_span_t s,
+                                struct aster_bytes_t error_type,
+                                struct aster_bytes_t message);
+
+/**
+ * A live span's context (all-zero for a no-op span), for the binding's
+ * call-context carrier and for `aster_trace_context_format`.
+ *
+ * # Safety
+ * `out` is writable.
+ */
+int32_t aster_span_context(aster_span_t s, struct aster_span_context_t *out);
+
+/**
+ * End a live span and free its handle.
+ */
+int32_t aster_span_end(aster_span_t s);
+
+/**
+ * Export a finished span with the binding's own ids and times. Copies
+ * everything; never blocks. The pipeline's sampler still runs (the default
+ * parent-based one follows the parent's flag). `INVALID_ARGUMENT` for an
+ * all-zero context, a parent from another trace, an end before the start,
+ * or a malformed field.
+ *
+ * # Safety
+ * `rec` points to a valid `aster_span_record_t` whose pointers are
+ * readable for the call.
+ */
+int32_t aster_span_record(const struct aster_span_record_t *rec);
+
+/**
+ * Write the W3C `traceparent` of `ctx` (55 bytes, version `00`, lowercase)
+ * into `buf` for outbound call metadata. `cap < 55`: `BUFFER_TOO_SMALL`
+ * with `*out_len` = 55. An all-zero id: `INVALID_ARGUMENT`.
+ *
+ * # Safety
+ * `ctx` is readable; `buf` has room for `cap` bytes; `out_len` is writable.
+ */
+int32_t aster_trace_context_format(const struct aster_span_context_t *ctx,
+                                   uint8_t *buf,
+                                   uint32_t cap,
+                                   uint32_t *out_len);
+
+/**
+ * Parse a W3C `traceparent` (from inbound metadata) into `*out` (marked
+ * remote). `INVALID_ARGUMENT` when malformed or an id is all-zero.
+ *
+ * # Safety
+ * `s` points to `len` readable bytes; `out` is writable.
+ */
+int32_t aster_trace_context_parse(const uint8_t *s, uint32_t len, struct aster_span_context_t *out);
 
 void aster_probe_reset(void);
 
@@ -5124,6 +5878,16 @@ int32_t aster_server_start(aster_runtime_t runtime,
                            aster_server_t *out_server);
 
 /**
+ * Attach an ops listener (`aster_health_start`) to a server before
+ * `aster_server_start`: a successful start sets it ready (and reports the
+ * registered service count), `aster_server_destroy` sets it not ready first.
+ * The built-in metrics record without it; this ties readiness only.
+ * `NOT_FOUND` for an unknown builder or listener; `ALREADY_CLOSED` for a
+ * builder already started.
+ */
+int32_t aster_server_attach_health(aster_server_builder_t builder, aster_health_t health);
+
+/**
  * Free a builder that was never started.
  */
 int32_t aster_server_builder_free(aster_server_builder_t builder);
@@ -5263,6 +6027,17 @@ int32_t aster_dispatch_attributes(aster_runtime_t runtime,
                                   aster_buffer_t *out_buffer);
 
 /**
+ * The server span context of a live call (design §5.2), for the binding's
+ * handler spans and logs: set with `ASTER_DISPATCH_FLAG_HAS_TRACE` on its
+ * `CALL` event. A call whose span is not exported gets an all-zero context
+ * (`OK`). `NOT_FOUND` once the call is over or for an unknown server.
+ */
+int32_t aster_dispatch_trace_context(aster_runtime_t runtime,
+                                     aster_server_t server_h,
+                                     uint64_t call_id,
+                                     struct aster_span_context_t *out);
+
+/**
  * End the call with `INTERNAL "handler dropped call"` unless it already
  * ended. `NOT_FOUND` when it had.
  */
@@ -5343,6 +6118,8 @@ int32_t aster_upcall_set_default_policy(aster_runtime_t runtime,
  * is closed). Returns the count (0 on timeout, unknown handle or bad
  * arguments). Single consumer; blocks the calling thread, so run it off
  * the runtime's threads (and off virtual-thread carriers when waiting).
+ * Since 4.6 a call from a tokio runtime thread is refused (0, last error
+ * `ASTER_STATUS_UNSUPPORTED: ...`), like `aster_log_poll`.
  */
 uint32_t aster_upcall_poll(aster_runtime_t runtime,
                            aster_upcalls_t upcalls,

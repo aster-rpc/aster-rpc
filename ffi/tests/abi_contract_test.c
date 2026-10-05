@@ -342,6 +342,74 @@ _Static_assert(sizeof(aster_coordination_client_t) == 8 && sizeof(aster_coordina
                sizeof(aster_coordination_lease_t) == 8 &&
                sizeof(aster_coordination_placement_manager_t) == 8, "handle size");
 
+/* ABI 4.6: observability and health */
+LAYOUT(aster_observability_config_t, 128);
+OFF(aster_observability_config_t, struct_size, 0);
+OFF(aster_observability_config_t, flags, 4);
+OFF(aster_observability_config_t, service_name, 8);
+OFF(aster_observability_config_t, otlp_endpoint, 24);
+OFF(aster_observability_config_t, otlp_headers, 40);
+OFF(aster_observability_config_t, resource_attrs, 56);
+OFF(aster_observability_config_t, log_filter, 72);
+OFF(aster_observability_config_t, extra_toml, 88);
+OFF(aster_observability_config_t, trace_sample_ratio, 104);
+OFF(aster_observability_config_t, protocol, 112);
+OFF(aster_observability_config_t, log_queue_capacity, 116);
+OFF(aster_observability_config_t, binding, 120);
+LAYOUT(aster_log_record_t, 96);
+OFF(aster_log_record_t, level, 0);
+OFF(aster_log_record_t, flags, 1);
+OFF(aster_log_record_t, timestamp_unix_ns, 8);
+OFF(aster_log_record_t, trace_id, 16);
+OFF(aster_log_record_t, span_id, 32);
+OFF(aster_log_record_t, call_id, 40);
+OFF(aster_log_record_t, target_ptr, 48);
+OFF(aster_log_record_t, target_len, 56);
+OFF(aster_log_record_t, message_ptr, 64);
+OFF(aster_log_record_t, message_len, 72);
+OFF(aster_log_record_t, fields_ptr, 80);
+OFF(aster_log_record_t, fields_len, 88);
+LAYOUT(aster_log_emit_t, 72);
+OFF(aster_log_emit_t, level, 4);
+OFF(aster_log_emit_t, timestamp_unix_ns, 8);
+OFF(aster_log_emit_t, logger, 16);
+OFF(aster_log_emit_t, message, 32);
+OFF(aster_log_emit_t, fields, 48);
+OFF(aster_log_emit_t, context, 64);
+LAYOUT(aster_instrument_desc_t, 80);
+OFF(aster_instrument_desc_t, kind, 4);
+OFF(aster_instrument_desc_t, name, 8);
+OFF(aster_instrument_desc_t, description, 24);
+OFF(aster_instrument_desc_t, unit, 40);
+OFF(aster_instrument_desc_t, auto_attrs, 56);
+OFF(aster_instrument_desc_t, cardinality_limit, 72);
+LAYOUT(aster_span_context_t, 32);
+OFF(aster_span_context_t, trace_id, 0);
+OFF(aster_span_context_t, span_id, 16);
+OFF(aster_span_context_t, trace_flags, 24);
+OFF(aster_span_context_t, is_remote, 25);
+LAYOUT(aster_span_record_t, 152);
+OFF(aster_span_record_t, context, 0);
+OFF(aster_span_record_t, parent, 32);
+OFF(aster_span_record_t, start_unix_nanos, 64);
+OFF(aster_span_record_t, end_unix_nanos, 72);
+OFF(aster_span_record_t, kind, 80);
+OFF(aster_span_record_t, status_code, 84);
+OFF(aster_span_record_t, name, 88);
+OFF(aster_span_record_t, status_message, 104);
+OFF(aster_span_record_t, kv, 120);
+OFF(aster_span_record_t, kv_len, 128);
+OFF(aster_span_record_t, events, 136);
+OFF(aster_span_record_t, events_len, 144);
+LAYOUT(aster_health_config_t, 24);
+OFF(aster_health_config_t, port, 4);
+OFF(aster_health_config_t, host, 8);
+_Static_assert(sizeof(aster_binding_kind_t) == 4 && sizeof(aster_otel_protocol_t) == 4 &&
+               sizeof(aster_log_level_t) == 4 && sizeof(aster_instrument_kind_t) == 4 &&
+               sizeof(aster_span_kind_t) == 4, "enum size");
+_Static_assert(sizeof(aster_instrument_t) == 8 && sizeof(aster_attrset_t) == 8 &&
+               sizeof(aster_span_t) == 8 && sizeof(aster_health_t) == 8, "handle size");
+
 /* ── Run-time checks ───────────────────────────────────────────────────── */
 
 static int failures = 0;
@@ -363,7 +431,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 5); /* 4.2: expose; 4.3: streaming relay; 4.4: coordination; 4.5: unary cancel tokens */
+    CHECK(ASTER_ABI_VERSION_MINOR == 6); /* 4.2: expose; 4.3: streaming relay; 4.4: coordination; 4.5: unary cancel tokens; 4.6: observability + health */
     CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
@@ -446,6 +514,19 @@ static void test_enum_values(void) {
     CHECK(ASTER_COORDINATION_READ_READ_LINEARIZABLE == 1 && ASTER_COORDINATION_READ_RECOVERY_EXPORT == 8);
     CHECK(ASTER_COORDINATION_TAG_MUTATION_REQUEST == 0xD0 && ASTER_COORDINATION_TAG_PLACEMENT_REPORT == 0xDE);
     CHECK(ASTER_COORDINATION_CLIENT_READ_ONLY == 1);
+    /* 4.6 */
+    CHECK(ASTER_STATUS_ALREADY_EXISTS == 17);
+    CHECK(strcmp(aster_status_name(ASTER_STATUS_ALREADY_EXISTS), "ASTER_STATUS_ALREADY_EXISTS") == 0);
+    CHECK(ASTER_BINDING_UNKNOWN == 0 && ASTER_BINDING_GO == 6);
+    CHECK(ASTER_OTEL_PROTOCOL_DEFAULT == 0 && ASTER_OTEL_PROTOCOL_GRPC == 2);
+    CHECK(ASTER_OBSERVABILITY_FROM_ENV == 1 && ASTER_OBSERVABILITY_TRACES == 2 && ASTER_OBSERVABILITY_METRICS == 4);
+    CHECK(ASTER_OBSERVABILITY_OTLP_LOGS == 8 && ASTER_OBSERVABILITY_LOG_BRIDGE == 16);
+    CHECK(ASTER_LOG_ERROR == 1 && ASTER_LOG_TRACE == 5);
+    CHECK(ASTER_LOG_FLAG_HAS_TRACE == 1 && ASTER_LOG_FLAG_IN_CALL == 2);
+    CHECK(ASTER_LOG_FLAG_SYNTHETIC == 4 && ASTER_LOG_FLAG_AUDIT == 8);
+    CHECK(ASTER_INSTRUMENT_COUNTER_U64 == 1 && ASTER_INSTRUMENT_GAUGE_F64 == 4);
+    CHECK(ASTER_SPAN_INTERNAL == 0 && ASTER_SPAN_CONSUMER == 4);
+    CHECK(ASTER_DISPATCH_FLAG_HAS_TRACE == 0x400);
 }
 
 static void test_data_plane(void) {
@@ -647,10 +728,6 @@ static void test_gate_and_node(void) {
     CHECK(ev.kind == ASTER_EVENT_NODE_CREATED && ev.user_data == 42 && ev.handle != 0);
     aster_node_t node = ev.handle;
 
-    aster_bytes_t text = {0};
-    CHECK(aster_node_metrics_prometheus(rt, node, &text) == ASTER_STATUS_OK);
-    CHECK(text.ptr != NULL && strstr((const char *)text.ptr, "iroh_send_ipv4") != NULL);
-    CHECK(aster_string_release(text.ptr, text.len) == ASTER_STATUS_OK);
     CHECK(aster_node_set_gate(rt, node, 0) == ASTER_STATUS_OK);
     CHECK(aster_node_set_gate(rt, node, gate) == ASTER_STATUS_OK);
 
@@ -1181,6 +1258,161 @@ static void test_coordination(void) {
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
+/* ABI 4.6: observability (process-global) and the ops listener. Smoke for
+ * every new symbol; behaviour is covered by ffi/tests/observability.rs and
+ * ffi/tests/health.rs. */
+static void test_observability(void) {
+    printf("[observability 4.6]\n");
+    aster_observability_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg;
+    cfg.flags = ASTER_OBSERVABILITY_LOG_BRIDGE; /* no exporters, no env */
+    cfg.service_name = (aster_bytes_t){(const uint8_t *)"abi-contract", 12};
+    cfg.trace_sample_ratio = -1.0;
+    cfg.binding = ASTER_BINDING_UNKNOWN;
+    aster_observability_config_t bad = cfg;
+    bad.struct_size = 8;
+    CHECK(aster_observability_init(&bad) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_observability_init(&cfg) == ASTER_STATUS_OK);
+    CHECK(aster_observability_init(&cfg) == ASTER_STATUS_OK); /* refcount 2 */
+    aster_observability_config_t other = cfg;
+    other.service_name = (aster_bytes_t){(const uint8_t *)"other", 5};
+    CHECK(aster_observability_init(&other) == ASTER_STATUS_ALREADY_EXISTS);
+    CHECK(aster_observability_flush(2000) == ASTER_STATUS_OK);
+
+    aster_log_record_t recs[4];
+    CHECK(aster_log_poll(recs, 8, 4, 0) == 0); /* wrong stride */
+    CHECK(aster_log_poll(recs, sizeof recs[0], 4, 0) == 0); /* nothing queued */
+    CHECK(aster_log_set_filter((const uint8_t *)"warn", 4) == ASTER_STATUS_OK);
+    CHECK(aster_log_set_filter((const uint8_t *)"[[", 2) == ASTER_STATUS_INVALID_ARGUMENT);
+    uint64_t dropped = 99;
+    CHECK(aster_log_dropped(&dropped) == ASTER_STATUS_OK);
+    CHECK(aster_log_dropped(NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+    aster_log_emit_t le;
+    memset(&le, 0, sizeof le);
+    le.struct_size = sizeof le;
+    le.level = ASTER_LOG_INFO;
+    le.logger = (aster_bytes_t){(const uint8_t *)"app", 3};
+    le.message = (aster_bytes_t){(const uint8_t *)"hello", 5};
+    CHECK(aster_log_emit(&le) == ASTER_STATUS_OK); /* no OTLP logs exporter: accepted, not exported */
+
+    aster_instrument_desc_t d;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d;
+    d.kind = ASTER_INSTRUMENT_COUNTER_U64;
+    d.name = (aster_bytes_t){(const uint8_t *)"abi.requests", 12};
+    aster_instrument_t inst = 0;
+    CHECK(aster_instrument_new(&d, &inst) == ASTER_STATUS_OK && inst != 0);
+    d.kind = ASTER_INSTRUMENT_GAUGE_F64;
+    aster_instrument_t clash = 0;
+    CHECK(aster_instrument_new(&d, &clash) == ASTER_STATUS_INVALID_ARGUMENT);
+    static const uint8_t kv[] = {1, 0, 0, 0, 1, 0, 0, 0, 'k', 1, 0, 0, 0, 'v'};
+    aster_attrset_t set = 0;
+    CHECK(aster_attrset_new(kv, sizeof kv, &set) == ASTER_STATUS_OK && set != 0);
+    CHECK(aster_metric_add_u64(inst, 3, set, NULL, 0, 0) == ASTER_STATUS_OK);
+    CHECK(aster_metric_add_u64(inst, 1, 0, kv, sizeof kv, 0) == ASTER_STATUS_OK);
+    CHECK(aster_metric_add_i64(inst, 1, 0, NULL, 0, 0) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_metric_record_f64(inst, 1.0, 0, NULL, 0, 0) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_metric_add_u64(424242, 1, 0, NULL, 0, 0) == ASTER_STATUS_NOT_FOUND);
+    aster_bytes_t text = {0};
+    CHECK(aster_metrics_prometheus(&text) == ASTER_STATUS_NOT_FOUND); /* no pull reader */
+    CHECK(aster_attrset_free(set) == ASTER_STATUS_OK);
+    CHECK(aster_instrument_free(inst) == ASTER_STATUS_OK);
+    CHECK(aster_instrument_free(inst) == ASTER_STATUS_NOT_FOUND);
+
+    aster_span_t span = 0;
+    CHECK(aster_span_start((aster_bytes_t){(const uint8_t *)"work", 4}, ASTER_SPAN_INTERNAL, NULL, NULL, 0, &span) ==
+          ASTER_STATUS_OK);
+    CHECK(aster_span_set_attributes(span, kv, sizeof kv) == ASTER_STATUS_OK);
+    CHECK(aster_span_add_event(span, (aster_bytes_t){(const uint8_t *)"e", 1}, NULL, 0) == ASTER_STATUS_OK);
+    CHECK(aster_span_set_status(span, 2, (aster_bytes_t){(const uint8_t *)"bad", 3}) == ASTER_STATUS_OK);
+    CHECK(aster_span_set_status(span, 9, (aster_bytes_t){0}) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_span_record_error(span, (aster_bytes_t){0}, (aster_bytes_t){(const uint8_t *)"x", 1}) ==
+          ASTER_STATUS_OK);
+    aster_span_context_t sc;
+    CHECK(aster_span_context(span, &sc) == ASTER_STATUS_OK);
+    CHECK(aster_span_end(span) == ASTER_STATUS_OK);
+    CHECK(aster_span_end(span) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_span_start((aster_bytes_t){0}, 77, NULL, NULL, 0, &span) == ASTER_STATUS_INVALID_ARGUMENT);
+
+    static const char tp[] = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    aster_span_context_t parsed;
+    CHECK(aster_trace_context_parse((const uint8_t *)tp, 55, &parsed) == ASTER_STATUS_OK);
+    CHECK(parsed.trace_flags == 1 && parsed.is_remote == 1);
+    char buf[64];
+    uint32_t n = 0;
+    CHECK(aster_trace_context_format(&parsed, (uint8_t *)buf, sizeof buf, &n) == ASTER_STATUS_OK && n == 55);
+    CHECK(memcmp(buf, tp, 55) == 0);
+    CHECK(aster_trace_context_format(&parsed, (uint8_t *)buf, 10, &n) == ASTER_STATUS_BUFFER_TOO_SMALL);
+    CHECK(aster_trace_context_parse((const uint8_t *)tp, 54, &parsed) == ASTER_STATUS_INVALID_ARGUMENT);
+    aster_span_record_t rec;
+    memset(&rec, 0, sizeof rec);
+    rec.context = parsed;
+    rec.start_unix_nanos = 1000;
+    rec.end_unix_nanos = 2000;
+    rec.name = (aster_bytes_t){(const uint8_t *)"recorded", 8};
+    CHECK(aster_span_record(&rec) == ASTER_STATUS_OK);
+    rec.end_unix_nanos = 10;
+    CHECK(aster_span_record(&rec) == ASTER_STATUS_INVALID_ARGUMENT);
+
+    CHECK(aster_log_close() == ASTER_STATUS_OK);
+    CHECK(aster_observability_shutdown(5000) == ASTER_STATUS_OK);
+    CHECK(aster_observability_shutdown(5000) == ASTER_STATUS_OK); /* last reference */
+    CHECK(aster_observability_shutdown(5000) == ASTER_STATUS_ALREADY_CLOSED);
+}
+
+static void test_health(void) {
+    printf("[health 4.6]\n");
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+    aster_config_t c;
+    CHECK(aster_config_init(&c) == ASTER_STATUS_OK);
+    c.relay_mode = ASTER_RELAY_MODE_DISABLED;
+    c.bind_addr = (aster_bytes_t){(const uint8_t *)"127.0.0.1:0", 11};
+    aster_bytes_t alpn = {(const uint8_t *)"aster/1", 7};
+    c.alpns = (aster_bytes_list_t){&alpn, 1};
+    aster_operation_t op = 0;
+    CHECK(aster_node_start(rt, &c, 0, 9, &op) == ASTER_STATUS_OK);
+    aster_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    CHECK(wait_event(rt, op, &ev));
+    aster_node_t node = ev.handle;
+
+    aster_health_t h = 0;
+    CHECK(aster_health_start(rt, node, NULL, &h) == ASTER_STATUS_INVALID_ARGUMENT); /* disabled in config */
+    aster_health_config_t hc;
+    memset(&hc, 0, sizeof hc);
+    hc.struct_size = sizeof hc;
+    hc.host = (aster_bytes_t){(const uint8_t *)"127.0.0.1", 9};
+    CHECK(aster_health_start(rt, node, &hc, &h) == ASTER_STATUS_OK && h != 0);
+    aster_bytes_t addr = {0};
+    CHECK(aster_health_addr(h, &addr) == ASTER_STATUS_OK && addr.len > 10);
+    CHECK(strncmp((const char *)addr.ptr, "127.0.0.1:", 10) == 0);
+    CHECK(aster_string_release(addr.ptr, addr.len) == ASTER_STATUS_OK);
+    aster_bytes_t text = {0};
+    CHECK(aster_metrics_prometheus(&text) == ASTER_STATUS_OK && text.len > 0);
+    CHECK(aster_string_release(text.ptr, text.len) == ASTER_STATUS_OK);
+
+    aster_server_builder_t b = 0;
+    CHECK(aster_server_builder_new(rt, node, &b) == ASTER_STATUS_OK);
+    CHECK(aster_server_attach_health(b, h) == ASTER_STATUS_OK);
+    CHECK(aster_server_attach_health(b, 424242) == ASTER_STATUS_NOT_FOUND);
+    aster_server_t srv = 0;
+    CHECK(aster_server_start(rt, b, 32, &srv) == ASTER_STATUS_OK);
+    CHECK(aster_health_check_set(h, (aster_bytes_t){(const uint8_t *)"db", 2}, true) == ASTER_STATUS_OK);
+    CHECK(aster_health_check_set(h, (aster_bytes_t){0}, true) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_health_set_healthy(h, true) == ASTER_STATUS_OK);
+    CHECK(aster_health_set_ready(h, true) == ASTER_STATUS_OK);
+    aster_span_context_t sc;
+    CHECK(aster_dispatch_trace_context(rt, srv, 1, &sc) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_server_destroy(rt, srv) == ASTER_STATUS_OK);
+    CHECK(aster_health_stop(rt, h) == ASTER_STATUS_OK);
+    CHECK(aster_health_stop(rt, h) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_health_set_ready(h, true) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_node_free(rt, node) == ASTER_STATUS_OK);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
+}
+
 /* ABI 4.5: cancel tokens for aster_rpc_unary_cancellable (no runtime needed). */
 static void test_cancel_tokens(void) {
     printf("[cancel tokens]\n");
@@ -1209,6 +1441,8 @@ int main(void) {
     test_expose();
     test_relay_stream();
     test_coordination();
+    test_observability();
+    test_health();
     if (failures) {
         printf("abi_contract_test: %d failure(s)\n", failures);
         return 1;

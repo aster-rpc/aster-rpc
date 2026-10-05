@@ -29,7 +29,13 @@ use crate::grants::{
     aster_grant_context_t, aster_grant_outcome_kind_t, aster_grant_outcome_t, aster_grant_record_t,
     aster_grant_state_t,
 };
+use crate::health::aster_health_config_t;
 use crate::node::{aster_config_t, aster_portmapper_t, aster_trust_mode_t};
+use crate::observability::{
+    aster_binding_kind_t, aster_instrument_desc_t, aster_instrument_kind_t, aster_log_emit_t,
+    aster_log_level_t, aster_log_record_t, aster_observability_config_t, aster_otel_protocol_t,
+    aster_span_context_t, aster_span_kind_t, aster_span_record_t,
+};
 use crate::pure::{
     aster_attest_options_t, aster_attestation_role_t, aster_id_kind_t, aster_verified_chain_t,
 };
@@ -93,6 +99,21 @@ const _: () = assert!(size_of::<aster_route_protocol_t>() == 4);
 const _: () = assert!(size_of::<aster_coordination_error_t>() == 4);
 const _: () = assert!(size_of::<aster_coordination_mutation_op_t>() == 4);
 const _: () = assert!(size_of::<aster_coordination_read_op_t>() == 4);
+const _: () = assert!(size_of::<aster_binding_kind_t>() == 4);
+const _: () = assert!(size_of::<aster_otel_protocol_t>() == 4);
+const _: () = assert!(size_of::<aster_log_level_t>() == 4);
+const _: () = assert!(size_of::<aster_instrument_kind_t>() == 4);
+const _: () = assert!(size_of::<aster_span_kind_t>() == 4);
+
+// ABI 4.6: platform-independent observability structs.
+assert_layout!(aster_span_context_t, size = 32, align = 4, {
+    trace_id = 0,
+    span_id = 16,
+    trace_flags = 24,
+    is_remote = 25,
+    _p0 = 26,
+    _p1 = 28,
+});
 
 #[cfg(target_pointer_width = "64")]
 mod lp64 {
@@ -425,5 +446,82 @@ mod lp64 {
         group_id = 8,
         seed_tickets = 16,
         journal_dir = 32,
+    });
+
+    // ABI 4.6: observability and health (observability.rs, health.rs).
+    assert_layout!(aster_observability_config_t, size = 128, align = 8, {
+        struct_size = 0,
+        flags = 4,
+        service_name = 8,
+        otlp_endpoint = 24,
+        otlp_headers = 40,
+        resource_attrs = 56,
+        log_filter = 72,
+        extra_toml = 88,
+        trace_sample_ratio = 104,
+        protocol = 112,
+        log_queue_capacity = 116,
+        binding = 120,
+        _reserved = 124,
+    });
+
+    assert_layout!(aster_log_record_t, size = 96, align = 8, {
+        level = 0,
+        flags = 1,
+        _p0 = 2,
+        _p1 = 4,
+        timestamp_unix_ns = 8,
+        trace_id = 16,
+        span_id = 32,
+        call_id = 40,
+        target_ptr = 48,
+        target_len = 56,
+        message_ptr = 64,
+        message_len = 72,
+        fields_ptr = 80,
+        fields_len = 88,
+    });
+
+    assert_layout!(aster_log_emit_t, size = 72, align = 8, {
+        struct_size = 0,
+        level = 4,
+        timestamp_unix_ns = 8,
+        logger = 16,
+        message = 32,
+        fields = 48,
+        context = 64,
+    });
+
+    assert_layout!(aster_instrument_desc_t, size = 80, align = 8, {
+        struct_size = 0,
+        kind = 4,
+        name = 8,
+        description = 24,
+        unit = 40,
+        auto_attrs = 56,
+        cardinality_limit = 72,
+        _p = 76,
+    });
+
+    assert_layout!(aster_span_record_t, size = 152, align = 8, {
+        context = 0,
+        parent = 32,
+        start_unix_nanos = 64,
+        end_unix_nanos = 72,
+        kind = 80,
+        status_code = 84,
+        name = 88,
+        status_message = 104,
+        kv = 120,
+        kv_len = 128,
+        events = 136,
+        events_len = 144,
+    });
+
+    assert_layout!(aster_health_config_t, size = 24, align = 8, {
+        struct_size = 0,
+        port = 4,
+        _p = 6,
+        host = 8,
     });
 }
