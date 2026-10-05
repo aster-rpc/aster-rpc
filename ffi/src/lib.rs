@@ -634,17 +634,14 @@ impl EventInternal {
     }
 }
 
-/// EventOwned wraps EventInternal with its data payload for crossing thread boundary
-/// This is Send-safe because EventInternal has no raw pointers
-///
-/// `payload` is a second reference to the buffer the `BufferRegistry` holds
-/// under `event.buffer_id`. The registry's reference is what keeps
-/// `aster_event_t.data_ptr` valid until `aster_buffer_release`; this one is
-/// dropped when the event is polled (forgetting it leaked every payload).
+/// An event queued for `aster_poll_events`. Send-safe: `EventInternal` has
+/// no raw pointers. A payload lives only in the `BufferRegistry` under
+/// `event.buffer_id`, which keeps `aster_event_t.data_ptr` valid until
+/// `aster_buffer_release`. (The queue used to carry a second reference that
+/// polling `mem::forget`-ed, leaking every payload.)
 #[derive(Default)]
 struct EventOwned {
     event: EventInternal,
-    payload: Option<Arc<[u8]>>,
 }
 
 // ============================================================================
@@ -932,10 +929,7 @@ impl BridgeRuntime {
         .with_buffer(buf_id, message.len());
         let mut event = event;
         event.flags = flags;
-        self.emit(EventOwned {
-            event,
-            payload: None,
-        });
+        self.emit(EventOwned { event });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -952,19 +946,13 @@ impl BridgeRuntime {
         let event = EventInternal::new(
             kind, status, operation, handle, related, user_data, error_code,
         );
-        self.emit(EventOwned {
-            event,
-            payload: None,
-        });
+        self.emit(EventOwned { event });
     }
 
     fn emit_with_data(&self, event: EventInternal, data: Vec<u8>) {
         let (buf_id, arc) = self.buffers.insert(data);
         let event = event.with_buffer(buf_id, arc.len());
-        self.emit(EventOwned {
-            event,
-            payload: Some(arc),
-        });
+        self.emit(EventOwned { event });
     }
 
     fn new_operation(&self) -> (u64, Arc<std::sync::atomic::AtomicBool>) {
@@ -4317,10 +4305,7 @@ pub unsafe extern "C" fn aster_tags_delete(
                     0,
                 );
                 event.flags = count as u32;
-                bridge2.emit(EventOwned {
-                    event,
-                    payload: None,
-                });
+                bridge2.emit(EventOwned { event });
             }
             Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
         }

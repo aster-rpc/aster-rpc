@@ -444,10 +444,7 @@ where
                 ev.flags = d.flags;
                 match d.data {
                     Some(data) => b.emit_with_data(ev, data),
-                    None => b.emit(EventOwned {
-                        event: ev,
-                        payload: None,
-                    }),
+                    None => b.emit(EventOwned { event: ev }),
                 }
             }
             Err(e) => b.emit_error_flagged(op_id, user_data, e.status, e.code, e.flags, &e.message),
