@@ -630,6 +630,11 @@ impl EventInternal {
 
 /// EventOwned wraps EventInternal with its data payload for crossing thread boundary
 /// This is Send-safe because EventInternal has no raw pointers
+///
+/// `payload` is a second reference to the buffer the `BufferRegistry` holds
+/// under `event.buffer_id`. The registry's reference is what keeps
+/// `aster_event_t.data_ptr` valid until `aster_buffer_release`; this one is
+/// dropped when the event is polled (forgetting it leaked every payload).
 #[derive(Default)]
 struct EventOwned {
     event: EventInternal,
@@ -1250,7 +1255,6 @@ pub unsafe extern "C" fn aster_poll_events(
         unsafe {
             ptr::write(out_events.add(written), ev);
         }
-        std::mem::forget(event_owned.payload);
         written += 1;
     } else {
         return 0;
@@ -1263,7 +1267,6 @@ pub unsafe extern "C" fn aster_poll_events(
                 unsafe {
                     ptr::write(out_events.add(written), ev);
                 }
-                std::mem::forget(event_owned.payload);
                 written += 1;
             }
             Err(_) => break,
@@ -7731,5 +7734,59 @@ mod runtime_drop_tests {
         done_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("last runtime reference dropped on its own worker panicked");
+    }
+}
+
+#[cfg(test)]
+mod event_buffer_tests {
+    use super::*;
+
+    /// A polled event's payload is freed by `aster_buffer_release`: polling
+    /// must not keep (or leak) a reference of its own. Regression for the
+    /// `mem::forget(payload)` in `aster_poll_events` that LSan reported in
+    /// every test binary that read an event payload.
+    #[test]
+    fn released_event_payload_is_freed() {
+        let mut handle: aster_runtime_t = 0;
+        let status =
+            unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, std::ptr::null(), &mut handle) };
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
+        let bridge = load_runtime(handle).expect("runtime");
+
+        let event = EventInternal::new(
+            aster_event_kind_t::ASTER_EVENT_BYTES_RESULT,
+            aster_status_t::ASTER_STATUS_OK,
+            1,
+            0,
+            0,
+            7,
+            0,
+        );
+        bridge.emit_with_data(event, b"payload".to_vec());
+
+        let mut out = std::mem::MaybeUninit::<aster_event_t>::uninit();
+        let n = unsafe { aster_poll_events(handle, out.as_mut_ptr(), 1, 1000) };
+        assert_eq!(n, 1);
+        let ev = unsafe { out.assume_init() };
+        assert_eq!(ev.user_data, 7);
+        assert_ne!(ev.buffer, 0);
+        let data = unsafe { std::slice::from_raw_parts(ev.data_ptr, ev.data_len) };
+        assert_eq!(data, b"payload");
+
+        let weak = Arc::downgrade(&bridge.buffers.get(ev.buffer).expect("buffer"));
+        assert_eq!(
+            unsafe { aster_buffer_release(handle, ev.buffer) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "event payload still referenced after aster_buffer_release"
+        );
+
+        drop(bridge);
+        assert_eq!(
+            unsafe { aster_runtime_close(handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
     }
 }
