@@ -407,6 +407,38 @@ async fn tunnel_upstream_clean_close_finishes_quic_stream() -> Result<()> {
     Ok(())
 }
 
+/// The consumer finishes its send half before the upstream answers: the
+/// TCP-to-QUIC pump must keep relaying after the QUIC-to-TCP pump ended
+/// cleanly (it used to re-poll the completed abort receiver and panic, so
+/// only the first chunk got through).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_relays_a_response_written_after_the_request_finished() -> Result<()> {
+    let (client_conn, _server, _client, _accept, _reactor, server_conns) = setup_pair().await?;
+    let server_conn = wait_for_one_server_conn(&server_conns).await?;
+
+    let addr = spawn_scripted_upstream(|mut sock| async move {
+        let mut req = Vec::new();
+        sock.read_to_end(&mut req).await.unwrap();
+        assert_eq!(req, b"request");
+        sock.write_all(b"first ").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sock.write_all(b"second ").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sock.write_all(b"third").await.unwrap();
+        sock.shutdown().await.unwrap();
+    })
+    .await?;
+    let ticket =
+        server_conn.authorize_tunnel(vec![TunnelTarget::Tcp { addr }], Duration::from_secs(10))?;
+
+    let (send, recv) = timeout(STEP_TIMEOUT, client_conn.open_tunnel(ticket)).await??;
+    send.write_all(b"request".to_vec()).await?;
+    send.finish().await?;
+    let body = timeout(STEP_TIMEOUT, recv.read_to_end(64 * 1024)).await??;
+    assert_eq!(body, b"first second third");
+    Ok(())
+}
+
 /// Run a tunnel to an upstream that reports how its read side ended, after the
 /// consumer either resets or finishes its send half.
 async fn upstream_read_outcome(reset_instead_of_finish: bool) -> Result<std::io::Result<usize>> {

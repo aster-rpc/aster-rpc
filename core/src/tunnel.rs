@@ -359,14 +359,22 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut buf = vec![0u8; TUNNEL_PUMP_BUF];
+    // A completed oneshot must not be polled again (tokio panics), and a
+    // non-matching `select!` pattern only disables its branch for that one
+    // `select!`, so track the receiver's completion across iterations.
+    let mut abort_pending = true;
     loop {
         let read = tokio::select! {
             r = reader.read(&mut buf) => r,
-            // An `Err` (sender dropped unsent) is the normal QUIC-to-TCP end;
-            // only an explicit abort resets.
-            Ok(()) = &mut abort => {
-                let _ = send.reset(RESET_CODE_TUNNEL_UPSTREAM_ABORTED).await;
-                return Ok(());
+            res = &mut abort, if abort_pending => {
+                if res.is_ok() {
+                    let _ = send.reset(RESET_CODE_TUNNEL_UPSTREAM_ABORTED).await;
+                    return Ok(());
+                }
+                // Sender dropped unsent: the normal QUIC-to-TCP end. Keep
+                // relaying the upstream's response.
+                abort_pending = false;
+                continue;
             }
         };
         let n = match read {
