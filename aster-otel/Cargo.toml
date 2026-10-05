@@ -8,9 +8,68 @@ license = "MIT OR Apache-2.0"
 repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
 publish = ["aster"]
 
-# Phase O0 of docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md: an opt-in
-# stderr log sink. The OpenTelemetry SDK, exporters and the binding log bridge
-# arrive in O1 and later; this crate deliberately depends on aster for nothing.
+# docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md. O0: the opt-in stderr
+# sink. O1: configuration, the OTel SDK pipeline (traces, metrics, opt-in OTLP
+# logs), the one reloadable global subscriber, OTLP over http/protobuf.
+# This crate deliberately depends on `aster` for nothing (design D1).
+#
+# Every OTel crate is pinned exactly (design §2.2): the 0.x APIs change on every
+# minor release, and `aster-otel` is the only crate that touches the SDK.
+[features]
+default = ["otlp"]
+# OTLP over http/protobuf with the blocking reqwest client on rustls (ring
+# provider, platform verifier: the same TLS stack iroh already links, so no
+# aws-lc-rs enters the binding graphs).
+otlp = [
+    "dep:opentelemetry-otlp",
+    "opentelemetry-otlp/http-proto",
+    "opentelemetry-otlp/reqwest-blocking-client",
+    "opentelemetry-otlp/trace",
+    "opentelemetry-otlp/metrics",
+    "dep:opentelemetry-http",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:rustls-platform-verifier",
+    "dep:async-trait",
+    "dep:http",
+    "dep:bytes",
+]
+# OTLP over gRPC (tonic). Compiles the tonic exporter into the graph; selecting
+# protocol `grpc` is still refused at init (see `pipeline::otlp`), because the
+# tonic channel needs a Tokio runtime the SDK's export threads do not provide.
+otlp-grpc = ["otlp", "opentelemetry-otlp/grpc-tonic"]
+# The OTel logs layer (tracing events -> OTLP logs). Off by default (Q4).
+otlp-logs = ["dep:opentelemetry-appender-tracing", "opentelemetry-otlp?/logs"]
+# A Prometheus pull reader, rendered as text exposition.
+prometheus = ["dep:opentelemetry-prometheus", "dep:prometheus"]
+# In-memory exporters (re-exported in `aster_otel::testing`) for tests.
+testing = ["opentelemetry_sdk/testing"]
+
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "registry", "fmt", "env-filter", "ansi"] }
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["trace", "metrics", "logs"] }
+tracing-opentelemetry = { version = "=0.34.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+opentelemetry-otlp = { version = "=0.33.0", default-features = false, optional = true }
+opentelemetry-http = { version = "=0.33.0", default-features = false, optional = true }
+reqwest = { version = "=0.13.3", default-features = false, features = ["blocking", "rustls-no-provider"], optional = true }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "=0.7.0", optional = true }
+async-trait = { version = "0.1", optional = true }
+http = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+
+opentelemetry-appender-tracing = { version = "=0.33.0", default-features = false, optional = true }
+
+opentelemetry-prometheus = { version = "=0.33.0", default-features = false, optional = true }
+prometheus = { version = "=0.14.0", default-features = false, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
