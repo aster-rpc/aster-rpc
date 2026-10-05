@@ -38,7 +38,7 @@ old, new = sys.argv[2:4]
 
 cargo_files = [
     "core/Cargo.toml", "ffi/Cargo.toml", "aster/Cargo.toml",
-    "aster-expose/Cargo.toml", "aster-macros/Cargo.toml",
+    "aster-expose/Cargo.toml", "aster-macros/Cargo.toml", "aster-otel/Cargo.toml",
     "aster-transport-salvo/Cargo.toml", "bindings/python/rust/Cargo.toml",
     "bindings/typescript/native/Cargo.toml",
 ]
@@ -104,7 +104,7 @@ EOF
 
 git -C "$repo" add VERSION Cargo.toml Cargo.lock pyproject.toml uv.lock \
   core/Cargo.toml ffi/Cargo.toml aster/Cargo.toml aster-expose/Cargo.toml \
-  aster-macros/Cargo.toml aster-transport-salvo/Cargo.toml \
+  aster-macros/Cargo.toml aster-otel/Cargo.toml aster-transport-salvo/Cargo.toml \
   bindings/python/rust/Cargo.toml bindings/typescript/native/Cargo.toml \
   bindings/typescript/native/package.json \
   bindings/typescript/packages/aster/package.json bindings/typescript/bun.lock \

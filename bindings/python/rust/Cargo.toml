@@ -20,6 +20,7 @@ aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "metri
 # pool, tunnels and bare endpoints (reached from `aster` handles through
 # `aster::binding_support`).
 aster_transport_core = { path = "../../../core", version = "=0.3.0" }
+aster-otel = { path = "../../../aster-otel", version = "=0.3.0" }
 
 # Python FFI
 pyo3        = { workspace = true }

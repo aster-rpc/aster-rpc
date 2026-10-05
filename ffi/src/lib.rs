@@ -1184,6 +1184,9 @@ pub unsafe extern "C" fn aster_runtime_new(
     config: *const aster_runtime_config_t,
     out_runtime: *mut aster_runtime_t,
 ) -> i32 {
+    // Opt-in Rust log sink (`ASTER_LOG_STDERR=1`, filter `ASTER_LOG`);
+    // idempotent, so every runtime after the first is a no-op.
+    aster_otel::init_stderr_from_env();
     if expected_abi_major != ASTER_ABI_VERSION_MAJOR {
         set_last_error(format!(
             "ABI major mismatch: caller expects {expected_abi_major}, library provides {ASTER_ABI_VERSION_MAJOR}.{ASTER_ABI_VERSION_MINOR}.{ASTER_ABI_VERSION_PATCH}"

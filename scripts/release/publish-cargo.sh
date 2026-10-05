@@ -18,6 +18,7 @@ esac
 
 packages=(
   aster_transport_core
+  aster-otel
   aster-macros
   aster-expose
   aster

@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 aster_transport_core = { path = "../../../core", version = "=0.3.0" }
+aster-otel = { path = "../../../aster-otel", version = "=0.3.0" }
 # Plan D1: the binding wraps the `aster` crate (Node, AsterConfig, identity
 # files); core stays a direct dependency for the reactor ring, call pool and
 # tunnels, reached through `aster::binding_support`. Binding profile:

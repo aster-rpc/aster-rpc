@@ -311,11 +311,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-otel"
+version = "0.3.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aster-transport-napi"
 version = "0.3.0"
 dependencies = [
  "anyhow",
  "aster",
+ "aster-otel",
  "aster_transport_core",
  "async-trait",
  "hex",
@@ -361,6 +370,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "aster",
+ "aster-otel",
  "aster_transport_core",
  "async-trait",
  "blake3",
@@ -417,6 +427,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "aster",
+ "aster-otel",
  "aster_transport_core",
  "async-trait",
  "base64 0.22.1",

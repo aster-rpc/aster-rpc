@@ -81,6 +81,8 @@ pub(crate) fn ensure_tokio_runtime() {
 
 #[pymodule]
 fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Opt-in Rust log sink (`ASTER_LOG_STDERR=1`, filter `ASTER_LOG`).
+    aster_otel::init_stderr_from_env();
     let py = m.py();
 
     // This comes from core/build.rs and therefore describes the source commit,

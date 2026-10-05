@@ -1,0 +1,16 @@
+[package]
+name = "aster-otel"
+version = "0.3.0"
+edition = "2021"
+rust-version.workspace = true
+description = "Aster observability: the Rust-owned tracing / OpenTelemetry pipeline every binding shares."
+license = "MIT OR Apache-2.0"
+repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
+publish = ["aster"]
+
+# Phase O0 of docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md: an opt-in
+# stderr log sink. The OpenTelemetry SDK, exporters and the binding log bridge
+# arrive in O1 and later; this crate deliberately depends on aster for nothing.
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "registry", "fmt", "env-filter", "ansi"] }

@@ -14,6 +14,7 @@ path = "src/bin/soak_test_runner/main.rs"
 
 [dependencies]
 aster_transport_core = { path = "../core", version = "=0.3.0" }
+aster-otel = { path = "../aster-otel", version = "=0.3.0" }
 # Plan D1: the C ABI wraps the `aster` crate (node + config + Gate 0 since ABI
 # 3.2). Binding profile: default + rpc + metrics + binding-support, plus
 # `expose` since ABI 4.2 and `coordination-client` since ABI 4.4 (the binding
