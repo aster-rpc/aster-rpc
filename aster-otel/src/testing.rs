@@ -77,4 +77,117 @@ impl TestExporters {
             .map(|s| s.name.into_owned())
             .collect()
     }
+
+    /// The data points of metric `name` in the most recent export that has
+    /// it (cumulative temporality, the default, so that export holds the
+    /// totals). Empty when it was never exported. Flush first.
+    pub fn metric_points(&self, name: &str) -> Vec<MetricPoint> {
+        let exports = self.metrics.get_finished_metrics().unwrap_or_default();
+        for rm in exports.iter().rev() {
+            for sm in rm.scope_metrics() {
+                if let Some(m) = sm.metrics().find(|m| m.name() == name) {
+                    return points(m.data());
+                }
+            }
+        }
+        Vec::new()
+    }
+}
+
+/// One exported data point, flattened for assertions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetricPoint {
+    /// Attribute key/value pairs (values as strings), sorted by key.
+    pub attributes: Vec<(String, String)>,
+    /// The sum (counters, up-down counters, histograms) or the last value
+    /// (gauges).
+    pub value: f64,
+    /// Histograms: the number of recordings. Otherwise 0.
+    pub count: u64,
+}
+
+impl MetricPoint {
+    /// The value of attribute `key`.
+    pub fn attr(&self, key: &str) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+fn points(data: &opentelemetry_sdk::metrics::data::AggregatedMetrics) -> Vec<MetricPoint> {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+
+    fn attrs<'a>(kv: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = kv
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect();
+        v.sort();
+        v
+    }
+    fn of<T: AsF64>(d: &MetricData<T>) -> Vec<MetricPoint> {
+        match d {
+            MetricData::Sum(s) => s
+                .data_points()
+                .map(|p| MetricPoint {
+                    attributes: attrs(p.attributes()),
+                    value: p.value().as_f64(),
+                    count: 0,
+                })
+                .collect(),
+            MetricData::Gauge(g) => g
+                .data_points()
+                .map(|p| MetricPoint {
+                    attributes: attrs(p.attributes()),
+                    value: p.value().as_f64(),
+                    count: 0,
+                })
+                .collect(),
+            MetricData::Histogram(h) => h
+                .data_points()
+                .map(|p| MetricPoint {
+                    attributes: attrs(p.attributes()),
+                    value: p.sum().as_f64(),
+                    count: p.count(),
+                })
+                .collect(),
+            MetricData::ExponentialHistogram(h) => h
+                .data_points()
+                .map(|p| MetricPoint {
+                    attributes: attrs(p.attributes()),
+                    value: p.sum().as_f64(),
+                    count: p.count() as u64,
+                })
+                .collect(),
+        }
+    }
+    match data {
+        AggregatedMetrics::F64(d) => of(d),
+        AggregatedMetrics::U64(d) => of(d),
+        AggregatedMetrics::I64(d) => of(d),
+    }
+}
+
+/// Data point values as `f64` (test values are small, so the casts are exact).
+trait AsF64: Copy {
+    fn as_f64(self) -> f64;
+}
+
+impl AsF64 for f64 {
+    fn as_f64(self) -> f64 {
+        self
+    }
+}
+
+impl AsF64 for u64 {
+    fn as_f64(self) -> f64 {
+        self as f64
+    }
+}
+
+impl AsF64 for i64 {
+    fn as_f64(self) -> f64 {
+        self as f64
+    }
 }

@@ -38,17 +38,18 @@ pub mod testing;
 mod tracer;
 
 pub use config::{
-    redact_url, BatchSettings, Binding, ExporterKind, ObservabilityConfig, OtlpHeaders,
-    OtlpProtocol, OtlpSettings, OtlpTarget, Propagator, Resolved, ResolvedBatch, ResolvedConfig,
-    SamplerConfig, Secret, SpanLimitSettings, Temporality, DEFAULT_LOG_QUEUE,
-    DEFAULT_METRIC_INTERVAL, DEFAULT_OTLP_ENDPOINT, DEFAULT_OTLP_TIMEOUT,
+    redact_url, AttributeExtractor, BatchSettings, Binding, ExporterKind, ExtractorSource,
+    ObservabilityConfig, OtlpHeaders, OtlpProtocol, OtlpSettings, OtlpTarget, Propagator, Resolved,
+    ResolvedBatch, ResolvedConfig, SamplerConfig, Secret, SpanLimitSettings, Temporality,
+    DEFAULT_LOG_QUEUE, DEFAULT_METRIC_INTERVAL, DEFAULT_OTLP_ENDPOINT, DEFAULT_OTLP_TIMEOUT,
     EXPORTER_INTERNAL_TARGETS, OTEL_SDK_DISABLED,
 };
 pub use error::{Error, Result};
 #[cfg(feature = "prometheus")]
 pub use pipeline::render_prometheus;
 pub use pipeline::{
-    flush, generation, init, shutdown, ObservabilityHandle, SCOPE_NAME, SHUTDOWN_TIMEOUT,
+    flush, generation, init, shutdown, state, ObservabilityHandle, PipelineState, SCOPE_NAME,
+    SHUTDOWN_TIMEOUT,
 };
 pub use subscriber::{
     init_stderr_from_env, layers, StderrInit, SubscriberStatus, DEFAULT_FILTER, ENV_FILTER,
@@ -59,3 +60,7 @@ pub use tracer::SwapTracer;
 /// The OpenTelemetry API crate this pipeline is built on, so dependents use the
 /// same (exactly pinned) version.
 pub use opentelemetry;
+/// Parent, attributes, status and events of the OTel span behind a `tracing`
+/// span (the `rpc` spans `aster` creates), without a direct
+/// `tracing-opentelemetry` dependency.
+pub use tracing_opentelemetry::OpenTelemetrySpanExt;

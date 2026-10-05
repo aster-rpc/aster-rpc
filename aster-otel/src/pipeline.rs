@@ -22,8 +22,8 @@ use opentelemetry_sdk::resource::{Resource, TelemetryResourceDetector};
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider, SpanLimits};
 
 use crate::config::{
-    with_exporter_targets_off, ExporterKind, ObservabilityConfig, Propagator, ResolvedConfig,
-    SamplerConfig, Temporality,
+    with_exporter_targets_off, AttributeExtractor, ExporterKind, ObservabilityConfig, Propagator,
+    ResolvedConfig, SamplerConfig, Temporality,
 };
 use crate::error::{Error, Result};
 use crate::subscriber::{self, env_filter, SlotFilter, SubscriberStatus};
@@ -345,6 +345,40 @@ pub fn init(cfg: ObservabilityConfig) -> Result<ObservabilityHandle> {
         noop,
         subscriber: status,
         warnings,
+    })
+}
+
+/// What the running pipeline feeds, for instrumentation cached per
+/// [`generation`] (design §4.1a). Read once per generation, not per record.
+#[derive(Debug, Clone)]
+pub struct PipelineState {
+    /// The generation this describes.
+    pub generation: u64,
+    /// A tracer provider is installed: Aster's spans are exported and trace
+    /// context is propagated (design §5.1).
+    pub traces: bool,
+    /// A meter provider is installed: the built-in instruments record.
+    pub metrics: bool,
+    /// The resolved per-call attribute extractors (design §4.4).
+    pub attribute_extractors: Vec<AttributeExtractor>,
+    /// Extractor keys copied into outbound baggage.
+    pub propagate_as_baggage: Vec<String>,
+}
+
+/// The running pipeline's [`PipelineState`], or `None` when there is no
+/// pipeline (never initialised, shut down, or a child forked after init).
+pub fn state() -> Option<PipelineState> {
+    if fork::forked() {
+        return None;
+    }
+    let g = pipeline();
+    let a = g.as_ref()?;
+    Some(PipelineState {
+        generation: a.generation,
+        traces: a.providers.tracer.is_some(),
+        metrics: a.providers.meter.is_some(),
+        attribute_extractors: a.resolved.attribute_extractors.clone(),
+        propagate_as_baggage: a.resolved.propagate_as_baggage.clone(),
     })
 }
 

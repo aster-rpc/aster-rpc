@@ -126,6 +126,46 @@ pub enum Temporality {
     LowMemory,
 }
 
+/// Where an attribute extractor reads its value (design §4.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtractorSource {
+    /// `attr:<key>`: the caller's Gate 3 / admission attributes.
+    Attribute(String),
+    /// `meta:<key>`: request metadata.
+    Metadata(String),
+    /// `baggage:<key>`: a W3C baggage member of the incoming trace context.
+    Baggage(String),
+}
+
+impl ExtractorSource {
+    /// Parse `attr:<key>`, `meta:<key>` or `baggage:<key>`.
+    pub fn parse(source: &str) -> Result<Self> {
+        let (kind, key) = source.split_once(':').unwrap_or((source, ""));
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(Error::Config(format!(
+                "attribute extractor source {source:?}: expected attr:<key>, meta:<key> or baggage:<key>"
+            )));
+        }
+        match kind.trim() {
+            "attr" => Ok(Self::Attribute(key.to_owned())),
+            "meta" => Ok(Self::Metadata(key.to_owned())),
+            "baggage" => Ok(Self::Baggage(key.to_owned())),
+            other => Err(Error::Config(format!(
+                "attribute extractor source {source:?}: unknown kind {other:?} (attr, meta, baggage)"
+            ))),
+        }
+    }
+}
+
+/// One declarative extractor: the OTel attribute `key` and where its value
+/// comes from. Evaluated once per call, in Rust (design §4.4, D7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeExtractor {
+    pub key: String,
+    pub source: ExtractorSource,
+}
+
 /// A secret string: `Debug` and `Display` print `<redacted>`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
@@ -289,6 +329,14 @@ pub struct ObservabilityConfig {
     pub log_stderr: Option<bool>,
     /// Binding log queue bound (`ASTER_LOG_QUEUE`, used by O4).
     pub log_queue: Option<usize>,
+    /// Per-call attributes, `(otel_key, source)` with `source` one of
+    /// `attr:<key>`, `meta:<key>`, `baggage:<key>` (programmatic / TOML only,
+    /// design §4.4). `Some(vec![])` means none.
+    pub attribute_extractors: Option<Vec<(String, String)>>,
+    /// Extractor keys whose values are added to the outbound baggage of calls
+    /// made while handling the call (programmatic / TOML only). Never put
+    /// secrets here: baggage travels to every downstream service.
+    pub propagate_as_baggage: Option<Vec<String>>,
     /// The `[observability]` TOML layer, below env.
     pub file: Option<Box<ObservabilityConfig>>,
     /// In-memory exporters that replace OTLP (tests).
@@ -324,6 +372,8 @@ impl Default for ObservabilityConfig {
             span_filter: None,
             log_stderr: None,
             log_queue: None,
+            attribute_extractors: None,
+            propagate_as_baggage: None,
             file: None,
             #[cfg(feature = "testing")]
             test_exporters: None,
@@ -359,6 +409,8 @@ impl fmt::Debug for ObservabilityConfig {
             .field("span_filter", &self.span_filter)
             .field("log_stderr", &self.log_stderr)
             .field("log_queue", &self.log_queue)
+            .field("attribute_extractors", &self.attribute_extractors)
+            .field("propagate_as_baggage", &self.propagate_as_baggage)
             .field("file", &self.file);
         #[cfg(feature = "testing")]
         d.field("test_exporters", &self.test_exporters.is_some());
@@ -411,6 +463,8 @@ struct TomlTable {
     span_filter: Option<String>,
     log_stderr: Option<bool>,
     log_queue: Option<usize>,
+    attribute_extractors: Option<BTreeMap<String, String>>,
+    propagate_as_baggage: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -468,6 +522,8 @@ impl ObservabilityConfig {
             span_filter: t.span_filter,
             log_stderr: t.log_stderr,
             log_queue: t.log_queue,
+            attribute_extractors: t.attribute_extractors.map(|m| m.into_iter().collect()),
+            propagate_as_baggage: t.propagate_as_baggage,
             metric_export_interval: t.metric_export_interval_ms.map(Duration::from_millis),
             ..Default::default()
         };
@@ -698,6 +754,8 @@ pub struct ResolvedConfig {
     pub span_filter: String,
     pub log_stderr: bool,
     pub log_queue: usize,
+    pub attribute_extractors: Vec<AttributeExtractor>,
+    pub propagate_as_baggage: Vec<String>,
 }
 
 impl ResolvedConfig {
@@ -730,6 +788,8 @@ impl ResolvedConfig {
             span_filter,
             log_stderr,
             log_queue,
+            attribute_extractors,
+            propagate_as_baggage,
         );
         type Names = [&'static str; 4];
         const TRACES: Names = [
@@ -968,6 +1028,31 @@ fn resolve_layers(layers: &[&ObservabilityConfig], w: &mut Vec<String>) -> Resul
     let log_queue = first(layers, |l| l.log_queue)
         .unwrap_or(DEFAULT_LOG_QUEUE)
         .max(1);
+    let attribute_extractors = first(layers, |l| l.attribute_extractors.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, source)| {
+            let key = key.trim().to_owned();
+            if key.is_empty() {
+                return Err(Error::Config(format!(
+                    "attribute extractor for {source:?}: empty attribute key"
+                )));
+            }
+            Ok(AttributeExtractor {
+                key,
+                source: ExtractorSource::parse(&source)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let propagate_as_baggage =
+        first(layers, |l| l.propagate_as_baggage.clone()).unwrap_or_default();
+    for k in &propagate_as_baggage {
+        if !attribute_extractors.iter().any(|e| &e.key == k) {
+            return Err(Error::Config(format!(
+                "propagate_as_baggage names {k:?}, which no attribute extractor sets"
+            )));
+        }
+    }
 
     Ok(ResolvedConfig {
         disabled,
@@ -994,6 +1079,8 @@ fn resolve_layers(layers: &[&ObservabilityConfig], w: &mut Vec<String>) -> Resul
         span_filter,
         log_stderr,
         log_queue,
+        attribute_extractors,
+        propagate_as_baggage,
     })
 }
 
@@ -1590,6 +1677,42 @@ mod tests {
             c.resource_attributes,
             vec![("deployment.environment".to_owned(), "test".to_owned())]
         );
+    }
+
+    #[test]
+    fn attribute_extractors_parse_and_validate() {
+        let file = ObservabilityConfig::from_toml_str(
+            "[observability]\npropagate_as_baggage = [\"tenant\"]\n[observability.attribute_extractors]\ntenant = \"attr:tenant_id\"\n\"app.region\" = \"meta:x-region\"\n",
+        )
+        .unwrap();
+        let c = ObservabilityConfig::new()
+            .with_file_layer(file)
+            .resolve_with_env(&env(&[]))
+            .unwrap()
+            .config;
+        assert_eq!(
+            c.attribute_extractors,
+            vec![
+                AttributeExtractor {
+                    key: "app.region".into(),
+                    source: ExtractorSource::Metadata("x-region".into()),
+                },
+                AttributeExtractor {
+                    key: "tenant".into(),
+                    source: ExtractorSource::Attribute("tenant_id".into()),
+                },
+            ]
+        );
+        assert_eq!(c.propagate_as_baggage, ["tenant"]);
+
+        let mut p = ObservabilityConfig::new();
+        p.attribute_extractors = Some(vec![("t".into(), "cookie:x".into())]);
+        assert!(p.resolve_with_env(&env(&[])).is_err());
+        p.attribute_extractors = Some(vec![("t".into(), "baggage:".into())]);
+        assert!(p.resolve_with_env(&env(&[])).is_err());
+        p.attribute_extractors = Some(vec![("t".into(), "baggage:tenant".into())]);
+        p.propagate_as_baggage = Some(vec!["other".into()]);
+        assert!(p.resolve_with_env(&env(&[])).is_err());
     }
 
     #[test]
