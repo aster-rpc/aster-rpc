@@ -260,6 +260,7 @@ async fn resolve(inner: &AdmitInner, ids: Vec<String>) -> Result<(), UpcallError
                 .upcalls
                 .policy(UpcallKind::TopologyAdmitted)
                 .fallback();
+            super::observe(super::Observed::Fallback, UpcallKind::TopologyAdmitted);
             tracing::warn!(
                 target: UPCALL,
                 error = %e,

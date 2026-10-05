@@ -10,7 +10,9 @@
 //! |---|---|---|
 //! | [`SERVER`] | info | `AsterServer` started / shutting down |
 //! | [`SERVER`] | debug | RPC serve loop start/end; connection closed (with sessions reaped); a connection on an ALPN nobody handles |
-//! | [`DISPATCH`] | debug | one `rpc` span per native call (service, method, call id, peer) and an `rpc completed` event with the final status and duration for every call; `rpc refused` for calls stopped before a handler; deadline expiry |
+//! | [`DISPATCH`] | debug | one `rpc` span per call, native or foreign (service, method, call id, peer), and an `rpc completed` event with the final status and duration for every call; `rpc refused` for calls stopped before a handler; deadline expiry |
+//! | [`DISPATCH`] | info | with the `otel` feature and an OTel tracer provider, the `rpc` span is created at info instead (with `otel.kind = server` and the caller's trace context as parent), so the OTel span filter can export it without debug logs |
+//! | [`CLIENT`] | info | with the `otel` feature and an OTel tracer provider: one `rpc.client` span per outgoing call, whose trace context goes out in the call metadata |
 //! | [`DISPATCH`] | warn | a corrupt request frame -- one that does not inflate, or a client-stream / bidi request that does not decode (the call fails with `INVALID_ARGUMENT`) |
 //! | [`SESSION`] | debug | session opened, sessions reaped with their connection, HTTP session ended |
 //! | [`FOREIGN`] | debug / trace | foreign (binding) dispatch: call delivered (trace), cancelled / expired / abandoned (debug) |
@@ -25,6 +27,8 @@
 pub const SERVER: &str = "aster::rpc::server";
 /// Per-call dispatch: spans, completions, refusals, deadlines, corrupt frames.
 pub const DISPATCH: &str = "aster::rpc::dispatch";
+/// Outgoing calls (`RpcConnection`): the client span, with the `otel` feature.
+pub const CLIENT: &str = "aster::rpc::client";
 /// Session-scoped service instances.
 pub const SESSION: &str = "aster::rpc::session";
 /// Foreign (language-binding) dispatch.

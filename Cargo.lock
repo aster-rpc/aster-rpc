@@ -244,8 +244,10 @@ name = "aster"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "aster-expose",
  "aster-macros",
+ "aster-otel",
  "aster_transport_core",
  "async-trait",
  "base64 0.22.1",

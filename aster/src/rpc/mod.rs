@@ -32,7 +32,7 @@ pub mod empty;
 pub(crate) mod foreign;
 pub mod interceptor;
 pub mod lease;
-mod observe;
+pub(crate) mod observe;
 pub mod projection;
 pub mod proxy;
 pub mod runtime;
@@ -65,6 +65,8 @@ pub use contract::{
 pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationError};
 pub use empty::Empty;
 pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
+#[cfg(feature = "otel")]
+pub use observe::otel::ExtractContext;
 pub use projection::{Projection, ProjectionRegistry};
 pub use proxy::{DynContract, DynResponseStream, DynValue, DynamicClient};
 #[cfg(all(feature = "docs", feature = "blobs"))]

@@ -60,6 +60,14 @@ metrics = []
 # `[health]` config. hyper / hyper-util / http-body-util are already in the
 # graph through iroh's HTTP client; this only enables hyper's `server` half.
 health = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+# OpenTelemetry (design docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md
+# §4.1, §5, phase O2): the built-in RPC instruments, the `rpc` server and
+# client spans exported to OTel, and W3C trace context / baggage on the wire.
+# Everything goes through the OTel *API* that `aster-otel` re-exports; the SDK
+# and exporters stay in `aster-otel` (D1), and with no pipeline initialised
+# every record is a no-op. `scripts/check-otel-deps.sh` keeps the SDK out of
+# the graphs that do not enable this.
+otel = ["rpc", "dep:aster-otel", "dep:arc-swap"]
 # Language-binding support (PyO3, NAPI, C ABI). Adds no new crate (async-trait
 # is already in the graph through the transport core; the upcall adapters
 # implement its traits). It exposes
@@ -114,6 +122,12 @@ tower = { version = "0.5", optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
+# The `otel` feature: the observability pipeline (and, re-exported from it, the
+# exactly pinned `opentelemetry` API), plus `arc-swap` for the instruments
+# cached per provider generation (design §4.1a). arc-swap is already in the
+# graph through iroh; pinned to the version the lock resolves.
+aster-otel = { path = "../aster-otel", version = "=0.3.0", registry = "aster", optional = true }
+arc-swap = { version = "=1.9.1", optional = true }
 # RPC codec (Apache Fory Rust crate). Gated by the `rpc` feature. Pinned to the
 # same version as core's attestation feature. The `#[derive(ForyStruct)]` macro
 # emits `::fory_core::` paths, so both crates are direct deps.
@@ -267,3 +281,5 @@ fory-core = "=1.7.6"
 fory-derive = "=1.7.6"
 # Build streaming request/response bodies in the `expose` integration tests.
 http-body-util = "0.1"
+# The `otel` tests export to aster-otel's in-memory exporters.
+aster-otel = { path = "../aster-otel", version = "=0.3.0", registry = "aster", features = ["testing"] }

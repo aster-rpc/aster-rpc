@@ -522,6 +522,9 @@ impl Foreign {
         } else {
             Arc::new(PeerAttributes::from_map(attributes))
         };
+        // For the delivery event only: the entry's `CallObs` owns the span,
+        // which ends when the call does.
+        let span = obs.span().clone();
         let state = self.table.insert(|call_id, table| CallState {
             call_id,
             sender: response_sender,
@@ -544,17 +547,20 @@ impl Foreign {
         // is delivered, so a `Cancelled` can never overtake its `Call`.
         let armed = state.clone();
 
-        tracing::trace!(
-            target: FOREIGN,
-            call_id,
-            service = header.service.as_str(),
-            method = header.method.as_str(),
-            service_idx = svc.idx,
-            method_idx,
-            session_key,
-            peer = &*peer_id,
-            "foreign call delivered"
-        );
+        span.in_scope(|| {
+            tracing::trace!(
+                target: FOREIGN,
+                call_id,
+                service = header.service.as_str(),
+                method = header.method.as_str(),
+                service_idx = svc.idx,
+                method_idx,
+                session_key,
+                peer = &*peer_id,
+                "foreign call delivered"
+            )
+        });
+        drop(span);
         self.sink.deliver(DispatchEvent::Call(ForeignCall {
             call_id,
             service_idx: svc.idx,
@@ -984,8 +990,15 @@ impl CallState {
         if cancel.is_some() {
             self.cancelled.store(true, Ordering::Release);
         }
-        if let Some(reason) = cancel {
-            tracing::debug!(target: FOREIGN, call_id = self.call_id, ?reason, "foreign call cancelled");
+        if let (Some(reason), Some(obs)) = (cancel, &obs) {
+            obs.span().in_scope(|| {
+                tracing::debug!(target: FOREIGN, call_id = self.call_id, ?reason, "foreign call cancelled")
+            });
+            obs.event(match reason {
+                CancelReason::Peer => "cancelled",
+                CancelReason::Deadline => "deadline",
+                CancelReason::InvalidRequest => "invalid_request",
+            });
         }
         let code = match (trailer, cancel) {
             (Some(status), _) => status.status_code(),

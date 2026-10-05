@@ -278,7 +278,7 @@ pub struct HandshakeRequest {
     pub is_alive: bool,
     reply: oneshot::Sender<CoreAfterHandshakeDecision>,
     /// When the request arrived, for the admission duration.
-    #[cfg(feature = "health")]
+    #[cfg(any(feature = "health", feature = "otel"))]
     received: std::time::Instant,
     #[cfg(feature = "health")]
     health: Option<crate::health::HealthState>,
@@ -294,7 +294,7 @@ impl HandshakeRequest {
             alpn: info.alpn,
             is_alive: info.is_alive,
             reply,
-            #[cfg(feature = "health")]
+            #[cfg(any(feature = "health", feature = "otel"))]
             received: std::time::Instant::now(),
             #[cfg(feature = "health")]
             health: None,
@@ -314,6 +314,8 @@ impl HandshakeRequest {
             h.metrics()
                 .record_consumer_admit(self.received.elapsed().as_secs_f64() * 1000.0);
         }
+        #[cfg(feature = "otel")]
+        crate::rpc::observe::otel::admission("consumer", "admit", self.received.elapsed());
         let _ = self.reply.send(CoreAfterHandshakeDecision::Accept);
     }
 
@@ -332,6 +334,8 @@ impl HandshakeRequest {
         if let Some(h) = &self.health {
             h.metrics().record_consumer_deny();
         }
+        #[cfg(feature = "otel")]
+        crate::rpc::observe::otel::admission("consumer", "deny", self.received.elapsed());
         let _ = self.reply.send(CoreAfterHandshakeDecision::Reject {
             error_code: code,
             reason,

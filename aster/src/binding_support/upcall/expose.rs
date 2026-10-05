@@ -146,6 +146,7 @@ pub fn foreign_route_policy(upcalls: Upcalls) -> RoutePolicy {
                 Ok(idx) => idx.into_iter().map(|i| specs[i as usize].clone()).collect(),
                 Err(e) => {
                     let fallback = upcalls.policy(UpcallKind::ExposeRoutePolicy).fallback();
+                    super::observe(super::Observed::Fallback, UpcallKind::ExposeRoutePolicy);
                     tracing::warn!(
                         target: UPCALL,
                         kind = %UpcallKind::ExposeRoutePolicy,

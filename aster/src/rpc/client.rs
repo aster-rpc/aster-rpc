@@ -48,11 +48,13 @@ use aster_transport_core::{
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 use super::codec::{
     deadline_header_secs, decode_rpc_status, encode_stream_header, SerializationMode, StreamHeader,
 };
 use super::interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
+use super::observe::{client_status, error_status, ClientObs};
 use super::status::{status_to_error, StatusCode};
 use crate::error::{Error, Result};
 
@@ -263,11 +265,29 @@ impl RpcConnection {
         options: &CallOptions,
     ) -> Result<Vec<u8>> {
         let deadline = options.deadline.or(self.pipeline.deadline);
-        let h = options.apply(header, deadline);
+        let mut h = options.apply(header, deadline);
+        // One client span and one completion per logical call, retries
+        // included; it injects the call's trace context into `h`.
+        let mut obs = ClientObs::start(&mut h);
+        let r = self
+            .unary_attempts(&h, request, deadline)
+            .instrument(obs.span())
+            .await;
+        obs.finish(client_status(&r));
+        r
+    }
+
+    /// The pipeline (or the bare transport) for one unary call.
+    async fn unary_attempts(
+        &self,
+        h: &StreamHeader,
+        request: Vec<u8>,
+        deadline: Option<Duration>,
+    ) -> Result<Vec<u8>> {
         if self.pipeline.is_passthrough() {
             return match deadline {
-                None => self.transport_unary(&h, request).await,
-                Some(d) => match tokio::time::timeout(d, self.transport_unary(&h, request)).await {
+                None => self.transport_unary(h, request).await,
+                Some(d) => match tokio::time::timeout(d, self.transport_unary(h, request)).await {
                     Ok(r) => r,
                     Err(_) => Err(deadline_exceeded(d)),
                 },
@@ -286,7 +306,7 @@ impl RpcConnection {
                 .collect(),
         };
         self.pipeline
-            .run_unary(ctx, request, |req| self.transport_unary(&h, req))
+            .run_unary(ctx, request, |req| self.transport_unary(h, req))
             .await
     }
 
@@ -519,19 +539,28 @@ impl RpcConnection {
     ) -> Result<Arc<CallCtl>> {
         let deadline = options.deadline;
         let at = deadline.map(|d| Instant::now() + d);
-        let h = options.apply(header, deadline);
-        let mut header_frame = encode_frame(&encode_stream_header(&h)?, FLAG_HEADER)?;
-        if let Some(first) = first {
-            header_frame.extend_from_slice(&first);
+        let mut h = options.apply(header, deadline);
+        let mut obs = ClientObs::start(&mut h);
+        let opened = async {
+            let mut header_frame = encode_frame(&encode_stream_header(&h)?, FLAG_HEADER)?;
+            if let Some(first) = first {
+                header_frame.extend_from_slice(&first);
+            }
+            let open = self.inner.open_streaming_substream();
+            let (send, recv) = match (at, deadline) {
+                (Some(at), Some(d)) => match tokio::time::timeout_at(at, open).await {
+                    Ok(r) => r?,
+                    Err(_) => return Err(deadline_exceeded(d)),
+                },
+                _ => open.await?,
+            };
+            Ok((send, recv, header_frame))
         }
-        let open = self.inner.open_streaming_substream();
-        let (send, recv) = match (at, deadline) {
-            (Some(at), Some(d)) => match tokio::time::timeout_at(at, open).await {
-                Ok(r) => r?,
-                Err(_) => return Err(deadline_exceeded(d)),
-            },
-            _ => open.await?,
-        };
+        .await;
+        if opened.is_err() {
+            obs.finish(client_status(&opened));
+        }
+        let (send, recv, header_frame) = opened?;
         let ctl = Arc::new(CallCtl {
             send,
             recv,
@@ -540,8 +569,13 @@ impl RpcConnection {
             torn: AtomicBool::new(false),
             write_lock: tokio::sync::Mutex::new(()),
             cancelled: Notify::new(),
+            obs: std::sync::Mutex::new(obs),
         });
-        ctl.write_timed(header_frame).await?;
+        let written = ctl.write_timed(header_frame).await;
+        if written.is_err() {
+            ctl.observe(client_status(&written));
+        }
+        written?;
         Ok(ctl)
     }
 }
@@ -761,9 +795,19 @@ struct CallCtl {
     write_lock: tokio::sync::Mutex<()>,
     /// Woken by `cancel` so in-flight sends and reads give way at once.
     cancelled: Notify,
+    /// The call's client telemetry; the first final status wins.
+    obs: std::sync::Mutex<ClientObs>,
 }
 
 impl CallCtl {
+    /// Record the call's final status (telemetry; the first one wins).
+    fn observe(&self, code: StatusCode) {
+        self.obs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish(code);
+    }
+
     fn is_open(&self) -> bool {
         self.state.load(Ordering::Acquire) == OPEN
     }
@@ -800,6 +844,7 @@ impl CallCtl {
         };
         if let Err(Error::Rpc { code, .. }) = &out {
             if *code == StatusCode::DeadlineExceeded.as_i32() {
+                self.observe(StatusCode::DeadlineExceeded);
                 self.cancel().await;
             }
         }
@@ -835,6 +880,7 @@ impl CallCtl {
         {
             return;
         }
+        self.observe(StatusCode::Cancelled);
         self.cancelled.notify_waiters();
         // Taking the write lock waits for an in-flight write to give way (it
         // was just woken), so `torn` is settled.
@@ -854,6 +900,7 @@ impl CallCtl {
             }
             Err(_) => {
                 self.state.store(CANCELLED, Ordering::Release);
+                self.observe(StatusCode::Cancelled);
                 let _ = self.recv.stop(u64::from(RESET_CODE_CANCELLED));
             }
         }
@@ -1044,28 +1091,37 @@ impl ResponseStream {
                     // this is a failure, not a clean end (mirrors the Python
                     // transport, which errors on EOF-before-trailer).
                     self.done = true;
-                    self.ctl.cancel().await;
-                    Some(Err(Error::Connection(
+                    let err = Error::Connection(
                         "RPC stream closed before trailer (incomplete response)".into(),
-                    )))
+                    );
+                    self.ctl.observe(error_status(&err));
+                    self.ctl.cancel().await;
+                    Some(Err(err))
                 }
                 Ok(Some((payload, flags))) if flags & FLAG_TRAILER != 0 => {
                     self.done = true;
+                    let end = if payload.is_empty() {
+                        None // success with no explicit status
+                    } else {
+                        match decode_rpc_status(&payload) {
+                            Ok(status) if status.code == StatusCode::Ok.as_i32() => None,
+                            Ok(status) => Some(Err(status_to_error(status))),
+                            Err(e) => Some(Err(e.into())),
+                        }
+                    };
+                    self.ctl.observe(match &end {
+                        None => StatusCode::Ok,
+                        Some(r) => client_status(r),
+                    });
                     self.ctl.complete().await;
-                    if payload.is_empty() {
-                        return None; // success with no explicit status
-                    }
-                    match decode_rpc_status(&payload) {
-                        Ok(status) if status.code == StatusCode::Ok.as_i32() => None,
-                        Ok(status) => Some(Err(status_to_error(status))),
-                        Err(e) => Some(Err(e.into())),
-                    }
+                    end
                 }
                 // Row-schema metadata, not a response item.
                 Ok(Some((_, flags))) if flags & FLAG_ROW_SCHEMA != 0 => continue,
                 Ok(Some((payload, flags))) => Some(payload_of(payload, flags).map_err(Error::from)),
                 Err(e) => {
                     self.done = true;
+                    self.ctl.observe(error_status(&e));
                     self.ctl.cancel().await;
                     Some(Err(e))
                 }

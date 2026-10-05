@@ -404,6 +404,24 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
+/// An upcall event for the `aster.upcall.*` instruments (`otel` feature).
+#[derive(Clone, Copy)]
+pub(crate) enum Observed {
+    Issued,
+    Timeout,
+    Fallback,
+}
+
+/// Count `what` for `kind` on the built-in OTel instruments; a no-op
+/// without the `otel` feature or a pipeline.
+#[inline]
+pub(crate) fn observe(what: Observed, kind: UpcallKind) {
+    #[cfg(feature = "otel")]
+    crate::rpc::observe::otel::upcall(what, kind.name());
+    #[cfg(not(feature = "otel"))]
+    let _ = (what, kind);
+}
+
 fn unix_ms_after(timeout: Duration) -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -526,6 +544,7 @@ impl Upcalls {
 
     fn deliver(&self, id: u64, kind: UpcallKind, timeout: Duration, payload: Vec<u8>) -> bool {
         tracing::trace!(target: UPCALL, invocation_id = id, %kind, "upcall issued");
+        observe(Observed::Issued, kind);
         self.inner.sink.deliver(UpcallEvent {
             invocation_id: id,
             kind,
@@ -563,6 +582,7 @@ impl Upcalls {
             }
             Err(_) => {
                 guard.reason = CancelReason::Timeout;
+                observe(Observed::Timeout, kind);
                 drop(guard);
                 Err(UpcallError::Timeout)
             }
@@ -612,6 +632,7 @@ impl Upcalls {
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 guard.reason = CancelReason::Timeout;
+                observe(Observed::Timeout, kind);
                 drop(guard);
                 Err(UpcallError::Timeout)
             }
@@ -635,6 +656,7 @@ impl Upcalls {
         };
         let policy = self.policy(kind);
         let fallback = policy.fallback();
+        observe(Observed::Fallback, kind);
         tracing::warn!(
             target: UPCALL,
             %kind,

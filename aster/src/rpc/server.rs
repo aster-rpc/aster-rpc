@@ -14,7 +14,7 @@
 //! | client-stream  | many (`recv_request` to `None`)      | [`Call::respond`]            |
 //! | bidi           | many (concurrent with sends)         | N× `send` + `finish`         |
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -42,7 +42,7 @@ use super::codec::{
 use super::deadline::DeadlineQueue;
 use super::dynamic::DynamicService;
 use super::foreign::{DispatchEvent, DispatchSink, Foreign, ForeignService, ForeignSession};
-use super::observe::{CallInfo, CallObs, Telemetry};
+use super::observe::{CallInfo, CallObs, ConnObs, Telemetry};
 use super::sessions::{
     check_shared, missing_session, ServiceKey, SessionFactory, SessionInstance, SessionStore,
     DEFAULT_MAX_SESSIONS_PER_CONNECTION,
@@ -298,6 +298,24 @@ impl Server {
         self
     }
 
+    /// Add a Rust-native attribute extractor (design §4.4): for every call
+    /// that passes the gates, `f` may return a value for the OTel attribute
+    /// `key` on the call's `rpc` span (e.g. a tenant derived from several
+    /// attributes). Declarative extractors (`attr:` / `meta:` / `baggage:`)
+    /// are configured on the pipeline instead
+    /// (`ObservabilityConfig::attribute_extractors`). Runs only while an OTel
+    /// tracer provider is installed. Set before
+    /// [`dispatcher`](Server::dispatcher) or [`serve`](Server::serve).
+    #[cfg(feature = "otel")]
+    pub fn attribute_extractor(
+        mut self,
+        key: impl Into<String>,
+        f: impl Fn(&super::ExtractContext<'_>) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.telemetry.extractors.push(key.into(), Arc::new(f));
+        self
+    }
+
     /// Set an already-boxed authenticator (used by [`AsterServer`](crate::rpc::AsterServer)).
     pub(crate) fn authenticator_arc(mut self, auth: Arc<dyn Authenticator>) -> Self {
         self.authenticator = Some(auth);
@@ -449,18 +467,22 @@ impl Server {
         // RPC pipeline: dispatch each `aster/1` call.
         let rpc_join = tokio::spawn(async move {
             tracing::debug!(target: SERVER, "rpc serve loop started");
-            // Connections seen so far, for the health connection counters.
-            // The reactor reports closes only, so a connection counts as open
-            // from its first call. Only kept when a health state is attached;
-            // this loop is its only user, so it needs no lock.
-            let track_connections = dispatcher.telemetry.has_health();
-            let mut open_connections: HashSet<u64> = HashSet::new();
+            // Connections seen so far, for the connection counters (health,
+            // OTel). The reactor reports closes only, so a connection counts
+            // as open from its first call. Only kept when something counts
+            // them; this loop is its only user, so it needs no lock.
+            let track_connections = dispatcher.telemetry.tracks_connections();
+            let mut open_connections: HashMap<u64, ConnObs> = HashMap::new();
             while let Some(ev) = event_rx.recv().await {
                 match ev {
                     ReactorEvent::Call(call) => {
                         let obs = dispatcher.telemetry.start_call();
-                        if track_connections && open_connections.insert(call.connection_id) {
-                            dispatcher.telemetry.connection_opened();
+                        if track_connections && !open_connections.contains_key(&call.connection_id)
+                        {
+                            open_connections.insert(
+                                call.connection_id,
+                                dispatcher.telemetry.connection_opened(),
+                            );
                         }
                         // Route inline: decoding, lookup, session resolution
                         // and Gate 3 are synchronous, so a refused call costs
@@ -496,8 +518,8 @@ impl Server {
                         ..
                     } => {
                         let reaped = dispatcher.close_connection(connection_id);
-                        if track_connections && open_connections.remove(&connection_id) {
-                            dispatcher.telemetry.connection_closed();
+                        if let Some(conn) = open_connections.remove(&connection_id) {
+                            dispatcher.telemetry.connection_closed(conn);
                         }
                         tracing::debug!(
                             target: SERVER,
@@ -829,22 +851,28 @@ impl Dispatcher {
 
     /// [`complete`](Dispatcher::complete) for a call whose telemetry the
     /// caller already started.
-    async fn complete_observed(&self, route: Route, mut parts: CallParts, obs: CallObs) {
+    async fn complete_observed(&self, route: Route, mut parts: CallParts, mut obs: CallObs) {
         let routed = match route {
             Route::Reject(status) => {
                 finish_refused(obs, &parts, &status);
                 emit_rpc_status(&parts.response_sender, &status).await;
                 return;
             }
-            Route::Dispatch(routed) => routed,
-            Route::Authenticate(routed) => match self.authenticate(routed, &mut parts).await {
-                Ok(routed) => routed,
-                Err(status) => {
-                    finish_refused(obs, &parts, &status);
-                    emit_rpc_status(&parts.response_sender, &status).await;
-                    return;
+            Route::Dispatch(mut routed) => {
+                open_routed(&mut obs, &mut routed, &parts.peer_id);
+                routed
+            }
+            Route::Authenticate(mut routed) => {
+                open_routed(&mut obs, &mut routed, &parts.peer_id);
+                match self.authenticate(routed, &mut parts).await {
+                    Ok(routed) => routed,
+                    Err(status) => {
+                        finish_refused(obs, &parts, &status);
+                        emit_rpc_status(&parts.response_sender, &status).await;
+                        return;
+                    }
                 }
-            },
+            }
         };
         if routed.is_foreign() {
             self.deliver_foreign(routed, parts, obs);
@@ -857,6 +885,7 @@ impl Dispatcher {
             deadline,
             ..
         } = routed;
+        obs.dispatching(&header, &parts.peer_id, &attributes);
         let svc = match target {
             Target::Ready(svc) => svc,
             Target::Foreign { .. } => unreachable!("foreign target delivered above"),
@@ -884,16 +913,10 @@ impl Dispatcher {
             }
         }
 
-        // One `rpc` span per native call, so a handler's own events carry the
-        // call's identity. Disabled (the common case): no span, no wrapper.
-        let span = tracing::debug_span!(
-            target: DISPATCH,
-            "rpc",
-            service = header.service.as_str(),
-            method = header.method.as_str(),
-            call_id = header.call_id,
-            peer = parts.peer_id.as_str(),
-        );
+        // The call's `rpc` span (opened in routing) wraps the handler, so its
+        // own events, and the client spans of calls it makes, carry the call's
+        // identity. Disabled (the common case): no span.
+        let span = obs.span().clone();
         let method = header.method.clone();
         // A peer cancel (or the stream failing under the call) drops the
         // handler, as a deadline does, whatever the pattern: a unary handler
@@ -984,7 +1007,10 @@ impl Dispatcher {
 
     /// Hand a routed foreign call to the binding (synchronous; see
     /// `Foreign::deliver`).
-    fn deliver_foreign(&self, routed: Routed, parts: CallParts, obs: CallObs) {
+    fn deliver_foreign(&self, mut routed: Routed, parts: CallParts, mut obs: CallObs) {
+        // From the serve loop's fast path the call is not open yet.
+        open_routed(&mut obs, &mut routed, &parts.peer_id);
+        obs.dispatching(&routed.header, &parts.peer_id, &routed.attributes);
         let Routed {
             header,
             method_idx,
@@ -1328,28 +1354,54 @@ fn gate3(
     Ok(())
 }
 
+/// Open a routed call's telemetry (no-op if already open): its `rpc` span and
+/// started count, with the method's pattern when routing knows it.
+fn open_routed(obs: &mut CallObs, routed: &mut Routed, peer: &str) {
+    #[cfg(feature = "otel")]
+    let pattern = routed
+        .foreign
+        .as_ref()
+        .and_then(|svc| svc.def.method(routed.method_idx))
+        .map(|m| super::observe::otel::pattern_name(m.pattern));
+    #[cfg(not(feature = "otel"))]
+    let pattern = None;
+    obs.open(&mut routed.header, peer, pattern);
+}
+
 /// Finish the telemetry of a call refused before any handler ran. The header
-/// is decoded again only when the refusal is actually logged.
+/// is decoded again only when the refusal is actually logged or recorded.
 pub(crate) fn finish_refused(mut obs: CallObs, parts: &CallParts, status: &RpcStatus) {
     let code = status.status_code();
-    if !tracing::enabled!(target: DISPATCH, Level::DEBUG) {
+    if !tracing::enabled!(target: DISPATCH, Level::DEBUG) && !obs.wants_header() {
         obs.finish(code, CallInfo::default());
         return;
     }
-    let header = decode_stream_header(&parts.header_payload).ok();
+    let mut header = decode_stream_header(&parts.header_payload).ok();
+    match header.as_mut() {
+        // Routing found the service and method (the refusal came later: Gate
+        // 3, a session rule, the authenticator): label them. An unknown
+        // service or method is the caller's choice and must not mint series.
+        Some(h) if !matches!(code, StatusCode::NotFound | StatusCode::Unimplemented) => {
+            obs.open(h, &parts.peer_id, None)
+        }
+        Some(h) => obs.open_unrouted(h, &parts.peer_id),
+        None => obs.open_unrouted(&mut StreamHeader::default(), &parts.peer_id),
+    }
     let (service, method, call_id) = header.as_ref().map_or(("", "", 0), |h| {
         (h.service.as_str(), h.method.as_str(), h.call_id)
     });
-    tracing::debug!(
-        target: DISPATCH,
-        service,
-        method,
-        call_id,
-        peer = parts.peer_id.as_str(),
-        status = ?code,
-        message = status.message.as_str(),
-        "rpc refused"
-    );
+    obs.span().in_scope(|| {
+        tracing::debug!(
+            target: DISPATCH,
+            service,
+            method,
+            call_id,
+            peer = parts.peer_id.as_str(),
+            status = ?code,
+            message = status.message.as_str(),
+            "rpc refused"
+        )
+    });
     obs.finish(
         code,
         CallInfo {
