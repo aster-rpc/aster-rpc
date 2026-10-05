@@ -20,6 +20,10 @@
 
 #![cfg(feature = "coordination-testing")]
 
+// Storage scratch dirs the production open policy accepts at any umask.
+#[path = "common/scratch.rs"]
+mod scratch;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -212,7 +216,7 @@ async fn start_group(secrets: &[[u8; 32]], profile: i32, acknowledge: bool) -> V
 
     let mut voters = Vec::new();
     for secret in secrets {
-        let dir = tempfile::tempdir().expect("a storage directory");
+        let dir = scratch::storage_dir();
         let mut builder = CoordinationConfig::builder()
             .storage_dir(dir.path())
             .authority_domain(DOMAIN)
@@ -512,9 +516,7 @@ async fn a_three_voter_group_reforms_after_a_full_restart() {
     let admission = admission_source(&secrets);
 
     // Directories outlive the servers, which is the whole point.
-    let dirs: Vec<tempfile::TempDir> = (0..3)
-        .map(|_| tempfile::tempdir().expect("a storage directory"))
-        .collect();
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| scratch::storage_dir()).collect();
 
     let genesis_hash = {
         use aster::coordination::raft::SignedCoordinationDocumentV1;
