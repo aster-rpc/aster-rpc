@@ -57,8 +57,17 @@ impl InstrumentKind {
     }
 }
 
+/// Histogram bucket upper bounds, in seconds, for durations (the OTel
+/// semantic-convention RPC buckets). The built-in RPC duration histograms use
+/// them, and so does a binding-declared histogram with unit `s` and no
+/// explicit [`boundaries`](InstrumentDesc::boundaries); the SDK default is
+/// millisecond-scaled.
+pub const SECONDS_BUCKETS: [f64; 14] = [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+];
+
 /// An instrument to declare.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InstrumentDesc {
     pub kind: InstrumentKind,
     /// OTel instrument name: an ASCII letter, then letters, digits, `_`, `.`,
@@ -76,6 +85,10 @@ pub struct InstrumentDesc {
     /// time (`spec_unstable_metrics_views`), so every instrument gets the
     /// SDK default for now.
     pub cardinality_limit: u32,
+    /// Histogram bucket upper bounds: finite, strictly increasing. Empty =
+    /// [`SECONDS_BUCKETS`] when the unit is `s`, else the SDK default.
+    /// [`Error::InvalidArgument`] on any other kind.
+    pub boundaries: Vec<f64>,
 }
 
 /// A value to record. Each instrument kind takes exactly one variant.
@@ -134,7 +147,15 @@ impl Instrument {
         match d.kind {
             InstrumentKind::CounterU64 => Built::Counter(common!(meter.u64_counter(name))),
             InstrumentKind::UpDownI64 => Built::UpDown(common!(meter.i64_up_down_counter(name))),
-            InstrumentKind::HistogramF64 => Built::Histogram(common!(meter.f64_histogram(name))),
+            InstrumentKind::HistogramF64 => {
+                let mut b = meter.f64_histogram(name);
+                if !d.boundaries.is_empty() {
+                    b = b.with_boundaries(d.boundaries.clone());
+                } else if d.unit == "s" {
+                    b = b.with_boundaries(SECONDS_BUCKETS.to_vec());
+                }
+                Built::Histogram(common!(b))
+            }
             InstrumentKind::GaugeF64 => Built::Gauge(common!(meter.f64_gauge(name))),
         }
     }
@@ -164,6 +185,9 @@ fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     f(g.get_or_insert_with(Table::default))
 }
 
+/// Bound on explicit histogram boundaries (each is a stored bucket per series).
+const MAX_BOUNDARIES: usize = 256;
+
 fn valid_name(name: &str) -> bool {
     let b = name.as_bytes();
     !b.is_empty()
@@ -176,8 +200,9 @@ fn valid_name(name: &str) -> bool {
 
 /// Declare an instrument; returns its handle (never 0, never reused).
 /// [`Error::InvalidArgument`] for a name that breaks the OTel rules, a unit
-/// that is not ASCII or longer than 63 characters, or a name already declared
-/// with a different kind.
+/// that is not ASCII or longer than 63 characters, boundaries that are not
+/// finite and strictly increasing (or on a non-histogram), or a name already
+/// declared with a different kind.
 pub fn instrument_new(desc: InstrumentDesc) -> Result<u64> {
     if !valid_name(&desc.name) {
         return Err(Error::InvalidArgument(format!(
@@ -190,6 +215,21 @@ pub fn instrument_new(desc: InstrumentDesc) -> Result<u64> {
         return Err(Error::InvalidArgument(
             "instrument unit must be ASCII and at most 63 characters".into(),
         ));
+    }
+    if !desc.boundaries.is_empty() {
+        if desc.kind != InstrumentKind::HistogramF64 {
+            return Err(Error::InvalidArgument(
+                "bucket boundaries apply to histograms only".into(),
+            ));
+        }
+        if desc.boundaries.len() > MAX_BOUNDARIES
+            || desc.boundaries.iter().any(|b| !b.is_finite())
+            || desc.boundaries.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(Error::InvalidArgument(format!(
+                "histogram boundaries must be finite and strictly increasing (at most {MAX_BOUNDARIES})"
+            )));
+        }
     }
     let _serial = DECLARE.lock().unwrap_or_else(|e| e.into_inner());
     with_table(|t| {

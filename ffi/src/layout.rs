@@ -492,7 +492,7 @@ mod lp64 {
         context = 64,
     });
 
-    assert_layout!(aster_instrument_desc_t, size = 80, align = 8, {
+    assert_layout!(aster_instrument_desc_t, size = 96, align = 8, {
         struct_size = 0,
         kind = 4,
         name = 8,
@@ -501,6 +501,9 @@ mod lp64 {
         auto_attrs = 56,
         cardinality_limit = 72,
         _p = 76,
+        boundaries = 80,
+        boundaries_len = 88,
+        _p1 = 92,
     });
 
     assert_layout!(aster_span_record_t, size = 152, align = 8, {

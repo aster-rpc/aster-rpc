@@ -19,7 +19,10 @@
 //! listener's readiness to the server (ready once serving, not ready first on
 //! destroy), and a call whose server span is exported carries
 //! `ASTER_DISPATCH_FLAG_HAS_TRACE`: `aster_dispatch_trace_context` returns
-//! the span's context for the binding's handler spans and logs.
+//! the span's context for the binding's handler spans and logs. A call that
+//! carried W3C `baggage` or `tracestate` (hidden from its metadata) has
+//! `ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE`, exported span or not:
+//! `aster_dispatch_inbound_trace` returns them as a k/v list.
 //!
 //! Rust does all framing, compression and status encoding: the binding sees
 //! request payloads (already decompressed) and passes response payloads plus
@@ -139,6 +142,9 @@ pub const ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES: u32 = 0x200;
 /// ABI 4.6: the call's server span is exported; its context is available
 /// from `aster_dispatch_trace_context`.
 pub const ASTER_DISPATCH_FLAG_HAS_TRACE: u32 = 0x400;
+/// ABI 4.6: the call carried W3C `baggage` and/or `tracestate`, which are
+/// hidden from its metadata; read them with `aster_dispatch_inbound_trace`.
+pub const ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE: u32 = 0x800;
 
 /// `timeout_ms` value for "wait without a limit" (`aster_dispatch_recv`,
 /// `aster_call_recv_payload`).
@@ -900,12 +906,16 @@ fn lower_call(
         connection,
         handle,
         trace_context,
+        inbound_trace,
         ..
     } = call;
     // Answered by id from now on.
     handle.detach();
     if trace_context.is_some() {
         flags |= ASTER_DISPATCH_FLAG_HAS_TRACE;
+    }
+    if inbound_trace.is_some() {
+        flags |= ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE;
     }
     if !header.metadata_keys.is_empty() {
         flags |= ASTER_DISPATCH_FLAG_HAS_METADATA;
@@ -1321,6 +1331,40 @@ pub unsafe extern "C" fn aster_dispatch_trace_context(
     // SAFETY: checked non-null.
     unsafe { ptr::write(out, cx) };
     status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// The inbound W3C `baggage` and `tracestate` of a live call as a k/v list
+/// (keys `baggage` and `tracestate`, the raw header values; a key is present
+/// only when the caller sent it), for the binding's `current_baggage`. Set
+/// with `ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE` on its `CALL` event, whether
+/// or not the call's span is exported. `baggage` is within the W3C limits
+/// (8192 bytes, 64 members); a larger header was dropped. Same lease
+/// contract as `aster_dispatch_metadata`. `NOT_FOUND` once the call is over.
+#[no_mangle]
+pub unsafe extern "C" fn aster_dispatch_inbound_trace(
+    runtime: aster_runtime_t,
+    server_h: aster_server_t,
+    call_id: u64,
+    out_ptr: *mut *const u8,
+    out_len: *mut u32,
+    out_buffer: *mut aster_buffer_t,
+) -> i32 {
+    let _ = runtime;
+    // SAFETY: forwarded caller pointers.
+    unsafe {
+        kv_out(server_h, call_id, out_ptr, out_len, out_buffer, |call| {
+            let mut pairs: Vec<(&str, &str)> = Vec::new();
+            if let Some(t) = call.inbound_trace() {
+                if let Some(b) = &t.baggage {
+                    pairs.push(("baggage", b));
+                }
+                if let Some(ts) = &t.tracestate {
+                    pairs.push(("tracestate", ts));
+                }
+            }
+            encode_kv(pairs.into_iter())
+        })
+    }
 }
 
 /// End the call with `INTERNAL "handler dropped call"` unless it already

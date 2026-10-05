@@ -767,7 +767,7 @@ pub enum aster_instrument_kind_t {
     ASTER_INSTRUMENT_GAUGE_F64 = 4,
 }
 
-/// An instrument to declare. 80 bytes (LP64).
+/// An instrument to declare. 96 bytes (LP64).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct aster_instrument_desc_t {
@@ -788,6 +788,13 @@ pub struct aster_instrument_desc_t {
     /// Series limit; 0 = default (2000). Kept; 4.6 applies the default.
     pub cardinality_limit: u32,
     pub _p: u32,
+    /// Histogram bucket upper bounds (`boundaries_len` doubles): finite and
+    /// strictly increasing. `NULL` / 0 = none given: unit `s` gets the RPC
+    /// seconds buckets (0.005 .. 10), any other unit the SDK default.
+    /// `INVALID_ARGUMENT` on a non-histogram or on bad values.
+    pub boundaries: *const f64,
+    pub boundaries_len: u32,
+    pub _p1: u32,
 }
 
 fn decode_key_list(mut b: &[u8]) -> Result<Vec<String>, String> {
@@ -869,6 +876,11 @@ pub unsafe extern "C" fn aster_instrument_new(
             Ok(v) => v,
             Err(e) => return invalid(format!("auto_attrs: {e}")),
         };
+        let boundaries = if d.boundaries.is_null() || d.boundaries_len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(d.boundaries, d.boundaries_len as usize).to_vec()
+        };
         InstrumentDesc {
             kind,
             name,
@@ -876,6 +888,7 @@ pub unsafe extern "C" fn aster_instrument_new(
             unit,
             auto_attrs,
             cardinality_limit: d.cardinality_limit,
+            boundaries,
         }
     };
     match instruments::instrument_new(desc) {
