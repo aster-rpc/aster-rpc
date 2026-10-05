@@ -148,7 +148,6 @@ final class NodeConfigTest {
       id = node.nodeId();
       String onDisk = Files.readString(keyFile).trim();
       assertEquals(HexFormat.of().formatHex(node.exportSecretKey()), onDisk);
-      assertTrue(node.metricsPrometheus().contains("iroh_send_ipv4"));
       for (String a : node.nodeAddr().directAddresses()) {
         assertTrue(a.startsWith("127.0.0.1:"), a);
       }

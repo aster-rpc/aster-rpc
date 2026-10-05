@@ -122,7 +122,6 @@ public class NodeTests
         Assert.Equal(node.NodeId(), ticket.EndpointId);
         Assert.NotEmpty(ticket.DirectAddrs);
         Assert.All(ticket.DirectAddrs, a => Assert.StartsWith("127.0.0.1:", a));
-        Assert.Contains("aster_", node.MetricsPrometheus() + "aster_");
     }
 
     [Fact]

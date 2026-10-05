@@ -132,17 +132,6 @@ func (n *Node) SetGate(g *Gate) error {
 	return wrapStatus("aster_node_set_gate", C.aster_node_set_gate(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), h))
 }
 
-// MetricsPrometheus returns the node's transport metrics in Prometheus text
-// exposition format.
-func (n *Node) MetricsPrometheus() (string, error) {
-	var out C.struct_aster_bytes_t
-	if err := wrapStatus("aster_node_metrics_prometheus",
-		C.aster_node_metrics_prometheus(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), &out)); err != nil {
-		return "", err
-	}
-	return string(takeRustBytes(out)), nil
-}
-
 // Ticket returns an aster1 ticket for this node: its direct ip:port addresses
 // (waiting up to wait for them to appear) and its relay if that is an ip:port.
 func (n *Node) Ticket(ctx context.Context, wait time.Duration) (string, error) {

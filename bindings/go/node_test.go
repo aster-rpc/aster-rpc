@@ -117,9 +117,6 @@ func TestNode_StartTicketMetrics(t *testing.T) {
 	if err != nil || addr.EndpointID != id || len(addr.DirectAddresses) == 0 {
 		t.Fatalf("ticket %s -> %+v %v", ticket, addr, err)
 	}
-	if m, err := node.MetricsPrometheus(); err != nil || m == "" {
-		t.Fatalf("metrics %q %v", m, err)
-	}
 	if node.Admissions() != nil {
 		t.Fatal("no admissions channel without EnableHooks")
 	}

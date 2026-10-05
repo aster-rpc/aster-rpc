@@ -2847,23 +2847,6 @@ public final class IrohLibrary implements SymbolLookup {
         gate);
   }
 
-  /**
-   * {@code aster_node_metrics_prometheus(runtime, node, aster_bytes_t *out)}; free {@code out} with
-   * {@link #stringRelease}.
-   */
-  public int nodeMetricsPrometheus(long runtimeHandle, long nodeHandle, MemorySegment outBytes) {
-    return call(
-        "aster_node_metrics_prometheus",
-        FunctionDescriptor.of(
-            ValueLayout.JAVA_INT,
-            ValueLayout.JAVA_LONG,
-            ValueLayout.JAVA_LONG,
-            ValueLayout.ADDRESS),
-        runtimeHandle,
-        nodeHandle,
-        outBytes);
-  }
-
   /** {@code aster_gate_new(runtime, aster_gate_t *out_gate)}. */
   public int gateNew(long runtimeHandle, MemorySegment outGate) {
     return call(

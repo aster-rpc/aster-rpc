@@ -54,8 +54,6 @@ internal static unsafe partial class Native
     public static partial int aster_node_start(ulong runtime, ConfigNative* config, ulong gate, ulong user_data, out ulong out_operation);
     [LibraryImport(NativeLib, EntryPoint = "aster_node_set_gate")]
     public static partial int aster_node_set_gate(ulong runtime, ulong node, ulong gate);
-    [LibraryImport(NativeLib, EntryPoint = "aster_node_metrics_prometheus")]
-    public static partial int aster_node_metrics_prometheus(ulong runtime, ulong node, Bytes* @out);
     [LibraryImport(NativeLib, EntryPoint = "aster_node_close")]
     public static partial int aster_node_close(ulong runtime, ulong node, ulong user_data, out ulong out_operation);
 

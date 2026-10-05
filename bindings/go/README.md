@@ -48,7 +48,8 @@ whose ABI major differs (4).
   `ConfigFromTOML(path)` resolve through Rust `aster::AsterConfig` plus the
   binding-level `[trust]` / `[connect]` / `[logging]` keys. `StartNode(ctx, cfg,
   NodeOptions{Gate, ExtraALPNs})` uses `aster_node_start`; `Node.Ticket`,
-  `Connect`, `Accept`, `AddNodeAddr`, `SetGate`, `MetricsPrometheus`, `Docs()`.
+  `Connect`, `Accept`, `AddNodeAddr`, `SetGate`, `Docs()`. (ABI 4.6 removed
+  `aster_node_metrics_prometheus`; metrics come back with observability in O10.)
   `Memory*` / `Persistent*` are convenience wrappers over `aster_node_start`
   (ABI 4.0 removed `aster_node_memory*` / `aster_node_persistent`). ABI 4.0
   also removed bare endpoints: `NewEndpoint` starts a node from the

@@ -185,14 +185,6 @@ public sealed class Node : IDisposable, IAsyncDisposable
         Native.Check(Native.aster_node_set_gate(_runtime.Handle, _handle.Value, gate?.Handle ?? 0), "aster_node_set_gate");
     }
 
-    /// <summary>Prometheus text exposition of the node's metrics.</summary>
-    public unsafe string MetricsPrometheus()
-    {
-        Bytes output = default;
-        Native.Check(Native.aster_node_metrics_prometheus(_runtime.Handle, _handle.Value, &output), "aster_node_metrics_prometheus");
-        return Encoding.UTF8.GetString(NativeScope.TakeOwned(ref output));
-    }
-
     /// <summary>
     /// Admission events for a node started with <see cref="AsterConfig.EnableHooks"/> and no
     /// gate. Every request must be answered (<see cref="AdmissionRequest.Allow"/> /

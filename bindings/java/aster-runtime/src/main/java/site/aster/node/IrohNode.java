@@ -212,26 +212,6 @@ public class IrohNode implements AutoCloseable {
     }
   }
 
-  /** Transport metrics in Prometheus text format ({@code aster_node_metrics_prometheus}). */
-  public String metricsPrometheus() {
-    IrohLibrary lib = IrohLibrary.getInstance();
-    try (Arena arena = Arena.ofConfined()) {
-      MemorySegment out = arena.allocate(IrohLibrary.ASTER_BYTES);
-      int status = lib.nodeMetricsPrometheus(runtime.nativeHandle(), nodeHandle, out);
-      if (status != 0) {
-        throw IrohException.forStatus(
-            IrohStatus.fromCode(status), "aster_node_metrics_prometheus failed");
-      }
-      MemorySegment ptr = out.get(ValueLayout.ADDRESS, 0);
-      long len = out.get(ValueLayout.JAVA_LONG, 8);
-      if (ptr.equals(MemorySegment.NULL) || len == 0) return "";
-      String text =
-          new String(ptr.reinterpret(len).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8);
-      lib.stringRelease(ptr, len);
-      return text;
-    }
-  }
-
   /** Close this node and free its handle. */
   public void close() {
     runtime.removeInboundHandler(acceptHandler);
