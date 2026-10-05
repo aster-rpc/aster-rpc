@@ -14,8 +14,8 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.slf4j.event.Level;
 import org.slf4j.spi.LoggingEventBuilder;
-import site.aster.ffi.DataPlane;
 import site.aster.ffi.Dispatch;
+import site.aster.ffi.IrohStatus;
 
 /**
  * Delivers Rust log records to SLF4J (design §3.1, §3.2). One dedicated platform daemon thread
@@ -145,22 +145,23 @@ final class LogBridge {
   private static void run() {
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment buf = arena.allocate(OtelNative.LOG_RECORD_SIZE * BATCH, 8);
+      MemorySegment count = arena.allocate(ValueLayout.JAVA_INT);
       long nextCheck = System.nanoTime() + RECHECK_NANOS;
       while (!stop) {
         long t0 = System.nanoTime();
-        int n =
+        int status =
             (int)
                 OtelNative.LOG_POLL.invoke(
-                    buf, (int) OtelNative.LOG_RECORD_SIZE, BATCH, POLL_TIMEOUT_MS);
+                    buf, (int) OtelNative.LOG_RECORD_SIZE, BATCH, POLL_TIMEOUT_MS, count);
+        if (status == IrohStatus.NOT_FOUND.code || status == IrohStatus.ALREADY_EXISTS.code) {
+          // The bridge is closed (or another poller exists). Stop instead of spinning.
+          return;
+        }
+        int n = status == IrohStatus.OK.code ? count.get(ValueLayout.JAVA_INT, 0) : 0;
         if (n > 0) {
           deliver(buf, n);
         } else if (System.nanoTime() - t0 < Duration.ofMillis(POLL_TIMEOUT_MS / 2).toNanos()) {
-          // A poll that returns 0 well before its timeout was refused: the bridge is closed (or
-          // another poller exists). Stop instead of spinning.
-          String err = DataPlane.lastError();
-          if (err.contains("NOT_FOUND") || err.contains("ALREADY_EXISTS")) {
-            return;
-          }
+          // Any other early return is a refusal: back off instead of spinning.
           Thread.sleep(25);
         }
         if (!pinned && System.nanoTime() >= nextCheck) {

@@ -135,7 +135,7 @@ internal static unsafe partial class Native
     // ─── Logs ───────────────────────────────────────────────────────────────
 
     [LibraryImport(NativeLib, EntryPoint = "aster_log_poll")]
-    public static partial uint aster_log_poll(LogRecordNative* @out, uint record_size, uint max, uint timeout_ms);
+    public static partial int aster_log_poll(LogRecordNative* @out, uint record_size, uint max, uint timeout_ms, uint* out_count);
     [LibraryImport(NativeLib, EntryPoint = "aster_log_close")]
     public static partial int aster_log_close();
     [LibraryImport(NativeLib, EntryPoint = "aster_log_dropped")]

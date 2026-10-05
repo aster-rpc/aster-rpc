@@ -391,11 +391,15 @@ pub unsafe extern "C" fn aster_upcall_set_default_policy(
 
 /// Drain up to `max` events into `out`. `timeout_ms` 0 = return at once;
 /// otherwise wait up to that long for the first event (or until the table
-/// is closed). Returns the count (0 on timeout, unknown handle or bad
-/// arguments). Single consumer; blocks the calling thread, so run it off
-/// the runtime's threads (and off virtual-thread carriers when waiting).
-/// Since 4.6 a call from a tokio runtime thread is refused (0, last error
-/// `ASTER_STATUS_UNSUPPORTED: ...`), like `aster_log_poll`.
+/// is closed). The count goes to `*out_count` (always written, 0 on any
+/// non-OK status; 0 with `OK` on timeout). Statuses: `NOT_FOUND` for an
+/// unknown runtime or upcalls handle, `INVALID_ARGUMENT` for NULL `out` /
+/// `out_count` or `max` 0, `UNSUPPORTED` from a tokio runtime thread (like
+/// `aster_log_poll`). Single consumer; blocks the calling thread, so run it
+/// off the runtime's threads (and off virtual-thread carriers when waiting).
+///
+/// # Safety
+/// `out` must have room for `max` events; `out_count` must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn aster_upcall_poll(
     runtime: aster_runtime_t,
@@ -403,20 +407,25 @@ pub unsafe extern "C" fn aster_upcall_poll(
     out: *mut aster_upcall_event_t,
     max: u32,
     timeout_ms: u32,
-) -> u32 {
+    out_count: *mut u32,
+) -> i32 {
+    if out_count.is_null() {
+        return invalid("out_count is NULL");
+    }
+    // SAFETY: checked non-null.
+    unsafe { ptr::write(out_count, 0) };
     if tokio::runtime::Handle::try_current().is_ok() {
         set_last_error(
-            "ASTER_STATUS_UNSUPPORTED: aster_upcall_poll blocks; call it from a dedicated \
+            "aster_upcall_poll blocks; call it from a dedicated \
              thread, not a tokio runtime thread",
         );
-        return 0;
+        return aster_status_t::ASTER_STATUS_UNSUPPORTED as i32;
     }
-    if out.is_null() || max == 0 || load_ok(runtime).is_none() {
-        return 0;
+    if out.is_null() || max == 0 {
+        return invalid("out is NULL or max is 0");
     }
-    let Some(state) = UPCALLS.get(upcalls) else {
-        return 0;
-    };
+    try_status!(bridge_for(runtime));
+    let state = try_status!(upcalls_for(upcalls));
     let _consumer = state.poll.lock().unwrap();
     let mut written = drain_into(&state, out, max);
     if written == 0 && timeout_ms > 0 {
@@ -425,11 +434,9 @@ pub unsafe extern "C" fn aster_upcall_poll(
             .wait_blocking(Duration::from_millis(timeout_ms as u64));
         written = drain_into(&state, out, max);
     }
-    written
-}
-
-fn load_ok(runtime: aster_runtime_t) -> Option<()> {
-    crate::load_runtime(runtime).ok().map(|_| ())
+    // SAFETY: checked non-null.
+    unsafe { ptr::write(out_count, written) };
+    OK
 }
 
 fn drain_into(state: &UpcallsState, out: *mut aster_upcall_event_t, max: u32) -> u32 {

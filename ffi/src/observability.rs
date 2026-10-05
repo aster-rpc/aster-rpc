@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!   aster_observability_init(cfg) / _flush(ms) / _shutdown(ms)   refcounted
-//!   aster_log_poll(out[], sizeof, max, ms) → n                    one poller
+//!   aster_log_poll(out[], sizeof, max, ms, &n) → status                   one poller
 //!   aster_log_close() / aster_log_dropped(&n) / aster_log_set_filter(..)
 //!   aster_log_emit(rec)                                           path B (OTLP logs)
 //!   aster_instrument_new(desc) → h,  aster_attrset_new(kv) → set
@@ -123,7 +123,7 @@ fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, i32> {
 fn on_tokio_thread(what: &str) -> bool {
     if tokio::runtime::Handle::try_current().is_ok() {
         set_last_error(format!(
-            "ASTER_STATUS_UNSUPPORTED: {what} blocks; call it from a dedicated thread, not a \
+            "{what} blocks; call it from a dedicated thread, not a \
              tokio runtime thread"
         ));
         return true;
@@ -519,54 +519,74 @@ unsafe fn lower_records(
 }
 
 /// Take up to `max` Rust log records into `out`, waiting up to `timeout_ms`
-/// for the first (0 = return at once). Returns the count: 0 on timeout,
-/// once the bridge is closed or not open (last error
-/// `ASTER_STATUS_NOT_FOUND: ...`), or on refusal. Audit records come first,
-/// then the rest in FIFO order; a synthetic drop report (`ASTER_LOG_FLAG_SYNTHETIC`)
-/// leads a batch at most once a second.
+/// for the first (0 = return at once). The count goes to `*out_count`
+/// (always written, 0 on any non-OK status): 0 with `OK` on timeout.
+/// Audit records come first, then the rest in FIFO order; a synthetic drop
+/// report (`ASTER_LOG_FLAG_SYNTHETIC`) leads a batch at most once a second.
 ///
-/// Rules: `record_size` must equal `sizeof(aster_log_record_t)` (the array
-/// stride); otherwise 0 and `ASTER_STATUS_INVALID_ARGUMENT: ...`. **One poller
-/// per process**: a concurrent second call returns 0 with last error
-/// `ASTER_STATUS_ALREADY_EXISTS: ...` (it would free the batch the first is
-/// reading). Refused on a tokio runtime thread (`ASTER_STATUS_UNSUPPORTED: ...`):
-/// run it on a dedicated thread, which this call marks as a log drain (events
-/// it emits never reach the bridge, so a logger that calls back into Aster
-/// cannot feed its own queue). The returned pointers stay valid until the
-/// next `aster_log_poll` or `aster_log_close`.
+/// Statuses: `NOT_FOUND` once the bridge is closed or not open;
+/// `INVALID_ARGUMENT` for a NULL `out` / `out_count`, `max` 0 or a wrong
+/// `record_size` (must equal `sizeof(aster_log_record_t)`, the array stride);
+/// `ALREADY_EXISTS` for a concurrent second call (**one poller per process**:
+/// it would free the batch the first is reading); `UNSUPPORTED` on a tokio
+/// runtime thread: run it on a dedicated thread, which this call marks as a
+/// log drain (events it emits never reach the bridge, so a logger that calls
+/// back into Aster cannot feed its own queue). The returned pointers stay
+/// valid until the next `aster_log_poll` or `aster_log_close`.
 ///
 /// # Safety
-/// `out` must have room for `max` records of `record_size` bytes.
+/// `out` must have room for `max` records of `record_size` bytes;
+/// `out_count` must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn aster_log_poll(
     out: *mut aster_log_record_t,
     record_size: u32,
     max: u32,
     timeout_ms: u32,
-) -> u32 {
+    out_count: *mut u32,
+) -> i32 {
+    if out_count.is_null() {
+        return invalid("out_count is NULL");
+    }
+    // SAFETY: checked non-null.
+    unsafe { std::ptr::write(out_count, 0) };
+    // SAFETY: forwarded caller contract.
+    match unsafe { log_poll_inner(out, record_size, max, timeout_ms) } {
+        Ok(n) => {
+            // SAFETY: checked non-null.
+            unsafe { std::ptr::write(out_count, n) };
+            OK
+        }
+        Err(status) => status,
+    }
+}
+
+unsafe fn log_poll_inner(
+    out: *mut aster_log_record_t,
+    record_size: u32,
+    max: u32,
+    timeout_ms: u32,
+) -> Result<u32, i32> {
     if on_tokio_thread("aster_log_poll") {
-        return 0;
+        return Err(aster_status_t::ASTER_STATUS_UNSUPPORTED as i32);
     }
     if record_size as usize != std::mem::size_of::<aster_log_record_t>() {
-        set_last_error(format!(
-            "ASTER_STATUS_INVALID_ARGUMENT: record_size {record_size} != sizeof(aster_log_record_t) {}",
+        return Err(invalid(format!(
+            "record_size {record_size} != sizeof(aster_log_record_t) {}",
             std::mem::size_of::<aster_log_record_t>()
-        ));
-        return 0;
+        )));
     }
     if out.is_null() || max == 0 {
-        set_last_error("ASTER_STATUS_INVALID_ARGUMENT: out is NULL or max is 0");
-        return 0;
+        return Err(invalid("out is NULL or max is 0"));
     }
     let mut guard = match POLLER.try_lock() {
         Ok(g) => g,
         Err(TryLockError::Poisoned(p)) => p.into_inner(),
         Err(TryLockError::WouldBlock) => {
-            set_last_error(
-                "ASTER_STATUS_ALREADY_EXISTS: another aster_log_poll is running (one poller per \
-                 process)",
-            );
-            return 0;
+            return Err(fail(
+                aster_status_t::ASTER_STATUS_ALREADY_EXISTS,
+                "another aster_log_poll is running (one poller per process)",
+            ));
         }
     };
     bridge::mark_drain_thread();
@@ -577,27 +597,28 @@ pub unsafe extern "C" fn aster_log_poll(
             Ok(d) => poller.drain = Some(d),
             Err(e) => {
                 let status = match e {
-                    aster_otel::Error::LogDrainBusy => "ASTER_STATUS_ALREADY_EXISTS",
-                    _ => "ASTER_STATUS_NOT_FOUND",
+                    aster_otel::Error::LogDrainBusy => aster_status_t::ASTER_STATUS_ALREADY_EXISTS,
+                    _ => aster_status_t::ASTER_STATUS_NOT_FOUND,
                 };
-                set_last_error(format!("{status}: {e}"));
-                return 0;
+                return Err(fail(status, e));
             }
         }
     }
     let Some(drain) = poller.drain.as_mut() else {
-        return 0;
+        return Ok(0);
     };
     let timeout = Duration::from_millis(timeout_ms as u64);
     match drain.poll_into(&mut poller.records, max as usize, timeout) {
         Poll::Records(_) => {}
-        Poll::Timeout => return 0,
+        Poll::Timeout => return Ok(0),
         Poll::Closed => {
             // Everything was delivered; a re-init opens a new queue, which
             // the next poll takes.
             poller.drain = None;
-            set_last_error("ASTER_STATUS_NOT_FOUND: the log bridge was closed");
-            return 0;
+            return Err(fail(
+                aster_status_t::ASTER_STATUS_NOT_FOUND,
+                "the log bridge was closed",
+            ));
         }
     }
     let Poller {
@@ -605,11 +626,11 @@ pub unsafe extern "C" fn aster_log_poll(
     } = poller;
     // SAFETY: `poll_into` appended at most `max` records; `out` has room.
     unsafe { lower_records(records, fields, out) };
-    records.len() as u32
+    Ok(records.len() as u32)
 }
 
 /// Close the log bridge: Rust events stop being queued, a waiting
-/// `aster_log_poll` wakes (and gets what was still queued, then 0), and the
+/// `aster_log_poll` wakes (and gets what was still queued, then `NOT_FOUND`), and the
 /// last batch's arena is freed when no poll is running. A later
 /// `aster_observability_init` with `ASTER_OBSERVABILITY_LOG_BRIDGE` opens a
 /// new bridge. `OK` also when no bridge is open.

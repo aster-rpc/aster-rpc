@@ -579,7 +579,8 @@ public class UpcallTests
         UpcallEventNative ev = default;
         uint n = 0;
         var end = DateTime.UtcNow + T;
-        while (n == 0 && DateTime.UtcNow < end) n = Native.aster_upcall_poll(rt.Handle, table, &ev, 1, 100);
+        while (n == 0 && DateTime.UtcNow < end)
+            Assert.Equal(0, Native.aster_upcall_poll(rt.Handle, table, &ev, 1, 100, &n));
         Assert.Equal(1u, n);
         Assert.Equal((ushort)UpcallKind.LeaseAuthorize, ev.kind);
         Assert.Equal(0, ev.cancel_reason);

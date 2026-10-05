@@ -162,7 +162,7 @@ public final class Upcalls implements AutoCloseable {
   private static final MethodHandle SET_DEFAULT_POLICY =
       UpcallNative.handle("aster_upcall_set_default_policy", FunctionDescriptor.of(I, J, J, I, I));
   private static final MethodHandle POLL =
-      UpcallNative.handle("aster_upcall_poll", FunctionDescriptor.of(I, J, J, A, I, I));
+      UpcallNative.handle("aster_upcall_poll", FunctionDescriptor.of(I, J, J, A, I, I, A));
   private static final MethodHandle RESPOND =
       UpcallNative.handle("aster_upcall_respond", FunctionDescriptor.of(I, J, J, J, I, A, I));
   private static final MethodHandle BUFFER_RELEASE =
@@ -175,6 +175,7 @@ public final class Upcalls implements AutoCloseable {
   private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
   private final Arena arena = Arena.ofShared();
   private final MemorySegment events;
+  private final MemorySegment pollCount;
   private final AtomicLong cancels = new AtomicLong();
   private volatile boolean closed;
   private final Thread pollThread;
@@ -183,6 +184,7 @@ public final class Upcalls implements AutoCloseable {
     this.runtime = runtime;
     this.handle = handle;
     this.events = arena.allocate(EVENT_LAYOUT, BATCH);
+    this.pollCount = arena.allocate(I);
     this.pollThread = Thread.ofVirtual().name("aster-upcalls-" + handle).start(this::pollLoop);
   }
 
@@ -335,7 +337,8 @@ public final class Upcalls implements AutoCloseable {
     while (!closed) {
       int n;
       try {
-        n = (int) POLL.invoke(runtime.nativeHandle(), handle, events, BATCH, 0);
+        int status = (int) POLL.invoke(runtime.nativeHandle(), handle, events, BATCH, 0, pollCount);
+        n = status == 0 ? pollCount.get(I, 0) : 0;
       } catch (Throwable t) {
         if (closed) {
           return;

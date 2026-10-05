@@ -156,7 +156,11 @@ internal static unsafe class LogBridge
             while (!s_stop)
             {
                 long begin = Stopwatch.GetTimestamp();
-                uint n = Native.aster_log_poll(buffer, (uint)sizeof(LogRecordNative), BatchSize, PollTimeoutMs);
+                uint n = 0;
+                int status = Native.aster_log_poll(buffer, (uint)sizeof(LogRecordNative), BatchSize, PollTimeoutMs, &n);
+                if (status == (int)Status.NotFound || status == (int)Status.AlreadyExists)
+                    return; // bridge closed, or another poller exists: stop instead of spinning
+                if (status != (int)Status.OK) n = 0;
                 for (uint i = 0; i < n; i++)
                 {
                     try { Deliver(&buffer[i]); }
@@ -167,7 +171,7 @@ internal static unsafe class LogBridge
                     lastCheck = Stopwatch.GetTimestamp();
                     if (AsterLogging.EffectiveLevel() != s_lastLevel) SyncLevel();
                 }
-                // A closed or foreign-closed bridge returns at once: do not spin.
+                // Any other refusal returns at once: do not spin.
                 if (n == 0 && Stopwatch.GetElapsedTime(begin) < TimeSpan.FromMilliseconds(20))
                     Thread.Sleep(50);
             }

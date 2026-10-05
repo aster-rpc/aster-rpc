@@ -21,7 +21,7 @@ internal static unsafe partial class Native
     [LibraryImport(NativeLib, EntryPoint = "aster_upcall_set_default_policy")]
     public static partial int aster_upcall_set_default_policy(ulong runtime, ulong upcalls, uint timeout_ms, uint failure_mode);
     [LibraryImport(NativeLib, EntryPoint = "aster_upcall_poll")]
-    public static partial uint aster_upcall_poll(ulong runtime, ulong upcalls, UpcallEventNative* @out, uint max, uint timeout_ms);
+    public static partial int aster_upcall_poll(ulong runtime, ulong upcalls, UpcallEventNative* @out, uint max, uint timeout_ms, uint* out_count);
     [LibraryImport(NativeLib, EntryPoint = "aster_upcall_buffer_release")]
     public static partial int aster_upcall_buffer_release(ulong runtime, ulong upcalls, ulong buffer);
     [LibraryImport(NativeLib, EntryPoint = "aster_upcall_respond")]
