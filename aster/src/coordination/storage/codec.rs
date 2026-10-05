@@ -75,12 +75,19 @@ mod runtime {
     use crate::coordination::contract::payload_fory;
     use crate::rpc::contract::WireField;
 
-    /// Runtimes actually constructed, so a gate can prove a bulk pass builds
-    /// none rather than one per row. A wall-clock assertion would be the wrong
-    /// shape for CI; a construction count is exact.
+    // Runtimes actually constructed, so a gate can prove a bulk pass builds
+    // none rather than one per row. A wall-clock assertion would be the wrong
+    // shape for CI; a construction count is exact.
+    //
+    // Per *thread*, not per process: `for_type` constructs on the calling
+    // thread, so a test's own calls are counted exactly, while a parallel test
+    // warming some other type's runtime cannot leak into its delta. A
+    // process-wide counter made the zero-construction gate flaky under the
+    // default parallel harness without making it prove anything more.
     #[cfg(test)]
-    pub(super) static CONSTRUCTED: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    thread_local! {
+        pub(super) static CONSTRUCTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
 
     #[allow(clippy::type_complexity)]
     fn cache() -> &'static RwLock<HashMap<TypeId, &'static fory_core::Fory>> {
@@ -103,7 +110,7 @@ mod runtime {
             return found;
         }
         #[cfg(test)]
-        CONSTRUCTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CONSTRUCTED.with(|c| c.set(c.get() + 1));
         let built: &'static fory_core::Fory = Box::leak(Box::new(payload_fory::<T>()));
         guard.insert(key, built);
         built
@@ -412,12 +419,10 @@ mod tests {
     /// `payload_fory` directly makes this two thousand.
     ///
     /// The warm-up is per type and is what makes the delta exact rather than
-    /// "small": the count is process-wide and other tests share the process, so
-    /// only a delta measured around this type's own calls means anything.
+    /// "small". The counter is per thread (see `runtime::CONSTRUCTED`), so a
+    /// parallel test constructing another type's runtime cannot reach the delta.
     #[test]
     fn a_bulk_pass_constructs_no_payload_runtime() {
-        use std::sync::atomic::Ordering;
-
         let meta = CoordinationMetaV1 {
             schema_version: 1,
             admin_revision: 3,
@@ -429,14 +434,14 @@ mod tests {
         let _: CoordinationMetaV1 =
             decode_persisted(Db::State, "CoordinationMetaV1", &bytes).expect("decode");
 
-        let before = runtime::CONSTRUCTED.load(Ordering::Relaxed);
+        let before = runtime::CONSTRUCTED.with(std::cell::Cell::get);
         for _ in 0..1_000 {
             let encoded = encode_owned(Db::State, "CoordinationMetaV1", &meta).expect("encode");
             let back: CoordinationMetaV1 =
                 decode_persisted(Db::State, "CoordinationMetaV1", &encoded).expect("decode");
             assert_eq!(back.admin_revision, 3, "the cached runtime round-trips");
         }
-        let constructed = runtime::CONSTRUCTED.load(Ordering::Relaxed) - before;
+        let constructed = runtime::CONSTRUCTED.with(std::cell::Cell::get) - before;
 
         assert_eq!(
             constructed, 0,
@@ -455,13 +460,11 @@ mod tests {
     #[test]
     fn each_persisted_root_gets_its_own_runtime() {
         use crate::coordination::raft::ResourceRowV1;
-        use std::sync::atomic::Ordering;
-
         // Warm the first type.
         let meta = CoordinationMetaV1::default();
         let _ = encode_owned(Db::State, "CoordinationMetaV1", &meta).expect("encode");
 
-        let before = runtime::CONSTRUCTED.load(Ordering::Relaxed);
+        let before = runtime::CONSTRUCTED.with(std::cell::Cell::get);
         let row = ResourceRowV1 {
             epoch: 4,
             ttl_ms: 1_000,
@@ -472,7 +475,7 @@ mod tests {
             ..Default::default()
         };
         let encoded = encode_owned(Db::State, "ResourceRowV1", &row).expect("encode");
-        let after_first = runtime::CONSTRUCTED.load(Ordering::Relaxed);
+        let after_first = runtime::CONSTRUCTED.with(std::cell::Cell::get);
         let back: ResourceRowV1 =
             decode_persisted(Db::State, "ResourceRowV1", &encoded).expect("decode");
 
@@ -489,7 +492,7 @@ mod tests {
             "the first use of a second root constructs at most one runtime"
         );
         assert_eq!(
-            runtime::CONSTRUCTED.load(Ordering::Relaxed),
+            runtime::CONSTRUCTED.with(std::cell::Cell::get),
             after_first,
             "the decode reused the runtime the encode constructed"
         );

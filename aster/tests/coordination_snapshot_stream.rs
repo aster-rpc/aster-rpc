@@ -31,6 +31,10 @@
 #![cfg(feature = "coordination-testing")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+// Storage scratch dirs the production open policy accepts at any umask.
+#[path = "common/scratch.rs"]
+mod scratch;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -241,7 +245,7 @@ async fn start_one(
     secret: [u8; 32],
     admission: Arc<dyn VerifiedAdmissionSource>,
 ) -> Voter {
-    let dir = tempfile::tempdir().expect("a storage directory");
+    let dir = scratch::storage_dir();
     let server = AsterServer::builder()
         .config(
             AsterConfig::builder()

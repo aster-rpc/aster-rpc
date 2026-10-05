@@ -21,6 +21,8 @@
 #![allow(dead_code)]
 
 pub mod linearize;
+#[path = "scratch.rs"]
+pub mod scratch;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -287,7 +289,7 @@ impl ChaosFixture {
         senders: &[usize],
         schedule: Schedule,
     ) -> ChaoticVoter {
-        let dir = tempfile::tempdir().expect("a storage directory");
+        let dir = scratch::storage_dir();
         let chaos = ChaosNetwork::new(schedule);
         let config = CoordinationConfig::builder()
             .storage_dir(dir.path())
@@ -339,7 +341,7 @@ impl ChaosFixture {
 
         let mut voters = Vec::new();
         for index in 0..self.size() {
-            let dir = tempfile::tempdir().expect("a storage directory");
+            let dir = scratch::storage_dir();
             let chaos = ChaosNetwork::new(schedule);
             let config = CoordinationConfig::builder()
                 .storage_dir(dir.path())
