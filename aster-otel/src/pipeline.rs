@@ -266,12 +266,15 @@ pub fn init(cfg: ObservabilityConfig) -> Result<ObservabilityHandle> {
 /// provider has the Prometheus pull reader, independent of
 /// `OTEL_METRICS_EXPORTER`.
 ///
-/// The SDK cannot add a reader to a built provider, so when the running
-/// pipeline has none, its meter provider is rebuilt with the configured
-/// readers plus the pull reader and installed under a new [`generation`]
-/// (instruments cached per generation rebuild on their next record; the
-/// tracer and logger providers are untouched). Outstanding handles keep
-/// counting against the same pipeline. Afterwards [`render_prometheus`]
+/// The SDK cannot add a reader to a built provider, so every meter provider
+/// is built with the pull reader from the start (feature `prometheus`): a
+/// pipeline that records metrics already has it, and joining it changes
+/// nothing, so values recorded earlier are kept. Only a pipeline with no
+/// meter provider at all (`metrics_exporter` none: nothing was recorded)
+/// gets one now, installed under a new [`generation`] (instruments cached per
+/// generation rebuild on their next record; the tracer and logger providers
+/// are untouched). Outstanding handles keep counting against the same
+/// pipeline. Afterwards [`render_prometheus`]
 /// returns `Some` until the pipeline is shut down, unless `OTEL_SDK_DISABLED`
 /// switched the SDK off (the handle then [`is_noop`](ObservabilityHandle::is_noop)).
 #[cfg(feature = "prometheus")]
@@ -467,10 +470,12 @@ fn open_bridge(
     }
 }
 
-/// Give the running pipeline a Prometheus pull reader if it has none: rebuild
-/// its meter provider (same readers plus the pull reader), install it, and
-/// bump the generation. Returns the replaced provider for the caller to shut
-/// down outside the lock. A disabled pipeline is left alone.
+/// Give the running pipeline a Prometheus pull reader if it has none. Every
+/// provider `build_meter` makes has one, so this only builds a provider for a
+/// pipeline that had none (no readers configured, nothing recorded yet),
+/// installs it, and bumps the generation. Returns the replaced provider
+/// (always `None` today) for the caller to shut down outside the lock. A
+/// disabled pipeline is left alone.
 #[cfg(feature = "prometheus")]
 fn ensure_pull_reader(a: &mut Active) -> Result<Option<SdkMeterProvider>> {
     if a.resolved.disabled || a.providers.prometheus.is_some() {
@@ -612,8 +617,9 @@ pub const PROMETHEUS_TEXT_CONTENT_TYPE: &str = "text/plain; version=0.0.4; chars
 
 /// The running pipeline's Prometheus reader rendered as text exposition
 /// (version 0.0.4), or `None` when the pipeline has no pull reader (none
-/// running, `OTEL_SDK_DISABLED`, or neither a `prometheus` metrics exporter
-/// nor [`init_with_prometheus`]).
+/// running, `OTEL_SDK_DISABLED`, or no meter provider: no metrics exporter
+/// configured and no [`init_with_prometheus`]). Every meter provider has the
+/// pull reader, whatever exporters push.
 #[cfg(feature = "prometheus")]
 pub fn render_prometheus() -> Option<String> {
     let registry = pipeline().as_ref()?.providers.prometheus.clone()?;
@@ -835,8 +841,9 @@ type PullRegistry = prometheus::Registry;
 type PullRegistry = ();
 
 /// The meter provider for `c`, or `None` when it has no reader. Test
-/// exporters replace OTLP, not a Prometheus reader; `with_prometheus` adds the
-/// pull reader whatever `metrics_exporter` says (design §6).
+/// exporters replace OTLP, not a Prometheus reader. The pull reader comes with
+/// every provider (feature `prometheus`), and `with_prometheus` adds it, and
+/// so a provider, whatever `metrics_exporter` says (design §6).
 #[allow(unused_variables, unused_mut, clippy::ptr_arg)]
 fn build_meter(
     c: &ResolvedConfig,
@@ -883,7 +890,13 @@ fn build_meter(
         }
     }
     let mut registry = None;
-    if with_prometheus || c.metrics_exporter.contains(&ExporterKind::Prometheus) {
+    // Any provider that records at all also carries the pull reader. The SDK
+    // cannot add a reader to a built provider, and a provider rebuilt later
+    // (a health listener starting after a metric was recorded) would start
+    // every instrument from zero, so the reader must exist from the start.
+    // Only a pipeline with no reader at all (`metrics_exporter` none) has no
+    // provider, and records nothing until `with_prometheus` builds one.
+    if with_prometheus || any_reader || c.metrics_exporter.contains(&ExporterKind::Prometheus) {
         #[cfg(feature = "prometheus")]
         {
             let r = prometheus::Registry::new();
