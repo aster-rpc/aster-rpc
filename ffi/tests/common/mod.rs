@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use std::{collections::HashSet, iter::FromIterator};
 
 use aster_transport_ffi::{
-    aster_buffer_release, aster_event_kind_t, aster_event_t, aster_operation_t, aster_poll_events,
-    aster_runtime_t, aster_status_t,
+    aster_event_kind_t, aster_event_t, aster_operation_t, aster_poll_events, aster_runtime_t,
+    aster_status_t,
 };
 
 /// Wait for one asynchronous FFI operation to produce its terminal event.
@@ -20,6 +20,11 @@ use aster_transport_ffi::{
 /// by kind rather than operation id. This helper blocks on the completion
 /// queue in bounded slices, correlates the exact operation, and retains a
 /// finite failure deadline without turning ordinary host load into a failure.
+///
+/// Events for other operations polled along the way are kept (payload buffers
+/// unreleased) for a later wait on that operation, not dropped: two operations
+/// that complete in the same poll batch, or out of the order the test waits on
+/// them, must both be found.
 pub unsafe fn wait_for_operation(
     runtime: aster_runtime_t,
     operation: aster_operation_t,
@@ -27,6 +32,9 @@ pub unsafe fn wait_for_operation(
     const DEADLINE: Duration = Duration::from_secs(30);
     const POLL_SLICE: Duration = Duration::from_millis(250);
 
+    if let Some(event) = take_stashed(runtime, operation) {
+        return event;
+    }
     let started = Instant::now();
     loop {
         let elapsed = started.elapsed();
@@ -44,18 +52,42 @@ pub unsafe fn wait_for_operation(
 
         let mut events: [aster_event_t; 8] = std::mem::zeroed();
         let count = aster_poll_events(runtime, events.as_mut_ptr(), events.len(), timeout_ms);
+        let mut found = None;
         for event in events.iter().take(count) {
-            if event.operation == operation {
-                return *event;
-            }
-
-            // The event has been removed from the queue even though it is not
-            // ours. Do not leak a payload while waiting for the correlated op.
-            if event.buffer != 0 {
-                let _ = aster_buffer_release(runtime, event.buffer);
+            if found.is_none() && event.operation == operation {
+                found = Some(*event);
+            } else {
+                stash(runtime, *event);
             }
         }
+        if let Some(event) = found {
+            return event;
+        }
     }
+}
+
+/// An event polled while waiting for a different operation.
+struct Stashed(aster_runtime_t, aster_event_t);
+// SAFETY: the payload pointer stays valid until `aster_buffer_release`, which
+// only the test that takes the event calls; the pointer is never dereferenced
+// while stashed.
+unsafe impl Send for Stashed {}
+
+static STASH: std::sync::Mutex<Vec<Stashed>> = std::sync::Mutex::new(Vec::new());
+
+fn stash(runtime: aster_runtime_t, event: aster_event_t) {
+    STASH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Stashed(runtime, event));
+}
+
+fn take_stashed(runtime: aster_runtime_t, operation: aster_operation_t) -> Option<aster_event_t> {
+    let mut stash = STASH.lock().unwrap_or_else(|e| e.into_inner());
+    let at = stash
+        .iter()
+        .position(|s| s.0 == runtime && s.1.operation == operation)?;
+    Some(stash.remove(at).1)
 }
 
 /// Wait for one operation and require its expected successful event.
@@ -101,6 +133,35 @@ pub unsafe fn wait_for_successful_operations(
     let mut completed = Vec::with_capacity(operations.len());
     let started = Instant::now();
 
+    let accept = |pending: &mut HashSet<aster_operation_t>,
+                  completed: &mut Vec<aster_event_t>,
+                  event: &aster_event_t| {
+        assert!(
+            pending.remove(&event.operation),
+            "operation {} produced more than one terminal event",
+            event.operation
+        );
+        assert_eq!(
+            event.kind, expected_kind as u32,
+            "operation {} produced event kind {} instead of {} (status {}, error {})",
+            event.operation, event.kind, expected_kind as u32, event.status, event.error_code
+        );
+        assert_eq!(
+            event.status,
+            aster_status_t::ASTER_STATUS_OK as u32,
+            "operation {} failed with status {} (event kind {}, error {})",
+            event.operation,
+            event.status,
+            event.kind,
+            event.error_code
+        );
+        completed.push(*event);
+    };
+    for &operation in operations {
+        if let Some(event) = take_stashed(runtime, operation) {
+            accept(&mut pending, &mut completed, &event);
+        }
+    }
     while !pending.is_empty() {
         let elapsed = started.elapsed();
         assert!(
@@ -121,33 +182,9 @@ pub unsafe fn wait_for_successful_operations(
         let count = aster_poll_events(runtime, events.as_mut_ptr(), events.len(), timeout_ms);
         for event in events.iter().take(count) {
             if all.contains(&event.operation) {
-                assert!(
-                    pending.remove(&event.operation),
-                    "operation {} produced more than one terminal event",
-                    event.operation
-                );
-                assert_eq!(
-                    event.kind,
-                    expected_kind as u32,
-                    "operation {} produced event kind {} instead of {} (status {}, error {})",
-                    event.operation,
-                    event.kind,
-                    expected_kind as u32,
-                    event.status,
-                    event.error_code
-                );
-                assert_eq!(
-                    event.status,
-                    aster_status_t::ASTER_STATUS_OK as u32,
-                    "operation {} failed with status {} (event kind {}, error {})",
-                    event.operation,
-                    event.status,
-                    event.kind,
-                    event.error_code
-                );
-                completed.push(*event);
-            } else if event.buffer != 0 {
-                let _ = aster_buffer_release(runtime, event.buffer);
+                accept(&mut pending, &mut completed, event);
+            } else {
+                stash(runtime, *event);
             }
         }
     }
