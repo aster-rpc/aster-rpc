@@ -28,7 +28,7 @@ iroh-mdns-address-lookup = { version = "=0.4.0", registry = "aster", git = "http
 
 # HTTP/WebTransport transport. Like the Iroh entries above, the Git location
 # is used for repository builds and the version is used for registry packages.
-salvo = { version = "1.0", registry = "aster", git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo = { version = "1.0", registry = "aster", git = "https://forge.emrul.dev/Aster/salvo.git", rev = "b636f542fe440917425d3c1638952831176a0ece" }
 
 # Python FFI
 pyo3        = { version = "0.28.2", features = ["extension-module", "abi3-py39", "generate-import-lib"] }
@@ -90,12 +90,12 @@ iroh-util                = { git = "https://forge.emrul.dev/Aster/iroh-util.git"
 # pin the rev/tag, not the branch. Maintenance workflow: ~/dev/aster/salvo_fork.md.
 # Propagation gotcha: the fork patches h3 / h3-quinn / salvo-http3 / h3-datagram internally,
 # but [patch.crates-io] does NOT cross workspaces — re-declare them here.
-salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "b636f542fe440917425d3c1638952831176a0ece" }
+salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "b636f542fe440917425d3c1638952831176a0ece" }
+salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "b636f542fe440917425d3c1638952831176a0ece" }
 # (salvo_extra is patched by portal-agent but not yet pulled here — re-add the
 #  line when a feature brings it into the graph, else cargo warns "patch unused".)
-salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
-h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "d4cdbbd38afd7a8c0d65c58469269da7f14f4912" }
+salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "b636f542fe440917425d3c1638952831176a0ece" }
+h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "b636f542fe440917425d3c1638952831176a0ece" }
+h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "b636f542fe440917425d3c1638952831176a0ece" }
+h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "b636f542fe440917425d3c1638952831176a0ece" }

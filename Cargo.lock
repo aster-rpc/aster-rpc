@@ -829,7 +829,6 @@ dependencies = [
  "rand 0.10.1",
  "rcgen 0.14.8",
  "reqwest",
- "rsa",
  "rustls",
  "serde",
  "serde_json",
@@ -1424,7 +1423,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1434,7 +1433,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
- "pem-rfc7468 0.7.0",
  "zeroize",
 ]
 
@@ -1445,7 +1443,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
 dependencies = [
  "const-oid 0.10.2",
- "pem-rfc7468 1.0.0",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -1530,7 +1528,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
- "const-oid 0.9.6",
  "crypto-common 0.1.7",
  "subtle",
 ]
@@ -1684,7 +1681,7 @@ dependencies = [
  "ff",
  "group",
  "hybrid-array",
- "pem-rfc7468 1.0.0",
+ "pem-rfc7468",
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
  "sec1",
@@ -2201,7 +2198,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.9"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2214,7 +2211,7 @@ dependencies = [
 [[package]]
 name = "h3-datagram"
 version = "0.0.3"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "bytes",
  "h3",
@@ -2224,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.11"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "bytes",
  "futures",
@@ -3279,9 +3276,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-dependencies = [
- "spin 0.9.9",
-]
 
 [[package]]
 name = "leb128fmt"
@@ -3938,22 +3932,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-bigint-dig"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"
-dependencies = [
- "lazy_static",
- "libm",
- "num-integer",
- "num-iter",
- "num-traits",
- "rand 0.8.6",
- "smallvec",
- "zeroize",
-]
-
-[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3969,24 +3947,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-iter"
-version = "0.1.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
-dependencies = [
- "autocfg",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
- "libm",
 ]
 
 [[package]]
@@ -4026,7 +3992,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4324,15 +4290,6 @@ dependencies = [
 
 [[package]]
 name = "pem-rfc7468"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
-dependencies = [
- "base64ct",
-]
-
-[[package]]
-name = "pem-rfc7468"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6305423e0e7738146434843d1694d621cce767262b2a86910beab705e4493d9"
@@ -4381,17 +4338,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pkcs1"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"
-dependencies = [
- "der 0.7.10",
- "pkcs8 0.10.2",
- "spki 0.7.3",
-]
 
 [[package]]
 name = "pkcs8"
@@ -5284,27 +5230,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsa"
-version = "0.9.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
-dependencies = [
- "const-oid 0.9.6",
- "digest 0.10.7",
- "num-bigint-dig",
- "num-integer",
- "num-traits",
- "pkcs1",
- "pkcs8 0.10.2",
- "rand_core 0.6.4",
- "sha2 0.10.9",
- "signature 2.2.0",
- "spki 0.7.3",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "rust-embed"
 version = "8.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5496,7 +5421,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "salvo"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "salvo-acme",
  "salvo-otel",
@@ -5508,7 +5433,7 @@ dependencies = [
 [[package]]
 name = "salvo-acme"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "certon",
  "futures-util",
@@ -5522,7 +5447,7 @@ dependencies = [
 [[package]]
 name = "salvo-http3"
 version = "0.7.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5538,7 +5463,7 @@ dependencies = [
 [[package]]
 name = "salvo-otel"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "opentelemetry",
  "opentelemetry-http",
@@ -5551,7 +5476,7 @@ dependencies = [
 [[package]]
 name = "salvo-proxy"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "fastrand",
  "futures-util",
@@ -5569,7 +5494,7 @@ dependencies = [
 [[package]]
 name = "salvo-serde-util"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5579,7 +5504,7 @@ dependencies = [
 [[package]]
 name = "salvo-serve-static"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "hex",
  "mime",
@@ -5598,7 +5523,7 @@ dependencies = [
 [[package]]
 name = "salvo_core"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5651,7 +5576,7 @@ dependencies = [
 [[package]]
 name = "salvo_macros"
 version = "1.0.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d4cdbbd38afd7a8c0d65c58469269da7f14f4912#d4cdbbd38afd7a8c0d65c58469269da7f14f4912"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=b636f542fe440917425d3c1638952831176a0ece#b636f542fe440917425d3c1638952831176a0ece"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -6007,7 +5932,6 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
- "digest 0.10.7",
  "rand_core 0.6.4",
 ]
 
@@ -7081,7 +7005,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
