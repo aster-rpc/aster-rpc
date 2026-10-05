@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# check-otel-deps.sh -- the observability feature-graph gate (design
+# docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md §2.2, phase O1).
+#
+# Properties a one-line Cargo.toml edit can break without failing any build:
+#
+#   1. The OpenTelemetry SDK stays out of `aster`'s default and `rpc`-only
+#      graphs. `aster-otel` owns the SDK and its exporters (design D1); `aster`
+#      reaches it only through its own opt-in `otel` feature (O2), so a
+#      consumer that never asked for telemetry links none of it.
+#
+#   2. `aster-otel` does not depend on `aster` (D1): the dependency points the
+#      other way, and a cycle-in-waiting would drag the whole runtime into
+#      every binding's telemetry crate.
+#
+#   3. `aster-otel`'s TLS is the rustls + ring stack iroh already links. Its
+#      OTLP client is built with reqwest `rustls-no-provider` and an explicit
+#      ring provider precisely so that aws-lc-rs (a C/asm build) and OpenSSL
+#      (native-tls) never enter the binding graphs.
+#
+#   4. The SDK resolves at the exactly pinned versions (§2.2).
+#
+# Usage: ./scripts/check-otel-deps.sh
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+RESET='\033[0m'
+
+pass() { echo -e "${GREEN}OK${RESET}  $1"; }
+fail() { echo -e "${RED}FAIL${RESET} $1"; exit 1; }
+
+# `-e normal` keeps dev-dependencies out (tests may use whatever they like);
+# `--locked` makes a stale Cargo.lock fail the gate instead of being re-resolved.
+tree() { cargo tree --locked -e normal "$@"; }
+
+# ── 1. No OTel SDK in aster's default and rpc-only graphs ───────────────────
+
+for label in "default" "rpc"; do
+    if [[ "$label" == "default" ]]; then
+        out=$(tree -p aster)
+    else
+        out=$(tree -p aster --no-default-features --features rpc)
+    fi
+    if grep -q '\bopentelemetry_sdk\b' <<<"$out"; then
+        echo "$out" | grep -n 'opentelemetry_sdk' || true
+        fail "opentelemetry_sdk is in aster's '$label' graph; it belongs behind aster-otel"
+    fi
+    pass "no opentelemetry_sdk in aster's '$label' graph"
+done
+
+# ── 2 + 3 + 4. aster-otel's own graph ───────────────────────────────────────
+
+for label in "default" "all-features"; do
+    if [[ "$label" == "default" ]]; then
+        out=$(tree -p aster-otel)
+    else
+        out=$(tree -p aster-otel --all-features)
+    fi
+    # "aster v" does not match "aster-otel v": the crate's own root line.
+    if grep -q '[[:space:]]aster v' <<<"$out"; then
+        fail "aster-otel depends on aster in its '$label' graph (design D1 forbids it)"
+    fi
+    pass "aster-otel does not depend on aster ('$label')"
+    for crate_name in aws-lc-rs aws-lc-sys openssl openssl-sys native-tls; do
+        if grep -q "\\b${crate_name} v" <<<"$out"; then
+            echo "$out" | grep -n "${crate_name} v" || true
+            fail "'$crate_name' is in aster-otel's '$label' graph; OTLP TLS must stay on rustls + ring"
+        fi
+    done
+    pass "no aws-lc / OpenSSL in aster-otel's '$label' graph"
+    for pinned in 'opentelemetry_sdk v0.33.0' 'opentelemetry v0.33.0' 'tracing-opentelemetry v0.34.0'; do
+        if ! grep -q "$pinned" <<<"$out"; then
+            fail "aster-otel's '$label' graph does not resolve the pinned $pinned"
+        fi
+    done
+    pass "pinned OpenTelemetry versions resolve in aster-otel's '$label' graph"
+done
+
+echo -e "\n${GREEN}Observability dependency gate passed.${RESET}"
