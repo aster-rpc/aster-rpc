@@ -33,6 +33,7 @@ import atexit
 import logging
 import os
 import threading
+import warnings
 from typing import Mapping, Sequence
 
 from . import _aster, _logbridge
@@ -162,16 +163,26 @@ def flush(timeout: float = 2.0) -> None:
     _aster.observability_flush(int(timeout * 1000))
 
 
-def shutdown(timeout: float = 2.0) -> bool:
+def shutdown(timeout: float = 5.0) -> bool:
     """Release every reference this process holds on the pipeline: the log
     drain stops, providers flush and stop (unless an ops listener still holds
     the pipeline), spans end and metric instruments are freed (``aster.metrics``
     objects re-declare themselves on next use). Returns whether anything was
-    held. A later :func:`init` starts a new pipeline."""
+    held. A later :func:`init` starts a new pipeline.
+
+    ``timeout`` bounds the wait for each reference (the default matches the
+    exporters' own shutdown bound). A slow exporter does not make this raise:
+    the release has already happened and the flush finishes in the background,
+    so a ``RuntimeWarning`` reports it instead."""
     global _auto
     held = False
     _logbridge.stop(min(timeout, 1.0))
-    while _aster.observability_shutdown(int(timeout * 1000)):
+    while True:
+        try:
+            if not _aster.observability_shutdown(int(timeout * 1000)):
+                break
+        except RuntimeError as e:
+            warnings.warn(str(e), RuntimeWarning, stacklevel=2)
         held = True
     with _lock:
         _auto = False

@@ -396,6 +396,32 @@ async def test_carrier_follows_asyncio_tasks():
     assert await asyncio.create_task(probe()) is None
 
 
+def test_shutdown_timeout_warns_instead_of_raising():
+    # A slow exporter (here an unreachable endpoint with a zero wait) must not
+    # make shutdown raise: the reference is released and the flush finishes in
+    # the background (seen once on a loaded macOS runner with the old 2 s
+    # default).
+    out = child_json(
+        """
+        import json, warnings
+        from aster import observability, tracing
+
+        observability.init(traces=True, otlp_endpoint="http://127.0.0.1:9")
+        with tracing.span("pending"):
+            pass
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            held = observability.shutdown(timeout=0)
+        print(json.dumps({
+            "held": held,
+            "only_runtime_warnings": all(w.category is RuntimeWarning for w in caught),
+            "released": observability._aster.observability_refs() == 0,
+        }))
+        """
+    )
+    assert out == {"held": True, "only_runtime_warnings": True, "released": True}
+
+
 def test_spans_nest_and_record_errors():
     out = child_json(
         """
