@@ -51,8 +51,8 @@ tree() { cargo tree --locked -e normal "$@"; }
 
 # ── 1. No OTel SDK in aster's default and rpc-only graphs ───────────────────
 
-for label in "default" "rpc" "rpc,binding-support,metrics" \
-    "rpc,binding-support,metrics,expose,coordination-client"; do
+for label in "default" "rpc" "rpc,binding-support" \
+    "rpc,binding-support,expose,coordination-client"; do
     if [[ "$label" == "default" ]]; then
         out=$(tree -p aster)
     else
@@ -67,7 +67,7 @@ done
 
 # ── 5. aster's `otel` feature goes through aster-otel only ──────────────────
 
-direct=$(tree -p aster --features rpc,binding-support,metrics,otel,health --depth 1)
+direct=$(tree -p aster --features rpc,binding-support,otel,health --depth 1)
 if ! grep -q 'aster-otel v' <<<"$direct"; then
     fail "aster's 'otel' feature does not depend on aster-otel"
 fi

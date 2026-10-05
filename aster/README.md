@@ -45,7 +45,6 @@ See `examples/quickstart.rs` for an end-to-end persistence round-trip.
 | `gossip` | ✅ | `Node::gossip()` |
 | `discovery` | — | mDNS local discovery config |
 | `hooks` | — | (reserved) |
-| `metrics` | — | `Node::metrics_prometheus()` |
 
 Admission (`Node::take_admission()`) additionally requires the node to be
 started with `AsterConfig::builder().hooks(true)`.

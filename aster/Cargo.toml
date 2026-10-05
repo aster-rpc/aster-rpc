@@ -54,7 +54,6 @@ coordination = [
 coordination-testing = ["coordination"]
 discovery = []
 hooks = []
-metrics = []
 # `aster::ops`: the /healthz, /readyz, /metrics HTTP listener (the Rust home
 # of the Python/TS `HealthServer`), started by `AsterServer` from the
 # `[health]` config. Implies `otel` (design §6, Q15): `/metrics` is the OTel

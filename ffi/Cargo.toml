@@ -24,7 +24,7 @@ aster-otel = { path = "../aster-otel", version = "=0.3.0", features = ["otlp", "
 # profile's "once the binding surfaces it"; the client only, never the voter),
 # and `otel` + `health` since ABI 4.6 (built-in metrics and spans, the ops
 # listener behind `aster_health_*`).
-aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "metrics", "binding-support", "expose", "coordination-client", "otel", "health"] }
+aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "binding-support", "expose", "coordination-client", "otel", "health"] }
 async-trait = "0.1"
 iroh = { workspace = true }
 tokio = { workspace = true }

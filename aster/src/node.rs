@@ -286,12 +286,6 @@ impl Node {
         Gossip::new(self.inner.gossip_client())
     }
 
-    /// Transport-level metrics in Prometheus text exposition format.
-    #[cfg(feature = "metrics")]
-    pub fn metrics_prometheus(&self) -> String {
-        self.inner.transport_metrics_prometheus()
-    }
-
     /// Cleanly shut the node down, flushing persistent state first.
     pub async fn shutdown(self) {
         self.inner.close().await;
