@@ -255,7 +255,10 @@ public class UpcallTests
         up.ServeLeaseSerializer(js);
         using var ser = NativeLeaseSerializer.Foreign(up);
 
-        var r = await Within(ser.AcquireAsync("tree/42", "alice", new LeaseTiming(TimeSpan.FromMilliseconds(600))));
+        // ttl 3 s (renew every 1 s, 300 ms margin): each renewal is a .NET upcall, and a 600 ms ttl
+        // let one slow thread-pool dispatch on a loaded CI host push the self-limit past "now", so
+        // CurrentFence() correctly read null below (seen on CI).
+        var r = await Within(ser.AcquireAsync("tree/42", "alice", new LeaseTiming(TimeSpan.FromSeconds(3))));
         await using var lease = Assert.IsType<AcquireResult.Granted>(r).Lease;
         Assert.Equal(new Fence("tree/42", 1, "alice"), lease.GrantedFence);
         Assert.Equal(1ul, lease.CurrentFence()!.Epoch);
@@ -265,7 +268,7 @@ public class UpcallTests
         Assert.Equal(DenyReason.HeldByOther, bob.Reason);
         Assert.Equal("alice", bob.Snapshot.Holder);
 
-        // Renewals reach .NET (ttl 600 ms -> every 200 ms).
+        // Renewals reach .NET (ttl 3 s -> every 1 s).
         await Eventually(() => js.Seen.Count(o => o is LeaseOp.Renew) >= 2, "renewals");
         Assert.NotNull(lease.CurrentFence());
 
