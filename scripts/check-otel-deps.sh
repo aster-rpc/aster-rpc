@@ -20,6 +20,11 @@
 #
 #   4. The SDK resolves at the exactly pinned versions (§2.2).
 #
+#   5. `aster`'s `otel` feature reaches OpenTelemetry only through `aster-otel`
+#      (O2): no direct `opentelemetry*` / `tracing-opentelemetry` edge, so the
+#      exact pins live in one crate and `aster` uses the API it re-exports.
+#      The binding profile without `otel` stays SDK-free like rule 1.
+#
 # Usage: ./scripts/check-otel-deps.sh
 
 set -euo pipefail
@@ -37,11 +42,11 @@ tree() { cargo tree --locked -e normal "$@"; }
 
 # ── 1. No OTel SDK in aster's default and rpc-only graphs ───────────────────
 
-for label in "default" "rpc"; do
+for label in "default" "rpc" "rpc,binding-support,metrics"; do
     if [[ "$label" == "default" ]]; then
         out=$(tree -p aster)
     else
-        out=$(tree -p aster --no-default-features --features rpc)
+        out=$(tree -p aster --no-default-features --features "$label")
     fi
     if grep -q '\bopentelemetry_sdk\b' <<<"$out"; then
         echo "$out" | grep -n 'opentelemetry_sdk' || true
@@ -49,6 +54,18 @@ for label in "default" "rpc"; do
     fi
     pass "no opentelemetry_sdk in aster's '$label' graph"
 done
+
+# ── 5. aster's `otel` feature goes through aster-otel only ──────────────────
+
+direct=$(tree -p aster --features rpc,binding-support,metrics,otel,health --depth 1)
+if ! grep -q 'aster-otel v' <<<"$direct"; then
+    fail "aster's 'otel' feature does not depend on aster-otel"
+fi
+if grep -Eq '(opentelemetry[a-z_-]*|tracing-opentelemetry) v' <<<"$direct"; then
+    echo "$direct" | grep -En '(opentelemetry[a-z_-]*|tracing-opentelemetry) v' || true
+    fail "aster depends on an OpenTelemetry crate directly; use aster-otel's re-exports"
+fi
+pass "aster's 'otel' feature reaches OpenTelemetry only through aster-otel"
 
 # ── 2 + 3 + 4. aster-otel's own graph ───────────────────────────────────────
 
