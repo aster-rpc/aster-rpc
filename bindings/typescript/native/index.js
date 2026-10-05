@@ -691,6 +691,7 @@ module.exports.leaseCheckFence = nativeBinding.leaseCheckFence
 module.exports.leaseTransition = nativeBinding.leaseTransition
 module.exports.liveSpans = nativeBinding.liveSpans
 module.exports.loadAsterIdentity = nativeBinding.loadAsterIdentity
+module.exports.logEmit = nativeBinding.logEmit
 module.exports.logFilter = nativeBinding.logFilter
 module.exports.logPoll = nativeBinding.logPoll
 module.exports.logSetFilter = nativeBinding.logSetFilter

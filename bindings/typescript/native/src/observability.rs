@@ -615,6 +615,44 @@ pub fn log_set_filter(directives: String) -> Result<()> {
     bridge::set_filter(&directives).map_err(otel_err)
 }
 
+/// Export an application log record through the Rust OTel logs provider
+/// (design 3.4 path B). `level`: 1 error, 2 warn, 3 info, 4 debug, 5 trace.
+/// `timestampNs` 0 = now. A no-op without an OTLP logs exporter. The record
+/// emits no Rust event, so it never reaches the log bridge.
+#[napi]
+pub fn log_emit(
+    level: u32,
+    logger: String,
+    message: String,
+    fields: Option<HashMap<String, String>>,
+    timestamp_ns: Option<f64>,
+    traceparent: Option<String>,
+) -> Result<()> {
+    let level = match level {
+        1 => bridge::LogLevel::Error,
+        2 => bridge::LogLevel::Warn,
+        3 => bridge::LogLevel::Info,
+        4 => bridge::LogLevel::Debug,
+        5 => bridge::LogLevel::Trace,
+        l => return Err(invalid(format!("unknown log level {l}"))),
+    };
+    let context = parent_in(traceparent).map(|c| (c.trace_id, c.span_id, c.trace_flags));
+    let fields = pairs(fields);
+    let view: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    bridge::emit_app_log(&bridge::AppLogRecord {
+        level: Some(level),
+        timestamp_unix_ns: timestamp_ns.map_or(0, |t| t as i64),
+        logger: &logger,
+        message: &message,
+        fields: &view,
+        context,
+    })
+    .map_err(otel_err)
+}
+
 /// The bridge's directives as last set, or `null` when it is not open.
 #[napi]
 pub fn log_filter() -> Option<String> {

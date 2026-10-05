@@ -144,6 +144,7 @@ public class ObservabilityTests : IAsyncLifetime
     {
         Assert.Equal(128, sizeof(ObservabilityConfigNative));
         Assert.Equal(96, sizeof(LogRecordNative));
+        Assert.Equal(72, sizeof(LogEmitNative));
         Assert.Equal(32, sizeof(SpanContextNative));
         Assert.Equal(152, sizeof(SpanRecordNative));
         Assert.Equal(96, sizeof(InstrumentDescNative));
@@ -177,6 +178,50 @@ public class ObservabilityTests : IAsyncLifetime
     }
 
     // ─── Logs ───────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task App_Logs_Are_Exported_Through_The_Rust_Logs_SDK_With_Trace_Ids()
+    {
+        using var receiver = new OtlpReceiver();
+        AsterObservability.Init(new ObservabilityOptions
+        {
+            ServiceName = "o9-pathb", OtlpLogs = true, OtlpEndpoint = receiver.Url, FromEnv = false, LogBridge = false,
+        });
+        using var provider = new AsterLogEmitProvider();
+        var logger = provider.CreateLogger("app.pathb");
+
+        using var source = new ActivitySource("O9.PathB");
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = _ => true,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+        };
+        ActivitySource.AddActivityListener(listener);
+        using var activity = source.StartActivity("work")!;
+        logger.LogWarning("pathb-marker-app {Order}", "o-1");
+
+        // A record the Rust bridge delivered (aster.origin=rust) is not re-emitted.
+        var bridged = new List<KeyValuePair<string, object?>> { new("aster.origin", "rust"), new("{OriginalFormat}", "pathb-marker-rust") };
+        logger.Log(LogLevel.Information, new EventId(0), (IReadOnlyList<KeyValuePair<string, object?>>)bridged, null, (_, _) => "pathb-marker-rust");
+
+        Assert.True(await WaitLogs(receiver, "pathb-marker-app"));
+        Assert.True(receiver.LogsContain("app.pathb"u8));
+        Assert.True(receiver.LogsContain("Order"u8) && receiver.LogsContain("o-1"u8));
+        Assert.True(receiver.LogsContain(Convert.FromHexString(activity.TraceId.ToHexString())));
+        Assert.True(receiver.LogsContain(Convert.FromHexString(activity.SpanId.ToHexString())));
+        Assert.False(receiver.LogsContain("pathb-marker-rust"u8));
+    }
+
+    private static async Task<bool> WaitLogs(OtlpReceiver r, string marker)
+    {
+        var needle = System.Text.Encoding.UTF8.GetBytes(marker);
+        for (int i = 0; i < 100 && !r.LogsContain(needle); i++)
+        {
+            AsterObservability.Flush(TimeSpan.FromSeconds(2));
+            await Task.Delay(100);
+        }
+        return r.LogsContain(needle);
+    }
 
     [Fact]
     public async Task Rust_Logs_Reach_ILogger_With_Trace_Ids_Of_The_Handler()

@@ -2759,6 +2759,14 @@ export declare function liveSpans(): number
  */
 export declare function loadAsterIdentity(path?: string | undefined | null, peerName?: string | undefined | null, role?: string | undefined | null): AsterIdentity | null
 
+/**
+ * Export an application log record through the Rust OTel logs provider
+ * (design 3.4 path B). `level`: 1 error, 2 warn, 3 info, 4 debug, 5 trace.
+ * `timestampNs` 0 = now. A no-op without an OTLP logs exporter. The record
+ * emits no Rust event, so it never reaches the log bridge.
+ */
+export declare function logEmit(level: number, logger: string, message: string, fields?: Record<string, string> | undefined | null, timestampNs?: number | undefined | null, traceparent?: string | undefined | null): void
+
 /** The bridge's directives as last set, or `null` when it is not open. */
 export declare function logFilter(): string | null
 

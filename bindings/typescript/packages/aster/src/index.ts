@@ -536,6 +536,8 @@ export {
   createLogger,
   withRequestContext,
   getRequestContext,
+  emitLog,
+  type EmitLevel,
   type RequestContext,
   type LoggerOptions,
 } from './logging.js';

@@ -63,6 +63,22 @@ internal unsafe struct SpanContextNative
     public uint _p1;
 }
 
+/// <summary><c>aster_log_emit_t</c> (72 bytes): an application log record for <c>aster_log_emit</c>.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct LogEmitNative
+{
+    public uint struct_size;
+    public byte level;
+    public byte _p0;
+    public byte _p1;
+    public byte _p2;
+    public long timestamp_unix_ns;
+    public Bytes logger;
+    public Bytes message;
+    public Bytes fields;
+    public SpanContextNative* context;
+}
+
 /// <summary><c>aster_span_record_t</c> (152 bytes).</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct SpanRecordNative
@@ -142,6 +158,8 @@ internal static unsafe partial class Native
     public static partial int aster_log_dropped(ulong* out_total);
     [LibraryImport(NativeLib, EntryPoint = "aster_log_set_filter")]
     public static partial int aster_log_set_filter(byte* directives, uint len);
+    [LibraryImport(NativeLib, EntryPoint = "aster_log_emit")]
+    public static partial int aster_log_emit(LogEmitNative* rec);
 
     // ─── Metrics ────────────────────────────────────────────────────────────
 

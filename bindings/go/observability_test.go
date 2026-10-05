@@ -28,11 +28,12 @@ import (
 var (
 	obsLogs = &capture{level: LevelTrace}
 
-	obsRecvOnce sync.Once
-	obsRecv     *httptest.Server
-	obsBodiesMu sync.Mutex
-	obsBodies   [][]byte
-	obsOurs     bool // this file's pipeline is the running one; guarded by obs.mu
+	obsRecvOnce  sync.Once
+	obsRecv      *httptest.Server
+	obsBodiesMu  sync.Mutex
+	obsBodies    [][]byte
+	obsLogBodies [][]byte
+	obsOurs      bool // this file's pipeline is the running one; guarded by obs.mu
 )
 
 func obsReceiver() *httptest.Server {
@@ -43,6 +44,11 @@ func obsReceiver() *httptest.Server {
 				if zr, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
 					body, _ = io.ReadAll(zr)
 				}
+			}
+			if strings.HasSuffix(r.URL.Path, "/v1/logs") {
+				obsBodiesMu.Lock()
+				obsLogBodies = append(obsLogBodies, body)
+				obsBodiesMu.Unlock()
 			}
 			if strings.HasSuffix(r.URL.Path, "/v1/traces") {
 				obsBodiesMu.Lock()
@@ -71,7 +77,7 @@ func obsSetup(t *testing.T) {
 	}
 	SetLogger(slog.New(obsLogs))
 	err := InitObservability(ObservabilityConfig{
-		ServiceName: "go-o10-test", OTLPEndpoint: obsReceiver().URL, Traces: true, NoEnv: true,
+		ServiceName: "go-o10-test", OTLPEndpoint: obsReceiver().URL, Traces: true, OTLPLogs: true, NoEnv: true,
 	})
 	if err != nil {
 		t.Fatalf("InitObservability: %v", err)
@@ -663,5 +669,45 @@ func TestObs_StatusAndABIFloor(t *testing.T) {
 	}
 	if ABIMinorRequired != 6 {
 		t.Fatalf("floor %d", ABIMinorRequired)
+	}
+}
+
+// Path B: an application record emitted through EmitHandler reaches the OTLP
+// logs exporter with the context's trace ids, and bridged Rust records are
+// never re-emitted.
+func TestObs_EmitHandlerExportsAppLogs(t *testing.T) {
+	obsSetup(t)
+	ctx, err := WithTraceContext(context.Background(), pureTP, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, _ := SpanContextFromContext(ctx)
+	l := slog.New(NewEmitHandlerNamed(nil, "app.pathb").WithAttrs([]slog.Attr{slog.String("k0", "v0")}))
+	l.InfoContext(ctx, "pathb-marker-app", "order", "o-1")
+	l.Info("pathb-marker-rust", "aster_origin", "rust")
+	if err := FlushObservability(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	has := func(needle []byte) bool {
+		obsBodiesMu.Lock()
+		defer obsBodiesMu.Unlock()
+		for _, b := range obsLogBodies {
+			if bytes.Contains(b, needle) {
+				return true
+			}
+		}
+		return false
+	}
+	waitFor(t, "the app log record at the OTLP receiver", func() bool { return has([]byte("pathb-marker-app")) })
+	for _, want := range []string{"app.pathb", "order", "o-1", "k0"} {
+		if !has([]byte(want)) {
+			t.Errorf("exported logs lack %q", want)
+		}
+	}
+	if !has(sc.TraceID[:]) || !has(sc.SpanID[:]) {
+		t.Error("exported record lacks the context's trace/span ids")
+	}
+	if has([]byte("pathb-marker-rust")) {
+		t.Error("a record marked aster_origin=rust was re-emitted")
 	}
 }

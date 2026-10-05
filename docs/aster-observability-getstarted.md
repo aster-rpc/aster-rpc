@@ -320,6 +320,12 @@ await shutdownObservability();
   health.check('db').set(true);   // created failing
   ```
 
+- **Your own logs over OTLP (path B, opt-in).** `emitLog('info', 'charged', { order })`
+  or `new AsterLogger({ otlp: true, name: 'orders' })` writes your records into the
+  Rust OTel logs SDK with the current trace ids. It exports only when logs export is on
+  (`exportOtlpLogs: true` or `OTEL_LOGS_EXPORTER`), is a quiet no-op otherwise, and cannot
+  loop back into the Rust log bridge.
+
 ### 5.4 Java
 
 Packages `site.aster.otel` and `site.aster.health`. Java uses SLF4J 2.x.
@@ -370,6 +376,12 @@ Tracing.withSpan("db.query", Map.of("db.system", "postgresql"), () -> {
   ```
 
   Standalone: `HealthServer.start(node, "127.0.0.1", 8080)`.
+
+- **Your own logs over OTLP (path B, opt-in).** `LogEmit.emit(Level.INFO, "orders", "charged", Map.of("order", id))`
+  writes a record into the Rust OTel logs SDK with the current trace context;
+  `LogEmit.emit(LoggingEvent)` is the hook for a logging backend's appender (it skips records the
+  Rust bridge delivered, `aster_origin=rust`). Needs `otlpLogs(true)` or `OTEL_LOGS_EXPORTER`;
+  a quiet no-op otherwise.
 
 ### 5.5 .NET
 
@@ -422,6 +434,11 @@ using (var span = Tracing.StartSpan("db.query"))        // an Activity of source
   using var health = HealthServer.Start(node, new HealthOptions { Port = 8080 });
   ```
 
+- **Your own logs over OTLP (path B, opt-in).** `builder.Logging.AddAsterLogEmit()` forwards your
+  `ILogger` records to the Rust OTel logs SDK with the current `Activity` trace ids
+  (`AsterLogEmit.Emit(...)` is the direct call). Records marked `aster.origin=rust` are skipped.
+  Needs `ObservabilityOptions.OtlpLogs = true` or `OTEL_LOGS_EXPORTER`; a quiet no-op otherwise.
+
 ### 5.6 Go
 
 Package `aster` (`github.com/aster-rpc/aster-go`). Logs use `log/slog`.
@@ -468,6 +485,12 @@ err := aster.WithSpan(ctx, "db.query", func(ctx context.Context) error {
   srv.Health().SetCheck("db", true)
   // standalone: h, err := aster.StartHealth(node, &aster.HealthConfig{Host: "127.0.0.1", Port: 8080})
   ```
+
+- **Your own logs over OTLP (path B, opt-in).** Wrap your handler:
+  `slog.New(aster.NewEmitHandler(aster.NewTraceHandler(inner)))`. Records are also written
+  into the Rust OTel logs SDK, with trace ids from the context (`aster.EmitLog` is the direct call).
+  Records the Rust bridge delivered (`aster_origin=rust`) are not re-emitted. Needs
+  `OTLPLogs: true` or `OTEL_LOGS_EXPORTER`; a quiet no-op otherwise.
 
 ## 6. Quick checks
 

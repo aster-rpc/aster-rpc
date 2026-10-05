@@ -77,6 +77,8 @@ final class OtelNative {
   static final MethodHandle LOG_SET_FILTER =
       h("aster_log_set_filter", FunctionDescriptor.of(I32, PTR, I32));
 
+  static final MethodHandle LOG_EMIT = h("aster_log_emit", FunctionDescriptor.of(I32, PTR));
+
   static final MethodHandle INSTRUMENT_NEW =
       h("aster_instrument_new", FunctionDescriptor.of(I32, PTR, PTR));
   static final MethodHandle INSTRUMENT_FREE =

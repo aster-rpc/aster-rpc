@@ -44,6 +44,19 @@ public sealed class OtlpReceiver : IDisposable
 
     public IReadOnlyList<ExportedSpan> Spans => _spans.ToArray();
 
+    private readonly ConcurrentQueue<byte[]> _logBodies = new();
+
+    /// <summary>Raw OTLP log export bodies (<c>POST /v1/logs</c>), decompressed.</summary>
+    public IReadOnlyList<byte[]> LogBodies => _logBodies.ToArray();
+
+    /// <summary>Whether any received log export contains <paramref name="needle"/> as raw bytes.</summary>
+    public bool LogsContain(ReadOnlySpan<byte> needle)
+    {
+        foreach (var b in _logBodies)
+            if (b.AsSpan().IndexOf(needle) >= 0) return true;
+        return false;
+    }
+
     private async Task Loop()
     {
         while (!_stop.IsCancellationRequested)
@@ -65,6 +78,8 @@ public sealed class OtlpReceiver : IDisposable
                 }
                 if (ctx.Request.Url!.AbsolutePath.EndsWith("/v1/traces", StringComparison.Ordinal))
                     foreach (var s in Protobuf.ParseTraces(body)) _spans.Enqueue(s);
+                else if (ctx.Request.Url!.AbsolutePath.EndsWith("/v1/logs", StringComparison.Ordinal))
+                    _logBodies.Enqueue(body);
                 ctx.Response.StatusCode = 200;
                 ctx.Response.ContentType = "application/x-protobuf";
                 ctx.Response.ContentLength64 = 0;
