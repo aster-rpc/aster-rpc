@@ -371,26 +371,30 @@ public class ClientInterceptorTests : IAsyncLifetime
     [Fact]
     public async Task Deadline_Interceptor_Passes_The_Remaining_Time_To_Each_Attempt()
     {
-        // The first attempt fails fast; the retry waits 1.5 s. The server reports the time left on the
-        // deadline it received: with a deadline interceptor the retry is sent ~8.5 s of the 10 s budget.
+        // The first attempt fails fast; the retry waits 2.5 s. The server reports the time left on the
+        // deadline it received, which travels in whole seconds (rounded up): with a deadline interceptor
+        // the retry is sent ~7.5 s of the 10 s budget, so its header says 8 s and the handler can never
+        // see more than that. A full-deadline attempt says 10 s. The handler measures when it runs, so
+        // dispatch delay under a loaded parallel suite (seen at ~1 s on CI) is subtracted from both;
+        // the thresholds leave 1.5 s for it.
         var o = new CallOptions { Idempotent = true, Deadline = TimeSpan.FromSeconds(10) };
         _flakyFailUntil = 1;
-        var bounded = _conn.WithInterceptors([new DeadlineInterceptor(), new RetryInterceptor(2, null, 1500, 1500, 2.0, 0.0)]);
+        var bounded = _conn.WithInterceptors([new DeadlineInterceptor(), new RetryInterceptor(2, null, 2500, 2500, 2.0, 0.0)]);
         await bounded.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), o);
         var seen = _flakyRemaining.ToArray();
         Assert.Equal(2, seen.Length);
-        Assert.True(seen[0] > 9.0, $"first {seen[0]}");
-        Assert.True(seen[1] < seen[0] - 0.5, $"second {seen[1]} should be shorter than first {seen[0]}");
+        Assert.True(seen[0] > 8.5, $"first {seen[0]}");
+        Assert.True(seen[1] <= 8.05, $"second {seen[1]} should be at most the 8 s left after the back-off");
 
         // Without one every attempt gets the full deadline.
         _flakyCalls = 0;
         _flakyFailUntil = 1;
         while (_flakyRemaining.TryDequeue(out _)) { }
-        var plain = _conn.WithInterceptors([new RetryInterceptor(2, null, 1500, 1500, 2.0, 0.0)]);
+        var plain = _conn.WithInterceptors([new RetryInterceptor(2, null, 2500, 2500, 2.0, 0.0)]);
         await plain.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), o);
         seen = _flakyRemaining.ToArray();
         Assert.Equal(2, seen.Length);
-        Assert.True(seen.All(s => s > 9.0), string.Join(",", seen));
+        Assert.True(seen.All(s => s > 8.5), string.Join(",", seen));
     }
 
     [Fact]
