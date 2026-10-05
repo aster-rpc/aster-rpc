@@ -196,7 +196,7 @@ public final class AsterServer implements AutoCloseable {
     return node.nodeId();
   }
 
-  /** The ops listener attached via {@link Builder#health}, or {@code null}. */
+  /** The ops listener attached via {@link Builder#health} or started from config, or null. */
   public site.aster.health.HealthServer health() {
     return health;
   }
@@ -838,6 +838,11 @@ public final class AsterServer implements AutoCloseable {
         boolean owned = false;
         if (attached == null && healthPort >= 0) {
           attached = site.aster.health.HealthServer.start(node, healthHost, healthPort);
+          owned = true;
+        } else if (attached == null && config != null && config.isHealthEnabled()) {
+          // Explicit builder health(...) wins; otherwise the config (ASTER_HEALTH_*, [health]).
+          attached =
+              site.aster.health.HealthServer.start(node, config.healthHost(), config.healthPort());
           owned = true;
         }
         try {

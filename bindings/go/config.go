@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -100,6 +101,24 @@ type AsterConfig struct {
 	LogFormat                string // "text" or "json"
 	LogLevel                 string
 	LogMask                  bool
+
+	// Ops listener (/healthz, /readyz, /metrics; Rust aster::ops). Env
+	// ASTER_HEALTH_PORT / _HOST / _ENABLED; TOML [health] port / host / enabled.
+	// HealthPort 0 = disabled unless HealthEnabled is true (then ephemeral).
+	HealthPort uint16
+	// HealthHost: "" = 127.0.0.1 (localhost only; pod probes need "0.0.0.0").
+	HealthHost string
+	// HealthEnabled forces the listener on or off; nil = on when HealthPort != 0.
+	HealthEnabled *bool
+}
+
+// IsHealthEnabled reports whether StartServer starts the ops listener from
+// this config: HealthEnabled when set, else HealthPort != 0.
+func (c *AsterConfig) IsHealthEnabled() bool {
+	if c.HealthEnabled != nil {
+		return *c.HealthEnabled
+	}
+	return c.HealthPort != 0
 }
 
 func bindingDefaults(c *AsterConfig) {
@@ -107,6 +126,7 @@ func bindingDefaults(c *AsterConfig) {
 	c.LogFormat = "text"
 	c.LogLevel = "info"
 	c.LogMask = true
+	c.HealthHost = "127.0.0.1"
 }
 
 // DefaultConfig returns the Rust defaults (aster_config_init).
@@ -130,7 +150,9 @@ func ConfigFromEnv() (AsterConfig, error) {
 	var c AsterConfig
 	bindingDefaults(&c)
 	c.fromNative(&n)
-	c.applyBindingEnv()
+	if err := c.applyBindingEnv(); err != nil {
+		return AsterConfig{}, err
+	}
 	return c, nil
 }
 
@@ -151,7 +173,9 @@ func ConfigFromTOML(path string) (AsterConfig, error) {
 	if err := c.applyBindingTOML(path); err != nil {
 		return AsterConfig{}, err
 	}
-	c.applyBindingEnv()
+	if err := c.applyBindingEnv(); err != nil {
+		return AsterConfig{}, err
+	}
 	return c, nil
 }
 
@@ -364,6 +388,11 @@ type tomlBinding struct {
 		Level  string `toml:"level"`
 		Mask   *bool  `toml:"mask"`
 	} `toml:"logging"`
+	Health struct {
+		Port    *int64 `toml:"port"`
+		Host    string `toml:"host"`
+		Enabled *bool  `toml:"enabled"`
+	} `toml:"health"`
 }
 
 func (c *AsterConfig) applyBindingTOML(path string) error {
@@ -402,10 +431,21 @@ func (c *AsterConfig) applyBindingTOML(path string) error {
 	if tc.Logging.Mask != nil {
 		c.LogMask = *tc.Logging.Mask
 	}
+	if tc.Health.Port != nil {
+		if *tc.Health.Port < 0 || *tc.Health.Port > 65535 {
+			return fmt.Errorf("%s: health.port out of range: %d: %w", path, *tc.Health.Port, ErrInvalidArgument)
+		}
+		c.HealthPort = uint16(*tc.Health.Port)
+	}
+	setStr(&c.HealthHost, tc.Health.Host)
+	if tc.Health.Enabled != nil {
+		v := *tc.Health.Enabled
+		c.HealthEnabled = &v
+	}
 	return nil
 }
 
-func (c *AsterConfig) applyBindingEnv() {
+func (c *AsterConfig) applyBindingEnv() error {
 	env := func(k string) string { return strings.TrimSpace(os.Getenv(k)) }
 	envBool := func(k string, dst *bool) {
 		switch strings.ToLower(env(k)) {
@@ -438,4 +478,21 @@ func (c *AsterConfig) applyBindingEnv() {
 		c.LogLevel = strings.ToLower(v)
 	}
 	envBool("ASTER_LOG_MASK", &c.LogMask)
+	if v := env("ASTER_HEALTH_PORT"); v != "" {
+		p, err := strconv.ParseUint(v, 10, 16)
+		if err != nil {
+			return fmt.Errorf("ASTER_HEALTH_PORT: expected a port number, got %q: %w", v, ErrInvalidArgument)
+		}
+		c.HealthPort = uint16(p)
+	}
+	setStr(&c.HealthHost, "ASTER_HEALTH_HOST")
+	switch strings.ToLower(env("ASTER_HEALTH_ENABLED")) {
+	case "true", "1", "yes", "on":
+		t := true
+		c.HealthEnabled = &t
+	case "false", "0", "no", "off":
+		f := false
+		c.HealthEnabled = &f
+	}
+	return nil
 }

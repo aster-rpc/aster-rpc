@@ -115,7 +115,10 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
         {
             node = await Node.StartAsync(config, gate, [AsterAlpn, ConsumerAdmissionAlpn], cancellationToken).ConfigureAwait(false);
             var byIndex = new ServiceDefinition[services.Count];
-            if (options.Health is { } healthOptions)
+            // Explicit options win; otherwise the config (ASTER_HEALTH_*, [health]).
+            var healthOptions = options.Health
+                ?? (config.IsHealthEnabled ? new HealthOptions { Host = config.HealthHost, Port = config.HealthPort } : null);
+            if (healthOptions is not null)
                 health = await HealthServer.StartAsync(node, healthOptions).ConfigureAwait(false);
             DispatchServer dispatch;
             using (var builder = new DispatchServer.Builder(node.Runtime.Handle, node.Handle.Value))
@@ -486,7 +489,8 @@ public sealed class AsterServerOptions
 
     /// <summary>
     /// Starts the ops listener (<c>/healthz</c>, <c>/readyz</c>, <c>/metrics</c>) on the server's node and
-    /// attaches it: ready after a successful start, not ready first on dispose. Null = no listener.
+    /// attaches it: ready after a successful start, not ready first on dispose. Null = the listener the
+    /// config asks for (<see cref="AsterConfig.HealthPort"/> / <see cref="AsterConfig.HealthEnabled"/>), if any.
     /// </summary>
     public HealthOptions? Health { get; init; }
 

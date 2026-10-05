@@ -66,7 +66,8 @@ type ServerOptions struct {
 	// Health, if set, starts an ops listener (/healthz, /readyz, /metrics)
 	// for the server's node and ties its readiness to the server: ready once
 	// the server serves, not ready first on Close. Reach it with
-	// AsterServer.Health. Nil = no listener.
+	// AsterServer.Health. Nil = the listener Config asks for (HealthPort /
+	// HealthEnabled, i.e. ASTER_HEALTH_* or [health]), if any.
 	Health *HealthConfig
 }
 
@@ -172,8 +173,12 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	}
 	EnsureObservability()
 	var health *HealthServer
-	if opts.Health != nil {
-		if health, err = StartHealth(node, opts.Health); err != nil {
+	healthCfg := opts.Health
+	if healthCfg == nil && opts.Config.IsHealthEnabled() {
+		healthCfg = &HealthConfig{Host: opts.Config.HealthHost, Port: opts.Config.HealthPort}
+	}
+	if healthCfg != nil {
+		if health, err = StartHealth(node, healthCfg); err != nil {
 			_ = node.Close()
 			return fail(err)
 		}

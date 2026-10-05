@@ -96,6 +96,17 @@ public sealed record AsterConfig
     public string LogLevel { get; init; } = "info";
     public bool LogMask { get; init; } = true;
 
+    // ── Ops endpoints (/healthz, /readyz, /metrics; Rust aster::ops) ──────
+
+    /// <summary>TCP port of the ops listener (<c>ASTER_HEALTH_PORT</c>, <c>[health] port</c>). 0 = disabled unless <see cref="HealthEnabled"/>.</summary>
+    public ushort HealthPort { get; init; }
+    /// <summary>Bind host (<c>ASTER_HEALTH_HOST</c>, <c>[health] host</c>); localhost only by default, pod probes need <c>0.0.0.0</c>.</summary>
+    public string HealthHost { get; init; } = "127.0.0.1";
+    /// <summary>Forces the listener on or off (<c>ASTER_HEALTH_ENABLED</c>, <c>[health] enabled</c>); <c>null</c> enables it when <see cref="HealthPort"/> is not 0.</summary>
+    public bool? HealthEnabled { get; init; }
+    /// <summary>Whether the ops listener should run: <see cref="HealthEnabled"/> when set, else <c>HealthPort != 0</c>.</summary>
+    public bool IsHealthEnabled => HealthEnabled ?? HealthPort != 0;
+
     // ── Factories ─────────────────────────────────────────────────────────
 
     /// <summary>The Rust defaults (<c>aster_config_init</c>).</summary>
@@ -281,6 +292,14 @@ public sealed record AsterConfig
             EndpointAddr = S(Sec("connect"), "endpoint_addr") ?? c.EndpointAddr,
         };
         var log = Sec("logging");
+        var health = Sec("health");
+        c = c with
+        {
+            HealthPort = health != null && health.TryGetValue("port", out var hp) && hp is long port
+                ? ToPort(port, "[health] port") : c.HealthPort,
+            HealthHost = S(health, "host") ?? c.HealthHost,
+            HealthEnabled = B(health, "enabled") ?? c.HealthEnabled,
+        };
         return c with
         {
             LogFormat = S(log, "format")?.ToLowerInvariant() ?? c.LogFormat,
@@ -315,8 +334,17 @@ public sealed record AsterConfig
             LogFormat = Env("ASTER_LOG_FORMAT")?.ToLowerInvariant() ?? LogFormat,
             LogLevel = Env("ASTER_LOG_LEVEL")?.ToLowerInvariant() ?? LogLevel,
             LogMask = EnvBool("ASTER_LOG_MASK") ?? LogMask,
+            HealthPort = Env("ASTER_HEALTH_PORT") is { } hp
+                ? (long.TryParse(hp, out var port) ? ToPort(port, "ASTER_HEALTH_PORT")
+                    : throw new FormatException($"ASTER_HEALTH_PORT: expected a port number, got \"{hp}\""))
+                : HealthPort,
+            HealthHost = Env("ASTER_HEALTH_HOST") ?? HealthHost,
+            HealthEnabled = EnvBool("ASTER_HEALTH_ENABLED") ?? HealthEnabled,
         };
     }
+
+    private static ushort ToPort(long v, string what)
+        => v is >= 0 and <= ushort.MaxValue ? (ushort)v : throw new FormatException($"{what}: out of range: {v}");
 
     /// <summary>Redacts the secret key.</summary>
     public override string ToString()

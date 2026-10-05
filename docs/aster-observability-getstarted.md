@@ -123,8 +123,13 @@ languages stays in one trace.
 
 ## 4. Health
 
-Enable the listener with `ASTER_HEALTH_PORT` (or the `[health]` TOML table, or
-your language's server option), or start one yourself against a node.
+Enable the listener with `ASTER_HEALTH_PORT` (or the `[health]` TOML table
+with `port`, `host`, `enabled`, or your language's config field or server
+option), or start one yourself against a node. Every binding's `AsterConfig`
+carries the same three settings (`health_port` = 0, `health_host` =
+`127.0.0.1`, `health_enabled` = unset): the listener runs when `enabled` is
+true, or when it is unset and the port is not 0. An explicit server option
+wins over the config.
 
 | Route | Meaning |
 |---|---|
@@ -351,14 +356,16 @@ Tracing.withSpan("db.query", Map.of("db.system", "postgresql"), () -> {
       Map.of(),
       () -> client.call(addr, "orders", "getOrder", req, Order.class).get(15, TimeUnit.SECONDS));
   ```
-- **Health.** Java's `AsterConfig` has no health fields, so there is no
-  config-driven start: attach the listener explicitly.
+- **Health.** `AsterConfig` carries `healthPort` / `healthHost` / `healthEnabled`
+  (`ASTER_HEALTH_*`, `[health]`), and `AsterServer` starts the listener from
+  them. A builder `.health(...)` call overrides the config.
 
   ```java
   AsterServer server = AsterServer.builder()
+      .config(AsterConfig.builder().healthPort(8080).build())   // or ASTER_HEALTH_PORT=8080
       /* ... services ... */
-      .health("127.0.0.1", 8080)      // ready after start; closed with the server
-      .build().get();
+      // or explicitly: .health("127.0.0.1", 8080)
+      .build().get();             // ready after start; closed with the server
   server.health().check("db").set(true);
   ```
 
@@ -403,10 +410,13 @@ using (var span = Tracing.StartSpan("db.query"))        // an Activity of source
 
   Do not also subscribe the OpenTelemetry .NET SDK to the `Aster` activity
   source: Aster exports those spans itself, and doing both double-exports.
-- **Health.** No `AsterConfig` fields; pass options on the server, or start one:
+- **Health.** `AsterConfig` has `HealthPort` / `HealthHost` / `HealthEnabled`
+  (`ASTER_HEALTH_*`, `[health]`) and `AsterServer` starts the listener from them;
+  `AsterServerOptions.Health` overrides the config:
 
   ```csharp
-  var server = await AsterServer.StartAsync(new AsterServerOptions { /* ... */ Health = new HealthOptions { Port = 8080 } });
+  var server = await AsterServer.StartAsync(new AsterServerOptions { /* ... */ Config = AsterConfig.FromEnv() with { HealthPort = 8080 } });
+  // or explicitly: Health = new HealthOptions { Port = 8080 }
   server.Health?.Check("db").Set(true);
   // standalone:
   using var health = HealthServer.Start(node, new HealthOptions { Port = 8080 });
@@ -447,10 +457,14 @@ err := aster.WithSpan(ctx, "db.query", func(ctx context.Context) error {
       "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", nil)
   r, err := aster.Call[GetOrder, Order](tctx, conn, "orders", "getOrder", &req)
   ```
-- **Health.** `ServerOptions.Health` starts the listener with the server:
+- **Health.** `AsterConfig` has `HealthPort` / `HealthHost` / `HealthEnabled`
+  (`ASTER_HEALTH_*` through `ConfigFromEnv`, `[health]` through `ConfigFromTOML`) and
+  `StartServer` starts the listener from them; `ServerOptions.Health` overrides:
 
   ```go
-  srv, err := aster.StartServer(ctx, aster.ServerOptions{ /* ... */ Health: &aster.HealthConfig{Port: 8080}})
+  cfg, _ := aster.ConfigFromEnv()   // or: cfg.HealthPort = 8080
+  srv, err := aster.StartServer(ctx, aster.ServerOptions{Config: cfg /* ... */})
+  // or explicitly: Health: &aster.HealthConfig{Port: 8080}
   srv.Health().SetCheck("db", true)
   // standalone: h, err := aster.StartHealth(node, &aster.HealthConfig{Host: "127.0.0.1", Port: 8080})
   ```

@@ -601,6 +601,46 @@ public class ObservabilityTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Server_Starts_Health_From_Config()
+    {
+        var svc = ServiceDefinition.Create("O9Echo", 1)
+            .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply { Message = req.Message }))
+            .Build();
+        await using var server = await AsterServer.StartAsync(new AsterServerOptions
+        {
+            Config = Loopback with { AllowAllConsumers = true, HealthEnabled = true }, // port 0 + enabled: ephemeral
+            Services = { svc },
+        });
+        var health = server.Health;
+        Assert.NotNull(health);
+        Assert.StartsWith("127.0.0.1:", health!.Address);
+        Assert.Equal(HttpStatusCode.OK, (await ProbeAsync(health.BaseUrl + "/healthz")).Code);
+    }
+
+    [Fact]
+    public void Health_Config_Defaults_And_Toml()
+    {
+        var d = new AsterConfig();
+        Assert.Equal((ushort)0, d.HealthPort);
+        Assert.Equal("127.0.0.1", d.HealthHost);
+        Assert.Null(d.HealthEnabled);
+        Assert.False(d.IsHealthEnabled);
+        Assert.True((d with { HealthPort = 8080 }).IsHealthEnabled);
+        Assert.False((d with { HealthPort = 8080, HealthEnabled = false }).IsHealthEnabled);
+
+        string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"aster-{Guid.NewGuid():N}.toml");
+        System.IO.File.WriteAllText(path, "[health]\nport = 9091\nhost = \"10.0.0.5\"\nenabled = false\n");
+        try
+        {
+            var c = AsterConfig.FromToml(path);
+            Assert.Equal((ushort)9091, c.HealthPort);
+            Assert.Equal("10.0.0.5", c.HealthHost);
+            Assert.False(c.HealthEnabled);
+        }
+        finally { System.IO.File.Delete(path); }
+    }
+
+    [Fact]
     public void Prometheus_Accessor_Is_Null_Without_A_Pull_Reader()
     {
         Assert.Null(AsterObservability.MetricsText());

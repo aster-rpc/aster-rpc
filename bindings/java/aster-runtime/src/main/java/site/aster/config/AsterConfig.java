@@ -87,6 +87,11 @@ public final class AsterConfig {
   private String logLevel = "info";
   private boolean logMask = true;
 
+  // ── Ops endpoints (/healthz, /readyz, /metrics; Rust aster::ops) ───────
+  private int healthPort;
+  private String healthHost = "127.0.0.1";
+  private Boolean healthEnabled;
+
   // ── Identity ───────────────────────────────────────────────────────────
   private String identityFile;
 
@@ -261,6 +266,28 @@ public final class AsterConfig {
 
   public String identityFile() {
     return identityFile;
+  }
+
+  /** TCP port of the ops listener; {@code 0} = disabled unless {@link #healthEnabled()}. */
+  public int healthPort() {
+    return healthPort;
+  }
+
+  /** Bind host of the ops listener (localhost only by default; pod probes need 0.0.0.0). */
+  public String healthHost() {
+    return healthHost;
+  }
+
+  /**
+   * Forces the ops listener on or off; {@code null} enables it when {@link #healthPort()} is not 0.
+   */
+  public Boolean healthEnabled() {
+    return healthEnabled;
+  }
+
+  /** Whether the ops listener should run: {@link #healthEnabled()} when set, else port != 0. */
+  public boolean isHealthEnabled() {
+    return healthEnabled != null ? healthEnabled : healthPort != 0;
   }
 
   // ── Factory ────────────────────────────────────────────────────────────
@@ -543,6 +570,28 @@ public final class AsterConfig {
       return this;
     }
 
+    // Ops endpoints
+    /** Ops listener port ({@code ASTER_HEALTH_PORT}, {@code [health] port}); 0 = off. */
+    public Builder healthPort(int port) {
+      if (port < 0 || port > 65535) {
+        throw new IllegalArgumentException("health port out of range: " + port);
+      }
+      c.healthPort = port;
+      return this;
+    }
+
+    /** Ops listener bind host ({@code ASTER_HEALTH_HOST}, {@code [health] host}). */
+    public Builder healthHost(String host) {
+      c.healthHost = host;
+      return this;
+    }
+
+    /** Force the ops listener on/off ({@code ASTER_HEALTH_ENABLED}, {@code [health] enabled}). */
+    public Builder healthEnabled(Boolean v) {
+      c.healthEnabled = v;
+      return this;
+    }
+
     // Identity
     public Builder identityFile(String path) {
       c.identityFile = path;
@@ -584,6 +633,16 @@ public final class AsterConfig {
           tomlString(logging, "level", v -> c.logLevel = v.toLowerCase());
           tomlBool(logging, "mask", v -> c.logMask = v);
         }
+
+        // [health]
+        TomlTable health = toml.getTable("health");
+        if (health != null) {
+          if (health.contains("port")) {
+            healthPort(Math.toIntExact(health.getLong("port")));
+          }
+          tomlString(health, "host", v -> c.healthHost = v);
+          tomlBool(health, "enabled", v -> c.healthEnabled = v);
+        }
       } catch (Exception e) {
         throw new RuntimeException(
             "Failed to parse TOML config: " + path + ": " + e.getMessage(), e);
@@ -607,6 +666,19 @@ public final class AsterConfig {
       envBool("ASTER_ALLOW_ALL_CONSUMERS", v -> c.allowAllConsumers = v);
       envBool("ASTER_ALLOW_ALL_PRODUCERS", v -> c.allowAllProducers = v);
       envBool("ASTER_LOG_MASK", v -> c.logMask = v);
+
+      envString(
+          "ASTER_HEALTH_PORT",
+          v -> {
+            try {
+              healthPort(Integer.parseInt(v));
+            } catch (NumberFormatException e) {
+              throw new IllegalArgumentException(
+                  "ASTER_HEALTH_PORT: expected a port number, got \"" + v + "\"", e);
+            }
+          });
+      envString("ASTER_HEALTH_HOST", v -> c.healthHost = v);
+      envBool("ASTER_HEALTH_ENABLED", v -> c.healthEnabled = v);
 
       envBytes("ASTER_ROOT_PUBKEY", v -> c.rootPubkey = v);
 
