@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"log"
+	"log/slog"
 	"sort"
 	"strconv"
 	"sync"
@@ -59,8 +59,15 @@ type ServerOptions struct {
 	// connection on an ALPN other than aster/1 (e.g. the consumer-admission
 	// ALPN); the handler owns conn and must Close it. Default: closed.
 	OnNonRPC func(alpn string, conn *Connection)
-	// Logger receives response failures (default: the standard logger).
-	Logger *log.Logger
+	// Logger receives the server's own messages, such as response failures
+	// (default: the logger set with SetLogger, else slog.Default()). Rust log
+	// records go to SetLogger's logger.
+	Logger *slog.Logger
+	// Health, if set, starts an ops listener (/healthz, /readyz, /metrics)
+	// for the server's node and ties its readiness to the server: ready once
+	// the server serves, not ready first on Close. Reach it with
+	// AsterServer.Health. Nil = no listener.
+	Health *HealthConfig
 }
 
 // AsterServer serves Services over aster/1 through Rust's aster::rpc::Server
@@ -83,7 +90,8 @@ type AsterServer struct {
 	icpts     []Interceptor
 	onClosed  func(uint64, string)
 	onNonRPC  func(string, *Connection)
-	logger    *log.Logger
+	logger    *slog.Logger
+	health    *HealthServer
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -162,7 +170,16 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	if err != nil {
 		return fail(err)
 	}
+	EnsureObservability()
+	var health *HealthServer
+	if opts.Health != nil {
+		if health, err = StartHealth(node, opts.Health); err != nil {
+			_ = node.Close()
+			return fail(err)
+		}
+	}
 	settings := serverSettings{
+		health:          health,
 		disableNodeInfo: opts.DisableNodeInfo,
 		topology:        opts.Topology,
 		ringCapacity:    opts.RingCapacity,
@@ -179,19 +196,22 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	}
 	ds, err := startDispatchServer(node, jsons, settings)
 	if err != nil {
+		if health != nil {
+			_ = health.Stop()
+		}
 		_ = node.Close()
 		return fail(err)
 	}
 	logger := opts.Logger
 	if logger == nil {
-		logger = log.Default()
+		logger = currentLogger()
 	}
 	sctx, cancel := context.WithCancel(context.Background())
 	s := &AsterServer{
 		node: node, gate: gate, ownedGate: owned, ds: ds, codec: codec,
 		byIndex: append([]*Service(nil), opts.Services...), icpts: opts.Interceptors,
 		onClosed: opts.OnConnectionClosed, onNonRPC: opts.OnNonRPC,
-		logger: logger, ctx: sctx, cancel: cancel,
+		logger: logger, health: health, ctx: sctx, cancel: cancel,
 		cancels: map[uint64]callCancel{}, sessions: map[uint64]*sessionRecord{},
 		peers: map[uint64]string{},
 	}
@@ -199,6 +219,9 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	go s.pollLoop()
 	return s, nil
 }
+
+// Health is the ops listener started from ServerOptions.Health (nil if none).
+func (s *AsterServer) Health() *HealthServer { return s.health }
 
 // Node is the server's node.
 func (s *AsterServer) Node() *Node { return s.node }
@@ -254,7 +277,10 @@ func (s *AsterServer) Close() error {
 	case <-callsDone:
 	case <-time.After(2 * time.Second):
 	}
-	err := s.ds.destroy()
+	err := s.ds.destroy() // clears the attached listener's ready flag first
+	if s.health != nil {
+		err = errors.Join(err, s.health.Stop())
+	}
 	s.mu.Lock()
 	sessions := s.sessions
 	s.sessions = map[uint64]*sessionRecord{}
@@ -468,6 +494,10 @@ func (s *AsterServer) serve(in inbound) {
 		defer dcancel()
 	}
 	ctx = context.WithValue(ctx, callInfoKey{}, info)
+	// The server span's context and the inbound baggage ride in ctx: spans and
+	// logs started from a handler nest under the call, and outbound calls
+	// continue the trace.
+	ctx = s.ds.callTraceContext(ctx, in.callID, in.flags, info.Metadata)
 
 	call := &serverCall{
 		ds: s.ds, callID: in.callID, first: in.request, firstIsEnd: in.firstIsEnd,
@@ -488,7 +518,9 @@ func (s *AsterServer) serve(in inbound) {
 		st = RpcStatus{Code: StatusUnavailable, Message: "server shutting down"}
 	}
 	if err := call.complete(st); err != nil && !errors.Is(err, errCallGone) {
-		s.logger.Printf("aster: trailer for call %d failed: %v", in.callID, err)
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "aster: trailer failed",
+			slog.Uint64("call_id", in.callID), slog.String("service", in.svc.Name),
+			slog.String("method", in.method.Name), slog.Any("error", err))
 	}
 }
 

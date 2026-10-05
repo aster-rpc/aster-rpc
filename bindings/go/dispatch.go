@@ -46,6 +46,8 @@ const (
 	dispatchFlagIrohAuthenticated = C.ASTER_DISPATCH_FLAG_IROH_AUTHENTICATED
 	dispatchFlagHasMetadata       = C.ASTER_DISPATCH_FLAG_HAS_METADATA
 	dispatchFlagHasAttributes     = C.ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES
+	dispatchFlagHasTrace          = C.ASTER_DISPATCH_FLAG_HAS_TRACE
+	dispatchFlagHasInboundTrace   = C.ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE
 )
 
 // aster_server_option_t.
@@ -85,6 +87,7 @@ type serverSettings struct {
 	handlerTimeoutMs         uint64
 	setHandlerTimeout        bool
 	ringCapacity             uint32
+	health                   *HealthServer // attached before start (readiness)
 }
 
 // startDispatchServer registers every service JSON (in order: the index is
@@ -129,6 +132,11 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 	}
 	if err := errors.Join(errs...); err != nil {
 		return fail("aster_server_set_option", err)
+	}
+	if s.health != nil {
+		if err := statusError(C.aster_server_attach_health(b, C.uint64_t(s.health.handle))); err != nil {
+			return fail("aster_server_attach_health", err)
+		}
 	}
 	var h C.aster_server_t
 	// aster_server_start consumes the builder whatever the outcome.

@@ -278,7 +278,7 @@ func lowerOptions(ctx context.Context, service, method string, o *callOptions) (
 		ms := math.Ceil(float64(left) / float64(time.Millisecond))
 		deadlineMs = uint32(min(ms, math.MaxUint32-1))
 	}
-	md := encodeKV(o.metadata)
+	md := encodeKV(injectTrace(ctx, o.metadata))
 	size := unsafe.Sizeof(C.aster_call_options_t{})
 	total := size + uintptr(len(service)+len(method)+len(md))
 	p := C.calloc(1, C.size_t(total))
