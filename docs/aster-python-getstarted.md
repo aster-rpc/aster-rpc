@@ -628,6 +628,10 @@ and hold `reg` while the routes should stay live.
 
 ## 10. Observability: logs, metrics, traces, health
 
+The same pipeline serves all six languages; see the
+[observability guide](aster-observability-getstarted.md) for the shared
+configuration, metric names and the other bindings.
+
 The whole pipeline lives in Rust (`aster-otel`); Python starts it and reads
 from it. Configuration is parsed once, in Rust: `observability.init(...)`
 arguments, then `OTEL_*` / `ASTER_*` environment variables, then the
@@ -656,7 +660,8 @@ with tracing.span("db.query", {"db.system": "postgresql"}):
   and gauges on the same pipeline. There is no `MetricsInterceptor`.
 - **Traces.** `aster.tracing.span` / `traced`; inside a handler the current trace
   is the call's server span, and outbound calls continue it (`traceparent` in the
-  call metadata).
+  call metadata). An inbound trace continues even with no exporter configured
+  (or traces off): `tracing.current_trace_id()` and outbound calls still see it.
 - **Health.** `AsterConfig(health_port=8080)` (or `ASTER_HEALTH_PORT`, `[health]`)
   makes `AsterServer` serve `/healthz`, `/readyz` and Prometheus `/metrics`
   (`server.health`). Standalone: `await HealthServer.start(node, host, port)`;

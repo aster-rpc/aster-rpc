@@ -212,6 +212,13 @@ bare `Node` needs no extra wiring. `aster::ops::route` serves the same routes
 from another HTTP stack, and `aster::ops::metrics_text()` returns the scrape
 body.
 
+With feature `otel`, `aster::rpc::current_trace_context()` returns the trace
+context of the running code (the current span's, else the inbound `traceparent`
+of the call a Rust-native handler is serving, even with no exporter), and
+`aster::rpc::with_trace_context(ctx, fut)` runs a future so that its client
+calls carry `ctx`. Logs, metrics and traces for all six languages are covered
+in the [observability guide](aster-observability-getstarted.md).
+
 The ALPNs are exported as `aster::RPC_ALPN` and `aster::alpns::{RPC,
 CONSUMER_ADMISSION, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,
 GOSSIP}`.

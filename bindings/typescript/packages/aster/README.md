@@ -224,6 +224,12 @@ the AST directly. You can delete them from new code. They still
 work (and still trigger the runtime manifest path) if you haven't
 run the scanner yet.
 
+## Observability
+
+Logs (into pino, winston or your own sink), custom metrics, tracing and the
+`/healthz` / `/readyz` / `/metrics` listener are covered in the
+[observability guide](../../../../docs/aster-observability-getstarted.md).
+
 ## API reference
 
 Generated API docs (TypeDoc): `bun run docs` produces `docs-api/`.

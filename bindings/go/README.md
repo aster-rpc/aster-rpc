@@ -247,6 +247,11 @@ Known gaps:
 - `hostile_race_test.go` / `TestSoak_Short` have no peer and only check "no
   crash"; `TestSoak_Runs` (30 min) is skipped unless `ASTER_GO_SOAK=1`.
 
+## Observability
+
+Logs into `log/slog`, custom metrics, tracing and the health listener are
+covered in the [observability guide](../../docs/aster-observability-getstarted.md).
+
 ## Build
 
 ```bash
