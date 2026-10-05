@@ -97,6 +97,8 @@ def _toml_section(name: str) -> str:
         return "[logging]"
     if name == "identity_file":
         return "[identity]"
+    if name.startswith("health_"):
+        return "[health]"
     return "[network]"
 
 
@@ -199,6 +201,14 @@ class AsterConfig:
     log_format: str = "text"
     log_level: str = "info"
     log_mask: bool = True
+
+    # -- Ops endpoints (/healthz, /readyz, /metrics; Rust ``aster::ops``) ------
+    health_port: int = 0
+    """TCP port of the ops listener. ``0`` means disabled unless ``health_enabled``."""
+    health_host: str = "127.0.0.1"
+    """Bind host (localhost only by default; pod probes need ``0.0.0.0``)."""
+    health_enabled: bool | None = None
+    """Force the listener on or off; ``None`` enables it when ``health_port != 0``."""
 
     # -- Credentials ---------------------------------------------------------
     identity_file: str | None = None

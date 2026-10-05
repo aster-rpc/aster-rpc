@@ -324,6 +324,7 @@ class AsterServer:
         # Populated by serve()
         self._serve_task: asyncio.Task | None = None
         self._subtasks: list[asyncio.Task] = []
+        self._health: Any | None = None  # aster.HealthServer (Rust ops listener)
         self._closed: bool = False
 
         # Producer service tokens for @aster endpoint registration.
@@ -349,6 +350,9 @@ class AsterServer:
             level=self._config.log_level,
             mask=self._config.log_mask,
         )
+        # Rust log records reach `logging`; exporters only if OTEL_* asks.
+        from aster import observability
+        observability.ensure_started()
 
         # Determine which aster ALPNs to register on the Router.
         # Consumer admission is ALWAYS registered -- even in open-gate mode
@@ -365,6 +369,7 @@ class AsterServer:
         if self._gate.trust_mode == TrustMode.PROTECTED:
             node_config = node_config.replace(hook_failure_mode="fail_closed")
         self._node = await Node.start(node_config, gate=self._gate)
+        await self._start_health()
         logger.debug(
             "Producer node: %s",
             f"persistent at {node_config.storage_path}"
@@ -746,6 +751,9 @@ class AsterServer:
         subtasks.append(
             asyncio.create_task(self._server.serve(), name="aster-dispatch")
         )
+        if self._health is not None:
+            self._health.set_registry(bool(self._service_summaries))
+            self._health.set_ready(True)
 
         # Auto-register endpoints with @aster for published services.
         # Requires producer service tokens (from `aster publish`).
@@ -815,6 +823,8 @@ class AsterServer:
             return
         self._closed = True
 
+        if self._health is not None:
+            self._health.set_ready(False)  # not ready first, then drain
         if self._server is not None and self._server._dispatcher is not None:
             self._server._dispatcher.close()
         for t in self._subtasks:
@@ -833,6 +843,30 @@ class AsterServer:
                 await self._node.close()
             except Exception:
                 pass
+        if self._health is not None:
+            try:
+                await self._health.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _start_health(self) -> None:
+        """Start the Rust ops listener (`/healthz`, `/readyz`, `/metrics`) when
+        the config enables it (``health_port`` / ``health_enabled`` /
+        ``ASTER_HEALTH_*`` / ``[health]``)."""
+        cfg = self._config
+        enabled = cfg.health_enabled if cfg.health_enabled is not None else cfg.health_port != 0
+        if not enabled:
+            return
+        from aster import HealthServer
+
+        self._health = await HealthServer.start(self._node, cfg.health_host, cfg.health_port)
+        self._health.set_services(len(getattr(self, "_services_in", ()) or ()))
+        logger.info("ops endpoints listening on %s", self._health.addr)
+
+    @property
+    def health(self) -> "Any | None":
+        """The :class:`aster.HealthServer` started from ``[health]`` config, or ``None``."""
+        return self._health
 
     # ── @aster endpoint registration ──────────────────────────────────────
 
@@ -1401,6 +1435,9 @@ class AsterClient:
         # fetch blobs. With storage_path set it is persistent: the node key
         # (secret_key_file), joined docs and downloaded blobs survive
         # restarts.
+        from aster import observability
+        observability.ensure_started()
+
         node_config = self._config.replace(
             alpns=(ALPN_CONSUMER_ADMISSION, RPC_ALPN) + tuple(self._config.alpns),
         )

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 from aster.codec import ForyCodec, ForyConfig
 from aster.rpc_types import SerializationMode
 from aster.status import RpcError, StatusCode
+from aster.tracing import inject as _inject_trace
 from aster.transport.base import BidiChannel, Transport, TransportError
 
 if TYPE_CHECKING:
@@ -46,6 +47,9 @@ def next_session_id(connection: Any) -> int:
 
 
 def _metadata(metadata: dict[str, str] | None) -> list[tuple[str, str]] | None:
+    # The current trace context (a span, or the call being handled) rides
+    # along as `traceparent` / `baggage`; Rust parents its client span on it.
+    metadata = _inject_trace(metadata)
     if not metadata:
         return None
     return list(metadata.items())

@@ -37,7 +37,6 @@ persistent state before closing.
 | `admission(*, outbound=False)` | Gate 0 requests as an async iterator (needs `enable_hooks=True`, no `gate`); see section 5 |
 | `gate` (property), `has_hooks()` | the attached `GatePolicy` (or `None`); whether admission hooks are on |
 | `add_node_addr(other)` | teach this node another node's address (tests, local setups) |
-| `transport_metrics_prometheus()` | transport metrics in Prometheus text format |
 | `shutdown()` / `close()` | clean shutdown |
 
 The protocol clients take the node: `blobs_client(node)`, `docs_client(node)`,
@@ -626,3 +625,42 @@ returns the granted `RouteSpec`s (or indexes; `True` = all). With no usable
 answer, fail-closed grants nothing. Origins ask with `reg = await
 request_route(conn, [RouteSpec("a.example", 443, service_id="app")], b"token")`
 and hold `reg` while the routes should stay live.
+
+## 10. Observability: logs, metrics, traces, health
+
+The whole pipeline lives in Rust (`aster-otel`); Python starts it and reads
+from it. Configuration is parsed once, in Rust: `observability.init(...)`
+arguments, then `OTEL_*` / `ASTER_*` environment variables, then the
+`[observability]` TOML table, then defaults.
+
+```python
+from aster import metrics, observability, tracing, HealthServer
+
+observability.init(service_name="orders")        # optional; before the first server
+orders = metrics.counter("orders.placed", "Orders placed")
+orders.add(1, {"region": "eu"})
+with tracing.span("db.query", {"db.system": "postgresql"}):
+    ...
+```
+
+- **Rust logs in `logging`.** The first `AsterServer` / `AsterClient` start opens the
+  log bridge (exporters start only when `OTEL_*` asks). Rust events arrive on
+  loggers named after their target (`aster::rpc::dispatch` -> `aster.rpc.dispatch`),
+  with `trace_id`, `span_id`, `rpc_service`, `rpc_method` attributes. Rust filters
+  by the `aster` logger's level: call `aster.logging.sync_level()` after
+  `dictConfig` / `basicConfig`. `ASTER_LOG=warn,aster=debug` pins the Rust filter.
+  `aster.logging.LoggingFilter`, `structlog_processor` and `loguru_patcher` add the
+  current trace ids to your own records.
+- **Metrics.** The built-in RPC, admission, transport and health metrics are
+  recorded in Rust; `aster.metrics` adds counters, up-down counters, histograms
+  and gauges on the same pipeline. There is no `MetricsInterceptor`.
+- **Traces.** `aster.tracing.span` / `traced`; inside a handler the current trace
+  is the call's server span, and outbound calls continue it (`traceparent` in the
+  call metadata).
+- **Health.** `AsterConfig(health_port=8080)` (or `ASTER_HEALTH_PORT`, `[health]`)
+  makes `AsterServer` serve `/healthz`, `/readyz` and Prometheus `/metrics`
+  (`server.health`). Standalone: `await HealthServer.start(node, host, port)`;
+  `health.check("db").set(True)` adds a readiness check (created failing).
+  Binds `127.0.0.1` by default; pod probes need `health_host="0.0.0.0"`.
+- **Fork.** Initialise in each worker, not in a pre-fork master: after `fork()`
+  the child's telemetry is disabled with one warning.

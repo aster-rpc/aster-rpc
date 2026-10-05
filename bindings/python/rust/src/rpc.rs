@@ -330,6 +330,9 @@ fn event_to_py(py: Python<'_>, ev: DispatchEvent) -> PyResult<Option<Bound<'_, P
                     header,
                     attrs: call.attributes,
                     connection: call.connection,
+                    trace_parent: call.trace_context.as_ref().map(|c| {
+                        crate::observability::call_traceparent(c.trace_id, c.span_id, c.trace_flags)
+                    }),
                     handle: call.handle,
                 },
             )?
@@ -422,11 +425,20 @@ pub struct ServerCall {
     header: Arc<StreamHeader>,
     attrs: Arc<PeerAttributes>,
     connection: Option<CoreConnection>,
+    /// W3C `traceparent` of the call's server span (set when the span is
+    /// exported; the parent of binding spans and the source of log trace ids).
+    trace_parent: Option<String>,
     handle: CallHandle,
 }
 
 #[pymethods]
 impl ServerCall {
+    /// The server span's `traceparent`, or `None` when tracing is off.
+    #[getter]
+    fn trace_parent(&self) -> Option<String> {
+        self.trace_parent.clone()
+    }
+
     /// Single-shot terminal response (unary, client-stream): one data frame
     /// (omitted when `payload` is empty) plus the status trailer.
     #[pyo3(signature = (payload, code=0, message="", details=None))]
