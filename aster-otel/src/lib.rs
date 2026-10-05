@@ -17,6 +17,10 @@
 //!   (feature `otlp-logs`) logger providers installed as globals, OTLP over
 //!   http/protobuf, and [`generation`] for instruments cached per provider.
 //!
+//! * O3 (feature `prometheus`): [`init_with_prometheus`], which joins or
+//!   starts the pipeline and guarantees it a Prometheus pull reader, and
+//!   [`render_prometheus`], the text exposition an ops `/metrics` serves.
+//!
 //! There is one global `tracing` subscriber, installed by whichever of
 //! [`init_stderr_from_env`] and [`init`] runs first; every layer in it sits
 //! behind `reload`, so the other fills its slot instead of competing for the
@@ -45,12 +49,12 @@ pub use config::{
     EXPORTER_INTERNAL_TARGETS, OTEL_SDK_DISABLED,
 };
 pub use error::{Error, Result};
-#[cfg(feature = "prometheus")]
-pub use pipeline::render_prometheus;
 pub use pipeline::{
     flush, generation, init, shutdown, state, ObservabilityHandle, PipelineState, SCOPE_NAME,
     SHUTDOWN_TIMEOUT,
 };
+#[cfg(feature = "prometheus")]
+pub use pipeline::{init_with_prometheus, render_prometheus, PROMETHEUS_TEXT_CONTENT_TYPE};
 pub use subscriber::{
     init_stderr_from_env, layers, StderrInit, SubscriberStatus, DEFAULT_FILTER, ENV_FILTER,
     ENV_STDERR,

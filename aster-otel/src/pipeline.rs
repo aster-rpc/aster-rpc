@@ -35,6 +35,10 @@ pub const SCOPE_NAME: &str = "aster";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Identity of each pipeline `init` creates. Handles count against the
+/// pipeline, not the generation: a Prometheus re-init (§6) bumps the
+/// generation of a running pipeline and keeps its references.
+static PIPELINE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The provider generation (design §4.1a): bumped by every `init` that builds a
 /// pipeline and by every shutdown. Instruments cached by generation are stale
@@ -108,7 +112,8 @@ fn sdk_result(errors: Vec<String>) -> Result<()> {
 
 struct Active {
     resolved: ResolvedConfig,
-    test_exporters: bool,
+    test: Option<TestExporters>,
+    id: u64,
     refs: usize,
     generation: u64,
     providers: Providers,
@@ -126,6 +131,7 @@ fn pipeline() -> MutexGuard<'static, Option<Active>> {
 /// A handle outlived by an explicit [`shutdown`] is inert.
 #[must_use = "dropping the last handle shuts the pipeline down"]
 pub struct ObservabilityHandle {
+    id: u64,
     generation: u64,
     live: bool,
     noop: bool,
@@ -136,6 +142,7 @@ pub struct ObservabilityHandle {
 impl ObservabilityHandle {
     fn inert() -> Self {
         ObservabilityHandle {
+            id: 0,
             generation: generation(),
             live: false,
             noop: true,
@@ -144,7 +151,9 @@ impl ObservabilityHandle {
         }
     }
 
-    /// The pipeline generation this handle belongs to.
+    /// The pipeline generation when this handle was taken (a later
+    /// Prometheus re-init, [`init_with_prometheus`], moves the pipeline to a
+    /// new generation without invalidating the handle).
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -176,13 +185,14 @@ impl Clone for ObservabilityHandle {
         let mut live = false;
         if self.live && !fork::forked() {
             if let Some(a) = pipeline().as_mut() {
-                if a.generation == self.generation {
+                if a.id == self.id {
                     a.refs += 1;
                     live = true;
                 }
             }
         }
         ObservabilityHandle {
+            id: self.id,
             generation: self.generation,
             live,
             noop: self.noop,
@@ -199,7 +209,7 @@ impl Drop for ObservabilityHandle {
         }
         let mut g = pipeline();
         let last = match g.as_mut() {
-            Some(a) if a.generation == self.generation => {
+            Some(a) if a.id == self.id => {
                 a.refs -= 1;
                 a.refs == 0
             }
@@ -239,21 +249,69 @@ impl std::fmt::Debug for ObservabilityHandle {
 ///   [`crate::layers`] into that subscriber.
 /// * In a child forked after init: an inert handle and a one-time warning.
 pub fn init(cfg: ObservabilityConfig) -> Result<ObservabilityHandle> {
+    start(cfg, false)
+}
+
+/// The pipeline a Prometheus pull endpoint needs (design §6): join the
+/// running pipeline **whatever its configuration**, or start one from `cfg`
+/// (an ops listener passes an env-only default), and make sure its meter
+/// provider has the Prometheus pull reader, independent of
+/// `OTEL_METRICS_EXPORTER`.
+///
+/// The SDK cannot add a reader to a built provider, so when the running
+/// pipeline has none, its meter provider is rebuilt with the configured
+/// readers plus the pull reader and installed under a new [`generation`]
+/// (instruments cached per generation rebuild on their next record; the
+/// tracer and logger providers are untouched). Outstanding handles keep
+/// counting against the same pipeline. Afterwards [`render_prometheus`]
+/// returns `Some` until the pipeline is shut down, unless `OTEL_SDK_DISABLED`
+/// switched the SDK off (the handle then [`is_noop`](ObservabilityHandle::is_noop)).
+#[cfg(feature = "prometheus")]
+pub fn init_with_prometheus(cfg: ObservabilityConfig) -> Result<ObservabilityHandle> {
+    start(cfg, true)
+}
+
+fn start(cfg: ObservabilityConfig, with_prometheus: bool) -> Result<ObservabilityHandle> {
     if fork::check() {
         return Ok(ObservabilityHandle::inert());
     }
-    let resolved = cfg.resolve()?;
-    let config = resolved.config;
-    let mut warnings = resolved.warnings;
     #[cfg(feature = "testing")]
     let test = cfg.test_exporters.clone();
     #[cfg(not(feature = "testing"))]
-    let test: Option<()> = None;
+    let test: Option<TestExporters> = None;
 
     let mut g = pipeline();
+    if with_prometheus {
+        if let Some(a) = g.as_mut() {
+            #[cfg(feature = "prometheus")]
+            let old = ensure_pull_reader(a)?;
+            a.refs += 1;
+            let handle = ObservabilityHandle {
+                id: a.id,
+                generation: a.generation,
+                live: true,
+                noop: a.resolved.disabled,
+                subscriber: a.subscriber,
+                warnings: Vec::new(),
+            };
+            drop(g);
+            #[cfg(feature = "prometheus")]
+            if let Some(old) = old {
+                // Flushes what the replaced readers held (a push exporter
+                // still gets its last interval).
+                let _ = old.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
+            }
+            return Ok(handle);
+        }
+    }
+
+    let resolved = cfg.resolve()?;
+    let config = resolved.config;
+    let mut warnings = resolved.warnings;
+
     if let Some(a) = g.as_mut() {
         let mut diff = a.resolved.diff(&config);
-        if a.test_exporters != test.is_some() {
+        if a.test.is_some() != test.is_some() {
             diff.push("test_exporters");
         }
         if !diff.is_empty() {
@@ -264,6 +322,7 @@ pub fn init(cfg: ObservabilityConfig) -> Result<ObservabilityHandle> {
         }
         a.refs += 1;
         return Ok(ObservabilityHandle {
+            id: a.id,
             generation: a.generation,
             live: true,
             noop: config.disabled,
@@ -277,7 +336,7 @@ pub fn init(cfg: ObservabilityConfig) -> Result<ObservabilityHandle> {
     let providers = if config.disabled {
         Providers::default()
     } else {
-        build_providers(&config, test.as_ref(), &mut warnings)?
+        build_providers(&config, test.as_ref(), with_prometheus, &mut warnings)?
     };
 
     fork::register();
@@ -325,10 +384,12 @@ pub fn init(cfg: ObservabilityConfig) -> Result<ObservabilityHandle> {
     }
 
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let id = PIPELINE_ID.fetch_add(1, Ordering::Relaxed) + 1;
     let noop = config.disabled;
     *g = Some(Active {
         resolved: config,
-        test_exporters: test.is_some(),
+        test,
+        id,
         refs: 1,
         generation,
         providers,
@@ -340,12 +401,42 @@ pub fn init(cfg: ObservabilityConfig) -> Result<ObservabilityHandle> {
         tracing::warn!(target: "aster::otel", "{w}");
     }
     Ok(ObservabilityHandle {
+        id,
         generation,
         live: true,
         noop,
         subscriber: status,
         warnings,
     })
+}
+
+/// Give the running pipeline a Prometheus pull reader if it has none: rebuild
+/// its meter provider (same readers plus the pull reader), install it, and
+/// bump the generation. Returns the replaced provider for the caller to shut
+/// down outside the lock. A disabled pipeline is left alone.
+#[cfg(feature = "prometheus")]
+fn ensure_pull_reader(a: &mut Active) -> Result<Option<SdkMeterProvider>> {
+    if a.resolved.disabled || a.providers.prometheus.is_some() {
+        return Ok(None);
+    }
+    // Warnings were reported by the init that built the pipeline.
+    let mut warnings = Vec::new();
+    let (meter, registry) = build_meter(
+        &a.resolved,
+        &resource(&a.resolved),
+        a.test.as_ref(),
+        true,
+        &mut ClientPool::default(),
+        &mut warnings,
+    )?;
+    let Some(meter) = meter else {
+        return Ok(None);
+    };
+    global::set_meter_provider(meter.clone());
+    let old = a.providers.meter.replace(meter);
+    a.providers.prometheus = registry;
+    a.generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    Ok(old)
 }
 
 /// What the running pipeline feeds, for instrumentation cached per
@@ -450,9 +541,16 @@ pub(crate) fn current_logger_provider() -> Option<opentelemetry_sdk::logs::SdkLo
     pipeline().as_ref().and_then(|a| a.providers.logger.clone())
 }
 
+/// `Content-Type` of [`render_prometheus`]'s output: the Prometheus text
+/// exposition format 0.0.4. (The `prometheus` crate's encoder writes no
+/// OpenMetrics, so there is nothing to negotiate.)
+#[cfg(feature = "prometheus")]
+pub const PROMETHEUS_TEXT_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
 /// The running pipeline's Prometheus reader rendered as text exposition
-/// (version 0.0.4), or `None` when no pipeline has a `prometheus` metrics
-/// exporter.
+/// (version 0.0.4), or `None` when the pipeline has no pull reader (none
+/// running, `OTEL_SDK_DISABLED`, or neither a `prometheus` metrics exporter
+/// nor [`init_with_prometheus`]).
 #[cfg(feature = "prometheus")]
 pub fn render_prometheus() -> Option<String> {
     let registry = pipeline().as_ref()?.providers.prometheus.clone()?;
@@ -552,16 +650,16 @@ type TestExporters = ();
 
 // Which pushes into `warnings` (and which bindings are mutated) depends on the
 // feature set.
-#[allow(unused_variables, unused_mut, clippy::ptr_arg)]
+#[allow(unused_variables, unused_mut, clippy::ptr_arg, clippy::let_unit_value)]
 fn build_providers(
     c: &ResolvedConfig,
     test: Option<&TestExporters>,
+    with_prometheus: bool,
     warnings: &mut Vec<String>,
 ) -> Result<Providers> {
     let resource = resource(c);
     let mut providers = Providers::default();
-    #[cfg(feature = "otlp")]
-    let mut clients = otlp::Clients::default();
+    let mut clients = ClientPool::default();
 
     // Traces.
     let mut tb = SdkTracerProvider::builder()
@@ -609,62 +707,15 @@ fn build_providers(
     }
 
     // Metrics.
-    let mut mb = SdkMeterProvider::builder().with_resource(resource.clone());
-    let mut any_reader = false;
-    #[cfg(feature = "testing")]
-    if let Some(t) = test {
-        mb = mb.with_reader(
-            opentelemetry_sdk::metrics::PeriodicReader::builder(t.metrics.clone())
-                .with_interval(c.metric_export_interval)
-                .build(),
-        );
-        any_reader = true;
+    let (meter, registry) =
+        build_meter(c, &resource, test, with_prometheus, &mut clients, warnings)?;
+    providers.meter = meter;
+    #[cfg(feature = "prometheus")]
+    {
+        providers.prometheus = registry;
     }
-    if !any_reader {
-        for kind in &c.metrics_exporter {
-            match kind {
-                ExporterKind::Otlp => {
-                    #[cfg(feature = "otlp")]
-                    {
-                        let exporter = otlp::metric_exporter(
-                            &c.otlp_metrics,
-                            sdk_temporality(c.metrics_temporality),
-                            &mut clients,
-                        )?;
-                        mb = mb.with_reader(
-                            opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-                                .with_interval(c.metric_export_interval)
-                                .build(),
-                        );
-                        any_reader = true;
-                    }
-                    #[cfg(not(feature = "otlp"))]
-                    {
-                        let _ = sdk_temporality(c.metrics_temporality);
-                        warnings.push("OTLP metric export needs aster-otel feature `otlp`; metrics are not pushed".into());
-                    }
-                }
-                ExporterKind::Prometheus => {
-                    #[cfg(feature = "prometheus")]
-                    {
-                        let registry = prometheus::Registry::new();
-                        let exporter = opentelemetry_prometheus::exporter()
-                            .with_registry(registry.clone())
-                            .build()
-                            .map_err(|e| Error::Exporter(format!("prometheus reader: {e}")))?;
-                        mb = mb.with_reader(exporter);
-                        providers.prometheus = Some(registry);
-                        any_reader = true;
-                    }
-                    #[cfg(not(feature = "prometheus"))]
-                    warnings.push("the prometheus metrics exporter needs aster-otel feature `prometheus`; ignoring it".into());
-                }
-            }
-        }
-    }
-    if any_reader {
-        providers.meter = Some(mb.build());
-    }
+    #[cfg(not(feature = "prometheus"))]
+    let _: Option<()> = registry;
 
     // Logs (opt-in, Q4).
     #[cfg(feature = "otlp-logs")]
@@ -707,6 +758,86 @@ fn build_providers(
         );
     }
     Ok(providers)
+}
+
+#[cfg(feature = "otlp")]
+type ClientPool = otlp::Clients;
+#[cfg(not(feature = "otlp"))]
+type ClientPool = ();
+
+#[cfg(feature = "prometheus")]
+type PullRegistry = prometheus::Registry;
+#[cfg(not(feature = "prometheus"))]
+type PullRegistry = ();
+
+/// The meter provider for `c`, or `None` when it has no reader. Test
+/// exporters replace OTLP, not a Prometheus reader; `with_prometheus` adds the
+/// pull reader whatever `metrics_exporter` says (design §6).
+#[allow(unused_variables, unused_mut, clippy::ptr_arg)]
+fn build_meter(
+    c: &ResolvedConfig,
+    resource: &Resource,
+    test: Option<&TestExporters>,
+    with_prometheus: bool,
+    clients: &mut ClientPool,
+    warnings: &mut Vec<String>,
+) -> Result<(Option<SdkMeterProvider>, Option<PullRegistry>)> {
+    let mut mb = SdkMeterProvider::builder().with_resource(resource.clone());
+    let mut any_reader = false;
+    let mut testing = false;
+    #[cfg(feature = "testing")]
+    if let Some(t) = test {
+        mb = mb.with_reader(
+            opentelemetry_sdk::metrics::PeriodicReader::builder(t.metrics.clone())
+                .with_interval(c.metric_export_interval)
+                .build(),
+        );
+        any_reader = true;
+        testing = true;
+    }
+    if !testing && c.metrics_exporter.contains(&ExporterKind::Otlp) {
+        #[cfg(feature = "otlp")]
+        {
+            let exporter = otlp::metric_exporter(
+                &c.otlp_metrics,
+                sdk_temporality(c.metrics_temporality),
+                clients,
+            )?;
+            mb = mb.with_reader(
+                opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
+                    .with_interval(c.metric_export_interval)
+                    .build(),
+            );
+            any_reader = true;
+        }
+        #[cfg(not(feature = "otlp"))]
+        {
+            let _ = sdk_temporality(c.metrics_temporality);
+            warnings.push(
+                "OTLP metric export needs aster-otel feature `otlp`; metrics are not pushed".into(),
+            );
+        }
+    }
+    let mut registry = None;
+    if with_prometheus || c.metrics_exporter.contains(&ExporterKind::Prometheus) {
+        #[cfg(feature = "prometheus")]
+        {
+            let r = prometheus::Registry::new();
+            let exporter = opentelemetry_prometheus::exporter()
+                .with_registry(r.clone())
+                .build()
+                .map_err(|e| Error::Exporter(format!("prometheus reader: {e}")))?;
+            mb = mb.with_reader(exporter);
+            registry = Some(r);
+            any_reader = true;
+        }
+        #[cfg(not(feature = "prometheus"))]
+        warnings.push(
+            "the prometheus metrics exporter needs aster-otel feature `prometheus`; ignoring it"
+                .into(),
+        );
+    }
+    Ok((any_reader.then(|| mb.build()), registry))
 }
 
 #[cfg(feature = "otlp")]

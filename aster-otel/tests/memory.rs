@@ -48,6 +48,12 @@ fn child() {
         "otlp_logs" => case_otlp_logs(),
         #[cfg(feature = "prometheus")]
         "prometheus" => case_prometheus(),
+        #[cfg(feature = "prometheus")]
+        "prometheus_implicit" => case_prometheus_implicit(),
+        #[cfg(feature = "prometheus")]
+        "prometheus_reinit" => case_prometheus_reinit(),
+        #[cfg(feature = "prometheus")]
+        "prometheus_disabled" => case_prometheus_disabled(),
         other => panic!("unknown case {other}"),
     }
     println!("case-ok");
@@ -170,6 +176,96 @@ fn case_prometheus() {
     );
 }
 
+#[cfg(feature = "prometheus")]
+fn probe_counter(n: u64) {
+    opentelemetry::global::meter_provider()
+        .meter("aster-test")
+        .u64_counter("probe.requests")
+        .build()
+        .add(n, &[]);
+}
+
+/// No pipeline yet: `init_with_prometheus` starts one (metrics exporter
+/// `none` notwithstanding) with the pull reader.
+#[cfg(feature = "prometheus")]
+fn case_prometheus_implicit() {
+    let g0 = aster_otel::generation();
+    let h = aster_otel::init_with_prometheus(ObservabilityConfig {
+        from_env: false,
+        traces_exporter: Some(vec![]),
+        metrics_exporter: Some(vec![]),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(aster_otel::generation(), g0 + 1);
+    probe_counter(3);
+    let text = aster_otel::render_prometheus().expect("pull reader");
+    assert!(text.contains("probe_requests_total"), "{text}");
+    // A second caller joins without another generation.
+    let h2 = aster_otel::init_with_prometheus(ObservabilityConfig::default()).unwrap();
+    assert_eq!(aster_otel::generation(), g0 + 1);
+    drop(h);
+    assert!(
+        aster_otel::render_prometheus().is_some(),
+        "h2 still holds it"
+    );
+    drop(h2);
+    assert!(
+        aster_otel::render_prometheus().is_none(),
+        "last handle dropped"
+    );
+}
+
+/// A pipeline without a pull reader (test exporters only) gets one under a
+/// new generation; the push reader keeps exporting and the first handle
+/// keeps counting against the same pipeline.
+#[cfg(feature = "prometheus")]
+fn case_prometheus_reinit() {
+    let t = TestExporters::new();
+    let h = aster_otel::init(with_test_exporters(&t)).unwrap();
+    let g1 = aster_otel::generation();
+    assert!(aster_otel::render_prometheus().is_none());
+    // Joins whatever config is running (this one differs from `h`'s).
+    let h2 = aster_otel::init_with_prometheus(ObservabilityConfig::default()).unwrap();
+    assert_eq!(
+        aster_otel::generation(),
+        g1 + 1,
+        "re-init bumps the generation"
+    );
+    assert_eq!(h2.generation(), g1 + 1);
+    probe_counter(5);
+    let text = aster_otel::render_prometheus().expect("pull reader");
+    assert!(text.contains("probe_requests_total"), "{text}");
+    aster_otel::flush(Duration::from_secs(10)).unwrap();
+    let pts = t.metric_points("probe.requests");
+    assert_eq!(pts.len(), 1, "push reader still exports: {pts:?}");
+    assert_eq!(pts[0].value, 5.0);
+    // The original config still joins after the re-init.
+    let h3 = aster_otel::init(with_test_exporters(&t)).unwrap();
+    drop(h);
+    drop(h3);
+    assert!(
+        aster_otel::render_prometheus().is_some(),
+        "h2 still holds it"
+    );
+    drop(h2);
+    assert!(aster_otel::render_prometheus().is_none());
+    assert_eq!(aster_otel::generation(), g1 + 2, "shut down once");
+}
+
+/// `OTEL_SDK_DISABLED` wins: a no-op handle and no reader.
+#[cfg(feature = "prometheus")]
+fn case_prometheus_disabled() {
+    let h = aster_otel::init_with_prometheus(ObservabilityConfig {
+        from_env: false,
+        disabled: Some(true),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(h.is_noop());
+    assert!(aster_otel::render_prometheus().is_none());
+}
+
 #[test]
 fn shutdown_flushes_buffered_spans() {
     run("flush_on_shutdown", &[]);
@@ -200,4 +296,22 @@ fn otlp_logs_layer_exports_filtered_events() {
 #[test]
 fn prometheus_reader_renders_text() {
     run("prometheus", &[]);
+}
+
+#[cfg(feature = "prometheus")]
+#[test]
+fn init_with_prometheus_starts_a_pipeline_with_the_pull_reader() {
+    run("prometheus_implicit", &[]);
+}
+
+#[cfg(feature = "prometheus")]
+#[test]
+fn init_with_prometheus_reinits_a_pipeline_without_one() {
+    run("prometheus_reinit", &[]);
+}
+
+#[cfg(feature = "prometheus")]
+#[test]
+fn init_with_prometheus_honours_the_kill_switch() {
+    run("prometheus_disabled", &[]);
 }
