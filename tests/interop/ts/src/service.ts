@@ -1,4 +1,4 @@
-import { Service, Rpc, ServerStream, ClientStream, BidiStream, CallContext, i32 } from '@aster-rpc/aster';
+import { Service, Rpc, ServerStream, ClientStream, BidiStream, CallContext, i32, currentTraceId } from '@aster-rpc/aster';
 import { EchoRequest, EchoReply } from './types.js';
 
 /** `hold` calls that observed a cancellation (process-wide). */
@@ -11,6 +11,7 @@ let holdCancelled = 0;
  * `chat`: one reply per request, right away: request echoed, count = its 0-based position.
  * `hold`: blocks until cancelled (counted) or 60 s (replies count -1, "timeout").
  * `cancelled`: count = number of `hold` calls that observed a cancellation.
+ * `traceEcho`: message = the trace id (32 hex) of the handler's dispatch context.
  * See tests/interop/rust/contract.rs.
  */
 @Service({ name: 'InteropEcho', version: 1 })
@@ -72,6 +73,16 @@ export class InteropEcho {
     return new EchoReply({
       message: 'cancelled',
       count: i32(holdCancelled),
+      data: new Uint8Array(),
+      server_lang: 'ts',
+    });
+  }
+
+  @Rpc()
+  async traceEcho(_req: EchoRequest): Promise<EchoReply> {
+    return new EchoReply({
+      message: currentTraceId() ?? '',
+      count: i32(0),
       data: new Uint8Array(),
       server_lang: 'ts',
     });

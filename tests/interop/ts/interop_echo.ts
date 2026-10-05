@@ -28,10 +28,12 @@ import {
   fromServiceInfo,
   setNativeContract,
   i32,
+  withTraceContext,
   Node,
   RpcError,
   StatusCode,
 } from '@aster-rpc/aster';
+import { randomBytes } from 'node:crypto';
 import { loadNative } from '@aster-rpc/aster/native.js';
 import { SERVICES, WIRE_TYPES, BUILD_ALL_TYPES } from './aster-rpc.generated.ts';
 import { InteropEcho, InteropSession } from './src/service.ts';
@@ -151,6 +153,7 @@ async function runClient(ticket: string): Promise<boolean> {
     ['deadline', () => deadlineCase(client)],
     ['cancel', () => cancelCase(client)],
     ['session', () => sessionCase(transport)],
+    ['trace', () => traceCase(client)],
   ] as [string, () => Promise<string>][]) {
     try {
       console.log(`CASE ${name} OK server_lang=${await withTimeout(run(), 30_000)}`);
@@ -229,6 +232,18 @@ async function expectServerCancel(client: any, want: number): Promise<void> {
     await new Promise((r) => setTimeout(r, 100));
   }
   throw new Error(`server never observed the cancellation (count ${seen}, want ${want})`);
+}
+
+const TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
+
+/** `traceEcho` under a known, sampled `traceparent`: the server must report the same trace id. */
+async function traceCase(client: any): Promise<string> {
+  const traceparent = `00-${TRACE_ID}-${randomBytes(8).toString('hex')}-01`;
+  const reply = (await withTraceContext(traceparent, () =>
+    withTimeout(client.traceEcho(probe()), 15_000),
+  )) as EchoReply;
+  if (reply.message !== TRACE_ID) throw new Error(`server saw trace id '${reply.message}', want ${TRACE_ID}`);
+  return reply.server_lang;
 }
 
 /** `hold` with a 1 s deadline: DEADLINE_EXCEEDED, and the server observes a cancellation. */

@@ -11,7 +11,10 @@ its cell):
   client_stream, bidi (interleaved ``chat``), deadline and cancel (``hold``
   blocks; the client gets DEADLINE_EXCEEDED / CANCELLED and the server must
   observe the cancellation) and session (state persists per session, isolated
-  between sessions).
+  between sessions) and trace (``traceEcho`` called under a known W3C trace
+  id; the server replies the trace id its dispatch context saw; every program
+  starts its observability pipeline from ``OTEL_*`` pointed at a closed local
+  port, so there is no collector).
 * Expose matrix: every language serves an HTTP handler through expose; the
   Rust and Python streaming-relay consumers call each one (``EXPOSE_CASES``).
 
@@ -75,7 +78,7 @@ DEFAULT_LANGS = tuple(
 RPC_CASES = (
     "small", "zstd", "long_string",
     "server_stream", "client_stream",
-    "bidi", "deadline", "cancel", "session",
+    "bidi", "deadline", "cancel", "session", "trace",
 )
 EXPOSE_CASES = ("expose_hello", "expose_echo_stream")
 
@@ -91,6 +94,18 @@ ENV = {
     "ASTER_BIND_ADDR": "127.0.0.1:0",
     "ASTER_LOG_LEVEL": os.environ.get("ASTER_LOG_LEVEL", "warn"),
     "PYTHONUNBUFFERED": "1",
+    # Trace continuity (``trace`` case): every program starts its observability
+    # pipeline from the environment, and a tracer provider exists only when a
+    # span exporter does. Point OTLP at a closed local port and never flush:
+    # no collector, nothing is exported, but dispatch contexts carry trace ids.
+    # The span filter defaults to the log filter, and ASTER_LOG_LEVEL=warn would
+    # disable the info-level RPC spans (no span, no trace id).
+    "ASTER_LOG": "warn,aster=info",
+    "OTEL_TRACES_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:9",
+    "OTEL_BSP_SCHEDULE_DELAY": "3600000",
+    "OTEL_METRICS_EXPORTER": "none",
+    "OTEL_LOGS_EXPORTER": "none",
 }
 
 CLIENT_TIMEOUT = 180  # seconds for one client run (all cases)
@@ -169,7 +184,7 @@ def build(native: bool, langs: set[str]) -> None:
         run_step("ts native", [*launcher, "bun", "run", "build"], REPO / "bindings/typescript/native")
     run_step(
         "rust interop_echo",
-        [*launcher, "cargo", "build", "-p", "aster", "--features", "rpc,expose", "--example", "interop_echo"],
+        [*launcher, "cargo", "build", "-p", "aster", "--features", "rpc,expose,otel", "--example", "interop_echo"],
         REPO,
     )
     if langs & {"java", "dotnet", "go"}:

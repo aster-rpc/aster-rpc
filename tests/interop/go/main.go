@@ -11,6 +11,7 @@
 //	  chat(stream interop/EchoRequest) -> stream interop/EchoReply  (bidi)
 //	  hold(interop/EchoRequest) -> interop/EchoReply                (unary, blocks)
 //	  cancelled(interop/EchoRequest) -> interop/EchoReply           (unary)
+//	  traceEcho(interop/EchoRequest) -> interop/EchoReply           (unary)
 //	service InteropSession v1 (session-scoped)
 //	  add(interop/EchoRequest) -> interop/EchoReply                 (unary)
 //	interop/EchoRequest { message: string, count: varint32, data: binary }
@@ -30,6 +31,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -138,6 +140,10 @@ func service() *aster.Service {
 		}),
 		aster.Unary("cancelled", func(_ context.Context, req *EchoRequest) (*EchoReply, error) {
 			return &EchoReply{Message: "cancelled", Count: holdCancelled.Load(), Data: []byte{}, ServerLang: "go"}, nil
+		}),
+		// The handler context carries the dispatch server span.
+		aster.Unary("traceEcho", func(ctx context.Context, req *EchoRequest) (*EchoReply, error) {
+			return &EchoReply{Message: aster.CurrentTraceID(ctx), Data: []byte{}, ServerLang: "go"}, nil
 		}),
 	)
 }
@@ -478,6 +484,28 @@ func client(svc, sess *aster.Service, ticket string) bool {
 		return "go", expectServerCancel(ctx, conn, before+1)
 	}) && ok
 
+	ok = runCase("trace", func(ctx context.Context) (string, error) {
+		// traceEcho under a known, sampled traceparent: the call injects the
+		// context's traceparent and the server must report the same trace id.
+		const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+		var span [8]byte
+		if _, err := rand.Read(span[:]); err != nil {
+			return "", err
+		}
+		span[0] |= 1
+		tctx, err := aster.WithTraceContext(ctx, fmt.Sprintf("00-%s-%x-01", traceID, span), nil)
+		if err != nil {
+			return "", err
+		}
+		r, err := aster.Call[EchoRequest, EchoReply](tctx, conn, "InteropEcho", "traceEcho", &EchoRequest{Message: "probe"})
+		if err != nil {
+			return "", fmt.Errorf("traceEcho(): %w", err)
+		}
+		if r.Message != traceID {
+			return "", fmt.Errorf("server saw trace id %q, want %s", r.Message, traceID)
+		}
+		return r.ServerLang, nil
+	}) && ok
 	ok = runCase("session", func(ctx context.Context) (string, error) {
 		var ids [2]uint32
 		for i := range ids {

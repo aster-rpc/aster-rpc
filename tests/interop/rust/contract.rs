@@ -11,6 +11,7 @@
 //!   chat(stream interop/EchoRequest) -> stream interop/EchoReply  (bidi)
 //!   hold(interop/EchoRequest) -> interop/EchoReply                (unary, blocks)
 //!   cancelled(interop/EchoRequest) -> interop/EchoReply           (unary)
+//!   traceEcho(interop/EchoRequest) -> interop/EchoReply           (unary)
 //! interop/EchoRequest { message: string, count: varint32, data: binary }
 //! interop/EchoReply   { message: string, count: varint32, data: binary, server_lang: string }
 //! ```
@@ -31,6 +32,9 @@
 //!   `message = "timeout"` instead (the cancel cases treat that as a failure).
 //! - `cancelled`: replies `count` = the number of `hold` calls that observed
 //!   a cancellation so far, `message = "cancelled"`.
+//! - `traceEcho`: replies `message` = the trace id (32 lowercase hex) the
+//!   handler's dispatch context saw for this call (`""` if none), `server_lang`
+//!   set. Clients call it under a known trace id and compare.
 //!
 //! A second service, `InteropSession v1`, is **session-scoped** (a fresh
 //! instance per `(connection, session id)`; see `interop_echo.rs`):
@@ -93,6 +97,9 @@ pub trait InteropEcho {
     async fn hold(&self, req: EchoRequest) -> Result<EchoReply>;
 
     async fn cancelled(&self, req: EchoRequest) -> Result<EchoReply>;
+
+    #[rpc(name = "traceEcho")]
+    async fn trace_echo(&self, req: EchoRequest) -> Result<EchoReply>;
 }
 
 pub struct EchoImpl;
@@ -193,4 +200,34 @@ impl InteropEcho for EchoImpl {
             server_lang: "rust".into(),
         })
     }
+
+    async fn trace_echo(&self, _req: EchoRequest) -> Result<EchoReply> {
+        Ok(EchoReply {
+            message: current_trace_id(),
+            count: 0,
+            data: vec![],
+            server_lang: "rust".into(),
+        })
+    }
+}
+
+/// The trace id of the call being dispatched: the handler runs inside the
+/// call's server span, so the `tracing` span's OpenTelemetry context carries
+/// it. Empty without the `otel` feature or without a tracer provider.
+#[cfg(feature = "otel")]
+fn current_trace_id() -> String {
+    use aster_otel::opentelemetry::trace::TraceContextExt;
+    use aster_otel::OpenTelemetrySpanExt;
+    let cx = tracing::Span::current().context();
+    let sc = cx.span().span_context().clone();
+    if sc.is_valid() {
+        sc.trace_id().to_string()
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+fn current_trace_id() -> String {
+    String::new()
 }

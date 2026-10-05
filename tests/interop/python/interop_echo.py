@@ -10,6 +10,7 @@ which documents every method's semantics, and to the other languages)::
       chat(stream interop/EchoRequest) -> stream interop/EchoReply  (bidi)
       hold(interop/EchoRequest) -> interop/EchoReply                (unary, blocks)
       cancelled(interop/EchoRequest) -> interop/EchoReply           (unary)
+      traceEcho(interop/EchoRequest) -> interop/EchoReply           (unary)
     service InteropSession v1 (scope = session)
       add(interop/EchoRequest) -> interop/EchoReply                 (unary)
     interop/EchoRequest { message: string, count: varint32, data: binary }
@@ -35,12 +36,14 @@ Open gate, relay disabled, loopback bind: works offline.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import pyfory
 
+from aster import tracing
 from aster import (
     AsterConfig,
     AsterServer,
@@ -132,6 +135,11 @@ class InteropEcho:
     @rpc()
     async def cancelled(self, req: EchoRequest) -> EchoReply:
         return EchoReply(message="cancelled", count=_HOLD_CANCELLED, data=b"", server_lang="python")
+
+    @rpc()
+    async def traceEcho(self, req: EchoRequest) -> EchoReply:  # noqa: N802 (wire name)
+        # The handler's trace carrier is filled from the dispatch trace context.
+        return EchoReply(message=tracing.current_trace_id() or "", count=0, data=b"", server_lang="python")
 
 
 # `hold` calls that observed a cancellation (process-wide).
@@ -312,6 +320,21 @@ async def _session_case(conn) -> str:
     return lang
 
 
+_TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+
+async def _trace_case(client) -> str:
+    """``traceEcho`` called under a known, sampled ``traceparent``: the client
+    sends it, the server must report the same trace id from its dispatch
+    context."""
+    traceparent = f"00-{_TRACE_ID}-{os.urandom(8).hex()}-01"
+    with tracing.with_trace_context(traceparent):
+        reply = await client.traceEcho(EchoRequest(message="probe"))
+    if reply.message != _TRACE_ID:
+        raise AssertionError(f"server saw trace id {reply.message!r}, want {_TRACE_ID}")
+    return reply.server_lang
+
+
 async def _wait_stdin_eof() -> None:
     loop = asyncio.get_running_loop()
     while await loop.run_in_executor(None, sys.stdin.readline):
@@ -364,6 +387,7 @@ async def run_client(ticket_str: str) -> bool:
         ("deadline", _deadline_case(client)),
         ("cancel", _cancel_case(client)),
         ("session", _session_case(conn)),
+        ("trace", _trace_case(client)),
     ):
         try:
             server_lang = await asyncio.wait_for(coro, 30)

@@ -10,6 +10,7 @@
 //     chat(stream interop/EchoRequest) -> stream interop/EchoReply  (bidi)
 //     hold(interop/EchoRequest) -> interop/EchoReply                (unary, blocks)
 //     cancelled(interop/EchoRequest) -> interop/EchoReply           (unary)
+//     traceEcho(interop/EchoRequest) -> interop/EchoReply           (unary)
 //   service InteropSession v1 (scope = session): add(interop/EchoRequest) -> interop/EchoReply
 //   (semantics: tests/interop/rust/contract.rs)
 //   interop/EchoRequest { message: string, count: varint32, data: binary }
@@ -111,6 +112,14 @@ internal static class InteropEcho
         {
             Message = "cancelled",
             Count = Volatile.Read(ref _holdCancelled),
+            Data = [],
+            ServerLang = lang,
+        }))
+        // The handler runs in an Activity parented on the call's server span (Activity bridge).
+        .Unary<EchoRequest, EchoReply>("traceEcho", (_, _) => ValueTask.FromResult(new EchoReply
+        {
+            Message = Aster.Observability.Tracing.CurrentTraceId ?? "",
+            Count = 0,
             Data = [],
             ServerLang = lang,
         }))
@@ -266,7 +275,24 @@ internal static class InteropEcho
         ok &= await RunCase("deadline", () => DeadlineCase(conn));
         ok &= await RunCase("cancel", () => CancelCase(conn));
         ok &= await RunCase("session", () => SessionCase(conn));
+        ok &= await RunCase("trace", () => TraceCase(conn));
         return ok;
+    }
+
+    private const string TraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    /// <summary>traceEcho under a known, sampled traceparent: the client call takes it from the current
+    /// Activity, and the server must report the same trace id.</summary>
+    private static async Task<string> TraceCase(RpcConnection conn)
+    {
+        string traceparent = $"00-{TraceId}-{Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8)).ToLowerInvariant()}-01";
+        EchoReply r;
+        using (Aster.Observability.Tracing.WithTraceContext(traceparent))
+        {
+            r = await conn.UnaryAsync<EchoRequest, EchoReply>("InteropEcho", "traceEcho", Probe()).WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        if (r.Message != TraceId) throw new InvalidOperationException($"server saw trace id '{r.Message}', want {TraceId}");
+        return r.ServerLang;
     }
 
     private static EchoRequest Probe(string message = "probe") => new() { Message = message };

@@ -11,6 +11,7 @@
 //     chat(stream interop/EchoRequest) -> stream interop/EchoReply  (bidi)
 //     hold(interop/EchoRequest) -> interop/EchoReply                (unary, blocks)
 //     cancelled(interop/EchoRequest) -> interop/EchoReply           (unary)
+//     traceEcho(interop/EchoRequest) -> interop/EchoReply           (unary)
 //   service InteropSession v1 (session-scoped): add(interop/EchoRequest) -> interop/EchoReply
 //
 // Expose mini-matrix: `expose-server` serves HTTP service interop-http on ALPN
@@ -155,21 +156,24 @@ public final class InteropEcho {
           "ingest", new Ingest(),
           "chat", new Chat(),
           "hold", new Hold(),
-          "cancelled", new Cancelled());
+          "cancelled", new Cancelled(),
+          "traceEcho", new TraceEcho());
     }
 
     @Override
     public Map<String, Class<?>> requestClasses() {
       return Map.of(
           "echo", EchoRequest.class, "generate", EchoRequest.class, "ingest", EchoRequest.class,
-          "chat", EchoRequest.class, "hold", EchoRequest.class, "cancelled", EchoRequest.class);
+          "chat", EchoRequest.class, "hold", EchoRequest.class, "cancelled", EchoRequest.class,
+          "traceEcho", EchoRequest.class);
     }
 
     @Override
     public Map<String, Class<?>> responseClasses() {
       return Map.of(
           "echo", EchoReply.class, "generate", EchoReply.class, "ingest", EchoReply.class,
-          "chat", EchoReply.class, "hold", EchoReply.class, "cancelled", EchoReply.class);
+          "chat", EchoReply.class, "hold", EchoReply.class, "cancelled", EchoReply.class,
+          "traceEcho", EchoReply.class);
     }
 
     @Override
@@ -307,6 +311,23 @@ public final class InteropEcho {
     @Override
     public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
       return codec.encode(new EchoReply("cancelled", HOLD_CANCELLED.get(), new byte[0], "java"));
+    }
+  }
+
+  /**
+   * {@code traceEcho}: replies the trace id (32 hex) of the handler's dispatch context, read from
+   * the {@code site.aster.otel.Tracing} carrier the dispatcher fills.
+   */
+  static final class TraceEcho implements UnaryDispatcher {
+    @Override
+    public MethodDescriptor descriptor() {
+      return desc("traceEcho", StreamingKind.UNARY);
+    }
+
+    @Override
+    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
+      String traceId = site.aster.otel.Tracing.currentTraceId();
+      return codec.encode(new EchoReply(traceId == null ? "" : traceId, 0, new byte[0], "java"));
     }
   }
 
@@ -741,8 +762,35 @@ public final class InteropEcho {
       ok &= runCase("deadline", () -> deadlineCase(client, addr, codec));
       ok &= runCase("cancel", () -> cancelCase(client, addr));
       ok &= runCase("session", () -> sessionCase(client, addr));
+      ok &= runCase("trace", () -> traceCase(client, addr));
     }
     System.exit(ok ? 0 : 1);
+  }
+
+  static final String TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+  /**
+   * {@code traceEcho} under a known, sampled {@code traceparent}: the client call takes the current
+   * {@code Tracing} context, and the server must report the same trace id.
+   */
+  static String traceCase(AsterClient client, NodeAddr addr) throws Exception {
+    byte[] span = new byte[8];
+    new java.util.Random().nextBytes(span);
+    span[0] |= 1;
+    String traceparent = "00-" + TRACE_ID + "-" + java.util.HexFormat.of().formatHex(span) + "-01";
+    EchoReply r =
+        site.aster.otel.Tracing.withTraceContext(
+            traceparent,
+            Map.of(),
+            () ->
+                client
+                    .<EchoRequest, EchoReply>call(
+                        addr, "InteropEcho", "traceEcho", new EchoRequest("probe", 0, new byte[0]), EchoReply.class)
+                    .get(15, TimeUnit.SECONDS));
+    if (!TRACE_ID.equals(r.message)) {
+      throw new IllegalStateException("server saw trace id '" + r.message + "', want " + TRACE_ID);
+    }
+    return r.server_lang;
   }
 
   static int cancelledCount(AsterClient client, NodeAddr addr) throws Exception {
