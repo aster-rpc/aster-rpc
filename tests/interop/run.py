@@ -122,11 +122,16 @@ def java_classpath() -> str:
     global _java_cp
     if _java_cp is None:
         out = HERE / ".java-classpath.txt"
-        subprocess.run(
-            ["mvn", *(["-o"] if _mvn_offline else []), "-q", "-pl", "aster-runtime",
-             "dependency:build-classpath", f"-Dmdep.outputFile={out}"],
-            cwd=JAVA_DIR, env=ENV, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        # -am + compile: sibling modules (aster-annotations) resolve from the
+        # reactor, not the local Maven repo, which a fresh CI cache lacks.
+        # The last module built is aster-runtime, so its classpath wins.
+        proc = subprocess.run(
+            ["mvn", "-B", *(["-o"] if _mvn_offline else []), "-q", "-pl", "aster-runtime", "-am",
+             "compile", "dependency:build-classpath", f"-Dmdep.outputFile={out}"],
+            cwd=JAVA_DIR, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
+        if proc.returncode != 0:
+            sys.exit(f"java classpath: mvn failed (exit {proc.returncode}):\n{proc.stdout}")
         deps = [p for p in out.read_text().strip().split(os.pathsep) if p and "/site/aster/" not in p]
         local = [str(JAVA_DIR / m / "target/classes") for m in ("aster-runtime", "aster-annotations")]
         _java_cp = os.pathsep.join(local + deps)
