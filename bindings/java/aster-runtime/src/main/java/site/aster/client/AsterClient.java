@@ -22,6 +22,8 @@ import site.aster.interceptors.Interceptor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
 import site.aster.node.NodeAddr;
+import site.aster.otel.Observability;
+import site.aster.otel.Tracing;
 import site.aster.registry.ServiceSummary;
 import site.aster.server.AsterServer;
 import site.aster.server.wire.RpcStatus;
@@ -55,7 +57,9 @@ public final class AsterClient implements AutoCloseable {
   private final AsterConfig config;
   private final List<Interceptor> interceptors;
   private final Map<String, IrohConnection> connectionCache = new ConcurrentHashMap<>();
-  private final Executor callExecutor = CallExecutor.INSTANCE;
+  // The submitter's trace context (a ScopedValue, which a plain pool does not inherit) travels
+  // with each task, so outbound calls continue the caller's trace.
+  private final Executor callExecutor = Tracing.propagating(CallExecutor.INSTANCE);
 
   /**
    * Inner credential JSON to present during consumer admission. Empty string ⇒ open-gate / dev
@@ -285,9 +289,17 @@ public final class AsterClient implements AutoCloseable {
       CallOptions options) {
     return connect(target)
         .thenApplyAsync(
-            conn ->
-                openServerStreamOn(
-                    conn, target.endpointId(), 0, service, method, request, responseType, options),
+            Tracing.bind(
+                conn ->
+                    openServerStreamOn(
+                        conn,
+                        target.endpointId(),
+                        0,
+                        service,
+                        method,
+                        request,
+                        responseType,
+                        options)),
             callExecutor);
   }
 
@@ -414,9 +426,10 @@ public final class AsterClient implements AutoCloseable {
       CallOptions options) {
     return connect(target)
         .thenApplyAsync(
-            conn ->
-                openBidiStreamOn(
-                    conn, target.endpointId(), 0, service, method, responseType, options),
+            Tracing.bind(
+                conn ->
+                    openBidiStreamOn(
+                        conn, target.endpointId(), 0, service, method, responseType, options)),
             callExecutor);
   }
 
@@ -922,6 +935,7 @@ public final class AsterClient implements AutoCloseable {
      * address, secret key / key file, transports — and build the client on it.
      */
     public CompletableFuture<AsterClient> build() {
+      Observability.ensureStarted(); // opens the log bridge (design Q2)
       site.aster.handle.IrohRuntime runtime = site.aster.handle.IrohRuntime.create();
       AsterConfig nodeConfig = config;
       byte[] key = secretKey != null && secretKey.length > 0 ? secretKey : null;

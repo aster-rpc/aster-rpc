@@ -32,6 +32,9 @@ import site.aster.interceptors.Interceptor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
 import site.aster.node.IrohNode;
+import site.aster.otel.Observability;
+import site.aster.otel.TraceContext;
+import site.aster.otel.Tracing;
 import site.aster.server.spi.BidiStreamDispatcher;
 import site.aster.server.spi.ClientStreamDispatcher;
 import site.aster.server.spi.MethodDispatcher;
@@ -88,6 +91,11 @@ public final class AsterServer implements AutoCloseable {
   private final ExecutorService streamingExecutor;
   private final site.aster.trust.ConsumerAdmissionHandler admissionHandler;
 
+  /** The ops listener attached to this server (null = none); closed with the server if owned. */
+  private final site.aster.health.HealthServer health;
+
+  private final boolean ownsHealth;
+
   /** 64-char hex doc-id of the registry doc created by the contract publisher; empty until then. */
   private volatile String registryNamespace = "";
 
@@ -112,8 +120,16 @@ public final class AsterServer implements AutoCloseable {
    */
   private final Map<String, Map<String, String>> peerAttributes = new ConcurrentHashMap<>();
 
-  private AsterServer(Builder b, IrohNode node, Dispatch dispatch, RegisteredService[] byIndex) {
+  private AsterServer(
+      Builder b,
+      IrohNode node,
+      Dispatch dispatch,
+      RegisteredService[] byIndex,
+      site.aster.health.HealthServer health,
+      boolean ownsHealth) {
     this.node = node;
+    this.health = health;
+    this.ownsHealth = ownsHealth;
     this.dispatch = dispatch;
     this.codec = b.codec != null ? b.codec : new ForyCodec();
     this.services = Map.copyOf(b.services);
@@ -178,6 +194,11 @@ public final class AsterServer implements AutoCloseable {
   /** The node ID of this server (hex string). */
   public String nodeId() {
     return node.nodeId();
+  }
+
+  /** The ops listener attached via {@link Builder#health}, or {@code null}. */
+  public site.aster.health.HealthServer health() {
+    return health;
   }
 
   public IrohNode node() {
@@ -292,7 +313,10 @@ public final class AsterServer implements AutoCloseable {
     }
     sessions.clear();
     connections.clear();
-    dispatch.close();
+    dispatch.close(); // aster_server_destroy clears the attached listener's ready flag first
+    if (ownsHealth && health != null) {
+      health.close();
+    }
     node.close();
   }
 
@@ -446,16 +470,25 @@ public final class AsterServer implements AutoCloseable {
       CallContext ctx = buildCallContext(call, method);
       long probeT3 = site.aster.probe.AsterProbes.ENABLED ? System.nanoTime() : 0L;
 
+      // The call's server span and inbound baggage are the current trace context (a ScopedValue
+      // plus the SLF4J MDC) for everything the handler runs, on whichever thread that is.
+      TraceContext trace = Tracing.fromDispatch(dispatch, callId, call.flags(), ctx.metadata());
+
       // Server interceptors run pre-dispatch with the raw request (Gate 3 already ran in Rust).
       if (!interceptors.isEmpty()) {
-        site.aster.interceptors.InterceptorChain.applyRequest(interceptors, ctx, call.request());
+        Tracing.runIn(
+            trace,
+            () ->
+                site.aster.interceptors.InterceptorChain.applyRequest(
+                    interceptors, ctx, call.request()));
       }
       if (Thread.currentThread().isVirtual()
           && (method instanceof ClientStreamDispatcher || method instanceof BidiStreamDispatcher)) {
-        streamingExecutor.execute(() -> runDispatch(call, method, ctx, probeT2, probeT3));
+        streamingExecutor.execute(
+            () -> Tracing.runIn(trace, () -> runDispatch(call, method, ctx, probeT2, probeT3)));
         return;
       }
-      runDispatch(call, method, ctx, probeT2, probeT3);
+      Tracing.runIn(trace, () -> runDispatch(call, method, ctx, probeT2, probeT3));
     } catch (Throwable t) {
       failWith(callId, t);
     }
@@ -628,8 +661,35 @@ public final class AsterServer implements AutoCloseable {
     private List<String> alpns = List.of(ASTER_ALPN, CONSUMER_ADMISSION_ALPN);
     private int ringCapacity = DEFAULT_RING_CAPACITY;
     private int maxSessionsPerConnection = DEFAULT_MAX_SESSIONS_PER_CONNECTION;
+    private site.aster.health.HealthServer health;
+    private String healthHost;
+    private int healthPort = -1;
 
     private Builder() {}
+
+    /**
+     * Serve the ops endpoints ({@code /healthz}, {@code /readyz}, {@code /metrics}) on {@code
+     * host}:{@code port} ({@code port} 0 = ephemeral; read it from {@link AsterServer#health()}).
+     * The listener is started with the server's node, attached before start (a successful start
+     * sets ready) and stopped by {@link AsterServer#close}. Bind {@code 127.0.0.1} unless a probe
+     * outside the host needs it.
+     */
+    public Builder health(String host, int port) {
+      this.healthHost = host;
+      this.healthPort = port;
+      this.health = null;
+      return this;
+    }
+
+    /**
+     * Attach an ops listener you started yourself ({@link site.aster.health.HealthServer#start}).
+     * You close it; the server only counts calls into it and sets ready / not ready.
+     */
+    public Builder health(site.aster.health.HealthServer health) {
+      this.health = health;
+      this.healthPort = -1;
+      return this;
+    }
 
     public Builder config(AsterConfig config) {
       this.config = config;
@@ -722,6 +782,8 @@ public final class AsterServer implements AutoCloseable {
     }
 
     public CompletableFuture<AsterServer> build() {
+      Observability
+          .ensureStarted(); // opens the log bridge (design Q2); exporters only if OTEL_* asks
       List<byte[]> alpnBytes = alpns.stream().map(s -> s.getBytes(StandardCharsets.UTF_8)).toList();
       // aster_node_start with the full config (ABI 3.2), plus the RPC + admission ALPNs.
       CompletableFuture<IrohNode> nodeFuture = IrohNode.start(config, alpnBytes, null);
@@ -772,8 +834,24 @@ public final class AsterServer implements AutoCloseable {
           byIndex[idx] = rs;
         }
         b.option(Dispatch.OPTION_MAX_SESSIONS_PER_CONNECTION, maxSessionsPerConnection);
-        Dispatch dispatch = b.start(ringCapacity);
-        return new AsterServer(this, node, dispatch, byIndex);
+        site.aster.health.HealthServer attached = health;
+        boolean owned = false;
+        if (attached == null && healthPort >= 0) {
+          attached = site.aster.health.HealthServer.start(node, healthHost, healthPort);
+          owned = true;
+        }
+        try {
+          if (attached != null) {
+            b.attachHealth(attached.nativeHandle());
+          }
+          Dispatch dispatch = b.start(ringCapacity);
+          return new AsterServer(this, node, dispatch, byIndex, attached, owned);
+        } catch (RuntimeException e) {
+          if (owned) {
+            attached.close();
+          }
+          throw e;
+        }
       }
     }
   }
