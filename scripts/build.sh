@@ -33,6 +33,7 @@ VERSIONED_BUILD_FILES=(
   aster/Cargo.toml
   aster-expose/Cargo.toml
   aster-macros/Cargo.toml
+  aster-otel/Cargo.toml
   aster-transport-salvo/Cargo.toml
   bindings/python/rust/Cargo.toml
   bindings/typescript/native/Cargo.toml
