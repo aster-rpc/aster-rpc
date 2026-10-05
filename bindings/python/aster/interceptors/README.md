@@ -12,14 +12,12 @@ disables all defaults).
 ```python
 from aster.interceptors.deadline import DeadlineInterceptor
 from aster.interceptors.rate_limit import RateLimitInterceptor
-from aster.interceptors.metrics import MetricsInterceptor
 
 server = AsterServer(
     services=[MyService()],
     interceptors=[
         DeadlineInterceptor(),
         RateLimitInterceptor(rate=1000, per="peer"),
-        MetricsInterceptor(),
     ],
 )
 ```
@@ -84,17 +82,13 @@ AuthInterceptor(
 | `metadata_key` | `"authorization"` | Metadata key for the token |
 | `scheme` | `"Bearer"` | Prefix stripped before validation |
 
-### MetricsInterceptor
+### Metrics and tracing
 
-Collects RED metrics (Rate, Errors, Duration). Optional OpenTelemetry
-integration; falls back to in-memory counters when OTel is unavailable.
-
-```python
-metrics = MetricsInterceptor()
-# After some calls:
-print(metrics.snapshot())
-# {'started': 100, 'succeeded': 95, 'failed': 5, 'in_flight': 2, ...}
-```
+There is no metrics interceptor: the Rust core records the RED metrics
+(`aster.rpc.server.requests_started`, `.requests_completed`, `.duration`,
+`.in_flight`) and the server and client spans itself. Enable export with
+`aster.observability.init(...)` or `OTEL_*`, scrape with `aster.HealthServer`
+(`/metrics`), and add your own with `aster.metrics` and `aster.tracing`.
 
 ### AuditLogInterceptor
 

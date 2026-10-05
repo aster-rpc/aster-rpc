@@ -101,7 +101,9 @@ Built-in middleware that wraps every RPC call. Configure them on the
 - :class:`RetryInterceptor` -- automatic retry for idempotent methods
 - :class:`CircuitBreakerInterceptor` -- circuit breaker for failing endpoints
 - :class:`AuditLogInterceptor` -- log every RPC call for audit
-- :class:`MetricsInterceptor` -- collect call latency and error metrics
+- :class:`HealthServer` -- ``/healthz``, ``/readyz`` and Prometheus ``/metrics`` (Rust)
+- :mod:`aster.metrics`, :mod:`aster.tracing`, :mod:`aster.observability` -- OpenTelemetry
+  metrics, spans and the pipeline, over Rust
 """
 
 from aster.runtime import AsterServer, AsterClient, AdmissionDeniedError
@@ -120,8 +122,9 @@ from aster.interceptors import (
     RetryInterceptor,
     CircuitBreakerInterceptor,
     AuditLogInterceptor,
-    MetricsInterceptor,
 )
+from aster._aster import HealthServer
+from aster import metrics, tracing, observability
 
 
 __all__ = [
@@ -160,5 +163,9 @@ __all__ = [
     "RetryInterceptor",
     "CircuitBreakerInterceptor",
     "AuditLogInterceptor",
-    "MetricsInterceptor",
+    # Observability
+    "HealthServer",
+    "metrics",
+    "tracing",
+    "observability",
 ]

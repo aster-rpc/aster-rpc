@@ -37,7 +37,7 @@ from aster.interceptors.base import (
     normalize_error,
 )
 from aster.limits import MAX_CLIENT_STREAM_ITEMS
-from aster.logging import request_context
+from aster.tracing import _CallScope
 from aster.status import RpcError, StatusCode
 
 logger = logging.getLogger(__name__)
@@ -515,6 +515,8 @@ class Dispatcher:
             if interceptors:
                 request = await apply_request_interceptors(interceptors, ctx, request)
             handler = getattr(self._instance(call, svc), m.name)
+            scope = _CallScope(call)
+            scope.__enter__()
             token = CallContext._current.set(ctx)
             try:
                 result = handler(request, ctx) if m.accepts_ctx else handler(request)
@@ -522,6 +524,7 @@ class Dispatcher:
                     result = await result
             finally:
                 CallContext._current.reset(token)
+                scope.__exit__()
             if interceptors:
                 result = await apply_response_interceptors(interceptors, ctx, result)
             await self._respond(call, self._codec.encode(result))
@@ -538,7 +541,7 @@ class Dispatcher:
         interceptors = svc.interceptors
         token = None
         try:
-            with request_context(request_id=ctx.call_id, service=svc.name, method=m.name, peer=call.peer):
+            with _CallScope(call):
                 if interceptors:
                     await apply_request_interceptors(interceptors, ctx, None)
                 try:
@@ -575,7 +578,7 @@ class Dispatcher:
         interceptors = svc.interceptors
         token = None
         try:
-            with request_context(request_id=ctx.call_id, service=svc.name, method=m.name, peer=call.peer):
+            with _CallScope(call):
                 if interceptors:
                     await apply_request_interceptors(interceptors, ctx, None)
                 requests = self._requests(call, m, ctx, interceptors)
@@ -602,7 +605,7 @@ class Dispatcher:
         interceptors = svc.interceptors
         token = None
         try:
-            with request_context(request_id=ctx.call_id, service=svc.name, method=m.name, peer=call.peer):
+            with _CallScope(call):
                 if interceptors:
                     await apply_request_interceptors(interceptors, ctx, None)
                 requests = self._requests(call, m, ctx, interceptors)

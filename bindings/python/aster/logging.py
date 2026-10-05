@@ -4,9 +4,14 @@ aster.logging -- Production-grade structured logging for the Aster RPC framework
 Provides:
   - JSON structured logging (default in production) or human-readable (dev)
   - Configurable via environment variables
-  - Request correlation IDs via contextvars
+  - Correlation fields from the current RPC call (``CallContext``) and the
+    current trace (``trace_id`` / ``span_id`` from ``aster.tracing``)
   - Sensitive field masking
   - Standard fields: timestamp, level, logger, service, method, peer, duration
+  - Rust log records (``aster_origin="rust"``) arrive through the log bridge
+    (``aster._logbridge``) as ordinary ``logging`` records
+  - Helpers for your own records: ``LoggingFilter``, ``structlog_processor``,
+    ``loguru_patcher``, and ``AsterLogHandler`` (OTLP export of application logs)
 
 Configuration:
   ASTER_LOG_FORMAT   = "json" | "text"     (default: "text")
@@ -15,18 +20,19 @@ Configuration:
 
 Usage::
 
-    from aster.logging import configure_logging, get_logger, request_context
+    from aster.logging import configure_logging, get_logger
 
     configure_logging()  # call once at startup
     logger = get_logger(__name__)
 
-    with request_context(service="Hello", method="sayHello", peer="abc123"):
-        logger.info("handling request", extra={"payload_size": 1024})
+    logger.info("handling request", extra={"payload_size": 1024})
+
+After ``logging.config.dictConfig`` / ``basicConfig`` call
+``aster.logging.sync_level()`` so Rust filters by the new ``aster`` level.
 """
 
 from __future__ import annotations
 
-import contextvars
 import json
 import logging
 import os
@@ -34,63 +40,102 @@ import time
 from typing import Any
 
 
-# ── Context variables for request correlation ─────────────────────────────────
-
-_request_id: contextvars.ContextVar[str] = contextvars.ContextVar("aster_request_id", default="")
-_service_name: contextvars.ContextVar[str] = contextvars.ContextVar("aster_service", default="")
-_method_name: contextvars.ContextVar[str] = contextvars.ContextVar("aster_method", default="")
-_peer_id: contextvars.ContextVar[str] = contextvars.ContextVar("aster_peer", default="")
+# ── Correlation fields ────────────────────────────────────────────────────────
 
 
-class request_context:
-    """Context manager that sets correlation fields for the current async scope.
+def _call_fields() -> tuple[str, str, str, str]:
+    """``(request_id, service, method, peer)`` of the RPC being handled."""
+    try:
+        from aster.interceptors.base import CallContext
+    except Exception:  # noqa: BLE001 -- import cycle during start-up
+        return "", "", "", ""
+    ctx = CallContext.current()
+    if ctx is None:
+        return "", "", "", ""
+    return ctx.call_id or "", ctx.service or "", ctx.method or "", ctx.peer or ""
 
-    Usage::
 
-        with request_context(request_id="abc", service="Hello", method="sayHello"):
-            logger.info("processing")
-            # log output includes service, method, request_id automatically
+def _trace_fields(record: logging.LogRecord) -> tuple[str, str]:
+    """``(trace_id, span_id)``: the record's own (a bridged Rust record carries
+    the ids of the span it was emitted in), else the current trace context."""
+    tid = getattr(record, "trace_id", None)
+    if tid is not None:
+        return tid, getattr(record, "span_id", "") or ""
+    from aster import tracing
+
+    return tracing.current_trace_id() or "", tracing.current_span_id() or ""
+
+
+class LoggingFilter(logging.Filter):
+    """Adds ``trace_id`` and ``span_id`` (``""`` outside a trace) to every record
+    that passes, so any formatter can print ``%(trace_id)s``::
+
+        handler.addFilter(aster.logging.LoggingFilter())
     """
 
-    def __init__(
-        self,
-        request_id: str = "",
-        service: str = "",
-        method: str = "",
-        peer: str = "",
-    ) -> None:
-        self._tokens: list[Any] = []
-        self._request_id = request_id
-        self._service = service
-        self._method = method
-        self._peer = peer
-
-    def __enter__(self) -> "request_context":
-        if self._request_id:
-            self._tokens.append(_request_id.set(self._request_id))
-        if self._service:
-            self._tokens.append(_service_name.set(self._service))
-        if self._method:
-            self._tokens.append(_method_name.set(self._method))
-        if self._peer:
-            self._tokens.append(_peer_id.set(self._peer))
-        return self
-
-    def __exit__(self, *args: Any) -> None:
-        for token in reversed(self._tokens):
-            # contextvars Token.reset() restores the previous value
-            token.var.reset(token)
-        self._tokens.clear()
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.trace_id, record.span_id = _trace_fields(record)
+        return True
 
 
-def get_request_id() -> str:
-    """Get the current request ID from context."""
-    return _request_id.get()
+def structlog_processor(logger: Any, method_name: str, event_dict: dict) -> dict:
+    """``structlog`` processor adding ``trace_id`` / ``span_id`` when a trace is current."""
+    from aster import tracing
+
+    tid = tracing.current_trace_id()
+    if tid:
+        event_dict.setdefault("trace_id", tid)
+        event_dict.setdefault("span_id", tracing.current_span_id())
+    return event_dict
 
 
-def set_request_id(rid: str) -> None:
-    """Set the current request ID in context."""
-    _request_id.set(rid)
+def loguru_patcher(record: dict) -> None:
+    """``loguru`` patcher: ``logger.configure(patcher=aster.logging.loguru_patcher)``."""
+    from aster import tracing
+
+    record["extra"]["trace_id"] = tracing.current_trace_id() or ""
+    record["extra"]["span_id"] = tracing.current_span_id() or ""
+
+
+class AsterLogHandler(logging.Handler):
+    """Export your application's log records through Rust's OTLP logs pipeline
+    (``otlp_logs=True`` / ``OTEL_LOGS_EXPORTER=otlp``), with the current trace
+    context. Records that came from Rust (``aster_origin="rust"``) are skipped:
+    Rust already exported them. A no-op when no logs exporter is configured.
+    """
+
+    _LEVELS = ((40, 1), (30, 2), (20, 3), (10, 4), (0, 5))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "aster_origin", None) == "rust":
+            return
+        try:
+            from aster import _aster, tracing
+
+            level = next(r for floor, r in self._LEVELS if record.levelno >= floor)
+            fields = [
+                ("code.namespace", record.name),
+                ("code.function", record.funcName or ""),
+            ]
+            _aster.log_emit(
+                level,
+                record.name,
+                record.getMessage(),
+                fields,
+                int(record.created * 1e9),
+                tracing.current_traceparent(),
+            )
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
+
+
+def sync_level() -> str | None:
+    """Make the Rust log filter follow the ``aster`` logger's effective level.
+    Call it after ``logging.config.dictConfig`` or ``basicConfig``. Returns the
+    directives applied, or ``None`` when the log bridge is not open."""
+    from aster import _logbridge
+
+    return _logbridge.sync_level()
 
 
 # ── Sensitive field masking ───────────────────────────────────────────────────
@@ -102,7 +147,7 @@ _SENSITIVE_FIELDS = frozenset({
 })
 
 _MASK_FIELDS = frozenset({
-    "root_pubkey", "endpoint_id", "node_id", "peer",
+    "root_pubkey", "endpoint_id", "node_id", "peer", "aster_peer",
     "nonce", "contract_id",
 })
 
@@ -151,24 +196,27 @@ class JsonFormatter(logging.Formatter):
             "msg": record.getMessage(),
         }
 
-        # Add correlation context
-        rid = _request_id.get()
+        # Add correlation context: the call being handled, the current trace
+        rid, svc, method, peer = _call_fields()
         if rid:
             entry["request_id"] = rid
-        svc = _service_name.get()
         if svc:
             entry["service"] = svc
-        method = _method_name.get()
         if method:
             entry["method"] = method
-        peer = _peer_id.get()
         if peer:
             entry["peer"] = _mask_value("peer", peer)
+        tid, sid = _trace_fields(record)
+        if tid:
+            entry["trace_id"] = tid
+            entry["span_id"] = sid
 
-        # Add extra fields from the log call
+        # Add extra fields from the log call (and from bridged Rust records)
         for key in ("service", "method", "peer", "request_id", "duration_ms",
                      "status_code", "error", "payload_size", "stream_count",
-                     "contract_id", "endpoint_id", "version"):
+                     "contract_id", "endpoint_id", "version",
+                     "rpc_service", "rpc_method", "aster_peer", "aster_call_id",
+                     "aster_origin"):
             val = getattr(record, key, None)
             if val is not None and key not in entry:
                 entry[key] = _mask_value(key, val)
@@ -193,6 +241,7 @@ class TextFormatter(logging.Formatter):
     """
 
     _LEVEL_COLORS = {
+        "TRACE": "\033[90m",    # grey
         "DEBUG": "\033[36m",    # cyan
         "INFO": "\033[32m",     # green
         "WARNING": "\033[33m",  # yellow
@@ -224,15 +273,16 @@ class TextFormatter(logging.Formatter):
 
         # Build context suffix
         ctx_parts: list[str] = []
-        rid = _request_id.get()
+        rid, svc, method, _peer = _call_fields()
         if rid:
             ctx_parts.append(f"req={rid[:8]}")
-        svc = _service_name.get()
         if svc:
             ctx_parts.append(f"svc={svc}")
-        method = _method_name.get()
         if method:
             ctx_parts.append(f"method={method}")
+        tid, _sid = _trace_fields(record)
+        if tid:
+            ctx_parts.append(f"trace={tid[:8]}")
 
         for key in ("duration_ms", "status_code", "payload_size"):
             val = getattr(record, key, None)
@@ -275,6 +325,7 @@ def configure_logging(
 
     # Map level string
     level_map = {
+        "trace": 5,
         "debug": logging.DEBUG,
         "info": logging.INFO,
         "warning": logging.WARNING,
@@ -300,6 +351,12 @@ def configure_logging(
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     aster_logger.addHandler(handler)
+    # Rust filters by level before allocating: keep it in step (unless an
+    # explicit Rust filter was given).
+    from aster import _logbridge
+
+    if not _logbridge.is_pinned():
+        _logbridge.sync_level()
 
     # Prevent propagation to root logger (avoids duplicate output)
     aster_logger.propagate = False

@@ -258,13 +258,9 @@ async def handle_consumer_admission_rpc(
         logger.warning("consumer admission: malformed request from %s: %s", peer_node_id, exc)
         return _denied
 
-    from aster.health import get_admission_metrics
-    _adm = get_admission_metrics()
-
     # Dev mode / open gate: empty credential → auto-admit.
     if not req.credential_json and allow_unenrolled:
         _admit_peer(gate, peer_node_id)
-        _adm.record_consumer_admit()
         logger.info("consumer admission: auto-admitted %s (open gate)", peer_node_id)
         return ConsumerAdmissionResponse(
             admitted=True,
@@ -299,12 +295,10 @@ async def handle_consumer_admission_rpc(
     )
 
     if not result.admitted:
-        _adm.record_consumer_deny()
         logger.info("consumer admission: denied %s", peer_node_id)
         return _denied
 
     _admit_peer(gate, peer_node_id, result.attributes, cred.expires_at)
-    _adm.record_consumer_admit()
     logger.info("consumer admission: admitted %s (expires_at=%d)", peer_node_id, cred.expires_at)
 
     resp = ConsumerAdmissionResponse(

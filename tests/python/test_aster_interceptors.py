@@ -13,7 +13,6 @@ from aster.interceptors import (
     AuthInterceptor,
     CircuitBreakerInterceptor,
     DeadlineInterceptor,
-    MetricsInterceptor,
     RetryInterceptor,
 )
 from aster.status import RpcError, StatusCode
@@ -49,19 +48,16 @@ class TestPhase7Interceptors:
     @pytest.mark.asyncio
     async def test_local_transport_interceptors_run(self):
         audit = AuditLogInterceptor()
-        metrics = MetricsInterceptor()
         client = create_local_client(
             InterceptorService,
             InterceptorService(),
             wire_compatible=True,
-            interceptors=[audit, metrics],
+            interceptors=[audit],
         )
 
         response = await client.echo(EchoRequest("hello"))
         assert response.message == "hello"
         assert [e["event"] for e in audit.sink] == ["request", "response"]
-        assert metrics.started == 1
-        assert metrics.succeeded == 1
 
     @pytest.mark.asyncio
     async def test_deadline_enforcement(self):

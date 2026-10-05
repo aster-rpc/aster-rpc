@@ -328,7 +328,8 @@ from .client import (
 )
 from .runtime import AsterServer, AsterClient, ClientSession, AdmissionDeniedError, RPC_ALPN
 from .capabilities import any_of, all_of
-from .health import HealthServer, check_health, check_ready, metrics_snapshot
+from ._aster import HealthServer
+from . import metrics, tracing, observability
 from .interceptors import (
     CallContext,
     Interceptor,
@@ -337,7 +338,6 @@ from .interceptors import (
     RetryInterceptor,
     CircuitBreakerInterceptor,
     AuditLogInterceptor,
-    MetricsInterceptor,
 )
 
 # The compiled constant remains correct even when the wheel was unpacked or
@@ -578,7 +578,11 @@ __all__ = [
     "RetryInterceptor",
     "CircuitBreakerInterceptor",
     "AuditLogInterceptor",
-    "MetricsInterceptor",
+    # ── Observability (Rust pipeline; see aster.observability) ──
+    "HealthServer",
+    "metrics",
+    "tracing",
+    "observability",
     # ── High-level declarative API ──
     "AsterConfig",
     "AsterServer",
