@@ -3,6 +3,20 @@ targets = []
 
 [advisories]
 version = 2
+# Unmaintained-only advisories with no maintained release of the crate that
+# pulls them in. Revisit when the parent moves on. Every vulnerability
+# advisory must be fixed, not listed here.
+ignore = [
+  # heapless 0.7 adds it only on targets without native compare-and-swap
+  # (postcard's default `heapless-cas`, via the iroh crates); none of our
+  # targets compile it.
+  { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill: never compiled on our targets" },
+  # Build-time proc-macro helper of Apache Fory 1.7.6 (pinned exactly for the
+  # cross-language wire format).
+  { id = "RUSTSEC-2024-0436", reason = "paste: build-time only, via fory-core 1.7.6" },
+  # Build-time proc-macro helper of genawaiter 0.99.1 (latest), via bao-tree.
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: build-time only, via genawaiter" },
+]
 
 [licenses]
 version = 2
