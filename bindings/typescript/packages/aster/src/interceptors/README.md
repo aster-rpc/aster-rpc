@@ -13,13 +13,11 @@ client gets `DEADLINE_EXCEEDED` and the handler's `ctx.signal` aborts), and
 ```typescript
 import { RpcServer } from 'aster';
 import { RateLimitInterceptor } from 'aster/interceptors/rate-limit';
-import { MetricsInterceptor } from 'aster/interceptors/metrics';
 
 const server = new RpcServer({
   registry,
   interceptors: [
     new RateLimitInterceptor({ perPeerRps: 1000 }),
-    new MetricsInterceptor(),
   ],
 });
 ```
@@ -67,17 +65,13 @@ new AuthInterceptor(
 )
 ```
 
-### MetricsInterceptor
+### Metrics
 
-Collects RED metrics (Rate, Errors, Duration). Optional OpenTelemetry
-integration; falls back to in-memory counters.
-
-```typescript
-const metrics = new MetricsInterceptor();
-// After some calls:
-console.log(metrics.snapshot());
-// { started: 100, succeeded: 95, failed: 5, inFlight: 2, ... }
-```
+There is no metrics interceptor: RED metrics (`aster.rpc.server.requests_started`,
+`...requests_completed`, `...duration`, `...in_flight`) are recorded in Rust for
+every call and served at `/metrics` / exported over OTLP. For your own
+instruments use `metrics.counter(...)` and `tracing.withSpan(...)`
+(`@aster-rpc/aster`).
 
 ### AuditLogInterceptor
 

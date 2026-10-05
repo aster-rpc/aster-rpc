@@ -20,6 +20,7 @@ import type {
   BlobsClient,
   DocsClient,
   GossipClient,
+  HealthServer,
   IrohConnection,
   Node as NativeNode,
 } from '@aster-rpc/transport';
@@ -245,9 +246,14 @@ export class Node implements AsyncDisposable {
     return this.native.connectNodeAddr(peer.nodeId, alpnBuf, direct, peer.relayUrl);
   }
 
-  /** Transport metrics in Prometheus text exposition format. */
-  metricsPrometheus(): string {
-    return this.native.metricsPrometheus();
+  /**
+   * Serve `/healthz`, `/readyz` and `/metrics` (OTel Prometheus text,
+   * including the transport counters) on `host:port` from Rust. Port `0`
+   * binds an ephemeral port. Starts the observability pipeline from the
+   * environment when nothing has. Replaces the former `metricsPrometheus()`.
+   */
+  async startHealth(options: { host?: string; port?: number } = {}): Promise<HealthServer> {
+    return loadNative().HealthServer.start(this.native, options);
   }
 
   /**

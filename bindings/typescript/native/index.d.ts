@@ -738,6 +738,41 @@ export declare class GrantorSerializer {
 }
 
 /**
+ * The health / readiness / metrics HTTP listener. Start with
+ * `HealthServer.start(node, options)`; `stop()` releases the port.
+ */
+export declare class HealthServer {
+  /**
+   * Bind and serve for `node`. Joins (or starts, from the environment) the
+   * observability pipeline and gives it the Prometheus pull reader, so
+   * `/metrics` is never empty.
+   */
+  static start(node: Node, options?: HealthOptions | undefined | null): Promise<HealthServer>
+  /** The bound `host:port`. */
+  get addr(): string
+  /** The bound port. */
+  get port(): number
+  /** Liveness (`/healthz`). */
+  setHealthy(healthy: boolean): void
+  /**
+   * Readiness of the application itself (`/readyz` also needs every
+   * check true).
+   */
+  setReady(ready: boolean): void
+  /** Services reported by `/readyz`. */
+  setServices(count: number): void
+  /** Whether the application and every check are ready. */
+  isReady(): boolean
+  isHealthy(): boolean
+  /** A named readiness check (created failing until it says `true`). */
+  check(name: string): ReadinessCheckHandle
+  /** Drop a named check. `false` when it did not exist. */
+  removeCheck(name: string): boolean
+  /** Stop listening and wait until the port is released. Idempotent. */
+  stop(): Promise<void>
+}
+
+/**
  * One HTTP exchange's body handle: read the request body, write the
  * response body. Everything async here is a napi async function: nothing
  * blocks the JavaScript thread.
@@ -1155,8 +1190,6 @@ export declare class Node {
    * Closes the shared node: every handle to it stops working.
    */
   close(): Promise<void>
-  /** Transport metrics in Prometheus text exposition format. */
-  metricsPrometheus(): string
   /**
    * This node's topology view (v1 peers; v2 shared swarm). Populates only
    * when the node runs with `enableMonitoring`.
@@ -1241,6 +1274,18 @@ export declare class PolicyDoc {
    * `<prefix>/grants/<recipient>`, or `null`.
    */
   fetchGrant(prefix: string, recipient: string): Promise<Buffer | null>
+}
+
+/**
+ * A named readiness check (`HealthServer.check`). The server is ready only
+ * while the application is ready and every check is `true`. Created failing.
+ */
+export declare class ReadinessCheckHandle {
+  /** Set the check. */
+  set(ok: boolean): void
+  /** The check's current value. */
+  get ok(): boolean
+  get name(): string
 }
 
 /**
@@ -1567,10 +1612,19 @@ export interface AsterConfig {
   logLevel?: string
   /** Mask sensitive fields in logs. `ASTER_LOG_MASK`. */
   logMask?: boolean
-  /** Health HTTP port; `0` disables. `ASTER_HEALTH_PORT`, `[health] port`. */
+  /**
+   * Health HTTP port; `0` disables unless `healthEnabled`. `ASTER_HEALTH_PORT`,
+   * `[health] port`.
+   */
   healthPort?: number
   /** Health HTTP host. `ASTER_HEALTH_HOST`, `[health] host`. */
   healthHost?: string
+  /**
+   * Force the listener on (`true`, ephemeral port when `healthPort` is 0) or
+   * off (`false`). Unset: on exactly when `healthPort` is non-zero.
+   * `ASTER_HEALTH_ENABLED`, `[health] enabled`.
+   */
+  healthEnabled?: boolean
 }
 
 /**
@@ -1672,6 +1726,14 @@ export interface AttestOptions {
  * secrets are 32-byte Ed25519 seeds (hex or bytes).
  */
 export declare function attestRootNode(rootSecret: string | Uint8Array, nodeSecret: string | Uint8Array, options?: AttestOptions | undefined | null): Buffer
+
+export declare function attrsetFree(handle: number): boolean
+
+/**
+ * Intern an attribute set; pass its handle to the `metric*` calls to skip
+ * building the list per record.
+ */
+export declare function attrsetNew(attributes: Record<string, string>): number
 
 /**
  * The correlation fingerprint of a `(namespace, access)` pair — the value an
@@ -2174,6 +2236,11 @@ export interface DispatchEvent {
   attributes?: Record<string, string>
   /** The ALPN of a non-RPC connection (`kind` 7). */
   alpn?: string
+  /**
+   * W3C `traceparent` of the call's server span, when it is exported
+   * (`flags & HAS_TRACE`). Binding spans and logs parent on it.
+   */
+  traceparent?: string
 }
 
 /** Options for [`DispatchServer::serve`] / [`DispatchServer::start`]. */
@@ -2251,6 +2318,14 @@ export interface EdgeRouteInfo {
   /** The origin node (hex node id). */
   nodeId: string
 }
+
+/**
+ * Test hook: emit `count` Rust events on target `aster::o7test` from a
+ * background thread, `intervalUs` apart, at `level` (1 error .. 5 trace,
+ * default 3). Messages are `<prefix> <i>`. Returns at once; watch
+ * `logStats().testEmitted`. Not part of the public API.
+ */
+export declare function emitTestLogs(count: number, intervalUs?: number | undefined | null, level?: number | undefined | null, prefix?: string | undefined | null): void
 
 /** Encode a `CallHeader` to AEv1 bytes. */
 export declare function encodeCallHeader(h: NativeCallHeader): Buffer
@@ -2504,6 +2579,14 @@ export interface GrantRecordObject {
   reason: string
 }
 
+/** Where the listener binds. */
+export interface HealthOptions {
+  /** Bind host. Default `127.0.0.1` (localhost only; pods need `0.0.0.0`). */
+  host?: string
+  /** TCP port; `0` binds an ephemeral one (read it back with `addr`). */
+  port?: number
+}
+
 export declare function hpkeEnvelopeAlg(): string
 
 export declare function hpkeEnvelopeDecode(data: Buffer): HpkeEnvelopeObject
@@ -2569,6 +2652,16 @@ export interface IdentityPeer {
   /** Published-service metadata (service name → JSON values). */
   publishedServices: any
 }
+
+/** Free an instrument handle. `false` when it was already gone. */
+export declare function instrumentFree(handle: number): boolean
+
+/**
+ * Declare an instrument on the global meter (scope `aster.app`). `kind`: 1
+ * counter (u64), 2 up-down counter (i64), 3 histogram (f64), 4 gauge (f64).
+ * Returns its handle. A name that exists with another kind fails.
+ */
+export declare function instrumentNew(kind: number, name: string, description?: string | undefined | null, unit?: string | undefined | null, autoAttrs?: Array<string> | undefined | null, cardinalityLimit?: number | undefined | null): number
 
 /**
  * The fence rule against `row`: `null` when `writer` (the authenticated
@@ -2650,6 +2743,9 @@ export interface LeaseTransition {
   denyReason?: 'held_by_other' | 'epoch_mismatch' | 'not_holder' | 'expired' | 'not_held' | 'unauthorized'
 }
 
+/** Spans started and not yet ended (diagnostics). */
+export declare function liveSpans(): number
+
 /**
  * Load a `.aster-identity` file (Rust `AsterConfig::load_identity`).
  *
@@ -2658,6 +2754,91 @@ export interface LeaseTransition {
  * the file does not exist; a malformed file is an error.
  */
 export declare function loadAsterIdentity(path?: string | undefined | null, peerName?: string | undefined | null, role?: string | undefined | null): AsterIdentity | null
+
+/** The bridge's directives as last set, or `null` when it is not open. */
+export declare function logFilter(): string | null
+
+/**
+ * Drain up to `max` queued records synchronously (default 256), without
+ * waiting. Works in either mode (in TSFN mode the drain thread yields for
+ * the call, up to one idle poll). The fallback for Bun and the final drain
+ * at exit.
+ */
+export declare function logPoll(max?: number | undefined | null): Array<RustLogRecord>
+
+/**
+ * Replace the bridge's `EnvFilter` directives (the Rust side of the
+ * binding's level sync). `aster::audit=info` is kept unless named.
+ */
+export declare function logSetFilter(directives: string): void
+
+/**
+ * Switch between TSFN delivery (`false`) and JavaScript polling (`true`).
+ * In poll mode the drain thread parks and `logPoll` is the only reader.
+ */
+export declare function logSetPollMode(enabled: boolean): void
+
+/** Options for `logSinkStart`. */
+export interface LogSinkOptions {
+  /** Most records per batch handed to JavaScript (default 256). */
+  maxBatch?: number
+  /**
+   * Start in poll mode: no TSFN deliveries, JavaScript calls `logPoll`
+   * (Bun, where TSFN delivery can stall).
+   */
+  poll?: boolean
+  /**
+   * Queued TSFN calls (of 64) above which small batches are coalesced
+   * into full ones instead of sent (default 32). 64 or more never holds:
+   * a refused batch is then dropped and counted.
+   */
+  holdAbove?: number
+}
+
+/**
+ * Start delivering Rust log records: `onBatch` is called on the JavaScript
+ * thread with each batch (an empty batch is a watchdog nudge; ignore it).
+ * Needs the bridge open (`observabilityInit` with `logBridge`). The callback
+ * does not keep the process alive. One sink at a time.
+ */
+export declare function logSinkStart(onBatch: (records: RustLogRecord[]) => void, options?: LogSinkOptions | undefined | null): void
+
+/**
+ * Stop the sink. Records still queued in Rust stay queued for the next sink.
+ * Idempotent.
+ */
+export declare function logSinkStop(): void
+
+export declare function logStats(): LogStats
+
+/** Log delivery counters. */
+export interface LogStats {
+  /** A sink is running (its drain thread has not exited). */
+  running: boolean
+  pollMode: boolean
+  /** Records the TSFN accepted. */
+  forwarded: number
+  /** Records in batches the TSFN refused (queue full). */
+  sinkDropped: number
+  droppedBatches: number
+  batches: number
+  /** Records the TSFN callback handed to JavaScript. */
+  delivered: number
+  /** TSFN callbacks run on the JavaScript thread. */
+  callbacks: number
+  /** Nudge calls queued by the Bun watchdog. */
+  rescues: number
+  /** Records returned by `logPoll`. */
+  polled: number
+  /** Records the Rust queue dropped when it was full (process-wide). */
+  bridgeDropped: number
+  /** `aster::audit` records the Rust queue dropped. */
+  auditDropped: number
+  /** Records waiting in the Rust queue. */
+  pending: number
+  /** Records `emitTestLogs` has emitted so far (process-wide). */
+  testEmitted: number
+}
 
 /** Largest size a compressed payload may expand to, bytes. */
 export const MAX_DECOMPRESSED_SIZE: number
@@ -2671,6 +2852,15 @@ export const MAX_FRAME_SIZE: number
  * `null` when the payload should be sent uncompressed.
  */
 export declare function maybeCompress(payload: Uint8Array, threshold?: number | undefined | null): Buffer | null
+
+/** Add to an up-down counter (kind 2). `value` must be an integer. */
+export declare function metricAddI64(instrument: number, value: number, attrset?: number | undefined | null, attributes?: Record<string, string> | undefined | null): void
+
+/** Add to a counter (kind 1). `value` must be a non-negative integer. */
+export declare function metricAddU64(instrument: number, value: number, attrset?: number | undefined | null, attributes?: Record<string, string> | undefined | null): void
+
+/** Record on a histogram (kind 3) or set a gauge (kind 4). */
+export declare function metricRecordF64(instrument: number, value: number, attrset?: number | undefined | null, attributes?: Record<string, string> | undefined | null): void
 
 export declare function namespaceCapabilityDecode(data: Buffer): DecodedNamespaceCapability
 
@@ -2713,6 +2903,65 @@ export interface NativeStreamHeader {
   /** `0` = stateless shared-pool stream; non-zero = session-bound. */
   sessionId: number
 }
+
+/**
+ * Flush every signal of the running pipeline, waiting at most `timeoutMs`.
+ * No pipeline: resolves at once.
+ */
+export declare function observabilityFlush(timeoutMs?: number | undefined | null): Promise<void>
+
+/**
+ * Start the observability pipeline, or join the running one (reference
+ * count + 1). A different configuration than the running pipeline's fails;
+ * `logBridge` is additive. Each success must be matched by one
+ * `observabilityShutdown`. Runs on a helper thread (an init can flush the
+ * provider it replaces).
+ */
+export declare function observabilityInit(options?: ObservabilityOptions | undefined | null): Promise<void>
+
+/**
+ * Options for `observabilityInit`. Explicit fields beat `OTEL_*` / `ASTER_*`
+ * env (read unless `fromEnv` is `false`), which beats `extraToml`, which
+ * beats the defaults.
+ */
+export interface ObservabilityOptions {
+  /** Apply `OTEL_*` / `ASTER_*` env under the explicit fields. Default true. */
+  fromEnv?: boolean
+  /** `service.name`. */
+  serviceName?: string
+  /** OTLP base URL (`/v1/<signal>` is appended). */
+  otlpEndpoint?: string
+  /** OTLP request headers. Secret: never logged or echoed. */
+  otlpHeaders?: Record<string, string>
+  /** Extra resource attributes. */
+  resourceAttributes?: Record<string, string>
+  /** `EnvFilter` directives for Rust events (`ASTER_LOG`). */
+  logFilter?: string
+  /** An `[observability]` TOML table (the header line may be omitted). */
+  extraToml?: string
+  /** Parent-based trace-id-ratio sampler in `[0, 1]`. */
+  traceSampleRatio?: number
+  /** Export traces over OTLP. Unset: env decides (with `fromEnv`), else off. */
+  exportTraces?: boolean
+  /** Export metrics over OTLP. Unset: env decides (with `fromEnv`), else off. */
+  exportMetrics?: boolean
+  /** Export Rust log records over OTLP. Unset: env decides, else off. */
+  exportOtlpLogs?: boolean
+  /** Open the binding log queue for `logSinkStart` / `logPoll` (default true). */
+  logBridge?: boolean
+  /** Bound of the Rust-side log queue in records (`ASTER_LOG_QUEUE`). */
+  logQueue?: number
+}
+
+/**
+ * Release one reference taken by `observabilityInit`. The last reference
+ * (counting other holders, such as a health listener) shuts the pipeline
+ * down: providers flush and stop, the log bridge closes, live spans end and
+ * instrument handles are freed. Resolves `false` when the addon holds no
+ * reference. Waits at most `timeoutMs`; the shutdown then finishes in the
+ * background.
+ */
+export declare function observabilityShutdown(timeoutMs?: number | undefined | null): Promise<boolean>
 
 /**
  * Open an envelope with the recipient's identity secret (hex or 32 bytes)
@@ -2811,6 +3060,13 @@ export interface PeerView {
   isConnected: boolean
 }
 
+/**
+ * The OTel Prometheus pull reader's scrape (the `/metrics` body), or `null`
+ * without a pull reader (no health listener has started, or
+ * `OTEL_SDK_DISABLED`).
+ */
+export declare function prometheusText(): string | null
+
 /** What one provider did during a multi-provider fetch. */
 export interface ProviderOutcome {
   nodeId: string
@@ -2882,6 +3138,32 @@ export interface RetireOutcome {
 /** The prefix of a failed call's error message (JSON status follows). */
 export declare function rpcErrorPrefix(): string
 
+/** One Rust log record, as the sink receives it. */
+export interface RustLogRecord {
+  /** 1 error, 2 warn, 3 info, 4 debug, 5 trace. */
+  level: number
+  /** `HAS_TRACE` 1 | `IN_CALL` 2 | `SYNTHETIC` 4 (a drop report) | `AUDIT` 8. */
+  flags: number
+  /** Wall clock, milliseconds since the Unix epoch (fractional). */
+  timestampMs: number
+  /** 32 lowercase hex characters when `flags & 1`. */
+  traceId?: string
+  /** 16 lowercase hex characters when `flags & 1`. */
+  spanId?: string
+  /** The `rpc` span's call id when `flags & 2`, else 0. */
+  callId: number
+  /** The `tracing` target (`aster::rpc::dispatch`). */
+  target: string
+  /** The target as a logger name (`aster.rpc.dispatch`). */
+  logger: string
+  message: string
+  /**
+   * The event's fields, then `rpc.service`, `rpc.method`, `aster.peer` and
+   * `thread.name` where they apply.
+   */
+  fields: Record<string, string>
+}
+
 /**
  * Seal `plaintext` to `ctx.recipient`'s identity-derived HPKE key; returns
  * the Fory-encoded envelope.
@@ -2917,6 +3199,30 @@ export declare function secretKeyReadFile(path: string): string | null
  * directories created). Refuses to overwrite an existing file.
  */
 export declare function secretKeyWriteFile(path: string, secretKey: string): void
+
+export declare function spanAddEvent(handle: number, name: string, attributes?: Record<string, string> | undefined | null): void
+
+/** The span's W3C `traceparent`, or `null` for a no-op span. */
+export declare function spanContext(handle: number): string | null
+
+/** End the span and free its handle. */
+export declare function spanEnd(handle: number): void
+
+/** An `exception` event plus status error. */
+export declare function spanRecordError(handle: number, errorType: string | undefined | null, message: string): void
+
+export declare function spanSetAttributes(handle: number, attributes: Record<string, string>): void
+
+/** `code`: 0 unset, 1 ok, 2 error (with `message`). */
+export declare function spanSetStatus(handle: number, code: number, message?: string | undefined | null): void
+
+/**
+ * Start a span. `kind`: 0 internal, 1 server, 2 client, 3 producer, 4
+ * consumer. `parent` is a W3C `traceparent` (the carrier's current span), or
+ * `null` for a root. Returns its handle; without a tracer pipeline the span
+ * is a no-op. Fails with `QueueFull` at 65 536 live spans.
+ */
+export declare function spanStart(name: string, kind: number, parent?: string | undefined | null, attributes?: Record<string, string> | undefined | null): number
 
 /** Options for `Topology.enableShared`. */
 export interface TopologySwarmOptions {

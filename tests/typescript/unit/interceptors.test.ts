@@ -5,7 +5,6 @@ import {
   applyResponseInterceptors,
   applyErrorInterceptors,
   normalizeError,
-  MetricsInterceptor,
   RetryInterceptor,
   RateLimitInterceptor,
   AuthInterceptor,
@@ -89,35 +88,6 @@ describe('normalizeError', () => {
     const err = normalizeError(new Error('oops'));
     expect(err.code).toBe(StatusCode.UNKNOWN);
     expect(err.message).toContain('oops');
-  });
-});
-
-// -- MetricsInterceptor -------------------------------------------------------
-
-describe('MetricsInterceptor', () => {
-  it('tracks started/succeeded', async () => {
-    const mi = new MetricsInterceptor();
-    await mi.onRequest(ctx(), {});
-    expect(mi.snapshot().started).toBe(1);
-    expect(mi.snapshot().inFlight).toBe(1);
-    await mi.onResponse(ctx(), {});
-    expect(mi.snapshot().succeeded).toBe(1);
-    expect(mi.snapshot().inFlight).toBe(0);
-  });
-
-  it('tracks failed', async () => {
-    const mi = new MetricsInterceptor();
-    await mi.onRequest(ctx(), {});
-    await mi.onError(ctx(), new RpcError(StatusCode.INTERNAL));
-    expect(mi.snapshot().failed).toBe(1);
-    expect(mi.snapshot().inFlight).toBe(0);
-  });
-
-  it('resets', () => {
-    const mi = new MetricsInterceptor();
-    mi.started = 10;
-    mi.reset();
-    expect(mi.snapshot().started).toBe(0);
   });
 });
 

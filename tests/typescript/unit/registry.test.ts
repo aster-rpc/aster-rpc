@@ -21,8 +21,6 @@ import {
   RegistryClient,
   registryKey,
   RegistryPublisher,
-  ConnectionMetrics,
-  AdmissionMetrics,
   type EndpointLease,
 } from '@aster-rpc/aster';
 
@@ -185,37 +183,5 @@ describe('RegistryPublisher', () => {
     expect(writes.some(([k]) => k === 'contracts/cid123')).toBe(true);
     expect(writes.some(([k]) => k === 'services/Echo/versions/v1')).toBe(true);
     pub.close();
-  });
-});
-
-// -- Metrics ---
-
-describe('ConnectionMetrics', () => {
-  it('tracks accept/reject/close', () => {
-    const m = new ConnectionMetrics();
-    m.onAccept();
-    m.onAccept();
-    m.onReject();
-    m.onClose();
-    const snap = m.snapshot();
-    expect(snap.connections_accepted).toBe(2);
-    expect(snap.connections_rejected).toBe(1);
-    expect(snap.connections_closed).toBe(1);
-    expect(snap.connections_active).toBe(1);
-  });
-});
-
-describe('AdmissionMetrics', () => {
-  it('tracks attempt/success/reject/error', () => {
-    const m = new AdmissionMetrics();
-    m.onAttempt();
-    m.onAttempt();
-    m.onSuccess();
-    m.onReject();
-    const snap = m.snapshot();
-    expect(snap.admissions_attempted).toBe(2);
-    expect(snap.admissions_succeeded).toBe(1);
-    expect(snap.admissions_rejected).toBe(1);
-    expect(snap.admissions_errored).toBe(0);
   });
 });

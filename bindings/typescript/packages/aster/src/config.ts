@@ -142,11 +142,17 @@ export interface AsterConfig {
   /** Mask sensitive fields. `ASTER_LOG_MASK`. */
   logMask?: boolean;
 
-  // ── Health (TypeScript binding only) ───────────────────────────────────
-  /** Health HTTP port; `0` disables. `ASTER_HEALTH_PORT`, `[health] port`. */
+  // ── Health (Rust listener, `/healthz` `/readyz` `/metrics`) ────────────
+  /** Health HTTP port; `0` disables unless `healthEnabled`. `ASTER_HEALTH_PORT`, `[health] port`. */
   healthPort?: number;
-  /** Health HTTP host. `ASTER_HEALTH_HOST`, `[health] host`. */
+  /** Health HTTP host (default `127.0.0.1`; pods need `0.0.0.0`). `ASTER_HEALTH_HOST`, `[health] host`. */
   healthHost?: string;
+  /**
+   * Force the listener on (an ephemeral port when `healthPort` is 0) or off.
+   * Unset: on exactly when `healthPort` is non-zero.
+   * `ASTER_HEALTH_ENABLED`, `[health] enabled`.
+   */
+  healthEnabled?: boolean;
 }
 
 function keyHex(value: KeyMaterial | undefined): string | undefined {
@@ -319,6 +325,6 @@ export function printConfig(config: AsterConfig): void {
   console.log(`    format                  : ${config.logFormat ?? 'text'}`);
   console.log(`    level                   : ${config.logLevel ?? 'info'}`);
   console.log(`  [health]`);
-  console.log(`    port                    : ${config.healthPort || 'disabled'}`);
+  console.log(`    port                    : ${config.healthPort || (config.healthEnabled ? 'ephemeral' : 'disabled')}`);
   console.log(`    host                    : ${config.healthHost ?? '127.0.0.1'}`);
 }

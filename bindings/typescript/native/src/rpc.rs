@@ -79,6 +79,9 @@ pub const EVENT_NON_RPC: u32 = 7;
 pub const FLAG_HAS_METADATA: u32 = 0x100;
 /// `flags` bit: the event carries `attributes`.
 pub const FLAG_HAS_ATTRIBUTES: u32 = 0x200;
+/// `flags` bit: the event carries `traceparent` (the call's server span is
+/// exported; design §5.2).
+pub const FLAG_HAS_TRACE: u32 = 0x400;
 
 /// One dispatch event, flattened for JS. Fields that do not apply to the
 /// event's `kind` are `0` (numbers) or absent.
@@ -120,6 +123,9 @@ pub struct JsDispatchEvent {
     pub attributes: Option<HashMap<String, String>>,
     /// The ALPN of a non-RPC connection (`kind` 7).
     pub alpn: Option<String>,
+    /// W3C `traceparent` of the call's server span, when it is exported
+    /// (`flags & HAS_TRACE`). Binding spans and logs parent on it.
+    pub traceparent: Option<String>,
 }
 
 /// An event with every JS-irrelevant part dropped (call handle detached).
@@ -141,6 +147,7 @@ struct Ev {
     metadata: Option<Vec<(String, String)>>,
     attributes: Option<Vec<(String, String)>>,
     alpn: Option<String>,
+    traceparent: Option<String>,
 }
 
 impl Ev {
@@ -162,6 +169,7 @@ impl Ev {
             metadata: None,
             attributes: None,
             alpn: None,
+            traceparent: None,
         }
     }
 
@@ -184,6 +192,7 @@ impl Ev {
             metadata: self.metadata.map(|m| m.into_iter().collect()),
             attributes: self.attributes.map(|m| m.into_iter().collect()),
             alpn: self.alpn,
+            traceparent: self.traceparent,
         }
     }
 }
@@ -231,6 +240,16 @@ impl Shared {
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect()
                 });
+                let traceparent = call.trace_context.map(|t| {
+                    flags |= FLAG_HAS_TRACE;
+                    aster_otel::TraceContext {
+                        trace_id: t.trace_id,
+                        span_id: t.span_id,
+                        trace_flags: t.trace_flags,
+                        is_remote: false,
+                    }
+                    .traceparent()
+                });
                 Ev {
                     kind: EVENT_CALL,
                     call_id: call.handle.detach(),
@@ -248,6 +267,7 @@ impl Shared {
                     metadata,
                     attributes,
                     alpn: None,
+                    traceparent,
                 }
             }
             DispatchEvent::Cancelled { call_id, reason } => Ev {
@@ -532,7 +552,7 @@ pub struct DispatchServerOptions {
 
 enum Running {
     /// Own node (`start`): shut down on close.
-    Own(AsterServer),
+    Own(Box<AsterServer>),
     /// Serving on a caller's node (`serve`): stop serving on close; the node
     /// stays up.
     Attached(ServerHandle),
@@ -844,7 +864,13 @@ impl DispatchServer {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let address = server.address().map_err(aster_err)?;
-            Ok(sinks.finish(Running::Own(server), table, attributes, address, ring))
+            Ok(sinks.finish(
+                Running::Own(Box::new(server)),
+                table,
+                attributes,
+                address,
+                ring,
+            ))
         })
     }
 

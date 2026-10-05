@@ -24,12 +24,6 @@ pub type U64Value = Either<f64, BigInt>;
 
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
-/// Environment variables for the binding-only health endpoint (not part of
-/// the Rust `AsterConfig`): `ASTER_HEALTH_PORT` / `ASTER_HEALTH_HOST`, TOML
-/// `[health] port` / `host`.
-const ENV_HEALTH_PORT: &str = "ASTER_HEALTH_PORT";
-const ENV_HEALTH_HOST: &str = "ASTER_HEALTH_HOST";
-
 /// Node / server / client configuration.
 ///
 /// All fields are optional; omitted fields take the Rust defaults. Resolution
@@ -139,11 +133,16 @@ pub struct JsAsterConfig {
     pub log_level: Option<String>,
     /// Mask sensitive fields in logs. `ASTER_LOG_MASK`.
     pub log_mask: Option<bool>,
-    // ── Health (binding-only) ────────────────────────────────────────────
-    /// Health HTTP port; `0` disables. `ASTER_HEALTH_PORT`, `[health] port`.
+    // ── Health (Rust `AsterConfig`) ──────────────────────────────────────
+    /// Health HTTP port; `0` disables unless `healthEnabled`. `ASTER_HEALTH_PORT`,
+    /// `[health] port`.
     pub health_port: Option<u32>,
     /// Health HTTP host. `ASTER_HEALTH_HOST`, `[health] host`.
     pub health_host: Option<String>,
+    /// Force the listener on (`true`, ephemeral port when `healthPort` is 0) or
+    /// off (`false`). Unset: on exactly when `healthPort` is non-zero.
+    /// `ASTER_HEALTH_ENABLED`, `[health] enabled`.
+    pub health_enabled: Option<bool>,
 }
 
 fn invalid(msg: impl Into<String>) -> Error {
@@ -352,6 +351,14 @@ impl JsAsterConfig {
         if let Some(v) = self.log_mask {
             c.log_mask = v;
         }
+        if let Some(v) = self.health_port {
+            c.health_port = u16::try_from(v)
+                .map_err(|_| invalid(format!("healthPort must be 0..=65535, got {v}")))?;
+        }
+        if let Some(v) = &self.health_host {
+            c.health_host = v.clone();
+        }
+        c.health_enabled = self.health_enabled;
         Ok(c)
     }
 
@@ -418,53 +425,11 @@ impl JsAsterConfig {
             log_format: Some(c.log_format.clone()),
             log_level: Some(c.log_level.clone()),
             log_mask: Some(c.log_mask),
-            health_port: Some(0),
-            health_host: Some("127.0.0.1".to_string()),
+            health_port: Some(u32::from(c.health_port)),
+            health_host: Some(c.health_host.clone()),
+            health_enabled: c.health_enabled,
         }
     }
-
-    /// Overlay the binding-only `[health]` table from a parsed TOML file.
-    fn apply_health_toml(&mut self, raw: &toml::Value, label: &str) -> Result<()> {
-        let Some(health) = raw.get("health") else {
-            return Ok(());
-        };
-        let health = health
-            .as_table()
-            .ok_or_else(|| invalid(format!("{label}: [health] must be a table")))?;
-        if let Some(port) = health.get("port") {
-            let port = port
-                .as_integer()
-                .and_then(|p| u16::try_from(p).ok())
-                .ok_or_else(|| invalid(format!("{label}: [health] port must be 0..=65535")))?;
-            self.health_port = Some(u32::from(port));
-        }
-        if let Some(host) = health.get("host") {
-            let host = host
-                .as_str()
-                .ok_or_else(|| invalid(format!("{label}: [health] host must be a string")))?;
-            self.health_host = Some(host.to_string());
-        }
-        Ok(())
-    }
-
-    /// Overlay `ASTER_HEALTH_PORT` / `ASTER_HEALTH_HOST`.
-    fn apply_health_env(&mut self) -> Result<()> {
-        if let Some(v) = env_nonempty(ENV_HEALTH_PORT) {
-            let port: u16 = v
-                .trim()
-                .parse()
-                .map_err(|_| invalid(format!("{ENV_HEALTH_PORT}: expected a port, got {v:?}")))?;
-            self.health_port = Some(u32::from(port));
-        }
-        if let Some(v) = env_nonempty(ENV_HEALTH_HOST) {
-            self.health_host = Some(v);
-        }
-        Ok(())
-    }
-}
-
-fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 /// Defaults overlaid with `ASTER_*` environment variables (the Rust
@@ -472,9 +437,7 @@ fn env_nonempty(key: &str) -> Option<String> {
 #[napi]
 pub fn aster_config_from_env() -> Result<JsAsterConfig> {
     let config = RsConfig::from_env().map_err(aster_err)?;
-    let mut js = JsAsterConfig::from_rust(&config);
-    js.apply_health_env()?;
-    Ok(js)
+    Ok(JsAsterConfig::from_rust(&config))
 }
 
 /// Defaults < `aster.toml` at `path` < `ASTER_*` environment (the Rust
@@ -482,14 +445,7 @@ pub fn aster_config_from_env() -> Result<JsAsterConfig> {
 #[napi]
 pub fn aster_config_from_file(path: String) -> Result<JsAsterConfig> {
     let config = RsConfig::from_file(&path).map_err(aster_err)?;
-    let mut js = JsAsterConfig::from_rust(&config);
-    let text = std::fs::read_to_string(&path).map_err(|e| invalid(format!("{path}: {e}")))?;
-    let raw: toml::Value = text
-        .parse()
-        .map_err(|e| invalid(format!("{path}: invalid TOML: {e}")))?;
-    js.apply_health_toml(&raw, &path)?;
-    js.apply_health_env()?;
-    Ok(js)
+    Ok(JsAsterConfig::from_rust(&config))
 }
 
 /// Normalise a config through Rust: validates every field and returns it
@@ -497,10 +453,7 @@ pub fn aster_config_from_file(path: String) -> Result<JsAsterConfig> {
 #[napi]
 pub fn aster_config_resolve(config: JsAsterConfig) -> Result<JsAsterConfig> {
     let rust = config.to_rust()?;
-    let mut js = JsAsterConfig::from_rust(&rust);
-    js.health_port = config.health_port.or(js.health_port);
-    js.health_host = config.health_host.or(js.health_host);
-    Ok(js)
+    Ok(JsAsterConfig::from_rust(&rust))
 }
 
 /// The deployment root public key (hex) from `rootPubkey` / `rootPubkeyFile`

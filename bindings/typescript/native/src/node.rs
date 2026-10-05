@@ -238,12 +238,6 @@ impl Node {
         Ok(())
     }
 
-    /// Transport metrics in Prometheus text exposition format.
-    #[napi]
-    pub fn metrics_prometheus(&self) -> String {
-        self.inner.metrics_prometheus()
-    }
-
     /// This node's topology view (v1 peers; v2 shared swarm). Populates only
     /// when the node runs with `enableMonitoring`.
     #[napi]
