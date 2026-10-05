@@ -36,6 +36,8 @@ const OTEL_METRICS_TEMPORALITY: &str = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_P
 const OTEL_EXPORTER_OTLP_INSECURE: &str = "OTEL_EXPORTER_OTLP_INSECURE";
 const ASTER_LOG_LEVEL: &str = "ASTER_LOG_LEVEL";
 const ASTER_LOG_QUEUE: &str = "ASTER_LOG_QUEUE";
+const ASTER_LOG_AUDIT_QUEUE: &str = "ASTER_LOG_AUDIT_QUEUE";
+const ASTER_LOG_AUDIT_BLOCK_MS: &str = "ASTER_LOG_AUDIT_BLOCK_MS";
 
 /// Default OTLP/HTTP collector base URL (OTel spec).
 pub const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4318";
@@ -45,6 +47,11 @@ pub const DEFAULT_OTLP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_METRIC_INTERVAL: Duration = Duration::from_secs(60);
 /// Default bound of the binding log queue (O4).
 pub const DEFAULT_LOG_QUEUE: usize = 8192;
+/// Default bound of the binding log queue's audit channel (design §3.1, §3.5).
+pub const DEFAULT_AUDIT_QUEUE: usize = 1024;
+/// The longest an `aster::audit` emitter may be made to wait for room in the
+/// audit channel (the opt-in Q8 mode, design §3.5).
+pub const MAX_AUDIT_BLOCK: Duration = Duration::from_secs(1);
 /// Targets the exporters themselves log on. Appended as `=off` to the span,
 /// OTLP-log and bridge filters (unless the directives already name them) so an
 /// export can never produce telemetry about itself. EnvFilter targets match by
@@ -329,6 +336,20 @@ pub struct ObservabilityConfig {
     pub log_stderr: Option<bool>,
     /// Binding log queue bound (`ASTER_LOG_QUEUE`, used by O4).
     pub log_queue: Option<usize>,
+    /// Open the binding log queue ([`crate::bridge`], design §3.1): Rust
+    /// events are queued for a binding drain. Programmatic only (the C ABI's
+    /// `ASTER_OBSERVABILITY_LOG_BRIDGE`); default false. Additive: an `init`
+    /// that asks for it joins a running pipeline that lacks it and opens it.
+    pub log_bridge: Option<bool>,
+    /// Bound of the audit channel (`ASTER_LOG_AUDIT_QUEUE`, default
+    /// [`DEFAULT_AUDIT_QUEUE`]).
+    pub log_audit_queue: Option<usize>,
+    /// **Q8 flag, undecided (design §3.5):** how long an `aster::audit`
+    /// emitter may block for room in a full audit channel before the record is
+    /// dropped (`ASTER_LOG_AUDIT_BLOCK_MS`, TOML `log_audit_block_ms`). Unset or
+    /// zero: never block (the shipped default). At most [`MAX_AUDIT_BLOCK`]. A
+    /// tokio worker can block in this mode.
+    pub log_audit_block: Option<Duration>,
     /// Per-call attributes, `(otel_key, source)` with `source` one of
     /// `attr:<key>`, `meta:<key>`, `baggage:<key>` (programmatic / TOML only,
     /// design §4.4). `Some(vec![])` means none.
@@ -372,6 +393,9 @@ impl Default for ObservabilityConfig {
             span_filter: None,
             log_stderr: None,
             log_queue: None,
+            log_bridge: None,
+            log_audit_queue: None,
+            log_audit_block: None,
             attribute_extractors: None,
             propagate_as_baggage: None,
             file: None,
@@ -409,6 +433,9 @@ impl fmt::Debug for ObservabilityConfig {
             .field("span_filter", &self.span_filter)
             .field("log_stderr", &self.log_stderr)
             .field("log_queue", &self.log_queue)
+            .field("log_bridge", &self.log_bridge)
+            .field("log_audit_queue", &self.log_audit_queue)
+            .field("log_audit_block", &self.log_audit_block)
             .field("attribute_extractors", &self.attribute_extractors)
             .field("propagate_as_baggage", &self.propagate_as_baggage)
             .field("file", &self.file);
@@ -463,6 +490,8 @@ struct TomlTable {
     span_filter: Option<String>,
     log_stderr: Option<bool>,
     log_queue: Option<usize>,
+    log_audit_queue: Option<usize>,
+    log_audit_block_ms: Option<u64>,
     attribute_extractors: Option<BTreeMap<String, String>>,
     propagate_as_baggage: Option<Vec<String>>,
 }
@@ -522,6 +551,8 @@ impl ObservabilityConfig {
             span_filter: t.span_filter,
             log_stderr: t.log_stderr,
             log_queue: t.log_queue,
+            log_audit_queue: t.log_audit_queue,
+            log_audit_block: t.log_audit_block_ms.map(Duration::from_millis),
             attribute_extractors: t.attribute_extractors.map(|m| m.into_iter().collect()),
             propagate_as_baggage: t.propagate_as_baggage,
             metric_export_interval: t.metric_export_interval_ms.map(Duration::from_millis),
@@ -683,6 +714,8 @@ impl ObservabilityConfig {
             c.log_stderr = Some(crate::subscriber::truthy(Some(&v)));
         }
         c.log_queue = parse_num(get(ASTER_LOG_QUEUE), ASTER_LOG_QUEUE, w);
+        c.log_audit_queue = parse_num(get(ASTER_LOG_AUDIT_QUEUE), ASTER_LOG_AUDIT_QUEUE, w);
+        c.log_audit_block = parse_ms(get(ASTER_LOG_AUDIT_BLOCK_MS), ASTER_LOG_AUDIT_BLOCK_MS, w);
         Ok(c)
     }
 }
@@ -754,6 +787,12 @@ pub struct ResolvedConfig {
     pub span_filter: String,
     pub log_stderr: bool,
     pub log_queue: usize,
+    /// Open the binding log queue. Not part of [`Self::diff`]: asking for the
+    /// bridge joins a running pipeline that lacks it.
+    pub log_bridge: bool,
+    pub log_audit_queue: usize,
+    /// `None`: an audit emitter never blocks (the default; Q8 undecided).
+    pub log_audit_block: Option<Duration>,
     pub attribute_extractors: Vec<AttributeExtractor>,
     pub propagate_as_baggage: Vec<String>,
 }
@@ -788,6 +827,8 @@ impl ResolvedConfig {
             span_filter,
             log_stderr,
             log_queue,
+            log_audit_queue,
+            log_audit_block,
             attribute_extractors,
             propagate_as_baggage,
         );
@@ -1028,6 +1069,20 @@ fn resolve_layers(layers: &[&ObservabilityConfig], w: &mut Vec<String>) -> Resul
     let log_queue = first(layers, |l| l.log_queue)
         .unwrap_or(DEFAULT_LOG_QUEUE)
         .max(1);
+    let log_bridge = first(layers, |l| l.log_bridge).unwrap_or(false);
+    let log_audit_queue = first(layers, |l| l.log_audit_queue)
+        .unwrap_or(DEFAULT_AUDIT_QUEUE)
+        .max(1);
+    let log_audit_block = first(layers, |l| l.log_audit_block).filter(|d| !d.is_zero());
+    if let Some(d) = log_audit_block {
+        if d > MAX_AUDIT_BLOCK {
+            return Err(Error::Config(format!(
+                "log_audit_block {} ms exceeds the {} ms maximum",
+                d.as_millis(),
+                MAX_AUDIT_BLOCK.as_millis()
+            )));
+        }
+    }
     let attribute_extractors = first(layers, |l| l.attribute_extractors.clone())
         .unwrap_or_default()
         .into_iter()
@@ -1079,6 +1134,9 @@ fn resolve_layers(layers: &[&ObservabilityConfig], w: &mut Vec<String>) -> Resul
         span_filter,
         log_stderr,
         log_queue,
+        log_bridge,
+        log_audit_queue,
+        log_audit_block,
         attribute_extractors,
         propagate_as_baggage,
     })
@@ -1567,6 +1625,64 @@ mod tests {
             p.resolve_with_env(&env(&[])),
             Err(Error::Config(_))
         ));
+    }
+
+    #[test]
+    fn log_bridge_settings() {
+        let c = ObservabilityConfig::new()
+            .resolve_with_env(&env(&[]))
+            .unwrap()
+            .config;
+        assert!(!c.log_bridge);
+        assert_eq!(c.log_audit_queue, DEFAULT_AUDIT_QUEUE);
+        assert_eq!(c.log_audit_block, None, "Q8: never block by default");
+
+        let toml = ObservabilityConfig::from_toml_str(
+            "[observability]\nlog_audit_queue = 64\nlog_audit_block_ms = 20\n",
+        )
+        .unwrap();
+        let c = ObservabilityConfig::new()
+            .with_file_layer(toml.clone())
+            .resolve_with_env(&env(&[("ASTER_LOG_AUDIT_BLOCK_MS", "50")]))
+            .unwrap()
+            .config;
+        assert_eq!(c.log_audit_queue, 64);
+        assert_eq!(c.log_audit_block, Some(Duration::from_millis(50)));
+
+        // Zero switches the opt-in off again; above the maximum is refused.
+        let p = ObservabilityConfig {
+            log_bridge: Some(true),
+            log_audit_block: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let c = p
+            .with_file_layer(toml)
+            .resolve_with_env(&env(&[("ASTER_LOG_AUDIT_QUEUE", "8")]))
+            .unwrap()
+            .config;
+        assert!(c.log_bridge);
+        assert_eq!(c.log_audit_queue, 8);
+        assert_eq!(c.log_audit_block, None);
+        let p = ObservabilityConfig {
+            log_audit_block: Some(MAX_AUDIT_BLOCK + Duration::from_millis(1)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            p.resolve_with_env(&env(&[])),
+            Err(Error::Config(_))
+        ));
+
+        // The bridge is additive: not a configuration difference.
+        let a = ObservabilityConfig::new()
+            .resolve_with_env(&env(&[]))
+            .unwrap();
+        let b = ObservabilityConfig {
+            log_bridge: Some(true),
+            ..Default::default()
+        }
+        .resolve_with_env(&env(&[]))
+        .unwrap();
+        assert!(a.config.diff(&b.config).is_empty());
     }
 
     #[test]

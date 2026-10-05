@@ -12,7 +12,7 @@
 //!   OTel span layer   tracing-opentelemetry + SwapTracer   filter: reload(spans only)
 //!   stderr fmt layer  O0 / log_stderr                      filter: reload
 //!   OTLP logs layer   reload(Option<bridge>) (otlp-logs)   filter: reload
-//!   binding log slot  reload(Option<layer>), empty until O4 filter: reload
+//!   binding log slot  reload(Option<BindingLogLayer>) (O4)  filter: reload
 //! ]
 //! ```
 //!
@@ -70,6 +70,9 @@ pub(crate) type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 pub(crate) struct SlotFilter {
     filter: Option<EnvFilter>,
     spans_only: bool,
+    /// Of the spans, only those named `rpc` (the binding log bridge, which
+    /// needs the call's span for its fields and nothing else).
+    rpc_spans: bool,
     fork_guard: bool,
 }
 
@@ -78,6 +81,7 @@ impl SlotFilter {
         SlotFilter {
             filter: None,
             spans_only: false,
+            rpc_spans: false,
             fork_guard: false,
         }
     }
@@ -86,6 +90,7 @@ impl SlotFilter {
         SlotFilter {
             filter: Some(filter),
             spans_only: false,
+            rpc_spans: false,
             fork_guard: false,
         }
     }
@@ -95,6 +100,7 @@ impl SlotFilter {
         SlotFilter {
             filter: Some(filter),
             spans_only: true,
+            rpc_spans: false,
             fork_guard: true,
         }
     }
@@ -104,15 +110,32 @@ impl SlotFilter {
         SlotFilter {
             filter: Some(filter),
             spans_only: false,
+            rpc_spans: false,
             fork_guard: true,
         }
+    }
+    /// The binding log bridge (O4): events matching `filter`, plus the `rpc`
+    /// spans it enables (their fields go on the records), no-op in a forked
+    /// child (the queue's locks may be held by a thread that did not fork).
+    pub(crate) fn bridge(filter: EnvFilter) -> Self {
+        SlotFilter {
+            filter: Some(filter),
+            spans_only: false,
+            rpc_spans: true,
+            fork_guard: true,
+        }
+    }
+
+    /// Whether `meta` is a span this filter never looks at.
+    fn skips_span(&self, meta: &Metadata<'_>) -> bool {
+        meta.is_span() && self.rpc_spans && meta.name() != "rpc"
     }
 }
 
 impl<S: Subscriber> Filter<S> for SlotFilter {
     fn enabled(&self, meta: &Metadata<'_>, cx: &Context<'_, S>) -> bool {
         let Some(f) = &self.filter else { return false };
-        if self.spans_only && !meta.is_span() {
+        if (self.spans_only && !meta.is_span()) || self.skips_span(meta) {
             return false;
         }
         if self.fork_guard && crate::fork::forked() {
@@ -125,7 +148,7 @@ impl<S: Subscriber> Filter<S> for SlotFilter {
         let Some(f) = &self.filter else {
             return Interest::never();
         };
-        if self.spans_only && !meta.is_span() {
+        if (self.spans_only && !meta.is_span()) || self.skips_span(meta) {
             return Interest::never();
         }
         let interest = Filter::<S>::callsite_enabled(f, meta);
@@ -201,10 +224,8 @@ pub(crate) struct Slots {
     pub(crate) otlp_logs: reload::Handle<Option<LogsBridge>, Registry>,
     #[cfg(feature = "otlp-logs")]
     pub(crate) otlp_logs_filter: FilterHandle,
-    /// O4 fills this with the binding log layer.
-    #[allow(dead_code)]
+    /// The binding log layer (O4, [`crate::bridge`]).
     pub(crate) bridge: reload::Handle<Option<BoxedLayer>, Registry>,
-    #[allow(dead_code)]
     pub(crate) bridge_filter: FilterHandle,
 }
 

@@ -21,6 +21,14 @@ pub enum Error {
     Timeout(&'static str),
     /// The SDK reported failures while flushing or shutting down.
     Sdk(String),
+    /// The binding log bridge is not open (no pipeline, `init` without
+    /// `log_bridge`, or a foreign global subscriber).
+    LogBridgeNotOpen,
+    /// A log drain already exists: the bridge has one consumer per process
+    /// (design §7.2; the C ABI maps this to `ALREADY_EXISTS`).
+    LogDrainBusy,
+    /// The operation needs a crate feature this build lacks.
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -34,6 +42,11 @@ impl fmt::Display for Error {
             Error::Exporter(m) => write!(f, "could not build the telemetry exporter: {m}"),
             Error::Timeout(what) => write!(f, "telemetry {what} timed out"),
             Error::Sdk(m) => write!(f, "telemetry SDK error: {m}"),
+            Error::LogBridgeNotOpen => f.write_str("the binding log bridge is not open"),
+            Error::LogDrainBusy => {
+                f.write_str("a log drain is already active (one consumer per process)")
+            }
+            Error::Unsupported(what) => write!(f, "unsupported in this build: {what}"),
         }
     }
 }

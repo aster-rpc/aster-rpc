@@ -21,6 +21,11 @@
 //!   starts the pipeline and guarantees it a Prometheus pull reader, and
 //!   [`render_prometheus`], the text exposition an ops `/metrics` serves.
 //!
+//! * O4: the binding log bridge, [`bridge`]: Rust events queued as owned
+//!   [`LogRecord`]s for a binding drain ([`bridge::drain`]), with drop
+//!   accounting, an audit channel and a reentrancy guard. Opened by `init`
+//!   with [`ObservabilityConfig::log_bridge`].
+//!
 //! There is one global `tracing` subscriber, installed by whichever of
 //! [`init_stderr_from_env`] and [`init`] runs first; every layer in it sits
 //! behind `reload`, so the other fills its slot instead of competing for the
@@ -30,6 +35,7 @@
 //! Features: `otlp` (default), `otlp-grpc`, `otlp-logs`, `prometheus`,
 //! `testing`.
 
+pub mod bridge;
 mod config;
 mod error;
 mod fork;
@@ -41,12 +47,13 @@ mod subscriber;
 pub mod testing;
 mod tracer;
 
+pub use bridge::{LogDrain, LogLevel, LogRecord};
 pub use config::{
     redact_url, AttributeExtractor, BatchSettings, Binding, ExporterKind, ExtractorSource,
     ObservabilityConfig, OtlpHeaders, OtlpProtocol, OtlpSettings, OtlpTarget, Propagator, Resolved,
     ResolvedBatch, ResolvedConfig, SamplerConfig, Secret, SpanLimitSettings, Temporality,
-    DEFAULT_LOG_QUEUE, DEFAULT_METRIC_INTERVAL, DEFAULT_OTLP_ENDPOINT, DEFAULT_OTLP_TIMEOUT,
-    EXPORTER_INTERNAL_TARGETS, OTEL_SDK_DISABLED,
+    DEFAULT_AUDIT_QUEUE, DEFAULT_LOG_QUEUE, DEFAULT_METRIC_INTERVAL, DEFAULT_OTLP_ENDPOINT,
+    DEFAULT_OTLP_TIMEOUT, EXPORTER_INTERNAL_TARGETS, MAX_AUDIT_BLOCK, OTEL_SDK_DISABLED,
 };
 pub use error::{Error, Result};
 pub use pipeline::{

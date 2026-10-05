@@ -318,6 +318,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "crossbeam-channel",
  "http",
  "libc",
  "opentelemetry",

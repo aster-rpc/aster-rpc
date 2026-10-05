@@ -59,6 +59,14 @@ struct Providers {
 }
 
 impl Providers {
+    /// An OTel logs provider exists (path A, §3.4).
+    fn has_logger(&self) -> bool {
+        #[cfg(feature = "otlp-logs")]
+        return self.logger.is_some();
+        #[cfg(not(feature = "otlp-logs"))]
+        false
+    }
+
     fn force_flush(&self) -> Result<()> {
         let mut errors = Vec::new();
         if let Some(p) = &self.tracer {
@@ -320,6 +328,17 @@ fn start(cfg: ObservabilityConfig, with_prometheus: bool) -> Result<Observabilit
                 diff.join(", ")
             )));
         }
+        // The log bridge is additive (not part of the diff): a binding that
+        // asks for it joins a pipeline started without it, e.g. by an ops
+        // listener.
+        if config.log_bridge {
+            open_bridge(
+                &config,
+                a.subscriber,
+                a.providers.has_logger(),
+                &mut warnings,
+            );
+        }
         a.refs += 1;
         return Ok(ObservabilityHandle {
             id: a.id,
@@ -382,6 +401,9 @@ fn start(cfg: ObservabilityConfig, with_prometheus: bool) -> Result<Observabilit
                 .reload(SlotFilter::events(env_filter(&config.log_filter)));
         }
     }
+    if config.log_bridge {
+        open_bridge(&config, status, providers.has_logger(), &mut warnings);
+    }
 
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let id = PIPELINE_ID.fetch_add(1, Ordering::Relaxed) + 1;
@@ -408,6 +430,41 @@ fn start(cfg: ObservabilityConfig, with_prometheus: bool) -> Result<Observabilit
         subscriber: status,
         warnings,
     })
+}
+
+/// Open the binding log bridge (design §3.1) in Aster's subscriber. With a
+/// foreign global subscriber there is no slot to put it in: a warning instead.
+/// With OTLP log export on too, one INFO (§3.4): Rust records then reach the
+/// collector through both path A and, if the binding's own OTel SDK exports its
+/// logger, path C.
+fn open_bridge(
+    config: &ResolvedConfig,
+    status: SubscriberStatus,
+    otlp_logs: bool,
+    warnings: &mut Vec<String>,
+) {
+    if crate::bridge::is_open() {
+        return;
+    }
+    let slots = match (status, subscriber::slots()) {
+        (SubscriberStatus::Installed, Some(s)) => s,
+        _ => {
+            warnings.push(
+                "the binding log bridge needs Aster's global subscriber, but another one is \
+                 installed; Rust events will not reach the binding logger"
+                    .into(),
+            );
+            return;
+        }
+    };
+    crate::bridge::open(config, slots);
+    if otlp_logs {
+        tracing::info!(
+            target: "aster::otel",
+            "OTLP log export and the binding log bridge are both on: export Rust records \
+             through one path only (this one, or the language's OTel SDK), not both"
+        );
+    }
 }
 
 /// Give the running pipeline a Prometheus pull reader if it has none: rebuild
@@ -502,6 +559,7 @@ pub fn shutdown() -> Result<()> {
 }
 
 fn teardown(a: Active) -> Result<()> {
+    crate::bridge::close();
     if let Some(s) = subscriber::slots() {
         let _ = s.spans.reload(SlotFilter::off());
         #[cfg(feature = "otlp-logs")]
@@ -837,7 +895,12 @@ fn build_meter(
                 .into(),
         );
     }
-    Ok((any_reader.then(|| mb.build()), registry))
+    let provider = any_reader.then(|| mb.build());
+    if let Some(p) = &provider {
+        use opentelemetry::metrics::MeterProvider as _;
+        crate::bridge::register_instruments(&p.meter_with_scope(scope()));
+    }
+    Ok((provider, registry))
 }
 
 #[cfg(feature = "otlp")]

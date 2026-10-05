@@ -10,7 +10,8 @@ publish = ["aster"]
 
 # docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md. O0: the opt-in stderr
 # sink. O1: configuration, the OTel SDK pipeline (traces, metrics, opt-in OTLP
-# logs), the one reloadable global subscriber, OTLP over http/protobuf.
+# logs), the one reloadable global subscriber, OTLP over http/protobuf. O4: the
+# binding log bridge (`bridge`).
 # This crate deliberately depends on `aster` for nothing (design D1).
 #
 # Every OTel crate is pinned exactly (design §2.2): the 0.x APIs change on every
@@ -53,6 +54,9 @@ opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = 
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# The binding log queue (O4, design §3.1): bounded MPSC with select and
+# send_timeout; already in the workspace graph.
+crossbeam-channel = "0.5.15"
 
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, optional = true }
 opentelemetry-http = { version = "=0.33.0", default-features = false, optional = true }
