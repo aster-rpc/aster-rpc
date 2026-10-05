@@ -94,6 +94,8 @@ func errorFromStatus(code C.int) *IrohError {
 		return errorf(c, "credential expired")
 	case ASTER_STATUS_VERIFICATION_FAILED:
 		return errorf(c, "verification failed")
+	case ASTER_STATUS_ALREADY_EXISTS:
+		return errorf(c, "already exists")
 	default:
 		return errorf(c, "unknown status %d", c)
 	}
@@ -123,6 +125,9 @@ var (
 	ErrUnauthenticated   = errors.New("unauthenticated")
 	ErrPermissionDenied  = errors.New("permission denied")
 	ErrCredentialExpired = errors.New("credential expired")
+	// ErrAlreadyExists (ABI 4.6): an observability init with a different
+	// configuration than the running pipeline's, or a second log poller.
+	ErrAlreadyExists = errors.New("already exists")
 )
 
 // statusToError maps status codes to sentinel errors for errors.Is matching.
@@ -143,6 +148,7 @@ var statusToError = map[int32]error{
 	ASTER_STATUS_UNAUTHENTICATED:     ErrUnauthenticated,
 	ASTER_STATUS_PERMISSION_DENIED:   ErrPermissionDenied,
 	ASTER_STATUS_CREDENTIAL_EXPIRED:  ErrCredentialExpired,
+	ASTER_STATUS_ALREADY_EXISTS:      ErrAlreadyExists,
 }
 
 // Is returns true if target is a matching sentinel error.

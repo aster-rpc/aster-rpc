@@ -33,6 +33,14 @@ func cStructSizes() map[string]uintptr {
 		"aster_route_spec_t":                  unsafe.Sizeof(C.aster_route_spec_t{}),
 		"aster_http_relay_options_t":          unsafe.Sizeof(C.aster_http_relay_options_t{}),
 		"aster_coordination_client_options_t": unsafe.Sizeof(C.aster_coordination_client_options_t{}),
+		// ABI 4.6 (observability, health)
+		"aster_observability_config_t": unsafe.Sizeof(C.aster_observability_config_t{}),
+		"aster_log_record_t":           unsafe.Sizeof(C.aster_log_record_t{}),
+		"aster_log_emit_t":             unsafe.Sizeof(C.aster_log_emit_t{}),
+		"aster_instrument_desc_t":      unsafe.Sizeof(C.aster_instrument_desc_t{}),
+		"aster_span_context_t":         unsafe.Sizeof(C.aster_span_context_t{}),
+		"aster_span_record_t":          unsafe.Sizeof(C.aster_span_record_t{}),
+		"aster_health_config_t":        unsafe.Sizeof(C.aster_health_config_t{}),
 	}
 }
 

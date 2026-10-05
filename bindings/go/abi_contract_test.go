@@ -35,6 +35,14 @@ func TestABI_StructSizes(t *testing.T) {
 		"aster_route_spec_t":                  40,
 		"aster_http_relay_options_t":          24, // ABI 4.3
 		"aster_coordination_client_options_t": 48, // ABI 4.4
+		// ABI 4.6
+		"aster_observability_config_t": 128,
+		"aster_log_record_t":           96,
+		"aster_log_emit_t":             72,
+		"aster_instrument_desc_t":      96,
+		"aster_span_context_t":         32,
+		"aster_span_record_t":          152,
+		"aster_health_config_t":        24,
 	}
 	got := cStructSizes()
 	for name, w := range want {
@@ -152,9 +160,13 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if CoordRPC != 5 || CoordClosed != 7 || CoordOther != 10 || MutateCancelMembership != 10 || ReadRecoveryExport != 8 {
 		t.Error("coordination enums drifted from the header")
 	}
-	// ABI 4.1 .. 4.5 are all in the library.
-	if _, minor, _ := Version(); minor < 5 {
-		t.Errorf("library ABI minor %d, binding needs >= 5", minor)
+	// ABI 4.1 .. 4.6 are all in the library.
+	if _, minor, _ := Version(); minor < 6 || ABIMinorRequired != 6 {
+		t.Errorf("library ABI minor %d, binding needs >= 6 (floor %d)", minor, ABIMinorRequired)
+	}
+	if ASTER_STATUS_ALREADY_EXISTS != 17 || !errors.Is(wrapError(ASTER_STATUS_ALREADY_EXISTS), ErrAlreadyExists) ||
+		StatusName(17) != "ASTER_STATUS_ALREADY_EXISTS" {
+		t.Error("ALREADY_EXISTS (17) drifted from the header or has no sentinel")
 	}
 }
 

@@ -532,13 +532,19 @@ func Version() (major, minor, patch uint32) {
 	return v >> 16, (v >> 8) & 0xff, v & 0xff
 }
 
+// ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
+// this binding runs against: 4.6 added observability, health and the
+// ALREADY_EXISTS status, and the binding calls those functions.
+const ABIMinorRequired = uint32(6)
+
 // CheckABI returns an error if the loaded native library's ABI major version
-// differs from the one this binding was compiled against.
+// differs from the one this binding was compiled against, or its minor
+// version is below ABIMinorRequired.
 func CheckABI() error {
 	major, minor, patch := Version()
-	if major != ABIVersionMajor {
-		return fmt.Errorf("aster: native library ABI %d.%d.%d, binding expects major %d: %w",
-			major, minor, patch, ABIVersionMajor, Error(C.ASTER_STATUS_ABI_MISMATCH))
+	if major != ABIVersionMajor || minor < ABIMinorRequired {
+		return fmt.Errorf("aster: native library ABI %d.%d.%d, binding expects %d.%d or newer: %w",
+			major, minor, patch, ABIVersionMajor, ABIMinorRequired, Error(C.ASTER_STATUS_ABI_MISMATCH))
 	}
 	return nil
 }
