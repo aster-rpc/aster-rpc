@@ -840,11 +840,15 @@ async fn a_corrupt_later_request_frame_fails_the_call() {
     binding
         .until("sum ended", |o| o.notes.iter().any(|n| n == "sum:ended:3"))
         .await;
-    assert!(binding
-        .observed()
-        .cancelled
-        .iter()
-        .any(|(_, r, m)| *r == CancelReason::InvalidRequest && *m == SUM));
+    // `Cancelled` reaches the binding's event thread, not the handler thread
+    // that saw `recv` end, so it may land after the note.
+    binding
+        .until("sum cancelled as InvalidRequest", |o| {
+            o.cancelled
+                .iter()
+                .any(|(_, r, m)| *r == CancelReason::InvalidRequest && *m == SUM)
+        })
+        .await;
     binding.assert_table_drains().await;
 
     // The connection survives.
