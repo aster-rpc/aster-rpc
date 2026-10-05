@@ -1967,11 +1967,29 @@ impl CoreNode {
             .map(|(swarm, _)| swarm.clone())
     }
 
+    /// A snapshot of the iroh endpoint's byte and connection counters, for
+    /// observable OTel instruments (`aster.transport.*`).
+    pub fn transport_counters(&self) -> TransportCounters {
+        let m = self.inner.endpoint.metrics();
+        let s = &m.socket;
+        TransportCounters {
+            send_ipv4: s.send_ipv4.get(),
+            send_ipv6: s.send_ipv6.get(),
+            send_relay: s.send_relay.get(),
+            recv_ipv4: s.recv_data_ipv4.get(),
+            recv_ipv6: s.recv_data_ipv6.get(),
+            recv_relay: s.recv_data_relay.get(),
+            conns_opened: s.num_conns_opened.get(),
+            conns_closed: s.num_conns_closed.get(),
+        }
+    }
+
     /// Export all transport-level metrics in Prometheus text exposition format.
     ///
     /// Covers socket I/O, path counts, holepunching, relay, and net report
-    /// counters from the iroh endpoint. Intended to be merged with Aster RPC
-    /// metrics on a single `/metrics/prometheus` scrape endpoint.
+    /// counters from the iroh endpoint, in the hand-written R7 format the C
+    /// ABI's `aster_node_metrics_prometheus` returns. (`aster::ops` serves
+    /// these as OTel instruments from [`transport_counters`](Self::transport_counters).)
     pub fn transport_metrics_prometheus(&self) -> String {
         let m = self.inner.endpoint.metrics();
         let s = &m.socket;
@@ -2044,6 +2062,21 @@ impl CoreNode {
             n.reports_full.get(),
         )
     }
+}
+
+/// The iroh endpoint's cumulative byte and connection counters
+/// ([`CoreNode::transport_counters`]). Every field counts since the endpoint
+/// started; connections count only completed handshakes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportCounters {
+    pub send_ipv4: u64,
+    pub send_ipv6: u64,
+    pub send_relay: u64,
+    pub recv_ipv4: u64,
+    pub recv_ipv6: u64,
+    pub recv_relay: u64,
+    pub conns_opened: u64,
+    pub conns_closed: u64,
 }
 
 // ============================================================================
