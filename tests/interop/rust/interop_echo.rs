@@ -150,24 +150,7 @@ async fn wait_stdin_eof() {
     .ok();
 }
 
-/// Start the observability pipeline from the environment (`run.py` points the
-/// OTLP trace exporter at a closed local port): a tracer provider is what makes
-/// the dispatch context carry a trace id and a caller's `traceparent` parent
-/// the client span. No collector is needed. Kept alive by the caller.
-#[cfg(feature = "otel")]
-fn obs_init() -> Option<aster_otel::ObservabilityHandle> {
-    match aster_otel::init(aster_otel::ObservabilityConfig::default()) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            eprintln!("observability init failed: {e}");
-            None
-        }
-    }
-}
-
 async fn serve() -> Result<()> {
-    #[cfg(feature = "otel")]
-    let _obs = obs_init();
     let srv = aster::rpc::AsterServer::builder()
         .config(cfg())
         .service(InteropEchoServer::new(EchoImpl))
@@ -201,8 +184,6 @@ async fn connect(node: &Node, ticket: &str) -> Result<aster::Connection> {
 }
 
 async fn run_client(ticket: &str) -> bool {
-    #[cfg(feature = "otel")]
-    let _obs = obs_init();
     let node = match Node::start(cfg()).await {
         Ok(n) => n,
         Err(e) => {
@@ -351,37 +332,29 @@ fn probe() -> EchoRequest {
 /// The known trace the `trace` case sends under.
 const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
-/// `traceEcho` called inside a `tracing` span whose OpenTelemetry parent is a
-/// remote, sampled span context with a known trace id: the client span joins
-/// that trace and injects `traceparent`, and the server must report the same
-/// trace id from its dispatch context.
+/// `traceEcho` called under a known remote, sampled trace context with no
+/// observability pipeline: the client puts that context on the wire and the
+/// server must report the same trace id from its dispatch context.
 #[cfg(feature = "otel")]
 async fn trace_case(client: &InteropEchoClient) -> Verdict {
-    use aster_otel::opentelemetry::trace::{
-        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
-    };
-    use aster_otel::opentelemetry::Context;
-    use aster_otel::OpenTelemetrySpanExt;
-    use tracing::Instrument;
-
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1)
         | 1;
-    let sc = SpanContext::new(
-        TraceId::from_hex(TRACE_ID).map_err(|e| e.to_string())?,
-        SpanId::from_bytes(nanos.to_be_bytes()),
-        TraceFlags::SAMPLED,
-        true,
-        TraceState::NONE,
-    );
-    // Target under `aster` so the default span filter (`aster=info`) enables it.
-    let span = tracing::info_span!(target: "aster::interop", "interop.trace");
-    let _ = span.set_parent(Context::new().with_remote_span_context(sc));
+    let mut trace_id = [0u8; 16];
+    for (i, b) in trace_id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&TRACE_ID[2 * i..2 * i + 2], 16).map_err(|e| e.to_string())?;
+    }
+    let ctx = aster_otel::TraceContext {
+        trace_id,
+        span_id: nanos.to_be_bytes(),
+        trace_flags: aster_otel::TraceContext::SAMPLED,
+        is_remote: true,
+    };
     let reply = tokio::time::timeout(
         Duration::from_secs(15),
-        client.trace_echo(probe()).instrument(span),
+        aster::rpc::with_trace_context(ctx, client.trace_echo(probe())),
     )
     .await
     .map_err(|_| "traceEcho(): timeout".to_string())?

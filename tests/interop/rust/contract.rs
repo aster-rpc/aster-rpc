@@ -211,20 +211,15 @@ impl InteropEcho for EchoImpl {
     }
 }
 
-/// The trace id of the call being dispatched: the handler runs inside the
-/// call's server span, so the `tracing` span's OpenTelemetry context carries
-/// it. Empty without the `otel` feature or without a tracer provider.
+/// The trace id of the call being dispatched: its span's OpenTelemetry
+/// context when a span carries one, else the pass-through context of the
+/// inbound `traceparent` (valid with no observability pipeline at all). Empty
+/// without the `otel` feature or without a `traceparent` on the call.
 #[cfg(feature = "otel")]
 fn current_trace_id() -> String {
-    use aster_otel::opentelemetry::trace::TraceContextExt;
-    use aster_otel::OpenTelemetrySpanExt;
-    let cx = tracing::Span::current().context();
-    let sc = cx.span().span_context().clone();
-    if sc.is_valid() {
-        sc.trace_id().to_string()
-    } else {
-        String::new()
-    }
+    aster::rpc::current_trace_context()
+        .map(|c| c.trace_id.iter().map(|b| format!("{b:02x}")).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(not(feature = "otel"))]

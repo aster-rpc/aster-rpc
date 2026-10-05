@@ -903,15 +903,18 @@ impl Dispatcher {
         // own events, and the client spans of calls it makes, carry the call's
         // identity. Disabled (the common case): no span.
         let span = obs.span().clone();
+        let pass = obs.pass();
         let method = header.method.clone();
         // A peer cancel (or the stream failing under the call) drops the
         // handler, as a deadline does, whatever the pattern: a unary handler
         // has no send to fail, so it would otherwise run to completion.
         let peer_cancel = peer_cancelled(parts.cancel_notify.clone(), parts.cancelled.clone());
         let Some(at) = deadline else {
-            let handler = svc
-                .dispatch(&method, Call::new(parts, header, attributes, None, obs))
-                .instrument(span.clone());
+            let handler = super::observe::scoped(
+                pass,
+                svc.dispatch(&method, Call::new(parts, header, attributes, None, obs))
+                    .instrument(span.clone()),
+            );
             tokio::select! {
                 biased;
                 () = handler => {}
@@ -931,7 +934,7 @@ impl Dispatcher {
         });
         let handler = svc.dispatch(&method, Call::new(parts, header, attributes, Some(at), obs));
         let deadline_span = span.clone();
-        let handler = handler.instrument(span);
+        let handler = super::observe::scoped(pass, handler.instrument(span));
         tokio::select! {
             biased;
             () = handler => {}

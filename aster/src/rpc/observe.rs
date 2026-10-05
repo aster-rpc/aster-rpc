@@ -57,6 +57,8 @@ impl Telemetry {
             span: Span::none(),
             #[cfg(feature = "otel")]
             otel,
+            #[cfg(feature = "otel")]
+            pass: None,
         }
     }
 
@@ -110,6 +112,10 @@ pub(crate) struct CallObs {
     span: Span,
     #[cfg(feature = "otel")]
     otel: Option<otel::CallOtel>,
+    /// The inbound trace context when no enabled span carries it (no
+    /// pipeline, traces off, or the `rpc` span filtered out).
+    #[cfg(feature = "otel")]
+    pass: Option<otel::Pass>,
 }
 
 impl CallObs {
@@ -148,9 +154,18 @@ impl CallObs {
         #[cfg(feature = "otel")]
         if let Some(o) = &mut self.otel {
             if let Some(span) = o.open(header, peer, pattern, known) {
+                if span.is_disabled() {
+                    self.pass = o.pass();
+                }
                 self.span = span;
                 return;
             }
+        }
+        // No span: no pipeline, or one without traces. The inbound context
+        // still passes through (W3C trace-context, like a non-recording span).
+        #[cfg(feature = "otel")]
+        {
+            self.pass = otel::pass_from_header(header);
         }
         let _ = (pattern, known);
         self.span = tracing::debug_span!(
@@ -198,8 +213,17 @@ impl CallObs {
     pub(crate) fn trace_context(&self) -> Option<super::foreign::CallTraceContext> {
         #[cfg(feature = "otel")]
         if self.otel.is_some() && !self.span.is_disabled() {
-            return otel::span_trace_context(&self.span);
+            if let Some(c) = otel::span_trace_context(&self.span) {
+                return Some(c);
+            }
         }
+        #[cfg(feature = "otel")]
+        return self
+            .pass
+            .as_ref()
+            .and_then(|p| p.ctx.as_ref())
+            .map(otel::call_trace_context);
+        #[cfg(not(feature = "otel"))]
         None
     }
 
@@ -207,10 +231,23 @@ impl CallObs {
     /// stripped from its metadata (Q7), exported or not.
     pub(crate) fn inbound_trace(&self) -> Option<super::foreign::InboundTrace> {
         #[cfg(feature = "otel")]
+        if let Some(p) = &self.pass {
+            return p.inbound.clone();
+        }
+        #[cfg(feature = "otel")]
         if let Some(o) = &self.otel {
             return o.inbound_trace();
         }
         None
+    }
+
+    /// The call's pass-through trace context, to wrap its Rust-native
+    /// handler future in [`scoped`] before the `CallObs` moves into the call.
+    pub(crate) fn pass(&self) -> Pass {
+        #[cfg(feature = "otel")]
+        return self.pass.clone();
+        #[cfg(not(feature = "otel"))]
+        Pass
     }
 
     /// Add an OTel event to the span (cancel and deadline, design §5.2).
@@ -269,6 +306,29 @@ impl Drop for CallObs {
     }
 }
 
+/// A call's pass-through trace context (`None` unless the `otel` feature and
+/// an inbound `traceparent` with no enabled span).
+#[cfg(feature = "otel")]
+pub(crate) type Pass = Option<otel::Pass>;
+#[cfg(not(feature = "otel"))]
+pub(crate) struct Pass;
+
+/// Run a Rust-native handler future with the call's pass-through trace
+/// context available to the client calls it makes (see
+/// [`ClientObs::start`]). Identity without a context or the `otel` feature.
+#[cfg(feature = "otel")]
+pub(crate) fn scoped<F: std::future::Future>(
+    pass: Pass,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
+    otel::scoped(pass, f)
+}
+
+#[cfg(not(feature = "otel"))]
+pub(crate) fn scoped<F: std::future::Future>(_pass: Pass, f: F) -> F {
+    f
+}
+
 /// One client call's telemetry (design §4.1 client instruments, §5.4): the
 /// client span and its trace context injected into the outgoing header.
 /// Finish it with [`finish`](ClientObs::finish); dropped unfinished, the call
@@ -283,11 +343,21 @@ impl ClientObs {
     /// Start a call whose header (options already applied) is `header`.
     #[inline]
     pub(crate) fn start(header: &mut StreamHeader) -> Self {
+        #[cfg(feature = "otel")]
+        {
+            let inner = otel::ClientOtel::start(header);
+            // No client span injected a context: a Rust-native handler's
+            // pass-through context goes out (a binding-written `traceparent`
+            // is left alone).
+            if inner.as_ref().is_none_or(|i| i.span.is_disabled()) {
+                otel::inject_pass(header);
+            }
+            ClientObs { inner }
+        }
         #[cfg(not(feature = "otel"))]
-        let _ = header;
-        ClientObs {
-            #[cfg(feature = "otel")]
-            inner: otel::ClientOtel::start(header),
+        {
+            let _ = header;
+            ClientObs {}
         }
     }
 

@@ -24,7 +24,7 @@ use aster_otel::opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounte
 use aster_otel::opentelemetry::propagation::{Extractor, Injector};
 use aster_otel::opentelemetry::trace::{Status, TraceContextExt};
 use aster_otel::opentelemetry::{global, Context, KeyValue};
-use aster_otel::{AttributeExtractor, ExtractorSource, OpenTelemetrySpanExt};
+use aster_otel::{AttributeExtractor, ExtractorSource, OpenTelemetrySpanExt, TraceContext};
 use tracing::Span;
 
 use super::status_name;
@@ -371,6 +371,105 @@ fn inbound_of(h: &StreamHeader) -> Option<InboundTrace> {
     })
 }
 
+/// A call's trace context when no recording span carries it: the inbound
+/// `traceparent` parsed directly (no propagator, no pipeline needed), like an
+/// OTel non-recording span, and the raw `baggage` / `tracestate`.
+#[derive(Clone)]
+pub(crate) struct Pass {
+    pub(crate) ctx: Option<TraceContext>,
+    pub(crate) inbound: Option<InboundTrace>,
+}
+
+tokio::task_local! {
+    /// The pass-through context of the Rust-native handler running in this
+    /// task, so the client calls it makes continue the caller's trace.
+    static PASS: Pass;
+}
+
+/// Read, parse and strip a header's reserved trace keys. `None` (and the
+/// header untouched) when it has none: one metadata key scan.
+pub(crate) fn pass_from_header(h: &mut StreamHeader) -> Option<Pass> {
+    if !has_trace_keys(h) {
+        return None;
+    }
+    let tp = metadata(h, TRACEPARENT);
+    let ctx = tp.and_then(|v| TraceContext::parse_traceparent(v.as_bytes()));
+    if tp.is_some() && ctx.is_none() {
+        tracing::debug!(target: DISPATCH, "malformed traceparent ignored; the call starts a new trace");
+    }
+    let inbound = inbound_of(h);
+    strip_trace_keys(h);
+    Some(Pass { ctx, inbound })
+}
+
+pub(crate) fn call_trace_context(c: &TraceContext) -> crate::rpc::foreign::CallTraceContext {
+    crate::rpc::foreign::CallTraceContext {
+        trace_id: c.trace_id,
+        span_id: c.span_id,
+        trace_flags: c.trace_flags,
+    }
+}
+
+/// Run `f` with `pass` as the handler's pass-through context (when it has a
+/// valid trace context).
+pub(crate) async fn scoped<F: std::future::Future>(pass: Option<Pass>, f: F) -> F::Output {
+    match pass {
+        Some(p) if p.ctx.is_some() => PASS.scope(p, f).await,
+        _ => f.await,
+    }
+}
+
+/// The running handler's pass-through context, if any.
+fn current_pass() -> Option<Pass> {
+    PASS.try_with(Clone::clone).ok()
+}
+
+/// The trace context of the code running here: the current `tracing` span's
+/// OpenTelemetry context when it has one, else the pass-through context of
+/// the call a Rust-native handler is serving (the caller's inbound
+/// `traceparent`, valid with no pipeline, with traces off, or with the `rpc`
+/// span filtered out).
+pub fn current_trace_context() -> Option<TraceContext> {
+    let cx = Span::current().context();
+    TraceContext::from_span_context(cx.span().span_context())
+        .or_else(|| current_pass().and_then(|p| p.ctx))
+}
+
+/// Run `f` with `ctx` as its trace context: the client calls it makes carry
+/// `ctx` (as a child of it when a client span is exported) unless a span with
+/// a valid context is current or the call's metadata has its own
+/// `traceparent`. For code that continues a trace with no pipeline.
+pub async fn with_trace_context<F: std::future::Future>(ctx: TraceContext, f: F) -> F::Output {
+    PASS.scope(
+        Pass {
+            ctx: Some(ctx),
+            inbound: None,
+        },
+        f,
+    )
+    .await
+}
+
+/// Write the running Rust-native handler's pass-through context into an
+/// outgoing header that carries no `traceparent` of its own.
+pub(crate) fn inject_pass(h: &mut StreamHeader) {
+    let Some(p) = current_pass() else { return };
+    let Some(ctx) = p.ctx else { return };
+    if metadata(h, TRACEPARENT).is_some() {
+        return;
+    }
+    let mut inj = HeaderInjector(h);
+    inj.set(TRACEPARENT, ctx.traceparent());
+    if let Some(i) = p.inbound {
+        if let Some(t) = i.tracestate {
+            inj.set(TRACESTATE, t.to_string());
+        }
+        if let Some(b) = i.baggage {
+            inj.set(BAGGAGE, b.to_string());
+        }
+    }
+}
+
 fn extract(h: &StreamHeader) -> Context {
     let cx = global::get_text_map_propagator(|p| p.extract(&HeaderCarrier(h)));
     if !cx.span().span_context().is_valid() && h.metadata_keys.iter().any(|k| k == TRACEPARENT) {
@@ -488,6 +587,19 @@ impl CallOtel {
     /// See [`CallObs::inbound_trace`](super::CallObs::inbound_trace).
     pub(crate) fn inbound_trace(&self) -> Option<InboundTrace> {
         self.inbound.clone()
+    }
+
+    /// The pass-through context of a call whose span is not enabled: the
+    /// remote parent extracted at open.
+    pub(crate) fn pass(&self) -> Option<Pass> {
+        let ctx = self
+            .parent
+            .as_ref()
+            .and_then(|cx| TraceContext::from_span_context(cx.span().span_context()));
+        (ctx.is_some() || self.inbound.is_some()).then(|| Pass {
+            ctx,
+            inbound: self.inbound.clone(),
+        })
     }
 
     /// Whether the call needs its start time (for the duration histogram).
@@ -741,6 +853,14 @@ impl ClientOtel {
                 let cx = extract(header);
                 if cx.span().span_context().is_valid() {
                     let _ = span.set_parent(cx);
+                }
+            }
+            // Under a Rust-native handler whose `rpc` span is not enabled the
+            // tracing context is empty: parent on the pass-through context.
+            if !has_trace_keys(header) && span_trace_context(&Span::current()).is_none() {
+                if let Some(ctx) = current_pass().and_then(|p| p.ctx) {
+                    let _ = span
+                        .set_parent(Context::new().with_remote_span_context(ctx.to_span_context()));
                 }
             }
             let cx = span.context();

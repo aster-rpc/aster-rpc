@@ -106,6 +106,10 @@ fn child() {
         "disabled_cost" => case_disabled_cost(),
         "record_contention" => case_record_contention(),
         "admission_and_upcalls" => case_admission_and_upcalls(),
+        "pass_none" => case_pass_through(Mode::NoPipeline),
+        "pass_traces_off" => case_pass_through(Mode::TracesOff),
+        "pass_span_filtered" => case_pass_through(Mode::SpanFiltered),
+        "pass_client_span_only" => case_pass_through(Mode::ClientSpanOnly),
         other => panic!("unknown case {other}"),
     }
     println!("case-ok");
@@ -119,8 +123,8 @@ fn header(method: &str) -> StreamHeader {
     StreamHeader {
         service: "test.Svc".into(),
         method: method.into(),
-        metadata_keys: vec!["traceparent".into(), "x-other".into()],
-        metadata_values: vec![TRACEPARENT.into(), "v".into()],
+        metadata_keys: vec!["x-other".into()],
+        metadata_values: vec!["v".into()],
         ..Default::default()
     }
 }
@@ -159,8 +163,170 @@ fn case_disabled_cost() {
         }
     });
     assert_eq!(n, 0, "the disabled record path allocated {n} times");
-    assert_eq!(h.metadata_keys, ["traceparent", "x-other"]);
-    assert_eq!(h.metadata_values[0], TRACEPARENT);
+    assert_eq!(h.metadata_keys, ["x-other"]);
+    assert_eq!(h.metadata_values, ["v"]);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// No pipeline at all.
+    NoPipeline,
+    /// A metrics-only pipeline: traces off.
+    TracesOff,
+    /// Traces on, the `rpc` and client spans filtered out by level.
+    SpanFiltered,
+    /// Traces on, only the client span enabled.
+    ClientSpanOnly,
+}
+
+fn tc(s: &str) -> aster_otel::TraceContext {
+    aster_otel::TraceContext::parse_traceparent(s.as_bytes()).unwrap()
+}
+
+fn meta<'a>(h: &'a StreamHeader, key: &str) -> Option<&'a str> {
+    h.metadata_keys
+        .iter()
+        .position(|k| k == key)
+        .map(|i| h.metadata_values[i].as_str())
+}
+
+/// W3C trace-context passes through whatever the pipeline: the call's trace
+/// context is the inbound one, the reserved keys are hidden, and a Rust-native
+/// handler's outbound call carries the context on.
+fn case_pass_through(mode: Mode) {
+    let t = aster_otel::testing::TestExporters::new();
+    let _h = match mode {
+        Mode::NoPipeline => None,
+        Mode::TracesOff => Some(
+            aster_otel::init(aster_otel::ObservabilityConfig {
+                from_env: false,
+                traces_exporter: Some(vec![]),
+                metrics_exporter: Some(vec![aster_otel::ExporterKind::Otlp]),
+                otlp_metrics: aster_otel::OtlpSettings {
+                    endpoint: Some("http://127.0.0.1:9/v1/metrics".into()),
+                    ..Default::default()
+                },
+                metric_export_interval: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            })
+            .unwrap(),
+        ),
+        Mode::SpanFiltered | Mode::ClientSpanOnly => {
+            let mut cfg = aster_otel::ObservabilityConfig {
+                from_env: false,
+                test_exporters: Some(t.clone()),
+                span_filter: Some(
+                    if mode == Mode::SpanFiltered {
+                        "warn"
+                    } else {
+                        "warn,aster::rpc::client=info"
+                    }
+                    .into(),
+                ),
+                metric_export_interval: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            };
+            cfg.span_batch.scheduled_delay = Some(Duration::from_secs(3600));
+            Some(aster_otel::init(cfg).unwrap())
+        }
+    };
+    let b = super::builtins();
+    match mode {
+        Mode::NoPipeline => assert!(b.is_none()),
+        Mode::TracesOff => assert!(b.is_some_and(|b| !b.traces)),
+        Mode::SpanFiltered | Mode::ClientSpanOnly => assert!(b.is_some_and(|b| b.traces)),
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let inbound = tc(TRACEPARENT);
+
+    let mut h = header("unary");
+    for (k, v) in [
+        ("traceparent", TRACEPARENT),
+        ("tracestate", "vendor=a"),
+        ("baggage", "k=v"),
+    ] {
+        h.metadata_keys.push(k.into());
+        h.metadata_values.push(v.into());
+    }
+    let mut obs = Telemetry::default().start_call();
+    obs.open(&mut h, "peer", Some("unary"));
+    assert!(obs.span().is_disabled(), "the rpc span must not be enabled");
+    let got = obs.trace_context().expect("trace context passes through");
+    assert_eq!(got.trace_id, inbound.trace_id);
+    assert_eq!(got.span_id, inbound.span_id);
+    assert_eq!(got.trace_flags, inbound.trace_flags);
+    assert_eq!(h.metadata_keys, ["x-other"], "reserved keys hidden (Q7)");
+    let it = obs.inbound_trace().unwrap();
+    assert_eq!(it.tracestate.as_deref(), Some("vendor=a"));
+    assert_eq!(it.baggage.as_deref(), Some("k=v"));
+
+    // A Rust-native handler's outbound call.
+    let out = |preset: Option<&str>| {
+        let mut o = header("out");
+        if let Some(p) = preset {
+            o.metadata_keys.insert(0, "traceparent".into());
+            o.metadata_values.insert(0, p.into());
+        }
+        rt.block_on(super::super::scoped(obs.pass(), async {
+            let mut c = ClientObs::start(&mut o);
+            c.finish(StatusCode::Ok);
+        }));
+        o
+    };
+    let o = out(None);
+    let sent = tc(meta(&o, "traceparent").expect("outbound carries the context"));
+    assert_eq!(sent.trace_id, inbound.trace_id);
+    if mode == Mode::ClientSpanOnly {
+        // The client span is exported as a child of the inbound span.
+        aster_otel::flush(Duration::from_secs(10)).unwrap();
+        let spans = t.spans.finished_spans();
+        let client = spans
+            .iter()
+            .find(|s| s.span_kind == aster_otel::opentelemetry::trace::SpanKind::Client)
+            .expect("client span exported");
+        assert_eq!(client.parent_span_id.to_bytes(), inbound.span_id);
+        assert_eq!(client.span_context.span_id().to_bytes(), sent.span_id);
+        assert_eq!(meta(&o, "x-other"), Some("v"));
+    } else {
+        assert_eq!(sent.span_id, inbound.span_id);
+        assert_eq!(sent.trace_flags, inbound.trace_flags);
+        assert_eq!(meta(&o, "tracestate"), Some("vendor=a"));
+        assert_eq!(meta(&o, "baggage"), Some("k=v"));
+        // A binding-written traceparent is left intact.
+        let own = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        assert_eq!(meta(&out(Some(own)), "traceparent"), Some(own));
+    }
+
+    // Outside a handler, nothing is added.
+    let mut o = header("out");
+    ClientObs::start(&mut o).finish(StatusCode::Ok);
+    if mode != Mode::ClientSpanOnly {
+        assert!(meta(&o, "traceparent").is_none());
+    }
+
+    // A malformed traceparent is no context: a new trace.
+    let mut h = header("unary");
+    h.metadata_keys.push("traceparent".into());
+    h.metadata_values.push("00-zz".into());
+    let mut obs = Telemetry::default().start_call();
+    obs.open(&mut h, "peer", Some("unary"));
+    assert!(obs.trace_context().is_none());
+    assert_eq!(h.metadata_keys, ["x-other"]);
+    let mut o = header("out");
+    rt.block_on(super::super::scoped(obs.pass(), async {
+        ClientObs::start(&mut o).finish(StatusCode::Ok);
+    }));
+    if mode != Mode::ClientSpanOnly {
+        assert!(meta(&o, "traceparent").is_none());
+    }
+    if matches!(mode, Mode::SpanFiltered | Mode::ClientSpanOnly) {
+        aster_otel::shutdown().unwrap();
+    } else {
+        // Exiting skips the final export (nothing listens on the endpoint).
+        std::mem::forget(_h);
+    }
 }
 
 /// Metrics on (traces off, so this is the instrument record path alone):
@@ -318,4 +484,24 @@ fn disabled_record_path_does_not_allocate() {
 #[test]
 fn hot_series_record_without_allocating_under_series_churn() {
     run("record_contention");
+}
+
+#[test]
+fn trace_context_passes_through_with_no_pipeline() {
+    run("pass_none");
+}
+
+#[test]
+fn trace_context_passes_through_with_traces_off() {
+    run("pass_traces_off");
+}
+
+#[test]
+fn trace_context_passes_through_with_the_rpc_span_filtered_out() {
+    run("pass_span_filtered");
+}
+
+#[test]
+fn client_span_under_an_unexported_rpc_span_is_a_child_of_the_inbound_span() {
+    run("pass_client_span_only");
 }

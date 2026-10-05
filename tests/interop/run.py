@@ -12,9 +12,9 @@ its cell):
   blocks; the client gets DEADLINE_EXCEEDED / CANCELLED and the server must
   observe the cancellation) and session (state persists per session, isolated
   between sessions) and trace (``traceEcho`` called under a known W3C trace
-  id; the server replies the trace id its dispatch context saw; every program
-  starts its observability pipeline from ``OTEL_*`` pointed at a closed local
-  port, so there is no collector).
+  id; the server replies the trace id its dispatch context saw). W3C
+  trace-context passes through whatever the observability pipeline: the
+  programs run with no ``OTEL_*`` set, no exporter and the default log level.
 * Expose matrix: every language serves an HTTP handler through expose; the
   Rust and Python streaming-relay consumers call each one (``EXPOSE_CASES``).
 
@@ -94,18 +94,6 @@ ENV = {
     "ASTER_BIND_ADDR": "127.0.0.1:0",
     "ASTER_LOG_LEVEL": os.environ.get("ASTER_LOG_LEVEL", "warn"),
     "PYTHONUNBUFFERED": "1",
-    # Trace continuity (``trace`` case): every program starts its observability
-    # pipeline from the environment, and a tracer provider exists only when a
-    # span exporter does. Point OTLP at a closed local port and never flush:
-    # no collector, nothing is exported, but dispatch contexts carry trace ids.
-    # The span filter defaults to the log filter, and ASTER_LOG_LEVEL=warn would
-    # disable the info-level RPC spans (no span, no trace id).
-    "ASTER_LOG": "warn,aster=info",
-    "OTEL_TRACES_EXPORTER": "otlp",
-    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:9",
-    "OTEL_BSP_SCHEDULE_DELAY": "3600000",
-    "OTEL_METRICS_EXPORTER": "none",
-    "OTEL_LOGS_EXPORTER": "none",
 }
 
 CLIENT_TIMEOUT = 180  # seconds for one client run (all cases)

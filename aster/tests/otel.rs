@@ -66,6 +66,12 @@ fn child() {
             "foreign_spans" => foreign::case_foreign_spans().await,
             #[cfg(feature = "binding-support")]
             "foreign_inbound_baggage" => foreign::case_inbound_baggage().await,
+            #[cfg(feature = "binding-support")]
+            "passthrough_none" => foreign::case_passthrough("none").await,
+            #[cfg(feature = "binding-support")]
+            "passthrough_traces_off" => foreign::case_passthrough("traces_off").await,
+            #[cfg(feature = "binding-support")]
+            "passthrough_span_filtered" => foreign::case_passthrough("span_filtered").await,
             other => panic!("unknown case {other}"),
         }
     });
@@ -501,9 +507,10 @@ async fn case_trace_continuity() {
 const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 const PARENT: &str = "00f067aa0ba902b7";
 
-/// No pipeline: trace metadata is ordinary metadata both ways (§5.1). Then
+/// No pipeline: the handler does not see the reserved trace keys either (Q7;
+/// the context passes through, see `trace_context_passes_through_*`). Then
 /// with tracing on, a caller-supplied `traceparent` parents the client span
-/// (§5.4) and the handler no longer sees the reserved keys (Q7).
+/// (§5.4) and the handler still does not see them.
 async fn case_pass_through_then_hidden() {
     let (_server, _client, _handle, conn) = echo_server().await;
     let traceparent = format!("00-{TRACE}-{PARENT}-01");
@@ -516,14 +523,7 @@ async fn case_pass_through_then_hidden() {
             .await
             .unwrap(),
     );
-    assert_eq!(
-        seen,
-        [
-            format!("traceparent={traceparent}"),
-            "baggage=k=v".into(),
-            "x-other=1".into()
-        ]
-    );
+    assert_eq!(seen, ["x-other=1"]);
 
     let t = TestExporters::new();
     let _h = aster_otel::init(test_cfg(&t)).unwrap();
@@ -613,7 +613,9 @@ mod foreign {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use aster::binding_support::dispatch::{CallRef, DispatchEvent, DispatchSink, InboundTrace};
+    use aster::binding_support::dispatch::{
+        CallRef, CallTraceContext, DispatchEvent, DispatchSink, InboundTrace,
+    };
     use aster::rpc::{DynamicService, MethodDesc, MethodPattern, RpcStatus, Server, TypeRef};
     use aster_otel::opentelemetry::trace::{SpanKind, Status};
     use aster_otel::testing::TestExporters;
@@ -681,6 +683,122 @@ mod foreign {
 
     /// Inbound `baggage` / `tracestate` reach the binding on the call, not in
     /// its metadata (Q7); a baggage over the W3C limits is dropped.
+    /// Records the trace context each call arrived with.
+    #[derive(Default)]
+    struct Ctx {
+        calls: Mutex<Vec<(Option<CallTraceContext>, Vec<String>)>>,
+    }
+
+    impl DispatchSink for Ctx {
+        fn deliver(&self, event: DispatchEvent) {
+            let DispatchEvent::Call(call) = event else {
+                return;
+            };
+            self.calls
+                .lock()
+                .unwrap()
+                .push((call.trace_context, call.header.metadata_keys.clone()));
+            let r = call.handle.to_ref();
+            call.handle.detach();
+            r.try_respond(&[], &RpcStatus::ok()).unwrap();
+        }
+    }
+
+    /// A Rust-native handler that calls `test.Inbound/m` on another node.
+    struct Hop(RpcConnection);
+
+    #[async_trait::async_trait]
+    impl ServiceDispatch for Hop {
+        fn name(&self) -> &str {
+            "test.Hop"
+        }
+        fn version(&self) -> i32 {
+            1
+        }
+        fn methods(&self) -> &[&str] {
+            &["hop"]
+        }
+        async fn dispatch(&self, _method: &str, mut call: Call) {
+            let req = call.recv_request().await.unwrap_or_default();
+            let status = match self.0.unary(&header("test.Inbound", "m"), req).await {
+                Ok(_) => RpcStatus::ok(),
+                Err(e) => RpcStatus::error(StatusCode::Internal, e.to_string()),
+            };
+            let _ = call.respond(vec![], &status).await;
+        }
+    }
+
+    /// Client → Hop (Rust-native) → Inbound (binding): the caller's trace
+    /// context reaches the binding on both hops, in every pipeline mode, and
+    /// the Rust-native hop's outbound call carries it on.
+    pub(super) async fn case_passthrough(mode: &str) {
+        let t = TestExporters::new();
+        let _h = match mode {
+            "none" => None,
+            "traces_off" => Some(
+                aster_otel::init(ObservabilityConfig {
+                    from_env: false,
+                    traces_exporter: Some(vec![]),
+                    metrics_exporter: Some(vec![aster_otel::ExporterKind::Otlp]),
+                    otlp_metrics: aster_otel::OtlpSettings {
+                        endpoint: Some("http://127.0.0.1:9/v1/metrics".into()),
+                        ..Default::default()
+                    },
+                    metric_export_interval: Some(Duration::from_secs(3600)),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            "span_filtered" => {
+                let mut cfg = test_cfg(&t);
+                cfg.span_filter = Some("warn".into());
+                Some(aster_otel::init(cfg).unwrap())
+            }
+            other => panic!("unknown mode {other}"),
+        };
+        let (a, c) = nodes().await;
+        let mut svc = DynamicService::new("test.Inbound", 1);
+        svc.methods = vec![method("m")];
+        let sink = Arc::new(Ctx::default());
+        let _ha = Server::new(&a)
+            .dispatch_sink(sink.clone())
+            .dynamic_service(svc)
+            .unwrap()
+            .serve();
+        let b = Node::start_with_alpns(node_cfg(), vec![RPC_ALPN.to_vec()])
+            .await
+            .unwrap();
+        wait_for_addr(&b).await;
+        for (x, y) in [(&a, &b), (&b, &c)] {
+            x.add_peer(y).unwrap();
+            y.add_peer(x).unwrap();
+        }
+        let _hb = Server::new(&b).register(Hop(connect(&b, &a).await)).serve();
+        let to_b = connect(&c, &b).await;
+
+        let opts = CallOptions::new()
+            .metadata("traceparent", format!("00-{TRACE}-{PARENT}-01"))
+            .metadata("x-user", "1");
+        within(to_b.unary_with(&header("test.Hop", "hop"), vec![1], &opts))
+            .await
+            .unwrap();
+        let calls = sink.calls.lock().unwrap();
+        let (tc, keys) = &calls[0];
+        let tc = tc.expect("the binding gets the trace context");
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(hex(&tc.trace_id), TRACE);
+        assert_eq!(tc.trace_flags, 1);
+        assert!(keys.is_empty(), "reserved keys hidden: {keys:?}");
+        // The hop is a pass-through: the same trace, the inbound span id.
+        assert_eq!(hex(&tc.span_id), PARENT);
+        drop(calls);
+        if mode != "traces_off" {
+            aster_otel::shutdown().unwrap();
+        } else {
+            std::mem::forget(_h);
+        }
+    }
+
     pub(super) async fn case_inbound_baggage() {
         let t = TestExporters::new();
         let _h = aster_otel::init(test_cfg(&t)).unwrap();
@@ -836,7 +954,7 @@ fn rust_to_rust_trace_continuity_across_two_hops() {
 }
 
 #[test]
-fn trace_metadata_passes_through_without_a_pipeline() {
+fn trace_keys_are_hidden_from_handlers_with_and_without_a_pipeline() {
     run("pass_through_then_hidden");
 }
 
@@ -860,4 +978,22 @@ fn foreign_calls_carry_inbound_baggage_and_tracestate_outside_metadata() {
 #[test]
 fn foreign_span_lasts_the_binding_handling_time_and_records_cancel_and_expiry() {
     run("foreign_spans");
+}
+
+#[cfg(feature = "binding-support")]
+#[test]
+fn trace_context_passes_through_two_hops_with_no_pipeline() {
+    run("passthrough_none");
+}
+
+#[cfg(feature = "binding-support")]
+#[test]
+fn trace_context_passes_through_two_hops_with_traces_off() {
+    run("passthrough_traces_off");
+}
+
+#[cfg(feature = "binding-support")]
+#[test]
+fn trace_context_passes_through_two_hops_with_the_rpc_span_filtered_out() {
+    run("passthrough_span_filtered");
 }

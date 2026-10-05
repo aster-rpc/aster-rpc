@@ -66,7 +66,7 @@ pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationE
 pub use empty::Empty;
 pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
 #[cfg(feature = "otel")]
-pub use observe::otel::ExtractContext;
+pub use observe::otel::{current_trace_context, with_trace_context, ExtractContext};
 pub use projection::{Projection, ProjectionRegistry};
 pub use proxy::{DynContract, DynResponseStream, DynValue, DynamicClient};
 #[cfg(all(feature = "docs", feature = "blobs"))]
