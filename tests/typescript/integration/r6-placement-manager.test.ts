@@ -9,7 +9,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -24,22 +24,12 @@ import {
   type TopologyView,
 } from '@aster-rpc/aster';
 
+import { coordinationFixture } from '../helpers/coordination-fixture.ts';
+
 const REPO = path.resolve(__dirname, '../../..');
 const OFFLINE = { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } as const;
 
-function fixtureBinary(): string | undefined {
-  const exe = process.platform === 'win32' ? '.exe' : '';
-  const target = process.env.CARGO_TARGET_DIR ?? path.join(REPO, 'target');
-  return [
-    process.env.ASTER_COORDINATION_FIXTURE,
-    path.join(target, 'debug', `aster-coordination-fixture${exe}`),
-    path.join(target, 'release', `aster-coordination-fixture${exe}`),
-  ]
-    .filter((p): p is string => !!p && existsSync(p))
-    .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
-}
-
-const FIXTURE = fixtureBinary();
+const FIXTURE = coordinationFixture(REPO);
 if (!FIXTURE) {
   console.warn('[r6-placement-manager] skipped: no aster-coordination-fixture binary');
 }

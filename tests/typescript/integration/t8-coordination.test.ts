@@ -36,21 +36,12 @@ import {
   type ResourceKeyInput,
 } from '@aster-rpc/aster';
 
+import { coordinationFixture } from '../helpers/coordination-fixture.ts';
+
 const REPO = path.resolve(__dirname, '../../..');
 const OFFLINE = { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } as const;
 
-function fixtureBinary(): string | undefined {
-  const exe = process.platform === 'win32' ? '.exe' : '';
-  const candidates = [
-    process.env.ASTER_COORDINATION_FIXTURE,
-    path.join(process.env.CARGO_TARGET_DIR ?? path.join(REPO, 'target'), 'debug', `aster-coordination-fixture${exe}`),
-    path.join(process.env.CARGO_TARGET_DIR ?? path.join(REPO, 'target'), 'release', `aster-coordination-fixture${exe}`),
-  ].filter((p): p is string => !!p && existsSync(p));
-  // Prefer the freshest build.
-  return candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
-}
-
-const FIXTURE = fixtureBinary();
+const FIXTURE = coordinationFixture(REPO);
 if (!FIXTURE) {
   console.warn(
     '[t8-coordination] skipped: no aster-coordination-fixture binary ' +
