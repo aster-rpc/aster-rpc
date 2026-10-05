@@ -23,6 +23,11 @@ export class RetryInterceptor implements Interceptor {
     this.policy = { ...DEFAULT_RETRY, ...policy };
   }
 
+  /** Total attempts allowed, including the first. */
+  get maxAttempts(): number {
+    return this.policy.maxAttempts;
+  }
+
   async onError(ctx: CallContext, error: RpcError): Promise<RpcError> {
     if (!ctx.idempotent) return error;
     if (!RETRYABLE_CODES.has(error.code)) return error;

@@ -12,6 +12,8 @@ import { getServiceInfo } from './service.js';
 import type { AsterTransport, CallOptions } from './transport/base.js';
 import { LocalTransport } from './transport/local.js';
 import { ServiceRegistry } from './service.js';
+import { ClientChain, type ClientMethod } from './client-interceptors.js';
+import type { Interceptor } from './interceptors/base.js';
 
 /**
  * Typed service client wrapper — provides service metadata accessors
@@ -43,6 +45,12 @@ export interface ClientOptions {
   timeout?: number;
   /** Default metadata for all calls. */
   metadata?: Record<string, string>;
+  /**
+   * Client interceptors: hooks on every call pattern, plus
+   * `CircuitBreakerInterceptor` / `RetryInterceptor` policies on unary and
+   * client-streaming calls (see `client-interceptors.ts`).
+   */
+  interceptors?: Interceptor[];
 }
 
 /**
@@ -111,6 +119,8 @@ export function createClient<T extends new (...args: any[]) => any>(
     );
   }
 
+  const chain = new ClientChain(options?.interceptors ?? []);
+
   return new Proxy({} as AsterClient<InstanceType<T>>, {
     get(_target, prop: string | symbol) {
       if (prop === 'close') {
@@ -139,6 +149,25 @@ export function createClient<T extends new (...args: any[]) => any>(
 
         if (options?.timeout && !opts.deadlineSecs) {
           opts.deadlineSecs = Math.max(1, Math.round(options.timeout));
+        }
+
+        if (!chain.empty) {
+          const m: ClientMethod = {
+            service: serviceInfo.name,
+            method: methodInfo.name,
+            pattern: methodInfo.pattern,
+            idempotent: methodInfo.idempotent,
+          };
+          switch (methodInfo.pattern) {
+            case RpcPattern.UNARY:
+              return chain.unary(transport, m, request, opts);
+            case RpcPattern.SERVER_STREAM:
+              return chain.serverStream(transport, m, request, opts);
+            case RpcPattern.CLIENT_STREAM:
+              return chain.clientStream(transport, m, request as AsyncIterable<unknown>, opts);
+            case RpcPattern.BIDI_STREAM:
+              return chain.bidi(transport, m, opts);
+          }
         }
 
         switch (methodInfo.pattern) {

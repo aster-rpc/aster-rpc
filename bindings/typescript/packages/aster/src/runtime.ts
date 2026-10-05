@@ -940,6 +940,8 @@ export interface AsterClientOptions {
   enrollmentCredentialFile?: string;
   /** Retry configuration for reconnection. */
   retryBackoff?: ExponentialBackoff;
+  /** Client interceptors applied to every typed client (`client()` / `service()`). */
+  interceptors?: Interceptor[];
   /** Pre-generated type metadata from aster-gen (same as AsterServer.generated). */
   generated?: {
     SERVICES: readonly any[];
@@ -1058,6 +1060,7 @@ function loadEnrollmentCredential(filePath: string): ConsumerEnrollmentCredentia
  */
 export class AsterClientWrapper {
   private transport!: AsterTransport;
+  private readonly _interceptors: Interceptor[];
   readonly config: AsterConfig;
   private backoff: ExponentialBackoff;
   private _connected = false;
@@ -1110,6 +1113,7 @@ export class AsterClientWrapper {
     this._address = opts.address ?? opts.endpointAddr as string | undefined;
     this.backoff = opts.retryBackoff ?? DEFAULT_BACKOFF;
     this._generated = opts.generated;
+    this._interceptors = opts.interceptors ?? [];
 
     // Load identity file (.aster-identity) if present. The first consumer-role
     // peer entry IS the credential — mirrors Python AsterClient behaviour.
@@ -1295,12 +1299,12 @@ export class AsterClientWrapper {
 
   /** Create a typed client proxy for a service class. */
   async client<T extends new (...args: any[]) => any>(serviceClass: T): Promise<ClientProxy<InstanceType<T>>> {
-    return createClient(serviceClass, this.transport);
+    return createClient(serviceClass, this.transport, { interceptors: this._interceptors });
   }
 
   /** Create a typed client proxy for a service class. */
   service<T extends new (...args: any[]) => any>(serviceClass: T): ClientProxy<InstanceType<T>> {
-    return createClient(serviceClass, this.transport);
+    return createClient(serviceClass, this.transport, { interceptors: this._interceptors });
   }
 
   /**
