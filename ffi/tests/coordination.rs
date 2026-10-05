@@ -67,10 +67,39 @@ const DOMAIN: &str = "ffi.coordination.test";
 // ── the voter group ──────────────────────────────────────────────────────────
 
 struct Group {
-    _rt: tokio::runtime::Runtime,
-    _voter: AsterServer,
+    /// The voter and its runtime; taken by `teardown_fixtures` at exit.
+    live: Mutex<Option<(tokio::runtime::Runtime, AsterServer)>>,
     fixture: GroupFixture,
     ticket: String,
+}
+
+/// Shut the process-lifetime fixtures (the shared ffi runtime and the voter
+/// group) down at exit. LeakSanitizer checks from an `atexit` handler
+/// installed before `main`; handlers run last-registered first, so this runs
+/// before the check, which then sees no live connections. (A live QUIC send
+/// buffer whose data was fully acknowledged holds only a one-past-the-end
+/// pointer to its allocation, which LSan reports as a leak.)
+fn teardown_at_exit() {
+    extern "C" fn teardown_fixtures() {
+        if let Some(shared) = SHARED.get() {
+            let status = aster_runtime_close_and_wait(shared.rt, Duration::from_secs(10));
+            if status != OK {
+                eprintln!("coordination fixtures: ffi runtime teardown returned {status}");
+            }
+        }
+        if let Some(group) = GROUP.get() {
+            let live = group.live.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some((rt, voter)) = live {
+                rt.block_on(voter.shutdown());
+                rt.shutdown_timeout(Duration::from_secs(10));
+            }
+        }
+    }
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        // SAFETY: registers a plain `extern "C" fn()`.
+        assert_eq!(unsafe { libc::atexit(teardown_fixtures) }, 0);
+    });
 }
 
 /// An Open ticket with the voter's direct addresses: the routing hint.
@@ -94,9 +123,11 @@ fn routed_ticket(server: &AsterServer) -> String {
     .unwrap()
 }
 
+static GROUP: OnceLock<Group> = OnceLock::new();
+
 fn group() -> &'static Group {
-    static GROUP: OnceLock<Group> = OnceLock::new();
     GROUP.get_or_init(|| {
+        teardown_at_exit();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -128,8 +159,7 @@ fn group() -> &'static Group {
         });
         let ticket = routed_ticket(&voter);
         Group {
-            _rt: rt,
-            _voter: voter,
+            live: Mutex::new(Some((rt, voter))),
             fixture,
             ticket,
         }
@@ -178,9 +208,11 @@ struct Shared {
     root_node: aster_node_t,
 }
 
+static SHARED: OnceLock<Shared> = OnceLock::new();
+
 fn shared() -> &'static Shared {
-    static SHARED: OnceLock<Shared> = OnceLock::new();
     SHARED.get_or_init(|| {
+        teardown_at_exit();
         let rt = runtime();
         let root_node = unsafe { start_node(rt, root_secret()) };
         Shared { rt, root_node }
