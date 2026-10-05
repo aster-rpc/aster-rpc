@@ -49,8 +49,18 @@ class CircuitBreakerInterceptor(Interceptor):
         self.half_open_calls = 0
         self.state = self.CLOSED
 
+    def release_probe(self) -> None:
+        """Give back a half-open probe slot taken by `before_call` for a call
+        whose outcome says nothing about the peer's health (an error code
+        the breaker does not count, a cancelled call, or a call refused by
+        another breaker). Without this the breaker stays half-open with no
+        free slot and refuses every later call."""
+        if self.state == self.HALF_OPEN and self.half_open_calls > 0:
+            self.half_open_calls -= 1
+
     def record_failure(self, error: RpcError) -> None:
         if error.code not in {StatusCode.UNAVAILABLE, StatusCode.INTERNAL, StatusCode.UNKNOWN}:
+            self.release_probe()
             return
         if self.state == self.HALF_OPEN:
             self.state = self.OPEN

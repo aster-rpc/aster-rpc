@@ -162,8 +162,15 @@ class ServiceClient:
         for attempt in range(1, max_attempts + 1):
             ctx.attempt = attempt
             current_request = request
-            for breaker in breaker_interceptors:
-                breaker.before_call(ctx)
+            admitted: list[CircuitBreakerInterceptor] = []
+            try:
+                for breaker in breaker_interceptors:
+                    breaker.before_call(ctx)
+                    admitted.append(breaker)
+            except BaseException:
+                for breaker in admitted:
+                    breaker.release_probe()
+                raise
 
             try:
                 current_request = await apply_request_interceptors(self._interceptors, ctx, current_request)
@@ -193,6 +200,12 @@ class ServiceClient:
                 if not should_retry:
                     raise maybe_error
                 await self._sleep_with_deadline(retry_delay, ctx)
+            except BaseException:
+                # Cancelled (asyncio.CancelledError) or interpreter exit: no
+                # verdict on the peer, so hand back any half-open probe slot.
+                for breaker in breaker_interceptors:
+                    breaker.release_probe()
+                raise
 
         if last_error is not None:
             raise last_error

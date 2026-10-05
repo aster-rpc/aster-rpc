@@ -150,6 +150,98 @@ class TestPhase7Interceptors:
             await client.echo(EchoRequest("half-open"))
         assert breaker.state == breaker.OPEN
 
+    @staticmethod
+    def _scripted_client(script, interceptors):
+        """A client whose unary calls follow `script`: each entry is an
+        exception to raise, the string "hang", or a response message."""
+
+        class ScriptedTransport:
+            async def unary(self, *args, **kwargs):
+                step = script.pop(0)
+                if isinstance(step, BaseException):
+                    raise step
+                if step == "hang":
+                    await asyncio.Event().wait()
+                return EchoResponse(message=step)
+
+            def server_stream(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            async def client_stream(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            def bidi_stream(self, *args, **kwargs):
+                raise AssertionError("unexpected")
+
+            async def close(self):
+                return None
+
+        return create_client(
+            InterceptorService, transport=ScriptedTransport(), interceptors=interceptors
+        )
+
+    @staticmethod
+    async def _open_then_half_open(client, breaker):
+        with pytest.raises(RpcError):
+            await client.echo(EchoRequest("trip"))
+        assert breaker.state == breaker.OPEN
+        await asyncio.sleep(0.02)
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_uncounted_error_frees_half_open_probe(self):
+        # A NOT_FOUND probe says nothing about the peer's health: the breaker
+        # stays half-open but must admit the next probe, which closes it.
+        breaker = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=0.01)
+        script = [
+            RpcError(StatusCode.UNAVAILABLE, "down"),
+            RpcError(StatusCode.NOT_FOUND, "no such thing"),
+            "ok",
+        ]
+        client = self._scripted_client(script, [breaker])
+        await self._open_then_half_open(client, breaker)
+
+        with pytest.raises(RpcError) as exc_info:
+            await client.echo(EchoRequest("probe"))
+        assert exc_info.value.code == StatusCode.NOT_FOUND
+        assert breaker.state == breaker.HALF_OPEN
+        assert breaker.half_open_calls == 0
+
+        assert (await client.echo(EchoRequest("probe"))).message == "ok"
+        assert breaker.state == breaker.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_cancelled_probe_frees_half_open_slot(self):
+        breaker = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=0.01)
+        script = [RpcError(StatusCode.UNAVAILABLE, "down"), "hang", "ok"]
+        client = self._scripted_client(script, [breaker])
+        await self._open_then_half_open(client, breaker)
+
+        probe = asyncio.ensure_future(client.echo(EchoRequest("probe")))
+        await asyncio.sleep(0.01)
+        assert breaker.half_open_calls == 1
+        probe.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe
+        assert breaker.half_open_calls == 0
+
+        assert (await client.echo(EchoRequest("probe"))).message == "ok"
+        assert breaker.state == breaker.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_refused_by_another_breaker_frees_slot(self):
+        first = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=0.01)
+        second = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=60.0)
+        client = self._scripted_client([RpcError(StatusCode.UNAVAILABLE, "down")], [first, second])
+        await self._open_then_half_open(client, first)
+        assert second.state == second.OPEN
+
+        # `first` admits a probe, `second` (still open) refuses the call:
+        # `first` must get its probe slot back.
+        with pytest.raises(RpcError, match="open"):
+            await client.echo(EchoRequest("probe"))
+        assert first.state == first.HALF_OPEN
+        assert first.half_open_calls == 0
+
     @pytest.mark.asyncio
     async def test_auth_interceptor_injects_metadata_for_local_transport(self):
         captured: dict[str, str] = {}
