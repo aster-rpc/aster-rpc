@@ -219,7 +219,6 @@ export {
   type Interceptor,
   type PeerAddr,
 } from './interceptors/base.js';
-export { MetricsInterceptor } from './interceptors/metrics.js';
 export { RetryInterceptor } from './interceptors/retry.js';
 export { RateLimitInterceptor, type RateLimitOptions } from './interceptors/rate-limit.js';
 export { AuthInterceptor } from './interceptors/auth.js';
@@ -541,22 +540,63 @@ export {
   type LoggerOptions,
 } from './logging.js';
 
-// Health
+// Observability (design OBSERVABILITY_HEALTH_DESIGN.md O7): pipeline, Rust log
+// records, custom metrics, tracing and the Rust health listener.
 export {
-  HealthServer,
-  ConnectionMetrics as HealthConnectionMetrics,
-  AdmissionMetrics as HealthAdmissionMetrics,
-  getConnectionMetrics,
-  getAdmissionMetrics,
-  resetMetrics,
-  checkHealth,
-  checkReady,
-  healthStatus,
-  readyStatus,
-  metricsSnapshot,
-  type HealthState,
-  type HealthMetrics,
-} from './health.js';
+  initObservability,
+  ensureObservability,
+  shutdownObservability,
+  flushObservability,
+  setLogSink,
+  setLogDelivery,
+  setLogFilter,
+  pollLogs,
+  logStats,
+  prometheusText,
+  consoleSink,
+  pinoSink,
+  winstonSink,
+  LOG_LEVELS,
+  LogFlag,
+  type LogSink,
+  type LogDeliveryOptions,
+  type RustLogRecord,
+  type LogStats,
+  type ObservabilityOptions,
+  type PinoLike,
+  type WinstonLike,
+} from './observability.js';
+export {
+  metrics,
+  Counter,
+  UpDownCounter,
+  Histogram,
+  Gauge,
+  AttributeSet,
+  type Attributes,
+  type InstrumentOptions,
+} from './metrics.js';
+export {
+  tracing,
+  Span,
+  span,
+  parseTraceparent,
+  formatTraceparent,
+  currentTraceContext,
+  currentTraceId,
+  currentSpanId,
+  currentBaggage,
+  currentTraceparent,
+  withTraceContext,
+  traceMetadata,
+  tracingMixin,
+  winstonTracingFormat,
+  type TraceContext,
+  type SpanKind,
+  type SpanAttributes,
+  type SpanOptions,
+} from './tracing.js';
+export type { HealthServer, ReadinessCheckHandle } from '@aster-rpc/transport';
 
 // High-level API
 export {
@@ -664,9 +704,6 @@ export {
   ATTR_IID_ROLE_ARN,
   type IIDBackend,
 } from './trust/iid.js';
-
-// Connection & Admission Metrics (from metrics.ts)
-export { ConnectionMetrics, AdmissionMetrics } from './metrics.js';
 
 // RPC server on `aster::rpc::Server` (dynamic dispatch, design §4.3)
 export { RpcServer, type ServerOptions } from './dispatch.js';

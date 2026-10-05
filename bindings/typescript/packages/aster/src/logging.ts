@@ -6,6 +6,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { currentTraceContext } from './tracing.js';
 
 /** Request context stored via AsyncLocalStorage for correlation. */
 export interface RequestContext {
@@ -94,6 +95,12 @@ export class AsterLogger {
       entry.method = ctx.method;
       entry.request_id = ctx.requestId;
       if (ctx.peer) entry.peer = maskValue('endpoint_id', ctx.peer, this.mask);
+    }
+
+    const trace = currentTraceContext();
+    if (trace) {
+      entry.trace_id = trace.traceId;
+      entry.span_id = trace.spanId;
     }
 
     if (fields) {

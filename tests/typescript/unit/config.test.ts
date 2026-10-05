@@ -18,7 +18,7 @@ import {
 const ENV_KEYS = Object.keys(process.env).filter((k) => k.startsWith('ASTER_'))
   .concat([
     'ASTER_LOG_FORMAT', 'ASTER_LOG_LEVEL', 'ASTER_LOG_MASK', 'ASTER_HEALTH_PORT',
-    'ASTER_HEALTH_HOST', 'ASTER_ALLOW_ALL_CONSUMERS', 'ASTER_ALLOW_ALL_PRODUCERS',
+    'ASTER_HEALTH_HOST', 'ASTER_HEALTH_ENABLED', 'ASTER_ALLOW_ALL_CONSUMERS', 'ASTER_ALLOW_ALL_PRODUCERS',
     'ASTER_RELAY_MODE', 'ASTER_RELAY_URLS', 'ASTER_BIND_ADDR', 'ASTER_SECRET_KEY',
     'ASTER_SECRET_KEY_FILE', 'ASTER_STORAGE_PATH', 'ASTER_GC_INTERVAL_MS',
     'ASTER_HOOK_TIMEOUT_MS', 'ASTER_TRANSPORT_RECEIVE_WINDOW', 'ASTER_ENABLE_HOOKS',
@@ -195,6 +195,7 @@ describe('AsterConfig round trip', () => {
       logMask: false,
       healthPort: 7000,
       healthHost: '0.0.0.0',
+      healthEnabled: true,
     };
     const out = AsterConfig.resolve(input);
     expect(out.rootPubkey).toBe(ROOT);
@@ -214,7 +215,7 @@ describe('AsterConfig round trip', () => {
       'transportMaxIdleTimeoutMs', 'transportKeepAliveIntervalMs', 'transportInitialMtu',
       'transportDatagramReceiveBufferSize', 'transportDatagramSendBufferSize',
       'transportSendFairness', 'transportEnableSegmentationOffload', 'logFormat',
-      'logLevel', 'logMask', 'healthPort', 'healthHost',
+      'logLevel', 'logMask', 'healthPort', 'healthHost', 'healthEnabled',
     ] as const) {
       expect(out[key], key).toEqual(input[key]);
     }

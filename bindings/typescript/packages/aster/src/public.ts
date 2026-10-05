@@ -263,12 +263,6 @@ export { CircuitBreakerInterceptor, type CircuitBreakerOptions } from './interce
 export { AuditLogInterceptor, type AuditEntry, type AuditLogFn } from './interceptors/audit.js';
 
 /**
- * Collect call latency and error metrics.
- * @group Interceptors
- */
-export { MetricsInterceptor } from './interceptors/metrics.js';
-
-/**
  * Token-bucket rate limiting per service, method, or peer.
  * @group Interceptors
  */
@@ -285,3 +279,41 @@ export { CompressionInterceptor } from './interceptors/compression.js';
  * @group Interceptors
  */
 export { CapabilityInterceptor } from './interceptors/capability.js';
+
+/**
+ * Start the OpenTelemetry pipeline, flush it, and route Rust's log records.
+ * @group Observability
+ */
+export {
+  initObservability,
+  shutdownObservability,
+  flushObservability,
+  setLogSink,
+  setLogFilter,
+  pinoSink,
+  winstonSink,
+  prometheusText,
+  type LogSink,
+  type RustLogRecord,
+  type ObservabilityOptions,
+} from './observability.js';
+
+/**
+ * Custom metrics (counter, up-down counter, histogram, gauge) on the Rust pipeline.
+ * @group Observability
+ */
+export { metrics, type InstrumentOptions } from './metrics.js';
+
+/**
+ * Binding spans and the trace-context carrier; pino and winston helpers.
+ * @group Observability
+ */
+export {
+  tracing,
+  currentTraceId,
+  currentSpanId,
+  currentBaggage,
+  withTraceContext,
+  tracingMixin,
+  winstonTracingFormat,
+} from './tracing.js';

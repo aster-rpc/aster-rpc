@@ -10,6 +10,7 @@
  * Requires the NAPI-RS addon (`@aster-rpc/transport`).
  */
 
+import { currentTraceparent, traceMetadata } from '../tracing.js';
 import type {
   IrohConnection,
   RpcConnection as NativeRpcConnection,
@@ -50,10 +51,14 @@ export function mapTransportError(e: unknown): RpcError {
 }
 
 function metadataList(metadata?: Record<string, string>): string[] | undefined {
-  if (!metadata) return undefined;
+  // The current trace context rides along as `traceparent` / `baggage`
+  // (Rust parents the client span on it); explicit metadata wins.
+  const trace = currentTraceparent() ? traceMetadata() : undefined;
+  if (!metadata && !trace) return undefined;
+  const merged = trace ? { ...trace, ...metadata } : metadata!;
   let out: string[] | undefined;
-  for (const k in metadata) {
-    (out ??= []).push(k, String(metadata[k]));
+  for (const k in merged) {
+    (out ??= []).push(k, String(merged[k]));
   }
   return out;
 }

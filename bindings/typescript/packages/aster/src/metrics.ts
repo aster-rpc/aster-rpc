@@ -1,107 +1,184 @@
 /**
- * Connection and admission metrics.
+ * Custom metrics over the Rust OpenTelemetry pipeline.
  *
- * Lightweight in-memory counters for monitoring connection and
- * admission activity. Complements the RPC-level MetricsInterceptor.
+ * The built-in RPC, admission, connection and transport metrics are recorded
+ * in Rust (`aster.rpc.server.*`, `aster.admission.*`, ...); this module is for
+ * the application's own instruments. They live on the same `MeterProvider`
+ * (scope `aster.app`), so they reach the OTLP exporter and `/metrics` with the
+ * built-ins.
+ *
+ * ```ts
+ * const created = metrics.counter('portal.workspace.created', {
+ *   description: 'Workspaces created', unit: '1',
+ * });
+ * created.add(1, { recipe: 'node' });
+ * ```
+ *
+ * Instruments may be declared before observability starts: a handle that a
+ * pipeline shutdown freed is declared again on the next record. Recording
+ * with no pipeline is a no-op in Rust.
  */
 
-/** Connection metrics counters. */
-export class ConnectionMetrics {
-  connectionsAccepted = 0;
-  connectionsRejected = 0;
-  connectionsClosed = 0;
-  connectionsActive = 0;
+import { loadNative } from './native.js';
 
-  /** Currently active RPC streams. */
-  streamsActive = 0;
-  /** Total streams handled since startup. */
-  streamsTotal = 0;
+/** Instrument declaration options. @group Metrics */
+export interface InstrumentOptions {
+  description?: string;
+  /** UCUM unit (`'1'`, `'ms'`, `'By'`). */
+  unit?: string;
+  /**
+   * Attribute keys merged in from the current call's extractors. Accepted
+   * and stored; merging is not active yet (Rust per-call cache, later step).
+   */
+  autoAttrs?: string[];
+  /** Series limit override; `0`/unset = the SDK default (2000). Not active yet. */
+  cardinalityLimit?: number;
+}
 
-  onAccept(): void {
-    this.connectionsAccepted++;
-    this.connectionsActive++;
+/** Attribute values are stringified. @group Metrics */
+export type Attributes = Record<string, string | number | boolean>;
+
+const KIND_COUNTER = 1;
+const KIND_UP_DOWN = 2;
+const KIND_HISTOGRAM = 3;
+const KIND_GAUGE = 4;
+
+function strings(attrs: Attributes | undefined): Record<string, string> | undefined {
+  if (!attrs) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(attrs)) out[k] = String(v);
+  return out;
+}
+
+function isGone(e: unknown): boolean {
+  return e instanceof Error && /no such (instrument|attribute set) handle/.test(e.message);
+}
+
+/**
+ * An interned attribute set: build it once, pass it to every record on a hot
+ * path to skip rebuilding the attribute list. @group Metrics
+ */
+export class AttributeSet {
+  readonly attributes: Readonly<Record<string, string>>;
+  #handle = 0;
+
+  constructor(attributes: Attributes) {
+    this.attributes = Object.freeze(strings(attributes) ?? {});
   }
 
-  onReject(): void {
-    this.connectionsRejected++;
-  }
-
-  onClose(): void {
-    this.connectionsClosed++;
-    this.connectionsActive = Math.max(0, this.connectionsActive - 1);
-  }
-
-  onStreamOpen(): void {
-    this.streamsActive++;
-    this.streamsTotal++;
-  }
-
-  onStreamClose(): void {
-    this.streamsActive = Math.max(0, this.streamsActive - 1);
-  }
-
-  snapshot(): Record<string, number> {
-    return {
-      connections_accepted: this.connectionsAccepted,
-      connections_rejected: this.connectionsRejected,
-      connections_closed: this.connectionsClosed,
-      connections_active: this.connectionsActive,
-      streams_active: this.streamsActive,
-      streams_total: this.streamsTotal,
-    };
-  }
-
-  reset(): void {
-    this.connectionsAccepted = 0;
-    this.connectionsRejected = 0;
-    this.connectionsClosed = 0;
-    this.connectionsActive = 0;
-    this.streamsActive = 0;
-    this.streamsTotal = 0;
+  /** @internal The native handle, declared on first use and after a shutdown. */
+  handle(fresh = false): number {
+    if (this.#handle === 0 || fresh) {
+      this.#handle = loadNative().attrsetNew({ ...this.attributes });
+    }
+    return this.#handle;
   }
 }
 
-/** Admission metrics counters. */
-export class AdmissionMetrics {
-  admissionsAttempted = 0;
-  admissionsSucceeded = 0;
-  admissionsRejected = 0;
-  admissionsErrored = 0;
-  /** Duration of the last admission handshake in milliseconds. */
-  lastAdmissionMs = 0;
+abstract class Instrument {
+  readonly name: string;
+  readonly options: InstrumentOptions;
+  #handle = 0;
 
-  onAttempt(): void {
-    this.admissionsAttempted++;
+  protected constructor(
+    private readonly kind: number,
+    name: string,
+    options: InstrumentOptions,
+  ) {
+    this.name = name;
+    this.options = options;
+    // Declared eagerly so a bad name or a kind clash fails at the call site.
+    this.declare();
   }
 
-  onSuccess(durationMs = 0): void {
-    this.admissionsSucceeded++;
-    this.lastAdmissionMs = durationMs;
+  private declare(): number {
+    this.#handle = loadNative().instrumentNew(
+      this.kind,
+      this.name,
+      this.options.description,
+      this.options.unit,
+      this.options.autoAttrs,
+      this.options.cardinalityLimit,
+    );
+    return this.#handle;
   }
 
-  onReject(): void {
-    this.admissionsRejected++;
-  }
-
-  onError(): void {
-    this.admissionsErrored++;
-  }
-
-  snapshot(): Record<string, number> {
-    return {
-      admissions_attempted: this.admissionsAttempted,
-      admissions_succeeded: this.admissionsSucceeded,
-      admissions_rejected: this.admissionsRejected,
-      admissions_errored: this.admissionsErrored,
-      last_admission_ms: this.lastAdmissionMs,
-    };
-  }
-
-  reset(): void {
-    this.admissionsAttempted = 0;
-    this.admissionsSucceeded = 0;
-    this.admissionsRejected = 0;
-    this.admissionsErrored = 0;
-    this.lastAdmissionMs = 0;
+  /** Run one native record, redeclaring once if a shutdown freed the handles. */
+  protected send(
+    call: (handle: number, set: number | undefined, attrs: Record<string, string> | undefined) => void,
+    attributes: Attributes | AttributeSet | undefined,
+  ): void {
+    const pick = (fresh: boolean) =>
+      attributes instanceof AttributeSet
+        ? ([attributes.handle(fresh), undefined] as const)
+        : ([undefined, strings(attributes)] as const);
+    try {
+      const [set, attrs] = pick(false);
+      call(this.#handle, set, attrs);
+    } catch (e) {
+      if (!isGone(e)) throw e;
+      const [set, attrs] = pick(true);
+      call(this.declare(), set, attrs);
+    }
   }
 }
+
+/** Monotonic sum. @group Metrics */
+export class Counter extends Instrument {
+  /** @internal */
+  constructor(name: string, options: InstrumentOptions) {
+    super(KIND_COUNTER, name, options);
+  }
+
+  /** Add a non-negative integer (default 1). */
+  add(value = 1, attributes?: Attributes | AttributeSet): void {
+    this.send((h, set, attrs) => loadNative().metricAddU64(h, value, set, attrs), attributes);
+  }
+}
+
+/** Sum that may go down. @group Metrics */
+export class UpDownCounter extends Instrument {
+  /** @internal */
+  constructor(name: string, options: InstrumentOptions) {
+    super(KIND_UP_DOWN, name, options);
+  }
+
+  /** Add an integer (negative to decrease). */
+  add(value: number, attributes?: Attributes | AttributeSet): void {
+    this.send((h, set, attrs) => loadNative().metricAddI64(h, value, set, attrs), attributes);
+  }
+}
+
+/** Distribution of values. @group Metrics */
+export class Histogram extends Instrument {
+  /** @internal */
+  constructor(name: string, options: InstrumentOptions) {
+    super(KIND_HISTOGRAM, name, options);
+  }
+
+  record(value: number, attributes?: Attributes | AttributeSet): void {
+    this.send((h, set, attrs) => loadNative().metricRecordF64(h, value, set, attrs), attributes);
+  }
+}
+
+/** Last value. @group Metrics */
+export class Gauge extends Instrument {
+  /** @internal */
+  constructor(name: string, options: InstrumentOptions) {
+    super(KIND_GAUGE, name, options);
+  }
+
+  record(value: number, attributes?: Attributes | AttributeSet): void {
+    this.send((h, set, attrs) => loadNative().metricRecordF64(h, value, set, attrs), attributes);
+  }
+}
+
+/** The metrics namespace of the design: `metrics.counter(...)`. @group Metrics */
+export const metrics = {
+  counter: (name: string, options: InstrumentOptions = {}) => new Counter(name, options),
+  upDownCounter: (name: string, options: InstrumentOptions = {}) => new UpDownCounter(name, options),
+  histogram: (name: string, options: InstrumentOptions = {}) => new Histogram(name, options),
+  gauge: (name: string, options: InstrumentOptions = {}) => new Gauge(name, options),
+  /** Intern an attribute set for a hot path. */
+  attributes: (attributes: Attributes) => new AttributeSet(attributes),
+};

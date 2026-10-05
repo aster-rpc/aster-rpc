@@ -16,7 +16,8 @@ import type { AsterTransport } from './transport/base.js';
 import { AsterConfig, loadIdentity, parseToml, resolveRootPubkey } from './config.js';
 import { Node } from './node.js';
 import { createLogger, type AsterLogger } from './logging.js';
-import { HealthServer } from './health.js';
+import type { HealthServer } from '@aster-rpc/transport';
+import { ensureObservability } from './observability.js';
 import { DEFAULT_BACKOFF, RpcPattern, RpcScope, type ExponentialBackoff } from './types.js';
 import { createXlangCodec, getXlangForyAndType } from './xlang.js';
 import { RpcServer } from './dispatch.js';
@@ -153,7 +154,7 @@ export class AsterServer {
   readonly registry: ServiceRegistry;
   readonly config: AsterConfig;
   readonly logger: AsterLogger;
-  private health: HealthServer;
+  private _health: HealthServer | null = null;
   private _node: Node | null = null;
   private _rpcServer: RpcServer | null = null;
   private _gate: GatePolicy | null = null;
@@ -184,10 +185,6 @@ export class AsterServer {
       mask: this.config.logMask,
     });
     this.registry = new ServiceRegistry();
-    this.health = new HealthServer({
-      port: this.config.healthPort ?? 0,
-      host: this.config.healthHost ?? '127.0.0.1',
-    });
     if (this.config.allowAllProducers === false) {
       throw new Error(
         'allowAllProducers=false is not supported: producer mesh admission ' +
@@ -300,6 +297,9 @@ export class AsterServer {
     // Gate-0 policy (from the trust settings). The whole resolved config
     // reaches the node (relay / bind / storage / secret key file / transport
     // knobs), so persistent and offline / loopback-only servers work.
+    // Observability starts from the environment unless the application
+    // called `initObservability()` first (design Q2).
+    await ensureObservability();
     this._node = await Node.start({
       ...this.config,
       alpns: [
@@ -364,7 +364,7 @@ export class AsterServer {
     // Serve once the admission summaries carry their contract ids.
     await this._rpcServer.start(this._node);
 
-    await this.health.start();
+    await this._startHealth();
     this._running = true;
     this._printBanner();
 
@@ -727,11 +727,31 @@ export class AsterServer {
     if (this._rpcServer) {
       await this._rpcServer.close();
     }
-    await this.health.stop();
+    await this._health?.stop();
+    this._health = null;
     if (this._node) {
       try { await this._node.close(); } catch { /* ignore */ }
     }
     this.logger.info('AsterServer stopped');
+  }
+
+  /**
+   * The `/healthz` `/readyz` `/metrics` listener (Rust), when the config
+   * enables it (`healthPort`, `healthEnabled`; `ASTER_HEALTH_*`). Use it to
+   * add readiness checks: `server.health?.check('db').set(true)`.
+   */
+  get health(): HealthServer | null {
+    return this._health;
+  }
+
+  private async _startHealth(): Promise<void> {
+    const c = this.config;
+    if (!(c.healthEnabled ?? (c.healthPort ?? 0) !== 0)) return;
+    if (!this._node) return;
+    const health = await this._node.startHealth({ host: c.healthHost, port: c.healthPort ?? 0 });
+    health.setServices(this._serviceSummaries.length);
+    health.setReady(true);
+    this._health = health;
   }
 
   /** The aster1... connection address for clients. */
@@ -1212,6 +1232,7 @@ export class AsterClientWrapper {
     // provided a secret key, it pins the node key so the client's endpoint id
     // matches the credential's enrolled endpoint_id (a `secretKeyFile` that
     // holds a different key is a conflict and fails the start).
+    await ensureObservability();
     this._node = await Node.start({
       ...this.config,
       ...(this._identitySecretKey ? { secretKey: this._identitySecretKey } : {}),
