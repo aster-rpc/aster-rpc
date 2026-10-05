@@ -220,8 +220,10 @@ cargo build -p aster_transport_ffi
 
 cd bindings/go
 export CGO_CFLAGS="-I$(pwd)/../../ffi"
-export CGO_LDFLAGS="-L$(pwd)/../../target/debug -laster_transport_ffi"
-export DYLD_LIBRARY_PATH="$(pwd)/../../target/debug"   # LD_LIBRARY_PATH on Linux
+# The rpath is required on macOS: the dylib's install name is @rpath/...,
+# and DYLD_LIBRARY_PATH alone did not reach the test binary under `go test`.
+export CGO_LDFLAGS="-L$(pwd)/../../target/debug -laster_transport_ffi -Wl,-rpath,$(pwd)/../../target/debug"
+export LD_LIBRARY_PATH="$(pwd)/../../target/debug"     # Linux
 
 go vet ./...
 go test ./...                       # all cgo tests (RPC, node, vectors, data plane)

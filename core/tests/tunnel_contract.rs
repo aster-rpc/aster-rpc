@@ -389,6 +389,10 @@ async fn tunnel_upstream_clean_close_finishes_quic_stream() -> Result<()> {
     let server_conn = wait_for_one_server_conn(&server_conns).await?;
 
     let addr = spawn_scripted_upstream(|mut sock| async move {
+        // Consume the request first: closing a TCP socket with unread input
+        // sends RST, not FIN, which would make this a reset test.
+        let mut req = [0u8; 7];
+        sock.read_exact(&mut req).await.unwrap();
         sock.write_all(b"whole response").await.unwrap();
         sock.shutdown().await.unwrap();
     })
