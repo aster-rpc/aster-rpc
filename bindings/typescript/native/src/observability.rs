@@ -647,8 +647,6 @@ pub struct LogStats {
     pub audit_dropped: f64,
     /// Records waiting in the Rust queue.
     pub pending: f64,
-    /// Records `emitTestLogs` has emitted so far (process-wide).
-    pub test_emitted: f64,
 }
 
 #[napi]
@@ -683,16 +681,25 @@ pub fn log_stats() -> LogStats {
         bridge_dropped: bridge::dropped_total() as f64,
         audit_dropped: bridge::audit_dropped_total() as f64,
         pending: pending as f64,
-        test_emitted: n(&TEST_EMITTED),
     }
 }
 
+#[cfg(feature = "test-hooks")]
 static TEST_EMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// Test hook: records `emitTestLogs` has emitted so far (process-wide).
+#[cfg(feature = "test-hooks")]
+#[napi]
+pub fn test_emitted() -> f64 {
+    TEST_EMITTED.load(Ordering::Relaxed) as f64
+}
 
 /// Test hook: emit `count` Rust events on target `aster::o7test` from a
 /// background thread, `intervalUs` apart, at `level` (1 error .. 5 trace,
 /// default 3). Messages are `<prefix> <i>`. Returns at once; watch
-/// `logStats().testEmitted`. Not part of the public API.
+/// `testEmitted()`. Compiled only with the `test-hooks` feature, so the
+/// published addon (built without it) does not export it.
+#[cfg(feature = "test-hooks")]
 #[napi]
 pub fn emit_test_logs(
     count: u32,
@@ -728,6 +735,9 @@ pub fn emit_test_logs(
 /// Declare an instrument on the global meter (scope `aster.app`). `kind`: 1
 /// counter (u64), 2 up-down counter (i64), 3 histogram (f64), 4 gauge (f64).
 /// Returns its handle. A name that exists with another kind fails.
+/// `boundaries` (histograms only): bucket upper bounds, finite and strictly
+/// increasing; none = the RPC seconds buckets for unit `s`, else the SDK
+/// default.
 #[napi]
 pub fn instrument_new(
     kind: u32,
@@ -736,6 +746,7 @@ pub fn instrument_new(
     unit: Option<String>,
     auto_attrs: Option<Vec<String>>,
     cardinality_limit: Option<u32>,
+    boundaries: Option<Vec<f64>>,
 ) -> Result<f64> {
     let kind = InstrumentKind::from_u32(kind).ok_or_else(|| invalid("unknown instrument kind"))?;
     let h = instruments::instrument_new(InstrumentDesc {
@@ -745,6 +756,7 @@ pub fn instrument_new(
         unit: unit.unwrap_or_default(),
         auto_attrs: auto_attrs.unwrap_or_default(),
         cardinality_limit: cardinality_limit.unwrap_or(0),
+        boundaries: boundaries.unwrap_or_default(),
     })
     .map_err(otel_err)?;
     Ok(h as f64)

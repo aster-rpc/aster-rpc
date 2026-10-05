@@ -25,9 +25,9 @@ import {
   winstonSink,
   type RustLogRecord,
 } from '@aster-rpc/aster';
-import { loadNative } from '../../../bindings/typescript/packages/aster/src/native.ts';
+import { nativeTestHooks } from '../helpers/native-test-hooks.ts';
 
-const native = loadNative();
+const native = nativeTestHooks();
 const FILTER = 'off,aster::o7test=trace';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -50,7 +50,7 @@ function collector(): { records: RustLogRecord[] } {
 }
 
 async function emitted(n: number, base: number): Promise<void> {
-  await until(() => logStats().testEmitted >= base + n);
+  await until(() => native.testEmitted() >= base + n);
 }
 
 beforeAll(async () => {
@@ -65,7 +65,7 @@ afterAll(async () => {
 describe('Rust log records reach the sink', () => {
   it('delivers N records in order, with level, logger and fields', async () => {
     const c = collector();
-    const base = logStats().testEmitted;
+    const base = native.testEmitted();
     native.emitTestLogs(200, 0, 3, 'rec');
     await until(() => c.records.length >= 200);
     expect(c.records).toHaveLength(200);
@@ -88,7 +88,7 @@ describe('Rust log records reach the sink', () => {
     const c = collector();
     setLogFilter('off,aster::o7test=warn');
     try {
-      const base = logStats().testEmitted;
+      const base = native.testEmitted();
       native.emitTestLogs(5, 0, 3, 'quiet'); // info: filtered in Rust
       native.emitTestLogs(5, 0, 2, 'loud'); // warn
       await emitted(10, base);
@@ -108,7 +108,7 @@ describe('a full TSFN queue counts drops', () => {
     setLogDelivery({ maxBatch: 1, holdAbove: 64 });
     const c = collector();
     const before = logStats();
-    const base = before.testEmitted;
+    const base = native.testEmitted();
     const N = 600;
     native.emitTestLogs(N, 0, 3, 'flood');
     // Starve the event loop: no TSFN callback can run for 400 ms.
@@ -138,7 +138,7 @@ describe('bursts are coalesced, not dropped', () => {
   it('a starved JS thread still gets every record (default delivery)', async () => {
     const c = collector();
     const before = logStats();
-    const base = before.testEmitted;
+    const base = native.testEmitted();
     const N = 600;
     native.emitTestLogs(N, 0, 3, 'burst');
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
@@ -167,9 +167,9 @@ describe('pollLogs fallback (the Bun path)', () => {
       expect(s.forwarded).toBe(before.forwarded);
 
       // And on demand, without waiting for the timer.
-      const base = s.testEmitted;
+      const base = native.testEmitted();
       native.emitTestLogs(10, 0, 3, 'now');
-      await until(() => logStats().testEmitted >= base + 10);
+      await until(() => native.testEmitted() >= base + 10);
       await until(() => logStats().pending >= 10 || c.records.length >= 130);
       pollLogs();
       expect(c.records).toHaveLength(130);

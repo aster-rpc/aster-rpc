@@ -376,13 +376,15 @@ OFF(aster_log_emit_t, logger, 16);
 OFF(aster_log_emit_t, message, 32);
 OFF(aster_log_emit_t, fields, 48);
 OFF(aster_log_emit_t, context, 64);
-LAYOUT(aster_instrument_desc_t, 80);
+LAYOUT(aster_instrument_desc_t, 96);
 OFF(aster_instrument_desc_t, kind, 4);
 OFF(aster_instrument_desc_t, name, 8);
 OFF(aster_instrument_desc_t, description, 24);
 OFF(aster_instrument_desc_t, unit, 40);
 OFF(aster_instrument_desc_t, auto_attrs, 56);
 OFF(aster_instrument_desc_t, cardinality_limit, 72);
+OFF(aster_instrument_desc_t, boundaries, 80);
+OFF(aster_instrument_desc_t, boundaries_len, 88);
 LAYOUT(aster_span_context_t, 32);
 OFF(aster_span_context_t, trace_id, 0);
 OFF(aster_span_context_t, span_id, 16);
@@ -527,6 +529,7 @@ static void test_enum_values(void) {
     CHECK(ASTER_INSTRUMENT_COUNTER_U64 == 1 && ASTER_INSTRUMENT_GAUGE_F64 == 4);
     CHECK(ASTER_SPAN_INTERNAL == 0 && ASTER_SPAN_CONSUMER == 4);
     CHECK(ASTER_DISPATCH_FLAG_HAS_TRACE == 0x400);
+    CHECK(ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE == 0x800);
 }
 
 static void test_data_plane(void) {
@@ -1304,6 +1307,26 @@ static void test_observability(void) {
     aster_instrument_t inst = 0;
     CHECK(aster_instrument_new(&d, &inst) == ASTER_STATUS_OK && inst != 0);
     d.kind = ASTER_INSTRUMENT_GAUGE_F64;
+    {   /* histogram boundaries: strictly increasing, histograms only */
+        static const double good[] = {1.0, 5.0};
+        static const double bad[] = {5.0, 1.0};
+        aster_instrument_desc_t hd = d;
+        hd.kind = ASTER_INSTRUMENT_HISTOGRAM_F64;
+        hd.name = (aster_bytes_t){(const uint8_t *)"abi.sizes", 9};
+        hd.boundaries = bad; hd.boundaries_len = 2;
+        aster_instrument_t hh = 0;
+        CHECK(aster_instrument_new(&hd, &hh) == ASTER_STATUS_INVALID_ARGUMENT);
+        hd.boundaries = good;
+        CHECK(aster_instrument_new(&hd, &hh) == ASTER_STATUS_OK && hh != 0);
+        CHECK(aster_metric_record_f64(hh, 3.0, 0, NULL, 0, 0) == ASTER_STATUS_OK);
+        CHECK(aster_instrument_free(hh) == ASTER_STATUS_OK);
+        aster_instrument_desc_t cd = d;   /* boundaries on a counter */
+        cd.kind = ASTER_INSTRUMENT_COUNTER_U64;
+        cd.name = (aster_bytes_t){(const uint8_t *)"abi.ctr2", 8};
+        cd.boundaries = good; cd.boundaries_len = 2;
+        aster_instrument_t ch = 0;
+        CHECK(aster_instrument_new(&cd, &ch) == ASTER_STATUS_INVALID_ARGUMENT);
+    }
     aster_instrument_t clash = 0;
     CHECK(aster_instrument_new(&d, &clash) == ASTER_STATUS_INVALID_ARGUMENT);
     static const uint8_t kv[] = {1, 0, 0, 0, 1, 0, 0, 0, 'k', 1, 0, 0, 0, 'v'};
@@ -1405,6 +1428,11 @@ static void test_health(void) {
     CHECK(aster_health_set_ready(h, true) == ASTER_STATUS_OK);
     aster_span_context_t sc;
     CHECK(aster_dispatch_trace_context(rt, srv, 1, &sc) == ASTER_STATUS_NOT_FOUND);
+    {
+        const uint8_t *ip = NULL; uint32_t il = 0; aster_buffer_t ib = 0;
+        CHECK(aster_dispatch_inbound_trace(rt, srv, 1, &ip, &il, &ib) == ASTER_STATUS_NOT_FOUND);
+        CHECK(aster_dispatch_inbound_trace(rt, srv, 1, NULL, &il, &ib) == ASTER_STATUS_INVALID_ARGUMENT);
+    }
     CHECK(aster_server_destroy(rt, srv) == ASTER_STATUS_OK);
     CHECK(aster_health_stop(rt, h) == ASTER_STATUS_OK);
     CHECK(aster_health_stop(rt, h) == ASTER_STATUS_NOT_FOUND);

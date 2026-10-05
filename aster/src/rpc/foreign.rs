@@ -234,6 +234,18 @@ pub struct CallTraceContext {
     pub trace_flags: u8,
 }
 
+/// The inbound W3C `baggage` and `tracestate` of a foreign call, as the
+/// caller's raw header values (design §5.1, Q7: the reserved keys are hidden
+/// from handler metadata, so bindings read them here). Present when the call
+/// carried either, whether or not its server span is exported. `baggage` is
+/// already within the W3C limits (8192 bytes, 64 members); a larger header is
+/// dropped, not truncated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InboundTrace {
+    pub baggage: Option<Arc<str>>,
+    pub tracestate: Option<Arc<str>>,
+}
+
 /// One call delivered to the binding.
 pub struct ForeignCall {
     /// The [`CallTable`] key for every response operation. Unique per server.
@@ -271,6 +283,8 @@ pub struct ForeignCall {
     /// The call's server span context, when it is exported (see
     /// [`CallTraceContext`]).
     pub trace_context: Option<CallTraceContext>,
+    /// The inbound `baggage` / `tracestate` (see [`InboundTrace`]).
+    pub inbound_trace: Option<InboundTrace>,
 }
 
 impl fmt::Debug for ForeignCall {
@@ -541,6 +555,7 @@ impl Foreign {
         // which ends when the call does.
         let span = obs.span().clone();
         let trace_context = obs.trace_context();
+        let inbound_trace = obs.inbound_trace();
         let state = self.table.insert(|call_id, table| CallState {
             call_id,
             sender: response_sender,
@@ -556,6 +571,7 @@ impl Foreign {
             peer: peer_id.clone(),
             attributes: attributes.clone(),
             trace_context,
+            inbound_trace: inbound_trace.clone(),
             table,
         });
         let call_id = state.call_id;
@@ -597,6 +613,7 @@ impl Foreign {
                 call: Some(CallRef(state)),
             },
             trace_context,
+            inbound_trace,
         }));
 
         if let Some(at) = deadline {
@@ -878,6 +895,7 @@ pub(crate) struct CallState {
     attributes: Arc<PeerAttributes>,
     /// The server span's context (shared with the [`ForeignCall`]).
     trace_context: Option<CallTraceContext>,
+    inbound_trace: Option<InboundTrace>,
     table: Weak<TableInner>,
 }
 
@@ -1178,6 +1196,12 @@ impl CallRef {
     /// [`ForeignCall::trace_context`]).
     pub fn trace_context(&self) -> Option<CallTraceContext> {
         self.0.trace_context
+    }
+
+    /// The call's inbound `baggage` / `tracestate` (the same as
+    /// [`ForeignCall::inbound_trace`]).
+    pub fn inbound_trace(&self) -> Option<&InboundTrace> {
+        self.0.inbound_trace.as_ref()
     }
 
     /// Single-shot terminal response: one data frame (omitted when `payload`

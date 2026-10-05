@@ -203,6 +203,16 @@ impl CallObs {
         None
     }
 
+    /// The inbound `baggage` / `tracestate` of a call whose trace keys were
+    /// stripped from its metadata (Q7), exported or not.
+    pub(crate) fn inbound_trace(&self) -> Option<super::foreign::InboundTrace> {
+        #[cfg(feature = "otel")]
+        if let Some(o) = &self.otel {
+            return o.inbound_trace();
+        }
+        None
+    }
+
     /// Add an OTel event to the span (cancel and deadline, design §5.2).
     pub(crate) fn event(&self, name: &'static str) {
         #[cfg(feature = "otel")]

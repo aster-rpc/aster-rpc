@@ -378,6 +378,9 @@ fn desc(kind: aster_instrument_kind_t, name: &'static [u8]) -> aster_instrument_
         auto_attrs: bytes(b""),
         cardinality_limit: 0,
         _p: 0,
+        boundaries: ptr::null(),
+        boundaries_len: 0,
+        _p1: 0,
     }
 }
 
@@ -410,6 +413,42 @@ fn metrics_record_through_handles_and_scrape() {
             aster_instrument_kind_t::ASTER_INSTRUMENT_GAUGE_F64,
             b"app.temperature",
         );
+        // Seconds histogram (default buckets) and one with explicit boundaries.
+        let mut secs_desc = desc(
+            aster_instrument_kind_t::ASTER_INSTRUMENT_HISTOGRAM_F64,
+            b"app.wait",
+        );
+        secs_desc.unit = bytes(b"s");
+        let mut secs = 0;
+        assert_eq!(aster_instrument_new(&secs_desc, &mut secs), OK);
+        let bounds = [1.0f64, 5.0];
+        let mut custom_desc = desc(
+            aster_instrument_kind_t::ASTER_INSTRUMENT_HISTOGRAM_F64,
+            b"app.sizes",
+        );
+        custom_desc.boundaries = bounds.as_ptr();
+        custom_desc.boundaries_len = 2;
+        let mut custom = 0;
+        assert_eq!(aster_instrument_new(&custom_desc, &mut custom), OK);
+        assert_eq!(aster_metric_record_f64(secs, 0.3, 0, ptr::null(), 0, 0), OK);
+        assert_eq!(
+            aster_metric_record_f64(custom, 3.0, 0, ptr::null(), 0, 0),
+            OK
+        );
+        // Bad boundaries, and boundaries on a counter, are refused.
+        let bad = [2.0f64, 1.0];
+        let mut bad_desc = custom_desc;
+        bad_desc.name = bytes(b"app.bad");
+        bad_desc.boundaries = bad.as_ptr();
+        let mut h = 0;
+        assert_eq!(aster_instrument_new(&bad_desc, &mut h), INVALID);
+        let mut ctr = desc(
+            aster_instrument_kind_t::ASTER_INSTRUMENT_COUNTER_U64,
+            b"app.ctr_bounds",
+        );
+        ctr.boundaries = bounds.as_ptr();
+        ctr.boundaries_len = 2;
+        assert_eq!(aster_instrument_new(&ctr, &mut h), INVALID);
 
         let attrs = kv(&[("tenant.id", "t-1")]);
         let mut set = 0;
@@ -503,6 +542,20 @@ fn metrics_record_through_handles_and_scrape() {
         assert_eq!(aster_string_release(text.ptr, text.len), OK);
         assert!(body.contains("app_jobs_total{"), "{body}");
         assert!(body.contains("otel_scope_name=\"aster.app\""), "{body}");
+        assert!(
+            body.contains("app_wait_seconds_bucket{") && body.contains("le=\"0.005\""),
+            "seconds histogram uses the RPC buckets: {body}"
+        );
+        assert!(body.contains("le=\"7.5\""), "{body}");
+        let sizes: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with("app_sizes_bucket"))
+            .collect();
+        assert_eq!(sizes.len(), 3, "explicit boundaries 1, 5, +Inf: {body}");
+        assert!(
+            sizes[0].contains("le=\"1\"") && sizes[1].contains("le=\"5\""),
+            "{sizes:?}"
+        );
         assert_eq!(aster_metrics_prometheus(ptr::null_mut()), INVALID);
 
         assert_eq!(aster_attrset_free(set), OK);
@@ -860,6 +913,25 @@ fn dispatch_carries_trace_context_and_rpc_unary_records_client_metrics() {
                         aster_dispatch_trace_context(rt, server, ev.call_id, &mut cx),
                         OK
                     );
+                    // Inbound baggage / tracestate: off the call, not in metadata.
+                    let kv_of = |f: unsafe extern "C" fn(
+                        aster_runtime_t,
+                        aster_server_t,
+                        u64,
+                        *mut *const u8,
+                        *mut u32,
+                        *mut aster_buffer_t,
+                    ) -> i32| {
+                        let (mut p, mut l, mut b) = (ptr::null(), 0u32, 0u64);
+                        assert_eq!(f(rt, server, ev.call_id, &mut p, &mut l, &mut b), OK);
+                        let v = decode_kv(&copy(p, l));
+                        if b != 0 {
+                            aster_dispatch_buffer_release(rt, server, b);
+                        }
+                        v
+                    };
+                    let inbound = kv_of(aster_dispatch_inbound_trace);
+                    let metadata = kv_of(aster_dispatch_metadata);
                     let req = copy(ev.request_ptr, ev.request_len);
                     let mut required = 0;
                     assert_eq!(
@@ -881,7 +953,15 @@ fn dispatch_carries_trace_context_and_rpc_unary_records_client_metrics() {
                         NOT_FOUND,
                         "call over"
                     );
-                    return (ev.flags, cx);
+                    let (mut p, mut l, mut b) = (ptr::null(), 0u32, 0u64);
+                    assert_eq!(
+                        aster_dispatch_inbound_trace(
+                            rt, server, ev.call_id, &mut p, &mut l, &mut b
+                        ),
+                        NOT_FOUND,
+                        "call over"
+                    );
+                    return (ev.flags, cx, inbound, metadata);
                 }
             }
             panic!("no call arrived");
@@ -904,7 +984,12 @@ fn dispatch_carries_trace_context_and_rpc_unary_records_client_metrics() {
         );
         let caller_cx = ctx_of(caller);
         let tp = traceparent(&caller_cx);
-        let meta = kv(&[("traceparent", std::str::from_utf8(&tp).unwrap())]);
+        let meta = kv(&[
+            ("traceparent", std::str::from_utf8(&tp).unwrap()),
+            ("baggage", "tenant=acme,flag=1"),
+            ("tracestate", "vendor=a"),
+            ("x-user", "1"),
+        ]);
         let opts = aster_call_options_t {
             struct_size: std::mem::size_of::<aster_call_options_t>() as u32,
             version: 1,
@@ -941,10 +1026,29 @@ fn dispatch_carries_trace_context_and_rpc_unary_records_client_metrics() {
         aster_call_buffer_release(rt, rb);
         aster_call_buffer_release(rt, sb);
 
-        let (flags, server_cx) = binding.join().unwrap();
+        let (flags, server_cx, inbound, metadata) = binding.join().unwrap();
         assert!(
             flags & ASTER_DISPATCH_FLAG_HAS_TRACE != 0,
             "flags {flags:#x}"
+        );
+        assert!(
+            flags & ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE != 0,
+            "flags {flags:#x}"
+        );
+        // The client's propagator may re-serialise the members in map order.
+        assert_eq!(inbound.len(), 2, "{inbound:?}");
+        assert_eq!(inbound[0].0, "baggage");
+        let mut members: Vec<&str> = inbound[0].1.split(',').collect();
+        members.sort_unstable();
+        assert_eq!(members, ["flag=1", "tenant=acme"]);
+        assert_eq!(
+            inbound[1],
+            ("tracestate".to_string(), "vendor=a".to_string())
+        );
+        assert_eq!(
+            metadata,
+            [("x-user".to_string(), "1".to_string())],
+            "reserved keys are not metadata"
         );
         assert_eq!(
             server_cx.trace_id, caller_cx.trace_id,
@@ -960,6 +1064,17 @@ fn dispatch_carries_trace_context_and_rpc_unary_records_client_metrics() {
         );
         assert_eq!(
             aster_dispatch_trace_context(rt, server, 1, ptr::null_mut()),
+            INVALID
+        );
+        assert_eq!(
+            aster_dispatch_inbound_trace(
+                rt,
+                server,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut()
+            ),
             INVALID
         );
 

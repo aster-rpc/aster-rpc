@@ -64,6 +64,8 @@ fn child() {
             "log_bridge_trace_ids" => case_log_bridge_trace_ids().await,
             #[cfg(feature = "binding-support")]
             "foreign_spans" => foreign::case_foreign_spans().await,
+            #[cfg(feature = "binding-support")]
+            "foreign_inbound_baggage" => foreign::case_inbound_baggage().await,
             other => panic!("unknown case {other}"),
         }
     });
@@ -611,7 +613,7 @@ mod foreign {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use aster::binding_support::dispatch::{CallRef, DispatchEvent, DispatchSink};
+    use aster::binding_support::dispatch::{CallRef, DispatchEvent, DispatchSink, InboundTrace};
     use aster::rpc::{DynamicService, MethodDesc, MethodPattern, RpcStatus, Server, TypeRef};
     use aster_otel::opentelemetry::trace::{SpanKind, Status};
     use aster_otel::testing::TestExporters;
@@ -650,6 +652,99 @@ mod foreign {
                 _ => self.held.lock().unwrap().push(r),
             }
         }
+    }
+
+    /// What the binding saw of each call, in arrival order.
+    /// (inbound trace, span exported, metadata keys)
+    type SeenCall = (Option<InboundTrace>, bool, Vec<String>);
+
+    #[derive(Default)]
+    struct Seen {
+        calls: Mutex<Vec<SeenCall>>,
+    }
+
+    impl DispatchSink for Seen {
+        fn deliver(&self, event: DispatchEvent) {
+            let DispatchEvent::Call(call) = event else {
+                return;
+            };
+            self.calls.lock().unwrap().push((
+                call.inbound_trace.clone(),
+                call.trace_context.is_some(),
+                call.header.metadata_keys.clone(),
+            ));
+            let r = call.handle.to_ref();
+            call.handle.detach();
+            r.try_respond(&[], &RpcStatus::ok()).unwrap();
+        }
+    }
+
+    /// Inbound `baggage` / `tracestate` reach the binding on the call, not in
+    /// its metadata (Q7); a baggage over the W3C limits is dropped.
+    pub(super) async fn case_inbound_baggage() {
+        let t = TestExporters::new();
+        let _h = aster_otel::init(test_cfg(&t)).unwrap();
+        let (server, client) = nodes().await;
+        let mut svc = DynamicService::new("test.Inbound", 1);
+        svc.methods = vec![method("m")];
+        let seen = Arc::new(Seen::default());
+        let _handle = Server::new(&server)
+            .dispatch_sink(seen.clone())
+            .dynamic_service(svc)
+            .unwrap()
+            .serve();
+        let conn = connect(&client, &server).await;
+        let call = |opts: CallOptions| {
+            let conn = &conn;
+            async move {
+                within(conn.unary_with(&header("test.Inbound", "m"), vec![1], &opts))
+                    .await
+                    .unwrap();
+            }
+        };
+        let traceparent = format!("00-{TRACE}-{PARENT}-01");
+        call(
+            CallOptions::new()
+                .metadata("traceparent", traceparent.clone())
+                .metadata("baggage", "tenant=acme,flag=1;prop=x")
+                .metadata("tracestate", "vendor=a")
+                .metadata("x-user", "1"),
+        )
+        .await;
+        // Baggage alone: still delivered, whatever the span's export state.
+        call(CallOptions::new().metadata("baggage", "tenant=beta")).await;
+        // Over 64 members: dropped.
+        let many = (0..65)
+            .map(|i| format!("k{i}=v"))
+            .collect::<Vec<_>>()
+            .join(",");
+        call(CallOptions::new().metadata("baggage", many)).await;
+        // Over 8192 bytes: dropped.
+        call(CallOptions::new().metadata("baggage", format!("k={}", "v".repeat(8192)))).await;
+        call(CallOptions::new().metadata("x-user", "2")).await;
+
+        let calls = seen.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5);
+        let (inbound, traced, keys) = &calls[0];
+        let inbound = inbound.as_ref().unwrap();
+        // The client's propagator re-serialises the members in map order.
+        let mut members: Vec<&str> = inbound.baggage.as_deref().unwrap().split(',').collect();
+        members.sort_unstable();
+        assert_eq!(members, ["flag=1;prop=x", "tenant=acme"]);
+        assert_eq!(inbound.tracestate.as_deref(), Some("vendor=a"));
+        assert!(*traced);
+        assert_eq!(keys, &["x-user"], "reserved keys hidden from metadata");
+        let (inbound, _, keys) = &calls[1];
+        assert_eq!(
+            inbound.as_ref().unwrap().baggage.as_deref(),
+            Some("tenant=beta")
+        );
+        assert!(keys.is_empty());
+        assert!(calls[2].0.is_none(), "65 members dropped");
+        assert!(calls[3].0.is_none(), "8193 bytes dropped");
+        assert!(calls[4].0.is_none());
+        drop(calls);
+        aster_otel::shutdown().unwrap();
     }
 
     /// The server span of a foreign call lasts as long as the binding takes
@@ -753,6 +848,12 @@ fn init_after_server_start_still_exports() {
 #[test]
 fn shutdown_then_reinit_exports_to_the_new_provider() {
     run("shutdown_then_reinit");
+}
+
+#[cfg(feature = "binding-support")]
+#[test]
+fn foreign_calls_carry_inbound_baggage_and_tracestate_outside_metadata() {
+    run("foreign_inbound_baggage");
 }
 
 #[cfg(feature = "binding-support")]

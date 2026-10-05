@@ -36,7 +36,7 @@ import {
   applyResponseInterceptors,
 } from './interceptors/base.js';
 import { withRequestContext, type AsterLogger, createLogger } from './logging.js';
-import { withTraceContext } from './tracing.js';
+import { withInboundTrace } from './tracing.js';
 import { MAX_CLIENT_STREAM_ITEMS } from './limits.js';
 import { lowerService } from './lowering.js';
 import {
@@ -401,7 +401,7 @@ export class RpcServer {
       run = withRequestContext(
         { service: svc.info.name, method: m.name, requestId: ctx.callId, peer: ctx.peer },
         // The call's server span is the current trace context for the handler.
-        () => withTraceContext(ev.traceparent ?? '', () => this.run(srv, ev, m, instance, ctx, state)),
+        () => withInboundTrace(ev.traceparent, ev.baggage, () => this.run(srv, ev, m, instance, ctx, state)),
       );
     } catch (e) {
       run = Promise.reject(e);

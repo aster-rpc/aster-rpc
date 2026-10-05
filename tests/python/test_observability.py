@@ -282,6 +282,90 @@ def test_rust_records_carry_the_span_trace_id_end_to_end():
     assert out["service_field"] == ["O6Echo"]
 
 
+_BAGGAGE_CHILD = """
+    import asyncio, json
+    from dataclasses import dataclass
+    from aster import AsterClient, AsterServer, CallContext, observability, rpc, service, tracing, wire_type
+
+    @wire_type("test.o6b/Req")
+    @dataclass
+    class Req:
+        text: str = ""
+
+    @wire_type("test.o6b/Resp")
+    @dataclass
+    class Resp:
+        text: str = ""
+
+    seen = {}
+
+    @service(name="O6Baggage", version=1)
+    class O6Baggage:
+        @rpc()
+        async def echo(self, req: Req) -> Resp:
+            seen["baggage"] = tracing.current_baggage()
+            seen["trace_id"] = tracing.current_trace_id()
+            seen["metadata"] = sorted(CallContext.current().metadata)
+            return Resp(text=req.text)
+
+    async def main():
+        INIT
+        async with AsterServer(services=[O6Baggage()], allow_all_consumers=True) as server:
+            server.serve()
+            async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:
+                svc = await client.client(O6Baggage)
+                with tracing.with_trace_context(TRACEPARENT, {"tenant": "acme", "k": "v w"}):
+                    await svc.echo(Req(text="hi"))
+                    first = dict(seen)
+                await svc.echo(Req(text="no context"))
+                second = dict(seen)
+        print(json.dumps({"first": first, "second": second}))
+
+    TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    asyncio.run(main())
+"""
+
+
+_TRACES_UNEXPORTED = 'observability.init(traces=True, otlp_endpoint="http://127.0.0.1:9")'
+_TRACES_EXPORTED = (
+    'observability.init(traces=True, otlp_endpoint="http://127.0.0.1:9", log_filter="warn,aster=trace")'
+)
+
+
+def _baggage_child(init: str) -> dict:
+    return child_json(_BAGGAGE_CHILD.replace("INIT", init))
+
+
+def test_inbound_baggage_is_visible_in_the_handler_and_hidden_from_metadata():
+    """Tracing on: the caller's baggage reaches ``current_baggage()`` in the
+    handler, off the call, while the reserved keys are not in the handler's
+    metadata (design Q7). A call with no baggage sees none."""
+    out = _baggage_child(_TRACES_EXPORTED)
+    first, second = out["first"], out["second"]
+    assert first["baggage"] == {"tenant": "acme", "k": "v w"}, out
+    assert first["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+    assert first["metadata"] == [], out
+    assert second["baggage"] == {} and second["metadata"] == [], out
+
+
+def test_inbound_baggage_is_visible_when_the_call_span_is_not_exported():
+    """Tracing on but the ``rpc`` span filtered out: no trace ids, yet the
+    baggage is on the call and still hidden from metadata."""
+    out = _baggage_child(_TRACES_UNEXPORTED)
+    first = out["first"]
+    assert first["trace_id"] is None, out
+    assert first["baggage"] == {"tenant": "acme", "k": "v w"}, out
+    assert first["metadata"] == [], out
+    assert out["second"]["baggage"] == {}, out
+
+
+def test_inbound_baggage_reaches_the_handler_without_a_tracer_provider():
+    """No pipeline (or an unexported span): the baggage is still visible."""
+    out = _baggage_child("pass")
+    assert out["first"]["baggage"] == {"tenant": "acme", "k": "v w"}, out
+    assert out["second"]["baggage"] == {}, out
+
+
 # -- tracing ---------------------------------------------------------------------
 
 
@@ -446,6 +530,30 @@ async def test_custom_metrics_visible_in_prometheus_text():
         assert headers["content-type"].startswith("text/plain; version=0.0.4")
         assert series(body, "o6_orders_placed_total") and series(body, "aster_health_ready")
         assert observability.metrics_text() is not None
+
+
+async def test_histogram_buckets_seconds_default_and_explicit_boundaries():
+    def les(text: str, name: str) -> list[str]:
+        return [ln.split('le="')[1].split('"')[0] for ln in series(text, name + "_bucket")]
+
+    async with running_health():
+        secs = metrics.histogram("o6b.wait", "Wait", unit="s")
+        custom = metrics.histogram("o6b.sizes", "Sizes", unit="By", boundaries=[10, 100.5])
+        custom_s = metrics.histogram("o6b.custom_s", "Custom seconds", unit="s", boundaries=(1, 5))
+        for h in (secs, custom, custom_s):
+            h.record(0.3)
+        text = metrics.prometheus_text()
+        assert text is not None
+        assert les(text, "o6b_wait_seconds") == [
+            "0.005", "0.01", "0.025", "0.05", "0.075", "0.1", "0.25", "0.5", "0.75",
+            "1", "2.5", "5", "7.5", "10", "+Inf",
+        ]
+        assert les(text, "o6b_sizes_bytes") == ["10", "100.5", "+Inf"]
+        assert les(text, "o6b_custom_s_seconds") == ["1", "5", "+Inf"]
+        with pytest.raises(ValueError):
+            metrics.histogram("o6b.bad", boundaries=[5, 1])
+        with pytest.raises(ValueError):
+            metrics.Counter("o6b.ctr", boundaries=[1, 2])  # histograms only
 
 
 # -- health ----------------------------------------------------------------------

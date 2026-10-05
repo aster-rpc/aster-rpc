@@ -288,6 +288,12 @@
 #define ASTER_DISPATCH_FLAG_HAS_TRACE 1024
 
 /**
+ * ABI 4.6: the call carried W3C `baggage` and/or `tracestate`, which are
+ * hidden from its metadata; read them with `aster_dispatch_inbound_trace`.
+ */
+#define ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE 2048
+
+/**
  * `timeout_ms` value for "wait without a limit" (`aster_dispatch_recv`,
  * `aster_call_recv_payload`).
  */
@@ -2283,7 +2289,7 @@ typedef struct aster_log_emit_t {
 } aster_log_emit_t;
 
 /**
- * An instrument to declare. 80 bytes (LP64).
+ * An instrument to declare. 96 bytes (LP64).
  */
 typedef struct aster_instrument_desc_t {
   /**
@@ -2315,6 +2321,15 @@ typedef struct aster_instrument_desc_t {
    */
   uint32_t cardinality_limit;
   uint32_t _p;
+  /**
+   * Histogram bucket upper bounds (`boundaries_len` doubles): finite and
+   * strictly increasing. `NULL` / 0 = none given: unit `s` gets the RPC
+   * seconds buckets (0.005 .. 10), any other unit the SDK default.
+   * `INVALID_ARGUMENT` on a non-histogram or on bad values.
+   */
+  const double *boundaries;
+  uint32_t boundaries_len;
+  uint32_t _p1;
 } aster_instrument_desc_t;
 
 /**
@@ -6036,6 +6051,22 @@ int32_t aster_dispatch_trace_context(aster_runtime_t runtime,
                                      aster_server_t server_h,
                                      uint64_t call_id,
                                      struct aster_span_context_t *out);
+
+/**
+ * The inbound W3C `baggage` and `tracestate` of a live call as a k/v list
+ * (keys `baggage` and `tracestate`, the raw header values; a key is present
+ * only when the caller sent it), for the binding's `current_baggage`. Set
+ * with `ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE` on its `CALL` event, whether
+ * or not the call's span is exported. `baggage` is within the W3C limits
+ * (8192 bytes, 64 members); a larger header was dropped. Same lease
+ * contract as `aster_dispatch_metadata`. `NOT_FOUND` once the call is over.
+ */
+int32_t aster_dispatch_inbound_trace(aster_runtime_t runtime,
+                                     aster_server_t server_h,
+                                     uint64_t call_id,
+                                     const uint8_t **out_ptr,
+                                     uint32_t *out_len,
+                                     aster_buffer_t *out_buffer);
 
 /**
  * End the call with `INTERNAL "handler dropped call"` unless it already

@@ -34,6 +34,12 @@ function fail(msg) {
   process.exit(1);
 }
 
+// `emitTestLogs` is a test hook the published addon does not export; build it
+// with `bun run build:test-hooks` (bindings/typescript/native).
+if (typeof native.emitTestLogs !== 'function') {
+  fail('the native addon has no test hooks (run `bun run build:test-hooks` in bindings/typescript/native)');
+}
+
 // A collector that does not keep the process alive.
 const collector = createServer((req, res) => {
   const chunks = [];

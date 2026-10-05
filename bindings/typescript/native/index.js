@@ -659,7 +659,6 @@ module.exports.decodeStreamHeader = nativeBinding.decodeStreamHeader
 module.exports.decompressPayload = nativeBinding.decompressPayload
 module.exports.defaultAuthorId = nativeBinding.defaultAuthorId
 module.exports.dynamicServiceContractId = nativeBinding.dynamicServiceContractId
-module.exports.emitTestLogs = nativeBinding.emitTestLogs
 module.exports.encodeCallHeader = nativeBinding.encodeCallHeader
 module.exports.encodeFrameNative = nativeBinding.encodeFrameNative
 module.exports.encodePayloadFrame = nativeBinding.encodePayloadFrame

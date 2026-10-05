@@ -41,6 +41,10 @@ import {
   type DynamicServiceSpec,
 } from '../../../bindings/typescript/packages/aster/src/dispatch-server.ts';
 import { loadNative } from '../../../bindings/typescript/packages/aster/src/native.ts';
+import {
+  parseBaggage,
+  withInboundTrace,
+} from '../../../bindings/typescript/packages/aster/src/tracing.ts';
 import { IrohTransport } from '../../../bindings/typescript/packages/aster/src/transport/iroh.ts';
 
 const native = loadNative() as any;
@@ -270,6 +274,90 @@ describe('tracing across a call', () => {
   });
 });
 
+describe('inbound baggage', () => {
+  it('reaches the handler off the dispatch event, never in metadata', async () => {
+    const seen: Array<{
+      baggage?: string;
+      tracestate?: string;
+      flags: number;
+      metadata: string[];
+      current: Record<string, string>;
+    }> = [];
+    const loop = await DispatchLoop.start({
+      config: OFFLINE as any,
+      services: [ECHO],
+      delivery: 'tsfn',
+      builtinNodeInfo: false,
+      onCall: (ev: DispatchEvent, srv) => {
+        const rec = {
+          baggage: ev.baggage,
+          tracestate: ev.tracestate,
+          flags: ev.flags,
+          metadata: Object.keys(ev.metadata ?? {}).sort(),
+          current: {} as Record<string, string>,
+        };
+        withInboundTrace(ev.traceparent, ev.baggage, () => {
+          rec.current = { ...currentBaggage() };
+        });
+        seen.push(rec);
+        void respondCall(srv, ev.callId, Buffer.from('ok'));
+      },
+      onEvent: (ev) => void (ev.kind === DispatchEventKind.Cancelled),
+    });
+    const alpn = Buffer.from('aster/1');
+    const node = await native.Node.start({ ...OFFLINE, alpns: [alpn] });
+    try {
+      const t = native.asterTicketFromString(loop.address);
+      const conn = await node.connectNodeAddr(t.endpointId, alpn, t.directAddrs, undefined);
+      const transport = new IrohTransport(conn, BYTES as any);
+
+      // The client propagates its context: traceparent + baggage metadata.
+      await withTraceContext(
+        TP,
+        () => transport.unary('test.Echo', 'echo', Buffer.from('a'), { metadata: { 'x-user': '1' } }),
+        { tenant: 'acme corp', flag: '1' },
+      );
+      // A call with no context carries none.
+      await transport.unary('test.Echo', 'echo', Buffer.from('b'));
+
+      expect(seen).toHaveLength(2);
+      expect(seen[0]!.flags & 0x800).toBe(0x800); // HAS_INBOUND_TRACE
+      // The client's propagator may re-serialise the members in map order.
+      expect(seen[0]!.baggage!.split(',').sort()).toEqual(['flag=1', 'tenant=acme%20corp']);
+      expect(seen[0]!.current).toEqual({ tenant: 'acme corp', flag: '1' });
+      expect(seen[0]!.metadata).toEqual(['x-user']); // the reserved keys are hidden
+      expect(seen[1]!.flags & 0x800).toBe(0);
+      expect(seen[1]!.baggage).toBeUndefined();
+      expect(seen[1]!.current).toEqual({});
+      conn.close(0, 'done');
+    } finally {
+      await node.close();
+      await loop.close();
+    }
+  });
+
+  it('is visible without an exported span, and propagates onward', () => {
+    expect(withInboundTrace(undefined, 'a=1,b=x%20y;prop=1', () => currentBaggage())).toEqual({
+      a: '1',
+      b: 'x y',
+    });
+    expect(currentBaggage()).toEqual({});
+    withInboundTrace(undefined, 'a=1', () => {
+      expect(currentTraceId()).toBeUndefined();
+      expect(traceMetadata()).toEqual({ baggage: 'a=1' });
+      tracing.withSpan('o7.inner', () => expect(currentBaggage()).toEqual({ a: '1' }));
+    });
+    // With a traceparent the baggage rides on the trace context.
+    withInboundTrace(TP, 'a=1', () => {
+      expect(currentTraceId()).toBe('0af7651916cd43dd8448eb211c80319c');
+      expect(currentBaggage()).toEqual({ a: '1' });
+    });
+    // Nothing inbound: the carrier is untouched; bad members are skipped.
+    expect(withInboundTrace(undefined, undefined, () => currentBaggage())).toEqual({});
+    expect(parseBaggage('ok=1,=nokey,noequals,bad=%E0%A4%A')).toEqual({ ok: '1' });
+  });
+});
+
 // ── health listener, custom metrics, /metrics ───────────────────────────────
 
 describe('HealthServer over Rust', () => {
@@ -322,6 +410,25 @@ describe('HealthServer over Rust', () => {
       expect(m.body).toMatch(/^o7_temp(\{[^}]*\})? 21.5$/m);
       expect(m.body).toContain('process_uptime_seconds');
       expect(prometheusText()).toContain('o7_requests_total');
+
+      // Histogram buckets: unit `s` gets the RPC seconds buckets; explicit
+      // boundaries win; other units keep the SDK default.
+      const les = (name: string) =>
+        [...m.body.matchAll(new RegExp(`^${name}_bucket\\{[^}]*le="([^"]+)"`, 'gm'))].map((x) => x[1]);
+      const sizes = metrics.histogram('o7.sizes', { unit: 'By', boundaries: [10, 100.5] });
+      const waits = metrics.histogram('o7.waits', { unit: 's', boundaries: [1, 5] });
+      sizes.record(50);
+      waits.record(0.3);
+      const b = await get(`${base}/metrics`);
+      m.body = b.body;
+      expect(les('o7_latency_seconds')).toEqual([
+        '0.005', '0.01', '0.025', '0.05', '0.075', '0.1', '0.25', '0.5', '0.75',
+        '1', '2.5', '5', '7.5', '10', '+Inf',
+      ]);
+      expect(les('o7_sizes_bytes')).toEqual(['10', '100.5', '+Inf']);
+      expect(les('o7_waits_seconds')).toEqual(['1', '5', '+Inf']);
+      expect(() => metrics.histogram('o7.bad', { boundaries: [5, 1] })).toThrow();
+      expect(() => metrics.counter('o7.ctr_bounds', { boundaries: [1] } as any)).toThrow();
 
       // Same name, other kind: refused in Rust.
       expect(() => metrics.histogram('o7.requests')).toThrow();

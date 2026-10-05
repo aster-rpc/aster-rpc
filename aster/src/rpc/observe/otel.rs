@@ -31,6 +31,7 @@ use super::status_name;
 use crate::log_targets::{CLIENT, DISPATCH};
 use crate::rpc::codec::StreamHeader;
 use crate::rpc::contract::MethodPattern;
+use crate::rpc::foreign::InboundTrace;
 use crate::rpc::status::StatusCode;
 
 // ── names ───────────────────────────────────────────────────────────────────
@@ -60,10 +61,9 @@ const BAGGAGE_MAX_MEMBERS: usize = 64;
 const MAX_LABELS: usize = 4096;
 
 /// Duration buckets in seconds (the OTel semantic-convention RPC buckets);
-/// the SDK default is millisecond-scaled.
-const SECONDS_BUCKETS: [f64; 14] = [
-    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
-];
+/// the SDK default is millisecond-scaled. Shared with binding-declared
+/// histograms in seconds.
+use aster_otel::instruments::SECONDS_BUCKETS;
 const MS_BUCKETS: [f64; 12] = [
     1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
 ];
@@ -354,6 +354,23 @@ impl Injector for HeaderInjector<'_> {
     }
 }
 
+/// The raw `baggage` (within the W3C limits) and `tracestate` of `h`.
+fn inbound_of(h: &StreamHeader) -> Option<InboundTrace> {
+    let c = HeaderCarrier(h);
+    let baggage = c
+        .get(BAGGAGE)
+        .filter(|v| !v.is_empty())
+        .map(Arc::<str>::from);
+    let tracestate = c
+        .get(TRACESTATE)
+        .filter(|v| !v.is_empty())
+        .map(Arc::<str>::from);
+    (baggage.is_some() || tracestate.is_some()).then_some(InboundTrace {
+        baggage,
+        tracestate,
+    })
+}
+
 fn extract(h: &StreamHeader) -> Context {
     let cx = global::get_text_map_propagator(|p| p.extract(&HeaderCarrier(h)));
     if !cx.span().span_context().is_valid() && h.metadata_keys.iter().any(|k| k == TRACEPARENT) {
@@ -448,6 +465,9 @@ pub(crate) struct CallOtel {
     /// The remote parent extracted at open, for `baggage:` extractors and
     /// `propagate_as_baggage`.
     parent: Option<Context>,
+    /// The raw inbound `baggage` / `tracestate`, read before the reserved
+    /// keys were stripped from the header.
+    inbound: Option<InboundTrace>,
 }
 
 impl CallOtel {
@@ -461,7 +481,13 @@ impl CallOtel {
             rust: rust.clone(),
             labels: None,
             parent: None,
+            inbound: None,
         })
+    }
+
+    /// See [`CallObs::inbound_trace`](super::CallObs::inbound_trace).
+    pub(crate) fn inbound_trace(&self) -> Option<InboundTrace> {
+        self.inbound.clone()
     }
 
     /// Whether the call needs its start time (for the duration histogram).
@@ -500,6 +526,7 @@ impl CallOtel {
         }
         let cx = if has_trace_keys(header) {
             let cx = extract(header);
+            self.inbound = inbound_of(header);
             strip_trace_keys(header);
             cx
         } else {

@@ -48,6 +48,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
+    "build:test-hooks": "napi build --platform --release --features test-hooks",
     "check:generated": "node ../scripts/check-native-generated.mjs"
   },
   "optionalDependencies": {

@@ -51,6 +51,8 @@ fn child() {
         #[cfg(feature = "prometheus")]
         "prometheus_implicit" => case_prometheus_implicit(),
         #[cfg(feature = "prometheus")]
+        "histogram_buckets" => case_histogram_buckets(),
+        #[cfg(feature = "prometheus")]
         "prometheus_reinit" => case_prometheus_reinit(),
         #[cfg(feature = "prometheus")]
         "prometheus_disabled" => case_prometheus_disabled(),
@@ -176,6 +178,65 @@ fn case_prometheus() {
     );
 }
 
+/// Binding-declared histograms: a seconds unit gets the RPC seconds buckets,
+/// explicit boundaries win, other units keep the SDK default.
+#[cfg(feature = "prometheus")]
+fn case_histogram_buckets() {
+    use aster_otel::instruments::{self, InstrumentDesc, InstrumentKind, Measurement};
+
+    let _h = aster_otel::init_with_prometheus(ObservabilityConfig {
+        from_env: false,
+        traces_exporter: Some(vec![]),
+        metrics_exporter: Some(vec![]),
+        ..Default::default()
+    })
+    .unwrap();
+    let desc = |name: &str, unit: &str, boundaries: Vec<f64>| InstrumentDesc {
+        kind: InstrumentKind::HistogramF64,
+        name: name.into(),
+        description: String::new(),
+        unit: unit.into(),
+        auto_attrs: vec![],
+        cardinality_limit: 0,
+        boundaries,
+    };
+    let secs = instruments::instrument_new(desc("probe.secs", "s", vec![])).unwrap();
+    let custom = instruments::instrument_new(desc("probe.custom", "s", vec![1.0, 5.0])).unwrap();
+    let default = instruments::instrument_new(desc("probe.default", "By", vec![])).unwrap();
+    for h in [secs, custom, default] {
+        instruments::record(h, Measurement::F64(0.3), 0, &[], 0).unwrap();
+    }
+    let text = aster_otel::render_prometheus().expect("prometheus reader");
+    let les = |metric: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with(&format!("{metric}_bucket")))
+            .map(|l| {
+                let i = l.find("le=\"").unwrap() + 4;
+                l[i..i + l[i..].find('"').unwrap()].to_string()
+            })
+            .collect()
+    };
+    let want_secs: Vec<String> = [
+        "0.005", "0.01", "0.025", "0.05", "0.075", "0.1", "0.25", "0.5", "0.75", "1", "2.5", "5",
+        "7.5", "10", "+Inf",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(les("probe_secs_seconds"), want_secs, "{text}");
+    assert_eq!(les("probe_custom_seconds"), ["1", "5", "+Inf"], "{text}");
+    let d = les("probe_default_bytes");
+    assert!(
+        d.contains(&"1000".to_string()) && d.contains(&"0".to_string()),
+        "{d:?}"
+    );
+    // Bad boundaries are refused.
+    assert!(instruments::instrument_new(desc("probe.bad", "s", vec![2.0, 1.0])).is_err());
+    assert!(instruments::instrument_new(desc("probe.nan", "s", vec![f64::NAN])).is_err());
+    let mut counter = desc("probe.ctr", "", vec![1.0]);
+    counter.kind = InstrumentKind::CounterU64;
+    assert!(instruments::instrument_new(counter).is_err());
+}
+
 #[cfg(feature = "prometheus")]
 fn probe_counter(n: u64) {
     opentelemetry::global::meter_provider()
@@ -290,6 +351,12 @@ fn reinit_after_shutdown_exports_to_the_new_provider() {
 #[test]
 fn otlp_logs_layer_exports_filtered_events() {
     run("otlp_logs", &[]);
+}
+
+#[cfg(feature = "prometheus")]
+#[test]
+fn binding_histograms_get_seconds_or_explicit_buckets() {
+    run("histogram_buckets", &[]);
 }
 
 #[cfg(feature = "prometheus")]
