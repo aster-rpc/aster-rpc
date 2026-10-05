@@ -339,7 +339,7 @@
       "source": "contract-defaults.json"
     },
     {
-      "expected_contract_id": "c5aa690b04f415990755ae87a2a608b14f41cf07306117028942b461af081c77",
+      "expected_contract_id": "e0cf99e9f8473034ca10b7134b4cb54d7c3317dd8a5685fac21ab6a9bc64100e",
       "name": "interop: InteropEcho v1",
       "service": {
         "methods": [
@@ -370,6 +370,42 @@
           {
             "name": "ingest",
             "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
             "request": {
               "display": "interop/EchoRequest",
               "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
@@ -1468,6 +1504,42 @@
               "display": "interop/EchoReply",
               "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
             }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
           }
         ],
         "name": "InteropEcho",
@@ -1643,6 +1715,42 @@
           {
             "name": "ingest",
             "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
             "request": {
               "display": "interop/EchoRequest",
               "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
@@ -1833,6 +1941,42 @@
               "display": "interop/EchoReply",
               "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
             }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
           }
         ],
         "name": "aster.ops.Fleet",
@@ -2007,6 +2151,42 @@
           {
             "name": "ingest",
             "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
             "request": {
               "display": "interop/EchoRequest",
               "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
@@ -2197,6 +2377,42 @@
               "display": "interop/EchoReply",
               "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
             }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
           }
         ],
         "name": "InteropEcho",
@@ -2371,6 +2587,42 @@
           {
             "name": "ingest",
             "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
             "request": {
               "display": "interop/EchoRequest",
               "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
@@ -2561,6 +2813,42 @@
               "display": "interop/EchoReply",
               "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
             }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
           }
         ],
         "name": "InteropEcho",
@@ -2736,6 +3024,42 @@
           {
             "name": "ingest",
             "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
             "request": {
               "display": "interop/EchoRequest",
               "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
@@ -2929,6 +3253,42 @@
               "display": "interop/EchoReply",
               "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
             }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
           }
         ],
         "name": "InteropEcho",
@@ -3103,6 +3463,42 @@
           {
             "name": "ingest",
             "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
             "request": {
               "display": "interop/EchoRequest",
               "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
@@ -3293,6 +3689,42 @@
               "display": "interop/EchoReply",
               "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
             }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
           }
         ],
         "name": "InteropEcho",
@@ -3468,6 +3900,42 @@
           {
             "name": "ingest",
             "pattern": "client_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "chat",
+            "pattern": "bidi_stream",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "hold",
+            "pattern": "unary",
+            "request": {
+              "display": "interop/EchoRequest",
+              "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"
+            },
+            "response": {
+              "display": "interop/EchoReply",
+              "hash": "4cd26d33fe1df34c37a3c657c52bff04a8d450bc5f7e26716a628548c1a50ab9"
+            }
+          },
+          {
+            "name": "cancelled",
+            "pattern": "unary",
             "request": {
               "display": "interop/EchoRequest",
               "hash": "088c3c11e89089dd6f6578131e6ad72e61ec858cb540f5d09f5f21f31641dd3b"

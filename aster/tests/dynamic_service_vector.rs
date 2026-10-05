@@ -31,7 +31,7 @@ mod interop;
 /// The `InteropEcho` contract id the interop servers report
 /// (`interop_echo contract`; `tests/interop/run.py` fails the matrix when the
 /// languages disagree).
-const INTEROP_ECHO_ID: &str = "c5aa690b04f415990755ae87a2a608b14f41cf07306117028942b461af081c77";
+const INTEROP_ECHO_ID: &str = "e0cf99e9f8473034ca10b7134b4cb54d7c3317dd8a5685fac21ab6a9bc64100e";
 
 fn vectors_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/vectors")
@@ -343,6 +343,9 @@ fn interop_echo_case() -> DynamicService {
         method::<EchoRequest, EchoReply>("echo", MethodPattern::Unary),
         method::<EchoRequest, EchoReply>("generate", MethodPattern::ServerStream),
         method::<EchoRequest, EchoReply>("ingest", MethodPattern::ClientStream),
+        method::<EchoRequest, EchoReply>("chat", MethodPattern::BidiStream),
+        method::<EchoRequest, EchoReply>("hold", MethodPattern::Unary),
+        method::<EchoRequest, EchoReply>("cancelled", MethodPattern::Unary),
     ];
     svc.type_defs = defs(&[EchoRequest::aster_type_def(), EchoReply::aster_type_def()]);
     svc
