@@ -166,7 +166,7 @@ pub struct Server {
     /// Built from the two fields above on first use and shared by every
     /// dispatcher, so all transports see one call table.
     foreign: OnceLock<Arc<Foreign>>,
-    /// Health counters fed by dispatch (see [`Server::health_state`]).
+    /// Telemetry sinks shared by every dispatcher (attribute extractors).
     telemetry: Telemetry,
 }
 
@@ -194,20 +194,6 @@ impl Server {
             foreign: OnceLock::new(),
             telemetry: Telemetry::default(),
         }
-    }
-
-    /// Feed `state`'s [`HealthMetrics`](crate::health::HealthMetrics) from
-    /// this server: every call counts as an RPC started and completed (OK or
-    /// failed, by its final status) and as an RPC stream while in flight,
-    /// whichever transport delivered it; [`serve`](Server::serve) also counts
-    /// each `aster/1` connection from its first call until it closes.
-    /// [`AsterServer`](crate::rpc::AsterServer) does this for its health
-    /// listener. Set before [`dispatcher`](Server::dispatcher) or
-    /// [`serve`](Server::serve).
-    #[cfg(feature = "health")]
-    pub fn health_state(mut self, state: crate::health::HealthState) -> Self {
-        self.telemetry.health = Some(state);
-        self
     }
 
     /// Where foreign calls and lifecycle events go (binding support). Set

@@ -1,7 +1,6 @@
 //! Per-call telemetry: the `aster::rpc::dispatch` tracing events and `rpc`
-//! span, with the `health` feature the R7 [`HealthMetrics`] counters, and with
-//! the `otel` feature the built-in OpenTelemetry instruments and the server and
-//! client spans exported to OTel (design
+//! span, and with the `otel` feature the built-in OpenTelemetry instruments
+//! and the server and client spans exported to OTel (design
 //! `docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md` §4.1, §5).
 //!
 //! Every call that reaches a dispatcher gets one [`CallObs`] from
@@ -13,13 +12,12 @@
 //! span lives in the `CallObs`, so a foreign call's span is held by its call
 //! table entry and ends when the binding finishes the call.
 //!
-//! Cost when nothing is listening: no health handle means no counter
-//! updates; with no OTel pipeline the cached [`otel::Builtins`] say so after
-//! one relaxed load; the span is a disabled `debug_span!`; and the start
-//! timestamp is taken only when the dispatch target is enabled at debug level
-//! or metrics are recorded. No allocation either way.
-//!
-//! [`HealthMetrics`]: crate::health::HealthMetrics
+//! Cost when nothing is listening: with no OTel pipeline the cached
+//! [`otel::Builtins`] say so after one relaxed load; the span is a disabled
+//! `debug_span!`; and the start timestamp is taken only when the dispatch
+//! target is enabled at debug level or metrics are recorded. No allocation
+//! either way. (The `health` feature's `/metrics` reads these same
+//! instruments through the OTel Prometheus reader.)
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -36,8 +34,6 @@ pub(crate) mod otel;
 /// The server's telemetry sinks, shared by every dispatcher clone.
 #[derive(Clone, Default)]
 pub(crate) struct Telemetry {
-    #[cfg(feature = "health")]
-    pub(crate) health: Option<crate::health::HealthState>,
     /// Rust-native attribute extractors (`Server::attribute_extractor`).
     #[cfg(feature = "otel")]
     pub(crate) extractors: otel::RustExtractors,
@@ -47,13 +43,6 @@ impl Telemetry {
     /// A call arrived: count it and start its clock.
     #[inline]
     pub(crate) fn start_call(&self) -> CallObs {
-        #[cfg(feature = "health")]
-        let health = self.health.as_ref().map(|h| {
-            let m = h.metrics();
-            m.rpc_started();
-            m.stream_opened();
-            h.clone()
-        });
         #[cfg(feature = "otel")]
         let otel = otel::CallOtel::start(&self.extractors);
         #[cfg(feature = "otel")]
@@ -61,8 +50,6 @@ impl Telemetry {
         #[cfg(not(feature = "otel"))]
         let timed = false;
         CallObs {
-            #[cfg(feature = "health")]
-            health,
             started: (timed || tracing::enabled!(target: DISPATCH, Level::DEBUG))
                 .then(Instant::now),
             done: false,
@@ -73,24 +60,15 @@ impl Telemetry {
         }
     }
 
-    /// Whether the serve loop should track connections (for the health
-    /// counters or the OTel connection instruments).
+    /// Whether the serve loop should track connections (for the OTel
+    /// connection instruments).
     pub(crate) fn tracks_connections(&self) -> bool {
-        #[cfg(feature = "otel")]
-        return true;
-        #[cfg(all(not(feature = "otel"), feature = "health"))]
-        return self.health.is_some();
-        #[cfg(not(any(feature = "otel", feature = "health")))]
-        false
+        cfg!(feature = "otel")
     }
 
     /// An `aster/1` connection delivered its first call. Pass the result to
     /// [`connection_closed`](Telemetry::connection_closed).
     pub(crate) fn connection_opened(&self) -> ConnObs {
-        #[cfg(feature = "health")]
-        if let Some(h) = &self.health {
-            h.metrics().connection_opened();
-        }
         ConnObs {
             #[cfg(feature = "otel")]
             otel: otel::connection_opened(),
@@ -98,10 +76,6 @@ impl Telemetry {
     }
 
     pub(crate) fn connection_closed(&self, conn: ConnObs) {
-        #[cfg(feature = "health")]
-        if let Some(h) = &self.health {
-            h.metrics().connection_closed();
-        }
         #[cfg(feature = "otel")]
         otel::connection_closed(conn.otel);
         #[cfg(not(feature = "otel"))]
@@ -129,8 +103,6 @@ pub(crate) struct CallInfo<'a> {
 /// known, finish it with [`finish`](CallObs::finish); one dropped unfinished
 /// counts as a failed call (no event: there is nothing to describe it with).
 pub(crate) struct CallObs {
-    #[cfg(feature = "health")]
-    health: Option<crate::health::HealthState>,
     started: Option<Instant>,
     done: bool,
     opened: bool,
@@ -261,17 +233,11 @@ impl CallObs {
             return false;
         }
         self.done = true;
-        #[cfg(feature = "health")]
-        if let Some(h) = self.health.take() {
-            let m = h.metrics();
-            m.rpc_completed(code == StatusCode::Ok);
-            m.stream_closed();
-        }
         #[cfg(feature = "otel")]
         if let Some(o) = &self.otel {
             o.finish(&self.span, code, self.started);
         }
-        #[cfg(not(any(feature = "health", feature = "otel")))]
+        #[cfg(not(feature = "otel"))]
         let _ = code;
         true
     }

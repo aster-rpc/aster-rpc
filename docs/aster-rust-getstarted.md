@@ -193,24 +193,24 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `health_host(h)` | `ASTER_HEALTH_HOST` | `[health] host` | default `127.0.0.1`; `0.0.0.0` for pod probes |
 | `health(b)` | `ASTER_HEALTH_ENABLED` | `[health] enabled` | force on (port `0` → ephemeral) or off; unset = on iff port ≠ 0 |
 
-The `[health]` keys start the `aster::health` HTTP listener (feature `health`)
-automatically under `AsterServer`; with a bare `Node`, call
-`aster::health::HealthServer::start(&node, cfg.health_config().unwrap())`. It
-serves the same routes as the Python/TS `HealthServer`: `GET /healthz`
-(liveness), `GET /readyz` (readiness, `HealthState::set_ready`), `GET /metrics`
-(JSON; Prometheus text when the `Accept` header asks for `text/plain` /
-OpenMetrics or with `?format=prometheus`) and `GET /metrics/prometheus` (the
-`aster_*` series plus, with `metrics`, `Node::metrics_prometheus`).
+The `[health]` keys start the `aster::ops` HTTP listener (feature `health`,
+which implies `otel`) automatically under `AsterServer`; with a bare `Node`,
+call `aster::ops::HealthServer::start(&node, cfg.health_config().unwrap())`.
+Routes: `GET /healthz` (liveness), `GET /readyz` (readiness: the server is
+ready, `HealthState::set_ready`, and every named check passes;
+`health.check("db").set(true)`; the JSON lists them under `checks`) and
+`GET /metrics` (Prometheus text, `text/plain; version=0.0.4`).
 
-Under `AsterServer` the counters are fed by the server itself: every RPC call
-counts as started and then succeeded or failed by its final status (calls
-refused before a handler ran count as failed), as an RPC stream while it is in
-flight, and each `aster/1` connection counts from its first call until it
-closes. Gate 0 decisions made through `AsterServer::take_admission()` count as
-the consumer admission series (accept = admitted, `reject` = denied). With a
-hand-built `Server` or a bare `Node`, wire the same counters with
-`Server::health_state(health.state())` and
-`node.take_admission().unwrap().with_health(health.state())`.
+`/metrics` is the OpenTelemetry Prometheus pull reader: the built-in
+`aster.*` instruments (RPC calls, durations, streams, connections, Gate 0
+decisions, upcalls), the `aster.transport.*` iroh counters, `aster.health.*`,
+`process.uptime`, and any custom instruments. The listener joins the
+`aster_otel` pipeline if one is running, or starts one from `OTEL_*` /
+`ASTER_*`, and adds the pull reader whatever `OTEL_METRICS_EXPORTER` says.
+The instruments record wherever calls happen, so a hand-built `Server` or a
+bare `Node` needs no extra wiring. `aster::ops::route` serves the same routes
+from another HTTP stack, and `aster::ops::metrics_text()` returns the scrape
+body.
 
 The ALPNs are exported as `aster::RPC_ALPN` and `aster::alpns::{RPC,
 CONSUMER_ADMISSION, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,
@@ -743,7 +743,7 @@ refusals. The targets (also listed in `aster::log_targets`):
 | `aster::rpc::foreign` | debug / trace | binding-implemented services: call cancelled (peer, deadline, invalid request) or abandoned (debug); call delivered (trace) |
 | `aster::admission` | info | Gate 0: inbound peer rejected (`peer`, `alpn`, `code`, `reason`) |
 | | debug | Gate 0: inbound peer accepted; outbound connect allowed / blocked |
-| `aster::health` | info / debug | health listener started / stopped; accept and connection errors |
+| `aster::ops` | info / debug | health listener started / stopped; accept and connection errors |
 
 The transport underneath logs under `aster_transport_core` (reactor, framing)
 and `iroh` / `iroh_*` (QUIC, relay, discovery); `RUST_LOG=warn,aster=debug`

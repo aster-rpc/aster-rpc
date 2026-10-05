@@ -93,18 +93,18 @@ pub struct AsterServerBuilder {
     dispatch_sink: Option<Arc<dyn super::foreign::DispatchSink>>,
     // Health listener override; `None` defers to the config's `[health]` keys.
     #[cfg(feature = "health")]
-    health: Option<crate::health::HealthConfig>,
+    health: Option<crate::ops::HealthConfig>,
 }
 
 impl AsterServerBuilder {
     /// Serve `/healthz`, `/readyz` and `/metrics` on `config.host:config.port`
-    /// (see [`crate::health`]), overriding the config's `[health]` keys. Without
+    /// (see [`crate::ops`]), overriding the config's `[health]` keys. Without
     /// this, the listener starts when [`AsterConfig::is_health_enabled`].
     ///
     /// The server reports **ready** once its services are being served, and
     /// not ready from the start of [`shutdown`](AsterServer::shutdown).
     #[cfg(feature = "health")]
-    pub fn health(mut self, config: crate::health::HealthConfig) -> Self {
+    pub fn health(mut self, config: crate::ops::HealthConfig) -> Self {
         self.health = Some(config);
         self
     }
@@ -498,7 +498,7 @@ impl AsterServerBuilder {
         #[cfg(feature = "health")]
         let health = match health_config {
             None => None,
-            Some(cfg) => match crate::health::HealthServer::start(&node, cfg).await {
+            Some(cfg) => match crate::ops::HealthServer::start(&node, cfg).await {
                 Ok(health) => {
                     health.state().set_services(service_count);
                     Some(health)
@@ -512,11 +512,6 @@ impl AsterServerBuilder {
 
         let attributes = self.attributes.unwrap_or_default();
         let mut server = Server::new(&node).attributes(attributes.clone());
-        // The health listener's counters are fed by this server's dispatch.
-        #[cfg(feature = "health")]
-        if let Some(health) = &health {
-            server = server.health_state(health.state().clone());
-        }
         if let Some(auth) = self.authenticator {
             server = server.authenticator_arc(auth);
         }
@@ -776,16 +771,16 @@ pub struct AsterServer {
     coordination: Option<crate::coordination::runtime::owner::CoordinationRuntime>,
     /// The health/metrics HTTP listener, when enabled.
     #[cfg(feature = "health")]
-    health: Option<crate::health::HealthServer>,
+    health: Option<crate::ops::HealthServer>,
 }
 
 impl AsterServer {
     /// The health/readiness/metrics HTTP listener, when enabled by the config's
     /// `[health]` keys or [`AsterServerBuilder::health`]. Use its
-    /// [`state`](crate::health::HealthServer::state) to toggle readiness and
-    /// record counters.
+    /// [`state`](crate::ops::HealthServer::state) to toggle readiness and add
+    /// readiness checks.
     #[cfg(feature = "health")]
-    pub fn health(&self) -> Option<&crate::health::HealthServer> {
+    pub fn health(&self) -> Option<&crate::ops::HealthServer> {
         self.health.as_ref()
     }
 
@@ -852,16 +847,10 @@ impl AsterServer {
 
     /// Take the admission handle (one-shot) for Gate-0 connection gating.
     /// Returns `None` unless built with [`hooks(true)`](AsterServerBuilder::hooks).
-    /// With a health listener, its accept/reject decisions are counted in the
-    /// `/metrics` admission series (see `Admission::with_health`).
+    /// With the `otel` feature its accept/reject decisions are counted in
+    /// `aster.admission.*` (and so on a health listener's `/metrics`).
     pub fn take_admission(&self) -> Option<crate::admission::Admission> {
-        let admission = self.node.take_admission()?;
-        #[cfg(feature = "health")]
-        let admission = match &self.health {
-            Some(health) => admission.with_health(health.state().clone()),
-            None => admission,
-        };
-        Some(admission)
+        self.node.take_admission()
     }
 
     /// Blob store client backed by this server's node.

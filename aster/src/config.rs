@@ -180,7 +180,7 @@ pub struct AsterConfig {
     /// Path to a `.aster-identity` file.
     pub identity_file: Option<PathBuf>,
 
-    /// Port of the health/readiness/metrics HTTP listener (`aster::health`,
+    /// Port of the health/readiness/metrics HTTP listener (`aster::ops`,
     /// feature `health`). `0` (the default) means disabled unless
     /// [`health_enabled`](Self::health_enabled) is `Some(true)`, in which case
     /// an ephemeral port is bound. See [`is_health_enabled`](Self::is_health_enabled).
@@ -598,9 +598,9 @@ impl AsterConfig {
     /// The health listener's bind config, or `None` when disabled (see
     /// [`is_health_enabled`](Self::is_health_enabled)).
     #[cfg(feature = "health")]
-    pub fn health_config(&self) -> Option<crate::health::HealthConfig> {
+    pub fn health_config(&self) -> Option<crate::ops::HealthConfig> {
         self.is_health_enabled()
-            .then(|| crate::health::HealthConfig::new(self.health_host.clone(), self.health_port))
+            .then(|| crate::ops::HealthConfig::new(self.health_host.clone(), self.health_port))
     }
 
     /// Resolve the root public key from `root_pubkey` or `root_pubkey_file`.
@@ -2257,7 +2257,7 @@ mod binding_knob_tests {
             let on = cfg.into_builder().health(true).build();
             assert_eq!(
                 on.health_config(),
-                Some(crate::health::HealthConfig::new("0.0.0.0", 8081))
+                Some(crate::ops::HealthConfig::new("0.0.0.0", 8081))
             );
         }
     }

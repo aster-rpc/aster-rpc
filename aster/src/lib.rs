@@ -86,8 +86,9 @@ mod docs;
 pub mod expose;
 #[cfg(feature = "gossip")]
 mod gossip;
+/// Ops endpoints: `/healthz`, `/readyz`, `/metrics` (feature `health`).
 #[cfg(feature = "health")]
-pub mod health;
+pub mod ops;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 

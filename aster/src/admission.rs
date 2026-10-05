@@ -133,30 +133,11 @@ impl Gate0 {
 /// debug.
 pub struct Admission {
     rx: CoreHookReceiver,
-    #[cfg(feature = "health")]
-    health: Option<crate::health::HealthState>,
 }
 
 impl Admission {
     pub(crate) fn new(rx: CoreHookReceiver) -> Self {
-        Self {
-            rx,
-            #[cfg(feature = "health")]
-            health: None,
-        }
-    }
-
-    /// Count this handle's inbound (Gate 0) decisions in `state`'s
-    /// [`HealthMetrics`](crate::health::HealthMetrics):
-    /// [`HandshakeRequest::accept`] records an admit (with the time since the
-    /// request arrived as its duration), [`HandshakeRequest::reject`] a deny.
-    /// They are reported as the `consumer` admission series. An
-    /// [`AsterServer`](crate::rpc::AsterServer) with a health listener does
-    /// this in `take_admission`.
-    #[cfg(feature = "health")]
-    pub fn with_health(mut self, state: crate::health::HealthState) -> Self {
-        self.health = Some(state);
-        self
+        Self { rx }
     }
 
     /// Binding support: wrap a raw transport-core hook receiver. Not part of
@@ -195,13 +176,7 @@ impl Admission {
         info: CoreHookHandshakeInfo,
         reply: oneshot::Sender<CoreAfterHandshakeDecision>,
     ) -> HandshakeRequest {
-        #[cfg_attr(not(feature = "health"), allow(unused_mut))]
-        let mut req = HandshakeRequest::new(info, reply);
-        #[cfg(feature = "health")]
-        {
-            req.health = self.health.clone();
-        }
-        req
+        HandshakeRequest::new(info, reply)
     }
 
     /// The next request of either kind, or `None` once both channels have
@@ -278,10 +253,8 @@ pub struct HandshakeRequest {
     pub is_alive: bool,
     reply: oneshot::Sender<CoreAfterHandshakeDecision>,
     /// When the request arrived, for the admission duration.
-    #[cfg(any(feature = "health", feature = "otel"))]
+    #[cfg(feature = "otel")]
     received: std::time::Instant,
-    #[cfg(feature = "health")]
-    health: Option<crate::health::HealthState>,
 }
 
 impl HandshakeRequest {
@@ -294,10 +267,8 @@ impl HandshakeRequest {
             alpn: info.alpn,
             is_alive: info.is_alive,
             reply,
-            #[cfg(any(feature = "health", feature = "otel"))]
+            #[cfg(feature = "otel")]
             received: std::time::Instant::now(),
-            #[cfg(feature = "health")]
-            health: None,
         }
     }
 
@@ -309,11 +280,6 @@ impl HandshakeRequest {
             alpn = %String::from_utf8_lossy(&self.alpn),
             "gate 0: peer accepted"
         );
-        #[cfg(feature = "health")]
-        if let Some(h) = &self.health {
-            h.metrics()
-                .record_consumer_admit(self.received.elapsed().as_secs_f64() * 1000.0);
-        }
         #[cfg(feature = "otel")]
         crate::rpc::observe::otel::admission("consumer", "admit", self.received.elapsed());
         let _ = self.reply.send(CoreAfterHandshakeDecision::Accept);
@@ -330,10 +296,6 @@ impl HandshakeRequest {
             reason = %String::from_utf8_lossy(&reason),
             "gate 0: peer rejected"
         );
-        #[cfg(feature = "health")]
-        if let Some(h) = &self.health {
-            h.metrics().record_consumer_deny();
-        }
         #[cfg(feature = "otel")]
         crate::rpc::observe::otel::admission("consumer", "deny", self.received.elapsed());
         let _ = self.reply.send(CoreAfterHandshakeDecision::Reject {

@@ -18,7 +18,7 @@
 //! | [`FOREIGN`] | debug / trace | foreign (binding) dispatch: call delivered (trace), cancelled / expired / abandoned (debug) |
 //! | [`ADMISSION`] | debug / info | Gate 0: inbound peer accepted (debug) or rejected (info); outbound dial allowed / blocked (debug) |
 //! | [`UPCALL`] | trace / debug / warn | binding upcalls: issued / answered (trace), cancelled or late answers (debug), a decision upcall that fell back to its failure mode (warn) |
-//! | [`HEALTH`] | info / debug | health listener bound and shut down (info); per-connection serve errors (debug) |
+//! | [`OPS`] | info / debug | ops (health/metrics) listener bound and shut down (info); per-connection serve errors (debug) |
 //!
 //! The lower layers log under their own crate names: `aster_transport_core`
 //! (reactor, framing) and `iroh` / `iroh_*` (QUIC, relay, discovery).
@@ -35,7 +35,7 @@ pub const SESSION: &str = "aster::rpc::session";
 pub const FOREIGN: &str = "aster::rpc::foreign";
 /// Gate 0 peer admission decisions.
 pub const ADMISSION: &str = "aster::admission";
-/// The `/healthz`, `/readyz`, `/metrics` HTTP listener.
-pub const HEALTH: &str = "aster::health";
+/// The `/healthz`, `/readyz`, `/metrics` HTTP listener (`aster::ops`).
+pub const OPS: &str = "aster::ops";
 /// Upcalls into binding code (`binding_support::upcall`).
 pub const UPCALL: &str = "aster::upcall";

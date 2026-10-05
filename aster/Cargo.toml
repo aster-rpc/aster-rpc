@@ -55,11 +55,19 @@ coordination-testing = ["coordination"]
 discovery = []
 hooks = []
 metrics = []
-# `aster::health`: the /healthz, /readyz, /metrics HTTP listener (the Rust home
+# `aster::ops`: the /healthz, /readyz, /metrics HTTP listener (the Rust home
 # of the Python/TS `HealthServer`), started by `AsterServer` from the
-# `[health]` config. hyper / hyper-util / http-body-util are already in the
+# `[health]` config. Implies `otel` (design §6, Q15): `/metrics` is the OTel
+# Prometheus pull reader (`aster-otel/prometheus`), and a listener joins or
+# starts the pipeline. hyper / hyper-util / http-body-util are already in the
 # graph through iroh's HTTP client; this only enables hyper's `server` half.
-health = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+health = [
+    "otel",
+    "aster-otel/prometheus",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+]
 # OpenTelemetry (design docs/_internal/bindings/OBSERVABILITY_HEALTH_DESIGN.md
 # §4.1, §5, phase O2): the built-in RPC instruments, the `rpc` server and
 # client spans exported to OTel, and W3C trace context / baggage on the wire.

@@ -179,9 +179,12 @@ impl Builtins {
             Some(s) if s.generation == generation => Builtins {
                 generation,
                 traces: s.traces,
-                metrics: s
-                    .metrics
-                    .then(|| Instruments::new(&global::meter(aster_otel::SCOPE_NAME))),
+                metrics: s.metrics.then(|| {
+                    let meter = global::meter(aster_otel::SCOPE_NAME);
+                    #[cfg(feature = "health")]
+                    crate::ops::register_observables(generation, &meter);
+                    Instruments::new(&meter)
+                }),
                 extractors: s.attribute_extractors,
                 propagate: s.propagate_as_baggage,
             },
