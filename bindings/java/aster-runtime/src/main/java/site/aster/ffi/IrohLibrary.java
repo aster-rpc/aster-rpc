@@ -152,6 +152,21 @@ public final class IrohLibrary implements SymbolLookup {
               + ", this binding expects "
               + EXPECTED_ABI_MAJOR);
     }
+    int minor = abiVersionMinor();
+    if (minor < REQUIRED_ABI_MINOR) {
+      throw new UnsatisfiedLinkError(
+          "Native library "
+              + LIB_PATH
+              + " has ABI "
+              + major
+              + "."
+              + minor
+              + ", this binding needs "
+              + EXPECTED_ABI_MAJOR
+              + "."
+              + REQUIRED_ABI_MINOR
+              + " or newer");
+    }
   }
 
   public static IrohLibrary getInstance() {
@@ -199,6 +214,12 @@ public final class IrohLibrary implements SymbolLookup {
    * loaded.
    */
   public static final int EXPECTED_ABI_MAJOR = 4;
+
+  /**
+   * Lowest C ABI minor version this binding runs against: 4.6 added the observability, log bridge,
+   * metrics, span and health functions ({@code site.aster.otel}, {@code site.aster.health}).
+   */
+  public static final int REQUIRED_ABI_MINOR = 6;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {

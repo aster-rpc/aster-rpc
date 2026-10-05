@@ -26,7 +26,12 @@ public enum IrohStatus {
   /** A policy refused the caller, e.g. a denied relay request (ABI 4.3). */
   PERMISSION_DENIED(15),
   /** Reserved for the auth design (ABI 4.3). */
-  CREDENTIAL_EXPIRED(16);
+  CREDENTIAL_EXPIRED(16),
+  /**
+   * The resource already exists: {@code aster_observability_init} with a configuration that differs
+   * from the running pipeline's, or a second concurrent {@code aster_log_poll} (ABI 4.6).
+   */
+  ALREADY_EXISTS(17);
 
   public final int code;
 

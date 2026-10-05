@@ -137,6 +137,19 @@ public final class Rpc {
   /** Native options for the common (shared, no deadline, no metadata) calls, built once. */
   private static final Map<String, MemorySegment> OPTIONS_CACHE = new ConcurrentHashMap<>();
 
+  /**
+   * {@code o} with the current trace context (call-context carrier) as {@code traceparent} / {@code
+   * baggage} metadata; Rust parents its client span on the {@code traceparent} (design §5.4). The
+   * same object when there is no context.
+   */
+  private static Options traced(Options o) {
+    Map<String, String> injected = site.aster.otel.Tracing.inject(o.metadata());
+    return injected == o.metadata()
+        ? o
+        : new Options(
+            o.service(), o.method(), o.version(), o.sessionId(), o.deadlineMs(), injected);
+  }
+
   private static MemorySegment options(Options o, Arena arena) {
     if (o.cacheable()) {
       String key = o.service() + '\u0000' + o.method() + '\u0000' + o.version();
@@ -208,6 +221,7 @@ public final class Rpc {
    */
   public static UnaryResult unary(
       long runtime, long connection, Options o, byte[] request, long token) {
+    o = traced(o);
     boolean small = request.length <= SCRATCH_REQUEST_LIMIT;
     if (o.cacheable() && small) {
       return unaryIn(runtime, connection, o, request, null, token);
@@ -325,7 +339,8 @@ public final class Rpc {
   public static long open(long runtime, long connection, int pattern, Options o) {
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment out = arena.allocate(I64);
-      int status = (int) OPEN.invoke(runtime, connection, (byte) pattern, options(o, arena), out);
+      int status =
+          (int) OPEN.invoke(runtime, connection, (byte) pattern, options(traced(o), arena), out);
       Dispatch.check(status, "aster_rpc_open");
       return out.get(I64, 0);
     } catch (Throwable t) {

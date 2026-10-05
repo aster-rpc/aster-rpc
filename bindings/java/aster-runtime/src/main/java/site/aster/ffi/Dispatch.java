@@ -106,6 +106,12 @@ public final class Dispatch implements AutoCloseable {
   public static final int FLAG_HAS_METADATA = 0x100;
   public static final int FLAG_HAS_ATTRIBUTES = 0x200;
 
+  /** The call's server span is exported: read it with {@link #traceContext}. */
+  public static final int FLAG_HAS_TRACE = 0x400;
+
+  /** The caller sent {@code baggage} / {@code tracestate}: read them with {@link #inboundTrace}. */
+  public static final int FLAG_HAS_INBOUND_TRACE = 0x800;
+
   /** {@code aster_server_option_t}. */
   public static final int OPTION_BUILTIN_NODE_INFO = 1;
 
@@ -182,6 +188,12 @@ public final class Dispatch implements AutoCloseable {
       h("aster_dispatch_metadata", FunctionDescriptor.of(I32, I64, I64, I64, PTR, PTR, PTR));
   private static final MethodHandle ATTRIBUTES =
       h("aster_dispatch_attributes", FunctionDescriptor.of(I32, I64, I64, I64, PTR, PTR, PTR));
+  private static final MethodHandle INBOUND_TRACE =
+      h("aster_dispatch_inbound_trace", FunctionDescriptor.of(I32, I64, I64, I64, PTR, PTR, PTR));
+  private static final MethodHandle TRACE_CONTEXT =
+      h("aster_dispatch_trace_context", FunctionDescriptor.of(I32, I64, I64, I64, PTR));
+  private static final MethodHandle ATTACH_HEALTH =
+      h("aster_server_attach_health", FunctionDescriptor.of(I32, I64, I64));
 
   // ── builder ──────────────────────────────────────────────────────────────
 
@@ -220,6 +232,20 @@ public final class Dispatch implements AutoCloseable {
     public Builder option(int key, long value) {
       try {
         check((int) SET_OPTION.invoke(handle, key, value), "aster_server_set_option");
+        return this;
+      } catch (Throwable t) {
+        throw rethrow(t);
+      }
+    }
+
+    /**
+     * {@code aster_server_attach_health}: the ops listener {@code healthHandle} (see {@code
+     * site.aster.health.HealthServer}) counts this server's calls, is set ready by a successful
+     * start and not ready first by {@link Dispatch#close}. Call before {@link #start}.
+     */
+    public Builder attachHealth(long healthHandle) {
+      try {
+        check((int) ATTACH_HEALTH.invoke(handle, healthHandle), "aster_server_attach_health");
         return this;
       } catch (Throwable t) {
         throw rethrow(t);
@@ -449,6 +475,32 @@ public final class Dispatch implements AutoCloseable {
   /** The caller's attributes as Gate 3 saw them. */
   public Map<String, String> attributes(long callId) {
     return kvOut(ATTRIBUTES, callId, "aster_dispatch_attributes");
+  }
+
+  /**
+   * The server span context of a live call ({@link #FLAG_HAS_TRACE}); {@code null} when the span is
+   * not exported (an all-zero context) or the call is over.
+   */
+  public site.aster.otel.SpanContext traceContext(long callId) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment out = arena.allocate(32, 8);
+      int status = (int) TRACE_CONTEXT.invoke(runtimeHandle, handle, callId, out);
+      if (status == IrohStatus.NOT_FOUND.code) {
+        return null;
+      }
+      check(status, "aster_dispatch_trace_context");
+      return site.aster.otel.SpanContext.fromNative(out);
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * The inbound W3C {@code baggage} and {@code tracestate} of a live call ({@link
+   * #FLAG_HAS_INBOUND_TRACE}), by those keys; empty when the call is over.
+   */
+  public Map<String, String> inboundTrace(long callId) {
+    return kvOut(INBOUND_TRACE, callId, "aster_dispatch_inbound_trace");
   }
 
   private Map<String, String> kvOut(MethodHandle fn, long callId, String op) {

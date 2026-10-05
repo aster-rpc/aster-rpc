@@ -57,6 +57,12 @@
             <artifactId>fory-core</artifactId>
         </dependency>
 
+        <!-- Q5: Rust log records are delivered to SLF4J 2 (fluent key/values, MDC for trace ids). -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>com.tngtech.archunit</groupId>
             <artifactId>archunit-junit5</artifactId>
