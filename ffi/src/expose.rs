@@ -979,7 +979,10 @@ pub unsafe extern "C" fn aster_expose_request_route(
         let handle = REGISTRATIONS.insert(Mutex::new(Some(reg)));
         Ok(
             Done::ok(aster_event_kind_t::ASTER_EVENT_BYTES_RESULT, handle)
-                .data(codec::encode_expose_route_grant(&indexes)),
+                .data(codec::encode_expose_route_grant(&indexes))
+                .on_discard(move || {
+                    free_registration(handle);
+                }),
         )
     })
 }
@@ -992,12 +995,21 @@ pub unsafe extern "C" fn aster_route_registration_free(
     registration: aster_route_registration_t,
 ) -> i32 {
     try_status!(bridge_for(runtime));
+    if free_registration(registration) {
+        OK
+    } else {
+        not_found(format!("unknown route registration {registration}"))
+    }
+}
+
+/// End a registration (the edge evicts its routes); `false` if unknown.
+fn free_registration(registration: aster_route_registration_t) -> bool {
     match REGISTRATIONS.remove(registration) {
         Some(slot) => {
             drop(slot.lock().unwrap().take());
-            OK
+            true
         }
-        None => not_found(format!("unknown route registration {registration}")),
+        None => false,
     }
 }
 

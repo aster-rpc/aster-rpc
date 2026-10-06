@@ -599,6 +599,8 @@ pub unsafe extern "C" fn aster_coordination_client_open(
                 out
             }
         };
+        #[cfg(feature = "coordination-fixture")]
+        test_hooks::before_open(user_data).await;
         let id = CLIENTS.insert(ClientState {
             group: *group.as_bytes(),
             local,
@@ -612,7 +614,10 @@ pub unsafe extern "C" fn aster_coordination_client_open(
             aster_event_kind_t::ASTER_EVENT_COORDINATION_CLIENT_OPENED,
             id,
         )
-        .related(node))
+        .related(node)
+        .on_discard(move || {
+            free_client(id);
+        }))
     })
 }
 
@@ -639,12 +644,21 @@ pub unsafe extern "C" fn aster_coordination_client_free(
     client: aster_coordination_client_t,
 ) -> i32 {
     try_status!(bridge_for(runtime));
+    if free_client(client) {
+        OK
+    } else {
+        not_found(format!("unknown coordination client {client}"))
+    }
+}
+
+/// Close and free a client; `false` for an unknown handle.
+fn free_client(client: aster_coordination_client_t) -> bool {
     match CLIENTS.remove(client) {
         Some(state) => {
             state.close();
-            OK
+            true
         }
-        None => not_found(format!("unknown coordination client {client}")),
+        None => false,
     }
 }
 
@@ -727,7 +741,13 @@ pub unsafe extern "C" fn aster_coordination_mutate(
         #[cfg(feature = "coordination-fixture")]
         test_hooks::before_track(client).await;
         let id = state.track_resolved(resolved)?;
-        Ok(Done::ok(aster_event_kind_t::ASTER_EVENT_COORDINATION_RESOLVED, id).data(payload))
+        Ok(
+            Done::ok(aster_event_kind_t::ASTER_EVENT_COORDINATION_RESOLVED, id)
+                .data(payload)
+                .on_discard(move || {
+                    RESOLVED.remove(id);
+                }),
+        )
     })
 }
 
@@ -832,7 +852,10 @@ unsafe fn redeliver(
             None => Done::ok(kind, 0),
             Some(resolved) => {
                 let payload = codec::encode_mutation_reply(resolved.reply());
-                Done::ok(kind, state.track_resolved(resolved)?).data(payload)
+                let id = state.track_resolved(resolved)?;
+                Done::ok(kind, id).data(payload).on_discard(move || {
+                    RESOLVED.remove(id);
+                })
             }
         })
     })
@@ -1090,7 +1113,12 @@ pub unsafe extern "C" fn aster_coordination_lease_acquire(
                     .fence()
                     .ok_or_else(|| other_op("the lease lapsed before it could be handed out"))?;
                 let payload = codec::encode_coordination_fence(&fence);
-                Ok(Done::ok(kind, state.track_lease(lease)?).data(payload))
+                #[cfg(feature = "coordination-fixture")]
+                test_hooks::before_track(client).await;
+                let id = state.track_lease(lease)?;
+                Ok(Done::ok(kind, id).data(payload).on_discard(move || {
+                    free_lease(id);
+                }))
             }
             LeaseAcquireOutcome::Denied(reason, snapshot) => Ok(Done::ok(kind, 0).data(
                 ucv1::encode_transition_outcome(&TransitionOutcome::Denied(reason, snapshot)),
@@ -1281,15 +1309,24 @@ pub unsafe extern "C" fn aster_coordination_lease_free(
     lease: aster_coordination_lease_t,
 ) -> i32 {
     try_status!(bridge_for(runtime));
+    if free_lease(lease) {
+        OK
+    } else {
+        not_found(format!("unknown coordination lease {lease}"))
+    }
+}
+
+/// Stop renewing and free a lease without releasing it; `false` if unknown.
+fn free_lease(lease: aster_coordination_lease_t) -> bool {
     match LEASES.remove(lease) {
         Some(slot) => {
             slot.closed.store(true, Ordering::SeqCst);
             if let Ok(mut g) = slot.lease.try_write() {
                 drop(g.take());
             }
-            OK
+            true
         }
-        None => not_found(format!("unknown coordination lease {lease}")),
+        None => false,
     }
 }
 
@@ -1432,19 +1469,48 @@ pub mod test_hooks {
         GATES.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Arm a one-shot gate for `client`'s next mutation.
-    pub fn arm(client: aster_coordination_client_t) -> Arc<Gate> {
-        let gate = Arc::new(Gate {
+    fn open_gates() -> &'static Mutex<HashMap<u64, Arc<Gate>>> {
+        static GATES: std::sync::OnceLock<Mutex<HashMap<u64, Arc<Gate>>>> =
+            std::sync::OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn new_gate() -> Arc<Gate> {
+        Arc::new(Gate {
             reached: Mutex::new(false),
             cv: Condvar::new(),
             release: tokio::sync::Semaphore::new(0),
-        });
+        })
+    }
+
+    /// Arm a one-shot gate for `client`'s next mutation or lease acquire.
+    pub fn arm(client: aster_coordination_client_t) -> Arc<Gate> {
+        let gate = new_gate();
         gates().lock().unwrap().insert(client, gate.clone());
         gate
     }
 
+    /// Arm a one-shot gate for the next client open submitted with
+    /// `user_data`: it stops after the journal opened, before the client is
+    /// registered.
+    pub fn arm_open(user_data: u64) -> Arc<Gate> {
+        let gate = new_gate();
+        open_gates().lock().unwrap().insert(user_data, gate.clone());
+        gate
+    }
+
+    pub(crate) async fn before_open(user_data: u64) {
+        let gate = open_gates().lock().unwrap().remove(&user_data);
+        pass(gate).await;
+    }
+
     pub(crate) async fn before_track(client: aster_coordination_client_t) {
-        let Some(gate) = gates().lock().unwrap().remove(&client) else {
+        let gate = gates().lock().unwrap().remove(&client);
+        pass(gate).await;
+    }
+
+    async fn pass(gate: Option<Arc<Gate>>) {
+        let Some(gate) = gate else {
             return;
         };
         *gate.reached.lock().unwrap() = true;

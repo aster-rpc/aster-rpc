@@ -698,7 +698,9 @@ pub unsafe extern "C" fn aster_lease_acquire(
                         holder: holder.clone(),
                     }));
                 let id = LEASES.insert(Mutex::new(Some(lease)));
-                Done::ok(kind, id).data(payload)
+                Done::ok(kind, id).data(payload).on_discard(move || {
+                    free_lease(id);
+                })
             }
             AcquireOutcome::Denied(reason, snap) => Done::ok(kind, 0).data(
                 codec::encode_transition_outcome(&TransitionOutcome::Denied(reason, snap)),
@@ -827,12 +829,21 @@ pub unsafe extern "C" fn aster_lease_release(
 #[no_mangle]
 pub unsafe extern "C" fn aster_lease_free(runtime: aster_runtime_t, lease: aster_lease_t) -> i32 {
     try_status!(bridge_for(runtime));
+    if free_lease(lease) {
+        OK
+    } else {
+        not_found(format!("unknown lease {lease}"))
+    }
+}
+
+/// Drop a lease handle without releasing it; `false` for an unknown handle.
+fn free_lease(lease: aster_lease_t) -> bool {
     match LEASES.remove(lease) {
         Some(slot) => {
             drop(slot.lock().unwrap().take());
-            OK
+            true
         }
-        None => not_found(format!("unknown lease {lease}")),
+        None => false,
     }
 }
 

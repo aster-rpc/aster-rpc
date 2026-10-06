@@ -342,9 +342,10 @@ pub(crate) struct Done {
     owned_handle: Option<OwnedHandle>,
 }
 
-#[derive(Clone, Copy)]
 enum OwnedHandle {
     Doc,
+    /// Frees a resource registered outside the runtime's own registries.
+    Discard(Box<dyn FnOnce() + Send>),
 }
 
 impl Done {
@@ -362,6 +363,12 @@ impl Done {
     }
     pub(crate) fn owned_doc(mut self) -> Self {
         self.owned_handle = Some(OwnedHandle::Doc);
+        self
+    }
+    /// `free` releases the resource success registered under `handle` if the
+    /// completion loses to cancellation (the caller never sees the handle).
+    pub(crate) fn on_discard(mut self, free: impl FnOnce() + Send + 'static) -> Self {
+        self.owned_handle = Some(OwnedHandle::Discard(Box::new(free)));
         self
     }
     pub(crate) fn related(mut self, related: u64) -> Self {
@@ -467,6 +474,7 @@ where
                         Some(OwnedHandle::Doc) => {
                             b.docs.remove(d.handle);
                         }
+                        Some(OwnedHandle::Discard(free)) => free(),
                         None => {}
                     }
                 }

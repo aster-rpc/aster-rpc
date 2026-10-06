@@ -413,6 +413,89 @@ fn foreign_serializer_acquire_renew_fence_release() {
 }
 
 #[test]
+fn a_cancelled_acquire_does_not_leave_a_renewing_lease() {
+    unsafe {
+        let rt = runtime();
+        let u = new_upcalls(rt);
+        // Hold the first acquire at the foreign serializer until cancelled.
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (reached_tx, release_rx) = (Mutex::new(Some(reached_tx)), Mutex::new(release_rx));
+        let inner = memory_backed_serializer(MemorySerializer::new());
+        let foreign = Foreign::start(rt, u, move |kind, payload| {
+            if kind == K_TRANSITION
+                && matches!(
+                    codec::decode_lease_transition_request(payload),
+                    Ok((_, LeaseOp::Acquire { .. }))
+                )
+            {
+                if let Some(tx) = reached_tx.lock().unwrap().take() {
+                    tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }
+            inner(kind, payload)
+        });
+        let mut ser = 0;
+        assert_eq!(aster_lease_serializer_foreign_new(rt, u, &mut ser), OK);
+
+        let mut op = 0;
+        assert_eq!(
+            aster_lease_acquire(
+                rt,
+                ser,
+                bytes(b"tree/7"),
+                bytes(b"alice"),
+                600,
+                0,
+                0,
+                7,
+                &mut op
+            ),
+            OK
+        );
+        reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(aster_operation_cancel(rt, op), OK);
+        release_tx.send(()).unwrap();
+        let ev = finish(rt, op);
+        assert_eq!(
+            ev.ev.kind,
+            aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED as u32
+        );
+
+        // The serializer granted it, but nobody holds the handle: it must
+        // neither renew (ttl 600 renews every 200 ms) nor block bob after TTL.
+        let renewals = |f: &Foreign| {
+            f.seen()
+                .iter()
+                .filter(|s| {
+                    s.kind == K_TRANSITION
+                        && matches!(
+                            codec::decode_lease_transition_request(&s.payload),
+                            Ok((_, LeaseOp::Renew { .. }))
+                        )
+                })
+                .count()
+        };
+        std::thread::sleep(Duration::from_millis(1_000));
+        assert_eq!(renewals(&foreign), 0, "the cancelled lease still renews");
+        let got = acquire(rt, ser, "tree/7", "bob", 600);
+        assert!(
+            got.is_ok(aster_event_kind_t::ASTER_EVENT_LEASE_ACQUIRED),
+            "{}",
+            got.text()
+        );
+        assert_ne!(got.ev.handle, 0, "bob is still denied");
+        assert_eq!(aster_lease_free(rt, got.ev.handle), OK);
+
+        assert_eq!(aster_lease_serializer_free(rt, ser), OK);
+        drop(foreign);
+        assert_eq!(aster_upcalls_free(rt, u), OK);
+        assert_eq!(aster_runtime_close(rt), OK);
+    }
+}
+
+#[test]
 fn memory_serializer_with_foreign_authorizer() {
     unsafe {
         let rt = runtime();

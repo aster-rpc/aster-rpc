@@ -1771,6 +1771,112 @@ fn resolution_after_close_is_an_error_and_redelivered() {
     }
 }
 
+const E_CANCELLED: u32 = aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED as u32;
+
+/// Cancel `op` while its gate holds it after success, then let it finish:
+/// cancellation wins and the caller never receives the handle.
+unsafe fn cancel_at_gate(
+    rt: aster_runtime_t,
+    op: aster_operation_t,
+    gate: &aster_transport_ffi::coordination::test_hooks::Gate,
+) {
+    assert!(
+        gate.wait_reached(Duration::from_secs(60)),
+        "reached the gate"
+    );
+    assert_eq!(aster_operation_cancel(rt, op), OK);
+    gate.release();
+    assert_eq!(finish(rt, op).kind(), E_CANCELLED);
+}
+
+#[test]
+fn a_cancelled_open_does_not_keep_the_journal() {
+    unsafe {
+        let Shared { rt, root_node } = *shared();
+        let dir = tempfile::tempdir().unwrap();
+        const USER_DATA: u64 = 0x0C0FFEE;
+        let gate = aster_transport_ffi::coordination::test_hooks::arm_open(USER_DATA);
+        let g = group();
+        let group_id = *g.fixture.group_id().as_bytes();
+        let tickets = [bytes(g.ticket.as_bytes())];
+        let path = dir.path().to_str().unwrap().to_owned();
+        let mut o: aster_coordination_client_options_t = std::mem::zeroed();
+        assert_eq!(aster_coordination_client_options_init(&mut o), OK);
+        o.group_id = group_id.as_ptr();
+        o.seed_tickets = aster_bytes_list_t {
+            items: tickets.as_ptr(),
+            len: 1,
+        };
+        o.journal_dir = bytes(path.as_bytes());
+        let mut op = 0;
+        assert_eq!(
+            aster_coordination_client_open(rt, root_node, &o, USER_DATA, &mut op),
+            OK
+        );
+        cancel_at_gate(rt, op, &gate);
+        // The orphaned client was closed: its journal opens again.
+        let c = open(rt, root_node, Some(dir.path()));
+        assert_eq!(aster_coordination_client_free(rt, c), OK);
+    }
+}
+
+#[test]
+fn a_cancelled_lease_acquire_stops_renewing() {
+    unsafe {
+        let Shared { rt, root_node } = *shared();
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = open(rt, root_node, Some(root_dir.path()));
+        let (w1_node, w2_node) = (
+            start_node(rt, actor_secret()),
+            start_node(rt, actor_secret()),
+        );
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (w1, w2) = (
+            open(rt, w1_node, Some(d1.path())),
+            open(rt, w2_node, Some(d2.path())),
+        );
+        let r = res("ffi.lease.cancel", "cancelled");
+        grant(rt, root, &r, local_id(rt, w1));
+        grant(rt, root, &r, local_id(rt, w2));
+        let acquire = |c, op: &mut aster_operation_t| {
+            aster_coordination_lease_acquire(
+                rt,
+                c,
+                bytes(b"ffi.lease.cancel"),
+                bytes(b"cancelled"),
+                5_000,
+                0,
+                0,
+                0,
+                op,
+            )
+        };
+
+        let gate = aster_transport_ffi::coordination::test_hooks::arm(w1);
+        let mut op = 0;
+        assert_eq!(acquire(w1, &mut op), OK);
+        if !gate.wait_reached(Duration::from_secs(20)) {
+            let ev = finish(rt, op);
+            panic!(
+                "acquire did not reach the gate: kind {} {}",
+                ev.kind(),
+                ev.text()
+            );
+        }
+        cancel_at_gate(rt, op, &gate);
+
+        // Unreturned, the granted lease must stop renewing and lapse by TTL.
+        std::thread::sleep(Duration::from_millis(8_000));
+        assert_eq!(acquire(w2, &mut op), OK);
+        let ev = finish(rt, op).expect(E_LEASE);
+        assert_ne!(ev.ev.handle, 0, "the cancelled holder still renews");
+        assert_eq!(aster_coordination_lease_free(rt, ev.ev.handle), OK);
+        for c in [w1, w2, root] {
+            assert_eq!(aster_coordination_client_free(rt, c), OK);
+        }
+    }
+}
+
 #[test]
 fn nothing_new_starts_after_close_even_with_a_take_pending() {
     unsafe {
