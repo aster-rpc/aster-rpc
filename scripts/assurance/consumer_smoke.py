@@ -17,9 +17,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 
-PYTHON_APP = r'''import asyncio, importlib.metadata as md, json, os, sys, time
+PYTHON_APP = r'''import asyncio, hashlib, importlib.metadata as md, json, os, sys, time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -34,6 +35,8 @@ for label, mod in (("aster", aster), ("native", native)):
     if root not in p.parents:
         raise AssertionError(f"{label} import escaped clean consumer: {p}")
 expected_version = os.environ["ASTER_SMOKE_VERSION"]
+native_hash = hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest()
+assert native_hash == os.environ["ASTER_SMOKE_PY_NATIVE_SHA256"], "installed native module differs from candidate wheel"
 if aster.VERSION != expected_version:
     raise AssertionError(f"unexpected aster.VERSION={aster.VERSION!r}; expected {expected_version!r}")
 distribution_version = md.version("aster-rpc")
@@ -41,7 +44,7 @@ if distribution_version != expected_version:
     raise AssertionError(f"unexpected aster-rpc distribution version {distribution_version!r}")
 print(json.dumps({"phase":"python_metadata", "version":aster.VERSION,
     "distribution":distribution_version, "module":str(Path(aster.__file__).resolve()),
-    "native":str(Path(native.__file__).resolve()), "python":sys.version}, sort_keys=True), flush=True)
+    "native":str(Path(native.__file__).resolve()), "native_sha256":native_hash, "python":sys.version}, sort_keys=True), flush=True)
 
 @wire_type("assurance.clean/Request")
 @dataclass
@@ -222,6 +225,7 @@ def arg_artifact(parser: argparse.ArgumentParser, name: str, help_text: str) -> 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--checkout-root", type=Path, help="source checkout to exclude; required when this harness is copied outside the checkout")
     ap.add_argument("--python", action="store_true", help="Run isolated Python wheel consumer")
     ap.add_argument("--typescript", action="store_true", help="Run isolated npm tarball consumer")
     ap.add_argument("--version", default="0.3.705", help="Exact expected package version (default: 0.3.705)")
@@ -251,7 +255,12 @@ def main() -> None:
             raise SystemExit(f"SHA-256 mismatch for {name}: {actual} != {expected}")
         artifacts[name] = (path, actual)
 
-    repo = Path(__file__).resolve().parents[2]
+    if a.checkout_root is not None:
+        repo = a.checkout_root.resolve(strict=True)
+    else:
+        repo = next((p for p in Path(__file__).resolve().parents if (p / ".git").exists()), None)
+        if repo is None:
+            ap.error("relocated harness requires --checkout-root")
     work = Path(tempfile.mkdtemp(prefix="aster-clean-consumer-", dir=os.environ.get("TMPDIR", "/tmp"))).resolve()
     if work == repo or repo in work.parents or work in repo.parents:
         raise SystemExit(f"temporary consumer must be isolated from checkout: {work}")
@@ -271,6 +280,11 @@ def main() -> None:
         run([sys.executable,"-m","venv",str(venv)],cwd=pdir,env=env,log_path=work/"python-venv.log")
         py=venv/"bin"/"python"
         wheel=artifacts["wheel"][0]
+        with zipfile.ZipFile(wheel) as archive:
+            members=[name for name in archive.namelist() if name.startswith("aster/_aster.") and name.endswith(".so")]
+            if len(members) != 1:
+                raise SystemExit(f"expected exactly one Linux native module in wheel: {members}")
+            env["ASTER_SMOKE_PY_NATIVE_SHA256"] = hashlib.sha256(archive.read(members[0])).hexdigest()
         run([str(py),"-m","pip","install",str(wheel)],cwd=pdir,env=env,log_path=work/"python-install.log")
         run([str(py),"consumer.py"],cwd=pdir,env=env,log_path=work/"python-smoke.log")
 
