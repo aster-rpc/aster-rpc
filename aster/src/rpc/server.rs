@@ -41,7 +41,10 @@ use super::codec::{
 };
 use super::deadline::DeadlineQueue;
 use super::dynamic::DynamicService;
-use super::foreign::{DispatchEvent, DispatchSink, Foreign, ForeignService, ForeignSession};
+use super::foreign::{
+    DispatchAdmission, DispatchEvent, DispatchPermit, DispatchSendError, DispatchSink, Foreign,
+    ForeignService, ForeignSession,
+};
 use super::observe::{CallInfo, CallObs, ConnObs, Telemetry};
 use super::sessions::{
     check_shared, missing_session, ServiceKey, SessionFactory, SessionInstance, SessionStore,
@@ -359,7 +362,7 @@ impl Server {
         // silently kept the 16 MiB default.
         let probe: Arc<dyn ServiceDispatch> = Arc::new(factory());
         let factory: SessionFactory =
-            Arc::new(move || SessionInstance::Native(Arc::new(factory())));
+            Arc::new(move || Ok(SessionInstance::Native(Arc::new(factory()))));
         let key = (probe.name().to_string(), probe.version());
         self.session_probes.insert(key.clone(), probe);
         self.session_factories.insert(key, factory);
@@ -517,11 +520,7 @@ impl Server {
                         if dispatcher.foreign.has_sink {
                             dispatcher
                                 .foreign
-                                .sink
-                                .deliver(DispatchEvent::ConnectionClosed {
-                                    connection_id,
-                                    peer_id: Arc::from(peer_id),
-                                });
+                                .connection_closed(connection_id, Arc::from(peer_id));
                         }
                     }
                 }
@@ -539,10 +538,35 @@ impl Server {
                     Some(handler) => handler(Connection::new(core)),
                     // Unclaimed, but a binding is listening: its handlers
                     // (e.g. frozen consumer admission) take it.
-                    None if foreign.has_sink => foreign.sink.deliver(DispatchEvent::NonRpc {
-                        alpn,
-                        connection: core,
-                    }),
+                    None if foreign.has_sink => {
+                        if let Some(permit) = foreign.sink.try_admit(DispatchAdmission::NonRpc) {
+                            match foreign.sink.deliver_admitted(
+                                DispatchEvent::NonRpc {
+                                    alpn,
+                                    connection: core,
+                                },
+                                permit,
+                            ) {
+                                Ok(()) => {}
+                                Err(DispatchSendError::Closed((event, permit))) => {
+                                    drop(event);
+                                    drop(permit);
+                                }
+                                Err(DispatchSendError::Full((event, permit))) => {
+                                    tracing::error!(target: SERVER, "admitted non-RPC dispatch event quota exhausted");
+                                    drop(event);
+                                    drop(permit);
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                target: SERVER,
+                                alpn = %String::from_utf8_lossy(&alpn),
+                                "foreign dispatch admission full; connection dropped"
+                            );
+                            drop(core);
+                        }
+                    }
                     // No handler for this ALPN: drop `core`, which closes the
                     // connection. The peer observes a closed connection.
                     None => {
@@ -748,6 +772,27 @@ impl Dispatcher {
             ));
         }
 
+        // Reserve the call and its connection before a session factory can
+        // mutate the session store. Overload is therefore pre-start: no
+        // session id is cached and no foreign factory side effect occurs.
+        let call_admission = if foreign.is_some() {
+            let Some(permit) = self.foreign.sink.try_admit(DispatchAdmission::Call) else {
+                return Route::Reject(RpcStatus::error(
+                    StatusCode::ResourceExhausted,
+                    "foreign dispatch admission limit reached",
+                ));
+            };
+            if !self.foreign.ensure_connection_admitted(parts.connection_id) {
+                return Route::Reject(RpcStatus::error(
+                    StatusCode::ResourceExhausted,
+                    "foreign dispatch admission limit reached",
+                ));
+            }
+            Some(permit)
+        } else {
+            None
+        };
+
         let target = match factory {
             // SHARED service: one instance for everyone, and no session id.
             None => match check_shared(&header.service, header.session_id) {
@@ -782,11 +827,15 @@ impl Dispatcher {
                     Some(sid) if self.authenticator.is_some() => {
                         Target::HttpSession { factory, sid }
                     }
-                    Some(sid) => target_of(
-                        self.sessions
-                            .resolve_http(&parts.peer_id, &key, &sid, &factory),
-                        &foreign,
-                    ),
+                    Some(sid) => {
+                        match self
+                            .sessions
+                            .resolve_http(&parts.peer_id, &key, &sid, &factory)
+                        {
+                            Ok(instance) => target_of(instance, &foreign),
+                            Err(error) => return Route::Reject(error.status()),
+                        }
+                    }
                 },
             },
         };
@@ -812,6 +861,7 @@ impl Dispatcher {
             target,
             attributes: HashMap::new(),
             deadline,
+            call_admission,
         };
         if self.authenticator.is_some() {
             return Route::Authenticate(routed);
@@ -984,11 +1034,11 @@ impl Dispatcher {
         }
         gate3(&*routed.meta, &routed.header, &attrs)?;
         if let Target::HttpSession { factory, sid } = &routed.target {
-            routed.target = target_of(
-                self.sessions
-                    .resolve_http(&parts.peer_id, &routed.key, sid, factory),
-                &routed.foreign,
-            );
+            let instance = self
+                .sessions
+                .resolve_http(&parts.peer_id, &routed.key, sid, factory)
+                .map_err(|error| error.status())?;
+            routed.target = target_of(instance, &routed.foreign);
         }
         routed.attributes = attrs;
         Ok(routed)
@@ -1006,6 +1056,7 @@ impl Dispatcher {
             target,
             attributes,
             deadline,
+            call_admission,
             ..
         } = routed;
         let (svc, session) = match target {
@@ -1022,6 +1073,7 @@ impl Dispatcher {
                 deadline,
                 parts,
                 obs,
+                call_admission: call_admission.expect("foreign route admission"),
             },
             &self.deadlines,
         );
@@ -1260,6 +1312,7 @@ pub struct Routed {
     target: Target,
     attributes: HashMap<String, String>,
     deadline: Option<Instant>,
+    call_admission: Option<DispatchPermit>,
 }
 
 impl Routed {

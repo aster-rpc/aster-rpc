@@ -20,8 +20,8 @@
 //!
 //! | `delivery` | How events reach JS |
 //! |---|---|
-//! | `"tsfn-batched"` (default) | Rust queues events and schedules one TSFN call while none is pending, so events that arrive while JS is busy are coalesced into one batch |
-//! | `"tsfn"` | one `napi_call_threadsafe_function` per event |
+//! | `"tsfn-batched"` (default) | Events enter a bounded ring; one unit TSFN notification drains the ready batch |
+//! | `"tsfn"` | compatibility alias for the same bounded, coalesced TSFN delivery |
 //! | `"ring"` | `RingSink` (SPSC ring + pump); JS pulls with `await nextBatch()` or sync `pollBatch()` |
 //!
 //! Call handles are detached (`CallHandle::detach`) as the event is handed
@@ -39,7 +39,8 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 
 use aster::binding_support::dispatch::{
-    CallTable, CancelReason, DispatchEvent, DispatchSink, RingConsumer, RingSink, SubmitError,
+    CallTable, CancelReason, DispatchAdmission, DispatchEvent, DispatchHandoff, DispatchPermit,
+    DispatchSendError, DispatchSink, RingConsumer, RingNotifier, RingSink, SubmitError,
 };
 use aster::rpc::{
     AsterServer, AttributeStore, AuthContext, AuthOutcome, Authenticator, DynamicService,
@@ -351,7 +352,34 @@ impl Shared {
 }
 
 /// A batch of events, converted to a `DispatchEvent[]` on the JS thread.
-pub struct EvBatch(Vec<Ev>);
+/// Admission permits stay alive until N-API has converted the batch.
+pub struct EvBatch {
+    events: Vec<Ev>,
+    handoffs: Vec<DispatchHandoff>,
+    table: Option<CallTable>,
+    shared: Option<Arc<Shared>>,
+}
+
+impl EvBatch {
+    fn empty() -> Self {
+        Self {
+            events: Vec::new(),
+            handoffs: Vec::new(),
+            table: None,
+            shared: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn with_cleanup(mut self, table: CallTable, shared: Arc<Shared>) -> Self {
+        self.table = Some(table);
+        self.shared = Some(shared);
+        self
+    }
+}
 
 impl TypeName for EvBatch {
     fn type_name() -> &'static str {
@@ -364,70 +392,168 @@ impl TypeName for EvBatch {
 
 impl ToNapiValue for EvBatch {
     unsafe fn to_napi_value(env: sys::napi_env, val: Self) -> Result<sys::napi_value> {
-        let js: Vec<JsDispatchEvent> = val.0.into_iter().map(Ev::into_js).collect();
-        unsafe { Vec::<JsDispatchEvent>::to_napi_value(env, js) }
+        let EvBatch {
+            events,
+            handoffs,
+            table,
+            shared,
+        } = val;
+        let lost_calls: Vec<_> = events
+            .iter()
+            .filter(|ev| ev.kind == EVENT_CALL)
+            .map(|ev| ev.call_id)
+            .collect();
+        let lost_non_rpc: Vec<_> = events
+            .iter()
+            .filter(|ev| ev.kind == EVENT_NON_RPC)
+            .map(|ev| ev.connection_id)
+            .collect();
+        let js: Vec<JsDispatchEvent> = events.into_iter().map(Ev::into_js).collect();
+        let result = unsafe { Vec::<JsDispatchEvent>::to_napi_value(env, js) };
+        if result.is_err() {
+            if let Some(table) = table {
+                for call_id in lost_calls {
+                    let _ = table.abandon(call_id);
+                }
+            }
+            if let Some(shared) = shared {
+                let mut non_rpc = shared.non_rpc.lock().unwrap();
+                for connection_id in lost_non_rpc {
+                    non_rpc.remove(&connection_id);
+                }
+            }
+        }
+        drop(handoffs);
+        result
     }
 }
 
 // ── TSFN sink (tsfn, tsfn-batched) ──────────────────────────────────────────
 
-/// `Some(ev)`: deliver exactly that event (`tsfn`). `None`: drain the shared
-/// queue (`tsfn-batched`).
-type Tsfn = ThreadsafeFunction<Option<Ev>, Unknown<'static>, EvBatch, Status, false>;
+/// A TSFN call is only a bounded notification; events stay in the ring.
+/// Two waiting slots let an event arriving during a callback queue its
+/// successor without carrying any event payload.
+type Tsfn = ThreadsafeFunction<(), Unknown<'static>, EvBatch, Status, false, true, 2>;
+
+struct TsfnQueue {
+    sink: Arc<RingSink>,
+    consumer: Mutex<RingConsumer>,
+}
 
 struct TsfnSink {
     tsfn: Mutex<Option<Arc<Tsfn>>>,
-    batched: bool,
     shared: Arc<Shared>,
-    /// Batched: events waiting for the scheduled TSFN call.
-    queue: Arc<Mutex<Vec<Ev>>>,
-    /// Batched: a TSFN call is queued and has not started draining yet.
+    /// Initialized on the runtime thread before the sink is registered.
+    queue: Arc<OnceLock<TsfnQueue>>,
+    /// A drain notification is queued or being handled.
     scheduled: Arc<AtomicBool>,
+    failed: AtomicBool,
     /// For abandoning calls whose event cannot reach JS any more.
-    table: OnceLock<CallTable>,
+    table: Arc<OnceLock<CallTable>>,
     /// Diagnostics: TSFN calls queued, callbacks run, failed calls, and the
     /// last failure's `napi_status`.
     stats: Arc<TsfnStats>,
     /// Batched: signalled once per scheduled drain call; wakes the watchdog.
     scheduled_wake: Arc<tokio::sync::Notify>,
+    /// Cancels the pump-readiness forwarder when the server closes.
+    close_wake: Arc<tokio::sync::Notify>,
 }
 
-/// How long a scheduled batched drain call may sit unrun before the
+/// How long a scheduled drain call may sit unrun before the
 /// watchdog queues another one.
 const TSFN_WATCHDOG: Duration = Duration::from_millis(2);
+const TSFN_WATCHDOG_MAX: Duration = Duration::from_millis(250);
+const TSFN_WATCHDOG_RESCUE_LIMIT: u32 = 128;
 
-/// Batched-delivery watchdog. Bun (1.2.15) sometimes leaves a queued TSFN
+/// TSFN watchdog. Bun (1.2.15) sometimes leaves a queued TSFN
 /// call unrun until the *next* call on the same TSFN arrives (a lost wakeup
 /// when a call is queued while the JS thread is inside that TSFN's
-/// callback). Per-event delivery never notices -- the next event is that
-/// next call -- but batched delivery makes exactly one call per batch, so
-/// the stranded call would stall every later event for good. The watchdog
-/// re-queues a drain call when one has been outstanding for
-/// [`TSFN_WATCHDOG`] with no callback run. Idle cost: none (it parks on a
-/// `Notify`); under load at most one timer per watchdog period.
+/// callback). The watchdog re-queues a drain notification when one remains
+/// outstanding without a callback run. Retries back off from 2 ms to 250 ms
+/// and stop on sink close or after 128 failed rescues (about 30 seconds at
+/// the maximum delay). The task parks on a Notify while idle.
 async fn tsfn_watchdog(sink: std::sync::Weak<TsfnSink>, wake: Arc<tokio::sync::Notify>) {
     loop {
         wake.notified().await;
+        let mut delay = TSFN_WATCHDOG;
+        let mut rescues = 0;
         loop {
             let Some(s) = sink.upgrade() else { return };
-            let before = s.stats.callbacks.load(Ordering::Acquire);
-            drop(s);
-            tokio::time::sleep(TSFN_WATCHDOG).await;
-            let Some(s) = sink.upgrade() else { return };
-            if s.tsfn.lock().unwrap().is_none() {
+            if s.failed.load(Ordering::Acquire) || s.tsfn.lock().unwrap().is_none() {
                 return;
             }
             if !s.scheduled.load(Ordering::Acquire) {
                 break;
             }
-            if s.stats.callbacks.load(Ordering::Acquire) == before {
-                let Some(tsfn) = s.tsfn.lock().unwrap().clone() else {
-                    return;
-                };
-                s.stats.calls.fetch_add(1, Ordering::Relaxed);
-                s.stats.rescues.fetch_add(1, Ordering::Relaxed);
-                let _ = tsfn.call(None, ThreadsafeFunctionCallMode::NonBlocking);
+            let before = s.stats.callbacks.load(Ordering::Acquire);
+            drop(s);
+            tokio::time::sleep(delay).await;
+            let Some(s) = sink.upgrade() else { return };
+            if s.failed.load(Ordering::Acquire) || s.tsfn.lock().unwrap().is_none() {
+                return;
             }
+            if !s.scheduled.load(Ordering::Acquire) {
+                break;
+            }
+            if s.stats.callbacks.load(Ordering::Acquire) != before {
+                delay = TSFN_WATCHDOG;
+                rescues = 0;
+                continue;
+            }
+            let Some(tsfn) = s.tsfn.lock().unwrap().clone() else {
+                return;
+            };
+            s.stats.calls.fetch_add(1, Ordering::Relaxed);
+            s.stats.rescues.fetch_add(1, Ordering::Relaxed);
+            let status = tsfn.call((), ThreadsafeFunctionCallMode::NonBlocking);
+            if status != Status::Ok && status != Status::QueueFull {
+                s.stats.failed(status);
+                s.failed.store(true, Ordering::Release);
+                s.scheduled.store(false, Ordering::Release);
+                s.tsfn.lock().unwrap().take();
+                s.close_wake.notify_one();
+                s.discard_queued();
+                return;
+            }
+            rescues += 1;
+            if rescues >= TSFN_WATCHDOG_RESCUE_LIMIT {
+                s.stats.failed(Status::GenericFailure);
+                s.failed.store(true, Ordering::Release);
+                s.scheduled.store(false, Ordering::Release);
+                s.tsfn.lock().unwrap().take();
+                s.discard_queued();
+                return;
+            }
+            delay = (delay * 2).min(TSFN_WATCHDOG_MAX);
+        }
+    }
+}
+
+/// Forward pump readiness to the JS callback scheduler. The ring's staging
+/// channel is intentionally invisible here: `ready()` resolves only after
+/// the pump has moved an event into the consumer ring.
+async fn tsfn_ready_forwarder(
+    sink: std::sync::Weak<TsfnSink>,
+    notifier: RingNotifier,
+    close: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        let Some(s) = sink.upgrade() else { return };
+        if s.failed.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            ready = notifier.ready() => {
+                if !ready {
+                    return;
+                }
+                let Some(s) = sink.upgrade() else { return };
+                if s.failed.load(Ordering::Acquire) {
+                    return;
+                }
+                s.notify();
+            }
+            _ = close.notified() => return,
         }
     }
 }
@@ -467,53 +593,119 @@ impl TsfnSink {
             _ => {}
         }
     }
-}
 
-impl DispatchSink for TsfnSink {
-    fn deliver(&self, event: DispatchEvent) {
-        let Some(ev) = self.shared.convert(event) else {
+    fn discard_queued(&self) {
+        let Some(queue) = self.queue.get() else {
             return;
         };
-        let tsfn = self.tsfn.lock().unwrap().clone();
-        let Some(tsfn) = tsfn else {
-            self.lost(&ev);
-            return;
-        };
-        if !self.batched {
-            let kind = ev.kind;
-            let id = if kind == EVENT_NON_RPC {
-                ev.connection_id
-            } else {
-                ev.call_id
-            };
-            self.stats.calls.fetch_add(1, Ordering::Relaxed);
-            let status = tsfn.call(Some(ev), ThreadsafeFunctionCallMode::NonBlocking);
-            if status != Status::Ok {
-                self.stats.failed(status);
-                let mut lost = Ev::simple(kind);
-                lost.call_id = id;
-                lost.connection_id = id;
-                self.lost(&lost);
-            }
-            return;
-        }
-        self.queue.lock().unwrap().push(ev);
+        queue
+            .consumer
+            .lock()
+            .unwrap()
+            .drain_admitted(usize::MAX, |event, handoff| {
+                if let Some(ev) = self.shared.convert(event) {
+                    self.lost(&ev);
+                }
+                drop(handoff);
+            });
+    }
+
+    fn notify(&self) {
         if self.scheduled.swap(true, Ordering::AcqRel) {
             return;
         }
+        let Some(tsfn) = self.tsfn.lock().unwrap().clone() else {
+            self.failed.store(true, Ordering::Release);
+            self.scheduled.store(false, Ordering::Release);
+            self.close_wake.notify_one();
+            self.discard_queued();
+            return;
+        };
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
-        let status = tsfn.call(None, ThreadsafeFunctionCallMode::NonBlocking);
-        if status == Status::Ok {
+        let status = tsfn.call((), ThreadsafeFunctionCallMode::NonBlocking);
+        if status == Status::Ok || status == Status::QueueFull {
+            // QueueFull means an earlier wake is already queued. It can still
+            // be stranded by a runtime lost-wakeup, so arm the watchdog too.
             self.scheduled_wake.notify_one();
         } else {
             self.stats.failed(status);
-            // Nothing will drain the queue: answer its calls, and clear the
-            // flag so the next event schedules again.
-            let lost: Vec<Ev> = std::mem::take(&mut *self.queue.lock().unwrap());
+            self.failed.store(true, Ordering::Release);
             self.scheduled.store(false, Ordering::Release);
-            for ev in &lost {
-                self.lost(ev);
+            self.tsfn.lock().unwrap().take();
+            self.close_wake.notify_one();
+            self.discard_queued();
+        }
+    }
+}
+
+impl DispatchSink for TsfnSink {
+    fn try_admit(&self, kind: DispatchAdmission) -> Option<DispatchPermit> {
+        if self.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.queue.get()?.sink.try_admit(kind)
+    }
+
+    fn deliver(
+        &self,
+        event: DispatchEvent,
+    ) -> std::result::Result<(), DispatchSendError<DispatchEvent>> {
+        if self.failed.load(Ordering::Acquire) {
+            if let Some(ev) = self.shared.convert(event) {
+                self.lost(&ev);
             }
+            return Ok(());
+        }
+        let Some(queue) = self.queue.get() else {
+            if let Some(ev) = self.shared.convert(event) {
+                self.lost(&ev);
+            }
+            return Ok(());
+        };
+        match queue.sink.deliver(event) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn deliver_for(
+        &self,
+        event: DispatchEvent,
+        permit: &DispatchPermit,
+    ) -> std::result::Result<(), DispatchSendError<DispatchEvent>> {
+        if self.failed.load(Ordering::Acquire) {
+            if let Some(ev) = self.shared.convert(event) {
+                self.lost(&ev);
+            }
+            return Ok(());
+        }
+        let Some(queue) = self.queue.get() else {
+            return Err(DispatchSendError::Closed(event));
+        };
+        match queue.sink.deliver_for(event, permit) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn deliver_admitted(
+        &self,
+        event: DispatchEvent,
+        permit: DispatchPermit,
+    ) -> std::result::Result<(), DispatchSendError<(DispatchEvent, DispatchPermit)>> {
+        if self.failed.load(Ordering::Acquire) {
+            if let Some(ev) = self.shared.convert(event) {
+                self.lost(&ev);
+            }
+            drop(permit);
+            return Ok(());
+        }
+        let Some(queue) = self.queue.get() else {
+            return Err(DispatchSendError::Closed((event, permit)));
+        };
+        match queue.sink.deliver_admitted(event, permit) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 }
@@ -528,10 +720,11 @@ struct Ring {
 }
 
 impl Ring {
-    fn drain_into(shared: &Shared, consumer: &mut RingConsumer, max: usize, out: &mut Vec<Ev>) {
-        consumer.drain(max, |ev| {
+    fn drain_into(shared: &Shared, consumer: &mut RingConsumer, max: usize, out: &mut EvBatch) {
+        consumer.drain_admitted(max, |ev, handoff| {
             if let Some(ev) = shared.convert(ev) {
-                out.push(ev);
+                out.events.push(ev);
+                out.handoffs.push(handoff);
             }
         });
     }
@@ -561,12 +754,16 @@ impl Authenticator for GateAttributes {
 #[napi(object)]
 #[derive(Default)]
 pub struct DispatchServerOptions {
-    /// `"tsfn-batched"` (default; TSFN, coalesced while JS is busy),
-    /// `"tsfn"` (one TSFN call per event) or `"ring"` (pull with
+    /// `"tsfn-batched"` (default; bounded ring with coalesced TSFN notification),
+    /// `"tsfn"` (compatibility alias) or `"ring"` (pull with
     /// `nextBatch` / `pollBatch`; no `onEvents`).
     pub delivery: Option<String>,
-    /// Ring capacity in events (`"ring"` only; default 4096).
+    /// Dispatch ring capacity in events (default 4096; minimum 16). Applies
+    /// to both TSFN and ring delivery.
     pub ring_capacity: Option<u32>,
+    /// Per-kind maximum for admitted foreign calls, sessions, RPC
+    /// connections, and non-RPC connections (default 4096; minimum 1).
+    pub max_foreign_inflight: Option<u32>,
     /// Serve the baseline `aster.ops.NodeInfo` service (default true).
     pub builtin_node_info: Option<bool>,
     /// Serve the baseline `aster.net.Topology` service (default false).
@@ -642,6 +839,7 @@ struct Sinks {
     tsfn_sink: Option<Arc<TsfnSink>>,
     shared: Arc<Shared>,
     ring_cap: usize,
+    max_inflight: usize,
 }
 
 impl Sinks {
@@ -656,35 +854,55 @@ impl Sinks {
                 let f = on_events.ok_or_else(|| {
                     Error::from_reason(format!("delivery \"{delivery}\" needs onEvents"))
                 })?;
-                let queue: Arc<Mutex<Vec<Ev>>> = Arc::new(Mutex::new(Vec::new()));
+                let queue = Arc::new(OnceLock::<TsfnQueue>::new());
                 let scheduled = Arc::new(AtomicBool::new(false));
                 let stats = Arc::new(TsfnStats::default());
-                let (q, s, st) = (queue.clone(), scheduled.clone(), stats.clone());
+                let table = Arc::new(OnceLock::new());
+                let (q, s, st, sh, t) = (
+                    queue.clone(),
+                    scheduled.clone(),
+                    stats.clone(),
+                    shared.clone(),
+                    table.clone(),
+                );
                 let tsfn: Tsfn = f
-                    .build_threadsafe_function::<Option<Ev>>()
+                    .build_threadsafe_function::<()>()
                     .callee_handled::<false>()
-                    .build_callback(move |ctx| {
+                    .weak::<true>()
+                    .max_queue_size::<2>()
+                    .build_callback(move |_ctx| {
                         st.callbacks.fetch_add(1, Ordering::Relaxed);
-                        Ok(match ctx.value {
-                            Some(ev) => EvBatch(vec![ev]),
-                            None => {
-                                // Clear the flag before draining: an event
-                                // pushed after this point schedules a new
-                                // call instead of being stranded.
-                                s.store(false, Ordering::Release);
-                                EvBatch(std::mem::take(&mut *q.lock().unwrap()))
-                            }
-                        })
+                        // Clear before draining. An event arriving afterward
+                        // either lands in this drain or schedules the next wake.
+                        s.store(false, Ordering::Release);
+                        let Some(queue) = q.get() else {
+                            return Ok(EvBatch::empty());
+                        };
+                        let Some(table) = t.get().cloned() else {
+                            return Ok(EvBatch::empty());
+                        };
+                        let mut batch = EvBatch::empty().with_cleanup(table, sh.clone());
+                        queue.consumer.lock().unwrap().drain_admitted(
+                            usize::MAX,
+                            |event, handoff| {
+                                if let Some(ev) = sh.convert(event) {
+                                    batch.events.push(ev);
+                                    batch.handoffs.push(handoff);
+                                }
+                            },
+                        );
+                        Ok(batch)
                     })?;
                 Some(Arc::new(TsfnSink {
                     tsfn: Mutex::new(Some(Arc::new(tsfn))),
-                    batched: delivery == "tsfn-batched",
                     shared: shared.clone(),
                     queue,
                     scheduled,
-                    table: OnceLock::new(),
+                    failed: AtomicBool::new(false),
+                    table,
                     stats,
                     scheduled_wake: Arc::new(tokio::sync::Notify::new()),
+                    close_wake: Arc::new(tokio::sync::Notify::new()),
                 }))
             }
             "ring" => None,
@@ -698,6 +916,7 @@ impl Sinks {
             tsfn_sink,
             shared,
             ring_cap: options.ring_capacity.unwrap_or(4096).max(16) as usize,
+            max_inflight: options.max_foreign_inflight.unwrap_or(4096).max(1) as usize,
         })
     }
 
@@ -705,13 +924,22 @@ impl Sinks {
     fn sink(&self) -> (Arc<dyn DispatchSink>, Option<Arc<Ring>>) {
         match &self.tsfn_sink {
             Some(s) => {
-                if s.batched {
-                    tokio::spawn(tsfn_watchdog(Arc::downgrade(s), s.scheduled_wake.clone()));
-                }
+                let (sink, consumer) = RingSink::new_with_limit(self.ring_cap, self.max_inflight);
+                let notifier = consumer.notifier();
+                let _ = s.queue.set(TsfnQueue {
+                    sink,
+                    consumer: Mutex::new(consumer),
+                });
+                tokio::spawn(tsfn_watchdog(Arc::downgrade(s), s.scheduled_wake.clone()));
+                tokio::spawn(tsfn_ready_forwarder(
+                    Arc::downgrade(s),
+                    notifier,
+                    s.close_wake.clone(),
+                ));
                 (s.clone(), None)
             }
             None => {
-                let (sink, consumer) = RingSink::new(self.ring_cap);
+                let (sink, consumer) = RingSink::new_with_limit(self.ring_cap, self.max_inflight);
                 let ring = Arc::new(Ring {
                     consumer: tokio::sync::Mutex::new(consumer),
                     closed: AtomicBool::new(false),
@@ -968,8 +1196,8 @@ impl DispatchServer {
 
     /// Diagnostics: `[liveCalls, queued, flag, tsfnCalls, tsfnCallbacks,
     /// tsfnFailures, lastFailureStatus, watchdogRescues]`. TSFN: `queued` =
-    /// events waiting in the batched queue, `flag` = a batched call is
-    /// outstanding. Ring: `queued` = events in the ring (-1 while a
+    /// events waiting in the bounded TSFN ring, `flag` = a drain notification
+    /// is outstanding. Ring: `queued` = events in the ring (-1 while a
     /// `nextBatch` holds it), `flag` = the pump stopped.
     #[napi]
     pub fn debug_state(&self) -> Vec<f64> {
@@ -978,7 +1206,10 @@ impl DispatchServer {
             (Some(s), _) => {
                 let st = &s.stats;
                 out.extend([
-                    s.queue.lock().unwrap().len() as f64,
+                    s.queue
+                        .get()
+                        .and_then(|q| q.consumer.lock().ok().map(|c| c.len()))
+                        .unwrap_or(0) as f64,
                     s.scheduled.load(Ordering::Acquire) as u8 as f64,
                     st.calls.load(Ordering::Relaxed) as f64,
                     st.callbacks.load(Ordering::Relaxed) as f64,
@@ -996,14 +1227,15 @@ impl DispatchServer {
         out
     }
 
-    /// Diagnostics: queue one extra batched drain call (no-op for other
+    /// Diagnostics: queue one extra drain notification (no-op for ring
     /// deliveries).
     #[napi]
     pub fn debug_nudge(&self) {
         if let Some(s) = &self.tsfn_sink {
             if let Some(tsfn) = s.tsfn.lock().unwrap().clone() {
                 s.stats.calls.fetch_add(1, Ordering::Relaxed);
-                let _ = tsfn.call(None, ThreadsafeFunctionCallMode::NonBlocking);
+                let _ = tsfn.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                s.scheduled_wake.notify_one();
             }
         }
     }
@@ -1017,14 +1249,14 @@ impl DispatchServer {
         let ring = self.ring_ref()?;
         let max = max.unwrap_or(256).max(1) as usize;
         let mut consumer = ring.consumer.lock().await;
-        let mut out = Vec::new();
+        let mut out = EvBatch::empty().with_cleanup(self.table.clone(), self.shared.clone());
         loop {
             if ring.closed.load(Ordering::Acquire) {
-                return Ok(EvBatch(out));
+                return Ok(out);
             }
             Ring::drain_into(&self.shared, &mut consumer, max, &mut out);
             if !out.is_empty() || consumer.is_closed() {
-                return Ok(EvBatch(out));
+                return Ok(out);
             }
             let closed = ring.close_notify.notified();
             tokio::select! {
@@ -1039,7 +1271,7 @@ impl DispatchServer {
     #[napi(ts_return_type = "DispatchEvent[]")]
     pub fn poll_batch(&self, max: Option<u32>) -> Result<EvBatch> {
         let ring = self.ring_ref()?;
-        let mut out = Vec::new();
+        let mut out = EvBatch::empty().with_cleanup(self.table.clone(), self.shared.clone());
         if let Ok(mut consumer) = ring.consumer.try_lock() {
             Ring::drain_into(
                 &self.shared,
@@ -1048,7 +1280,7 @@ impl DispatchServer {
                 &mut out,
             );
         }
-        Ok(EvBatch(out))
+        Ok(out)
     }
 
     fn ring_ref(&self) -> Result<&Arc<Ring>> {
@@ -1199,10 +1431,13 @@ impl DispatchServer {
     #[napi]
     pub async fn close(&self) -> Result<()> {
         if let Some(s) = &self.tsfn_sink {
+            s.failed.store(true, Ordering::Release);
             let tsfn = s.tsfn.lock().unwrap().take();
             drop(tsfn);
+            s.discard_queued();
             // Let a parked watchdog see the closed sink and exit.
             s.scheduled_wake.notify_one();
+            s.close_wake.notify_one();
         }
         if let Some(r) = &self.ring {
             r.closed.store(true, Ordering::Release);

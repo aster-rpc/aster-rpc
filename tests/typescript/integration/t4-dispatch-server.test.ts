@@ -255,3 +255,66 @@ describe.skipIf(!hasDispatch).each(DISPATCH_DELIVERIES)('DispatchServer (%s)', (
     await other.node.close();
   });
 });
+
+describe.skipIf(!hasDispatch)('DispatchServer bounded TSFN delivery', () => {
+  it('keeps a stalled callback within its admission bound and resumes afterward', async () => {
+    let stalled = false;
+    const batchSizes: number[] = [];
+    let server: any;
+    server = await native.DispatchServer.start(
+      OFFLINE,
+      [JSON.stringify(ECHO_SERVICE)],
+      {
+        delivery: 'tsfn-batched',
+        ringCapacity: 16,
+        maxForeignInflight: 16,
+        builtinNodeInfo: false,
+      },
+      (events: DispatchEvent[]) => {
+        batchSizes.push(events.length);
+        if (!stalled) {
+          stalled = true;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+        }
+        for (const ev of events) {
+          if (ev.kind === DispatchEventKind.Call) {
+            server.respond(ev.callId, ev.request ?? Buffer.alloc(0));
+          }
+        }
+      },
+    );
+    const client = await connect(server.address);
+    try {
+      const results = await Promise.allSettled(
+        Array.from({ length: 20 }, async (_, i) => {
+          let timeout: ReturnType<typeof setTimeout>;
+          try {
+            return await Promise.race([
+              client.transport.unary('test.Echo', 'echo', Buffer.from('bounded-' + i)),
+              new Promise<never>((_, reject) => {
+                timeout = setTimeout(() => reject(new Error('dispatch timed out')), 5000);
+              }),
+            ]);
+          } finally {
+            clearTimeout(timeout!);
+          }
+        }),
+      );
+      expect(results.filter((r) => r.status === 'rejected' && String(r.reason).includes('dispatch timed out'))).toHaveLength(0);
+      expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
+      expect(stalled).toBe(true);
+      await until(() => server.liveCalls() === 0);
+      expect(batchSizes.length).toBeGreaterThan(0);
+      expect(Math.max(...batchSizes)).toBeLessThanOrEqual(16);
+      expect(server.debugState()[1]).toBe(0);
+      expect(server.debugState()[7]).toBeLessThanOrEqual(16);
+
+      const resumed = await client.transport.unary('test.Echo', 'echo', Buffer.from('resumed'));
+      expect(Buffer.from(resumed as Uint8Array).toString()).toBe('resumed');
+    } finally {
+      try { client.conn.close(0, 'done'); } catch { /* ignore */ }
+      await client.node.close();
+      await server.close();
+    }
+  });
+});

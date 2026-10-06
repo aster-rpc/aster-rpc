@@ -10,8 +10,8 @@
  *
  * | delivery | how events arrive |
  * |---|---|
- * | `tsfn-batched` (default) | Rust coalesces events while JS is busy, one threadsafe-function call per batch |
- * | `tsfn` | Rust calls a threadsafe function once per event |
+ * | `tsfn-batched` (default) | Events enter a bounded ring; one threadsafe-function notification drains the ready batch |
+ * | `tsfn` | Compatibility alias for the same bounded, coalesced TSFN delivery |
  * | `ring` / `ring-await` | SPSC ring; JS loops on `await nextBatch()` |
  * | `ring-poll` | SPSC ring; sync `pollBatch()` from `setImmediate`, parking on `nextBatch()` when empty |
  *
@@ -93,8 +93,10 @@ export interface DispatchServerTuning {
   maxSessionsPerConnection?: number;
   /** Cap on any handler in ms (Rust default 300 000; 0 = none). */
   handlerTimeoutMs?: number;
-  /** Ring capacity (ring deliveries). */
+  /** Dispatch ring capacity for TSFN and ring deliveries (default 4096, minimum 16). */
   ringCapacity?: number;
+  /** Per-kind maximum for foreign calls, sessions, RPC connections, and non-RPC connections (default 4096). */
+  maxForeignInflight?: number;
 }
 
 export interface DispatchLoopOptions extends DispatchServerTuning {
@@ -161,6 +163,7 @@ export class DispatchLoop {
       maxSessionsPerConnection: opts.maxSessionsPerConnection,
       handlerTimeoutMs: opts.handlerTimeoutMs,
       ringCapacity: opts.ringCapacity,
+      maxForeignInflight: opts.maxForeignInflight,
     };
     const tsfn = delivery === 'tsfn' || delivery === 'tsfn-batched';
     const nativeOpts = { ...common, delivery: tsfn ? delivery : 'ring' };

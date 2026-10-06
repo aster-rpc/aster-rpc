@@ -382,13 +382,13 @@ export declare class DispatchServer {
   /**
    * Diagnostics: `[liveCalls, queued, flag, tsfnCalls, tsfnCallbacks,
    * tsfnFailures, lastFailureStatus, watchdogRescues]`. TSFN: `queued` =
-   * events waiting in the batched queue, `flag` = a batched call is
-   * outstanding. Ring: `queued` = events in the ring (-1 while a
+   * events waiting in the bounded TSFN ring, `flag` = a drain notification
+   * is outstanding. Ring: `queued` = events in the ring (-1 while a
    * `nextBatch` holds it), `flag` = the pump stopped.
    */
   debugState(): Array<number>
   /**
-   * Diagnostics: queue one extra batched drain call (no-op for other
+   * Diagnostics: queue one extra drain notification (no-op for ring
    * deliveries).
    */
   debugNudge(): void
@@ -2255,13 +2255,21 @@ export interface DispatchEvent {
 /** Options for [`DispatchServer::serve`] / [`DispatchServer::start`]. */
 export interface DispatchServerOptions {
   /**
-   * `"tsfn-batched"` (default; TSFN, coalesced while JS is busy),
-   * `"tsfn"` (one TSFN call per event) or `"ring"` (pull with
+   * `"tsfn-batched"` (default; bounded ring with coalesced TSFN notification),
+   * `"tsfn"` (compatibility alias) or `"ring"` (pull with
    * `nextBatch` / `pollBatch`; no `onEvents`).
    */
   delivery?: string
-  /** Ring capacity in events (`"ring"` only; default 4096). */
+  /**
+   * Dispatch ring capacity in events (default 4096; minimum 16). Applies
+   * to both TSFN and ring delivery.
+   */
   ringCapacity?: number
+  /**
+   * Per-kind maximum for admitted foreign calls, sessions, RPC connections,
+   * and non-RPC connections (default 4096; minimum 1).
+   */
+  maxForeignInflight?: number
   /** Serve the baseline `aster.ops.NodeInfo` service (default true). */
   builtinNodeInfo?: boolean
   /** Serve the baseline `aster.net.Topology` service (default false). */

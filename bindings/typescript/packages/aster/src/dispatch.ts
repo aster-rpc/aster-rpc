@@ -150,7 +150,7 @@ export interface ServerOptions extends DispatchServerTuning {
   /** Server interceptors, run in order around every handler. */
   interceptors?: Interceptor[];
   logger?: AsterLogger;
-  /** Event delivery (default `tsfn-batched`; `ring` selectable). */
+  /** Event delivery (default `tsfn-batched`; TSFN variants use a bounded coalesced drain). */
   delivery?: DispatchDelivery;
   /**
    * Connections on non-RPC ALPNs no Rust handler claimed (e.g. the frozen
@@ -245,6 +245,7 @@ export class RpcServer {
       maxSessionsPerConnection: this.opts.maxSessionsPerConnection,
       handlerTimeoutMs: this.opts.handlerTimeoutMs,
       ringCapacity: this.opts.ringCapacity,
+      maxForeignInflight: this.opts.maxForeignInflight,
       gateAttributes: this.opts.gateAttributes?.native,
       onCall: (ev, srv) => this.onCall(ev, srv),
       onEvent: (ev, srv) => this.onEvent(ev, srv),
@@ -558,4 +559,3 @@ export class RpcServer {
     }
   }
 }
-

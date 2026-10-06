@@ -133,8 +133,13 @@ pub mod upcall;
 //   `aster_node_metrics_prometheus`, replaced by `aster_metrics_prometheus`.
 //   Behaviour on misuse: `aster_upcall_poll` refuses a tokio runtime thread.
 //   See `ffi/RENAME_MAP.md` "New in 4.6".
+// - 4.7.0 (additive): `aster_runtime_config_t.max_inflight_operations`
+//   separates operation admission from `event_queue_capacity`; saturation
+//   returns `ASTER_STATUS_OPERATION_LIMIT` (18).
+// - 4.8.0 (additive): `ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT` (5) and
+//   bounded FIFO foreign-dispatch staging behind the existing event ring.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 7;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 8;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

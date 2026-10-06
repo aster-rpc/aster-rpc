@@ -46,7 +46,7 @@ use super::server::{
     corrupt_frame_status, next_request_frame, reject_now, warn_corrupt_frame, Call, CallParts,
     NextFrame, ServiceDispatch,
 };
-use super::sessions::{ServiceKey, SessionFactory, SessionInstance};
+use super::sessions::{ServiceKey, SessionError, SessionFactory, SessionInstance};
 use super::status::StatusCode;
 use crate::log_targets::FOREIGN;
 
@@ -119,6 +119,92 @@ pub enum DispatchEvent {
     },
 }
 
+/// A live foreign entity whose eventual dispatch events must remain bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DispatchAdmission {
+    Call,
+    Session,
+    Connection,
+    NonRpc,
+}
+
+/// Opaque admission ownership returned by a [`DispatchSink`]. Bindings carry
+/// it until the entity ends; bounded sinks attach it to the final event so a
+/// replacement entity cannot be admitted before that event is consumed.
+pub struct DispatchPermit {
+    inner: Arc<DispatchPermitInner>,
+}
+
+impl Clone for DispatchPermit {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+struct DispatchPermitInner {
+    _guard: Box<dyn Send + Sync>,
+    outstanding_events: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) struct DispatchEventPermit {
+    inner: Arc<DispatchPermitInner>,
+}
+
+/// Why a nonblocking dispatch submission returned its value to the caller.
+pub enum DispatchSendError<T> {
+    /// The sink's finite queue has no available credit.
+    Full(T),
+    /// The consumer or sink has closed.
+    Closed(T),
+}
+
+impl<T> DispatchSendError<T> {
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::Full(value) | Self::Closed(value) => value,
+        }
+    }
+}
+
+impl Drop for DispatchEventPermit {
+    fn drop(&mut self) {
+        self.inner.outstanding_events.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl DispatchPermit {
+    pub(crate) fn new(guard: impl Send + Sync + 'static) -> Self {
+        Self {
+            inner: Arc::new(DispatchPermitInner {
+                _guard: Box::new(guard),
+                outstanding_events: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn unlimited() -> Self {
+        Self::new(())
+    }
+
+    pub(crate) fn event(&self) -> Option<DispatchEventPermit> {
+        self.inner
+            .outstanding_events
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                // A drain callback may reenter while its Call handoff is
+                // still owned, then queue Writable, ResponseClosed and
+                // Cancelled before that callback returns.
+                (current < 4).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| DispatchEventPermit {
+                inner: self.inner.clone(),
+            })
+    }
+}
+
 impl fmt::Debug for DispatchEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -163,7 +249,45 @@ impl fmt::Debug for DispatchEvent {
 ///
 /// [`RingSink`]: crate::binding_support::dispatch::RingSink
 pub trait DispatchSink: Send + Sync + 'static {
-    fn deliver(&self, event: DispatchEvent);
+    /// Admit one live entity without blocking. `None` means pre-start
+    /// overload; callers must not expose or cache the rejected entity.
+    fn try_admit(&self, _kind: DispatchAdmission) -> Option<DispatchPermit> {
+        Some(DispatchPermit::unlimited())
+    }
+
+    /// Queue one event without blocking. Returns the event unchanged when the
+    /// finite sink is full or closed.
+    fn deliver(&self, event: DispatchEvent) -> Result<(), DispatchSendError<DispatchEvent>>;
+
+    /// Queue a non-final event for an admitted entity. At most four events
+    /// per entity may be outstanding at once, covering a reentrant Call
+    /// handoff plus Writable, ResponseClosed, and Cancelled.
+    fn deliver_for(
+        &self,
+        event: DispatchEvent,
+        _permit: &DispatchPermit,
+    ) -> Result<(), DispatchSendError<DispatchEvent>> {
+        self.deliver(event)
+    }
+
+    /// Deliver an event that transfers the entity's final admission owner.
+    /// The default keeps existing custom sinks source-compatible.
+    fn deliver_admitted(
+        &self,
+        event: DispatchEvent,
+        permit: DispatchPermit,
+    ) -> Result<(), DispatchSendError<(DispatchEvent, DispatchPermit)>> {
+        match self.deliver(event) {
+            Ok(()) => {
+                drop(permit);
+                Ok(())
+            }
+            Err(DispatchSendError::Full(event)) => Err(DispatchSendError::Full((event, permit))),
+            Err(DispatchSendError::Closed(event)) => {
+                Err(DispatchSendError::Closed((event, permit)))
+            }
+        }
+    }
 }
 
 /// Discards every event. Used when no sink is configured, so a server
@@ -171,7 +295,9 @@ pub trait DispatchSink: Send + Sync + 'static {
 pub(crate) struct NullSink;
 
 impl DispatchSink for NullSink {
-    fn deliver(&self, _event: DispatchEvent) {}
+    fn deliver(&self, _event: DispatchEvent) -> Result<(), DispatchSendError<DispatchEvent>> {
+        Ok(())
+    }
 }
 
 /// The caller's resolved authorization attributes, as Gate 3 saw them: the
@@ -382,6 +508,21 @@ impl ServiceDispatch for ForeignService {
     }
 }
 
+fn handle_final_delivery(result: Result<(), DispatchSendError<(DispatchEvent, DispatchPermit)>>) {
+    match result {
+        Ok(()) => {}
+        Err(DispatchSendError::Closed((event, permit))) => {
+            drop(event);
+            drop(permit);
+        }
+        Err(DispatchSendError::Full((event, permit))) => {
+            tracing::error!(target: FOREIGN, "admitted final dispatch event quota exhausted");
+            drop(event);
+            drop(permit);
+        }
+    }
+}
+
 /// The Rust-side record of one foreign session. Its state lives in the
 /// binding under `key`; dropping the record (connection reaped, HTTP session
 /// ended) tells the binding with [`DispatchEvent::SessionClosed`].
@@ -389,6 +530,7 @@ pub(crate) struct ForeignSession {
     key: u64,
     announced: AtomicBool,
     sink: Arc<dyn DispatchSink>,
+    admission: Option<DispatchPermit>,
 }
 
 impl ForeignSession {
@@ -404,9 +546,14 @@ impl ForeignSession {
 
 impl Drop for ForeignSession {
     fn drop(&mut self) {
-        self.sink.deliver(DispatchEvent::SessionClosed {
-            session_key: self.key,
-        });
+        if let Some(permit) = self.admission.take() {
+            handle_final_delivery(self.sink.deliver_admitted(
+                DispatchEvent::SessionClosed {
+                    session_key: self.key,
+                },
+                permit,
+            ));
+        }
     }
 }
 
@@ -417,6 +564,7 @@ pub(crate) struct Foreign {
     factories: HashMap<ServiceKey, SessionFactory>,
     pub(crate) sink: Arc<dyn DispatchSink>,
     pub(crate) table: CallTable,
+    connections: Mutex<HashMap<u64, DispatchPermit>>,
     /// Whether a real sink was configured (connection and non-RPC events are
     /// only worth producing then).
     pub(crate) has_sink: bool,
@@ -442,11 +590,17 @@ impl Foreign {
                 let sink = sink.clone();
                 let next = next_session.clone();
                 let factory: SessionFactory = Arc::new(move || {
-                    SessionInstance::Foreign(Arc::new(ForeignSession {
+                    let permit = sink.try_admit(DispatchAdmission::Session).ok_or_else(|| {
+                        SessionError::Exhausted(
+                            "foreign dispatch admission limit reached".to_string(),
+                        )
+                    })?;
+                    Ok(SessionInstance::Foreign(Arc::new(ForeignSession {
                         key: next.fetch_add(1, Ordering::Relaxed),
                         announced: AtomicBool::new(false),
                         sink: sink.clone(),
-                    }))
+                        admission: Some(permit),
+                    })))
                 });
                 factories.insert(key.clone(), factory);
             }
@@ -457,8 +611,36 @@ impl Foreign {
             factories,
             table: CallTable::new(sink.clone()),
             sink,
+            connections: Mutex::new(HashMap::new()),
             has_sink,
         }
+    }
+
+    pub(crate) fn connection_closed(&self, connection_id: u64, peer_id: Arc<str>) {
+        if let Some(permit) = self.connections.lock().unwrap().remove(&connection_id) {
+            handle_final_delivery(self.sink.deliver_admitted(
+                DispatchEvent::ConnectionClosed {
+                    connection_id,
+                    peer_id,
+                },
+                permit,
+            ));
+        }
+    }
+
+    pub(crate) fn ensure_connection_admitted(&self, connection_id: Option<u64>) -> bool {
+        let Some(connection_id) = connection_id else {
+            return true;
+        };
+        let mut connections = self.connections.lock().unwrap();
+        if connections.contains_key(&connection_id) {
+            return true;
+        }
+        let Some(permit) = self.sink.try_admit(DispatchAdmission::Connection) else {
+            return false;
+        };
+        connections.insert(connection_id, permit);
+        true
     }
 
     pub(crate) fn service(&self, key: &ServiceKey) -> Option<&Arc<ForeignService>> {
@@ -483,6 +665,7 @@ impl Foreign {
             deadline,
             parts,
             obs,
+            call_admission,
         } = d;
         let CallParts {
             peer_id,
@@ -556,6 +739,7 @@ impl Foreign {
         let span = obs.span().clone();
         let trace_context = obs.trace_context();
         let inbound_trace = obs.inbound_trace();
+        let call_event_admission = call_admission.clone();
         let state = self.table.insert(|call_id, table| CallState {
             call_id,
             sender: response_sender,
@@ -565,6 +749,7 @@ impl Foreign {
             frames_read: AtomicU64::new(0),
             inner: Mutex::new(CallInner {
                 obs: Some(obs),
+                admission: Some(call_admission),
                 ..CallInner::default()
             }),
             header: header.clone(),
@@ -594,7 +779,7 @@ impl Foreign {
             )
         });
         drop(span);
-        self.sink.deliver(DispatchEvent::Call(ForeignCall {
+        let call_event = DispatchEvent::Call(ForeignCall {
             call_id,
             service_idx: svc.idx,
             method_idx,
@@ -614,7 +799,19 @@ impl Foreign {
             },
             trace_context,
             inbound_trace,
-        }));
+        });
+        match self.sink.deliver_for(call_event, &call_event_admission) {
+            Ok(()) => {}
+            Err(DispatchSendError::Closed(event)) => {
+                drop(event);
+                return;
+            }
+            Err(DispatchSendError::Full(event)) => {
+                tracing::error!(target: FOREIGN, call_id, "admitted dispatch event quota exhausted");
+                drop(event);
+                return;
+            }
+        }
 
         if let Some(at) = deadline {
             let mut inner = armed.inner.lock().unwrap();
@@ -657,6 +854,7 @@ pub(crate) struct Delivery {
     pub(crate) deadline: Option<Instant>,
     pub(crate) parts: CallParts,
     pub(crate) obs: CallObs,
+    pub(crate) call_admission: DispatchPermit,
 }
 
 fn unix_ms(at: Instant) -> u64 {
@@ -908,6 +1106,9 @@ struct CallInner {
     obs: Option<CallObs>,
     /// At most one capacity reservation (single producer per call).
     reservation: Option<Reservation>,
+    /// Independent live-entity budget. Moved to the final lifecycle event,
+    /// or released directly after a normal terminal response.
+    admission: Option<DispatchPermit>,
     deadline: Option<DeadlineGuard>,
     next_token: u64,
 }
@@ -927,9 +1128,40 @@ impl CallState {
         self.table.upgrade().map(|t| t.sink.clone())
     }
 
-    fn deliver(&self, event: DispatchEvent) {
+    fn deliver_for_call(&self, event: DispatchEvent) {
         if let Some(sink) = self.sink() {
-            sink.deliver(event);
+            let permit = self.inner.lock().unwrap().admission.as_ref().cloned();
+            let result = match permit {
+                Some(permit) => sink.deliver_for(event, &permit),
+                None => sink.deliver(event),
+            };
+            match result {
+                Ok(()) => {}
+                Err(DispatchSendError::Closed(event)) => drop(event),
+                Err(DispatchSendError::Full(event)) => {
+                    tracing::error!(target: FOREIGN, call_id = self.call_id, "admitted dispatch event quota exhausted");
+                    drop(event);
+                }
+            }
+        }
+    }
+
+    fn deliver_with(&self, event: DispatchEvent, permit: &DispatchPermit) {
+        if let Some(sink) = self.sink() {
+            match sink.deliver_for(event, permit) {
+                Ok(()) => {}
+                Err(DispatchSendError::Closed(event)) => drop(event),
+                Err(DispatchSendError::Full(event)) => {
+                    tracing::error!(target: FOREIGN, call_id = self.call_id, "admitted dispatch event quota exhausted");
+                    drop(event);
+                }
+            }
+        }
+    }
+
+    fn deliver_admitted(&self, event: DispatchEvent, permit: DispatchPermit) {
+        if let Some(sink) = self.sink() {
+            handle_final_delivery(sink.deliver_admitted(event, permit));
         }
     }
 
@@ -999,10 +1231,12 @@ impl CallState {
             inner.terminal = true;
             let guard = inner.deadline.take();
             let obs = inner.obs.take();
+            let admission = inner.admission.take();
             drop(inner);
             drop(guard);
             self.remove();
             self.observe_end(obs, code);
+            drop(admission);
         }
         Ok(())
     }
@@ -1012,7 +1246,7 @@ impl CallState {
     /// `cancel`. A no-op for a call that already ended; returns whether this
     /// ended it.
     fn end(&self, cancel: Option<CancelReason>, trailer: Option<&RpcStatus>) -> bool {
-        let (reservation, guard, obs) = {
+        let (reservation, guard, obs, admission) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.terminal {
                 return false;
@@ -1022,6 +1256,7 @@ impl CallState {
                 inner.reservation.take(),
                 inner.deadline.take(),
                 inner.obs.take(),
+                inner.admission.take(),
             )
         };
         drop(guard);
@@ -1063,15 +1298,37 @@ impl CallState {
         }
         self.remove();
         if had_reservation {
-            self.deliver(DispatchEvent::ResponseClosed {
-                call_id: self.call_id,
-            });
+            if cancel.is_some() {
+                if let Some(permit) = admission.as_ref() {
+                    self.deliver_with(
+                        DispatchEvent::ResponseClosed {
+                            call_id: self.call_id,
+                        },
+                        permit,
+                    );
+                }
+            } else if let Some(permit) = admission {
+                self.deliver_admitted(
+                    DispatchEvent::ResponseClosed {
+                        call_id: self.call_id,
+                    },
+                    permit,
+                );
+                return true;
+            }
         }
         if let Some(reason) = cancel {
-            self.deliver(DispatchEvent::Cancelled {
-                call_id: self.call_id,
-                reason,
-            });
+            if let Some(permit) = admission {
+                self.deliver_admitted(
+                    DispatchEvent::Cancelled {
+                        call_id: self.call_id,
+                        reason,
+                    },
+                    permit,
+                );
+            }
+        } else {
+            drop(admission);
         }
         true
     }
@@ -1254,7 +1511,7 @@ impl CallRef {
         let state = self.0.clone();
         rt.spawn(async move {
             if state.finish_reserve(token, cancel_rx, required_len).await {
-                state.deliver(DispatchEvent::ResponseWritable {
+                state.deliver_for_call(DispatchEvent::ResponseWritable {
                     call_id: state.call_id,
                 });
             }

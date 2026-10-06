@@ -433,7 +433,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 7); /* 4.7: independent event and operation bounds */
+    CHECK(ASTER_ABI_VERSION_MINOR == 8); /* 4.8: bounded foreign dispatch staging */
     CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
@@ -491,6 +491,7 @@ static void test_enum_values(void) {
     CHECK(ASTER_CANCEL_REASON_PEER == 0 && ASTER_CANCEL_REASON_DEADLINE == 1 && ASTER_CANCEL_REASON_INVALID_REQUEST == 2);
     CHECK(ASTER_METHOD_PATTERN_UNARY == 0 && ASTER_METHOD_PATTERN_BIDI_STREAM == 3);
     CHECK(ASTER_SERVER_OPTION_BUILTIN_NODE_INFO == 1 && ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS == 4);
+    CHECK(ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT == 5);
     CHECK(ASTER_DISPATCH_FLAG_FIRST_IS_END == 1 && ASTER_DISPATCH_FLAG_NEW_SESSION == 2);
     CHECK(ASTER_DISPATCH_FLAG_IROH_AUTHENTICATED == 4);
     CHECK(ASTER_DISPATCH_FLAG_HAS_METADATA == 0x100 && ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES == 0x200);

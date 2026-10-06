@@ -126,6 +126,9 @@ pub enum aster_server_option_t {
     ASTER_SERVER_OPTION_MAX_SESSIONS_PER_CONNECTION = 3,
     /// Cap on any handler's run time in ms (default 300000); 0 = no cap.
     ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS = 4,
+    /// Per-kind bound for live foreign calls, sessions, RPC connections and
+    /// transferred non-RPC connections (default 4096; at least 1).
+    ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT = 5,
 }
 
 /// `aster_dispatch_event_t.flags`: the first request frame ended the request
@@ -240,6 +243,7 @@ struct BuilderSpec {
     topology: bool,
     max_sessions: Option<usize>,
     handler_timeout: Option<Option<Duration>>,
+    max_foreign_inflight: usize,
     health: Option<HealthState>,
 }
 
@@ -457,6 +461,7 @@ pub unsafe extern "C" fn aster_server_builder_new(
             topology: false,
             max_sessions: None,
             handler_timeout: None,
+            max_foreign_inflight: aster::binding_support::dispatch::DEFAULT_MAX_FOREIGN_INFLIGHT,
             health: None,
         })),
     });
@@ -538,6 +543,7 @@ pub extern "C" fn aster_server_set_option(
     const MAX_SESSIONS: u32 =
         aster_server_option_t::ASTER_SERVER_OPTION_MAX_SESSIONS_PER_CONNECTION as u32;
     const TIMEOUT: u32 = aster_server_option_t::ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS as u32;
+    const MAX_FOREIGN: u32 = aster_server_option_t::ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT as u32;
     match key {
         NODE_INFO | TOPOLOGY if value > 1 => {
             return fail(
@@ -558,6 +564,15 @@ pub extern "C" fn aster_server_set_option(
         }
         TIMEOUT => {
             spec.handler_timeout = Some((value != 0).then(|| Duration::from_millis(value)));
+        }
+        MAX_FOREIGN => {
+            if value == 0 || value > u32::MAX as u64 {
+                return fail(
+                    aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+                    "max_foreign_inflight must be in 1..=u32::MAX",
+                );
+            }
+            spec.max_foreign_inflight = value as usize;
         }
         other => {
             return fail(
@@ -606,7 +621,7 @@ pub unsafe extern "C" fn aster_server_start(
 
     let node = aster::Node::from_core_node(spec.node);
     let attributes = AttributeStore::new();
-    let (sink, consumer) = RingSink::new_on(&rt, capacity);
+    let (sink, consumer) = RingSink::new_on_with_limit(&rt, capacity, spec.max_foreign_inflight);
     let mut server = Server::new(&node)
         .attributes(attributes.clone())
         .dispatch_sink(sink);

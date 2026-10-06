@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.7)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.8)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -36,6 +36,16 @@ field rename is source-incompatible for C callers that used the old
 operations and terminal events waiting for queue capacity are independently
 bounded by `max_inflight_operations`; saturation returns the new pre-start
 `ASTER_STATUS_OPERATION_LIMIT` (18). Wrappers surface that overload immediately.
+
+## New in 4.8 (bounded foreign dispatch staging)
+
+`ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT` (5) sets the finite per-kind limit
+for live foreign calls, sessions, RPC connections and transferred non-RPC
+connections (default 4096 each; total at most four times the configured
+value). The dispatch ring and its FIFO staging queue retain event ownership
+until polling. A saturated call pool rejects a new RPC call with
+`RESOURCE_EXHAUSTED` before session creation. `ring_capacity` continues to set
+only the SPSC ring size.
 
 ## New in 4.6 (observability and health; one removal)
 

@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 7
+#define ASTER_ABI_VERSION_MINOR 8
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -920,6 +920,12 @@ typedef enum aster_server_option_t {
    * Cap on any handler's run time in ms (default 300000); 0 = no cap.
    */
   ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS = 4,
+  /**
+   * Per-kind live foreign call/session/RPC-connection/non-RPC-connection
+   * bound (default 4096; at least 1). Call-pool exhaustion rejects a new
+   * call with RESOURCE_EXHAUSTED before session creation.
+   */
+  ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT = 5,
 } aster_server_option_t;
 
 /**

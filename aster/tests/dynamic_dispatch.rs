@@ -574,6 +574,95 @@ fn rpc_code(r: Result<Vec<u8>, Error>) -> (i32, String) {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capacity_one_ring_resumes_a_real_stalled_foreign_call() {
+    let (sink, consumer) = RingSink::new_with_limit(1, 4);
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .dispatch_sink(sink)
+        .dynamic_service(echo_service())
+        .unwrap()
+        .dynamic_service(counter_service())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let table = srv.call_table();
+    let (_client, conn) = client(&srv).await;
+    let pending = tokio::spawn(async move { conn.unary(&echo("echo"), b"stalled".to_vec()).await });
+
+    // Leave the real Call event in the capacity-one dispatch path. Starting
+    // the consumer later must release its handoff and let the handler answer.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !pending.is_finished(),
+        "call completed before its event was drained"
+    );
+    let binding = Binding::start(consumer, table, tokio::runtime::Handle::current());
+    let out = within(pending).await.unwrap().unwrap();
+    assert_eq!(out, b"stalled");
+    binding.assert_table_drains().await;
+
+    drop(binding);
+    srv.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undersized_entity_budget_rejects_before_dispatch_without_stalling() {
+    let (sink, consumer) = RingSink::new_with_limit(1, 1);
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .dispatch_sink(sink)
+        .dynamic_service(echo_service())
+        .unwrap()
+        .dynamic_service(counter_service())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let binding = Binding::start(
+        consumer,
+        srv.call_table(),
+        tokio::runtime::Handle::current(),
+    );
+    let (_client, conn) = client(&srv).await;
+    let active = conn.clone();
+    let pending = tokio::spawn(async move { active.unary(&echo("park"), vec![1]).await });
+    binding
+        .until("first call holds the call admission", |observed| {
+            observed.notes.iter().any(|note| note == "park:started")
+        })
+        .await;
+
+    // A new session id is refused by the already-full call pool before its
+    // fallible session factory runs or the id enters the session graveyard.
+    let mut rejected = within(conn.server_stream(&header("test.Counter", "count", 1), vec![1]))
+        .await
+        .unwrap();
+    let error = within(rejected.collect()).await.unwrap_err();
+    let (code, message) = rpc_code(Err(error));
+    assert_eq!(code, StatusCode::ResourceExhausted.as_i32());
+    assert!(message.contains("admission limit"));
+    assert_eq!(binding.observed().sessions_opened.len(), 0);
+
+    pending.abort();
+    let _ = pending.await;
+    binding
+        .until("first call cancellation releases admission", |observed| {
+            observed.notes.iter().any(|note| note == "park:cancelled")
+        })
+        .await;
+    let mut stream = within(conn.server_stream(&header("test.Counter", "count", 1), vec![1]))
+        .await
+        .unwrap();
+    assert_eq!(within(stream.collect()).await.unwrap().len(), 1);
+    assert_eq!(binding.observed().sessions_opened.len(), 1);
+    binding.assert_table_drains().await;
+
+    drop(binding);
+    srv.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn all_four_patterns_over_a_foreign_service() {
     let Setup { srv, binding } = start().await;
     let (_client, conn) = client(&srv).await;

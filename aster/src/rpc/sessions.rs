@@ -44,7 +44,8 @@ pub(crate) enum SessionInstance {
 }
 
 /// Builds a fresh per-session instance of a session-scoped service.
-pub(crate) type SessionFactory = Arc<dyn Fn() -> SessionInstance + Send + Sync>;
+pub(crate) type SessionFactory =
+    Arc<dyn Fn() -> Result<SessionInstance, SessionError> + Send + Sync>;
 
 /// Default cap on active sessions per connection (`max_sessions_per_connection`).
 pub const DEFAULT_MAX_SESSIONS_PER_CONNECTION: usize = 1024;
@@ -131,7 +132,7 @@ impl SessionStore {
                 self.max_per_connection
             )));
         }
-        let inst = factory();
+        let inst = factory()?;
         state.last_opened = session_id;
         state.active.insert(key, inst.clone());
         tracing::debug!(
@@ -154,29 +155,28 @@ impl SessionStore {
         service: &ServiceKey,
         session_id: &str,
         factory: &SessionFactory,
-    ) -> SessionInstance {
+    ) -> Result<SessionInstance, SessionError> {
         let key = (
             principal.to_string(),
             service.0.clone(),
             service.1,
             session_id.to_string(),
         );
-        self.http
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_insert_with(|| {
-                tracing::debug!(
-                    target: SESSION,
-                    principal,
-                    session_id,
-                    service = service.0.as_str(),
-                    version = service.1,
-                    "http session opened"
-                );
-                factory()
-            })
-            .clone()
+        let mut sessions = self.http.lock().unwrap();
+        if let Some(instance) = sessions.get(&key) {
+            return Ok(instance.clone());
+        }
+        let instance = factory()?;
+        tracing::debug!(
+            target: SESSION,
+            principal,
+            session_id,
+            service = service.0.as_str(),
+            version = service.1,
+            "http session opened"
+        );
+        sessions.insert(key, instance.clone());
+        Ok(instance)
     }
 
     /// Drop every session opened on `connection_id`, and the connection's
@@ -232,4 +232,36 @@ pub(crate) fn missing_session(service: &str) -> SessionError {
     SessionError::ScopeMismatch(format!(
         "service '{service}' is SESSION-scoped; call must carry a non-zero sessionId"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn failed_factory_does_not_cache_or_advance_session_id() {
+        let store = SessionStore::new(4);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let factory: SessionFactory = Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Err(SessionError::Exhausted("dispatch full".into()))
+        });
+        let service = ("test.Counter".to_string(), 1);
+
+        assert!(matches!(
+            store.resolve_connection(7, &service, 3, &factory),
+            Err(SessionError::Exhausted(_))
+        ));
+        assert!(matches!(
+            store.resolve_connection(7, &service, 3, &factory),
+            Err(SessionError::Exhausted(_))
+        ));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2, "retry reruns factory");
+        let connections = store.connections.lock().unwrap();
+        let state = connections.get(&7).unwrap();
+        assert_eq!(state.last_opened, 0);
+        assert!(state.active.is_empty());
+    }
 }

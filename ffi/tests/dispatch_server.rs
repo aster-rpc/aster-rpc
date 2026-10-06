@@ -1913,6 +1913,20 @@ fn builder_and_argument_validation() {
             ),
             OK
         );
+        assert_eq!(
+            opt(
+                aster_server_option_t::ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT,
+                0
+            ),
+            INVALID
+        );
+        assert_eq!(
+            opt(
+                aster_server_option_t::ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT,
+                16
+            ),
+            OK
+        );
         assert_eq!(aster_server_set_option(b, 99, 1), INVALID);
 
         // contract_id of the JSON form.
