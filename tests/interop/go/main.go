@@ -33,15 +33,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -191,6 +194,11 @@ func main() {
 		if !chainClient(svc, os.Args[2]) {
 			os.Exit(1)
 		}
+	case len(os.Args) == 3 && os.Args[1] == "campaign-client":
+		if err := campaignClient(svc, os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "campaign:", err)
+			os.Exit(1)
+		}
 	case len(os.Args) == 2 && os.Args[1] == "expose-server":
 		if err := exposeServe(); err != nil {
 			fmt.Fprintf(os.Stderr, "expose server: %v\n", err)
@@ -204,6 +212,350 @@ func main() {
 
 const chainTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
 const chainTenant = "acme catalogue"
+
+type campaignCommand struct {
+	Cmd           string   `json:"cmd"`
+	Command       string   `json:"command"`
+	Op            string   `json:"op"`
+	WindowID      string   `json:"window_id"`
+	Duration      float64  `json:"duration_s"`
+	Phase         string   `json:"phase"`
+	Expected      []string `json:"expected_errors"`
+	ExpectedFlush []string `json:"expected_flush_errors"`
+	Ticket        string   `json:"ticket"`
+	Generation    int      `json:"generation"`
+	SlowMS        int      `json:"slow_ms"`
+}
+
+type campaignStats struct {
+	mu                                                                           sync.Mutex
+	completed, unary, stream, cancel, unexpected, integrity, emitted, emitErrors uint64
+	attempted                                                                    uint64
+	hist                                                                         [27]uint64
+	errorClasses                                                                 map[string]uint64
+	errorSamples                                                                 map[string]string
+	firstSuccess, lastSuccess                                                    int64
+	active                                                                       atomic.Int32
+	high                                                                         atomic.Int32
+}
+
+func campaignError(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	var rpc *aster.RpcError
+	if errors.As(err, &rpc) {
+		switch rpc.Code {
+		case aster.StatusDeadlineExceeded:
+			return "deadline_exceeded"
+		case aster.StatusUnavailable:
+			return "unavailable"
+		case aster.StatusCancelled:
+			return "cancelled"
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "local_timeout"
+	}
+	return "local_error"
+}
+
+func campaignExpected(command campaignCommand, class string) bool {
+	if command.Phase != "fault" || (class != "unavailable" && class != "deadline_exceeded" && class != "cancelled") {
+		return false
+	}
+	for _, want := range command.Expected {
+		if want == class {
+			return true
+		}
+	}
+	return false
+}
+
+func campaignWindow(conn *aster.RpcConnection, command campaignCommand, generation int, emit bool) (map[string]any, error) {
+	stats := &campaignStats{errorClasses: make(map[string]uint64), errorSamples: make(map[string]string), firstSuccess: -1, lastSuccess: -1}
+	marker := "campaign:go:" + command.WindowID
+	data := make([]byte, 16384)
+	for i := range data {
+		data[i] = byte((i*131 + i/8) % 251)
+	}
+	jobs := make(chan uint64, 128)
+	produceCtx, stopProducer := context.WithTimeout(context.Background(), time.Duration(command.Duration*float64(time.Second)))
+	defer stopProducer()
+	started := time.Now()
+	var workers sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-produceCtx.Done():
+					return
+				case sequence := <-jobs:
+					if produceCtx.Err() != nil {
+						return
+					}
+					stats.active.Add(1)
+					callStarted := time.Now()
+					kind := sequence % 4
+					budget := 2 * time.Second
+					if kind == 3 {
+						budget = 10 * time.Second
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), budget)
+					var err error
+					bad := false
+					req := &EchoRequest{Message: "campaign", Count: 41, Data: data}
+					if kind == 3 {
+						timer := time.AfterFunc(50*time.Millisecond, cancel)
+						_, err = aster.Call[EchoRequest, EchoReply](ctx, conn, "InteropEcho", "hold", req)
+						timer.Stop()
+						if err == nil {
+							bad = true
+						}
+					} else if kind == 1 {
+						req.Count = 5
+						count := 0
+						for reply, recvErr := range aster.CallServerStream[EchoRequest, EchoReply](ctx, conn, "InteropEcho", "generate", req) {
+							if recvErr != nil {
+								err = recvErr
+								break
+							}
+							if reply.Count != int32(count) || reply.Message != req.Message || !bytes.Equal(reply.Data, data) || reply.ServerLang != "rust" {
+								bad = true
+							}
+							count++
+							if command.SlowMS > 0 {
+								time.Sleep(time.Duration(command.SlowMS) * time.Millisecond)
+							}
+						}
+						if err == nil && count != 5 {
+							bad = true
+						}
+					} else {
+						var reply *EchoReply
+						reply, err = aster.Call[EchoRequest, EchoReply](ctx, conn, "InteropEcho", "echo", req)
+						if err == nil {
+							_, checkErr := check(req, reply)
+							bad = checkErr != nil || reply.ServerLang != "rust"
+						}
+					}
+					cancel()
+					stats.active.Add(-1)
+					stats.mu.Lock()
+					stats.attempted++
+					if bad {
+						stats.integrity++
+					}
+					success := err == nil && !bad
+					if err != nil {
+						class := campaignError(err)
+						stats.errorClasses[class]++
+						sample := err.Error()
+						if len(sample) > 1024 {
+							sample = sample[:1024]
+						}
+						stats.errorSamples[class] = sample
+						if kind == 3 && class == "cancelled" {
+							success = true
+						} else if !campaignExpected(command, class) {
+							stats.unexpected++
+						}
+					}
+					if success {
+						stats.completed++
+						if kind == 3 {
+							stats.cancel++
+						} else if kind == 1 {
+							stats.stream++
+						} else {
+							stats.unary++
+						}
+						micros := max(int64(1), time.Since(callStarted).Microseconds())
+						bin := 0
+						for bin < 26 && micros > (int64(1)<<bin) {
+							bin++
+						}
+						stats.hist[bin]++
+						if kind != 3 {
+							elapsed := time.Since(started).Milliseconds()
+							if stats.firstSuccess < 0 {
+								stats.firstSuccess = elapsed
+							}
+							stats.lastSuccess = elapsed
+						}
+					}
+					stats.mu.Unlock()
+					if success && emit {
+						emitErr := aster.EmitLog(slog.LevelInfo, "app.campaign", marker, nil, nil)
+						stats.mu.Lock()
+						if emitErr != nil {
+							stats.emitErrors++
+							stats.unexpected++
+						} else {
+							stats.emitted++
+						}
+						stats.mu.Unlock()
+					}
+				}
+			}
+		}()
+	}
+	var sequence uint64
+produce:
+	for {
+		select {
+		case <-produceCtx.Done():
+			break produce
+		case jobs <- sequence:
+			sequence++
+			depth := int32(len(jobs))
+			for old := stats.high.Load(); depth > old && !stats.high.CompareAndSwap(old, depth); old = stats.high.Load() {
+			}
+		}
+	}
+	drained := make(chan struct{})
+	go func() { workers.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(4 * time.Second):
+		return nil, fmt.Errorf("campaign workers did not drain within 4 s")
+	}
+	discarded := len(jobs)
+	for len(jobs) > 0 {
+		<-jobs
+	}
+	flushErrors := 0
+	flushClass, flushMessage := "", ""
+	flushStarted := time.Now()
+	if emit {
+		if err := aster.FlushObservability(500 * time.Millisecond); err != nil {
+			flushErrors++
+			flushClass = "sdk"
+			if errors.Is(err, aster.ErrTimeout) {
+				flushClass = "timeout"
+			}
+			flushMessage = err.Error()
+			expected := false
+			if command.Phase == "fault" {
+				for _, want := range command.ExpectedFlush {
+					if want == flushClass {
+						expected = true
+					}
+				}
+			}
+			if !expected {
+				stats.unexpected++
+			}
+		}
+	}
+	return map[string]any{"phase": "campaign_window", "language": "go", "generation": generation, "duration_s": command.Duration, "elapsed_s": time.Since(started).Seconds(),
+		"log_marker": marker, "window_id": command.WindowID, "error_samples": stats.errorSamples,
+		"completed": stats.completed, "attempted": stats.attempted, "unary": stats.unary, "stream": stats.stream, "cancel": stats.cancel, "unexpected_errors": stats.unexpected, "integrity_failures": stats.integrity,
+		"active_calls": stats.active.Load(), "queue_scope": "adapter_admission", "queue_capacity": 128, "queue_high_water": stats.high.Load(), "queue_depth": len(jobs), "queue_discarded": discarded,
+		"latency_histogram": map[string]any{"unit": "us", "upper_bounds_powers_of_two": true, "counts": stats.hist}, "error_classes": stats.errorClasses,
+		"first_success_elapsed_ms": stats.firstSuccess, "last_success_elapsed_ms": stats.lastSuccess, "app_log_emitted": stats.emitted, "app_log_emit_errors": stats.emitErrors, "collector_flush_errors": flushErrors,
+		"flush_completed": emit && flushErrors == 0, "flush_elapsed_ms": time.Since(flushStarted).Milliseconds(), "flush_error_class": flushClass, "flush_error_message": flushMessage}, nil
+}
+
+func campaignClient(svc *aster.Service, ticket string) error {
+	collector := os.Getenv("ASTER_CAMPAIGN_COLLECTOR")
+	if collector != "" {
+		if err := aster.InitObservability(aster.ObservabilityConfig{ServiceName: "go-campaign", OTLPEndpoint: collector, OTLPLogs: true, NoEnv: true}); err != nil {
+			return err
+		}
+		defer aster.ShutdownObservability(2 * time.Second)
+	}
+	cl, err := aster.StartClient(context.Background(), config())
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+	ownerIdentity, err := cl.Node().NodeID()
+	if err != nil {
+		return err
+	}
+	if err := cl.RegisterService(svc); err != nil {
+		return err
+	}
+	connect := func(ticket string) (*aster.RpcConnection, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return cl.ConnectTicket(ctx, ticket)
+	}
+	conn, err := connect(ticket)
+	if err != nil {
+		return err
+	}
+	peer, err := aster.NodeAddrFromTicket(ticket)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	encode := json.NewEncoder(os.Stdout)
+	if err := encode.Encode(map[string]any{"phase": "campaign_ready", "language": "go", "pid": os.Getpid(), "owner_identity": ownerIdentity, "generation": 0, "active_calls": 0, "collector_enabled": collector != ""}); err != nil {
+		return err
+	}
+	generation := 0
+	decode := json.NewDecoder(os.Stdin)
+	for {
+		var command campaignCommand
+		if err := decode.Decode(&command); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if command.Cmd == "" {
+			command.Cmd = command.Command
+		}
+		if command.Cmd == "" {
+			command.Cmd = command.Op
+		}
+		switch command.Cmd {
+		case "baseline", "run":
+			if command.Duration <= 0 || command.Duration > 3600 || command.SlowMS < 0 || command.SlowMS > 300 || len(command.WindowID) > 128 {
+				return fmt.Errorf("invalid campaign duration/slow_ms")
+			}
+			result, err := campaignWindow(conn, command, generation, collector != "")
+			if err != nil {
+				return err
+			}
+			result["pid"], result["owner_identity"] = os.Getpid(), ownerIdentity
+			if err := encode.Encode(result); err != nil {
+				return err
+			}
+		case "pause":
+			if err := encode.Encode(map[string]any{"phase": "campaign_idle", "generation": generation, "active_calls": 0, "queue_depth": 0}); err != nil {
+				return err
+			}
+		case "replace_peer":
+			replacement, err := aster.NodeAddrFromTicket(command.Ticket)
+			if err != nil {
+				return err
+			}
+			if replacement.EndpointID == peer.EndpointID {
+				return fmt.Errorf("replace_peer requires fresh peer identity")
+			}
+			if err := conn.Close(); err != nil {
+				return err
+			}
+			if conn, err = connect(command.Ticket); err != nil {
+				return err
+			}
+			generation = command.Generation
+			peer = replacement
+			if err := encode.Encode(map[string]any{"phase": "campaign_peer", "generation": generation, "active_calls": 0}); err != nil {
+				return err
+			}
+		case "stop":
+			return encode.Encode(map[string]any{"phase": "campaign_stopped", "generation": generation, "active_calls": 0})
+		default:
+			return fmt.Errorf("unknown campaign command %q", command.Cmd)
+		}
+	}
+}
 
 func chainContext(ctx context.Context, request string, budget time.Duration) (context.Context, context.CancelFunc, error) {
 	tctx, err := aster.WithTraceContext(ctx, "00-"+chainTraceID+"-00f067aa0ba902b7-01",
@@ -224,7 +576,9 @@ func checkChainReceipt(receipt, request string, budget time.Duration) error {
 	if len(rows) != 2 {
 		return fmt.Errorf("chain receipt has %d hops: %q", len(rows), receipt)
 	}
-	previous := budget.Milliseconds() + 20 // Native deadline encoding rounds up to milliseconds.
+	// Native deadline encoding rounds up to whole seconds. The first hop can
+	// therefore observe almost one second more than the source duration.
+	previous := budget.Milliseconds() + 1020
 	for i, lang := range []string{"java", "dotnet"} {
 		fields := strings.Split(rows[i], "|")
 		if len(fields) != 5 || fields[0] != lang || fields[1] != chainTraceID || fields[2] != chainTenant || fields[3] != request {
@@ -234,7 +588,7 @@ func checkChainReceipt(receipt, request string, budget time.Duration) error {
 		if err != nil || remaining <= 0 || remaining > previous {
 			return fmt.Errorf("%s remaining deadline %q outside (0, %d] ms", lang, fields[4], previous)
 		}
-		if i == 1 && previous-remaining < 100 {
+		if i == 1 && previous-remaining < 800 {
 			return fmt.Errorf("forwarding refreshed deadline: java=%d dotnet=%d ms", previous, remaining)
 		}
 		previous = remaining
@@ -290,7 +644,7 @@ func chainClient(svc *aster.Service, ticket string) bool {
 		if err != nil {
 			return "", err
 		}
-		const budget = 1200 * time.Millisecond
+		const budget = 3 * time.Second
 		dctx, cancel, err := chainContext(ctx, "deadline", budget)
 		if err != nil {
 			return "", err

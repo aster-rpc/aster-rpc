@@ -42,12 +42,16 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.fory.BaseFory;
 import org.apache.fory.Fory;
 import site.aster.annotations.Scope;
@@ -288,7 +292,10 @@ public final class InteropEcho {
     // Consume measurable budget before forwarding. The outbound timeout is computed afterwards,
     // so the leaf receives the remaining budget rather than a fresh copy of the original timeout.
     if (!method.equals("cancelled")) {
-      Thread.sleep(150);
+      // Deadlines are encoded on the native wire in whole seconds. Consume
+      // more than one tick so the leaf receipt can prove the forwarded budget
+      // shrank despite ceiling at both hops.
+      Thread.sleep(1100);
     }
     if (ctx.isExpired()) {
       throw new RpcError(StatusCode.DEADLINE_EXCEEDED, "chain: deadline passed");
@@ -524,6 +531,251 @@ public final class InteropEcho {
       serve();
     } finally {
       chainClient = null;
+    }
+  }
+
+  static final class CampaignStats {
+    long completed, attempted, unary, stream, cancel, unexpected, integrity, emitted, emitErrors;
+    long firstSuccess = -1, lastSuccess = -1;
+    final long[] histogram = new long[27];
+    final Map<String, Long> errors = new java.util.HashMap<>();
+    final Map<String, String> errorSamples = new java.util.HashMap<>();
+    final AtomicInteger active = new AtomicInteger();
+    final AtomicInteger high = new AtomicInteger();
+  }
+
+  static String campaignError(Throwable error) {
+    while (error instanceof ExecutionException || error instanceof java.util.concurrent.CompletionException) {
+      if (error.getCause() == null) break;
+      error = error.getCause();
+    }
+    if (error instanceof CancellationException) return "cancelled";
+    if (error instanceof TimeoutException) return "local_timeout";
+    if (error instanceof RpcError rpc) {
+      if (rpc.code() == StatusCode.CANCELLED) return "cancelled";
+      if (rpc.code() == StatusCode.DEADLINE_EXCEEDED) return "deadline_exceeded";
+      if (rpc.code() == StatusCode.UNAVAILABLE) return "unavailable";
+    }
+    return "local_error";
+  }
+
+  static boolean campaignExpected(JsonNode command, String error) {
+    if (!command.path("phase").asText().equals("fault")) return false;
+    if (!List.of("unavailable", "deadline_exceeded", "cancelled").contains(error)) return false;
+    for (JsonNode expected : command.path("expected_errors")) {
+      if (expected.asText().equals(error)) return true;
+    }
+    return false;
+  }
+
+  static Map<String, Object> campaignWindow(AsterClient client, NodeAddr addr,
+      JsonNode command, int generation, boolean emit) throws Exception {
+    double duration = command.path("duration_s").asDouble();
+    int slowMs = command.path("slow_ms").asInt();
+    if (!(duration > 0 && duration <= 3600) || slowMs < 0 || slowMs > 300
+        || command.path("window_id").asText().getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 128) {
+      throw new IllegalArgumentException("invalid campaign duration/slow_ms");
+    }
+    CampaignStats stats = new CampaignStats();
+    String marker = "campaign:java:" + command.path("window_id").asText();
+    byte[] data = new byte[16384];
+    for (int i = 0; i < data.length; i++) data[i] = (byte) ((i * 131 + i / 8) % 251);
+    ArrayBlockingQueue<Long> jobs = new ArrayBlockingQueue<>(128);
+    long started = System.nanoTime();
+    long deadline = started + (long) (duration * 1e9);
+    List<Thread> workers = new ArrayList<>();
+    for (int worker = 0; worker < 4; worker++) {
+      workers.add(Thread.ofVirtual().start(() -> {
+        while (System.nanoTime() < deadline) {
+          Long sequence;
+          try { sequence = jobs.poll(20, TimeUnit.MILLISECONDS); }
+          catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+          if (sequence == null || System.nanoTime() >= deadline) continue;
+          stats.active.incrementAndGet();
+          long callStarted = System.nanoTime();
+          int kind = (int) (sequence % 4);
+          boolean bad = false, success = false;
+          Throwable failure = null;
+          CompletableFuture<?> owned = null;
+          try {
+            CallOptions options = CallOptions.DEFAULT.withTimeout(java.time.Duration.ofSeconds(kind == 3 ? 10 : 2));
+            EchoRequest request = new EchoRequest("campaign", kind == 1 ? 5 : 41, data);
+            if (kind == 3) {
+              CompletableFuture<EchoReply> call = client.call(addr, "InteropEcho", "hold", request, EchoReply.class, options);
+              owned = call;
+              Thread.sleep(50);
+              // An early transport failure must keep its original class, not become cancellation.
+              if (!call.isDone()) call.cancel(true);
+              call.get(1, TimeUnit.SECONDS);
+              bad = true;
+            } else if (kind == 1) {
+              CompletableFuture<ServerStreamCall<EchoReply>> opening = client.openServerStream(
+                  addr, "InteropEcho", "generate", request, EchoReply.class, options);
+              ServerStreamCall<EchoReply> stream;
+              try { stream = opening.get(2, TimeUnit.SECONDS); }
+              catch (Throwable error) {
+                // The opening future has no native cancellation hook. Reclaim a late result.
+                opening.whenComplete((late, failed) -> { if (late != null) late.close(); });
+                throw error;
+              }
+              try (stream) {
+                int count = 0;
+                while (true) {
+                  if (System.nanoTime() - callStarted >= 2_000_000_000L) throw new TimeoutException("stream deadline");
+                  EchoReply reply = stream.recvWithTimeout(20, TimeUnit.MILLISECONDS);
+                  if (reply == null) {
+                    if (stream.isComplete()) break;
+                    continue;
+                  }
+                  if (reply.count != count || !reply.message.equals(request.message) || !Arrays.equals(reply.data, data) || !reply.server_lang.equals("rust")) bad = true;
+                  count++;
+                  if (slowMs > 0) Thread.sleep(slowMs);
+                }
+                if (count != 5) bad = true;
+              }
+            } else {
+              CompletableFuture<EchoReply> call = client.call(addr, "InteropEcho", "echo", request, EchoReply.class, options);
+              owned = call;
+              EchoReply reply = call.get(2, TimeUnit.SECONDS);
+              bad = reply.count != 42 || !reply.message.equals(request.message) || !Arrays.equals(reply.data, data) || !reply.server_lang.equals("rust");
+            }
+            success = !bad;
+          } catch (Throwable error) {
+            failure = error;
+          } finally {
+            if (owned != null && !owned.isDone()) owned.cancel(true);
+            stats.active.decrementAndGet();
+          }
+          synchronized (stats) {
+            stats.attempted++;
+            if (bad) stats.integrity++;
+            if (failure != null) {
+              String error = campaignError(failure);
+              stats.errors.merge(error, 1L, Long::sum);
+              String sample = failure.toString();
+              stats.errorSamples.put(error, sample.substring(0, Math.min(1024, sample.length())));
+              if (kind == 3 && error.equals("cancelled")) success = true;
+              else if (!campaignExpected(command, error)) stats.unexpected++;
+            }
+            if (success) {
+              stats.completed++;
+              if (kind == 3) stats.cancel++; else if (kind == 1) stats.stream++; else stats.unary++;
+              long micros = Math.max(1, (System.nanoTime() - callStarted) / 1000);
+              int bin = 0;
+              while (bin < 26 && micros > (1L << bin)) bin++;
+              stats.histogram[bin]++;
+              if (kind != 3) {
+                long elapsed = (System.nanoTime() - started) / 1_000_000;
+                if (stats.firstSuccess < 0) stats.firstSuccess = elapsed;
+                stats.lastSuccess = elapsed;
+              }
+            }
+          }
+          if (success && emit) {
+            try {
+              site.aster.otel.LogEmit.emit(org.slf4j.event.Level.INFO, "app.campaign", marker);
+              synchronized (stats) { stats.emitted++; }
+            } catch (Throwable error) {
+              synchronized (stats) { stats.emitErrors++; stats.unexpected++; }
+            }
+          }
+        }
+      }));
+    }
+    long sequence = 0;
+    while (System.nanoTime() < deadline) {
+      if (jobs.offer(sequence, 20, TimeUnit.MILLISECONDS)) {
+        sequence++;
+        stats.high.accumulateAndGet(jobs.size(), Math::max);
+      }
+    }
+    long drainEnd = System.nanoTime() + 4_000_000_000L;
+    for (Thread worker : workers) {
+      worker.join(Math.max(1, (drainEnd - System.nanoTime()) / 1_000_000));
+      if (worker.isAlive()) throw new IllegalStateException("campaign worker did not drain within 4 s");
+    }
+    int discarded = jobs.size();
+    jobs.clear();
+    int flushErrors = 0;
+    String flushClass = "", flushMessage = "";
+    long flushStarted = System.nanoTime();
+    if (emit) {
+      try { site.aster.otel.Observability.flush(java.time.Duration.ofMillis(500)); }
+      catch (RuntimeException error) {
+        flushErrors++;
+        flushClass = error instanceof site.aster.ffi.IrohException nativeError
+            && nativeError.status() == site.aster.ffi.IrohStatus.TIMEOUT ? "timeout" : "sdk";
+        flushMessage = error.toString();
+        boolean expected = false;
+        if (command.path("phase").asText().equals("fault")) {
+          for (JsonNode wanted : command.path("expected_flush_errors")) if (wanted.asText().equals(flushClass)) expected = true;
+        }
+        if (!expected) stats.unexpected++;
+      }
+    }
+    Map<String, Object> result = new java.util.LinkedHashMap<>();
+    result.put("phase", "campaign_window"); result.put("language", "java"); result.put("generation", generation);
+    result.put("window_id", command.path("window_id").asText()); result.put("log_marker", marker);
+    result.put("duration_s", duration); result.put("elapsed_s", (System.nanoTime() - started) / 1e9);
+    result.put("completed", stats.completed); result.put("attempted", stats.attempted); result.put("unary", stats.unary); result.put("stream", stats.stream); result.put("cancel", stats.cancel);
+    result.put("unexpected_errors", stats.unexpected); result.put("integrity_failures", stats.integrity); result.put("active_calls", stats.active.get());
+    result.put("queue_scope", "adapter_admission"); result.put("queue_capacity", 128); result.put("queue_high_water", stats.high.get()); result.put("queue_depth", jobs.size()); result.put("queue_discarded", discarded);
+    result.put("latency_histogram", Map.of("unit", "us", "upper_bounds_powers_of_two", true, "counts", stats.histogram)); result.put("error_classes", stats.errors);
+    result.put("first_success_elapsed_ms", stats.firstSuccess); result.put("last_success_elapsed_ms", stats.lastSuccess);
+    result.put("app_log_emitted", stats.emitted); result.put("app_log_emit_errors", stats.emitErrors); result.put("collector_flush_errors", flushErrors);
+    result.put("error_samples", stats.errorSamples); result.put("flush_completed", emit && flushErrors == 0);
+    result.put("flush_elapsed_ms", (System.nanoTime() - flushStarted) / 1_000_000);
+    result.put("flush_error_class", flushClass); result.put("flush_error_message", flushMessage);
+    return result;
+  }
+
+  static void campaignClient(String ticket) throws Exception {
+    String collector = System.getenv("ASTER_CAMPAIGN_COLLECTOR");
+    boolean emit = collector != null && !collector.isEmpty();
+    if (emit) site.aster.otel.Observability.init(site.aster.otel.ObservabilityConfig.builder()
+        .serviceName("java-campaign").otlpEndpoint(collector).otlpLogs(true).fromEnv(false).build());
+    ForyCodec codec = new ForyCodec(); registerTypes(codec.fory());
+    ObjectMapper json = new ObjectMapper();
+    try (AsterClient client = AsterClient.builder().config(config()).codec(codec)
+        .consumerAdmission(false).build().get(30, TimeUnit.SECONDS)) {
+      NodeAddr addr = NodeAddr.fromTicket(ticket);
+      IrohConnection connection = client.connect(addr).get(2, TimeUnit.SECONDS);
+      int generation = 0;
+      long pid = ProcessHandle.current().pid();
+      String ownerIdentity = client.nodeId();
+      System.out.println(json.writeValueAsString(Map.of("phase", "campaign_ready", "language", "java", "pid", pid, "owner_identity", ownerIdentity, "generation", generation, "active_calls", 0, "collector_enabled", emit)));
+      System.out.flush();
+      BufferedReader input = new BufferedReader(new InputStreamReader(System.in));
+      for (String line; (line = input.readLine()) != null;) {
+        JsonNode command = json.readTree(line);
+        String name = command.path("cmd").asText(command.path("command").asText(command.path("op").asText()));
+        Map<String, Object> response;
+        switch (name) {
+          case "baseline", "run" -> {
+            response = campaignWindow(client, addr, command, generation, emit);
+            response.put("pid", pid); response.put("owner_identity", ownerIdentity);
+          }
+          case "pause" -> response = Map.of("phase", "campaign_idle", "generation", generation, "active_calls", 0, "queue_depth", 0);
+          case "replace_peer" -> {
+            NodeAddr replacement = NodeAddr.fromTicket(command.path("ticket").asText());
+            if (replacement.endpointId().equals(addr.endpointId())) throw new IllegalArgumentException("replace_peer requires fresh peer identity");
+            connection.close();
+            connection = client.connect(replacement).get(2, TimeUnit.SECONDS);
+            addr = replacement; generation = command.path("generation").asInt();
+            response = Map.of("phase", "campaign_peer", "generation", generation, "active_calls", 0);
+          }
+          case "stop" -> {
+            connection.close();
+            System.out.println(json.writeValueAsString(Map.of("phase", "campaign_stopped", "generation", generation, "active_calls", 0)));
+            System.out.flush(); return;
+          }
+          default -> throw new IllegalArgumentException("unknown campaign command " + name);
+        }
+        System.out.println(json.writeValueAsString(response)); System.out.flush();
+      }
+      connection.close();
+    } finally {
+      if (emit) site.aster.otel.Observability.shutdown(java.time.Duration.ofSeconds(2));
     }
   }
 
@@ -1065,6 +1317,8 @@ public final class InteropEcho {
       System.exit(0);
     } else if (args.length == 2 && args[0].equals("chain-server")) {
       chainServe(args[1]);
+    } else if (args.length == 2 && args[0].equals("campaign-client")) {
+      campaignClient(args[1]);
     } else if (args.length >= 1 && args[0].equals("server")) {
       serve();
     } else if (args.length == 1 && args[0].equals("expose-server")) {
