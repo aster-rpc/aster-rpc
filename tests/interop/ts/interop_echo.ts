@@ -484,10 +484,18 @@ async function campaignClient(ticket: string): Promise<void> {
     for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
       try {
         const command = JSON.parse(line), op = command.command ?? command.cmd ?? command.op;
+        // Diagnostic trace (stderr): which generation each command saw.
+        console.error(JSON.stringify({ diag: 'command', op, window_id: command.window_id,
+          sent_generation: command.generation, generation, at_ms: performance.now() }));
         let result: any;
         if (op === 'configure') { settings = { ...settings, ...command }; result = { phase: 'campaign_configured' }; }
         else if (op === 'run' || op === 'baseline') result = await window({ ...settings, ...command });
-        else if (op === 'replace_peer') { await replace(command.ticket); generation = command.generation; result = { phase: 'campaign_peer_replaced', generation }; }
+        else if (op === 'replace_peer') {
+          await replace(command.ticket);
+          generation = command.generation;
+          result = { phase: 'campaign_peer_replaced', generation };
+          console.error(JSON.stringify({ diag: 'replaced', generation, at_ms: performance.now() }));
+        }
         else if (op === 'pause' || op === 'stop') { result = { phase: `campaign_${op}`, active_calls: 0, unexpected_errors: 0 }; await flush({ ...settings, ...command }, result); }
         else throw new Error('unknown campaign command');
         reply({ ...result, owner_identity: identity, pid: process.pid });
