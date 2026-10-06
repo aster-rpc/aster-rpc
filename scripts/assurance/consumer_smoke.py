@@ -125,16 +125,11 @@ asyncio.run(main())
 '''
 
 
-TS_APP = r'''import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { AsterServer, AsterClientWrapper, CallContext, Rpc, RpcError, ServerStream, Service, StatusCode, WireType } from '@aster-rpc/aster';
-import { version as nativeVersion } from '@aster-rpc/transport';
+TS_SERVICE = r'''import { CallContext, Rpc, ServerStream, Service, WireType } from '@aster-rpc/aster';
 
 @WireType('assurance.clean/Request') export class Request { value = ''; count = 0; }
 @WireType('assurance.clean/Reply') export class Reply { value = ''; count = 0; }
-let cancelSeen = false, deadlineSeen = false;
+export let cancelSeen = false, deadlineSeen = false;
 @Service({name:'AssuranceCleanConsumerTS',version:1})
 export class Smoke {
   @Rpc({request:Request,response:Reply,timeout:20})
@@ -152,6 +147,16 @@ export class Smoke {
     const r=new Reply();r.value=req.value;return r;
   }
 }
+'''
+
+
+TS_APP = r'''import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { AsterServer, AsterClientWrapper, RpcError, StatusCode } from '@aster-rpc/aster';
+import { version as nativeVersion } from '@aster-rpc/transport';
+import { cancelSeen, deadlineSeen, Request, Reply, Smoke } from './service.js';
 
 const root=process.env.ASTER_CONSUMER_ROOT ?? process.cwd();
 const require=createRequire(import.meta.url);
@@ -304,7 +309,8 @@ def main() -> None:
             "tsx":"4.19.2",
             "typescript":"5.9.2"}
         (tdir/"package.json").write_text(json.dumps({"name":"aster-clean-consumer","private":True,"type":"module","dependencies":deps},indent=2)+"\n")
-        (tdir/"tsconfig.json").write_text(json.dumps({"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","types":["node"],"skipLibCheck":True,"outDir":"dist","rootDir":"."},"include":["consumer.ts","aster-rpc.generated.ts"]},indent=2)+"\n")
+        (tdir/"tsconfig.json").write_text(json.dumps({"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","types":["node"],"skipLibCheck":True,"outDir":"dist","rootDir":"."},"include":["consumer.ts","service.ts","aster-rpc.generated.ts"]},indent=2)+"\n")
+        (tdir/"service.ts").write_text(TS_SERVICE)
         (tdir/"consumer.ts").write_text(TS_APP)
         run(["npm","install","--no-audit","--no-fund"],cwd=tdir,env=env,log_path=work/"npm-install.log")
         run(["npm","ls","--all","@aster-rpc/aster","@aster-rpc/transport","@aster-rpc/transport-linux-x64-gnu"],cwd=tdir,env=env,log_path=work/"npm-tree.log")
