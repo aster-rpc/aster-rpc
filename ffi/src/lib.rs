@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CString};
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -440,6 +440,10 @@ pub enum aster_hook_decision_t {
 pub struct aster_runtime_config_t {
     pub struct_size: u32,
     pub worker_threads: u32,
+    /// Maximum admitted asynchronous operations and queued pushed events.
+    /// Zero selects the default (4096). An async operation that cannot reserve
+    /// its terminal-event slot returns `ASTER_STATUS_QUEUE_FULL` before it
+    /// starts; retry after polling at least one event.
     pub event_queue_capacity: u32,
     pub reserved: u32,
 }
@@ -730,8 +734,10 @@ pub(crate) struct BridgeRuntime {
     // `Arc<BridgeRuntime>` clones, so the last reference can go away on one of
     // this runtime's own worker threads, where dropping a Runtime panics.
     pub(crate) runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
-    events_tx: tokio::sync::mpsc::UnboundedSender<EventOwned>,
-    events_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<EventOwned>>,
+    events_tx: tokio::sync::mpsc::Sender<EventOwned>,
+    events_rx: Mutex<tokio::sync::mpsc::Receiver<EventOwned>>,
+    closing: AtomicBool,
+    close_notify: tokio::sync::Notify,
 
     // Handle registries
     pub(crate) nodes: HandleRegistry<CoreNode>,
@@ -828,6 +834,10 @@ impl RuntimeTeardown {
 
 struct OperationState {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    user_data: u64,
+    /// Reserved before the operation starts, so its one terminal event can
+    /// never be stranded behind a full queue or dropped.
+    completion: Mutex<Option<tokio::sync::mpsc::OwnedPermit<EventOwned>>>,
 }
 
 impl BridgeRuntime {
@@ -843,17 +853,19 @@ impl BridgeRuntime {
 
         let runtime = builder.build()?;
 
-        let _capacity = if queue_capacity > 0 {
+        let capacity = if queue_capacity > 0 {
             queue_capacity
         } else {
             4096
-        };
-        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        } as usize;
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(capacity);
 
         Ok(Self {
             runtime: std::mem::ManuallyDrop::new(runtime),
             events_tx,
             events_rx: Mutex::new(events_rx),
+            closing: AtomicBool::new(false),
+            close_notify: tokio::sync::Notify::new(),
             nodes: HandleRegistry::new(),
             connections: HandleRegistry::new(),
             send_streams: HandleRegistry::new(),
@@ -902,8 +914,35 @@ impl BridgeRuntime {
         self.buffers.clear();
     }
 
-    fn emit(&self, event: EventOwned) {
-        let _ = self.events_tx.send(event);
+    fn begin_close(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.close_notify.notify_waiters();
+    }
+
+    /// Deliver one operation's terminal event through the slot reserved when
+    /// the operation was admitted. The first terminal path wins; cancellation
+    /// and normal completion can race without duplicating or losing a result.
+    fn complete(&self, event: EventInternal, data: Option<Vec<u8>>) -> bool {
+        debug_assert_ne!(event.operation, 0);
+        let Some(operation) = self.operations.remove(event.operation) else {
+            return false;
+        };
+        let Some(permit) = operation
+            .completion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return false;
+        };
+        let event = if let Some(data) = data {
+            let (buffer, bytes) = self.buffers.insert(data);
+            event.with_buffer(buffer, bytes.len())
+        } else {
+            event
+        };
+        permit.send(EventOwned { event });
+        true
     }
 
     fn emit_error(&self, operation: u64, user_data: u64, message: &str) {
@@ -938,9 +977,7 @@ impl BridgeRuntime {
         flags: u32,
         message: &str,
     ) {
-        let data = message.as_bytes().to_vec();
-        let (buf_id, _) = self.buffers.insert(data);
-        let event = EventInternal::new(
+        let mut event = EventInternal::new(
             aster_event_kind_t::ASTER_EVENT_ERROR,
             status,
             operation,
@@ -948,11 +985,9 @@ impl BridgeRuntime {
             0,
             user_data,
             error_code,
-        )
-        .with_buffer(buf_id, message.len());
-        let mut event = event;
+        );
         event.flags = flags;
-        self.emit(EventOwned { event });
+        self.complete(event, Some(message.as_bytes().to_vec()));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -969,22 +1004,68 @@ impl BridgeRuntime {
         let event = EventInternal::new(
             kind, status, operation, handle, related, user_data, error_code,
         );
-        self.emit(EventOwned { event });
+        self.complete(event, None);
     }
 
     fn emit_with_data(&self, event: EventInternal, data: Vec<u8>) {
-        let (buf_id, arc) = self.buffers.insert(data);
-        let event = event.with_buffer(buf_id, arc.len());
-        self.emit(EventOwned { event });
+        self.complete(event, Some(data));
     }
 
-    fn new_operation(&self) -> (u64, Arc<std::sync::atomic::AtomicBool>) {
+    /// Backpressure a pushed event that has no operation admission slot. The
+    /// producer awaits queue capacity on the runtime instead of blocking a
+    /// worker thread or allocating an unbounded staging queue.
+    async fn emit_pushed_with_data(&self, event: EventInternal, data: Vec<u8>) -> bool {
+        debug_assert_eq!(event.operation, 0);
+        let notified = self.close_notify.notified();
+        tokio::pin!(notified);
+        if self.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        let permit = tokio::select! {
+            biased;
+            _ = &mut notified => return false,
+            result = self.events_tx.clone().reserve_owned() => match result {
+                Ok(permit) => permit,
+                Err(_) => return false,
+            },
+        };
+        let (buffer, bytes) = self.buffers.insert(data);
+        permit.send(EventOwned {
+            event: event.with_buffer(buffer, bytes.len()),
+        });
+        true
+    }
+
+    fn new_operation(
+        &self,
+        user_data: u64,
+    ) -> Result<(u64, Arc<std::sync::atomic::AtomicBool>), aster_status_t> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(aster_status_t::ASTER_STATUS_ALREADY_CLOSED);
+        }
+        let completion =
+            self.events_tx
+                .clone()
+                .try_reserve_owned()
+                .map_err(|error| match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        aster_status_t::ASTER_STATUS_QUEUE_FULL
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        aster_status_t::ASTER_STATUS_ALREADY_CLOSED
+                    }
+                })?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(aster_status_t::ASTER_STATUS_ALREADY_CLOSED);
+        }
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let op = OperationState {
             cancelled: cancelled.clone(),
+            user_data,
+            completion: Mutex::new(Some(completion)),
         };
         let id = self.operations.insert(op);
-        (id, cancelled)
+        Ok((id, cancelled))
     }
 
     /// Return the per-doc RegistryAcl, lazily creating one in open mode on first
@@ -1007,12 +1088,30 @@ impl BridgeRuntime {
     }
 
     fn cancel_operation(&self, op_id: u64) -> bool {
-        if let Some(op) = self.operations.get(op_id) {
-            op.cancelled.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
-        }
+        let Some(op) = self.operations.remove(op_id) else {
+            return false;
+        };
+        op.cancelled.store(true, Ordering::SeqCst);
+        let Some(permit) = op
+            .completion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return false;
+        };
+        permit.send(EventOwned {
+            event: EventInternal::new(
+                aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED,
+                aster_status_t::ASTER_STATUS_CANCELLED,
+                op_id,
+                0,
+                0,
+                op.user_data,
+                aster_status_t::ASTER_STATUS_CANCELLED as i32,
+            ),
+        });
+        true
     }
 }
 
@@ -1271,6 +1370,7 @@ fn close_runtime(runtime: aster_runtime_t) -> Result<Arc<RuntimeTeardown>, aster
         },
         Err(_) => return Err(aster_status_t::ASTER_STATUS_INTERNAL),
     };
+    arc.begin_close();
     arc.release_handles();
     let teardown = arc.teardown.clone();
     drop(arc);
@@ -1492,15 +1592,6 @@ pub unsafe extern "C" fn aster_operation_cancel(
     };
 
     if bridge.cancel_operation(operation) {
-        bridge.emit_simple(
-            aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED,
-            aster_status_t::ASTER_STATUS_CANCELLED,
-            operation,
-            0,
-            0,
-            0,
-            aster_status_t::ASTER_STATUS_CANCELLED as i32,
-        );
         aster_status_t::ASTER_STATUS_OK as i32
     } else {
         aster_status_t::ASTER_STATUS_NOT_FOUND as i32
@@ -1602,7 +1693,10 @@ pub unsafe extern "C" fn aster_node_close(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -1972,7 +2066,10 @@ pub unsafe extern "C" fn aster_connect(
         None
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2040,7 +2137,10 @@ pub unsafe extern "C" fn aster_accept(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2102,7 +2202,10 @@ pub unsafe extern "C" fn aster_node_accept_aster(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2227,7 +2330,10 @@ pub unsafe extern "C" fn aster_connection_closed(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2310,7 +2416,10 @@ pub unsafe extern "C" fn aster_connection_read_datagram(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2368,7 +2477,10 @@ pub unsafe extern "C" fn aster_open_bi(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2423,7 +2535,10 @@ pub unsafe extern "C" fn aster_accept_bi(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2543,7 +2658,10 @@ pub unsafe extern "C" fn aster_connection_open_tunnel(
     unsafe { ptr::copy_nonoverlapping(ticket, ticket_bytes.as_mut_ptr(), 32) };
     let ticket = aster_transport_core::tunnel::TunnelTicket(ticket_bytes);
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2597,7 +2715,10 @@ pub unsafe extern "C" fn aster_open_uni(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2651,7 +2772,10 @@ pub unsafe extern "C" fn aster_accept_uni(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2708,7 +2832,10 @@ pub unsafe extern "C" fn aster_stream_write(
 
     let data_bytes = unsafe { read_bytes(&data) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2761,7 +2888,10 @@ pub unsafe extern "C" fn aster_stream_finish(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2816,7 +2946,10 @@ pub unsafe extern "C" fn aster_stream_read(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2883,7 +3016,10 @@ pub unsafe extern "C" fn aster_stream_read_to_end(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2939,7 +3075,10 @@ pub unsafe extern "C" fn aster_stream_read_exact(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -2993,7 +3132,10 @@ pub unsafe extern "C" fn aster_stream_stopped(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -3258,7 +3400,10 @@ pub unsafe extern "C" fn aster_blobs_add_bytes(
     let blobs = node_arc.blobs_client();
     let data_bytes = unsafe { read_bytes(&data) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -3319,7 +3464,10 @@ pub unsafe extern "C" fn aster_blobs_read(
         Err(e) => return e,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -3383,7 +3531,10 @@ pub unsafe extern "C" fn aster_blobs_add_path(
         Err(e) => return e,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -3452,7 +3603,10 @@ pub unsafe extern "C" fn aster_blobs_add_path_with_named_tag(
         Err(e) => return e,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -3521,7 +3675,10 @@ pub unsafe extern "C" fn aster_blobs_add_bytes_as_collection(
     };
     let data_bytes = unsafe { read_bytes(&data) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -3602,7 +3759,10 @@ pub unsafe extern "C" fn aster_blobs_add_collection(
         }
     }
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -3668,7 +3828,10 @@ pub unsafe extern "C" fn aster_blobs_list_collection(
         Err(e) => return e,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -3836,7 +3999,10 @@ pub unsafe extern "C" fn aster_blobs_download(
         Err(e) => return e,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4049,7 +4215,10 @@ pub unsafe extern "C" fn aster_blobs_observe_complete(
         String::from_utf8(unsafe { slice::from_raw_parts(hash_hex_ptr, hash_hex_len).to_vec() })
             .unwrap_or_default();
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4187,7 +4356,10 @@ pub unsafe extern "C" fn aster_tags_set(
     };
 
     let blobs = node_arc.blobs_client();
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4243,7 +4415,10 @@ pub unsafe extern "C" fn aster_tags_get(
         .unwrap_or_default();
 
     let blobs = node_arc.blobs_client();
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4312,7 +4487,10 @@ pub unsafe extern "C" fn aster_tags_delete(
         .unwrap_or_default();
 
     let blobs = node_arc.blobs_client();
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4334,7 +4512,7 @@ pub unsafe extern "C" fn aster_tags_delete(
                     0,
                 );
                 event.flags = count as u32;
-                bridge2.emit(EventOwned { event });
+                bridge2.complete(event, None);
             }
             Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
         }
@@ -4375,7 +4553,10 @@ pub unsafe extern "C" fn aster_tags_list_prefix(
     };
 
     let blobs = node_arc.blobs_client();
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4440,7 +4621,10 @@ pub unsafe extern "C" fn aster_docs_create(
 
     let docs = node_arc.docs_client();
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4496,7 +4680,10 @@ pub unsafe extern "C" fn aster_docs_create_author(
 
     let docs = node_arc.docs_client();
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4557,7 +4744,10 @@ pub unsafe extern "C" fn aster_docs_join(
         Err(e) => return e,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4621,7 +4811,10 @@ pub unsafe extern "C" fn aster_doc_set_bytes(
     let key_bytes = unsafe { read_bytes(&key) };
     let value_bytes = unsafe { read_bytes(&value) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4687,7 +4880,10 @@ pub unsafe extern "C" fn aster_doc_del(
     };
     let prefix_bytes = unsafe { read_bytes(&prefix) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4749,7 +4945,10 @@ pub unsafe extern "C" fn aster_doc_get_exact(
     };
     let key_bytes = unsafe { read_bytes(&key) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4823,7 +5022,10 @@ pub unsafe extern "C" fn aster_doc_share(
         _ => return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -4908,7 +5110,10 @@ pub unsafe extern "C" fn aster_doc_query(
 
     let key_bytes = unsafe { read_bytes(&key) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5006,7 +5211,10 @@ pub unsafe extern "C" fn aster_doc_read_entry_content(
         Err(e) => return e,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5069,7 +5277,10 @@ pub unsafe extern "C" fn aster_doc_start_sync(
 
     let peer_strs = unsafe { read_string_list(&peers) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5122,7 +5333,10 @@ pub unsafe extern "C" fn aster_doc_leave(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5218,7 +5432,10 @@ pub unsafe extern "C" fn aster_doc_subscribe(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5275,7 +5492,10 @@ pub unsafe extern "C" fn aster_doc_event_recv(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5386,7 +5606,10 @@ pub unsafe extern "C" fn aster_doc_set_download_policy(
         _ => return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5448,7 +5671,10 @@ pub unsafe extern "C" fn aster_doc_share_with_addr(
         _ => return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5511,7 +5737,10 @@ pub unsafe extern "C" fn aster_docs_join_and_subscribe(
         Err(e) => return e,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5575,7 +5804,10 @@ pub unsafe extern "C" fn aster_gossip_subscribe(
     let topic_bytes = unsafe { read_bytes(&topic) };
     let peers_strs = unsafe { read_string_list(&peers) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5632,7 +5864,10 @@ pub unsafe extern "C" fn aster_gossip_broadcast(
 
     let data_bytes = unsafe { read_bytes(&data) };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -5685,7 +5920,10 @@ pub unsafe extern "C" fn aster_gossip_recv(
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -7262,7 +7500,10 @@ pub unsafe extern "C" fn aster_registry_resolve(
     };
     let acl = bridge.registry_acl_lookup(doc);
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -7405,7 +7646,10 @@ pub unsafe extern "C" fn aster_registry_publish(
         bridge.gossip_topics.get(gossip_topic)
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -7524,7 +7768,10 @@ pub unsafe extern "C" fn aster_registry_renew_lease(
         bridge.gossip_topics.get(gossip_topic)
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -7647,7 +7894,10 @@ unsafe fn aster_registry_acl_mutate_writer(
 
     let acl = bridge.registry_acl_for_doc(doc);
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -7712,7 +7962,10 @@ pub unsafe extern "C" fn aster_registry_acl_list_writers(
 
     let acl = bridge.registry_acl_for_doc(doc);
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
@@ -7862,11 +8115,9 @@ mod runtime_drop_tests {
 mod event_buffer_tests {
     use super::*;
 
-    /// `aster_runtime_config_t.event_queue_capacity` is a public resource
-    /// bound. Keep the reproducer ignored while the runtime still uses an
-    /// unbounded channel; run it explicitly during release qualification.
+    /// `aster_runtime_config_t.event_queue_capacity` bounds admitted
+    /// operations and their reserved terminal-event slots.
     #[test]
-    #[ignore = "known defect: event_queue_capacity is not enforced"]
     fn runtime_event_queue_capacity_bounds_pending_events() {
         let config = aster_runtime_config_t {
             struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
@@ -7879,16 +8130,25 @@ mod event_buffer_tests {
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let bridge = load_runtime(handle).expect("runtime");
 
-        for operation in 1..=8 {
-            bridge.emit_simple(
-                aster_event_kind_t::ASTER_EVENT_CLOSED,
-                aster_status_t::ASTER_STATUS_OK,
-                operation,
-                0,
-                0,
-                0,
-                0,
-            );
+        let mut admitted = 0;
+        let mut rejected = 0;
+        for _ in 0..8 {
+            match bridge.new_operation(0) {
+                Ok((operation, _)) => {
+                    admitted += 1;
+                    bridge.emit_simple(
+                        aster_event_kind_t::ASTER_EVENT_CLOSED,
+                        aster_status_t::ASTER_STATUS_OK,
+                        operation,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                Err(aster_status_t::ASTER_STATUS_QUEUE_FULL) => rejected += 1,
+                Err(status) => panic!("unexpected admission status: {status:?}"),
+            }
         }
 
         let mut out: [std::mem::MaybeUninit<aster_event_t>; 8] =
@@ -7901,15 +8161,173 @@ mod event_buffer_tests {
                 0,
             )
         };
+        assert_eq!(admitted, config.event_queue_capacity as usize);
+        assert_eq!(rejected, 8 - admitted);
+        assert_eq!(pending, admitted);
+
+        let (operation, _) = bridge.new_operation(0).expect("slot released by poll");
+        bridge.emit_simple(
+            aster_event_kind_t::ASTER_EVENT_CLOSED,
+            aster_status_t::ASTER_STATUS_OK,
+            operation,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(
+            unsafe {
+                aster_poll_events(
+                    handle,
+                    out.as_mut_ptr().cast::<aster_event_t>(),
+                    out.len(),
+                    0,
+                )
+            },
+            1
+        );
+
         drop(bridge);
         assert_eq!(
             unsafe { aster_runtime_close(handle) },
             aster_status_t::ASTER_STATUS_OK as i32
         );
+    }
+
+    #[test]
+    fn cancellation_uses_reserved_terminal_slot_once() {
+        let config = aster_runtime_config_t {
+            struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
+            worker_threads: 1,
+            event_queue_capacity: 1,
+            reserved: 0,
+        };
+        let mut handle: aster_runtime_t = 0;
+        assert_eq!(
+            unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        let bridge = load_runtime(handle).expect("runtime");
+        let (operation, _) = bridge.new_operation(73).expect("event slot");
+
+        assert_eq!(
+            unsafe { aster_operation_cancel(handle, operation) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        assert_eq!(
+            unsafe { aster_operation_cancel(handle, operation) },
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+        assert_eq!(
+            bridge.new_operation(73).unwrap_err(),
+            aster_status_t::ASTER_STATUS_QUEUE_FULL
+        );
+        assert!(!bridge.complete(
+            EventInternal::new(
+                aster_event_kind_t::ASTER_EVENT_CLOSED,
+                aster_status_t::ASTER_STATUS_OK,
+                operation,
+                0,
+                0,
+                0,
+                0,
+            ),
+            None,
+        ));
+
+        let mut out = std::mem::MaybeUninit::<aster_event_t>::uninit();
+        assert_eq!(
+            unsafe { aster_poll_events(handle, out.as_mut_ptr(), 1, 0) },
+            1
+        );
+        let event = unsafe { out.assume_init() };
+        assert_eq!(
+            event.kind,
+            aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED as u32
+        );
+        assert_eq!(event.operation, operation);
+        assert_eq!(event.user_data, 73);
+
+        let (next, _) = bridge
+            .new_operation(73)
+            .expect("cancel event released slot");
+        bridge.emit_simple(
+            aster_event_kind_t::ASTER_EVENT_CLOSED,
+            aster_status_t::ASTER_STATUS_OK,
+            next,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(
+            unsafe { aster_poll_events(handle, out.as_mut_ptr(), 1, 0) },
+            1
+        );
+
+        drop(bridge);
+        assert_eq!(
+            unsafe { aster_runtime_close(handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+    }
+
+    #[test]
+    fn runtime_close_wakes_pushed_event_backpressure() {
+        let config = aster_runtime_config_t {
+            struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
+            worker_threads: 1,
+            event_queue_capacity: 1,
+            reserved: 0,
+        };
+        let mut handle: aster_runtime_t = 0;
+        assert_eq!(
+            unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        let bridge = load_runtime(handle).expect("runtime");
+        let (operation, _) = bridge.new_operation(0).expect("event slot");
+        bridge.emit_simple(
+            aster_event_kind_t::ASTER_EVENT_CLOSED,
+            aster_status_t::ASTER_STATUS_OK,
+            operation,
+            0,
+            0,
+            0,
+            0,
+        );
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = bridge.clone();
+        bridge.runtime.spawn(async move {
+            started_tx.send(()).unwrap();
+            let delivered = producer
+                .emit_pushed_with_data(
+                    EventInternal::new(
+                        aster_event_kind_t::ASTER_EVENT_HOOK_BEFORE_CONNECT,
+                        aster_status_t::ASTER_STATUS_OK,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ),
+                    b"hook".to_vec(),
+                )
+                .await;
+            done_tx.send(delivered).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        drop(bridge);
+        let teardown = close_runtime(handle).expect("close runtime");
+        assert!(!done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocked producer did not wake on close"));
         assert!(
-            pending <= config.event_queue_capacity as usize,
-            "configured capacity {} retained {pending} pending events",
-            config.event_queue_capacity
+            teardown.wait(Duration::from_secs(10)),
+            "runtime did not tear down after waking producer"
         );
     }
 
@@ -7924,11 +8342,12 @@ mod event_buffer_tests {
             unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, std::ptr::null(), &mut handle) };
         assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
         let bridge = load_runtime(handle).expect("runtime");
+        let (operation, _) = bridge.new_operation(7).expect("event slot");
 
         let event = EventInternal::new(
             aster_event_kind_t::ASTER_EVENT_BYTES_RESULT,
             aster_status_t::ASTER_STATUS_OK,
-            1,
+            operation,
             0,
             0,
             7,

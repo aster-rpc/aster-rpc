@@ -51,7 +51,7 @@ use aster_transport_core::CoreBlobStatus;
 use crate::{
     aster_bytes_list_t, aster_bytes_t, aster_connection_t, aster_event_kind_t, aster_node_t,
     aster_operation_t, aster_path_kind_t, aster_runtime_t, aster_send_stream_t, aster_status_t,
-    check_cancelled, load_runtime, set_last_error, BridgeRuntime, EventInternal, EventOwned,
+    check_cancelled, load_runtime, set_last_error, BridgeRuntime, EventInternal,
 };
 
 // ── enums and constants ─────────────────────────────────────────────────────
@@ -422,7 +422,10 @@ pub(crate) unsafe fn spawn_op_coded<F>(
 where
     F: Future<Output = Result<Done, OpError>> + Send + 'static,
 {
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     *out_operation = op_id;
     let b = bridge.clone();
     bridge.runtime.spawn(async move {
@@ -444,7 +447,9 @@ where
                 ev.flags = d.flags;
                 match d.data {
                     Some(data) => b.emit_with_data(ev, data),
-                    None => b.emit(EventOwned { event: ev }),
+                    None => {
+                        b.complete(ev, None);
+                    }
                 }
             }
             Err(e) => b.emit_error_flagged(op_id, user_data, e.status, e.code, e.flags, &e.message),

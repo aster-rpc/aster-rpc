@@ -922,7 +922,12 @@ pub(crate) fn spawn_hook_drainers(
                 user_data,
                 0,
             );
-            b.emit_with_data(event, encode_hook_connect_payload(&info));
+            if !b
+                .emit_pushed_with_data(event, encode_hook_connect_payload(&info))
+                .await
+            {
+                break;
+            }
         }
     });
 
@@ -957,7 +962,12 @@ pub(crate) fn spawn_hook_drainers(
                 user_data,
                 0,
             );
-            b.emit_with_data(event, encode_hook_handshake_payload(&info));
+            if !b
+                .emit_pushed_with_data(event, encode_hook_handshake_payload(&info))
+                .await
+            {
+                break;
+            }
         }
     });
 }
@@ -1053,7 +1063,10 @@ pub unsafe extern "C" fn aster_node_start(
         Some(try_status!(gate_entry(&bridge, gate)))
     };
 
-    let (op_id, cancelled) = bridge.new_operation();
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
     *out_operation = op_id;
 
     let bridge2 = bridge.clone();
