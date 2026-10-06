@@ -22,6 +22,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { encodeContractDefault, foryTypeExpr } from '../wire-types.js';
 
@@ -1679,13 +1680,15 @@ function main(): void {
   }
 }
 
-// Run as CLI only when invoked directly as a script. When imported
-// by the plugin modules (`import { generate } from '../cli/gen.js'`),
-// we must not execute main() as a side effect.
+// Run as CLI only when invoked directly as a script. npm installs package bins
+// as node_modules/.bin symlinks on POSIX, so compare their canonical targets.
+// When imported by plugin modules (`import { generate } from '../cli/gen.js'`),
+// argv[1] remains the importing program and main() stays side-effect free.
 const isDirectCLI = typeof process !== 'undefined' &&
   Array.isArray(process.argv) &&
   typeof process.argv[1] === 'string' &&
-  (process.argv[1].endsWith('/cli/gen.js') || process.argv[1].endsWith('\\cli\\gen.js'));
+  fs.existsSync(process.argv[1]) &&
+  fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
 if (isDirectCLI) {
   main();
 }

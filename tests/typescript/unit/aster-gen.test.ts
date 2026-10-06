@@ -19,6 +19,8 @@ import { describe, expect, it, beforeAll } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 
 const _require = createRequire(import.meta.url);
@@ -216,6 +218,53 @@ describe('aster-gen scanner', () => {
     const bytes = m![1]!.split(',').map(s => parseInt(s.trim(), 16));
     const hex = bytes.map(b => b.toString(16).padStart(2, '0')).join('');
     expect(hex).toBe(expected);
+  });
+});
+
+describe('installed aster-gen package bin', () => {
+  it('runs through node_modules/.bin and writes the scanned contract', () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'aster-gen-bin-'));
+    try {
+      const binDir = path.join(work, 'node_modules', '.bin');
+      const bin = path.join(binDir, 'aster-gen');
+      const out = path.join(work, 'aster-rpc.generated.ts');
+      fs.mkdirSync(binDir, { recursive: true });
+      fs.symlinkSync(GEN_CLI, bin);
+
+      const result = spawnSync(process.execPath, [
+        bin,
+        '-p', path.join(FIXTURE_DIR, 'tsconfig.json'),
+        '-o', out,
+      ], { encoding: 'utf8', cwd: work });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toContain('aster-gen: wrote');
+      const source = fs.readFileSync(out, 'utf8');
+      expect(source).toContain('tag: "sample/StatusRequest"');
+      expect(source).toContain('name: "MissionControl"');
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('does not execute the CLI when imported as a module', () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'aster-gen-import-'));
+    try {
+      const importer = path.join(work, 'importer.mjs');
+      const out = path.join(work, 'aster-rpc.generated.ts');
+      fs.writeFileSync(importer, `await import(${JSON.stringify(pathToFileURL(GEN_CLI).href)});\n`);
+
+      const result = spawnSync(process.execPath, [importer], {
+        encoding: 'utf8',
+        cwd: work,
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).not.toContain('aster-gen: wrote');
+      expect(fs.existsSync(out)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
   });
 });
 
