@@ -325,6 +325,15 @@ impl RingConsumer {
             wake: self.wake.clone(),
         }
     }
+
+    /// Close producer admission and wake the pump. Staged and in-flight
+    /// events are dropped by the pump; events already in the ring remain
+    /// available to drain.
+    pub fn close(&self) {
+        self.wake.consumer_alive.store(false, Ordering::Release);
+        self.wake.space.notify_waiters();
+        self.wake.consumer_closed.notify_one();
+    }
     /// Drain events while transferring their optional final-entity permit to
     /// the consumer. Callback bridges keep the permit until the event has
     /// been converted and handed to the foreign runtime.
@@ -420,11 +429,7 @@ impl RingNotifier {
 
 impl Drop for RingConsumer {
     fn drop(&mut self) {
-        self.wake.consumer_alive.store(false, Ordering::Release);
-        self.wake.space.notify_waiters();
-        // `notify_one` retains a permit if the idle pump has not entered its
-        // select yet; `notify_waiters` could lose that close wakeup.
-        self.wake.consumer_closed.notify_one();
+        self.close();
     }
 }
 
@@ -496,5 +501,25 @@ mod tests {
         })
         .await
         .expect("pump did not exit after its consumer was dropped");
+    }
+
+    #[tokio::test]
+    async fn explicit_close_and_drain_release_final_permits() {
+        let (sink, mut consumer) = RingSink::new_with_limit(1, 1);
+        let permit = sink.try_admit(DispatchAdmission::Call).unwrap();
+        assert!(sink.deliver_admitted(event(1), permit).is_ok());
+        consumer.close();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                consumer.drain(1, drop);
+                if sink.call_admissions.available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("staged final permit survived consumer close");
     }
 }

@@ -257,6 +257,48 @@ describe.skipIf(!hasDispatch).each(DISPATCH_DELIVERIES)('DispatchServer (%s)', (
 });
 
 describe.skipIf(!hasDispatch)('DispatchServer bounded TSFN delivery', () => {
+  it('closes an idle pump forwarder and clears its callback queue', async () => {
+    const server = await native.DispatchServer.start(
+      OFFLINE,
+      [JSON.stringify(ECHO_SERVICE)],
+      { delivery: 'tsfn-batched', ringCapacity: 16, builtinNodeInfo: false },
+      () => {},
+    );
+    await server.close();
+    expect(server.liveCalls()).toBe(0);
+    expect(server.debugState().slice(0, 3)).toEqual([0, 0, 0]);
+    await server.close();
+  });
+
+  it('fails live calls and releases queued ownership when callback delivery closes', async () => {
+    let sawCall!: () => void;
+    const delivered = new Promise<void>((resolve) => { sawCall = resolve; });
+    const server = await native.DispatchServer.start(
+      OFFLINE,
+      [JSON.stringify(ECHO_SERVICE)],
+      { delivery: 'tsfn-batched', ringCapacity: 16, builtinNodeInfo: false },
+      (events: DispatchEvent[]) => {
+        if (events.some((event) => event.kind === DispatchEventKind.Call)) sawCall();
+      },
+    );
+    const client = await connect(server.address);
+    try {
+      const pending = client.transport.unary('test.Echo', 'echo', Buffer.from('fail-close'));
+      await delivered;
+      server.debugFailDelivery();
+      await expect(pending).rejects.toMatchObject({ code: StatusCode.INTERNAL });
+      await until(() => server.liveCalls() === 0);
+      const state = server.debugState();
+      expect(state[1]).toBe(0);
+      expect(state[2]).toBe(0);
+      expect(state[5]).toBeGreaterThan(0);
+    } finally {
+      try { client.conn.close(0, 'done'); } catch { /* ignore */ }
+      await client.node.close();
+      await server.close();
+    }
+  });
+
   it('keeps a stalled callback within its admission bound and resumes afterward', async () => {
     let stalled = false;
     const batchSizes: number[] = [];

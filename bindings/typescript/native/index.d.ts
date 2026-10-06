@@ -393,6 +393,11 @@ export declare class DispatchServer {
    */
   debugNudge(): void
   /**
+   * Diagnostics: force the same terminal cleanup used after TSFN delivery
+   * failure or watchdog exhaustion.
+   */
+  debugFailDelivery(): void
+  /**
    * Resolve with the next batch (at most `max`, default 256), waiting
    * until there is one. Resolves `[]` once the server is closed.
    */
@@ -2266,8 +2271,8 @@ export interface DispatchServerOptions {
    */
   ringCapacity?: number
   /**
-   * Per-kind maximum for admitted foreign calls, sessions, RPC connections,
-   * and non-RPC connections (default 4096; minimum 1).
+   * Per-kind maximum for admitted foreign calls, sessions, RPC
+   * connections, and non-RPC connections (default 4096; minimum 1).
    */
   maxForeignInflight?: number
   /** Serve the baseline `aster.ops.NodeInfo` service (default true). */

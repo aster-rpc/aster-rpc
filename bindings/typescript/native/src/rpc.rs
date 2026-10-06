@@ -529,8 +529,10 @@ async fn tsfn_ready_forwarder(
     close: Arc<tokio::sync::Notify>,
 ) {
     loop {
-        let Some(s) = sink.upgrade() else { return };
-        if s.failed.load(Ordering::Acquire) {
+        if sink
+            .upgrade()
+            .is_none_or(|s| s.failed.load(Ordering::Acquire))
+        {
             return;
         }
         tokio::select! {
@@ -567,8 +569,7 @@ impl TsfnStats {
 }
 
 impl TsfnSink {
-    fn fail(&self, status: Status) {
-        self.stats.failed(status);
+    fn shutdown(&self) {
         self.failed.store(true, Ordering::Release);
         self.scheduled.store(false, Ordering::Release);
         self.tsfn.lock().unwrap().take();
@@ -577,6 +578,11 @@ impl TsfnSink {
             table.abandon_all();
         }
         self.discard_queued();
+    }
+
+    fn fail(&self, status: Status) {
+        self.stats.failed(status);
+        self.shutdown();
     }
 
     fn lost(&self, ev: &Ev) {
@@ -601,27 +607,23 @@ impl TsfnSink {
         let Some(queue) = self.queue.get() else {
             return;
         };
-        queue
-            .consumer
-            .lock()
-            .unwrap()
-            .drain_admitted(usize::MAX, |event, handoff| {
-                if let Some(ev) = self.shared.convert(event) {
-                    self.lost(&ev);
-                }
-                drop(handoff);
-            });
+        let mut consumer = queue.consumer.lock().unwrap();
+        consumer.close();
+        consumer.drain_admitted(usize::MAX, |event, handoff| {
+            if let Some(ev) = self.shared.convert(event) {
+                self.lost(&ev);
+            }
+            drop(handoff);
+        });
     }
 
     fn notify(&self) {
         if self.scheduled.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Some(tsfn) = self.tsfn.lock().unwrap().clone() else {
-            self.failed.store(true, Ordering::Release);
-            self.scheduled.store(false, Ordering::Release);
-            self.close_wake.notify_one();
-            self.discard_queued();
+        let tsfn = { self.tsfn.lock().unwrap().clone() };
+        let Some(tsfn) = tsfn else {
+            self.fail(Status::Closing);
             return;
         };
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
@@ -632,6 +634,16 @@ impl TsfnSink {
             self.scheduled_wake.notify_one();
         } else {
             self.fail(status);
+        }
+    }
+}
+
+impl Drop for TsfnSink {
+    fn drop(&mut self) {
+        self.scheduled_wake.notify_one();
+        self.close_wake.notify_one();
+        if let Some(queue) = self.queue.get() {
+            queue.consumer.lock().unwrap().close();
         }
     }
 }
@@ -1238,6 +1250,15 @@ impl DispatchServer {
         }
     }
 
+    /// Diagnostics: force the same terminal cleanup used after TSFN delivery
+    /// failure or watchdog exhaustion.
+    #[napi]
+    pub fn debug_fail_delivery(&self) {
+        if let Some(s) = &self.tsfn_sink {
+            s.fail(Status::GenericFailure);
+        }
+    }
+
     // ── ring pulls ──────────────────────────────────────────────────────────
 
     /// Resolve with the next batch (at most `max`, default 256), waiting
@@ -1429,13 +1450,7 @@ impl DispatchServer {
     #[napi]
     pub async fn close(&self) -> Result<()> {
         if let Some(s) = &self.tsfn_sink {
-            s.failed.store(true, Ordering::Release);
-            let tsfn = s.tsfn.lock().unwrap().take();
-            drop(tsfn);
-            s.discard_queued();
-            // Let a parked watchdog see the closed sink and exit.
-            s.scheduled_wake.notify_one();
-            s.close_wake.notify_one();
+            s.shutdown();
         }
         if let Some(r) = &self.ring {
             r.closed.store(true, Ordering::Release);
