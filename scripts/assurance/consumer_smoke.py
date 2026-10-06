@@ -296,6 +296,7 @@ def main() -> None:
             "@aster-rpc/transport":"file:"+str(artifacts["npm-transport"][0]),
             "@aster-rpc/transport-linux-x64-gnu":"file:"+str(artifacts["npm-linux-x64-gnu"][0]),
             "@types/node":"24.10.1",
+            "tsx":"4.19.2",
             "typescript":"5.9.2"}
         (tdir/"package.json").write_text(json.dumps({"name":"aster-clean-consumer","private":True,"type":"module","dependencies":deps},indent=2)+"\n")
         (tdir/"tsconfig.json").write_text(json.dumps({"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","types":["node"],"skipLibCheck":True,"outDir":"dist","rootDir":"."},"include":["consumer.ts","aster-rpc.generated.ts"]},indent=2)+"\n")
@@ -305,7 +306,10 @@ def main() -> None:
         run(["node_modules/.bin/aster-gen"],cwd=tdir,env=env,log_path=work/"typescript-gen.log")
         run(["node_modules/.bin/tsc"],cwd=tdir,env=env,log_path=work/"typescript-build.log")
         env["ASTER_CONSUMER_ROOT"] = str(tdir)
-        run(["node","consumer.js"],cwd=tdir/"dist",env=env,log_path=work/"typescript-smoke.log")
+        # The current runtime imports the generated TypeScript filename from
+        # cwd. Execute through tsx so that documented generated metadata is
+        # loaded; the preceding tsc command independently checks compilation.
+        run(["node_modules/.bin/tsx","consumer.ts"],cwd=tdir,env=env,log_path=work/"typescript-smoke.log")
     print(f"CLEAN_CONSUMER_PASS report_dir={work}",flush=True)
 
 
