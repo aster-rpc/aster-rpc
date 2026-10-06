@@ -7862,6 +7862,57 @@ mod runtime_drop_tests {
 mod event_buffer_tests {
     use super::*;
 
+    /// `aster_runtime_config_t.event_queue_capacity` is a public resource
+    /// bound. Keep the reproducer ignored while the runtime still uses an
+    /// unbounded channel; run it explicitly during release qualification.
+    #[test]
+    #[ignore = "known defect: event_queue_capacity is not enforced"]
+    fn runtime_event_queue_capacity_bounds_pending_events() {
+        let config = aster_runtime_config_t {
+            struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
+            worker_threads: 1,
+            event_queue_capacity: 2,
+            reserved: 0,
+        };
+        let mut handle: aster_runtime_t = 0;
+        let status = unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut handle) };
+        assert_eq!(status, aster_status_t::ASTER_STATUS_OK as i32);
+        let bridge = load_runtime(handle).expect("runtime");
+
+        for operation in 1..=8 {
+            bridge.emit_simple(
+                aster_event_kind_t::ASTER_EVENT_CLOSED,
+                aster_status_t::ASTER_STATUS_OK,
+                operation,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+
+        let mut out: [std::mem::MaybeUninit<aster_event_t>; 8] =
+            std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+        let pending = unsafe {
+            aster_poll_events(
+                handle,
+                out.as_mut_ptr().cast::<aster_event_t>(),
+                out.len(),
+                0,
+            )
+        };
+        drop(bridge);
+        assert_eq!(
+            unsafe { aster_runtime_close(handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        assert!(
+            pending <= config.event_queue_capacity as usize,
+            "configured capacity {} retained {pending} pending events",
+            config.event_queue_capacity
+        );
+    }
+
     /// A polled event's payload is freed by `aster_buffer_release`: polling
     /// must not keep (or leak) a reference of its own. Regression for the
     /// `mem::forget(payload)` in `aster_poll_events` that LSan reported in
