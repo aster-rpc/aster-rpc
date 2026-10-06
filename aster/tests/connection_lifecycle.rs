@@ -3,24 +3,29 @@
     feature = "binding-support",
     feature = "reactor-test-hooks"
 ))]
-//! Close-versus-dispatch lifecycle regression: a call fully read on a stream
-//! whose task is descheduled until after the connection's close event must not
-//! leave foreign admission held. Run with:
+//! Close-versus-dispatch lifecycle regressions: a call fully read on a stream
+//! whose task is descheduled until after the connection's close must not leave
+//! per-connection state (foreign admission, a session) that no later event
+//! reaps. Run with:
 //! cargo test -p aster --features rpc,binding-support,reactor-test-hooks --test connection_lifecycle
 
 use std::time::Duration;
 
 use aster::binding_support::dispatch::{
-    CancelReason, DispatchAdmission, DispatchEvent, DispatchSink, RingSink,
+    CancelReason, DispatchAdmission, DispatchEvent, DispatchSink, RingConsumer, RingSink,
 };
 use aster::rpc::{
-    AsterServer, DynamicService, MethodDesc, MethodPattern, RpcStatus, StreamHeader, TypeRef,
+    AsterServer, DynamicService, MethodDesc, MethodPattern, RpcStatus, ScopeKind, StreamHeader,
+    TypeRef,
 };
 use aster::{AsterConfig, Node, RelayMode};
 use aster_transport_core::framing::{encode_frame, FLAG_END_STREAM, FLAG_HEADER};
-use aster_transport_core::reactor::test_hooks;
+use aster_transport_core::reactor::test_hooks::{self, CallEnqueueGate};
 
 const WAIT: Duration = Duration::from_secs(15);
+
+/// The enqueue gate is process-wide; tests in this binary take turns.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn config() -> AsterConfig {
     AsterConfig::builder()
@@ -51,10 +56,12 @@ async fn connect(server: &AsterServer) -> (Node, aster::rpc::RpcConnection) {
     (client, connection)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn closed_connection_with_a_descheduled_call_releases_foreign_capacity() {
-    let (sink, mut consumer) = RingSink::new_with_limit(1, 1);
+/// A server whose foreign sink admits one call, one connection and one
+/// session at a time, so a single leaked admission refuses the next peer.
+async fn server(scope: ScopeKind) -> (AsterServer, std::sync::Arc<RingSink>, RingConsumer) {
+    let (sink, consumer) = RingSink::new_with_limit(1, 1);
     let mut service = DynamicService::new("test.Lifecycle", 1);
+    service.scope = scope;
     service.methods = vec![MethodDesc::new(
         "echo",
         MethodPattern::Unary,
@@ -69,56 +76,80 @@ async fn closed_connection_with_a_descheduled_call_releases_foreign_capacity() {
         .start()
         .await
         .unwrap();
-    let header = StreamHeader {
+    (server, sink, consumer)
+}
+
+fn header(scope: ScopeKind) -> StreamHeader {
+    StreamHeader {
         service: "test.Lifecycle".into(),
         method: "echo".into(),
         version: 1,
+        session_id: if scope == ScopeKind::Session { 1 } else { 0 },
         ..Default::default()
-    };
-    let (departing_client, departing) = connect(&server).await;
-    let mut gate = test_hooks::pause_next_call_enqueue(departing_client.id().to_string());
-    let (send, _recv) = departing
+    }
+}
+
+/// Write one complete unary request on a fresh multiplexed stream, bypassing
+/// the client so nothing waits for the response.
+async fn send_request(connection: &aster::rpc::RpcConnection, header: &StreamHeader) {
+    let (send, _recv) = connection
         .core_connection()
         .open_streaming_substream()
         .await
         .unwrap();
-    let encoded_header = aster::rpc::encode_stream_header(&header).unwrap();
+    let encoded_header = aster::rpc::encode_stream_header(header).unwrap();
     let mut request = encode_frame(&encoded_header, FLAG_HEADER).unwrap();
     request.extend(encode_frame(b"departing", FLAG_END_STREAM).unwrap());
     send.write_all(request).await.unwrap();
+}
 
-    // The complete request is now owned by a stream task paused immediately
-    // before Call publication. Closing is ordinary connection teardown.
-    let connection_id = within(gate.paused()).await;
-    departing
-        .core_connection()
-        .close(0, b"finished".to_vec())
-        .unwrap();
-    within(gate.closed_enqueued()).await;
-    // Close is already in the event queue, so the serve loop consumes it before
-    // anything this task publishes, irrespective of runtime scheduling.
-    gate.resume();
-
-    // Suppressing the late call is correct; delivering it is acceptable only
-    // if it is cancelled and leaves nothing admitted. Either way the task has
-    // settled before the fresh peer below routes its call.
+/// After the gated call has settled: suppressing it is correct; delivering it
+/// is acceptable only if it is cancelled and everything it admitted is
+/// reaped. Then a fresh peer must be served, which fails with
+/// RESOURCE_EXHAUSTED if the late call resurrected an admission.
+async fn assert_late_call_left_nothing(
+    server: AsterServer,
+    sink: &RingSink,
+    consumer: &mut RingConsumer,
+    gate: &mut CallEnqueueGate,
+    connection_id: u64,
+    scope: ScopeKind,
+    departing_client: Node,
+) {
     let published = within(gate.settled()).await;
-    let mut late_call_id = None;
+    let mut late_call = None;
     let mut cancelled = !published;
     while !cancelled {
         within(consumer.ready()).await;
         consumer.drain(8, |event| match event {
             DispatchEvent::Call(call) => {
                 assert_eq!(call.connection_id, connection_id);
-                late_call_id = Some(call.handle.detach());
+                late_call = Some((call.call_id, call.session_key));
+                call.handle.detach();
             }
             DispatchEvent::Cancelled { call_id, reason } => {
-                assert_eq!(Some(call_id), late_call_id);
+                assert_eq!(Some(call_id), late_call.map(|(id, _)| id));
                 assert_eq!(reason, CancelReason::Peer);
                 cancelled = true;
             }
             other => panic!("unexpected departing connection event: {other:?}"),
         });
+    }
+    if let (Some((_, session_key)), ScopeKind::Session) = (late_call, scope) {
+        // A session created for a closed connection is reaped by nothing.
+        let mut reaped = false;
+        while !reaped {
+            tokio::time::timeout(WAIT, consumer.ready())
+                .await
+                .expect("a session created after its connection closed was never reaped");
+            consumer.drain(8, |event| match event {
+                DispatchEvent::SessionClosed { session_key: key } => {
+                    assert_eq!(key, session_key);
+                    reaped = true;
+                }
+                other => panic!("unexpected departing connection event: {other:?}"),
+            });
+        }
     }
     assert!(
         server.call_table().is_empty(),
@@ -129,10 +160,9 @@ async fn closed_connection_with_a_descheduled_call_releases_foreign_capacity() {
         "the drained cancellation must release call capacity"
     );
 
-    // A separate peer must still be able to use the server. This fails with
-    // RESOURCE_EXHAUSTED if the late Call resurrected connection admission.
     let (fresh_client, fresh) = connect(&server).await;
-    let unary = fresh.unary(&header, b"healthy".to_vec());
+    let fresh_header = header(scope);
+    let unary = fresh.unary(&fresh_header, b"healthy".to_vec());
     tokio::pin!(unary);
     let result = within(async {
         loop {
@@ -154,7 +184,85 @@ async fn closed_connection_with_a_descheduled_call_releases_foreign_capacity() {
     departing_client.shutdown().await;
     server.shutdown().await;
     assert_eq!(
-        result.expect("closed connection leaked foreign admission capacity"),
+        result.expect("a closed connection leaked foreign admission capacity"),
         b"healthy"
     );
+}
+
+/// The call pauses before publication until its connection's close event is
+/// enqueued, then resumes.
+async fn descheduled_past_close(scope: ScopeKind) {
+    let _serial = SERIAL.lock().await;
+    let (server, sink, mut consumer) = server(scope).await;
+    let (departing_client, departing) = connect(&server).await;
+    let mut gate = test_hooks::pause_next_call_enqueue(departing_client.id().to_string());
+    send_request(&departing, &header(scope)).await;
+
+    let connection_id = within(gate.paused()).await;
+    departing
+        .core_connection()
+        .close(0, b"finished".to_vec())
+        .unwrap();
+    within(gate.closed_enqueued()).await;
+    // Close is already in the event queue, so the serve loop consumes it before
+    // anything this task publishes, irrespective of runtime scheduling.
+    gate.resume();
+    assert_late_call_left_nothing(
+        server,
+        &sink,
+        &mut consumer,
+        &mut gate,
+        connection_id,
+        scope,
+        departing_client,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_connection_with_a_descheduled_call_releases_foreign_capacity() {
+    descheduled_past_close(ScopeKind::Shared).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_connection_with_a_descheduled_session_call_leaves_no_session() {
+    descheduled_past_close(ScopeKind::Session).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_blocked_on_a_full_queue_is_not_published_after_close() {
+    let _serial = SERIAL.lock().await;
+    let scope = ScopeKind::Shared;
+    let (server, sink, mut consumer) = server(scope).await;
+    let (departing_client, departing) = connect(&server).await;
+    let mut gate =
+        test_hooks::pause_next_call_enqueue_with_full_queue(departing_client.id().to_string());
+    send_request(&departing, &header(scope)).await;
+
+    assert!(
+        within(gate.filled()).await > 0,
+        "the event queue had no free slot to hold"
+    );
+    let connection_id = within(gate.paused()).await;
+    departing
+        .core_connection()
+        .close(0, b"finished".to_vec())
+        .unwrap();
+    // The close is marked and its event now waits for a slot in the full
+    // queue, ahead of the call's publication.
+    within(gate.close_sending()).await;
+    gate.resume();
+    gate.release_queue();
+    // Neither side holds anything across the wait for capacity: both finish.
+    within(gate.closed_enqueued()).await;
+    assert_late_call_left_nothing(
+        server,
+        &sink,
+        &mut consumer,
+        &mut gate,
+        connection_id,
+        scope,
+        departing_client,
+    )
+    .await;
 }

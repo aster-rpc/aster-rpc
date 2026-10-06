@@ -716,6 +716,8 @@ async fn connection_loop(
     // future resolves immediately; otherwise it resolves on the next
     // close frame.
     let info = conn.closed().await;
+    #[cfg(feature = "test-hooks")]
+    test_hooks::connection_close_sending(connection_id);
     let closed_enqueued = event_tx
         .send(ReactorEvent::ConnectionClosed {
             peer_id,
@@ -782,51 +784,86 @@ pub mod test_hooks {
 
     static WRITER_EXIT_PAUSE_US: AtomicU64 = AtomicU64::new(0);
     static CALL_ENQUEUE_GATE: Mutex<Option<PendingCallGate>> = Mutex::new(None);
-    static CLOSE_ENQUEUED: Mutex<Option<HashMap<u64, oneshot::Sender<()>>>> = Mutex::new(None);
+    static CLOSE_WAITERS: Mutex<Option<HashMap<u64, CloseWaiters>>> = Mutex::new(None);
 
     struct PendingCallGate {
         peer_id: String,
         paused: oneshot::Sender<u64>,
-        closed: oneshot::Sender<()>,
+        close: CloseWaiters,
         resume: oneshot::Receiver<()>,
         settled: oneshot::Sender<bool>,
+        /// Full-queue mode: reserve every free event slot before pausing and
+        /// hold them until this fires (or its sender drops).
+        fill: Option<(oneshot::Sender<usize>, oneshot::Receiver<()>)>,
+    }
+
+    struct CloseWaiters {
+        sending: Option<oneshot::Sender<()>>,
+        enqueued: Option<oneshot::Sender<()>>,
     }
 
     /// Pause the next fully read call from one peer before publishing its
     /// event. This models a descheduled stream task without sleeping or
     /// blocking a runtime worker. Only one gate may be installed at a time.
     pub fn pause_next_call_enqueue(peer_id: String) -> CallEnqueueGate {
+        install(peer_id, false)
+    }
+
+    /// As [`pause_next_call_enqueue`], and also fill the reactor event queue
+    /// when the call pauses: every free slot is reserved (no event is sent)
+    /// until [`CallEnqueueGate::release_queue`]. While it is held, the
+    /// connection's close and the call's publication both block on a full
+    /// queue, as they would behind a slow consumer.
+    pub fn pause_next_call_enqueue_with_full_queue(peer_id: String) -> CallEnqueueGate {
+        install(peer_id, true)
+    }
+
+    fn install(peer_id: String, fill: bool) -> CallEnqueueGate {
         let (paused_tx, paused) = oneshot::channel();
+        let (sending_tx, sending) = oneshot::channel();
         let (closed_tx, closed) = oneshot::channel();
         let (resume, resume_rx) = oneshot::channel();
         let (settled_tx, settled) = oneshot::channel();
+        let (filled_tx, filled) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
         let mut slot = CALL_ENQUEUE_GATE.lock().unwrap();
         assert!(slot.is_none(), "a call enqueue gate is already installed");
         *slot = Some(PendingCallGate {
             peer_id: peer_id.clone(),
             paused: paused_tx,
-            closed: closed_tx,
+            close: CloseWaiters {
+                sending: Some(sending_tx),
+                enqueued: Some(closed_tx),
+            },
             resume: resume_rx,
             settled: settled_tx,
+            fill: fill.then_some((filled_tx, release_rx)),
         });
         CallEnqueueGate {
             peer_id,
             connection_id: None,
             paused,
+            sending,
             closed,
             resume: Some(resume),
             settled,
+            filled,
+            release: Some(release),
         }
     }
 
-    /// Dropping the gate releases a paused task, including on test failure.
+    /// Dropping the gate releases a paused task and a held queue, including
+    /// on test failure.
     pub struct CallEnqueueGate {
         peer_id: String,
         connection_id: Option<u64>,
         paused: oneshot::Receiver<u64>,
+        sending: oneshot::Receiver<()>,
         closed: oneshot::Receiver<()>,
         resume: Option<oneshot::Sender<()>>,
         settled: oneshot::Receiver<bool>,
+        filled: oneshot::Receiver<usize>,
+        release: Option<oneshot::Sender<()>>,
     }
 
     impl CallEnqueueGate {
@@ -834,6 +871,22 @@ pub mod test_hooks {
             let id = (&mut self.paused).await.expect("call enqueue gate dropped");
             self.connection_id = Some(id);
             id
+        }
+
+        /// Full-queue mode: how many free event slots were reserved. Resolves
+        /// before [`paused`](Self::paused).
+        pub async fn filled(&mut self) -> usize {
+            (&mut self.filled)
+                .await
+                .expect("the gate is not in full-queue mode")
+        }
+
+        /// The connection's close has been marked and its close event is
+        /// about to be sent (it may then block on a full queue).
+        pub async fn close_sending(&mut self) {
+            (&mut self.sending)
+                .await
+                .expect("connection close gate dropped");
         }
 
         /// The matching close event has entered the reactor event queue.
@@ -846,6 +899,13 @@ pub mod test_hooks {
         pub fn resume(&mut self) {
             if let Some(resume) = self.resume.take() {
                 let _ = resume.send(());
+            }
+        }
+
+        /// Free the slots reserved in full-queue mode.
+        pub fn release_queue(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
             }
         }
 
@@ -887,14 +947,18 @@ pub mod test_hooks {
                 slot.take();
             }
             if let Some(id) = self.connection_id {
-                if let Some(waiters) = CLOSE_ENQUEUED.lock().unwrap().as_mut() {
+                if let Some(waiters) = CLOSE_WAITERS.lock().unwrap().as_mut() {
                     waiters.remove(&id);
                 }
             }
         }
     }
 
-    pub(super) async fn call_enqueue_pause(peer_id: &str, connection_id: u64) -> Option<Settled> {
+    pub(super) async fn call_enqueue_pause(
+        peer_id: &str,
+        connection_id: u64,
+        call_tx: &tokio::sync::mpsc::Sender<super::ReactorEvent>,
+    ) -> Option<Settled> {
         let gate = {
             let mut slot = CALL_ENQUEUE_GATE.lock().unwrap();
             if slot.as_ref().is_some_and(|gate| gate.peer_id == peer_id) {
@@ -903,25 +967,47 @@ pub mod test_hooks {
                 None
             }
         };
-        if let Some(gate) = gate {
-            CLOSE_ENQUEUED
-                .lock()
-                .unwrap()
-                .get_or_insert_with(HashMap::new)
-                .insert(connection_id, gate.closed);
-            let _ = gate.paused.send(connection_id);
-            let _ = gate.resume.await;
-            return Some(Settled(Some(gate.settled)));
+        let gate = gate?;
+        CLOSE_WAITERS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(connection_id, gate.close);
+        if let Some((filled, release)) = gate.fill {
+            let mut held = Vec::new();
+            while let Ok(permit) = call_tx.clone().try_reserve_owned() {
+                held.push(permit);
+            }
+            let _ = filled.send(held.len());
+            tokio::spawn(async move {
+                let _ = release.await;
+                drop(held);
+            });
         }
-        None
+        let _ = gate.paused.send(connection_id);
+        let _ = gate.resume.await;
+        Some(Settled(Some(gate.settled)))
+    }
+
+    pub(super) fn connection_close_sending(connection_id: u64) {
+        if let Some(sending) = CLOSE_WAITERS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|waiters| waiters.get_mut(&connection_id))
+            .and_then(|w| w.sending.take())
+        {
+            let _ = sending.send(());
+        }
     }
 
     pub(super) fn connection_closed_enqueued(connection_id: u64) {
-        if let Some(closed) = CLOSE_ENQUEUED
+        if let Some(closed) = CLOSE_WAITERS
             .lock()
             .unwrap()
             .as_mut()
             .and_then(|waiters| waiters.remove(&connection_id))
+            .and_then(|w| w.enqueued)
         {
             let _ = closed.send(());
         }
@@ -1337,7 +1423,7 @@ async fn dispatch_one_call(
     let mut req_tx_opt = if request_ended { None } else { Some(req_tx) };
 
     #[cfg(feature = "test-hooks")]
-    let settled = test_hooks::call_enqueue_pause(peer_id, connection_id).await;
+    let settled = test_hooks::call_enqueue_pause(peer_id, connection_id, call_tx).await;
 
     let call = ReactorEvent::Call(IncomingCall {
         call_id: next_call_id(),
