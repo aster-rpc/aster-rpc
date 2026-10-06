@@ -152,7 +152,7 @@ class Smoke {
   }
 }
 
-const root=process.cwd();
+const root=process.env.ASTER_CONSUMER_ROOT ?? process.cwd();
 const require=createRequire(import.meta.url);
 const asterEntry=fileURLToPath(import.meta.resolve('@aster-rpc/aster'));
 const loader=require.resolve('@aster-rpc/transport');
@@ -177,14 +177,14 @@ try {
   if(result.value!=='echo:candidate') throw Error('unary mismatch');
   const rows:Reply[]=[]; for await(const row of svc.sequence(Object.assign(new Request(),{value:'s',count:5}))) rows.push(row);
   if(rows.length!==5||rows.some((r,i)=>r.count!==i)) throw Error('stream mismatch');
-  const ac=new AbortController(); const hold=svc.hold(Object.assign(new Request(),{value:'cancel'}),{signal:ac.signal});
+  const ac=new AbortController(); const hold=(svc as any).hold(Object.assign(new Request(),{value:'cancel'}),{signal:ac.signal});
   await new Promise(r=>setTimeout(r,150)); ac.abort();
   try { await hold; throw Error('aborted call unexpectedly succeeded'); }
   catch(e) { if(e instanceof Error && e.message==='aborted call unexpectedly succeeded') throw e;
     if(!(e instanceof RpcError) || e.code!==StatusCode.CANCELLED) throw Error(`wrong cancel result: ${String(e)}`); }
   await waitUntil(()=>cancelSeen,4000,'server handler cancel acknowledgement');
   const deadlineStarted=Date.now();
-  try { await svc.delayed(Object.assign(new Request(),{value:'deadline'}),{deadlineSecs:0.2}); throw Error('deadline call unexpectedly succeeded'); }
+  try { await (svc as any).delayed(Object.assign(new Request(),{value:'deadline'}),{deadlineSecs:0.2}); throw Error('deadline call unexpectedly succeeded'); }
   catch(e) { if(e instanceof Error && e.message==='deadline call unexpectedly succeeded') throw e;
     if(!(e instanceof RpcError) || e.code!==StatusCode.DEADLINE_EXCEEDED) throw Error(`wrong deadline result: ${String(e)}`); }
   const deadlineElapsed=Date.now()-deadlineStarted;
@@ -295,15 +295,17 @@ def main() -> None:
         deps={"@aster-rpc/aster":"file:"+str(artifacts["npm-aster"][0]),
             "@aster-rpc/transport":"file:"+str(artifacts["npm-transport"][0]),
             "@aster-rpc/transport-linux-x64-gnu":"file:"+str(artifacts["npm-linux-x64-gnu"][0]),
+            "@types/node":"24.10.1",
             "typescript":"5.9.2"}
         (tdir/"package.json").write_text(json.dumps({"name":"aster-clean-consumer","private":True,"type":"module","dependencies":deps},indent=2)+"\n")
-        (tdir/"tsconfig.json").write_text(json.dumps({"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","experimentalDecorators":True,"skipLibCheck":True,"outDir":"dist","rootDir":"."},"include":["consumer.ts","aster-rpc.generated.ts"]},indent=2)+"\n")
+        (tdir/"tsconfig.json").write_text(json.dumps({"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","types":["node"],"skipLibCheck":True,"outDir":"dist","rootDir":"."},"include":["consumer.ts","aster-rpc.generated.ts"]},indent=2)+"\n")
         (tdir/"consumer.ts").write_text(TS_APP)
         run(["npm","install","--no-audit","--no-fund"],cwd=tdir,env=env,log_path=work/"npm-install.log")
         run(["npm","ls","--all","@aster-rpc/aster","@aster-rpc/transport","@aster-rpc/transport-linux-x64-gnu"],cwd=tdir,env=env,log_path=work/"npm-tree.log")
         run(["node_modules/.bin/aster-gen"],cwd=tdir,env=env,log_path=work/"typescript-gen.log")
         run(["node_modules/.bin/tsc"],cwd=tdir,env=env,log_path=work/"typescript-build.log")
-        run(["node","dist/consumer.js"],cwd=tdir,env=env,log_path=work/"typescript-smoke.log")
+        env["ASTER_CONSUMER_ROOT"] = str(tdir)
+        run(["node","consumer.js"],cwd=tdir/"dist",env=env,log_path=work/"typescript-smoke.log")
     print(f"CLEAN_CONSUMER_PASS report_dir={work}",flush=True)
 
 
