@@ -256,6 +256,86 @@ describe.skipIf(!hasDispatch).each(DISPATCH_DELIVERIES)('DispatchServer (%s)', (
   });
 });
 
+describe.skipIf(!hasDispatch)('DispatchServer ring delivery close', () => {
+  it('an attached ring server ends live and unread calls on close', async () => {
+    const node = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
+    const server = await native.DispatchServer.serve(
+      node,
+      [JSON.stringify(ECHO_SERVICE)],
+      { delivery: 'ring', ringCapacity: 16, builtinNodeInfo: false },
+    );
+    const peer = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
+    const conn = await peer.connectNodeAddr(node.nodeId(), RPC_ALPN, node.directAddresses(), undefined);
+    const transport = new IrohTransport(conn, BYTES as any);
+    try {
+      // One call taken by JS and left unanswered, one never taken.
+      const taken = transport.unary('test.Echo', 'echo', Buffer.from('taken'));
+      const first: DispatchEvent[] = await server.nextBatch(1);
+      expect(first.map((e) => e.kind)).toEqual([DispatchEventKind.Call]);
+      const unread = transport.unary('test.Echo', 'echo', Buffer.from('unread'));
+      await until(() => server.liveCalls() === 2);
+      await server.close();
+      // The node stays up (attached), so only close can end these calls.
+      const outcome = (p: Promise<unknown>) =>
+        Promise.race([
+          p.then(
+            () => 'answered',
+            (e) => (e instanceof RpcError ? e.code : String(e)),
+          ),
+          new Promise((r) => setTimeout(() => r('hung'), 5000)),
+        ]);
+      expect(await outcome(taken)).toBe(StatusCode.INTERNAL);
+      expect(await outcome(unread)).toBe(StatusCode.INTERNAL);
+      expect(server.liveCalls()).toBe(0);
+    } finally {
+      try { conn.close(0, 'done'); } catch { /* ignore */ }
+      await peer.close();
+      await node.close();
+    }
+  });
+});
+
+describe.skipIf(typeof native?.DispatchServer?.prototype?.debugFailDelivery !== 'function')(
+  'DispatchServer attach window',
+  () => {
+    it('delivers a call that arrives before serve() resolves', async () => {
+      const node = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
+      const peer = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
+      process.env.ASTER_TEST_DISPATCH_ATTACH_DELAY_MS = '1000';
+      let conn: any;
+      let loop: DispatchLoop | undefined;
+      try {
+        const serving = DispatchLoop.start({
+          node,
+          services: [ECHO_SERVICE],
+          delivery: 'tsfn-batched',
+          builtinNodeInfo: false,
+          onCall: (ev, srv) => {
+            void respondCall(srv, ev.callId, Buffer.concat([Buffer.from('echo:'), ev.request!]));
+          },
+        } as any);
+        // Call while the server accepts but has not attached its call table.
+        await new Promise((r) => setTimeout(r, 300));
+        conn = await peer.connectNodeAddr(node.nodeId(), RPC_ALPN, node.directAddresses(), undefined);
+        const transport = new IrohTransport(conn, BYTES as any);
+        const reply = transport.unary('test.Echo', 'echo', Buffer.from('early'));
+        loop = await serving;
+        const got = await Promise.race([
+          reply.then((b: any) => Buffer.from(b).toString()),
+          new Promise((r) => setTimeout(() => r('hung'), 5000)),
+        ]);
+        expect(got).toBe('echo:early');
+      } finally {
+        delete process.env.ASTER_TEST_DISPATCH_ATTACH_DELAY_MS;
+        try { conn?.close(0, 'done'); } catch { /* ignore */ }
+        await loop?.close();
+        await peer.close();
+        await node.close();
+      }
+    });
+  },
+);
+
 describe.skipIf(!hasDispatch)('DispatchServer bounded TSFN delivery', () => {
   it('closes an idle pump forwarder and clears its callback queue', async () => {
     const server = await native.DispatchServer.start(

@@ -136,10 +136,16 @@ export class DispatchLoop {
     const json = opts.services.map((s) => JSON.stringify(s));
     let loop: DispatchLoop | undefined;
     // `handle` closes over `loop` so the TSFN callback, created before the
-    // native server exists, can reach it once `start` resolves. Events
-    // cannot arrive before that: the address is not published yet.
+    // native server exists, can reach it once `start` resolves. A peer that
+    // already knows the node (`serve`, or a persistent identity) can call
+    // before then: hold those events until `loop` exists.
+    let early: DispatchEvent[] = [];
     const handle = (events: DispatchEvent[]): void => {
-      const srv = loop!.native;
+      if (!loop) {
+        for (let i = 0; i < events.length; i++) early.push(events[i]);
+        return;
+      }
+      const srv = loop.native;
       for (let i = 0; i < events.length; i++) {
         const ev = events[i];
         if (ev.kind === DispatchEventKind.Call) {
@@ -172,6 +178,9 @@ export class DispatchLoop {
       ? await native.DispatchServer.serve(opts.node as any, json, nativeOpts, onEvents, opts.gateAttributes as any)
       : await native.DispatchServer.start(opts.config, json, nativeOpts, onEvents);
     loop = new DispatchLoop(srv, delivery);
+    const held = early;
+    early = [];
+    if (held.length) handle(held);
     if (delivery === 'ring-await') loop.runAwait(handle, batchMax);
     else if (delivery === 'ring-poll') loop.runPoll(handle, batchMax);
     return loop;

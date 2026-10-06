@@ -970,6 +970,9 @@ impl Sinks {
     ) -> DispatchServer {
         if let Some(s) = &self.tsfn_sink {
             let _ = s.table.set(table.clone());
+            // A drain that ran before the table existed returned nothing and
+            // left its events queued; schedule another for them.
+            s.notify();
         }
         DispatchServer {
             running: Arc::new(tokio::sync::Mutex::new(Some(running))),
@@ -1069,6 +1072,8 @@ impl DispatchServer {
             }
             let table = server.call_table();
             let handle = server.serve();
+            #[cfg(feature = "test-hooks")]
+            attach_delay().await;
             Ok(sinks.finish(
                 Running::Attached(handle),
                 table,
@@ -1261,6 +1266,11 @@ impl DispatchServer {
         let mut consumer = ring.consumer.lock().await;
         let mut out = EvBatch::empty().with_cleanup(self.table.clone(), self.shared.clone());
         loop {
+            // Register before checking `closed`: `close` must not slip
+            // between the check and the wait, since it then needs this lock.
+            let closed = ring.close_notify.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
             if ring.closed.load(Ordering::Acquire) {
                 return Ok(out);
             }
@@ -1268,7 +1278,6 @@ impl DispatchServer {
             if !out.is_empty() || consumer.is_closed() {
                 return Ok(out);
             }
-            let closed = ring.close_notify.notified();
             tokio::select! {
                 _ = consumer.ready() => {}
                 _ = closed => {}
@@ -1453,9 +1462,34 @@ impl DispatchServer {
             Some(Running::Attached(handle)) => handle.abort(),
             None => {}
         }
+        if let Some(r) = &self.ring {
+            // As TSFN shutdown: release what JS never took and end live
+            // calls (an attached node keeps their connections open).
+            let mut consumer = r.consumer.lock().await;
+            consumer.close();
+            consumer.drain_admitted(usize::MAX, |event, handoff| {
+                let _ = self.shared.convert(event);
+                drop(handoff);
+            });
+            drop(consumer);
+            self.table.abandon_all();
+        }
         self.shared.non_rpc.lock().unwrap().clear();
         self.shared.connections.lock().unwrap().clear();
         Ok(())
+    }
+}
+
+/// Test hook: widen the window in which an attached server is already
+/// serving but its call table is not yet attached to the delivery sink.
+#[cfg(feature = "test-hooks")]
+async fn attach_delay() {
+    let ms = std::env::var("ASTER_TEST_DISPATCH_ATTACH_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if ms > 0 {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 }
 
