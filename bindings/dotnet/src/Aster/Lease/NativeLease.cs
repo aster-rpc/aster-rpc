@@ -231,13 +231,10 @@ public sealed class NativeFencedResource : IDisposable
     public async Task<MutateResult> MutateAsync(Fence fence, string writer, byte[] op, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        ulong opId = await _runtime.SubmitAsync((out ulong operation) =>
-        {
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-            using var scope = new NativeScope();
-            return Native.aster_fenced_mutate(_runtime.Handle, _handle, scope.Utf8(fence.Resource), fence.Epoch,
-                scope.Utf8(fence.Holder), scope.Utf8(writer), scope.Bytes(op), 0, out operation);
-        }, "aster_fenced_mutate", cancellationToken).ConfigureAwait(false);
+        ulong opId;
+        using (var scope = new NativeScope())
+            Native.Check(Native.aster_fenced_mutate(_runtime.Handle, _handle, scope.Utf8(fence.Resource), fence.Epoch,
+                scope.Utf8(fence.Holder), scope.Utf8(writer), scope.Bytes(op), 0, out opId), "aster_fenced_mutate");
         var (_, data) = await Operations.AwaitAsync(_runtime, opId, EventKind.BytesResult, "aster_fenced_mutate", cancellationToken).ConfigureAwait(false);
         return Ucv1.DecodeFencedMutateResponse(data);
     }

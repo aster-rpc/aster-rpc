@@ -1095,7 +1095,7 @@ pub unsafe extern "C" fn aster_node_start(
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(handle, slot.clone());
                 }
-                bridge2.emit_simple(
+                let completed = bridge2.emit_simple(
                     aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -1104,8 +1104,13 @@ pub unsafe extern "C" fn aster_node_start(
                     user_data,
                     0,
                 );
-                if let Some(receiver) = receiver {
-                    spawn_hook_drainers(&bridge2, handle, user_data, receiver, slot);
+                if completed {
+                    if let Some(receiver) = receiver {
+                        spawn_hook_drainers(&bridge2, handle, user_data, receiver, slot);
+                    }
+                } else {
+                    forget_node(&bridge2, handle);
+                    bridge2.nodes.remove(handle);
                 }
             }
             Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),

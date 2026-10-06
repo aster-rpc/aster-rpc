@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 6
+#define ASTER_ABI_VERSION_MINOR 7
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -357,6 +357,11 @@ typedef enum aster_status_t {
    * running pipeline's, or a second concurrent `aster_log_poll`.
    */
   ASTER_STATUS_ALREADY_EXISTS = 17,
+  /**
+   * ABI 4.7: the independent asynchronous-operation admission bound is
+   * exhausted. The refused operation did not start.
+   */
+  ASTER_STATUS_OPERATION_LIMIT = 18,
 } aster_status_t;
 
 /**
@@ -1354,8 +1359,10 @@ typedef enum aster_span_kind_t {
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
   uint32_t worker_threads;
+  /** Maximum events waiting for aster_poll_events; 0 = 4096. */
   uint32_t event_queue_capacity;
-  uint32_t reserved;
+  /** Maximum admitted async operations; 0 = 4096. Independent of event queue capacity. */
+  uint32_t max_inflight_operations;
 } aster_runtime_config_t;
 
 /**

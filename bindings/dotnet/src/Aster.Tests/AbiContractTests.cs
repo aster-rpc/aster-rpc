@@ -66,9 +66,11 @@ public class AbiContractTests
         //   uint32_t struct_size;        // 0
         //   uint32_t worker_threads;     // 4
         //   uint32_t event_queue_capacity; // 8
-        //   uint32_t reserved;           // 12
+        //   uint32_t max_inflight_operations; // 12
         // }; = 16 bytes
         Assert.Equal(16, Marshal.SizeOf<RuntimeConfig>());
+        Assert.Equal(8, Marshal.OffsetOf<RuntimeConfig>(nameof(RuntimeConfig.event_queue_capacity)).ToInt32());
+        Assert.Equal(12, Marshal.OffsetOf<RuntimeConfig>(nameof(RuntimeConfig.max_inflight_operations)).ToInt32());
     }
 
     [Fact]
@@ -312,6 +314,7 @@ public class AbiContractTests
         Assert.Equal(10, (int)Status.ConnectionRefused);
         Assert.Equal(11, (int)Status.StreamReset);
         Assert.Equal(12, (int)Status.AbiMismatch);
+        Assert.Equal(18, (int)Status.OperationLimit);
     }
 
     // ─── Runtime version check ────────────────────────────────────────────────

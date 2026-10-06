@@ -216,10 +216,10 @@ public final class IrohLibrary implements SymbolLookup {
   public static final int EXPECTED_ABI_MAJOR = 4;
 
   /**
-   * Lowest C ABI minor version this binding runs against: 4.6 added the observability, log bridge,
-   * metrics, span and health functions ({@code site.aster.otel}, {@code site.aster.health}).
+   * Lowest C ABI minor version this binding runs against: 4.7 separates the event queue from the
+   * asynchronous-operation admission bound.
    */
-  public static final int REQUIRED_ABI_MINOR = 6;
+  public static final int REQUIRED_ABI_MINOR = 7;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {
@@ -2083,14 +2083,15 @@ public final class IrohLibrary implements SymbolLookup {
           );
 
   /**
-   * aster_runtime_config_t: struct_size, worker_threads, event_queue_capacity, reserved. 16 bytes.
+   * aster_runtime_config_t: struct_size, worker_threads, event_queue_capacity,
+   * max_inflight_operations. 16 bytes.
    */
   public static final MemoryLayout ASTER_RUNTIME_CONFIG =
       MemoryLayout.structLayout(
           ValueLayout.JAVA_INT.withName("struct_size"), // 0
           ValueLayout.JAVA_INT.withName("worker_threads"), // 4
           ValueLayout.JAVA_INT.withName("event_queue_capacity"), // 8
-          ValueLayout.JAVA_INT.withName("reserved") // 12
+          ValueLayout.JAVA_INT.withName("max_inflight_operations") // 12
           );
 
   /**

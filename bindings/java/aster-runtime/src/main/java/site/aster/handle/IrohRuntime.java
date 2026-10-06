@@ -40,7 +40,7 @@ public class IrohRuntime implements AutoCloseable {
     configSeg.set(ValueLayout.JAVA_INT, 0, (int) IrohLibrary.ASTER_RUNTIME_CONFIG.byteSize());
     configSeg.set(ValueLayout.JAVA_INT, 4, 0); // worker_threads = 0 (library default)
     configSeg.set(ValueLayout.JAVA_INT, 8, 0); // event_queue_capacity = 0 (library default)
-    configSeg.set(ValueLayout.JAVA_INT, 12, 0); // reserved
+    configSeg.set(ValueLayout.JAVA_INT, 12, 0); // max_inflight_operations = 0 (library default)
 
     var runtimeNew =
         lib.getHandle(

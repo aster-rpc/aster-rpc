@@ -134,7 +134,7 @@ pub mod upcall;
 //   Behaviour on misuse: `aster_upcall_poll` refuses a tokio runtime thread.
 //   See `ffi/RENAME_MAP.md` "New in 4.6".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 6;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 7;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -199,6 +199,10 @@ pub enum aster_status_t {
     /// `aster_observability_init` with a configuration that differs from the
     /// running pipeline's, or a second concurrent `aster_log_poll`.
     ASTER_STATUS_ALREADY_EXISTS = 17,
+    /// ABI 4.7: the independent asynchronous-operation admission bound is
+    /// exhausted. The refused operation did not start and may be retried only
+    /// when the caller knows an existing operation can finish independently.
+    ASTER_STATUS_OPERATION_LIMIT = 18,
 }
 
 /// Relay mode
@@ -440,12 +444,12 @@ pub enum aster_hook_decision_t {
 pub struct aster_runtime_config_t {
     pub struct_size: u32,
     pub worker_threads: u32,
-    /// Maximum admitted asynchronous operations and queued pushed events.
-    /// Zero selects the default (4096). An async operation that cannot reserve
-    /// its terminal-event slot returns `ASTER_STATUS_QUEUE_FULL` before it
-    /// starts; retry after polling at least one event.
+    /// Maximum events waiting for `aster_poll_events`. Zero selects 4096.
     pub event_queue_capacity: u32,
-    pub reserved: u32,
+    /// Maximum admitted asynchronous operations, including terminal events
+    /// waiting for queue capacity. Zero selects 4096. Admission above this
+    /// independent bound returns `ASTER_STATUS_OPERATION_LIMIT` before work starts.
+    pub max_inflight_operations: u32,
 }
 
 #[repr(C)]
@@ -666,9 +670,12 @@ impl EventInternal {
 /// `event.buffer_id`, which keeps `aster_event_t.data_ptr` valid until
 /// `aster_buffer_release`. (The queue used to carry a second reference that
 /// polling `mem::forget`-ed, leaking every payload.)
-#[derive(Default)]
 struct EventOwned {
     event: EventInternal,
+    data: Option<Vec<u8>>,
+    /// Keeps the operation-admission slot occupied until its terminal event
+    /// has entered and then left the polled-event queue.
+    _operation_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 // ============================================================================
@@ -698,6 +705,11 @@ impl BufferRegistry {
     #[allow(dead_code)]
     pub(crate) fn get(&self, id: u64) -> Option<Arc<[u8]>> {
         self.buffers.read().unwrap().get(&id).cloned()
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.buffers.read().unwrap().len()
     }
 
     pub(crate) fn release(&self, id: u64) -> bool {
@@ -736,8 +748,9 @@ pub(crate) struct BridgeRuntime {
     pub(crate) runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
     events_tx: tokio::sync::mpsc::Sender<EventOwned>,
     events_rx: Mutex<tokio::sync::mpsc::Receiver<EventOwned>>,
-    closing: AtomicBool,
-    close_notify: tokio::sync::Notify,
+    operation_slots: Arc<tokio::sync::Semaphore>,
+    closing: Arc<AtomicBool>,
+    close_notify: Arc<tokio::sync::Notify>,
 
     // Handle registries
     pub(crate) nodes: HandleRegistry<CoreNode>,
@@ -835,13 +848,13 @@ impl RuntimeTeardown {
 struct OperationState {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     user_data: u64,
-    /// Reserved before the operation starts, so its one terminal event can
-    /// never be stranded behind a full queue or dropped.
-    completion: Mutex<Option<tokio::sync::mpsc::OwnedPermit<EventOwned>>>,
+    /// Independent operation-admission budget. It travels with the terminal
+    /// event and is released only when that event is polled or shutdown drops it.
+    completion: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl BridgeRuntime {
-    fn new(worker_threads: u32, queue_capacity: u32) -> Result<Self> {
+    fn new(worker_threads: u32, queue_capacity: u32, max_inflight_operations: u32) -> Result<Self> {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.enable_all();
 
@@ -858,14 +871,20 @@ impl BridgeRuntime {
         } else {
             4096
         } as usize;
+        let operation_capacity = if max_inflight_operations > 0 {
+            max_inflight_operations
+        } else {
+            4096
+        } as usize;
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(capacity);
 
         Ok(Self {
             runtime: std::mem::ManuallyDrop::new(runtime),
             events_tx,
             events_rx: Mutex::new(events_rx),
-            closing: AtomicBool::new(false),
-            close_notify: tokio::sync::Notify::new(),
+            operation_slots: Arc::new(tokio::sync::Semaphore::new(operation_capacity)),
+            closing: Arc::new(AtomicBool::new(false)),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
             nodes: HandleRegistry::new(),
             connections: HandleRegistry::new(),
             send_streams: HandleRegistry::new(),
@@ -919,9 +938,45 @@ impl BridgeRuntime {
         self.close_notify.notify_waiters();
     }
 
-    /// Deliver one operation's terminal event through the slot reserved when
-    /// the operation was admitted. The first terminal path wins; cancellation
-    /// and normal completion can race without duplicating or losing a result.
+    /// Queue one operation's terminal event. The independent operation permit
+    /// bounds terminal senders waiting behind a full event queue without
+    /// consuming the queue capacity needed by pushed dependencies.
+    fn enqueue_terminal(
+        &self,
+        event: EventInternal,
+        data: Option<Vec<u8>>,
+        operation_slot: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let owned = EventOwned {
+            event,
+            data,
+            _operation_slot: Some(operation_slot),
+        };
+        match self.events_tx.try_send(owned) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(owned)) => {
+                let sender = self.events_tx.clone();
+                let closing = self.closing.clone();
+                let close_notify = self.close_notify.clone();
+                self.runtime.spawn(async move {
+                    let notified = close_notify.notified();
+                    tokio::pin!(notified);
+                    if closing.load(Ordering::Acquire) {
+                        return;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = &mut notified => {}
+                        _ = sender.send(owned) => {}
+                    }
+                });
+            }
+        }
+    }
+
+    /// The first terminal path wins; cancellation and normal completion can
+    /// race without duplicating a result.
     fn complete(&self, event: EventInternal, data: Option<Vec<u8>>) -> bool {
         debug_assert_ne!(event.operation, 0);
         let Some(operation) = self.operations.remove(event.operation) else {
@@ -935,13 +990,7 @@ impl BridgeRuntime {
         else {
             return false;
         };
-        let event = if let Some(data) = data {
-            let (buffer, bytes) = self.buffers.insert(data);
-            event.with_buffer(buffer, bytes.len())
-        } else {
-            event
-        };
-        permit.send(EventOwned { event });
+        self.enqueue_terminal(event, data, permit);
         true
     }
 
@@ -1000,15 +1049,88 @@ impl BridgeRuntime {
         related: u64,
         user_data: u64,
         error_code: i32,
-    ) {
+    ) -> bool {
         let event = EventInternal::new(
             kind, status, operation, handle, related, user_data, error_code,
         );
-        self.complete(event, None);
+        self.complete(event, None)
     }
 
-    fn emit_with_data(&self, event: EventInternal, data: Vec<u8>) {
-        self.complete(event, Some(data));
+    fn emit_with_data(&self, event: EventInternal, data: Vec<u8>) -> bool {
+        self.complete(event, Some(data))
+    }
+
+    /// Complete an operation that has already inserted a returned resource
+    /// handle. If cancellation won the completion race, remove the handle so
+    /// it cannot become an unreachable registry entry.
+    fn complete_with_handle<T>(
+        &self,
+        event: EventInternal,
+        data: Option<Vec<u8>>,
+        registry: &HandleRegistry<T>,
+        handle: u64,
+    ) -> bool {
+        let completed = self.complete(event, data);
+        if !completed {
+            registry.remove(handle);
+        }
+        completed
+    }
+
+    /// Paired form for APIs that return send/receive or document/subscription
+    /// handles in one terminal event.
+    fn complete_with_handles<T, U>(
+        &self,
+        event: EventInternal,
+        data: Option<Vec<u8>>,
+        first_registry: &HandleRegistry<T>,
+        first: u64,
+        second_registry: &HandleRegistry<U>,
+        second: u64,
+    ) -> bool {
+        let completed = self.complete(event, data);
+        if !completed {
+            first_registry.remove(first);
+            second_registry.remove(second);
+        }
+        completed
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_simple_with_handle<T>(
+        &self,
+        kind: aster_event_kind_t,
+        status: aster_status_t,
+        operation: u64,
+        handle: u64,
+        related: u64,
+        user_data: u64,
+        error_code: i32,
+        registry: &HandleRegistry<T>,
+    ) -> bool {
+        let event = EventInternal::new(
+            kind, status, operation, handle, related, user_data, error_code,
+        );
+        self.complete_with_handle(event, None, registry, handle)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_simple_with_handles<T, U>(
+        &self,
+        kind: aster_event_kind_t,
+        status: aster_status_t,
+        operation: u64,
+        first: u64,
+        second: u64,
+        user_data: u64,
+        error_code: i32,
+        first_registry: &HandleRegistry<T>,
+        second_registry: &HandleRegistry<U>,
+    ) -> bool {
+        let event = EventInternal::new(
+            kind, status, operation, first, second, user_data, error_code,
+        );
+        self.complete_with_handles(event, None, first_registry, first, second_registry, second)
     }
 
     /// Backpressure a pushed event that has no operation admission slot. The
@@ -1029,9 +1151,10 @@ impl BridgeRuntime {
                 Err(_) => return false,
             },
         };
-        let (buffer, bytes) = self.buffers.insert(data);
         permit.send(EventOwned {
-            event: event.with_buffer(buffer, bytes.len()),
+            event,
+            data: Some(data),
+            _operation_slot: None,
         });
         true
     }
@@ -1043,18 +1166,11 @@ impl BridgeRuntime {
         if self.closing.load(Ordering::Acquire) {
             return Err(aster_status_t::ASTER_STATUS_ALREADY_CLOSED);
         }
-        let completion =
-            self.events_tx
-                .clone()
-                .try_reserve_owned()
-                .map_err(|error| match error {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        aster_status_t::ASTER_STATUS_QUEUE_FULL
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        aster_status_t::ASTER_STATUS_ALREADY_CLOSED
-                    }
-                })?;
+        let completion = self
+            .operation_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| aster_status_t::ASTER_STATUS_OPERATION_LIMIT)?;
         if self.closing.load(Ordering::Acquire) {
             return Err(aster_status_t::ASTER_STATUS_ALREADY_CLOSED);
         }
@@ -1100,8 +1216,8 @@ impl BridgeRuntime {
         else {
             return false;
         };
-        permit.send(EventOwned {
-            event: EventInternal::new(
+        self.enqueue_terminal(
+            EventInternal::new(
                 aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED,
                 aster_status_t::ASTER_STATUS_CANCELLED,
                 op_id,
@@ -1110,7 +1226,9 @@ impl BridgeRuntime {
                 op.user_data,
                 aster_status_t::ASTER_STATUS_CANCELLED as i32,
             ),
-        });
+            None,
+            permit,
+        );
         true
     }
 }
@@ -1334,8 +1452,12 @@ pub unsafe extern "C" fn aster_runtime_new(
         .as_ref()
         .map(|c| c.event_queue_capacity)
         .unwrap_or(4096);
+    let max_inflight_operations = config
+        .as_ref()
+        .map(|c| c.max_inflight_operations)
+        .unwrap_or(4096);
 
-    let bridge = match BridgeRuntime::new(worker_threads, queue_capacity) {
+    let bridge = match BridgeRuntime::new(worker_threads, queue_capacity, max_inflight_operations) {
         Ok(b) => b,
         Err(e) => return set_last_error(e),
     };
@@ -1465,7 +1587,7 @@ pub unsafe extern "C" fn aster_poll_events(
     let mut written = 0usize;
 
     if let Some(event_owned) = first {
-        let ev = to_iroh_event(&event_owned.event, &bridge.buffers);
+        let ev = to_iroh_event(event_owned, &bridge.buffers);
         unsafe {
             ptr::write(out_events.add(written), ev);
         }
@@ -1477,7 +1599,7 @@ pub unsafe extern "C" fn aster_poll_events(
     while written < max_events {
         match guard.try_recv() {
             Ok(event_owned) => {
-                let ev = to_iroh_event(&event_owned.event, &bridge.buffers);
+                let ev = to_iroh_event(event_owned, &bridge.buffers);
                 unsafe {
                     ptr::write(out_events.add(written), ev);
                 }
@@ -1491,7 +1613,12 @@ pub unsafe extern "C" fn aster_poll_events(
 }
 
 /// Convert internal EventInternal to C-compatible aster_event_t
-fn to_iroh_event(event: &EventInternal, buffers: &BufferRegistry) -> aster_event_t {
+fn to_iroh_event(mut owned: EventOwned, buffers: &BufferRegistry) -> aster_event_t {
+    if let Some(data) = owned.data.take() {
+        let (buffer, bytes) = buffers.insert(data);
+        owned.event = owned.event.with_buffer(buffer, bytes.len());
+    }
+    let event = &owned.event;
     let (data_ptr, data_len) = if event.buffer_id != 0 {
         if let Some(buf) = buffers.get(event.buffer_id) {
             (buf.as_ptr(), buf.len())
@@ -1662,6 +1789,9 @@ pub extern "C" fn aster_status_name(status: i32) -> *const c_char {
         }
         x if x == aster_status_t::ASTER_STATUS_ALREADY_EXISTS as i32 => {
             "ASTER_STATUS_ALREADY_EXISTS\0"
+        }
+        x if x == aster_status_t::ASTER_STATUS_OPERATION_LIMIT as i32 => {
+            "ASTER_STATUS_OPERATION_LIMIT\0"
         }
         _ => "ASTER_STATUS_UNKNOWN\0",
     };
@@ -2089,7 +2219,7 @@ pub unsafe extern "C" fn aster_connect(
         match connect_result {
             Ok(conn) => {
                 let handle = bridge2.connections.insert(conn);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_CONNECTED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -2097,6 +2227,7 @@ pub unsafe extern "C" fn aster_connect(
                     endpoint_or_node,
                     user_data,
                     0,
+                    &bridge2.connections,
                 );
             }
             Err(e) => {
@@ -2154,7 +2285,7 @@ pub unsafe extern "C" fn aster_accept(
         match node_arc.accept_aster().await {
             Ok((_alpn, conn)) => {
                 let handle = bridge2.connections.insert(conn);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_CONNECTION_ACCEPTED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -2162,6 +2293,7 @@ pub unsafe extern "C" fn aster_accept(
                     node,
                     user_data,
                     0,
+                    &bridge2.connections,
                 );
             }
             Err(e) => {
@@ -2229,7 +2361,7 @@ pub unsafe extern "C" fn aster_node_accept_aster(
                     0,
                 );
                 // ALPN bytes go into the event payload (data_ptr/data_len).
-                bridge2.emit_with_data(event, alpn);
+                bridge2.complete_with_handle(event, Some(alpn), &bridge2.connections, conn_handle);
             }
             Err(e) => {
                 bridge2.emit_error(op_id, user_data, &e.to_string());
@@ -2495,7 +2627,7 @@ pub unsafe extern "C" fn aster_open_bi(
             Ok((send, recv)) => {
                 let send_handle = bridge2.send_streams.insert(send);
                 let recv_handle = bridge2.recv_streams.insert(recv);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handles(
                     aster_event_kind_t::ASTER_EVENT_STREAM_OPENED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -2503,6 +2635,8 @@ pub unsafe extern "C" fn aster_open_bi(
                     recv_handle,
                     user_data,
                     0,
+                    &bridge2.send_streams,
+                    &bridge2.recv_streams,
                 );
             }
             Err(e) => {
@@ -2553,7 +2687,7 @@ pub unsafe extern "C" fn aster_accept_bi(
             Ok((send, recv)) => {
                 let send_handle = bridge2.send_streams.insert(send);
                 let recv_handle = bridge2.recv_streams.insert(recv);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handles(
                     aster_event_kind_t::ASTER_EVENT_STREAM_ACCEPTED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -2561,6 +2695,8 @@ pub unsafe extern "C" fn aster_accept_bi(
                     recv_handle,
                     user_data,
                     0,
+                    &bridge2.send_streams,
+                    &bridge2.recv_streams,
                 );
             }
             Err(e) => {
@@ -2675,7 +2811,7 @@ pub unsafe extern "C" fn aster_connection_open_tunnel(
             Ok((send, recv)) => {
                 let send_handle = bridge2.send_streams.insert(send);
                 let recv_handle = bridge2.recv_streams.insert(recv);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handles(
                     aster_event_kind_t::ASTER_EVENT_STREAM_OPENED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -2683,6 +2819,8 @@ pub unsafe extern "C" fn aster_connection_open_tunnel(
                     recv_handle,
                     user_data,
                     0,
+                    &bridge2.send_streams,
+                    &bridge2.recv_streams,
                 );
             }
             Err(e) => {
@@ -2732,7 +2870,7 @@ pub unsafe extern "C" fn aster_open_uni(
         match conn_arc.open_uni().await {
             Ok(send) => {
                 let handle = bridge2.send_streams.insert(send);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_STREAM_OPENED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -2740,6 +2878,7 @@ pub unsafe extern "C" fn aster_open_uni(
                     0,
                     user_data,
                     0,
+                    &bridge2.send_streams,
                 );
             }
             Err(e) => {
@@ -2789,7 +2928,7 @@ pub unsafe extern "C" fn aster_accept_uni(
         match conn_arc.accept_uni().await {
             Ok(recv) => {
                 let handle = bridge2.recv_streams.insert(recv);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_STREAM_ACCEPTED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -2797,6 +2936,7 @@ pub unsafe extern "C" fn aster_accept_uni(
                     0,
                     user_data,
                     0,
+                    &bridge2.recv_streams,
                 );
             }
             Err(e) => {
@@ -4638,7 +4778,7 @@ pub unsafe extern "C" fn aster_docs_create(
         match docs.create().await {
             Ok(doc) => {
                 let handle = bridge2.docs.insert(doc);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_DOC_CREATED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -4646,6 +4786,7 @@ pub unsafe extern "C" fn aster_docs_create(
                     node,
                     user_data,
                     0,
+                    &bridge2.docs,
                 );
             }
             Err(e) => {
@@ -4761,7 +4902,7 @@ pub unsafe extern "C" fn aster_docs_join(
         match docs.join(ticket_str).await {
             Ok(doc) => {
                 let handle = bridge2.docs.insert(doc);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_DOC_JOINED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -4769,6 +4910,7 @@ pub unsafe extern "C" fn aster_docs_join(
                     node,
                     user_data,
                     0,
+                    &bridge2.docs,
                 );
             }
             Err(e) => {
@@ -5449,7 +5591,7 @@ pub unsafe extern "C" fn aster_doc_subscribe(
         match doc_arc.subscribe().await {
             Ok(receiver) => {
                 let handle = bridge2.doc_event_receivers.insert(receiver);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_DOC_SUBSCRIBED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -5457,6 +5599,7 @@ pub unsafe extern "C" fn aster_doc_subscribe(
                     doc,
                     user_data,
                     0,
+                    &bridge2.doc_event_receivers,
                 );
             }
             Err(e) => {
@@ -5756,7 +5899,7 @@ pub unsafe extern "C" fn aster_docs_join_and_subscribe(
                 let doc_handle = bridge2.docs.insert(doc);
                 let receiver_handle = bridge2.doc_event_receivers.insert(receiver);
                 // event.handle = doc_handle, event.related = receiver_handle
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handles(
                     aster_event_kind_t::ASTER_EVENT_DOC_JOINED_AND_SUBSCRIBED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -5764,6 +5907,8 @@ pub unsafe extern "C" fn aster_docs_join_and_subscribe(
                     receiver_handle,
                     user_data,
                     0,
+                    &bridge2.docs,
+                    &bridge2.doc_event_receivers,
                 );
             }
             Err(e) => bridge2.emit_error(op_id, user_data, &e.to_string()),
@@ -5821,7 +5966,7 @@ pub unsafe extern "C" fn aster_gossip_subscribe(
         match gossip.subscribe(topic_bytes, peers_strs).await {
             Ok(topic_handle) => {
                 let handle = bridge2.gossip_topics.insert(topic_handle);
-                bridge2.emit_simple(
+                bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_GOSSIP_SUBSCRIBED,
                     aster_status_t::ASTER_STATUS_OK,
                     op_id,
@@ -5829,6 +5974,7 @@ pub unsafe extern "C" fn aster_gossip_subscribe(
                     node,
                     user_data,
                     0,
+                    &bridge2.gossip_topics,
                 );
             }
             Err(e) => {
@@ -8115,15 +8261,15 @@ mod runtime_drop_tests {
 mod event_buffer_tests {
     use super::*;
 
-    /// `aster_runtime_config_t.event_queue_capacity` bounds admitted
-    /// operations and their reserved terminal-event slots.
+    /// `aster_runtime_config_t.max_inflight_operations` independently bounds
+    /// admitted operations and their pending terminal events.
     #[test]
-    fn runtime_event_queue_capacity_bounds_pending_events() {
+    fn runtime_max_inflight_operations_bounds_pending_operations() {
         let config = aster_runtime_config_t {
             struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
             worker_threads: 1,
             event_queue_capacity: 2,
-            reserved: 0,
+            max_inflight_operations: 2,
         };
         let mut handle: aster_runtime_t = 0;
         let status = unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut handle) };
@@ -8146,7 +8292,7 @@ mod event_buffer_tests {
                         0,
                     );
                 }
-                Err(aster_status_t::ASTER_STATUS_QUEUE_FULL) => rejected += 1,
+                Err(aster_status_t::ASTER_STATUS_OPERATION_LIMIT) => rejected += 1,
                 Err(status) => panic!("unexpected admission status: {status:?}"),
             }
         }
@@ -8161,7 +8307,7 @@ mod event_buffer_tests {
                 0,
             )
         };
-        assert_eq!(admitted, config.event_queue_capacity as usize);
+        assert_eq!(admitted, config.max_inflight_operations as usize);
         assert_eq!(rejected, 8 - admitted);
         assert_eq!(pending, admitted);
 
@@ -8195,12 +8341,59 @@ mod event_buffer_tests {
     }
 
     #[test]
+    fn event_queue_capacity_bounds_queued_and_staged_terminals() {
+        let config = aster_runtime_config_t {
+            struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
+            worker_threads: 1,
+            event_queue_capacity: 2,
+            max_inflight_operations: 8,
+        };
+        let mut handle: aster_runtime_t = 0;
+        assert_eq!(
+            unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        let bridge = load_runtime(handle).expect("runtime");
+
+        for _ in 0..8 {
+            let (operation, _) = bridge.new_operation(0).expect("operation admission");
+            bridge.emit_simple(
+                aster_event_kind_t::ASTER_EVENT_CLOSED,
+                aster_status_t::ASTER_STATUS_OK,
+                operation,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+        assert_eq!(bridge.events_rx.lock().unwrap().len(), 2);
+        assert_eq!(bridge.operation_slots.available_permits(), 0);
+
+        let mut out = std::mem::MaybeUninit::<aster_event_t>::uninit();
+        for _ in 0..8 {
+            assert_eq!(
+                unsafe { aster_poll_events(handle, out.as_mut_ptr(), 1, 500) },
+                1
+            );
+            assert!(bridge.events_rx.lock().unwrap().len() <= 2);
+        }
+        assert_eq!(bridge.operation_slots.available_permits(), 8);
+
+        drop(bridge);
+        assert_eq!(
+            unsafe { aster_runtime_close(handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+    }
+
+    #[test]
     fn cancellation_uses_reserved_terminal_slot_once() {
         let config = aster_runtime_config_t {
             struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
             worker_threads: 1,
             event_queue_capacity: 1,
-            reserved: 0,
+            max_inflight_operations: 1,
         };
         let mut handle: aster_runtime_t = 0;
         assert_eq!(
@@ -8220,7 +8413,7 @@ mod event_buffer_tests {
         );
         assert_eq!(
             bridge.new_operation(73).unwrap_err(),
-            aster_status_t::ASTER_STATUS_QUEUE_FULL
+            aster_status_t::ASTER_STATUS_OPERATION_LIMIT
         );
         assert!(!bridge.complete(
             EventInternal::new(
@@ -8272,13 +8465,70 @@ mod event_buffer_tests {
         );
     }
 
+    /// Representative of connection/node/doc/stream creation: if cancel wins
+    /// after native work inserted a returned handle, the late success path
+    /// must remove that otherwise unreachable resource (and must not register
+    /// its payload buffer).
+    #[test]
+    fn cancelled_handle_completion_removes_late_resource() {
+        let mut runtime: aster_runtime_t = 0;
+        assert_eq!(
+            unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, std::ptr::null(), &mut runtime) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        let bridge = load_runtime(runtime).expect("runtime");
+        let (operation, _) = bridge.new_operation(91).expect("operation admission");
+        assert_eq!(
+            unsafe { aster_operation_cancel(runtime, operation) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+
+        let returned_resources = HandleRegistry::new();
+        let late_handle = returned_resources.insert(());
+        let completed = bridge.complete_with_handle(
+            EventInternal::new(
+                aster_event_kind_t::ASTER_EVENT_ASTER_ACCEPTED,
+                aster_status_t::ASTER_STATUS_OK,
+                operation,
+                late_handle,
+                0,
+                91,
+                0,
+            ),
+            Some(b"late alpn".to_vec()),
+            &returned_resources,
+            late_handle,
+        );
+
+        assert!(!completed, "late success must lose to cancellation");
+        assert_eq!(returned_resources.count(), 0, "late handle leaked");
+        assert_eq!(bridge.buffers.count(), 0, "late payload was registered");
+
+        let mut out = std::mem::MaybeUninit::<aster_event_t>::uninit();
+        assert_eq!(
+            unsafe { aster_poll_events(runtime, out.as_mut_ptr(), 1, 0) },
+            1
+        );
+        let event = unsafe { out.assume_init() };
+        assert_eq!(
+            event.kind,
+            aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED as u32
+        );
+
+        drop(bridge);
+        assert_eq!(
+            unsafe { aster_runtime_close(runtime) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+    }
+
     #[test]
     fn runtime_close_wakes_pushed_event_backpressure() {
         let config = aster_runtime_config_t {
             struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
             worker_threads: 1,
             event_queue_capacity: 1,
-            reserved: 0,
+            max_inflight_operations: 0,
         };
         let mut handle: aster_runtime_t = 0;
         assert_eq!(
@@ -8328,6 +8578,82 @@ mod event_buffer_tests {
         assert!(
             teardown.wait(Duration::from_secs(10)),
             "runtime did not tear down after waking producer"
+        );
+    }
+
+    /// An admitted operation may need a pushed host decision before it can
+    /// complete. Its terminal-event budget must not consume the queue slot
+    /// required to deliver that decision.
+    #[test]
+    fn operation_reservation_does_not_block_its_required_pushed_event() {
+        let config = aster_runtime_config_t {
+            struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
+            worker_threads: 1,
+            event_queue_capacity: 1,
+            max_inflight_operations: 0,
+        };
+        let mut handle: aster_runtime_t = 0;
+        assert_eq!(
+            unsafe { aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
+        );
+        let bridge = load_runtime(handle).expect("runtime");
+        let (operation, _) = bridge.new_operation(0).expect("operation admission");
+
+        let producer = bridge.clone();
+        bridge.runtime.spawn(async move {
+            if producer
+                .emit_pushed_with_data(
+                    EventInternal::new(
+                        aster_event_kind_t::ASTER_EVENT_HOOK_BEFORE_CONNECT,
+                        aster_status_t::ASTER_STATUS_OK,
+                        0,
+                        1,
+                        2,
+                        0,
+                        0,
+                    ),
+                    b"decision".to_vec(),
+                )
+                .await
+            {
+                producer.emit_simple(
+                    aster_event_kind_t::ASTER_EVENT_CONNECTED,
+                    aster_status_t::ASTER_STATUS_OK,
+                    operation,
+                    3,
+                    0,
+                    0,
+                    0,
+                );
+            }
+        });
+
+        let mut out = std::mem::MaybeUninit::<aster_event_t>::uninit();
+        assert_eq!(
+            unsafe { aster_poll_events(handle, out.as_mut_ptr(), 1, 500) },
+            1,
+            "operation reservation blocked the pushed event it depends on"
+        );
+        let hook = unsafe { out.assume_init() };
+        assert_eq!(
+            hook.kind,
+            aster_event_kind_t::ASTER_EVENT_HOOK_BEFORE_CONNECT as u32
+        );
+        assert_eq!(unsafe { aster_buffer_release(handle, hook.buffer) }, 0);
+
+        assert_eq!(
+            unsafe { aster_poll_events(handle, out.as_mut_ptr(), 1, 500) },
+            1,
+            "operation completion was not delivered after its dependency"
+        );
+        let completion = unsafe { out.assume_init() };
+        assert_eq!(completion.operation, operation);
+
+        drop(bridge);
+        assert_eq!(
+            unsafe { aster_runtime_close(handle) },
+            aster_status_t::ASTER_STATUS_OK as i32
         );
     }
 

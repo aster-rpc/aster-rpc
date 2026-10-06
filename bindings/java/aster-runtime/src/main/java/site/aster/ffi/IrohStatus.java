@@ -31,7 +31,9 @@ public enum IrohStatus {
    * The resource already exists: {@code aster_observability_init} with a configuration that differs
    * from the running pipeline's, or a second concurrent {@code aster_log_poll} (ABI 4.6).
    */
-  ALREADY_EXISTS(17);
+  ALREADY_EXISTS(17),
+  /** The runtime's independent asynchronous-operation limit is exhausted (ABI 4.7). */
+  OPERATION_LIMIT(18);
 
   public final int code;
 

@@ -199,7 +199,7 @@ pub fn default_runtime_config() -> aster_transport_ffi::aster_runtime_config_t {
         struct_size: std::mem::size_of::<aster_transport_ffi::aster_runtime_config_t>() as u32,
         worker_threads: 1,
         event_queue_capacity: 100,
-        reserved: 0,
+        max_inflight_operations: 0,
     }
 }
 

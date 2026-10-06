@@ -337,6 +337,14 @@ pub(crate) struct Done {
     data: Option<Vec<u8>>,
     /// `error_code` of the event; `None`: derived from `status`.
     code: Option<i32>,
+    /// Registry owning `handle`, when success inserted a resource before the
+    /// cancellation/completion race was resolved.
+    owned_handle: Option<OwnedHandle>,
+}
+
+#[derive(Clone, Copy)]
+enum OwnedHandle {
+    Doc,
 }
 
 impl Done {
@@ -349,7 +357,12 @@ impl Done {
             flags: 0,
             data: None,
             code: None,
+            owned_handle: None,
         }
+    }
+    pub(crate) fn owned_doc(mut self) -> Self {
+        self.owned_handle = Some(OwnedHandle::Doc);
+        self
     }
     pub(crate) fn related(mut self, related: u64) -> Self {
         self.related = related;
@@ -445,10 +458,16 @@ where
                     d.kind, d.status, op_id, d.handle, d.related, user_data, code,
                 );
                 ev.flags = d.flags;
-                match d.data {
+                let completed = match d.data {
                     Some(data) => b.emit_with_data(ev, data),
-                    None => {
-                        b.complete(ev, None);
+                    None => b.complete(ev, None),
+                };
+                if !completed {
+                    match d.owned_handle {
+                        Some(OwnedHandle::Doc) => {
+                            b.docs.remove(d.handle);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -843,9 +862,9 @@ pub unsafe extern "C" fn aster_docs_open(
     let b = bridge.clone();
     spawn_op(&bridge, user_data, out_operation, async move {
         Ok(match docs.open(ns.to_hex()).await.map_err(err)? {
-            Some(d) => {
-                Done::ok(aster_event_kind_t::ASTER_EVENT_DOC_OPENED, b.docs.insert(d)).related(node)
-            }
+            Some(d) => Done::ok(aster_event_kind_t::ASTER_EVENT_DOC_OPENED, b.docs.insert(d))
+                .related(node)
+                .owned_doc(),
             None => Done::ok(aster_event_kind_t::ASTER_EVENT_DOC_OPENED, 0)
                 .related(node)
                 .status(aster_status_t::ASTER_STATUS_NOT_FOUND),
@@ -884,7 +903,11 @@ pub unsafe extern "C" fn aster_docs_import_write_namespace(
             .import_write_namespace(secret.to_bytes().to_vec())
             .await
             .map_err(err)?;
-        Ok(Done::ok(aster_event_kind_t::ASTER_EVENT_DOC_OPENED, b.docs.insert(d)).related(node))
+        Ok(
+            Done::ok(aster_event_kind_t::ASTER_EVENT_DOC_OPENED, b.docs.insert(d))
+                .related(node)
+                .owned_doc(),
+        )
     })
 }
 
@@ -914,7 +937,11 @@ pub unsafe extern "C" fn aster_docs_import_read_namespace(
             .import_read_namespace(ns.to_bytes().to_vec())
             .await
             .map_err(err)?;
-        Ok(Done::ok(aster_event_kind_t::ASTER_EVENT_DOC_OPENED, b.docs.insert(d)).related(node))
+        Ok(
+            Done::ok(aster_event_kind_t::ASTER_EVENT_DOC_OPENED, b.docs.insert(d))
+                .related(node)
+                .owned_doc(),
+        )
     })
 }
 

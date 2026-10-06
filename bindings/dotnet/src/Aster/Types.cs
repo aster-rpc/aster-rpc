@@ -32,6 +32,8 @@ public enum Status
     CredentialExpired = 16,
     /// <summary>ABI 4.6: <c>aster_observability_init</c> with a configuration that differs from the running pipeline's, or a second concurrent <c>aster_log_poll</c>.</summary>
     AlreadyExists = 17,
+    /// <summary>ABI 4.7: the runtime's independent asynchronous-operation limit is exhausted.</summary>
+    OperationLimit = 18,
 }
 
 /// <summary>
@@ -171,14 +173,14 @@ public struct RuntimeConfig
     public uint struct_size;
     public uint worker_threads;
     public uint event_queue_capacity;
-    public uint reserved;
+    public uint max_inflight_operations;
 
     public static RuntimeConfig Default => new()
     {
         struct_size = (uint)Marshal.SizeOf<RuntimeConfig>(),
         worker_threads = 1,
         event_queue_capacity = 256,
-        reserved = 0,
+        max_inflight_operations = 0,
     };
 }
 

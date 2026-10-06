@@ -383,7 +383,7 @@ unsafe fn runtime() -> aster_runtime_t {
         struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
         worker_threads: 2,
         event_queue_capacity: 1024,
-        reserved: 0,
+        max_inflight_operations: 0,
     };
     assert_eq!(
         aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &cfg, &mut rt),

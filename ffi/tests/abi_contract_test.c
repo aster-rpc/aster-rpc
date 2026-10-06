@@ -46,7 +46,7 @@ LAYOUT(aster_runtime_config_t, 16);
 OFF(aster_runtime_config_t, struct_size, 0);
 OFF(aster_runtime_config_t, worker_threads, 4);
 OFF(aster_runtime_config_t, event_queue_capacity, 8);
-OFF(aster_runtime_config_t, reserved, 12);
+OFF(aster_runtime_config_t, max_inflight_operations, 12);
 
 LAYOUT(aster_connect_config_t, 48);
 OFF(aster_connect_config_t, struct_size, 0);
@@ -433,7 +433,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 6); /* 4.2: expose; 4.3: streaming relay; 4.4: coordination; 4.5: unary cancel tokens; 4.6: observability + health */
+    CHECK(ASTER_ABI_VERSION_MINOR == 7); /* 4.7: independent event and operation bounds */
     CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
@@ -519,6 +519,8 @@ static void test_enum_values(void) {
     /* 4.6 */
     CHECK(ASTER_STATUS_ALREADY_EXISTS == 17);
     CHECK(strcmp(aster_status_name(ASTER_STATUS_ALREADY_EXISTS), "ASTER_STATUS_ALREADY_EXISTS") == 0);
+    CHECK(ASTER_STATUS_OPERATION_LIMIT == 18);
+    CHECK(strcmp(aster_status_name(ASTER_STATUS_OPERATION_LIMIT), "ASTER_STATUS_OPERATION_LIMIT") == 0);
     CHECK(ASTER_BINDING_UNKNOWN == 0 && ASTER_BINDING_GO == 6);
     CHECK(ASTER_OTEL_PROTOCOL_DEFAULT == 0 && ASTER_OTEL_PROTOCOL_GRPC == 2);
     CHECK(ASTER_OBSERVABILITY_FROM_ENV == 1 && ASTER_OBSERVABILITY_TRACES == 2 && ASTER_OBSERVABILITY_METRICS == 4);

@@ -57,15 +57,17 @@ func cDataToGoBytes(ptr unsafe.Pointer, n uintptr) []byte {
 
 // RuntimeConfig controls how the runtime is created.
 type RuntimeConfig struct {
-	WorkerThreads      uint32
-	EventQueueCapacity uint32
+	WorkerThreads         uint32
+	EventQueueCapacity    uint32
+	MaxInflightOperations uint32
 }
 
 // DefaultRuntimeConfig returns a sensible default configuration.
 func DefaultRuntimeConfig() RuntimeConfig {
 	return RuntimeConfig{
-		WorkerThreads:      1,
-		EventQueueCapacity: 256,
+		WorkerThreads:         1,
+		EventQueueCapacity:    256,
+		MaxInflightOperations: 4096,
 	}
 }
 
@@ -112,10 +114,10 @@ type Runtime struct {
 // The background poller goroutine starts immediately.
 func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	config := C.aster_runtime_config_t{
-		struct_size:          C.uint32_t(unsafe.Sizeof(C.aster_runtime_config_t{})),
-		worker_threads:       C.uint32_t(cfg.WorkerThreads),
-		event_queue_capacity: C.uint32_t(cfg.EventQueueCapacity),
-		reserved:             0,
+		struct_size:             C.uint32_t(unsafe.Sizeof(C.aster_runtime_config_t{})),
+		worker_threads:          C.uint32_t(cfg.WorkerThreads),
+		event_queue_capacity:    C.uint32_t(cfg.EventQueueCapacity),
+		max_inflight_operations: C.uint32_t(cfg.MaxInflightOperations),
 	}
 
 	if err := CheckABI(); err != nil {
@@ -533,9 +535,8 @@ func Version() (major, minor, patch uint32) {
 }
 
 // ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
-// this binding runs against: 4.6 added observability, health and the
-// ALREADY_EXISTS status, and the binding calls those functions.
-const ABIMinorRequired = uint32(6)
+// this binding runs against: 4.7 separates event-queue and operation bounds.
+const ABIMinorRequired = uint32(7)
 
 // CheckABI returns an error if the loaded native library's ABI major version
 // differs from the one this binding was compiled against, or its minor

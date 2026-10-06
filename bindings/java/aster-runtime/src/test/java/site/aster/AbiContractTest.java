@@ -65,6 +65,8 @@ public class AbiContractTest {
   @Test
   public void testRuntimeConfigSize() {
     assertEquals(16, IrohLibrary.ASTER_RUNTIME_CONFIG.byteSize());
+    assertEquals(8, offsetOf(IrohLibrary.ASTER_RUNTIME_CONFIG, "event_queue_capacity"));
+    assertEquals(12, offsetOf(IrohLibrary.ASTER_RUNTIME_CONFIG, "max_inflight_operations"));
   }
 
   @Test

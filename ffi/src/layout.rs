@@ -126,7 +126,7 @@ mod lp64 {
         struct_size = 0,
         worker_threads = 4,
         event_queue_capacity = 8,
-        reserved = 12,
+        max_inflight_operations = 12,
     });
 
     assert_layout!(aster_connect_config_t, size = 48, align = 8, {

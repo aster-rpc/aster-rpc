@@ -572,38 +572,61 @@ public class UpcallTests
     }
 
     [Fact]
-    public async Task Event_Queue_Admission_Cancellation_Does_Not_Retry_The_Waiter()
+    public async Task Operation_Limit_Is_Immediate_And_Does_Not_Start_Dependent_Work()
     {
-        using var rt = new Runtime();
-        int attempts = 0;
-        using var cancelled = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
-        Task<ulong> waiting = rt.SubmitAsync((out ulong operation) =>
+        var config = RuntimeConfig.Default;
+        config.event_queue_capacity = 1;
+        config.max_inflight_operations = 1;
+        using var rt = new Runtime(config);
+        await using var up = Upcalls.Create(rt, 8);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int started = 0;
+        up.ServeFencedResource(new FuncFenced(async (_, _, op, ct) =>
         {
-            operation = 0;
-            Interlocked.Increment(ref attempts);
-            return (int)Status.QueueFull;
-        }, "test", cancelled.Token);
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting).WaitAsync(T);
-        Assert.Equal(1, Volatile.Read(ref attempts));
+            Interlocked.Increment(ref started);
+            await gate.Task.WaitAsync(ct);
+            return new MutateResult.Applied(op);
+        }));
+        using var res = NativeFencedResource.Foreign(up);
+
+        Task<MutateResult> first = res.MutateAsync(new Fence("r", 1, "a"), "a", new byte[] { 1 });
+        while (Volatile.Read(ref started) == 0)
+            await Task.Delay(1);
+        IrohException overloaded = await Assert.ThrowsAsync<IrohException>(() =>
+            res.MutateAsync(new Fence("r", 1, "a"), "a", new byte[] { 2 }));
+        Assert.Equal(Status.OperationLimit, overloaded.Status);
+        Assert.Equal(1, Volatile.Read(ref started));
+
+        gate.SetResult();
+        Assert.IsType<MutateResult.Applied>(await first.WaitAsync(T));
     }
 
     [Fact]
-    public async Task Runtime_Close_Wakes_Event_Queue_Admission()
+    public async Task Cancelled_Wait_Drains_Its_Native_Terminal_Marker()
     {
-        var rt = new Runtime();
-        int attempts = 0;
-        Task<ulong> waiting = rt.SubmitAsync((out ulong operation) =>
+        using var rt = new Runtime();
+        await using var up = Upcalls.Create(rt, 8);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        up.ServeFencedResource(new FuncFenced(async (_, _, op, ct) =>
         {
-            operation = 0;
-            Interlocked.Increment(ref attempts);
-            return (int)Status.QueueFull;
-        }, "test");
-        while (Volatile.Read(ref attempts) == 0)
-            await Task.Delay(1);
+            started.TrySetResult();
+            await release.Task;
+            return new MutateResult.Applied(op);
+        }));
+        using var res = NativeFencedResource.Foreign(up);
+        using var cancel = new CancellationTokenSource();
 
-        rt.Dispose();
-        await Assert.ThrowsAsync<ObjectDisposedException>(() => waiting).WaitAsync(T);
-        Assert.Equal(1, Volatile.Read(ref attempts));
+        Task<MutateResult> call = res.MutateAsync(new Fence("r", 1, "a"), "a", new byte[] { 1 }, cancel.Token);
+        await started.Task.WaitAsync(T);
+        cancel.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call).WaitAsync(T);
+        release.TrySetResult();
+
+        var deadline = DateTime.UtcNow + T;
+        while (rt.PendingOperationCount != 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(1);
+        Assert.Equal(0, rt.PendingOperationCount);
     }
 
     [Fact]

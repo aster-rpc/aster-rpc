@@ -19,17 +19,11 @@ public sealed class Runtime : IDisposable
     private readonly ulong _handle;
     private readonly Thread _pollThread;
     private readonly CancellationTokenSource _cts = new();
-    // Replaced on every successful poll. A submitter snapshots this before its
-    // native attempt, so a poll racing with QUEUE_FULL cannot be missed and old
-    // progress cannot accumulate into a retry spin.
-    private readonly object _queueProgressLock = new();
-    private TaskCompletionSource<bool> _queueProgress = NewProgressTcs();
-    // Only one submitter retries after saturation. This prevents a poll from
-    // waking an unbounded retry herd and lets every waiter make progress.
-    private readonly SemaphoreSlim _submissionTurn = new(1, 1);
 
     // Maps operation ID -> TaskCompletionSource that receives the event.
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<Event>> _ops = new();
+    // Serializes native cancel's winner decision with managed terminal dispatch.
+    private readonly object _completionGate = new();
 
     // Unsolicited events (operation == 0, e.g. admission hooks) routed by event.handle.
     private readonly ConcurrentDictionary<ulong, Action<Event>> _inbound = new();
@@ -84,6 +78,8 @@ public sealed class Runtime : IDisposable
     /// </summary>
     public ulong Handle => _handle;
 
+    internal int PendingOperationCount => _ops.Count;
+
     /// <summary>
     /// Returns the ABI version of the native library.
     /// </summary>
@@ -121,8 +117,12 @@ public sealed class Runtime : IDisposable
         if (cancellationToken.CanBeCanceled)
         {
             registration = cancellationToken.Register(
-                state => ((TaskCompletionSource<Event>)state!).TrySetCanceled(),
-                tcs, false);
+                state =>
+                {
+                    var (runtime, operation, completion, token) = ((Runtime, ulong, TaskCompletionSource<Event>, CancellationToken))state!;
+                    runtime.CancelWait(operation, completion, token);
+                },
+                (this, opId, tcs, cancellationToken), false);
         }
 
         // When the Task completes (success, cancel, or fault), unregister.
@@ -130,7 +130,10 @@ public sealed class Runtime : IDisposable
             (completedTask, state) =>
             {
                 var (ops, id, t, reg) = ((ConcurrentDictionary<ulong, TaskCompletionSource<Event>>, ulong, TaskCompletionSource<Event>, CancellationTokenRegistration))state!;
-                ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(id, t));
+                // Keep a cancelled marker until the native terminal event arrives;
+                // dispatch then releases any buffer instead of creating an orphan TCS.
+                if (!completedTask.IsCanceled)
+                    ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(id, t));
                 reg.Dispose();
             },
             (_ops, opId, tcs, registration),
@@ -139,46 +142,6 @@ public sealed class Runtime : IDisposable
             TaskScheduler.Default);
 
         return tcs.Task;
-    }
-
-    /// <summary>
-    /// Starts an asynchronous native operation, waiting for completion-queue space when the
-    /// native runtime reports <see cref="Status.QueueFull"/>. The submit callback must keep
-    /// native argument storage alive only for the duration of one invocation; it may be called
-    /// more than once, but a retry happens only after the native pre-start refusal.
-    /// </summary>
-    internal async Task<ulong> SubmitAsync(
-        NativeOperation submit,
-        string what,
-        CancellationToken cancellationToken = default)
-    {
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
-        try
-        {
-            await _submissionTurn.WaitAsync(linked.Token).ConfigureAwait(false);
-            try
-            {
-                while (true)
-                {
-                    ObjectDisposedException.ThrowIf(_disposed, this);
-                    Task progress = QueueProgressTask();
-                    int status = submit(out ulong operation);
-                    if (status == 0)
-                        return operation;
-                    if (status != (int)Status.QueueFull)
-                        throw IrohException.FromStatus(status, what);
-                    await progress.WaitAsync(linked.Token).ConfigureAwait(false);
-                }
-            }
-            finally
-            {
-                _submissionTurn.Release();
-            }
-        }
-        catch (OperationCanceledException) when (_cts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-        {
-            throw new ObjectDisposedException(nameof(Runtime));
-        }
     }
 
     /// <summary>
@@ -274,7 +237,6 @@ public sealed class Runtime : IDisposable
             if (n > 0)
             {
                 DispatchBatch(events, n);
-                SignalQueueProgress();
             }
 
             // If we got fewer than MaxEvents, the queue may be drained;
@@ -318,33 +280,26 @@ public sealed class Runtime : IDisposable
                 continue;
             }
             // If no waiter is registered yet, park the completed TCS for it.
-            // (A registered waiter's continuation removes the entry.)
-            _ops.GetOrAdd(ev.operation, NewTcs).TrySetResult(ev);
+            // A cancelled marker stays registered until this late terminal arrives.
+            lock (_completionGate)
+            {
+                var completion = _ops.GetOrAdd(ev.operation, NewTcs);
+                if (completion.Task.IsCanceled)
+                {
+                    _ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(ev.operation, completion));
+                    if (ev.buffer != 0)
+                        Native.aster_buffer_release(_handle, ev.buffer);
+                }
+                else if (!completion.TrySetResult(ev) && ev.buffer != 0)
+                {
+                    Native.aster_buffer_release(_handle, ev.buffer);
+                }
+            }
         }
     }
 
     private static TaskCompletionSource<Event> NewTcs(ulong _)
         => new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    private static TaskCompletionSource<bool> NewProgressTcs()
-        => new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    private Task QueueProgressTask()
-    {
-        lock (_queueProgressLock)
-            return _queueProgress.Task;
-    }
-
-    private void SignalQueueProgress()
-    {
-        TaskCompletionSource<bool> previous;
-        lock (_queueProgressLock)
-        {
-            previous = _queueProgress;
-            _queueProgress = NewProgressTcs();
-        }
-        previous.TrySetResult(true);
-    }
 
     private void DrainEvents()
     {
@@ -355,7 +310,6 @@ public sealed class Runtime : IDisposable
             if (n == 0)
                 break;
             DispatchBatch(events, n);
-            SignalQueueProgress();
         }
     }
 
@@ -374,12 +328,39 @@ public sealed class Runtime : IDisposable
     /// </summary>
     public void Cancel(ulong opId)
     {
-        if (_ops.TryRemove(opId, out var pending))
-            pending.TrySetCanceled();
-        int r = Native.aster_operation_cancel(_handle, opId);
-        if (r != 0)
-            throw IrohException.FromStatus(r, "aster_operation_cancel");
+        lock (_completionGate)
+        {
+            bool hadWaiter = _ops.TryGetValue(opId, out _);
+            var pending = _ops.GetOrAdd(opId, NewTcs);
+            int r = Native.aster_operation_cancel(_handle, opId);
+            if (r == 0)
+                pending.TrySetCanceled();
+            else
+            {
+                if (r != (int)Status.NotFound || !hadWaiter)
+                    _ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(opId, pending));
+                throw IrohException.FromStatus(r, "aster_operation_cancel");
+            }
+        }
+    }
+
+    private void CancelWait(ulong opId, TaskCompletionSource<Event> pending, CancellationToken token)
+    {
+        lock (_completionGate)
+        {
+            int status = Native.aster_operation_cancel(_handle, opId);
+            if (status == 0)
+            {
+                // The native cancellation terminal will arrive later. Keep this
+                // marker so DispatchBatch releases that event rather than parking it.
+                pending.TrySetCanceled(token);
+            }
+            else if (status != (int)Status.NotFound)
+            {
+                pending.TrySetException(IrohException.FromStatus(status, "aster_operation_cancel"));
+            }
+            // NOT_FOUND means native completion won the race. Leave the waiter
+            // live so it receives and owns the already-queued result and handles.
+        }
     }
 }
-
-internal delegate int NativeOperation(out ulong operation);

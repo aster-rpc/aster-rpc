@@ -96,6 +96,8 @@ func errorFromStatus(code C.int) *IrohError {
 		return errorf(c, "verification failed")
 	case ASTER_STATUS_ALREADY_EXISTS:
 		return errorf(c, "already exists")
+	case ASTER_STATUS_OPERATION_LIMIT:
+		return errorf(c, "operation limit exhausted")
 	default:
 		return errorf(c, "unknown status %d", c)
 	}
@@ -128,6 +130,9 @@ var (
 	// ErrAlreadyExists (ABI 4.6): an observability init with a different
 	// configuration than the running pipeline's, or a second log poller.
 	ErrAlreadyExists = errors.New("already exists")
+	// ErrOperationLimit (ABI 4.7): the runtime's independent asynchronous
+	// operation admission bound is exhausted. The refused operation did not start.
+	ErrOperationLimit = errors.New("operation limit exhausted")
 )
 
 // statusToError maps status codes to sentinel errors for errors.Is matching.
@@ -149,6 +154,7 @@ var statusToError = map[int32]error{
 	ASTER_STATUS_PERMISSION_DENIED:   ErrPermissionDenied,
 	ASTER_STATUS_CREDENTIAL_EXPIRED:  ErrCredentialExpired,
 	ASTER_STATUS_ALREADY_EXISTS:      ErrAlreadyExists,
+	ASTER_STATUS_OPERATION_LIMIT:     ErrOperationLimit,
 }
 
 // Is returns true if target is a matching sentinel error.

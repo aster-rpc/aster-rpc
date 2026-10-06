@@ -1,4 +1,4 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.6)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.7)
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch
@@ -24,6 +24,18 @@ Header: `ffi/aster_ffi.h` (was `ffi/iroh_ffi.h`). Library file name unchanged
 | `iroh_endpoint_config_t.relay_mode`: unknown value silently = default | `aster_relay_mode_t`; unknown -> `ASTER_STATUS_INVALID_ARGUMENT` | `ASTER_RELAY_MODE_STAGING` = 3 now named. |
 | `iroh_doc_share` / `iroh_doc_share_with_addr` `mode`: 0 = read, anything else = write | `aster_doc_share_mode_t`: 0 read, 1 write, other -> `ASTER_STATUS_INVALID_ARGUMENT` | |
 | `ASTER_EVENT_KIND_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` (reactor `event_kind`, uint8) | `ASTER_REACTOR_EVENT_CALL/CONNECTION_CLOSED/RESPONSE_WRITABLE/RESPONSE_CLOSED` | Values unchanged (0..3). Renamed so they cannot be confused with the completion-queue `ASTER_EVENT_*` values of `aster_event_kind_t`. |
+
+## New in 4.7 (independent event and operation bounds)
+
+`aster_runtime_config_t` keeps its 16-byte layout and gives the former reserved
+word at offset 12 the additive meaning `max_inflight_operations` (zero = 4096).
+This preserves binary layout and zero-initialized legacy behavior, but the
+field rename is source-incompatible for C callers that used the old
+`.reserved` designated initializer; they must rename that initializer.
+`event_queue_capacity` now bounds only events waiting to be polled. Running
+operations and terminal events waiting for queue capacity are independently
+bounded by `max_inflight_operations`; saturation returns the new pre-start
+`ASTER_STATUS_OPERATION_LIMIT` (18). Wrappers surface that overload immediately.
 
 ## New in 4.6 (observability and health; one removal)
 

@@ -19,7 +19,7 @@ fn test_abi_version() {
     // client + placement; 4.5.0: unary cancel tokens (all additive); 4.6.0:
     // observability + health, aster_node_metrics_prometheus removed.
     assert_eq!(ASTER_ABI_VERSION_MAJOR, 4);
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 6);
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 7);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);
@@ -53,7 +53,7 @@ fn test_runtime_new_rejects_bad_struct_size() {
             struct_size: 4,
             worker_threads: 1,
             event_queue_capacity: 16,
-            reserved: 0,
+            max_inflight_operations: 0,
         };
         let mut runtime: aster_runtime_t = 0;
         let status = aster_runtime_new(ASTER_ABI_VERSION_MAJOR, &config, &mut runtime);
@@ -83,7 +83,7 @@ fn test_runtime_create_and_close() {
             struct_size: std::mem::size_of::<aster_runtime_config_t>() as u32,
             worker_threads: 2,
             event_queue_capacity: 100,
-            reserved: 0,
+            max_inflight_operations: 0,
         };
 
         let mut runtime: aster_runtime_t = 0;
