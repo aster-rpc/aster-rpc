@@ -244,10 +244,9 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
 
   it('a pre-proposal permission denial is a typed RPC error that leaves the sequence open', async () => {
     const actor = await Node.start({ ...OFFLINE, secretKey: randomBytes(32), rootPubkey: info.authorityKey });
-    const client = await CoordinationClient.connect(actor, info.groupId, {
-      seedTickets: seeds(),
-      journalDir: journal('ungranted'),
-    });
+    const dir = journal('ungranted');
+    let client = await CoordinationClient.connect(actor, info.groupId, { seedTickets: seeds(), journalDir: dir });
+    const originalClientId = await client.clientId();
     try {
       // No ACL row for this actor: refused before proposal (PERMISSION_DENIED).
       const denied = await client.acquire(res('head'), 30_000).catch((e: unknown) => e);
@@ -264,6 +263,38 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
       const viaLease = await second.acquireLease(res('head')).catch((e: unknown) => e);
       second.close();
       expect(viaLease).toBeInstanceOf(CoordinationRpcError);
+
+      // Restore permission after closing the process handle. Reopening the
+      // same journal must drive its saved acquire request, without planning a
+      // replacement request or consuming a different sequence.
+      client.close();
+      const acl = await root.reads().inspectAcl(res('head'));
+      const grant = await root.setGrant(res('head'), actor.id, CoordinationRights.HOLDER, acl.aclRevision);
+      expect(grant.outcome).toBe('grant_updated');
+      await grant.acknowledge();
+
+      client = await CoordinationClient.connect(actor, info.groupId, { seedTickets: seeds(), journalDir: dir });
+      const resumed = await client.resume();
+      expect(resumed).not.toBeNull();
+      expect(resumed!.outcome).toBe('granted');
+      expect(resumed!.reply.consumed).toBe(true);
+      expect(await client.clientId()).toBe(originalClientId);
+      expect(resumed!.reply.clientId).toBe(originalClientId);
+      expect(resumed!.reply.requestHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(resumed!.snapshot?.resource.namespace).toBe(res('head').namespace);
+      expect(Buffer.from(resumed!.snapshot!.resource.key).toString()).toBe('head');
+
+      // Until acknowledged, resume returns the same durable result. Once
+      // acknowledged, the next mutation can use the recovered fence and must
+      // advance this journal by exactly one sequence.
+      const replay = await client.resume();
+      expect(replay?.reply).toEqual(resumed!.reply);
+      await resumed!.acknowledge();
+      const released = await client.release(fenceOf(resumed!.snapshot!));
+      expect(released.outcome).toBe('released');
+      expect(released.sequence).toBe(resumed!.sequence + 1);
+      expect(released.reply.clientId).toBe(resumed!.reply.clientId);
+      await released.acknowledge();
     } finally {
       client.close();
       await actor.close();
