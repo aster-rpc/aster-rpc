@@ -130,6 +130,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AsterServer, AsterClientWrapper, CallContext, Rpc, RpcError, ServerStream, Service, StatusCode, WireType } from '@aster-rpc/aster';
+import { version as nativeVersion } from '@aster-rpc/transport';
 
 @WireType('assurance.clean/Request') class Request { value = ''; count = 0; }
 @WireType('assurance.clean/Reply') class Reply { value = ''; count = 0; }
@@ -162,8 +163,10 @@ const versions={aster:pkg(join(dirname(asterEntry),'..','package.json')).version
   transport:pkg(join(dirname(loader),'package.json')).version,sidecar:pkg(join(dirname(sidecar),'package.json')).version};
 for(const [k,p] of Object.entries({aster:asterEntry,transport:loader,sidecar})) if(!p.startsWith(root+'/')) throw Error(`${k} resolved outside clean project: ${p}`);
 const expectedVersion=process.env.ASTER_SMOKE_VERSION;
+const expectedNativeVersion=process.env.ASTER_SMOKE_NATIVE_VERSION;
 if(Object.values(versions).some(v=>v!==expectedVersion)) throw Error(`unexpected package versions ${JSON.stringify(versions)}; expected ${expectedVersion}`);
-console.log(JSON.stringify({phase:'typescript_metadata',node:process.version,versions,asterEntry,loader,sidecar}));
+if(nativeVersion()!==expectedNativeVersion) throw Error(`unexpected embedded native version ${nativeVersion()}; expected ${expectedNativeVersion}`);
+console.log(JSON.stringify({phase:'typescript_metadata',node:process.version,versions,nativeVersion:nativeVersion(),asterEntry,loader,sidecar}));
 
 const server=new AsterServer({services:[new Smoke()],allowAllConsumers:true,config:{relayMode:'disabled',bindAddr:'127.0.0.1:0'}});
 let client:AsterClientWrapper|undefined;
@@ -229,6 +232,7 @@ def main() -> None:
     ap.add_argument("--python", action="store_true", help="Run isolated Python wheel consumer")
     ap.add_argument("--typescript", action="store_true", help="Run isolated npm tarball consumer")
     ap.add_argument("--version", default="0.3.705", help="Exact expected package version (default: 0.3.705)")
+    ap.add_argument("--native-version", help="Expected embedded native version (defaults to --version)")
     arg_artifact(ap, "wheel", "candidate aster-rpc 0.3.705 manylinux x86_64 wheel")
     arg_artifact(ap, "npm-aster", "candidate @aster-rpc/aster tarball")
     arg_artifact(ap, "npm-transport", "candidate @aster-rpc/transport loader tarball")
@@ -271,6 +275,7 @@ def main() -> None:
 
     env = os.environ.copy()
     env["ASTER_SMOKE_VERSION"] = a.version
+    env["ASTER_SMOKE_NATIVE_VERSION"] = a.native_version or a.version
     for key in ("PYTHONPATH", "PYTHONHOME", "NODE_PATH", "ASTER_STORAGE_PATH", "ASTER_SECRET_KEY_FILE", "ASTER_IDENTITY_FILE"):
         env.pop(key, None)
 
