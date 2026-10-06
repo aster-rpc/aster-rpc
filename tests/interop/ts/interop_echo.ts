@@ -368,7 +368,10 @@ async function campaignClient(ticket: string): Promise<void> {
   const native = loadNative();
   const codec = registerAll();
   let node: any, conn: any, client: any;
-  let generation: any = 0;
+  // Held in an object, not a reassigned closure `let`: on 0.3.739 and 0.3.757
+  // the window after the second replace_peer read the previous generation
+  // although the command loop had already observed the new one.
+  const state: { generation: any } = { generation: 0 };
   let settings: any = {};
   const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
   const reply = (v: any) => console.log(JSON.stringify(v));
@@ -397,6 +400,8 @@ async function campaignClient(ticket: string): Promise<void> {
     const windowId = command.window_id ?? 'window';
     if (typeof windowId !== 'string' || Buffer.byteLength(windowId) > 128) throw new Error('window_id must be at most 128 bytes');
     const marker = `campaign:ts:${windowId};`;
+    const generation = state.generation;
+    console.error(JSON.stringify({ diag: 'window', window_id: windowId, generation, at_ms: performance.now() }));
     const result: any = { phase: 'campaign_window', window_phase: phase, generation, log_marker: marker,
       completed: 0, attempted: 0, unary: 0, stream: 0, cancel: 0, unexpected_errors: 0,
       integrity_failures: 0, active_calls: 0, queue_capacity: 128, queue_scope: 'adapter_admission',
@@ -480,21 +485,21 @@ async function campaignClient(ticket: string): Promise<void> {
     node = await native.Node.start({ alpns: [RPC_ALPN], relayMode: 'disabled', bindAddr: '127.0.0.1:0' });
     await replace(ticket);
     const identity = node.nodeId();
-    reply({ phase: 'campaign_ready', owner_identity: identity, pid: process.pid, generation });
+    reply({ phase: 'campaign_ready', owner_identity: identity, pid: process.pid, generation: state.generation });
     for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
       try {
         const command = JSON.parse(line), op = command.command ?? command.cmd ?? command.op;
         // Diagnostic trace (stderr): which generation each command saw.
         console.error(JSON.stringify({ diag: 'command', op, window_id: command.window_id,
-          sent_generation: command.generation, generation, at_ms: performance.now() }));
+          sent_generation: command.generation, generation: state.generation, at_ms: performance.now() }));
         let result: any;
         if (op === 'configure') { settings = { ...settings, ...command }; result = { phase: 'campaign_configured' }; }
         else if (op === 'run' || op === 'baseline') result = await window({ ...settings, ...command });
         else if (op === 'replace_peer') {
           await replace(command.ticket);
-          generation = command.generation;
-          result = { phase: 'campaign_peer_replaced', generation };
-          console.error(JSON.stringify({ diag: 'replaced', generation, at_ms: performance.now() }));
+          state.generation = command.generation;
+          result = { phase: 'campaign_peer_replaced', generation: state.generation };
+          console.error(JSON.stringify({ diag: 'replaced', generation: state.generation, at_ms: performance.now() }));
         }
         else if (op === 'pause' || op === 'stop') { result = { phase: `campaign_${op}`, active_calls: 0, unexpected_errors: 0 }; await flush({ ...settings, ...command }, result); }
         else throw new Error('unknown campaign command');
