@@ -393,11 +393,6 @@ export declare class DispatchServer {
    */
   debugNudge(): void
   /**
-   * Diagnostics: force the same terminal cleanup used after TSFN delivery
-   * failure or watchdog exhaustion.
-   */
-  debugFailDelivery(): void
-  /**
    * Resolve with the next batch (at most `max`, default 256), waiting
    * until there is one. Resolves `[]` once the server is closed.
    */

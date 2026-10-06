@@ -1250,15 +1250,6 @@ impl DispatchServer {
         }
     }
 
-    /// Diagnostics: force the same terminal cleanup used after TSFN delivery
-    /// failure or watchdog exhaustion.
-    #[napi]
-    pub fn debug_fail_delivery(&self) {
-        if let Some(s) = &self.tsfn_sink {
-            s.fail(Status::GenericFailure);
-        }
-    }
-
     // ── ring pulls ──────────────────────────────────────────────────────────
 
     /// Resolve with the next batch (at most `max`, default 256), waiting
@@ -1465,6 +1456,19 @@ impl DispatchServer {
         self.shared.non_rpc.lock().unwrap().clear();
         self.shared.connections.lock().unwrap().clear();
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[napi]
+impl DispatchServer {
+    /// Diagnostics: force the same terminal cleanup used after TSFN delivery
+    /// failure or watchdog exhaustion. Test-hook addons only.
+    #[napi]
+    pub fn debug_fail_delivery(&self) {
+        if let Some(s) = &self.tsfn_sink {
+            s.fail(Status::GenericFailure);
+        }
     }
 }
 
