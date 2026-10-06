@@ -828,7 +828,14 @@ func exerciseApplicationLogOutage(t *testing.T, mode string) {
 			obsRestartReceiver(t, endpoint)
 			obsRecvClosed = false
 		}
-		obsSetup(t) // Restore the healthy shared pipeline after outage shutdown.
+		// The outage test owns this pipeline. Starting another exporter here
+		// leaves background HTTP keep-alives arriving in later lifetime tests.
+		// obsSetup restarts it explicitly for the next observability test.
+		if _, err := ShutdownObservability(3 * time.Second); err != nil {
+			t.Errorf("close outage-owned pipeline during cleanup: %v", err)
+		}
+		obsReceiver().CloseClientConnections()
+		waitFor(t, "outage-owned poller cleanup", func() bool { return !pollerRunning() })
 	})
 	marker := "go-" + mode + "-"
 	obsBodiesMu.Lock()
