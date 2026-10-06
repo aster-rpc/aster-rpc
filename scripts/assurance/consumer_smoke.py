@@ -295,13 +295,15 @@ def main() -> None:
         deps={"@aster-rpc/aster":"file:"+str(artifacts["npm-aster"][0]),
             "@aster-rpc/transport":"file:"+str(artifacts["npm-transport"][0]),
             "@aster-rpc/transport-linux-x64-gnu":"file:"+str(artifacts["npm-linux-x64-gnu"][0]),
-            "tsx":"4.19.2"}
+            "typescript":"5.9.2"}
         (tdir/"package.json").write_text(json.dumps({"name":"aster-clean-consumer","private":True,"type":"module","dependencies":deps},indent=2)+"\n")
-        (tdir/"tsconfig.json").write_text(json.dumps({"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","experimentalDecorators":True,"skipLibCheck":True}},indent=2)+"\n")
+        (tdir/"tsconfig.json").write_text(json.dumps({"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","experimentalDecorators":True,"skipLibCheck":True,"outDir":"dist","rootDir":"."},"include":["consumer.ts","aster-rpc.generated.ts"]},indent=2)+"\n")
         (tdir/"consumer.ts").write_text(TS_APP)
         run(["npm","install","--no-audit","--no-fund"],cwd=tdir,env=env,log_path=work/"npm-install.log")
         run(["npm","ls","--all","@aster-rpc/aster","@aster-rpc/transport","@aster-rpc/transport-linux-x64-gnu"],cwd=tdir,env=env,log_path=work/"npm-tree.log")
-        run(["node_modules/.bin/tsx","consumer.ts"],cwd=tdir,env=env,log_path=work/"typescript-smoke.log")
+        run(["node_modules/.bin/aster-gen"],cwd=tdir,env=env,log_path=work/"typescript-gen.log")
+        run(["node_modules/.bin/tsc"],cwd=tdir,env=env,log_path=work/"typescript-build.log")
+        run(["node","dist/consumer.js"],cwd=tdir,env=env,log_path=work/"typescript-smoke.log")
     print(f"CLEAN_CONSUMER_PASS report_dir={work}",flush=True)
 
 
