@@ -785,6 +785,107 @@ def test_otlp_log_handler_skips_rust_records_and_never_raises(monkeypatch):
     assert errors == []
 
 
+def test_application_logs_recover_after_exporter_http503_outage():
+    out = child_json(
+        """
+        import gzip, json, logging, threading, time, warnings
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from aster import observability, tracing, _aster
+        from aster.logging import AsterLogHandler
+
+        accepted = []
+        rejected = []
+        outage = threading.Event()
+        outage.set()
+        class Collector(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers['Content-Length']))
+                if self.headers.get('Content-Encoding') == 'gzip':
+                    body = gzip.decompress(body)
+                if outage.is_set() and self.path.endswith('/v1/logs'):
+                    rejected.append(body)
+                    self.send_response(503)
+                else:
+                    accepted.append(body)
+                    self.send_response(200)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        receiver = ThreadingHTTPServer(('127.0.0.1', 0), Collector)
+        thread = threading.Thread(target=receiver.serve_forever, daemon=True)
+        thread.start()
+        bridge = []
+        class Capture(logging.Handler):
+            def emit(self, record):
+                bridge.append(record.getMessage())
+        logging.getLogger('aster').addHandler(Capture())
+        app = logging.getLogger('app.outage')
+        app.propagate = False
+        app.setLevel(logging.WARNING)
+        app.addHandler(AsterLogHandler())
+        try:
+            observability.init(from_env=False, service_name='python-outage', traces=False,
+                metrics=False, otlp_logs=True,
+                otlp_endpoint=f'http://127.0.0.1:{receiver.server_port}')
+            start = time.monotonic()
+            for i in range(1000):
+                app.warning('python-outage-%s', i)
+            emission = time.monotonic() - start
+            flush_error = None
+            start = time.monotonic()
+            try:
+                observability.flush(timeout=1)
+            except Exception as e:
+                flush_error = str(e)
+            flush_elapsed = time.monotonic() - start
+            assert rejected, 'collector did not observe a refused logs request'
+            assert not any(b'python-outage-' in b for b in accepted)
+            outage.clear()
+            with tracing.with_trace_context('00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'):
+                app.warning('python-recovered')
+            end = time.monotonic() + 10
+            recovered = None
+            while time.monotonic() < end:
+                observability.flush(timeout=1)
+                recovered = next((b for b in accepted if b'python-recovered' in b), None)
+                if recovered is not None:
+                    break
+                time.sleep(0.05)
+            assert recovered is not None
+            # The handler exports its documented code metadata, not arbitrary LogRecord extras.
+            assert b'app.outage' in recovered and b'code.namespace' in recovered and b'code.function' in recovered
+            assert bytes.fromhex('4bf92f3577b34da6a3ce929d0e0e4736') in recovered
+            assert bytes.fromhex('00f067aa0ba902b7') in recovered
+            outage.set()
+            app.warning('python-outage-shutdown')
+            start = time.monotonic()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                held = observability.shutdown(timeout=1)
+            shutdown_elapsed = time.monotonic() - start
+            print(json.dumps({'emission': emission, 'flush_elapsed': flush_elapsed,
+                'flush_error': flush_error, 'rejected': len(rejected),
+                'shutdown_elapsed': shutdown_elapsed, 'held': held,
+                'released': _aster.observability_refs() == 0,
+                'feedback': any('python-outage-' in m or 'python-recovered' in m for m in bridge),
+                'only_runtime_warnings': all(w.category is RuntimeWarning for w in caught)}))
+        finally:
+            outage.clear()
+            observability.shutdown(timeout=1)
+            receiver.shutdown()
+            receiver.server_close()
+            thread.join(timeout=2)
+        """
+    )
+    assert out['emission'] < 1
+    assert out['flush_elapsed'] < 3 and out['flush_error']
+    assert out['rejected'] > 0
+    assert out['shutdown_elapsed'] < 3
+    assert out['held'] and out['released'] and out['only_runtime_warnings']
+    assert not out['feedback']
+
+
 def test_directive_for_levels():
     assert _logbridge._directive(logging.DEBUG) == "warn,aster=debug"
     assert _logbridge._directive(logging.INFO) == "warn,aster=info"

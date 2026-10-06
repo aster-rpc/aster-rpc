@@ -224,6 +224,63 @@ public class ObservabilityTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task App_Log_Export_Remains_Bounded_During_503_And_Recovers()
+    {
+        using var receiver = new OtlpReceiver();
+        var bridge = new CapturingLoggerFactory { MinimumLevel = LogLevel.Trace };
+        AsterLogging.UseLoggerFactory(bridge);
+        AsterObservability.Init(new ObservabilityOptions
+        {
+            ServiceName = "o9-outage",
+            OtlpLogs = true,
+            Traces = true,
+            OtlpEndpoint = receiver.Url,
+            FromEnv = false,
+            LogBridge = true,
+            LogFilter = "warn,aster=trace",
+        });
+        using var provider = new AsterLogEmitProvider();
+        var logger = provider.CreateLogger("app.outage");
+
+        receiver.RejectLogs = true;
+        int rejectedBefore = receiver.RejectedLogs;
+        var emitStart = Stopwatch.StartNew();
+        for (int i = 0; i < 1_000; i++)
+            logger.LogWarning("dotnet-outage-{Index}", i);
+        emitStart.Stop();
+        Assert.True(emitStart.Elapsed < TimeSpan.FromSeconds(1), $"1,000 emissions took {emitStart.Elapsed}");
+
+        var flushStart = Stopwatch.StartNew();
+        Assert.Throws<IrohException>(() => AsterObservability.Flush(TimeSpan.FromSeconds(1)));
+        flushStart.Stop();
+        Assert.True(flushStart.Elapsed < TimeSpan.FromSeconds(3), $"failed flush took {flushStart.Elapsed}");
+        Assert.True(receiver.RejectedLogs > rejectedBefore, "the receiver did not observe an HTTP 503 log export");
+        Assert.False(receiver.LogsContain("dotnet-outage-"u8));
+
+        receiver.RejectLogs = false;
+        using var source = new ActivitySource("O9.Outage");
+        using var listener = ListenTo("O9.Outage");
+        using var activity = source.StartActivity("recovered-work")!;
+        AsterLogEmit.Emit(LogLevel.Warning, "app.outage", "dotnet-recovered",
+            new[] { new KeyValuePair<string, string>("phase", "recovered"), new("payload.key", "payload-value") },
+            activity: activity);
+        Assert.True(await WaitLogs(receiver, "dotnet-recovered"));
+        byte[] recovered = receiver.LogBodies.First(body => body.AsSpan().IndexOf("dotnet-recovered"u8) >= 0);
+        Assert.True(recovered.AsSpan().IndexOf("app.outage"u8) >= 0);
+        Assert.True(recovered.AsSpan().IndexOf("payload.key"u8) >= 0 && recovered.AsSpan().IndexOf("payload-value"u8) >= 0);
+        Assert.True(recovered.AsSpan().IndexOf(Convert.FromHexString(activity.TraceId.ToHexString())) >= 0);
+        Assert.True(recovered.AsSpan().IndexOf(Convert.FromHexString(activity.SpanId.ToHexString())) >= 0);
+        Assert.DoesNotContain(bridge.Logs, l => l.Message.Contains("dotnet-recovered", StringComparison.Ordinal));
+
+        receiver.RejectLogs = true;
+        logger.LogWarning("dotnet-shutdown-outage");
+        var shutdownStart = Stopwatch.StartNew();
+        Assert.True(AsterObservability.Shutdown(TimeSpan.FromSeconds(1)));
+        shutdownStart.Stop();
+        Assert.True(shutdownStart.Elapsed < TimeSpan.FromSeconds(3), $"outage shutdown took {shutdownStart.Elapsed}");
+    }
+
+    [Fact]
     public async Task Rust_Logs_Reach_ILogger_With_Trace_Ids_Of_The_Handler()
     {
         var factory = new CapturingLoggerFactory();

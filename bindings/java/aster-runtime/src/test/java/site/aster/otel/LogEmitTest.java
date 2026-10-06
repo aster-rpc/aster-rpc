@@ -2,6 +2,7 @@ package site.aster.otel;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sun.net.httpserver.HttpServer;
@@ -13,6 +14,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.GZIPInputStream;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -28,6 +30,8 @@ final class LogEmitTest {
 
   static HttpServer receiver;
   static final List<byte[]> LOG_BODIES = new CopyOnWriteArrayList<>();
+  static final AtomicInteger REJECTED_LOGS = new AtomicInteger();
+  static volatile boolean rejectLogs;
 
   @BeforeAll
   static void start() throws Exception {
@@ -45,6 +49,12 @@ final class LogEmitTest {
               z.transferTo(o);
               body = o.toByteArray();
             }
+          }
+          if (ex.getRequestURI().getPath().endsWith("/v1/logs") && rejectLogs) {
+            REJECTED_LOGS.incrementAndGet();
+            ex.sendResponseHeaders(503, -1);
+            ex.close();
+            return;
           }
           if (ex.getRequestURI().getPath().endsWith("/v1/logs")) {
             LOG_BODIES.add(body);
@@ -79,6 +89,14 @@ final class LogEmitTest {
 
   private static boolean has(String s) {
     return has(s.getBytes(StandardCharsets.UTF_8));
+  }
+
+  private static byte[] bodyWith(String needle) {
+    byte[] bytes = needle.getBytes(StandardCharsets.UTF_8);
+    for (byte[] body : LOG_BODIES) {
+      if (indexOf(body, bytes) >= 0) return body;
+    }
+    return null;
   }
 
   private static int indexOf(byte[] h, byte[] n) {
@@ -132,5 +150,78 @@ final class LogEmitTest {
     assertTrue(has(java.util.HexFormat.of().parseHex("00f067aa0ba902b7")));
     assertTrue(has("pathb-marker-ctx"));
     assertFalse(has("pathb-marker-rust"));
+  }
+
+  @Test
+  void applicationEmissionStaysBoundedDuringOutageAndExportsAfterRecovery() {
+    int rejectedBefore = REJECTED_LOGS.get();
+    rejectLogs = true;
+    try {
+      long emitStarted = System.nanoTime();
+      for (int i = 0; i < 1_000; i++) {
+        LogEmit.emit(Level.WARN, "app.outage", "java-pathb-outage-" + i, Map.of("phase", "outage"));
+      }
+      assertTrue(Duration.ofNanos(System.nanoTime() - emitStarted).toMillis() < 1_000);
+
+      long flushStarted = System.nanoTime();
+      assertThrows(RuntimeException.class, () -> Observability.flush(Duration.ofSeconds(1)));
+      assertTrue(Duration.ofNanos(System.nanoTime() - flushStarted).toMillis() < 3_000);
+      long rejectedDeadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+      while (REJECTED_LOGS.get() == rejectedBefore && System.nanoTime() < rejectedDeadline) {
+        try {
+          Observability.flush(Duration.ofMillis(250));
+        } catch (RuntimeException expectedDuringOutage) {
+          // Keep waiting for the receiver to confirm that it returned HTTP 503.
+        }
+        Thread.sleep(25);
+      }
+      assertTrue(REJECTED_LOGS.get() > rejectedBefore, "collector observed an HTTP 503 request");
+      assertFalse(has("java-pathb-outage-"));
+
+      rejectLogs = false;
+      String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+      LogEmit.emit(
+          Level.WARN,
+          "app.outage",
+          "java-pathb-recovered",
+          Map.of("phase", "recovered"),
+          0L,
+          SpanContext.parse(traceparent));
+      long recoveryDeadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+      while (bodyWith("java-pathb-recovered") == null && System.nanoTime() < recoveryDeadline) {
+        Observability.flush(Duration.ofSeconds(1));
+        Thread.sleep(25);
+      }
+      byte[] recovered = bodyWith("java-pathb-recovered");
+      assertTrue(recovered != null, "recovered application log was exported");
+      assertTrue(indexOf(recovered, "app.outage".getBytes(StandardCharsets.UTF_8)) >= 0);
+      assertTrue(indexOf(recovered, "phase".getBytes(StandardCharsets.UTF_8)) >= 0);
+      assertTrue(indexOf(recovered, "recovered".getBytes(StandardCharsets.UTF_8)) >= 0);
+      assertTrue(
+          indexOf(recovered, java.util.HexFormat.of().parseHex("0af7651916cd43dd8448eb211c80319c"))
+              >= 0);
+      assertTrue(indexOf(recovered, java.util.HexFormat.of().parseHex("b7ad6b7169203331")) >= 0);
+
+      rejectLogs = true;
+      LogEmit.emit(Level.WARN, "app.outage", "java-pathb-shutdown-outage");
+      long shutdownStarted = System.nanoTime();
+      assertTrue(Observability.shutdown(Duration.ofSeconds(1)));
+      assertTrue(Duration.ofNanos(System.nanoTime() - shutdownStarted).toMillis() < 3_000);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new AssertionError("interrupted while waiting for log export", e);
+    } finally {
+      rejectLogs = false;
+      if (!Observability.isInitialized()) {
+        Observability.init(
+            ObservabilityConfig.builder()
+                .fromEnv(false)
+                .serviceName("java-pathb-test")
+                .otlpEndpoint("http://127.0.0.1:" + receiver.getAddress().getPort())
+                .otlpLogs(true)
+                .logFilter("warn,aster=info")
+                .build());
+      }
+    }
   }
 }

@@ -45,9 +45,21 @@ public sealed class OtlpReceiver : IDisposable
     public IReadOnlyList<ExportedSpan> Spans => _spans.ToArray();
 
     private readonly ConcurrentQueue<byte[]> _logBodies = new();
+    private int _rejectLogs;
+    private int _rejectedLogs;
 
     /// <summary>Raw OTLP log export bodies (<c>POST /v1/logs</c>), decompressed.</summary>
     public IReadOnlyList<byte[]> LogBodies => _logBodies.ToArray();
+
+    /// <summary>When true, log exports receive HTTP 503 and are counted instead of retained.</summary>
+    public bool RejectLogs
+    {
+        get => Volatile.Read(ref _rejectLogs) != 0;
+        set => Volatile.Write(ref _rejectLogs, value ? 1 : 0);
+    }
+
+    /// <summary>Number of log exports answered with HTTP 503.</summary>
+    public int RejectedLogs => Volatile.Read(ref _rejectedLogs);
 
     /// <summary>Whether any received log export contains <paramref name="needle"/> as raw bytes.</summary>
     public bool LogsContain(ReadOnlySpan<byte> needle)
@@ -66,6 +78,7 @@ public sealed class OtlpReceiver : IDisposable
             catch (Exception) { return; }
             try
             {
+                ctx.Response.StatusCode = 200;
                 using var ms = new MemoryStream();
                 await ctx.Request.InputStream.CopyToAsync(ms).ConfigureAwait(false);
                 byte[] body = ms.ToArray();
@@ -76,11 +89,15 @@ public sealed class OtlpReceiver : IDisposable
                     gz.CopyTo(plain);
                     body = plain.ToArray();
                 }
-                if (ctx.Request.Url!.AbsolutePath.EndsWith("/v1/traces", StringComparison.Ordinal))
+                if (ctx.Request.Url!.AbsolutePath.EndsWith("/v1/logs", StringComparison.Ordinal) && RejectLogs)
+                {
+                    Interlocked.Increment(ref _rejectedLogs);
+                    ctx.Response.StatusCode = 503;
+                }
+                else if (ctx.Request.Url!.AbsolutePath.EndsWith("/v1/traces", StringComparison.Ordinal))
                     foreach (var s in Protobuf.ParseTraces(body)) _spans.Enqueue(s);
                 else if (ctx.Request.Url!.AbsolutePath.EndsWith("/v1/logs", StringComparison.Ordinal))
                     _logBodies.Enqueue(body);
-                ctx.Response.StatusCode = 200;
                 ctx.Response.ContentType = "application/x-protobuf";
                 ctx.Response.ContentLength64 = 0;
             }

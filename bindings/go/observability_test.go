@@ -28,12 +28,14 @@ import (
 var (
 	obsLogs = &capture{level: LevelTrace}
 
-	obsRecvOnce  sync.Once
-	obsRecv      *httptest.Server
-	obsBodiesMu  sync.Mutex
-	obsBodies    [][]byte
-	obsLogBodies [][]byte
-	obsOurs      bool // this file's pipeline is the running one; guarded by obs.mu
+	obsRecvOnce     sync.Once
+	obsRecv         *httptest.Server
+	obsBodiesMu     sync.Mutex
+	obsBodies       [][]byte
+	obsLogBodies    [][]byte
+	obsRejectLogs   bool
+	obsRejectedLogs int
+	obsOurs         bool // this file's pipeline is the running one; guarded by obs.mu
 )
 
 func obsReceiver() *httptest.Server {
@@ -47,6 +49,12 @@ func obsReceiver() *httptest.Server {
 			}
 			if strings.HasSuffix(r.URL.Path, "/v1/logs") {
 				obsBodiesMu.Lock()
+				if obsRejectLogs {
+					obsRejectedLogs++
+					obsBodiesMu.Unlock()
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
 				obsLogBodies = append(obsLogBodies, body)
 				obsBodiesMu.Unlock()
 			}
@@ -709,5 +717,100 @@ func TestObs_EmitHandlerExportsAppLogs(t *testing.T) {
 	}
 	if has([]byte("pathb-marker-rust")) {
 		t.Error("a record marked aster_origin=rust was re-emitted")
+	}
+}
+
+func TestObs_ApplicationLogsRecoverAfterExporterHTTP503(t *testing.T) {
+	obsSetup(t)
+	setOutage := func(value bool) {
+		obsBodiesMu.Lock()
+		obsRejectLogs = value
+		obsBodiesMu.Unlock()
+	}
+	t.Cleanup(func() {
+		setOutage(false)
+		obsSetup(t) // Restore the healthy shared pipeline after outage shutdown.
+	})
+	obsBodiesMu.Lock()
+	rejectedBefore := obsRejectedLogs
+	obsBodiesMu.Unlock()
+	setOutage(true)
+	start := time.Now()
+	for i := 0; i < 1000; i++ {
+		if err := EmitLog(slog.LevelWarn, "app.outage", fmt.Sprintf("go-outage-%d", i), nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("application emission blocked for %s", elapsed)
+	}
+	start = time.Now()
+	if err := FlushObservability(time.Second); err == nil {
+		t.Fatal("flush should report exporter failure")
+	}
+	if elapsed := time.Since(start); elapsed >= 3*time.Second {
+		t.Fatalf("failed flush exceeded bound: %s", elapsed)
+	}
+	obsBodiesMu.Lock()
+	rejected := obsRejectedLogs - rejectedBefore
+	for _, body := range obsLogBodies {
+		if bytes.Contains(body, []byte("go-outage-")) {
+			obsBodiesMu.Unlock()
+			t.Fatal("collector accepted an outage record while rejecting logs")
+		}
+	}
+	obsBodiesMu.Unlock()
+	if rejected == 0 {
+		t.Fatal("collector did not observe a refused logs request")
+	}
+	setOutage(false)
+	sc, err := ParseTraceparent(pureTP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := EmitLog(slog.LevelWarn, "app.outage", "go-recovered", []Attr{StringAttr("phase", "recovered")}, &sc); err != nil {
+		t.Fatal(err)
+	}
+	var recovered []byte
+	waitFor(t, "recovered application record", func() bool {
+		_ = FlushObservability(time.Second)
+		obsBodiesMu.Lock()
+		defer obsBodiesMu.Unlock()
+		for _, body := range obsLogBodies {
+			if bytes.Contains(body, []byte("go-recovered")) {
+				recovered = append([]byte(nil), body...)
+				return true
+			}
+		}
+		return false
+	})
+	for _, expected := range [][]byte{[]byte("app.outage"), []byte("phase"), sc.TraceID[:], sc.SpanID[:]} {
+		if !bytes.Contains(recovered, expected) {
+			t.Fatalf("recovered payload lacks %x", expected)
+		}
+	}
+	for _, record := range obsLogs.all() {
+		message, _ := record["msg"].(string)
+		if record["aster_origin"] == "rust" && (strings.Contains(message, "go-outage-") || strings.Contains(message, "go-recovered")) {
+			t.Fatal("application record fed back into Rust log bridge")
+		}
+	}
+	setOutage(true)
+	if err := EmitLog(slog.LevelWarn, "app.outage", "go-outage-shutdown", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	start = time.Now()
+	held, err := ShutdownObservability(time.Second)
+	obs.mu.Lock()
+	obsOurs = false
+	obs.mu.Unlock()
+	if err != nil || !held {
+		t.Fatalf("outage shutdown: held=%v err=%v", held, err)
+	}
+	if elapsed := time.Since(start); elapsed >= 3*time.Second {
+		t.Fatalf("outage shutdown exceeded bound: %s", elapsed)
+	}
+	if held, err := ShutdownObservability(time.Second); err != nil || held {
+		t.Fatalf("shutdown left a pipeline reference: held=%v err=%v", held, err)
 	}
 }
