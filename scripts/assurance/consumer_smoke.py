@@ -132,11 +132,11 @@ import { fileURLToPath } from 'node:url';
 import { AsterServer, AsterClientWrapper, CallContext, Rpc, RpcError, ServerStream, Service, StatusCode, WireType } from '@aster-rpc/aster';
 import { version as nativeVersion } from '@aster-rpc/transport';
 
-@WireType('assurance.clean/Request') class Request { value = ''; count = 0; }
-@WireType('assurance.clean/Reply') class Reply { value = ''; count = 0; }
+@WireType('assurance.clean/Request') export class Request { value = ''; count = 0; }
+@WireType('assurance.clean/Reply') export class Reply { value = ''; count = 0; }
 let cancelSeen = false, deadlineSeen = false;
 @Service({name:'AssuranceCleanConsumerTS',version:1})
-class Smoke {
+export class Smoke {
   @Rpc({request:Request,response:Reply,timeout:20})
   async echo(req:Request):Promise<Reply> { const r=new Reply(); r.value='echo:'+req.value; return r; }
   @ServerStream({request:Request,response:Reply})
