@@ -22,6 +22,7 @@
 // x-server-lang), admitting every peer.
 //
 // Usage: interop_echo contract | server | client <aster1-ticket> | expose-server
+// Catalogue chain: chain-client <java-chain-server-ticket> (Java forwards to a .NET chain-server).
 // Every mode prints CONTRACT_ID and SESSION_CONTRACT_ID first; servers print
 // ADDRESS <aster1...> and serve until stdin closes (loopback, relays off);
 // `client` prints CASE <name> OK|FAIL lines.
@@ -39,6 +40,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -185,15 +187,209 @@ func main() {
 		if !client(svc, sess, os.Args[2]) {
 			os.Exit(1)
 		}
+	case len(os.Args) == 3 && os.Args[1] == "chain-client":
+		if !chainClient(svc, os.Args[2]) {
+			os.Exit(1)
+		}
 	case len(os.Args) == 2 && os.Args[1] == "expose-server":
 		if err := exposeServe(); err != nil {
 			fmt.Fprintf(os.Stderr, "expose server: %v\n", err)
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: interop_echo contract | server | client <aster1-ticket> | expose-server")
+		fmt.Fprintln(os.Stderr, "usage: interop_echo contract | server | client <aster1-ticket> | chain-client <java-ticket> | expose-server")
 		os.Exit(2)
 	}
+}
+
+const chainTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+const chainTenant = "acme catalogue"
+
+func chainContext(ctx context.Context, request string, budget time.Duration) (context.Context, context.CancelFunc, error) {
+	tctx, err := aster.WithTraceContext(ctx, "00-"+chainTraceID+"-00f067aa0ba902b7-01",
+		map[string]string{"tenant": chainTenant, "request": request})
+	if err != nil {
+		return nil, nil, err
+	}
+	if aster.CurrentTraceID(tctx) != chainTraceID || aster.CurrentBaggage(tctx)["tenant"] != chainTenant || aster.CurrentBaggage(tctx)["request"] != request {
+		return nil, nil, fmt.Errorf("Go origin trace/baggage mismatch")
+	}
+	dctx, cancel := context.WithTimeout(tctx, budget)
+	return dctx, cancel, nil
+}
+
+// Chain receipts travel in existing EchoReply fields, only in opt-in fixture modes.
+func checkChainReceipt(receipt, request string, budget time.Duration) error {
+	rows := strings.Split(receipt, "\n")
+	if len(rows) != 2 {
+		return fmt.Errorf("chain receipt has %d hops: %q", len(rows), receipt)
+	}
+	previous := budget.Milliseconds() + 20 // Native deadline encoding rounds up to milliseconds.
+	for i, lang := range []string{"java", "dotnet"} {
+		fields := strings.Split(rows[i], "|")
+		if len(fields) != 5 || fields[0] != lang || fields[1] != chainTraceID || fields[2] != chainTenant || fields[3] != request {
+			return fmt.Errorf("%s trace/baggage receipt mismatch: %q", lang, rows[i])
+		}
+		remaining, err := strconv.ParseInt(fields[4], 10, 64)
+		if err != nil || remaining <= 0 || remaining > previous {
+			return fmt.Errorf("%s remaining deadline %q outside (0, %d] ms", lang, fields[4], previous)
+		}
+		if i == 1 && previous-remaining < 100 {
+			return fmt.Errorf("forwarding refreshed deadline: java=%d dotnet=%d ms", previous, remaining)
+		}
+		previous = remaining
+		fmt.Printf("CHAIN_RECEIPT %s %s\n", request, rows[i])
+	}
+	fmt.Printf("CHAIN_RECEIPT %s go|%s|%s|%s|%d\n", request, chainTraceID, chainTenant, request, budget.Milliseconds())
+	return nil
+}
+
+func chainCancelled(ctx context.Context, conn *aster.RpcConnection) (*EchoReply, error) {
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return aster.Call[EchoRequest, EchoReply](pctx, conn, "InteropEcho", "cancelled", &EchoRequest{Message: "probe"})
+}
+
+func chainClient(svc *aster.Service, ticket string) bool {
+	ctx := context.Background()
+	cl, err := aster.StartClient(ctx, config())
+	if err != nil {
+		fmt.Printf("CASE connect FAIL %v\n", err)
+		return false
+	}
+	defer cl.Close()
+	if err := cl.RegisterService(svc); err != nil {
+		fmt.Printf("CASE connect FAIL %v\n", err)
+		return false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	conn, err := cl.ConnectTicket(cctx, ticket)
+	cancel()
+	if err != nil {
+		fmt.Printf("CASE connect FAIL %v\n", err)
+		return false
+	}
+	ok := runCase("chain_trace_baggage", func(ctx context.Context) (string, error) {
+		const budget = 6 * time.Second
+		tctx, cancel, err := chainContext(ctx, "trace", budget)
+		if err != nil {
+			return "", err
+		}
+		defer cancel()
+		r, err := aster.Call[EchoRequest, EchoReply](tctx, conn, "InteropEcho", "traceEcho", &EchoRequest{Message: "probe"})
+		if err != nil {
+			return "", err
+		}
+		if r.ServerLang != "dotnet" {
+			return "", fmt.Errorf("chain leaf %q != dotnet", r.ServerLang)
+		}
+		return "go->java->dotnet", checkChainReceipt(r.Message, "trace", budget)
+	})
+	ok = runCase("chain_remaining_deadline", func(ctx context.Context) (string, error) {
+		before, err := chainCancelled(ctx, conn)
+		if err != nil {
+			return "", err
+		}
+		const budget = 1200 * time.Millisecond
+		dctx, cancel, err := chainContext(ctx, "deadline", budget)
+		if err != nil {
+			return "", err
+		}
+		defer cancel()
+		started := time.Now()
+		_, err = aster.Call[EchoRequest, EchoReply](dctx, conn, "InteropEcho", "hold", &EchoRequest{Message: "hold"})
+		var rpcErr *aster.RpcError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != aster.StatusDeadlineExceeded {
+			return "", fmt.Errorf("chain hold wanted DEADLINE_EXCEEDED, got %v", err)
+		}
+		if time.Since(started) > budget+time.Second {
+			return "", fmt.Errorf("chain deadline did not bound the call")
+		}
+		if err := expectServerCancel(ctx, conn, before.Count+1); err != nil {
+			return "", err
+		}
+		after, err := chainCancelled(ctx, conn)
+		if err != nil {
+			return "", err
+		}
+		if after.Count != before.Count+1 {
+			return "", fmt.Errorf("leaf deadline count %d != %d", after.Count, before.Count+1)
+		}
+		fmt.Printf("CHAIN_CANCEL_COUNT deadline before=%d after=%d\n", before.Count, after.Count)
+		return "go->java->dotnet", checkChainReceipt(string(after.Data), "deadline", budget)
+	}) && ok
+	ok = runCase("chain_cancel", func(ctx context.Context) (string, error) {
+		before, err := chainCancelled(ctx, conn)
+		if err != nil {
+			return "", err
+		}
+		const budget = 8 * time.Second
+		started := time.Now()
+		dctx, timeout, err := chainContext(ctx, "cancel", budget)
+		if err != nil {
+			return "", err
+		}
+		defer timeout()
+		cctx, cancel := context.WithCancel(dctx)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := aster.Call[EchoRequest, EchoReply](cctx, conn, "InteropEcho", "hold", &EchoRequest{Message: "hold"})
+			done <- err
+		}()
+		// Confirm this exact traced hold reached the leaf before explicitly cancelling it.
+		var receipt *EchoReply
+		for until := time.Now().Add(2 * time.Second); time.Now().Before(until); {
+			receipt, err = chainCancelled(ctx, conn)
+			if err != nil {
+				return "", err
+			}
+			if strings.Contains(string(receipt.Data), "dotnet|"+chainTraceID+"|"+chainTenant+"|cancel|") {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if receipt == nil {
+			return "", fmt.Errorf("leaf never started hold")
+		}
+		if err := checkChainReceipt(string(receipt.Data), "cancel", budget); err != nil {
+			return "", err
+		}
+		if receipt.Count != before.Count {
+			return "", fmt.Errorf("leaf hold ended before explicit cancel")
+		}
+		leafFields := strings.Split(strings.Split(string(receipt.Data), "\n")[1], "|")
+		leafRemaining, _ := strconv.ParseInt(leafFields[4], 10, 64)
+		if leafRemaining < 6000 {
+			return "", fmt.Errorf("leaf cancel test needs at least 6 s remaining, saw %d ms", leafRemaining)
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, aster.ErrCancelled) {
+				return "", fmt.Errorf("chain explicit cancel wanted CANCELLED, got %v", err)
+			}
+		case <-time.After(time.Second):
+			return "", fmt.Errorf("chain explicit cancel did not return promptly")
+		}
+		// This bound finishes well before the 8 s deadline: only explicit cancel can pass.
+		for until := time.Now().Add(2 * time.Second); time.Now().Before(until); {
+			after, err := chainCancelled(ctx, conn)
+			if err != nil {
+				return "", err
+			}
+			if after.Count == before.Count+1 {
+				if time.Since(started) >= 4*time.Second {
+					return "", fmt.Errorf("explicit cancel observation was not safely before the 8 s deadline")
+				}
+				fmt.Printf("CHAIN_CANCEL_COUNT cancel before=%d after=%d elapsed_ms=%d\n", before.Count, after.Count, time.Since(started).Milliseconds())
+				return "go->java->dotnet", nil
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return "", fmt.Errorf("explicit cancellation did not reach leaf before its deadline")
+	}) && ok
+	return ok
 }
 
 func serve(svc, sess *aster.Service) error {

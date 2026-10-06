@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -161,6 +162,38 @@ type readerFunc func([]byte) (int, error)
 
 func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
+// A blocked upload must be interrupted through its actual io.Closer, not
+// merely forgotten when the response/native handles are released.
+type closeObservedFeed struct {
+	*feed
+	closed       chan struct{}
+	readingAgain chan struct{}
+	reads        atomic.Int32
+	once         sync.Once
+}
+
+func (f *closeObservedFeed) Read(p []byte) (int, error) {
+	if f.reads.Add(1) == 2 {
+		close(f.readingAgain)
+	}
+	return f.feed.Read(p)
+}
+
+func (f *closeObservedFeed) Close() error {
+	err := f.feed.Close()
+	f.once.Do(func() { close(f.closed) })
+	return err
+}
+
+func waitRelayDone(t *testing.T, description string, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s did not finish", description)
+	}
+}
+
 func TestRelayStream_SourceFailureBeforeTheHeadFailsTheCall(t *testing.T) {
 	rig := newExposeRig(t, true)
 	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
@@ -219,7 +252,47 @@ func TestRelayStream_SourceFailureAfterTheHeadIsReportedNotReturned(t *testing.T
 }
 
 func TestRelayStream_CloseBeforeTheEndResetsTheUpload(t *testing.T) {
-	rig := newExposeRig(t, true)
+	// The shared OTLP collector may accept an unrelated keepalive connection
+	// during this test. Verify this exchange's resources instead of process counts.
+	rig := newExposeRigWithLeakCheck(t, true, false)
+	t.Cleanup(func() {
+		// Run before the fixture's idempotent fallback cleanups so native Close
+		// errors are observed on their first call, including each owned runtime.
+		closed := make(chan []string, 1)
+		go func() {
+			var failures []string
+			for _, step := range []struct {
+				name  string
+				close func() error
+			}{
+				{"connection", func() error { return rig.conn.Close("done") }},
+				{"expose", rig.ex.Close}, {"bodies", rig.bodies.Close}, {"upcalls", rig.up.Close},
+				{"client node and runtime", rig.client.Close}, {"server node and runtime", rig.server.Close},
+			} {
+				if err := step.close(); err != nil {
+					failures = append(failures, step.name+": "+err.Error())
+				}
+			}
+			for name, rt := range map[string]*Runtime{"server": rig.server.Runtime(), "client": rig.client.Runtime()} {
+				if !rt.closed.Load() || rt.refs.Load() != 0 {
+					failures = append(failures, name+" fixture runtime retained after node close")
+				}
+				if err := rt.Close(); err != nil {
+					failures = append(failures, name+" exact runtime: "+err.Error())
+				}
+				rt.wg.Wait() // The exact CQ poller must have exited, not just been marked closed.
+			}
+			closed <- failures
+		}()
+		select {
+		case failures := <-closed:
+			for _, failure := range failures {
+				t.Errorf("relay fixture cleanup: %s", failure)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("relay fixture and its exact runtimes did not stop within 5 s")
+		}
+	})
 	handlerErr := make(chan error, 1)
 	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
 		w.(http.Flusher).Flush()
@@ -229,17 +302,29 @@ func TestRelayStream_CloseBeforeTheEndResetsTheUpload(t *testing.T) {
 		handlerErr <- err
 	}, nil)
 	var uploadErrs atomic.Int64
-	up := newFeed()
+	up := &closeObservedFeed{feed: newFeed(), closed: make(chan struct{}), readingAgain: make(chan struct{})}
+	t.Cleanup(func() { _ = up.Close(); _ = up.pw.Close() })
 	resp, err := rig.stream(RelayStreamRequest{Body: up, OnUploadError: func(error) { uploadErrs.Add(1) }})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	exchange := resp.Body.(*relayBody).x
 	got := make([]byte, 5)
 	if _, err := io.ReadFull(resp.Body, got); err != nil || string(got) != "hello" {
 		t.Fatalf("%q, %v", got, err)
 	}
-	up.pw.Write([]byte("in flight"))
-	resp.Body.Close() // before the end of the response
+	if _, err := up.pw.Write([]byte("in flight")); err != nil {
+		t.Fatal(err)
+	}
+	// No second chunk is supplied: the pump must leave this source Read when closed.
+	waitRelayDone(t, "upload pump requesting another source chunk", up.readingAgain)
+	if err := resp.Body.Close(); err != nil { // before the end of the response
+		t.Fatal(err)
+	}
+	waitRelayDone(t, "upload source close", up.closed)
+	waitRelayDone(t, "upload pump and native upload release", exchange.pumpDone)
+	waitRelayDone(t, "exchange abandonment", exchange.done)
 	select {
 	case err := <-handlerErr:
 		if err == nil {

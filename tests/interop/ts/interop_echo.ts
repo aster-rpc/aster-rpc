@@ -93,26 +93,44 @@ async function waitStdinEof(): Promise<void> {
   });
 }
 
-async function serve(): Promise<void> {
+async function serve(forwardTicket?: string): Promise<void> {
   process.env.ASTER_RELAY_MODE ??= 'disabled';
   process.env.ASTER_BIND_ADDR ??= '127.0.0.1:0';
+  let forwardNode: any;
+  let forwardConn: any;
+  let forward: any;
+  if (forwardTicket) {
+    const native = loadNative();
+    const codec = registerAll();
+    forwardNode = await native.Node.start({ alpns: [RPC_ALPN], relayMode: 'disabled', bindAddr: '127.0.0.1:0' });
+    const t = native.asterTicketFromString(forwardTicket);
+    forwardConn = await withTimeout(
+      forwardNode.connectNodeAddr(t.endpointId, RPC_ALPN, t.directAddrs, undefined),
+      15_000,
+    );
+    forward = createClient(InteropEcho, new IrohTransport(forwardConn, codec));
+  }
   const server = new AsterServer({
-    services: [new InteropEcho(), new InteropSession()],
+    services: [new InteropEcho(forward), new InteropSession()],
     allowAllConsumers: true,
     generated,
     config: { logLevel: 'warn' } as any,
   });
-  await server.start();
-  // Direct addresses appear shortly after bind.
-  for (let i = 0; i < 100; i++) {
-    if ((server as any)._node.directAddresses().length) break;
-    await new Promise((r) => setTimeout(r, 50));
+  try {
+    await server.start();
+    // Direct addresses appear shortly after bind.
+    for (let i = 0; i < 100; i++) {
+      if ((server as any)._node.directAddresses().length) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    console.log(`ADDRESS ${server.address}`);
+    void server.serve();
+    await waitStdinEof();
+    await server.close();
+  } finally {
+    try { forwardConn?.close(0, 'done'); } catch { /* already closed */ }
+    await forwardNode?.close();
   }
-  console.log(`ADDRESS ${server.address}`);
-  void server.serve();
-  await waitStdinEof();
-  await server.close();
-  process.exit(0);
 }
 
 async function runClient(ticket: string): Promise<boolean> {
@@ -339,7 +357,7 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 // Server registers generated metadata itself (AsterServer.start); the
 // contract id needs the ServiceInfo stamped either way.
 const mode = process.argv[2];
-if (mode !== 'server') registerAll();
+if (mode !== 'server' && mode !== 'chain-server') registerAll();
 else registerGenerated({ ...generated });
 console.log(`CONTRACT_ID ${contractId()}`);
 console.log(`SESSION_CONTRACT_ID ${contractId(InteropSession)}`);
@@ -348,11 +366,13 @@ if (mode === 'contract') {
   process.exit(0);
 } else if (mode === 'server') {
   await serve();
+} else if (mode === 'chain-server' && process.argv[3]) {
+  await serve(process.argv[3]);
 } else if (mode === 'expose-server') {
   await exposeServe();
 } else if (mode === 'client' && process.argv[3]) {
   process.exit((await runClient(process.argv[3])) ? 0 : 1);
 } else {
-  console.error('usage: interop_echo.ts contract | server | client <aster1-ticket> | expose-server');
+  console.error('usage: interop_echo.ts contract | server | chain-server <rust-ticket> | client <aster1-ticket> | expose-server');
   process.exit(2);
 }

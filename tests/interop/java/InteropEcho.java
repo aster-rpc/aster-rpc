@@ -23,6 +23,7 @@
 //   java --enable-native-access=ALL-UNNAMED -cp <aster-runtime classpath> \
 //       tests/interop/java/InteropEcho.java contract | server | client <aster1-ticket>
 //   java ... InteropEcho.java expose-server
+//   java ... InteropEcho.java chain-server <dotnet-chain-server-ticket>
 //   java ... InteropEcho.java bench <aster1-ticket> [--duration S] [--warmup S]
 //       [--concurrency 1,10,50,100] [--stream-frames 100,10000] [--client-stream 10000]
 //
@@ -41,7 +42,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -50,6 +53,7 @@ import org.apache.fory.Fory;
 import site.aster.annotations.Scope;
 import site.aster.annotations.WireType;
 import site.aster.client.AsterClient;
+import site.aster.client.CallOptions;
 import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
 import site.aster.codec.ForyTags;
@@ -267,6 +271,66 @@ public final class InteropEcho {
   /** {@code hold} calls that observed a cancellation (process-wide). */
   static final AtomicInteger HOLD_CANCELLED = new AtomicInteger();
 
+  // Opt-in catalogue-chain fixture. No methods or wire types are added to the contract.
+  static AsterClient chainClient;
+  static NodeAddr chainLeaf;
+  static volatile String chainHoldReceipt = "";
+
+  static String chainReceipt(CallContext ctx) {
+    Map<String, String> baggage = site.aster.otel.Tracing.currentBaggage();
+    Double remaining = ctx.remainingSeconds();
+    return "java|" + site.aster.otel.Tracing.currentTraceId() + "|"
+        + baggage.getOrDefault("tenant", "") + "|" + baggage.getOrDefault("request", "")
+        + "|" + (remaining == null ? -1 : (long) (remaining * 1000));
+  }
+
+  static EchoReply chainForward(String method, EchoRequest req, CallContext ctx) throws Exception {
+    // Consume measurable budget before forwarding. The outbound timeout is computed afterwards,
+    // so the leaf receives the remaining budget rather than a fresh copy of the original timeout.
+    if (!method.equals("cancelled")) {
+      Thread.sleep(150);
+    }
+    if (ctx.isExpired()) {
+      throw new RpcError(StatusCode.DEADLINE_EXCEEDED, "chain: deadline passed");
+    }
+    if (ctx.isCancelled()) {
+      throw new RpcError(StatusCode.CANCELLED, "chain: inbound cancelled");
+    }
+    Double remaining = ctx.remainingSeconds();
+    CallOptions options = CallOptions.DEFAULT.withTimeout(java.time.Duration.ofNanos(
+        remaining == null ? 8_000_000_000L : Math.max(1L, (long) (remaining * 1e9))));
+    // AsterClient captures the handler's current trace and baggage when call() is invoked.
+    CompletableFuture<EchoReply> future = chainClient.call(
+        chainLeaf, "InteropEcho", method, req, EchoReply.class, options);
+    long cleanupBound = System.nanoTime() + 10_000_000_000L;
+    try {
+      while (System.nanoTime() < cleanupBound) {
+        if (ctx.isExpired()) {
+          throw new RpcError(StatusCode.DEADLINE_EXCEEDED, "chain: deadline passed");
+        }
+        if (ctx.isCancelled()) {
+          throw new RpcError(StatusCode.CANCELLED, "chain: inbound cancelled");
+        }
+        try {
+          return future.get(20, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException pending) {
+          // Poll only while this handler owns the outbound invocation.
+        } catch (ExecutionException failed) {
+          if (failed.getCause() instanceof Exception cause) {
+            throw cause;
+          }
+          throw failed;
+        }
+      }
+      throw new RpcError(StatusCode.DEADLINE_EXCEEDED, "chain: cleanup bound reached");
+    } finally {
+      // Cancelling this exact returned future invokes InvocationFuture's native cancel hook.
+      if (!future.isDone()) {
+        future.cancel(true);
+      }
+    }
+  }
+
   /**
    * {@code hold}: blocks until cancelled (a client cancel, seen as {@code ctx.isCancelled()}, or
    * the call's deadline, by watching the clock) or 60 s.
@@ -278,7 +342,12 @@ public final class InteropEcho {
     }
 
     @Override
-    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
+    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) throws Exception {
+      if (chainClient != null) {
+        chainHoldReceipt = chainReceipt(ctx);
+        return codec.encode(chainForward("hold",
+            (EchoRequest) codec.decode(requestBytes, EchoRequest.class), ctx));
+      }
       Double deadline = ctx.deadline();
       long end = System.nanoTime() + 60_000_000_000L;
       while (System.nanoTime() < end) {
@@ -309,7 +378,15 @@ public final class InteropEcho {
     }
 
     @Override
-    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
+    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) throws Exception {
+      if (chainClient != null) {
+        EchoReply reply = chainForward("cancelled",
+            (EchoRequest) codec.decode(requestBytes, EchoRequest.class), ctx);
+        reply.data = (chainHoldReceipt + "\n"
+            + new String(reply.data, java.nio.charset.StandardCharsets.UTF_8))
+            .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        return codec.encode(reply);
+      }
       return codec.encode(new EchoReply("cancelled", HOLD_CANCELLED.get(), new byte[0], "java"));
     }
   }
@@ -325,7 +402,14 @@ public final class InteropEcho {
     }
 
     @Override
-    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) {
+    public byte[] invoke(Object impl, byte[] requestBytes, Codec codec, CallContext ctx) throws Exception {
+      if (chainClient != null) {
+        String receipt = chainReceipt(ctx);
+        EchoReply reply = chainForward("traceEcho",
+            (EchoRequest) codec.decode(requestBytes, EchoRequest.class), ctx);
+        reply.message = receipt + "\n" + reply.message;
+        return codec.encode(reply);
+      }
       String traceId = site.aster.otel.Tracing.currentTraceId();
       return codec.encode(new EchoReply(traceId == null ? "" : traceId, 0, new byte[0], "java"));
     }
@@ -423,7 +507,24 @@ public final class InteropEcho {
       // serve until stdin closes
     }
     server.close();
+    if (chainClient != null) {
+      chainClient.close();
+    }
     System.exit(0);
+  }
+
+  static void chainServe(String leafTicket) throws Exception {
+    ForyCodec codec = new ForyCodec();
+    registerTypes(codec.fory());
+    try (AsterClient client = AsterClient.builder().config(config()).codec(codec)
+        .consumerAdmission(false).build().get(30, TimeUnit.SECONDS)) {
+      chainLeaf = NodeAddr.fromTicket(leafTicket);
+      client.connect(chainLeaf).get(15, TimeUnit.SECONDS);
+      chainClient = client;
+      serve();
+    } finally {
+      chainClient = null;
+    }
   }
 
   // ---- bench client -------------------------------------------------------
@@ -962,6 +1063,8 @@ public final class InteropEcho {
     System.out.flush();
     if (args.length == 1 && args[0].equals("contract")) {
       System.exit(0);
+    } else if (args.length == 2 && args[0].equals("chain-server")) {
+      chainServe(args[1]);
     } else if (args.length >= 1 && args[0].equals("server")) {
       serve();
     } else if (args.length == 1 && args[0].equals("expose-server")) {
@@ -972,7 +1075,7 @@ public final class InteropEcho {
       bench(args);
     } else {
       System.err.println(
-          "usage: InteropEcho.java contract | server | client <aster1-ticket> | bench <aster1-ticket> [options]");
+          "usage: InteropEcho.java contract | server | chain-server <dotnet-ticket> | client <aster1-ticket> | bench <aster1-ticket> [options]");
       System.exit(2);
     }
   }

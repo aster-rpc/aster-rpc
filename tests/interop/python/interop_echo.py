@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -335,6 +336,138 @@ async def _trace_case(client) -> str:
     return reply.server_lang
 
 
+async def _chain_trace_baggage_case(client) -> str:
+    request_id = os.urandom(8).hex()
+    traceparent = f"00-{_TRACE_ID}-{os.urandom(8).hex()}-01"
+    with tracing.with_trace_context(traceparent, {"tenant": "interop-chain", "request": request_id}):
+        if tracing.current_trace_id() != _TRACE_ID:
+            raise AssertionError("Python source context lost the supplied trace id")
+        source_baggage = tracing.current_baggage()
+        if source_baggage.get("tenant") != "interop-chain" or source_baggage.get("request") != request_id:
+            raise AssertionError(f"Python source baggage mismatch: {source_baggage!r}")
+        reply = await client.traceEcho(EchoRequest(message=f"chain-trace:{request_id}"), timeout=12)
+    rows = reply.message.splitlines()
+    if len(rows) != 2:
+        raise AssertionError(f"chain returned {len(rows)} handler receipt rows, expected 2: {reply.message!r}")
+    parsed = []
+    for row, lang in zip(rows, ("ts", "rust"), strict=True):
+        fields = row.split("|")
+        if len(fields) != 5:
+            raise AssertionError(f"malformed {lang} receipt: {row!r}")
+        got_lang, trace_id, tenant, got_request, remaining_ms = fields
+        if got_lang != lang or trace_id != _TRACE_ID or tenant != "interop-chain" or got_request != request_id:
+            raise AssertionError(f"{lang} receipt mismatch: {row!r}")
+        parsed.append((lang, int(remaining_ms)))
+    # TS exposes its inbound deadline. Rust's handler API does not; -1 is an
+    # explicit unsupported sentinel. Native Rust deadline enforcement is
+    # verified by the leaf cancellation case below.
+    if parsed[0][1] <= 0 or parsed[0][1] > 12_000 or parsed[1][1] != -1:
+        raise AssertionError(f"deadline observations unsupported, expired, or extended: {parsed!r}")
+    return "python-client->ts->rust"
+
+
+async def _chain_expect_leaf_cancel(client, want: int) -> None:
+    seen = 0
+    until = time.monotonic() + 4
+    while time.monotonic() < until:
+        seen = await asyncio.wait_for(_cancelled_count(client), until - time.monotonic())
+        if seen == want:
+            return
+        if seen > want:
+            raise AssertionError(f"Rust leaf cancellation count advanced unexpectedly: {seen}, expected {want}")
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"Rust leaf never observed cancellation (count {seen}, want {want})")
+
+
+async def _chain_deadline_case(client) -> str:
+    before = await _cancelled_count(client)
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(client.hold(EchoRequest(message="chain-deadline"), timeout=2), 8)
+    except RpcError as exc:
+        if exc.code != StatusCode.DEADLINE_EXCEEDED:
+            raise AssertionError(f"expected DEADLINE_EXCEEDED, got {exc!r}") from exc
+    else:
+        raise AssertionError("held chain call unexpectedly returned")
+    elapsed = time.monotonic() - started
+    if elapsed < 1 or elapsed >= 4:
+        raise AssertionError(f"chain deadline did not expire near the requested 2s budget: {elapsed:.3f}s")
+    await _chain_expect_leaf_cancel(client, before + 1)
+    return "python-client->ts->rust"
+
+
+async def _chain_cancel_case(client) -> str:
+    before = await _cancelled_count(client)
+    request_id = os.urandom(8).hex()
+    call = asyncio.create_task(client.hold(EchoRequest(message=f"chain-cancel:{request_id}"), timeout=10))
+    leaf_started = False
+    try:
+        until = time.monotonic() + 4
+        while time.monotonic() < until:
+            remaining = until - time.monotonic()
+            receipt = await asyncio.wait_for(
+                client.cancelled(EchoRequest(message=f"chain-cancel:{request_id}")), min(1, remaining)
+            )
+            if receipt.message == "chain-hold-started":
+                leaf_started = True
+                break
+        else:
+            raise AssertionError("Rust leaf did not report the matching hold handler started within 4s")
+        call.cancel()
+        await asyncio.wait_for(call, 2)
+    except asyncio.TimeoutError:
+        if leaf_started:
+            raise AssertionError("caller cancellation was not observed promptly")
+        raise AssertionError("Rust leaf did not report the matching hold handler started within 4s")
+    except asyncio.CancelledError:
+        pass
+    except RpcError as exc:
+        if exc.code != StatusCode.CANCELLED:
+            raise
+    else:
+        raise AssertionError("held chain call returned before caller cancellation")
+    finally:
+        if not call.done():
+            call.cancel()
+            try:
+                await call
+            except asyncio.CancelledError:
+                pass
+    await _chain_expect_leaf_cancel(client, before + 1)
+    return "python-client->ts->rust"
+
+
+async def run_chain_client(ticket_str: str) -> bool:
+    cfg = AsterConfig(alpns=(RPC_ALPN,), relay_mode="disabled", bind_addr="127.0.0.1:0")
+    node = await Node.start(cfg)
+    try:
+        t = AsterTicket.from_string(ticket_str)
+        addr = NodeAddr(endpoint_id=t.endpoint_id, relay_url=None, direct_addresses=t.direct_addrs)
+        conn = await asyncio.wait_for(net_client(node).connect_node_addr(addr, RPC_ALPN), 15)
+    except Exception as exc:  # noqa: BLE001
+        print(f"CASE connect FAIL {type(exc).__name__}: {exc}", flush=True)
+        await node.close()
+        return False
+    client = create_client(InteropEcho, connection=conn)
+    all_ok = True
+    try:
+        for name, run in (
+            ("chain_trace_baggage", _chain_trace_baggage_case),
+            ("chain_remaining_deadline", _chain_deadline_case),
+            ("chain_cancel", _chain_cancel_case),
+        ):
+            try:
+                result = await asyncio.wait_for(run(client), 25)
+                print(f"CASE {name} OK server_lang={result}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                all_ok = False
+                print(f"CASE {name} FAIL {type(exc).__name__}: {exc}", flush=True)
+    finally:
+        conn.close(0, b"done")
+        await node.close()
+    return all_ok
+
+
 async def _wait_stdin_eof() -> None:
     loop = asyncio.get_running_loop()
     while await loop.run_in_executor(None, sys.stdin.readline):
@@ -344,17 +477,18 @@ async def _wait_stdin_eof() -> None:
 async def serve() -> None:
     config = AsterConfig.from_env().replace(relay_mode="disabled", bind_addr="127.0.0.1:0")
     srv = AsterServer(services=[InteropEcho(), InteropSession], config=config, allow_all_consumers=True)
-    await srv.start()
-    for _ in range(100):
-        if srv.node.node_addr_info().direct_addresses:
-            break
-        await asyncio.sleep(0.05)
-    print(f"ADDRESS {srv.address}", flush=True)
-    serve_task = srv.serve()
     try:
+        await srv.start()
+        for _ in range(100):
+            if srv.node.node_addr_info().direct_addresses:
+                break
+            await asyncio.sleep(0.05)
+        print(f"ADDRESS {srv.address}", flush=True)
+        serve_task = srv.serve()
         await _wait_stdin_eof()
     finally:
-        serve_task.cancel()
+        if "serve_task" in locals():
+            serve_task.cancel()
         await srv.close()
 
 
@@ -516,9 +650,11 @@ def main() -> int:
     if args == ["server"]:
         asyncio.run(serve())
         return 0
+    if len(args) == 2 and args[0] == "chain-client":
+        return 0 if asyncio.run(run_chain_client(args[1])) else 1
     if len(args) == 2 and args[0] == "client":
         return 0 if asyncio.run(run_client(args[1])) else 1
-    print("usage: interop_echo.py contract | server | client <ticket> | expose-server | expose-client <ticket>", file=sys.stderr)
+    print("usage: interop_echo.py contract | server | chain-client <ts-ticket> | client <ticket> | expose-server | expose-client <ticket>", file=sys.stderr)
     return 2
 
 

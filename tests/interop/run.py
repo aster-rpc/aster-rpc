@@ -81,6 +81,8 @@ RPC_CASES = (
     "bidi", "deadline", "cancel", "session", "trace",
 )
 EXPOSE_CASES = ("expose_hello", "expose_echo_stream")
+CHAIN_CASES = ("chain_trace_baggage", "chain_remaining_deadline", "chain_cancel")
+CHAINS = (("python", "ts", "rust"), ("go", "java", "dotnet"))
 
 # Known binding bugs: (matrix, server, client, case) -> reason; "*" matches any
 # language. A listed case that FAILs is reported XFAIL and does not fail the
@@ -227,9 +229,9 @@ def contract_ids(langs: list[str]) -> dict[str, tuple[str, str]]:
 
 
 class Server:
-    def __init__(self, lang: str, mode: str = "server") -> None:
+    def __init__(self, lang: str, mode: str = "server", *args: str) -> None:
         self.lang = lang
-        cmd, cwd = command(lang, mode)
+        cmd, cwd = command(lang, mode, *args)
         self.proc = subprocess.Popen(
             cmd, cwd=cwd, env=ENV, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -352,6 +354,36 @@ def run_matrix(
 _DETAILS: dict[tuple[str, str, str, str], str] = {}
 
 
+def run_chains() -> bool:
+    """Run the two catalogue paths, keeping the leaf alive through each case."""
+    passed = 0
+    for source, middle, leaf in CHAINS:
+        path = ">".join((source, middle, leaf))
+        terminal = Server(leaf, "chain-server")
+        forwarder = None
+        try:
+            leaf_ticket = terminal.address()
+            if leaf_ticket is None:
+                raise RuntimeError(f"leaf did not start: {' | '.join(terminal.stderr[-5:])}")
+            forwarder = Server(middle, "chain-server", leaf_ticket)
+            ticket = forwarder.address()
+            if ticket is None:
+                raise RuntimeError(f"middle did not start: {' | '.join(forwarder.stderr[-5:])}")
+            results = run_client(source, "chain-client", ticket, CHAIN_CASES)
+        except Exception as exc:
+            results = {case: (False, str(exc)) for case in CHAIN_CASES}
+        finally:
+            if forwarder is not None:
+                forwarder.stop()
+            terminal.stop()
+        for case, (ok, detail) in results.items():
+            print(f"[chain] {path} {case} {'PASS' if ok else 'FAIL'} {detail}", flush=True)
+            passed += int(ok)
+    total = len(CHAINS) * len(CHAIN_CASES)
+    print(f"Chains: {passed}/{total} cases passed", flush=True)
+    return passed == total
+
+
 def report(matrix: str, title: str, servers: list[str], clients: list[str], cases: tuple[str, ...],
            results: dict[tuple[str, str], dict[str, str]]) -> bool:
     """Print the cell matrix and the per-case table; return True if all green."""
@@ -413,6 +445,7 @@ def main() -> int:
     ap.add_argument("--clients", default=",".join(DEFAULT_LANGS))
     ap.add_argument("--no-expose", action="store_true", help="skip the expose/relay matrix")
     ap.add_argument("--no-rpc", action="store_true", help="skip the RPC matrix")
+    ap.add_argument("--chains", action="store_true", help="also require both three-hop catalogue paths")
     ap.add_argument("--require-all", action="store_true",
                     help="all six languages are required: a missing toolchain is an error")
     ap.add_argument("--mvn-online", action="store_true", help="let Maven resolve dependencies (default: offline)")
@@ -451,6 +484,8 @@ def main() -> int:
         ex_clients = [c for c in clients if c in EXPOSE_CLIENTS]
         expose = run_matrix("expose", servers, ex_clients, "expose-server", "expose-client", EXPOSE_CASES)
         failed |= not report("expose", "Expose matrix", servers, ex_clients, EXPOSE_CASES, expose)
+    if args.chains:
+        failed |= not run_chains()
     return 1 if failed else 0
 
 

@@ -53,6 +53,8 @@
 use aster::rpc::{async_trait, RequestStream, ResponseSink};
 use aster::Result;
 use fory_derive::ForyStruct;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "interop/EchoRequest")]
@@ -108,16 +110,45 @@ pub struct EchoImpl;
 /// one server process per server language and clients take turns).
 static HOLD_CANCELLED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Baggage observed by the Rust-native attribute extractor in the chain test.
+/// The request id comes from the inbound W3C baggage header, not the payload.
+static CHAIN_BAGGAGE: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+static CHAIN_HOLD_STARTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+pub fn record_chain_baggage(request: &str, tenant: &str) {
+    CHAIN_BAGGAGE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(request.to_owned(), (request.to_owned(), tenant.to_owned()));
+}
+
+fn take_chain_baggage(request: &str) -> Option<(String, String)> {
+    CHAIN_BAGGAGE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(request)
+}
+
 /// Counts a cancelled `hold`: the handler future is dropped when the call is
 /// cancelled or its deadline passes, which runs this before `disarm`.
 struct HoldGuard {
     armed: bool,
+    chain_request: Option<String>,
 }
 
 impl Drop for HoldGuard {
     fn drop(&mut self) {
         if self.armed {
             HOLD_CANCELLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(request) = self.chain_request.take() {
+            CHAIN_HOLD_STARTED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request);
         }
     }
 }
@@ -180,8 +211,19 @@ impl InteropEcho for EchoImpl {
         Ok(())
     }
 
-    async fn hold(&self, _req: EchoRequest) -> Result<EchoReply> {
-        let mut guard = HoldGuard { armed: true };
+    async fn hold(&self, req: EchoRequest) -> Result<EchoReply> {
+        let chain_request = req.message.strip_prefix("chain-cancel:").map(str::to_owned);
+        if let Some(request) = &chain_request {
+            CHAIN_HOLD_STARTED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(request.clone());
+        }
+        let mut guard = HoldGuard {
+            armed: true,
+            chain_request,
+        };
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         guard.armed = false;
         Ok(EchoReply {
@@ -192,16 +234,47 @@ impl InteropEcho for EchoImpl {
         })
     }
 
-    async fn cancelled(&self, _req: EchoRequest) -> Result<EchoReply> {
+    async fn cancelled(&self, req: EchoRequest) -> Result<EchoReply> {
+        let chain_started = req.message.strip_prefix("chain-cancel:").map(|request| {
+            CHAIN_HOLD_STARTED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(request)
+        });
         Ok(EchoReply {
-            message: "cancelled".into(),
+            message: match chain_started {
+                Some(true) => "chain-hold-started",
+                Some(false) => "chain-hold-not-started",
+                None => "cancelled",
+            }
+            .into(),
             count: HOLD_CANCELLED.load(std::sync::atomic::Ordering::SeqCst),
             data: vec![],
             server_lang: "rust".into(),
         })
     }
 
-    async fn trace_echo(&self, _req: EchoRequest) -> Result<EchoReply> {
+    async fn trace_echo(&self, req: EchoRequest) -> Result<EchoReply> {
+        if let Some(request) = req.message.strip_prefix("chain-trace:") {
+            // Rust handlers intentionally have no call-context/baggage getter.
+            // The lower-level Server extractor records the actual inbound
+            // baggage while opening this call's native span; consume that
+            // receipt here so the external chain client can verify it.
+            let (observed_request, tenant) = take_chain_baggage(request)
+                .unwrap_or_else(|| ("<unobserved>".into(), "<unobserved>".into()));
+            return Ok(EchoReply {
+                message: format!(
+                    "rust|{}|{}|{}|-1",
+                    current_trace_id(),
+                    tenant,
+                    observed_request
+                ),
+                count: 0,
+                data: vec![],
+                server_lang: "rust".into(),
+            });
+        }
         Ok(EchoReply {
             message: current_trace_id(),
             count: 0,

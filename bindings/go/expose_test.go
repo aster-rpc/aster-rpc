@@ -45,7 +45,14 @@ type exposeRig struct {
 // HandleConnection (false).
 func newExposeRig(t *testing.T, serve bool) *exposeRig {
 	t.Helper()
-	leakCheck(t)
+	return newExposeRigWithLeakCheck(t, serve, true)
+}
+
+func newExposeRigWithLeakCheck(t *testing.T, serve, checkLeaks bool) *exposeRig {
+	t.Helper()
+	if checkLeaks {
+		leakCheck(t)
+	}
 	ctx := upCtx(t)
 	r := &exposeRig{t: t, ctx: ctx}
 	r.server = startTestNode(t, ctx, exposeALPN)

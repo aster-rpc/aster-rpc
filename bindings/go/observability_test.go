@@ -773,15 +773,27 @@ func exerciseApplicationLogOutage(t *testing.T, mode string) {
 	if err != nil {
 		t.Fatalf("start audit health node: %v", err)
 	}
+	// Memory's legacy Close releases only the node. This fixture also owns
+	// its private runtime; stop its CQ poller on every exit, including failures.
+	defer func() {
+		if err := node.Close(); err != nil {
+			t.Errorf("close audit health node: %v", err)
+		}
+		if err := node.Runtime().Close(); err != nil {
+			t.Errorf("close audit health runtime: %v", err)
+		}
+	}()
 	health, err := StartHealth(node, &HealthConfig{Host: "127.0.0.1"})
 	if err != nil {
-		_ = node.Close()
 		t.Fatalf("start audit health listener: %v", err)
 	}
+	defer func() {
+		if err := health.Close(); err != nil {
+			t.Errorf("close audit health listener: %v", err)
+		}
+	}()
 	healthAddr, err := health.Addr()
 	if err != nil {
-		_ = health.Close()
-		_ = node.Close()
 		t.Fatalf("audit health address: %v", err)
 	}
 	if err := health.SetReady(true); err != nil {
@@ -796,10 +808,6 @@ func exerciseApplicationLogOutage(t *testing.T, mode string) {
 			t.Fatalf("%s readyz audit check: %d %s", stage, code, body)
 		}
 	}
-	defer func() {
-		_ = health.Close()
-		_ = node.Close()
-	}()
 	assertAuditReady("before exporter outage")
 	setOutage := func(value bool) {
 		obsBodiesMu.Lock()
@@ -985,6 +993,9 @@ func exerciseApplicationLogOutage(t *testing.T, mode string) {
 	}
 	if err := node.Close(); err != nil {
 		t.Fatalf("close audit node before shutdown measurement: %v", err)
+	}
+	if err := node.Runtime().Close(); err != nil {
+		t.Fatalf("close audit runtime before shutdown measurement: %v", err)
 	}
 	start = time.Now()
 	held, err := ShutdownObservability(time.Second)

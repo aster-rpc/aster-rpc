@@ -1,4 +1,4 @@
-import { Service, Rpc, ServerStream, ClientStream, BidiStream, CallContext, i32, currentTraceId } from '@aster-rpc/aster';
+import { Service, Rpc, ServerStream, ClientStream, BidiStream, CallContext, i32, currentTraceId, currentBaggage } from '@aster-rpc/aster';
 import { EchoRequest, EchoReply } from './types.js';
 
 /** `hold` calls that observed a cancellation (process-wide). */
@@ -16,6 +16,8 @@ let holdCancelled = 0;
  */
 @Service({ name: 'InteropEcho', version: 1 })
 export class InteropEcho {
+  constructor(private readonly forward?: any) {}
+
   @Rpc()
   async echo(req: EchoRequest): Promise<EchoReply> {
     return new EchoReply({
@@ -55,6 +57,12 @@ export class InteropEcho {
 
   @Rpc()
   async hold(_req: EchoRequest, ctx: CallContext): Promise<EchoReply> {
+    if (this.forward) {
+      const deadlineSecs = ctx.deadline === undefined
+        ? undefined
+        : Math.max(0.001, ctx.deadline - Date.now() / 1000);
+      return await this.forward.hold(_req, { deadlineSecs, signal: ctx.signal });
+    }
     const timedOut = await new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(true), 60_000);
       const onAbort = () => {
@@ -70,6 +78,7 @@ export class InteropEcho {
 
   @Rpc()
   async cancelled(_req: EchoRequest): Promise<EchoReply> {
+    if (this.forward) return await this.forward.cancelled(_req);
     return new EchoReply({
       message: 'cancelled',
       count: i32(holdCancelled),
@@ -79,7 +88,20 @@ export class InteropEcho {
   }
 
   @Rpc()
-  async traceEcho(_req: EchoRequest): Promise<EchoReply> {
+  async traceEcho(_req: EchoRequest, ctx: CallContext): Promise<EchoReply> {
+    const chainRequest = _req.message.startsWith('chain-trace:') ? _req.message.slice('chain-trace:'.length) : undefined;
+    if (this.forward && chainRequest) {
+      const baggage = currentBaggage();
+      const remainingMs = ctx.deadline === undefined
+        ? -1
+        : Math.max(0, Math.floor((ctx.deadline - Date.now() / 1000) * 1000));
+      const row = `ts|${currentTraceId() ?? ''}|${baggage.tenant ?? '<missing>'}|${baggage.request ?? '<missing>'}|${remainingMs}`;
+      const deadlineSecs = ctx.deadline === undefined
+        ? undefined
+        : Math.max(0.001, ctx.deadline - Date.now() / 1000);
+      const downstream = await this.forward.traceEcho(_req, { deadlineSecs, signal: ctx.signal }) as EchoReply;
+      return new EchoReply({ message: `${row}\n${downstream.message}`, count: i32(0), data: new Uint8Array(), server_lang: 'ts' });
+    }
     return new EchoReply({
       message: currentTraceId() ?? '',
       count: i32(0),

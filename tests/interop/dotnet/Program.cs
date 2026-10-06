@@ -16,7 +16,7 @@
 //   interop/EchoRequest { message: string, count: varint32, data: binary }
 //   interop/EchoReply   { message: string, count: varint32, data: binary, server_lang: string }
 //
-// Usage: dotnet InteropEcho.dll contract | server | client <aster1-ticket> | expose-server
+// Usage: dotnet InteropEcho.dll contract | server | chain-server | client <aster1-ticket> | expose-server
 // expose-server: ALPN aster-expose/interop/1, HTTP service interop-http (GET /hello, POST /echo
 // streamed back, header x-server-lang), prints ADDRESS <aster1...>, serves until stdin closes.
 // Every mode prints CONTRACT_ID <hex> first; `server` prints ADDRESS <aster1...> and serves
@@ -30,7 +30,7 @@ using Aster.Interceptors;
 using Aster.Rpc;
 using Aster.Upcall;
 
-var service = InteropEcho.Service("dotnet");
+var service = InteropEcho.Service("dotnet", args is ["chain-server"]);
 var session = InteropEcho.SessionService("dotnet");
 Console.WriteLine($"CONTRACT_ID {service.ContractId}");
 Console.WriteLine($"SESSION_CONTRACT_ID {session.ContractId}");
@@ -40,6 +40,7 @@ switch (args)
     case ["contract"]:
         return 0;
     case ["server"]:
+    case ["chain-server"]:
         await InteropEcho.ServeAsync(service, session);
         return 0;
     case ["expose-server"]:
@@ -48,7 +49,7 @@ switch (args)
     case ["client", var ticket]:
         return await InteropEcho.ClientAsync(service, session, ticket) ? 0 : 1;
     default:
-        Console.Error.WriteLine("usage: InteropEcho contract | server | client <aster1-ticket> | expose-server");
+        Console.Error.WriteLine("usage: InteropEcho contract | server | chain-server | client <aster1-ticket> | expose-server");
         return 2;
 }
 
@@ -74,7 +75,7 @@ public sealed class EchoReply
 internal static class InteropEcho
 {
     /// <summary>The service (same semantics in every language).</summary>
-    public static ServiceDefinition Service(string lang) => ServiceDefinition.Create("InteropEcho", 1)
+    public static ServiceDefinition Service(string lang, bool chain = false) => ServiceDefinition.Create("InteropEcho", 1)
         .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply
         {
             Message = req.Message,
@@ -97,6 +98,7 @@ internal static class InteropEcho
         .BidiStream<EchoRequest, EchoReply>("chat", Chat)
         .Unary<EchoRequest, EchoReply>("hold", async (_, ctx) =>
         {
+            if (chain) Volatile.Write(ref _chainHoldReceipt, ChainReceipt(ctx));
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(60), ctx.CancellationToken);
@@ -112,13 +114,13 @@ internal static class InteropEcho
         {
             Message = "cancelled",
             Count = Volatile.Read(ref _holdCancelled),
-            Data = [],
+            Data = chain ? System.Text.Encoding.UTF8.GetBytes(Volatile.Read(ref _chainHoldReceipt)) : [],
             ServerLang = lang,
         }))
         // The handler runs in an Activity parented on the call's server span (Activity bridge).
-        .Unary<EchoRequest, EchoReply>("traceEcho", (_, _) => ValueTask.FromResult(new EchoReply
+        .Unary<EchoRequest, EchoReply>("traceEcho", (_, ctx) => ValueTask.FromResult(new EchoReply
         {
-            Message = Aster.Observability.Tracing.CurrentTraceId ?? "",
+            Message = chain ? ChainReceipt(ctx) : Aster.Observability.Tracing.CurrentTraceId ?? "",
             Count = 0,
             Data = [],
             ServerLang = lang,
@@ -127,6 +129,15 @@ internal static class InteropEcho
 
     /// <summary>`hold` calls that observed a cancellation (process-wide).</summary>
     private static int _holdCancelled;
+    private static string _chainHoldReceipt = "";
+
+    private static string ChainReceipt(ServerCallContext ctx)
+    {
+        var baggage = Aster.Observability.Tracing.CurrentBaggage;
+        long remaining = ctx.Deadline is { } deadline
+            ? Math.Max(0, (long)(deadline - DateTimeOffset.UtcNow).TotalMilliseconds) : -1;
+        return $"dotnet|{Aster.Observability.Tracing.CurrentTraceId}|{baggage.GetValueOrDefault("tenant", "")}|{baggage.GetValueOrDefault("request", "")}|{remaining}";
+    }
 
     private sealed class SessionState
     {

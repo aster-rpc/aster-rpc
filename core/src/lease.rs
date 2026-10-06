@@ -622,9 +622,13 @@ impl LeaseHandle {
     /// action *at send time*; do not cache across awaits.
     pub fn fence(&self) -> Option<Fence> {
         if *self.status_rx.borrow() != LeaseStatus::Held {
+            #[cfg(feature = "test-hooks")]
+            tracing::debug!(target: "aster::lease::diagnostic", resource = %self.fence.resource, epoch = self.fence.epoch, status = ?*self.status_rx.borrow(), reason = "status", "fence unavailable");
             return None;
         }
         if Instant::now() >= *self.self_limit.lock().unwrap() {
+            #[cfg(feature = "test-hooks")]
+            tracing::debug!(target: "aster::lease::diagnostic", resource = %self.fence.resource, epoch = self.fence.epoch, status = ?*self.status_rx.borrow(), reason = "self_limit", expired_ms = Instant::now().saturating_duration_since(*self.self_limit.lock().unwrap()).as_millis() as u64, "fence unavailable");
             return None;
         }
         Some(self.fence.clone())
@@ -689,6 +693,8 @@ impl LeaseHandle {
     /// end a lease, it does not modify the other two.
     pub fn stop_renewing(self) -> Option<Fence> {
         let fence = self.fence();
+        #[cfg(feature = "test-hooks")]
+        tracing::debug!(target: "aster::lease::diagnostic", resource = %self.fence.resource, epoch = self.fence.epoch, status = ?*self.status_rx.borrow(), presentable = fence.is_some(), remaining_ms = self.self_limit.lock().unwrap().saturating_duration_since(Instant::now()).as_millis() as u64, "lease handoff");
         self.renew_task.abort();
         self.status_tx.send_replace(LeaseStatus::Released);
         fence
@@ -708,9 +714,20 @@ async fn renew_loop(
     self_limit: Arc<Mutex<Instant>>,
     status: Arc<watch::Sender<LeaseStatus>>,
 ) {
+    #[cfg(feature = "test-hooks")]
+    let origin = Instant::now();
+    #[cfg(feature = "test-hooks")]
+    let mut sequence = 0u64;
     loop {
+        #[cfg(feature = "test-hooks")]
+        let expected_wake = Instant::now() + opts.renew_interval;
         tokio::time::sleep(opts.renew_interval).await;
         let send = Instant::now();
+        #[cfg(feature = "test-hooks")]
+        {
+            sequence += 1;
+            tracing::debug!(target: "aster::lease::diagnostic", resource = %fence.resource, epoch = fence.epoch, sequence, elapsed_ms = send.duration_since(origin).as_millis() as u64, wake_late_ms = send.saturating_duration_since(expected_wake).as_millis() as u64, status = ?*status.borrow(), remaining_ms = self_limit.lock().unwrap().saturating_duration_since(send).as_millis() as u64, "renew send");
+        }
         let result = serializer
             .transition(
                 &fence.resource,
@@ -720,6 +737,8 @@ async fn renew_loop(
                 },
             )
             .await;
+        #[cfg(feature = "test-hooks")]
+        tracing::debug!(target: "aster::lease::diagnostic", resource = %fence.resource, epoch = fence.epoch, sequence, elapsed_ms = Instant::now().duration_since(origin).as_millis() as u64, duration_ms = send.elapsed().as_millis() as u64, outcome = ?result, status = ?*status.borrow(), "renew complete");
         match result {
             Ok(TransitionOutcome::Renewed) => {
                 *self_limit.lock().unwrap() = send + opts.ttl - opts.holder_margin;
@@ -741,6 +760,8 @@ async fn renew_loop(
         }
         if Instant::now() >= *self_limit.lock().unwrap() {
             status.send_replace(LeaseStatus::Lost);
+            #[cfg(feature = "test-hooks")]
+            tracing::debug!(target: "aster::lease::diagnostic", resource = %fence.resource, epoch = fence.epoch, sequence, reason = "self_limit", "renew status lost");
             return;
         }
     }
@@ -767,6 +788,109 @@ pub async fn revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn renewal_diagnostics_emit_correlation_and_handoff_reason() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().target() != "aster::lease::diagnostic" {
+                    return;
+                }
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn fmt::Debug,
+                    ) {
+                        use std::fmt::Write;
+                        write!(self.0, "{}={value:?};", field.name()).unwrap();
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(events.clone()), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let opts = LeaseOptions {
+                        ttl: Duration::from_secs(1),
+                        renew_interval: Duration::from_millis(10),
+                        holder_margin: Duration::from_millis(100),
+                    };
+                    let outcome = LeaseHandle::acquire(
+                        Arc::new(MemorySerializer::new()),
+                        "diagnostic",
+                        "owner",
+                        opts,
+                    )
+                    .await
+                    .unwrap();
+                    let AcquireOutcome::Granted(handle) = outcome else {
+                        panic!("expected grant")
+                    };
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while !events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|line| line.contains("renew complete"))
+                        {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .expect("renewal completed before diagnostic watchdog");
+                    *handle.self_limit.lock().unwrap() = Instant::now();
+                    assert!(handle.stop_renewing().is_none());
+                });
+        });
+        let events = events.lock().unwrap();
+        let send = events
+            .iter()
+            .find(|line| line.contains("renew send"))
+            .expect("enabled subscriber receives renewal send");
+        for field in [
+            "resource=",
+            "epoch=",
+            "sequence=",
+            "elapsed_ms=",
+            "wake_late_ms=",
+            "remaining_ms=",
+        ] {
+            assert!(send.contains(field), "missing {field}: {send}");
+        }
+        let complete = events
+            .iter()
+            .find(|line| line.contains("renew complete"))
+            .expect("renew completion emitted");
+        assert!(complete.contains("duration_ms=") && complete.contains("Renewed"));
+        assert!(events
+            .iter()
+            .any(|line| line.contains("reason=\"self_limit\"")));
+        assert!(events
+            .iter()
+            .any(|line| line.contains("lease handoff") && line.contains("presentable=false")));
+    }
 
     const TTL: Duration = Duration::from_secs(30);
 

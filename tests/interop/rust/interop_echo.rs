@@ -38,7 +38,7 @@ use aster::expose::{
     RelayBody, ResponseBody,
 };
 use aster::rpc::{
-    contract_id, PayloadRegistry, RpcConnection, RpcSession, ScopeKind, SerializationMode,
+    contract_id, PayloadRegistry, RpcConnection, RpcSession, ScopeKind, SerializationMode, Server,
     StatusCode, StreamHeader, WireField,
 };
 use aster::{AsterConfig, Credential, Node, RelayMode, Result, Ticket};
@@ -162,6 +162,40 @@ async fn serve() -> Result<()> {
     println!("ADDRESS {}", srv.address()?);
     wait_stdin_eof().await;
     srv.shutdown().await;
+    Ok(())
+}
+
+/// Chain leaf with an in-memory trace provider so the existing Rust-native
+/// baggage extractor seam can observe (and record) the actual incoming W3C
+/// baggage without exporting telemetry or changing the public SDK surface.
+async fn chain_serve() -> Result<()> {
+    let exporters = aster_otel::testing::TestExporters::new();
+    let _observability = aster_otel::init(aster_otel::ObservabilityConfig {
+        from_env: false,
+        disabled: Some(false),
+        traces_exporter: Some(vec![]),
+        test_exporters: Some(exporters),
+        ..Default::default()
+    })
+    .map_err(|error| anyhow::anyhow!("chain tracing init: {error}"))?;
+    let node = Node::start_with_alpns(cfg(), vec![aster::rpc::RPC_ALPN.to_vec()]).await?;
+    let _server = Server::new(&node)
+        .register(InteropEchoServer::new(EchoImpl))
+        .register_session(|| InteropSessionServer::new(SessionImpl::default()))
+        .attribute_extractor("interop.chain.tenant", |ctx| {
+            let tenant = ctx.baggage("tenant")?;
+            let request = ctx.baggage("request")?;
+            contract::record_chain_baggage(request, tenant);
+            Some(tenant.to_owned())
+        })
+        .serve();
+    wait_for_addr(&node).await;
+    println!(
+        "ADDRESS {}",
+        Ticket::from_node_addr(&node.addr(), Credential::Open)?.to_base58()?
+    );
+    wait_stdin_eof().await;
+    node.shutdown().await;
     Ok(())
 }
 
@@ -734,6 +768,12 @@ async fn main() {
         Some("server") => {
             if let Err(e) = serve().await {
                 eprintln!("server error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("chain-server") => {
+            if let Err(e) = chain_serve().await {
+                eprintln!("chain server error: {e}");
                 std::process::exit(1);
             }
         }
