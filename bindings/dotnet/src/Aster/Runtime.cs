@@ -19,6 +19,14 @@ public sealed class Runtime : IDisposable
     private readonly ulong _handle;
     private readonly Thread _pollThread;
     private readonly CancellationTokenSource _cts = new();
+    // Replaced on every successful poll. A submitter snapshots this before its
+    // native attempt, so a poll racing with QUEUE_FULL cannot be missed and old
+    // progress cannot accumulate into a retry spin.
+    private readonly object _queueProgressLock = new();
+    private TaskCompletionSource<bool> _queueProgress = NewProgressTcs();
+    // Only the head submitter retries after saturation. This prevents a poll
+    // from waking an unbounded retry herd and preserves admission order.
+    private readonly SemaphoreSlim _submissionTurn = new(1, 1);
 
     // Maps operation ID -> TaskCompletionSource that receives the event.
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<Event>> _ops = new();
@@ -134,6 +142,46 @@ public sealed class Runtime : IDisposable
     }
 
     /// <summary>
+    /// Starts an asynchronous native operation, waiting for completion-queue space when the
+    /// native runtime reports <see cref="Status.QueueFull"/>. The submit callback must keep
+    /// native argument storage alive only for the duration of one invocation; it may be called
+    /// more than once, but a retry happens only after the native pre-start refusal.
+    /// </summary>
+    internal async Task<ulong> SubmitAsync(
+        NativeOperation submit,
+        string what,
+        CancellationToken cancellationToken = default)
+    {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+        try
+        {
+            await _submissionTurn.WaitAsync(linked.Token).ConfigureAwait(false);
+            try
+            {
+                while (true)
+                {
+                    ObjectDisposedException.ThrowIf(_disposed, this);
+                    Task progress = QueueProgressTask();
+                    int status = submit(out ulong operation);
+                    if (status == 0)
+                        return operation;
+                    if (status != (int)Status.QueueFull)
+                        throw IrohException.FromStatus(status, what);
+                    await progress.WaitAsync(linked.Token).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                _submissionTurn.Release();
+            }
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new ObjectDisposedException(nameof(Runtime));
+        }
+    }
+
+    /// <summary>
     /// Convenience: waits for an operation and returns the event handle.
     /// </summary>
     public async Task<Event> WaitForAsync(
@@ -226,6 +274,7 @@ public sealed class Runtime : IDisposable
             if (n > 0)
             {
                 DispatchBatch(events, n);
+                SignalQueueProgress();
             }
 
             // If we got fewer than MaxEvents, the queue may be drained;
@@ -277,6 +326,26 @@ public sealed class Runtime : IDisposable
     private static TaskCompletionSource<Event> NewTcs(ulong _)
         => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private static TaskCompletionSource<bool> NewProgressTcs()
+        => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private Task QueueProgressTask()
+    {
+        lock (_queueProgressLock)
+            return _queueProgress.Task;
+    }
+
+    private void SignalQueueProgress()
+    {
+        TaskCompletionSource<bool> previous;
+        lock (_queueProgressLock)
+        {
+            previous = _queueProgress;
+            _queueProgress = NewProgressTcs();
+        }
+        previous.TrySetResult(true);
+    }
+
     private void DrainEvents()
     {
         var events = new Event[MaxEvents];
@@ -286,6 +355,7 @@ public sealed class Runtime : IDisposable
             if (n == 0)
                 break;
             DispatchBatch(events, n);
+            SignalQueueProgress();
         }
     }
 
@@ -311,3 +381,5 @@ public sealed class Runtime : IDisposable
             throw IrohException.FromStatus(r, "aster_operation_cancel");
     }
 }
+
+internal delegate int NativeOperation(out ulong operation);

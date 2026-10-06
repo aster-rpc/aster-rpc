@@ -545,6 +545,68 @@ public class UpcallTests
     }
 
     [Fact]
+    public async Task Event_Queue_Capacity_Two_Admits_Queued_Mutations_Fairly()
+    {
+        var config = RuntimeConfig.Default;
+        config.event_queue_capacity = 2;
+        using var rt = new Runtime(config);
+        await using var up = Upcalls.Create(rt, 64);
+        var order = new ConcurrentQueue<int>();
+        up.ServeFencedResource(new FuncFenced(async (_, _, op, ct) =>
+        {
+            await Task.Delay(10, ct);
+            int value = BitConverter.ToInt32(op);
+            order.Enqueue(value);
+            return new MutateResult.Applied(op);
+        }));
+        using var res = NativeFencedResource.Foreign(up);
+
+        var calls = Enumerable.Range(0, 12)
+            .Select(i => res.MutateAsync(new Fence("r", 1, "a"), "a", BitConverter.GetBytes(i)))
+            .ToArray();
+        var results = await Task.WhenAll(calls).WaitAsync(T);
+
+        Assert.Equal(Enumerable.Range(0, 12), order.OrderBy(i => i));
+        for (int i = 0; i < results.Length; i++)
+            Assert.Equal(BitConverter.GetBytes(i), Assert.IsType<MutateResult.Applied>(results[i]).Output);
+    }
+
+    [Fact]
+    public async Task Event_Queue_Admission_Cancellation_Does_Not_Retry_The_Waiter()
+    {
+        using var rt = new Runtime();
+        int attempts = 0;
+        using var cancelled = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        Task<ulong> waiting = rt.SubmitAsync((out ulong operation) =>
+        {
+            operation = 0;
+            Interlocked.Increment(ref attempts);
+            return (int)Status.QueueFull;
+        }, "test", cancelled.Token);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting).WaitAsync(T);
+        Assert.Equal(1, Volatile.Read(ref attempts));
+    }
+
+    [Fact]
+    public async Task Runtime_Close_Wakes_Event_Queue_Admission()
+    {
+        var rt = new Runtime();
+        int attempts = 0;
+        Task<ulong> waiting = rt.SubmitAsync((out ulong operation) =>
+        {
+            operation = 0;
+            Interlocked.Increment(ref attempts);
+            return (int)Status.QueueFull;
+        }, "test");
+        while (Volatile.Read(ref attempts) == 0)
+            await Task.Delay(1);
+
+        rt.Dispose();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => waiting).WaitAsync(T);
+        Assert.Equal(1, Volatile.Read(ref attempts));
+    }
+
+    [Fact]
     public async Task A_Full_Queue_Refuses_At_Once()
     {
         using var rt = new Runtime();
