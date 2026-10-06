@@ -692,13 +692,19 @@ async fn connection_loop(
     // future resolves immediately; otherwise it resolves on the next
     // close frame.
     let info = conn.closed().await;
-    let _ = event_tx
+    let closed_enqueued = event_tx
         .send(ReactorEvent::ConnectionClosed {
             peer_id,
             connection_id,
             info,
         })
         .await;
+    #[cfg(feature = "test-hooks")]
+    if closed_enqueued.is_ok() {
+        test_hooks::connection_closed_enqueued(connection_id);
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = closed_enqueued;
 }
 
 /// One frame as read off the wire by the per-stream reader task.
@@ -744,10 +750,124 @@ const EARLY_HEADER_GRACE: Duration = Duration::from_secs(1);
 /// build; the tests that need it enable it explicitly.
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
+    use tokio::sync::oneshot;
 
     static WRITER_EXIT_PAUSE_US: AtomicU64 = AtomicU64::new(0);
+    static CALL_ENQUEUE_GATE: Mutex<Option<PendingCallGate>> = Mutex::new(None);
+    static CLOSE_ENQUEUED: Mutex<Option<HashMap<u64, oneshot::Sender<()>>>> = Mutex::new(None);
+
+    struct PendingCallGate {
+        peer_id: String,
+        paused: oneshot::Sender<u64>,
+        closed: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    /// Pause the next fully read call from one peer before publishing its
+    /// event. This models a descheduled stream task without sleeping or
+    /// blocking a runtime worker. Only one gate may be installed at a time.
+    pub fn pause_next_call_enqueue(peer_id: String) -> CallEnqueueGate {
+        let (paused_tx, paused) = oneshot::channel();
+        let (closed_tx, closed) = oneshot::channel();
+        let (resume, resume_rx) = oneshot::channel();
+        let mut slot = CALL_ENQUEUE_GATE.lock().unwrap();
+        assert!(slot.is_none(), "a call enqueue gate is already installed");
+        *slot = Some(PendingCallGate {
+            peer_id: peer_id.clone(),
+            paused: paused_tx,
+            closed: closed_tx,
+            resume: resume_rx,
+        });
+        CallEnqueueGate {
+            peer_id,
+            connection_id: None,
+            paused,
+            closed,
+            resume: Some(resume),
+        }
+    }
+
+    /// Dropping the gate releases a paused task, including on test failure.
+    pub struct CallEnqueueGate {
+        peer_id: String,
+        connection_id: Option<u64>,
+        paused: oneshot::Receiver<u64>,
+        closed: oneshot::Receiver<()>,
+        resume: Option<oneshot::Sender<()>>,
+    }
+
+    impl CallEnqueueGate {
+        pub async fn paused(&mut self) -> u64 {
+            let id = (&mut self.paused).await.expect("call enqueue gate dropped");
+            self.connection_id = Some(id);
+            id
+        }
+
+        /// The matching close event has entered the reactor event queue.
+        pub async fn closed_enqueued(&mut self) {
+            (&mut self.closed)
+                .await
+                .expect("connection close gate dropped");
+        }
+
+        pub fn resume(mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+    }
+
+    impl Drop for CallEnqueueGate {
+        fn drop(&mut self) {
+            let mut slot = CALL_ENQUEUE_GATE.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|gate| gate.peer_id == self.peer_id)
+            {
+                slot.take();
+            }
+            if let Some(id) = self.connection_id {
+                if let Some(waiters) = CLOSE_ENQUEUED.lock().unwrap().as_mut() {
+                    waiters.remove(&id);
+                }
+            }
+        }
+    }
+
+    pub(super) async fn call_enqueue_pause(peer_id: &str, connection_id: u64) {
+        let gate = {
+            let mut slot = CALL_ENQUEUE_GATE.lock().unwrap();
+            if slot.as_ref().is_some_and(|gate| gate.peer_id == peer_id) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            CLOSE_ENQUEUED
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .insert(connection_id, gate.closed);
+            let _ = gate.paused.send(connection_id);
+            let _ = gate.resume.await;
+        }
+    }
+
+    pub(super) fn connection_closed_enqueued(connection_id: u64) {
+        if let Some(closed) = CLOSE_ENQUEUED
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|waiters| waiters.remove(&connection_id))
+        {
+            let _ = closed.send(());
+        }
+    }
 
     /// Hold the response writer task for `pause` right after it has written a
     /// call's terminal frame, before it completes. That is a descheduled
@@ -1157,6 +1277,9 @@ async fn dispatch_one_call(
     // ended is expressed by `req_tx_opt` being `None`.
     let request_ended = first_request_flags & FLAG_END_STREAM != 0;
     let mut req_tx_opt = if request_ended { None } else { Some(req_tx) };
+
+    #[cfg(feature = "test-hooks")]
+    test_hooks::call_enqueue_pause(peer_id, connection_id).await;
 
     call_tx
         .send(ReactorEvent::Call(IncomingCall {

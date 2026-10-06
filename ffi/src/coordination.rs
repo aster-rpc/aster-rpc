@@ -600,7 +600,7 @@ pub unsafe extern "C" fn aster_coordination_client_open(
             }
         };
         #[cfg(feature = "coordination-fixture")]
-        test_hooks::before_open(user_data).await;
+        let discard_gate = test_hooks::before_open(user_data).await;
         let id = CLIENTS.insert(ClientState {
             group: *group.as_bytes(),
             local,
@@ -617,6 +617,8 @@ pub unsafe extern "C" fn aster_coordination_client_open(
         .related(node)
         .on_discard(move || {
             free_client(id);
+            #[cfg(feature = "coordination-fixture")]
+            test_hooks::discarded(discard_gate);
         }))
     })
 }
@@ -739,13 +741,15 @@ pub unsafe extern "C" fn aster_coordination_mutate(
         let resolved = run_mutation(&c, req).await.map_err(coord_err)?;
         let payload = codec::encode_mutation_reply(resolved.reply());
         #[cfg(feature = "coordination-fixture")]
-        test_hooks::before_track(client).await;
+        let discard_gate = test_hooks::before_track(client).await;
         let id = state.track_resolved(resolved)?;
         Ok(
             Done::ok(aster_event_kind_t::ASTER_EVENT_COORDINATION_RESOLVED, id)
                 .data(payload)
                 .on_discard(move || {
                     RESOLVED.remove(id);
+                    #[cfg(feature = "coordination-fixture")]
+                    test_hooks::discarded(discard_gate);
                 }),
         )
     })
@@ -1114,10 +1118,12 @@ pub unsafe extern "C" fn aster_coordination_lease_acquire(
                     .ok_or_else(|| other_op("the lease lapsed before it could be handed out"))?;
                 let payload = codec::encode_coordination_fence(&fence);
                 #[cfg(feature = "coordination-fixture")]
-                test_hooks::before_track(client).await;
+                let discard_gate = test_hooks::before_track(client).await;
                 let id = state.track_lease(lease)?;
                 Ok(Done::ok(kind, id).data(payload).on_discard(move || {
                     free_lease(id);
+                    #[cfg(feature = "coordination-fixture")]
+                    test_hooks::discarded(discard_gate);
                 }))
             }
             LeaseAcquireOutcome::Denied(reason, snapshot) => Ok(Done::ok(kind, 0).data(
@@ -1431,9 +1437,8 @@ pub unsafe extern "C" fn aster_coordination_placement_manager_free(
 }
 
 /// Test-only seams (feature `coordination-fixture`, never in a shipping
-/// build): pause a mutation of one client between "resolved and fsynced" and
-/// "handle handed out", so a test can close the client in exactly that
-/// window.
+/// build): pause successful opens, mutations and lease acquisitions before
+/// registration, and observe cleanup when cancellation wins completion.
 #[cfg(feature = "coordination-fixture")]
 #[doc(hidden)]
 pub mod test_hooks {
@@ -1443,10 +1448,12 @@ pub mod test_hooks {
 
     use super::aster_coordination_client_t;
 
-    /// An armed gate: the next mutation of its client stops before tracking.
+    /// An armed gate: one operation stops before registering its handle.
     pub struct Gate {
         reached: Mutex<bool>,
+        discarded: Mutex<bool>,
         cv: Condvar,
+        discarded_cv: Condvar,
         release: tokio::sync::Semaphore,
     }
 
@@ -1455,6 +1462,16 @@ pub mod test_hooks {
         pub fn wait_reached(&self, timeout: Duration) -> bool {
             let g = self.reached.lock().unwrap();
             let (g, _) = self.cv.wait_timeout_while(g, timeout, |r| !*r).unwrap();
+            *g
+        }
+        /// Wait until the late handle has been freed after cancellation.
+        /// The cancellation event itself is queued before this cleanup.
+        pub fn wait_discarded(&self, timeout: Duration) -> bool {
+            let g = self.discarded.lock().unwrap();
+            let (g, _) = self
+                .discarded_cv
+                .wait_timeout_while(g, timeout, |d| !*d)
+                .unwrap();
             *g
         }
         /// Let it continue.
@@ -1478,7 +1495,9 @@ pub mod test_hooks {
     fn new_gate() -> Arc<Gate> {
         Arc::new(Gate {
             reached: Mutex::new(false),
+            discarded: Mutex::new(false),
             cv: Condvar::new(),
+            discarded_cv: Condvar::new(),
             release: tokio::sync::Semaphore::new(0),
         })
     }
@@ -1499,26 +1518,42 @@ pub mod test_hooks {
         gate
     }
 
-    pub(crate) async fn before_open(user_data: u64) {
+    pub(crate) async fn before_open(user_data: u64) -> Option<Arc<Gate>> {
         let gate = open_gates().lock().unwrap().remove(&user_data);
-        pass(gate).await;
+        pass(gate).await
     }
 
-    pub(crate) async fn before_track(client: aster_coordination_client_t) {
+    pub(crate) async fn before_track(client: aster_coordination_client_t) -> Option<Arc<Gate>> {
         let gate = gates().lock().unwrap().remove(&client);
-        pass(gate).await;
+        pass(gate).await
     }
 
-    async fn pass(gate: Option<Arc<Gate>>) {
-        let Some(gate) = gate else {
-            return;
-        };
+    async fn pass(gate: Option<Arc<Gate>>) -> Option<Arc<Gate>> {
+        let gate = gate?;
         *gate.reached.lock().unwrap() = true;
         gate.cv.notify_all();
-        let permit = gate.release.acquire().await;
-        if let Ok(p) = permit {
-            p.forget();
+        {
+            let permit = gate.release.acquire().await;
+            if let Ok(p) = permit {
+                p.forget();
+            }
         }
+        Some(gate)
+    }
+
+    pub(crate) fn discarded(gate: Option<Arc<Gate>>) {
+        if let Some(gate) = gate {
+            *gate.discarded.lock().unwrap() = true;
+            gate.discarded_cv.notify_all();
+        }
+    }
+
+    /// Count live resolved slots tracked by this client, including any
+    /// orphan whose handle was never delivered. Other clients are excluded.
+    pub fn resolved_count(client: aster_coordination_client_t) -> usize {
+        let state = super::CLIENTS.get(client).expect("known fixture client");
+        let slots = super::lock(&state.resolved);
+        slots.iter().filter(|slot| slot.strong_count() > 0).count()
     }
 }
 

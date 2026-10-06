@@ -1787,6 +1787,73 @@ unsafe fn cancel_at_gate(
     assert_eq!(aster_operation_cancel(rt, op), OK);
     gate.release();
     assert_eq!(finish(rt, op).kind(), E_CANCELLED);
+    assert!(
+        gate.wait_discarded(Duration::from_secs(60)),
+        "the cancelled operation freed its late handle"
+    );
+}
+
+#[test]
+fn a_cancelled_mutation_discards_its_handle_and_preserves_redelivery() {
+    // A failed assertion must not leave this client's journal or a paused
+    // operation alive in the process-wide fixture used by the other tests.
+    struct Cleanup {
+        rt: aster_runtime_t,
+        client: aster_coordination_client_t,
+        gate: Arc<aster_transport_ffi::coordination::test_hooks::Gate>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.gate.release();
+            unsafe {
+                let _ = aster_coordination_client_free(self.rt, self.client);
+            }
+        }
+    }
+    unsafe {
+        let Shared { rt, root_node } = *shared();
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(rt, root_node, Some(dir.path()));
+        let gate = aster_transport_ffi::coordination::test_hooks::arm(root);
+        let _cleanup = Cleanup {
+            rt,
+            client: root,
+            gate: gate.clone(),
+        };
+        let resolved_count = aster_transport_ffi::coordination::test_hooks::resolved_count;
+        assert_eq!(resolved_count(root), 0);
+        let req = codec::encode_mutation_request(&grant_req("cancel-discard", 0x53));
+        let mut op = 0;
+        assert_eq!(
+            aster_coordination_mutate(rt, root, bytes(&req), 0, &mut op),
+            OK
+        );
+        cancel_at_gate(rt, op, &gate);
+        // Check before close: close would empty an orphaned result and mask
+        // the leak, while the durable redelivery contract would still pass.
+        assert_eq!(
+            resolved_count(root),
+            0,
+            "the undelivered result still has a slot"
+        );
+
+        assert_eq!(aster_coordination_unacknowledged(rt, root, 0, &mut op), OK);
+        let again = finish(rt, op).expect(E_RESOLVED);
+        assert_ne!(again.ev.handle, 0, "the result remains journaled");
+        assert_eq!(resolved_count(root), 1);
+        let reply = codec::decode_mutation_reply(&again.data).unwrap();
+        assert_eq!(reply.outcome_code, 6);
+        assert_eq!(reply.sequence, 1);
+        assert_eq!(
+            aster_coordination_resolved_acknowledge(rt, again.ev.handle, 0, &mut op),
+            OK
+        );
+        finish(rt, op).expect(E_UNIT);
+        assert_eq!(resolved_count(root), 0);
+        assert_eq!(aster_coordination_unacknowledged(rt, root, 0, &mut op), OK);
+        assert_eq!(finish(rt, op).expect(E_RESOLVED).ev.handle, 0);
+        assert_eq!(aster_coordination_client_close(rt, root), OK);
+    }
 }
 
 #[test]
