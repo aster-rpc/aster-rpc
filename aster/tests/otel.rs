@@ -614,7 +614,7 @@ mod foreign {
     use std::time::{Duration, Instant};
 
     use aster::binding_support::dispatch::{
-        CallRef, CallTraceContext, DispatchEvent, DispatchSink, InboundTrace,
+        CallRef, CallTraceContext, DispatchEvent, DispatchSendError, DispatchSink, InboundTrace,
     };
     use aster::rpc::{DynamicService, MethodDesc, MethodPattern, RpcStatus, Server, TypeRef};
     use aster_otel::opentelemetry::trace::{SpanKind, Status};
@@ -637,9 +637,9 @@ mod foreign {
     }
 
     impl DispatchSink for Binding {
-        fn deliver(&self, event: DispatchEvent) {
+        fn deliver(&self, event: DispatchEvent) -> Result<(), DispatchSendError<DispatchEvent>> {
             let DispatchEvent::Call(call) = event else {
-                return;
+                return Ok(());
             };
             let r = call.handle.to_ref();
             let _ = call.handle.detach();
@@ -653,6 +653,7 @@ mod foreign {
                 }
                 _ => self.held.lock().unwrap().push(r),
             }
+            Ok(())
         }
     }
 
@@ -666,9 +667,9 @@ mod foreign {
     }
 
     impl DispatchSink for Seen {
-        fn deliver(&self, event: DispatchEvent) {
+        fn deliver(&self, event: DispatchEvent) -> Result<(), DispatchSendError<DispatchEvent>> {
             let DispatchEvent::Call(call) = event else {
-                return;
+                return Ok(());
             };
             self.calls.lock().unwrap().push((
                 call.inbound_trace.clone(),
@@ -678,6 +679,7 @@ mod foreign {
             let r = call.handle.to_ref();
             call.handle.detach();
             r.try_respond(&[], &RpcStatus::ok()).unwrap();
+            Ok(())
         }
     }
 
@@ -690,9 +692,9 @@ mod foreign {
     }
 
     impl DispatchSink for Ctx {
-        fn deliver(&self, event: DispatchEvent) {
+        fn deliver(&self, event: DispatchEvent) -> Result<(), DispatchSendError<DispatchEvent>> {
             let DispatchEvent::Call(call) = event else {
-                return;
+                return Ok(());
             };
             self.calls
                 .lock()
@@ -701,6 +703,7 @@ mod foreign {
             let r = call.handle.to_ref();
             call.handle.detach();
             r.try_respond(&[], &RpcStatus::ok()).unwrap();
+            Ok(())
         }
     }
 
