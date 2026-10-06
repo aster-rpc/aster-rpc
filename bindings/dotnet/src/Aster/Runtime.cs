@@ -24,8 +24,8 @@ public sealed class Runtime : IDisposable
     // progress cannot accumulate into a retry spin.
     private readonly object _queueProgressLock = new();
     private TaskCompletionSource<bool> _queueProgress = NewProgressTcs();
-    // Only the head submitter retries after saturation. This prevents a poll
-    // from waking an unbounded retry herd and preserves admission order.
+    // Only one submitter retries after saturation. This prevents a poll from
+    // waking an unbounded retry herd and lets every waiter make progress.
     private readonly SemaphoreSlim _submissionTurn = new(1, 1);
 
     // Maps operation ID -> TaskCompletionSource that receives the event.

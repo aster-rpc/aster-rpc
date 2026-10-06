@@ -545,7 +545,7 @@ public class UpcallTests
     }
 
     [Fact]
-    public async Task Event_Queue_Capacity_Two_Admits_Queued_Mutations_Fairly()
+    public async Task Event_Queue_Capacity_Two_Drains_All_Queued_Mutations()
     {
         var config = RuntimeConfig.Default;
         config.event_queue_capacity = 2;
