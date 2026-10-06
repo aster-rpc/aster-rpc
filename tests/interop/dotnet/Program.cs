@@ -23,6 +23,9 @@
 // until stdin closes (loopback, relays off); `client` prints CASE <name> OK|FAIL lines.
 
 using System.Runtime.CompilerServices;
+using System.Diagnostics;
+using System.Text.Json;
+using System.Threading.Channels;
 using Apache.Fory;
 using Aster;
 using Aster.Expose;
@@ -48,6 +51,9 @@ switch (args)
         return 0;
     case ["client", var ticket]:
         return await InteropEcho.ClientAsync(service, session, ticket) ? 0 : 1;
+    case ["campaign-client", var ticket]:
+        await InteropEcho.CampaignClientAsync(service, ticket);
+        return 0;
     default:
         Console.Error.WriteLine("usage: InteropEcho contract | server | chain-server | client <aster1-ticket> | expose-server");
         return 2;
@@ -74,6 +80,232 @@ public sealed class EchoReply
 
 internal static class InteropEcho
 {
+    private sealed class CampaignStats
+    {
+        public readonly object Mutex = new();
+        public long Completed, Attempted, Unary, Stream, Cancel, Unexpected, Integrity, Emitted, EmitErrors;
+        public long FirstSuccess = -1, LastSuccess = -1;
+        public readonly long[] Histogram = new long[27];
+        public readonly Dictionary<string, long> Errors = new();
+        public readonly Dictionary<string, string> ErrorSamples = new();
+        public int Active, High;
+    }
+
+    private static string CampaignError(Exception error) => error switch
+    {
+        OperationCanceledException => "cancelled",
+        TimeoutException => "local_timeout",
+        RpcError rpc when rpc.Code == StatusCode.Cancelled => "cancelled",
+        RpcError rpc when rpc.Code == StatusCode.DeadlineExceeded => "deadline_exceeded",
+        RpcError rpc when rpc.Code == StatusCode.Unavailable => "unavailable",
+        _ => "local_error",
+    };
+
+    private static bool CampaignExpected(JsonElement command, string error)
+    {
+        if (!command.TryGetProperty("phase", out var phase) || phase.GetString() != "fault") return false;
+        if (error is not ("unavailable" or "deadline_exceeded" or "cancelled")) return false;
+        return command.TryGetProperty("expected_errors", out var expected)
+            && expected.EnumerateArray().Any(item => item.GetString() == error);
+    }
+
+    private static async Task<object> CampaignWindowAsync(RpcConnection conn, JsonElement command, int generation, string ownerIdentity, bool emit)
+    {
+        double duration = command.GetProperty("duration_s").GetDouble();
+        int slowMs = command.TryGetProperty("slow_ms", out var slow) ? slow.GetInt32() : 0;
+        if (!(duration > 0 && duration <= 3600) || slowMs < 0 || slowMs > 300)
+            throw new ArgumentException("invalid campaign duration/slow_ms");
+        var stats = new CampaignStats();
+        string windowId = command.GetProperty("window_id").GetString()!;
+        if (System.Text.Encoding.UTF8.GetByteCount(windowId) > 128) throw new ArgumentException("window_id too long");
+        string marker = $"campaign:dotnet:{windowId};";
+        byte[] data = Enumerable.Range(0, 16384).Select(i => (byte)((i * 131 + i / 8) % 251)).ToArray();
+        var jobs = Channel.CreateBounded<long>(new BoundedChannelOptions(128) { FullMode = BoundedChannelFullMode.Wait });
+        using var admission = new CancellationTokenSource(TimeSpan.FromSeconds(duration));
+        var started = Stopwatch.StartNew();
+        Task[] workers = Enumerable.Range(0, 4).Select(_ => Task.Run(async () =>
+        {
+            while (!admission.IsCancellationRequested)
+            {
+                long sequence;
+                try { sequence = await jobs.Reader.ReadAsync(admission.Token); }
+                catch (OperationCanceledException) { break; }
+                if (admission.IsCancellationRequested) break;
+                Interlocked.Increment(ref stats.Active);
+                long callStarted = Stopwatch.GetTimestamp();
+                int kind = (int)(sequence % 4);
+                bool bad = false, success = false;
+                Exception? failure = null;
+                // The token is a harness watchdog; the CallOptions deadline is
+                // the public SDK budget and must win boundary races.
+                using var call = new CancellationTokenSource(TimeSpan.FromSeconds(kind == 3 ? 10 : 3));
+                var options = new CallOptions { Deadline = TimeSpan.FromSeconds(kind == 3 ? 10 : 2) };
+                var request = new EchoRequest { Message = "campaign", Count = kind == 1 ? 5 : 41, Data = data };
+                try
+                {
+                    if (kind == 3)
+                    {
+                        call.CancelAfter(50);
+                        await conn.UnaryAsync<EchoRequest, EchoReply>("InteropEcho", "hold", request, options, call.Token);
+                        bad = true;
+                    }
+                    else if (kind == 1)
+                    {
+                        int count = 0;
+                        await foreach (var reply in conn.ServerStreamAsync<EchoRequest, EchoReply>("InteropEcho", "generate", request, options, call.Token))
+                        {
+                            if (reply.Count != count || reply.Message != request.Message || !reply.Data.AsSpan().SequenceEqual(data) || reply.ServerLang != "rust") bad = true;
+                            count++;
+                            if (slowMs > 0) await Task.Delay(slowMs, call.Token);
+                        }
+                        if (count != 5) bad = true;
+                    }
+                    else
+                    {
+                        var reply = await conn.UnaryAsync<EchoRequest, EchoReply>("InteropEcho", "echo", request, options, call.Token);
+                        bad = reply.Count != 42 || reply.Message != request.Message || !reply.Data.AsSpan().SequenceEqual(data) || reply.ServerLang != "rust";
+                    }
+                    success = !bad;
+                }
+                catch (Exception error) { failure = error; }
+                finally { Interlocked.Decrement(ref stats.Active); }
+                lock (stats.Mutex)
+                {
+                    stats.Attempted++;
+                    if (bad) stats.Integrity++;
+                    if (failure is not null)
+                    {
+                        string error = kind != 3 && failure is OperationCanceledException && call.IsCancellationRequested
+                            ? "local_timeout" : CampaignError(failure);
+                        stats.Errors[error] = stats.Errors.GetValueOrDefault(error) + 1;
+                        string sample = failure.ToString();
+                        stats.ErrorSamples[error] = sample[..Math.Min(1024, sample.Length)];
+                        if (kind == 3 && error == "cancelled") success = true;
+                        else if (!CampaignExpected(command, error)) stats.Unexpected++;
+                    }
+                    if (success)
+                    {
+                        stats.Completed++;
+                        if (kind == 3) stats.Cancel++; else if (kind == 1) stats.Stream++; else stats.Unary++;
+                        long micros = Math.Max(1, (long)(Stopwatch.GetElapsedTime(callStarted).TotalMilliseconds * 1000));
+                        int bin = 0;
+                        while (bin < 26 && micros > (1L << bin)) bin++;
+                        stats.Histogram[bin]++;
+                        if (kind != 3)
+                        {
+                            if (stats.FirstSuccess < 0) stats.FirstSuccess = started.ElapsedMilliseconds;
+                            stats.LastSuccess = started.ElapsedMilliseconds;
+                        }
+                    }
+                }
+                if (success && emit)
+                {
+                    try
+                    {
+                        Aster.Observability.AsterLogEmit.Emit(Microsoft.Extensions.Logging.LogLevel.Information, "app.campaign", marker);
+                        lock (stats.Mutex) stats.Emitted++;
+                    }
+                    catch (Exception) { lock (stats.Mutex) { stats.EmitErrors++; stats.Unexpected++; } }
+                }
+            }
+        })).ToArray();
+        long sequence = 0;
+        try
+        {
+            while (!admission.IsCancellationRequested)
+            {
+                await jobs.Writer.WriteAsync(sequence++, admission.Token);
+                int depth = jobs.Reader.Count;
+                for (int old = Volatile.Read(ref stats.High); depth > old; old = Volatile.Read(ref stats.High))
+                    if (Interlocked.CompareExchange(ref stats.High, depth, old) == old) break;
+            }
+        }
+        catch (OperationCanceledException) { }
+        await Task.WhenAll(workers).WaitAsync(TimeSpan.FromSeconds(4));
+        int discarded = jobs.Reader.Count;
+        while (jobs.Reader.TryRead(out _)) { }
+        int flushErrors = 0;
+        string flushClass = "", flushMessage = "";
+        long flushStarted = Stopwatch.GetTimestamp();
+        if (emit)
+        {
+            try { Aster.Observability.AsterObservability.Flush(TimeSpan.FromMilliseconds(500)); }
+            catch (Exception error)
+            {
+                flushErrors++;
+                flushClass = error is IrohException nativeError && nativeError.Status == Status.Timeout ? "timeout" : "sdk";
+                flushMessage = error.ToString();
+                bool expected = command.TryGetProperty("phase", out var phase) && phase.GetString() == "fault"
+                    && command.TryGetProperty("expected_flush_errors", out var errors)
+                    && errors.EnumerateArray().Any(item => item.GetString() == flushClass);
+                if (!expected) stats.Unexpected++;
+            }
+        }
+        return new
+        {
+            phase = "campaign_window", language = "dotnet", pid = Environment.ProcessId, owner_identity = ownerIdentity, generation, duration_s = duration, elapsed_s = started.Elapsed.TotalSeconds,
+            window_id = windowId, log_marker = marker,
+            completed = stats.Completed, attempted = stats.Attempted, unary = stats.Unary, stream = stats.Stream, cancel = stats.Cancel,
+            unexpected_errors = stats.Unexpected, integrity_failures = stats.Integrity, active_calls = stats.Active,
+            queue_scope = "adapter_admission", queue_capacity = 128, queue_high_water = stats.High, queue_depth = jobs.Reader.Count, queue_discarded = discarded,
+            latency_histogram = new { unit = "us", upper_bounds_powers_of_two = true, counts = stats.Histogram }, error_classes = stats.Errors,
+            first_success_elapsed_ms = stats.FirstSuccess, last_success_elapsed_ms = stats.LastSuccess,
+            app_log_emitted = stats.Emitted, app_log_emit_errors = stats.EmitErrors, collector_flush_errors = flushErrors,
+            error_samples = stats.ErrorSamples, flush_completed = emit && flushErrors == 0,
+            flush_elapsed_ms = Stopwatch.GetElapsedTime(flushStarted).TotalMilliseconds, flush_error_class = flushClass, flush_error_message = flushMessage,
+        };
+    }
+
+    public static async Task CampaignClientAsync(ServiceDefinition service, string ticket)
+    {
+        string? collector = Environment.GetEnvironmentVariable("ASTER_CAMPAIGN_COLLECTOR");
+        bool emit = !string.IsNullOrEmpty(collector);
+        if (emit) Aster.Observability.AsterObservability.Init(new Aster.Observability.ObservabilityOptions
+        { ServiceName = "dotnet-campaign", OtlpEndpoint = collector, OtlpLogs = true, FromEnv = false });
+        try
+        {
+            await using var client = await AsterClient.StartAsync(Config());
+            client.RegisterTypes(service);
+            AsterTicket peer = AsterTicket.Parse(ticket);
+            async Task<RpcConnection> Connect(AsterTicket target)
+            {
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                return await client.ConnectAsync(target, deadline.Token).WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            RpcConnection conn = await Connect(peer);
+            string ownerIdentity = client.Node.NodeId();
+            int generation = 0;
+            void Reply(object response) { Console.WriteLine(JsonSerializer.Serialize(response)); Console.Out.Flush(); }
+            Reply(new { phase = "campaign_ready", language = "dotnet", pid = Environment.ProcessId, owner_identity = ownerIdentity, generation, active_calls = 0, collector_enabled = emit });
+            for (string? line; (line = await Console.In.ReadLineAsync()) is not null;)
+            {
+                using var document = JsonDocument.Parse(line);
+                var command = document.RootElement;
+                string? name = command.TryGetProperty("cmd", out var cmd) ? cmd.GetString()
+                    : command.TryGetProperty("command", out var alias) ? alias.GetString() : command.GetProperty("op").GetString();
+                switch (name)
+                {
+                    case "baseline":
+                    case "run": Reply(await CampaignWindowAsync(conn, command, generation, ownerIdentity, emit)); break;
+                    case "pause": Reply(new { phase = "campaign_idle", generation, active_calls = 0, queue_depth = 0, unexpected_errors = 0, pid = Environment.ProcessId, owner_identity = ownerIdentity }); break;
+                    case "replace_peer":
+                        var replacement = AsterTicket.Parse(command.GetProperty("ticket").GetString()!);
+                        if (replacement.ToNodeAddr().EndpointId == peer.ToNodeAddr().EndpointId) throw new ArgumentException("replace_peer requires fresh peer identity");
+                        await conn.DisposeAsync();
+                        conn = await Connect(replacement);
+                        peer = replacement; generation = command.GetProperty("generation").GetInt32();
+                        Reply(new { phase = "campaign_peer", generation, active_calls = 0, pid = Environment.ProcessId, owner_identity = ownerIdentity }); break;
+                    case "stop":
+                        await conn.DisposeAsync();
+                        Reply(new { phase = "campaign_stopped", generation, active_calls = 0, unexpected_errors = 0, pid = Environment.ProcessId, owner_identity = ownerIdentity }); return;
+                    default: throw new ArgumentException($"unknown campaign command {name}");
+                }
+            }
+            await conn.DisposeAsync();
+        }
+        finally { if (emit) Aster.Observability.AsterObservability.Shutdown(TimeSpan.FromSeconds(2)); }
+    }
+
     /// <summary>The service (same semantics in every language).</summary>
     public static ServiceDefinition Service(string lang, bool chain = false) => ServiceDefinition.Create("InteropEcho", 1)
         .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply

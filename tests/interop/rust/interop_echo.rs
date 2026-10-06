@@ -150,6 +150,22 @@ async fn wait_stdin_eof() {
     .ok();
 }
 
+/// Optional read-only campaign control on the ordinary Rust server's stdin.
+async fn campaign_server_control() {
+    let _ = tokio::task::spawn_blocking(|| {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break; };
+            let Ok(command) = serde_json::from_str::<serde_json::Value>(&line) else { continue; };
+            let op = command["command"].as_str().or_else(|| command["cmd"].as_str()).or_else(|| command["op"].as_str());
+            if op == Some("campaign_status") {
+                let active = contract::active_holds();
+                println!("{}", serde_json::json!({"phase":"campaign_server_status", "active_holds":active, "active_calls":contract::active_calls(), "active_calls_scope":"native_echo_handlers", "active_holds_scope":"native_hold_handlers", "pid":std::process::id()}));
+            }
+        }
+    }).await;
+}
+
 async fn serve() -> Result<()> {
     let srv = aster::rpc::AsterServer::builder()
         .config(cfg())
@@ -160,7 +176,7 @@ async fn serve() -> Result<()> {
         .await?;
     wait_for_addr(srv.node()).await;
     println!("ADDRESS {}", srv.address()?);
-    wait_stdin_eof().await;
+    campaign_server_control().await;
     srv.shutdown().await;
     Ok(())
 }
@@ -758,12 +774,416 @@ async fn expose_echo(conn: &aster::Connection) -> Verdict {
     Ok(lang)
 }
 
+// Campaign state is bounded: one adapter admission queue and 27 histogram bins.
+// It deliberately makes no claim about native SDK queue depths.
+fn campaign_status(error: &aster::Error) -> String {
+    let Some(code) = error.rpc_code() else {
+        return "local_error".into();
+    };
+    let name = format!("{code:?}");
+    let mut out = String::new();
+    for (i, ch) in name.chars().enumerate() {
+        if i > 0 && ch.is_uppercase() {
+            out.push('_');
+        }
+        out.extend(ch.to_uppercase());
+    }
+    out.to_lowercase()
+}
+
+async fn campaign_connect(node: &Node, ticket: &str) -> anyhow::Result<RpcConnection> {
+    let t = Ticket::from_base58(ticket)?;
+    let id = node.add_ticket_addr(&t)?;
+    Ok(tokio::time::timeout(Duration::from_secs(2), node.rpc_connect(&id)).await??)
+}
+
+async fn campaign_request(
+    client: &InteropEchoClient,
+    sequence: u64,
+    slow_ms: f64,
+) -> std::result::Result<&'static str, String> {
+    let kind = ["unary", "stream", "unary", "cancel"][sequence as usize % 4];
+    let req = EchoRequest {
+        message: "campaign".into(),
+        count: if kind == "stream" { 5 } else { 41 },
+        data: (0..16384)
+            .map(|i| ((i * 131 + i / 8) % 251) as u8)
+            .collect(),
+    };
+    if kind == "cancel" {
+        // Dropping this public call future sends caller cancellation; the hold
+        // connection carries a ten-second RPC budget independently of the drop.
+        match tokio::time::timeout(Duration::from_millis(50), client.hold(req)).await {
+            Err(_) => return Ok(kind),
+            Ok(Ok(_)) => return Err("INTEGRITY".into()),
+            Ok(Err(error)) => return Err(campaign_status(&error)),
+        }
+    }
+    if kind == "unary" {
+        let reply = client
+            .echo(req.clone())
+            .await
+            .map_err(|e| campaign_status(&e))?;
+        check(&req, &reply).map_err(|_| "INTEGRITY".to_owned())?;
+    } else {
+        let mut stream = client
+            .generate(req.clone())
+            .await
+            .map_err(|e| campaign_status(&e))?;
+        let mut count = 0;
+        loop {
+            let next = match tokio::time::timeout(Duration::from_secs(2), stream.recv()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    // The generated typed stream has no CallOptions overload;
+                    // dropping it is the public cancellation operation.
+                    drop(stream);
+                    return Err("planned_stream_cancel".into());
+                }
+            };
+            let Some(reply) = next else {
+                break;
+            };
+            let reply = reply.map_err(|e| campaign_status(&e))?;
+            if reply.count != count
+                || reply.message != req.message
+                || reply.data != req.data
+                || reply.server_lang.is_empty()
+            {
+                return Err("INTEGRITY".into());
+            }
+            count += 1;
+            if slow_ms > 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64(slow_ms / 1000.0)).await;
+            }
+        }
+        if count != 5 {
+            return Err("INTEGRITY".into());
+        }
+    }
+    Ok(kind)
+}
+
+type CampaignStats = Arc<std::sync::Mutex<serde_json::Value>>;
+fn campaign_inc(stats: &mut serde_json::Value, field: &str) {
+    stats[field] = (stats[field].as_u64().unwrap_or(0) + 1).into();
+}
+struct CampaignActive(CampaignStats);
+impl Drop for CampaignActive {
+    fn drop(&mut self) {
+        let mut stats = self.0.lock().unwrap();
+        stats["active_calls"] = stats["active_calls"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(1)
+            .into();
+    }
+}
+async fn campaign_flush(command: &serde_json::Value, stats: &mut serde_json::Value) {
+    let result = tokio::task::spawn_blocking(|| aster_otel::flush(Duration::from_secs(1))).await;
+    let category = match result {
+        Ok(Ok(())) => "ok",
+        Ok(Err(aster_otel::Error::Timeout(_))) => "timeout",
+        Ok(Err(aster_otel::Error::Sdk(_))) => "sdk",
+        _ => "other",
+    };
+    stats["flush_status"] = category.into();
+    let accepted = command["phase"] == "fault"
+        && command["expected_flush_errors"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|name| name == category));
+    if category != "ok" && !accepted {
+        campaign_inc(stats, "unexpected_errors");
+    }
+}
+
+async fn campaign_window(
+    client: Arc<InteropEchoClient>,
+    cancel_client: Arc<InteropEchoClient>,
+    command: &serde_json::Value,
+    generation: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+    let duration = command["duration_s"].as_f64().unwrap_or(5.0);
+    anyhow::ensure!(
+        duration.is_finite() && duration > 0.0 && duration <= 300.0,
+        "duration_s must be in (0,300]"
+    );
+    let phase = command["phase"].as_str().unwrap_or("healthy");
+    anyhow::ensure!(
+        matches!(phase, "healthy" | "fault"),
+        "phase must be healthy or fault"
+    );
+    let expected = command["expected_errors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    anyhow::ensure!(
+        expected.iter().all(|v| v.is_string()),
+        "expected_errors must be status-name strings"
+    );
+    let slow = command["slow_ms"].as_f64().unwrap_or(0.0);
+    anyhow::ensure!(
+        slow.is_finite() && (0.0..=1000.0).contains(&slow),
+        "slow_ms must be in [0,1000]"
+    );
+    let expected = Arc::new(if phase == "fault" { expected } else { vec![] });
+    let window_id = command["window_id"].as_str().unwrap_or("window");
+    anyhow::ensure!(
+        window_id.len() <= 128,
+        "window_id must be at most 128 bytes"
+    );
+    let marker = format!("campaign:rust:{window_id};");
+    let stats = Arc::new(std::sync::Mutex::new(json!({
+        "phase": "campaign_window", "window_phase": phase, "generation": generation, "log_marker":marker,
+        "completed": 0, "attempted": 0, "unary": 0, "stream": 0, "cancel": 0,
+        "unexpected_errors": 0, "integrity_failures": 0, "active_calls": 0,
+        "planned_stream_cancellations": 0,
+        "queue_capacity": 128, "queue_scope": "adapter_admission", "queue_depth": 0,
+        "queue_high_water": 0, "latency_histogram": vec![0u64;27],
+        "first_success_elapsed_ms": null, "last_success_elapsed_ms": null,
+        "error_classes": {}, "app_log_emitted": 0
+    })));
+    let (tx, rx) = tokio::sync::mpsc::channel::<u64>(128);
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let accepting = Arc::new(AtomicBool::new(true));
+    let started = std::time::Instant::now();
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let (client, cancel_client, stats, expected, rx, accepting) = (
+            client.clone(),
+            cancel_client.clone(),
+            stats.clone(),
+            expected.clone(),
+            rx.clone(),
+            accepting.clone(),
+        );
+        let marker = marker.clone();
+        workers.spawn(async move {
+            while accepting.load(Ordering::SeqCst) {
+                let Some(sequence) = rx.lock().await.recv().await else {
+                    break;
+                };
+                if !accepting.load(Ordering::SeqCst) {
+                    break;
+                }
+                {
+                    campaign_inc(&mut stats.lock().unwrap(), "active_calls");
+                }
+                let active = CampaignActive(stats.clone());
+                let began = std::time::Instant::now();
+                let caller = if sequence % 4 == 3 {
+                    &cancel_client
+                } else {
+                    &client
+                };
+                let outcome = match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    campaign_request(caller, sequence, slow),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(_) => Err("local_timeout".into()),
+                };
+                let status = match &outcome {
+                    Ok(_) => "OK",
+                    Err(status) => status.as_str(),
+                };
+                let success = outcome.is_ok();
+                let emitted = success
+                    && aster_otel::bridge::emit_app_log(&aster_otel::bridge::AppLogRecord {
+                        level: Some(aster_otel::bridge::LogLevel::Info),
+                        timestamp_unix_ns: 0,
+                        logger: "app.campaign.rust",
+                        message: &marker,
+                        fields: &[("status", status)],
+                        context: None,
+                    })
+                    .is_ok();
+                {
+                    let mut stats = stats.lock().unwrap();
+                    campaign_inc(&mut stats, "attempted");
+                    if success {
+                        campaign_inc(&mut stats, "completed");
+                    }
+                    if emitted {
+                        campaign_inc(&mut stats, "app_log_emitted");
+                    } else if success {
+                        campaign_inc(&mut stats, "unexpected_errors");
+                    }
+                    let micros = began.elapsed().as_micros().max(1) as u64;
+                    let bin = (64 - (micros - 1).leading_zeros()).min(26) as usize;
+                    let current = stats["latency_histogram"][bin].as_u64().unwrap();
+                    if success {
+                        stats["latency_histogram"][bin] = (current + 1).into();
+                    }
+                    match outcome {
+                        Ok(kind) => {
+                            campaign_inc(&mut stats, kind);
+                            // Recovery timing requires a real peer reply, never a local future drop.
+                            if kind != "cancel" {
+                                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                                if stats["first_success_elapsed_ms"].is_null() {
+                                    stats["first_success_elapsed_ms"] = elapsed.into();
+                                }
+                                stats["last_success_elapsed_ms"] = elapsed.into();
+                            }
+                        }
+                        Err(status) if status == "INTEGRITY" => {
+                            campaign_inc(&mut stats, "integrity_failures")
+                        }
+                        Err(status) => {
+                            if status == "planned_stream_cancel" {
+                                campaign_inc(&mut stats, "planned_stream_cancellations");
+                            }
+                            let n = stats["error_classes"][&status].as_u64().unwrap_or(0) + 1;
+                            stats["error_classes"][&status] = n.into();
+                            if !expected.iter().any(|name| name == &status)
+                                || !matches!(
+                                    status.as_str(),
+                                    "unavailable"
+                                        | "deadline_exceeded"
+                                        | "cancelled"
+                                        | "planned_stream_cancel"
+                                )
+                            {
+                                campaign_inc(&mut stats, "unexpected_errors");
+                            }
+                        }
+                    }
+                }
+                drop(active);
+            }
+        });
+    }
+    let mut sequence = 0;
+    while started.elapsed().as_secs_f64() < duration {
+        if tx.try_send(sequence).is_ok() {
+            sequence += 1;
+            let depth = 128 - tx.capacity();
+            let mut stats = stats.lock().unwrap();
+            if depth as u64 > stats["queue_high_water"].as_u64().unwrap() {
+                stats["queue_high_water"] = depth.into();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    accepting.store(false, Ordering::SeqCst);
+    drop(tx);
+    let drained = tokio::time::timeout(Duration::from_secs(4), async {
+        while let Some(result) = workers.join_next().await {
+            if result.is_err() {
+                campaign_inc(&mut stats.lock().unwrap(), "unexpected_errors");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+        campaign_inc(&mut stats.lock().unwrap(), "unexpected_errors");
+    }
+    let mut receiver = rx.lock().await;
+    while receiver.try_recv().is_ok() {}
+    drop(receiver);
+    let mut result = stats.lock().unwrap().clone();
+    result["latency_histogram"] = json!({"unit":"us", "upper_bounds_powers_of_two":true, "counts":result["latency_histogram"].clone()});
+    campaign_flush(command, &mut result).await;
+    Ok(result)
+}
+
+async fn campaign_client(ticket: &str) -> anyhow::Result<()> {
+    use serde_json::{json, Value};
+    let endpoint = std::env::var("ASTER_CAMPAIGN_COLLECTOR")?;
+    let mut config = aster_otel::ObservabilityConfig {
+        from_env: false,
+        service_name: Some("rust-campaign".into()),
+        log_bridge: Some(false),
+        traces_exporter: Some(vec![]),
+        metrics_exporter: Some(vec![]),
+        logs_exporter: Some(vec![aster_otel::ExporterKind::Otlp]),
+        ..Default::default()
+    };
+    config.otlp.endpoint = Some(endpoint);
+    config.otlp.timeout = Some(Duration::from_secs(1));
+    let observability = aster_otel::init(config)?;
+    let node = Node::start(cfg()).await?;
+    let result = async {
+        let mut conn = campaign_connect(&node, ticket).await?;
+        let mut client = Arc::new(InteropEchoClient::new(conn.clone().with_deadline(Duration::from_secs(2))));
+        let mut cancel_client = Arc::new(InteropEchoClient::new(conn.clone().with_deadline(Duration::from_secs(10))));
+        let identity = node.id().to_string();
+        let pid = std::process::id();
+        let mut generation = json!(0);
+        println!("{}", json!({"phase":"campaign_ready", "owner_identity": identity, "pid":pid, "generation":generation}));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        tokio::task::spawn_blocking(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break; };
+                let stop = serde_json::from_str::<Value>(&line).ok().is_some_and(|v| v["command"] == "stop" || v["cmd"] == "stop" || v["op"] == "stop");
+                if tx.blocking_send(line).is_err() || stop { break; }
+            }
+        });
+        let mut settings = json!({});
+        while let Some(line) = rx.recv().await {
+            let command_result: anyhow::Result<(Value, bool)> = async {
+                let command: Value = serde_json::from_str(&line)?;
+                let op = command["command"].as_str().or_else(|| command["cmd"].as_str())
+                    .or_else(|| command["op"].as_str()).unwrap_or("");
+                let mut merged = settings.clone();
+                for (key, value) in command.as_object().ok_or_else(|| anyhow::anyhow!("command must be an object"))? { merged[key] = value.clone(); }
+                let result = match op {
+                    "configure" => { settings = merged; json!({"phase":"campaign_configured"}) }
+                    "baseline" | "run" => campaign_window(client.clone(), cancel_client.clone(), &merged, &generation).await?,
+                    "replace_peer" => {
+                        conn = campaign_connect(&node, command["ticket"].as_str().ok_or_else(|| anyhow::anyhow!("ticket required"))?).await?;
+                        client = Arc::new(InteropEchoClient::new(conn.clone().with_deadline(Duration::from_secs(2))));
+                        cancel_client = Arc::new(InteropEchoClient::new(conn.clone().with_deadline(Duration::from_secs(10))));
+                        generation = command["generation"].clone();
+                        json!({"phase":"campaign_peer_replaced", "generation":generation})
+                    }
+                    "pause" | "stop" => {
+                        let mut result = json!({"phase":format!("campaign_{op}"), "active_calls":0, "unexpected_errors":0});
+                        campaign_flush(&merged, &mut result).await;
+                        result
+                    }
+                    _ => anyhow::bail!("unknown campaign command"),
+                };
+                Ok((result, op == "stop"))
+            }.await;
+            match command_result {
+                Ok((mut result, stop)) => {
+                    result["owner_identity"] = identity.clone().into(); result["pid"] = pid.into();
+                    println!("{result}");
+                    if stop { break; }
+                }
+                Err(error) => println!("{}", json!({"phase":"campaign_error", "detail":error.to_string().chars().take(256).collect::<String>()})),
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    node.shutdown().await;
+    drop(observability);
+    result
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    println!("CONTRACT_ID {}", contract_hex());
-    println!("SESSION_CONTRACT_ID {}", session_contract_hex());
+    if args.first().map(String::as_str) != Some("campaign-client") {
+        println!("CONTRACT_ID {}", contract_hex());
+        println!("SESSION_CONTRACT_ID {}", session_contract_hex());
+    }
     match args.first().map(String::as_str) {
+        Some("campaign-client") if args.len() == 2 => {
+            if let Err(error) = campaign_client(&args[1]).await {
+                eprintln!("campaign error: {error}");
+                std::process::exit(1);
+            }
+        }
         Some("contract") => {}
         Some("server") => {
             if let Err(e) = serve().await {

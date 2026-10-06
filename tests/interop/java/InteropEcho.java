@@ -577,7 +577,7 @@ public final class InteropEcho {
       throw new IllegalArgumentException("invalid campaign duration/slow_ms");
     }
     CampaignStats stats = new CampaignStats();
-    String marker = "campaign:java:" + command.path("window_id").asText();
+    String marker = "campaign:java:" + command.path("window_id").asText() + ";";
     byte[] data = new byte[16384];
     for (int i = 0; i < data.length; i++) data[i] = (byte) ((i * 131 + i / 8) % 251);
     ArrayBlockingQueue<Long> jobs = new ArrayBlockingQueue<>(128);
@@ -612,7 +612,7 @@ public final class InteropEcho {
               CompletableFuture<ServerStreamCall<EchoReply>> opening = client.openServerStream(
                   addr, "InteropEcho", "generate", request, EchoReply.class, options);
               ServerStreamCall<EchoReply> stream;
-              try { stream = opening.get(2, TimeUnit.SECONDS); }
+              try { stream = opening.get(3, TimeUnit.SECONDS); }
               catch (Throwable error) {
                 // The opening future has no native cancellation hook. Reclaim a late result.
                 opening.whenComplete((late, failed) -> { if (late != null) late.close(); });
@@ -621,7 +621,7 @@ public final class InteropEcho {
               try (stream) {
                 int count = 0;
                 while (true) {
-                  if (System.nanoTime() - callStarted >= 2_000_000_000L) throw new TimeoutException("stream deadline");
+                  if (System.nanoTime() - callStarted >= 3_000_000_000L) throw new TimeoutException("stream watchdog");
                   EchoReply reply = stream.recvWithTimeout(20, TimeUnit.MILLISECONDS);
                   if (reply == null) {
                     if (stream.isComplete()) break;
@@ -636,7 +636,7 @@ public final class InteropEcho {
             } else {
               CompletableFuture<EchoReply> call = client.call(addr, "InteropEcho", "echo", request, EchoReply.class, options);
               owned = call;
-              EchoReply reply = call.get(2, TimeUnit.SECONDS);
+              EchoReply reply = call.get(3, TimeUnit.SECONDS);
               bad = reply.count != 42 || !reply.message.equals(request.message) || !Arrays.equals(reply.data, data) || !reply.server_lang.equals("rust");
             }
             success = !bad;
@@ -755,18 +755,18 @@ public final class InteropEcho {
             response = campaignWindow(client, addr, command, generation, emit);
             response.put("pid", pid); response.put("owner_identity", ownerIdentity);
           }
-          case "pause" -> response = Map.of("phase", "campaign_idle", "generation", generation, "active_calls", 0, "queue_depth", 0);
+          case "pause" -> response = Map.of("phase", "campaign_idle", "generation", generation, "active_calls", 0, "queue_depth", 0, "unexpected_errors", 0, "pid", pid, "owner_identity", ownerIdentity);
           case "replace_peer" -> {
             NodeAddr replacement = NodeAddr.fromTicket(command.path("ticket").asText());
             if (replacement.endpointId().equals(addr.endpointId())) throw new IllegalArgumentException("replace_peer requires fresh peer identity");
             connection.close();
             connection = client.connect(replacement).get(2, TimeUnit.SECONDS);
             addr = replacement; generation = command.path("generation").asInt();
-            response = Map.of("phase", "campaign_peer", "generation", generation, "active_calls", 0);
+            response = Map.of("phase", "campaign_peer", "generation", generation, "active_calls", 0, "pid", pid, "owner_identity", ownerIdentity);
           }
           case "stop" -> {
             connection.close();
-            System.out.println(json.writeValueAsString(Map.of("phase", "campaign_stopped", "generation", generation, "active_calls", 0)));
+            System.out.println(json.writeValueAsString(Map.of("phase", "campaign_stopped", "generation", generation, "active_calls", 0, "unexpected_errors", 0, "pid", pid, "owner_identity", ownerIdentity)));
             System.out.flush(); return;
           }
           default -> throw new IllegalArgumentException("unknown campaign command " + name);

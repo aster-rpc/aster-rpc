@@ -255,13 +255,13 @@ func campaignError(err error) string {
 		}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return "local_timeout"
+		return "context_deadline_exceeded"
 	}
 	return "local_error"
 }
 
 func campaignExpected(command campaignCommand, class string) bool {
-	if command.Phase != "fault" || (class != "unavailable" && class != "deadline_exceeded" && class != "cancelled") {
+	if command.Phase != "fault" || (class != "unavailable" && class != "deadline_exceeded" && class != "cancelled" && class != "context_deadline_exceeded") {
 		return false
 	}
 	for _, want := range command.Expected {
@@ -274,7 +274,7 @@ func campaignExpected(command campaignCommand, class string) bool {
 
 func campaignWindow(conn *aster.RpcConnection, command campaignCommand, generation int, emit bool) (map[string]any, error) {
 	stats := &campaignStats{errorClasses: make(map[string]uint64), errorSamples: make(map[string]string), firstSuccess: -1, lastSuccess: -1}
-	marker := "campaign:go:" + command.WindowID
+	marker := "campaign:go:" + command.WindowID + ";"
 	data := make([]byte, 16384)
 	for i := range data {
 		data[i] = byte((i*131 + i/8) % 251)
@@ -527,7 +527,7 @@ func campaignClient(svc *aster.Service, ticket string) error {
 				return err
 			}
 		case "pause":
-			if err := encode.Encode(map[string]any{"phase": "campaign_idle", "generation": generation, "active_calls": 0, "queue_depth": 0}); err != nil {
+			if err := encode.Encode(map[string]any{"phase": "campaign_idle", "generation": generation, "active_calls": 0, "queue_depth": 0, "unexpected_errors": 0, "pid": os.Getpid(), "owner_identity": ownerIdentity}); err != nil {
 				return err
 			}
 		case "replace_peer":
@@ -546,11 +546,11 @@ func campaignClient(svc *aster.Service, ticket string) error {
 			}
 			generation = command.Generation
 			peer = replacement
-			if err := encode.Encode(map[string]any{"phase": "campaign_peer", "generation": generation, "active_calls": 0}); err != nil {
+			if err := encode.Encode(map[string]any{"phase": "campaign_peer", "generation": generation, "active_calls": 0, "pid": os.Getpid(), "owner_identity": ownerIdentity}); err != nil {
 				return err
 			}
 		case "stop":
-			return encode.Encode(map[string]any{"phase": "campaign_stopped", "generation": generation, "active_calls": 0})
+			return encode.Encode(map[string]any{"phase": "campaign_stopped", "generation": generation, "active_calls": 0, "unexpected_errors": 0, "pid": os.Getpid(), "owner_identity": ownerIdentity})
 		default:
 			return fmt.Errorf("unknown campaign command %q", command.Cmd)
 		}

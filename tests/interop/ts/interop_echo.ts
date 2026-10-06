@@ -32,8 +32,11 @@ import {
   Node,
   RpcError,
   StatusCode,
+  statusName,
+  initObservability, flushObservability, shutdownObservability, emitLog,
 } from '@aster-rpc/aster';
 import { randomBytes } from 'node:crypto';
+import { createInterface } from 'node:readline';
 import { loadNative } from '@aster-rpc/aster/native.js';
 import { SERVICES, WIRE_TYPES, BUILD_ALL_TYPES } from './aster-rpc.generated.ts';
 import { InteropEcho, InteropSession } from './src/service.ts';
@@ -354,15 +357,161 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+
+/** Persistent four-worker campaign; admission accounting describes this adapter only. */
+async function campaignClient(ticket: string): Promise<void> {
+  const endpoint = process.env.ASTER_CAMPAIGN_COLLECTOR;
+  if (!endpoint) throw new Error('ASTER_CAMPAIGN_COLLECTOR is required');
+  await initObservability({ fromEnv: false, serviceName: 'ts-campaign', exportTraces: false,
+    exportMetrics: false, exportOtlpLogs: true, otlpEndpoint: endpoint, logBridge: false,
+    extraToml: 'otlp_timeout_ms = 1000' });
+  const native = loadNative();
+  const codec = registerAll();
+  let node: any, conn: any, client: any;
+  let generation: any = 0;
+  let settings: any = {};
+  const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+  const reply = (v: any) => console.log(JSON.stringify(v));
+  const replace = async (newTicket: string) => {
+    conn?.close(0, 'replace peer');
+    const t = native.asterTicketFromString(newTicket);
+    conn = await withTimeout(node.connectNodeAddr(t.endpointId, RPC_ALPN, t.directAddrs, undefined), 2000);
+    client = createClient(InteropEcho, new IrohTransport(conn, codec));
+  };
+  const flush = async (command: any, result: any) => {
+    try { await flushObservability(1000); result.flush_status = 'ok'; }
+    catch (e) {
+      const text = String(e);
+      const category = text.includes('telemetry flush timed out') ? 'timeout' : text.includes('telemetry SDK error:') ? 'sdk' : 'other';
+      result.flush_status = category;
+      if (command.phase !== 'fault' || !(command.expected_flush_errors ?? []).includes(category)) result.unexpected_errors++;
+    }
+  };
+  const window = async (command: any) => {
+    const duration = command.duration_s ?? 5, phase = command.phase ?? 'healthy', slow = command.slow_ms ?? 0;
+    if (!Number.isFinite(duration) || duration <= 0 || duration > 300) throw new Error('invalid duration_s');
+    if (!['healthy', 'fault'].includes(phase)) throw new Error('invalid phase');
+    if (!Number.isFinite(slow) || slow < 0 || slow > 1000) throw new Error('invalid slow_ms');
+    const expected = phase === 'fault' ? command.expected_errors ?? [] : [];
+    if (!Array.isArray(expected) || expected.some((x: any) => typeof x !== 'string')) throw new Error('expected_errors must be status-name strings');
+    const windowId = command.window_id ?? 'window';
+    if (typeof windowId !== 'string' || Buffer.byteLength(windowId) > 128) throw new Error('window_id must be at most 128 bytes');
+    const marker = `campaign:ts:${windowId};`;
+    const result: any = { phase: 'campaign_window', window_phase: phase, generation, log_marker: marker,
+      completed: 0, attempted: 0, unary: 0, stream: 0, cancel: 0, unexpected_errors: 0,
+      integrity_failures: 0, active_calls: 0, queue_capacity: 128, queue_scope: 'adapter_admission',
+      queue_depth: 0, queue_high_water: 0, latency_histogram: Array(27).fill(0),
+      first_success_elapsed_ms: null, last_success_elapsed_ms: null, error_classes: {}, app_log_emitted: 0 };
+    const started = performance.now();
+    const payload = Uint8Array.from({ length: 16384 }, (_, i) => (i * 131 + Math.floor(i / 8)) % 251);
+    const queue: number[] = [];
+    let accepting = true, sequence = 0;
+    const workers = Array.from({ length: 4 }, async () => {
+      while (accepting) {
+        const n = queue.shift();
+        if (n === undefined) { await sleep(1); continue; }
+        const kind = ['unary', 'stream', 'unary', 'cancel'][n % 4];
+        const req = new EchoRequest({ message: 'campaign', count: i32(kind === 'stream' ? 5 : 41), data: payload });
+        const began = performance.now();
+        result.active_calls++;
+        const ac = new AbortController();
+        // Keep the harness watchdog outside the public two-second SDK budget so
+        // a native deadline status wins the boundary race.
+        const timer = setTimeout(() => ac.abort(), kind === 'cancel' ? 50 : 3000);
+        let status = 'ok', success = false;
+        try {
+          if (kind === 'cancel') {
+            await client.hold(req, { signal: ac.signal, deadlineSecs: 10 });
+            throw new Error('INTEGRITY');
+          } else if (kind === 'unary') {
+            const r = await client.echo(req, { signal: ac.signal, deadlineSecs: 2 });
+            try { check(req, r); } catch { throw new Error('INTEGRITY'); }
+          } else {
+            let count = 0;
+            for await (const r of client.generate(req, { signal: ac.signal, deadlineSecs: 2 })) {
+              if (r.count !== count || r.message !== req.message || !r.server_lang || Buffer.compare(Buffer.from(r.data), Buffer.from(payload)) !== 0) throw new Error('INTEGRITY');
+              count++;
+              if (slow) await sleep(slow);
+            }
+            if (count !== 5) throw new Error('INTEGRITY');
+          }
+          result[kind]++;
+          success = true;
+          // Recovery timing requires receipt from the peer.
+          if (kind !== 'cancel') {
+            result.first_success_elapsed_ms ??= performance.now() - started;
+            result.last_success_elapsed_ms = performance.now() - started;
+          }
+        } catch (e) {
+          status = e instanceof RpcError ? statusName(e.code).toLowerCase() : e instanceof Error && e.message === 'INTEGRITY' ? 'integrity' : kind !== 'cancel' && ac.signal.aborted ? 'local_timeout' : 'local_error';
+          if (kind === 'cancel' && e instanceof RpcError && e.code === StatusCode.CANCELLED && ac.signal.aborted) { result.cancel++; success = true; }
+          else if (status === 'integrity') result.integrity_failures++;
+          else {
+            result.error_classes[status] = (result.error_classes[status] ?? 0) + 1;
+            if (!expected.includes(status) || !['unavailable', 'deadline_exceeded', 'cancelled'].includes(status)) result.unexpected_errors++;
+          }
+        } finally {
+          clearTimeout(timer);
+          result.active_calls--;
+          result.attempted++;
+          if (success) {
+            result.completed++;
+            const micros = Math.max(1, Math.ceil((performance.now() - began) * 1000));
+            result.latency_histogram[Math.min(26, Math.ceil(Math.log2(micros)))]++;
+            try { emitLog('info', marker, { sequence: n, status }, { logger: 'app.campaign.ts' }); result.app_log_emitted++; }
+            catch { result.unexpected_errors++; }
+          }
+        }
+      }
+    });
+    while (performance.now() - started < duration * 1000) {
+      if (queue.length < 128) { queue.push(sequence++); result.queue_high_water = Math.max(result.queue_high_water, queue.length); }
+      await sleep(1);
+    }
+    accepting = false;
+    queue.length = 0;
+    try { await withTimeout(Promise.all(workers), 4000); }
+    catch { result.unexpected_errors++; throw new Error('campaign workers did not drain within 4s'); }
+    result.latency_histogram = { unit: 'us', upper_bounds_powers_of_two: true, counts: result.latency_histogram };
+    await flush(command, result);
+    return result;
+  };
+  try {
+    node = await native.Node.start({ alpns: [RPC_ALPN], relayMode: 'disabled', bindAddr: '127.0.0.1:0' });
+    await replace(ticket);
+    const identity = node.nodeId();
+    reply({ phase: 'campaign_ready', owner_identity: identity, pid: process.pid, generation });
+    for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+      try {
+        const command = JSON.parse(line), op = command.command ?? command.cmd ?? command.op;
+        let result: any;
+        if (op === 'configure') { settings = { ...settings, ...command }; result = { phase: 'campaign_configured' }; }
+        else if (op === 'run' || op === 'baseline') result = await window({ ...settings, ...command });
+        else if (op === 'replace_peer') { await replace(command.ticket); generation = command.generation; result = { phase: 'campaign_peer_replaced', generation }; }
+        else if (op === 'pause' || op === 'stop') { result = { phase: `campaign_${op}`, active_calls: 0, unexpected_errors: 0 }; await flush({ ...settings, ...command }, result); }
+        else throw new Error('unknown campaign command');
+        reply({ ...result, owner_identity: identity, pid: process.pid });
+        if (op === 'stop') break;
+      } catch (e) { reply({ phase: 'campaign_error', detail: String(e).slice(0, 256) }); }
+    }
+  } finally {
+    try { conn?.close(0, 'done'); } finally { await node?.close(); await shutdownObservability(1000); }
+  }
+}
+
 // Server registers generated metadata itself (AsterServer.start); the
 // contract id needs the ServiceInfo stamped either way.
 const mode = process.argv[2];
 if (mode !== 'server' && mode !== 'chain-server') registerAll();
 else registerGenerated({ ...generated });
-console.log(`CONTRACT_ID ${contractId()}`);
-console.log(`SESSION_CONTRACT_ID ${contractId(InteropSession)}`);
+if (mode !== 'campaign-client') {
+  console.log(`CONTRACT_ID ${contractId()}`);
+  console.log(`SESSION_CONTRACT_ID ${contractId(InteropSession)}`);
+}
 
-if (mode === 'contract') {
+if (mode === 'campaign-client' && process.argv[3]) {
+  await campaignClient(process.argv[3]);
+} else if (mode === 'contract') {
   process.exit(0);
 } else if (mode === 'server') {
   await serve();

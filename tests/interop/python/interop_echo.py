@@ -36,6 +36,8 @@ Open gate, relay disabled, loopback bind: works offline.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import sys
 import time
@@ -636,7 +638,205 @@ async def expose_client(ticket_str: str) -> bool:
     return all_ok
 
 
+
+async def campaign_client(ticket_str: str) -> None:
+    """Persistent adapter load; the measured 128-slot queue is not an SDK queue."""
+    from aster import observability
+    from aster.logging import AsterLogHandler
+
+    endpoint = os.environ["ASTER_CAMPAIGN_COLLECTOR"]
+    observability.init(from_env=False, service_name="python-campaign", traces=False,
+                       metrics=False, otlp_logs=True, otlp_endpoint=endpoint,
+                       log_bridge=False, config_toml="otlp_timeout_ms = 1000")
+    logger = logging.getLogger("app.campaign.python")
+    logger.handlers = [AsterLogHandler()]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    node = None
+    conn = None
+    client = None
+    generation = 0
+    settings = {}
+    def reply(value):
+        print(json.dumps(value, separators=(",", ":")), flush=True)
+
+    async def replace(ticket):
+        nonlocal conn, client
+        if conn is not None:
+            conn.close(0, b"replace peer")
+        t = AsterTicket.from_string(ticket)
+        addr = NodeAddr(endpoint_id=t.endpoint_id, relay_url=None, direct_addresses=t.direct_addrs)
+        conn = await asyncio.wait_for(net_client(node).connect_node_addr(addr, RPC_ALPN), 2)
+        client = create_client(InteropEcho, connection=conn)
+
+    async def flush(command, result):
+        try:
+            await asyncio.to_thread(observability.flush, 1)
+            result["flush_status"] = "ok"
+        except RuntimeError as exc:
+            message = str(exc)
+            category = "timeout" if "telemetry flush timed out" in message else "sdk" if "telemetry SDK error:" in message else "other"
+            result["flush_status"] = category
+            if command.get("phase", "healthy") != "fault" or category not in command.get("expected_flush_errors", []):
+                result["unexpected_errors"] += 1
+
+    async def window(command):
+        started = time.monotonic()
+        duration = float(command.get("duration_s", 5))
+        if not 0 < duration <= 300:
+            raise ValueError("duration_s must be in (0,300]")
+        phase = command.get("phase", "healthy")
+        if phase not in ("healthy", "fault"):
+            raise ValueError("phase must be healthy or fault")
+        expected = command.get("expected_errors", []) if phase == "fault" else []
+        if not isinstance(expected, list) or not all(isinstance(x, str) for x in expected):
+            raise ValueError("expected_errors must be status-name strings")
+        slow = float(command.get("slow_ms", 0)) / 1000
+        if not 0 <= slow <= 1:
+            raise ValueError("slow_ms must be in [0,1000]")
+        window_id = command.get("window_id", "window")
+        if not isinstance(window_id, str) or len(window_id.encode()) > 128:
+            raise ValueError("window_id must be a string of at most 128 bytes")
+        marker = f"campaign:python:{window_id};"
+        result = dict(phase="campaign_window", window_phase=phase, generation=generation, log_marker=marker,
+                      completed=0, attempted=0, unary=0, stream=0, cancel=0, unexpected_errors=0,
+                      integrity_failures=0, active_calls=0, queue_capacity=128,
+                      queue_scope="adapter_admission", queue_depth=0, queue_high_water=0,
+                      latency_histogram=[0] * 27, first_success_elapsed_ms=None,
+                      last_success_elapsed_ms=None, error_classes={}, app_log_emitted=0)
+        queue = asyncio.Queue(maxsize=128)
+        payload = bytes((i * 131 + i // 8) % 251 for i in range(16384))
+        async def request(sequence):
+            kind = ("unary", "stream", "unary", "cancel")[sequence % 4]
+            req = EchoRequest(message="campaign", count=5 if kind == "stream" else 41, data=payload)
+            if kind == "cancel":
+                task = asyncio.create_task(client.hold(req, timeout=10))
+                await asyncio.sleep(.05)
+                if task.done():
+                    await task
+                    raise AssertionError("hold returned before caller cancellation")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    return kind
+                raise AssertionError("hold accepted caller cancellation as success")
+            if kind == "unary":
+                check(req, await client.echo(req, timeout=2))
+            else:
+                count = 0
+                async for r in client.generate(req, timeout=2):
+                    if r.count != count or r.message != req.message or bytes(r.data) != payload or not r.server_lang:
+                        raise AssertionError("stream integrity mismatch")
+                    count += 1
+                    if slow:
+                        await asyncio.sleep(slow)
+                if count != 5:
+                    raise AssertionError("stream length mismatch")
+            return kind
+        async def worker():
+            while True:
+                sequence = await queue.get()
+                began = time.monotonic()
+                result["active_calls"] += 1
+                status = "ok"
+                success = False
+                try:
+                    kind = await asyncio.wait_for(request(sequence), 3)
+                    result[kind] += 1
+                    success = True
+                    elapsed = (time.monotonic() - started) * 1000
+                    # Recovery timing requires receipt from the peer.
+                    if kind != "cancel":
+                        if result["first_success_elapsed_ms"] is None:
+                            result["first_success_elapsed_ms"] = elapsed
+                        result["last_success_elapsed_ms"] = elapsed
+                except AssertionError:
+                    status = "integrity"
+                    result["integrity_failures"] += 1
+                except Exception as exc:
+                    status = exc.code.name.lower() if isinstance(exc, RpcError) else "local_timeout" if isinstance(exc, TimeoutError) else "local_error"
+                    result["error_classes"][status] = result["error_classes"].get(status, 0) + 1
+                    if status not in expected or status not in ("unavailable", "deadline_exceeded", "cancelled"):
+                        result["unexpected_errors"] += 1
+                finally:
+                    result["active_calls"] -= 1
+                    result["attempted"] += 1
+                    if success:
+                        result["completed"] += 1
+                        micros = max(1, int((time.monotonic() - began) * 1_000_000))
+                        result["latency_histogram"][min(26, (micros - 1).bit_length())] += 1
+                        logger.info("%s request %s %s", marker, sequence, status)
+                        result["app_log_emitted"] += 1
+                    queue.task_done()
+        workers = [asyncio.create_task(worker()) for _ in range(4)]
+        sequence = 0
+        try:
+            while time.monotonic() - started < duration:
+                try:
+                    queue.put_nowait(sequence)
+                    sequence += 1
+                    result["queue_high_water"] = max(result["queue_high_water"], queue.qsize())
+                except asyncio.QueueFull:
+                    pass
+                await asyncio.sleep(.001)
+        finally:
+            while not queue.empty():
+                queue.get_nowait()
+                queue.task_done()
+            try:
+                await asyncio.wait_for(queue.join(), 4)
+            except TimeoutError:
+                result["unexpected_errors"] += 1
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        result["queue_depth"] = queue.qsize()
+        result["latency_histogram"] = dict(unit="us", upper_bounds_powers_of_two=True, counts=result["latency_histogram"])
+        await flush(command, result)
+        return result
+
+    try:
+        node = await Node.start(AsterConfig(alpns=(RPC_ALPN,), relay_mode="disabled", bind_addr="127.0.0.1:0"))
+        await replace(ticket_str)
+        identity = str(node.node_addr_info().endpoint_id)
+        reply(dict(phase="campaign_ready", owner_identity=identity, pid=os.getpid(), generation=generation))
+        loop = asyncio.get_running_loop()
+        while line := await loop.run_in_executor(None, sys.stdin.readline):
+            try:
+                command = json.loads(line)
+                op = command.get("command", command.get("cmd", command.get("op")))
+                if op == "configure":
+                    settings.update({k: v for k, v in command.items() if k not in ("command", "cmd", "op")})
+                    result = dict(phase="campaign_configured")
+                elif op in ("run", "baseline"):
+                    result = await window(settings | command)
+                elif op == "replace_peer":
+                    await replace(command["ticket"])
+                    generation = command["generation"]
+                    result = dict(phase="campaign_peer_replaced", generation=generation)
+                elif op in ("pause", "stop"):
+                    result = dict(phase="campaign_" + op, active_calls=0, unexpected_errors=0)
+                    await flush(settings | command, result)
+                else:
+                    raise ValueError("unknown campaign command")
+                reply(result | dict(owner_identity=identity, pid=os.getpid()))
+                if op == "stop":
+                    break
+            except Exception as exc:
+                reply(dict(phase="campaign_error", error=type(exc).__name__, detail=str(exc)[:256]))
+    finally:
+        if conn is not None:
+            conn.close(0, b"done")
+        if node is not None:
+            await node.close()
+        await asyncio.to_thread(observability.shutdown, 1)
+
+
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "campaign-client":
+        asyncio.run(campaign_client(sys.argv[2]))
+        return 0
     print(f"CONTRACT_ID {contract_id_from_service(InteropEcho)}", flush=True)
     print(f"SESSION_CONTRACT_ID {contract_id_from_service(InteropSession)}", flush=True)
     args = sys.argv[1:]

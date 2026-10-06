@@ -109,6 +109,27 @@ pub struct EchoImpl;
 /// `hold` calls that observed a cancellation (process-wide; the matrix runs
 /// one server process per server language and clients take turns).
 static HOLD_CANCELLED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+// Constant-space fixture counter: guards own actual native hold-handler lifetime.
+static ACTIVE_CALLS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub fn active_calls() -> i32 {
+    ACTIVE_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+struct ActiveCallGuard;
+impl ActiveCallGuard {
+    fn enter() -> Self {
+        ACTIVE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for ActiveCallGuard {
+    fn drop(&mut self) {
+        ACTIVE_CALLS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+static ACTIVE_HOLDS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub fn active_holds() -> i32 {
+    ACTIVE_HOLDS.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// Baggage observed by the Rust-native attribute extractor in the chain test.
 /// The request id comes from the inbound W3C baggage header, not the payload.
@@ -140,6 +161,7 @@ struct HoldGuard {
 
 impl Drop for HoldGuard {
     fn drop(&mut self) {
+        ACTIVE_HOLDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         if self.armed {
             HOLD_CANCELLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -156,6 +178,7 @@ impl Drop for HoldGuard {
 #[async_trait]
 impl InteropEcho for EchoImpl {
     async fn echo(&self, req: EchoRequest) -> Result<EchoReply> {
+        let _active = ActiveCallGuard::enter();
         Ok(EchoReply {
             message: req.message,
             count: req.count.wrapping_add(1),
@@ -165,6 +188,7 @@ impl InteropEcho for EchoImpl {
     }
 
     async fn generate(&self, req: EchoRequest, out: ResponseSink<EchoReply>) -> Result<()> {
+        let _active = ActiveCallGuard::enter();
         for i in 0..req.count.max(0) {
             out.send(&EchoReply {
                 message: req.message.clone(),
@@ -178,6 +202,7 @@ impl InteropEcho for EchoImpl {
     }
 
     async fn ingest(&self, mut reqs: RequestStream<EchoRequest>) -> Result<EchoReply> {
+        let _active = ActiveCallGuard::enter();
         let mut n = 0i32;
         let mut last = String::new();
         while let Some(r) = reqs.recv().await? {
@@ -197,6 +222,7 @@ impl InteropEcho for EchoImpl {
         mut reqs: RequestStream<EchoRequest>,
         out: ResponseSink<EchoReply>,
     ) -> Result<()> {
+        let _active = ActiveCallGuard::enter();
         let mut i = 0i32;
         while let Some(r) = reqs.recv().await? {
             out.send(&EchoReply {
@@ -212,6 +238,7 @@ impl InteropEcho for EchoImpl {
     }
 
     async fn hold(&self, req: EchoRequest) -> Result<EchoReply> {
+        let _active = ActiveCallGuard::enter();
         let chain_request = req.message.strip_prefix("chain-cancel:").map(str::to_owned);
         if let Some(request) = &chain_request {
             CHAIN_HOLD_STARTED
@@ -220,6 +247,7 @@ impl InteropEcho for EchoImpl {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(request.clone());
         }
+        ACTIVE_HOLDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut guard = HoldGuard {
             armed: true,
             chain_request,
@@ -235,6 +263,7 @@ impl InteropEcho for EchoImpl {
     }
 
     async fn cancelled(&self, req: EchoRequest) -> Result<EchoReply> {
+        let _active = ActiveCallGuard::enter();
         let chain_started = req.message.strip_prefix("chain-cancel:").map(|request| {
             CHAIN_HOLD_STARTED
                 .get_or_init(Default::default)
@@ -256,6 +285,7 @@ impl InteropEcho for EchoImpl {
     }
 
     async fn trace_echo(&self, req: EchoRequest) -> Result<EchoReply> {
+        let _active = ActiveCallGuard::enter();
         if let Some(request) = req.message.strip_prefix("chain-trace:") {
             // Rust handlers intentionally have no call-context/baggage getter.
             // The lower-level Server extractor records the actual inbound
