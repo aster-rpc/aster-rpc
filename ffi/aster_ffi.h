@@ -359,7 +359,8 @@ typedef enum aster_status_t {
   ASTER_STATUS_ALREADY_EXISTS = 17,
   /**
    * ABI 4.7: the independent asynchronous-operation admission bound is
-   * exhausted. The refused operation did not start.
+   * exhausted. The refused operation did not start and may be retried only
+   * when the caller knows an existing operation can finish independently.
    */
   ASTER_STATUS_OPERATION_LIMIT = 18,
 } aster_status_t;
@@ -921,9 +922,8 @@ typedef enum aster_server_option_t {
    */
   ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS = 4,
   /**
-   * Per-kind live foreign call/session/RPC-connection/non-RPC-connection
-   * bound (default 4096; at least 1). Call-pool exhaustion rejects a new
-   * call with RESOURCE_EXHAUSTED before session creation.
+   * Per-kind bound for live foreign calls, sessions, RPC connections and
+   * transferred non-RPC connections (default 4096; at least 1).
    */
   ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT = 5,
 } aster_server_option_t;
@@ -1365,9 +1365,15 @@ typedef enum aster_span_kind_t {
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
   uint32_t worker_threads;
-  /** Maximum events waiting for aster_poll_events; 0 = 4096. */
+  /**
+   * Maximum events waiting for `aster_poll_events`. Zero selects 4096.
+   */
   uint32_t event_queue_capacity;
-  /** Maximum admitted async operations; 0 = 4096. Independent of event queue capacity. */
+  /**
+   * Maximum admitted asynchronous operations, including terminal events
+   * waiting for queue capacity. Zero selects 4096. Admission above this
+   * independent bound returns `ASTER_STATUS_OPERATION_LIMIT` before work starts.
+   */
   uint32_t max_inflight_operations;
 } aster_runtime_config_t;
 
