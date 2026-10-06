@@ -76,7 +76,7 @@ try {
                 assembly=assemblyPath, assemblyVersion=asm.GetName().Version?.ToString(), informationalVersion=infoVersion,
                 nativePath=expectedNativePath, nativeSha256=expectedNativeHash,
                 runtime=Environment.Version.ToString(), os=Environment.OSVersion.ToString() }));
-            var conn = await client.ConnectAsync(AsterTicket.Parse(await server.TicketAsync())).WaitAsync(TimeSpan.FromSeconds(12));
+            var conn = await client.ConnectAsync(await server.TicketAsync()).WaitAsync(TimeSpan.FromSeconds(12));
             var reply = await conn.UnaryAsync<Request, Reply>("AssuranceCleanConsumer", "echo", new Request { Value="candidate", Count=17 }).WaitAsync(TimeSpan.FromSeconds(8));
             Check(reply.Value == "echo:candidate" && reply.Count == 17, "unary response mismatch"); unary++;
             var rows = new List<Reply>();
