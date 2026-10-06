@@ -29,7 +29,7 @@
 //!   (`aster::expose` and the transport-level tests).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -635,12 +635,36 @@ async fn accept_loop(
 struct ConnectionGone {
     gone: AtomicBool,
     notify: Notify,
+    /// Serializes `Call` publication with the transition to gone, which
+    /// precedes `ConnectionClosed`. A call is published under this lock only
+    /// while the connection is not gone, so `ConnectionClosed` is always the
+    /// connection's last event. Without it, a stream task descheduled between
+    /// reading a request and publishing it could deliver a `Call` after the
+    /// close, and the server would admit state for that connection (foreign
+    /// admission, a session) that no later event reaps.
+    publish: Mutex<()>,
 }
 
 impl ConnectionGone {
     fn set(&self) {
+        let _publish = self.publish.lock().unwrap();
         self.gone.store(true, Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    /// Publish `event` unless the connection is already gone. The channel slot
+    /// is reserved first, so the lock is never held across an await.
+    async fn publish(&self, tx: &mpsc::Sender<ReactorEvent>, event: ReactorEvent) -> Result<bool> {
+        let slot = tx
+            .reserve()
+            .await
+            .map_err(|_| anyhow!("reactor channel closed"))?;
+        let _publish = self.publish.lock().unwrap();
+        if self.gone.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        slot.send(event);
+        Ok(true)
     }
 
     async fn wait(&self) {
@@ -765,6 +789,7 @@ pub mod test_hooks {
         paused: oneshot::Sender<u64>,
         closed: oneshot::Sender<()>,
         resume: oneshot::Receiver<()>,
+        settled: oneshot::Sender<bool>,
     }
 
     /// Pause the next fully read call from one peer before publishing its
@@ -774,6 +799,7 @@ pub mod test_hooks {
         let (paused_tx, paused) = oneshot::channel();
         let (closed_tx, closed) = oneshot::channel();
         let (resume, resume_rx) = oneshot::channel();
+        let (settled_tx, settled) = oneshot::channel();
         let mut slot = CALL_ENQUEUE_GATE.lock().unwrap();
         assert!(slot.is_none(), "a call enqueue gate is already installed");
         *slot = Some(PendingCallGate {
@@ -781,6 +807,7 @@ pub mod test_hooks {
             paused: paused_tx,
             closed: closed_tx,
             resume: resume_rx,
+            settled: settled_tx,
         });
         CallEnqueueGate {
             peer_id,
@@ -788,6 +815,7 @@ pub mod test_hooks {
             paused,
             closed,
             resume: Some(resume),
+            settled,
         }
     }
 
@@ -798,6 +826,7 @@ pub mod test_hooks {
         paused: oneshot::Receiver<u64>,
         closed: oneshot::Receiver<()>,
         resume: Option<oneshot::Sender<()>>,
+        settled: oneshot::Receiver<bool>,
     }
 
     impl CallEnqueueGate {
@@ -814,9 +843,36 @@ pub mod test_hooks {
                 .expect("connection close gate dropped");
         }
 
-        pub fn resume(mut self) {
+        pub fn resume(&mut self) {
             if let Some(resume) = self.resume.take() {
                 let _ = resume.send(());
+            }
+        }
+
+        /// The resumed task has finished its publication step: `true` if
+        /// its Call entered the event queue, `false` if it did not (refused,
+        /// failed, or the task ended early).
+        pub async fn settled(&mut self) -> bool {
+            (&mut self.settled).await.unwrap_or(false)
+        }
+    }
+
+    /// Reports the publication outcome of a gated call. Dropped unreported,
+    /// it reports `false`, so an early return or unwind still settles.
+    pub(super) struct Settled(Option<oneshot::Sender<bool>>);
+
+    impl Settled {
+        pub(super) fn report(mut self, published: bool) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(published);
+            }
+        }
+    }
+
+    impl Drop for Settled {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(false);
             }
         }
     }
@@ -838,7 +894,7 @@ pub mod test_hooks {
         }
     }
 
-    pub(super) async fn call_enqueue_pause(peer_id: &str, connection_id: u64) {
+    pub(super) async fn call_enqueue_pause(peer_id: &str, connection_id: u64) -> Option<Settled> {
         let gate = {
             let mut slot = CALL_ENQUEUE_GATE.lock().unwrap();
             if slot.as_ref().is_some_and(|gate| gate.peer_id == peer_id) {
@@ -855,7 +911,9 @@ pub mod test_hooks {
                 .insert(connection_id, gate.closed);
             let _ = gate.paused.send(connection_id);
             let _ = gate.resume.await;
+            return Some(Settled(Some(gate.settled)));
         }
+        None
     }
 
     pub(super) fn connection_closed_enqueued(connection_id: u64) {
@@ -1279,26 +1337,33 @@ async fn dispatch_one_call(
     let mut req_tx_opt = if request_ended { None } else { Some(req_tx) };
 
     #[cfg(feature = "test-hooks")]
-    test_hooks::call_enqueue_pause(peer_id, connection_id).await;
+    let settled = test_hooks::call_enqueue_pause(peer_id, connection_id).await;
 
-    call_tx
-        .send(ReactorEvent::Call(IncomingCall {
-            call_id: next_call_id(),
-            stream_id,
-            connection_id,
-            connection: connection.clone(),
-            header_payload,
-            header_flags,
-            request_payload: first_request_payload,
-            request_flags: first_request_flags,
-            peer_id: peer_id.to_string(),
-            response_sender: resp_tx,
-            request_receiver: req_rx,
-            cancelled: cancelled.clone(),
-            cancel_notify: cancel_notify.clone(),
-        }))
-        .await
-        .map_err(|_| anyhow!("reactor channel closed"))?;
+    let call = ReactorEvent::Call(IncomingCall {
+        call_id: next_call_id(),
+        stream_id,
+        connection_id,
+        connection: connection.clone(),
+        header_payload,
+        header_flags,
+        request_payload: first_request_payload,
+        request_flags: first_request_flags,
+        peer_id: peer_id.to_string(),
+        response_sender: resp_tx,
+        request_receiver: req_rx,
+        cancelled: cancelled.clone(),
+        cancel_notify: cancel_notify.clone(),
+    });
+    let published = gone.publish(call_tx, call).await?;
+    #[cfg(feature = "test-hooks")]
+    if let Some(settled) = settled {
+        settled.report(published);
+    }
+    if !published {
+        // The connection closed before this call could be delivered: the
+        // binding never saw it, so there is nothing to reap. End the stream.
+        return Ok(CallOutcome::Cancelled);
+    }
 
     // The response writer runs in its OWN task, owning `resp_rx` and a clone of
     // the send half.

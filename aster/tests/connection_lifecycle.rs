@@ -3,11 +3,10 @@
     feature = "binding-support",
     feature = "reactor-test-hooks"
 ))]
-//! Draft close-versus-dispatch lifecycle regression; awaiting Claude validation.
-//! Not compiled or executed. The current late-event expectation must be revised
-//! to also accept a correct implementation that suppresses the late call.
-//! This ignore is not a qualification waiver. Run explicitly after review with:
-//! cargo test -p aster --features rpc,binding-support,reactor-test-hooks --test connection_lifecycle -- --ignored
+//! Close-versus-dispatch lifecycle regression: a call fully read on a stream
+//! whose task is descheduled until after the connection's close event must not
+//! leave foreign admission held. Run with:
+//! cargo test -p aster --features rpc,binding-support,reactor-test-hooks --test connection_lifecycle
 
 use std::time::Duration;
 
@@ -53,7 +52,6 @@ async fn connect(server: &AsterServer) -> (Node, aster::rpc::RpcConnection) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "draft: awaiting Claude validation and correction of late-event expectation"]
 async fn closed_connection_with_a_descheduled_call_releases_foreign_capacity() {
     let (sink, mut consumer) = RingSink::new_with_limit(1, 1);
     let mut service = DynamicService::new("test.Lifecycle", 1);
@@ -78,7 +76,7 @@ async fn closed_connection_with_a_descheduled_call_releases_foreign_capacity() {
         ..Default::default()
     };
     let (departing_client, departing) = connect(&server).await;
-    let mut gate = test_hooks::pause_next_call_enqueue(departing_client.id());
+    let mut gate = test_hooks::pause_next_call_enqueue(departing_client.id().to_string());
     let (send, _recv) = departing
         .core_connection()
         .open_streaming_substream()
@@ -92,14 +90,21 @@ async fn closed_connection_with_a_descheduled_call_releases_foreign_capacity() {
     // The complete request is now owned by a stream task paused immediately
     // before Call publication. Closing is ordinary connection teardown.
     let connection_id = within(gate.paused()).await;
-    departing.core_connection().close(0, b"finished".to_vec());
+    departing
+        .core_connection()
+        .close(0, b"finished".to_vec())
+        .unwrap();
     within(gate.closed_enqueued()).await;
-    // Close is already in the event queue. The serve loop consumes it before
-    // this task can publish Call, irrespective of runtime scheduling.
+    // Close is already in the event queue, so the serve loop consumes it before
+    // anything this task publishes, irrespective of runtime scheduling.
     gate.resume();
 
+    // Suppressing the late call is correct; delivering it is acceptable only
+    // if it is cancelled and leaves nothing admitted. Either way the task has
+    // settled before the fresh peer below routes its call.
+    let published = within(gate.settled()).await;
     let mut late_call_id = None;
-    let mut cancelled = false;
+    let mut cancelled = !published;
     while !cancelled {
         within(consumer.ready()).await;
         consumer.drain(8, |event| match event {
