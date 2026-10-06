@@ -223,8 +223,11 @@ public class ObservabilityTests : IAsyncLifetime
         return r.LogsContain(needle);
     }
 
-    [Fact]
-    public async Task App_Log_Export_Remains_Bounded_During_503_And_Recovers()
+    [Theory]
+    [InlineData("http503")]
+    [InlineData("refused")]
+    [InlineData("stall")]
+    public async Task App_Log_Export_Remains_Bounded_During_503_And_Recovers(string fault)
     {
         using var receiver = new OtlpReceiver();
         var bridge = new CapturingLoggerFactory { MinimumLevel = LogLevel.Trace };
@@ -241,8 +244,18 @@ public class ObservabilityTests : IAsyncLifetime
         });
         using var provider = new AsterLogEmitProvider();
         var logger = provider.CreateLogger("app.outage");
+        await using var node = await Node.StartAsync(Loopback);
+        using var health = HealthServer.Start(node);
+        health.SetReady(true);
 
         receiver.RejectLogs = true;
+        receiver.StallLogs = fault == "stall";
+        if (fault == "refused")
+        {
+            receiver.StopListening();
+            using var probe = new System.Net.Sockets.TcpClient();
+            Assert.Throws<System.Net.Sockets.SocketException>(() => probe.Connect(new Uri(receiver.Url).Host, new Uri(receiver.Url).Port));
+        }
         int rejectedBefore = receiver.RejectedLogs;
         var emitStart = Stopwatch.StartNew();
         for (int i = 0; i < 1_000; i++)
@@ -254,10 +267,15 @@ public class ObservabilityTests : IAsyncLifetime
         Assert.Throws<IrohException>(() => AsterObservability.Flush(TimeSpan.FromSeconds(1)));
         flushStart.Stop();
         Assert.True(flushStart.Elapsed < TimeSpan.FromSeconds(3), $"failed flush took {flushStart.Elapsed}");
-        Assert.True(receiver.RejectedLogs > rejectedBefore, "the receiver did not observe an HTTP 503 log export");
+        if (fault != "refused")
+            Assert.True(receiver.RejectedLogs > rejectedBefore, "the receiver did not observe a failed log export");
         Assert.False(receiver.LogsContain("dotnet-outage-"u8));
+        var (readyCode, readyBody) = await ProbeAsync(health.BaseUrl + "/readyz");
+        Assert.Equal(HttpStatusCode.OK, readyCode);
+        Assert.Contains("\"audit\":true", readyBody.Replace(" ", ""));
 
         receiver.RejectLogs = false;
+        if (fault == "refused") receiver.StartListening();
         using var source = new ActivitySource("O9.Outage");
         using var listener = ListenTo("O9.Outage");
         using var activity = source.StartActivity("recovered-work")!;
@@ -271,13 +289,27 @@ public class ObservabilityTests : IAsyncLifetime
         Assert.True(recovered.AsSpan().IndexOf(Convert.FromHexString(activity.TraceId.ToHexString())) >= 0);
         Assert.True(recovered.AsSpan().IndexOf(Convert.FromHexString(activity.SpanId.ToHexString())) >= 0);
         Assert.DoesNotContain(bridge.Logs, l => l.Message.Contains("dotnet-recovered", StringComparison.Ordinal));
+        Assert.Equal(HttpStatusCode.OK, (await ProbeAsync(health.BaseUrl + "/readyz")).Code);
+        health.Dispose();
+        await node.DisposeAsync();
 
         receiver.RejectLogs = true;
+        if (fault == "refused") receiver.StopListening();
         logger.LogWarning("dotnet-shutdown-outage");
         var shutdownStart = Stopwatch.StartNew();
         Assert.True(AsterObservability.Shutdown(TimeSpan.FromSeconds(1)));
         shutdownStart.Stop();
+        Assert.False(AsterObservability.Shutdown(TimeSpan.FromSeconds(1)));
         Assert.True(shutdownStart.Elapsed < TimeSpan.FromSeconds(3), $"outage shutdown took {shutdownStart.Elapsed}");
+        receiver.RejectLogs = false;
+        if (fault == "refused") receiver.StartListening();
+        AsterObservability.Init(new ObservabilityOptions
+        {
+            FromEnv = false, ServiceName = "dotnet-reinit", Traces = false, Metrics = false,
+            OtlpLogs = true, OtlpEndpoint = receiver.Url,
+        });
+        logger.LogWarning("dotnet-after-outage-shutdown");
+        Assert.True(await WaitLogs(receiver, "dotnet-after-outage-shutdown"));
     }
 
     [Fact]

@@ -284,10 +284,14 @@ export async function shutdownObservability(timeoutMs = 2000): Promise<boolean> 
   } catch {
     // no sink
   }
-  const released = await native.observabilityShutdown(timeoutMs);
-  refs--;
-  if (refs === 0) stopTimers();
-  return released;
+  // Native consumes the handle before waiting for final exporter shutdown.
+  // A timeout rejects while that shutdown continues in the background.
+  try {
+    return await native.observabilityShutdown(timeoutMs);
+  } finally {
+    refs--;
+    if (refs === 0) stopTimers();
+  }
 }
 
 /** Flush spans, metrics and OTLP logs now (bounded by `timeoutMs`). @group Observability */

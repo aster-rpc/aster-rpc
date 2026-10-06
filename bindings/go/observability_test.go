@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -30,43 +32,73 @@ var (
 
 	obsRecvOnce     sync.Once
 	obsRecv         *httptest.Server
+	obsRecvClosed   bool
 	obsBodiesMu     sync.Mutex
 	obsBodies       [][]byte
 	obsLogBodies    [][]byte
+	obsLogRequests  int
 	obsRejectLogs   bool
 	obsRejectedLogs int
+	obsStallLogs    bool
+	obsStalledLogs  int
+	obsStallGate    chan struct{}
 	obsOurs         bool // this file's pipeline is the running one; guarded by obs.mu
 )
 
+func obsReceiverHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			if zr, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
+				body, _ = io.ReadAll(zr)
+			}
+		}
+		if strings.HasSuffix(r.URL.Path, "/v1/logs") {
+			obsBodiesMu.Lock()
+			obsLogRequests++
+			if obsStallLogs {
+				obsStalledLogs++
+				gate := obsStallGate
+				obsBodiesMu.Unlock()
+				if gate != nil {
+					<-gate
+				}
+				obsBodiesMu.Lock()
+			}
+			if obsRejectLogs {
+				obsRejectedLogs++
+				obsBodiesMu.Unlock()
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			obsLogBodies = append(obsLogBodies, body)
+			obsBodiesMu.Unlock()
+		}
+		if strings.HasSuffix(r.URL.Path, "/v1/traces") {
+			obsBodiesMu.Lock()
+			obsBodies = append(obsBodies, body)
+			obsBodiesMu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
 func obsReceiver() *httptest.Server {
 	obsRecvOnce.Do(func() {
-		obsRecv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			body, _ := io.ReadAll(r.Body)
-			if r.Header.Get("Content-Encoding") == "gzip" {
-				if zr, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
-					body, _ = io.ReadAll(zr)
-				}
-			}
-			if strings.HasSuffix(r.URL.Path, "/v1/logs") {
-				obsBodiesMu.Lock()
-				if obsRejectLogs {
-					obsRejectedLogs++
-					obsBodiesMu.Unlock()
-					w.WriteHeader(http.StatusServiceUnavailable)
-					return
-				}
-				obsLogBodies = append(obsLogBodies, body)
-				obsBodiesMu.Unlock()
-			}
-			if strings.HasSuffix(r.URL.Path, "/v1/traces") {
-				obsBodiesMu.Lock()
-				obsBodies = append(obsBodies, body)
-				obsBodiesMu.Unlock()
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
+		obsRecv = httptest.NewServer(obsReceiverHandler())
 	})
 	return obsRecv
+}
+
+func obsRestartReceiver(t *testing.T, addr string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("rebind collector at same endpoint %s: %v", addr, err)
+	}
+	obsRecv = httptest.NewUnstartedServer(obsReceiverHandler())
+	obsRecv.Listener = listener
+	obsRecv.Start()
 }
 
 // obsSetup (re)starts the shared pipeline when none is held.
@@ -721,23 +753,107 @@ func TestObs_EmitHandlerExportsAppLogs(t *testing.T) {
 }
 
 func TestObs_ApplicationLogsRecoverAfterExporterHTTP503(t *testing.T) {
+	exerciseApplicationLogOutage(t, "http503")
+}
+
+func TestObs_ApplicationLogsRecoverAfterConnectionRefusal(t *testing.T) {
+	exerciseApplicationLogOutage(t, "refusal")
+}
+
+func TestObs_ApplicationLogsRecoverAfterStalledResponse(t *testing.T) {
+	exerciseApplicationLogOutage(t, "stall")
+}
+
+func exerciseApplicationLogOutage(t *testing.T, mode string) {
 	obsSetup(t)
+	if err := FlushObservability(5 * time.Second); err != nil {
+		t.Fatalf("flush before exporter outage: %v", err)
+	}
+	node, err := Memory(context.Background())
+	if err != nil {
+		t.Fatalf("start audit health node: %v", err)
+	}
+	health, err := StartHealth(node, &HealthConfig{Host: "127.0.0.1"})
+	if err != nil {
+		_ = node.Close()
+		t.Fatalf("start audit health listener: %v", err)
+	}
+	healthAddr, err := health.Addr()
+	if err != nil {
+		_ = health.Close()
+		_ = node.Close()
+		t.Fatalf("audit health address: %v", err)
+	}
+	if err := health.SetReady(true); err != nil {
+		t.Fatal(err)
+	}
+	assertAuditReady := func(stage string) {
+		t.Helper()
+		if code, body := httpGet(t, healthAddr, "/healthz"); code != http.StatusOK {
+			t.Fatalf("%s healthz: %d %s", stage, code, body)
+		}
+		if code, body := httpGet(t, healthAddr, "/readyz"); code != http.StatusOK || !strings.Contains(body, `"audit":true`) {
+			t.Fatalf("%s readyz audit check: %d %s", stage, code, body)
+		}
+	}
+	defer func() {
+		_ = health.Close()
+		_ = node.Close()
+	}()
+	assertAuditReady("before exporter outage")
 	setOutage := func(value bool) {
 		obsBodiesMu.Lock()
 		obsRejectLogs = value
 		obsBodiesMu.Unlock()
 	}
+	endpoint := ""
 	t.Cleanup(func() {
 		setOutage(false)
+		obsBodiesMu.Lock()
+		obsStallLogs = false
+		if obsStallGate != nil {
+			close(obsStallGate)
+			obsStallGate = nil
+		}
+		obsBodiesMu.Unlock()
+		if obsRecvClosed && endpoint != "" {
+			obsRestartReceiver(t, endpoint)
+			obsRecvClosed = false
+		}
 		obsSetup(t) // Restore the healthy shared pipeline after outage shutdown.
 	})
+	marker := "go-" + mode + "-"
 	obsBodiesMu.Lock()
 	rejectedBefore := obsRejectedLogs
+	stalledBefore := obsStalledLogs
+	requestsBefore := obsLogRequests
+	addr, err := url.Parse(obsReceiver().URL)
+	if err != nil {
+		obsBodiesMu.Unlock()
+		t.Fatal(err)
+	}
+	endpoint = addr.Host
 	obsBodiesMu.Unlock()
-	setOutage(true)
+	if mode == "refusal" {
+		obsRecv.Close()
+		obsRecvClosed = true
+		probe, err := net.Listen("tcp", endpoint)
+		if err != nil {
+			t.Fatalf("collector endpoint did not become unbound: %v", err)
+		}
+		probe.Close()
+	} else {
+		obsBodiesMu.Lock()
+		obsRejectLogs = true
+		if mode == "stall" {
+			obsStallLogs = true
+			obsStallGate = make(chan struct{})
+		}
+		obsBodiesMu.Unlock()
+	}
 	start := time.Now()
 	for i := 0; i < 1000; i++ {
-		if err := EmitLog(slog.LevelWarn, "app.outage", fmt.Sprintf("go-outage-%d", i), nil, nil); err != nil {
+		if err := EmitLog(slog.LevelWarn, "app.outage", fmt.Sprintf("%soutage-%d", marker, i), nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -753,22 +869,63 @@ func TestObs_ApplicationLogsRecoverAfterExporterHTTP503(t *testing.T) {
 	}
 	obsBodiesMu.Lock()
 	rejected := obsRejectedLogs - rejectedBefore
+	stalled := obsStalledLogs - stalledBefore
+	requests := obsLogRequests
 	for _, body := range obsLogBodies {
-		if bytes.Contains(body, []byte("go-outage-")) {
+		if bytes.Contains(body, []byte(marker+"outage-")) {
 			obsBodiesMu.Unlock()
 			t.Fatal("collector accepted an outage record while rejecting logs")
 		}
 	}
 	obsBodiesMu.Unlock()
-	if rejected == 0 {
+	assertAuditReady("during " + mode + " exporter outage")
+	if mode == "http503" && rejected == 0 {
 		t.Fatal("collector did not observe a refused logs request")
+	}
+	if mode == "http503" && requests <= requestsBefore {
+		t.Fatal("collector did not receive a logs request")
+	}
+	if mode == "refusal" && rejected != 0 {
+		t.Fatalf("closed collector unexpectedly returned HTTP responses: %d", rejected)
+	}
+	if mode == "refusal" && requests != requestsBefore {
+		t.Fatalf("closed collector received logs requests: before=%d after=%d", requestsBefore, requests)
+	}
+	if mode == "stall" && stalled == 0 {
+		deadline := time.Now().Add(5 * time.Second)
+		for stalled == 0 && time.Now().Before(deadline) {
+			time.Sleep(25 * time.Millisecond)
+			obsBodiesMu.Lock()
+			stalled = obsStalledLogs - stalledBefore
+			obsBodiesMu.Unlock()
+		}
+		if stalled == 0 {
+			t.Fatal("collector did not read a logs request and withhold its response")
+		}
+		obsBodiesMu.Lock()
+		requests := obsLogRequests
+		obsBodiesMu.Unlock()
+		if requests <= requestsBefore {
+			t.Fatal("collector did not receive a logs request")
+		}
+	}
+	if mode == "stall" {
+		obsBodiesMu.Lock()
+		close(obsStallGate)
+		obsStallGate = nil
+		obsStallLogs = false
+		obsBodiesMu.Unlock()
+	}
+	if mode == "refusal" {
+		obsRestartReceiver(t, endpoint)
+		obsRecvClosed = false
 	}
 	setOutage(false)
 	sc, err := ParseTraceparent(pureTP)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := EmitLog(slog.LevelWarn, "app.outage", "go-recovered", []Attr{StringAttr("phase", "recovered")}, &sc); err != nil {
+	if err := EmitLog(slog.LevelWarn, "app.outage", marker+"recovered", []Attr{StringAttr("phase", "recovered")}, &sc); err != nil {
 		t.Fatal(err)
 	}
 	var recovered []byte
@@ -777,7 +934,7 @@ func TestObs_ApplicationLogsRecoverAfterExporterHTTP503(t *testing.T) {
 		obsBodiesMu.Lock()
 		defer obsBodiesMu.Unlock()
 		for _, body := range obsLogBodies {
-			if bytes.Contains(body, []byte("go-recovered")) {
+			if bytes.Contains(body, []byte(marker+"recovered")) {
 				recovered = append([]byte(nil), body...)
 				return true
 			}
@@ -789,26 +946,77 @@ func TestObs_ApplicationLogsRecoverAfterExporterHTTP503(t *testing.T) {
 			t.Fatalf("recovered payload lacks %x", expected)
 		}
 	}
+	assertAuditReady("after " + mode + " exporter recovery")
 	for _, record := range obsLogs.all() {
 		message, _ := record["msg"].(string)
-		if record["aster_origin"] == "rust" && (strings.Contains(message, "go-outage-") || strings.Contains(message, "go-recovered")) {
+		if record["aster_origin"] == "rust" && (strings.Contains(message, marker+"outage-") || strings.Contains(message, marker+"recovered")) {
 			t.Fatal("application record fed back into Rust log bridge")
 		}
 	}
-	setOutage(true)
-	if err := EmitLog(slog.LevelWarn, "app.outage", "go-outage-shutdown", nil, nil); err != nil {
+	if err := FlushObservability(5 * time.Second); err != nil {
+		t.Fatalf("flush recovery before shutdown outage: %v", err)
+	}
+	obsBodiesMu.Lock()
+	shutdownRequestsBefore := obsLogRequests
+	shutdownRejectedBefore := obsRejectedLogs
+	shutdownStalledBefore := obsStalledLogs
+	if mode != "refusal" {
+		obsRejectLogs = true
+	}
+	if mode == "stall" {
+		obsStallLogs = true
+		obsStallGate = make(chan struct{})
+	}
+	obsBodiesMu.Unlock()
+	if mode == "refusal" {
+		obsRecv.Close()
+		obsRecvClosed = true
+		probe, err := net.Listen("tcp", endpoint)
+		if err != nil {
+			t.Fatalf("collector endpoint did not become unbound for shutdown: %v", err)
+		}
+		probe.Close()
+	}
+	if err := EmitLog(slog.LevelWarn, "app.outage", marker+"shutdown-outage", nil, nil); err != nil {
 		t.Fatal(err)
+	}
+	if err := health.Close(); err != nil {
+		t.Fatalf("close audit listener before shutdown measurement: %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("close audit node before shutdown measurement: %v", err)
 	}
 	start = time.Now()
 	held, err := ShutdownObservability(time.Second)
 	obs.mu.Lock()
 	obsOurs = false
 	obs.mu.Unlock()
-	if err != nil || !held {
+	if (err != nil && !errors.Is(err, ErrTimeout)) || !held {
 		t.Fatalf("outage shutdown: held=%v err=%v", held, err)
 	}
 	if elapsed := time.Since(start); elapsed >= 3*time.Second {
 		t.Fatalf("outage shutdown exceeded bound: %s", elapsed)
+	}
+	obsBodiesMu.Lock()
+	shutdownRequests := obsLogRequests
+	shutdownRejected := obsRejectedLogs
+	shutdownStalled := obsStalledLogs
+	obsBodiesMu.Unlock()
+	if mode == "refusal" {
+		if shutdownRequests != shutdownRequestsBefore || shutdownRejected != shutdownRejectedBefore {
+			t.Fatalf("shutdown logs reached closed collector: requests %d->%d, responses %d->%d", shutdownRequestsBefore, shutdownRequests, shutdownRejectedBefore, shutdownRejected)
+		}
+	} else if mode == "stall" {
+		if shutdownStalled <= shutdownStalledBefore || shutdownRequests <= shutdownRequestsBefore {
+			t.Fatalf("shutdown did not reach a held collector request: stalled %d->%d, requests %d->%d", shutdownStalledBefore, shutdownStalled, shutdownRequestsBefore, shutdownRequests)
+		}
+		obsBodiesMu.Lock()
+		close(obsStallGate)
+		obsStallGate = nil
+		obsStallLogs = false
+		obsBodiesMu.Unlock()
+	} else if shutdownRejected <= shutdownRejectedBefore || shutdownRequests <= shutdownRequestsBefore {
+		t.Fatalf("shutdown exporter request was not rejected: requests %d->%d, responses %d->%d", shutdownRequestsBefore, shutdownRequests, shutdownRejectedBefore, shutdownRejected)
 	}
 	if held, err := ShutdownObservability(time.Second); err != nil || held {
 		t.Fatalf("shutdown left a pipeline reference: held=%v err=%v", held, err)

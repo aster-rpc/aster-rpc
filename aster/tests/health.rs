@@ -689,6 +689,22 @@ fn case_audit_readiness() {
     assert!(!state.is_ready());
     let resp = aster::ops::route(&state, &hyper_get("/readyz"));
     assert_eq!(resp.status(), 503);
+
+    // A continuously drop-free window restores readiness after the documented
+    // 30-second degradation period. Keep the bound loose enough for loaded CI.
+    let recovered_by = std::time::Instant::now() + Duration::from_secs(35);
+    while aster_otel::bridge::audit_degraded() && std::time::Instant::now() < recovered_by {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !aster_otel::bridge::audit_degraded(),
+        "audit readiness did not recover within 35 seconds"
+    );
+    assert!(state.is_ready());
+    assert_eq!(
+        aster::ops::route(&state, &hyper_get("/readyz")).status(),
+        200
+    );
     drop(handle);
 }
 

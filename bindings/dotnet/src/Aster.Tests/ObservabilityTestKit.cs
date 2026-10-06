@@ -26,7 +26,7 @@ public sealed class OtlpReceiver : IDisposable
     private readonly HttpListener _listener = new();
     private readonly ConcurrentQueue<ExportedSpan> _spans = new();
     private readonly CancellationTokenSource _stop = new();
-    private readonly Task _loop;
+    private Task _loop;
 
     public string Url { get; }
 
@@ -60,6 +60,19 @@ public sealed class OtlpReceiver : IDisposable
 
     /// <summary>Number of log exports answered with HTTP 503.</summary>
     public int RejectedLogs => Volatile.Read(ref _rejectedLogs);
+    public bool StallLogs { get; set; }
+
+    public void StopListening()
+    {
+        _listener.Stop();
+        _loop.Wait(TimeSpan.FromSeconds(2));
+    }
+
+    public void StartListening()
+    {
+        _listener.Start();
+        _loop = Task.Run(Loop);
+    }
 
     /// <summary>Whether any received log export contains <paramref name="needle"/> as raw bytes.</summary>
     public bool LogsContain(ReadOnlySpan<byte> needle)
@@ -92,6 +105,8 @@ public sealed class OtlpReceiver : IDisposable
                 if (ctx.Request.Url!.AbsolutePath.EndsWith("/v1/logs", StringComparison.Ordinal) && RejectLogs)
                 {
                     Interlocked.Increment(ref _rejectedLogs);
+                    while (StallLogs && RejectLogs && !_stop.IsCancellationRequested)
+                        await Task.Delay(10).ConfigureAwait(false);
                     ctx.Response.StatusCode = 503;
                 }
                 else if (ctx.Request.Url!.AbsolutePath.EndsWith("/v1/traces", StringComparison.Ordinal))

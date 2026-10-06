@@ -263,6 +263,9 @@ func ShutdownObservability(timeout time.Duration) (bool, error) {
 		if s == C.ASTER_STATUS_ALREADY_CLOSED {
 			break
 		}
+		if s == C.ASTER_STATUS_TIMEOUT {
+			held = true // Native consumed the reference; shutdown continues in the background.
+		}
 		if s != C.ASTER_STATUS_OK {
 			err = fmt.Errorf("aster_observability_shutdown: %w", statusError(s))
 			break

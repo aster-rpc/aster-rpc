@@ -25,6 +25,10 @@ use aster_transport_ffi::upcall::*;
 use aster_transport_ffi::*;
 
 mod common;
+#[path = "../../tests/support/otlp_faults.rs"]
+mod otlp_faults;
+
+use otlp_faults::{Collector, Fault};
 
 const OK: i32 = aster_status_t::ASTER_STATUS_OK as i32;
 const INVALID: i32 = aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
@@ -32,6 +36,7 @@ const NOT_FOUND: i32 = aster_status_t::ASTER_STATUS_NOT_FOUND as i32;
 const UNSUPPORTED: i32 = aster_status_t::ASTER_STATUS_UNSUPPORTED as i32;
 const EXISTS: i32 = aster_status_t::ASTER_STATUS_ALREADY_EXISTS as i32;
 const CLOSED: i32 = aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32;
+const TIMEOUT: i32 = aster_status_t::ASTER_STATUS_TIMEOUT as i32;
 const RPC_ALPN: &[u8] = b"aster/1";
 const REC: u32 = std::mem::size_of::<aster_log_record_t>() as u32;
 
@@ -120,6 +125,209 @@ fn test_cfg(t: &TestExporters) -> ObservabilityConfig {
     };
     cfg.span_batch.scheduled_delay = Some(Duration::from_secs(3600));
     cfg
+}
+
+fn emit_app_log(
+    logger: &[u8],
+    message: &[u8],
+    fields: &[u8],
+    context: &aster_span_context_t,
+) -> i32 {
+    let rec = aster_log_emit_t {
+        struct_size: std::mem::size_of::<aster_log_emit_t>() as u32,
+        level: aster_log_level_t::ASTER_LOG_INFO as u8,
+        _p: [0; 3],
+        timestamp_unix_ns: 0,
+        logger: bytes(logger),
+        message: bytes(message),
+        fields: bytes(fields),
+        context: context as *const aster_span_context_t,
+    };
+    // SAFETY: all byte slices and the context live through this call.
+    unsafe { aster_log_emit(&rec) }
+}
+
+fn poll_bridge_messages() -> Vec<String> {
+    let mut out: [std::mem::MaybeUninit<aster_log_record_t>; 64] =
+        [std::mem::MaybeUninit::uninit(); 64];
+    let mut count = 0;
+    // SAFETY: `out` has room for 64 records and `count` is writable.
+    assert_eq!(
+        unsafe {
+            aster_log_poll(
+                out.as_mut_ptr().cast(),
+                REC,
+                out.len() as u32,
+                0,
+                &mut count,
+            )
+        },
+        OK
+    );
+    out.iter()
+        .take(count as usize)
+        .map(|slot| {
+            // SAFETY: a successful poll initialized exactly `count` records;
+            // their message buffers remain valid until the next poll.
+            let rec = unsafe { slot.assume_init_ref() };
+            let message = unsafe { copy(rec.message_ptr, rec.message_len) };
+            String::from_utf8_lossy(&message).into_owned()
+        })
+        .collect()
+}
+
+fn c_abi_exporter_fault(fault: Fault, fault_name: &str) {
+    let _g = serial();
+    let mut collector = Collector::new(fault);
+    if matches!(fault, Fault::Refused) {
+        collector.assert_refused();
+    }
+    let endpoint = collector.url();
+
+    unsafe {
+        let mut cfg = config(
+            ASTER_OBSERVABILITY_OTLP_LOGS | ASTER_OBSERVABILITY_LOG_BRIDGE,
+            b"ffi-exporter-fault",
+            b"warn,aster=info",
+        );
+        cfg.otlp_endpoint = bytes(endpoint.as_bytes());
+        assert_eq!(aster_observability_init(&cfg), OK, "{}", last_error());
+
+        let context = aster_span_context_t {
+            trace_id: [0x11; 16],
+            span_id: [0x22; 8],
+            trace_flags: 1,
+            is_remote: 0,
+            _p0: 0,
+            _p1: 0,
+        };
+        let logger = b"app.ffi.outage";
+        let outage_marker = format!("ffi-{fault_name}-outage");
+        let outage_fields = kv(&[("phase", "outage")]);
+        let emit_started = Instant::now();
+        for i in 0..1000 {
+            let message = format!("{outage_marker}-{i}");
+            assert_eq!(
+                emit_app_log(logger, message.as_bytes(), &outage_fields, &context),
+                OK
+            );
+        }
+        assert!(
+            emit_started.elapsed() < Duration::from_secs(1),
+            "C ABI application log emission blocked for {:?}",
+            emit_started.elapsed()
+        );
+
+        let flush_started = Instant::now();
+        let status = aster_observability_flush(1_000);
+        assert_ne!(status, OK, "faulted exporter unexpectedly flushed");
+        assert!(flush_started.elapsed() < Duration::from_secs(3));
+        if matches!(fault, Fault::Refused) {
+            collector.assert_refused();
+        } else {
+            let observed_by = Instant::now() + Duration::from_secs(2);
+            while collector.failed_requests() == 0 && Instant::now() < observed_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                collector.failed_requests() > 0,
+                "collector saw no failed request"
+            );
+        }
+        assert!(
+            collector.accepted().is_empty(),
+            "failed-mode body was accepted"
+        );
+
+        collector.recover();
+        let recovered_marker = format!("ffi-{fault_name}-recovered");
+        let recovered_fields = kv(&[("phase", "recovered"), ("case", fault_name)]);
+        assert_eq!(
+            emit_app_log(
+                logger,
+                recovered_marker.as_bytes(),
+                &recovered_fields,
+                &context,
+            ),
+            OK
+        );
+        assert_eq!(aster_observability_flush(5_000), OK, "{}", last_error());
+        let body = collector
+            .wait_for(recovered_marker.as_bytes(), Duration::from_secs(5))
+            .expect("recovered C ABI log was not exported");
+        assert!(body.windows(logger.len()).any(|w| w == logger));
+        assert!(body.windows(b"recovered".len()).any(|w| w == b"recovered"));
+        assert!(body.windows(b"case".len()).any(|w| w == b"case"));
+        assert!(body
+            .windows(fault_name.len())
+            .any(|w| w == fault_name.as_bytes()));
+        assert!(body.windows(16).any(|w| w == [0x11; 16]), "trace id absent");
+        assert!(body.windows(8).any(|w| w == [0x22; 8]), "span id absent");
+        let bridge_messages = poll_bridge_messages();
+        assert!(
+            bridge_messages
+                .iter()
+                .all(|m| { !m.contains(&outage_marker) && !m.contains(&recovered_marker) }),
+            "application logs fed back into the Rust bridge: {bridge_messages:?}"
+        );
+
+        // Exercise an exporter fault while shutdown flushes pending data. The
+        // C reference is consumed by the first call, even when it times out.
+        collector.fail(fault);
+        if matches!(fault, Fault::Refused) {
+            collector.assert_refused();
+        }
+        let failed_before_shutdown = collector.failed_requests();
+        let shutdown_message = format!("ffi-{fault_name}-shutdown");
+        assert_eq!(
+            emit_app_log(
+                logger,
+                shutdown_message.as_bytes(),
+                &outage_fields,
+                &context,
+            ),
+            OK
+        );
+        let shutdown_started = Instant::now();
+        let shutdown = aster_observability_shutdown(1_000);
+        assert!(
+            shutdown == OK || shutdown == TIMEOUT,
+            "shutdown status {shutdown}"
+        );
+        assert!(shutdown_started.elapsed() < Duration::from_secs(3));
+        if !matches!(fault, Fault::Refused) {
+            assert!(collector.failed_requests() > failed_before_shutdown);
+        }
+        let repeated_started = Instant::now();
+        assert_eq!(aster_observability_shutdown(1_000), CLOSED);
+        assert!(repeated_started.elapsed() < Duration::from_secs(3));
+        assert_eq!(aster_log_close(), OK);
+
+        collector.recover();
+        let closed_by = Instant::now() + Duration::from_secs(3);
+        while aster_otel::state().is_some() && Instant::now() < closed_by {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            aster_otel::state().is_none(),
+            "pipeline shutdown did not finish"
+        );
+    }
+}
+
+#[test]
+fn c_abi_application_logs_recover_after_http503() {
+    c_abi_exporter_fault(Fault::Http503, "http503");
+}
+
+#[test]
+fn c_abi_application_logs_recover_after_connection_refusal() {
+    c_abi_exporter_fault(Fault::Refused, "refused");
+}
+
+#[test]
+fn c_abi_application_logs_recover_after_stalled_exporter() {
+    c_abi_exporter_fault(Fault::Stall, "stall");
 }
 
 /// Run `f` on a fresh thread (so the calling thread's drain mark, set by

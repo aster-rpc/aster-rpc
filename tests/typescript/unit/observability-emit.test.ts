@@ -4,16 +4,22 @@
  * OTLP/HTTP to a collector this file runs on 127.0.0.1.
  */
 
-import { createServer, type Server } from 'node:http';
+import { createServer, type Server, type ServerResponse } from 'node:http';
+import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { gunzipSync } from 'node:zlib';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { initObservability, shutdownObservability, flushObservability, emitLog, AsterLogger, tracing, setLogSink, pollLogs } from '@aster-rpc/aster';
+import { initObservability, shutdownObservability, flushObservability, ensureObservability, logStats, emitLog, AsterLogger, tracing, setLogSink, pollLogs, Node } from '@aster-rpc/aster';
 
 const hits: { path: string; body: Buffer }[] = [];
 let collector: Server;
 let rejectLogs = false;
 let rejectedLogs = 0;
+let stallLogs = false;
+let collectorPort = 0;
+const stalledResponses: ServerResponse[] = [];
+const options = () => ({ fromEnv: false, serviceName: 'pathb-test', otlpEndpoint: `http://127.0.0.1:${collectorPort}`,
+  exportOtlpLogs: true, exportTraces: true, logFilter: 'warn,aster=info' });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const got = (needle: string | Buffer) =>
@@ -28,7 +34,7 @@ async function until(cond: () => boolean, ms = 10_000): Promise<void> {
   }
 }
 
-beforeAll(async () => {
+async function startCollector(port = 0): Promise<void> {
   collector = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (c) => chunks.push(c));
@@ -37,6 +43,10 @@ beforeAll(async () => {
       if (req.headers['content-encoding'] === 'gzip') body = gunzipSync(body);
       if (rejectLogs && req.url?.endsWith('/v1/logs')) {
         rejectedLogs++;
+        if (stallLogs) {
+          stalledResponses.push(res);
+          return;
+        }
         res.writeHead(503);
         res.end();
         return;
@@ -46,16 +56,22 @@ beforeAll(async () => {
       res.end();
     });
   });
-  await new Promise<void>((r) => collector.listen(0, '127.0.0.1', r));
-  const endpoint = `http://127.0.0.1:${(collector.address() as AddressInfo).port}`;
-  await initObservability({
-    fromEnv: false,
-    serviceName: 'pathb-test',
-    otlpEndpoint: endpoint,
-    exportOtlpLogs: true,
-    exportTraces: true,
-    logFilter: 'warn,aster=info',
-  });
+  await new Promise<void>((r) => collector.listen(port, '127.0.0.1', r));
+  collectorPort = (collector.address() as AddressInfo).port;
+}
+
+async function closeCollector(): Promise<void> {
+  collector.closeAllConnections();
+  await new Promise<void>((resolve, reject) => collector.close((error) => error ? reject(error) : resolve()));
+}
+
+function releaseStalls(): void {
+  for (const response of stalledResponses.splice(0)) { response.writeHead(503); response.end(); }
+}
+
+beforeAll(async () => {
+  await startCollector();
+  await initObservability(options());
 });
 
 afterAll(async () => {
@@ -101,11 +117,37 @@ describe('emitLog (path B)', () => {
     expect(() => emitLog('loud' as never, 'x')).toThrow(RangeError);
   });
 
-  it('keeps application emission bounded during exporter outage and exports after recovery', async () => {
+  it.each([
+    ['http503', 'shutdown'], ['refused', 'shutdown'], ['stall', 'shutdown'],
+    ['http503', 'readiness'], ['refused', 'readiness'], ['stall', 'readiness'],
+  ])('keeps application emission bounded during %s exporter outage (%s) and exports after recovery', async (fault, scope) => {
+    await shutdownObservability();
+    await initObservability(options());
+    hits.length = 0;
     const failedBefore = rejectedLogs;
     const bridgedMessages: string[] = [];
     setLogSink((record) => bridgedMessages.push(record.message));
     rejectLogs = true;
+    stallLogs = fault === 'stall';
+    // Readiness owns a pipeline handle for the health object's lifetime.
+    // Test its isolation separately from final-reference exporter shutdown.
+    const node = scope === 'readiness' ? await Node.start({ relayMode: 'disabled', bindAddr: '127.0.0.1:0', logLevel: 'warn' }) : undefined;
+    const health = await node?.startHealth({ port: 0 });
+    health?.setReady(true);
+    const assertReady = async () => {
+      if (!health) return;
+      const response = await fetch(`http://127.0.0.1:${health.port}/readyz`);
+      expect(response.status).toBe(200);
+      expect((await response.json() as { checks: { audit: boolean } }).checks.audit).toBe(true);
+    };
+    if (fault === 'refused') {
+      await closeCollector();
+      await new Promise<void>((resolve, reject) => {
+        const socket = connect(collectorPort, '127.0.0.1');
+        socket.once('connect', () => { socket.destroy(); reject(new Error('collector still listening')); });
+        socket.once('error', (error: NodeJS.ErrnoException) => error.code === 'ECONNREFUSED' ? resolve() : reject(error));
+      });
+    }
     try {
       const start = performance.now();
       for (let i = 0; i < 1_000; i++) {
@@ -116,10 +158,13 @@ describe('emitLog (path B)', () => {
       const flushStart = performance.now();
       await expect(flushObservability(1_000)).rejects.toThrow();
       expect(performance.now() - flushStart).toBeLessThan(3_000);
-      expect(rejectedLogs).toBeGreaterThan(failedBefore);
+      if (fault !== 'refused') expect(rejectedLogs).toBeGreaterThan(failedBefore);
       expect(got('pathb-outage-')).toBe(false);
+      await assertReady();
 
       rejectLogs = false;
+      releaseStalls();
+      if (fault === 'refused') await startCollector(collectorPort);
       emitLog('warning', 'pathb-recovered', { phase: 'recovered' }, { logger: 'app.outage', traceparent: TP });
       await until(() => got('pathb-recovered'));
       const recovered = hits.find((hit) => hit.path.endsWith('/v1/logs') && hit.body.includes(Buffer.from('pathb-recovered')))!;
@@ -127,15 +172,35 @@ describe('emitLog (path B)', () => {
       expect(recovered.body.includes(Buffer.from('0af7651916cd43dd8448eb211c80319c', 'hex'))).toBe(true);
       pollLogs();
       expect(bridgedMessages.some((message) => message.includes('pathb-outage-') || message.includes('pathb-recovered'))).toBe(false);
+      await assertReady();
+      if (scope === 'readiness') return;
 
       rejectLogs = true;
+      if (fault === 'refused') await closeCollector();
       emitLog('warning', 'pathb-outage-shutdown');
       const shutdownStart = performance.now();
       // Export failure must not prevent release of the pipeline reference.
-      expect(await shutdownObservability(1_000)).toBe(true);
+      if (fault === 'stall') {
+        await expect(shutdownObservability(1_000)).rejects.toThrow('continues in the background');
+      } else {
+        expect(await shutdownObservability(1_000)).toBe(true);
+      }
       expect(performance.now() - shutdownStart).toBeLessThan(3_000);
+      rejectLogs = false;
+      releaseStalls();
+      // A timed-out release consumed the native reference. Implicit startup
+      // must open a new pipeline rather than trusting a stale JS ref count.
+      await ensureObservability();
+      expect(logStats().running).toBe(true);
+      await shutdownObservability();
     } finally {
       rejectLogs = false;
+      stallLogs = false;
+      releaseStalls();
+      await health?.stop();
+      await node?.close();
+      if (!collector.listening) await startCollector(collectorPort);
+      await shutdownObservability();
       setLogSink(null);
     }
   }, 15_000);

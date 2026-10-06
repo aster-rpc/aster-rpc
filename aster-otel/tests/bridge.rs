@@ -103,6 +103,7 @@ fn child() {
         "drops" => case_drops(),
         "audit_reserved" => case_audit_reserved(),
         "audit_block" => case_audit_block(),
+        "audit_block_timeout" => case_audit_block_timeout(),
         "no_feedback" => case_no_feedback(),
         "lifecycle" => case_lifecycle(),
         "rpc_span_context" => case_rpc_span_context(),
@@ -265,9 +266,14 @@ fn case_audit_reserved() {
     assert!(got[..first_general].iter().filter(|r| r.is_audit()).count() == 4);
     assert!(!bridge::audit_degraded());
 
+    let emit_started = Instant::now();
     for i in 0..10u32 {
         tracing::info!(target: "aster::audit::gate0", seq = i, "over-{i}");
     }
+    assert!(
+        emit_started.elapsed() < Duration::from_secs(1),
+        "default audit emission should remain nonblocking under pressure"
+    );
     assert_eq!(bridge::audit_dropped_total(), 6);
     assert!(bridge::audit_degraded());
     let got = take(&mut d, 100);
@@ -303,6 +309,29 @@ fn case_audit_block() {
     );
     assert_eq!(consumer.join().unwrap(), ["first", "second"]);
     assert_eq!(bridge::audit_dropped_total(), 0);
+}
+
+/// Even the opt-in audit wait is bounded: a full queue drops after the
+/// configured timeout and marks audit readiness degraded.
+fn case_audit_block_timeout() {
+    let mut cfg = bridge_cfg("warn,aster=info");
+    cfg.log_audit_queue = Some(1);
+    cfg.log_audit_block = Some(Duration::from_millis(50));
+    let _h = aster_otel::init(cfg).unwrap();
+    tracing::info!(target: "aster::audit", "fills the only slot");
+
+    let before = bridge::audit_dropped_total();
+    let started = Instant::now();
+    tracing::info!(target: "aster::audit", "times out waiting for room");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(40),
+        "waited only {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_millis(500), "waited {elapsed:?}");
+    assert_eq!(bridge::audit_dropped_total(), before + 1);
+    assert!(bridge::audit_degraded());
 }
 
 /// Nothing a drain thread emits reaches the queue, nor do exporter-internal
@@ -553,6 +582,11 @@ fn audit_reservation_holds_under_pressure() {
 #[test]
 fn audit_block_opt_in_waits_for_room() {
     run("audit_block", &[]);
+}
+
+#[test]
+fn audit_block_timeout_drops_and_degrades() {
+    run("audit_block_timeout", &[]);
 }
 
 #[test]

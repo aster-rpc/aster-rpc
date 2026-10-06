@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aster::rpc::{DynamicService, MethodDesc, MethodPattern, TypeRef};
 use aster_transport_ffi::health::*;
@@ -201,6 +201,57 @@ fn attach_and_readiness_transitions() {
             "last pipeline reference released"
         );
 
+        assert_eq!(aster_node_free(rt, node), OK);
+        aster_runtime_close(rt);
+    }
+}
+
+/// The C health listener shares readiness with the Rust-owned bridge. This
+/// drives synthetic native tracing audit events because the public C ABI has
+/// no audit-event emitter; it checks the C listener's observable contract.
+#[test]
+fn native_audit_drop_fails_and_recovers_c_health_readiness() {
+    let _g = serial();
+    unsafe {
+        let (rt, node) = runtime_and_node();
+        let cfg = health_cfg(b"127.0.0.1");
+        let mut h = 0;
+        assert_eq!(aster_health_start(rt, node, &cfg, &mut h), OK);
+        let a = addr(h);
+        assert_eq!(aster_health_set_ready(h, true), OK);
+        assert_eq!(get(&a, "/readyz").0, 200);
+
+        // Opening the bridge is additive to the health listener's pipeline.
+        let bridge = aster_otel::init(aster_otel::ObservabilityConfig {
+            log_bridge: Some(true),
+            ..Default::default()
+        })
+        .expect("open bridge on the listener's pipeline");
+        let before = aster_otel::bridge::audit_dropped_total();
+        // The default queue holds 1024 records. No consumer drains it here.
+        for n in 0..1025 {
+            tracing::info!(target: "aster::audit", n, "synthetic FFI health audit");
+        }
+        assert!(aster_otel::bridge::audit_dropped_total() > before);
+        let (status, body) = get(&a, "/readyz");
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("\"audit\":false"), "{body}");
+
+        let recovery_deadline = Instant::now() + Duration::from_secs(35);
+        while aster_otel::bridge::audit_degraded() && Instant::now() < recovery_deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !aster_otel::bridge::audit_degraded(),
+            "audit readiness did not recover within 35 seconds"
+        );
+        let (status, body) = get(&a, "/readyz");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"audit\":true"), "{body}");
+
+        assert_eq!(aster_health_stop(rt, h), OK);
+        drop(bridge);
+        assert!(aster_otel::state().is_none());
         assert_eq!(aster_node_free(rt, node), OK);
         aster_runtime_close(rt);
     }

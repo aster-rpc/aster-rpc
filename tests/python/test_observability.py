@@ -785,18 +785,20 @@ def test_otlp_log_handler_skips_rust_records_and_never_raises(monkeypatch):
     assert errors == []
 
 
-def test_application_logs_recover_after_exporter_http503_outage():
+def _application_log_fault_result(fault, readiness=False):
     out = child_json(
         """
-        import gzip, json, logging, threading, time, warnings
+        import asyncio, gzip, http.client, json, logging, socket, threading, time, warnings
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        from aster import observability, tracing, _aster
+        from aster import observability, tracing, _aster, AsterConfig, Node, HealthServer
         from aster.logging import AsterLogHandler
 
         accepted = []
         rejected = []
         outage = threading.Event()
         outage.set()
+        fault = 'FAULT_MODE'
+        readiness = READINESS_MODE
         class Collector(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers['Content-Length']))
@@ -804,6 +806,9 @@ def test_application_logs_recover_after_exporter_http503_outage():
                     body = gzip.decompress(body)
                 if outage.is_set() and self.path.endswith('/v1/logs'):
                     rejected.append(body)
+                    if fault == 'stall':
+                        while outage.is_set():
+                            time.sleep(0.01)
                     self.send_response(503)
                 else:
                     accepted.append(body)
@@ -813,8 +818,21 @@ def test_application_logs_recover_after_exporter_http503_outage():
             def log_message(self, *args):
                 pass
         receiver = ThreadingHTTPServer(('127.0.0.1', 0), Collector)
-        thread = threading.Thread(target=receiver.serve_forever, daemon=True)
-        thread.start()
+        address = receiver.server_address
+        def start_receiver():
+            thread = threading.Thread(target=receiver.serve_forever, daemon=True)
+            thread.start()
+            return thread
+        thread = None
+        if fault == 'refused':
+            receiver.server_close()
+            try:
+                socket.create_connection(address, timeout=1)
+                raise AssertionError('fault endpoint is unexpectedly listening')
+            except ConnectionRefusedError:
+                pass
+        else:
+            thread = start_receiver()
         bridge = []
         class Capture(logging.Handler):
             def emit(self, record):
@@ -824,10 +842,35 @@ def test_application_logs_recover_after_exporter_http503_outage():
         app.propagate = False
         app.setLevel(logging.WARNING)
         app.addHandler(AsterLogHandler())
+        node = health = None
+        async def start_health():
+            node = await Node.start(AsterConfig(relay_mode='disabled', bind_addr='127.0.0.1:0'))
+            health = await HealthServer.start(node, '127.0.0.1', 0)
+            health.set_ready(True)
+            return node, health
+        async def stop_health():
+            if health is not None:
+                await health.stop()
+            if node is not None:
+                await node.shutdown()
+        def assert_ready():
+            if health is None:
+                return
+            host, port = health.addr.rsplit(':', 1)
+            conn = http.client.HTTPConnection(host, int(port), timeout=2)
+            try:
+                conn.request('GET', '/readyz')
+                response = conn.getresponse()
+                body = json.loads(response.read())
+                assert response.status == 200 and body['checks']['audit'] is True
+            finally:
+                conn.close()
         try:
             observability.init(from_env=False, service_name='python-outage', traces=False,
                 metrics=False, otlp_logs=True,
-                otlp_endpoint=f'http://127.0.0.1:{receiver.server_port}')
+                otlp_endpoint=f'http://127.0.0.1:{address[1]}')
+            if readiness:
+                node, health = asyncio.run(start_health())
             start = time.monotonic()
             for i in range(1000):
                 app.warning('python-outage-%s', i)
@@ -839,9 +882,14 @@ def test_application_logs_recover_after_exporter_http503_outage():
             except Exception as e:
                 flush_error = str(e)
             flush_elapsed = time.monotonic() - start
-            assert rejected, 'collector did not observe a refused logs request'
+            if fault != 'refused':
+                assert rejected, 'collector did not observe a failed logs request'
             assert not any(b'python-outage-' in b for b in accepted)
+            assert_ready()  # App OTLP failure does not drop native audit bridge records.
             outage.clear()
+            if fault == 'refused':
+                receiver = ThreadingHTTPServer(address, Collector)
+                thread = start_receiver()
             with tracing.with_trace_context('00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'):
                 app.warning('python-recovered')
             end = time.monotonic() + 10
@@ -857,32 +905,59 @@ def test_application_logs_recover_after_exporter_http503_outage():
             assert b'app.outage' in recovered and b'code.namespace' in recovered and b'code.function' in recovered
             assert bytes.fromhex('4bf92f3577b34da6a3ce929d0e0e4736') in recovered
             assert bytes.fromhex('00f067aa0ba902b7') in recovered
-            outage.set()
-            app.warning('python-outage-shutdown')
-            start = time.monotonic()
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter('always')
-                held = observability.shutdown(timeout=1)
-            shutdown_elapsed = time.monotonic() - start
-            print(json.dumps({'emission': emission, 'flush_elapsed': flush_elapsed,
-                'flush_error': flush_error, 'rejected': len(rejected),
-                'shutdown_elapsed': shutdown_elapsed, 'held': held,
-                'released': _aster.observability_refs() == 0,
-                'feedback': any('python-outage-' in m or 'python-recovered' in m for m in bridge),
-                'only_runtime_warnings': all(w.category is RuntimeWarning for w in caught)}))
+            assert_ready()
+            result = {'emission': emission, 'flush_elapsed': flush_elapsed,
+                'flush_error': flush_error, 'fault': fault, 'rejected': len(rejected),
+                'feedback': any('python-outage-' in m or 'python-recovered' in m for m in bridge)}
+            if not readiness:
+                outage.set()
+                if fault == 'refused':
+                    receiver.shutdown()
+                    receiver.server_close()
+                    thread.join(timeout=2)
+                    thread = None
+                app.warning('python-outage-shutdown')
+                start = time.monotonic()
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter('always')
+                    held = observability.shutdown(timeout=1)
+                result.update(shutdown_elapsed=time.monotonic() - start, held=held,
+                    released=_aster.observability_refs() == 0,
+                    only_runtime_warnings=all(w.category is RuntimeWarning for w in caught))
+            print(json.dumps(result))
         finally:
             outage.clear()
+            asyncio.run(stop_health())
             observability.shutdown(timeout=1)
-            receiver.shutdown()
+            if thread is not None:
+                receiver.shutdown()
             receiver.server_close()
-            thread.join(timeout=2)
-        """
+            if thread is not None:
+                thread.join(timeout=2)
+        """.replace('FAULT_MODE', fault).replace('READINESS_MODE', repr(readiness))
     )
+    return out
+
+
+@pytest.mark.parametrize('fault', ['http503', 'refused', 'stall'])
+def test_application_logs_recover_after_exporter_outage(fault):
+    out = _application_log_fault_result(fault)
     assert out['emission'] < 1
     assert out['flush_elapsed'] < 3 and out['flush_error']
-    assert out['rejected'] > 0
+    assert out['fault'] == 'refused' or out['rejected'] > 0
     assert out['shutdown_elapsed'] < 3
     assert out['held'] and out['released'] and out['only_runtime_warnings']
+    assert not out['feedback']
+
+
+@pytest.mark.parametrize('fault', ['http503', 'refused', 'stall'])
+def test_exporter_outage_preserves_native_audit_readiness(fault):
+    # A live health server deliberately retains a native pipeline owner.
+    # Its process checks readiness only; final exporter teardown has its own case.
+    out = _application_log_fault_result(fault, readiness=True)
+    assert out['emission'] < 1
+    assert out['flush_elapsed'] < 3 and out['flush_error']
+    assert out['fault'] == 'refused' or out['rejected'] > 0
     assert not out['feedback']
 
 

@@ -190,7 +190,17 @@ public static class AsterObservability
         {
             ActivityBridge.Stop();
             LogBridge.Stop(TimeSpan.FromSeconds(1));
-            while (Native.aster_observability_shutdown(ms) == 0) held = true;
+            while (true)
+            {
+                int status = Native.aster_observability_shutdown(ms);
+                if (status == (int)Status.Timeout)
+                {
+                    held = true; // Native consumed the reference; shutdown continues in the background.
+                    break;
+                }
+                if (status != 0) break;
+                held = true;
+            }
             s_refs = 0;
             s_auto = false;
         }

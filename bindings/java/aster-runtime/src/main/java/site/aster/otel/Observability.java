@@ -198,8 +198,12 @@ public final class Observability {
       try {
         while (true) {
           int status = (int) OtelNative.OBSERVABILITY_SHUTDOWN.invoke((int) timeout.toMillis());
+          if (status == IrohStatus.TIMEOUT.code) {
+            held = true; // Native consumed the reference; shutdown continues in the background.
+            break;
+          }
           if (status != IrohStatus.OK.code) {
-            break; // ALREADY_CLOSED: none left; TIMEOUT: finishes in the background
+            break; // ALREADY_CLOSED: none left
           }
           held = true;
         }
