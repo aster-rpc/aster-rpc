@@ -1072,6 +1072,24 @@ impl CallTable {
             Ok(())
         })
     }
+
+    /// Abandon every live call, returning how many were asked to terminate.
+    /// Callback bridges use this when their foreign runtime is no longer
+    /// reachable, so callers receive a terminal INTERNAL response instead of
+    /// waiting on events that cannot be delivered.
+    pub fn abandon_all(&self) -> usize {
+        let calls: Vec<_> = self
+            .inner
+            .shards
+            .iter()
+            .flat_map(|shard| shard.lock().unwrap().values().cloned().collect::<Vec<_>>())
+            .collect();
+        let count = calls.len();
+        for call in calls {
+            CallRef(call).abandon();
+        }
+        count
+    }
 }
 
 /// Per-call state. Owned by the table until the call ends; [`CallRef`]s

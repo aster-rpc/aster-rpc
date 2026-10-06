@@ -507,21 +507,12 @@ async fn tsfn_watchdog(sink: std::sync::Weak<TsfnSink>, wake: Arc<tokio::sync::N
             s.stats.rescues.fetch_add(1, Ordering::Relaxed);
             let status = tsfn.call((), ThreadsafeFunctionCallMode::NonBlocking);
             if status != Status::Ok && status != Status::QueueFull {
-                s.stats.failed(status);
-                s.failed.store(true, Ordering::Release);
-                s.scheduled.store(false, Ordering::Release);
-                s.tsfn.lock().unwrap().take();
-                s.close_wake.notify_one();
-                s.discard_queued();
+                s.fail(status);
                 return;
             }
             rescues += 1;
             if rescues >= TSFN_WATCHDOG_RESCUE_LIMIT {
-                s.stats.failed(Status::GenericFailure);
-                s.failed.store(true, Ordering::Release);
-                s.scheduled.store(false, Ordering::Release);
-                s.tsfn.lock().unwrap().take();
-                s.discard_queued();
+                s.fail(Status::GenericFailure);
                 return;
             }
             delay = (delay * 2).min(TSFN_WATCHDOG_MAX);
@@ -576,6 +567,18 @@ impl TsfnStats {
 }
 
 impl TsfnSink {
+    fn fail(&self, status: Status) {
+        self.stats.failed(status);
+        self.failed.store(true, Ordering::Release);
+        self.scheduled.store(false, Ordering::Release);
+        self.tsfn.lock().unwrap().take();
+        self.close_wake.notify_one();
+        if let Some(table) = self.table.get() {
+            table.abandon_all();
+        }
+        self.discard_queued();
+    }
+
     fn lost(&self, ev: &Ev) {
         match ev.kind {
             EVENT_CALL => {
@@ -628,12 +631,7 @@ impl TsfnSink {
             // be stranded by a runtime lost-wakeup, so arm the watchdog too.
             self.scheduled_wake.notify_one();
         } else {
-            self.stats.failed(status);
-            self.failed.store(true, Ordering::Release);
-            self.scheduled.store(false, Ordering::Release);
-            self.tsfn.lock().unwrap().take();
-            self.close_wake.notify_one();
-            self.discard_queued();
+            self.fail(status);
         }
     }
 }

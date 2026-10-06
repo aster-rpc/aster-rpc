@@ -663,6 +663,39 @@ async fn undersized_entity_budget_rejects_before_dispatch_without_stalling() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoning_all_calls_returns_a_terminal_error_and_releases_admission() {
+    let (sink, mut consumer) = RingSink::new_with_limit(1, 1);
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .dispatch_sink(sink)
+        .dynamic_service(echo_service())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let table = srv.call_table();
+    let (_client, conn) = client(&srv).await;
+    let active = conn.clone();
+    let pending = tokio::spawn(async move { active.unary(&echo("park"), vec![1]).await });
+    consumer.ready().await;
+    let mut call_id = None;
+    consumer.drain(1, |event| match event {
+        DispatchEvent::Call(call) => {
+            call_id = Some(call.handle.detach());
+        }
+        other => panic!("expected Call, got {other:?}"),
+    });
+    assert!(call_id.is_some());
+
+    assert_eq!(table.abandon_all(), 1);
+    let (code, message) = rpc_code(within(pending).await.unwrap());
+    assert_eq!(code, StatusCode::Internal.as_i32());
+    assert!(message.contains("handler dropped call"));
+    assert!(table.is_empty());
+    srv.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn all_four_patterns_over_a_foreign_service() {
     let Setup { srv, binding } = start().await;
     let (_client, conn) = client(&srv).await;
