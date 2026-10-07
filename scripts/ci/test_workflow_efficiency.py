@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -26,6 +27,7 @@ class RuntimeGates(unittest.TestCase):
                 calls.append(argv)
                 self.assertFalse(stale.exists())
                 self.assertIn('aster::lease::diagnostic=debug', kwargs['env']['ASTER_LOG'])
+                self.assertIn('aster::coordination::diagnostic=debug', kwargs['env']['ASTER_LOG'])
                 return subprocess.CompletedProcess(argv, 1 if len(calls) == 1 else 0)
             output = root / 'out.json'
             self.assertEqual(R.run(root, output, root, invoke), 1)
@@ -48,6 +50,51 @@ class RuntimeGates(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0)
             self.assertEqual(R.run(root, root / 'out.json', root, invoke), 1)
             self.assertEqual([c[0] for c in calls[-2:]], ['bun', 'bun'])
+
+    def test_failed_vitest_retains_fresh_full_report_and_all_runtimes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / 'runtime-evidence/typescript.json'
+            output.parent.mkdir()
+            retained = output.parent / 'vitest.json'
+            retained.write_text('stale')
+            fresh = json.dumps({'success': False, 'testResults': [{'message': 'full coordination error'}]})
+            calls = []
+            def invoke(argv, **kwargs):
+                calls.append(argv)
+                if len(calls) == 1:
+                    self.assertFalse(retained.exists())
+                    (root / 'o7-vitest.json').write_text(fresh)
+                return subprocess.CompletedProcess(argv, 1 if len(calls) == 1 else 0)
+            self.assertEqual(R.run(root, output, root, invoke), 1)
+            self.assertEqual(retained.read_text(), fresh)
+            self.assertEqual(len(calls), 5)
+            # A later failed invocation without a fresh report cannot retain
+            # the previous run's diagnostic as current evidence.
+            self.assertEqual(R.run(root, output, root, lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1)), 1)
+            self.assertFalse(retained.exists())
+
+    def test_runtime_is_after_core_and_before_expensive_release_producers(self):
+        workflow = (ROOT / '.forgejo/workflows/linux.yml').read_text()
+        matches = list(re.finditer(r'^  ([\w-]+):$', workflow[workflow.index('\njobs:'):], re.M))
+        body = workflow[workflow.index('\njobs:'):]
+        blocks = {match[1]: body[match.end():matches[index+1].start() if index+1 < len(matches) else len(body)] for index, match in enumerate(matches)}
+        dependencies = {}
+        for job, block in blocks.items():
+            need = re.search(r'^    needs: (.+)$', block, re.M)
+            dependencies[job] = set(re.findall(r'[\w-]+', need[1])) if need else set()
+        def ancestors(job, stack=()):
+            self.assertNotIn(job, stack, 'candidate dependency cycle')
+            self.assertIn(job, dependencies, 'unknown dependency')
+            return dependencies[job] | set().union(*(ancestors(parent, (*stack, job)) for parent in dependencies[job]))
+        for job in dependencies:
+            ancestors(job)
+        self.assertEqual(dependencies['typescript'], {'test'})
+        for job in ('build-linux-arm64-wheel', 'build-windows-wheel', 'ffi-release-linux', 'ffi-natives-cross', 'npm-native-linux-x64', 'npm-native-cross', 'npm-native-darwin', 'mobile-ios', 'mobile-android', 'nightly-sanitize', 'nightly-miri'):
+            self.assertTrue({'test', 'typescript'} <= ancestors(job), job)
+        ts = blocks['typescript']
+        self.assertIn('--features coordination-fixture,test-hooks --bin aster-coordination-fixture', ts)
+        self.assertLess(ts.index('run: bun run build\n'), ts.index('run: bun run build:test-hooks'))
 
     def test_actual_o7_checker_accepts_full_report_and_rejects_missing_failed_cases(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import time
 
@@ -24,8 +25,11 @@ def gates(root, temporary):
 def run(root, output, temporary, invoke=subprocess.run):
     # A fresh file prevents a failed O7 invocation consuming stale counts.
     (temporary / "o7-vitest.json").unlink(missing_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report_copy = output.parent / "vitest.json"
+    report_copy.unlink(missing_ok=True)
     outcomes = {"schema": 1, "sha": os.environ.get("FORGEJO_SHA"), "run_id": os.environ.get("FORGEJO_RUN_ID"), "attempt": os.environ.get("FORGEJO_RUN_ATTEMPT"), "runtimes": {"node": [], "bun": []}}
-    env = {**os.environ, "ASTER_LOG_STDERR": "1", "ASTER_LOG": "warn,aster::lease::diagnostic=debug"}
+    env = {**os.environ, "ASTER_LOG_STDERR": "1", "ASTER_LOG": "warn,aster::lease::diagnostic=debug,aster::coordination::diagnostic=debug"}
     failed = False
     for runtime, name, cwd, argv in gates(root, temporary):
         print(f"::group::{runtime}: {name}", flush=True)
@@ -38,7 +42,9 @@ def run(root, output, temporary, invoke=subprocess.run):
         outcomes["runtimes"][runtime].append({"gate": name, "exit_code": code, "seconds": round(time.monotonic() - started, 3)})
         failed |= code != 0
         print("::endgroup::", flush=True)
-    output.parent.mkdir(parents=True, exist_ok=True)
+    report = temporary / "o7-vitest.json"
+    if report.is_file():
+        shutil.copyfile(report, report_copy)
     output.write_text(json.dumps(outcomes, indent=2) + "\n")
     return int(failed)
 
