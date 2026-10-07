@@ -268,24 +268,27 @@ describe.skipIf(!hasDispatch)('DispatchServer ring delivery close', () => {
     const conn = await peer.connectNodeAddr(node.nodeId(), RPC_ALPN, node.directAddresses(), undefined);
     const transport = new IrohTransport(conn, BYTES as any);
     try {
+      // Close may reject either call before its own await resumes. Attach both
+      // outcome handlers when the calls are created, before any intervening await.
+      const outcome = (p: Promise<unknown>) => p.then(
+        () => 'answered',
+        (e) => (e instanceof RpcError ? e.code : String(e)),
+      );
       // One call taken by JS and left unanswered, one never taken.
-      const taken = transport.unary('test.Echo', 'echo', Buffer.from('taken'));
+      const taken = outcome(transport.unary('test.Echo', 'echo', Buffer.from('taken')));
       const first: DispatchEvent[] = await server.nextBatch(1);
       expect(first.map((e) => e.kind)).toEqual([DispatchEventKind.Call]);
-      const unread = transport.unary('test.Echo', 'echo', Buffer.from('unread'));
+      const unread = outcome(transport.unary('test.Echo', 'echo', Buffer.from('unread')));
       await until(() => server.liveCalls() === 2);
       await server.close();
       // The node stays up (attached), so only close can end these calls.
-      const outcome = (p: Promise<unknown>) =>
-        Promise.race([
-          p.then(
-            () => 'answered',
-            (e) => (e instanceof RpcError ? e.code : String(e)),
-          ),
-          new Promise((r) => setTimeout(() => r('hung'), 5000)),
-        ]);
-      expect(await outcome(taken)).toBe(StatusCode.INTERNAL);
-      expect(await outcome(unread)).toBe(StatusCode.INTERNAL);
+      // Keep the original post-close five-second outcome budget.
+      const bounded = (p: Promise<unknown>) => Promise.race([
+        p,
+        new Promise((r) => setTimeout(() => r('hung'), 5000)),
+      ]);
+      expect(await bounded(taken)).toBe(StatusCode.INTERNAL);
+      expect(await bounded(unread)).toBe(StatusCode.INTERNAL);
       expect(server.liveCalls()).toBe(0);
     } finally {
       try { conn.close(0, 'done'); } catch { /* ignore */ }
