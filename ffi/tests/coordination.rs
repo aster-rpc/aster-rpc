@@ -219,6 +219,26 @@ fn shared() -> &'static Shared {
     })
 }
 
+/// A ROOT client shared by tests that need ROOT only to set up grants.
+///
+/// The group caps active (unretired) client ids at eight per actor (§12.1,
+/// `MAX_ACTIVE_CLIENTS_PER_ACTOR`), and nothing in this binary retires one, so
+/// every ROOT journal that mutates holds one of the eight for the whole
+/// process. Past the cap, ROOT mutations are refused with retryable
+/// `ActiveClientCap` until the driver's attempt budget runs out, in whichever
+/// test happens to come later. This client holds one; each test that opens its
+/// own mutating ROOT journal holds another (six do). Never closed or freed;
+/// `grant` serializes its use.
+fn grant_root() -> aster_coordination_client_t {
+    static ROOT: OnceLock<(aster_coordination_client_t, tempfile::TempDir)> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let Shared { rt, root_node } = *shared();
+        let dir = tempfile::tempdir().unwrap();
+        (unsafe { open(rt, root_node, Some(dir.path())) }, dir)
+    })
+    .0
+}
+
 fn runtime() -> aster_runtime_t {
     let mut rt = 0;
     let cfg = aster_runtime_config_t {
@@ -416,6 +436,10 @@ unsafe fn grant(
     r: &ResourceKeyV1,
     actor: [u8; 32],
 ) {
+    // A journal holds one unacknowledged result at a time, and tests grant
+    // concurrently through the shared `grant_root` client.
+    static GRANTS: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
     let acl =
         codec::decode_acl_status(&read(rt, root, &ReadRequest::InspectAcl(r.clone()))).unwrap();
     let reply = mutate_ack(
@@ -967,9 +991,8 @@ fn an_acl_refusal_is_permission_denied() {
 #[test]
 fn coordination_lease_lifecycle() {
     unsafe {
-        let Shared { rt, root_node } = *shared();
-        let root_dir = tempfile::tempdir().unwrap();
-        let root = open(rt, root_node, Some(root_dir.path()));
+        let Shared { rt, .. } = *shared();
+        let root = grant_root();
         let (w1_node, w2_node) = (
             start_node(rt, actor_secret()),
             start_node(rt, actor_secret()),
@@ -1125,7 +1148,7 @@ fn coordination_lease_lifecycle() {
             INVALID
         );
 
-        for c in [root, w1, w2] {
+        for c in [w1, w2] {
             assert_eq!(aster_coordination_client_free(rt, c), OK);
         }
     }
@@ -1595,9 +1618,8 @@ fn placement_manager_over_foreign_providers() {
 #[test]
 fn a_release_waits_for_an_in_flight_compare_and_set() {
     unsafe {
-        let Shared { rt, root_node } = *shared();
-        let dir = tempfile::tempdir().unwrap();
-        let root = open(rt, root_node, Some(dir.path()));
+        let Shared { rt, .. } = *shared();
+        let root = grant_root();
         let w_node = start_node(rt, actor_secret());
         let wdir = tempfile::tempdir().unwrap();
         let w = open(rt, w_node, Some(wdir.path()));
@@ -1649,7 +1671,7 @@ fn a_release_waits_for_an_in_flight_compare_and_set() {
             assert!(!after.held);
             assert_eq!(after.value.as_deref(), Some(&value[..]));
         }
-        for c in [root, w] {
+        for c in [w] {
             assert_eq!(aster_coordination_client_free(rt, c), OK);
         }
     }
@@ -1890,9 +1912,8 @@ fn a_cancelled_open_does_not_keep_the_journal() {
 #[test]
 fn a_cancelled_lease_acquire_stops_renewing() {
     unsafe {
-        let Shared { rt, root_node } = *shared();
-        let root_dir = tempfile::tempdir().unwrap();
-        let root = open(rt, root_node, Some(root_dir.path()));
+        let Shared { rt, .. } = *shared();
+        let root = grant_root();
         let (w1_node, w2_node) = (
             start_node(rt, actor_secret()),
             start_node(rt, actor_secret()),
@@ -1938,7 +1959,7 @@ fn a_cancelled_lease_acquire_stops_renewing() {
         let ev = finish(rt, op).expect(E_LEASE);
         assert_ne!(ev.ev.handle, 0, "the cancelled holder still renews");
         assert_eq!(aster_coordination_lease_free(rt, ev.ev.handle), OK);
-        for c in [w1, w2, root] {
+        for c in [w1, w2] {
             assert_eq!(aster_coordination_client_free(rt, c), OK);
         }
     }
