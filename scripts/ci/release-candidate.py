@@ -14,11 +14,14 @@ import glob
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
+import zipfile
 from urllib.parse import urlencode
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -79,7 +82,7 @@ def file_map(root: Path) -> dict[str, str]:
     return found
 
 
-def record(artifact: str, path_pattern: str, output: Path, job: str, matrix: str) -> None:
+def record(artifact: str, path_pattern: str, output: Path, job: str, matrix: str, recipe: dict | None = None) -> None:
     if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
         fail("candidate provenance must come from the first job attempt")
     safe_name(artifact)
@@ -112,12 +115,138 @@ def record(artifact: str, path_pattern: str, output: Path, job: str, matrix: str
     evidence = {**identity(), "artifact": artifact, "job": job, "matrix": json.loads(matrix) or {}, "attempt": 1,
                 "tools": tools, "files": files,
                 "build_environment": {k: os.environ.get(k, "") for k in ("RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_RELEASE_DEBUG")}}
+    if recipe is not None:
+        validate_recipe(recipe)
+        if recipe["lock_sha256"] != evidence["source_hashes"]["Cargo.lock"]:
+            fail("recorded native recipe differs from committed lock inputs")
+        evidence["build_recipe"] = recipe
     output.mkdir(parents=True, exist_ok=True)
     (output / f"{artifact}.json").write_text(json.dumps(evidence, indent=2) + "\n")
 
 
 def read_json(path: Path):
     return json.loads(path.read_text())
+
+
+def validate_recipe(recipe: dict) -> None:
+    base_keys = {"schema", "kind", "package", "profile", "default_features", "features", "target", "target_mode",
+                 "rustc", "cargo", "lock_sha256", "environment", "host_runtime"}
+    python_keys = {"python", "python_abi", "maturin"} if recipe.get("kind") == "python-wheel" else set()
+    if set(recipe) != base_keys | python_keys or recipe.get("schema") != 1:
+        fail("native recipe schema/inventory mismatch")
+    if (recipe["kind"], recipe["package"]) not in (("python-wheel", "aster_rs"), ("ffi", "aster_transport_ffi")):
+        fail("unsupported reusable native product")
+    if recipe["profile"] != "release" or recipe["default_features"] is not True or recipe["target_mode"] != "host":
+        fail("reuse currently supports only default-feature release host products")
+    expected_features = ["pyo3/extension-module"] if python_keys else []
+    if recipe["features"] != expected_features or not re.fullmatch(r"[a-z0-9_]+-[a-z0-9_-]+", recipe["target"]):
+        fail("native recipe feature/target mismatch")
+    if not all(isinstance(recipe[key], str) and recipe[key] for key in ("rustc", "cargo", "lock_sha256")):
+        fail("native recipe lacks compiler/lock evidence")
+    if not re.fullmatch(r"[0-9a-f]{64}", recipe["lock_sha256"]) or "host: " + recipe["target"] not in recipe["rustc"].splitlines():
+        fail("native recipe compiler host/lock mismatch")
+    if not isinstance(recipe["environment"], dict):
+        fail("native recipe lacks build environment")
+    if not isinstance(recipe["host_runtime"], dict) or set(recipe["host_runtime"]) != {"machine", "system", "libc"}:
+        fail("native recipe lacks host runtime")
+    if python_keys and (recipe["python_abi"] != "abi3-py39" or not isinstance(recipe["python"], dict)
+                        or set(recipe["python"]) != {"implementation", "version", "cache_tag", "machine", "libc"}
+                        or recipe["python"]["implementation"] != "cpython" or not recipe["maturin"]):
+        fail("native recipe lacks Python ABI/interpreter evidence")
+
+
+def build_recipe(kind: str, package: str, profile: str, features: str,
+                 target: str, interpreter: str | None, maturin: str | None) -> dict:
+    """Describe one native build command, not the workspace's unified test graph."""
+    if (kind, package) not in (("python-wheel", "aster_rs"), ("ffi", "aster_transport_ffi")):
+        fail("unsupported reusable native product")
+    rustc = subprocess.check_output(["rustc", "-vV"], text=True).strip()
+    host = next(line.removeprefix("host: ") for line in rustc.splitlines() if line.startswith("host: "))
+    resolved_target = host if target == "host" else target
+    if target == "host" and os.environ.get("CARGO_BUILD_TARGET", host) != host:
+        fail("host recipe cannot describe an implicit cross-target build")
+    environment = {key: os.environ.get(key, "") for key in
+                   ("RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET",
+                    "CC", "CXX", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "AR",
+                    "PYO3_USE_ABI3_FORWARD_COMPATIBILITY", "PYO3_NO_PYTHON")}
+    environment.update({key: value for key, value in sorted(os.environ.items())
+                        if key.startswith("CARGO_PROFILE_" + profile.upper() + "_")
+                        or (key.startswith("CARGO_TARGET_") and key != "CARGO_TARGET_DIR")})
+    # Cross-Python config and external linker/config files need additional input
+    # hashing; none belongs to the host products currently shared by this DAG.
+    if any(os.environ.get(key) for key in ("PYO3_CONFIG_FILE", "PYO3_CROSS", "PYO3_CROSS_LIB_DIR",
+                                          "PYO3_CROSS_PYTHON_VERSION", "PYO3_CROSS_PYTHON_IMPLEMENTATION")):
+        fail("external/cross Python configuration is not a reusable host recipe")
+    recipe = {"schema": 1, "kind": kind, "package": package, "profile": profile,
+              "default_features": True, "features": sorted(set(filter(None, features.split(",")))),
+              "target": resolved_target, "target_mode": "host" if target == "host" else "explicit",
+              "rustc": rustc, "cargo": subprocess.check_output(["cargo", "--version"], text=True).strip(),
+              "lock_sha256": source_hashes()["Cargo.lock"], "environment": environment,
+              "host_runtime": {"machine": platform.machine(), "system": sys.platform, "libc": list(platform.libc_ver())}}
+    if kind == "python-wheel":
+        if not interpreter or not maturin or resolved_target != host:
+            fail("wheel recipe requires host interpreter and Maturin")
+        code = "import json,platform,sys; print(json.dumps({'implementation':sys.implementation.name,'version':sys.version,'cache_tag':sys.implementation.cache_tag,'machine':platform.machine(),'libc':platform.libc_ver()}))"
+        recipe["python"] = json.loads(subprocess.check_output([interpreter, "-c", code], text=True))
+        recipe["python_abi"] = "abi3-py39"
+        recipe["maturin"] = subprocess.check_output([maturin, "--version"], text=True).strip()
+    elif interpreter or maturin:
+        fail("FFI recipe has no Python build inputs")
+    validate_recipe(recipe)
+    return recipe
+
+
+def verify_input(root: Path, evidence: dict, artifact: str, job: str, recipe: dict) -> None:
+    """Reject a mismatched intra-run handoff before a consumer installs/loads it."""
+    if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
+        fail("native reuse requires a first-attempt consumer")
+    safe_name(artifact)
+    expected = identity()
+    validate_recipe(recipe)
+    for key, value in expected.items():
+        if evidence.get(key) != value:
+            fail(f"reused input has mismatched {key}")
+    if evidence.get("artifact") != artifact or evidence.get("job") != job:
+        fail("reused input has wrong artifact or producer")
+    if evidence.get("attempt") != 1 or evidence.get("matrix") != {}:
+        fail("reused host input has wrong attempt or matrix")
+    if evidence.get("build_recipe") != recipe or recipe.get("lock_sha256") != expected["source_hashes"]["Cargo.lock"]:
+        fail("reused input has mismatched native build recipe")
+    if root.is_symlink() or not root.is_dir() or file_map(root) != evidence.get("files"):
+        fail("reused input checksum/inventory mismatch")
+    if recipe["kind"] == "ffi":
+        libraries = [path for path in root.iterdir() if path.name in ("libaster_transport_ffi.so", "libaster_transport_ffi.dylib")]
+        if len(libraries) != 1:
+            fail("reused FFI input must contain exactly one host native library")
+        code = "import ctypes,sys; lib=ctypes.CDLL(sys.argv[1]); lib.aster_version.restype=ctypes.c_char_p; print(lib.aster_version().decode())"
+        native_version = subprocess.check_output([sys.executable, "-c", code, str(libraries[0].resolve())], text=True).strip()
+        if native_version != expected["version"]:
+            fail("reused FFI native version differs from exact candidate")
+
+
+def verify_python_install(wheel: Path, interpreter: str) -> None:
+    """Prove tests import the wheel's Python and native bytes, at this exact version."""
+    code = "import aster,aster._aster,importlib.metadata,json; d=importlib.metadata.distribution('aster-rpc'); print(json.dumps({'package':aster.__file__,'distribution_package':str(d.locate_file('aster/__init__.py')),'native':aster._aster.__file__,'version':aster.VERSION,'native_version':aster._aster.VERSION,'distribution_version':d.version}))"
+    installed = json.loads(subprocess.check_output([interpreter, "-c", code], text=True))
+    if any(installed[key] != identity()["version"] for key in ("version", "native_version", "distribution_version")):
+        fail("installed Python/native version differs from exact candidate")
+    package = Path(installed["package"]).parent
+    if Path(installed["package"]) != Path(installed["distribution_package"]):
+        fail("Python source shadows the installed wheel")
+    native = Path(installed["native"])
+    with zipfile.ZipFile(wheel) as archive:
+        files = [name for name in archive.namelist() if name.startswith("aster/") and not name.endswith("/")]
+        if not files or "aster/__init__.py" not in files or "aster/" + native.name not in files:
+            fail("wheel lacks the imported package/native payload")
+        for name in files:
+            relative = PurePosixPath(name).relative_to("aster")
+            if ".." in relative.parts:
+                fail("unsafe wheel package path")
+            path = package.joinpath(*relative.parts)
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != archive.read(name):
+                fail(f"installed Python payload differs from wheel: {name}")
+        if native.parent != package:
+            fail("imported native module is outside installed package")
 
 
 def verify_payload(root: Path, manifest: dict, expected: dict, policy: dict) -> None:
@@ -410,6 +539,25 @@ def main() -> None:
     rec.add_argument("--output", type=Path, default=Path("ci-evidence"))
     rec.add_argument("--job", required=True)
     rec.add_argument("--matrix", default="{}")
+    rec.add_argument("--recipe", type=Path)
+    recipe_args = sub.add_parser("build-recipe")
+    recipe_args.add_argument("--kind", choices=("python-wheel", "ffi"), required=True)
+    recipe_args.add_argument("--package", required=True)
+    recipe_args.add_argument("--profile", choices=("release",), default="release")
+    recipe_args.add_argument("--features", default="")
+    recipe_args.add_argument("--target", default="host")
+    recipe_args.add_argument("--interpreter")
+    recipe_args.add_argument("--maturin")
+    recipe_args.add_argument("--output", type=Path, required=True)
+    reuse = sub.add_parser("verify-input")
+    reuse.add_argument("--artifact", required=True)
+    reuse.add_argument("--path", type=Path, required=True)
+    reuse.add_argument("--evidence", type=Path, required=True)
+    reuse.add_argument("--job", required=True)
+    reuse.add_argument("--recipe", type=Path, required=True)
+    installed = sub.add_parser("verify-python-install")
+    installed.add_argument("--wheel", type=Path, required=True)
+    installed.add_argument("--interpreter", required=True)
     seal_args = sub.add_parser("seal")
     seal_args.add_argument("--handoff", type=Path, default=Path("handoff"))
     seal_args.add_argument("--output", type=Path, default=Path("candidate"))
@@ -421,7 +569,15 @@ def main() -> None:
     sub.add_parser("check-api")
     args = parser.parse_args()
     if args.command == "record":
-        record(args.artifact, args.path, args.output, args.job, args.matrix)
+        record(args.artifact, args.path, args.output, args.job, args.matrix, read_json(args.recipe) if args.recipe else None)
+    elif args.command == "build-recipe":
+        recipe = build_recipe(args.kind, args.package, args.profile, args.features, args.target, args.interpreter, args.maturin)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(recipe, indent=2) + "\n")
+    elif args.command == "verify-input":
+        verify_input(args.path, read_json(args.evidence), args.artifact, args.job, read_json(args.recipe))
+    elif args.command == "verify-python-install":
+        verify_python_install(args.wheel, args.interpreter)
     elif args.command == "seal":
         seal(args.handoff, args.output, json.loads(os.environ["CANDIDATE_NEEDS"]))
     elif args.command == "fetch":

@@ -59,6 +59,156 @@ class API:
         return io.BytesIO(self.bytes[Path(path).name])
 
 
+class NativeReuseTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.payload = self.root / "input"
+        self.payload.mkdir()
+        (self.payload / "libaster_transport_ffi.so").write_bytes(b"exact-native")
+        self.recipe = {"schema": 1, "kind": "ffi", "package": "aster_transport_ffi", "profile": "release",
+                       "default_features": True, "features": [], "target": "x86_64-unknown-linux-gnu", "target_mode": "host",
+                       "rustc": "rustc 1.96.0\nhost: x86_64-unknown-linux-gnu", "cargo": "cargo 1.96.0",
+                       "lock_sha256": "b" * 64, "environment": {},
+                       "host_runtime": {"machine": "x86_64", "system": "linux", "libc": ["glibc", "2.39"]}}
+        self.evidence = {**deepcopy(IDENTITY), "artifact": "native-linux-27", "job": "ffi-release-linux",
+                         "attempt": 1, "matrix": {}, "build_recipe": deepcopy(self.recipe), "files": C.file_map(self.payload)}
+
+    def verify(self):
+        with patch.object(C, "identity", return_value=deepcopy(IDENTITY)), patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "1"}), patch.object(C.subprocess, "check_output", return_value=IDENTITY["version"]):
+            C.verify_input(self.payload, self.evidence, "native-linux-27", "ffi-release-linux", self.recipe)
+
+    def test_exact_intra_run_payload_is_reusable(self):
+        self.verify()
+
+    def test_record_embeds_recipe_and_rejects_lock_mismatch(self):
+        output = self.root / "evidence"
+        with patch.object(C, "identity", return_value=deepcopy(IDENTITY)), patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "1"}), patch.object(C.shutil, "which", return_value=None):
+            C.record("native-linux-27", str(self.payload), output, "ffi-release-linux", "{}", self.recipe)
+            recorded = C.read_json(output / "native-linux-27.json")
+            self.assertEqual(recorded["build_recipe"], self.recipe)
+            self.assertEqual(recorded["files"], self.evidence["files"])
+            with self.assertRaisesRegex(ValueError, "lock"):
+                C.record("native-linux-27", str(self.payload), output, "ffi-release-linux", "{}", {**self.recipe, "lock_sha256": "c" * 64})
+
+    def test_matching_record_does_not_hide_stale_native_ffi_version(self):
+        with patch.object(C, "identity", return_value=deepcopy(IDENTITY)), patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "1"}), patch.object(C.subprocess, "check_output", return_value="0.3.775"):
+            with self.assertRaisesRegex(ValueError, "native version"):
+                C.verify_input(self.payload, self.evidence, "native-linux-27", "ffi-release-linux", self.recipe)
+
+    def test_old_commit_version_lock_run_or_producer_rejected_before_use(self):
+        for key, wrong in (("sha", "c" * 40), ("version", "0.3.775"), ("run_id", 43), ("run_number", 28),
+                           ("source_hashes", {"Cargo.lock": "bad"}), ("workflow", "old.yml"),
+                           ("artifact", "other-27"), ("job", "ffi-java"), ("attempt", 2), ("matrix", {"target": "arm64"})):
+            before = deepcopy(self.evidence)
+            self.evidence[key] = wrong
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.verify()
+            self.evidence = before
+
+    def test_different_profile_features_target_flags_compiler_or_runtime_rejected(self):
+        for key, wrong in (("profile", "dev"), ("features", ["coordination-fixture"]), ("target", "aarch64-unknown-linux-gnu"),
+                           ("target_mode", "explicit"), ("rustc", "rustc different"), ("cargo", "cargo different"),
+                           ("lock_sha256", "c" * 64), ("environment", {"RUSTFLAGS": "-C target-cpu=native"}),
+                           ("host_runtime", {"machine": "x86_64", "system": "linux", "libc": ["glibc", "2.40"]})):
+            before = deepcopy(self.evidence)
+            self.evidence["build_recipe"][key] = wrong
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "recipe"):
+                self.verify()
+            self.evidence = before
+
+    def test_missing_recipe_corrupt_extra_missing_or_symlink_payload_rejected(self):
+        del self.evidence["build_recipe"]
+        with self.assertRaises(ValueError):
+            self.verify()
+        self.evidence["build_recipe"] = deepcopy(self.recipe)
+        library = self.payload / "libaster_transport_ffi.so"
+        for mutation in (lambda: library.write_bytes(b"wrong"), lambda: library.unlink(),
+                         lambda: library.symlink_to("/etc/passwd")):
+            mutation()
+            with self.assertRaises(ValueError):
+                self.verify()
+        library.unlink()
+        library.write_bytes(b"exact-native")
+        (self.payload / "unexpected").write_bytes(b"extra")
+        with self.assertRaises(ValueError):
+            self.verify()
+
+    def test_consumer_retry_and_untyped_recipe_rejected(self):
+        with patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "2"}), self.assertRaises(ValueError):
+            C.verify_input(self.payload, self.evidence, "native-linux-27", "ffi-release-linux", self.recipe)
+        for mutation in ({}, {**self.recipe, "extra": True}, {**self.recipe, "profile": "dev"},
+                         {**self.recipe, "features": ["coordination-fixture"]}, {**self.recipe, "lock_sha256": "bad"}):
+            with self.subTest(recipe=mutation), self.assertRaises(ValueError):
+                C.validate_recipe(mutation)
+
+    def test_recipe_captures_exact_interpreter_maturin_and_compiler_inputs(self):
+        python = {"implementation": "cpython", "version": "3.13.8", "cache_tag": "cpython-313", "machine": "x86_64", "libc": ["glibc", "2.39"]}
+        def command(args, **kwargs):
+            return {"rustc": self.recipe["rustc"], "cargo": self.recipe["cargo"],
+                    "python": json.dumps(python), "maturin": "maturin 1.9.6"}[args[0]]
+        with patch.object(C.subprocess, "check_output", side_effect=command), patch.object(C, "source_hashes", return_value={"Cargo.lock": "b" * 64}), patch.dict(os.environ, {"RUSTFLAGS": "-C debuginfo=1", "CARGO_PROFILE_RELEASE_LTO": "thin"}, clear=True):
+            recipe = C.build_recipe("python-wheel", "aster_rs", "release", "pyo3/extension-module", "host", "python", "maturin")
+        self.assertEqual(recipe["python"], python)
+        self.assertEqual(recipe["maturin"], "maturin 1.9.6")
+        self.assertEqual(recipe["python_abi"], "abi3-py39")
+        self.assertEqual(recipe["environment"]["RUSTFLAGS"], "-C debuginfo=1")
+        self.assertEqual(recipe["environment"]["CARGO_PROFILE_RELEASE_LTO"], "thin")
+
+    def test_python_recipe_requires_all_abi_runtime_fields(self):
+        recipe = {**self.recipe, "kind": "python-wheel", "package": "aster_rs", "features": ["pyo3/extension-module"],
+                  "python_abi": "abi3-py39", "python": {"implementation": "cpython", "version": "3.13.8", "cache_tag": "cpython-313", "machine": "x86_64", "libc": ["glibc", "2.39"]}, "maturin": "maturin 1.9.6"}
+        C.validate_recipe(recipe)
+        for key, wrong in (("python_abi", "cp313"), ("python", {}), ("maturin", "")):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                C.validate_recipe({**recipe, key: wrong})
+
+    def test_distinct_disposable_output_paths_do_not_change_recipe_but_linker_and_flags_do(self):
+        def command(args, **kwargs):
+            return self.recipe["rustc"] if args[0] == "rustc" else self.recipe["cargo"]
+        def recipe(environment):
+            with patch.object(C.subprocess, "check_output", side_effect=command), patch.object(C, "source_hashes", return_value={"Cargo.lock": "b" * 64}), patch.dict(os.environ, environment, clear=True):
+                return C.build_recipe("ffi", "aster_transport_ffi", "release", "", "host", None, None)
+        producer = recipe({"CARGO_TARGET_DIR": "/cache/targets/producer"})
+        self.assertEqual(producer, recipe({"CARGO_TARGET_DIR": "/cache/targets/consumer"}))
+        for environment in ({"CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "different-linker"}, {"RUSTFLAGS": "-C target-cpu=native"}):
+            with self.subTest(environment=environment):
+                self.assertNotEqual(producer, recipe(environment))
+
+    def test_installed_package_and_native_must_match_wheel_bytes_and_exact_version(self):
+        import zipfile
+        package = self.root / "site-packages/aster"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_bytes(b"python-package")
+        (package / "_aster.so").write_bytes(b"native-payload")
+        wheel = self.root / "aster.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for path in package.iterdir():
+                archive.write(path, "aster/" + path.name)
+        installed = {"package": str(package / "__init__.py"), "distribution_package": str(package / "__init__.py"),
+                     "native": str(package / "_aster.so"), "version": IDENTITY["version"],
+                     "native_version": IDENTITY["version"], "distribution_version": IDENTITY["version"]}
+        with patch.object(C, "identity", return_value=IDENTITY), patch.object(C.subprocess, "check_output", side_effect=lambda *a, **k: json.dumps(installed)):
+            C.verify_python_install(wheel, "python")
+            for key in ("version", "native_version", "distribution_version"):
+                installed[key] = "0.3.775"
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    C.verify_python_install(wheel, "python")
+                installed[key] = IDENTITY["version"]
+            installed["distribution_package"] = str(self.root / "shadowed/__init__.py")
+            with self.assertRaisesRegex(ValueError, "shadows"):
+                C.verify_python_install(wheel, "python")
+            installed["distribution_package"] = installed["package"]
+            for name in ("__init__.py", "_aster.so"):
+                path = package / name
+                before = path.read_bytes()
+                path.write_bytes(b"replacement")
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "payload differs"):
+                    C.verify_python_install(wheel, "python")
+                path.write_bytes(before)
+
+
 class CandidateTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -222,6 +372,18 @@ class CandidateTests(unittest.TestCase):
         evidence = handoff / "ci-evidence-linux-27"
         evidence.mkdir()
         (evidence / "native-linux-27.json").write_text(json.dumps(self.manifest["artifacts"]["native-linux-27"]))
+        # Intra-run wheel handoff is verified by consumers, but is not a second
+        # release product. Nested recipe sidecars are not artifact attestations.
+        internal = handoff / "tested-python-linux-27"
+        internal.mkdir()
+        (internal / "aster.whl").write_bytes(b"tested-wheel")
+        internal_evidence = handoff / "ci-evidence-test-27"
+        internal_evidence.mkdir()
+        (internal_evidence / "tested-python-linux-27.json").write_text(json.dumps(
+            {**IDENTITY, "artifact": "tested-python-linux-27", "job": "test", "attempt": 1,
+             "files": {"aster.whl": C.digest(internal / "aster.whl")}}))
+        (internal_evidence / "recipes").mkdir()
+        (internal_evidence / "recipes/python-wheel.json").write_text(json.dumps({"schema": 1}))
         policy = self.root / "policy.json"
         policy.write_text(json.dumps(POLICY))
         with patch.object(C, "POLICY_PATH", policy), patch.object(C, "identity", return_value=IDENTITY), patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "1"}):
