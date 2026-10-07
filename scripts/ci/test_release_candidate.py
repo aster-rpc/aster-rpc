@@ -23,8 +23,8 @@ C = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(C)
 SHA = "a" * 40
 IDENTITY = {"schema": 1, "repository": C.REPOSITORY, "sha": SHA, "version": "0.3.776",
-            "workflow": "linux.yml", "source_hashes": {"Cargo.lock": "b" * 64}, "run_id": 42, "run_number": 27}
-POLICY = {"required_jobs": ["linux", "macos"], "required_artifacts": {"native-linux": {"job": "linux", "matrix": {"target": "x86_64-unknown-linux-gnu"}}}}
+            "assurance_profile": "standard", "workflow": "linux.yml", "source_hashes": {"Cargo.lock": "b" * 64}, "run_id": 42, "run_number": 27}
+POLICY = {"assurance_profile": "standard", "optional_assurance_jobs": [], "full_assurance_artifacts": {}, "required_jobs": ["linux", "macos"], "required_artifacts": {"native-linux": {"job": "linux", "matrix": {"target": "x86_64-unknown-linux-gnu"}}}}
 
 
 def run_fixture(**updates):
@@ -219,7 +219,7 @@ class CandidateTests(unittest.TestCase):
         artifact.mkdir(parents=True)
         (artifact / "lib.so").write_bytes(b"tested-native-exact-version")
         self.manifest = {**deepcopy(IDENTITY), "gates": {"linux": "success", "macos": "success"},
-                         "created_at": datetime.now(timezone.utc).isoformat(), "retention_days": 30,
+                         "disabled_assurance_jobs": [], "created_at": datetime.now(timezone.utc).isoformat(), "retention_days": 30,
                          "artifacts": {"native-linux-27": {**deepcopy(IDENTITY), "artifact": "native-linux-27", "job": "linux",
                                        "matrix": {"target": "x86_64-unknown-linux-gnu"}, "attempt": 1, "tools": {"rustc": "rustc 1.96.0"},
                                        "files": {"lib.so": C.digest(artifact / "lib.so")}}}}
@@ -298,7 +298,7 @@ class CandidateTests(unittest.TestCase):
 
     def test_sha_version_run_and_build_inputs_must_all_match(self):
         for key, wrong in (("sha", "c" * 40), ("version", "0.3.775"), ("run_id", 43), ("run_number", 28),
-                           ("repository", "attacker/repo"), ("source_hashes", {"Cargo.lock": "bad"})):
+                           ("repository", "attacker/repo"), ("source_hashes", {"Cargo.lock": "bad"}), ("assurance_profile", "full")):
             for location in (self.manifest, self.manifest["artifacts"]["native-linux-27"]):
                 changed = deepcopy(self.manifest)
                 target = changed if location is self.manifest else changed["artifacts"]["native-linux-27"]
@@ -318,6 +318,49 @@ class CandidateTests(unittest.TestCase):
                       {"linux": {"result": "success"}, "macos": {"result": "skipped"}}):
             with patch.object(C, "read_json", return_value=POLICY), patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "1"}), self.assertRaises(ValueError):
                 C.seal(self.root / "handoff", self.root / "sealed", needs)
+
+    def test_profile_disabled_gates_are_explicit_and_cannot_mask_failure(self):
+        policy = {**deepcopy(POLICY), "optional_assurance_jobs": ["extreme"]}
+        manifest = deepcopy(self.manifest)
+        manifest["gates"]["extreme"] = "skipped"
+        manifest["disabled_assurance_jobs"] = ["extreme"]
+        C.verify_payload(self.payload, manifest, IDENTITY, policy)
+        for status in ("failure", "cancelled", "success", "running"):
+            changed = deepcopy(manifest)
+            changed["gates"]["extreme"] = status
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                C.verify_payload(self.payload, changed, IDENTITY, policy)
+        changed = deepcopy(manifest)
+        changed["disabled_assurance_jobs"] = []
+        with self.assertRaises(ValueError):
+            C.verify_payload(self.payload, changed, IDENTITY, policy)
+        full = {**policy, "assurance_profile": "full"}
+        full_identity = {**IDENTITY, "assurance_profile": "full"}
+        manifest["assurance_profile"] = "full"
+        manifest["artifacts"]["native-linux-27"]["assurance_profile"] = "full"
+        manifest["disabled_assurance_jobs"] = []
+        for status in ("skipped", "failure", "cancelled"):
+            manifest["gates"]["extreme"] = status
+            with self.subTest(full_status=status), self.assertRaises(ValueError):
+                C.verify_payload(self.payload, manifest, full_identity, full)
+        manifest["gates"]["extreme"] = "success"
+        C.verify_payload(self.payload, manifest, full_identity, full)
+
+    def test_profile_workflow_conditions_and_mobile_publication(self):
+        policy = C.read_json(C.POLICY_PATH)
+        workflow = (C.ROOT / ".forgejo/workflows/linux.yml").read_text()
+        for job in policy["optional_assurance_jobs"]:
+            block = re.search(r"^  " + job + r":\n.*?(?=^  [\w-]+:|\Z)", workflow, re.M | re.S).group()
+            self.assertIn("needs.lint.outputs.assurance_profile == 'full'", block)
+            self.assertIn("lint", re.search(r"needs: (.*)", block).group(1))
+        self.assertIn("if: always() && forgejo.event_name", workflow[workflow.index("  candidate:"):])
+        self.assertEqual(len(policy["required_jobs"]), 18)
+        self.assertEqual(len(C.artifact_policy(policy)), 20)
+        self.assertEqual(len(C.artifact_policy({**policy, "assurance_profile": "full"})), 22)
+        promotion = (C.ROOT / ".forgejo/workflows/release.yml").read_text()
+        self.assertIn("Retain promoted mobile artifacts\n        if: env.ASTER_ASSURANCE_PROFILE == 'full'", promotion)
+        with self.assertRaises(ValueError):
+            C.expected_gates({**policy, "assurance_profile": "unknown"})
 
     def test_extra_or_missing_artifacts_and_files_cannot_promote(self):
         changed = deepcopy(self.manifest)
@@ -396,9 +439,9 @@ class CandidateTests(unittest.TestCase):
         workflow = (C.ROOT / ".forgejo/workflows/linux.yml").read_text()
         policy = C.read_json(C.POLICY_PATH)
         jobs = set(re.findall(r"^  ([\w-]+):$", workflow[workflow.index("\njobs:"):], re.M))
-        self.assertEqual(jobs, set(policy["required_jobs"]) | {"python-windows", "candidate"})
+        self.assertEqual(jobs, set(policy["required_jobs"]) | set(policy["optional_assurance_jobs"]) | {"python-windows", "candidate"})
         for required in ("lint", "test", "coordination-fault-macos", "coordination-fault-windows", "nightly-sanitize", "nightly-miri", "ffi-go", "ffi-dotnet", "ffi-java", "ffi-macos", "typescript", "typescript-macos", "python-extended", "python-macos"):
-            self.assertIn(required, policy["required_jobs"])
+            self.assertIn(required, policy["required_jobs"] + policy["optional_assurance_jobs"])
         self.assertEqual(workflow.count("name: Refuse retry-to-green candidate builds"), len(jobs))
         self.assertNotIn('tags: ["v*"]', workflow)
         self.assertIn('ASTER_REQUIRE_FAULT_MATRIX: "1"', workflow)
@@ -580,21 +623,31 @@ class FullPolicyHandoffTests(unittest.TestCase):
     selections flatten their selected root and globs retain paths below the
     search root, matching upload-artifact's documented behavior.
     """
-    def test_all_artifacts_and_matrices_record_seal_fetch_and_materialize(self):
+    def test_standard_artifacts_record_seal_fetch_and_materialize(self):
+        self.round_trip("standard")
+
+    def test_full_artifacts_record_seal_fetch_and_materialize(self):
+        self.round_trip("full")
+
+    def round_trip(self, profile):
         repository = C.ROOT
         policy_path = C.POLICY_PATH
-        policy = C.read_json(policy_path)
+        policy = {**C.read_json(policy_path), "assurance_profile": profile}
+        selected_rules = C.artifact_policy(policy)
+        original_read = C.read_json
+        def read_policy(path):
+            return deepcopy(policy) if path == policy_path else original_read(path)
         workflow = (repository / ".forgejo/workflows/linux.yml").read_text()
         records = re.findall(r'--artifact "([^"]+)" --path "([^"]+)" --job "([^"]+)"', workflow)
         uploads = re.findall(r'name: ([^\n]+)\n          path: ([^\n]+)', workflow)
-        identity = {**deepcopy(IDENTITY), "source_hashes": C.source_hashes()}
+        identity = {**deepcopy(IDENTITY), "assurance_profile": profile, "source_hashes": C.source_hashes()}
         suffix = "-27"
         platforms = ("linux-x64-gnu", "linux-arm64-gnu", "darwin-arm64", "darwin-x64", "win32-x64-msvc", "transport", "aster")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             handoff = root / "handoff"
             handoff.mkdir()
-            for name, rule in policy["required_artifacts"].items():
+            for name, rule in selected_rules.items():
                 def expand(value):
                     return value.replace("${{ forgejo.run_number }}", "27").replace("${{ matrix.platform }}", rule["matrix"].get("platform", ""))
                 selected = [(expand(a), expand(p), j) for a, p, j in records if expand(a) == name + suffix]
@@ -661,22 +714,24 @@ class FullPolicyHandoffTests(unittest.TestCase):
                             destination = uploaded / file.relative_to(base)
                             destination.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copyfile(file, destination)
-            needs = {job: {"result": "success"} for job in policy["required_jobs"]}
+            needs = {job: {"result": result} for job, result in C.expected_gates(policy).items()}
             sealed = root / "sealed"
-            with patch.object(C, "identity", return_value=identity), patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "1"}):
+            with patch.object(C, "read_json", side_effect=read_policy), patch.object(C, "identity", return_value=identity), patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "1"}):
                 C.seal(handoff, sealed, needs)
             manifest = C.read_json(sealed / "candidate.json")
-            self.assertEqual(len(manifest["artifacts"]), len(policy["required_artifacts"]))
+            self.assertEqual(len(manifest["artifacts"]), len(selected_rules))
             self.assertEqual(manifest["artifacts"]["npm-linux-arm64-gnu-27"]["matrix"], policy["required_artifacts"]["npm-linux-arm64-gnu"]["matrix"])
             self.assertEqual(manifest["artifacts"]["npm-win32-x64-msvc-27"]["matrix"], policy["required_artifacts"]["npm-win32-x64-msvc"]["matrix"])
             downloaded = root / "downloaded"
             tasks = [{"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA, "event": "push", "head_branch": "main",
-                      "status": "success", "name": job} for job in policy["required_jobs"]]
-            tasks.append({**tasks[-1], "name": "npm-native-cross (win32-x64-msvc)"})
+                      "status": result, "name": job} for job, result in C.expected_gates(policy).items()]
+            tasks.append({**tasks[0], "status": "success", "name": "npm-native-cross (win32-x64-msvc)"})
             api = API(run_fixture(), manifest, (sealed / "candidate.tar.gz").read_bytes(), tasks=tasks)
             release = root / "release"
             release.mkdir()
-            with patch.object(C, "identity", return_value={**identity, "run_id": 99, "run_number": 28}), patch.object(C, "ROOT", release), patch.dict(os.environ, {"FORGEJO_REF": "refs/tags/v0.3.776"}):
+            (release / "mobile/stale").mkdir(parents=True)
+            (release / "mobile/stale/old.a").write_bytes(b"old mobile product")
+            with patch.object(C, "read_json", side_effect=read_policy), patch.object(C, "identity", return_value={**identity, "run_id": 99, "run_number": 28}), patch.object(C, "ROOT", release), patch.dict(os.environ, {"FORGEJO_REF": "refs/tags/v0.3.776"}):
                 C.fetch(downloaded, api)
                 C.materialize(downloaded)
             self.assertEqual(len(list((release / "dist/python").iterdir())), 5)
@@ -686,11 +741,17 @@ class FullPolicyHandoffTests(unittest.TestCase):
             self.assertEqual((release / "dist/maven/aster-runtime-0.3.776.jar").read_bytes(), b"exact tested JVM bytecode")
             self.assertEqual((release / "publish-order").read_text().splitlines(), ["artifacts/npm-" + platform for platform in platforms])
             self.assertEqual(C.file_map(release / "artifacts"), manifest["artifacts"]["npm-packages-27"]["files"])
+            self.assertFalse((release / "mobile/stale").exists())
             for mobile in ("ios-xcframework", "android-libs"):
-                self.assertEqual(C.file_map(release / "mobile" / mobile), manifest["artifacts"][mobile + suffix]["files"])
+                if profile == "full":
+                    self.assertEqual(C.file_map(release / "mobile" / mobile), manifest["artifacts"][mobile + suffix]["files"])
+                else:
+                    self.assertFalse((release / "mobile" / mobile).exists())
             self.assertEqual(C.read_json(release / "release-provenance/candidate.json"), manifest)
             # A downloader retaining the selected xcframework root instead of
             # flattening it must be rejected, even when every byte is intact.
+            if profile != "full":
+                return
             ios = downloaded / "payload/ios-xcframework-27"
             nested = ios / "AsterTransport.xcframework"
             nested.mkdir()

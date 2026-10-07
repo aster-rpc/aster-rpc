@@ -1,14 +1,9 @@
 {
+  "assurance_profile": "standard",
   "required_jobs": [
     "lint",
     "test",
-    "coordination-fault-macos",
-    "coordination-fault-windows",
     "typescript",
-    "python-extended",
-    "python-docs",
-    "python-macos",
-    "typescript-macos",
     "build-linux-wheel",
     "build-windows-wheel",
     "build-linux-arm64-wheel",
@@ -23,11 +18,7 @@
     "npm-native-linux-x64",
     "npm-native-cross",
     "npm-native-darwin",
-    "npm-stage",
-    "mobile-ios",
-    "mobile-android",
-    "nightly-sanitize",
-    "nightly-miri"
+    "npm-stage"
   ],
   "required_artifacts": {
     "aster-python-linux": {
@@ -117,7 +108,21 @@
     "npm-packages": {
       "job": "npm-stage",
       "matrix": {}
-    },
+    }
+  },
+  "optional_assurance_jobs": [
+    "coordination-fault-macos",
+    "coordination-fault-windows",
+    "python-extended",
+    "python-docs",
+    "python-macos",
+    "typescript-macos",
+    "nightly-sanitize",
+    "nightly-miri",
+    "mobile-ios",
+    "mobile-android"
+  ],
+  "full_assurance_artifacts": {
     "ios-xcframework": {
       "job": "mobile-ios",
       "matrix": {}

@@ -726,9 +726,22 @@ public class ObservabilityTests : IAsyncLifetime
         string url = health.BaseUrl;
 
         Assert.Equal(HttpStatusCode.OK, (await ProbeAsync(url + "/readyz")).Code);
+        const string completed = "aster_rpc_server_requests_completed_total";
+        Assert.DoesNotContain(completed, await GetAsync(url + "/metrics"));
         await h.CallAsync();
+
+        // The native server queues the response/trailer before recording completion.
+        // Client receipt is not a barrier for that final server-side metric.
+        const string completedCall = "(?m)^aster_rpc_server_requests_completed_total\\{(?=[^}]*rpc_service=\"O9Echo\")(?=[^}]*rpc_method=\"echo\")(?=[^}]*aster_status=\"OK\")[^}]*\\} 1$";
+        var wait = Stopwatch.StartNew();
         string text = await GetAsync(url + "/metrics");
-        Assert.Contains("aster_rpc_server_requests_completed_total", text); // built-ins count the call
+        while (!System.Text.RegularExpressions.Regex.IsMatch(text, completedCall)
+            && wait.Elapsed < TimeSpan.FromSeconds(2))
+        {
+            await Task.Delay(20);
+            text = await GetAsync(url + "/metrics");
+        }
+        Assert.Matches(completedCall, text); // the successful call is counted exactly once
 
         await h.Server.DisposeAsync();
         await Assert.ThrowsAnyAsync<HttpRequestException>(() => GetAsync(url + "/readyz"));

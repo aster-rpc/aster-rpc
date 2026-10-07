@@ -54,6 +54,28 @@ def source_hashes() -> dict[str, str]:
     return {name: hashlib.sha256(subprocess.check_output(["git", "-C", str(ROOT), "show", f"HEAD:{name}"])).hexdigest() for name in BOUND_FILES}
 
 
+def assurance_profile(policy: dict) -> str:
+    profile = policy.get("assurance_profile")
+    if profile not in ("standard", "full"):
+        fail("release policy assurance_profile must be standard or full")
+    return profile
+
+
+def expected_gates(policy: dict) -> dict[str, str]:
+    profile = assurance_profile(policy)
+    required = policy["required_jobs"]
+    optional = policy.get("optional_assurance_jobs", [])
+    if set(required) & set(optional) or len(set(required + optional)) != len(required + optional):
+        fail("release policy has overlapping or duplicate jobs")
+    return {**{job: "success" for job in required},
+            **{job: "success" if profile == "full" else "skipped" for job in optional}}
+
+
+def artifact_policy(policy: dict) -> dict:
+    return {**policy["required_artifacts"],
+            **(policy.get("full_assurance_artifacts", {}) if assurance_profile(policy) == "full" else {})}
+
+
 def identity() -> dict:
     sha = git("rev-parse", "HEAD")
     if os.environ.get("FORGEJO_SHA", sha) != sha:
@@ -61,6 +83,7 @@ def identity() -> dict:
     version = subprocess.check_output([str(ROOT / "scripts/release/version.sh")], text=True).strip()
     return {"schema": 1, "repository": REPOSITORY, "sha": sha, "version": version,
             "workflow": WORKFLOW, "source_hashes": source_hashes(),
+            "assurance_profile": assurance_profile(read_json(POLICY_PATH)),
             "run_id": int(os.environ["FORGEJO_RUN_ID"]),
             "run_number": int(os.environ["FORGEJO_RUN_NUMBER"])}
 
@@ -250,24 +273,28 @@ def verify_python_install(wheel: Path, interpreter: str) -> None:
 
 
 def verify_payload(root: Path, manifest: dict, expected: dict, policy: dict) -> None:
-    for key in ("schema", "repository", "sha", "version", "workflow", "source_hashes", "run_id", "run_number"):
+    for key in ("schema", "repository", "sha", "version", "workflow", "source_hashes", "run_id", "run_number", "assurance_profile"):
         if manifest.get(key) != expected[key]:
             fail(f"candidate identity mismatch: {key}")
-    if manifest.get("gates") != {job: "success" for job in policy["required_jobs"]}:
+    if manifest.get("gates") != expected_gates(policy):
         fail("candidate lacks successful evidence for every required job")
+    disabled = policy.get("optional_assurance_jobs", []) if assurance_profile(policy) == "standard" else []
+    if manifest.get("disabled_assurance_jobs") != disabled:
+        fail("candidate disabled assurance jobs differ from release policy")
     suffix = f'-{expected["run_number"]}'
     artifacts = manifest.get("artifacts", {})
-    required = {name + suffix for name in policy["required_artifacts"]}
+    rules = artifact_policy(policy)
+    required = {name + suffix for name in rules}
     if set(artifacts) != required:
         fail("candidate artifact inventory differs from release policy")
     for name, evidence in artifacts.items():
         safe_name(name)
         if evidence.get("artifact") != name:
             fail(f"artifact {name} provenance names another artifact")
-        for key in ("schema", "repository", "sha", "version", "workflow", "source_hashes", "run_id", "run_number"):
+        for key in ("schema", "repository", "sha", "version", "workflow", "source_hashes", "run_id", "run_number", "assurance_profile"):
             if evidence.get(key) != expected[key]:
                 fail(f"artifact {name} has mismatched {key}")
-        rule = policy["required_artifacts"][name.removesuffix(suffix)]
+        rule = rules[name.removesuffix(suffix)]
         if evidence.get("job") != rule["job"] or evidence.get("matrix") != rule["matrix"]:
             fail(f"artifact {name} has wrong job or build matrix")
         if evidence.get("attempt") != 1:
@@ -290,8 +317,8 @@ def seal(handoff: Path, output: Path, needs: dict) -> None:
     if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
         fail("candidate sealing requires first-attempt evidence")
     policy = read_json(POLICY_PATH)
-    required = policy["required_jobs"]
-    if set(needs) != set(required) or any(needs[j].get("result") != "success" for j in required):
+    gates = expected_gates(policy)
+    if set(needs) != set(gates) or any(needs[j].get("result") != result for j, result in gates.items()):
         fail("not every candidate dependency completed successfully")
     expected = identity()
     artifacts = {}
@@ -302,10 +329,11 @@ def seal(handoff: Path, output: Path, needs: dict) -> None:
             if name in artifacts:
                 fail(f"duplicate provenance for {name}")
             artifacts[name] = evidence
-    names = {n + f'-{expected["run_number"]}' for n in policy["required_artifacts"]}
+    names = {n + f'-{expected["run_number"]}' for n in artifact_policy(policy)}
     # Documentation artifacts remain in the run but aren't release inputs.
     artifacts = {n: e for n, e in artifacts.items() if n in names}
-    manifest = {**expected, "gates": {job: "success" for job in required}, "artifacts": artifacts,
+    manifest = {**expected, "gates": {job: needs[job]["result"] for job in gates}, "artifacts": artifacts,
+                "disabled_assurance_jobs": policy.get("optional_assurance_jobs", []) if assurance_profile(policy) == "standard" else [],
                 "created_at": datetime.now(timezone.utc).isoformat(), "retention_days": RETENTION_DAYS}
     payload = output / "payload"
     payload.mkdir(parents=True)
@@ -503,6 +531,8 @@ def materialize(candidate: Path) -> None:
     expected.update(run_id=manifest["run_id"], run_number=manifest["run_number"])
     verify_payload(candidate / "payload", manifest, expected, read_json(POLICY_PATH))
     number = manifest["run_number"]
+    if (ROOT / "mobile").exists():
+        shutil.rmtree(ROOT / "mobile")
     for prefix, destination in (("aster-python-", "dist/python"), ("ffi-tarballs-", "dist/ffi"),
                                 ("dotnet-nupkg-", "dist/nuget"), ("maven-packages-", "dist/maven"),
                                 ("java-classifier-", "jars")):
@@ -522,7 +552,8 @@ def materialize(candidate: Path) -> None:
         if package.get("version") != manifest["version"]:
             fail(f"promoted npm package has wrong version: {path}")
     for name in ("ios-xcframework", "android-libs"):
-        shutil.copytree(candidate / "payload" / f"{name}-{number}", ROOT / "mobile" / name)
+        if f"{name}-{number}" in manifest["artifacts"]:
+            shutil.copytree(candidate / "payload" / f"{name}-{number}", ROOT / "mobile" / name)
     # Registry writes across several services cannot be atomic. This immutable
     # provenance binds retries to identical bytes; a completion receipt is
     # created only after every required publisher has succeeded.
@@ -567,6 +598,7 @@ def main() -> None:
     layout.add_argument("--candidate", type=Path, default=Path("candidate"))
     sub.add_parser("prune")
     sub.add_parser("check-api")
+    sub.add_parser("profile")
     args = parser.parse_args()
     if args.command == "record":
         record(args.artifact, args.path, args.output, args.job, args.matrix, read_json(args.recipe) if args.recipe else None)
@@ -587,6 +619,8 @@ def main() -> None:
         materialize(args.candidate)
     elif args.command == "check-api":
         check_api()
+    elif args.command == "profile":
+        print(assurance_profile(read_json(POLICY_PATH)))
     else:
         prune()
 
