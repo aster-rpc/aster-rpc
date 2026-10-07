@@ -559,6 +559,7 @@ async fn ending_a_lease_mid_renewal_leaves_the_journal_free() {
     use aster_transport_core::lease::LeaseOptions;
 
     const CYCLES: usize = 40;
+    const ACTORS: usize = 8;
 
     let fixture = GroupFixture::new("client.leaserace", 0xE6, 1);
     let dir = tempfile::tempdir().expect("a directory");
@@ -571,30 +572,40 @@ async fn ending_a_lease_mid_renewal_leaves_the_journal_free() {
         .journal_dir(root_journal.path())
         .build()
         .expect("the ROOT client builds");
-    let holder_secret = [0xE6 ^ 0x41; 32];
-    let subject = ed25519_dalek::SigningKey::from_bytes(&holder_secret)
-        .verifying_key()
-        .to_bytes();
-    let granted = within(
-        "grant",
-        root.set_grant(
-            resource(b"race"),
-            subject,
-            RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW | RIGHT_MUTATE | RIGHT_RELEASE,
-            0,
-        ),
-    )
-    .await
-    .expect("ROOT grants");
-    within("ack", granted.acknowledge()).await.expect("ack");
+    // The 20 ms renew cadence plus acquire/release can exceed §12.2's
+    // per-actor 20/s, burst-40 allowance on a fast host. Keep the real quota:
+    // rotate eight actors, each reusing its own journal for five cycles.
+    // Stride eight is coprime to three, so every actor covers all ending modes
+    // and subsequent acquisitions over that same journal.
+    let mut holders = Vec::with_capacity(ACTORS);
+    for actor in 0..ACTORS {
+        let holder_secret = [0xE6 ^ (0x41 + actor as u8); 32];
+        let subject = ed25519_dalek::SigningKey::from_bytes(&holder_secret)
+            .verifying_key()
+            .to_bytes();
+        let granted = within(
+            "grant",
+            root.set_grant(
+                resource(b"race"),
+                subject,
+                RIGHT_READ | RIGHT_ACQUIRE | RIGHT_RENEW | RIGHT_MUTATE | RIGHT_RELEASE,
+                actor as u64,
+            ),
+        )
+        .await
+        .expect("ROOT grants");
+        assert_eq!(granted.reply().acl_revision, actor as u64 + 1);
+        within("ack", granted.acknowledge()).await.expect("ack");
 
-    let holder_node = client_node(holder_secret, &fixture, &voter).await;
-    let holder_journal = tempfile::tempdir().expect("a directory");
-    let holder = CoordinationClient::builder(holder_node, group(&fixture))
-        .seed_tickets([voter_ticket(&fixture, 0)])
-        .journal_dir(holder_journal.path())
-        .build()
-        .expect("the holder client builds");
+        let holder_node = client_node(holder_secret, &fixture, &voter).await;
+        let holder_journal = tempfile::tempdir().expect("a directory");
+        let holder = CoordinationClient::builder(holder_node, group(&fixture))
+            .seed_tickets([voter_ticket(&fixture, 0)])
+            .journal_dir(holder_journal.path())
+            .build()
+            .expect("the holder client builds");
+        holders.push((holder_journal, holder));
+    }
 
     // The §12.1 minimum TTL, renewing as fast as the loop will go.
     let options = LeaseOptions {
@@ -605,6 +616,7 @@ async fn ending_a_lease_mid_renewal_leaves_the_journal_free() {
 
     let mut failures = Vec::new();
     for cycle in 0..CYCLES {
+        let holder = &holders[cycle % ACTORS].1;
         let lease = match within(
             "acquire",
             CoordinationLease::acquire(holder.clone(), resource(b"race"), options),
@@ -668,15 +680,23 @@ async fn ending_a_lease_mid_renewal_leaves_the_journal_free() {
         failures.len(),
         failures.join("\n")
     );
-    // Nothing is left behind for the application.
-    assert!(within("unacknowledged", holder.unacknowledged())
-        .await
-        .expect("the journal reads")
-        .is_none());
-    assert!(within("resume", holder.resume())
-        .await
-        .expect("the journal resumes")
-        .is_none());
+    // Nothing is left behind in any actor's reused journal.
+    for (actor, (_, holder)) in holders.iter().enumerate() {
+        assert!(
+            within("unacknowledged", holder.unacknowledged())
+                .await
+                .expect("the journal reads")
+                .is_none(),
+            "actor {actor} has an unacknowledged result"
+        );
+        assert!(
+            within("resume", holder.resume())
+                .await
+                .expect("the journal resumes")
+                .is_none(),
+            "actor {actor} has an interrupted mutation"
+        );
+    }
 
     voter.shutdown().await;
 }

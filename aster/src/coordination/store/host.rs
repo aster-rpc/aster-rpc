@@ -2245,6 +2245,42 @@ mod tests {
         SetAdminActionV1, SetGrantActionV1,
     };
 
+    /// A load-model control, not a reproduction of any host's timing: even
+    /// just 40 acquire/release pairs exceed one actor's initial burst. Actor
+    /// rotation keeps that workload within independent production allowances.
+    #[test]
+    fn repeated_lease_cycles_need_independent_actor_bursts() {
+        fn take_without_refill(buckets: &Buckets, actor: &[u8; 32]) -> bool {
+            // Freeze elapsed refill for this call. Instant::duration_since
+            // saturates at zero for a future `last`; rate and burst remain
+            // the production constants and admission runs its real path.
+            buckets.with(actor, |entry| {
+                entry.mutate.last = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            });
+            assert!(buckets.enter(actor));
+            let admitted = buckets.take_mutate(actor);
+            buckets.leave(actor);
+            admitted
+        }
+
+        let one_actor = Buckets::default();
+        let admitted = (0..80)
+            .filter(|_| take_without_refill(&one_actor, &[0xEE; 32]))
+            .count();
+        assert_eq!(
+            admitted, 40,
+            "leaving an in-flight call does not refund rate tokens"
+        );
+
+        let eight_actors = Buckets::default();
+        for request in 0..80 {
+            assert!(take_without_refill(
+                &eight_actors,
+                &[(request % 8) as u8; 32]
+            ));
+        }
+    }
+
     fn key() -> ResourceKeyV1 {
         ResourceKeyV1 {
             namespace: "ns".into(),
