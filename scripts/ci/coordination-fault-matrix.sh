@@ -18,7 +18,7 @@ set -euo pipefail
 
 platform="$(uname -s)"
 
-if [[ "${CI_EVENT:-}" == "push" && "${CI_REF:-}" == "refs/heads/main" ]]; then
+if [[ "${ASTER_REQUIRE_FAULT_MATRIX:-}" != "1" && "${CI_EVENT:-}" == "push" && "${CI_REF:-}" == "refs/heads/main" ]]; then
   before="${CI_BEFORE:-}"
   if [[ -n "$before" && ! "$before" =~ ^0+$ ]] \
      && git cat-file -e "${before}^{commit}" 2>/dev/null; then

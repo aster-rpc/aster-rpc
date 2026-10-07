@@ -1,0 +1,129 @@
+{
+  "required_jobs": [
+    "lint",
+    "test",
+    "coordination-fault-macos",
+    "coordination-fault-windows",
+    "typescript",
+    "python-extended",
+    "python-docs",
+    "python-macos",
+    "typescript-macos",
+    "build-linux-wheel",
+    "build-windows-wheel",
+    "build-linux-arm64-wheel",
+    "build-macos-wheel",
+    "ffi-go",
+    "ffi-dotnet",
+    "ffi-java",
+    "ffi-natives-cross",
+    "ffi-macos",
+    "ffi-package",
+    "npm-native-linux-x64",
+    "npm-native-cross",
+    "npm-native-darwin",
+    "npm-stage",
+    "mobile-ios",
+    "mobile-android",
+    "nightly-sanitize",
+    "nightly-miri"
+  ],
+  "required_artifacts": {
+    "aster-python-linux": {
+      "job": "build-linux-wheel",
+      "matrix": {}
+    },
+    "aster-python-windows-x64": {
+      "job": "build-windows-wheel",
+      "matrix": {}
+    },
+    "aster-python-linux-arm64": {
+      "job": "build-linux-arm64-wheel",
+      "matrix": {}
+    },
+    "aster-python-macos-arm64": {
+      "job": "build-macos-wheel",
+      "matrix": {}
+    },
+    "java-classifier-linux-x86_64": {
+      "job": "ffi-java",
+      "matrix": {}
+    },
+    "maven-packages": {
+      "job": "ffi-java",
+      "matrix": {}
+    },
+    "ffi-native-linux-x64": {
+      "job": "ffi-java",
+      "matrix": {}
+    },
+    "ffi-native-win-x64": {
+      "job": "ffi-natives-cross",
+      "matrix": {}
+    },
+    "ffi-native-linux-arm64": {
+      "job": "ffi-natives-cross",
+      "matrix": {}
+    },
+    "java-classifier-macos-aarch64": {
+      "job": "ffi-macos",
+      "matrix": {}
+    },
+    "ffi-native-osx-arm64": {
+      "job": "ffi-macos",
+      "matrix": {}
+    },
+    "ffi-tarballs": {
+      "job": "ffi-package",
+      "matrix": {}
+    },
+    "dotnet-nupkg": {
+      "job": "ffi-package",
+      "matrix": {}
+    },
+    "npm-linux-x64-gnu": {
+      "job": "npm-native-linux-x64",
+      "matrix": {}
+    },
+    "npm-transport": {
+      "job": "npm-native-linux-x64",
+      "matrix": {}
+    },
+    "npm-linux-arm64-gnu": {
+      "job": "npm-native-cross",
+      "matrix": {
+        "platform": "linux-arm64-gnu",
+        "target": "aarch64-unknown-linux-gnu",
+        "napi_flags": ""
+      }
+    },
+    "npm-win32-x64-msvc": {
+      "job": "npm-native-cross",
+      "matrix": {
+        "platform": "win32-x64-msvc",
+        "target": "x86_64-pc-windows-msvc",
+        "napi_flags": "--cross-compile"
+      }
+    },
+    "npm-darwin-arm64": {
+      "job": "npm-native-darwin",
+      "matrix": {}
+    },
+    "npm-darwin-x64": {
+      "job": "npm-native-darwin",
+      "matrix": {}
+    },
+    "npm-packages": {
+      "job": "npm-stage",
+      "matrix": {}
+    },
+    "ios-xcframework": {
+      "job": "mobile-ios",
+      "matrix": {}
+    },
+    "android-libs": {
+      "job": "mobile-android",
+      "matrix": {}
+    }
+  }
+}

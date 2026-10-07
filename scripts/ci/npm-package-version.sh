@@ -25,6 +25,11 @@ if [[ "$ref" == refs/tags/v* ]]; then
   fi
   npm_version="$version"
   dist_tag=latest
+elif [[ "${ASTER_RELEASE_CANDIDATE:-}" == "1" ]]; then
+  # A candidate carries the exact commit version before its release tag exists.
+  # This only stages artifacts; release.yml separately authorizes promotion.
+  npm_version="$version"
+  dist_tag=latest
 else
   [[ "$run" =~ ^[0-9]+$ ]] || { echo "error: run number '$run' is not numeric" >&2; exit 1; }
   npm_version="$version-dev.$run"
