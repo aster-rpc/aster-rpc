@@ -43,9 +43,17 @@ class Evidence:
         self.lock = threading.Lock()
 
     def write(self, kind: str, **fields):
+        entered = time.monotonic()
         with self.lock:
-            self.log.write(json.dumps(dict(kind=kind, monotonic=time.monotonic(), **fields)) + "\n")
+            acquired = time.monotonic()
+            self.log.write(json.dumps(dict(kind=kind, monotonic=acquired, **fields)) + "\n")
+            flush_started = time.monotonic()
             self.log.flush()
+            flushed = time.monotonic()
+        return dict(evidence_entered_monotonic=entered,
+                    evidence_lock_acquired_monotonic=acquired,
+                    evidence_flush_started_monotonic=flush_started,
+                    evidence_flush_completed_monotonic=flushed)
 
 
 class Peer:
@@ -130,7 +138,9 @@ class Collector:
                 pass
 
             def do_POST(self):
+                handler_started = time.monotonic()
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body_read_completed = time.monotonic()
                 if self.headers.get("Content-Encoding") == "gzip":
                     body = gzip.decompress(body)
                 with collector.lock:
@@ -139,6 +149,7 @@ class Collector:
                     collector.release.wait(timeout=15)
                     return
                 status = 503 if mode == "http503" else 200
+                accepted = None
                 if status == 200 and self.path.endswith("/v1/logs"):
                     found = {x.decode() for x in re.findall(rb"campaign:(?:rust|python|ts|go|java|dotnet):[0-9]+;", body)}
                     now = time.monotonic()
@@ -147,13 +158,30 @@ class Collector:
                             collector.markers.setdefault(marker, now)
                         while len(collector.markers) > 2048:
                             del collector.markers[next(iter(collector.markers))]
-                    collector.evidence.write("collector_accept", markers=sorted(found), bytes=len(body))
+                    accepted = collector.evidence.write(
+                        "collector_accept", markers=sorted(found), bytes=len(body),
+                        handler_started_monotonic=handler_started,
+                        body_read_completed_monotonic=body_read_completed)
+                response_error = None
                 try:
                     self.send_response(status)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                 except (BrokenPipeError, ConnectionResetError):
-                    pass
+                    response_error = "peer_closed"
+                response_completed = time.monotonic()
+                if accepted is not None:
+                    # Capture response timing before serialization. This record
+                    # adds no evidence I/O before this HTTP response is sent,
+                    # but its shared file/lock work can delay other handlers.
+                    # These samples diagnose coupling, not network arrival or
+                    # confirmation that the exporter consumed the response.
+                    collector.evidence.write(
+                        "collector_response", markers=sorted(found), status=status,
+                        handler_started_monotonic=handler_started,
+                        body_read_completed_monotonic=body_read_completed,
+                        response_completed_monotonic=response_completed,
+                        response_error=response_error, **accepted)
 
         class Server(http.server.ThreadingHTTPServer):
             allow_reuse_address = True
