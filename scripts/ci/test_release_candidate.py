@@ -346,6 +346,71 @@ else: sys.exit(2)
         self.assertIn("another checksum", result.stderr)
 
 
+class IOSPackagingTests(unittest.TestCase):
+    def run_packaging(self, directory, **extra):
+        binaries = directory / "bin"
+        binaries.mkdir()
+        tool = '''#!/usr/bin/env python3
+import json,os,pathlib,sys
+name=pathlib.Path(sys.argv[0]).name; args=sys.argv[1:]
+with open(os.environ["IOS_CALLS"],"a") as log: log.write(json.dumps([name,*args])+"\\n")
+root=pathlib.Path(os.environ["CARGO_TARGET_DIR"])
+if name=="cargo":
+    assert args[0]=="rustc" and "--lib" in args and args[args.index("--crate-type")+1]=="staticlib"
+    target=args[args.index("--target")+1]
+    if target!=os.environ.get("IOS_MISSING_TARGET"):
+        archive=root/target/"release/libaster_transport_ffi.a"
+        archive.parent.mkdir(parents=True,exist_ok=True); archive.write_bytes(b"!<arch>\\nfixture archive")
+elif name=="lipo":
+    assert all(pathlib.Path(p).is_file() for p in args[1:args.index("-output")])
+    pathlib.Path(args[args.index("-output")+1]).write_bytes(b"fat simulator archive")
+elif name=="xcodebuild":
+    assert args[0]=="-create-xcframework"
+    assert all(pathlib.Path(args[i+1]).is_file() for i,a in enumerate(args) if a=="-library")
+    output=pathlib.Path(args[args.index("-output")+1]); output.mkdir()
+    if not os.environ.get("IOS_MISSING_METADATA"): (output/"Info.plist").write_bytes(b"xcframework metadata")
+else: sys.exit(2)
+'''
+        for name in ("cargo", "lipo", "xcodebuild"):
+            executable = binaries / name
+            executable.write_text(tool)
+            executable.chmod(0o755)
+        environment = {**os.environ, "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+                       "CARGO_TARGET_DIR": str(directory / "target"), "IOS_CALLS": str(directory / "calls"), **extra}
+        result = subprocess.run(["bash", str(C.ROOT / "scripts/ci/build-ios-xcframework.sh"), str(directory / "AsterTransport.xcframework")],
+                                cwd=directory, env=environment, capture_output=True, text=True)
+        log = directory / "calls"
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return result, calls
+
+    def test_real_workflow_requests_static_archives_for_all_ios_targets(self):
+        workflow = (C.ROOT / ".forgejo/workflows/linux.yml").read_text()
+        ios = workflow[workflow.index("  mobile-ios:"):workflow.index("  mobile-android:")]
+        self.assertIn("run: scripts/ci/build-ios-xcframework.sh", ios)
+        self.assertNotIn("cargo build", ios)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            result, calls = self.run_packaging(directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([call[call.index("--target") + 1] for call in calls if call[0] == "cargo"],
+                             ["aarch64-apple-ios", "aarch64-apple-ios-sim", "x86_64-apple-ios"])
+            self.assertEqual([call[0] for call in calls], ["cargo", "cargo", "cargo", "lipo", "xcodebuild"])
+            self.assertTrue((directory / "AsterTransport.xcframework/Info.plist").is_file())
+
+    def test_missing_static_archive_fails_before_lipo(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result, calls = self.run_packaging(Path(temporary), IOS_MISSING_TARGET="aarch64-apple-ios-sim")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing iOS static archive", result.stdout)
+            self.assertEqual([call[0] for call in calls], ["cargo", "cargo"])
+
+    def test_missing_xcframework_metadata_fails_before_recording(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _ = self.run_packaging(Path(temporary), IOS_MISSING_METADATA="1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("XCFramework metadata was not produced", result.stdout)
+
+
 class FullPolicyHandoffTests(unittest.TestCase):
     """Exercise real workflow selections through every handoff stage.
 
