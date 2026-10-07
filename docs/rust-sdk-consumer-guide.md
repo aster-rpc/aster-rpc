@@ -135,14 +135,13 @@ those macros, or need an additional supported Salvo feature, add the fork from
 the Aster registry rather than crates.io:
 
 ```toml
-salvo = { version = "=1.0.1", registry = "aster", features = ["quinn"] }
+salvo = { version = "=1.0.3", registry = "aster", features = ["quinn"] }
 ```
 
-The currently published Salvo family is 1.0.1. The cancellation-safe accept
-fix is staged for the next Aster release with Salvo 1.0.3; after that wave is
-published, use `=1.0.3` for this direct macro dependency so its crate identity
-matches the Aster release. The staged Git revision and proposed tags are not
-yet public release sources.
+Aster 0.3.794 publishes the cancellation-safe accept fix with Salvo 1.0.3.
+Use `=1.0.3` for this direct macro dependency so its crate identity matches
+`aster-transport-salvo` 0.3.794. Both source crate families are anonymously
+readable from the Aster registry.
 
 Only the Salvo feature closure validated by Aster is part of the release. Ask
 the maintainers to expand that closure before enabling a Salvo component which
