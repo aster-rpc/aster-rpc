@@ -2221,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.9"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2234,7 +2234,7 @@ dependencies = [
 [[package]]
 name = "h3-datagram"
 version = "0.0.3"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "bytes",
  "h3",
@@ -2244,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.11"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "bytes",
  "futures",
@@ -5568,8 +5568,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "salvo"
-version = "1.0.2"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+version = "1.0.3"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "salvo-acme",
  "salvo-otel",
@@ -5580,8 +5580,8 @@ dependencies = [
 
 [[package]]
 name = "salvo-acme"
-version = "1.0.2"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+version = "1.0.3"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "certon",
  "futures-util",
@@ -5595,7 +5595,7 @@ dependencies = [
 [[package]]
 name = "salvo-http3"
 version = "0.7.1"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5610,8 +5610,8 @@ dependencies = [
 
 [[package]]
 name = "salvo-otel"
-version = "1.0.2"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+version = "1.0.3"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "opentelemetry",
  "opentelemetry-http",
@@ -5623,8 +5623,8 @@ dependencies = [
 
 [[package]]
 name = "salvo-proxy"
-version = "1.0.2"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+version = "1.0.3"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "fastrand",
  "futures-util",
@@ -5641,8 +5641,8 @@ dependencies = [
 
 [[package]]
 name = "salvo-serde-util"
-version = "1.0.2"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+version = "1.0.3"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5651,8 +5651,8 @@ dependencies = [
 
 [[package]]
 name = "salvo-serve-static"
-version = "1.0.2"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+version = "1.0.3"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "hex",
  "mime",
@@ -5670,8 +5670,8 @@ dependencies = [
 
 [[package]]
 name = "salvo_core"
-version = "1.0.2"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+version = "1.0.3"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5723,8 +5723,8 @@ dependencies = [
 
 [[package]]
 name = "salvo_macros"
-version = "1.0.2"
-source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=e9b48e52fdf87c3fcae9b4788f53142fd0994415#e9b48e52fdf87c3fcae9b4788f53142fd0994415"
+version = "1.0.3"
+source = "git+https://forge.emrul.dev/Aster/salvo.git?rev=d282442d3b8aa14524fe7b744fd3b4d7672e1206#d282442d3b8aa14524fe7b744fd3b4d7672e1206"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
