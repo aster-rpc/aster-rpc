@@ -257,11 +257,13 @@ pub trait DispatchSink: Send + Sync + 'static {
 
     /// Queue one event without blocking. Returns the event unchanged when the
     /// finite sink is full or closed.
+    #[allow(clippy::result_large_err)] // Returning the owned event is the retry contract.
     fn deliver(&self, event: DispatchEvent) -> Result<(), DispatchSendError<DispatchEvent>>;
 
     /// Queue a non-final event for an admitted entity. At most four events
     /// per entity may be outstanding at once, covering a reentrant Call
     /// handoff plus Writable, ResponseClosed, and Cancelled.
+    #[allow(clippy::result_large_err)] // Preserve the same event-return contract.
     fn deliver_for(
         &self,
         event: DispatchEvent,
@@ -272,6 +274,7 @@ pub trait DispatchSink: Send + Sync + 'static {
 
     /// Deliver an event that transfers the entity's final admission owner.
     /// The default keeps existing custom sinks source-compatible.
+    #[allow(clippy::result_large_err)] // Return both event and admission owner intact.
     fn deliver_admitted(
         &self,
         event: DispatchEvent,

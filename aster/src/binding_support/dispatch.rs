@@ -163,6 +163,8 @@ impl RingSink {
         )
     }
 
+    // Return the event and handoff owner intact on backpressure, without allocating.
+    #[allow(clippy::result_large_err)]
     fn enqueue(
         &self,
         event: DispatchEvent,
