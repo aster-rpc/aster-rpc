@@ -266,3 +266,34 @@ async fn a_call_blocked_on_a_full_queue_is_not_published_after_close() {
     )
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_waiting_on_a_full_queue_ends_when_the_server_shuts_down() {
+    let _serial = SERIAL.lock().await;
+    let scope = ScopeKind::Shared;
+    let (server, _sink, _consumer) = server(scope).await;
+    let (client, connection) = connect(&server).await;
+    let mut gate = test_hooks::pause_next_call_enqueue_with_full_queue(client.id().to_string());
+    send_request(&connection, &header(scope)).await;
+
+    assert!(
+        within(gate.filled()).await > 0,
+        "the event queue had no free slot to hold"
+    );
+    within(gate.paused()).await;
+    // The call now waits for a slot in the full queue; the queue is never
+    // released. Shutdown must neither wait on that call nor let it publish.
+    gate.resume();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), gate.settled())
+            .await
+            .is_err(),
+        "the call should be waiting for a queue slot"
+    );
+    within(server.shutdown()).await;
+    assert!(
+        !within(gate.settled()).await,
+        "a call was published into a server that had shut down"
+    );
+    client.shutdown().await;
+}
