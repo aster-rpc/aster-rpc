@@ -19,8 +19,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.GZIPInputStream;
@@ -38,7 +41,7 @@ import site.aster.node.IrohNode;
  */
 final class LogEmitTest {
 
-  static volatile HttpServer receiver;
+  static volatile Receiver receiver;
   static int receiverPort;
   static final List<byte[]> LOG_BODIES = new CopyOnWriteArrayList<>();
   static final AtomicInteger LOG_REQUESTS = new AtomicInteger();
@@ -51,55 +54,108 @@ final class LogEmitTest {
   @BeforeAll
   static void start() throws Exception {
     receiver = startReceiver(0);
-    receiverPort = receiver.getAddress().getPort();
+    receiverPort = receiver.server.getAddress().getPort();
     Observability.shutdown();
     initObservability();
   }
 
-  private static HttpServer startReceiver(int port) throws java.io.IOException {
+  private static final class Receiver {
+    final HttpServer server;
+    final ExecutorService executor = Executors.newSingleThreadExecutor();
+    final AtomicInteger accepted = new AtomicInteger();
+    final AtomicInteger inFlight = new AtomicInteger();
+    final AtomicInteger logRequests = new AtomicInteger();
+    final CountDownLatch listenerStopped = new CountDownLatch(1);
+
+    Receiver(HttpServer server) {
+      this.server = server;
+      server.setExecutor(executor);
+    }
+
+    void stop() {
+      server.stop(0);
+      // stop(0) closes sockets, but a handler already accepted by the executor
+      // may still update the fixture counters. Drain it before taking a baseline.
+      executor.shutdown();
+      listenerStopped.countDown();
+      try {
+        assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "collector handlers drained");
+        assertEquals(0, inFlight.get(), "collector has no in-flight handlers");
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new AssertionError("interrupted while draining collector handlers", e);
+      }
+    }
+  }
+
+  private static Receiver startReceiver(int port) throws java.io.IOException {
+    return startReceiver(port, new CountDownLatch(0), new CountDownLatch(0));
+  }
+
+  private static Receiver startReceiver(
+      int port, CountDownLatch bodyRead, CountDownLatch releaseBody) throws java.io.IOException {
     HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
+    Receiver collector = new Receiver(server);
     server.createContext(
         "/",
         ex -> {
-          byte[] body;
-          try (InputStream in = ex.getRequestBody()) {
-            body = in.readAllBytes();
-          }
-          if ("gzip".equals(ex.getRequestHeaders().getFirst("Content-Encoding"))) {
-            try (GZIPInputStream z = new GZIPInputStream(new java.io.ByteArrayInputStream(body))) {
-              ByteArrayOutputStream o = new ByteArrayOutputStream();
-              z.transferTo(o);
-              body = o.toByteArray();
+          collector.accepted.incrementAndGet();
+          collector.inFlight.incrementAndGet();
+          try {
+            byte[] body;
+            try (InputStream in = ex.getRequestBody()) {
+              body = in.readAllBytes();
             }
-          }
-          boolean logs = ex.getRequestURI().getPath().endsWith("/v1/logs");
-          boolean stalled = logs && stallLogs;
-          boolean reject = rejectLogs;
-          if (logs) {
-            LOG_REQUESTS.incrementAndGet();
-            if (stalled) {
-              STALLED_LOGS.incrementAndGet();
-              try {
-                releaseStalledLog.await(10, TimeUnit.SECONDS);
-              } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            if ("gzip".equals(ex.getRequestHeaders().getFirst("Content-Encoding"))) {
+              try (GZIPInputStream z =
+                  new GZIPInputStream(new java.io.ByteArrayInputStream(body))) {
+                ByteArrayOutputStream o = new ByteArrayOutputStream();
+                z.transferTo(o);
+                body = o.toByteArray();
               }
             }
-          }
-          if (logs && (stalled ? reject : rejectLogs)) {
-            REJECTED_LOGS.incrementAndGet();
-            ex.sendResponseHeaders(503, -1);
+            boolean logs = ex.getRequestURI().getPath().endsWith("/v1/logs");
+            if (logs) {
+              bodyRead.countDown();
+              try {
+                assertTrue(releaseBody.await(5, TimeUnit.SECONDS), "release pre-close request");
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted before recording collector request", e);
+              }
+            }
+            boolean stalled = logs && stallLogs;
+            boolean reject = rejectLogs;
+            if (logs) {
+              collector.logRequests.incrementAndGet();
+              LOG_REQUESTS.incrementAndGet();
+              if (stalled) {
+                STALLED_LOGS.incrementAndGet();
+                try {
+                  releaseStalledLog.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                }
+              }
+            }
+            if (logs && (stalled ? reject : rejectLogs)) {
+              REJECTED_LOGS.incrementAndGet();
+              ex.sendResponseHeaders(503, -1);
+              ex.close();
+              return;
+            }
+            if (ex.getRequestURI().getPath().endsWith("/v1/logs")) {
+              LOG_BODIES.add(body);
+            }
+            ex.sendResponseHeaders(200, -1);
             ex.close();
-            return;
+          } finally {
+            ex.close();
+            collector.inFlight.decrementAndGet();
           }
-          if (ex.getRequestURI().getPath().endsWith("/v1/logs")) {
-            LOG_BODIES.add(body);
-          }
-          ex.sendResponseHeaders(200, -1);
-          ex.close();
         });
     server.start();
-    return server;
+    return collector;
   }
 
   private static void initObservability() {
@@ -116,7 +172,7 @@ final class LogEmitTest {
   @AfterAll
   static void stop() {
     Observability.shutdown();
-    if (receiver != null) receiver.stop(0);
+    if (receiver != null) receiver.stop();
   }
 
   private static boolean has(byte[] needle) {
@@ -227,27 +283,73 @@ final class LogEmitTest {
     exerciseOutage("stall");
   }
 
+  @Test
+  void refusalBaselineIncludesLegitimatePreCloseRequestAndDrainsItsHandler() throws Exception {
+    CountDownLatch bodyRead = new CountDownLatch(1);
+    CountDownLatch releaseBody = new CountDownLatch(1);
+    Receiver collector = startReceiver(0, bodyRead, releaseBody);
+    CompletableFuture<Void> stopped = null;
+    int oldBaseline = collector.logRequests.get();
+    try {
+      // Hold a fully read, legitimate request before the old counter increment.
+      // Closing its socket does not mean its handler has finished recording it.
+      CompletableFuture<HttpResponse<Void>> request =
+          HttpClient.newHttpClient()
+              .sendAsync(
+                  HttpRequest.newBuilder(
+                          URI.create(
+                              "http://127.0.0.1:"
+                                  + collector.server.getAddress().getPort()
+                                  + "/v1/logs"))
+                      .timeout(Duration.ofSeconds(5))
+                      .POST(HttpRequest.BodyPublishers.ofString("pre-close-control"))
+                      .build(),
+                  HttpResponse.BodyHandlers.discarding());
+      assertTrue(bodyRead.await(5, TimeUnit.SECONDS), "control request read before close");
+      assertEquals(1, collector.accepted.get());
+      assertEquals(1, collector.inFlight.get());
+      assertEquals(oldBaseline, collector.logRequests.get());
+      stopped = CompletableFuture.runAsync(collector::stop);
+      assertTrue(collector.listenerStopped.await(5, TimeUnit.SECONDS));
+      assertEquals(1, collector.inFlight.get(), "pre-close handler still needs draining");
+      assertFalse(stopped.isDone(), "stop must wait for the accepted handler");
+      releaseBody.countDown();
+      stopped.get(5, TimeUnit.SECONDS);
+      // Diagnostic control: the old equality assertion fails without any request
+      // being sent to a closed listener. The post-drain baseline includes it.
+      assertThrows(
+          AssertionError.class, () -> assertEquals(oldBaseline, collector.logRequests.get()));
+      assertEquals(oldBaseline + 1, collector.logRequests.get());
+      assertEquals(0, collector.inFlight.get());
+      request.handle((response, error) -> null).get(5, TimeUnit.SECONDS);
+    } finally {
+      releaseBody.countDown();
+      if (stopped == null) collector.stop();
+      else stopped.get(5, TimeUnit.SECONDS);
+    }
+  }
+
+  private static void closeCollectorForRefusal() throws Exception {
+    receiver.stop();
+    receiver = null;
+    try (Socket probe = new Socket()) {
+      probe.connect(new InetSocketAddress("127.0.0.1", receiverPort), 500);
+      throw new AssertionError("collector port remained bound during connection-refusal outage");
+    } catch (ConnectException expected) {
+      // The listener is closed and its accepted handlers have finished.
+    } catch (java.io.IOException e) {
+      throw new AssertionError("could not verify the collector listener was unbound", e);
+    }
+  }
+
   private static void exerciseOutage(String mode) throws Exception {
     Observability.flush(Duration.ofSeconds(5));
-    int rejectedBefore = REJECTED_LOGS.get();
-    int stalledBefore = STALLED_LOGS.get();
-    int requestsBefore = LOG_REQUESTS.get();
     String marker = "java-pathb-" + mode + "-";
     IrohNode node = IrohNode.start(null, List.of(), null).get(20, TimeUnit.SECONDS);
     HealthServer health = HealthServer.start(node, "127.0.0.1", 0);
     try {
       if (mode.equals("refusal")) {
-        receiver.stop(0);
-        receiver = null;
-        try (Socket probe = new Socket()) {
-          probe.connect(new InetSocketAddress("127.0.0.1", receiverPort), 500);
-          throw new AssertionError(
-              "collector port remained bound during connection-refusal outage");
-        } catch (ConnectException expected) {
-          // The listener is actually closed, rather than returning an HTTP error.
-        } catch (java.io.IOException e) {
-          throw new AssertionError("could not verify the collector listener was unbound", e);
-        }
+        closeCollectorForRefusal();
       } else if (mode.equals("stall")) {
         rejectLogs = true;
         stallLogs = true;
@@ -255,6 +357,11 @@ final class LogEmitTest {
       } else {
         rejectLogs = true;
       }
+      // Node/health startup can legitimately export while the collector is open.
+      // Refusal starts only after the listener closes AND accepted handlers drain.
+      int rejectedBefore = REJECTED_LOGS.get();
+      int stalledBefore = STALLED_LOGS.get();
+      int requestsBefore = LOG_REQUESTS.get();
       health.setReady(true);
       assertAuditReady(health, "during " + mode + " exporter outage");
       long emitStarted = System.nanoTime();
@@ -333,18 +440,8 @@ final class LogEmitTest {
       assertTrue(indexOf(recovered, java.util.HexFormat.of().parseHex("b7ad6b7169203331")) >= 0);
       assertAuditReady(health, "after " + mode + " exporter recovery");
 
-      int shutdownRequestsBefore = LOG_REQUESTS.get();
-      int shutdownRejectedBefore = REJECTED_LOGS.get();
-      int shutdownStalledBefore = STALLED_LOGS.get();
       if (mode.equals("refusal")) {
-        receiver.stop(0);
-        receiver = null;
-        try (Socket probe = new Socket()) {
-          probe.connect(new InetSocketAddress("127.0.0.1", receiverPort), 500);
-          throw new AssertionError("collector port remained bound during refusal shutdown");
-        } catch (ConnectException expected) {
-          // Confirm the exporter sees an unbound listener during shutdown.
-        }
+        closeCollectorForRefusal();
       } else {
         rejectLogs = true;
         if (mode.equals("stall")) {
@@ -352,6 +449,9 @@ final class LogEmitTest {
           releaseStalledLog = new CountDownLatch(1);
         }
       }
+      int shutdownRequestsBefore = LOG_REQUESTS.get();
+      int shutdownRejectedBefore = REJECTED_LOGS.get();
+      int shutdownStalledBefore = STALLED_LOGS.get();
       LogEmit.emit(Level.WARN, "app.outage", marker + "shutdown-outage");
       health.close(); // Release its observability reference before measuring shutdown.
       node.close();
