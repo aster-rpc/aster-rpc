@@ -257,6 +257,40 @@ describe.skipIf(!hasDispatch).each(DISPATCH_DELIVERIES)('DispatchServer (%s)', (
 });
 
 describe.skipIf(!hasDispatch)('DispatchServer ring delivery close', () => {
+  it('wakes an idle nextBatch waiter on close and preserves its attached node', async () => {
+    const node = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
+    const server = await native.DispatchServer.serve(
+      node,
+      [JSON.stringify(ECHO_SERVICE)],
+      { delivery: 'ring', ringCapacity: 16, builtinNodeInfo: false },
+    );
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const batch = server.nextBatch(1);
+      // A locked consumer proves the idle pull has entered native code.
+      // Closing before this point would miss the waiter/close lock ordering.
+      await until(() => server.debugState()[1] === -1);
+      const closed = server.close();
+      const result = await Promise.race([
+        Promise.all([batch, closed]).then(([events]) => events),
+        new Promise((resolve) => { timeout = setTimeout(() => resolve('hung'), 5000); }),
+      ]);
+      expect(result).toEqual([]);
+      expect(server.debugState().slice(0, 3)).toEqual([0, 0, 1]);
+      expect(await server.nextBatch(1)).toEqual([]);
+      // Reattaching requires the original node to remain usable after close.
+      const replacement = await native.DispatchServer.serve(
+        node,
+        [JSON.stringify(ECHO_SERVICE)],
+        { delivery: 'ring', ringCapacity: 16, builtinNodeInfo: false },
+      );
+      await replacement.close();
+    } finally {
+      clearTimeout(timeout);
+      await node.close();
+    }
+  });
+
   it('an attached ring server ends live and unread calls on close', async () => {
     const node = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
     const server = await native.DispatchServer.serve(
