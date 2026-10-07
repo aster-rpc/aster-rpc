@@ -1671,9 +1671,7 @@ fn a_release_waits_for_an_in_flight_compare_and_set() {
             assert!(!after.held);
             assert_eq!(after.value.as_deref(), Some(&value[..]));
         }
-        for c in [w] {
-            assert_eq!(aster_coordination_client_free(rt, c), OK);
-        }
+        assert_eq!(aster_coordination_client_free(rt, w), OK);
     }
 }
 
