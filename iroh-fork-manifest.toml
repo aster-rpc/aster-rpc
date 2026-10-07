@@ -118,8 +118,8 @@ repo = "https://forge.emrul.dev/Aster/salvo.git"
 upstream_base = "v1.0.0"
 tag = "v1.0.0-aster.4"  # proposed; not created (also aster-salvo-2026-10-07)
 commit = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492"
-branch = "review/quinn-accept-cancellation-1.0.3-final"
-status = "local_candidate"  # revision, tag and 1.0.3 wave are not published
+branch = "main"
+status = "local_unpublished"  # local main adopted; revision, tags and wave are not published
 crates = ["salvo", "salvo_core", "salvo_macros", "salvo-http3", "h3", "h3-quinn", "h3-datagram"]
 registry_crates = [
   "h3", "h3-datagram", "h3-quinn", "salvo", "salvo-acme", "salvo-cache",
