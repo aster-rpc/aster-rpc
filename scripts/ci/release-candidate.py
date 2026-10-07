@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import tarfile
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -201,13 +202,34 @@ class Forgejo:
 
     def request(self, path: str, *, method: str = "GET"):
         headers = {"User-Agent": "aster-release-candidate/1"}
-        if self.token:
+        actions = path.startswith(f"/api/v1/repos/{REPOSITORY}/actions/")
+        if actions and not self.token:
+            fail("Actions API requires ASTER_ACTIONS_TOKEN from forgejo.token in a running job of this repository")
+        # Public candidate package reads are anonymous. The repository-bound
+        # job token is not a package token; pruning alone uses a package token.
+        if self.token and (actions or method != "GET"):
             headers["Authorization"] = "token " + self.token
-        return urlopen(Request(self.base + path, headers=headers, method=method), timeout=60)
+        try:
+            return urlopen(Request(self.base + path, headers=headers, method=method), timeout=60)
+        except HTTPError as error:
+            if actions and error.code in (401, 403, 404):
+                error.close()
+                fail(f"Actions API unavailable (HTTP {error.code}); use forgejo.token from a running job in {REPOSITORY} with Actions enabled; promotion remains blocked")
+            raise
 
     def json(self, path: str):
         with self.request(path) as response:
             return json.load(response)
+
+
+def check_api(api: Forgejo | None = None) -> None:
+    """Probe the actual task token before an expensive main qualification."""
+    api = api or Forgejo()
+    for endpoint in ("runs", "tasks"):
+        response = api.json(f"/api/v1/repos/{REPOSITORY}/actions/{endpoint}?limit=1&page=1")
+        if not isinstance(response.get("workflow_runs"), list):
+            fail(f"unexpected Forgejo Actions {endpoint} API response")
+    print("repository job token can read candidate run and task evidence")
 
 
 def validate_run(run: dict, sha: str) -> None:
@@ -396,6 +418,7 @@ def main() -> None:
     layout = sub.add_parser("materialize")
     layout.add_argument("--candidate", type=Path, default=Path("candidate"))
     sub.add_parser("prune")
+    sub.add_parser("check-api")
     args = parser.parse_args()
     if args.command == "record":
         record(args.artifact, args.path, args.output, args.job, args.matrix)
@@ -406,6 +429,8 @@ def main() -> None:
         print(f'validated candidate {manifest["sha"]} from run {manifest["run_number"]}')
     elif args.command == "materialize":
         materialize(args.candidate)
+    elif args.command == "check-api":
+        check_api()
     else:
         prune()
 
