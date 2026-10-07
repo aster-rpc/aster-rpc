@@ -65,6 +65,8 @@ fn routed_ticket(server: &AsterServer) -> String {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    #[cfg(feature = "test-hooks")]
+    aster_otel::init_stderr_from_env();
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().expect("usage: <storage-dir> [voters] [seed]"));
     let voters = usize::from(parse_u8(args.next(), 1));

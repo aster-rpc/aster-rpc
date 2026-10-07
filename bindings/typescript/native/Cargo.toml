@@ -36,10 +36,10 @@ async-trait = "0.1"
 
 [features]
 # Test-only: exports `emitTestLogs` / `testEmitted` (a synthetic Rust log
-# source for the O7 log-bridge tests) and enables core diagnostic events used
+# source for the O7 log-bridge tests) and enables shared diagnostic events used
 # by bounded lease investigations. Never in a published addon:
 # `bun run build:test-hooks` builds it for the test legs.
-test-hooks = ["aster_transport_core/test-hooks"]
+test-hooks = ["aster/reactor-test-hooks"]
 # Test-only: builds the `aster-coordination-fixture` binary (a real voter group
 # for tests/typescript). The voter stays Rust-only (D7) — this feature never
 # reaches the addon `napi build` produces.

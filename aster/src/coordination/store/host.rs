@@ -1164,7 +1164,23 @@ async fn propose_and_reply<T, F>(
     F: FnOnce(CommandReplyV1) -> Result<T, RpcStatus>,
 {
     use openraft::error::ClientWriteError;
-    match runtime.raft.client_write(command).await {
+    #[cfg(feature = "reactor-test-hooks")]
+    let writing = {
+        let (client, sequence) = match &command {
+            CommandV1::Client(c) => (c.client_id.as_slice(), c.sequence),
+            _ => (&[][..], 0),
+        };
+        super::super::diagnostics::Phase::new(
+            "voter_client_write",
+            "client_write",
+            client,
+            sequence,
+        )
+    };
+    let written = runtime.raft.client_write(command).await;
+    #[cfg(feature = "reactor-test-hooks")]
+    writing.finish();
+    match written {
         Ok(response) => match project(response.data) {
             Ok(reply) => respond_reply(call, reply).await,
             Err(status) => {

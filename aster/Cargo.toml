@@ -93,7 +93,7 @@ otel = ["rpc", "dep:aster-otel", "dep:arc-swap"]
 # `coordination`, `coordination-testing` and `expose-edge` are Rust-only (D7)
 # and never belong in a binding.
 binding-support = ["dep:async-trait"]
-# Test-only reactor scheduling gates; never enabled in shipping builds.
+# Test-only scheduling gates and bounded coordination timing; never shipping.
 reactor-test-hooks = ["aster_transport_core/test-hooks"]
 # Expose local HTTP services over Aster (the `aster-expose` L7 relay). Off by
 # default so non-expose consumers don't pull in http/tower. See

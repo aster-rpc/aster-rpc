@@ -445,7 +445,24 @@ impl CoordinationClient {
     {
         let request_hash = hash::request_hash(&action)
             .map_err(|_| client_error("the action has no canonical hash"))?;
+        #[cfg(feature = "reactor-test-hooks")]
+        let mut wait = super::diagnostics::Phase::new("journal_wait", method, &[], 0);
         let mut journal = self.journal.lock().await;
+        #[cfg(feature = "reactor-test-hooks")]
+        {
+            wait.identify(
+                &journal.record().client_id,
+                journal.sequence().saturating_add(1),
+            );
+            wait.finish();
+        }
+        #[cfg(feature = "reactor-test-hooks")]
+        let recovery = super::diagnostics::Phase::new(
+            "interrupted_settle",
+            method,
+            &journal.record().client_id,
+            journal.sequence(),
+        );
         // An interrupted lease transition that cannot be settled now (its
         // drive was denied, or nobody answered) blocks this mutation exactly
         // as any unresolved entry does: the refusal is `Unresolved`, with the
@@ -461,6 +478,8 @@ impl CoordinationClient {
                 err,
             )));
         }
+        #[cfg(feature = "reactor-test-hooks")]
+        recovery.finish();
         let request = build(
             self.engine.group.as_bytes().to_vec(),
             journal.record().client_id.clone(),
@@ -480,7 +499,16 @@ impl CoordinationClient {
         match journal.state() {
             JournalState::Ready => {
                 let sequence = journal.sequence() + 1;
+                #[cfg(feature = "reactor-test-hooks")]
+                let begin = super::diagnostics::Phase::new(
+                    "begin",
+                    method,
+                    &journal.record().client_id,
+                    sequence,
+                );
                 journal.begin(sequence, method, request, request_hash)?;
+                #[cfg(feature = "reactor-test-hooks")]
+                begin.finish();
                 if self.self_acknowledging {
                     journal.mark_self_acknowledging();
                 }
@@ -510,9 +538,27 @@ impl CoordinationClient {
                 ));
             }
         }
+        #[cfg(feature = "reactor-test-hooks")]
+        let driving = super::diagnostics::Phase::new(
+            "drive",
+            method,
+            &journal.record().client_id,
+            journal.sequence(),
+        );
         let delivery = drive(&self.engine, &mut journal).await?;
+        #[cfg(feature = "reactor-test-hooks")]
+        driving.finish();
         if self.self_acknowledging {
+            #[cfg(feature = "reactor-test-hooks")]
+            let ack = super::diagnostics::Phase::new(
+                "auto_ack",
+                method,
+                &journal.record().client_id,
+                journal.sequence(),
+            );
             settle(&mut journal, &delivery.token, delivery.via_retirement)?;
+            #[cfg(feature = "reactor-test-hooks")]
+            ack.finish();
             drop(journal);
             return Ok(ResolvedMutation {
                 settled: true,

@@ -591,20 +591,56 @@ impl Journal {
         let tmp = self.dir.join(RECORD_TMP);
         let target = self.dir.join(RECORD);
         {
+            #[cfg(feature = "reactor-test-hooks")]
+            let writing = super::super::diagnostics::Phase::new(
+                "journal_write",
+                &record.pending_method,
+                &record.client_id,
+                record.sequence,
+            );
             let mut file =
                 File::create(&tmp).map_err(|source| io_error("creating", &tmp, source))?;
             restrict_permissions(&tmp, 0o600)?;
             file.write_all(&bytes)
                 .map_err(|source| io_error("writing", &tmp, source))?;
+            #[cfg(feature = "reactor-test-hooks")]
+            writing.finish();
+            #[cfg(feature = "reactor-test-hooks")]
+            let syncing = super::super::diagnostics::Phase::new(
+                "journal_file_fsync",
+                &record.pending_method,
+                &record.client_id,
+                record.sequence,
+            );
             file.sync_all()
                 .map_err(|source| io_error("fsyncing", &tmp, source))?;
+            #[cfg(feature = "reactor-test-hooks")]
+            syncing.finish();
         }
         // A kill here leaves the *old* record: the temporary is never read.
         self.boundary("persist_tmp_fsynced")?;
+        #[cfg(feature = "reactor-test-hooks")]
+        let replacing = super::super::diagnostics::Phase::new(
+            "journal_replace",
+            &record.pending_method,
+            &record.client_id,
+            record.sequence,
+        );
         atomic_replace(&tmp, &target)?;
+        #[cfg(feature = "reactor-test-hooks")]
+        replacing.finish();
         // A kill here leaves the *new* record: the rename is the commit point.
         self.boundary("persist_renamed")?;
+        #[cfg(feature = "reactor-test-hooks")]
+        let syncing = super::super::diagnostics::Phase::new(
+            "journal_dir_fsync",
+            &record.pending_method,
+            &record.client_id,
+            record.sequence,
+        );
         fsync_dir(&self.dir)?;
+        #[cfg(feature = "reactor-test-hooks")]
+        syncing.finish();
         self.record = record;
         Ok(())
     }

@@ -12,6 +12,8 @@ pub(crate) mod guards;
 /// The public durable client (§3.4). Client-graph only.
 pub mod client;
 pub mod contract;
+#[cfg(feature = "reactor-test-hooks")]
+pub(crate) mod diagnostics;
 pub mod hash;
 pub mod ids;
 pub mod reason;

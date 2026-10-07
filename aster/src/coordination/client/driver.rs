@@ -108,7 +108,16 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
 
     for attempt in 0..DRIVE_ATTEMPTS {
         journal.boundary("before_send")?;
+        #[cfg(feature = "reactor-test-hooks")]
+        let rpc = super::super::diagnostics::Phase::new(
+            "rpc",
+            &method,
+            &journal.record().client_id,
+            journal.sequence(),
+        );
         let outcome = engine.unary(&method, bytes.clone()).await;
+        #[cfg(feature = "reactor-test-hooks")]
+        rpc.finish();
         journal.boundary("after_send")?;
 
         match outcome {
@@ -120,7 +129,16 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
                     continue;
                 };
                 if reply.disposition_code == 1 {
+                    #[cfg(feature = "reactor-test-hooks")]
+                    let resolving = super::super::diagnostics::Phase::new(
+                        "resolve",
+                        &method,
+                        &journal.record().client_id,
+                        journal.sequence(),
+                    );
                     let token = journal.resolve(payload)?;
+                    #[cfg(feature = "reactor-test-hooks")]
+                    resolving.finish();
                     return Ok(Some(Delivery {
                         reply,
                         via_retirement: false,

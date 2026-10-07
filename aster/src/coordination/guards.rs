@@ -29,6 +29,7 @@
 /// list trustworthy — the list on its own is a promise.
 #[cfg(test)]
 pub(crate) const SOURCES: &[(&str, &str)] = &[
+    ("diagnostics.rs", include_str!("diagnostics.rs")),
     ("admission.rs", include_str!("admission.rs")),
     ("boot.rs", include_str!("boot.rs")),
     ("client/driver.rs", include_str!("client/driver.rs")),
