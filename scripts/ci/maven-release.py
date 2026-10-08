@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,7 +20,7 @@ NS = {"p": "http://maven.apache.org/POM/4.0.0"}
 
 
 def stage(output: Path) -> None:
-    version = subprocess.check_output([str(ROOT / "scripts/release/version.sh")], text=True).strip()
+    version = subprocess.check_output([str(ROOT / "scripts/release/version.sh")], text=True, timeout=60).strip()
     output.mkdir(parents=True)
     packages = []
     for module in ("", *MODULES):
@@ -71,27 +71,24 @@ def deploy(directory: Path, classifiers: Path) -> None:
             if remote is not None and remote != local:
                 raise ValueError(f"immutable Maven file differs: {name}")
             urls[name] = (url, local, remote)
-    with tempfile.TemporaryDirectory(prefix="aster-maven-promote-") as temporary:
-        settings = Path(temporary) / "settings.xml"
-        settings.write_text('''<settings><servers><server><id>forgejo</id><username>agents</username><password>${env.ASTER_PACKAGE_TOKEN}</password></server></servers></settings>''')
-        for package in packages:
-            url, local, remote = urls[package["file"]]
-            if remote == local and urls[package["pom"]][2] == urls[package["pom"]][1]:
-                print(f'already published: {package["file"]}')
-                continue
-            args = ["mvn", "-B", "--no-transfer-progress", "-s", str(settings),
-                    "org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy-file",
-                    f'-Dfile={directory.resolve() / package["file"]}',
-                    f'-DpomFile={directory.resolve() / package["pom"]}',
-                    "-DgeneratePom=false", f'-DgroupId={package["group"]}',
-                    f'-DartifactId={package["artifact"]}', f'-Dversion={package["version"]}',
-                    f'-Dpackaging={package["packaging"]}', "-DrepositoryId=forgejo", f"-Durl={registry}"]
-            if package.get("classifier"):
-                args.append(f'-Dclassifier={package["classifier"]}')
-            subprocess.run(args, cwd=temporary, check=True)
-        for name, (url, local, _) in urls.items():
-            if remote_digest(url) != local:
-                raise ValueError(f"Maven publication checksum mismatch: {name}")
+    # Forgejo accepts individual Maven files. Upload only missing files: Maven's
+    # deploy-file always resends the shared POM, including for classifiers.
+    token = os.environ["ASTER_PACKAGE_TOKEN"]
+    auth = base64.b64encode(f"agents:{token}".encode()).decode()
+    for name, (url, local, remote) in urls.items():
+        if remote == local:
+            print(f"already published: {name}")
+            continue
+        request = Request(url, data=(directory / name).read_bytes(), method="PUT",
+                          headers={"Authorization": f"Basic {auth}",
+                                   "Content-Type": "application/octet-stream"})
+        # A race/conflict is not treated as success; immutable preflight and
+        # final readback remain required, and arbitrary 409s are never ignored.
+        with urlopen(request, timeout=60) as response:
+            response.read()
+    for name, (url, local, _) in urls.items():
+        if remote_digest(url) != local:
+            raise ValueError(f"Maven publication checksum mismatch: {name}")
 
 
 def main() -> None:

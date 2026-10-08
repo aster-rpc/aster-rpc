@@ -27,17 +27,35 @@ packages=(
 
 cd "$repo"
 
+# All Cargo subprocesses share a finite deadline; no SDK test is retried.
+bounded_cargo() {
+  python3 - "$@" <<'PYTHON'
+import os
+import signal
+import subprocess
+import sys
+process = subprocess.Popen(["cargo", *sys.argv[1:]], start_new_session=True)
+try:
+    status = process.wait(timeout=1800)
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    raise SystemExit("Cargo phase exceeded 1800-second deadline")
+raise SystemExit(status)
+PYTHON
+}
+
 if [[ "$mode" == "--check" ]]; then
   for package in "${packages[@]}"; do
     # `--list` checks file selection without resolving the alternate-registry
     # fallback locations. The real Cargo packaging check runs immediately
     # before each upload, after that crate's dependencies are in the index.
-    cargo package --locked --allow-dirty --list -p "$package" >/dev/null
+    bounded_cargo package --locked --allow-dirty --list -p "$package" >/dev/null
   done
 
   # A dependency with a local path but no explicit registry is normalized to
   # crates.io. That would split the Aster package family at publication time.
-  cargo metadata --locked --format-version 1 --no-deps \
+  bounded_cargo metadata --locked --format-version 1 --no-deps \
     | python3 -c '
 import json
 import sys
@@ -67,7 +85,7 @@ if errors:
   # registry fallback. `git + version` without this field becomes crates.io in
   # the normalized package, which can compile locally while publishing the
   # wrong package identity.
-  cargo metadata --locked --format-version 1 --no-deps \
+  bounded_cargo metadata --locked --format-version 1 --no-deps \
     | python3 -c '
 import json
 import sys
@@ -106,7 +124,7 @@ if errors:
   # Fory's runtime and proc macro must remain an exact validated pair. A
   # seemingly narrow `"1.3"` requirement can select a newer 1.x release in a
   # consumer lockfile even while this repository's lock still contains 1.3.0.
-  cargo metadata --locked --format-version 1 --no-deps \
+  bounded_cargo metadata --locked --format-version 1 --no-deps \
     | python3 -c '
 import json
 import sys
@@ -141,7 +159,7 @@ if errors:
   # Compute the reverse registry boundary to catch second-order bridges (for
   # example portmapper -> netwatch -> noq). The manifest is the release BOM;
   # this check prevents it drifting from the resolved all-feature workspace.
-  cargo metadata --locked --format-version 1 --all-features \
+  bounded_cargo metadata --locked --format-version 1 --all-features \
     | python3 -c '
 import json
 import re
@@ -202,11 +220,11 @@ fi
 
 # This is also the acceptance test for anonymous consumer access. A 401 here
 # means Forgejo's owner/instance package visibility has not been opened yet.
-curl --fail-with-body --silent --show-error \
+curl --connect-timeout 10 --max-time 60 --fail-with-body --silent --show-error \
   "https://forge.emrul.dev/api/packages/Aster/cargo/config.json" >/dev/null
 
 registry_url="https://forge.emrul.dev/api/packages/Aster/cargo"
-metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
+metadata="$(bounded_cargo metadata --locked --format-version 1 --no-deps)"
 
 package_version() {
   python3 -c '
@@ -241,60 +259,21 @@ if [[ -z "${CARGO_REGISTRIES_ASTER_TOKEN:-}" ]]; then
   export CARGO_REGISTRIES_ASTER_TOKEN="Bearer ${ASTER_CARGO_TOKEN}"
 fi
 
-index_path() {
-  local name length
-  name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  length="${#name}"
-  case "$length" in
-    1) printf '1/%s\n' "$name" ;;
-    2) printf '2/%s\n' "$name" ;;
-    3) printf '3/%s/%s\n' "${name:0:1}" "$name" ;;
-    *) printf '%s/%s/%s\n' "${name:0:2}" "${name:2:2}" "$name" ;;
-  esac
-}
-
-crate_is_indexed() {
-  local package version
-  package="$1"
-  version="$2"
-  curl --fail --silent "${registry_url}/$(index_path "$package")" 2>/dev/null \
-    | python3 -c '
-import json
-import sys
-
-version = sys.argv[1]
-found = False
-for line in sys.stdin:
-    if line.strip() and json.loads(line).get("vers") == version:
-        found = True
-raise SystemExit(0 if found else 1)
-' "$version"
-}
-
-wait_until_indexed() {
-  local package version attempt
-  package="$1"
-  version="$2"
-  for ((attempt = 1; attempt <= 30; attempt++)); do
-    if crate_is_indexed "$package" "$version"; then
-      return 0
-    fi
-    sleep 2
-  done
-  echo "timed out waiting for ${package} ${version} in the Aster sparse index" >&2
-  return 1
-}
-
+target_directory="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' <<<"$metadata")"
 for package in "${packages[@]}"; do
   version="$(package_version "$package")"
-  if crate_is_indexed "$package" "$version"; then
-    echo "${package} ${version} is already immutable in the Aster registry; skipping"
+  # Build the precise candidate archive before accepting an existing version.
+  # Dependencies become visible in order; verification still runs for new uploads.
+  bounded_cargo package --registry aster --locked --allow-dirty --no-verify -p "$package"
+  archive="$target_directory/package/$package-$version.crate"
+  if python3 "$repo/scripts/release/cargo-publication-identity.py" "$registry_url" "$package" "$version" "$archive"; then
+    echo "${package} ${version} has identical archive and index identity; skipping"
     continue
+  else
+    status=$?
+    [[ "$status" == 3 ]] || exit "$status"
   fi
-
-  # A single all-workspace dry run cannot validate a first release: each
-  # parent needs its just-published workspace dependencies in the index.
-  cargo publish --registry aster --locked --allow-dirty -p "$package" --dry-run
-  cargo publish --registry aster --locked --allow-dirty -p "$package"
-  wait_until_indexed "$package" "$version"
+  bounded_cargo publish --registry aster --locked --allow-dirty -p "$package" --dry-run
+  bounded_cargo publish --registry aster --locked --allow-dirty -p "$package"
+  python3 "$repo/scripts/release/cargo-publication-identity.py" "$registry_url" "$package" "$version" "$archive" --wait
 done
