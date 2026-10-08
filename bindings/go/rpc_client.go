@@ -20,6 +20,7 @@ import (
 	"iter"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -454,11 +455,14 @@ var errCallClosed = errors.New("aster: call is over")
 // natively (aster_call_cancel: FLAG_CANCEL + stream reset), which also wakes
 // a blocked recv.
 type rpcCall struct {
-	rc   *RpcConnection
-	ctx  context.Context
-	h    C.aster_call_t
-	stop func() bool
-	once sync.Once
+	rc       *RpcConnection
+	ctx      context.Context
+	h        C.aster_call_t
+	stop     func() bool
+	once     sync.Once
+	opMu     sync.Mutex
+	released bool
+	active   sync.WaitGroup
 }
 
 func openCall(ctx context.Context, rc *RpcConnection, pattern MethodPattern, service, method string, o *callOptions) (*rpcCall, error) {
@@ -508,19 +512,42 @@ func (c *rpcCall) readSingle(kind string) ([]byte, error) {
 	return last, nil
 }
 
-// cancel cancels the call (no-op once it is over or released).
-func (c *rpcCall) cancel() { C.aster_call_cancel(c.rc.rt(), c.h) }
+// beginOperation leases the handle without holding a lock across native IO.
+func (c *rpcCall) beginOperation() bool {
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	if c.released {
+		return false
+	}
+	c.active.Add(1)
+	return true
+}
+func (c *rpcCall) cancel() {
+	if !c.beginOperation() {
+		return
+	}
+	defer c.active.Done()
+	C.aster_call_cancel(c.rc.rt(), c.h)
+}
 
-// release frees the call, cancelling it if unfinished.
+// release stops new operations, wakes any flow-controlled send, drains operations,
+// then frees the native handle. Cancellation never waits behind a blocked send.
 func (c *rpcCall) release() {
 	c.once.Do(func() {
 		c.stop()
+		c.opMu.Lock()
+		c.released = true
+		c.opMu.Unlock()
+		C.aster_call_cancel(c.rc.rt(), c.h)
+		c.active.Wait()
 		C.aster_call_release(c.rc.rt(), c.h)
 	})
 }
-
-// send sends one request payload; errCallClosed when the call is over.
 func (c *rpcCall) send(payload []byte, end bool) error {
+	if !c.beginOperation() {
+		return errCallClosed
+	}
+	defer c.active.Done()
 	p, n := cBytesArg(payload)
 	var e C.uint8_t
 	if end {
@@ -541,6 +568,10 @@ func (c *rpcCall) send(payload []byte, end bool) error {
 // (recvSliceMs); between slices the call's context is checked, so a recv
 // returns once ctx ends even if the native cancel has not woken it.
 func (c *rpcCall) recv() ([]byte, error) {
+	if !c.beginOperation() {
+		return nil, &RpcError{Code: StatusCancelled, Message: "call already released"}
+	}
+	defer c.active.Done()
 	var ptr *C.uint8_t
 	var n C.uint32_t
 	var buf C.uint64_t
@@ -638,7 +669,11 @@ func callServerStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 }
 
 // CallClientStream makes a client-streaming call: every request from reqs
-// (each sent as it is produced), then one response.
+// (each sent as it is produced), then one response. Requests run on a sender
+// goroutine concurrently with receiving the response, so an early server reply
+// ends the RPC even when the source is blocked. An arbitrary blocked iter.Seq
+// cannot be stopped by the SDK: sources must observe ctx or release their own
+// waits/resources after the call returns. Later yields are refused.
 func CallClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, reqs iter.Seq[*Req], opts ...CallOption) (*Resp, error) {
 	o := buildOptions(opts)
 	if ch := rc.chain(o); ch != nil {
@@ -654,33 +689,80 @@ func callClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 		return nil, err
 	}
 	defer c.release()
-	closed := false
-	for r := range reqs {
-		payload, err := rc.codec.Encode(r)
-		if err != nil {
-			return nil, fmt.Errorf("encode request: %w", err)
-		}
-		if err := c.send(payload, false); err != nil {
-			if errors.Is(err, errCallClosed) {
-				closed = true // the trailer says why
-				break
+	var terminal atomic.Bool
+	defer terminal.Store(true)
+	type sendResult struct {
+		err        error
+		panicValue any
+	}
+	sent := make(chan sendResult, 1)
+	productionEnded := make(chan struct{})
+	var endProduction sync.Once
+	end := func() { endProduction.Do(func() { close(productionEnded) }) }
+	go func() {
+		result := sendResult{}
+		defer func() {
+			result.panicValue = recover()
+			end()
+			sent <- result
+			if !terminal.Load() && (result.err != nil || result.panicValue != nil) {
+				c.cancel()
 			}
-			return nil, err
+		}()
+		for r := range reqs {
+			if terminal.Load() {
+				return
+			}
+			payload, err := rc.codec.Encode(r)
+			if err != nil {
+				result.err = fmt.Errorf("encode request: %w", err)
+				return
+			}
+			if terminal.Load() {
+				return
+			}
+			if err := c.send(payload, false); err != nil {
+				if !errors.Is(err, errCallClosed) {
+					result.err = err
+				}
+				return
+			}
 		}
-	}
-	if !closed && ctx.Err() != nil {
-		// The context ended while requests were produced: cancel rather than
-		// half-close, so the server sees a cancel, not a clean end of stream
-		// (the AfterFunc cancel may not have run yet).
-		c.cancel()
-		return nil, ctxFailure(ctx)
-	}
-	if !closed {
+		end() // No user producer remains; the final native send may be joined safely.
+		if terminal.Load() {
+			return
+		}
+		if ctx.Err() != nil {
+			result.err = ctxFailure(ctx)
+			return
+		}
 		if err := c.send(nil, true); err != nil && !errors.Is(err, errCallClosed) {
-			return nil, err
+			result.err = err
+		}
+	}()
+
+	last, err := c.readSingle("client-stream")
+	terminal.Store(true)
+	var result sendResult
+	select {
+	case <-productionEnded:
+		result = <-sent
+	default:
+		select {
+		case result = <-sent:
+		default:
 		}
 	}
-	last, err := c.readSingle("client-stream")
+	// Preserve a source panic on the invoking goroutine. A source still
+	// parked after terminal completion must cooperate before its worker
+	// exits; that worker cannot send again.
+	if result.panicValue != nil {
+		panic(result.panicValue)
+	}
+	if result.err != nil {
+		return nil, result.err
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -767,7 +849,8 @@ func (b *BidiCall[Req, Resp]) Close() { b.c.release() }
 // sent as soon as the iterator yields it (on its own goroutine) while
 // responses are yielded, so ping-pong protocols work. A send failure ends
 // the request side; the trailer reports the outcome. Breaking out early
-// cancels the call.
+// cancels the call. A blocked source must observe ctx or release its own waits;
+// cancellation cannot interrupt arbitrary source code.
 func CallBidiStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, reqs iter.Seq[*Req], opts ...CallOption) iter.Seq2[*Resp, error] {
 	return func(yield func(*Resp, error) bool) {
 		b, err := OpenBidiStream[Req, Resp](ctx, rc, service, method, opts...)

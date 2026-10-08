@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -335,7 +336,12 @@ public sealed class RpcConnection : IAsyncDisposable
             yield return _codec.Decode<TResp>(payload);
     }
 
-    /// <summary>A client-streaming call: a stream of requests, one response.</summary>
+    /// <summary>A client-streaming call: requests are produced concurrently with the response.</summary>
+    /// <remarks>An early native response ends the RPC without waiting for a source that ignores
+    /// cancellation. Such a source must release its own pending MoveNext operation; disposal is
+    /// deferred until that operation ends, and arbitrary user cleanup cannot delay the RPC.
+    /// With retry interceptors, requests must be replayable: each enumeration must reproduce
+    /// the same sequence independently; a consumed one-shot source cannot be retried safely.</remarks>
     public Task<TResp> ClientStreamAsync<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
         CallOptions? options = null, CancellationToken cancellationToken = default)
     {
@@ -352,8 +358,27 @@ public sealed class RpcConnection : IAsyncDisposable
     {
         await using var call = await PayloadCall.OpenAsync(this, PatternClientStream, new CallSpec(service, method, options), cancellationToken)
             .ConfigureAwait(false);
-        await call.SendAllAsync(requests, _codec, cancellationToken).ConfigureAwait(false);
-        byte[] response = await call.ReadSingleAsync(cancellationToken).ConfigureAwait(false);
+        using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var sending = Task.Run(() => call.SendAllAsync(requests, _codec, sendCts.Token), CancellationToken.None);
+        var reading = call.ReadSingleAsync(cancellationToken);
+        ObserveDetached(sending);
+        ObserveDetached(reading);
+        byte[] response;
+        try
+        {
+            if (await Task.WhenAny(sending, reading).ConfigureAwait(false) == sending)
+            {
+                try { await sending.ConfigureAwait(false); }
+                catch
+                {
+                    // Producer failure cancels natively; drain the owned reader before release.
+                    try { await reading.ConfigureAwait(false); } catch { }
+                    throw;
+                }
+            }
+            response = await reading.ConfigureAwait(false);
+        }
+        finally { sendCts.Cancel(); }
         if (response.Length == 0)
             throw new RpcError(StatusCode.Internal, "OK trailer with no response frame");
         return _codec.Decode<TResp>(response);
@@ -365,6 +390,8 @@ public sealed class RpcConnection : IAsyncDisposable
         => ClientStreamAsync<TReq, TResp>(service, method, requests.ToAsyncEnumerable(), options, cancellationToken);
 
     /// <summary>A bidi-streaming call: requests are sent concurrently with reading responses.</summary>
+    /// <remarks>Sources should observe their cancellation token. An uncooperative pending
+    /// MoveNext cannot be forcibly stopped; source disposal follows its eventual completion.</remarks>
     public IAsyncEnumerable<TResp> BidiStreamAsync<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
         CallOptions? options = null, CancellationToken cancellationToken = default)
     {
@@ -398,9 +425,15 @@ public sealed class RpcConnection : IAsyncDisposable
         finally
         {
             sendCts.Cancel();
-            try { await sending.ConfigureAwait(false); }
-            catch (OperationCanceledException) { }
+            // Source MoveNext/Dispose may ignore cancellation. The RPC still ends.
+            ObserveDetached(sending);
         }
+    }
+
+    private static void ObserveDetached(Task task)
+    {
+        _ = task.ContinueWith(static failed => { _ = failed.Exception; }, CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     public ValueTask DisposeAsync()
@@ -436,6 +469,9 @@ public sealed class RpcConnection : IAsyncDisposable
         private readonly ulong _call;
         private CancellationTokenRegistration _cancel;
         private int _released;
+        private readonly object _operationGate = new();
+        private int _activeOperations;
+        private ExceptionDispatchInfo? _producerError;
 
         private PayloadCall(RpcConnection owner, ulong call)
         {
@@ -457,14 +493,41 @@ public sealed class RpcConnection : IAsyncDisposable
             return call;
         }
 
+        private bool BeginOperation()
+        {
+            lock (_operationGate)
+            {
+                if (_released != 0) return false;
+                _activeOperations++;
+                return true;
+            }
+        }
+
+        private void EndOperation()
+        {
+            lock (_operationGate)
+            {
+                _activeOperations--;
+                Monitor.PulseAll(_operationGate);
+            }
+        }
+
         private void CancelNative()
         {
-            if (Volatile.Read(ref _released) == 0)
-                Native.aster_call_cancel(_owner.Rt, _call);
+            if (!BeginOperation()) return;
+            try { Native.aster_call_cancel(_owner.Rt, _call); }
+            finally { EndOperation(); }
         }
 
         /// <summary>Sends one request payload; false when the call is over (the trailer says why).</summary>
         public unsafe bool Send(byte[] payload, bool end)
+        {
+            if (!BeginOperation()) return false;
+            try { return SendCore(payload, end); }
+            finally { EndOperation(); }
+        }
+
+        private unsafe bool SendCore(byte[] payload, bool end)
         {
             int r;
             fixed (byte* p = payload)
@@ -477,8 +540,15 @@ public sealed class RpcConnection : IAsyncDisposable
         /// <summary>Several payloads framed into as few writes as possible (client-stream / bidi).</summary>
         private unsafe bool SendMany(List<byte[]> payloads, bool end)
         {
+            if (!BeginOperation()) return false;
+            try { return SendManyCore(payloads, end); }
+            finally { EndOperation(); }
+        }
+
+        private unsafe bool SendManyCore(List<byte[]> payloads, bool end)
+        {
             if (payloads.Count <= 1)
-                return Send(payloads.Count == 0 ? Array.Empty<byte>() : payloads[0], end);
+                return SendCore(payloads.Count == 0 ? Array.Empty<byte>() : payloads[0], end);
             var pins = new GCHandle[payloads.Count];
             var descs = new Bytes[payloads.Count];
             try
@@ -510,28 +580,73 @@ public sealed class RpcConnection : IAsyncDisposable
         {
             var batch = new List<byte[]>();
             int bytes = 0;
-            await using var e = requests.GetAsyncEnumerator(ct);
-            while (true)
+            IAsyncEnumerator<TReq>? e = null;
+            Task<bool>? pending = null;
+            try
             {
-                ValueTask<bool> next = e.MoveNextAsync();
-                if (!next.IsCompleted && batch.Count > 0)
+                e = requests.GetAsyncEnumerator(ct);
+                while (true)
                 {
-                    if (!SendMany(batch, end: false)) return;
-                    batch.Clear();
-                    bytes = 0;
+                    ct.ThrowIfCancellationRequested();
+                    ValueTask<bool> next = e.MoveNextAsync();
+                    pending = next.IsCompleted ? null : next.AsTask();
+                    if (pending is not null && batch.Count > 0)
+                    {
+                        if (!SendMany(batch, end: false)) return;
+                        batch.Clear();
+                        bytes = 0;
+                    }
+                    bool more = pending is null ? next.GetAwaiter().GetResult()
+                        : await pending.WaitAsync(ct).ConfigureAwait(false);
+                    pending = null;
+                    ct.ThrowIfCancellationRequested();
+                    if (!more) break;
+                    byte[] payload = codec.Encode(e.Current);
+                    ct.ThrowIfCancellationRequested();
+                    batch.Add(payload);
+                    bytes += payload.Length;
+                    if (bytes >= BatchBytes || batch.Count >= BatchCount)
+                    {
+                        if (!SendMany(batch, end: false)) return;
+                        batch.Clear();
+                        bytes = 0;
+                    }
                 }
-                if (!await next.ConfigureAwait(false)) break;
-                byte[] payload = codec.Encode(e.Current);
-                batch.Add(payload);
-                bytes += payload.Length;
-                if (bytes >= BatchBytes || batch.Count >= BatchCount)
+                ct.ThrowIfCancellationRequested();
+                SendMany(batch, end: true);
+            }
+            catch (Exception error)
+            {
+                if (!ct.IsCancellationRequested)
+                    Volatile.Write(ref _producerError, ExceptionDispatchInfo.Capture(error));
+                CancelNative();
+                throw;
+            }
+            finally
+            {
+                if (e is not null && pending is { IsCompleted: false })
                 {
-                    if (!SendMany(batch, end: false)) return;
-                    batch.Clear();
-                    bytes = 0;
+                    // Enumerators need not support Dispose concurrently with MoveNext.
+                    // Await that outstanding user operation only in detached cleanup.
+                    async Task Cleanup()
+                    {
+                        try { await pending.ConfigureAwait(false); } catch { }
+                        await e.DisposeAsync().ConfigureAwait(false);
+                    }
+                    ObserveDetached(Cleanup());
+                }
+                else if (e is not null)
+                {
+                    try { await e.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception error)
+                    {
+                        if (!ct.IsCancellationRequested)
+                            Volatile.Write(ref _producerError, ExceptionDispatchInfo.Capture(error));
+                        CancelNative();
+                        throw;
+                    }
                 }
             }
-            SendMany(batch, end: true);
         }
 
         private enum RecvKind { Payload, Trailer, Timeout, Closed }
@@ -576,6 +691,7 @@ public sealed class RpcConnection : IAsyncDisposable
                 var (kind, bytes) = Recv(0);
                 if (kind == RecvKind.Timeout)
                     (kind, bytes) = await Task.Run(WaitRecv, CancellationToken.None).ConfigureAwait(false);
+                Volatile.Read(ref _producerError)?.Throw();
                 switch (kind)
                 {
                     case RecvKind.Payload:
@@ -610,10 +726,21 @@ public sealed class RpcConnection : IAsyncDisposable
 
         public ValueTask DisposeAsync()
         {
-            // Waits for a running cancel callback, then frees the call (cancelling it if unfinished).
+            // The owning response reader is drained before disposal. Stop new send/cancel
+            // operations, wake active sends, and drain their leases before native release.
             _cancel.Dispose();
-            if (Interlocked.Exchange(ref _released, 1) == 0)
+            lock (_operationGate)
+            {
+                if (_released != 0) return ValueTask.CompletedTask;
+                _released = 1;
+            }
+            // Cancel outside the gate: a flow-controlled send needs cancellation to drain.
+            Native.aster_call_cancel(_owner.Rt, _call);
+            lock (_operationGate)
+            {
+                while (_activeOperations != 0) Monitor.Wait(_operationGate);
                 Native.aster_call_release(_owner.Rt, _call);
+            }
             return ValueTask.CompletedTask;
         }
     }
