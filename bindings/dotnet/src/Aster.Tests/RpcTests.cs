@@ -61,6 +61,7 @@ public class RpcTests : IAsyncLifetime
     private AsterServer _server = null!;
     private AsterClient _client = null!;
     private RpcConnection _conn = null!;
+    private RpcCodecDiagnostics? _codecDiagnostics;
     private readonly TaskCompletionSource<CancellationToken> _slowCancelled = new();
     private readonly TaskCompletionSource<bool> _hangStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _hangCancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -158,13 +159,16 @@ public class RpcTests : IAsyncLifetime
     public async Task InitializeAsync()
     {
         var echo = InteropEcho("dotnet");
+        var extra = Extra();
+        _codecDiagnostics = RpcCodecDiagnostics.Create();
         _server = await AsterServer.StartAsync(new AsterServerOptions
         {
             Config = Loopback with { AllowAllConsumers = true },
-            Services = { echo, Extra() },
+            Services = { echo, extra },
+            Codec = _codecDiagnostics?.For("server", echo, extra),
             Interceptors = { new RequireTokenInterceptor() },
         });
-        _client = await AsterClient.StartAsync(Loopback);
+        _client = await AsterClient.StartAsync(Loopback, _codecDiagnostics?.For("client", echo));
         _client.RegisterTypes(echo);
         _conn = await _client.ConnectAsync(await _server.TicketAsync());
     }
@@ -173,6 +177,7 @@ public class RpcTests : IAsyncLifetime
     {
         await _client.DisposeAsync();
         await _server.DisposeAsync();
+        _codecDiagnostics?.Dispose();
     }
 
     [Fact]
