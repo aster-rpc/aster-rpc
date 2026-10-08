@@ -4,7 +4,9 @@ package aster
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -98,5 +100,116 @@ func TestHealthConfig_ServerStartsListenerFromConfig(t *testing.T) {
 	}
 	if code, body := httpGet(t, addr, "/readyz"); code != 200 {
 		t.Fatalf("config check recovery = %d %s", code, body)
+	}
+}
+
+func TestHealthConfig_LiveDisabledBindPrecedenceAndReuse(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	port := uint16(occupied.Addr().(*net.TCPAddr).Port)
+	cfg := testCfg()
+	cfg.AllowAllConsumers = true
+	cfg.HealthPort = port
+	off := false
+	cfg.HealthEnabled = &off
+	disabled := newRPCFixture(t, ServerOptions{Config: cfg})
+	if disabled.srv.Health() != nil {
+		t.Fatal("disabled config created listener")
+	}
+	disabled.srv.Close()
+	on := true
+	cfg.HealthEnabled = &on
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	bad, err := StartServer(ctx, ServerOptions{Config: cfg})
+	if err == nil {
+		bad.Close()
+		t.Fatal("occupied health bind succeeded")
+	}
+	explicit := newRPCFixture(t, ServerOptions{Config: cfg, Health: &HealthConfig{Host: "127.0.0.1", Port: 0}})
+	addr, err := explicit.srv.Health().Addr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr == occupied.Addr().String() {
+		t.Fatal("explicit health ignored")
+	}
+	if code, body := httpGet(t, addr, "/readyz"); code != 200 {
+		t.Fatalf("ready=%d %s", code, body)
+	}
+	explicit.srv.Close()
+	rebound, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("released port: %v", err)
+	}
+	rebound.Close()
+}
+
+func TestHealthConfig_DirectHealthUsesNodeConfig(t *testing.T) {
+	cfg := testCfg()
+	on := true
+	cfg.HealthEnabled = &on
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	node, err := StartNode(ctx, cfg, NodeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	// The caller can mutate its config after creation without changing this node.
+	on = false
+	for _, opts := range []*HealthConfig{nil, {FromNodeConfig: true}} {
+		health, err := StartHealth(node, opts)
+		if err != nil {
+			t.Fatalf("node health config not used: %v", err)
+		}
+		addr, err := health.Addr()
+		if err != nil {
+			health.Stop()
+			t.Fatal(err)
+		}
+		if code, body := httpGet(t, addr, "/healthz"); code != 200 {
+			health.Stop()
+			t.Fatalf("health %d %s", code, body)
+		}
+		health.Stop()
+	}
+}
+
+func TestHealthConfig_DirectDisabledAllowsExplicitOverride(t *testing.T) {
+	cfg := testCfg()
+	off := false
+	cfg.HealthEnabled = &off
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	node, err := StartNode(ctx, cfg, NodeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	for _, opts := range []*HealthConfig{nil, {FromNodeConfig: true}} {
+		h, err := StartHealth(node, opts)
+		if h != nil {
+			h.Stop()
+			t.Fatal("disabled node config started health")
+		}
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("disabled error: %v", err)
+		}
+	}
+	h, err := StartHealth(node, &HealthConfig{Host: "127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Stop()
+	addr, err := h.Addr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := httpGet(t, addr, "/healthz"); code != 200 {
+		t.Fatalf("explicit health %d %s", code, body)
 	}
 }

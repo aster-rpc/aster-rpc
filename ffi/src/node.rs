@@ -218,6 +218,16 @@ pub(crate) unsafe fn lower_config(c: &aster_config_t) -> Result<AsterConfig, Str
         ));
     }
     let mut cfg = AsterConfig::default();
+    // SAFETY: storage is NULL for caller-built configs, or the library-owned
+    // ConfigStorage from fill_config, kept alive until aster_config_release.
+    // Health fields have no public ABI slots; preserve their parsed values here.
+    if let Some(storage) = c.storage.cast::<ConfigStorage>().as_ref() {
+        if let Some(health) = &storage.health {
+            cfg.health_port = health.port;
+            cfg.health_host.clone_from(&health.host);
+            cfg.health_enabled = health.enabled;
+        }
+    }
 
     let mut urls = Vec::new();
     for (i, u) in list_view(&c.relay_urls).iter().enumerate() {
@@ -397,6 +407,13 @@ pub(crate) unsafe fn lower_config(c: &aster_config_t) -> Result<AsterConfig, Str
 struct ConfigStorage {
     bufs: Vec<Vec<u8>>,
     lists: Vec<Vec<aster_bytes_t>>,
+    health: Option<StoredHealthConfig>,
+}
+
+struct StoredHealthConfig {
+    port: u16,
+    host: String,
+    enabled: Option<bool>,
 }
 
 impl ConfigStorage {
@@ -440,10 +457,21 @@ fn path_str(p: &Option<PathBuf>) -> Option<String> {
     p.as_ref().map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Fill `out` from `cfg`. Allocates storage only when some string or list is
-/// non-empty; otherwise `out.storage` is NULL.
+/// Fill `out` from `cfg`. Allocates storage for non-empty strings/lists or
+/// non-default health metadata; otherwise `out.storage` is NULL.
 pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
     let mut st = ConfigStorage::default();
+    let defaults = AsterConfig::default();
+    if cfg.health_port != defaults.health_port
+        || cfg.health_host != defaults.health_host
+        || cfg.health_enabled != defaults.health_enabled
+    {
+        st.health = Some(StoredHealthConfig {
+            port: cfg.health_port,
+            host: cfg.health_host.clone(),
+            enabled: cfg.health_enabled,
+        });
+    }
     let (relay_mode, urls) = match &cfg.relay_mode {
         RelayMode::Default => (aster_relay_mode_t::ASTER_RELAY_MODE_DEFAULT, Vec::new()),
         RelayMode::Custom(u) => (
@@ -555,7 +583,7 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
         transport_datagram_send_buffer_size: dsb,
         storage: std::ptr::null_mut(),
     };
-    if !st.bufs.is_empty() || !st.lists.is_empty() {
+    if !st.bufs.is_empty() || !st.lists.is_empty() || st.health.is_some() {
         out.storage = Box::into_raw(Box::new(st)) as *mut c_void;
     }
 }
@@ -1225,6 +1253,9 @@ mod tests {
         assert_eq!(a.storage_path, b.storage_path);
         assert_eq!(a.gc_interval, b.gc_interval);
         assert_eq!(a.bind_addr, b.bind_addr);
+        assert_eq!(a.health_port, b.health_port);
+        assert_eq!(a.health_host, b.health_host);
+        assert_eq!(a.health_enabled, b.health_enabled);
         assert_eq!(a.alpns, b.alpns);
         assert_eq!(a.identity_file, b.identity_file);
         assert_eq!(a.local_discovery, b.local_discovery);
@@ -1399,6 +1430,9 @@ mod tests {
         "ASTER_PORTMAPPER_CONFIG",
         "ASTER_TRANSPORT_INITIAL_MTU",
         "ASTER_SECRET_KEY",
+        "ASTER_HEALTH_PORT",
+        "ASTER_HEALTH_HOST",
+        "ASTER_HEALTH_ENABLED",
     ];
 
     fn clear_env() {
@@ -1419,6 +1453,9 @@ mod tests {
         std::env::set_var("ASTER_PORTMAPPER_CONFIG", "disabled");
         std::env::set_var("ASTER_TRANSPORT_INITIAL_MTU", "1300");
         std::env::set_var("ASTER_SECRET_KEY", "07".repeat(32));
+        std::env::set_var("ASTER_HEALTH_PORT", "18080");
+        std::env::set_var("ASTER_HEALTH_HOST", "0.0.0.0");
+        std::env::set_var("ASTER_HEALTH_ENABLED", "false");
         let mut c: aster_config_t = unsafe { std::mem::zeroed() };
         let status = unsafe { aster_config_from_env(&mut c) };
         clear_env();
@@ -1441,6 +1478,10 @@ mod tests {
         assert_eq!(c.transport_set, ASTER_TRANSPORT_INITIAL_MTU);
         assert_eq!(c.transport_initial_mtu, 1300);
         assert_eq!(unsafe { view(&c.secret_key) }, &[7u8; 32]);
+        let health = unsafe { lower_config(&c) }.unwrap();
+        assert_eq!(health.health_port, 18080);
+        assert_eq!(health.health_host, "0.0.0.0");
+        assert_eq!(health.health_enabled, Some(false));
         assert!(!c.storage.is_null());
         assert_eq!(unsafe { aster_config_release(&mut c) }, 0);
         assert!(c.storage.is_null());
@@ -1487,6 +1528,11 @@ transport_max_concurrent_bidi_streams = 512
 transport_keep_alive_interval_ms = 2000
 transport_send_fairness = true
 
+[health]
+port = 18081
+host = "0.0.0.0"
+enabled = true
+
 [identity]
 file = "/etc/aster/.aster-identity"
 "#,
@@ -1512,6 +1558,9 @@ file = "/etc/aster/.aster-identity"
         assert_eq!(cfg.storage_path, Some(PathBuf::from("/var/lib/aster-test")));
         assert_eq!(cfg.gc_interval, Some(Duration::from_secs(60)));
         assert_eq!(cfg.bind_addr.as_deref(), Some("0.0.0.0:9000"));
+        assert_eq!(cfg.health_port, 18081);
+        assert_eq!(cfg.health_host, "0.0.0.0");
+        assert_eq!(cfg.health_enabled, Some(true));
         assert_eq!(
             cfg.secret_key_file,
             Some(PathBuf::from("/var/lib/aster-test/node.key"))
@@ -1574,5 +1623,31 @@ file = "/etc/aster/.aster-identity"
         assert_eq!(status, aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32);
         assert!(c.storage.is_null());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn health_config_survives_owned_round_trip_and_public_overrides() {
+        for enabled in [None, Some(true), Some(false)] {
+            let original = AsterConfig {
+                health_port: 18080,
+                health_host: "0.0.0.0".into(),
+                health_enabled: enabled,
+                ..Default::default()
+            };
+            let mut c: aster_config_t = unsafe { std::mem::zeroed() };
+            fill_config(&original, &mut c);
+            // Caller-owned public overrides remain independent of opaque metadata.
+            let bind = b"127.0.0.1:0";
+            c.bind_addr = aster_bytes_t {
+                ptr: bind.as_ptr(),
+                len: bind.len(),
+            };
+            let lowered = unsafe { lower_config(&c) }.unwrap();
+            assert_eq!(unsafe { aster_config_release(&mut c) }, 0);
+            // The lowered Rust config must own its strings after C storage release.
+            assert_eq!(lowered.health_port, original.health_port);
+            assert_eq!(lowered.health_host, original.health_host);
+            assert_eq!(lowered.health_enabled, enabled);
+            assert_eq!(lowered.bind_addr.as_deref(), Some("127.0.0.1:0"));
+        }
     }
 }

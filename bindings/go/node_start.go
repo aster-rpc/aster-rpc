@@ -67,6 +67,7 @@ func StartNode(ctx context.Context, cfg AsterConfig, opts NodeOptions) (*Node, e
 }
 
 func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOptions) (*Node, error) {
+	healthSettings := &nodeHealthSettings{host: cfg.HealthHost, port: cfg.HealthPort, enabled: cfg.IsHealthEnabled()}
 	var a cArena
 	defer a.free()
 	native, err := cfg.toNative(&a, opts.ExtraALPNs)
@@ -91,10 +92,11 @@ func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOpt
 	}
 	rt.releaseEventBuffer(ev)
 	n := &Node{
-		handle:      ev.Handle,
-		runtime:     rt,
-		connections: make(chan AcceptedAster, 64),
-		ownsRuntime: true,
+		handle:         ev.Handle,
+		runtime:        rt,
+		connections:    make(chan AcceptedAster, 64),
+		ownsRuntime:    true,
+		healthSettings: healthSettings,
 	}
 	rt.registerAcceptHandler(n.handle, n)
 	if opts.Gate == nil && cfg.EnableHooks {

@@ -666,6 +666,11 @@ async def test_asterserver_starts_ops_endpoints_from_config_and_counts_calls():
         server.serve()
         status, _, body = await get(addr, "/readyz")
         assert status == 200 and json.loads(body)["services"] == 1
+        check = health.check("config-cache")
+        assert (await get(addr, "/readyz"))[0] == 503
+        check.set(True)
+        assert (await get(addr, "/readyz"))[0] == 200
+
 
         async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:
             svc = await client.client(O6InprocEcho)
@@ -1147,3 +1152,44 @@ def test_interpreter_exit_joins_the_drain_thread():
     )
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert proc.stdout.strip().endswith("done")
+
+
+async def test_health_live_disabled_bind_failure_and_port_reuse():
+    import socket
+    occupied = socket.socket()
+    occupied.bind(("127.0.0.1", 0))
+    occupied.listen()
+    port = occupied.getsockname()[1]
+    cfg = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0",
+                      health_port=port, health_enabled=False)
+    try:
+        off = AsterServer(services=[O6InprocEcho()], allow_all_consumers=True, config=cfg)
+        try:
+            await off.start()
+            assert off.health is None
+        finally:
+            await off.close()
+        conflict = AsterServer(services=[O6InprocEcho()], allow_all_consumers=True,
+                               config=cfg.replace(health_enabled=True))
+        try:
+            with pytest.raises(Exception) as refused:
+                await asyncio.wait_for(conflict.start(), 10)
+            assert not isinstance(refused.value, (TimeoutError, asyncio.TimeoutError))
+            assert "bind" in str(refused.value).lower() or "address" in str(refused.value).lower()
+        finally:
+            await conflict.close()
+    finally:
+        occupied.close()
+    server = AsterServer(services=[O6InprocEcho()], allow_all_consumers=True,
+                         config=cfg.replace(health_enabled=True))
+    try:
+        await server.start()
+        server.serve()
+        assert (await get(server.health.addr, "/readyz"))[0] == 200
+    finally:
+        await server.close()
+    with socket.socket() as rebound:
+        # Match listener restart semantics; TCP TIME_WAIT is not a live listener.
+        rebound.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        rebound.bind(("127.0.0.1", port))
+        rebound.listen()

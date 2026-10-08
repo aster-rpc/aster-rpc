@@ -6,6 +6,7 @@
  */
 
 import { request } from 'node:http';
+import { createServer } from 'node:net';
 import { describe, it, expect } from 'vitest';
 import { AsterServer, logStats } from '@aster-rpc/aster';
 
@@ -68,4 +69,31 @@ describe('AsterServer health listener', () => {
     expect(server.health).toBeNull();
     await expect(get(`${base}/healthz`)).rejects.toThrow();
   });
+  it('honors disabled config, rejects bind conflict and releases its port', async () => {
+    const occupied = createServer();
+    await new Promise<void>((resolve) => occupied.listen(0, '127.0.0.1', resolve));
+    const port = (occupied.address() as import('node:net').AddressInfo).port;
+    const cfg = { ...OFFLINE, healthPort: port, healthEnabled: false };
+    const off = new AsterServer({ services: [], allowAllConsumers: true, config: cfg });
+    const conflict = new AsterServer({ services: [], allowAllConsumers: true,
+      config: { ...cfg, healthEnabled: true } });
+    try {
+      await off.start();
+      expect(off.health).toBeNull();
+      await expect(conflict.start()).rejects.toThrow();
+    } finally {
+      await off.close(); await conflict.close();
+      await new Promise<void>((resolve, reject) => occupied.close((err) => err ? reject(err) : resolve()));
+    }
+    const server = new AsterServer({ services: [], allowAllConsumers: true,
+      config: { ...cfg, healthEnabled: true } });
+    try { await server.start(); expect((await get(`http://127.0.0.1:${port}/readyz`)).status).toBe(200); }
+    finally { await server.close(); }
+    const rebound = createServer();
+    await new Promise<void>((resolve, reject) => {
+      rebound.once('error', reject); rebound.listen(port, '127.0.0.1', resolve);
+    });
+    await new Promise<void>((resolve) => rebound.close(() => resolve()));
+  });
+
 });

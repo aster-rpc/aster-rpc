@@ -83,6 +83,13 @@ public final class HealthServer implements AutoCloseable {
    * @throws IllegalArgumentException when that configuration has health disabled
    */
   public static HealthServer start(IrohNode node) {
+    var settings = node.healthSettings();
+    if (settings != null) {
+      if (!settings.enabled()) {
+        throw new IllegalArgumentException("health is disabled in the node's config");
+      }
+      return start(node, settings.host(), settings.port(), true);
+    }
     return start(node, null, 0, false);
   }
 

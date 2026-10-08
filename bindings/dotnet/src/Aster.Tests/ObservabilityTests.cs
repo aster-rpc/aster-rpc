@@ -774,6 +774,38 @@ public class ObservabilityTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, (await ProbeAsync(health.BaseUrl + "/readyz")).Code);
     }
 
+
+    [Fact]
+    public async Task Health_Config_Live_Disabled_Bind_Precedence_And_Reuse()
+    {
+        using var occupied = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        occupied.Start();
+        var port = (ushort)((System.Net.IPEndPoint)occupied.LocalEndpoint).Port;
+        var disabled = Loopback with { AllowAllConsumers = true, HealthEnabled = false, HealthPort = port };
+        await using (var off = await AsterServer.StartAsync(new AsterServerOptions { Config = disabled }))
+            Assert.Null(off.Health);
+        var conflict = disabled with { HealthEnabled = true };
+        await Assert.ThrowsAnyAsync<Exception>(() => AsterServer.StartAsync(new AsterServerOptions { Config = conflict }));
+        var explicitServer = await AsterServer.StartAsync(new AsterServerOptions
+        {
+            Config = conflict,
+            Health = new Aster.Health.HealthOptions { Host = "127.0.0.1", Port = 0 },
+        });
+        int actual;
+        try
+        {
+            Assert.NotNull(explicitServer.Health);
+            actual = int.Parse(explicitServer.Health!.Address.Split(':')[1]);
+            Assert.NotEqual((int)port, actual);
+            Assert.Equal(HttpStatusCode.OK, (await ProbeAsync(explicitServer.Health.BaseUrl + "/readyz")).Code);
+        }
+        finally { await explicitServer.DisposeAsync(); }
+        using var rebound = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, actual);
+        rebound.Server.SetSocketOption(System.Net.Sockets.SocketOptionLevel.Socket, System.Net.Sockets.SocketOptionName.ReuseAddress, true);
+        rebound.Start();
+        Assert.Equal(actual, ((System.Net.IPEndPoint)rebound.LocalEndpoint).Port);
+    }
+
     [Fact]
     public void Health_Config_Defaults_And_Toml()
     {

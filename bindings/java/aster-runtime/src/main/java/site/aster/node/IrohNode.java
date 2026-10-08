@@ -55,10 +55,22 @@ public class IrohNode implements AutoCloseable {
 
   private final boolean hooks;
 
-  private IrohNode(IrohRuntime runtime, long nodeHandle, boolean hooks) {
+  /** Immutable health-only settings captured when this node was created. */
+  public record HealthSettings(String host, int port, boolean enabled) {}
+
+  private final HealthSettings healthSettings;
+
+  /** The health-only creation settings; null for a node without source configuration. */
+  public HealthSettings healthSettings() {
+    return healthSettings;
+  }
+
+  private IrohNode(
+      IrohRuntime runtime, long nodeHandle, boolean hooks, HealthSettings healthSettings) {
     this.runtime = runtime;
     this.nodeHandle = nodeHandle;
     this.hooks = hooks;
+    this.healthSettings = healthSettings;
     this.connections = new MutableSharedFlow<>(0, 64, BufferOverflow.SUSPEND);
     this.acceptHandler = this::onAcceptEvent;
     registerAcceptHandler();
@@ -283,14 +295,21 @@ public class IrohNode implements AutoCloseable {
    */
   public static CompletableFuture<IrohNode> start(
       AsterConfig config, java.util.List<byte[]> alpns, Gate gate) {
+    AsterConfig effectiveConfig = config == null ? AsterConfig.builder().build() : config;
+    HealthSettings healthSettings =
+        new HealthSettings(
+            effectiveConfig.healthHost(),
+            effectiveConfig.healthPort(),
+            effectiveConfig.isHealthEnabled());
     IrohRuntime runtime = gate != null ? gate.runtime() : IrohRuntime.create();
     return CompletableFuture.supplyAsync(
         () -> {
           try {
             long handle =
-                NativeConfig.startNode(runtime, config, alpns, gate == null ? 0 : gate.handle());
-            boolean hooks = gate != null || (config != null && config.enableHooks());
-            return new IrohNode(runtime, handle, hooks);
+                NativeConfig.startNode(
+                    runtime, effectiveConfig, alpns, gate == null ? 0 : gate.handle());
+            boolean hooks = gate != null || effectiveConfig.enableHooks();
+            return new IrohNode(runtime, handle, hooks, healthSettings);
           } catch (RuntimeException e) {
             if (gate == null) runtime.close();
             throw e;

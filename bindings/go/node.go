@@ -20,6 +20,12 @@ import (
 	"unsafe"
 )
 
+type nodeHealthSettings struct {
+	host    string
+	port    uint16
+	enabled bool
+}
+
 // NodeAddr represents the address of a node.
 type NodeAddr struct {
 	EndpointID      string
@@ -54,7 +60,9 @@ type Node struct {
 
 	// ownsRuntime: started by StartNode; Close releases the runtime reference.
 	ownsRuntime bool
-	admissions  chan *AdmissionRequest
+	// Immutable health-only snapshot; nil identifies a node without source config.
+	healthSettings *nodeHealthSettings
+	admissions     chan *AdmissionRequest
 }
 
 // Connections returns a channel that emits AcceptedAster for each

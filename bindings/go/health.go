@@ -52,6 +52,13 @@ type HealthServer struct {
 // pipeline (or starting an environment-only one) with the Prometheus pull
 // reader. cfg nil = the node's AsterConfig.
 func StartHealth(node *Node, cfg *HealthConfig) (*HealthServer, error) {
+	if (cfg == nil || cfg.FromNodeConfig) && node.healthSettings != nil {
+		settings := node.healthSettings
+		if !settings.enabled {
+			return nil, fmt.Errorf("health is disabled in the node's config: %w", ErrInvalidArgument)
+		}
+		cfg = &HealthConfig{Host: settings.host, Port: settings.port}
+	}
 	EnsureObservability()
 	var a cArena
 	defer a.free()
