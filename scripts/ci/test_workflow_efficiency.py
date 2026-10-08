@@ -70,7 +70,7 @@ class RuntimeGates(unittest.TestCase):
             self.assertEqual(R.run(root, output, root, invoke), 1)
             self.assertEqual(len(calls), 5)
             self.assertEqual(calls[0][:5], ['npx', 'vitest', 'run', '--reporter=default', '--reporter=json'])
-            self.assertEqual(calls[1][-3:], ['observability-logs.test.ts=7', 'observability-export.test.ts=12', 'o7-server-health.test.ts=2'])
+            self.assertEqual(calls[1][-3:], ['observability-logs.test.ts=7', 'observability-export.test.ts=13', 'o7-server-health.test.ts=3'])
             evidence = json.loads(output.read_text())
             self.assertEqual(len(evidence['runtimes']['node']), 3)
             self.assertEqual(len(evidence['runtimes']['bun']), 2)
@@ -138,18 +138,41 @@ class RuntimeGates(unittest.TestCase):
     def test_actual_o7_checker_accepts_full_report_and_rejects_missing_failed_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / 'full.json'
-            pairs = [('observability-logs.test.ts', 7), ('observability-export.test.ts', 12), ('o7-server-health.test.ts', 2)]
+            pairs = [('observability-logs.test.ts', 7), ('observability-export.test.ts', 13), ('o7-server-health.test.ts', 3)]
             data = {'testResults': [{'name': '/suite/' + name, 'assertionResults': [{'status': 'passed'} for _ in range(count)]} for name, count in pairs]}
             data['testResults'].append({'name': '/suite/unrelated.test.ts', 'assertionResults': [{'status': 'passed'}]})
             command = ['node', str(ROOT / 'bindings/typescript/scripts/check-vitest-count.mjs'), str(report)] + [f'{name}={count}' for name, count in pairs]
             report.write_text(json.dumps(data))
-            self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
-            data['testResults'][0]['assertionResults'][0]['status'] = 'failed'
-            report.write_text(json.dumps(data))
-            self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+            self.assertEqual(subprocess.run(command, capture_output=True, timeout=10).returncode, 0)
+            original = json.dumps(data)
+            for status in ('failed', 'pending', 'todo'):
+                with self.subTest(status=status):
+                    data = json.loads(original)
+                    data['testResults'][0]['assertionResults'][0]['status'] = status
+                    report.write_text(json.dumps(data))
+                    self.assertNotEqual(subprocess.run(command, capture_output=True, timeout=10).returncode, 0)
+            for change in ('missing-case', 'extra-case'):
+                with self.subTest(change=change):
+                    data = json.loads(original)
+                    results = data['testResults'][0]['assertionResults']
+                    if change == 'missing-case':
+                        results.pop()
+                    else:
+                        results.append({'status': 'passed'})
+                    report.write_text(json.dumps(data))
+                    self.assertNotEqual(subprocess.run(command, capture_output=True, timeout=10).returncode, 0)
+            data = json.loads(original)
             data['testResults'].pop(0)
             report.write_text(json.dumps(data))
-            self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+            self.assertNotEqual(subprocess.run(command, capture_output=True, timeout=10).returncode, 0)
+
+    def test_macos_and_linux_observability_inventory_agrees(self):
+        workflow = (ROOT / '.forgejo/workflows/linux.yml').read_text()
+        macos = re.search(r'node ../../scripts/check-vitest-count\.mjs "\$out" \\\n((?:[^\n]*test\.ts=\d+[^\n]*\n)+)', workflow)
+        self.assertIsNotNone(macos)
+        pairs = re.findall(r'[\w-]+\.test\.ts=\d+', macos[1])
+        linux = R.gates(ROOT, ROOT / 'temporary')[1][3][3:]
+        self.assertEqual(pairs, linux)
 
     def test_java_bundle_uses_supplied_library_without_cargo(self):
         with tempfile.TemporaryDirectory() as directory:
