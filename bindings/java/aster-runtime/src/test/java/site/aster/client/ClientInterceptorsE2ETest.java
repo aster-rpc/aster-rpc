@@ -3,6 +3,7 @@ package site.aster.client;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -73,6 +74,8 @@ final class ClientInterceptorsE2ETest {
 
   /** Handlers of {@code slow} that started. */
   static final AtomicInteger SLOW_ENTERED = new AtomicInteger();
+
+  static final AtomicInteger CHAT_ENTERED = new AtomicInteger();
 
   static volatile CountDownLatch slowEntered = new CountDownLatch(1);
   static volatile CountDownLatch slowCancelled = new CountDownLatch(1);
@@ -246,31 +249,70 @@ final class ClientInterceptorsE2ETest {
             public void invoke(
                 Object impl, RequestStream in, Codec c, CallContext ctx, ResponseStream out)
                 throws Exception {
+              CHAT_ENTERED.incrementAndGet();
               byte[] next;
               while ((next = in.receive()) != null) {
                 out.send(c.encode(new Msg("re:" + msg(c, next).text(), 0)));
               }
             }
           };
-      return Map.of(
-          "echo",
-          echo,
-          "flaky",
-          flaky,
-          "boom",
-          boom,
-          "deadline",
-          deadline,
-          "slow",
-          slow,
-          "count",
-          count,
-          "streamFail",
-          streamFail,
-          "sum",
-          sum,
-          "chat",
-          chat);
+      var methods =
+          new java.util.HashMap<String, MethodDispatcher>(
+              Map.of(
+                  "echo",
+                  echo,
+                  "flaky",
+                  flaky,
+                  "boom",
+                  boom,
+                  "deadline",
+                  deadline,
+                  "slow",
+                  slow,
+                  "count",
+                  count,
+                  "streamFail",
+                  streamFail,
+                  "sum",
+                  sum,
+                  "chat",
+                  chat));
+      methods.put(
+          "earlyChat",
+          new BidiStreamDispatcher() {
+            public MethodDescriptor descriptor() {
+              return desc("earlyChat", StreamingKind.BIDI_STREAM);
+            }
+
+            public void invoke(
+                Object impl, RequestStream in, Codec c, CallContext ctx, ResponseStream out)
+                throws Exception {
+              Msg first = msg(c, in.receive());
+              if (first.text().equals("reject"))
+                throw new RpcError(StatusCode.INVALID_ARGUMENT, "early rejection");
+              out.send(c.encode(new Msg("early answer", 1)));
+            }
+          });
+      methods.put(
+          "burstChat",
+          new BidiStreamDispatcher() {
+            public MethodDescriptor descriptor() {
+              return desc("burstChat", StreamingKind.BIDI_STREAM);
+            }
+
+            public void invoke(
+                Object impl,
+                RequestStream requests,
+                Codec codec,
+                CallContext ctx,
+                ResponseStream out)
+                throws Exception {
+              Msg m = msg(codec, requests.receive());
+              for (int i = 0; i < m.n(); i++) out.send(codec.encode(new Msg(m.text(), i)));
+              throw new RpcError(StatusCode.NOT_FOUND, "after burst");
+            }
+          });
+      return methods;
     }
 
     @Override
@@ -340,6 +382,7 @@ final class ClientInterceptorsE2ETest {
     CALLS.clear();
     SLOW_CANCELLED.set(0);
     SLOW_ENTERED.set(0);
+    CHAT_ENTERED.set(0);
     slowEntered = new CountDownLatch(1);
     slowCancelled = new CountDownLatch(1);
   }
@@ -967,5 +1010,198 @@ final class ClientInterceptorsE2ETest {
     }
     assertEquals(CircuitBreakerInterceptor.State.CLOSED, breaker.state());
     assertFalse(breaker == null);
+  }
+
+  @Test
+  void incrementalServerStreamBoundsUnreadResponsesAndCloseWakesReader() throws Exception {
+    AsterClient c = client();
+    ServerStreamCall<Msg> call =
+        get(c.<Msg, Msg>openServerStream(addr, SVC, "count", new Msg("bounded", 1024), Msg.class));
+    var field = ServerStreamCall.class.getDeclaredField("responses");
+    field.setAccessible(true);
+    var queue = (ResponseBuffer) field.get(call);
+    try {
+      long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (queue.size() < 256 && System.nanoTime() < end) Thread.sleep(5);
+      assertTrue(queue.size() >= 256, "real native responses reached wrapper queue");
+      assertEquals(
+          0, queue.remainingCapacity(), "unread wrapper responses must have a finite item ceiling");
+      assertEquals(256, queue.size());
+    } finally {
+      call.close();
+    }
+    var reader = ServerStreamCall.class.getDeclaredField("readerThread");
+    reader.setAccessible(true);
+    assertFalse(((Thread) reader.get(call)).isAlive(), "close wakes a capacity-blocked reader");
+    assertEquals(
+        "echo:after-bound|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("after-bound", 0), Msg.class)).text());
+  }
+
+  @Test
+  void boundedBidiDrainsInOrderThenSurfacesTrailerAndRecovers() throws Exception {
+    AsterClient c = client();
+    try (BidiCall<Msg, Msg> call =
+        get(c.<Msg, Msg>openBidiStream(addr, SVC, "burstChat", Msg.class))) {
+      call.send(new Msg("burst", 600));
+      var field = BidiCall.class.getDeclaredField("responses");
+      field.setAccessible(true);
+      ResponseBuffer queue = (ResponseBuffer) field.get(call);
+      long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (queue.size() < 256 && System.nanoTime() < end) Thread.sleep(5);
+      assertEquals(256, queue.size());
+      assertEquals(0, queue.remainingCapacity());
+      assertTrue(queue.retainedBytes() <= ResponseBuffer.MAX_RETAINED_BYTES);
+      for (int i = 0; i < 600; i++) {
+        Msg response = call.recvWithTimeout(5, TimeUnit.SECONDS);
+        assertNotNull(response);
+        assertEquals(i, response.n());
+      }
+      RpcError error =
+          assertThrows(RpcError.class, () -> call.recvWithTimeout(5, TimeUnit.SECONDS));
+      assertEquals(StatusCode.NOT_FOUND, error.code());
+      assertEquals("after burst", error.rpcMessage());
+      assertThrows(RpcError.class, call::recv);
+    }
+    assertEquals(
+        "echo:after-drain|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("after-drain", 0), Msg.class)).text());
+  }
+
+  @Test
+  void boundedBidiCancellationWakesFullReader() throws Exception {
+    AsterClient c = client();
+    try (BidiCall<Msg, Msg> call =
+        get(c.<Msg, Msg>openBidiStream(addr, SVC, "burstChat", Msg.class))) {
+      call.send(new Msg("cancel", 600));
+      var field = BidiCall.class.getDeclaredField("responses");
+      field.setAccessible(true);
+      ResponseBuffer queue = (ResponseBuffer) field.get(call);
+      long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (queue.size() < 256 && System.nanoTime() < end) Thread.sleep(5);
+      assertEquals(256, queue.size());
+      call.cancel();
+      RpcError error =
+          assertThrows(RpcError.class, () -> call.recvWithTimeout(5, TimeUnit.SECONDS));
+      assertEquals(StatusCode.CANCELLED, error.code());
+      var reader = BidiCall.class.getDeclaredField("readerThread");
+      reader.setAccessible(true);
+      ((Thread) reader.get(call)).join(2000);
+      assertFalse(((Thread) reader.get(call)).isAlive());
+      assertEquals(0, queue.retainedBytes());
+    }
+    assertEquals(
+        "echo:after-cancel-bound|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("after-cancel-bound", 0), Msg.class))
+            .text());
+  }
+
+  @Test
+  void emptyBufferedStreamsAreRefusedBeforeDispatch() throws Exception {
+    AsterClient c = client();
+    assertInstanceOf(
+        IllegalArgumentException.class,
+        failure(c.<Msg, Msg>callClientStream(addr, SVC, "sum", List.of(), Msg.class)));
+    assertInstanceOf(
+        IllegalArgumentException.class,
+        failure(c.<Msg, Msg>callBidiStream(addr, SVC, "chat", List.of(), Msg.class)));
+    assertEquals(0, server.liveCalls());
+    assertTrue(CALLS.isEmpty());
+    assertEquals(0, CHAT_ENTERED.get());
+    assertEquals(
+        "echo:after-empty|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("after-empty", 1), Msg.class)).text());
+  }
+
+  @Test
+  void interactiveEmptyAndRepeatedCompletionRemainTerminal() throws Exception {
+    AsterClient c = client();
+    try (BidiCall<Msg, Msg> empty = get(c.<Msg, Msg>openBidiStream(addr, SVC, "chat", Msg.class))) {
+      empty.complete();
+      empty.complete();
+      Throwable terminal =
+          failure(
+              CompletableFuture.supplyAsync(
+                  () -> {
+                    try {
+                      return empty.recv();
+                    } catch (InterruptedException e) {
+                      throw new RuntimeException(e);
+                    }
+                  }));
+      assertInstanceOf(RpcError.class, terminal);
+      // Native finish cancels before publishing its validation error; the eager
+      // reader may win that race. Both statuses are documented non-OK outcomes.
+      assertTrue(
+          Set.of(StatusCode.INVALID_ARGUMENT, StatusCode.CANCELLED)
+              .contains(((RpcError) terminal).code()));
+    }
+    assertEquals(0, CHAT_ENTERED.get());
+    try (BidiCall<Msg, Msg> unopened =
+        get(c.<Msg, Msg>openBidiStream(addr, SVC, "chat", Msg.class))) {
+      // Close an eager native handle without ever sending a request.
+    }
+    assertEquals(0, CHAT_ENTERED.get());
+    try (BidiCall<Msg, Msg> call = get(c.<Msg, Msg>openBidiStream(addr, SVC, "chat", Msg.class))) {
+      call.send(new Msg("one", 1));
+      assertEquals("re:one", call.recv().text());
+      call.complete();
+      call.complete();
+      assertNull(call.recv());
+      assertNull(call.recv());
+    }
+    assertEquals(1, CHAT_ENTERED.get());
+    assertEquals(
+        "echo:after-finish|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("after-finish", 1), Msg.class)).text());
+  }
+
+  @Test
+  void zeroResponseServerStreamCompletesNormally() throws Exception {
+    AsterClient c = client();
+    assertTrue(
+        get(c.<Msg, Msg>callServerStream(addr, SVC, "count", new Msg("zero", 0), Msg.class))
+            .isEmpty());
+    try (ServerStreamCall<Msg> stream =
+        get(c.<Msg, Msg>openServerStream(addr, SVC, "count", new Msg("zero", 0), Msg.class))) {
+      assertNull(stream.recv());
+      assertNull(stream.recv());
+    }
+    assertEquals(
+        "echo:after-zero|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("after-zero", 1), Msg.class)).text());
+  }
+
+  @Test
+  void interactiveBidiEarlyAnswerAndRejectionDoNotWaitForCompletion() throws Exception {
+    AsterClient c = client();
+    for (boolean reject : new boolean[] {false, true}) {
+      try (BidiCall<Msg, Msg> call =
+          get(c.<Msg, Msg>openBidiStream(addr, SVC, "earlyChat", Msg.class))) {
+        call.send(new Msg(reject ? "reject" : "answer", 1));
+        CompletableFuture<Msg> reading =
+            CompletableFuture.supplyAsync(
+                () -> {
+                  try {
+                    return call.recv();
+                  } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                  }
+                });
+        if (reject) {
+          RpcError error =
+              assertInstanceOf(RpcError.class, failure(reading.orTimeout(3, TimeUnit.SECONDS)));
+          assertEquals(StatusCode.INVALID_ARGUMENT, error.code());
+        } else {
+          assertEquals("early answer", reading.get(3, TimeUnit.SECONDS).text());
+          assertNull(call.recv());
+        }
+        call.complete();
+        call.complete();
+      }
+    }
+    assertEquals(
+        "echo:after-early|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("after-early", 1), Msg.class)).text());
   }
 }

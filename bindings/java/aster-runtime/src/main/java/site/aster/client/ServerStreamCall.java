@@ -1,7 +1,5 @@
 package site.aster.client;
 
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import site.aster.codec.Codec;
 import site.aster.ffi.Rpc;
@@ -25,6 +23,12 @@ import site.aster.interceptors.StatusCode;
  *   // ...decide to stop early...
  * }   // close() cancels the call if it has not ended
  * }</pre>
+ *
+ * <p>Unread buffering is bounded to 256 queued/in-flight items and 8 MiB of queued raw response
+ * payload plus at most one legal 16 MiB in-flight frame (24 MiB combined). A single frame larger
+ * than 8 MiB is admitted only into an empty buffer. Capacity is acquired before decoding. Decoded
+ * object heap size depends on the codec. A stalled consumer backpressures the native reader;
+ * cancel/close wakes it.
  */
 public final class ServerStreamCall<Resp> implements AutoCloseable {
 
@@ -38,7 +42,7 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   /** The client's interceptors and this call's context; {@code null} when it has none. */
   private final AsterClient.Intercepted intercepted;
 
-  private final BlockingQueue<Object> responses = new LinkedBlockingQueue<>();
+  private final ResponseBuffer responses = new ResponseBuffer(END_SENTINEL);
   private final Thread readerThread;
   private volatile RpcError trailerError;
   private volatile Throwable readerFault;
@@ -84,6 +88,7 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   public void cancel() {
     if (!closed) {
       cancelRequested = true;
+      responses.cancel();
       Rpc.cancel(runtime, call);
     }
   }
@@ -119,7 +124,6 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   @SuppressWarnings("unchecked")
   private Resp unwrap(Object item) {
     if (item == END_SENTINEL) {
-      responses.offer(END_SENTINEL); // keep later recv() calls terminal
       if (readerFault != null) {
         throw new RpcError(
             StatusCode.INTERNAL,
@@ -136,9 +140,11 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
   private void readLoop() {
     try {
       while (true) {
+        responses.beginRead();
         Rpc.Recv r = Rpc.recvPolling(runtime, call, () -> cancelRequested);
         if (r instanceof Rpc.Recv.Data d) {
-          responses.offer(codec.decode(d.payload(), responseType));
+          responses.awaitCapacity(d.payload().length);
+          responses.data(codec.decode(d.payload(), responseType), d.payload().length);
         } else if (r instanceof Rpc.Recv.Trailer t) {
           RpcError e = AsterClient.statusError(t.status());
           if (e == null) {
@@ -146,13 +152,17 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
           } else {
             trailerError = e;
           }
-          responses.offer(END_SENTINEL);
+          responses.finish();
           return;
         }
       }
     } catch (Throwable t) {
-      readerFault = t;
-      responses.offer(END_SENTINEL);
+      if (cancelRequested) {
+        trailerError = new RpcError(StatusCode.CANCELLED, "call cancelled");
+      } else {
+        readerFault = t;
+      }
+      responses.finish();
     }
   }
 
@@ -164,8 +174,10 @@ public final class ServerStreamCall<Resp> implements AutoCloseable {
     }
     if (!cleanTrailer && trailerError == null) {
       cancelRequested = true;
+      responses.cancel();
       Rpc.cancel(runtime, call);
     }
+    responses.cancel();
     if (readerThread.isAlive()) {
       try {
         readerThread.join(2_000);
