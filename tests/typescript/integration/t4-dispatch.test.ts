@@ -151,8 +151,10 @@ class Counter {
 
 @Service({ name: 't4.Guarded', version: 1 })
 class Guarded {
+  calls = 0;
   @Rpc({ requires: 'admin' })
   async secret(_req: unknown, ctx: CallContext): Promise<unknown> {
+    this.calls++;
     return { role: ctx.attributes['aster.role'] ?? null };
   }
 
@@ -357,15 +359,19 @@ describe.skipIf(!available)('T4: Gate 3 requires, attribute bridges, non-RPC ALP
   });
 
   it('requires: denied without attributes; setPeerAttributes admits', async () => {
-    f = await fixture({ services: [new Guarded()], delivery: 'ring' });
+    const guarded = new Guarded();
+    f = await fixture({ services: [guarded], delivery: 'ring' });
     const t = await connect(f);
     const me = f.clientNode.nodeId();
     expect(await t.unary('t4.Guarded', 'open', {})).toEqual({ ok: true });
     await expectCode(t.unary('t4.Guarded', 'secret', {}), StatusCode.PERMISSION_DENIED);
+    expect(guarded.calls).toBe(0);
     f.server.setPeerAttributes(me, { 'aster.role': 'admin' });
     expect(await t.unary('t4.Guarded', 'secret', {})).toEqual({ role: 'admin' });
+    expect(guarded.calls).toBe(1);
     f.server.setPeerAttributes(me, null);
     await expectCode(t.unary('t4.Guarded', 'secret', {}), StatusCode.PERMISSION_DENIED);
+    expect(guarded.calls).toBe(1);
     await until(() => f!.server.liveCalls === 0);
     await teardown(f);
     f = undefined;
@@ -373,14 +379,18 @@ describe.skipIf(!available)('T4: Gate 3 requires, attribute bridges, non-RPC ALP
 
   it('requires: Gate 3 reads the gate\'s admission store (frozen admission bridge)', async () => {
     const gate = GatePolicy.openDev();
-    f = await fixture({ services: [new Guarded()], gate });
+    const guarded = new Guarded();
+    f = await fixture({ services: [guarded], gate });
     const t = await connect(f);
     const me = f.clientNode.nodeId();
     await expectCode(t.unary('t4.Guarded', 'secret', {}), StatusCode.PERMISSION_DENIED);
+    expect(guarded.calls).toBe(0);
     gate.admit(me, { attributes: { 'aster.role': 'admin' } });
     expect(await t.unary('t4.Guarded', 'secret', {})).toEqual({ role: 'admin' });
+    expect(guarded.calls).toBe(1);
     gate.revoke(me);
     await expectCode(t.unary('t4.Guarded', 'secret', {}), StatusCode.PERMISSION_DENIED);
+    expect(guarded.calls).toBe(1);
     await teardown(f);
     f = undefined;
   });
