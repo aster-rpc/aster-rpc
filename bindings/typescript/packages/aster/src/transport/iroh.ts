@@ -377,8 +377,8 @@ export class IrohTransport implements AsterTransport {
 
     const next = async (): Promise<IteratorResult<unknown>> => {
       if (trailer) return { done: true, value: undefined };
-      const call = await open();
       try {
+        const call = await open();
         const item = await call.next();
         if (item === null) {
           trailer = [StatusCode.OK, ''];

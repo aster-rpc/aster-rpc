@@ -38,6 +38,51 @@ async function fixture() {
 }
 
 describe('transport: native pool and concurrent open recovery', () => {
+  it('refuses an empty client stream without dispatch, then serves a healthy call', async () => {
+    const f = await fixture();
+    const transport = new IrohTransport(f.conn, BYTES as any, { rpc: f.rpc });
+    try {
+      const resultCode = await bounded(transport.clientStream('review.Pool', 'client_stream', (async function* () {})())).then(
+        () => StatusCode.OK, (error) => error.code,
+      );
+      // Native finish refuses an empty stream and cancels its reader. The
+      // asynchronous response can observe either terminal error; never OK.
+      expect([StatusCode.INVALID_ARGUMENT, StatusCode.CANCELLED]).toContain(resultCode);
+      expect(f.server.liveCalls()).toBe(0);
+      expect(f.server.pollBatch()).toEqual([]);
+      const result = transport.unary('review.Pool', 'unary', Buffer.from('healthy'));
+      const [event] = await bounded<any[]>(f.server.nextBatch(1));
+      expect(event.request.toString()).toBe('healthy');
+      expect(f.server.respond(event.callId, event.request)).toBe(0);
+      expect(await bounded(result)).toEqual(Buffer.from('healthy'));
+    } finally { await f.close(); }
+  });
+
+  it('ends a zero-response server stream cleanly', async () => {
+    const f = await fixture();
+    const transport = new IrohTransport(f.conn, BYTES as any, { rpc: f.rpc });
+    try {
+      const iterator = transport.serverStream('review.Pool', 'server_stream', Buffer.from('request'))[Symbol.asyncIterator]();
+      const first = iterator.next();
+      const [event] = await bounded<any[]>(f.server.nextBatch(1));
+      expect(f.server.finish(event.callId)).toBe(0);
+      expect(await bounded(first)).toEqual({ done: true, value: undefined });
+      expect(await bounded(iterator.next())).toEqual({ done: true, value: undefined });
+      expect(f.server.liveCalls()).toBe(0);
+    } finally { await f.close(); }
+  });
+
+  it('reports a failed bidi open as an error trailer', async () => {
+    const f = await fixture();
+    const transport = new IrohTransport(f.conn, BYTES as any, { rpc: f.rpc });
+    try {
+      f.conn.close(0, 'close before opening');
+      const channel = transport.bidiStream('review.Pool', 'bidi');
+      const trailer = await bounded(channel.waitForTrailer());
+      expect(trailer[0]).toBe(StatusCode.UNAVAILABLE);
+    } finally { await f.close(); }
+  });
+
   it.each(['serverStream', 'clientStream', 'bidi'] as const)('cancels a real %s handle returned after abort', async (pattern) => {
     const f = await fixture();
     const entered = gate(), release = gate();
