@@ -131,7 +131,9 @@ class RuntimeGates(unittest.TestCase):
             self.assertTrue({'test', 'typescript'} <= ancestors(job), job)
         ts = blocks['typescript']
         self.assertIn('--features coordination-fixture,test-hooks --bin aster-coordination-fixture', ts)
-        self.assertLess(ts.index('run: bun run build\n'), ts.index('run: bun run build:test-hooks'))
+        self.assertLess(ts.index('Verify and reuse the tested normal NAPI addon'), ts.index('run: bun run build:test-hooks'))
+        self.assertIn('release-candidate.py verify-input', ts)
+        self.assertNotIn('run: bun run build\n', ts)
 
     def test_actual_o7_checker_accepts_full_report_and_rejects_missing_failed_cases(self):
         with tempfile.TemporaryDirectory() as directory:

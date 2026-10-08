@@ -155,11 +155,13 @@ def validate_recipe(recipe: dict) -> None:
     base_keys = {"schema", "kind", "package", "profile", "default_features", "features", "target", "target_mode",
                  "rustc", "cargo", "lock_sha256", "environment", "host_runtime"}
     python_keys = {"python", "python_abi", "maturin"} if recipe.get("kind") == "python-wheel" else set()
-    if set(recipe) != base_keys | python_keys or recipe.get("schema") != 1:
+    napi_keys = {"generator"} if recipe.get("kind") == "napi" else set()
+    if set(recipe) != base_keys | python_keys | napi_keys or recipe.get("schema") != 1:
         fail("native recipe schema/inventory mismatch")
-    if (recipe["kind"], recipe["package"]) not in (("python-wheel", "aster_rs"), ("ffi", "aster_transport_ffi")):
+    if (recipe["kind"], recipe["package"]) not in (("python-wheel", "aster_rs"), ("ffi", "aster_transport_ffi"), ("napi", "aster-transport-napi")):
         fail("unsupported reusable native product")
-    if recipe["profile"] != "release" or recipe["default_features"] is not True or recipe["target_mode"] != "host":
+    mode = "explicit" if napi_keys else "host"
+    if recipe["profile"] != "release" or recipe["default_features"] is not True or recipe["target_mode"] != mode:
         fail("reuse currently supports only default-feature release host products")
     expected_features = ["pyo3/extension-module"] if python_keys else []
     if recipe["features"] != expected_features or not re.fullmatch(r"[a-z0-9_]+-[a-z0-9_-]+", recipe["target"]):
@@ -176,12 +178,24 @@ def validate_recipe(recipe: dict) -> None:
                         or set(recipe["python"]) != {"implementation", "version", "cache_tag", "machine", "libc"}
                         or recipe["python"]["implementation"] != "cpython" or not recipe["maturin"]):
         fail("native recipe lacks Python ABI/interpreter evidence")
+    if napi_keys:
+        generator = recipe["generator"]
+        if recipe["target"] != "x86_64-unknown-linux-gnu" or not isinstance(generator, dict) or set(generator) != {"node", "bun", "cli", "cli_sha256", "inputs"}:
+            fail("NAPI reuse requires explicit Linux host and pinned generator evidence")
+        if not all(isinstance(generator[key], str) and generator[key] for key in ("node", "bun", "cli")):
+            fail("NAPI recipe lacks generator versions")
+        if not re.fullmatch(r"[0-9a-f]{64}", generator["cli_sha256"]):
+            fail("NAPI recipe lacks generator code digest")
+        inputs = generator["inputs"]
+        required = {"bindings/typescript/bun.lock", "bindings/typescript/package.json", "bindings/typescript/native/package.json", "bindings/typescript/scripts/check-native-generated.mjs", "scripts/ci/napi-loader.mjs"}
+        if not isinstance(inputs, dict) or set(inputs) != required or not all(re.fullmatch(r"[0-9a-f]{64}", value) for value in inputs.values()):
+            fail("NAPI recipe generator input inventory mismatch")
 
 
 def build_recipe(kind: str, package: str, profile: str, features: str,
                  target: str, interpreter: str | None, maturin: str | None) -> dict:
     """Describe one native build command, not the workspace's unified test graph."""
-    if (kind, package) not in (("python-wheel", "aster_rs"), ("ffi", "aster_transport_ffi")):
+    if (kind, package) not in (("python-wheel", "aster_rs"), ("ffi", "aster_transport_ffi"), ("napi", "aster-transport-napi")):
         fail("unsupported reusable native product")
     rustc = subprocess.check_output(["rustc", "-vV"], text=True).strip()
     host = next(line.removeprefix("host: ") for line in rustc.splitlines() if line.startswith("host: "))
@@ -215,6 +229,14 @@ def build_recipe(kind: str, package: str, profile: str, features: str,
         recipe["maturin"] = subprocess.check_output([maturin, "--version"], text=True).strip()
     elif interpreter or maturin:
         fail("FFI recipe has no Python build inputs")
+    if kind == "napi":
+        cli_root = ROOT / "bindings/typescript/node_modules/@napi-rs/cli"
+        inputs = ("bindings/typescript/bun.lock", "bindings/typescript/package.json", "bindings/typescript/native/package.json", "bindings/typescript/scripts/check-native-generated.mjs", "scripts/ci/napi-loader.mjs")
+        recipe["generator"] = {"node": subprocess.check_output(["node", "--version"], text=True).strip(),
+                               "bun": subprocess.check_output(["bun", "--version"], text=True).strip(),
+                               "cli": read_json(cli_root / "package.json")["version"],
+                               "cli_sha256": digest(cli_root / "dist/index.js"),
+                               "inputs": {name: hashlib.sha256(subprocess.check_output(["git", "-C", str(ROOT), "show", f"HEAD:{name}"])).hexdigest() for name in inputs}}
     validate_recipe(recipe)
     return recipe
 
@@ -245,6 +267,14 @@ def verify_input(root: Path, evidence: dict, artifact: str, job: str, recipe: di
         native_version = subprocess.check_output([sys.executable, "-c", code, str(libraries[0].resolve())], text=True).strip()
         if native_version != expected["version"]:
             fail("reused FFI native version differs from exact candidate")
+    elif recipe["kind"] == "napi":
+        required = {"aster-transport.linux-x64-gnu.node", "index.js", "index.d.ts"}
+        if set(evidence["files"]) != required:
+            fail("reused NAPI payload must contain normal addon and generated bindings only")
+        code = "const n=require(process.argv[1]); if('emitTestLogs' in n || 'testEmitted' in n) throw Error('test hooks in normal addon'); console.log(n.version())"
+        native_version = subprocess.check_output(["node", "-e", code, str((root / "aster-transport.linux-x64-gnu.node").resolve())], text=True, timeout=30).strip()
+        if native_version != expected["version"]:
+            fail("reused NAPI native version differs from exact candidate")
 
 
 def verify_python_install(wheel: Path, interpreter: str) -> None:
@@ -572,7 +602,7 @@ def main() -> None:
     rec.add_argument("--matrix", default="{}")
     rec.add_argument("--recipe", type=Path)
     recipe_args = sub.add_parser("build-recipe")
-    recipe_args.add_argument("--kind", choices=("python-wheel", "ffi"), required=True)
+    recipe_args.add_argument("--kind", choices=("python-wheel", "ffi", "napi"), required=True)
     recipe_args.add_argument("--package", required=True)
     recipe_args.add_argument("--profile", choices=("release",), default="release")
     recipe_args.add_argument("--features", default="")
