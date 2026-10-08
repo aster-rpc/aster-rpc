@@ -396,6 +396,38 @@ async def test_carrier_follows_asyncio_tasks():
     assert await asyncio.create_task(probe()) is None
 
 
+
+async def test_concurrent_trace_carriers_are_isolated_and_restored():
+    from aster import tracing
+
+    entered = [asyncio.Event(), asyncio.Event()]
+    release = asyncio.Event()
+    traces = ["1" * 32, "2" * 32]
+
+    async def worker(index):
+        trace = traces[index]
+        with tracing.with_trace_context(f"00-{trace}-00f067aa0ba902b7-01", {"tenant": str(index)}):
+            entered[index].set()
+            await release.wait()
+            await asyncio.sleep(0)
+            assert tracing.current_trace_id() == trace
+            assert tracing.current_baggage() == {"tenant": str(index)}
+        assert tracing.current_trace_id() is None
+        assert tracing.current_baggage() == {}
+
+    tasks = [asyncio.create_task(worker(i)) for i in range(2)]
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), 2)
+        assert tracing.current_trace_id() is None
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), 2)
+    finally:
+        release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def test_shutdown_timeout_warns_instead_of_raising():
     # A slow exporter (here an unreachable endpoint with a zero wait) must not
     # make shutdown raise: the reference is released and the flush finishes in

@@ -285,3 +285,37 @@ func TestObsPure_LevelMapping(t *testing.T) {
 		t.Errorf("above error: %v", got)
 	}
 }
+
+func TestConcurrentTraceCarriersRemainIndependent(t *testing.T) {
+	contexts := make([]context.Context, 2)
+	traces := []string{strings.Repeat("1", 32), strings.Repeat("2", 32)}
+	for i, trace := range traces {
+		var err error
+		contexts[i], err = WithTraceContext(context.Background(), "00-"+trace+"-00f067aa0ba902b7-01", map[string]string{"tenant": trace})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	results := make(chan bool, 2)
+	for i, ctx := range contexts {
+		go func(i int, ctx context.Context) {
+			entered <- struct{}{}
+			<-release
+			results <- CurrentTraceID(ctx) == traces[i] && CurrentBaggage(ctx)["tenant"] == traces[i]
+		}(i, ctx)
+	}
+	for range contexts {
+		<-entered
+	}
+	close(release)
+	for range contexts {
+		if !<-results {
+			t.Fatal("concurrent carrier crossed contexts")
+		}
+	}
+	if CurrentTraceID(context.Background()) != "" {
+		t.Fatal("background context inherited a trace")
+	}
+}

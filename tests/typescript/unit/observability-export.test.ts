@@ -171,6 +171,33 @@ describe('trace-context carrier', () => {
   });
 });
 
+describe('concurrent trace carriers', () => {
+  it('isolates two suspended contexts and restores the caller', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered: Array<Promise<void>> = [];
+    const runs = ['1'.repeat(32), '2'.repeat(32)].map((trace, index) => {
+      let acknowledge!: () => void;
+      entered.push(new Promise<void>((resolve) => { acknowledge = resolve; }));
+      return withTraceContext(`00-${trace}-00f067aa0ba902b7-01`, async () => {
+        acknowledge();
+        await gate;
+        await Promise.resolve();
+        expect(currentTraceId()).toBe(trace);
+        expect(currentBaggage()).toEqual({ tenant: String(index) });
+      }, { tenant: String(index) });
+    });
+    try {
+      await Promise.all(entered);
+      expect(currentTraceId()).toBeUndefined();
+      release();
+      await Promise.all(runs);
+      expect(currentTraceId()).toBeUndefined();
+      expect(currentBaggage()).toEqual({});
+    } finally { release(); await Promise.allSettled(runs); }
+  });
+});
+
 describe('binding spans', () => {
   it('withSpan makes the span current; children share the trace; the carrier is restored', () => {
     const out = tracing.withSpan('o7.outer', { 'o7.attr': 1 }, (outer) => {

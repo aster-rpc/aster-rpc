@@ -834,6 +834,37 @@ public class ObservabilityTests : IAsyncLifetime
     {
         Assert.Null(AsterObservability.MetricsText());
     }
+    [Fact]
+    public async Task Concurrent_Trace_Carriers_Are_Isolated_And_Restored()
+    {
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new[] { new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously), new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) };
+        var original = Tracing.CurrentTraceId;
+        async Task Worker(int index)
+        {
+            var trace = new string(index == 0 ? '1' : '2', 32);
+            using (Tracing.WithTraceContext($"00-{trace}-00f067aa0ba902b7-01", new Dictionary<string, string> { ["tenant"] = trace }))
+            {
+                entered[index].SetResult(true);
+                await release.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                await Task.Yield();
+                Assert.Equal(trace, Tracing.CurrentTraceId);
+                Assert.Equal(trace, Tracing.CurrentBaggage["tenant"]);
+            }
+            Assert.Equal(original, Tracing.CurrentTraceId);
+        }
+        var tasks = new[] { Worker(0), Worker(1) };
+        try
+        {
+            await Task.WhenAll(entered[0].Task, entered[1].Task).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(original, Tracing.CurrentTraceId);
+            release.SetResult(true);
+            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(original, Tracing.CurrentTraceId);
+        }
+        finally { release.TrySetResult(true); await Task.WhenAll(tasks); }
+    }
+
 }
 
 [CollectionDefinition("Observability", DisableParallelization = true)]

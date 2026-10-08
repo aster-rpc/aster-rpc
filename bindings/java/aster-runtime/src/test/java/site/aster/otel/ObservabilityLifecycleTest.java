@@ -251,4 +251,44 @@ final class ObservabilityLifecycleTest {
                   throw new IllegalStateException("boom");
                 }));
   }
+
+  @Test
+  void concurrentPropagatedCarriersRemainIndependent() throws Exception {
+    var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+    var entered = new java.util.concurrent.CountDownLatch(2);
+    var release = new java.util.concurrent.CountDownLatch(1);
+    var tasks = new java.util.ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+    try {
+      for (String trace : new String[] {"1".repeat(32), "2".repeat(32)}) {
+        Tracing.runWithTraceContext(
+            "00-" + trace + "-00f067aa0ba902b7-01",
+            Map.of("tenant", trace),
+            () -> {
+              tasks.add(
+                  java.util.concurrent.CompletableFuture.runAsync(
+                      () -> {
+                        entered.countDown();
+                        try {
+                          assertTrue(release.await(5, TimeUnit.SECONDS));
+                        } catch (InterruptedException e) {
+                          Thread.currentThread().interrupt();
+                          throw new AssertionError(e);
+                        }
+                        assertEquals(trace, Tracing.currentTraceId());
+                        assertEquals(Map.of("tenant", trace), Tracing.currentBaggage());
+                      },
+                      Tracing.propagating(pool)));
+            });
+      }
+      assertTrue(entered.await(5, TimeUnit.SECONDS));
+      assertNull(Tracing.currentTraceId());
+      release.countDown();
+      for (var task : tasks) task.get(5, TimeUnit.SECONDS);
+      assertNull(pool.submit(Tracing::currentTraceId).get(5, TimeUnit.SECONDS));
+    } finally {
+      release.countDown();
+      pool.shutdownNow();
+      assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+    }
+  }
 }
