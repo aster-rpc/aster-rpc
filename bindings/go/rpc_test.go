@@ -440,6 +440,11 @@ func TestRPC_RequiresAndAttributes(t *testing.T) {
 	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Admin", "op", req); !errors.Is(err, ErrRpcPermissionDenied) {
 		t.Fatalf("without role: %v", err)
 	}
+	select {
+	case <-seen:
+		t.Fatal("denied call invoked handler")
+	default:
+	}
 	peer, _ := f.cl.Node().NodeID()
 	if err := f.srv.SetPeerAttributes(peer, map[string]string{"aster.role": "admin", "team": "x"}); err != nil {
 		t.Fatal(err)

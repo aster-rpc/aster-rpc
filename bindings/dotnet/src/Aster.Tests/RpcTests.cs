@@ -65,6 +65,7 @@ public class RpcTests : IAsyncLifetime
     private readonly TaskCompletionSource<bool> _hangStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _hangCancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _parkEntered, _parkCancelled;
+    private int _adminEntered;
 
     public static ServiceDefinition InteropEcho(string lang) => ServiceDefinition.Create("InteropEcho", 1)
         .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply
@@ -120,10 +121,14 @@ public class RpcTests : IAsyncLifetime
             await Task.Delay(TimeSpan.FromSeconds(30), ctx.CancellationToken);
             return new EchoReply();
         }, defaultTimeout: TimeSpan.FromMilliseconds(500))
-        .Unary<EchoRequest, EchoReply>("admin", (_, ctx) => ValueTask.FromResult(new EchoReply
+        .Unary<EchoRequest, EchoReply>("admin", (_, ctx) =>
         {
-            Message = ctx.Attributes.TryGetValue("aster.role", out var role) ? role : "",
-        }), requires: CapabilityRequirement.AnyOf("admin", "ops"))
+            Interlocked.Increment(ref _adminEntered);
+            return ValueTask.FromResult(new EchoReply
+            {
+                Message = ctx.Attributes.TryGetValue("aster.role", out var role) ? role : "",
+            });
+        }, requires: CapabilityRequirement.AnyOf("admin", "ops"))
         .BidiStream<EchoRequest, EchoReply>("chat", Chat)
         .ServerStream<EchoRequest, EchoReply>("failMidStream", FailMidStream)
         .Build();
@@ -509,15 +514,18 @@ public class RpcTests : IAsyncLifetime
     {
         var ex = await Assert.ThrowsAsync<RpcError>(() => _conn.UnaryAsync<EchoRequest, EchoReply>("Extra", "admin", new EchoRequest()));
         Assert.Equal(StatusCode.PermissionDenied, ex.Code);
+        Assert.Equal(0, Volatile.Read(ref _adminEntered));
 
         string peer = _client.Node.NodeId();
         _server.SetPeerAttributes(peer, new Dictionary<string, string> { ["aster.role"] = "ops" });
         var reply = await _conn.UnaryAsync<EchoRequest, EchoReply>("Extra", "admin", new EchoRequest());
         Assert.Equal("ops", reply.Message);
+        Assert.Equal(1, Volatile.Read(ref _adminEntered));
 
         _server.SetPeerAttributes(peer, null);
         ex = await Assert.ThrowsAsync<RpcError>(() => _conn.UnaryAsync<EchoRequest, EchoReply>("Extra", "admin", new EchoRequest()));
         Assert.Equal(StatusCode.PermissionDenied, ex.Code);
+        Assert.Equal(1, Volatile.Read(ref _adminEntered));
     }
 
     [Fact]

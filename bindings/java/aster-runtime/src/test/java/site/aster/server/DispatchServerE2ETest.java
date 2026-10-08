@@ -47,6 +47,8 @@ import site.aster.server.spi.UnaryDispatcher;
  * from {@link AsterServer#setPeerAttributes}), and the JSON lowering's contract id.
  */
 final class DispatchServerE2ETest {
+  private static final java.util.concurrent.atomic.AtomicInteger adminEntered =
+      new java.util.concurrent.atomic.AtomicInteger();
 
   static final String MSG = "_aster_test/DispatchMsg";
 
@@ -162,6 +164,7 @@ final class DispatchServerE2ETest {
             }
 
             public byte[] invoke(Object impl, byte[] req, Codec c, CallContext ctx) {
+              adminEntered.incrementAndGet();
               return c.encode(new Msg(ctx.attributes().getOrDefault("aster.role", ""), 0));
             }
           };
@@ -373,17 +376,20 @@ final class DispatchServerE2ETest {
 
   @Test
   void requiresIsEnforcedInRustWithBridgedAttributes() throws Exception {
+    adminEntered.set(0);
     RpcError denied =
         assertInstanceOf(
             RpcError.class,
             failure(
                 client.<Msg, Msg>call(addr, "test.Dispatch", "admin", new Msg("", 0), Msg.class)));
     assertEquals(StatusCode.PERMISSION_DENIED, denied.code());
+    assertEquals(0, adminEntered.get());
     server.setPeerAttributes(client.nodeId(), Map.of("aster.role", "admin"));
     try {
       Msg ok =
           get(client.<Msg, Msg>call(addr, "test.Dispatch", "admin", new Msg("", 0), Msg.class));
       assertEquals("admin", ok.text());
+      assertEquals(1, adminEntered.get());
     } finally {
       server.clearPeerAttributes(client.nodeId());
     }
@@ -393,6 +399,7 @@ final class DispatchServerE2ETest {
             failure(
                 client.<Msg, Msg>call(addr, "test.Dispatch", "admin", new Msg("", 0), Msg.class)));
     assertEquals(StatusCode.PERMISSION_DENIED, again.code());
+    assertEquals(1, adminEntered.get());
   }
 
   @Test
