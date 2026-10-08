@@ -81,8 +81,10 @@ function rpcOf(connection: object): NativeRpcConnection {
   return rpc;
 }
 
-/** Up to this many encoded requests queue behind an in-flight write. */
+/** Queued and in-flight request item ceiling (including zero-byte items). */
 const MAX_PENDING_REQUESTS = 1024;
+/** Pause at 8 MiB, allowing the just-encoded legal 16 MiB frame: at most 24 MiB. */
+const MAX_RETAINED_REQUEST_BYTES = 8 * 1024 * 1024;
 
 /**
  * Writes a request stream with at most one native write in flight; requests
@@ -91,6 +93,11 @@ const MAX_PENDING_REQUESTS = 1024;
 class RequestPump {
   private pending: Uint8Array[] = [];
   private inflight: Promise<void> | null = null;
+  private pendingBytes = 0;
+  private retainedBytes = 0;
+  private retainedItems = 0;
+  private wakeStopped!: () => void;
+  private readonly stopSignal = new Promise<void>((resolve) => { this.wakeStopped = resolve; });
   private error: unknown = undefined;
   private stopped = false;
 
@@ -100,32 +107,59 @@ class RequestPump {
     if (this.stopped) return;
     if (this.error !== undefined) throw this.error;
     this.pending.push(payload);
-    if (!this.inflight) this.inflight = this.run();
-    else if (this.pending.length >= MAX_PENDING_REQUESTS) await this.inflight;
+    this.pendingBytes += payload.byteLength;
+    this.retainedBytes += payload.byteLength;
+    this.retainedItems++;
+    // Assign the promise before run starts: even a synchronous native validation
+    // throw must leave finally's null state intact, rather than a settled write
+    // promise that flush would await forever.
+    if (!this.inflight) this.inflight = Promise.resolve().then(() => this.run());
+    if (this.retainedItems >= MAX_PENDING_REQUESTS || this.retainedBytes >= MAX_RETAINED_REQUEST_BYTES) {
+      // Only one producer calls push. Pause before it advances/encodes another item;
+      // account for the native batch as well as requests waiting behind it.
+      await Promise.race([this.inflight!, this.stopSignal]);
+      if (!this.stopped && this.error !== undefined) throw this.error;
+    }
   }
 
   private async run(): Promise<void> {
     try {
       while (!this.stopped && this.pending.length) {
         const batch = this.pending;
+        const bytes = this.pendingBytes;
         this.pending = [];
-        if (batch.length === 1) await this.call.send(batch[0]!);
-        else await this.call.sendMany(batch, false);
+        this.pendingBytes = 0;
+        try {
+          if (batch.length === 1) await this.call.send(batch[0]!);
+          else await this.call.sendMany(batch, false);
+        } finally {
+          this.retainedBytes -= bytes;
+          this.retainedItems -= batch.length;
+        }
       }
     } catch (e) {
       this.error = e;
+      this.clearPending();
     } finally {
       this.inflight = null;
     }
   }
 
+  private clearPending(): void {
+    this.retainedBytes -= this.pendingBytes;
+    this.retainedItems -= this.pending.length;
+    this.pending = [];
+    this.pendingBytes = 0;
+  }
+
   stop(): void {
     this.stopped = true;
-    this.pending = [];
+    this.clearPending();
+    this.wakeStopped();
   }
 
   async flush(): Promise<void> {
-    while (this.inflight) await this.inflight;
+    while (this.inflight && !this.stopped) await Promise.race([this.inflight, this.stopSignal]);
     if (this.error !== undefined) throw this.error;
   }
 }
@@ -321,14 +355,24 @@ export class IrohTransport implements AsterTransport {
         }
       } catch (error) {
         if (!terminal) {
-          if (String((error as Error)?.message ?? error).includes(STATUS_PREFIX)) {
-            // Native completion owns its status even if a write sees it first.
+          const nativeFailure = String((error as Error)?.message ?? error).includes(STATUS_PREFIX)
+            ? mapTransportError(error) : undefined;
+          const terminalSendCodes: readonly StatusCode[] = [
+            StatusCode.CANCELLED,
+            StatusCode.INVALID_ARGUMENT,
+            StatusCode.DEADLINE_EXCEEDED,
+          ];
+          if (nativeFailure && terminalSendCodes.includes(nativeFailure.code)) {
+            // RequestSink reports completed/cancelled/deadline calls with these
+            // codes; the response owns the peer's actual terminal status.
             await response;
-            throw mapTransportError(error);
+            throw nativeFailure;
           }
+          // Local framing validation or a failed write need not end the reader.
+          // Cancel it and report that original failure without waiting for a reply.
           closeRequests();
           void Promise.resolve(call.cancel()).catch(() => {});
-          throw error;
+          throw nativeFailure ?? error;
         }
       }
       // Finishing the request half does not finish the response half.
