@@ -40,12 +40,20 @@ upload_base="$forge/api/packages/$owner/generic/$package/$version"
 
 authed_curl() {
   printf 'user = "%s:%s"\n' "$user" "$ASTER_PACKAGE_TOKEN" \
-    | curl --config - --silent --show-error "$@"
+    | curl --config - --silent --show-error --connect-timeout 10 --max-time 180 "$@"
 }
 
 remote_files() {
   # A version that does not exist yet answers 404; that is an empty listing.
-  authed_curl --fail "$files_api" 2>/dev/null || printf '[]'
+  # Authentication, proxy and transport failures must not authorize writes.
+  local response status
+  response="$(authed_curl --write-out $'\n%{http_code}' "$files_api")" || return 1
+  status="${response##*$'\n'}"
+  case "$status" in
+    200) printf '%s' "${response%$'\n'*}" ;;
+    404) printf '[]' ;;
+    *) die "cannot inspect existing package files: HTTP $status" ;;
+  esac
 }
 
 remote_sha256() {
