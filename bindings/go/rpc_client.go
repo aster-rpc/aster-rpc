@@ -673,7 +673,8 @@ func callServerStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 // goroutine concurrently with receiving the response, so an early server reply
 // ends the RPC even when the source is blocked. An arbitrary blocked iter.Seq
 // cannot be stopped by the SDK: sources must observe ctx or release their own
-// waits/resources after the call returns. Later yields are refused.
+// waits/resources after the call returns. Later yields are refused. A source
+// that finishes without yielding a request returns ErrRpcInvalidArgument.
 func CallClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, reqs iter.Seq[*Req], opts ...CallOption) (*Resp, error) {
 	o := buildOptions(opts)
 	if ch := rc.chain(o); ch != nil {
@@ -701,6 +702,7 @@ func callClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 	end := func() { endProduction.Do(func() { close(productionEnded) }) }
 	go func() {
 		result := sendResult{}
+		producedAny := false
 		defer func() {
 			result.panicValue = recover()
 			end()
@@ -710,6 +712,7 @@ func callClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 			}
 		}()
 		for r := range reqs {
+			producedAny = true
 			if terminal.Load() {
 				return
 			}
@@ -734,6 +737,12 @@ func callClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 		}
 		if ctx.Err() != nil {
 			result.err = ctxFailure(ctx)
+			return
+		}
+		if !producedAny {
+			// Match the Rust facade's empty-stream validation before native
+			// finish cancels the response half and can hide this error.
+			result.err = &RpcError{Code: StatusInvalidArgument, Message: "client-streaming requires at least one request"}
 			return
 		}
 		if err := c.send(nil, true); err != nil && !errors.Is(err, errCallClosed) {

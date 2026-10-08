@@ -132,19 +132,25 @@ type lifecycleEncodeFailure struct {
 func (c lifecycleEncodeFailure) Encode(any) ([]byte, error) { return nil, c.err }
 
 func TestRPC_ClientStreamLocalFailures(t *testing.T) {
-	for _, phase := range []string{"panic", "encode"} {
+	for _, phase := range []string{"panic", "encode", "nil-encode"} {
 		t.Run(phase, func(t *testing.T) {
 			f := newRPCFixture(t, ServerOptions{Services: []*Service{interopService()}})
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			original := f.conn.codec
 			failure := errors.New("local encoding failure")
-			if phase == "encode" {
+			if phase != "panic" {
 				f.conn.codec = lifecycleEncodeFailure{original, failure}
 			}
 			reqs := func(yield func(*testEchoRequest) bool) {
 				if phase == "panic" {
 					panic(failure)
+				}
+				if phase == "nil-encode" {
+					// A yielded nil still goes through the codec; it is not
+					// an iterator that produced no requests.
+					yield(nil)
+					return
 				}
 				yield(&testEchoRequest{Data: []byte{}})
 			}
@@ -175,6 +181,70 @@ func TestRPC_ClientStreamLocalFailures(t *testing.T) {
 			}
 			if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "echo", &testEchoRequest{Data: []byte{}}); err != nil {
 				t.Fatalf("followup: %v", err)
+			}
+		})
+	}
+}
+
+func TestRPC_ClientStreamEmptyValidationAndRecovery(t *testing.T) {
+	var dispatched atomic.Int32
+	svc := interopService()
+	svc.addMethod(ClientStream("emptyguard", func(_ context.Context, requests iter.Seq2[*testEchoRequest, error]) (*testEchoReply, error) {
+		dispatched.Add(1)
+		var count int32
+		for _, err := range requests {
+			if err != nil {
+				return nil, err
+			}
+			count++
+		}
+		return &testEchoReply{Count: count, Data: []byte{}}, nil
+	}))
+	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	empty := func(func(*testEchoRequest) bool) {}
+	if reply, err := CallClientStream[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "emptyguard", empty); reply != nil || !errors.Is(err, ErrRpcInvalidArgument) {
+		t.Fatalf("empty request validation: reply=%+v error=%v", reply, err)
+	}
+	if dispatched.Load() != 0 || f.srv.LiveCalls() != 0 {
+		t.Fatalf("empty request dispatched=%d live=%d", dispatched.Load(), f.srv.LiveCalls())
+	}
+	// An item with zero-valued fields is a request, not an empty source.
+	one := func(yield func(*testEchoRequest) bool) { yield(&testEchoRequest{Data: []byte{}}) }
+	if reply, err := CallClientStream[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "emptyguard", one); err != nil || reply.Count != 1 {
+		t.Fatalf("nonempty followup: reply=%+v error=%v", reply, err)
+	}
+	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "echo", &testEchoRequest{Data: []byte{}}); err != nil {
+		t.Fatalf("healthy unary followup: %v", err)
+	}
+}
+
+func TestRPC_ClientStreamEmptyContextPriority(t *testing.T) {
+	f := newRPCFixture(t, ServerOptions{Services: []*Service{interopService()}})
+	for _, deadline := range []bool{false, true} {
+		t.Run(map[bool]string{false: "cancel", true: "deadline"}[deadline], func(t *testing.T) {
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if deadline {
+				ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+			}
+			defer cancel()
+			source := func(func(*testEchoRequest) bool) {
+				if !deadline {
+					cancel()
+				}
+				<-ctx.Done()
+			}
+			_, err := CallClientStream[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "ingest", source)
+			want := ErrRpcCancelled
+			if deadline {
+				want = ErrRpcDeadlineExceeded
+			}
+			if !errors.Is(err, want) || errors.Is(err, ErrRpcInvalidArgument) {
+				t.Fatalf("context must precede empty validation: %v", err)
 			}
 		})
 	}
