@@ -4,10 +4,26 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def invoke_bounded(argv, *, cwd, env, check, timeout):
+    # npx starts child processes. Kill the whole group on timeout so a hung
+    # test cannot keep touching shared storage while later gates run.
+    with subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True) as child:
+        try:
+            return subprocess.CompletedProcess(argv, child.wait(timeout=timeout))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+            raise
 
 
 def gates(root, temporary):
@@ -22,7 +38,7 @@ def gates(root, temporary):
     ]
 
 
-def run(root, output, temporary, invoke=subprocess.run):
+def run(root, output, temporary, invoke=invoke_bounded):
     # A fresh file prevents a failed O7 invocation consuming stale counts.
     (temporary / "o7-vitest.json").unlink(missing_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -34,13 +50,18 @@ def run(root, output, temporary, invoke=subprocess.run):
     for runtime, name, cwd, argv in gates(root, temporary):
         print(f"::group::{runtime}: {name}", flush=True)
         started = time.monotonic()
+        timeout = 600 if name == "vitest" else 120
         try:
-            code = invoke(argv, cwd=cwd, env=env, check=False).returncode
+            code = invoke(argv, cwd=cwd, env=env, check=False, timeout=timeout).returncode
+        except subprocess.TimeoutExpired:
+            print(f"::error::{runtime} {name}: exceeded {timeout}s deadline", flush=True)
+            code = 124
         except OSError as error:
             print(f"::error::{runtime} {name}: {error}", flush=True)
             code = 127
-        outcomes["runtimes"][runtime].append({"gate": name, "exit_code": code, "seconds": round(time.monotonic() - started, 3)})
+        outcomes["runtimes"][runtime].append({"gate": name, "exit_code": code, "timeout_seconds": timeout, "seconds": round(time.monotonic() - started, 3)})
         failed |= code != 0
+        output.write_text(json.dumps(outcomes, indent=2) + "\n")
         print("::endgroup::", flush=True)
     report = temporary / "o7-vitest.json"
     if report.is_file():

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -17,6 +18,42 @@ SPEC.loader.exec_module(R)
 
 
 class RuntimeGates(unittest.TestCase):
+    def test_timeout_is_retained_without_retry_and_bun_still_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+            def invoke(argv, **kwargs):
+                calls.append(argv)
+                if len(calls) == 1:
+                    self.assertEqual(kwargs['timeout'], 600)
+                    raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
+                self.assertEqual(kwargs['timeout'], 120)
+                return subprocess.CompletedProcess(argv, 0)
+            output = root / 'out.json'
+            self.assertEqual(R.run(root, output, root, invoke), 1)
+            self.assertEqual(len(calls), 5)
+            evidence = json.loads(output.read_text())
+            self.assertEqual(evidence['runtimes']['node'][0]['exit_code'], 124)
+            self.assertEqual(len(evidence['runtimes']['bun']), 2)
+
+    def test_hung_subprocess_is_terminated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                R.invoke_bounded([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                 cwd=directory, env=os.environ, check=False, timeout=0.1)
+
+    def test_all_candidate_and_promotion_jobs_have_finite_deadlines(self):
+        for filename in ('linux.yml', 'release.yml'):
+            workflow = (ROOT / '.forgejo/workflows' / filename).read_text()
+            body = workflow.split('\njobs:\n', 1)[1]
+            matches = list(re.finditer(r'^  ([\w-]+):$', body, re.M))
+            self.assertTrue(matches)
+            for index, match in enumerate(matches):
+                block = body[match.end():matches[index + 1].start() if index + 1 < len(matches) else len(body)]
+                timeout = re.search(r'^    timeout-minutes: (\d+)$', block, re.M)
+                self.assertIsNotNone(timeout, match[1])
+                self.assertTrue(1 <= int(timeout[1]) <= 90, match[1])
+
     def test_failure_keeps_bun_and_all_existing_node_gates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
