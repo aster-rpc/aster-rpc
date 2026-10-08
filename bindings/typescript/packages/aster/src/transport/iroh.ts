@@ -92,10 +92,12 @@ class RequestPump {
   private pending: Uint8Array[] = [];
   private inflight: Promise<void> | null = null;
   private error: unknown = undefined;
+  private stopped = false;
 
   constructor(private readonly call: ClientCall) {}
 
   async push(payload: Uint8Array): Promise<void> {
+    if (this.stopped) return;
     if (this.error !== undefined) throw this.error;
     this.pending.push(payload);
     if (!this.inflight) this.inflight = this.run();
@@ -104,7 +106,7 @@ class RequestPump {
 
   private async run(): Promise<void> {
     try {
-      while (this.pending.length) {
+      while (!this.stopped && this.pending.length) {
         const batch = this.pending;
         this.pending = [];
         if (batch.length === 1) await this.call.send(batch[0]!);
@@ -115,6 +117,11 @@ class RequestPump {
     } finally {
       this.inflight = null;
     }
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.pending = [];
   }
 
   async flush(): Promise<void> {
@@ -277,38 +284,61 @@ export class IrohTransport implements AsterTransport {
     }
     const onAbort = () => void call.cancel();
     signal?.addEventListener('abort', onAbort, { once: true });
-    // Resolves as soon as the server answers (possibly early, with an error).
-    const response = call.response();
-    response.catch(() => {});
+    const pump = new RequestPump(call);
+    let terminal = false;
+    let sourceClosed = false;
+    let iterator: AsyncIterator<unknown> | Iterator<unknown> | undefined;
+    // Neither a pending next() nor an uncooperative return() may delay the RPC.
+    const closeRequests = () => {
+      terminal = true;
+      pump.stop();
+      if (sourceClosed) return;
+      sourceClosed = true;
+      try { void Promise.resolve(iterator?.return?.()).catch(() => {}); }
+      catch { /* Best-effort source cleanup. */ }
+    };
+    const response = Promise.resolve().then(() => call.response()).then(
+      (out) => { closeRequests(); return out; },
+      (error) => { closeRequests(); throw mapTransportError(error); },
+    );
+    const producing = (async (): Promise<Buffer> => {
+      try {
+        const asyncIterator = requests[Symbol.asyncIterator]?.();
+        iterator = asyncIterator ?? (requests as unknown as Iterable<unknown>)[Symbol.iterator]();
+        while (!terminal) {
+          const item = await iterator.next();
+          if (terminal) break;
+          if (item.done) {
+            sourceClosed = true;
+            await pump.flush();
+            if (!terminal) await call.finish();
+            break;
+          }
+          // for-await unwraps promised values from synchronous iterators only.
+          const value = asyncIterator ? item.value : await item.value;
+          if (terminal) break;
+          await pump.push(this.codec.encode(value, opts?.hintType));
+        }
+      } catch (error) {
+        if (!terminal) {
+          if (String((error as Error)?.message ?? error).includes(STATUS_PREFIX)) {
+            // Native completion owns its status even if a write sees it first.
+            await response;
+            throw mapTransportError(error);
+          }
+          closeRequests();
+          void Promise.resolve(call.cancel()).catch(() => {});
+          throw error;
+        }
+      }
+      // Finishing the request half does not finish the response half.
+      return await response;
+    })();
     try {
-      const pump = new RequestPump(call);
-      try {
-        for await (const req of requests) await pump.push(this.codec.encode(req, opts?.hintType));
-        await pump.flush();
-        await call.finish();
-      } catch (sendErr) {
-        const native = String((sendErr as Error)?.message ?? sendErr).includes(STATUS_PREFIX);
-        if (!native) {
-          // A local failure (encode, or the request source threw): cancel.
-          void call.cancel();
-          throw sendErr;
-        }
-        // The call ended under the send: the response carries its status.
-        try {
-          await response;
-        } catch (e) {
-          throw mapTransportError(e);
-        }
-        throw mapTransportError(sendErr);
-      }
-      let out: Buffer;
-      try {
-        out = await response;
-      } catch (e) {
-        throw mapTransportError(e);
-      }
+      const out = await Promise.race([response, producing]);
       return out.byteLength ? this.codec.decode(out) : undefined;
     } finally {
+      closeRequests();
       signal?.removeEventListener('abort', onAbort);
     }
   }
