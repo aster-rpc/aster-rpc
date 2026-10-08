@@ -98,8 +98,12 @@ pub mod rpc;
 #[cfg(feature = "coordination-client")]
 pub mod coordination;
 
-#[cfg(feature = "coordination")]
+#[cfg(any(feature = "coordination", feature = "audit-outbox"))]
 mod durable_storage;
+
+/// Explicit durable local audit acceptance and acknowledged eventual delivery.
+#[cfg(feature = "audit-outbox")]
+pub mod audit_outbox;
 
 pub use admission::{alpns, Admission, ConnectRequest, Gate0, HandshakeRequest};
 pub use aster_transport_core::hpke_envelope::{

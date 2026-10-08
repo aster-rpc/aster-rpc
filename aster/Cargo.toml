@@ -52,6 +52,7 @@ coordination = [
 # turns it on. `scripts/check-coordination-deps.sh` asserts the default and
 # `coordination` graphs do not enable it.
 coordination-testing = ["coordination"]
+audit-outbox = ["dep:redb", "dep:libc", "dep:windows-sys", "dep:serde", "dep:sha2", "dep:url", "dep:reqwest", "dep:crossbeam-channel", "dep:rustls", "dep:rustls-platform-verifier", "dep:httpdate"]
 discovery = []
 hooks = []
 # `aster::ops`: the /healthz, /readyz, /metrics HTTP listener (the Rust home
@@ -199,6 +200,13 @@ base64 = "0.22"
 # OS CSPRNG for SecretKey::generate (32-byte Ed25519 seed) — same source the
 # C FFI and Python binding use. Pinned to core's getrandom major.
 getrandom = "0.2"
+sha2 = { version = "0.10", optional = true }
+url = { version = "2.5", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+reqwest = { version = "=0.13.3", default-features = false, features = ["blocking", "rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "=0.7.0", optional = true }
+httpdate = { version = "1", optional = true }
 
 # §11.4 atomic snapshot replacement on Windows. `rename` over an existing file
 # is not the same operation there that it is on Unix, so the replacement step

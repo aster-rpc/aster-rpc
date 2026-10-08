@@ -91,6 +91,7 @@ impl DirectoryLock {
         }
     }
 
+    #[cfg(any(feature = "coordination", test))]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
