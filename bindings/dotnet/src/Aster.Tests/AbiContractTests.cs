@@ -22,6 +22,21 @@ namespace Aster.Tests;
 /// These are pure ABI tests — no networking required.
 public class AbiContractTests
 {
+    [Fact]
+    public void PackagedNativeLibraryLoadsWithoutFilenameAliases()
+    {
+        string filename = OperatingSystem.IsWindows() ? "aster_transport_ffi.dll"
+            : OperatingSystem.IsMacOS() ? "libaster_transport_ffi.dylib"
+            : "libaster_transport_ffi.so";
+        Assert.True(File.Exists(Path.Combine(AppContext.BaseDirectory, filename)),
+            $"The published native filename {filename} must be copied to the consumer output");
+
+        // Use the ordinary P/Invoke path: no resolver, absolute-path preload,
+        // or renamed library may hide a mismatch with the packaged filename.
+        using var runtime = new Runtime();
+        Assert.NotEqual(0UL, runtime.Handle);
+    }
+
     // ─── Struct size verification ─────────────────────────────────────────────
 
     [Fact]
@@ -459,7 +474,7 @@ public class AbiContractTests
         while (dir != null && !File.Exists(Path.Combine(dir.FullName, "ffi", "aster_ffi.h"))) dir = dir.Parent;
         if (dir != null) header = File.ReadAllText(Path.Combine(dir.FullName, "ffi", "aster_ffi.h"));
 
-        Assert.True(NativeLibrary.TryLoad("libaster_transport_ffi", typeof(Native).Assembly, null, out IntPtr lib), "native library");
+        Assert.True(NativeLibrary.TryLoad("aster_transport_ffi", typeof(Native).Assembly, null, out IntPtr lib), "native library");
         foreach (string name in names)
         {
             Assert.True(typeof(Native).GetMethod(name, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static) != null, $"Native.{name} is not declared");

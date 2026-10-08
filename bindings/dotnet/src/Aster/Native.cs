@@ -14,7 +14,9 @@ namespace Aster;
 /// </summary>
 internal static partial class Native
 {
-    private const string NativeLib = "libaster_transport_ffi";
+    // .NET supplies lib/.so/.dylib on Unix and .dll on Windows.
+    // Keep the logical name portable so it matches the packaged native files.
+    private const string NativeLib = "aster_transport_ffi";
 
     /// <summary>ABI major this binding is written against (<c>ASTER_ABI_VERSION_MAJOR</c>).</summary>
     public const uint AbiVersionMajor = 4;
