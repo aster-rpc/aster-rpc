@@ -1,7 +1,7 @@
 """Collector-only diagnostics; no native SDK, campaign, or host changes.
 
-These controls demonstrate that synchronous evidence I/O can withhold healthy
-HTTP responses. They do not attribute an earlier campaign failure to that cause.
+Healthy acknowledgements precede evidence I/O; shutdown drains evidence and
+rejects write failures. These tests do not attribute an earlier campaign failure.
 """
 import concurrent.futures
 import importlib.util
@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+import http.client
 
 
 SOURCE = pathlib.Path(__file__).resolve().parents[2] / "scripts/assurance/campaign.py"
@@ -35,31 +36,16 @@ class GatedFlush:
         self.stream.flush()
 
 
-class RecordingEvidence(campaign.Evidence):
-    def __init__(self, root):
-        super().__init__(root)
-        self.responses = 0
-        self.finished = threading.Condition()
-
-    def write(self, kind, **fields):
-        timing = super().write(kind, **fields)
-        if kind == "collector_response":
-            with self.finished:
-                self.responses += 1
-                self.finished.notify_all()
-        return timing
-
-
 class CollectorEvidenceDiagnostics(unittest.TestCase):
     def exercise(self, blocked):
         with tempfile.TemporaryDirectory() as directory:
-            evidence = RecordingEvidence(pathlib.Path(directory) / "evidence")
+            evidence = campaign.Evidence(pathlib.Path(directory) / "evidence")
             original = evidence.log
             gate = GatedFlush(original)
             if blocked:
                 evidence.log = gate
             collector = campaign.Collector(evidence)
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=7)
             try:
                 def post(language):
                     request = urllib.request.Request(
@@ -73,18 +59,16 @@ class CollectorEvidenceDiagnostics(unittest.TestCase):
                 requests = [pool.submit(post, language) for language in campaign.LANGUAGES]
                 if blocked:
                     self.assertTrue(gate.entered.wait(1), "a collector handler reached evidence flush")
-                    completed, pending = concurrent.futures.wait(requests, timeout=0.5)
-                    self.assertEqual(len(completed), 0, "healthy responses wait behind evidence I/O")
-                    self.assertEqual(len(pending), 6)
-                    gate.release.set()
-                else:
-                    completed, pending = concurrent.futures.wait(requests, timeout=0.5)
-                    self.assertEqual(len(completed), 6, "healthy control responds within the 500 ms budget")
-                    self.assertEqual(len(pending), 0)
+                completed, pending = concurrent.futures.wait(requests, timeout=0.5)
+                self.assertEqual(len(completed), 6, "healthy responses do not wait for evidence I/O")
+                self.assertEqual(len(pending), 0)
                 self.assertEqual([request.result(timeout=3) for request in requests], [200] * 6)
-                with evidence.finished:
-                    self.assertTrue(evidence.finished.wait_for(lambda: evidence.responses == 6, timeout=3),
-                                    "all handler evidence writes finish before closing their file")
+                if blocked:
+                    closing = pool.submit(collector.close)
+                    with self.assertRaises(concurrent.futures.TimeoutError):
+                        closing.result(timeout=0.6)
+                    gate.release.set()
+                    closing.result(timeout=3)
             finally:
                 gate.release.set()
                 pool.shutdown(wait=True)
@@ -96,9 +80,10 @@ class CollectorEvidenceDiagnostics(unittest.TestCase):
             for record in responses:
                 stages = [record[key] for key in (
                     "handler_started_monotonic", "body_read_completed_monotonic",
+                    "response_completed_monotonic",
                     "evidence_entered_monotonic", "evidence_lock_acquired_monotonic",
                     "evidence_flush_started_monotonic", "evidence_flush_completed_monotonic",
-                    "response_completed_monotonic", "monotonic")]
+                    "monotonic")]
                 self.assertEqual(stages, sorted(stages))
                 self.assertIsNone(record["response_error"])
             if blocked:
@@ -109,8 +94,71 @@ class CollectorEvidenceDiagnostics(unittest.TestCase):
     def test_healthy_collector_responds_without_evidence_stall(self):
         self.exercise(blocked=False)
 
-    def test_stalled_evidence_flush_withholds_all_six_healthy_responses(self):
+    def test_stalled_evidence_flush_does_not_gate_responses_and_shutdown_drains(self):
         self.exercise(blocked=True)
+
+    def test_handler_evidence_failure_rejects_shutdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = campaign.Evidence(pathlib.Path(directory) / "evidence")
+            original = evidence.log
+
+            class FailedFlush:
+                def write(self, data):
+                    return original.write(data)
+
+                def flush(self):
+                    raise OSError("injected evidence write failure")
+
+            evidence.log = FailedFlush()
+            collector = campaign.Collector(evidence)
+            try:
+                request = urllib.request.Request(collector.endpoint + "/v1/logs",
+                                                 data=b"campaign:go:179;", method="POST")
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                with self.assertRaisesRegex(RuntimeError, "evidence is incomplete") as failure:
+                    collector.close()
+                self.assertIsInstance(failure.exception.__cause__, OSError)
+            finally:
+                try:
+                    collector.close()
+                except RuntimeError:
+                    pass
+                original.close()
+
+    def test_fault_restore_and_shutdown_drain_stalled_handlers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = campaign.Evidence(pathlib.Path(directory) / "evidence")
+            collector = campaign.Collector(evidence)
+            class ObservedRelease(threading.Event):
+                def __init__(self):
+                    super().__init__()
+                    self.waiting = threading.Event()
+
+                def wait(self, timeout=None):
+                    self.waiting.set()
+                    return super().wait(timeout)
+
+            collector.release = ObservedRelease()
+            collector.release.set()
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                collector.fault("stall")
+                request = urllib.request.Request(collector.endpoint + "/v1/logs",
+                                                 data=b"campaign:go:180;", method="POST")
+                pending = pool.submit(urllib.request.urlopen, request, timeout=3)
+                self.assertTrue(collector.release.waiting.wait(1))
+                collector.restore()
+                collector.fault("refusal")
+                collector.restore()
+                collector.close()
+                self.assertEqual(collector.pending_handlers, 0)
+                with self.assertRaises(http.client.RemoteDisconnected):
+                    pending.result(timeout=3)
+            finally:
+                collector.close()
+                pool.shutdown(wait=True)
+                evidence.log.close()
 
 
 if __name__ == "__main__":

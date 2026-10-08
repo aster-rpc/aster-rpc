@@ -12,7 +12,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import {
   DISPATCH_DELIVERIES,
   DispatchEventKind,
@@ -27,6 +27,7 @@ import {
   type NativeDispatchServer,
 } from '../../../bindings/typescript/packages/aster/src/dispatch-server.ts';
 import { tryLoadNative } from '../../../bindings/typescript/packages/aster/src/native.ts';
+import * as nativeLoader from '../../../bindings/typescript/packages/aster/src/native.ts';
 import { IrohTransport } from '../../../bindings/typescript/packages/aster/src/transport/iroh.ts';
 import { RpcError, StatusCode } from '../../../bindings/typescript/packages/aster/src/status.ts';
 
@@ -328,6 +329,108 @@ describe.skipIf(!hasDispatch)('DispatchServer ring delivery close', () => {
       try { conn.close(0, 'done'); } catch { /* ignore */ }
       await peer.close();
       await node.close();
+    }
+  });
+});
+
+describe.skipIf(!hasDispatch)('DispatchLoop JS wrapper attach window', () => {
+  it('holds a real native callback until the JS wrapper attaches', async () => {
+    let node: any;
+    let peer: any;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let ready!: () => void;
+    let failReady!: (error: unknown) => void;
+    const nativeReady = new Promise<void>((resolve, reject) => { ready = resolve; failReady = reject; });
+    let delivered!: (event: DispatchEvent) => void;
+    let failDelivery!: (error: unknown) => void;
+    const callbackReturned = new Promise<DispatchEvent>((resolve, reject) => {
+      delivered = resolve;
+      failDelivery = reject;
+    });
+    const originalServe = native.DispatchServer.serve;
+    // Run the real native server and callback, but hold its returned Promise.
+    // This isolates the JS await boundary after native delivery is attached.
+    const controlledServe = async (...args: any[]) => {
+      const onEvents = args[3];
+      args[3] = (events: DispatchEvent[]) => {
+        try {
+          onEvents(events);
+        } catch (error) {
+          failDelivery(error);
+          return;
+        }
+        const call = events.find((event) => event.kind === DispatchEventKind.Call);
+        if (call) delivered(call); // Acknowledge only after the real callback returns.
+      };
+      try {
+        const server = await originalServe.apply(native.DispatchServer, args);
+        ready();
+        await held;
+        return server;
+      } catch (error) {
+        failReady(error);
+        throw error;
+      }
+    };
+    // NAPI static methods are non-configurable, so wrap only the loader's
+    // returned serve method; every event and server still comes from native.
+    const spy = vi.spyOn(nativeLoader, 'loadNative').mockReturnValue({
+      ...native,
+      DispatchServer: { serve: controlledServe },
+    } as any);
+    let conn: any;
+    let loop: DispatchLoop | undefined;
+    let serving: Promise<DispatchLoop> | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let attached = false;
+    const onCall = vi.fn((event: DispatchEvent, server: NativeDispatchServer) => {
+      void respondCall(server, event.callId, Buffer.concat([Buffer.from('echo:'), event.request!]));
+    });
+    try {
+      node = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
+      peer = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
+      serving = DispatchLoop.start({
+        node,
+        services: [ECHO_SERVICE],
+        delivery: 'tsfn-batched',
+        builtinNodeInfo: false,
+        onCall,
+      });
+      void serving.then(() => { attached = true; }, () => {});
+      await nativeReady;
+      conn = await peer.connectNodeAddr(node.nodeId(), RPC_ALPN, node.directAddresses(), undefined);
+      const transport = new IrohTransport(conn, BYTES as any);
+      const reply = transport.unary('test.Echo', 'echo', Buffer.from('js-early')).then(
+        (bytes) => Buffer.from(bytes as Uint8Array).toString(),
+        (error) => ({ error }),
+      );
+      const event = await callbackReturned;
+      expect(event.kind).toBe(DispatchEventKind.Call);
+      expect(event.request!.toString()).toBe('js-early');
+      expect(attached).toBe(false);
+      expect(onCall).not.toHaveBeenCalled();
+      release();
+      loop = await serving;
+      const result = await Promise.race([
+        reply,
+        new Promise((resolve) => { timeout = setTimeout(() => resolve('hung'), 5000); }),
+      ]);
+      expect(result).toBe('echo:js-early');
+      expect(onCall).toHaveBeenCalledTimes(1);
+      await until(() => loop!.native.liveCalls() === 0);
+    } finally {
+      clearTimeout(timeout);
+      release();
+      spy.mockRestore();
+      try {
+        loop ??= await serving;
+        await loop?.close();
+      } finally {
+        try { conn?.close(0, 'done'); } catch { /* ignore */ }
+        await peer?.close();
+        await node?.close();
+      }
     }
   });
 });

@@ -20,6 +20,7 @@ import queue
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -128,6 +129,9 @@ class Collector:
         self.port = 0
         self.server = None
         self.removed = None
+        self.handlers = threading.Condition()
+        self.pending_handlers = 0
+        self.handler_errors = []
         self.start()
 
     def start(self):
@@ -158,10 +162,7 @@ class Collector:
                             collector.markers.setdefault(marker, now)
                         while len(collector.markers) > 2048:
                             del collector.markers[next(iter(collector.markers))]
-                    accepted = collector.evidence.write(
-                        "collector_accept", markers=sorted(found), bytes=len(body),
-                        handler_started_monotonic=handler_started,
-                        body_read_completed_monotonic=body_read_completed)
+                    accepted = now
                 response_error = None
                 try:
                     self.send_response(status)
@@ -171,21 +172,49 @@ class Collector:
                     response_error = "peer_closed"
                 response_completed = time.monotonic()
                 if accepted is not None:
-                    # Capture response timing before serialization. This record
-                    # adds no evidence I/O before this HTTP response is sent,
-                    # but its shared file/lock work can delay other handlers.
-                    # These samples diagnose coupling, not network arrival or
-                    # confirmation that the exporter consumed the response.
+                    # The collector accepts into memory before acknowledging;
+                    # evidence-file latency must not become exporter latency.
+                    # close() joins these handlers and rejects missing evidence.
+                    timing = collector.evidence.write(
+                        "collector_accept", markers=sorted(found), bytes=len(body),
+                        handler_started_monotonic=handler_started,
+                        body_read_completed_monotonic=body_read_completed,
+                        accepted_monotonic=accepted,
+                        response_completed_monotonic=response_completed)
                     collector.evidence.write(
                         "collector_response", markers=sorted(found), status=status,
                         handler_started_monotonic=handler_started,
                         body_read_completed_monotonic=body_read_completed,
                         response_completed_monotonic=response_completed,
-                        response_error=response_error, **accepted)
+                        response_error=response_error, **timing)
 
         class Server(http.server.ThreadingHTTPServer):
             allow_reuse_address = True
             daemon_threads = True
+
+            def process_request(self, request, client_address):
+                with collector.handlers:
+                    collector.pending_handlers += 1
+                    collector.handlers.notify_all()
+                try:
+                    super().process_request(request, client_address)
+                except Exception:
+                    with collector.handlers:
+                        collector.pending_handlers -= 1
+                        collector.handlers.notify_all()
+                    raise
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    with collector.handlers:
+                        collector.pending_handlers -= 1
+                        collector.handlers.notify_all()
+
+            def handle_error(self, request, client_address):
+                with collector.handlers:
+                    collector.handler_errors.append(sys.exc_info()[1])
 
         self.server = Server(("127.0.0.1", self.port), Handler)
         self.port = self.server.server_address[1]
@@ -221,6 +250,11 @@ class Collector:
         if self.server is not None:
             self.server.shutdown()
             self.server.server_close()
+        with self.handlers:
+            if not self.handlers.wait_for(lambda: self.pending_handlers == 0, timeout=20):
+                raise TimeoutError("collector handlers did not drain their evidence within 20s")
+            if self.handler_errors:
+                raise RuntimeError("collector handler failed; evidence is incomplete") from self.handler_errors[0]
 
 
 def proc_fields(pid):
@@ -601,7 +635,11 @@ def main():
         try:
             collector.close()
         finally:
-            evidence.log.close()
+            # A drained write failure rejects PASS but can close its stream.
+            # A timed-out handler may still be writing; do not race that I/O.
+            with collector.handlers:
+                if collector.pending_handlers == 0:
+                    evidence.log.close()
         if cleanup_errors:
             raise RuntimeError("owned process cleanup failed: " + "; ".join(cleanup_errors))
     # A PASS artifact is a terminal claim: all pending recovery and owned
