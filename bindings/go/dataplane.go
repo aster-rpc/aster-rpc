@@ -330,8 +330,10 @@ func (d *Doc) AuthorityReport(ctx context.Context, node *Node) (AuthorityReport,
 	return parseAuthority(d.runtime, ev, "aster_doc_authority_report")
 }
 
-// SetBytesDurable writes an entry and waits until it is durable; returns the
-// content hash.
+// SetBytesDurable commits value blob metadata before publishing the document
+// record; returns the content hash. After a hard process kill, a surviving record
+// cannot name missing locally-authored content. It does not guarantee document
+// metadata persistence or survival of sudden machine power loss.
 func (d *Doc) SetBytesDurable(ctx context.Context, author AuthorID, key string, value []byte) (BlobID, error) {
 	var a cArena
 	defer a.free()

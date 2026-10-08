@@ -496,3 +496,131 @@ async fn one_candidate_matches_the_single_provider_api() {
     old_consumer.shutdown().await;
     new_consumer.shutdown().await;
 }
+
+#[tokio::test]
+async fn interrupted_download_resumes_verified_partial_content() -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    use aster::native::{
+        iroh::{address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router},
+        iroh_blobs::{
+            provider::events::{EventMask, EventSender, ProviderMessage, ThrottleMode},
+            store::mem::MemStore,
+            BlobFormat as NativeFormat, BlobsProtocol, HashAndFormat,
+        },
+    };
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::sync::{oneshot, Notify};
+
+    // Four BAO chunk groups: no timing-sized payload or host stress.
+    let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    let store = MemStore::new();
+    let tag = store.blobs().add_slice(&payload).await?;
+    let native_hash = tag.hash;
+    let hash = aster::Hash::from_hex(native_hash.to_hex().to_string());
+    let provider = aster::native::iroh::Endpoint::builder(presets::N0)
+        .relay_mode(aster::native::iroh::RelayMode::Disabled)
+        .bind_addr("127.0.0.1:0")?
+        .bind()
+        .await?;
+    let provider_id = aster::NodeId::from_hex(provider.id().to_string());
+    let release = Arc::new(Notify::new());
+    let once = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (events, mut messages) = EventSender::channel(
+        8,
+        EventMask {
+            throttle: ThrottleMode::Intercept,
+            ..EventMask::DEFAULT
+        },
+    );
+    let router = Router::builder(provider.clone())
+        .accept(
+            aster::native::iroh_blobs::ALPN,
+            BlobsProtocol::new(&store, Some(events)),
+        )
+        .spawn();
+    let release_worker = release.clone();
+    let once_worker = once.clone();
+    let event_worker = tokio::spawn(async move {
+        let mut entered_tx = Some(entered_tx);
+        while let Some(message) = messages.recv().await {
+            if let ProviderMessage::Throttle(message) = message {
+                // The provider has already emitted a verified 16 KiB group.
+                if !once_worker.swap(true, Ordering::SeqCst) {
+                    if let Some(tx) = entered_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    release_worker.notified().await;
+                }
+                let _ = message.tx.send(Ok(())).await;
+            }
+        }
+    });
+    let consumer = start_node().await;
+    let blobs = consumer.blobs();
+    let memory = MemoryLookup::new();
+    memory.add_endpoint_info(provider.addr());
+    blobs.native_endpoint().address_lookup()?.add(memory);
+    let download_blobs = blobs.clone();
+    let download_hash = hash.clone();
+    let download_provider = provider_id.clone();
+    let mut initial = Some(tokio::spawn(async move {
+        download_blobs
+            .download_hash_to_store_from(
+                &download_hash,
+                &[download_provider],
+                BlobFormat::Raw,
+                FetchStrategy::Whole,
+            )
+            .await
+    }));
+    // Return errors instead of asserting/panicking inside the controlled gate,
+    // so every failure releases the provider and tears down owned tasks.
+    let result: anyhow::Result<()> = async {
+        timeout(Duration::from_secs(3), entered_rx).await.context("provider never reached throttle")??;
+        let partial = timeout(Duration::from_secs(3), async {
+            loop {
+                let local = blobs.native_store().remote().local(HashAndFormat::new(native_hash, NativeFormat::Raw)).await?;
+                if local.local_bytes() > 0 { return Ok::<_, anyhow::Error>(local); }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.context("no verified partial data reached store")??;
+        let resident = partial.local_bytes();
+        ensure!(!partial.is_complete() && resident < payload.len() as u64, "gated transfer falsely complete");
+        ensure!(!initial.as_ref().context("missing initial task")?.is_finished(), "download finished before provider gate was released");
+        let initial_task = initial.take().context("missing initial task")?;
+        initial_task.abort();
+        // Abort is observed by the downloader via its closed progress channel.
+        // The provider remains gated while the public result is canceled.
+        let cancelled = timeout(Duration::from_secs(2), initial_task).await.context("cancelled task failed to settle")?;
+        ensure!(matches!(cancelled, Err(error) if error.is_cancelled()), "initial download did not cancel");
+        ensure!(matches!(blobs.status(&hash).await?, aster::BlobStatus::Partial { .. }), "interrupted blob not Partial");
+        release.notify_one();
+        let (bytes, report) = timeout(Duration::from_secs(5), blobs.download_hash_from(
+            &hash, &[provider_id], BlobFormat::Raw, FetchStrategy::Whole
+        )).await.context("resume timed out")??;
+        ensure!(bytes == payload, "resumed bytes differ");
+        // Report counts transferred payload bytes, not Bao proof/framing bytes.
+        ensure!(report.bytes_transferred() > 0 && report.bytes_transferred() < payload.len() as u64,
+                "resume did not reuse verified resident data: {}", report.bytes_transferred());
+        ensure!(matches!(blobs.status(&hash).await?, aster::BlobStatus::Complete { size } if size == payload.len() as u64), "resume incomplete");
+        eprintln!("DATA01 partial_bytes={resident} resumed_payload_bytes={} total_bytes={}", report.bytes_transferred(), payload.len());
+        Ok(())
+    }.await;
+    release.notify_one();
+    if let Some(task) = initial {
+        task.abort();
+        let _ = timeout(Duration::from_secs(2), task).await;
+    }
+    let consumer_closed = timeout(Duration::from_secs(3), consumer.shutdown()).await;
+    let provider_closed = timeout(Duration::from_secs(3), router.shutdown()).await;
+    event_worker.abort();
+    let _ = event_worker.await;
+    result?;
+    consumer_closed.context("consumer shutdown timed out")?;
+    provider_closed.context("provider shutdown timed out")??;
+    Ok(())
+}

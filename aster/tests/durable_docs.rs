@@ -100,6 +100,16 @@ fn public_durable_write_survives_an_immediate_hard_kill() {
                 },
                 "round {round}: acknowledged value is not complete after reopen"
             );
+            let recovered = store
+                .blobs()
+                .get_bytes(hash)
+                .await
+                .expect("read acknowledged content after hard kill");
+            assert_eq!(
+                recovered.as_ref(),
+                vec![0xA5; PAYLOAD_LEN].as_slice(),
+                "round {round}: acknowledged content changed after reopen"
+            );
             store.shutdown().await.expect("shutdown reopened store");
         });
     }

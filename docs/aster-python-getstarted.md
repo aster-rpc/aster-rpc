@@ -265,7 +265,8 @@ Docs (`docs_client(node)` and its `DocHandle`s):
   (`None` if not local), `open_or_import_read_namespace(namespace)`,
   `open_or_import_write_namespace(secret)`, `authority_report(namespace)`,
   `retire_local_write_authority(namespace)`.
-- `DocHandle`: `set_bytes_durable(author, key, value)` (survives a hard kill),
+- `DocHandle`: `set_bytes_durable(author, key, value)` (commits value blob metadata before
+  publishing the document record),
   `entry_exists(author, key)` (true for a deletion tombstone too),
   `entry_content_status(hash)` (`BlobStatusResult`),
   `read_entry_contents_if_complete(hashes)`, `authority_report()`,
@@ -280,6 +281,11 @@ Docs (`docs_client(node)` and its `DocHandle`s):
   `shutdown_for_role_swap`).
 - Events are async iterators: `async for ev in doc.events(): ...` (or
   `await doc.subscribe()`); `ev.kind` says which fields are set.
+
+The durable write orders blob persistence before document publication: after a
+hard process kill, a surviving record cannot name missing locally-authored
+content. It does not guarantee persistence of document metadata or survival of
+sudden machine power loss.
 
 Network: `IrohConnection.paths()` lists every open `PathInfo` (`kind`
 `"direct"` / `"relay"` / `"other"`, `addr`, `relay_url`, `is_selected`,
