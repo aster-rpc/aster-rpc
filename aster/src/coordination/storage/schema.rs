@@ -24,7 +24,7 @@
 // wires the voter runtime rather than at any Slice 2 checkpoint.
 #![allow(dead_code)]
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use redb::{
@@ -213,159 +213,58 @@ impl StorageLayout {
     }
 }
 
-// ── The lifetime lock ────────────────────────────────────────────────────────
+// Shared mechanisms; coordination keeps its policy and diagnostic contract.
+#[cfg(test)]
+use crate::durable_storage::DIR_MODE;
+use crate::durable_storage::FILE_MODE;
 
-/// An exclusive lock on the storage directory, held for the runtime lifetime.
-///
-/// The lock is released by dropping this value, which closes the file. It is
-/// advisory against cooperating processes; arbitrary code already running as
-/// the storage owner is inside the host threat boundary and this does not
-/// pretend otherwise.
-#[derive(Debug)]
-pub(crate) struct DirectoryLock {
-    path: PathBuf,
-    file: File,
+impl From<crate::durable_storage::StorageError> for StorageError {
+    fn from(error: crate::durable_storage::StorageError) -> Self {
+        use crate::durable_storage::StorageError as Shared;
+        match error {
+            Shared::LockContended { path } => Self::LockContended { path },
+            Shared::LockIo { path, source } => Self::LockIo { path, source },
+            Shared::Io { what, path, source } => Self::Io { what, path, source },
+            Shared::SymlinkedPath { path } => Self::SymlinkedPath { path },
+            Shared::BroadPermissions { path, mode } => Self::BroadPermissions { path, mode },
+        }
+    }
 }
+
+#[derive(Debug)]
+pub(crate) struct DirectoryLock(crate::durable_storage::DirectoryLock);
 
 impl DirectoryLock {
-    /// Acquire the lock, or fail with the reason it could not be acquired.
-    ///
-    /// The two failure modes are kept apart deliberately. `WouldBlock` is the
-    /// only result that means another voter owns this directory; the standard
-    /// library guarantees it never hides a `WouldBlock` inside
-    /// `TryLockError::Error`, so the split is exact rather than heuristic.
     pub(crate) fn acquire(path: impl Into<PathBuf>, policy: &OpenPolicy) -> StorageResult<Self> {
-        let path = path.into();
-        reject_symlink(&path)?;
-
-        // Whether the lock file already existed decides what happens to its
-        // permissions, and the two are not interchangeable. A pre-existing
-        // group-writable `LOCK` is a production policy violation to *refuse*;
-        // chmodding it would repair the symptom, let startup continue, and
-        // erase the evidence that something else could write the file this
-        // voter's mutual exclusion depends on.
-        let existed = path.exists();
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| StorageError::LockIo {
-                path: path.clone(),
-                source,
-            })?;
-        if existed {
-            check_permissions(&path, policy)?;
-        } else {
-            restrict_permissions(&path, FILE_MODE)?;
-        }
-
-        match file.try_lock() {
-            Ok(()) => Ok(Self { path, file }),
-            Err(failure) => Err(classify_lock_failure(path, failure)),
-        }
+        crate::durable_storage::DirectoryLock::acquire(path, policy.enforces_permissions())
+            .map(Self)
+            .map_err(Into::into)
     }
-
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        self.0.path()
     }
-
-    /// Release the lock explicitly during an orderly shutdown.
     pub(crate) fn unlock(self) -> StorageResult<()> {
-        self.file.unlock().map_err(|source| StorageError::LockIo {
-            path: self.path.clone(),
-            source,
-        })
+        self.0.unlock().map_err(Into::into)
     }
 }
 
-/// Map a `try_lock` failure to its named storage failure.
-///
-/// A pure function, for the same reason [`classify_integrity`] is one: a real
-/// `TryLockError::Error` needs a filesystem that fails the lock syscall while
-/// still opening the file, which is not something a test can arrange on a
-/// normal volume. Fused into [`DirectoryLock::acquire`], the `Error` arm had
-/// no test at all — an earlier version of this module collapsed both arms into
-/// contention and every lock test still passed, because the only I/O failure
-/// being exercised happened at `File::open`, one step earlier.
+#[cfg(test)]
 fn classify_lock_failure(path: PathBuf, failure: std::fs::TryLockError) -> StorageError {
-    match failure {
-        std::fs::TryLockError::WouldBlock => StorageError::LockContended { path },
-        std::fs::TryLockError::Error(source) => StorageError::LockIo { path, source },
-    }
+    crate::durable_storage::classify_lock_failure(path, failure).into()
 }
-
-// ── Permissions ──────────────────────────────────────────────────────────────
-
-const DIR_MODE: u32 = 0o700;
-const FILE_MODE: u32 = 0o600;
-
-/// Set owner-only permissions on a path we just created. A no-op off Unix,
-/// where §11.1 relies on the application directory's inherited user ACL and a
-/// platform test/runbook instead.
-#[cfg(unix)]
 fn restrict_permissions(path: &Path, mode: u32) -> StorageResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|source| StorageError::io("set permissions", path, source))
+    crate::durable_storage::restrict_permissions(path, mode).map_err(Into::into)
 }
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path, _mode: u32) -> StorageResult<()> {
-    Ok(())
-}
-
-/// Refuse an existing path that is writable beyond its owner.
-#[cfg(unix)]
 fn check_permissions(path: &Path, policy: &OpenPolicy) -> StorageResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if !policy.enforces_permissions() {
-        return Ok(());
-    }
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|source| StorageError::io("read metadata", path, source))?;
-    let mode = meta.permissions().mode() & 0o777;
-    // Group- or other-writable. Read access is not the concern here: §11.1
-    // provides no at-rest encryption and says so, but another writer can
-    // corrupt state the lock is supposed to protect.
-    if mode & 0o022 != 0 {
-        return Err(StorageError::BroadPermissions {
-            path: path.to_path_buf(),
-            mode,
-        });
-    }
-    Ok(())
+    crate::durable_storage::check_permissions(path, policy.enforces_permissions())
+        .map_err(Into::into)
 }
-
-#[cfg(not(unix))]
-fn check_permissions(_path: &Path, _policy: &OpenPolicy) -> StorageResult<()> {
-    Ok(())
-}
-
-/// Refuse a symlinked path.
 fn reject_symlink(path: &Path) -> StorageResult<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(StorageError::SymlinkedPath {
-            path: path.to_path_buf(),
-        }),
-        Ok(_) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(StorageError::io("read metadata", path, source)),
-    }
+    crate::durable_storage::reject_symlink(path).map_err(Into::into)
 }
-
-/// Create a directory with owner-only permissions if it is absent, and
-/// validate it if it is not.
 fn ensure_directory(path: &Path, policy: &OpenPolicy) -> StorageResult<()> {
-    reject_symlink(path)?;
-    if path.exists() {
-        check_permissions(path, policy)?;
-        return Ok(());
-    }
-    std::fs::create_dir_all(path)
-        .map_err(|source| StorageError::io("create directory", path, source))?;
-    restrict_permissions(path, DIR_MODE)
+    crate::durable_storage::ensure_directory(path, policy.enforces_permissions())
+        .map_err(Into::into)
 }
 
 // ── Write transactions ───────────────────────────────────────────────────────
@@ -383,13 +282,7 @@ fn ensure_directory(path: &Path, policy: &OpenPolicy) -> StorageResult<()> {
 /// setting from one of two write paths in the same file still passed.
 pub(crate) fn durable_write(database: &Database, db: Db) -> StorageResult<redb::WriteTransaction> {
     super::crash::reached(super::crash::CrashPoint::TransactionBegin);
-    let mut write = database
-        .begin_write()
-        .map_err(|source| StorageError::redb(db, source))?;
-    write
-        .set_durability(redb::Durability::Immediate)
-        .map_err(|source| StorageError::redb(db, source))?;
-    Ok(write)
+    crate::durable_storage::durable_write(database).map_err(|source| StorageError::redb(db, source))
 }
 
 /// Commit a durable transaction, and nothing else.
@@ -1776,7 +1669,9 @@ mod tests {
     #[test]
     fn nothing_outside_replace_can_take_a_candidate_s_path() {
         let source = include_str!("schema.rs");
-        let end = source.find("\n#[cfg(test)]\n").unwrap_or(source.len());
+        let end = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module boundary");
         let production = &source[..end];
         // Whitespace-collapsed, so rustfmt wrapping a signature is not a
         // finding. The guard is about what the API offers, not its layout.

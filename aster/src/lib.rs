@@ -98,6 +98,9 @@ pub mod rpc;
 #[cfg(feature = "coordination-client")]
 pub mod coordination;
 
+#[cfg(feature = "coordination")]
+mod durable_storage;
+
 pub use admission::{alpns, Admission, ConnectRequest, Gate0, HandshakeRequest};
 pub use aster_transport_core::hpke_envelope::{
     hpke_generate_keypair, hpke_open, hpke_public_key_from_private, hpke_seal, HpkeEnvelope,

@@ -398,6 +398,10 @@ mod durability_guard {
     /// Every source file in this module tree, checked as text.
     const SOURCES: &[(&str, &str)] = &[
         ("mod.rs", include_str!("mod.rs")),
+        (
+            "durable_storage.rs",
+            include_str!("../../durable_storage.rs"),
+        ),
         ("actor.rs", include_str!("actor.rs")),
         ("codec.rs", include_str!("codec.rs")),
         ("bench.rs", include_str!("bench.rs")),
@@ -478,6 +482,7 @@ mod durability_guard {
         let on_disk: std::collections::BTreeSet<String> = found.into_iter().collect();
         let guarded: std::collections::BTreeSet<String> = SOURCES
             .iter()
+            .filter(|(name, _)| *name != "durable_storage.rs")
             .map(|(name, _)| (*name).to_string())
             .collect();
 
@@ -570,11 +575,11 @@ mod durability_guard {
         assert_eq!(
             sites.len(),
             1,
-            "write transactions must be created only by schema::durable_write, \
+            "write transactions must be created only by durable_storage::durable_write, \
              so the durability setting has one place to be got wrong; found: {sites:?}"
         );
         assert!(
-            sites[0].starts_with("schema.rs"),
+            sites[0].starts_with("durable_storage.rs"),
             "the single construction site must be the helper: {sites:?}"
         );
     }
