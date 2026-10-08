@@ -87,6 +87,19 @@ class IrohTransport(Transport):
         self._versions: dict[str, int] = {}
         self._default_serialization_mode = SerializationMode.XLANG.value
         self._client_obj: Any = None
+        self._stream_tasks: set[asyncio.Future[Any]] = set()
+
+    def _track_stream_task(self, task: asyncio.Future[Any]) -> asyncio.Future[Any]:
+        """Own background cancellation/cleanup until it settles, observing late errors."""
+        self._stream_tasks.add(task)
+
+        def completed(done: asyncio.Future[Any]) -> None:
+            self._stream_tasks.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(completed)
+        return task
 
     @property
     def session_id(self) -> int:
@@ -203,22 +216,124 @@ class IrohTransport(Transport):
         deadline_secs: int = 0,
         serialization_mode: int | None = None,
     ) -> Any:
-        encode = self._codec.encode
-        payloads = [encode(item) async for item in requests]
-        if not payloads:
-            # The server dispatches a call on its first request frame.
-            raise TransportError("client_stream requires at least one request frame")
-        response = await self._client.client_stream(
+        """Send incrementally; native completion never waits for an arbitrary source.
+
+        Sources should cooperate with cancellation. A pending __anext__ that ignores
+        cancellation is allowed to finish independently; aclose runs afterward, never
+        concurrently with that operation. Cleanup errors do not replace the RPC result.
+        """
+        iterator = aiter(requests)
+        sink, response = await self._client.client_stream_open(
             service,
             method,
-            payloads,
             version=self._version_of(service),
             session_id=self._session_id,
             deadline=float(deadline_secs),
             serialization_mode=self._resolve_mode(serialization_mode),
             metadata=_metadata(metadata),
         )
-        return self._codec.decode(response)
+        reader = self._track_stream_task(asyncio.ensure_future(response.result()))
+        produced = self._track_stream_task(asyncio.get_running_loop().create_future())
+        terminal = asyncio.Event()
+
+        async def send_requests(
+            iterator=iterator, reader=reader, produced=produced,
+            terminal=terminal, sink=sink, owner=self,
+        ) -> None:
+            pending: asyncio.Future[Any] | None = None
+            exhausted = False
+            count = 0
+            phase = "source"
+            try:
+                while not terminal.is_set() and not reader.done():
+                    phase = "source"
+                    pending = owner._track_stream_task(asyncio.ensure_future(anext(iterator)))
+                    try:
+                        item = await asyncio.shield(pending)
+                    except StopAsyncIteration:
+                        exhausted = True
+                        if count == 0:
+                            raise TransportError("client_stream requires at least one request frame")
+                        phase = "native"
+                        if not terminal.is_set() and not reader.done():
+                            await sink.finish()
+                        break
+                    finally:
+                        if pending.done():
+                            pending = None
+                    if terminal.is_set() or reader.done():
+                        break
+                    phase = "encode"
+                    payload = owner._codec.encode(item)
+                    if terminal.is_set() or reader.done():
+                        break
+                    phase = "native"
+                    await sink.send(payload)
+                    count += 1
+                if not produced.done():
+                    produced.set_result(None)
+            except asyncio.CancelledError:
+                if not terminal.is_set() and not reader.done() and not produced.done():
+                    produced.cancel()
+            except BaseException as error:
+                if not terminal.is_set() and not reader.done() and not produced.done():
+                    native_terminal = (
+                        isinstance(error, RpcError)
+                        and error.code in (StatusCode.CANCELLED, StatusCode.DEADLINE_EXCEEDED)
+                    ) or (type(error) is TransportError and str(error) == "call already completed")
+                    if phase == "native" and native_terminal:
+                        # A terminal native status owns the response, including early OK
+                        # even when its request half has already become CANCELLED.
+                        try:
+                            await asyncio.shield(reader)
+                        except BaseException:
+                            pass
+                        if not produced.done():
+                            produced.set_result(None)
+                    else:
+                        produced.set_exception(error)
+            finally:
+                if not exhausted:
+                    async def cleanup_source(
+                        source: Any, next_item: asyncio.Future[Any] | None,
+                    ) -> None:
+                        if next_item is not None:
+                            next_item.cancel()
+                            try:
+                                await asyncio.shield(next_item)
+                            except BaseException:
+                                pass
+                        close = getattr(source, "aclose", None)
+                        if close is not None:
+                            try:
+                                await close()
+                            except BaseException:
+                                pass
+
+                    # Terminal cancellation may arrive while sender is already
+                    # unwinding. Give sequential source cleanup its own owner.
+                    owner._track_stream_task(asyncio.create_task(cleanup_source(iterator, pending)))
+
+        sender = self._track_stream_task(
+            asyncio.create_task(send_requests(), name="aster-client-stream-producer")
+        )
+        try:
+            await asyncio.wait((reader, produced), return_when=asyncio.FIRST_COMPLETED)
+            if produced.done():
+                await produced  # Preserve local source/encode errors before native cancellation.
+            payload = await asyncio.shield(reader)
+            return self._codec.decode(payload)
+        finally:
+            terminal.set()
+            if not produced.done():
+                produced.cancel()
+            if not sender.done():
+                sender.cancel()
+            # These native operations are owned/observed, but cannot delay public
+            # completion behind an uncooperative application iterator or cleanup.
+            self._track_stream_task(asyncio.ensure_future(sink.cancel()))
+            if not reader.done():
+                reader.cancel()
 
     # -- Bidirectional Streaming -------------------------------------------
 

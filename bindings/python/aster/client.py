@@ -9,6 +9,8 @@ This module provides client stub generation for Aster RPC services:
 
 from __future__ import annotations
 
+import asyncio
+
 import inspect
 import time
 from typing import TYPE_CHECKING, Any, AsyncIterator
@@ -68,6 +70,7 @@ class ServiceClient:
         self._service_info = service_info
         self._codec = codec
         self._interceptors = list(interceptors) if interceptors else []
+        self._request_cleanup_tasks: set[asyncio.Future[Any]] = set()
 
     async def close(self) -> None:
         """Close the underlying transport if it exposes resources."""
@@ -255,7 +258,6 @@ class ServiceClient:
                 metadata=ctx.metadata,
                 deadline_secs=deadline,
                 serialization_mode=serialization_mode,
-
             )
 
         return await self._run_call_with_interceptors(ctx, request, invoke)
@@ -272,7 +274,6 @@ class ServiceClient:
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
-
         ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
 
         async def iterator() -> AsyncIterator[Any]:
@@ -284,7 +285,6 @@ class ServiceClient:
                 metadata=ctx.metadata,
                 deadline_secs=deadline,
                 serialization_mode=serialization_mode,
-
             )
             try:
                 async for item in source:
@@ -309,12 +309,32 @@ class ServiceClient:
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
-
         ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
 
-        async def wrapped_requests() -> AsyncIterator[Any]:
-            async for item in requests:
-                yield await apply_request_interceptors(self._interceptors, ctx, item)
+        async def wrapped_requests(source=requests, owner=self, context=ctx) -> AsyncIterator[Any]:
+            exhausted = False
+            try:
+                async for item in source:
+                    yield await apply_request_interceptors(owner._interceptors, context, item)
+                exhausted = True
+            finally:
+                close = getattr(source, "aclose", None)
+                if not exhausted and close is not None:
+                    # The wrapper has finished its pending __anext__. Forward cleanup
+                    # without letting arbitrary user aclose delay a response/error.
+                    try:
+                        cleanup = asyncio.ensure_future(close())
+                    except BaseException:
+                        pass
+                    else:
+                        owner._request_cleanup_tasks.add(cleanup)
+
+                        def completed(done: asyncio.Future[Any]) -> None:
+                            owner._request_cleanup_tasks.discard(done)
+                            if not done.cancelled():
+                                done.exception()
+
+                        cleanup.add_done_callback(completed)
 
         async def invoke(_: Any) -> Any:
             return await self._transport.client_stream(
@@ -324,7 +344,6 @@ class ServiceClient:
                 metadata=ctx.metadata,
                 deadline_secs=deadline,
                 serialization_mode=serialization_mode,
-
             )
 
         # A caller-owned AsyncIterator may already be partially or fully consumed.
@@ -342,7 +361,6 @@ class ServiceClient:
         """Make a bidirectional-streaming RPC call."""
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
-
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
         channel = self._transport.bidi_stream(
