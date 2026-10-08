@@ -20,7 +20,9 @@
 //! is written into the header in whole seconds rounded **up**
 //! ([`deadline_header_secs`](super::codec::deadline_header_secs)) and enforced
 //! client-side for every call shape: when it passes, the call is cancelled and
-//! fails with `DEADLINE_EXCEEDED`.
+//! fails with `DEADLINE_EXCEEDED`. For unary retries, each transport attempt
+//! receives that budget; interceptor hooks and retry backoff are outside it.
+//! Streaming deadlines bound the whole call from opening the stream.
 //!
 //! **Cancellation.** [`RequestSink::cancel`], [`ResponseStream::cancel`] and
 //! [`ResponseFuture::cancel`] write a `FLAG_CANCEL` frame (unless a frame write
@@ -74,16 +76,18 @@ const WRITE_BATCH: usize = 64 * 1024;
 /// - `session_id`: non-zero replaces `header.session_id` (and selects that
 ///   session's pooled stream for unary calls). Get one from
 ///   [`RpcConnection::open_session`].
-/// - `deadline`: the call's total budget, from the moment it is issued.
-///   Written into the header as whole seconds rounded up, and enforced
-///   client-side (`DEADLINE_EXCEEDED`).
+/// - `deadline`: a client-side timeout (`DEADLINE_EXCEEDED`), written into
+///   the header as whole seconds rounded up. For unary calls, each transport
+///   attempt (including pool wait) receives this budget; interceptor hooks and
+///   retry backoff are outside it. For streaming calls, it bounds the whole
+///   call from opening the stream, including sending and receiving.
 /// - `metadata`: appended to the header's metadata.
 /// - `serialization_mode`: replaces `header.serialization_mode`.
 #[derive(Clone, Debug, Default)]
 pub struct CallOptions {
     /// Session id; `0` keeps the header's.
     pub session_id: u32,
-    /// Total call budget; `None` = no client deadline.
+    /// Per-attempt unary or whole-stream budget; `None` = no client deadline.
     pub deadline: Option<Duration>,
     /// Extra `(key, value)` metadata, appended to the header's.
     pub metadata: Vec<(String, String)>,
@@ -103,7 +107,8 @@ impl CallOptions {
         self
     }
 
-    /// Set the deadline (total call budget).
+    /// Set the per-attempt unary or whole-stream budget.
+    /// See the pattern-specific timing contract on [`CallOptions`].
     pub fn deadline(mut self, deadline: Duration) -> Self {
         self.deadline = Some(deadline);
         self

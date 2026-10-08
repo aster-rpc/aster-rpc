@@ -270,3 +270,54 @@ impl Pipeline {
         error
     }
 }
+
+#[cfg(test)]
+mod deadline_contract_regression {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn call_options_deadline_is_per_unary_attempt() {
+        let options = crate::rpc::CallOptions::default().deadline(Duration::from_millis(15));
+        let pipeline = Pipeline {
+            retry: Some(RetryPolicy {
+                max_attempts: 2,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                multiplier: 1.0,
+                retryable: vec![StatusCode::Unavailable],
+            }),
+            ..Default::default()
+        };
+        let ctx = CallContext {
+            service: "deadline-contract".into(),
+            method: "retry".into(),
+            attempt: 1,
+            deadline: options.deadline,
+            metadata: Default::default(),
+        };
+        let attempts = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let outcome = pipeline
+            .run_unary(ctx, vec![], |_| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    if attempt == 0 {
+                        Err(Error::Rpc {
+                            code: StatusCode::Unavailable.as_i32(),
+                            message: "retry me".into(),
+                            details: vec![],
+                        })
+                    } else {
+                        Ok(vec![1])
+                    }
+                }
+            })
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(outcome.unwrap(), vec![1]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(elapsed, Duration::from_millis(20));
+    }
+}

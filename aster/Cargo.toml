@@ -257,7 +257,7 @@ path = "src/bin/coordination_voter.rs"
 required-features = ["coordination-testing"]
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 # Topology integration tests forge raw `topo/v1/…` records to prove readers
 # drop them (attribution rules) — the record encoders live in core.
