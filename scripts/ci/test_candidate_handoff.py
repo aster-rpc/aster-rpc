@@ -82,11 +82,11 @@ class HandoffTests(unittest.TestCase):
             run.assert_not_called()
 
     def listing(self):
-        return {"artifacts": [{"name": n, "workflowRunBackendId": "run", "workflowJobRunBackendId": "producer-id", "databaseId": str(i)}
+        return {"artifacts": [{"name": n, "workflowRunBackendId": "31", "workflowJobRunBackendId": "consumer-id", "databaseId": str(i)}
                               for i, n in enumerate(("product-27", "ci-evidence-producer-27", "unrelated-27"), 1)]}
 
     def test_selection_only_exact_products_and_attestations(self):
-        selected = H.selection(self.listing(), POLICY, IDENTITY, "run")
+        selected = H.selection(self.listing(), POLICY, IDENTITY, "31")
         self.assertEqual({e["name"] for e in selected}, {"product-27", "ci-evidence-producer-27"})
         for mutation in ("missing", "duplicate", "wrong-run"):
             listing = self.listing()
@@ -97,13 +97,13 @@ class HandoffTests(unittest.TestCase):
             else:
                 listing["artifacts"][0]["workflowRunBackendId"] = "another-run"
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                H.selection(listing, POLICY, IDENTITY, "run")
+                H.selection(listing, POLICY, IDENTITY, "31")
 
     def test_conflicting_wire_identity_fields_rejected(self):
         listing = self.listing()
         listing["artifacts"][0]["workflow_run_backend_id"] = "other"
         with self.assertRaisesRegex(ValueError, "conflicting protobuf"):
-            H.selection(listing, POLICY, IDENTITY, "run")
+            H.selection(listing, POLICY, IDENTITY, "31")
 
     def test_backend_scope_identity(self):
         payload = base64.urlsafe_b64encode(json.dumps({"scp": "Other Actions.Results:run:job"}).encode()).decode().rstrip("=")
@@ -125,15 +125,19 @@ class HandoffTests(unittest.TestCase):
         import hashlib
         evidence = {**deepcopy(IDENTITY), "artifact": "product-27", "job": "producer", "matrix": {}, "attempt": 1,
                     "tools": {"rustc": "1.90"}, "files": {"native": hashlib.sha256(data).hexdigest()}}
-        payload = base64.urlsafe_b64encode(json.dumps({"scp": "Actions.Results:run:job"}).encode()).decode().rstrip("=")
+        payload = base64.urlsafe_b64encode(json.dumps({"scp": "Actions.Results:31:job"}).encode()).decode().rstrip("=")
         env = {"FORGEJO_RUN_ATTEMPT": "1", "CANDIDATE_NEEDS": '{"producer":{"result":"success"}}',
                "ACTIONS_RUNTIME_TOKEN": "x." + payload + ".x", "ACTIONS_RESULTS_URL": "https://forge.emrul.dev/"}
         for conflict in (False, True):
             destination = self.root / ("conflicting" if conflict else "valid")
             def get(transport, url, target, **kwargs):
                 if url.endswith("ListArtifacts"):
+                    self.assertEqual(kwargs["data"], {"workflow_run_backend_id": "31", "workflow_job_run_backend_id": "job"})
                     return self.listing()
                 if url.endswith("GetSignedArtifactURL"):
+                    self.assertEqual(set(kwargs["data"]), {"workflow_run_backend_id", "workflow_job_run_backend_id", "name"})
+                    self.assertEqual(kwargs["data"]["workflow_run_backend_id"], "31")
+                    self.assertEqual(kwargs["data"]["workflow_job_run_backend_id"], "consumer-id")
                     return {"signedUrl": "https://forge.emrul.dev/" + kwargs["data"]["name"]}
                 content = {"product-27": {"native": b"changed" if conflict else data},
                            "ci-evidence-producer-27": {"product-27.json": json.dumps(evidence)}}[url.rsplit("/", 1)[-1]]
@@ -147,6 +151,15 @@ class HandoffTests(unittest.TestCase):
                 else:
                     H.retrieve(destination)
                     self.assertEqual((destination / "product-27/native").read_bytes(), data)
+
+    def test_runtime_backend_from_another_run_is_rejected_before_transport(self):
+        payload = base64.urlsafe_b64encode(json.dumps({"scp": "Actions.Results:32:job"}).encode()).decode().rstrip("=")
+        env = {"FORGEJO_RUN_ATTEMPT": "1", "CANDIDATE_NEEDS": '{"producer":{"result":"success"}}',
+               "ACTIONS_RUNTIME_TOKEN": "x." + payload + ".x", "ACTIONS_RESULTS_URL": "https://forge.emrul.dev/"}
+        with patch.dict(os.environ, env), patch.object(C, "identity", return_value=IDENTITY), patch.object(C, "read_json", return_value=POLICY), patch.object(H.Transport, "get") as get:
+            with self.assertRaisesRegex(ValueError, "runtime backend ID"):
+                H.retrieve(self.root / "handoff")
+            get.assert_not_called()
 
 
 if __name__ == "__main__":

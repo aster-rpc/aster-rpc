@@ -5,6 +5,17 @@ Uses the same runtime JWT/Twirp protocol as forgejo/download-artifact v4,
 but lists once, selects only policy products/attestations and fails closed.
 An eight-minute overall budget includes three attempts per transport request.
 Diagnostics never contain runtime tokens, signed URLs or response bodies.
+
+Runtime/protocol sources checked against the deployed runner/server series:
+https://code.forgejo.org/forgejo/runner/src/tag/v13.0.0/internal/app/run/runner.go
+https://code.forgejo.org/forgejo/runner/src/tag/v13.0.0/internal/app/run/runner_test.go
+https://codeberg.org/forgejo/forgejo/src/tag/v15.0.1/routers/api/actions/artifactsv4.go
+https://codeberg.org/forgejo/forgejo/src/tag/v15.0.1/services/actions/auth.go
+https://codeberg.org/forgejo/forgejo/src/tag/v15.0.1/services/actions/context.go
+Runner runEnvs supplies the runtime token/results origin to shell steps; its
+environment test explicitly exercises those variables in a run: step.
+Server CreateAuthorizationToken scopes Actions.Results to task.Job.RunID,
+the same database ID assigned to the workflow run_id context (not run_number).
 """
 from __future__ import annotations
 
@@ -167,6 +178,8 @@ def retrieve(handoff: Path = Path("handoff")) -> None:
     expected = C.identity()
     token = os.environ["ACTIONS_RUNTIME_TOKEN"]
     ids = backend_ids(token)
+    if ids["workflow_run_backend_id"] != str(expected["run_id"]):
+        C.fail("runtime backend ID differs from the exact checkout run")
     base = origin(os.environ["ACTIONS_RESULTS_URL"])
     if handoff.exists():
         C.fail("candidate handoff already exists")
