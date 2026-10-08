@@ -231,9 +231,18 @@ def arg_artifact(parser: argparse.ArgumentParser, name: str, help_text: str) -> 
     parser.add_argument(f"--{name}-sha256", help="Expected lowercase SHA-256")
 
 
+def source_metadata(checkout: Path, candidate_commit: str | None) -> dict:
+    """Keep a caller's artifact-source claim separate from the harness checkout."""
+    checkout_source = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=checkout, text=True,
+    ).strip()
+    return {"candidate_source": candidate_commit, "harness_checkout_source": checkout_source}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkout-root", type=Path, help="source checkout to exclude; required when this harness is copied outside the checkout")
+    ap.add_argument("--candidate-commit", help="Claimed source commit of the supplied artifacts; verify independently from their provenance")
     ap.add_argument("--python", action="store_true", help="Run isolated Python wheel consumer")
     ap.add_argument("--typescript", action="store_true", help="Run isolated npm tarball consumer")
     ap.add_argument("--version", default="0.3.705", help="Exact expected package version (default: 0.3.705)")
@@ -273,7 +282,7 @@ def main() -> None:
     work = Path(tempfile.mkdtemp(prefix="aster-clean-consumer-", dir=os.environ.get("TMPDIR", "/tmp"))).resolve()
     if work == repo or repo in work.parents or work in repo.parents:
         raise SystemExit(f"temporary consumer must be isolated from checkout: {work}")
-    print(json.dumps({"candidate_source":"e947eb7f", "candidate_version":a.version,
+    print(json.dumps({**source_metadata(repo, a.candidate_commit), "candidate_version":a.version,
         "platform":platform.platform(), "machine":platform.machine(), "python":sys.version,
         "node":shutil.which("node"), "npm":shutil.which("npm"), "workdir":str(work),
         "artifact_sha256":{n:h for n,(_,h) in artifacts.items() if n in selected}},sort_keys=True),flush=True)
