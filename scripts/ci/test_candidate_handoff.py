@@ -142,7 +142,7 @@ class HandoffTests(unittest.TestCase):
                 content = {"product-27": {"native": b"changed" if conflict else data},
                            "ci-evidence-producer-27": {"product-27.json": json.dumps(evidence)}}[url.rsplit("/", 1)[-1]]
                 target.write_bytes(zipped(content))
-            with patch.dict(os.environ, env), patch.object(C, "identity", return_value=IDENTITY), patch.object(C, "read_json", wraps=C.read_json) as read, patch.object(H.Transport, "get", get):
+            with patch.dict(os.environ, env), patch.object(C, "identity", return_value=IDENTITY), patch.object(C, "read_json", wraps=C.read_json) as read, patch.object(H.Transport, "get", get), patch.object(C.shutil, "copytree", side_effect=AssertionError("retrieval copied payload")), patch.object(C.tarfile, "open", side_effect=AssertionError("retrieval created archive")), patch.object(C, "seal", side_effect=AssertionError("retrieval invoked sealing")):
                 read.side_effect = lambda path: POLICY if path == C.POLICY_PATH else json.loads(path.read_text())
                 if conflict:
                     with self.assertRaisesRegex(ValueError, "checksum/inventory"):
@@ -160,6 +160,26 @@ class HandoffTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "runtime backend ID"):
                 H.retrieve(self.root / "handoff")
             get.assert_not_called()
+
+    def test_direct_validation_preserves_strict_payload_and_handoff_inventories(self):
+        handoff = self.root / "handoff"
+        product = handoff / "product-27"
+        product.mkdir(parents=True)
+        (product / "native").write_bytes(b"qualified")
+        evidence = {**deepcopy(IDENTITY), "artifact": "product-27", "job": "producer", "matrix": {}, "attempt": 1,
+                    "tools": {"rustc": "1.90"}, "files": C.file_map(product)}
+        directory = handoff / "ci-evidence-producer-27"
+        directory.mkdir()
+        (directory / "product-27.json").write_text(json.dumps(evidence))
+        needs = {"producer": {"result": "success"}}
+        manifest = C.handoff_manifest(handoff, needs, IDENTITY, POLICY, strict_inventory=True)
+        self.assertEqual(manifest["artifacts"], {"product-27": evidence})
+        # A payload root cannot silently admit the handoff's attestation dirs.
+        with self.assertRaisesRegex(ValueError, "unexpected artifact paths"):
+            C.verify_payload(handoff, manifest, IDENTITY, POLICY)
+        (handoff / "ci-evidence-unselected-27").mkdir()
+        with self.assertRaisesRegex(ValueError, "unexpected artifact paths"):
+            C.handoff_manifest(handoff, needs, IDENTITY, POLICY, strict_inventory=True)
 
 
 if __name__ == "__main__":

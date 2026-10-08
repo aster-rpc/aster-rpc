@@ -130,10 +130,7 @@ def backend_ids(token: str) -> dict:
 
 
 def selection(listing: dict, policy: dict, expected: dict, run_backend: str) -> list[dict]:
-    suffix = f'-{expected["run_number"]}'
-    rules = C.artifact_policy(policy)
-    required = {name + suffix for name in rules}
-    required |= {"ci-evidence-" + rule["job"] + ("-" + rule["matrix"]["platform"] if rule["matrix"] else "") + suffix for rule in rules.values()}
+    required = C.handoff_names(policy, expected)
     entries = listing.get("artifacts")
     if not isinstance(entries, list):
         C.fail("artifact listing is missing inventory")
@@ -206,9 +203,9 @@ def retrieve(handoff: Path = Path("handoff")) -> None:
                     C.fail(f"artifact {name} transport checksum mismatch")
             extract(archive, root / name)
             archive.unlink()
-        # Seal has the authoritative identity/inventory/hash checks. Validate
-        # into disposable staging first, so a failed retrieval leaves no handoff.
-        C.seal(root, stage / "validation", needs)
+        # Validate original files in place. Only the workflow sealing step
+        # copies payloads and creates the candidate archive.
+        C.handoff_manifest(root, needs, expected, policy, strict_inventory=True)
         root.rename(handoff)
 
 

@@ -302,7 +302,8 @@ def verify_python_install(wheel: Path, interpreter: str) -> None:
             fail("imported native module is outside installed package")
 
 
-def verify_payload(root: Path, manifest: dict, expected: dict, policy: dict) -> None:
+def _verify_artifacts(root: Path, manifest: dict, expected: dict, policy: dict) -> None:
+    """Authoritative identity/inventory/hash checks, independent of container layout."""
     for key in ("schema", "repository", "sha", "version", "workflow", "source_hashes", "run_id", "run_number", "assurance_profile"):
         if manifest.get(key) != expected[key]:
             fail(f"candidate identity mismatch: {key}")
@@ -331,29 +332,61 @@ def verify_payload(root: Path, manifest: dict, expected: dict, policy: dict) -> 
             fail(f"artifact {name} lacks first-attempt evidence")
         if not evidence.get("tools"):
             fail(f"artifact {name} has no runtime/toolchain evidence")
-        actual = file_map(root / name)
+        directory = root / name
+        if directory.is_symlink() or not directory.is_dir():
+            fail(f"artifact {name} has invalid payload directory")
+        actual = file_map(directory)
         if actual != evidence.get("files"):
             fail(f"artifact {name} checksum/inventory mismatch")
         for path in actual:
             parsed = PurePosixPath(path)
             if parsed.is_absolute() or ".." in parsed.parts:
                 fail(f"unsafe artifact path: {path}")
+
+
+def verify_payload(root: Path, manifest: dict, expected: dict, policy: dict) -> None:
+    _verify_artifacts(root, manifest, expected, policy)
+    required = {name + f'-{expected["run_number"]}' for name in artifact_policy(policy)}
     # No unrecorded payload directories, including from a partial prior run.
     if {p.name for p in root.iterdir()} != required:
         fail("candidate contains unexpected artifact paths")
 
 
-def seal(handoff: Path, output: Path, needs: dict) -> None:
-    if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
-        fail("candidate sealing requires first-attempt evidence")
-    policy = read_json(POLICY_PATH)
+def handoff_names(policy: dict, expected: dict) -> set[str]:
+    """Only release products and their producer attestation directories."""
+    suffix = f'-{expected["run_number"]}'
+    rules = artifact_policy(policy)
+    return ({name + suffix for name in rules}
+            | {"ci-evidence-" + rule["job"] + ("-" + rule["matrix"]["platform"] if "platform" in rule["matrix"] else "") + suffix
+               for rule in rules.values()})
+
+
+def _qualified_gates(needs: dict, policy: dict) -> dict[str, str]:
     gates = expected_gates(policy)
     if set(needs) != set(gates) or any(needs[j].get("result") != result for j, result in gates.items()):
         fail("not every candidate dependency completed successfully")
-    expected = identity()
+    return gates
+
+
+def handoff_manifest(handoff: Path, needs: dict, expected: dict, policy: dict, *, strict_inventory: bool = False) -> dict:
+    """Validate original handoff bytes without copying payloads or creating an archive.
+
+    Retrieval requires the exact selected product/attestation directory set.
+    Seal also supports the older bulk handoff layout containing internal reuse
+    and documentation artifacts; those never become release payloads.
+    """
+    gates = _qualified_gates(needs, policy)
+    if handoff.is_symlink() or not handoff.is_dir():
+        fail("invalid candidate handoff directory")
+    if strict_inventory and {path.name for path in handoff.iterdir()} != handoff_names(policy, expected):
+        fail("candidate handoff contains unexpected artifact paths")
     artifacts = {}
     for directory in handoff.glob("ci-evidence-*"):
+        if directory.is_symlink() or not directory.is_dir():
+            fail("invalid candidate attestation directory")
         for path in directory.glob("*.json"):
+            if path.is_symlink() or not path.is_file():
+                fail("invalid candidate attestation file")
             evidence = read_json(path)
             name = evidence["artifact"]
             if name in artifacts:
@@ -365,6 +398,19 @@ def seal(handoff: Path, output: Path, needs: dict) -> None:
     manifest = {**expected, "gates": {job: needs[job]["result"] for job in gates}, "artifacts": artifacts,
                 "disabled_assurance_jobs": policy.get("optional_assurance_jobs", []) if assurance_profile(policy) == "standard" else [],
                 "created_at": datetime.now(timezone.utc).isoformat(), "retention_days": RETENTION_DAYS}
+    _verify_artifacts(handoff, manifest, expected, policy)
+    return manifest
+
+
+def seal(handoff: Path, output: Path, needs: dict) -> None:
+    if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
+        fail("candidate sealing requires first-attempt evidence")
+    policy = read_json(POLICY_PATH)
+    # Preserve the fail-before-identity gate for unqualified dependencies.
+    _qualified_gates(needs, policy)
+    expected = identity()
+    manifest = handoff_manifest(handoff, needs, expected, policy)
+    names = set(manifest["artifacts"])
     payload = output / "payload"
     payload.mkdir(parents=True)
     for name in names:
