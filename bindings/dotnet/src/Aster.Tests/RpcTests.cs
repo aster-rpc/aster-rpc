@@ -229,6 +229,12 @@ public class RpcTests : IAsyncLifetime
         var tasks = Enumerable.Range(0, 64).Select(i =>
             _conn.UnaryAsync<EchoRequest, EchoReply>("InteropEcho", "echo", new EchoRequest { Message = $"m{i}", Count = i }));
         var replies = await Task.WhenAll(tasks);
+        for (int i = 0; i < replies.Length; i++)
+        {
+            var reply = replies[i];
+            Assert.True(reply.Count == i + 1 && reply.Message == $"m{i}" && reply.ServerLang == "dotnet",
+                $"call {i}: count={reply.Count}, message='{reply.Message}', server='{reply.ServerLang}'");
+        }
         Assert.Equal(Enumerable.Range(1, 64), replies.Select(r => r.Count).OrderBy(c => c));
     }
 
