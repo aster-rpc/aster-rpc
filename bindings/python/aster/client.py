@@ -150,8 +150,10 @@ class ServiceClient:
         ctx: CallContext,
         request: Any,
         invoke: Any,
+        *,
+        retry_allowed: bool = True,
     ) -> Any:
-        retry_interceptors = self._matching_interceptors(RetryInterceptor)
+        retry_interceptors = self._matching_interceptors(RetryInterceptor) if retry_allowed else []
         breaker_interceptors = self._matching_interceptors(CircuitBreakerInterceptor)
         max_attempts = 1
         for retry in retry_interceptors:
@@ -303,7 +305,7 @@ class ServiceClient:
         timeout: float | None = None,
         serialization_override: SerializationMode | None = None,
     ) -> Any:
-        """Make a client-streaming RPC call."""
+        """Make one client-streaming attempt. Arbitrary AsyncIterator sources cannot be replayed safely."""
         deadline = self._get_deadline(timeout)
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
@@ -325,7 +327,10 @@ class ServiceClient:
 
             )
 
-        return await self._run_call_with_interceptors(ctx, None, invoke)
+        # A caller-owned AsyncIterator may already be partially or fully consumed.
+        # Idempotence does not make its body replayable. Keep hooks, deadline and
+        # breaker behavior, but never retry it with a different request body.
+        return await self._run_call_with_interceptors(ctx, None, invoke, retry_allowed=False)
 
     def _call_bidi_stream(
         self,

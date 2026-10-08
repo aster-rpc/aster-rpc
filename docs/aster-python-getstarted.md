@@ -675,3 +675,14 @@ with tracing.span("db.query", {"db.system": "postgresql"}):
   Binds `127.0.0.1` by default; pod probes need `health_host="0.0.0.0"`.
 - **Fork.** Initialise in each worker, not in a pre-fork master: after `fork()`
   the child's telemetry is disabled with one warning.
+
+## Request-stream retry policy
+
+`RetryInterceptor` can retry idempotent unary calls. Python client-stream calls
+accept caller-owned `AsyncIterator` request sources and make one attempt, even
+when their RPC is declared idempotent. A source may already be partly consumed
+when a call fails; reusing it would send a different body. Server-stream and bidi
+calls also do not automatically retry. Interceptor request/response/error hooks,
+deadlines and circuit-breaker policies still apply to these calls. To retry a
+stream at the application level, create a fresh source and account for the
+service's idempotence and partial effects explicitly.
