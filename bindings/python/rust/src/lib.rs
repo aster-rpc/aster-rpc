@@ -49,6 +49,7 @@ mod monitor;
 mod net;
 mod node;
 mod observability;
+mod response_queue;
 mod rpc;
 mod ticket;
 mod topology;

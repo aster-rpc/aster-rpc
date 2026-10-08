@@ -618,7 +618,7 @@ impl<'py> IntoPyObject<'py> for BytesList {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        PyList::new(py, self.0.iter().map(|b| PyBytes::new(py, b)))
+        PyList::new(py, self.0.into_iter().map(|b| PyBytes::new(py, &b)))
     }
 }
 
@@ -869,97 +869,53 @@ impl RpcClient {
     }
 }
 
-/// What the read-ahead pump hands to Python.
-enum StreamItem {
-    Item(Vec<u8>),
-    Error(aster::Error),
-}
-
-/// Responses read ahead by a pump task.
-const READ_AHEAD: usize = 64;
-
-/// The response half of a server-stream or bidi call. A pump task reads
-/// responses ahead (up to 64), so `next_batch` takes whatever has arrived
-/// in one crossing. Dropping it (or `cancel`) before the end cancels the
-/// call.
+/// The response half of a server-stream or bidi call. Read-ahead is bounded by
+/// 64 items and 8 MiB of charged payload; one legal larger frame is allowed
+/// only alone. Together with one in-flight native frame, raw read-ahead is at
+/// most 24 MiB under the native 16 MiB frame limit. A returned batch is bounded
+/// separately (64 items / 8 MiB plus one legal crossing frame, at most 24 MiB).
+/// Raw read-ahead plus one Rust batch is bounded separately from Python copies,
+/// codec objects and RSS. Conversion consumes each Vec after copying it into
+/// Python; batches retained by the application are caller-owned.
 #[pyclass(frozen, module = "aster._aster")]
 pub struct ClientResponseStream {
-    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<StreamItem>>>,
-    pump: tokio::task::JoinHandle<()>,
+    queue: Arc<crate::response_queue::ResponseReadAhead>,
 }
 
 impl ClientResponseStream {
-    fn spawn(mut stream: ResponseStream) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(READ_AHEAD);
-        let pump = tokio::spawn(async move {
-            loop {
-                let item = match stream.next().await {
-                    None => return, // OK trailer: dropping `tx` ends the stream
-                    Some(Ok(p)) => StreamItem::Item(p),
-                    Some(Err(e)) => StreamItem::Error(e),
-                };
-                let last = matches!(item, StreamItem::Error(_));
-                if tx.send(item).await.is_err() || last {
-                    return;
-                }
-            }
-        });
-        ClientResponseStream {
-            rx: Arc::new(tokio::sync::Mutex::new(rx)),
-            pump,
+    fn spawn(stream: ResponseStream) -> Self {
+        Self {
+            queue: Arc::new(crate::response_queue::ResponseReadAhead::spawn(stream)),
         }
     }
 }
 
 #[pymethods]
 impl ClientResponseStream {
-    /// Up to `max` response payloads once at least one has arrived; `[]` at
-    /// the OK trailer. A non-OK trailer raises `RpcError` (after the
-    /// payloads that preceded it were returned).
+    /// Up to `max` response payloads, capped at 64 items and an 8 MiB batch
+    /// threshold (one legal frame may cross it); `[]` at the OK trailer.
+    /// A non-OK trailer raises after the payloads that preceded it were returned.
     #[pyo3(signature = (max=64))]
     fn next_batch<'py>(&self, py: Python<'py>, max: usize) -> PyResult<Bound<'py, PyAny>> {
-        let rx = self.rx.clone();
-        let max = max.max(1);
+        let queue = self.queue.clone();
         future_into_py(py, async move {
-            let mut rx = rx.lock().await;
-            let mut out = Vec::new();
-            let mut pending_err = None;
-            match rx.recv().await {
-                None => return Ok(BytesList(out)),
-                Some(StreamItem::Item(p)) => out.push(p),
-                Some(StreamItem::Error(e)) => return Err(client_err(e)),
-            }
-            while out.len() < max {
-                match rx.try_recv() {
-                    Ok(StreamItem::Item(p)) => out.push(p),
-                    Ok(StreamItem::Error(e)) => {
-                        pending_err = Some(e);
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
-            if let Some(e) = pending_err {
-                // Hand the error back next time, after these payloads.
-                let (tx, new_rx) = tokio::sync::mpsc::channel(1);
-                let _ = tx.try_send(StreamItem::Error(e));
-                *rx = new_rx;
-            }
-            Ok(BytesList(out))
+            queue
+                .next_batch(max)
+                .await
+                .map(BytesList)
+                .map_err(client_err)
         })
     }
 
     /// Cancel the call (`FLAG_CANCEL` + reset). A no-op after the trailer.
     fn cancel(&self) {
-        self.pump.abort();
+        self.queue.cancel();
     }
 }
 
 impl Drop for ClientResponseStream {
     fn drop(&mut self) {
-        // Dropping the pump drops the `ResponseStream`, which cancels the
-        // call unless its trailer was read.
-        self.pump.abort();
+        self.queue.cancel();
     }
 }
 
