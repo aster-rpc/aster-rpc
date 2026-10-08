@@ -16,6 +16,7 @@ from aster.config import AsterConfig
 from aster.interceptors import CircuitBreakerInterceptor, DeadlineInterceptor, RetryInterceptor
 from aster.rpc_types import RetryPolicy
 from aster.status import RpcError, StatusCode
+from aster.transport.iroh import IrohTransport
 
 
 @wire_type("test.review.retrydeadline/Request")
@@ -56,6 +57,62 @@ class Probe:
                 raise RpcError(StatusCode.UNAVAILABLE, "transient native response")
             return Response("retried")
         return Response(request.tag)
+
+
+@pytest.mark.timeout(20)
+async def test_native_healthy_peer_progresses_beside_stalled_and_disconnected_peer():
+    """One real client endpoint, two connections: a stalled peer cannot block its neighbor."""
+    stalled, healthy = Probe(), Probe()
+    config = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0")
+    task = None
+    transports = []
+    async with AsterServer(services=[stalled], allow_all_consumers=True, config=config) as bad:
+        async with AsterServer(services=[healthy], allow_all_consumers=True, config=config) as good:
+            async with AsterClient(address=bad.address, config=config) as owner:
+                client = await owner.client(Probe)
+                try:
+                    # Both connections originate from the same native endpoint.
+                    connection = await owner._ep.connect_node_addr(good.node.node_addr_info(), b"aster/1")
+                    neighbor = IrohTransport(connection, codec=client._transport._codec)
+                    transports.append(neighbor)
+                    task = asyncio.ensure_future(client.call(Request("hold"), timeout=10))
+                    await asyncio.wait_for(stalled.hold_entered.wait(), 3)
+                    for phase in ("stalled", "disconnected"):
+                        for index in range(3):
+                            tag = f"{phase}-{index}"
+                            response = await asyncio.wait_for(neighbor.unary(
+                                "ReviewRetryDeadline", "call", Request(tag), deadline_secs=1), 2)
+                            assert response.tag == tag
+                        if phase == "stalled":
+                            assert not task.done() and stalled.active_holds == 1
+                            await client._transport.close()
+                            with pytest.raises(RpcError) as failed:
+                                await asyncio.wait_for(task, 3)
+                            # Abrupt local close has no remote trailer. The existing
+                            # interceptor normalizes ConnectionLostError to UNKNOWN.
+                            assert failed.value.code in (StatusCode.CANCELLED, StatusCode.UNAVAILABLE, StatusCode.UNKNOWN)
+                    async with asyncio.timeout(3):
+                        while stalled.active_holds:
+                            await asyncio.sleep(0.01)
+                    recovery_connection = await owner._ep.connect_node_addr(bad.node.node_addr_info(), b"aster/1")
+                    recovered = IrohTransport(recovery_connection, codec=client._transport._codec)
+                    transports.append(recovered)
+                    assert (await asyncio.wait_for(recovered.unary(
+                        "ReviewRetryDeadline", "call", Request("recovered"), deadline_secs=1), 2)).tag == "recovered"
+                    assert healthy.received_tags == [f"{phase}-{index}" for phase in ("stalled", "disconnected") for index in range(3)]
+                    for server in (bad, good):
+                        dispatcher = server._server._dispatcher
+                        async with asyncio.timeout(3):
+                            while dispatcher.in_flight or dispatcher.server.live_calls():
+                                await asyncio.sleep(0.01)
+                finally:
+                    stalled.release_hold.set()
+                    if task is not None:
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    for transport in transports:
+                        await transport.close()
 
 
 @pytest.mark.asyncio

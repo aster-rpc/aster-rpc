@@ -146,6 +146,7 @@ class P4Session:
 class P4Guarded:
     @rpc(requires=any_of("ops", "admin"))
     async def secret(self, req: Req) -> Resp:
+        EVENTS.append("guarded-secret-invoked")
         return Resp(text="secret")
 
     @rpc()
@@ -442,12 +443,15 @@ async def test_session_close_hook_on_disconnect():
 
 @pytest.mark.timeout(30)
 async def test_gate3_reads_gate_attributes(p4_pair):
+    EVENTS.clear()
     server, client = p4_pair
     svc = await client.client(P4Guarded)
     assert (await svc.open(Req())).text == "open"
     with pytest.raises(RpcError) as e:
         await svc.secret(Req())
     assert e.value.code == StatusCode.PERMISSION_DENIED
+    assert "guarded-secret-invoked" not in EVENTS
     # Admission attributes recorded in the node's gate feed Rust's Gate 3.
     server.gate.admit(client._node.node_id(), attributes={"aster.role": "ops"})
     assert (await svc.secret(Req())).text == "secret"
+    assert EVENTS.count("guarded-secret-invoked") == 1
