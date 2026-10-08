@@ -160,9 +160,9 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if CoordRPC != 5 || CoordClosed != 7 || CoordOther != 10 || MutateCancelMembership != 10 || ReadRecoveryExport != 8 {
 		t.Error("coordination enums drifted from the header")
 	}
-	// ABI 4.1 .. 4.7 are all in the library.
-	if _, minor, _ := Version(); minor < 7 || ABIMinorRequired != 7 {
-		t.Errorf("library ABI minor %d, binding needs >= 7 (floor %d)", minor, ABIMinorRequired)
+	// ABI 4.1 .. 4.9 are all in the library.
+	if _, minor, _ := Version(); minor < 9 || ABIMinorRequired != 9 {
+		t.Errorf("library ABI minor %d, binding needs >= 9 (floor %d)", minor, ABIMinorRequired)
 	}
 	if ASTER_STATUS_ALREADY_EXISTS != 17 || !errors.Is(wrapError(ASTER_STATUS_ALREADY_EXISTS), ErrAlreadyExists) ||
 		StatusName(17) != "ASTER_STATUS_ALREADY_EXISTS" {
