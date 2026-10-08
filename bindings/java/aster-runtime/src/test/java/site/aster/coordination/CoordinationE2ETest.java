@@ -378,16 +378,48 @@ final class CoordinationE2ETest {
   @Test
   void anActorWithoutRightsIsPermissionDenied() throws Exception {
     IrohNode stranger = VoterFixture.node(VoterFixture.actorSecret());
-    try (CoordinationClient c = get(CoordinationClient.open(stranger, group.durable(journal())))) {
-      CoordinationException e = assertCoordFailure(c.acquire(res("forbidden"), 5_000));
-      assertEquals(CoordinationException.Kind.RPC, e.kind());
-      assertTrue(e.isPermissionDenied(), "status " + e.status() + " rpc " + e.rpcCode());
-      assertEquals(IrohStatus.PERMISSION_DENIED, e.status());
-      assertEquals(7, e.rpcCode());
-      // The denied sequence stays journaled as unresolved until resumed (inherited behaviour).
-      assertEquals(
-          CoordinationException.Kind.UNRESOLVED,
-          assertCoordFailure(c.acquire(res("again"), 5_000)).kind());
+    Path dir = journal();
+    ResourceKey key = res("forbidden");
+    byte[] originalId;
+    try {
+      try (CoordinationClient c = get(CoordinationClient.open(stranger, group.durable(dir)))) {
+        originalId = get(c.clientId());
+        CoordinationException e = assertCoordFailure(c.acquire(key, 5_000));
+        assertEquals(CoordinationException.Kind.RPC, e.kind());
+        assertTrue(e.isPermissionDenied(), "status " + e.status() + " rpc " + e.rpcCode());
+        assertEquals(IrohStatus.PERMISSION_DENIED, e.status());
+        assertEquals(7, e.rpcCode());
+        // The denied sequence stays journaled as unresolved until resumed (inherited behaviour).
+        assertEquals(
+            CoordinationException.Kind.UNRESOLVED,
+            assertCoordFailure(c.acquire(res("again"), 5_000)).kind());
+      }
+      try (CoordinationClient root = reopen(rootDir())) {
+        grant(root, key, idOf(stranger));
+      }
+      try (CoordinationClient reopened =
+          get(CoordinationClient.open(stranger, group.durable(dir)))) {
+        assertArrayEquals(originalId, get(reopened.clientId()));
+        try (ResolvedMutation resumed = get(reopened.resume()).orElseThrow()) {
+          assertNotNull(resumed);
+          MutationReply reply = resumed.reply();
+          assertEquals(1, reply.outcomeCode());
+          assertTrue(reply.snapshot().held());
+          assertArrayEquals(originalId, reply.clientId());
+          try (ResolvedMutation replay = get(reopened.resume()).orElseThrow()) {
+            assertNotNull(replay);
+            assertEquals(reply.sequence(), replay.reply().sequence());
+            assertArrayEquals(reply.requestHash(), replay.reply().requestHash());
+          }
+          get(resumed.acknowledge());
+          MutationReply released =
+              ack(
+                  reopened.release(
+                      new Fence(group.groupId, key, reply.snapshot().epoch(), idOf(stranger))));
+          assertEquals(reply.sequence() + 1, released.sequence());
+          assertFalse(released.snapshot().held());
+        }
+      }
     } finally {
       stranger.close();
     }

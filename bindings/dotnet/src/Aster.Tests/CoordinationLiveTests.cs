@@ -313,7 +313,9 @@ public class CoordinationLiveTests(CoordinationFixture fx) : IClassFixture<Coord
     public async Task Acl_Refusal_Is_Permission_Denied_And_The_Request_Stays_Unresolved()
     {
         await using var other = await fx.StartNodeAsync();
-        await using var c = await CoordinationClient.OpenAsync(other, fx.Options()).WaitAsync(T);
+        var journal = fx.NewJournalDir();
+        await using var c = await CoordinationClient.OpenAsync(other, fx.Options(journal)).WaitAsync(T);
+        var originalId = await c.ClientIdAsync().WaitAsync(T);
         var key = Key("tree/denied");
         var e = await Assert.ThrowsAsync<CoordinationException>(() => c.AcquireAsync(key, TimeSpan.FromSeconds(30)).WaitAsync(T));
         Assert.Equal(CoordinationErrorKind.Rpc, e.Kind);
@@ -325,6 +327,25 @@ public class CoordinationLiveTests(CoordinationFixture fx) : IClassFixture<Coord
         // A read without a READ grant is refused the same way.
         var read = await Assert.ThrowsAsync<CoordinationException>(() => c.ReadLinearizableAsync(key).WaitAsync(T));
         Assert.Equal((CoordinationErrorKind.Rpc, 7u, Status.PermissionDenied), (read.Kind, read.RpcCode, read.Status));
+        await c.DisposeAsync();
+        await using var root = await OpenRoot();
+        await GrantAsync(root, key, Convert.FromHexString(other.NodeId()));
+        await using var reopened = await CoordinationClient.OpenAsync(other, fx.Options(journal)).WaitAsync(T);
+        Assert.Equal(originalId, await reopened.ClientIdAsync().WaitAsync(T));
+        using var resumed = await reopened.ResumeAsync().WaitAsync(T);
+        Assert.NotNull(resumed);
+        Assert.True(resumed.Reply.Snapshot!.Held);
+        Assert.Equal(originalId, resumed.Reply.ClientId);
+        using var replay = await reopened.ResumeAsync().WaitAsync(T);
+        Assert.NotNull(replay);
+        Assert.Equal(resumed.Reply.Sequence, replay.Reply.Sequence);
+        Assert.Equal(resumed.Reply.RequestHash, replay.Reply.RequestHash);
+        await resumed.AcknowledgeAsync().WaitAsync(T);
+        var snapshot = resumed.Reply.Snapshot;
+        using var released = await reopened.ReleaseAsync(new CoordFence(reopened.GroupId, key, snapshot.Epoch, reopened.LocalNodeId)).WaitAsync(T);
+        Assert.Equal(resumed.Reply.Sequence + 1, released.Reply.Sequence);
+        Assert.False(released.Reply.Snapshot!.Held);
+        await released.AcknowledgeAsync().WaitAsync(T);
     }
 
     [LiveFact]

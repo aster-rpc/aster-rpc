@@ -509,6 +509,65 @@ func TestCoordinationLive_DeniedMutationIsAPermissionDeniedRPCErrorAndStaysUnres
 	}
 }
 
+func TestCoordinationLive_DeniedJournalResumesAfterGrantAndReopen(t *testing.T) {
+	g := group(t)
+	actor := g.actor(t, "denied-recovery")
+	// The group owns shared actor runtimes until TestMain cleanup. Establish
+	// that fixture before measuring per-test client/operation goroutines.
+	leakCheck(t)
+	ctx := coordCtx(t)
+	journal := g.journal(t, "denied-recovery")
+	c := g.reopen(t, actor, journal)
+	id, err := c.ClientID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Acquire(ctx, res("denied-recovery"), 30*time.Second); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected initial permission denial: %v", err)
+	}
+	if _, err := c.Acquire(ctx, res("other"), 30*time.Second); !errors.Is(err, ErrCoordinationUnresolved) {
+		t.Fatalf("denied journal allowed new request: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root := g.open(t, g.actor(t, "root"), g.journal(t, "root"))
+	g.grant(t, root, "denied-recovery", actor)
+	reopened := g.reopen(t, actor, journal)
+	againID, err := reopened.ClientID(ctx)
+	if err != nil || !bytes.Equal(id, againID) {
+		t.Fatalf("client identity changed: %x, %v", againID, err)
+	}
+	resumed, err := reopened.Resume(ctx)
+	if err != nil || resumed == nil {
+		t.Fatalf("resume: %+v, %v", resumed, err)
+	}
+	defer resumed.Release()
+	if resumed.Reply.OutcomeCode != OutcomeCodeGranted || !bytes.Equal(resumed.Reply.ClientID, id) {
+		t.Fatalf("wrong resumed reply: %+v", resumed.Reply)
+	}
+	replay, err := reopened.Resume(ctx)
+	if err != nil || replay == nil {
+		t.Fatalf("replay: %+v, %v", replay, err)
+	}
+	defer replay.Release()
+	if replay.Reply.Sequence != resumed.Reply.Sequence || !bytes.Equal(replay.Reply.RequestHash, resumed.Reply.RequestHash) {
+		t.Fatal("resume changed durable result")
+	}
+	if err := resumed.Acknowledge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fence, ok := FenceOf(*resumed.Reply.Snapshot)
+	if !ok {
+		t.Fatal("resumed grant has no fence")
+	}
+	released, err := reopened.ReleaseFence(ctx, fence)
+	ack(t, released, err, OutcomeCodeReleased)
+	if released.Reply.Sequence != resumed.Reply.Sequence+1 {
+		t.Fatal("next sequence did not advance once")
+	}
+}
+
 func mustResolved(r *ResolvedMutation, err error) *ResolvedMutation {
 	if err != nil {
 		panic(err)

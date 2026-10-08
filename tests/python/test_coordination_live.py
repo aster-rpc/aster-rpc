@@ -336,6 +336,7 @@ async def test_a_lease_renews_in_rust_mutates_and_hands_off(group):
 async def test_a_permission_denial_is_a_typed_rpc_error(group):
     actor = await group.actor()
     client = await group.connect(actor, "ungranted")
+    original_id = await client.client_id()
     try:
         # No ACL row for this actor: refused before proposal (PERMISSION_DENIED).
         with pytest.raises(CoordinationRpcError) as denied:
@@ -354,6 +355,26 @@ async def test_a_permission_denial_is_a_typed_rpc_error(group):
                 await second.acquire_lease(res("head"))
         finally:
             second.close()
+
+        # Restore permission while the journal is closed, then drive its saved
+        # request rather than replacing the denied operation with a new one.
+        client.close()
+        await group.grant("head", actor)
+        client = await group.connect(actor, "ungranted")
+        resumed = await client.resume()
+        assert resumed is not None and resumed.outcome == "granted"
+        assert resumed.reply.consumed
+        assert await client.client_id() == original_id
+        assert resumed.reply.client_id == original_id
+        assert resumed.snapshot.resource == res("head")
+        replay = await client.resume()
+        assert replay.reply == resumed.reply
+        await resumed.acknowledge()
+        released = await client.release(fence_of(resumed.snapshot))
+        assert released.outcome == "released"
+        assert released.sequence == resumed.sequence + 1
+        assert released.reply.client_id == original_id
+        await released.acknowledge()
     finally:
         client.close()
         await actor.shutdown()
