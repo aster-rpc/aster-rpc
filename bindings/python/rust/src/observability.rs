@@ -628,7 +628,27 @@ impl ReadinessCheckHandle {
 /// `127.0.0.1`.
 #[pyclass(frozen, module = "aster._aster", name = "HealthServer")]
 pub struct HealthServer {
-    inner: Arc<aster::ops::HealthServer>,
+    inner: Arc<tokio::sync::Mutex<Option<aster::ops::HealthServer>>>,
+    state: aster::ops::HealthState,
+    addr: std::net::SocketAddr,
+    stopped: Arc<AtomicBool>,
+}
+
+// Caller cancellation must not abandon the listener join or owner release.
+async fn stop_owned_health(
+    inner: Arc<tokio::sync::Mutex<Option<aster::ops::HealthServer>>>,
+    stopped: Arc<AtomicBool>,
+) -> PyResult<()> {
+    tokio::spawn(async move {
+        let mut owned = inner.lock().await;
+        if let Some(server) = owned.take() {
+            server.shutdown().await;
+            drop(server);
+        }
+        stopped.store(true, Ordering::Release);
+    })
+    .await
+    .map_err(|e| PyRuntimeError::new_err(format!("health shutdown: {e}")))
 }
 
 #[pymethods]
@@ -656,69 +676,77 @@ impl HealthServer {
         future_into_py(py, async move {
             aster::ops::HealthServer::start(&node, HealthConfig::new(host, port))
                 .await
-                .map(|s| HealthServer { inner: Arc::new(s) })
+                .map(|s| HealthServer {
+                    state: s.state(),
+                    addr: s.addr(),
+                    inner: Arc::new(tokio::sync::Mutex::new(Some(s))),
+                    stopped: Arc::new(AtomicBool::new(false)),
+                })
                 .map_err(aster_err_to_py)
         })
     }
 
     fn set_ready(&self, ready: bool) {
-        self.inner.set_ready(ready);
+        self.state.set_ready(ready);
     }
 
     fn set_healthy(&self, healthy: bool) {
-        self.inner.set_healthy(healthy);
+        self.state.set_healthy(healthy);
     }
 
     fn is_ready(&self) -> bool {
-        self.inner.state().is_ready()
+        self.state.is_ready()
     }
 
     fn is_healthy(&self) -> bool {
-        self.inner.state().is_healthy()
+        self.state.is_healthy()
     }
 
     /// The number of registered services `/readyz` reports.
     fn set_services(&self, services: u32) {
-        self.inner.state().set_services(services);
+        self.state.set_services(services);
     }
 
     /// Whether the registry / contracts are published (`/readyz`).
     fn set_registry(&self, published: bool) {
-        self.inner.state().set_registry(published);
+        self.state.set_registry(published);
     }
 
     /// A named readiness check; `/readyz` is ready only while all are true.
     fn check(&self, name: &str) -> ReadinessCheckHandle {
         ReadinessCheckHandle {
-            inner: self.inner.check(name),
+            inner: self.state.check(name),
         }
     }
 
     fn remove_check(&self, name: &str) -> bool {
-        self.inner.state().remove_check(name)
+        self.state.remove_check(name)
     }
 
     /// The bound `host:port`.
     #[getter]
     fn addr(&self) -> String {
-        self.inner.addr().to_string()
+        self.addr.to_string()
     }
 
     #[getter]
     fn port(&self) -> u16 {
-        self.inner.addr().port()
+        self.addr.port()
     }
 
     #[getter]
     fn is_shut_down(&self) -> bool {
-        self.inner.is_shut_down()
+        self.stopped.load(Ordering::Acquire)
     }
 
-    /// Stop listening and wait until the port is released. Idempotent.
+    /// Stop listening and release the owned observability reference. Concurrent
+    /// calls join shutdown before returning; cached state/address remain usable.
     fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let s = self.inner.clone();
+        let inner = self.inner.clone();
+        let stopped = self.stopped.clone();
+        self.state.set_ready(false);
         future_into_py(py, async move {
-            s.shutdown().await;
+            stop_owned_health(inner, stopped).await?;
             Ok(())
         })
     }
@@ -737,15 +765,17 @@ impl HealthServer {
         _exc: Option<Bound<'py, PyAny>>,
         _tb: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let s = self.inner.clone();
+        let inner = self.inner.clone();
+        let stopped = self.stopped.clone();
+        self.state.set_ready(false);
         future_into_py(py, async move {
-            s.shutdown().await;
+            stop_owned_health(inner, stopped).await?;
             Ok(false)
         })
     }
 
     fn __repr__(&self) -> String {
-        format!("HealthServer(addr='{}')", self.inner.addr())
+        format!("HealthServer(addr='{}')", self.addr)
     }
 }
 

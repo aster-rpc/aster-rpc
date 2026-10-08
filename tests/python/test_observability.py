@@ -1225,3 +1225,46 @@ async def test_health_live_disabled_bind_failure_and_port_reuse():
         rebound.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         rebound.bind(("127.0.0.1", port))
         rebound.listen()
+
+
+def test_retained_stopped_health_releases_pipeline_without_gc():
+    out = child_json(
+        """
+        import asyncio, json
+        from aster import AsterConfig, HealthServer, Node, observability, _aster
+
+        async def main():
+            observability.init(from_env=False, service_name="retained-health-first", traces=False, metrics=False)
+            node = await Node.start(AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0"))
+            health = await HealthServer.start(node, "127.0.0.1", 0)
+            addr, port = health.addr, health.port
+            check = health.check("retained")
+            check.set(True)
+            await asyncio.gather(health.stop(), health.stop(), health.stop())
+            assert health.is_shut_down
+            assert health.addr == addr and health.port == port
+            health.set_ready(True); health.set_healthy(True)
+            assert health.is_ready() and health.is_healthy()
+            after = health.check("after-stop")
+            assert not health.is_ready()
+            after.set(True)
+            assert health.is_ready()
+            assert health.remove_check("after-stop")
+            await health.stop()
+            await node.shutdown()
+            observability.shutdown()
+            refs = _aster.observability_refs()
+            print(json.dumps({"stage": "retained-stop", "refs": refs, "pipeline_stopped": _aster.observability_state() is None}), flush=True)
+            assert refs == 0
+            assert _aster.observability_state() is None, "stopped health object retains observability"
+            observability.init(from_env=False, service_name="retained-health-second", traces=False, metrics=False)
+            other = await Node.start(AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0"))
+            replacement = await HealthServer.start(other, "127.0.0.1", port)
+            await replacement.stop(); await other.shutdown()
+            observability.shutdown()
+            assert health.addr == addr  # still retained; no GC needed
+            print(json.dumps({"refs": refs, "retained": True}))
+        asyncio.run(main())
+        """
+    )
+    assert out == {"refs": 0, "retained": True}

@@ -54,7 +54,8 @@ impl ReadinessCheckHandle {
 /// `HealthServer.start(node, options)`; `stop()` releases the port.
 #[napi]
 pub struct HealthServer {
-    server: Arc<RsHealthServer>,
+    server: Arc<tokio::sync::Mutex<Option<RsHealthServer>>>,
+    port: u16,
     state: HealthState,
     addr: String,
 }
@@ -92,7 +93,8 @@ impl HealthServer {
             Ok(HealthServer {
                 state: server.state(),
                 addr: server.addr().to_string(),
-                server: Arc::new(server),
+                port: server.addr().port(),
+                server: Arc::new(tokio::sync::Mutex::new(Some(server))),
             })
         })
     }
@@ -106,20 +108,20 @@ impl HealthServer {
     /// The bound port.
     #[napi(getter)]
     pub fn port(&self) -> u32 {
-        u32::from(self.server.addr().port())
+        u32::from(self.port)
     }
 
     /// Liveness (`/healthz`).
     #[napi]
     pub fn set_healthy(&self, healthy: bool) {
-        self.server.set_healthy(healthy);
+        self.state.set_healthy(healthy);
     }
 
     /// Readiness of the application itself (`/readyz` also needs every
     /// check true).
     #[napi]
     pub fn set_ready(&self, ready: bool) {
-        self.server.set_ready(ready);
+        self.state.set_ready(ready);
     }
 
     /// Services reported by `/readyz`.
@@ -143,7 +145,7 @@ impl HealthServer {
     #[napi]
     pub fn check(&self, name: String) -> ReadinessCheckHandle {
         ReadinessCheckHandle {
-            inner: self.server.check(&name),
+            inner: self.state.check(&name),
         }
     }
 
@@ -153,11 +155,23 @@ impl HealthServer {
         self.state.remove_check(&name)
     }
 
-    /// Stop listening and wait until the port is released. Idempotent.
+    /// Stop listening, release the owned observability reference, and wait until
+    /// the port is released. Concurrent calls join the same shutdown; idempotent.
     #[napi]
     pub async fn stop(&self) -> Result<()> {
-        self.server.set_ready(false);
-        self.server.shutdown().await;
+        self.state.set_ready(false);
+        let inner = self.server.clone();
+        // The worker owns shutdown even if the caller cancels its await.
+        tokio::spawn(async move {
+            let mut owned = inner.lock().await;
+            if let Some(server) = owned.take() {
+                server.shutdown().await;
+                // Drop before unlocking: concurrent stops must join release.
+                drop(server);
+            }
+        })
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, format!("health shutdown: {e}")))?;
         Ok(())
     }
 }
