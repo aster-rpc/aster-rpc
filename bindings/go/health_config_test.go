@@ -81,4 +81,22 @@ func TestHealthConfig_ServerStartsListenerFromConfig(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.Contains(string(body), `"status":"ok"`) {
 		t.Fatalf("/healthz = %d %s", resp.StatusCode, body)
 	}
+	// The configuration path must attach readiness to the serving RPC server,
+	// rather than merely start an independent, live health listener.
+	if code, body := httpGet(t, addr, "/readyz"); code != 200 ||
+		!strings.Contains(body, `"status":"ready"`) || !strings.Contains(body, `"services":1`) {
+		t.Fatalf("config /readyz = %d %s", code, body)
+	}
+	if err := h.SetCheck("config-cache", false); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := httpGet(t, addr, "/readyz"); code != 503 || !strings.Contains(body, `"config-cache":false`) {
+		t.Fatalf("config failing check = %d %s", code, body)
+	}
+	if err := h.SetCheck("config-cache", true); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := httpGet(t, addr, "/readyz"); code != 200 {
+		t.Fatalf("config check recovery = %d %s", code, body)
+	}
 }
