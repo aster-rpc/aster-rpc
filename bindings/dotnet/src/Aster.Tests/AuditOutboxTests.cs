@@ -6,6 +6,11 @@ namespace Aster.Tests;
 
 public sealed class AuditOutboxTests
 {
+    private static string PythonExecutable =>
+        Environment.GetEnvironmentVariable("ASTER_TEST_PYTHON") is { Length: > 0 } configured
+            ? configured
+            : OperatingSystem.IsWindows() ? "python" : "python3";
+
     private sealed class Receiver : IDisposable
     {
         private readonly Process _process;
@@ -15,7 +20,7 @@ public sealed class AuditOutboxTests
             var root = new DirectoryInfo(AppContext.BaseDirectory);
             while (root is not null && !File.Exists(Path.Combine(root.FullName, "tests/audit_outbox/receiver.py"))) root = root.Parent;
             Assert.NotNull(root);
-            var start = new ProcessStartInfo("python3") { RedirectStandardOutput = true, RedirectStandardError = true };
+            var start = new ProcessStartInfo(PythonExecutable) { RedirectStandardOutput = true, RedirectStandardError = true };
             start.ArgumentList.Add(Path.Combine(root!.FullName, "tests/audit_outbox/receiver.py"));
             start.ArgumentList.Add("--database"); start.ArgumentList.Add(database);
             start.ArgumentList.Add("--port"); start.ArgumentList.Add(port.ToString());
@@ -57,7 +62,7 @@ public sealed class AuditOutboxTests
                 await box.FlushAsync(TimeSpan.FromSeconds(10));
                 Assert.Equal(0UL, (await box.StatusAsync()).PendingRecords);
             }
-            var query = new ProcessStartInfo("python3") { RedirectStandardOutput = true };
+            var query = new ProcessStartInfo(PythonExecutable) { RedirectStandardOutput = true };
             query.ArgumentList.Add("-c");
             query.ArgumentList.Add("import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT id FROM events').fetchone()[0])");
             query.ArgumentList.Add(database);

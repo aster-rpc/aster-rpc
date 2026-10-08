@@ -22,6 +22,12 @@ import site.aster.handle.IrohRuntime;
 final class AuditOutboxTest {
   @TempDir Path directory;
 
+  private static String python() {
+    String configured = System.getenv("ASTER_TEST_PYTHON");
+    if (configured != null && !configured.isBlank()) return configured;
+    return System.getProperty("os.name").startsWith("Windows") ? "python" : "python3";
+  }
+
   private static <T> T get(CompletableFuture<T> future) throws Exception {
     return future.get(15, TimeUnit.SECONDS);
   }
@@ -50,7 +56,7 @@ final class AuditOutboxTest {
   private Receiver receiver(int port) throws Exception {
     Process process =
         new ProcessBuilder(
-                "python3",
+                python(),
                 receiverScript().toString(),
                 "--database",
                 directory.resolve("receiver.sqlite").toString(),
@@ -115,7 +121,7 @@ final class AuditOutboxTest {
       }
       Process query =
           new ProcessBuilder(
-                  "python3",
+                  python(),
                   "-c",
                   "import sqlite3,sys,base64,json; db=sqlite3.connect(sys.argv[1]); print(json.dumps([[k,base64.b64encode(v).decode()] for k,v in db.execute('SELECT id,envelope FROM events')]))",
                   directory.resolve("receiver.sqlite").toString())

@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -21,9 +23,19 @@ type auditReceiverProcess struct {
 	stopped  bool
 }
 
+func auditTestPython() string {
+	if configured := os.Getenv("ASTER_TEST_PYTHON"); configured != "" {
+		return configured
+	}
+	if runtime.GOOS == "windows" {
+		return "python"
+	}
+	return "python3"
+}
+
 func startAuditReceiver(t *testing.T, database, port string) *auditReceiverProcess {
 	t.Helper()
-	command := exec.Command("python3", "../../tests/audit_outbox/receiver.py", "--database", database, "--port", port)
+	command := exec.Command(auditTestPython(), "../../tests/audit_outbox/receiver.py", "--database", database, "--port", port)
 	pipe, err := command.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +121,7 @@ func TestAuditOutbox_ReopenDeliveryAndTypedError(t *testing.T) {
 		t.Fatalf("drained %+v: %v", status, err)
 	}
 	receiver.stop()
-	check := exec.Command("python3", "-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT id FROM events').fetchone()[0])", database)
+	check := exec.Command(auditTestPython(), "-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT id FROM events').fetchone()[0])", database)
 	found, err := check.Output()
 	if err != nil || strings.TrimSpace(string(found)) != id {
 		t.Fatalf("receiver ID %q vs %q: %v", found, id, err)

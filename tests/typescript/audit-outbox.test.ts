@@ -10,11 +10,12 @@ import { AuditOutbox, AuditOutboxError, type AuditOutboxConfig } from '@aster-rp
 
 const repo = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const receiverScript = resolve(repo, 'tests/audit_outbox/receiver.py');
+const python = process.env.ASTER_TEST_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 const directories: string[] = [];
 const receivers: ChildProcess[] = [];
 
 async function startReceiver(database: string, port = 0): Promise<{ child: ChildProcess; endpoint: string }> {
-  const child = spawn('python3', [receiverScript, '--database', database, '--port', String(port)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(python, [receiverScript, '--database', database, '--port', String(port)], { stdio: ['ignore', 'pipe', 'pipe'] });
   receivers.push(child);
   let output = '';
   const endpoint = await new Promise<string>((resolveEndpoint, reject) => {
@@ -73,7 +74,7 @@ describe('shared native durable audit outbox', () => {
       await reopened.flush(10_000);
       expect((await reopened.status()).pendingRecords).toBe(0n);
     } finally { await reopened.close(); }
-    const query = spawnSync('python3', ['-c',
+    const query = spawnSync(python, ['-c',
       'import sqlite3,sys,base64,json; db=sqlite3.connect(sys.argv[1]); print(json.dumps([[k,base64.b64encode(v).decode()] for k,v in db.execute("SELECT id,envelope FROM events")]))', database], { encoding: 'utf8' });
     expect(query.status).toBe(0);
     const events: [string, string][] = JSON.parse(query.stdout);
