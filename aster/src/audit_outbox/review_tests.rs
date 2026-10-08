@@ -30,7 +30,7 @@ fn stall(sequence: u64, kind: DeliveryErrorKind) -> DeliveryError {
 
 #[test]
 fn completed_flush_prefix_ignores_later_stalls_and_dispositions() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tests::private_directory();
     let mut store = store::Store::open(config(dir.path())).unwrap();
     let ids = store
         .submit_group(vec![event(1), event(2)])
@@ -76,7 +76,7 @@ fn completed_flush_prefix_ignores_later_stalls_and_dispositions() {
 
 #[test]
 fn credential_repair_fences_old_errors_and_acks_without_changing_bytes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tests::private_directory();
     let mut cfg = config(dir.path());
     let mut store = store::Store::open(cfg.clone()).unwrap();
     let id = store.submit_group(vec![event(1)]).remove(0).unwrap();
@@ -115,7 +115,7 @@ fn credential_repair_fences_old_errors_and_acks_without_changing_bytes() {
 
 #[test]
 fn failed_quarantine_budget_preserves_pending_record_and_exact_evidence() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tests::private_directory();
     let mut cfg = config(dir.path());
     let mut store = store::Store::open(cfg.clone()).unwrap();
     let id = store.submit_group(vec![event(1)]).remove(0).unwrap();
@@ -172,7 +172,7 @@ fn failed_quarantine_budget_preserves_pending_record_and_exact_evidence() {
 #[tokio::test]
 async fn invalid_operator_commands_are_rejected_before_the_bounded_control_queue() {
     use std::sync::atomic::Ordering;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tests::private_directory();
     let outbox = AuditOutbox::open(config(dir.path())).await.unwrap();
     let id = outbox.submit(event(1)).await.unwrap();
     outbox

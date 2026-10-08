@@ -704,6 +704,60 @@ mod tests {
 
     use crate::audit_test_common as common;
 
+    // Docker exec (including Forgejo steps) can start with umask 0000.
+    // Configure the test-owned directory itself, never the parallel process.
+    fn private_directory() -> tempfile::TempDir {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("aster-ffi-audit-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        builder.tempdir().expect("private audit test directory")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_fixture_opens_and_reopens_under_permissive_umask() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "--exact",
+            "audit_outbox::tests::clones_are_runtime_scoped_and_reopen_keeps_durable_ids_and_errors",
+            "--nocapture",
+        ]);
+        // SAFETY: umask is an async-signal-safe syscall in the child after fork;
+        // it never changes the parent test process or another parallel test.
+        unsafe {
+            child.pre_exec(|| {
+                libc::umask(0);
+                Ok(())
+            });
+        }
+        let mut child = child
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("private fixture child exceeded its 60-second deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "private fixture failed under umask 0000: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
     const OK: i32 = aster_status_t::ASTER_STATUS_OK as i32;
     fn bytes(json: &[u8]) -> aster_bytes_t {
         aster_bytes_t {
@@ -842,7 +896,7 @@ mod tests {
 
     #[test]
     fn clones_are_runtime_scoped_and_reopen_keeps_durable_ids_and_errors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_directory();
         unsafe {
             let rt = runtime(16);
             let other = runtime(16);
@@ -931,7 +985,7 @@ mod tests {
 
     #[test]
     fn cancelled_late_open_closes_unobserved_handle_and_releases_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_directory();
         unsafe {
             let rt = runtime(8);
             let user_data = next_handle_id();
@@ -962,7 +1016,7 @@ mod tests {
 
     #[test]
     fn cancelling_committed_submit_never_retracts_event_and_shutdown_closes_clones() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_directory();
         unsafe {
             let rt = runtime(8);
             let handle = open(rt, dir.path(), 4096);
@@ -999,8 +1053,8 @@ mod tests {
 
     #[test]
     fn runtime_shutdown_rejects_late_registration_and_operation_limit_starts_no_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let unused = tempfile::tempdir().unwrap();
+        let dir = private_directory();
+        let unused = private_directory();
         unsafe {
             let rt = runtime(1);
             let user_data = next_handle_id();
@@ -1034,7 +1088,7 @@ mod tests {
 
     #[test]
     fn runtime_shutdown_closes_engines_retained_only_by_freed_handle_operations() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_directory();
         unsafe {
             let rt = runtime(8);
             let handle = open(rt, dir.path(), 4096);

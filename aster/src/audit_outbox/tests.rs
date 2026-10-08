@@ -26,6 +26,19 @@ pub(crate) struct Hooks {
     pub write_failure: std::sync::atomic::AtomicBool,
 }
 
+// Every store fixture owns an explicit private root, independent of Docker
+// exec's ambient umask. Do not change the shared process umask for this suite.
+pub(super) fn private_directory() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("aster-audit-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private audit test directory")
+}
+
 fn event(n: u64) -> AuditEvent {
     AuditEvent {
         timestamp_ms: n,
@@ -85,7 +98,7 @@ fn opaque_wire_and_restore_safe_ids() {
 
 #[test]
 fn durable_groups_capacity_quarantine_replay_and_receipt_budget() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let mut config = config(directory.path());
     config.max_retained_bytes = 4096;
     let mut store = store::Store::open(config.clone()).unwrap();
@@ -149,7 +162,7 @@ fn reject(store: &mut store::Store, sequence: u64) {
 
 #[test]
 fn commit_failure_fails_entire_group_without_acknowledging() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let mut store = store::Store::open(config(directory.path())).unwrap();
     COMMIT_FAILURE.with(|f| f.set(true));
     let outcomes = store.submit_group(vec![event(1), event(2)]);
@@ -194,7 +207,7 @@ fn delivery_classification_complete_table() {
 
 #[tokio::test]
 async fn cloned_handles_outage_and_nonblocking_close_reopen() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let outbox = AuditOutbox::open(config.clone()).await.unwrap();
     let clone = outbox.clone();
@@ -249,7 +262,7 @@ async fn wait_status(
 
 #[tokio::test]
 async fn persistent_receiver_lost_ack_deduplicates_exact_bytes() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let receiver = fixture::Receiver::start(&directory.path().join("receiver.redb"), 1);
     let outbox = AuditOutbox::open(OutboxConfig::new(
         directory.path().join("outbox"),
@@ -277,7 +290,7 @@ async fn persistent_receiver_lost_ack_deduplicates_exact_bytes() {
 
 #[tokio::test]
 async fn rejected_batch_isolates_in_order_and_survives_restart_with_remedy() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let receiver = fixture::Receiver::start(&directory.path().join("receiver.redb"), 2);
     let config = OutboxConfig::new(directory.path().join("outbox"), receiver.destination());
     let mut store = store::Store::open(config.clone()).unwrap();
@@ -336,7 +349,7 @@ async fn rejected_batch_isolates_in_order_and_survives_restart_with_remedy() {
 
 #[tokio::test]
 async fn credential_rotation_unblocks_waiting_flush_and_protocol_errors_retry() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let receiver = fixture::Receiver::start(&directory.path().join("receiver.redb"), 3);
     let outbox = AuditOutbox::open(OutboxConfig::new(
         directory.path().join("outbox"),
@@ -385,7 +398,7 @@ async fn credential_rotation_unblocks_waiting_flush_and_protocol_errors_retry() 
 
 #[test]
 fn stale_ack_destination_and_quarantine_classes_are_fenced() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let mut store = store::Store::open(config.clone()).unwrap();
     let id = store.submit_group(vec![event(1)]).remove(0).unwrap();
@@ -464,7 +477,7 @@ fn stale_ack_destination_and_quarantine_classes_are_fenced() {
 
 #[test]
 fn restore_reuses_sequence_with_content_bound_distinct_ids() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let mut store = store::Store::open(config.clone()).unwrap();
     let first = store.submit_group(vec![event(1)]).remove(0).unwrap();
@@ -511,7 +524,7 @@ fn restore_reuses_sequence_with_content_bound_distinct_ids() {
 
 #[test]
 fn ambiguous_after_commit_is_recoverable_and_never_reported_success() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let mut store = store::Store::open(config.clone()).unwrap();
     COMMIT_AFTER_FAILURE.with(|f| f.set(true));
@@ -528,7 +541,7 @@ fn ambiguous_after_commit_is_recoverable_and_never_reported_success() {
 #[tokio::test]
 async fn cancellation_after_commit_keeps_record_and_no_early_completion() {
     use std::sync::atomic::Ordering;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let outbox = AuditOutbox::open(config(directory.path())).await.unwrap();
     outbox
         .shared
@@ -573,7 +586,7 @@ async fn cancellation_after_commit_keeps_record_and_no_early_completion() {
 #[tokio::test]
 async fn saturation_grouping_and_worker_exit_complete_waiters() {
     use std::sync::atomic::Ordering;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let outbox = AuditOutbox::open(config(directory.path())).await.unwrap();
     outbox
         .shared
@@ -643,7 +656,7 @@ async fn saturation_grouping_and_worker_exit_complete_waiters() {
 #[tokio::test]
 async fn delivery_worker_exit_is_visible_and_pending_data_survive() {
     use std::sync::atomic::Ordering;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let outbox = AuditOutbox::open(config.clone()).await.unwrap();
     outbox.submit(event(1)).await.unwrap();
@@ -673,7 +686,7 @@ async fn delivery_worker_exit_is_visible_and_pending_data_survive() {
 
 #[test]
 fn physical_space_reuse_and_durable_latency_measurements() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let mut store = store::Store::open(config).unwrap();
     let mut sizes = Vec::new();
@@ -756,7 +769,7 @@ fn retry_after_seconds_dates_are_bounded_and_invalid_values_ignored() {
 
 #[test]
 fn dead_letters_exhaust_budget_without_purge_and_failed_quarantine_preserves_pending() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let mut store = store::Store::open(config.clone()).unwrap();
     let ids = store
@@ -814,7 +827,7 @@ fn dead_letters_exhaust_budget_without_purge_and_failed_quarantine_preserves_pen
 #[tokio::test]
 async fn concurrent_submit_close_completes_admitted_work_without_receiver() {
     use std::sync::atomic::Ordering;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let outbox = AuditOutbox::open(config.clone()).await.unwrap();
     outbox
@@ -860,7 +873,7 @@ async fn concurrent_submit_close_completes_admitted_work_without_receiver() {
 
 #[tokio::test]
 async fn cloned_cancelled_flush_credential_rotation_close_reopens_original_configuration() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let receiver = fixture::Receiver::start(&directory.path().join("receiver.redb"), 7);
     let config = OutboxConfig::new(directory.path().join("outbox"), receiver.destination());
     let outbox = AuditOutbox::open(config.clone()).await.unwrap();
@@ -895,7 +908,7 @@ async fn cloned_cancelled_flush_credential_rotation_close_reopens_original_confi
 
 #[tokio::test]
 async fn canceled_open_and_last_handle_drop_release_directory() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let task = {
         let config = config.clone();
@@ -1041,7 +1054,7 @@ fn child_process_entry() {
 #[tokio::test]
 async fn submission_byte_budget_is_independent_of_count_budget() {
     use std::sync::atomic::Ordering;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let mut config = config(directory.path());
     config.max_event_bytes = MAX_EVENT_BYTES;
     let outbox = AuditOutbox::open(config.clone()).await.unwrap();
@@ -1093,7 +1106,7 @@ async fn submission_byte_budget_is_independent_of_count_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "durable workload measurement; run explicitly after the fault matrix"]
 async fn durable_submit_workload_measurements() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let outbox = AuditOutbox::open(config(directory.path())).await.unwrap();
     let mut idle = Vec::new();
     let start = std::time::Instant::now();
@@ -1156,7 +1169,7 @@ async fn durable_submit_workload_measurements() {
 #[tokio::test]
 async fn write_failure_closes_admission_and_preserves_previous_durable_records() {
     use std::sync::atomic::Ordering;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let config = config(directory.path());
     let outbox = AuditOutbox::open(config.clone()).await.unwrap();
     let id = outbox.submit(event(1)).await.unwrap();
@@ -1180,7 +1193,7 @@ async fn write_failure_closes_admission_and_preserves_previous_durable_records()
 #[tokio::test]
 async fn saturated_submission_queue_cannot_starve_ack_deletion_or_flush_controls() {
     use std::sync::atomic::Ordering;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let receiver = fixture::Receiver::start(&directory.path().join("receiver.redb"), 0);
     let outbox = AuditOutbox::open(OutboxConfig::new(
         directory.path().join("outbox"),
@@ -1261,7 +1274,7 @@ fn wait_file(path: &std::path::Path) {
 
 #[test]
 fn cross_process_exclusive_lock() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_directory();
     let store = store::Store::open(config(directory.path())).unwrap();
     let marker = directory.path().join("marker");
     let mut child = child(directory.path(), &marker, "lock", None);
@@ -1274,7 +1287,7 @@ fn cross_process_exclusive_lock() {
 #[test]
 fn process_kill_before_and_after_quarantine_commit_preserves_original_and_receipt() {
     for (mode, after) in [("quarantine_before", false), ("quarantine_after", true)] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_directory();
         let config = config(directory.path());
         let mut store = store::Store::open(config.clone()).unwrap();
         let ids = store
@@ -1308,7 +1321,7 @@ fn process_kill_before_and_after_quarantine_commit_preserves_original_and_receip
 #[tokio::test]
 async fn process_kill_after_acceptance_and_after_receiver_commit_recovers_same_id() {
     for mode in [7, 9] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_directory();
         let receiver = fixture::Receiver::start(&directory.path().join("receiver.redb"), mode);
         let outbox_path = directory.path().join("outbox");
         let marker = directory.path().join("marker");
