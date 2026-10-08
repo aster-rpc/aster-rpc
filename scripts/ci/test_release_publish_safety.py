@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -159,10 +160,12 @@ class NpmSafetyTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any(call[1] == "publish" for call in self.calls()))
         self.assertNotIn("offline-secret-token", result.stdout + result.stderr)
-        import yaml
-        workflow = yaml.safe_load((ROOT / ".forgejo/workflows/release.yml").read_text())
-        self.assertEqual(workflow["concurrency"]["group"], "forgejo-aster-promotion")
-        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+        # Keep the guard suite standard-library-only on the runner image.
+        workflow = (ROOT / ".forgejo/workflows/release.yml").read_text()
+        concurrency = re.search(r"(?m)^concurrency:\n((?:[ \t]+.*\n)+)", workflow)
+        self.assertIsNotNone(concurrency)
+        self.assertEqual(re.findall(r"(?m)^  group: (.+)$", concurrency[1]), ["forgejo-aster-promotion"])
+        self.assertEqual(re.findall(r"(?m)^  cancel-in-progress: (.+)$", concurrency[1]), ["false"])
 
     def test_semver_ordering_and_invalid_identifiers(self):
         versions = ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0", "1.0.1", "1.1.0", "2.0.0"]
