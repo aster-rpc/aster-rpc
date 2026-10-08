@@ -48,6 +48,8 @@ tempfile = "3"
 libc = { workspace = true }
 
 [features]
+# Deterministic route-registration cancellation regression; never published.
+expose-fixture = []
 # Test-only: `tests/coordination.rs` hosts a real voter group in process
 # (`aster/coordination-testing`; D7: the voter is Rust-only). A feature, not a
 # dev-dependency, so a workspace `--all-targets` build does not unify the voter

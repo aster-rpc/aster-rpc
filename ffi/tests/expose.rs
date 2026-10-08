@@ -1169,6 +1169,11 @@ fn route_specs() -> Specs {
 }
 
 unsafe fn request_routes(rig: &Rig, specs: &Specs, metadata: &[u8]) -> Ev {
+    let op = request_routes_start(rig, specs, metadata, 4);
+    finish(rig.rt, op)
+}
+
+unsafe fn request_routes_start(rig: &Rig, specs: &Specs, metadata: &[u8], user_data: u64) -> u64 {
     let hosts: Vec<_> = specs.iter().map(|s| s.0.clone()).collect();
     let svcs: Vec<_> = specs.iter().map(|s| s.3.clone()).collect();
     let raw: Vec<aster_route_spec_t> = specs
@@ -1189,12 +1194,89 @@ unsafe fn request_routes(rig: &Rig, specs: &Specs, metadata: &[u8]) -> Ev {
             raw.as_ptr(),
             raw.len(),
             bytes(metadata),
-            4,
+            user_data,
             &mut op
         ),
         OK
     );
-    finish(rig.rt, op)
+    op
+}
+
+#[cfg(feature = "expose-fixture")]
+#[test]
+fn cancelled_successful_route_registration_frees_handle_and_evicts_route() {
+    struct Cleanup {
+        rt: u64,
+        handle: u64,
+        op: u64,
+        gate: Arc<test_hooks::Gate>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            unsafe {
+                aster_operation_cancel(self.rt, self.op);
+            }
+            self.gate.release();
+            unsafe {
+                let handle = self
+                    .gate
+                    .wait_reached(Duration::ZERO)
+                    .unwrap_or(self.handle);
+                aster_route_registration_free(self.rt, handle);
+            }
+        }
+    }
+    let mut rig = Rig::bare(true);
+    unsafe {
+        assert_eq!(
+            aster_expose_route_policy_foreign(rig.rt, rig.expose, rig.upcalls),
+            OK
+        );
+        rig.start_foreign(no_http(), Arc::new(|_| Some(enc_c8(&[0]))));
+        let specs = vec![("cancel.example".into(), 443, 0, "web".into())];
+        let gate = test_hooks::arm(0xcafe_4201);
+        let mut cleanup = Cleanup {
+            rt: rig.rt,
+            handle: 0,
+            op: 0,
+            gate: gate.clone(),
+        };
+        let op = request_routes_start(&rig, &specs, b"", 0xcafe_4201);
+        cleanup.op = op;
+        let handle = gate
+            .wait_reached(WAIT)
+            .expect("successful registration did not reach completion gate");
+        cleanup.handle = handle;
+        assert!(test_hooks::registration_present(handle));
+        assert!(test_hooks::route_present(rig.expose, "cancel.example", 443));
+        assert_eq!(aster_operation_cancel(rig.rt, op), OK);
+        let cancelled = finish(rig.rt, op);
+        // Release even if the cancellation outcome is wrong, so teardown
+        // cannot strand the gated operation.
+        gate.release();
+        assert_eq!(
+            cancelled.ev.kind,
+            aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED as u32
+        );
+        assert!(
+            gate.wait_discarded(WAIT),
+            "cancelled success did not discard its registration"
+        );
+        assert!(
+            !test_hooks::registration_present(handle),
+            "cancelled success leaked its exact registration handle"
+        );
+        assert_eq!(aster_route_registration_free(rig.rt, handle), NOT_FOUND);
+        let end = Instant::now() + WAIT;
+        while test_hooks::route_present(rig.expose, "cancel.example", 443) {
+            assert!(
+                Instant::now() < end,
+                "edge did not evict the cancelled registration"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        test_hooks::forget_router(rig.expose);
+    }
 }
 
 #[test]

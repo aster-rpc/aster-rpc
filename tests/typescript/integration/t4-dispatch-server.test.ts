@@ -332,17 +332,18 @@ describe.skipIf(!hasDispatch)('DispatchServer ring delivery close', () => {
   });
 });
 
-describe.skipIf(typeof native?.DispatchServer?.prototype?.debugFailDelivery !== 'function')(
+describe.skipIf(typeof native?.DispatchServer?.debugArmAttach !== 'function')(
   'DispatchServer attach window',
   () => {
     it('delivers a call that arrives before serve() resolves', async () => {
       const node = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
       const peer = await native.Node.start({ ...OFFLINE, alpns: [RPC_ALPN] });
-      process.env.ASTER_TEST_DISPATCH_ATTACH_DELAY_MS = '1000';
+      native.DispatchServer.debugArmAttach();
       let conn: any;
       let loop: DispatchLoop | undefined;
+      let serving: Promise<DispatchLoop> | undefined;
       try {
-        const serving = DispatchLoop.start({
+        serving = DispatchLoop.start({
           node,
           services: [ECHO_SERVICE],
           delivery: 'tsfn-batched',
@@ -352,10 +353,14 @@ describe.skipIf(typeof native?.DispatchServer?.prototype?.debugFailDelivery !== 
           },
         } as any);
         // Call while the server accepts but has not attached its call table.
-        await new Promise((r) => setTimeout(r, 300));
+        await until(() => native.DispatchServer.debugAttachState() === 0);
         conn = await peer.connectNodeAddr(node.nodeId(), RPC_ALPN, node.directAddresses(), undefined);
         const transport = new IrohTransport(conn, BYTES as any);
         const reply = transport.unary('test.Echo', 'echo', Buffer.from('early'));
+        void reply.catch(() => {});
+        // A live call in the held native gate proves arrival before attach.
+        await until(() => native.DispatchServer.debugAttachState() === 1);
+        native.DispatchServer.debugReleaseAttach();
         loop = await serving;
         const got = await Promise.race([
           reply.then((b: any) => Buffer.from(b).toString()),
@@ -363,11 +368,15 @@ describe.skipIf(typeof native?.DispatchServer?.prototype?.debugFailDelivery !== 
         ]);
         expect(got).toBe('echo:early');
       } finally {
-        delete process.env.ASTER_TEST_DISPATCH_ATTACH_DELAY_MS;
+        native.DispatchServer.debugReleaseAttach();
         try { conn?.close(0, 'done'); } catch { /* ignore */ }
-        await loop?.close();
-        await peer.close();
-        await node.close();
+        try {
+          loop ??= await serving;
+          await loop?.close();
+        } finally {
+          await peer.close();
+          await node.close();
+        }
       }
     });
   },

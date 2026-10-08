@@ -314,7 +314,11 @@ pub unsafe extern "C" fn aster_expose_free(
 ) -> i32 {
     try_status!(bridge_for(runtime));
     match EXPOSES.remove(expose) {
-        Some(_) => OK,
+        Some(_) => {
+            #[cfg(feature = "expose-fixture")]
+            test_hooks::forget_router(expose);
+            OK
+        }
         None => not_found(format!("unknown expose handle {expose}")),
     }
 }
@@ -609,7 +613,10 @@ pub unsafe extern "C" fn aster_expose_route_policy_foreign(
     try_status!(bridge_for(runtime));
     let e = try_status!(expose_for(expose));
     let u = try_status!(upcalls_for(upcalls));
-    e.serve_routes(EdgeRouter::new(), foreign_route_policy(u.upcalls.clone()));
+    let router = EdgeRouter::new();
+    #[cfg(feature = "expose-fixture")]
+    test_hooks::remember_router(expose, router.clone());
+    e.serve_routes(router, foreign_route_policy(u.upcalls.clone()));
     OK
 }
 
@@ -977,11 +984,15 @@ pub unsafe extern "C" fn aster_expose_request_route(
             }
         }
         let handle = REGISTRATIONS.insert(Mutex::new(Some(reg)));
+        #[cfg(feature = "expose-fixture")]
+        let gate = test_hooks::before_complete(user_data, handle).await;
         Ok(
             Done::ok(aster_event_kind_t::ASTER_EVENT_BYTES_RESULT, handle)
                 .data(codec::encode_expose_route_grant(&indexes))
                 .on_discard(move || {
                     free_registration(handle);
+                    #[cfg(feature = "expose-fixture")]
+                    test_hooks::discarded(gate);
                 }),
         )
     })
@@ -1010,6 +1021,97 @@ fn free_registration(registration: aster_route_registration_t) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// One-shot completion gates for the route-registration regression.
+#[cfg(feature = "expose-fixture")]
+#[doc(hidden)]
+pub mod test_hooks {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar};
+    use std::time::Duration;
+
+    pub struct Gate {
+        state: Mutex<(Option<u64>, bool)>,
+        changed: Condvar,
+        release: tokio::sync::Semaphore,
+    }
+    impl Gate {
+        pub fn wait_reached(&self, timeout: Duration) -> Option<u64> {
+            let state = self.state.lock().unwrap();
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, timeout, |s| s.0.is_none())
+                .unwrap();
+            state.0
+        }
+        pub fn wait_discarded(&self, timeout: Duration) -> bool {
+            let state = self.state.lock().unwrap();
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, timeout, |s| !s.1)
+                .unwrap();
+            state.1
+        }
+        pub fn release(&self) {
+            self.release.add_permits(1);
+        }
+    }
+    fn gates() -> &'static Mutex<HashMap<u64, Arc<Gate>>> {
+        static GATES: std::sync::OnceLock<Mutex<HashMap<u64, Arc<Gate>>>> =
+            std::sync::OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    fn routers() -> &'static Mutex<HashMap<u64, EdgeRouter>> {
+        static ROUTERS: std::sync::OnceLock<Mutex<HashMap<u64, EdgeRouter>>> =
+            std::sync::OnceLock::new();
+        ROUTERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    pub fn arm(user_data: u64) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            state: Mutex::new((None, false)),
+            changed: Condvar::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        assert!(gates()
+            .lock()
+            .unwrap()
+            .insert(user_data, gate.clone())
+            .is_none());
+        gate
+    }
+    pub(crate) async fn before_complete(user_data: u64, handle: u64) -> Option<Arc<Gate>> {
+        let gate = gates().lock().unwrap().remove(&user_data)?;
+        gate.state.lock().unwrap().0 = Some(handle);
+        gate.changed.notify_all();
+        gate.release.acquire().await.unwrap().forget();
+        Some(gate)
+    }
+    pub(crate) fn discarded(gate: Option<Arc<Gate>>) {
+        if let Some(gate) = gate {
+            gate.state.lock().unwrap().1 = true;
+            gate.changed.notify_all();
+        }
+    }
+    pub(crate) fn remember_router(expose: u64, router: EdgeRouter) {
+        routers().lock().unwrap().insert(expose, router);
+    }
+    pub fn route_present(expose: u64, host: &str, port: u16) -> bool {
+        routers()
+            .lock()
+            .unwrap()
+            .get(&expose)
+            .expect("known fixture expose")
+            .lookup(host, port)
+            .is_some()
+    }
+    pub fn registration_present(handle: u64) -> bool {
+        REGISTRATIONS.get(handle).is_some()
+    }
+    pub fn forget_router(expose: u64) {
+        routers().lock().unwrap().remove(&expose);
     }
 }
 

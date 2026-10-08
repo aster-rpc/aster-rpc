@@ -1073,7 +1073,7 @@ impl DispatchServer {
             let table = server.call_table();
             let handle = server.serve();
             #[cfg(feature = "test-hooks")]
-            attach_delay().await;
+            attach_gate(table.clone()).await;
             Ok(sinks.finish(
                 Running::Attached(handle),
                 table,
@@ -1480,22 +1480,75 @@ impl DispatchServer {
     }
 }
 
-/// Test hook: widen the window in which an attached server is already
-/// serving but its call table is not yet attached to the delivery sink.
 #[cfg(feature = "test-hooks")]
-async fn attach_delay() {
-    let ms = std::env::var("ASTER_TEST_DISPATCH_ATTACH_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if ms > 0 {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+struct AttachGate {
+    table: OnceLock<CallTable>,
+    claimed: AtomicBool,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(feature = "test-hooks")]
+fn attach_gate_slot() -> &'static Mutex<Option<Arc<AttachGate>>> {
+    static GATE: OnceLock<Mutex<Option<Arc<AttachGate>>>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(feature = "test-hooks")]
+async fn attach_gate(table: CallTable) {
+    let gate = attach_gate_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|gate| !gate.claimed.swap(true, Ordering::AcqRel))
+        .cloned();
+    if let Some(gate) = gate {
+        let _ = gate.table.set(table);
+        gate.release.acquire().await.unwrap().forget();
+        attach_gate_slot().lock().unwrap().take();
     }
 }
 
 #[cfg(feature = "test-hooks")]
 #[napi]
 impl DispatchServer {
+    /// Arm a one-shot attached-server gate before the delivery table attaches.
+    #[napi]
+    pub fn debug_arm_attach() -> Result<()> {
+        let mut slot = attach_gate_slot().lock().unwrap();
+        if slot.is_some() {
+            return Err(Error::from_reason("attach gate already armed"));
+        }
+        *slot = Some(Arc::new(AttachGate {
+            table: OnceLock::new(),
+            claimed: AtomicBool::new(false),
+            release: tokio::sync::Semaphore::new(0),
+        }));
+        Ok(())
+    }
+
+    /// -1 before entry; otherwise the number of calls registered while held.
+    #[napi]
+    pub fn debug_attach_state() -> i32 {
+        attach_gate_slot()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|g| g.table.get())
+            .map(|t| t.len() as i32)
+            .unwrap_or(-1)
+    }
+
+    #[napi]
+    pub fn debug_release_attach() {
+        let mut slot = attach_gate_slot().lock().unwrap();
+        if let Some(gate) = slot.as_ref() {
+            gate.release.add_permits(1);
+            if !gate.claimed.load(Ordering::Acquire) {
+                slot.take();
+            }
+        }
+    }
+
     /// Diagnostics: force the same terminal cleanup used after TSFN delivery
     /// failure or watchdog exhaustion. Test-hook addons only.
     #[napi]
