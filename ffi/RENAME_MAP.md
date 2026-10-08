@@ -1,4 +1,16 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.8)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.9)
+
+## New in 4.9 (durable audit outbox; additive)
+
+`aster_audit_outbox_{open,clone,submit,status,flush,close,free,reconfigure,quarantine,export,replay}`
+wrap the shared Rust outbox with runtime-owned references and the existing async
+completion queue. New events 114–117 carry opened handles, durable submission IDs,
+JSON status and original evidence exports. Typed error codes distinguish admission,
+storage/uncertain commits, lifecycle, delivery stalls and explicit dispositions.
+
+Requests/results use bounded JSON v1; see
+[`Aster-audit-outbox-spec.md`](../ffi_spec/Aster-audit-outbox-spec.md). No existing
+layout changes. Ordinary diagnostic logging retains its existing behavior.
 
 ABI 3.0.0 renames the entire C ABI of `aster_transport_ffi` to the single
 `aster_` / `ASTER_` prefix. No backward compatibility: a binding must switch

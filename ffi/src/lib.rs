@@ -20,6 +20,12 @@ use anyhow::Result;
 
 use aster_transport_core::*;
 
+pub mod audit_outbox;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod audit_test_common;
+#[cfg(test)]
+extern crate self as aster_transport_ffi;
 pub mod call;
 pub mod coordination;
 pub mod coordination_codec;
@@ -138,8 +144,10 @@ pub mod upcall;
 //   returns `ASTER_STATUS_OPERATION_LIMIT` (18).
 // - 4.8.0 (additive): `ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT` (5) and
 //   bounded FIFO foreign-dispatch staging behind the existing event ring.
+// - 4.9.0 (additive): durable audit outbox, versioned bounded JSON and
+//   asynchronous lifecycle/operator completions (`audit_outbox.rs`).
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 8;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 9;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -378,6 +386,15 @@ pub enum aster_event_kind_t {
     /// `aster_coordination_lease_t`, payload = `DD` (the fence); denied --
     /// `handle` = 0, payload = UCv1 `B2` (denied, reason + snapshot).
     ASTER_EVENT_COORDINATION_LEASE_ACQUIRED = 113,
+    /// `aster_audit_outbox_open`: `handle` = the new outbox handle.
+    ASTER_EVENT_AUDIT_OUTBOX_OPENED = 114,
+    /// `aster_audit_outbox_submit`: payload = the full UTF-8 event ID.
+    /// Success means durable local acceptance, not remote delivery.
+    ASTER_EVENT_AUDIT_OUTBOX_SUBMITTED = 115,
+    /// `aster_audit_outbox_status`: versioned JSON status payload.
+    ASTER_EVENT_AUDIT_OUTBOX_STATUS = 116,
+    /// `aster_audit_outbox_export`: versioned JSON evidence payload.
+    ASTER_EVENT_AUDIT_OUTBOX_EXPORTED = 117,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
@@ -760,6 +777,9 @@ pub(crate) struct BridgeRuntime {
     // Handle registries
     pub(crate) nodes: HandleRegistry<CoreNode>,
     pub(crate) connections: HandleRegistry<CoreConnection>,
+    pub(crate) audit_outboxes: HandleRegistry<audit_outbox::OutboxState>,
+    // Includes engines retained only by an in-flight operation after handle free.
+    pub(crate) audit_outbox_lifetimes: Mutex<Vec<std::sync::Weak<audit_outbox::OutboxState>>>,
     send_streams: HandleRegistry<CoreSendStream>,
     recv_streams: HandleRegistry<CoreRecvStream>,
     #[allow(dead_code)]
@@ -892,6 +912,8 @@ impl BridgeRuntime {
             close_notify: Arc::new(tokio::sync::Notify::new()),
             nodes: HandleRegistry::new(),
             connections: HandleRegistry::new(),
+            audit_outboxes: HandleRegistry::new(),
+            audit_outbox_lifetimes: Mutex::new(Vec::new()),
             send_streams: HandleRegistry::new(),
             recv_streams: HandleRegistry::new(),
             blobs_clients: HandleRegistry::new(),
@@ -1498,6 +1520,7 @@ fn close_runtime(runtime: aster_runtime_t) -> Result<Arc<RuntimeTeardown>, aster
         Err(_) => return Err(aster_status_t::ASTER_STATUS_INTERNAL),
     };
     arc.begin_close();
+    audit_outbox::shutdown_runtime(&arc);
     arc.release_handles();
     let teardown = arc.teardown.clone();
     drop(arc);

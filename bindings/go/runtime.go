@@ -535,8 +535,8 @@ func Version() (major, minor, patch uint32) {
 }
 
 // ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
-// this binding runs against: 4.7 separates event-queue and operation bounds.
-const ABIMinorRequired = uint32(7)
+// this binding runs against: 4.9 adds the durable audit outbox.
+const ABIMinorRequired = uint32(9)
 
 // CheckABI returns an error if the loaded native library's ABI major version
 // differs from the one this binding was compiled against, or its minor

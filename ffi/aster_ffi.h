@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 8
+#define ASTER_ABI_VERSION_MINOR 9
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -23,6 +23,27 @@
  * This is the value `aster_abi_version()` returns.
  */
 #define ASTER_ABI_VERSION (((ASTER_ABI_VERSION_MAJOR << 16) | (ASTER_ABI_VERSION_MINOR << 8)) | ASTER_ABI_VERSION_PATCH)
+
+/**
+ * Version of all audit outbox JSON request/status/export wrappers.
+ */
+#define ASTER_AUDIT_OUTBOX_JSON_VERSION 1
+
+/**
+ * Maximum encoded UTF-8 config or destination request (before reading/copying it).
+ */
+#define ASTER_AUDIT_OUTBOX_MAX_CONFIG_JSON (32 * 1024)
+
+/**
+ * Maximum encoded UTF-8 quarantine/export/replay request.
+ */
+#define ASTER_AUDIT_OUTBOX_MAX_OPERATOR_JSON (8 * 1024)
+
+/**
+ * Additional encoded JSON framing allowed above the configured envelope limit.
+ * Raw input whitespace/escaping also counts; native envelope validation remains authoritative.
+ */
+#define ASTER_AUDIT_OUTBOX_EVENT_JSON_OVERHEAD 1024
 
 /**
  * `aster_coordination_client_options_t.flags`: open the read-only client
@@ -520,6 +541,23 @@ typedef enum aster_event_kind_t {
    * `handle` = 0, payload = UCv1 `B2` (denied, reason + snapshot).
    */
   ASTER_EVENT_COORDINATION_LEASE_ACQUIRED = 113,
+  /**
+   * `aster_audit_outbox_open`: `handle` = the new outbox handle.
+   */
+  ASTER_EVENT_AUDIT_OUTBOX_OPENED = 114,
+  /**
+   * `aster_audit_outbox_submit`: payload = the full UTF-8 event ID.
+   * Success means durable local acceptance, not remote delivery.
+   */
+  ASTER_EVENT_AUDIT_OUTBOX_SUBMITTED = 115,
+  /**
+   * `aster_audit_outbox_status`: versioned JSON status payload.
+   */
+  ASTER_EVENT_AUDIT_OUTBOX_STATUS = 116,
+  /**
+   * `aster_audit_outbox_export`: versioned JSON evidence payload.
+   */
+  ASTER_EVENT_AUDIT_OUTBOX_EXPORTED = 117,
 } aster_event_kind_t;
 
 /**
@@ -1362,6 +1400,37 @@ typedef enum aster_span_kind_t {
   ASTER_SPAN_CONSUMER = 4,
 } aster_span_kind_t;
 
+/**
+ * `error_code` on audit outbox `ASTER_EVENT_ERROR`. Switch on this enum,
+ * never on error text. Synchronous malformed ABI input returns INVALID_ARGUMENT.
+ */
+typedef enum aster_audit_outbox_error_t {
+  ASTER_AUDIT_OUTBOX_ERROR_NONE = 0,
+  ASTER_AUDIT_OUTBOX_ERROR_INVALID_CONFIG = 1,
+  ASTER_AUDIT_OUTBOX_ERROR_INVALID_EVENT = 2,
+  ASTER_AUDIT_OUTBOX_ERROR_EVENT_TOO_LARGE = 3,
+  ASTER_AUDIT_OUTBOX_ERROR_STORAGE_FULL = 4,
+  ASTER_AUDIT_OUTBOX_ERROR_STORAGE = 5,
+  /**
+   * The commit outcome is uncertain; retry may duplicate an accepted event.
+   */
+  ASTER_AUDIT_OUTBOX_ERROR_COMMIT_UNCERTAIN = 6,
+  ASTER_AUDIT_OUTBOX_ERROR_QUEUE_OVERLOADED = 7,
+  ASTER_AUDIT_OUTBOX_ERROR_MAINTENANCE = 8,
+  ASTER_AUDIT_OUTBOX_ERROR_CLOSED = 9,
+  ASTER_AUDIT_OUTBOX_ERROR_WORKER_FAILED = 10,
+  ASTER_AUDIT_OUTBOX_ERROR_TIMEOUT = 11,
+  ASTER_AUDIT_OUTBOX_ERROR_DELIVERY_STALLED = 12,
+  /**
+   * The flushed prefix includes a quarantined disposition, not delivery.
+   */
+  ASTER_AUDIT_OUTBOX_ERROR_DISPOSITION = 13,
+  ASTER_AUDIT_OUTBOX_ERROR_NOT_FOUND = 14,
+  ASTER_AUDIT_OUTBOX_ERROR_DESTINATION_MISMATCH = 15,
+  ASTER_AUDIT_OUTBOX_ERROR_INTEGRITY_CONFLICT = 16,
+  ASTER_AUDIT_OUTBOX_ERROR_STALE_DELIVERY = 17,
+} aster_audit_outbox_error_t;
+
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
   uint32_t worker_threads;
@@ -1521,6 +1590,11 @@ typedef struct aster_transport_metrics_t {
   uint64_t net_reports;
   uint64_t net_reports_full;
 } aster_transport_metrics_t;
+
+/**
+ * Runtime-owned reference to a shared Rust outbox. Clone shares workers and budget.
+ */
+typedef uint64_t aster_audit_outbox_t;
 
 typedef uint64_t aster_call_t;
 
@@ -3687,6 +3761,108 @@ int32_t aster_registry_acl_list_writers(aster_runtime_t runtime,
                                         uint64_t doc,
                                         uint64_t user_data,
                                         aster_operation_t *out_operation);
+
+/**
+ * Open JSON v1 `{ "version":1, "config":{...} }`; configuration and storage
+ * failures complete asynchronously. Emits AUDIT_OUTBOX_OPENED with the handle.
+ * Cancelled successful opens are closed/freed even when completion arrives late.
+ */
+int32_t aster_audit_outbox_open(aster_runtime_t runtime,
+                                struct aster_bytes_t json,
+                                uint64_t user_data,
+                                aster_operation_t *out_operation);
+
+/**
+ * Clone a handle without reopening storage or allocating workers/queues.
+ * Closing any clone stops the shared engine; free releases only this reference.
+ */
+int32_t aster_audit_outbox_clone(aster_runtime_t runtime,
+                                 aster_audit_outbox_t outbox,
+                                 aster_audit_outbox_t *out_clone);
+
+/**
+ * Release a handle. Last-reference drop signals worker shutdown without waiting.
+ * Prefer asynchronous close before free when immediate reopen is required.
+ */
+int32_t aster_audit_outbox_free(aster_runtime_t runtime, aster_audit_outbox_t outbox);
+
+/**
+ * Submit JSON v1 `{ "version":1, "event":{ "timestamp_ms":..., "kind":...,
+ * "payload":... } }`. Emits SUBMITTED with the full ID after durable commit.
+ * Cancellation can lose the result of an accepted event; it never deletes it.
+ */
+int32_t aster_audit_outbox_submit(aster_runtime_t runtime,
+                                  aster_audit_outbox_t outbox,
+                                  struct aster_bytes_t json,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * Obtain JSON v1 `{ "version":1, "status":{...} }` asynchronously.
+ */
+int32_t aster_audit_outbox_status(aster_runtime_t runtime,
+                                  aster_audit_outbox_t outbox,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * Wait for the committed prefix captured by Rust. Timeout/cancellation keeps
+ * pending events. Quarantine of a prefix returns DISPOSITION, never success.
+ */
+int32_t aster_audit_outbox_flush(aster_runtime_t runtime,
+                                 aster_audit_outbox_t outbox,
+                                 uint64_t timeout_ms,
+                                 uint64_t user_data,
+                                 aster_operation_t *out_operation);
+
+/**
+ * Stop shared workers and release storage asynchronously, retaining pending
+ * records. The handle remains registered until free; all clones become closed.
+ */
+int32_t aster_audit_outbox_close(aster_runtime_t runtime,
+                                 aster_audit_outbox_t outbox,
+                                 uint64_t user_data,
+                                 aster_operation_t *out_operation);
+
+/**
+ * Rotate credentials or explicitly repair destination JSON v1. Identity changes
+ * while pending/dead-letter data exist are rejected by the shared Rust engine.
+ */
+int32_t aster_audit_outbox_reconfigure(aster_runtime_t runtime,
+                                       aster_audit_outbox_t outbox,
+                                       struct aster_bytes_t json,
+                                       uint64_t user_data,
+                                       aster_operation_t *out_operation);
+
+/**
+ * Explicit, evidence-preserving quarantine JSON v1. Never frees capacity or
+ * marks delivery successful. No purge operation exists in v1.
+ */
+int32_t aster_audit_outbox_quarantine(aster_runtime_t runtime,
+                                      aster_audit_outbox_t outbox,
+                                      struct aster_bytes_t json,
+                                      uint64_t user_data,
+                                      aster_operation_t *out_operation);
+
+/**
+ * Read-only export JSON v1 `{ "version":1, "event_id":"..." }`. Emits
+ * EXPORTED with `{ "version":1, "export":{...} }` including original bytes.
+ */
+int32_t aster_audit_outbox_export(aster_runtime_t runtime,
+                                  aster_audit_outbox_t outbox,
+                                  struct aster_bytes_t json,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * Explicit replay JSON v1, preserving the original event ID and disposition
+ * trail. Emits UNIT_RESULT; remote acceptance remains separately flushable.
+ */
+int32_t aster_audit_outbox_replay(aster_runtime_t runtime,
+                                  aster_audit_outbox_t outbox,
+                                  struct aster_bytes_t json,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
 
 /**
  * Free a call from `aster_rpc_open`. An unfinished call is cancelled

@@ -24,7 +24,7 @@ aster-otel = { path = "../aster-otel", version = "=0.3.0", features = ["otlp", "
 # profile's "once the binding surfaces it"; the client only, never the voter),
 # and `otel` + `health` since ABI 4.6 (built-in metrics and spans, the ops
 # listener behind `aster_health_*`).
-aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "binding-support", "expose", "coordination-client", "otel", "health"] }
+aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "binding-support", "expose", "coordination-client", "otel", "health", "audit-outbox"] }
 async-trait = "0.1"
 iroh = { workspace = true }
 tokio = { workspace = true }
@@ -32,6 +32,7 @@ anyhow = { workspace = true }
 getrandom = "0.2"
 once_cell = { workspace = true }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 hex = "0.4"
 base64 = "0.22"
 # Note: aster_ffi.h is regenerated externally with cbindgen; not a build dep.

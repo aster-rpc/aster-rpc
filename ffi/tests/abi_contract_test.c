@@ -433,7 +433,11 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 8); /* 4.8: bounded foreign dispatch staging */
+    CHECK(ASTER_ABI_VERSION_MINOR == 9); /* 4.9: durable audit outbox */
+    CHECK(sizeof(aster_audit_outbox_error_t) == 4);
+    CHECK(sizeof(aster_audit_outbox_t) == 8);
+    CHECK(ASTER_EVENT_AUDIT_OUTBOX_OPENED == 114);
+    CHECK(ASTER_EVENT_AUDIT_OUTBOX_EXPORTED == 117);
     CHECK(ASTER_ABI_VERSION_MAJOR == 4); /* 4.0: reactor, framed calls, node factories and bare endpoints removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }

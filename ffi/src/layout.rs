@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+use crate::audit_outbox::aster_audit_outbox_error_t;
 use core::mem::{align_of, offset_of, size_of};
 
 use crate::coordination::{
@@ -65,6 +66,7 @@ macro_rules! assert_layout {
 
 // C enums are `int`-sized; every enum is carried as uint32_t/int32_t on the wire.
 const _: () = assert!(size_of::<aster_status_t>() == 4);
+const _: () = assert!(size_of::<aster_audit_outbox_error_t>() == 4);
 const _: () = assert!(size_of::<aster_relay_mode_t>() == 4);
 const _: () = assert!(size_of::<aster_hook_failure_mode_t>() == 4);
 const _: () = assert!(size_of::<aster_hook_decision_t>() == 4);

@@ -18,9 +18,10 @@ fn test_abi_version() {
     // 4.2.0: expose; 4.3.0: streaming consumer relay; 4.4.0: coordination
     // client + placement; 4.5.0: unary cancel tokens (all additive); 4.6.0:
     // observability + health, aster_node_metrics_prometheus removed; 4.7.0:
-    // independent event and operation bounds; 4.8.0: bounded foreign dispatch.
+    // independent event and operation bounds; 4.8.0: bounded foreign dispatch;
+    // 4.9.0: durable audit outbox.
     assert_eq!(ASTER_ABI_VERSION_MAJOR, 4);
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 8);
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 9);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);

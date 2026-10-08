@@ -58,4 +58,5 @@ include = [
   "aster_log_level_t",
   "aster_instrument_kind_t",
   "aster_span_kind_t",
+  "aster_audit_outbox_error_t",
 ]

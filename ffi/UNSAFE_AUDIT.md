@@ -3,6 +3,22 @@
 ## Scope
 `ffi/src/lib.rs` — all `unsafe` blocks at the FFI boundary.
 
+The audit outbox boundary in `ffi/src/audit_outbox.rs` uses the existing byte-slice
+and completion-buffer ownership helpers. It validates encoded request lengths
+before constructing a foreign slice or allocating parsed data. Oversized submit
+requests complete with typed EventTooLarge without reading their pointer; invalid
+config/operator requests return synchronously. As elsewhere in the C ABI, the host
+must supply valid readable pointer/length pairs for inputs within those bounds and
+valid writable output pointers. Rust does not validate foreign memory ownership.
+
+Async operations capture an `Arc` before returning, so concurrent handle free
+cannot invalidate started work. Runtime-scoped registries fence late registration;
+weak lifetime tracking covers outstanding operations after handle free. Cancelled
+opens close/free late unobserved handles. Cancelled submissions never remove accepted
+events. Unit tests call these C functions to exercise a dangling pointer with an
+over-limit length (no dereference), runtime scope, cancellation, reopen and teardown.
+These tests passed on macOS; sanitizer/platform qualification remains separate.
+
 ## Unsafe Patterns
 
 ### 1. `read_bytes` / `read_string` / `read_string_list`
