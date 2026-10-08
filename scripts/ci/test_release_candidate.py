@@ -522,16 +522,24 @@ class CandidateTests(unittest.TestCase):
         fake = binaries / "npm"
         fake.write_text('''#!/usr/bin/env python3
 import hashlib,json,os,pathlib,sys
-args=sys.argv[1:]; state=pathlib.Path(os.environ["FAKE_NPM_STATE"])
+args=sys.argv[1:]; state=pathlib.Path(os.environ["FAKE_NPM_STATE"]); tags=state.with_suffix(".tags")
 if args[0]=="pack":
     output=pathlib.Path(args[args.index("--pack-destination")+1]); data=b"exact-package"
     (output/"fixture.tgz").write_bytes(data)
     print(json.dumps([{"filename":"fixture.tgz","shasum":hashlib.sha1(data).hexdigest()}]))
 elif args[0]=="view":
-    if state.exists(): print(json.dumps(state.read_text()))
+    if len(args)>2 and args[2]=="dist-tags": print(tags.read_text() if tags.exists() else "{}")
+    elif state.exists(): print(json.dumps(state.read_text()))
     else: print(json.dumps({"error":{"code":"E404"}})); print("launcher: package manager exited 1"); sys.exit(1)
 elif args[0]=="publish":
     data=pathlib.Path(args[1]).read_bytes(); state.write_text(hashlib.sha1(data).hexdigest())
+    current=json.loads(tags.read_text()) if tags.exists() else {}; current[args[args.index("--tag")+1]]="0.3.776"; tags.write_text(json.dumps(current))
+elif args[0]=="dist-tag":
+    current=json.loads(tags.read_text()) if tags.exists() else {}
+    if args[1]=="add": current[args[3]]=args[2].rsplit("@",1)[1]
+    elif args[1]=="rm": current.pop(args[3],None)
+    else: sys.exit(2)
+    tags.write_text(json.dumps(current))
 else: sys.exit(2)
 ''')
         fake.chmod(0o755)

@@ -52,33 +52,6 @@ for path in artifacts:
         raise SystemExit(f"{path.name}: metadata version {actual!r}, expected {expected!r}")
 PY
 
-forge="${FORGEJO_SERVER_URL:-https://forge.emrul.dev}"
-api="$forge/api/v1/repos/Aster/aster-rpc-internal"
-auth=(-H "Authorization: token $ASTER_RELEASE_TOKEN")
-request() {
-  local method="$1" path="$2"; shift 2
-  curl --fail-with-body --silent --show-error -X "$method" "${auth[@]}" "$@" "$api$path"
-}
-
-release_id="$(request GET "/releases/tags/$tag" 2>/dev/null \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null || true)"
-if [[ -z "$release_id" ]]; then
-  payload="$(python3 - "$tag" "$version" "$(git -C "$repo" rev-parse HEAD)" <<'PY'
-import json, sys
-tag, version, commit = sys.argv[1:4]
-print(json.dumps({
-    "tag_name": tag,
-    "name": f"Aster {version}",
-    "body": f"Aster {version}, built from `{commit}`.\n\nAssets include Linux, Windows, and Apple Silicon macOS Python abi3 wheels plus the source distribution.",
-    "draft": False,
-    "prerelease": False,
-}))
-PY
-)"
-  release_id="$(request POST /releases -H 'Content-Type: application/json' --data "$payload" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-fi
-
 python3 - "$dist" <<'PY'
 from pathlib import Path
 import hashlib
@@ -95,16 +68,7 @@ with checksum_file.open("w") as output:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         output.write(f"{digest}  {path.name}\n")
 PY
-for artifact in "$dist"/*; do
-  name="$(basename "$artifact")"
-  asset_id="$(request GET "/releases/$release_id/assets" \
-    | python3 -c 'import json,sys; name=sys.argv[1]; print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"] == name), ""))' "$name")"
-  if [[ -n "$asset_id" ]]; then
-    request DELETE "/releases/$release_id/assets/$asset_id" >/dev/null
-  fi
-  request POST "/releases/$release_id/assets?name=$name" \
-    -F "attachment=@$artifact;type=application/octet-stream" >/dev/null
-  echo "uploaded $name"
-done
-
-echo "published $forge/Aster/aster-rpc-internal/releases/tag/$tag"
+commit="$(git -C "$repo" rev-parse HEAD)"
+body="Aster $version, built from $commit. Assets are the verified private mirror of the publicly published packages."
+exec python3 "$repo/scripts/release/forgejo-release-assets.py" \
+  --body "$body" "$tag" "Aster $version" "$dist"/*
