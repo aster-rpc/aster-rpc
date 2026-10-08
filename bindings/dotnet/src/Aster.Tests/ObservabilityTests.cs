@@ -762,6 +762,16 @@ public class ObservabilityTests : IAsyncLifetime
         Assert.NotNull(health);
         Assert.StartsWith("127.0.0.1:", health!.Address);
         Assert.Equal(HttpStatusCode.OK, (await ProbeAsync(health.BaseUrl + "/healthz")).Code);
+        var ready = await ProbeAsync(health.BaseUrl + "/readyz");
+        Assert.Equal(HttpStatusCode.OK, ready.Code);
+        Assert.Contains("\"services\":1", ready.Body.Replace(" ", ""));
+        var cache = health.Check("config-cache");
+        cache.Set(false);
+        var failed = await ProbeAsync(health.BaseUrl + "/readyz");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, failed.Code);
+        Assert.Contains("\"config-cache\":false", failed.Body.Replace(" ", ""));
+        cache.Set(true);
+        Assert.Equal(HttpStatusCode.OK, (await ProbeAsync(health.BaseUrl + "/readyz")).Code);
     }
 
     [Fact]

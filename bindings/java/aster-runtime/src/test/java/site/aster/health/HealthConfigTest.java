@@ -77,6 +77,30 @@ final class HealthConfigTest {
                   HttpResponse.BodyHandlers.ofString());
       assertEquals(200, r.statusCode());
       assertTrue(r.body().contains("\"status\":\"ok\""), r.body());
+      HttpClient http = HttpClient.newHttpClient();
+      String readyUrl = "http://" + health.address() + "/readyz";
+      HttpResponse<String> ready =
+          http.send(
+              HttpRequest.newBuilder(URI.create(readyUrl)).timeout(Duration.ofSeconds(5)).build(),
+              HttpResponse.BodyHandlers.ofString());
+      assertEquals(200, ready.statusCode(), ready.body());
+      var cache = health.check("config-cache");
+      cache.set(false);
+      HttpResponse<String> failed =
+          http.send(
+              HttpRequest.newBuilder(URI.create(readyUrl)).timeout(Duration.ofSeconds(5)).build(),
+              HttpResponse.BodyHandlers.ofString());
+      assertEquals(503, failed.statusCode(), failed.body());
+      assertTrue(failed.body().contains("\"config-cache\":false"), failed.body());
+      cache.set(true);
+      assertEquals(
+          200,
+          http.send(
+                  HttpRequest.newBuilder(URI.create(readyUrl))
+                      .timeout(Duration.ofSeconds(5))
+                      .build(),
+                  HttpResponse.BodyHandlers.ofString())
+              .statusCode());
     } finally {
       server.close();
     }
