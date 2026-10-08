@@ -148,6 +148,11 @@ except ImportError as e:
 DocDownloadPolicy = DownloadPolicy
 
 from .config import AsterConfig
+from .audit_outbox import (
+    AuditDestination, AuditOutboxConfig, AuditEvent, AuditOutbox,
+    AuditOutboxError, AuditOutboxStatus, AuditDeliveryError,
+    AuditDispositionReceipt, AuditQuarantineExport,
+)
 
 # -- Attestation, sealed grants, leases, topology (plan P7) --
 from .attestation import (
@@ -345,6 +350,9 @@ from .interceptors import (
 __version__ = VERSION
 
 __all__ = [
+    "AuditDestination", "AuditOutboxConfig", "AuditEvent", "AuditOutbox",
+    "AuditOutboxError", "AuditOutboxStatus", "AuditDeliveryError",
+    "AuditDispositionReceipt", "AuditQuarantineExport",
     "VERSION",
     "__version__",
     # ── Iroh native bindings ──

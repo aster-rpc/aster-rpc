@@ -32,6 +32,7 @@ use pyo3::prelude::*;
 
 mod admission;
 mod attestation;
+mod audit_outbox;
 mod blobs;
 mod config;
 mod contract;
@@ -111,6 +112,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crypto::register(py, m)?;
     wire::register(py, m)?;
     attestation::register(py, m)?;
+    audit_outbox::register(m)?;
     grants::register(py, m)?;
     lease::register(py, m)?;
     topology::register(py, m)?;

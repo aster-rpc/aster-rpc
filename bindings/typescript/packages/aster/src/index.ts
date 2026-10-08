@@ -799,3 +799,11 @@ export {
   type BiStream,
   type AdmissionConnection,
 } from './trust/delegated.js';
+
+// Explicit durable audit submission (shared Rust outbox).
+export {
+  AuditOutbox, AuditOutboxError,
+  type AuditOutboxErrorKind, type AuditDestination, type AuditOutboxConfig,
+  type AuditEvent, type AuditJson, type AuditOutboxStatus, type AuditDeliveryError,
+  type AuditDispositionReceipt, type AuditQuarantineExport,
+} from './audit-outbox.js';

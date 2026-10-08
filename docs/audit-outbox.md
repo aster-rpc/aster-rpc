@@ -39,6 +39,63 @@ operator deletion or records missing from a restored backup. Content-bound IDs
 prevent a restored sequence from silently colliding with different earlier content;
 they cannot reconstruct events absent from that backup.
 
+## Language entrypoints
+
+These APIs call the same Rust outbox. Import Python types from `aster`,
+TypeScript types from `@aster-rpc/aster`, and Java types from `site.aster.audit`.
+Rust consumers enable the `audit-outbox` feature; .NET uses `Aster.Audit`.
+
+| Language | Open | Event and integer fields | Flush and shutdown |
+| --- | --- | --- | --- |
+| Rust | `aster::audit_outbox::AuditOutbox::open(OutboxConfig)` | `AuditEvent`; unsigned 64-bit timestamps and counters | Async `flush(std::time::Duration)` and `close()` |
+| Python | `await AuditOutbox.open(AuditOutboxConfig(directory, AuditDestination(endpoint)))` | `AuditEvent(timestamp_ms, kind, payload)`; exact Python `int` | `await outbox.flush(timeout_seconds)`; `await outbox.close()` or async context management |
+| TypeScript | `await AuditOutbox.open({ directory, destination: { endpoint } })` | `{ timestampMs, kind, payload }`; `bigint` timestamps, retained budget and status counters | `await outbox.flush(timeoutMs)`; `await outbox.close()` or async disposal |
+| Java | `AuditOutbox.open(runtime, new AuditOutbox.Config(directory, new AuditOutbox.Destination(endpoint)))` | `AuditOutbox.Event`; `BigInteger` represents unsigned 64-bit fields, and payload is a Jackson `JsonNode` | `outbox.flush(Duration)` and `outbox.closeAsync()` return `CompletableFuture`; `close()` enqueues shutdown and returns immediately |
+| Go | `OpenAuditOutbox(ctx, runtime, AuditOutboxConfig)` | `AuditEvent`; `uint64` timestamps and counters | `Flush(ctx, time.Duration)`; `Close(ctx)` |
+| .NET | `AuditOutbox.OpenAsync(runtime, AuditOutboxConfig, ct)` | `AuditEvent`; `ulong` timestamps and counters | `FlushAsync(TimeSpan, ct)`; `CloseAsync(ct)` or async disposal |
+
+Rust `Clone`, Python and TypeScript `clone()`, Java `copy()`, and Go/.NET
+`Clone()` share workers, storage and capacity. Explicitly closing any clone stops
+the shared outbox. Await shutdown
+before reopening its directory; Java callers should compose `closeAsync()` when
+they need to wait for the lock to be released. Cancelling a Java future only
+cancels that wait; native completion and handle cleanup continue.
+
+```python
+from aster import AuditDestination, AuditEvent, AuditOutbox, AuditOutboxConfig
+
+async with await AuditOutbox.open(
+    AuditOutboxConfig("./state/audit", AuditDestination(endpoint))
+) as outbox:
+    event_id = await outbox.submit(AuditEvent(timestamp_ms, "operation.intent", {"operation": "update"}))
+    await outbox.flush(10)  # seconds
+```
+
+```typescript
+import { AuditOutbox } from '@aster-rpc/aster';
+
+const outbox = await AuditOutbox.open({
+  directory: './state/audit', destination: { endpoint },
+});
+try {
+  const eventId = await outbox.submit({
+    timestampMs: BigInt(Date.now()), kind: 'operation.intent',
+    payload: { operation: 'update' },
+  });
+  await outbox.flush(10_000); // milliseconds
+} finally {
+  await outbox.close();
+}
+```
+
+Python failures expose `AuditOutboxError.kind`, TypeScript failures expose
+`AuditOutboxError.kind`, and Java failures expose `AuditOutboxException.kind()`.
+Rust uses `AuditError.kind()`, Go uses `*AuditOutboxError` with its `Kind` field,
+and .NET uses `AuditOutboxException.Kind`.
+Status includes `storage_recovered` (Python) or `storageRecovered` (TypeScript and
+Java): the database performed a physical repair during this open and subsequently
+passed the outbox's logical validation. Credentials are excluded from status.
+
 ## Receiver responsibility
 
 The SDK consumer chooses and operates the HTTP(S) receiver. It must implement the

@@ -6,6 +6,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 import site.aster.event.IrohEvent;
 
 /**
@@ -23,6 +24,7 @@ public class IrohPollThread {
   private final int maxEvents;
   private final Duration pollTimeout;
   private final MethodHandle pollEvents;
+  private final MethodHandle bufferRelease;
 
   private volatile boolean running = false;
   private Thread thread;
@@ -54,6 +56,11 @@ public class IrohPollThread {
                 ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_INT));
+    this.bufferRelease =
+        lib.getHandle(
+            "aster_buffer_release",
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
   }
 
   /** Add a handler for inbound events. Handlers are cumulative. */
@@ -114,15 +121,16 @@ public class IrohPollThread {
   private void dispatchEvent(IrohEvent event) {
     // Error events — always complete exceptionally
     if (event.kind() == IrohEventKind.ERROR || event.kind() == IrohEventKind.OPERATION_CANCELLED) {
-      IrohStatus status = IrohStatus.fromCode(event.status());
-      String detail = readErrorPayload(event);
-      String message =
-          detail.isEmpty()
-              ? "operation failed: " + status.name()
-              : "operation failed: " + status.name() + ": " + detail;
-      registry.completeExceptionally(
-          event.operation(),
-          IrohException.forStatus(status, message).withEvent(event.errorCode(), event.flags()));
+      dispatchFailure(
+          registry,
+          event,
+          buffer -> {
+            try {
+              bufferRelease.invoke(runtimeHandle, buffer);
+            } catch (Throwable ignored) {
+              // A closing native runtime owns any remaining buffers.
+            }
+          });
       return;
     }
 
@@ -148,6 +156,24 @@ public class IrohPollThread {
     // STREAM_OPENED, STREAM_ACCEPTED, ENDPOINT_CREATED, CONNECTED,
     // CONNECTION_ACCEPTED, etc.
     registry.complete(event.operation(), event);
+  }
+
+  /** Error futures receive copied text only; the poller owns the borrowed native buffer. */
+  static void dispatchFailure(OperationRegistry registry, IrohEvent event, LongConsumer release) {
+    IrohStatus status = IrohStatus.fromCode(event.status());
+    String detail;
+    try {
+      detail = readErrorPayload(event);
+    } finally {
+      if (event.hasBuffer()) release.accept(event.buffer());
+    }
+    String message =
+        detail.isEmpty()
+            ? "operation failed: " + status.name()
+            : "operation failed: " + status.name() + ": " + detail;
+    registry.completeExceptionally(
+        event.operation(),
+        IrohException.forStatus(status, message).withEvent(event.errorCode(), event.flags()));
   }
 
   public boolean isRunning() {

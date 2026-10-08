@@ -613,6 +613,7 @@ module.exports.LeaseGrantorServer = nativeBinding.LeaseGrantorServer
 module.exports.LeaseHandle = nativeBinding.LeaseHandle
 module.exports.LeaseStatusStream = nativeBinding.LeaseStatusStream
 module.exports.MemorySerializer = nativeBinding.MemorySerializer
+module.exports.NativeAuditOutbox = nativeBinding.NativeAuditOutbox
 module.exports.Node = nativeBinding.Node
 module.exports.PeerAdmissionStore = nativeBinding.PeerAdmissionStore
 module.exports.PolicyDoc = nativeBinding.PolicyDoc

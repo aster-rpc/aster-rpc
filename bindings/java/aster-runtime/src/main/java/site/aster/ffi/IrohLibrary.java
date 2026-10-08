@@ -216,10 +216,10 @@ public final class IrohLibrary implements SymbolLookup {
   public static final int EXPECTED_ABI_MAJOR = 4;
 
   /**
-   * Lowest C ABI minor version this binding runs against: 4.7 separates the event queue from the
-   * asynchronous-operation admission bound.
+   * Lowest C ABI minor version this binding runs against: 4.9 adds the durable audit outbox.
+   * Version 4.7 separates the event queue from the asynchronous-operation admission bound.
    */
-  public static final int REQUIRED_ABI_MINOR = 7;
+  public static final int REQUIRED_ABI_MINOR = 9;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {

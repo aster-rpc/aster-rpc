@@ -12,6 +12,7 @@ use napi_derive::napi;
 
 mod admission;
 mod attestation;
+mod audit_outbox;
 mod blobs;
 mod config;
 mod contract;

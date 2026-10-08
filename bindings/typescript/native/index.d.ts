@@ -768,7 +768,10 @@ export declare class HealthServer {
   check(name: string): ReadinessCheckHandle
   /** Drop a named check. `false` when it did not exist. */
   removeCheck(name: string): boolean
-  /** Stop listening and wait until the port is released. Idempotent. */
+  /**
+   * Stop listening, release the owned observability reference, and wait until
+   * the port is released. Concurrent calls join the same shutdown; idempotent.
+   */
   stop(): Promise<void>
 }
 
@@ -1096,6 +1099,19 @@ export declare class MemorySerializer {
    * must not call back into this serializer.
    */
   mutateFenced(fence: Fence, writer: string, f: () => unknown): FenceRejection | null
+}
+
+export declare class NativeAuditOutbox {
+  cloneHandle(): NativeAuditOutbox
+  static open(configJson: string): Promise<NativeAuditOutbox>
+  submit(eventJson: string): Promise<string>
+  status(): Promise<string>
+  flush(timeoutMs: number): Promise<void>
+  close(): Promise<void>
+  reconfigure(destinationJson: string): Promise<void>
+  quarantine(eventId: string, reason: string, operatorReference: string): Promise<void>
+  export(eventId: string): Promise<string>
+  replay(eventId: string): Promise<void>
 }
 
 /**

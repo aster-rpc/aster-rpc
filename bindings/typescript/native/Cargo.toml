@@ -23,7 +23,7 @@ aster-otel = { path = "../../../aster-otel", version = "=0.3.0", features = ["ot
 # the coordination client is wrapped, never ported; see aster/Cargo.toml) +
 # expose (socket targets with JavaScript authorization over R6 upcalls) + otel
 # and health (built-in metrics / spans, the /healthz /readyz /metrics listener).
-aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "binding-support", "coordination-client", "expose", "otel", "health"] }
+aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "binding-support", "coordination-client", "expose", "otel", "health", "audit-outbox"] }
 napi = { version = "3", default-features = false, features = ["async", "napi9", "serde-json"] }
 napi-derive = { version = "3", features = ["type-def"] }
 tokio = { workspace = true }
