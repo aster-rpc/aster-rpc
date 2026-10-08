@@ -32,7 +32,13 @@ let _attempted = false;
 
 function tryLoad(path: string): NativeAddon | null {
   try {
-    return requireCjs(path) as NativeAddon;
+    const addon = requireCjs(path) as Partial<NativeAddon> | null;
+    // A loadable NAPI module may still be unrelated or too old for this SDK.
+    // Reject it before callers try to construct a missing native handle.
+    if (!addon || typeof addon.Node !== 'function'
+      || typeof addon.RpcConnection !== 'function'
+      || typeof addon.DispatchServer !== 'function') return null;
+    return addon as NativeAddon;
   } catch {
     return null;
   }
