@@ -23,6 +23,9 @@ can leave an event committed without the caller receiving its ID. Resubmitting m
 create a duplicate intent; exactly-once business operations are not promised.
 
 Use a persistent, private storage directory. One process holds its lifetime lock.
+On Windows, provision a private NTFS directory whose inheritable ACL grants access
+to the application account and trusted administrators/SYSTEM only. Aster relies on
+that inherited ACL; it does not tighten or reject broad Windows ACLs automatically.
 Cloned handles share workers, queues and limits. Closing stops the shared outbox,
 releases its storage and preserves pending records; it does not require a working
 receiver. Reopen the same directory to resume delivery.
