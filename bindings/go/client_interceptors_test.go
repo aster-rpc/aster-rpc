@@ -901,3 +901,71 @@ func TestClientInterceptors_ConcurrentCalls(t *testing.T) {
 		t.Fatalf("%d request hooks, want 40", reqs.Load())
 	}
 }
+
+func TestClientInterceptors_NativeBreakerAftermath(t *testing.T) {
+	for _, aftermath := range []string{"later_refusal", "cancelled_probe"} {
+		t.Run(aftermath, func(t *testing.T) {
+			first := NewCircuitBreakerInterceptor()
+			first.FailureThreshold, first.RecoveryTimeout = 1, 0
+			second := NewCircuitBreakerInterceptor()
+			second.FailureThreshold, second.RecoveryTimeout = 1, 0.15
+			breakers := []Interceptor{first}
+			if aftermath == "later_refusal" {
+				breakers = append(breakers, second)
+			}
+			f := newClientFixture(t, false, WithClientInterceptors(breakers...))
+			f.f.failFirst.Store(1)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := echo(ctx, f, "seed"); !errors.Is(err, ErrRpcUnavailable) {
+				t.Fatalf("seed: %v", err)
+			}
+			if aftermath == "later_refusal" {
+				if _, err := echo(ctx, f, "refused"); !errors.Is(err, ErrRpcUnavailable) {
+					t.Fatalf("refusal: %v", err)
+				}
+				if f.f.calls.Load() != 1 {
+					t.Fatal("refused call reached peer")
+				}
+				time.Sleep(180 * time.Millisecond)
+			} else {
+				probeCtx, stop := context.WithCancel(ctx)
+				defer stop()
+				done := make(chan error, 1)
+				go func() {
+					_, err := Call[testEchoRequest, testEchoReply](probeCtx, f.conn, "Flaky", "slow", &testEchoRequest{Data: []byte{}})
+					done <- err
+				}()
+				until := time.Now().Add(2 * time.Second)
+				for f.f.calls.Load() != 2 {
+					if time.Now().After(until) {
+						t.Fatal("probe never reached peer")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				stop()
+				select {
+				case err := <-done:
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("cancel: %v", err)
+					}
+				case <-ctx.Done():
+					t.Fatal("probe cancellation hung")
+				}
+			}
+			if first.State() != "half_open" {
+				t.Fatalf("abandoned probe state %s", first.State())
+			}
+			reply, err := echo(ctx, f, "healthy-probe")
+			if err != nil || reply.Message != "healthy-probe" {
+				t.Fatalf("healthy probe: %v %v", reply, err)
+			}
+			if first.State() != "closed" {
+				t.Fatalf("probe failed to close breaker: %s", first.State())
+			}
+			if aftermath == "later_refusal" && second.State() != "closed" {
+				t.Fatal("later breaker did not recover")
+			}
+		})
+	}
+}

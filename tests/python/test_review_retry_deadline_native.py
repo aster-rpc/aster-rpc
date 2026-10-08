@@ -13,7 +13,7 @@ import pytest
 
 from aster import AsterClient, AsterServer, rpc, service, wire_type
 from aster.config import AsterConfig
-from aster.interceptors import DeadlineInterceptor, RetryInterceptor
+from aster.interceptors import CircuitBreakerInterceptor, DeadlineInterceptor, RetryInterceptor
 from aster.rpc_types import RetryPolicy
 from aster.status import RpcError, StatusCode
 
@@ -233,3 +233,61 @@ async def test_native_saturated_pool_cancellation_and_recovery(monkeypatch):
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("aftermath", ["later_refusal", "cancelled_probe"])
+async def test_native_breaker_probe_recovery(aftermath):
+    """An abandoned half-open admission must allow a later real peer call."""
+    probe = Probe()
+    config = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0")
+    first = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=0.02)
+    second = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=60)
+    breakers = [first, second] if aftermath == "later_refusal" else [first]
+    pending = None
+    async with AsterServer(services=[probe], allow_all_consumers=True, config=config) as server:
+        async with AsterClient(address=server.address, config=config) as owner:
+            client = await owner.client(Probe, interceptors=breakers)
+            try:
+                with pytest.raises(RpcError) as seed:
+                    await client.call(Request("transient"), timeout=2)
+                assert seed.value.code == StatusCode.UNAVAILABLE
+                assert first.state == first.OPEN and first.failure_count == 1
+                await asyncio.sleep(0.03)
+                if aftermath == "later_refusal":
+                    with pytest.raises(RpcError, match="open"):
+                        await client.call(Request("refused"), timeout=2)
+                    assert probe.received_tags == ["transient"]
+                    assert second.state == second.OPEN
+                    # Make the later breaker's cooldown eligible too. This only
+                    # advances admission policy, never bypasses native transport.
+                    second.opened_at -= second.recovery_timeout
+                else:
+                    pending = asyncio.ensure_future(client.call(Request("hold"), timeout=3))
+                    await asyncio.wait_for(probe.hold_entered.wait(), timeout=2)
+                    assert first.half_open_calls == 1
+                    pending.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await pending
+                    probe.release_hold.set()
+                assert first.state == first.HALF_OPEN
+                assert first.half_open_calls == 0 and first.failure_count == 1
+                assert (await client.call(Request("healthy-probe"), timeout=2)).tag == "healthy-probe"
+                assert all(b.state == b.CLOSED and b.half_open_calls == 0 and b.failure_count == 0 for b in breakers)
+                dispatcher = server._server._dispatcher
+                until = asyncio.get_running_loop().time() + 2
+                while dispatcher.in_flight or dispatcher.server.live_calls():
+                    assert asyncio.get_running_loop().time() < until, "breaker calls did not drain"
+                    await asyncio.sleep(0.01)
+                assert probe.active_holds == 0
+                assert probe.received_tags == (["transient", "healthy-probe"] if aftermath == "later_refusal" else ["transient", "hold", "healthy-probe"])
+                print(json.dumps({"breaker_aftermath": aftermath, "healthy_native_probe": True,
+                                  "server_tags": probe.received_tags, "native_live_calls": 0,
+                                  "handler_in_flight": 0, "states": [b.state for b in breakers]}))
+            finally:
+                probe.release_hold.set()
+                if pending is not None:
+                    if not pending.done():
+                        pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)

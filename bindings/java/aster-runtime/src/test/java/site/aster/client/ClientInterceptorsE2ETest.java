@@ -777,6 +777,42 @@ final class ClientInterceptorsE2ETest {
     assertTrue(calls("d1").get() < 10);
   }
 
+  @Test
+  void nativeBreakerRefusalThenHealthyProbe() throws Exception {
+    var first = new CircuitBreakerInterceptor(1, 0.0, 1);
+    var second = new CircuitBreakerInterceptor(1, 0.15, 1);
+    var c = client(first, second);
+    assertEquals(
+        StatusCode.INTERNAL,
+        ((RpcError) failure(c.<Msg, Msg>call(addr, SVC, "boom", new Msg("rollback", 0), Msg.class)))
+            .code());
+    var refused = failure(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("refused", 0), Msg.class));
+    assertEquals(StatusCode.UNAVAILABLE, ((RpcError) refused).code());
+    assertEquals(CircuitBreakerInterceptor.State.HALF_OPEN, first.state());
+    Thread.sleep(180);
+    assertEquals(
+        "echo:healthy-probe|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("healthy-probe", 0), Msg.class)).text());
+    assertEquals(CircuitBreakerInterceptor.State.CLOSED, first.state());
+    assertEquals(CircuitBreakerInterceptor.State.CLOSED, second.state());
+  }
+
+  @Test
+  void nativeBreakerCancelledProbeThenHealthyProbe() throws Exception {
+    var breaker = new CircuitBreakerInterceptor(1, 0.0, 1);
+    var c = client(breaker);
+    failure(c.<Msg, Msg>call(addr, SVC, "boom", new Msg("cancel-probe", 0), Msg.class));
+    var probe = c.<Msg, Msg>call(addr, SVC, "slow", new Msg("probe", 0), Msg.class);
+    assertTrue(slowEntered.await(5, TimeUnit.SECONDS));
+    assertTrue(probe.cancel(true));
+    assertThrows(CancellationException.class, () -> probe.get(5, TimeUnit.SECONDS));
+    assertTrue(slowCancelled.await(5, TimeUnit.SECONDS));
+    assertEquals(
+        "echo:healthy-probe|",
+        get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("healthy-probe", 0), Msg.class)).text());
+    assertEquals(CircuitBreakerInterceptor.State.CLOSED, breaker.state());
+  }
+
   // ───── native unary cancel ──────────────────────────────────────────────
 
   @Test

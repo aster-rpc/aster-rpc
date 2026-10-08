@@ -354,6 +354,50 @@ public class ClientInterceptorTests : IAsyncLifetime
         Assert.Equal(CircuitBreakerInterceptor.StateClosed, breaker.State);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Native_Breaker_Abandoned_Probe_Then_Healthy_Recovery(bool cancelProbe)
+    {
+        _flakyFailUntil = 1;
+        var first = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0);
+        var second = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0.15);
+        var conn = _conn.WithInterceptors(cancelProbe ? [first] : [first, second]);
+        var seed = await Assert.ThrowsAsync<RpcError>(() => conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req()));
+        Assert.Equal(StatusCode.Unavailable, seed.Code);
+        if (cancelProbe)
+        {
+            using var cancel = new CancellationTokenSource();
+            var pending = conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "slow", Req(), cancellationToken: cancel.Token);
+            try
+            {
+                var until = DateTime.UtcNow.AddSeconds(3);
+                while (Volatile.Read(ref _slowCalls) == 0)
+                {
+                    Assert.True(DateTime.UtcNow < until, "probe did not reach peer");
+                    await Task.Delay(5);
+                }
+                cancel.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+            }
+            finally { cancel.Cancel(); }
+        }
+        else
+        {
+            var refusal = await Assert.ThrowsAsync<RpcError>(() => conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req()));
+            Assert.Equal(StatusCode.Unavailable, refusal.Code);
+            Assert.Equal(1, _flakyCalls);
+            await Task.Delay(180);
+        }
+        Assert.Equal(CircuitBreakerInterceptor.StateHalfOpen, first.State);
+        Assert.Equal(1, first.FailureCount);
+        var healthy = await conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req());
+        Assert.Equal(2, healthy.Count);
+        Assert.Equal(CircuitBreakerInterceptor.StateClosed, first.State);
+        Assert.Equal(0, first.FailureCount);
+        if (!cancelProbe) Assert.Equal(CircuitBreakerInterceptor.StateClosed, second.State);
+    }
+
     // ---- deadlines --------------------------------------------------------------------------
 
     [Fact]

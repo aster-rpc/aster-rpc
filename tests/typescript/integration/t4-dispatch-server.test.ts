@@ -29,6 +29,9 @@ import {
 import { tryLoadNative } from '../../../bindings/typescript/packages/aster/src/native.ts';
 import * as nativeLoader from '../../../bindings/typescript/packages/aster/src/native.ts';
 import { IrohTransport } from '../../../bindings/typescript/packages/aster/src/transport/iroh.ts';
+import { ClientChain } from '../../../bindings/typescript/packages/aster/src/client-interceptors.ts';
+import { CircuitBreakerInterceptor } from '../../../bindings/typescript/packages/aster/src/interceptors/circuit-breaker.ts';
+import { RpcPattern } from '../../../bindings/typescript/packages/aster/src/types.ts';
 import { RpcError, StatusCode } from '../../../bindings/typescript/packages/aster/src/status.ts';
 
 const native = tryLoadNative() as any;
@@ -589,6 +592,63 @@ describe.skipIf(!hasDispatch)('DispatchServer bounded TSFN delivery', () => {
       try { client.conn.close(0, 'done'); } catch { /* ignore */ }
       await client.node.close();
       await server.close();
+    }
+  });
+});
+
+
+describe.skipIf(!hasDispatch)('native breaker aftermath', () => {
+  it.each(['later_refusal', 'cancelled_probe'])('%s allows a later healthy native probe', async (aftermath) => {
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const seen: string[] = [];
+    const loop = await DispatchLoop.start({
+      config: OFFLINE as any, services: [ECHO_SERVICE], delivery: 'ring', builtinNodeInfo: false,
+      onCall: (ev, srv) => {
+        const tag = Buffer.from(ev.request!).toString();
+        seen.push(tag);
+        if (tag === 'seed') return respondCall(srv, ev.callId, Buffer.alloc(0), StatusCode.UNAVAILABLE, 'seed');
+        if (tag === 'hold') {
+          return gate.then(() => respondCall(srv, ev.callId, Buffer.from('released'))).catch(() => {});
+        }
+        return respondCall(srv, ev.callId, Buffer.from(tag));
+      },
+    });
+    let peer: Awaited<ReturnType<typeof connect>> | undefined;
+    const abort = new AbortController();
+    try {
+      peer = await connect(loop.address);
+      const first = new CircuitBreakerInterceptor({failureThreshold: 1, resetTimeoutMs: 0});
+      const second = new CircuitBreakerInterceptor({failureThreshold: 1, resetTimeoutMs: 150});
+      const chain = new ClientChain(aftermath === 'later_refusal' ? [first, second] : [first]);
+      const method = { service: 'test.Echo', method: 'echo', pattern: RpcPattern.UNARY, idempotent: false };
+      const call = (tag: string, signal?: AbortSignal) => chain.unary(peer!.transport, method, Buffer.from(tag), { signal, deadlineSecs: 2 });
+      await expect(call('seed')).rejects.toMatchObject({code: StatusCode.UNAVAILABLE});
+      if (aftermath === 'later_refusal') {
+        await expect(call('refused')).rejects.toThrow('circuit breaker is open');
+        expect(seen).toEqual(['seed']);
+        await new Promise(r => setTimeout(r, 180));
+      } else {
+        const pending = call('hold', abort.signal);
+        const terminal = pending.then(value => ({value}), error => ({error}));
+        await until(() => seen.includes('hold'));
+        expect(first.halfOpenInFlight).toBe(1);
+        abort.abort();
+        expect(await terminal).toMatchObject({error: {code: StatusCode.CANCELLED}});
+        release();
+      }
+      expect(first.currentState).toBe('half_open');
+      expect(first.halfOpenInFlight).toBe(0);
+      expect(Buffer.from(await call('healthy-probe') as Uint8Array).toString()).toBe('healthy-probe');
+      expect(first.currentState).toBe('closed');
+      if (aftermath === 'later_refusal') expect(second.currentState).toBe('closed');
+      await until(() => loop.native.liveCalls() === 0);
+      expect(seen).toEqual(aftermath === 'later_refusal' ? ['seed', 'healthy-probe'] : ['seed', 'hold', 'healthy-probe']);
+    } finally {
+      abort.abort(); release();
+      try { peer?.conn.close(0, 'done'); } catch { /* closed */ }
+      await peer?.node.close();
+      await loop.close();
     }
   });
 });
