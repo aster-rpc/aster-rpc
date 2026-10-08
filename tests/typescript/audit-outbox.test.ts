@@ -23,7 +23,7 @@ async function startReceiver(database: string, port = 0): Promise<{ child: Child
     child.once('exit', () => reject(new Error('receiver exited before ready')));
     child.stdout!.on('data', (chunk) => {
       output += chunk.toString();
-      if (output.includes('\n')) resolveEndpoint(output.split('\n')[0]);
+      if (output.includes('\n')) resolveEndpoint(output.split(/\r?\n/)[0]);
     });
   });
   return { child, endpoint };
