@@ -1097,6 +1097,35 @@ final class ClientInterceptorsE2ETest {
   }
 
   @Test
+  void registeredConnectionCleanupClosesNativeHandleWithoutGcTiming() throws Exception {
+    AsterClient c = client();
+    var connection = get(c.connect(addr));
+    assertTrue(connection.nextSessionId() > 0);
+    Runnable cleanup;
+    try {
+      var registration = site.aster.handle.IrohHandle.class.getDeclaredField("cleanable");
+      registration.setAccessible(true);
+      var action = (java.lang.ref.Cleaner.Cleanable) registration.get(connection);
+      cleanup = action::clean;
+    } catch (NoSuchFieldException oldImplementation) {
+      // The original registered record has only (handle, kind), and its
+      // run method merely logs. Invoke that exact action, without GC timing.
+      var action = Class.forName("site.aster.handle.IrohHandle$Cleanup");
+      var constructor = action.getDeclaredConstructor(long.class, String.class);
+      constructor.setAccessible(true);
+      cleanup = (Runnable) constructor.newInstance(connection.nativeHandle(), "iroh_connection");
+    }
+    cleanup.run();
+    assertThrows(
+        site.aster.ffi.IrohException.class,
+        connection::nextSessionId,
+        "Cleaner action must retire the actual native connection handle");
+    cleanup.run();
+    connection.close();
+    assertTrue(connection.isClosed());
+  }
+
+  @Test
   void emptyBufferedStreamsAreRefusedBeforeDispatch() throws Exception {
     AsterClient c = client();
     assertInstanceOf(

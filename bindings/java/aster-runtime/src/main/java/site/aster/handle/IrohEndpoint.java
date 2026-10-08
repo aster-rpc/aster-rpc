@@ -9,6 +9,7 @@ import site.aster.node.NodeAddr;
 public class IrohEndpoint extends IrohHandle {
 
   private final IrohRuntime runtime;
+  private CompletableFuture<Void> closeFuture;
 
   private IrohEndpoint(IrohRuntime runtime, long nodeHandle) {
     super(nodeHandle);
@@ -51,25 +52,26 @@ public class IrohEndpoint extends IrohHandle {
    */
   public String nodeId() {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
 
-    // Hex-encoded NodeId is 64 ASCII bytes.
-    var bufSeg = alloc.allocate(64);
-    var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+      // Hex-encoded NodeId is 64 ASCII bytes.
+      var bufSeg = alloc.allocate(64);
+      var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    int status = lib.nodeId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
-    if (status != 0) {
-      throw new IrohException(IrohStatus.fromCode(status), "aster_node_id failed: " + status);
+      int status = lib.nodeId(runtime.nativeHandle(), nativeHandle(), bufSeg, 64, lenSeg);
+      if (status != 0) {
+        throw new IrohException(IrohStatus.fromCode(status), "aster_node_id failed: " + status);
+      }
+
+      int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
+      if (len == 0) {
+        return "";
+      }
+
+      byte[] bytes = bufSeg.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
+      return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
     }
-
-    int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
-    if (len == 0) {
-      return "";
-    }
-
-    byte[] bytes = bufSeg.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
-    return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
   }
 
   /**
@@ -81,25 +83,26 @@ public class IrohEndpoint extends IrohHandle {
   public NodeAddr addrInfo() {
     var lib = IrohLibrary.getInstance();
     // Use confined arena - kept alive for duration of this method
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
 
-    MemorySegment bufSeg = alloc.allocate(ValueLayout.JAVA_BYTE, 4096);
-    // ASTER_NODE_ADDR is 48 bytes but allocate(layout) creates 0-size segment
-    // Use explicit size to ensure proper allocation
-    MemorySegment addrSeg = alloc.allocate(48);
+      MemorySegment bufSeg = alloc.allocate(ValueLayout.JAVA_BYTE, 4096);
+      // ASTER_NODE_ADDR is 48 bytes but allocate(layout) creates 0-size segment
+      // Use explicit size to ensure proper allocation
+      MemorySegment addrSeg = alloc.allocate(48);
 
-    int status = lib.nodeAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg);
-    if (status != 0) {
-      throw new IrohException(
-          IrohStatus.fromCode(status), "aster_node_addr_info failed: " + status);
+      int status = lib.nodeAddrInfo(runtime.nativeHandle(), nativeHandle(), bufSeg, 4096, addrSeg);
+      if (status != 0) {
+        throw new IrohException(
+            IrohStatus.fromCode(status), "aster_node_addr_info failed: " + status);
+      }
+
+      String endpointId = readIrohBytes(addrSeg.asSlice(0, 16));
+      String relayUrl = readIrohBytesOpt(addrSeg.asSlice(16, 16));
+      java.util.List<String> directAddresses = readIrohBytesList(addrSeg.asSlice(32, 16));
+
+      return new NodeAddr(endpointId, relayUrl, directAddresses);
     }
-
-    String endpointId = readIrohBytes(addrSeg.asSlice(0, 16));
-    String relayUrl = readIrohBytesOpt(addrSeg.asSlice(16, 16));
-    java.util.List<String> directAddresses = readIrohBytesList(addrSeg.asSlice(32, 16));
-
-    return new NodeAddr(endpointId, relayUrl, directAddresses);
   }
 
   private String readIrohBytes(MemorySegment seg) {
@@ -161,46 +164,47 @@ public class IrohEndpoint extends IrohHandle {
    */
   public CompletableFuture<IrohConnection> connectAsync(String nodeIdHex, String alpn) {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
 
-    // Build aster_connect_config_t via ConnectionConfig builder
-    var configSeg = new ConnectionConfig().nodeId(nodeIdHex).alpn(alpn).toNative(alloc);
+      // Build aster_connect_config_t via ConnectionConfig builder
+      var configSeg = new ConnectionConfig().nodeId(nodeIdHex).alpn(alpn).toNative(alloc);
 
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+      var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    var connect =
-        lib.getHandle(
-            "aster_connect",
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_INT,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS));
+      var connect =
+          lib.getHandle(
+              "aster_connect",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS));
 
-    try {
-      int status =
-          (int) connect.invoke(runtime.nativeHandle(), nativeHandle(), configSeg, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "aster_connect failed: " + status);
+      try {
+        int status =
+            (int) connect.invoke(runtime.nativeHandle(), nativeHandle(), configSeg, 0L, opSeg);
+        if (status != 0) {
+          throw new IrohException(IrohStatus.fromCode(status), "aster_connect failed: " + status);
+        }
+      } catch (Throwable t) {
+        throw new IrohException("aster_connect threw: " + t.getMessage());
       }
-    } catch (Throwable t) {
-      throw new IrohException("aster_connect threw: " + t.getMessage());
-    }
 
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime
-        .registry()
-        .register(opId)
-        .thenApply(
-            event -> {
-              if (event.kind() == IrohEventKind.CONNECTED) {
-                return new IrohConnection(runtime, event.handle());
-              }
-              throw new IrohException("connect failed: unexpected event " + event.kind());
-            });
+      long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+      return runtime
+          .registry()
+          .register(opId)
+          .thenApply(
+              event -> {
+                if (event.kind() == IrohEventKind.CONNECTED) {
+                  return new IrohConnection(runtime, event.handle());
+                }
+                throw new IrohException("connect failed: unexpected event " + event.kind());
+              });
+    }
   }
 
   /**
@@ -212,54 +216,55 @@ public class IrohEndpoint extends IrohHandle {
    */
   public CompletableFuture<IrohConnection> connectNodeAddrAsync(NodeAddr addr, String alpn) {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
 
-    // Build aster_node_addr_t from the NodeAddr
-    MemorySegment addrSeg = addr.toNative(alloc);
+      // Build aster_node_addr_t from the NodeAddr
+      MemorySegment addrSeg = addr.toNative(alloc);
 
-    // Build aster_connect_config_t with the addr field set to point to addrSeg
-    var configSeg =
-        new ConnectionConfig()
-            .nodeId(addr.endpointId())
-            .alpn(alpn)
-            .addr(addrSeg.address())
-            .toNative(alloc);
+      // Build aster_connect_config_t with the addr field set to point to addrSeg
+      var configSeg =
+          new ConnectionConfig()
+              .nodeId(addr.endpointId())
+              .alpn(alpn)
+              .addr(addrSeg.address())
+              .toNative(alloc);
 
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+      var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    var connect =
-        lib.getHandle(
-            "aster_connect",
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_INT,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS));
+      var connect =
+          lib.getHandle(
+              "aster_connect",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS));
 
-    try {
-      int status =
-          (int) connect.invoke(runtime.nativeHandle(), nativeHandle(), configSeg, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "aster_connect failed: " + status);
+      try {
+        int status =
+            (int) connect.invoke(runtime.nativeHandle(), nativeHandle(), configSeg, 0L, opSeg);
+        if (status != 0) {
+          throw new IrohException(IrohStatus.fromCode(status), "aster_connect failed: " + status);
+        }
+      } catch (Throwable t) {
+        throw new IrohException("aster_connect threw: " + t.getMessage());
       }
-    } catch (Throwable t) {
-      throw new IrohException("aster_connect threw: " + t.getMessage());
-    }
 
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime
-        .registry()
-        .register(opId)
-        .thenApply(
-            event -> {
-              if (event.kind() == IrohEventKind.CONNECTED) {
-                return new IrohConnection(runtime, event.handle());
-              }
-              throw new IrohException("connect failed: unexpected event " + event.kind());
-            });
+      long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+      return runtime
+          .registry()
+          .register(opId)
+          .thenApply(
+              event -> {
+                if (event.kind() == IrohEventKind.CONNECTED) {
+                  return new IrohConnection(runtime, event.handle());
+                }
+                throw new IrohException("connect failed: unexpected event " + event.kind());
+              });
+    }
   }
 
   /**
@@ -269,41 +274,42 @@ public class IrohEndpoint extends IrohHandle {
    */
   public CompletableFuture<IrohConnection> acceptAsync() {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
+      var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    var accept =
-        lib.getHandle(
-            "aster_accept",
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_INT,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS));
+      var accept =
+          lib.getHandle(
+              "aster_accept",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS));
 
-    try {
-      // runtime, endpoint, user_data, out_operation
-      int status = (int) accept.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "aster_accept failed: " + status);
+      try {
+        // runtime, endpoint, user_data, out_operation
+        int status = (int) accept.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
+        if (status != 0) {
+          throw new IrohException(IrohStatus.fromCode(status), "aster_accept failed: " + status);
+        }
+      } catch (Throwable t) {
+        throw new IrohException("aster_accept threw: " + t.getMessage());
       }
-    } catch (Throwable t) {
-      throw new IrohException("aster_accept threw: " + t.getMessage());
-    }
 
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime
-        .registry()
-        .register(opId)
-        .thenApply(
-            event -> {
-              if (event.kind() == IrohEventKind.CONNECTION_ACCEPTED) {
-                return new IrohConnection(runtime, event.handle());
-              }
-              throw new IrohException("accept failed: unexpected event " + event.kind());
-            });
+      long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+      return runtime
+          .registry()
+          .register(opId)
+          .thenApply(
+              event -> {
+                if (event.kind() == IrohEventKind.CONNECTION_ACCEPTED) {
+                  return new IrohConnection(runtime, event.handle());
+                }
+                throw new IrohException("accept failed: unexpected event " + event.kind());
+              });
+    }
   }
 
   /**
@@ -311,34 +317,48 @@ public class IrohEndpoint extends IrohHandle {
    *
    * @return a future that completes when the endpoint is closed
    */
-  public CompletableFuture<Void> closeAsync() {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    var endpointClose =
-        lib.getHandle(
-            "aster_node_close",
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_INT,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS));
-
+  public synchronized CompletableFuture<Void> closeAsync() {
+    if (closeFuture != null) return closeFuture.copy();
+    claimClose();
     try {
-      // runtime, endpoint, user_data, out_operation
-      int status = (int) endpointClose.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "aster_node_close failed: " + status);
-      }
-    } catch (Throwable t) {
-      throw new IrohException("aster_node_close threw: " + t.getMessage());
+      closeFuture = submitClose();
+    } catch (Throwable error) {
+      closeFuture = CompletableFuture.failedFuture(error);
     }
+    // Caller cancellation/completion must not replace the owned native shutdown outcome.
+    return closeFuture.copy();
+  }
 
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime.registry().register(opId).thenApply(e -> null);
+  private CompletableFuture<Void> submitClose() {
+    var lib = IrohLibrary.getInstance();
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
+      var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+
+      var endpointClose =
+          lib.getHandle(
+              "aster_node_close",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS));
+
+      try {
+        // runtime, endpoint, user_data, out_operation
+        int status = (int) endpointClose.invoke(runtime.nativeHandle(), nativeHandle(), 0L, opSeg);
+        if (status != 0) {
+          throw new IrohException(
+              IrohStatus.fromCode(status), "aster_node_close failed: " + status);
+        }
+      } catch (Throwable t) {
+        throw new IrohException("aster_node_close threw: " + t.getMessage());
+      }
+
+      long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+      return runtime.registry().register(opId).thenApply(e -> null);
+    }
   }
 
   /** Synchronously close this endpoint. Blocks until closed. */
@@ -362,40 +382,42 @@ public class IrohEndpoint extends IrohHandle {
    */
   public byte[] exportSecretKey() {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
 
-    // Secret key is always 32 bytes
-    var bufSeg = alloc.allocate(32);
-    var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+      // Secret key is always 32 bytes
+      var bufSeg = alloc.allocate(32);
+      var lenSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    var exportSecretKey =
-        lib.getHandle(
-            "aster_node_export_secret_key",
-            FunctionDescriptor.of(
-                ValueLayout.JAVA_INT,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS,
-                ValueLayout.JAVA_LONG,
-                ValueLayout.ADDRESS));
+      var exportSecretKey =
+          lib.getHandle(
+              "aster_node_export_secret_key",
+              FunctionDescriptor.of(
+                  ValueLayout.JAVA_INT,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS,
+                  ValueLayout.JAVA_LONG,
+                  ValueLayout.ADDRESS));
 
-    try {
-      int status =
-          (int) exportSecretKey.invoke(runtime.nativeHandle(), nativeHandle(), bufSeg, 32L, lenSeg);
-      if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_node_export_secret_key failed: " + status);
+      try {
+        int status =
+            (int)
+                exportSecretKey.invoke(runtime.nativeHandle(), nativeHandle(), bufSeg, 32L, lenSeg);
+        if (status != 0) {
+          throw new IrohException(
+              IrohStatus.fromCode(status), "aster_node_export_secret_key failed: " + status);
+        }
+      } catch (Throwable t) {
+        throw new IrohException("aster_node_export_secret_key threw: " + t.getMessage());
       }
-    } catch (Throwable t) {
-      throw new IrohException("aster_node_export_secret_key threw: " + t.getMessage());
-    }
 
-    int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
-    if (len == 0) {
-      return new byte[0];
-    }
+      int len = (int) lenSeg.get(ValueLayout.JAVA_LONG, 0);
+      if (len == 0) {
+        return new byte[0];
+      }
 
-    return bufSeg.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
+      return bufSeg.asSlice(0, len).toArray(ValueLayout.JAVA_BYTE);
+    }
   }
 }

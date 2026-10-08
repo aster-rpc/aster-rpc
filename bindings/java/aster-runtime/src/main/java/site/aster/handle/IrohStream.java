@@ -228,44 +228,48 @@ public class IrohStream implements AutoCloseable {
    */
   public CompletableFuture<Void> sendAsync(byte[] payload) {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
 
-    long messageId = nextMessageId.incrementAndGet();
+      long messageId = nextMessageId.incrementAndGet();
 
-    // Track by message_id so the SEND_COMPLETED handler can complete it. The message id is ours, so
-    // the future must be in place *before* the native write starts: a fast write can have its
-    // SEND_COMPLETED polled before this method returns, and an unregistered completion is dropped.
-    // Note: We do NOT register with registry - SEND_COMPLETED goes to inbound handlers
-    // via pendingSends, not to registry.complete().
-    CompletableFuture<Void> sendFuture = new CompletableFuture<>();
-    pendingSends.put(messageId, sendFuture);
+      // Track by message_id so the SEND_COMPLETED handler can complete it. The message id is ours,
+      // so
+      // the future must be in place *before* the native write starts: a fast write can have its
+      // SEND_COMPLETED polled before this method returns, and an unregistered completion is
+      // dropped.
+      // Note: We do NOT register with registry - SEND_COMPLETED goes to inbound handlers
+      // via pendingSends, not to registry.complete().
+      CompletableFuture<Void> sendFuture = new CompletableFuture<>();
+      pendingSends.put(messageId, sendFuture);
 
-    // Build aster_bytes_t payload struct inline
-    var payloadSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
-    var payloadCopy = alloc.allocate(payload.length);
-    payloadCopy.copyFrom(MemorySegment.ofArray(payload));
-    payloadSeg.set(ValueLayout.ADDRESS, 0, payloadCopy);
-    payloadSeg.set(ValueLayout.JAVA_LONG, 8, (long) payload.length);
+      // Build aster_bytes_t payload struct inline
+      var payloadSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
+      var payloadCopy = alloc.allocate(payload.length);
+      payloadCopy.copyFrom(MemorySegment.ofArray(payload));
+      payloadSeg.set(ValueLayout.ADDRESS, 0, payloadCopy);
+      payloadSeg.set(ValueLayout.JAVA_LONG, 8, (long) payload.length);
 
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+      var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    try {
-      // runtime, send_stream, data (aster_bytes_t), user_data, out_operation
-      int status =
-          (int)
-              streamWrite.invoke(runtime.nativeHandle(), sendHandle, payloadSeg, messageId, opSeg);
-      if (status != 0) {
+      try {
+        // runtime, send_stream, data (aster_bytes_t), user_data, out_operation
+        int status =
+            (int)
+                streamWrite.invoke(
+                    runtime.nativeHandle(), sendHandle, payloadSeg, messageId, opSeg);
+        if (status != 0) {
+          pendingSends.remove(messageId);
+          throw new IrohException(
+              IrohStatus.fromCode(status), "aster_stream_write failed: " + status);
+        }
+      } catch (Throwable t) {
         pendingSends.remove(messageId);
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_stream_write failed: " + status);
+        throw new IrohException("aster_stream_write threw: " + t.getMessage());
       }
-    } catch (Throwable t) {
-      pendingSends.remove(messageId);
-      throw new IrohException("aster_stream_write threw: " + t.getMessage());
-    }
 
-    return sendFuture;
+      return sendFuture;
+    }
   }
 
   /**
@@ -275,22 +279,23 @@ public class IrohStream implements AutoCloseable {
    */
   public CompletableFuture<Void> finishAsync() {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
+      var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    try {
-      int status = (int) streamFinish.invoke(runtime.nativeHandle(), sendHandle, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_stream_finish failed: " + status);
+      try {
+        int status = (int) streamFinish.invoke(runtime.nativeHandle(), sendHandle, 0L, opSeg);
+        if (status != 0) {
+          throw new IrohException(
+              IrohStatus.fromCode(status), "aster_stream_finish failed: " + status);
+        }
+      } catch (Throwable t) {
+        throw new IrohException("aster_stream_finish threw: " + t.getMessage());
       }
-    } catch (Throwable t) {
-      throw new IrohException("aster_stream_finish threw: " + t.getMessage());
-    }
 
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime.registry().register(opId).thenApply(e -> null);
+      long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+      return runtime.registry().register(opId).thenApply(e -> null);
+    }
   }
 
   /**
@@ -317,35 +322,38 @@ public class IrohStream implements AutoCloseable {
    */
   public CompletableFuture<byte[]> readAsync(long maxLen) {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
+      var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    try {
-      int status = (int) streamRead.invoke(runtime.nativeHandle(), sendHandle, maxLen, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "aster_stream_read failed: " + status);
+      try {
+        int status = (int) streamRead.invoke(runtime.nativeHandle(), sendHandle, maxLen, 0L, opSeg);
+        if (status != 0) {
+          throw new IrohException(
+              IrohStatus.fromCode(status), "aster_stream_read failed: " + status);
+        }
+      } catch (Throwable t) {
+        throw new IrohException("aster_stream_read threw: " + t.getMessage());
       }
-    } catch (Throwable t) {
-      throw new IrohException("aster_stream_read threw: " + t.getMessage());
-    }
 
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    CompletableFuture<byte[]> readFuture = new CompletableFuture<>();
-    runtime.registry().register(opId);
-    // Track so FRAME_RECEIVED handler can complete this future with the frame bytes. The frame may
-    // already have been polled (a fast read, or this thread descheduled): claim it if so.
-    byte[] early;
-    synchronized (readLock) {
-      early = earlyFrames.remove(opId);
-      if (early == null) {
-        pendingReads.put(opId, readFuture);
+      long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+      CompletableFuture<byte[]> readFuture = new CompletableFuture<>();
+      runtime.registry().register(opId);
+      // Track so FRAME_RECEIVED handler can complete this future with the frame bytes. The frame
+      // may
+      // already have been polled (a fast read, or this thread descheduled): claim it if so.
+      byte[] early;
+      synchronized (readLock) {
+        early = earlyFrames.remove(opId);
+        if (early == null) {
+          pendingReads.put(opId, readFuture);
+        }
       }
+      if (early != null) {
+        readFuture.complete(early);
+      }
+      return readFuture;
     }
-    if (early != null) {
-      readFuture.complete(early);
-    }
-    return readFuture;
   }
 
   /**
@@ -361,37 +369,38 @@ public class IrohStream implements AutoCloseable {
    */
   public CompletableFuture<byte[]> readToEndAsync(long maxSize) {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+    try (Arena confined = Arena.ofConfined()) {
+      var alloc = confined;
+      var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
 
-    try {
-      int status =
-          (int) streamReadToEnd.invoke(runtime.nativeHandle(), recvHandle, maxSize, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_stream_read_to_end failed: " + status);
+      try {
+        int status =
+            (int) streamReadToEnd.invoke(runtime.nativeHandle(), recvHandle, maxSize, 0L, opSeg);
+        if (status != 0) {
+          throw new IrohException(
+              IrohStatus.fromCode(status), "aster_stream_read_to_end failed: " + status);
+        }
+      } catch (Throwable t) {
+        throw new IrohException("aster_stream_read_to_end threw: " + t.getMessage());
       }
-    } catch (Throwable t) {
-      throw new IrohException("aster_stream_read_to_end threw: " + t.getMessage());
-    }
 
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime
-        .registry()
-        .register(opId)
-        .thenApply(
-            event -> {
-              if (event.dataLen() <= 0) {
-                return new byte[0];
-              }
-              byte[] bytes =
-                  event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE);
-              if (event.hasBuffer()) {
-                runtime.releaseBuffer(event.buffer());
-              }
-              return bytes;
-            });
+      long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
+      return runtime
+          .registry()
+          .register(opId)
+          .thenApply(
+              event -> {
+                if (event.dataLen() <= 0) {
+                  return new byte[0];
+                }
+                byte[] bytes =
+                    event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE);
+                if (event.hasBuffer()) {
+                  runtime.releaseBuffer(event.buffer());
+                }
+                return bytes;
+              });
+    }
   }
 
   /**

@@ -1,6 +1,7 @@
 package site.aster.handle;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -39,5 +40,21 @@ final class NodeEndpointTest {
       epB.closeAsync().get(20, TimeUnit.SECONDS);
       epA.closeAsync().get(20, TimeUnit.SECONDS);
     }
+  }
+
+  @Test
+  void explicitEndpointCloseReportsClosedState() throws Exception {
+    IrohNode node =
+        IrohNode.memoryWithAlpns(List.of(ALPN.getBytes(StandardCharsets.UTF_8)))
+            .get(20, TimeUnit.SECONDS);
+    IrohEndpoint endpoint = IrohEndpoint.ofNode(node.runtime(), node.nodeHandle());
+    var closing = endpoint.closeAsync();
+    var joined = endpoint.closeAsync();
+    assertNotSame(closing, joined);
+    closing.cancel(false);
+    joined.get(20, TimeUnit.SECONDS);
+    endpoint.close();
+    endpoint.closeAsync().get(20, TimeUnit.SECONDS);
+    assertTrue(endpoint.isClosed(), "explicit endpoint close must update inherited state");
   }
 }

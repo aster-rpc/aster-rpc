@@ -1,41 +1,49 @@
 package site.aster.handle;
 
 import java.lang.ref.Cleaner;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongConsumer;
 
 /**
- * Base for all Aster handle types.
+ * Base for Aster native handles. Explicit close attempts native release exactly once.
  *
- * <p>Wraps a native {@code uint64_t} handle. Subclasses must implement {@link #freeNative(long)} to
- * call the correct typed FFI free function. The {@link Cleaner} is used as a backstop if {@link
- * #close()} is not called before the Java object is GC'd.
+ * <p>Subclasses with synchronous cleanup may supply a detached action to the two-argument
+ * constructor for a Cleaner backstop. The action must not capture this handle (directly or
+ * indirectly). The original one-argument constructor requires explicit close; asynchronous
+ * resources cannot be released by the Cleaner.
  */
 public abstract class IrohHandle implements AutoCloseable {
-
-  private static final AtomicLong nextId = new AtomicLong(1);
   private static final Cleaner CLEANER = Cleaner.create();
-
   protected final long handle;
-  private final long resourceId;
-  private volatile boolean closed = false;
+  private final AtomicBoolean closed = new AtomicBoolean();
+  private final Cleaner.Cleanable cleanable;
 
   protected IrohHandle(long handle) {
-    this.handle = handle;
-    this.resourceId = nextId.incrementAndGet();
-    CLEANER.register(this, new Cleanup(handle, freeNativeKind()));
+    this(handle, null);
   }
 
-  /** FFI function name to free this handle type (e.g. {@code "aster_node_free"}). */
+  protected IrohHandle(long handle, LongConsumer detachedCleanup) {
+    this.handle = handle;
+    cleanable =
+        detachedCleanup == null
+            ? null
+            : CLEANER.register(this, new Cleanup(handle, closed, detachedCleanup));
+  }
+
+  /** FFI function name identifying this native handle type. */
   protected abstract String freeNativeKind();
 
-  /** Called by the Cleaner (or explicitly) to free the native handle. */
+  /** Explicit native release. Cleaner cleanup uses the separately supplied detached action. */
   protected abstract void freeNative(long handle);
 
   @Override
   public void close() {
-    if (!closed) {
-      closed = true;
-      freeNative(handle);
+    if (claimClose()) {
+      try {
+        freeNative(handle);
+      } finally {
+        if (cleanable != null) cleanable.clean();
+      }
     }
   }
 
@@ -43,19 +51,29 @@ public abstract class IrohHandle implements AutoCloseable {
     return handle;
   }
 
+  /** Claim the first explicit close attempt for asynchronous subclasses. */
+  protected final boolean claimClose() {
+    return closed.compareAndSet(false, true);
+  }
+
   public boolean isClosed() {
-    return closed;
+    return closed.get();
   }
 
   protected void checkNotClosed() {
-    if (closed) {
-      throw new IllegalStateException("handle already closed");
-    }
+    if (closed.get()) throw new IllegalStateException("handle already closed");
   }
 
-  private record Cleanup(long handle, String kind) implements Runnable {
+  private record Cleanup(long handle, AtomicBoolean closed, LongConsumer release)
+      implements Runnable {
     public void run() {
-      System.err.println("IrohHandle: " + kind + " handle " + handle + " freed by Cleaner");
+      if (closed.compareAndSet(false, true)) {
+        try {
+          release.accept(handle);
+        } catch (Throwable error) {
+          System.err.println("IrohHandle cleanup failed: " + error.getMessage());
+        }
+      }
     }
   }
 }
