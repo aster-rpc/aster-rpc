@@ -222,8 +222,14 @@ class ServiceClient:
             return
         if timeout <= 0:
             raise RpcError.from_status(4, "deadline exceeded")
-        async with timeouts(timeout):
-            await time_sleep(delay)
+        try:
+            async with timeouts(timeout):
+                await time_sleep(delay)
+        except TimeoutError as exc:
+            # Backoff runs from the retry handler, outside the attempt's error
+            # normalization. Expose the same RPC status as invocation expiry;
+            # caller cancellation remains a CancelledError.
+            raise normalize_error(exc) from exc
 
     async def _call_unary(
         self,

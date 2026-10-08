@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
+import aster.client as client_module
+import aster.interceptors.base as context_module
+import aster.interceptors.deadline as deadline_module
 
 from aster.client import create_client, create_local_client
 from aster.codec import ForyCodec, wire_type
@@ -103,6 +108,145 @@ class TestPhase7Interceptors:
         response = await client.echo(EchoRequest("retry"))
         assert response.message == "ok"
         assert attempts["count"] == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enforce_deadline", [True, False])
+    async def test_retry_deadline_budget_and_healthy_follow_up(self, monkeypatch, enforce_deadline):
+        # Pure policy control: no native/network work or wall-clock sleeps.
+        # The adapters observe the client's requested remaining timeout; they
+        # never compute the retry policy or the invocation's absolute deadline.
+        now = [1000.0]
+        active_timeouts = []
+        timeout_budgets = []
+        requested_sleeps = []
+        attempts = []
+
+        def advance(seconds):
+            if active_timeouts and now[0] + seconds >= active_timeouts[-1]:
+                now[0] = active_timeouts[-1]
+                raise TimeoutError("controlled timeout expired")
+            now[0] += seconds
+
+        @asynccontextmanager
+        async def controlled_timeout(seconds):
+            timeout_budgets.append(seconds)
+            active_timeouts.append(now[0] + seconds)
+            try:
+                yield
+            finally:
+                active_timeouts.pop()
+
+        async def controlled_sleep(seconds):
+            requested_sleeps.append(seconds)
+            advance(seconds)
+
+        clock = SimpleNamespace(time=lambda: now[0])
+        monkeypatch.setattr(context_module, "time", clock)
+        monkeypatch.setattr(deadline_module, "time", clock)
+        monkeypatch.setattr(client_module, "timeouts", controlled_timeout)
+        monkeypatch.setattr(client_module, "time_sleep", controlled_sleep)
+
+        class TransientTransport:
+            async def unary(self, *args, **kwargs):
+                request = kwargs["request"]
+                attempts.append((request.message, kwargs["deadline_secs"]))
+                if request.message == "healthy":
+                    return EchoResponse(message="healthy")
+                advance(0.2)
+                if sum(name == "transient" for name, _ in attempts) < 3:
+                    raise RpcError(StatusCode.UNAVAILABLE, "transient failure")
+                return EchoResponse(message="recovered")
+
+            async def close(self):
+                return None
+
+        policy = RetryPolicy(max_attempts=3)
+        policy.backoff.initial_ms = 400
+        policy.backoff.max_ms = 400
+        policy.backoff.jitter = 0
+        interceptors = [RetryInterceptor(policy)]
+        if enforce_deadline:
+            interceptors.insert(0, DeadlineInterceptor())
+        client = create_client(InterceptorService, transport=TransientTransport(), interceptors=interceptors)
+        try:
+            if enforce_deadline:
+                with pytest.raises(RpcError) as failure:
+                    await client.echo(EchoRequest("transient"), timeout=1)
+                assert failure.value.code == StatusCode.DEADLINE_EXCEEDED
+                assert attempts == [("transient", 1)] * 2
+                assert timeout_budgets == pytest.approx([1.0, 0.8, 0.4, 0.2])
+                assert now[0] == pytest.approx(1001.0)
+            else:
+                assert (await client.echo(EchoRequest("transient"), timeout=1)).message == "recovered"
+                # With no DeadlineInterceptor, each attempt retains the native
+                # relative timeout; no overall invocation/backoff timer exists.
+                assert attempts == [("transient", 1)] * 3
+                assert timeout_budgets == []
+                assert now[0] == pytest.approx(1001.4)
+            assert requested_sleeps == [0.4, 0.4]
+            assert active_timeouts == []
+
+            assert (await client.echo(EchoRequest("healthy"), timeout=1)).message == "healthy"
+            assert attempts[-1] == ("healthy", 1)
+            if enforce_deadline:
+                assert timeout_budgets[-1] == pytest.approx(1.0)
+            assert active_timeouts == []
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_backoff_actual_timeout_is_rpc_deadline_and_recovers(self):
+        policy = RetryPolicy(max_attempts=3)
+        policy.backoff.initial_ms = 400
+        policy.backoff.max_ms = 800
+        policy.backoff.multiplier = 2
+        policy.backoff.jitter = 0
+        script = [
+            RpcError(StatusCode.UNAVAILABLE, "first attempt"),
+            RpcError(StatusCode.UNAVAILABLE, "second attempt"),
+            "healthy",
+        ]
+        client = self._scripted_client(script, [DeadlineInterceptor(), RetryInterceptor(policy)])
+        try:
+            with pytest.raises(RpcError) as failure:
+                await client.echo(EchoRequest("retry"), timeout=1)
+            assert failure.value.code == StatusCode.DEADLINE_EXCEEDED
+            assert isinstance(failure.value.__cause__, TimeoutError)
+            # The third attempt never starts after the budget expires.
+            assert script == ["healthy"]
+            assert (await client.echo(EchoRequest("healthy"), timeout=1)).message == "healthy"
+            assert script == []
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_backoff_caller_cancellation_remains_cancelled(self, monkeypatch):
+        policy = RetryPolicy(max_attempts=3)
+        policy.backoff.initial_ms = policy.backoff.max_ms = 10000
+        policy.backoff.jitter = 0
+        sleeping = asyncio.Event()
+        original_sleep = client_module.time_sleep
+
+        async def observed_sleep(delay):
+            sleeping.set()
+            await original_sleep(delay)
+
+        monkeypatch.setattr(client_module, "time_sleep", observed_sleep)
+        script = [RpcError(StatusCode.UNAVAILABLE, "first attempt"), "healthy"]
+        client = self._scripted_client(script, [DeadlineInterceptor(), RetryInterceptor(policy)])
+        call = asyncio.ensure_future(client.echo(EchoRequest("retry"), timeout=20))
+        try:
+            await asyncio.wait_for(sleeping.wait(), timeout=2)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            assert script == ["healthy"]
+            assert (await client.echo(EchoRequest("healthy"), timeout=1)).message == "healthy"
+        finally:
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+            await client.close()
 
     @pytest.mark.asyncio
     async def test_circuit_breaker_state_transitions(self):
