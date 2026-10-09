@@ -45,7 +45,7 @@ The runnable reference for everything below is
 
 ---
 
-## 2. The fastest path — `AsterServer::with_http`
+## 2. Serve with `AsterServer::with_http`
 
 Register your services once; serve them over Iroh **and** HTTPS from one builder.
 
@@ -74,11 +74,11 @@ srv.run().await;                               // serves until shutdown
 # }
 ```
 
-That's it: `POST https://host/aster/<Service>/<method>` now reaches the same
+`POST https://host/aster/<Service>/<method>` now reaches the same
 services as Iroh. `with_http` is **off by default** — without it you get an
 Iroh-only node, exactly as before.
 
-### Low-level composition (own your own Salvo app)
+### Compose a Salvo application
 
 When you run other servers in the same process (your own routes, a separate
 listener), grab the shared dispatcher and compose Salvo yourself:
@@ -137,9 +137,8 @@ self-signed (ACME is H1/H2 today). For PEM/self-signed you can also build a
 
 ## 4. Canonical Aster-over-HTTP (`application/aster-frames`)
 
-This is *real* Aster RPC over HTTP — same Fory payloads, same frame envelope and
-status trailer as Iroh, full transport parity. The body is length-prefixed Aster
-frames; SDK clients use it directly. Each call:
+Canonical HTTP RPC uses the same Fory payloads, frame envelope and status
+trailer as Iroh. The body contains length-prefixed Aster frames. Each call:
 
 ```
 POST /aster/<Service>/<method>
@@ -147,8 +146,8 @@ content-type: application/aster-frames
 <aster frames>            →    <response frames><status trailer>
 ```
 
-All four call patterns work (unary, server-stream, client-stream, bidi). Nothing
-to configure — `router(dispatcher)` serves it.
+`router(dispatcher)` serves unary, server-stream, client-stream and bidi calls.
+HTTP request bodies are buffered; see the limits below.
 
 ---
 
@@ -239,7 +238,7 @@ scheduling (supersession, drop-stale) stays in your app.
 ### Browser cert pinning (`serverCertificateHashes`)
 
 A browser can connect to a self-signed WebTransport server *without* a CA by
-pinning the cert's SHA-256 — perfect for mesh/dev. `generate_webtransport_cert`
+pinning the cert's SHA-256. `generate_webtransport_cert`
 produces a WT-valid cert (ECDSA, ≤14 days, CN bound to your node id) and its hash:
 
 ```rust
@@ -397,7 +396,7 @@ is unchanged.
 
 ---
 
-## 11. What's supported / not yet
+## 11. Current support
 
 **Supported:** HTTPS (H1/H2/H3) + WebTransport, TLS (PEM / ACME / self-signed +
 WebTransport `serverCertificateHashes`), browser JSON/NDJSON projections,

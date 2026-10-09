@@ -1,16 +1,18 @@
-# Aster Go FFI Bindings
+# Aster Go FFI bindings
 
-**Package:** `github.com/aster-rpc/aster-go`
+**Module path:** `github.com/aster-rpc/aster-go`
+
+This guide uses `bindings/go` in a source checkout. Public Go module availability
+is pending; the module path alone is not a working public installation source.
 **Target:** Go 1.25+ (Fory Go 1.7.6 requires it)
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Status (ABI 4.4: upcalls, leases, expose, streaming relay, coordination; 2026-10-04)
+## Preview status (ABI 4.9 minimum)
 
-**Working at RPC parity for open-gate interop.** Go is in the `tests/interop/`
-matrix (Rust / Python / TypeScript / Java / .NET / Go, 6×6 = 36/36, identical
-`InteropEcho` contract id `c5aa690b…`). The binding refuses a native library
-whose ABI major differs (4).
+Go participates in the six-language `tests/interop/` matrix with Rust, Python,
+TypeScript, Java and .NET. The binding requires native ABI 4.9 or newer within
+major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview release.
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
   safe for concurrent use (a pool of Fory instances, no global lock). Payload types implement `aster.WireTyped`
@@ -61,7 +63,7 @@ whose ABI major differs (4).
   bridge, Prometheus renderer) lives in Rust; the binding starts it and wraps the
   rest. `InitObservability(ObservabilityConfig{...})` (before the first server;
   otherwise `StartServer` / `StartHealth` run the implicit environment-only
-  start) and `ShutdownObservability`. Floor: the library must be ABI 4.6 or newer
+  start) and `ShutdownObservability`. Floor: the binding requires ABI 4.9 or newer
   (`ABIMinorRequired`, checked by `CheckABI` / `NewRuntime`).
   - *Logs:* Rust `tracing` events reach `log/slog`. One goroutine on a locked OS
     thread polls `aster_log_poll`; `SetLogger(*slog.Logger)` picks the
@@ -190,8 +192,8 @@ whose ABI major differs (4).
   `Finish` / `Abort`, `*BodyError` with `ErrBody*` sentinels). Consumer side:
   `Connection.RelayRequest` / `RelayHTTP` (buffered) and `RequestRoute`. Close
   the upcall table before the runtime, and `Unexpose` services that must stop
-  before closing the registry. The `ExposeInfo` / handler behaviour follows
-  `docs/_internal/bindings/upcall-design.md` section 6.
+  before closing the registry. `ExposeInfoFrom(ctx)` identifies the authenticated
+  peer for each request.
 
 - **ABI 4.3 streaming consumer relay** (`relay_stream.go`):
   `Connection.RelayStream(ctx, RelayStreamRequest{ServiceID, Method, URI,
@@ -229,14 +231,6 @@ whose ABI major differs (4).
   (`cargo build -p aster-transport-napi --features coordination-fixture --bin
   aster-coordination-fixture`, or `ASTER_COORDINATION_FIXTURE`); without it they
   skip.
-
-Fixed in the catch-up: completions that arrived before their operation was
-registered were dropped (calls could hang); `ReadDatagram` rejected the
-`DATAGRAM_RECEIVED` completion; ticket encode/decode and the canonical/contract
-helpers panicked on empty input and used fixed buffers; the hand-rolled ticket
-JSON parser mis-read `null`; the two blob-collection tests built invalid JSON /
-expected no error for invalid JSON; status 13 (`VERIFICATION_FAILED`) was
-unnamed; `Node` had no `Docs()`.
 
 Known gaps:
 
@@ -280,7 +274,7 @@ ABI bump run `go test -a ...` once (a stale header shows up as
 The interop leg lives in `tests/interop/go/` (its own module, `replace`d onto
 this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 
-## Source Files
+## Source files
 
 | File | Purpose |
 |------|---------|
@@ -317,12 +311,12 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `connection.go` | `Connection` type — bi/uni streams, datagrams |
 | `stream.go` | `SendStream` / `RecvStream` types — write/read/finish |
 | `cq_fake.go` | Goroutine-safe fake CQ for unit testing (`//go:build !cgo`) |
-| `cq_test.go` | 8 CQ state machine unit tests (`//go:build !cgo`) |
+| `cq_test.go` | CQ state machine unit tests (`//go:build !cgo`) |
 | `abi_contract_test.go` + `abi_layout.go` | ABI contract tests — header struct sizes, ABI version, status names, node-backed endpoint (`//go:build cgo`) |
-| `ucv1_test.go`, `upcall_test.go`, `expose_test.go` | UCv1 vectors, upcall / lease / fenced / topology flows, expose flows (`-race -count=20` clean) |
-| `observability_pure_test.go`, `observability_test.go` | 8 pure observability cases (also `CGO_ENABLED=0`) and 10 against the library: logs with trace ids, spans parented from dispatch, baggage, Prometheus text, health endpoints, shutdown / re-init |
-| `hostile_race_test.go` | 7 hostile race integration tests (`//go:build cgo`) |
-| `soak_test.go` | 2 soak/leak tests (`//go:build cgo`) |
+| `ucv1_test.go`, `upcall_test.go`, `expose_test.go` | UCv1 vectors, upcall / lease / fenced / topology flows, expose flows |
+| `observability_pure_test.go`, `observability_test.go` | Pure observability cases (also `CGO_ENABLED=0`) and native integration tests: logs with trace ids, spans parented from dispatch, baggage, Prometheus text, health endpoints, shutdown / re-init |
+| `hostile_race_test.go` | Hostile race integration tests (`//go:build cgo`) |
+| `soak_test.go` | Soak/leak tests (`//go:build cgo`) |
 | `rpc_test.go`, `node_test.go`, `dataplane_test.go`, `vectors_test.go` | RPC (4 patterns, errors, deadlines, gate, interceptors, QUEUE_FULL), config/node/gate/admission, data plane, conformance vectors |
 
 ## Architecture
@@ -360,7 +354,7 @@ func (r *Runtime) pollLoop() {
 }
 ```
 
-### Error Model
+### Error model
 
 All FFI calls return typed `*IrohError` errors that support `errors.Is` and `errors.As`:
 

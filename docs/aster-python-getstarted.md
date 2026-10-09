@@ -2,8 +2,7 @@
 
 The Python binding (`pip install aster-rpc`, `import aster`) wraps the Rust
 `aster` crate. Configuration, the node, and node identity are the Rust ones;
-this page covers the Python surface. Fuller RPC coverage follows with the rest
-of the binding catch-up (plan P10).
+this page covers the Python surface shipped in the 0.3 preview.
 
 ## 1. Start a node
 
@@ -77,7 +76,7 @@ settings with the source of each one and masks secrets.
 ## 3. Node identity
 
 A node's identity is its secret key. On disk, that key is a **secret key
-file**: 64 hex characters, written with mode 0600. The Rust SDK and every
+file**: 64 hex characters, written with mode 0600 on Unix. The Rust SDK and every
 binding use this same format.
 
 ```python

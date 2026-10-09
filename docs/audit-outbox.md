@@ -5,10 +5,9 @@ delivery to a receiver selected by the SDK consumer. It is separate from Aster's
 ordinary logs and OpenTelemetry exporters. Sending a diagnostic log, including
 `aster_log_emit`, does not place it in the durable outbox.
 
-Implementation status and qualification are maintained in the
-[internal design](./_internal/bindings/DURABLE_AUDIT_OUTBOX_DESIGN.md). Until its
-implementation gates pass, this guide describes the new interface rather than a
-published release capability.
+The outbox is available in the Aster 0.3.893 preview across Rust, Python,
+TypeScript, Go, Java and .NET. Its delivery guarantee depends on local storage
+surviving and the receiver implementing the acknowledgement protocol below.
 
 ## Submission and delivery
 

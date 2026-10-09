@@ -5,16 +5,15 @@ RPCs, under the reserved `aster.*` namespace, on every node regardless of
 which application runs there. This is what lets a control panel, CLI, or
 monitor dial any node and ask "who are you?" without out-of-band knowledge.
 
-Shipped today (Rust; other bindings follow with the FFI updates):
+The Rust server exposes the following baseline service:
 
 | Service | Method | Returns |
 |---|---|---|
 | `aster.ops.NodeInfo` (v1) | `describe()` (idempotent) | `aster/NodeIdentity` |
 
-> Status: Rust↔Rust, like the rest of the Rust RPC layer. The contract
-> identity (including the `aster/Value` union) is cross-binding-correct;
-> union *payload* codecs in Python/TS/Java land with the cross-binding
-> payload work.
+> The examples below use Rust. Python, TypeScript and the C ABI also expose
+> baseline NodeInfo through the shared Rust dispatcher; their configuration
+> surfaces differ from the Rust builder shown here.
 
 ---
 
@@ -125,9 +124,8 @@ AsterServer::builder()
 With the baseline service disabled and no `.service(...)` registered,
 `start()` refuses with `InvalidArgument` (nothing to serve).
 
-`NodeIdentity` is deliberately **generic identity only**: id, name, tags,
-roles, typed attributes. Domain policy — admission state, expiry, your app's
-records — belongs in your own service, which can embed `NodeIdentity` in its
+`NodeIdentity` contains id, name, tags, roles and typed attributes. Domain
+policy — admission state, expiry and application records — belongs in your own service, which can embed `NodeIdentity` in its
 own response types rather than re-declaring `node_id`.
 
 ## 3. `aster/Value` — the typed name/value primitive
@@ -151,7 +149,7 @@ assert_eq!(t.as_text(), Some("eu-west"));
 Under the hood each variant wraps a one-field message (`aster/IntValue`
 etc.) rather than a bare primitive — ContractIdentity §11.3.3 v1 admits
 only message-typed union variants, and that constraint is what keeps the
-contract identity byte-identical across all four bindings today. The `From`
+contract identity consistent across bindings. The `From`
 / `as_*` helpers mean you never touch the wrappers directly.
 
 ## 4. Defining your own union payloads
@@ -203,9 +201,7 @@ The rules (all enforced with compile errors that say so):
 A union used in a service's request/response types registers itself and its
 variant messages transitively — nothing extra to wire up.
 
-## 5. What's next
+## 5. Next steps
 
-The baseline catalog grows from here (`aster.ops.Health`, `aster.ops.Manifest`
-reflection, `aster.ops.Logs`, …) — see `docs/_internal/aster-baseline-services.md`
-for the roadmap and design rationale. Python/TS/Java/.NET surfaces for
-`NodeInfo` arrive with the binding FFI updates.
+See the [Rust getting-started guide](aster-rust-getstarted.md) for application
+services, clients and per-method authorization.

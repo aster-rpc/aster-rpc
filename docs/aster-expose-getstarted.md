@@ -15,7 +15,8 @@ buffering), so SSE, chunked transfer, and long-lived HTTP/2 all pass through.
 
 > The public edge is built on the [Salvo](https://salvo.rs) fork — it terminates
 > browser TLS (HTTP/1.1 and HTTP/2) and brings rustls + Let's Encrypt listeners.
-> HTTP/3 + WebTransport and gRPC trailers are **V2** (see the end of this guide).
+> HTTP/3 + WebTransport and gRPC trailer support are outside this edge
+> interface (see the limits at the end of this guide).
 
 A complete, runnable version of everything below is in
 [`aster-expose/examples/reverse_proxy.rs`](../aster-expose/examples/reverse_proxy.rs):
@@ -124,7 +125,7 @@ If you already run an `aster::Node`, the `expose` feature folds all of it onto
 the node — mirroring how `AsterServer::with_http` folds RPC on:
 
 ```toml
-aster = { git = "...", features = ["expose"] }   # add "expose-edge" for the edge
+aster = { version = "0.3", registry = "aster", features = ["expose"] }   # add "expose-edge" for the edge
 ```
 
 ```rust
@@ -226,7 +227,7 @@ Bindings use the same API through the `aster` crate, with concrete types only:
   `HttpBodies` handles, plus `foreign_authorize_fn` and `foreign_route_policy`
   so the admission policy and an edge's route policy can be written in the
   binding's language too. Upcall failures become `5xx`; a peer that goes away
-  cancels the upcall. Spec: `docs/_internal/bindings/upcall-design.md` §6.
+  cancels the upcall.
 - **Consumer** — `relay_request` (buffered) or `relay_request_streaming` with
   a `body_channel` body, as above.
 
@@ -335,7 +336,7 @@ EdgeConfig::new("0.0.0.0:443")
     .tls(EdgeTls::Static { cert_pem, key_pem })
 ```
 
-### Host / Origin rewrite
+### Host / origin rewrite
 
 For strict-origin backends, rewrite the outbound `Host`/`Origin` before
 relaying (off by default):
@@ -380,13 +381,11 @@ loop {
 
 ---
 
-## 7. What's V2
+## 7. Current limits
 
-These are deferred and land on the *same* Salvo stack (the edge listener swaps
-`TcpListener` → `QuinnListener`):
+The public edge currently has these limits:
 
-- **HTTP/3 + WebTransport** at the edge — WT streams map to Aster streams, WT
-  datagrams to congestion-controlled Aster datagrams.
+- **HTTP/3 + WebTransport** are not supported at the public edge.
 - **gRPC trailers** — until then, plain request/response, SSE, chunked, and
   long-lived h2 work; gRPC (which needs HTTP trailers for `grpc-status`) does
   not.
@@ -397,5 +396,5 @@ These are deferred and land on the *same* Salvo stack (the edge listener swaps
 
 ## See also
 
-- Design + rationale: [`docs/_internal/working_ideas/aster-expose-http.md`](./_internal/working_ideas/aster-expose-http.md)
+- [HTTP RPC and WebTransport guide](aster-http-getstarted.md)
 - Runnable demo: [`aster-expose/examples/reverse_proxy.rs`](../aster-expose/examples/reverse_proxy.rs)

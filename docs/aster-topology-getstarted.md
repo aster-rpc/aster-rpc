@@ -1,25 +1,20 @@
 # Topology: locality-aware swarms with `aster.net.Topology`
 
-Every Aster node can build a live picture of **where its peers are** — same
-LAN, same region, far away — and swarms can self-organise into **clusters of
-nearby nodes** with an elected **bridge** per cluster for cross-cluster work.
-No coordinator, no config file describing your network: nodes measure,
-share measurements, and every node independently derives the *same* answer.
+Aster topology records peer proximity and path quality, then derives clusters
+and bridge candidates from shared measurements. Nodes with the same shared
+records derive the same result; their views can differ while records propagate
+or expire. Bridge selection does not provide exclusive ownership.
 
-> **Status: v1 + v2 core shipped (Rust, 2026-07-04).** The local per-peer
-> view (§3) and the shared swarm — clusters, bridges, `separated()` (§4) —
-> are implemented in the Rust `aster` crate; other bindings follow the FFI
-> wave. Still to come as v2.x
-> ([design doc](_internal/aster-network-topology.md)):
-> prefix-hash L1 candidates, witness join-probing and maintenance probes
-> (today's swarm measures organically-connected peers only), and the ASN
-> hint.
+The local peer view and shared clusters, bridges and separation verdicts ship
+in Rust. Python, TypeScript and C-ABI surfaces wrap the same implementation.
+Measurements cover connected peers; discovery and probing coverage constrain
+what the view can establish.
 
 ---
 
 ## 1. What you get
 
-Three things, from cheapest to most powerful:
+The API exposes three kinds of information:
 
 1. **A proximity view of every peer** — a *locality ladder* level per peer:
 
@@ -32,18 +27,17 @@ Three things, from cheapest to most powerful:
 
 2. **Clusters** — the swarm partitions itself into groups of mutually-close
    nodes. Every node computes the same partition from the same shared
-   measurements, so "my cluster" is an agreed fact, not a local guess.
+   measurements, although views can differ until records converge.
 
 3. **A bridge per cluster** — one member, deterministically elected, that
    handles cross-cluster work (cross-region replication, fan-in
    aggregation). Every member knows whether it is the bridge without any
    election protocol running.
 
-The canonical use case: **six nodes doing file replication, three per
-region**. They self-organise into two clusters of three; members replicate
-densely inside their cluster; the two bridges replicate across regions.
-Nobody configured that layout — it was derived, and it re-derives itself
-when a node dies or a new one joins.
+For example, six replication nodes may form two clusters of three when their
+measurements support that partition. An application can replicate within each
+cluster and use bridges for cross-cluster synchronization. The partition is
+recomputed as nodes join, leave or provide new measurements.
 
 ### Producer nodes only
 
@@ -51,15 +45,12 @@ Topology is for **producer nodes** — the nodes *you* operate, admitted
 under one root identity, that work together (replication peers, edge
 services). **Consumer nodes** — nodes that merely use your swarm's
 services — never participate: they aren't admitted to the topology
-namespace, publish nothing, and never appear in a cluster. For example, in
-portal-desktop the edge service is a producer while every host is a
-consumer; in portal-sync every node under a single root identity is a
-producer (and future externally-invited sync nodes will be consumers).
+namespace, publish nothing, and never appear in a cluster.
 This is a trust boundary: topology assumes its members are your own
-semi-trusted cooperators. Steering a *consumer* to its nearest producer is
-a separate future feature, not something you get by admitting consumers.
+semi-trusted cooperators. Consumer routing should use a separate policy;
+admitting a consumer to this namespace gives it producer-level participation.
 
-## 2. The mental model
+## 2. Use proximity, quality and confidence
 
 Three separate outputs, because they answer different questions:
 
@@ -69,7 +60,7 @@ Three separate outputs, because they answer different questions:
 | Path quality | How good is the link *right now*? | Fast | Selection: which nearby peer to fetch from now |
 | Confidence | How sure are we? | With measurement | Policy: prefer the certain path over the maybe-faster one |
 
-Two rules worth internalising:
+Use these rules when selecting peers:
 
 - **Structure ignores link health.** A same-LAN peer behind a saturated
   switch is still same-LAN. Pick *candidates* by position, pick *among
@@ -79,7 +70,7 @@ Two rules worth internalising:
   pair close, and LAN status requires a verified private-path dial. Claims
   (subnets, ASNs) only generate candidates to check.
 
-## 3. Reading your node's view (v1 — shipped in Rust)
+## 3. Read the local peer view
 
 One prerequisite: start the node with monitoring enabled. From there the
 view is fed passively by connections your node already makes (RPC,
@@ -144,7 +135,7 @@ addresses (those stay in-process only).
 In v1 the view covers **peers you've actually connected to**. Ranking
 never-contacted peers arrives with v2's shared measurements.
 
-## 4. Clusters and bridges (v2 — shipped in Rust)
+## 4. Derive shared clusters and bridges
 
 v2 adds a shared **topology document** (an iroh-docs namespace) where every
 producer publishes its measurements, and from which every producer
@@ -231,9 +222,9 @@ so operators can inspect a producer's derived view remotely.
 
 Two practical notes:
 
-- **Timing knobs**: production defaults (60s heartbeat, 2min edge hold,
-  5min liveness) come from the design doc; `TopologySwarmOptions.timing`
-  overrides them (tests run with sub-second refresh).
+- **Timing knobs**: defaults are a 60 s heartbeat, 2 min edge hold and
+  5 min liveness TTL. Set heartbeat cadence with `position_refresh` and
+  reader timing with `TopologySwarmOptions.timing` (tests run with sub-second refresh).
 - **Custom admission**: `TopologySwarmOptions.admitted` installs a
   read-time filter over record authors. Without it, every holder of the
   namespace secret counts — which is already admission-gated by how you
@@ -279,8 +270,7 @@ subnet layout.
 
 ## 6. Tuning
 
-Defaults are chosen for "LAN vs metro vs region" distinctions and should
-just work. The knobs you're most likely to touch:
+Tune proximity and liveness for your deployment:
 
 | Knob | Default | When to change |
 |---|---|---|
@@ -288,23 +278,12 @@ just work. The knobs you're most likely to touch:
 | `liveness_ttl` | 5 min | Faster bridge failover vs more heartbeat writes |
 | `witness_r` | 3 | Larger clusters / more separation evidence |
 
-The full normative table (hysteresis bands, hold times, TTLs, coverage
-rule) lives in the
-[design doc](_internal/aster-network-topology.md#defaults-normative-config-tunable).
+The timing and coverage settings are defined by `TopoConfig` in
+`core/src/topology/cluster.rs` and exposed through `TopologySwarmOptions.timing`.
 
-## 7. Roadmap
+## 7. Next steps
 
-- **v1 — local view. Shipped (Rust).** Ladder + path quality + confidence
-  over live connections; `Node::topology()` + opt-in `aster.net.Topology`.
-  No shared state. Python/TS/Java surfaces follow the FFI wave.
-- **v2 — clusters. Core shipped (Rust).** Shared topology doc, corroborated
-  edge rules, cluster derivation, bridges/witnesses, `separated()`,
-  sealed-grant secret distribution, read-time admission filter. Remaining
-  v2.x: prefix-hash L1 candidates, witness join-probing + maintenance
-  probes, ASN hint.
-- **v3 — consumers.** Locality-aware gossip biasing, blob-fetch
-  strategies, leader-per-LAN aggregation, replica-placement policies built
-  on the view.
-
-Design rationale, trust model, and the normative wire schema:
-[`docs/_internal/aster-network-topology.md`](_internal/aster-network-topology.md).
+Use the [coordination guide](aster-coordination-getstarted.md) when placement
+needs an exclusive writer or quorum membership. The
+[Python guide](aster-python-getstarted.md) shows shared topology and admission
+filters from a binding.

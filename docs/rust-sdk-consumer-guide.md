@@ -4,7 +4,7 @@ This is the dependency and native-interop contract for Rust applications using
 Aster. Use [`docs/aster-rust-getstarted.md`](aster-rust-getstarted.md) for the
 facade APIs themselves.
 
-## The short version
+## Dependency setup
 
 - Install released Aster crates from the public `Aster` Forgejo Cargo registry.
 - Commit `Cargo.lock` in applications and deploy from it.
@@ -15,14 +15,8 @@ facade APIs themselves.
 - Add a direct dependency from the same source only when a proc macro or an
   extra Cargo feature requires one.
 
-> First-release gate: the commands below are the release contract. Do not
-> announce an Aster version until an unauthenticated request to
-> `https://forge.emrul.dev/api/packages/Aster/cargo/config.json` returns `200`
-> and unauthenticated `git ls-remote` works for every fork URL, and that exact
-> Aster plus native dependency wave is present. The native wave may be
-> bootstrapped before the first `aster` facade package. If Cargo reports that no
-> matching `aster` package exists, the Git fallback at the end is only for
-> already-authorized maintainers; that facade release is not public yet.
+The public preview is **0.3.893**. The registry is anonymously readable.
+Preview APIs may change before general availability.
 
 ## Configure Cargo once per project
 
@@ -38,27 +32,23 @@ index = "sparse+https://forge.emrul.dev/api/packages/Aster/cargo/"
 Reading released crates is anonymous. Consumers must not put a Forgejo token in
 their repository, CI variables, Cargo credentials, or dependency URLs.
 
-Then add the compatible Aster series:
+Then add the preview version:
 
 ```toml
 [dependencies]
-aster = { version = "0.3", registry = "aster" }
+aster = { version = "=0.3.893", registry = "aster" }
 ```
 
 Enable only the optional surfaces you use:
 
 ```toml
-aster = {
-  version = "0.3",
-  registry = "aster",
-  features = ["rpc", "expose-edge"]
-}
-aster-transport-salvo = { version = "0.3", registry = "aster" }
+aster = { version = "=0.3.893", registry = "aster", features = ["rpc", "expose-edge"] }
+aster-transport-salvo = { version = "=0.3.893", registry = "aster" }
 ```
 
 Applications pin the resolved release by committing `Cargo.lock`; use
-`cargo update -p aster` deliberately. A reusable library should use a compatible
-range such as `0.3` and test the lowest and newest supported releases. Aster's
+`cargo update -p aster` deliberately. Reusable libraries should choose a version range based on the releases they
+have tested; preview API compatibility is not guaranteed across releases. Aster's
 published internal requirements keep directly listed Aster crates on one
 coherent patch release.
 
@@ -86,8 +76,8 @@ code needs an extra upstream feature, add the crate directly from the **Aster
 registry** at the exact supported version so Cargo unifies it with Aster:
 
 ```toml
-iroh = { version = "=1.0.1", registry = "aster", features = ["metrics"] }
-iroh-blobs = { version = "=0.103.0", registry = "aster" }
+iroh = { version = "=1.3.0", registry = "aster", features = ["metrics"] }
+iroh-blobs = { version = "=0.103.5", registry = "aster" }
 ```
 
 Do not combine Aster-registry Iroh crates with same-named crates from crates.io
@@ -107,7 +97,7 @@ therefore list both packages directly:
 
 ```toml
 [dependencies]
-aster = { version = "0.3", registry = "aster", features = ["rpc"] }
+aster = { version = "=0.3.893", registry = "aster", features = ["rpc"] }
 fory-core = "=1.7.6"
 fory-derive = "=1.7.6"
 ```
@@ -115,8 +105,8 @@ fory-derive = "=1.7.6"
 This is a proc-macro name-resolution requirement, not a second Fory runtime.
 Keep the exact version: a broad `"1.3"` requirement can now select a newer 1.x
 release and silently diverge from Aster's validated wire-codec pair. Cargo
-unifies the exact crates.io version. Aster will publish Fory in its own registry
-only if it carries an Aster-specific Fory patch.
+unifies the exact crates.io version. The C# binding uses a separate patched NuGet package; that does not change
+the Rust Fory dependencies shown here.
 
 ## Salvo applications
 
@@ -138,9 +128,9 @@ the Aster registry rather than crates.io:
 salvo = { version = "=1.0.3", registry = "aster", features = ["quinn"] }
 ```
 
-Aster 0.3.794 publishes the cancellation-safe accept fix with Salvo 1.0.3.
+Aster 0.3.893 uses Salvo 1.0.3, including the cancellation-safe accept fix.
 Use `=1.0.3` for this direct macro dependency so its crate identity matches
-`aster-transport-salvo` 0.3.794. Both source crate families are anonymously
+`aster-transport-salvo` 0.3.893. Both source crate families are anonymously
 readable from the Aster registry.
 
 Only the Salvo feature closure validated by Aster is part of the release. Ask
@@ -160,28 +150,7 @@ Windows builds validate target portability; an anonymous scratch build from the
 published registry validates the source-package dependency graph. Neither
 replaces source-crate publication.
 
-## Temporary Git fallback
+## Next steps
 
-Use this only while the Cargo registry is being bootstrapped or to diagnose a
-registry outage:
-
-1. Authorized maintainers pin `aster` to a release commit from its private
-   Forgejo repository.
-2. Copy the bootstrap `[patch.crates-io]` blocks from that same commit's
-   `iroh-fork-manifest.toml` into the consumer workspace root.
-3. Commit `Cargo.lock`.
-
-```toml
-[dependencies]
-aster = {
-  git = "https://forge.emrul.dev/Aster/aster-rpc-internal.git",
-  rev = "<release-commit>",
-  features = ["rpc"]
-}
-```
-
-Never distribute credentials for this fallback, use `branch = "main"` for a
-production build, or combine a manifest from one Aster revision with another
-revision. This fallback exists precisely because Cargo does not propagate a
-dependency's root `[patch]` section; it is retired once the public source-crate
-wave is available.
+Use the [Rust getting-started guide](aster-rust-getstarted.md) to start a node
+and define RPC services. See [known issues](KNOWN_ISSUES.md) for current limits.

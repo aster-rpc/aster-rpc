@@ -1,31 +1,21 @@
 # Leases: single-owner coordination with `aster::lease`
 
-Sometimes exactly one node may act: one writer for a database, one owner of
-a volume, one live instance of a singleton workload. On a P2P mesh there is
-no central lock server to ask — and Aster deliberately doesn't add one.
-Instead, `aster::lease` gives you **fenced leases**: a cheap, imperfect
-*grant* (who currently holds the lease) backed by a *fence* the resource
-itself checks on every write. Even when the grant goes wrong — a paused
-process, a partition, a clock hiccup — the stale holder's writes are
-**rejected by the thing it writes to**. Grant errors cost availability,
-never corruption.
+Use a fenced lease when a resource needs one current writer, such as a database,
+volume or singleton workload. `aster::lease` combines a grant identifying the
+holder with a fence checked inside the resource's write path. A stale holder's
+writes are rejected only when every protected mutation enforces that fence.
 
-> **Status: core primitive + RPC grantor shipped (Rust, 2026-07-05).** The
-> state machine, fence rule, holder engine (§3–§4), and the
-> `aster.lease.Grantor` service (§5) are implemented in the Rust `aster`
-> crate; other bindings follow the FFI wave. Still to come
-> ([design doc](_internal/aster-leases.md)): the quorum-backed coordination
-> serializer for resources whose owner moves between nodes, the single-node
-> portal-store and S3-catalog serializer backends, the advisory directory row
-> (lease visibility in the shared doc), and `aster.ops` metrics for fencing
-> rejections.
+The lease state machine, holder engine and `aster.lease.Grantor` RPC service
+ship in the Rust crate. Python, TypeScript and C-ABI bindings expose lease
+primitives and foreign serializer hooks. For a replicated grantor, use the
+[coordination client](aster-coordination-getstarted.md).
 
 ---
 
 ## 1. What you get
 
-Three pieces, and you need the first two — granting without enforcing is
-not a lease, it's a suggestion:
+The API has three pieces. A protected resource needs both the handle and
+fence enforcement:
 
 1. **A lease handle** — [`LeaseHandle::acquire`] takes the lease, renews it
    in the background over a live connection, and hands out the current
@@ -45,21 +35,20 @@ not a lease, it's a suggestion:
    operations are bound to the caller's **authenticated QUIC identity** —
    the wire cannot impersonate a holder.
 
-## 2. The mental model
+## 2. Choose when to use a lease
 
-First question, always: **what breaks if two nodes briefly both act?**
+Choose according to the effect of two nodes acting at once.
 
 | If overlap causes… | Use | Cost |
 |---|---|---|
-| a conflict you can detect and resolve later | no lease — detect, don't prevent | none |
+| a conflict you can detect and resolve later | detect and resolve the conflict | none |
 | corruption (double-writer on a DB, volume, catalog) | a **fenced lease** (this guide) | one CAS per grant/renew |
-| corruption, and nothing can check a fence | don't ship it — see the design doc's Tier 2 | consensus, per-resource |
+| corruption, and nothing can check a fence | redesign the write path or use resource-specific consensus | consensus, per-resource |
 
-Most "locks" are the first row. Portal's "one runtime owner per tree
-preference", replica placement, dashboards — a transient collision there is
-survivable, so pay nothing. Reach for a lease only when overlap corrupts.
+Advisory placement and dashboards can often tolerate transient overlap. Use a
+fenced lease when overlapping actions would corrupt protected state.
 
-Two rules worth internalising:
+Enforce both of these rules:
 
 - **The grant is a hint; the fence is the safety.** Nothing may gate a
   write on "I believe I hold the lease" — beliefs go stale. Writes are
@@ -115,7 +104,7 @@ What the handle does for you:
   re-acquire; `Lost` means the serializer was unreachable past the
   self-limit.
 
-Release when you're done — it's not optional politeness:
+Release the lease when the protected work is complete:
 
 ```rust
 lease.release().await?;
@@ -216,7 +205,7 @@ Properties worth knowing:
 - **Identity is bound by the transport.** The grantor takes the holder for
   every acquire/renew/release from the QUIC handshake, not from the
   request. Another node replaying your epoch, or claiming to be you, is
-  refused server-side (`NotHolder`) — this is tested, not aspirational.
+  refused server-side (`NotHolder`); the RPC tests cover this identity binding.
 - **`revoke` is gated.** By default it requires the `operator` role
   (Gate 3); override with `LeaseGrantor::revoke_requires`, and gate the
   whole service with `.requires(...)` if any admitted caller shouldn't be
@@ -224,9 +213,8 @@ Properties worth knowing:
   even though it can't corrupt).
 - **A dead grantor stops grants and renewals — nothing else.** Holders run
   to their self-limit and stop; nobody new can acquire until you move the
-  grantor. That's deliberate: automatic grantor failover without consensus
-  would split-brain the grantor itself. Availability loss, never
-  corruption.
+  grantor. Automatic grantor failover requires consensus to preserve a single
+  serialization point; use coordination for replicated grants.
 
 ## 6. What to rely on — and what not to
 
@@ -242,9 +230,9 @@ Properties worth knowing:
 
 **Do not rely on:**
 
-- **Snapshots or directory rows as permission.** `snapshot()` (and the
-  future directory record) may be stale the moment you read them. They're
-  for dashboards, routing hints, and backoff — never for gating a write.
+- **Snapshots or directory rows as permission.** `snapshot()` may already be stale
+  when it returns. Use it for dashboards, routing hints and backoff; check the
+  fence inside each write.
 - **TTLs as safety.** Expiry timing decides *availability* (when a takeover
   may happen). Safety is only the fence check. If a clock is wrong, the
   worst case is a live holder gets fenced and must re-acquire.
@@ -252,11 +240,11 @@ Properties worth knowing:
   (tombstone) does not stop in-flight writes — only the grantor/serializer
   revoke advances the fence. Do both, fence first.
 - **A lease making an unfenced API safe.** If any write path skips the
-  fence check, that path is unprotected, full stop.
+  fence check, that path is unprotected.
 
 ## 7. Tuning
 
-Defaults suit "seconds-scale failover, negligible traffic". The knobs:
+These per-acquire options control renewal and takeover timing:
 
 | Knob | Default | When to change |
 |---|---|---|
@@ -267,19 +255,8 @@ Defaults suit "seconds-scale failover, negligible traffic". The knobs:
 All three are per-acquire (`LeaseOptions`), so different resources can run
 different tempos against the same grantor.
 
-## 8. Roadmap
+## 8. Next steps
 
-- **Core primitive + RPC grantor — shipped (Rust).** Normative state
-  machine, fence rule, `MemorySerializer` (restart-safe, authorizer hook),
-  `LeaseHandle` engine, `aster.lease.Grantor` + `GrantorSerializer` with
-  transport-bound identity. Design-doc test matrix rows 1–6, 8, 10 plus
-  wire tests pass.
-- **Next:** the quorum-backed coordination serializer (the one to use when the
-  holder moves between nodes — a single node's store cannot serialize a handoff
-  between two nodes that each have their own), single-node portal-store (SQLite
-  row) and S3-catalog serializer backends, the advisory directory row +
-  serializer-authored audit trail, fencing-rejection metrics in `aster.ops`.
-  Python/TS/Java surfaces follow the FFI wave.
-
-Design rationale, the full state machine, timing rules, and the test
-matrix: [`docs/_internal/aster-leases.md`](_internal/aster-leases.md).
+Use the [coordination guide](aster-coordination-getstarted.md) for replicated
+fenced registers and leases. The [Python guide](aster-python-getstarted.md)
+shows foreign-language lease serializers and fenced resources.

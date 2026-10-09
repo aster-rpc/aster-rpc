@@ -1,7 +1,7 @@
 # @aster-rpc/aster
 
-Aster RPC framework for TypeScript — peer-to-peer services with type
-safety, streaming, and trust, built on [Iroh](https://github.com/n0-computer/iroh)
+Aster RPC framework for TypeScript — peer-to-peer services with typed
+payloads, streaming, and admission controls, built on [Iroh](https://github.com/n0-computer/iroh)
 (QUIC, blobs, docs, gossip).
 
 Runs on Node.js 20+, Bun 1.0+, and Deno via Node compat.
@@ -20,9 +20,7 @@ bun add @aster-rpc/aster
 
 Write a class with `@Service`, wire types with `@WireType`, and
 methods with `@Rpc` / `@ServerStream` / `@ClientStream` / `@BidiStream`.
-The method's parameter and return types *are* the schema — no
-explicit `{ request, response }` options, no decorator metadata
-boilerplate.
+The scanner derives the schema from method parameter and return types.
 
 ```ts
 import {
@@ -72,7 +70,7 @@ Field types map to wire types per spec §11.3.2.3:
 
 | TS type | Wire type | Notes |
 |---|---|---|
-| `number` | `float64` | `number` is IEEE 754 double — honest mapping |
+| `number` | `float64` | `number` is IEEE 754 double |
 | `bigint` | `int64` | Use for integers on the wire |
 | `boolean` | `bool` | |
 | `string` | `string` | |
@@ -196,7 +194,7 @@ consume the generated data instead of reflecting at runtime.
 
 ## What happens if you don't run `aster-gen`?
 
-Everything still works. The runtime falls back to reflection
+The runtime falls back to reflection
 (`new cls()` + `Object.keys`, plus `Function.length` for CallContext
 detection) and logs a warning once per class / service / method:
 
@@ -211,8 +209,7 @@ Reflection has documented limitations:
 - Optional / `null` nested types don't get recursed into
 - Classes that need constructor arguments can't be introspected
 
-Running `aster-gen` fixes all three — it reads types from the AST,
-not from runtime values.
+Run `aster-gen` to obtain these types from the TypeScript AST.
 
 ## Brand types vs `@Rpc({ request, response })`
 

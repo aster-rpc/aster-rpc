@@ -6,10 +6,9 @@ content-addressed **blobs**, CRDT **docs**, **gossip**, connection **admission**
 **Rust-native RPC framework** (services, clients, streaming, capability checks,
 interceptors, and cross-binding contract publication).
 
-> Status: the RPC layer is **Rust↔Rust** today. Contract identity and published
-> manifests are cross-binding-correct (byte-identical to the Python/Java/TS
-> bindings); RPC *payload* wire-compat with the other bindings is deferred on a
-> Fory version gap. See "Current limits" at the end.
+> Aster 0.3 is a preview release. RPC interoperability is exercised by the
+> Rust, Python, TypeScript, Go, Java and .NET matrix in `tests/interop/`.
+> See “Current limits” for restrictions that affect application design.
 
 ---
 
@@ -34,8 +33,7 @@ aster = { version = "0.3", registry = "aster", features = ["rpc"] }
 Commit `Cargo.lock` in applications so the resolved patch is reproducible.
 Consumers do not copy Aster's fork pins. See
 [Consuming the Aster Rust SDK](rust-sdk-consumer-guide.md)
-for registry bootstrap status, native Iroh/Fory/Salvo interop, version policy,
-and the maintainer-only private-Git fallback.
+for registry setup, native Iroh/Fory/Salvo interop and version policy.
 
 To define **typed RPC payloads** you also need the Apache Fory derive in scope
 (the `#[derive(ForyStruct)]` macro expands to `::fory_core::` paths, so both
@@ -449,8 +447,8 @@ like any other payload (it must anyway to serialize).
 
 You can lower a scalar default into the contract with
 `#[aster(default = <expr>)]` (supported for `String` / `bool` / `i32` / `i64` /
-`f64`); a changed default changes the `contract_id`. See the cross-binding
-caveat under "Current limits" before relying on it.
+`f64`); a changed default changes the `contract_id`. Matching cross-language
+contracts must declare the same default.
 
 ### 4.2 Define a service
 
@@ -556,12 +554,12 @@ srv.run().await;       // serve until the node closes
 `EchoServer` is generated from the `Echo` trait. Add one `.service(…)` per
 service (Rust can't hold heterogeneous instances in one `[…]` list the way Python
 does). The server keeps serving as long as you hold `srv` and call
-[`run`](https://docs.rs/aster) — or end it with `shutdown` for a clean,
+`run()` — or end it with `shutdown` for a clean,
 store-flushing close (Rust has no `async with`).
 
 `.identity(path)` persists only the endpoint **secret key** (64 hex chars,
 load-or-create) — enough for a restart-stable `NodeId`. Python's `.aster-identity`
-is a richer JSON credential file (root pubkey + enrollment material); Gate-1
+is a TOML credential file (root pubkey + enrollment material); Gate-1
 credential plumbing isn't in the Rust crate yet.
 
 #### Low-level: building a `Server` by hand
@@ -756,8 +754,10 @@ The transport underneath logs under `aster_transport_core` (reactor, framing)
 and `iroh` / `iroh_*` (QUIC, relay, discovery); `RUST_LOG=warn,aster=debug`
 keeps those quiet while showing everything from `aster`.
 
-The Python and TypeScript packages and the C ABI do not forward these events
-yet; they keep their own logging.
+Python, TypeScript, Go, Java and .NET forward Rust events to their language
+loggers through the shared observability pipeline. See the
+[observability guide](aster-observability-getstarted.md) for initialization,
+exporters and log-level synchronization.
 
 ---
 
@@ -768,7 +768,8 @@ yet; they keep their own logging.
 | `blobs` / `docs` / `gossip` | ✅ | the corresponding `Node` accessors |
 | `attestation` | ✅ | ownership-attestation mint/verify |
 | `rpc` | — | the RPC framework (pulls Fory + the proc-macros) |
-| `discovery` / `hooks` / `metrics` | — | DNS/mDNS resolution, admission hooks, Prometheus metrics |
+| `discovery` / `hooks` | — | Local discovery and admission hooks |
+| `otel` / `health` | — | Observability integration and the health/Prometheus listener |
 
 Admission (`Node::take_admission`) additionally requires the node to be started
 with `AsterConfigBuilder::hooks(true)`.
@@ -777,19 +778,11 @@ with `AsterConfigBuilder::hooks(true)`.
 
 ## 7. Current limits
 
-- **Cross-binding RPC payloads** are Rust↔Rust only today (the Rust Fory crate
-  and the other bindings' Fory are on different majors). **Contract identity and
-  published manifests are cross-binding-correct now** — a Rust `contract_id` is
-  byte-identical to the equivalent Python/Java/TS contract.
-- **Defaults caveat:** Rust lowers `#[aster(default = …)]` into the contract-id
-  per the spec, but the other bindings currently emit every field as `required`
-  regardless of declared defaults. So a Rust type *with* a default produces a
-  contract-id the other bindings don't yet match — use no-default fields for
-  exact cross-binding parity until the ecosystem catches up.
 - **Gate 1 / Gate 2** auth (enrollment-credential verification, session
   `authorize` → rcan) are not yet in the Rust crate.
-- **Client-side request streaming** (client-stream / bidi inputs) is eager —
-  you pass a `Vec<Req>`. Server-side streaming is fully incremental.
+- **Generated client request-stream methods** take a `Vec<Req>`. For incremental
+  request sending, use the lower-level `RpcConnection::client_stream_open` or
+  `bidi_open` APIs.
 - **Interceptors** apply to unary calls; streaming calls are not yet intercepted.
 - `Admission` exposes separate `next_handshake()` (inbound) and `next_connect()`
   (outbound) streams; with hooks enabled, unhandled outbound connect hooks wait

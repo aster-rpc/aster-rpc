@@ -1,16 +1,10 @@
 # Aster coordination: a consumer walkthrough
 
-> **Released.** Coordination ships in the `aster` crate from **0.3.337**
-> (tag `v0.3.337`, commit `9cfb0f59`), Rust-first, behind the opt-in
-> `coordination` and `coordination-client` features. Every block below
-> presented as Rust is compiled against the released API: the same text
-> lives in `aster/tests/coordination_guide.rs`, which fails if the guide
-> drifts. Blocks marked `pseudocode` or `text` are schematic on purpose.
-> Portal's roaming workspaces are the first consumer; its acceptance matrix
-> is recorded in the Portal repository's `docs/design/roaming-coordination.md`.
-
-**Status date:** 2026-09-05 (aster 0.3.337; native macOS, Linux and Windows
-evidence — see §15).
+> Coordination is available in the Aster 0.3 preview behind the opt-in
+> `coordination` and `coordination-client` features. Rust code blocks are checked
+> against `aster/tests/coordination_guide.rs`; blocks marked `pseudocode` or
+> `text` are schematic. Hosting voters requires Rust; clients are available in
+> Rust, Python, TypeScript, Go, Java and .NET.
 
 Aster coordination gives an Aster application a small, durable place to decide
 facts for which there must be exactly one current answer:
@@ -36,12 +30,9 @@ The consumer experience is:
 This guide follows that path using a ten-producer network with exactly three
 voters.
 
-For the underlying contracts, see the
-[coordination design](_internal/working_ideas/aster-coordination.md) and
-[implementation plan](_internal/working_ideas/aster-coordination-implementation-plan.md).
-The existing [lease guide](aster-leases-getstarted.md) explains fencing in more
-depth, and the [topology guide](aster-topology-getstarted.md) explains the
-network observations used for placement.
+The [lease guide](aster-leases-getstarted.md) explains fencing, and the
+[topology guide](aster-topology-getstarted.md) explains the network observations
+used for placement.
 
 ## 1. Consensus without the terminology
 
@@ -58,7 +49,7 @@ delivered in different orders:
 - when a voter returns or is replaced, it catches up before it may vote; and
 - after a leader fails, another voter can take over from the committed history.
 
-That is the useful part of Raft for an application. Consumers should not call
+[Raft](https://raft.github.io/) provides these consensus properties. Consumers should not call
 Raft APIs or implement those transitions themselves. Aster embeds the runtime,
 durable storage, authenticated network, snapshots, and membership controller
 behind the coordination service.
@@ -81,7 +72,7 @@ producer or voter. ROOT is not a voter role and has no implicit right to read or
 mutate a coordinated resource; it can grant an exact right when an operator
 deliberately brings the ROOT identity online.
 
-**Benefit:** a large Aster network does not become a large consensus group.
+a large Aster network does not become a large consensus group.
 Only the small committed voter set pays the replication cost; every other node
 uses it as a client or remains an eligible replacement.
 
@@ -129,7 +120,7 @@ one authoritative activation
 Consensus orders the head. It does not prove that the content named by the head
 exists or has enough replicas; that remains the application's responsibility.
 
-**Benefit:** the expensive consensus path is limited to the few bytes that need
+the expensive consensus path is limited to the few bytes that need
 one global answer, while bulk data keeps the scaling and distribution model
 best suited to it.
 
@@ -180,7 +171,7 @@ majority. It stops. Neither topology nor an administrator can safely force a
 local node into membership; the operator must restore a voter or use the
 new-group recovery procedure.
 
-**Benefit:** the application describes the desired shape and supplies hosts;
+the application describes the desired shape and supplies hosts;
 Aster performs the safe, resumable membership workflow without turning all ten
 nodes into voters.
 
@@ -214,13 +205,11 @@ The hosting feature remains off by default. Enabling `coordination-client`
 does not start a service, open a voter database, or make the node eligible for
 membership.
 
-Hosting a voter is Rust-only. The client is available from Rust, and Python
-and TypeScript wrap the same Rust client (`aster.coordination` /
-`CoordinationClient` in `@aster-rpc/aster`) rather than reimplementing it; see
-`docs/aster-python-getstarted.md` and the TypeScript package. C, Java, .NET and
-Go coordination surfaces are not delivered yet.
+Hosting a voter is Rust-only. Rust, Python, TypeScript, Go, Java and .NET clients
+use the same Rust implementation. See the
+[Python guide](aster-python-getstarted.md) and each binding's API for its wrapper.
 
-**Benefit:** ordinary Aster applications and language bindings do not inherit a
+Ordinary Aster applications and language bindings do not inherit a
 consensus/database stack merely because the SDK supports it.
 
 ## 5. Prepare identity, trust, and durable paths
@@ -258,9 +247,9 @@ another voter.
 ### 5.2 Reuse Aster's deployment ROOT
 
 Coordination does not introduce another authority key. It reuses the one Aster
-deployment ROOT already defined by the
-[Aster trust specification](../ffi_spec/Aster-trust-spec.md) and configured
-through `AsterConfig`, including the normal production environment inputs:
+deployment ROOT configured through `AsterConfig`. The same root is the trust
+anchor for producer admission and the coordination signatures described below.
+Set it through these environment inputs:
 
 ```bash
 # Inline hex, or point at a hex/JSON public-key file.
@@ -318,7 +307,7 @@ fn admission_source(
 }
 ```
 
-Producer admission is necessary but deliberately insufficient:
+Producer admission has these limits:
 
 - it does not grant resource rights;
 - it does not make the producer eligible under placement policy; and
@@ -330,7 +319,7 @@ The deployment tool creates one random 32-byte `CoordinationGroupId`. The group
 id, signed genesis hash, deployment profile, Aster ROOT key, and authority domain
 are bound to both databases and checked on every restart.
 
-**Benefit:** an address, role claim, copied database, or self-signed document
+an address, role claim, copied database, or self-signed document
 cannot silently create or join the authoritative group.
 
 ## 6. Bootstrap the initial three voters
@@ -433,7 +422,7 @@ client profile whose endpoint secret is the ROOT secret, load it only for an
 explicit operation, and take it offline again. Both paths hit the same
 replicated authorization predicate and audit trail.
 
-**Benefit:** bootstrap is reproducible and identity-bound. Accidental second
+bootstrap is reproducible and identity-bound. Accidental second
 clusters, wrong profiles, foreign storage, and ephemeral voter identities fail
 at startup instead of becoming a split brain later.
 
@@ -484,7 +473,7 @@ client id, and next sequence. Redirects, leader changes, timeouts, and retries
 must resend those same bytes. The replicated session row makes the server
 effect idempotent even when the command committed but the reply was lost.
 
-> **Client-delivery decision (frozen):** a resolved mutation is fsynced as
+> **Client delivery:** a resolved mutation is fsynced as
 > `ResolvedAwaitingAck` before the caller sees it and survives process death.
 > The application acknowledges explicitly after its own durable handling;
 > until then no new sequence is permitted, and on restart
@@ -501,7 +490,7 @@ The client can dial any known member. Followers return an authenticated leader
 hint; the client reconnects directly so the leader authenticates the real
 caller. The follower never becomes an authorization proxy.
 
-**Benefit:** applications do not write leader-routing or ambiguous-retry logic,
+applications do not write leader-routing or ambiguous-retry logic,
 and a lost response cannot make the same sequenced operation take effect twice.
 
 ## 8. Grant exact rights to an exact resource
@@ -569,7 +558,7 @@ The service checks access before proposing obvious denials, then the replicated
 state machine checks it again in committed order. If an ACL changes during a
 request, the committed check wins.
 
-**Benefit:** authorization follows the state through leader changes, snapshots,
+authorization follows the state through leader changes, snapshots,
 and restarts. An application policy adapter supplies facts, but cannot bypass
 Aster's replicated enforcement.
 
@@ -666,7 +655,7 @@ TTL controls takeover latency, not safety. If the leader changes, timers are
 re-armed conservatively. If quorum disappears, renewals stop and the holder's
 self-limit removes its usable fence before a successor could be granted one.
 
-**Benefit:** a paused, partitioned, or superseded process cannot continue
+a paused, partitioned, or superseded process cannot continue
 publishing authoritative mutations merely because it still believes it is the
 owner.
 
@@ -800,14 +789,14 @@ observed, the current and selected voters and learners, the members past
 their replacement grace, the separation summary, any pending operation, and
 a `reason`. It never edits a database or membership locally.
 
-**Benefit:** Aster turns current topology and application policy into a safe
+Aster turns current topology and application policy into a safe
 membership request, while the application retains control over trust, machines,
 failure-domain requirements, and planned maintenance.
 
 ## 11. What common failures look like
 
-The important property is not that failures disappear. It is that each failure
-has a bounded, unsurprising outcome.
+Use the following outcomes to decide whether to retry, restore a member or
+intervene in storage.
 
 | Event | Aster behavior | Consumer behavior |
 | --- | --- | --- |
@@ -978,11 +967,11 @@ Do not improvise this procedure from snapshots or by copying voter directories.
 of it; the signed recovery genesis in between is minted by the deployment
 ROOT tooling against the export's hash.
 
-**Benefit:** routine lifecycle operations converge through committed state, and
+routine lifecycle operations converge through committed state, and
 catastrophic recovery cannot accidentally resurrect authority from the old
 group.
 
-## 13. Observe the group honestly
+## 13. Observe group status
 
 The runtime distinguishes:
 
@@ -1040,19 +1029,15 @@ fn report_startup(coordination: &Coordination) {
 }
 ```
 
-Alert thresholds — which signal, what budget fixes the number, and where warn and
-page sit — are the S5-E budget table in the coordination contract matrix. Two
-rules are worth repeating here: **stale-fence and revision refusals are never an
-alarm** (they are the register working), and every threshold is set by an
-operational budget rather than by a multiple of a benchmark.
+Set alert thresholds from your application's latency and availability budgets.
+Stale-fence and revision refusals are expected concurrency outcomes; investigate
+unexpected rates in context rather than treating every refusal as an alarm.
 
-**Benefit:** the API distinguishes temporary unavailability, advisory local
+The API distinguishes temporary unavailability, advisory local
 knowledge, and local corruption instead of compressing them into a misleading
 healthy/unhealthy boolean.
 
 ## 14. Responsibility boundary
-
-The value of the feature is that this line stays sharp.
 
 | Aster owns | The consumer owns |
 | --- | --- |
@@ -1072,12 +1057,9 @@ membership controller beside Aster.
 
 ## 15. Production checklist
 
-Each item the draft of this guide asked for before the feature could be
-called released, and where the released feature and its first consumer
-demonstrate it. Aster rows name the test target or the evidence-ledger row in
-`docs/_internal/working_ideas/aster-coordination-implementation-plan.md`
-§19; Portal rows name the scenario in Portal's
-`docs/design/slice6-acceptance-inventory.md`.
+The following test targets cover lifecycle and fault scenarios. Historical
+platform evidence below describes the 0.3.337 qualification, rather than a
+claim that every scenario was rerun for the current preview.
 
 | Demonstrated | Where |
 | --- | --- |
@@ -1103,7 +1085,7 @@ voters. Ten is a test corridor, not a maximum network size. Three is a deliberat
 availability/latency tradeoff: it tolerates one unavailable voter without
 making every producer participate in consensus.
 
-## 16. What the consumer should feel
+## 16. Application responsibilities
 
 Application code mostly answers five questions:
 
@@ -1113,10 +1095,6 @@ Application code mostly answers five questions:
 4. What placement and failure policy should select three of them?
 5. How does the protected resource enforce the returned fence?
 
-Everything below that line—election, log replication, durable apply, snapshots,
-ambiguous retries, learner catch-up, joint consensus, and restart recovery—is
-Aster's problem.
-
-That is the consumption promise, kept in 0.3.337: not “consensus has no
-operational cost,” but “every Aster consumer does not have to assemble and
-maintain its own consensus system.”
+Aster handles election, log replication, durable apply, snapshots, retries,
+learner catch-up, joint consensus and restart recovery. Applications retain the
+storage, trust, provisioning and fence-enforcement responsibilities above.

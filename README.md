@@ -1,300 +1,149 @@
 # Aster
 
-[![PyPI – aster-rpc](https://img.shields.io/pypi/v/aster-rpc?label=PyPI%3A%20aster-rpc&color=3776ab&logo=pypi&logoColor=white)](https://pypi.org/project/aster-rpc/)
-[![PyPI – aster-cli](https://img.shields.io/pypi/v/aster-cli?label=PyPI%3A%20aster-cli&color=3776ab&logo=pypi&logoColor=white)](https://pypi.org/project/aster-cli/)
-[![npm – @aster-rpc/aster](https://img.shields.io/npm/v/@aster-rpc/aster?label=npm%3A%20%40aster-rpc%2Faster&color=cb3837&logo=npm&logoColor=white)](https://www.npmjs.com/package/@aster-rpc/aster)
-[![Python](https://img.shields.io/pypi/pyversions/aster-rpc?label=Python&color=3776ab&logo=python&logoColor=white)](https://pypi.org/project/aster-rpc/)
-[![Node.js](https://img.shields.io/badge/Node.js-20%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+Aster is a peer-to-peer SDK for typed RPC, streaming, and shared data. It connects
+services by peer identity and uses [Iroh](https://iroh.computer/) for QUIC
+connections, NAT traversal, and relay fallback. Applications can define who may
+connect and which methods a caller may use.
 
-> **Machines need to authenticate to other machines, often on behalf of a user. Aster makes that safe — without a central authority and without shared secrets.**
+It is useful when services run on devices or networks where maintaining a public
+address for every service is impractical. A connection can cross network
+boundaries while the application keeps its service contracts and authorization
+rules. Direct connections depend on network conditions; relays provide a fallback.
 
-Aster is a peer-to-peer RPC framework with identity in the connection. You define typed services in Python or TypeScript, and any machine that holds the right capability credential can call them — across NATs, across organisations, across languages — without DNS, without a load balancer, without a certificate authority, and without an OAuth proxy in the middle.
+**The current public preview is 0.3.893.** APIs may change before general
+availability. See [known limitations](docs/KNOWN_ISSUES.md) before adopting it.
 
-The 2026 vivid example is AI agents calling tools on remote machines: agent on machine A wants to invoke a function on machine B, you don't want a hosted proxy in between, you don't want to rotate API keys, and you want the call to be scoped to specific methods. That's exactly what Aster solves. The same engineering also covers IoT fleets, edge compute, multi-tenant microservices, and anything else where the machine is the principal and the user is the delegating authority.
+- [Documentation](https://docs.aster.site/): concepts, tutorials, and API reference.
+- [First service](https://docs.aster.site/docs/quickstart/python): Python and TypeScript setup.
+- [Rust guide](docs/aster-rust-getstarted.md): the native Rust API.
+- [Public packages](https://forge.emrul.dev/Aster/-/packages): versioned preview downloads.
 
-Built on [iroh](https://iroh.computer) (QUIC + NAT traversal), [Apache Fory](https://fory.apache.org) (cross-language wire format), and [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) (content-addressed contract identity). Capability-based credentials, four-gate authorization, and an offline ed25519 root key.
+## Language support
 
-- **Website** — [aster.site](https://aster.site)
-- **Docs** — [docs.aster.site](https://docs.aster.site)
-- **Mission Control walkthrough** — [docs.aster.site/docs/quickstart/mission-control](https://docs.aster.site/docs/quickstart/mission-control) (the canonical 30-minute deep dive — seven chapters, four streaming patterns, auth, gen-client, cross-language)
+Rust, Python, TypeScript, Java, .NET, and Go use the shared Rust engine. RPC
+payloads use [Apache Fory](https://fory.apache.org/); matching service contracts
+allow callers and servers to use different languages.
 
----
+| Language | Preview distribution |
+| --- | --- |
+| Rust | Source crates in the public Aster Cargo registry |
+| Python | Platform wheels and a source archive on Forgejo |
+| TypeScript | Packages in the Forgejo npm registry |
+| Java | Packages in the Forgejo Maven registry |
+| .NET | Packages in the Forgejo NuGet registry |
+| Go | Binding tested from source; a standalone public Go module is not yet available |
 
-## Install
+The current tutorials focus on Python and TypeScript. More language examples
+will be added separately. Kotlin is not a separately qualified binding in this preview.
 
-Two packages: the framework and the CLI.
+## Install the preview
 
-### Python
-
-```bash
-uv pip install aster-rpc aster-cli
-# or:
-pip install aster-rpc aster-cli
-```
-
-`aster-rpc` gives you `from aster import ...` for your service code. `aster-cli` gives you the `aster` command — shell, contract gen-client, trust manager, enrollment, MCP integration. They're versioned independently.
-
-### TypeScript
-
-```bash
-bun add @aster-rpc/aster
-# or: npm install @aster-rpc/aster
-```
-
-The CLI is shared across all language bindings — install it once via Python and it works against any Aster server regardless of what wrote the service:
-
-```bash
-uv tool install aster-cli
-# or: pip install aster-cli
-```
-
-### Verify
-
-```bash
-aster --version
-aster shell --demo      # interactive shell against a sample peer, no network needed
-```
-
-Pre-built wheels for Linux x86_64/aarch64, macOS arm64, and Windows x64. TypeScript native binaries for the same platforms via NAPI-RS.
-
----
-
-## A working service in 60 seconds
+Version 0.3.893 is available from Forgejo without a token. This version was not
+published to PyPI or npmjs.org; an unqualified install from those registries may
+select an older release.
 
 ### Python
 
-```python
-from dataclasses import dataclass
-from aster import service, rpc, wire_type, AsterServer
+Download a wheel for your platform from the
+[0.3.893 Python package](https://forge.emrul.dev/Aster/-/packages/generic/aster-python/0.3.893).
+Wheels are available for Linux x86-64 and ARM64, macOS Apple Silicon, and Windows x64.
 
-@wire_type("hello/Request")
-@dataclass
-class Request:
-    name: str = ""
+For example, on **macOS Apple Silicon**, create a virtual environment with
+[uv](https://docs.astral.sh/uv/) and install the wheel directly:
 
-@wire_type("hello/Response")
-@dataclass
-class Response:
-    message: str = ""
-
-@service(name="HelloService", version=1)
-class HelloService:
-    @rpc
-    async def greet(self, req: Request) -> Response:
-        return Response(message=f"Hello, {req.name}!")
-
-async def main():
-    async with AsterServer(services=[HelloService()]) as srv:
-        print(srv.address)   # share this aster1... with consumers
-        await srv.serve()
-```
-
-Call it from another machine — no DNS, no port forwarding, no shared schema file:
-
-```python
-from aster import AsterClient
-
-async def main():
-    async with AsterClient(address="aster1...") as c:
-        hello = c.proxy("HelloService")
-        reply = await hello.greet({"name": "World"})
-        print(reply["message"])
-```
-
-### TypeScript
-
-```typescript
-import { Service, Rpc, AsterServer, AsterClientWrapper } from "@aster-rpc/aster";
-
-class Request {
-  name = "";
-  constructor(init?: Partial<Request>) { if (init) Object.assign(this, init); }
-}
-
-class Response {
-  message = "";
-  constructor(init?: Partial<Response>) { if (init) Object.assign(this, init); }
-}
-
-@Service({ name: "HelloService", version: 1 })
-export class HelloService {
-  @Rpc({ request: Request, response: Response })
-  async greet(req: Request): Promise<Response> {
-    return new Response({ message: `Hello, ${req.name}!` });
-  }
-}
-
-const server = new AsterServer({ services: [new HelloService()] });
-await server.start();
-console.log(server.address);
-await server.serve();
-```
-
-The Python service and the TypeScript service speak the same wire format natively — no codegen step, no IDL file. A Python client can call a TypeScript service and vice versa using the dynamic proxy or a generated typed client.
-
-For the full guide — auth, sessions, streaming, cross-language interop — see the [Mission Control walkthrough](https://docs.aster.site/docs/quickstart/mission-control).
-
----
-
-## What's in this repo
-
-```
-aster-rpc/                          PyPI: aster-rpc            (framework + Python bindings)
-@aster-rpc/aster                    npm:  @aster-rpc/aster     (framework + TypeScript bindings)
-@aster-rpc/transport                npm:  @aster-rpc/transport (NAPI-RS native addon)
-aster-cli                           PyPI: aster-cli            (the `aster` command)
-
-bindings/python/                    Python binding source (PyO3 + Python)
-bindings/typescript/                TypeScript binding source (NAPI-RS + TypeScript)
-
-cli/                                CLI source (the `aster` command)
-core/                               Shared Rust core (iroh wrapper)
-
-examples/python/                    Python example services (incl. mission_control)
-examples/typescript/                TypeScript example services (incl. missionControl, hello-world)
-
-tests/                              Unit + integration tests for all bindings
-conformance/                        Cross-language conformance vectors
-```
-
-Java, .NET, Kotlin, and Go bindings are in progress in the source repo and will land in the public tree once they're shipping. Rust is planned.
-
----
-
-## Where this is going
-
-Today: typed services, four streaming patterns, capability-based auth, Python and TypeScript bindings shipping at 0.1.2, MCP integration for AI agent tool calling.
-
-Next: identity-aware load balancing and self-healing built from the same primitives. The substrate keeps growing from one consistent identity model — load balancing across endpoints that share an identity, self-healing rooted in the same trust topology. The "no infrastructure" pitch starts as *no DNS, no LB, no certs* and grows into *no DNS, no LB, no certs, no service mesh, no sidecars, no control plane*.
-
-Java, .NET, Kotlin, and Go bindings are in progress. Rust is planned (direct access to the core crate, no FFI overhead).
-
----
-
-## Building from source
-
-You only need this if you're contributing to Aster itself. Most users should `pip install aster-rpc`.
-
-### Prerequisites
-
-- Python ≥ 3.9
-- Rust toolchain — pinned to 1.96.0 by `rust-toolchain.toml`; rustup selects it
-  automatically, and 1.94 cannot parse this workspace
-- [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`
-- For TypeScript binding: [`bun`](https://bun.sh/) or Node.js 20+
-
-### Python binding
-
-```bash
-git clone https://forge.emrul.dev/Aster/aster-rpc-internal.git
-cd aster-rpc-internal
-
+```sh
 uv venv
-uv pip install maturin pytest pytest-asyncio pytest-timeout pytest-rerunfailures
-./scripts/pin-fork-deps.sh   # see "aster-rpc fork deps" below
-uv run maturin develop -m bindings/python/rust/Cargo.toml
-uv pip install -e cli/
+uv pip install https://forge.emrul.dev/api/packages/Aster/generic/aster-python/0.3.893/aster_rpc-0.3.893-cp39-abi3-macosx_11_0_arm64.whl
+uv run python -c 'import aster; print(aster.__version__)'
 ```
 
-Or use the build script which also regenerates type stubs and pins fork deps:
+For another platform, use its wheel from the package page. The package also
+provides `SHA256SUMS` for checking downloaded files.
 
-```bash
-./scripts/build.sh
+### TypeScript
+
+Add the Aster registry to your project's `.npmrc`:
+
+```ini
+@aster-rpc:registry=https://forge.emrul.dev/api/packages/Aster/npm/
 ```
 
-### aster-rpc fork deps
+Then install the preview:
 
-Repository development uses Aster's public Forgejo forks of Iroh/Noq and Salvo,
-pinned to commit SHAs via `[patch.crates-io]` in the root `Cargo.toml`. This is
-a maintainer mechanism; released Rust consumers use the public Cargo registry
-and do not copy the patches. See `docs/rust-sdk-consumer-guide.md` and
-`docs/_internal/rust-sdk-maintainer-guide.md`.
-
-One wart: cargo's resolver picks the latest `hickory-proto` / `hickory-net`
-beta by default, but the iroh fork pins `hickory-resolver = "=0.26.0-beta.1"`
-and beta.3 has breaking API changes. Run the pinning script once after a
-fresh clone (or any time you `rm Cargo.lock`):
-
-```bash
-./scripts/pin-fork-deps.sh
+```sh
+npm install @aster-rpc/aster@0.3.893
 ```
 
-`build.sh` and `validate.sh` both call this automatically.
+The scoped registry setting leaves other npm dependencies on your existing
+registry. Follow the [TypeScript build setup](https://docs.aster.site/docs/guides/typescript-build-setup)
+for decorators and generated type metadata.
 
-### TypeScript binding
+### Rust
 
-```bash
-cd bindings/typescript
-bun install
-bun run build
+Add the registry to `.cargo/config.toml`:
+
+```toml
+[registries.aster]
+index = "sparse+https://forge.emrul.dev/api/packages/Aster/cargo/"
 ```
 
-### Run tests
+Then add Aster to `Cargo.toml`:
 
-```bash
-# Python: all tests (some need network, may take a few minutes)
-uv run pytest tests/python/ -v --timeout=30
-
-# Python: unit tests only (fast)
-uv run pytest tests/python/ -v --timeout=30 -m "not network"
-
-# TypeScript
-cd bindings/typescript && bun test
-
-# Cross-language matrix (Python ↔ TypeScript)
-bash tests/integration/mission_control/run_matrix.sh
+```toml
+[dependencies]
+aster = { version = "=0.3.893", registry = "aster", features = ["rpc"] }
 ```
 
-### Lint and full validation
+Commit your application's `Cargo.lock`. The
+[Rust consumer guide](docs/rust-sdk-consumer-guide.md) covers Fory payload derives,
+optional features, and direct access to the native dependencies.
 
-```bash
-cargo fmt --manifest-path bindings/python/rust/Cargo.toml
-cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
+### Java and .NET
 
-# Full validation (mirrors CI)
-./scripts/validate.sh
-```
+The [public package catalogue](https://forge.emrul.dev/Aster/-/packages)
+provides Maven and NuGet packages for 0.3.893. Use the registry configuration
+shown with the package. The .NET binding also depends on
+`Apache.Fory` version `1.7.6-aster.1` from the same Forgejo NuGet feed.
 
-### Optional: speed up Rust builds with sccache
+## Try a service
 
-```bash
-brew install sccache       # macOS
-# or: cargo install sccache
-export RUSTC_WRAPPER=sccache
-```
+Start with the [first-service tutorial](https://docs.aster.site/docs/quickstart/python).
+For streaming, sessions, authorization, and cross-language clients, continue to
+[Mission Control](https://docs.aster.site/docs/quickstart/mission-control).
 
----
+The repository includes examples under `examples/python/`,
+`examples/typescript/`, and `examples/rust/`. The tutorials explain the setup and
+credentials each example needs.
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Application code (Python / TypeScript / Java / .NET / Go)           │
-├──────────────────────────────────────────────────────────────────────┤
-│  Aster RPC framework                                                 │
-│    @service / @rpc decorators, codegen, interceptors,                │
-│    contract identity, session-scoped services, capabilities          │
-├──────────────────────────────────────────────────────────────────────┤
-│  Wire protocol                                                       │
-│    Stream framing, codec (Fory XLANG / NATIVE / ROW / JSON),         │
-│    trailers, deadlines                                               │
-├──────────────────────────────────────────────────────────────────────┤
-│  Trust layer (Gates 0–3)                                             │
-│    ed25519 root key, OTT/policy credentials, peer admission,         │
-│    role-based capabilities, optional @aster delegated auth           │
-├──────────────────────────────────────────────────────────────────────┤
-│  Iroh QUIC transport                                                 │
-│    NAT traversal, P2P discovery, blobs, docs, gossip                 │
-└──────────────────────────────────────────────────────────────────────┘
-```
+Application APIs call the shared Rust engine. Rust applications use the `aster`
+crate; foreign-language bindings bridge into Rust through PyO3, NAPI-RS, or the
+C ABI. The engine manages transport, RPC dispatch, and shared services.
 
-The Python binding is built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs); the TypeScript binding uses [NAPI-RS](https://napi.rs/). Both share the same Rust core (`core/` + iroh crates), so a Python client and a TypeScript server (or vice versa) speak the same wire protocol byte-for-byte.
+| Layer | Responsibility |
+| --- | --- |
+| Language APIs | Typed services, clients, and language-specific async interfaces |
+| RPC | Contract identity, payload framing, deadlines, and streaming |
+| Authorization | Peer admission and permissions for service calls |
+| Iroh transport | Peer connections, NAT traversal, and relay fallback |
 
-Full conceptual reference, API docs, and the four-gate trust model live on the [docs site](https://docs.aster.site).
+The [architecture reference](https://docs.aster.site/docs/reference/architecture)
+and [trust model](https://docs.aster.site/docs/concepts/trust-model) describe the
+configuration and boundaries of these layers.
 
----
+## Working on the SDK
+
+The workspace contains the `aster` Rust facade, shared code in `core/`,
+foreign-language APIs in `bindings/`, the C ABI in `ffi/`, and tests in `tests/`.
+Some binding sources are not yet included in the public source mirror; use the
+published packages when evaluating the preview.
+
+For a complete development checkout, use the Rust toolchain pinned by
+`rust-toolchain.toml` and follow [CONTRIBUTING.md](CONTRIBUTING.md). Released Rust
+applications use the registry configuration above; they do not need the
+workspace's fork patches.
 
 ## License
 
-Apache-2.0
+[Apache License 2.0](LICENSE).

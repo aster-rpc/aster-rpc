@@ -1,4 +1,4 @@
-# Aster Observability: Get Started
+# Getting started with Aster observability
 
 Logs, metrics, traces and health for Aster services, in Rust, Python,
 TypeScript, Java, .NET and Go. Everything below uses synthetic names: a

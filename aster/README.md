@@ -6,9 +6,12 @@ CRDT documents, and gossip pub-sub over QUIC.
 
 This is the supported entry point for Rust consumers. It is an idiomatic facade
 over the internal `aster_transport_core` backend (the Python / TypeScript /
-Java / Kotlin bindings wrap the same core).
+Go / Java / .NET bindings wrap the same core).
 
 ## Quick start
+
+This fragment runs inside an async function returning `aster::Result<()>`.
+Supply `my_32_byte_seed` from your application's namespace-key storage.
 
 ```rust
 use aster::{AsterConfig, Node, RelayMode};
@@ -36,13 +39,14 @@ node.shutdown().await;
 
 See `examples/quickstart.rs` for an end-to-end persistence round-trip.
 
-## Cargo features
+## Selected Cargo features
 
 | Feature | Default | Gates |
 |---------|---------|-------|
 | `blobs` | ✅ | `Node::blobs()` |
 | `docs` | ✅ | `Node::docs()` |
 | `gossip` | ✅ | `Node::gossip()` |
+| `rpc` | — | Typed RPC services, clients and streaming |
 | `discovery` | — | mDNS local discovery config |
 | `hooks` | — | (reserved) |
 
@@ -68,12 +72,11 @@ aster = { version = "0.3", registry = "aster" }
 
 Use the selected release version rather than copying Aster's private fork
 graph. Advanced Rust consumers can access the exact Iroh/Fory/Salvo stack via
-`aster::native`. See `docs/rust-sdk-consumer-guide.md` in the repository for
-the registry rollout state, direct-dependency exceptions for proc macros, and
-the maintainer-only private-Git fallback.
+`aster::native`. See the [Rust SDK consumer guide](../docs/rust-sdk-consumer-guide.md)
+for registry setup and direct-dependency exceptions for proc macros.
 
-## Status
+## Preview status
 
-Step 1 (node + blobs/docs/gossip + admission + deterministic namespaces) is
-implemented. Rust-native **RPC services** are designed but not yet shipped — see
-`docs/_internal/aster-rust.md`.
+Rust RPC services, clients and streaming ship behind the `rpc` feature.
+Aster 0.3 is a preview release; see the [Rust getting-started guide](../docs/aster-rust-getstarted.md)
+for examples and current limits.
