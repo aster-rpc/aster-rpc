@@ -14,8 +14,13 @@
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
-- **Codec:** Apache.Fory **1.7.6** (`ForyCodec`: `ThreadSafeFory`, compatible on, ref tracking
-  off; Fory C# is always xlang). Types register under Aster wire tags
+- **Codec:** Apache.Fory **1.7.6-aster.1** (exact fork pin; FORY-CS-001 metadata-cache
+  publication correction, unchanged 1.7.6 wire format). Restore uses
+  `bindings/dotnet/NuGet.Config`, mapping `Apache.Fory` to the public Aster
+  Forgejo feed. Downstream projects must include that feed and source mapping
+  in their own NuGet configuration; package dependencies do not carry feed
+  configuration. `ForyCodec`: `ThreadSafeFory`, compatible on, ref tracking
+  off; Fory C# is always xlang. Types register under Aster wire tags
   (`Register<T>("ns/Name")`, split on the last `/` like every binding). JSON mode is gone;
   `ICodec` is generic (`Encode<T>` / `Decode<T>`).
 - **Envelope / compression:** AEv1 `StreamHeader` / `CallHeader` / `RpcStatus` and zstd via
