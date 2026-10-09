@@ -2,8 +2,9 @@
 """Run a clean .NET consumer against supplied local Aster and Linux FFI artifacts.
 
 The consumer project is generated under a fresh temporary directory outside the
-checkout. It references only the supplied local NuGet package; package
-dependencies restore from nuget.org. The separately supplied FFI library is
+checkout. Aster restores only from the supplied local NuGet package; its exact
+Apache.Fory fork restores from Forgejo, and other dependencies from nuget.org.
+The separately supplied FFI library is
 copied next to the application so .NET's native loader resolves the candidate.
 This script builds/runs the consumer when invoked; it does not build Aster.
 """
@@ -195,7 +196,20 @@ def main() -> None:
 </Project>
 ''', encoding="utf-8")
     (project / "NuGet.Config").write_text(f'''<?xml version="1.0" encoding="utf-8"?>
-<configuration><packageSources><clear/><add key="candidate" value="{feed}"/><add key="nuget.org" value="https://api.nuget.org/v3/index.json" /></packageSources></configuration>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="candidate" value="{feed}" />
+    <add key="forgejo" value="https://forge.emrul.dev/api/packages/Aster/nuget/index.json" />
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+  </packageSources>
+  <packageSourceMapping>
+    <clear />
+    <packageSource key="candidate"><package pattern="Aster" /></packageSource>
+    <packageSource key="forgejo"><package pattern="Apache.Fory" /></packageSource>
+    <packageSource key="nuget.org"><package pattern="*" /></packageSource>
+  </packageSourceMapping>
+</configuration>
 ''', encoding="utf-8")
 
     env = os.environ.copy()

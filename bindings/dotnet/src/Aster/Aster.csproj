@@ -48,7 +48,7 @@
     <!-- ILogger bridge (O9): the abstractions only; the application brings its logging provider -->
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.9" />
     <!-- 1.7.6 wire format with the C# metadata-cache publication fix (FORY-CS-001).
-         Resolve this exact fork package through bindings/dotnet/NuGet.Config. -->
+         Resolve this exact fork package through NuGet.Config. -->
     <PackageReference Include="Apache.Fory" Version="[1.7.6-aster.1]" />
   </ItemGroup>
 
