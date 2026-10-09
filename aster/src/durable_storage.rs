@@ -38,7 +38,7 @@ impl StorageError {
 
 /// An exclusive lock on the storage directory, held for the runtime lifetime.
 ///
-/// The lock is released by dropping this value, which closes the file. It is
+/// The lock is explicitly released before dropping this value closes the file. It is
 /// advisory against cooperating processes; arbitrary code already running as
 /// the storage owner is inside the host threat boundary and this does not
 /// pretend otherwise.
@@ -102,6 +102,17 @@ impl DirectoryLock {
             path: self.path.clone(),
             source,
         })
+    }
+}
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        // Closing alone leaves a Unix flock held while an unrelated forked
+        // subprocess still has the inherited open file description, even with
+        // close-on-exec set. Release at the owner's shutdown boundary instead.
+        // Callers drop this guard only after their database actors/readers stop.
+        // Drop cannot report an error; the file still closes as a fallback.
+        let _ = self.file.unlock();
     }
 }
 
@@ -228,6 +239,31 @@ mod tests {
             .unwrap()
             .unlock()
             .unwrap();
+    }
+
+    // A forked subprocess temporarily inherits the same open file description
+    // until exec closes it. Cloning models that lifetime without forking the
+    // multithreaded test harness or relying on a scheduling race.
+    #[cfg(unix)]
+    #[test]
+    fn owner_drop_releases_lock_while_an_inherited_descriptor_remains_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("LOCK");
+        let owner = DirectoryLock::acquire(&path, true).unwrap();
+        let inherited = owner.file.try_clone().unwrap();
+        assert!(matches!(
+            DirectoryLock::acquire(&path, true),
+            Err(StorageError::LockContended { .. })
+        ));
+        drop(owner);
+        let reopened = DirectoryLock::acquire(&path, true)
+            .expect("the departed owner must release its lock before an inherited fd closes");
+        drop(inherited);
+        assert!(matches!(
+            DirectoryLock::acquire(&path, true),
+            Err(StorageError::LockContended { .. })
+        ));
+        drop(reopened);
     }
 
     #[test]
