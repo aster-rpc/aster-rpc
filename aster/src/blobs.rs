@@ -3,7 +3,8 @@
 use crate::error::{Error, Result};
 use crate::id::{Hash, NodeId};
 use aster_transport_core::{
-    CoreBlobStatus, CoreBlobsClient, CoreFetchReport, CoreFetchStrategy, CoreProviderOutcome,
+    CoreBlobCustody, CoreBlobStatus, CoreBlobsClient, CoreFetchReport, CoreFetchStrategy,
+    CoreProviderOutcome,
 };
 
 /// The on-wire format of a blob.
@@ -178,6 +179,83 @@ impl From<CoreFetchReport> for FetchReport {
     }
 }
 
+/// Temporary custody for multiple typed roots, including roots not yet fetched.
+///
+/// Close rejects new operations. Already admitted native work retains all
+/// guards until it completes. No persistent tag is created until retain.
+/// HashSeq describes an arbitrary sequence of hashes, not a Collection schema.
+pub struct BlobCustody {
+    inner: CoreBlobCustody,
+}
+impl BlobCustody {
+    pub fn close(&self) {
+        self.inner.close();
+    }
+    pub async fn close_and_wait(&self) {
+        self.inner.close_and_wait().await;
+    }
+    pub async fn protect(&self, hash: &Hash, format: BlobFormat) -> Result<()> {
+        Ok(self
+            .inner
+            .protect(hash.as_str().into(), format.as_core())
+            .await?)
+    }
+    pub async fn add_bytes(&self, data: impl Into<Vec<u8>>, format: BlobFormat) -> Result<Hash> {
+        Ok(Hash::from_hex(
+            self.inner.add_bytes(data.into(), format.as_core()).await?,
+        ))
+    }
+    pub async fn add_path(&self, path: impl Into<String>, format: BlobFormat) -> Result<Hash> {
+        Ok(Hash::from_hex(
+            self.inner.add_path(path.into(), format.as_core()).await?,
+        ))
+    }
+    pub async fn retain(
+        &self,
+        hash: &Hash,
+        format: BlobFormat,
+        tag_name: impl Into<String>,
+    ) -> Result<()> {
+        Ok(self
+            .inner
+            .retain(
+                hash.as_str().into(),
+                format.as_core(),
+                tag_name.into(),
+                None,
+            )
+            .await?)
+    }
+    /// Read the root's bytes without interpreting a Collection.
+    pub async fn read(&self, hash: &Hash) -> Result<Vec<u8>> {
+        Ok(self.inner.read(hash.as_str().into()).await?)
+    }
+    /// Fetch to the store under temporary custody, preserving HashSeq format.
+    pub async fn download(
+        &self,
+        hash: &Hash,
+        format: BlobFormat,
+        providers: &[NodeId],
+        strategy: FetchStrategy,
+    ) -> Result<FetchReport> {
+        Ok(self
+            .inner
+            .download(
+                hash.as_str().into(),
+                format.as_core(),
+                providers.iter().map(|id| id.as_str().to_owned()).collect(),
+                strategy.as_core(),
+            )
+            .await?
+            .into())
+    }
+}
+impl Drop for BlobCustody {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// A handle to a node's blob store. Cheap to clone.
 #[derive(Clone)]
 pub struct Blobs {
@@ -225,6 +303,56 @@ impl Blobs {
         Ok(Hash::from_hex(
             self.inner
                 .add_path_with_named_tag(path.into(), tag_name.into())
+                .await?,
+        ))
+    }
+
+    /// Own temporary GC custody across host verification and multiple roots.
+    pub fn custody(&self) -> BlobCustody {
+        BlobCustody {
+            inner: self.inner.custody(),
+        }
+    }
+
+    /// Import, compare the store-computed hash, then commit a named root.
+    /// A mismatch or cancellation before commit leaves the previous tag intact.
+    /// This preserves ordinary store durability, without a stronger fsync claim.
+    pub async fn add_bytes_verified(
+        &self,
+        data: impl Into<Vec<u8>>,
+        expected_hash: &Hash,
+        format: BlobFormat,
+        tag_name: impl Into<String>,
+    ) -> Result<Hash> {
+        Ok(Hash::from_hex(
+            self.inner
+                .add_bytes_verified(
+                    data.into(),
+                    expected_hash.as_str().into(),
+                    format.as_core(),
+                    tag_name.into(),
+                    None,
+                )
+                .await?,
+        ))
+    }
+    /// Verified retained Copy import; later source edits cannot alter the blob.
+    pub async fn add_path_verified(
+        &self,
+        path: impl Into<String>,
+        expected_hash: &Hash,
+        format: BlobFormat,
+        tag_name: impl Into<String>,
+    ) -> Result<Hash> {
+        Ok(Hash::from_hex(
+            self.inner
+                .add_path_verified(
+                    path.into(),
+                    expected_hash.as_str().into(),
+                    format.as_core(),
+                    tag_name.into(),
+                    None,
+                )
                 .await?,
         ))
     }

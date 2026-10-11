@@ -14,6 +14,7 @@ path = "src/bin/soak_test_runner/main.rs"
 
 [dependencies]
 aster_transport_core = { path = "../core", version = "=0.3.0" }
+aster-transport-salvo = { path = "../aster-transport-salvo", version = "=0.3.0" }
 # Observability (ABI 4.6, design OBSERVABILITY_HEALTH_DESIGN.md §2.1/§7): the
 # binding profile's exporters -- OTLP over http/protobuf, OTLP logs (path B,
 # `aster_log_emit`) and the Prometheus pull reader (`aster_metrics_prometheus`).
@@ -38,6 +39,9 @@ base64 = "0.22"
 # Note: aster_ffi.h is regenerated externally with cbindgen; not a build dep.
 
 [dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rustls = "0.23"
+wtransport = { version = "0.7", features = ["quinn", "dangerous-configuration"] }
 # In-memory exporters for tests/observability.rs.
 aster-otel = { path = "../aster-otel", version = "=0.3.0", features = ["testing"] }
 # Rust events for the log bridge cases.

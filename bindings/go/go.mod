@@ -1,4 +1,4 @@
-module aster-ffi
+module sdk.getaster.now/go
 
 go 1.25.0
 

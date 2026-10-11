@@ -119,6 +119,35 @@ func nz(s []string) []string {
 
 func ucCodecFor(typ string) *ucCodec {
 	switch typ {
+	case "RpcAuthRequest":
+		return &ucCodec{
+			func(b []byte) (any, error) {
+				v, err := DecodeRPCAuthRequest(b)
+				return jm{"peer_id": v.PeerID, "service": v.Service, "method": v.Method, "session_id": v.SessionID, "metadata": v.Metadata}, err
+			},
+			func(b []byte) ([]byte, error) {
+				v, err := DecodeRPCAuthRequest(b)
+				if err != nil {
+					return nil, err
+				}
+				return EncodeRPCAuthRequest(v)
+			}}
+	case "RpcAuthResponse":
+		return &ucCodec{
+			func(b []byte) (any, error) {
+				v, err := DecodeRPCAuthResponse(b)
+				if !v.Accepted {
+					return jm{"accepted": false}, err
+				}
+				return jm{"accepted": true, "principal": v.Principal, "attributes": v.Attributes}, err
+			},
+			func(b []byte) ([]byte, error) {
+				v, err := DecodeRPCAuthResponse(b)
+				if err != nil {
+					return nil, err
+				}
+				return EncodeRPCAuthResponse(v)
+			}}
 	case "LeaseTransitionRequest":
 		return &ucCodec{
 			func(b []byte) (any, error) {
@@ -403,7 +432,8 @@ var ucUnsupported = map[string]bool{}
 
 func TestUCv1_ValidVectors(t *testing.T) {
 	checked := 0
-	for _, v := range loadUCVectors(t).Valid {
+	vectors := loadUCVectors(t).Valid
+	for _, v := range vectors {
 		c := ucCodecFor(v.Type)
 		if c == nil {
 			if !ucUnsupported[v.Type] {
@@ -430,14 +460,15 @@ func TestUCv1_ValidVectors(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != 46 {
-		t.Errorf("checked %d valid vectors, want 46", checked)
+	if checked != len(vectors) {
+		t.Errorf("checked %d valid vectors, want %d", checked, len(vectors))
 	}
 }
 
 func TestUCv1_InvalidVectors(t *testing.T) {
 	checked := 0
-	for _, v := range loadUCVectors(t).Invalid {
+	vectors := loadUCVectors(t).Invalid
+	for _, v := range vectors {
 		c := ucCodecFor(v.Type)
 		if c == nil {
 			t.Fatalf("no codec for %s", v.Type)
@@ -448,8 +479,8 @@ func TestUCv1_InvalidVectors(t *testing.T) {
 		}
 		checked++
 	}
-	if checked != 21 {
-		t.Errorf("checked %d invalid vectors, want 21", checked)
+	if checked != len(vectors) {
+		t.Errorf("checked %d invalid vectors, want %d", checked, len(vectors))
 	}
 }
 
@@ -462,6 +493,7 @@ func TestUCv1_TablesMatchTheSpec(t *testing.T) {
 		33: "placement_provision", UpcallExposeAuthorize: "expose_authorize", UpcallExposeHTTP: "expose_http",
 		UpcallExposeRoutePolicy: "expose_route_policy", UpcallAdmissionConnect: "admission_connect",
 		UpcallAdmissionHandshake: "admission_handshake",
+		UpcallRpcAuthenticate:    "rpc_authenticate",
 	}
 	for _, k := range d.Kinds {
 		kind := UpcallKind(k.Code)

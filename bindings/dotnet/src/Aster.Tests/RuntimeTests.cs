@@ -13,6 +13,59 @@ namespace Aster.Tests;
 public class RuntimeTests
 {
     [Fact]
+    public async Task Close_Faults_Idle_Native_Docs_Receive_And_Rejects_New_Waits()
+    {
+        using var runtime = new Runtime();
+        // Use raw native owners here so final Runtime.Dispose really closes
+        // the runtime, rather than releasing one reference of a managed receiver.
+        ulong start = Node.BeginStart(runtime, new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" }, null, null);
+        var nodeEvent = await Ops.Await(runtime, start, EventKind.NodeCreated, "start", default);
+        var docs = new Docs(runtime, nodeEvent.handle);
+        using var doc = await docs.CreateAsync();
+        Native.Check(Native.aster_doc_subscribe(runtime.Handle, doc.Handle, 0, out ulong subscribe), "subscribe");
+        var receiver = await Ops.Await(runtime, subscribe, EventKind.DocSubscribed, "subscribe", default);
+        EventError.TakePayload(runtime, receiver);
+        Native.Check(Native.aster_doc_event_recv(runtime.Handle, receiver.handle, 0, out ulong receive), "receive");
+        var pending = runtime.WaitForAsync(receive);
+        Assert.False(pending.IsCompleted);
+        runtime.Dispose();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => pending.WaitAsync(TimeSpan.FromSeconds(3)));
+        Assert.Equal(0, runtime.PendingOperationCount);
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () => await runtime.WaitForAsync(ulong.MaxValue));
+        Assert.Throws<ObjectDisposedException>(() => runtime.Retain());
+    }
+
+    [Fact]
+    public async Task Close_Racing_Wait_Registration_Completes_Every_Waiter()
+    {
+        using var runtime = new Runtime();
+        using var start = new ManualResetEventSlim();
+        var waiters = Enumerable.Range(1, 100).Select(id => Task.Run(async () =>
+        {
+            start.Wait();
+            await Assert.ThrowsAsync<ObjectDisposedException>(async () => await runtime.WaitForAsync((ulong)id));
+        })).ToArray();
+        var close = Task.Run(() => { start.Wait(); runtime.Dispose(); });
+        start.Set();
+        await Task.WhenAll(waiters.Append(close)).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, runtime.PendingOperationCount);
+    }
+
+    [Fact]
+    public async Task Managed_Receiver_Keeps_Runtime_Alive_Until_Receiver_And_Receive_End()
+    {
+        var node = await Node.StartAsync(new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" });
+        var runtime = node.Runtime;
+        using var doc = await node.Docs().CreateAsync();
+        using var events = await doc.SubscribeAsync();
+        var pending = events.ReceiveAsync();
+        node.Dispose();
+        events.Dispose();
+        Assert.Null(await pending.WaitAsync(TimeSpan.FromSeconds(3)));
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () => await runtime.WaitForAsync(ulong.MaxValue));
+    }
+
+    [Fact]
     public void Create_Close_NoExceptions()
     {
         var runtime = new Runtime();

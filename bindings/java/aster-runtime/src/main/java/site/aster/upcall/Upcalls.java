@@ -15,6 +15,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import site.aster.handle.IrohRuntime;
@@ -178,6 +179,7 @@ public final class Upcalls implements AutoCloseable {
   private final MemorySegment pollCount;
   private final AtomicLong cancels = new AtomicLong();
   private volatile boolean closed;
+  private final AtomicBoolean disposed = new AtomicBoolean();
   private final Thread pollThread;
 
   private Upcalls(IrohRuntime runtime, long handle) {
@@ -280,6 +282,30 @@ public final class Upcalls implements AutoCloseable {
     return this;
   }
 
+  /** Whether a typed or raw kind-80 authentication handler is registered. */
+  public boolean hasRpcAuthenticator() {
+    return !closed && handlers.containsKey(UpcallKind.RPC_AUTHENTICATE.code);
+  }
+
+  /**
+   * Serve listener authentication with the strict C9/CA codec. Explicit rejection maps to
+   * UNAUTHENTICATED; callback/encoding errors map to UNAVAILABLE. Cancellation interrupts the
+   * callback and suppresses late responses. Decision failure-mode settings cannot make auth open.
+   */
+  public Upcalls serveRpcAuthenticator(RpcAuthenticator authenticator) {
+    java.util.Objects.requireNonNull(authenticator, "authenticator");
+    return handleInvocation(
+        UpcallKind.RPC_AUTHENTICATE,
+        inv -> {
+          Ucv1.RpcAuthRequest request = Ucv1.decodeRpcAuthRequest(inv.payload());
+          Ucv1.RpcAuthResponse response = authenticator.authenticate(request, inv);
+          byte[] encoded = Ucv1.encodeRpcAuthResponse(response);
+          if (!inv.isCancelled() && !Thread.currentThread().isInterrupted()) {
+            inv.respond(STATUS_OK, encoded);
+          }
+        });
+  }
+
   /** Serve {@code LEASE_TRANSITION} and {@code LEASE_SNAPSHOT} with {@code s}. */
   public Upcalls serveLeaseSerializer(LeaseSerializer s) {
     handle(
@@ -338,6 +364,15 @@ public final class Upcalls implements AutoCloseable {
       int n;
       try {
         int status = (int) POLL.invoke(runtime.nativeHandle(), handle, events, BATCH, 0, pollCount);
+        if (status == site.aster.ffi.IrohStatus.NOT_FOUND.code
+            || status == site.aster.ffi.IrohStatus.ALREADY_CLOSED.code) {
+          // Runtime shutdown removes the native table before its CANCEL events can be polled.
+          // Settle managed workers too; native no longer accepts any of their responses.
+          closed = true;
+          cancelHandlers(CANCEL_SHUTDOWN);
+          workers.shutdownNow();
+          return;
+        }
         n = status == 0 ? pollCount.get(I, 0) : 0;
       } catch (Throwable t) {
         if (closed) {
@@ -464,7 +499,7 @@ public final class Upcalls implements AutoCloseable {
    */
   @Override
   public void close() {
-    if (closed) {
+    if (!disposed.compareAndSet(false, true)) {
       return;
     }
     try {
@@ -478,7 +513,7 @@ public final class Upcalls implements AutoCloseable {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
-    inFlight.values().forEach(r -> r.task().cancel(true));
+    cancelHandlers(CANCEL_SHUTDOWN);
     workers.shutdownNow();
     try {
       workers.awaitTermination(2, TimeUnit.SECONDS);
@@ -491,5 +526,15 @@ public final class Upcalls implements AutoCloseable {
       // runtime already closed
     }
     arena.close();
+  }
+
+  private void cancelHandlers(int reason) {
+    inFlight
+        .values()
+        .forEach(
+            r -> {
+              r.invocation().cancelReason = reason;
+              r.task().cancel(true);
+            });
   }
 }

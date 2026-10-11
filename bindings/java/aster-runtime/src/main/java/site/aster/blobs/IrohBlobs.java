@@ -34,6 +34,32 @@ public class IrohBlobs {
     this.nodeHandle = nodeHandle;
   }
 
+  /**
+   * Open temporary Raw/HashSeq GC custody without creating a persistent root. Close every scope.
+   */
+  public BlobCustody custody() {
+    return BlobCustody.create(runtime, nodeHandle);
+  }
+
+  /** Verify the store-computed hash before committing the exact named Raw/HashSeq root. */
+  public BlobOperation<BlobId> addBytesVerifiedAsync(
+      byte[] data, BlobId expectedHash, BlobFormat format, String tagName) {
+    return BlobCustody.verified(runtime, nodeHandle, data, null, expectedHash, format, tagName);
+  }
+
+  /** Verified Copy import, never a mutable file reference. No anonymous tag is created. */
+  public BlobOperation<BlobId> addPathVerifiedAsync(
+      Path path, BlobId expectedHash, BlobFormat format, String tagName) {
+    return BlobCustody.verified(
+        runtime,
+        nodeHandle,
+        null,
+        java.util.Objects.requireNonNull(path, "path"),
+        expectedHash,
+        format,
+        tagName);
+  }
+
   private IrohRuntime runtime() {
     return runtime;
   }
@@ -388,44 +414,33 @@ public class IrohBlobs {
    */
   public CompletableFuture<byte[]> readAsync(String hashHex) {
     var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-
-    var hashSeg = toHexSegment(hashHex, alloc);
-    // Wrap in aster_bytes_t struct
-    var hashBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
-    hashBytesSeg.set(ValueLayout.ADDRESS, 0, hashSeg);
-    hashBytesSeg.set(
-        ValueLayout.JAVA_LONG, 8, (long) hashHex.getBytes(StandardCharsets.UTF_8).length);
-
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    try {
-      int status = lib.blobsRead(runtime.nativeHandle(), nodeHandle, hashBytesSeg, opSeg);
+    final long opId;
+    try (Arena arena = Arena.ofConfined()) {
+      var hash = DataPlane.utf8(arena, hashHex);
+      var out = arena.allocate(ValueLayout.JAVA_LONG);
+      int status = lib.blobsRead(runtime.nativeHandle(), nodeHandle, hash, out);
       if (status != 0) {
         throw new IrohException(IrohStatus.fromCode(status), "aster_blobs_read failed: " + status);
       }
+      opId = out.get(ValueLayout.JAVA_LONG, 0);
     } catch (IrohException e) {
       return CompletableFuture.failedFuture(e);
     } catch (Throwable t) {
       return CompletableFuture.failedFuture(
           new IrohException("aster_blobs_read threw: " + t.getMessage()));
     }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
     return runtime
         .registry()
         .register(opId)
         .thenApply(
             event -> {
-              if (event.kind() == IrohEventKind.BLOB_READ) {
-                byte[] data = event.data().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
-                if (event.hasBuffer()) {
-                  runtime.releaseBuffer(event.buffer());
-                }
-                return data;
+              try {
+                if (event.kind() != IrohEventKind.BLOB_READ)
+                  throw new IrohException("read failed: unexpected event " + event.kind());
+                return BlobOperation.payload(event);
+              } finally {
+                if (event.hasBuffer()) runtime.releaseBuffer(event.buffer());
               }
-              throw new IrohException("read failed: unexpected event " + event.kind());
             });
   }
 

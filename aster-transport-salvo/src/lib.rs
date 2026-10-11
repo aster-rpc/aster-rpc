@@ -36,8 +36,10 @@
 /// when a Salvo proc macro requires an extern-prelude `salvo` name.
 pub use salvo;
 
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -56,11 +58,14 @@ use aster_transport_core::framing::{
     decode_frame, payload_of, FLAG_COMPRESSED, FLAG_END_STREAM, FLAG_TRAILER,
 };
 use aster_transport_core::reactor::{
-    response_channel, ResponseItem, ResponseLease, ResponseReceiver,
+    response_channel, CancelSignal, ResponseItem, ResponseLease, ResponseReceiver,
 };
 
+pub(crate) mod listener;
 pub mod tls;
 pub mod webtransport;
+pub use listener::OwnedListener;
+use listener::TaskScope;
 pub use tls::{
     generate_self_signed, generate_webtransport_cert, rustls_config, serve_https, serve_https_with,
     verify_cert_binding, GeneratedCert, NodeBinding, TlsMaterial, TransportConfig,
@@ -115,6 +120,55 @@ impl HttpConfig {
     ) -> Self {
         self.static_mounts.push((path_prefix.into(), dir.into()));
         self
+    }
+
+    /// Bind an owned PEM listener using the supplied authentication policy.
+    /// Both TCP and (when enabled) WebTransport are ready before this returns.
+    /// The original dispatcher's policy is unchanged.
+    /// Authentication applies to RPC routes; static mounts remain public files.
+    pub async fn start_authenticated(
+        self,
+        dispatcher: Dispatcher,
+        auth: Arc<dyn aster::rpc::Authenticator>,
+    ) -> Result<OwnedListener, String> {
+        let dispatcher = dispatcher.with_authenticator(auth);
+        self.start_owned(dispatcher).await
+    }
+
+    /// Bind an explicitly public, anonymous PEM listener.
+    ///
+    /// Shared RPC services need no credentials, but Gate 3 and Iroh-only
+    /// restrictions still apply. Session-scoped services are refused before
+    /// creating an instance; addresses and supplied session ids do not establish
+    /// a caller identity. Static mounts remain public files.
+    pub async fn start_public(self, dispatcher: Dispatcher) -> Result<OwnedListener, String> {
+        self.start_owned(dispatcher.for_public_transport()).await
+    }
+
+    async fn start_owned(self, dispatcher: Dispatcher) -> Result<OwnedListener, String> {
+        let scope = TaskScope::new();
+        let mut app = Router::new().push(router_with_scope(
+            dispatcher.clone(),
+            self.projections,
+            scope.clone(),
+        ));
+        if self.webtransport {
+            app = app.push(webtransport::wt_router_with_scope(
+                dispatcher,
+                scope.clone(),
+            ));
+        }
+        for (prefix, dir) in self.static_mounts {
+            app = app.push(static_router(&prefix, dir));
+        }
+        tls::start_pem_listener(
+            &self.addr,
+            self.tls,
+            Service::new(app),
+            self.webtransport,
+            scope,
+        )
+        .await
     }
 }
 
@@ -178,15 +232,65 @@ pub fn router(dispatcher: Dispatcher) -> Router {
 /// Like [`router`], plus a [`ProjectionRegistry`] enabling browser media types
 /// (`application/json` / `application/x-ndjson`) for the registered services.
 pub fn router_with(dispatcher: Dispatcher, projections: ProjectionRegistry) -> Router {
+    router_with_scope(dispatcher, projections, TaskScope::new())
+}
+
+pub(crate) fn router_with_scope(
+    dispatcher: Dispatcher,
+    projections: ProjectionRegistry,
+    scope: TaskScope,
+) -> Router {
     Router::with_path("aster/{service}/{method}").post(AsterHandler {
         dispatcher,
         projections,
+        scope,
     })
 }
 
 struct AsterHandler {
     dispatcher: Dispatcher,
     projections: ProjectionRegistry,
+    scope: TaskScope,
+}
+
+struct CallCancellation {
+    signal: Arc<CancelSignal>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for CallCancellation {
+    fn drop(&mut self) {
+        self.signal.cancel(&self.cancelled);
+    }
+}
+
+/// Own cancellation for the response body's entire lifetime, including foreign
+/// dispatchers that return before their binding finishes sending the response.
+struct CallResponse {
+    terminal: bool,
+    receiver: ResponseReceiver,
+    _cancel: CallCancellation,
+}
+
+impl futures_util::Stream for CallResponse {
+    type Item = ResponseItem;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminal {
+            return Poll::Ready(None);
+        }
+        let item = Pin::new(&mut self.receiver).poll_next(cx);
+        if let Poll::Ready(Some(ref item)) = item {
+            self.terminal = item.is_terminal();
+        }
+        item
+    }
+}
+
+impl CallResponse {
+    async fn recv(&mut self) -> Option<ResponseItem> {
+        self.next().await
+    }
 }
 
 #[async_trait]
@@ -336,7 +440,7 @@ impl AsterHandler {
     fn respond_ndjson(
         &self,
         res: &mut Response,
-        resp_rx: ResponseReceiver,
+        resp_rx: CallResponse,
         proj: Arc<dyn Projection>,
         method: String,
     ) {
@@ -368,7 +472,7 @@ impl AsterHandler {
     async fn respond_json(
         &self,
         res: &mut Response,
-        mut resp_rx: ResponseReceiver,
+        mut resp_rx: CallResponse,
         proj: Arc<dyn Projection>,
         method: String,
         media_out: String,
@@ -422,7 +526,7 @@ impl AsterHandler {
         peer_id: String,
         header_payload: Vec<u8>,
         req_frames: Vec<(Vec<u8>, u8)>,
-    ) -> ResponseReceiver {
+    ) -> CallResponse {
         // Bounded to match `CallParts`, but sized to the frames already in
         // hand rather than to `FRAME_CHANNEL_DEPTH`. Unlike the WebTransport
         // path this is not a live stream: an HTTP request body is fully read
@@ -441,7 +545,9 @@ impl AsterHandler {
         let (resp_tx, resp_rx) = response_channel();
         // `Other`: an HTTP front end's peer id may be a client-supplied
         // header. See the WebTransport site for the same reasoning.
-        let parts = CallParts::new(
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new(CancelSignal::new());
+        let mut parts = CallParts::new(
             peer_id,
             PeerProvenance::Other,
             header_payload,
@@ -449,13 +555,42 @@ impl AsterHandler {
             request_flags,
             resp_tx,
             req_rx,
-            Arc::new(AtomicBool::new(false)),
+            cancelled.clone(),
         );
+        parts.cancel_notify = Some(signal.clone());
         let dispatcher = self.dispatcher.clone();
-        tokio::spawn(async move {
-            dispatcher.dispatch_parts(parts).await;
+        let task_cancel = CallCancellation {
+            signal: signal.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let response_cancel = CallCancellation {
+            signal: signal.clone(),
+            cancelled: cancelled.clone(),
+        };
+        self.scope.spawn(async move {
+            let _cancel = task_cancel;
+            let notified = signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            tokio::select! {
+                _ = dispatcher.dispatch_parts(parts) => {
+                    // Do not retain a ResponseSender here: that would prevent
+                    // EOF after a successful handler drops its last producer.
+                    if !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        notified.await;
+                    }
+                }
+                _ = &mut notified => {}
+            }
         });
-        resp_rx
+        CallResponse {
+            terminal: false,
+            receiver: resp_rx,
+            _cancel: response_cancel,
+        }
     }
 }
 
@@ -598,4 +733,37 @@ fn build_header(req: &Request, service: String, method: String) -> Result<Vec<u8
 fn fail(res: &mut Response, code: HttpStatus, msg: &str) {
     res.status_code(code);
     res.render(msg.to_string());
+}
+
+#[cfg(test)]
+mod response_completion_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn terminal_response_ends_http_body_with_a_retained_sender() {
+        for frame in [
+            OutgoingFrame::Trailer(vec![1]),
+            OutgoingFrame::CompleteUnary(vec![2]),
+        ] {
+            let (sender, receiver) = response_channel();
+            sender.send(frame).await.unwrap();
+            let mut response = CallResponse {
+                terminal: false,
+                receiver,
+                _cancel: CallCancellation {
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    signal: Arc::new(CancelSignal::new()),
+                },
+            };
+            assert!(response.next().await.unwrap().is_terminal());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), response.next())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(sender);
+        }
+    }
 }

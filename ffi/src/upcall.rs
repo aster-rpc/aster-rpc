@@ -47,6 +47,7 @@
 //! `ASTER_STATUS_NOT_FOUND`, which bindings ignore.
 
 use std::ptr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -129,6 +130,9 @@ pub enum aster_upcall_kind_t {
     ASTER_UPCALL_KIND_ADMISSION_CONNECT = 64,
     /// Gate 0 handshake hook (decision): `C2` → `C3` (not issued by the C ABI yet).
     ASTER_UPCALL_KIND_ADMISSION_HANDSHAKE = 65,
+    /// Per-call authentication: explicit principal/attributes or rejection (C9 -> CA).
+    /// Never uses a fail-open policy; served by authenticated HTTP/WT listeners.
+    ASTER_UPCALL_KIND_RPC_AUTHENTICATE = 80,
 }
 
 /// `status` of `aster_upcall_respond`. An unknown value reads as `ERROR`.
@@ -215,6 +219,7 @@ pub struct aster_topology_admitted_stats_t {
 // ============================================================================
 
 pub(crate) struct UpcallsState {
+    pub(crate) runtime_owner: aster_runtime_t,
     pub(crate) upcalls: Upcalls,
     queue: Arc<UpcallQueue>,
     buffers: BufferRegistry,
@@ -240,8 +245,21 @@ static LEASES: once_cell::sync::Lazy<HandleRegistry<Mutex<Option<LeaseHandle>>>>
     once_cell::sync::Lazy::new(HandleRegistry::new);
 static FENCED: once_cell::sync::Lazy<HandleRegistry<ForeignFencedResource>> =
     once_cell::sync::Lazy::new(HandleRegistry::new);
-static ADMITTED: once_cell::sync::Lazy<HandleRegistry<ForeignAdmittedFn>> =
-    once_cell::sync::Lazy::new(HandleRegistry::new);
+
+/// Retire runtime-owned callback tables and wake any pending authentications.
+pub(crate) fn shutdown_runtime(bridge: &crate::BridgeRuntime) {
+    let ids = std::mem::take(
+        &mut *bridge
+            .upcall_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
+    for id in ids {
+        if let Some(state) = UPCALLS.remove(id) {
+            state.close();
+        }
+    }
+}
 
 pub(crate) fn upcalls_for(upcalls: aster_upcalls_t) -> Result<Arc<UpcallsState>, i32> {
     UPCALLS
@@ -299,7 +317,14 @@ pub unsafe extern "C" fn aster_upcalls_new(
         return invalid("aster_upcalls_new: out_upcalls is NULL");
     }
     *out_upcalls = 0;
-    try_status!(bridge_for(runtime));
+    let bridge = try_status!(bridge_for(runtime));
+    let mut owned = bridge
+        .upcall_handles
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if bridge.closing.load(Ordering::Acquire) {
+        return aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32;
+    }
     let cap = if capacity == 0 {
         ASTER_UPCALL_DEFAULT_CAPACITY
     } else {
@@ -308,11 +333,13 @@ pub unsafe extern "C" fn aster_upcalls_new(
     let queue = UpcallQueue::new(cap as usize);
     let upcalls = Upcalls::new(queue.clone());
     *out_upcalls = UPCALLS.insert(UpcallsState {
+        runtime_owner: runtime,
         upcalls,
         queue,
         buffers: BufferRegistry::new(),
         poll: Mutex::new(()),
     });
+    owned.push(*out_upcalls);
     OK
 }
 
@@ -328,7 +355,11 @@ pub unsafe extern "C" fn aster_upcalls_close(
     upcalls: aster_upcalls_t,
 ) -> i32 {
     try_status!(bridge_for(runtime));
-    try_status!(upcalls_for(upcalls)).close();
+    let state = try_status!(upcalls_for(upcalls));
+    if state.runtime_owner != runtime {
+        return not_found("upcalls belongs to another runtime");
+    }
+    state.close();
     OK
 }
 
@@ -339,9 +370,17 @@ pub unsafe extern "C" fn aster_upcalls_free(
     runtime: aster_runtime_t,
     upcalls: aster_upcalls_t,
 ) -> i32 {
-    try_status!(bridge_for(runtime));
+    let bridge = try_status!(bridge_for(runtime));
+    if try_status!(upcalls_for(upcalls)).runtime_owner != runtime {
+        return not_found("upcalls belongs to another runtime");
+    }
     match UPCALLS.remove(upcalls) {
         Some(state) => {
+            bridge
+                .upcall_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|id| *id != upcalls);
             state.close();
             OK
         }
@@ -1008,6 +1047,9 @@ pub unsafe extern "C" fn aster_topology_admitted_new(
     *out_admitted = 0;
     let bridge = try_status!(bridge_for(runtime));
     let state = try_status!(upcalls_for(upcalls));
+    if state.runtime_owner != runtime {
+        return not_found("upcalls belongs to another runtime");
+    }
     let d = AdmittedCacheOptions::default();
     let opts = AdmittedCacheOptions {
         ttl: if ttl_ms == 0 {
@@ -1028,7 +1070,14 @@ pub unsafe extern "C" fn aster_topology_admitted_new(
     };
     // The refresher task is spawned on the bridge runtime.
     let _enter = bridge.runtime.enter();
-    *out_admitted = ADMITTED.insert(ForeignAdmittedFn::new(state.upcalls.clone(), opts));
+    *out_admitted = bridge
+        .topology_admitted
+        .insert(ForeignAdmittedFn::new(state.upcalls.clone(), opts));
+    if bridge.closing.load(Ordering::Acquire) {
+        bridge.topology_admitted.remove(*out_admitted);
+        *out_admitted = 0;
+        return aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32;
+    }
     OK
 }
 
@@ -1038,15 +1087,19 @@ pub unsafe extern "C" fn aster_topology_admitted_free(
     runtime: aster_runtime_t,
     admitted: aster_topology_admitted_t,
 ) -> i32 {
-    try_status!(bridge_for(runtime));
-    match ADMITTED.remove(admitted) {
+    let bridge = try_status!(bridge_for(runtime));
+    match bridge.topology_admitted.remove(admitted) {
         Some(_) => OK,
         None => not_found(format!("unknown topology admitted filter {admitted}")),
     }
 }
 
-fn admitted_for(admitted: aster_topology_admitted_t) -> Result<Arc<ForeignAdmittedFn>, i32> {
-    ADMITTED
+pub(crate) fn admitted_for(
+    runtime: aster_runtime_t,
+    admitted: aster_topology_admitted_t,
+) -> Result<Arc<ForeignAdmittedFn>, i32> {
+    bridge_for(runtime)?
+        .topology_admitted
         .get(admitted)
         .ok_or_else(|| not_found(format!("unknown topology admitted filter {admitted}")))
 }
@@ -1064,7 +1117,7 @@ pub unsafe extern "C" fn aster_topology_admitted_check(
         return invalid("aster_topology_admitted_check: out_admitted is NULL");
     }
     try_status!(bridge_for(runtime));
-    let f = try_status!(admitted_for(admitted));
+    let f = try_status!(admitted_for(runtime, admitted));
     let id = try_status!(in_hex32(&node_id, "node_id"));
     *out_admitted = u32::from(f.is_admitted(&id));
     OK
@@ -1079,7 +1132,7 @@ pub unsafe extern "C" fn aster_topology_admitted_set(
     is_admitted: u32,
 ) -> i32 {
     try_status!(bridge_for(runtime));
-    let f = try_status!(admitted_for(admitted));
+    let f = try_status!(admitted_for(runtime, admitted));
     let id = try_status!(in_hex32(&node_id, "node_id"));
     f.set(&id, is_admitted != 0);
     OK
@@ -1094,7 +1147,7 @@ pub unsafe extern "C" fn aster_topology_admitted_invalidate(
     node_id: aster_bytes_t,
 ) -> i32 {
     try_status!(bridge_for(runtime));
-    let f = try_status!(admitted_for(admitted));
+    let f = try_status!(admitted_for(runtime, admitted));
     if node_id.len == 0 {
         f.clear();
     } else {
@@ -1119,7 +1172,7 @@ pub unsafe extern "C" fn aster_topology_admitted_prefetch(
         return invalid("aster_topology_admitted_prefetch: out_operation is NULL");
     }
     let bridge = try_status!(bridge_for(runtime));
-    let f = try_status!(admitted_for(admitted));
+    let f = try_status!(admitted_for(runtime, admitted));
     let ids: Vec<String> = try_status!(in_hex_list(&node_ids, "node_ids"));
     spawn_op(&bridge, user_data, out_operation, async move {
         f.prefetch(&ids).await.map_err(|e| e.to_string())?;
@@ -1155,7 +1208,7 @@ pub unsafe extern "C" fn aster_topology_admitted_stats(
         return invalid("aster_topology_admitted_stats: out is NULL");
     }
     try_status!(bridge_for(runtime));
-    let f = try_status!(admitted_for(admitted));
+    let f = try_status!(admitted_for(runtime, admitted));
     let s = f.stats();
     *out = aster_topology_admitted_stats_t {
         hits: s.hits,
@@ -1197,7 +1250,7 @@ pub unsafe extern "C" fn aster_topology_enable_shared(
     let filter = if admitted == 0 {
         None
     } else {
-        Some(try_status!(admitted_for(admitted)).admitted_fn())
+        Some(try_status!(admitted_for(runtime, admitted)).admitted_fn())
     };
     let bootstrap: Vec<String> = try_status!(in_node_list(&bootstrap, "bootstrap"))
         .iter()
@@ -1220,4 +1273,63 @@ pub unsafe extern "C" fn aster_topology_enable_shared(
             .map_err(|e| format!("{e:#}"))?;
         Ok(Done::ok(aster_event_kind_t::ASTER_EVENT_UNIT_RESULT, node))
     })
+}
+
+#[cfg(test)]
+mod runtime_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_close_retires_and_closes_tables_without_explicit_free() {
+        unsafe {
+            let mut runtime = 0;
+            assert_eq!(
+                crate::aster_runtime_new(crate::ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime),
+                OK
+            );
+            let mut table = 0;
+            assert_eq!(aster_upcalls_new(runtime, 1, &mut table), OK);
+            let retained = UPCALLS.get(table).unwrap();
+            assert_eq!(crate::aster_runtime_close(runtime), OK);
+            assert!(UPCALLS.get(table).is_none());
+            assert!(retained.upcalls.is_closed());
+            assert!(retained.queue.is_closed());
+        }
+    }
+
+    #[test]
+    fn another_runtime_cannot_close_or_free_a_table() {
+        unsafe {
+            let mut owner = 0;
+            let mut other = 0;
+            assert_eq!(
+                crate::aster_runtime_new(crate::ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut owner),
+                OK
+            );
+            assert_eq!(
+                crate::aster_runtime_new(crate::ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut other),
+                OK
+            );
+            let mut table = 0;
+            assert_eq!(aster_upcalls_new(owner, 1, &mut table), OK);
+            assert_eq!(
+                aster_upcalls_close(other, table),
+                aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+            );
+            assert_eq!(
+                aster_upcalls_free(other, table),
+                aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+            );
+            assert!(!UPCALLS.get(table).unwrap().upcalls.is_closed());
+            assert_eq!(aster_upcalls_free(owner, table), OK);
+            assert!(crate::load_runtime(owner)
+                .unwrap()
+                .upcall_handles
+                .lock()
+                .unwrap()
+                .is_empty());
+            assert_eq!(crate::aster_runtime_close(owner), OK);
+            assert_eq!(crate::aster_runtime_close(other), OK);
+        }
+    }
 }

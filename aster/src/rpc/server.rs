@@ -347,7 +347,8 @@ impl Server {
     /// `aster-session-id` header (or a non-zero `session_id`) names the
     /// session, scoped to the caller's principal (the [`Authenticator`]
     /// principal, else the transport's peer id); those instances have no cap
-    /// and live until [`end_session`].
+    /// and live until [`end_session`]. Explicit public transport dispatchers reject
+    /// session-scoped services before creating an instance.
     ///
     /// [`end_session`]: Dispatcher::end_session
     pub fn register_session<S, F>(mut self, factory: F) -> Self
@@ -435,6 +436,7 @@ impl Server {
             sessions: Arc::new(SessionStore::new(self.max_sessions_per_connection)),
             attributes: self.attributes.clone(),
             authenticator: self.authenticator.clone(),
+            public_transport: false,
             handler_timeout: self.handler_timeout,
             deadlines: self.deadlines.clone(),
             foreign: self.foreign(),
@@ -608,6 +610,8 @@ pub struct Dispatcher {
     sessions: Arc<SessionStore>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
+    /// Anonymous transport policy: no address-derived authority or sessions.
+    public_transport: bool,
     handler_timeout: Option<Duration>,
     deadlines: DeadlineQueue,
     /// Foreign services, the sink and the shared call table.
@@ -616,6 +620,36 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
+    /// Clone this dispatcher with authentication specific to one listener.
+    ///
+    /// Services, attributes, sessions and the foreign call table remain shared.
+    /// Other clones keep their existing authenticator, so an HTTP credential
+    /// policy need not alter the Iroh listener's policy. Authenticating a
+    /// principal does not change the transport's [`PeerProvenance`].
+    pub fn with_authenticator(&self, auth: Arc<dyn Authenticator>) -> Self {
+        Self {
+            authenticator: Some(auth),
+            public_transport: false,
+            ..self.clone()
+        }
+    }
+
+    /// Clone for an explicitly public, anonymous transport.
+    ///
+    /// The clone has no authenticator or enrolled caller attributes. Gate 3
+    /// still applies with empty attributes and Iroh-only services still require
+    /// transport proof. Session-scoped services are rejected before any session
+    /// factory runs: an address or caller-supplied session id cannot safely
+    /// isolate anonymous callers. Other dispatcher clones are unchanged.
+    pub fn for_public_transport(&self) -> Self {
+        Self {
+            authenticator: None,
+            attributes: AttributeStore::new(),
+            public_transport: true,
+            ..self.clone()
+        }
+    }
+
     /// Build the transport's per-method frame-limit resolver from the
     /// registered services.
     ///
@@ -731,6 +765,12 @@ impl Dispatcher {
         // something to confirm.
         if meta.iroh_only() && !parts.provenance.is_authenticated() {
             return Route::Reject(not_found(&header));
+        }
+        if self.public_transport && factory.is_some() {
+            return Route::Reject(RpcStatus::error(
+                StatusCode::Unauthenticated,
+                "session-scoped service requires an authenticated principal",
+            ));
         }
 
         let unimplemented = || {
@@ -866,7 +906,11 @@ impl Dispatcher {
         if self.authenticator.is_some() {
             return Route::Authenticate(routed);
         }
-        let attributes = self.attributes.get(&parts.peer_id);
+        let attributes = if self.public_transport {
+            HashMap::new()
+        } else {
+            self.attributes.get(&parts.peer_id)
+        };
         if let Err(status) = gate3(&*routed.meta, &routed.header, &attributes) {
             return Route::Reject(status);
         }
@@ -901,7 +945,17 @@ impl Dispatcher {
             Route::Authenticate(mut routed) => {
                 open_routed(&mut obs, &mut routed, &parts.peer_id);
                 match self.authenticate(routed, &mut parts).await {
-                    Ok(routed) => routed,
+                    Ok(Some(routed)) => routed,
+                    Ok(None) => {
+                        // The transport has already stopped listening. Drop
+                        // authentication without emitting a terminal response.
+                        finish_refused(
+                            obs,
+                            &parts,
+                            &RpcStatus::error(StatusCode::Cancelled, "peer cancelled"),
+                        );
+                        return;
+                    }
                     Err(status) => {
                         finish_refused(obs, &parts, &status);
                         emit_rpc_status(&parts.response_sender, &status).await;
@@ -1014,9 +1068,27 @@ impl Dispatcher {
         &self,
         mut routed: Routed,
         parts: &mut CallParts,
-    ) -> std::result::Result<Routed, RpcStatus> {
+    ) -> std::result::Result<Option<Routed>, RpcStatus> {
         let mut attrs = self.attributes.get(&parts.peer_id);
         if let Some(auth) = self.authenticator.as_ref() {
+            // Authentication spends the same routed deadline as the handler.
+            // Register before invoking the hook, so a stalled foreign auth
+            // upcall is dropped on deadline or transport cancellation too.
+            if parts.cancelled.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let deadline_status =
+                || RpcStatus::error(StatusCode::DeadlineExceeded, "deadline exceeded");
+            if routed.deadline.is_some_and(|at| Instant::now() >= at) {
+                parts.cancelled.store(true, Ordering::Release);
+                return Err(deadline_status());
+            }
+            let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+            let _guard = routed.deadline.map(|at| {
+                self.deadlines.register(at, move || {
+                    let _ = fire.send(());
+                })
+            });
             let ctx = AuthContext {
                 peer_id: parts.peer_id.clone(),
                 service: routed.header.service.clone(),
@@ -1024,7 +1096,26 @@ impl Dispatcher {
                 session_id: routed.header.session_id,
                 metadata: metadata_map(&routed.header),
             };
-            let outcome = auth.authenticate(&ctx).await?;
+            let outcome = tokio::select! {
+                biased;
+                () = peer_cancelled(parts.cancel_notify.clone(), parts.cancelled.clone()) => {
+                    return Ok(None);
+                }
+                _ = fired, if routed.deadline.is_some() => {
+                    parts.cancelled.store(true, Ordering::Release);
+                    return Err(deadline_status());
+                }
+                outcome = auth.authenticate(&ctx) => outcome?,
+            };
+            // A ready hook can race the deadline task or a flag-only transport.
+            // Do not resolve a session or dispatch after either has won.
+            if parts.cancelled.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            if routed.deadline.is_some_and(|at| Instant::now() >= at) {
+                parts.cancelled.store(true, Ordering::Release);
+                return Err(deadline_status());
+            }
             if let Some(principal) = outcome.principal {
                 parts.peer_id = principal;
             }
@@ -1041,7 +1132,7 @@ impl Dispatcher {
             routed.target = target_of(instance, &routed.foreign);
         }
         routed.attributes = attrs;
-        Ok(routed)
+        Ok(Some(routed))
     }
 
     /// Hand a routed foreign call to the binding (synchronous; see

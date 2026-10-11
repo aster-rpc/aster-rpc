@@ -353,6 +353,7 @@ dependencies = [
  "anyhow",
  "aster",
  "aster-otel",
+ "aster-transport-salvo",
  "aster_transport_core",
  "async-trait",
  "hex",
@@ -389,6 +390,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "wtransport",
  "x509-parser 0.17.0",
 ]
@@ -400,6 +402,7 @@ dependencies = [
  "anyhow",
  "aster",
  "aster-otel",
+ "aster-transport-salvo",
  "aster_transport_core",
  "async-trait",
  "blake3",
@@ -457,6 +460,7 @@ dependencies = [
  "anyhow",
  "aster",
  "aster-otel",
+ "aster-transport-salvo",
  "aster_transport_core",
  "async-trait",
  "base64 0.22.1",
@@ -467,11 +471,14 @@ dependencies = [
  "libc",
  "loom",
  "once_cell",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "wtransport",
 ]
 
 [[package]]

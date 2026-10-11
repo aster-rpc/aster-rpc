@@ -50,6 +50,8 @@ pub use aster_transport_core::trust::HookFailureMode;
 use crate::log_targets::UPCALL;
 
 pub mod admission;
+#[cfg(feature = "rpc")]
+pub mod auth;
 pub mod codec;
 #[cfg(feature = "expose")]
 pub mod expose;
@@ -63,7 +65,7 @@ pub mod topology;
 /// What an upcall asks. The numeric value is the wire/ABI code (`u16`);
 /// it never changes once assigned. Ranges: `0` control, `1..=15` leases,
 /// `16..=31` topology, `32..=47` placement, `48..=63` expose, `64..=79`
-/// Gate 0 admission.
+/// Gate 0 admission, `80..=95` RPC authentication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u16)]
 #[non_exhaustive]
@@ -101,11 +103,14 @@ pub enum UpcallKind {
     /// Gate 0 inbound after-handshake hook -> accept, or reject with
     /// code + reason.
     AdmissionHandshake = 65,
+    /// Per-call RPC authentication -> an explicit principal and attributes, or rejection.
+    /// This is not a yes/no decision: failure modes can never authorize a call.
+    RpcAuthenticate = 80,
 }
 
 impl UpcallKind {
     /// Every kind, in code order.
-    pub const ALL: [UpcallKind; 14] = [
+    pub const ALL: [UpcallKind; 15] = [
         UpcallKind::Cancel,
         UpcallKind::LeaseTransition,
         UpcallKind::LeaseSnapshot,
@@ -120,6 +125,7 @@ impl UpcallKind {
         UpcallKind::ExposeRoutePolicy,
         UpcallKind::AdmissionConnect,
         UpcallKind::AdmissionHandshake,
+        UpcallKind::RpcAuthenticate,
     ];
 
     /// The ABI code.
@@ -149,6 +155,7 @@ impl UpcallKind {
             UpcallKind::ExposeRoutePolicy => "expose_route_policy",
             UpcallKind::AdmissionConnect => "admission_connect",
             UpcallKind::AdmissionHandshake => "admission_handshake",
+            UpcallKind::RpcAuthenticate => "rpc_authenticate",
         }
     }
 

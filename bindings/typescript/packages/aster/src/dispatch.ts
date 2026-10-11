@@ -1,3 +1,4 @@
+import { HttpListener, type HttpListenerOptions, type RpcAuthenticator } from './http-listener.js';
 /**
  * dispatch.ts -- JS handlers on `aster::rpc::Server` (plan T4, design
  * `dynamic-dispatch-design.md` §2, §4.3).
@@ -193,6 +194,7 @@ export class RpcServer {
   private readonly calls = new Map<number, CallState>();
   private loop: DispatchLoop | null = null;
   private native: NativeDispatchServer | null = null;
+  private readonly httpListeners = new Set<HttpListener>();
   private closedP: Promise<void> | null = null;
   private resolveClosed: (() => void) | null = null;
   private closing: Promise<void> | null = null;
@@ -242,6 +244,7 @@ export class RpcServer {
       delivery: this.opts.delivery,
       builtinNodeInfo: this.opts.builtinNodeInfo,
       builtinTopology: this.opts.builtinTopology,
+      topologyRequires: this.opts.topologyRequires,
       maxSessionsPerConnection: this.opts.maxSessionsPerConnection,
       handlerTimeoutMs: this.opts.handlerTimeoutMs,
       ringCapacity: this.opts.ringCapacity,
@@ -265,12 +268,40 @@ export class RpcServer {
     if (this.closedP) await this.closedP;
   }
 
+  /** Start an authenticated PEM HTTPS/optional WebTransport listener. */
+  async startHttp(options: HttpListenerOptions, authenticate: RpcAuthenticator): Promise<HttpListener> {
+    if (!this.native || this.closing) throw new Error('RPC server is not running');
+    const listener = await HttpListener.start(this.native, options, authenticate,
+      (closed) => this.httpListeners.delete(closed));
+    if (this.closing) {
+      await listener.close();
+      throw new Error('RPC server is closing');
+    }
+    this.httpListeners.add(listener);
+    return listener;
+  }
+
+  /** Explicit anonymous HTTPS/WebTransport. Attribute gates remain enforced; sessions are disabled. */
+  async startPublicHttp(options: HttpListenerOptions): Promise<HttpListener> {
+    if (!this.native || this.closing) throw new Error('RPC server is not running');
+    const listener = await HttpListener.startPublic(this.native, options,
+      (closed) => this.httpListeners.delete(closed));
+    if (this.closing) {
+      await listener.close();
+      throw new Error('RPC server is closing');
+    }
+    this.httpListeners.add(listener);
+    return listener;
+  }
+
   /** Stop serving. The node stays up. */
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closing = (async () => {
       for (const st of this.calls.values()) st.cancel(CancelReason.Peer);
       if (this.loop) await this.loop.close();
+      for (const listener of this.httpListeners) await listener.close();
+      this.httpListeners.clear();
       this.resolveClosed?.();
     })();
     return this.closing;
@@ -384,6 +415,7 @@ export class RpcServer {
         callId: String(ev.wireCallId || id),
         sessionId: ev.sessionId ? String(ev.sessionId) : undefined,
         peer: ev.peer ?? undefined,
+        irohAuthenticated: !!(ev.flags & DispatchFlags.IrohAuthenticated),
         metadata: ev.metadata ?? {},
         attributes: ev.attributes ?? undefined,
         deadline: ev.deadlineMs ? ev.deadlineMs / 1000 : undefined,
@@ -394,7 +426,7 @@ export class RpcServer {
       state,
       srv,
       ev.connectionId,
-      this.opts.peerAttributes,
+      (ev.flags & DispatchFlags.IrohAuthenticated) ? this.opts.peerAttributes : undefined,
     );
     let run: Promise<void>;
     try {

@@ -13,8 +13,8 @@ rules. Direct connections depend on network conditions; relays provide a fallbac
 **The current public preview is 0.3.893.** APIs may change before general
 availability. See [known limitations](docs/KNOWN_ISSUES.md) before adopting it.
 
-- [Documentation](https://docs.aster.site/): concepts, tutorials, and API reference.
-- [First service](https://docs.aster.site/docs/quickstart/python): Python and TypeScript setup.
+- [Documentation](https://sdk.getaster.now/docs/): concepts, tutorials, and API reference.
+- [First service](https://sdk.getaster.now/docs/quickstart/python): Python and TypeScript setup.
 - [Rust guide](docs/aster-rust-getstarted.md): the native Rust API.
 - [Public packages](https://forge.emrul.dev/Aster/-/packages): versioned preview downloads.
 
@@ -75,7 +75,7 @@ npm install @aster-rpc/aster@0.3.893
 ```
 
 The scoped registry setting leaves other npm dependencies on your existing
-registry. Follow the [TypeScript build setup](https://docs.aster.site/docs/guides/typescript-build-setup)
+registry. Follow the [TypeScript build setup](https://sdk.getaster.now/docs/guides/typescript-build-setup)
 for decorators and generated type metadata.
 
 ### Rust
@@ -107,9 +107,9 @@ shown with the package. The .NET binding also depends on
 
 ## Try a service
 
-Start with the [first-service tutorial](https://docs.aster.site/docs/quickstart/python).
+Start with the [first-service tutorial](https://sdk.getaster.now/docs/quickstart/python).
 For streaming, sessions, authorization, and cross-language clients, continue to
-[Mission Control](https://docs.aster.site/docs/quickstart/mission-control).
+[Mission Control](https://sdk.getaster.now/docs/quickstart/mission-control).
 
 The repository includes examples under `examples/python/`,
 `examples/typescript/`, and `examples/rust/`. The tutorials explain the setup and
@@ -128,8 +128,8 @@ C ABI. The engine manages transport, RPC dispatch, and shared services.
 | Authorization | Peer admission and permissions for service calls |
 | Iroh transport | Peer connections, NAT traversal, and relay fallback |
 
-The [architecture reference](https://docs.aster.site/docs/reference/architecture)
-and [trust model](https://docs.aster.site/docs/concepts/trust-model) describe the
+The [architecture reference](https://sdk.getaster.now/docs/reference/architecture)
+and [trust model](https://sdk.getaster.now/docs/concepts/trust-model) describe the
 configuration and boundaries of these layers.
 
 ## Working on the SDK

@@ -40,6 +40,7 @@
  * @module
  */
 
+import type { RpcAuthenticator, RpcAuthRequest } from './http-listener.js';
 import type {
   Upcalls as NativeUpcalls,
   UpcallEventJs as NativeUpcallEvent,
@@ -63,6 +64,7 @@ export const UPCALL_KINDS = Object.freeze({
   expose_route_policy: 50,
   admission_connect: 64,
   admission_handshake: 65,
+  rpc_authenticate: 80,
 } as const);
 
 /** An upcall kind other than `cancel`. @group Upcalls */
@@ -189,6 +191,19 @@ export class Upcalls implements Disposable {
     for (const [kind, policy] of Object.entries(options.policies ?? {})) {
       if (policy) this.setPolicy(kind as UpcallKindName, policy);
     }
+  }
+
+  /** Install fail-closed authentication for every HTTP/WT RPC. */
+  serveRpcAuthenticator(authenticate: RpcAuthenticator): () => void {
+    if (this.closed) throw new Error('upcalls table is closed');
+    return this.handle('rpc_authenticate', async (request, context) => {
+      const identity = await authenticate(request as RpcAuthRequest, context);
+      if (identity === null) return { accepted: false };
+      if (!identity || typeof identity.principal !== 'string' || !identity.principal.length) {
+        throw new TypeError('authentication requires a nonempty principal or null');
+      }
+      return { accepted: true, principal: identity.principal, attributes: identity.attributes ?? {} };
+    });
   }
 
   /** Set `kind`'s policy (unset fields keep their current value). */

@@ -1,17 +1,19 @@
 # Aster Go FFI bindings
 
-**Module path:** `github.com/aster-rpc/aster-go`
+**Module path:** `sdk.getaster.now/go`
 
-This guide uses `bindings/go` in a source checkout. Public Go module availability
-is pending; the module path alone is not a working public installation source.
+The module path is `sdk.getaster.now/go` (Go 1.25+). This guide uses
+`bindings/go` in a source checkout. Public installation is pending HTTPS vanity
+discovery and public release tags; the module path alone is not yet a working
+public installation source. See [publication setup](../../deploy/go-vanity/README.md).
 **Target:** Go 1.25+ (Fory Go 1.7.6 requires it)
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (ABI 4.9 minimum)
+## Preview status (ABI 4.16 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
-TypeScript, Java and .NET. The binding requires native ABI 4.9 or newer within
+TypeScript, Java and .NET. The binding requires native ABI 4.16 or newer within
 major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview release.
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
@@ -63,7 +65,7 @@ major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview rel
   bridge, Prometheus renderer) lives in Rust; the binding starts it and wraps the
   rest. `InitObservability(ObservabilityConfig{...})` (before the first server;
   otherwise `StartServer` / `StartHealth` run the implicit environment-only
-  start) and `ShutdownObservability`. Floor: the binding requires ABI 4.9 or newer
+  start) and `ShutdownObservability`. Floor: the binding requires ABI 4.16 or newer
   (`ABIMinorRequired`, checked by `CheckABI` / `NewRuntime`).
   - *Logs:* Rust `tracing` events reach `log/slog`. One goroutine on a locked OS
     thread polls `aster_log_poll`; `SetLogger(*slog.Logger)` picks the
@@ -151,6 +153,19 @@ major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview rel
   `ShutdownForRoleSwap`; `AuthorityFingerprint`; `Connection.Paths` /
   `SelectedPath`; `SendStream.SetPriority` / `Priority`. Streams also adapt to
   `io.Reader` / `io.WriteCloser` (`RecvStream.Reader`, `SendStream.Writer`).
+- **Docs and file imports:** `Doc.ID`, `Del`, `StartSync(ctx, peers...)`,
+  and `ShareWithAddr` wrap the existing ABI. `GetExact` returns the value in
+  `DocEntry.Value` with the requested key/author and its length; use `Query`
+  for `ContentHash`, `ContentLen`, and `Timestamp`, then `ReadEntryContent`
+  for bytes. Query results contain metadata, not inline values.
+  `Blobs.AddPath` copies a file into the store with automatic retention;
+  `AddPathWithNamedTag` uses only the named retention root and replaces that
+  tag's previous value. Cancellation stops the Go wait but an import already
+  started may still finish. Docs live events use `Doc.Subscribe` or atomic
+  `Docs.JoinAndSubscribeWithEvents`. The returned `DocSubscription` exposes
+  `Recv(ctx)` and must be closed. Timeout preserves subsequent events; a
+  completion that wins the cancellation race is returned. Close wakes pending
+  receives with `io.EOF`. The old document-only `JoinAndSubscribe` is deprecated.
 - **ABI 3.4 pure functions:** typed ids (`ParseID`, `FormatID`, `ValidateID`,
   `SecretKeyPublicKey`, `NamespaceSecretID`), HPKE (`HPKESeal` / `HPKEOpen`,
   identity-derived X25519), attestation (`AttestRootNode`,
@@ -241,6 +256,105 @@ Known gaps:
 - `hostile_race_test.go` / `TestSoak_Short` have no peer and only check "no
   crash"; `TestSoak_Runs` (30 min) is skipped unless `ASTER_GO_SOAK=1`.
 
+## Authenticated HTTPS and WebTransport
+
+ABI 4.11 adds `AsterServer.StartHTTP` over the server's registered RPC services.
+Register a typed authenticator on an upcall table from `srv.Node().Runtime()`
+before starting the listener. The authenticator validates credentials from
+`RPCAuthRequest.Metadata` and returns `RPCAuthResponse{Accepted: true,
+Principal: ..., Attributes: ...}`. A successful principal must be nonempty;
+`Accepted: false` rejects credentials, while a callback error reports an
+authentication backend failure. Resolved attributes apply to that call's Gate 3
+checks. An HTTP address is an identity hint; accepted calls retain HTTP/WT
+provenance rather than becoming Iroh-authenticated peers.
+
+```go
+// auth implements aster.RPCAuthenticator using your credential backend.
+// The caller owns srv and closes it after this function returns.
+func serveHTTPS(ctx context.Context, srv *aster.AsterServer,
+	certPEM, keyPEM []byte, auth aster.RPCAuthenticator) error {
+	up, err := aster.NewUpcalls(srv.Node().Runtime(), 256)
+	if err != nil { return err }
+	defer up.Close()
+	if err := up.ServeRPCAuthenticator(auth); err != nil { return err }
+	if err := up.SetPolicy(aster.UpcallRpcAuthenticate,
+		2*time.Second, aster.FailureModeClosed); err != nil { return err }
+	listener, err := srv.StartHTTP(ctx, up, aster.HTTPListenerConfig{
+		BindAddr: "127.0.0.1:0",
+		CertificatePEM: certPEM, PrivateKeyPEM: keyPEM,
+		WebTransport: true,
+		MaxPendingAuth: 256, MaxAuthPayloadBytes: 64 << 10,
+	})
+	// A rare cleanup failure can return an owner together with an error.
+	if listener != nil { defer listener.Close() }
+	if err != nil { return err }
+	fmt.Println("HTTPS:", listener.TCPAddr(), "WebTransport:", listener.QUICAddr())
+	<-ctx.Done()
+	return listener.Stop(2*time.Second)
+}
+```
+
+Startup returns after TCP and optional QUIC bind; WebTransport uses the same
+bound address and port. `QUICAddr()` is empty when disabled. Empty `BindAddr`
+selects `127.0.0.1:0`; zero auth limits select the defaults shown above. Pending
+auth capacity is acquired before encoding and remains occupied after queue
+polling until completion, timeout or cancellation. Kind 80 always fails closed,
+including when its failure policy is set to `FailureModeOpen`.
+
+Stop the listener, close its upcall table, then close the server and any separately
+owned runtime. `Stop(grace)` drains until the grace expires, then cancels remaining
+work and joins native tasks; `Close()` cancels application work immediately.
+The grace bounds application draining, while QUIC protocol/socket cleanup may
+extend beyond it. Both release TCP/UDP ports on success. Stop errors preserve the listener owner for retry. Server
+shutdown also stops its children, but their Go wrappers still require `Close()`.
+The start context is checked before and after synchronous native startup;
+cancellation during startup stops a newly created listener before returning.
+Auth callbacks should observe their context when canceled.
+
+This surface accepts PEM certificate/key material from the operator or the
+certificate helpers below. The Go client
+currently speaks Iroh RPC; there is no Go HTTPS/WT client wrapper yet. HTTP clients
+can POST Aster frames to `/aster/{service}/{method}`, while WebTransport clients
+open `/aster/wt` and use one bidirectional stream per RPC call.
+
+### Explicit public serving and certificate helpers
+
+ABI 4.12 adds a separately named `StartPublicHTTP`; missing authentication on
+`StartHTTP` still fails. Public serving takes no upcall table, supplies no
+capability attributes, preserves Gate 3 and Iroh-only checks, and rejects all
+session-scoped services with `UNAUTHENTICATED` before their factory runs. Its
+authentication-limit fields must remain zero. Use it only for services intended
+to accept uncredentialed calls. It has the same readiness and joined cleanup
+contract as authenticated serving.
+
+```go
+cert, err := aster.GenerateWebTransportCertificate("my-service",
+    []string{"localhost", "127.0.0.1"}, nil)
+if err != nil { return err }
+listener, err := srv.StartPublicHTTP(ctx, aster.HTTPListenerConfig{
+    CertificatePEM: cert.CertificatePEM, PrivateKeyPEM: cert.PrivateKeyPEM,
+    WebTransport: true,
+})
+if listener != nil { defer listener.Close() }
+if err != nil { return err }
+// cert.SHA256 hashes the complete DER certificate for serverCertificateHashes.
+```
+
+`GenerateSelfSignedCertificate(sans, nodeSecret)` generates an ECDSA certificate;
+empty SANs select `localhost`. `GenerateWebTransportCertificate(subject, sans,
+nodeSecret)` generates P-256 material with validity at most 14 days and includes
+`localhost`. The subject is a display name. Pass nil for an unbound certificate
+or exactly 32 bytes of an Aster node secret for a signed TLS public-key binding.
+These helpers never emit an unsigned node-identity claim. Protect the returned
+private-key PEM and distribute the certificate hash through a trusted channel.
+
+`VerifyCertificateBinding(cert.CertificatePEM, trustedNodeID)` verifies the signed
+binding against a node ID learned independently through a trusted channel. It
+proves the TLS public-key binding, not the whole certificate, TLS chain,
+hostname, validity or trust in that expected ID. Generation is not ACME and
+makes no FIPS validation claim. Owned ACME, static-mount/projection configuration
+and Go HTTP/WT clients remain outside this surface.
+
 ## Observability
 
 Logs into `log/slog`, custom metrics, tracing and the health listener are
@@ -266,6 +380,12 @@ go run ./cmd/aster_server_test      # typed server + client echo, bidi ping-pong
 # Pure-Go unit tests (no native library)
 CGO_ENABLED=0 go test ./...
 ```
+
+For a staged native archive, use its extracted directory in both `CGO_CFLAGS`
+and `CGO_LDFLAGS`; the packaging workflow includes the matching `aster_ffi.h`
+beside the library. On macOS, point the rpath to that directory as well.
+This supports an external cgo build; public module installation still depends
+on publishing a resolvable Go module identity and tags.
 
 cgo does not track changes to `ffi/aster_ffi.h` in Go's build cache: after an
 ABI bump run `go test -a ...` once (a stale header shows up as
@@ -297,6 +417,8 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `rpc_client.go` | `AsterClient`, `RpcConnection`, `Call*` functions, `BidiCall` (`aster_rpc_*`) |
 | `ucv1.go`, `upcall_types.go` | UCv1 upcall payload codec and kind / status tables (plain Go, no cgo) |
 | `upcall.go` | ABI 4.1 `Upcalls`: poll goroutine, per-kind policy, typed serving, owned-operation helper |
+| `rpc_http_listener.go` | ABI 4.11 authenticated and 4.12 explicit public HTTPS/WebTransport listeners, bound addresses and joined stop |
+| `tls.go` | ABI 4.12 self-signed/WebTransport PEM and DER hash generation, signed TLS public-key binding verification |
 | `lease.go` | ABI 4.1 leases, fenced resource, topology admitted filter, `Node.EnableShared` |
 | `coordination*.go`, `ucv1_placement.go` | ABI 4.4 coordination client, D0-DE codec, outcome / reason codes, placement messages |
 | `relay_stream.go` | ABI 4.3 `Connection.RelayStream` (full-duplex streaming relay, readiness-driven) |
@@ -368,3 +490,106 @@ if errors.As(err, &irohErr) {
     fmt.Println(irohErr.Code())
 }
 ```
+
+## Temporary custody and verified retained imports (ABI 4.13)
+
+Use an owned scope when fetching or inspecting bytes before deciding to retain
+an object. It protects multiple typed roots, including hashes not local yet:
+
+```go
+scope, err := node.Blobs().NewCustodyScope()
+if err != nil { return err }
+defer scope.Close()
+if err := scope.Protect(ctx, expectedHash, aster.BLOB_FORMAT_RAW); err != nil { return err }
+data, _, err := scope.DownloadHashFrom(ctx, expectedHash, providers,
+    aster.BLOB_FORMAT_RAW, aster.FetchWhole, false)
+if err != nil { return err }
+// Verify application-specific content in data while scope remains open.
+if err := scope.Retain(ctx, expectedHash, aster.BLOB_FORMAT_RAW, "verified/object"); err != nil { return err }
+```
+
+`AddBytes` and `AddPath` on the scope create temporary roots without automatic
+persistent tags. `Read` and `DownloadHashFrom` keep its guards through accepted
+work even when `Close` races completion; closing seals new submissions. Keep
+scopes open for host-side verification and for reads/fetches submitted through
+older APIs outside the scope. `HashSeq` protects the sequence graph without
+imposing Collection metadata; scoped reads return the raw sequence bytes.
+
+For an expected hash known in advance, `Blobs.AddBytesVerified` and
+`Blobs.AddPathVerified` copy input, verify its store-computed hash, and commit
+exactly the supplied named tag only on a match. Mismatch preserves the previous
+named root and leaves no anonymous persistent tag. Reusing a name replaces its
+root. Existing store durability applies; no stronger fsync/power-loss guarantee
+is added.
+
+These operations keep their completion registration after cancellation and wait
+for native cleanup. A tag commit already begun returns its actual success/error;
+committed success wins a racing canceled context. Fetch cancellation can wait
+for downloader/network drain, so it is not a prompt deadline for a stalled peer.
+Close each scope after host verification or named retention; disposing the node
+does not replace this ownership obligation.
+
+## Locally complete batch Docs reads (ABI 4.14)
+
+```go
+values, err := doc.ReadEntryContentsIfComplete(ctx,
+    []aster.BlobID{firstHash, missingHash, emptyHash, firstHash})
+if err != nil { return err }
+// values[i] == nil means missing or partial locally.
+// A non-nil slice of length zero is complete empty content.
+```
+
+The ordered result preserves duplicates and copies every present value. The
+method submits one native operation and performs no download, tag update or
+retention. Empty input returns a non-nil empty result. All hashes must contain
+exactly 64 hexadecimal characters; an invalid hash rejects the entire request.
+Missing or partial blobs at the initial check return nil. Complete inline data
+is copied in the store transaction; larger values use validated export. This
+is not a global snapshot: GC/deletion before large export may fail the whole
+batch, and an I/O/integrity error is never converted to a missing slot. Hold a
+PC08 custody scope when host verification needs stable retention.
+
+## Coordination authority provisioning (ABI 4.15)
+
+`CoordinationCanonicalGenesis` and `CoordinationCanonicalJoinPermit` take typed
+hex32 document inputs and return native canonical Fory bytes, preserving list
+order. `CoordinationGenesisSigningBytes` / `CoordinationJoinSigningBytes` produce
+exact preimages for your external Ed25519 signer. Assemble its raw 32-byte public
+key and 64-byte signature with `CoordinationSignedDocumentFromParts`.
+`CoordinationCanonicalCandidateTicket` derives the native open candidate ticket;
+`CoordinationGenesisHash` hashes opaque bytes without verifying them.
+
+Verify an external envelope with `CoordinationVerifyGenesis` or
+`CoordinationVerifyJoinPermitForStart`, supplying a key/domain learned through
+an independently trusted channel, never the envelope's adjacent key. Join
+verification also pins the candidate; compare returned group/genesis against
+independent expectations where required. Returned summaries are copied metadata,
+not a native seal. Encoding/assembly never grants membership, starts a voter or
+creates a group. Native validation does not sort lists or choose a deployment
+profile. `CoordinationProvisioningError.Code` is stable; `Detail` is diagnostic.
+
+## Local and shared Topology (ABI 4.16)
+
+`node.Topology()` reads passive local peer metrics with `HasMonitoring`, `Peers`
+and `Peer`. Start with `Config.EnableMonitoring = true` to populate them. RTT and
+jitter remain nil until sampled; an unknown peer returns nil. Local `RemoteAddr`
+is intentionally omitted by baseline RPC.
+
+Call `EnableShared(ctx, secret32, filter, bootstrap, TopologySwarmOptions{...})`
+to join the namespace. A nil admission filter admits every secret holder.
+Optional uint32 millisecond/coverage values preserve native defaults when nil
+and explicit zero when supplied (position refresh zero selects 60s). Canceling
+the wait does not roll back joining; the node owns installed publishing work.
+
+`Snapshot(ctx)` returns an owned `TopologyObservation`; defer `Close`. Its
+`Clusters`, `ClusterOf` and `Separated` always use the same immutable native view.
+Unknown is a real verdict, never evidence of distance. Captured views survive
+later observations and node shutdown while retaining their runtime. The live
+`Clusters(ctx)`, `MyCluster(ctx)` and `Separated(ctx, a, b)` conveniences each
+capture separately and may observe different eventual states. Use one snapshot
+for a placement decision; these observations are local evidence, not policy proof.
+
+Baseline `aster.net.Topology` RPC is explicitly opt-in through
+`ServerOptions{Topology:true, TopologyRequirement:RequireRole("observer")}` and
+requires monitoring. Requirements are enforced natively before handlers; local
+reads alone do not expose network layout over RPC.

@@ -1,9 +1,11 @@
 package site.aster.ffi;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 import site.aster.event.IrohEvent;
 
 /**
@@ -25,6 +27,18 @@ public class OperationRegistry {
   private static final int MAX_EARLY = 4096;
 
   private final Object lock = new Object();
+  private final Consumer<IrohEvent> discardEvent;
+  private Throwable closed;
+
+  public OperationRegistry() {
+    this(event -> {});
+  }
+
+  /** Discard consumes the buffer of a completion that cannot be handed to a future. */
+  public OperationRegistry(Consumer<IrohEvent> discardEvent) {
+    this.discardEvent = java.util.Objects.requireNonNull(discardEvent);
+  }
+
   private final Map<Long, CompletableFuture<?>[]> pending = new HashMap<>();
 
   /**
@@ -100,17 +114,60 @@ public class OperationRegistry {
   }
 
   /**
+   * Permanently reject registrations and settle every outstanding future. The runtime stops its
+   * poller before calling this, and closes the native runtime afterward: discarded early events'
+   * buffers are released here, while any unpublished returned handles remain native-runtime owned.
+   */
+  public void close(Throwable failure) {
+    final ArrayList<CompletableFuture<?>[]> futures;
+    final ArrayList<Object> outcomes;
+    synchronized (lock) {
+      if (closed != null) return;
+      closed = java.util.Objects.requireNonNull(failure);
+      futures = new ArrayList<>(pending.values());
+      outcomes = new ArrayList<>(early.values());
+      pending.clear();
+      early.clear();
+    }
+    // Neither native release nor user continuations run while holding the registry lock.
+    RuntimeException releaseFailure = null;
+    try {
+      for (Object outcome : outcomes) {
+        try {
+          discard(outcome);
+        } catch (RuntimeException e) {
+          if (releaseFailure == null) releaseFailure = e;
+          else if (releaseFailure != e) releaseFailure.addSuppressed(e);
+        }
+      }
+    } finally {
+      for (CompletableFuture<?>[] pair : futures) {
+        for (CompletableFuture<?> future : pair) {
+          if (future != null) future.completeExceptionally(failure);
+        }
+      }
+    }
+    if (releaseFailure != null) throw releaseFailure;
+  }
+
+  private void discard(Object outcome) {
+    if (outcome instanceof IrohEvent event) discardEvent.accept(event);
+  }
+
+  /**
    * Take the future waiting on {@code operationId}; with none registered yet, park {@code outcome}
    * for the registration that is about to follow and return {@code null}.
    */
   private CompletableFuture<?>[] take(long operationId, Object outcome) {
     synchronized (lock) {
-      CompletableFuture<?>[] futures = pending.remove(operationId);
-      if (futures == null && operationId != 0) {
-        early.put(operationId, outcome);
+      if (closed == null) {
+        CompletableFuture<?>[] futures = pending.remove(operationId);
+        if (futures == null && operationId != 0) early.put(operationId, outcome);
+        return futures;
       }
-      return futures;
     }
+    discard(outcome);
+    return null;
   }
 
   /**
@@ -120,14 +177,16 @@ public class OperationRegistry {
   private void deliverIfEarly(long operationId, CompletableFuture<?>[] futures) {
     Object outcome;
     synchronized (lock) {
-      outcome = early.remove(operationId);
+      outcome = closed != null ? closed : early.remove(operationId);
       if (outcome == null) {
         pending.put(operationId, futures);
         return;
       }
     }
     if (outcome instanceof Throwable t) {
-      ((CompletableFuture<IrohEvent>) futures[0]).completeExceptionally(t);
+      for (CompletableFuture<?> future : futures) {
+        if (future != null) future.completeExceptionally(t);
+      }
     } else {
       ((CompletableFuture<IrohEvent>) futures[0]).complete((IrohEvent) outcome);
     }

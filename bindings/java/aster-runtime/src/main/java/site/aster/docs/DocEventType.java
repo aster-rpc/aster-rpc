@@ -24,6 +24,6 @@ public enum DocEventType {
     for (DocEventType t : values()) {
       if (t.code == code) return t;
     }
-    return INSERT_LOCAL;
+    throw new IllegalArgumentException("unknown document event type: " + code);
   }
 }

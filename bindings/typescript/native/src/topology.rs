@@ -157,7 +157,8 @@ fn ms_in(field: &str, ms: f64) -> Result<Duration> {
             "{field} must be a non-negative number of ms"
         )));
     }
-    Ok(Duration::from_secs_f64(ms / 1000.0))
+    Duration::try_from_secs_f64(ms / 1000.0)
+        .map_err(|_| invalid(format!("{field} exceeds the native duration range")))
 }
 
 fn swarm_options_in(o: Option<TopologySwarmOptions>) -> Result<RsSwarmOptions> {

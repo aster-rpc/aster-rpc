@@ -34,7 +34,7 @@ namespace Aster;
 /// Console.WriteLine(await server.TicketAsync());
 /// </code>
 /// </summary>
-public sealed class AsterServer : IAsyncDisposable, IDisposable
+public sealed partial class AsterServer : IAsyncDisposable, IDisposable
 {
     public const string AsterAlpn = "aster/1";
     /// <summary>The consumer-admission ALPN; kept open by the default gate.</summary>
@@ -64,9 +64,6 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
 
     /// <summary>Peer id strings by connection id (poll thread only), so calls do not re-decode them.</summary>
     private readonly Dictionary<ulong, string> _peers = new();
-
-    /// <summary>Attributes set through <see cref="SetPeerAttributes"/> (mirrored into Rust's Gate 3 store).</summary>
-    private readonly ConcurrentDictionary<string, IReadOnlyDictionary<string, string>> _peerAttributes = new(StringComparer.Ordinal);
 
     private static readonly IReadOnlyDictionary<string, string> NoAttributes = new Dictionary<string, string>();
 
@@ -126,6 +123,7 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
                 foreach (var s in services.Values)
                     byIndex[builder.AddServiceJson(s.RegistrationJson)] = s;
                 if (health is not null) builder.AttachHealth(health.Handle);
+                builder.Topology(options.Topology, options.TopologyRequirement);
                 builder.Option(DispatchServerOption.MaxSessionsPerConnection, (ulong)options.MaxSessionsPerConnection);
                 if (options.HandlerTimeout is { } cap)
                     builder.Option(DispatchServerOption.HandlerTimeoutMs, cap <= TimeSpan.Zero ? 0 : (ulong)Math.Ceiling(cap.TotalMilliseconds));
@@ -188,22 +186,20 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
     public event Action<string, Connection>? NonRpcConnection;
 
     /// <summary>
-    /// Attaches attributes (e.g. <c>aster.role</c>) to every later call from
+    /// Attaches attributes (e.g. <c>aster.role</c>) to every later authenticated Iroh call from
     /// <paramref name="peerId"/>: Rust's Gate 3 checks <see cref="CapabilityRequirement"/>s
     /// against them, and handlers see them in <see cref="ServerCallContext.Attributes"/>. Null or
-    /// empty clears.
+    /// empty clears. HTTP/WT uses the authenticator's per-call attributes instead.
     /// </summary>
     public void SetPeerAttributes(string peerId, IReadOnlyDictionary<string, string>? attributes)
     {
         ArgumentException.ThrowIfNullOrEmpty(peerId);
         if (attributes is null || attributes.Count == 0)
         {
-            _peerAttributes.TryRemove(peerId, out _);
             _dispatch.SetPeerAttributes(peerId, null);
             return;
         }
         var copy = new Dictionary<string, string>(attributes, StringComparer.Ordinal);
-        _peerAttributes[peerId] = copy;
         _dispatch.SetPeerAttributes(peerId, copy);
     }
 
@@ -219,7 +215,7 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
                 uint n;
                 try { n = _dispatch.Poll(events, PollBatch, PollTimeoutMs); }
                 catch (ObjectDisposedException) { return; }
-                for (uint i = 0; i < n; i++)
+                for (uint i = 0; i < n && _running; i++)
                 {
                     try { OnEvent(ref events[i]); }
                     catch (Exception ex) { Console.Error.WriteLine($"aster-server-poll: event failed: {ex.Message}"); }
@@ -305,10 +301,14 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
     {
         ulong callId = ev.call_id;
         byte[] request = ev.request_len == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>((byte*)ev.request_ptr, (int)ev.request_len).ToArray();
-        if (!_peers.TryGetValue(ev.connection_id, out string? peer))
+        // HTTP/WT has connection id zero and authenticates each call separately.
+        // Caching its first principal would attribute later callers to that user.
+        bool cachePeer = ((DispatchFlags)ev.flags & DispatchFlags.IrohAuthenticated) != 0 && ev.connection_id != 0;
+        string? peer;
+        if (!cachePeer || !_peers.TryGetValue(ev.connection_id, out peer))
         {
             peer = ev.peer_len == 0 ? "" : Encoding.UTF8.GetString((byte*)ev.peer_ptr, (int)ev.peer_len);
-            _peers[ev.connection_id] = peer;
+            if (cachePeer) _peers[ev.connection_id] = peer;
         }
         _dispatch.BufferRelease(ev.buffer);
 
@@ -350,14 +350,15 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
                 ? _dispatch.Metadata(inbound.CallId)
                 : Array.Empty<KeyValuePair<string, string>>();
             IReadOnlyDictionary<string, string> attributes = NoAttributes;
-            if (_peerAttributes.TryGetValue(inbound.Peer, out var peerAttrs))
-                attributes = peerAttrs;
-            else if ((flags & DispatchFlags.HasAttributes) != 0)
+            // Use the same per-call snapshot Rust used for Gate 3. Enrollment
+            // attributes must not override a foreign authenticator's outcome.
+            if ((flags & DispatchFlags.HasAttributes) != 0)
                 attributes = _dispatch.Attributes(inbound.CallId).GroupBy(kv => kv.Key).ToDictionary(g => g.Key, g => g.Last().Value);
             DateTimeOffset? deadline = inbound.DeadlineUnixMs > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(inbound.DeadlineUnixMs) : null;
             var method = inbound.Method;
             var ctx = new ServerCallContext(inbound.Service.Name, method.Name, method.Pattern, inbound.Peer, inbound.ConnectionId,
-                inbound.SessionId, inbound.SessionKey, inbound.Session, metadata, attributes, deadline, inbound.Cts.Token);
+                inbound.SessionId, inbound.SessionKey, inbound.Session, metadata, attributes, deadline, inbound.Cts.Token,
+                (flags & DispatchFlags.IrohAuthenticated) != 0);
             call = new ServerCall(_dispatch, inbound.CallId, inbound.Request, (flags & DispatchFlags.FirstIsEnd) != 0, _codec, ctx);
             if (_interceptors.Count > 0)
             {
@@ -432,22 +433,27 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
     /// <summary>Stops dispatching, cancels and waits briefly for in-flight calls, then closes the node.</summary>
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _running = false;
-        _pollThread.Join(5000);
-        foreach (var cts in _live.Values)
+        await _httpLifecycleGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            try { cts.Cancel(); }
-            catch (Exception) { /* a handler callback failed; shutting down anyway */ }
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _running = false;
+            if (Thread.CurrentThread != _pollThread) _pollThread.Join(5000);
+            foreach (var cts in _live.Values)
+            {
+                try { cts.Cancel(); }
+                catch (Exception) { /* a handler callback failed; shutting down anyway */ }
+            }
+            for (int i = 0; i < 50 && Volatile.Read(ref _inFlight) > 0; i++)
+                await Task.Delay(20).ConfigureAwait(false);
+            await Task.Run(_dispatch.Dispose).ConfigureAwait(false);
+            _health?.Dispose();
+            foreach (var state in _sessions.Values) DisposeSession(state);
+            _sessions.Clear();
+            await _node.DisposeAsync().ConfigureAwait(false);
+            _ownedGate?.Dispose();
         }
-        for (int i = 0; i < 50 && Volatile.Read(ref _inFlight) > 0; i++)
-            await Task.Delay(20).ConfigureAwait(false);
-        _dispatch.Dispose();
-        _health?.Dispose();
-        foreach (var state in _sessions.Values) DisposeSession(state);
-        _sessions.Clear();
-        await _node.DisposeAsync().ConfigureAwait(false);
-        _ownedGate?.Dispose();
+        finally { _httpLifecycleGate.Release(); }
     }
 
     public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
@@ -456,6 +462,11 @@ public sealed class AsterServer : IAsyncDisposable, IDisposable
 /// <summary>Options for <see cref="AsterServer.StartAsync"/>.</summary>
 public sealed class AsterServerOptions
 {
+    /// <summary>Explicitly expose aster.net.Topology. Requires Config.EnableMonitoring. Default false.</summary>
+    public bool Topology { get; init; }
+    /// <summary>Optional native Gate-3 requirement for the topology RPC, without host authorization logic.</summary>
+    public CapabilityRequirement? TopologyRequirement { get; init; }
+
     /// <summary>Node configuration (null = defaults).</summary>
     public AsterConfig? Config { get; init; }
 

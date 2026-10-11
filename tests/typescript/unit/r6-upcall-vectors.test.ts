@@ -182,6 +182,10 @@ function toVectorJson(type: string, v: Obj): unknown {
       return { peer: v.peer, alpn: Buffer.from(v.alpn).toString('utf8'), is_alive: v.isAlive };
     case 'AdmissionHandshakeResponse':
       return { accept: v.accept, code: v.code, reason: Buffer.from(v.reason).toString('utf8') };
+    case 'RpcAuthRequest':
+      return { peer_id: v.peerId, service: v.service, method: v.method, session_id: v.sessionId, metadata: v.metadata };
+    case 'RpcAuthResponse':
+      return v.accepted ? { accepted: true, principal: v.principal, attributes: v.attributes } : { accepted: false };
     default:
       throw new Error(`no JSON rendering for ${type}`);
   }

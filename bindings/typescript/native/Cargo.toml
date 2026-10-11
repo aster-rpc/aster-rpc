@@ -11,6 +11,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+aster-transport-salvo = { path = "../../../aster-transport-salvo", version = "=0.3.0" }
 aster_transport_core = { path = "../../../core", version = "=0.3.0" }
 # Observability (design OBSERVABILITY_HEALTH_DESIGN §8 O7): OTLP export of the
 # three signals, plus the Prometheus pull reader behind `HealthServer` and

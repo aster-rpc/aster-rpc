@@ -15,9 +15,11 @@ use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use salvo::conn::rustls::{Keycert, RustlsConfig};
-use salvo::conn::{QuinnListener, TcpListener};
+use salvo::conn::{Acceptor, QuinnListener, TcpListener};
 use salvo::prelude::*;
 use sha2::{Digest, Sha256};
+
+use crate::listener::{serve_owned, OwnedListener, QuicOwner, TaskScope};
 
 /// How a generated cert is tied to an Aster identity (the node's Ed25519 key).
 ///
@@ -26,8 +28,8 @@ use sha2::{Digest, Sha256};
 ///   claim is meaningful only when the cert hash is pinned over a trusted channel.
 /// - [`Signed`](NodeBinding::Signed) additionally has the node's secret key sign
 ///   the cert's public key, embedding an `aster-sig` SAN. [`verify_cert_binding`]
-///   checks it, proving the holder of that node key authorized this exact TLS
-///   key — a cert that is **self-attesting** and MITM-resistant without TOFU.
+///   checks it, proving the holder of that node key authorized this TLS public
+///   key. Certificate trust, validity and hostname checks remain separate.
 pub enum NodeBinding<'a> {
     /// Stamp `aster://<node_id>` (the id is the Ed25519 public key, hex). Claim only.
     Claim(&'a str),
@@ -215,8 +217,9 @@ pub fn generate_webtransport_cert(
 /// SAN whose Ed25519 signature — made by `expected_node_id`'s key — covers the
 /// cert's own public key (`SubjectPublicKeyInfo`).
 ///
-/// A success proves the holder of the node's secret key authorized *this exact*
-/// TLS certificate, so a MITM serving a substitute cert is rejected. The caller
+/// A success proves the holder of the node's secret key authorized the cert's
+/// TLS public key (SPKI), not the entire certificate. Certificate trust,
+/// validity and hostname checks remain separate. The caller
 /// must supply the `expected_node_id` it learned over a trusted channel (the
 /// Ed25519-authenticated Aster connection / ticket) — verifying against the id
 /// the cert *claims* would accept an attacker's self-consistent cert.
@@ -336,6 +339,60 @@ pub async fn serve_https_with(
 }
 
 type TransportTuner = Arc<dyn Fn(&mut TransportConfig) + Send + Sync>;
+
+/// Bind operator PEM material before reporting readiness. Unlike the legacy
+/// serving future, binding errors are returned to the listener's owner.
+pub(crate) async fn start_pem_listener(
+    addr: &str,
+    tls: TlsMaterial,
+    service: Service,
+    webtransport: bool,
+    scope: TaskScope,
+) -> Result<OwnedListener, String> {
+    if !matches!(tls, TlsMaterial::Pem { .. }) {
+        return Err(
+            "owned authenticated listeners require PEM certificate and key material".into(),
+        );
+    }
+    let config = rustls_config(&tls)?;
+    let tcp = TcpListener::new(addr.to_owned())
+        .rustls(config.clone())
+        .try_bind()
+        .await
+        .map_err(|e| e.to_string())?;
+    let tcp_addr = tcp
+        .holdings()
+        .first()
+        .and_then(|h| h.local_addr.clone().into_std())
+        .ok_or("TCP listener did not report its bound address")?;
+    let (handle, server, quic) = if webtransport {
+        let mut quinn_config = config.build_quinn_config().map_err(|e| e.to_string())?;
+        // Preserve the default transport settings used by QuinnListener.
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        transport.max_idle_timeout(Some(
+            std::time::Duration::from_secs(30)
+                .try_into()
+                .map_err(|e| format!("invalid idle timeout: {e}"))?,
+        ));
+        quinn_config.transport_config(Arc::new(transport));
+        let (owner, quinn) = QuicOwner::bind(quinn_config, tcp_addr)?;
+        let acceptor = salvo::conn::JoinedAcceptor::new(quinn, tcp);
+        let (handle, server) = serve_owned(acceptor, service);
+        (handle, server, Some(owner))
+    } else {
+        let (handle, server) = serve_owned(tcp, service);
+        (handle, server, None)
+    };
+    Ok(OwnedListener::new(
+        tcp_addr,
+        webtransport.then_some(tcp_addr),
+        handle,
+        server,
+        scope,
+        quic,
+    ))
+}
 
 async fn serve_https_inner(
     addr: &str,

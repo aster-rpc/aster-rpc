@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using Aster.Lease;
 
@@ -80,6 +81,15 @@ public sealed record AdmissionHandshakeRequest(string Peer, byte[] Alpn, bool Is
 /// <summary>Accept (code 0, empty reason) or reject with a code and reason.</summary>
 public sealed record HandshakeDecision(bool Accept, uint Code, byte[] Reason);
 
+/// <summary>Per-call authentication context; maps use UTF-8 byte order on the wire.</summary>
+public sealed record RpcAuthRequest(string PeerId, string Service, string Method, int SessionId, IReadOnlyDictionary<string, string> Metadata);
+
+/// <summary>Explicit rejection or a nonempty resolved principal with per-call attributes.</summary>
+public sealed record RpcAuthResponse(bool Accepted, string? Principal, IReadOnlyDictionary<string, string> Attributes)
+{
+    public static RpcAuthResponse Rejected() => new(false, null, new Dictionary<string, string>());
+}
+
 /// <summary>
 /// UCv1, the canonical upcall payload encoding (design <c>docs/_internal/bindings/upcall-design.md</c>
 /// §3, vectors <c>conformance/vectors/upcalls.json</c>):
@@ -121,6 +131,8 @@ public static class Ucv1
     public const byte TagExposeHttpTrailers = 0xC6;
     public const byte TagExposeRoutePolicyRequest = 0xC7;
     public const byte TagExposeRouteGrant = 0xC8;
+    public const byte TagRpcAuthRequest = 0xC9;
+    public const byte TagRpcAuthResponse = 0xCA;
     public const byte TagDecision = 0xCF;
 
     /// <summary>Highest HTTP version code (0 HTTP/0.9 .. 4 HTTP/3).</summary>
@@ -130,6 +142,82 @@ public static class Ucv1
     private const byte ListHeader = 0x0C;
 
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+
+    private static int CompareAuthKeys(string a, string b)
+        => StrictUtf8.GetBytes(a).AsSpan().SequenceCompareTo(StrictUtf8.GetBytes(b));
+
+    private static void PutAuthMap(W w, IReadOnlyDictionary<string, string> values)
+    {
+        var keys = values.Keys.ToList();
+        keys.Sort(CompareAuthKeys);
+        w.List(keys.Count);
+        foreach (string key in keys) w.Str(key).Str(values[key]);
+    }
+
+    private static IReadOnlyDictionary<string, string> GetAuthMap(R r)
+    {
+        int count = r.List();
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        string? previous = null;
+        for (int i = 0; i < count; i++)
+        {
+            string key = r.Str();
+            if (previous != null && CompareAuthKeys(previous, key) >= 0)
+                throw new Ucv1DecodeException("authentication map keys not strictly ascending");
+            previous = key;
+            values.Add(key, r.Str());
+        }
+        return new System.Collections.ObjectModel.ReadOnlyDictionary<string, string>(values);
+    }
+
+    public static byte[] EncodeRpcAuthRequest(RpcAuthRequest value)
+    {
+        var w = new W(TagRpcAuthRequest);
+        w.Str(value.PeerId).Str(value.Service).Str(value.Method);
+        w.Uint(unchecked((uint)((value.SessionId << 1) ^ (value.SessionId >> 31))));
+        PutAuthMap(w, value.Metadata);
+        return w.Done();
+    }
+
+    public static RpcAuthRequest DecodeRpcAuthRequest(byte[] bytes)
+    {
+        var r = new R(bytes, TagRpcAuthRequest);
+        string peer = r.Str(), service = r.Str(), method = r.Str();
+        uint raw = (uint)r.UintMax(uint.MaxValue, "authentication session id");
+        int session = unchecked((int)(raw >> 1) ^ -((int)raw & 1));
+        var value = new RpcAuthRequest(peer, service, method, session, GetAuthMap(r));
+        r.End();
+        return value;
+    }
+
+    public static byte[] EncodeRpcAuthResponse(RpcAuthResponse value)
+    {
+        var w = new W(TagRpcAuthResponse).Bool(value.Accepted);
+        if (value.Accepted)
+        {
+            if (string.IsNullOrEmpty(value.Principal)) throw new ArgumentException("empty authentication principal", nameof(value));
+            w.Str(value.Principal);
+            PutAuthMap(w, value.Attributes);
+        }
+        else if (value.Principal != null || value.Attributes.Count != 0)
+            throw new ArgumentException("rejected authentication carries fields", nameof(value));
+        return w.Done();
+    }
+
+    public static RpcAuthResponse DecodeRpcAuthResponse(byte[] bytes)
+    {
+        var r = new R(bytes, TagRpcAuthResponse);
+        RpcAuthResponse value;
+        if (r.Bool())
+        {
+            string principal = r.Str();
+            if (principal.Length == 0) throw new Ucv1DecodeException("empty authentication principal");
+            value = new RpcAuthResponse(true, principal, GetAuthMap(r));
+        }
+        else value = RpcAuthResponse.Rejected();
+        r.End();
+        return value;
+    }
 
     // ── writer / reader ──────────────────────────────────────────────────────
 

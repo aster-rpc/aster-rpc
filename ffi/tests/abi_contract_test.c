@@ -34,6 +34,15 @@
 _Static_assert(sizeof(aster_status_t) == 4, "enum size");
 _Static_assert(sizeof(aster_event_kind_t) == 4, "enum size");
 
+LAYOUT(aster_blob_custody_t, 8);
+LAYOUT(aster_provisioning_result_t, 32);
+OFF(aster_provisioning_result_t, data, 0);
+OFF(aster_provisioning_result_t, error, 16);
+_Static_assert(ASTER_EVENT_BLOB_CUSTODY_DONE == 118, "custody event value");
+_Static_assert(ASTER_EVENT_DOC_CONTENTS_BATCH == 119, "batch content event value");
+_Static_assert(ASTER_EVENT_TOPOLOGY_SNAPSHOT == 120, "topology snapshot event value");
+_Static_assert(ASTER_TOPOLOGY_UNKNOWN == 0 && ASTER_TOPOLOGY_CONNECTED == 1 && ASTER_TOPOLOGY_SEPARATED == 2, "topology separation values");
+
 LAYOUT(aster_bytes_t, 16);
 OFF(aster_bytes_t, ptr, 0);
 OFF(aster_bytes_t, len, 8);
@@ -403,6 +412,20 @@ OFF(aster_span_record_t, kv, 120);
 OFF(aster_span_record_t, kv_len, 128);
 OFF(aster_span_record_t, events, 136);
 OFF(aster_span_record_t, events_len, 144);
+LAYOUT(aster_generated_cert_t, 64);
+OFF(aster_generated_cert_t, cert_pem, 0);
+OFF(aster_generated_cert_t, key_pem, 16);
+OFF(aster_generated_cert_t, sha256, 32);
+
+LAYOUT(aster_http_server_config_t, 64);
+OFF(aster_http_server_config_t, flags, 4);
+OFF(aster_http_server_config_t, bind_addr, 8);
+OFF(aster_http_server_config_t, cert_pem, 24);
+OFF(aster_http_server_config_t, key_pem, 40);
+OFF(aster_http_server_config_t, max_pending_auth, 56);
+OFF(aster_http_server_config_t, max_auth_payload_bytes, 60);
+_Static_assert(ASTER_HTTP_SERVER_WEBTRANSPORT == 1, "WT config flag");
+_Static_assert(ASTER_UPCALL_KIND_RPC_AUTHENTICATE == 80, "RPC authentication kind");
 LAYOUT(aster_health_config_t, 24);
 OFF(aster_health_config_t, port, 4);
 OFF(aster_health_config_t, host, 8);
@@ -433,7 +456,8 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 9); /* 4.9: durable audit outbox */
+    CHECK(ASTER_ABI_VERSION_MINOR == 16); /* 4.16: topology observations */
+    CHECK(aster_doc_event_receiver_free(0, 0) == ASTER_STATUS_NOT_FOUND);
     CHECK(sizeof(aster_audit_outbox_error_t) == 4);
     CHECK(sizeof(aster_audit_outbox_t) == 8);
     CHECK(ASTER_EVENT_AUDIT_OUTBOX_OPENED == 114);

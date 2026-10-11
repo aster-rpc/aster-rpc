@@ -653,11 +653,20 @@ unsafe fn runtime() -> aster_runtime_t {
 }
 
 unsafe fn start_node(rt: aster_runtime_t, alpns: &[&[u8]]) -> aster_node_t {
+    start_node_with_monitoring(rt, alpns, false)
+}
+
+unsafe fn start_node_with_monitoring(
+    rt: aster_runtime_t,
+    alpns: &[&[u8]],
+    monitoring: bool,
+) -> aster_node_t {
     let alpn_b: Vec<aster_bytes_t> = alpns.iter().map(|a| bytes(a)).collect();
     let mut cfg: aster_config_t = std::mem::zeroed();
     assert_eq!(aster_config_init(&mut cfg), 0);
     cfg.relay_mode = aster_relay_mode_t::ASTER_RELAY_MODE_DISABLED as u32;
     cfg.bind_addr = bytes(b"127.0.0.1:0");
+    cfg.enable_monitoring = u32::from(monitoring);
     cfg.alpns = aster_bytes_list_t {
         items: alpn_b.as_ptr(),
         len: alpn_b.len(),
@@ -1995,5 +2004,140 @@ fn builder_and_argument_validation() {
 
         assert_eq!(aster_server_destroy(rt, server), OK);
         aster_runtime_close(rt);
+    }
+}
+
+#[test]
+fn topology_opt_in_requires_monitoring_and_enforces_native_role_gate() {
+    unsafe {
+        use aster_transport_ffi::topology::*;
+        fn owned_json(data: aster_bytes_t) -> serde_json::Value {
+            let value =
+                serde_json::from_slice(unsafe { std::slice::from_raw_parts(data.ptr, data.len) })
+                    .unwrap();
+            unsafe {
+                aster_string_release(data.ptr, data.len);
+            }
+            value
+        }
+        let rt = runtime();
+        let plain = start_node(rt, &[RPC_ALPN]);
+        let mut enabled = 9;
+        assert_eq!(aster_topology_has_monitoring(rt, plain, &mut enabled), OK);
+        assert_eq!(enabled, 0);
+        let mut data = aster_bytes_t {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        assert_eq!(aster_topology_peers(rt, plain, &mut data), OK);
+        assert_eq!(owned_json(data), serde_json::json!([]));
+        let mut builder = 0;
+        assert_eq!(aster_server_builder_new(rt, plain, &mut builder), OK);
+        assert_eq!(
+            aster_server_set_topology(builder, 1, bytes(b"null")),
+            INVALID
+        );
+        assert_eq!(
+            aster_server_set_topology(builder, 2, bytes(b"null")),
+            INVALID
+        );
+        assert_eq!(aster_server_set_topology(builder, 0, bytes(b"{")), INVALID);
+        assert_eq!(aster_server_set_topology(builder, 0, bytes(b"null")), OK);
+        let mut server = 0;
+        assert_eq!(aster_server_start(rt, builder, 64, &mut server), OK);
+        let client = start_node(rt, &[RPC_ALPN]);
+        let absent_conn = connect(rt, client, plain, RPC_ALPN);
+        let opts = Opts {
+            service: "aster.net.Topology".into(),
+            method: "peers".into(),
+            metadata: vec![],
+            session_id: 0,
+            deadline_ms: 5000,
+        };
+        assert!(
+            unary(rt, absent_conn, &opts, &[]).is_err(),
+            "baseline disabled"
+        );
+        assert_eq!(aster_server_destroy(rt, server), OK);
+
+        let monitored = start_node_with_monitoring(rt, &[RPC_ALPN], true);
+        assert_eq!(aster_server_builder_new(rt, monitored, &mut builder), OK);
+        assert_eq!(
+            aster_server_set_topology(
+                builder,
+                1,
+                bytes(br#"{"kind":"role","roles":["operator"]}"#)
+            ),
+            OK
+        );
+        // Failed updates must not clear the configured gate.
+        assert_eq!(
+            aster_server_set_topology(builder, 1, bytes(br#"{"kind":"invalid","roles":[]}"#)),
+            INVALID
+        );
+        assert_eq!(aster_server_start(rt, builder, 64, &mut server), OK);
+        let conn = connect(rt, client, monitored, RPC_ALPN);
+        assert_eq!(
+            unary(rt, conn, &opts, &[]).unwrap_err().0,
+            StatusCode::PermissionDenied.as_i32()
+        );
+        let (id, _) = addr_of(rt, client);
+        let attrs = kv(&[(aster::rpc::ROLE_ATTRIBUTE, "operator")]);
+        assert_eq!(
+            aster_server_set_peer_attributes(
+                server,
+                id.as_ptr(),
+                id.len() as u32,
+                attrs.as_ptr(),
+                attrs.len() as u32
+            ),
+            OK
+        );
+        assert!(
+            unary(rt, conn, &opts, &[]).is_ok(),
+            "native gate accepts operator"
+        );
+        assert_eq!(
+            aster_server_set_peer_attributes(server, id.as_ptr(), id.len() as u32, ptr::null(), 0),
+            OK
+        );
+        assert_eq!(
+            unary(rt, conn, &opts, &[]).unwrap_err().0,
+            StatusCode::PermissionDenied.as_i32()
+        );
+        assert_eq!(
+            aster_topology_has_monitoring(rt, monitored, &mut enabled),
+            OK
+        );
+        assert_eq!(enabled, 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert_eq!(
+                aster_topology_peer(rt, monitored, bytes(id.as_bytes()), &mut data),
+                OK
+            );
+            let peer = owned_json(data);
+            if peer["samples"].as_u64().unwrap_or(0) > 0 {
+                assert_eq!(peer["node_id"], id);
+                assert_eq!(peer["level"], 0);
+                assert_eq!(peer["direct"], true);
+                assert_eq!(peer["is_connected"], true);
+                assert!(peer["remote_addr"].as_str().unwrap().contains("127.0.0.1"));
+                assert_eq!(aster_topology_peers(rt, monitored, &mut data), OK);
+                assert!(owned_json(data)
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["node_id"] == id));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "local measured peer never appeared"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(aster_server_destroy(rt, server), OK);
+        assert_eq!(aster_runtime_close(rt), OK);
     }
 }

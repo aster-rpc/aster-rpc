@@ -143,6 +143,8 @@ pub struct DispatchServer {
     handle: Mutex<Option<ServerHandle>>,
     attributes: AttributeStore,
     table: aster::binding_support::dispatch::CallTable,
+    dispatcher: Mutex<Option<aster::rpc::Dispatcher>>,
+    http: Arc<crate::http::HttpChildren>,
 }
 
 #[pymethods]
@@ -157,7 +159,7 @@ impl DispatchServer {
     /// - `handler_timeout`: cap on any handler, seconds (`None` = the Rust
     ///   default, 300 s; `<= 0` = no cap).
     #[staticmethod]
-    #[pyo3(signature = (node, services, *, node_info=Some((String::new(), Vec::new(), Vec::new())), gate=None, gate_attributes=false, max_sessions_per_connection=None, handler_timeout=None, ring_capacity=256))]
+    #[pyo3(signature = (node, services, *, node_info=Some((String::new(), Vec::new(), Vec::new())), gate=None, gate_attributes=false, max_sessions_per_connection=None, handler_timeout=None, ring_capacity=256, builtin_topology=false, topology_requires=None))]
     #[allow(clippy::too_many_arguments)]
     fn start(
         node: PyRef<'_, crate::node::Node>,
@@ -168,7 +170,24 @@ impl DispatchServer {
         max_sessions_per_connection: Option<usize>,
         handler_timeout: Option<f64>,
         ring_capacity: usize,
+        builtin_topology: bool,
+        topology_requires: Option<&str>,
     ) -> PyResult<Self> {
+        if builtin_topology && !node.inner.topology().has_monitoring() {
+            return Err(PyValueError::new_err(
+                "builtin topology requires monitoring",
+            ));
+        }
+        let requirement = if let Some(json) = topology_requires {
+            if json.len() > 1024 * 1024 {
+                return Err(PyValueError::new_err("topology requirement exceeds 1 MiB"));
+            }
+            serde_json::from_str::<Option<aster::rpc::CapabilityRequirement>>(json).map_err(
+                |error| PyValueError::new_err(format!("invalid topology requirement: {error}")),
+            )?
+        } else {
+            None
+        };
         crate::ensure_tokio_runtime();
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let _guard = rt.enter();
@@ -176,6 +195,9 @@ impl DispatchServer {
         let (sink, consumer) = RingSink::new_on(rt.handle(), ring_capacity.max(2));
         let attributes = AttributeStore::new();
         let mut server = Server::new(&node.inner).attributes(attributes.clone());
+        if builtin_topology {
+            server = server.with_builtin_topology(&node.inner, requirement);
+        }
         if let Some((node_name, tags, roles)) = node_info {
             server = server.register(NodeInfoServer::new(StaticNodeInfo(NodeIdentity {
                 node_id: node.inner.id().to_string(),
@@ -206,12 +228,15 @@ impl DispatchServer {
             server = server.dynamic_service(svc).map_err(aster_err_to_py)?;
         }
         let table = server.call_table();
+        let dispatcher = server.dispatcher();
         let handle = server.serve();
         Ok(DispatchServer {
             consumer: Arc::new(tokio::sync::Mutex::new(consumer)),
             handle: Mutex::new(Some(handle)),
             attributes,
             table,
+            dispatcher: Mutex::new(Some(dispatcher)),
+            http: Arc::new(crate::http::HttpChildren::default()),
         })
     }
 
@@ -270,9 +295,89 @@ impl DispatchServer {
         self.table.len()
     }
 
+    /// Bind an authenticated PEM listener over these registered services.
+    #[pyo3(signature = (authenticator, bind_addr, cert_pem, key_pem, *, webtransport=false, max_pending_auth=256, max_auth_payload_bytes=65536))]
+    #[allow(clippy::too_many_arguments)]
+    fn start_http<'py>(
+        &self,
+        py: Python<'py>,
+        authenticator: &Bound<'_, PyAny>,
+        bind_addr: String,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        webtransport: bool,
+        max_pending_auth: usize,
+        max_auth_payload_bytes: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let auth =
+            crate::http::authenticator(authenticator, max_pending_auth, max_auth_payload_bytes)?;
+        let children = self.http.clone();
+        let dispatcher = self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("server is closed"))?;
+        future_into_py(py, async move {
+            crate::http::start(
+                children,
+                dispatcher,
+                crate::http::ListenerPolicy::Authenticated(auth),
+                bind_addr,
+                cert_pem,
+                key_pem,
+                webtransport,
+            )
+            .await
+        })
+    }
+
+    /// Bind an explicitly anonymous PEM listener; session services are rejected.
+    #[pyo3(signature = (bind_addr, cert_pem, key_pem, *, webtransport=false))]
+    fn start_public_http<'py>(
+        &self,
+        py: Python<'py>,
+        bind_addr: String,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        webtransport: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let children = self.http.clone();
+        let dispatcher = self
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("server is closed"))?;
+        future_into_py(py, async move {
+            crate::http::start(
+                children,
+                dispatcher,
+                crate::http::ListenerPolicy::Public,
+                bind_addr,
+                cert_pem,
+                key_pem,
+                webtransport,
+            )
+            .await
+        })
+    }
+
+    /// Join HTTP children before stopping the Python dispatch pump.
+    fn close_http<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let children = self.http.clone();
+        children.close();
+        future_into_py(py, async move { children.stop_all().await })
+    }
+
     /// Stop serving: the accept/dispatch loops are aborted. In-flight calls
     /// end when their `ServerCall`s are answered or dropped.
     fn close(&self) {
+        self.http.force_cleanup();
+        self.dispatcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(handle) = self.handle.lock().unwrap().take() {
             handle.abort();
         }
@@ -281,6 +386,7 @@ impl DispatchServer {
 
 impl Drop for DispatchServer {
     fn drop(&mut self) {
+        self.http.force_cleanup();
         if let Some(handle) = self.handle.get_mut().ok().and_then(Option::take) {
             handle.abort();
         }
@@ -991,6 +1097,7 @@ fn dynamic_service_contract_id(json: &str) -> PyResult<String> {
 }
 
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    crate::http::register(m)?;
     m.add_function(wrap_pyfunction!(dynamic_service_contract_id, m)?)?;
     m.add_class::<DispatchServer>()?;
     m.add_class::<ServerCall>()?;

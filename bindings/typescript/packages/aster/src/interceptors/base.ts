@@ -39,6 +39,8 @@ export class CallContext {
   callId: string;
   sessionId: string | undefined;
   peer: string | undefined;
+  /** True only for native Iroh endpoint authentication, never an HTTP/WT auth callback. */
+  readonly irohAuthenticated: boolean;
   metadata: Record<string, string>;
   private _attributes: Record<string, string>;
   /** Server side: resolves `attributes` on first access when the call carried none. */
@@ -64,6 +66,7 @@ export class CallContext {
     callId?: string;
     sessionId?: string;
     peer?: string;
+    irohAuthenticated?: boolean;
     metadata?: Record<string, string>;
     attributes?: Record<string, string>;
     deadline?: number;
@@ -80,6 +83,7 @@ export class CallContext {
     this.callId = init.callId ?? crypto.randomUUID();
     this.sessionId = init.sessionId;
     this.peer = init.peer;
+    this.irohAuthenticated = init.irohAuthenticated ?? false;
     this.metadata = init.metadata ?? {};
     this._attributes = init.attributes ?? {};
     this.deadline = init.deadline;

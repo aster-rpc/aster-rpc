@@ -48,7 +48,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	aster "aster-ffi"
+	aster "sdk.getaster.now/go"
 )
 
 const (

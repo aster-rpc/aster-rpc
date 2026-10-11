@@ -158,6 +158,14 @@ public enum EventKind : uint
     /// <summary><c>aster_coordination_lease_acquire</c>: granted = <c>handle</c> + <c>DD</c>, denied = handle 0 + UCv1 <c>B2</c>.</summary>
     CoordinationLeaseAcquired = 113,
 
+    /// <summary>ABI 4.13: temporary custody protection or named retention completed.</summary>
+    BlobCustodyDone = 118,
+
+    /// <summary>ABI 4.14: ordered optional bytes from one local Docs content batch.</summary>
+    DocContentsBatch = 119,
+    /// <summary>ABI 4.16: owned immutable topology snapshot handle.</summary>
+    TopologySnapshot = 120,
+
     // Errors
     OperationCancelled = 98,
     Error = 99,

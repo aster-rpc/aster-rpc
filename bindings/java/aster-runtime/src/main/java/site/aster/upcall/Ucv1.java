@@ -2,12 +2,15 @@ package site.aster.upcall;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import site.aster.lease.DenyReason;
 import site.aster.lease.Fence;
 import site.aster.lease.FenceRejection;
@@ -64,6 +67,8 @@ public final class Ucv1 {
   public static final int TAG_EXPOSE_HTTP_TRAILERS = 0xC6;
   public static final int TAG_EXPOSE_ROUTE_POLICY_REQUEST = 0xC7;
   public static final int TAG_EXPOSE_ROUTE_GRANT = 0xC8;
+  public static final int TAG_RPC_AUTH_REQUEST = 0xC9;
+  public static final int TAG_RPC_AUTH_RESPONSE = 0xCA;
 
   /** Highest HTTP version code ({@code 0} HTTP/0.9 .. {@code 4} HTTP/3). */
   public static final int HTTP_VERSION_MAX = 4;
@@ -89,6 +94,117 @@ public final class Ucv1 {
   // ── message types without a home in site.aster.lease ─────────────────────
 
   public record LeaseTransitionRequest(String resource, LeaseOp op) {}
+
+  /** Per-call authentication context. Map keys have canonical UTF-8 byte order on the wire. */
+  public record RpcAuthRequest(
+      String peerId, String service, String method, int sessionId, Map<String, String> metadata) {
+    public RpcAuthRequest {
+      metadata = Map.copyOf(metadata);
+    }
+  }
+
+  /** Explicit rejection or a nonempty resolved principal with per-call attributes. */
+  public record RpcAuthResponse(
+      boolean accepted, String principal, Map<String, String> attributes) {
+    public RpcAuthResponse {
+      attributes = Map.copyOf(attributes);
+    }
+
+    public static RpcAuthResponse rejected() {
+      return new RpcAuthResponse(false, null, Map.of());
+    }
+  }
+
+  private static byte[] authUtf8(String value) {
+    try {
+      ByteBuffer encoded =
+          StandardCharsets.UTF_8
+              .newEncoder()
+              .onMalformedInput(CodingErrorAction.REPORT)
+              .onUnmappableCharacter(CodingErrorAction.REPORT)
+              .encode(CharBuffer.wrap(value));
+      byte[] bytes = new byte[encoded.remaining()];
+      encoded.get(bytes);
+      return bytes;
+    } catch (CharacterCodingException e) {
+      throw new IllegalArgumentException("authentication string is not valid Unicode", e);
+    }
+  }
+
+  private static W authString(W w, String value) {
+    authUtf8(value);
+    return w.str(value);
+  }
+
+  private static void putAuthMap(W w, Map<String, String> values) {
+    List<String> keys = new ArrayList<>(values.keySet());
+    keys.sort((a, b) -> Arrays.compareUnsigned(authUtf8(a), authUtf8(b)));
+    w.list(keys.size());
+    for (String key : keys) {
+      authString(w, key);
+      authString(w, values.get(key));
+    }
+  }
+
+  private static Map<String, String> getAuthMap(R r) {
+    int count = r.list();
+    Map<String, String> values = new LinkedHashMap<>();
+    byte[] previous = null;
+    for (int i = 0; i < count; i++) {
+      String key = r.str();
+      byte[] encoded = authUtf8(key);
+      if (previous != null && Arrays.compareUnsigned(previous, encoded) >= 0)
+        throw new DecodeException("authentication map keys not strictly ascending");
+      previous = encoded;
+      values.put(key, r.str());
+    }
+    return Map.copyOf(values);
+  }
+
+  public static byte[] encodeRpcAuthRequest(RpcAuthRequest value) {
+    W w = new W(TAG_RPC_AUTH_REQUEST);
+    authString(w, value.peerId());
+    authString(w, value.service());
+    authString(w, value.method());
+    w.uint(Integer.toUnsignedLong((value.sessionId() << 1) ^ (value.sessionId() >> 31)));
+    putAuthMap(w, value.metadata());
+    return w.done();
+  }
+
+  public static RpcAuthRequest decodeRpcAuthRequest(byte[] bytes) {
+    R r = new R(bytes, TAG_RPC_AUTH_REQUEST);
+    String peer = r.str(), service = r.str(), method = r.str();
+    int raw = (int) r.uintMax(0xffff_ffffL, "authentication session id");
+    int session = (raw >>> 1) ^ -(raw & 1);
+    var value = new RpcAuthRequest(peer, service, method, session, getAuthMap(r));
+    r.end();
+    return value;
+  }
+
+  public static byte[] encodeRpcAuthResponse(RpcAuthResponse value) {
+    W w = new W(TAG_RPC_AUTH_RESPONSE).bool(value.accepted());
+    if (value.accepted()) {
+      if (value.principal() == null || value.principal().isEmpty())
+        throw new IllegalArgumentException("empty authentication principal");
+      authString(w, value.principal());
+      putAuthMap(w, value.attributes());
+    } else if (value.principal() != null || !value.attributes().isEmpty()) {
+      throw new IllegalArgumentException("rejected authentication carries fields");
+    }
+    return w.done();
+  }
+
+  public static RpcAuthResponse decodeRpcAuthResponse(byte[] bytes) {
+    R r = new R(bytes, TAG_RPC_AUTH_RESPONSE);
+    RpcAuthResponse value;
+    if (r.bool()) {
+      String principal = r.str();
+      if (principal.isEmpty()) throw new DecodeException("empty authentication principal");
+      value = new RpcAuthResponse(true, principal, getAuthMap(r));
+    } else value = RpcAuthResponse.rejected();
+    r.end();
+    return value;
+  }
 
   public record FencedMutateRequest(Fence fence, String writer, byte[] op) {
     @Override

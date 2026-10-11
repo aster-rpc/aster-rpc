@@ -419,6 +419,106 @@ fn other_cases() -> Vec<Case> {
     ]
 }
 
+fn auth_cases() -> Vec<Case> {
+    let metadata = std::collections::HashMap::from([
+        ("authorization".into(), "Bearer token".into()),
+        ("aster-session-id".into(), "counter/7".into()),
+    ]);
+    let response = codec::RpcAuthResponse::Authenticated {
+        principal: "user/alice".into(),
+        attributes: std::collections::HashMap::from([
+            ("aster.role".into(), "operator".into()),
+            ("tenant".into(), "one".into()),
+        ]),
+    };
+    let unicode_metadata = std::collections::HashMap::from([
+        ("\u{e000}".into(), "BMP".into()),
+        ("\u{10000}".into(), "supplementary".into()),
+    ]);
+    vec![
+        Case {
+            name: "RPC authentication request",
+            ty: "RpcAuthRequest",
+            value: json!({"peer_id":"127.0.0.1:1234","service":"Counter","method":"read","session_id":7,"metadata":metadata}),
+            bytes: codec::encode_rpc_auth_request(
+                "127.0.0.1:1234",
+                "Counter",
+                "read",
+                7,
+                &metadata,
+            ),
+            reencode: |b| {
+                let r = codec::decode_rpc_auth_request(b).unwrap();
+                codec::encode_rpc_auth_request(
+                    &r.peer_id,
+                    &r.service,
+                    &r.method,
+                    r.session_id,
+                    &r.metadata,
+                )
+            },
+        },
+        Case {
+            name: "RPC authentication request: signed session boundary",
+            ty: "RpcAuthRequest",
+            value: json!({"peer_id":"peer","service":"svc","method":"method","session_id":i32::MIN,"metadata":{}}),
+            bytes: codec::encode_rpc_auth_request(
+                "peer",
+                "svc",
+                "method",
+                i32::MIN,
+                &std::collections::HashMap::new(),
+            ),
+            reencode: |b| {
+                let r = codec::decode_rpc_auth_request(b).unwrap();
+                codec::encode_rpc_auth_request(
+                    &r.peer_id,
+                    &r.service,
+                    &r.method,
+                    r.session_id,
+                    &r.metadata,
+                )
+            },
+        },
+        Case {
+            name: "RPC authentication: accepted",
+            ty: "RpcAuthResponse",
+            value: json!({"accepted":true,"principal":"user/alice","attributes":{"aster.role":"operator","tenant":"one"}}),
+            bytes: codec::encode_rpc_auth_response(&response).unwrap(),
+            reencode: |b| {
+                codec::encode_rpc_auth_response(&codec::decode_rpc_auth_response(b).unwrap())
+                    .unwrap()
+            },
+        },
+        Case {
+            name: "RPC authentication request: UTF-8 map order",
+            ty: "RpcAuthRequest",
+            value: json!({"peer_id":"peer","service":"svc","method":"method","session_id":0,"metadata":unicode_metadata}),
+            bytes: codec::encode_rpc_auth_request("peer", "svc", "method", 0, &unicode_metadata),
+            reencode: |b| {
+                let r = codec::decode_rpc_auth_request(b).unwrap();
+                codec::encode_rpc_auth_request(
+                    &r.peer_id,
+                    &r.service,
+                    &r.method,
+                    r.session_id,
+                    &r.metadata,
+                )
+            },
+        },
+        Case {
+            name: "RPC authentication: rejected",
+            ty: "RpcAuthResponse",
+            value: json!({"accepted":false}),
+            bytes: codec::encode_rpc_auth_response(&codec::RpcAuthResponse::Rejected).unwrap(),
+            reencode: |b| {
+                codec::encode_rpc_auth_response(&codec::decode_rpc_auth_response(b).unwrap())
+                    .unwrap()
+            },
+        },
+    ]
+}
+
 fn hdrs(v: &[(&str, &[u8])]) -> Vec<codec::HttpHeader> {
     v.iter().map(|(n, x)| (n.to_string(), x.to_vec())).collect()
 }
@@ -821,6 +921,46 @@ fn invalid() -> Vec<(&'static str, &'static str, String)> {
             "TopologyAdmittedResponse",
             "b901050c01".into(),
         ),
+        (
+            "authentication empty principal",
+            "RpcAuthResponse",
+            "ca010102000c".into(),
+        ),
+        (
+            "authentication invalid bool",
+            "RpcAuthResponse",
+            "ca0102".into(),
+        ),
+        (
+            "authentication rejected with trailing fields",
+            "RpcAuthResponse",
+            "ca010000".into(),
+        ),
+        (
+            "authentication attributes not ascending",
+            "RpcAuthResponse",
+            "ca01010678020c066202066102".into(),
+        ),
+        (
+            "authentication duplicate attribute",
+            "RpcAuthResponse",
+            "ca01010678020c066102066102".into(),
+        ),
+        (
+            "authentication session out of range",
+            "RpcAuthRequest",
+            "c9010202028080808010000c".into(),
+        ),
+        (
+            "authentication nonminimal session",
+            "RpcAuthRequest",
+            "c9010202028000000c".into(),
+        ),
+        (
+            "authentication metadata not ascending",
+            "RpcAuthRequest",
+            "c90102020200020c066202066102".into(),
+        ),
     ]
     .into_iter()
     .chain(expose_http_invalid())
@@ -840,6 +980,8 @@ fn decode_by_type(ty: &str, b: &[u8]) -> anyhow::Result<()> {
         "ExposeHttpResponse" => codec::decode_expose_http_response(b).map(drop),
         "ExposeRoutePolicyRequest" => codec::decode_expose_route_policy_request(b).map(drop),
         "ExposeRouteGrant" => codec::decode_expose_route_grant(b).map(drop),
+        "RpcAuthRequest" => codec::decode_rpc_auth_request(b).map(drop),
+        "RpcAuthResponse" => codec::decode_rpc_auth_response(b).map(drop),
         other => panic!("no decoder for {other}"),
     }
 }
@@ -849,6 +991,7 @@ fn render() -> Value {
     cases.extend(other_cases());
     cases.extend(placement_cases());
     cases.extend(expose_http_cases());
+    cases.extend(auth_cases());
     let kinds: Vec<Value> = UpcallKind::ALL
         .iter()
         .map(|k| json!({"code": k.code(), "name": k.name(), "decision": k.is_decision()}))
@@ -930,6 +1073,7 @@ fn upcall_vectors() {
     cases.extend(other_cases());
     cases.extend(placement_cases());
     cases.extend(expose_http_cases());
+    cases.extend(auth_cases());
     for c in &cases {
         assert_eq!((c.reencode)(&c.bytes), c.bytes, "{} round trip", c.name);
     }

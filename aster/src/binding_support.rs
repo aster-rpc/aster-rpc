@@ -42,6 +42,11 @@ pub mod dispatch;
 /// providers, expose authorize, Gate 0) through one event + respond channel.
 pub mod upcall;
 
+/// Stateless coordination provisioning adapters. The authoritative Fory and
+/// authority rules remain in `coordination::model::authority`.
+#[cfg(feature = "coordination-client")]
+pub mod provisioning;
+
 /// Consumer-side streaming HTTP relay: concrete upload / response-reader
 /// handles over `expose::relay_request_streaming`.
 #[cfg(feature = "expose")]

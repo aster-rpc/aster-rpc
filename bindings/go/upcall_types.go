@@ -37,6 +37,8 @@ const (
 	// by upcall (not issued by the C ABI; Gate 0 keeps its own events).
 	UpcallAdmissionConnect   UpcallKind = 64
 	UpcallAdmissionHandshake UpcallKind = 65
+	// UpcallRpcAuthenticate: C9 -> CA (typed authentication, never fail-open).
+	UpcallRpcAuthenticate UpcallKind = 80
 )
 
 // IsDecision reports whether the kind is a decision kind: with no usable

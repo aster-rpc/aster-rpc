@@ -1,4 +1,153 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.9)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.16)
+
+## New in 4.16 (local/shared topology views and RPC policy; additive)
+
+`aster_topology_has_monitoring`, `_peers` and `_peer` expose local passive metrics.
+Peer JSON preserves nullable u64 RTT/jitter, full u64 counters, ladder levels 0–4,
+and local-only remote socket addresses; baseline RPC deliberately omits addresses.
+No-monitoring views are empty, and unknown peers return JSON null.
+
+`aster_topology_snapshot` captures one immutable shared view and emits
+`ASTER_EVENT_TOPOLOGY_SNAPSHOT` = 120 with an owned handle. Free it with
+`aster_topology_snapshot_free`; query `_clusters`, `_cluster_of`, `_separated`
+on the captured handle. Unknown (0), Connected (1), Separated (2) come from native
+coverage rules; missing measurements never imply separation. Returned JSON spans
+are independently owned and use `aster_string_release`. Snapshot ownership is
+runtime-scoped; canceled undispatched snapshot creation releases its owner.
+
+`aster_topology_enable_shared_with_options` adds strict JSON native options for
+position refresh, min hold, liveness/edge TTL, clock skew, separation coverage and
+witness count. Omitted values retain defaults; explicit zero is preserved except
+position refresh zero means 60s. Every value is at most u32; options cap is 16 KiB
+and unknown fields fail. Canceling a join wait does not roll back installed work;
+the node owns its publisher until shutdown or replacement.
+
+`aster_server_set_topology` atomically selects explicit baseline RPC opt-in and
+an optional native capability requirement (role/any_of/all_of). The new API
+requires monitoring when enabled; default is disabled. This does not open an RPC
+for local reads or duplicate authorization rules in host code. Legacy builder
+options remain compatible. Shared observations are local evidence, not policy proof.
+
+## New in 4.15 (coordination authority provisioning; additive)
+
+Nine stateless `aster_coordination_*` functions expose native canonical genesis
+and join document encoding, genesis/join signing preimages, genesis hashing,
+canonical candidate tickets, signed-envelope assembly, genesis verification and
+join verification for start. Canonical JSON DTO inputs use hex32 identifiers and
+nonces; native code fixes version 1 and derives the candidate ticket. Caller
+ordering is preserved. Encoding and envelope assembly do not establish authority.
+
+`aster_provisioning_result_t` contains owned `data` and `error` byte spans;
+release both with `aster_string_release` on every path. Success data is raw Fory,
+preimage/hash bytes, UTF-8 ticket, or verified-summary JSON depending on the call.
+Errors contain JSON `{code,detail}` with stable code and diagnostic detail:
+invalid input maps to `INVALID_ARGUMENT`, encoding to `INTERNAL`, verification
+to `VERIFICATION_FAILED`. These synchronous operations require no runtime.
+
+Verification pins an independently configured authority public key and domain;
+join-for-start also pins the candidate, but extracts group/genesis rather than
+checking independent expected values. Returned summaries are copied metadata,
+not native sealed authority handles. External signing, policy selection, list
+sorting, group creation and membership commitment remain caller responsibilities.
+
+## New in 4.14 (locally complete batch Docs reads; additive)
+
+`aster_doc_read_entry_contents_if_complete(runtime, doc, hashes, user_data,
+ out_operation)` reads ordered content hashes in one local operation. Inputs
+are copied and all hashes validated as hex64 before submission. Empty input
+is valid; order and duplicates are preserved. No fetch, tags or retention.
+
+`ASTER_EVENT_DOC_CONTENTS_BATCH` = 119 returns `u32LE count`, then each slot:
+`u8 presence`; 0 has no following bytes, 1 has `u64LE length` and exactly that
+many bytes. Count equals submitted hashes; empty input encodes four zero bytes.
+Present empty data uses presence 1 and length zero, distinct from missing/partial
+presence 0. Decoders reject unknown markers, mismatched counts, oversized lengths,
+truncation and trailing bytes. Native buffers use normal completion ownership.
+
+Missing or partial content at the initial batch check returns an absent slot.
+Complete inline values are copied in the store transaction; large complete
+values use validated export. This is not a global snapshot: concurrent GC/delete
+may fail large export and thus the entire batch. I/O/integrity errors are never
+converted to absence. Use custody for stable host-side verification. Standard
+read-only operation cancellation applies; no custody semantics are introduced.
+
+## New in 4.13 (temporary blob custody and verified retained imports; additive)
+
+- `aster_blobs_custody_new` / `aster_blob_custody_free` own a temporary scope
+  protecting multiple `(hash, RAW|HASH_SEQ)` roots, including hashes not local
+  yet. Free seals new work; synchronously accepted operations keep every scope
+  guard until their work and cleanup finish.
+- `aster_blob_custody_protect`, `_add_bytes`, `_add_path`, `_retain`, `_read` and
+  `_download_hash_from` span acquisition, fetching and host verification.
+  Imports create no automatic persistent tag; retain commits the exact named
+  root. HashSeq protection includes its graph without imposing Collection
+  schema, and scoped reads return raw root bytes.
+- `aster_blobs_add_bytes_verified` / `aster_blobs_add_path_verified` copy input,
+  compare its store-computed hash and commit the exact named tag only on a match.
+  Mismatch returns `VERIFICATION_FAILED`, preserves the old named root and
+  creates no anonymous persistent tag. Existing store durability is unchanged.
+- `ASTER_EVENT_BLOB_CUSTODY_DONE` = 118 is the empty protect/retain completion;
+  imports emit `BLOB_ADDED`, read emits `BLOB_READ`, fetch emits `BLOB_FETCHED`
+  with the existing report layout. All operations use cooperative cancellation:
+  collect their single definitive terminal event; pre-commit cancellation waits
+  for cleanup, while a commit already started returns actual success/error.
+  Scoped fetch cancellation may wait for downloader/network drain.
+
+## New in 4.12 (public HTTP/WebTransport and certificate helpers; additive)
+
+- `aster_server_http_start_public`: explicit anonymous serving, no upcall table;
+  authentication limits must be zero. Session-scoped services are rejected;
+  method gates remain active and identity attributes are empty.
+- `aster_tls_generate_self_signed`, `aster_tls_generate_webtransport`,
+  `aster_tls_verify_binding`, and `aster_generated_cert_t`: shared TLS generation,
+  certificate DER SHA-256 pins and optional signed node-key authorization.
+  PEM outputs are separately released with `aster_string_release`.
+- Authenticated start remains unchanged. Node-binding verification checks TLS
+  key authorization, not certificate expiry, hostname or PKI trust. No ACME or
+  FIPS capability is implied.
+
+## New in 4.11 (authenticated HTTP/WebTransport; additive)
+
+`aster_server_http_start` attaches a PEM HTTPS listener to an existing dispatch
+server and requires an upcall table. `aster_http_listener_tcp_addr` and
+`aster_http_listener_quic_addr` return bound addresses; enabling WebTransport
+uses the TCP-selected port for QUIC, including port zero.
+`aster_http_listener_stop` drains within a grace period, then cancels remaining
+calls and joins listener cleanup. QUIC protocol/socket drain may extend beyond
+the application grace period. Start/stop and server destruction run off Tokio
+runtime threads.
+Listeners belong to their runtime and server; cross-runtime attachment is
+rejected. Runtime close retires server and upcall-table owners even when callers
+have not explicitly freed them. There is no implicit public mode or ACME
+configuration in this API.
+
+`ASTER_UPCALL_KIND_RPC_AUTHENTICATE` (80) uses UCv1 C9/CA. Authentication requires
+an explicit nonempty principal and per-call attributes, or explicit rejection.
+Pending requests and payload sizes are bounded. Missing callbacks, malformed
+answers, overload, shutdown and timeout fail closed regardless of any fail-open
+policy. The routed call deadline also applies while authentication is pending.
+The payload codecs have shared conformance vectors across all five language
+bindings; listener wrappers are introduced in Go first.
+
+## New in 4.10 (Docs receiver lifecycle; additive)
+
+`aster_doc_event_receiver_free(runtime, receiver)` releases a live Docs event
+subscription independently from its Doc handle. It removes the registry owner
+and wakes pending receives with `ASTER_EVENT_DOC_EVENT` / `NOT_FOUND` (EOF).
+An in-flight receive racing close may complete successfully. Repeated release returns `NOT_FOUND`. Stream EOF/errors release the receiver
+automatically; runtime shutdown wakes blocked reads and drops their owners.
+
+`aster_doc_event_recv` serializes reads and now interrupts blocked reads when
+`aster_operation_cancel` wins. An event consumed just before cancellation wins
+is retained for the next receive. Cancellation and completion produce exactly
+one terminal event: bindings must await that terminal after cancelling, returning
+an already committed successful event when completion won the race. They must
+release every returned payload buffer.
+
+The wire layout is unchanged: `event.flags` carries the subtype, query-shaped
+entry metadata has no inline value, and atomic join returns the document in
+`event.handle` and the 64-bit receiver in `event.related`. The generated header
+now states these contracts explicitly.
 
 ## New in 4.9 (durable audit outbox; additive)
 

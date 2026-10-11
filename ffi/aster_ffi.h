@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 9
+#define ASTER_ABI_VERSION_MINOR 16
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -187,6 +187,11 @@
  * Envelope format version (second byte of every envelope).
  */
 #define ASTER_ENVELOPE_VERSION 1
+
+/**
+ * Enable WebTransport on the TCP listener's exact bound address and port.
+ */
+#define ASTER_HTTP_SERVER_WEBTRANSPORT 1
 
 #define ASTER_TRANSPORT_MAX_CONCURRENT_BIDI_STREAMS (1 << 0)
 
@@ -558,6 +563,18 @@ typedef enum aster_event_kind_t {
    * `aster_audit_outbox_export`: versioned JSON evidence payload.
    */
   ASTER_EVENT_AUDIT_OUTBOX_EXPORTED = 117,
+  /**
+   * A custody protect/retain operation completed; handle = custody scope.
+   */
+  ASTER_EVENT_BLOB_CUSTODY_DONE = 118,
+  /**
+   * Ordered optional content values; see aster_doc_read_entry_contents_if_complete.
+   */
+  ASTER_EVENT_DOC_CONTENTS_BATCH = 119,
+  /**
+   * One immutable shared topology view; handle = owned topology snapshot.
+   */
+  ASTER_EVENT_TOPOLOGY_SNAPSHOT = 120,
 } aster_event_kind_t;
 
 /**
@@ -1031,6 +1048,11 @@ typedef enum aster_upcall_kind_t {
    * Gate 0 handshake hook (decision): `C2` → `C3` (not issued by the C ABI yet).
    */
   ASTER_UPCALL_KIND_ADMISSION_HANDSHAKE = 65,
+  /**
+   * Per-call authentication: explicit principal/attributes or rejection (C9 -> CA).
+   * Never uses a fail-open policy; served by authenticated HTTP/WT listeners.
+   */
+  ASTER_UPCALL_KIND_RPC_AUTHENTICATE = 80,
 } aster_upcall_kind_t;
 
 /**
@@ -1431,6 +1453,15 @@ typedef enum aster_audit_outbox_error_t {
   ASTER_AUDIT_OUTBOX_ERROR_STALE_DELIVERY = 17,
 } aster_audit_outbox_error_t;
 
+/**
+ * Unknown is absence of adequate evidence, never proof of separation.
+ */
+typedef enum aster_topology_separation_t {
+  ASTER_TOPOLOGY_UNKNOWN = 0,
+  ASTER_TOPOLOGY_CONNECTED = 1,
+  ASTER_TOPOLOGY_SEPARATED = 2,
+} aster_topology_separation_t;
+
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
   uint32_t worker_threads;
@@ -1653,6 +1684,11 @@ typedef uint64_t aster_upcalls_t;
  * A placement manager (`aster_coordination_placement_manager_new`).
  */
 typedef uint64_t aster_coordination_placement_manager_t;
+
+/**
+ * Runtime-local owned temporary custody scope. Free with aster_blob_custody_free.
+ */
+typedef uint64_t aster_blob_custody_t;
 
 /**
  * One network path of a connection (`aster::PathInfo`). Strings point into
@@ -2094,6 +2130,30 @@ typedef struct aster_health_config_t {
 typedef uint64_t aster_health_t;
 
 /**
+ * A running dispatch server (`aster_server_start`).
+ */
+typedef uint64_t aster_server_t;
+
+/**
+ * Inputs are copied during start. Only operator-supplied PEM is accepted.
+ * Zero limits select 256 pending auth callbacks and 65536 payload bytes.
+ */
+typedef struct aster_http_server_config_t {
+  uint32_t struct_size;
+  uint32_t flags;
+  struct aster_bytes_t bind_addr;
+  struct aster_bytes_t cert_pem;
+  struct aster_bytes_t key_pem;
+  uint32_t max_pending_auth;
+  uint32_t max_auth_payload_bytes;
+} aster_http_server_config_t;
+
+/**
+ * An owned TCP/optional QUIC listener.
+ */
+typedef uint64_t aster_http_listener_t;
+
+/**
  * Node configuration: every knob of `aster::AsterConfig` that a node uses
  * (docs/aster-rust-getstarted.md §2.2). Start from `aster_config_init` (or
  * `aster_config_from_env` / `aster_config_from_toml`), then set fields. See
@@ -2482,6 +2542,18 @@ typedef struct aster_span_record_t {
 } aster_span_record_t;
 
 /**
+ * Owned provisioning result. On success data contains the documented output;
+ * on failure error contains UTF-8 JSON {"code": string, "detail": string}.
+ * Both spans start empty. Release each nonempty span with aster_string_release.
+ * No runtime is required. Verified JSON is metadata from native verified
+ * accessors, not a transferable authorization capability.
+ */
+typedef struct aster_provisioning_result_t {
+  struct aster_bytes_t data;
+  struct aster_bytes_t error;
+} aster_provisioning_result_t;
+
+/**
  * Policy of a minted attestation edge (`aster::attestation::AttestOptions`).
  */
 typedef struct aster_attest_options_t {
@@ -2601,11 +2673,6 @@ typedef uint64_t aster_cancel_token_t;
 typedef uint64_t aster_server_builder_t;
 
 /**
- * A running dispatch server (`aster_server_start`).
- */
-typedef uint64_t aster_server_t;
-
-/**
  * One dispatch event, filled by `aster_server_poll`. 104 bytes (LP64).
  *
  * `request` and `peer` point into one lease, `buffer`, valid until
@@ -2690,6 +2757,29 @@ typedef struct aster_dispatch_event_t {
 } aster_dispatch_event_t;
 
 /**
+ * Generated server PEM material and SHA-256 of certificate DER (not SPKI).
+ * Release each PEM independently with aster_string_release(ptr, len).
+ * No runtime is required; callers own and must protect the private key.
+ */
+typedef struct aster_generated_cert_t {
+  struct aster_bytes_t cert_pem;
+  struct aster_bytes_t key_pem;
+  uint8_t sha256[32];
+} aster_generated_cert_t;
+
+/**
+ * Runtime-local owner of one immutable shared view. Free explicitly, or close
+ * its runtime. The observation remains readable after its source node closes.
+ */
+typedef uint64_t aster_topology_snapshot_t;
+
+/**
+ * A cached, batched foreign topology admission filter
+ * (`aster_topology_admitted_new`).
+ */
+typedef uint64_t aster_topology_admitted_t;
+
+/**
  * One upcall event, filled by `aster_upcall_poll`. 40 bytes (LP64).
  *
  * `payload_ptr` / `payload_len` is the kind's UCv1 request, valid until
@@ -2737,12 +2827,6 @@ typedef uint64_t aster_lease_t;
  * A foreign fenced resource (`aster_fenced_resource_foreign_new`).
  */
 typedef uint64_t aster_fenced_resource_t;
-
-/**
- * A cached, batched foreign topology admission filter
- * (`aster_topology_admitted_new`).
- */
-typedef uint64_t aster_topology_admitted_t;
 
 /**
  * Counters of a topology admission filter (`aster_topology_admitted_stats`).
@@ -2820,7 +2904,8 @@ int32_t aster_buffer_release(aster_runtime_t runtime, uint64_t buffer);
  * `aster_endpoint_remote_info_list`), `aster_connection_info_t.alpn`, and
  * `aster_transport_snapshot_t.peer_host` / `.relay_url`, and the `out`
  * buffer of `aster_{stream_header,call_header,rpc_status}_encode`,
- * `aster_zstd_maybe_compress` and `aster_zstd_decompress`.
+ * `aster_zstd_maybe_compress`, `aster_zstd_decompress`, and both PEM fields
+ * of `aster_generated_cert_t`.
  *
  * Pass back exactly the `ptr` and `len` the library returned. Non-empty
  * buffers are additionally NUL-terminated (the terminator is not counted in
@@ -2834,6 +2919,14 @@ int32_t aster_buffer_release(aster_runtime_t runtime, uint64_t buffer);
  */
 int32_t aster_string_release(const uint8_t *ptr, uintptr_t len);
 
+/**
+ * Request cancellation. Continue polling and collect the operation's terminal
+ * event. ABI 4.13 custody and verified imports acknowledge cancellation only
+ * after native cleanup; a named-tag commit already started reports its actual
+ * result, which may be success. Fetch cleanup can wait for downloader drain.
+ * # Safety
+ * This function does not dereference caller pointers.
+ */
 int32_t aster_operation_cancel(aster_runtime_t runtime, aster_operation_t operation);
 
 uintptr_t aster_last_error_message(uint8_t *buffer, uintptr_t capacity);
@@ -3354,9 +3447,29 @@ int32_t aster_doc_subscribe(aster_runtime_t runtime,
                             aster_operation_t *out_operation);
 
 /**
- * Receive the next live document event (long-poll, like gossip_recv).
- * Emits ASTER_EVENT_DOC_EVENT with event.subtype indicating the event kind and
- * packed data in the payload.  When the subscription ends, emits with status=NOT_FOUND.
+ * Release a document event receiver independently from its document handle.
+ * Removes the handle and wakes pending receives, which complete with
+ * ASTER_EVENT_DOC_EVENT / ASTER_STATUS_NOT_FOUND (end of stream). An in-flight
+ * receive racing close may complete successfully. Repeated
+ * release, or receiving through a released handle, returns NOT_FOUND.
+ * Runtime shutdown also releases receivers and wakes pending receives.
+ */
+int32_t aster_doc_event_receiver_free(aster_runtime_t runtime, uint64_t receiver);
+
+/**
+ * Receive the next live document event. Subtype is carried in event.flags:
+ * 0=InsertLocal, 1=InsertRemote, 2=ContentReady, 3=PendingContentReady,
+ * 4=NeighborUp, 5=NeighborDown, 6=SyncFinished. Entry events use the DOC_QUERY
+ * metadata layout; InsertRemote appends a length-prefixed peer ID. ContentReady
+ * carries the hash string; neighbor/sync events carry the peer string.
+ * PendingContentReady has an empty payload.
+ *
+ * Receives on one receiver are serialized. Cancelling an operation wakes its
+ * wait without consuming a later event; if cancellation wins after a stream
+ * event was consumed, that event is retained for the next receive. EOF and
+ * errors release the receiver handle automatically. EOF or receiver close
+ * emits ASTER_EVENT_DOC_EVENT / NOT_FOUND; cancellation emits the usual
+ * ASTER_EVENT_OPERATION_CANCELLED. Release every returned payload buffer.
  */
 int32_t aster_doc_event_recv(aster_runtime_t runtime,
                              uint64_t receiver,
@@ -3391,7 +3504,7 @@ int32_t aster_doc_share_with_addr(aster_runtime_t runtime,
  * Join a document and subscribe to live events atomically.
  * Emits ASTER_EVENT_DOC_JOINED_AND_SUBSCRIBED:
  *   event.handle = doc handle
- *   event.flags  = event-receiver handle
+ *   event.related = event-receiver handle (64-bit; not event.flags)
  */
 int32_t aster_docs_join_and_subscribe(aster_runtime_t runtime,
                                       aster_node_t node,
@@ -4155,6 +4268,150 @@ int32_t aster_coordination_placement_manager_free(aster_runtime_t runtime,
                                                   aster_coordination_placement_manager_t manager);
 
 /**
+ * Create a temporary custody scope for a node. No persistent staging tag is created.
+ * # Safety
+ * out_scope must be writable.
+ */
+int32_t aster_blobs_custody_new(aster_runtime_t runtime,
+                                aster_node_t node,
+                                aster_blob_custody_t *out_scope);
+
+/**
+ * Seal a scope and release its owner. Accepted operations retain its guards
+ * until they finish; unaccepted calls return NOT_FOUND. Repeated free is NOT_FOUND.
+ */
+int32_t aster_blob_custody_free(aster_runtime_t runtime, aster_blob_custody_t scope);
+
+/**
+ * Scope-bound protect. Emits ASTER_EVENT_BLOB_CUSTODY_DONE on success.
+ * Formats are RAW=0 or HASH_SEQ=1. Reads and imports return bytes/hash payloads;
+ * protect and retain have empty payloads. Protection is temporary until retain.
+ * Cancellation requests must collect the terminal event; commit may win the race.
+ * # Safety
+ * Input spans must be readable and out_operation writable for this call.
+ */
+int32_t aster_blob_custody_protect(aster_runtime_t runtime,
+                                   aster_blob_custody_t scope,
+                                   struct aster_bytes_t hash,
+                                   uint32_t format,
+                                   uint64_t user_data,
+                                   aster_operation_t *out_operation);
+
+/**
+ * Scope-bound add bytes. Emits ASTER_EVENT_BLOB_ADDED on success.
+ * Formats are RAW=0 or HASH_SEQ=1. Reads and imports return bytes/hash payloads;
+ * protect and retain have empty payloads. Protection is temporary until retain.
+ * Cancellation requests must collect the terminal event; commit may win the race.
+ * # Safety
+ * Input spans must be readable and out_operation writable for this call.
+ */
+int32_t aster_blob_custody_add_bytes(aster_runtime_t runtime,
+                                     aster_blob_custody_t scope,
+                                     struct aster_bytes_t data,
+                                     uint32_t format,
+                                     uint64_t user_data,
+                                     aster_operation_t *out_operation);
+
+/**
+ * Scope-bound add path. Emits ASTER_EVENT_BLOB_ADDED on success.
+ * Formats are RAW=0 or HASH_SEQ=1. Reads and imports return bytes/hash payloads;
+ * protect and retain have empty payloads. Protection is temporary until retain.
+ * Cancellation requests must collect the terminal event; commit may win the race.
+ * # Safety
+ * Input spans must be readable and out_operation writable for this call.
+ */
+int32_t aster_blob_custody_add_path(aster_runtime_t runtime,
+                                    aster_blob_custody_t scope,
+                                    struct aster_bytes_t path,
+                                    uint32_t format,
+                                    uint64_t user_data,
+                                    aster_operation_t *out_operation);
+
+/**
+ * Scope-bound retain. Emits ASTER_EVENT_BLOB_CUSTODY_DONE on success.
+ * Formats are RAW=0 or HASH_SEQ=1. Reads and imports return bytes/hash payloads;
+ * protect and retain have empty payloads. Protection is temporary until retain.
+ * Cancellation requests must collect the terminal event; commit may win the race.
+ * # Safety
+ * Input spans must be readable and out_operation writable for this call.
+ */
+int32_t aster_blob_custody_retain(aster_runtime_t runtime,
+                                  aster_blob_custody_t scope,
+                                  struct aster_bytes_t hash,
+                                  uint32_t format,
+                                  struct aster_bytes_t tag,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * Scope-bound read. Emits ASTER_EVENT_BLOB_READ on success.
+ * Formats are RAW=0 or HASH_SEQ=1. Reads and imports return bytes/hash payloads;
+ * protect and retain have empty payloads. Protection is temporary until retain.
+ * Cancellation requests must collect the terminal event; commit may win the race.
+ * # Safety
+ * Input spans must be readable and out_operation writable for this call.
+ */
+int32_t aster_blob_custody_read(aster_runtime_t runtime,
+                                aster_blob_custody_t scope,
+                                struct aster_bytes_t hash,
+                                uint64_t user_data,
+                                aster_operation_t *out_operation);
+
+/**
+ * Copy data into the store, verify its expected hash, then commit exactly
+ * the named tag with the requested format. No anonymous persistent root is
+ * created. Hash mismatch returns VERIFICATION_FAILED and leaves the tag unchanged.
+ * Emits BLOB_ADDED with hash hex. Cancellation before commit cleans up; once
+ * commit starts, collect its actual success/error rather than assuming cancellation.
+ * # Safety
+ * Input spans must be readable and out_operation writable for this call.
+ */
+int32_t aster_blobs_add_bytes_verified(aster_runtime_t runtime,
+                                       aster_node_t node,
+                                       struct aster_bytes_t data,
+                                       struct aster_bytes_t expected_hash,
+                                       uint32_t format,
+                                       struct aster_bytes_t tag,
+                                       uint64_t user_data,
+                                       aster_operation_t *out_operation);
+
+/**
+ * Copy path into the store, verify its expected hash, then commit exactly
+ * the named tag with the requested format. No anonymous persistent root is
+ * created. Hash mismatch returns VERIFICATION_FAILED and leaves the tag unchanged.
+ * Emits BLOB_ADDED with hash hex. Cancellation before commit cleans up; once
+ * commit starts, collect its actual success/error rather than assuming cancellation.
+ * # Safety
+ * Input spans must be readable and out_operation writable for this call.
+ */
+int32_t aster_blobs_add_path_verified(aster_runtime_t runtime,
+                                      aster_node_t node,
+                                      struct aster_bytes_t path,
+                                      struct aster_bytes_t expected_hash,
+                                      uint32_t format,
+                                      struct aster_bytes_t tag,
+                                      uint64_t user_data,
+                                      aster_operation_t *out_operation);
+
+/**
+ * Fetch under temporary scope protection. Signature, flags, strategy and
+ * BLOB_FETCHED report payload match aster_blobs_download_hash_from, replacing
+ * the node handle with a custody scope. Protection is established before the
+ * network request and remains in the scope afterward; no named tag is created.
+ * # Safety
+ * Input spans/list must be readable and out_operation writable for this call.
+ */
+int32_t aster_blob_custody_download_hash_from(aster_runtime_t runtime,
+                                              aster_blob_custody_t scope,
+                                              struct aster_bytes_t hash,
+                                              struct aster_bytes_list_t providers,
+                                              uint32_t format,
+                                              uint32_t strategy,
+                                              uint32_t flags,
+                                              uint64_t user_data,
+                                              aster_operation_t *out_operation);
+
+/**
  * Download a blob by hash from an **ordered** list of providers
  * (`aster::Blobs::download_hash_from` / `download_hash_to_store_from`).
  *
@@ -4378,6 +4635,30 @@ int32_t aster_doc_entry_content_status(aster_runtime_t runtime,
                                        struct aster_bytes_t content_hash_hex,
                                        uint64_t user_data,
                                        aster_operation_t *out_operation);
+
+/**
+ * Read ordered content hashes through one local blob-store batch. No network
+ * fetch, document-membership check, tags, or retention mutation is performed.
+ * Missing/partial content returns an absent slot; present empty bytes remain
+ * distinct. Duplicates and input order are preserved. This is not an atomic
+ * snapshot: GC or I/O failure during a large validated export fails the batch.
+ * Use temporary blob custody when content must remain protected across reads.
+ *
+ * Emits ASTER_EVENT_DOC_CONTENTS_BATCH (handle=doc, flags=0). Payload: u32 LE
+ * count, then one u8 presence per slot. 0 has no following bytes; 1 is followed
+ * by u64 LE byte length and that many bytes. No padding or trailing bytes.
+ * Empty input emits four zero bytes. Release the event buffer normally.
+ * All hashes must be 64 ASCII hex characters; invalid input is rejected before
+ * operation admission. The list count must fit u32.
+ * # Safety
+ * Nonempty input lists and spans must be readable/aligned for this call;
+ * out_operation must be writable. Input is copied before this function returns.
+ */
+int32_t aster_doc_read_entry_contents_if_complete(aster_runtime_t runtime,
+                                                  uint64_t doc,
+                                                  struct aster_bytes_list_t content_hashes,
+                                                  uint64_t user_data,
+                                                  aster_operation_t *out_operation);
 
 /**
  * Snapshot every currently open network path of `connection`
@@ -5240,6 +5521,67 @@ int32_t aster_health_addr(aster_health_t h, struct aster_bytes_t *out);
 int32_t aster_health_stop(aster_runtime_t rt, aster_health_t h);
 
 /**
+ * Bind an authenticated listener over this server's registered services.
+ * Both sockets are ready on success. The server and upcalls must belong to
+ * runtime. Unknown flags, malformed config/PEM and binding failures are
+ * INVALID_ARGUMENT. A concurrently closing owner returns ALREADY_CLOSED.
+ * This blocks and is UNSUPPORTED on a tokio runtime thread.
+ *
+ * # Safety
+ * config and out_listener are valid; config's byte spans are readable.
+ */
+int32_t aster_server_http_start(aster_runtime_t runtime,
+                                aster_server_t server,
+                                aster_upcalls_t upcalls,
+                                const struct aster_http_server_config_t *config,
+                                aster_http_listener_t *out_listener);
+
+/**
+ * Explicitly bind a public listener without an authentication callback.
+ * Public calls receive no identity attributes and cannot use session-scoped
+ * services. Method access rules and Iroh-only requirements still apply.
+ * Both auth limits must be zero. Ownership and errors match authenticated start.
+ *
+ * # Safety
+ * config and out_listener are valid; config's byte spans are readable.
+ */
+int32_t aster_server_http_start_public(aster_runtime_t runtime,
+                                       aster_server_t server,
+                                       const struct aster_http_server_config_t *config,
+                                       aster_http_listener_t *out_listener);
+
+/**
+ * Copy the bound TCP address into a runtime-owned buffer. Release out_buffer
+ * with aster_buffer_release. All output pointers must be writable.
+ */
+int32_t aster_http_listener_tcp_addr(aster_runtime_t runtime,
+                                     aster_http_listener_t listener,
+                                     aster_buffer_t *out_buffer,
+                                     const uint8_t **out_ptr,
+                                     uint32_t *out_len);
+
+/**
+ * Copy the bound QUIC address; NOT_FOUND if WebTransport is disabled.
+ * Buffer ownership and safety requirements match aster_http_listener_tcp_addr.
+ */
+int32_t aster_http_listener_quic_addr(aster_runtime_t runtime,
+                                      aster_http_listener_t listener,
+                                      aster_buffer_t *out_buffer,
+                                      const uint8_t **out_ptr,
+                                      uint32_t *out_len);
+
+/**
+ * Stop accepting and join calls/connections, allowing grace_ms to drain before
+ * cancellation, then free the owner. TCP/UDP ports are released on success.
+ * Repeated stops return NOT_FOUND. Refused on tokio threads before mutation.
+ * Runtime close drops owners into forced cleanup; close_and_wait joins the
+ * runtime teardown. Server destroy joins children with zero grace.
+ */
+int32_t aster_http_listener_stop(aster_runtime_t runtime,
+                                 aster_http_listener_t listener,
+                                 uint32_t grace_ms);
+
+/**
  * Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
  * in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
  * overrides). Never allocates (`storage` is NULL).
@@ -5683,6 +6025,101 @@ void aster_probe_reset(void);
 int32_t aster_probe_dump_unary_csv(const uint8_t *path_ptr, uint32_t path_len);
 
 /**
+ * Canonically encode a v1 genesis from strict UTF-8 JSON. Fixed-width fields
+ * are hex32; format_version is fixed at 1. The DTO preserves caller ordering,
+ * and encoding alone does not establish validity or authorization.
+ * Success data is opaque canonical Fory document bytes.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_canonical_genesis(struct aster_bytes_t json,
+                                             struct aster_provisioning_result_t *out);
+
+/**
+ * Canonically encode a v1 join permit from strict UTF-8 JSON. The candidate
+ * ticket is derived natively and must not be supplied. Success data is opaque
+ * canonical Fory bytes. Encoding alone does not grant membership.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_canonical_join_permit(struct aster_bytes_t json,
+                                                 struct aster_provisioning_result_t *out);
+
+/**
+ * Exact domain-separated genesis preimage for an external Ed25519 signer.
+ * This accepts opaque bytes and does not verify their content.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_genesis_signing_bytes(struct aster_bytes_t document,
+                                                 struct aster_provisioning_result_t *out);
+
+/**
+ * Exact domain-separated join preimage for an external Ed25519 signer.
+ * This accepts opaque bytes and does not verify their content.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_join_signing_bytes(struct aster_bytes_t document,
+                                              struct aster_provisioning_result_t *out);
+
+/**
+ * Assemble an opaque signed document from exact document bytes, raw 32-byte
+ * authority public key and raw 64-byte external signature. Does not verify.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_signed_document_from_parts(struct aster_bytes_t document,
+                                                      struct aster_bytes_t authority_key,
+                                                      struct aster_bytes_t signature,
+                                                      struct aster_provisioning_result_t *out);
+
+/**
+ * Verify genesis against independently configured raw public key and UTF-8
+ * domain pins. Returns UTF-8 JSON exclusively from VerifiedGenesis accessors.
+ * Never uses the envelope's key as the trust anchor. No group is created.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_verify_genesis(struct aster_bytes_t authority_key,
+                                          struct aster_bytes_t authority_domain,
+                                          struct aster_bytes_t envelope,
+                                          struct aster_provisioning_result_t *out);
+
+/**
+ * Verify a join permit against configured raw key, domain and raw candidate
+ * node ID. Returns UTF-8 JSON from VerifiedJoinPermit accessors. This extracts
+ * the signed group/genesis; it does not compare independent expectations for
+ * them and does not commit membership or start a voter.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_verify_join_permit_for_start(struct aster_bytes_t authority_key,
+                                                        struct aster_bytes_t authority_domain,
+                                                        struct aster_bytes_t candidate,
+                                                        struct aster_bytes_t envelope,
+                                                        struct aster_provisioning_result_t *out);
+
+/**
+ * Canonical addressless open ticket for a raw 32-byte candidate ID. Output is
+ * UTF-8 text; caller-supplied route hints cannot enter the signed permit.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_canonical_candidate_ticket(struct aster_bytes_t node,
+                                                      struct aster_provisioning_result_t *out);
+
+/**
+ * Hash supplied genesis document bytes using the native domain separation.
+ * Output is raw 32-byte digest. This makes no verification/authority claim;
+ * use verify_genesis before acting on an externally supplied genesis.
+ * # Safety
+ * Input spans must be readable for this call; out must be writable.
+ */
+int32_t aster_coordination_genesis_hash(struct aster_bytes_t document,
+                                        struct aster_provisioning_result_t *out);
+
+/**
  * Parse a 64-hex-character id (either case, no surrounding whitespace) into
  * its 32 bytes, checking it is valid for `kind` (`aster_id_kind_t`; Ed25519
  * kinds must decode to a curve point). Writes 32 bytes to `out`.
@@ -6072,6 +6509,20 @@ int32_t aster_server_add_service_json(aster_server_builder_t builder,
                                       uint32_t *out_idx);
 
 /**
+ * Configure the opt-in topology baseline service and its native Gate-3
+ * capability requirement atomically (ABI 4.16). Enabling requires monitoring.
+ * An empty span or JSON null means no additional capability requirement;
+ * otherwise use the native CapabilityRequirement JSON (kind and roles).
+ * The default is disabled. Remote peer views never expose remote_addr.
+ * This does not change the legacy set_option behavior for existing callers.
+ * # Safety
+ * requirement_json must be readable for its advertised length during the call.
+ */
+int32_t aster_server_set_topology(aster_server_builder_t builder,
+                                  uint32_t enabled,
+                                  struct aster_bytes_t requirement_json);
+
+/**
  * Set one `aster_server_option_t`. Unknown keys and out-of-range values →
  * `INVALID_ARGUMENT`.
  */
@@ -6107,7 +6558,9 @@ int32_t aster_server_builder_free(aster_server_builder_t builder);
  * Stop serving and free the server. Events still in the ring are dropped
  * (their calls are abandoned with `INTERNAL`); calls the binding still holds
  * return `NOT_FOUND` afterwards; borrowed connection handles are freed.
- * Does not close the node.
+ * Joins owned HTTP/WebTransport child listeners with zero grace, releasing
+ * their ports on success. Blocks and is UNSUPPORTED on a tokio runtime thread
+ * (checked before removal). Does not close the node.
  */
 int32_t aster_server_destroy(aster_runtime_t runtime, aster_server_t server);
 
@@ -6291,6 +6744,140 @@ int32_t aster_dynamic_service_contract_id(const uint8_t *json,
  * Live calls in the server's table (diagnostics / tests).
  */
 uint64_t aster_server_live_calls(aster_server_t server_h);
+
+/**
+ * Generate a self-signed ECDSA certificate. Empty SANs default to localhost.
+ * node_secret is empty (no binding) or exactly 32 bytes (signed node binding).
+ * Outputs are cleared on failure. Malformed inputs return INVALID_ARGUMENT.
+ *
+ * # Safety
+ * All nonempty input spans/lists must be readable, and out must be writable.
+ */
+int32_t aster_tls_generate_self_signed(struct aster_bytes_list_t sans,
+                                       struct aster_bytes_t node_secret,
+                                       struct aster_generated_cert_t *out);
+
+/**
+ * Generate a WebTransport pin-compatible P-256 certificate valid less than
+ * 14 days. Includes localhost plus supplied SANs. subject labels the common
+ * name; only node_secret establishes a signed identity binding.
+ * The SHA-256 pin must reach clients over a trusted channel.
+ *
+ * # Safety
+ * Same input/output contract as aster_tls_generate_self_signed.
+ */
+int32_t aster_tls_generate_webtransport(struct aster_bytes_t subject,
+                                        struct aster_bytes_list_t sans,
+                                        struct aster_bytes_t node_secret,
+                                        struct aster_generated_cert_t *out);
+
+/**
+ * Verify that a trusted expected node ID authorized the certificate's TLS
+ * public key. This does not verify certificate validity, hostname or PKI trust.
+ * Unsigned, mismatched or malformed bindings return INVALID_ARGUMENT.
+ *
+ * # Safety
+ * Both nonempty byte spans must be readable for this call.
+ */
+int32_t aster_tls_verify_binding(struct aster_bytes_t cert_pem,
+                                 struct aster_bytes_t expected_node_id);
+
+/**
+ * Whether this node has monitoring, the prerequisite for measured local peers.
+ * # Safety
+ * out must be writable for one u32.
+ */
+int32_t aster_topology_has_monitoring(aster_runtime_t runtime, aster_node_t node, uint32_t *out);
+
+/**
+ * Every known local peer, including decaying recently disconnected peers.
+ * Output is owned UTF-8 JSON; free with aster_string_release. Level is 0..4,
+ * confidence_ppm is native integer confidence; nullable RTT/jitter stay null.
+ * remote_addr is local-only and never added to the baseline Topology RPC.
+ * # Safety
+ * out must be writable for one byte span.
+ */
+int32_t aster_topology_peers(aster_runtime_t runtime, aster_node_t node, struct aster_bytes_t *out);
+
+/**
+ * One local peer object, or JSON null when unknown/unmeasured/no monitoring.
+ * node_id is exactly 64 ASCII hex characters. Release owned JSON with string_release.
+ * # Safety
+ * node_id must be readable for its length and out writable for one span.
+ */
+int32_t aster_topology_peer(aster_runtime_t runtime,
+                            aster_node_t node,
+                            struct aster_bytes_t node_id,
+                            struct aster_bytes_t *out);
+
+/**
+ * Capture one shared observation. Requires enable_shared first. Completes with
+ * TOPOLOGY_SNAPSHOT, handle = runtime-local snapshot. All queries on that owner
+ * use the same immutable native view. Cancellation discards an unseen owner.
+ * # Safety
+ * out_operation must be writable for one operation ID.
+ */
+int32_t aster_topology_snapshot(aster_runtime_t runtime,
+                                aster_node_t node,
+                                uint64_t user_data,
+                                aster_operation_t *out_operation);
+
+/**
+ * Free an immutable observation. Repeated free or another runtime returns NOT_FOUND.
+ */
+int32_t aster_topology_snapshot_free(aster_runtime_t runtime, aster_topology_snapshot_t snapshot);
+
+/**
+ * Clusters from one captured observation, as owned UTF-8 JSON array.
+ * # Safety
+ * out must be writable for one byte span.
+ */
+int32_t aster_topology_snapshot_clusters(aster_runtime_t runtime,
+                                         aster_topology_snapshot_t snapshot,
+                                         struct aster_bytes_t *out);
+
+/**
+ * Cluster containing node_id from that observation, or owned JSON null.
+ * # Safety
+ * node_id must be readable for its length and out writable for one span.
+ */
+int32_t aster_topology_snapshot_cluster_of(aster_runtime_t runtime,
+                                           aster_topology_snapshot_t snapshot,
+                                           struct aster_bytes_t node_id,
+                                           struct aster_bytes_t *out);
+
+/**
+ * Unknown=0, Connected=1, Separated=2, always from the captured observation.
+ * # Safety
+ * a and b must be readable for their lengths, and out writable for one u32.
+ */
+int32_t aster_topology_snapshot_separated(aster_runtime_t runtime,
+                                          aster_topology_snapshot_t snapshot,
+                                          struct aster_bytes_t a,
+                                          struct aster_bytes_t b,
+                                          uint32_t *out);
+
+/**
+ * Join shared topology with native timing/coverage options. Missing fields use
+ * defaults; explicit zero is retained, except position_refresh_ms=0 means 60s.
+ * All options are optional u32 values (milliseconds max ~49.7 days); JSON
+ * rejects unknown fields and inputs over 16KiB. An empty span means {}.
+ * admitted is runtime-local (0 means every holder
+ * of the namespace secret counts). Completes with UNIT_RESULT, handle=node.
+ * Like the legacy enable call, cancellation does not roll back a native join
+ * already in progress. The publisher remains owned by the node until rejoin/close.
+ * # Safety
+ * secret must point to 32 readable bytes, input spans/list must be readable for
+ * their advertised lengths, and out_operation writable for one operation ID.
+ */
+int32_t aster_topology_enable_shared_with_options(aster_runtime_t runtime,
+                                                  aster_node_t node,
+                                                  const uint8_t *secret,
+                                                  aster_topology_admitted_t admitted,
+                                                  struct aster_bytes_list_t bootstrap,
+                                                  struct aster_bytes_t options_json,
+                                                  uint64_t user_data,
+                                                  aster_operation_t *out_operation);
 
 /**
  * Create an upcall table with a bounded queue of `capacity` upcalls (0 =

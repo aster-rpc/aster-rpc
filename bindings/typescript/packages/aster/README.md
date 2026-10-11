@@ -221,6 +221,178 @@ the AST directly. You can delete them from new code. They still
 work (and still trigger the runtime manifest path) if you haven't
 run the scanner yet.
 
+## Authenticated HTTPS and WebTransport listeners
+
+`RpcServer.startHttp(options, authenticate)` serves the registered services
+through an owned HTTPS listener. `AsterServer.startHttp(...)` also starts its
+node/server when needed. Supply the operator's PEM certificate and private key;
+startup resolves after TCP and optional QUIC sockets are bound. WebTransport
+binds UDP on the selected TCP address and port.
+
+```ts
+const listener = await server.startHttp({
+  bindAddr: '127.0.0.1:0',
+  certificatePem: await readFile('server-cert.pem'),
+  privateKeyPem: await readFile('server-key.pem'),
+  webTransport: true,
+  maxPendingAuth: 256,       // zero/absent selects the default
+  maxAuthPayloadBytes: 65536,
+}, async (request, context) => {
+  const identity = await verifyCredential(request.metadata.authorization, {
+    signal: context.signal,
+  });
+  if (!identity) return null;
+  return { principal: identity.subject, attributes: { 'aster.role': 'operator' } };
+});
+console.log(listener.tcpAddr, listener.quicAddr);
+await listener.stop(2000); // application drain grace in milliseconds
+// await listener.close() uses zero grace; both operations are idempotent.
+```
+
+Authentication runs independently for each routed call, before Gate 3 and
+session creation. The request includes service, method, session ID, HTTP
+metadata, and an incoming peer string. That incoming string is not an
+authenticated identity. Return `null` for `UNAUTHENTICATED`, or a nonempty
+principal with attributes local to this call. Callback/encoding errors and auth
+timeout fail closed with `UNAVAILABLE`; admission failure modes never grant
+access. Auth attributes are passed to the normal Gate 3 checks and
+`CallContext.attributes`. `CallContext.peer` is the resolved principal, while
+`CallContext.irohAuthenticated` remains false for HTTPS/WebTransport. Iroh policy
+and provenance remain native properties.
+
+The callback's `context.signal` aborts on timeout, transport cancellation,
+listener shutdown, or table shutdown. Pass it to cancellable application work;
+late responses are discarded. Each high-level listener owns a private upcall
+table and closes it with the listener. `stop(graceMs)` allows active calls to
+drain, then cancels and joins remaining native calls/connections before releasing
+TCP/UDP ports. QUIC protocol/socket drain may extend beyond the application
+grace. Failed stops retain ownership for retry. Parent server close also joins
+child listeners. Use explicit `await listener.close()` or `await using` for
+deterministic resource release; finalizers only schedule forced cleanup.
+Cached address strings remain readable after close. An aborted startup cleans
+up any listener that finished binding before it rejects.
+If cleanup itself fails, `HttpListenerStartError` preserves the original error
+in `cause`, the cleanup error in `cleanupError`, and the owned `listener` so the
+caller can retry `await error.listener.close()`.
+
+Canonical HTTPS requests are `POST /aster/{service}/{method}` with
+`Content-Type: application/aster-frames` and Aster frames. All four RPC patterns
+are supported. HTTPS buffers the request body before dispatch; WebTransport
+supports live bidirectional streams. This API opens the native WebTransport
+server and does not add a WebTransport client. The SDK requires matching native
+`HttpListener` and `DispatchServer.startHttp` exports and rejects stale addons
+when loading them.
+
+## Explicit public listeners and certificate helpers
+
+`RpcServer.startPublicHttp(options)` and `AsterServer.startPublicHttp(options)`
+serve anonymous shared services without allocating an authentication callback
+table. Attribute gates and Iroh-only restrictions remain enforced; session
+services are rejected before instance creation. `startHttp` always requires its
+authenticator and never falls back to public mode. Both modes use the same
+owned listener, cancellation and joined shutdown semantics. Public mode accepts
+only zero/absent authentication limits.
+
+```ts
+import { generateWebTransportCertificate } from '@aster-rpc/aster';
+const cert = generateWebTransportCertificate('my-server', ['localhost']);
+await using listener = await server.startPublicHttp({ ...cert, webTransport: true });
+console.log(listener.tcpAddr);
+```
+
+`generateSelfSignedCertificate(sans = [], nodeSecret?)` and
+`generateWebTransportCertificate(subject, sans = [], nodeSecret?)` return
+`certificatePem`, `privateKeyPem`, and the 32-byte `sha256` of certificate DER.
+The optional identity secret must be exactly 32 bytes. Without it the
+self-signed certificate has no node identity binding; no unsigned node identity
+claim is exposed.
+WebTransport material uses P-256 and a validity period shorter than 14 days.
+Keep private key bytes secret.
+
+`verifyCertificateBinding(certificatePem, expectedNodeId)` throws unless the
+certificate proves ownership of the TLS key by that trusted node, whose id
+must come from a trusted source. This verifies the signed TLS public-key
+binding, not the whole certificate or chain. Expiry, hostname and PKI trust
+remain separate TLS checks. The DER hash can be used for
+explicit certificate pinning.
+
+## Blob custody and verified imports
+
+`node.blobs().custody()` provides temporary GC protection without persistent
+anonymous tags. Use `using` or `close()` to seal admission; accepted operations
+retain every scope guard until native work and cleanup finish.
+
+```ts
+using custody = node.blobs().custody();
+const hash = await custody.addBytes(bytes, 'raw');
+await custody.retain(hash, 'raw', 'tree/current');
+```
+
+`protect(hash, format)` can protect an absent root before
+`downloadHashFrom(hash, providers, format, strategy)`, which fetches to the
+store. A `'hash_seq'` root is concatenated 32-byte child hashes, and custody
+protects that graph. `read(hash)` returns root bytes without requiring a
+Collection schema. Named-root retention requires this scope to hold the root
+with exactly the same format.
+
+`blobs.addBytesVerified(data, expectedHash, format, tag)` and
+`blobs.addPathVerified(path, expectedHash, format, tag)` verify bytes before
+atomically replacing the exact named tag. Path imports copy bytes, never retain
+a mutable source reference. A mismatch throws `BlobCustodyError` with kind
+`'hash_mismatch'` and leaves the old named root intact. No anonymous tag is
+created; deleting the final named tag makes the data eligible for GC. This adds
+no fsync guarantee beyond the store's existing persistence semantics.
+
+Every new async method accepts a final `{ signal }` option. An abort requests
+cooperative native cancellation and the promise waits for cleanup. Cancellation
+before tag commit publishes no named root; once commit begins, its actual
+success or error wins. Fetch cancellation may wait for a stalled native
+transfer and other downloader work to drain. The other typed error kinds are
+`'closed'`, `'cancelled'`, `'unprotected_root'`, and `'native'`.
+
+## Batch local document content reads
+
+`doc.readEntryContentsIfComplete(hashes)` uses one shared native batch read and
+returns `(Buffer | null)[]` in the exact input order, including duplicates.
+Missing or initially partial blobs are `null`; a complete zero-byte value is
+an empty `Buffer`. Empty input returns `[]`. Pass content hashes directly,
+for example `entries.map(entry => entry.contentHash)`.
+
+This reads only the local store, fetches nothing, and creates no tags or GC
+protection. Storage or integrity errors fail the whole batch. It is not a
+global snapshot: concurrent GC between the completeness check and a large-value
+export may also fail the batch. Use blob custody when content must remain
+available during host verification.
+
+## Coordination authority provisioning
+
+`CoordinationProvisioning` provides offline canonical genesis/join documents,
+domain-separated signing preimages, signed envelopes, candidate tickets,
+genesis hashes and verification. All byte-exact encoding, domain and authority
+rules run in Rust; authority private keys stay with your external signer.
+
+```ts
+const document = CoordinationProvisioning.canonicalGenesis(input);
+const signature = externalSigner.sign(CoordinationProvisioning.genesisSigningBytes(document));
+const envelope = CoordinationProvisioning.signedDocumentFromParts(document, authorityPublicKey, signature);
+const verified = CoordinationProvisioning.verifyGenesis(trustedAuthorityPublicKey, configuredDomain, envelope);
+```
+
+Typed genesis/join inputs accept ids, hashes and nonces as raw bytes or hex.
+Version is fixed to 1, and Rust derives the join candidate's canonical
+addressless Open ticket. Callers choose randomness and deployment profiles and
+provide lists in protocol order. Nothing is sorted, deduplicated or inferred.
+Canonical encoding alone establishes neither authorization nor profile validity.
+
+Verify against independently trusted authority key/domain pins, never just the
+key inside an envelope. `verifyJoinPermitForStart` also checks the candidate;
+the group/genesis are extracted rather than independently pinned.
+`genesisHash` hashes supplied bytes without verification. Verified summaries
+are informational metadata, not Rust sealed values or transferable capabilities;
+preserve their exact `documentBytes` for persistence/forwarding. Summary ids and
+hashes are lowercase hex. Failures throw `ProvisioningError` with stable native
+`code` and diagnostic `detail`. These helpers do not sign or host a voter.
+
 ## Observability
 
 Logs (into pino, winston or your own sink), custom metrics, tracing and the
@@ -234,3 +406,20 @@ Generated API docs (TypeDoc): `bun run docs` produces `docs-api/`.
 ## License
 
 Apache-2.0.
+
+### Topology baseline policy
+
+Local `node.topology()` exposes measured peers, shared swarm timing and immutable
+snapshots. Measurements require `enableMonitoring: true`. Use one `snapshot()`
+for several placement decisions: separate convenience calls can observe different
+eventual views, and `unknown` never proves separation. Local peer measurements
+include the selected remote address; the remote baseline omits it.
+
+`AsterServer`, `RpcServer` and `DispatchLoop` accept explicit
+`builtinTopology: true` and optional
+`topologyRequires: { kind: 'role', roles: ['operator'] }` (also `any_of` / `all_of`).
+The native baseline stays disabled by default; enabling it requires monitoring.
+Rust checks the policy before every topology method, including HTTP/WebTransport
+calls. Public listener mode cannot bypass it. The native addon exposes
+`DispatchServerOptions.topologyRequiresJson` for direct consumers with the same
+native capability requirement JSON. Out-of-range durations return argument errors.

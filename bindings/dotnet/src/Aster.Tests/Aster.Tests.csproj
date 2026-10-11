@@ -28,6 +28,10 @@
     <None Include="../../../../conformance/vectors/*.json" Link="vectors/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="../../../../tests/fixtures/coordination_provisioning_v1.json" Link="fixtures/coordination_provisioning_v1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <!-- The native library is copied to the output by the Aster project reference
        (see NativeLibraryPath in ../Aster/Aster.csproj). -->
 

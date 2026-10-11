@@ -492,7 +492,6 @@ export type {
   AdmissionRequests,
   AuthorityReport,
   BlobStatusInfo,
-  BlobsClient,
   CollectionFetchResult,
   DocEntry,
   DocEvent,
@@ -807,3 +806,14 @@ export {
   type AuditEvent, type AuditJson, type AuditOutboxStatus, type AuditDeliveryError,
   type AuditDispositionReceipt, type AuditQuarantineExport,
 } from './audit-outbox.js';
+
+export { HttpListener, HttpListenerStartError, type HttpListenerOptions, type RpcAuthenticator, type RpcAuthRequest, type RpcAuthIdentity } from './http-listener.js';
+
+export { generateSelfSignedCertificate, generateWebTransportCertificate, verifyCertificateBinding, type GeneratedCertificate } from './tls.js';
+
+export { BlobCustody, BlobCustodyError, type BlobsClient, type BlobCustodyErrorKind, type BlobOperationOptions } from './blobs.js';
+export {
+  CoordinationProvisioning, ProvisioningError,
+  type ProvisioningBytes, type ProvisioningVoterSeed, type GenesisInput, type JoinPermitInput,
+  type VerifiedGenesis, type VerifiedJoinPermit, type ProvisioningErrorCode,
+} from './coordination-provisioning.js';

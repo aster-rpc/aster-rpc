@@ -124,5 +124,6 @@ pub(crate) fn secs_in(field: &str, secs: f64) -> PyResult<std::time::Duration> {
             "{field} must be a non-negative number of seconds"
         )));
     }
-    Ok(std::time::Duration::from_secs_f64(secs))
+    std::time::Duration::try_from_secs_f64(secs)
+        .map_err(|_| invalid(format!("{field} is outside the supported duration range")))
 }

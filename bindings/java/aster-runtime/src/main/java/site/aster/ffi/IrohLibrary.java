@@ -216,10 +216,13 @@ public final class IrohLibrary implements SymbolLookup {
   public static final int EXPECTED_ABI_MAJOR = 4;
 
   /**
-   * Lowest C ABI minor version this binding runs against: 4.9 adds the durable audit outbox.
-   * Version 4.7 separates the event queue from the asynchronous-operation admission bound.
+   * Lowest C ABI minor version this binding runs against: 4.16 adds local/shared topology views and
+   * baseline capability policy. 4.15 added offline coordination provisioning. Version 4.14 adds
+   * batch local Docs content reads. Version 4.13 adds temporary blob custody and verified retained
+   * imports. Version 4.12 adds public listeners and certificate helpers; version 4.11 adds
+   * authenticated listeners and 4.10 adds owned Docs receivers.
    */
-  public static final int REQUIRED_ABI_MINOR = 9;
+  public static final int REQUIRED_ABI_MINOR = 16;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {
@@ -733,7 +736,7 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
+                      ASTER_BYTES,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, nodeHandle, hashHexSegment, 0L, outOpId);
@@ -1592,7 +1595,7 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
+                      ASTER_BYTES,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, nodeHandle, ticketSegment, userData, outOpId);
@@ -1601,24 +1604,35 @@ public final class IrohLibrary implements SymbolLookup {
     }
   }
 
-  /**
-   * Set bytes in a document.
-   *
-   * @param runtimeHandle the runtime handle
-   * @param docHandle the document handle
-   * @param authorSegment segment containing the author hex (aster_bytes_t)
-   * @param keySegment segment containing the key (aster_bytes_t)
-   * @param valueSegment segment containing the value (aster_bytes_t)
-   * @param userData user data passed to the operation
-   * @param outOpId where to write the operation id
-   * @return status code (0 = OK)
-   */
-  /**
-   * Invoke {@code aster_doc_set_bytes}. The C signature takes three {@code aster_bytes_t} args by
-   * value; we split each into (ptr, len) so FFM places the pointer + length in consecutive
-   * registers per AAPCS64 §6.8.2 / SysV AMD64 §3.2.3. Same convention as {@link
-   * #asterRegistryPublish}.
-   */
+  /** Set bytes using the native by-value aster_bytes_t arguments. */
+  public int docSetBytes(
+      long runtimeHandle,
+      long docHandle,
+      MemorySegment author,
+      MemorySegment key,
+      MemorySegment value,
+      long userData,
+      MemorySegment outOpId) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_doc_set_bytes",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.JAVA_LONG,
+                      ASTER_BYTES,
+                      ASTER_BYTES,
+                      ASTER_BYTES,
+                      ValueLayout.JAVA_LONG,
+                      ValueLayout.ADDRESS))
+              .invoke(runtimeHandle, docHandle, author, key, value, userData, outOpId);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
+  /** Compatibility overload; FFM still marshals real structs on every platform. */
   public int docSetBytes(
       long runtimeHandle,
       long docHandle,
@@ -1630,35 +1644,17 @@ public final class IrohLibrary implements SymbolLookup {
       long valueLen,
       long userData,
       MemorySegment outOpId) {
-    try {
-      return (int)
-          getHandle(
-                  "aster_doc_set_bytes",
-                  FunctionDescriptor.of(
-                      ValueLayout.JAVA_INT,
-                      ValueLayout.JAVA_LONG, // runtime
-                      ValueLayout.JAVA_LONG, // doc
-                      ValueLayout.ADDRESS, // author ptr
-                      ValueLayout.JAVA_LONG, // author len
-                      ValueLayout.ADDRESS, // key ptr
-                      ValueLayout.JAVA_LONG, // key len
-                      ValueLayout.ADDRESS, // value ptr
-                      ValueLayout.JAVA_LONG, // value len
-                      ValueLayout.JAVA_LONG, // user data
-                      ValueLayout.ADDRESS)) // out op
-              .invoke(
-                  runtimeHandle,
-                  docHandle,
-                  authorPtr,
-                  authorLen,
-                  keyPtr,
-                  keyLen,
-                  valuePtr,
-                  valueLen,
-                  userData,
-                  outOpId);
-    } catch (Throwable t) {
-      throw new AssertionError(t);
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment author = arena.allocate(ASTER_BYTES);
+      author.set(ValueLayout.ADDRESS, 0, authorPtr);
+      author.set(ValueLayout.JAVA_LONG, 8, authorLen);
+      MemorySegment key = arena.allocate(ASTER_BYTES);
+      key.set(ValueLayout.ADDRESS, 0, keyPtr);
+      key.set(ValueLayout.JAVA_LONG, 8, keyLen);
+      MemorySegment value = arena.allocate(ASTER_BYTES);
+      value.set(ValueLayout.ADDRESS, 0, valuePtr);
+      value.set(ValueLayout.JAVA_LONG, 8, valueLen);
+      return docSetBytes(runtimeHandle, docHandle, author, key, value, userData, outOpId);
     }
   }
 
@@ -1688,8 +1684,8 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
-                      ValueLayout.ADDRESS,
+                      ASTER_BYTES,
+                      ASTER_BYTES,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, docHandle, authorSegment, keySegment, userData, outOpId);
@@ -1745,6 +1741,18 @@ public final class IrohLibrary implements SymbolLookup {
       MemorySegment keySegment,
       long userData,
       MemorySegment outOpId) {
+    return docQuery(runtimeHandle, docHandle, mode, keySegment, 0L, userData, outOpId);
+  }
+
+  /** Query document metadata; limit zero means unbounded. */
+  public int docQuery(
+      long runtimeHandle,
+      long docHandle,
+      int mode,
+      MemorySegment keySegment,
+      long limit,
+      long userData,
+      MemorySegment outOpId) {
     try {
       return (int)
           getHandle(
@@ -1754,10 +1762,11 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_INT,
-                      ValueLayout.ADDRESS,
+                      ASTER_BYTES,
+                      ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
-              .invoke(runtimeHandle, docHandle, mode, keySegment, userData, outOpId);
+              .invoke(runtimeHandle, docHandle, mode, keySegment, limit, userData, outOpId);
     } catch (Throwable t) {
       throw new AssertionError(t);
     }
@@ -1787,7 +1796,7 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
+                      ASTER_BYTES,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, docHandle, contentHashSegment, userData, outOpId);
@@ -1820,7 +1829,7 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
+                      ASTER_BYTES_LIST,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, docHandle, peersSegment, userData, outOpId);
@@ -1909,6 +1918,20 @@ public final class IrohLibrary implements SymbolLookup {
     }
   }
 
+  /** Release a live document event receiver (ABI 4.10). */
+  public int docEventReceiverFree(long runtime, long receiver) {
+    try {
+      return (int)
+          getHandle(
+                  "aster_doc_event_receiver_free",
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG))
+              .invoke(runtime, receiver);
+    } catch (Throwable t) {
+      throw new AssertionError(t);
+    }
+  }
+
   /**
    * Set download policy for a document.
    *
@@ -1936,7 +1959,7 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_INT,
-                      ValueLayout.ADDRESS,
+                      ASTER_BYTES_LIST,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, docHandle, mode, prefixesSegment, userData, outOpId);
@@ -1998,7 +2021,7 @@ public final class IrohLibrary implements SymbolLookup {
                       ValueLayout.JAVA_INT,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.JAVA_LONG,
-                      ValueLayout.ADDRESS,
+                      ASTER_BYTES,
                       ValueLayout.JAVA_LONG,
                       ValueLayout.ADDRESS))
               .invoke(runtimeHandle, nodeHandle, ticketSegment, userData, outOpId);

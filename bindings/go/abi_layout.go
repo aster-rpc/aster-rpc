@@ -41,6 +41,8 @@ func cStructSizes() map[string]uintptr {
 		"aster_span_context_t":         unsafe.Sizeof(C.aster_span_context_t{}),
 		"aster_span_record_t":          unsafe.Sizeof(C.aster_span_record_t{}),
 		"aster_health_config_t":        unsafe.Sizeof(C.aster_health_config_t{}),
+		"aster_http_server_config_t":   unsafe.Sizeof(C.aster_http_server_config_t{}),
+		"aster_generated_cert_t":       unsafe.Sizeof(C.aster_generated_cert_t{}),
 	}
 }
 
@@ -118,6 +120,7 @@ func abiEnums() map[string]int64 {
 		"UPCALL_KIND_EXPOSE_ROUTE_POLICY": C.ASTER_UPCALL_KIND_EXPOSE_ROUTE_POLICY,
 		"UPCALL_KIND_ADMISSION_CONNECT":   C.ASTER_UPCALL_KIND_ADMISSION_CONNECT,
 		"UPCALL_KIND_ADMISSION_HANDSHAKE": C.ASTER_UPCALL_KIND_ADMISSION_HANDSHAKE,
+		"UPCALL_KIND_RPC_AUTHENTICATE":    C.ASTER_UPCALL_KIND_RPC_AUTHENTICATE,
 		"UPCALL_STATUS_OK":                C.ASTER_UPCALL_STATUS_OK,
 		"UPCALL_STATUS_ERROR":             C.ASTER_UPCALL_STATUS_ERROR,
 		"UPCALL_STATUS_UNIMPLEMENTED":     C.ASTER_UPCALL_STATUS_UNIMPLEMENTED,
@@ -160,6 +163,9 @@ func abiEnums() map[string]int64 {
 		"EVENT_COORDINATION_CLIENT_OPENED":  C.ASTER_EVENT_COORDINATION_CLIENT_OPENED,
 		"EVENT_COORDINATION_RESOLVED":       C.ASTER_EVENT_COORDINATION_RESOLVED,
 		"EVENT_COORDINATION_RESULT":         C.ASTER_EVENT_COORDINATION_RESULT,
+		"EVENT_DOC_CONTENTS_BATCH":          C.ASTER_EVENT_DOC_CONTENTS_BATCH,
+		"EVENT_TOPOLOGY_SNAPSHOT":           C.ASTER_EVENT_TOPOLOGY_SNAPSHOT,
+		"EVENT_BLOB_CUSTODY_DONE":           C.ASTER_EVENT_BLOB_CUSTODY_DONE,
 		"EVENT_COORDINATION_LEASE_ACQUIRED": C.ASTER_EVENT_COORDINATION_LEASE_ACQUIRED,
 		"COORDINATION_CLIENT_READ_ONLY":     C.ASTER_COORDINATION_CLIENT_READ_ONLY,
 		"COORDINATION_ERROR_NONE":           C.ASTER_COORDINATION_ERROR_NONE,
@@ -218,3 +224,13 @@ func dispatchEventOffsets() map[string]uintptr {
 
 // headerABIVersion is ASTER_ABI_VERSION from the header this binding was built against.
 const headerABIVersion = uint32(C.ASTER_ABI_VERSION)
+
+func httpServerConfigOffsets() map[string]uintptr {
+	var c C.aster_http_server_config_t
+	return map[string]uintptr{
+		"struct_size": unsafe.Offsetof(c.struct_size), "flags": unsafe.Offsetof(c.flags),
+		"bind_addr": unsafe.Offsetof(c.bind_addr), "cert_pem": unsafe.Offsetof(c.cert_pem),
+		"key_pem": unsafe.Offsetof(c.key_pem), "max_pending_auth": unsafe.Offsetof(c.max_pending_auth),
+		"max_auth_payload_bytes": unsafe.Offsetof(c.max_auth_payload_bytes),
+	}
+}

@@ -147,6 +147,8 @@ public final class Dispatch implements AutoCloseable {
       h("aster_server_add_service_json", FunctionDescriptor.of(I32, I64, PTR, I32, PTR));
   private static final MethodHandle SET_OPTION =
       h("aster_server_set_option", FunctionDescriptor.of(I32, I64, I32, I64));
+  private static final MethodHandle SET_TOPOLOGY =
+      h("aster_server_set_topology", FunctionDescriptor.of(I32, I64, I32, IrohLibrary.ASTER_BYTES));
   private static final MethodHandle BUILDER_FREE =
       h("aster_server_builder_free", FunctionDescriptor.of(I32, I64));
   private static final MethodHandle START =
@@ -239,6 +241,29 @@ public final class Dispatch implements AutoCloseable {
     }
 
     /**
+     * Opt in to the native topology RPC baseline, with optional Rust-enforced Gate 3 roles.
+     * Enabling requires monitoring. A null requirement admits any transport-admitted caller.
+     */
+    public Builder topology(
+        boolean enabled, site.aster.contract.CapabilityRequirement requirement) {
+      try (Arena arena = Arena.ofConfined()) {
+        byte[] json =
+            requirement == null
+                ? new byte[0]
+                : new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsBytes(requirement);
+        NativeCall.callChecked(
+            SET_TOPOLOGY,
+            "aster_server_set_topology",
+            handle,
+            enabled ? 1 : 0,
+            NativeCall.bytes(arena, json));
+        return this;
+      } catch (java.io.IOException e) {
+        throw new IllegalArgumentException(e);
+      }
+    }
+
+    /**
      * {@code aster_server_attach_health}: the ops listener {@code healthHandle} (see {@code
      * site.aster.health.HealthServer}) counts this server's calls, is set ready by a successful
      * start and not ready first by {@link Dispatch#close}. Call before {@link #start}.
@@ -310,6 +335,28 @@ public final class Dispatch implements AutoCloseable {
 
   public long handle() {
     return handle;
+  }
+
+  /**
+   * Bind an authenticated HTTPS/optional WebTransport child. Startup is serialized with server
+   * destruction; the upcall table must belong to this runtime and serve kind-80 authentication.
+   */
+  public synchronized site.aster.server.HttpListener startHttp(
+      site.aster.upcall.Upcalls upcalls, site.aster.server.HttpListenerConfig config) {
+    if (closed) {
+      throw IrohException.forStatus(IrohStatus.ALREADY_CLOSED, "server closed");
+    }
+    return site.aster.server.HttpListener.start(runtimeHandle, handle, upcalls, config);
+  }
+
+  /**
+   * Explicit anonymous HTTPS/WebTransport; sessions are disabled and attribute gates remain
+   * enforced.
+   */
+  public synchronized site.aster.server.HttpListener startPublicHttp(
+      site.aster.server.HttpListenerConfig config) {
+    if (closed) throw IrohException.forStatus(IrohStatus.ALREADY_CLOSED, "server closed");
+    return site.aster.server.HttpListener.startPublic(runtimeHandle, handle, config);
   }
 
   /**
@@ -655,7 +702,7 @@ public final class Dispatch implements AutoCloseable {
   }
 
   @Override
-  public void close() {
+  public synchronized void close() {
     if (closed) {
       return;
     }

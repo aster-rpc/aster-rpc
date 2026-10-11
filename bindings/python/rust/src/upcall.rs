@@ -756,6 +756,7 @@ fn types_of(kind: UpcallKind) -> Option<(&'static str, &'static str)> {
         UpcallKind::AdmissionHandshake => {
             ("AdmissionHandshakeRequest", "AdmissionHandshakeResponse")
         }
+        UpcallKind::RpcAuthenticate => ("RpcAuthRequest", "RpcAuthResponse"),
         UpcallKind::ExposeHttp => ("ExposeHttpRequest", "ExposeHttpResponse"),
         UpcallKind::ExposeRoutePolicy => ("ExposeRoutePolicyRequest", "ExposeRouteGrant"),
         _ => return None,
@@ -895,6 +896,26 @@ fn decode_type_with<'py>(
             py,
             &codec::decode_admission_handshake_response(b).map_err(cerr)?,
         ),
+        "RpcAuthRequest" => {
+            let r = codec::decode_rpc_auth_request(b).map_err(cerr)?;
+            t(vec![
+                r.peer_id.into_pyobject(py)?.into_any(),
+                r.service.into_pyobject(py)?.into_any(),
+                r.method.into_pyobject(py)?.into_any(),
+                r.session_id.into_pyobject(py)?.into_any(),
+                r.metadata.into_pyobject(py)?.into_any(),
+            ])
+        }
+        "RpcAuthResponse" => match codec::decode_rpc_auth_response(b).map_err(cerr)? {
+            codec::RpcAuthResponse::Rejected => Ok(py.None().into_bound(py)),
+            codec::RpcAuthResponse::Authenticated {
+                principal,
+                attributes,
+            } => t(vec![
+                principal.into_pyobject(py)?.into_any(),
+                attributes.into_pyobject(py)?.into_any(),
+            ]),
+        },
         "PlacementPolicyRequest" => {
             codec::decode_placement_policy_request(b).map_err(cerr)?;
             t(vec![])
@@ -997,6 +1018,28 @@ pub(crate) fn encode_type(ty: &str, v: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         }
         "AdmissionHandshakeResponse" => {
             codec::encode_admission_handshake_response(&handshake_in(v)?)
+        }
+        "RpcAuthRequest" => {
+            let a = items(v, 5, ty)?;
+            codec::encode_rpc_auth_request(
+                &str_in(&a[0], "peer_id")?,
+                &str_in(&a[1], "service")?,
+                &str_in(&a[2], "method")?,
+                a[3].extract::<i32>()?,
+                &a[4].extract::<HashMap<String, String>>()?,
+            )
+        }
+        "RpcAuthResponse" => {
+            let response = if v.is_none() {
+                codec::RpcAuthResponse::Rejected
+            } else {
+                let a = items(v, 2, ty)?;
+                codec::RpcAuthResponse::Authenticated {
+                    principal: str_in(&a[0], "principal")?,
+                    attributes: a[1].extract::<HashMap<String, String>>()?,
+                }
+            };
+            codec::encode_rpc_auth_response(&response).map_err(cerr)?
         }
         "PlacementPolicyRequest" => {
             items(v, 0, ty)?;

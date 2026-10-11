@@ -127,27 +127,26 @@ final class MissionControlE2ETest {
   @Test
   void serverStreamTailLogsDeliversBufferedEntries() throws Exception {
     try (Fixture f = Fixture.start()) {
-      // Pre-seed the queue so tailLogs has something to drain. The server method exits as soon as
-      // the queue is idle for ~250ms, which is the right shape for a deterministic test.
+      // Pre-seed the open-ended tail and cancel after receiving the expected entries.
       for (int i = 0; i < 4; i++) {
         f.missionControl.logQueue().offer(new LogEntry(i, "info", "line-" + i, "agent-1"));
       }
 
-      List<LogEntry> entries =
+      try (var stream =
           f.client
-              .<TailRequest, LogEntry>callServerStream(
+              .<TailRequest, LogEntry>openServerStream(
                   f.serverAddr,
                   MissionControlDispatcher.SERVICE_NAME,
                   "tailLogs",
                   new TailRequest("agent-1", "info"),
                   LogEntry.class)
-              .orTimeout(15, TimeUnit.SECONDS)
-              .get();
-
-      assertEquals(4, entries.size());
-      for (int i = 0; i < entries.size(); i++) {
-        assertEquals("line-" + i, entries.get(i).message());
-        assertEquals("agent-1", entries.get(i).agentId());
+              .get(15, TimeUnit.SECONDS)) {
+        for (int i = 0; i < 4; i++) {
+          LogEntry entry = stream.recvWithTimeout(15, TimeUnit.SECONDS);
+          assertNotNull(entry);
+          assertEquals("line-" + i, entry.message());
+          assertEquals("agent-1", entry.agentId());
+        }
       }
     }
   }
@@ -159,20 +158,21 @@ final class MissionControlE2ETest {
       f.missionControl.logQueue().offer(new LogEntry(1, "info", "ok", "agent-1"));
       f.missionControl.logQueue().offer(new LogEntry(2, "error", "boom", "agent-1"));
 
-      List<LogEntry> entries =
+      try (var stream =
           f.client
-              .<TailRequest, LogEntry>callServerStream(
+              .<TailRequest, LogEntry>openServerStream(
                   f.serverAddr,
                   MissionControlDispatcher.SERVICE_NAME,
                   "tailLogs",
                   new TailRequest("agent-1", "warn"),
                   LogEntry.class)
-              .orTimeout(15, TimeUnit.SECONDS)
-              .get();
-
-      assertEquals(1, entries.size());
-      assertEquals("boom", entries.get(0).message());
-      assertEquals("error", entries.get(0).level());
+              .get(15, TimeUnit.SECONDS)) {
+        LogEntry entry = stream.recvWithTimeout(15, TimeUnit.SECONDS);
+        assertNotNull(entry);
+        assertEquals("boom", entry.message());
+        assertEquals("error", entry.level());
+        assertNull(stream.recvWithTimeout(250, TimeUnit.MILLISECONDS));
+      }
     }
   }
 
@@ -291,9 +291,11 @@ final class MissionControlE2ETest {
         // check inside the dispatcher records "CANCELLED" as the exit reason.
         call.cancel();
 
-        // Drain any trailing responses + the trailer. Should hit end-of-stream quickly.
-        CommandResult tail = call.recv();
-        assertNull(tail, "expected end-of-stream after cancel()");
+        // Cancellation is surfaced as the native CANCELLED status, rather than a clean trailer.
+        var cancelled =
+            org.junit.jupiter.api.Assertions.assertThrows(
+                site.aster.interceptors.RpcError.class, call::recv);
+        assertEquals(site.aster.interceptors.StatusCode.CANCELLED, cancelled.code());
       }
     }
 

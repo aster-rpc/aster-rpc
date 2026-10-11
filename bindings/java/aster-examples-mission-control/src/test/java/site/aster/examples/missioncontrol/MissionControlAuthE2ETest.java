@@ -110,21 +110,22 @@ final class MissionControlAuthE2ETest {
 
   @Test
   void anyOfAcceptsEitherListedRole() throws Exception {
-    // tailLogs requires any_of(LOGS, ADMIN). Call w/ ADMIN only; response stream drains quickly
-    // because no logs have been submitted and the handler exits on idle timeout.
+    // tailLogs is open-ended: receiving a real entry proves ADMIN passes the any-of policy.
     try (AuthFixture f = AuthFixture.start()) {
       f.grant(Role.ADMIN);
-      java.util.List<LogEntry> entries =
+      LogEntry expected = new LogEntry(1.0d, "info", "authorized", "agent-1");
+      f.missionControl.logQueue().offer(expected);
+      try (var stream =
           f.client
-              .<site.aster.examples.missioncontrol.types.TailRequest, LogEntry>callServerStream(
+              .<site.aster.examples.missioncontrol.types.TailRequest, LogEntry>openServerStream(
                   f.serverAddr,
                   "MissionControl",
                   "tailLogs",
                   new site.aster.examples.missioncontrol.types.TailRequest("", "debug"),
                   LogEntry.class)
-              .orTimeout(15, TimeUnit.SECONDS)
-              .get();
-      assertNotNull(entries);
+              .get(15, TimeUnit.SECONDS)) {
+        assertEquals(expected, stream.recvWithTimeout(15, TimeUnit.SECONDS));
+      }
     }
   }
 

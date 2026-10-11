@@ -31,6 +31,7 @@ use crate::grants::{
     aster_grant_state_t,
 };
 use crate::health::aster_health_config_t;
+use crate::http_server::aster_http_server_config_t;
 use crate::node::{aster_config_t, aster_portmapper_t, aster_trust_mode_t};
 use crate::observability::{
     aster_binding_kind_t, aster_instrument_desc_t, aster_instrument_kind_t, aster_log_emit_t,
@@ -45,6 +46,7 @@ use crate::server::{
     aster_cancel_reason_t, aster_dispatch_event_kind_t, aster_dispatch_event_t,
     aster_method_pattern_t, aster_server_option_t,
 };
+use crate::tls::aster_generated_cert_t;
 use crate::upcall::{
     aster_lease_status_t, aster_topology_admitted_stats_t, aster_upcall_cancel_reason_t,
     aster_upcall_event_t, aster_upcall_kind_t, aster_upcall_status_t,
@@ -521,6 +523,14 @@ mod lp64 {
         kv_len = 128,
         events = 136,
         events_len = 144,
+    });
+
+    assert_layout!(aster_generated_cert_t, size = 64, align = 8, {
+        cert_pem = 0, key_pem = 16, sha256 = 32,
+    });
+    assert_layout!(aster_http_server_config_t, size = 64, align = 8, {
+        struct_size = 0, flags = 4, bind_addr = 8, cert_pem = 24,
+        key_pem = 40, max_pending_auth = 56, max_auth_payload_bytes = 60,
     });
 
     assert_layout!(aster_health_config_t, size = 24, align = 8, {

@@ -17,7 +17,6 @@
 
 import type {
   AdmissionRequests,
-  BlobsClient,
   DocsClient,
   GossipClient,
   HealthServer,
@@ -25,6 +24,7 @@ import type {
   Node as NativeNode,
 } from '@aster-rpc/transport';
 import { type AsterConfig, toNativeConfig } from './config.js';
+import { wrapBlobsClient, type BlobsClient } from './blobs.js';
 import { Expose } from './expose.js';
 import type { AdmissionHooks, AdmissionRequest, GatePolicy } from './gate.js';
 import { ForeignLeaseSerializer, GrantorSerializer, type MemorySerializer } from './lease.js';
@@ -217,7 +217,7 @@ export class Node implements AsyncDisposable {
 
   /** Blob store client. */
   blobs(): BlobsClient {
-    return this.native.blobsClient();
+    return wrapBlobsClient(this.native.blobsClient());
   }
 
   /** Document sync client. */

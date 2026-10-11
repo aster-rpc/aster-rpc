@@ -81,7 +81,7 @@ type Runtime struct {
 	closed atomic.Bool
 
 	// ops holds the mapping from operation ID to event channel.
-	// Only accessed by the poller goroutine.
+	// Guarded by mu; dispatch and cancellation transfer ownership under the lock.
 	ops map[uint64]chan<- *Event
 
 	// mu protects ops during cancel/close.
@@ -205,11 +205,20 @@ func (r *Runtime) Handle() uint64 { return r.handle }
 func (r *Runtime) Register(op uint64, ch chan<- *Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed.Load() {
+		if ev, ok := r.pending[op]; ok {
+			delete(r.pending, op)
+			r.releaseEventBuffer(ev)
+		}
+		close(ch)
+		return
+	}
 	if ev, ok := r.pending[op]; ok {
 		delete(r.pending, op)
 		select {
 		case ch <- ev:
 		default:
+			r.releaseEventBuffer(ev)
 		}
 		return
 	}
@@ -287,7 +296,7 @@ func (r *Runtime) await(ctx context.Context, op uint64) (*Event, error) {
 		}
 		return ev, nil
 	case <-ctx.Done():
-		_ = r.Cancel(op)
+		_ = r.cancelAndDrain(op, ch, nil)
 		return nil, ctx.Err()
 	}
 }
@@ -365,31 +374,30 @@ func (r *Runtime) dispatchBatch(events []C.aster_event_t) {
 			continue
 		}
 
-		// Normal op-based dispatch.
-		op := uint64(ev.operation)
-		r.mu.Lock()
-		ch, ok := r.ops[op]
-		if ok {
-			delete(r.ops, op)
-		} else if _, gone := r.abandoned[op]; gone {
-			delete(r.abandoned, op)
-			r.releaseEventBuffer(goEv)
-		} else if op != 0 && goEv.Kind != ASTER_EVENT_OPERATION_CANCELLED {
-			// Completed before anyone registered: keep it for Register.
-			r.pending[op] = goEv
-		}
-		r.mu.Unlock()
+		r.dispatchCompletion(goEv)
+	}
+}
 
-		if !ok {
-			continue
-		}
-
+// dispatchCompletion transfers ownership while holding mu. Cancellation can
+// then detach the channel and drain it without racing an in-flight send.
+func (r *Runtime) dispatchCompletion(ev *Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	op := ev.Operation
+	if ch, ok := r.ops[op]; ok {
+		delete(r.ops, op)
 		select {
-		case ch <- goEv:
+		case ch <- ev:
 		default:
-			// Channel full; drop the event.
-			r.releaseEventBuffer(goEv)
+			r.releaseEventBuffer(ev)
 		}
+	} else if _, gone := r.abandoned[op]; gone {
+		delete(r.abandoned, op)
+		r.releaseEventBuffer(ev)
+	} else if op != 0 && ev.Kind != ASTER_EVENT_OPERATION_CANCELLED {
+		r.pending[op] = ev
+	} else {
+		r.releaseEventBuffer(ev)
 	}
 }
 
@@ -426,19 +434,54 @@ func (r *Runtime) Poll(ctx context.Context, op uint64) (*Event, error) {
 	}
 }
 
-// Cancel submits a cancellation request for op.
+// Cancel submits a cancellation request for op and stops future dispatch.
+// The caller still owns any event already delivered to its registered channel
+// and must release that event's buffer and returned native handles.
 func (r *Runtime) Cancel(op uint64) error {
-	r.Unregister(op) // Remove channel so cancelled event doesn't get dispatched.
-	r.mu.Lock()
-	delete(r.ops, op)
-	r.abandoned[op] = struct{}{}
-	r.mu.Unlock()
+	return r.cancelAndDrain(op, nil, nil)
+}
 
+// cancelAndCollect keeps the operation registered until its sole terminal
+// event arrives. A native completion may already be committed but not polled;
+// callers owning handles must collect it even when cancellation is too late.
+func (r *Runtime) cancelAndCollect(op uint64, ch <-chan *Event) *Event {
+	C.aster_operation_cancel(C.uint64_t(r.handle), C.uint64_t(op))
+	return <-ch
+}
+
+// cancelAndDrain takes back a completion already delivered to the caller's
+// channel before cancelling. cleanup runs outside mu because it can call FFI.
+func (r *Runtime) cancelAndDrain(op uint64, ch <-chan *Event, cleanup func(*Event)) error {
+	ev := r.detachCompletion(op, ch)
+	if ev != nil {
+		if cleanup != nil {
+			cleanup(ev)
+		}
+		r.releaseEventBuffer(ev)
+	}
 	err := C.aster_operation_cancel(C.uint64_t(r.handle), C.uint64_t(op))
 	if err != 0 {
 		return fmt.Errorf("aster_operation_cancel: %w", Error(err))
 	}
 	return nil
+}
+
+func (r *Runtime) detachCompletion(op uint64, ch <-chan *Event) *Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.ops, op)
+	ev := r.pending[op]
+	delete(r.pending, op)
+	if ev == nil && ch != nil {
+		select {
+		case ev = <-ch:
+		default:
+		}
+	}
+	if ev == nil {
+		r.abandoned[op] = struct{}{}
+	}
+	return ev
 }
 
 // ReleaseBuffer releases a buffer allocated by Rust.
@@ -535,8 +578,8 @@ func Version() (major, minor, patch uint32) {
 }
 
 // ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
-// this binding runs against: 4.9 adds the durable audit outbox.
-const ABIMinorRequired = uint32(9)
+// this binding runs against: 4.16 adds local/shared topology views and explicit RPC policy.
+const ABIMinorRequired = uint32(16)
 
 // CheckABI returns an error if the loaded native library's ABI major version
 // differs from the one this binding was compiled against, or its minor

@@ -42,8 +42,8 @@ use aster::binding_support::dispatch::{
 };
 use aster::ops::HealthState;
 use aster::rpc::{
-    decode_rpc_status, AttributeStore, DynamicService, MethodPattern, RpcStatus, Server,
-    ServerHandle,
+    decode_rpc_status, AttributeStore, Dispatcher, DynamicService, MethodPattern, RpcStatus,
+    Server, ServerHandle,
 };
 use aster_transport_core::{CoreConnection, CoreNode};
 
@@ -241,6 +241,7 @@ struct BuilderSpec {
     services: Vec<DynamicService>,
     node_info: bool,
     topology: bool,
+    topology_requires: Option<aster::rpc::CapabilityRequirement>,
     max_sessions: Option<usize>,
     handler_timeout: Option<Option<Duration>>,
     max_foreign_inflight: usize,
@@ -335,6 +336,9 @@ struct PollState {
 }
 
 pub(crate) struct ServerState {
+    pub(crate) runtime_owner: aster_runtime_t,
+    pub(crate) dispatcher: Dispatcher,
+    pub(crate) http_children: Mutex<HttpChildren>,
     poll: Mutex<PollState>,
     table: CallTable,
     attributes: AttributeStore,
@@ -343,6 +347,12 @@ pub(crate) struct ServerState {
     rt: tokio::runtime::Handle,
     /// An attached ops listener's state (`aster_server_attach_health`).
     health: Option<HealthState>,
+}
+
+#[derive(Default)]
+pub(crate) struct HttpChildren {
+    pub(crate) closed: bool,
+    pub(crate) handles: Vec<u64>,
 }
 
 pub(crate) static BUILDERS: once_cell::sync::Lazy<HandleRegistry<BuilderState>> =
@@ -459,6 +469,7 @@ pub unsafe extern "C" fn aster_server_builder_new(
             services: Vec::new(),
             node_info: true,
             topology: false,
+            topology_requires: None,
             max_sessions: None,
             handler_timeout: None,
             max_foreign_inflight: aster::binding_support::dispatch::DEFAULT_MAX_FOREIGN_INFLIGHT,
@@ -517,6 +528,70 @@ pub unsafe extern "C" fn aster_server_add_service_json(
         // SAFETY: checked non-null.
         unsafe { ptr::write(out_idx, idx) };
     }
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// Configure the opt-in topology baseline service and its native Gate-3
+/// capability requirement atomically (ABI 4.16). Enabling requires monitoring.
+/// An empty span or JSON null means no additional capability requirement;
+/// otherwise use the native CapabilityRequirement JSON (kind and roles).
+/// The default is disabled. Remote peer views never expose remote_addr.
+/// This does not change the legacy set_option behavior for existing callers.
+/// # Safety
+/// requirement_json must be readable for its advertised length during the call.
+#[no_mangle]
+pub unsafe extern "C" fn aster_server_set_topology(
+    builder: aster_server_builder_t,
+    enabled: u32,
+    requirement_json: aster_bytes_t,
+) -> i32 {
+    if enabled > 1 {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "enabled must be 0 or 1",
+        );
+    }
+    if requirement_json.len > 1024 * 1024 {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "topology requirement exceeds 1 MiB",
+        );
+    }
+    let input = match unsafe { crate::data::in_slice(&requirement_json, "requirement_json") } {
+        Ok(input) => input,
+        Err(status) => return status,
+    };
+    let requirement = if input.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<Option<aster::rpc::CapabilityRequirement>>(input) {
+            Ok(requirement) => requirement,
+            Err(error) => {
+                return fail(
+                    aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+                    format!("invalid topology requirement: {error}"),
+                )
+            }
+        }
+    };
+    let Some(state) = BUILDERS.get(builder) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let mut guard = state.spec.lock().unwrap();
+    let Some(spec) = guard.as_mut() else {
+        return fail(
+            aster_status_t::ASTER_STATUS_ALREADY_CLOSED,
+            "builder already started",
+        );
+    };
+    if enabled == 1 && !spec.node.has_monitoring() {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "builtin topology requires monitoring",
+        );
+    }
+    spec.topology = enabled == 1;
+    spec.topology_requires = requirement;
     status(aster_status_t::ASTER_STATUS_OK)
 }
 
@@ -637,7 +712,7 @@ pub unsafe extern "C" fn aster_server_start(
             .0;
     }
     if spec.topology {
-        server = server.with_builtin_topology(&node, None);
+        server = server.with_builtin_topology(&node, spec.topology_requires);
     }
     let services = spec.services.len() as u32;
     for svc in spec.services {
@@ -647,9 +722,13 @@ pub unsafe extern "C" fn aster_server_start(
         };
     }
     let table = server.call_table();
+    let dispatcher = server.dispatcher();
     let handle = server.serve();
 
-    let id = SERVERS.insert(ServerState {
+    let state = ServerState {
+        runtime_owner: runtime,
+        dispatcher,
+        http_children: Mutex::new(HttpChildren::default()),
         poll: Mutex::new(PollState {
             consumer,
             connections: HashMap::new(),
@@ -660,12 +739,25 @@ pub unsafe extern "C" fn aster_server_start(
         handle: Mutex::new(Some(handle)),
         rt: rt.clone(),
         health: spec.health.clone(),
-    });
+    };
+    let mut tracked = bridge
+        .server_handles
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if bridge.closing.load(Ordering::Acquire) {
+        if let Some(handle) = state.handle.lock().unwrap().take() {
+            handle.abort();
+        }
+        return status(aster_status_t::ASTER_STATUS_ALREADY_CLOSED);
+    }
+    let id = SERVERS.insert(state);
+    tracked.push(id);
     // Ready once serving (design §6), as `AsterServer` does.
     if let Some(h) = &spec.health {
         h.set_services(services);
         h.set_ready(true);
     }
+    drop(tracked);
     // SAFETY: checked non-null.
     unsafe { ptr::write(out_server, id) };
     status(aster_status_t::ASTER_STATUS_OK)
@@ -711,15 +803,51 @@ pub extern "C" fn aster_server_builder_free(builder: aster_server_builder_t) -> 
 /// Stop serving and free the server. Events still in the ring are dropped
 /// (their calls are abandoned with `INTERNAL`); calls the binding still holds
 /// return `NOT_FOUND` afterwards; borrowed connection handles are freed.
-/// Does not close the node.
+/// Joins owned HTTP/WebTransport child listeners with zero grace, releasing
+/// their ports on success. Blocks and is UNSUPPORTED on a tokio runtime thread
+/// (checked before removal). Does not close the node.
 #[no_mangle]
 pub extern "C" fn aster_server_destroy(runtime: aster_runtime_t, server: aster_server_t) -> i32 {
+    if let Some(error) = crate::http_server::blocking_on_runtime("aster_server_destroy") {
+        return error;
+    }
+    let bridge = match load_runtime(runtime) {
+        Ok(bridge) => bridge,
+        Err(s) => return status(s),
+    };
+    let Some(owner) = SERVERS.get(server) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    if owner.runtime_owner != runtime {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    }
     let Some(state) = SERVERS.remove(server) else {
         return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
     };
+    bridge
+        .server_handles
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|id| *id != server);
     // Not ready first (design §6): probes stop routing before calls fail.
     if let Some(h) = &state.health {
         h.set_ready(false);
+    }
+    // Seal listener admission before joining any child; a start that was
+    // binding concurrently must recheck this flag before publishing its owner.
+    let children = {
+        let mut children = state
+            .http_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        children.closed = true;
+        std::mem::take(&mut children.handles)
+    };
+    let mut child_error = None;
+    for child in children {
+        if let Err(error) = crate::http_server::stop_child(&bridge, child, Duration::ZERO) {
+            child_error.get_or_insert(error);
+        }
     }
     if let Some(handle) = state.handle.lock().unwrap().take() {
         handle.abort();
@@ -736,7 +864,50 @@ pub extern "C" fn aster_server_destroy(runtime: aster_runtime_t, server: aster_s
         }
     }
     state.leases.clear();
+    if let Some(error) = child_error {
+        return fail(aster_status_t::ASTER_STATUS_INTERNAL, error);
+    }
     status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// Runtime shutdown cannot block on its own workers. Remove global server
+/// owners, seal their listener admission, abort the Iroh loops and drop state;
+/// the runtime's listener registry is cleared next to force child cleanup.
+pub(crate) fn shutdown_runtime(bridge: &BridgeRuntime) {
+    let handles = std::mem::take(
+        &mut *bridge
+            .server_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
+    for id in handles {
+        let Some(state) = SERVERS.remove(id) else {
+            continue;
+        };
+        if let Some(health) = &state.health {
+            health.set_ready(false);
+        }
+        state
+            .http_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed = true;
+        if let Some(handle) = state
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+        state
+            .poll
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .consumer
+            .drain(usize::MAX, drop);
+        state.leases.clear();
+    }
 }
 
 /// Attribute bridge (design §2.6): set the attributes Gate 3 sees for

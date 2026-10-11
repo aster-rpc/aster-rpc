@@ -16,7 +16,7 @@ namespace Aster;
 public enum BlobFormat : uint
 {
     Raw = 0,
-    /// <summary>A hash sequence (collection).</summary>
+    /// <summary>A hash sequence; it need not use Collection metadata.</summary>
     HashSeq = 1,
 }
 

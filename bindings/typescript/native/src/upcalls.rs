@@ -87,6 +87,7 @@ fn request_type(kind: UpcallKind) -> Option<&'static str> {
         UpcallKind::ExposeRoutePolicy => "ExposeRoutePolicyRequest",
         UpcallKind::AdmissionConnect => "AdmissionConnectRequest",
         UpcallKind::AdmissionHandshake => "AdmissionHandshakeRequest",
+        UpcallKind::RpcAuthenticate => "RpcAuthRequest",
         _ => return None,
     })
 }
@@ -107,6 +108,7 @@ fn response_type(kind: UpcallKind) -> Option<&'static str> {
         UpcallKind::ExposeHttp => "ExposeHttpResponse",
         UpcallKind::ExposeRoutePolicy => "ExposeRouteGrant",
         UpcallKind::AdmissionHandshake => "AdmissionHandshakeResponse",
+        UpcallKind::RpcAuthenticate => "RpcAuthResponse",
         _ => return None,
     })
 }
@@ -350,6 +352,24 @@ pub struct UpcallAdmissionHandshakeResponse {
     pub reason: Option<Buffer>,
 }
 
+/// Per-call RPC authentication context (kind 80).
+#[napi(object)]
+pub struct UpcallRpcAuthRequest {
+    pub peer_id: String,
+    pub service: String,
+    pub method: String,
+    pub session_id: i32,
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// Authentication must explicitly accept a nonempty principal; otherwise reject.
+#[napi(object)]
+pub struct UpcallRpcAuthResponse {
+    pub accepted: bool,
+    pub principal: Option<String>,
+    pub attributes: Option<std::collections::HashMap<String, String>>,
+}
+
 /// Any decoded UCv1 message (the JavaScript object of its type).
 pub enum UpcallValue {
     LeaseTransitionRequest(UpcallLeaseTransitionRequest),
@@ -376,6 +396,8 @@ pub enum UpcallValue {
     AdmissionConnectRequest(UpcallAdmissionConnectRequest),
     AdmissionHandshakeRequest(UpcallAdmissionHandshakeRequest),
     AdmissionHandshakeResponse(UpcallAdmissionHandshakeResponse),
+    RpcAuthRequest(UpcallRpcAuthRequest),
+    RpcAuthResponse(UpcallRpcAuthResponse),
 }
 
 impl TypeName for UpcallValue {
@@ -416,6 +438,8 @@ impl ToNapiValue for UpcallValue {
                 V::AdmissionConnectRequest(v) => ToNapiValue::to_napi_value(env, v),
                 V::AdmissionHandshakeRequest(v) => ToNapiValue::to_napi_value(env, v),
                 V::AdmissionHandshakeResponse(v) => ToNapiValue::to_napi_value(env, v),
+                V::RpcAuthRequest(v) => ToNapiValue::to_napi_value(env, v),
+                V::RpcAuthResponse(v) => ToNapiValue::to_napi_value(env, v),
             }
         }
     }
@@ -753,6 +777,33 @@ pub(crate) fn decode_value(ty: &str, b: &[u8]) -> Result<UpcallValue> {
                 }
             },
         ),
+        "RpcAuthRequest" => {
+            let r = codec::decode_rpc_auth_request(b).map_err(codec_err)?;
+            V::RpcAuthRequest(UpcallRpcAuthRequest {
+                peer_id: r.peer_id,
+                service: r.service,
+                method: r.method,
+                session_id: r.session_id,
+                metadata: r.metadata,
+            })
+        }
+        "RpcAuthResponse" => V::RpcAuthResponse(
+            match codec::decode_rpc_auth_response(b).map_err(codec_err)? {
+                codec::RpcAuthResponse::Rejected => UpcallRpcAuthResponse {
+                    accepted: false,
+                    principal: None,
+                    attributes: None,
+                },
+                codec::RpcAuthResponse::Authenticated {
+                    principal,
+                    attributes,
+                } => UpcallRpcAuthResponse {
+                    accepted: true,
+                    principal: Some(principal),
+                    attributes: Some(attributes),
+                },
+            },
+        ),
         other => return Err(invalid(format!("unknown upcall message type {other:?}"))),
     })
 }
@@ -926,6 +977,30 @@ pub(crate) fn encode_value(env: &Env, ty: &str, v: &Unknown) -> Result<Vec<u8>> 
                 }
             })
         }
+        "RpcAuthRequest" => {
+            let r: UpcallRpcAuthRequest = from_js(env, v)?;
+            codec::encode_rpc_auth_request(
+                &r.peer_id,
+                &r.service,
+                &r.method,
+                r.session_id,
+                &r.metadata,
+            )
+        }
+        "RpcAuthResponse" => {
+            let r: UpcallRpcAuthResponse = from_js(env, v)?;
+            let response = if r.accepted {
+                codec::RpcAuthResponse::Authenticated {
+                    principal: r
+                        .principal
+                        .ok_or_else(|| invalid("accepted authentication requires a principal"))?,
+                    attributes: r.attributes.unwrap_or_default(),
+                }
+            } else {
+                codec::RpcAuthResponse::Rejected
+            };
+            codec::encode_rpc_auth_response(&response).map_err(codec_err)?
+        }
         other => return Err(invalid(format!("unknown upcall message type {other:?}"))),
     })
 }
@@ -934,7 +1009,7 @@ pub(crate) fn encode_value(env: &Env, ty: &str, v: &Unknown) -> Result<Vec<u8>> 
 /// `conformance/vectors/upcalls.json`, e.g. `"LeaseTransitionRequest"`).
 /// Throws on any non-canonical input.
 #[napi(
-    ts_return_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
+    ts_return_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse | UpcallRpcAuthRequest | UpcallRpcAuthResponse"
 )]
 pub fn upcall_codec_decode(type_name: String, bytes: Buffer) -> Result<UpcallValue> {
     decode_value(&type_name, &bytes)
@@ -947,7 +1022,7 @@ pub fn upcall_codec_encode(
     env: Env,
     type_name: String,
     #[napi(
-        ts_arg_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
+        ts_arg_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse | UpcallRpcAuthRequest | UpcallRpcAuthResponse"
     )]
     value: Unknown,
 ) -> Result<Buffer> {
@@ -966,7 +1041,7 @@ pub struct UpcallEventJs {
     pub deadline_unix_ms: f64,
     pub cancel_reason: Option<u32>,
     #[napi(
-        ts_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse"
+        ts_type = "UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse | UpcallRpcAuthRequest | UpcallRpcAuthResponse"
     )]
     pub request: Option<UpcallValue>,
     /// Set when the request could not be decoded (answer it with an error).

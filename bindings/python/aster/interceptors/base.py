@@ -28,6 +28,8 @@ class CallContext:
         method: The method name (e.g., ``"getStatus"``).
         call_id: Unique ID for this call (auto-generated UUID).
         peer: Remote peer identifier (endpoint ID hex).
+        iroh_authenticated: Whether Iroh authenticated the remote node key.
+            HTTP/WT principals keep this false after application authentication.
         metadata: Key/value headers sent with the call.
         attributes: Enrollment attributes from the consumer's credential.
         deadline: Absolute deadline as epoch timestamp, or ``None``.
@@ -63,6 +65,7 @@ class CallContext:
     peer_addr: tuple[str, int] | None = None
     relay_url: str | None = None
     rtt_micros: int | None = None
+    iroh_authenticated: bool = False
 
     _current: ClassVar[contextvars.ContextVar["CallContext | None"]] = (
         contextvars.ContextVar("aster_call_context", default=None)

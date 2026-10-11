@@ -22,6 +22,7 @@ aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "bindi
 # pool, tunnels and bare endpoints (reached from `aster` handles through
 # `aster::binding_support`).
 aster_transport_core = { path = "../../../core", version = "=0.3.0" }
+aster-transport-salvo = { path = "../../../aster-transport-salvo", version = "=0.3.0" }
 # The observability pipeline (init, log bridge, instruments, spans). `otlp-logs`
 # is the application-log appender (path B, design 3.4); `prometheus` is the
 # pull reader `health` already requires.

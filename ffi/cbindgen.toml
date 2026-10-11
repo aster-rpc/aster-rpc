@@ -59,4 +59,5 @@ include = [
   "aster_instrument_kind_t",
   "aster_span_kind_t",
   "aster_audit_outbox_error_t",
+  "aster_topology_separation_t",
 ]

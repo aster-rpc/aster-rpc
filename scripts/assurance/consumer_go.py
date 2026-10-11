@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Linux Go staged source-package smoke; deliberately NOT public module registry proof.
 
-The candidate module identity is aster-ffi. A fresh consumer uses an explicit
-local replace to an extracted, hashed archive, plus the hashed candidate C
-header/native library. Invocation builds only this consumer, not the Rust SDK.
+The candidate module identity is sdk.getaster.now/go. A fresh consumer uses
+an explicit local replace to an extracted, hashed archive, plus the hashed
+candidate C header/native library. Invocation builds only this consumer, not the
+Rust SDK.
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ import (
   "strings"
   "sync/atomic"
   "time"
-  aster "aster-ffi"
+  aster "sdk.getaster.now/go"
 )
 
 type EchoRequest struct { Message string; Count int32; Data []byte `fory:"type=bytes"` }
@@ -76,10 +77,10 @@ func main() {
   check(version==os.Getenv("ASTER_CONSUMER_VERSION"),"native release version mismatch: "+version)
   info,ok:=debug.ReadBuildInfo(); check(ok,"missing Go build provenance")
   moduleDir:=""
-  for _,dep:=range info.Deps { if dep.Path=="aster-ffi" && dep.Replace!=nil { moduleDir=dep.Replace.Path } }
+  for _,dep:=range info.Deps { if dep.Path=="sdk.getaster.now/go" && dep.Replace!=nil { moduleDir=dep.Replace.Path } }
   check(moduleDir==os.Getenv("ASTER_CONSUMER_MODULE"),"Go build did not use isolated staged module: "+moduleDir)
   major,minor,patch:=aster.Version()
-  receipt(map[string]any{"phase":"go_metadata","version":version,"module_identity":"aster-ffi","module_origin":moduleDir,"native":native,"native_sha256":hex.EncodeToString(digest[:]),"abi":fmt.Sprintf("%d.%d.%d",major,minor,patch),"go":info.GoVersion,"public_registry_proof":false})
+  receipt(map[string]any{"phase":"go_metadata","version":version,"module_identity":"sdk.getaster.now/go","module_origin":moduleDir,"native":native,"native_sha256":hex.EncodeToString(digest[:]),"abi":fmt.Sprintf("%d.%d.%d",major,minor,patch),"go":info.GoVersion,"public_registry_proof":false})
   var started,cancelled atomic.Int32
   service:=aster.NewService("InteropEcho",1,
     aster.Unary("echo",func(_ context.Context,req *EchoRequest)(*EchoReply,error){ return &EchoReply{Message:req.Message,Count:req.Count+1,Data:req.Data,ServerLang:"go"},nil }),
@@ -196,8 +197,8 @@ def main() -> None:
         ap.error(f"archive must contain exactly one candidate go.mod: {modules}")
     module = modules[0].parent
     text = modules[0].read_text()
-    if not re.search(r"(?m)^module\s+aster-ffi\s*$", text) or not (module / "go.sum").is_file():
-        ap.error("archive must be the aster-ffi source package with go.sum")
+    if not re.search(r"(?m)^module\s+" + re.escape("sdk.getaster.now/go") + r"\s*$", text) or not (module / "go.sum").is_file():
+        ap.error("archive must be the sdk.getaster.now/go source package with go.sum")
     if re.search(r"(?m)^replace\s", text):
         ap.error("staged module cannot refer to additional local source replacements")
     native_dir, include_dir = output / "native", output / "include"
@@ -206,7 +207,7 @@ def main() -> None:
     shutil.copy2(artifacts["ffi"], native)
     shutil.copy2(artifacts["header"], include_dir / "aster_ffi.h")
     (project / "main.go").write_text(APP)
-    (project / "go.mod").write_text(f'module assurance-clean-consumer\n\ngo 1.25.0\n\nrequire aster-ffi v0.0.0\n\nreplace aster-ffi => {json.dumps(str(module))}\n')
+    (project / "go.mod").write_text(f'module assurance-clean-consumer\n\ngo 1.25.0\n\nrequire sdk.getaster.now/go v0.0.0\n\nreplace sdk.getaster.now/go => {json.dumps(str(module))}\n')
     env = os.environ.copy()
     for key in list(env):
         if key.startswith(("ASTER_", "OTEL_")):
@@ -220,11 +221,11 @@ def main() -> None:
                CGO_CFLAGS=f'-I{include_dir}', CGO_LDFLAGS=f'-L{native_dir} -laster_transport_ffi -Wl,-rpath,{native_dir}', LD_LIBRARY_PATH=str(native_dir),
                ASTER_CONSUMER_VERSION=args.version, ASTER_CONSUMER_MODULE=str(module), ASTER_CONSUMER_FFI_PATH=str(native), ASTER_CONSUMER_FFI_SHA256=sha(native))
     metadata = {"scope": "staged_go_source_package_local_replace", "public_registry_proof": False, "version": args.version,
-                "module_identity": "aster-ffi", "module_origin": str(module), "artifact_sha256": {name: sha(path) for name, path in artifacts.items()}, "project": str(project)}
+                "module_identity": "sdk.getaster.now/go", "module_origin": str(module), "artifact_sha256": {name: sha(path) for name, path in artifacts.items()}, "project": str(project)}
     print(json.dumps(metadata, sort_keys=True), flush=True)
     run(["go", "mod", "tidy"], project, env, output / "resolve.log")
-    resolved = json.loads(run(["go", "list", "-m", "-json", "aster-ffi"], project, env, output / "module-origin.log"))
-    if resolved.get("Path") != "aster-ffi" or Path(resolved["Dir"]).resolve() != module:
+    resolved = json.loads(run(["go", "list", "-m", "-json", "sdk.getaster.now/go"], project, env, output / "module-origin.log"))
+    if resolved.get("Path") != "sdk.getaster.now/go" or Path(resolved["Dir"]).resolve() != module:
         raise SystemExit(f"Go module escaped isolated staged archive: {resolved}")
     executable = project / "consumer"
     run(["go", "build", "-o", str(executable), "."], project, env, output / "compile.log")

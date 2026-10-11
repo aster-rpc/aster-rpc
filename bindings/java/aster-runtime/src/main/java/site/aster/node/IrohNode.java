@@ -53,6 +53,11 @@ public class IrohNode implements AutoCloseable {
     return connections;
   }
 
+  /** Local proximity and shared swarm view; measurements require monitoring. */
+  public site.aster.topology.Topology topology() {
+    return new site.aster.topology.Topology(this);
+  }
+
   private final boolean hooks;
 
   /** Immutable health-only settings captured when this node was created. */

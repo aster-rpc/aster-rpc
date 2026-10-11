@@ -28,4 +28,4 @@ works and to play with the decorator surface.
 
 For the real-network version (across machines, with credentials, the
 full streaming and session story), work through the
-[Mission Control walkthrough](https://docs.aster.site/docs/quickstart/mission-control).
+[Mission Control walkthrough](https://sdk.getaster.now/docs/quickstart/mission-control).

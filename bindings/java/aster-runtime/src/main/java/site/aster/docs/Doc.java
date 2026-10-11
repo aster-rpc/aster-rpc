@@ -2,11 +2,13 @@ package site.aster.docs;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.SegmentAllocator;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import site.aster.blobs.BlobId;
 import site.aster.ffi.DataPlane;
@@ -17,16 +19,12 @@ import site.aster.ffi.IrohStatus;
 import site.aster.handle.IrohRuntime;
 
 /**
- * A document handle for content-addressed operations.
- *
- * <p>Documents support setting/getting content, querying entries, and sync. Obtain via {@link
- * Docs#createAsync} or {@link Docs#joinAsync}.
+ * A document handle. Queries return metadata; read values with getExactAsync or
+ * readEntryContentAsync.
  */
-public class Doc {
-
+public class Doc implements AutoCloseable {
   private final IrohRuntime runtime;
   private final long docHandle;
-  // The node that opened this document (0 if unknown); needed by authorityReportAsync.
   private final long nodeHandle;
 
   public Doc(IrohRuntime runtime, long docHandle) {
@@ -47,482 +45,203 @@ public class Doc {
     return docHandle;
   }
 
-  private MemorySegment toStringSegment(String str, SegmentAllocator alloc) {
-    byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
-    MemorySegment seg = alloc.allocate(bytes.length);
-    seg.copyFrom(MemorySegment.ofArray(bytes));
-    return seg;
+  /** Subscribe to this document independently of the document handle. Close the returned owner. */
+  public CompletableFuture<DocEvents> subscribeAsync() {
+    return DocEvents.subscribe(this);
   }
 
-  private MemorySegment toBytesSegment(byte[] data, SegmentAllocator alloc) {
-    MemorySegment dataSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
-    MemorySegment heapSeg = alloc.allocate(data.length);
-    heapSeg.copyFrom(MemorySegment.ofArray(data));
-    dataSeg.set(ValueLayout.ADDRESS, 0, heapSeg);
-    dataSeg.set(ValueLayout.JAVA_LONG, 8, (long) data.length);
-    return dataSeg;
-  }
-
-  /** Close this document and free its handle. */
+  @Override
   public void close() {
-    IrohLibrary lib = IrohLibrary.getInstance();
-    lib.docFree(runtime.nativeHandle(), docHandle);
+    IrohLibrary.getInstance().docFree(runtime.nativeHandle(), docHandle);
   }
 
-  /**
-   * The 64-char hex namespace id of this document (spec §11.2). Used by consumer admission to
-   * advertise the registry doc so consumers can {@code join_and_subscribe_namespace} and fetch
-   * published contract manifests.
-   */
+  /** The document's 64-character hex namespace identifier. */
   public String docId() {
-    IrohLibrary lib = IrohLibrary.getInstance();
     try (Arena arena = Arena.ofConfined()) {
-      MemorySegment outBuf = arena.allocate(128);
-      MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
-      outLen.set(ValueLayout.JAVA_LONG, 0, 128L);
-      int status = lib.docId(runtime.nativeHandle(), docHandle, outBuf, outLen);
-      if (status != 0) {
+      MemorySegment out = arena.allocate(64);
+      MemorySegment len = arena.allocate(ValueLayout.JAVA_LONG);
+      len.set(ValueLayout.JAVA_LONG, 0, 64L);
+      int status = IrohLibrary.getInstance().docId(runtime.nativeHandle(), docHandle, out, len);
+      if (status != 0)
         throw new IrohException(IrohStatus.fromCode(status), "aster_doc_id failed: " + status);
-      }
-      long written = outLen.get(ValueLayout.JAVA_LONG, 0);
-      byte[] bytes = outBuf.asSlice(0, written).toArray(ValueLayout.JAVA_BYTE);
-      return new String(bytes, StandardCharsets.UTF_8);
+      return new String(
+          out.asSlice(0, len.get(ValueLayout.JAVA_LONG, 0)).toArray(ValueLayout.JAVA_BYTE),
+          StandardCharsets.UTF_8);
     }
   }
 
-  /**
-   * Set bytes in the document.
-   *
-   * @param author the author ID
-   * @param key the content key
-   * @param value the content value
-   * @return a future that completes when the content is set
-   */
+  private static DataPlane.Result expect(DataPlane.Result r, IrohEventKind kind) {
+    if (r.event().kind() != kind)
+      throw new IrohException("expected " + kind + ", got " + r.event().kind());
+    if (r.event().status() != IrohStatus.OK.code)
+      throw new IrohException(IrohStatus.fromCode(r.event().status()), "document operation failed");
+    return r;
+  }
+
+  /** Set a value under a UTF-8 key. */
   public CompletableFuture<Void> setBytesAsync(AuthorId author, String key, byte[] value) {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-
-    // aster_doc_set_bytes takes three aster_bytes_t by value; pass each as (ptr, len) separately
-    // so FFM marshals them into the consecutive registers the struct-by-value ABI expects.
-    byte[] authorBytes = author.hex().getBytes(StandardCharsets.UTF_8);
-    byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-
-    MemorySegment authorPtr = alloc.allocate(authorBytes.length);
-    authorPtr.copyFrom(MemorySegment.ofArray(authorBytes));
-    MemorySegment keyPtr = alloc.allocate(keyBytes.length);
-    keyPtr.copyFrom(MemorySegment.ofArray(keyBytes));
-    MemorySegment valuePtr = alloc.allocate(value.length);
-    valuePtr.copyFrom(MemorySegment.ofArray(value));
-
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    try {
-      int status =
-          lib.docSetBytes(
-              runtime.nativeHandle(),
-              docHandle,
-              authorPtr,
-              authorBytes.length,
-              keyPtr,
-              keyBytes.length,
-              valuePtr,
-              value.length,
-              0L,
-              opSeg);
-      if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_doc_set_bytes failed: " + status);
-      }
-    } catch (IrohException e) {
-      return CompletableFuture.failedFuture(e);
-    } catch (Throwable t) {
-      return CompletableFuture.failedFuture(
-          new IrohException("aster_doc_set_bytes threw: " + t.getMessage()));
-    }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime.registry().register(opId).thenApply(event -> null);
+    return setBytesAsync(author, key.getBytes(StandardCharsets.UTF_8), value);
   }
 
-  /**
-   * Get exact entry from the document.
-   *
-   * @param author the author ID
-   * @param key the content key
-   * @return a future that completes with the entry, or null if not found
-   */
-  public CompletableFuture<DocEntry> getExactAsync(AuthorId author, String key) {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-
-    byte[] authorBytes = author.hex().getBytes(StandardCharsets.UTF_8);
-    byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-
-    var authorSeg = alloc.allocate(authorBytes.length);
-    authorSeg.copyFrom(MemorySegment.ofArray(authorBytes));
-    var authorBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
-    authorBytesSeg.set(ValueLayout.ADDRESS, 0, authorSeg);
-    authorBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) authorBytes.length);
-
-    var keySeg = alloc.allocate(keyBytes.length);
-    keySeg.copyFrom(MemorySegment.ofArray(keyBytes));
-    var keyBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
-    keyBytesSeg.set(ValueLayout.ADDRESS, 0, keySeg);
-    keyBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) keyBytes.length);
-
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    try {
-      int status =
-          lib.docGetExact(
-              runtime.nativeHandle(), docHandle, authorBytesSeg, keyBytesSeg, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_doc_get_exact failed: " + status);
-      }
-    } catch (IrohException e) {
-      return CompletableFuture.failedFuture(e);
-    } catch (Throwable t) {
-      return CompletableFuture.failedFuture(
-          new IrohException("aster_doc_get_exact threw: " + t.getMessage()));
-    }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime
-        .registry()
-        .register(opId)
+  /** Set a value under an arbitrary byte key. */
+  public CompletableFuture<Void> setBytesAsync(AuthorId author, byte[] key, byte[] value) {
+    return DataPlane.docSetBytes(runtime, docHandle, author.hex(), key, value)
         .thenApply(
-            event -> {
-              if (event.kind() == IrohEventKind.DOC_GET) {
-                if (event.status() == IrohStatus.NOT_FOUND.code) {
-                  return null;
-                }
-                byte[] bytes =
-                    event.dataLen() > 0
-                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
-                        : new byte[0];
-                if (event.hasBuffer()) {
-                  runtime.releaseBuffer(event.buffer());
-                }
-                return parseDocEntry(bytes);
-              }
-              throw new IrohException("getExact failed: unexpected event " + event.kind());
+            r -> {
+              expect(r, IrohEventKind.DOC_SET);
+              return null;
             });
   }
 
-  /**
-   * Query entries from the document.
-   *
-   * @param mode the query mode
-   * @param keyPrefix key prefix to filter (empty for all entries)
-   * @return a future that completes with matching entries
-   */
-  public CompletableFuture<List<DocEntry>> queryAsync(QueryMode mode, String keyPrefix) {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+  /** Read raw value bytes under a UTF-8 key, or null when absent. */
+  public CompletableFuture<byte[]> getExactAsync(AuthorId author, String key) {
+    return getExactAsync(author, key.getBytes(StandardCharsets.UTF_8));
+  }
 
-    byte[] keyBytes = keyPrefix.getBytes(StandardCharsets.UTF_8);
-    var keySeg = alloc.allocate(keyBytes.length);
-    keySeg.copyFrom(MemorySegment.ofArray(keyBytes));
-    var keyBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
-    keyBytesSeg.set(ValueLayout.ADDRESS, 0, keySeg);
-    keyBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) keyBytes.length);
-
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    try {
-      int status =
-          lib.docQuery(runtime.nativeHandle(), docHandle, mode.code(), keyBytesSeg, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "aster_doc_query failed: " + status);
-      }
-    } catch (IrohException e) {
-      return CompletableFuture.failedFuture(e);
-    } catch (Throwable t) {
-      return CompletableFuture.failedFuture(
-          new IrohException("aster_doc_query threw: " + t.getMessage()));
-    }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime
-        .registry()
-        .register(opId)
+  /** Read raw value bytes under an arbitrary byte key, or null when absent. */
+  public CompletableFuture<byte[]> getExactAsync(AuthorId author, byte[] key) {
+    return DataPlane.docGetExact(runtime, docHandle, author.hex(), key)
         .thenApply(
-            event -> {
-              if (event.kind() == IrohEventKind.DOC_QUERY) {
-                byte[] bytes =
-                    event.dataLen() > 0
-                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
-                        : new byte[0];
-                if (event.hasBuffer()) {
-                  runtime.releaseBuffer(event.buffer());
-                }
-                return parseDocEntryList(bytes);
-              }
-              throw new IrohException("query failed: unexpected event " + event.kind());
+            r -> {
+              if (r.event().kind() == IrohEventKind.DOC_GET
+                  && r.event().status() == IrohStatus.NOT_FOUND.code) return null;
+              return expect(r, IrohEventKind.DOC_GET).data();
             });
   }
 
-  /**
-   * Read entry content from the document.
-   *
-   * @param contentHash the content hash
-   * @return a future that completes with the content bytes
-   */
-  public CompletableFuture<byte[]> readEntryContentAsync(BlobId contentHash) {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+  /** Query metadata for a UTF-8 key/prefix without limiting the result. */
+  public CompletableFuture<List<DocEntry>> queryAsync(QueryMode mode, String key) {
+    return queryAsync(mode, key, 0);
+  }
 
-    byte[] hashBytes = contentHash.hex().getBytes(StandardCharsets.UTF_8);
-    var hashSeg = alloc.allocate(hashBytes.length);
-    hashSeg.copyFrom(MemorySegment.ofArray(hashBytes));
-    var hashBytesSeg = alloc.allocate(IrohLibrary.ASTER_BYTES);
-    hashBytesSeg.set(ValueLayout.ADDRESS, 0, hashSeg);
-    hashBytesSeg.set(ValueLayout.JAVA_LONG, 8, (long) hashBytes.length);
+  /** Query metadata for a UTF-8 key/prefix; zero limit means unbounded. */
+  public CompletableFuture<List<DocEntry>> queryAsync(QueryMode mode, String key, long limit) {
+    return queryAsync(mode, key.getBytes(StandardCharsets.UTF_8), limit);
+  }
 
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    try {
-      int status =
-          lib.docReadEntryContent(runtime.nativeHandle(), docHandle, hashBytesSeg, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_doc_read_entry_content failed: " + status);
-      }
-    } catch (IrohException e) {
-      return CompletableFuture.failedFuture(e);
-    } catch (Throwable t) {
+  /** Query metadata for an arbitrary byte key/prefix; values are read separately. */
+  public CompletableFuture<List<DocEntry>> queryAsync(QueryMode mode, byte[] key, long limit) {
+    if (limit < 0)
       return CompletableFuture.failedFuture(
-          new IrohException("aster_doc_read_entry_content threw: " + t.getMessage()));
-    }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime
-        .registry()
-        .register(opId)
+          new IllegalArgumentException("limit must be nonnegative"));
+    return DataPlane.docQuery(runtime, docHandle, mode.code(), key, limit)
         .thenApply(
-            event -> {
-              if (event.kind() == IrohEventKind.DOC_GET) {
-                byte[] data =
-                    event.dataLen() > 0
-                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
-                        : new byte[0];
-                if (event.hasBuffer()) {
-                  runtime.releaseBuffer(event.buffer());
-                }
-                return data;
-              }
-              throw new IrohException("readEntryContent failed: unexpected event " + event.kind());
+            r -> {
+              expect(r, IrohEventKind.DOC_QUERY);
+              return DocEntry.decodeList(r.data(), Integer.toUnsignedLong(r.event().flags()));
             });
   }
 
+  /** Delete this author's entries whose keys begin with the UTF-8 prefix. */
+  public CompletableFuture<Long> deleteAsync(AuthorId author, String prefix) {
+    return deleteAsync(author, prefix.getBytes(StandardCharsets.UTF_8));
+  }
+
+  /** Delete this author's entries under prefix (empty means all), returning the removed count. */
+  public CompletableFuture<Long> deleteAsync(AuthorId author, byte[] prefix) {
+    return DataPlane.docDel(runtime, docHandle, author.hex(), prefix)
+        .thenApply(
+            r -> {
+              expect(r, IrohEventKind.DOC_DEL);
+              if (r.data().length != Long.BYTES)
+                throw new IrohException("invalid deletion count payload");
+              return ByteBuffer.wrap(r.data()).order(ByteOrder.LITTLE_ENDIAN).getLong();
+            });
+  }
+
+  /** Read the value blob associated with query metadata. */
+  public CompletableFuture<byte[]> readEntryContentAsync(BlobId hash) {
+    return DataPlane.docReadEntryContent(runtime, docHandle, hash.hex())
+        .thenApply(r -> expect(r, IrohEventKind.BLOB_READ).data());
+  }
+
   /**
-   * Share this document.
-   *
-   * @param mode the share mode (0=read, 1=write)
-   * @return a future that completes with the ticket
+   * Read one local batch of content hashes, preserving input order and duplicates. Missing or
+   * initially partial blobs are empty optionals; a complete zero-byte blob is present. This never
+   * fetches or retains content. Store/integrity errors fail the whole batch. This is not a global
+   * snapshot: use blob custody when content must survive concurrent GC.
    */
+  public CompletableFuture<List<Optional<byte[]>>> readEntryContentsIfCompleteAsync(
+      List<BlobId> contentHashes) {
+    List<String> hashes = List.copyOf(contentHashes).stream().map(BlobId::hex).toList();
+    return DataPlane.docReadEntryContentsIfComplete(runtime, docHandle, hashes)
+        .thenApply(
+            r ->
+                decodeContentsBatch(
+                    expect(r, IrohEventKind.DOC_CONTENTS_BATCH).data(), hashes.size()));
+  }
+
+  static List<Optional<byte[]>> decodeContentsBatch(byte[] payload, int expectedCount) {
+    ByteBuffer input = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
+    if (input.remaining() < Integer.BYTES) throw invalidBatch();
+    long count = Integer.toUnsignedLong(input.getInt());
+    // Each slot needs at least its presence byte. Check before allocating.
+    if (count != expectedCount || count > input.remaining()) throw invalidBatch();
+    List<Optional<byte[]>> values = new ArrayList<>(expectedCount);
+    for (int i = 0; i < expectedCount; i++) {
+      if (!input.hasRemaining()) throw invalidBatch();
+      int present = Byte.toUnsignedInt(input.get());
+      if (present == 0) values.add(Optional.empty());
+      else if (present == 1) {
+        if (input.remaining() < Long.BYTES) throw invalidBatch();
+        long length = input.getLong();
+        if (Long.compareUnsigned(length, input.remaining()) > 0) throw invalidBatch();
+        byte[] bytes = new byte[(int) length];
+        input.get(bytes);
+        values.add(Optional.of(bytes));
+      } else throw invalidBatch();
+    }
+    if (input.hasRemaining()) throw invalidBatch();
+    return List.copyOf(values);
+  }
+
+  private static IrohException invalidBatch() {
+    return new IrohException("invalid Docs contents batch payload");
+  }
+
+  /** Share the namespace (0=read, 1=write). */
   public CompletableFuture<String> shareAsync(int mode) {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
+    return share(mode, false);
+  }
 
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
+  /** Share the namespace with this node's address hints (0=read, 1=write). */
+  public CompletableFuture<String> shareWithAddrAsync(int mode) {
+    return share(mode, true);
+  }
 
-    try {
-      int status = lib.docShare(runtime.nativeHandle(), docHandle, mode, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "aster_doc_share failed: " + status);
-      }
-    } catch (IrohException e) {
-      return CompletableFuture.failedFuture(e);
-    } catch (Throwable t) {
-      return CompletableFuture.failedFuture(
-          new IrohException("aster_doc_share threw: " + t.getMessage()));
-    }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime
-        .registry()
-        .register(opId)
+  private CompletableFuture<String> share(int mode, boolean withAddr) {
+    return DataPlane.docShare(runtime, docHandle, mode, withAddr)
         .thenApply(
-            event -> {
-              if (event.kind() == IrohEventKind.DOC_SHARED) {
-                byte[] data =
-                    event.dataLen() > 0
-                        ? event.data().asSlice(0, event.dataLen()).toArray(ValueLayout.JAVA_BYTE)
-                        : new byte[0];
-                if (event.hasBuffer()) {
-                  runtime.releaseBuffer(event.buffer());
-                }
-                return new String(data, StandardCharsets.UTF_8).trim();
-              }
-              throw new IrohException("share failed: unexpected event " + event.kind());
+            r -> new String(expect(r, IrohEventKind.DOC_SHARED).data(), StandardCharsets.UTF_8));
+  }
+
+  /** Start syncing without an explicit peer list. */
+  public CompletableFuture<Void> startSyncAsync() {
+    return startSyncAsync(List.of());
+  }
+
+  /** Start syncing with explicit peer endpoint identifiers (64 hex characters each). */
+  public CompletableFuture<Void> startSyncAsync(List<String> peers) {
+    List<String> copy = List.copyOf(peers);
+    if (copy.stream().anyMatch(p -> !p.matches("[0-9a-fA-F]{64}")))
+      return CompletableFuture.failedFuture(
+          new IllegalArgumentException("peer must be a 64-character hex identifier"));
+    return DataPlane.docStartSync(runtime, docHandle, copy)
+        .thenApply(
+            r -> {
+              expect(r, IrohEventKind.UNIT_RESULT);
+              return null;
             });
   }
 
-  /**
-   * Start syncing this document.
-   *
-   * @return a future that completes when sync starts
-   */
-  public CompletableFuture<Void> startSyncAsync() {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-
-    // Empty peers list
-    var peersSeg = alloc.allocate(IrohLibrary.ASTER_BYTES_LIST);
-    peersSeg.set(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
-    peersSeg.set(ValueLayout.JAVA_LONG, 8, 0L);
-
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    try {
-      int status = lib.docStartSync(runtime.nativeHandle(), docHandle, peersSeg, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(
-            IrohStatus.fromCode(status), "aster_doc_start_sync failed: " + status);
-      }
-    } catch (IrohException e) {
-      return CompletableFuture.failedFuture(e);
-    } catch (Throwable t) {
-      return CompletableFuture.failedFuture(
-          new IrohException("aster_doc_start_sync threw: " + t.getMessage()));
-    }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime.registry().register(opId).thenApply(event -> null);
-  }
-
-  /**
-   * Leave (stop syncing) this document.
-   *
-   * @return a future that completes when sync stops
-   */
+  /** Stop syncing this namespace. */
   public CompletableFuture<Void> leaveAsync() {
-    var lib = IrohLibrary.getInstance();
-    Arena confined = Arena.ofConfined();
-    var alloc = confined;
-
-    var opSeg = alloc.allocate(ValueLayout.JAVA_LONG);
-
-    try {
-      int status = lib.docLeave(runtime.nativeHandle(), docHandle, 0L, opSeg);
-      if (status != 0) {
-        throw new IrohException(IrohStatus.fromCode(status), "aster_doc_leave failed: " + status);
-      }
-    } catch (IrohException e) {
-      return CompletableFuture.failedFuture(e);
-    } catch (Throwable t) {
-      return CompletableFuture.failedFuture(
-          new IrohException("aster_doc_leave threw: " + t.getMessage()));
-    }
-
-    long opId = opSeg.get(ValueLayout.JAVA_LONG, 0);
-    return runtime.registry().register(opId).thenApply(event -> null);
-  }
-
-  // Entry format: author_hex (64 chars) + key_len (4 bytes) + key + content_hash_hex (64 chars) +
-  // content_len (8 bytes)
-  private DocEntry parseDocEntry(byte[] data) {
-    try {
-      int offset = 0;
-
-      // Read author (64 hex chars)
-      String author = new String(data, offset, 64, StandardCharsets.UTF_8).trim();
-      offset += 64;
-
-      // Read key length
-      long keyLen =
-          java.nio.ByteBuffer.wrap(data, offset, 4)
-              .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-              .getInt();
-      offset += 4;
-
-      // Read key
-      String key = new String(data, offset, (int) keyLen, StandardCharsets.UTF_8);
-      offset += keyLen;
-
-      // Read content hash (64 hex chars)
-      String contentHash = new String(data, offset, 64, StandardCharsets.UTF_8).trim();
-      offset += 64;
-
-      // Read content length
-      long contentLen =
-          java.nio.ByteBuffer.wrap(data, offset, 8)
-              .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-              .getLong();
-      offset += 8;
-
-      // Read value (content_len bytes)
-      byte[] value = new byte[(int) contentLen];
-      System.arraycopy(data, offset, value, 0, (int) contentLen);
-
-      return new DocEntry(key, AuthorId.of(author), BlobId.of(contentHash), value);
-    } catch (Exception e) {
-      throw new IrohException("Failed to parse doc entry: " + e.getMessage());
-    }
-  }
-
-  private List<DocEntry> parseDocEntryList(byte[] data) {
-    List<DocEntry> entries = new ArrayList<>();
-    if (data == null || data.length == 0) {
-      return entries;
-    }
-
-    try {
-      int offset = 0;
-      while (offset < data.length) {
-        // Check if we have enough data for the header
-        if (offset + 68 > data.length) break; // 64 (author) + 4 (key_len)
-
-        // Read author
-        String author = new String(data, offset, 64, StandardCharsets.UTF_8).trim();
-        offset += 64;
-
-        // Read key length
-        long keyLen =
-            java.nio.ByteBuffer.wrap(data, offset, 4)
-                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                .getInt();
-        offset += 4;
-
-        if (offset + keyLen + 72 > data.length) break; // key + 64 (hash) + 8 (content_len)
-
-        // Read key
-        String key = new String(data, offset, (int) keyLen, StandardCharsets.UTF_8);
-        offset += keyLen;
-
-        // Read content hash
-        String contentHash = new String(data, offset, 64, StandardCharsets.UTF_8).trim();
-        offset += 64;
-
-        // Read content length
-        long contentLen =
-            java.nio.ByteBuffer.wrap(data, offset, 8)
-                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                .getLong();
-        offset += 8;
-
-        if (offset + contentLen > data.length) break;
-
-        // Read value
-        byte[] value = new byte[(int) contentLen];
-        System.arraycopy(data, offset, value, 0, (int) contentLen);
-        offset += contentLen;
-
-        entries.add(new DocEntry(key, AuthorId.of(author), BlobId.of(contentHash), value));
-      }
-    } catch (Exception e) {
-      // Return what we have on parse error
-    }
-
-    return entries;
+    return DataPlane.docLeave(runtime, docHandle)
+        .thenApply(
+            r -> {
+              expect(r, IrohEventKind.UNIT_RESULT);
+              return null;
+            });
   }
 
   // ── ABI 3.3 data plane ──────────────────────────────────────────────────

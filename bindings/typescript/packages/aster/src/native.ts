@@ -37,7 +37,29 @@ function tryLoad(path: string): NativeAddon | null {
     // Reject it before callers try to construct a missing native handle.
     if (!addon || typeof addon.Node !== 'function'
       || typeof addon.RpcConnection !== 'function'
-      || typeof addon.DispatchServer !== 'function') return null;
+      || typeof addon.DispatchServer !== 'function'
+      || typeof addon.HttpListener !== 'function'
+      || typeof addon.DispatchServer.prototype?.startHttp !== 'function'
+      || typeof addon.DispatchServer.prototype?.startPublicHttp !== 'function'
+      || typeof addon.generateSelfSignedCertificate !== 'function'
+      || typeof addon.generateWebTransportCertificate !== 'function'
+      || typeof addon.verifyCertificateBinding !== 'function'
+      || typeof addon.BlobCustody !== 'function'
+      || typeof addon.BlobCancelToken !== 'function'
+      || typeof addon.BlobsClient?.prototype?.custody !== 'function'
+      || typeof addon.BlobsClient?.prototype?.addBytesVerified !== 'function'
+      || typeof addon.BlobsClient?.prototype?.addPathVerified !== 'function'
+      || typeof addon.coordinationCanonicalGenesis !== 'function'
+      || typeof addon.coordinationCanonicalJoinPermit !== 'function'
+      || typeof addon.coordinationGenesisSigningBytes !== 'function'
+      || typeof addon.coordinationJoinSigningBytes !== 'function'
+      || typeof addon.coordinationGenesisHash !== 'function'
+      || typeof addon.coordinationSignedDocumentFromParts !== 'function'
+      || typeof addon.coordinationCanonicalCandidateTicket !== 'function'
+      || typeof addon.coordinationVerifyGenesis !== 'function'
+      || typeof addon.coordinationVerifyJoinPermitForStart !== 'function'
+      || typeof addon.rpcTopologyPolicyVersion !== 'function'
+      || addon.rpcTopologyPolicyVersion() !== 1) return null;
     return addon as NativeAddon;
   } catch {
     return null;
@@ -85,7 +107,8 @@ export function loadNative(): NativeAddon {
   const native = tryLoadNative();
   if (!native) {
     throw new Error(
-      'Aster native addon (@aster-rpc/transport) is not available. ' +
+      'Aster native addon (@aster-rpc/transport) is not available or is incompatible ' +
+      '(HttpListener/startHttp support is required, including public listeners, TLS helpers, blob custody, coordination provisioning and topology policy version 1). ' +
       'Install it, build it with `bun run build` in bindings/typescript/native, ' +
       'or point ASTER_NATIVE_PATH at a directory containing the .node binary.',
     );

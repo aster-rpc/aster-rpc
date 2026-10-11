@@ -548,18 +548,15 @@ func (u *Upcalls) ServeRoutePolicy(f RoutePolicyFunc) error {
 
 // ─── async operations that return native handles ─────────────────────────
 
-// lateCompletionWait bounds how long a gave-up operation's completion is
-// waited for before it is dropped.
+// lateCompletionWait gives abandoned owned operations time to finish before
+// requesting native cancellation and collecting the sole terminal completion.
 const lateCompletionWait = 5 * time.Minute
 
-// startOwnedOp runs an async FFI call whose completion may carry a native
-// handle (a lease). aster_operation_cancel does not stop the native
-// operation (it emits OPERATION_CANCELLED and the operation still runs to
-// completion, creating its handle), so when ctx ends first the call is NOT
-// cancelled; its late completion is collected in the background and handed
-// to cleanup, which must release the handle it carries (a granted lease
-// would otherwise renew forever). The wait is bounded by the native
-// operation itself (for a lease acquire, the serializer upcall's timeout).
+// startOwnedOp runs an async FFI call whose completion may own a native handle.
+// When ctx ends first, a background waiter collects the completion and passes
+// it to cleanup. After lateCompletionWait it requests native cancellation, but
+// still collects a success that already committed before cancellation won.
+// cleanup must ignore cancellation/error events and release successful owners.
 func startOwnedOp(ctx context.Context, rt *Runtime, what string,
 	call func(op *C.aster_operation_t) C.int32_t, cleanup func(*Event)) (*Event, error) {
 	var op C.aster_operation_t
@@ -579,16 +576,17 @@ func startOwnedOp(ctx context.Context, rt *Runtime, what string,
 		go func() {
 			t := time.NewTimer(lateCompletionWait)
 			defer t.Stop()
+			var ev *Event
 			select {
-			case ev, ok := <-ch:
-				if ok && ev != nil {
-					if cleanup != nil {
-						cleanup(ev)
-					}
-					rt.releaseEventBuffer(ev)
-				}
+			case ev = <-ch:
 			case <-t.C:
-				_ = rt.Cancel(id) // give up: a completion after this is dropped
+				ev = rt.cancelAndCollect(id, ch)
+			}
+			if ev != nil {
+				if cleanup != nil {
+					cleanup(ev)
+				}
+				rt.releaseEventBuffer(ev)
 			}
 		}()
 		return nil, fmt.Errorf("%s: %w", what, ctx.Err())

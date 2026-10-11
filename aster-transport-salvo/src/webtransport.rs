@@ -25,20 +25,28 @@ use salvo::proto::webtransport::server::AcceptedBi;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::listener::TaskScope;
 use aster::rpc::codec::{decode_stream_header, StreamHeader};
 use aster::rpc::{CallParts, Dispatcher, OutgoingFrame, PeerProvenance, RequestFrame};
-use aster_transport_core::framing::FLAG_END_STREAM;
-use aster_transport_core::reactor::{response_channel, FRAME_CHANNEL_DEPTH};
+use aster_transport_core::framing::{FLAG_END_STREAM, MAX_CALL_HEADER_SIZE, MAX_FRAME_SIZE};
+use aster_transport_core::reactor::{
+    response_channel, CancelSignal, FrameLimit, FRAME_CHANNEL_DEPTH,
+};
 
 /// Mount the Aster WebTransport endpoint at `/aster/wt`. Nest into your app
 /// router; a browser opens a WebTransport session to this path and runs one
 /// bidi stream per RPC call.
 pub fn wt_router(dispatcher: Dispatcher) -> Router {
-    Router::with_path("aster/wt").goal(WtHandler { dispatcher })
+    wt_router_with_scope(dispatcher, TaskScope::new())
+}
+
+pub(crate) fn wt_router_with_scope(dispatcher: Dispatcher, scope: TaskScope) -> Router {
+    Router::with_path("aster/wt").goal(WtHandler { dispatcher, scope })
 }
 
 struct WtHandler {
     dispatcher: Dispatcher,
+    scope: TaskScope,
 }
 
 #[async_trait]
@@ -50,7 +58,8 @@ impl Handler for WtHandler {
         res: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
-        // TODO(auth): resolve a principal from the session; remote addr for now.
+        // Transport hint only; the dispatcher authenticates each RPC from its
+        // StreamHeader metadata before authorization or session creation.
         let peer_id = req.remote_addr().to_string();
         let session = match req.web_transport_mut().await {
             Ok(s) => s,
@@ -66,19 +75,27 @@ impl Handler for WtHandler {
                     let (send, mut recv) = stream.split();
                     let dispatcher = self.dispatcher.clone();
                     let peer = peer_id.clone();
-                    tokio::spawn(async move {
-                        // First frame = StreamHeader; set per-call priority on the
-                        // concrete send half before handing off to the generic IO.
-                        let header_payload = match read_frame(&mut recv).await {
-                            Ok(Some((payload, _flags))) => payload,
-                            _ => return,
-                        };
-                        if let Ok(header) = decode_stream_header(&header_payload) {
-                            if let Some(urgency) = urgency_from(&header) {
-                                let _ = send.set_priority(urgency_to_priority(urgency));
+                    self.scope.spawn(async move {
+                        // Observe STOP_SENDING/connection loss even before the
+                        // header arrives, and while a unary handler has no output.
+                        let stopped = send.transport_acked();
+                        let call = async move {
+                            let header_payload =
+                                match read_frame(&mut recv, MAX_CALL_HEADER_SIZE).await {
+                                    Ok(Some((payload, _flags))) => payload,
+                                    _ => return,
+                                };
+                            if let Ok(header) = decode_stream_header(&header_payload) {
+                                if let Some(urgency) = urgency_from(&header) {
+                                    let _ = send.set_priority(urgency_to_priority(urgency));
+                                }
                             }
+                            serve_call(dispatcher, peer, header_payload, send, recv).await;
+                        };
+                        tokio::select! {
+                            _ = stopped => {},
+                            () = call => {},
                         }
-                        serve_call(dispatcher, peer, header_payload, send, recv).await;
                     });
                 }
                 // A nested HTTP request over the WT session — not used by Aster.
@@ -101,37 +118,24 @@ async fn serve_call<Snd, Rcv>(
     Snd: AsyncWrite + Unpin + Send + 'static,
     Rcv: AsyncRead + Unpin + Send + 'static,
 {
-    // First request frame rides inline; the rest stream via a channel.
-    let (first_payload, first_flags) = match read_frame(&mut recv).await {
-        Ok(Some(f)) => f,
-        _ => (Vec::new(), FLAG_END_STREAM),
+    let limit = match dispatcher.frame_limit_resolver()(&header_payload) {
+        FrameLimit::Reject => return,
+        FrameLimit::Default => MAX_FRAME_SIZE,
+        FrameLimit::Limit(limit) => limit.min(MAX_FRAME_SIZE),
     };
-    // Bounded: this reads a LIVE stream, so the channel is the backpressure
-    // seam. An unbounded one let a peer that keeps sending outrun a handler
-    // that is slow to read, with no ceiling on what the process buffers.
+    let (first_payload, first_flags) = match read_frame(&mut recv, limit).await {
+        Ok(Some(f)) => f,
+        _ => return,
+    };
     let (req_tx, req_rx) = mpsc::channel::<RequestFrame>(FRAME_CHANNEL_DEPTH);
-    if first_flags & FLAG_END_STREAM == 0 {
-        tokio::spawn(async move {
-            while let Ok(Some((payload, flags))) = read_frame(&mut recv).await {
-                // `.await` here is the point: it stops reading the stream when
-                // the handler is behind, rather than queueing without limit.
-                if req_tx.send(RequestFrame { payload, flags }).await.is_err() {
-                    break;
-                }
-                if flags & FLAG_END_STREAM != 0 {
-                    break;
-                }
-            }
-        });
-    } else {
-        drop(req_tx);
-    }
-
     let (resp_tx, mut resp_rx) = response_channel();
-    // `Other`: this peer id came from the WebTransport session, not an iroh
-    // handshake, so it is a hint rather than a proof. A service that treats the
-    // peer id as authority declares `iroh_only` and dispatch refuses the call.
-    let parts = CallParts::new(
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = Arc::new(CancelSignal::new());
+    let _cancel_on_drop = CancelOnDrop {
+        cancelled: cancelled.clone(),
+        signal: signal.clone(),
+    };
+    let mut parts = CallParts::new(
         peer_id,
         PeerProvenance::Other,
         header_payload,
@@ -139,34 +143,84 @@ async fn serve_call<Snd, Rcv>(
         first_flags,
         resp_tx,
         req_rx,
-        Arc::new(AtomicBool::new(false)),
+        cancelled.clone(),
     );
-    tokio::spawn(async move { dispatcher.dispatch_parts(parts).await });
+    parts.cancel_notify = Some(signal.clone());
 
-    // Stream response frames out as the handler emits them.
-    while let Some(item) = resp_rx.recv().await {
-        let (frame, _lease) = item.into_parts();
-        if send.write_all(&raw_bytes(frame)).await.is_err() {
-            return;
+    // All three futures belong to this call; none can outlive its stream.
+    // A clean request END_STREAM half-close still allows a response.
+    let pump = async {
+        if first_flags & FLAG_END_STREAM == 0 {
+            loop {
+                match read_frame(&mut recv, limit).await {
+                    Ok(Some((payload, flags))) => {
+                        if req_tx.send(RequestFrame { payload, flags }).await.is_err() {
+                            break;
+                        }
+                        if flags & FLAG_END_STREAM != 0 {
+                            break;
+                        }
+                    }
+                    _ => {
+                        signal.cancel(&cancelled);
+                        break;
+                    }
+                }
+            }
         }
+        drop(req_tx);
+        std::future::pending::<()>().await;
+    };
+    let responses = async {
+        while let Some(item) = resp_rx.recv().await {
+            let terminal = item.is_terminal();
+            let (frame, _lease) = item.into_parts();
+            if send.write_all(&raw_bytes(frame)).await.is_err() {
+                signal.cancel(&cancelled);
+                return;
+            }
+            if terminal {
+                break;
+            }
+        }
+        let _ = send.flush().await;
+        let _ = send.shutdown().await;
+    };
+    let dispatch_and_responses = async {
+        tokio::join!(dispatcher.dispatch_parts(parts), responses);
+    };
+    tokio::select! {
+        () = dispatch_and_responses => {},
+        () = pump => unreachable!("request pump remains pending until call completion"),
     }
-    let _ = send.flush().await;
-    let _ = send.shutdown().await;
+}
+
+struct CancelOnDrop {
+    cancelled: Arc<AtomicBool>,
+    signal: Arc<CancelSignal>,
+}
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.signal.cancel(&self.cancelled);
+    }
 }
 
 /// Read one length-prefixed Aster frame. `Ok(None)` on clean EOF.
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<(Vec<u8>, u8)>> {
+async fn read_frame<R: AsyncRead + Unpin>(
+    r: &mut R,
+    limit: u32,
+) -> std::io::Result<Option<(Vec<u8>, u8)>> {
     let mut len = [0u8; 4];
-    match r.read_exact(&mut len).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    // Only EOF before any prefix byte is clean; truncated prefixes are errors.
+    if r.read(&mut len[..1]).await? == 0 {
+        return Ok(None);
     }
+    r.read_exact(&mut len[1..]).await?;
     let body_len = u32::from_le_bytes(len) as usize;
-    if body_len == 0 {
+    if body_len == 0 || body_len > limit.min(MAX_FRAME_SIZE) as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "zero-length frame",
+            "frame length is zero or exceeds the configured limit",
         ));
     }
     let mut body = vec![0u8; body_len];
@@ -192,4 +246,45 @@ fn urgency_from(h: &StreamHeader) -> Option<u8> {
 /// RFC 9218 urgency (0 = most urgent) → quinn priority (higher = more urgent).
 fn urgency_to_priority(urgency: u8) -> i32 {
     7 - urgency.min(7) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frame_limits_are_checked_before_reading_body() {
+        for (length, limit) in [
+            (0, MAX_FRAME_SIZE),
+            (MAX_FRAME_SIZE + 1, MAX_FRAME_SIZE),
+            (MAX_CALL_HEADER_SIZE + 1, MAX_CALL_HEADER_SIZE),
+            (33, 32),
+        ] {
+            let bytes = length.to_le_bytes();
+            let err = read_frame(&mut &bytes[..], limit).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+        let bytes = [3, 0, 0, 0, FLAG_END_STREAM, 7, 8];
+        assert_eq!(
+            read_frame(&mut &bytes[..], 3).await.unwrap(),
+            Some((vec![7, 8], FLAG_END_STREAM))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_empty_input_is_clean_eof() {
+        assert_eq!(
+            read_frame(&mut &[][..], MAX_FRAME_SIZE).await.unwrap(),
+            None
+        );
+        for bytes in [&[1][..], &[1, 0, 0][..], &[2, 0, 0, 0, 0][..]] {
+            assert_eq!(
+                read_frame(&mut &bytes[..], MAX_FRAME_SIZE)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
 }

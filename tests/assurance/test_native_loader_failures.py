@@ -29,7 +29,7 @@ class NativeLoaderFailures(unittest.TestCase):
         cls.preparing = True
         cls.fixtures = {}
         versions = {"major": "3 << 16", "minor": "(4 << 16) | (6 << 8)",
-                    "missing": None, "compatible": "(4 << 16) | (9 << 8)"}
+                    "missing": None, "compatible": "(4 << 16) | (16 << 8)"}
         for name, value in versions.items():
             source = "int unrelated(void) { return 0; }\n"
             if value: source += f"unsigned int aster_abi_version(void) {{ return {value}; }}\n"
@@ -101,8 +101,8 @@ class NativeLoaderFailures(unittest.TestCase):
             self.skipTest("provide ASTER_LOADER_FFI for actual Go reexport/link variants")
         probe = self.work / "go-probe"
         probe.mkdir()
-        (probe / "go.mod").write_text('module loaderprobe\ngo 1.25.0\nrequire aster-ffi v0.0.0\nreplace aster-ffi => ' + str(ROOT / "bindings/go") + '\n')
-        (probe / "main.go").write_text('package main\nimport ("fmt"; "os"; aster "aster-ffi")\nfunc main() { if err := aster.CheckABI(); err != nil { fmt.Fprintln(os.Stderr,err); os.Exit(2) }; fmt.Println("compatible ABI") }\n')
+        (probe / "go.mod").write_text('module loaderprobe\ngo 1.25.0\nrequire sdk.getaster.now/go v0.0.0\nreplace sdk.getaster.now/go => ' + str(ROOT / "bindings/go") + '\n')
+        (probe / "main.go").write_text('package main\nimport ("fmt"; "os"; aster "sdk.getaster.now/go")\nfunc main() { if err := aster.CheckABI(); err != nil { fmt.Fprintln(os.Stderr,err); os.Exit(2) }; fmt.Println("compatible ABI") }\n')
         for variant in ["major", "minor", "missing", "wrongarch", "absent"]:
             with self.subTest(variant=variant):
                 native = self.work / ("go-" + variant)
@@ -122,7 +122,7 @@ class NativeLoaderFailures(unittest.TestCase):
                 if variant in ["major", "minor"]:
                     self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
                     result = self.run_command([str(binary)])
-                    self.assert_failure(result, "binding expects 4.9 or newer")
+                    self.assert_failure(result, "binding expects 4.16 or newer")
                     self.assertIn("native library ABI " + ("3.0.0" if variant == "major" else "4.6.0"), result.stderr)
                 else:
                     self.assert_failure(build, "library 'aster_transport_ffi' not found" if variant == "absent" else "_aster_abi_version")
@@ -137,7 +137,7 @@ class NativeLoaderFailures(unittest.TestCase):
                 self.assert_failure(r, message)
 
     def test_dotnet_real_loader_variants(self):
-        expected = {"absent": "DllNotFoundException", "major": "does not match binding ABI major 4", "minor": "this binding needs 4.9+", "missing": "EntryPointNotFoundException", "wrongarch": "incompatible architecture", "compatible": "aster_runtime_new"}
+        expected = {"absent": "DllNotFoundException", "major": "does not match binding ABI major 4", "minor": "this binding needs 4.16+", "missing": "EntryPointNotFoundException", "wrongarch": "incompatible architecture", "compatible": "aster_runtime_new"}
         for variant, message in expected.items():
             with self.subTest(variant=variant):
                 self.assert_failure(self.run_command(["dotnet", str(self.dotnet_probe), str(self.fixtures[variant])]), message)

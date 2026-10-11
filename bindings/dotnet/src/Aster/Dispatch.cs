@@ -77,6 +77,7 @@ internal sealed class DispatchServer : IDisposable
 
     private readonly ulong _runtime;
     private readonly ulong _handle;
+    internal ulong NativeHandle => _handle;
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<bool>> _capacityWaiters = new();
     private int _pollThreadId = -1;
     private volatile bool _disposed;
@@ -112,6 +113,14 @@ internal sealed class DispatchServer : IDisposable
             fixed (byte* p = bytes)
                 Native.Check(Native.aster_server_add_service_json(_handle, p, (uint)bytes.Length, out idx), "aster_server_add_service_json");
             return idx;
+        }
+
+        public Builder Topology(bool enabled, Aster.Rpc.CapabilityRequirement? requirement)
+        {
+            using var scope = new NativeScope();
+            byte[] json = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(requirement is null ? null : new { kind = requirement.WireKind, roles = requirement.Roles });
+            Native.Check(Native.aster_server_set_topology(_handle, enabled ? 1u : 0u, scope.Bytes(json)), "aster_server_set_topology");
+            return this;
         }
 
         public Builder Option(DispatchServerOption key, ulong value)

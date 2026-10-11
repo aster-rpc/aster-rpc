@@ -25,6 +25,7 @@ import type {
   DispatchServer as NativeDispatchServer,
 } from '@aster-rpc/transport';
 import { loadNative } from './native.js';
+import type { CapabilityRequirement } from './service.js';
 import type { DynamicServiceSpec } from './lowering.js';
 
 export type { DispatchEvent };
@@ -89,6 +90,8 @@ export interface DispatchServerTuning {
   builtinNodeInfo?: boolean;
   /** Serve the baseline `aster.net.Topology` (default false). */
   builtinTopology?: boolean;
+  /** Rust-enforced Gate 3 policy for every topology baseline method. */
+  topologyRequires?: CapabilityRequirement;
   /** Cap on concurrently open sessions per connection (default 1024). */
   maxSessionsPerConnection?: number;
   /** Cap on any handler in ms (Rust default 300 000; 0 = none). */
@@ -166,6 +169,7 @@ export class DispatchLoop {
     const common = {
       builtinNodeInfo: opts.builtinNodeInfo ?? true,
       builtinTopology: opts.builtinTopology,
+      topologyRequiresJson: opts.topologyRequires == null ? undefined : JSON.stringify(opts.topologyRequires),
       maxSessionsPerConnection: opts.maxSessionsPerConnection,
       handlerTimeoutMs: opts.handlerTimeoutMs,
       ringCapacity: opts.ringCapacity,

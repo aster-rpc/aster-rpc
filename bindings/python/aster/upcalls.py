@@ -213,6 +213,8 @@ def _handlers(obj, role: str) -> Dict[str, Callable]:
             "admission_connect": _method(obj, "connect"),
             "admission_handshake": _overridden(obj, "handshake"),
         }
+    elif role == "rpc_authenticate":
+        table = {"rpc_authenticate": _method(obj, "authenticate")}
     else:
         raise ValueError(f"unknown upcall role {role!r}")
     return {k: v for k, v in table.items() if v is not None}

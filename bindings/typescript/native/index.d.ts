@@ -46,7 +46,27 @@ export declare class AdmissionRequests {
   close(): Promise<void>
 }
 
+export declare class BlobCancelToken {
+  constructor()
+  cancel(): void
+}
+
+export declare class BlobCustody {
+  /** Seal new admission; accepted leases keep every root protected until cleanup finishes. */
+  close(): void
+  protect(hash: string, format: string, token?: BlobCancelToken | undefined | null): Promise<undefined>
+  addBytes(data: Buffer, format: string, token?: BlobCancelToken | undefined | null): Promise<string>
+  addPath(path: string, format: string, token?: BlobCancelToken | undefined | null): Promise<string>
+  retain(hash: string, format: string, tag: string, token?: BlobCancelToken | undefined | null): Promise<undefined>
+  read(hash: string, token?: BlobCancelToken | undefined | null): Promise<Buffer>
+  /** Store-only fetch, interpreting HashSeq as a hash graph rather than a Collection. */
+  downloadHashFrom(hash: string, providers: Array<string>, format: string, strategy: string, token?: BlobCancelToken | undefined | null): Promise<FetchReport>
+}
+
 export declare class BlobsClient {
+  custody(): BlobCustody
+  addBytesVerified(data: Buffer, expectedHash: string, format: string, tag: string, token?: BlobCancelToken | undefined | null): Promise<string>
+  addPathVerified(path: string, expectedHash: string, format: string, tag: string, token?: BlobCancelToken | undefined | null): Promise<string>
   /** Add bytes to the blob store, returning the hash hex string. */
   addBytes(data: Buffer): Promise<string>
   /**
@@ -352,6 +372,10 @@ export declare class DispatchServer {
    * `serve`). `close()` shuts the node down too.
    */
   static start(config: AsterConfig | undefined | null, servicesJson: string[], options?: DispatchServerOptions | undefined | null, onEvents?: ((events: DispatchEvent[]) => void) | undefined | null): Promise<DispatchServer>
+  /** Bind a listener with bounded, fail-closed per-RPC foreign authentication. */
+  startHttp(options: HttpListenerOptions, upcalls: Upcalls): Promise<HttpListener>
+  /** Bind an explicit anonymous listener. Session services are disabled by the dispatcher. */
+  startPublicHttp(options: HttpListenerOptions): Promise<HttpListener>
   /** This server's `aster1…` ticket (`start` only; `""` for `serve`). */
   get address(): string
   /** Number of live calls in the call table (0 once every call ended). */
@@ -805,6 +829,15 @@ export declare class HttpBodyHandle {
    * a truncated one.
    */
   abort(message?: string | undefined | null): void
+}
+
+/** An owned HTTPS / optional WebTransport listener. Await close for socket release. */
+export declare class HttpListener {
+  get tcpAddr(): string
+  get quicAddr(): string | null
+  /** Grace bounds application drain; QUIC protocol/socket drain may take longer. */
+  stop(graceMs?: number | undefined | null): Promise<void>
+  close(): Promise<void>
 }
 
 /**
@@ -1902,6 +1935,12 @@ export interface CoordinationAuditRecord {
   valueRevision: number
 }
 
+export declare function coordinationCanonicalCandidateTicket(node: Buffer): string
+
+export declare function coordinationCanonicalGenesis(json: string): Buffer
+
+export declare function coordinationCanonicalJoinPermit(json: string): Buffer
+
 /**
  * Open the durable, journaled client bound to `node`'s identity and `group`.
  * Takes the per-actor/group journal lifetime lock until `close()`.
@@ -1940,6 +1979,10 @@ export interface CoordinationFence {
   holder: string
 }
 
+export declare function coordinationGenesisHash(document: Buffer): Buffer
+
+export declare function coordinationGenesisSigningBytes(document: Buffer): Buffer
+
 /**
  * The `group_status` cut (S4-STATUS-CUT). Advisory fields describe the
  * answering node; replicated fields are the group's.
@@ -1969,6 +2012,8 @@ export interface CoordinationGroupStatus {
   authorityDomain: string
   recoveredFrom?: CoordinationRecoveredFrom
 }
+
+export declare function coordinationJoinSigningBytes(document: Buffer): Buffer
 
 /** A Raft log id (`term`, leader, `index`). */
 export interface CoordinationLogId {
@@ -2165,6 +2210,12 @@ export interface CoordinationSeparationSummary {
   diversityProved: boolean
 }
 
+export declare function coordinationSignedDocumentFromParts(document: Buffer, key: Buffer, signature: Buffer): Buffer
+
+export declare function coordinationVerifyGenesis(key: Buffer, domain: string, envelope: Buffer): string
+
+export declare function coordinationVerifyJoinPermitForStart(key: Buffer, domain: string, candidate: Buffer, envelope: Buffer): string
+
 /** Decode AEv1 bytes to a `CallHeader`. Throws on any malformed input. */
 export declare function decodeCallHeader(data: Uint8Array): NativeCallHeader
 
@@ -2290,6 +2341,8 @@ export interface DispatchServerOptions {
   builtinNodeInfo?: boolean
   /** Serve the baseline `aster.net.Topology` service (default false). */
   builtinTopology?: boolean
+  /** Optional native CapabilityRequirement JSON for every topology baseline method. */
+  topologyRequiresJson?: string
   /** Cap on concurrently open sessions per connection (default 1024). */
   maxSessionsPerConnection?: number
   /**
@@ -2530,6 +2583,16 @@ export interface GatePolicyOptions {
   rejectReason?: string
 }
 
+export interface GeneratedCertificate {
+  certificatePem: Buffer
+  privateKeyPem: Buffer
+  sha256: Buffer
+}
+
+export declare function generateSelfSignedCertificate(sans: Array<string>, nodeSecret?: Buffer | undefined | null): GeneratedCertificate
+
+export declare function generateWebTransportCertificate(subject: string, sans: Array<string>, nodeSecret?: Buffer | undefined | null): GeneratedCertificate
+
 /** An event on a gossip topic. */
 export interface GossipEvent {
   kind: 'received' | 'neighbor_up' | 'neighbor_down' | 'lagged'
@@ -2653,6 +2716,16 @@ export declare function hpkeX25519PublicFromNodeId(nodeId: string): Buffer
  * `crypto_sign_ed25519_sk_to_curve25519`.
  */
 export declare function hpkeX25519SecretFromIdentity(secret: string | Uint8Array): Buffer
+
+/** Authenticated PEM listener options. Authentication is required for every RPC. */
+export interface HttpListenerOptions {
+  bindAddr?: string
+  certificatePem: Buffer
+  privateKeyPem: Buffer
+  webTransport?: boolean
+  maxPendingAuth?: number
+  maxAuthPayloadBytes?: number
+}
 
 /** The head of a streamed response and its body reader. */
 export interface HttpRelayHead {
@@ -3172,6 +3245,12 @@ export interface RetireOutcome {
 /** The prefix of a failed call's error message (JSON status follows). */
 export declare function rpcErrorPrefix(): string
 
+/**
+ * Version of the native topology baseline policy option. Host loaders require this before
+ * forwarding role policies, so older addons cannot silently ignore a security-sensitive option.
+ */
+export declare function rpcTopologyPolicyVersion(): number
+
 /** One Rust log record, as the sink receives it. */
 export interface RustLogRecord {
   /** 1 error, 2 warn, 3 info, 4 debug, 5 trace. */
@@ -3350,13 +3429,13 @@ export interface UpcallAdmissionHandshakeResponse {
  * `conformance/vectors/upcalls.json`, e.g. `"LeaseTransitionRequest"`).
  * Throws on any non-canonical input.
  */
-export declare function upcallCodecDecode(typeName: string, bytes: Buffer): UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse
+export declare function upcallCodecDecode(typeName: string, bytes: Buffer): UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse | UpcallRpcAuthRequest | UpcallRpcAuthResponse
 
 /**
  * Encode `value` as the UCv1 message of type `typeName` (the inverse of
  * `upcallCodecDecode`).
  */
-export declare function upcallCodecEncode(typeName: string, value: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse): Buffer
+export declare function upcallCodecEncode(typeName: string, value: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse | UpcallRpcAuthRequest | UpcallRpcAuthResponse): Buffer
 
 /** A yes/no answer (kinds 3, 48, 64). */
 export interface UpcallDecision {
@@ -3378,7 +3457,7 @@ export interface UpcallEventJs {
   /** When Rust stops waiting (Unix ms; 0 on a cancellation). */
   deadlineUnixMs: number
   cancelReason?: number
-  request?: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse
+  request?: UpcallLeaseTransitionRequest | TransitionOutcome | UpcallLeaseSnapshotRequest | LeaseSnapshot | UpcallLeaseAuthorizeRequest | UpcallFencedMutateRequest | UpcallFencedMutateResponse | UpcallDecision | UpcallTopologyAdmittedRequest | UpcallTopologyAdmittedResponse | UpcallEmpty | UpcallTopologyView | CoordinationPlacementPolicy | UpcallPlacementProvisionRequest | CoordinationMemberSeed | UpcallExposeAuthorizeRequest | UpcallExposeHttpRequest | UpcallExposeHttpResponse | Array<ExposeHeader> | UpcallExposeRoutePolicyRequest | UpcallExposeRouteGrant | UpcallAdmissionConnectRequest | UpcallAdmissionHandshakeRequest | UpcallAdmissionHandshakeResponse | UpcallRpcAuthRequest | UpcallRpcAuthResponse
   /** Set when the request could not be decoded (answer it with an error). */
   error?: string
 }
@@ -3499,6 +3578,22 @@ export interface UpcallPolicyJs {
   failureMode: 'fail_open' | 'fail_closed'
 }
 
+/** Per-call RPC authentication context (kind 80). */
+export interface UpcallRpcAuthRequest {
+  peerId: string
+  service: string
+  method: string
+  sessionId: number
+  metadata: Record<string, string>
+}
+
+/** Authentication must explicitly accept a nonempty principal; otherwise reject. */
+export interface UpcallRpcAuthResponse {
+  accepted: boolean
+  principal?: string
+  attributes?: Record<string, string>
+}
+
 /** Options for `new Upcalls(onEvents, options)`. */
 export interface UpcallsOptions {
   /**
@@ -3556,6 +3651,8 @@ export interface VerifiedChain {
   /** Number of edges. */
   depth: number
 }
+
+export declare function verifyCertificateBinding(certificatePem: Buffer, expectedNodeId: string): void
 
 /** Exact version embedded by the shared Rust core build. */
 export declare function version(): string

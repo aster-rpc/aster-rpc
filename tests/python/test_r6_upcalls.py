@@ -221,6 +221,10 @@ def _render(ty: str, v):
         if v is True:
             return {"accept": True, "code": 0, "reason": ""}
         return {"accept": False, "code": v[0], "reason": v[1].decode()}
+    if ty == "RpcAuthRequest":
+        return dict(zip(("peer_id", "service", "method", "session_id", "metadata"), v))
+    if ty == "RpcAuthResponse":
+        return {"accepted": False} if v is None else {"accepted": True, "principal": v[0], "attributes": v[1]}
     if ty == "PlacementPolicy":
         return {
             "revision": v.revision,

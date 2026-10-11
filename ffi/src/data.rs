@@ -253,7 +253,7 @@ pub(crate) unsafe fn in_node_list(l: &aster_bytes_list_t, what: &str) -> Result<
         .collect()
 }
 
-fn blob_format(v: u32) -> Result<BlobFormat, i32> {
+pub(crate) fn blob_format(v: u32) -> Result<BlobFormat, i32> {
     match v {
         0 => Ok(BlobFormat::Raw),
         1 => Ok(BlobFormat::HashSeq),
@@ -261,7 +261,7 @@ fn blob_format(v: u32) -> Result<BlobFormat, i32> {
     }
 }
 
-fn fetch_strategy(v: u32) -> Result<FetchStrategy, i32> {
+pub(crate) fn fetch_strategy(v: u32) -> Result<FetchStrategy, i32> {
     match v {
         0 => Ok(FetchStrategy::Whole),
         1 => Ok(FetchStrategy::SplitChildren),
@@ -269,7 +269,7 @@ fn fetch_strategy(v: u32) -> Result<FetchStrategy, i32> {
     }
 }
 
-fn fetch_flags(v: u32) -> Result<bool, i32> {
+pub(crate) fn fetch_flags(v: u32) -> Result<bool, i32> {
     if v & !ASTER_FETCH_TO_STORE != 0 {
         return Err(invalid(format!("unknown fetch flags {v:#x}")));
     }
@@ -1042,6 +1042,93 @@ pub unsafe extern "C" fn aster_doc_entry_content_status(
                 .data(size.to_le_bytes().to_vec()),
         )
     })
+}
+
+/// Read ordered content hashes through one local blob-store batch. No network
+/// fetch, document-membership check, tags, or retention mutation is performed.
+/// Missing/partial content returns an absent slot; present empty bytes remain
+/// distinct. Duplicates and input order are preserved. This is not an atomic
+/// snapshot: GC or I/O failure during a large validated export fails the batch.
+/// Use temporary blob custody when content must remain protected across reads.
+///
+/// Emits ASTER_EVENT_DOC_CONTENTS_BATCH (handle=doc, flags=0). Payload: u32 LE
+/// count, then one u8 presence per slot. 0 has no following bytes; 1 is followed
+/// by u64 LE byte length and that many bytes. No padding or trailing bytes.
+/// Empty input emits four zero bytes. Release the event buffer normally.
+/// All hashes must be 64 ASCII hex characters; invalid input is rejected before
+/// operation admission. The list count must fit u32.
+/// # Safety
+/// Nonempty input lists and spans must be readable/aligned for this call;
+/// out_operation must be writable. Input is copied before this function returns.
+#[no_mangle]
+pub unsafe extern "C" fn aster_doc_read_entry_contents_if_complete(
+    runtime: aster_runtime_t,
+    doc: u64,
+    content_hashes: aster_bytes_list_t,
+    user_data: u64,
+    out_operation: *mut aster_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return invalid("batch read: out_operation is NULL");
+    }
+    *out_operation = 0;
+    if content_hashes.len > u32::MAX as usize
+        || content_hashes.len > isize::MAX as usize / std::mem::size_of::<aster_bytes_t>()
+    {
+        return invalid("batch read: too many hashes");
+    }
+    let items = if content_hashes.len == 0 {
+        &[][..]
+    } else {
+        if content_hashes.items.is_null() {
+            return invalid("batch read: NULL hash list");
+        }
+        slice::from_raw_parts(content_hashes.items, content_hashes.len)
+    };
+    let mut hashes = Vec::with_capacity(items.len());
+    for item in items {
+        hashes.push(try_status!(in_hex32(item, "content hash")));
+    }
+    let bridge = try_status!(bridge_for(runtime));
+    let Some(d) = bridge.docs.get(doc) else {
+        return not_found(format!("unknown doc handle {doc}"));
+    };
+    spawn_op(&bridge, user_data, out_operation, async move {
+        let values = d
+            .read_entry_contents_if_complete(hashes)
+            .await
+            .map_err(err)?;
+        Ok(
+            Done::ok(aster_event_kind_t::ASTER_EVENT_DOC_CONTENTS_BATCH, doc)
+                .data(encode_doc_contents_batch(values)?),
+        )
+    })
+}
+
+fn encode_doc_contents_batch(values: Vec<Option<Vec<u8>>>) -> Result<Vec<u8>, String> {
+    let count = u32::try_from(values.len()).map_err(err)?;
+    let mut size = 4usize;
+    for value in &values {
+        let slot = match value {
+            None => 1,
+            Some(bytes) => bytes.len().checked_add(9).ok_or("batch payload overflow")?,
+        };
+        size = size.checked_add(slot).ok_or("batch payload overflow")?;
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(size).map_err(err)?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        match value {
+            None => out.push(0),
+            Some(bytes) => {
+                out.push(1);
+                out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ── Net: paths ──────────────────────────────────────────────────────────────

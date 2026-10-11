@@ -23,6 +23,7 @@
 //! map) are lists in strictly ascending byte order; a decoder refuses any
 //! other order or a duplicate.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Result};
@@ -60,6 +61,8 @@ pub mod tag {
     pub const EXPOSE_HTTP_TRAILERS: u8 = 0xC6;
     pub const EXPOSE_ROUTE_POLICY_REQUEST: u8 = 0xC7;
     pub const EXPOSE_ROUTE_GRANT: u8 = 0xC8;
+    pub const RPC_AUTH_REQUEST: u8 = 0xC9;
+    pub const RPC_AUTH_RESPONSE: u8 = 0xCA;
     pub const DECISION: u8 = 0xCF;
 }
 
@@ -541,6 +544,176 @@ pub fn decode_decision(buf: &[u8]) -> Result<bool> {
     let v = r.bool()?;
     r.end()?;
     Ok(v)
+}
+
+// ── RPC authentication ─────────────────────────────────────────────────────
+
+/// Per-call RPC authentication context. The transport peer is a hint unless its
+/// transport independently authenticated it; the response resolves the principal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpcAuthRequest {
+    pub peer_id: String,
+    pub service: String,
+    pub method: String,
+    pub session_id: i32,
+    pub metadata: HashMap<String, String>,
+}
+
+/// An explicit authentication result. An accepted principal must not be empty.
+/// Attributes apply to this call only and do not update the enrollment store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RpcAuthResponse {
+    Rejected,
+    Authenticated {
+        principal: String,
+        attributes: HashMap<String, String>,
+    },
+}
+
+fn put_auth_map(w: &mut W, values: &HashMap<String, String>) {
+    let mut entries: Vec<_> = values.iter().collect();
+    entries.sort_unstable_by_key(|(a, _)| *a);
+    w.list(entries.len());
+    for (key, value) in entries {
+        w.str(key).str(value);
+    }
+}
+
+fn get_auth_map(r: &mut R<'_>) -> Result<HashMap<String, String>> {
+    let count = r.list()?;
+    let mut values = HashMap::new();
+    let mut previous: Option<String> = None;
+    for _ in 0..count {
+        let key = r.str()?;
+        ensure!(
+            previous.as_ref().is_none_or(|prev| prev < &key),
+            "UCv1: authentication map keys not strictly ascending"
+        );
+        let value = r.str()?;
+        previous = Some(key.clone());
+        values.insert(key, value);
+    }
+    Ok(values)
+}
+
+#[cfg(feature = "rpc")]
+fn varint_size(mut value: u64) -> usize {
+    let mut size = 1;
+    while value >= 128 {
+        value >>= 7;
+        size += 1;
+    }
+    size
+}
+
+#[cfg(feature = "rpc")]
+fn auth_string_size(value: &str) -> Option<usize> {
+    let header = u64::try_from(value.len())
+        .ok()?
+        .checked_mul(4)?
+        .checked_add(2)?;
+    value.len().checked_add(varint_size(header))
+}
+
+/// Exact request size without allocating or encoding. The adapter checks it
+/// after acquiring capacity, before cloning/sorting any untrusted metadata.
+#[cfg(feature = "rpc")]
+pub(crate) fn rpc_auth_request_size(
+    peer_id: &str,
+    service: &str,
+    method: &str,
+    session_id: i32,
+    metadata: &HashMap<String, String>,
+) -> Option<usize> {
+    let zigzag = ((session_id << 1) ^ (session_id >> 31)) as u32;
+    let mut size = 2usize.checked_add(varint_size(zigzag as u64))?;
+    for value in [peer_id, service, method] {
+        size = size.checked_add(auth_string_size(value)?)?;
+    }
+    size = size.checked_add(varint_size(metadata.len() as u64) + 1)?;
+    for (key, value) in metadata {
+        size = size.checked_add(auth_string_size(key)?)?;
+        size = size.checked_add(auth_string_size(value)?)?;
+    }
+    Some(size)
+}
+
+/// `peer_id:string service:string method:string session_id:zigzag-i32
+/// metadata:list<(string,string)>`. Map keys are sorted by UTF-8 bytes.
+pub fn encode_rpc_auth_request(
+    peer_id: &str,
+    service: &str,
+    method: &str,
+    session_id: i32,
+    metadata: &HashMap<String, String>,
+) -> Vec<u8> {
+    let mut w = W::new(tag::RPC_AUTH_REQUEST);
+    w.str(peer_id).str(service).str(method);
+    c::write_zigzag_i32(&mut w.0, session_id);
+    put_auth_map(&mut w, metadata);
+    w.done()
+}
+
+pub fn decode_rpc_auth_request(buf: &[u8]) -> Result<RpcAuthRequest> {
+    let mut r = R::new(buf, tag::RPC_AUTH_REQUEST)?;
+    let peer_id = r.str()?;
+    let service = r.str()?;
+    let method = r.str()?;
+    // Check minimal encoding and range before applying canonical zigzag.
+    let start = r.pos;
+    r.uint_max(u32::MAX as u64, "authentication session id")?;
+    r.pos = start;
+    let session_id = c::read_zigzag_i32(r.buf, &mut r.pos)?;
+    let metadata = get_auth_map(&mut r)?;
+    r.end()?;
+    Ok(RpcAuthRequest {
+        peer_id,
+        service,
+        method,
+        session_id,
+        metadata,
+    })
+}
+
+/// `accepted:bool`; only when true, `principal:string attributes:list<(string,string)>`.
+pub fn encode_rpc_auth_response(value: &RpcAuthResponse) -> Result<Vec<u8>> {
+    let mut w = W::new(tag::RPC_AUTH_RESPONSE);
+    match value {
+        RpcAuthResponse::Rejected => {
+            w.bool(false);
+        }
+        RpcAuthResponse::Authenticated {
+            principal,
+            attributes,
+        } => {
+            ensure!(
+                !principal.is_empty(),
+                "UCv1: empty authentication principal"
+            );
+            w.bool(true).str(principal);
+            put_auth_map(&mut w, attributes);
+        }
+    }
+    Ok(w.done())
+}
+
+pub fn decode_rpc_auth_response(buf: &[u8]) -> Result<RpcAuthResponse> {
+    let mut r = R::new(buf, tag::RPC_AUTH_RESPONSE)?;
+    let value = if r.bool()? {
+        let principal = r.str()?;
+        ensure!(
+            !principal.is_empty(),
+            "UCv1: empty authentication principal"
+        );
+        RpcAuthResponse::Authenticated {
+            principal,
+            attributes: get_auth_map(&mut r)?,
+        }
+    } else {
+        RpcAuthResponse::Rejected
+    };
+    r.end()?;
+    Ok(value)
 }
 
 // ── topology ───────────────────────────────────────────────────────────────

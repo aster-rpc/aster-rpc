@@ -18,7 +18,8 @@ public enum UpcallKind {
   EXPOSE_HTTP(49, false),
   EXPOSE_ROUTE_POLICY(50, true),
   ADMISSION_CONNECT(64, true),
-  ADMISSION_HANDSHAKE(65, true);
+  ADMISSION_HANDSHAKE(65, true),
+  RPC_AUTHENTICATE(80, false);
 
   public final int code;
   public final boolean decision;

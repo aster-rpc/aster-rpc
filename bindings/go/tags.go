@@ -149,7 +149,7 @@ func (t *Tags) ListPrefix(ctx context.Context, prefix string) ([]TagEntry, error
 	r := C.aster_tags_list_prefix(
 		C.uint64_t(t.runtime.handle),
 		C.uint64_t(t.node.handle),
-		(*C.uint8_t)(unsafe.Pointer(&prefixBytes[0])),
+		(*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(prefixBytes))),
 		C.uintptr_t(len(prefixBytes)),
 		0,
 		&opID,
@@ -162,6 +162,7 @@ func (t *Tags) ListPrefix(ctx context.Context, prefix string) ([]TagEntry, error
 	if err != nil {
 		return nil, fmt.Errorf("list prefix poll: %w", err)
 	}
+	defer t.runtime.releaseEventBuffer(ev)
 	if ev.Kind != ASTER_EVENT_TAG_LIST {
 		return nil, fmt.Errorf("list prefix: unexpected event %d", ev.Kind)
 	}

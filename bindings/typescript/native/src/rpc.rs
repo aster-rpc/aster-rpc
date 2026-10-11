@@ -43,8 +43,8 @@ use aster::binding_support::dispatch::{
     DispatchSendError, DispatchSink, RingConsumer, RingNotifier, RingSink, SubmitError,
 };
 use aster::rpc::{
-    AsterServer, AttributeStore, AuthContext, AuthOutcome, Authenticator, DynamicService,
-    RpcStatus, Server, ServerHandle,
+    AsterServer, AttributeStore, AuthContext, AuthOutcome, Authenticator, CapabilityRequirement,
+    Dispatcher, DynamicService, RpcStatus, Server, ServerHandle,
 };
 use aster_transport_core::CoreConnection;
 
@@ -52,6 +52,13 @@ use crate::admission::GatePolicy;
 use crate::config::{aster_err, JsAsterConfig};
 use crate::net::{IrohConnection, TransportSnapshot};
 use crate::node::Node;
+
+/// Version of the native topology baseline policy option. Host loaders require this before
+/// forwarding role policies, so older addons cannot silently ignore a security-sensitive option.
+#[napi]
+pub fn rpc_topology_policy_version() -> u32 {
+    1
+}
 
 // ── events ──────────────────────────────────────────────────────────────────
 
@@ -778,6 +785,8 @@ pub struct DispatchServerOptions {
     pub builtin_node_info: Option<bool>,
     /// Serve the baseline `aster.net.Topology` service (default false).
     pub builtin_topology: Option<bool>,
+    /// Optional native CapabilityRequirement JSON for every topology baseline method.
+    pub topology_requires_json: Option<String>,
     /// Cap on concurrently open sessions per connection (default 1024).
     pub max_sessions_per_connection: Option<u32>,
     /// Cap on any handler, ms (default 300 000; 0 = no cap). A call's
@@ -806,6 +815,9 @@ enum Running {
 /// `-3` too large; `-4` invalid (empty stream payload, second reservation).
 #[napi]
 pub struct DispatchServer {
+    runtime: tokio::runtime::Handle,
+    dispatcher: Dispatcher,
+    http_children: Arc<Mutex<Vec<HttpOwner>>>,
     running: Arc<tokio::sync::Mutex<Option<Running>>>,
     table: CallTable,
     attributes: AttributeStore,
@@ -813,6 +825,94 @@ pub struct DispatchServer {
     shared: Arc<Shared>,
     tsfn_sink: Option<Arc<TsfnSink>>,
     ring: Option<Arc<Ring>>,
+}
+
+type HttpOwner = Arc<tokio::sync::Mutex<Option<aster_transport_salvo::OwnedListener>>>;
+
+/// Authenticated PEM listener options. Authentication is required for every RPC.
+#[napi(object)]
+pub struct HttpListenerOptions {
+    pub bind_addr: Option<String>,
+    pub certificate_pem: Buffer,
+    pub private_key_pem: Buffer,
+    pub web_transport: Option<bool>,
+    pub max_pending_auth: Option<u32>,
+    pub max_auth_payload_bytes: Option<u32>,
+}
+
+/// An owned HTTPS / optional WebTransport listener. Await close for socket release.
+#[napi]
+pub struct HttpListener {
+    inner: HttpOwner,
+    tcp: String,
+    quic: Option<String>,
+    runtime: tokio::runtime::Handle,
+}
+
+async fn stop_http_listener(inner: &HttpOwner, grace: Duration) -> Result<()> {
+    let mut owner = inner.lock().await;
+    if let Some(listener) = owner.as_mut() {
+        listener.stop(grace).await.map_err(Error::from_reason)?;
+        owner.take();
+    }
+    Ok(())
+}
+
+#[napi]
+impl HttpListener {
+    #[napi(getter)]
+    pub fn tcp_addr(&self) -> String {
+        self.tcp.clone()
+    }
+    #[napi(getter)]
+    pub fn quic_addr(&self) -> Option<String> {
+        self.quic.clone()
+    }
+
+    /// Grace bounds application drain; QUIC protocol/socket drain may take longer.
+    #[napi]
+    pub async fn stop(&self, grace_ms: Option<f64>) -> Result<()> {
+        let ms = grace_ms.unwrap_or(0.0);
+        if !ms.is_finite() || !(0.0..=u32::MAX as f64).contains(&ms) {
+            return Err(Error::from_reason(
+                "graceMs must be finite and between 0 and 4294967295",
+            ));
+        }
+        stop_http_listener(&self.inner, Duration::from_secs_f64(ms / 1000.0)).await
+    }
+
+    #[napi]
+    pub async fn close(&self) -> Result<()> {
+        stop_http_listener(&self.inner, Duration::ZERO).await
+    }
+}
+
+impl Drop for HttpListener {
+    fn drop(&mut self) {
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            let _ = stop_http_listener(&inner, Duration::ZERO).await;
+        });
+    }
+}
+
+impl Drop for DispatchServer {
+    fn drop(&mut self) {
+        let children = self.http_children.clone();
+        let running = self.running.clone();
+        self.runtime.spawn(async move {
+            let mut running = running.lock().await;
+            let children = std::mem::take(&mut *children.lock().unwrap());
+            for child in children {
+                let _ = stop_http_listener(&child, Duration::ZERO).await;
+            }
+            match running.take() {
+                Some(Running::Own(server)) => server.shutdown().await,
+                Some(Running::Attached(handle)) => handle.abort(),
+                None => {}
+            }
+        });
+    }
 }
 
 fn submit_code(r: std::result::Result<(), SubmitError>) -> i64 {
@@ -963,6 +1063,7 @@ impl Sinks {
     fn finish(
         self,
         running: Running,
+        dispatcher: Dispatcher,
         table: CallTable,
         attributes: AttributeStore,
         address: String,
@@ -975,6 +1076,9 @@ impl Sinks {
             s.notify();
         }
         DispatchServer {
+            runtime: tokio::runtime::Handle::current(),
+            dispatcher,
+            http_children: Arc::new(Mutex::new(Vec::new())),
             running: Arc::new(tokio::sync::Mutex::new(Some(running))),
             table,
             attributes,
@@ -1042,7 +1146,16 @@ impl DispatchServer {
         let sinks = Sinks::new(&options, on_events)?;
         let node_info = options.builtin_node_info.unwrap_or(true);
         let topology = options.builtin_topology.unwrap_or(false);
+        let topology_requires = options
+            .topology_requires_json
+            .as_deref()
+            .map(serde_json::from_str::<CapabilityRequirement>)
+            .transpose()
+            .map_err(|e| Error::from_reason(format!("invalid topology requirement: {e}")))?;
         let max_sessions = options.max_sessions_per_connection;
+        if topology && !node.topology().has_monitoring() {
+            return Err(Error::from_reason("builtinTopology requires monitoring"));
+        }
 
         env.spawn_future(async move {
             let (sink, ring) = sinks.sink();
@@ -1065,17 +1178,19 @@ impl DispatchServer {
                     .0;
             }
             if topology {
-                server = server.with_builtin_topology(&node, None);
+                server = server.with_builtin_topology(&node, topology_requires);
             }
             for svc in services {
                 server = server.dynamic_service(svc).map_err(aster_err)?;
             }
+            let dispatcher = server.dispatcher();
             let table = server.call_table();
             let handle = server.serve();
             #[cfg(feature = "test-hooks")]
             attach_gate(table.clone()).await;
             Ok(sinks.finish(
                 Running::Attached(handle),
+                dispatcher,
                 table,
                 attributes,
                 String::new(),
@@ -1104,6 +1219,12 @@ impl DispatchServer {
         let sinks = Sinks::new(&options, on_events)?;
         let node_info = options.builtin_node_info.unwrap_or(true);
         let topology = options.builtin_topology.unwrap_or(false);
+        let topology_requires = options
+            .topology_requires_json
+            .as_deref()
+            .map(serde_json::from_str::<CapabilityRequirement>)
+            .transpose()
+            .map_err(|e| Error::from_reason(format!("invalid topology requirement: {e}")))?;
         let max_sessions = options.max_sessions_per_connection;
 
         env.spawn_future(async move {
@@ -1115,6 +1236,9 @@ impl DispatchServer {
                 .builtin_node_info(node_info)
                 .builtin_topology(topology)
                 .dispatch_sink(sink);
+            if let Some(requirement) = topology_requires {
+                builder = builder.topology_requires(requirement);
+            }
             if let Some(max) = max_sessions {
                 builder = builder.max_sessions_per_connection(max.max(1) as usize);
             }
@@ -1125,6 +1249,7 @@ impl DispatchServer {
                 builder = builder.dynamic_service(svc).map_err(aster_err)?;
             }
             let server = builder.start().await.map_err(aster_err)?;
+            let dispatcher = server.dispatcher();
             let table = server.call_table();
             // A ticket without direct addresses is undialable offline; they
             // appear shortly after bind.
@@ -1137,11 +1262,127 @@ impl DispatchServer {
             let address = server.address().map_err(aster_err)?;
             Ok(sinks.finish(
                 Running::Own(Box::new(server)),
+                dispatcher,
                 table,
                 attributes,
                 address,
                 ring,
             ))
+        })
+    }
+
+    /// Bind a listener with bounded, fail-closed per-RPC foreign authentication.
+    #[napi]
+    pub fn start_http<'env>(
+        &self,
+        env: &'env Env,
+        options: HttpListenerOptions,
+        upcalls: &crate::upcalls::Upcalls,
+    ) -> Result<PromiseRaw<'env, HttpListener>> {
+        use aster::binding_support::upcall::auth::{
+            ForeignAuthenticator, ForeignAuthenticatorOptions,
+        };
+        let upcalls = upcalls.table();
+        if upcalls.is_closed() {
+            return Err(Error::from_reason("authentication table is closed"));
+        }
+        let defaults = ForeignAuthenticatorOptions::default();
+        let auth = ForeignAuthenticator::with_options(
+            upcalls,
+            ForeignAuthenticatorOptions {
+                max_pending: options
+                    .max_pending_auth
+                    .filter(|n| *n != 0)
+                    .map_or(defaults.max_pending, |n| n as usize),
+                max_payload_bytes: options
+                    .max_auth_payload_bytes
+                    .filter(|n| *n != 0)
+                    .map_or(defaults.max_payload_bytes, |n| n as usize),
+            },
+        )
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+        let config = aster_transport_salvo::HttpConfig::new(
+            options.bind_addr.unwrap_or_else(|| "127.0.0.1:0".into()),
+            aster_transport_salvo::TlsMaterial::pem(
+                options.certificate_pem.to_vec(),
+                options.private_key_pem.to_vec(),
+            ),
+        )
+        .webtransport(options.web_transport.unwrap_or(false));
+        let dispatcher = self.dispatcher.clone();
+        let running = self.running.clone();
+        // Capture a registry independently of the borrowed NAPI receiver.
+        let children = self.http_children.clone();
+        env.spawn_future(async move {
+            let guard = running.lock().await;
+            if guard.is_none() {
+                return Err(Error::from_reason("server is closed"));
+            }
+            let listener = config
+                .start_authenticated(dispatcher, Arc::new(auth))
+                .await
+                .map_err(Error::from_reason)?;
+            let tcp = listener.tcp_addr().to_string();
+            let quic = listener.quic_addr().map(|a| a.to_string());
+            let inner = Arc::new(tokio::sync::Mutex::new(Some(listener)));
+            let mut children = children.lock().unwrap();
+            children.retain(|c| c.try_lock().map_or(true, |v| v.is_some()));
+            children.push(inner.clone());
+            Ok(HttpListener {
+                inner,
+                tcp,
+                quic,
+                runtime: tokio::runtime::Handle::current(),
+            })
+        })
+    }
+
+    /// Bind an explicit anonymous listener. Session services are disabled by the dispatcher.
+    #[napi]
+    pub fn start_public_http<'env>(
+        &self,
+        env: &'env Env,
+        options: HttpListenerOptions,
+    ) -> Result<PromiseRaw<'env, HttpListener>> {
+        if options.max_pending_auth.unwrap_or(0) != 0
+            || options.max_auth_payload_bytes.unwrap_or(0) != 0
+        {
+            return Err(Error::from_reason(
+                "public listeners do not accept authentication limits",
+            ));
+        }
+        let config = aster_transport_salvo::HttpConfig::new(
+            options.bind_addr.unwrap_or_else(|| "127.0.0.1:0".into()),
+            aster_transport_salvo::TlsMaterial::pem(
+                options.certificate_pem.to_vec(),
+                options.private_key_pem.to_vec(),
+            ),
+        )
+        .webtransport(options.web_transport.unwrap_or(false));
+        let dispatcher = self.dispatcher.clone();
+        let running = self.running.clone();
+        let children = self.http_children.clone();
+        env.spawn_future(async move {
+            let guard = running.lock().await;
+            if guard.is_none() {
+                return Err(Error::from_reason("server is closed"));
+            }
+            let listener = config
+                .start_public(dispatcher)
+                .await
+                .map_err(Error::from_reason)?;
+            let tcp = listener.tcp_addr().to_string();
+            let quic = listener.quic_addr().map(|a| a.to_string());
+            let inner = Arc::new(tokio::sync::Mutex::new(Some(listener)));
+            let mut children = children.lock().unwrap();
+            children.retain(|c| c.try_lock().map_or(true, |v| v.is_some()));
+            children.push(inner.clone());
+            Ok(HttpListener {
+                inner,
+                tcp,
+                quic,
+                runtime: tokio::runtime::Handle::current(),
+            })
         })
     }
 
@@ -1449,6 +1690,12 @@ impl DispatchServer {
     /// Untaken non-RPC connections are closed.
     #[napi]
     pub async fn close(&self) -> Result<()> {
+        let mut running = self.running.lock().await;
+        let children = self.http_children.lock().unwrap().clone();
+        for child in children {
+            stop_http_listener(&child, Duration::ZERO).await?;
+        }
+        self.http_children.lock().unwrap().clear();
         if let Some(s) = &self.tsfn_sink {
             s.shutdown();
         }
@@ -1456,8 +1703,7 @@ impl DispatchServer {
             r.closed.store(true, Ordering::Release);
             r.close_notify.notify_waiters();
         }
-        let running = self.running.lock().await.take();
-        match running {
+        match running.take() {
             Some(Running::Own(server)) => server.shutdown().await,
             Some(Running::Attached(handle)) => handle.abort(),
             None => {}

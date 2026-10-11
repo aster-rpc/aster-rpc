@@ -3,6 +3,7 @@ package site.aster.handle;
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import site.aster.event.IrohEvent;
 import site.aster.ffi.*;
@@ -21,6 +22,7 @@ public class IrohRuntime implements AutoCloseable {
   private final OperationRegistry registry;
   private final IrohPollThread poller;
   private final LeakTracker tracker;
+  private final AtomicBoolean closed = new AtomicBoolean();
 
   private final MethodHandle runtimeClose;
   private final MethodHandle bufferRelease;
@@ -34,7 +36,11 @@ public class IrohRuntime implements AutoCloseable {
   IrohRuntime(IrohLibrary lib, LeakTracker tracker) {
     this.lib = lib;
     this.tracker = tracker;
-    this.registry = new OperationRegistry();
+    this.registry =
+        new OperationRegistry(
+            event -> {
+              if (event.hasBuffer()) releaseBuffer(event.buffer());
+            });
 
     MemorySegment configSeg = lib.allocator().allocate(IrohLibrary.ASTER_RUNTIME_CONFIG);
     configSeg.set(ValueLayout.JAVA_INT, 0, (int) IrohLibrary.ASTER_RUNTIME_CONFIG.byteSize());
@@ -67,7 +73,6 @@ public class IrohRuntime implements AutoCloseable {
 
     this.handle = lib.runtimeHandleSegment().get(ValueLayout.JAVA_LONG, 0);
     this.poller = new IrohPollThread(registry, handle);
-    this.poller.start();
 
     this.runtimeClose =
         lib.getHandle(
@@ -85,6 +90,8 @@ public class IrohRuntime implements AutoCloseable {
             "aster_operation_cancel",
             FunctionDescriptor.of(
                 ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
+    // Discard callbacks can release buffers as soon as polling starts.
+    this.poller.start();
   }
 
   /** Returns the native runtime handle for FFI calls. */
@@ -134,11 +141,17 @@ public class IrohRuntime implements AutoCloseable {
 
   @Override
   public void close() {
+    if (!closed.compareAndSet(false, true)) return;
     poller.stop();
     try {
-      runtimeClose.invoke(handle);
-    } catch (Throwable t) {
-      throw new IrohException("aster_runtime_close failed: " + t.getMessage());
+      registry.close(IrohException.forStatus(IrohStatus.ALREADY_CLOSED, "runtime closed"));
+    } finally {
+      // Native shutdown owns any resources returned by unpublished completions.
+      try {
+        runtimeClose.invoke(handle);
+      } catch (Throwable t) {
+        throw new IrohException("aster_runtime_close failed: " + t.getMessage());
+      }
     }
   }
 

@@ -26,6 +26,7 @@ public enum UpcallKind : ushort
     ExposeRoutePolicy = 50,
     AdmissionConnect = 64,
     AdmissionHandshake = 65,
+    RpcAuthenticate = 80,
 }
 
 /// <summary><c>aster_upcall_status_t</c>: how a binding answers an upcall.</summary>
@@ -122,6 +123,15 @@ public interface IRoutePolicy
     /// <summary>Indexes into <c>request.Specs</c> to grant, strictly ascending.</summary>
     ValueTask<IReadOnlyList<uint>> GrantAsync(ExposeRoutePolicyRequest request, CancellationToken cancellationToken);
 }
+
+/// <summary>Resolve per-call credentials to an explicit nonempty principal and capability attributes.</summary>
+public interface IRpcAuthenticator
+{
+    ValueTask<RpcAuthResponse> AuthenticateAsync(RpcAuthRequest request, CancellationToken cancellationToken);
+}
+
+/// <summary>A typed RPC authentication callback; rejection is Accepted=false, exceptions are backend failures.</summary>
+public delegate ValueTask<RpcAuthResponse> RpcAuthenticator(RpcAuthRequest request, CancellationToken cancellationToken);
 
 /// <summary>
 /// One upcall table per runtime (C ABI 4.1, design <c>docs/_internal/bindings/upcall-design.md</c> §4):
@@ -226,10 +236,34 @@ public sealed class Upcalls : IAsyncDisposable, IDisposable
     /// <summary>Registers a raw handler for <paramref name="kind"/> (replaces any earlier one).</summary>
     public Upcalls Handle(UpcallKind kind, UpcallHandler handler)
     {
+        ThrowIfDisposed();
         if (kind == UpcallKind.Cancel) throw new ArgumentException("CANCEL is not answerable", nameof(kind));
         ArgumentNullException.ThrowIfNull(handler);
         _handlers[(ushort)kind] = handler;
         return this;
+    }
+
+    /// <summary>Serve typed kind-80 per-call RPC authentication. Fail-open policy never authenticates a caller.</summary>
+    public Upcalls ServeRpcAuthenticator(IRpcAuthenticator authenticator)
+    {
+        ArgumentNullException.ThrowIfNull(authenticator);
+        return ServeRpcAuthenticator(authenticator.AuthenticateAsync);
+    }
+
+    /// <summary>Serve typed kind-80 authentication; observe cancellation when native work ends.</summary>
+    public Upcalls ServeRpcAuthenticator(RpcAuthenticator authenticator)
+    {
+        ArgumentNullException.ThrowIfNull(authenticator);
+        return Handle(UpcallKind.RpcAuthenticate, async (bytes, context) =>
+            Ucv1.EncodeRpcAuthResponse(await authenticator(Ucv1.DecodeRpcAuthRequest(bytes), context.Cancellation).ConfigureAwait(false)));
+    }
+
+    internal void RequireRpcAuthenticator(Runtime runtime)
+    {
+        ThrowIfDisposed();
+        if (!ReferenceEquals(runtime, _runtime)) throw new ArgumentException("upcalls must share the server runtime");
+        if (!_handlers.ContainsKey((ushort)UpcallKind.RpcAuthenticate))
+            throw new InvalidOperationException("register ServeRpcAuthenticator before starting a listener");
     }
 
     /// <summary>Serves <c>LEASE_TRANSITION</c> and <c>LEASE_SNAPSHOT</c> with <paramref name="serializer"/>.</summary>

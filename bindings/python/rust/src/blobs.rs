@@ -320,6 +320,67 @@ impl BlobsClient {
         })
     }
 
+    /// Own temporary roots across reads, downloads and host verification.
+    fn custody(&self) -> crate::blob_custody::BlobCustody {
+        crate::blob_custody::BlobCustody {
+            inner: self.inner.custody(),
+        }
+    }
+
+    /// Verify store-computed hash before committing a persistent named tag.
+    #[pyo3(signature = (data, expected_hash, tag_name, *, format=BlobFormatArg(aster::BlobFormat::Raw)))]
+    fn add_bytes_verified<'py>(
+        &self,
+        py: Python<'py>,
+        data: Vec<u8>,
+        expected_hash: HexArg,
+        tag_name: String,
+        format: BlobFormatArg,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = flag.clone();
+        crate::blob_custody::operation(py, flag, async move {
+            client
+                .add_bytes_verified(
+                    data,
+                    expected_hash.0,
+                    crate::blob_custody::format(format),
+                    tag_name,
+                    Some(cancelled),
+                )
+                .await
+                .map_err(crate::blob_custody::error)
+        })
+    }
+
+    /// Verified Copy import; later edits to the source cannot change the blob.
+    #[pyo3(signature = (path, expected_hash, tag_name, *, format=BlobFormatArg(aster::BlobFormat::Raw)))]
+    fn add_path_verified<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        expected_hash: HexArg,
+        tag_name: String,
+        format: BlobFormatArg,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = flag.clone();
+        crate::blob_custody::operation(py, flag, async move {
+            client
+                .add_path_verified(
+                    path,
+                    expected_hash.0,
+                    crate::blob_custody::format(format),
+                    tag_name,
+                    Some(cancelled),
+                )
+                .await
+                .map_err(crate::blob_custody::error)
+        })
+    }
+
     /// Import a file by path (Copy mode, never TryReference) and return the
     /// BLAKE3 hash as a hex string. Like `add_bytes`, an auto-tag keeps the blob
     /// alive; use `add_path_with_named_tag` for a deterministic GC-keyed tag.
@@ -782,6 +843,7 @@ pub fn blobs_client(node: &Node) -> BlobsClient {
 
 /// Register the blobs types with the Python module.
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    crate::blob_custody::register(_py, m)?;
     m.add_class::<BlobStatusResult>()?;
     m.add_class::<BlobObserveResult>()?;
     m.add_class::<BlobLocalInfo>()?;

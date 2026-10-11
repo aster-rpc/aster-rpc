@@ -7,10 +7,10 @@
 **C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 4.6, 2026-10-05)
+## STATUS (ABI 4.12, 2026-10-10)
 
 - **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
-  `Native.RequiredAbiMinor` = 6 for the 4.6 observability and health functions (4.5 added the cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
+  `Native.RequiredAbiMinor` = 12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
@@ -148,6 +148,23 @@
     The .NET `AsterConfig` has no health fields, so the listener is configured through `HealthOptions` (127.0.0.1 and an ephemeral port by default).
   - Tests: `ObservabilityTests` (xUnit, `-warnaserror`): end to end against a loopback OTLP/HTTP receiver that decodes the exported spans.
 - **Interop:** joins `tests/interop/` (`tests/interop/dotnet/`), 5×5 matrix all pass.
+- **Authenticated serving (ABI 4.11):** `AsterServer.StartHttpListenerAsync` returns an
+  `AsterHttpListener` after native TCP/optional QUIC readiness. The same-runtime
+  `Upcalls.ServeRpcAuthenticator` bridges typed UCv1 C9/CA requests and outcomes
+  (kind 80), with native bounded pending work, payload limits, deadline and
+  fail-closed enforcement. Per-call principal and attributes come from the native
+  authentication snapshot; only authenticated Iroh connection identities are cached.
+  Startup is serialized with server disposal. Each listener retains its runtime;
+  stop joins native cleanup and only then releases that owner. Grace bounds
+  application work, not QUIC protocol draining. Cancellation never abandons a
+  native start or stop already in progress. ABI 4.12 adds a separately named
+  `StartPublicHttpListenerAsync`: empty capability attributes, unchanged Gate 3
+  and Iroh-only restrictions, no session factories, no authentication-limit
+  configuration. `TlsCertificates` generates copied PEM/hash outputs, optionally
+  signed by a 32-byte node secret, and verifies the TLS public-key binding against
+  a trusted expected node ID. No unsigned Claim, ACME or FIPS validation is
+  implied. A managed WebTransport client remains outside this surface. See the README and
+  `HttpListenerTests` for native lifecycle and all HTTP RPC pattern coverage.
 - `Bytes.FromArray` (unpinned pointer) is removed; use `fixed` + `Bytes.FromPointer`,
   `Bytes.FromPinned`, or the internal `NativeScope`.
 - Tests: `dotnet test Aster.sln --filter "FullyQualifiedName!~SoakTests"`; the soak suite

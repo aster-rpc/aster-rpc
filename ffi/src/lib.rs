@@ -29,18 +29,23 @@ extern crate self as aster_transport_ffi;
 pub mod call;
 pub mod coordination;
 pub mod coordination_codec;
+pub mod custody;
 pub mod data;
 pub mod envelope;
 pub mod expose;
 pub mod grants;
 pub mod health;
+pub mod http_server;
 mod layout;
 pub mod node;
 pub mod observability;
 pub mod probe;
+pub mod provisioning;
 pub mod pure;
 pub mod rpc;
 pub mod server;
+pub mod tls;
+pub mod topology;
 pub mod upcall;
 
 // ============================================================================
@@ -146,8 +151,17 @@ pub mod upcall;
 //   bounded FIFO foreign-dispatch staging behind the existing event ring.
 // - 4.9.0 (additive): durable audit outbox, versioned bounded JSON and
 //   asynchronous lifecycle/operator completions (`audit_outbox.rs`).
+// - 4.10.0 (additive): Docs event receiver release and cancellation-safe
+//   receives (`aster_doc_event_receiver_free`).
+// - 4.11.0 (additive): authenticated HTTPS/WebTransport listener ownership
+//   and bounded RPC authentication upcalls (`http_server.rs`).
+// - 4.12.0 (additive): explicit public HTTP/WT listeners and certificate helpers.
+// - 4.13.0 (additive): temporary blob custody and verified retained imports.
+// - 4.14.0 (additive): locally complete batch document content reads.
+// - 4.15.0 (additive): stateless coordination authority provisioning helpers.
+// - 4.16.0 (additive): topology reads, owned snapshots, reader options and RPC gating.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 9;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 16;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -395,6 +409,12 @@ pub enum aster_event_kind_t {
     ASTER_EVENT_AUDIT_OUTBOX_STATUS = 116,
     /// `aster_audit_outbox_export`: versioned JSON evidence payload.
     ASTER_EVENT_AUDIT_OUTBOX_EXPORTED = 117,
+    /// A custody protect/retain operation completed; handle = custody scope.
+    ASTER_EVENT_BLOB_CUSTODY_DONE = 118,
+    /// Ordered optional content values; see aster_doc_read_entry_contents_if_complete.
+    ASTER_EVENT_DOC_CONTENTS_BATCH = 119,
+    /// One immutable shared topology view; handle = owned topology snapshot.
+    ASTER_EVENT_TOPOLOGY_SNAPSHOT = 120,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
@@ -778,6 +798,13 @@ pub(crate) struct BridgeRuntime {
     pub(crate) nodes: HandleRegistry<CoreNode>,
     pub(crate) connections: HandleRegistry<CoreConnection>,
     pub(crate) audit_outboxes: HandleRegistry<audit_outbox::OutboxState>,
+    pub(crate) http_listeners: HandleRegistry<http_server::HttpListenerState>,
+    pub(crate) blob_custody: HandleRegistry<custody::CustodyState>,
+    pub(crate) topology_snapshots: HandleRegistry<aster::topology::TopologySnapshot>,
+    pub(crate) topology_admitted:
+        HandleRegistry<aster::binding_support::upcall::topology::ForeignAdmittedFn>,
+    pub(crate) server_handles: Mutex<Vec<u64>>,
+    pub(crate) upcall_handles: Mutex<Vec<u64>>,
     // Includes engines retained only by an in-flight operation after handle free.
     pub(crate) audit_outbox_lifetimes: Mutex<Vec<std::sync::Weak<audit_outbox::OutboxState>>>,
     send_streams: HandleRegistry<CoreSendStream>,
@@ -802,7 +829,7 @@ pub(crate) struct BridgeRuntime {
     node_gates: node::NodeGates,
 
     // Doc event receiver registry (Phase 1c.4)
-    doc_event_receivers: HandleRegistry<aster_transport_core::CoreDocEventReceiver>,
+    doc_event_receivers: HandleRegistry<DocEventReceiver>,
 
     // Buffer registry
     buffers: BufferRegistry,
@@ -872,6 +899,8 @@ impl RuntimeTeardown {
 
 struct OperationState {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cancel_notify: Arc<tokio::sync::Notify>,
+    cooperative_cancel: bool,
     user_data: u64,
     /// Independent operation-admission budget. It travels with the terminal
     /// event and is released only when that event is polled or shutdown drops it.
@@ -913,6 +942,12 @@ impl BridgeRuntime {
             nodes: HandleRegistry::new(),
             connections: HandleRegistry::new(),
             audit_outboxes: HandleRegistry::new(),
+            http_listeners: HandleRegistry::new(),
+            blob_custody: HandleRegistry::new(),
+            topology_snapshots: HandleRegistry::new(),
+            topology_admitted: HandleRegistry::new(),
+            server_handles: Mutex::new(Vec::new()),
+            upcall_handles: Mutex::new(Vec::new()),
             audit_outbox_lifetimes: Mutex::new(Vec::new()),
             send_streams: HandleRegistry::new(),
             recv_streams: HandleRegistry::new(),
@@ -942,6 +977,12 @@ impl BridgeRuntime {
         // Dropping endpoints and streams may need the runtime's context.
         let _context = self.runtime.enter();
         // Pending hook replies first: dropping a sender settles the hook.
+        upcall::shutdown_runtime(self);
+        server::shutdown_runtime(self);
+        self.http_listeners.clear();
+        self.topology_snapshots.clear();
+        self.topology_admitted.clear();
+        custody::shutdown(self);
         self.hook_invocations.clear();
         self.operations.clear();
         self.doc_event_receivers.clear();
@@ -1190,6 +1231,14 @@ impl BridgeRuntime {
         &self,
         user_data: u64,
     ) -> Result<(u64, Arc<std::sync::atomic::AtomicBool>), aster_status_t> {
+        self.new_operation_with_cancel_mode(user_data, false)
+    }
+
+    fn new_operation_with_cancel_mode(
+        &self,
+        user_data: u64,
+        cooperative_cancel: bool,
+    ) -> Result<(u64, Arc<AtomicBool>), aster_status_t> {
         if self.closing.load(Ordering::Acquire) {
             return Err(aster_status_t::ASTER_STATUS_ALREADY_CLOSED);
         }
@@ -1204,6 +1253,8 @@ impl BridgeRuntime {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let op = OperationState {
             cancelled: cancelled.clone(),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            cooperative_cancel,
             user_data,
             completion: Mutex::new(Some(completion)),
         };
@@ -1231,10 +1282,20 @@ impl BridgeRuntime {
     }
 
     fn cancel_operation(&self, op_id: u64) -> bool {
+        if let Some(op) = self.operations.get(op_id) {
+            if op.cooperative_cancel {
+                // Custody operations retain their terminal slot until cleanup
+                // or an irrevocable named-tag commit has actually completed.
+                op.cancelled.store(true, Ordering::SeqCst);
+                op.cancel_notify.notify_waiters();
+                return true;
+            }
+        }
         let Some(op) = self.operations.remove(op_id) else {
             return false;
         };
         op.cancelled.store(true, Ordering::SeqCst);
+        op.cancel_notify.notify_waiters();
         let Some(permit) = op
             .completion
             .lock()
@@ -1697,7 +1758,8 @@ pub unsafe extern "C" fn aster_buffer_release(runtime: aster_runtime_t, buffer: 
 /// `aster_endpoint_remote_info_list`), `aster_connection_info_t.alpn`, and
 /// `aster_transport_snapshot_t.peer_host` / `.relay_url`, and the `out`
 /// buffer of `aster_{stream_header,call_header,rpc_status}_encode`,
-/// `aster_zstd_maybe_compress` and `aster_zstd_decompress`.
+/// `aster_zstd_maybe_compress`, `aster_zstd_decompress`, and both PEM fields
+/// of `aster_generated_cert_t`.
 ///
 /// Pass back exactly the `ptr` and `len` the library returned. Non-empty
 /// buffers are additionally NUL-terminated (the terminator is not counted in
@@ -1732,6 +1794,12 @@ pub unsafe extern "C" fn aster_string_release(ptr: *const u8, len: usize) -> i32
 // C FFI Functions - Operation Cancellation
 // ============================================================================
 
+/// Request cancellation. Continue polling and collect the operation's terminal
+/// event. ABI 4.13 custody and verified imports acknowledge cancellation only
+/// after native cleanup; a named-tag commit already started reports its actual
+/// result, which may be success. Fetch cleanup can wait for downloader drain.
+/// # Safety
+/// This function does not dereference caller pointers.
 #[no_mangle]
 pub unsafe extern "C" fn aster_operation_cancel(
     runtime: aster_runtime_t,
@@ -5618,7 +5686,9 @@ pub unsafe extern "C" fn aster_doc_subscribe(
 
         match doc_arc.subscribe().await {
             Ok(receiver) => {
-                let handle = bridge2.doc_event_receivers.insert(receiver);
+                let handle = bridge2
+                    .doc_event_receivers
+                    .insert(DocEventReceiver::new(receiver));
                 bridge2.emit_simple_with_handle(
                     aster_event_kind_t::ASTER_EVENT_DOC_SUBSCRIBED,
                     aster_status_t::ASTER_STATUS_OK,
@@ -5639,9 +5709,103 @@ pub unsafe extern "C" fn aster_doc_subscribe(
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
-/// Receive the next live document event (long-poll, like gossip_recv).
-/// Emits ASTER_EVENT_DOC_EVENT with event.subtype indicating the event kind and
-/// packed data in the payload.  When the subscription ends, emits with status=NOT_FOUND.
+/// A receiver owns its stream independently from the Doc handle. The lock both
+/// serializes reads and keeps an event consumed just before cancellation wins
+/// the completion race, so the next receive observes that same event.
+struct DocEventReceiver {
+    inner: CoreDocEventReceiver,
+    pending: tokio::sync::Mutex<Option<CoreDocEvent>>,
+    closed: AtomicBool,
+    close_notify: tokio::sync::Notify,
+}
+
+impl DocEventReceiver {
+    fn new(inner: CoreDocEventReceiver) -> Self {
+        Self {
+            inner,
+            pending: tokio::sync::Mutex::new(None),
+            closed: AtomicBool::new(false),
+            close_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.close_notify.notify_waiters();
+    }
+
+    /// Called while holding `pending`, so a later receive cannot overtake an
+    /// event being returned to the stream after cancellation won.
+    fn deliver(
+        &self,
+        bridge: &BridgeRuntime,
+        operation: u64,
+        receiver: u64,
+        user_data: u64,
+        value: CoreDocEvent,
+        pending: &mut Option<CoreDocEvent>,
+    ) {
+        let (subtype, payload) = encode_doc_event(&value);
+        let mut event = EventInternal::new(
+            aster_event_kind_t::ASTER_EVENT_DOC_EVENT,
+            aster_status_t::ASTER_STATUS_OK,
+            operation,
+            receiver,
+            0,
+            user_data,
+            subtype as i32,
+        );
+        event.flags = subtype;
+        if !bridge.complete(event, Some(payload)) && !self.closed.load(Ordering::Acquire) {
+            *pending = Some(value);
+        }
+    }
+}
+
+fn close_doc_event_receiver(bridge: &BridgeRuntime, receiver: u64) -> bool {
+    if let Some(receiver) = bridge.doc_event_receivers.remove(receiver) {
+        receiver.close();
+        true
+    } else {
+        false
+    }
+}
+
+/// Release a document event receiver independently from its document handle.
+/// Removes the handle and wakes pending receives, which complete with
+/// ASTER_EVENT_DOC_EVENT / ASTER_STATUS_NOT_FOUND (end of stream). An in-flight
+/// receive racing close may complete successfully. Repeated
+/// release, or receiving through a released handle, returns NOT_FOUND.
+/// Runtime shutdown also releases receivers and wakes pending receives.
+#[no_mangle]
+pub unsafe extern "C" fn aster_doc_event_receiver_free(
+    runtime: aster_runtime_t,
+    receiver: u64,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(bridge) => bridge,
+        Err(status) => return status as i32,
+    };
+    if close_doc_event_receiver(&bridge, receiver) {
+        aster_status_t::ASTER_STATUS_OK as i32
+    } else {
+        aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+    }
+}
+
+/// Receive the next live document event. Subtype is carried in event.flags:
+/// 0=InsertLocal, 1=InsertRemote, 2=ContentReady, 3=PendingContentReady,
+/// 4=NeighborUp, 5=NeighborDown, 6=SyncFinished. Entry events use the DOC_QUERY
+/// metadata layout; InsertRemote appends a length-prefixed peer ID. ContentReady
+/// carries the hash string; neighbor/sync events carry the peer string.
+/// PendingContentReady has an empty payload.
+///
+/// Receives on one receiver are serialized. Cancelling an operation wakes its
+/// wait without consuming a later event; if cancellation wins after a stream
+/// event was consumed, that event is retained for the next receive. EOF and
+/// errors release the receiver handle automatically. EOF or receiver close
+/// emits ASTER_EVENT_DOC_EVENT / NOT_FOUND; cancellation emits the usual
+/// ASTER_EVENT_OPERATION_CANCELLED. Release every returned payload buffer.
 #[no_mangle]
 pub unsafe extern "C" fn aster_doc_event_recv(
     runtime: aster_runtime_t,
@@ -5652,64 +5816,94 @@ pub unsafe extern "C" fn aster_doc_event_recv(
     if out_operation.is_null() {
         return aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
     }
-
     let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return s as i32,
+        Ok(bridge) => bridge,
+        Err(status) => return status as i32,
     };
-
     let receiver_arc = match bridge.doc_event_receivers.get(receiver) {
-        Some(r) => r,
+        Some(receiver) => receiver,
         None => return aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
     };
-
     let (op_id, cancelled) = match bridge.new_operation(user_data) {
         Ok(operation) => operation,
         Err(status) => return status as i32,
     };
+    // Fetch this before publishing the operation ID to the caller.
+    let cancel_notify = match bridge.operations.get(op_id) {
+        Some(operation) => operation.cancel_notify.clone(),
+        // Runtime shutdown can clear the operation registry immediately
+        // after admission, before its ID has been published to the caller.
+        None => return aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32,
+    };
     unsafe {
         *out_operation = op_id;
     }
-
     let bridge2 = bridge.clone();
     bridge.runtime.spawn(async move {
-        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+        let cancelled_wait = cancel_notify.notified();
+        let closed_wait = receiver_arc.close_notify.notified();
+        let runtime_closed = bridge2.close_notify.notified();
+        tokio::pin!(cancelled_wait, closed_wait, runtime_closed);
+        // Notify::notify_waiters does not retain permits. Register before
+        // testing the corresponding atomics to cover close/cancel-before-poll.
+        cancelled_wait.as_mut().enable();
+        closed_wait.as_mut().enable();
+        runtime_closed.as_mut().enable();
+        if cancelled.load(Ordering::Acquire) || bridge2.closing.load(Ordering::Acquire) {
             return;
         }
-
-        match receiver_arc.recv().await {
-            Ok(Some(ev)) => {
-                let (subtype, payload) = encode_doc_event(&ev);
-                let mut event = EventInternal::new(
-                    aster_event_kind_t::ASTER_EVENT_DOC_EVENT,
-                    aster_status_t::ASTER_STATUS_OK,
-                    op_id,
-                    receiver,
-                    0,
-                    user_data,
-                    subtype as i32,
-                );
-                event.flags = subtype;
-                bridge2.emit_with_data(event, payload);
+        let emit_eof = || {
+            close_doc_event_receiver(&bridge2, receiver);
+            bridge2.emit_simple(
+                aster_event_kind_t::ASTER_EVENT_DOC_EVENT,
+                aster_status_t::ASTER_STATUS_NOT_FOUND,
+                op_id,
+                receiver,
+                0,
+                user_data,
+                0,
+            );
+        };
+        if receiver_arc.closed.load(Ordering::Acquire) {
+            emit_eof();
+            return;
+        }
+        let mut pending = tokio::select! {
+            biased;
+            _ = &mut cancelled_wait => return,
+            _ = &mut runtime_closed => return,
+            _ = &mut closed_wait => { emit_eof(); return; }
+            pending = receiver_arc.pending.lock() => pending,
+        };
+        if cancelled.load(Ordering::Acquire) || bridge2.closing.load(Ordering::Acquire) {
+            return;
+        }
+        if receiver_arc.closed.load(Ordering::Acquire) {
+            emit_eof();
+            return;
+        }
+        let result = if let Some(value) = pending.take() {
+            Ok(Some(value))
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut cancelled_wait => return,
+                _ = &mut runtime_closed => return,
+                _ = &mut closed_wait => { emit_eof(); return; }
+                result = receiver_arc.inner.recv() => result,
             }
-            Ok(None) => {
-                // Subscription ended cleanly.
-                bridge2.emit_simple(
-                    aster_event_kind_t::ASTER_EVENT_DOC_EVENT,
-                    aster_status_t::ASTER_STATUS_NOT_FOUND,
-                    op_id,
-                    receiver,
-                    0,
-                    user_data,
-                    0,
-                );
+        };
+        match result {
+            Ok(Some(value)) => {
+                receiver_arc.deliver(&bridge2, op_id, receiver, user_data, value, &mut pending)
             }
-            Err(e) => {
-                bridge2.emit_error(op_id, user_data, &e.to_string());
+            Ok(None) => emit_eof(),
+            Err(error) => {
+                close_doc_event_receiver(&bridge2, receiver);
+                bridge2.emit_error(op_id, user_data, &error.to_string());
             }
         }
     });
-
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
@@ -5879,7 +6073,7 @@ pub unsafe extern "C" fn aster_doc_share_with_addr(
 /// Join a document and subscribe to live events atomically.
 /// Emits ASTER_EVENT_DOC_JOINED_AND_SUBSCRIBED:
 ///   event.handle = doc handle
-///   event.flags  = event-receiver handle
+///   event.related = event-receiver handle (64-bit; not event.flags)
 #[no_mangle]
 pub unsafe extern "C" fn aster_docs_join_and_subscribe(
     runtime: aster_runtime_t,
@@ -5925,7 +6119,9 @@ pub unsafe extern "C" fn aster_docs_join_and_subscribe(
         match docs.join_and_subscribe(ticket_str).await {
             Ok((doc, receiver)) => {
                 let doc_handle = bridge2.docs.insert(doc);
-                let receiver_handle = bridge2.doc_event_receivers.insert(receiver);
+                let receiver_handle = bridge2
+                    .doc_event_receivers
+                    .insert(DocEventReceiver::new(receiver));
                 // event.handle = doc_handle, event.related = receiver_handle
                 bridge2.emit_simple_with_handles(
                     aster_event_kind_t::ASTER_EVENT_DOC_JOINED_AND_SUBSCRIBED,
@@ -8733,5 +8929,358 @@ mod event_buffer_tests {
             unsafe { aster_runtime_close(handle) },
             aster_status_t::ASTER_STATUS_OK as i32
         );
+    }
+}
+
+#[cfg(test)]
+mod doc_event_receiver_tests {
+    use super::*;
+    use crate::audit_test_common::{start_node, wait_for_operation, wait_for_successful_operation};
+    use std::time::Instant;
+
+    struct Fixture {
+        runtime: u64,
+        bridge: Arc<BridgeRuntime>,
+        doc: u64,
+        receiver: u64,
+        author: Vec<u8>,
+    }
+
+    fn bytes(p: &[u8]) -> aster_bytes_t {
+        aster_bytes_t {
+            ptr: p.as_ptr(),
+            len: p.len(),
+        }
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            unsafe {
+                let mut runtime = 0;
+                assert_eq!(
+                    aster_runtime_new(ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime),
+                    0
+                );
+                let bridge = load_runtime(runtime).unwrap();
+                let node = start_node(runtime, &[b"doc-receiver-test"]);
+                let mut op = 0;
+                assert_eq!(aster_docs_create(runtime, node, 0, &mut op), 0);
+                let doc = wait_for_successful_operation(
+                    runtime,
+                    op,
+                    aster_event_kind_t::ASTER_EVENT_DOC_CREATED,
+                )
+                .handle;
+                assert_eq!(aster_docs_create_author(runtime, node, 0, &mut op), 0);
+                let event = wait_for_successful_operation(
+                    runtime,
+                    op,
+                    aster_event_kind_t::ASTER_EVENT_AUTHOR_CREATED,
+                );
+                let author = slice::from_raw_parts(event.data_ptr, event.data_len).to_vec();
+                assert_eq!(aster_buffer_release(runtime, event.buffer), 0);
+                assert_eq!(aster_doc_subscribe(runtime, doc, 0, &mut op), 0);
+                let event = wait_for_successful_operation(
+                    runtime,
+                    op,
+                    aster_event_kind_t::ASTER_EVENT_DOC_SUBSCRIBED,
+                );
+                assert_eq!(event.related, doc);
+                Self {
+                    runtime,
+                    bridge,
+                    doc,
+                    receiver: event.handle,
+                    author,
+                }
+            }
+        }
+
+        fn recv(&self) -> u64 {
+            let mut operation = 0;
+            assert_eq!(
+                unsafe { aster_doc_event_recv(self.runtime, self.receiver, 73, &mut operation) },
+                0
+            );
+            operation
+        }
+
+        fn set(&self, key: &[u8], value: &[u8]) {
+            unsafe {
+                let mut op = 0;
+                assert_eq!(
+                    aster_doc_set_bytes(
+                        self.runtime,
+                        self.doc,
+                        bytes(&self.author),
+                        bytes(key),
+                        bytes(value),
+                        0,
+                        &mut op
+                    ),
+                    0
+                );
+                let event = wait_for_successful_operation(
+                    self.runtime,
+                    op,
+                    aster_event_kind_t::ASTER_EVENT_DOC_SET,
+                );
+                assert_eq!(aster_buffer_release(self.runtime, event.buffer), 0);
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            unsafe {
+                aster_runtime_close(self.runtime);
+            }
+        }
+    }
+
+    fn eventually(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "receiver task did not release its owner"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn doc_receiver_cancel_wakes_wait_and_preserves_next_native_insert() {
+        let f = Fixture::new();
+        let owner = f.bridge.doc_event_receivers.get(f.receiver).unwrap();
+        let operation = f.recv();
+        // The serial lock is held throughout the pending stream read. This
+        // proves cancellation interrupts a running receive, not just startup.
+        eventually(|| owner.pending.try_lock().is_err());
+        assert_eq!(unsafe { aster_operation_cancel(f.runtime, operation) }, 0);
+        let cancelled = unsafe { wait_for_operation(f.runtime, operation) };
+        assert_eq!(
+            cancelled.kind,
+            aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED as u32
+        );
+        assert_eq!(cancelled.user_data, 73);
+        eventually(|| Arc::strong_count(&owner) == 2); // registry + this test
+        f.set(b"policy/key", b"hello");
+        let operation = f.recv();
+        let event = unsafe {
+            wait_for_successful_operation(
+                f.runtime,
+                operation,
+                aster_event_kind_t::ASTER_EVENT_DOC_EVENT,
+            )
+        };
+        assert_eq!(event.flags, 0); // InsertLocal
+        let payload = unsafe { slice::from_raw_parts(event.data_ptr, event.data_len) };
+        assert_eq!(
+            u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize,
+            f.author.len()
+        );
+        assert_eq!(&payload[4..4 + f.author.len()], f.author.as_slice());
+        let key_offset = 4 + f.author.len();
+        assert_eq!(
+            u32::from_le_bytes(payload[key_offset..key_offset + 4].try_into().unwrap()),
+            10
+        );
+        assert_eq!(&payload[key_offset + 4..key_offset + 14], b"policy/key");
+        assert_eq!(unsafe { aster_buffer_release(f.runtime, event.buffer) }, 0);
+        assert_eq!(f.bridge.operations.count(), 0);
+        assert_eq!(f.bridge.buffers.count(), 0);
+    }
+
+    #[test]
+    fn doc_receiver_cancel_winning_after_consumption_requeues_event() {
+        let f = Fixture::new();
+        let owner = f.bridge.doc_event_receivers.get(f.receiver).unwrap();
+        let (operation, _) = f.bridge.new_operation(73).unwrap();
+        assert_eq!(unsafe { aster_operation_cancel(f.runtime, operation) }, 0);
+        // Deterministically exercise the narrow race after the upstream read
+        // consumed an event but before complete claims the terminal permit.
+        f.bridge.runtime.block_on(async {
+            let mut pending = owner.pending.lock().await;
+            owner.deliver(
+                &f.bridge,
+                operation,
+                f.receiver,
+                73,
+                CoreDocEvent::ContentReady {
+                    hash: "hash-after-cancel".into(),
+                },
+                &mut pending,
+            );
+            assert!(pending.is_some());
+        });
+        let terminal = unsafe { wait_for_operation(f.runtime, operation) };
+        assert_eq!(
+            terminal.kind,
+            aster_event_kind_t::ASTER_EVENT_OPERATION_CANCELLED as u32
+        );
+        assert_eq!(
+            f.bridge.buffers.count(),
+            0,
+            "lost completion registered a buffer"
+        );
+        let operation = f.recv();
+        let event = unsafe {
+            wait_for_successful_operation(
+                f.runtime,
+                operation,
+                aster_event_kind_t::ASTER_EVENT_DOC_EVENT,
+            )
+        };
+        assert_eq!(event.flags, 2);
+        assert_eq!(
+            unsafe { slice::from_raw_parts(event.data_ptr, event.data_len) },
+            b"hash-after-cancel"
+        );
+        assert_eq!(unsafe { aster_buffer_release(f.runtime, event.buffer) }, 0);
+        assert!(owner.pending.try_lock().unwrap().is_none());
+        assert_eq!(f.bridge.operations.count(), 0);
+    }
+
+    #[test]
+    fn doc_receiver_committed_event_wins_late_cancellation() {
+        let f = Fixture::new();
+        let owner = f.bridge.doc_event_receivers.get(f.receiver).unwrap();
+        let (operation, _) = f.bridge.new_operation(73).unwrap();
+        f.bridge.runtime.block_on(async {
+            let mut pending = owner.pending.lock().await;
+            owner.deliver(
+                &f.bridge,
+                operation,
+                f.receiver,
+                73,
+                CoreDocEvent::ContentReady {
+                    hash: "committed-before-cancel".into(),
+                },
+                &mut pending,
+            );
+        });
+        assert_eq!(
+            unsafe { aster_operation_cancel(f.runtime, operation) },
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+        let event = unsafe {
+            wait_for_successful_operation(
+                f.runtime,
+                operation,
+                aster_event_kind_t::ASTER_EVENT_DOC_EVENT,
+            )
+        };
+        assert_eq!(
+            unsafe { slice::from_raw_parts(event.data_ptr, event.data_len) },
+            b"committed-before-cancel"
+        );
+        assert_eq!(unsafe { aster_buffer_release(f.runtime, event.buffer) }, 0);
+        assert!(owner.pending.try_lock().unwrap().is_none());
+        assert_eq!(f.bridge.operations.count(), 0);
+    }
+
+    #[test]
+    fn doc_receiver_free_wakes_all_reads_and_drops_owner() {
+        let f = Fixture::new();
+        let owner = f.bridge.doc_event_receivers.get(f.receiver).unwrap();
+        let weak = Arc::downgrade(&owner);
+        let first = f.recv();
+        eventually(|| owner.pending.try_lock().is_err());
+        let second = f.recv();
+        assert_eq!(
+            unsafe { aster_doc_event_receiver_free(f.runtime, f.receiver) },
+            0
+        );
+        assert_eq!(f.bridge.doc_event_receivers.count(), 0);
+        assert_eq!(
+            unsafe { aster_doc_event_receiver_free(f.runtime, f.receiver) },
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+        let mut rejected = 0;
+        assert_eq!(
+            unsafe { aster_doc_event_recv(f.runtime, f.receiver, 0, &mut rejected) },
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+        for operation in [first, second] {
+            let event = unsafe { wait_for_operation(f.runtime, operation) };
+            assert_eq!(event.kind, aster_event_kind_t::ASTER_EVENT_DOC_EVENT as u32);
+            assert_eq!(event.status, aster_status_t::ASTER_STATUS_NOT_FOUND as u32);
+            assert_eq!(event.buffer, 0);
+        }
+        drop(owner);
+        eventually(|| weak.upgrade().is_none());
+        assert_eq!(f.bridge.operations.count(), 0);
+        assert_eq!(f.bridge.buffers.count(), 0);
+    }
+
+    #[test]
+    fn doc_receiver_runtime_shutdown_wakes_blocked_read() {
+        let f = Fixture::new();
+        let owner = f.bridge.doc_event_receivers.get(f.receiver).unwrap();
+        let weak = Arc::downgrade(&owner);
+        f.recv();
+        eventually(|| owner.pending.try_lock().is_err());
+        drop(owner);
+        assert_eq!(unsafe { aster_runtime_close(f.runtime) }, 0);
+        eventually(|| weak.upgrade().is_none());
+        assert_eq!(f.bridge.doc_event_receivers.count(), 0);
+        assert_eq!(f.bridge.operations.count(), 0);
+        let teardown = f.bridge.teardown.clone();
+        drop(f);
+        assert!(
+            teardown.wait(Duration::from_secs(5)),
+            "blocked receive retained runtime"
+        );
+    }
+
+    #[test]
+    fn doc_receiver_join_subscribe_uses_related_and_independent_ownership() {
+        let f = Fixture::new();
+        unsafe {
+            let mut op = 0;
+            assert_eq!(
+                aster_doc_share(
+                    f.runtime,
+                    f.doc,
+                    aster_doc_share_mode_t::ASTER_DOC_SHARE_WRITE as u32,
+                    0,
+                    &mut op
+                ),
+                0
+            );
+            let event = wait_for_successful_operation(
+                f.runtime,
+                op,
+                aster_event_kind_t::ASTER_EVENT_DOC_SHARED,
+            );
+            let ticket = slice::from_raw_parts(event.data_ptr, event.data_len).to_vec();
+            assert_eq!(aster_buffer_release(f.runtime, event.buffer), 0);
+            let node = start_node(f.runtime, &[b"doc-join-receiver-test"]);
+            assert_eq!(
+                aster_docs_join_and_subscribe(f.runtime, node, bytes(&ticket), 0, &mut op),
+                0
+            );
+            let event = wait_for_successful_operation(
+                f.runtime,
+                op,
+                aster_event_kind_t::ASTER_EVENT_DOC_JOINED_AND_SUBSCRIBED,
+            );
+            assert!(f.bridge.docs.get(event.handle).is_some());
+            let owner = f
+                .bridge
+                .doc_event_receivers
+                .get(event.related)
+                .expect("receiver in related");
+            assert_eq!(event.flags, 0);
+            assert_eq!(aster_doc_free(f.runtime, event.handle), 0);
+            assert!(f.bridge.doc_event_receivers.get(event.related).is_some());
+            let weak = Arc::downgrade(&owner);
+            drop(owner);
+            assert_eq!(aster_doc_event_receiver_free(f.runtime, event.related), 0);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(aster_doc_event_receiver_free(f.runtime, f.receiver), 0);
+            assert_eq!(f.bridge.doc_event_receivers.count(), 0);
+        }
     }
 }

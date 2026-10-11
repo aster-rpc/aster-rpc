@@ -56,12 +56,12 @@ packages = {
 # in lockstep with the package versions stamped above; Cargo uses the path in a
 # checkout and the version from the target registry in a published `.crate`.
 versioned_path_dependencies = {
-    "ffi/Cargo.toml": ["aster", "aster_transport_core", "aster-otel"],
+    "ffi/Cargo.toml": ["aster", "aster_transport_core", "aster-otel", "aster-transport-salvo"],
     "aster/Cargo.toml": ["aster_transport_core", "aster-expose", "aster-macros", "aster-otel"],
     "aster-expose/Cargo.toml": ["aster_transport_core"],
     "aster-transport-salvo/Cargo.toml": ["aster", "aster_transport_core"],
-    "bindings/python/rust/Cargo.toml": ["aster", "aster_transport_core", "aster-otel"],
-    "bindings/typescript/native/Cargo.toml": ["aster", "aster_transport_core", "aster-otel"],
+    "bindings/python/rust/Cargo.toml": ["aster-transport-salvo", "aster", "aster_transport_core", "aster-otel"],
+    "bindings/typescript/native/Cargo.toml": ["aster-transport-salvo", "aster", "aster_transport_core", "aster-otel"],
 }
 
 package_block_re = re.compile(

@@ -289,6 +289,27 @@ public final class AsterServer implements AutoCloseable {
     return dispatch.liveCalls();
   }
 
+  /**
+   * Start a bind-ready authenticated HTTPS/optional WebTransport listener over these services.
+   * Register {@code upcalls.serveRpcAuthenticator(...)} first. The table must use {@code
+   * node().runtime()}; this server's close also stops and joins every child listener.
+   * Authentication supplies the principal and Gate 3 attributes and does not grant Iroh transport
+   * provenance.
+   */
+  public HttpListener startHttp(site.aster.upcall.Upcalls upcalls, HttpListenerConfig config) {
+    if (!running.get()) {
+      throw IrohException.forStatus(site.aster.ffi.IrohStatus.ALREADY_CLOSED, "server closed");
+    }
+    return dispatch.startHttp(upcalls, config);
+  }
+
+  /** Explicit anonymous HTTPS/WebTransport; requires no authentication table. */
+  public HttpListener startPublicHttp(HttpListenerConfig config) {
+    if (!running.get())
+      throw IrohException.forStatus(site.aster.ffi.IrohStatus.ALREADY_CLOSED, "server closed");
+    return dispatch.startPublicHttp(config);
+  }
+
   @Override
   public void close() {
     if (!running.compareAndSet(true, false)) {
@@ -548,11 +569,12 @@ public final class AsterServer implements AutoCloseable {
             ? new HashMap<>(dispatch.metadata(callId))
             : new HashMap<>();
     Map<String, String> attributes = new HashMap<>();
-    Map<String, String> peerAttrs = peerAttributes.get(call.peer());
+    Map<String, String> peerAttrs =
+        (flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0 ? peerAttributes.get(call.peer()) : null;
     if (peerAttrs != null) {
       attributes.putAll(peerAttrs);
     }
-    if ((flags & Dispatch.FLAG_HAS_ATTRIBUTES) != 0 && peerAttrs == null) {
+    if ((flags & Dispatch.FLAG_HAS_ATTRIBUTES) != 0) {
       attributes.putAll(dispatch.attributes(callId));
     }
 
@@ -575,6 +597,7 @@ public final class AsterServer implements AutoCloseable {
     var d = method.descriptor();
     return CallContext.builder(call.service().descriptor.name(), d.name())
         .peer(call.peer())
+        .irohAuthenticated((flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0)
         .metadata(metadata)
         .attributes(attributes)
         .deadline(call.deadlineUnixMs() > 0 ? call.deadlineUnixMs() / 1000.0 : null)
@@ -656,6 +679,8 @@ public final class AsterServer implements AutoCloseable {
   public static final class Builder {
     private AsterConfig config;
     private Codec codec;
+    private boolean builtinTopology;
+    private site.aster.contract.CapabilityRequirement topologyRequirement;
     private final Map<String, RegisteredService> services = new LinkedHashMap<>();
     private List<Interceptor> interceptors = List.of();
     private List<String> alpns = List.of(ASTER_ALPN, CONSUMER_ADMISSION_ALPN);
@@ -693,6 +718,18 @@ public final class AsterServer implements AutoCloseable {
 
     public Builder config(AsterConfig config) {
       this.config = config;
+      return this;
+    }
+
+    /** Explicitly enable/disable aster.net.Topology; disabled by default. Requires monitoring. */
+    public Builder builtinTopology(boolean enabled) {
+      builtinTopology = enabled;
+      return this;
+    }
+
+    /** Optional Rust-enforced role policy for every topology RPC method. */
+    public Builder topologyRequires(site.aster.contract.CapabilityRequirement requirement) {
+      topologyRequirement = requirement;
       return this;
     }
 
@@ -782,6 +819,9 @@ public final class AsterServer implements AutoCloseable {
     }
 
     public CompletableFuture<AsterServer> build() {
+      if (builtinTopology && (config == null || !config.enableMonitoring()))
+        return CompletableFuture.failedFuture(
+            new IllegalArgumentException("builtinTopology requires monitoring"));
       Observability
           .ensureStarted(); // opens the log bridge (design Q2); exporters only if OTEL_* asks
       List<byte[]> alpnBytes = alpns.stream().map(s -> s.getBytes(StandardCharsets.UTF_8)).toList();
@@ -834,6 +874,7 @@ public final class AsterServer implements AutoCloseable {
           byIndex[idx] = rs;
         }
         b.option(Dispatch.OPTION_MAX_SESSIONS_PER_CONNECTION, maxSessionsPerConnection);
+        b.topology(builtinTopology, topologyRequirement);
         site.aster.health.HealthServer attached = health;
         boolean owned = false;
         if (attached == null && healthPort >= 0) {

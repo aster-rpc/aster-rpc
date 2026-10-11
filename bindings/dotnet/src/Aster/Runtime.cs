@@ -99,49 +99,52 @@ public sealed class Runtime : IDisposable
     /// </summary>
     public Task<Event> WaitForAsync(ulong opId, CancellationToken cancellationToken = default)
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(Runtime));
-
         // The native submit has already returned opId, so the completion may
         // have been dispatched before we get here. Both sides use GetOrAdd so
         // whichever arrives first creates the TCS and the other finds it.
-        var tcs = _ops.GetOrAdd(opId, NewTcs);
-
-        if (tcs.Task.IsCompleted)
+        // Check shutdown under the same lock as registration: Close must not
+        // miss a waiter inserted after its final sweep.
+        TaskCompletionSource<Event> tcs;
+        lock (_completionGate)
         {
-            _ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(opId, tcs));
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(Runtime));
+            tcs = _ops.GetOrAdd(opId, NewTcs);
+            if (tcs.Task.IsCompleted)
+            {
+                _ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(opId, tcs));
+                return tcs.Task;
+            }
+            CancellationTokenRegistration registration = default;
+            if (cancellationToken.CanBeCanceled)
+            {
+                registration = cancellationToken.Register(
+                    state =>
+                    {
+                        var (runtime, operation, completion, token) = ((Runtime, ulong, TaskCompletionSource<Event>, CancellationToken))state!;
+                        runtime.CancelWait(operation, completion, token);
+                    },
+                    (this, opId, tcs, cancellationToken), false);
+            }
+
+            // When the Task completes (success, cancel, or fault), unregister.
+            tcs.Task.ContinueWith(
+                (completedTask, state) =>
+                {
+                    var (ops, id, t, reg) = ((ConcurrentDictionary<ulong, TaskCompletionSource<Event>>, ulong, TaskCompletionSource<Event>, CancellationTokenRegistration))state!;
+                    // Keep a cancelled marker until the native terminal event arrives;
+                    // dispatch then releases any buffer instead of creating an orphan TCS.
+                    if (!completedTask.IsCanceled)
+                        ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(id, t));
+                    reg.Dispose();
+                },
+                (_ops, opId, tcs, registration),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+
             return tcs.Task;
         }
-
-        CancellationTokenRegistration registration = default;
-        if (cancellationToken.CanBeCanceled)
-        {
-            registration = cancellationToken.Register(
-                state =>
-                {
-                    var (runtime, operation, completion, token) = ((Runtime, ulong, TaskCompletionSource<Event>, CancellationToken))state!;
-                    runtime.CancelWait(operation, completion, token);
-                },
-                (this, opId, tcs, cancellationToken), false);
-        }
-
-        // When the Task completes (success, cancel, or fault), unregister.
-        tcs.Task.ContinueWith(
-            (completedTask, state) =>
-            {
-                var (ops, id, t, reg) = ((ConcurrentDictionary<ulong, TaskCompletionSource<Event>>, ulong, TaskCompletionSource<Event>, CancellationTokenRegistration))state!;
-                // Keep a cancelled marker until the native terminal event arrives;
-                // dispatch then releases any buffer instead of creating an orphan TCS.
-                if (!completedTask.IsCanceled)
-                    ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(id, t));
-                reg.Dispose();
-            },
-            (_ops, opId, tcs, registration),
-            CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
-
-        return tcs.Task;
     }
 
     /// <summary>
@@ -165,15 +168,22 @@ public sealed class Runtime : IDisposable
     /// <summary>Adds an owner; the runtime closes when every owner has released it.</summary>
     internal Runtime Retain()
     {
-        if (Interlocked.Increment(ref _refCount) <= 1)
-            throw new ObjectDisposedException(nameof(Runtime));
-        return this;
+        lock (_completionGate)
+        {
+            if (_disposed || Volatile.Read(ref _refCount) <= 0)
+                throw new ObjectDisposedException(nameof(Runtime));
+            Interlocked.Increment(ref _refCount);
+            return this;
+        }
     }
 
     /// <summary>Drops one owner (see <see cref="Retain"/>).</summary>
     internal void Release()
     {
-        if (Interlocked.Decrement(ref _refCount) == 0)
+        bool close;
+        lock (_completionGate)
+            close = Interlocked.Decrement(ref _refCount) == 0;
+        if (close)
             Close();
     }
 
@@ -182,7 +192,15 @@ public sealed class Runtime : IDisposable
     /// to <paramref name="handler"/>, called on the poll thread. The event's data buffer is
     /// released after the handler returns, so copy what you need.
     /// </summary>
-    internal void RegisterInbound(ulong handle, Action<Event> handler) => _inbound[handle] = handler;
+    internal void RegisterInbound(ulong handle, Action<Event> handler)
+    {
+        lock (_completionGate)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(Runtime));
+            _inbound[handle] = handler;
+        }
+    }
 
     internal void UnregisterInbound(ulong handle) => _inbound.TryRemove(handle, out _);
 
@@ -198,9 +216,12 @@ public sealed class Runtime : IDisposable
 
     private void Close()
     {
-        if (_disposed)
-            return;
-        _disposed = true;
+        lock (_completionGate)
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+        }
 
         _cts.Cancel();
 
@@ -208,6 +229,22 @@ public sealed class Runtime : IDisposable
         // Signal with a zero-timeout poll to break out of the sleep.
         _pollThread.Join(TimeSpan.FromSeconds(5));
 
+        // Native shutdown does not promise a polled terminal for every op.
+        // After draining committed events, finish all remaining managed waits.
+        // Completed events may already belong to a caller whose continuation
+        // has not removed its TCS yet; native close owns final buffer cleanup.
+        KeyValuePair<ulong, TaskCompletionSource<Event>>[] remaining;
+        lock (_completionGate)
+        {
+            remaining = _ops.ToArray();
+            foreach (var (id, completion) in remaining)
+                _ops.TryRemove(new KeyValuePair<ulong, TaskCompletionSource<Event>>(id, completion));
+            _inbound.Clear();
+        }
+        // Finish outside the lock: a cancellation-registration disposal may
+        // wait for its callback, which also takes _completionGate.
+        foreach (var (_, completion) in remaining)
+            completion.TrySetException(new ObjectDisposedException(nameof(Runtime)));
         Native.aster_runtime_close(_handle);
         _cts.Dispose();
     }
@@ -330,6 +367,8 @@ public sealed class Runtime : IDisposable
     {
         lock (_completionGate)
         {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(Runtime));
             bool hadWaiter = _ops.TryGetValue(opId, out _);
             var pending = _ops.GetOrAdd(opId, NewTcs);
             int r = Native.aster_operation_cancel(_handle, opId);
@@ -348,6 +387,8 @@ public sealed class Runtime : IDisposable
     {
         lock (_completionGate)
         {
+            if (_disposed)
+                return; // Close will fault any pending registered wait.
             int status = Native.aster_operation_cancel(_handle, opId);
             if (status == 0)
             {

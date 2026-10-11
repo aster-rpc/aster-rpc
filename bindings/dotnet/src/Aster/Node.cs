@@ -15,6 +15,9 @@ namespace Aster;
 /// </summary>
 public sealed class Node : IDisposable, IAsyncDisposable
 {
+    /// <summary>Local passive/shared topology. This property does not expose an RPC.</summary>
+    public TopologyView Topology => new(this);
+
     private readonly Runtime _runtime;
     private readonly NodeHandle _handle;
     private readonly bool _ownsRuntime;

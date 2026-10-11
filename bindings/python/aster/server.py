@@ -16,12 +16,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from aster.codec import ForyCodec, ForyConfig
 from aster.limits import LimitExceeded, MAX_METADATA_ENTRIES, validate_metadata
 from aster.rpc_types import RpcScope, SerializationMode
 from aster.service import ServiceRegistry
+from aster.http import HTTPListener
 
 if TYPE_CHECKING:
     import aster
@@ -91,6 +93,8 @@ class Server:
         node: Any = None,
         on_non_rpc: Any = None,
         handler_timeout: float | None = None,
+        builtin_topology: bool = False,
+        topology_requires: Any = None,
     ) -> None:
         """Initialize the server.
 
@@ -119,6 +123,10 @@ class Server:
             handler_timeout: Cap on any handler, seconds (default 300 s,
                 ``<= 0`` = none). Enforced in Rust together with the caller's
                 deadline and the method's ``timeout``.
+            builtin_topology: Explicit opt-in to the native ``aster.net.Topology``
+                baseline RPC. Requires monitoring on the node; default False.
+            topology_requires: Native Gate-3 role, ``any_of`` or ``all_of``
+                requirement for that baseline service.
         """
         self._endpoint = endpoint
         self._owns_endpoint = owns_endpoint
@@ -126,6 +134,8 @@ class Server:
         self._node = node
         self._on_non_rpc = on_non_rpc
         self._handler_timeout_s = handler_timeout
+        self._builtin_topology = builtin_topology
+        self._topology_requires = topology_requires
         self._dispatcher: Any = None
         # Deadlines are enforced by the Rust dispatcher (design sec. 2.4), so
         # there is no server-side deadline interceptor by default.
@@ -174,6 +184,8 @@ class Server:
         self._serving = False
         self._serve_task: asyncio.Task | None = None
         self._shutdown_event = asyncio.Event()
+        self._http_listeners: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._http_closed = False
 
         for service_info in self._registry.get_all_services():
             key = (service_info.name, service_info.version)
@@ -225,10 +237,76 @@ class Server:
             on_non_rpc=self._on_non_rpc,
             max_sessions_per_connection=self._max_sessions_per_connection,
             handler_timeout=self._handler_timeout_s,
+            builtin_topology=self._builtin_topology,
+            topology_requires=self._topology_requires,
         )
         dispatcher.start(self._node)
         self._dispatcher = dispatcher
         return dispatcher
+
+    async def start_http(
+        self, *, authenticator, certificate_pem: bytes, private_key_pem: bytes,
+        bind_addr: str = "127.0.0.1:0", webtransport: bool = False,
+        max_pending_auth: int = 256, max_auth_payload_bytes: int = 65536,
+        upcall_runtime=None,
+    ) -> HTTPListener:
+        """Bind an authenticated PEM HTTPS/optional WT listener.
+
+        Required keyword arguments: authenticator, certificate_pem,
+        private_key_pem. See :mod:`aster.http`. Starts the dispatch pump if
+        necessary. Server close joins child listeners before stopping it.
+        """
+        if self._http_closed:
+            raise ServerError("server is closed")
+        from aster.http import _start_http
+        dispatcher = self.start()
+        if self._serve_task is None or self._serve_task.done():
+            self._serve_task = asyncio.create_task(self.serve(), name="aster-dispatch")
+        listener = await _start_http(
+            dispatcher.server, authenticator=authenticator,
+            certificate_pem=certificate_pem, private_key_pem=private_key_pem,
+            bind_addr=bind_addr, webtransport=webtransport,
+            max_pending_auth=max_pending_auth, max_auth_payload_bytes=max_auth_payload_bytes,
+            upcall_runtime=upcall_runtime,
+        )
+        if self._http_closed:
+            await listener.aclose()
+            raise ServerError("server closed during HTTP startup")
+        self._http_listeners.add(listener)
+        return listener
+
+    async def start_public_http(
+        self, *, certificate_pem: bytes, private_key_pem: bytes,
+        bind_addr: str = "127.0.0.1:0", webtransport: bool = False,
+    ) -> HTTPListener:
+        """Bind explicitly anonymous RPCs with empty attributes and no session services.
+
+        Gate 3 and Iroh-only requirements still apply. Caller headers and address
+        hints never establish a principal. Close joins this child listener.
+        """
+        if self._http_closed:
+            raise ServerError("server is closed")
+        from aster.http import _start_public_http
+        dispatcher = self.start()
+        if self._serve_task is None or self._serve_task.done():
+            self._serve_task = asyncio.create_task(self.serve(), name="aster-dispatch")
+        listener = await _start_public_http(
+            dispatcher.server, certificate_pem=certificate_pem, private_key_pem=private_key_pem,
+            bind_addr=bind_addr, webtransport=webtransport,
+        )
+        if self._http_closed:
+            await listener.aclose()
+            raise ServerError("server closed during HTTP startup")
+        self._http_listeners.add(listener)
+        return listener
+
+    async def _close_http(self) -> None:
+        self._http_closed = True
+        if self._dispatcher is not None and self._dispatcher.server is not None:
+            await self._dispatcher.server.close_http()
+        for listener in list(self._http_listeners):
+            await listener.aclose()
+        self._http_listeners.clear()
 
     async def serve(self, channel_capacity: int = 256) -> None:
         """Serve until cancelled (or :meth:`close`).
@@ -264,6 +342,7 @@ class Server:
     async def close(self) -> None:
         """Stop serving and cancel in-flight handlers."""
         logger.info("Closing server")
+        await self._close_http()
         if self._dispatcher is not None:
             self._dispatcher.close()
 

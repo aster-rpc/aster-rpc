@@ -67,7 +67,7 @@ public sealed class ServerCallContext
     internal ServerCallContext(string service, string method, MethodPattern pattern, string peerId, ulong connectionId,
         int sessionId, ulong sessionKey, object? session,
         IReadOnlyList<KeyValuePair<string, string>> metadata, IReadOnlyDictionary<string, string> attributes,
-        DateTimeOffset? deadline, CancellationToken cancellationToken)
+        DateTimeOffset? deadline, CancellationToken cancellationToken, bool irohAuthenticated = false)
     {
         Service = service;
         Method = method;
@@ -81,16 +81,20 @@ public sealed class ServerCallContext
         Attributes = attributes;
         Deadline = deadline;
         CancellationToken = cancellationToken;
+        IrohAuthenticated = irohAuthenticated;
     }
 
     public string Service { get; }
     public string Method { get; }
     public MethodPattern Pattern { get; }
 
-    /// <summary>The caller's node id (64 hex).</summary>
+    /// <summary>The resolved principal, or the caller's node id on an Iroh-authenticated call.</summary>
     public string PeerId { get; }
 
-    /// <summary>Server connection id: key per-connection state on it (see <see cref="AsterServer.ConnectionClosed"/>).</summary>
+    /// <summary>True only for transport-authenticated Iroh calls; credential authentication does not upgrade HTTP/WT provenance.</summary>
+    public bool IrohAuthenticated { get; }
+
+    /// <summary>Iroh server connection id; zero for HTTP/WT. Only use nonzero ids for per-connection state (see <see cref="AsterServer.ConnectionClosed"/>).</summary>
     public ulong ConnectionId { get; }
 
     /// <summary>The wire session id (0 = shared service); for logs. Rust keys the session by <see cref="SessionKey"/>.</summary>

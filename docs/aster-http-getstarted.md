@@ -12,6 +12,17 @@ is transport-agnostic.
 > payload types — are covered in [Getting started with the `aster`
 > crate](./aster-rust-getstarted.md). This guide is the HTTP layer on top.
 
+This guide describes the Rust transport, including its broader TLS, projection
+and routing options. Scoped owned PEM listeners, with explicit authenticated
+or public serving APIs and certificate helpers, are also
+available in [Go](../bindings/go/README.md#authenticated-https-and-webtransport),
+[Java and Kotlin](../bindings/java/README.md#authenticated-https-and-webtransport-listeners),
+[.NET](../bindings/dotnet/README.md#authenticated-https-and-webtransport-serving),
+[Python](../bindings/python/README.md), and
+[TypeScript](../bindings/typescript/packages/aster/README.md#authenticated-https-and-webtransport-listeners).
+Those language guides define their available configuration and cleanup APIs;
+the Rust options below are not a claim of identical foreign-language coverage.
+
 ---
 
 ## 1. Add the dependencies
@@ -78,6 +89,68 @@ srv.run().await;                               // serves until shutdown
 services as Iroh. `with_http` is **off by default** — without it you get an
 Iroh-only node, exactly as before.
 
+### Own an authenticated listener
+
+Use `HttpConfig::start_authenticated` when startup must report bound readiness
+and shutdown must release the listener's ports. It accepts operator-supplied
+PEM and an explicit `Arc<dyn Authenticator>`; the `BearerAuth` example in §7
+rejects missing credentials and resolves an authenticated principal.
+
+```rust
+use std::{sync::Arc, time::Duration};
+use aster::rpc::Server;
+use aster_transport_salvo::{HttpConfig, TlsMaterial};
+
+let server = Server::new(&node).register(svc);
+let dispatcher = server.dispatcher();
+let _iroh = server.serve();
+let mut listener = HttpConfig::new(
+    "127.0.0.1:0",
+    TlsMaterial::pem(cert_pem, key_pem),
+)
+.webtransport(true)
+.start_authenticated(dispatcher, Arc::new(BearerAuth))
+.await?;
+
+println!("HTTPS: {}", listener.tcp_addr());
+println!("HTTP/3 + WebTransport: {:?}", listener.quic_addr());
+
+// Wait for your application's shutdown signal, then drain and join.
+listener.shutdown(Duration::from_secs(2)).await?;
+```
+
+Both sockets are bound before startup returns. With `webtransport(true)`, QUIC
+uses the exact TCP address and port, including the assigned port when binding
+to `:0`; otherwise `quic_addr()` is `None`. Binding or PEM errors are returned.
+This listener uses a dispatcher clone with the supplied authentication policy;
+the original dispatcher's policy, including its Iroh serving policy, is unchanged.
+Authentication covers routed RPCs. Configured static mounts remain public files.
+
+`stop(grace)` and its alias `shutdown(grace)` stop admitting new calls, allow
+existing work to finish during the grace period, then cancel remaining work and
+join cleanup. QUIC's protocol close/drain and final socket release can take
+longer than the application grace period. Successful shutdown guarantees that
+TCP and UDP ports are released. Cancelling a shutdown future retains ownership:
+call shutdown again to finish joining. Dropping the listener schedules forced
+cleanup on its runtime; await shutdown when port release must be complete before
+continuing. Repeated successful shutdown is harmless.
+
+### Explicit public serving
+
+Use `HttpConfig::start_public(dispatcher).await` only when uncredentialed RPC
+calls are intentional. It has the same PEM, bound-readiness and owned-shutdown
+contract as `start_authenticated`, but supplies empty capability attributes.
+Gate 3 and Iroh-only checks still apply. All session-scoped services return
+`UNAUTHENTICATED` before their factories run: an address or client-supplied
+session ID is not an authenticated identity. This policy is local to the
+listener and does not change the original dispatcher's Iroh policy.
+
+Foreign bindings expose separately named public-start methods; authenticated
+start never falls back to public mode when its authenticator is absent or
+fails. C ABI 4.12, Go, Java/Kotlin and .NET require zero authentication-limit
+fields for public start; Python and TypeScript likewise reject nonzero limits.
+See their guides above for method names and lifecycle details.
+
 ### Compose a Salvo application
 
 When you run other servers in the same process (your own routes, a separate
@@ -132,6 +205,8 @@ TlsMaterial::self_signed_for_node(node.id().to_string(), ["localhost".into()]);
 `serve_https` serves **H1/H2 over TCP + H3 over QUIC** on one address for PEM /
 self-signed (ACME is H1/H2 today). For PEM/self-signed you can also build a
 `RustlsConfig` yourself with `rustls_config(&tls)`.
+The owned `start_authenticated` API accepts PEM only; generated development
+certificates can be passed through `TlsMaterial::pem(cert.cert_pem, cert.key_pem)`.
 
 ---
 
@@ -227,6 +302,14 @@ per call**: write a header frame (the `StreamHeader`) + request frames; read bac
 response frames + the status trailer — the same bi-stream-per-call model as Iroh.
 All four patterns ride it.
 
+Authentication runs separately for every RPC stream. Put credentials in each
+call's `StreamHeader.metadata_keys` / `metadata_values`, for example
+`["authorization"]` / `["Bearer secret"]`. HTTP headers on the WebTransport
+session handshake do not supply RPC credentials to its streams. Opening a
+session successfully does not authorize its calls; each call still passes
+authentication and Gate 3. An authenticated principal remains
+`PeerProvenance::Other`, so an Iroh-only service remains unavailable over WT.
+
 ### Stream priority
 
 Tag a call with an **RFC 9218 urgency** (`0` = most urgent … `7` = background) via
@@ -286,7 +369,7 @@ let cert = generate_webtransport_cert(
 
 // Client/relay: after learning the peer's node id over a trusted Aster channel,
 // verify the served cert really belongs to it — a substituted (MITM) cert fails.
-verify_cert_binding(&served_cert_pem, &expected_node_id)?; // Ok ⇒ node key signed this exact cert
+verify_cert_binding(&served_cert_pem, &expected_node_id)?; // Ok ⇒ node key signed this TLS public key
 ```
 
 `verify_cert_binding` requires the node id you expect (from the ticket /
@@ -295,6 +378,17 @@ would accept an attacker's self-consistent cert. With it, an attacker can't serv
 a substitute cert: they can't produce your Ed25519 signature over their TLS key.
 Browsers don't check this extension (they ignore unknown SANs); it's for
 **Aster-side** verifiers (a relay, a native peer, the edge proxy).
+
+Foreign-language certificate helpers return copied certificate/key PEM and
+the SHA-256 of the complete DER certificate. They generate either a normal
+self-signed ECDSA certificate or WebTransport-suitable P-256 material with
+validity at most 14 days. An optional 32-byte Aster node secret adds a signed
+binding; without it the certificate is identity-unbound. Foreign helpers do not
+expose unsigned `NodeBinding::Claim`. Their verification API requires an
+expected node ID learned through a trusted channel and proves the signed TLS
+public-key binding, not the whole certificate, chain, hostname, validity period
+or trust in that expected ID. Protect the private-key PEM. These helpers are
+not ACME and make no FIPS validation claim.
 
 > ⚠️ ACME certs can't carry this — see the note in §3. Identity binding applies to
 > the self-signed / WebTransport certs only.
@@ -309,7 +403,7 @@ reject or resolve a principal + attributes. (The transport copies HTTP headers
 into Aster metadata, lowercased, so `authorization` is visible.)
 
 ```rust
-use aster::rpc::{Authenticator, AuthContext, AuthOutcome, RpcStatus};
+use aster::rpc::{Authenticator, AuthContext, AuthOutcome, RpcStatus, StatusCode};
 use std::collections::HashMap;
 
 struct BearerAuth;
@@ -317,11 +411,12 @@ struct BearerAuth;
 #[aster::rpc::async_trait]
 impl Authenticator for BearerAuth {
     async fn authenticate(&self, ctx: &AuthContext) -> Result<AuthOutcome, RpcStatus> {
-        let mut attributes = HashMap::new();
-        if ctx.metadata.get("authorization").map(String::as_str) == Some("Bearer secret") {
-            attributes.insert("aster.role".into(), "operator".into());
+        if ctx.metadata.get("authorization").map(String::as_str) != Some("Bearer secret") {
+            return Err(RpcStatus::error(StatusCode::Unauthenticated, "invalid credential"));
         }
-        Ok(AuthOutcome { principal: None, attributes })
+        let mut attributes = HashMap::new();
+        attributes.insert("aster.role".into(), "operator".into());
+        Ok(AuthOutcome { principal: Some("operator-1".into()), attributes })
     }
 }
 
@@ -332,7 +427,14 @@ Resolved attributes feed the capability gate: a method tagged
 `#[rpc(requires = require_role("operator"))]` then passes only with the right
 credential. Attributes merge with the enrollment `AttributeStore` —
 **enrollment wins on collision** (a per-request delegate can't overwrite a
-vouched attribute). The same `Authenticator` applies over Iroh too.
+vouched attribute). When configured on `Server` or `AsterServer`, the same
+`Authenticator` applies over Iroh too.
+`start_authenticated` instead supplies a policy for the owned HTTP/WT listener
+without changing the original dispatcher. HTTP/WT authentication resolves an
+application principal; it never upgrades the call to Iroh-authenticated
+transport provenance. Authentication is cancelled when the caller disconnects
+or its RPC deadline expires, before creating an HTTP-scoped session or starting
+the handler.
 
 ---
 
@@ -376,6 +478,8 @@ let app = salvo::Router::new()
 `/aster/*` always wins over a catch-all static mount, so RPC and your SPA
 coexist. The public-SPA pattern is the right default: serve the whole bundle
 (login UI included) publicly, gate the *RPC calls*, not the static assets.
+This also applies to mounts on `start_authenticated`: its authenticator runs
+for RPCs and does not protect static files.
 
 ---
 
@@ -402,6 +506,15 @@ is unchanged.
 WebTransport `serverCertificateHashes`), browser JSON/NDJSON projections,
 per-call WebTransport stream priority, pluggable auth, session-scoped services,
 filesystem static files, no-request methods — all on the same dispatcher as Iroh.
+Owned authenticated PEM listeners additionally report bound readiness and offer
+joined graceful shutdown. C ABI 4.12 adds explicit public serving and certificate
+helpers to the authenticated listener surface introduced in 4.11. Go,
+Java/Kotlin and .NET use that ABI; Python and TypeScript use their native Rust
+bridges. The authenticated and explicitly public serving APIs support the four
+RPC patterns over HTTPS and WebTransport. They do not expose Rust's full TLS,
+static-mount or projection configuration. ACME listener ownership remains
+pending. They add no
+HTTP/WT client wrappers. See the language guides linked above for each API.
 
 **Not yet:** `#[aster::service(scoped = "session")]` macro sugar (use
 `register_session`), session idle-TTL / connection-close reaping (use

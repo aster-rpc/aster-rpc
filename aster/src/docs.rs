@@ -639,7 +639,15 @@ impl Doc {
 
     /// Read multiple content blobs that are already complete locally.
     ///
-    /// Missing or partial values return `None` at their original index.
+    /// Preserves input length/order and duplicates. Missing/partial local blobs
+    /// return `None`; complete empty content returns `Some(Vec::new())`. Empty
+    /// input returns an empty list. All hashes are validated before store reads.
+    /// No fetch, tags or retention mutation occurs.
+    ///
+    /// This is not a global snapshot: a later GC/availability change can make
+    /// a large validated export fail. Storage/export/integrity errors fail the
+    /// entire call and are never disguised as `None`. Use blob custody for
+    /// stable retention during reads and host verification.
     pub async fn read_entry_contents_if_complete(
         &self,
         content_hashes: &[Hash],

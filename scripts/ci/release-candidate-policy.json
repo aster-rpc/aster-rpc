@@ -15,6 +15,7 @@
     "ffi-natives-cross",
     "ffi-macos",
     "ffi-package",
+    "ffi-archive-consumers",
     "npm-native-linux-x64",
     "npm-native-cross",
     "npm-native-darwin",

@@ -71,6 +71,7 @@ try:
         Hash,
         # Blobs
         BlobsClient,
+        BlobCustody,
         BlobFormat,
         FetchStrategy,
         FetchReport,
@@ -148,6 +149,13 @@ except ImportError as e:
 DocDownloadPolicy = DownloadPolicy
 
 from .config import AsterConfig
+from .provisioning import (
+    ProvisioningError, GenesisVoter, GenesisSpec, JoinPermitSpec,
+    VerifiedGenesis, VerifiedJoinPermit, canonical_genesis, canonical_join_permit,
+    genesis_signing_bytes, join_signing_bytes, genesis_hash,
+    signed_document_from_parts, canonical_candidate_ticket,
+    verify_genesis, verify_join_permit_for_start,
+)
 from .audit_outbox import (
     AuditDestination, AuditOutboxConfig, AuditEvent, AuditOutbox,
     AuditOutboxError, AuditOutboxStatus, AuditDeliveryError,
@@ -317,6 +325,9 @@ from .decorators import (
     MethodInfo,
 )
 from .service import ServiceRegistry, get_default_registry, set_default_registry
+from .http import (HTTPListener, RPCAuthRequest, RPCAuthResponse, GeneratedCertificate,
+                   generate_self_signed_certificate, generate_webtransport_certificate,
+                   verify_certificate_binding)
 from .server import (
     Server,
     ServerError,
@@ -350,6 +361,14 @@ from .interceptors import (
 __version__ = VERSION
 
 __all__ = [
+    "ProvisioningError", "GenesisVoter", "GenesisSpec", "JoinPermitSpec",
+    "VerifiedGenesis", "VerifiedJoinPermit", "canonical_genesis", "canonical_join_permit",
+    "genesis_signing_bytes", "join_signing_bytes", "genesis_hash",
+    "signed_document_from_parts", "canonical_candidate_ticket",
+    "verify_genesis", "verify_join_permit_for_start",
+    "HTTPListener", "RPCAuthRequest", "RPCAuthResponse", "GeneratedCertificate",
+    "generate_self_signed_certificate", "generate_webtransport_certificate",
+    "verify_certificate_binding",
     "AuditDestination", "AuditOutboxConfig", "AuditEvent", "AuditOutbox",
     "AuditOutboxError", "AuditOutboxStatus", "AuditDeliveryError",
     "AuditDispositionReceipt", "AuditQuarantineExport",
@@ -367,6 +386,7 @@ __all__ = [
     "NodeId",
     "Hash",
     "BlobsClient",
+    "BlobCustody",
     "BlobFormat",
     "FetchStrategy",
     "FetchReport",

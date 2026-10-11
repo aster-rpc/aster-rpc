@@ -43,11 +43,19 @@ func TestABI_StructSizes(t *testing.T) {
 		"aster_span_context_t":         32,
 		"aster_span_record_t":          152,
 		"aster_health_config_t":        24,
+		"aster_http_server_config_t":   64,
+		"aster_generated_cert_t":       64,
 	}
 	got := cStructSizes()
 	for name, w := range want {
 		if got[name] != w {
 			t.Errorf("sizeof(%s) = %d, want %d", name, got[name], w)
+		}
+	}
+	for name, off := range httpServerConfigOffsets() {
+		want := map[string]uintptr{"struct_size": 0, "flags": 4, "bind_addr": 8, "cert_pem": 24, "key_pem": 40, "max_pending_auth": 56, "max_auth_payload_bytes": 60}
+		if off != want[name] {
+			t.Errorf("HTTP config offset %s = %d, want %d", name, off, want[name])
 		}
 	}
 	wantOff := map[string]uintptr{
@@ -97,7 +105,8 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		"UPCALL_KIND_LEASE_AUTHORIZE": 3, "UPCALL_KIND_FENCED_MUTATE": 4, "UPCALL_KIND_TOPOLOGY_ADMITTED": 16,
 		"UPCALL_KIND_EXPOSE_AUTHORIZE": 48, "UPCALL_KIND_EXPOSE_HTTP": 49, "UPCALL_KIND_EXPOSE_ROUTE_POLICY": 50,
 		"UPCALL_KIND_ADMISSION_CONNECT": 64, "UPCALL_KIND_ADMISSION_HANDSHAKE": 65,
-		"UPCALL_STATUS_OK": 0, "UPCALL_STATUS_ERROR": 1, "UPCALL_STATUS_UNIMPLEMENTED": 2,
+		"UPCALL_KIND_RPC_AUTHENTICATE": int64(UpcallRpcAuthenticate),
+		"UPCALL_STATUS_OK":             0, "UPCALL_STATUS_ERROR": 1, "UPCALL_STATUS_UNIMPLEMENTED": 2,
 		"UPCALL_CANCEL_NONE": 0, "UPCALL_CANCEL_TIMEOUT": 1, "UPCALL_CANCEL_ABANDONED": 2, "UPCALL_CANCEL_SHUTDOWN": 3,
 		"LEASE_STATUS_HELD": 0, "LEASE_STATUS_RELEASED": 1, "LEASE_STATUS_FENCED": 2, "LEASE_STATUS_LOST": 3,
 		"EVENT_LEASE_ACQUIRED": 107, "EVENT_LEASE_STATUS": 108,
@@ -110,6 +119,9 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		"HTTP_BODY_BUFFER_TOO_SMALL": 17, "EVENT_HTTP_RELAY_READY": 109,
 		"STATUS_UNAUTHENTICATED": 14, "STATUS_PERMISSION_DENIED": 15, "STATUS_CREDENTIAL_EXPIRED": 16,
 		"EVENT_COORDINATION_CLIENT_OPENED": 110, "EVENT_COORDINATION_RESOLVED": 111, "EVENT_COORDINATION_RESULT": 112,
+		"EVENT_DOC_CONTENTS_BATCH":          119,
+		"EVENT_TOPOLOGY_SNAPSHOT":           120,
+		"EVENT_BLOB_CUSTODY_DONE":           118,
 		"EVENT_COORDINATION_LEASE_ACQUIRED": 113, "COORDINATION_CLIENT_READ_ONLY": 1,
 		"COORDINATION_ERROR_NONE": 0, "COORDINATION_ERROR_AWAITING_ACK": 1, "COORDINATION_ERROR_UNRESOLVED": 2,
 		"COORDINATION_ERROR_JOURNAL_LOCKED": 3, "COORDINATION_ERROR_JOURNAL_FATAL": 4, "COORDINATION_ERROR_RPC": 5,
@@ -160,9 +172,12 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if CoordRPC != 5 || CoordClosed != 7 || CoordOther != 10 || MutateCancelMembership != 10 || ReadRecoveryExport != 8 {
 		t.Error("coordination enums drifted from the header")
 	}
-	// ABI 4.1 .. 4.9 are all in the library.
-	if _, minor, _ := Version(); minor < 9 || ABIMinorRequired != 9 {
-		t.Errorf("library ABI minor %d, binding needs >= 9 (floor %d)", minor, ABIMinorRequired)
+	if ASTER_EVENT_TOPOLOGY_SNAPSHOT != 120 {
+		t.Error("topology snapshot event drifted from header")
+	}
+	// ABI 4.1 .. 4.16 are all in the library.
+	if _, minor, _ := Version(); minor < 16 || ABIMinorRequired != 16 {
+		t.Errorf("library ABI minor %d, binding needs >= 16 (floor %d)", minor, ABIMinorRequired)
 	}
 	if ASTER_STATUS_ALREADY_EXISTS != 17 || !errors.Is(wrapError(ASTER_STATUS_ALREADY_EXISTS), ErrAlreadyExists) ||
 		StatusName(17) != "ASTER_STATUS_ALREADY_EXISTS" {

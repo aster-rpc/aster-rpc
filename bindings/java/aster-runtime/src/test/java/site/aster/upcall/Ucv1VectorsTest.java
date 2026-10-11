@@ -58,6 +58,33 @@ final class Ucv1VectorsTest {
 
   private static Codec codec(String type) {
     return switch (type) {
+      case "RpcAuthRequest" ->
+          new Codec(
+              b -> {
+                var r = Ucv1.decodeRpcAuthRequest(b);
+                return map(
+                    "peer_id",
+                    r.peerId(),
+                    "service",
+                    r.service(),
+                    "method",
+                    r.method(),
+                    "session_id",
+                    r.sessionId(),
+                    "metadata",
+                    r.metadata());
+              },
+              b -> Ucv1.encodeRpcAuthRequest(Ucv1.decodeRpcAuthRequest(b)));
+      case "RpcAuthResponse" ->
+          new Codec(
+              b -> {
+                var r = Ucv1.decodeRpcAuthResponse(b);
+                return r.accepted()
+                    ? map(
+                        "accepted", true, "principal", r.principal(), "attributes", r.attributes())
+                    : map("accepted", false);
+              },
+              b -> Ucv1.encodeRpcAuthResponse(Ucv1.decodeRpcAuthResponse(b)));
       case "LeaseTransitionRequest" ->
           new Codec(
               b -> {
@@ -371,7 +398,7 @@ final class Ucv1VectorsTest {
       assertArrayEquals(bytes, c.roundTrip().apply(bytes), name);
       checked++;
     }
-    assertEquals(41, checked);
+    assertEquals(46, checked);
   }
 
   @Test
@@ -385,7 +412,7 @@ final class Ucv1VectorsTest {
           Ucv1.DecodeException.class, () -> c.render().apply(bytes), v.get("name").asText());
       checked++;
     }
-    assertEquals(21, checked);
+    assertEquals(29, checked);
   }
 
   @Test

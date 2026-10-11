@@ -3,6 +3,9 @@
 package aster
 
 import (
+	"bytes"
+	"encoding/binary"
+	"reflect"
 	"testing"
 )
 
@@ -156,5 +159,56 @@ func TestHookConstants(t *testing.T) {
 	}
 	if ASTER_EVENT_HOOK_INVOCATION_RELEASED != 72 {
 		t.Errorf("ASTER_EVENT_HOOK_INVOCATION_RELEASED = %d, want 72", ASTER_EVENT_HOOK_INVOCATION_RELEASED)
+	}
+}
+
+// This fixture follows ffi/src/lib.rs::encode_entry_payload rather than the Go parser.
+func docMetadataFixture(author, key, hash string, contentLen, timestamp uint64) []byte {
+	var p []byte
+	for _, field := range []string{author, key, hash} {
+		p = binary.LittleEndian.AppendUint32(p, uint32(len(field)))
+		p = append(p, []byte(field)...)
+	}
+	p = binary.LittleEndian.AppendUint64(p, contentLen)
+	return binary.LittleEndian.AppendUint64(p, timestamp)
+}
+
+func TestDocQueryPayload(t *testing.T) {
+	first := DocEntry{Author: AuthorID(string(bytes.Repeat([]byte("a"), 64))), Key: "policy/\x00\xff", ContentHash: BlobID(string(bytes.Repeat([]byte("b"), 64))), ContentLen: ^uint64(0), Timestamp: 1234567890123456}
+	second := DocEntry{Author: "second-author", Key: "", ContentHash: "second-hash", ContentLen: 7, Timestamp: 42}
+	p := append(docMetadataFixture(string(first.Author), first.Key, string(first.ContentHash), first.ContentLen, first.Timestamp), docMetadataFixture(string(second.Author), second.Key, string(second.ContentHash), second.ContentLen, second.Timestamp)...)
+	got, err := parseDocEntryList(p)
+	if err != nil || !reflect.DeepEqual(got, []DocEntry{first, second}) {
+		t.Fatalf("entries = %+v, %v", got, err)
+	}
+	for _, entry := range got {
+		if entry.Value != nil {
+			t.Fatalf("query synthesized inline content: %x", entry.Value)
+		}
+	}
+	empty, err := parseDocEntryList(nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty = %+v, %v", empty, err)
+	}
+}
+
+func TestDocQueryMalformedPayload(t *testing.T) {
+	p := docMetadataFixture("author", "key", "hash", 999, 42)
+	for n := 1; n < len(p); n++ {
+		if got, err := parseDocEntryList(p[:n]); err == nil || got != nil {
+			t.Fatalf("truncation %d: got %+v, %v", n, got, err)
+		}
+	}
+	for _, offset := range []int{0, 10, 17} {
+		bad := bytes.Clone(p)
+		binary.LittleEndian.PutUint32(bad[offset:], ^uint32(0))
+		if got, err := parseDocEntryList(bad); err == nil || got != nil {
+			t.Fatalf("oversized field at %d: %+v, %v", offset, got, err)
+		}
+	}
+	for _, bad := range [][]byte{append(bytes.Clone(p), 1), append(bytes.Clone(p), p[:len(p)-1]...)} {
+		if got, err := parseDocEntryList(bad); err == nil || got != nil {
+			t.Fatalf("invalid tail: %+v, %v", got, err)
+		}
 	}
 }

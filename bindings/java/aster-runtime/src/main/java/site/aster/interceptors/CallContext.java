@@ -59,6 +59,7 @@ public final class CallContext {
   private final String callId;
   private final String sessionId;
   private final String peer;
+  private final boolean irohAuthenticated;
   private final Map<String, String> metadata;
   private final Map<String, String> attributes;
   private final Double deadline;
@@ -77,6 +78,7 @@ public final class CallContext {
     this.callId = builder.callId != null ? builder.callId : UUID.randomUUID().toString();
     this.sessionId = builder.sessionId;
     this.peer = builder.peer;
+    this.irohAuthenticated = builder.irohAuthenticated;
     this.metadata = builder.metadata;
     this.attributes = builder.attributes;
     this.deadline = builder.deadline;
@@ -108,6 +110,11 @@ public final class CallContext {
 
   public String peer() {
     return peer;
+  }
+
+  /** True only for native Iroh endpoint authentication, never for an HTTP auth callback. */
+  public boolean irohAuthenticated() {
+    return irohAuthenticated;
   }
 
   public Map<String, String> metadata() {
@@ -203,6 +210,7 @@ public final class CallContext {
     private String callId;
     private String sessionId;
     private String peer;
+    private boolean irohAuthenticated;
     private Map<String, String> metadata = new HashMap<>();
     private Map<String, String> attributes = new HashMap<>();
     private Double deadline;
@@ -232,6 +240,11 @@ public final class CallContext {
 
     public Builder peer(String peer) {
       this.peer = peer;
+      return this;
+    }
+
+    public Builder irohAuthenticated(boolean value) {
+      this.irohAuthenticated = value;
       return this;
     }
 

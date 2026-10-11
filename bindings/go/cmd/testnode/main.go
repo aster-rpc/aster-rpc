@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	aster "aster-ffi"
+	aster "sdk.getaster.now/go"
 )
 
 const ALPN = "aster"

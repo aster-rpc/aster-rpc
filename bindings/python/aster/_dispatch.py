@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import sys
 import time
@@ -92,6 +93,7 @@ class ServerCallContext(CallContext):
         d["call_id"] = str(wire_id) if wire_id else str(call.call_id)
         d["session_id"] = str(call.session_key) if call.session_key else None
         d["peer"] = call.peer
+        d["iroh_authenticated"] = bool(call.flags & FLAG_IROH_AUTHENTICATED)
         secs = call.deadline_secs
         d["deadline"] = time.time() + secs if secs > 0 else None
         d["is_streaming"] = method.streaming
@@ -139,7 +141,7 @@ class ServerCallContext(CallContext):
             gate = self.__dict__["_gate"]
             peer = self.__dict__["peer"]
             attrs = self.__dict__["_call"].attributes()
-            if gate is not None and peer:
+            if gate is not None and peer and self.__dict__["iroh_authenticated"]:
                 attrs.update(gate.attributes(peer))
             return attrs
         return self._lazy("_attributes", make)
@@ -257,6 +259,8 @@ class Dispatcher:
         max_sessions_per_connection: int | None = None,
         handler_timeout: float | None = None,
         node_info: tuple[str, list[str], list[str]] | None = ("", [], []),
+        builtin_topology: bool = False,
+        topology_requires: Any = None,
     ) -> None:
         base = list(interceptors or [])
         self._services = [_Service(s, base) for s in services]
@@ -266,6 +270,8 @@ class Dispatcher:
         self._max_sessions = max_sessions_per_connection
         self._handler_timeout = handler_timeout
         self._node_info = node_info
+        self._builtin_topology = builtin_topology
+        self._topology_requires = topology_requires
         runners = {
             "unary": self._unary,
             "server_stream": self._server_stream,
@@ -298,6 +304,8 @@ class Dispatcher:
             s.info.requires is not None or any(mi.requires is not None for mi in s.info.methods.values())
             for s in self._services
         )
+        any_requires = any_requires or (self._builtin_topology and self._topology_requires is not None)
+        from ._lowering import _requirement_json
         self._server = DispatchServer.start(
             node,
             [lower_json(s.cls) for s in self._services],
@@ -306,6 +314,8 @@ class Dispatcher:
             gate_attributes=bool(self._gate is not None and any_requires),
             max_sessions_per_connection=self._max_sessions,
             handler_timeout=self._handler_timeout,
+            builtin_topology=self._builtin_topology,
+            topology_requires=json.dumps(_requirement_json(self._topology_requires)),
         )
         return self._server
 
@@ -338,6 +348,10 @@ class Dispatcher:
                     on_call(ev, loop)
                 else:
                     on_event(ev)
+            # A terminal ServerCall can still own a native response producer.
+            # Do not retain the last call/batch while waiting for future work.
+            ev = None
+            batch = None
             # Let the handlers just started run before taking more.
             await asyncio.sleep(0)
 

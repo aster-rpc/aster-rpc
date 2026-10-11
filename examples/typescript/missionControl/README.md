@@ -3,7 +3,7 @@
 A control plane for managing remote agents, demonstrating all four Aster
 RPC patterns, session-scoped services, and capability-based auth.
 
-**Full walkthrough on the docs site:** [Mission Control quickstart](https://docs.aster.site/docs/quickstart/mission-control) (switch to the TypeScript tab) — seven chapters covering all four RPC patterns, session-scoped services, capability-based auth, contract gen-client, and cross-language interop. The code in this directory is the runnable TypeScript implementation that the walkthrough builds up to chapter by chapter.
+**Full walkthrough on the docs site:** [Mission Control quickstart](https://sdk.getaster.now/docs/quickstart/mission-control) (switch to the TypeScript tab) — seven chapters covering all four RPC patterns, session-scoped services, capability-based auth, contract gen-client, and cross-language interop. The code in this directory is the runnable TypeScript implementation that the walkthrough builds up to chapter by chapter.
 
 ## Quick start
 
@@ -29,7 +29,7 @@ The `npx aster-gen` step reads your `tsconfig.json`, discovers all
 with wire type metadata, field shapes, and contract identity hashes.
 Re-run it after adding or changing wire types or RPC methods.
 
-See the [TypeScript Build Setup](https://docs.aster.site/docs/guides/typescript-build-setup)
+See the [TypeScript Build Setup](https://sdk.getaster.now/docs/guides/typescript-build-setup)
 guide for Vite/Webpack plugin integration and other options.
 
 ## Cross-language (Chapter 7)

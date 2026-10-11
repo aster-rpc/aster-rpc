@@ -1,3 +1,4 @@
+import { type HttpListener, type HttpListenerOptions, type RpcAuthenticator } from './http-listener.js';
 /**
  * High-level AsterServer and AsterClient wrappers.
  *
@@ -114,6 +115,10 @@ const GENERATED_FILENAME = 'aster-rpc.generated.ts';
 
 export interface AsterServerOptions {
   services: object[];
+  /** Explicit native aster.net.Topology baseline opt-in (default false); requires monitoring. */
+  builtinTopology?: boolean;
+  /** Rust-enforced role policy for every topology baseline method. */
+  topologyRequires?: import("./service.js").CapabilityRequirement;
   /**
    * Explicit generated metadata (output of `aster-gen`). When omitted,
    * `start()` auto-imports `./aster-rpc.generated.js` from the working
@@ -165,9 +170,13 @@ export class AsterServer {
   private _closed = false;
   private _allowAllConsumers: boolean;
   private _userInterceptors: unknown[] = [];
+  private _builtinTopology = false;
+  private _topologyRequires?: import("./service.js").CapabilityRequirement;
   private _pendingServices: object[] = [];
   private _explicitGenerated: Pick<RegisterGeneratedOptions, 'SERVICES' | 'WIRE_TYPES'> | undefined;
   private _signalHandlers: (() => void)[] = [];
+  private _starting: Promise<void> | undefined;
+  private _closing: Promise<void> | undefined;
   private _serviceSummaries: ServiceSummary[] = [];
   private _registryNamespace = '';
   private _servePromise: Promise<void> | null = null;
@@ -194,8 +203,26 @@ export class AsterServer {
     }
     this._allowAllConsumers = opts.allowAllConsumers ?? this.config.allowAllConsumers ?? false;
     this._userInterceptors = opts.interceptors ?? [];
+    this._builtinTopology = opts.builtinTopology ?? false;
+    this._topologyRequires = opts.topologyRequires;
     this._pendingServices = opts.services;
     this._explicitGenerated = opts.generated;
+  }
+
+  /** Serve the registered services through authenticated HTTPS/WebTransport. */
+  async startHttp(options: HttpListenerOptions, authenticate: RpcAuthenticator): Promise<HttpListener> {
+    if (this._closed) throw new Error('server is closed');
+    await this.start();
+    if (this._closed || !this._rpcServer) throw new Error('server is closed');
+    return this._rpcServer.startHttp(options, authenticate);
+  }
+
+  /** Explicit anonymous HTTPS/WebTransport; no callback is required or inferred. */
+  async startPublicHttp(options: HttpListenerOptions): Promise<HttpListener> {
+    if (this._closed) throw new Error('server is closed');
+    await this.start();
+    if (this._closed || !this._rpcServer) throw new Error('server is closed');
+    return this._rpcServer.startPublicHttp(options);
   }
 
   /**
@@ -231,8 +258,19 @@ export class AsterServer {
    * working directory (unless `generated` was passed explicitly),
    * registers the generated metadata, then registers all services.
    */
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    if (this._closed) return Promise.reject(new Error('server is closed'));
+    if (this._starting) return this._starting;
+    if (this._node) return Promise.resolve();
+    this._starting = this._start().finally(() => { this._starting = undefined; });
+    return this._starting;
+  }
+
+  private async _start(): Promise<void> {
     if (this._node) return;
+    if (this._builtinTopology && !this.config.enableMonitoring) {
+      throw new Error('builtinTopology requires monitoring');
+    }
 
     // ── Register generated metadata + services ──────────────────────
     // Create the xlang codec early so BUILD_ALL_TYPES (if present in the
@@ -333,7 +371,7 @@ export class AsterServer {
     // Gate 3 reads each caller's attributes live from the gate's admission
     // store (the frozen credential admission writes them there, design
     // §2.6); otherwise calls skip that lookup.
-    let anyHasRequires = false;
+    let anyHasRequires = this._builtinTopology && this._topologyRequires != null;
     for (const info of this.registry.getAllServices()) {
       if (info.requires) anyHasRequires = true;
       for (const mi of info.methods.values()) {
@@ -347,6 +385,8 @@ export class AsterServer {
     const peerStore = this.peerStore;
     this._rpcServer = new RpcServer({
       registry: this.registry,
+      builtinTopology: this._builtinTopology,
+      topologyRequires: this._topologyRequires,
       codec: xlangCodec ?? createXlangCodec(),
       interceptors: [...(this._userInterceptors as Interceptor[])],
       logger: this.logger,
@@ -711,9 +751,17 @@ export class AsterServer {
   /**
    * Stop accepting connections and close the node.
    */
-  async close(): Promise<void> {
-    if (this._closed) return;
+  close(): Promise<void> {
+    if (this._closing) return this._closing;
     this._closed = true;
+    this._closing = this._close();
+    return this._closing;
+  }
+
+  private async _close(): Promise<void> {
+    // A lazy start may still be publishing its node/server. Wait for it before taking ownership
+    // of cleanup, so a listener request racing close cannot leave a late node behind.
+    await this._starting?.catch(() => {});
     this._running = false;
 
     // Remove signal handlers

@@ -50,8 +50,11 @@ type ServerOptions struct {
 	MaxSessionsPerConnection int
 	// DisableNodeInfo stops serving the baseline aster.ops.NodeInfo service.
 	DisableNodeInfo bool
-	// Topology serves the baseline aster.net.Topology service.
+	// Topology explicitly serves the baseline aster.net.Topology service.
+	// Config.EnableMonitoring must be true. Default false reveals no topology RPC.
 	Topology bool
+	// TopologyRequirement is enforced natively before topology RPC handlers.
+	TopologyRequirement *Requirement
 	// OnConnectionClosed, if set, runs on the poll goroutine when a peer
 	// connection closes (drop per-connection state). Must not block.
 	OnConnectionClosed func(connectionID uint64, peerID string)
@@ -184,10 +187,11 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		}
 	}
 	settings := serverSettings{
-		health:          health,
-		disableNodeInfo: opts.DisableNodeInfo,
-		topology:        opts.Topology,
-		ringCapacity:    opts.RingCapacity,
+		health:              health,
+		disableNodeInfo:     opts.DisableNodeInfo,
+		topology:            opts.Topology,
+		topologyRequirement: opts.TopologyRequirement,
+		ringCapacity:        opts.RingCapacity,
 	}
 	if opts.MaxSessionsPerConnection > 0 {
 		settings.maxSessionsPerConnection = uint64(opts.MaxSessionsPerConnection)
@@ -412,10 +416,15 @@ func (s *AsterServer) onCall(ev *C.aster_dispatch_event_t) {
 	if ev.request_len > 0 {
 		in.request = C.GoBytes(unsafe.Pointer(ev.request_ptr), C.int(ev.request_len))
 	}
-	peer, ok := s.peers[in.connID]
-	if !ok {
-		peer = cString(ev.peer_ptr, ev.peer_len)
-		s.peers[in.connID] = peer
+	peer := cString(ev.peer_ptr, ev.peer_len)
+	// HTTP/WT calls have connection ID zero and resolve a principal per call.
+	// Only authenticated Iroh peers can share a connection identity cache.
+	if in.flags&dispatchFlagIrohAuthenticated != 0 {
+		if cached, ok := s.peers[in.connID]; ok {
+			peer = cached
+		} else {
+			s.peers[in.connID] = peer
+		}
 	}
 	in.peer = peer
 	s.ds.releaseBuffer(ev.buffer)

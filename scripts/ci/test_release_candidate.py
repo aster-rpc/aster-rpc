@@ -34,6 +34,12 @@ def run_fixture(**updates):
             "status": "success", "stopped": datetime.now(timezone.utc).isoformat(), **updates}
 
 
+def archive_consumer_tasks():
+    return [{"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA,
+             "event": "push", "head_branch": "main", "status": "success", "name": name}
+            for name in sorted(C.FFI_ARCHIVE_CONSUMER_TASKS)]
+
+
 class API:
     def __init__(self, run, manifest, archive, *, final_run=None, files=None, tasks=None):
         self.run = run
@@ -41,8 +47,7 @@ class API:
         self.bytes = {"candidate.json": json.dumps(manifest).encode(), "candidate.tar.gz": archive}
         self.files = files or [{"name": name, "sha256": hashlib.sha256(data).hexdigest()} for name, data in self.bytes.items()]
         self.reads = []
-        self.tasks = tasks if tasks is not None else [{"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA,
-                                                      "event": "push", "head_branch": "main", "status": "success"}]
+        self.tasks = tasks if tasks is not None else archive_consumer_tasks()
 
     def json(self, path):
         self.reads.append(path)
@@ -265,6 +270,22 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             C.validate_tasks([], run_fixture())
 
+    def test_archive_consumer_matrix_requires_unique_success_for_every_target(self):
+        tasks = archive_consumer_tasks()
+        C.validate_tasks(tasks, run_fixture())
+        # Other skipped assurance tasks retain their established semantics.
+        C.validate_tasks(tasks + [{**tasks[0], "name": "nightly-miri", "status": "skipped"}], run_fixture())
+        for index in range(len(tasks)):
+            for status in ("skipped", "failure", "cancelled", "running"):
+                invalid = deepcopy(tasks)
+                invalid[index]["status"] = status
+                with self.subTest(index=index, status=status), self.assertRaises(ValueError):
+                    C.validate_tasks(invalid, run_fixture())
+            for invalid in (tasks[:index] + tasks[index + 1:], tasks + [tasks[index]],
+                            tasks[:index] + [{**tasks[index], "head_sha": "c" * 40}] + tasks[index + 1:]):
+                with self.subTest(index=index, tasks=invalid), self.assertRaisesRegex(ValueError, "archive consumer"):
+                    C.validate_tasks(invalid, run_fixture())
+
     def test_failed_run_rejected_before_artifact_download(self):
         api = API(run_fixture(status="failure"), self.manifest, self.archive)
         with self.assertRaises(ValueError):
@@ -354,7 +375,7 @@ class CandidateTests(unittest.TestCase):
             self.assertIn("needs.lint.outputs.assurance_profile == 'full'", block)
             self.assertIn("lint", re.search(r"needs: (.*)", block).group(1))
         self.assertIn("if: always() && forgejo.event_name", workflow[workflow.index("  candidate:"):])
-        self.assertEqual(len(policy["required_jobs"]), 18)
+        self.assertEqual(len(policy["required_jobs"]), 19)
         self.assertEqual(len(C.artifact_policy(policy)), 20)
         self.assertEqual(len(C.artifact_policy({**policy, "assurance_profile": "full"})), 22)
         promotion = (C.ROOT / ".forgejo/workflows/release.yml").read_text()
@@ -733,6 +754,7 @@ class FullPolicyHandoffTests(unittest.TestCase):
             downloaded = root / "downloaded"
             tasks = [{"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA, "event": "push", "head_branch": "main",
                       "status": result, "name": job} for job, result in C.expected_gates(policy).items()]
+            tasks.extend(archive_consumer_tasks())
             tasks.append({**tasks[0], "status": "success", "name": "npm-native-cross (win32-x64-msvc)"})
             api = API(run_fixture(), manifest, (sealed / "candidate.tar.gz").read_bytes(), tasks=tasks)
             release = root / "release"

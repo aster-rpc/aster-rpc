@@ -202,7 +202,13 @@ impl Topology {
             opts.bootstrap.push(NodeId::from_hex(node_hex(&b)?));
         }
         if let Some(s) = position_refresh {
-            opts.position_refresh = secs_in("position_refresh", s)?;
+            let duration = secs_in("position_refresh", s)?;
+            if std::time::Instant::now().checked_add(duration).is_none() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "position_refresh is outside the supported timer range",
+                ));
+            }
+            opts.position_refresh = duration;
         }
         if let Some(t) = timing.filter(|t| !t.is_none()) {
             opts.timing = timing_in(t)?;

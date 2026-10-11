@@ -66,6 +66,7 @@ from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
 from .rpc_types import RpcScope, SerializationMode
 from .server import Server
+from .http import HTTPListener
 from .trust.consumer import (
     ConsumerAdmissionRequest,
     ConsumerAdmissionResponse,
@@ -175,6 +176,8 @@ class AsterServer:
         registry_namespace: str = "",
         max_sessions_per_connection: int | None = None,
         handler_timeout: float | None = None,
+        builtin_topology: bool = False,
+        topology_requires: Any = None,
     ) -> None:
         """Create an Aster RPC server.
 
@@ -208,6 +211,10 @@ class AsterServer:
             handler_timeout: Cap on any handler, in seconds (default 300;
                 ``<= 0`` = no cap). Enforced in Rust together with the
                 caller's deadline and each method's ``timeout``.
+            builtin_topology: Explicit opt-in to the native ``aster.net.Topology``
+                RPC service. Requires ``config.enable_monitoring=True``.
+            topology_requires: Native role/``any_of``/``all_of`` Gate-3 requirement
+                for the opt-in topology baseline service.
             allow_all_producers: Must be ``True`` (the default). Producer
                 mesh admission (``aster.producer_admission``) is not
                 supported; ``False`` raises ``NotImplementedError``.
@@ -310,6 +317,8 @@ class AsterServer:
         self._registry_namespace = registry_namespace
         self._max_sessions_per_connection = max_sessions_per_connection
         self._handler_timeout = handler_timeout
+        self._builtin_topology = builtin_topology
+        self._topology_requires = topology_requires
 
         # Populated by start()
         self._started: bool = False
@@ -500,6 +509,8 @@ class AsterServer:
             node=self._node,
             on_non_rpc=self._on_non_rpc,
             handler_timeout=self._handler_timeout,
+            builtin_topology=self._builtin_topology,
+            topology_requires=self._topology_requires,
         )
         if self._max_sessions_per_connection is not None:
             server_kwargs["max_sessions_per_connection"] = self._max_sessions_per_connection
@@ -729,6 +740,44 @@ class AsterServer:
             # consumers just won't get rich contract metadata
             logger.warning("Contract publication failed (non-fatal): %s", exc)
 
+    async def start_http(
+        self, *, authenticator, certificate_pem: bytes, private_key_pem: bytes,
+        bind_addr: str = "127.0.0.1:0", webtransport: bool = False,
+        max_pending_auth: int = 256, max_auth_payload_bytes: int = 65536,
+        upcall_runtime=None,
+    ) -> HTTPListener:
+        """Start an owned authenticated PEM listener over registered services.
+
+        See :mod:`aster.http` for configuration and authentication types.
+        The server must have completed start(); this also starts serving RPCs.
+        """
+        if not self._started or self._closed:
+            raise RuntimeError("start_http requires a started, open AsterServer")
+        self.serve()
+        await asyncio.sleep(0)  # Let the existing dispatch pump record its task.
+        assert self._server is not None
+        return await self._server.start_http(
+            authenticator=authenticator, certificate_pem=certificate_pem,
+            private_key_pem=private_key_pem, bind_addr=bind_addr,
+            webtransport=webtransport, max_pending_auth=max_pending_auth,
+            max_auth_payload_bytes=max_auth_payload_bytes, upcall_runtime=upcall_runtime,
+        )
+
+    async def start_public_http(
+        self, *, certificate_pem: bytes, private_key_pem: bytes,
+        bind_addr: str = "127.0.0.1:0", webtransport: bool = False,
+    ) -> HTTPListener:
+        """Start explicitly anonymous RPCs; attributes are empty and sessions rejected."""
+        if not self._started or self._closed:
+            raise RuntimeError("start_public_http requires a started, open AsterServer")
+        self.serve()
+        await asyncio.sleep(0)
+        assert self._server is not None
+        return await self._server.start_public_http(
+            certificate_pem=certificate_pem, private_key_pem=private_key_pem,
+            bind_addr=bind_addr, webtransport=webtransport,
+        )
+
     def serve(self) -> asyncio.Task:
         """Spawn the accept loop; return an aggregate task. (Gate 0 runs in Rust.)
 
@@ -748,9 +797,11 @@ class AsterServer:
         # dispatched to the Python handlers, other ALPNs (consumer
         # admission) arrive through `_on_non_rpc`.
         self._server.start()
-        subtasks.append(
-            asyncio.create_task(self._server.serve(), name="aster-dispatch")
-        )
+        pump = self._server._serve_task
+        if pump is None or pump.done():
+            pump = asyncio.create_task(self._server.serve(), name="aster-dispatch")
+            self._server._serve_task = pump
+        subtasks.append(pump)
         if self._health is not None:
             self._health.set_registry(bool(self._service_summaries))
             self._health.set_ready(True)
@@ -821,6 +872,8 @@ class AsterServer:
         """Cancel serve loops and close the node. Safe to call multiple times."""
         if self._closed:
             return
+        if self._server is not None:
+            await self._server._close_http()
         self._closed = True
 
         if self._health is not None:

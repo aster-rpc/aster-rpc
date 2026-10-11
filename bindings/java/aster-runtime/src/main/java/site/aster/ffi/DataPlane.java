@@ -140,18 +140,21 @@ public final class DataPlane {
         .register(opId)
         .thenApply(
             ev -> {
-              byte[] data =
-                  ev.dataLen() > 0 && ev.data() != null && ev.data().address() != 0
-                      ? ev.data().asSlice(0, ev.dataLen()).toArray(ValueLayout.JAVA_BYTE)
-                      : new byte[0];
-              if (ev.hasBuffer()) {
-                try {
-                  runtime.releaseBuffer(ev.buffer());
-                } catch (RuntimeException ignored) {
-                  // already released or runtime closing; the payload is copied
+              try {
+                byte[] data =
+                    ev.dataLen() > 0 && ev.data() != null && ev.data().address() != 0
+                        ? ev.data().asSlice(0, ev.dataLen()).toArray(ValueLayout.JAVA_BYTE)
+                        : new byte[0];
+                return new Result(ev, data);
+              } finally {
+                if (ev.hasBuffer()) {
+                  try {
+                    runtime.releaseBuffer(ev.buffer());
+                  } catch (RuntimeException ignored) {
+                    // Already released or the runtime is closing.
+                  }
                 }
               }
-              return new Result(ev, data);
             });
   }
 
@@ -273,6 +276,117 @@ public final class DataPlane {
         rt,
         node,
         namespaceHex.getBytes(StandardCharsets.UTF_8));
+  }
+
+  public static CompletableFuture<Result> docsCreate(IrohRuntime rt, long node) {
+    var mh = handle("aster_docs_create", FunctionDescriptor.of(I, J, J, J, A));
+    return submit(
+        rt, "aster_docs_create", (a, op) -> (int) mh.invoke(rt.nativeHandle(), node, 0L, op));
+  }
+
+  public static CompletableFuture<Result> docsCreateAuthor(IrohRuntime rt, long node) {
+    var mh = handle("aster_docs_create_author", FunctionDescriptor.of(I, J, J, J, A));
+    return submit(
+        rt,
+        "aster_docs_create_author",
+        (a, op) -> (int) mh.invoke(rt.nativeHandle(), node, 0L, op));
+  }
+
+  public static CompletableFuture<Result> docsJoin(
+      IrohRuntime rt, long node, String ticket, boolean subscribe) {
+    String name = subscribe ? "aster_docs_join_and_subscribe" : "aster_docs_join";
+    var mh = handle(name, FunctionDescriptor.of(I, J, J, B, J, A));
+    return submit(
+        rt, name, (a, op) -> (int) mh.invoke(rt.nativeHandle(), node, utf8(a, ticket), 0L, op));
+  }
+
+  public static CompletableFuture<Result> docSetBytes(
+      IrohRuntime rt, long doc, String author, byte[] key, byte[] value) {
+    var mh = handle("aster_doc_set_bytes", FunctionDescriptor.of(I, J, J, B, B, B, J, A));
+    return submit(
+        rt,
+        "aster_doc_set_bytes",
+        (a, op) ->
+            (int)
+                mh.invoke(
+                    rt.nativeHandle(),
+                    doc,
+                    utf8(a, author),
+                    bytes(a, key),
+                    bytes(a, value),
+                    0L,
+                    op));
+  }
+
+  public static CompletableFuture<Result> docGetExact(
+      IrohRuntime rt, long doc, String author, byte[] key) {
+    var mh = handle("aster_doc_get_exact", FunctionDescriptor.of(I, J, J, B, B, J, A));
+    return submit(
+        rt,
+        "aster_doc_get_exact",
+        (a, op) -> (int) mh.invoke(rt.nativeHandle(), doc, utf8(a, author), bytes(a, key), 0L, op));
+  }
+
+  public static CompletableFuture<Result> docQuery(
+      IrohRuntime rt, long doc, int mode, byte[] key, long limit) {
+    var mh = handle("aster_doc_query", FunctionDescriptor.of(I, J, J, I, B, J, J, A));
+    return submit(
+        rt,
+        "aster_doc_query",
+        (a, op) -> (int) mh.invoke(rt.nativeHandle(), doc, mode, bytes(a, key), limit, 0L, op));
+  }
+
+  public static CompletableFuture<Result> docDel(
+      IrohRuntime rt, long doc, String author, byte[] prefix) {
+    var mh = handle("aster_doc_del", FunctionDescriptor.of(I, J, J, B, B, J, A));
+    return submit(
+        rt,
+        "aster_doc_del",
+        (a, op) ->
+            (int) mh.invoke(rt.nativeHandle(), doc, utf8(a, author), bytes(a, prefix), 0L, op));
+  }
+
+  public static CompletableFuture<Result> docReadEntryContent(
+      IrohRuntime rt, long doc, String hash) {
+    var mh = handle("aster_doc_read_entry_content", FunctionDescriptor.of(I, J, J, B, J, A));
+    return submit(
+        rt,
+        "aster_doc_read_entry_content",
+        (a, op) -> (int) mh.invoke(rt.nativeHandle(), doc, utf8(a, hash), 0L, op));
+  }
+
+  /** ABI 4.14: one local batch read, preserving order and duplicates. */
+  public static CompletableFuture<Result> docReadEntryContentsIfComplete(
+      IrohRuntime rt, long doc, List<String> hashes) {
+    var mh =
+        handle(
+            "aster_doc_read_entry_contents_if_complete", FunctionDescriptor.of(I, J, J, BL, J, A));
+    return submit(
+        rt,
+        "aster_doc_read_entry_contents_if_complete",
+        (a, op) -> (int) mh.invoke(rt.nativeHandle(), doc, utf8List(a, hashes), 0L, op));
+  }
+
+  public static CompletableFuture<Result> docShare(
+      IrohRuntime rt, long doc, int mode, boolean withAddr) {
+    String name = withAddr ? "aster_doc_share_with_addr" : "aster_doc_share";
+    var mh = handle(name, FunctionDescriptor.of(I, J, J, I, J, A));
+    return submit(rt, name, (a, op) -> (int) mh.invoke(rt.nativeHandle(), doc, mode, 0L, op));
+  }
+
+  public static CompletableFuture<Result> docStartSync(
+      IrohRuntime rt, long doc, List<String> peers) {
+    var mh = handle("aster_doc_start_sync", FunctionDescriptor.of(I, J, J, BL, J, A));
+    return submit(
+        rt,
+        "aster_doc_start_sync",
+        (a, op) -> (int) mh.invoke(rt.nativeHandle(), doc, utf8List(a, peers), 0L, op));
+  }
+
+  public static CompletableFuture<Result> docLeave(IrohRuntime rt, long doc) {
+    var mh = handle("aster_doc_leave", FunctionDescriptor.of(I, J, J, J, A));
+    return submit(
+        rt, "aster_doc_leave", (a, op) -> (int) mh.invoke(rt.nativeHandle(), doc, 0L, op));
   }
 
   public static CompletableFuture<Result> docsOpen(IrohRuntime rt, long node, String namespaceHex) {

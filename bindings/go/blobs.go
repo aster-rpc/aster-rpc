@@ -88,6 +88,52 @@ func (b *Blobs) Node() *Node {
 	return b.node
 }
 
+// AddPath imports a UTF-8 file path into the blob store and returns its hash.
+// The store owns a copy, so later source edits do not change the blob. An
+// automatically created persistent tag retains it across garbage collection.
+// If ctx ends after the import starts, the import may still finish.
+func (b *Blobs) AddPath(ctx context.Context, path string) (BlobID, error) {
+	const what = "aster_blobs_add_path"
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("%s: %w", what, err)
+	}
+	var a cArena
+	defer a.free()
+	ev, err := startOwnedOp(ctx, b.runtime, what, func(op *C.aster_operation_t) C.int32_t {
+		return C.aster_blobs_add_path(C.uint64_t(b.runtime.handle), C.uint64_t(b.node.handle), a.str(path), 0, op)
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+	p, err := expect(b.runtime, ev, ASTER_EVENT_BLOB_ADDED, what)
+	return BlobID(p), err
+}
+
+// AddPathWithNamedTag imports a UTF-8 file path and retains the copied blob
+// under the exact UTF-8 tagName, replacing any previous value of that tag.
+// It creates no additional automatic tag; deleting tagName permits garbage
+// collection when no other retention protects the blob.
+// If ctx ends after the import starts, the import and tag update may still finish.
+func (b *Blobs) AddPathWithNamedTag(ctx context.Context, path, tagName string) (BlobID, error) {
+	const what = "aster_blobs_add_path_with_named_tag"
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("%s: %w", what, err)
+	}
+	var a cArena
+	defer a.free()
+	// Rust copies both arguments before returning. Keep collecting a late
+	// completion after cancellation so its native payload is released.
+	ev, err := startOwnedOp(ctx, b.runtime, what, func(op *C.aster_operation_t) C.int32_t {
+		return C.aster_blobs_add_path_with_named_tag(C.uint64_t(b.runtime.handle), C.uint64_t(b.node.handle),
+			a.str(path), a.str(tagName), 0, op)
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+	p, err := expect(b.runtime, ev, ASTER_EVENT_BLOB_ADDED, what)
+	return BlobID(p), err
+}
+
 // AddBytes stores bytes in the blob store.
 func (b *Blobs) AddBytes(ctx context.Context, data []byte) (BlobID, error) {
 	var opID C.aster_operation_t

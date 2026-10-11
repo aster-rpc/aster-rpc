@@ -1,0 +1,3 @@
+# Additional client for real authenticated HTTP/3/WebTransport integration.
+# Install alongside pytest/pytest-asyncio/pytest-timeout/pytest-rerunfailures.
+aioquic==1.3.0

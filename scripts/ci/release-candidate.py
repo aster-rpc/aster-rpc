@@ -31,6 +31,10 @@ REPOSITORY = "Aster/aster-rpc-internal"
 WORKFLOW = "linux.yml"
 PACKAGE = "aster-ci-candidate"
 RETENTION_DAYS = 30
+FFI_ARCHIVE_CONSUMER_TASKS = frozenset(
+    "ffi-archive-consumer-" + rid
+    for rid in ("linux-x64", "linux-arm64", "win-x64", "osx-arm64")
+)
 POLICY_PATH = ROOT / "scripts/ci/release-candidate-policy.json"
 BOUND_FILES = (".forgejo/workflows/linux.yml", "Cargo.lock", "iroh-fork-manifest.toml", "VERSION", "scripts/ci/release-candidate-policy.json")
 
@@ -504,6 +508,12 @@ def validate_tasks(tasks: list[dict], run: dict) -> None:
             fail("candidate task has untrusted event/ref evidence")
         if task.get("status") not in ("success", "skipped"):
             fail(f'candidate includes a {task.get("status")} task attempt; no retry-to-green promotion')
+    # Aggregate matrix success alone does not establish complete per-target evidence.
+    # The workflow gives each archive consumer a stable explicit task name.
+    for name in sorted(FFI_ARCHIVE_CONSUMER_TASKS):
+        matches = [task for task in selected if task.get("name") == name]
+        if len(matches) != 1 or matches[0].get("status") != "success":
+            fail(f"candidate requires one successful archive consumer task: {name}")
 
 
 def safe_extract(archive: Path, output: Path) -> None:

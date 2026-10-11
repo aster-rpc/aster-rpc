@@ -144,6 +144,14 @@ impl CancelSignal {
         }
     }
 
+    /// Cancel a transport call, publishing its flag before waking waiters and
+    /// invoking its cancellation hook. Pass the flag paired with this signal
+    /// in the call's parts. Safe to call repeatedly.
+    pub fn cancel(&self, cancelled: &AtomicBool) {
+        cancelled.store(true, Ordering::Release);
+        self.fire();
+    }
+
     /// Wake the waiters, then run the hook (once).
     fn fire(&self) {
         self.notify.notify_waiters();
@@ -438,6 +446,14 @@ impl tokio_stream::Stream for ResponseReceiver {
 }
 
 impl ResponseItem {
+    /// A terminal item finishes the response even if a producer is retained.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.frame,
+            OutgoingFrame::Trailer(_) | OutgoingFrame::CompleteUnary(_)
+        )
+    }
+
     pub fn into_parts(self) -> (OutgoingFrame, ResponseLease) {
         (self.frame, self.lease)
     }
@@ -618,10 +634,11 @@ async fn accept_loop(
                 }
             }
             Err(e) => {
-                if event_tx.is_closed() {
-                    break;
-                }
-                tracing::warn!("reactor accept error: {}", e);
+                // accept_aster errors only when its channel is permanently
+                // closed. Retrying can spin without yielding while the node's
+                // shutdown is still waiting and dispatch receivers remain live.
+                tracing::debug!("reactor accept ended: {}", e);
+                break;
             }
         }
     }
@@ -1732,6 +1749,24 @@ mod cancel_signal_tests {
         Arc::downgrade(c) as Weak<Count>
     }
 
+    #[tokio::test]
+    async fn transport_cancel_publishes_flag_and_wakes_waiters() {
+        let sig = CancelSignal::new();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let c = Arc::new(Count::default());
+        sig.on_cancel(hook(&c));
+        let notified = sig.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        sig.cancel(&flag);
+        assert!(flag.load(Ordering::Acquire));
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+        sig.cancel(&flag);
+        assert_eq!(c.0.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_hook_runs_once_on_fire() {
         let sig = CancelSignal::new();
@@ -1764,5 +1799,41 @@ mod cancel_signal_tests {
         sig.on_cancel(hook(&gone));
         drop(gone);
         sig.fire(); // no owner: nothing to run, no panic
+    }
+}
+
+#[cfg(test)]
+mod accept_shutdown_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_node_ends_accept_with_live_dispatch_receivers() {
+        let node = CoreNode::memory_with_alpns(
+            vec![RPC_ALPN.to_vec()],
+            Some(crate::CoreEndpointConfig {
+                relay_mode: Some("disabled".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        node.close().await;
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (non_rpc_tx, mut non_rpc_rx) = mpsc::channel(1);
+        let task = tokio::spawn(accept_loop(node, event_tx, non_rpc_tx, None));
+        let ended = tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await;
+        // Also clean up the old retry-loop implementation on assertion failure:
+        // closing the receiver lets it notice terminal shutdown on its next lap.
+        event_rx.close();
+        non_rpc_rx.close();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(ended, Ok(None)),
+            "closed accept channel retained dispatch sender"
+        );
+        assert!(non_rpc_rx.recv().await.is_none());
     }
 }

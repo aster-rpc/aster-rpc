@@ -641,3 +641,165 @@ fn connection_paths_and_stream_priority() {
     accept_task.abort();
     tokio.block_on(prov.shutdown());
 }
+
+#[test]
+fn doc_batch_contents_preserves_order_empty_missing_duplicates_and_owned_input() {
+    unsafe {
+        let rt = runtime();
+        let node = start_ffi_node(rt);
+        let doc = run(rt, aster_event_kind_t::ASTER_EVENT_DOC_OPENED, |op| {
+            aster_docs_import_write_namespace(rt, node, bytes(&[17; 32]), 0, op)
+        })
+        .ev
+        .handle;
+        let values = [vec![], b"batch value".to_vec(), vec![0xA5; 128 * 1024]];
+        let hashes: Vec<String> = values
+            .iter()
+            .map(|v| aster::native::iroh_blobs::Hash::new(v).to_hex().to_string())
+            .collect();
+        for (i, value) in values.iter().enumerate() {
+            run(rt, aster_event_kind_t::ASTER_EVENT_BLOB_ADDED, |op| {
+                aster_transport_ffi::custody::aster_blobs_add_bytes_verified(
+                    rt,
+                    node,
+                    bytes(value),
+                    bytes(hashes[i].as_bytes()),
+                    0,
+                    bytes(format!("batch-{i}").as_bytes()),
+                    0,
+                    op,
+                )
+            });
+        }
+        let missing = aster::native::iroh_blobs::Hash::new(b"not local")
+            .to_hex()
+            .to_string();
+        let mut owned = vec![
+            hashes[1].clone(),
+            missing,
+            hashes[0].clone(),
+            hashes[2].clone(),
+            hashes[1].clone(),
+        ];
+        let spans: Vec<_> = owned.iter().map(|s| bytes(s.as_bytes())).collect();
+        let mut op = 0;
+        assert_eq!(
+            aster_doc_read_entry_contents_if_complete(rt, doc, list(&spans), 42, &mut op),
+            OK
+        );
+        // The implementation copied all hashes before returning admission.
+        for hash in &mut owned {
+            hash.clear();
+        }
+        let ev = finish(rt, op);
+        assert_eq!(
+            ev.ev.kind,
+            aster_event_kind_t::ASTER_EVENT_DOC_CONTENTS_BATCH as u32
+        );
+        assert_eq!(ev.ev.status, 0);
+        assert_eq!(ev.ev.user_data, 42);
+        assert_eq!(ev.ev.handle, doc);
+        assert_eq!(ev.ev.flags, 0);
+        let mut expected = 5u32.to_le_bytes().to_vec();
+        for value in [
+            Some(&values[1]),
+            None,
+            Some(&values[0]),
+            Some(&values[2]),
+            Some(&values[1]),
+        ] {
+            match value {
+                None => expected.push(0),
+                Some(v) => {
+                    expected.push(1);
+                    expected.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                    expected.extend_from_slice(v);
+                }
+            }
+        }
+        assert_eq!(ev.data, expected);
+        assert_eq!(
+            run(
+                rt,
+                aster_event_kind_t::ASTER_EVENT_DOC_CONTENTS_BATCH,
+                |op| { aster_doc_read_entry_contents_if_complete(rt, doc, list(&[]), 0, op) }
+            )
+            .data,
+            [0, 0, 0, 0]
+        );
+        // Reads create no retention: removing the only tag then sweeping makes
+        // the same hash absent, even though this document remains open.
+        run(rt, aster_event_kind_t::ASTER_EVENT_TAG_DELETED, |op| {
+            aster_tags_delete(rt, node, b"batch-1".as_ptr(), 7, 0, op)
+        });
+        run(rt, aster_event_kind_t::ASTER_EVENT_UNIT_RESULT, |op| {
+            aster_blobs_gc_run_once(rt, node, 0, op)
+        });
+        assert_eq!(
+            run(
+                rt,
+                aster_event_kind_t::ASTER_EVENT_DOC_CONTENTS_BATCH,
+                |op| {
+                    aster_doc_read_entry_contents_if_complete(
+                        rt,
+                        doc,
+                        list(&[bytes(hashes[1].as_bytes())]),
+                        0,
+                        op,
+                    )
+                }
+            )
+            .data,
+            [1, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            aster_runtime_close_and_wait(rt, std::time::Duration::from_secs(10)),
+            OK
+        );
+    }
+}
+
+#[test]
+fn doc_batch_contents_rejects_invalid_input_before_admission() {
+    unsafe {
+        let rt = runtime();
+        let node = start_ffi_node(rt);
+        let doc = run(rt, aster_event_kind_t::ASTER_EVENT_DOC_OPENED, |op| {
+            aster_docs_import_write_namespace(rt, node, bytes(&[18; 32]), 0, op)
+        })
+        .ev
+        .handle;
+        let mut op = 99;
+        let bad = [bytes(b"bad")];
+        for hashes in [
+            list(&bad),
+            aster_bytes_list_t {
+                items: ptr::null(),
+                len: 1,
+            },
+            aster_bytes_list_t {
+                items: ptr::null(),
+                len: usize::MAX,
+            },
+        ] {
+            assert_eq!(
+                aster_doc_read_entry_contents_if_complete(rt, doc, hashes, 0, &mut op),
+                INVALID
+            );
+            assert_eq!(op, 0);
+        }
+        assert_eq!(
+            aster_doc_read_entry_contents_if_complete(rt, doc, list(&[]), 0, ptr::null_mut()),
+            INVALID
+        );
+        assert_eq!(
+            aster_doc_read_entry_contents_if_complete(rt, u64::MAX, list(&[]), 0, &mut op),
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+        assert_eq!(op, 0);
+        assert_eq!(
+            aster_runtime_close_and_wait(rt, std::time::Duration::from_secs(10)),
+            OK
+        );
+    }
+}

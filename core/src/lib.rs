@@ -1,3 +1,5 @@
+pub mod blob_custody;
+pub use blob_custody::{CoreBlobCustody, CoreBlobCustodyError, CoreBlobCustodyLease};
 #[cfg(feature = "attestation")]
 pub mod attestation;
 pub mod canonical;
@@ -1436,7 +1438,31 @@ struct CoreNodeInner {
     /// [`CoreNode::topology_join_swarm`]. The paired guard owns the
     /// publisher task: dropping this slot (close, re-join) aborts the
     /// publisher even while external `Arc`s to the swarm survive.
-    topo_swarm: RwLock<Option<(Arc<CoreTopoSwarm>, AbortOnDrop)>>,
+    topo_swarm: RwLock<TopologyRegistration>,
+}
+
+/// The close marker and registration share one lock, so an asynchronous join
+/// cannot install a publisher after close has retired the previous publisher.
+#[derive(Default)]
+struct TopologyRegistration {
+    closed: bool,
+    swarm: Option<(Arc<CoreTopoSwarm>, AbortOnDrop)>,
+}
+
+impl TopologyRegistration {
+    fn install(&mut self, swarm: Arc<CoreTopoSwarm>, guard: AbortOnDrop) -> Result<()> {
+        if self.closed {
+            // Dropping guard aborts a publisher whose startup raced close.
+            return Err(anyhow!("cannot join topology on a closed node"));
+        }
+        self.swarm = Some((swarm, guard));
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        self.swarm = None;
+    }
 }
 
 /// Build the iroh `Endpoint` for a `CoreNode`, optionally applying a
@@ -1776,7 +1802,7 @@ impl CoreNode {
                 aster_rx: Mutex::new(aster_rx),
                 monitor,
                 hook_receiver,
-                topo_swarm: RwLock::new(None),
+                topo_swarm: RwLock::new(TopologyRegistration::default()),
             }),
         })
     }
@@ -1795,11 +1821,11 @@ impl CoreNode {
         // long as a swarm handle exists, and a caller that keeps this
         // CoreNode around after close() would otherwise leave it writing
         // against a shut-down docs engine.
-        *self
-            .inner
+        self.inner
             .topo_swarm
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+            .unwrap_or_else(|e| e.into_inner())
+            .close();
         // Flush blob-store metadata to disk while the store actor is still
         // alive. `router.shutdown()` below shuts the store down (via
         // `BlobsProtocol::shutdown()` -> `store.shutdown()`), so a `sync_db()`
@@ -1927,6 +1953,15 @@ impl CoreNode {
         secret: &[u8],
         config: CoreTopoSwarmConfig,
     ) -> Result<Arc<CoreTopoSwarm>> {
+        if self
+            .inner
+            .topo_swarm
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed
+        {
+            return Err(anyhow!("cannot join topology on a closed node"));
+        }
         let monitor = self
             .inner
             .monitor
@@ -1946,11 +1981,11 @@ impl CoreNode {
             config,
         )
         .await?;
-        *self
-            .inner
+        self.inner
             .topo_swarm
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some((swarm.clone(), publisher_guard));
+            .unwrap_or_else(|e| e.into_inner())
+            .install(swarm.clone(), publisher_guard)?;
         Ok(swarm)
     }
 
@@ -1963,6 +1998,7 @@ impl CoreNode {
             .topo_swarm
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .swarm
             .as_ref()
             .map(|(swarm, _)| swarm.clone())
     }
@@ -4510,16 +4546,32 @@ impl CoreDoc {
 
     /// Read multiple document entry value blobs that are complete locally.
     ///
-    /// Missing or partial values return `None` at their original index. Complete
-    /// values use the blob store's batched inline fast path when possible and
-    /// fall back to the existing validated export path for larger blobs.
+    /// Output length/order match the inputs, including duplicates. Missing or
+    /// partial blobs at the local completeness check return `None`; a complete
+    /// empty blob returns `Some(Vec::new())`. Empty input returns an empty list.
+    /// Every hash must contain exactly 64 ASCII hexadecimal characters and is
+    /// validated before any store read; malformed input fails the
+    /// entire call. No network fetch, tag creation or retention is performed.
+    ///
+    /// Complete inline values use the store's batched read transaction. Larger
+    /// values fall back to validated export. This is not a global snapshot: GC
+    /// or local availability may change between check and export. Export,
+    /// integrity and storage errors fail the entire call, rather than becoming
+    /// `None` or partial results. Use blob custody when stable retention is
+    /// needed across reads and host verification.
     pub async fn read_entry_contents_if_complete(
         &self,
         content_hash_hexes: Vec<String>,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         let mut hashes = Vec::with_capacity(content_hash_hexes.len());
         for hash_hex in content_hash_hexes {
-            hashes.push(hash_hex.parse::<Hash>()?);
+            // The upstream parser assumes a correctly sized decode buffer for
+            // non-hex input. Validate the public hex contract before calling it.
+            anyhow::ensure!(
+                hash_hex.len() == 64 && hash_hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "content hash must contain exactly 64 ASCII hexadecimal characters"
+            );
+            hashes.push(hash_hex.to_ascii_lowercase().parse::<Hash>()?);
         }
 
         let results = self
@@ -5008,5 +5060,53 @@ mod role_swap_shutdown_tests {
         let text = format!("{err:#}");
         assert!(text.contains("leave timed out"), "{text}");
         assert!(text.contains("close timed out"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod topology_registration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn late_join_registration_after_close_aborts_its_publisher() {
+        let node = CoreNode::memory_with_alpns_and_gc(
+            Vec::new(),
+            Some(CoreEndpointConfig {
+                relay_mode: Some("disabled".into()),
+                enable_monitoring: true,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let swarm = node
+            .topology_join_swarm(&[17; 32], CoreTopoSwarmConfig::default())
+            .await
+            .unwrap();
+        // Hold a completed startup just before its registration commit. Close
+        // must win this ordering, including when a caller retains the query Arc.
+        let (_, publisher) = node.inner.topo_swarm.write().unwrap().swarm.take().unwrap();
+        let abort = publisher.0.clone();
+        node.close().await;
+        assert!(node
+            .inner
+            .topo_swarm
+            .write()
+            .unwrap()
+            .install(swarm, publisher)
+            .is_err());
+        assert!(node.topology_swarm().is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rejected registration must abort its publisher");
+        assert!(node
+            .topology_join_swarm(&[17; 32], CoreTopoSwarmConfig::default())
+            .await
+            .is_err());
     }
 }

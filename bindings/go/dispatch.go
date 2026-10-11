@@ -14,6 +14,7 @@ import "C"
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -83,6 +84,7 @@ type dispatchServer struct {
 type serverSettings struct {
 	disableNodeInfo          bool
 	topology                 bool
+	topologyRequirement      *Requirement
 	maxSessionsPerConnection uint64
 	handlerTimeoutMs         uint64
 	setHandlerTimeout        bool
@@ -119,11 +121,17 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 	if s.disableNodeInfo {
 		nodeInfo = 0
 	}
-	topology := uint64(0)
+	topology := C.uint32_t(0)
 	if s.topology {
 		topology = 1
 	}
-	errs := []error{opt(serverOptionBuiltinNodeInfo, nodeInfo), opt(serverOptionBuiltinTopology, topology)}
+	requirement, err := json.Marshal(s.topologyRequirement)
+	if err != nil {
+		return fail("topology requirement", err)
+	}
+	var arena cArena
+	defer arena.free()
+	errs := []error{opt(serverOptionBuiltinNodeInfo, nodeInfo), statusError(C.aster_server_set_topology(b, topology, arena.bytes(requirement)))}
 	if s.maxSessionsPerConnection > 0 {
 		errs = append(errs, opt(serverOptionMaxSessionsPerConnection, s.maxSessionsPerConnection))
 	}

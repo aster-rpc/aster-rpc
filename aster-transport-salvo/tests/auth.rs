@@ -4,6 +4,7 @@
 //! pre-dispatch auth hook + Gate-3 work end-to-end over HTTP.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aster::rpc::codec::decode_rpc_status;
 use aster::rpc::{
@@ -94,11 +95,14 @@ async fn auth_hook_gates_over_http() {
         .bind_addr("127.0.0.1:0")
         .build();
     let node = Node::start(cfg).await.unwrap();
-    let dispatcher = Server::new(&node)
-        .register(Secured)
-        .authenticator(HeaderAuth)
-        .dispatcher();
-    let service = Service::new(aster_transport_salvo::router(dispatcher));
+    let dispatcher = Server::new(&node).register(Secured).dispatcher();
+    let listener = dispatcher.with_authenticator(Arc::new(HeaderAuth));
+    let service = Service::new(aster_transport_salvo::router(listener));
+    let original = Service::new(aster_transport_salvo::router(dispatcher));
+
+    // The listener's auth policy does not change the original dispatcher.
+    let (_, status) = call(&original, Some("Bearer secret"), vec![1, 2, 3]).await;
+    assert_eq!(status.code, StatusCode::PermissionDenied.as_i32());
 
     // No credential → operator role not granted → PERMISSION_DENIED.
     let (data, status) = call(&service, None, vec![1, 2, 3]).await;

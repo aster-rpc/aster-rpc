@@ -19,6 +19,8 @@ public class Ucv1VectorTests
 
     private static readonly Dictionary<string, Func<byte[], byte[]>> RoundTrip = new()
     {
+        ["RpcAuthRequest"] = b => Ucv1.EncodeRpcAuthRequest(Ucv1.DecodeRpcAuthRequest(b)),
+        ["RpcAuthResponse"] = b => Ucv1.EncodeRpcAuthResponse(Ucv1.DecodeRpcAuthResponse(b)),
         ["LeaseTransitionRequest"] = b => { var v = Ucv1.DecodeLeaseTransitionRequest(b); return Ucv1.EncodeLeaseTransitionRequest(v.Resource, v.Op); },
         ["TransitionOutcome"] = b => Ucv1.EncodeTransitionOutcome(Ucv1.DecodeTransitionOutcome(b)),
         ["LeaseSnapshotRequest"] = b => Ucv1.EncodeLeaseSnapshotRequest(Ucv1.DecodeLeaseSnapshotRequest(b)),
@@ -112,6 +114,21 @@ public class Ucv1VectorTests
         Assert.Equal(new ExposeRouteSpec("a.example", 443, ExposeRouteSpec.ProtocolHttp, "web"), routes.Specs[0]);
         Assert.Equal(new ExposeRouteSpec("", 5432, ExposeRouteSpec.ProtocolTcp, "db"), routes.Specs[1]);
         Assert.Equal(new uint[] { 1 }, Ucv1.DecodeExposeRouteGrant(Hex("expose route grant")));
+
+        var auth = Ucv1.DecodeRpcAuthRequest(Hex("RPC authentication request"));
+        Assert.Equal("127.0.0.1:1234", auth.PeerId);
+        Assert.Equal("Counter", auth.Service);
+        Assert.Equal("read", auth.Method);
+        Assert.Equal(7, auth.SessionId);
+        Assert.Equal("Bearer token", auth.Metadata["authorization"]);
+        Assert.Equal("counter/7", auth.Metadata["aster-session-id"]);
+        Assert.Equal(int.MinValue, Ucv1.DecodeRpcAuthRequest(Hex("RPC authentication request: signed session boundary")).SessionId);
+        var authenticated = Ucv1.DecodeRpcAuthResponse(Hex("RPC authentication: accepted"));
+        Assert.True(authenticated.Accepted);
+        Assert.Equal("user/alice", authenticated.Principal);
+        Assert.Equal("operator", authenticated.Attributes["aster.role"]);
+        Assert.Equal("one", authenticated.Attributes["tenant"]);
+        Assert.False(Ucv1.DecodeRpcAuthResponse(Hex("RPC authentication: rejected")).Accepted);
     }
 
     [Fact]

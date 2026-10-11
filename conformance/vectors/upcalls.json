@@ -89,6 +89,46 @@
       "type": "TopologyAdmittedResponse"
     },
     {
+      "hex": "ca010102000c",
+      "name": "authentication empty principal",
+      "type": "RpcAuthResponse"
+    },
+    {
+      "hex": "ca0102",
+      "name": "authentication invalid bool",
+      "type": "RpcAuthResponse"
+    },
+    {
+      "hex": "ca010000",
+      "name": "authentication rejected with trailing fields",
+      "type": "RpcAuthResponse"
+    },
+    {
+      "hex": "ca01010678020c066202066102",
+      "name": "authentication attributes not ascending",
+      "type": "RpcAuthResponse"
+    },
+    {
+      "hex": "ca01010678020c066102066102",
+      "name": "authentication duplicate attribute",
+      "type": "RpcAuthResponse"
+    },
+    {
+      "hex": "c9010202028080808010000c",
+      "name": "authentication session out of range",
+      "type": "RpcAuthRequest"
+    },
+    {
+      "hex": "c9010202028000000c",
+      "name": "authentication nonminimal session",
+      "type": "RpcAuthRequest"
+    },
+    {
+      "hex": "c90102020200020c066202066102",
+      "name": "authentication metadata not ascending",
+      "type": "RpcAuthRequest"
+    },
+    {
       "hex": "c4010e6170700082026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616107050e4745542a2f67726565743f783d31020c12686f7374096170702e6c6f63616c1a616363657074032a2f2a01",
       "name": "unknown HTTP version",
       "type": "ExposeHttpRequest"
@@ -204,6 +244,11 @@
       "code": 65,
       "decision": true,
       "name": "admission_handshake"
+    },
+    {
+      "code": 80,
+      "decision": false,
+      "name": "rpc_authenticate"
     }
   ],
   "statuses": [
@@ -815,6 +860,69 @@
       "type": "ExposeRouteGrant",
       "value": {
         "granted": []
+      }
+    },
+    {
+      "hex": "c9013a3132372e302e302e313a313233341e436f756e74657212726561640e020c4261737465722d73657373696f6e2d696426636f756e7465722f3736617574686f72697a6174696f6e3242656172657220746f6b656e",
+      "name": "RPC authentication request",
+      "type": "RpcAuthRequest",
+      "value": {
+        "metadata": {
+          "aster-session-id": "counter/7",
+          "authorization": "Bearer token"
+        },
+        "method": "read",
+        "peer_id": "127.0.0.1:1234",
+        "service": "Counter",
+        "session_id": 7
+      }
+    },
+    {
+      "hex": "c90112706565720e7376631a6d6574686f64ffffffff0f000c",
+      "name": "RPC authentication request: signed session boundary",
+      "type": "RpcAuthRequest",
+      "value": {
+        "metadata": {},
+        "method": "method",
+        "peer_id": "peer",
+        "service": "svc",
+        "session_id": -2147483648
+      }
+    },
+    {
+      "hex": "ca01012a757365722f616c696365020c2a61737465722e726f6c65226f70657261746f721a74656e616e740e6f6e65",
+      "name": "RPC authentication: accepted",
+      "type": "RpcAuthResponse",
+      "value": {
+        "accepted": true,
+        "attributes": {
+          "aster.role": "operator",
+          "tenant": "one"
+        },
+        "principal": "user/alice"
+      }
+    },
+    {
+      "hex": "c90112706565720e7376631a6d6574686f6400020c0eee80800e424d5012f090808036737570706c656d656e74617279",
+      "name": "RPC authentication request: UTF-8 map order",
+      "type": "RpcAuthRequest",
+      "value": {
+        "metadata": {
+          "": "BMP",
+          "𐀀": "supplementary"
+        },
+        "method": "method",
+        "peer_id": "peer",
+        "service": "svc",
+        "session_id": 0
+      }
+    },
+    {
+      "hex": "ca0100",
+      "name": "RPC authentication: rejected",
+      "type": "RpcAuthResponse",
+      "value": {
+        "accepted": false
       }
     }
   ]

@@ -27,7 +27,7 @@ public class IrohPollThread {
   private final MethodHandle bufferRelease;
 
   private volatile boolean running = false;
-  private Thread thread;
+  private volatile Thread thread;
 
   /** All registered inbound handlers. Each receives every inbound event. */
   private final List<Consumer<IrohEvent>> inboundHandlers = new CopyOnWriteArrayList<>();
@@ -38,16 +38,21 @@ public class IrohPollThread {
 
   public IrohPollThread(
       OperationRegistry registry, long runtimeHandle, int maxEvents, Duration pollTimeout) {
-    this.registry = registry;
-    this.runtimeHandle = runtimeHandle;
-    this.maxEvents = maxEvents;
-    this.pollTimeout = pollTimeout;
+    this(registry, runtimeHandle, maxEvents, pollTimeout, IrohLibrary.getInstance());
+  }
 
-    IrohLibrary lib = IrohLibrary.getInstance();
-
-    this.eventBuffer = lib.allocator().allocate(IrohLibrary.ASTER_EVENT.byteSize() * maxEvents, 1);
-
-    this.pollEvents =
+  private IrohPollThread(
+      OperationRegistry registry,
+      long runtimeHandle,
+      int maxEvents,
+      Duration pollTimeout,
+      IrohLibrary lib) {
+    this(
+        registry,
+        runtimeHandle,
+        maxEvents,
+        pollTimeout,
+        lib.allocator().allocate(IrohLibrary.ASTER_EVENT.byteSize() * maxEvents, 1),
         lib.getHandle(
             "aster_poll_events",
             FunctionDescriptor.of(
@@ -55,12 +60,29 @@ public class IrohPollThread {
                 ValueLayout.JAVA_LONG,
                 ValueLayout.ADDRESS,
                 ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_INT));
-    this.bufferRelease =
+                ValueLayout.JAVA_INT)),
         lib.getHandle(
             "aster_buffer_release",
             FunctionDescriptor.of(
-                ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
+                ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)));
+  }
+
+  // Injection keeps shutdown/batch arbitration tests deterministic without native timing races.
+  IrohPollThread(
+      OperationRegistry registry,
+      long runtimeHandle,
+      int maxEvents,
+      Duration pollTimeout,
+      MemorySegment eventBuffer,
+      MethodHandle pollEvents,
+      MethodHandle bufferRelease) {
+    this.registry = registry;
+    this.runtimeHandle = runtimeHandle;
+    this.maxEvents = maxEvents;
+    this.pollTimeout = pollTimeout;
+    this.eventBuffer = eventBuffer;
+    this.pollEvents = pollEvents;
+    this.bufferRelease = bufferRelease;
   }
 
   /** Add a handler for inbound events. Handlers are cumulative. */
@@ -83,13 +105,16 @@ public class IrohPollThread {
 
   public void stop() {
     running = false;
-    if (thread != null) {
-      thread.interrupt();
+    Thread worker = thread;
+    // Completion and inbound continuations execute here: self-stop must not interrupt or join them.
+    if (worker != null && worker != Thread.currentThread()) {
+      worker.interrupt();
       try {
-        thread.join(Duration.ofSeconds(5).toMillis());
+        worker.join(Duration.ofSeconds(5).toMillis());
       } catch (InterruptedException ignored) {
+        Thread.currentThread().interrupt();
       }
-      thread = null;
+      if (!worker.isAlive() && thread == worker) thread = null;
     }
   }
 
@@ -109,7 +134,8 @@ public class IrohPollThread {
     int timeoutMs = (int) pollTimeout.toMillis();
     long count = (long) pollEvents.invoke(runtimeHandle, eventBuffer, (long) maxEvents, timeoutMs);
 
-    for (int i = 0; i < count; i++) {
+    // A synchronous completion can close the runtime and free the rest of this native batch.
+    for (int i = 0; i < count && running; i++) {
       MemorySegment eventSeg =
           eventBuffer.asSlice(
               i * IrohLibrary.ASTER_EVENT.byteSize(), IrohLibrary.ASTER_EVENT.byteSize());
@@ -143,6 +169,8 @@ public class IrohPollThread {
         || event.kind() == IrohEventKind.HOOK_BEFORE_CONNECT
         || event.kind() == IrohEventKind.HOOK_AFTER_CONNECT) {
       for (Consumer<IrohEvent> handler : inboundHandlers) {
+        // A preceding handler can close the runtime and invalidate this event's borrowed payload.
+        if (!running) break;
         try {
           handler.accept(event);
         } catch (Throwable t) {

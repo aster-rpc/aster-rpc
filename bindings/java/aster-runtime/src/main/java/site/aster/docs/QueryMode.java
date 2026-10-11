@@ -1,13 +1,11 @@
 package site.aster.docs;
 
-/** Query mode for document queries. */
+/** Native document query modes. Queries do not filter by author. */
 public enum QueryMode {
-  /** Query entries by author only. */
-  AUTHOR(0),
-  /** Query all entries. */
-  ALL(1),
-  /** Query entries by key prefix. */
-  PREFIX(2);
+  KEY_EXACT(0),
+  KEY_PREFIX(1),
+  LATEST_EXACT(2),
+  LATEST_PREFIX(3);
 
   private final int code;
 
@@ -15,16 +13,12 @@ public enum QueryMode {
     this.code = code;
   }
 
-  /** The numeric code used in FFI. */
   public int code() {
     return code;
   }
 
-  /** Convert from FFI numeric code. */
   public static QueryMode fromCode(int code) {
-    for (QueryMode m : values()) {
-      if (m.code == code) return m;
-    }
-    return ALL;
+    for (QueryMode mode : values()) if (mode.code == code) return mode;
+    throw new IllegalArgumentException("unknown query mode: " + code);
   }
 }

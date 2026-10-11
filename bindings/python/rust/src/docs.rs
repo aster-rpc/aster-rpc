@@ -904,8 +904,12 @@ impl DocHandle {
         })
     }
 
-    /// Read several content blobs that are already complete locally; a
-    /// missing or partial value is `None` at its index.
+    /// Read local values in input order, preserving duplicates: list[bytes | None].
+    /// Missing/partial content is None, complete empty content is b"". No fetch
+    /// or tags are created. Malformed hashes fail before any store read.
+    /// This is not a snapshot: GC can race larger exports, and any storage,
+    /// integrity or export error fails the entire call. Use custody for stable
+    /// retention across reads and host verification.
     fn read_entry_contents_if_complete<'py>(
         &self,
         py: Python<'py>,
