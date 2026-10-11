@@ -200,7 +200,7 @@ class _PlainConn:
         return "peer-y"
 
 
-def _build_ctx(conn):
+def _build_ctx(conn, *, flags=0):
     """A server-side CallContext for a call that arrived on ``conn``."""
     from types import SimpleNamespace
 
@@ -208,7 +208,7 @@ def _build_ctx(conn):
 
     call = SimpleNamespace(
         wire_call_id=0, call_id=1, session_key=0, peer="peer", deadline_secs=0,
-        connection=lambda: conn,
+        flags=flags, connection=lambda: conn,
     )
     method = SimpleNamespace(
         service=SimpleNamespace(name="Svc"), name="M", streaming=False,
@@ -229,3 +229,13 @@ def test_call_context_attaches_tunnel_handle_for_iroh_connection():
 def test_call_context_tunnel_none_for_stub_connection():
     call_ctx = _build_ctx(_PlainConn())
     assert call_ctx.tunnel is None
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_call_context_iroh_authentication_comes_from_native_flags(authenticated):
+    from aster._dispatch import FLAG_IROH_AUTHENTICATED
+
+    flags = FLAG_IROH_AUTHENTICATED if authenticated else 0
+    call_ctx = _build_ctx(_TunnelCapableConn(), flags=flags)
+    assert call_ctx.iroh_authenticated is authenticated
+    assert isinstance(call_ctx.tunnel, TunnelHandle)
