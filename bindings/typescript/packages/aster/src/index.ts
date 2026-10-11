@@ -817,3 +817,6 @@ export {
   type ProvisioningBytes, type ProvisioningVoterSeed, type GenesisInput, type JoinPermitInput,
   type VerifiedGenesis, type VerifiedJoinPermit, type ProvisioningErrorCode,
 } from './coordination-provisioning.js';
+
+export { WebTransportListener, WebTransportSession, WebTransportStream } from "./webtransport.js";
+export type { WebTransportOptions, WebTransportOperation, WebTransportSessionInfo, WebTransportStreamInfo, WebTransportCloseInfo, WebTransportStats } from "./webtransport.js";

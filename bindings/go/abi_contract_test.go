@@ -175,9 +175,9 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if ASTER_EVENT_TOPOLOGY_SNAPSHOT != 120 {
 		t.Error("topology snapshot event drifted from header")
 	}
-	// ABI 4.1 .. 4.16 are all in the library.
-	if _, minor, _ := Version(); minor < 16 || ABIMinorRequired != 16 {
-		t.Errorf("library ABI minor %d, binding needs >= 16 (floor %d)", minor, ABIMinorRequired)
+	// ABI 4.1 .. 4.17 are all in the library.
+	if _, minor, _ := Version(); minor < 17 || ABIMinorRequired != 17 {
+		t.Errorf("library ABI minor %d, binding needs >= 17 (floor %d)", minor, ABIMinorRequired)
 	}
 	if ASTER_STATUS_ALREADY_EXISTS != 17 || !errors.Is(wrapError(ASTER_STATUS_ALREADY_EXISTS), ErrAlreadyExists) ||
 		StatusName(17) != "ASTER_STATUS_ALREADY_EXISTS" {

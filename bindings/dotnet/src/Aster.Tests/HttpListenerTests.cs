@@ -176,7 +176,7 @@ public class HttpListenerTests
     [Fact]
     public void NativeLayoutMatchesAbi411()
     {
-        Assert.Equal(16u, Native.RequiredAbiMinor);
+        Assert.Equal(17u, Native.RequiredAbiMinor);
         Assert.Equal(64, Marshal.SizeOf<HttpServerConfigNative>());
         foreach (var (field, offset) in new[] { ("struct_size", 0), ("flags", 4), ("bind_addr", 8), ("cert_pem", 24), ("key_pem", 40), ("max_pending_auth", 56), ("max_auth_payload_bytes", 60) })
             Assert.Equal(offset, Marshal.OffsetOf<HttpServerConfigNative>(field).ToInt32());

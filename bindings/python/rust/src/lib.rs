@@ -53,6 +53,7 @@ mod net;
 mod node;
 mod observability;
 mod provisioning;
+mod raw_webtransport;
 mod response_queue;
 mod rpc;
 mod ticket;
@@ -121,6 +122,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     topology::register(py, m)?;
     coordination::register(py, m)?;
     provisioning::register(m)?;
+    raw_webtransport::register(m)?;
     rpc::register(py, m)?;
     upcall::register(py, m)?;
     observability::register(py, m)?;

@@ -28,7 +28,7 @@ iroh-mdns-address-lookup = { version = "=0.4.0", registry = "aster", git = "http
 
 # HTTP/WebTransport transport. Like the Iroh entries above, the Git location
 # is used for repository builds and the version is used for registry packages.
-salvo = { version = "=1.0.3", registry = "aster", git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492" }
+salvo = { version = "=1.0.4", registry = "aster", git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
 
 # Python FFI
 pyo3        = { version = "0.29.3", features = ["extension-module", "abi3-py39", "generate-import-lib"] }
@@ -77,22 +77,20 @@ iroh-util                = { git = "https://forge.emrul.dev/Aster/iroh-util.git"
 # ──────────────────────────────────────────────────────────────────────────
 # Aster Salvo fork (HTTP transport — see docs/_internal/working_ideas/aster-http3-transport.md)
 # ──────────────────────────────────────────────────────────────────────────
-# Local candidate d282442d (Salvo 1.0.3): upstream v1.0.0 + eight Aster
-# patches, including cancellation-safe Quinn accept. Proposed release tags are
-# v1.0.0-aster.4 / aster-salvo-2026-10-07; neither exists yet, and this
-# candidate revision has not been pushed or published. Existing WebTransport
-# hand-off/control/ACK, keepalive/tuning, ratified interop and alt-svc remain.
-# H3 versions are unchanged: h3 0.0.9 / h3-quinn 0.0.11 /
-# salvo-http3 0.7.1 / h3-datagram 0.0.3. Publish the fork wave before Aster.
+# Salvo 1.0.4: upstream v1.0.0 plus the Aster WebTransport patches.
+# Published source tags: v1.0.0-aster.5 / aster-salvo-2026-10-11.
+# PC13 adds cancellation-safe receive control while a read is pending.
+# H3 versions: h3 0.0.9 / h3-quinn 0.0.12 /
+# salvo-http3 0.7.2 / h3-datagram 0.0.3. Publish the fork wave before Aster.
 # Maintenance workflow: ~/dev/aster/salvo_fork.md.
 # Propagation gotcha: the fork patches h3 / h3-quinn / salvo-http3 / h3-datagram internally,
 # but [patch.crates-io] does NOT cross workspaces — re-declare them here.
-salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492" }
-salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492" }
-salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492" }
+salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
+salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
+salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
 # (salvo_extra is patched by portal-agent but not yet pulled here — re-add the
 #  line when a feature brings it into the graph, else cargo warns "patch unused".)
-salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492" }
-h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492" }
-h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492" }
-h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "0cf945a9e9ac94cfe718dbed46ecf21f8a67a492" }
+salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
+h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
+h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
+h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }

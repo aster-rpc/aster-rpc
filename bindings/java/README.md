@@ -291,3 +291,16 @@ The remote `aster.net.Topology` baseline is disabled by default. Enable it with
 Enabling requires monitoring. Rust enforces the role requirement; the RPC peer view
 omits local socket addresses. Low-level `Dispatch.Builder.topology(enabled, requirement)`
 provides the same explicit opt-in and policy. These additions require C ABI 4.16.
+
+Standalone raw WebTransport (C ABI 4.17) is available as
+`site.aster.webtransport.RawWebTransport`. Generate browser-compatible PEM using
+`TlsCertificates.generateWebTransportCertificate`, then use `start(runtime,
+upcalls, config)` for foreign pre-upgrade authentication or explicit
+`startPublic(runtime, config)`. Listener/session/stream owners are AutoCloseable.
+Sessions expose bi/uni accept/open, datagrams, current peer and authenticated
+principal/attributes, close info, and network statistics. Stream reads return
+bytes plus EOF; FIN retains the send half for `transportAcked()` or reset.
+Higher signed priorities are served first. Cancelling a returned future cancels
+native work immediately; a cancelled write may have delivered a prefix and must
+not be replayed automatically. Session `close(code, reason)` actively closes
+QUIC while retaining its owner for stats; `close()` frees the owner.

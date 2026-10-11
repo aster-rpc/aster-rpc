@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 4
 
-#define ASTER_ABI_VERSION_MINOR 16
+#define ASTER_ABI_VERSION_MINOR 17
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -575,6 +575,12 @@ typedef enum aster_event_kind_t {
    * One immutable shared topology view; handle = owned topology snapshot.
    */
   ASTER_EVENT_TOPOLOGY_SNAPSHOT = 120,
+  ASTER_EVENT_RAW_WT_SESSION = 121,
+  ASTER_EVENT_RAW_WT_STREAM = 122,
+  ASTER_EVENT_RAW_WT_READ = 123,
+  ASTER_EVENT_RAW_WT_DATAGRAM = 124,
+  ASTER_EVENT_RAW_WT_CLOSED = 125,
+  ASTER_EVENT_RAW_WT_ACKED = 126,
 } aster_event_kind_t;
 
 /**
@@ -2614,6 +2620,34 @@ typedef struct aster_verified_chain_t {
    */
   void *storage;
 } aster_verified_chain_t;
+
+/**
+ * ABI 4.17: inputs copied before start. struct_size must equal sizeof; flags/reserved zero.
+ * Exact path is not normalized. Zero limits select the shared adapter defaults.
+ */
+typedef struct aster_raw_wt_config_t {
+  uint32_t struct_size;
+  uint32_t flags;
+  struct aster_bytes_t bind_addr;
+  struct aster_bytes_t certificate_pem;
+  struct aster_bytes_t private_key_pem;
+  struct aster_bytes_t path;
+  uint32_t max_sessions;
+  uint32_t max_streams;
+  uint32_t max_datagrams;
+  uint32_t max_datagram_bytes;
+  uint32_t max_read_bytes;
+  uint32_t max_pending_auth;
+  uint32_t max_auth_payload_bytes;
+  uint32_t reserved;
+} aster_raw_wt_config_t;
+
+/**
+ * Runtime-local owned raw listener, session, and directional stream handles.
+ */
+typedef uint64_t aster_raw_wt_listener_t;
+
+typedef uint64_t aster_raw_wt_stream_t;
 
 /**
  * Per-call options for `aster_rpc_unary` / `aster_rpc_open`. 72 bytes
@@ -6316,6 +6350,268 @@ int32_t aster_verified_chain_release(struct aster_verified_chain_t *chain);
 int32_t aster_verified_chain_role_of(const struct aster_verified_chain_t *chain,
                                      const uint8_t *id,
                                      uint32_t *out_role);
+
+/**
+ * Bind ready TCP+QUIC listener; foreign auth runs before upgrade (kind80).
+ * Blocking: call off Tokio workers. All spans copied; malformed input INVALID_ARGUMENT.
+ * # Safety
+ * config/out valid; config spans readable during call.
+ */
+int32_t aster_raw_wt_listener_start(aster_runtime_t runtime,
+                                    aster_upcalls_t upcalls,
+                                    const struct aster_raw_wt_config_t *config,
+                                    aster_raw_wt_listener_t *out);
+
+/**
+ * Explicit public raw listener; transport provides no authenticated identity.
+ * # Safety
+ * Same input/output contract as authenticated start.
+ */
+int32_t aster_raw_wt_listener_start_public(aster_runtime_t runtime,
+                                           const struct aster_raw_wt_config_t *config,
+                                           aster_raw_wt_listener_t *out);
+
+/**
+ * Owned version1 JSON {tcp_addr,quic_addr,path?}; release with string_release.
+ * # Safety
+ * out writable for one span.
+ */
+int32_t aster_raw_wt_listener_addr(uint64_t runtime, uint64_t listener, struct aster_bytes_t *out);
+
+/**
+ * Stops and joins the listener; consumed on success. Repeated stop NOT_FOUND.
+ * Blocking off Tokio workers; grace milliseconds bounded by u32.
+ */
+int32_t aster_raw_wt_listener_stop(uint64_t runtime, uint64_t listener, uint32_t grace_ms);
+
+/**
+ * Accept one session. SESSION event121 handle owns session; late cancelled result closes it.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_listener_accept(uint64_t runtime,
+                                     uint64_t listener,
+                                     uint64_t user_data,
+                                     aster_operation_t *out);
+
+/**
+ * Synchronously close actual QUIC session; retains owner for closed/info until free. Child streams terminate.
+ * Reason is copied before return; code is uint32 WebTransport application code.
+ * # Safety
+ * reason readable for length.
+ */
+int32_t aster_raw_wt_session_close(uint64_t runtime,
+                                   uint64_t session,
+                                   uint32_t code,
+                                   struct aster_bytes_t reason);
+
+/**
+ * Free closes the session; repeated free NOT_FOUND (wrappers make Dispose idempotent).
+ */
+int32_t aster_raw_wt_session_free(uint64_t runtime, uint64_t session);
+
+/**
+ * Free stream owner; dropping halves resets/stops unfinished directions. NOT_FOUND if repeated.
+ */
+int32_t aster_raw_wt_stream_free(uint64_t runtime, uint64_t stream);
+
+/**
+ * Returns one owned stream(event122); flags bit0 send, bit1 receive. Raw/unframed.
+ * Cancellation discards/reset-stops an unseen stream owner.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_session_open_bi(uint64_t runtime,
+                                     uint64_t session,
+                                     uint64_t user_data,
+                                     aster_operation_t *out);
+
+/**
+ * Returns one owned stream(event122); flags bit0 send, bit1 receive. Raw/unframed.
+ * Cancellation discards/reset-stops an unseen stream owner.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_session_open_uni(uint64_t runtime,
+                                      uint64_t session,
+                                      uint64_t user_data,
+                                      aster_operation_t *out);
+
+/**
+ * Returns one owned stream(event122); flags bit0 send, bit1 receive. Raw/unframed.
+ * Cancellation discards/reset-stops an unseen stream owner.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_session_accept_bi(uint64_t runtime,
+                                       uint64_t session,
+                                       uint64_t user_data,
+                                       aster_operation_t *out);
+
+/**
+ * Returns one owned stream(event122); flags bit0 send, bit1 receive. Raw/unframed.
+ * Cancellation discards/reset-stops an unseen stream owner.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_session_accept_uni(uint64_t runtime,
+                                        uint64_t session,
+                                        uint64_t user_data,
+                                        aster_operation_t *out);
+
+/**
+ * Version1 JSON snapshot; owned span released with string_release. No native pointer fields.
+ * # Safety
+ * out writable for one span.
+ */
+int32_t aster_raw_wt_session_info(uint64_t runtime, uint64_t session, struct aster_bytes_t *out);
+
+/**
+ * Version1 JSON snapshot; owned span released with string_release. No native pointer fields.
+ * # Safety
+ * out writable for one span.
+ */
+int32_t aster_raw_wt_session_stats(uint64_t runtime, uint64_t session, struct aster_bytes_t *out);
+
+/**
+ * Wait session close; event125 owns version1 JSON {kind,code?,reason} payload.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_session_closed(uint64_t runtime,
+                                    uint64_t session,
+                                    uint64_t user_data,
+                                    uint64_t *out);
+
+/**
+ * Send datagram synchronously; errors never truncate. Empty datagrams are valid.
+ * # Safety
+ * data span readable during call.
+ */
+int32_t aster_raw_wt_session_send_datagram(uint64_t runtime,
+                                           uint64_t session,
+                                           struct aster_bytes_t data);
+
+/**
+ * One datagram per event124; payload may be empty; release nonzero event.buffer always.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_session_receive_datagram(uint64_t runtime,
+                                              uint64_t session,
+                                              uint64_t user_data,
+                                              uint64_t *out);
+
+/**
+ * Current maximum datagram payload; is_some0 means unavailable, size0. Never encode None as zero-size support.
+ * # Safety
+ * both outputs writable.
+ */
+int32_t aster_raw_wt_session_max_datagram_size(uint64_t runtime,
+                                               uint64_t session,
+                                               uint64_t *out_size,
+                                               uint32_t *out_is_some);
+
+/**
+ * Read at most max_bytes, nonzero and bounded by configured max_read_bytes. Event123 payload raw.
+ * flags bit0 EOF; empty payload+EOF distinct from an empty datagram. No framing or read-to-end allocation.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_stream_read(uint64_t runtime,
+                                 uint64_t stream,
+                                 uint32_t max_bytes,
+                                 uint64_t user_data,
+                                 uint64_t *out);
+
+/**
+ * Raw write-all; 16 MiB absolute input cap before copying, configured max_read_bytes transmission cap.
+ * Input copied before submission. Cancellation can leave a written prefix; never retry automatically.
+ * # Safety
+ * input span readable during call; out writable.
+ */
+int32_t aster_raw_wt_stream_write(uint64_t runtime,
+                                  uint64_t stream,
+                                  struct aster_bytes_t data,
+                                  uint64_t user_data,
+                                  uint64_t *out);
+
+/**
+ * Async stream finish; direction errors arrive as ERROR99. UNIT92 on success.
+ * FIN retains send owner for transport_acked or reset; never free on FIN.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_stream_finish(uint64_t runtime,
+                                   uint64_t stream,
+                                   uint64_t user_data,
+                                   uint64_t *out);
+
+/**
+ * Async stream reset; direction errors arrive as ERROR99. UNIT92 on success.
+ * FIN retains send owner for transport_acked or reset; never free on FIN.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_stream_reset(uint64_t runtime,
+                                  uint64_t stream,
+                                  uint32_t code,
+                                  uint64_t user_data,
+                                  uint64_t *out);
+
+/**
+ * Async stream stop; direction errors arrive as ERROR99. UNIT92 on success.
+ * FIN retains send owner for transport_acked or reset; never free on FIN.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_stream_stop(uint64_t runtime,
+                                 uint64_t stream,
+                                 uint32_t code,
+                                 uint64_t user_data,
+                                 uint64_t *out);
+
+/**
+ * Async stream set_priority; direction errors arrive as ERROR99. UNIT92 on success.
+ * FIN retains send owner for transport_acked or reset; never free on FIN.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_stream_set_priority(uint64_t runtime,
+                                         uint64_t stream,
+                                         int32_t priority,
+                                         uint64_t user_data,
+                                         uint64_t *out);
+
+/**
+ * Priority BYTES91 payload signed i32 LE when flags1; flags0 empty means unavailable.
+ * Higher signed priority is scheduled first; negative priorities are valid.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_stream_priority(uint64_t runtime,
+                                     uint64_t stream,
+                                     uint64_t user_data,
+                                     uint64_t *out);
+
+/**
+ * ACKED126 flags1 all sent data+FIN acknowledged; flags0 reset/connection loss. No timeout implied.
+ * # Safety
+ * out writable for operation ID.
+ */
+int32_t aster_raw_wt_stream_transport_acked(uint64_t runtime,
+                                            uint64_t stream,
+                                            uint64_t user_data,
+                                            uint64_t *out);
+
+/**
+ * Owned version1 JSON stream_id/has_send/has_receive. Release with string_release.
+ * # Safety
+ * out points to writable span storage.
+ */
+int32_t aster_raw_wt_stream_info(aster_runtime_t runtime,
+                                 aster_raw_wt_stream_t stream,
+                                 struct aster_bytes_t *out);
 
 /**
  * One unary call on `connection`'s pooled streams: one write of header +

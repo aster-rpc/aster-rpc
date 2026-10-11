@@ -15,6 +15,8 @@ aster_transport_core = { path = "../core", version = "=0.3.0", registry = "aster
 
 # Aster Salvo fork (pinned in the workspace-root [patch.crates-io]).
 salvo = { workspace = true, features = ["quinn", "rustls", "acme", "serve-static"] }
+salvo-http3 = { version = "=0.7.2", registry = "aster", git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931", features = ["quinn"] }
+serde = { version = "1", features = ["derive"] }
 # TLS: self-signed cert generation + the WebTransport serverCertificateHashes hash.
 rcgen = "0.13"
 sha2 = "0.10"

@@ -323,3 +323,47 @@ checks the caller's admission attributes for every baseline call. Enabling
 this service does not grant roles or bypass admission. Without a shared join,
 the RPC cluster list is empty and separation is Unknown. The baseline uses
 the native Fory payloads and is not a new discovery or placement protocol.
+
+## Raw WebTransport media (PC13)
+
+`aster.webtransport` exposes unframed WebTransport sessions, independently of
+`/aster/wt` RPC. Start an exact-route PEM listener with
+`WebTransportListener.start(options, authenticate)` or explicitly choose
+`start_public(options)`. Authentication receives `RPCAuthRequest` with service
+`webtransport`, method `CONNECT`, HTTP headers and trusted
+`aster.webtransport.path` / `aster.webtransport.query` metadata. The query is
+raw and must be validated by the application. A remote socket address is not
+an authenticated Iroh identity. Authentication runs before upgrade; any
+application proof-of-possession exchange must finish before sending media.
+
+```python
+from aster.webtransport import WebTransportListener, WebTransportOptions
+from aster.http import RPCAuthResponse
+
+async def authenticate(request):
+    return RPCAuthResponse("desktop-user") if verify_ticket(request) else RPCAuthResponse()
+
+async with await WebTransportListener.start(
+    WebTransportOptions(cert_pem, key_pem, path="/wt"), authenticate
+) as listener:
+    async with await listener.accept() as session:
+        frame = await session.open_uni()
+        await frame.set_priority(20)  # signed; higher values go first
+        await frame.write(encoded_frame)
+        await frame.finish()  # FIN only, not delivery acknowledgment
+        delivered = await frame.transport_acked()
+```
+
+Sessions also accept/open bidirectional streams, accept unidirectional streams,
+send/receive datagrams, expose the current maximum datagram payload and connection
+statistics. Stream `read(maximum)` returns `b""` at EOF; reads do not consume
+unread data when cancelled. A cancelled write may have sent a prefix. `reset`
+and `stop` interrupt their respective directions; retain the stream after FIN
+until acknowledgment or explicit reset. Acknowledgment is transport delivery,
+not confirmation that the peer application decoded a frame.
+
+All queues and read allocations have configured limits. Session `close()`
+closes the **entire QUIC connection**. Await listener `stop()`/`aclose()` for
+joined cleanup and released TCP/UDP sockets, including while closed stream
+objects remain referenced. This standalone raw listener uses its own port;
+it does not add arbitrary HTTP routes or codecs to the RPC listener.

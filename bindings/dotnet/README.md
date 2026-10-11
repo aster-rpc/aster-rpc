@@ -1,7 +1,7 @@
 # Aster .NET binding
 
 The .NET API wraps Aster's shared Rust engine through the C ABI. This checkout
-targets .NET 9 and requires native ABI **4.16 or newer within major 4**.
+targets .NET 9 and requires native ABI **4.17 or newer within major 4**.
 `Runtime` checks compatibility when it opens. Supply the native library through
 the repository build or an explicit build property:
 
@@ -300,3 +300,32 @@ Baseline `aster.net.Topology` RPC remains off by default. Opt in with
 `AsterServerOptions.Topology = true` and an explicit `TopologyRequirement`
 (e.g. `CapabilityRequirement.Role("observer")`). Monitoring is required and
 native Gate 3 enforces the requirement before RPC handlers.
+
+
+## Raw WebTransport (ABI 4.17)
+
+`RawWTListener.StartAsync(runtime, options, upcalls)` authenticates before the
+CONNECT upgrade using `ServeRpcAuthenticator`. `StartPublicAsync` explicitly
+serves anonymous sessions. Metadata includes the exact route and unnormalized
+query; remote addresses are diagnostic, not authenticated Iroh provenance.
+Accepted sessions retain the authenticated principal and attributes in `Info`.
+This is a separate listener, not arbitrary HTTP/RPC router composition.
+
+`AcceptAsync` returns an owned session. `OpenBiAsync` / `OpenUniAsync` and
+`AcceptBiAsync` / `AcceptUniAsync` return directional raw byte streams. Bounded
+`ReadAsync` returns null at EOF; it does not add RPC framing. `WriteAsync`
+cancellation can leave a sent prefix, so never retry automatically. `FinishAsync`
+queues FIN while retaining the send owner. `TransportAckedAsync` separately
+proves transport receipt; false means reset or loss. `ResetAsync` is explicit
+and remains available after FIN. Priority is signed Quinn priority, larger first.
+Cancellation requests native cancellation and collects its terminal event;
+a committed success can win the race and still belongs to the caller.
+
+`SendDatagram` / `ReceiveDatagramAsync` preserve empty messages.
+`MaxDatagramSize` is nullable, distinguishing unavailable support from zero.
+`Info`, `Stats` and `ClosedAsync` expose versioned copied snapshots.
+`CloseConnection` actively closes the underlying QUIC connection, including
+other sessions on it. Dispose streams and sessions, then the listener and
+borrowed upcalls, before the runtime. Listener stop joins cleanup beyond its
+application grace budget. First-stream proof-of-possession and media gating
+remain application responsibilities.

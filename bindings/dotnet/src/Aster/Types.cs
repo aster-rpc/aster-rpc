@@ -165,6 +165,12 @@ public enum EventKind : uint
     DocContentsBatch = 119,
     /// <summary>ABI 4.16: owned immutable topology snapshot handle.</summary>
     TopologySnapshot = 120,
+    RawWTSession = 121,
+    RawWTStream = 122,
+    RawWTRead = 123,
+    RawWTDatagram = 124,
+    RawWTClosed = 125,
+    RawWTAcked = 126,
 
     // Errors
     OperationCancelled = 98,

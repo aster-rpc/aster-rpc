@@ -32,6 +32,7 @@ mod net;
 mod node;
 mod observability;
 mod provisioning;
+mod raw_webtransport;
 mod rpc;
 mod rpc_client;
 mod ticket;

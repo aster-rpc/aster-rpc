@@ -38,6 +38,11 @@ function tryLoad(path: string): NativeAddon | null {
     if (!addon || typeof addon.Node !== 'function'
       || typeof addon.RpcConnection !== 'function'
       || typeof addon.DispatchServer !== 'function'
+      || typeof addon.rawWtStart !== 'function'
+      || typeof addon.RawWtCancel !== 'function'
+      || typeof addon.RawWtListenerHandle !== 'function'
+      || typeof addon.RawWtSessionHandle !== 'function'
+      || typeof addon.RawWtStreamHandle !== 'function'
       || typeof addon.HttpListener !== 'function'
       || typeof addon.DispatchServer.prototype?.startHttp !== 'function'
       || typeof addon.DispatchServer.prototype?.startPublicHttp !== 'function'
@@ -108,7 +113,7 @@ export function loadNative(): NativeAddon {
   if (!native) {
     throw new Error(
       'Aster native addon (@aster-rpc/transport) is not available or is incompatible ' +
-      '(HttpListener/startHttp support is required, including public listeners, TLS helpers, blob custody, coordination provisioning and topology policy version 1). ' +
+      '(HttpListener/startHttp support is required, including raw WebTransport media, public listeners, TLS helpers, blob custody, coordination provisioning and topology policy version 1). ' +
       'Install it, build it with `bun run build` in bindings/typescript/native, ' +
       'or point ASTER_NATIVE_PATH at a directory containing the .node binary.',
     );

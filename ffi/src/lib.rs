@@ -42,6 +42,7 @@ pub mod observability;
 pub mod probe;
 pub mod provisioning;
 pub mod pure;
+pub mod raw_webtransport;
 pub mod rpc;
 pub mod server;
 pub mod tls;
@@ -161,7 +162,8 @@ pub mod upcall;
 // - 4.15.0 (additive): stateless coordination authority provisioning helpers.
 // - 4.16.0 (additive): topology reads, owned snapshots, reader options and RPC gating.
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 16;
+// ABI 4.17 adds standalone raw WebTransport owners and cancellable operations.
+pub const ASTER_ABI_VERSION_MINOR: u32 = 17;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -415,6 +417,12 @@ pub enum aster_event_kind_t {
     ASTER_EVENT_DOC_CONTENTS_BATCH = 119,
     /// One immutable shared topology view; handle = owned topology snapshot.
     ASTER_EVENT_TOPOLOGY_SNAPSHOT = 120,
+    ASTER_EVENT_RAW_WT_SESSION = 121,
+    ASTER_EVENT_RAW_WT_STREAM = 122,
+    ASTER_EVENT_RAW_WT_READ = 123,
+    ASTER_EVENT_RAW_WT_DATAGRAM = 124,
+    ASTER_EVENT_RAW_WT_CLOSED = 125,
+    ASTER_EVENT_RAW_WT_ACKED = 126,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
@@ -799,6 +807,11 @@ pub(crate) struct BridgeRuntime {
     pub(crate) connections: HandleRegistry<CoreConnection>,
     pub(crate) audit_outboxes: HandleRegistry<audit_outbox::OutboxState>,
     pub(crate) http_listeners: HandleRegistry<http_server::HttpListenerState>,
+    pub(crate) raw_wt_listeners:
+        HandleRegistry<aster_transport_salvo::raw_webtransport::RawWtListener>,
+    pub(crate) raw_wt_sessions:
+        HandleRegistry<aster_transport_salvo::raw_webtransport::RawWtSession>,
+    pub(crate) raw_wt_streams: HandleRegistry<raw_webtransport::StreamState>,
     pub(crate) blob_custody: HandleRegistry<custody::CustodyState>,
     pub(crate) topology_snapshots: HandleRegistry<aster::topology::TopologySnapshot>,
     pub(crate) topology_admitted:
@@ -943,6 +956,9 @@ impl BridgeRuntime {
             connections: HandleRegistry::new(),
             audit_outboxes: HandleRegistry::new(),
             http_listeners: HandleRegistry::new(),
+            raw_wt_listeners: HandleRegistry::new(),
+            raw_wt_sessions: HandleRegistry::new(),
+            raw_wt_streams: HandleRegistry::new(),
             blob_custody: HandleRegistry::new(),
             topology_snapshots: HandleRegistry::new(),
             topology_admitted: HandleRegistry::new(),
@@ -980,6 +996,7 @@ impl BridgeRuntime {
         upcall::shutdown_runtime(self);
         server::shutdown_runtime(self);
         self.http_listeners.clear();
+        raw_webtransport::shutdown(self);
         self.topology_snapshots.clear();
         self.topology_admitted.clear();
         custody::shutdown(self);

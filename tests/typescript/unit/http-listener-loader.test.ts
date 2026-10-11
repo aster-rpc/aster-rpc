@@ -41,6 +41,8 @@ describe('native authenticated listener inventory', () => {
       coordinationJoinSigningBytes() {}, coordinationGenesisHash() {}, coordinationSignedDocumentFromParts() {},
       coordinationCanonicalCandidateTicket() {}, coordinationVerifyGenesis() {}, coordinationVerifyJoinPermitForStart() {},
       rpcTopologyPolicyVersion() { return 1; },
+      rawWtStart() {}, RawWtCancel: class {}, RawWtListenerHandle: class {},
+      RawWtSessionHandle: class {}, RawWtStreamHandle: class {},
     };
   }
 
@@ -49,6 +51,11 @@ describe('native authenticated listener inventory', () => {
     expect((await loader(old)).tryLoadNative()).toBeNull();
     expect((await loader({ ...compatible(), rpcTopologyPolicyVersion: () => 0 })).tryLoadNative()).toBeNull();
     expect((await loader({ ...compatible(), rpcTopologyPolicyVersion: () => { throw new Error("bad marker"); } })).tryLoadNative()).toBeNull();
+  });
+
+  it('rejects addons without raw WebTransport media ownership', async () => {
+    const { rawWtStart: _removed, ...old } = compatible();
+    expect((await loader(old)).tryLoadNative()).toBeNull();
   });
 
   it('retains a compatible addon', async () => {

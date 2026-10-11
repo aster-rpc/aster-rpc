@@ -325,6 +325,7 @@ from .decorators import (
     MethodInfo,
 )
 from .service import ServiceRegistry, get_default_registry, set_default_registry
+from .webtransport import WebTransportListener, WebTransportSession, WebTransportStream, WebTransportOptions
 from .http import (HTTPListener, RPCAuthRequest, RPCAuthResponse, GeneratedCertificate,
                    generate_self_signed_certificate, generate_webtransport_certificate,
                    verify_certificate_binding)
@@ -366,6 +367,7 @@ __all__ = [
     "genesis_signing_bytes", "join_signing_bytes", "genesis_hash",
     "signed_document_from_parts", "canonical_candidate_ticket",
     "verify_genesis", "verify_join_permit_for_start",
+    "WebTransportListener", "WebTransportSession", "WebTransportStream", "WebTransportOptions",
     "HTTPListener", "RPCAuthRequest", "RPCAuthResponse", "GeneratedCertificate",
     "generate_self_signed_certificate", "generate_webtransport_certificate",
     "verify_certificate_binding",

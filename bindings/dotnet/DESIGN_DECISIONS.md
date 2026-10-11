@@ -7,10 +7,10 @@
 **C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 4.12, 2026-10-10)
+## STATUS (ABI 4.17, 2026-10-11)
 
 - **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
-  `Native.RequiredAbiMinor` = 12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
+  `Native.RequiredAbiMinor` = 17 (owned raw WebTransport and media controls), with 4.12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.

@@ -1325,6 +1325,44 @@ export declare class PolicyDoc {
   fetchGrant(prefix: string, recipient: string): Promise<Buffer | null>
 }
 
+export declare class RawWtCancel {
+  constructor()
+  cancel(): void
+}
+
+export declare class RawWtListenerHandle {
+  get tcpAddr(): string
+  get quicAddr(): string
+  accept(cancel?: RawWtCancel | undefined | null): Promise<RawWtSessionHandle>
+  stop(graceMs: number): Promise<undefined>
+}
+
+export declare class RawWtSessionHandle {
+  info(): string
+  stats(): string
+  maxDatagramSize(): number | null
+  sendDatagram(data: Buffer): void
+  receiveDatagram(cancel?: RawWtCancel | undefined | null): Promise<Buffer>
+  acceptBi(cancel?: RawWtCancel | undefined | null): Promise<RawWtStreamHandle>
+  acceptUni(cancel?: RawWtCancel | undefined | null): Promise<RawWtStreamHandle>
+  openBi(cancel?: RawWtCancel | undefined | null): Promise<RawWtStreamHandle>
+  openUni(cancel?: RawWtCancel | undefined | null): Promise<RawWtStreamHandle>
+  close(code: number, reason: Buffer): void
+  closed(cancel?: RawWtCancel | undefined | null): Promise<string>
+}
+
+export declare class RawWtStreamHandle {
+  info(): string
+  read(maximum: number, cancel?: RawWtCancel | undefined | null): Promise<Buffer>
+  write(data: Buffer, cancel?: RawWtCancel | undefined | null): Promise<undefined>
+  finish(cancel?: RawWtCancel | undefined | null): Promise<undefined>
+  reset(code: number): Promise<undefined>
+  stop(code: number): Promise<undefined>
+  setPriority(priority: number): Promise<undefined>
+  priority(): Promise<number | undefined | null>
+  transportAcked(cancel?: RawWtCancel | undefined | null): Promise<boolean>
+}
+
 /**
  * A named readiness check (`HealthServer.check`). The server is ready only
  * while the application is ready and every check is `true`. Created failing.
@@ -3184,6 +3222,20 @@ export interface ProviderOutcome {
   /** Requests this provider carried to completion. */
   completedRequests: number
 }
+
+export interface RawWtOptions {
+  bindAddr?: string
+  certificatePem: Buffer
+  privateKeyPem: Buffer
+  path?: string
+  maxSessions?: number
+  maxStreams?: number
+  maxDatagrams?: number
+  maxDatagramBytes?: number
+  maxReadBytes?: number
+}
+
+export declare function rawWtStart(options: RawWtOptions, upcalls?: Upcalls | undefined | null): Promise<RawWtListenerHandle>
 
 /**
  * Decide what to do with the record at `ctx.path` (`null` = no record),

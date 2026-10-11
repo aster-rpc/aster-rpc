@@ -21,7 +21,7 @@ fn test_abi_version() {
     // independent event and operation bounds; 4.8.0: bounded foreign dispatch;
     // 4.16.0: topology views, snapshots and RPC gating.
     assert_eq!(ASTER_ABI_VERSION_MAJOR, 4);
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 16);
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 17);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);

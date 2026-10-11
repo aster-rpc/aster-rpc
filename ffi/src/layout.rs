@@ -41,6 +41,7 @@ use crate::observability::{
 use crate::pure::{
     aster_attest_options_t, aster_attestation_role_t, aster_id_kind_t, aster_verified_chain_t,
 };
+use crate::raw_webtransport::aster_raw_wt_config_t;
 use crate::rpc::aster_call_options_t;
 use crate::server::{
     aster_cancel_reason_t, aster_dispatch_event_kind_t, aster_dispatch_event_t,
@@ -125,6 +126,12 @@ mod lp64 {
 
     assert_layout!(aster_bytes_t, size = 16, align = 8, { ptr = 0, len = 8 });
     assert_layout!(aster_bytes_list_t, size = 16, align = 8, { items = 0, len = 8 });
+
+    assert_layout!(aster_raw_wt_config_t, size = 104, align = 8, {
+        struct_size=0, flags=4, bind_addr=8, certificate_pem=24, private_key_pem=40, path=56,
+        max_sessions=72, max_streams=76, max_datagrams=80, max_datagram_bytes=84, max_read_bytes=88,
+        max_pending_auth=92, max_auth_payload_bytes=96, reserved=100,
+    });
 
     assert_layout!(aster_runtime_config_t, size = 16, align = 4, {
         struct_size = 0,

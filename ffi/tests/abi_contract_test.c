@@ -51,6 +51,23 @@ LAYOUT(aster_bytes_list_t, 16);
 OFF(aster_bytes_list_t, items, 0);
 OFF(aster_bytes_list_t, len, 8);
 
+LAYOUT(aster_raw_wt_config_t, 104);
+OFF(aster_raw_wt_config_t, struct_size, 0);
+OFF(aster_raw_wt_config_t, flags, 4);
+OFF(aster_raw_wt_config_t, bind_addr, 8);
+OFF(aster_raw_wt_config_t, certificate_pem, 24);
+OFF(aster_raw_wt_config_t, private_key_pem, 40);
+OFF(aster_raw_wt_config_t, path, 56);
+OFF(aster_raw_wt_config_t, max_sessions, 72);
+OFF(aster_raw_wt_config_t, max_streams, 76);
+OFF(aster_raw_wt_config_t, max_datagrams, 80);
+OFF(aster_raw_wt_config_t, max_datagram_bytes, 84);
+OFF(aster_raw_wt_config_t, max_read_bytes, 88);
+OFF(aster_raw_wt_config_t, max_pending_auth, 92);
+OFF(aster_raw_wt_config_t, max_auth_payload_bytes, 96);
+OFF(aster_raw_wt_config_t, reserved, 100);
+_Static_assert(ASTER_EVENT_RAW_WT_SESSION == 121 && ASTER_EVENT_RAW_WT_ACKED == 126, "raw WT events");
+
 LAYOUT(aster_runtime_config_t, 16);
 OFF(aster_runtime_config_t, struct_size, 0);
 OFF(aster_runtime_config_t, worker_threads, 4);
@@ -456,7 +473,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 16); /* 4.16: topology observations */
+    CHECK(ASTER_ABI_VERSION_MINOR == 17); /* 4.17: raw WebTransport */
     CHECK(aster_doc_event_receiver_free(0, 0) == ASTER_STATUS_NOT_FOUND);
     CHECK(sizeof(aster_audit_outbox_error_t) == 4);
     CHECK(sizeof(aster_audit_outbox_t) == 8);

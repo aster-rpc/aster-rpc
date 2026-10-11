@@ -423,3 +423,40 @@ Rust checks the policy before every topology method, including HTTP/WebTransport
 calls. Public listener mode cannot bypass it. The native addon exposes
 `DispatchServerOptions.topologyRequiresJson` for direct consumers with the same
 native capability requirement JSON. Out-of-range durations return argument errors.
+
+## Raw WebTransport media (PC13)
+
+`WebTransportListener.start(options, authenticate)` exposes an exact raw-media
+route, separate from `/aster/wt` RPC. `startPublic` is the explicit anonymous
+alternative. The existing `RpcAuthenticator` runs **before CONNECT upgrade**,
+with service `webtransport`, method `CONNECT`, HTTP headers and native-supplied
+`aster.webtransport.path` / `aster.webtransport.query` metadata. The raw query
+is application input, and the peer socket address is not Iroh identity.
+
+```typescript
+await using listener = await WebTransportListener.start({
+  certificatePem, privateKeyPem, path: '/wt',
+}, async request => verifyTicket(request) ? { principal: 'desktop-user' } : null);
+using session = await listener.accept({ signal });
+const frame = await session.openUni({ signal });
+await frame.setPriority(20); // signed transport priority; higher goes first
+await frame.write(encodedFrame, { signal });
+await frame.finish({ signal }); // FIN, not delivery acknowledgment
+const delivered = await frame.transportAcked({ signal });
+```
+
+The session exposes bidirectional and unidirectional streams, datagrams and
+connection statistics. Keep finished streams alive until transport acknowledgment
+or explicit reset; releasing an owner aborts its directions. `read()` returns
+empty bytes at EOF. Cancellation of reads preserves unread bytes; cancellation
+of writes can leave a sent prefix. `reset()` interrupts a blocked send and
+`stop()` interrupts receive. Operations accept an `AbortSignal` and settle
+through native cancellation rather than abandoning an unobserved owner.
+
+`session.close()` closes its entire QUIC connection. Await `listener.close()`
+for joined shutdown and released TCP/UDP sockets. Limits bound accepted sessions,
+streams, datagrams and read sizes. The standalone listener owns a separate
+port and supplies transport primitives; codecs, frame pacing, application PoP
+and arbitrary HTTP route composition remain application responsibilities.
+`statsJson()` preserves exact counter integers when JavaScript number precision
+would be insufficient.

@@ -10,10 +10,10 @@ public installation source. See [publication setup](../../deploy/go-vanity/READM
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (ABI 4.16 minimum)
+## Preview status (ABI 4.17 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
-TypeScript, Java and .NET. The binding requires native ABI 4.16 or newer within
+TypeScript, Java and .NET. The binding requires native ABI 4.17 or newer within
 major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview release.
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
@@ -65,7 +65,7 @@ major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview rel
   bridge, Prometheus renderer) lives in Rust; the binding starts it and wraps the
   rest. `InitObservability(ObservabilityConfig{...})` (before the first server;
   otherwise `StartServer` / `StartHealth` run the implicit environment-only
-  start) and `ShutdownObservability`. Floor: the binding requires ABI 4.16 or newer
+  start) and `ShutdownObservability`. Floor: the binding requires ABI 4.17 or newer
   (`ABIMinorRequired`, checked by `CheckABI` / `NewRuntime`).
   - *Logs:* Rust `tracing` events reach `log/slog`. One goroutine on a locked OS
     thread polls `aster_log_poll`; `SetLogger(*slog.Logger)` picks the
@@ -593,3 +593,37 @@ Baseline `aster.net.Topology` RPC is explicitly opt-in through
 `ServerOptions{Topology:true, TopologyRequirement:RequireRole("observer")}` and
 requires monitoring. Requirements are enforced natively before handlers; local
 reads alone do not expose network layout over RPC.
+
+
+## Raw WebTransport (ABI 4.17)
+
+`Runtime.StartRawWT(ctx, upcalls, RawWTConfig{...})` binds a separate TCP/QUIC
+listener at an exact non-RPC path; `StartPublicRawWT` explicitly opts out of
+authentication. Supply PEM material from `GenerateWebTransportCertificate` or
+external provisioning. Register `ServeRPCAuthenticator` before authenticated
+start. Its metadata includes `aster.webtransport.path` and the original query;
+peer addresses are diagnostic hints, not Iroh-authenticated identities.
+
+`listener.Accept(ctx)` returns an owned `RawWTSession`. Use `AcceptBi`,
+`AcceptUni`, `OpenBi` and `OpenUni` for raw byte streams, and `ReceiveDatagram` /
+`SendDatagram` for bounded unreliable messages. No Aster RPC framing is added.
+`MaxDatagramSize` distinguishes unavailable datagrams from a zero size.
+Applications implementing first-stream proof of possession must withhold media
+until their own proof check succeeds.
+
+Stream `Read(ctx, maxBytes)` is bounded and returns `io.EOF` at FIN. `Write`
+writes all supplied bytes, but cancellation may leave a transmitted prefix;
+do not automatically retry. `Finish` queues FIN and retains ownership.
+`TransportAcked` separately waits for transport receipt; false means reset or
+connection loss. `Reset` remains available after FIN. `SetPriority` / `Priority`
+use signed Quinn priorities (larger values first), not HTTP urgency values.
+Context cancellation immediately requests native cancellation and collects the
+terminal completion; a success already committed can win the race.
+
+`Info`, `Stats` and `Closed(ctx)` expose versioned native snapshots.
+`CloseConnection(code, reason)` actively closes the underlying QUIC connection,
+including any other sessions on it. `Close` also frees the session owner.
+Close every stream and session owner, then the listener and borrowed upcall
+table, before closing the runtime. Listener `Stop(grace)` joins protocol cleanup;
+grace is not a deadline on the socket/driver join. This separate raw listener
+does not compose arbitrary foreign HTTP routes or the `/aster/wt` RPC router.
