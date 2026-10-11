@@ -34,6 +34,18 @@ def verify_host(rid: str, qemu: bool) -> None:
         raise ValueError("consumer host does not match its claimed execution target")
 
 
+def cgo_flags(native: Path, rid: str) -> tuple[str, str]:
+    # Go's quoted.Split only recognizes a quote at the start of an argument;
+    # quoting a path after -I/-L leaves literal quotes in Windows arguments.
+    cflags = shlex.quote("-I" + str(native))
+    ldflags = ["-L" + str(native), "-laster_transport_ffi"]
+    if rid != "win-x64":
+        ldflags.append("-Wl,-rpath," + str(native))
+    if rid.startswith("linux"):
+        ldflags.append("-ldl")
+    return cflags, " ".join(shlex.quote(flag) for flag in ldflags)
+
+
 def digest(path: Path) -> str:
     value = hashlib.sha256()
     with path.open("rb") as stream:
@@ -110,16 +122,13 @@ def run(archive: Path, rid: str, version: str, output: Path, qemu: bool = False)
         env = dict(os.environ)
         for name in ("CC", "CXX", "CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_LDFLAGS", "CPATH", "C_INCLUDE_PATH", "LIBRARY_PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "GOFLAGS", "GOWORK"):
             env.pop(name, None)
-        env.update(CGO_ENABLED="1", GOWORK="off", CGO_CFLAGS="-I" + shlex.quote(str(native)),
-                   CGO_LDFLAGS="-L" + shlex.quote(str(native)) + " -laster_transport_ffi",
+        cflags, ldflags = cgo_flags(native, rid)
+        env.update(CGO_ENABLED="1", GOWORK="off", CGO_CFLAGS=cflags,
+                   CGO_LDFLAGS=ldflags,
                    GOCACHE=str(project / "go-cache"), GOMODCACHE=str(project / "go-mod-cache"),
                    GOENV="off", GOTOOLCHAIN="local", GOPROXY="off", GOSUMDB="off")
         if rid == "win-x64":
             env["CC"] = "gcc"
-        if rid != "win-x64":
-            env["CGO_LDFLAGS"] += " -Wl,-rpath," + shlex.quote(str(native))
-        if rid.startswith("linux"):
-            env["CGO_LDFLAGS"] += " -ldl"
         env["LD_LIBRARY_PATH"] = str(native)
         env["DYLD_LIBRARY_PATH"] = str(native)
         env["PATH"] = str(native) + os.pathsep + env["PATH"]

@@ -17,6 +17,13 @@ SPEC.loader.exec_module(F)
 
 
 class ArchiveConsumer(unittest.TestCase):
+    def test_windows_and_space_paths_quote_whole_cgo_arguments(self):
+        for native in (Path(r"C:\Users\runner\AppData\Local\Temp\native"), Path("/tmp/consumer with spaces/native")):
+            cflags, ldflags = F.cgo_flags(native, "win-x64")
+            self.assertEqual(cflags, "'" + "-I" + str(native) + "'")
+            self.assertTrue(ldflags.startswith("'" + "-L" + str(native) + "' "))
+            self.assertNotIn("rpath", ldflags)
+
     def test_native_host_and_emulator_target_cannot_be_mislabeled(self):
         with patch.object(F.platform, "machine", return_value="x86_64"), patch.object(F.platform, "system", return_value="Linux"):
             F.verify_host("linux-x64", False)

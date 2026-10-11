@@ -15,8 +15,9 @@
 #
 #   3. `aster-otel`'s TLS is the rustls + ring stack iroh already links. Its
 #      OTLP client is built with reqwest `rustls-no-provider` and an explicit
-#      ring provider precisely so that aws-lc-rs (a C/asm build) and OpenSSL
-#      (native-tls) never enter the binding graphs.
+#      ring provider precisely so that the telemetry crate itself adds neither
+#      aws-lc-rs (a C/asm build) nor OpenSSL (native-tls). The HTTP transport
+#      has a separate provider graph (see rule 7).
 #
 #   4. The SDK resolves at the exactly pinned versions (§2.2).
 #
@@ -32,7 +33,9 @@
 #
 #   7. The C ABI (`aster_transport_ffi`, ABI 4.6) links the pipeline through
 #      aster-otel with OTLP logs and the Prometheus reader, at the pinned
-#      versions, and still without aws-lc or OpenSSL.
+#      versions, without OpenSSL/native-tls. Its HTTP transport also links the
+#      pinned Salvo/ACME stack, whose defaults include AWS-LC; that does not
+#      change OTLP's explicitly preconfigured ring client.
 #
 # Usage: ./scripts/check-otel-deps.sh
 
@@ -124,12 +127,25 @@ for needle in 'aster-otel v' 'opentelemetry_sdk v0.33.0' 'opentelemetry-promethe
         fail "the C ABI graph lacks '$needle' (ABI 4.6 observability)"
     fi
 done
-for crate_name in aws-lc-rs aws-lc-sys openssl openssl-sys native-tls; do
+# Salvo/ACME already uses AWS-LC in the HTTP transport graph. ABI 4.16 now
+# exposes that transport to every binding. Keep OTLP's isolated default and
+# all-features graphs strictly ring-only above, and keep native TLS out of the
+# whole C ABI. aster-otel/src/http.rs uses builder_with_provider(ring) and
+# tls_backend_preconfigured, so feature unification cannot select AWS-LC for it.
+for crate_name in openssl openssl-sys native-tls; do
     if grep -q "\\b${crate_name} v" <<<"$out"; then
         echo "$out" | grep -n "${crate_name} v" || true
-        fail "'$crate_name' is in the C ABI graph; OTLP TLS must stay on rustls + ring"
+        fail "'$crate_name' is in the C ABI graph; TLS must stay on rustls"
     fi
 done
-pass "the C ABI links the pinned pipeline, without aws-lc / OpenSSL"
+if grep -Eq '\baws-lc-(rs|sys) v' <<<"$out"; then
+    for needle in 'aster-transport-salvo v' 'salvo-acme v' 'certon v'; do
+        if ! grep -q "$needle" <<<"$out"; then
+            fail "AWS-LC in the C ABI graph without the pinned Salvo/ACME transport"
+        fi
+    done
+    pass "the C ABI includes Salvo/ACME AWS-LC; OTLP independently selects ring"
+fi
+pass "the C ABI links the pinned pipeline without OpenSSL / native-tls"
 
 echo -e "\n${GREEN}Observability dependency gate passed.${RESET}"
