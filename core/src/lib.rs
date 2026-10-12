@@ -6,6 +6,8 @@ pub mod canonical;
 pub mod contract;
 pub mod datagram;
 pub mod dynamic;
+#[cfg(feature = "enrollment")]
+pub mod enrollment;
 pub mod envelope;
 pub mod framing;
 pub mod grant_record;
@@ -555,6 +557,10 @@ pub struct CoreHookHandshakeInfo {
     pub remote_endpoint_id: String,
     pub alpn: Vec<u8>,
     pub is_alive: bool,
+    /// Selected direct QUIC peer address, observed by the transport. Relayed,
+    /// unknown and future paths do not supply an originating-peer address.
+    #[cfg(feature = "enrollment")]
+    pub observed_peer_addr: Option<SocketAddr>,
 }
 
 /// Decision for after_handshake hook
@@ -1113,6 +1119,30 @@ impl CoreHooksAdapter {
     }
 }
 
+fn selected_transport_snapshot(connection: &Connection) -> CoreTransportSnapshot {
+    let paths = connection.paths();
+    let Some(path) = paths.iter().find(|p| p.is_selected()) else {
+        return CoreTransportSnapshot::default();
+    };
+    let (peer_addr, relay_url) = match path.remote_addr() {
+        TransportAddr::Ip(socket) => (Some(*socket), None),
+        TransportAddr::Relay(url) => (None, Some(url.to_string())),
+        // Custom or future transports: surface RTT but no addr/url.
+        _ => (None, None),
+    };
+    let rtt = path.rtt();
+    let rtt_micros = if rtt == Duration::ZERO {
+        None
+    } else {
+        Some(rtt.as_micros().min(u64::MAX as u128) as u64)
+    };
+    CoreTransportSnapshot {
+        peer_addr,
+        relay_url,
+        rtt_micros,
+    }
+}
+
 impl EndpointHooks for CoreHooksAdapter {
     async fn before_connect<'a>(
         &'a self,
@@ -1139,6 +1169,8 @@ impl EndpointHooks for CoreHooksAdapter {
             remote_endpoint_id: conn.remote_id().to_string(),
             alpn: conn.alpn().to_vec(),
             is_alive: conn.close_reason().is_none(),
+            #[cfg(feature = "enrollment")]
+            observed_peer_addr: selected_transport_snapshot(conn).peer_addr,
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -1405,6 +1437,8 @@ pub struct CoreNode {
 }
 
 struct CoreNodeInner {
+    #[cfg(feature = "enrollment")]
+    enrollment_hook_failure_mode: trust::HookFailureMode,
     endpoint: Endpoint,
     router: Router,
     #[allow(dead_code)]
@@ -1622,6 +1656,10 @@ impl CoreNode {
         endpoint_config: Option<CoreEndpointConfig>,
         gc_interval: Option<Duration>,
     ) -> Result<Self> {
+        let hook_failure_mode = endpoint_config
+            .as_ref()
+            .map(|config| config.hook_failure_mode)
+            .unwrap_or_default();
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         // The docs engine stores entry content as untagged blobs in this shared
         // store, so GC must protect the docs live-content set or the first sweep
@@ -1646,7 +1684,7 @@ impl CoreNode {
             None,
             aster_alpns,
             monitor,
-            hook_receiver,
+            (hook_receiver, hook_failure_mode),
             (protect_handler, protect_cb),
         )
         .await
@@ -1676,6 +1714,10 @@ impl CoreNode {
         endpoint_config: Option<CoreEndpointConfig>,
         gc_interval: Option<Duration>,
     ) -> Result<Self> {
+        let hook_failure_mode = endpoint_config
+            .as_ref()
+            .map(|config| config.hook_failure_mode)
+            .unwrap_or_default();
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let root = std::path::PathBuf::from(&path);
         // Create the data directory privately *before* the stores write secret
@@ -1704,7 +1746,7 @@ impl CoreNode {
             Some(root),
             aster_alpns,
             monitor,
-            hook_receiver,
+            (hook_receiver, hook_failure_mode),
             (protect_handler, protect_cb),
         )
         .await
@@ -1725,12 +1767,16 @@ impl CoreNode {
         docs_root: Option<std::path::PathBuf>,
         aster_alpns: Vec<Vec<u8>>,
         monitor: Option<CoreMonitor>,
-        hook_receiver: Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
+        hooks: (
+            Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
+            trust::HookFailureMode,
+        ),
         // The docs GC protection bridge, created together by
         // `ProtectCallbackHandler::new()`: the handler half drives the docs
         // engine, the callback half is stored for manual `gc_run_once` sweeps.
         gc_protect: (ProtectCallbackHandler, ProtectCb),
     ) -> Result<Self> {
+        let (hook_receiver, _hook_failure_mode) = hooks;
         let (protect_handler, protect_cb) = gc_protect;
         let downloader = Downloader::new(&store, &endpoint);
         let blobs = BlobsProtocol::new(&store, None);
@@ -1790,6 +1836,8 @@ impl CoreNode {
 
         Ok(Self {
             inner: Arc::new(CoreNodeInner {
+                #[cfg(feature = "enrollment")]
+                enrollment_hook_failure_mode: _hook_failure_mode,
                 endpoint,
                 router,
                 blobs,
@@ -2622,27 +2670,7 @@ impl CoreConnection {
     /// call once per RPC dispatch. Returns all-`None` fields if the
     /// connection has been dropped or no path is selected yet.
     pub fn transport_snapshot(&self) -> CoreTransportSnapshot {
-        let paths = self.inner.paths();
-        let Some(path) = paths.iter().find(|p| p.is_selected()) else {
-            return CoreTransportSnapshot::default();
-        };
-        let (peer_addr, relay_url) = match path.remote_addr() {
-            TransportAddr::Ip(socket) => (Some(*socket), None),
-            TransportAddr::Relay(url) => (None, Some(url.to_string())),
-            // Custom or future transports: surface RTT but no addr/url.
-            _ => (None, None),
-        };
-        let rtt = path.rtt();
-        let rtt_micros = if rtt == Duration::ZERO {
-            None
-        } else {
-            Some(rtt.as_micros().min(u64::MAX as u128) as u64)
-        };
-        CoreTransportSnapshot {
-            peer_addr,
-            relay_url,
-            rtt_micros,
-        }
+        selected_transport_snapshot(&self.inner)
     }
 
     /// Owned snapshot of every currently-open network path. Unlike

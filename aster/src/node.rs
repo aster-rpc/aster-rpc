@@ -26,6 +26,10 @@ pub struct Node {
 }
 
 impl Node {
+    #[cfg(feature = "enrollment")]
+    pub(crate) fn enrollment_core(&self) -> CoreNode {
+        self.inner.clone()
+    }
     /// Start a node from `config`. The node is in-memory unless the config sets
     /// a persistent data directory.
     pub async fn start(config: AsterConfig) -> Result<Node> {

@@ -30,6 +30,10 @@ pub struct Connection {
 }
 
 impl Connection {
+    #[cfg(feature = "enrollment")]
+    pub(crate) fn enrollment_core(&self) -> CoreConnection {
+        self.inner.clone()
+    }
     pub(crate) fn new(inner: CoreConnection) -> Self {
         Self { inner }
     }

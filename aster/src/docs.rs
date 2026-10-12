@@ -480,6 +480,19 @@ pub struct Doc {
 }
 
 impl Doc {
+    /// Borrow the shared engine document for native policy integrations.
+    pub fn as_core(&self) -> &CoreDoc {
+        &self.inner
+    }
+
+    #[cfg(feature = "enrollment")]
+    pub(crate) fn from_enrollment_core(inner: CoreDoc, docs: CoreDocsClient) -> Self {
+        Self::new(inner, docs)
+    }
+    #[cfg(feature = "enrollment")]
+    pub(crate) fn enrollment_core(&self) -> CoreDoc {
+        self.inner.clone()
+    }
     fn new(inner: CoreDoc, docs: CoreDocsClient) -> Self {
         Self { inner, docs }
     }

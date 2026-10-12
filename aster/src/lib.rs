@@ -65,6 +65,8 @@ mod admission;
 pub mod binding_support;
 mod config;
 pub mod crypto;
+#[cfg(feature = "enrollment")]
+pub mod enrollment;
 mod error;
 pub mod grants;
 mod id;
