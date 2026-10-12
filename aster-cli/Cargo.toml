@@ -1,0 +1,39 @@
+[package]
+name = "aster-cli"
+version = "0.3.0"
+edition = "2024"
+rust-version.workspace = true
+description = "The `aster` command-line tool."
+license = "MIT OR Apache-2.0"
+repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
+publish = false
+
+# Design and dependency policy: docs/_internal/working_ideas/aster-cli-rust.md.
+# The library target holds the command tree so `examples/docgen.rs` and the
+# tests can reach it; `main.rs` only parses and dispatches.
+[[bin]]
+name = "aster"
+path = "src/main.rs"
+
+[dependencies]
+aster-exec = { path = "../aster-exec", features = ["policy"] }
+aster-exec-client = { path = "../aster-exec-client" }
+fs2 = "0.4"
+uuid = { version = "1", features = ["v4"] }
+aster = { path = "../aster", default-features = false, features = ["attestation", "enrollment", "docs"] }
+hex = "0.4"
+aster-cli-kit = { path = "../aster-cli-kit" }
+aster-config = { path = "../aster-config" }
+aster-directory-client = { path = "../aster-directory-client" }
+aster-keystore = { path = "../aster-keystore" }
+anyhow = { workspace = true }
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "env"] }
+clap_complete = "4.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { workspace = true }
+zeroize = "1"
+libc = "0.2"
+
+[dev-dependencies]
+clap_mangen = "0.3"
