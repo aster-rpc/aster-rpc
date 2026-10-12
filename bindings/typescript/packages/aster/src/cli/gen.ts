@@ -25,6 +25,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { encodeContractDefault, foryTypeExpr } from '../wire-types.js';
+import { formatUsageSnippet, generateTypescriptClients } from '../codegen/client.js';
 
 // ─── CLI argv ────────────────────────────────────────────────────────────────
 
@@ -66,6 +67,8 @@ function printHelp(): void {
       'aster-gen — build-time scanner for @aster-rpc/aster',
       '',
       'Usage: aster-gen [options]',
+      '       aster-gen client --manifest <file> --out <dir> --namespace <name>',
+      '                        (typed clients from a manifest; used by `aster contract client`)',
       '',
       'Options:',
       '  -p, --project <tsconfig>   Path to tsconfig.json  (default: ./tsconfig.json)',
@@ -1665,7 +1668,51 @@ export function generate(options: GenerateOptions): GenerateResult {
 
 export { ScanError };
 
+/**
+ * `aster-gen client --manifest FILE --out DIR --namespace NAME [--source S] [--address A]`
+ *
+ * The client-generation handoff the `aster` CLI calls for TypeScript. Writes
+ * typed clients for every service in the manifest file and one JSON object to
+ * stdout: `{"aster_codegen_handoff": 1, "files": [...], "usage": "..."}`.
+ * Errors go to stderr with exit status 1.
+ */
+function clientMain(argv: string[]): void {
+  const opts: Record<string, string> = {};
+  for (let i = 0; i < argv.length; i++) {
+    const key = argv[i].replace(/^--/, '');
+    if (!argv[i].startsWith('--') || !['manifest', 'out', 'namespace', 'source', 'address'].includes(key)) {
+      console.error(`aster-gen client: unknown argument: ${argv[i]}`);
+      process.exit(2);
+    }
+    opts[key] = argv[++i] ?? '';
+  }
+  for (const required of ['manifest', 'out', 'namespace']) {
+    if (!opts[required]) {
+      console.error(`aster-gen client: --${required} is required`);
+      process.exit(2);
+    }
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(opts.manifest, 'utf8'));
+    const manifests = Array.isArray(data) ? data : [data];
+    const files = generateTypescriptClients(manifests, {
+      outDir: opts.out,
+      namespace: opts.namespace,
+      source: opts.source || opts.manifest,
+    });
+    const usage = formatUsageSnippet(opts.out, opts.namespace, manifests, opts.address ?? '');
+    process.stdout.write(JSON.stringify({ aster_codegen_handoff: 1, files, usage }) + '\n');
+  } catch (e) {
+    console.error(`${e instanceof Error ? e.name : 'Error'}: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+}
+
 function main(): void {
+  if (process.argv[2] === 'client') {
+    clientMain(process.argv.slice(3));
+    return;
+  }
   const cli = parseArgv(process.argv.slice(2));
   try {
     const result = generate(cli);

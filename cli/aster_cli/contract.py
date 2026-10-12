@@ -19,7 +19,6 @@ import json as _json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 
@@ -161,109 +160,21 @@ def _gen_command(args: argparse.Namespace) -> int:
 
 
 def _gen_single_service(spec: str, args: argparse.Namespace) -> "ContractManifest | None":
-    """Generate a manifest for a single service class."""
-    from aster.contract.identity import (
-        ServiceContract,
-        build_type_graph,
-        canonical_xlang_bytes,
-        compute_contract_id,
-        compute_type_hash,
-        resolve_with_cycles,
-    )
-    from aster.contract.manifest import ContractManifest, extract_method_descriptors
-    from aster.decorators import _SERVICE_INFO_ATTR
+    """Generate a manifest for a single service class (``aster.contract.generate``)."""
+    from aster.contract.generate import build_manifest
 
     cls = _import_service_class(spec)
-
-    service_info = getattr(cls, _SERVICE_INFO_ATTR, None)
-    if service_info is None:
-        print(
-            f"Error: Class {cls.__name__} is not decorated with @service.",
-            file=sys.stderr,
+    try:
+        return build_manifest(
+            cls,
+            semver=getattr(args, "semver", None),
+            vcs_revision=_git_revision(),
+            vcs_tag=_git_tag(),
+            vcs_url=_git_remote_url(),
         )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return None
-
-    # Collect all root types from method signatures
-    root_types: list[type] = []
-    for method_info in service_info.methods.values():
-        if method_info.request_type is not None:
-            root_types.append(method_info.request_type)
-        if method_info.response_type is not None:
-            root_types.append(method_info.response_type)
-
-    # Build type graph and resolve with cycle-breaking
-    type_graph = build_type_graph(root_types)
-    type_defs = resolve_with_cycles(type_graph)
-
-    # Compute type hashes (already done in resolve_with_cycles -- re-compute for manifest)
-    type_hashes: dict[str, bytes] = {}
-    for fqn, td in type_defs.items():
-        td_bytes = canonical_xlang_bytes(td)
-        type_hashes[fqn] = compute_type_hash(td_bytes)
-
-    # Build ServiceContract
-    contract = ServiceContract.from_service_info(service_info, type_hashes)
-
-    # Compute canonical bytes and contract_id
-    contract_bytes = canonical_xlang_bytes(contract)
-    contract_id = compute_contract_id(contract_bytes)
-
-    # Map scoped string
-    scoped_str = getattr(service_info, "scoped", "shared")
-
-    # Build type_hashes list (hex, sorted)
-    type_hashes_hex = sorted(h.hex() for h in type_hashes.values())
-
-    # Serialization modes -- convert enum values to lowercase name strings
-    ser_modes: list[str] = []
-    for mode in service_info.serialization_modes:
-        if hasattr(mode, "name"):
-            ser_modes.append(mode.name.lower())
-        elif hasattr(mode, "value") and isinstance(mode.value, str):
-            ser_modes.append(mode.value)
-        elif isinstance(mode, str):
-            ser_modes.append(mode)
-        else:
-            ser_modes.append(str(mode))
-    if not ser_modes:
-        ser_modes = ["xlang"]
-
-    # Capture VCS info
-    vcs_revision = _git_revision()
-    vcs_tag = _git_tag()
-    vcs_url = _git_remote_url()
-
-    # Extract method descriptors with field definitions
-    methods = extract_method_descriptors(service_info)
-
-    # Determine producer_language per spec 11.3.2.3:
-    # required when "native" in serialization_modes, empty string otherwise.
-    producer_lang = "python" if "native" in ser_modes else ""
-
-    # Build manifest
-    manifest = ContractManifest(
-        service=service_info.name,
-        version=service_info.version,
-        contract_id=contract_id,
-        canonical_encoding="fory-xlang/0.15",
-        type_count=len(type_defs),
-        type_hashes=type_hashes_hex,
-        method_count=len(contract.methods),
-        methods=methods,
-        serialization_modes=ser_modes,
-        producer_language=producer_lang,
-        scoped=scoped_str,
-        deprecated=False,
-        semver=getattr(args, "semver", None),
-        vcs_revision=vcs_revision,
-        vcs_tag=vcs_tag,
-        vcs_url=vcs_url,
-        changelog=None,
-        published_by="",
-        published_at_epoch_ms=int(time.time() * 1000),
-    )
-
-    return manifest
 
 
 # ── Export / Import / Verify ─────────────────────────────────────────────────
