@@ -168,11 +168,24 @@ read; warm RPCs use the local authority snapshot without repeating those reads.
 Configure background refresh between 200 ms and 2 seconds. A positive snapshot
 expires after 30 seconds and then RPCs fail closed until a successful refresh;
 denials are retried after one second. Enrollment revocation notifications
-invalidate the snapshot immediately. Reconciliation runs every ten seconds to
-cancel revoked jobs and replay terminal audit outcomes. A transient policy-read
-failure can defer cancellation of an already running job for at most 30 seconds
-since its last successful authority read; a definite denial cancels on the next
-reconcile. Preserve local denial watermarks when restoring state.
+invalidate the snapshot immediately.
+
+Reconciliation runs every ten seconds, and on each revocation, to cancel jobs
+whose owner has lost authority and to replay terminal audit outcomes. It reads
+each job owner's enrollment and grant afresh and acts on the result:
+
+- A definite denial (a revoked or expired grant, a revoked enrollment) cancels
+  the owner's running jobs on that pass.
+- A caller with no enrollment session, as after an API restart, cannot make
+  calls until it reconnects, and its CLI does this automatically. Its running
+  jobs continue while its grant stays valid.
+- If policy cannot be read (local storage, a pending Docs record, a timeout),
+  calls fail with a retryable error and running jobs continue for up to five
+  minutes; after that they are cancelled.
+
+Revoke the Exec grant to stop a caller's work on a target: grant revocation
+applies even to callers that have not reconnected since an API restart.
+Preserve local denial watermarks when restoring state.
 
 Place API and helper state on a filesystem with an explicit project quota or
 dedicated bounded volume, and alert before exhaustion. Keep enough free space

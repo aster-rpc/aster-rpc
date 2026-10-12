@@ -14,7 +14,7 @@ use {
     tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{UnixListener, UnixStream},
-        sync::{Mutex, OnceCell},
+        sync::{Mutex, OnceCell, Semaphore},
     },
 };
 
@@ -310,12 +310,12 @@ async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
         hook_failure_mode: aster::HookFailureMode::FailClosed,
         ..Default::default()
     };
-    let node = Arc::new(
+    let node =
         aster::Node::start_with_alpns(config, vec![aster::enrollment::ENROLLMENT_ALPN.to_vec()])
-            .await?,
-    );
-    let direct_addresses = Arc::new(settings.exec_direct_addresses.clone());
-    let enrollment = Arc::new(aster::enrollment::Enrollment::install(
+            .await?;
+    let enrollment_options = aster::enrollment::EnrollmentOptions::default();
+    let handshakes = enrollment_options.max_concurrent_handshakes;
+    let enrollment = aster::enrollment::Enrollment::install(
         &node,
         Arc::new(aster::enrollment::EnrollmentPolicyStore::open(
             dir.join("enrollment.json"),
@@ -328,75 +328,58 @@ async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
         Arc::new(aster::enrollment::PolicyExpressionV1::Predicate(
             aster::enrollment::PolicyPredicate::TolerateStalePolicy,
         )),
-        aster::enrollment::EnrollmentOptions::default(),
-    )?);
+        enrollment_options,
+    )?;
+    let remotes = Arc::new(Remotes {
+        node,
+        enrollment,
+        direct_addresses: settings.exec_direct_addresses.clone(),
+        pool: Mutex::new(HashMap::new()),
+        handshakes: Semaphore::new(handshakes),
+    });
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-    let pool = Arc::new(Mutex::new(HashMap::<
-        String,
-        Arc<OnceCell<aster_exec_client::Client>>,
-    >::new()));
     let mut tasks = tokio::task::JoinSet::new();
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let mut idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(idle_deadline), if tasks.is_empty() => break,
             _ = shutdown.notified() => break,
             connection = listener.accept() => {
-                let (mut stream,_) = match connection {
-                    Ok(connection) => connection,
-                    Err(error) => { eprintln!("Exec daemon accept failed: {error}"); continue; }
+                idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                let mut stream = match connection {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        // Running out of descriptors must not become a busy loop.
+                        eprintln!("Exec daemon accept failed: {error}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
-                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-                if !stream.peer_cred().is_ok_and(|cred| cred.uid() == unsafe { libc::geteuid() }) { continue; }
-                let node = node.clone(); let pool = pool.clone(); let shutdown = shutdown.clone(); let enrollment = enrollment.clone(); let direct_addresses = direct_addresses.clone();
+                let same_user = stream
+                    .peer_cred()
+                    .is_ok_and(|cred| cred.uid() == unsafe { libc::geteuid() });
+                if !same_user {
+                    continue;
+                }
+                let remotes = remotes.clone();
+                let shutdown = shutdown.clone();
                 tasks.spawn(async move {
-                    let outcome: Result<Value> = async {
-                        let envelope = tokio::time::timeout(Duration::from_secs(10),read(&mut stream)).await.map_err(|_|Error::usage("local request deadline exceeded"))??;
-                        if envelope["protocol"] != 1 { return Err(Error::usage("incompatible local Exec protocol")); }
-                        let req = &envelope["request"];
-                        if req["operation"] == "ping" { return Ok(json!({"ready":true,"protocol":1,"idle_timeout_seconds":600})); }
-                        if req["operation"] == "stop" { shutdown.notify_one(); return Ok(json!({"stopping":true})); }
-                        let budget = Duration::from_millis(envelope["budget_ms"].as_u64().unwrap_or(40000).clamp(1, 45000));
-                        tokio::time::timeout(budget, async {
-                        let invocation: Invocation = serde_json::from_value(req.clone())?;
-                        let cell = {
-                            let mut pool = pool.lock().await;
-                            pool.entry(invocation.node.clone()).or_default().clone()
-                        };
-                        let client = cell.get_or_try_init(|| async {
-                            let peer = invocation.node.parse()?;
-                            tokio::time::timeout(Duration::from_secs(15), async {
-                                let address = aster::NodeAddr { node_id: peer, relay_url: None, direct_addresses: direct_addresses.get(&invocation.node).cloned().unwrap_or_default() };
-                                node.add_node_addr(address.clone())?;
-                                enrollment.connect(address).await?;
-                                let peer = invocation.node.parse()?;
-                                Ok::<_, Error>(aster_exec_client::Client::new(node.rpc_connect(&peer).await?))
-                            }).await.map_err(|_| Error::new(ErrorKind::Unavailable,"remote enrollment/connection deadline exceeded"))?
-                        }).await?.clone();
-                        let p = invocation.request;
-                        macro_rules! invoke { ($method:ident) => { match client.$method(&serde_json::from_value(p)?).await { Ok(value) => serde_json::to_value(value)?, Err(error) => { if matches!(&error,aster_exec_client::Error::Transport(_)) { pool.lock().await.remove(&invocation.node); } return Err(client_error(error)); } } }; }
-                        Ok(match invocation.method.as_str() {
-                            "targets" => match client.targets().await {Ok(value)=>serde_json::to_value(value)?,Err(error)=>{if matches!(&error,aster_exec_client::Error::Transport(_)){pool.lock().await.remove(&invocation.node);}return Err(client_error(error));}},
-                            "watch" => {
-                                let req: aster_exec_client::WatchRequestV1 = serde_json::from_value(p)?;
-                                let page_request=aster_exec_client::OutputRequestV1 {job:req.job.clone(),cursor:req.cursor,max_bytes:aster_exec_client::MAX_PAGE_BYTES};
-                                let page=match client.output(&page_request).await{Ok(value)=>value,Err(error)=>{if matches!(&error,aster_exec_client::Error::Transport(_)){pool.lock().await.remove(&invocation.node);}return Err(client_error(error));}};
-                                let status=match client.status(&req.job).await{Ok(value)=>value,Err(error)=>{if matches!(&error,aster_exec_client::Error::Transport(_)){pool.lock().await.remove(&invocation.node);}return Err(client_error(error));}};
-                                json!({"output":page,"status":status})
-                            },
-                            "capabilities" => invoke!(capabilities), "submit" => invoke!(submit), "status" => invoke!(status), "output" => invoke!(output), "cancel" => invoke!(cancel),
-                            _ => return Err(Error::usage("unknown Exec operation")),
-                        })
-                        }).await.unwrap_or_else(|_| Err(Error::new(ErrorKind::Unavailable,
-                            "Exec operation deadline exceeded; reconcile any submission with the same request ID")))
-                    }.await;
-                    let reply = match outcome { Ok(value) => json!({"protocol":1,"result":value}),Err(error)=>{let mut value=error.to_json();value["protocol"]=json!(1);value} };
-                    let _ = write(&mut stream,&reply).await;
+                    let reply = match handle(&mut stream, &remotes, &shutdown).await {
+                        Ok(value) => json!({"protocol": 1, "result": value}),
+                        Err(error) => {
+                            let mut value = error.to_json();
+                            value["protocol"] = json!(1);
+                            value
+                        }
+                    };
+                    let _ = write(&mut stream, &reply).await;
                 });
             }
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => { idle_deadline = tokio::time::Instant::now() + Duration::from_secs(600); }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {
+                idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+            }
         }
     }
     drop(listener);
@@ -404,6 +387,193 @@ async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
     std::fs::remove_file(socket)?;
     Ok(())
 }
+#[cfg(unix)]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Answer one local request: a ping, a stop, or an Exec call run within the
+/// caller's budget.
+#[cfg(unix)]
+async fn handle(
+    stream: &mut UnixStream,
+    remotes: &Remotes,
+    shutdown: &tokio::sync::Notify,
+) -> Result<Value> {
+    let envelope = tokio::time::timeout(Duration::from_secs(10), read(stream))
+        .await
+        .map_err(|_| Error::usage("local request deadline exceeded"))??;
+    if envelope["protocol"] != 1 {
+        return Err(Error::usage("incompatible local Exec protocol"));
+    }
+    let request = &envelope["request"];
+    if request["operation"] == "ping" {
+        return Ok(
+            json!({"ready": true, "protocol": 1, "idle_timeout_seconds": IDLE_TIMEOUT.as_secs()}),
+        );
+    }
+    if request["operation"] == "stop" {
+        shutdown.notify_one();
+        return Ok(json!({"stopping": true}));
+    }
+    let budget = Duration::from_millis(
+        envelope["budget_ms"]
+            .as_u64()
+            .unwrap_or(40_000)
+            .clamp(1, 45_000),
+    );
+    let invocation: Invocation = serde_json::from_value(request.clone())?;
+    tokio::time::timeout(budget, remotes.invoke(invocation))
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::new(
+                ErrorKind::Unavailable,
+                "Exec operation deadline exceeded; reconcile any submission with the same request ID",
+            ))
+        })
+}
+
+/// Enrolled connections to Exec nodes, shared by every local request.
+#[cfg(unix)]
+struct Remotes {
+    node: aster::Node,
+    enrollment: aster::enrollment::Enrollment,
+    direct_addresses: std::collections::BTreeMap<String, Vec<String>>,
+    pool: Mutex<HashMap<String, Arc<OnceCell<aster_exec_client::Client>>>>,
+    /// Enrollment refuses rather than queues past its handshake limit, so
+    /// cold connections to many nodes wait here instead of failing.
+    handshakes: Semaphore,
+}
+
+#[cfg(unix)]
+type Remote<T> = std::result::Result<T, aster_exec_client::Error>;
+
+#[cfg(unix)]
+impl Remotes {
+    /// Run one Exec call. A broken connection is dropped from the pool. A
+    /// lost enrollment session is retried once on a fresh connection, which
+    /// enrolls again; nothing was admitted, so a submit is safe to repeat.
+    async fn invoke(&self, invocation: Invocation) -> Result<Value> {
+        let mut reenrolled = false;
+        loop {
+            let client = self.client(&invocation.node).await?;
+            let outcome = dispatch(&client, &invocation.method, invocation.request.clone()).await?;
+            let error = match outcome {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+            let not_enrolled = matches!(
+                &error,
+                aster_exec_client::Error::Exec(failure)
+                    if failure.code == aster_exec_client::ExecErrorCodeV1::Unauthenticated
+            );
+            if not_enrolled || matches!(&error, aster_exec_client::Error::Transport(_)) {
+                self.pool.lock().await.remove(&invocation.node);
+            }
+            if not_enrolled && !reenrolled {
+                reenrolled = true;
+                continue;
+            }
+            return Err(client_error(error));
+        }
+    }
+
+    /// The pooled connection to `node_id`, enrolling and connecting once.
+    async fn client(&self, node_id: &str) -> Result<aster_exec_client::Client> {
+        let peer: aster::NodeId = node_id.parse()?;
+        let cell = self
+            .pool
+            .lock()
+            .await
+            .entry(node_id.to_owned())
+            .or_default()
+            .clone();
+        let client = cell
+            .get_or_try_init(|| async {
+                tokio::time::timeout(Duration::from_secs(15), self.connect(node_id, peer.clone()))
+                    .await
+                    .map_err(|_| {
+                        Error::new(
+                            ErrorKind::Unavailable,
+                            "remote enrollment/connection deadline exceeded",
+                        )
+                    })?
+            })
+            .await?;
+        Ok(client.clone())
+    }
+
+    async fn connect(
+        &self,
+        node_id: &str,
+        peer: aster::NodeId,
+    ) -> Result<aster_exec_client::Client> {
+        let address = aster::NodeAddr {
+            node_id: peer.clone(),
+            relay_url: None,
+            direct_addresses: self
+                .direct_addresses
+                .get(node_id)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        self.node.add_node_addr(address.clone())?;
+        {
+            let _handshake = self
+                .handshakes
+                .acquire()
+                .await
+                .map_err(|_| Error::new(ErrorKind::Unavailable, "Exec daemon stopping"))?;
+            self.enrollment.connect(address).await?;
+        }
+        Ok(aster_exec_client::Client::new(
+            self.node.rpc_connect(&peer).await?,
+        ))
+    }
+}
+
+/// Make one remote call. The outer result carries local failures such as
+/// malformed parameters; the inner one is the remote outcome.
+#[cfg(unix)]
+async fn dispatch(
+    client: &aster_exec_client::Client,
+    method: &str,
+    params: Value,
+) -> Result<Remote<Value>> {
+    fn encoded<T: serde::Serialize>(result: Remote<T>) -> Result<Remote<Value>> {
+        Ok(match result {
+            Ok(value) => Ok(serde_json::to_value(value)?),
+            Err(error) => Err(error),
+        })
+    }
+    match method {
+        "targets" => encoded(client.targets().await),
+        "capabilities" => encoded(client.capabilities(&serde_json::from_value(params)?).await),
+        "submit" => encoded(client.submit(&serde_json::from_value(params)?).await),
+        "status" => encoded(client.status(&serde_json::from_value(params)?).await),
+        "output" => encoded(client.output(&serde_json::from_value(params)?).await),
+        "cancel" => encoded(client.cancel(&serde_json::from_value(params)?).await),
+        "watch" => {
+            let request: aster_exec_client::WatchRequestV1 = serde_json::from_value(params)?;
+            let page = client
+                .output(&aster_exec_client::OutputRequestV1 {
+                    job: request.job.clone(),
+                    cursor: request.cursor,
+                    max_bytes: aster_exec_client::MAX_PAGE_BYTES,
+                })
+                .await;
+            let page = match page {
+                Ok(page) => page,
+                Err(error) => return Ok(Err(error)),
+            };
+            let status = match client.status(&request.job).await {
+                Ok(status) => status,
+                Err(error) => return Ok(Err(error)),
+            };
+            Ok(Ok(json!({"output": page, "status": status})))
+        }
+        _ => Err(Error::usage("unknown Exec operation")),
+    }
+}
+
 #[cfg(not(unix))]
 pub async fn call(_: &Ctx, _: Invocation) -> Result<Value> {
     Err(Error::new(

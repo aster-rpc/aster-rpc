@@ -48,12 +48,8 @@ mod linux {
         direct_addresses: Vec<String>,
     }
     fn identity(value: &str) -> Result<[u8; 32]> {
-        if value.len() != 64 || value.bytes().any(|b| b.is_ascii_uppercase()) {
-            return Err("identity must be 64 lowercase hex characters".into());
-        }
-        Ok(hex::decode(value)?
-            .try_into()
-            .map_err(|_| "invalid identity length")?)
+        Ok(aster_exec::policy::parse_node_id(value)
+            .ok_or("identity must be 64 lowercase hex characters")?)
     }
     fn private_file(path: &std::path::Path, limit: u64) -> Result<Vec<u8>> {
         let file = std::fs::OpenOptions::new()
@@ -170,7 +166,6 @@ mod linux {
         if document.id()?.to_string() != config.policy_namespace {
             return Err("policy ticket namespace differs from pinned namespace".into());
         }
-        enrollment.set_policy_document(&document)?;
         let audit = Arc::new(AuditOutbox::open(config.audit).await?);
         let guarantees = GuaranteesV1 {
             profile: "open".into(),
@@ -210,7 +205,7 @@ mod linux {
             config.ceiling,
             Arc::new(enrollment.clone()),
             Arc::new(DocsGrantProvider {
-                store: tokio::sync::Mutex::new(ExecGrantStore::open(
+                store: Arc::new(ExecGrantStore::open(
                     &config.state_directory.join("grants.redb"),
                     root,
                     namespace,
@@ -226,13 +221,11 @@ mod linux {
             }),
             RequestLedger::open(&config.state_directory.join("requests.redb"))?,
         );
-        // Reconcile before accepting RPCs; helper failure is reported but does not
-        // remove the endpoint needed for discovery and recovery diagnostics.
-        if let Err(error) = service.refresh_authority().await {
-            eprintln!("Exec authority refresh: {:?}", error.code);
-        }
-        if let Err(error) = service.reconcile_policy().await {
-            eprintln!("Exec startup reconciliation: {:?}", error.code);
+        // Reconcile before accepting RPCs. Callers have no enrollment session
+        // yet, which leaves their running jobs untouched; helper failure is
+        // reported but does not remove the endpoint needed for diagnostics.
+        if let Err(failure) = service.reconcile_policy().await {
+            eprintln!("Exec startup reconciliation: {:?}", failure.code);
         }
         let routed = enrollment.clone();
         let server = Server::new(&node)
@@ -248,95 +241,19 @@ mod linux {
             })
             .serve();
         eprintln!("Aster Exec node {}", node.id());
-        let mut maintenance = tokio::task::JoinSet::new();
-        let refresh_interval = config.reconcile_interval_ms;
-        let authority_service = service.clone();
-        maintenance.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(refresh_interval));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                if let Err(error) = authority_service.refresh_authority().await {
-                    eprintln!("Exec authority refresh: {:?}", error.code);
-                }
-            }
-        });
-        let policy_service = service.clone();
-        maintenance.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(10));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                match tokio::time::timeout(
-                    Duration::from_secs(20),
-                    policy_service.reconcile_policy(),
-                )
-                .await
-                {
-                    Ok(Err(error)) => eprintln!("Exec reconciliation: {:?}", error.code),
-                    Err(_) => eprintln!("Exec reconciliation deadline exceeded"),
-                    Ok(Ok(_)) => {}
-                }
-            }
-        });
-        let enrollment_maintenance = enrollment.clone();
-        maintenance.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                if tokio::time::timeout(Duration::from_secs(5), enrollment_maintenance.reconcile())
-                    .await
-                    .is_err()
-                {
-                    eprintln!("Exec enrollment reconciliation deadline exceeded");
-                }
-            }
-        });
-        let mut revoked = enrollment.revocations();
-        let revocation_service = service.clone();
-        maintenance.spawn(async move {
-            loop {
-                match revoked.recv().await {
-                    Ok(event) => {
-                        let peer = hex::encode(event.peer);
-                        if let Err(error) = revocation_service.invalidate_peer(&peer) {
-                            eprintln!("Exec enrollment invalidation: {:?}", error.code);
-                        }
-                        match tokio::time::timeout(
-                            Duration::from_secs(20),
-                            revocation_service.reconcile_policy(),
-                        )
-                        .await
-                        {
-                            Ok(Err(error)) => {
-                                eprintln!("Exec revocation reconciliation: {:?}", error.code)
-                            }
-                            Err(_) => eprintln!("Exec revocation reconciliation deadline exceeded"),
-                            Ok(Ok(_)) => {}
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if let Err(error) = revocation_service.refresh_authority().await {
-                            eprintln!("Exec revocation refresh: {:?}", error.code);
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
+        let refresh_interval = Duration::from_millis(config.reconcile_interval_ms);
+        let revocations = enrollment.revocations();
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let maintenance_failed = tokio::select! {
             result = tokio::signal::ctrl_c() => { result?; false },
             _ = terminate.recv() => false,
-            task = maintenance.join_next() => {
-                eprintln!("Exec maintenance task stopped: {task:?}");
+            failure = service.maintain(refresh_interval, revocations) => {
+                eprintln!("Exec maintenance stopped: {}", failure.safe_message);
                 true
             },
         };
         server.abort();
-        maintenance.abort_all();
         let _ = audit.flush(Duration::from_secs(5)).await;
         audit.close().await?;
         node.shutdown().await;

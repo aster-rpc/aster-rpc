@@ -137,8 +137,8 @@ impl RequestLedger {
             .transpose()
     }
 
-    /// Atomic first reservation. Same digest returns the existing job; a
-    /// different digest is a conflict even when the first job is terminal.
+    /// Reserve with the default output limit.
+    #[cfg(test)]
     pub fn reserve(
         &self,
         key: &str,
@@ -155,6 +155,8 @@ impl RequestLedger {
         )
     }
 
+    /// Atomic first reservation. Same digest returns the existing job; a
+    /// different digest is a conflict even when the first job is terminal.
     pub fn reserve_with_output(
         &self,
         key: &str,
@@ -263,11 +265,34 @@ impl RequestLedger {
         Ok(entry)
     }
 
-    /// Finish failed/ambiguous admission without releasing the request ID.
-    /// Retries return this exact error and never issue another launch.
-    pub fn fail_admission(
+    /// Record that a request failed before its launch boundary. Only a
+    /// Preparing reservation qualifies, and it owns no output. The request ID
+    /// stays reserved: retries return this exact error and never launch.
+    pub fn fail_preparing(
         &self,
         key: &str,
+        error: crate::contract::ExecErrorV1,
+        now_ms: u64,
+    ) -> Result<Reservation, LedgerError> {
+        self.tombstone(key, ReservationPhase::Preparing, error, now_ms)
+    }
+
+    /// Record that an accepted launch never produced a job. The caller must
+    /// have proved that no launch is still in flight and that the lifetime
+    /// owner has no record of the job.
+    pub fn abandon_accepted(
+        &self,
+        key: &str,
+        error: crate::contract::ExecErrorV1,
+        now_ms: u64,
+    ) -> Result<Reservation, LedgerError> {
+        self.tombstone(key, ReservationPhase::Accepted, error, now_ms)
+    }
+
+    fn tombstone(
+        &self,
+        key: &str,
+        expected: ReservationPhase,
         error: crate::contract::ExecErrorV1,
         now_ms: u64,
     ) -> Result<Reservation, LedgerError> {
@@ -283,20 +308,12 @@ impl RequestLedger {
             .value()
             .to_vec();
         let mut entry: Reservation = serde_json::from_slice(&bytes).map_err(storage)?;
-        if entry.admission_error.is_some() {
-            return Ok(entry);
-        }
-        if entry.phase == ReservationPhase::Terminal {
+        if entry.phase != expected {
             return Err(LedgerError::InvalidTransition);
-        }
-        // Preparing precedes the only launch boundary, so these failed
-        // requests cannot own output. Accepted failures may be ambiguous and
-        // keep their output budget until normal output retention expires.
-        if entry.phase == ReservationPhase::Preparing {
-            entry.output_limit_bytes = 0;
         }
         entry.phase = ReservationPhase::Terminal;
         entry.terminal_at_ms = Some(now_ms);
+        entry.output_limit_bytes = 0;
         entry.admission_error = Some(error);
         let bytes = serde_json::to_vec(&entry).map_err(storage)?;
         table.insert(key, bytes.as_slice()).map_err(storage)?;
@@ -337,30 +354,6 @@ impl RequestLedger {
         write.commit().map_err(storage)?;
         Ok(keys.len())
     }
-
-    /// Only an unaccepted reservation can be removed after audit admission
-    /// fails. Once accepted, the tombstone remains for the retention window.
-    pub fn release_preparing(&self, key: &str) -> Result<(), LedgerError> {
-        let mut write = self.database.begin_write().map_err(storage)?;
-        write
-            .set_durability(redb::Durability::Immediate)
-            .map_err(storage)?;
-        let mut table = write.open_table(REQUESTS).map_err(storage)?;
-        let bytes = table
-            .get(key)
-            .map_err(storage)?
-            .ok_or(LedgerError::Missing)?
-            .value()
-            .to_vec();
-        let entry: Reservation = serde_json::from_slice(&bytes).map_err(storage)?;
-        if entry.phase != ReservationPhase::Preparing {
-            return Err(LedgerError::InvalidTransition);
-        }
-        table.remove(key).map_err(storage)?;
-        drop(table);
-        write.commit().map_err(storage)?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -386,7 +379,7 @@ mod tests {
             Err(LedgerError::Conflict)
         ));
         assert!(matches!(
-            reopened.release_preparing(&key),
+            reopened.fail_preparing(&key, crate::contract::ExecErrorV1::invalid("late"), 4),
             Err(LedgerError::InvalidTransition)
         ));
     }
@@ -468,7 +461,7 @@ mod tests {
                 .unwrap();
         }
         let failure = crate::contract::ExecErrorV1::invalid("admission failed");
-        let failed = ledger.fail_admission("r0", failure.clone(), 2).unwrap();
+        let failed = ledger.fail_preparing("r0", failure.clone(), 2).unwrap();
         assert_eq!(failed.phase, ReservationPhase::Terminal);
         assert_eq!(failed.output_limit_bytes, 0);
         ledger.reserve("new", [1; 32], "new", 3).unwrap();

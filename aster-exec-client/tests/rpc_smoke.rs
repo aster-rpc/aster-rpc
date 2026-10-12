@@ -1,5 +1,6 @@
 //! Real authenticated Iroh/RPC transport; deterministic policy/runtime fixtures.
 use aster::audit_outbox::AuditEvent;
+use aster::enrollment::AdmissionError;
 use aster::rpc::{RPC_ALPN, Server, StreamHeader};
 use aster::{AsterConfig, Node, RelayMode};
 use aster_exec::{
@@ -15,11 +16,11 @@ use std::time::Duration;
 struct Admission(Vec<[u8; 32]>);
 #[async_trait]
 impl EnrollmentAdmission for Admission {
-    async fn check(&self, caller: &[u8; 32]) -> Result<(), ExecErrorV1> {
+    async fn check(&self, caller: &[u8; 32]) -> Result<(), AdmissionError> {
         if self.0.contains(caller) {
             Ok(())
         } else {
-            Err(error(ExecErrorCodeV1::PermissionDenied, "not enrolled"))
+            Err(AdmissionError::NotAdmitted)
         }
     }
 }
@@ -236,12 +237,14 @@ async fn authenticated_rpc_retry_ownership_malformed_payload_and_grant_denial() 
             1,
             "retry must not emit another intent"
         );
+        // A peer without an enrollment session is told to enroll.
         let unknown =
             aster_exec_client::Client::new(stranger.rpc_connect(&server.id()).await.unwrap());
         assert!(matches!(
             unknown.targets().await,
             Err(aster_exec_client::Error::Exec(ExecErrorV1 {
-                code: ExecErrorCodeV1::PermissionDenied,
+                code: ExecErrorCodeV1::Unauthenticated,
+                retryable: true,
                 ..
             }))
         ));

@@ -12,30 +12,83 @@ use crate::{
     authorization::{AuthorizedSubmit, LocalCeilingV1},
     contract::*,
     ledger::{LedgerError, RequestLedger, ReservationPhase, request_key},
-    policy::{ExecGrantStore, ExecGrantV1, ExecOperationV1, GrantError},
+    policy::{
+        ExecGrantStore, ExecGrantV1, ExecOperationV1, GrantError, MAX_ISSUED_AT_SKEW_SECONDS,
+        parse_node_id as identity_bytes,
+    },
 };
 use aster::audit_outbox::{AuditEvent, AuditOutbox};
+use aster::enrollment::{AdmissionError, EnrollmentRevoked};
 use aster::rpc::{Call, RpcStatus, ServiceDispatch, StatusCode, async_trait};
 use aster_transport_core::CoreDoc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 pub const MAX_AUTHORITY_PEERS: usize = 1024;
 pub const MAX_REFRESH_PEERS: usize = 128;
+/// A positive authority snapshot older than this denies calls.
 pub const AUTHORITY_FRESHNESS: Duration = Duration::from_secs(30);
+/// Running jobs survive this long while their owner's policy cannot be
+/// evaluated. A definite denial cancels them at once.
+pub const UNKNOWN_STANDING_GRACE: Duration = Duration::from_secs(300);
 const DENIAL_FRESHNESS: Duration = Duration::from_secs(1);
 const AUTHORITY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_REFRESHES: usize = 16;
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+const RECONCILE_DEADLINE: Duration = Duration::from_secs(60);
+/// After this long, an accepted launch that is no longer in flight has
+/// either created its job or never will.
+const LAUNCH_SETTLE: Duration = Duration::from_secs(120);
 const WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_WATCHES_PER_CALLER: usize = 4;
 const MAX_WATCHES: usize = 64;
 
+/// A caller's authority as of its latest refresh.
+#[derive(Clone, Debug)]
+enum Standing {
+    /// Enrollment and the grant both allow.
+    Allowed(ExecGrantV1),
+    /// No enrollment session, for example after an API restart, and nothing
+    /// definitely denies the caller. Calls fail until it enrolls again; its
+    /// running jobs continue while the grant stays valid.
+    NotEnrolled(ExecGrantV1),
+    /// A definite enrollment or grant denial. Running jobs are cancelled.
+    Denied(ExecErrorV1),
+    /// Policy could not be evaluated. Running jobs are cancelled only after
+    /// [`UNKNOWN_STANDING_GRACE`] without a settled result.
+    Unknown(ExecErrorV1),
+}
+
+impl Standing {
+    /// The result an RPC receives.
+    fn call_result(&self) -> Result<ExecGrantV1, ExecErrorV1> {
+        match self {
+            Self::Allowed(grant) => Ok(grant.clone()),
+            Self::NotEnrolled(_) => Err(not_enrolled()),
+            Self::Denied(failure) | Self::Unknown(failure) => Err(failure.clone()),
+        }
+    }
+
+    fn is_settled(&self) -> bool {
+        !matches!(self, Self::Unknown(_))
+    }
+}
+
+fn not_enrolled() -> ExecErrorV1 {
+    let mut failure = error(
+        ExecErrorCodeV1::Unauthenticated,
+        "enrollment session required; reconnect to enroll and retry",
+    );
+    failure.retryable = true;
+    failure
+}
+
 struct PeerAuthority {
     refreshed_at: Instant,
     last_used: Instant,
-    last_success: Option<Instant>,
-    result: Result<ExecGrantV1, ExecErrorV1>,
+    standing: Standing,
 }
 
 #[derive(Default)]
@@ -43,6 +96,23 @@ struct AuthoritySnapshot {
     observed: BTreeSet<String>,
     refresh_offset: usize,
     peers: BTreeMap<String, PeerAuthority>,
+}
+
+impl AuthoritySnapshot {
+    /// Make room for `caller` by evicting the least recently used peer.
+    fn reserve(&mut self, caller: &str) {
+        if self.peers.len() >= MAX_AUTHORITY_PEERS
+            && !self.peers.contains_key(caller)
+            && let Some(victim) = self
+                .peers
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(peer, _)| peer.clone())
+        {
+            self.peers.remove(&victim);
+            self.observed.remove(&victim);
+        }
+    }
 }
 
 struct InflightAdmission {
@@ -100,23 +170,21 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-/// Admission and operation authority are independent checks.
+/// Admission and operation authority are independent checks. Only
+/// [`AdmissionError::Denied`] is a definite denial.
 #[async_trait]
 pub trait EnrollmentAdmission: Send + Sync {
-    async fn check(&self, caller: &[u8; 32]) -> Result<(), ExecErrorV1>;
+    async fn check(&self, caller: &[u8; 32]) -> Result<(), AdmissionError>;
 }
 #[async_trait]
 impl EnrollmentAdmission for aster::enrollment::Enrollment {
-    async fn check(&self, caller: &[u8; 32]) -> Result<(), ExecErrorV1> {
-        self.check_peer(caller).await.map(|_| ()).map_err(|_| {
-            error(
-                ExecErrorCodeV1::PermissionDenied,
-                "enrollment admission denied",
-            )
-        })
+    async fn check(&self, caller: &[u8; 32]) -> Result<(), AdmissionError> {
+        self.check_peer(caller).await.map(|_| ())
     }
 }
-/// Authenticate the current exact-root leaf on cold admission and background refresh.
+/// Authenticate the current exact-root leaf on cold admission and background
+/// refresh. `PermissionDenied` is a definite denial; any other error means the
+/// grant could not be evaluated.
 #[async_trait]
 pub trait GrantProvider: Send + Sync {
     async fn current(
@@ -127,7 +195,7 @@ pub trait GrantProvider: Send + Sync {
     ) -> Result<ExecGrantV1, ExecErrorV1>;
 }
 pub struct DocsGrantProvider {
-    pub store: Mutex<ExecGrantStore>,
+    pub store: Arc<ExecGrantStore>,
     pub document: CoreDoc,
 }
 #[async_trait]
@@ -138,26 +206,30 @@ impl GrantProvider for DocsGrantProvider {
         target: [u8; 32],
         now: u64,
     ) -> Result<ExecGrantV1, ExecErrorV1> {
-        let mut store = self.store.lock().await;
-        store
-            .refresh_one(&self.document, &caller, &target)
-            .await
-            .map_err(grant_error)?;
-        store.grant_for(&caller, &target, now).map_err(grant_error)
+        // The Docs read runs concurrently across callers; applying it may
+        // fsync, so it runs off the async workers.
+        let read = self.store.read_leaf(&self.document, &caller, &target).await;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            match read.and_then(|read| store.apply_leaf(&caller, &target, read)) {
+                Err(GrantError::Storage(detail)) => Err(GrantError::Storage(detail)),
+                // A content failure recorded any denial barrier for grant_for.
+                _ => store.grant_for(&caller, &target, now),
+            }
+        })
+        .await
+        .map_err(|_| GrantError::PolicyUnavailable)
+        .and_then(|result| result)
+        .map_err(grant_error)
     }
 }
 fn grant_error(failure: GrantError) -> ExecErrorV1 {
     match failure {
-        GrantError::PolicyUnavailable | GrantError::Storage(_) => error(
+        GrantError::Denied => error(ExecErrorCodeV1::PermissionDenied, "Exec grant denied"),
+        _ => error(
             ExecErrorCodeV1::PolicyUnavailable,
             "current Exec policy unavailable",
         ),
-        GrantError::InvalidRecord
-        | GrantError::WrongContext
-        | GrantError::Stale
-        | GrantError::Conflict
-        | GrantError::ReauthorizationRequired
-        | GrantError::Denied => error(ExecErrorCodeV1::PermissionDenied, "Exec grant denied"),
     }
 }
 /// Production admission uses the shipped durable Aster outbox.
@@ -204,10 +276,12 @@ pub struct ExecService {
     audit: Arc<dyn ExecAudit>,
     runtime: Arc<dyn ExecRuntime>,
     ledger: Arc<RequestLedger>,
-    started_at: Instant,
     inflight: Arc<StdMutex<BTreeSet<String>>>,
     watchers: Arc<StdMutex<BTreeMap<String, usize>>>,
     authority: Arc<RwLock<AuthoritySnapshot>>,
+    /// When each live job owner last had a settled standing, for the
+    /// [`UNKNOWN_STANDING_GRACE`] decision. Pruned to current owners.
+    owners_settled: Arc<StdMutex<BTreeMap<String, Instant>>>,
     cold_refresh: Arc<Mutex<BTreeMap<String, Weak<Mutex<()>>>>>,
     reconcile_lock: Arc<Mutex<()>>,
 }
@@ -227,59 +301,144 @@ impl ExecService {
             audit,
             runtime,
             ledger: Arc::new(ledger),
-            started_at: Instant::now(),
             inflight: Arc::new(StdMutex::new(BTreeSet::new())),
             watchers: Arc::new(StdMutex::new(BTreeMap::new())),
             authority: Arc::new(RwLock::new(AuthoritySnapshot::default())),
+            owners_settled: Arc::new(StdMutex::new(BTreeMap::new())),
             cold_refresh: Arc::new(Mutex::new(BTreeMap::new())),
             reconcile_lock: Arc::new(Mutex::new(())),
         }
     }
-    /// Refresh an admitted peer outside the RPC hot path. Exact-root Docs and
-    /// enrollment checks execute here; successful snapshots are bounded in age.
+
+    /// Run the background work a serving Exec node needs until one part
+    /// stops, and return why. The host should treat a return as fatal.
+    ///
+    /// - every `refresh_interval`: refresh cached caller authority;
+    /// - every ten seconds: reconcile running jobs with policy, prune the
+    ///   ledger and replay audit outcomes;
+    /// - on each enrollment revocation: invalidate the caller and reconcile.
+    ///   A lagged receiver missed revocations, so every cached caller is
+    ///   rechecked before its next call.
+    pub async fn maintain(
+        &self,
+        refresh_interval: Duration,
+        mut revocations: broadcast::Receiver<EnrollmentRevoked>,
+    ) -> ExecErrorV1 {
+        let refresh = async {
+            let mut tick = tokio::time::interval(refresh_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                self.refresh_authority().await;
+            }
+        };
+        let reconcile = async {
+            let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                self.reconcile_logged("Exec reconciliation").await;
+            }
+        };
+        let revoke = async {
+            loop {
+                match revocations.recv().await {
+                    Ok(event) => self.invalidate_peer(&hex::encode(event.peer)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => self.invalidate_all(),
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return error(
+                            ExecErrorCodeV1::Internal,
+                            "enrollment revocation stream closed",
+                        );
+                    }
+                }
+                self.reconcile_logged("Exec revocation reconciliation")
+                    .await;
+            }
+        };
+        tokio::select! {
+            failure = revoke => failure,
+            never = refresh => never,
+            never = reconcile => never,
+        }
+    }
+
+    async fn reconcile_logged(&self, context: &str) {
+        match tokio::time::timeout(RECONCILE_DEADLINE, self.reconcile_policy()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(failure)) => eprintln!("{context}: {:?} {}", failure.code, failure.safe_message),
+            Err(_) => eprintln!("{context}: deadline exceeded"),
+        }
+    }
+
+    /// Read a caller's enrollment and grant. A definite denial from either
+    /// wins; otherwise any unevaluated part leaves the standing unknown.
+    async fn read_standing(&self, caller: [u8; 32], target: [u8; 32]) -> Standing {
+        let enrollment = self.enrollment.check(&caller).await;
+        if let Err(AdmissionError::Denied(_)) = enrollment {
+            return Standing::Denied(error(
+                ExecErrorCodeV1::PermissionDenied,
+                "enrollment admission revoked",
+            ));
+        }
+        let grant = match self.grants.current(caller, target, now_ms() / 1000).await {
+            Ok(grant) => grant,
+            Err(failure) if failure.code == ExecErrorCodeV1::PermissionDenied => {
+                return Standing::Denied(failure);
+            }
+            Err(failure) => return Standing::Unknown(failure),
+        };
+        match enrollment {
+            Ok(()) => Standing::Allowed(grant),
+            Err(AdmissionError::NotAdmitted) => Standing::NotEnrolled(grant),
+            Err(_) => Standing::Unknown(error(
+                ExecErrorCodeV1::PolicyUnavailable,
+                "enrollment policy unavailable",
+            )),
+        }
+    }
+
+    /// Refresh one caller now, outside its next call, and return what that
+    /// call would receive.
     pub async fn refresh_peer(&self, caller: &str) -> Result<(), ExecErrorV1> {
+        self.refresh_standing(caller)
+            .await
+            .call_result()
+            .map(|_| ())
+    }
+
+    /// Refresh one caller outside the RPC hot path and record the result.
+    /// A refresh that started before a newer recorded one is discarded.
+    async fn refresh_standing(&self, caller: &str) -> Standing {
         let started = Instant::now();
-        let decode = |id: &str| hex::decode(id).ok().and_then(|bytes| bytes.try_into().ok());
-        let caller_bytes = decode(caller)
-            .ok_or_else(|| error(ExecErrorCodeV1::Unauthenticated, "invalid node identity"))?;
-        let target_bytes = decode(&self.ceiling.target_id)
-            .ok_or_else(|| ExecErrorV1::invalid("invalid target identity"))?;
-        let result = tokio::time::timeout(AUTHORITY_READ_TIMEOUT, async {
-            self.enrollment.check(&caller_bytes).await?;
-            self.grants
-                .current(caller_bytes, target_bytes, now_ms() / 1000)
-                .await
-        })
+        let Some(caller_bytes) = identity_bytes(caller) else {
+            return Standing::Denied(error(
+                ExecErrorCodeV1::Unauthenticated,
+                "invalid node identity",
+            ));
+        };
+        let Some(target_bytes) = identity_bytes(&self.ceiling.target_id) else {
+            return Standing::Unknown(ExecErrorV1::invalid("invalid target identity"));
+        };
+        let standing = tokio::time::timeout(
+            AUTHORITY_READ_TIMEOUT,
+            self.read_standing(caller_bytes, target_bytes),
+        )
         .await
         .unwrap_or_else(|_| {
-            Err(error(
+            Standing::Unknown(error(
                 ExecErrorCodeV1::PolicyUnavailable,
                 "Exec authority refresh timed out",
             ))
         });
-        let mut snapshot = self.authority.write().map_err(|_| {
-            error(
-                ExecErrorCodeV1::PolicyUnavailable,
-                "authorization snapshot unavailable",
-            )
-        })?;
+        let mut snapshot = self.authority.write().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = snapshot.peers.get(caller)
             && existing.refreshed_at > started
         {
-            return existing.result.clone().map(|_| ());
+            return existing.standing.clone();
         }
-        if snapshot.peers.len() >= MAX_AUTHORITY_PEERS
-            && !snapshot.peers.contains_key(caller)
-            && let Some(victim) = snapshot
-                .peers
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(peer, _)| peer.clone())
-        {
-            snapshot.peers.remove(&victim);
-            snapshot.observed.remove(&victim);
-        }
-        if result.is_ok() {
+        snapshot.reserve(caller);
+        if matches!(standing, Standing::Allowed(_)) {
             snapshot.observed.insert(caller.into());
         } else {
             snapshot.observed.remove(caller);
@@ -288,137 +447,105 @@ impl ExecService {
             .peers
             .get(caller)
             .map_or(started, |entry| entry.last_used);
-        let last_success = if result.is_ok() {
-            Some(started)
-        } else {
-            snapshot
-                .peers
-                .get(caller)
-                .and_then(|entry| entry.last_success)
-        };
         snapshot.peers.insert(
             caller.into(),
             PeerAuthority {
                 refreshed_at: started,
                 last_used,
-                last_success,
-                result: result.clone(),
+                standing: standing.clone(),
             },
         );
-        result.map(|_| ())
+        standing
     }
-    /// Immediately remove a revoked Enrollment session from usable authority.
-    /// An older in-flight refresh cannot replace this denial.
-    pub fn invalidate_peer(&self, caller: &str) -> Result<(), ExecErrorV1> {
-        let mut snapshot = self.authority.write().map_err(|_| {
-            error(
-                ExecErrorCodeV1::PolicyUnavailable,
-                "authorization snapshot unavailable",
-            )
-        })?;
+
+    /// Immediately deny a revoked caller. An older in-flight refresh cannot
+    /// replace this denial.
+    pub fn invalidate_peer(&self, caller: &str) {
+        let mut snapshot = self.authority.write().unwrap_or_else(|e| e.into_inner());
         snapshot.observed.remove(caller);
-        if snapshot.peers.len() >= MAX_AUTHORITY_PEERS
-            && !snapshot.peers.contains_key(caller)
-            && let Some(victim) = snapshot
-                .peers
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(peer, _)| peer.clone())
-        {
-            snapshot.peers.remove(&victim);
-            snapshot.observed.remove(&victim);
-        }
+        snapshot.reserve(caller);
+        let now = Instant::now();
         snapshot.peers.insert(
             caller.to_owned(),
             PeerAuthority {
-                refreshed_at: Instant::now(),
-                last_used: Instant::now(),
-                last_success: None,
-                result: Err(error(
+                refreshed_at: now,
+                last_used: now,
+                standing: Standing::Denied(error(
                     ExecErrorCodeV1::PermissionDenied,
                     "enrollment admission revoked",
                 )),
             },
         );
-        Ok(())
     }
-    fn defer_uncertain_cancel(&self, caller: &str, failure: &ExecErrorV1) -> bool {
-        if failure.code != ExecErrorCodeV1::PolicyUnavailable {
-            return false;
+
+    /// Force every cached caller to be read again before its next call.
+    pub fn invalidate_all(&self) {
+        let mut snapshot = self.authority.write().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        for entry in snapshot.peers.values_mut() {
+            entry.refreshed_at = now;
+            entry.standing = Standing::Unknown(error(
+                ExecErrorCodeV1::PolicyUnavailable,
+                "Exec authority is being rechecked",
+            ));
         }
-        let last_success = self.authority.read().ok().and_then(|snapshot| {
-            snapshot
-                .peers
-                .get(caller)
-                .and_then(|entry| entry.last_success)
-        });
-        last_success.unwrap_or(self.started_at).elapsed() < AUTHORITY_FRESHNESS
     }
-    /// Call on policy/enrollment change notifications and every one second.
-    /// A helper failure must not stop enrollment and grant refresh for cached
-    /// callers. Each peer read has its own deadline and bounded concurrency.
-    pub async fn refresh_authority(&self) -> Result<(), ExecErrorV1> {
-        let mut callers = self
-            .authority
-            .read()
-            .map_err(|_| {
-                error(
-                    ExecErrorCodeV1::PolicyUnavailable,
-                    "authorization snapshot unavailable",
-                )
-            })?
-            .observed
-            .clone();
-        {
-            let mut state = self.authority.write().map_err(|_| {
-                error(
-                    ExecErrorCodeV1::PolicyUnavailable,
-                    "authorization snapshot unavailable",
-                )
-            })?;
-            let all = callers.into_iter().collect::<Vec<_>>();
-            callers = all
+
+    /// Refresh a rotating window of recently admitted callers so warm calls
+    /// stay within [`AUTHORITY_FRESHNESS`]. Each read has its own deadline
+    /// and reads run with bounded concurrency.
+    pub async fn refresh_authority(&self) {
+        let callers: Vec<String> = {
+            let mut snapshot = self.authority.write().unwrap_or_else(|e| e.into_inner());
+            let all: Vec<String> = snapshot.observed.iter().cloned().collect();
+            let window = all
                 .iter()
                 .cycle()
-                .skip(state.refresh_offset)
+                .skip(snapshot.refresh_offset)
                 .take(all.len().min(MAX_REFRESH_PEERS))
                 .cloned()
                 .collect();
-            state.refresh_offset = if all.is_empty() {
+            snapshot.refresh_offset = if all.is_empty() {
                 0
             } else {
-                (state.refresh_offset + MAX_REFRESH_PEERS) % all.len()
+                (snapshot.refresh_offset + MAX_REFRESH_PEERS) % all.len()
             };
-        }
-        let jobs = self.runtime.list_jobs().await;
-        if let Ok(jobs) = &jobs {
-            callers.extend(
-                jobs.iter()
-                    .filter(|job| !job.state.is_terminal())
-                    .map(|job| job.caller_id.clone()),
-            );
-        }
+            window
+        };
+        self.refresh_many(callers).await;
+    }
+
+    async fn refresh_many(&self, callers: Vec<String>) -> BTreeMap<String, Standing> {
         let mut queue = callers.into_iter();
         let mut tasks = tokio::task::JoinSet::new();
+        let mut standings = BTreeMap::new();
         loop {
-            while tasks.len() < 16 {
+            while tasks.len() < MAX_CONCURRENT_REFRESHES {
                 let Some(caller) = queue.next() else { break };
                 let service = self.clone();
-                tasks.spawn(async move { service.refresh_peer(&caller).await });
+                tasks.spawn(async move {
+                    let standing = service.refresh_standing(&caller).await;
+                    (caller, standing)
+                });
             }
-            if tasks.join_next().await.is_none() {
-                break;
+            match tasks.join_next().await {
+                Some(Ok((caller, standing))) => {
+                    standings.insert(caller, standing);
+                }
+                Some(Err(panic)) => eprintln!("Exec authority refresh task failed: {panic}"),
+                None => break,
             }
         }
-        jobs.map(|_| ())
+        standings
     }
+
     async fn authorize(
         &self,
         caller: &str,
         target: &str,
         op: ExecOperationV1,
     ) -> Result<ExecGrantV1, ExecErrorV1> {
-        if caller.len() != 64 || hex::decode(caller).is_err() {
+        if identity_bytes(caller).is_none() {
             return Err(error(
                 ExecErrorCodeV1::Unauthenticated,
                 "authenticated node identity required",
@@ -434,21 +561,7 @@ impl ExecService {
                 "Exec operation denied",
             ));
         }
-        let cold = self
-            .authority
-            .read()
-            .map_err(|_| {
-                error(
-                    ExecErrorCodeV1::PolicyUnavailable,
-                    "authorization snapshot unavailable",
-                )
-            })?
-            .peers
-            .get(caller)
-            .is_none_or(|entry| {
-                entry.result.is_err() && entry.refreshed_at.elapsed() > DENIAL_FRESHNESS
-            });
-        if cold {
+        if self.needs_cold_refresh(caller) {
             // Only first calls for the same peer share an authority read.
             // A slow peer cannot serialize cold admission for other peers.
             let peer_lock = {
@@ -471,31 +584,12 @@ impl ExecService {
                 }
             };
             let _refresh = peer_lock.lock().await;
-            let missing = self
-                .authority
-                .read()
-                .map_err(|_| {
-                    error(
-                        ExecErrorCodeV1::PolicyUnavailable,
-                        "authorization snapshot unavailable",
-                    )
-                })?
-                .peers
-                .get(caller)
-                .is_none_or(|entry| {
-                    entry.result.is_err() && entry.refreshed_at.elapsed() > DENIAL_FRESHNESS
-                });
-            if missing {
-                self.refresh_peer(caller).await?;
+            if self.needs_cold_refresh(caller) {
+                self.refresh_standing(caller).await;
             }
         }
         let grant = {
-            let mut snapshot = self.authority.write().map_err(|_| {
-                error(
-                    ExecErrorCodeV1::PolicyUnavailable,
-                    "authorization snapshot unavailable",
-                )
-            })?;
+            let mut snapshot = self.authority.write().unwrap_or_else(|e| e.into_inner());
             let entry = snapshot.peers.get_mut(caller).ok_or_else(|| {
                 error(
                     ExecErrorCodeV1::PolicyUnavailable,
@@ -509,17 +603,42 @@ impl ExecService {
                 ));
             }
             entry.last_used = Instant::now();
-            entry.result.clone()?
+            entry.standing.call_result()?
         };
+        self.check_grant(&grant, caller, op)?;
+        Ok(grant)
+    }
+
+    /// A caller with no entry, or whose last result was a failure more than
+    /// [`DENIAL_FRESHNESS`] ago, is read again before this call.
+    fn needs_cold_refresh(&self, caller: &str) -> bool {
+        self.authority
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .peers
+            .get(caller)
+            .is_none_or(|entry| {
+                !matches!(entry.standing, Standing::Allowed(_))
+                    && entry.refreshed_at.elapsed() > DENIAL_FRESHNESS
+            })
+    }
+
+    /// Time-dependent grant checks, applied on every use of a snapshot.
+    fn check_grant(
+        &self,
+        grant: &ExecGrantV1,
+        caller: &str,
+        op: ExecOperationV1,
+    ) -> Result<(), ExecErrorV1> {
         let now = now_ms() / 1000;
         if !grant.cancel_on_revocation
             || grant.version != 1
             || grant.status != crate::policy::GrantStatusV1::Active
-            || grant.issued_at > now.saturating_add(60)
+            || grant.issued_at > now.saturating_add(MAX_ISSUED_AT_SKEW_SECONDS)
             || grant.not_before.is_some_and(|time| now < time)
             || grant.expires_at.is_some_and(|time| now >= time)
             || grant.caller != caller
-            || grant.target != target
+            || grant.target != self.ceiling.target_id
             || grant.account_alias != self.ceiling.account_alias
             || !grant.operations.contains(&op)
         {
@@ -528,7 +647,29 @@ impl ExecService {
                 "Exec operation denied",
             ));
         }
-        Ok(grant)
+        Ok(())
+    }
+
+    /// Whether a live job's owner has lost authority, from a fresh read.
+    fn should_cancel(&self, owner: &str, standing: &Standing) -> bool {
+        let settled_at = {
+            let mut settled = self
+                .owners_settled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = settled.entry(owner.to_owned()).or_insert_with(Instant::now);
+            if standing.is_settled() {
+                *entry = Instant::now();
+            }
+            *entry
+        };
+        match standing {
+            Standing::Allowed(grant) | Standing::NotEnrolled(grant) => self
+                .check_grant(grant, owner, ExecOperationV1::Submit)
+                .is_err(),
+            Standing::Denied(_) => true,
+            Standing::Unknown(_) => settled_at.elapsed() >= UNKNOWN_STANDING_GRACE,
+        }
     }
     async fn owned(
         &self,
@@ -582,12 +723,22 @@ impl ExecService {
                 "previous admission was interrupted before launch; use a new request ID",
             );
             failure.request_id = Some(request.request_id.clone());
-            failure.job_id = Some(old.job_id);
+            failure.job_id = Some(old.job_id.clone());
             failure.retryable = false;
-            self.ledger
-                .fail_admission(key, failure.clone(), now_ms())
-                .map_err(ledger_error)?;
-            return Err(failure);
+            return match self.ledger.fail_preparing(key, failure.clone(), now_ms()) {
+                Ok(_) => Err(failure),
+                // Another admission advanced it meanwhile; report its state.
+                Err(LedgerError::InvalidTransition) => {
+                    let mut pending = error(
+                        ExecErrorCodeV1::SupervisorUnavailable,
+                        "request admission changed; retry with the same request ID",
+                    );
+                    pending.request_id = Some(request.request_id.clone());
+                    pending.job_id = Some(old.job_id);
+                    Err(pending)
+                }
+                Err(other) => Err(ledger_error(other)),
+            };
         }
         // Accepted launch outcomes are ambiguous across a helper restart or
         // lost response. Keep the durable reservation and its capacity until
@@ -655,7 +806,7 @@ impl ExecService {
             failure.job_id = Some(job_id.clone());
             failure.retryable = false;
             self.ledger
-                .fail_admission(&key, failure.clone(), now_ms())
+                .fail_preparing(&key, failure.clone(), now_ms())
                 .map_err(ledger_error)?;
             return Err(failure);
         }
@@ -722,126 +873,195 @@ impl ExecService {
         first_error.map_or(Ok(count), Err)
     }
     /// Call on startup and periodically, independently of incoming RPCs.
-    /// Policy unavailability fails closed: active jobs are cancelled and the
-    /// lifetime owner durably retains the terminal audit outcome even when
-    /// the outbox cannot admit the best-effort revocation intent.
+    ///
+    /// Settles ledger reservations against the lifetime owner, cancels live
+    /// jobs whose owner has lost authority, prunes expired tombstones and
+    /// replays audit outcomes. Every item is handled independently: a failure
+    /// is reported in the result but never stops the remaining work.
     pub async fn reconcile_policy(&self) -> Result<usize, ExecErrorV1> {
         let _reconcile = self.reconcile_lock.lock().await;
-        let mut count = 0;
-        let reservations = self.ledger.entries().map_err(ledger_error)?;
         let mut first_error = None;
-        let jobs = match self.runtime.list_jobs().await {
-            Ok(jobs) => jobs,
+        // Copy in-flight admissions before reading the ledger, so a submit
+        // that completes in between is seen as in flight rather than stale.
+        let inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let reservations = self.ledger.entries().unwrap_or_else(|failure| {
+            first_error.get_or_insert(ledger_error(failure));
+            Vec::new()
+        });
+        let (jobs, listed) = match self.runtime.list_jobs().await {
+            Ok(jobs) => (jobs, true),
             Err(failure) => {
                 // One unreadable helper folder must not hide every other job
                 // from revocation. Accepted reservations retain the job IDs
                 // needed to recover each status independently.
-                first_error = Some(failure);
-                let mut recovered = Vec::new();
-                for (_, reservation) in &reservations {
-                    if reservation.phase == ReservationPhase::Terminal {
-                        continue;
-                    }
-                    let job = JobRefV1 {
-                        job_id: reservation.job_id.clone(),
-                        target_id: self.ceiling.target_id.clone(),
-                    };
-                    match self.runtime.status(&job).await {
-                        Ok(status) => recovered.push(status),
-                        Err(error) => {
-                            first_error.get_or_insert(error);
-                        }
-                    }
-                }
-                recovered
+                first_error.get_or_insert(failure);
+                (
+                    self.recover_jobs(&reservations, &mut first_error).await,
+                    false,
+                )
             }
         };
-        let inflight = self
-            .inflight
-            .lock()
-            .map_err(|_| error(ExecErrorCodeV1::Internal, "admission state unavailable"))?
-            .clone();
         for (key, reservation) in &reservations {
-            if reservation.phase == ReservationPhase::Preparing
-                && !inflight.contains(&reservation.job_id)
+            if let Err(failure) = self
+                .settle_reservation(key, reservation, &inflight, &jobs, listed)
+                .await
             {
+                first_error.get_or_insert(failure);
+            }
+        }
+        let live: Vec<&JobStatusV1> = jobs.iter().filter(|job| !job.state.is_terminal()).collect();
+        let owners: BTreeSet<String> = live.iter().map(|job| job.caller_id.clone()).collect();
+        self.owners_settled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|owner, _| owners.contains(owner));
+        let standings = self.refresh_many(owners.into_iter().collect()).await;
+        let mut cancelled = 0;
+        for job in live {
+            let Some(standing) = standings.get(&job.caller_id) else {
+                continue;
+            };
+            if !self.should_cancel(&job.caller_id, standing) {
+                continue;
+            }
+            match self.cancel_for_revocation(job).await {
+                Ok(()) => cancelled += 1,
+                Err(failure) => {
+                    first_error.get_or_insert(failure);
+                }
+            }
+        }
+        if let Err(failure) = self.ledger.prune(now_ms()) {
+            first_error.get_or_insert(ledger_error(failure));
+        }
+        if let Err(failure) = self.replay_outcomes().await {
+            first_error.get_or_insert(failure);
+        }
+        first_error.map_or(Ok(cancelled), Err)
+    }
+
+    async fn recover_jobs(
+        &self,
+        reservations: &[(String, crate::ledger::Reservation)],
+        first_error: &mut Option<ExecErrorV1>,
+    ) -> Vec<JobStatusV1> {
+        let mut recovered = Vec::new();
+        for (_, reservation) in reservations {
+            if reservation.phase == ReservationPhase::Terminal {
+                continue;
+            }
+            let job = JobRefV1 {
+                job_id: reservation.job_id.clone(),
+                target_id: self.ceiling.target_id.clone(),
+            };
+            match self.runtime.status(&job).await {
+                Ok(status) => recovered.push(status),
+                Err(failure) => {
+                    first_error.get_or_insert(failure);
+                }
+            }
+        }
+        recovered
+    }
+
+    /// Move one reservation forward when the lifetime owner proves its fate.
+    /// A missing Accepted job is not proof of non-execution until no launch
+    /// can still be in flight and the owner definitely has no such job.
+    async fn settle_reservation(
+        &self,
+        key: &str,
+        reservation: &crate::ledger::Reservation,
+        inflight: &BTreeSet<String>,
+        jobs: &[JobStatusV1],
+        listed: bool,
+    ) -> Result<(), ExecErrorV1> {
+        if inflight.contains(&reservation.job_id) {
+            return Ok(());
+        }
+        let settled = |result: Result<_, LedgerError>| match result {
+            // The reservation moved on concurrently; nothing to settle.
+            Ok(_) | Err(LedgerError::InvalidTransition) => Ok(()),
+            Err(other) => Err(ledger_error(other)),
+        };
+        match reservation.phase {
+            ReservationPhase::Terminal => Ok(()),
+            ReservationPhase::Preparing => {
                 let mut failure = error(
                     ExecErrorCodeV1::AuditUnavailable,
                     "interrupted before launch; execution will not be retried automatically",
                 );
                 failure.job_id = Some(reservation.job_id.clone());
                 failure.retryable = false;
-                self.ledger
-                    .fail_admission(key, failure, now_ms())
-                    .map_err(ledger_error)?;
-                continue;
+                settled(self.ledger.fail_preparing(key, failure, now_ms()))
             }
-            // A missing Accepted job is not proof of non-execution. The helper
-            // may be restarting or a launch response may have been lost.
-            if reservation.phase == ReservationPhase::Accepted
-                && jobs
-                    .iter()
-                    .any(|job| job.job.job_id == reservation.job_id && job.state.is_terminal())
-            {
-                self.ledger
-                    .advance(key, ReservationPhase::Terminal, now_ms())
-                    .map_err(ledger_error)?;
-            }
-        }
-        for status in jobs {
-            if status.state.is_terminal() {
-                continue;
-            }
-            if let Err(denial) = self
-                .authorize(
-                    &status.caller_id,
-                    &status.job.target_id,
-                    ExecOperationV1::Submit,
-                )
-                .await
-            {
-                if self.defer_uncertain_cancel(&status.caller_id, &denial) {
-                    continue;
-                }
-                let event = AuditEvent {
-                    timestamp_ms: now_ms(),
-                    kind: "exec.revocation.cancel.v1".into(),
-                    payload: serde_json::json!({
-                        "caller": status.caller_id,
-                        "job_id": status.job.job_id,
-                        "target": status.job.target_id,
-                    }),
-                };
-                if let Err(failure) = self.audit.admit(event).await {
-                    eprintln!(
-                        "Exec revocation intent audit unavailable for {}",
-                        status.job.job_id
+            ReservationPhase::Accepted => {
+                let job = jobs.iter().find(|job| job.job.job_id == reservation.job_id);
+                if job.is_some_and(|job| job.state.is_terminal()) {
+                    return settled(
+                        self.ledger
+                            .advance(key, ReservationPhase::Terminal, now_ms()),
                     );
-                    first_error.get_or_insert(failure);
                 }
-                match self
+                let launch_settled = now_ms().saturating_sub(reservation.accepted_at_ms)
+                    >= LAUNCH_SETTLE.as_millis() as u64;
+                if job.is_some() || !listed || !launch_settled {
+                    return Ok(());
+                }
+                let status = self
                     .runtime
-                    .cancel(&CancelRequestV1 {
-                        job: status.job,
-                        grace_ms: Some(DEFAULT_CANCEL_GRACE_MS),
+                    .status(&JobRefV1 {
+                        job_id: reservation.job_id.clone(),
+                        target_id: self.ceiling.target_id.clone(),
                     })
-                    .await
-                {
-                    Ok(_) => count += 1,
-                    Err(failure) => {
-                        first_error.get_or_insert(failure);
+                    .await;
+                match status {
+                    Err(failure) if failure.code == ExecErrorCodeV1::JobNotFound => {
+                        let mut failure = error(
+                            ExecErrorCodeV1::SupervisorUnavailable,
+                            "launch did not start; use a new request ID",
+                        );
+                        failure.job_id = Some(reservation.job_id.clone());
+                        failure.retryable = false;
+                        settled(self.ledger.abandon_accepted(key, failure, now_ms()))
                     }
+                    _ => Ok(()),
                 }
             }
         }
-        if let Err(failure) = self.ledger.prune(now_ms()).map_err(ledger_error) {
-            first_error.get_or_insert(failure);
-        }
-        if let Err(failure) = self.replay_outcomes().await {
-            first_error.get_or_insert(failure);
-        }
-        first_error.map_or(Ok(count), Err)
     }
+
+    async fn cancel_for_revocation(&self, job: &JobStatusV1) -> Result<(), ExecErrorV1> {
+        let event = AuditEvent {
+            timestamp_ms: now_ms(),
+            kind: "exec.revocation.cancel.v1".into(),
+            payload: serde_json::json!({
+                "caller": job.caller_id,
+                "job_id": job.job.job_id,
+                "target": job.job.target_id,
+            }),
+        };
+        // The cancellation proceeds even if its intent cannot be audited; the
+        // lifetime owner durably records the terminal outcome either way.
+        let audited = self.audit.admit(event).await;
+        if audited.is_err() {
+            eprintln!(
+                "Exec revocation intent audit unavailable for {}",
+                job.job.job_id
+            );
+        }
+        self.runtime
+            .cancel(&CancelRequestV1 {
+                job: job.job.clone(),
+                grace_ms: Some(DEFAULT_CANCEL_GRACE_MS),
+            })
+            .await?;
+        audited
+    }
+
     fn watch_permit(&self, caller: &str) -> Result<WatchPermit, ExecErrorV1> {
         let mut watchers = self.watchers.lock().map_err(|_| {
             error(
@@ -1136,21 +1356,27 @@ mod tests {
     struct Admitted;
     #[async_trait]
     impl EnrollmentAdmission for Admitted {
-        async fn check(&self, _: &[u8; 32]) -> Result<(), ExecErrorV1> {
+        async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
             Ok(())
         }
     }
-    struct NotEnrolled;
+    /// Enrollment answers every check with this fixed error.
+    struct Enrollment(AdmissionError);
     #[async_trait]
-    impl EnrollmentAdmission for NotEnrolled {
-        async fn check(&self, _: &[u8; 32]) -> Result<(), ExecErrorV1> {
-            Err(error(ExecErrorCodeV1::PermissionDenied, "not enrolled"))
+    impl EnrollmentAdmission for Enrollment {
+        async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
+            Err(self.0.clone())
         }
+    }
+    fn revoked() -> Arc<Enrollment> {
+        Arc::new(Enrollment(AdmissionError::Denied(
+            aster::enrollment::DenialReason::NodeRevoked,
+        )))
     }
     struct CountAdmission(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait]
     impl EnrollmentAdmission for CountAdmission {
-        async fn check(&self, _: &[u8; 32]) -> Result<(), ExecErrorV1> {
+        async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
@@ -1346,16 +1572,21 @@ mod tests {
             let older = {
                 let service = service.clone();
                 let caller = caller.clone();
-                tokio::spawn(async move { service.refresh_peer(&caller).await })
+                tokio::spawn(async move { service.refresh_standing(&caller).await.call_result() })
             };
             tokio::time::timeout(Duration::from_secs(2), grants.entered.notified())
                 .await
                 .unwrap();
             if invalidate {
-                service.invalidate_peer(&caller).unwrap();
+                service.invalidate_peer(&caller);
             } else {
                 assert_eq!(
-                    service.refresh_peer(&caller).await.unwrap_err().code,
+                    service
+                        .refresh_standing(&caller)
+                        .await
+                        .call_result()
+                        .unwrap_err()
+                        .code,
                     ExecErrorCodeV1::PermissionDenied
                 );
             }
@@ -1542,7 +1773,7 @@ mod tests {
             fail_list: false,
         });
         service.runtime = runtime.clone();
-        service.invalidate_peer(&"11".repeat(32)).unwrap();
+        service.enrollment = revoked();
         assert_eq!(
             service.reconcile_policy().await.unwrap_err().code,
             ExecErrorCodeV1::SupervisorUnavailable
@@ -1575,7 +1806,7 @@ mod tests {
                 .advance(key, ReservationPhase::Accepted, now_ms())
                 .unwrap();
         }
-        service.invalidate_peer(&"11".repeat(32)).unwrap();
+        service.enrollment = revoked();
         let failure = service.reconcile_policy().await.unwrap_err();
         assert_eq!(failure.code, ExecErrorCodeV1::SupervisorUnavailable);
         assert_eq!(failure.safe_message, "list failed");
@@ -1587,17 +1818,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helper_list_failure_still_refreshes_cached_authority() {
+    async fn background_refresh_applies_definite_denial() {
         let temp = tempfile::tempdir().unwrap();
         let mut service = authority_test_service(&temp);
         let caller = "11".repeat(32);
-        service.refresh_peer(&caller).await.unwrap();
+        assert!(matches!(
+            service.refresh_standing(&caller).await,
+            Standing::Allowed(_)
+        ));
+        // The helper is not consulted: an offline helper cannot stall refresh.
         service.runtime = Arc::new(OfflineRuntime);
-        service.enrollment = Arc::new(NotEnrolled);
-        assert_eq!(
-            service.refresh_authority().await.unwrap_err().code,
-            ExecErrorCodeV1::SupervisorUnavailable
-        );
+        service.enrollment = revoked();
+        service.refresh_authority().await;
         assert_eq!(
             service
                 .authorize(&caller, &service.ceiling.target_id, ExecOperationV1::Submit)
@@ -1607,6 +1839,91 @@ mod tests {
             ExecErrorCodeV1::PermissionDenied
         );
         assert!(!service.authority.read().unwrap().observed.contains(&caller));
+    }
+
+    fn running_jobs_service(temp: &tempfile::TempDir) -> (ExecService, Arc<CancelFailures>) {
+        let mut service = authority_test_service(temp);
+        let runtime = Arc::new(CancelFailures {
+            attempted: StdMutex::new(vec![]),
+            recovered: StdMutex::new(vec![]),
+            fail_list: false,
+        });
+        service.runtime = runtime.clone();
+        (service, runtime)
+    }
+
+    #[tokio::test]
+    async fn caller_without_enrollment_session_keeps_jobs_and_must_reenroll() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut service, runtime) = running_jobs_service(&temp);
+        // After an API restart no caller has an enrollment session yet.
+        service.enrollment = Arc::new(Enrollment(AdmissionError::NotAdmitted));
+        assert_eq!(service.reconcile_policy().await.unwrap(), 0);
+        assert!(runtime.attempted.lock().unwrap().is_empty());
+        let failure = service
+            .authorize(
+                &"11".repeat(32),
+                &service.ceiling.target_id,
+                ExecOperationV1::Submit,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, ExecErrorCodeV1::Unauthenticated);
+        assert!(failure.retryable);
+    }
+
+    #[tokio::test]
+    async fn unknown_standing_cancels_only_after_grace() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut service, runtime) = running_jobs_service(&temp);
+        service.enrollment = Arc::new(Enrollment(AdmissionError::Unavailable(
+            "policy store offline".into(),
+        )));
+        assert_eq!(service.reconcile_policy().await.unwrap(), 0);
+        assert!(runtime.attempted.lock().unwrap().is_empty());
+        *service
+            .owners_settled
+            .lock()
+            .unwrap()
+            .get_mut(&"11".repeat(32))
+            .unwrap() = Instant::now() - UNKNOWN_STANDING_GRACE - Duration::from_secs(1);
+        service.reconcile_policy().await.unwrap_err();
+        assert_eq!(
+            *runtime.attempted.lock().unwrap(),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_settles_lost_launch_but_not_inflight_or_recent_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = authority_test_service(&temp);
+        // The helper has no record of any job.
+        service.runtime = Arc::new(FailLaunch(Arc::default()));
+        let old = now_ms() - LAUNCH_SETTLE.as_millis() as u64 - 1;
+        for (key, job_id, accepted_at) in [
+            ("lost", "lost", old),
+            ("recent", "recent", now_ms()),
+            ("inflight", "inflight", old),
+        ] {
+            service
+                .ledger
+                .reserve(key, [1; 32], job_id, accepted_at)
+                .unwrap();
+            service
+                .ledger
+                .advance(key, ReservationPhase::Accepted, accepted_at)
+                .unwrap();
+        }
+        service.inflight.lock().unwrap().insert("inflight".into());
+        service.reconcile_policy().await.unwrap();
+        let phase = |key| service.ledger.lookup(key).unwrap().unwrap();
+        let lost = phase("lost");
+        assert_eq!(lost.phase, ReservationPhase::Terminal);
+        assert!(!lost.admission_error.unwrap().retryable);
+        assert_eq!(lost.output_limit_bytes, 0);
+        assert_eq!(phase("recent").phase, ReservationPhase::Accepted);
+        assert_eq!(phase("inflight").phase, ReservationPhase::Accepted);
     }
 
     #[tokio::test]
@@ -1652,15 +1969,16 @@ mod tests {
         );
         for index in 0..=MAX_AUTHORITY_PEERS {
             service
-                .refresh_peer(&format!("{index:064x}"))
+                .refresh_standing(&format!("{index:064x}"))
                 .await
+                .call_result()
                 .unwrap();
         }
         let snapshot = service.authority.read().unwrap();
         assert_eq!(snapshot.peers.len(), MAX_AUTHORITY_PEERS);
         assert!(!snapshot.peers.contains_key(&format!("{:064x}", 0)));
         drop(snapshot);
-        service.invalidate_peer(&"ff".repeat(32)).unwrap();
+        service.invalidate_peer(&"ff".repeat(32));
         assert_eq!(
             service.authority.read().unwrap().peers.len(),
             MAX_AUTHORITY_PEERS
@@ -1735,8 +2053,14 @@ mod tests {
             execution_timeout_ms: None,
             output_limit_bytes: None,
         };
-        service.enrollment = Arc::new(NotEnrolled);
-        assert!(service.refresh_peer(&caller).await.is_err());
+        service.enrollment = revoked();
+        assert!(
+            service
+                .refresh_standing(&caller)
+                .await
+                .call_result()
+                .is_err()
+        );
         assert_eq!(
             service
                 .submit(&caller, request.clone())
@@ -1784,7 +2108,11 @@ mod tests {
                 .code,
             ExecErrorCodeV1::PolicyUnavailable
         );
-        service.refresh_peer(&caller).await.unwrap();
+        service
+            .refresh_standing(&caller)
+            .await
+            .call_result()
+            .unwrap();
         assert_eq!(
             service
                 .submit(&caller, request.clone())
