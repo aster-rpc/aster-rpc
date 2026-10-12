@@ -132,8 +132,10 @@ replica again and reports `"delivered": true`; if any replica did not
 synchronize, the command exits with an error and the record exists nowhere
 else, so rerun the same command, which replays it idempotently. Delivery does
 not prove target acceptance; inspect remote readiness before submitting.
-Replicas fetch the record's content after synchronizing, so keep at least one
-other policy replica online.
+Replicas fetch the record's content after synchronizing; the publisher keeps
+serving for five seconds after delivery but cannot confirm those downloads.
+Before relying on a revocation, confirm a replica holds it, for example by
+running `exec check` against a target after its next refresh.
 
 Publishers for one root and namespace must be serialized operationally, and
 the chosen replicas must hold current root history. Docs does not provide a

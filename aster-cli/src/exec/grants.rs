@@ -9,6 +9,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Replicas download a record's content after synchronizing its metadata.
+/// The in-memory publisher keeps serving for this long after delivery,
+/// because it cannot observe those downloads.
+const CONTENT_SERVE_GRACE: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Args)]
 pub struct PublishArgs {
     /// Complete ExecGrantV1 JSON; grant requires active, revoke requires revoked
@@ -321,6 +326,9 @@ pub async fn publish(ctx: &Ctx, args: PublishArgs, revoked: bool) -> Result<()> 
         "note": "Delivery to replicas does not prove target authorization or cancellation; run exec check/status separately.",
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
+    if delivered {
+        tokio::time::sleep(CONTENT_SERVE_GRACE).await;
+    }
     doc.leave().await?;
     drop(doc);
     drop(docs);
