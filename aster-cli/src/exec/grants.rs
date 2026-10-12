@@ -5,7 +5,6 @@ use clap::Args;
 use fs2::FileExt;
 use serde_json::json;
 use std::{
-    io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,45 +28,10 @@ pub struct PublishArgs {
     pub peer: Vec<String>,
 }
 pub(super) fn identity(value: &str) -> Result<[u8; 32]> {
-    if value.len() != 64 || value.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(Error::usage("identity must be 64 lowercase hex characters"));
-    }
-    hex::decode(value)?
-        .try_into()
-        .map_err(|_| Error::usage("identity must encode 32 bytes"))
+    aster_exec::policy::parse_node_id(value)
+        .ok_or_else(|| Error::usage("identity must be 64 lowercase hex characters"))
 }
-pub(super) fn bounded(path: &Path, limit: usize, secret: bool) -> Result<Vec<u8>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.len() > limit as u64 {
-        return Err(Error::usage("grant inputs must be bounded regular files"));
-    }
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::MetadataExt;
-        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-            return Err(Error::new(
-                ErrorKind::Denied,
-                "namespace secret must be owned by this user with mode 0600",
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = secret;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(Error::usage("grant input exceeds its size limit"));
-    }
-    Ok(bytes)
-}
+pub(super) use crate::files::read_bounded as bounded;
 fn validate(grant: &ExecGrantV1, root: &str, audience: &str, revoked: bool) -> Result<Vec<u8>> {
     let caller = identity(&grant.caller)?;
     let target = identity(&grant.target)?;
@@ -143,12 +107,7 @@ async fn write_grant(
         .await?
         .map(|bytes| serde_json::from_slice::<ExecGrantV1>(&bytes))
         .transpose()?;
-    if previous.is_none()
-        && doc
-            .as_core()
-            .entry_exists(author.to_string(), key.to_vec())
-            .await?
-    {
+    if previous.is_none() && doc.entry_exists(author, key.to_vec()).await? {
         return Err(Error::new(
             ErrorKind::Denied,
             "root grant key has a deletion tombstone; restore an explicit revisioned denial before publishing",
@@ -162,6 +121,9 @@ async fn write_grant(
     Ok(changed)
 }
 
+/// Synchronize with every policy replica, wait for the exact root record's
+/// content to be readable, then write. Never reads the predecessor from a
+/// possibly stale local replica.
 async fn reconcile_and_write(
     doc: &aster::Doc,
     peers: &[aster::NodeId],
@@ -170,7 +132,18 @@ async fn reconcile_and_write(
     grant: &ExecGrantV1,
     budget: Duration,
 ) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + budget;
     doc.sync_with_timeout(peers, budget).await?;
+    // Metadata sync can finish before the record's content arrives.
+    while let Err(error) = doc.get_exact(author, key.to_vec()).await {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                format!("current root grant record is not yet readable: {error}"),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     write_grant(doc, author, key, grant).await
 }
 
@@ -252,14 +225,11 @@ pub async fn publish(ctx: &Ctx, args: PublishArgs, revoked: bool) -> Result<()> 
     }
     let credential =
         zeroize::Zeroizing::new(String::from_utf8(bounded(credential_path, 65536, true)?)?);
-    let key_path = ctx.home.join("keys").join(format!("{profile}.node.key"));
-    let key_bytes = zeroize::Zeroizing::new(bounded(&key_path, 128, true)?);
-    let key_text = std::str::from_utf8(&key_bytes)
-        .map_err(|_| Error::usage("publisher node key must contain hex"))?
-        .trim();
+    let node_key = super::daemon::load_node_key(&super::daemon::node_key_path(ctx, &profile))?;
+    // In memory: the root author is imported for this run only, and every
+    // run reconciles with the replicas before reading anything.
     let config = aster::AsterConfig {
-        storage_path: Some(owner.join("docs")),
-        secret_key: Some(aster::SecretKey::from_bytes(identity(key_text)?)),
+        secret_key: Some(node_key),
         root_pubkey: Some(aster::PublicKey::from_hex(root)?),
         enable_hooks: true,
         hook_failure_mode: aster::HookFailureMode::FailClosed,
@@ -322,36 +292,45 @@ pub async fn publish(ctx: &Ctx, args: PublishArgs, revoked: bool) -> Result<()> 
         .iter()
         .map(|p| identity(p).map(|_| aster::NodeId::from_hex(p)))
         .collect::<Result<_>>()?;
-    // Never read the predecessor from a potentially stale publisher replica.
-    // The sync primitive checks the native result, not merely SyncFinished.
     let changed =
         reconcile_and_write(&doc, &peers, &author, &key, &grant, Duration::from_secs(15)).await?;
     let read_ticket = doc.share_with_addr(aster::ShareMode::Read).await?;
-    // A delivery failure cannot roll back a durable publication, but must be
-    // reported separately from the required pre-publication reconciliation.
+    // The write exists only in this in-memory replica until delivered, so an
+    // undelivered publication fails. Rerunning the same command is an
+    // idempotent replay that retries delivery.
     let delivered = doc
         .sync_with_timeout(&peers, Duration::from_secs(15))
         .await
         .is_ok();
-    let synced: std::collections::BTreeSet<_> = if delivered {
-        peers.iter().map(ToString::to_string).collect()
-    } else {
-        Default::default()
-    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Error::usage("system clock precedes Unix epoch"))?
         .as_secs();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(
-            &json!({"published":true,"changed":changed,"namespace":args.namespace,"author":root,"key":String::from_utf8(key)?,"revision":grant.revision,"status":grant.status,"read_ticket":read_ticket,"synced_peers":synced,"sync_completed":delivered,"delivery_verified":false,"publisher_node_id":node.id().to_string(),"observed_at":now,"note":"Sync does not prove target authorization or cancellation; run exec check/status separately."})
-        )?
-    );
+    let report = json!({
+        "written": changed,
+        "delivered": delivered,
+        "namespace": args.namespace,
+        "author": root,
+        "key": String::from_utf8(key)?,
+        "revision": grant.revision,
+        "status": grant.status,
+        "read_ticket": read_ticket,
+        "replicas": args.peer,
+        "publisher_node_id": node.id().to_string(),
+        "observed_at": now,
+        "note": "Delivery to replicas does not prove target authorization or cancellation; run exec check/status separately.",
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
     doc.leave().await?;
     drop(doc);
     drop(docs);
     node.shutdown().await;
+    if !delivered {
+        return Err(Error::new(
+            ErrorKind::Unavailable,
+            "grant was not delivered to every policy replica; rerun the same command to retry",
+        ));
+    }
     Ok(())
 }
 
@@ -394,10 +373,7 @@ mod tests {
         g.status = GrantStatusV1::Revoked;
         g.revision = 2;
         assert!(write_grant(&doc, &author, &key, &g).await.unwrap());
-        doc.as_core()
-            .del(author.to_string(), key.clone())
-            .await
-            .unwrap();
+        doc.del(&author, key.clone()).await.unwrap();
         g.revision = 3;
         assert!(write_grant(&doc, &author, &key, &g).await.is_err());
         doc.leave().await.unwrap();
@@ -473,29 +449,22 @@ mod tests {
             .unwrap();
         // Importing a namespace does not enable the replica's sync handler.
         remote.start_sync(&[]).await.unwrap();
-        let peers = [replica.id(), replica.id()];
-        // Metadata sync can finish before content download. Pending content must
-        // refuse publication too; retry until the exact root bytes are readable.
-        for _ in 0..100 {
-            let attempt = reconcile_and_write(
-                &local,
-                &peers,
-                &author,
-                &key,
-                &stale,
-                Duration::from_secs(5),
-            )
-            .await;
-            assert!(attempt.is_err());
-            if local
-                .get_exact(&author, key.clone())
-                .await
-                .is_ok_and(|v| v.is_some())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // The stale publisher learns revision 7 before writing and refuses
+        // its own lower revision.
+        let refused = reconcile_and_write(
+            &local,
+            &[replica.id()],
+            &author,
+            &key,
+            &stale,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("revision must increase"),
+            "{refused}"
+        );
         let actual: ExecGrantV1 =
             serde_json::from_slice(&local.get_exact(&author, key).await.unwrap().unwrap()).unwrap();
         assert_eq!(actual, denied);

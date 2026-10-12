@@ -158,11 +158,14 @@ async fn ensure(ctx: &Ctx) -> Result<std::path::PathBuf> {
     }
     use std::os::unix::process::CommandExt;
     command.process_group(0);
+    let log_path = dir.join("daemon.log");
+    let log = open_log(&log_path)?;
     command
         .args(["exec", "daemon", "foreground"])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::null()).spawn()?;
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        .spawn()?;
     loop {
         if exchange(&socket, json!({"operation":"ping"})).await.is_ok() {
             return Ok(socket);
@@ -170,16 +173,38 @@ async fn ensure(ctx: &Ctx) -> Result<std::path::PathBuf> {
         if tokio::time::Instant::now() >= deadline {
             return Err(Error::new(
                 ErrorKind::Unavailable,
-                "Exec daemon did not become ready; run `aster exec daemon foreground` with the same --home and --profile for diagnostics",
+                format!(
+                    "Exec daemon did not become ready; see {}",
+                    log_path.display()
+                ),
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+/// The daemon's private log, restarted once it exceeds 1 MiB.
+#[cfg(unix)]
+fn open_log(path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let oversized = std::fs::metadata(path).is_ok_and(|m| m.len() > 1024 * 1024);
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(!oversized)
+        .write(true)
+        .truncate(oversized)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?)
+}
 #[cfg(unix)]
 pub async fn call(ctx: &Ctx, call: Invocation) -> Result<Value> {
+    call_within(ctx, call, Duration::from_secs(45)).await
+}
+/// Call the daemon, giving it and its remote call no more than `budget`.
+#[cfg(unix)]
+pub async fn call_within(ctx: &Ctx, call: Invocation, budget: Duration) -> Result<Value> {
     let submit = call.method == "submit";
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + budget;
     tokio::time::timeout_at(deadline, async {
         let socket = ensure(ctx).await?;
         exchange_budget(
@@ -240,7 +265,12 @@ pub async fn lifecycle(ctx: &Ctx, command: DaemonCommand) -> Result<()> {
     }
 }
 #[cfg(unix)]
-pub(super) fn grants_key(path: &std::path::Path) -> Result<aster::SecretKey> {
+/// Where a profile's node (caller) key lives.
+pub(super) fn node_key_path(ctx: &Ctx, profile: &str) -> std::path::PathBuf {
+    ctx.home.join("keys").join(format!("{profile}.node.key"))
+}
+/// Load an existing node key. A missing key is an error, never generated.
+pub(super) fn load_node_key(path: &std::path::Path) -> Result<aster::SecretKey> {
     let bytes = zeroize::Zeroizing::new(super::grants::bounded(path, 128, true)?);
     let text =
         std::str::from_utf8(&bytes).map_err(|_| Error::usage("node key must contain hex"))?;
@@ -267,10 +297,9 @@ async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
     }
     let cfg = aster_config::load(&ctx.home)?;
     let profile = cfg.selected_profile_name(ctx.profile.as_deref());
-    let key_path = ctx.home.join("keys").join(format!("{profile}.node.key"));
     // Loading the existing seed explicitly prevents Node::start from silently
     // generating a new caller when a provisioned key disappears.
-    let key = grants_key(&key_path)?;
+    let key = load_node_key(&node_key_path(ctx, &profile))?;
     let settings = cfg
         .profiles
         .get(&profile)
@@ -595,7 +624,7 @@ mod tests {
     #[test]
     fn missing_caller_key_is_never_generated() {
         let path = std::env::temp_dir().join(format!("missing-exec-key-{}", uuid::Uuid::new_v4()));
-        assert!(grants_key(&path).is_err());
+        assert!(load_node_key(&path).is_err());
         assert!(!path.exists());
     }
     #[test]

@@ -137,7 +137,7 @@ impl Server {
                     && let Some(rid) = params.get("requestId")
                     && let Some(task) = in_flight
                         .lock()
-                        .expect("in-flight lock")
+                        .unwrap_or_else(|e| e.into_inner())
                         .remove(&rid.to_string())
                 {
                     task.abort();
@@ -257,7 +257,7 @@ impl Server {
             }
         }
 
-        for (_, task) in in_flight.lock().expect("in-flight lock").drain() {
+        for (_, task) in in_flight.lock().unwrap_or_else(|e| e.into_inner()).drain() {
             task.abort();
         }
         drop(outbox);
@@ -281,7 +281,7 @@ fn spawn_call(
     in_flight: &InFlight,
 ) {
     let key = id.to_string();
-    let mut guard = in_flight.lock().expect("in-flight lock");
+    let mut guard = in_flight.lock().unwrap_or_else(|e| e.into_inner());
     // A second call under a running call's id would orphan the first.
     if guard.contains_key(&key) {
         send(
@@ -302,7 +302,7 @@ fn spawn_call(
             let response = tool_result(call.await, &id, modern);
             if registry
                 .lock()
-                .expect("in-flight lock")
+                .unwrap_or_else(|e| e.into_inner())
                 .remove(&key)
                 .is_some()
             {

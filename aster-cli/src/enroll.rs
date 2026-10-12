@@ -1,7 +1,8 @@
 //! Enrollment issuance adapter; credential semantics live in Aster core.
 
+use crate::files::read_bounded;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -186,41 +187,4 @@ fn issue(ctx: &Ctx, args: NodeArgs, now: u64) -> Result<IssuedReport> {
         credential_file: args.out,
         registered: false,
     })
-}
-
-fn read_bounded(path: &Path, limit: u64, secret: bool) -> Result<Vec<u8>> {
-    if !std::fs::metadata(path)?.is_file() {
-        return Err(Error::usage("enrollment inputs must be regular files"));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    // Recheck the opened descriptor below. Nonblocking open also prevents a
-    // regular file replaced by a FIFO between these checks from hanging.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(Error::usage("enrollment inputs must be regular files"));
-    }
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::PermissionsExt;
-        if file.metadata()?.permissions().mode() & 0o077 != 0 {
-            return Err(
-                Error::usage("root key file must have owner-only permissions")
-                    .with_hint("restrict the key file to mode 0600 before retrying"),
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = secret;
-    let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(Error::usage("enrollment input exceeds its size limit"));
-    }
-    Ok(bytes)
 }

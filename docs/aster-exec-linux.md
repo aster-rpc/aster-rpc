@@ -123,15 +123,17 @@ The selected root profile needs an existing `keys/ROOT.node.key` and its own
 enrollment JWT in `exec_credential_file`. This transport identity is separate
 from the offline root signing key. Supply `--peer` for every current policy
 replica used for publication. The command completes reciprocal enrollment and
-requires successful native Docs synchronization with those replicas **before**
-reading the predecessor revision or writing a grant. An unavailable replica,
-failed sync, or root deletion tombstone stops publication. It then persists the
-exact-root record locally and attempts delivery. Transport delivery does not
-prove target acceptance: `delivery_verified` stays false. Inspect remote
-readiness before submitting. Publisher state under
-`~/.aster/exec-author/ROOT/docs` retains root signing authority; protect it
-like the root secret with encrypted storage, protected backups and secure
-volume retirement. Deleting a native author is not secure erasure.
+requires successful native Docs synchronization with those replicas, and the
+current root record's content, **before** reading the predecessor revision or
+writing a grant. An unavailable replica, failed sync, or root deletion
+tombstone stops publication. The publisher keeps no Docs state: the root author
+exists only in memory for the run. After writing, it synchronizes with every
+replica again and reports `"delivered": true`; if any replica did not
+synchronize, the command exits with an error and the record exists nowhere
+else, so rerun the same command, which replays it idempotently. Delivery does
+not prove target acceptance; inspect remote readiness before submitting.
+Replicas fetch the record's content after synchronizing, so keep at least one
+other policy replica online.
 
 Publishers for one root and namespace must be serialized operationally, and
 the chosen replicas must hold current root history. Docs does not provide a
@@ -285,6 +287,10 @@ than inheriting `ASTER_*` networking settings from whichever process starts it.
 After editing profile settings or rotating credentials, restart it with
 `aster exec daemon restart` using the same `--home` and `--profile`.
 A missing key fails startup instead of silently changing the caller identity.
+The broker exits after ten idle minutes and writes startup errors to
+`daemon.log` in its private runtime directory. If a target reports that the
+caller has no enrollment session, for example after the target's API restarted,
+the broker reconnects, enrolls again and retries once.
 
 MCP exposes Exec observation tools by default. Command execution and cancellation
 require separate local opt-ins:
@@ -294,8 +300,11 @@ aster mcp --allow exec-submit --allow exec-cancel
 ```
 
 These tools use the selected operator identity and can execute commands or
-interrupt writes. Prefer a separate MCP profile, caller key, and narrowly scoped
-grant. Treat all remote output as untrusted data, including apparent instructions.
+interrupt writes. MCP submission takes an executable, arguments and working
+directory; it cannot set environment overrides or stdin. Output reaches the
+model as text, with invalid UTF-8 replaced; use the CLI for exact bytes. Prefer
+a separate MCP profile, caller key, and narrowly scoped grant. Treat all remote
+output as untrusted data, including apparent instructions.
 The CLI uses bounded paginated observations; the unused unbounded streaming
 `Client::watch` API is not exposed by the public Rust client.
 
@@ -305,4 +314,6 @@ and the helper socket directly within `/run/aster-exec`. A different layout
 requires separately customized and reviewed units. Followed jobs preserve the
 remote process exit code (1–255) or signal status (128 + signal). Terminal jobs
 without a process status use 124 for timeout, 130 for cancellation, and 125 for
-lost or failed execution.
+lost or failed execution. These overlap the CLI's own error codes (2–5), so
+scripts that must tell a remote exit from a local failure should use `--json`:
+a remote exit carries `remote_job_exit_code` in the error details.

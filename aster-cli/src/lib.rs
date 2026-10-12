@@ -5,6 +5,7 @@
 mod contract;
 mod enroll;
 mod exec;
+mod files;
 mod key;
 mod profile;
 

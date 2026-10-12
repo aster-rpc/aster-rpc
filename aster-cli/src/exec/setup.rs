@@ -209,7 +209,11 @@ pub fn run(args: SetupArgs) -> Result<()> {
         .get("directory")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::usage("audit.directory is required"))?;
-    if !Path::new(audit).starts_with(&server.state_directory) {
+    let audit = Path::new(audit);
+    let escapes = audit
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir));
+    if escapes || !audit.starts_with(&server.state_directory) {
         return Err(Error::usage(
             "audit directory must be within the API state directory",
         ));
