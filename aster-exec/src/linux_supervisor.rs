@@ -8,6 +8,7 @@ use crate::linux_cgroup::{DelegatedJobCgroup, PayloadIdentity};
 use crate::local_control::{ControlRequestV1, ControlResponseV1};
 use crate::spool::Spool;
 use crate::state::{JobStore, StoreError};
+use crate::unix_millis as now_ms;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,13 +52,6 @@ fn terminal_result(stop: Option<StopReason>, successful_exit: bool) -> (JobState
         None if successful_exit => (JobStateV1::Succeeded, "exited"),
         None => (JobStateV1::Failed, "nonzero_exit"),
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn other(error: impl std::fmt::Display) -> io::Error {
@@ -122,17 +116,16 @@ fn drain_output(
 
 fn handle_control(
     mut stream: UnixStream,
-    spec: &SupervisorSpecV1,
     store: &JobStore,
     spool: &mut Spool,
     cgroup: &DelegatedJobCgroup,
     stop: &mut Option<(StopReason, Instant)>,
 ) -> io::Result<()> {
-    let caller_uid = peer_uid(&stream)?;
-    if caller_uid != spec.api_uid && caller_uid != 0 {
+    // Only the root helper talks to supervisors.
+    if peer_uid(&stream)? != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "control peer is not Exec API",
+            "control peer is not the Exec helper",
         ));
     }
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -217,7 +210,9 @@ fn handle_control(
     stream.flush()
 }
 
-fn terminal_outcome(status: &JobStatusV1) -> io::Result<Vec<u8>> {
+/// The durable audit outcome for a terminal job. The helper uses the same
+/// record when it settles a job whose supervisor was lost.
+pub(crate) fn terminal_outcome(status: &JobStatusV1) -> io::Result<Vec<u8>> {
     serde_json::to_vec(&serde_json::json!({
         "timestamp_ms": status.finished_at_ms.unwrap_or_else(now_ms),
         "kind": "exec.outcome.v1",
@@ -271,11 +266,9 @@ pub fn run(spec: SupervisorSpecV1) -> io::Result<JobStatusV1> {
     if store.state().request_digest != spec.request_digest || store.state().status != spec.status {
         return Err(other("durable admission does not match sealed spec"));
     }
-    // The API group gets traversal to its socket, but no directory listing or
-    // access to root-only state.redb/output.log. Ancestor directories are
-    // provisioned with the same execute-only API-group access by the helper.
-    chown(&spec.job_directory, Some(0), Some(spec.api_gid))?;
-    fs::set_permissions(&spec.job_directory, fs::Permissions::from_mode(0o710))?;
+    // Only root (the helper) reaches the job directory and its socket.
+    chown(&spec.job_directory, Some(0), Some(0))?;
+    fs::set_permissions(&spec.job_directory, fs::Permissions::from_mode(0o700))?;
     let mut spool = Spool::open(
         &spec.job_directory.join("output.log"),
         0,
@@ -290,8 +283,7 @@ pub fn run(spec: SupervisorSpecV1) -> io::Result<JobStatusV1> {
         ));
     }
     let listener = UnixListener::bind(&spec.control_socket)?;
-    chown(&spec.control_socket, Some(0), Some(spec.api_gid))?;
-    fs::set_permissions(&spec.control_socket, fs::Permissions::from_mode(0o660))?;
+    fs::set_permissions(&spec.control_socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
     store
@@ -327,15 +319,16 @@ pub fn run(spec: SupervisorSpecV1) -> io::Result<JobStatusV1> {
     ) {
         Ok(child) => child,
         Err(error) => {
+            let finished_at = now_ms();
             let mut status = store.state().status.clone();
             status.state = JobStateV1::Failed;
-            status.finished_at_ms = Some(now_ms());
+            status.finished_at_ms = Some(finished_at);
             status.reason_code = Some("launch_error".into());
             let outcome = terminal_outcome(&status)?;
             store
                 .transition(
                     JobStateV1::Failed,
-                    status.finished_at_ms.unwrap(),
+                    finished_at,
                     None,
                     None,
                     status.reason_code.clone(),
@@ -374,11 +367,11 @@ pub fn run(spec: SupervisorSpecV1) -> io::Result<JobStatusV1> {
     let deadline = Instant::now() + timeout;
     let mut stop: Option<(StopReason, Instant)> = None;
     let mut exit = None;
-    loop {
+    let exit = loop {
         let output_closed = drain_output(&rx, &mut spool, &mut store)?;
         match listener.accept() {
             Ok((stream, _)) => {
-                let _ = handle_control(stream, &spec, &store, &mut spool, &cgroup, &mut stop);
+                let _ = handle_control(stream, &store, &mut spool, &cgroup, &mut stop);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => eprintln!("supervisor accept failed: {error}"),
@@ -406,16 +399,19 @@ pub fn run(spec: SupervisorSpecV1) -> io::Result<JobStatusV1> {
         {
             cgroup.kill_payload()?;
         }
-        if exit.is_some() && cgroup.payload_empty()? && output_closed {
-            break;
+        if let Some(exit) = exit
+            && cgroup.payload_empty()?
+            && output_closed
+        {
+            break exit;
         }
         thread::sleep(Duration::from_millis(20));
-    }
-    let exit = exit.expect("child status observed before terminal transition");
+    };
     let (state, reason) = terminal_result(stop.map(|(reason, _)| reason), exit.success());
+    let finished_at = now_ms();
     let mut status = store.state().status.clone();
     status.state = state;
-    status.finished_at_ms = Some(now_ms());
+    status.finished_at_ms = Some(finished_at);
     status.exit_code = exit.code();
     status.reason_code = Some(reason.into());
     #[cfg(unix)]
@@ -427,7 +423,7 @@ pub fn run(spec: SupervisorSpecV1) -> io::Result<JobStatusV1> {
     store
         .transition(
             state,
-            status.finished_at_ms.unwrap(),
+            finished_at,
             status.exit_code,
             status.signal,
             status.reason_code.clone(),

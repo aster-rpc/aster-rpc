@@ -1,13 +1,17 @@
 //! Fixed systemd transient-unit template used only by the privileged helper.
 
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const UNIT_PREFIX: &str = "aster-exec-job-";
+/// The fixed systemctl the helper validates and runs.
+pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
+/// A supervisor that outlives the longest job by this much is stopped.
+const RUNTIME_MAX: &str = "RuntimeMaxSec=25h";
 
 pub fn unit_name(job_id: &str) -> io::Result<String> {
     let uuid = uuid::Uuid::parse_str(job_id)
@@ -30,7 +34,7 @@ fn unit_args(job_id: &str, supervisor: &Path, sealed_spec: &Path) -> io::Result<
         OsString::from("--property=Delegate=yes"),
         OsString::from("--property=Restart=no"),
         OsString::from("--property=CollectMode=inactive-or-failed"),
-        OsString::from("--property=RuntimeMaxSec=25h"),
+        OsString::from(format!("--property={RUNTIME_MAX}")),
         OsString::from("--property=KillMode=control-group"),
         OsString::from("--property=TimeoutStopSec=10s"),
         OsString::from("--property=OOMPolicy=continue"),
@@ -61,21 +65,61 @@ pub fn create(
         ));
     }
     let args = unit_args(job_id, supervisor, sealed_spec)?;
-    let mut child = Command::new(systemd_run)
-        .args(&args)
+    match run_bounded(systemd_run, &args, Duration::from_secs(5)) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if error.kind() == io::ErrorKind::TimedOut {
+                // systemd may still hold the queued start. Cancel it so the
+                // supervisor cannot start after this launch reported failure.
+                if let Err(stop_error) = stop(job_id) {
+                    eprintln!("cannot cancel timed-out start of job {job_id}: {stop_error}");
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Stop a job unit, cancelling any queued start.
+pub fn stop(job_id: &str) -> io::Result<()> {
+    let name = unit_name(job_id)?;
+    run_bounded(
+        Path::new(SYSTEMCTL),
+        &[OsString::from("stop"), OsString::from(name)],
+        Duration::from_secs(15),
+    )
+    .map(|_| ())
+}
+
+/// Run a fixed command with a cleared environment and a deadline. Returns its
+/// standard output (bounded); a failure carries its standard error.
+fn run_bounded(program: &Path, args: &[OsString], limit: Duration) -> io::Result<String> {
+    let mut child = Command::new(program)
+        .args(args)
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + limit;
     loop {
         if let Some(status) = child.try_wait()? {
+            let read = |pipe: Option<&mut dyn Read>| {
+                let mut text = String::new();
+                if let Some(pipe) = pipe {
+                    let _ = pipe.take(4096).read_to_string(&mut text);
+                }
+                text
+            };
+            let stdout = read(child.stdout.as_mut().map(|p| p as &mut dyn Read));
             if status.success() {
-                return Ok(());
+                return Ok(stdout);
             }
+            let stderr = read(child.stderr.as_mut().map(|p| p as &mut dyn Read));
             return Err(io::Error::other(format!(
-                "systemd-run exited with {status}"
+                "{} exited with {status}: {}",
+                program.display(),
+                stderr.trim()
             )));
         }
         if Instant::now() >= deadline {
@@ -83,7 +127,7 @@ pub fn create(
             let _ = child.wait();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "systemd-run timed out",
+                format!("{} timed out", program.display()),
             ));
         }
         thread::sleep(Duration::from_millis(20));
@@ -94,44 +138,26 @@ pub fn create(
 /// endpoint alone is never evidence that payload descendants have stopped.
 pub fn confirm_stopped(job_id: &str) -> io::Result<()> {
     let name = unit_name(job_id)?;
-    let mut child = Command::new("/usr/bin/systemctl")
-        .args(["show", "--property=ActiveState", "--value", &name])
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                return Err(io::Error::other("cannot verify supervisor unit state"));
-            }
-            let mut state = String::new();
-            use std::io::Read;
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| io::Error::other("missing systemctl output"))?
-                .take(1024)
-                .read_to_string(&mut state)?;
-            return match state.trim() {
-                "inactive" | "failed" => Ok(()),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "supervisor unit still active; retry its control endpoint",
-                )),
-            };
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "unit recovery check timed out",
-            ));
-        }
-        thread::sleep(Duration::from_millis(20));
+    let state = run_bounded(
+        Path::new(SYSTEMCTL),
+        &[
+            OsString::from("show"),
+            OsString::from("--property=ActiveState"),
+            OsString::from("--value"),
+            OsString::from(name),
+        ],
+        Duration::from_secs(2),
+    )
+    .map_err(|error| match error.kind() {
+        io::ErrorKind::TimedOut => error,
+        _ => io::Error::other("cannot verify supervisor unit state"),
+    })?;
+    match state.trim() {
+        "inactive" | "failed" => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "supervisor unit still active; retry its control endpoint",
+        )),
     }
 }
 

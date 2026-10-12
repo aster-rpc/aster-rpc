@@ -16,6 +16,7 @@ use crate::{
         ExecGrantStore, ExecGrantV1, ExecOperationV1, GrantError, MAX_ISSUED_AT_SKEW_SECONDS,
         parse_node_id as identity_bytes,
     },
+    unix_millis as now_ms,
 };
 use aster::audit_outbox::{AuditEvent, AuditOutbox};
 use aster::enrollment::{AdmissionError, EnrollmentRevoked};
@@ -161,14 +162,6 @@ pub fn error(code: ExecErrorCodeV1, message: &str) -> ExecErrorV1 {
         retry_after_ms: None,
     }
 }
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
 
 /// Admission and operation authority are independent checks. Only
 /// [`AdmissionError::Denied`] is a definite denial.
@@ -264,6 +257,7 @@ pub trait ExecRuntime: Send + Sync {
     async fn status(&self, job: &JobRefV1) -> Result<JobStatusV1, ExecErrorV1>;
     async fn output(&self, request: &OutputRequestV1) -> Result<OutputPageV1, ExecErrorV1>;
     async fn cancel(&self, request: &CancelRequestV1) -> Result<CancelReceiptV1, ExecErrorV1>;
+    /// Jobs that are not terminal. May include terminal jobs; callers filter.
     async fn list_jobs(&self) -> Result<Vec<JobStatusV1>, ExecErrorV1>;
     async fn pending_outcomes(&self) -> Result<Vec<(String, Vec<u8>)>, ExecErrorV1>;
     async fn ack_outcome(&self, job_id: &str) -> Result<(), ExecErrorV1>;
@@ -892,22 +886,19 @@ impl ExecService {
             first_error.get_or_insert(ledger_error(failure));
             Vec::new()
         });
-        let (jobs, listed) = match self.runtime.list_jobs().await {
-            Ok(jobs) => (jobs, true),
+        let jobs = match self.runtime.list_jobs().await {
+            Ok(jobs) => jobs,
             Err(failure) => {
                 // One unreadable helper folder must not hide every other job
                 // from revocation. Accepted reservations retain the job IDs
                 // needed to recover each status independently.
                 first_error.get_or_insert(failure);
-                (
-                    self.recover_jobs(&reservations, &mut first_error).await,
-                    false,
-                )
+                self.recover_jobs(&reservations, &mut first_error).await
             }
         };
         for (key, reservation) in &reservations {
             if let Err(failure) = self
-                .settle_reservation(key, reservation, &inflight, &jobs, listed)
+                .settle_reservation(key, reservation, &inflight, &jobs)
                 .await
             {
                 first_error.get_or_insert(failure);
@@ -976,8 +967,7 @@ impl ExecService {
         key: &str,
         reservation: &crate::ledger::Reservation,
         inflight: &BTreeSet<String>,
-        jobs: &[JobStatusV1],
-        listed: bool,
+        live: &[JobStatusV1],
     ) -> Result<(), ExecErrorV1> {
         if inflight.contains(&reservation.job_id) {
             return Ok(());
@@ -999,16 +989,10 @@ impl ExecService {
                 settled(self.ledger.fail_preparing(key, failure, now_ms()))
             }
             ReservationPhase::Accepted => {
-                let job = jobs.iter().find(|job| job.job.job_id == reservation.job_id);
-                if job.is_some_and(|job| job.state.is_terminal()) {
-                    return settled(
-                        self.ledger
-                            .advance(key, ReservationPhase::Terminal, now_ms()),
-                    );
-                }
-                let launch_settled = now_ms().saturating_sub(reservation.accepted_at_ms)
-                    >= LAUNCH_SETTLE.as_millis() as u64;
-                if job.is_some() || !listed || !launch_settled {
+                let running = live
+                    .iter()
+                    .any(|job| job.job.job_id == reservation.job_id && !job.state.is_terminal());
+                if running {
                     return Ok(());
                 }
                 let status = self
@@ -1018,8 +1002,17 @@ impl ExecService {
                         target_id: self.ceiling.target_id.clone(),
                     })
                     .await;
+                let launch_settled = now_ms().saturating_sub(reservation.accepted_at_ms)
+                    >= LAUNCH_SETTLE.as_millis() as u64;
                 match status {
-                    Err(failure) if failure.code == ExecErrorCodeV1::JobNotFound => {
+                    Ok(status) if status.state.is_terminal() => settled(self.ledger.advance(
+                        key,
+                        ReservationPhase::Terminal,
+                        now_ms(),
+                    )),
+                    Err(failure)
+                        if failure.code == ExecErrorCodeV1::JobNotFound && launch_settled =>
+                    {
                         let mut failure = error(
                             ExecErrorCodeV1::SupervisorUnavailable,
                             "launch did not start; use a new request ID",
@@ -1812,9 +1805,14 @@ mod tests {
         let failure = service.reconcile_policy().await.unwrap_err();
         assert_eq!(failure.code, ExecErrorCodeV1::SupervisorUnavailable);
         assert_eq!(failure.safe_message, "list failed");
-        assert_eq!(
-            *runtime.recovered.lock().unwrap(),
-            ["unreadable", "readable"]
+        // Recovery reads every reservation in ledger order; settling then
+        // retries the unreadable one without blocking the readable job.
+        assert!(
+            runtime
+                .recovered
+                .lock()
+                .unwrap()
+                .starts_with(&["unreadable".to_string(), "readable".to_string()])
         );
         assert_eq!(*runtime.attempted.lock().unwrap(), ["readable"]);
     }

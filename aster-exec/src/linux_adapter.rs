@@ -131,35 +131,29 @@ impl ExecRuntime for LinuxRuntime {
             _ => Err(Self::unexpected()),
         }
     }
+    /// Live jobs only. Fails if any job could not be read, so the caller
+    /// falls back to checking each reservation it holds.
     async fn list_jobs(&self) -> Result<Vec<JobStatusV1>, ExecErrorV1> {
         match self.call(Q::Enumerate).await? {
-            R::Jobs(j) => Ok(j),
+            R::Jobs {
+                jobs,
+                complete: true,
+            } => Ok(jobs),
+            R::Jobs { .. } => Err(error(
+                ExecErrorCodeV1::SupervisorUnavailable,
+                "some Exec jobs could not be read",
+            )),
             _ => Err(Self::unexpected()),
         }
     }
     async fn pending_outcomes(&self) -> Result<Vec<(String, Vec<u8>)>, ExecErrorV1> {
-        let mut result = Vec::new();
-        let jobs = match self.call(Q::EnumerateOutcomes).await? {
-            R::Jobs(jobs) => jobs,
-            _ => return Err(Self::unexpected()),
-        };
-        for status in jobs {
-            if !status.state.is_terminal() {
-                continue;
-            }
-            let job_id = status.job.job_id;
-            match self
-                .call(Q::Outcome {
-                    job_id: job_id.clone(),
-                })
-                .await
-            {
-                Ok(R::Outcome(Some(bytes))) => result.push((job_id, bytes)),
-                Ok(R::Outcome(None)) => {}
-                _ => eprintln!("pending outcome unavailable for {job_id}"),
-            }
+        match self.call(Q::PendingOutcomes).await? {
+            R::Outcomes(outcomes) => Ok(outcomes
+                .into_iter()
+                .map(|pending| (pending.job_id, pending.outcome))
+                .collect()),
+            _ => Err(Self::unexpected()),
         }
-        Ok(result)
     }
     async fn ack_outcome(&self, job_id: &str) -> Result<(), ExecErrorV1> {
         match self

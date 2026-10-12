@@ -360,7 +360,7 @@ mod linux {
                 serde_json::to_vec(&grant)?,
             )
             .await?;
-        let mut local_store = aster_exec::policy::ExecGrantStore::open(
+        let local_store = aster_exec::policy::ExecGrantStore::open(
             &work.join("root-grant-check.redb"),
             bytes(&root_id),
             bytes(&namespace),

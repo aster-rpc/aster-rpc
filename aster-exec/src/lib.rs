@@ -3,6 +3,16 @@
 //! This crate does not expose a network service until a qualified lifetime
 //! owner, verified Exec grants, and durable audit admission are installed.
 
+/// Milliseconds since the Unix epoch. A clock set before the epoch reads 0.
+pub fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 #[cfg(feature = "policy")]
 pub mod authorization;
 pub mod contract;
