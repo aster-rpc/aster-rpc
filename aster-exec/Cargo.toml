@@ -9,8 +9,8 @@ publish = false
 
 [features]
 default = []
-policy = ["dep:aster_transport_core"]
-service = ["policy", "dep:aster", "dep:async-trait"]
+policy = ["dep:aster"]
+service = ["policy", "aster/rpc", "aster/audit-outbox", "dep:async-trait"]
 
 [dependencies]
 base64 = "0.22"
@@ -21,8 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
-aster_transport_core = { path = "../core", features = ["enrollment"], optional = true }
-aster = { path = "../aster", default-features = false, features = ["rpc", "audit-outbox", "enrollment", "docs"], optional = true }
+aster = { path = "../aster", default-features = false, features = ["enrollment", "docs"], optional = true }
 async-trait = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]

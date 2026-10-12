@@ -10,7 +10,24 @@
 //! identity verification. Consumers retain their sole custom ALPN accept loop
 //! and route enrollment connections into [`Enrollment::accept`].
 
-pub use aster_transport_core::enrollment::*;
+pub use aster_transport_core::enrollment::{
+    admit, check_root_revision, credential_status_key, node_registration_key,
+    should_record_rejection, validate_root_record_json, AdmissionClaims, AdmissionContext,
+    AdmissionDecision, AdmissionError, AdmissionEvidenceSource, AdmissionGuard, AdmissionPolicy,
+    Audience, Confirmation, CredentialStatusV1, DenialReason, EnrollmentClaimsV1, EnrollmentError,
+    EnrollmentExtensionV1, EnrollmentIssueRequest, EnrollmentOptions, EnrollmentPolicyStore,
+    EnrollmentReadiness, EnrollmentRevoked, IssuedEnrollmentCredential, JwtEnrollmentIssuer,
+    JwtEnrollmentVerifier, KnownRevocations, MatchState, NodeRegistrationStatus,
+    NodeRegistrationV1, ObservedSourceAddress, PolicyError, PolicyExpressionV1, PolicyPredicate,
+    PolicyRefreshIssue, PolicyRefreshReport, PolicySynchronization, PublicConfirmationKey,
+    RecordAvailability, RecordError, RootRecordError, RootRecordRead, RootRevisionError,
+    SourceAddressProvenance, SourceCidr, SynchronizationSource, TypedAttribute,
+    VerifiedAdmissionEvidence, ENROLLMENT_ALPN, ENROLLMENT_JWT_TYPE, MAX_JWT_BYTES,
+    MAX_POLICY_DEPTH, MAX_POLICY_NODES, MAX_POLICY_RECORDS, MAX_POLICY_RECORD_BYTES,
+    POLICY_RECORD_PREFIX, POLICY_RECORD_VERSION,
+};
+
+use aster_transport_core::enrollment::{EnrollmentService, RootAuthoredDocView};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +39,39 @@ pub fn issue_jwt(
     issued_at: u64,
 ) -> Result<IssuedEnrollmentCredential, EnrollmentError> {
     JwtEnrollmentIssuer::from_seed(&root.to_bytes()).issue(request, issued_at)
+}
+
+/// Reads the records one root author wrote in a Docs namespace, within size
+/// and count bounds. Other authors' entries under the same keys are ignored.
+#[cfg(feature = "docs")]
+#[derive(Clone)]
+pub struct RootAuthoredReader(RootAuthoredDocView);
+
+#[cfg(feature = "docs")]
+impl RootAuthoredReader {
+    pub fn new(
+        namespace: [u8; 32],
+        root: [u8; 32],
+        max_record_bytes: u64,
+        max_records: usize,
+    ) -> Self {
+        Self(RootAuthoredDocView::new(
+            namespace,
+            root,
+            max_record_bytes,
+            max_records,
+        ))
+    }
+
+    /// The root author's record at `key`: available, pending download, or
+    /// absent.
+    pub async fn read_exact(
+        &self,
+        doc: &crate::docs::Doc,
+        key: Vec<u8>,
+    ) -> Result<RootRecordRead, RootRecordError> {
+        self.0.read_exact(&doc.enrollment_core(), key).await
+    }
 }
 
 /// Cloneable facade over shared opt-in enrollment state.

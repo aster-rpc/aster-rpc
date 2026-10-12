@@ -21,7 +21,6 @@ use crate::{
 use aster::audit_outbox::{AuditEvent, AuditOutbox};
 use aster::enrollment::{AdmissionError, EnrollmentRevoked};
 use aster::rpc::{Call, RpcStatus, ServiceDispatch, StatusCode, async_trait};
-use aster_transport_core::CoreDoc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -189,7 +188,7 @@ pub trait GrantProvider: Send + Sync {
 }
 pub struct DocsGrantProvider {
     pub store: Arc<ExecGrantStore>,
-    pub document: CoreDoc,
+    pub document: aster::Doc,
 }
 #[async_trait]
 impl GrantProvider for DocsGrantProvider {

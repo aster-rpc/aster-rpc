@@ -1,8 +1,8 @@
 //! Exec grants from exact-root Docs records, with local denial watermarks.
 
-use aster_transport_core::CoreDoc;
-use aster_transport_core::enrollment::{
-    RootAuthoredDocView, RootRecordRead, RootRevisionError, check_root_revision,
+use aster::Doc;
+use aster::enrollment::{
+    RootAuthoredReader, RootRecordRead, RootRevisionError, check_root_revision,
     should_record_rejection, validate_root_record_json,
 };
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
@@ -142,7 +142,7 @@ fn key_text(caller: &[u8; 32], target: &[u8; 32]) -> String {
 /// read-modify-write of a stored grant runs under `apply`.
 pub struct ExecGrantStore {
     database: redb::Database,
-    reader: RootAuthoredDocView,
+    reader: RootAuthoredReader,
     context: Context,
     authenticated: Mutex<BTreeSet<String>>,
     apply: Mutex<()>,
@@ -203,7 +203,7 @@ impl ExecGrantStore {
         write.commit().map_err(storage)?;
         Ok(Self {
             database,
-            reader: RootAuthoredDocView::new(namespace, root, MAX_GRANT_BYTES as u64, 4096),
+            reader: RootAuthoredReader::new(namespace, root, MAX_GRANT_BYTES as u64, 4096),
             context,
             authenticated: Mutex::new(BTreeSet::new()),
             apply: Mutex::new(()),
@@ -346,7 +346,7 @@ impl ExecGrantStore {
     /// Read and apply the exact-root leaf for one caller and target.
     pub async fn refresh_one(
         &self,
-        doc: &CoreDoc,
+        doc: &Doc,
         caller: &[u8; 32],
         target: &[u8; 32],
     ) -> Result<(), GrantError> {
@@ -357,7 +357,7 @@ impl ExecGrantStore {
     /// Read the exact-root leaf from the local Docs replica. Changes nothing.
     pub async fn read_leaf(
         &self,
-        doc: &CoreDoc,
+        doc: &Doc,
         caller: &[u8; 32],
         target: &[u8; 32],
     ) -> Result<RootRecordRead, GrantError> {

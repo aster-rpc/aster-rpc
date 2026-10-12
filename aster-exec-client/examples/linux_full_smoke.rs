@@ -367,7 +367,7 @@ mod linux {
             "exec-full-smoke".into(),
         )?;
         local_store
-            .refresh_one(document.as_core(), &bytes(&caller_id), &bytes(&api_id))
+            .refresh_one(&document, &bytes(&caller_id), &bytes(&api_id))
             .await?;
         assert_eq!(
             local_store

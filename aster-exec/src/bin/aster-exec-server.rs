@@ -211,7 +211,7 @@ mod linux {
                     namespace,
                     config.audience,
                 )?),
-                document: document.as_core().clone(),
+                document,
             }),
             audit.clone(),
             Arc::new(LinuxRuntime {
