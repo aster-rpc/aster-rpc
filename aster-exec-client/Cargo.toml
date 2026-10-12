@@ -1,0 +1,20 @@
+[package]
+name = "aster-exec-client"
+version = "0.3.0"
+edition = "2024"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+aster = { path = "../aster", default-features = false }
+aster-exec = { path = "../aster-exec" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+aster-exec = { path = "../aster-exec", features = ["service"] }
+async-trait = "0.1"
+tempfile = "3"

@@ -1,0 +1,36 @@
+[package]
+name = "aster-exec"
+version = "0.3.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Aster Exec job contract and supervised process runtime"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+default = []
+policy = ["dep:aster_transport_core"]
+service = ["policy", "dep:aster", "dep:async-trait"]
+
+[dependencies]
+blake3 = "1"
+hex = "0.4"
+redb = "=4.1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+aster_transport_core = { path = "../core", features = ["enrollment"], optional = true }
+aster = { path = "../aster", default-features = false, features = ["rpc", "audit-outbox", "enrollment", "docs"], optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "aster-exec-server"
+path = "src/bin/aster-exec-server.rs"
+required-features = ["service"]

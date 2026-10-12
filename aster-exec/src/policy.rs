@@ -1,0 +1,474 @@
+//! Exec grants from exact-root Docs records, with local denial watermarks.
+
+use aster_transport_core::CoreDoc;
+use aster_transport_core::enrollment::{
+    RootAuthoredDocView, RootRecordRead, RootRevisionError, check_root_revision,
+    should_record_rejection, validate_root_record_json,
+};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::path::Path;
+
+pub const EXEC_GRANT_PREFIX: &[u8] = b"aster/exec/v1/grants/";
+pub const MAX_GRANT_BYTES: usize = 64 * 1024;
+const GRANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("exec_grants_v1");
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("exec_grant_meta_v1");
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantStatusV1 {
+    Active,
+    Revoked,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecOperationV1 {
+    Discover,
+    Submit,
+    Status,
+    Output,
+    Watch,
+    Cancel,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecGrantV1 {
+    pub version: u32,
+    pub issuer: String,
+    pub audience: String,
+    pub caller: String,
+    pub target: String,
+    pub revision: u64,
+    pub issued_at: u64,
+    pub not_before: Option<u64>,
+    pub expires_at: Option<u64>,
+    pub status: GrantStatusV1,
+    pub account_alias: String,
+    pub profiles: Vec<String>,
+    pub operations: Vec<ExecOperationV1>,
+    pub cwd_roots: Vec<String>,
+    pub max_timeout_ms: u64,
+    pub max_output_bytes: u64,
+    pub cancel_on_revocation: bool,
+    pub reauthorizes_revision: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Stored {
+    grant: Option<ExecGrantV1>,
+    denial_watermark: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Context {
+    version: u32,
+    root: [u8; 32],
+    namespace: [u8; 32],
+    audience: String,
+}
+
+#[derive(Debug)]
+pub enum GrantError {
+    InvalidRecord,
+    WrongContext,
+    Stale,
+    Conflict,
+    ReauthorizationRequired,
+    PolicyUnavailable,
+    Denied,
+    Storage(String),
+}
+impl std::fmt::Display for GrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Exec grant: {self:?}")
+    }
+}
+impl std::error::Error for GrantError {}
+fn storage(error: impl std::fmt::Display) -> GrantError {
+    GrantError::Storage(error.to_string())
+}
+impl From<RootRevisionError> for GrantError {
+    fn from(value: RootRevisionError) -> Self {
+        match value {
+            RootRevisionError::Stale => Self::Stale,
+            RootRevisionError::Conflict => Self::Conflict,
+            RootRevisionError::ReauthorizationRequired => Self::ReauthorizationRequired,
+        }
+    }
+}
+
+fn identity(text: &str) -> Result<[u8; 32], GrantError> {
+    if text.len() != 64 || text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(GrantError::InvalidRecord);
+    }
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(text, &mut bytes).map_err(|_| GrantError::InvalidRecord)?;
+    Ok(bytes)
+}
+
+pub fn grant_key(caller: &[u8; 32], target: &[u8; 32]) -> Vec<u8> {
+    let mut pair = [0u8; 64];
+    pair[..32].copy_from_slice(caller);
+    pair[32..].copy_from_slice(target);
+    let mut key = EXEC_GRANT_PREFIX.to_vec();
+    key.extend_from_slice(blake3::hash(&pair).to_hex().as_bytes());
+    key
+}
+
+fn key_text(caller: &[u8; 32], target: &[u8; 32]) -> String {
+    String::from_utf8(grant_key(caller, target)).expect("grant key is ASCII")
+}
+
+pub struct ExecGrantStore {
+    database: redb::Database,
+    reader: RootAuthoredDocView,
+    context: Context,
+    authenticated: BTreeSet<String>,
+}
+
+impl ExecGrantStore {
+    pub fn open(
+        path: &Path,
+        root: [u8; 32],
+        namespace: [u8; 32],
+        audience: String,
+    ) -> Result<Self, GrantError> {
+        if audience.is_empty() {
+            return Err(GrantError::WrongContext);
+        }
+        fs::create_dir_all(path.parent().ok_or(GrantError::WrongContext)?).map_err(storage)?;
+        if !path.exists() {
+            let mut options = OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(path).map_err(storage)?;
+        }
+        let database = redb::Database::create(path).map_err(storage)?;
+        let context = Context {
+            version: 1,
+            root,
+            namespace,
+            audience,
+        };
+        let write = database.begin_write().map_err(storage)?;
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let existing_context = meta
+            .get("context")
+            .map_err(storage)?
+            .map(|value| value.value().to_vec());
+        match existing_context {
+            Some(existing) => {
+                let saved: Context = serde_json::from_slice(&existing).map_err(storage)?;
+                if saved.version != context.version
+                    || saved.root != context.root
+                    || saved.namespace != context.namespace
+                    || saved.audience != context.audience
+                {
+                    return Err(GrantError::WrongContext);
+                }
+            }
+            None => {
+                let bytes = serde_json::to_vec(&context).map_err(storage)?;
+                meta.insert("context", bytes.as_slice()).map_err(storage)?;
+            }
+        }
+        drop(meta);
+        write.open_table(GRANTS).map_err(storage)?;
+        write.commit().map_err(storage)?;
+        Ok(Self {
+            database,
+            reader: RootAuthoredDocView::new(namespace, root, MAX_GRANT_BYTES as u64, 4096),
+            context,
+            authenticated: BTreeSet::new(),
+        })
+    }
+
+    fn read_stored(&self, key: &str) -> Result<Stored, GrantError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(GRANTS).map_err(storage)?;
+        match table.get(key).map_err(storage)? {
+            Some(value) => serde_json::from_slice(value.value()).map_err(storage),
+            None => Ok(Stored {
+                grant: None,
+                denial_watermark: None,
+            }),
+        }
+    }
+
+    fn write_stored(&self, key: &str, stored: &Stored) -> Result<(), GrantError> {
+        let bytes = serde_json::to_vec(stored).map_err(storage)?;
+        let mut write = self.database.begin_write().map_err(storage)?;
+        write
+            .set_durability(redb::Durability::Immediate)
+            .map_err(storage)?;
+        write
+            .open_table(GRANTS)
+            .map_err(storage)?
+            .insert(key, bytes.as_slice())
+            .map_err(storage)?;
+        write.commit().map_err(storage)
+    }
+
+    fn validate(&self, key: &[u8], grant: &ExecGrantV1) -> Result<(), GrantError> {
+        let caller = identity(&grant.caller)?;
+        let target = identity(&grant.target)?;
+        if key != grant_key(&caller, &target)
+            || grant.version != 1
+            || identity(&grant.issuer)? != self.context.root
+            || grant.audience != self.context.audience
+            || grant.revision == 0
+            || grant.issued_at > grant.expires_at.unwrap_or(u64::MAX)
+            || grant
+                .not_before
+                .is_some_and(|nbf| grant.expires_at.is_some_and(|exp| nbf >= exp))
+            || grant.account_alias.is_empty()
+            || grant.account_alias.len() > 64
+            || !grant
+                .account_alias
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || grant.profiles.is_empty()
+            || grant.operations.is_empty()
+            || grant.cwd_roots.is_empty()
+            || grant.profiles.len() > 32
+            || grant.operations.len() > 6
+            || grant.cwd_roots.len() > 32
+            // First qualified backend always cancels on authority loss.
+            // Reject an unsupported weaker policy rather than silently ignore it.
+            || !grant.cancel_on_revocation
+            || grant.max_timeout_ms == 0
+            || grant.max_output_bytes == 0
+        {
+            return Err(GrantError::InvalidRecord);
+        }
+        if serde_json::to_vec(grant).map_err(storage)?.len() > MAX_GRANT_BYTES {
+            return Err(GrantError::InvalidRecord);
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self, key: String, grant: ExecGrantV1) -> Result<(), GrantError> {
+        self.validate(key.as_bytes(), &grant)?;
+        let mut stored = self.read_stored(&key)?;
+        let old = stored.grant.as_ref();
+        let old_needs_reauthorization = old.is_some_and(|old| {
+            grant.status == GrantStatusV1::Active
+                && (old.status != GrantStatusV1::Active
+                    || old.expires_at.is_some_and(|exp| grant.issued_at >= exp))
+        });
+        let required_predecessor = if grant.status == GrantStatusV1::Active {
+            old_needs_reauthorization
+                .then(|| old.unwrap().revision)
+                .or(stored.denial_watermark)
+        } else {
+            None
+        };
+        let changed = check_root_revision(
+            old.map(|old| old.revision),
+            stored.denial_watermark,
+            grant.revision,
+            old == Some(&grant),
+            required_predecessor,
+            grant.reauthorizes_revision,
+        )?;
+        if changed {
+            stored.grant = Some(grant);
+            stored.denial_watermark = None;
+            self.write_stored(&key, &stored)?;
+        }
+        self.authenticated.insert(key);
+        Ok(())
+    }
+
+    fn observe_invalid_binding(&mut self, key: &str, bytes: &[u8]) -> Result<(), GrantError> {
+        #[derive(Deserialize)]
+        struct Binding {
+            issuer: String,
+            audience: String,
+            caller: String,
+            target: String,
+            revision: u64,
+        }
+        let Ok(binding) = serde_json::from_slice::<Binding>(bytes) else {
+            return Ok(());
+        };
+        if identity(&binding.issuer).ok() != Some(self.context.root)
+            || binding.audience != self.context.audience
+            || identity(&binding.caller)
+                .ok()
+                .zip(identity(&binding.target).ok())
+                .is_none_or(|(caller, target)| key.as_bytes() != grant_key(&caller, &target))
+        {
+            return Ok(());
+        }
+        let mut stored = self.read_stored(key)?;
+        if should_record_rejection(
+            stored.grant.as_ref().map(|g| g.revision),
+            stored.denial_watermark,
+            binding.revision,
+        ) {
+            stored.denial_watermark = Some(binding.revision);
+            self.write_stored(key, &stored)?;
+        }
+        Ok(())
+    }
+
+    pub async fn refresh_one(
+        &mut self,
+        doc: &CoreDoc,
+        caller: &[u8; 32],
+        target: &[u8; 32],
+    ) -> Result<(), GrantError> {
+        let key = key_text(caller, target);
+        // Every background refresh reauthenticates the exact-root leaf.
+        // A missing, pending, unreadable, or invalid leaf cannot renew an
+        // earlier positive authorization snapshot in this process.
+        self.authenticated.remove(&key);
+        let read = self
+            .reader
+            .read_exact(doc, key.as_bytes().to_vec())
+            .await
+            .map_err(storage)?;
+        match read {
+            RootRecordRead::Available(bytes) => {
+                if validate_root_record_json(&bytes).is_err() {
+                    self.observe_invalid_binding(&key, &bytes)?;
+                    return Err(GrantError::InvalidRecord);
+                }
+                let grant: ExecGrantV1 = match serde_json::from_slice(&bytes) {
+                    Ok(grant) => grant,
+                    Err(_) => {
+                        self.observe_invalid_binding(&key, &bytes)?;
+                        return Err(GrantError::InvalidRecord);
+                    }
+                };
+                if let Err(error) = self.observe(key.clone(), grant) {
+                    self.observe_invalid_binding(&key, &bytes)?;
+                    return Err(error);
+                }
+            }
+            RootRecordRead::Pending | RootRecordRead::Absent => {}
+        }
+        Ok(())
+    }
+
+    /// Positive authority is usable only after a fresh exact-root local Docs
+    /// read in this process. Persisted denial barriers apply immediately.
+    pub fn grant_for(
+        &self,
+        caller: &[u8; 32],
+        target: &[u8; 32],
+        now: u64,
+    ) -> Result<ExecGrantV1, GrantError> {
+        let key = key_text(caller, target);
+        let stored = self.read_stored(&key)?;
+        if stored.denial_watermark.is_some() {
+            return Err(GrantError::PolicyUnavailable);
+        }
+        if !self.authenticated.contains(&key) {
+            return Err(GrantError::PolicyUnavailable);
+        }
+        let grant = stored.grant.ok_or(GrantError::Denied)?;
+        if grant.status != GrantStatusV1::Active
+            || grant.issued_at > now
+            || grant.not_before.is_some_and(|nbf| now < nbf)
+            || grant.expires_at.is_some_and(|exp| now >= exp)
+        {
+            return Err(GrantError::Denied);
+        }
+        Ok(grant)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(
+        root: [u8; 32],
+        caller: [u8; 32],
+        target: [u8; 32],
+        revision: u64,
+        status: GrantStatusV1,
+    ) -> ExecGrantV1 {
+        ExecGrantV1 {
+            version: 1,
+            issuer: hex::encode(root),
+            audience: "fleet".into(),
+            caller: hex::encode(caller),
+            target: hex::encode(target),
+            revision,
+            issued_at: revision,
+            not_before: None,
+            expires_at: None,
+            status,
+            account_alias: "builder".into(),
+            profiles: vec!["open".into()],
+            operations: vec![ExecOperationV1::Submit],
+            cwd_roots: vec!["/srv/build".into()],
+            max_timeout_ms: 1000,
+            max_output_bytes: 4096,
+            cancel_on_revocation: true,
+            reauthorizes_revision: None,
+        }
+    }
+
+    #[test]
+    fn denied_grant_requires_exact_newer_root_reauthorization() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("grants.redb");
+        let (root, namespace, caller, target) = ([1; 32], [4; 32], [2; 32], [3; 32]);
+        let key = key_text(&caller, &target);
+        let mut store = ExecGrantStore::open(&path, root, namespace, "fleet".into()).unwrap();
+        let mut unsupported = grant(root, caller, target, 1, GrantStatusV1::Active);
+        unsupported.cancel_on_revocation = false;
+        assert!(matches!(
+            store.validate(key.as_bytes(), &unsupported),
+            Err(GrantError::InvalidRecord)
+        ));
+        store
+            .observe(
+                key.clone(),
+                grant(root, caller, target, 1, GrantStatusV1::Active),
+            )
+            .unwrap();
+        assert!(store.grant_for(&caller, &target, 2).is_ok());
+        let revoked = grant(root, caller, target, 2, GrantStatusV1::Revoked);
+        store.observe(key.clone(), revoked).unwrap();
+        assert!(matches!(
+            store.grant_for(&caller, &target, 2),
+            Err(GrantError::Denied)
+        ));
+        let active = grant(root, caller, target, 3, GrantStatusV1::Active);
+        assert!(matches!(
+            store.observe(key.clone(), active.clone()),
+            Err(GrantError::ReauthorizationRequired)
+        ));
+        store
+            .observe_invalid_binding(&key, &serde_json::to_vec(&active).unwrap())
+            .unwrap();
+        assert!(matches!(
+            store.grant_for(&caller, &target, 3),
+            Err(GrantError::PolicyUnavailable)
+        ));
+        let mut active = grant(root, caller, target, 4, GrantStatusV1::Active);
+        active.reauthorizes_revision = Some(2);
+        store.observe(key.clone(), active).unwrap();
+        drop(store);
+        let reopened = ExecGrantStore::open(&path, root, namespace, "fleet".into()).unwrap();
+        assert!(matches!(
+            reopened.grant_for(&caller, &target, 4),
+            Err(GrantError::PolicyUnavailable)
+        ));
+    }
+}

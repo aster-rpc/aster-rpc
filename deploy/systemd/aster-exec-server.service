@@ -1,0 +1,34 @@
+[Unit]
+Description=Aster Exec authenticated RPC service
+After=network-online.target aster-exec-helper.service
+Wants=network-online.target
+Requires=aster-exec-helper.service
+
+[Service]
+Type=simple
+User=aster-exec-api
+Group=aster-exec-api
+ExecStart=/usr/local/libexec/aster-exec-server /etc/aster-exec/server.json
+StateDirectory=aster-exec-api
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

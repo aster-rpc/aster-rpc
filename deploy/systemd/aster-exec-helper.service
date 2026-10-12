@@ -1,0 +1,41 @@
+[Unit]
+Description=Aster Exec fixed privileged supervisor launcher
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/libexec/aster-exec-helper /etc/aster-exec/helper.json
+RuntimeDirectory=aster-exec
+RuntimeDirectoryMode=0755
+StateDirectory=aster-exec-helper
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=3
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/aster-exec /var/lib/aster-exec-helper
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+PrivateNetwork=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=256M
+TasksMax=64
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target
