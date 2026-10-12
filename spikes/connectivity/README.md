@@ -1,6 +1,6 @@
 # Connectivity spike: does a Fly.io edge get a *direct* Aster connection home?
 
-Settles the open question in `docs/_internal/working_ideas/aster-expose-portal-webrtc.md` §11:
+Settles the open question in `docs/_internal/portal-webrtc-edge-handoff.md` §11:
 Cloudflare Containers can't do outbound UDP, so iroh there is **relay-only**. Fly.io
 is UDP-native — this spike measures whether a Fly container hole-punches a **Direct**
 path to a home-NAT node, and how much faster direct is than relay.

@@ -48,4 +48,4 @@ SHA-256 provenance:
 Generated serializer logic comes from Apache Fory 1.7.6 (Apache License 2.0).
 This fixture preserves evidence; production must be corrected in the generator,
 not by copying this serializer into the SDK. See the
-[investigation](../../../docs/_internal/dotnet_concurrent_rpc_investigation.md).
+[investigation](../../../docs/_internal/_archive/dotnet_concurrent_rpc_investigation.md).
