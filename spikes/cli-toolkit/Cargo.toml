@@ -1,0 +1,37 @@
+[package]
+name = "aster-cli-toolkit-spike"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+description = "Throwaway spike for selecting the Rust CLI toolkit; see README.md"
+
+# Standalone: not a member of the repository workspace.
+[workspace]
+
+[[bin]]
+name = "aster-spike"
+path = "src/main.rs"
+
+# Minimal-surface stack: every dependency here is justified in
+# docs/_internal/working_ideas/aster-cli-rust.md. Default features are off
+# wherever they pull in more than the CLI uses.
+[dependencies]
+anyhow = "1"
+anstyle = "1"
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "env"] }
+clap_complete = "4.6"
+rustyline = { version = "18", default-features = false, features = ["with-file-history"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shlex = "1"
+toml = "0.8"
+unicode-width = "0.2"
+keyring-core = "1"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { version = "1", default-features = false }

@@ -1,0 +1,29 @@
+[package]
+name = "aster-keystore"
+version = "0.3.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Where Aster operator tools keep profile root private keys: the OS credential store, or an owner-only file."
+license = "MIT OR Apache-2.0"
+repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
+publish = ["aster"]
+
+# Dependency policy: docs/_internal/working_ideas/aster-cli-rust.md. keyring-
+# core with explicit native stores (not the keyring facade crate); no Secret
+# Service client on Linux, which uses the file store.
+[dependencies]
+anyhow = { workspace = true }
+aster-config = { path = "../aster-config" }
+# Versions follow the Aster facade's pins.
+ed25519-dalek = "=3.0.0-rc.0"
+getrandom = "0.2"
+zeroize = "1"
+
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+keyring-core = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { version = "1", default-features = false }

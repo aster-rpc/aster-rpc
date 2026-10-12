@@ -319,8 +319,13 @@ fn is_reserved_namespace(value: &str) -> bool {
 /// macro-expansion time via the expanding crate's package name (covers the
 /// crate's own tests/examples too, which share `CARGO_PKG_NAME=aster`).
 fn expanding_inside_aster() -> bool {
-    std::env::var("CARGO_PKG_NAME").is_ok_and(|p| p == "aster")
+    std::env::var("CARGO_PKG_NAME").is_ok_and(|p| FIRST_PARTY.contains(&p.as_str()))
 }
+
+/// Crates that may use the reserved namespace: the framework itself, and the
+/// client of the @aster directory service, whose Python server (`aster-app`)
+/// declares its types as `aster/<Type>`.
+const FIRST_PARTY: &[&str] = &["aster", "aster-directory-client"];
 
 struct FieldInfo {
     optional: bool,

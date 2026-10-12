@@ -1,0 +1,15 @@
+[package]
+name = "aster-config"
+version = "0.3.0"
+edition = "2024"
+rust-version.workspace = true
+description = "The shared Aster operator configuration (`~/.aster/config.toml`): profiles and @aster service settings, for every Aster tool."
+license = "MIT OR Apache-2.0"
+repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
+publish = ["aster"]
+
+# Deliberately tiny: any Aster tool can depend on it without a CLI stack.
+[dependencies]
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
