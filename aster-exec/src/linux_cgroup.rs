@@ -17,7 +17,6 @@ pub struct PayloadIdentity {
 
 pub struct DelegatedJobCgroup {
     root: PathBuf,
-    supervisor: PathBuf,
     payload: PathBuf,
     initial_oom_kill: u64,
     file_bytes: Option<u64>,
@@ -113,7 +112,6 @@ impl DelegatedJobCgroup {
         let initial_oom_kill = metric(&payload.join("memory.events.local"), "oom_kill")?;
         Ok(Self {
             root,
-            supervisor,
             payload,
             initial_oom_kill,
             file_bytes: limits.file_bytes,
@@ -246,16 +244,6 @@ impl DelegatedJobCgroup {
             .file_name()
             .is_some_and(|name| crate::systemd_unit::matches_unit(name, job_id))
     }
-
-    pub fn unit_root(&self) -> &Path {
-        &self.root
-    }
-    pub fn supervisor_leaf(&self) -> &Path {
-        &self.supervisor
-    }
-    pub fn payload_leaf(&self) -> &Path {
-        &self.payload
-    }
 }
 
 #[cfg(test)]
@@ -279,7 +267,6 @@ mod tests {
         fs::write(temp.path().join("cgroup.procs"), "").unwrap();
         let cgroup = DelegatedJobCgroup {
             root: temp.path().into(),
-            supervisor: temp.path().into(),
             payload: temp.path().into(),
             initial_oom_kill: 0,
             file_bytes: None,

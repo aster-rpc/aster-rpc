@@ -792,7 +792,15 @@ impl ExecService {
         let event = AuditEvent {
             timestamp_ms: now,
             kind: "exec.intent.v1".into(),
-            payload: serde_json::json!({"caller":caller,"target":request.target_id,"request_id":request.request_id,"job_id":job_id,"request_digest":hex::encode(digest),"grant_revision":grant.revision,"profile":authorized.profile}),
+            payload: serde_json::json!({
+                "caller": caller,
+                "target": request.target_id,
+                "request_id": request.request_id,
+                "job_id": job_id,
+                "request_digest": hex::encode(digest),
+                "grant_revision": grant.revision,
+                "profile": authorized.profile,
+            }),
         };
         if let Err(mut failure) = self.audit.admit(event).await {
             failure.request_id = Some(request.request_id.clone());
@@ -1249,7 +1257,16 @@ impl ExecService {
                 if req.grace_ms.is_some_and(|v| v > MAX_CANCEL_GRACE_MS) {
                     return Err(ExecErrorV1::invalid("invalid cancellation grace"));
                 }
-                self.audit.admit(AuditEvent{timestamp_ms:now_ms(),kind:"exec.cancel.intent.v1".into(),payload:serde_json::json!({"caller":caller,"job_id":req.job.job_id,"target":req.job.target_id})}).await?;
+                let intent = AuditEvent {
+                    timestamp_ms: now_ms(),
+                    kind: "exec.cancel.intent.v1".into(),
+                    payload: serde_json::json!({
+                        "caller": caller,
+                        "job_id": req.job.job_id,
+                        "target": req.job.target_id,
+                    }),
+                };
+                self.audit.admit(intent).await?;
                 encode(self.runtime.cancel(&req).await?)
             }
             _ => Err(error(
