@@ -217,7 +217,7 @@ async fn stale_and_reauthorization_errors_do_not_hide_later_revocations() {
     );
     assert_eq!(
         s.select_evidence(&subject(denied), None, NOW).unwrap_err(),
-        RecordError::Denied(DenialReason::PolicyStateUnavailable)
+        RecordError::Denied(DenialReason::RegistrationRejected)
     );
     node.close().await;
 }
@@ -310,6 +310,19 @@ async fn bulk_persistence_failure_publishes_no_partial_state_and_fails_closed() 
         RecordError::Denied(DenialReason::PolicyStateUnavailable)
     );
     assert_eq!(std::fs::read(dir.0.join("policy.json")).unwrap(), original);
+
+    // Once storage is writable again, the next full refresh re-derives every
+    // record, commits it, and lifts the fail-closed state.
+    let restored = dir.0.with_extension("");
+    std::fs::rename(&dir.0, &restored).unwrap();
+    dir.0 = restored;
+    s.refresh(&doc).await.unwrap();
+    assert_eq!(
+        s.select_evidence(&subject(8), None, NOW).unwrap_err(),
+        RecordError::Denied(DenialReason::NodeRevoked)
+    );
+    assert!(s.select_evidence(&subject(9), None, NOW).is_ok());
+    assert_ne!(std::fs::read(dir.0.join("policy.json")).unwrap(), original);
     node.close().await;
 }
 
@@ -416,7 +429,7 @@ async fn unsupported_newer_policy_blocks_cached_grants_across_restart_and_old_re
     );
     assert_eq!(
         s.select_evidence(&subject(8), None, NOW).unwrap_err(),
-        RecordError::Denied(DenialReason::PolicyStateUnavailable)
+        RecordError::Denied(DenialReason::RegistrationRejected)
     );
     let policy = PolicyExpressionV1::Predicate(PolicyPredicate::TolerateStalePolicy);
     assert_eq!(
@@ -429,13 +442,13 @@ async fn unsupported_newer_policy_blocks_cached_grants_across_restart_and_old_re
             || NOW
         )
         .await,
-        AdmissionDecision::Deny(DenialReason::PolicyStateUnavailable)
+        AdmissionDecision::Deny(DenialReason::RegistrationRejected)
     );
     drop(s);
     let s = store(&dir, &doc);
     assert_eq!(
         s.denial(&cached, NOW),
-        Some(DenialReason::PolicyStateUnavailable)
+        Some(DenialReason::RegistrationRejected)
     );
     for revision in [1, 2] {
         write(
@@ -449,7 +462,7 @@ async fn unsupported_newer_policy_blocks_cached_grants_across_restart_and_old_re
         );
         assert_eq!(
             s.denial(&cached, NOW),
-            Some(DenialReason::PolicyStateUnavailable)
+            Some(DenialReason::RegistrationRejected)
         );
     }
     write(
@@ -483,7 +496,7 @@ async fn individual_conflicting_revision_blocks_old_grant_until_higher_root_stat
     );
     assert_eq!(
         s.denial(&cached, NOW),
-        Some(DenialReason::PolicyStateUnavailable)
+        Some(DenialReason::RegistrationRejected)
     );
     write(
         &doc,

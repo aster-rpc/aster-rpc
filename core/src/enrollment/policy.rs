@@ -286,6 +286,11 @@ impl PolicyPredicate {
 pub enum DenialReason {
     NodeRevoked,
     RegistrationSuperseded,
+    /// A newer root registration for this peer could not be applied (an
+    /// unsupported restriction or a conflicting revision). The peer stays
+    /// denied until the root publishes a higher revision.
+    RegistrationRejected,
+    /// Local policy state could not be read or persisted.
     PolicyStateUnavailable,
     CredentialRevoked,
     InvalidValidity,
@@ -294,6 +299,25 @@ pub enum DenialReason {
     PolicyError(PolicyError),
     PolicyTimeout,
     Consumer(String),
+}
+
+impl DenialReason {
+    /// Definite denials come from root policy, signed validity or an explicit
+    /// policy decision, and justify revoking an admitted session. The others
+    /// mean policy could not be evaluated now: deny the operation, keep the
+    /// session, and retry.
+    pub fn is_definite(&self) -> bool {
+        matches!(
+            self,
+            Self::NodeRevoked
+                | Self::RegistrationSuperseded
+                | Self::RegistrationRejected
+                | Self::CredentialRevoked
+                | Self::InvalidValidity
+                | Self::PolicyDidNotMatch
+                | Self::Consumer(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

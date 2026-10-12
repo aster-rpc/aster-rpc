@@ -146,7 +146,7 @@ impl EnrollmentPolicyStore {
         std::fs::create_dir_all(parent).map_err(storage)?;
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
-        let lock = private_open(Path::new(&lock_path), false)?;
+        let lock = private_open(Path::new(&lock_path))?;
         lock.try_lock().map_err(storage)?;
         let policy = match File::open(&path) {
             Ok(file) => {
@@ -376,9 +376,13 @@ impl EnrollmentPolicyStore {
             }
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Self::check_state(&state)?;
+        // Every leaf has just been re-read, so durably committing this scan
+        // recovers from an earlier failed write. A single-record observation
+        // cannot, because it does not re-derive the lost transition.
+        let recovering = state.failed;
         let mut next = state.clone();
-        let mut changed = false;
+        next.failed = false;
+        let mut changed = recovering;
         let mut capacity_failure = false;
         for (key, record) in records {
             let watermark = match &record {
@@ -728,7 +732,7 @@ impl EnrollmentPolicyStore {
             return Err(RecordError::Denied(DenialReason::PolicyStateUnavailable));
         }
         if state.policy.rejected_nodes.contains_key(&hex::encode(peer)) {
-            return Err(RecordError::Denied(DenialReason::PolicyStateUnavailable));
+            return Err(RecordError::Denied(DenialReason::RegistrationRejected));
         }
         let selected = if let Some(record) = state.policy.nodes.get(&hex::encode(peer)) {
             if record.status != NodeRegistrationStatus::Active {
@@ -828,7 +832,7 @@ impl AdmissionGuard for EnrollmentPolicyStore {
             .rejected_nodes
             .contains_key(&hex::encode(evidence.subject()))
         {
-            return Some(DenialReason::PolicyStateUnavailable);
+            return Some(DenialReason::RegistrationRejected);
         }
         if let Some(node) = state.policy.nodes.get(&hex::encode(evidence.subject())) {
             if node.status != NodeRegistrationStatus::Active {
@@ -877,13 +881,9 @@ impl AdmissionGuard for EnrollmentPolicyStore {
 fn identity(value: &str) -> Result<[u8; 32], RecordError> {
     super::canonical_identity(value).map_err(|_| RecordError::InvalidRecord)
 }
-fn private_open(path: &Path, truncate: bool) -> Result<File, RecordError> {
+fn private_open(path: &Path) -> Result<File, RecordError> {
     let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(truncate);
+    options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

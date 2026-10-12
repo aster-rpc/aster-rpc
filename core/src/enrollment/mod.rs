@@ -46,7 +46,8 @@ mod jwt;
 mod policy;
 
 pub use bootstrap::{
-    EnrollmentOptions, EnrollmentReadiness, EnrollmentRevoked, EnrollmentService, ENROLLMENT_ALPN,
+    AdmissionError, EnrollmentOptions, EnrollmentReadiness, EnrollmentRevoked, EnrollmentService,
+    ENROLLMENT_ALPN,
 };
 mod records;
 mod root_records;

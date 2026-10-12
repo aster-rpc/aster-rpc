@@ -5,25 +5,28 @@
 //! admission. Configured replica addresses are discovery hints, never trust.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, ensure, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Semaphore, SemaphorePermit};
+use tokio::sync::{broadcast, oneshot, Semaphore, SemaphorePermit};
+use tokio::task::AbortHandle;
 
 use super::{
     admit, AdmissionContext, AdmissionDecision, AdmissionEvidenceSource, AdmissionPolicy,
-    EnrollmentPolicyStore, JwtEnrollmentVerifier, ObservedSourceAddress, PolicySynchronization,
-    SourceAddressProvenance, SynchronizationSource, VerifiedAdmissionEvidence, MAX_JWT_BYTES,
+    DenialReason, EnrollmentPolicyStore, JwtEnrollmentVerifier, ObservedSourceAddress,
+    PolicySynchronization, RecordAvailability, RecordError, SourceAddressProvenance,
+    SynchronizationSource, VerifiedAdmissionEvidence, MAX_JWT_BYTES,
 };
 use crate::{
-    CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreNode, CoreNodeAddr, CoreRecvStream,
-    CoreSendStream,
+    CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreHookHandshakeInfo, CoreHookReceiver,
+    CoreNode, CoreNodeAddr, CoreRecvStream, CoreSendStream,
 };
 
 pub const ENROLLMENT_ALPN: &[u8] = b"aster.enrollment/1";
@@ -48,6 +51,10 @@ pub struct EnrollmentOptions {
     pub max_handshakes_per_second: u32,
     pub max_handshakes_per_second_per_source: u32,
     pub max_admitted_peers: usize,
+    /// At `max_admitted_peers`, a new admission may evict the least recently
+    /// checked session idle at least this long. Eviction is not revocation:
+    /// the evicted peer re-enrolls on its next connection.
+    pub session_idle_eviction: Duration,
 }
 
 impl Default for EnrollmentOptions {
@@ -65,6 +72,7 @@ impl Default for EnrollmentOptions {
             max_handshakes_per_second: 32,
             max_handshakes_per_second_per_source: 128,
             max_admitted_peers: 1024,
+            session_idle_eviction: Duration::from_secs(300),
         }
     }
 }
@@ -80,12 +88,57 @@ pub struct EnrollmentReadiness {
     pub observed_source: Option<ObservedSourceAddress>,
 }
 
-/// Consumers receive this after local reconciliation denies a formerly
-/// admitted peer, and should cancel their own jobs/output access as required.
+/// Consumers receive this after a definite denial revokes a formerly admitted
+/// peer, and should cancel their own jobs/output access as required. A lagged
+/// receiver has missed revocations and must recheck every peer it relies on.
 #[derive(Clone, Debug)]
 pub struct EnrollmentRevoked {
     pub peer: [u8; 32],
+    pub reason: DenialReason,
 }
+
+/// Why a peer is not admitted right now. Only [`AdmissionError::Denied`]
+/// revokes a session; consumers should cancel work only on that variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdmissionError {
+    /// No admission session exists, for example after this process restarted
+    /// or an idle session was evicted. The peer must enroll again.
+    NotAdmitted,
+    /// Root policy, signed validity or the consumer policy denies the peer.
+    Denied(DenialReason),
+    /// Policy could not be evaluated now (local storage, pending content, a
+    /// timeout or a handler error). Any session is kept; retry later.
+    Unavailable(String),
+}
+
+impl AdmissionError {
+    fn from_reason(reason: DenialReason) -> Self {
+        if reason.is_definite() {
+            Self::Denied(reason)
+        } else {
+            Self::Unavailable(format!("{reason:?}"))
+        }
+    }
+
+    fn from_record(error: RecordError) -> Self {
+        match error {
+            RecordError::Denied(reason) => Self::from_reason(reason),
+            other => Self::Unavailable(other.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAdmitted => write!(f, "peer not admitted; enrollment handshake required"),
+            Self::Denied(reason) => write!(f, "enrollment denied: {reason:?}"),
+            Self::Unavailable(detail) => write!(f, "enrollment policy unavailable: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
 
 #[derive(Clone)]
 struct Session {
@@ -93,6 +146,35 @@ struct Session {
     evidence: VerifiedAdmissionEvidence,
     connections: Vec<CoreConnection>,
     observed_source: Option<ObservedSourceAddress>,
+    last_used: Instant,
+}
+
+/// Recent definite revocations, so a peer whose session was revoked is still
+/// reported as denied rather than merely not admitted. Oldest entries drop
+/// first; a later successful admission clears the peer.
+#[derive(Default)]
+struct RevokedPeers {
+    order: VecDeque<[u8; 32]>,
+    reasons: BTreeMap<[u8; 32], DenialReason>,
+}
+
+impl RevokedPeers {
+    fn insert(&mut self, peer: [u8; 32], reason: DenialReason, capacity: usize) {
+        if self.reasons.insert(peer, reason).is_none() {
+            self.order.push_back(peer);
+        }
+        while self.order.len() > capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.reasons.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, peer: &[u8; 32]) {
+        if self.reasons.remove(peer).is_some() {
+            self.order.retain(|known| known != peer);
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,6 +246,7 @@ fn decrement_count<K: Ord>(counts: &mut BTreeMap<K, usize>, key: &K) {
 
 /// Shared core implementation; the facade delegates to this type.
 pub struct EnrollmentService {
+    this: Weak<Self>,
     node: CoreNode,
     store: Arc<EnrollmentPolicyStore>,
     verifier: JwtEnrollmentVerifier,
@@ -171,8 +254,10 @@ pub struct EnrollmentService {
     policy: Arc<dyn AdmissionPolicy>,
     options: EnrollmentOptions,
     document: RwLock<Option<CoreDoc>>,
+    policy_watch: Mutex<Option<AbortHandle>>,
     context: RwLock<AdmissionContext>,
     sessions: Mutex<BTreeMap<[u8; 32], Session>>,
+    revoked_peers: Mutex<RevokedPeers>,
     inbound_permits: Semaphore,
     outbound_permits: Semaphore,
     gate_permits: Arc<Semaphore>,
@@ -180,6 +265,19 @@ pub struct EnrollmentService {
     rate: Mutex<RateState>,
     next_generation: AtomicU64,
     revoked: broadcast::Sender<EnrollmentRevoked>,
+}
+
+impl Drop for EnrollmentService {
+    fn drop(&mut self) {
+        if let Some(watch) = self
+            .policy_watch
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            watch.abort();
+        }
+    }
 }
 
 impl EnrollmentService {
@@ -206,7 +304,8 @@ impl EnrollmentService {
                 && !options.first_message_timeout.is_zero()
                 && !options.handshake_timeout.is_zero()
                 && !options.policy_timeout.is_zero()
-                && !options.reconciliation_interval.is_zero(),
+                && !options.reconciliation_interval.is_zero()
+                && !options.session_idle_eviction.is_zero(),
             "invalid enrollment bounds"
         );
         ensure!(
@@ -221,61 +320,11 @@ impl EnrollmentService {
         if let Some(token) = &credential {
             verifier.verify(token, &identity(&node.node_id())?, unix_now())?;
         }
-        let mut hooks = node
+        let hooks = node
             .take_hook_receiver()
             .ok_or_else(|| anyhow!("enrollment requires unused node hooks"))?;
-        let (revoked, _) = broadcast::channel(128);
-        let service = Arc::new(Self {
-            node,
-            store,
-            verifier,
-            credential,
-            policy,
-            inbound_permits: Semaphore::new(options.max_concurrent_handshakes),
-            outbound_permits: Semaphore::new(options.max_concurrent_handshakes),
-            gate_permits: Arc::new(Semaphore::new(options.max_concurrent_gate_checks)),
-            handshake_counts: Mutex::new(HandshakeCounts::default()),
-            options,
-            document: RwLock::new(None),
-            context: RwLock::new(AdmissionContext::default()),
-            sessions: Mutex::new(BTreeMap::new()),
-            rate: Mutex::new(RateState {
-                started: Instant::now(),
-                peers: BTreeMap::new(),
-                sources: BTreeMap::new(),
-            }),
-            next_generation: AtomicU64::new(1),
-            revoked,
-        });
-        let weak = Arc::downgrade(&service);
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some((_, reply)) = hooks.before_connect_rx.recv() => {
-                        let _ = reply.send(true);
-                    }
-                    Some((info, reply)) = hooks.after_handshake_rx.recv() => {
-                        let Some(service) = weak.upgrade() else { break; };
-                        if info.alpn == ENROLLMENT_ALPN {
-                            let allowed = identity(&info.remote_endpoint_id).is_ok_and(|peer| service.take_rate_slot(peer, info.observed_peer_addr.map(|address| address.ip())));
-                            let _ = reply.send(hook_decision(allowed));
-                        } else if let Ok(peer) = identity(&info.remote_endpoint_id) {
-                            let permit = if service.has_session(&peer) { service.gate_permits.clone().try_acquire_owned().ok() } else { None };
-                            if let Some(permit) = permit {
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let source = info.observed_peer_addr.map(|address| ObservedSourceAddress {
-                                        address: address.ip(), provenance: SourceAddressProvenance::DirectPeer,
-                                    });
-                                    let _ = reply.send(hook_decision(service.check_peer_at_source(&peer, source).await.is_ok()));
-                                });
-                            } else { let _ = reply.send(hook_decision(false)); }
-                        } else { let _ = reply.send(hook_decision(false)); }
-                    }
-                    else => break,
-                }
-            }
-        });
+        let service = Self::new(node, store, verifier, credential, policy, options);
+        service.spawn_hook_loop(hooks);
         let weak = Arc::downgrade(&service);
         let interval = service.options.reconciliation_interval;
         tokio::spawn(async move {
@@ -291,18 +340,182 @@ impl EnrollmentService {
         Ok(service)
     }
 
+    fn new(
+        node: CoreNode,
+        store: Arc<EnrollmentPolicyStore>,
+        verifier: JwtEnrollmentVerifier,
+        credential: Option<String>,
+        policy: Arc<dyn AdmissionPolicy>,
+        options: EnrollmentOptions,
+    ) -> Arc<Self> {
+        // One reconciliation can revoke every admitted peer; size the channel
+        // so that does not lag a promptly polling consumer.
+        let (revoked, _) = broadcast::channel(options.max_admitted_peers.max(128));
+        Arc::new_cyclic(|this| Self {
+            this: this.clone(),
+            node,
+            store,
+            verifier,
+            credential,
+            policy,
+            inbound_permits: Semaphore::new(options.max_concurrent_handshakes),
+            outbound_permits: Semaphore::new(options.max_concurrent_handshakes),
+            gate_permits: Arc::new(Semaphore::new(options.max_concurrent_gate_checks)),
+            handshake_counts: Mutex::new(HandshakeCounts::default()),
+            options,
+            document: RwLock::new(None),
+            policy_watch: Mutex::new(None),
+            context: RwLock::new(AdmissionContext::default()),
+            sessions: Mutex::new(BTreeMap::new()),
+            revoked_peers: Mutex::new(RevokedPeers::default()),
+            rate: Mutex::new(RateState {
+                started: Instant::now(),
+                peers: BTreeMap::new(),
+                sources: BTreeMap::new(),
+            }),
+            next_generation: AtomicU64::new(1),
+            revoked,
+        })
+    }
+
+    fn spawn_hook_loop(&self, mut hooks: CoreHookReceiver) {
+        let weak = self.this.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some((_, reply)) = hooks.before_connect_rx.recv() => {
+                        let _ = reply.send(true);
+                    }
+                    Some((info, reply)) = hooks.after_handshake_rx.recv() => {
+                        let Some(service) = weak.upgrade() else {
+                            break;
+                        };
+                        service.after_handshake(info, reply);
+                    }
+                    else => break,
+                }
+            }
+        });
+    }
+
+    /// Enrollment connections are only rate limited. Every other ALPN needs an
+    /// admitted session whose policy still allows the observed source.
+    fn after_handshake(
+        self: Arc<Self>,
+        info: CoreHookHandshakeInfo,
+        reply: oneshot::Sender<CoreAfterHandshakeDecision>,
+    ) {
+        let Ok(peer) = identity(&info.remote_endpoint_id) else {
+            let _ = reply.send(hook_decision(false));
+            return;
+        };
+        let address = info.observed_peer_addr;
+        if info.alpn == ENROLLMENT_ALPN {
+            let allowed = self.take_rate_slot(peer, address.map(|address| address.ip()));
+            let _ = reply.send(hook_decision(allowed));
+            return;
+        }
+        let permit = if self.has_session(&peer) {
+            self.gate_permits.clone().try_acquire_owned().ok()
+        } else {
+            None
+        };
+        let Some(permit) = permit else {
+            let _ = reply.send(hook_decision(false));
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let source = address.map(|address| ObservedSourceAddress {
+                address: address.ip(),
+                provenance: SourceAddressProvenance::DirectPeer,
+            });
+            let allowed = self.check_peer_at_source(&peer, source).await.is_ok();
+            let _ = reply.send(hook_decision(allowed));
+        });
+    }
+
     pub fn revocations(&self) -> broadcast::Receiver<EnrollmentRevoked> {
         self.revoked.subscribe()
     }
 
     /// Attach the pinned policy namespace. It may be a read-only replica.
+    /// Live syncs with the root or an admitted replica keep policy freshness
+    /// current from then on.
     pub fn set_policy_document(&self, doc: CoreDoc) -> Result<()> {
         ensure!(
             namespace(&doc.doc_id())? == *self.store.namespace(),
             "wrong policy namespace"
         );
-        *self.document.write().unwrap_or_else(|e| e.into_inner()) = Some(doc);
+        *self.document.write().unwrap_or_else(|e| e.into_inner()) = Some(doc.clone());
+        let weak = self.this.clone();
+        let watch = tokio::spawn(async move {
+            use futures_lite::StreamExt;
+            let Ok(events) = doc.doc.subscribe().await else {
+                return;
+            };
+            futures_lite::pin!(events);
+            while let Some(Ok(event)) = events.next().await {
+                let iroh_docs::engine::LiveEvent::SyncFinished(sync) = event else {
+                    continue;
+                };
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                if sync.result.is_ok() {
+                    service
+                        .observe_policy_sync(&doc, &sync.peer.to_string())
+                        .await;
+                }
+            }
+        });
+        if let Some(previous) = self
+            .policy_watch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(watch.abort_handle())
+        {
+            previous.abort();
+        }
         Ok(())
+    }
+
+    /// Record a completed policy sync with the root or an admitted replica
+    /// once no policy content is still pending. Other peers prove nothing.
+    async fn observe_policy_sync(&self, doc: &CoreDoc, peer: &str) {
+        let Ok(peer) = identity(peer) else {
+            return;
+        };
+        if peer != *self.store.root() && !self.has_session(&peer) {
+            return;
+        }
+        let Ok(report) = self.store.refresh(doc).await else {
+            return;
+        };
+        let mut context = self.context.write().unwrap_or_else(|e| e.into_inner());
+        context.pending_policy_content = report.has_uncertainty();
+        if report.pending == 0 {
+            context.policy_sync = Some(self.synchronization(peer));
+        }
+    }
+
+    fn synchronization(&self, peer: [u8; 32]) -> PolicySynchronization {
+        PolicySynchronization {
+            completed_at: unix_now(),
+            source: if peer == *self.store.root() {
+                SynchronizationSource::Root
+            } else {
+                SynchronizationSource::Replica(peer)
+            },
+            observed_revision: None,
+        }
+    }
+
+    fn note_pending_policy_content(&self) {
+        self.context
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_policy_content = true;
     }
 
     fn take_rate_slot(&self, peer: [u8; 32], source: Option<IpAddr>) -> bool {
@@ -363,64 +576,73 @@ impl EnrollmentService {
         })
     }
 
+    /// Derive this peer's current evidence from root records and an optional
+    /// presented JWT, then evaluate it. A record read failure that recorded
+    /// no definite denial leaves the peer's standing unknown.
     async fn evidence(
         &self,
         peer: &[u8; 32],
         token: Option<&str>,
         observed_source: Option<ObservedSourceAddress>,
-    ) -> Result<VerifiedAdmissionEvidence> {
+    ) -> Result<VerifiedAdmissionEvidence, AdmissionError> {
         let doc = self
             .document
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let mut unresolved = None;
         if let Some(doc) = &doc {
-            let pending = match self.store.refresh_node(doc, peer).await {
-                Ok(availability) => availability == super::RecordAvailability::Pending,
-                Err(super::RecordError::StaleRevision) => true,
-                Err(error) => return Err(error.into()),
-            };
-            if pending {
-                self.context
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .pending_policy_content = true;
-            }
+            unresolved = self.refresh_issue(self.store.refresh_node(doc, peer).await);
         }
         // Independent root registration replaces presentation evidence. An
         // obsolete/expired JWT must not block a newer valid registration.
         if let Ok(registration) = self.store.select_evidence(peer, None, unix_now()) {
+            if let Some(issue) = unresolved {
+                return Err(issue);
+            }
             self.evaluate(&registration, observed_source).await?;
             return Ok(registration);
         }
         let jwt = token
             .map(|token| self.verifier.verify(token, peer, unix_now()))
-            .transpose()?;
-        if let Some(doc) = &doc {
-            if let Some(id) = jwt.as_ref().and_then(|jwt| jwt.credential_id()) {
-                let pending = match self.store.refresh_credential(doc, id).await {
-                    Ok(availability) => availability == super::RecordAvailability::Pending,
-                    Err(super::RecordError::StaleRevision) => true,
-                    Err(error) => return Err(error.into()),
-                };
-                if pending {
-                    self.context
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .pending_policy_content = true;
-                }
-            }
+            .transpose()
+            .map_err(|_| AdmissionError::Denied(DenialReason::InvalidValidity))?;
+        if let (Some(doc), Some(id)) = (&doc, jwt.as_ref().and_then(|jwt| jwt.credential_id())) {
+            let issue = self.refresh_issue(self.store.refresh_credential(doc, id).await);
+            unresolved = unresolved.or(issue);
         }
-        let evidence = self.store.select_evidence(peer, jwt.as_ref(), unix_now())?;
+        let evidence = self
+            .store
+            .select_evidence(peer, jwt.as_ref(), unix_now())
+            .map_err(AdmissionError::from_record)?;
+        if let Some(issue) = unresolved {
+            return Err(issue);
+        }
         self.evaluate(&evidence, observed_source).await?;
         Ok(evidence)
+    }
+
+    /// Pending or stale content only marks policy uncertain. Any other read
+    /// failure is returned so the caller cannot admit on partial evidence.
+    fn refresh_issue(
+        &self,
+        result: std::result::Result<RecordAvailability, RecordError>,
+    ) -> Option<AdmissionError> {
+        match result {
+            Ok(RecordAvailability::Pending) | Err(RecordError::StaleRevision) => {
+                self.note_pending_policy_content();
+                None
+            }
+            Ok(_) => None,
+            Err(error) => Some(AdmissionError::from_record(error)),
+        }
     }
 
     async fn evaluate(
         &self,
         evidence: &VerifiedAdmissionEvidence,
         observed_source: Option<ObservedSourceAddress>,
-    ) -> Result<()> {
+    ) -> Result<(), AdmissionError> {
         self.evaluate_with_policy(
             evidence,
             observed_source,
@@ -436,27 +658,26 @@ impl EnrollmentService {
         observed_source: Option<ObservedSourceAddress>,
         policy: &dyn AdmissionPolicy,
         timeout: Duration,
-    ) -> Result<()> {
+    ) -> Result<(), AdmissionError> {
         let mut context = self
             .context
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         context.observed_source = observed_source;
-        ensure!(
-            admit(
-                evidence,
-                self.store.as_ref(),
-                &context,
-                policy,
-                timeout,
-                unix_now
-            )
-            .await
-                == AdmissionDecision::Allow,
-            "enrollment denied"
-        );
-        Ok(())
+        match admit(
+            evidence,
+            self.store.as_ref(),
+            &context,
+            policy,
+            timeout,
+            unix_now,
+        )
+        .await
+        {
+            AdmissionDecision::Allow => Ok(()),
+            AdmissionDecision::Deny(reason) => Err(AdmissionError::from_reason(reason)),
+        }
     }
 
     fn remember(
@@ -485,16 +706,31 @@ impl EnrollmentService {
                 "admission changed during reconciliation"
             );
         }
-        ensure!(
-            sessions.contains_key(&peer) || sessions.len() < self.options.max_admitted_peers,
-            "admitted peer limit"
-        );
-        if sessions.get(&peer).is_some_and(|session| {
+        if let Some(session) = sessions.get_mut(&peer).filter(|session| {
             session.evidence.source() == evidence.source()
                 && session.evidence.original_jwt() == evidence.original_jwt()
                 && session.observed_source == observed_source
         }) {
+            session.last_used = Instant::now();
             return Ok(self.readiness(peer, evidence.source(), observed_source));
+        }
+        if !sessions.contains_key(&peer) && sessions.len() >= self.options.max_admitted_peers {
+            let idle = self.options.session_idle_eviction;
+            let victim = sessions
+                .iter()
+                .filter(|(_, session)| {
+                    session.last_used.elapsed() >= idle
+                        && session
+                            .connections
+                            .iter()
+                            .all(|connection| !connection.connection_info().is_connected)
+                })
+                .min_by_key(|(_, session)| session.last_used)
+                .map(|(peer, _)| *peer);
+            let Some(victim) = victim else {
+                bail!("admitted peer limit");
+            };
+            sessions.remove(&victim);
         }
         let source = evidence.source();
         let generation = self
@@ -514,8 +750,13 @@ impl EnrollmentService {
                 evidence,
                 connections,
                 observed_source,
+                last_used: Instant::now(),
             },
         );
+        self.revoked_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer);
         Ok(self.readiness(peer, source, observed_source))
     }
 
@@ -538,13 +779,12 @@ impl EnrollmentService {
         }
     }
 
-    fn session_snapshot(&self, peer: &[u8; 32]) -> Result<Session> {
+    fn session(&self, peer: &[u8; 32]) -> Option<Session> {
         self.sessions
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(peer)
             .cloned()
-            .ok_or_else(|| anyhow!("peer not admitted"))
     }
 
     fn has_session(&self, peer: &[u8; 32]) -> bool {
@@ -554,16 +794,46 @@ impl EnrollmentService {
             .contains_key(peer)
     }
 
-    fn ensure_generation(&self, peer: &[u8; 32], generation: u64) -> Result<()> {
-        ensure!(
-            self.sessions
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get(peer)
-                .is_some_and(|session| session.generation == generation),
-            "admission changed during evaluation"
-        );
-        Ok(())
+    /// Without a session, report a known definite denial so consumers can act
+    /// on it after a revocation or restart; otherwise the peer must re-enroll.
+    fn sessionless_standing(&self, peer: &[u8; 32]) -> AdmissionError {
+        if let Some(reason) = self
+            .revoked_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reasons
+            .get(peer)
+        {
+            return AdmissionError::Denied(reason.clone());
+        }
+        match self.store.select_evidence(peer, None, unix_now()) {
+            Err(RecordError::Denied(reason)) if reason.is_definite() => {
+                AdmissionError::Denied(reason)
+            }
+            _ => AdmissionError::NotAdmitted,
+        }
+    }
+
+    /// Accept a check only if the evaluated generation is still current, and
+    /// record the use for idle eviction.
+    fn confirm(&self, peer: &[u8; 32], generation: u64) -> Result<(), AdmissionError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match sessions.get_mut(peer) {
+            Some(session) if session.generation == generation => {
+                session.last_used = Instant::now();
+                Ok(())
+            }
+            Some(_) => Err(AdmissionError::Unavailable(
+                "admission changed during evaluation".into(),
+            )),
+            None => {
+                drop(sessions);
+                Err(self.sessionless_standing(peer))
+            }
+        }
     }
 
     /// Handle one connection selected by the caller's sole ALPN accept loop.
@@ -748,10 +1018,7 @@ impl EnrollmentService {
         let events = doc.doc.subscribe().await?;
         futures_lite::pin!(events);
         self.set_policy_document(doc.clone())?;
-        self.context
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending_policy_content = true;
+        self.note_pending_policy_content();
         doc.start_sync(vec![hex::encode(peer)]).await?;
         let result = tokio::time::timeout(timeout, async {
             use futures_lite::StreamExt;
@@ -791,33 +1058,31 @@ impl EnrollmentService {
         self.context
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .policy_sync = Some(PolicySynchronization {
-            completed_at: unix_now(),
-            source: if peer == *self.store.root() {
-                SynchronizationSource::Root
-            } else {
-                SynchronizationSource::Replica(peer)
-            },
-            observed_revision: None,
-        });
+            .policy_sync = Some(self.synchronization(peer));
         self.check_peer(&peer).await?;
         Ok(doc)
     }
 
     /// Recheck before each consumer operation. Gate-0 also calls this before
     /// accepting each new ordinary connection. This does not authorize the
-    /// operation itself.
-    pub async fn check_peer(&self, peer: &[u8; 32]) -> Result<EnrollmentReadiness> {
-        let session = self.session_snapshot(peer)?;
-        if self
+    /// operation itself. Only a definite denial revokes the session.
+    pub async fn check_peer(
+        &self,
+        peer: &[u8; 32],
+    ) -> std::result::Result<EnrollmentReadiness, AdmissionError> {
+        let Some(session) = self.session(peer) else {
+            return Err(self.sessionless_standing(peer));
+        };
+        if let Err(error) = self
             .evaluate(&session.evidence, session.observed_source)
             .await
-            .is_err()
         {
-            self.revoke_generation(peer, session.generation);
-            bail!("peer no longer admitted");
+            if let AdmissionError::Denied(reason) = &error {
+                self.revoke_generation(peer, session.generation, reason.clone());
+            }
+            return Err(error);
         }
-        self.ensure_generation(peer, session.generation)?;
+        self.confirm(peer, session.generation)?;
         Ok(self.readiness(*peer, session.evidence.source(), session.observed_source))
     }
 
@@ -826,8 +1091,9 @@ impl EnrollmentService {
     pub async fn check_connection(
         &self,
         connection: &CoreConnection,
-    ) -> Result<EnrollmentReadiness> {
-        let peer = identity(&connection.remote_id())?;
+    ) -> std::result::Result<EnrollmentReadiness, AdmissionError> {
+        let peer = identity(&connection.remote_id())
+            .map_err(|error| AdmissionError::Unavailable(error.to_string()))?;
         self.check_peer_at_source(&peer, observed_source(connection))
             .await
     }
@@ -840,25 +1106,32 @@ impl EnrollmentService {
         connection: &CoreConnection,
         policy: &dyn AdmissionPolicy,
         timeout: Duration,
-    ) -> Result<EnrollmentReadiness> {
-        let peer = identity(&connection.remote_id())?;
+    ) -> std::result::Result<EnrollmentReadiness, AdmissionError> {
         self.check_connection(connection).await?;
-        let session = self.session_snapshot(&peer)?;
+        let peer = identity(&connection.remote_id())
+            .map_err(|error| AdmissionError::Unavailable(error.to_string()))?;
+        let Some(session) = self.session(&peer) else {
+            return Err(self.sessionless_standing(&peer));
+        };
         let source = observed_source(connection);
         self.evaluate_with_policy(&session.evidence, source, policy, timeout)
             .await?;
-        self.ensure_generation(&peer, session.generation)?;
+        self.confirm(&peer, session.generation)?;
         Ok(self.readiness(peer, session.evidence.source(), source))
     }
 
+    /// The handshake gate denies a connection without revoking the session:
+    /// its source may differ from the one admitted.
     async fn check_peer_at_source(
         &self,
         peer: &[u8; 32],
         source: Option<ObservedSourceAddress>,
-    ) -> Result<EnrollmentReadiness> {
-        let session = self.session_snapshot(peer)?;
+    ) -> std::result::Result<EnrollmentReadiness, AdmissionError> {
+        let Some(session) = self.session(peer) else {
+            return Err(self.sessionless_standing(peer));
+        };
         self.evaluate(&session.evidence, source).await?;
-        self.ensure_generation(peer, session.generation)?;
+        self.confirm(peer, session.generation)?;
         Ok(self.readiness(*peer, session.evidence.source(), source))
     }
 
@@ -880,7 +1153,7 @@ impl EnrollmentService {
         Ok(())
     }
 
-    fn revoke_generation(&self, peer: &[u8; 32], expected_generation: u64) {
+    fn revoke_generation(&self, peer: &[u8; 32], expected_generation: u64, reason: DenialReason) {
         let mut sessions = self
             .sessions
             .lock()
@@ -891,17 +1164,26 @@ impl EnrollmentService {
         {
             return;
         }
-        if let Some(session) = sessions.remove(peer) {
-            drop(sessions);
-            for connection in session.connections {
-                let _ = connection.close(REJECT, b"enrollment revoked".to_vec());
-            }
-            let _ = self.revoked.send(EnrollmentRevoked { peer: *peer });
+        let Some(session) = sessions.remove(peer) else {
+            return;
+        };
+        self.revoked_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(*peer, reason.clone(), self.options.max_admitted_peers);
+        drop(sessions);
+        for connection in session.connections {
+            let _ = connection.close(REJECT, b"enrollment revoked".to_vec());
         }
+        let _ = self.revoked.send(EnrollmentRevoked {
+            peer: *peer,
+            reason,
+        });
     }
 
     /// Refresh currently admitted identities from the local Docs replica.
-    /// Errors/pending content never invent a revocation or new authority.
+    /// Only a definite denial revokes; storage errors, pending content and
+    /// policy timeouts keep the session for the next pass.
     pub async fn reconcile(&self) {
         let doc = self
             .document
@@ -936,14 +1218,14 @@ impl EnrollmentService {
         // consumer handler. A slow unrelated policy cannot defer revocations.
         let mut pending = VecDeque::new();
         for (peer, evidence, source, generation) in peers {
-            if self
+            match self
                 .store
                 .select_evidence(&peer, Some(&evidence), unix_now())
-                .is_err()
             {
-                self.revoke_generation(&peer, generation);
-            } else {
-                pending.push_back((peer, evidence, source, generation));
+                Err(RecordError::Denied(reason)) if reason.is_definite() => {
+                    self.revoke_generation(&peer, generation, reason);
+                }
+                _ => pending.push_back((peer, evidence, source, generation)),
             }
         }
         let count = pending
@@ -966,7 +1248,10 @@ impl EnrollmentService {
                         Ok(evidence) => {
                             let _ = self.replace_session(evidence, source, Some(generation));
                         }
-                        Err(_) => self.revoke_generation(&peer, generation),
+                        Err(AdmissionError::Denied(reason)) => {
+                            self.revoke_generation(&peer, generation, reason);
+                        }
+                        Err(_) => {}
                     }
                 }
             };
@@ -984,7 +1269,7 @@ fn identity(hex: &str) -> Result<[u8; 32]> {
 fn namespace(hex: &str) -> Result<[u8; 32]> {
     hex::decode(hex)?
         .try_into()
-        .map_err(|_| anyhow!("invalid node identity"))
+        .map_err(|_| anyhow!("invalid policy namespace"))
 }
 fn observed_source(connection: &CoreConnection) -> Option<ObservedSourceAddress> {
     connection
@@ -1030,7 +1315,9 @@ async fn transmit(send: &CoreSendStream, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 async fn receive<T: for<'de> Deserialize<'de>>(recv: &CoreRecvStream) -> Result<T> {
-    let len = u32::from_be_bytes(recv.read_exact(4).await?.try_into().unwrap()) as usize;
+    let mut prefix = [0; 4];
+    prefix.copy_from_slice(&recv.read_exact(4).await?);
+    let len = u32::from_be_bytes(prefix) as usize;
     ensure!(len <= MAX_ENVELOPE, "enrollment envelope too large");
     Ok(serde_json::from_slice(&recv.read_exact(len).await?)?)
 }
@@ -1130,30 +1417,9 @@ mod tests {
         ));
         let store =
             Arc::new(EnrollmentPolicyStore::open(&path, public(1), [42; 32], AUDIENCE).unwrap());
-        let (revoked, _) = broadcast::channel(128);
+        let verifier = JwtEnrollmentVerifier::new(public(1), AUDIENCE).unwrap();
         (
-            Arc::new(EnrollmentService {
-                node,
-                store,
-                verifier: JwtEnrollmentVerifier::new(public(1), AUDIENCE).unwrap(),
-                credential: None,
-                policy,
-                inbound_permits: Semaphore::new(options.max_concurrent_handshakes),
-                outbound_permits: Semaphore::new(options.max_concurrent_handshakes),
-                gate_permits: Arc::new(Semaphore::new(options.max_concurrent_gate_checks)),
-                options,
-                document: RwLock::new(None),
-                context: RwLock::new(AdmissionContext::default()),
-                sessions: Mutex::new(BTreeMap::new()),
-                handshake_counts: Mutex::new(HandshakeCounts::default()),
-                rate: Mutex::new(RateState {
-                    started: Instant::now(),
-                    peers: BTreeMap::new(),
-                    sources: BTreeMap::new(),
-                }),
-                next_generation: AtomicU64::new(1),
-                revoked,
-            }),
+            EnrollmentService::new(node, store, verifier, None, policy, options),
             path,
         )
     }
@@ -1173,13 +1439,13 @@ mod tests {
             let policy = PausedPolicy::new(false);
             let (service, path) = service(policy.clone(), EnrollmentOptions::default()).await;
             service.remember(evidence(3, "old"), None).unwrap();
-            let old_generation = service.session_snapshot(&public(3)).unwrap().generation;
+            let old_generation = service.session(&public(3)).unwrap().generation;
             let task = tokio::spawn({
                 let service = service.clone();
                 async move { service.reconcile().await }
             });
             policy.entered.notified().await;
-            service.revoke_generation(&public(3), old_generation);
+            service.revoke_generation(&public(3), old_generation, DenialReason::NodeRevoked);
             if reenroll {
                 service.remember(evidence(3, "new"), None).unwrap();
             }
@@ -1188,14 +1454,14 @@ mod tests {
             if reenroll {
                 assert_eq!(
                     service
-                        .session_snapshot(&public(3))
+                        .session(&public(3))
                         .unwrap()
                         .evidence
                         .credential_id(),
                     Some("new")
                 );
             } else {
-                assert!(service.session_snapshot(&public(3)).is_err());
+                assert!(service.session(&public(3)).is_none());
             }
             cleanup(service, path).await;
         }
@@ -1206,17 +1472,14 @@ mod tests {
         let policy = PausedPolicy::new(false);
         let (service, path) = service(policy.clone(), EnrollmentOptions::default()).await;
         service.remember(evidence(3, "same"), None).unwrap();
-        let generation = service.session_snapshot(&public(3)).unwrap().generation;
+        let generation = service.session(&public(3)).unwrap().generation;
         let task = tokio::spawn({
             let service = service.clone();
             async move { service.check_peer(&public(3)).await }
         });
         policy.entered.notified().await;
         service.reconcile().await;
-        assert_eq!(
-            service.session_snapshot(&public(3)).unwrap().generation,
-            generation
-        );
+        assert_eq!(service.session(&public(3)).unwrap().generation, generation);
         policy.release.notify_one();
         assert!(task.await.unwrap().is_ok());
         cleanup(service, path).await;
@@ -1249,10 +1512,7 @@ mod tests {
         });
         policy.entered.notified().await;
         tokio::time::timeout(Duration::from_secs(1), async {
-            while service.has_session(&public(4))
-                || service.has_session(&public(5))
-                || policy.evaluated.load(Ordering::SeqCst) < 35
-            {
+            while service.has_session(&public(4)) || policy.evaluated.load(Ordering::SeqCst) < 35 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1263,6 +1523,77 @@ mod tests {
         policy.release.notify_one();
         task.await.unwrap();
         assert!(service.check_peer(&public(7)).await.is_ok());
+        // A definite consumer denial revokes; a failing handler only makes
+        // the peer's standing unknown, so its session survives.
+        assert!(matches!(
+            service.check_peer(&public(4)).await,
+            Err(AdmissionError::Denied(DenialReason::Consumer(_)))
+        ));
+        assert!(service.has_session(&public(5)));
+        assert!(matches!(
+            service.check_peer(&public(5)).await,
+            Err(AdmissionError::Unavailable(_))
+        ));
+        assert!(service.has_session(&public(5)));
+        cleanup(service, path).await;
+    }
+
+    #[tokio::test]
+    async fn sessionless_peer_reports_not_admitted_until_revoked() {
+        let (service, path) = service(PausedPolicy::new(true), EnrollmentOptions::default()).await;
+        let mut revocations = service.revocations();
+        assert_eq!(
+            service.check_peer(&public(4)).await.unwrap_err(),
+            AdmissionError::NotAdmitted
+        );
+        service.remember(evidence(4, "denied"), None).unwrap();
+        assert!(matches!(
+            service.check_peer(&public(4)).await,
+            Err(AdmissionError::Denied(DenialReason::Consumer(_)))
+        ));
+        let revoked = revocations.try_recv().unwrap();
+        assert_eq!(revoked.peer, public(4));
+        assert!(matches!(revoked.reason, DenialReason::Consumer(_)));
+        // The revocation outlives the session it removed.
+        assert!(matches!(
+            service.check_peer(&public(4)).await,
+            Err(AdmissionError::Denied(DenialReason::Consumer(_)))
+        ));
+        // A later successful admission clears it.
+        service.remember(evidence(4, "again"), None).unwrap();
+        assert!(service.revoked_peers.lock().unwrap().reasons.is_empty());
+        cleanup(service, path).await;
+    }
+
+    #[tokio::test]
+    async fn full_session_table_evicts_only_idle_sessions() {
+        let (service, path) = service(
+            PausedPolicy::new(false),
+            EnrollmentOptions {
+                max_admitted_peers: 2,
+                session_idle_eviction: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await;
+        service.remember(evidence(10, "a"), None).unwrap();
+        service.remember(evidence(11, "b"), None).unwrap();
+        assert!(service.remember(evidence(12, "c"), None).is_err());
+        service
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&public(10))
+            .unwrap()
+            .last_used = Instant::now() - Duration::from_secs(120);
+        service.remember(evidence(12, "c"), None).unwrap();
+        assert!(!service.has_session(&public(10)));
+        assert!(service.has_session(&public(11)) && service.has_session(&public(12)));
+        // Eviction is not a revocation.
+        assert_eq!(
+            service.check_peer(&public(10)).await.unwrap_err(),
+            AdmissionError::NotAdmitted
+        );
         cleanup(service, path).await;
     }
 

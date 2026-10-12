@@ -98,14 +98,15 @@ impl Enrollment {
         ))
     }
 
-    pub async fn check_peer(&self, peer: &[u8; 32]) -> anyhow::Result<EnrollmentReadiness> {
+    /// Recheck an admitted peer. Only [`AdmissionError::Denied`] revokes.
+    pub async fn check_peer(&self, peer: &[u8; 32]) -> Result<EnrollmentReadiness, AdmissionError> {
         self.inner.check_peer(peer).await
     }
 
     pub async fn check_connection(
         &self,
         connection: &crate::Connection,
-    ) -> anyhow::Result<EnrollmentReadiness> {
+    ) -> Result<EnrollmentReadiness, AdmissionError> {
         self.inner
             .check_connection(&connection.enrollment_core())
             .await
@@ -116,7 +117,7 @@ impl Enrollment {
         connection: &crate::Connection,
         policy: &dyn AdmissionPolicy,
         timeout: Duration,
-    ) -> anyhow::Result<EnrollmentReadiness> {
+    ) -> Result<EnrollmentReadiness, AdmissionError> {
         self.inner
             .check_connection_with_policy(&connection.enrollment_core(), policy, timeout)
             .await
