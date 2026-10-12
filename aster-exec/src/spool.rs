@@ -1,6 +1,8 @@
 //! Checksummed, append-only output frames with stable sequence cursors.
 
-use crate::contract::{MAX_PAGE_BYTES, OutputChunkV1, OutputPageV1, OutputStreamV1};
+use crate::contract::{
+    MAX_PAGE_BYTES, OUTPUT_CHUNK_OVERHEAD_BYTES, OutputChunkV1, OutputPageV1, OutputStreamV1,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -178,11 +180,14 @@ impl Spool {
             if frame.sequence != expected {
                 return Err(invalid("output sequence mismatch"));
             }
-            if total + frame.bytes.len() > max_bytes as usize {
+            // Charging each chunk's encoding overhead bounds the encoded page;
+            // the first chunk always fits so a reader always progresses.
+            let cost = frame.bytes.len() + OUTPUT_CHUNK_OVERHEAD_BYTES;
+            if !chunks.is_empty() && total + cost > max_bytes as usize {
                 self.file.seek(SeekFrom::Start(offset))?;
                 break;
             }
-            total += frame.bytes.len();
+            total += cost;
             expected += 1;
             chunks.push(frame);
         }
@@ -246,5 +251,22 @@ mod tests {
         assert_eq!(page.chunks.len(), 2);
         assert_eq!(page.chunks[0].bytes, b"first");
         assert_eq!(page.chunks[1].bytes, b"second");
+    }
+
+    #[test]
+    fn pages_charge_chunk_overhead_but_always_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(&temp.path().join("output.log"), 0, 1 << 20).unwrap();
+        for _ in 0..200 {
+            spool.append(OutputStreamV1::Stdout, b"x").unwrap();
+        }
+        let page = spool.page(0, 4096, false).unwrap();
+        assert_eq!(page.chunks.len(), 4096 / (1 + OUTPUT_CHUNK_OVERHEAD_BYTES));
+        let mut full = Spool::open(&temp.path().join("full.log"), 0, 1 << 20).unwrap();
+        full.append(OutputStreamV1::Stdout, &[7; MAX_FRAME_BYTES])
+            .unwrap();
+        let page = full.page(0, MAX_FRAME_BYTES as u32, false).unwrap();
+        assert_eq!(page.chunks.len(), 1);
+        assert_eq!(page.next_cursor, 1);
     }
 }

@@ -26,6 +26,9 @@ fn terminal_index() -> &'static std::sync::Mutex<std::collections::HashMap<PathB
     INDEX.get_or_init(Default::default)
 }
 const MAX_MESSAGE: u64 = MAX_LOCAL_MESSAGE_BYTES as u64;
+/// Responses are read by the unprivileged API, and job enumeration grows
+/// with retained jobs, so they get a larger bound than root-side reads.
+const MAX_RESPONSE: u64 = 32 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelperConfig {
@@ -706,8 +709,8 @@ pub fn call(path: &Path, request: &HelperRequestV1) -> io::Result<HelperResponse
     stream.write_all(&bytes)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut bytes = Vec::new();
-    stream.take(MAX_MESSAGE + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_MESSAGE {
+    stream.take(MAX_RESPONSE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RESPONSE {
         return Err(other("helper response too large"));
     }
     serde_json::from_slice(&bytes).map_err(other)

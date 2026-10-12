@@ -13,6 +13,7 @@ policy = ["dep:aster_transport_core"]
 service = ["policy", "dep:aster", "dep:async-trait"]
 
 [dependencies]
+base64 = "0.22"
 blake3 = "1"
 hex = "0.4"
 redb = "=4.1.0"

@@ -374,6 +374,7 @@ dependencies = [
  "aster",
  "aster_transport_core",
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "hex",
  "libc",

@@ -318,6 +318,15 @@ async fn authenticated_rpc_retry_ownership_malformed_payload_and_grant_denial() 
             1,
             "denied requests must not emit intent"
         );
+        // The advertised maximum stdin crosses the real RPC frame bound and is
+        // decoded: it reaches authorization rather than failing as a frame.
+        let mut large =
+            aster_exec_client::request(&target, root.path().to_string_lossy(), "/bin/cat", vec![]);
+        large.stdin_bytes = Some(vec![0xFF; MAX_STDIN_BYTES]);
+        assert_exec_code(
+            client.submit(&large).await,
+            ExecErrorCodeV1::PermissionDenied,
+        );
         assert_eq!(other_client.targets().await.unwrap().len(), 1);
         handle.abort();
         caller.shutdown().await;

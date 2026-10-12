@@ -1309,7 +1309,7 @@ impl ServiceDispatch for ExecService {
         (method != "watch").then_some(Duration::from_secs(30))
     }
     fn max_frame_size(&self, _: &str) -> Option<u32> {
-        Some(MAX_REQUEST_BYTES as u32)
+        Some(MAX_REQUEST_FRAME_BYTES as u32)
     }
     async fn dispatch(&self, method: &str, mut call: Call) {
         let caller = call.peer().to_string();
@@ -1318,7 +1318,9 @@ impl ServiceDispatch for ExecService {
             return;
         }
         let result = match call.recv_request().await {
-            Some(raw) if raw.len() <= MAX_REQUEST_BYTES => self.run(method, &caller, &raw).await,
+            Some(raw) if raw.len() <= MAX_REQUEST_FRAME_BYTES => {
+                self.run(method, &caller, &raw).await
+            }
             _ => Err(ExecErrorV1::invalid("invalid Exec frame")),
         };
         match serde_json::to_vec(&result) {

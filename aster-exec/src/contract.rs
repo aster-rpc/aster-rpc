@@ -1,9 +1,13 @@
 //! Versioned Exec v1 request and result types. IDs are not bearer authority.
-
-/// Bound for worst-case JSON byte arrays and sealed request metadata.
-pub const MAX_LOCAL_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+//!
+//! Byte fields (`stdin_bytes`, output chunk `bytes`) are standard base64
+//! strings in JSON.
 
 use serde::{Deserialize, Serialize};
+
+/// Bound for one local helper or supervisor message: an encoded request
+/// frame plus sealed launch metadata.
+pub const MAX_LOCAL_MESSAGE_BYTES: usize = MAX_REQUEST_FRAME_BYTES + 256 * 1024;
 
 pub const SERVICE_NAME: &str = "aster.exec.Exec";
 pub const SERVICE_VERSION: u32 = 1;
@@ -21,7 +25,54 @@ pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
 pub const MAX_ENV_ENTRIES: usize = 64;
 pub const MAX_ENV_BYTES: usize = 128 * 1024;
 pub const MAX_ARGV_BYTES: usize = 256 * 1024;
+/// Bound on a request's raw content: identifiers, paths, argv, environment
+/// and stdin.
 pub const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+/// Bound on an encoded request frame. It covers base64 stdin and JSON string
+/// escaping of up to six bytes per byte of argv and environment.
+pub const MAX_REQUEST_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Output paging charges each chunk this much beyond its bytes, so a page's
+/// encoded size stays within 4/3 of its byte budget however small its chunks.
+pub const OUTPUT_CHUNK_OVERHEAD_BYTES: usize = 96;
+
+/// Serde adapters that carry bytes as standard base64 strings rather than
+/// JSON number arrays, which cost up to four bytes per byte.
+pub mod base64_bytes {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD.decode(text).map_err(D::Error::custom)
+    }
+
+    pub mod option {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            bytes: &Option<Vec<u8>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match bytes {
+                Some(bytes) => super::serialize(bytes, serializer),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Vec<u8>>, D::Error> {
+            Option::<String>::deserialize(deserializer)?
+                .map(|text| STANDARD.decode(text).map_err(D::Error::custom))
+                .transpose()
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +143,7 @@ pub struct ExecRequestV1 {
     pub executable: String,
     pub argv: Vec<String>,
     pub environment_overrides: std::collections::BTreeMap<String, String>,
+    #[serde(default, with = "base64_bytes::option")]
     pub stdin_bytes: Option<Vec<u8>>,
     pub execution_timeout_ms: Option<u64>,
     pub output_limit_bytes: Option<u64>,
@@ -172,6 +224,7 @@ pub enum OutputStreamV1 {
 pub struct OutputChunkV1 {
     pub sequence: u64,
     pub stream: OutputStreamV1,
+    #[serde(with = "base64_bytes")]
     pub bytes: Vec<u8>,
 }
 
@@ -392,59 +445,98 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maximum_byte_arrays_fit_local_protocol_bound() {
+    fn worst_case_request_fits_its_frame_bound() {
+        // Control characters escape to six bytes in JSON; 0xFF stdin is the
+        // longest base64.
+        let escaped = |len: usize| "\u{1}".repeat(len);
+        let mut environment = std::collections::BTreeMap::new();
+        for index in 0..MAX_ENV_ENTRIES {
+            let key = format!("K{index:02}");
+            let value = escaped(MAX_ENV_BYTES / MAX_ENV_ENTRIES - key.len());
+            environment.insert(key, value);
+        }
+        let executable = "/usr/bin/cat".to_string();
         let bytes = vec![255u8; MAX_STDIN_BYTES];
         let request = ExecRequestV1 {
             request_id: uuid::Uuid::new_v4().to_string(),
-            target_id: "target".into(),
-            profile: None,
+            target_id: "22".repeat(32),
+            profile: Some("open".into()),
             cwd: "/tmp".into(),
-            executable: "/usr/bin/cat".into(),
-            argv: vec![],
-            environment_overrides: Default::default(),
+            argv: vec![escaped(MAX_ARGV_BYTES - executable.len())],
+            executable,
+            environment_overrides: environment,
             stdin_bytes: Some(bytes.clone()),
-            execution_timeout_ms: None,
-            output_limit_bytes: None,
+            execution_timeout_ms: Some(MAX_TIMEOUT_MS),
+            output_limit_bytes: Some(MAX_OUTPUT_BYTES),
         };
         request.validate().unwrap();
         let encoded = serde_json::to_vec(&request).unwrap();
-        assert!(encoded.len() < MAX_LOCAL_MESSAGE_BYTES);
-        assert_eq!(
-            serde_json::from_slice::<ExecRequestV1>(&encoded)
-                .unwrap()
-                .stdin_bytes
-                .unwrap(),
-            bytes
-        );
-        let page = OutputPageV1 {
-            chunks: (0..256)
-                .map(|sequence| OutputChunkV1 {
-                    sequence,
-                    stream: OutputStreamV1::Stdout,
-                    bytes: vec![255; 4096],
-                })
-                .collect(),
-            next_cursor: 256,
-            truncated: false,
-            eof: true,
-        };
-        let encoded = serde_json::to_vec(&page).unwrap();
-        assert!(encoded.len() < MAX_LOCAL_MESSAGE_BYTES);
-        let decoded: OutputPageV1 = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(
-            decoded
-                .chunks
-                .iter()
-                .map(|chunk| chunk.bytes.len())
-                .sum::<usize>(),
-            MAX_PAGE_BYTES as usize
-        );
         assert!(
-            decoded
-                .chunks
-                .iter()
-                .all(|chunk| chunk.bytes.iter().all(|byte| *byte == 255))
+            encoded.len() <= MAX_REQUEST_FRAME_BYTES,
+            "{} > {MAX_REQUEST_FRAME_BYTES}",
+            encoded.len()
         );
+        assert!(encoded.len() < MAX_LOCAL_MESSAGE_BYTES);
+        let decoded: ExecRequestV1 = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.stdin_bytes.unwrap(), bytes);
+    }
+
+    #[test]
+    fn output_pages_encode_within_their_byte_budget() {
+        // Paging charges OUTPUT_CHUNK_OVERHEAD_BYTES per chunk; even one-byte
+        // chunks keep the encoded page within 4/3 of the budget.
+        let budget = MAX_PAGE_BYTES as usize;
+        for size in [1usize, 3, 4096] {
+            let count = budget / (size + OUTPUT_CHUNK_OVERHEAD_BYTES);
+            let page = OutputPageV1 {
+                chunks: (0..count as u64)
+                    .map(|offset| OutputChunkV1 {
+                        sequence: u64::MAX - offset,
+                        stream: OutputStreamV1::Stderr,
+                        bytes: vec![255; size],
+                    })
+                    .collect(),
+                next_cursor: u64::MAX,
+                truncated: true,
+                eof: false,
+            };
+            let encoded = serde_json::to_vec(&page).unwrap();
+            assert!(
+                encoded.len() <= budget * 4 / 3 + 1024,
+                "{size}: {}",
+                encoded.len()
+            );
+            assert_eq!(
+                serde_json::from_slice::<OutputPageV1>(&encoded).unwrap(),
+                page
+            );
+        }
+    }
+
+    #[test]
+    fn byte_fields_are_base64_and_stdin_may_be_omitted() {
+        let chunk: OutputChunkV1 =
+            serde_json::from_str(r#"{"sequence":0,"stream":"stdout","bytes":"aGk="}"#).unwrap();
+        assert_eq!(chunk.bytes, b"hi");
+        assert!(
+            serde_json::from_str::<OutputChunkV1>(
+                r#"{"sequence":0,"stream":"stdout","bytes":[104]}"#
+            )
+            .is_err()
+        );
+        let request = serde_json::json!({
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "target_id": "t",
+            "profile": null,
+            "cwd": "/tmp",
+            "executable": "/bin/true",
+            "argv": [],
+            "environment_overrides": {},
+            "execution_timeout_ms": null,
+            "output_limit_bytes": null,
+        });
+        let request: ExecRequestV1 = serde_json::from_value(request).unwrap();
+        assert!(request.stdin_bytes.is_none());
     }
 
     #[test]
