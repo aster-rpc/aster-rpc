@@ -4121,7 +4121,9 @@ impl CoreDocsClient {
             }
         }
         Ok(CoreDoc {
-            doc: self.inner.api().import_namespace(ticket.capability).await?,
+            // The ticket carries replica addresses; importing only its
+            // capability creates an empty local document without syncing.
+            doc: self.inner.api().import(ticket).await?,
             store: self.store.clone(),
         })
     }
@@ -4645,6 +4647,41 @@ impl CoreDoc {
             .collect::<Result<Vec<_>>>()?;
         self.doc.start_sync(endpoint_addrs).await?;
         Ok(())
+    }
+
+    /// Synchronize with every selected replica before trusting local policy state.
+    /// Failed syncs and a closed event stream fail closed. This waits for metadata
+    /// reconciliation; callers must still require complete content when reading.
+    pub async fn sync_with_timeout(&self, peers: Vec<String>, budget: Duration) -> Result<()> {
+        let mut pending = peers
+            .into_iter()
+            .map(|peer| peer.parse::<EndpointId>())
+            .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
+        if pending.is_empty() {
+            return Err(anyhow!("policy publication requires at least one replica"));
+        }
+        tokio::time::timeout(budget, async {
+            let events = self.doc.subscribe().await?;
+            futures_lite::pin!(events);
+            self.start_sync(pending.iter().map(ToString::to_string).collect())
+                .await?;
+            while !pending.is_empty() {
+                match futures_lite::StreamExt::next(&mut events).await {
+                    Some(Ok(LiveEvent::SyncFinished(event))) if pending.contains(&event.peer) => {
+                        event
+                            .result
+                            .map_err(|error| anyhow!("policy replica sync failed: {error}"))?;
+                        pending.remove(&event.peer);
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => return Err(anyhow!("policy replica sync stream ended")),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow!("policy replica sync deadline exceeded; publication refused"))?
     }
 
     /// Stop syncing this document.

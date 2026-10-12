@@ -688,6 +688,18 @@ impl Doc {
         Ok(self.inner.start_sync(peers).await?)
     }
 
+    /// Require successful metadata synchronization with every selected replica.
+    /// Content reads must additionally reject pending or unavailable bytes.
+    pub async fn sync_with_timeout(&self, peers: &[NodeId], budget: Duration) -> Result<()> {
+        Ok(self
+            .inner
+            .sync_with_timeout(
+                peers.iter().map(|peer| peer.as_str().to_string()).collect(),
+                budget,
+            )
+            .await?)
+    }
+
     /// Stop syncing this document.
     pub async fn leave(&self) -> Result<()> {
         Ok(self.inner.leave().await?)

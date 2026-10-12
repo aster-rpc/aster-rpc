@@ -98,6 +98,24 @@ async fn blob_round_trips_between_nodes() {
 }
 
 #[tokio::test]
+async fn join_ticket_starts_document_sync() {
+    let (a, b) = node_pair().await;
+    let doc_a = a.docs().create().await.expect("create doc");
+    let author = a.docs().default_author().await.expect("author");
+    doc_a
+        .set_bytes(&author, b"policy/grant".to_vec(), b"active".to_vec())
+        .await
+        .expect("write grant");
+
+    let ticket = doc_a.share_with_addr(ShareMode::Read).await.expect("share");
+    let doc_b = b.docs().join(ticket).await.expect("join");
+    wait_for_exact(&doc_b, &author, b"policy/grant", Some(b"active")).await;
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
 async fn doc_prefix_delete_tombstone_syncs_to_current_and_late_peers() {
     let (a, b) = node_pair().await;
 
