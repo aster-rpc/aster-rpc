@@ -25,6 +25,7 @@ use super::{
     RecordAvailability, RecordError, SourceAddressProvenance, SynchronizationSource,
     VerifiedAdmissionEvidence, MAX_CHAIN_BYTES,
 };
+use crate::delegation::ChainError;
 use crate::{
     CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreHookHandshakeInfo, CoreHookReceiver,
     CoreNode, CoreNodeAddr, CoreRecvStream, CoreSendStream, CoreWeakConnection,
@@ -736,20 +737,35 @@ impl EnrollmentService {
             self.evaluate(&registration, observed_source).await?;
             return Ok(registration);
         }
+        // Gate G6 rejects a chain through a delegate the root has revoked.
         let chain = token
-            .map(|token| self.verifier.verify(token, peer, unix_now()))
+            .map(|token| {
+                self.verifier
+                    .verify_with(token, peer, unix_now(), self.store.as_ref())
+            })
             .transpose()
             .map_err(|error| match error {
                 EnrollmentError::ClockSkew { offset_seconds } => {
                     AdmissionError::ClockSkew { offset_seconds }
                 }
+                EnrollmentError::Chain(ChainError::Revoked) => {
+                    AdmissionError::Denied(DenialReason::IssuerRevoked)
+                }
                 _ => AdmissionError::Denied(DenialReason::InvalidValidity),
             })?;
-        if let (Some(doc), Some(id)) =
-            (&doc, chain.as_ref().and_then(|chain| chain.credential_id()))
-        {
-            let issue = self.refresh_issue(self.store.refresh_credential(doc, id).await);
-            unresolved = unresolved.or(issue);
+        if let (Some(doc), Some(chain)) = (&doc, chain.as_ref()) {
+            if let Some(id) = chain.credential_id() {
+                let issue = self.refresh_issue(self.store.refresh_credential(doc, id).await);
+                unresolved = unresolved.or(issue);
+            }
+            // Read the root's current statement about every delegate on the
+            // path, so a revocation this node has not reconciled yet applies.
+            if let AdmissionEvidenceSource::PresentedChain { issuers, .. } = chain.source() {
+                for delegate in issuers.iter().filter(|key| *key != self.store.root()) {
+                    let issue = self.refresh_issue(self.store.refresh_issuer(doc, delegate).await);
+                    unresolved = unresolved.or(issue);
+                }
+            }
         }
         let evidence = self
             .store

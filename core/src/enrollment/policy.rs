@@ -294,6 +294,10 @@ pub enum DenialReason {
     /// Local policy state could not be read or persisted.
     PolicyStateUnavailable,
     CredentialRevoked,
+    /// An issuer on the presented chain is revoked by a root-authored
+    /// `IssuerStatusV1` record. A registration the root published still
+    /// authorizes the node.
+    IssuerRevoked,
     InvalidValidity,
     /// The peer's clock, or its credential issuer's, differs from ours by more
     /// than the activation leeway. Not definite: fix the clock and retry.
@@ -319,6 +323,7 @@ impl DenialReason {
                 | Self::RegistrationSuperseded
                 | Self::RegistrationRejected
                 | Self::CredentialRevoked
+                | Self::IssuerRevoked
                 | Self::InvalidValidity
                 | Self::PolicyDidNotMatch
                 | Self::Consumer(_)

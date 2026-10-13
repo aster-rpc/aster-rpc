@@ -10,6 +10,7 @@ use super::records::*;
 use super::root_records::{RootAuthoredDocView, RootRecordError, RootRecordRead};
 use super::root_revisions::{check_root_revision, should_record_rejection, RootRevisionError};
 use super::{AdmissionEvidenceSource, AdmissionGuard, DenialReason, VerifiedAdmissionEvidence};
+use crate::delegation::RevokedDelegates;
 use crate::CoreDoc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -89,6 +90,17 @@ pub struct PolicyRefreshIssue {
 enum PolicyRecord {
     Node(NodeRegistrationV1),
     Credential(CredentialStatusV1),
+    Issuer(IssuerStatusV1),
+    Binding(NamespaceBindingV1),
+}
+
+/// What a store reads from its namespace. The fleet namespace carries every
+/// kind of record; a bound membership namespace contributes registrations
+/// only, so a record there can never bind namespaces or revoke issuers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreRole {
+    Fleet,
+    Membership,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -103,6 +115,17 @@ struct PersistedPolicy {
     #[serde(default)]
     rejected_nodes: BTreeMap<String, u64>,
     credentials: BTreeMap<String, CredentialStatusV1>,
+    /// Fleet only: root statements about delegate keys.
+    #[serde(default)]
+    issuers: BTreeMap<String, IssuerStatusV1>,
+    /// Fleet only: namespaces bound to this fleet, keyed by namespace hex.
+    #[serde(default)]
+    bindings: BTreeMap<String, NamespaceBindingV1>,
+}
+impl PersistedPolicy {
+    fn record_count(&self) -> usize {
+        self.nodes.len() + self.credentials.len() + self.issuers.len() + self.bindings.len()
+    }
 }
 const MAX_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 #[derive(Clone)]
@@ -130,13 +153,54 @@ pub struct EnrollmentPolicyStore {
     namespace: [u8; 32],
     audience: String,
     activation_leeway: u64,
+    role: StoreRole,
 }
 impl EnrollmentPolicyStore {
+    /// Open the store for a fleet namespace: the namespace a consumer pins,
+    /// which carries bindings, issuer statuses, credential revocations and
+    /// denial mirrors as well as registrations.
     pub fn open(
         path: impl AsRef<Path>,
         root: [u8; 32],
         namespace: [u8; 32],
         audience: impl Into<String>,
+    ) -> Result<Self, RecordError> {
+        Self::open_role(path, root, namespace, audience, StoreRole::Fleet)
+    }
+
+    /// Open the store for a membership namespace bound to this fleet, beside
+    /// this store's file and with the same root, audience and leeway. Each
+    /// namespace keeps its own watermarks and denials.
+    pub fn open_bound(&self, namespace: [u8; 32]) -> Result<Self, RecordError> {
+        if self.role != StoreRole::Fleet || namespace == self.namespace {
+            return Err(RecordError::InvalidConfiguration);
+        }
+        let name = self
+            .path
+            .file_name()
+            .ok_or(RecordError::InvalidConfiguration)?
+            .to_string_lossy()
+            .into_owned();
+        let path = self
+            .path
+            .with_file_name(format!("{name}.{}.bound", hex::encode(namespace)));
+        let mut store = Self::open_role(
+            path,
+            self.root,
+            namespace,
+            self.audience.clone(),
+            StoreRole::Membership,
+        )?;
+        store.activation_leeway = self.activation_leeway;
+        Ok(store)
+    }
+
+    fn open_role(
+        path: impl AsRef<Path>,
+        root: [u8; 32],
+        namespace: [u8; 32],
+        audience: impl Into<String>,
+        role: StoreRole,
     ) -> Result<Self, RecordError> {
         let audience = audience.into();
         if super::JwtEnrollmentVerifier::new(root, audience.clone()).is_err() {
@@ -172,10 +236,12 @@ impl EnrollmentPolicyStore {
                 nodes: BTreeMap::new(),
                 rejected_nodes: BTreeMap::new(),
                 credentials: BTreeMap::new(),
+                issuers: BTreeMap::new(),
+                bindings: BTreeMap::new(),
             },
             Err(error) => return Err(storage(error)),
         };
-        if policy.nodes.len() + policy.credentials.len() > MAX_POLICY_RECORDS
+        if policy.record_count() > MAX_POLICY_RECORDS
             || policy.rejected_nodes.len() > MAX_POLICY_RECORDS
         {
             return Err(RecordError::TooManyRecords);
@@ -184,6 +250,10 @@ impl EnrollmentPolicyStore {
             || policy.root != root
             || policy.namespace != namespace
             || policy.audience != audience
+            || (role == StoreRole::Membership
+                && (!policy.credentials.is_empty()
+                    || !policy.issuers.is_empty()
+                    || !policy.bindings.is_empty()))
         {
             return Err(RecordError::InvalidConfiguration);
         }
@@ -199,6 +269,7 @@ impl EnrollmentPolicyStore {
             namespace,
             audience,
             activation_leeway: DEFAULT_ACTIVATION_LEEWAY_SECONDS,
+            role,
         };
         {
             let state = store.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -223,6 +294,18 @@ impl EnrollmentPolicyStore {
             for (key, record) in &state.policy.credentials {
                 store.validate_credential(record)?;
                 if key != &record.credential_id {
+                    return Err(RecordError::InvalidRecord);
+                }
+            }
+            for (key, record) in &state.policy.issuers {
+                store.validate_issuer(record)?;
+                if key != &record.subject {
+                    return Err(RecordError::InvalidRecord);
+                }
+            }
+            for (key, record) in &state.policy.bindings {
+                store.validate_binding(record)?;
+                if key != &record.namespace {
                     return Err(RecordError::InvalidRecord);
                 }
             }
@@ -295,6 +378,38 @@ impl EnrollmentPolicyStore {
             .get(id)
             .map(|record| record.revision)
     }
+    /// Highest accepted revision of the root's statement about a delegate.
+    pub fn observed_issuer_revision(&self, delegate: &[u8; 32]) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy
+            .issuers
+            .get(&hex::encode(delegate))
+            .map(|record| record.revision)
+    }
+    /// Whether an accepted root record currently revokes this delegate key.
+    pub fn issuer_revoked(&self, delegate: &[u8; 32]) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy
+            .issuers
+            .get(&hex::encode(delegate))
+            .is_some_and(|record| record.status == IssuerStatus::Revoked)
+    }
+    /// Active namespace bindings this fleet store has accepted.
+    pub fn bindings(&self) -> Vec<NamespaceBindingV1> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy
+            .bindings
+            .values()
+            .filter(|binding| binding.status == BindingStatus::Active)
+            .cloned()
+            .collect()
+    }
     fn check_doc(&self, doc: &CoreDoc) -> Result<(), RecordError> {
         if doc.doc.id().as_bytes() != &self.namespace {
             Err(RecordError::WrongNamespace)
@@ -329,7 +444,7 @@ impl EnrollmentPolicyStore {
         if let Some(value) = value {
             match self.decode_record(&key, &value) {
                 Ok(PolicyRecord::Node(record)) => self.observe_node(record)?,
-                Ok(PolicyRecord::Credential(_)) => return Err(RecordError::InvalidRecord),
+                Ok(_) => return Err(RecordError::InvalidRecord),
                 Err(error) => {
                     if let Some((subject, revision)) = self.rejection_watermark(&key, &value) {
                         self.observe_rejection(subject, revision)?;
@@ -357,6 +472,25 @@ impl EnrollmentPolicyStore {
                 return Err(RecordError::InvalidRecord);
             }
             self.observe_credential(record)?;
+        }
+        Ok(availability)
+    }
+    /// Refresh the root's statement about one delegate key (fleet only).
+    pub async fn refresh_issuer(
+        &self,
+        doc: &CoreDoc,
+        delegate: &[u8; 32],
+    ) -> Result<RecordAvailability, RecordError> {
+        if self.role != StoreRole::Fleet {
+            return Ok(RecordAvailability::Absent);
+        }
+        let key = issuer_status_key(delegate);
+        let (availability, value) = self.read(doc, key.clone()).await?;
+        if let Some(value) = value {
+            match self.decode_record(&key, &value)? {
+                PolicyRecord::Issuer(record) => self.observe_issuer(record)?,
+                _ => return Err(RecordError::InvalidRecord),
+            }
         }
         Ok(availability)
     }
@@ -417,11 +551,13 @@ impl EnrollmentPolicyStore {
         for (key, record) in records {
             let watermark = match &record {
                 PolicyRecord::Node(record) => Some((record.subject.clone(), record.revision)),
-                PolicyRecord::Credential(_) => None,
+                _ => None,
             };
             let result = match record {
                 PolicyRecord::Node(record) => self.apply_node(&mut next, record),
                 PolicyRecord::Credential(record) => self.apply_credential(&mut next, record),
+                PolicyRecord::Issuer(record) => Self::apply_issuer(&mut next, record),
+                PolicyRecord::Binding(record) => Self::apply_binding(&mut next, record),
             };
             match result {
                 Ok(update) => changed |= update,
@@ -470,6 +606,35 @@ impl EnrollmentPolicyStore {
             }
             self.validate_node(&record)?;
             Ok(PolicyRecord::Node(record))
+        } else if self.role != StoreRole::Fleet {
+            // Only the fleet namespace binds namespaces, revokes issuers or
+            // credentials. Elsewhere such records are unrelated, not partial.
+            Err(RecordError::WrongAudience)
+        } else if key.starts_with(b"aster/enrollment/v1/issuers/") {
+            #[derive(Deserialize)]
+            struct ScopedEnvelope {
+                audience: super::Audience,
+            }
+            let scope: ScopedEnvelope =
+                serde_json::from_slice(value).map_err(|_| RecordError::InvalidRecord)?;
+            if !scope.audience.contains(&self.audience) {
+                return Err(RecordError::WrongAudience);
+            }
+            let record: IssuerStatusV1 =
+                serde_json::from_slice(value).map_err(|_| RecordError::InvalidRecord)?;
+            if key != issuer_status_key(&identity(&record.subject)?) {
+                return Err(RecordError::InvalidRecord);
+            }
+            self.validate_issuer(&record)?;
+            Ok(PolicyRecord::Issuer(record))
+        } else if key.starts_with(b"aster/enrollment/v1/namespaces/") {
+            let record: NamespaceBindingV1 =
+                serde_json::from_slice(value).map_err(|_| RecordError::InvalidRecord)?;
+            if key != namespace_binding_key(&namespace_id(&record.namespace)?) {
+                return Err(RecordError::InvalidRecord);
+            }
+            self.validate_binding(&record)?;
+            Ok(PolicyRecord::Binding(record))
         } else if key.starts_with(b"aster/enrollment/v1/credentials/") {
             let record: CredentialStatusV1 =
                 serde_json::from_slice(value).map_err(|_| RecordError::InvalidRecord)?;
@@ -591,6 +756,42 @@ impl EnrollmentPolicyStore {
         }
         Ok(())
     }
+    fn validate_issuer(&self, record: &IssuerStatusV1) -> Result<(), RecordError> {
+        if !record.audience.contains(&self.audience) {
+            return Err(RecordError::WrongAudience);
+        }
+        if record.version != POLICY_RECORD_VERSION {
+            return Err(RecordError::UnsupportedVersion);
+        }
+        if identity(&record.issuer)? != self.root
+            || identity(&record.subject)? == self.root
+            || record.revision == 0
+        {
+            return Err(RecordError::InvalidRecord);
+        }
+        Ok(())
+    }
+    fn validate_binding(&self, record: &NamespaceBindingV1) -> Result<(), RecordError> {
+        if record.version != POLICY_RECORD_VERSION {
+            return Err(RecordError::UnsupportedVersion);
+        }
+        let bounded = |scopes: &BTreeSet<String>| {
+            scopes.len() <= crate::delegation::MAX_LIST_ENTRIES
+                && scopes.iter().all(|scope| {
+                    !scope.is_empty() && scope.len() <= crate::delegation::MAX_STRING_BYTES
+                })
+        };
+        if identity(&record.issuer)? != self.root
+            || namespace_id(&record.namespace)? == self.namespace
+            || record.revision == 0
+            || !bounded(&record.read_scopes)
+            || !bounded(&record.write_scopes)
+            || (record.purpose != NamespacePurpose::Observations && !record.write_scopes.is_empty())
+        {
+            return Err(RecordError::InvalidRecord);
+        }
+        Ok(())
+    }
     // Private: only authenticated Docs reads feed these transitions.
     fn observe_node(&self, record: NodeRegistrationV1) -> Result<(), RecordError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -684,7 +885,7 @@ impl EnrollmentPolicyStore {
             return Ok(false);
         }
         if !state.policy.nodes.contains_key(&record.subject)
-            && state.policy.nodes.len() + state.policy.credentials.len() >= MAX_POLICY_RECORDS
+            && state.policy.record_count() >= MAX_POLICY_RECORDS
         {
             return Err(RecordError::TooManyRecords);
         }
@@ -721,7 +922,7 @@ impl EnrollmentPolicyStore {
             return Ok(false);
         }
         if !state.policy.credentials.contains_key(&record.credential_id)
-            && state.policy.nodes.len() + state.policy.credentials.len() >= MAX_POLICY_RECORDS
+            && state.policy.record_count() >= MAX_POLICY_RECORDS
         {
             return Err(RecordError::TooManyRecords);
         }
@@ -740,6 +941,70 @@ impl EnrollmentPolicyStore {
                 .insert(record.credential_id.clone(), record);
         }
         Ok(changed)
+    }
+    fn observe_issuer(&self, record: IssuerStatusV1) -> Result<(), RecordError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::check_state(&state)?;
+        let mut next = state.clone();
+        match Self::apply_issuer(&mut next, record) {
+            Ok(changed) => self.commit(&mut state, next, changed),
+            Err(error) => {
+                if error == RecordError::TooManyRecords {
+                    state.failed = true;
+                }
+                Err(error)
+            }
+        }
+    }
+    fn apply_issuer(state: &mut State, record: IssuerStatusV1) -> Result<bool, RecordError> {
+        let old = state.policy.issuers.get(&record.subject);
+        let changed = check_root_revision(
+            old.map(|old| old.revision),
+            None,
+            record.revision,
+            old == Some(&record),
+            old.filter(|old| {
+                old.status == IssuerStatus::Revoked && record.status == IssuerStatus::Active
+            })
+            .map(|old| old.revision),
+            record.reauthorizes_revision,
+        )?;
+        if !changed {
+            return Ok(false);
+        }
+        if old.is_none() && state.policy.record_count() >= MAX_POLICY_RECORDS {
+            return Err(RecordError::TooManyRecords);
+        }
+        state.policy.issuers.insert(record.subject.clone(), record);
+        Ok(true)
+    }
+    /// A binding is withdrawn by retiring it at a higher revision. Retiring is
+    /// final for that namespace id, so a retired namespace never regains
+    /// authority; bind a fresh namespace instead.
+    fn apply_binding(state: &mut State, record: NamespaceBindingV1) -> Result<bool, RecordError> {
+        let old = state.policy.bindings.get(&record.namespace);
+        let changed = check_root_revision(
+            old.map(|old| old.revision),
+            None,
+            record.revision,
+            old == Some(&record),
+            None,
+            None,
+        )?;
+        if !changed {
+            return Ok(false);
+        }
+        if old.is_some_and(|old| old.status == BindingStatus::Retired) {
+            return Err(RecordError::ReauthorizationRequired);
+        }
+        if old.is_none() && state.policy.record_count() >= MAX_POLICY_RECORDS {
+            return Err(RecordError::TooManyRecords);
+        }
+        state
+            .policy
+            .bindings
+            .insert(record.namespace.clone(), record);
+        Ok(true)
     }
     fn commit(&self, state: &mut State, next: State, changed: bool) -> Result<(), RecordError> {
         if changed {
@@ -910,11 +1175,40 @@ impl AdmissionGuard for EnrollmentPolicyStore {
         }) {
             return Some(DenialReason::CredentialRevoked);
         }
+        if let AdmissionEvidenceSource::PresentedChain { issuers, .. } = evidence.source() {
+            if issuers.iter().any(|issuer| {
+                state
+                    .policy
+                    .issuers
+                    .get(&hex::encode(issuer))
+                    .is_some_and(|record| record.status == IssuerStatus::Revoked)
+            }) {
+                return Some(DenialReason::IssuerRevoked);
+            }
+        }
         None
+    }
+}
+/// Delegate keys the root has revoked, for chain verification (gate G6).
+impl RevokedDelegates for EnrollmentPolicyStore {
+    fn is_revoked(&self, key: &[u8; 32]) -> bool {
+        self.issuer_revoked(key)
     }
 }
 fn identity(value: &str) -> Result<[u8; 32], RecordError> {
     super::canonical_identity(value).map_err(|_| RecordError::InvalidRecord)
+}
+/// A namespace id is 32 bytes in canonical lowercase hex; unlike a node key
+/// it need not be a curve point.
+pub(super) fn namespace_id(value: &str) -> Result<[u8; 32], RecordError> {
+    let bytes: [u8; 32] = hex::decode(value)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(RecordError::InvalidRecord)?;
+    if hex::encode(bytes) != value {
+        return Err(RecordError::InvalidRecord);
+    }
+    Ok(bytes)
 }
 fn private_open(path: &Path) -> Result<File, RecordError> {
     let mut options = OpenOptions::new();
