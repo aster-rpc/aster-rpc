@@ -10,7 +10,9 @@ import { tmpdir } from 'node:os';
 import {
   AsterConfig,
   getProducerTokens,
+  isEnrollmentEnabled,
   loadIdentity,
+  mergeConfig,
   resolveRootPubkey,
 } from '@aster-rpc/aster';
 
@@ -18,7 +20,10 @@ import {
 const ENV_KEYS = Object.keys(process.env).filter((k) => k.startsWith('ASTER_'))
   .concat([
     'ASTER_LOG_FORMAT', 'ASTER_LOG_LEVEL', 'ASTER_LOG_MASK', 'ASTER_HEALTH_PORT',
-    'ASTER_HEALTH_HOST', 'ASTER_HEALTH_ENABLED', 'ASTER_ALLOW_ALL_CONSUMERS', 'ASTER_ALLOW_ALL_PRODUCERS',
+    'ASTER_HEALTH_HOST', 'ASTER_HEALTH_ENABLED', 'ASTER_ALLOW_ALL_CONSUMERS', 'ASTER_ENROLLMENT_CREDENTIAL_IID',
+    'ASTER_ENROLLMENT_AUDIENCE', 'ASTER_ENROLLMENT_FLEET_NAMESPACE', 'ASTER_ENROLLMENT_POLICY',
+    'ASTER_ENROLLMENT_ROLE_ATTRIBUTE', 'ASTER_ENROLLMENT_HANDSHAKE_TIMEOUT_MS',
+    'ASTER_ENROLLMENT_CREDENTIAL', 'ASTER_ENROLLMENT_REPLICAS', 'ASTER_ROOT_ROTATIONS', 'ASTER_ROOT_SEQ',
     'ASTER_RELAY_MODE', 'ASTER_RELAY_URLS', 'ASTER_BIND_ADDR', 'ASTER_SECRET_KEY',
     'ASTER_SECRET_KEY_FILE', 'ASTER_STORAGE_PATH', 'ASTER_GC_INTERVAL_MS',
     'ASTER_HOOK_TIMEOUT_MS', 'ASTER_TRANSPORT_RECEIVE_WINDOW', 'ASTER_ENABLE_HOOKS',
@@ -54,8 +59,17 @@ describe('AsterConfig.fromEnv', () => {
     expect(c.logFormat).toBe('text');
     expect(c.logLevel).toBe('info');
     expect(c.logMask).toBe(true);
-    expect(c.allowAllConsumers).toBe(false);
-    expect(c.allowAllProducers).toBe(true);
+    // Retired with the legacy consumer admission.
+    expect('allowAllConsumers' in c).toBe(false);
+    expect('allowAllProducers' in c).toBe(false);
+    expect('enrollmentCredentialIid' in c).toBe(false);
+    // Enrollment is off, with the Rust defaults filled in.
+    expect(isEnrollmentEnabled(c)).toBe(false);
+    expect(c.rootSeq).toBe(0);
+    expect(c.rootRotations).toEqual([]);
+    expect(c.enrollment?.roles).toEqual({
+      attribute: 'aster.role', scopesAsRoles: false, scopes: {}, tags: {}, includeAttributes: true,
+    });
     expect(c.relayMode).toBe('default');
     expect(c.hookTimeoutMs).toBe(5000);
     expect(c.hookFailureMode).toBe('fail_open');
@@ -70,6 +84,7 @@ describe('AsterConfig.fromEnv', () => {
   it('reads ASTER_* variables, including u64 knobs above u32', () => {
     process.env.ASTER_LOG_FORMAT = 'json';
     process.env.ASTER_HEALTH_PORT = '8080';
+    // A retired variable is ignored; it never opens anything.
     process.env.ASTER_ALLOW_ALL_CONSUMERS = 'true';
     process.env.ASTER_RELAY_URLS = 'https://r1.example, https://r2.example';
     process.env.ASTER_SECRET_KEY = KEY_A;
@@ -79,7 +94,8 @@ describe('AsterConfig.fromEnv', () => {
     const c = AsterConfig.fromEnv();
     expect(c.logFormat).toBe('json');
     expect(c.healthPort).toBe(8080);
-    expect(c.allowAllConsumers).toBe(true);
+    expect('allowAllConsumers' in c).toBe(false);
+    expect(isEnrollmentEnabled(c)).toBe(false);
     expect(c.relayMode).toBe('custom');
     expect(c.relayUrls).toEqual(['https://r1.example', 'https://r2.example']);
     expect(c.secretKey).toBe(KEY_A);
@@ -99,8 +115,34 @@ describe('AsterConfig.fromFile', () => {
     const file = join(dir, 'aster.toml');
     writeFileSync(file, `
 [trust]
-allow_all_consumers = true
 root_pubkey = "${ROOT}"
+enrollment_credential = "${join(dir, 'node.cred')}"
+next_root_commitment = "${'cd'.repeat(32)}"
+root_seq = 2
+root_rotations = ["s1", "s2"]
+
+[enrollment]
+audience = "mission-control"
+fleet_namespace = "${'ef'.repeat(32)}"
+state_path = "${join(dir, 'enrollment.json')}"
+replicas = ["${'01'.repeat(32)}"]
+policy = { all_of = [{ scope = "ops" }, "tolerate_stale_policy"] }
+renew = false
+
+[enrollment.limits]
+handshake_timeout_ms = 2500
+sync_timeout_ms = 9000
+
+[enrollment.roles]
+scopes_as_roles = true
+include_attributes = false
+
+[enrollment.roles.scopes]
+fleet = ["ops.status", "ops.logs"]
+
+[enrollment.issuer]
+delegation_file = "${join(dir, 'issuer.chain')}"
+lifetime = "2h"
 
 [storage]
 path = "${join(dir, 'store')}"
@@ -125,8 +167,26 @@ host = "0.0.0.0"
 `);
     process.env.ASTER_LOG_LEVEL = 'error';
     const c = AsterConfig.fromFile(file);
-    expect(c.allowAllConsumers).toBe(true);
     expect(c.rootPubkey).toBe(ROOT);
+    expect(c.enrollmentCredentialFile).toBe(join(dir, 'node.cred'));
+    expect(c.nextRootCommitment).toBe('cd'.repeat(32));
+    expect(c.rootSeq).toBe(2);
+    expect(c.rootRotations).toEqual(['s1', 's2']);
+    expect(isEnrollmentEnabled(c)).toBe(true);
+    const e = c.enrollment!;
+    expect(e.audience).toBe('mission-control');
+    expect(e.fleetNamespace).toBe('ef'.repeat(32));
+    expect(e.statePath).toBe(join(dir, 'enrollment.json'));
+    expect(e.replicas).toEqual(['01'.repeat(32)]);
+    expect(e.policy).toEqual({ all_of: [{ scope: 'ops' }, 'tolerate_stale_policy'] });
+    expect(e.renew).toBe(false);
+    expect(e.limits?.handshakeTimeoutMs).toBe(2500);
+    expect(e.limits?.syncTimeoutMs).toBe(9000);
+    expect(e.roles?.scopesAsRoles).toBe(true);
+    expect(e.roles?.includeAttributes).toBe(false);
+    expect(e.roles?.scopes).toEqual({ fleet: ['ops.status', 'ops.logs'] });
+    expect(e.issuerDelegationFile).toBe(join(dir, 'issuer.chain'));
+    expect(e.issuerLifetimeSecs).toBe(7200);
     expect(c.storagePath).toBe(join(dir, 'store'));
     expect(c.gcIntervalMs).toBe(60000);
     expect(c.relayMode).toBe('disabled');
@@ -234,6 +294,98 @@ describe('AsterConfig round trip', () => {
     // `{ ...fromEnv(), relayUrls }` (mode "default") selects custom relays.
     expect(AsterConfig.resolve({ relayMode: 'default', relayUrls: ['https://r'] }).relayMode)
       .toBe('custom');
+  });
+});
+
+describe('enrollment configuration', () => {
+  it('reads the ASTER_ENROLLMENT_* variables with the Rust names', () => {
+    process.env.ASTER_ENROLLMENT_AUDIENCE = 'mc';
+    process.env.ASTER_ENROLLMENT_FLEET_NAMESPACE = 'ab'.repeat(32);
+    process.env.ASTER_ENROLLMENT_POLICY = '{"any_of":[{"tag":"edge"},"require_registration"]}';
+    process.env.ASTER_ENROLLMENT_ROLE_ATTRIBUTE = 'team.role';
+    process.env.ASTER_ENROLLMENT_HANDSHAKE_TIMEOUT_MS = '1500';
+    process.env.ASTER_ENROLLMENT_CREDENTIAL = '/etc/aster/node.cred';
+    process.env.ASTER_ENROLLMENT_REPLICAS = `${'01'.repeat(32)}, ${'02'.repeat(32)}`;
+    process.env.ASTER_ROOT_ROTATIONS = 'a,b';
+    process.env.ASTER_ROOT_SEQ = '2';
+    const c = AsterConfig.fromEnv();
+    expect(isEnrollmentEnabled(c)).toBe(true);
+    expect(c.enrollmentCredentialFile).toBe('/etc/aster/node.cred');
+    expect(c.rootRotations).toEqual(['a', 'b']);
+    expect(c.rootSeq).toBe(2);
+    expect(c.enrollment?.audience).toBe('mc');
+    expect(c.enrollment?.policy).toEqual({ any_of: [{ tag: 'edge' }, 'require_registration'] });
+    expect(c.enrollment?.roles?.attribute).toBe('team.role');
+    expect(c.enrollment?.limits?.handshakeTimeoutMs).toBe(1500);
+    expect(c.enrollment?.replicas).toEqual(['01'.repeat(32), '02'.repeat(32)]);
+  });
+
+  it('enablement follows the Rust rule: the root alone does not enable it', () => {
+    expect(isEnrollmentEnabled({ rootPubkey: ROOT })).toBe(false);
+    expect(isEnrollmentEnabled({ enrollment: { audience: 'mc' } })).toBe(true);
+    expect(isEnrollmentEnabled({ enrollment: { fleetNamespace: 'ab'.repeat(32) } })).toBe(true);
+    expect(isEnrollmentEnabled({ enrollmentCredentialChain: 'x' })).toBe(true);
+    expect(isEnrollmentEnabled({ enrollmentCredentialFile: '/x.cred' })).toBe(true);
+    expect(isEnrollmentEnabled({ enrollment: { audience: 'mc', enabled: false } })).toBe(false);
+    expect(isEnrollmentEnabled({ enrollment: { enabled: true } })).toBe(true);
+  });
+
+  it('round-trips the section set in code', () => {
+    const input: AsterConfig = {
+      enrollmentCredentialChain: 'chain',
+      nextRootCommitment: 'cd'.repeat(32),
+      rootSeq: 1,
+      rootRotations: ['r1'],
+      enrollment: {
+        audience: 'mc',
+        fleetNamespace: 'ab'.repeat(32),
+        statePath: join(dir, 'e.json'),
+        replicas: ['01'.repeat(32)],
+        policy: { all_of: [{ attribute_equals: { key: 'k', value: { type: 'int', value: 3 } } }, 'tolerate_stale_policy'] },
+        requireSynchronizedClock: true,
+        activationLeewaySecs: 30,
+        limits: { stepTimeoutMs: 100, maxAdmittedPeers: 10 },
+        roles: { attribute: '', scopes: { a: ['r'] }, tags: { t: ['x', 'y'] } },
+        issuerDelegationFile: join(dir, 'issuer.chain'),
+        issuerLifetimeSecs: 600,
+        renewFrom: '01'.repeat(32),
+        renew: true,
+        synchronize: false,
+      },
+    };
+    const out = AsterConfig.resolve(input);
+    expect(out.enrollmentCredentialChain).toBe('chain');
+    expect(out.nextRootCommitment).toBe('cd'.repeat(32));
+    expect(out.rootSeq).toBe(1);
+    expect(out.rootRotations).toEqual(['r1']);
+    const e = out.enrollment!;
+    expect(e.policy).toEqual(input.enrollment!.policy);
+    expect(e.requireSynchronizedClock).toBe(true);
+    expect(e.activationLeewaySecs).toBe(30);
+    expect(e.limits).toMatchObject({ stepTimeoutMs: 100, maxAdmittedPeers: 10 });
+    expect(e.roles).toEqual({
+      attribute: '', scopesAsRoles: false, scopes: { a: ['r'] }, tags: { t: ['x', 'y'] }, includeAttributes: true,
+    });
+    expect(e.issuerLifetimeSecs).toBe(600);
+    expect(e.renewFrom).toBe('01'.repeat(32));
+    expect(e.renew).toBe(true);
+    expect(e.synchronize).toBe(false);
+    expect(AsterConfig.resolve(out)).toEqual(out);
+  });
+
+  it('mergeConfig overlays the enrollment section field by field', () => {
+    const base: AsterConfig = {
+      logLevel: 'info',
+      enrollment: {
+        audience: 'mc', fleetNamespace: 'ab'.repeat(32), limits: { stepTimeoutMs: 5 }, roles: { attribute: 'a' },
+      },
+    };
+    const merged = mergeConfig(base, { enrollment: { statePath: '/s', limits: { syncTimeoutMs: 9 } } });
+    expect(merged.enrollment).toEqual({
+      audience: 'mc', fleetNamespace: 'ab'.repeat(32), statePath: '/s',
+      limits: { stepTimeoutMs: 5, syncTimeoutMs: 9 }, roles: { attribute: 'a' },
+    });
+    expect(mergeConfig(base, { logLevel: 'debug' }).enrollment).toBe(base.enrollment);
   });
 });
 

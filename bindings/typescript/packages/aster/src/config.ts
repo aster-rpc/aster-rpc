@@ -48,19 +48,43 @@ export interface AsterConfig {
   // ── Trust ──────────────────────────────────────────────────────────────
   /** Deployment root public key. `ASTER_ROOT_PUBKEY`, `[trust] root_pubkey`. */
   rootPubkey?: KeyMaterial;
-  /** File with the root public key (hex or `{"public_key": "<hex>"}`). */
-  rootPubkeyFile?: string;
-  /** Enrollment credential file. `ASTER_ENROLLMENT_CREDENTIAL`. */
-  enrollmentCredentialFile?: string;
-  /** Cloud instance identity token. `ASTER_ENROLLMENT_CREDENTIAL_IID`. */
-  enrollmentCredentialIid?: string;
-  /** Skip the consumer admission gate (dev mode). `ASTER_ALLOW_ALL_CONSUMERS`. */
-  allowAllConsumers?: boolean;
   /**
-   * Kept for schema parity with Rust. Producer mesh admission is not
-   * supported by the TypeScript binding: `AsterServer` throws on `false`.
+   * File with the root public key (hex or `{"public_key": "<hex>"}`).
+   * `ASTER_ROOT_PUBKEY_FILE`, `[trust] root_pubkey_file`. A configured file
+   * that does not exist fails an enrollment start.
    */
-  allowAllProducers?: boolean;
+  rootPubkeyFile?: string;
+  /**
+   * Pre-rotation commitment to the next root key (64 hex, as
+   * `aster trust show` prints it). Without it every rotation statement is
+   * refused. `ASTER_NEXT_ROOT_COMMITMENT`, `[trust] next_root_commitment`.
+   */
+  nextRootCommitment?: string;
+  /** Rotations applied to reach the root (default 0). `ASTER_ROOT_SEQ`, `[trust] root_seq`. */
+  rootSeq?: number | bigint;
+  /**
+   * Applied rotation statements, oldest first; needs `nextRootCommitment`.
+   * `ASTER_ROOT_ROTATIONS` (comma-separated), `[trust] root_rotations`.
+   */
+  rootRotations?: string[];
+  /**
+   * This node's enrollment credential: the chain file `aster enroll node
+   * --out` writes. Setting it enables enrollment.
+   * `ASTER_ENROLLMENT_CREDENTIAL`, `[trust] enrollment_credential`.
+   */
+  enrollmentCredentialFile?: string;
+  /**
+   * This node's enrollment credential chain inline; wins over the file. A
+   * value that is not a chain (a path, say) is refused.
+   * `ASTER_ENROLLMENT_CREDENTIAL_CHAIN`, `[trust] enrollment_credential_chain`.
+   */
+  enrollmentCredentialChain?: string;
+  /**
+   * Enrollment (the `[enrollment]` section): which peers `AsterServer` admits
+   * and how their credential claims become the roles `requires` checks. See
+   * {@link EnrollmentConfig}.
+   */
+  enrollment?: EnrollmentConfig;
 
   // ── Connect ────────────────────────────────────────────────────────────
   /** Producer address for consumer-side dialing. `ASTER_ENDPOINT_ADDR`. */
@@ -155,6 +179,127 @@ export interface AsterConfig {
   healthEnabled?: boolean;
 }
 
+
+/**
+ * The admission policy, as the externally tagged `PolicyConfig` tree (the
+ * same JSON as `ASTER_ENROLLMENT_POLICY` and the TOML `[enrollment] policy`).
+ * Unknown nodes are refused when the node starts.
+ *
+ * @example
+ * ```ts
+ * const policy: PolicyConfig = { all_of: [{ scope: 'ops' }, 'tolerate_stale_policy'] };
+ * ```
+ * @group Enrollment
+ */
+export type PolicyConfig =
+  | 'tolerate_stale_policy'
+  | 'require_registration'
+  | { all_of: PolicyConfig[] }
+  | { any_of: PolicyConfig[] }
+  | { none_of: PolicyConfig[] }
+  | { source_cidr: string }
+  | { audience: string }
+  | { scope: string }
+  | { tag: string }
+  | {
+      attribute_equals: {
+        key: string;
+        value: { type: 'bool' | 'int' | 'float' | 'string'; value: boolean | number | string };
+      };
+    }
+  | { issued_by: string }
+  | { max_credential_age_secs: number }
+  | { policy_synchronized_within: { max_age_secs: number; require_root?: boolean } };
+
+/**
+ * `[enrollment.limits]`: overrides of the Enrollment defaults
+ * (`ASTER_ENROLLMENT_<FIELD>` upper-cased, e.g.
+ * `ASTER_ENROLLMENT_HANDSHAKE_TIMEOUT_MS`).
+ * @group Enrollment
+ */
+export interface EnrollmentLimits {
+  handshakeTimeoutMs?: number | bigint;
+  stepTimeoutMs?: number | bigint;
+  policyTimeoutMs?: number | bigint;
+  reconciliationIntervalMs?: number | bigint;
+  maxAdmittedPeers?: number | bigint;
+  /** Bound on enrolling with and synchronizing from a replica (default 15 000 ms). */
+  syncTimeoutMs?: number | bigint;
+}
+
+/**
+ * `[enrollment.roles]`: how a peer's verified claims become the attributes
+ * `requires` is checked against. A peer's roles are the comma-separated
+ * values of the claim attribute `attribute`, plus every verified scope when
+ * `scopesAsRoles`, plus the roles `scopes` / `tags` map its scopes and tags
+ * to. Evaluated on every call.
+ * @group Enrollment
+ */
+export interface EnrollmentRoles {
+  /** Claim attribute listing roles (default `"aster.role"`; `""` disables it). `ASTER_ENROLLMENT_ROLE_ATTRIBUTE`. */
+  attribute?: string;
+  /** Each verified scope is also a role (default false). `ASTER_ENROLLMENT_SCOPES_AS_ROLES`. */
+  scopesAsRoles?: boolean;
+  /** Scope → roles. `[enrollment.roles.scopes]`. */
+  scopes?: Record<string, string[]>;
+  /** Tag → roles. `[enrollment.roles.tags]`. */
+  tags?: Record<string, string[]>;
+  /** Pass the other claim attributes to handlers (default true). `ASTER_ENROLLMENT_INCLUDE_ATTRIBUTES`. */
+  includeAttributes?: boolean;
+}
+
+/**
+ * The `[enrollment]` section, field for field the Rust `EnrollmentConfig`.
+ *
+ * Enrollment is on when `enabled` is `true`, or, with `enabled` unset, when
+ * an `audience`, `fleetNamespace`, `issuerDelegationFile` or a credential
+ * (`enrollmentCredentialFile` / `enrollmentCredentialChain`) is set. Once on,
+ * every value is validated when the server or client starts and any missing
+ * or malformed value fails the start with an error naming it: enrollment
+ * never degrades to an open node.
+ * @group Enrollment
+ */
+export interface EnrollmentConfig {
+  /** Force enrollment on or off. `ASTER_ENROLLMENT_ENABLED`. */
+  enabled?: boolean;
+  /** Fleet audience. Required. `ASTER_ENROLLMENT_AUDIENCE`. */
+  audience?: string;
+  /** Fleet policy namespace (64 hex, from `aster enroll namespace create`). Required. `ASTER_ENROLLMENT_FLEET_NAMESPACE`. */
+  fleetNamespace?: string;
+  /**
+   * Durable denials and watermarks. Default `<storagePath>/enrollment.json`;
+   * a server with neither refuses to start, a client uses a temporary
+   * directory. `ASTER_ENROLLMENT_STATE_PATH`.
+   */
+  statePath?: string;
+  /** Policy replicas (`aster1…` tickets or 64-hex node ids). `ASTER_ENROLLMENT_REPLICAS`. */
+  replicas?: string[];
+  /** Admission policy (default `"tolerate_stale_policy"`). `ASTER_ENROLLMENT_POLICY` (JSON). */
+  policy?: PolicyConfig;
+  /** Refuse to start on an unsynchronized clock (Linux). `ASTER_ENROLLMENT_REQUIRE_SYNCHRONIZED_CLOCK`. */
+  requireSynchronizedClock?: boolean;
+  /** `iat`/`nbf` leeway, 0–300 s (default 60). `ASTER_ENROLLMENT_ACTIVATION_LEEWAY_SECS`. */
+  activationLeewaySecs?: number | bigint;
+  /** `[enrollment.limits]`. */
+  limits?: EnrollmentLimits;
+  /** `[enrollment.roles]`. */
+  roles?: EnrollmentRoles;
+  /**
+   * Server only: run a delegated issuer holding this delegation chain
+   * (`aster enroll delegate --out`) and serve `aster.enrollment.IssuerV1`.
+   * `[enrollment.issuer] delegation_file`, `ASTER_ENROLLMENT_ISSUER_DELEGATION_FILE`.
+   */
+  issuerDelegationFile?: string;
+  /** Lifetime of issued credentials in seconds (default 24 h). `[enrollment.issuer] lifetime`, `ASTER_ENROLLMENT_ISSUER_LIFETIME`. */
+  issuerLifetimeSecs?: number | bigint;
+  /** Issuer to renew this node's credential from (ticket or node id). `ASTER_ENROLLMENT_RENEW_FROM`. */
+  renewFrom?: string;
+  /** `false` disables renewal. `ASTER_ENROLLMENT_RENEW`. */
+  renew?: boolean;
+  /** Client: synchronize the fleet namespace the server offers (default true). `ASTER_ENROLLMENT_SYNCHRONIZE`. */
+  synchronize?: boolean;
+}
+
 function keyHex(value: KeyMaterial | undefined): string | undefined {
   if (value === undefined || value === null) return undefined;
   return typeof value === 'string' ? value : Buffer.from(value).toString('hex');
@@ -206,6 +351,39 @@ export const AsterConfig = {
     return fromNative(loadNative().asterConfigResolve(toNativeConfig(config)));
   },
 };
+
+/**
+ * Overlay `override` on `base` the way `AsterServer` / `AsterClient` resolve
+ * their configuration (`{ ...AsterConfig.fromEnv(), ...opts.config }`), but
+ * merging the `enrollment` section (and its `limits` / `roles`) field by
+ * field, so setting one enrollment value in code keeps the rest from the
+ * environment or file.
+ */
+export function mergeConfig(base: AsterConfig, override: Partial<AsterConfig> = {}): AsterConfig {
+  const out: AsterConfig = { ...base, ...override };
+  if (base.enrollment && override.enrollment) {
+    const b = base.enrollment;
+    const o = override.enrollment;
+    out.enrollment = {
+      ...b,
+      ...o,
+      ...(b.limits || o.limits ? { limits: { ...b.limits, ...o.limits } } : {}),
+      ...(b.roles || o.roles ? { roles: { ...b.roles, ...o.roles } } : {}),
+    };
+  }
+  return out;
+}
+
+/**
+ * Whether `config` enables enrollment (Rust
+ * `AsterConfig::is_enrollment_enabled`): `enrollment.enabled` when set,
+ * otherwise when an audience, fleet namespace, issuer delegation or
+ * credential is configured. The root key alone does not enable it.
+ * @group Enrollment
+ */
+export function isEnrollmentEnabled(config: AsterConfig): boolean {
+  return loadNative().asterConfigIsEnrollmentEnabled(toNativeConfig(config));
+}
 
 /**
  * The deployment root public key (hex) from `rootPubkey` / `rootPubkeyFile`
@@ -310,8 +488,13 @@ export function printConfig(config: AsterConfig): void {
   const root = keyHex(config.rootPubkey);
   console.log(`  [trust]`);
   console.log(`    root_pubkey             : ${root ? `${root.slice(0, 8)}...` : '<not set>'}`);
-  console.log(`    allow_all_consumers     : ${config.allowAllConsumers ?? false}`);
-  console.log(`    allow_all_producers     : ${config.allowAllProducers ?? true}`);
+  console.log(`    enrollment_credential   : ${config.enrollmentCredentialFile ?? (config.enrollmentCredentialChain ? '<inline chain>' : '<not set>')}`);
+  const e = config.enrollment ?? {};
+  console.log(`  [enrollment]`);
+  console.log(`    enabled                 : ${isEnrollmentEnabled(config)}`);
+  console.log(`    audience                : ${e.audience ?? '<not set>'}`);
+  console.log(`    fleet_namespace         : ${e.fleetNamespace ? `${e.fleetNamespace.slice(0, 8)}...` : '<not set>'}`);
+  console.log(`    state_path              : ${e.statePath ?? '<default>'}`);
   console.log(`  [connect]`);
   console.log(`    endpoint_addr           : ${config.endpointAddr ?? '<not set>'}`);
   console.log(`  [network]`);

@@ -35,6 +35,15 @@ pub struct Node {
 }
 
 impl Node {
+    /// Wrap a node another owner started (an `AsterServer` or `AsterClient`):
+    /// no admission hooks are exposed, because that owner holds them.
+    pub(crate) fn from_aster(inner: aster::Node) -> Self {
+        Self {
+            inner,
+            admission: None,
+        }
+    }
+
     /// The transport-core node, for sibling modules and the
     /// still-core-backed methods below.
     pub(crate) fn core(&self) -> &CoreNode {

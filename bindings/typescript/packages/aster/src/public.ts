@@ -77,7 +77,7 @@ export { AsterServer } from './runtime.js';
 export type { AsterServerOptions } from './runtime.js';
 
 /**
- * High-level RPC client wrapper with admission, proxy, and typed clients.
+ * High-level RPC client wrapper with enrollment, proxy, and typed clients.
  * @group Server and Client
  */
 export { AsterClientWrapper } from './runtime.js';
@@ -95,10 +95,11 @@ export type { AsterClientOptions } from './runtime.js';
 export { ProxyClient } from './runtime.js';
 
 /**
- * Thrown when a connection is rejected by the producer's admission gate.
- * @group Server and Client
+ * The `[enrollment]` configuration section: only enrolled peers connect to
+ * an `AsterServer`, and their credential roles reach `requires`.
+ * @group Enrollment
  */
-export { AdmissionDeniedError } from './runtime.js';
+export type { EnrollmentConfig, EnrollmentLimits, EnrollmentRoles, PolicyConfig } from './config.js';
 
 /**
  * Unified node/server/client configuration (`AsterConfig.fromEnv()` /

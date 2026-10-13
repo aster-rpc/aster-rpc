@@ -1,21 +1,16 @@
 /**
- * Admission ALPNs and the admit hook the frozen credential handlers call.
+ * The delegated-admission ALPN and the admit hook its handler calls.
  *
  * Gate 0 itself (which peer may use which ALPN) is decided in Rust — see
- * `GatePolicy` in `../gate.ts`. This module only names the ALPNs that stay
- * open to un-admitted peers and the narrow interface the credential
- * handlers use to admit a peer after a successful credential check.
+ * `GatePolicy` in `../gate.ts`. This module only names the delegated
+ * admission ALPN and the narrow interface `handleDelegatedAdmissionConnection`
+ * uses to admit a peer after a successful check. (The consumer and producer
+ * admission ALPNs are retired: `AsterServer` admits peers with Enrollment.)
  */
 
 import type { GatePolicy } from '../gate.js';
 
 const _encoder = new TextEncoder();
-
-/** Admission ALPN for producer enrollment. */
-export const PRODUCER_ADMISSION_ALPN: Uint8Array = _encoder.encode('aster.producer_admission');
-
-/** Admission ALPN for consumer enrollment. */
-export const CONSUMER_ADMISSION_ALPN: Uint8Array = _encoder.encode('aster.consumer_admission');
 
 /** Admission ALPN for delegated enrollment. */
 export const DELEGATED_ADMISSION_ALPN: Uint8Array = _encoder.encode('aster.admission');

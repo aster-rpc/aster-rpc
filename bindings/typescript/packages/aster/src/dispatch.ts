@@ -23,7 +23,8 @@ import { HttpListener, type HttpListenerOptions, type RpcAuthenticator } from '.
  * aborts it too.
  */
 
-import type { IrohConnection } from '@aster-rpc/transport';
+import type { AsterConfig as NativeAsterConfig, IrohConnection } from '@aster-rpc/transport';
+import { toNativeConfig, type AsterConfig } from './config.js';
 import type { Codec } from './codec.js';
 import { createXlangCodec } from './xlang.js';
 import { RpcError, StatusCode } from './status.js';
@@ -154,17 +155,17 @@ export interface ServerOptions extends DispatchServerTuning {
   /** Event delivery (default `tsfn-batched`; TSFN variants use a bounded coalesced drain). */
   delivery?: DispatchDelivery;
   /**
-   * Connections on non-RPC ALPNs no Rust handler claimed (e.g. the frozen
-   * consumer-admission ALPNs). Without a handler they are closed.
+   * Connections on non-RPC ALPNs no Rust handler claimed (an application
+   * ALPN in `config.alpns`). Without a handler they are closed.
    */
   onNonRpc?: (alpn: string, connection: IrohConnection) => void;
   /** Called once per closed `aster/1` connection. */
   onConnectionClosed?: (connectionId: number, peer: string) => void;
   /**
-   * Attribute bridge (design §2.6): Gate 3 also reads each caller's
-   * attributes from this gate's admission store, so `requires` admits
-   * credentialed callers. Costs one task per call in Rust; `AsterServer`
-   * sets it only when a service declares `requires`.
+   * Attribute bridge (design §2.6), for `start(node)` only: Gate 3 also
+   * reads each caller's attributes from this gate's admission store, so
+   * `requires` admits peers admitted there with attributes. Costs one task
+   * per call in Rust.
    */
   gateAttributes?: { native: unknown };
   /**
@@ -235,11 +236,27 @@ export class RpcServer {
   async start(node: unknown): Promise<void> {
     if (this.loop) return;
     const nativeNode = (node as { native?: unknown }).native ?? node;
+    await this.startLoop({ node: nativeNode });
+  }
+
+  /**
+   * Start the Rust `AsterServer` from `config` (its own node) and serve on
+   * it. This is the path `AsterServer` uses: the configuration's
+   * `[enrollment]` section installs Enrollment there, so Gate 0 admits
+   * enrolled peers only and `requires` reads each peer's credential roles.
+   * `close()` shuts the node down; reach it with `dispatchServer.node()`.
+   */
+  async startWithConfig(config: AsterConfig): Promise<void> {
+    if (this.loop) return;
+    await this.startLoop({ config: toNativeConfig(config) });
+  }
+
+  private async startLoop(target: { node?: unknown; config?: NativeAsterConfig }): Promise<void> {
     this.table = this.registry.getAllServices().map((info) => this.entryOf(info));
     const services = this.table.map((e) => lowerService(e.info));
     this.closedP = new Promise((r) => { this.resolveClosed = r; });
     this.loop = await DispatchLoop.start({
-      node: nativeNode,
+      ...target,
       services,
       delivery: this.opts.delivery,
       builtinNodeInfo: this.opts.builtinNodeInfo,
@@ -249,7 +266,7 @@ export class RpcServer {
       handlerTimeoutMs: this.opts.handlerTimeoutMs,
       ringCapacity: this.opts.ringCapacity,
       maxForeignInflight: this.opts.maxForeignInflight,
-      gateAttributes: this.opts.gateAttributes?.native,
+      gateAttributes: target.node ? this.opts.gateAttributes?.native : undefined,
       onCall: (ev, srv) => this.onCall(ev, srv),
       onEvent: (ev, srv) => this.onEvent(ev, srv),
     });

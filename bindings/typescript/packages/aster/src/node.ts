@@ -113,6 +113,15 @@ export class Node implements AsyncDisposable {
     return new Node(await native.Node.start(toNativeConfig(config), options.gate?.native));
   }
 
+  /**
+   * Wrap a node another owner started (the native `AsterServer` /
+   * `AsterClient`). Its owner shuts it down.
+   * @internal
+   */
+  static fromNative(native: NativeNode): Node {
+    return new Node(native);
+  }
+
   /** This node's id. */
   get id(): NodeId {
     return this.native.nodeId() as NodeId;

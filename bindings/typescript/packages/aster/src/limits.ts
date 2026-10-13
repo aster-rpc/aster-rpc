@@ -51,13 +51,7 @@ export const MAX_STATUS_MESSAGE_LEN = 4096;
 /** Maximum number of detail key-value pairs in an RpcStatus. */
 export const MAX_STATUS_DETAIL_ENTRIES = 32;
 
-// -- Admission limits --------------------------------------------------------
-
-/** Maximum number of ServiceSummary entries in a ConsumerAdmissionResponse. */
-export const MAX_SERVICES_IN_ADMISSION = 10_000;
-
-/** Maximum size of the admission request/response JSON payload. */
-export const MAX_ADMISSION_PAYLOAD_SIZE = 64 * 1024;
+// -- Service summary limits --------------------------------------------------
 
 /** Maximum number of channels per ServiceSummary. */
 export const MAX_CHANNELS_PER_SERVICE = 100;

@@ -578,6 +578,7 @@ if (!nativeBinding) {
 module.exports = nativeBinding
 module.exports.AdmissionRequest = nativeBinding.AdmissionRequest
 module.exports.AdmissionRequests = nativeBinding.AdmissionRequests
+module.exports.AsterClient = nativeBinding.AsterClient
 module.exports.BlobCancelToken = nativeBinding.BlobCancelToken
 module.exports.BlobCustody = nativeBinding.BlobCustody
 module.exports.BlobsClient = nativeBinding.BlobsClient
@@ -633,6 +634,7 @@ module.exports.TopologySnapshot = nativeBinding.TopologySnapshot
 module.exports.Upcalls = nativeBinding.Upcalls
 module.exports.asterConfigFromEnv = nativeBinding.asterConfigFromEnv
 module.exports.asterConfigFromFile = nativeBinding.asterConfigFromFile
+module.exports.asterConfigIsEnrollmentEnabled = nativeBinding.asterConfigIsEnrollmentEnabled
 module.exports.asterConfigResolve = nativeBinding.asterConfigResolve
 module.exports.asterConfigResolveRootPubkey = nativeBinding.asterConfigResolveRootPubkey
 module.exports.asterTicketDecode = nativeBinding.asterTicketDecode

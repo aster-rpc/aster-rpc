@@ -144,7 +144,7 @@ describe('AsterServer / AsterClientWrapper on Node + AsterConfig', () => {
       storagePath: join(dir, 'srv'),
       secretKeyFile: join(dir, 'srv', 'node.key'),
     };
-    const first = new AsterServer({ services: [], allowAllConsumers: true, config });
+    const first = new AsterServer({ services: [], config });
     await first.start();
     const id = first.endpointId;
     for (let i = 0; i < 100 && (first as any)._node.directAddresses().length === 0; i++) {
@@ -154,7 +154,7 @@ describe('AsterServer / AsterClientWrapper on Node + AsterConfig', () => {
     expect(first.address.startsWith('aster1')).toBe(true);
     await first.close();
 
-    const second = new AsterServer({ services: [], allowAllConsumers: true, config });
+    const second = new AsterServer({ services: [], config });
     await second.start();
     expect(second.endpointId).toBe(id);
     expect(SecretKey.nodeId(SecretKey.readFile(config.secretKeyFile)!)).toBe(id);
@@ -166,7 +166,7 @@ describe('AsterServer / AsterClientWrapper on Node + AsterConfig', () => {
     SecretKey.writeFile(keyFile, KEY_B);
     process.env.ASTER_SECRET_KEY_FILE = keyFile;
     try {
-      const server = new AsterServer({ services: [], allowAllConsumers: true });
+      const server = new AsterServer({ services: [] });
       await server.start();
       expect(server.endpointId).toBe(SecretKey.nodeId(KEY_B));
       await server.close();

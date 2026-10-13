@@ -11,6 +11,7 @@
 use napi_derive::napi;
 
 mod admission;
+mod aster_client;
 mod audit_outbox;
 mod blob_custody;
 mod blobs;
@@ -19,6 +20,8 @@ mod contract;
 mod coordination;
 mod crypto;
 mod docs;
+#[cfg(feature = "test-hooks")]
+mod enrollment_fixture;
 mod envelope;
 mod error;
 mod expose;

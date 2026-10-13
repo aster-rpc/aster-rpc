@@ -23,8 +23,10 @@ aster-otel = { path = "../../../aster-otel", version = "=0.3.0", features = ["ot
 # default + rpc + metrics + binding-support + coordination-client (plan D7:
 # the coordination client is wrapped, never ported; see aster/Cargo.toml) +
 # expose (socket targets with JavaScript authorization over R6 upcalls) + otel
-# and health (built-in metrics / spans, the /healthz /readyz /metrics listener).
-aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "binding-support", "coordination-client", "expose", "otel", "health", "audit-outbox"] }
+# and health (built-in metrics / spans, the /healthz /readyz /metrics listener)
+# + enrollment (`[enrollment]` on AsterServer / AsterClient, §15 of
+# docs/_internal/working_ideas/aster-enrollment.md).
+aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "binding-support", "coordination-client", "expose", "otel", "health", "audit-outbox", "enrollment"] }
 napi = { version = "3", default-features = false, features = ["async", "napi9", "serde-json"] }
 napi-derive = { version = "3", features = ["type-def"] }
 tokio = { workspace = true }

@@ -2,7 +2,7 @@
  * Gate 0 — connection-level peer admission, decided in Rust.
  *
  * {@link GatePolicy} wraps the Rust `GatePolicy`: the admission ALPNs
- * (`aster.consumer_admission`, `aster.admission`, `aster.producer_admission`)
+ * (by default `aster.admission` and the names core still reserves)
  * are open to every peer so it can present a credential; any other ALPN
  * needs a peer admitted into the gate's {@link PeerAdmissionStore} (or
  * `'open_dev'` mode). Rejected peers are closed with the gate's reject code
@@ -18,6 +18,11 @@
  *   else req.reject(403, 'not on the list');
  * }
  * ```
+ *
+ * `AsterServer` / `AsterClient` do not use a gate: with `[enrollment]`
+ * configured, Enrollment owns Gate 0 (only enrolled peers connect);
+ * without it the node is open. A gate is the low-level escape hatch for a
+ * node you start and serve yourself (`Node.start` + `RpcServer.start`).
  */
 
 import type {
@@ -26,7 +31,6 @@ import type {
   PeerAdmission as NativePeerAdmission,
   PeerAdmissionStore as NativePeerAdmissionStore,
 } from '@aster-rpc/transport';
-import type { AsterConfig } from './config.js';
 import { loadNative } from './native.js';
 
 /**
@@ -198,14 +202,6 @@ export class GatePolicy {
   /** An open (dev) gate: every peer passes. */
   static openDev(options: Omit<GatePolicyOptions, 'mode'> = {}): GatePolicy {
     return new GatePolicy({ ...options, mode: 'open_dev' });
-  }
-
-  /**
-   * The gate an Aster server runs from its trust settings:
-   * `allowAllConsumers` → `'open_dev'`, otherwise `'protected'`.
-   */
-  static fromConfig(config: Pick<AsterConfig, 'allowAllConsumers'>, options: Omit<GatePolicyOptions, 'mode'> = {}): GatePolicy {
-    return new GatePolicy({ ...options, mode: config.allowAllConsumers ? 'open_dev' : 'protected' });
   }
 
   get mode(): TrustMode {

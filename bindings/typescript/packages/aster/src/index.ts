@@ -509,6 +509,12 @@ export {
   loadIdentity,
   getProducerTokens,
   printConfig,
+  mergeConfig,
+  isEnrollmentEnabled,
+  type EnrollmentConfig,
+  type EnrollmentLimits,
+  type EnrollmentRoles,
+  type PolicyConfig,
   type AsterIdentity,
   type IdentityPeer,
   type RelayModeName,
@@ -594,9 +600,10 @@ export {
   AsterServer,
   AsterClientWrapper,
   ProxyClient,
-  AdmissionDeniedError,
+  REGISTRY_NAMESPACE_ATTRIBUTE,
   type AsterServerOptions,
   type AsterClientOptions,
+  type ServiceSummary,
 } from './runtime.js';
 
 // @aster endpoint registration
@@ -624,29 +631,10 @@ export {
   verify,
   ATTR_ROLE,
   ATTR_NAME,
-  type EnrollmentCredential,
-  type ConsumerEnrollmentCredential,
-  canonicalJson,
-  producerSigningBytes,
-  consumerSigningBytes,
-  credentialSigningBytes,
-  signCredential,
-  verifyCredentialSignature,
   hexToBytes,
   bytesToHex,
 } from './trust/credentials.js';
 export {
-  verifyConsumerCredential,
-  verifyProducerCredential,
-  checkOffline,
-  checkRuntime,
-  admit,
-  type AdmissionResult,
-  type AdmitOptions,
-} from './trust/admission.js';
-export {
-  PRODUCER_ADMISSION_ALPN,
-  CONSUMER_ADMISSION_ALPN,
   DELEGATED_ADMISSION_ALPN,
   gateAdmitter,
   type PeerAdmitter,
@@ -666,12 +654,6 @@ export {
   type AdmissionHookRequest,
   type AdmissionRejection,
 } from './gate.js';
-// Nonce store
-export {
-  InMemoryNonceStore,
-  type NonceStore,
-} from './trust/nonce.js';
-
 // RCAN validation
 export {
   evaluateCapability,
@@ -680,21 +662,6 @@ export {
   encodeRcan,
   decodeRcan,
 } from './trust/rcan.js';
-
-// IID (cloud identity)
-export {
-  verifyIID,
-  getIIDBackend,
-  MockIIDBackend,
-  AWSIIDBackend,
-  GCPIIDBackend,
-  AzureIIDBackend,
-  ATTR_IID_PROVIDER,
-  ATTR_IID_ACCOUNT,
-  ATTR_IID_REGION,
-  ATTR_IID_ROLE_ARN,
-  type IIDBackend,
-} from './trust/iid.js';
 
 // RPC server on `aster::rpc::Server` (dynamic dispatch, design §4.3)
 export { RpcServer, type ServerOptions } from './dispatch.js';
@@ -759,20 +726,6 @@ export {
   type EndpointLease,
   type GossipEvent,
 } from './registry/models.js';
-
-// Consumer admission
-export {
-  performAdmission,
-  consumerCredToJson,
-  consumerCredFromJson,
-  handleConsumerAdmissionRpc,
-  handleConsumerAdmissionConnection,
-  serveConsumerAdmission,
-  type ConsumerAdmissionRequest,
-  type ConsumerAdmissionResponse,
-  type ConsumerAdmissionOpts,
-  type ServiceSummary,
-} from './trust/consumer.js';
 
 // Delegated admission (aster.admission ALPN)
 export {

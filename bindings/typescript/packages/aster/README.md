@@ -1,7 +1,7 @@
 # @aster-rpc/aster
 
 Aster RPC framework for TypeScript — peer-to-peer services with typed
-payloads, streaming, and admission controls, built on [Iroh](https://github.com/n0-computer/iroh)
+payloads, streaming, and enrollment-based admission, built on [Iroh](https://github.com/n0-computer/iroh)
 (QUIC, blobs, docs, gossip).
 
 Runs on Node.js 20+, Bun 1.0+, and Deno via Node compat.
@@ -220,6 +220,34 @@ decorator options are redundant — the scanner reads the types from
 the AST directly. You can delete them from new code. They still
 work (and still trigger the runtime manifest path) if you haven't
 run the scanner yet.
+
+## Enrollment: who may connect, and their roles
+
+`AsterServer` and `AsterClientWrapper` admit peers with Enrollment, driven
+by `AsterConfig` alone (the same schema, TOML keys and `ASTER_*` variables as
+the Rust `AsterServer` / `AsterClient`). Without enrollment configured the
+server is open. With it, only nodes holding a credential from your root
+connect, and each peer's `aster.role` claim is what `requires` checks, on
+every call:
+
+```ts
+const server = new AsterServer({
+  services: [new MissionControl()],
+  config: {
+    rootPubkey: ROOT,                    // [trust] root_pubkey
+    secretKeyFile: 'server.key',         // aster key node generate --out server.key
+    enrollmentCredentialFile: 'server.cred', // aster enroll node --subject … --out server.cred
+    enrollment: { audience: 'mission-control', fleetNamespace: FLEET, statePath: './enrollment.json' },
+  },
+});
+```
+
+A client sets the same root, audience and fleet namespace plus its own key
+and credential; it enrolls with the server before its RPC connection opens
+and renews its credential from a configured issuer. Every missing or
+malformed value fails `start()` / `connect()` with an error naming it. See
+`examples/typescript/missionControl` (Chapter 5) for the CLI steps, and
+`CHANGELOG.md` for migrating from the retired consumer admission.
 
 ## Authenticated HTTPS and WebTransport listeners
 

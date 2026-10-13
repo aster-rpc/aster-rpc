@@ -115,7 +115,6 @@ async function serve(forwardTicket?: string): Promise<void> {
   }
   const server = new AsterServer({
     services: [new InteropEcho(forward), new InteropSession()],
-    allowAllConsumers: true,
     generated,
     config: { logLevel: 'warn' } as any,
   });

@@ -303,7 +303,7 @@ const isSession = (m: Manifest) => m.scoped === 'session' || m.scoped === 'strea
 function fromConnectionPreamble(svc: string, cls: string): string[] {
   return [
     `  static async fromConnection(client: AsterClientWrapper): Promise<${cls}> {`,
-    `    const summary = client.services.find((s: { name: string }) => s.name === "${svc}");`,
+    `    const summary = (await client.listServices()).find((s: { name: string }) => s.name === "${svc}");`,
     '    if (!summary) {',
     `      throw new Error("${svc} not offered by this peer (did you connect to the right address?)");`,
     '    }',

@@ -7,7 +7,7 @@
 //! value is above `Number.MAX_SAFE_INTEGER`, in which case it is a `bigint`.
 //! (The previous `EndpointConfig` narrowed them to `u32`.)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,8 +15,9 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use aster::{
-    AsterConfig as RsConfig, AsterIdentityPeer, HookFailureMode, LoadedIdentity, PublicKey,
-    RelayMode, SecretKey,
+    AsterConfig as RsConfig, AsterIdentityPeer, EnrollmentConfig as RsEnrollmentConfig,
+    EnrollmentLimits as RsEnrollmentLimits, HookFailureMode, LoadedIdentity, PublicKey, RelayMode,
+    RoleMappingConfig as RsRoleMappingConfig, SecretKey,
 };
 
 /// A non-negative integer knob: `number` (exact up to 2^53 - 1) or `bigint`.
@@ -40,15 +41,25 @@ pub struct JsAsterConfig {
     /// File holding the root public key (hex or `{"public_key": "<hex>"}`).
     /// `ASTER_ROOT_PUBKEY_FILE`, `[trust] root_pubkey_file`.
     pub root_pubkey_file: Option<String>,
-    /// Enrollment credential file. `ASTER_ENROLLMENT_CREDENTIAL`,
-    /// `[trust] enrollment_credential`.
+    /// Pre-rotation commitment to the next root key (64 hex).
+    /// `ASTER_NEXT_ROOT_COMMITMENT`, `[trust] next_root_commitment`.
+    pub next_root_commitment: Option<String>,
+    /// Rotations applied to reach the root (default 0). `ASTER_ROOT_SEQ`,
+    /// `[trust] root_seq`.
+    pub root_seq: Option<U64Value>,
+    /// Applied rotation statements, oldest first; needs
+    /// `nextRootCommitment`. `ASTER_ROOT_ROTATIONS` (comma-separated),
+    /// `[trust] root_rotations`.
+    pub root_rotations: Option<Vec<String>>,
+    /// This node's enrollment credential: the chain file `aster enroll node
+    /// --out` writes. Setting it enables enrollment.
+    /// `ASTER_ENROLLMENT_CREDENTIAL`, `[trust] enrollment_credential`.
     pub enrollment_credential_file: Option<String>,
-    /// Cloud instance identity document token. `ASTER_ENROLLMENT_CREDENTIAL_IID`.
-    pub enrollment_credential_iid: Option<String>,
-    /// Skip the consumer admission gate (dev mode). `ASTER_ALLOW_ALL_CONSUMERS`.
-    pub allow_all_consumers: Option<bool>,
-    /// Skip the producer admission gate. `ASTER_ALLOW_ALL_PRODUCERS`.
-    pub allow_all_producers: Option<bool>,
+    /// This node's enrollment credential chain inline; wins over the file.
+    /// `ASTER_ENROLLMENT_CREDENTIAL_CHAIN`, `[trust] enrollment_credential_chain`.
+    pub enrollment_credential_chain: Option<String>,
+    /// The `[enrollment]` section (see `EnrollmentConfig`).
+    pub enrollment: Option<JsEnrollmentConfig>,
     // ── Connect ──────────────────────────────────────────────────────────
     /// Producer address for consumer-side dialing. `ASTER_ENDPOINT_ADDR`.
     pub endpoint_addr: Option<String>,
@@ -145,6 +156,218 @@ pub struct JsAsterConfig {
     pub health_enabled: Option<bool>,
 }
 
+/// `[enrollment.limits]`: overrides of the Enrollment defaults
+/// (`ASTER_ENROLLMENT_<FIELD>` upper-cased, e.g.
+/// `ASTER_ENROLLMENT_HANDSHAKE_TIMEOUT_MS`).
+#[napi(object, js_name = "EnrollmentLimits")]
+#[derive(Default)]
+pub struct JsEnrollmentLimits {
+    pub handshake_timeout_ms: Option<U64Value>,
+    pub step_timeout_ms: Option<U64Value>,
+    pub policy_timeout_ms: Option<U64Value>,
+    pub reconciliation_interval_ms: Option<U64Value>,
+    pub max_admitted_peers: Option<U64Value>,
+    /// Bound on enrolling with and synchronizing from a replica (default 15 000).
+    pub sync_timeout_ms: Option<U64Value>,
+}
+
+/// `[enrollment.roles]`: how a peer's verified claims become the attributes
+/// `requires` is checked against.
+#[napi(object, js_name = "EnrollmentRoles")]
+#[derive(Default)]
+pub struct JsEnrollmentRoles {
+    /// Claim attribute listing roles (default `"aster.role"`; `""` disables
+    /// it). `ASTER_ENROLLMENT_ROLE_ATTRIBUTE`.
+    pub attribute: Option<String>,
+    /// Each verified scope is also a role. `ASTER_ENROLLMENT_SCOPES_AS_ROLES`.
+    pub scopes_as_roles: Option<bool>,
+    /// Scope → roles. `[enrollment.roles.scopes]`.
+    pub scopes: Option<HashMap<String, Vec<String>>>,
+    /// Tag → roles. `[enrollment.roles.tags]`.
+    pub tags: Option<HashMap<String, Vec<String>>>,
+    /// Pass the other claim attributes to handlers (default true).
+    /// `ASTER_ENROLLMENT_INCLUDE_ATTRIBUTES`.
+    pub include_attributes: Option<bool>,
+}
+
+/// The `[enrollment]` section, field for field the Rust `EnrollmentConfig`
+/// (`docs/_internal/working_ideas/aster-enrollment.md` §15.3).
+#[napi(object, js_name = "EnrollmentConfig")]
+#[derive(Default)]
+pub struct JsEnrollmentConfig {
+    /// Force enrollment on or off. Unset: on when an audience, fleet
+    /// namespace, issuer delegation or credential is set.
+    /// `ASTER_ENROLLMENT_ENABLED`.
+    pub enabled: Option<bool>,
+    /// Fleet audience. Required. `ASTER_ENROLLMENT_AUDIENCE`.
+    pub audience: Option<String>,
+    /// Fleet policy namespace (64 hex). Required.
+    /// `ASTER_ENROLLMENT_FLEET_NAMESPACE`.
+    pub fleet_namespace: Option<String>,
+    /// Durable denials and watermarks. `ASTER_ENROLLMENT_STATE_PATH`.
+    pub state_path: Option<String>,
+    /// Policy replicas (`aster1…` tickets or 64-hex node ids).
+    /// `ASTER_ENROLLMENT_REPLICAS`.
+    pub replicas: Option<Vec<String>>,
+    /// Admission policy: the `PolicyConfig` tree (an object, or a bare name
+    /// such as `"tolerate_stale_policy"`). `ASTER_ENROLLMENT_POLICY` (JSON).
+    pub policy: Option<serde_json::Value>,
+    /// Refuse to start on an unsynchronized clock (Linux).
+    /// `ASTER_ENROLLMENT_REQUIRE_SYNCHRONIZED_CLOCK`.
+    pub require_synchronized_clock: Option<bool>,
+    /// `iat`/`nbf` leeway, 0–300 s (default 60).
+    /// `ASTER_ENROLLMENT_ACTIVATION_LEEWAY_SECS`.
+    pub activation_leeway_secs: Option<U64Value>,
+    /// `[enrollment.limits]`.
+    pub limits: Option<JsEnrollmentLimits>,
+    /// `[enrollment.roles]`.
+    pub roles: Option<JsEnrollmentRoles>,
+    /// Server only: serve `aster.enrollment.IssuerV1` with this delegation.
+    /// `[enrollment.issuer] delegation_file`,
+    /// `ASTER_ENROLLMENT_ISSUER_DELEGATION_FILE`.
+    pub issuer_delegation_file: Option<String>,
+    /// Lifetime of issued credentials in seconds (default 24 h).
+    /// `[enrollment.issuer] lifetime`, `ASTER_ENROLLMENT_ISSUER_LIFETIME`.
+    pub issuer_lifetime_secs: Option<U64Value>,
+    /// Issuer to renew this node's credential from (ticket or node id).
+    /// `ASTER_ENROLLMENT_RENEW_FROM`.
+    pub renew_from: Option<String>,
+    /// `false` disables renewal. `ASTER_ENROLLMENT_RENEW`.
+    pub renew: Option<bool>,
+    /// Client: synchronize the fleet namespace the server offers (default
+    /// true). `ASTER_ENROLLMENT_SYNCHRONIZE`.
+    pub synchronize: Option<bool>,
+}
+
+fn opt_u64(field: &str, value: &Option<U64Value>) -> Result<Option<u64>> {
+    value.as_ref().map(|v| u64_in(field, v)).transpose()
+}
+
+fn role_map(map: &Option<HashMap<String, Vec<String>>>) -> BTreeMap<String, Vec<String>> {
+    map.iter()
+        .flatten()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+impl JsEnrollmentLimits {
+    fn to_rust(&self) -> Result<RsEnrollmentLimits> {
+        let f = |name: &str| format!("enrollment.limits.{name}");
+        Ok(RsEnrollmentLimits {
+            handshake_timeout_ms: opt_u64(&f("handshakeTimeoutMs"), &self.handshake_timeout_ms)?,
+            step_timeout_ms: opt_u64(&f("stepTimeoutMs"), &self.step_timeout_ms)?,
+            policy_timeout_ms: opt_u64(&f("policyTimeoutMs"), &self.policy_timeout_ms)?,
+            reconciliation_interval_ms: opt_u64(
+                &f("reconciliationIntervalMs"),
+                &self.reconciliation_interval_ms,
+            )?,
+            max_admitted_peers: opt_u64(&f("maxAdmittedPeers"), &self.max_admitted_peers)?,
+            sync_timeout_ms: opt_u64(&f("syncTimeoutMs"), &self.sync_timeout_ms)?,
+        })
+    }
+}
+
+impl JsEnrollmentRoles {
+    fn to_rust(&self) -> RsRoleMappingConfig {
+        let default = RsRoleMappingConfig::default();
+        RsRoleMappingConfig {
+            attribute: self.attribute.clone().unwrap_or(default.attribute),
+            scopes_as_roles: self.scopes_as_roles.unwrap_or(default.scopes_as_roles),
+            scopes: role_map(&self.scopes),
+            tags: role_map(&self.tags),
+            include_attributes: self
+                .include_attributes
+                .unwrap_or(default.include_attributes),
+        }
+    }
+}
+
+impl JsEnrollmentConfig {
+    fn to_rust(&self) -> Result<RsEnrollmentConfig> {
+        Ok(RsEnrollmentConfig {
+            enabled: self.enabled,
+            audience: self.audience.clone(),
+            fleet_namespace: self.fleet_namespace.clone(),
+            state_path: self
+                .state_path
+                .as_ref()
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
+            replicas: self.replicas.clone().unwrap_or_default(),
+            policy: self.policy.clone(),
+            require_synchronized_clock: self.require_synchronized_clock.unwrap_or(false),
+            activation_leeway_secs: opt_u64(
+                "enrollment.activationLeewaySecs",
+                &self.activation_leeway_secs,
+            )?,
+            limits: match &self.limits {
+                None => RsEnrollmentLimits::default(),
+                Some(limits) => limits.to_rust()?,
+            },
+            roles: self
+                .roles
+                .as_ref()
+                .map_or_else(RsRoleMappingConfig::default, JsEnrollmentRoles::to_rust),
+            issuer_delegation_file: self.issuer_delegation_file.as_ref().map(PathBuf::from),
+            issuer_lifetime_secs: opt_u64(
+                "enrollment.issuerLifetimeSecs",
+                &self.issuer_lifetime_secs,
+            )?,
+            renew_from: self.renew_from.clone(),
+            renew: self.renew,
+            synchronize: self.synchronize,
+        })
+    }
+
+    fn from_rust(e: &RsEnrollmentConfig) -> Self {
+        let l = &e.limits;
+        let out = |v: Option<u64>| v.map(u64_out);
+        let map = |m: &BTreeMap<String, Vec<String>>| -> HashMap<String, Vec<String>> {
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.to_string_lossy().into_owned());
+        Self {
+            enabled: e.enabled,
+            audience: e.audience.clone(),
+            fleet_namespace: e.fleet_namespace.clone(),
+            state_path: path(&e.state_path),
+            replicas: Some(e.replicas.clone()),
+            policy: e.policy.clone(),
+            require_synchronized_clock: Some(e.require_synchronized_clock),
+            activation_leeway_secs: out(e.activation_leeway_secs),
+            limits: Some(JsEnrollmentLimits {
+                handshake_timeout_ms: out(l.handshake_timeout_ms),
+                step_timeout_ms: out(l.step_timeout_ms),
+                policy_timeout_ms: out(l.policy_timeout_ms),
+                reconciliation_interval_ms: out(l.reconciliation_interval_ms),
+                max_admitted_peers: out(l.max_admitted_peers),
+                sync_timeout_ms: out(l.sync_timeout_ms),
+            }),
+            roles: Some(JsEnrollmentRoles {
+                attribute: Some(e.roles.attribute.clone()),
+                scopes_as_roles: Some(e.roles.scopes_as_roles),
+                scopes: Some(map(&e.roles.scopes)),
+                tags: Some(map(&e.roles.tags)),
+                include_attributes: Some(e.roles.include_attributes),
+            }),
+            issuer_delegation_file: path(&e.issuer_delegation_file),
+            issuer_lifetime_secs: out(e.issuer_lifetime_secs),
+            renew_from: e.renew_from.clone(),
+            renew: e.renew,
+            synchronize: e.synchronize,
+        }
+    }
+}
+
+/// Whether `config` enables enrollment (Rust
+/// `AsterConfig::is_enrollment_enabled`): `enrollment.enabled` when set,
+/// otherwise when an audience, fleet namespace, issuer delegation or
+/// credential is configured. The root alone does not enable it.
+#[napi]
+pub fn aster_config_is_enrollment_enabled(config: JsAsterConfig) -> Result<bool> {
+    Ok(config.to_rust()?.is_enrollment_enabled())
+}
+
 fn invalid(msg: impl Into<String>) -> Error {
     Error::new(Status::InvalidArg, msg.into())
 }
@@ -227,13 +450,17 @@ impl JsAsterConfig {
             );
         }
         c.root_pubkey_file = self.root_pubkey_file.as_ref().map(PathBuf::from);
-        c.enrollment_credential_file = self.enrollment_credential_file.as_ref().map(PathBuf::from);
-        c.enrollment_credential_iid = self.enrollment_credential_iid.clone();
-        if let Some(v) = self.allow_all_consumers {
-            c.allow_all_consumers = v;
+        c.next_root_commitment = self.next_root_commitment.clone();
+        if let Some(v) = &self.root_seq {
+            c.root_seq = u64_in("rootSeq", v)?;
         }
-        if let Some(v) = self.allow_all_producers {
-            c.allow_all_producers = v;
+        if let Some(v) = &self.root_rotations {
+            c.root_rotations = v.clone();
+        }
+        c.enrollment_credential_file = self.enrollment_credential_file.as_ref().map(PathBuf::from);
+        c.enrollment_credential_chain = self.enrollment_credential_chain.clone();
+        if let Some(e) = &self.enrollment {
+            c.enrollment = e.to_rust()?;
         }
         c.endpoint_addr = self.endpoint_addr.clone();
         c.storage_path = self
@@ -375,10 +602,12 @@ impl JsAsterConfig {
         Self {
             root_pubkey: c.root_pubkey.map(|k| k.to_hex()),
             root_pubkey_file: path(&c.root_pubkey_file),
+            next_root_commitment: c.next_root_commitment.clone(),
+            root_seq: Some(u64_out(c.root_seq)),
+            root_rotations: Some(c.root_rotations.clone()),
             enrollment_credential_file: path(&c.enrollment_credential_file),
-            enrollment_credential_iid: c.enrollment_credential_iid.clone(),
-            allow_all_consumers: Some(c.allow_all_consumers),
-            allow_all_producers: Some(c.allow_all_producers),
+            enrollment_credential_chain: c.enrollment_credential_chain.clone(),
+            enrollment: Some(JsEnrollmentConfig::from_rust(&c.enrollment)),
             endpoint_addr: c.endpoint_addr.clone(),
             storage_path: path(&c.storage_path),
             gc_interval_ms: Some(u64_out(

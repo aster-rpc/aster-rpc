@@ -26,7 +26,7 @@ function get(url: string): Promise<{ status: number; body: string }> {
 
 describe('AsterServer health listener', () => {
   it('is off by default', async () => {
-    const server = new AsterServer({ services: [], allowAllConsumers: true, config: { ...OFFLINE } });
+    const server = new AsterServer({ services: [], config: { ...OFFLINE } });
     await server.start();
     try {
       expect(server.health).toBeNull();
@@ -40,7 +40,6 @@ describe('AsterServer health listener', () => {
   it('serves /healthz /readyz /metrics once enabled, and stops with the server', async () => {
     const server = new AsterServer({
       services: [],
-      allowAllConsumers: true,
       config: { ...OFFLINE, healthEnabled: true, healthHost: '127.0.0.1' },
     });
     await server.start();
@@ -74,8 +73,8 @@ describe('AsterServer health listener', () => {
     await new Promise<void>((resolve) => occupied.listen(0, '127.0.0.1', resolve));
     const port = (occupied.address() as import('node:net').AddressInfo).port;
     const cfg = { ...OFFLINE, healthPort: port, healthEnabled: false };
-    const off = new AsterServer({ services: [], allowAllConsumers: true, config: cfg });
-    const conflict = new AsterServer({ services: [], allowAllConsumers: true,
+    const off = new AsterServer({ services: [], config: cfg });
+    const conflict = new AsterServer({ services: [],
       config: { ...cfg, healthEnabled: true } });
     try {
       await off.start();
@@ -85,7 +84,7 @@ describe('AsterServer health listener', () => {
       await off.close(); await conflict.close();
       await new Promise<void>((resolve, reject) => occupied.close((err) => err ? reject(err) : resolve()));
     }
-    const server = new AsterServer({ services: [], allowAllConsumers: true,
+    const server = new AsterServer({ services: [],
       config: { ...cfg, healthEnabled: true } });
     try { await server.start(); expect((await get(`http://127.0.0.1:${port}/readyz`)).status).toBe(200); }
     finally { await server.close(); }

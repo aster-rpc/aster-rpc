@@ -1,5 +1,5 @@
 /**
- * Tests for Metadata, RCAN validation, and IID (cloud identity).
+ * Tests for Metadata and RCAN validation.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -16,12 +16,6 @@ import {
   validateRcan,
   encodeRcan,
   decodeRcan,
-  verifyIID,
-  MockIIDBackend,
-  getIIDBackend,
-  ATTR_IID_PROVIDER,
-  ATTR_IID_ACCOUNT,
-  ATTR_IID_REGION,
   SERVICE_INFO_KEY,
   METHOD_INFO_KEY,
 } from '@aster-rpc/aster';
@@ -198,64 +192,5 @@ describe('RCAN validation', () => {
   it('encodeRcan/decodeRcan roundtrip', () => {
     const data = new Uint8Array([42, 99]);
     expect(decodeRcan(encodeRcan(data))).toEqual(data);
-  });
-});
-
-// -- IID ---------------------------------------------------------------------
-
-describe('IID (cloud identity)', () => {
-  it('verifyIID passes when no provider attribute', async () => {
-    const [ok] = await verifyIID({});
-    expect(ok).toBe(true);
-  });
-
-  it('MockIIDBackend passes by default', async () => {
-    const backend = new MockIIDBackend();
-    const [ok] = await backend.verify({});
-    expect(ok).toBe(true);
-  });
-
-  it('MockIIDBackend can fail', async () => {
-    const backend = new MockIIDBackend({ shouldPass: false, reason: 'test deny' });
-    const [ok, reason] = await backend.verify({});
-    expect(ok).toBe(false);
-    expect(reason).toBe('test deny');
-  });
-
-  it('MockIIDBackend checks expected attributes', async () => {
-    const backend = new MockIIDBackend({
-      expectedAttributes: { [ATTR_IID_ACCOUNT]: '123' },
-    });
-    const [ok1] = await backend.verify({ [ATTR_IID_ACCOUNT]: '123' });
-    expect(ok1).toBe(true);
-    const [ok2, reason] = await backend.verify({ [ATTR_IID_ACCOUNT]: '999' });
-    expect(ok2).toBe(false);
-    expect(reason).toContain('mismatch');
-  });
-
-  it('getIIDBackend returns correct backends', () => {
-    expect(getIIDBackend('aws')).toBeDefined();
-    expect(getIIDBackend('gcp')).toBeDefined();
-    expect(getIIDBackend('azure')).toBeDefined();
-    expect(getIIDBackend('mock')).toBeDefined();
-  });
-
-  it('getIIDBackend throws for unknown provider', () => {
-    expect(() => getIIDBackend('unknown')).toThrow('unknown IID provider');
-  });
-
-  it('verifyIID with mock backend', async () => {
-    const backend = new MockIIDBackend({ shouldPass: true });
-    const [ok] = await verifyIID(
-      { [ATTR_IID_PROVIDER]: 'mock' },
-      backend,
-    );
-    expect(ok).toBe(true);
-  });
-
-  it('verifyIID auto-selects backend from provider attribute', async () => {
-    // 'mock' backend always passes
-    const [ok] = await verifyIID({ [ATTR_IID_PROVIDER]: 'mock' });
-    expect(ok).toBe(true);
   });
 });

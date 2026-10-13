@@ -41,7 +41,7 @@ const auth = (req: { metadata: Record<string, string> }) => ({ principal: 'alice
 describe('topology baseline configuration', () => {
   it('high-level opt-in is absent by default and the native role requirement gates every caller', async () => {
     for (const enabled of [false, true]) {
-      const server = new AsterServer({ services: [], allowAllConsumers: true, config: { ...OFFLINE, enableMonitoring: true }, builtinTopology: enabled, topologyRequires: { ...requirement, roles: [...requirement.roles] } });
+      const server = new AsterServer({ services: [], config: { ...OFFLINE, enableMonitoring: true }, builtinTopology: enabled, topologyRequires: { ...requirement, roles: [...requirement.roles] } });
       const listener = await server.startHttp(tls(), auth);
       try {
         expect((await call(listener.tcpAddr, 'none')).code).toBe(enabled ? 7 : 5);
@@ -62,7 +62,7 @@ describe('topology baseline configuration', () => {
     } finally { await authenticated.close(); await anonymous.close(); await loop.close(); }
   });
   it('owned and attached enablement reject unmonitored nodes and malformed native policy', async () => {
-    const highLevel = new AsterServer({ services: [], allowAllConsumers: true, config: OFFLINE, builtinTopology: true });
+    const highLevel = new AsterServer({ services: [], config: OFFLINE, builtinTopology: true });
     try {
       await expect(highLevel.start()).rejects.toThrow(/monitoring/);
       await expect(highLevel.start()).rejects.toThrow(/monitoring/);

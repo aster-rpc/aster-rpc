@@ -77,7 +77,7 @@ pub const EVENT_SESSION_CLOSED: u32 = 5;
 /// `DispatchEvent.kind`: an `aster/1` connection closed (`connectionId`, `peer`).
 pub const EVENT_CONNECTION_CLOSED: u32 = 6;
 /// `DispatchEvent.kind`: a connection on a non-RPC ALPN (`alpn`) no Rust
-/// handler claimed (the frozen admission ALPNs). Take it with
+/// handler claimed (e.g. an application ALPN in `config.alpns`). Take it with
 /// `takeConnection(connectionId)`; an untaken one is closed when the server
 /// closes.
 pub const EVENT_NON_RPC: u32 = 7;
@@ -750,8 +750,8 @@ impl Ring {
 // ── attribute bridge ────────────────────────────────────────────────────────
 
 /// Gate 3 reads the caller's Gate-0 admission attributes: the bridge from
-/// the (frozen) TS credential admission, which records attributes in the
-/// node's `GatePolicy` store, to Rust-enforced `requires` (design §2.6).
+/// a `GatePolicy` store (peers admitted by hand or by delegated admission,
+/// with attributes) to Rust-enforced `requires` (design §2.6).
 /// Live: expiry and revocation apply from the next call.
 struct GateAttributes(aster::PeerAdmissionStore);
 
@@ -794,7 +794,18 @@ pub struct DispatchServerOptions {
     pub handler_timeout_ms: Option<f64>,
 }
 
-enum Running {
+/// What a `start` server owns beyond the running `AsterServer`.
+struct Owned {
+    node: aster::Node,
+    /// The server's `aster1…` ticket.
+    address: String,
+    /// Whether `[enrollment]` installed Enrollment.
+    enrolled: bool,
+    /// The served `aster.ops.NodeInfo` identity, when the baseline is on.
+    identity: Option<aster::rpc::baseline::NodeIdentityHandle>,
+}
+
+pub(crate) enum Running {
     /// Own node (`start`): shut down on close.
     Own(Box<AsterServer>),
     /// Serving on a caller's node (`serve`): stop serving on close; the node
@@ -818,10 +829,16 @@ pub struct DispatchServer {
     runtime: tokio::runtime::Handle,
     dispatcher: Dispatcher,
     http_children: Arc<Mutex<Vec<HttpOwner>>>,
-    running: Arc<tokio::sync::Mutex<Option<Running>>>,
+    pub(crate) running: Arc<tokio::sync::Mutex<Option<Running>>>,
     table: CallTable,
     attributes: AttributeStore,
     address: String,
+    /// The node a `start` server owns (`None` for `serve`).
+    own_node: Option<aster::Node>,
+    /// Whether `[enrollment]` installed Enrollment on a `start` server.
+    enrolled: bool,
+    /// The served `aster.ops.NodeInfo` identity of a `start` server.
+    node_identity: Option<aster::rpc::baseline::NodeIdentityHandle>,
     shared: Arc<Shared>,
     tsfn_sink: Option<Arc<TsfnSink>>,
     ring: Option<Arc<Ring>>,
@@ -1066,7 +1083,7 @@ impl Sinks {
         dispatcher: Dispatcher,
         table: CallTable,
         attributes: AttributeStore,
-        address: String,
+        own: Option<Owned>,
         ring: Option<Arc<Ring>>,
     ) -> DispatchServer {
         if let Some(s) = &self.tsfn_sink {
@@ -1082,7 +1099,10 @@ impl Sinks {
             running: Arc::new(tokio::sync::Mutex::new(Some(running))),
             table,
             attributes,
-            address,
+            address: own.as_ref().map(|o| o.address.clone()).unwrap_or_default(),
+            enrolled: own.as_ref().is_some_and(|o| o.enrolled),
+            node_identity: own.as_ref().and_then(|o| o.identity.clone()),
+            own_node: own.map(|o| o.node),
             shared: self.shared,
             tsfn_sink: self.tsfn_sink,
             ring,
@@ -1193,7 +1213,7 @@ impl DispatchServer {
                 dispatcher,
                 table,
                 attributes,
-                String::new(),
+                None,
                 ring,
             ))
         })
@@ -1260,12 +1280,18 @@ impl DispatchServer {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let address = server.address().map_err(aster_err)?;
+            let own = Owned {
+                node: server.node().clone(),
+                address,
+                enrolled: server.enrollment().is_some(),
+                identity: server.node_identity(),
+            };
             Ok(sinks.finish(
                 Running::Own(Box::new(server)),
                 dispatcher,
                 table,
                 attributes,
-                address,
+                Some(own),
                 ring,
             ))
         })
@@ -1392,6 +1418,41 @@ impl DispatchServer {
         self.address.clone()
     }
 
+    /// The node a `start` server runs on (`null` for `serve`), for blobs,
+    /// docs and the health listener. `close()` on the server shuts it down;
+    /// do not close it separately.
+    #[napi]
+    pub fn node(&self) -> Option<crate::node::Node> {
+        self.own_node.clone().map(crate::node::Node::from_aster)
+    }
+
+    /// Whether the configuration's `[enrollment]` section installed
+    /// Enrollment (a `start` server only): Gate 0 admits enrolled peers only
+    /// and `requires` reads each peer's credential roles.
+    #[napi(getter)]
+    pub fn enrolled(&self) -> bool {
+        self.enrolled
+    }
+
+    /// Set (or, with `null`, remove) a text attribute of the served
+    /// `aster.ops.NodeInfo` identity (a `start` server with the baseline on).
+    /// Returns `false` when there is no identity to update.
+    #[napi]
+    pub fn set_node_attribute(&self, name: String, value: Option<String>) -> bool {
+        let Some(handle) = &self.node_identity else {
+            return false;
+        };
+        handle.update(|identity| {
+            identity.attributes.retain(|attr| attr.name != name);
+            if let Some(value) = value {
+                identity
+                    .attributes
+                    .push(aster::rpc::baseline::Attr::new(name, value));
+            }
+        });
+        true
+    }
+
     /// Number of live calls in the call table (0 once every call ended).
     #[napi]
     pub fn live_calls(&self) -> u32 {
@@ -1400,7 +1461,8 @@ impl DispatchServer {
 
     /// Attribute bridge (design §2.6): set the attributes Gate 3 checks
     /// `requires` against for `peer` (hex node id). `null` / empty clears
-    /// the entry. Fed by the frozen credential admission.
+    /// the entry. Attributes derived from a peer's enrollment credential win
+    /// on a key clash.
     #[napi]
     pub fn set_peer_attributes(&self, peer: String, attributes: Option<HashMap<String, String>>) {
         match attributes {

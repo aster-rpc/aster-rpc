@@ -46,6 +46,60 @@ export declare class AdmissionRequests {
   close(): Promise<void>
 }
 
+/**
+ * A connected client: a node plus an RPC connection to one server, enrolled
+ * with it when the configuration enables enrollment.
+ *
+ * `AsterClient.connect(config, address)`; always `close()` it (it stops
+ * renewal and shuts the node down).
+ */
+export declare class AsterClient {
+  /**
+   * Start a node from `config` and connect to `address` (an `aster1…`
+   * ticket or a 64-hex node id). With `[enrollment]` configured the client
+   * presents its credential, enrolls and synchronizes before the RPC
+   * connection opens; any misconfiguration or refusal rejects with an
+   * error naming the problem.
+   */
+  static connect(config: JsAsterConfig | undefined | null, address: string): Promise<AsterClient>
+  /** This client's node (blobs, docs, gossip). Closed by `close()`. */
+  node(): Node
+  /** The current `aster/1` connection to the server. */
+  rpcConnection(): IrohConnection
+  /**
+   * Open a fresh `aster/1` connection to the server (for example after
+   * the previous one closed) and make it current.
+   */
+  reconnect(): Promise<IrohConnection>
+  /** The server's node id (hex). */
+  get serverId(): string
+  /** This client's node id (hex). */
+  get id(): string
+  /**
+   * Whether `[enrollment]` installed Enrollment and the client enrolled
+   * with the server.
+   */
+  get enrolled(): boolean
+  /**
+   * Whether this client renews its credential (from `renewFrom`, or from
+   * the server when the server signed it).
+   */
+  isRenewing(): Promise<boolean>
+  /**
+   * The credential chain this client currently presents (it changes when
+   * renewal succeeds); `null` without enrollment.
+   */
+  credential(): Promise<string | null>
+  /**
+   * Call the server's baseline `aster.ops.NodeInfo.describe`. A server
+   * announces its contract registry there (the `aster.registry_namespace`
+   * attribute), which replaces the retired consumer-admission response.
+   */
+  describeServer(): Promise<ServerIdentity>
+  /** Stop renewing and shut the node down. Idempotent. */
+  close(): Promise<void>
+}
+
 export declare class BlobCancelToken {
   constructor()
   cancel(): void
@@ -378,12 +432,31 @@ export declare class DispatchServer {
   startPublicHttp(options: HttpListenerOptions): Promise<HttpListener>
   /** This server's `aster1…` ticket (`start` only; `""` for `serve`). */
   get address(): string
+  /**
+   * The node a `start` server runs on (`null` for `serve`), for blobs,
+   * docs and the health listener. `close()` on the server shuts it down;
+   * do not close it separately.
+   */
+  node(): Node | null
+  /**
+   * Whether the configuration's `[enrollment]` section installed
+   * Enrollment (a `start` server only): Gate 0 admits enrolled peers only
+   * and `requires` reads each peer's credential roles.
+   */
+  get enrolled(): boolean
+  /**
+   * Set (or, with `null`, remove) a text attribute of the served
+   * `aster.ops.NodeInfo` identity (a `start` server with the baseline on).
+   * Returns `false` when there is no identity to update.
+   */
+  setNodeAttribute(name: string, value?: string | undefined | null): boolean
   /** Number of live calls in the call table (0 once every call ended). */
   liveCalls(): number
   /**
    * Attribute bridge (design §2.6): set the attributes Gate 3 checks
    * `requires` against for `peer` (hex node id). `null` / empty clears
-   * the entry. Fed by the frozen credential admission.
+   * the entry. Attributes derived from a peer's enrollment credential win
+   * on a key clash.
    */
   setPeerAttributes(peer: string, attributes?: Record<string, string> | undefined | null): void
   /** The attributes Gate 3 currently sees for `peer`. */
@@ -1595,16 +1668,34 @@ export interface AsterConfig {
    */
   rootPubkeyFile?: string
   /**
-   * Enrollment credential file. `ASTER_ENROLLMENT_CREDENTIAL`,
-   * `[trust] enrollment_credential`.
+   * Pre-rotation commitment to the next root key (64 hex).
+   * `ASTER_NEXT_ROOT_COMMITMENT`, `[trust] next_root_commitment`.
+   */
+  nextRootCommitment?: string
+  /**
+   * Rotations applied to reach the root (default 0). `ASTER_ROOT_SEQ`,
+   * `[trust] root_seq`.
+   */
+  rootSeq?: U64Value
+  /**
+   * Applied rotation statements, oldest first; needs
+   * `nextRootCommitment`. `ASTER_ROOT_ROTATIONS` (comma-separated),
+   * `[trust] root_rotations`.
+   */
+  rootRotations?: Array<string>
+  /**
+   * This node's enrollment credential: the chain file `aster enroll node
+   * --out` writes. Setting it enables enrollment.
+   * `ASTER_ENROLLMENT_CREDENTIAL`, `[trust] enrollment_credential`.
    */
   enrollmentCredentialFile?: string
-  /** Cloud instance identity document token. `ASTER_ENROLLMENT_CREDENTIAL_IID`. */
-  enrollmentCredentialIid?: string
-  /** Skip the consumer admission gate (dev mode). `ASTER_ALLOW_ALL_CONSUMERS`. */
-  allowAllConsumers?: boolean
-  /** Skip the producer admission gate. `ASTER_ALLOW_ALL_PRODUCERS`. */
-  allowAllProducers?: boolean
+  /**
+   * This node's enrollment credential chain inline; wins over the file.
+   * `ASTER_ENROLLMENT_CREDENTIAL_CHAIN`, `[trust] enrollment_credential_chain`.
+   */
+  enrollmentCredentialChain?: string
+  /** The `[enrollment]` section (see `EnrollmentConfig`). */
+  enrollment?: JsEnrollmentConfig
   /** Producer address for consumer-side dialing. `ASTER_ENDPOINT_ADDR`. */
   endpointAddr?: string
   /**
@@ -1725,6 +1816,14 @@ export declare function asterConfigFromEnv(): AsterConfig
  * `AsterConfig::from_file` loader). Every field is filled in.
  */
 export declare function asterConfigFromFile(path: string): AsterConfig
+
+/**
+ * Whether `config` enables enrollment (Rust
+ * `AsterConfig::is_enrollment_enabled`): `enrollment.enabled` when set,
+ * otherwise when an audience, fleet namespace, issuer delegation or
+ * credential is configured. The root alone does not enable it.
+ */
+export declare function asterConfigIsEnrollmentEnabled(config: AsterConfig): boolean
 
 /**
  * Normalise a config through Rust: validates every field and returns it
@@ -2428,6 +2527,113 @@ export declare function encodeRpcStatus(s: NativeRpcStatus): Buffer
 
 /** Encode a `StreamHeader` to AEv1 bytes. */
 export declare function encodeStreamHeader(h: NativeStreamHeader): Buffer
+
+/**
+ * The `[enrollment]` section, field for field the Rust `EnrollmentConfig`
+ * (`docs/_internal/working_ideas/aster-enrollment.md` §15.3).
+ */
+export interface EnrollmentConfig {
+  /**
+   * Force enrollment on or off. Unset: on when an audience, fleet
+   * namespace, issuer delegation or credential is set.
+   * `ASTER_ENROLLMENT_ENABLED`.
+   */
+  enabled?: boolean
+  /** Fleet audience. Required. `ASTER_ENROLLMENT_AUDIENCE`. */
+  audience?: string
+  /**
+   * Fleet policy namespace (64 hex). Required.
+   * `ASTER_ENROLLMENT_FLEET_NAMESPACE`.
+   */
+  fleetNamespace?: string
+  /** Durable denials and watermarks. `ASTER_ENROLLMENT_STATE_PATH`. */
+  statePath?: string
+  /**
+   * Policy replicas (`aster1…` tickets or 64-hex node ids).
+   * `ASTER_ENROLLMENT_REPLICAS`.
+   */
+  replicas?: Array<string>
+  /**
+   * Admission policy: the `PolicyConfig` tree (an object, or a bare name
+   * such as `"tolerate_stale_policy"`). `ASTER_ENROLLMENT_POLICY` (JSON).
+   */
+  policy?: any
+  /**
+   * Refuse to start on an unsynchronized clock (Linux).
+   * `ASTER_ENROLLMENT_REQUIRE_SYNCHRONIZED_CLOCK`.
+   */
+  requireSynchronizedClock?: boolean
+  /**
+   * `iat`/`nbf` leeway, 0–300 s (default 60).
+   * `ASTER_ENROLLMENT_ACTIVATION_LEEWAY_SECS`.
+   */
+  activationLeewaySecs?: U64Value
+  /** `[enrollment.limits]`. */
+  limits?: EnrollmentLimits
+  /** `[enrollment.roles]`. */
+  roles?: EnrollmentRoles
+  /**
+   * Server only: serve `aster.enrollment.IssuerV1` with this delegation.
+   * `[enrollment.issuer] delegation_file`,
+   * `ASTER_ENROLLMENT_ISSUER_DELEGATION_FILE`.
+   */
+  issuerDelegationFile?: string
+  /**
+   * Lifetime of issued credentials in seconds (default 24 h).
+   * `[enrollment.issuer] lifetime`, `ASTER_ENROLLMENT_ISSUER_LIFETIME`.
+   */
+  issuerLifetimeSecs?: U64Value
+  /**
+   * Issuer to renew this node's credential from (ticket or node id).
+   * `ASTER_ENROLLMENT_RENEW_FROM`.
+   */
+  renewFrom?: string
+  /** `false` disables renewal. `ASTER_ENROLLMENT_RENEW`. */
+  renew?: boolean
+  /**
+   * Client: synchronize the fleet namespace the server offers (default
+   * true). `ASTER_ENROLLMENT_SYNCHRONIZE`.
+   */
+  synchronize?: boolean
+}
+
+/**
+ * `[enrollment.limits]`: overrides of the Enrollment defaults
+ * (`ASTER_ENROLLMENT_<FIELD>` upper-cased, e.g.
+ * `ASTER_ENROLLMENT_HANDSHAKE_TIMEOUT_MS`).
+ */
+export interface EnrollmentLimits {
+  handshakeTimeoutMs?: U64Value
+  stepTimeoutMs?: U64Value
+  policyTimeoutMs?: U64Value
+  reconciliationIntervalMs?: U64Value
+  maxAdmittedPeers?: U64Value
+  /** Bound on enrolling with and synchronizing from a replica (default 15 000). */
+  syncTimeoutMs?: U64Value
+}
+
+/**
+ * `[enrollment.roles]`: how a peer's verified claims become the attributes
+ * `requires` is checked against.
+ */
+export interface EnrollmentRoles {
+  /**
+   * Claim attribute listing roles (default `"aster.role"`; `""` disables
+   * it). `ASTER_ENROLLMENT_ROLE_ATTRIBUTE`.
+   */
+  attribute?: string
+  /** Each verified scope is also a role. `ASTER_ENROLLMENT_SCOPES_AS_ROLES`. */
+  scopesAsRoles?: boolean
+  /** Scope → roles. `[enrollment.roles.scopes]`. */
+  scopes?: Record<string, Array<string>>
+  /** Tag → roles. `[enrollment.roles.tags]`. */
+  tags?: Record<string, Array<string>>
+  /**
+   * Pass the other claim attributes to handlers (default true).
+   * `ASTER_ENROLLMENT_INCLUDE_ATTRIBUTES`.
+   */
+  includeAttributes?: boolean
+}
 
 /**
  * One HTTP header (or trailer): `name` is lowercase and non-empty; `value`
@@ -3330,6 +3536,18 @@ export declare function secretKeyReadFile(path: string): string | null
  * directories created). Refuses to overwrite an existing file.
  */
 export declare function secretKeyWriteFile(path: string, secretKey: string): void
+
+/**
+ * What a server's `aster.ops.NodeInfo.describe` returns; attribute values
+ * as text (numbers and booleans in their display form).
+ */
+export interface ServerIdentity {
+  nodeId: string
+  nodeName: string
+  tags: Array<string>
+  roles: Array<string>
+  attributes: Record<string, string>
+}
 
 export declare function spanAddEvent(handle: number, name: string, attributes?: Record<string, string> | undefined | null): void
 

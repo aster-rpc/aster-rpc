@@ -1,7 +1,7 @@
 /**
- * aster/peer-store -- the admission-record view the frozen credential
- * handlers (`trust/consumer.ts`, `trust/delegated.ts`) and RPC dispatch use,
- * backed by the Rust Gate-0 {@link PeerAdmissionStore}.
+ * aster/peer-store -- the admission-record view the delegated admission
+ * handler (`trust/delegated.ts`) uses, backed by the Rust Gate-0
+ * {@link PeerAdmissionStore}.
  *
  * There is one store: admitting a peer here admits it into the gate's store,
  * so it passes Gate 0 on the RPC ALPN; its attributes feed RPC
@@ -32,7 +32,7 @@ export interface PeerAdmission {
   admittedAt: number;
   /** Epoch seconds; 0 = no credential expiry (PEER_TTL_S still applies). */
   expiresAt: number;
-  /** "consumer_admission" | "aster.admission" */
+  /** `"aster.admission"`, or `"manual"` for a peer admitted another way. */
   admissionPath: string;
 }
 
@@ -68,7 +68,7 @@ export class PeerAttributeStore {
     this.store.admit(admission.endpointId, {
       attributes: admission.attributes,
       expiresAt: Math.max(0, Math.floor(Math.min(ttlEnd, credEnd))),
-      source: admission.admissionPath === 'aster.admission' ? 'attestation' : 'credential',
+      source: admission.admissionPath === 'aster.admission' ? 'attestation' : 'manual',
     });
   }
 
@@ -82,7 +82,7 @@ export class PeerAttributeStore {
       attributes: new Map(Object.entries(a.attributes)),
       admittedAt: a.admittedAt.getTime() / 1000,
       expiresAt: a.expiresAt ? a.expiresAt.getTime() / 1000 : 0,
-      admissionPath: a.source === 'attestation' ? 'aster.admission' : 'consumer_admission',
+      admissionPath: a.source === 'attestation' ? 'aster.admission' : 'manual',
     };
   }
 

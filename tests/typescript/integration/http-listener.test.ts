@@ -156,7 +156,7 @@ describe('explicit public listeners and certificate helpers', () => {
       await expect(server.startPublicHttp({ ...options(), maxPendingAuth: 1 })).rejects.toThrow();
       await expect(server.startHttp(options(), undefined as any)).rejects.toThrow('authenticator');
     } finally { await listener.close(); await server.close(); await node.close(); }
-    const lazy = new AsterServer({ services: [], allowAllConsumers: true, config: { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } });
+    const lazy = new AsterServer({ services: [], config: { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } });
     const owned = await lazy.startPublicHttp(options());
     await lazy.close(); await owned.close(); await released(owned.tcpAddr);
     await expect(lazy.startPublicHttp(options())).rejects.toThrow('closed');
@@ -199,7 +199,7 @@ describe('authenticated HTTP listener', () => {
   });
 
   it('AsterServer lazy startup is shared and close cannot leave a late listener', async () => {
-    const server = new AsterServer({ services: [], allowAllConsumers: true, config: { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } });
+    const server = new AsterServer({ services: [], config: { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } });
     const first = server.start();
     expect(server.start()).toBe(first);
     await first;
@@ -214,7 +214,7 @@ describe('authenticated HTTP listener', () => {
       await expect(server.startHttp(options(), () => null)).rejects.toThrow('closed');
     } finally { await listener.close(); await server.close(); }
 
-    const racing = new AsterServer({ services: [], allowAllConsumers: true, config: { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } });
+    const racing = new AsterServer({ services: [], config: { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } });
     const pending = racing.startHttp(options(), () => ({ principal: 'alice' })).then((l) => l.close(), (error) => { expect(String(error)).toContain('closed'); });
     const close = racing.close();
     expect(racing.close()).toBe(close);

@@ -4,41 +4,17 @@
 // D3). Until then this module is frozen: fix bugs, but do not extend it
 // or port it to other languages.
 /**
- * Credential types and ed25519 signing/verification.
+ * Ed25519 signing/verification helpers (used by delegated admission).
  *
- * Spec reference: Aster-trust-spec.md
- *
- * Signing bytes computation delegates to Rust core via NAPI.
+ * The legacy consumer / producer credential formats that lived here were
+ * retired with consumer admission: `AsterServer` admits peers with
+ * Enrollment (`docs/_internal/working_ideas/aster-enrollment.md` §15).
  * Ed25519 operations use @noble/ed25519 for portability.
  */
-
-/** Producer enrollment credential. */
-export interface EnrollmentCredential {
-  endpointId: string;
-  rootPubkey: string; // hex
-  expiresAt: number; // epoch seconds
-  attributes: Record<string, string>;
-  signature: string; // hex
-}
-
-/** Consumer enrollment credential. */
-export interface ConsumerEnrollmentCredential {
-  credentialType: 'policy' | 'ott';
-  rootPubkey: string;
-  expiresAt: number;
-  attributes: Record<string, string>;
-  endpointId?: string;
-  nonce?: string; // hex
-  signature: string; // hex
-}
 
 /** Reserved attribute keys. */
 export const ATTR_ROLE = 'aster.role';
 export const ATTR_NAME = 'aster.name';
-export const ATTR_IID_PROVIDER = 'aster.iid_provider';
-export const ATTR_IID_ACCOUNT = 'aster.iid_account';
-export const ATTR_IID_REGION = 'aster.iid_region';
-export const ATTR_IID_ROLE_ARN = 'aster.iid_role_arn';
 
 // ── Crypto backend (lazy-loaded once, then cached) ──────────────────────────
 //
@@ -158,114 +134,6 @@ function hexToBytes(hex: string): Uint8Array {
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-// ── Canonical signing bytes ─────────────────────────────────────────────────
-// Spec reference: Aster-trust-spec.md §2.2, §2.4
-// Authoritative implementation: core/src/signing.rs
-// This TS version mirrors the Python helper for credential sign/verify.
-
-/** Canonical JSON: UTF-8, sorted keys, no extra whitespace. */
-export function canonicalJson(attributes: Record<string, string>): Uint8Array {
-  const sorted = Object.keys(attributes).sort();
-  const obj: Record<string, string> = {};
-  for (const k of sorted) obj[k] = attributes[k];
-  const json = JSON.stringify(obj);
-  return new TextEncoder().encode(json);
-}
-
-/** u64 big-endian encoding. */
-function writeU64BE(value: number): Uint8Array {
-  const buf = new ArrayBuffer(8);
-  const view = new DataView(buf);
-  // JS numbers are safe up to 2^53; for epoch seconds this is fine
-  view.setUint32(0, Math.floor(value / 0x100000000));
-  view.setUint32(4, value >>> 0);
-  return new Uint8Array(buf);
-}
-
-/** Signing bytes for EnrollmentCredential (producer). */
-export function producerSigningBytes(cred: EnrollmentCredential): Uint8Array {
-  const parts: Uint8Array[] = [
-    new TextEncoder().encode(cred.endpointId),
-    hexToBytes(cred.rootPubkey),       // 32 bytes
-    writeU64BE(cred.expiresAt),        // 8 bytes
-    canonicalJson(cred.attributes),
-  ];
-  return concatBytes(parts);
-}
-
-/** Signing bytes for ConsumerEnrollmentCredential. */
-export function consumerSigningBytes(cred: ConsumerEnrollmentCredential): Uint8Array {
-  const typeCode = cred.credentialType === 'ott' ? new Uint8Array([0x01]) : new Uint8Array([0x00]);
-
-  let eidPart: Uint8Array;
-  if (cred.endpointId != null) {
-    const eidBytes = new TextEncoder().encode(cred.endpointId);
-    eidPart = concatBytes([new Uint8Array([0x01]), eidBytes]);
-  } else {
-    eidPart = new Uint8Array([0x00]);
-  }
-
-  let noncePart: Uint8Array;
-  if (cred.nonce != null) {
-    noncePart = concatBytes([new Uint8Array([0x01]), hexToBytes(cred.nonce)]);
-  } else {
-    noncePart = new Uint8Array([0x00]);
-  }
-
-  return concatBytes([
-    typeCode,
-    eidPart,
-    hexToBytes(cred.rootPubkey),       // 32 bytes
-    writeU64BE(cred.expiresAt),        // 8 bytes
-    canonicalJson(cred.attributes),
-    noncePart,
-  ]);
-}
-
-/** Compute signing bytes for any credential type. */
-export function credentialSigningBytes(
-  cred: EnrollmentCredential | ConsumerEnrollmentCredential,
-): Uint8Array {
-  if ('endpointId' in cred && 'credentialType' in cred) {
-    return consumerSigningBytes(cred as ConsumerEnrollmentCredential);
-  }
-  if ('endpointId' in cred && !('credentialType' in cred)) {
-    return producerSigningBytes(cred as EnrollmentCredential);
-  }
-  throw new Error(`Unsupported credential type`);
-}
-
-/**
- * Sign a credential with the root private key.
- * Returns 64-byte signature as hex string.
- */
-export async function signCredential(
-  cred: EnrollmentCredential | ConsumerEnrollmentCredential,
-  rootPrivkeyRaw: Uint8Array,
-): Promise<string> {
-  const msg = credentialSigningBytes(cred);
-  const sig = await sign(rootPrivkeyRaw, msg);
-  return bytesToHex(sig);
-}
-
-/**
- * Verify a credential's signature.
- * If rootPubkeyHex is provided, it overrides cred.rootPubkey.
- * Returns true on success, false on any failure.
- */
-export async function verifyCredentialSignature(
-  cred: EnrollmentCredential | ConsumerEnrollmentCredential,
-  rootPubkeyHex?: string,
-): Promise<boolean> {
-  const pubkeyHex = rootPubkeyHex ?? cred.rootPubkey;
-  try {
-    const msg = credentialSigningBytes(cred);
-    return await verify(hexToBytes(pubkeyHex), msg, hexToBytes(cred.signature));
-  } catch {
-    return false;
-  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
