@@ -309,6 +309,15 @@ impl Enrollment {
     }
 }
 
+/// Delegates the root has revoked in the fleet namespace (`IssuerStatusV1`),
+/// for consumers that verify their own delegation chains with
+/// [`crate::delegation::verify_chain`].
+impl crate::delegation::RevokedDelegates for Enrollment {
+    fn is_revoked(&self, key: &[u8; 32]) -> bool {
+        self.inner.delegate_revoked(key)
+    }
+}
+
 /// Verify a presented chain against the actual authenticated connecting peer.
 /// The peer identity is read from the connection rather than request metadata.
 /// `now` is trusted UTC time in integral seconds.

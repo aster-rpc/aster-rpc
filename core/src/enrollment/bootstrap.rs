@@ -771,6 +771,15 @@ impl EnrollmentService {
         }
     }
 
+    /// Whether the root has revoked `key` as a delegate (`IssuerStatusV1` in
+    /// the fleet namespace), as this node last reconciled it. Consumers that
+    /// verify their own chains, such as Exec's on-behalf-of action chains,
+    /// apply the same withdrawals enrollment does.
+    pub fn delegate_revoked(&self, key: &[u8; 32]) -> bool {
+        use crate::delegation::RevokedDelegates;
+        self.stores.is_revoked(key)
+    }
+
     pub fn revocations(&self) -> broadcast::Receiver<EnrollmentRevoked> {
         self.revoked.subscribe()
     }

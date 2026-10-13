@@ -20,7 +20,7 @@ use crate::{
 };
 use aster::audit_outbox::{AuditEvent, AuditOutbox};
 use aster::delegation::{
-    LeafClaims, LeafKind, NoRevocations, TrustContext, VerifiedChain, verify_chain,
+    LeafClaims, LeafKind, RevokedDelegates, TrustContext, VerifiedChain, verify_chain,
 };
 use aster::enrollment::{AdmissionError, EnrollmentRevoked};
 use aster::rpc::{Call, RpcStatus, ServiceDispatch, StatusCode, async_trait};
@@ -221,11 +221,29 @@ pub fn error(code: ExecErrorCodeV1, message: &str) -> ExecErrorV1 {
 #[async_trait]
 pub trait EnrollmentAdmission: Send + Sync {
     async fn check(&self, caller: &[u8; 32]) -> Result<(), AdmissionError>;
+
+    /// Whether the root has revoked `key` as a delegate (`IssuerStatusV1`).
+    /// Delegation links in on-behalf-of action chains are withdrawn by the
+    /// same records as enrollment issuers.
+    fn delegate_revoked(&self, key: &[u8; 32]) -> bool;
 }
 #[async_trait]
 impl EnrollmentAdmission for aster::enrollment::Enrollment {
     async fn check(&self, caller: &[u8; 32]) -> Result<(), AdmissionError> {
         self.check_peer(caller).await.map(|_| ())
+    }
+
+    fn delegate_revoked(&self, key: &[u8; 32]) -> bool {
+        aster::delegation::RevokedDelegates::is_revoked(self, key)
+    }
+}
+
+/// The enrollment view of delegate revocations, as `verify_chain` takes it.
+struct AdmissionRevocations<'a>(&'a dyn EnrollmentAdmission);
+
+impl RevokedDelegates for AdmissionRevocations<'_> {
+    fn is_revoked(&self, key: &[u8; 32]) -> bool {
+        self.0.delegate_revoked(key)
     }
 }
 /// Authenticate the current exact-root leaf on cold admission and background
@@ -1051,7 +1069,10 @@ impl ExecService {
             return Err(denied("invalid on-behalf-of identity"));
         };
         let anchors = [principal_key];
-        let trust = TrustContext::new(&anchors, audience, now_ms() / 1000, &NoRevocations);
+        // Gate G6: a delegate the root revoked withdraws every chain through
+        // it. A job already running stays under the principal's grant.
+        let revoked = AdmissionRevocations(self.enrollment.as_ref());
+        let trust = TrustContext::new(&anchors, audience, now_ms() / 1000, &revoked);
         verify_chain(chain.as_bytes(), LeafKind::Action, &actor_key, &trust)
             .map_err(|failure| denied(&format!("on-behalf-of chain rejected: {failure:?}")))
     }
@@ -1656,6 +1677,9 @@ mod tests {
         async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
             Ok(())
         }
+        fn delegate_revoked(&self, _: &[u8; 32]) -> bool {
+            false
+        }
     }
     /// Enrollment answers every check with this fixed error.
     struct Enrollment(AdmissionError);
@@ -1663,6 +1687,9 @@ mod tests {
     impl EnrollmentAdmission for Enrollment {
         async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
             Err(self.0.clone())
+        }
+        fn delegate_revoked(&self, _: &[u8; 32]) -> bool {
+            false
         }
     }
     fn revoked() -> Arc<Enrollment> {
@@ -1676,6 +1703,9 @@ mod tests {
         async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
+        }
+        fn delegate_revoked(&self, _: &[u8; 32]) -> bool {
+            false
         }
     }
     struct CountGrants {
@@ -2541,11 +2571,19 @@ mod on_behalf_tests {
 
     const AUDIENCE: &str = "fleet";
 
-    struct Admitted;
+    /// Admits every caller; `revoked` stands in for the root's issuer-status
+    /// records in the fleet namespace.
+    #[derive(Default)]
+    struct Admitted {
+        revoked: StdMutex<Vec<[u8; 32]>>,
+    }
     #[async_trait]
     impl EnrollmentAdmission for Admitted {
         async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
             Ok(())
+        }
+        fn delegate_revoked(&self, key: &[u8; 32]) -> bool {
+            self.revoked.lock().unwrap().contains(key)
         }
     }
 
@@ -2712,6 +2750,7 @@ mod on_behalf_tests {
         grants: Arc<GrantTable>,
         audit: Arc<RecordingAudit>,
         runtime: Arc<MemoryRuntime>,
+        admission: Arc<Admitted>,
     }
 
     fn grant(fixture_cwd: &str, holder: &str, target: &str) -> ExecGrantV1 {
@@ -2752,6 +2791,7 @@ mod on_behalf_tests {
         let grants = Arc::new(GrantTable::default());
         let audit = Arc::new(RecordingAudit::default());
         let runtime = Arc::new(MemoryRuntime::default());
+        let admission = Arc::new(Admitted::default());
         let service = ExecService::new(
             LocalCeilingV1 {
                 version: 1,
@@ -2770,7 +2810,7 @@ mod on_behalf_tests {
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
                 denied_callers: Default::default(),
             },
-            Arc::new(Admitted),
+            admission.clone(),
             grants.clone(),
             audit.clone(),
             runtime.clone(),
@@ -2784,6 +2824,7 @@ mod on_behalf_tests {
             grants,
             audit,
             runtime,
+            admission,
         }
     }
 
@@ -2927,6 +2968,43 @@ mod on_behalf_tests {
         f.service.invalidate_all();
         let _ = f.service.reconcile_policy().await;
         assert_eq!(*f.runtime.cancelled.lock().unwrap(), vec![job.job_id]);
+    }
+
+    /// Root-revoking delegate O (`IssuerStatusV1`) withdraws every action
+    /// chain through it: A can no longer submit for H. A job A already
+    /// started for H keeps running, because its authority is H's grant, which
+    /// still stands; H's grant revocation is what cancels it.
+    #[tokio::test]
+    async fn a_revoked_delegate_withdraws_new_submissions_only() {
+        let f = fixture();
+        let (h, o, a) = (key(1), key(2), key(3));
+        f.grants.insert(grant(&f.cwd, &id(&h), &f.target));
+        let chain = action(&o, &principal_delegates(&h, &o), &a.public_key(), &[], None);
+        let running = f
+            .service
+            .submit(&id(&a), on_behalf(request(&f), &h, &chain))
+            .await
+            .unwrap();
+
+        f.admission
+            .revoked
+            .lock()
+            .unwrap()
+            .push(o.public_key().to_bytes());
+        let failure = denied(
+            f.service
+                .submit(&id(&a), on_behalf(request(&f), &h, &chain))
+                .await,
+        );
+        assert!(failure.safe_message.contains("Revoked"), "{failure:?}");
+
+        f.service.invalidate_all();
+        let _ = f.service.reconcile_policy().await;
+        assert!(f.runtime.cancelled.lock().unwrap().is_empty());
+        f.service
+            .owned(&id(&a), &running.job, ExecOperationV1::Status)
+            .await
+            .unwrap();
     }
 
     /// INV-E21: without a chain the caller's own grant applies; with one, the

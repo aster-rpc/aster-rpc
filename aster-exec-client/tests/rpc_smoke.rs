@@ -23,6 +23,10 @@ impl EnrollmentAdmission for Admission {
             Err(AdmissionError::NotAdmitted)
         }
     }
+
+    fn delegate_revoked(&self, _: &[u8; 32]) -> bool {
+        false
+    }
 }
 struct Grants(Mutex<ExecGrantV1>);
 #[async_trait]
