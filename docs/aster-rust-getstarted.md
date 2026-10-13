@@ -190,6 +190,10 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `health_port(p)` | `ASTER_HEALTH_PORT` | `[health] port` | health/metrics HTTP port; `0` (default) = disabled unless `health(true)` |
 | `health_host(h)` | `ASTER_HEALTH_HOST` | `[health] host` | default `127.0.0.1`; `0.0.0.0` for pod probes |
 | `health(b)` | `ASTER_HEALTH_ENABLED` | `[health] enabled` | force on (port `0` → ephemeral) or off; unset = on iff port ≠ 0 |
+| `root_pubkey(k)` | `ASTER_ROOT_PUBKEY` / `ASTER_ROOT_PUBKEY_FILE` | `[trust] root_pubkey` / `root_pubkey_file` | the deployment root Enrollment trusts (and coordination pins) |
+| `root_rotation(c, seq, statements)` | `ASTER_NEXT_ROOT_COMMITMENT`, `ASTER_ROOT_SEQ`, `ASTER_ROOT_ROTATIONS` | `[trust] next_root_commitment`, `root_seq`, `root_rotations` | the rotation pin, copied from `aster trust show` |
+| `enrollment_credential_file(p)` / `enrollment_credential_chain(c)` | `ASTER_ENROLLMENT_CREDENTIAL` / `ASTER_ENROLLMENT_CREDENTIAL_CHAIN` | `[trust] enrollment_credential` / `enrollment_credential_chain` | this node's credential: the file `aster enroll node --out` writes, or the chain inline |
+| `enrollment(EnrollmentConfig)` | `ASTER_ENROLLMENT_*` | `[enrollment]` | see §3.0 |
 
 The `[health]` keys start the `aster::ops` HTTP listener (feature `health`,
 which implies `otel`) automatically under `AsterServer`; with a bare `Node`,
@@ -217,11 +221,108 @@ of the call a Rust-native handler is serving, even with no exporter), and
 calls carry `ctx`. Logs, metrics and traces for all six languages are covered
 in the [observability guide](aster-observability-getstarted.md).
 
-The ALPNs are exported as `aster::RPC_ALPN` and `aster::alpns::{RPC,
-CONSUMER_ADMISSION, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,
-GOSSIP}`.
+The ALPNs are exported as `aster::RPC_ALPN`, `aster::enrollment::ENROLLMENT_ALPN`
+and `aster::alpns::{RPC, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,
+GOSSIP}`. (`alpns::CONSUMER_ADMISSION` belongs to the retired consumer
+admission and is going away; Enrollment replaces it.)
 
 ## 3. Admission (Gate 0) and enrollment credentials
+
+### 3.0 Enrollment through `AsterServer` and `AsterClient` (recommended)
+
+Configure enrollment and `requires` just works: `AsterServer` admits only
+nodes holding a credential from your root, turns the roles in each peer's
+credential into the attributes Gate 3 checks, and closes a peer's connections
+when the root revokes it. There is no admission code to write. Needs the
+`enrollment` feature (with `rpc` and `docs`).
+
+The operator produces every file with the CLI:
+
+```bash
+aster key root generate                                   # the profile's root
+aster enroll namespace create --out-secret fleet.secret   # prints FLEET
+aster key node generate --out server.key                  # prints SERVER
+aster key node generate --out agent.key                   # prints AGENT
+aster enroll node --subject $SERVER --audience my-fleet --out server.cred
+echo '{"aster.role":{"type":"string","value":"ops.status,ops.ingest"}}' > agent-roles.json
+aster enroll node --subject $AGENT --audience my-fleet \
+  --attributes agent-roles.json --out agent.cred
+```
+
+and points the configuration at them (`aster.toml`, or the `ASTER_*`
+variables in the comments):
+
+```toml
+[trust]
+root_pubkey = "<aster key root show>"        # ASTER_ROOT_PUBKEY
+enrollment_credential = "server.cred"   # ASTER_ENROLLMENT_CREDENTIAL
+
+[network]
+secret_key_file = "server.key"               # ASTER_SECRET_KEY_FILE
+
+[enrollment]
+audience = "my-fleet"                        # ASTER_ENROLLMENT_AUDIENCE
+fleet_namespace = "<FLEET>"                  # ASTER_ENROLLMENT_FLEET_NAMESPACE
+state_path = "/var/lib/my-app/enrollment.json"  # ASTER_ENROLLMENT_STATE_PATH
+```
+
+```rust
+use aster::rpc::{AsterClient, AsterServer};
+
+# async fn run() -> aster::Result<()> {
+let srv = AsterServer::builder()
+    .service(EchoServer::new(EchoImpl))     // methods carry #[rpc(requires = …)]
+    .config(aster::AsterConfig::from_file("aster.toml")?)
+    .start()
+    .await?;
+
+// The agent: its own key and credential, the same root/audience/fleet.
+let client = AsterClient::builder()
+    .config(aster::AsterConfig::from_env()?)
+    .address(srv.address()?)
+    .connect()
+    .await?;
+let echo = EchoClient::new(client.rpc());
+# Ok(())
+# }
+```
+
+- **Who is admitted.** Any node with a valid credential from the root for this
+  audience, minus every revocation the root has published. Narrow it with
+  `[enrollment] policy`, e.g. `policy = { all_of = [{ scope = "ops" },
+  "tolerate_stale_policy"] }`, or in code with
+  `AsterServerBuilder::enrollment_policy`.
+- **Roles.** By default the comma-separated `aster.role` claim attribute is
+  the peer's role set; `[enrollment.roles]` can also map scopes and tags to
+  roles (`scopes_as_roles = true`, `[enrollment.roles.scopes] "fleet.ops" =
+  ["ops.status"]`), or use `AsterServerBuilder::enrollment_roles`. Other claim
+  attributes reach handlers through `call.attributes()`.
+- **Policy and revocation.** With no `replicas`, the server holds the fleet
+  namespace itself, and the root publishes into it:
+  `aster enroll revoke --subject $AGENT --fleet-only --fleet-namespace $FLEET
+  --fleet-secret-file fleet.secret --audience my-fleet --peer $SERVER`. The
+  revoked agent's next call is refused and its connections close. With
+  `replicas = ["aster1…"]` the server instead enrolls with those policy
+  replicas and synchronizes from them at start.
+- **Issuing and renewing.** `[enrollment.issuer] delegation_file =
+  "issuer.chain"` (from `aster enroll delegate`) makes the server a delegated
+  issuer: `srv.issuer().unwrap().issue_for(..)` enrolls new nodes and the
+  server serves their renewals. A client renews automatically from the server
+  that signed its credential, or from `[enrollment] renew_from`.
+- **Fail closed.** Setting a credential, audience, fleet namespace or issuer
+  turns enrollment on; anything missing or malformed stops `start()` /
+  `connect()` with an error that names the setting. Nothing falls back to an
+  open node.
+
+`srv.enrollment()` and `client.enrollment()` return the installed
+`aster::enrollment::Enrollment` for anything further (checking a peer,
+following revocations, applying a root rotation). The full schema is in
+`docs/_internal/working_ideas/aster-enrollment.md` ("AsterServer
+integration"); the Rust Mission Control example's auth chapter is a complete
+walk-through.
+
+The rest of this section is the low-level path, for hosts that run their own
+node and accept loop.
 
 Use Aster's `Gate0` rather than a separate static allowlist. Built-in
 docs/blobs/gossip ALPNs are always registered; add your admission ALPN(s)
@@ -568,9 +669,9 @@ does). The server keeps serving as long as you hold `srv` and call
 store-flushing close (Rust has no `async with`).
 
 `.identity(path)` persists only the endpoint **secret key** (64 hex chars,
-load-or-create) — enough for a restart-stable `NodeId`. Python's `.aster-identity`
-is a TOML credential file (root pubkey + enrollment material); Gate-1
-credential plumbing isn't in the Rust crate yet.
+load-or-create) — enough for a restart-stable `NodeId`, which is what an
+enrollment credential is issued for. Credentials come from the configuration
+(§3.0).
 
 #### Low-level: building a `Server` by hand
 
@@ -596,8 +697,29 @@ let _server = Server::new(&node)
 
 ### 4.4 Call it
 
-A client dials the producer's `address()` ticket — register its address
-material, then open an RPC connection by id:
+`AsterClient` is the high-level consumer, the peer of the Python/TS
+`AsterClient`: it resolves the config (`ASTER_ENDPOINT_ADDR` supplies the
+address when `.address(..)` is not called), starts a node, enrolls when
+`[enrollment]` is configured, and opens the RPC connection:
+
+```rust
+use aster::rpc::AsterClient;
+
+# async fn call(address: &str) -> aster::Result<()> {
+let client = AsterClient::builder()
+    .config(aster::AsterConfig::from_env()?)
+    .address(address)                       // the aster1… string from srv.address()
+    .connect()
+    .await?;
+let echo = EchoClient::new(client.rpc());   // EchoClient is generated from `Echo`
+let resp = echo.echo(EchoRequest { message: "hi".into(), count: 0 }).await?;
+client.close().await;
+# Ok(())
+# }
+```
+
+Low-level: with your own `Node`, register the ticket's address material, then
+open an RPC connection by id:
 
 ```rust
 use aster::rpc::RpcConnection;
@@ -644,11 +766,13 @@ let replies = chat.collect().await?;
 ### 4.6 Per-call authorization (Gate 3)
 
 `#[rpc(requires = …)]` is checked **before** the handler runs, against the
-caller's attributes in the server's `AttributeStore`. Your admission logic
-populates the store (e.g. after verifying the peer's enrollment credential). A
-missing capability fails with `PERMISSION_DENIED`.
+caller's attributes in the server's `AttributeStore`. A missing capability
+fails with `PERMISSION_DENIED`. With enrollment configured (§3.0) the store
+reads each peer's roles from its live, verified enrollment session, so there
+is nothing to populate; entries you set by hand still apply, and the
+enrollment-derived ones win on a clash.
 
-Give `AsterServer` the store with `.attributes(store)` (or read it back via
+Without enrollment, give `AsterServer` the store with `.attributes(store)` (or read it back via
 `srv.attributes()`) and keep a clone to populate from admission:
 
 ```rust
@@ -666,9 +790,8 @@ let _ = require_any_of(["operator", "admin"]);
 ```
 
 Gate 0 (connection admission) and Gate 3 (per-call capability) are independent
-layers. Gate 1 (enrollment-credential verification) and Gate 2 (session
-`authorize` → rcan) are not yet in the Rust crate — inject attributes from your
-own admission for now.
+layers; Enrollment drives both when configured. Gate 2 (session `authorize` →
+rcan) is not yet in the Rust crate.
 
 ### 4.7 Client interceptors (deadline / retry / circuit breaker)
 
@@ -776,7 +899,7 @@ exporters and log-level synchronization.
 | Feature | Default | What it enables |
 |---------|:-------:|-----------------|
 | `blobs` / `docs` / `gossip` | ✅ | the corresponding `Node` accessors |
-| `enrollment` | — | JWT enrollment credentials, root policy and the enrollment handshake |
+| `enrollment` | — | Enrollment: credentials, root policy, the handshake, and (with `rpc` + `docs`) `[enrollment]` on `AsterServer` / `AsterClient` |
 | `rpc` | — | the RPC framework (pulls Fory + the proc-macros) |
 | `discovery` / `hooks` | — | Local discovery and admission hooks |
 | `otel` / `health` | — | Observability integration and the health/Prometheus listener |
@@ -788,8 +911,8 @@ with `AsterConfigBuilder::hooks(true)`.
 
 ## 7. Current limits
 
-- **Gate 1 / Gate 2** auth (enrollment-credential verification, session
-  `authorize` → rcan) are not yet in the Rust crate.
+- **Gate 2** auth (session `authorize` → rcan) is not yet in the Rust crate.
+  Enrollment (§3.0) covers admission and per-call roles.
 - **Generated client request-stream methods** take a `Vec<Req>`. For incremental
   request sending, use the lower-level `RpcConnection::client_stream_open` or
   `bidi_open` APIs.
