@@ -1630,17 +1630,47 @@ impl EnrollmentService {
         let Some(session) = self.session(peer) else {
             return Err(self.sessionless_standing(peer));
         };
-        if let Err(error) = self
-            .evaluate(&session.evidence, session.observed_source)
+        match self
+            .evaluate_session(peer, &session, session.observed_source)
             .await
         {
-            if let AdmissionError::Denied(reason) = &error {
-                self.revoke_generation(peer, session.generation, reason.clone());
+            Ok(Some(readiness)) => Ok(readiness),
+            Ok(None) => {
+                self.confirm(peer, session.generation)?;
+                Ok(self.readiness(*peer, session.evidence.source(), session.observed_source))
             }
-            return Err(error);
+            Err(error) => {
+                if let AdmissionError::Denied(reason) = &error {
+                    self.revoke_generation(peer, session.generation, reason.clone());
+                }
+                Err(error)
+            }
         }
-        self.confirm(peer, session.generation)?;
-        Ok(self.readiness(*peer, session.evidence.source(), session.observed_source))
+    }
+
+    /// Evaluate a session's evidence at `source`. When a newer root record
+    /// superseded it (a promotion, or a later registration revision), derive
+    /// current evidence as reconciliation would and replace that exact
+    /// generation instead of reporting the stale evidence as a denial.
+    /// `Ok(Some(_))` is the upgraded session; `Ok(None)` means unchanged.
+    async fn evaluate_session(
+        &self,
+        peer: &[u8; 32],
+        session: &Session,
+        source: Option<ObservedSourceAddress>,
+    ) -> std::result::Result<Option<EnrollmentReadiness>, AdmissionError> {
+        match self.evaluate(&session.evidence, source).await {
+            Err(AdmissionError::Denied(DenialReason::RegistrationSuperseded)) => {}
+            other => return other.map(|()| None),
+        }
+        let current = self
+            .evidence(peer, session.evidence.presented_chain(), source)
+            .await?;
+        let mut readiness = self
+            .replace_session(current, session.observed_source, Some(session.generation))
+            .map_err(|error| AdmissionError::Unavailable(error.to_string()))?;
+        readiness.observed_source = source;
+        Ok(Some(readiness))
     }
 
     /// Recheck a live connection's current selected path at operation time.
@@ -1687,7 +1717,9 @@ impl EnrollmentService {
         let Some(session) = self.session(peer) else {
             return Err(self.sessionless_standing(peer));
         };
-        self.evaluate(&session.evidence, source).await?;
+        if let Some(readiness) = self.evaluate_session(peer, &session, source).await? {
+            return Ok(readiness);
+        }
         self.confirm(peer, session.generation)?;
         Ok(self.readiness(*peer, session.evidence.source(), source))
     }
@@ -2045,6 +2077,100 @@ mod tests {
             } else {
                 assert!(service.session(&public(3)).is_none());
             }
+            cleanup(service, path).await;
+        }
+    }
+
+    /// Promotion race: once this node's store holds a root registration for a
+    /// peer admitted on its chain, a check that runs before reconciliation
+    /// upgrades the session to the registration instead of revoking the peer
+    /// as `RegistrationSuperseded`. Both the operation check and the Gate 0
+    /// path are covered.
+    #[tokio::test]
+    async fn check_before_reconcile_upgrades_a_promoted_chain_session() {
+        use super::super::{AdmissionClaims, NodeRegistrationStatus, NodeRegistrationV1};
+        for gate in [false, true] {
+            // The service runs on the root's node, whose default author is the
+            // root key, so its own writes are exact-root records.
+            let root = raw_node(1).await;
+            let doc = root.docs_client().create().await.unwrap();
+            let mut nonce = [0; 8];
+            getrandom::getrandom(&mut nonce).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "aster-bootstrap-promotion-{}-{}.json",
+                std::process::id(),
+                hex::encode(nonce)
+            ));
+            let store = Arc::new(
+                EnrollmentPolicyStore::open(&path, public(1), *doc.doc.id().as_bytes(), AUDIENCE)
+                    .unwrap(),
+            );
+            let policy = PausedPolicy::new(false);
+            policy.pause_next.store(false, Ordering::SeqCst);
+            let service = EnrollmentService::new(
+                root,
+                store.clone(),
+                JwtEnrollmentVerifier::new(public(1), AUDIENCE).unwrap(),
+                None,
+                policy,
+                EnrollmentOptions::default(),
+                None,
+            );
+            service.set_policy_document(doc.clone()).unwrap();
+            service.remember(evidence(3), None).unwrap();
+            let generation = service.session(&public(3)).unwrap().generation;
+
+            let record = NodeRegistrationV1 {
+                version: 1,
+                issuer: hex::encode(public(1)),
+                subject: hex::encode(public(3)),
+                audience: crate::delegation::Audience::One(AUDIENCE.into()),
+                revision: 1,
+                issued_at: unix_now() - 60,
+                not_before: None,
+                expires_at: None,
+                status: NodeRegistrationStatus::Active,
+                claims: AdmissionClaims::default(),
+                mandatory: vec![],
+                reauthorizes_revision: None,
+            };
+            doc.set_bytes_durable(
+                hex::encode(public(1)),
+                super::super::node_registration_key(&public(3)),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+            // A policy sync refreshed the store; reconciliation has not run.
+            store.refresh(&doc).await.unwrap();
+            assert!(matches!(
+                service
+                    .stores
+                    .select_evidence(&public(3), None, unix_now())
+                    .unwrap()
+                    .source(),
+                AdmissionEvidenceSource::RootAuthoredRecord { revision: 1, .. }
+            ));
+
+            let ready = if gate {
+                service
+                    .check_peer_at_source(&public(3), None)
+                    .await
+                    .unwrap()
+            } else {
+                service.check_peer(&public(3)).await.unwrap()
+            };
+            assert!(matches!(
+                ready.source,
+                AdmissionEvidenceSource::RootAuthoredRecord { revision: 1, .. }
+            ));
+            let session = service.session(&public(3)).expect("session survives");
+            assert_ne!(session.generation, generation);
+            assert!(matches!(
+                session.evidence.source(),
+                AdmissionEvidenceSource::RootAuthoredRecord { .. }
+            ));
+            assert!(service.revoked_peers.lock().unwrap().reasons.is_empty());
             cleanup(service, path).await;
         }
     }
