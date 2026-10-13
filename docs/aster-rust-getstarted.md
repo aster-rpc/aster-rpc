@@ -769,8 +769,14 @@ let replies = chat.collect().await?;
 caller's attributes in the server's `AttributeStore`. A missing capability
 fails with `PERMISSION_DENIED`. With enrollment configured (§3.0) the store
 reads each peer's roles from its live, verified enrollment session, so there
-is nothing to populate; entries you set by hand still apply, and the
-enrollment-derived ones win on a clash.
+is nothing to populate. The credential sets the maximum; runtime settings can
+only restrict: `srv.attributes().restrict_roles(peer, ["ops.status"])` narrows
+an enrolled peer's credential roles from its next call (a role the credential
+lacks is never granted, and the restriction ends with the enrollment session
+but survives renewals), and `clear_restriction(peer)` restores them.
+`set` / `set_role` refuse `aster.role` for an enrolled peer
+(`RoleChangeError::CredentialOwnsRoles`); other keys you set still apply, and
+the credential's attributes win on a clash.
 
 Without enrollment, give `AsterServer` the store with `.attributes(store)` (or read it back via
 `srv.attributes()`) and keep a clone to populate from admission:
@@ -782,7 +788,9 @@ let attrs = AttributeStore::new();
 // let srv = AsterServer::builder().service(…).attributes(attrs.clone()).start().await?;
 
 // In your admission accept loop, once a peer's chain verifies and you know its role:
-attrs.set_role(conn.peer().as_str(), "operator");
+attrs
+    .set_role(conn.peer().as_str(), "operator")
+    .expect("refused only for a peer with a live enrollment session");
 // attrs.remove(peer)  // revoke
 
 // Requirements are constructed with require_role / require_any_of / require_all_of.
