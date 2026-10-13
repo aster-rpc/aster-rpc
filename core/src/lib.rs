@@ -577,6 +577,31 @@ pub struct CoreHookHandshakeInfo {
     /// unknown and future paths do not supply an originating-peer address.
     #[cfg(feature = "enrollment")]
     pub observed_peer_addr: Option<SocketAddr>,
+    /// The connection being admitted, so admission can close it later.
+    #[cfg(feature = "enrollment")]
+    pub connection: CoreWeakConnection,
+}
+
+/// A non-owning reference to a connection: it does not keep the connection
+/// alive, but can close it while it still exists.
+#[cfg(feature = "enrollment")]
+#[derive(Clone, Debug)]
+pub struct CoreWeakConnection(WeakConnectionHandle);
+
+#[cfg(feature = "enrollment")]
+impl CoreWeakConnection {
+    pub fn is_alive(&self) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|connection| connection.close_reason().is_none())
+    }
+
+    /// Close the connection if it still exists.
+    pub fn close(&self, code: u64, reason: &[u8]) {
+        if let (Some(connection), Ok(code)) = (self.0.upgrade(), u64_to_varint(code)) {
+            connection.close(code, reason);
+        }
+    }
 }
 
 /// Decision for after_handshake hook
@@ -1187,6 +1212,8 @@ impl EndpointHooks for CoreHooksAdapter {
             is_alive: conn.close_reason().is_none(),
             #[cfg(feature = "enrollment")]
             observed_peer_addr: selected_transport_snapshot(conn).peer_addr,
+            #[cfg(feature = "enrollment")]
+            connection: CoreWeakConnection(conn.weak_handle()),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if self

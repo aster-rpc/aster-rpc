@@ -846,3 +846,174 @@ async fn install_rejects_mismatched_activation_leeway() {
     assert!(install(matched, exact).is_ok());
     node.shutdown().await;
 }
+
+/// Allows everyone until `failing` is set, then errors (policy unavailable,
+/// never a definite denial).
+struct Switchable {
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl AdmissionPolicy for Switchable {
+    async fn evaluate(
+        &self,
+        _: &VerifiedAdmissionEvidence,
+        _: &AdmissionContext,
+        _: u64,
+    ) -> Result<AdmissionDecision, PolicyError> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(PolicyError::Handler("unavailable".into()))
+        } else {
+            Ok(AdmissionDecision::Allow)
+        }
+    }
+}
+
+/// Route enrollment only; ordinary connections are held open but never
+/// registered with `track_connection`, so only Gate 0 can close them.
+fn serve_untracked(node: Node, enrollment: Enrollment) -> mpsc::Receiver<aster::Connection> {
+    let (send, recv) = mpsc::channel(16);
+    tokio::spawn(async move {
+        while let Ok((alpn, connection)) = node.accept().await {
+            if alpn == ENROLLMENT_ALPN {
+                let enrollment = enrollment.clone();
+                tokio::spawn(async move {
+                    let _ = enrollment.accept(&connection).await;
+                    connection.closed().await;
+                });
+            } else {
+                let _ = send.send(connection).await;
+            }
+        }
+    });
+    recv
+}
+
+#[tokio::test]
+async fn definite_denial_closes_every_gate_admitted_connection() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let files = tempfile::tempdir().unwrap();
+        let root = node(1).await;
+        let doc = root.docs().create().await.unwrap();
+        let namespace: [u8; 32] = hex::decode(doc.id().unwrap().to_string())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let root_enroll = enrollment(
+            &root,
+            namespace,
+            &files.path().join("root.json"),
+            Some(token(1)),
+        );
+        root_enroll.set_policy_document(&doc).unwrap();
+        let _root_connections = serve(root.clone(), root_enroll);
+
+        let interval = Duration::from_millis(50);
+        let replica = node(2).await;
+        let policy = Arc::new(Switchable {
+            failing: false.into(),
+        });
+        let replica_enroll = Enrollment::install(
+            &replica,
+            Arc::new(
+                EnrollmentPolicyStore::open(
+                    files.path().join("replica.json"),
+                    public(1),
+                    namespace,
+                    FLEET,
+                )
+                .unwrap(),
+            ),
+            JwtEnrollmentVerifier::new(public(1), FLEET).unwrap(),
+            Some(token(2)),
+            policy.clone(),
+            EnrollmentOptions {
+                reconciliation_interval: interval,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut inbound = serve_untracked(replica.clone(), replica_enroll.clone());
+        sync(&replica_enroll, root.addr()).await;
+
+        let peer = node(5).await;
+        let peer_enroll = enrollment(
+            &peer,
+            namespace,
+            &files.path().join("peer.json"),
+            Some(token(5)),
+        );
+        let mut peer_inbound = serve_untracked(peer.clone(), peer_enroll.clone());
+        sync(&peer_enroll, replica.addr()).await;
+
+        // Two connections from the peer and one the replica opened to it.
+        peer.add_peer(&replica).unwrap();
+        replica.add_peer(&peer).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(peer.connect(&replica.id(), NORMAL).await.unwrap());
+            held.push(inbound.recv().await.unwrap());
+        }
+        held.push(replica.connect(&peer.id(), NORMAL).await.unwrap());
+        held.push(peer_inbound.recv().await.unwrap());
+
+        // Policy unavailable is not a denial: nothing closes.
+        policy
+            .failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        replica_enroll.reconcile().await;
+        assert!(matches!(
+            replica_enroll.check_peer(&public(5)).await,
+            Err(AdmissionError::Unavailable(_))
+        ));
+        tokio::time::sleep(interval * 4).await;
+        for connection in &held {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), connection.closed())
+                    .await
+                    .is_err(),
+                "an unavailable policy closed a connection"
+            );
+        }
+        policy
+            .failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let mut revoked = replica_enroll.revocations();
+        write(
+            &root,
+            &doc,
+            &registration(5, 1, NodeRegistrationStatus::Revoked),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while revoked.recv().await.unwrap().peer != public(5) {}
+        })
+        .await
+        .unwrap();
+        let denied = std::time::Instant::now();
+        for connection in &held {
+            tokio::time::timeout(interval + Duration::from_secs(1), connection.closed())
+                .await
+                .expect("Gate 0 left an admitted connection open after denial");
+        }
+        assert!(denied.elapsed() <= interval + Duration::from_secs(1));
+        assert!(
+            peer.connect(&replica.id(), NORMAL).await.is_err()
+                || tokio::time::timeout(Duration::from_secs(3), async {
+                    peer.connect(&replica.id(), NORMAL)
+                        .await
+                        .unwrap()
+                        .closed()
+                        .await
+                })
+                .await
+                .is_ok()
+        );
+        peer.shutdown().await;
+        replica.shutdown().await;
+        root.shutdown().await;
+    })
+    .await
+    .expect("close-on-deny test timed out");
+}

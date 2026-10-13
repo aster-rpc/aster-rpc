@@ -27,7 +27,7 @@ use super::{
 };
 use crate::{
     CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreHookHandshakeInfo, CoreHookReceiver,
-    CoreNode, CoreNodeAddr, CoreRecvStream, CoreSendStream,
+    CoreNode, CoreNodeAddr, CoreRecvStream, CoreSendStream, CoreWeakConnection,
 };
 
 pub const ENROLLMENT_ALPN: &[u8] = b"aster.enrollment/1";
@@ -164,7 +164,11 @@ impl std::error::Error for AdmissionError {}
 struct Session {
     generation: u64,
     evidence: VerifiedAdmissionEvidence,
+    /// Connections registered with `track_connection`.
     connections: Vec<CoreConnection>,
+    /// Every ordinary connection Gate 0 admitted for this peer, in either
+    /// direction. A definite denial closes them all.
+    admitted: Vec<CoreWeakConnection>,
     observed_source: Option<ObservedSourceAddress>,
     last_used: Instant,
 }
@@ -461,15 +465,44 @@ impl EnrollmentService {
             let _ = reply.send(hook_decision(false));
             return;
         };
+        let connection = info.connection;
         tokio::spawn(async move {
             let _permit = permit;
             let source = address.map(|address| ObservedSourceAddress {
                 address: address.ip(),
                 provenance: SourceAddressProvenance::DirectPeer,
             });
-            let allowed = self.check_peer_at_source(&peer, source).await.is_ok();
+            let allowed = self.gate_connection(&peer, source, connection).await;
             let _ = reply.send(hook_decision(allowed));
         });
+    }
+
+    /// Gate 0 for one ordinary connection: admit it only under the session it
+    /// was evaluated against, and remember it in the same step so a later
+    /// definite denial closes it.
+    async fn gate_connection(
+        &self,
+        peer: &[u8; 32],
+        source: Option<ObservedSourceAddress>,
+        connection: CoreWeakConnection,
+    ) -> bool {
+        let Some(session) = self.session(peer) else {
+            return false;
+        };
+        if self.evaluate(&session.evidence, source).await.is_err() {
+            return false;
+        }
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(current) = sessions
+            .get_mut(peer)
+            .filter(|current| current.generation == session.generation)
+        else {
+            return false;
+        };
+        current.last_used = Instant::now();
+        current.admitted.retain(CoreWeakConnection::is_alive);
+        current.admitted.push(connection);
+        true
     }
 
     pub fn revocations(&self) -> broadcast::Receiver<EnrollmentRevoked> {
@@ -766,6 +799,7 @@ impl EnrollmentService {
                             .connections
                             .iter()
                             .all(|connection| !connection.connection_info().is_connected)
+                        && !session.admitted.iter().any(CoreWeakConnection::is_alive)
                 })
                 .min_by_key(|(_, session)| session.last_used)
                 .map(|(peer, _)| *peer);
@@ -781,9 +815,9 @@ impl EnrollmentService {
                 value.checked_add(1)
             })
             .map_err(|_| anyhow!("admission generation exhausted"))?;
-        let connections = sessions
+        let (connections, admitted) = sessions
             .remove(&peer)
-            .map(|session| session.connections)
+            .map(|session| (session.connections, session.admitted))
             .unwrap_or_default();
         sessions.insert(
             peer,
@@ -791,6 +825,7 @@ impl EnrollmentService {
                 generation,
                 evidence,
                 connections,
+                admitted,
                 observed_source,
                 last_used: Instant::now(),
             },
@@ -1208,9 +1243,10 @@ impl EnrollmentService {
         Ok(self.readiness(*peer, session.evidence.source(), source))
     }
 
-    /// Opt into closing a custom connection when this service learns denial.
-    /// Built-in Docs/blobs/gossip connections are not exposed by this API;
-    /// consumers must use revocation notifications for their own teardown.
+    /// Opt into closing a connection that did not pass this node's Gate 0
+    /// hook when this service learns denial. Connections Gate 0 admitted,
+    /// including built-in Docs/blobs/gossip/RPC ones, are closed already;
+    /// consumers still cancel their own work on revocation notifications.
     pub async fn track_connection(&self, connection: CoreConnection) -> Result<()> {
         let peer = identity(&connection.remote_id())?;
         self.check_connection(&connection).await?;
@@ -1247,6 +1283,9 @@ impl EnrollmentService {
         drop(sessions);
         for connection in session.connections {
             let _ = connection.close(REJECT, b"enrollment revoked".to_vec());
+        }
+        for connection in session.admitted {
+            connection.close(REJECT, b"enrollment revoked");
         }
         let _ = self.revoked.send(EnrollmentRevoked {
             peer: *peer,
