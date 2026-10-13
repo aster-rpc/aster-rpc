@@ -402,6 +402,26 @@ internal sealed class DispatchServer : IDisposable
                 "aster_server_set_peer_attributes");
     }
 
+    /// <summary>Narrows an enrolled peer's roles to <paramref name="roles"/> (comma-separated) ∩ its credential roles.</summary>
+    public unsafe void RestrictPeerRoles(string peer, string roles)
+    {
+        byte[] p = Encoding.UTF8.GetBytes(peer);
+        byte[] r = Encoding.UTF8.GetBytes(roles);
+        fixed (byte* pp = p)
+        fixed (byte* rp = r)
+            Native.Check(Native.aster_server_restrict_peer_roles(_handle, pp, (uint)p.Length, r.Length == 0 ? null : rp, (uint)r.Length),
+                "aster_server_restrict_peer_roles");
+    }
+
+    /// <summary>Removes <paramref name="peer"/>'s role restriction.</summary>
+    public unsafe void ClearPeerRestriction(string peer)
+    {
+        byte[] p = Encoding.UTF8.GetBytes(peer);
+        fixed (byte* pp = p)
+            Native.Check(Native.aster_server_clear_peer_restriction(_handle, pp, (uint)p.Length),
+                "aster_server_clear_peer_restriction");
+    }
+
     /// <summary>Stops serving: queued calls are abandoned, waiters fail. Call after the poll loop stopped.</summary>
     public void Dispose()
     {

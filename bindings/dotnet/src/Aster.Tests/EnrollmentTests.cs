@@ -179,6 +179,36 @@ public class EnrollmentTests
         Assert.Equal("ops.ingest", await Call(ingest, addr, "ping"));
     }
 
+    // The credential sets the maximum; runtime settings can only restrict. Restricting a
+    // credential's ops.status,ops.logs to ops.status refuses logs on the next call;
+    // SetPeerAttributes cannot grant an enrolled peer a role; clearing restores the credential
+    // roles; a peer without a session cannot be restricted.
+    [Fact]
+    public async Task Runtime_Restriction_Refuses_The_Next_Call()
+    {
+        var (server, addr) = await StartOps(new AsterServerOptions { Config = ServerConfig(TempDir()) });
+        await using var _s = server;
+        await using var session = await Client(Enrolled(5, CredentialFor(5, "ops.status,ops.logs")));
+        Assert.Equal("ops.logs,ops.status", await Call(session, addr, "logs"));
+
+        server.RestrictPeerRoles(Pub(5), ["ops.status"]);
+        Assert.Equal("ops.status", await Call(session, addr, "status"));
+        var denied = await Assert.ThrowsAsync<RpcError>(() => Call(session, addr, "logs"));
+        Assert.Equal(StatusCode.PermissionDenied, denied.Code);
+
+        var grant = Assert.ThrowsAny<IrohException>(
+            () => server.SetPeerAttributes(Pub(5), new Dictionary<string, string> { ["aster.role"] = "ops.admin" }));
+        Assert.Equal(Status.InvalidArgument, grant.Status);
+        denied = await Assert.ThrowsAsync<RpcError>(() => Call(session, addr, "logs"));
+        Assert.Equal(StatusCode.PermissionDenied, denied.Code);
+
+        server.ClearPeerRestriction(Pub(5));
+        Assert.Equal("ops.logs,ops.status", await Call(session, addr, "logs"));
+        var none = Assert.ThrowsAny<IrohException>(() => server.RestrictPeerRoles(Pub(9), ["ops.status"]));
+        Assert.Equal(Status.NotFound, none.Status);
+    }
+
+
     // A server configured as a delegated issuer serves renewals; a client whose credential that
     // server signed renews automatically and stays admitted, with its roles, across several short
     // lifetimes. The server synchronizes policy from a configured replica (the root).

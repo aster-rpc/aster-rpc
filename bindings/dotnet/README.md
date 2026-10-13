@@ -41,6 +41,14 @@ await using var server = await AsterServer.StartAsync(new AsterServerOptions
 });
 ```
 
+Runtime role changes: the credential sets the maximum; runtime settings can
+only restrict. `server.RestrictPeerRoles(peer, roles)` narrows an enrolled
+peer's credential roles from its next call (a role the credential lacks is never
+granted; the restriction ends with the enrollment session and survives
+renewals), and `server.ClearPeerRestriction(peer)` restores them.
+`SetPeerAttributes` with `aster.role` throws for an enrolled peer; for peers
+without an enrollment session it grants roles as before.
+
 Escape hatches: `server.Enrollment` / `client.Enrollment` (`Status()`,
 `PeerClaims(peer)`, `CheckPeerAsync`, `NextRevocationAsync`), `server.Issuer`
 (configured delegated issuer: `Info()`, `Issue(...)`), `client.IsRenewing`,

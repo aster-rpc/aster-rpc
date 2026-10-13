@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed: the credential sets the maximum roles; runtime can only restrict
+
+For a peer with a live enrollment session, the roles Gate 3 checks are now the
+roles from its credential (`[enrollment.roles]`) intersected with an optional
+runtime restriction. New `AsterServer.RestrictPeerRoles(peerId, roles)` narrows
+them from the peer's next call (calls in flight finish); an empty list leaves
+the peer no roles; a role the credential lacks is never granted.
+`AsterServer.ClearPeerRestriction(peerId)` restores the credential roles. A
+restriction survives renewals of the same credential subject and ends with the
+peer's enrollment session (revocation, eviction, expiry); `RestrictPeerRoles`
+throws an `IrohException` (`Status.NotFound`) for a peer without a live
+session. `SetPeerAttributes` with `aster.role` for an enrolled peer now throws
+(`Status.InvalidArgument`); other keys still apply (the credential's
+attributes win on a clash). Peers without an enrollment session are unchanged.
+
 ### Breaking change: legacy consumer admission retired; Enrollment from configuration
 
 The consumer admission path is removed with no backward compatibility, in favour
@@ -67,7 +82,8 @@ because one would turn a typo into an open server.
    `[enrollment] audience`, `fleet_namespace` and `state_path` (server) on both
    sides. Put roles in the credential's `aster.role` attribute
    (`{"aster.role": {"type": "string", "value": "ops.status,ops.logs"}}`) instead
-   of calling `SetPeerAttributes`.
+   of calling `SetPeerAttributes`; at runtime you can only narrow them with
+   `RestrictPeerRoles`.
 4. Code that read `server.Gate` to admit peers must pass its own `Gate` in
    `AsterServerOptions.Gate` (only without enrollment), or use Enrollment.
 5. Code that handled `aster.consumer_admission` through `NonRpcConnection`

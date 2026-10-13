@@ -258,6 +258,15 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
     /// <paramref name="peerId"/>: Rust's Gate 3 checks <see cref="CapabilityRequirement"/>s
     /// against them, and handlers see them in <see cref="ServerCallContext.Attributes"/>. Null or
     /// empty clears. HTTP/WT uses the authenticator's per-call attributes instead.
+    /// <para>
+    /// With enrollment configured, the credential sets the maximum and runtime settings can only
+    /// restrict: a peer with a live enrollment session takes its roles from its credential
+    /// (<c>[enrollment.roles]</c>), so <c>aster.role</c> here throws an
+    /// <see cref="IrohException"/> (<c>InvalidArgument</c>; narrow it with
+    /// <see cref="RestrictPeerRoles"/>). Other keys apply, and the credential's attributes win on a
+    /// clash. For a peer without a session (no enrollment, or a custom gate) these attributes,
+    /// <c>aster.role</c> included, apply as given.
+    /// </para>
     /// </summary>
     public void SetPeerAttributes(string peerId, IReadOnlyDictionary<string, string>? attributes)
     {
@@ -269,6 +278,28 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
         }
         var copy = new Dictionary<string, string>(attributes, StringComparer.Ordinal);
         _dispatch.SetPeerAttributes(peerId, copy);
+    }
+
+    /// <summary>
+    /// Narrows an enrolled peer's roles to <paramref name="roles"/> ∩ its credential roles, from
+    /// its next call (calls in flight finish). The credential sets the maximum: a role it lacks is
+    /// never granted, and an empty list refuses every role-gated call. Replaces an earlier
+    /// restriction, survives renewals of the same credential subject, and ends with the peer's
+    /// enrollment session (revocation, eviction, expiry). Throws an <see cref="IrohException"/>
+    /// (<c>NotFound</c>) when <paramref name="peerId"/> has no live enrollment session.
+    /// </summary>
+    public void RestrictPeerRoles(string peerId, IEnumerable<string> roles)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(peerId);
+        ArgumentNullException.ThrowIfNull(roles);
+        _dispatch.RestrictPeerRoles(peerId, string.Join(",", roles));
+    }
+
+    /// <summary>Removes <paramref name="peerId"/>'s role restriction; its credential roles apply from its next call.</summary>
+    public void ClearPeerRestriction(string peerId)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(peerId);
+        _dispatch.ClearPeerRestriction(peerId);
     }
 
     // ─── Poll loop ──────────────────────────────────────────────────────────

@@ -27,6 +27,10 @@ internal static unsafe partial class Native
     public static partial int aster_server_destroy(ulong runtime, ulong server);
     [LibraryImport(NativeLib, EntryPoint = "aster_server_set_peer_attributes")]
     public static partial int aster_server_set_peer_attributes(ulong server, byte* peer, uint peer_len, byte* kv, uint kv_len);
+    [LibraryImport(NativeLib, EntryPoint = "aster_server_restrict_peer_roles")]
+    public static partial int aster_server_restrict_peer_roles(ulong server, byte* peer, uint peer_len, byte* roles, uint roles_len);
+    [LibraryImport(NativeLib, EntryPoint = "aster_server_clear_peer_restriction")]
+    public static partial int aster_server_clear_peer_restriction(ulong server, byte* peer, uint peer_len);
     [LibraryImport(NativeLib, EntryPoint = "aster_server_poll")]
     public static partial uint aster_server_poll(ulong runtime, ulong server, DispatchEventNative* events, uint max, uint timeout_ms);
     [LibraryImport(NativeLib, EntryPoint = "aster_server_live_calls")]
