@@ -10,6 +10,8 @@ import kotlinx.coroutines.runBlocking
 import site.aster.client.AsterClient
 import site.aster.client.ClientSession
 import site.aster.codec.ForyCodec
+import site.aster.config.AsterConfig
+import site.aster.enrollment.EnrollmentConfig
 import site.aster.examples.missioncontrol.AgentSessionDispatcher
 import site.aster.examples.missioncontrol.MissionControlDispatcher
 import site.aster.examples.missioncontrol.Server
@@ -37,7 +39,10 @@ import site.aster.node.NodeAddr
  *
  * Exit codes: `0` all tests passed, `1` at least one test failed, `2` setup/usage error.
  *
- * Currently implements Ch1–Ch4 (dev mode). Ch5 (auth) and Ch6 (gen-client) land in later phases.
+ * Dev mode runs Ch1–Ch4. Auth mode (Ch5) runs against a server with Enrollment configured: the
+ * keys dir is what `setup_auth.sh` writes with the Rust `aster` CLI (`auth.env` plus each
+ * client's `<name>.key` / `<name>.cred`), and each client is an [AsterClient] configured with
+ * its own key and credential, exactly as an application would be.
  */
 
 private var quiet = false
@@ -309,7 +314,31 @@ private fun isPermissionDenied(t: Throwable): Boolean {
   return false
 }
 
-private suspend fun buildClient(addrStr: String, identityPath: Path?): Pair<AsterClient?, NodeAddr?> {
+/**
+ * The configuration of client `name` from the keys dir: the shared `auth.env` (root, audience,
+ * fleet namespace) plus `<name>.key` and `<name>.cred`; `null` name = no enrollment at all.
+ */
+private fun enrolledConfig(keysDir: String, name: String?): AsterConfig {
+  val builder = AsterConfig.builder()
+  if (name == null) return builder.build()
+  val env =
+      Path.of(keysDir, "auth.env").toFile().readLines().mapNotNull { line ->
+        val i = line.indexOf('=')
+        if (i <= 0) null else line.substring(0, i).trim() to line.substring(i + 1).trim()
+      }.toMap()
+  return builder
+      .rootPubkey(java.util.HexFormat.of().parseHex(env.getValue("ASTER_ROOT_PUBKEY")))
+      .secretKeyFile(Path.of(keysDir, "$name.key").toString())
+      .enrollmentCredentialFile(Path.of(keysDir, "$name.cred").toString())
+      .enrollment(
+          EnrollmentConfig.builder()
+              .audience(env.getValue("ASTER_ENROLLMENT_AUDIENCE"))
+              .fleetNamespace(env.getValue("ASTER_ENROLLMENT_FLEET_NAMESPACE"))
+              .build())
+      .build()
+}
+
+private suspend fun buildClient(addrStr: String, config: AsterConfig): Pair<AsterClient?, NodeAddr?> {
   val addr =
       try {
         NodeAddr.fromTicket(addrStr)
@@ -319,10 +348,7 @@ private suspend fun buildClient(addrStr: String, identityPath: Path?): Pair<Aste
       }
   val codec = ForyCodec()
   Server.registerWireTypes(codec)
-  val builder = AsterClient.builder().codec(codec)
-  if (identityPath != null) {
-    builder.identity(identityPath)
-  }
+  val builder = AsterClient.builder().codec(codec).config(config)
   val client =
       try {
         builder.build().get(15, TimeUnit.SECONDS)
@@ -333,9 +359,9 @@ private suspend fun buildClient(addrStr: String, identityPath: Path?): Pair<Aste
   return client to addr
 }
 
-/** No credential → admission should deny. Works against strict-mode servers only. */
-private suspend fun testCh5NoCredential(addrStr: String) {
-  val (client, addr) = buildClient(addrStr, null)
+/** No credential: Gate 0 on the enrolled server refuses the connection, so nothing can be called. */
+private suspend fun testCh5NoCredential(addrStr: String, keysDir: String) {
+  val (client, addr) = buildClient(addrStr, enrolledConfig(keysDir, null))
   if (client == null || addr == null) return
   try {
     client
@@ -347,13 +373,10 @@ private suspend fun testCh5NoCredential(addrStr: String) {
             StatusResponse::class.java)
         .orTimeout(15, TimeUnit.SECONDS)
         .await()
-    fail("Ch5 no-cred denied", "call succeeded — admission should have denied")
+    fail("Ch5 no-cred denied", "call succeeded (should have been refused)")
   } catch (e: Throwable) {
-    if (isPermissionDenied(unwrap(e))) {
-      ok("Ch5 no credential → denied")
-    } else {
-      fail("Ch5 no-cred denied", "unexpected error: ${unwrap(e)}")
-    }
+    // Refused at Gate 0: a closed connection, a timeout or PERMISSION_DENIED.
+    ok("Ch5 no credential → refused (${unwrap(e).javaClass.simpleName})")
   } finally {
     try {
       client.close()
@@ -362,8 +385,8 @@ private suspend fun testCh5NoCredential(addrStr: String) {
 }
 
 /** Edge credential: getStatus OK (has ops.status), tailLogs DENIED, runCommand DENIED. */
-private suspend fun testCh5EdgeCredential(addrStr: String, edgeCred: Path) {
-  val (client, addr) = buildClient(addrStr, edgeCred)
+private suspend fun testCh5EdgeCredential(addrStr: String, keysDir: String) {
+  val (client, addr) = buildClient(addrStr, enrolledConfig(keysDir, "edge"))
   if (client == null || addr == null) return
   try {
     try {
@@ -432,8 +455,8 @@ private suspend fun testCh5EdgeCredential(addrStr: String, edgeCred: Path) {
 }
 
 /** Ops credential: getStatus OK, tailLogs OK (any_of(LOGS, ADMIN)), runCommand OK. */
-private suspend fun testCh5OpsCredential(addrStr: String, opsCred: Path) {
-  val (client, addr) = buildClient(addrStr, opsCred)
+private suspend fun testCh5OpsCredential(addrStr: String, keysDir: String) {
+  val (client, addr) = buildClient(addrStr, enrolledConfig(keysDir, "ops"))
   if (client == null || addr == null) return
   try {
     try {
@@ -511,20 +534,16 @@ private suspend fun testCh5OpsCredential(addrStr: String, opsCred: Path) {
 
 private suspend fun runAuthMode(addrStr: String, keysDir: String) {
   section("Auth mode (Chapter 5)")
-  val edgeCred = Path.of(keysDir, "edge.cred")
-  val opsCred = Path.of(keysDir, "ops.cred")
-  if (!edgeCred.toFile().exists()) {
-    fail("Ch5 setup", "missing ${edgeCred} — run setup_auth.sh first")
-    return
-  }
-  if (!opsCred.toFile().exists()) {
-    fail("Ch5 setup", "missing ${opsCred} — run setup_auth.sh first")
-    return
+  for (file in listOf("auth.env", "edge.key", "edge.cred", "ops.key", "ops.cred")) {
+    if (!Path.of(keysDir, file).toFile().exists()) {
+      fail("Ch5 setup", "missing ${Path.of(keysDir, file)} — run setup_auth.sh first")
+      return
+    }
   }
 
-  testCh5NoCredential(addrStr)
-  testCh5EdgeCredential(addrStr, edgeCred)
-  testCh5OpsCredential(addrStr, opsCred)
+  testCh5NoCredential(addrStr, keysDir)
+  testCh5EdgeCredential(addrStr, keysDir)
+  testCh5OpsCredential(addrStr, keysDir)
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────

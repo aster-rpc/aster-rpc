@@ -33,8 +33,9 @@ import site.aster.server.spi.UnaryDispatcher;
 /**
  * Auth-mode {@link ServiceDispatcher} for {@link MissionControl}. Wire-identical to {@code
  * MissionControlDispatcher} but annotates each {@link MethodDescriptor} with a {@link
- * CapabilityRequirement} so {@code CapabilityInterceptor} can gate the call. Mirrors the role
- * assignment in {@code examples/python/mission_control/services_auth.py}:
+ * CapabilityRequirement} that Rust enforces (Gate 3) against the roles in the caller's enrollment
+ * credential. Mirrors the role assignment in {@code
+ * examples/python/mission_control/services_auth.py}:
  *
  * <ul>
  *   <li>{@code getStatus} — {@link Role#STATUS}

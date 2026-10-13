@@ -203,21 +203,28 @@ start_java_server() {
   # mvn exec:java re-uses installed classes, but we still invoke in-module so no
   # `install` step is required. Spotbugs/fmt/checkstyle are skipped for speed.
   cd "$JAVA_BINDINGS_DIR"
-  local main_class exec_args
+  local main_class
   if [[ "$mode" == "auth" ]]; then
+    # Enrollment from the environment: auth.env (root, audience, fleet
+    # namespace) plus the server's own key, credential and state.
     main_class=site.aster.examples.missioncontrol.ServerAuth
-    exec_args="--strict"
   else
     main_class=site.aster.examples.missioncontrol.Server
-    exec_args=""
   fi
 
-  IROH_LIB_PATH="$JAVA_FFI_LIB" \
-    mvn -pl aster-examples-mission-control exec:java \
+  (
+    if [[ "$mode" == "auth" ]]; then
+      set -a; . "$WORK_DIR/auth.env"; set +a
+      export ASTER_SECRET_KEY_FILE="$WORK_DIR/server.key"
+      export ASTER_ENROLLMENT_CREDENTIAL="$WORK_DIR/server.cred"
+      export ASTER_ENROLLMENT_STATE_PATH="$WORK_DIR/server-enrollment.json"
+      rm -f "$ASTER_ENROLLMENT_STATE_PATH"
+    fi
+    export IROH_LIB_PATH="$JAVA_FFI_LIB"
+    exec mvn -pl aster-examples-mission-control exec:java \
       -Dexec.mainClass="$main_class" \
-      -Dexec.args="$exec_args" \
-      -Dspotbugs.skip=true -Dfmt.skip=true -Dcheckstyle.skip=true -q \
-    > "$addr_file" 2> "$log_file" &
+      -Dspotbugs.skip=true -Dfmt.skip=true -Dcheckstyle.skip=true -q
+  ) > "$addr_file" 2> "$log_file" &
 
   echo $! > "$pid_file"
 
