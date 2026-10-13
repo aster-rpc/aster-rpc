@@ -1,4 +1,3 @@
-#![cfg(feature = "attestation")]
 //! Cross-binding golden vectors for sealed grants and ticket relay folding,
 //! published as `conformance/vectors/grants.json` and
 //! `conformance/vectors/ticket.json`.
@@ -73,7 +72,7 @@ const X25519_PRIVATE: [u8; 32] = [0x44; 32];
 const NAMESPACE_SECRET: [u8; 32] = [0x55; 32];
 
 fn node_id(secret: [u8; 32]) -> NodeId {
-    NodeId::from_hex(aster::attestation::public_key(&SecretKey::from_bytes(secret)).to_hex())
+    NodeId::from_hex(SecretKey::from_bytes(secret).public_key().to_hex())
 }
 
 /// Owned context fields, so vectors can be built and parsed.

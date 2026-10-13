@@ -35,7 +35,6 @@ crossbeam-utils = { workspace = true }
 getrandom = "0.2"
 fory-core = "=1.7.6"
 fory-derive = "=1.7.6"
-thiserror = { version = "2", optional = true }
 base64 = "0.22"
 # Compact Ed25519 JWS signing and verification for delegation chains and
 # enrollment credentials (AWS-LC, the backend the native stack already uses).
@@ -55,9 +54,6 @@ ingress-metrics = []
 # Test-only fault injection (see reactor::test_hooks). Never on in a shipping
 # build; the tests that need it enable it explicitly.
 test-hooks = []
-# Ownership-attestation chain. Apache Fory is now a core dependency because
-# simple trust-config primitives also use Fory XLANG.
-attestation = ["dep:thiserror"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

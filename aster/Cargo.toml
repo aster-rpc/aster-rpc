@@ -11,11 +11,10 @@ publish = ["aster"]
 [features]
 enrollment = ["delegation", "aster_transport_core/enrollment"]
 delegation = ["aster_transport_core/delegation"]
-default = ["blobs", "docs", "gossip", "attestation"]
+default = ["blobs", "docs", "gossip"]
 blobs = ["dep:iroh-blobs"]
 docs = ["blobs"]
 gossip = ["dep:iroh-gossip"]
-attestation = ["aster_transport_core/attestation"]
 # Rust-native RPC (envelope + payload codec, dispatch, client stub). Off by
 # default so Step-1 consumers don't compile Fory. See docs/_internal/aster-rust.md.
 rpc = [
@@ -88,7 +87,7 @@ otel = ["rpc", "dep:aster-otel", "dep:arc-swap"]
 #
 # Binding profile -- what a binding crate enables on `aster`:
 #
-#   default (blobs, docs, gossip, attestation) + rpc + metrics + binding-support
+#   default (blobs, docs, gossip) + rpc + metrics + binding-support
 #
 # and, only once the binding surfaces them, `coordination-client` (wrap the
 # coordination client, never port it), `expose` (HTTP-over-Aster) and `health`
@@ -141,7 +140,7 @@ http-body-util = { version = "0.1", optional = true }
 aster-otel = { path = "../aster-otel", version = "=0.3.0", registry = "aster", optional = true }
 arc-swap = { version = "=1.9.1", optional = true }
 # RPC codec (Apache Fory Rust crate). Gated by the `rpc` feature. Pinned to the
-# same version as core's attestation feature. The `#[derive(ForyStruct)]` macro
+# same version as core's Fory dependency. The `#[derive(ForyStruct)]` macro
 # emits `::fory_core::` paths, so both crates are direct deps.
 fory-core = { version = "=1.7.6", optional = true }
 fory-derive = { version = "=1.7.6", optional = true }

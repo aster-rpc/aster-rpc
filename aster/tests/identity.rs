@@ -65,10 +65,7 @@ async fn generated_secret_key_pins_node_identity() {
     // The node accepted the generated key as its identity, and the offline
     // public-key helper derives the matching identity.
     assert_eq!(node.export_secret_key().unwrap().to_bytes(), a.to_bytes());
-    assert_eq!(
-        node.id().to_string(),
-        aster::attestation::public_key(&a).to_hex()
-    );
+    assert_eq!(node.id().to_string(), a.public_key().to_hex());
     node.shutdown().await;
 }
 
@@ -117,10 +114,7 @@ async fn secret_key_file_gives_a_restart_stable_node_id() {
     n1.shutdown().await;
 
     let on_disk = SecretKey::read_file(&key_path).expect("the key file was written");
-    assert_eq!(
-        aster::attestation::public_key(&on_disk).to_hex(),
-        id1.to_string()
-    );
+    assert_eq!(on_disk.public_key().to_hex(), id1.to_string());
 
     let n2 = Node::start(cfg()).await.expect("second start");
     assert_eq!(n2.id(), id1, "same key file, same node id");

@@ -238,7 +238,7 @@ pub fn run(args: SetupArgs) -> Result<()> {
         ));
     }
     let node_secret = aster::SecretKey::read_file(&key)?;
-    let target = aster::attestation::public_key(&node_secret).to_hex();
+    let target = node_secret.public_key().to_hex();
     if target != server.ceiling.target_id {
         return Err(Error::usage(
             "persistent node key does not match the ceiling target ID",

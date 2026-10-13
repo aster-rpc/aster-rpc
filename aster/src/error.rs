@@ -27,10 +27,6 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
-    /// An ownership-attestation operation failed (mint, verify, or decode).
-    #[error("attestation error: {0}")]
-    Attestation(String),
-
     /// An RPC call returned a non-OK status (the `rpc` feature). `code` is the
     /// [`StatusCode`](crate::rpc::StatusCode) value; `details` are the trailer's
     /// key/value pairs.

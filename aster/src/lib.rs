@@ -80,8 +80,6 @@ mod node;
 mod ticket;
 pub mod topology;
 
-#[cfg(feature = "attestation")]
-pub mod attestation;
 #[cfg(feature = "blobs")]
 mod blobs;
 #[cfg(feature = "docs")]

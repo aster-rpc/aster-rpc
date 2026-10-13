@@ -226,7 +226,7 @@ impl fmt::Debug for NamespaceCapability {
     }
 }
 
-/// A 32-byte Ed25519 public key — an attestation identity (anchor / root / node).
+/// A 32-byte Ed25519 public key (a root, issuer or node identity).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PublicKey(pub(crate) [u8; 32]);
 
@@ -276,7 +276,7 @@ impl SecretKey {
     /// `getrandom` — the same construction the C FFI (`aster_secret_key_generate`)
     /// and the Python binding (`ed25519_generate_keypair`) use. Derive the public
     /// half (the value peers see as the [`NodeId`]) with
-    /// [`attestation::public_key`](crate::attestation::public_key), or pin a node
+    /// [`public_key`](Self::public_key), or pin a node
     /// to it via [`AsterConfigBuilder::secret_key`](crate::AsterConfigBuilder::secret_key).
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
@@ -290,6 +290,12 @@ impl SecretKey {
     /// The raw 32 bytes.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
+    }
+
+    /// The Ed25519 public key for this secret: the value peers see as the
+    /// [`NodeId`].
+    pub fn public_key(&self) -> PublicKey {
+        PublicKey(aster_transport_core::keys::public_key(&self.0))
     }
 
     /// The canonical text form: 64 lowercase hex characters. This is exactly

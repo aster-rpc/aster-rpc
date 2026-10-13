@@ -16,8 +16,8 @@
 //! hash exists for, which is recognising a retry of the same request at the same
 //! sequence.
 //!
-//! The trailing NUL matches the domain-separation convention in
-//! `core/src/attestation.rs`.
+//! The trailing NUL matches Aster's domain-separation convention (for example
+//! `aster.chain.v1\0` in `docs/_internal/ownership-attestations.md`).
 //!
 //! ## `Unknown` is never hashable
 //!
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(
             *ACTION_DOMAIN.last().unwrap(),
             0,
-            "the trailing NUL is the convention in core/src/attestation.rs"
+            "the trailing NUL is Aster's domain-separation convention"
         );
     }
 

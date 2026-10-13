@@ -388,7 +388,7 @@ fn node_generate(out: &Path) -> Result<NodeKey> {
     key.write_file(out)
         .map_err(|e| Error::usage(e.to_string()))?;
     Ok(NodeKey {
-        node_id: aster::attestation::public_key(&key).to_hex(),
+        node_id: key.public_key().to_hex(),
         file: out.to_path_buf(),
     })
 }

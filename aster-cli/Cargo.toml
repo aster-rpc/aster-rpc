@@ -20,7 +20,7 @@ aster-exec = { path = "../aster-exec", features = ["policy"] }
 aster-exec-client = { path = "../aster-exec-client" }
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4"] }
-aster = { path = "../aster", default-features = false, features = ["attestation", "enrollment", "docs"] }
+aster = { path = "../aster", default-features = false, features = ["enrollment", "docs"] }
 hex = "0.4"
 aster-cli-kit = { path = "../aster-cli-kit" }
 aster-config = { path = "../aster-config" }

@@ -17,7 +17,7 @@ fn cfg() -> AsterConfig {
 
 fn node_identity() -> (SecretKey, aster::NodeId) {
     let secret = SecretKey::generate();
-    let node_id = aster::NodeId::from_hex(aster::attestation::public_key(&secret).to_hex());
+    let node_id = aster::NodeId::from_hex(secret.public_key().to_hex());
     (secret, node_id)
 }
 

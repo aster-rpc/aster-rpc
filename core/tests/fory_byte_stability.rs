@@ -1,6 +1,6 @@
 //! Byte-stability fixtures for every Fory-encoded artefact `core` may persist
-//! or exchange (attestation chains, namespace capabilities, HPKE envelopes,
-//! grant records, topology records).
+//! or exchange (namespace capabilities, HPKE envelopes, grant records,
+//! topology records).
 //!
 //! `fixtures/fory_golden_1_3_0.txt` was captured under `fory-core =1.3.0`
 //! (the pin before the workspace moved to 1.7.6). The tests below assert two
@@ -12,15 +12,11 @@
 //!   bytes back to the original value (what persisted data needs).
 //!
 //! Regenerate (only when a change is intended and recorded):
-//! `ASTER_FORY_GOLDEN_WRITE=1 cargo test -p aster_transport_core --features attestation --test fory_byte_stability`
-#![cfg(feature = "attestation")]
+//! `ASTER_FORY_GOLDEN_WRITE=1 cargo test -p aster_transport_core --test fory_byte_stability`
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use aster_transport_core::attestation::{
-    attest_root_node, public_key, verify_chain, AttestOptions,
-};
 use aster_transport_core::grant_record::GrantRecord;
 use aster_transport_core::hpke_envelope::HpkeEnvelope;
 use aster_transport_core::namespace::CoreNamespaceCapability;
@@ -28,9 +24,6 @@ use aster_transport_core::topology::records::{
     decode_lan_edge, decode_position, decode_rtt_edge, encode_lan_edge, encode_position,
     encode_rtt_edge, LanEdge, NetworkPosition, RttEdge,
 };
-
-const ROOT_SEED: [u8; 32] = [0x01; 32];
-const NODE_SEED: [u8; 32] = [0x02; 32];
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fory_golden_1_3_0.txt")
@@ -66,23 +59,9 @@ fn lan() -> LanEdge {
     }
 }
 
-fn attestation() -> Vec<u8> {
-    attest_root_node(
-        &ROOT_SEED,
-        &NODE_SEED,
-        &AttestOptions {
-            epoch: 7,
-            not_before: 0,
-            not_after: 0,
-        },
-    )
-    .expect("mint")
-}
-
 /// Current encodings, by fixture name.
 fn current() -> BTreeMap<&'static str, Vec<u8>> {
     let mut m = BTreeMap::new();
-    m.insert("attestation.chain.root_node", attestation());
     m.insert(
         "namespace.read",
         CoreNamespaceCapability::Read([0x11; 32]).encode_fory(),
@@ -164,14 +143,6 @@ fn golden_1_3_0_bytes_still_decode() {
         Err(e) => failures.push(format!("{name}: decode error: {e}")),
     };
 
-    let node = public_key(&NODE_SEED);
-    let root = public_key(&ROOT_SEED);
-    check(
-        "attestation.chain.root_node",
-        verify_chain(&g["attestation.chain.root_node"], &[root], &node)
-            .map(|v| v.node == node && v.anchor == root && v.depth == 1)
-            .map_err(|e| e.to_string()),
-    );
     check(
         "namespace.read",
         CoreNamespaceCapability::decode_fory(&g["namespace.read"])

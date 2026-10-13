@@ -1,12 +1,8 @@
-#![cfg(feature = "attestation")]
 //! Custom-ALPN connections + the bootstrap-ALPN admission flow:
-//! unknown peer is blocked on a normal ALPN, presents an attestation chain on
-//! the admission ALPN, is admitted, and is then allowed on the normal ALPN.
+//! unknown peer is blocked on a normal ALPN, presents an enrollment credential
+//! on the admission ALPN, is admitted, and is then allowed on the normal ALPN.
 
-use aster::attestation::{attest_root_node, public_key, verify_chain, AttestOptions, Chain};
-use aster::{
-    alpns, AsterConfig, Credential, Gate0, Node, NodeId, PublicKey, RelayMode, SecretKey, Ticket,
-};
+use aster::{alpns, AsterConfig, Credential, Gate0, Node, NodeId, RelayMode, Ticket};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -160,13 +156,24 @@ async fn add_ticket_addr_then_connect_by_id() {
     server.shutdown().await;
 }
 
+#[cfg(feature = "enrollment")]
 #[tokio::test]
 async fn bootstrap_alpn_admission_gates_normal_alpn() {
+    use aster::enrollment::{
+        issue_jwt, verify_connection, EnrollmentIssueRequest, JwtEnrollmentVerifier,
+    };
+    use aster::SecretKey;
+
     // Trust anchor.
     let root = SecretKey::from_bytes([5u8; 32]);
-    let root_pk: PublicKey = public_key(&root);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let verifier =
+        JwtEnrollmentVerifier::new(root.public_key().to_bytes(), "connection-test").unwrap();
 
-    // Server admits via Gate 0 + an attestation handshake on the admission ALPN.
+    // Server admits via Gate 0 + a credential presented on the admission ALPN.
     let server =
         Node::start_with_alpns(cfg(true), vec![ADMISSION_ALPN.to_vec(), RPC_ALPN.to_vec()])
             .await
@@ -186,9 +193,10 @@ async fn bootstrap_alpn_admission_gates_normal_alpn() {
         }
     });
 
-    // Accept loop: verify chains on the admission ALPN; echo on the RPC ALPN.
+    // Accept loop: verify credentials on the admission ALPN; echo on the RPC ALPN.
     let srv = server.clone();
     let gate_srv = gate.clone();
+    let verifier = std::sync::Arc::new(verifier);
     tokio::spawn(async move {
         loop {
             let (alpn, conn) = match srv.accept().await {
@@ -196,17 +204,16 @@ async fn bootstrap_alpn_admission_gates_normal_alpn() {
                 Err(_) => return,
             };
             let gate = gate_srv.clone();
+            let verifier = verifier.clone();
             tokio::spawn(async move {
                 if alpn == ADMISSION_ALPN {
                     let Ok((send, recv)) = conn.accept_bi().await else {
                         return;
                     };
-                    let raw = recv.read_to_end(8192).await.unwrap_or_default();
-                    let chain = Chain::from_bytes(raw);
-                    let Ok(expected) = PublicKey::from_hex(conn.peer().as_str()) else {
-                        return;
-                    };
-                    let resp: &[u8] = match verify_chain(&chain, &[root_pk], &expected) {
+                    let raw = recv.read_to_end(16 * 1024).await.unwrap_or_default();
+                    let token = String::from_utf8(raw).unwrap_or_default();
+                    // The subject is checked against the authenticated peer.
+                    let resp: &[u8] = match verify_connection(&verifier, &token, &conn, now) {
                         Ok(_) => {
                             gate.admit(conn.peer());
                             b"ok"
@@ -228,10 +235,12 @@ async fn bootstrap_alpn_admission_gates_normal_alpn() {
         }
     });
 
-    // Client node, attested under the root.
+    // Client node, enrolled under the root.
     let client = Node::start(cfg(false)).await.unwrap();
-    let client_secret = client.export_secret_key().unwrap();
-    let chain = attest_root_node(&root, &client_secret, &AttestOptions::default()).unwrap();
+    let client_key = client.export_secret_key().unwrap().public_key().to_bytes();
+    let mut request = EnrollmentIssueRequest::new(client_key, "connection-test");
+    request.expires_at = Some(now + 3600);
+    let credential = issue_jwt(&root, &request, now).unwrap();
 
     wait_for_addr(&server).await;
     wait_for_addr(&client).await;
@@ -250,16 +259,18 @@ async fn bootstrap_alpn_admission_gates_normal_alpn() {
     let echoed = matches!(&pre, Ok(Ok(b)) if b.as_slice() == b"ping");
     assert!(!echoed, "unadmitted peer must not complete an RPC echo");
 
-    // Phase 2: present the attestation chain on the admission ALPN → admitted.
+    // Phase 2: present the credential on the admission ALPN → admitted.
     let conn = client.connect(&server.id(), ADMISSION_ALPN).await.unwrap();
     let (send, recv) = conn.open_bi().await.unwrap();
-    send.write_all(chain.into_bytes()).await.unwrap();
+    send.write_all(credential.into_jwt().into_bytes())
+        .await
+        .unwrap();
     send.finish().await.unwrap();
     let verdict = timeout(Duration::from_secs(10), recv.read_to_end(64))
         .await
         .expect("admission timed out")
         .unwrap();
-    assert_eq!(verdict, b"ok", "valid chain must be admitted");
+    assert_eq!(verdict, b"ok", "valid credential must be admitted");
 
     // Phase 3: now the RPC ALPN is allowed (peer admitted) and echoes.
     let conn = client.connect(&server.id(), RPC_ALPN).await.unwrap();

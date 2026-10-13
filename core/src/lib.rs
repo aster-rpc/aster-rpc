@@ -1,7 +1,5 @@
 pub mod blob_custody;
 pub use blob_custody::{CoreBlobCustody, CoreBlobCustodyError, CoreBlobCustodyLease};
-#[cfg(feature = "attestation")]
-pub mod attestation;
 pub mod canonical;
 pub mod contract;
 pub mod datagram;
@@ -15,6 +13,7 @@ pub mod framing;
 pub mod grant_record;
 pub mod grants;
 pub mod hpke_envelope;
+pub mod keys;
 pub mod lease;
 pub mod namespace;
 pub mod pool;

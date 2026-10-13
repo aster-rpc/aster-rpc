@@ -137,7 +137,7 @@ pub async fn run(ctx: &Ctx, command: ExecCommand) -> Result<()> {
                 let key = daemon::load_node_key(&path)?;
                 print(&json!({
                     "profile": profile,
-                    "node_id": aster::attestation::public_key(&key).to_hex(),
+                    "node_id": key.public_key().to_hex(),
                     "key_file": path,
                 }))?;
                 return Ok(());
