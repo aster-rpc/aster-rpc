@@ -879,3 +879,26 @@ fn a_root_issued_enrollment_credential_is_a_one_link_chain() {
     assert_eq!(verified.issuers(), &[key(ROOT)]);
     assert_eq!(verified.jtis()[0], credential.credential_id());
 }
+
+#[test]
+fn only_an_anchors_one_link_credential_may_name_its_own_issuer() {
+    // The root's own enrollment: issuer, subject and anchor are one key.
+    let own = issue_enrollment(
+        &seed(ROOT),
+        None,
+        &key(ROOT),
+        &aud(),
+        &enrollment(&["build"]),
+        validity(NOW - 10, DAY),
+    )
+    .unwrap();
+    verify(own.to_text(), ROOT).unwrap();
+    // Below a delegation the same self-issue is a repeated key.
+    let parent = delegation_to_issuer(&grant());
+    let leaf = link(
+        ISSUER,
+        &payload(ISSUER, ISSUER, LinkKind::Enrollment, NOW - 5, NOW + DAY / 2),
+    );
+    let text = chain(&[leaf, parent.links().next().unwrap().to_owned()]);
+    assert_eq!(verify(&text, ISSUER).unwrap_err(), ChainError::Bridge);
+}

@@ -1,23 +1,25 @@
-//! JWT enrollment, durable Docs policy and opt-in reciprocal admission.
-//! Legacy signing and attestation stay separate.
+//! Chain enrollment, durable Docs policy and opt-in reciprocal admission.
+//! Legacy signing stays separate.
 //!
-//! This first profile uses compact signed JWTs (RFC 7519/8725), `EdDSA`
-//! (Ed25519), `typ = aster-enrollment-v1+jwt`, and canonical lowercase hex
-//! Ed25519 public keys for `iss` and `sub`. `cnf.jwk` (RFC 7800/8037) must be
-//! an `OKP`/`Ed25519` public key equal to both `sub` and the authenticated peer.
-//! Trust comes exclusively from the configured root key; headers never select
-//! keys or cause network access. `aud`, `jti`, `iat` and `cnf` are required.
+//! A credential is a delegation chain (`crate::delegation`) whose leaf is an
+//! enrollment link: one link when the root issues it, more when an online
+//! issuer does. Links are compact Ed25519 JWTs (`EdDSA`,
+//! `typ = aster-enrollment-v1+jwt` for the leaf), with canonical lowercase hex
+//! `iss`/`sub` and a `cnf.jwk` equal to both `sub` and the authenticated peer.
+//! Trust comes exclusively from the configured root key, the chain's anchor;
+//! headers never select keys or cause network access. Every link requires
+//! `aud`, `jti`, `iat`, `exp` and `cnf`, and unknown claims are rejected.
 //! NumericDates are nonnegative integral seconds. Activation tolerates a
 //! configurable leeway for an issuer clock running ahead (default 60 s, at most
 //! 300 s): `iat <= now + leeway`, `nbf <= now + leeway`. Expiry is exact,
 //! `now < exp`. Callers provide synchronized, trusted UTC; see
-//! [`local_clock_synchronization`]. Expiry may be omitted.
+//! [`local_clock_synchronization`].
 //!
 //! The namespaced `aster_enrollment_v1` extension contains optional complete
-//! scope/tag/attribute sets and a required `mandatory` list. This slice supports
+//! scope/tag/attribute sets, a required `mandatory` list and a `registration`
+//! of `ephemeral` (default) or `persistent`. An issuer may sign a persistent
+//! credential only if its delegation has `may_register`. This slice supports
 //! no additional mandatory restrictions, so every nonempty list is rejected.
-//! Unknown optional JWT claims are ignored. JOSE critical extensions are not
-//! payload restrictions and are rejected separately.
 //!
 //! [`EnrollmentPolicyStore`] verifies exact-root Docs records and retains
 //! revision watermarks and denials across restart. Reopened positive records
