@@ -135,7 +135,8 @@ pub struct AsterConfig {
     pub hook_failure_mode: HookFailureMode,
     /// Disable direct IP transports.
     pub clear_ip_transports: bool,
-    /// Disable relay transports.
+    /// Disable relay transports (direct-IP-only). Start-up then does not wait
+    /// for a home relay, whatever `relay_mode` is set to.
     pub clear_relay_transports: bool,
     /// Portmapper config: `"enabled"` or `"disabled"`.
     pub portmapper_config: Option<String>,
@@ -1032,7 +1033,9 @@ impl AsterConfigBuilder {
         self
     }
 
-    /// Remove every relay transport: direct-IP-only mode.
+    /// Remove every relay transport: direct-IP-only mode. The node is ready as
+    /// soon as it binds; it does not wait for a home relay, even with the
+    /// default `relay_mode` (iroh's `online()` would otherwise never resolve).
     pub fn clear_relay_transports(mut self, yes: bool) -> Self {
         self.config.clear_relay_transports = yes;
         self

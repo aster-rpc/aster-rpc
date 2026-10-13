@@ -123,7 +123,9 @@ pub struct CoreEndpointConfig {
     pub bind_addr: Option<String>,
     /// Remove all direct IP (UDP/QUIC) transports; relay-only mode
     pub clear_ip_transports: bool,
-    /// Remove all relay transports; direct IP-only mode
+    /// Remove all relay transports; direct IP-only mode. Equivalent to
+    /// `relay_mode = "disabled"` for start-up: the endpoint is ready once
+    /// bound and does not wait for a home relay, whatever `relay_mode` says.
     pub clear_relay_transports: bool,
     /// Portmapper: "enabled" (default) or "disabled"
     pub portmapper_config: Option<String>,
@@ -1283,6 +1285,19 @@ fn relay_mode_from_config(config: &CoreEndpointConfig) -> Result<RelayMode> {
     }
 }
 
+/// Whether the endpoint built from `config` will have any relay transport.
+///
+/// Start-up waits on [`Endpoint::online`] only when this is true: `online()`
+/// resolves once a home relay is connected and, per iroh, "will pend forever"
+/// when no relay is configured. Both `relay_mode = "disabled"` and
+/// `clear_relay_transports = true` remove every relay transport, so either one
+/// makes the node direct-only and start-up must not wait for a relay. A
+/// direct-only node (for example inside a Kubernetes pod network) is a
+/// supported configuration, not a contradiction.
+fn has_relay_transport(config: &CoreEndpointConfig, relay_mode: &RelayMode) -> bool {
+    !config.clear_relay_transports && !matches!(relay_mode, RelayMode::Disabled)
+}
+
 fn u64_to_varint_field(field: &str, value: u64) -> Result<VarInt> {
     VarInt::try_from(value).map_err(|_| anyhow!("{field} must be less than 2^62"))
 }
@@ -1596,7 +1611,7 @@ async fn build_node_endpoint(
                 endpoint.address_lookup()?.add(mdns);
             }
 
-            if !matches!(relay_mode, RelayMode::Disabled) {
+            if has_relay_transport(&config, &relay_mode) {
                 endpoint.online().await;
             }
             Ok((endpoint, monitor, hook_receiver))
@@ -2194,7 +2209,7 @@ impl CoreNetClient {
             endpoint.address_lookup()?.add(mdns);
         }
 
-        if !matches!(relay_mode, RelayMode::Disabled) {
+        if has_relay_transport(&config, &relay_mode) {
             endpoint.online().await;
         }
         let secret_key_bytes = endpoint.secret_key().to_bytes().to_vec();
@@ -5255,5 +5270,50 @@ mod topology_registration_tests {
             .topology_join_swarm(&[17; 32], CoreTopoSwarmConfig::default())
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod relay_online_wait_tests {
+    use super::*;
+
+    /// Bound on endpoint start. A node with no relay transport binds in well
+    /// under a second; a node stuck in `Endpoint::online()` never returns.
+    const START_BUDGET: Duration = Duration::from_secs(10);
+
+    /// Direct-only config: the default relay mode, but every relay transport
+    /// removed. This is the Kubernetes pod-network shape
+    /// (`ClearRelayTransports=true` without touching `relay_mode`).
+    fn cleared_relay_config() -> CoreEndpointConfig {
+        CoreEndpointConfig {
+            relay_mode: None,
+            clear_relay_transports: true,
+            bind_addr: Some("127.0.0.1:0".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn cleared_relay_transports_net_client_starts() {
+        let client = tokio::time::timeout(
+            START_BUDGET,
+            CoreNetClient::create_with_config(cleared_relay_config()),
+        )
+        .await
+        .expect("net client with cleared relay transports hung waiting for a relay")
+        .unwrap();
+        client.endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn cleared_relay_transports_node_starts() {
+        let node = tokio::time::timeout(
+            START_BUDGET,
+            CoreNode::memory_with_alpns_and_gc(Vec::new(), Some(cleared_relay_config()), None),
+        )
+        .await
+        .expect("node with cleared relay transports hung waiting for a relay")
+        .unwrap();
+        node.close().await;
     }
 }
