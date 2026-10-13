@@ -8,6 +8,9 @@ Tests every chapter of the Mission Control guide against a running server
     python tests/integration/mission_control/test_guide.py <address> --mode dev
     python tests/integration/mission_control/test_guide.py <address> --mode auth --keys-dir <work_dir>
 
+Auth mode reads the Enrollment files setup_auth.sh produces with the Rust
+`aster` CLI (auth.env, edge.key/edge.cred, ops.key/ops.cred).
+
 Exit codes:
   0  all tests passed
   1  at least one test failed
@@ -240,11 +243,33 @@ async def test_ch4_session(client, services_module) -> None:
 
 # ── Chapter 5: Auth ─────────────────────────────────────────────────────────
 
+def _auth_config(keys_dir: str, name: str):
+    """The client configuration setup_auth.sh lays out: auth.env (root,
+    audience, fleet namespace) plus this node's key and credential."""
+    from aster import AsterConfig, EnrollmentConfig
+
+    env: dict[str, str] = {}
+    with open(os.path.join(keys_dir, "auth.env")) as f:
+        for line in f:
+            if "=" in line:
+                key, value = line.strip().split("=", 1)
+                env[key] = value
+    return AsterConfig(
+        root_pubkey=env["ASTER_ROOT_PUBKEY"],
+        secret_key_file=os.path.join(keys_dir, f"{name}.key"),
+        enrollment_credential_file=os.path.join(keys_dir, f"{name}.cred"),
+        enrollment=EnrollmentConfig(
+            audience=env["ASTER_ENROLLMENT_AUDIENCE"],
+            fleet_namespace=env["ASTER_ENROLLMENT_FLEET_NAMESPACE"],
+        ),
+    )
+
+
 async def test_ch5_no_credential(address: str) -> None:
     """No credential → connection refused."""
-    from aster import AsterClient
+    from aster import AsterClient, AsterConfig
     try:
-        client = AsterClient(address=address)
+        client = AsterClient(config=AsterConfig(), address=address)
         await client.connect()
         await client.close()
         fail("Ch5 no-cred denied", "connection succeeded (should have been refused)")
@@ -257,14 +282,11 @@ async def test_ch5_no_credential(address: str) -> None:
             fail("Ch5 no-cred denied", f"unexpected error: {e}")
 
 
-async def test_ch5_edge_credential(address: str, edge_cred: str) -> None:
+async def test_ch5_edge_credential(address: str, keys_dir: str) -> None:
     """Edge credential: getStatus OK, tailLogs DENIED, runCommand DENIED."""
     from aster import AsterClient
 
-    # The .cred file is a TOML .aster-identity containing both the node
-    # secret key and the consumer peer entry. Pass it as identity= and the
-    # client auto-extracts the credential from the same file.
-    client = AsterClient(address=address, identity=edge_cred)
+    client = AsterClient(config=_auth_config(keys_dir, "edge"), address=address)
     try:
         await client.connect()
     except Exception as e:
@@ -327,11 +349,11 @@ async def test_ch5_edge_credential(address: str, edge_cred: str) -> None:
     await client.close()
 
 
-async def test_ch5_ops_credential(address: str, ops_cred: str) -> None:
+async def test_ch5_ops_credential(address: str, keys_dir: str) -> None:
     """Ops credential: getStatus OK, tailLogs OK, runCommand OK."""
     from aster import AsterClient
 
-    client = AsterClient(address=address, identity=ops_cred)
+    client = AsterClient(config=_auth_config(keys_dir, "ops"), address=address)
     try:
         await client.connect()
     except Exception as e:
@@ -572,18 +594,14 @@ async def run_dev_mode(address: str, work_dir: str | None) -> None:
 
 async def run_auth_mode(address: str, keys_dir: str) -> None:
     section("Auth mode (Chapter 5)")
-    edge_cred = os.path.join(keys_dir, "edge.cred")
-    ops_cred = os.path.join(keys_dir, "ops.cred")
-    if not os.path.exists(edge_cred):
-        fail("Ch5 setup", f"missing {edge_cred} -- run setup_auth.sh first")
-        return
-    if not os.path.exists(ops_cred):
-        fail("Ch5 setup", f"missing {ops_cred} -- run setup_auth.sh first")
-        return
+    for name in ("auth.env", "edge.key", "edge.cred", "ops.key", "ops.cred"):
+        if not os.path.exists(os.path.join(keys_dir, name)):
+            fail("Ch5 setup", f"missing {name} in {keys_dir} -- run setup_auth.sh first")
+            return
 
     await test_ch5_no_credential(address)
-    await test_ch5_edge_credential(address, edge_cred)
-    await test_ch5_ops_credential(address, ops_cred)
+    await test_ch5_edge_credential(address, keys_dir)
+    await test_ch5_ops_credential(address, keys_dir)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -594,7 +612,7 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="Mission Control guide test (Python client)")
     parser.add_argument("address", help="Server address (aster1...)")
     parser.add_argument("--mode", choices=["dev", "auth"], default="dev")
-    parser.add_argument("--keys-dir", help="Directory containing root.key, edge.cred, ops.cred (auth mode)")
+    parser.add_argument("--keys-dir", help="setup_auth.sh output: auth.env, edge.key/.cred, ops.key/.cred (auth mode)")
     parser.add_argument("--work-dir", help="Working directory for gen-client output (dev mode)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress per-test output, show only summary")
     args = parser.parse_args()

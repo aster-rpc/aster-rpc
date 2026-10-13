@@ -55,7 +55,7 @@ async def run(auth: bool = False, config_path: str | None = None) -> None:
         services=[MissionControl(), AgentSession()],
         config=config,
     ) as srv:
-        print(srv.address)
+        print(srv.address, flush=True)
         await srv.serve()
 
 
