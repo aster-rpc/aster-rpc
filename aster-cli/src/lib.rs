@@ -8,6 +8,7 @@ mod exec;
 mod files;
 mod key;
 mod profile;
+mod trust;
 
 use aster_cli_kit::mcp::Server;
 use aster_cli_kit::{Ctx, GlobalArgs, Result, Tool};
@@ -39,6 +40,10 @@ pub enum Command {
     /// Manage root keys and node identity keys
     #[command(subcommand)]
     Key(key::KeyCommand),
+
+    /// Pre-commit the next root key and rotate the root
+    #[command(subcommand)]
+    Trust(trust::TrustCommand),
 
     /// Generate and inspect service contract manifests
     #[command(subcommand)]
@@ -100,6 +105,7 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
         Command::Enroll(cmd) => enroll::run(ctx, cmd).await,
         Command::Profile(cmd) => profile::run(ctx, cmd).await,
         Command::Key(cmd) => key::run(ctx, cmd).await,
+        Command::Trust(cmd) => trust::run(ctx, cmd).await,
         Command::Contract(cmd) => contract::run(ctx, cmd).await,
         Command::Mcp { allow } => {
             let server = Server {

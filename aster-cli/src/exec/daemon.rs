@@ -343,8 +343,19 @@ async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
         aster::Node::start_with_alpns(config, vec![aster::enrollment::ENROLLMENT_ALPN.to_vec()])
             .await?;
     // Signed times and peer clocks are judged against this clock.
+    let rotation = settings
+        .next_root_commitment
+        .as_deref()
+        .map(|commitment| -> Result<aster::enrollment::RotationPin> {
+            Ok(aster::enrollment::RotationPin {
+                next_commitment: super::grants::identity(commitment)?,
+                seq: settings.root_seq,
+            })
+        })
+        .transpose()?;
     let enrollment_options = aster::enrollment::EnrollmentOptions {
         require_synchronized_clock: true,
+        rotation,
         ..Default::default()
     };
     let handshakes = enrollment_options.max_concurrent_handshakes;

@@ -7,6 +7,11 @@
 //!   owner-only directory (0700) and file (0600). The default elsewhere, and
 //!   what headless hosts use.
 //!
+//! Each profile has two slots ([`Slot`]): the active root, and the next root
+//! a pre-rotation commitment names (account `next-root-key/<profile>`, file
+//! `<profile>.next-root.key`). The next root is meant to leave this machine
+//! once committed; see `aster trust`.
+//!
 //! `ASTER_KEYSTORE=os|file` overrides the choice and `ASTER_KEYRING_SERVICE`
 //! the OS service name; tests set both so they never touch real entries.
 //!
@@ -105,6 +110,30 @@ impl fmt::Debug for RootSecret {
     }
 }
 
+/// Which of a profile's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    /// The active root.
+    Root,
+    /// The committed next root, which signs the rotation to itself.
+    NextRoot,
+}
+
+impl Slot {
+    fn account(self, profile: &str) -> String {
+        match self {
+            Self::Root => format!("root-key/{profile}"),
+            Self::NextRoot => format!("next-root-key/{profile}"),
+        }
+    }
+    fn file_name(self, profile: &str) -> String {
+        match self {
+            Self::Root => format!("{profile}.root.key"),
+            Self::NextRoot => format!("{profile}.next-root.key"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Os,
@@ -145,79 +174,98 @@ impl KeyStore {
         self.kind
     }
 
-    /// Where `profile`'s key lives, for messages.
+    /// Where `profile`'s root key lives, for messages.
     pub fn location(&self, profile: &str) -> String {
+        self.location_in(profile, Slot::Root)
+    }
+
+    /// Where `profile`'s key in `slot` lives, for messages.
+    pub fn location_in(&self, profile: &str, slot: Slot) -> String {
         match self.kind {
             Kind::Os if cfg!(windows) => format!(
                 "Windows Credential Manager ({}, {})",
                 self.service,
-                account(profile)
+                slot.account(profile)
             ),
             Kind::Os => format!(
                 "macOS Keychain (service {}, account {})",
                 self.service,
-                account(profile)
+                slot.account(profile)
             ),
-            Kind::File => self.file(profile).display().to_string(),
+            Kind::File => self.file(profile, slot).display().to_string(),
         }
     }
 
     pub fn get(&self, profile: &str) -> Result<Option<RootSecret>> {
+        self.get_in(profile, Slot::Root)
+    }
+
+    pub fn get_in(&self, profile: &str, slot: Slot) -> Result<Option<RootSecret>> {
         check_profile(profile)?;
+        let file = self.file(profile, slot);
         let hex = match self.kind {
-            Kind::Os => os::get(&self.service, &account(profile))?,
-            Kind::File => match std::fs::read_to_string(self.file(profile)) {
+            Kind::Os => os::get(&self.service, &slot.account(profile))?,
+            Kind::File => match std::fs::read_to_string(&file) {
                 Ok(s) => {
                     let s = Zeroizing::new(s);
-                    check_owner_only(&self.file(profile))?;
+                    check_owner_only(&file)?;
                     Some(s)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e).with_context(|| self.location(profile)),
+                Err(e) => return Err(e).with_context(|| self.location_in(profile, slot)),
             },
         };
         hex.map(|h| {
-            RootSecret::from_hex(&h).with_context(|| format!("reading {}", self.location(profile)))
+            RootSecret::from_hex(&h)
+                .with_context(|| format!("reading {}", self.location_in(profile, slot)))
         })
         .transpose()
     }
 
-    /// Store a key for a profile that has none; an existing key is never
-    /// replaced.
+    /// Store a root key for a profile that has none; an existing key is
+    /// never replaced.
     pub fn put_new(&self, profile: &str, secret: &RootSecret) -> Result<()> {
+        self.put_new_in(profile, Slot::Root, secret)
+    }
+
+    pub fn put_new_in(&self, profile: &str, slot: Slot, secret: &RootSecret) -> Result<()> {
         check_profile(profile)?;
-        if self.get(profile)?.is_some() {
+        if self.get_in(profile, slot)?.is_some() {
             bail!(
-                "profile `{profile}` already has a root key in {}",
-                self.location(profile)
+                "profile `{profile}` already has a key in {}",
+                self.location_in(profile, slot)
             );
         }
         match self.kind {
-            Kind::Os => os::set(&self.service, &account(profile), &secret.to_hex()),
-            Kind::File => self.write_file(profile, secret),
+            Kind::Os => os::set(&self.service, &slot.account(profile), &secret.to_hex()),
+            Kind::File => self.write_file(profile, slot, secret),
         }
-        .with_context(|| format!("storing the root key in {}", self.location(profile)))
+        .with_context(|| format!("storing the key in {}", self.location_in(profile, slot)))
     }
 
     /// `Ok(false)` when there was no key. An error leaves the key in place.
     pub fn delete(&self, profile: &str) -> Result<bool> {
+        self.delete_in(profile, Slot::Root)
+    }
+
+    pub fn delete_in(&self, profile: &str, slot: Slot) -> Result<bool> {
         check_profile(profile)?;
         match self.kind {
-            Kind::Os => os::delete(&self.service, &account(profile)),
-            Kind::File => match std::fs::remove_file(self.file(profile)) {
+            Kind::Os => os::delete(&self.service, &slot.account(profile)),
+            Kind::File => match std::fs::remove_file(self.file(profile, slot)) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(e.into()),
             },
         }
-        .with_context(|| format!("removing the root key from {}", self.location(profile)))
+        .with_context(|| format!("removing the key from {}", self.location_in(profile, slot)))
     }
 
-    fn file(&self, profile: &str) -> PathBuf {
-        self.dir.join(format!("{profile}.root.key"))
+    fn file(&self, profile: &str, slot: Slot) -> PathBuf {
+        self.dir.join(slot.file_name(profile))
     }
 
-    fn write_file(&self, profile: &str, secret: &RootSecret) -> Result<()> {
+    fn write_file(&self, profile: &str, slot: Slot, secret: &RootSecret) -> Result<()> {
         let mut dir = std::fs::DirBuilder::new();
         dir.recursive(true);
         #[cfg(unix)]
@@ -229,7 +277,7 @@ impl KeyStore {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        secret.write_new_file(&self.file(profile))
+        secret.write_new_file(&self.file(profile, slot))
     }
 }
 
@@ -239,10 +287,6 @@ fn default_kind() -> Kind {
     } else {
         Kind::File
     }
-}
-
-fn account(profile: &str) -> String {
-    format!("root-key/{profile}")
 }
 
 /// The one profile-name rule, shared by every Aster tool.

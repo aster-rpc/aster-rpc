@@ -2,8 +2,10 @@
 //! deployment) and node identity keys. Private root keys live in
 //! `aster_keystore`; the profile records only the public key.
 //!
-//! A profile's root public key is never replaced: once set, only the matching
-//! private key can be imported, and generating needs a new profile.
+//! A profile's root public key is never replaced here: once set, only the
+//! matching private key can be imported, and generating needs a new profile.
+//! The one way a profile's root changes is a pre-committed rotation
+//! (`aster trust rotate`).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -205,7 +207,7 @@ impl Report for NodeKey {
 }
 
 /// `--profile` / `ASTER_PROFILE`, else the active profile.
-fn profile_name(ctx: &Ctx) -> Result<String> {
+pub(crate) fn profile_name(ctx: &Ctx) -> Result<String> {
     aster_config::load(&ctx.home)?
         .selected_profile(ctx.profile.as_deref())
         .map_err(|e| Error::from(e).with_kind(ErrorKind::Usage))
@@ -274,7 +276,7 @@ fn import(ctx: &Ctx, from: &Path) -> Result<RootKeyChanged> {
 
 /// 64 hex characters, or a JSON object with `private_key` (the Python CLI's
 /// export format).
-fn parse_key(text: &str) -> Result<RootSecret> {
+pub(crate) fn parse_key(text: &str) -> Result<RootSecret> {
     let trimmed = text.trim();
     let hex = if trimmed.starts_with('{') {
         let mut file: KeyFile = serde_json::from_str(trimmed)
@@ -308,7 +310,11 @@ impl Drop for KeyFile {
 /// Store `secret` for the selected profile and record its public key. The
 /// profile is created when missing (and made active if the active name
 /// points at nothing). If recording fails, the stored key is removed again.
-fn store_root(ctx: &Ctx, secret: &RootSecret, action: RootKeyAction) -> Result<RootKeyChanged> {
+pub(crate) fn store_root(
+    ctx: &Ctx,
+    secret: &RootSecret,
+    action: RootKeyAction,
+) -> Result<RootKeyChanged> {
     let name = profile_name(ctx)?;
     let store = KeyStore::open(&ctx.home)?;
     let pubkey = public_hex(secret);

@@ -24,6 +24,7 @@
 //!
 //! [profiles.prod]
 //! root_pubkey = "…"
+//! next_root_commitment = "…"
 //! root_cadence = "6h"
 //! replication_allowance = "1h"
 //! email = "ops@example.com"
@@ -108,6 +109,14 @@ pub struct Profile {
     /// credential store, never here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_pubkey: Option<String>,
+    /// Pre-rotation commitment to the next root key (hex BLAKE3, see
+    /// `aster trust`). With it, a statement signed by that key can replace
+    /// `root_pubkey`; without it, the root cannot rotate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_root_commitment: Option<String>,
+    /// Rotations applied to reach `root_pubkey`; 0 for an original root.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub root_seq: u64,
     /// How often the root comes online to promote and renew, as a duration
     /// such as "6h" or "1d". Sizes persistent credentials and delegations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,6 +167,9 @@ pub enum HandleStatus {
 
 fn default_profile_name() -> String {
     "default".into()
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 fn yes() -> bool {
     true

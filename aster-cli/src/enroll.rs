@@ -8,6 +8,7 @@
 mod observe;
 mod policy;
 mod publish;
+mod recovery;
 mod registration;
 
 use crate::files::read_bounded;
@@ -55,6 +56,10 @@ pub enum EnrollCommand {
     Revoke(Box<registration::RevokeArgs>),
     /// Re-admit a revoked node as the root, naming the revoked revision
     Reauthorize(Box<registration::ReauthorizeArgs>),
+    /// Export the root's records for review before a root rotation
+    Export(Box<recovery::ExportArgs>),
+    /// Republish reviewed records under the new root after a rotation
+    Republish(Box<recovery::RepublishArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -209,6 +214,8 @@ pub async fn run(ctx: &Ctx, command: EnrollCommand) -> Result<()> {
         EnrollCommand::Promote(args) => observe::run_promote(ctx, *args).await,
         EnrollCommand::Revoke(args) => registration::revoke(ctx, *args).await,
         EnrollCommand::Reauthorize(args) => registration::reauthorize(ctx, *args).await,
+        EnrollCommand::Export(args) => recovery::export(ctx, *args).await,
+        EnrollCommand::Republish(args) => recovery::republish(ctx, *args).await,
     }
 }
 
