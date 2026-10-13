@@ -114,6 +114,12 @@ aster enroll revoke --subject $AGENT --fleet-only --fleet-namespace $FLEET \
   --fleet-secret-file fleet.secret --audience mission-control --peer $SERVER
 ```
 
+`--peer` takes the server's node id, `<node id>@<ip:port>`, or the `aster1…`
+address the server prints. A node id alone is found through the relay; a
+server with the relay disabled (`ASTER_RELAY_MODE=disabled`) is reachable
+only at its direct address, so pass its `aster1…` address (or set
+`exec_direct_addresses` for it in the CLI profile).
+
 The agent's next call is refused and its connection closes.
 
 `tests/python/test_mission_control_auth.py` runs this chapter as a test: a

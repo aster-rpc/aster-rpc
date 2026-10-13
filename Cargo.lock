@@ -315,6 +315,7 @@ dependencies = [
  "aster-exec",
  "aster-exec-client",
  "aster-keystore",
+ "async-trait",
  "clap",
  "clap_complete",
  "clap_mangen",

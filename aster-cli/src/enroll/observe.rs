@@ -89,7 +89,8 @@ pub struct IssuerObservationArgs {
     /// Fleet namespace public ID the policy replicas enroll this session under
     #[arg(long)]
     fleet_namespace: Option<String>,
-    /// Replica to deliver the observation to; repeatable
+    /// Replica to deliver the observation to (an `aster1…` address,
+    /// `<node id>@<ip:port>`, or a node id); repeatable
     #[arg(long)]
     peer: Vec<String>,
 }

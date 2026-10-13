@@ -37,3 +37,6 @@ libc = "0.2"
 
 [dev-dependencies]
 clap_mangen = "0.3"
+# The publication-session test runs a real AsterServer replica.
+aster = { path = "../aster", default-features = false, features = ["enrollment", "docs", "rpc"] }
+async-trait = "0.1"

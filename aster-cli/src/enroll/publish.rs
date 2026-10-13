@@ -36,7 +36,10 @@ pub struct FleetArgs {
     /// Fleet audience; records name it and verifiers pin it
     #[arg(long)]
     pub audience: String,
-    /// Policy replica to reconcile with before writing and deliver to after; repeatable
+    /// Policy replica to reconcile with before writing and deliver to after:
+    /// its `aster1…` address (as the server prints it), `<node id>@<ip:port>[,<ip:port>…]`,
+    /// or a node id (dialled at the profile's `exec_direct_addresses` for it, else
+    /// found by discovery); repeatable
     #[arg(long, required = true)]
     pub peer: Vec<String>,
 }
@@ -50,6 +53,53 @@ pub(super) struct Session {
     peers: Vec<aster::NodeId>,
     audience: String,
     fleet_namespace: [u8; 32],
+}
+
+/// Where to dial one `--peer`: an `aster1…` address carries the node id and
+/// its direct addresses (and relay); `<id>@<ip:port>[,…]` names them; a bare
+/// node id takes the profile's `exec_direct_addresses` for it. The profile's
+/// addresses are added to any the argument carries.
+pub(super) fn peer_addr(
+    peer: &str,
+    configured: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<aster::NodeAddr> {
+    let peer = peer.trim();
+    let (node_id, relay_url, mut direct) = if peer.starts_with("aster1") {
+        let addr = aster::Ticket::from_base58(peer)
+            .and_then(|ticket| ticket.to_node_addr())
+            .map_err(|e| Error::usage(format!("peer {peer}: not a valid aster1 address: {e}")))?;
+        (
+            addr.node_id.as_str().to_owned(),
+            addr.relay_url,
+            addr.direct_addresses,
+        )
+    } else if let Some((id, addresses)) = peer.split_once('@') {
+        let direct: Vec<String> = addresses
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_owned)
+            .collect();
+        for address in &direct {
+            address.parse::<std::net::SocketAddr>().map_err(|_| {
+                Error::usage(format!("peer {peer}: {address} is not an ip:port address"))
+            })?;
+        }
+        (id.to_owned(), None, direct)
+    } else {
+        (peer.to_owned(), None, Vec::new())
+    };
+    hex32(&node_id, "peer node id")?;
+    for address in configured.get(&node_id).into_iter().flatten() {
+        if !direct.contains(address) {
+            direct.push(address.clone());
+        }
+    }
+    Ok(aster::NodeAddr {
+        node_id: aster::NodeId::from_hex(node_id),
+        relay_url,
+        direct_addresses: direct,
+    })
 }
 
 pub(super) fn hex32(value: &str, what: &str) -> Result<[u8; 32]> {
@@ -218,29 +268,52 @@ impl Session {
             )),
             EnrollmentOptions::default(),
         )?;
+        let mut addrs = std::collections::BTreeMap::new();
+        for peer in peer {
+            let addr = peer_addr(peer, &settings.exec_direct_addresses)?;
+            addrs
+                .entry(addr.node_id.as_str().to_owned())
+                .and_modify(|known: &mut aster::NodeAddr| {
+                    for address in &addr.direct_addresses {
+                        if !known.direct_addresses.contains(address) {
+                            known.direct_addresses.push(address.clone());
+                        }
+                    }
+                    if known.relay_url.is_none() {
+                        known.relay_url = addr.relay_url.clone();
+                    }
+                })
+                .or_insert(addr);
+        }
         let mut peers = Vec::new();
-        for peer in peer.iter().collect::<std::collections::BTreeSet<_>>() {
-            hex32(peer, "peer")?;
-            tokio::time::timeout(
-                SYNC_BUDGET,
-                enrollment.connect(aster::NodeAddr {
-                    node_id: aster::NodeId::from_hex(peer),
-                    relay_url: None,
-                    direct_addresses: settings
-                        .exec_direct_addresses
-                        .get(peer)
-                        .cloned()
-                        .unwrap_or_default(),
-                }),
-            )
-            .await
-            .map_err(|_| {
-                Error::new(
+        for addr in addrs.into_values() {
+            let id = addr.node_id.clone();
+            let routed = !addr.direct_addresses.is_empty() || addr.relay_url.is_some();
+            // Later Docs syncs dial the replica by id: let them reuse the route.
+            if routed {
+                node.add_node_addr(addr.clone())?;
+            }
+            let unreachable = |detail: String| {
+                let error = Error::new(
                     ErrorKind::Unavailable,
-                    "publisher enrollment deadline exceeded",
-                )
-            })??;
-            peers.push(aster::NodeId::from_hex(peer));
+                    format!("policy replica {id}: {detail}"),
+                );
+                if routed {
+                    error
+                } else {
+                    error.with_hint(
+                        "no direct address is known for it, so it was looked up by discovery; a \
+                         server with relay disabled is reachable only at its direct address: pass \
+                         --peer with its aster1… address (or <node id>@<ip:port>), or set \
+                         exec_direct_addresses for it in the profile",
+                    )
+                }
+            };
+            tokio::time::timeout(SYNC_BUDGET, enrollment.connect(addr))
+                .await
+                .map_err(|_| unreachable("publisher enrollment deadline exceeded".into()))?
+                .map_err(|e| unreachable(e.to_string()))?;
+            peers.push(id);
         }
         node.docs()
             .native_docs()
