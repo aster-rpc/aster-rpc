@@ -3130,9 +3130,9 @@ int32_t aster_doc_free(aster_runtime_t runtime, uint64_t doc);
 /**
  * Synchronous: write the 64-char hex namespace id of the doc to `out_buf`.
  *
- * Mirrors `CoreDoc::doc_id()` — used by consumer-admission responses to
- * carry the registry namespace so a client can `join_and_subscribe_namespace`
- * the doc and fetch published contract manifests.
+ * Mirrors `CoreDoc::doc_id()` — used to share a registry namespace so a
+ * client can `join_and_subscribe_namespace` the doc and fetch published
+ * contract manifests.
  *
  * On BUFFER_TOO_SMALL, sets `*out_len` to required size.
  */

@@ -473,10 +473,21 @@ mod tests {
     }
 
     #[test]
-    fn retired_consumer_admission_keys_do_not_enable_or_open_anything() {
-        assert!(!enabled(
-            "[trust]\nallow_all_consumers = true\nenrollment_credential_iid = \"x\""
-        ));
+    fn retired_consumer_admission_keys_are_refused() {
+        for key in [
+            "allow_all_consumers = false",
+            "allow_all_producers = true",
+            "enrollment_credential_iid = \"x\"",
+        ] {
+            let raw: toml::Value = format!("[trust]\n{key}").parse().unwrap();
+            let err = crate::AsterConfig::default()
+                .apply_toml_value(&raw, "test")
+                .unwrap_err()
+                .to_string();
+            let name = key.split(' ').next().unwrap();
+            assert!(err.contains(&format!("[trust] {name}")), "{err}");
+            assert!(err.contains("enrollment_credential"), "{err}");
+        }
     }
 
     #[test]

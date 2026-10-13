@@ -84,8 +84,6 @@ describe('AsterConfig.fromEnv', () => {
   it('reads ASTER_* variables, including u64 knobs above u32', () => {
     process.env.ASTER_LOG_FORMAT = 'json';
     process.env.ASTER_HEALTH_PORT = '8080';
-    // A retired variable is ignored; it never opens anything.
-    process.env.ASTER_ALLOW_ALL_CONSUMERS = 'true';
     process.env.ASTER_RELAY_URLS = 'https://r1.example, https://r2.example';
     process.env.ASTER_SECRET_KEY = KEY_A;
     process.env.ASTER_SECRET_KEY_FILE = '/tmp/node.key';
@@ -94,7 +92,6 @@ describe('AsterConfig.fromEnv', () => {
     const c = AsterConfig.fromEnv();
     expect(c.logFormat).toBe('json');
     expect(c.healthPort).toBe(8080);
-    expect('allowAllConsumers' in c).toBe(false);
     expect(isEnrollmentEnabled(c)).toBe(false);
     expect(c.relayMode).toBe('custom');
     expect(c.relayUrls).toEqual(['https://r1.example', 'https://r2.example']);
@@ -107,6 +104,11 @@ describe('AsterConfig.fromEnv', () => {
   it('rejects malformed values instead of guessing', () => {
     process.env.ASTER_ENABLE_HOOKS = 'maybe';
     expect(() => AsterConfig.fromEnv()).toThrow(/ASTER_ENABLE_HOOKS/);
+  });
+
+  it('refuses a retired consumer-admission variable, naming the replacement', () => {
+    process.env.ASTER_ALLOW_ALL_CONSUMERS = 'false';
+    expect(() => AsterConfig.fromEnv()).toThrow(/ASTER_ALLOW_ALL_CONSUMERS.*enrollment_credential/);
   });
 });
 
@@ -207,6 +209,9 @@ host = "0.0.0.0"
     const bad = join(dir, 'bad.toml');
     writeFileSync(bad, '[network]\nrelay_mode = \n');
     expect(() => AsterConfig.fromFile(bad)).toThrow(/invalid TOML/);
+    const retired = join(dir, 'retired.toml');
+    writeFileSync(retired, '[trust]\nallow_all_consumers = false\n');
+    expect(() => AsterConfig.fromFile(retired)).toThrow(/\[trust\] allow_all_consumers/);
   });
 });
 

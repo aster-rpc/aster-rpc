@@ -506,7 +506,7 @@ pub enum ReactorEvent {
 }
 
 /// Aster RPC ALPN. Connections negotiating this ALPN flow into the reactor's RPC
-/// pipeline; connections on any other aster ALPN (e.g. `aster.consumer_admission`)
+/// pipeline; connections on any other aster ALPN (e.g. `aster.producer_admission`)
 /// are forwarded to the reactor's non-rpc channel so bindings can dispatch them
 /// to higher-level handlers.
 pub const RPC_ALPN: &[u8] = b"aster/1";
@@ -514,7 +514,7 @@ pub const RPC_ALPN: &[u8] = b"aster/1";
 pub struct ReactorHandle {
     event_rx: mpsc::Receiver<ReactorEvent>,
     /// Non-rpc accept queue. Populated by `accept_loop` when a connection
-    /// negotiates an ALPN other than `aster/1` (e.g. `aster.consumer_admission`).
+    /// negotiates an ALPN other than `aster/1` (e.g. `aster.producer_admission`).
     /// Always present -- `start_reactor_with_limits` wires it even when no
     /// non-rpc ALPNs are registered; stays empty in that case, and in
     /// `create_reactor` mode, where the caller owns the accept loop.

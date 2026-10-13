@@ -2792,8 +2792,8 @@ export interface GatePolicyOptions {
    */
   mode?: 'protected' | 'open_dev'
   /**
-   * ALPNs open to un-admitted peers. Default: `aster.producer_admission`,
-   * `aster.consumer_admission`, `aster.admission`.
+   * ALPNs open to un-admitted peers. Default: `aster.producer_admission`
+   * and `aster.admission`.
    */
   admissionAlpns?: Array<string | Uint8Array>
   /** Close code for rejected peers (default 403). */

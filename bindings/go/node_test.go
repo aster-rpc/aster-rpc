@@ -80,14 +80,14 @@ func TestConfig_DefaultsEnvTOML(t *testing.T) {
 		e.IssuerDelegationFile != "issuer.chain" || e.IssuerLifetimeSecs != 7200 {
 		t.Fatalf("enrollment from toml %+v", e)
 	}
-	// Retired consumer-admission keys no longer exist: they neither parse
-	// into anything nor enable anything.
+	// Retired consumer-admission keys are refused, naming the replacement.
 	retired := filepath.Join(dir, "retired.toml")
-	if err := os.WriteFile(retired, []byte("[trust]\nallow_all_consumers = true\n"), 0o600); err != nil {
+	if err := os.WriteFile(retired, []byte("[trust]\nallow_all_consumers = false\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if r, err := ConfigFromTOML(retired); err != nil || r.IsEnrollmentEnabled() {
-		t.Fatalf("retired keys: %v %v", err, r.IsEnrollmentEnabled())
+	if _, err := ConfigFromTOML(retired); !errors.Is(err, ErrInvalidArgument) ||
+		!strings.Contains(err.Error(), "allow_all_consumers") || !strings.Contains(err.Error(), "enrollment_credential") {
+		t.Fatalf("retired keys: %v", err)
 	}
 	if _, err := ConfigFromTOML(filepath.Join(dir, "missing.toml")); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("missing file: %v", err)

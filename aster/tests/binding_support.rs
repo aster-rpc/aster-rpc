@@ -8,7 +8,6 @@ use aster::{alpns, AsterConfig, Node, RelayMode, RPC_ALPN};
 fn rpc_alpn_is_exported() {
     assert_eq!(RPC_ALPN, b"aster/1");
     assert_eq!(alpns::RPC, RPC_ALPN);
-    assert_eq!(alpns::CONSUMER_ADMISSION, b"aster.consumer_admission");
 }
 
 #[test]

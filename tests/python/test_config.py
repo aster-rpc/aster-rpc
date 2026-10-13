@@ -622,10 +622,16 @@ def test_retired_consumer_admission_settings_are_gone(field):
     assert not hasattr(AsterConfig(), field)
 
 
-def test_retired_consumer_admission_toml_keys_open_nothing(tmp_path):
-    p = _write(
-        tmp_path,
-        "aster.toml",
-        '[trust]\nallow_all_consumers = true\nenrollment_credential_iid = "x"\n',
-    )
-    assert not AsterConfig.from_file(p).is_enrollment_enabled
+@pytest.mark.parametrize(
+    "line", ["allow_all_consumers = false", 'enrollment_credential_iid = "x"']
+)
+def test_retired_consumer_admission_toml_keys_are_refused(tmp_path, line):
+    p = _write(tmp_path, "aster.toml", f"[trust]\n{line}\n")
+    with pytest.raises(Exception, match="enrollment_credential"):
+        AsterConfig.from_file(p)
+
+
+def test_retired_consumer_admission_env_is_refused(monkeypatch):
+    monkeypatch.setenv("ASTER_ALLOW_ALL_CONSUMERS", "true")
+    with pytest.raises(Exception, match="ASTER_ALLOW_ALL_CONSUMERS"):
+        AsterConfig.from_env()

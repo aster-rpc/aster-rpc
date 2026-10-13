@@ -12,8 +12,8 @@ use crate::id::NodeId;
 use crate::log_targets::ADMISSION;
 use aster_transport_core::{
     trust::{
-        AdmissionSource, GateDecision, GatePolicy, PeerAdmission, ALPN_CONSUMER_ADMISSION,
-        ALPN_DELEGATED_ADMISSION, ALPN_PRODUCER_ADMISSION,
+        AdmissionSource, GateDecision, GatePolicy, PeerAdmission, ALPN_DELEGATED_ADMISSION,
+        ALPN_PRODUCER_ADMISSION,
     },
     CoreAfterHandshakeDecision, CoreHookConnectInfo, CoreHookHandshakeInfo, CoreHookReceiver,
 };
@@ -21,7 +21,7 @@ use tokio::sync::oneshot;
 
 /// Well-known ALPNs.
 ///
-/// The three `*_ADMISSION` ALPNs are let through to present a credential, even
+/// The two `*_ADMISSION` ALPNs are let through to present a credential, even
 /// from peers not yet admitted (see [`Gate0`]). [`RPC`](alpns::RPC) is the Aster
 /// RPC ALPN; `BLOBS` / `DOCS` / `GOSSIP` are the built-in protocol ALPNs every
 /// node registers.
@@ -30,9 +30,6 @@ pub mod alpns {
 
     /// Producer (mesh-join) admission.
     pub const PRODUCER_ADMISSION: &[u8] = trust::ALPN_PRODUCER_ADMISSION;
-    /// The retired legacy consumer admission; Enrollment replaces it. Kept
-    /// until the Python native module stops exporting it.
-    pub const CONSUMER_ADMISSION: &[u8] = trust::ALPN_CONSUMER_ADMISSION;
     /// Delegated (@aster-issued token) admission.
     pub const DELEGATED_ADMISSION: &[u8] = trust::ALPN_DELEGATED_ADMISSION;
 
@@ -76,7 +73,6 @@ impl Gate0 {
     pub fn new() -> Self {
         Self::with_admission_alpns(vec![
             ALPN_PRODUCER_ADMISSION.to_vec(),
-            ALPN_CONSUMER_ADMISSION.to_vec(),
             ALPN_DELEGATED_ADMISSION.to_vec(),
         ])
     }

@@ -285,8 +285,8 @@ pub struct GatePolicyOptions {
     /// ALPNs. `'open_dev'`: anyone may use any ALPN (local / dev only).
     #[napi(ts_type = "'protected' | 'open_dev'")]
     pub mode: Option<String>,
-    /// ALPNs open to un-admitted peers. Default: `aster.producer_admission`,
-    /// `aster.consumer_admission`, `aster.admission`.
+    /// ALPNs open to un-admitted peers. Default: `aster.producer_admission`
+    /// and `aster.admission`.
     pub admission_alpns: Option<Vec<Either<String, Uint8Array>>>,
     /// Close code for rejected peers (default 403).
     pub reject_code: Option<u32>,

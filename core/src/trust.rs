@@ -10,11 +10,6 @@ use std::time::{Duration, SystemTime};
 
 /// Producer mesh admission ALPN.
 pub const ALPN_PRODUCER_ADMISSION: &[u8] = b"aster.producer_admission";
-/// The retired legacy consumer admission ALPN. Enrollment
-/// (`ENROLLMENT_ALPN`) replaces it; it stays in the default admission set only
-/// until the Python/TypeScript native modules and binding gates stop naming it
-/// (enrollment design, "Legacy consumer admission retired").
-pub const ALPN_CONSUMER_ADMISSION: &[u8] = b"aster.consumer_admission";
 /// Delegated admission ALPN.
 pub const ALPN_DELEGATED_ADMISSION: &[u8] = b"aster.admission";
 
@@ -22,7 +17,6 @@ pub const ALPN_DELEGATED_ADMISSION: &[u8] = b"aster.admission";
 pub fn default_admission_alpns() -> Vec<Vec<u8>> {
     vec![
         ALPN_PRODUCER_ADMISSION.to_vec(),
-        ALPN_CONSUMER_ADMISSION.to_vec(),
         ALPN_DELEGATED_ADMISSION.to_vec(),
     ]
 }
@@ -430,13 +424,14 @@ mod tests {
         let policy = GatePolicy::protected();
 
         assert!(policy
-            .should_allow(PEER, ALPN_CONSUMER_ADMISSION)
-            .is_allowed());
-        assert!(policy
             .should_allow(PEER, ALPN_PRODUCER_ADMISSION)
             .is_allowed());
         assert!(policy
             .should_allow(PEER, ALPN_DELEGATED_ADMISSION)
+            .is_allowed());
+        // The retired consumer admission ALPN is no longer an admission ALPN.
+        assert!(!policy
+            .should_allow(PEER, b"aster.consumer_admission")
             .is_allowed());
     }
 
@@ -510,7 +505,7 @@ mod tests {
 
         assert!(policy.should_allow(PEER, b"custom.admit").is_allowed());
         assert!(!policy
-            .should_allow(PEER, ALPN_CONSUMER_ADMISSION)
+            .should_allow(PEER, ALPN_PRODUCER_ADMISSION)
             .is_allowed());
     }
 }

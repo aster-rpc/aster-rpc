@@ -111,8 +111,8 @@ pub enum DispatchEvent {
         connection_id: u64,
         peer_id: Arc<str>,
     },
-    /// A connection on a non-RPC ALPN that no Rust handler claimed (e.g. the
-    /// frozen consumer-admission ALPNs, D3).
+    /// A connection on a non-RPC ALPN that no Rust handler claimed (e.g. a
+    /// binding-owned admission ALPN, D3).
     NonRpc {
         alpn: Vec<u8>,
         connection: CoreConnection,

@@ -173,7 +173,7 @@ if(Object.values(versions).some(v=>v!==expectedVersion)) throw Error(`unexpected
 if(nativeVersion()!==expectedNativeVersion) throw Error(`unexpected embedded native version ${nativeVersion()}; expected ${expectedNativeVersion}`);
 console.log(JSON.stringify({phase:'typescript_metadata',node:process.version,versions,nativeVersion:nativeVersion(),asterEntry,loader,sidecar}));
 
-const server=new AsterServer({services:[new Smoke()],allowAllConsumers:true,config:{relayMode:'disabled',bindAddr:'127.0.0.1:0'}});
+const server=new AsterServer({services:[new Smoke()],config:{relayMode:'disabled',bindAddr:'127.0.0.1:0'}});
 let client:AsterClientWrapper|undefined;
 let serveTask:Promise<void>|undefined;
 try {

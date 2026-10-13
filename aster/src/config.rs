@@ -110,20 +110,6 @@ pub struct AsterConfig {
     /// `ASTER_ENROLLMENT_CREDENTIAL_CHAIN`; TOML `[trust]
     /// enrollment_credential_chain`.
     pub enrollment_credential_chain: Option<String>,
-    /// Retired with the legacy consumer admission: read for the Python and
-    /// TypeScript loaders until phase 3 removes it, and ignored by Rust.
-    #[doc(hidden)]
-    pub enrollment_credential_iid: Option<String>,
-    /// Retired with the legacy consumer admission: read for the Python and
-    /// TypeScript loaders until phase 3 removes it, and ignored by Rust. A
-    /// node is open exactly when enrollment is not configured.
-    #[doc(hidden)]
-    pub allow_all_consumers: bool,
-    /// Retired with the legacy producer admission: read for the Python and
-    /// TypeScript loaders until phase 3 removes it, and ignored by Rust.
-    #[doc(hidden)]
-    pub allow_all_producers: bool,
-
     /// Producer endpoint address for consumer-side dialing.
     pub endpoint_addr: Option<String>,
 
@@ -266,7 +252,7 @@ impl AsterConfig {
     ///
     /// Supported variables mirror the high-level bindings: trust fields
     /// (`ASTER_ROOT_PUBKEY`, `ASTER_ROOT_PUBKEY_FILE`,
-    /// `ASTER_ENROLLMENT_CREDENTIAL`, `ASTER_ALLOW_ALL_*`), connect/storage
+    /// `ASTER_ENROLLMENT_CREDENTIAL`, `ASTER_ENROLLMENT_*`), connect/storage
     /// fields, endpoint/network fields, transport tuning, logging, and
     /// `ASTER_IDENTITY_FILE`.
     pub fn from_env() -> Result<Self> {
@@ -318,16 +304,10 @@ impl AsterConfig {
             if let Some(value) = toml_string(trust, "enrollment_credential_chain", label)? {
                 self.enrollment_credential_chain = Some(value);
             }
-            // Retired legacy consumer admission keys: still read for the
-            // Python/TypeScript loaders (phase 3 removes them); no effect here.
-            if let Some(value) = toml_string(trust, "enrollment_credential_iid", label)? {
-                self.enrollment_credential_iid = Some(value);
-            }
-            if let Some(value) = toml_bool(trust, "allow_all_consumers", label)? {
-                self.allow_all_consumers = value;
-            }
-            if let Some(value) = toml_bool(trust, "allow_all_producers", label)? {
-                self.allow_all_producers = value;
+            for key in RETIRED_TRUST_KEYS {
+                if trust.contains_key(key.0) {
+                    return Err(retired_setting(&format!("{label}: [trust] {}", key.0)));
+                }
             }
         }
 
@@ -488,16 +468,10 @@ impl AsterConfig {
                 .map(str::to_string)
                 .collect();
         }
-        // Retired legacy consumer admission settings: still read for the
-        // Python/TypeScript loaders (phase 3 removes them); no effect here.
-        if let Some(value) = env_string("ASTER_ENROLLMENT_CREDENTIAL_IID") {
-            self.enrollment_credential_iid = Some(value);
-        }
-        if let Some(value) = env_bool("ASTER_ALLOW_ALL_CONSUMERS")? {
-            self.allow_all_consumers = value;
-        }
-        if let Some(value) = env_bool("ASTER_ALLOW_ALL_PRODUCERS")? {
-            self.allow_all_producers = value;
+        for key in RETIRED_TRUST_KEYS {
+            if std::env::var_os(key.1).is_some() {
+                return Err(retired_setting(key.1));
+            }
         }
         if let Some(value) = env_string("ASTER_ENDPOINT_ADDR") {
             self.endpoint_addr = Some(value);
@@ -930,9 +904,6 @@ impl Default for AsterConfig {
             root_rotations: Vec::new(),
             enrollment_credential_file: None,
             enrollment_credential_chain: None,
-            enrollment_credential_iid: None,
-            allow_all_consumers: false,
-            allow_all_producers: true,
             endpoint_addr: None,
             storage_path: None,
             gc_interval: None,
@@ -1444,6 +1415,29 @@ fn parse_pubkey_file(path: &Path, content: &str) -> Result<PublicKey> {
     }
 
     parse_public_key(&path.to_string_lossy(), content)
+}
+
+/// Settings of the retired legacy consumer admission, as (`[trust]` TOML key,
+/// environment variable). They are refused rather than ignored: each one used
+/// to change who could connect, so a configuration that still sets one (for
+/// example `allow_all_consumers = false`, expecting a closed server) must not
+/// start with a different meaning.
+const RETIRED_TRUST_KEYS: &[(&str, &str)] = &[
+    ("allow_all_consumers", "ASTER_ALLOW_ALL_CONSUMERS"),
+    ("allow_all_producers", "ASTER_ALLOW_ALL_PRODUCERS"),
+    (
+        "enrollment_credential_iid",
+        "ASTER_ENROLLMENT_CREDENTIAL_IID",
+    ),
+];
+
+fn retired_setting(name: &str) -> Error {
+    Error::InvalidArgument(format!(
+        "{name} was removed with the legacy consumer admission: a node is open exactly \
+         when Enrollment is not configured; to restrict who connects, set [trust] \
+         enrollment_credential (ASTER_ENROLLMENT_CREDENTIAL) and [enrollment] instead \
+         (see the Enrollment migration in the binding CHANGELOG)"
+    ))
 }
 
 fn toml_section<'a>(
@@ -1971,6 +1965,20 @@ mod tests {
         let err = AsterConfig::from_env().unwrap_err();
         assert!(err.to_string().contains("ASTER_ENROLLMENT_POLICY"));
         env::remove_var("ASTER_ENROLLMENT_POLICY");
+
+        // Retired consumer-admission variables are refused, naming the
+        // replacement, rather than silently ignored.
+        for key in [
+            "ASTER_ALLOW_ALL_CONSUMERS",
+            "ASTER_ALLOW_ALL_PRODUCERS",
+            "ASTER_ENROLLMENT_CREDENTIAL_IID",
+        ] {
+            env::set_var(key, "false");
+            let err = AsterConfig::from_env().unwrap_err().to_string();
+            assert!(err.contains(key), "{err}");
+            assert!(err.contains("enrollment_credential"), "{err}");
+            env::remove_var(key);
+        }
     }
 
     #[test]

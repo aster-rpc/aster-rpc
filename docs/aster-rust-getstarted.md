@@ -223,8 +223,7 @@ in the [observability guide](aster-observability-getstarted.md).
 
 The ALPNs are exported as `aster::RPC_ALPN`, `aster::enrollment::ENROLLMENT_ALPN`
 and `aster::alpns::{RPC, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,
-GOSSIP}`. (`alpns::CONSUMER_ADMISSION` belongs to the retired consumer
-admission and is going away; Enrollment replaces it.)
+GOSSIP}`.
 
 ## 3. Admission (Gate 0) and enrollment credentials
 
