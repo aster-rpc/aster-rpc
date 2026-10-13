@@ -29,6 +29,13 @@ mod linux {
         state_directory: PathBuf,
         bind_address: String,
         root_public_key: String,
+        /// Commitment to the next root key (`aster trust show`); enables
+        /// root rotation. Absent, the root can change only by reconfiguring.
+        #[serde(default)]
+        next_root_commitment: Option<String>,
+        /// Rotations already applied to `root_public_key`.
+        #[serde(default)]
+        root_seq: u64,
         policy_namespace: String,
         policy_replicas: Vec<Replica>,
         audience: String,
@@ -81,6 +88,7 @@ mod linux {
         let config: Config = serde_json::from_slice(&private_file(&path, 65536)?)?;
         let root = identity(&config.root_public_key)?;
         let namespace = identity(&config.policy_namespace)?;
+        let configured_namespace = namespace;
         if !config.state_directory.is_absolute()
             || !config.helper_socket.is_absolute()
             || !(200..=2000).contains(&config.reconcile_interval_ms)
@@ -145,9 +153,23 @@ mod linux {
             // Signed times and peer clocks are judged against this clock.
             EnrollmentOptions {
                 require_synchronized_clock: true,
+                rotation: config
+                    .next_root_commitment
+                    .as_deref()
+                    .map(|commitment| -> Result<RotationPin> {
+                        Ok(RotationPin {
+                            next_commitment: identity(commitment)?,
+                            seq: config.root_seq,
+                        })
+                    })
+                    .transpose()?,
                 ..Default::default()
             },
         )?;
+        // A rotation journaled beside the store moves the root and fleet
+        // namespace on from what this file pins.
+        let root = enrollment.trusted_root();
+        let namespace = enrollment.fleet_namespace();
         let replicas = config
             .policy_replicas
             .into_iter()
@@ -167,7 +189,7 @@ mod linux {
                 Duration::from_secs(15),
             )
             .await?;
-        if document.id()?.to_string() != config.policy_namespace {
+        if document.id()?.to_string() != hex::encode(namespace) {
             return Err("policy ticket namespace differs from pinned namespace".into());
         }
         // Grants live in the Exec-grant namespace the fleet binds for this
@@ -182,7 +204,16 @@ mod linux {
                 bound,
                 format!("grants-{}.redb", binding.namespace),
             ),
-            None => (namespace, document, "grants.redb".to_string()),
+            // After a rotation the fleet namespace is new, and so is its
+            // grant state: nothing kept for the old root is read.
+            None if namespace == configured_namespace => {
+                (namespace, document, "grants.redb".to_string())
+            }
+            None => (
+                namespace,
+                document,
+                format!("grants-{}.redb", hex::encode(namespace)),
+            ),
         };
         let audit = Arc::new(AuditOutbox::open(config.audit).await?);
         let guarantees = GuaranteesV1 {
@@ -263,20 +294,35 @@ mod linux {
         let revocations = enrollment.revocations();
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let maintenance_failed = tokio::select! {
-            result = tokio::signal::ctrl_c() => { result?; false },
-            _ = terminate.recv() => false,
+        // Grants were read under the root this process started with. A root
+        // rotation learned at runtime ends the process so it restarts under
+        // the new root's namespaces, with no grant from the old root.
+        let rotated = {
+            let enrollment = enrollment.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(refresh_interval).await;
+                    if enrollment.trusted_root() != root {
+                        break;
+                    }
+                }
+            }
+        };
+        let stopped: Option<&str> = tokio::select! {
+            result = tokio::signal::ctrl_c() => { result?; None },
+            _ = terminate.recv() => None,
+            () = rotated => Some("Exec root rotated; restart under the new root"),
             failure = service.maintain(refresh_interval, revocations) => {
                 eprintln!("Exec maintenance stopped: {}", failure.safe_message);
-                true
+                Some("Exec maintenance task stopped")
             },
         };
         server.abort();
         let _ = audit.flush(Duration::from_secs(5)).await;
         audit.close().await?;
         node.shutdown().await;
-        if maintenance_failed {
-            return Err("Exec maintenance task stopped".into());
+        if let Some(reason) = stopped {
+            return Err(reason.into());
         }
         Ok(())
     }

@@ -81,6 +81,14 @@ impl PolicyRefreshReport {
         self.pending > 0 || !self.rejected.is_empty()
     }
 }
+/// See [`EnrollmentPolicyStore::accepted_records`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AcceptedRecords {
+    pub registrations: Vec<NodeRegistrationV1>,
+    pub credentials: Vec<CredentialStatusV1>,
+    pub issuers: Vec<IssuerStatusV1>,
+    pub bindings: Vec<NamespaceBindingV1>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRefreshIssue {
     pub key: Vec<u8>,
@@ -466,6 +474,19 @@ impl EnrollmentPolicyStore {
             .filter(|binding| binding.status == BindingStatus::Active)
             .cloned()
             .collect()
+    }
+    /// The root records this store holds, for an operator's recovery
+    /// export (`aster enroll export`). Registrations include denials;
+    /// rejected-statement barriers are not records and are omitted. Refresh
+    /// from the namespace first: only what was read is here.
+    pub fn accepted_records(&self) -> AcceptedRecords {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        AcceptedRecords {
+            registrations: state.policy.nodes.values().cloned().collect(),
+            credentials: state.policy.credentials.values().cloned().collect(),
+            issuers: state.policy.issuers.values().cloned().collect(),
+            bindings: state.policy.bindings.values().cloned().collect(),
+        }
     }
     pub(super) fn failed(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).failed

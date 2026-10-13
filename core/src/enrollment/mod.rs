@@ -100,5 +100,7 @@ pub use root_records::{
 };
 pub use root_revisions::{check_root_revision, should_record_rejection, RootRevisionError};
 pub use rotation::{RotationPin, MAX_FORWARDED_ROTATIONS};
-pub use store::{EnrollmentPolicyStore, PolicyRefreshIssue, PolicyRefreshReport, RecordError};
+pub use store::{
+    AcceptedRecords, EnrollmentPolicyStore, PolicyRefreshIssue, PolicyRefreshReport, RecordError,
+};
 pub use stores::PolicyStores;

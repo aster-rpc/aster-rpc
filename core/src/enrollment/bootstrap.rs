@@ -946,6 +946,16 @@ impl EnrollmentService {
         Ok(unreached)
     }
 
+    /// The root key this node currently trusts.
+    pub fn trusted_root(&self) -> [u8; 32] {
+        *self.trust().store.root()
+    }
+
+    /// The fleet namespace pinned to the current root.
+    pub fn fleet_namespace(&self) -> [u8; 32] {
+        *self.trust().store.namespace()
+    }
+
     /// The root this node currently trusts, with its next-root commitment
     /// and rotation count. `None` when the consumer configured no rotation.
     pub fn root_state(&self) -> Option<RootState> {

@@ -36,8 +36,8 @@ pub use aster_transport_core::enrollment::{
     ObservationRejection, ObservationReview, ObservationV1, ObserverGrant, PolicyStores,
     ReviewedObservation, MAX_OBSERVATION_LIFETIME, OBSERVATION_JWT_TYPE,
 };
+pub use aster_transport_core::enrollment::{AcceptedRecords, RotationPin, MAX_FORWARDED_ROTATIONS};
 pub use aster_transport_core::enrollment::{DelegatedIssuer, IssuanceError, SubjectStanding};
-pub use aster_transport_core::enrollment::{RotationPin, MAX_FORWARDED_ROTATIONS};
 
 #[cfg(all(feature = "rpc", feature = "docs"))]
 pub mod issuer;
@@ -110,23 +110,29 @@ impl RootAuthoredReader {
 /// Refresh a policy view from local documents: the fleet store from `fleet`,
 /// then the stores for every membership namespace it binds from the matching
 /// document in `membership` (others are ignored). For root-side tools such as
-/// review; an installed [`Enrollment`] refreshes itself.
+/// review; an installed [`Enrollment`] refreshes itself. Returns whether any
+/// namespace left content pending or records rejected, so the view may be
+/// incomplete.
 #[cfg(feature = "docs")]
 pub async fn refresh_policy(
     stores: &PolicyStores,
     fleet: &crate::docs::Doc,
     membership: &[crate::docs::Doc],
-) -> anyhow::Result<()> {
-    stores.fleet().refresh(&fleet.enrollment_core()).await?;
+) -> anyhow::Result<bool> {
+    let mut uncertain = stores
+        .fleet()
+        .refresh(&fleet.enrollment_core())
+        .await?
+        .has_uncertainty();
     stores.sync_bindings()?;
     for doc in membership {
         let core = doc.enrollment_core();
         let namespace: [u8; 32] = *core.doc.id().as_bytes();
         if let Some(store) = stores.membership(&namespace) {
-            store.refresh(&core).await?;
+            uncertain |= store.refresh(&core).await?.has_uncertainty();
         }
     }
-    Ok(())
+    Ok(uncertain)
 }
 
 /// Review the observations namespace as the root: see
@@ -327,6 +333,16 @@ impl Enrollment {
         chain: String,
     ) -> anyhow::Result<Vec<([u8; 32], String)>> {
         self.inner.replace_credential(chain).await
+    }
+
+    /// The root key this node trusts now; after a rotation, the new root.
+    pub fn trusted_root(&self) -> [u8; 32] {
+        self.inner.trusted_root()
+    }
+
+    /// The fleet namespace pinned to [`Self::trusted_root`].
+    pub fn fleet_namespace(&self) -> [u8; 32] {
+        self.inner.fleet_namespace()
     }
 
     /// The root this node trusts now, with its next-root commitment and
