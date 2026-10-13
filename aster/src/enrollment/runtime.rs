@@ -612,18 +612,36 @@ impl Plan {
             tokio::time::timeout(self.sync_timeout, enrollment.connect(server.clone()))
                 .await
                 .map_err(|_| {
-                    invalid("the server did not complete the enrollment handshake in time")
+                    Error::Connection(
+                        "the server did not complete the enrollment handshake in time".into(),
+                    )
                 })?
-                .map_err(|e| invalid(format!("enrolling with the server: {e:#}")))?;
+                .map_err(|e| enroll_failure(e, "enrolling with the server"))?;
         if self.synchronize {
             if let Some(ticket) = ticket {
                 enrollment
                     .synchronize(readiness.peer, ticket, self.sync_timeout)
                     .await
-                    .map_err(|e| invalid(format!("synchronizing the fleet namespace: {e:#}")))?;
+                    .map_err(|e| enroll_failure(e, "synchronizing the fleet namespace"))?;
             }
         }
         Ok(readiness)
+    }
+}
+
+/// An enrollment failure against one server. An admission decision (either
+/// side's [`AdmissionError`](super::AdmissionError): denied, not admitted,
+/// clock skew, policy unavailable) stays downcastable inside
+/// [`Error::Transport`] so callers can map its kind; anything else (the
+/// server unreachable, a protocol or transport failure) is
+/// [`Error::Connection`].
+fn enroll_failure(error: anyhow::Error, what: &'static str) -> Error {
+    if error.downcast_ref::<super::AdmissionError>().is_some() {
+        // The context carries the whole message, so `{}` names the cause.
+        let message = format!("{what}: {error:#}");
+        Error::Transport(error.context(message))
+    } else {
+        Error::Connection(format!("{what}: {error:#}"))
     }
 }
 

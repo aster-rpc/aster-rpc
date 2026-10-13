@@ -41,6 +41,14 @@ const REJECT: u64 = 403;
 /// Close reason prefix carrying the observed offset (remote minus local
 /// seconds) back to a peer whose clock is outside the activation leeway.
 const CLOCK_SKEW_REASON: &str = "enrollment clock skew ";
+/// Close reason for a definite denial ([`AdmissionError::Denied`]).
+const DENIED_REASON: &str = "enrollment denied";
+/// Close reason when policy could not be evaluated now
+/// ([`AdmissionError::Unavailable`] / [`AdmissionError::NotAdmitted`]).
+const UNAVAILABLE_REASON: &str = "enrollment unavailable";
+/// Close reason for a failure that is not an admission decision (protocol,
+/// transport, a timeout or a busy responder).
+const FAILED_REASON: &str = "enrollment failed";
 const MAX_RATE_KEYS: usize = 8192;
 
 #[derive(Clone, Debug)]
@@ -2000,8 +2008,9 @@ impl EnrollmentService {
             match result {
                 Ok(value) => Ok(value),
                 Err(error) => {
-                    // Read the replica's close reason before closing locally.
-                    let error = reported_skew(&connection).map_or(error, anyhow::Error::from);
+                    // Read the replica's close reason before closing locally:
+                    // its admission decision about this node.
+                    let error = reported_refusal(&connection).map_or(error, anyhow::Error::from);
                     let _ = connection.close(REJECT, denial_close_reason(&error));
                     Err(error)
                 }
@@ -2404,21 +2413,36 @@ fn denial_close_reason(error: &anyhow::Error) -> Vec<u8> {
         Some(AdmissionError::ClockSkew { offset_seconds }) => {
             format!("{CLOCK_SKEW_REASON}{offset_seconds}").into_bytes()
         }
-        _ => b"enrollment denied".to_vec(),
+        Some(AdmissionError::Denied(_)) => DENIED_REASON.as_bytes().to_vec(),
+        Some(AdmissionError::Unavailable(_) | AdmissionError::NotAdmitted) => {
+            UNAVAILABLE_REASON.as_bytes().to_vec()
+        }
+        None => FAILED_REASON.as_bytes().to_vec(),
     }
 }
-/// A replica that closed with a skew reason measured our clock against its
-/// own; restate the offset from our side (remote minus local).
-fn reported_skew(connection: &CoreConnection) -> Option<AdmissionError> {
+/// The replica's admission decision about this node, from its close reason:
+/// a skew reason measured our clock against its own (restated from our side,
+/// remote minus local); a denial or an unavailable policy maps to the same
+/// [`AdmissionError`] kind the replica reached. The replica keeps the detailed
+/// reason; a peer only learns the kind.
+fn reported_refusal(connection: &CoreConnection) -> Option<AdmissionError> {
     let closed = connection.close_info()?;
     if closed.code != Some(REJECT) {
         return None;
     }
     let reason = String::from_utf8(closed.reason?).ok()?;
-    let theirs: i64 = reason.strip_prefix(CLOCK_SKEW_REASON)?.parse().ok()?;
-    let offset_seconds = theirs.checked_neg()?;
-    tracing::warn!(offset_seconds, "enrollment: replica reports clock skew");
-    Some(AdmissionError::ClockSkew { offset_seconds })
+    if let Some(theirs) = reason.strip_prefix(CLOCK_SKEW_REASON) {
+        let offset_seconds = theirs.parse::<i64>().ok()?.checked_neg()?;
+        tracing::warn!(offset_seconds, "enrollment: replica reports clock skew");
+        return Some(AdmissionError::ClockSkew { offset_seconds });
+    }
+    match reason.as_str() {
+        DENIED_REASON => Some(AdmissionError::Denied(DenialReason::RefusedByPeer)),
+        UNAVAILABLE_REASON => Some(AdmissionError::Unavailable(
+            "the replica could not evaluate enrollment policy now".into(),
+        )),
+        _ => None,
+    }
 }
 struct CloseEnrollmentConnection(CoreConnection);
 impl Drop for CloseEnrollmentConnection {

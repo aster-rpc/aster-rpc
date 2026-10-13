@@ -335,6 +335,9 @@ pub enum DenialReason {
     PolicyError(PolicyError),
     PolicyTimeout,
     Consumer(String),
+    /// The remote peer of an enrollment handshake denied this node (its close
+    /// reason). The peer keeps the detailed reason; only the kind crosses.
+    RefusedByPeer,
 }
 
 impl DenialReason {
@@ -354,6 +357,7 @@ impl DenialReason {
                 | Self::RootRotated
                 | Self::PolicyDidNotMatch
                 | Self::Consumer(_)
+                | Self::RefusedByPeer
         )
     }
 }

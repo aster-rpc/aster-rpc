@@ -13,14 +13,17 @@ results are UTF-8 JSON; synchronous outputs are owned spans freed with
 `aster_string_release`; async operations complete with the new
 `ASTER_EVENT_ENROLLMENT_RESULT` = 127 (JSON payload) or `ASTER_EVENT_ERROR`,
 whose `flags` carry an `aster_enrollment_error_t` (`NOT_ADMITTED` 1, `DENIED`
-2, `CLOCK_SKEW` 3, `UNAVAILABLE` 4) for admission errors.
+2, `CLOCK_SKEW` 3, `UNAVAILABLE` 4) for admission errors. The event status
+follows the kind: `DENIED` is `PERMISSION_DENIED`, `NOT_ADMITTED` is
+`UNAUTHENTICATED`, and `CLOCK_SKEW` / `UNAVAILABLE` are the new
+`ASTER_STATUS_UNAVAILABLE` = 19 (retry later).
 
 | Function | Role |
 |---|---|
 | `aster_config_enrollment_from_env(*out_json)`, `aster_config_enrollment_from_toml(path, *out_json)` | Resolve `[trust]` / `[enrollment]` (and `ASTER_ROOT_*`, `ASTER_ENROLLMENT_*`) through `AsterConfig::from_env` / `from_file` into the trust JSON: `root_pubkey`, `root_pubkey_file`, `next_root_commitment`, `root_seq`, `root_rotations`, `enrollment_credential_file`, `enrollment_credential_chain`, `enrollment {enabled, audience, fleet_namespace, state_path, replicas, policy, require_synchronized_clock, activation_leeway_secs, limits {…, sync_timeout_ms}, roles {attribute, scopes_as_roles, scopes, tags, include_attributes}, issuer_delegation_file, issuer_lifetime_secs, renew_from, renew, synchronize}`. |
 | `aster_node_start_enrolled(rt, config, trust_json, side, ud, *op)` | `side` = `aster_enrollment_side_t` (`SERVER` 0, `CLIENT` 1). Validates the plan before starting (fail closed: `INVALID_ARGUMENT` naming the setting); starts the node with fail-closed hooks and `aster.enrollment/1` and installs Enrollment. `ASTER_EVENT_NODE_CREATED`: `handle` = node, `related` = `aster_enrollment_t` (0 when the trust JSON does not enable enrollment: exactly `aster_node_start(config, gate 0)`). The node takes no gate; closing it releases the enrollment. A client node answers inbound enrollment handshakes itself. |
 | `aster_server_builder_new` + `aster_server_start` (behaviour change) | On a server-side enrolled node the server routes `aster.enrollment/1`, serves `aster.enrollment.IssuerV1` when an issuer delegation is configured, feeds Gate 3 each peer's roles per call (`[enrollment.roles]`), and after serving attaches policy (blocking up to `sync_timeout_ms` with replicas; `UNSUPPORTED` on a tokio thread) and starts renewal. A client-side enrollment is `INVALID_ARGUMENT` at `builder_new`. |
-| `aster_enrollment_enroll(rt, e, server_json, ud, *op)` | Client: handshake with one server, sync the fleet namespace it offers, start renewal (from `renew_from`, or from this server when it signed the credential). Result `{readiness, renewing}`. Call before the first `aster/1` connection to that server. |
+| `aster_enrollment_enroll(rt, e, server_json, ud, *op)` | Client: handshake with one server, sync the fleet namespace it offers, start renewal (from `renew_from`, or from this server when it signed the credential). Result `{readiness, renewing}`. Call before the first `aster/1` connection to that server. Either side's admission decision keeps its kind in `flags`: a server that denies this node is `PERMISSION_DENIED` + `DENIED`; a server that cannot evaluate policy now, or a skewed clock, is `UNAVAILABLE` + `UNAVAILABLE` / `CLOCK_SKEW`. A server that cannot be reached or does not finish the handshake in time is `UNAVAILABLE` with `flags` 0. |
 | `aster_enrollment_status(rt, e, *out_json)` | `side`, trusted root, fleet namespace, audience, own credential, rotation state, `renewing`, `issuer`. |
 | `aster_enrollment_peer_claims(rt, e, peer, *out_json)` | Verified evidence of a peer's session (audit; the server maps roles itself). |
 | `aster_enrollment_check_peer(rt, e, peer, ud, *op)` | Re-evaluate a peer before a sensitive operation; `DENIED` revokes. |

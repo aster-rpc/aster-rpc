@@ -33,7 +33,12 @@ public enum IrohStatus {
    */
   ALREADY_EXISTS(17),
   /** The runtime's independent asynchronous-operation limit is exhausted (ABI 4.7). */
-  OPERATION_LIMIT(18);
+  OPERATION_LIMIT(18),
+  /**
+   * Not now, retry: an Enrollment admission whose policy could not be evaluated or whose clock is
+   * skewed, or a server that could not be reached to enroll (ABI 5.1).
+   */
+  UNAVAILABLE(19);
 
   public final int code;
 

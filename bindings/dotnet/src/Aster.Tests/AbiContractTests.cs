@@ -330,6 +330,7 @@ public class AbiContractTests
         Assert.Equal(11, (int)Status.StreamReset);
         Assert.Equal(12, (int)Status.AbiMismatch);
         Assert.Equal(18, (int)Status.OperationLimit);
+        Assert.Equal(19, (int)Status.Unavailable);
     }
 
     // ─── Runtime version check ────────────────────────────────────────────────

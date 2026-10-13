@@ -372,6 +372,24 @@ async fn credential_roles_gate_requires_and_root_revocation_closes_the_connectio
         assert!(call(&rpc, "ping").await.is_err(), "connection closed");
         // Unaffected peers keep working.
         assert_eq!(call(&ingest.rpc(), "ping").await.unwrap(), "ops.ingest");
+        // Enrolling again as the revoked operator: the server's refusal keeps
+        // its admission kind (denied), not a generic failure.
+        match connect(
+            &server,
+            client_config(&root, 5, credential(5, Some("ops.status"))),
+        )
+        .await
+        {
+            Err(aster::Error::Transport(error)) => assert!(
+                matches!(
+                    error.downcast_ref::<AdmissionError>(),
+                    Some(AdmissionError::Denied(_))
+                ),
+                "{error:#}"
+            ),
+            Err(other) => panic!("expected a denied admission, got {other:?}"),
+            Ok(_) => panic!("a revoked operator enrolled again"),
+        }
 
         for client in [operator, ingest] {
             client.close().await;

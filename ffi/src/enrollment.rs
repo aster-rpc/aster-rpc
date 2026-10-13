@@ -687,6 +687,7 @@ fn denial_json(reason: &DenialReason) -> Value {
         DenialReason::PolicyError(_) => "policy_error",
         DenialReason::PolicyTimeout => "policy_timeout",
         DenialReason::Consumer(_) => "consumer",
+        DenialReason::RefusedByPeer => "refused_by_peer",
     };
     let detail = match reason {
         DenialReason::ClockSkew { offset_seconds } => json!(offset_seconds),
@@ -785,11 +786,11 @@ fn admission_error(error: AdmissionError) -> OpError {
             aster_enrollment_error_t::ASTER_ENROLLMENT_ERROR_DENIED,
         ),
         AdmissionError::ClockSkew { .. } => (
-            aster_status_t::ASTER_STATUS_INTERNAL,
+            aster_status_t::ASTER_STATUS_UNAVAILABLE,
             aster_enrollment_error_t::ASTER_ENROLLMENT_ERROR_CLOCK_SKEW,
         ),
         AdmissionError::Unavailable(_) => (
-            aster_status_t::ASTER_STATUS_INTERNAL,
+            aster_status_t::ASTER_STATUS_UNAVAILABLE,
             aster_enrollment_error_t::ASTER_ENROLLMENT_ERROR_UNAVAILABLE,
         ),
     };
@@ -798,6 +799,28 @@ fn admission_error(error: AdmissionError) -> OpError {
         code: status as i32,
         flags: kind as u32,
         message: error.to_string(),
+    }
+}
+
+/// `aster_enrollment_enroll`'s failure: the admission decision of either side
+/// keeps its kind (and status) from [`admission_error`]; a server that could
+/// not be reached or did not finish the handshake is `UNAVAILABLE`.
+fn enroll_error(error: aster::Error) -> OpError {
+    match error {
+        aster::Error::Transport(error) => match error.downcast_ref::<AdmissionError>() {
+            Some(admission) => OpError {
+                message: error.to_string(),
+                ..admission_error(admission.clone())
+            },
+            None => other_error(error),
+        },
+        aster::Error::Connection(message) => OpError {
+            status: aster_status_t::ASTER_STATUS_UNAVAILABLE,
+            code: aster_status_t::ASTER_STATUS_UNAVAILABLE as i32,
+            flags: 0,
+            message,
+        },
+        other => other_error(other),
     }
 }
 
@@ -886,9 +909,13 @@ impl AddrJson {
 /// "direct_addresses": ["ip:port"]?}`. Completes with
 /// `ASTER_EVENT_ENROLLMENT_RESULT`: `{"readiness": {"peer", "source":
 /// "chain"|"registration", "observed_source", "policy_sync", "local_clock"},
-/// "renewing": bool}`, or `ASTER_EVENT_ERROR` (an admission error keeps its
-/// `aster_enrollment_error_t` in `flags`). `INVALID_ARGUMENT` for a server
-/// enrollment.
+/// "renewing": bool}`, or `ASTER_EVENT_ERROR`. An admission decision by
+/// either side keeps its `aster_enrollment_error_t` in `flags`, with status
+/// `PERMISSION_DENIED` (`DENIED`: the server refused this node, or this node
+/// refused the server), `UNAUTHENTICATED` (`NOT_ADMITTED`) or `UNAVAILABLE`
+/// (`CLOCK_SKEW`, `UNAVAILABLE`: retry). A server that could not be reached or
+/// did not finish the handshake in time is `UNAVAILABLE` with `flags` 0.
+/// `INVALID_ARGUMENT` for a server enrollment.
 ///
 /// # Safety
 /// `server_json` must be readable; `out_operation` writable.
@@ -920,7 +947,7 @@ pub unsafe extern "C" fn aster_enrollment_enroll(
             .plan
             .enroll_with_server(&state.enrollment, &server)
             .await
-            .map_err(other_error)?;
+            .map_err(enroll_error)?;
         let renewing = state.start_renewal(Some(&server));
         Ok(result(
             enrollment,

@@ -388,6 +388,13 @@ typedef enum aster_status_t {
    * when the caller knows an existing operation can finish independently.
    */
   ASTER_STATUS_OPERATION_LIMIT = 18,
+  /**
+   * ABI 5.1: the operation could not complete now and may be retried --
+   * an Enrollment admission whose policy could not be evaluated, a clock
+   * outside the activation leeway (`ASTER_ENROLLMENT_ERROR_UNAVAILABLE` /
+   * `_CLOCK_SKEW`), or a server that could not be reached to enroll.
+   */
+  ASTER_STATUS_UNAVAILABLE = 19,
 } aster_status_t;
 
 /**
@@ -4800,9 +4807,13 @@ int32_t aster_node_start_enrolled(aster_runtime_t runtime,
  * "direct_addresses": ["ip:port"]?}`. Completes with
  * `ASTER_EVENT_ENROLLMENT_RESULT`: `{"readiness": {"peer", "source":
  * "chain"|"registration", "observed_source", "policy_sync", "local_clock"},
- * "renewing": bool}`, or `ASTER_EVENT_ERROR` (an admission error keeps its
- * `aster_enrollment_error_t` in `flags`). `INVALID_ARGUMENT` for a server
- * enrollment.
+ * "renewing": bool}`, or `ASTER_EVENT_ERROR`. An admission decision by
+ * either side keeps its `aster_enrollment_error_t` in `flags`, with status
+ * `PERMISSION_DENIED` (`DENIED`: the server refused this node, or this node
+ * refused the server), `UNAUTHENTICATED` (`NOT_ADMITTED`) or `UNAVAILABLE`
+ * (`CLOCK_SKEW`, `UNAVAILABLE`: retry). A server that could not be reached or
+ * did not finish the handshake in time is `UNAVAILABLE` with `flags` 0.
+ * `INVALID_ARGUMENT` for a server enrollment.
  *
  * # Safety
  * `server_json` must be readable; `out_operation` writable.

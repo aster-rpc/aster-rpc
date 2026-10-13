@@ -34,6 +34,8 @@ public enum Status
     AlreadyExists = 17,
     /// <summary>ABI 4.7: the runtime's independent asynchronous-operation limit is exhausted.</summary>
     OperationLimit = 18,
+    /// <summary>ABI 5.1: not now, retry -- an Enrollment admission whose policy could not be evaluated or whose clock is skewed, or a server that could not be reached to enroll.</summary>
+    Unavailable = 19,
 }
 
 /// <summary>

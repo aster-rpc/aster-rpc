@@ -247,6 +247,11 @@ pub enum aster_status_t {
     /// exhausted. The refused operation did not start and may be retried only
     /// when the caller knows an existing operation can finish independently.
     ASTER_STATUS_OPERATION_LIMIT = 18,
+    /// ABI 5.1: the operation could not complete now and may be retried --
+    /// an Enrollment admission whose policy could not be evaluated, a clock
+    /// outside the activation leeway (`ASTER_ENROLLMENT_ERROR_UNAVAILABLE` /
+    /// `_CLOCK_SKEW`), or a server that could not be reached to enroll.
+    ASTER_STATUS_UNAVAILABLE = 19,
 }
 
 /// Relay mode
@@ -1937,6 +1942,7 @@ pub extern "C" fn aster_status_name(status: i32) -> *const c_char {
         x if x == aster_status_t::ASTER_STATUS_OPERATION_LIMIT as i32 => {
             "ASTER_STATUS_OPERATION_LIMIT\0"
         }
+        x if x == aster_status_t::ASTER_STATUS_UNAVAILABLE as i32 => "ASTER_STATUS_UNAVAILABLE\0",
         _ => "ASTER_STATUS_UNKNOWN\0",
     };
     s.as_ptr() as *const c_char

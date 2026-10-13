@@ -191,6 +191,10 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		StatusName(18) != "ASTER_STATUS_OPERATION_LIMIT" {
 		t.Error("OPERATION_LIMIT (18) drifted from the header or has no sentinel")
 	}
+	if ASTER_STATUS_UNAVAILABLE != 19 || !errors.Is(wrapError(ASTER_STATUS_UNAVAILABLE), ErrUnavailable) ||
+		StatusName(19) != "ASTER_STATUS_UNAVAILABLE" {
+		t.Error("UNAVAILABLE (19) drifted from the header or has no sentinel")
+	}
 }
 
 func TestABI_VersionMatchesHeader(t *testing.T) {

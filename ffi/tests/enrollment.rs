@@ -609,6 +609,20 @@ fn config_driven_server_issues_renews_and_follows_revocation() {
             aster_status_t::ASTER_STATUS_NOT_FOUND as i32
         );
 
+        // Enrolling again is refused by the server: the admission kind and
+        // PERMISSION_DENIED, not INTERNAL "invalid argument".
+        let (code, flags, message) = enroll(rt, client, &server_addr).unwrap_err();
+        assert_eq!(
+            code,
+            aster_status_t::ASTER_STATUS_PERMISSION_DENIED as u32,
+            "{message}"
+        );
+        assert_eq!(
+            flags,
+            aster_enrollment_error_t::ASTER_ENROLLMENT_ERROR_DENIED as u32
+        );
+        assert!(!message.contains("invalid argument"), "{message}");
+
         // Releasing an enrollment ends a pending revocation wait.
         let mut op = 0;
         assert_eq!(aster_enrollment_next_revocation(rt, client, 0, &mut op), OK);

@@ -287,6 +287,14 @@ func TestEnrollment_CredentialRolesGateRequiresAndRootRevocationClosesTheConnect
 	if _, err := srv.Enrollment().CheckPeer(ctx, enrollPub(5)); !errors.As(err, &admission) || admission.Kind == AdmissionErrorOther {
 		t.Fatalf("revoked peer check: %v", err)
 	}
+	// Enrolling again as the revoked node: the server's denial keeps its
+	// admission kind and PERMISSION_DENIED (it used to be INTERNAL
+	// "invalid argument: ...").
+	again := startClient(t, ctx, enrolledCfg(5, credentialFor(t, 5, "ops.status")))
+	if _, err := again.Connect(ctx, server); !errors.Is(err, ErrPermissionDenied) ||
+		!errors.As(err, &admission) || admission.Kind != AdmissionErrorDenied || strings.Contains(err.Error(), "invalid argument") {
+		t.Fatalf("re-enrolling a revoked node: want PERMISSION_DENIED (denied), got %v", err)
+	}
 	// Unaffected peers keep working.
 	if roles, err := opsCall(ctx, ingest, server, "ping"); err != nil || roles != "ops.ingest" {
 		t.Fatalf("ingest after the revocation: %q %v", roles, err)

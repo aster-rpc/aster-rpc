@@ -98,6 +98,8 @@ func errorFromStatus(code C.int) *IrohError {
 		return errorf(c, "already exists")
 	case ASTER_STATUS_OPERATION_LIMIT:
 		return errorf(c, "operation limit exhausted")
+	case ASTER_STATUS_UNAVAILABLE:
+		return errorf(c, "unavailable")
 	default:
 		return errorf(c, "unknown status %d", c)
 	}
@@ -133,6 +135,10 @@ var (
 	// ErrOperationLimit (ABI 4.7): the runtime's independent asynchronous
 	// operation admission bound is exhausted. The refused operation did not start.
 	ErrOperationLimit = errors.New("operation limit exhausted")
+	// ErrUnavailable (ABI 5.1): not now, retry -- an Enrollment admission
+	// whose policy could not be evaluated or whose clock is skewed, or a
+	// server that could not be reached to enroll.
+	ErrUnavailable = errors.New("unavailable")
 )
 
 // statusToError maps status codes to sentinel errors for errors.Is matching.
@@ -155,6 +161,7 @@ var statusToError = map[int32]error{
 	ASTER_STATUS_CREDENTIAL_EXPIRED:  ErrCredentialExpired,
 	ASTER_STATUS_ALREADY_EXISTS:      ErrAlreadyExists,
 	ASTER_STATUS_OPERATION_LIMIT:     ErrOperationLimit,
+	ASTER_STATUS_UNAVAILABLE:         ErrUnavailable,
 }
 
 // Is returns true if target is a matching sentinel error.
