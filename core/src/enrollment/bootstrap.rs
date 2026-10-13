@@ -42,6 +42,12 @@ const MAX_RATE_KEYS: usize = 8192;
 pub struct EnrollmentOptions {
     /// Bounds opening the first stream and receiving the credential-free probe.
     pub first_message_timeout: Duration,
+    /// Accepted enrollment connections that have not yet sent a complete
+    /// probe. They hold no handshake slot or per-peer/per-source budget; when
+    /// the pool is full the oldest is closed. Starving joiners therefore needs
+    /// more than `max_pending_probes / first_message_timeout` new connections
+    /// per second.
+    pub max_pending_probes: usize,
     pub handshake_timeout: Duration,
     pub policy_timeout: Duration,
     pub reconciliation_interval: Duration,
@@ -68,6 +74,7 @@ impl Default for EnrollmentOptions {
     fn default() -> Self {
         Self {
             first_message_timeout: Duration::from_secs(2),
+            max_pending_probes: 256,
             handshake_timeout: Duration::from_secs(10),
             policy_timeout: Duration::from_secs(2),
             reconciliation_interval: Duration::from_secs(1),
@@ -237,6 +244,29 @@ struct RateState {
     sources: BTreeMap<IpAddr, u32>,
 }
 
+/// Enrollment connections waiting for their probe, oldest first.
+#[derive(Default)]
+struct PendingProbes {
+    next: u64,
+    waiting: VecDeque<(u64, CoreConnection)>,
+}
+
+/// Membership in the pre-probe pool, released on drop.
+struct PendingProbe<'a> {
+    pool: &'a Mutex<PendingProbes>,
+    id: u64,
+}
+
+impl Drop for PendingProbe<'_> {
+    fn drop(&mut self) {
+        self.pool
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .waiting
+            .retain(|(id, _)| *id != self.id);
+    }
+}
+
 #[derive(Default)]
 struct HandshakeCounts {
     peers: BTreeMap<[u8; 32], usize>,
@@ -291,6 +321,7 @@ pub struct EnrollmentService {
     outbound_permits: Semaphore,
     gate_permits: Arc<Semaphore>,
     handshake_counts: Mutex<HandshakeCounts>,
+    pending_probes: Mutex<PendingProbes>,
     rate: Mutex<RateState>,
     next_generation: AtomicU64,
     revoked: broadcast::Sender<EnrollmentRevoked>,
@@ -325,6 +356,7 @@ impl EnrollmentService {
             options.max_concurrent_handshakes > 0
                 && options.max_concurrent_handshakes_per_peer > 0
                 && options.max_concurrent_handshakes_per_source > 0
+                && options.max_pending_probes > 0
                 && options.max_concurrent_gate_checks > 0
                 && options.max_concurrent_reconciliations > 0
                 && options.max_admitted_peers > 0
@@ -402,6 +434,7 @@ impl EnrollmentService {
             outbound_permits: Semaphore::new(options.max_concurrent_handshakes),
             gate_permits: Arc::new(Semaphore::new(options.max_concurrent_gate_checks)),
             handshake_counts: Mutex::new(HandshakeCounts::default()),
+            pending_probes: Mutex::new(PendingProbes::default()),
             options,
             document: RwLock::new(None),
             policy_watch: Mutex::new(None),
@@ -611,6 +644,27 @@ impl EnrollmentService {
             *rate.sources.entry(source).or_default() += 1;
         }
         true
+    }
+
+    /// Join the pre-probe pool, closing the oldest waiting connection when it
+    /// is full. Waiting costs no handshake slot.
+    fn pending_probe(&self, connection: &CoreConnection) -> PendingProbe<'_> {
+        let mut pool = self
+            .pending_probes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while pool.waiting.len() >= self.options.max_pending_probes {
+            if let Some((_, oldest)) = pool.waiting.pop_front() {
+                let _ = oldest.close(REJECT, b"enrollment busy".to_vec());
+            }
+        }
+        let id = pool.next;
+        pool.next += 1;
+        pool.waiting.push_back((id, connection.clone()));
+        PendingProbe {
+            pool: &self.pending_probes,
+            id,
+        }
     }
 
     fn inbound_slot(&self, peer: [u8; 32], source: Option<IpAddr>) -> Result<HandshakeSlot<'_>> {
@@ -938,7 +992,9 @@ impl EnrollmentService {
             );
             let peer = identity(&connection.remote_id())?;
             let source = observed_source(connection);
-            let _slot = self.inbound_slot(peer, source.map(|source| source.address))?;
+            // A connection holds a handshake slot only once its probe has
+            // arrived, so stalled probes cannot exhaust the slots.
+            let pending = self.pending_probe(connection);
             let (send, recv, hello) =
                 tokio::time::timeout(self.options.first_message_timeout, async {
                     let (send, recv) = connection.accept_bi().await?;
@@ -947,6 +1003,8 @@ impl EnrollmentService {
                 })
                 .await
                 .map_err(|_| anyhow!("enrollment first message timeout"))??;
+            drop(pending);
+            let _slot = self.inbound_slot(peer, source.map(|source| source.address))?;
             ensure!(hello.version == 1, "unsupported enrollment version");
             self.check_skew(hello.sent_at)?;
             // Joining credentials are withheld until the client has verified
@@ -1924,6 +1982,107 @@ mod tests {
             handler.await.unwrap();
             replica.close().await;
         }
+        cleanup(service, path).await;
+    }
+
+    fn pending(service: &EnrollmentService) -> usize {
+        service.pending_probes.lock().unwrap().waiting.len()
+    }
+
+    async fn wait_until(condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_probes_hold_no_handshake_slot_or_budget() {
+        let (service, path) = service(
+            PausedPolicy::new(false),
+            EnrollmentOptions {
+                max_concurrent_handshakes: 1,
+                max_concurrent_handshakes_per_source: 1,
+                first_message_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut stalled = Vec::new();
+        for seed in 20..24 {
+            let client = raw_node(seed).await;
+            let (connection, accept) = raw_handshake(&service, &client).await;
+            stalled.push((client, connection, accept));
+        }
+        wait_until(|| pending(&service) == stalled.len()).await;
+        // Every slot and the one per-source allowance are still free: a
+        // joiner from the same loopback source completes its probe.
+        assert!(service.handshake_counts.lock().unwrap().sources.is_empty());
+        assert_eq!(service.inbound_permits.available_permits(), 1);
+        let client = raw_node(7).await;
+        let (connection, accept) = raw_handshake(&service, &client).await;
+        let (send, recv) = connection.open_bi().await.unwrap();
+        transmit(
+            &send,
+            &Hello {
+                version: 1,
+                sent_at: unix_now(),
+            },
+        )
+        .await
+        .unwrap();
+        let _: ReplicaProof = receive(&recv).await.unwrap();
+        assert_eq!(service.inbound_permits.available_permits(), 0);
+        assert_eq!(pending(&service), stalled.len());
+        connection.close(0, b"done".to_vec()).unwrap();
+        assert!(accept.await.unwrap().is_err());
+        for (client, connection, accept) in stalled {
+            connection.close(0, b"done".to_vec()).unwrap();
+            assert!(accept.await.unwrap().is_err());
+            client.close().await;
+        }
+        assert_eq!(pending(&service), 0);
+        client.close().await;
+        cleanup(service, path).await;
+    }
+
+    #[tokio::test]
+    async fn full_pre_probe_pool_closes_the_oldest_waiting_connection() {
+        let (service, path) = service(
+            PausedPolicy::new(false),
+            EnrollmentOptions {
+                max_pending_probes: 2,
+                first_message_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut waiting = Vec::new();
+        for seed in 20..23 {
+            let client = raw_node(seed).await;
+            let (connection, accept) = raw_handshake(&service, &client).await;
+            waiting.push((client, connection, accept));
+            wait_until(|| pending(&service) == waiting.len().min(2)).await;
+        }
+        let (_, oldest, accept) = &mut waiting[0];
+        let closed = tokio::time::timeout(Duration::from_secs(2), oldest.closed())
+            .await
+            .unwrap();
+        assert_eq!(closed.code, Some(REJECT));
+        assert_eq!(closed.reason.unwrap(), b"enrollment busy");
+        assert!(accept.await.unwrap().is_err());
+        for (_, connection, _) in &waiting[1..] {
+            assert!(connection.close_info().is_none());
+        }
+        for (client, connection, accept) in waiting.into_iter().skip(1) {
+            connection.close(0, b"done".to_vec()).unwrap();
+            assert!(accept.await.unwrap().is_err());
+            client.close().await;
+        }
+        assert_eq!(pending(&service), 0);
         cleanup(service, path).await;
     }
 }
