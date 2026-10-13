@@ -216,6 +216,21 @@ Properties worth knowing:
   grantor. Automatic grantor failover requires consensus to preserve a single
   serialization point; use coordination for replicated grants.
 
+The Go binding has the same pair over the C ABI: a server serves the grantor
+over a serializer written in Go, and clients acquire through it
+(`bindings/go/examples/lease_postgres` runs a Postgres serializer this way):
+
+```go
+srv, err := aster.StartServer(ctx, aster.ServerOptions{
+    Config:       cfg,
+    LeaseGrantor: &aster.LeaseGrantor{Serializer: &PGSerializer{DB: db}}, // nil = in memory
+})
+
+leases, err := client.LeaseGrantor(ctx, grantorAddr)
+me, _ := client.ID()
+lease, err := leases.Acquire(ctx, "db/primary", me, aster.LeaseOptions{})
+```
+
 ## 6. What to rely on — and what not to
 
 **Rely on:**
