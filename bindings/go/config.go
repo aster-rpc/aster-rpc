@@ -89,28 +89,42 @@ type AsterConfig struct {
 	Portmapper           Portmapper
 	Transport            TransportConfig
 
-	// ── Binding-level settings ──
+	// ── Trust and Enrollment ([trust], [enrollment]; design §15.3) ──
+	//
+	// Read by ConfigFromEnv / ConfigFromTOML through the Rust
+	// aster::AsterConfig, so names, defaults and precedence (defaults < TOML
+	// < environment < code) are the Rust SDK's exactly. A node is open
+	// exactly when enrollment is not configured (IsEnrollmentEnabled).
 
-	// AllowAllConsumers opens Gate 0 to every consumer (dev mode): a server's
-	// default gate uses TrustOpenDev.
-	AllowAllConsumers bool
-	AllowAllProducers bool
 	// RootPubkey (32 bytes) or RootPubkeyFile (64 hex, or JSON
-	// {"public_key": "<hex>"}) is the deployment root key. Enrollment
-	// (NodeOptions.Enrollment / ServerOptions.Enrollment) trusts it when
-	// EnrollmentConfig.Root is empty. Env ASTER_ROOT_PUBKEY(_FILE); TOML
-	// [trust] root_pubkey(_file).
+	// {"public_key": "<hex>"}) is the trusted root. Env
+	// ASTER_ROOT_PUBKEY(_FILE); TOML [trust] root_pubkey(_file).
 	RootPubkey     []byte
 	RootPubkeyFile string
-	// EnrollmentCredentialFile holds this node's enrollment credential (a
-	// delegation chain, aster-chain-v1~...). Enrollment presents it when
-	// EnrollmentConfig.Credential is empty. Env ASTER_ENROLLMENT_CREDENTIAL;
-	// TOML [trust] enrollment_credential.
-	EnrollmentCredentialFile string
-	EndpointAddr             string
-	LogFormat                string // "text" or "json"
-	LogLevel                 string
-	LogMask                  bool
+	// NextRootCommitment (64 hex), RootSeq and RootRotations are the root
+	// rotation pin; without the commitment every rotation statement is
+	// refused. Env ASTER_NEXT_ROOT_COMMITMENT, ASTER_ROOT_SEQ,
+	// ASTER_ROOT_ROTATIONS (comma-separated); TOML [trust]
+	// next_root_commitment, root_seq, root_rotations.
+	NextRootCommitment string
+	RootSeq            uint64
+	RootRotations      []string
+	// EnrollmentCredentialFile is this node's credential chain file (aster
+	// enroll node --out); EnrollmentCredentialChain is the chain inline and
+	// wins over the file. Either enables enrollment. Env
+	// ASTER_ENROLLMENT_CREDENTIAL / ASTER_ENROLLMENT_CREDENTIAL_CHAIN; TOML
+	// [trust] enrollment_credential / enrollment_credential_chain.
+	EnrollmentCredentialFile  string
+	EnrollmentCredentialChain string
+	// Enrollment is the [enrollment] section (ASTER_ENROLLMENT_*).
+	Enrollment EnrollmentConfig
+
+	// ── Binding-level settings ──
+
+	EndpointAddr string
+	LogFormat    string // "text" or "json"
+	LogLevel     string
+	LogMask      bool
 
 	// Ops listener (/healthz, /readyz, /metrics; Rust aster::ops). Env
 	// ASTER_HEALTH_PORT / _HOST / _ENABLED; TOML [health] port / host / enabled.
@@ -132,7 +146,6 @@ func (c *AsterConfig) IsHealthEnabled() bool {
 }
 
 func bindingDefaults(c *AsterConfig) {
-	c.AllowAllProducers = true
 	c.LogFormat = "text"
 	c.LogLevel = "info"
 	c.LogMask = true
@@ -163,6 +176,13 @@ func ConfigFromEnv() (AsterConfig, error) {
 	if err := c.applyBindingEnv(); err != nil {
 		return AsterConfig{}, err
 	}
+	var trust C.aster_bytes_t
+	if err := wrapStatus("aster_config_enrollment_from_env", C.aster_config_enrollment_from_env(&trust)); err != nil {
+		return AsterConfig{}, err
+	}
+	if err := c.applyTrustJSON(trust); err != nil {
+		return AsterConfig{}, err
+	}
 	return c, nil
 }
 
@@ -184,6 +204,13 @@ func ConfigFromTOML(path string) (AsterConfig, error) {
 		return AsterConfig{}, err
 	}
 	if err := c.applyBindingEnv(); err != nil {
+		return AsterConfig{}, err
+	}
+	var trust C.aster_bytes_t
+	if err := wrapStatus("aster_config_enrollment_from_toml", C.aster_config_enrollment_from_toml(a.str(path), &trust)); err != nil {
+		return AsterConfig{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := c.applyTrustJSON(trust); err != nil {
 		return AsterConfig{}, err
 	}
 	return c, nil
@@ -239,8 +266,8 @@ func (c AsterConfig) String() string {
 	if c.SecretKey != nil {
 		key = "<redacted>"
 	}
-	return fmt.Sprintf("AsterConfig{RelayMode:%q BindAddr:%q StoragePath:%q ALPNs:%v SecretKey:%s EnableHooks:%v AllowAllConsumers:%v}",
-		c.RelayMode, c.BindAddr, c.StoragePath, c.ALPNs, key, c.EnableHooks, c.AllowAllConsumers)
+	return fmt.Sprintf("AsterConfig{RelayMode:%q BindAddr:%q StoragePath:%q ALPNs:%v SecretKey:%s EnableHooks:%v Enrollment:%v}",
+		c.RelayMode, c.BindAddr, c.StoragePath, c.ALPNs, key, c.EnableHooks, c.IsEnrollmentEnabled())
 }
 
 // ─── aster_config_t marshalling ───────────────────────────────────────────
@@ -408,13 +435,6 @@ func (c *AsterConfig) fromNative(n *C.aster_config_t) {
 // ─── binding-level sources ─────────────────────────────────────────────────
 
 type tomlBinding struct {
-	Trust struct {
-		RootPubkey           string `toml:"root_pubkey"`
-		RootPubkeyFile       string `toml:"root_pubkey_file"`
-		EnrollmentCredential string `toml:"enrollment_credential"`
-		AllowAllConsumers    *bool  `toml:"allow_all_consumers"`
-		AllowAllProducers    *bool  `toml:"allow_all_producers"`
-	} `toml:"trust"`
 	Connect struct {
 		EndpointAddr string `toml:"endpoint_addr"`
 	} `toml:"connect"`
@@ -440,22 +460,7 @@ func (c *AsterConfig) applyBindingTOML(path string) error {
 			*dst = v
 		}
 	}
-	setStr(&c.RootPubkeyFile, tc.Trust.RootPubkeyFile)
-	setStr(&c.EnrollmentCredentialFile, tc.Trust.EnrollmentCredential)
 	setStr(&c.EndpointAddr, tc.Connect.EndpointAddr)
-	if tc.Trust.RootPubkey != "" {
-		b, err := hex.DecodeString(tc.Trust.RootPubkey)
-		if err != nil || len(b) != 32 {
-			return fmt.Errorf("%s: trust.root_pubkey: want 64 hex characters: %w", path, ErrInvalidArgument)
-		}
-		c.RootPubkey = b
-	}
-	if tc.Trust.AllowAllConsumers != nil {
-		c.AllowAllConsumers = *tc.Trust.AllowAllConsumers
-	}
-	if tc.Trust.AllowAllProducers != nil {
-		c.AllowAllProducers = *tc.Trust.AllowAllProducers
-	}
 	if tc.Logging.Format != "" {
 		c.LogFormat = strings.ToLower(tc.Logging.Format)
 	}
@@ -494,18 +499,7 @@ func (c *AsterConfig) applyBindingEnv() error {
 			*dst = v
 		}
 	}
-	if v := env("ASTER_ROOT_PUBKEY"); v != "" {
-		b, err := hex.DecodeString(v)
-		if err != nil || len(b) != 32 {
-			return fmt.Errorf("ASTER_ROOT_PUBKEY: want 64 hex characters: %w", ErrInvalidArgument)
-		}
-		c.RootPubkey = b
-	}
-	setStr(&c.RootPubkeyFile, "ASTER_ROOT_PUBKEY_FILE")
-	setStr(&c.EnrollmentCredentialFile, "ASTER_ENROLLMENT_CREDENTIAL")
 	setStr(&c.EndpointAddr, "ASTER_ENDPOINT_ADDR")
-	envBool("ASTER_ALLOW_ALL_CONSUMERS", &c.AllowAllConsumers)
-	envBool("ASTER_ALLOW_ALL_PRODUCERS", &c.AllowAllProducers)
 	if v := env("ASTER_LOG_FORMAT"); v != "" {
 		c.LogFormat = strings.ToLower(v)
 	}

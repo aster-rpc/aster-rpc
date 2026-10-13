@@ -104,7 +104,6 @@ func newRPCFixture(t *testing.T, opts ServerOptions) *rpcFixture {
 	defer cancel()
 	if opts.Config.BindAddr == "" {
 		opts.Config = testCfg()
-		opts.Config.AllowAllConsumers = true
 	}
 	srv, err := StartServer(ctx, opts)
 	if err != nil {
@@ -542,7 +541,10 @@ func TestRPC_FrameLimitAndConnectionEvents(t *testing.T) {
 	svc := NewService("Small", 1, Unary("put", func(context.Context, *testEchoRequest) (*testEchoReply, error) {
 		return &testEchoReply{Data: []byte{}}, nil
 	}, MaxFrameSize(1024)))
+	cfg := testCfg()
+	cfg.ALPNs = []string{customALPN}
 	f := newRPCFixture(t, ServerOptions{
+		Config:             cfg,
 		Services:           []*Service{svc},
 		OnConnectionClosed: func(_ uint64, peer string) { closedCh <- peer },
 		OnNonRPC: func(alpn string, conn *Connection) {
@@ -565,10 +567,10 @@ func TestRPC_FrameLimitAndConnectionEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conn, err := f.cl.Node().Connect(ctx, addr, ConsumerAdmissionALPN); err == nil {
+	if conn, err := f.cl.Node().Connect(ctx, addr, customALPN); err == nil {
 		select {
 		case alpn := <-nonRPC:
-			if alpn != ConsumerAdmissionALPN {
+			if alpn != customALPN {
 				t.Fatalf("alpn %q", alpn)
 			}
 		case <-time.After(10 * time.Second):
@@ -576,7 +578,7 @@ func TestRPC_FrameLimitAndConnectionEvents(t *testing.T) {
 		}
 		_ = conn.Close("")
 	} else {
-		t.Fatalf("connect admission alpn: %v", err)
+		t.Fatalf("connect custom alpn: %v", err)
 	}
 	peer, _ := f.cl.Node().NodeID()
 	_ = f.conn.Close()
@@ -612,10 +614,20 @@ func TestRPC_Interceptor(t *testing.T) {
 	}
 }
 
+// customALPN is an application ALPN a server lists in Config.ALPNs.
+const customALPN = "example.custom/1"
+
+// An explicit Gate (the escape hatch) admits only the peers it names; the
+// default server without enrollment is open.
 func TestRPC_ProtectedGateRejectsUnadmitted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	srv, err := StartServer(ctx, ServerOptions{Config: testCfg(), Services: []*Service{interopService()}})
+	gate, err := NewGate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close()
+	srv, err := StartServer(ctx, ServerOptions{Config: testCfg(), Gate: gate, Services: []*Service{interopService()}})
 	if err != nil {
 		t.Fatal(err)
 	}

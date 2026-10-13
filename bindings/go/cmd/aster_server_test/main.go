@@ -67,10 +67,10 @@ func main() {
 	}
 	fmt.Printf("   contract_id: %s\n   PASS\n", contractID)
 
-	// 1. Start the server (open gate, loopback).
+	// 1. Start the server (no enrollment: open, loopback).
 	fmt.Println("\n1. Starting AsterServer...")
 	cfg := aster.DefaultConfig()
-	cfg.RelayMode, cfg.BindAddr, cfg.AllowAllConsumers = "disabled", "127.0.0.1:0", true
+	cfg.RelayMode, cfg.BindAddr = "disabled", "127.0.0.1:0"
 	srv, err := aster.StartServer(ctx, aster.ServerOptions{Config: cfg, Services: []*aster.Service{svc}})
 	if err != nil {
 		fail("StartServer: %v", err)

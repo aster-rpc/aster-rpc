@@ -93,7 +93,7 @@ func main() {
     }),
   )
   ctx,stop:=context.WithTimeout(context.Background(),40*time.Second);defer stop()
-  cfg:=aster.AsterConfig{RelayMode:"disabled",BindAddr:"127.0.0.1:0",AllowAllConsumers:true}
+  cfg:=aster.AsterConfig{RelayMode:"disabled",BindAddr:"127.0.0.1:0"}
   server,err:=aster.StartServer(ctx,aster.ServerOptions{Config:cfg,Services:[]*aster.Service{service}});must(err);defer server.Close()
   client,err:=aster.StartClient(ctx,cfg);must(err);defer client.Close();must(client.RegisterService(service))
   ticket,err:=server.Ticket(ctx);must(err)

@@ -25,10 +25,6 @@ const (
 	TrustOpenDev TrustMode = C.ASTER_TRUST_MODE_OPEN_DEV
 )
 
-// ConsumerAdmissionALPN is the consumer-admission ALPN, kept open by a
-// server's default gate.
-const ConsumerAdmissionALPN = "aster.consumer_admission"
-
 // Gate is a Gate-0 connection admission policy decided in Rust
 // (aster::GatePolicy, C ABI aster_gate_*). Pass it in NodeOptions.Gate (or to
 // Node.SetGate): admission ALPNs stay open to everyone, every other ALPN needs

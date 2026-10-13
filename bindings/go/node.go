@@ -63,12 +63,12 @@ type Node struct {
 	// Immutable health-only snapshot; nil identifies a node without source config.
 	healthSettings *nodeHealthSettings
 	admissions     chan *AdmissionRequest
-	// enrollment is set when started with NodeOptions.Enrollment.
+	// enrollment is set when a server or client installed Enrollment.
 	enrollment *Enrollment
 }
 
-// Enrollment returns the Enrollment installed by NodeOptions.Enrollment (nil
-// otherwise). The node owns it.
+// Enrollment returns the Enrollment StartServer / StartClient installed on
+// this node from its config (nil otherwise). The node owns it.
 func (n *Node) Enrollment() *Enrollment { return n.enrollment }
 
 // Connections returns a channel that emits AcceptedAster for each
@@ -256,7 +256,7 @@ func createNode(ctx context.Context, alpns []string, path string) (*Node, error)
 	cfg := DefaultConfig()
 	cfg.ALPNs = alpns
 	cfg.StoragePath = path
-	node, err := startNodeOn(ctx, runtime, cfg, NodeOptions{})
+	node, err := startNodeOn(ctx, runtime, cfg, NodeOptions{}, -1)
 	if err != nil {
 		runtime.Close()
 		return nil, fmt.Errorf("node create: %w", err)

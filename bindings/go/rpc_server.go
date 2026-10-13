@@ -26,16 +26,32 @@ import (
 
 // ServerOptions configure StartServer.
 type ServerOptions struct {
-	// Config is the node configuration (zero value = Rust defaults).
+	// Config is the node configuration (zero value = Rust defaults). With
+	// enrollment configured (Config.IsEnrollmentEnabled: [trust] and
+	// [enrollment], ASTER_ENROLLMENT_*), the server admits only nodes
+	// holding a credential from Config's root, and each peer's verified
+	// claims become the roles Requires checks, on every call (design §15).
+	// Without it the node is open: there is no "allow all" switch.
 	Config AsterConfig
 	// Services to serve.
 	Services []*Service
 	// Codec for payloads (default: a ForyCodec; service types are registered on it).
 	Codec Codec
-	// Gate is the Gate-0 policy. Default: a gate owned by the server, in
-	// TrustOpenDev when Config.AllowAllConsumers is set, else TrustProtected
-	// (only admitted peers reach aster/1).
+	// Gate is an explicit Gate-0 policy (an escape hatch; Rust's Gate0).
+	// Default: none, so an unenrolled server is open and an enrolled one is
+	// guarded by Enrollment. Setting it with enrollment configured is an
+	// error.
 	Gate *Gate
+	// EnrollmentPolicy overrides Config.Enrollment.Policy, and
+	// EnrollmentRoles Config.Enrollment.Roles (Rust
+	// AsterServerBuilder::enrollment_policy / enrollment_roles). Enablement
+	// still comes from Config.
+	EnrollmentPolicy *Policy
+	EnrollmentRoles  *RoleMapping
+	// LeaseGrantor, if set, serves aster.lease.Grantor (Rust
+	// aster::rpc::lease::LeaseGrantor): the designated serialization point
+	// other nodes acquire leases through (AsterClient.LeaseGrantor).
+	LeaseGrantor *LeaseGrantor
 	// Interceptors run OnRequest (with the raw first request payload) before
 	// every handler; an error rejects the call (an *RpcError keeps its code).
 	// Gate 3 (Requires) already ran in Rust.
@@ -59,22 +75,14 @@ type ServerOptions struct {
 	// connection closes (drop per-connection state). Must not block.
 	OnConnectionClosed func(connectionID uint64, peerID string)
 	// OnNonRPC, if set, receives (on its own goroutine) every accepted
-	// connection on an ALPN other than aster/1 (e.g. the consumer-admission
-	// ALPN); the handler owns conn and must Close it. Default: closed.
+	// connection on an ALPN of Config.ALPNs other than aster/1 that Rust does
+	// not serve itself; the handler owns conn and must Close it. Default:
+	// closed.
 	OnNonRPC func(alpn string, conn *Connection)
 	// Logger receives the server's own messages, such as response failures
 	// (default: the logger set with SetLogger, else slog.Default()). Rust log
 	// records go to SetLogger's logger.
 	Logger *slog.Logger
-	// Enrollment, if set, makes Enrollment the node's admission instead of a
-	// Gate (C ABI 5.1; incompatible with Gate): only peers that complete the
-	// enrollment handshake reach aster/1, and the server answers inbound
-	// handshakes. Reach it with AsterServer.Enrollment.
-	Enrollment *EnrollmentConfig
-	// EnrollmentIssuer, with Enrollment, makes the node a delegated issuer
-	// and serves aster.enrollment.IssuerV1 renewals. Reach it with
-	// AsterServer.EnrollmentIssuer.
-	EnrollmentIssuer *IssuerConfig
 	// Health, if set, starts an ops listener (/healthz, /readyz, /metrics)
 	// for the server's node and ties its readiness to the server: ready once
 	// the server serves, not ready first on Close. Reach it with
@@ -94,18 +102,18 @@ type ServerOptions struct {
 //	defer srv.Close()
 //	ticket, err := srv.Ticket(ctx)
 type AsterServer struct {
-	node      *Node
-	gate      *Gate
-	ownedGate bool
-	ds        *dispatchServer
-	codec     Codec
-	byIndex   []*Service // service_idx -> service
-	icpts     []Interceptor
-	onClosed  func(uint64, string)
-	onNonRPC  func(string, *Connection)
-	logger    *slog.Logger
-	health    *HealthServer
-	issuer    *EnrollmentIssuer
+	node     *Node
+	gate     *Gate
+	ds       *dispatchServer
+	codec    Codec
+	byIndex  []*Service // service_idx -> service
+	icpts    []Interceptor
+	onClosed func(uint64, string)
+	onNonRPC func(string, *Connection)
+	logger   *slog.Logger
+	health   *HealthServer
+	issuer   *EnrollmentIssuer
+	grantor  *grantorBackend
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -158,44 +166,45 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		}
 	}
 
-	if opts.EnrollmentIssuer != nil && opts.Enrollment == nil {
-		return nil, fmt.Errorf("EnrollmentIssuer needs Enrollment: %w", ErrInvalidArgument)
+	cfg := opts.Config
+	if opts.EnrollmentPolicy != nil {
+		cfg.Enrollment.Policy = opts.EnrollmentPolicy
 	}
-	if opts.Enrollment != nil && opts.Gate != nil {
-		return nil, fmt.Errorf("Enrollment and Gate both decide admission; set one: %w", ErrInvalidArgument)
+	if opts.EnrollmentRoles != nil {
+		cfg.Enrollment.Roles = *opts.EnrollmentRoles
 	}
-	gate, owned := opts.Gate, false
-	if gate == nil && opts.Enrollment == nil {
-		var err error
-		if gate, err = NewGate(nil); err != nil {
-			return nil, err
-		}
-		owned = true
-		mode := TrustProtected
-		if opts.Config.AllowAllConsumers {
-			mode = TrustOpenDev
-		}
-		if err := errors.Join(gate.SetTrustMode(mode), gate.SetAdmissionALPNs(ConsumerAdmissionALPN)); err != nil {
-			_ = gate.Close()
-			return nil, err
-		}
-	}
-	fail := func(err error) (*AsterServer, error) {
-		if owned {
-			_ = gate.Close()
-		}
-		return nil, err
-	}
-	node, err := StartNode(ctx, opts.Config, NodeOptions{Gate: gate, ExtraALPNs: []string{AsterALPN, ConsumerAdmissionALPN}, Enrollment: opts.Enrollment})
+	gate := opts.Gate
+	fail := func(err error) (*AsterServer, error) { return nil, err }
+	node, err := startNode(ctx, cfg, NodeOptions{Gate: gate, ExtraALPNs: []string{AsterALPN}}, enrollmentSideServer)
 	if err != nil {
 		return fail(err)
 	}
 	var issuer *EnrollmentIssuer
-	if opts.EnrollmentIssuer != nil {
-		if issuer, err = node.Enrollment().NewIssuer(*opts.EnrollmentIssuer); err != nil {
+	if e := node.Enrollment(); e != nil {
+		st, err := e.Status()
+		if err != nil {
 			_ = node.Close()
 			return fail(err)
 		}
+		if st.Issuer != "" {
+			issuer = &EnrollmentIssuer{e: e}
+		}
+	}
+	var grantor *grantorBackend
+	if opts.LeaseGrantor != nil {
+		if grantor, err = opts.LeaseGrantor.backend(node.Runtime()); err != nil {
+			_ = node.Close()
+			return fail(err)
+		}
+	}
+	// After this point a failure releases the grantor's table before the
+	// node (and the node's runtime).
+	fail = func(err error) (*AsterServer, error) {
+		if grantor != nil {
+			grantor.close()
+		}
+		_ = node.Close()
+		return nil, err
 	}
 	EnsureObservability()
 	var health *HealthServer
@@ -205,7 +214,6 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	}
 	if healthCfg != nil {
 		if health, err = StartHealth(node, healthCfg); err != nil {
-			_ = node.Close()
 			return fail(err)
 		}
 	}
@@ -215,8 +223,8 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		topology:            opts.Topology,
 		topologyRequirement: opts.TopologyRequirement,
 		ringCapacity:        opts.RingCapacity,
-		enrollment:          node.Enrollment(),
-		issuer:              issuer,
+		leaseGrantor:        opts.LeaseGrantor,
+		grantor:             grantor,
 	}
 	if opts.MaxSessionsPerConnection > 0 {
 		settings.maxSessionsPerConnection = uint64(opts.MaxSessionsPerConnection)
@@ -233,7 +241,6 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		if health != nil {
 			_ = health.Stop()
 		}
-		_ = node.Close()
 		return fail(err)
 	}
 	logger := opts.Logger
@@ -242,7 +249,7 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	}
 	sctx, cancel := context.WithCancel(context.Background())
 	s := &AsterServer{
-		node: node, gate: gate, ownedGate: owned, ds: ds, codec: codec, issuer: issuer,
+		node: node, gate: gate, ds: ds, codec: codec, issuer: issuer, grantor: grantor,
 		byIndex: append([]*Service(nil), opts.Services...), icpts: opts.Interceptors,
 		onClosed: opts.OnConnectionClosed, onNonRPC: opts.OnNonRPC,
 		logger: logger, health: health, ctx: sctx, cancel: cancel,
@@ -260,15 +267,28 @@ func (s *AsterServer) Health() *HealthServer { return s.health }
 // Node is the server's node.
 func (s *AsterServer) Node() *Node { return s.node }
 
-// Gate is the Gate-0 policy guarding the node (admit peers on it unless dev
-// mode is on); nil when Enrollment decides admission.
+// Gate is the explicit Gate-0 policy (ServerOptions.Gate), or nil.
 func (s *AsterServer) Gate() *Gate { return s.gate }
 
-// Enrollment is the node's Enrollment (ServerOptions.Enrollment), or nil.
+// Enrollment is the Enrollment installed from Config (nil when enrollment
+// is off). Roles and revocations need nothing from it; it is for audit,
+// checks and revocation events.
 func (s *AsterServer) Enrollment() *Enrollment { return s.node.Enrollment() }
 
-// EnrollmentIssuer is the delegated issuer (ServerOptions.EnrollmentIssuer), or nil.
-func (s *AsterServer) EnrollmentIssuer() *EnrollmentIssuer { return s.issuer }
+// Issuer is the delegated issuer the server runs when
+// Config.Enrollment.IssuerDelegationFile is set (nil otherwise). It already
+// serves renewals; use Issue to enroll new nodes.
+func (s *AsterServer) Issuer() *EnrollmentIssuer { return s.issuer }
+
+// LeaseSerializer is the serialization point behind ServerOptions.LeaseGrantor
+// (nil without one): the grantor's own rows, for snapshots and for
+// co-located holders on this node.
+func (s *AsterServer) LeaseSerializer() *LeaseSerializerHandle {
+	if s.grantor == nil {
+		return nil
+	}
+	return s.grantor.serializer
+}
 
 // NodeID is the server's node id (64 hex).
 func (s *AsterServer) NodeID() (string, error) { return s.node.NodeID() }
@@ -281,7 +301,9 @@ func (s *AsterServer) Ticket(ctx context.Context) (string, error) {
 
 // SetPeerAttributes sets the attributes Gate 3 checks Requires against for
 // calls from peer (64-hex node id), and that handlers see in
-// CallInfo.Attributes. Empty or nil clears them.
+// CallInfo.Attributes. Empty or nil clears them. An escape hatch for roles
+// decided at runtime: with enrollment configured, roles come from each
+// peer's credential ([enrollment.roles]) and win on a key clash.
 func (s *AsterServer) SetPeerAttributes(peer string, attributes map[string]string) error {
 	entries := make([]MetadataEntry, 0, len(attributes))
 	for k, v := range attributes {
@@ -328,13 +350,13 @@ func (s *AsterServer) Close() error {
 	for _, rec := range sessions {
 		rec.close()
 	}
+	if s.grantor != nil {
+		s.grantor.close()
+	}
 	err = errors.Join(err, s.node.Close())
 	select { // the closed connections end any remaining request waits
 	case <-callsDone:
 	case <-time.After(2 * time.Second):
-	}
-	if s.ownedGate {
-		err = errors.Join(err, s.gate.Close())
 	}
 	return err
 }

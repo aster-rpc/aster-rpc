@@ -14,7 +14,7 @@ public installation source. See [publication setup](../../deploy/go-vanity/READM
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
 TypeScript, Java and .NET. The binding requires native ABI 5.1 or newer within
-major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment). Aster 0.3 is a preview release.
+major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment from config and the lease grantor). Aster 0.3 is a preview release.
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
   safe for concurrent use (a pool of Fory instances, no global lock). Payload types implement `aster.WireTyped`
@@ -50,8 +50,11 @@ major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment). Aste
   idempotent flag; `WithIdempotent` overrides it.
 - **Node:** `AsterConfig` mirrors `aster_config_t`; `ConfigFromEnv()` /
   `ConfigFromTOML(path)` resolve through Rust `aster::AsterConfig` plus the
-  binding-level `[trust]` / `[connect]` / `[logging]` keys. `StartNode(ctx, cfg,
-  NodeOptions{Gate, ExtraALPNs})` uses `aster_node_start`; `Node.Ticket`,
+  binding-level `[connect]` / `[logging]` keys; `[trust]` and `[enrollment]`
+  resolve through Rust too (`aster_config_enrollment_from_env` / `_from_toml`).
+  `StartNode(ctx, cfg, NodeOptions{Gate, ExtraALPNs})` uses `aster_node_start`
+  (and, like Rust `Node::start`, ignores enrollment); `StartServer` /
+  `StartClient` use `aster_node_start_enrolled`; `Node.Ticket`,
   `Connect`, `Accept`, `AddNodeAddr`, `SetGate`, `Docs()`. (ABI 4.6 removed
   `aster_node_metrics_prometheus`; `MetricsPrometheus()` replaces it, see
   Observability below.)
@@ -94,10 +97,13 @@ major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment). Aste
     is ready once the server serves and not ready first on `Close`.
     `SetReady`, `SetHealthy`, `SetCheck(name, ok)`, `Addr`, `Stop`.
   - `MetricsInterceptor` is gone: the built-in metrics record in Rust.
-- **Gate 0:** `NewGate` (`aster_gate_*`: trust mode, admission ALPNs, reject
-  code/reason, admit/revoke/is-admitted/should-allow). Without a gate, a node
-  with `EnableHooks` delivers `*AdmissionRequest`s on `Node.Admissions()`;
-  answer with `Allow()` / `Deny(code, reason)` (`aster_admission_respond`).
+- **Gate 0:** a server or client is open unless its config enables
+  Enrollment (see "Enrollment"), which then decides admission; there is no
+  "allow all" switch. Escape hatches: `NewGate` (`aster_gate_*`: trust mode,
+  admission ALPNs, reject code/reason, admit/revoke/is-admitted/should-allow;
+  `ServerOptions.Gate`), and, without a gate, a node with `EnableHooks`
+  delivers `*AdmissionRequest`s on `Node.Admissions()`; answer with `Allow()`
+  / `Deny(code, reason)` (`aster_admission_respond`).
 - **Server (ABI 3.5 dynamic dispatch):** `StartServer(ctx, ServerOptions{Config,
   Services, Gate, Interceptors, ...})` registers each service as its JSON
   registration form (`DynamicServiceJSON`; contract id from
@@ -116,8 +122,11 @@ major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment). Aste
   context carries the call deadline and ends on a peer cancel (streaming) or
   deadline. Session-scoped services: `NewSessionService(name, v, factory,
   ...)`, instance via `Session[T](ctx)`, closed (`io.Closer`) when the
-  session ends. `SetPeerAttributes` feeds Gate 3 (attribute bridge);
-  `CallInfo.Attributes` / `Metadata` are read lazily from Rust.
+  session ends. With Enrollment, Gate 3 sees the roles in each peer's
+  credential; `SetPeerAttributes` (attribute bridge) is the escape hatch for
+  roles decided at runtime. `CallInfo.Attributes` / `Metadata` are read lazily
+  from Rust. `ServerOptions.LeaseGrantor` serves `aster.lease.Grantor` (see
+  "Lease grantor").
   `OnConnectionClosed`, `OnNonRPC` (accepted non-`aster/1` ALPN connections,
   owned by the callback). Every call ends with exactly one AEv1 `RpcStatus`
   (`*RpcError` keeps its code, deadline → `DEADLINE_EXCEEDED`, panics and
@@ -248,8 +257,9 @@ major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment). Aste
 
 Known gaps:
 
-- No `go generate` codegen yet; no
-  consumer-admission handler (`OnNonRPC` hands the connection over).
+- No `go generate` codegen yet. The legacy consumer admission
+  (`aster.consumer_admission`, `AllowAllConsumers` / `AllowAllProducers`) is
+  retired: Enrollment replaces it.
 - A client-stream call with no request is refused by the Rust client
   (`INVALID_ARGUMENT`).
 - `hostile_race_test.go` / `TestSoak_Short` have no peer and only check "no
@@ -405,7 +415,8 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `config.go` | `AsterConfig` ↔ `aster_config_t`, `ConfigFromEnv` / `ConfigFromTOML` |
 | `node_start.go` | `StartNode`, admission requests, connect/accept/ticket helpers |
 | `gate.go` | `Gate` — Gate-0 policy (`aster_gate_*`) |
-| `enrollment.go` | ABI 5.1 Enrollment: `EnrollmentConfig` / `Policy*`, `Enrollment` (connect, synchronize, peer claims, revocations, renewal), `EnrollmentIssuer` |
+| `enrollment.go` | ABI 5.1 Enrollment from config: `EnrollmentConfig` / `RoleMapping` / `Policy*`, `Enrollment` (status, peer claims, check, revocations), `EnrollmentIssuer` |
+| `lease_grantor.go` | ABI 5.1 `LeaseGrantor` (served by `StartServer`) and `AsterClient.LeaseGrantor` |
 | `envelope.go` | AEv1 envelope, zstd, framing (via the C ABI) |
 | `codec.go` | `Codec`, `ForyCodec` (Fory 1.7.6), `WireTyped` |
 | `contract.go` | Contract identity: TypeDef / ServiceContract JSON → Rust hash |
@@ -439,7 +450,8 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `observability_pure_test.go`, `observability_test.go` | Pure observability cases (also `CGO_ENABLED=0`) and native integration tests: logs with trace ids, spans parented from dispatch, baggage, Prometheus text, health endpoints, shutdown / re-init |
 | `hostile_race_test.go` | Hostile race integration tests (`//go:build cgo`) |
 | `soak_test.go` | Soak/leak tests (`//go:build cgo`) |
-| `enrollment_test.go` | Enrollment end to end on loopback: a test-only root signer, a delegated issuer, peer claims, renewal, revocation |
+| `enrollment_test.go` | Enrollment through `StartServer` / `StartClient` (mirrors `aster/tests/enrollment_aster_server.rs`): roles reach `Requires`, a missing role is refused, no credential cannot connect, root revocation, config-driven issuer renewal, fail-closed misconfiguration; the root is `internal/testroot` |
+| `lease_grantor_test.go` | The lease grantor over a Go serializer and the in-memory one |
 | `rpc_test.go`, `node_test.go`, `dataplane_test.go`, `vectors_test.go` | RPC (4 patterns, errors, deadlines, gate, interceptors, QUEUE_FULL), config/node/gate/admission, data plane, conformance vectors |
 
 ## Architecture
@@ -598,68 +610,126 @@ reads alone do not expose network layout over RPC.
 
 ## Enrollment (ABI 5.1)
 
-Enrollment admits peers on delegation chains rooted in one root key
-(`docs/_internal/working_ideas/aster-enrollment.md`). Go gets the two roles a
-non-Rust process plays: an **enrolled node** and a **delegated issuer**. Root
-operations (namespace create/bind, promote, revoke, reauthorize, rotate,
-delegate) stay in the Rust CLI (`aster enroll`, `aster trust`).
-
-Install it when the node starts; it then *is* the node's Gate 0 (incompatible
-with a `Gate`): only peers that complete the reciprocal handshake under your
-policy reach `aster/1`, Docs or any other ALPN, and a definite denial closes
-every connection of that peer.
+Enrollment admits nodes holding a credential (a delegation chain) from one
+root key, and turns each node's verified claims into the roles `Requires`
+checks. It is configuration, exactly as on the Rust `AsterServer` /
+`AsterClient` (design `docs/_internal/working_ideas/aster-enrollment.md` §15):
+the same `[trust]` / `[enrollment]` TOML, `ASTER_ENROLLMENT_*` variables,
+defaults and fail-closed validation, resolved by the Rust config loader.
+Root operations (keys, credentials, namespaces, revocation, delegation,
+rotation) stay in the `aster` CLI.
 
 ```go
-cfg.RootPubkeyFile = "/etc/aster/root.pub"            // or RootPubkey / ASTER_ROOT_PUBKEY
-cfg.EnrollmentCredentialFile = "/run/aster/node.chain" // or EnrollmentConfig.Credential
-srv, err := aster.StartServer(ctx, aster.ServerOptions{
-    Config:   cfg,
-    Services: services,
-    Enrollment: &aster.EnrollmentConfig{
-        Audience:       "kasm",
-        FleetNamespace: fleetNamespaceHex,
-        StatePath:      "/var/lib/agent/enrollment.json", // durable denials
-        Policy: aster.PolicyAllOf(
-            aster.PolicyScope("session"), aster.PolicyTolerateStale()),
-    },
-})
-enr := srv.Enrollment()
-ready, ticket, err := enr.Connect(ctx, replicas...)          // reciprocal handshake
-_, err = enr.Synchronize(ctx, ready.Peer, ticket, 15*time.Second) // policy namespace
+cfg, err := aster.ConfigFromEnv() // or aster.ConfigFromTOML("aster.toml")
+srv, err := aster.StartServer(ctx, aster.ServerOptions{Config: cfg, Services: services})
 ```
 
-- **Policy** is declarative and evaluated in Rust: `PolicyAllOf` / `AnyOf` /
-  `NoneOf` over `PolicyScope`, `PolicyTag`, `PolicyAudience`,
-  `PolicySourceCIDR`, `PolicyAttributeEquals`, `PolicyIssuedBy`,
-  `PolicyMaxCredentialAge`, `PolicySynchronizedWithin`,
-  `PolicyRequireRegistration`, `PolicyTolerateStale`. There is no Go upcall.
-- **Claims to roles:** admission never grants operation access.
-  `enr.PeerClaims(peer)` returns the verified `PeerEvidence` (subject, root,
-  issuer and issuer path, scopes, tags, typed attributes, expiry, ephemeral or
-  registered); map it with `srv.SetPeerAttributes(peer, {"aster.role": ...})`
-  so `Requires` checks it. `enr.CheckPeer` re-evaluates a peer before a
-  sensitive operation (`*AdmissionError`; only `AdmissionErrorDenied` revokes).
-- **Revocations:** `enr.NextRevocation(ctx)` returns each revoked peer
-  (connections already closed) or `Lagged`; drop its roles and per-peer state.
-- **Credential lifecycle:** `enr.Status`, `enr.ReplaceCredential`,
-  `enr.VerifyCredential(subject, chain)` (offline), and
-  `enr.StartRenewal(RenewalConfig{Issuer: addr})` renewing from the issuer
-  until the root registers the node (`Renewal.Wait` gives the outcome).
-- **Delegated issuer:** `ServerOptions.EnrollmentIssuer: &IssuerConfig{
-  Delegation, Lifetime}` (the delegation chain is issued by the root with
-  `aster enroll delegate`). `srv.EnrollmentIssuer().Issue(nodeID, claims,
-  RegistrationEphemeral)` signs a short credential for a subject the
-  orchestrator has authenticated itself (for example from a Kubernetes
-  service-account token); the server also serves `aster.enrollment.IssuerV1`
-  renewals. A refusal is an `*IssuerRefusal` with the service's code.
-- A node that only dials can use `StartNode(..., NodeOptions{Enrollment: ...})`;
-  inbound handshakes need a server.
+```toml
+[trust]
+root_pubkey = "<aster key root show>"
+enrollment_credential = "server.cred"     # aster enroll node --out server.cred
 
-Config: `RootPubkey` / `RootPubkeyFile` (`ASTER_ROOT_PUBKEY(_FILE)`, TOML
-`[trust] root_pubkey(_file)`) and `EnrollmentCredentialFile`
-(`ASTER_ENROLLMENT_CREDENTIAL`, `[trust] enrollment_credential`) are the
-defaults for `EnrollmentConfig.Root` and `.Credential`. The legacy
-`EnrollmentCredentialIID` field was removed: nothing consumed it.
+[network]
+secret_key_file = "server.key"            # aster key node generate --out server.key
+
+[enrollment]
+audience = "mission-control"
+fleet_namespace = "<aster enroll namespace create>"
+state_path = "/var/lib/mc/enrollment.json"
+```
+
+A client is the same configuration with its own key and credential:
+
+```go
+cfg, err := aster.ConfigFromEnv() // ASTER_SECRET_KEY_FILE, ASTER_ENROLLMENT_CREDENTIAL, ...
+client, err := aster.StartClient(ctx, cfg)
+conn, err := client.ConnectTicket(ctx, serverAddress) // enrolls first
+```
+
+- **Enablement:** `cfg.IsEnrollmentEnabled()` is `Enrollment.Enabled` when
+  set, else true when an audience, fleet namespace, issuer delegation or
+  credential (`EnrollmentCredentialFile` / `EnrollmentCredentialChain`) is
+  configured; the root (and rotation pin) alone do not enable it. Once
+  enabled every value is validated before the node starts, and any error
+  fails `StartServer` / `StartClient` naming the setting. Nothing falls back
+  to an open node.
+- **Server** (§15.4): admits only enrolled nodes (Enrollment is Gate 0;
+  `ServerOptions.Gate` with it is an error), serves the handshake, holds the
+  fleet namespace (or synchronizes it from `Enrollment.Replicas`), runs a
+  delegated issuer serving `aster.enrollment.IssuerV1` when
+  `Enrollment.IssuerDelegationFile` is set (`srv.Issuer().Issue(...)` enrolls
+  new nodes), and renews its own credential from `Enrollment.RenewFrom`.
+- **Roles** (§15.6): a peer's roles are the comma-separated values of its
+  `aster.role` claim attribute (`aster enroll node --attributes roles.json`
+  with `{"aster.role": {"type": "string", "value": "ops.status,ops.logs"}}`),
+  plus `Enrollment.Roles` mappings (`ScopesAsRoles`, `Scopes`, `Tags`;
+  `Attribute` renames or disables the attribute). They are evaluated per call
+  from the peer's live session, so a revocation, a promotion or a renewal
+  takes effect on the next call with no code. Other claim attributes reach
+  handlers in `CallInfo.Attributes` (`IncludeAttributes`).
+- **Client** (§15.7): before its first connection to a server the client
+  enrolls over the reciprocal handshake (the server verifies the client and
+  the client verifies the server), synchronizes the fleet namespace the
+  server offers (`Synchronize`), and renews its credential from that server
+  when the server signed it (or from `RenewFrom`; `Renew = false` disables
+  it). `client.IsRenewing()`.
+- **Revocation:** a revocation the root publishes (`aster enroll revoke
+  --peer <server>`) makes the server close every connection of that node and
+  refuse its next call.
+- **Overrides** (Rust `enrollment_policy` / `enrollment_roles`):
+  `ServerOptions.EnrollmentPolicy`, `ServerOptions.EnrollmentRoles`,
+  `WithEnrollmentPolicy(p)` for a client. The policy is declarative and
+  evaluated in Rust: `PolicyAllOf` / `AnyOf` / `NoneOf` over `PolicyScope`,
+  `PolicyTag`, `PolicyAudience`, `PolicySourceCIDR`, `PolicyAttributeEquals`,
+  `PolicyIssuedBy`, `PolicyMaxCredentialAge`, `PolicySynchronizedWithin`,
+  `PolicyRequireRegistration`, `PolicyTolerateStale` (the default).
+- **Escape hatches** on `srv.Enrollment()` / `client.Enrollment()`: `Status`
+  (side, trusted root, own credential, renewing, issuer), `Credential`,
+  `PeerClaims(peer)` (verified evidence, for audit), `CheckPeer(ctx, peer)`
+  before a sensitive operation (`*AdmissionError`), `NextRevocation(ctx)` for
+  per-peer application state. `srv.SetPeerAttributes` remains for roles that
+  change at runtime; roles from a credential win on a clash.
+
+| `AsterConfig` field | TOML | Env |
+|---|---|---|
+| `RootPubkey` / `RootPubkeyFile` | `[trust] root_pubkey` / `root_pubkey_file` | `ASTER_ROOT_PUBKEY` / `_FILE` |
+| `NextRootCommitment`, `RootSeq`, `RootRotations` | `[trust] next_root_commitment`, `root_seq`, `root_rotations` | `ASTER_NEXT_ROOT_COMMITMENT`, `ASTER_ROOT_SEQ`, `ASTER_ROOT_ROTATIONS` |
+| `EnrollmentCredentialFile` / `EnrollmentCredentialChain` | `[trust] enrollment_credential` / `enrollment_credential_chain` | `ASTER_ENROLLMENT_CREDENTIAL` / `_CHAIN` |
+| `Enrollment.Enabled`, `Audience`, `FleetNamespace`, `StatePath`, `Replicas`, `Policy`, `RequireSynchronizedClock`, `ActivationLeewaySecs`, `RenewFrom`, `Renew`, `Synchronize` | `[enrollment]` (snake_case) | `ASTER_ENROLLMENT_<NAME>` |
+| `Enrollment.Limits.*` | `[enrollment.limits]` | `ASTER_ENROLLMENT_<FIELD>` (e.g. `_SYNC_TIMEOUT_MS`) |
+| `Enrollment.Roles.*` | `[enrollment.roles]`, `.scopes`, `.tags` | `ASTER_ENROLLMENT_ROLE_ATTRIBUTE`, `_SCOPES_AS_ROLES`, `_INCLUDE_ATTRIBUTES` |
+| `Enrollment.IssuerDelegationFile`, `IssuerLifetimeSecs` | `[enrollment.issuer] delegation_file`, `lifetime` | `ASTER_ENROLLMENT_ISSUER_DELEGATION_FILE`, `_ISSUER_LIFETIME` |
+
+Examples: `examples/mission_control` (the Rust Mission Control auth chapter
+in Go: a server and an agent, roles `ops.status`, `ops.logs`, `ops.admin`,
+`ops.ingest`) and `examples/roles_revocation` (roles from credentials, a root
+revocation, and runtime role changes through a control RPC).
+
+## Lease grantor (ABI 5.1)
+
+A server serves `aster.lease.Grantor` (Rust `aster::rpc::lease::LeaseGrantor`)
+over a lease serializer implemented in Go, for example on Postgres; clients
+acquire through it (Rust `GrantorSerializer`). The grantor binds every
+operation to the caller's authenticated node id, never a request field.
+
+```go
+srv, err := aster.StartServer(ctx, aster.ServerOptions{
+    Config:       cfg,
+    Services:     []*aster.Service{work},           // the store that checks fences
+    LeaseGrantor: &aster.LeaseGrantor{Serializer: &PGSerializer{DB: db}},
+})
+
+client, err := aster.StartClient(ctx, cfg)
+leases, err := client.LeaseGrantor(ctx, grantorAddr) // a *LeaseSerializerHandle
+me, _ := client.ID()
+lease, err := leases.Acquire(ctx, "db/primary", me, aster.LeaseOptions{TTL: 10 * time.Second})
+fence, ok := lease.Fence() // carry it on every protected write
+```
+
+`Serializer` nil uses Rust's in-memory serializer. `Requires` gates every
+method; `revoke` requires the `operator` role unless `RevokeRequires` /
+`RevokeUngated` say otherwise. `srv.LeaseSerializer()` reads the grantor's
+own rows. See `examples/lease_postgres`.
 
 ## Raw WebTransport (ABI 4.17)
 

@@ -5,6 +5,7 @@ package aster
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,38 +16,78 @@ import (
 
 func TestConfig_DefaultsEnvTOML(t *testing.T) {
 	d := DefaultConfig()
-	if d.RelayMode != "default" || d.HookFailureMode != HookFailOpen || d.EnableHooks || !d.AllowAllProducers || d.LogLevel != "info" {
+	if d.RelayMode != "default" || d.HookFailureMode != HookFailOpen || d.EnableHooks || d.IsEnrollmentEnabled() || d.LogLevel != "info" {
 		t.Fatalf("defaults %+v", d)
 	}
 
 	t.Setenv("ASTER_RELAY_MODE", "disabled")
 	t.Setenv("ASTER_BIND_ADDR", "127.0.0.1:0")
-	t.Setenv("ASTER_ALLOW_ALL_CONSUMERS", "true")
 	t.Setenv("ASTER_LOG_LEVEL", "DEBUG")
+	t.Setenv("ASTER_ENROLLMENT_AUDIENCE", "mission-control")
+	t.Setenv("ASTER_ENROLLMENT_CREDENTIAL", "agent.cred")
+	t.Setenv("ASTER_ENROLLMENT_REPLICAS", "aa, bb")
+	t.Setenv("ASTER_ENROLLMENT_POLICY", `{"scope":"ops"}`)
+	t.Setenv("ASTER_ENROLLMENT_SYNC_TIMEOUT_MS", "2000")
+	t.Setenv("ASTER_ENROLLMENT_ISSUER_LIFETIME", "6h")
 	c, err := ConfigFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.RelayMode != "disabled" || c.BindAddr != "127.0.0.1:0" || !c.AllowAllConsumers || c.LogLevel != "debug" {
+	if c.RelayMode != "disabled" || c.BindAddr != "127.0.0.1:0" || c.LogLevel != "debug" {
 		t.Fatalf("from env %+v", c)
+	}
+	e := c.Enrollment
+	policy, _ := json.Marshal(e.Policy)
+	if !c.IsEnrollmentEnabled() || e.Audience != "mission-control" || c.EnrollmentCredentialFile != "agent.cred" ||
+		strings.Join(e.Replicas, ",") != "aa,bb" || string(policy) != `{"scope":"ops"}` ||
+		e.Limits.SyncTimeoutMs != 2000 || e.IssuerLifetimeSecs != 6*3600 || *e.Roles.Attribute != "aster.role" {
+		t.Fatalf("enrollment from env %+v", e)
+	}
+	t.Setenv("ASTER_ENROLLMENT_SYNC_TIMEOUT_MS", "soon")
+	if _, err := ConfigFromEnv(); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("malformed variable: %v", err)
+	}
+	for _, k := range []string{"AUDIENCE", "CREDENTIAL", "REPLICAS", "POLICY", "SYNC_TIMEOUT_MS", "ISSUER_LIFETIME"} {
+		t.Setenv("ASTER_ENROLLMENT_"+k, "")
 	}
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aster.toml")
-	toml := "[network]\nrelay_mode = \"staging\"\nenable_monitoring = true\n\n[trust]\nallow_all_consumers = false\nroot_pubkey = \"" +
-		strings.Repeat("ab", 32) + "\"\n\n[logging]\nformat = \"JSON\"\n"
+	toml := "[network]\nrelay_mode = \"staging\"\nenable_monitoring = true\n\n[trust]\nroot_pubkey = \"" +
+		strings.Repeat("ab", 32) + "\"\nnext_root_commitment = \"" + strings.Repeat("cd", 32) + "\"\nroot_seq = 2\n" +
+		"enrollment_credential_chain = \"aster-chain-v1~x\"\n\n[logging]\nformat = \"JSON\"\n\n" +
+		"[enrollment]\naudience = \"mc\"\nfleet_namespace = \"" + strings.Repeat("ef", 32) + "\"\n" +
+		"policy = { all_of = [{ scope = \"ops\" }, \"tolerate_stale_policy\"] }\n\n" +
+		"[enrollment.roles]\nattribute = \"\"\nscopes_as_roles = true\n[enrollment.roles.tags]\nadmin = \"ops.admin, ops.logs\"\n\n" +
+		"[enrollment.issuer]\ndelegation_file = \"issuer.chain\"\nlifetime = \"2h\"\n"
 	if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ASTER_RELAY_MODE", "")
-	t.Setenv("ASTER_ALLOW_ALL_CONSUMERS", "")
 	c, err = ConfigFromTOML(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.RelayMode != "staging" || !c.EnableMonitoring || c.AllowAllConsumers || c.LogFormat != "json" ||
+	if c.RelayMode != "staging" || !c.EnableMonitoring || c.LogFormat != "json" ||
 		len(c.ResolveRootPubkey()) != 32 || c.BindAddr != "127.0.0.1:0" {
 		t.Fatalf("from toml %+v", c)
+	}
+	e = c.Enrollment
+	policy, _ = json.Marshal(e.Policy)
+	if c.NextRootCommitment != strings.Repeat("cd", 32) || c.RootSeq != 2 || c.EnrollmentCredentialChain != "aster-chain-v1~x" ||
+		e.Audience != "mc" || string(policy) != `{"all_of":[{"scope":"ops"},"tolerate_stale_policy"]}` ||
+		*e.Roles.Attribute != "" || !e.Roles.ScopesAsRoles || strings.Join(e.Roles.Tags["admin"], ",") != "ops.admin,ops.logs" ||
+		e.IssuerDelegationFile != "issuer.chain" || e.IssuerLifetimeSecs != 7200 {
+		t.Fatalf("enrollment from toml %+v", e)
+	}
+	// Retired consumer-admission keys no longer exist: they neither parse
+	// into anything nor enable anything.
+	retired := filepath.Join(dir, "retired.toml")
+	if err := os.WriteFile(retired, []byte("[trust]\nallow_all_consumers = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := ConfigFromTOML(retired); err != nil || r.IsEnrollmentEnabled() {
+		t.Fatalf("retired keys: %v %v", err, r.IsEnrollmentEnabled())
 	}
 	if _, err := ConfigFromTOML(filepath.Join(dir, "missing.toml")); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("missing file: %v", err)
@@ -218,13 +259,17 @@ func TestGate_Policy(t *testing.T) {
 	if ok, _ := g.ShouldAllow(peer, "aster/1"); ok {
 		t.Fatal("protected gate allowed an un-admitted peer")
 	}
-	if ok, _ := g.ShouldAllow(peer, "aster.consumer_admission"); !ok {
+	if ok, _ := g.ShouldAllow(peer, "aster.producer_admission"); !ok {
 		t.Fatal("admission ALPN should be open")
+	}
+	// The retired consumer admission ALPN is not in the default set (5.1).
+	if ok, _ := g.ShouldAllow(peer, "aster.consumer_admission"); ok {
+		t.Fatal("the retired consumer admission ALPN is open")
 	}
 	if err := g.SetAdmissionALPNs(); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := g.ShouldAllow(peer, "aster.consumer_admission"); ok {
+	if ok, _ := g.ShouldAllow(peer, "aster.producer_admission"); ok {
 		t.Fatal("empty admission set should close the admission ALPN")
 	}
 	if err := g.Admit(strings.ToUpper(peer)); err != nil {

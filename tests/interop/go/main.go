@@ -749,7 +749,6 @@ func chainClient(svc *aster.Service, ticket string) bool {
 func serve(svc, sess *aster.Service) error {
 	ctx := context.Background()
 	cfg := config()
-	cfg.AllowAllConsumers = true
 	srv, err := aster.StartServer(ctx, aster.ServerOptions{Config: cfg, Services: []*aster.Service{svc, sess}})
 	if err != nil {
 		return err

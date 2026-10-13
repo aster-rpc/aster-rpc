@@ -5,9 +5,6 @@ package aster
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,92 +13,122 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sdk.getaster.now/go/internal/testroot"
 )
 
-// Enrollment through the C ABI (5.1) with real nodes on loopback. Root
-// operations stay in the Rust CLI, so this file plays the root itself with a
-// test-only signer: it signs the delegation and root credentials as compact
-// Ed25519 JWTs (crypto/ed25519) and writes root records into the fleet
-// namespace with the generic Docs API. None of it is public API, and Rust
-// verifying links signed here doubles as a cross-implementation check.
+// Enrollment through the high-level path only, mirroring
+// aster/tests/enrollment_aster_server.rs: StartServer and StartClient
+// configured by AsterConfig's trust fields and [enrollment] section. The
+// root is played by internal/testroot (root operations belong to the CLI);
+// everything the application writes is configuration and Requires.
 
-const enrollFleet = "go-enrollment"
+const enrollFleet = "mission-control"
 
 func enrollSeed(seed byte) []byte { return bytes.Repeat([]byte{seed}, 32) }
 
-func enrollKey(seed byte) ed25519.PrivateKey { return ed25519.NewKeyFromSeed(enrollSeed(seed)) }
+func enrollPub(seed byte) string { return testroot.NodeID(enrollSeed(seed)) }
 
-func enrollPub(seed byte) string {
-	return hex.EncodeToString(enrollKey(seed).Public().(ed25519.PublicKey))
-}
+// The root (seed 1) and the fleet namespace (from a fixed secret).
+var (
+	enrollRoot   = testroot.New(enrollSeed(1), enrollFleet)
+	fleetSecret  = Key(bytes.Repeat([]byte{0x55}, 32))
+	enrollFleetN = testroot.Namespace(fleetSecret)
+)
 
-// testRoot signs links as the root (seed 1).
-type testRoot struct{ key ed25519.PrivateKey }
-
-var b64 = base64.RawURLEncoding
-
-func (r testRoot) link(t *testing.T, typ, subject string, lifetime time.Duration, extension string, body any) string {
+// credentialFor is a root-issued credential for seed carrying roles in
+// aster.role ("" = none).
+func credentialFor(t *testing.T, seed byte, roles string) string {
 	t.Helper()
-	sub, err := hex.DecodeString(subject)
+	chain, err := enrollRoot.Credential(enrollPub(seed), testroot.RoleClaims(roles), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	jti := make([]byte, 16)
-	if _, err := rand.Read(jti); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().Unix()
-	payload, err := json.Marshal(map[string]any{
-		"iss": hex.EncodeToString(r.key.Public().(ed25519.PublicKey)),
-		"sub": subject,
-		"cnf": map[string]any{"jwk": map[string]string{"kty": "OKP", "crv": "Ed25519", "x": b64.EncodeToString(sub)}},
-		"aud": enrollFleet,
-		"jti": b64.EncodeToString(jti),
-		"iat": now,
-		"exp": now + int64(lifetime/time.Second),
-		extension: body,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	header, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": typ})
-	input := b64.EncodeToString(header) + "." + b64.EncodeToString(payload)
-	return input + "." + b64.EncodeToString(ed25519.Sign(r.key, []byte(input)))
+	return chain
 }
 
-// credential enrolls subject as the root, with unknown claims.
-func (r testRoot) credential(t *testing.T, subject string) string {
-	return "aster-chain-v1~" + r.link(t, "aster-enrollment-v1+jwt", subject, time.Hour, "aster_enrollment_v1",
-		map[string]any{"scopes": nil, "tags": nil, "attributes": nil, "mandatory": []string{}, "registration": "ephemeral"})
-}
-
-// delegation lets subject enroll ephemeral "build" nodes with a "pod" attribute.
-func (r testRoot) delegation(t *testing.T, subject string) string {
-	return "aster-chain-v1~" + r.link(t, "aster-delegation-v1+jwt", subject, time.Hour, "aster_delegation_v1",
-		map[string]any{
-			"may_issue": []string{"enrollment"}, "audiences": []string{enrollFleet}, "scopes": []string{"build"},
-			"tags": []string{}, "attribute_keys": []string{"pod"}, "max_child_lifetime": 3600, "max_depth": 0,
-			"subjects": nil, "operations": []string{}, "mandatory": []string{}, "may_register": false,
-		})
-}
-
-// revocation is a root NodeRegistrationV1 record revoking subject.
-func (r testRoot) revocation(subject string) []byte {
-	record, _ := json.Marshal(map[string]any{
-		"version": 1, "issuer": hex.EncodeToString(r.key.Public().(ed25519.PublicKey)), "subject": subject,
-		"audience": enrollFleet, "revision": 1, "issued_at": time.Now().Unix() - 60, "status": "revoked",
-		"claims": map[string]any{"scopes": []string{"build"}, "tags": []string{}, "attributes": map[string]any{}},
-		"mandatory": []string{}, "reauthorizes_revision": nil, "reason": "decommissioned",
-	})
-	return record
-}
-
-func writeFile(path, content string) error { return os.WriteFile(path, []byte(content), 0o600) }
-
-func enrollCfg(seed byte) AsterConfig {
+// enrolledCfg is a loopback node (seed) with the root pinned, credential
+// inline and the fleet's [enrollment] section.
+func enrolledCfg(seed byte, credential string) AsterConfig {
 	cfg := testCfg()
 	cfg.SecretKey = enrollSeed(seed)
+	root, _ := hex.DecodeString(enrollRoot.PublicKey())
+	cfg.RootPubkey = root
+	cfg.EnrollmentCredentialChain = credential
+	cfg.Enrollment = EnrollmentConfig{Audience: enrollFleet, FleetNamespace: enrollFleetN}
 	return cfg
+}
+
+// serverCfg is the server (seed 2) with a root-issued credential, durable
+// state in dir and a fast reconciliation interval.
+func serverCfg(t *testing.T, dir string) AsterConfig {
+	cfg := enrolledCfg(2, credentialFor(t, 2, ""))
+	cfg.Enrollment.StatePath = filepath.Join(dir, "server-enrollment.json")
+	cfg.Enrollment.Limits.ReconciliationIntervalMs = 200
+	return cfg
+}
+
+type opsRequest struct{ N int32 }
+
+func (opsRequest) AsterWireType() string { return "test.enrollment/OpsRequest" }
+
+type opsReply struct{ Roles string }
+
+func (opsReply) AsterWireType() string { return "test.enrollment/OpsReply" }
+
+// opsService: status requires ops.status, logs ops.logs or ops.admin, ping
+// is open. Each echoes the caller's aster.role.
+func opsService() *Service {
+	echo := func(ctx context.Context, _ *opsRequest) (*opsReply, error) {
+		info, _ := CallInfoFromContext(ctx)
+		for _, a := range info.Attributes {
+			if a.Key == "aster.role" {
+				return &opsReply{Roles: a.Value}, nil
+			}
+		}
+		return &opsReply{}, nil
+	}
+	return NewService("Ops", 1,
+		Unary("ping", echo),
+		Unary("status", echo, Requires(RequireRole("ops.status"))),
+		Unary("logs", echo, Requires(RequireAnyOf("ops.logs", "ops.admin"))),
+	)
+}
+
+func startOps(t *testing.T, ctx context.Context, opts ServerOptions) (*AsterServer, *NodeAddr) {
+	t.Helper()
+	opts.Services = []*Service{opsService()}
+	srv, err := StartServer(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	addr := addrOf(t, srv.Node())
+	return srv, &addr
+}
+
+func opsCall(ctx context.Context, cl *AsterClient, server *NodeAddr, method string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	rc, err := cl.Connect(cctx, server)
+	if err != nil {
+		return "", err
+	}
+	reply, err := Call[opsRequest, opsReply](cctx, rc, "Ops", method, &opsRequest{N: 1})
+	if err != nil {
+		return "", err
+	}
+	return reply.Roles, nil
+}
+
+func startClient(t *testing.T, ctx context.Context, cfg AsterConfig, opts ...ClientOption) *AsterClient {
+	t.Helper()
+	cl, err := StartClient(ctx, cfg, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cl.Close() })
+	return cl
 }
 
 func addrOf(t *testing.T, n *Node) NodeAddr {
@@ -119,271 +146,291 @@ func addrOf(t *testing.T, n *Node) NodeAddr {
 	}
 }
 
-func TestEnrollment_IssuerRenewalClaimsAndRevocation(t *testing.T) {
+// The roles in a client's credential are what Requires checks, with no
+// application code; a credential without the role is refused, and a node
+// with no credential cannot reach the service. A revocation the root
+// publishes refuses the next call and closes the connection.
+func TestEnrollment_CredentialRolesGateRequiresAndRootRevocationClosesTheConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	// No replicas: the server holds the fleet namespace and the root
+	// publishes into it, as `aster enroll revoke --peer <server>` does.
+	srv, server := startOps(t, ctx, ServerOptions{Config: serverCfg(t, t.TempDir())})
+	if srv.Enrollment() == nil || srv.Gate() != nil || srv.Issuer() != nil {
+		t.Fatal("an enrolled server has Enrollment, no gate and (unconfigured) no issuer")
+	}
+	if st, err := srv.Enrollment().Status(); err != nil || st.Side != "server" || st.TrustedRoot != enrollRoot.PublicKey() ||
+		st.FleetNamespace != enrollFleetN || st.Credential.Subject != enrollPub(2) {
+		t.Fatalf("server status %+v %v", st, err)
+	}
+
+	operator := startClient(t, ctx, enrolledCfg(5, credentialFor(t, 5, "ops.status, ops.logs")))
+	for _, method := range []string{"ping", "status", "logs"} {
+		if roles, err := opsCall(ctx, operator, server, method); err != nil || roles != "ops.logs,ops.status" {
+			t.Fatalf("operator %s: %q %v", method, roles, err)
+		}
+	}
+	if operator.IsRenewing() {
+		t.Fatal("a root-issued credential has no issuer to renew from")
+	}
+
+	ingest := startClient(t, ctx, enrolledCfg(6, credentialFor(t, 6, "ops.ingest")))
+	if roles, err := opsCall(ctx, ingest, server, "ping"); err != nil || roles != "ops.ingest" {
+		t.Fatalf("ingest ping: %q %v", roles, err)
+	}
+	for _, method := range []string{"status", "logs"} {
+		if _, err := opsCall(ctx, ingest, server, method); !errors.Is(err, ErrRpcPermissionDenied) {
+			t.Fatalf("ingest %s: want PERMISSION_DENIED, got %v", method, err)
+		}
+	}
+	// The server sees the verified claims (audit), and maps them itself.
+	if ev, err := srv.Enrollment().PeerClaims(enrollPub(6)); err != nil || ev.Attributes["aster.role"].Value != "ops.ingest" {
+		t.Fatalf("peer claims: %+v %v", ev, err)
+	}
+
+	// No enrollment at all: Gate 0 refuses the connection itself.
+	stranger := startClient(t, ctx, testCfg())
+	if _, err := opsCall(ctx, stranger, server, "ping"); err == nil {
+		t.Fatal("a node without a credential reached the service")
+	}
+
+	// The root enrolls with the server (a publication session) and delivers
+	// a revocation of the operator into the fleet namespace the server holds.
+	revoked := make(chan Revocation, 4)
+	go func() {
+		for {
+			rev, err := srv.Enrollment().NextRevocation(ctx)
+			if err != nil {
+				return
+			}
+			revoked <- rev
+		}
+	}()
+	root := startClient(t, ctx, enrolledCfg(1, credentialFor(t, 1, "")))
+	if _, err := root.Connect(ctx, server); err != nil {
+		t.Fatalf("root enrolls with the server: %v", err)
+	}
+	fleet, err := root.Node().Docs().ImportWriteNamespace(ctx, fleetSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fleet.Close()
+	if err := fleet.SetBytes(ctx, AuthorID(enrollRoot.PublicKey()), testroot.RegistrationKey(enrollPub(5)),
+		enrollRoot.Revocation(enrollPub(5), "decommissioned")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.StartSync(ctx, enrollPub(2)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rev := <-revoked:
+		if rev.Peer != enrollPub(5) || rev.Reason.Code != "node_revoked" || !rev.Reason.Definite {
+			t.Fatalf("revocation %+v", rev)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the server did not revoke the operator")
+	}
+	if _, err := opsCall(ctx, operator, server, "status"); err == nil {
+		t.Fatal("revoked: the next call must be refused")
+	}
+	if _, err := opsCall(ctx, operator, server, "ping"); err == nil {
+		t.Fatal("revoked: the connection must be closed")
+	}
+	if _, err := srv.Enrollment().PeerClaims(enrollPub(5)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("revoked peer claims: %v", err)
+	}
+	var admission *AdmissionError
+	if _, err := srv.Enrollment().CheckPeer(ctx, enrollPub(5)); !errors.As(err, &admission) || admission.Kind == AdmissionErrorOther {
+		t.Fatalf("revoked peer check: %v", err)
+	}
+	// Unaffected peers keep working.
+	if roles, err := opsCall(ctx, ingest, server, "ping"); err != nil || roles != "ops.ingest" {
+		t.Fatalf("ingest after the revocation: %q %v", roles, err)
+	}
+}
+
+// A server configured as a delegated issuer serves renewals; a client whose
+// credential that server signed renews automatically and stays admitted,
+// with its roles, across several short lifetimes. The server synchronizes
+// policy from a configured replica (the root).
+func TestEnrollment_ConfigDrivenIssuerRenewsClientCredentials(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	dir := t.TempDir()
-	root := testRoot{enrollKey(1)}
-	nsSecret := Key(bytes.Repeat([]byte{0x55}, 32))
-	fleet := hex.EncodeToString(ed25519.NewKeyFromSeed(nsSecret[:]).Public().(ed25519.PublicKey))
-	fast := 200 * time.Millisecond
 
-	// The root: an enrolled server holding the fleet namespace. Its root key
-	// comes from the node config (RootPubkey), not the EnrollmentConfig.
-	rootCfg := enrollCfg(1)
-	rootCfg.RootPubkey = root.key.Public().(ed25519.PublicKey)
-	rootSrv, err := StartServer(ctx, ServerOptions{Config: rootCfg, Enrollment: &EnrollmentConfig{
-		Audience: enrollFleet, FleetNamespace: fleet, StatePath: filepath.Join(dir, "root.json"),
-		Credential: root.credential(t, enrollPub(1)), Policy: PolicyTolerateStale(), ReconciliationInterval: fast,
-	}})
+	// The root as a policy replica: it holds the fleet namespace.
+	rootCfg := enrolledCfg(1, credentialFor(t, 1, ""))
+	rootCfg.Enrollment.StatePath = filepath.Join(dir, "root.json")
+	rootSrv, err := StartServer(ctx, ServerOptions{Config: rootCfg})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rootSrv.Close()
-	if rootSrv.Gate() != nil || rootSrv.Enrollment() == nil {
-		t.Fatal("an enrolled server has Enrollment instead of a gate")
-	}
-	fleetDoc, err := rootSrv.Node().Docs().ImportWriteNamespace(ctx, nsSecret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fleetDoc.Close()
-	ticket, err := fleetDoc.ShareWithAddr(ctx, DOC_SHARE_READ)
+	addrOf(t, rootSrv.Node())
+	rootTicket, err := rootSrv.Ticket(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// The issuer: enrolled by the root, synchronized, serving renewals. Its
-	// credential comes from the node config's EnrollmentCredentialFile.
-	issuerCfg := enrollCfg(2)
-	issuerCfg.EnrollmentCredentialFile = filepath.Join(dir, "issuer.chain")
-	if err := writeFile(issuerCfg.EnrollmentCredentialFile, root.credential(t, enrollPub(2))); err != nil {
-		t.Fatal(err)
-	}
-	policy := PolicyAnyOf(PolicyScope("build"), PolicyTolerateStale())
-	issuerSrv, err := StartServer(ctx, ServerOptions{
-		Config: issuerCfg,
-		Enrollment: &EnrollmentConfig{
-			Root: root.key.Public().(ed25519.PublicKey), Audience: enrollFleet, FleetNamespace: fleet,
-			StatePath: filepath.Join(dir, "issuer.json"), Policy: policy, ReconciliationInterval: fast,
-		},
-		EnrollmentIssuer: &IssuerConfig{Delegation: root.delegation(t, enrollPub(2)), Lifetime: 6 * time.Second},
-	})
+	delegation, err := enrollRoot.Delegation(enrollPub(2), []string{}, []string{"aster.role"}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer issuerSrv.Close()
-	enr := issuerSrv.Enrollment()
-	ready, _, err := enr.Connect(ctx, addrOf(t, rootSrv.Node()))
-	if err != nil {
+	cfg := serverCfg(t, dir)
+	cfg.Enrollment.Replicas = []string{rootTicket}
+	cfg.Enrollment.IssuerDelegationFile = filepath.Join(dir, "issuer.chain")
+	cfg.Enrollment.IssuerLifetimeSecs = 6
+	if err := os.WriteFile(cfg.Enrollment.IssuerDelegationFile, []byte(delegation+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if ready.Peer != enrollPub(1) || ready.Source != "chain" {
-		t.Fatalf("readiness %+v", ready)
+	srv, server := startOps(t, ctx, ServerOptions{Config: cfg})
+	issuer := srv.Issuer()
+	if issuer == nil {
+		t.Fatal("configured issuer missing")
 	}
-	if ns, err := enr.Synchronize(ctx, ready.Peer, ticket, 20*time.Second); err != nil || ns != fleet {
-		t.Fatalf("synchronize: %q %v", ns, err)
-	}
-	status, err := enr.Status()
-	if err != nil || status.TrustedRoot != enrollPub(1) || status.Credential.Subject != enrollPub(2) {
-		t.Fatalf("status %+v %v", status, err)
-	}
-	issuer := issuerSrv.EnrollmentIssuer()
 	if info, err := issuer.Info(); err != nil || info.PublicKey != enrollPub(2) {
 		t.Fatalf("issuer info %+v %v", info, err)
 	}
-
 	// Claims beyond the delegation are refused with a code.
 	_, err = issuer.Issue(enrollPub(7), EnrollmentClaims{Scopes: []string{"deploy"}, Tags: []string{}}, RegistrationEphemeral)
 	var refusal *IssuerRefusal
 	if !errors.As(err, &refusal) || refusal.Code != "invalid_credential" || !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("wider claims: %v", err)
 	}
-
-	// The orchestrator authenticated pod node 7 out of band: issue for it.
 	issued, err := issuer.Issue(enrollPub(7), EnrollmentClaims{
-		Scopes: []string{"build"}, Tags: []string{}, Attributes: map[string]Attribute{"pod": StringAttribute("p-1")},
+		Scopes: []string{}, Tags: []string{}, Attributes: map[string]Attribute{"aster.role": StringAttribute("ops.status")},
 	}, RegistrationEphemeral)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(issued.Chain, "aster-chain-v1~") || issued.ExpiresAt > uint64(time.Now().Unix())+6 {
-		t.Fatalf("issued %+v", issued)
-	}
 
-	revocations := make(chan Revocation, 1)
-	go func() {
-		if rev, err := enr.NextRevocation(ctx); err == nil {
-			revocations <- rev
+	client := startClient(t, ctx, enrolledCfg(7, issued.Chain))
+	if roles, err := opsCall(ctx, client, server, "status"); err != nil || roles != "ops.status" {
+		t.Fatalf("status: %q %v", roles, err)
+	}
+	if !client.IsRenewing() {
+		t.Fatal("the server signed the credential, so the client renews from it")
+	}
+	deadline := time.Now().Add(3*6*time.Second + 2*time.Second)
+	for time.Now().Before(deadline) {
+		if roles, err := opsCall(ctx, client, server, "status"); err != nil || roles != "ops.status" {
+			t.Fatalf("status across lifetimes: %q %v", roles, err)
 		}
-	}()
-
-	// Node 7 enrolls with the issuer on the issued credential.
-	pod, err := StartNode(ctx, enrollCfg(7), NodeOptions{Enrollment: &EnrollmentConfig{
-		Root: root.key.Public().(ed25519.PublicKey), Audience: enrollFleet, FleetNamespace: fleet,
-		StatePath: filepath.Join(dir, "pod.json"), Credential: issued.Chain, Policy: policy,
-	}})
-	if err != nil {
-		t.Fatal(err)
+		time.Sleep(500 * time.Millisecond)
 	}
-	defer pod.Close()
-	issuerAddr := addrOf(t, issuerSrv.Node())
-	if ready, _, err := pod.Enrollment().Connect(ctx, issuerAddr); err != nil || ready.Peer != enrollPub(2) {
-		t.Fatalf("pod connect: %+v %v", ready, err)
-	}
-
-	// The issuer reads the pod's verified claims and maps them to a role.
-	claims, err := enr.PeerClaims(enrollPub(7))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if claims.Subject != enrollPub(7) || claims.Root != enrollPub(1) || claims.Issuer != enrollPub(2) ||
-		claims.Source != "chain" || !claims.HasScope("build") || claims.Attributes["pod"].Value != "p-1" ||
-		claims.Registration != RegistrationEphemeral || claims.Registered() || claims.ExpiresAt == nil {
-		t.Fatalf("claims %+v", claims)
-	}
-	if err := issuerSrv.SetPeerAttributes(claims.Subject, map[string]string{"aster.role": "build"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := enr.PeerClaims(enrollPub(9)); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("unknown peer claims: %v", err)
-	}
-	if _, err := enr.CheckPeer(ctx, enrollPub(7)); err != nil {
-		t.Fatal(err)
-	}
-	if ev, err := enr.VerifyCredential(enrollPub(7), issued.Chain); err != nil || ev.CredentialID != issued.CredentialID {
-		t.Fatalf("verify: %+v %v", ev, err)
-	}
-	if _, err := enr.VerifyCredential(enrollPub(9), issued.Chain); !errors.Is(err, ErrVerificationFailed) {
-		t.Fatalf("verify for another subject: %v", err)
-	}
-
-	// Renewal keeps the pod on fresh credentials from the issuer.
-	renewal, err := pod.Enrollment().StartRenewal(RenewalConfig{Issuer: issuerAddr, Retry: fast})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The pod switches to the renewed credential first, then presents it to
-	// the issuer: wait for both.
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		st, err := pod.Enrollment().Status()
-		if err != nil {
-			t.Fatal(err)
-		}
-		seen, err := enr.PeerClaims(enrollPub(7))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if st.Credential.CredentialID != issued.CredentialID && seen.CredentialID == st.Credential.CredentialID {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("renewal did not move the pod and the issuer's session to a new credential: %+v", seen)
-		}
-		time.Sleep(fast)
-	}
-
-	// The root revokes the pod; the issuer revokes its session and reports it.
-	rootID := AuthorID(enrollPub(1))
-	if err := fleetDoc.SetBytes(ctx, rootID, "aster/enrollment/v1/nodes/"+enrollPub(7), root.revocation(enrollPub(7))); err != nil {
-		t.Fatal(err)
-	}
-	_ = fleetDoc.StartSync(ctx, enrollPub(2))
-	select {
-	case rev := <-revocations:
-		if rev.Peer != enrollPub(7) || rev.Reason.Code != "node_revoked" || !rev.Reason.Definite {
-			t.Fatalf("revocation %+v", rev)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("no revocation event")
-	}
-	var admission *AdmissionError
-	if _, err := enr.CheckPeer(ctx, enrollPub(7)); !errors.As(err, &admission) || admission.Kind != AdmissionErrorDenied ||
-		!errors.Is(err, ErrPermissionDenied) {
-		t.Fatalf("revoked peer check: %v", err)
-	}
-	if _, err := enr.PeerClaims(enrollPub(7)); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("revoked peer claims: %v", err)
-	}
-	outcome, err := renewal.Wait(ctx)
-	if err != nil || (outcome.Outcome != "refused" && outcome.Outcome != "expired") {
-		t.Fatalf("renewal outcome %+v %v", outcome, err)
-	}
-	if outcome.Outcome == "refused" && outcome.Refusal.Code != "subject_denied" {
-		t.Fatalf("refusal %+v", outcome.Refusal)
+	current, err := client.Enrollment().Credential()
+	if err != nil || current.CredentialID == issued.CredentialID {
+		t.Fatalf("the credential was not renewed: %+v %v", current, err)
 	}
 }
 
-func TestEnrollment_ConfigurationErrors(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// Builder overrides of the policy and role mapping (Rust enrollment_policy /
+// enrollment_roles) take precedence over the configuration.
+func TestEnrollment_RoleMappingOverride(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	dir := t.TempDir()
-	fleet := strings.Repeat("ab", 32)
-	base := EnrollmentConfig{Audience: enrollFleet, FleetNamespace: fleet, StatePath: filepath.Join(dir, "s.json"), Policy: PolicyTolerateStale()}
-
-	// No root anywhere: refused before the node starts.
-	if _, err := StartNode(ctx, enrollCfg(3), NodeOptions{Enrollment: &base}); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("no root: %v", err)
-	}
-	cfg := enrollCfg(3)
-	cfg.RootPubkeyFile = filepath.Join(dir, "missing.pub")
-	if _, err := StartNode(ctx, cfg, NodeOptions{Enrollment: &base}); err == nil {
-		t.Fatal("unreadable RootPubkeyFile accepted")
-	}
-	cfg.RootPubkeyFile = filepath.Join(dir, "root.json")
-	if err := writeFile(cfg.RootPubkeyFile, `{"public_key": "`+enrollPub(1)+`"}`); err != nil {
+	off := ""
+	_, server := startOps(t, ctx, ServerOptions{
+		Config: serverCfg(t, t.TempDir()),
+		// Scopes are roles; the aster.role attribute grants nothing.
+		EnrollmentRoles: &RoleMapping{Attribute: &off, ScopesAsRoles: true, Tags: map[string][]string{"oncall": {"ops.logs"}}},
+	})
+	claims := testroot.RoleClaims("ops.admin")
+	claims.Scopes, claims.Tags = []string{"ops.status"}, []string{"oncall"}
+	chain, err := enrollRoot.Credential(enrollPub(5), claims, time.Hour)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// A policy Rust rejects, and a Gate next to Enrollment.
-	bad := base
-	bad.Policy = PolicyAllOf()
-	if _, err := StartNode(ctx, cfg, NodeOptions{Enrollment: &bad}); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("empty all_of: %v", err)
+	cl := startClient(t, ctx, enrolledCfg(5, chain))
+	if roles, err := opsCall(ctx, cl, server, "status"); err != nil || roles != "ops.logs,ops.status" {
+		t.Fatalf("mapped roles: %q %v", roles, err)
 	}
+}
+
+// Misconfiguration stops the start with an error that names the problem;
+// nothing runs open.
+func TestEnrollment_MisconfigurationFailsClosed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	refused := func(name string, opts ServerOptions, expect string) {
+		t.Helper()
+		srv, err := StartServer(ctx, opts)
+		if err == nil {
+			_ = srv.Close()
+			t.Fatalf("%s: started", name)
+		}
+		if !strings.Contains(err.Error(), expect) {
+			t.Fatalf("%s: %q not in %v", name, expect, err)
+		}
+	}
+	good := func() AsterConfig { return serverCfg(t, dir) }
+
+	c := good()
+	c.Enrollment.Audience = ""
+	refused("no audience", ServerOptions{Config: c}, "audience is required")
+	c = good()
+	c.RootPubkey = nil
+	refused("no root", ServerOptions{Config: c}, "no trusted root")
+	c = good()
+	c.Enrollment.StatePath = ""
+	refused("no state", ServerOptions{Config: c}, "keeps denials durably")
+	c = good()
+	c.EnrollmentCredentialChain = ""
+	c.Enrollment.Enabled = ptrBool(true)
+	refused("no credential", ServerOptions{Config: c}, "no credential")
+	c = good()
+	c.EnrollmentCredentialChain = "/etc/aster/server.cred"
+	refused("a path where the chain belongs", ServerOptions{Config: c}, "ASTER_ENROLLMENT_CREDENTIAL)")
+	c = good()
+	c.EnrollmentCredentialChain = credentialFor(t, 3, "")
+	refused("a credential for another key", ServerOptions{Config: c}, "enrollment:")
+	c = good()
+	c.Enrollment.Policy = &Policy{"allow_everyone"}
+	refused("unknown policy", ServerOptions{Config: c}, "policy")
+	refused("policy override", ServerOptions{Config: good(), EnrollmentPolicy: PolicyAllOf()}, "policy")
+	c = good()
+	c.Enrollment.FleetNamespace = "not-hex"
+	refused("namespace", ServerOptions{Config: c}, "fleet_namespace")
+	c = enrolledCfg(2, credentialFor(t, 2, ""))
+	c.Enrollment = EnrollmentConfig{Enabled: ptrBool(true)}
+	refused("enabled alone", ServerOptions{Config: c}, "audience is required")
 	gate, err := NewGate(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer gate.Close()
-	if _, err := StartNode(ctx, cfg, NodeOptions{Enrollment: &base, Gate: gate}); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := StartServer(ctx, ServerOptions{Config: good(), Gate: gate}); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("gate and enrollment: %v", err)
 	}
-	if _, err := StartServer(ctx, ServerOptions{Config: cfg, EnrollmentIssuer: &IssuerConfig{}}); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("issuer without enrollment: %v", err)
-	}
 
-	// A pure verifier (root from RootPubkeyFile, no credential) installs, and
-	// the node refuses a gate afterwards.
-	n, err := StartNode(ctx, cfg, NodeOptions{Enrollment: &base})
+	// A client: no credential, and server-only issuer settings.
+	c = enrolledCfg(5, "")
+	if _, err := StartClient(ctx, c); err == nil || !strings.Contains(err.Error(), "no credential") {
+		t.Fatalf("client without a credential: %v", err)
+	}
+	c = enrolledCfg(5, credentialFor(t, 5, ""))
+	c.Enrollment.IssuerDelegationFile = filepath.Join(dir, "x")
+	if _, err := StartClient(ctx, c); err == nil || !strings.Contains(err.Error(), "server-only") {
+		t.Fatalf("client with an issuer: %v", err)
+	}
+	// Enrollment off (the root alone does not enable it): an open server.
+	open := testCfg()
+	open.RootPubkey = enrolledCfg(2, "").RootPubkey
+	if open.IsEnrollmentEnabled() {
+		t.Fatal("the root alone enabled enrollment")
+	}
+	srv, err := StartServer(ctx, ServerOptions{Config: open})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
-	st, err := n.Enrollment().Status()
-	if err != nil || st.Credential != nil || st.TrustedRoot != enrollPub(1) || st.FleetNamespace != fleet {
-		t.Fatalf("status %+v %v", st, err)
+	if srv.Enrollment() != nil {
+		t.Fatal("enrollment installed without being configured")
 	}
-	sameRuntime, err := NewGate(n.Runtime())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sameRuntime.Close()
-	if err := n.SetGate(sameRuntime); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("set gate after enrollment: %v", err)
-	}
-	// A delegation that does not name this node is refused.
-	other := testRoot{enrollKey(1)}
-	if _, err := n.Enrollment().NewIssuer(IssuerConfig{Delegation: other.delegation(t, enrollPub(2))}); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("foreign delegation: %v", err)
-	}
-	if err := n.Enrollment().Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := n.Enrollment().Status(); !errors.Is(err, ErrAlreadyClosed) {
-		t.Fatalf("closed enrollment: %v", err)
-	}
+	_ = srv.Close()
 }
+
+func ptrBool(v bool) *bool { return &v }
 
 func TestEnrollment_PolicyJSON(t *testing.T) {
 	p := PolicyAllOf(
@@ -407,5 +454,17 @@ func TestEnrollment_PolicyJSON(t *testing.T) {
 		`{"max_credential_age_secs":3600},"require_registration","tolerate_stale_policy"]}`
 	if string(got) != want {
 		t.Fatalf("policy JSON\n got %s\nwant %s", got, want)
+	}
+	// A policy read from configuration round-trips unchanged.
+	var back Policy
+	if err := json.Unmarshal(got, &back); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := json.Marshal(&back); string(again) != want {
+		t.Fatalf("round trip %s", again)
+	}
+	var none *Policy
+	if b, _ := json.Marshal(none); string(b) != "null" {
+		t.Fatalf("nil policy %s", b)
 	}
 }

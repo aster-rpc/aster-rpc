@@ -85,7 +85,14 @@ func WithIdempotent(idempotent bool) CallOption {
 type ClientOption func(*clientOptions)
 
 type clientOptions struct {
-	interceptors []Interceptor
+	interceptors     []Interceptor
+	enrollmentPolicy *Policy
+}
+
+// WithEnrollmentPolicy judges servers' enrollment evidence with p instead of
+// the configured Enrollment.Policy (Rust AsterClientBuilder::enrollment_policy).
+func WithEnrollmentPolicy(p *Policy) ClientOption {
+	return func(o *clientOptions) { o.enrollmentPolicy = p }
 }
 
 // WithClientInterceptors sets the interceptors applied to every call of the
@@ -106,32 +113,45 @@ func buildClientOptions(opts []ClientOption) *clientOptions {
 
 // AsterClient is an RPC client: a node, a codec and a cache of RpcConnections.
 //
-//	client, err := aster.StartClient(ctx, cfg)
+//	client, err := aster.StartClient(ctx, cfg) // cfg from ConfigFromEnv / ConfigFromTOML
 //	defer client.Close()
 //	conn, err := client.ConnectTicket(ctx, ticket)
 //	reply, err := aster.Call[EchoRequest, EchoReply](ctx, conn, "InteropEcho", "echo", &req)
 //
-// Calls go straight to aster/1 (open gate); consumer admission is not
-// performed.
+// With enrollment configured (cfg.IsEnrollmentEnabled) the client presents
+// its credential: before its first connection to a server it enrolls over
+// the reciprocal handshake (the server verifies this node, this node
+// verifies the server), synchronizes the fleet namespace the server offers,
+// and renews its credential from that server when the server signed it (or
+// from Enrollment.RenewFrom). Its roles on the server are the ones in its
+// credential (design §15.7).
 type AsterClient struct {
 	node         *Node
 	ownsNode     bool
 	codec        Codec
 	interceptors []Interceptor
+	enrollment   *Enrollment
 
 	mu       sync.Mutex
 	conns    map[string]*RpcConnection
 	services map[string]*Service
 }
 
-// StartClient starts a client node (adds aster/1 to cfg.ALPNs).
+// StartClient starts a client node from cfg (adding aster/1 to its ALPNs)
+// and, when cfg enables enrollment, installs Enrollment from it: a missing
+// or malformed setting fails here, naming the setting (a credential is
+// required; issuer settings are refused).
 func StartClient(ctx context.Context, cfg AsterConfig, opts ...ClientOption) (*AsterClient, error) {
-	node, err := StartNode(ctx, cfg, NodeOptions{ExtraALPNs: []string{AsterALPN}})
+	if p := buildClientOptions(opts).enrollmentPolicy; p != nil {
+		cfg.Enrollment.Policy = p
+	}
+	node, err := startNode(ctx, cfg, NodeOptions{ExtraALPNs: []string{AsterALPN}}, enrollmentSideClient)
 	if err != nil {
 		return nil, err
 	}
 	c := newClient(node, NewForyCodec(), opts)
 	c.ownsNode = true
+	c.enrollment = node.Enrollment()
 	return c, nil
 }
 
@@ -154,6 +174,24 @@ func NewClient(node *Node, codec Codec, opts ...ClientOption) *AsterClient {
 // Node is the client's node.
 func (c *AsterClient) Node() *Node { return c.node }
 
+// ID is this client's node id (64 hex): the identity servers see, and the
+// holder for leases acquired through a grantor.
+func (c *AsterClient) ID() (string, error) { return c.node.NodeID() }
+
+// Enrollment is the Enrollment installed from the config (nil when
+// enrollment is off).
+func (c *AsterClient) Enrollment() *Enrollment { return c.enrollment }
+
+// IsRenewing reports whether this client renews its credential (Rust
+// AsterClient::is_renewing).
+func (c *AsterClient) IsRenewing() bool {
+	if c.enrollment == nil {
+		return false
+	}
+	st, err := c.enrollment.Status()
+	return err == nil && st.Renewing
+}
+
 // Codec is the client's payload codec.
 func (c *AsterClient) Codec() Codec { return c.codec }
 
@@ -171,14 +209,24 @@ func (c *AsterClient) RegisterService(svc *Service) error {
 	return nil
 }
 
-// Connect returns a (cached) RPC connection to addr.
+// Connect returns a (cached) RPC connection to addr, enrolling with it first
+// when enrollment is configured. Drop a connection the server closed with
+// Reconnect.
 func (c *AsterClient) Connect(ctx context.Context, addr *NodeAddr) (*RpcConnection, error) {
+	if addr == nil {
+		return nil, fmt.Errorf("connect: nil address: %w", ErrInvalidArgument)
+	}
 	c.mu.Lock()
 	if rc, ok := c.conns[addr.EndpointID]; ok {
 		c.mu.Unlock()
 		return rc, nil
 	}
 	c.mu.Unlock()
+	if c.enrollment != nil {
+		if err := c.enrollment.enroll(ctx, addr); err != nil {
+			return nil, fmt.Errorf("enroll with %s: %w", addr.EndpointID, err)
+		}
+	}
 	conn, err := c.node.Connect(ctx, addr, AsterALPN)
 	if err != nil {
 		return nil, err
@@ -192,6 +240,19 @@ func (c *AsterClient) Connect(ctx context.Context, addr *NodeAddr) (*RpcConnecti
 	}
 	c.conns[addr.EndpointID] = rc
 	return rc, nil
+}
+
+// Reconnect drops the cached connection to addr and opens a new one (Rust
+// AsterClient::reconnect).
+func (c *AsterClient) Reconnect(ctx context.Context, addr *NodeAddr) (*RpcConnection, error) {
+	c.mu.Lock()
+	rc, ok := c.conns[addr.EndpointID]
+	delete(c.conns, addr.EndpointID)
+	c.mu.Unlock()
+	if ok {
+		_ = rc.Close()
+	}
+	return c.Connect(ctx, addr)
 }
 
 // ConnectTicket connects to the peer named by an aster1 ticket.

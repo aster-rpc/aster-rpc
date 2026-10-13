@@ -60,7 +60,7 @@ const (
 
 // ─── ServiceSummary (§3.2.2) ────────────────────────────────────────────────
 
-// ServiceSummary is the compact descriptor returned in ConsumerAdmissionResponse.
+// ServiceSummary is the compact descriptor of a published service.
 type ServiceSummary struct {
 	Name               string            `json:"name"`
 	Version            int32             `json:"version"`

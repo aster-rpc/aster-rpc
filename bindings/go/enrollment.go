@@ -14,19 +14,22 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
 )
 
-// Enrollment (C ABI 5.1): admission on delegation chains, for enrolled nodes
-// and delegated issuers. Root operations (namespace create/bind, promote,
-// revoke, reauthorize, rotate, delegate) stay in the Rust CLI. Design:
-// docs/_internal/working_ideas/aster-enrollment.md.
+// Enrollment (C ABI 5.1), driven by AsterConfig exactly as the Rust
+// AsterServer / AsterClient are (design
+// docs/_internal/working_ideas/aster-enrollment.md §15): StartServer with a
+// config that enables enrollment admits only nodes holding a credential from
+// the configured root and turns each peer's verified claims into the roles
+// Requires checks, per call; StartClient presents its credential, enrolls
+// with each server it connects to, and renews. Root operations (namespace
+// create/bind, promote, revoke, reauthorize, rotate, delegate) stay in the
+// aster CLI.
 
 // EnrollmentALPN is the ALPN of the reciprocal enrollment handshake.
 const EnrollmentALPN = "aster.enrollment/1"
@@ -34,62 +37,201 @@ const EnrollmentALPN = "aster.enrollment/1"
 // ASTER_EVENT_ENROLLMENT_RESULT completes an Enrollment operation (JSON payload).
 const ASTER_EVENT_ENROLLMENT_RESULT = C.ASTER_EVENT_ENROLLMENT_RESULT
 
-// EnrollmentConfig installs Enrollment on a node (NodeOptions.Enrollment,
-// ServerOptions.Enrollment). Enrollment then decides the node's admission
-// (Gate 0): only peers that complete the enrollment handshake under Policy
-// reach its other ALPNs. Admission never grants operation access; map a
-// peer's verified claims (Enrollment.PeerClaims) to roles for that.
+const (
+	enrollmentSideServer = C.ASTER_ENROLLMENT_SIDE_SERVER
+	enrollmentSideClient = C.ASTER_ENROLLMENT_SIDE_CLIENT
+)
+
+// EnrollmentConfig is the [enrollment] section (Rust aster::EnrollmentConfig;
+// env ASTER_ENROLLMENT_*). The root and this node's credential live in
+// AsterConfig's trust fields. Once enabled every value is validated when the
+// server or client starts, and any error stops the start: enrollment never
+// degrades to an open node.
 type EnrollmentConfig struct {
-	// Root is the trusted root public key (32 bytes). Empty: the node
-	// config's RootPubkey / RootPubkeyFile.
-	Root []byte
-	// Audience is the fleet audience credentials must carry.
-	Audience string
-	// FleetNamespace is the fleet policy namespace id (64 hex) pinned to Root.
-	FleetNamespace string
-	// StatePath is the durable policy state file (denials and revision
-	// watermarks survive restarts). Required.
-	StatePath string
-	// Credential is this node's credential chain (aster-chain-v1~...). Empty:
-	// the contents of the node config's EnrollmentCredentialFile, if set;
-	// otherwise none (a pure verifier).
-	Credential string
-	// Policy is the admission policy (required): compose the predicates
-	// below, e.g. PolicyAllOf(PolicyScope("session"), PolicyTolerateStale()).
-	Policy *Policy
-	// Rotation accepts root rotations continuing the pinned root.
-	Rotation *RotationPin
-	// AppliedRotations are rotation statements that produced Root, oldest first.
-	AppliedRotations []string
-	// RequireSynchronizedClock refuses to install while the kernel reports
-	// the clock unsynchronized (Linux).
-	RequireSynchronizedClock bool
-	// ActivationLeeway tolerates an issuer clock this far ahead (0 = 60 s).
-	ActivationLeeway time.Duration
-	// Optional bounds (0 = the Rust defaults).
-	HandshakeTimeout       time.Duration
-	StepTimeout            time.Duration
-	PolicyTimeout          time.Duration
-	ReconciliationInterval time.Duration
-	MaxAdmittedPeers       int
+	// Enabled forces enrollment on or off; nil enables it exactly when
+	// Audience, FleetNamespace, IssuerDelegationFile or a credential is set.
+	// TOML enabled; env ASTER_ENROLLMENT_ENABLED.
+	Enabled *bool `json:"enabled"`
+	// Audience is the fleet audience credentials must name. Required.
+	// TOML audience; env ASTER_ENROLLMENT_AUDIENCE.
+	Audience string `json:"audience,omitempty"`
+	// FleetNamespace is the fleet policy namespace (64 hex, aster enroll
+	// namespace create). Required. TOML fleet_namespace; env
+	// ASTER_ENROLLMENT_FLEET_NAMESPACE.
+	FleetNamespace string `json:"fleet_namespace,omitempty"`
+	// StatePath keeps denials and watermarks durably. Default
+	// <StoragePath>/enrollment.json; a server with neither refuses to
+	// start, a client uses a temporary directory. TOML state_path; env
+	// ASTER_ENROLLMENT_STATE_PATH.
+	StatePath string `json:"state_path,omitempty"`
+	// Replicas are policy replicas (aster1 tickets or 64-hex node ids) a
+	// server enrolls with and synchronizes the fleet namespace from at
+	// start. Empty: the server holds the fleet namespace and the root
+	// publishes into it (aster enroll ... --peer <server>). TOML replicas;
+	// env ASTER_ENROLLMENT_REPLICAS (comma-separated).
+	Replicas []string `json:"replicas"`
+	// Policy is the admission policy; nil = PolicyTolerateStale(): any
+	// valid credential from the root for the audience, minus every known
+	// revocation. TOML policy (inline table or string); env
+	// ASTER_ENROLLMENT_POLICY (JSON).
+	Policy *Policy `json:"policy"`
+	// RequireSynchronizedClock refuses to start on an unsynchronized clock
+	// (Linux). TOML require_synchronized_clock.
+	RequireSynchronizedClock bool `json:"require_synchronized_clock"`
+	// ActivationLeewaySecs is the iat/nbf leeway, 0-300; nil = 60. TOML
+	// activation_leeway_secs.
+	ActivationLeewaySecs *uint64 `json:"activation_leeway_secs"`
+	// Limits overrides Enrollment's limits ([enrollment.limits]).
+	Limits EnrollmentLimits `json:"limits"`
+	// Roles maps verified claims to Gate-3 roles ([enrollment.roles]).
+	Roles RoleMapping `json:"roles"`
+	// IssuerDelegationFile makes a server a delegated issuer serving
+	// aster.enrollment.IssuerV1 (aster enroll delegate --out). A client
+	// with it set is refused. TOML [enrollment.issuer] delegation_file; env
+	// ASTER_ENROLLMENT_ISSUER_DELEGATION_FILE.
+	IssuerDelegationFile string `json:"issuer_delegation_file,omitempty"`
+	// IssuerLifetimeSecs is the lifetime of issued credentials, shortened
+	// to the delegation; 0 = 24 h. TOML [enrollment.issuer] lifetime
+	// (seconds or "24h"); env ASTER_ENROLLMENT_ISSUER_LIFETIME.
+	IssuerLifetimeSecs uint64 `json:"issuer_lifetime_secs,omitempty"`
+	// RenewFrom is the issuer this node renews from (ticket or node id).
+	// TOML renew_from; env ASTER_ENROLLMENT_RENEW_FROM.
+	RenewFrom string `json:"renew_from,omitempty"`
+	// Renew = false disables renewal; nil renews from RenewFrom, or a
+	// client from the server that signed its credential. TOML renew.
+	Renew *bool `json:"renew"`
+	// Synchronize (client; nil = true) synchronizes the fleet namespace the
+	// server offers, so the client learns revocations of the server too.
+	Synchronize *bool `json:"synchronize"`
 }
 
-// RotationPin is the commitment to the next root key, pinned beside Root.
-type RotationPin struct {
-	NextCommitment string `json:"next_commitment"` // 64 hex
-	Seq            uint64 `json:"seq"`
+// EnrollmentLimits are [enrollment.limits] overrides; 0 keeps the default.
+// Env ASTER_ENROLLMENT_<FIELD> (e.g. ASTER_ENROLLMENT_HANDSHAKE_TIMEOUT_MS).
+type EnrollmentLimits struct {
+	HandshakeTimeoutMs       uint64 `json:"handshake_timeout_ms,omitempty"`
+	StepTimeoutMs            uint64 `json:"step_timeout_ms,omitempty"`
+	PolicyTimeoutMs          uint64 `json:"policy_timeout_ms,omitempty"`
+	ReconciliationIntervalMs uint64 `json:"reconciliation_interval_ms,omitempty"`
+	MaxAdmittedPeers         uint64 `json:"max_admitted_peers,omitempty"`
+	// SyncTimeoutMs bounds enrolling with and synchronizing from a replica
+	// or server (default 15000).
+	SyncTimeoutMs uint64 `json:"sync_timeout_ms,omitempty"`
 }
 
-// Policy is a declarative admission policy, evaluated in Rust
-// (PolicyExpressionV1). Build one with the Policy* constructors.
+// RoleMapping turns a peer's verified claims into the attributes Gate 3
+// checks Requires against ([enrollment.roles]; Rust RoleMapping). Roles =
+// the comma-separated values of the string claim attribute Attribute,
+// plus every verified scope when ScopesAsRoles, plus the roles Scopes and
+// Tags map each verified scope or tag to; joined, sorted, into aster.role.
+// It is evaluated per call from the peer's live session: a revocation,
+// promotion or renewal applies on the next call.
+type RoleMapping struct {
+	// Attribute is the claim attribute listing roles; nil = "aster.role",
+	// "" disables it. TOML attribute; env ASTER_ENROLLMENT_ROLE_ATTRIBUTE.
+	Attribute *string `json:"attribute"`
+	// ScopesAsRoles makes every verified scope a role.
+	ScopesAsRoles bool `json:"scopes_as_roles"`
+	// Scopes and Tags map a verified scope or tag to roles.
+	Scopes map[string][]string `json:"scopes,omitempty"`
+	Tags   map[string][]string `json:"tags,omitempty"`
+	// IncludeAttributes passes the other claim attributes to handlers as
+	// strings (CallInfo.Attributes); nil = true.
+	IncludeAttributes *bool `json:"include_attributes"`
+}
+
+// IsEnrollmentEnabled reports whether StartServer / StartClient install
+// Enrollment from this config: Enrollment.Enabled when set, else whether an
+// audience, fleet namespace, issuer delegation or credential is configured.
+// The root alone does not enable it. (Rust AsterConfig::is_enrollment_enabled.)
+func (c *AsterConfig) IsEnrollmentEnabled() bool {
+	if c.Enrollment.Enabled != nil {
+		return *c.Enrollment.Enabled
+	}
+	e := &c.Enrollment
+	return strings.TrimSpace(e.Audience) != "" || strings.TrimSpace(e.FleetNamespace) != "" ||
+		strings.TrimSpace(e.IssuerDelegationFile) != "" || strings.TrimSpace(c.EnrollmentCredentialFile) != "" ||
+		strings.TrimSpace(c.EnrollmentCredentialChain) != ""
+}
+
+// trustJSON is the [trust] + [enrollment] JSON of the C ABI
+// (aster_config_enrollment_from_*, aster_node_start_enrolled).
+type trustJSON struct {
+	RootPubkey                string           `json:"root_pubkey,omitempty"`
+	RootPubkeyFile            string           `json:"root_pubkey_file,omitempty"`
+	NextRootCommitment        string           `json:"next_root_commitment,omitempty"`
+	RootSeq                   uint64           `json:"root_seq"`
+	RootRotations             []string         `json:"root_rotations"`
+	EnrollmentCredentialFile  string           `json:"enrollment_credential_file,omitempty"`
+	EnrollmentCredentialChain string           `json:"enrollment_credential_chain,omitempty"`
+	Enrollment                EnrollmentConfig `json:"enrollment"`
+}
+
+func (c *AsterConfig) trustJSON() ([]byte, error) {
+	t := trustJSON{
+		RootPubkeyFile:            c.RootPubkeyFile,
+		NextRootCommitment:        c.NextRootCommitment,
+		RootSeq:                   c.RootSeq,
+		RootRotations:             append([]string{}, c.RootRotations...),
+		EnrollmentCredentialFile:  c.EnrollmentCredentialFile,
+		EnrollmentCredentialChain: c.EnrollmentCredentialChain,
+		Enrollment:                c.Enrollment,
+	}
+	if len(c.RootPubkey) > 0 {
+		if len(c.RootPubkey) != 32 {
+			return nil, fmt.Errorf("RootPubkey: %d bytes, want 32: %w", len(c.RootPubkey), ErrInvalidArgument)
+		}
+		t.RootPubkey = hex.EncodeToString(c.RootPubkey)
+	}
+	if t.Enrollment.Replicas == nil {
+		t.Enrollment.Replicas = []string{}
+	}
+	return json.Marshal(t)
+}
+
+// applyTrustJSON takes the owned JSON Rust resolved and sets the trust and
+// enrollment fields from it.
+func (c *AsterConfig) applyTrustJSON(b C.aster_bytes_t) error {
+	var t trustJSON
+	if err := takeJSON(b, &t); err != nil {
+		return fmt.Errorf("enrollment config: %w", err)
+	}
+	c.RootPubkey = nil
+	if t.RootPubkey != "" {
+		key, err := hex.DecodeString(t.RootPubkey)
+		if err != nil || len(key) != 32 {
+			return fmt.Errorf("root_pubkey: want 64 hex characters: %w", ErrInvalidArgument)
+		}
+		c.RootPubkey = key
+	}
+	c.RootPubkeyFile = t.RootPubkeyFile
+	c.NextRootCommitment = t.NextRootCommitment
+	c.RootSeq = t.RootSeq
+	c.RootRotations = t.RootRotations
+	c.EnrollmentCredentialFile = t.EnrollmentCredentialFile
+	c.EnrollmentCredentialChain = t.EnrollmentCredentialChain
+	c.Enrollment = t.Enrollment
+	return nil
+}
+
+// ─── Policy ───────────────────────────────────────────────────────────────
+
+// Policy is a declarative admission policy, evaluated in Rust (PolicyConfig
+// / PolicyExpressionV1). Build one with the Policy* constructors, or set it
+// in TOML ([enrollment] policy) or ASTER_ENROLLMENT_POLICY.
 type Policy struct{ v any }
 
-// MarshalJSON encodes the policy as the C ABI's policy JSON.
+// MarshalJSON encodes the policy as the PolicyConfig JSON.
 func (p *Policy) MarshalJSON() ([]byte, error) {
-	if p == nil {
-		return nil, fmt.Errorf("nil policy: %w", ErrInvalidArgument)
+	if p == nil || p.v == nil {
+		return []byte("null"), nil
 	}
 	return json.Marshal(p.v)
+}
+
+// UnmarshalJSON keeps a PolicyConfig JSON tree as is (Rust validates it).
+func (p *Policy) UnmarshalJSON(data []byte) error {
+	p.v = json.RawMessage(append([]byte(nil), data...))
+	return nil
 }
 
 func policyList(ps []*Policy) []any {
@@ -131,7 +273,7 @@ func PolicyAttributeEquals(key string, value Attribute) *Policy {
 }
 
 // PolicyTolerateStale explicitly accepts cached/offline policy (known
-// revocations still deny).
+// revocations still deny). The default policy.
 func PolicyTolerateStale() *Policy { return &Policy{"tolerate_stale_policy"} }
 
 // PolicySynchronizedWithin requires a policy synchronization at most maxAge
@@ -152,6 +294,8 @@ func PolicyIssuedBy(key string) *Policy { return &Policy{map[string]any{"issued_
 func PolicyMaxCredentialAge(maxAge time.Duration) *Policy {
 	return &Policy{map[string]any{"max_credential_age_secs": uint64(maxAge / time.Second)}}
 }
+
+// ─── Claims and evidence ──────────────────────────────────────────────────
 
 // Attribute is a typed claim value: Type is "bool", "int", "float" or "string".
 type Attribute struct {
@@ -250,8 +394,8 @@ type DenialReason struct {
 }
 
 // Revocation reports a formerly admitted peer revoked by a definite denial;
-// its connections are already closed. Lagged > 0 instead means that many
-// revocations were missed: recheck every peer relied on.
+// its connections are already closed and its roles are gone from the next
+// call. Lagged > 0 instead means that many revocations were missed.
 type Revocation struct {
 	Peer   string       `json:"peer"`
 	Reason DenialReason `json:"reason"`
@@ -260,22 +404,21 @@ type Revocation struct {
 
 // EnrollmentStatus is this node's Enrollment state.
 type EnrollmentStatus struct {
+	Side           string        `json:"side"` // "server" or "client"
 	TrustedRoot    string        `json:"trusted_root"`
 	FleetNamespace string        `json:"fleet_namespace"`
 	Audience       string        `json:"audience"`
-	Credential     *PeerEvidence `json:"credential"`
+	Credential     *PeerEvidence `json:"credential"` // follows renewals
 	RootState      *struct {
 		Root           string `json:"root"`
 		NextCommitment string `json:"next_commitment"`
 		Seq            uint64 `json:"seq"`
 	} `json:"root_state"`
 	RootRotations []string `json:"root_rotations"`
-}
-
-// UnreachedPeer is a peer a replaced credential could not be presented to.
-type UnreachedPeer struct {
-	Peer  string `json:"peer"`
-	Error string `json:"error"`
+	// Renewing reports whether this node renews its credential.
+	Renewing bool `json:"renewing"`
+	// Issuer is the configured delegated issuer's key ("" when none).
+	Issuer string `json:"issuer"`
 }
 
 // AdmissionErrorKind classifies an AdmissionError (aster_enrollment_error_t).
@@ -300,16 +443,25 @@ type AdmissionError struct {
 func (e *AdmissionError) Error() string { return e.Message }
 func (e *AdmissionError) Unwrap() error { return e.err }
 
-// Enrollment is Enrollment installed on a node. The node owns it: Node.Close
-// releases it (and its issuers and renewals).
+// ─── Enrollment ───────────────────────────────────────────────────────────
+
+// Enrollment is the Enrollment a server or client installed from its
+// config (AsterServer.Enrollment, AsterClient.Enrollment; Rust
+// aster::enrollment::Enrollment). Nothing here is needed for roles or
+// revocation, which apply automatically; these are escape hatches for
+// audit, diagnostics and checks before a sensitive operation. The node owns
+// it: closing the server or client releases it.
 type Enrollment struct {
-	node     *Node
-	rt       *Runtime
-	handle   uint64
-	mu       sync.Mutex
-	closed   bool
-	issuers  []*EnrollmentIssuer
-	renewals []*Renewal
+	rt     *Runtime
+	handle uint64
+	mu     sync.Mutex
+	closed bool
+	// enrolled: servers a client has enrolled with (node id → done).
+	enrolled map[string]bool
+}
+
+func newEnrollment(rt *Runtime, handle uint64) *Enrollment {
+	return &Enrollment{rt: rt, handle: handle, enrolled: map[string]bool{}}
 }
 
 func (e *Enrollment) live() (uint64, error) {
@@ -321,90 +473,9 @@ func (e *Enrollment) live() (uint64, error) {
 	return e.handle, nil
 }
 
-// installConfigJSON resolves defaults from the node config and encodes the
-// C ABI install configuration.
-func (c *EnrollmentConfig) installJSON(node AsterConfig) ([]byte, error) {
-	root := c.Root
-	if len(root) == 0 {
-		var err error
-		if root, err = node.RootKey(); err != nil {
-			return nil, fmt.Errorf("enrollment root: %w", err)
-		}
-	}
-	if len(root) != 32 {
-		return nil, fmt.Errorf("enrollment root: set EnrollmentConfig.Root or the node's RootPubkey / RootPubkeyFile: %w", ErrInvalidArgument)
-	}
-	credential := strings.TrimSpace(c.Credential)
-	if credential == "" && node.EnrollmentCredentialFile != "" {
-		data, err := os.ReadFile(node.EnrollmentCredentialFile)
-		if err != nil {
-			return nil, fmt.Errorf("enrollment credential: %w", err)
-		}
-		credential = strings.TrimSpace(string(data))
-	}
-	if c.Policy == nil {
-		return nil, fmt.Errorf("enrollment policy: required: %w", ErrInvalidArgument)
-	}
-	ms := func(d time.Duration) any {
-		if d <= 0 {
-			return nil
-		}
-		return uint64(max(d.Milliseconds(), 1))
-	}
-	limits := map[string]any{}
-	for k, v := range map[string]any{
-		"handshake_timeout_ms":       ms(c.HandshakeTimeout),
-		"step_timeout_ms":            ms(c.StepTimeout),
-		"policy_timeout_ms":          ms(c.PolicyTimeout),
-		"reconciliation_interval_ms": ms(c.ReconciliationInterval),
-	} {
-		if v != nil {
-			limits[k] = v
-		}
-	}
-	if c.MaxAdmittedPeers > 0 {
-		limits["max_admitted_peers"] = c.MaxAdmittedPeers
-	}
-	cfg := map[string]any{
-		"root":                       hex.EncodeToString(root),
-		"audience":                   c.Audience,
-		"fleet_namespace":            c.FleetNamespace,
-		"state_path":                 c.StatePath,
-		"policy":                     c.Policy,
-		"applied_rotations":          append([]string{}, c.AppliedRotations...),
-		"require_synchronized_clock": c.RequireSynchronizedClock,
-		"limits":                     limits,
-	}
-	if credential != "" {
-		cfg["credential"] = credential
-	}
-	if c.Rotation != nil {
-		cfg["rotation"] = c.Rotation
-	}
-	if c.ActivationLeeway > 0 {
-		cfg["activation_leeway_secs"] = uint64(c.ActivationLeeway / time.Second)
-	}
-	return json.Marshal(cfg)
-}
-
-// installEnrollment installs Enrollment on a node started for it.
-func installEnrollment(n *Node, cfg *EnrollmentConfig, nodeCfg AsterConfig) (*Enrollment, error) {
-	body, err := cfg.installJSON(nodeCfg)
-	if err != nil {
-		return nil, err
-	}
-	var a cArena
-	defer a.free()
-	var h C.aster_enrollment_t
-	if err := wrapStatus("aster_enrollment_install", C.aster_enrollment_install(
-		C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), a.bytes(body), &h)); err != nil {
-		return nil, err
-	}
-	return &Enrollment{node: n, rt: n.runtime, handle: uint64(h)}, nil
-}
-
-// Close releases the enrollment with its issuers and renewals. The node then
-// rejects ordinary inbound connections (fail closed); Node.Close calls it.
+// Close releases the enrollment early (closing the node does it too):
+// pending NextRevocation calls end with ErrAlreadyClosed and a client stops
+// renewing.
 func (e *Enrollment) Close() error {
 	e.mu.Lock()
 	if e.closed {
@@ -412,18 +483,8 @@ func (e *Enrollment) Close() error {
 		return nil
 	}
 	e.closed = true
-	issuers, renewals := e.issuers, e.renewals
-	e.issuers, e.renewals = nil, nil
 	e.mu.Unlock()
-	var errs []error
-	for _, r := range renewals {
-		errs = append(errs, r.Close())
-	}
-	for _, i := range issuers {
-		errs = append(errs, i.Close())
-	}
-	errs = append(errs, statusError(C.aster_enrollment_free(C.uint64_t(e.rt.handle), C.aster_enrollment_t(e.handle))))
-	return errors.Join(errs...)
+	return statusError(C.aster_enrollment_free(C.uint64_t(e.rt.handle), C.aster_enrollment_t(e.handle)))
 }
 
 // result runs an async Enrollment operation and decodes its JSON result.
@@ -437,23 +498,19 @@ func (e *Enrollment) result(ctx context.Context, what string, out any,
 	if err := wrapStatus(what, call(C.aster_enrollment_t(h), &op)); err != nil {
 		return err
 	}
-	return awaitEnrollmentResult(ctx, e.rt, uint64(op), what, out)
-}
-
-func awaitEnrollmentResult(ctx context.Context, rt *Runtime, op uint64, what string, out any) error {
-	ev, err := rt.await(ctx, op)
+	ev, err := e.rt.await(ctx, uint64(op))
 	if err != nil {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	if ev.Kind != ASTER_EVENT_ENROLLMENT_RESULT {
 		kind := AdmissionErrorKind(ev.Flags)
-		cause := rt.eventError(ev, what)
+		cause := e.rt.eventError(ev, what)
 		if kind != AdmissionErrorOther {
 			return &AdmissionError{Kind: kind, Message: cause.Error(), err: cause}
 		}
 		return cause
 	}
-	payload := rt.takePayload(ev)
+	payload := e.rt.takePayload(ev)
 	if out == nil {
 		return nil
 	}
@@ -469,60 +526,33 @@ type addrJSON struct {
 	DirectAddresses []string `json:"direct_addresses"`
 }
 
-func toAddrJSON(a NodeAddr) addrJSON {
-	return addrJSON{NodeID: a.EndpointID, RelayURL: a.RelayURL, DirectAddresses: append([]string{}, a.DirectAddresses...)}
-}
-
-// Connect enrolls reciprocally with the first of replicas (tried in order, at
-// most 16) that completes the handshake. It returns the replica's readiness
-// and, when the replica offers one, a read ticket for the fleet namespace
-// (pass both to Synchronize).
-func (e *Enrollment) Connect(ctx context.Context, replicas ...NodeAddr) (Readiness, string, error) {
-	addrs := make([]addrJSON, len(replicas))
-	for i, r := range replicas {
-		addrs[i] = toAddrJSON(r)
+// enroll runs the client sequence against server once (design §15.7):
+// reciprocal handshake, fleet namespace sync, renewal when the server signed
+// this node's credential (or RenewFrom is set).
+func (e *Enrollment) enroll(ctx context.Context, server *NodeAddr) error {
+	e.mu.Lock()
+	done := e.enrolled[server.EndpointID]
+	e.mu.Unlock()
+	if done {
+		return nil
 	}
-	body, err := json.Marshal(addrs)
+	body, err := json.Marshal(addrJSON{NodeID: server.EndpointID, RelayURL: server.RelayURL,
+		DirectAddresses: append([]string{}, server.DirectAddresses...)})
 	if err != nil {
-		return Readiness{}, "", err
-	}
-	var out struct {
-		Readiness    Readiness `json:"readiness"`
-		PolicyTicket *string   `json:"policy_ticket"`
+		return err
 	}
 	var a cArena
 	defer a.free()
-	err = e.result(ctx, "aster_enrollment_connect", &out, func(h C.aster_enrollment_t, op *C.aster_operation_t) C.int32_t {
-		return C.aster_enrollment_connect(C.uint64_t(e.rt.handle), h, a.bytes(body), 0, op)
+	err = e.result(ctx, "aster_enrollment_enroll", nil, func(h C.aster_enrollment_t, op *C.aster_operation_t) C.int32_t {
+		return C.aster_enrollment_enroll(C.uint64_t(e.rt.handle), h, a.bytes(body), 0, op)
 	})
 	if err != nil {
-		return Readiness{}, "", err
+		return err
 	}
-	ticket := ""
-	if out.PolicyTicket != nil {
-		ticket = *out.PolicyTicket
-	}
-	return out.Readiness, ticket, nil
-}
-
-// Synchronize syncs the fleet policy namespace from an admitted peer with a
-// read-only ticket (Connect's, or one provisioned out of band), then every
-// bound namespace the peer offered, waiting up to timeout (0 = 15 s). It
-// returns the fleet namespace id.
-func (e *Enrollment) Synchronize(ctx context.Context, peer, ticket string, timeout time.Duration) (string, error) {
-	var out struct {
-		Namespace string `json:"namespace"`
-	}
-	var a cArena
-	defer a.free()
-	ms := uint64(0)
-	if timeout > 0 {
-		ms = uint64(max(timeout.Milliseconds(), 1))
-	}
-	err := e.result(ctx, "aster_enrollment_synchronize", &out, func(h C.aster_enrollment_t, op *C.aster_operation_t) C.int32_t {
-		return C.aster_enrollment_synchronize(C.uint64_t(e.rt.handle), h, a.str(peer), a.str(ticket), C.uint64_t(ms), 0, op)
-	})
-	return out.Namespace, err
+	e.mu.Lock()
+	e.enrolled[server.EndpointID] = true
+	e.mu.Unlock()
+	return nil
 }
 
 // CheckPeer re-evaluates an admitted peer against current policy (call it
@@ -548,10 +578,10 @@ func takeJSON(b C.aster_bytes_t, out any) error {
 	return json.Unmarshal(data, out)
 }
 
-// PeerClaims returns the verified evidence peer's admission session rests on
-// (subject, issuer path, scopes, tags, attributes, validity), to map to RPC
-// roles (AsterServer.SetPeerAttributes). It reflects the last admission or
-// check (CheckPeer re-evaluates). ErrNotFound: the peer has no session.
+// PeerClaims returns the verified evidence peer's admission session rests
+// on (subject, issuer path, scopes, tags, attributes, validity), for audit.
+// A server already maps it to roles on every call ([enrollment.roles]).
+// ErrNotFound: the peer has no session (never enrolled, revoked, evicted).
 func (e *Enrollment) PeerClaims(peer string) (*PeerEvidence, error) {
 	h, err := e.live()
 	if err != nil {
@@ -568,27 +598,7 @@ func (e *Enrollment) PeerClaims(peer string) (*PeerEvidence, error) {
 	return &ev, takeJSON(out, &ev)
 }
 
-// VerifyCredential verifies chain as subject's credential under this node's
-// trust (root, audience, validity, the root's delegate revocations) without
-// consulting root records. ErrVerificationFailed carries the reason.
-func (e *Enrollment) VerifyCredential(subject, chain string) (*PeerEvidence, error) {
-	h, err := e.live()
-	if err != nil {
-		return nil, err
-	}
-	var a cArena
-	defer a.free()
-	var out C.aster_bytes_t
-	if err := wrapStatus("aster_enrollment_verify_credential", C.aster_enrollment_verify_credential(
-		C.uint64_t(e.rt.handle), C.aster_enrollment_t(h), a.str(subject), a.str(chain), &out)); err != nil {
-		return nil, err
-	}
-	var ev PeerEvidence
-	return &ev, takeJSON(out, &ev)
-}
-
-// Status returns this node's Enrollment state (trusted root, which moves on
-// after an accepted root rotation, and its own credential).
+// Status returns this node's Enrollment state.
 func (e *Enrollment) Status() (EnrollmentStatus, error) {
 	var st EnrollmentStatus
 	h, err := e.live()
@@ -603,24 +613,20 @@ func (e *Enrollment) Status() (EnrollmentStatus, error) {
 	return st, takeJSON(out, &st)
 }
 
-// ReplaceCredential installs a new credential (it must verify for this node)
-// and presents it to every peer this node has a session with.
-func (e *Enrollment) ReplaceCredential(ctx context.Context, chain string) ([]UnreachedPeer, error) {
-	var out struct {
-		Unreached []UnreachedPeer `json:"unreached"`
+// Credential returns this node's current credential chain evidence (it
+// changes as renewal replaces it).
+func (e *Enrollment) Credential() (*PeerEvidence, error) {
+	st, err := e.Status()
+	if err != nil {
+		return nil, err
 	}
-	var a cArena
-	defer a.free()
-	err := e.result(ctx, "aster_enrollment_replace_credential", &out, func(h C.aster_enrollment_t, op *C.aster_operation_t) C.int32_t {
-		return C.aster_enrollment_replace_credential(C.uint64_t(e.rt.handle), h, a.str(chain), 0, op)
-	})
-	return out.Unreached, err
+	return st.Credential, nil
 }
 
 // NextRevocation waits for the next revocation of a formerly admitted peer
-// (buffered from install). Cancelling ctx consumes nothing; Close ends a
-// pending wait with ErrAlreadyClosed. Drop per-peer state (roles, sessions,
-// jobs) on each one.
+// (buffered from start). Cancelling ctx consumes nothing; Close ends a
+// pending wait with ErrAlreadyClosed. Roles and connections need no action:
+// both are already gone. Use it for application state keyed by peer.
 func (e *Enrollment) NextRevocation(ctx context.Context) (Revocation, error) {
 	var out Revocation
 	err := e.result(ctx, "aster_enrollment_next_revocation", &out, func(h C.aster_enrollment_t, op *C.aster_operation_t) C.int32_t {
@@ -629,27 +635,13 @@ func (e *Enrollment) NextRevocation(ctx context.Context) (Revocation, error) {
 	return out, err
 }
 
-// ─── Delegated issuer ─────────────────────────────────────────────────────
+// ─── Configured issuer ────────────────────────────────────────────────────
 
-// IssuerConfig makes a server's node a delegated issuer
-// (ServerOptions.EnrollmentIssuer).
-type IssuerConfig struct {
-	// Delegation is this node's delegation chain from the root; its leaf
-	// names this node's key.
-	Delegation string
-	// Lifetime of issued (and renewed) credentials (0 = 24 h), shortened to
-	// the delegation's max_child_lifetime and expiry.
-	Lifetime time.Duration
-}
-
-// EnrollmentIssuer signs credentials under a delegation from the root and,
-// on a server, serves aster.enrollment.IssuerV1 renewals.
-type EnrollmentIssuer struct {
-	e      *Enrollment
-	handle uint64
-	mu     sync.Mutex
-	closed bool
-}
+// EnrollmentIssuer is the delegated issuer a server runs when
+// Enrollment.IssuerDelegationFile is configured (AsterServer.Issuer; Rust
+// aster::enrollment::Issuer). It already serves aster.enrollment.IssuerV1
+// renewals; Issue enrolls new nodes.
+type EnrollmentIssuer struct{ e *Enrollment }
 
 // IssuerInfo identifies an issuer.
 type IssuerInfo struct {
@@ -681,60 +673,26 @@ func (r *IssuerRefusal) Error() string {
 // Is matches ErrPermissionDenied.
 func (r *IssuerRefusal) Is(target error) bool { return target == ErrPermissionDenied }
 
-// NewIssuer makes this node a delegated issuer (see IssuerConfig).
-func (e *Enrollment) NewIssuer(cfg IssuerConfig) (*EnrollmentIssuer, error) {
-	h, err := e.live()
-	if err != nil {
-		return nil, err
-	}
-	var a cArena
-	defer a.free()
-	var out C.aster_enrollment_issuer_t
-	secs := uint64(0)
-	if cfg.Lifetime > 0 {
-		secs = uint64(max(cfg.Lifetime/time.Second, 1))
-	}
-	if err := wrapStatus("aster_enrollment_issuer_new", C.aster_enrollment_issuer_new(
-		C.uint64_t(e.rt.handle), C.aster_enrollment_t(h), a.str(cfg.Delegation), C.uint64_t(secs), &out)); err != nil {
-		return nil, err
-	}
-	i := &EnrollmentIssuer{e: e, handle: uint64(out)}
-	e.mu.Lock()
-	e.issuers = append(e.issuers, i)
-	e.mu.Unlock()
-	return i, nil
-}
-
-func (i *EnrollmentIssuer) live() (uint64, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.closed {
-		return 0, fmt.Errorf("issuer closed: %w", ErrAlreadyClosed)
-	}
-	return i.handle, nil
-}
-
 // Info returns the issuer's key and delegation expiry.
 func (i *EnrollmentIssuer) Info() (IssuerInfo, error) {
 	var info IssuerInfo
-	h, err := i.live()
+	h, err := i.e.live()
 	if err != nil {
 		return info, err
 	}
 	var out C.aster_bytes_t
 	if err := wrapStatus("aster_enrollment_issuer_info", C.aster_enrollment_issuer_info(
-		C.uint64_t(i.e.rt.handle), C.aster_enrollment_issuer_t(h), &out)); err != nil {
+		C.uint64_t(i.e.rt.handle), C.aster_enrollment_t(h), &out)); err != nil {
 		return info, err
 	}
 	return info, takeJSON(out, &info)
 }
 
 // Issue signs a credential for subject (a node id the orchestrator has
-// authenticated out of band, e.g. from a Kubernetes service-account token).
-// A refusal is an *IssuerRefusal.
+// authenticated out of band). A refusal is an *IssuerRefusal.
 func (i *EnrollmentIssuer) Issue(subject string, claims EnrollmentClaims, registration Registration) (IssuedCredential, error) {
 	var issued IssuedCredential
-	h, err := i.live()
+	h, err := i.e.live()
 	if err != nil {
 		return issued, err
 	}
@@ -748,7 +706,7 @@ func (i *EnrollmentIssuer) Issue(subject string, claims EnrollmentClaims, regist
 	var a cArena
 	defer a.free()
 	var out C.aster_bytes_t
-	status := C.aster_enrollment_issue(C.uint64_t(i.e.rt.handle), C.aster_enrollment_issuer_t(h), a.bytes(body), &out)
+	status := C.aster_enrollment_issue(C.uint64_t(i.e.rt.handle), C.aster_enrollment_t(h), a.bytes(body), &out)
 	if status == C.ASTER_STATUS_PERMISSION_DENIED && out.ptr != nil {
 		var refusal IssuerRefusal
 		if err := takeJSON(out, &refusal); err != nil {
@@ -760,106 +718,4 @@ func (i *EnrollmentIssuer) Issue(subject string, claims EnrollmentClaims, regist
 		return issued, err
 	}
 	return issued, takeJSON(out, &issued)
-}
-
-// Close releases the issuer (a server it serves on keeps serving it).
-func (i *EnrollmentIssuer) Close() error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.closed {
-		return nil
-	}
-	i.closed = true
-	return statusError(C.aster_enrollment_issuer_free(C.uint64_t(i.e.rt.handle), C.aster_enrollment_issuer_t(i.handle)))
-}
-
-// ─── Renewal ──────────────────────────────────────────────────────────────
-
-// RenewalConfig says where and how a node renews its credential.
-type RenewalConfig struct {
-	// Issuer is the issuer that signed this node's credential.
-	Issuer NodeAddr
-	// Retry is the first retry delay (doubling to MaxRetry); CallTimeout
-	// bounds each call. 0 = defaults (1 s, 60 s, 30 s).
-	Retry, MaxRetry, CallTimeout time.Duration
-}
-
-// Renewal renews this node's credential in the background.
-type Renewal struct {
-	e      *Enrollment
-	handle uint64
-	mu     sync.Mutex
-	closed bool
-}
-
-// RenewalOutcome is why renewal stopped: "registered" (the root registered
-// the node; the record is its authority now), "refused" (Refusal says why),
-// "expired" or "no_credential".
-type RenewalOutcome struct {
-	Outcome string         `json:"outcome"`
-	Refusal *IssuerRefusal `json:"refusal"`
-}
-
-// StartRenewal renews this node's credential from cfg.Issuer whenever a
-// third of its lifetime remains, presenting each renewal to every admitted
-// peer, until the root registers the node, the issuer refuses for good, or
-// the credential expires. Close the renewal to stop it.
-func (e *Enrollment) StartRenewal(cfg RenewalConfig) (*Renewal, error) {
-	h, err := e.live()
-	if err != nil {
-		return nil, err
-	}
-	ms := func(d time.Duration) uint64 {
-		if d <= 0 {
-			return 0
-		}
-		return uint64(max(d.Milliseconds(), 1))
-	}
-	body, err := json.Marshal(map[string]any{
-		"issuer": toAddrJSON(cfg.Issuer), "retry_ms": ms(cfg.Retry),
-		"max_retry_ms": ms(cfg.MaxRetry), "call_timeout_ms": ms(cfg.CallTimeout),
-	})
-	if err != nil {
-		return nil, err
-	}
-	var a cArena
-	defer a.free()
-	var out C.aster_enrollment_renewal_t
-	if err := wrapStatus("aster_enrollment_start_renewal", C.aster_enrollment_start_renewal(
-		C.uint64_t(e.rt.handle), C.aster_enrollment_t(h), a.bytes(body), &out)); err != nil {
-		return nil, err
-	}
-	r := &Renewal{e: e, handle: uint64(out)}
-	e.mu.Lock()
-	e.renewals = append(e.renewals, r)
-	e.mu.Unlock()
-	return r, nil
-}
-
-// Wait blocks until renewal stops (or ctx ends) and returns why.
-func (r *Renewal) Wait(ctx context.Context) (RenewalOutcome, error) {
-	var out RenewalOutcome
-	r.mu.Lock()
-	closed, h := r.closed, r.handle
-	r.mu.Unlock()
-	if closed {
-		return out, fmt.Errorf("renewal closed: %w", ErrAlreadyClosed)
-	}
-	var op C.aster_operation_t
-	if err := wrapStatus("aster_enrollment_renewal_wait", C.aster_enrollment_renewal_wait(
-		C.uint64_t(r.e.rt.handle), C.aster_enrollment_renewal_t(h), 0, &op)); err != nil {
-		return out, err
-	}
-	return out, awaitEnrollmentResult(ctx, r.e.rt, uint64(op), "aster_enrollment_renewal_wait", &out)
-}
-
-// Close stops renewing.
-func (r *Renewal) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil
-	}
-	r.closed = true
-	return statusError(C.aster_enrollment_renewal_free(C.uint64_t(r.e.rt.handle), C.aster_enrollment_renewal_t(r.handle)))
 }

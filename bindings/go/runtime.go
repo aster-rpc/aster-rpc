@@ -578,7 +578,8 @@ func Version() (major, minor, patch uint32) {
 }
 
 // ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
-// this binding runs against: 5.1 adds Enrollment (aster_enrollment_*).
+// this binding runs against: 5.1 adds Enrollment from config
+// (aster_node_start_enrolled, aster_enrollment_*) and the lease grantor.
 const ABIMinorRequired = uint32(1)
 
 // CheckABI returns an error if the loaded native library's ABI major version

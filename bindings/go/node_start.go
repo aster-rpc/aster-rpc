@@ -40,18 +40,19 @@ type NodeOptions struct {
 	// AdmissionBuffer sizes the Admissions channel (default 64). A request
 	// that does not fit is allowed immediately.
 	AdmissionBuffer int
-	// Enrollment installs Enrollment as the node's admission (C ABI 5.1):
-	// the node starts with fail-closed hooks and EnrollmentALPN, and
-	// Node.Enrollment returns it. Incompatible with Gate. Inbound enrollment
-	// handshakes are served by a server (ServerOptions.Enrollment); a node
-	// started this way without one only dials.
-	Enrollment *EnrollmentConfig
 }
 
 // StartNode starts a node from cfg through the Rust aster::Node::start
 // (aster_node_start). The node owns a reference to its runtime; Close
-// releases it.
+// releases it. Like Rust Node::start it ignores cfg.Enrollment: StartServer
+// and StartClient install Enrollment.
 func StartNode(ctx context.Context, cfg AsterConfig, opts NodeOptions) (*Node, error) {
+	return startNode(ctx, cfg, opts, -1)
+}
+
+// startNode starts a node; side >= 0 (enrollmentSide*) installs Enrollment
+// from cfg when it enables it (aster_node_start_enrolled).
+func startNode(ctx context.Context, cfg AsterConfig, opts NodeOptions, side int) (*Node, error) {
 	var rt *Runtime
 	switch {
 	case opts.Gate != nil:
@@ -64,7 +65,7 @@ func StartNode(ctx context.Context, cfg AsterConfig, opts NodeOptions) (*Node, e
 			return nil, err
 		}
 	}
-	node, err := startNodeOn(ctx, rt, cfg, opts)
+	node, err := startNodeOn(ctx, rt, cfg, opts, side)
 	if err != nil {
 		_ = rt.release()
 		return nil, err
@@ -72,15 +73,9 @@ func StartNode(ctx context.Context, cfg AsterConfig, opts NodeOptions) (*Node, e
 	return node, nil
 }
 
-func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOptions) (*Node, error) {
-	if opts.Enrollment != nil {
-		if opts.Gate != nil {
-			return nil, fmt.Errorf("NodeOptions: Enrollment and Gate both decide admission; set one: %w", ErrInvalidArgument)
-		}
-		// Enrollment decides admission; the node must fail closed while it does.
-		cfg.EnableHooks = true
-		cfg.HookFailureMode = HookFailClosed
-		opts.ExtraALPNs = append(append([]string{}, opts.ExtraALPNs...), EnrollmentALPN)
+func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOptions, side int) (*Node, error) {
+	if side >= 0 && opts.Gate != nil && cfg.IsEnrollmentEnabled() {
+		return nil, fmt.Errorf("enrollment decides admission; a Gate cannot be set with it: %w", ErrInvalidArgument)
 	}
 	healthSettings := &nodeHealthSettings{host: cfg.HealthHost, port: cfg.HealthPort, enabled: cfg.IsHealthEnabled()}
 	var a cArena
@@ -94,8 +89,19 @@ func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOpt
 		gate = C.aster_gate_t(opts.Gate.handle)
 	}
 	var op C.aster_operation_t
-	// The config is validated and copied before aster_node_start returns.
-	if err := wrapStatus("aster_node_start", C.aster_node_start(C.uint64_t(rt.handle), &native, gate, 0, &op)); err != nil {
+	// The config is validated and copied before the start call returns.
+	if side >= 0 && opts.Gate == nil {
+		trust, err := cfg.trustJSON()
+		if err != nil {
+			return nil, err
+		}
+		// Rust validates the whole enrollment plan here (fail closed) and,
+		// when the config does not enable enrollment, starts a plain node.
+		if err := wrapStatus("aster_node_start_enrolled", C.aster_node_start_enrolled(
+			C.uint64_t(rt.handle), &native, a.bytes(trust), C.uint32_t(side), 0, &op)); err != nil {
+			return nil, err
+		}
+	} else if err := wrapStatus("aster_node_start", C.aster_node_start(C.uint64_t(rt.handle), &native, gate, 0, &op)); err != nil {
 		return nil, err
 	}
 	ev, err := rt.await(ctx, uint64(op))
@@ -114,16 +120,9 @@ func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOpt
 		healthSettings: healthSettings,
 	}
 	rt.registerAcceptHandler(n.handle, n)
-	if opts.Enrollment != nil {
-		// No Admissions channel: until install, unanswered hooks time out
-		// into the fail-closed mode; after it, Rust forwards them to Enrollment.
-		e, err := installEnrollment(n, opts.Enrollment, cfg)
-		if err != nil {
-			n.ownsRuntime = false // StartNode releases the runtime reference
-			_ = n.Close()
-			return nil, err
-		}
-		n.enrollment = e
+	if ev.Related != 0 {
+		// Enrollment consumes the node's hooks; it owns admission.
+		n.enrollment = newEnrollment(rt, ev.Related)
 		return n, nil
 	}
 	if opts.Gate == nil && cfg.EnableHooks {

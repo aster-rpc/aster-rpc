@@ -56,7 +56,6 @@ func TestHealthConfig_DefaultsEnvTOML(t *testing.T) {
 
 func TestHealthConfig_ServerStartsListenerFromConfig(t *testing.T) {
 	cfg := testCfg()
-	cfg.AllowAllConsumers = true
 	on := true
 	cfg.HealthEnabled = &on // port 0 + enabled: an ephemeral port
 	f := newRPCFixture(t, ServerOptions{Config: cfg, Services: []*Service{probeService(&probeState{})}})
@@ -111,7 +110,6 @@ func TestHealthConfig_LiveDisabledBindPrecedenceAndReuse(t *testing.T) {
 	defer occupied.Close()
 	port := uint16(occupied.Addr().(*net.TCPAddr).Port)
 	cfg := testCfg()
-	cfg.AllowAllConsumers = true
 	cfg.HealthPort = port
 	off := false
 	cfg.HealthEnabled = &off

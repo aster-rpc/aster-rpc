@@ -237,7 +237,6 @@ func newClientFixture(t *testing.T, idempotent bool, copts ...ClientOption) *cli
 	defer cancel()
 	opts := ServerOptions{Services: []*Service{svc}, Interceptors: []Interceptor{metaSpy{f: f}}}
 	opts.Config = testCfg()
-	opts.Config.AllowAllConsumers = true
 	srv, err := StartServer(ctx, opts)
 	if err != nil {
 		t.Fatalf("StartServer: %v", err)

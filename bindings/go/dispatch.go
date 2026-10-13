@@ -90,8 +90,8 @@ type serverSettings struct {
 	setHandlerTimeout        bool
 	ringCapacity             uint32
 	health                   *HealthServer // attached before start (readiness)
-	enrollment               *Enrollment   // routes aster.enrollment/1 (ABI 5.1)
-	issuer                   *EnrollmentIssuer
+	leaseGrantor             *LeaseGrantor // serves aster.lease.Grantor (ABI 5.1)
+	grantor                  *grantorBackend
 }
 
 // startDispatchServer registers every service JSON (in order: the index is
@@ -148,19 +148,14 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 			return fail("aster_server_attach_health", err)
 		}
 	}
-	if s.enrollment != nil {
-		eh, err := s.enrollment.live()
+	if s.grantor != nil {
+		requires, revoke, err := s.leaseGrantor.requirements()
 		if err != nil {
-			return fail("aster_server_set_enrollment", err)
+			return fail("lease grantor", err)
 		}
-		ih := uint64(0)
-		if s.issuer != nil {
-			if ih, err = s.issuer.live(); err != nil {
-				return fail("aster_server_set_enrollment", err)
-			}
-		}
-		if err := statusError(C.aster_server_set_enrollment(rt, b, C.aster_enrollment_t(eh), C.aster_enrollment_issuer_t(ih))); err != nil {
-			return fail("aster_server_set_enrollment", err)
+		if err := statusError(C.aster_server_add_lease_grantor(b, C.aster_lease_serializer_t(s.grantor.serializer.handle),
+			arena.bytes(requires), arena.bytes(revoke))); err != nil {
+			return fail("aster_server_add_lease_grantor", err)
 		}
 	}
 	var h C.aster_server_t
