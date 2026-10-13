@@ -1,63 +1,59 @@
-# Roles per node id, revoked at runtime
+# Roles from enrollment credentials, revoked by the root
 
-An API node grants a session node a set of roles on a serving node, then
-revokes them. After the revocation, the session node's next method call is
-refused with `PERMISSION_DENIED`.
+A serving node admits only nodes enrolled by your root, and the roles in each
+node's credential decide which methods it may call. The root revokes a node
+and the serving node closes its connections; its next call is refused.
+Nothing in the code reads a credential: it is all configuration.
 
-| node | role on the serving node | what it does |
-|------|--------------------------|--------------|
-| serving node | (n/a) | serves `Clipboard.Read` (requires `clipboard.read`) and `Control.SetRoles` (requires `roles.admin`) |
-| API node | `roles.admin` (set from the serving node's own config at boot) | calls `Control.SetRoles` to grant or revoke roles for any other node id |
-| session node | whatever the API node grants | calls `Clipboard.Read` |
+| node | credential | what it does |
+|------|-----------|--------------|
+| serving node | from the root, no roles | `StartServer` from an `aster.toml` with `[trust]` and `[enrollment]`; serves `Clipboard.Read` (requires `clipboard.read`) and `Control.SetRoles` (requires `roles.admin`) |
+| session node | roles `clipboard.read` | reads the clipboard; then the root revokes it |
+| viewer node | no roles | enrolled, so it connects, but `Clipboard.Read` refuses it |
+| API node | roles `roles.admin` | changes roles at runtime through `Control.SetRoles` |
+| stranger | none | cannot connect at all |
+
+This is the same path as the [Mission Control auth chapter](../mission_control):
+`StartServer` / `StartClient` from configuration, design §15
+(`docs/_internal/working_ideas/aster-enrollment.md`).
 
 ## How it works
 
-- `aster.Requires(aster.RequireRole("clipboard.read"))` puts the
-  requirement in the method contract. Rust enforces it (Gate 3) **before**
-  the Go handler runs. A caller without the role never reaches your code.
-- Gate 3 checks the caller's attributes on the serving node. You set them
-  with `AsterServer.SetPeerAttributes(peerNodeID, map)`. Roles go under the
-  key `aster.role` as a comma-separated list. An empty or nil map clears
-  them.
-- Those attributes live in memory **on the serving node**. Another node
-  changes them through a small control RPC on the serving node, which calls
-  `SetPeerAttributes`. Here that RPC is `Control.SetRoles`:
-  - It requires `roles.admin`. Only the API node has that role, granted by
-    the serving node's own configuration. The session node is refused.
-  - It refuses to change the API node's own entry, so an admin cannot lock
-    itself (or a co-admin) out over RPC.
-  - It takes the complete role set for a peer. `""` revokes everything.
-  - The peer identity Gate 3 checks is the QUIC-authenticated node id. Roles
-    are bound to the node's key, not to anything the caller claims.
-- Gate 0 (admission: who may connect at all) is separate from roles. The
-  demo runs the server in the default protected trust mode and admits the
-  API and session nodes with `Gate().Admit`. Removing roles leaves the
-  session node connected but powerless. Use `Gate().Revoke` if it should
-  not connect at all.
+- The serving node's `aster.toml` names the root (`[trust] root_pubkey`), its
+  own key and credential, the fleet audience and namespace, and a durable
+  state path (`[enrollment]`). That enables Enrollment: the node admits only
+  peers that complete the enrollment handshake with a credential from that
+  root (Gate 0), so the stranger never reaches `Clipboard`.
+- Each client is `StartClient` with its key, its credential, the root and the
+  same `[enrollment]` audience and namespace. Before its first connection it
+  enrolls with the server over the reciprocal handshake.
+- A role is a comma-separated value of the `aster.role` claim attribute in
+  the credential (`aster enroll node --attributes roles.json` with
+  `{"aster.role": {"type": "string", "value": "clipboard.read"}}`). The server
+  maps it to the attribute Gate 3 checks `Requires` against, **on every
+  call** from the peer's live enrollment session.
+- `aster.Requires(aster.RequireRole("clipboard.read"))` puts the requirement
+  in the method contract; Rust enforces it before the Go handler runs.
+- Revocation is the root's: `aster enroll revoke --subject <id> --fleet-only
+  --peer <server>` publishes a revocation record into the fleet namespace the
+  serving node holds. The serving node revokes the session, closes every
+  connection of that node, and refuses it from then on, durably (it survives
+  restarts in `state_path`) and without any code in the application.
 
-## Revocation semantics
+## Runtime role changes (secondary)
 
-- **Latency: the next call.** Gate 3 evaluates the requirement on every
-  call against the current attributes. A revocation applies to every call
-  that starts after `SetPeerAttributes` returns, including calls on an
-  already open connection. There is no cache and no reconnect. The time from
-  the API node's decision to enforcement is one `Control.SetRoles` round trip
-  (2 ms on loopback in the run below).
-- **In-flight calls are not interrupted.** A call that already passed Gate
-  3 runs to completion (step 4/6 below). For long-running streams or
-  session-scoped services, re-check inside the handler if you need that:
-  `CallInfoFromContext(ctx).Attributes` is the snapshot taken when the call
-  started. Alternatively, close the connection to cut the peer off.
-- **Not durable.** The attributes are in-memory state of one serving node.
-  After a restart they are gone, and they are not replicated to other
-  replicas. The API node (or the serving node's config) must re-apply them.
-  For example, on startup the serving node pulls the current role table
-  from the API, or the API pushes it to every replica.
-- **Coming later: Enrollment claims.** Roles carried as claims in an
-  Enrollment credential (verified by the serving node, with no control RPC
-  and no per-node push) are being added to the Go binding separately. That
-  path survives restarts and scales to many serving nodes. Revocation then
-  happens by re-issuing or denying enrollment, not by `SetPeerAttributes`.
+Credentials carry the roles a node has for the credential's lifetime. For
+roles that change mid-session without issuing a new credential, a control
+RPC on the serving node can call `AsterServer.SetPeerAttributes`, the escape
+hatch. Here `Control.SetRoles` requires `roles.admin`, which the API node has
+**in its credential**, so the control plane itself is gated by enrollment.
+
+- Runtime roles live in memory on the serving node: they are lost on
+  restart and not replicated. Durable roles belong in credentials.
+- Roles from a credential win on a clash: a runtime grant applies to nodes
+  whose credentials carry no roles (the viewer here).
+- A runtime revoke applies from the next call; a call already past Gate 3
+  completes. A root revocation, by contrast, closes the node's connections.
 
 ## Run
 
@@ -72,32 +68,37 @@ go run ./examples/roles_revocation
 go test ./examples/roles_revocation     # the same scenario as a test
 ```
 
-Output from a real run:
+The demo is self-contained: it plays the root in process
+(`internal/testroot`, which signs what `aster key root generate`,
+`aster enroll node` and `aster enroll revoke` produce) and writes the key,
+credential and `aster.toml` files to a temporary directory. In production
+the operator runs the CLI and each process reads its files from
+configuration. Output from a real run (Rust log lines on stderr omitted):
 
 ```
-serving node 7315ffb42c95...
-API node     06996a49a51f... (role roles.admin)
-session node 82d6c559ec57... (no roles)
+serving node 18c41b8ba72e... (aster.toml, enrollment on)
+session node eb6f1cf03efe... (credential roles: clipboard.read)
+viewer node  0ea438866bf3... (credential roles: none)
 
-1. session reads before any grant
+1. the session node reads: its credential carries clipboard.read
+   -> "contents of desk-7"
+
+2. the viewer reads: enrolled, but its credential carries no role
    -> PERMISSION_DENIED ([PERMISSION_DENIED] capability check failed for 'Clipboard.Read')
 
-2. API grants "clipboard.read,clipboard.write" to the session node
-   session read -> "contents of desk-7"
+3. a node with no credential tries to connect
+   -> refused at admission ([UNAVAILABLE] stream ended before response)
 
-3. session tries to grant itself roles.admin
-   -> PERMISSION_DENIED ([PERMISSION_DENIED] capability check failed for 'Control.SetRoles')
+4. the root revokes the session node (aster enroll revoke --peer <server>)
+   serving node revoked eb6f1cf03efe... (node_revoked) and closed its connections
 
-4. session starts a slow read (1.5 s); API revokes while it runs
-   API revoked all roles (SetRoles round trip 2ms)
+5. the session node's next call
+   -> refused ([UNAVAILABLE] connection lost)
+   -> and it cannot come back: the revocation is the root's, durable on the serving node
 
-5. session's next call, same connection
+6. mid-session change without a new credential: the API node (roles.admin in its credential) grants the viewer clipboard.read
+   viewer read -> "contents of desk-7"
    -> PERMISSION_DENIED ([PERMISSION_DENIED] capability check failed for 'Clipboard.Read')
-
-6. the read that was already in flight completed: "contents of desk-7"
-
-7. the API node's own grant is not changeable over RPC
-   -> PERMISSION_DENIED ([PERMISSION_DENIED] roles of 06996a49...30a2 are not managed over RPC)
 
 OK
 ```

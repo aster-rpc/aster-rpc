@@ -275,23 +275,3 @@ WHERE resource = $1
 	}
 	return nil, tx.Commit()
 }
-
-// PGFencedResource serves FencedWrite as an Aster fenced resource, so the
-// write path is aster.FencedResourceHandle.Mutate (the same contract a remote
-// resource behind an RPC would implement).
-type PGFencedResource struct{ DB *sql.DB }
-
-var _ aster.FencedResource = (*PGFencedResource)(nil)
-
-// Mutate implements aster.FencedResource. A database fault is an error: the
-// caller sees ErrMutationOutcomeUnknown, never a false "rejected".
-func (r *PGFencedResource) Mutate(ctx context.Context, fence aster.Fence, writer string, op []byte) (aster.MutateResult, error) {
-	rej, err := FencedWrite(ctx, r.DB, fence, writer, string(op))
-	if err != nil {
-		return aster.MutateResult{}, err
-	}
-	if rej != nil {
-		return aster.MutateResult{Rejection: rej}, nil
-	}
-	return aster.MutateResult{Output: []byte("ok")}, nil
-}

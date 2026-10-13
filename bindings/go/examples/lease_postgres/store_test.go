@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -152,4 +153,18 @@ func TestPGSerializer_DBFaultIsAnError(t *testing.T) {
 	if _, err := FencedWrite(context.Background(), broken, aster.Fence{Resource: "x", Epoch: 1, Holder: "a"}, "a", "p"); err == nil {
 		t.Fatal("unreachable database: fenced write did not error")
 	}
+}
+
+// TestGrantorScenario runs the demo: the Postgres serializer behind a
+// LeaseGrantor on StartServer, controllers as StartClients, fenced writes
+// through Work.Write.
+func TestGrantorScenario(t *testing.T) {
+	db := testDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var out strings.Builder
+	if err := Run(ctx, db, &out); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	t.Log("\n" + out.String())
 }

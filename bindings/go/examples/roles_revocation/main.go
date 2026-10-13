@@ -1,45 +1,50 @@
 //go:build cgo
 
-// Example: roles per node id, granted and revoked at runtime.
+// Example: roles from enrollment credentials, revoked by the root.
 //
-// Three nodes:
+// A serving node runs StartServer from an aster.toml that enables
+// Enrollment. Every other node is a StartClient configured with its own key
+// and credential. Nothing in the code reads a credential:
 //
-//   - serving node: serves Clipboard.Read (requires role "clipboard.read")
-//     and Control.SetRoles (requires role "roles.admin").
-//   - API node: holds "roles.admin" on the serving node and grants or
-//     revokes roles for other node ids by calling Control.SetRoles.
-//   - session node: calls Clipboard.Read.
+//   - The serving node admits only nodes holding a credential from the
+//     configured root, and the roles in each credential's aster.role claim
+//     are what Requires checks, on every call.
+//   - A session node whose credential carries "clipboard.read" reads the
+//     clipboard; a viewer whose credential carries no role is refused; a node
+//     with no credential cannot connect at all.
+//   - The root revokes the session node (aster enroll revoke): the serving
+//     node closes its connections, and its next call is refused.
+//   - Secondary: roles that change mid-session without re-issuing a
+//     credential, through a small control RPC (Control.SetRoles, itself gated
+//     by the roles.admin role from the API node's credential).
 //
-// Roles live in memory on the serving node (AsterServer.SetPeerAttributes,
-// key "aster.role"). Gate 3 checks them on every call before the handler
-// runs, so a revocation applies from the session node's next call, on the
-// same connection. A call already in flight is not interrupted.
-//
-// Run (see README.md):
+// The root operations (keys, credentials, the revocation) are what the aster
+// CLI does; this self-contained demo plays the root in process with
+// internal/testroot. Run (see README.md):
 //
 //	go run ./examples/roles_revocation
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	aster "sdk.getaster.now/go"
+	"sdk.getaster.now/go/internal/testroot"
 )
 
 // ─── wire types ───────────────────────────────────────────────────────────
 
-type ReadRequest struct {
-	ClipboardID string
-	// DelayMs holds the handler this long (to show an in-flight call).
-	DelayMs int32
-}
+type ReadRequest struct{ ClipboardID string }
 
 func (ReadRequest) AsterWireType() string { return "examples.roles/ReadRequest" }
 
@@ -48,7 +53,7 @@ type ReadReply struct{ Text string }
 func (ReadReply) AsterWireType() string { return "examples.roles/ReadReply" }
 
 type SetRolesRequest struct {
-	// Peer is the 64-hex node id whose roles are replaced.
+	// Peer is the 64-hex node id whose runtime roles are replaced.
 	Peer string
 	// Roles is the complete comma-separated role set; "" revokes all.
 	Roles string
@@ -63,46 +68,34 @@ func (SetRolesReply) AsterWireType() string { return "examples.roles/SetRolesRep
 const (
 	RoleClipboardRead = "clipboard.read"
 	RoleAdmin         = "roles.admin"
-	roleKey           = "aster.role" // the attribute Gate 3 reads, comma-separated
+	audience          = "kasm-sessions"
 )
 
 // ─── serving node ─────────────────────────────────────────────────────────
 
-// Services builds the two services. srv is read when a handler runs (it is
-// set once StartServer returns); protected are node ids whose roles
-// SetRoles must not change (the API node's own grant).
-func Services(srv **aster.AsterServer, protected map[string]bool) []*aster.Service {
+// Services builds Clipboard (Read requires clipboard.read) and Control
+// (SetRoles requires roles.admin). srv is read when a handler runs (it is
+// set once StartServer returns).
+func Services(srv **aster.AsterServer) []*aster.Service {
 	clipboard := aster.NewService("Clipboard", 1,
 		aster.Unary("Read", func(ctx context.Context, r *ReadRequest) (*ReadReply, error) {
-			if r.DelayMs > 0 {
-				select {
-				case <-time.After(time.Duration(r.DelayMs) * time.Millisecond):
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			}
 			return &ReadReply{Text: "contents of " + r.ClipboardID}, nil
 		}, aster.Requires(aster.RequireRole(RoleClipboardRead))),
 	)
 	control := aster.NewService("Control", 1,
 		aster.Unary("SetRoles", func(ctx context.Context, r *SetRolesRequest) (*SetRolesReply, error) {
-			info, _ := aster.CallInfoFromContext(ctx)
-			if info == nil || !info.IrohAuthenticated {
-				return nil, aster.NewRpcError(aster.StatusPermissionDenied, "caller identity not authenticated")
-			}
 			peer := strings.ToLower(strings.TrimSpace(r.Peer))
 			if len(peer) != 64 {
 				return nil, aster.NewRpcError(aster.StatusInvalidArgument, "peer must be a 64-hex node id")
 			}
-			if protected[peer] {
-				return nil, aster.NewRpcError(aster.StatusPermissionDenied, "roles of %s are not managed over RPC", peer)
-			}
 			roles := normalizeRoles(r.Roles)
 			attrs := map[string]string{}
 			if roles != "" {
-				attrs[roleKey] = roles
+				attrs["aster.role"] = roles
 			}
-			// Empty map clears: the peer has no roles from the next call on.
+			// Runtime roles (the escape hatch). Roles from a peer's
+			// credential win on a clash, so these apply to peers whose
+			// credentials carry no roles.
 			if err := (*srv).SetPeerAttributes(peer, attrs); err != nil {
 				return nil, err
 			}
@@ -122,11 +115,114 @@ func normalizeRoles(s string) string {
 	return strings.Join(out, ",")
 }
 
-// loopback is a relay-free local config for the demo.
-func loopback() aster.AsterConfig {
+// ─── the operator's files (what the aster CLI produces) ───────────────────
+
+type fleet struct {
+	dir    string
+	root   *testroot.Root
+	secret [32]byte // aster enroll namespace create --out-secret
+}
+
+func newFleet(dir string) (*fleet, error) {
+	root, err := testroot.Generate(audience) // aster key root generate
+	if err != nil {
+		return nil, err
+	}
+	f := &fleet{dir: dir, root: root}
+	_, err = rand.Read(f.secret[:])
+	return f, err
+}
+
+// node writes a key (aster key node generate --out <name>.key) and a
+// credential carrying roles (aster enroll node --attributes roles.json
+// --out <name>.cred), and returns the key file, credential file and node id.
+func (f *fleet) node(name, roles string) (keyFile, credFile, id string, err error) {
+	seed := make([]byte, 32)
+	if _, err = rand.Read(seed); err != nil {
+		return
+	}
+	return f.nodeWithSeed(name, seed, roles)
+}
+
+func (f *fleet) nodeWithSeed(name string, seed []byte, roles string) (keyFile, credFile, id string, err error) {
+	id = testroot.NodeID(seed)
+	keyFile = filepath.Join(f.dir, name+".key")
+	if err = os.WriteFile(keyFile, []byte(hex.EncodeToString(seed)+"\n"), 0o600); err != nil {
+		return
+	}
+	chain, err := f.root.Credential(id, testroot.RoleClaims(roles), time.Hour)
+	if err != nil {
+		return
+	}
+	credFile = filepath.Join(f.dir, name+".cred")
+	err = os.WriteFile(credFile, []byte(chain+"\n"), 0o600)
+	return
+}
+
+// clientConfig is what a node's environment would say (ASTER_SECRET_KEY_FILE,
+// ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_CREDENTIAL, ASTER_ENROLLMENT_*), here as
+// the struct; credFile "" = no enrollment.
+func (f *fleet) clientConfig(keyFile, credFile string) aster.AsterConfig {
 	cfg := aster.DefaultConfig()
-	cfg.RelayMode, cfg.BindAddr = "disabled", "127.0.0.1:0"
+	cfg.RelayMode, cfg.BindAddr, cfg.SecretKeyFile = "disabled", "127.0.0.1:0", keyFile
+	if credFile != "" {
+		cfg.RootPubkey, _ = hex.DecodeString(f.root.PublicKey())
+		cfg.EnrollmentCredentialFile = credFile
+		cfg.Enrollment = aster.EnrollmentConfig{Audience: audience, FleetNamespace: testroot.Namespace(f.secret)}
+	}
 	return cfg
+}
+
+// serverTOML is the serving node's aster.toml.
+func (f *fleet) serverTOML(keyFile, credFile string) (string, error) {
+	path := filepath.Join(f.dir, "aster.toml")
+	text := fmt.Sprintf(`[trust]
+root_pubkey = %q
+enrollment_credential = %q
+
+[network]
+secret_key_file = %q
+relay_mode = "disabled"
+bind_addr = "127.0.0.1:0"
+
+[enrollment]
+audience = %q
+fleet_namespace = %q
+state_path = %q
+`, f.root.PublicKey(), credFile, keyFile, audience, testroot.Namespace(f.secret), filepath.Join(f.dir, "enrollment.json"))
+	return path, os.WriteFile(path, []byte(text), 0o600)
+}
+
+// revoke is `aster enroll revoke --subject <id> --fleet-only --peer
+// <server>`: the root enrolls with the serving node (it holds the fleet
+// namespace) and publishes a revocation record into it, staying connected
+// until delivered reports the server has it.
+func (f *fleet) revoke(ctx context.Context, server *aster.NodeAddr, subject string, delivered func() error) error {
+	keyFile, credFile, _, err := f.nodeWithSeed("root", f.root.Seed(), "")
+	if err != nil {
+		return err
+	}
+	root, err := aster.StartClient(ctx, f.clientConfig(keyFile, credFile))
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if _, err := root.Connect(ctx, server); err != nil {
+		return err
+	}
+	doc, err := root.Node().Docs().ImportWriteNamespace(ctx, aster.Key(f.secret))
+	if err != nil {
+		return err
+	}
+	defer doc.Close()
+	if err := doc.SetBytes(ctx, aster.AuthorID(f.root.PublicKey()), testroot.RegistrationKey(subject),
+		f.root.Revocation(subject, "session ended")); err != nil {
+		return err
+	}
+	if err := doc.StartSync(ctx, server.EndpointID); err != nil {
+		return err
+	}
+	return delivered()
 }
 
 // ─── demo ─────────────────────────────────────────────────────────────────
@@ -135,67 +231,94 @@ func loopback() aster.AsterConfig {
 // behave as described.
 func Run(ctx context.Context, out io.Writer) error {
 	say := func(format string, args ...any) { fmt.Fprintf(out, format+"\n", args...) }
-
-	// The API and session nodes (clients have their own node ids).
-	api, err := aster.StartClient(ctx, loopback())
+	dir, err := os.MkdirTemp("", "roles-revocation-")
 	if err != nil {
 		return err
 	}
-	defer api.Close()
-	sess, err := aster.StartClient(ctx, loopback())
+	defer os.RemoveAll(dir)
+	f, err := newFleet(dir)
 	if err != nil {
 		return err
 	}
-	defer sess.Close()
-	apiID, _ := api.Node().NodeID()
-	sessID, _ := sess.Node().NodeID()
 
-	// The serving node. Gate 0 (who may connect at all) is separate from
-	// roles: both nodes are admitted, neither has a role yet.
+	// The serving node: StartServer from its aster.toml.
+	srvKey, srvCred, _, err := f.node("server", "")
+	if err != nil {
+		return err
+	}
+	toml, err := f.serverTOML(srvKey, srvCred)
+	if err != nil {
+		return err
+	}
+	cfg, err := aster.ConfigFromTOML(toml)
+	if err != nil {
+		return err
+	}
 	var srv *aster.AsterServer
-	srv, err = aster.StartServer(ctx, aster.ServerOptions{
-		Config:   loopback(),
-		Services: Services(&srv, map[string]bool{apiID: true}),
-	})
+	srv, err = aster.StartServer(ctx, aster.ServerOptions{Config: cfg, Services: Services(&srv)})
 	if err != nil {
 		return err
 	}
 	defer srv.Close()
-	for _, id := range []string{apiID, sessID} {
-		if err := srv.Gate().Admit(id); err != nil {
-			return err
-		}
-	}
-	// Bootstrap: the serving node's own configuration trusts the API node.
-	if err := srv.SetPeerAttributes(apiID, map[string]string{roleKey: RoleAdmin}); err != nil {
-		return err
-	}
-	srvID, _ := srv.NodeID()
-	say("serving node %s", short(srvID))
-	say("API node     %s (role %s)", short(apiID), RoleAdmin)
-	say("session node %s (no roles)", short(sessID))
-
 	ticket, err := srv.Ticket(ctx)
 	if err != nil {
 		return err
 	}
-	apiConn, err := api.ConnectTicket(ctx, ticket)
+	server, err := aster.NodeAddrFromTicket(ticket)
 	if err != nil {
 		return err
 	}
-	sessConn, err := sess.ConnectTicket(ctx, ticket)
-	if err != nil {
-		return err
-	}
+	revocations := make(chan aster.Revocation, 4)
+	go func() {
+		for {
+			rev, err := srv.Enrollment().NextRevocation(ctx)
+			if err != nil {
+				return
+			}
+			revocations <- rev
+		}
+	}()
 
-	read := func(delay time.Duration) (*ReadReply, error) {
-		return aster.Call[ReadRequest, ReadReply](ctx, sessConn, "Clipboard", "Read",
-			&ReadRequest{ClipboardID: "desk-7", DelayMs: int32(delay.Milliseconds())})
+	// Each node: its key, its credential, StartClient.
+	start := func(name, roles string, enrolled bool) (*aster.AsterClient, string, error) {
+		key, cred, id, err := f.node(name, roles)
+		if err != nil {
+			return nil, "", err
+		}
+		if !enrolled {
+			cred = ""
+		}
+		cl, err := aster.StartClient(ctx, f.clientConfig(key, cred))
+		return cl, id, err
 	}
-	setRoles := func(conn *aster.RpcConnection, peer, roles string) error {
-		_, err := aster.Call[SetRolesRequest, SetRolesReply](ctx, conn, "Control", "SetRoles",
-			&SetRolesRequest{Peer: peer, Roles: roles})
+	session, sessID, err := start("session", RoleClipboardRead, true)
+	if err != nil {
 		return err
+	}
+	defer session.Close()
+	viewer, viewerID, err := start("viewer", "", true)
+	if err != nil {
+		return err
+	}
+	defer viewer.Close()
+	api, _, err := start("api", RoleAdmin, true)
+	if err != nil {
+		return err
+	}
+	defer api.Close()
+	srvID, _ := srv.NodeID()
+	say("serving node %s (aster.toml, enrollment on)", short(srvID))
+	say("session node %s (credential roles: %s)", short(sessID), RoleClipboardRead)
+	say("viewer node  %s (credential roles: none)", short(viewerID))
+
+	read := func(cl *aster.AsterClient) (*ReadReply, error) {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		conn, err := cl.Connect(cctx, server)
+		if err != nil {
+			return nil, err
+		}
+		return aster.Call[ReadRequest, ReadReply](cctx, conn, "Clipboard", "Read", &ReadRequest{ClipboardID: "desk-7"})
 	}
 	expectDenied := func(step string, err error) error {
 		if !errors.Is(err, aster.ErrRpcPermissionDenied) {
@@ -205,58 +328,80 @@ func Run(ctx context.Context, out io.Writer) error {
 		return nil
 	}
 
-	say("\n1. session reads before any grant")
-	_, err = read(0)
-	if err := expectDenied("read before grant", err); err != nil {
-		return err
-	}
-
-	say("\n2. API grants %q to the session node", RoleClipboardRead+",clipboard.write")
-	if err := setRoles(apiConn, sessID, RoleClipboardRead+", clipboard.write"); err != nil {
-		return fmt.Errorf("grant: %w", err)
-	}
-	r, err := read(0)
+	say("\n1. the session node reads: its credential carries %s", RoleClipboardRead)
+	r, err := read(session)
 	if err != nil {
-		return fmt.Errorf("read after grant: %w", err)
+		return fmt.Errorf("session read: %w", err)
 	}
-	say("   session read -> %q", r.Text)
+	say("   -> %q", r.Text)
 
-	say("\n3. session tries to grant itself %s", RoleAdmin)
-	if err := expectDenied("self-grant", setRoles(sessConn, sessID, RoleAdmin)); err != nil {
+	say("\n2. the viewer reads: enrolled, but its credential carries no role")
+	_, err = read(viewer)
+	if err := expectDenied("viewer read", err); err != nil {
 		return err
 	}
 
-	say("\n4. session starts a slow read (1.5 s); API revokes while it runs")
-	type result struct {
-		r   *ReadReply
-		err error
+	say("\n3. a node with no credential tries to connect")
+	stranger, _, err := start("stranger", "", false)
+	if err != nil {
+		return err
 	}
-	inflight := make(chan result, 1)
-	go func() {
-		r, err := read(1500 * time.Millisecond)
-		inflight <- result{r, err}
-	}()
-	time.Sleep(300 * time.Millisecond) // let the call pass Gate 3
-	start := time.Now()
-	if err := setRoles(apiConn, sessID, ""); err != nil {
+	defer stranger.Close()
+	if _, err := read(stranger); err == nil {
+		return errors.New("a node without a credential reached the service")
+	} else {
+		say("   -> refused at admission (%v)", firstLine(err))
+	}
+
+	say("\n4. the root revokes the session node (aster enroll revoke --peer <server>)")
+	err = f.revoke(ctx, server, sessID, func() error {
+		select {
+		case rev := <-revocations:
+			say("   serving node revoked %s (%s) and closed its connections", short(rev.Peer), rev.Reason.Code)
+			return nil
+		case <-time.After(30 * time.Second):
+			return errors.New("the serving node did not revoke the session node")
+		}
+	})
+	if err != nil {
 		return fmt.Errorf("revoke: %w", err)
 	}
-	say("   API revoked all roles (SetRoles round trip %v)", time.Since(start).Round(time.Millisecond))
 
-	say("\n5. session's next call, same connection")
-	_, err = read(0)
-	if err := expectDenied("read after revoke", err); err != nil {
+	say("\n5. the session node's next call")
+	if _, err := read(session); err == nil {
+		return errors.New("a revoked node's call succeeded")
+	} else {
+		say("   -> refused (%v)", firstLine(err))
+	}
+	if _, err := session.Reconnect(ctx, server); err == nil {
+		if _, err := read(session); err == nil {
+			return errors.New("a revoked node reconnected and read")
+		}
+	}
+	say("   -> and it cannot come back: the revocation is the root's, durable on the serving node")
+
+	say("\n6. mid-session change without a new credential: the API node (%s in its credential) grants the viewer %s",
+		RoleAdmin, RoleClipboardRead)
+	conn, err := api.Connect(ctx, server)
+	if err != nil {
 		return err
 	}
-
-	res := <-inflight
-	if res.err != nil {
-		return fmt.Errorf("in-flight read should complete after revoke, got %v", res.err)
+	setRoles := func(roles string) error {
+		_, err := aster.Call[SetRolesRequest, SetRolesReply](ctx, conn, "Control", "SetRoles", &SetRolesRequest{Peer: viewerID, Roles: roles})
+		return err
 	}
-	say("\n6. the read that was already in flight completed: %q", res.r.Text)
-
-	say("\n7. the API node's own grant is not changeable over RPC")
-	if err := expectDenied("change API roles", setRoles(apiConn, apiID, "")); err != nil {
+	if err := setRoles(RoleClipboardRead); err != nil {
+		return fmt.Errorf("grant: %w", err)
+	}
+	if r, err = read(viewer); err != nil {
+		return fmt.Errorf("viewer read after the grant: %w", err)
+	}
+	say("   viewer read -> %q", r.Text)
+	if err := setRoles(""); err != nil {
+		return fmt.Errorf("revoke runtime roles: %w", err)
+	}
+	_, err = read(viewer)
+	if err := expectDenied("viewer read after the runtime revoke", err); err != nil {
 		return err
 	}
 	say("\nOK")
@@ -270,8 +415,19 @@ func short(id string) string {
 	return id
 }
 
+func firstLine(err error) string {
+	s := err.Error()
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 100 {
+		s = s[:100] + "..."
+	}
+	return s
+}
+
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if err := Run(ctx, os.Stdout); err != nil {
 		log.Fatal(err)

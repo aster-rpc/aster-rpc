@@ -1,4 +1,4 @@
-# Postgres lease serializer and fenced writes
+# Postgres lease serializer behind a lease grantor, and fenced writes
 
 A controller that pauses (GC pause, `SIGSTOP`, VM live migration, a long
 syscall) and is replaced while it is paused must not overwrite the work its
@@ -7,18 +7,26 @@ does not know its lease expired. Fencing prevents it. Every protected write
 carries the fence `(resource, epoch, holder)`, and the store accepts the
 write only if that fence is still current.
 
-This example implements both halves on Postgres:
+The example runs the high-level path (`StartServer` / `StartClient`, Rust
+`aster::rpc::lease`):
 
-- **`PGSerializer`** (`store.go`) is the lease serialization point. It
-  implements `aster.LeaseSerializer` and is served with
-  `Upcalls.ServeLeaseSerializer`. The Rust holder engine (acquire,
-  background renewals, the holder's self-limit) runs over it through
-  `aster.NewForeignLeaseSerializer`.
-- **`FencedWrite` / `PGFencedResource`** (`store.go`) are the resource side.
-  They update a `work` row only when the writer holds the current epoch.
-  They are served with `Upcalls.ServeFencedResource` and called through
-  `aster.FencedResourceHandle.Mutate`. You can also call `FencedWrite`
-  directly from your own code.
+- **The grantor node** is an `AsterServer` serving `aster.lease.Grantor`
+  (`ServerOptions.LeaseGrantor`) over **`PGSerializer`** (`store.go`), a
+  Postgres implementation of `aster.LeaseSerializer`. It is the one
+  serialization point for the resource's leases. It also serves the
+  protected store, **`Work.Write`** (`main.go`), which applies a write with
+  **`FencedWrite`** (`store.go`) only while the fence is current.
+- **The controllers** are `AsterClient`s with their own node keys. Each
+  acquires through the grantor (`AsterClient.LeaseGrantor`); the Rust holder
+  engine renews in the background through it. The grantor binds every
+  lease operation to the caller's **authenticated** node id, never a request
+  field, and `Work.Write` uses that same id as both the fence holder and the
+  writer: a controller can neither take nor use a lease as anyone else.
+
+Configuration comes from `aster.ConfigFromEnv()` (defaulting to a relay-free
+loopback node for the demo), so the same program runs with Enrollment
+(`ASTER_ENROLLMENT_*`): the grantor then admits only enrolled controllers,
+and `LeaseGrantor.Requires` can gate the methods by role.
 
 The example is a separate Go module, so the `pgx` driver stays out of the
 binding's `go.mod`. A `replace` points it at the binding (`../..`).
@@ -35,37 +43,39 @@ export CGO_LDFLAGS="-L$(pwd)/../../../../target/debug -laster_transport_ffi -Wl,
 export PG_DSN="postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable"
 
 go run .          # the demo
-go test -v .      # serializer and fence tests (skipped when PG_DSN is unset)
+go test -v .      # serializer, fence and grantor tests (skipped when PG_DSN is unset)
 ```
 
 The demo creates `leases` and `work` if they do not exist. It uses the
 resource `kasm/session-controller`. Epochs carry over between runs and are
-never reused. Output from a real run against Postgres 17:
+never reused. Output from a real run against a fresh Postgres 17 (Rust log
+lines on stderr omitted):
 
 ```
-start: kasm/session-controller epoch=3 held=false (epochs persist across runs; never reused)
+controller-a is node 39b4eeb2cc4f, controller-b is node a89417916e3b
+start: kasm/session-controller epoch=0 held=false (epochs persist across runs; never reused)
 
-1. controller-a acquired epoch 4
-  controller-a  write "a: scale pool to 3"         fence(epoch=4, holder=controller-a): APPLIED
-   controller-b acquire while a is live: denied (held_by_other, retry in ~1999ms)
+1. controller-a acquired epoch 1
+  controller-a  write "a: scale pool to 3"         epoch=1: APPLIED
+   controller-b acquire while a is live: denied (held_by_other, retry in ~1995ms)
 
 2. controller-a paused (no renewals), sleeping 2.5s past its TTL of 2s
 
-3. controller-b acquired epoch 5 (a's lease expired)
-  controller-b  write "b: scale pool to 5"         fence(epoch=5, holder=controller-b): APPLIED
+3. controller-b acquired epoch 2 (a's lease expired)
+  controller-b  write "b: scale pool to 5"         epoch=2: APPLIED
 
 4. controller-a wakes up and sends its delayed write
-  controller-a  write "a: scale pool to 3 (stale)" fence(epoch=4, holder=controller-a): REFUSED (stale_epoch, carried=4 current=5)
+  controller-a  write "a: scale pool to 3 (stale)" epoch=1: REFUSED (stale_epoch, carried=1 current=2)
 
-5. controller-a replays the current epoch 5 (read from a snapshot)
-  controller-a  write "a: replayed current epoch"  fence(epoch=5, holder=controller-a): REFUSED (not_holder)
-   a naive "WHERE epoch = 5" guard would have accepted that write: true
+5. controller-a replays the current epoch 2 (read from a snapshot)
+  controller-a  write "a: replayed current epoch"  epoch=2: REFUSED (not_holder)
+   a naive "WHERE epoch = 2" guard would have accepted that write: true
 
 6. controller-b released (fence advances)
-  controller-b  write "b: late write after release" fence(epoch=5, holder=controller-b): REFUSED (stale_epoch, carried=5 current=6)
+  controller-b  write "b: late write after release" epoch=2: REFUSED (stale_epoch, carried=2 current=3)
 
-final work row: "b: scale pool to 5" written by controller-b at epoch 5
-final lease:    epoch=6 held=false
+final work row: "b: scale pool to 5" written by controller-b at epoch 2
+final lease:    epoch=3 held=false
 OK: the deposed controller did not overwrite its successor's work
 ```
 
@@ -132,8 +142,9 @@ WHERE resource = $1
   was refused (`stale_epoch`, `not_holder`, `not_held`, `future_epoch`).
 - `$3` (`writer`) must be the **authenticated** identity of the caller,
   never a value from the request. On Aster, that is the peer node id that
-  the QUIC handshake proves (`CallInfo.PeerID` in a handler). In this
-  single-process demo, the writer names are plain strings.
+  the QUIC handshake proves: `Work.Write` passes `CallInfo.PeerID`, the
+  same id the grantor bound the lease to. The request carries only the
+  resource, the epoch and the payload.
 - If your business table can store the lease epoch, you can fence without
   a join. Add `WHERE work.lease_epoch <= $2` and also keep the holder check
   against the lease row. A monotonic per-row epoch on its own still does
@@ -167,6 +178,11 @@ atomically with the write. That is `aster::lease::check_fence`, which is
 - `Lease.Close()` stops renewals without releasing, as a frozen process
   would. `Release` hands the lease off at once and advances the epoch.
   After a release, the holder's own in-flight writes are refused.
-- Authorization (who may acquire or revoke) is not part of this example.
-  Gate it before the state machine, either in your RPC layer or with a
-  `Denied(unauthorized)` result from `Transition`.
+- Authorization: the grantor's `revoke` requires the `operator` role by
+  default (`LeaseGrantor.RevokeRequires`); `LeaseGrantor.Requires` gates
+  every method by role (for example from enrollment credentials). A
+  serializer can also refuse with a `Denied(unauthorized)` result from
+  `Transition`.
+- A dead grantor stops grants and renewals; holders run to their
+  self-limit and report `Lost`. It never splits: there is no automatic
+  failover.
