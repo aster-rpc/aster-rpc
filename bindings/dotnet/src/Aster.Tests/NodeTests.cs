@@ -88,15 +88,16 @@ public class NodeTests
             relay_mode = "disabled"
             bind_addr = "127.0.0.1:0"
 
-            [trust]
-            allow_all_consumers = true
+            [connect]
+            endpoint_addr = "aster1example"
             """);
         try
         {
             var c = AsterConfig.FromToml(path);
             Assert.Equal("disabled", c.RelayMode);
             Assert.Equal("127.0.0.1:0", c.BindAddr);
-            Assert.True(c.AllowAllConsumers);
+            Assert.Equal("aster1example", c.EndpointAddr);
+            Assert.False(c.IsEnrollmentEnabled);
         }
         finally { File.Delete(path); }
     }

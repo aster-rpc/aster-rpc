@@ -38,7 +38,7 @@ static class AsterServerExample
 
         await using var server = await AsterServer.StartAsync(new AsterServerOptions
         {
-            Config = config with { AllowAllConsumers = true },
+            Config = config, // no [enrollment] configured: an open server (see mc-server --auth)
             Services = { service },
         });
         var ticket = await server.TicketAsync();

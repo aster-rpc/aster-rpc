@@ -64,7 +64,7 @@ var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" 
 int unary = 0, streamed = 0, deadline = 0, cancel = 0, shutdown = 0;
 try {
     await using (var server = await AsterServer.StartAsync(new AsterServerOptions {
-        Config = config with { AllowAllConsumers = true }, Services = { service }
+        Config = config, Services = { service }
     })) {
         await using (var client = await AsterClient.StartAsync(config)) {
             client.RegisterTypes(service);

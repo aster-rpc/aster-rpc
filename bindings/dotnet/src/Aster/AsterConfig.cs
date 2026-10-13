@@ -46,8 +46,8 @@ public sealed record TransportConfig
 /// var config = AsterConfig.FromEnv() with { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
 /// await using var node = await Node.StartAsync(config);
 /// </code>
-/// The binding-level settings at the end (trust, connect, logging) are read from the same
-/// sources by this class.
+/// <c>[trust]</c> and <c>[enrollment]</c> are resolved by Rust too (C ABI 5.1); the binding-level
+/// settings at the end (connect, logging, health) are read from the same sources by this class.
 /// </summary>
 public sealed record AsterConfig
 {
@@ -82,15 +82,57 @@ public sealed record AsterConfig
     public Portmapper Portmapper { get; init; }
     public TransportConfig Transport { get; init; } = new();
 
-    // ── Binding-level settings ────────────────────────────────────────────
+    // ── Trust and Enrollment ([trust], [enrollment]; design §15.3) ────────
+    //
+    // Read by FromEnv / FromToml through the Rust aster::AsterConfig
+    // (aster_config_enrollment_from_env / _from_toml), so names, defaults and precedence
+    // (defaults < TOML < environment < code) are the Rust SDK's exactly. A node is open exactly
+    // when enrollment is not configured (IsEnrollmentEnabled): there is no "allow all" switch.
 
-    /// <summary>Open Gate 0 to every consumer (dev mode): the server's gate uses <see cref="TrustMode.OpenDev"/>.</summary>
-    public bool AllowAllConsumers { get; init; }
-    public bool AllowAllProducers { get; init; } = true;
+    /// <summary>
+    /// The trusted root (32 bytes): <see cref="RootPubkey"/>, or <see cref="RootPubkeyFile"/> (64
+    /// hex, or JSON <c>{"public_key": "&lt;hex&gt;"}</c>); both set must agree. Env
+    /// <c>ASTER_ROOT_PUBKEY(_FILE)</c>; TOML <c>[trust] root_pubkey(_file)</c>.
+    /// </summary>
     public byte[]? RootPubkey { get; init; }
     public string? RootPubkeyFile { get; init; }
+    /// <summary>
+    /// Root rotation pin (64 hex); without it every rotation statement is refused. Env
+    /// <c>ASTER_NEXT_ROOT_COMMITMENT</c>; TOML <c>[trust] next_root_commitment</c>.
+    /// </summary>
+    public string? NextRootCommitment { get; init; }
+    /// <summary>Rotations applied to reach the root (<c>ASTER_ROOT_SEQ</c>, <c>[trust] root_seq</c>).</summary>
+    public ulong RootSeq { get; init; }
+    /// <summary>Applied rotation statements, oldest first (<c>ASTER_ROOT_ROTATIONS</c> comma-separated, <c>[trust] root_rotations</c>).</summary>
+    public IReadOnlyList<string> RootRotations { get; init; } = Array.Empty<string>();
+    /// <summary>
+    /// This node's enrollment credential chain file (<c>aster enroll node --out</c>). Env
+    /// <c>ASTER_ENROLLMENT_CREDENTIAL</c>; TOML <c>[trust] enrollment_credential</c>. Setting it
+    /// enables enrollment.
+    /// </summary>
     public string? EnrollmentCredentialFile { get; init; }
-    public string? EnrollmentCredentialIid { get; init; }
+    /// <summary>
+    /// The credential chain inline; wins over <see cref="EnrollmentCredentialFile"/>. A value that
+    /// is not a chain is refused. Env <c>ASTER_ENROLLMENT_CREDENTIAL_CHAIN</c>; TOML
+    /// <c>[trust] enrollment_credential_chain</c>.
+    /// </summary>
+    public string? EnrollmentCredentialChain { get; init; }
+    /// <summary>The <c>[enrollment]</c> section (<c>ASTER_ENROLLMENT_*</c>).</summary>
+    public EnrollmentConfig Enrollment { get; init; } = new();
+
+    /// <summary>
+    /// Whether <see cref="AsterServer"/> / <see cref="AsterClient"/> install Enrollment from this
+    /// config: <see cref="EnrollmentConfig.Enabled"/> when set, else whether an audience, a fleet
+    /// namespace, an issuer delegation or a credential (file or chain) is configured. The root and
+    /// rotation pin alone do not enable it. (Rust <c>AsterConfig::is_enrollment_enabled</c>.)
+    /// </summary>
+    public bool IsEnrollmentEnabled => Enrollment.Enabled ?? (
+        !string.IsNullOrWhiteSpace(Enrollment.Audience) || !string.IsNullOrWhiteSpace(Enrollment.FleetNamespace)
+        || !string.IsNullOrWhiteSpace(Enrollment.IssuerDelegationFile) || !string.IsNullOrWhiteSpace(EnrollmentCredentialFile)
+        || !string.IsNullOrWhiteSpace(EnrollmentCredentialChain));
+
+    // ── Binding-level settings ([connect], [logging]) ─────────────────────
+
     public string? EndpointAddr { get; init; }
     public string LogFormat { get; init; } = "text";
     public string LogLevel { get; init; } = "info";
@@ -117,43 +159,95 @@ public sealed record AsterConfig
         return FromNative(in n, new AsterConfig());
     }
 
-    /// <summary>Rust <c>AsterConfig::from_env</c> plus the binding-level <c>ASTER_*</c> variables.</summary>
+    /// <summary>
+    /// Rust <c>AsterConfig::from_env</c>: the node settings, <c>[trust]</c> and <c>[enrollment]</c>
+    /// (<c>ASTER_ROOT_*</c>, <c>ASTER_ENROLLMENT_*</c>), plus the binding-level <c>ASTER_*</c>
+    /// variables. A malformed variable throws <see cref="IrohException"/> (<c>InvalidArgument</c>).
+    /// </summary>
     public static unsafe AsterConfig FromEnv()
     {
         ConfigNative n = default;
         Native.Check(Native.aster_config_from_env(&n), "aster_config_from_env");
-        try { return FromNative(in n, new AsterConfig()).WithBindingEnv(); }
+        AsterConfig c;
+        try { c = FromNative(in n, new AsterConfig()).WithBindingEnv(); }
         finally { Native.aster_config_release(&n); }
+        Bytes trust = default;
+        Native.Check(Native.aster_config_enrollment_from_env(&trust), "aster_config_enrollment_from_env");
+        return c.WithTrust(TrustJson.Parse(NativeScope.TakeOwned(ref trust)));
     }
 
     /// <summary>
-    /// Rust <c>AsterConfig::from_file</c> (the TOML file, then <c>ASTER_*</c> overrides) plus the
-    /// file's <c>[trust]</c> / <c>[connect]</c> / <c>[logging]</c> sections and their env overrides.
+    /// Rust <c>AsterConfig::from_file</c> (the TOML file, then <c>ASTER_*</c> overrides), including
+    /// <c>[trust]</c> and <c>[enrollment]</c>, plus the file's <c>[connect]</c> / <c>[logging]</c> /
+    /// <c>[health]</c> sections and their env overrides.
     /// </summary>
     public static unsafe AsterConfig FromToml(string path)
     {
         ConfigNative n = default;
+        Bytes trust = default;
         using (var scope = new NativeScope())
             Native.Check(Native.aster_config_from_toml(scope.Utf8(path), &n), "aster_config_from_toml");
         AsterConfig c;
         try { c = FromNative(in n, new AsterConfig()); }
         finally { Native.aster_config_release(&n); }
-        return c.WithBindingToml(path).WithBindingEnv();
+        using (var scope = new NativeScope())
+            Native.Check(Native.aster_config_enrollment_from_toml(scope.Utf8(path), &trust), "aster_config_enrollment_from_toml");
+        return c.WithBindingToml(path).WithBindingEnv().WithTrust(TrustJson.Parse(NativeScope.TakeOwned(ref trust)));
     }
 
-    /// <summary>Resolves the root public key from <see cref="RootPubkey"/> or <see cref="RootPubkeyFile"/>.</summary>
+    /// <summary>
+    /// The configured root public key: <see cref="RootPubkey"/>, else the key in
+    /// <see cref="RootPubkeyFile"/> (64 hex, or JSON <c>{"public_key": "&lt;hex&gt;"}</c>); null when
+    /// neither yields a 32-byte key.
+    /// </summary>
     public byte[]? ResolveRootPubkey()
     {
-        if (RootPubkey != null) return RootPubkey;
-        if (RootPubkeyFile != null && File.Exists(RootPubkeyFile))
+        if (RootPubkey is { Length: 32 }) return RootPubkey;
+        if (RootPubkeyFile == null || !File.Exists(RootPubkeyFile)) return null;
+        var content = File.ReadAllText(RootPubkeyFile).Trim();
+        try
         {
-            var content = File.ReadAllText(RootPubkeyFile).Trim();
-            if (content.Length == 64)
-            {
-                try { return Convert.FromHexString(content); } catch (FormatException) { }
-            }
+            if (content.StartsWith('{'))
+                content = System.Text.Json.JsonDocument.Parse(content).RootElement.GetProperty("public_key").GetString() ?? "";
+            var key = Convert.FromHexString(content);
+            return key.Length == 32 ? key : null;
         }
-        return null;
+        catch (Exception e) when (e is FormatException or System.Text.Json.JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    // ── [trust] + [enrollment] JSON (C ABI 5.1) ───────────────────────────
+
+    private AsterConfig WithTrust(TrustJson t) => this with
+    {
+        RootPubkey = string.IsNullOrWhiteSpace(t.RootPubkey) ? null : Convert.FromHexString(t.RootPubkey.Trim()),
+        RootPubkeyFile = t.RootPubkeyFile,
+        NextRootCommitment = t.NextRootCommitment,
+        RootSeq = t.RootSeq,
+        RootRotations = t.RootRotations,
+        EnrollmentCredentialFile = t.EnrollmentCredentialFile,
+        EnrollmentCredentialChain = t.EnrollmentCredentialChain,
+        Enrollment = t.Enrollment,
+    };
+
+    /// <summary>The trust JSON <c>aster_node_start_enrolled</c> takes.</summary>
+    internal byte[] TrustJsonBytes()
+    {
+        if (RootPubkey is { } key && key.Length != 32)
+            throw new ArgumentException($"RootPubkey: {key.Length} bytes, want 32", nameof(RootPubkey));
+        return new TrustJson
+        {
+            RootPubkey = RootPubkey is null ? null : Convert.ToHexString(RootPubkey).ToLowerInvariant(),
+            RootPubkeyFile = RootPubkeyFile,
+            NextRootCommitment = NextRootCommitment,
+            RootSeq = RootSeq,
+            RootRotations = RootRotations.ToList(),
+            EnrollmentCredentialFile = EnrollmentCredentialFile,
+            EnrollmentCredentialChain = EnrollmentCredentialChain,
+            Enrollment = Enrollment,
+        }.Encode();
     }
 
     // ── aster_config_t marshalling ────────────────────────────────────────
@@ -280,17 +374,8 @@ public sealed record AsterConfig
         static string? S(TomlTable? t, string k) => t != null && t.TryGetValue(k, out var v) && v is string s ? s : null;
         static bool? B(TomlTable? t, string k) => t != null && t.TryGetValue(k, out var v) && v is bool b ? b : null;
 
-        var trust = Sec("trust");
-        c = c with
-        {
-            RootPubkeyFile = S(trust, "root_pubkey_file") ?? c.RootPubkeyFile,
-            EnrollmentCredentialFile = S(trust, "enrollment_credential") ?? c.EnrollmentCredentialFile,
-            EnrollmentCredentialIid = S(trust, "enrollment_credential_iid") ?? c.EnrollmentCredentialIid,
-            AllowAllConsumers = B(trust, "allow_all_consumers") ?? c.AllowAllConsumers,
-            AllowAllProducers = B(trust, "allow_all_producers") ?? c.AllowAllProducers,
-            RootPubkey = S(trust, "root_pubkey") is { } hex ? Convert.FromHexString(hex) : c.RootPubkey,
-            EndpointAddr = S(Sec("connect"), "endpoint_addr") ?? c.EndpointAddr,
-        };
+        // [trust] and [enrollment] come from Rust (aster_config_enrollment_from_toml).
+        c = c with { EndpointAddr = S(Sec("connect"), "endpoint_addr") ?? c.EndpointAddr };
         var log = Sec("logging");
         var health = Sec("health");
         c = c with
@@ -317,20 +402,10 @@ public sealed record AsterConfig
             "false" or "0" or "no" or "off" => false,
             _ => null,
         };
-        byte[]? rootPubkey = RootPubkey;
-        if (Env("ASTER_ROOT_PUBKEY") is { } hex)
-        {
-            try { rootPubkey = Convert.FromHexString(hex); } catch (FormatException) { }
-        }
+        // ASTER_ROOT_* and ASTER_ENROLLMENT_* come from Rust (aster_config_enrollment_from_*).
         return this with
         {
-            RootPubkey = rootPubkey,
-            RootPubkeyFile = Env("ASTER_ROOT_PUBKEY_FILE") ?? RootPubkeyFile,
-            EnrollmentCredentialFile = Env("ASTER_ENROLLMENT_CREDENTIAL") ?? EnrollmentCredentialFile,
-            EnrollmentCredentialIid = Env("ASTER_ENROLLMENT_CREDENTIAL_IID") ?? EnrollmentCredentialIid,
             EndpointAddr = Env("ASTER_ENDPOINT_ADDR") ?? EndpointAddr,
-            AllowAllConsumers = EnvBool("ASTER_ALLOW_ALL_CONSUMERS") ?? AllowAllConsumers,
-            AllowAllProducers = EnvBool("ASTER_ALLOW_ALL_PRODUCERS") ?? AllowAllProducers,
             LogFormat = Env("ASTER_LOG_FORMAT")?.ToLowerInvariant() ?? LogFormat,
             LogLevel = Env("ASTER_LOG_LEVEL")?.ToLowerInvariant() ?? LogLevel,
             LogMask = EnvBool("ASTER_LOG_MASK") ?? LogMask,
@@ -352,7 +427,7 @@ public sealed record AsterConfig
         var sb = new StringBuilder("AsterConfig { ");
         sb.Append($"RelayMode = {RelayMode}, BindAddr = {BindAddr}, StoragePath = {StoragePath}, ");
         sb.Append($"Alpns = [{string.Join(", ", Alpns)}], SecretKey = {(SecretKey is null ? "null" : "<redacted>")}, ");
-        sb.Append($"EnableHooks = {EnableHooks}, AllowAllConsumers = {AllowAllConsumers} }}");
+        sb.Append($"EnableHooks = {EnableHooks}, Enrollment = {IsEnrollmentEnabled} }}");
         return sb.ToString();
     }
 }

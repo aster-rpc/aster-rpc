@@ -123,6 +123,16 @@ internal sealed class DispatchServer : IDisposable
             return this;
         }
 
+        /// <summary>Serves <c>aster.lease.Grantor</c> over <paramref name="serializer"/> (<c>aster_server_add_lease_grantor</c>).</summary>
+        public Builder LeaseGrantor(ulong serializer, LeaseGrantorOptions options)
+        {
+            var (requires, revoke) = options.Requirements();
+            using var scope = new NativeScope();
+            Native.Check(Native.aster_server_add_lease_grantor(_handle, serializer, scope.Bytes(requires), scope.Bytes(revoke)),
+                "aster_server_add_lease_grantor");
+            return this;
+        }
+
         public Builder Option(DispatchServerOption key, ulong value)
         {
             Native.Check(Native.aster_server_set_option(_handle, (uint)key, value), "aster_server_set_option");

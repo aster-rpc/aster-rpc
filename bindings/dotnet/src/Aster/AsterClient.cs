@@ -57,7 +57,15 @@ public sealed record CallOptions
 /// var conn = await client.ConnectAsync(AsterTicket.Parse(ticket));
 /// EchoReply reply = await conn.UnaryAsync&lt;EchoRequest, EchoReply&gt;("InteropEcho", "echo", request);
 /// </code>
-/// Calls go straight to <c>aster/1</c> (open gate); consumer admission is not performed.
+/// <para>
+/// <b>Enrollment.</b> With enrollment configured (<see cref="AsterConfig.IsEnrollmentEnabled"/>)
+/// the client presents its credential: before its first connection to a server it enrolls over
+/// the reciprocal handshake (the server verifies this node, this node verifies the server),
+/// synchronizes the fleet namespace the server offers, and renews its credential from that
+/// server when the server signed it (or from <see cref="EnrollmentConfig.RenewFrom"/>). Its roles
+/// on the server are the ones in its credential (design <c>aster-enrollment.md</c> §15.7).
+/// Without enrollment calls go straight to <c>aster/1</c>.
+/// </para>
 /// <para>
 /// <b>Interceptors.</b> Pass client interceptors (<see cref="DeadlineInterceptor"/>,
 /// <see cref="RetryInterceptor"/>, <see cref="CircuitBreakerInterceptor"/>, your own
@@ -85,13 +93,26 @@ public sealed class AsterClient : IAsyncDisposable
         _interceptors = interceptors is null ? ClientInterceptors.None : new ClientInterceptors(interceptors);
     }
 
-    /// <summary>Starts a client node (adds the <c>aster/1</c> ALPN to <paramref name="config"/>).</summary>
-    public static async Task<AsterClient> StartAsync(AsterConfig? config = null, ICodec? codec = null,
+    /// <summary>
+    /// Starts a client node (adds the <c>aster/1</c> ALPN to <paramref name="config"/>) and, when
+    /// the config enables enrollment, installs Enrollment from it: a missing or malformed setting
+    /// fails here, naming the setting (a credential is required; issuer settings are refused).
+    /// </summary>
+    public static Task<AsterClient> StartAsync(AsterConfig? config = null, ICodec? codec = null,
         IEnumerable<IInterceptor>? interceptors = null, CancellationToken cancellationToken = default)
+        => StartAsync(new AsterClientOptions { Config = config, Codec = codec, Interceptors = interceptors }, cancellationToken);
+
+    /// <summary>Starts a client from <paramref name="options"/> (see <see cref="StartAsync(AsterConfig?, ICodec?, IEnumerable{IInterceptor}?, CancellationToken)"/>).</summary>
+    public static async Task<AsterClient> StartAsync(AsterClientOptions options, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(options);
         AsterObservability.EnsureStarted();
-        var node = await Node.StartAsync(config, null, [AsterServer.AsterAlpn], cancellationToken).ConfigureAwait(false);
-        return new AsterClient(node, codec ?? new ForyCodec(), ownsNode: true, interceptors);
+        var config = options.Config ?? new AsterConfig();
+        if (options.EnrollmentPolicy is { } policy)
+            config = config with { Enrollment = config.Enrollment with { Policy = policy } };
+        var node = await Node.StartEnrolledAsync(config, Native.EnrollmentSideClient, [AsterServer.AsterAlpn], cancellationToken)
+            .ConfigureAwait(false);
+        return new AsterClient(node, options.Codec ?? new ForyCodec(), ownsNode: true, options.Interceptors);
     }
 
     /// <summary>A client on an existing node (which the caller keeps owning).</summary>
@@ -134,11 +155,60 @@ public sealed class AsterClient : IAsyncDisposable
     public Task<RpcConnection> ConnectAsync(AsterTicket ticket, CancellationToken cancellationToken = default)
         => ConnectAsync(ticket.ToNodeAddr(), cancellationToken);
 
+    /// <summary>
+    /// Drops the cached connection to <paramref name="addr"/> (for one the server closed, e.g.
+    /// after a revocation) and opens a new one, enrolling again first when enrollment is configured.
+    /// </summary>
+    public async Task<RpcConnection> ReconnectAsync(NodeAddrInfo addr, CancellationToken cancellationToken = default)
+    {
+        if (_connections.TryRemove(addr.EndpointId, out var old) && old.IsCompletedSuccessfully)
+            await old.Result.DisposeAsync().ConfigureAwait(false);
+        Enrollment?.Forget(addr.EndpointId);
+        return await ConnectAsync(addr, cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task<RpcConnection> ConnectCore(NodeAddrInfo addr, CancellationToken ct)
     {
+        // Enroll before the first aster/1 connection to each server (design §15.7).
+        if (Enrollment is { } enrollment)
+            await enrollment.EnrollAsync(addr, force: false, ct).ConfigureAwait(false);
         var conn = await _node.ConnectAsync(addr, AsterServer.AsterAlpn, ct).ConfigureAwait(false);
         return new RpcConnection(conn, Codec, _interceptors);
     }
+
+    /// <summary>The Enrollment installed from the config (null when enrollment is off).</summary>
+    public Enrollment? Enrollment => _node.Enrollment;
+
+    /// <summary>Whether this client renews its credential (Rust <c>AsterClient::is_renewing</c>).</summary>
+    public bool IsRenewing
+    {
+        get
+        {
+            if (Enrollment is not { } e) return false;
+            try { return e.Status().Renewing; }
+            catch (Exception ex) when (ex is IrohException or ObjectDisposedException) { return false; }
+        }
+    }
+
+    /// <summary>
+    /// A lease serializer backed by the <c>aster.lease.Grantor</c> the server at
+    /// <paramref name="addr"/> serves (Rust <c>GrantorSerializer</c>): acquire, snapshot and revoke
+    /// are calls to it, and acquired leases renew through it in the background. Acquire with
+    /// holder = this client's node id (<see cref="Node.NodeId"/>): the grantor binds this client's
+    /// calls to it. Enrolls with the server first when enrollment is configured. Dispose the
+    /// serializer when done.
+    /// </summary>
+    public async Task<Lease.NativeLeaseSerializer> LeaseGrantorAsync(NodeAddrInfo addr, CancellationToken cancellationToken = default)
+    {
+        var rc = await ConnectAsync(addr, cancellationToken).ConfigureAwait(false);
+        Native.Check(Native.aster_lease_serializer_grantor_new(_node.Runtime.Handle, _node.Handle.Value, rc.Connection.Handle.Value,
+            out ulong serializer), "aster_lease_serializer_grantor_new");
+        return new Lease.NativeLeaseSerializer(_node.Runtime, serializer);
+    }
+
+    /// <inheritdoc cref="LeaseGrantorAsync(NodeAddrInfo, CancellationToken)"/>
+    public Task<Lease.NativeLeaseSerializer> LeaseGrantorAsync(AsterTicket ticket, CancellationToken cancellationToken = default)
+        => LeaseGrantorAsync(ticket.ToNodeAddr(), cancellationToken);
 
     public async ValueTask DisposeAsync()
     {
@@ -151,6 +221,25 @@ public sealed class AsterClient : IAsyncDisposable
         if (_ownsNode)
             await _node.DisposeAsync().ConfigureAwait(false);
     }
+}
+
+/// <summary>Options for <see cref="AsterClient.StartAsync(AsterClientOptions, CancellationToken)"/>.</summary>
+public sealed class AsterClientOptions
+{
+    /// <summary>Node configuration (null = defaults), including <c>[trust]</c> and <c>[enrollment]</c>.</summary>
+    public AsterConfig? Config { get; init; }
+
+    /// <summary>Payload codec (default: a <see cref="ForyCodec"/>).</summary>
+    public ICodec? Codec { get; init; }
+
+    /// <summary>Client interceptors, in the order they run.</summary>
+    public IEnumerable<IInterceptor>? Interceptors { get; init; }
+
+    /// <summary>
+    /// Judges servers' enrollment evidence with this policy instead of
+    /// <see cref="EnrollmentConfig.Policy"/> (Rust <c>AsterClientBuilder::enrollment_policy</c>).
+    /// </summary>
+    public EnrollmentPolicy? EnrollmentPolicy { get; init; }
 }
 
 /// <summary>

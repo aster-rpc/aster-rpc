@@ -10,7 +10,7 @@ namespace Aster.Tests;
 /// <summary>Session-scoped services: Rust routes sessions per connection; .NET keeps the per-session state.</summary>
 public class SessionTests
 {
-    private static readonly AsterConfig Loopback = new() { RelayMode = "disabled", BindAddr = "127.0.0.1:0", AllowAllConsumers = true };
+    private static readonly AsterConfig Loopback = new() { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
 
     public sealed class SessionLog
     {
@@ -55,7 +55,7 @@ public class SessionTests
             Services = { Counter(log) },
             MaxSessionsPerConnection = maxSessions,
         });
-        var client = await AsterClient.StartAsync(Loopback with { AllowAllConsumers = false });
+        var client = await AsterClient.StartAsync(Loopback);
         client.RegisterTypes(Counter(log));
         var conn = await client.ConnectAsync(await server.TicketAsync());
         return (server, client, conn);

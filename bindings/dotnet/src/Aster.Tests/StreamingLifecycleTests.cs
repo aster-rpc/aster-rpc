@@ -54,7 +54,7 @@ public class StreamingLifecycleTests
             .BidiStream<EchoRequest, EchoReply>("chat", Bidi)
             .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply { Message = req.Message }))
             .Build();
-        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0", AllowAllConsumers = true };
+        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
         await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = config, Services = { service } });
         await using var client = await AsterClient.StartAsync(config);
         client.RegisterTypes(service);
@@ -126,7 +126,7 @@ public class StreamingLifecycleTests
         var service = ServiceDefinition.Create("LocalFailure", 1)
             .ClientStream<EchoRequest, EchoReply>("upload", Hold)
             .BidiStream<EchoRequest, EchoReply>("chat", HoldBidi).Build();
-        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0", AllowAllConsumers = true };
+        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
         await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = config, Services = { service } });
         await using var client = await AsterClient.StartAsync(config);
         client.RegisterTypes(service);
@@ -156,7 +156,7 @@ public class StreamingLifecycleTests
         var service = ServiceDefinition.Create("Empty", 1).ClientStream<EchoRequest, EchoReply>("upload", Upload)
             .BidiStream<EchoRequest, EchoReply>("chat", Chat)
             .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply { Message = req.Message })).Build();
-        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0", AllowAllConsumers = true };
+        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
         await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = config, Services = { service } });
         await using var client = await AsterClient.StartAsync(config);
         client.RegisterTypes(service);
@@ -198,7 +198,7 @@ public class StreamingLifecycleTests
         { yield return await Hold(source, ctx); }
         var service = ServiceDefinition.Create("CancelParked", 1).ClientStream<EchoRequest, EchoReply>("upload", Hold)
             .BidiStream<EchoRequest, EchoReply>("chat", Chat).Build();
-        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0", AllowAllConsumers = true };
+        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
         await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = config, Services = { service } });
         await using var client = await AsterClient.StartAsync(config);
         client.RegisterTypes(service);
@@ -250,7 +250,7 @@ public class StreamingLifecycleTests
             catch (OperationCanceledException) { cancelled.TrySetResult(true); throw; }
         }
         var service = ServiceDefinition.Create("Abandon", 1).BidiStream<EchoRequest, EchoReply>("chat", Chat).Build();
-        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0", AllowAllConsumers = true };
+        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
         await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = config, Services = { service } });
         await using var client = await AsterClient.StartAsync(config);
         client.RegisterTypes(service);
@@ -292,7 +292,7 @@ public class StreamingLifecycleTests
             .ClientStream<EchoRequest, EchoReply>("upload", Hold)
             .Unary<EchoRequest, EchoReply>("echo", (req, _) => ValueTask.FromResult(new EchoReply { Message = req.Message }))
             .Build();
-        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0", AllowAllConsumers = true };
+        var config = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
         await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = config, Services = { service } });
         await using var client = await AsterClient.StartAsync(config);
         client.RegisterTypes(service);

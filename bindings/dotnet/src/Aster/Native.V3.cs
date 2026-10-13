@@ -9,7 +9,7 @@ namespace Aster;
 internal static unsafe partial class Native
 {
     /// <summary>Minimum ABI minor (of <see cref="AbiVersionMajor"/>) for everything this binding declares.</summary>
-    public const uint RequiredAbiMinor = 0; // 5.0: 4.17 minus the removed attestation functions.
+    public const uint RequiredAbiMinor = 1; // 5.1: Enrollment from configuration and the lease grantor.
 
     // ─── 3.1: AEv1 envelope + zstd ──────────────────────────────────────────
 

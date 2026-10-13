@@ -176,7 +176,7 @@ public class ClientInterceptorTests : IAsyncLifetime
         var svc = Service();
         _server = await AsterServer.StartAsync(new AsterServerOptions
         {
-            Config = Loopback with { AllowAllConsumers = true },
+            Config = Loopback,
             Services = { svc, RpcTests.InteropEcho("dotnet") },
         });
         _client = await AsterClient.StartAsync(Loopback);

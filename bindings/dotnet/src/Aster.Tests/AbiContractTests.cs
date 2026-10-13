@@ -486,6 +486,23 @@ public class AbiContractTests
     [Fact]
     public void Abi_4_1_Exports_Are_Declared_Exported_And_In_The_Header() => AssertExports(Abi41Exports);
 
+    /// <summary>The 5.1 exports: Enrollment from configuration and the lease grantor.</summary>
+    [Fact]
+    public void Abi_5_1_Exports_Are_Declared_Exported_And_In_The_Header()
+    {
+        AssertExports([
+            "aster_config_enrollment_from_env", "aster_config_enrollment_from_toml", "aster_node_start_enrolled",
+            "aster_enrollment_enroll", "aster_enrollment_free", "aster_enrollment_check_peer", "aster_enrollment_peer_claims",
+            "aster_enrollment_status", "aster_enrollment_next_revocation", "aster_enrollment_issuer_info", "aster_enrollment_issue",
+            "aster_server_add_lease_grantor", "aster_lease_serializer_grantor_new",
+        ]);
+        Assert.Equal(127u, (uint)EventKind.EnrollmentResult);
+        Assert.Equal(1u, Native.RequiredAbiMinor);
+        Assert.Equal(new uint[] { 0, 1, 2, 3, 4 }, Enum.GetValues<AdmissionErrorKind>().Select(k => (uint)k).Order().ToArray());
+        Assert.Equal(0u, Native.EnrollmentSideServer);
+        Assert.Equal(1u, Native.EnrollmentSideClient);
+    }
+
     // ─── ABI 4.2: expose ────────────────────────────────────────────────────
 
     [Fact]

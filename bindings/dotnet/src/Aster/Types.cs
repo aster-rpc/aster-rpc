@@ -171,6 +171,8 @@ public enum EventKind : uint
     RawWTDatagram = 124,
     RawWTClosed = 125,
     RawWTAcked = 126,
+    /// <summary>ABI 5.1: an Enrollment operation's JSON result (payload); <c>handle</c> = the enrollment.</summary>
+    EnrollmentResult = 127,
 
     // Errors
     OperationCancelled = 98,

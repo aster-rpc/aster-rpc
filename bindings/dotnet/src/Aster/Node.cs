@@ -66,6 +66,53 @@ public sealed class Node : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Starts a node as <see cref="AsterServer"/> / <see cref="AsterClient"/> do
+    /// (<c>aster_node_start_enrolled</c>): when <paramref name="config"/> enables enrollment, Rust
+    /// validates the whole plan first (fail closed, naming the setting), starts the node with
+    /// fail-closed hooks and <see cref="Aster.Enrollment.Alpn"/>, and installs Enrollment from the
+    /// credential; otherwise this is a plain start with no gate.
+    /// </summary>
+    internal static async Task<Node> StartEnrolledAsync(AsterConfig config, uint side, IEnumerable<string>? extraAlpns,
+        CancellationToken cancellationToken)
+    {
+        byte[] trust = config.TrustJsonBytes();
+        var runtime = new Runtime();
+        try
+        {
+            ulong opId = BeginStartEnrolled(runtime, config, trust, side, extraAlpns);
+            Event ev = await runtime.WaitForAsync(opId, cancellationToken).ConfigureAwait(false);
+            if (ev.kind != (uint)EventKind.NodeCreated)
+                throw EventError.From(runtime, ev, "aster_node_start_enrolled");
+            ulong enrollment = ev.related;
+            var node = new Node(runtime, new NodeHandle(ev.handle), ownsRuntime: true,
+                admissionEvents: enrollment == 0 && config.EnableHooks);
+            if (enrollment != 0) node.Enrollment = new Enrollment(runtime, enrollment);
+            return node;
+        }
+        catch
+        {
+            runtime.Release();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The Enrollment installed when an <see cref="AsterServer"/> / <see cref="AsterClient"/>
+    /// started this node from a config that enables it (null otherwise). It owns admission.
+    /// </summary>
+    public Enrollment? Enrollment { get; private set; }
+
+    private static unsafe ulong BeginStartEnrolled(Runtime runtime, AsterConfig config, byte[] trust, uint side, IEnumerable<string>? extraAlpns)
+    {
+        using var scope = new NativeScope();
+        ConfigNative native = config.ToNative(scope, extraAlpns);
+        // The config and trust JSON are validated and copied before the call returns.
+        Native.Check(Native.aster_node_start_enrolled(runtime.Handle, &native, scope.Bytes(trust), side, 0, out ulong opId),
+            "aster_node_start_enrolled");
+        return opId;
+    }
+
     internal static unsafe ulong BeginStart(Runtime runtime, AsterConfig config, Gate? gate, IEnumerable<string>? extraAlpns)
     {
         using var scope = new NativeScope();
@@ -255,6 +302,8 @@ public sealed class Node : IDisposable, IAsyncDisposable
 
     private void Teardown()
     {
+        // Closing the node releases its enrollment handle.
+        Enrollment?.MarkClosed();
         if (_admissions != null)
         {
             _runtime.UnregisterInbound(_handle.Value);

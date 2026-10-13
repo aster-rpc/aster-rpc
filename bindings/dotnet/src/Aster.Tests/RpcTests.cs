@@ -163,7 +163,7 @@ public class RpcTests : IAsyncLifetime
         _codecDiagnostics = RpcCodecDiagnostics.Create();
         _server = await AsterServer.StartAsync(new AsterServerOptions
         {
-            Config = Loopback with { AllowAllConsumers = true },
+            Config = Loopback,
             Services = { echo, extra },
             Codec = _codecDiagnostics?.For("server", echo, extra),
             Interceptors = { new RequireTokenInterceptor() },

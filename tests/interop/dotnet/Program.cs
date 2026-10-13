@@ -411,7 +411,7 @@ internal static class InteropEcho
     {
         await using var server = await AsterServer.StartAsync(new AsterServerOptions
         {
-            Config = Config() with { AllowAllConsumers = true },
+            Config = Config(),
             Services = { service, session },
         });
         var ticket = await server.TicketAsync();

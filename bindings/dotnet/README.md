@@ -1,7 +1,7 @@
 # Aster .NET binding
 
 The .NET API wraps Aster's shared Rust engine through the C ABI. This checkout
-targets .NET 9 and requires native ABI **5.0 or newer within major 5**.
+targets .NET 9 and requires native ABI **5.1 or newer within major 5**.
 `Runtime` checks compatibility when it opens. Supply the native library through
 the repository build or an explicit build property:
 
@@ -14,6 +14,42 @@ dotnet test src/Aster.Tests/Aster.Tests.csproj \
 This is a checkout build instruction; it does not establish public NuGet or
 native package availability. The project copies the native library into build
 output. Without an override it looks in `target/release`, then `target/debug`.
+
+## Enrollment and roles (from configuration)
+
+`AsterServer` and `AsterClient` install Enrollment from `AsterConfig` exactly
+as the Rust SDK does (design `docs/_internal/working_ideas/aster-enrollment.md`
+§15): `[trust]` (`root_pubkey(_file)`, `enrollment_credential(_chain)`, the
+rotation pin) and `[enrollment]` (`audience`, `fleet_namespace`, `state_path`,
+`replicas`, `policy`, `limits`, `roles`, `issuer`, `renew_from`, …) in
+`aster.toml`, or the `ASTER_ROOT_*` / `ASTER_ENROLLMENT_*` variables, are read
+by Rust through `AsterConfig.FromToml` / `FromEnv`. With enrollment configured
+the server admits only nodes holding a credential from the root and turns each
+peer's verified claims into the roles `CapabilityRequirement`s are checked
+against, on every call; the client enrolls with each server before its first
+call and renews its credential. A missing or malformed setting fails the start,
+naming it. Without enrollment the node is open; there is no "allow all" switch.
+
+```csharp
+var config = AsterConfig.FromEnv(); // or AsterConfig.FromToml("aster.toml")
+await using var server = await AsterServer.StartAsync(new AsterServerOptions
+{
+    Config = config,
+    Services = { ServiceDefinition.Create("Ops", 1)
+        .Unary<StatusRequest, StatusReply>("status", Status, requires: CapabilityRequirement.Role("ops.status"))
+        .Build() },
+});
+```
+
+Escape hatches: `server.Enrollment` / `client.Enrollment` (`Status()`,
+`PeerClaims(peer)`, `CheckPeerAsync`, `NextRevocationAsync`), `server.Issuer`
+(configured delegated issuer: `Info()`, `Issue(...)`), `client.IsRenewing`,
+and the overrides `AsterServerOptions.EnrollmentPolicy` / `EnrollmentRoles` and
+`AsterClientOptions.EnrollmentPolicy`. `AsterServerOptions.LeaseGrantor` serves
+`aster.lease.Grantor`; `client.LeaseGrantorAsync(addr)` acquires through it.
+The Mission Control auth chapter in [`examples/`](examples/README.md) walks
+through it with the Rust `aster` CLI. Changes are listed in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Authenticated HTTPS and WebTransport serving
 

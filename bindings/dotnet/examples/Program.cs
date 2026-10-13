@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using Aster;
 
@@ -6,16 +7,26 @@ namespace Examples;
 
 class Program
 {
-    static async Task Main(string[] args)
+    static async Task<int> Main(string[] args)
     {
-        if (args.Length > 0 && args[0] == "runtime")
+        string command = args.Length > 0 ? args[0] : "echo";
+        string[] rest = args.Skip(1).ToArray();
+        switch (command)
         {
-            RunRuntimeTest();
-            return;
+            case "runtime":
+                RunRuntimeTest();
+                return 0;
+            case "mc-server":
+                return await MissionControl.ServerAsync(rest);
+            case "mc-agent":
+                return await MissionControl.AgentAsync(rest);
+            case "echo":
+                await AsterServerExample.RunAsync();
+                return 0;
+            default:
+                Console.Error.WriteLine("usage: Examples [echo | runtime | mc-server [--auth] [--config aster.toml] | mc-agent <address>]");
+                return 2;
         }
-
-        // Default: run the AsterServer echo example
-        await AsterServerExample.RunAsync();
     }
 
     static void RunRuntimeTest()

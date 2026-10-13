@@ -37,6 +37,7 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Include="$(MSBuildThisFileDirectory)../../../../ffi/aster_ffi.h" Link="aster_ffi.h" />
+    <None Include="$(MSBuildThisFileDirectory)../../CHANGELOG.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>

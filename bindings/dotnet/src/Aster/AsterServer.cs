@@ -28,23 +28,30 @@ namespace Aster;
 /// <code>
 /// await using var server = await AsterServer.StartAsync(new AsterServerOptions
 /// {
-///     Config = AsterConfig.FromEnv() with { AllowAllConsumers = true },
+///     Config = AsterConfig.FromEnv(),
 ///     Services = { service },
 /// });
 /// Console.WriteLine(await server.TicketAsync());
 /// </code>
+/// <para>
+/// <b>Enrollment.</b> With enrollment configured (<see cref="AsterConfig.IsEnrollmentEnabled"/>:
+/// <c>[trust]</c> and <c>[enrollment]</c>, <c>ASTER_ENROLLMENT_*</c>) the server admits only nodes
+/// holding a credential from the configured root, and each peer's verified claims become the
+/// roles <see cref="CapabilityRequirement"/>s are checked against, on every call, with no
+/// application code (design <c>aster-enrollment.md</c> §15.4). Without it the node is open: there
+/// is no "allow all" switch.
+/// </para>
 /// </summary>
 public sealed partial class AsterServer : IAsyncDisposable, IDisposable
 {
     public const string AsterAlpn = "aster/1";
-    /// <summary>The consumer-admission ALPN; kept open by the default gate.</summary>
-    public const string ConsumerAdmissionAlpn = "aster.consumer_admission";
 
     private const int PollBatch = 64;
     private const uint PollTimeoutMs = 100;
 
     private readonly Node _node;
-    private readonly Gate? _ownedGate;
+    private readonly Lease.NativeLeaseSerializer? _leaseSerializer;
+    private readonly Upcall.Upcalls? _leaseUpcalls;
     private readonly DispatchServer _dispatch;
     private readonly HealthServer? _health;
     private readonly ICodec _codec;
@@ -67,13 +74,16 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
 
     private static readonly IReadOnlyDictionary<string, string> NoAttributes = new Dictionary<string, string>();
 
-    private AsterServer(Node node, Gate? ownedGate, Gate gate, DispatchServer dispatch, HealthServer? health, ICodec codec,
+    private AsterServer(Node node, Gate? gate, EnrollmentIssuer? issuer, Lease.NativeLeaseSerializer? leaseSerializer,
+        Upcall.Upcalls? leaseUpcalls, DispatchServer dispatch, HealthServer? health, ICodec codec,
         Dictionary<string, ServiceDefinition> services, ServiceDefinition[] byIndex, IReadOnlyList<IInterceptor> interceptors)
     {
         _interceptors = interceptors;
         _node = node;
-        _ownedGate = ownedGate;
         Gate = gate;
+        Issuer = issuer;
+        _leaseSerializer = leaseSerializer;
+        _leaseUpcalls = leaseUpcalls;
         _dispatch = dispatch;
         _health = health;
         _codec = codec;
@@ -102,15 +112,43 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
                 m.RegisterTypes(fory);
 
         var config = options.Config ?? new AsterConfig();
-        Gate? ownedGate = null;
-        Gate gate = options.Gate ?? (ownedGate = Gate.Create()
-            .SetTrustMode(config.AllowAllConsumers ? TrustMode.OpenDev : TrustMode.Protected)
-            .SetAdmissionAlpns([ConsumerAdmissionAlpn]));
+        // Builder overrides (Rust AsterServerBuilder::enrollment_policy / enrollment_roles);
+        // enablement still comes from the configuration.
+        if (options.EnrollmentPolicy is not null || options.EnrollmentRoles is not null)
+            config = config with
+            {
+                Enrollment = config.Enrollment with
+                {
+                    Policy = options.EnrollmentPolicy ?? config.Enrollment.Policy,
+                    Roles = options.EnrollmentRoles ?? config.Enrollment.Roles,
+                },
+            };
+        Gate? gate = options.Gate;
+        if (gate is not null && config.IsEnrollmentEnabled)
+            throw new ArgumentException("enrollment decides admission; a Gate cannot be set with it", nameof(options));
         Node? node = null;
         HealthServer? health = null;
+        Upcall.Upcalls? leaseUpcalls = null;
+        Lease.NativeLeaseSerializer? leaseSerializer = null;
         try
         {
-            node = await Node.StartAsync(config, gate, [AsterAlpn, ConsumerAdmissionAlpn], cancellationToken).ConfigureAwait(false);
+            node = gate is not null
+                ? await Node.StartAsync(config, gate, [AsterAlpn], cancellationToken).ConfigureAwait(false)
+                : await Node.StartEnrolledAsync(config, Native.EnrollmentSideServer, [AsterAlpn], cancellationToken).ConfigureAwait(false);
+            EnrollmentIssuer? issuer = null;
+            if (node.Enrollment is { } enrollment && enrollment.Status().Issuer is { Length: > 0 })
+                issuer = new EnrollmentIssuer(enrollment);
+            if (options.LeaseGrantor is { } grantor)
+            {
+                if (grantor.Serializer is null)
+                    leaseSerializer = Lease.NativeLeaseSerializer.Memory(node.Runtime);
+                else
+                {
+                    leaseUpcalls = Upcall.Upcalls.Create(node.Runtime);
+                    leaseUpcalls.ServeLeaseSerializer(grantor.Serializer);
+                    leaseSerializer = Lease.NativeLeaseSerializer.Foreign(leaseUpcalls);
+                }
+            }
             var byIndex = new ServiceDefinition[services.Count];
             // Explicit options win; otherwise the config (ASTER_HEALTH_*, [health]).
             var healthOptions = options.Health
@@ -127,18 +165,45 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
                 builder.Option(DispatchServerOption.MaxSessionsPerConnection, (ulong)options.MaxSessionsPerConnection);
                 if (options.HandlerTimeout is { } cap)
                     builder.Option(DispatchServerOption.HandlerTimeoutMs, cap <= TimeSpan.Zero ? 0 : (ulong)Math.Ceiling(cap.TotalMilliseconds));
-                dispatch = builder.Start(options.RingCapacity);
+                if (options.LeaseGrantor is { } g && leaseSerializer is not null)
+                    builder.LeaseGrantor(leaseSerializer.Handle, g);
+                // On an enrolled node this also attaches policy, which blocks up to
+                // limits.sync_timeout_ms with replicas: keep it off the caller's thread.
+                var started = builder;
+                dispatch = await Task.Run(() => started.Start(options.RingCapacity), cancellationToken).ConfigureAwait(false);
             }
-            return new AsterServer(node, ownedGate, gate, dispatch, health, codec, services, byIndex, options.Interceptors.ToList());
+            return new AsterServer(node, gate, issuer, leaseSerializer, leaseUpcalls, dispatch, health, codec, services, byIndex,
+                options.Interceptors.ToList());
         }
         catch
         {
             health?.Dispose();
+            leaseSerializer?.Dispose();
+            if (leaseUpcalls is not null) await leaseUpcalls.DisposeAsync().ConfigureAwait(false);
             node?.Dispose();
-            ownedGate?.Dispose();
             throw;
         }
     }
+
+    /// <summary>
+    /// The Enrollment installed from <see cref="AsterServerOptions.Config"/> (null when enrollment
+    /// is off). Roles and revocations need nothing from it; it is for audit, checks and
+    /// revocation events.
+    /// </summary>
+    public Enrollment? Enrollment => _node.Enrollment;
+
+    /// <summary>
+    /// The delegated issuer the server runs when <see cref="EnrollmentConfig.IssuerDelegationFile"/>
+    /// is configured (null otherwise). It already serves renewals; use
+    /// <see cref="EnrollmentIssuer.Issue"/> to enroll new nodes.
+    /// </summary>
+    public EnrollmentIssuer? Issuer { get; }
+
+    /// <summary>
+    /// The serialization point behind <see cref="AsterServerOptions.LeaseGrantor"/> (null without
+    /// one): the grantor's own rows, for snapshots and co-located holders on this node.
+    /// </summary>
+    public Lease.NativeLeaseSerializer? LeaseSerializer => _leaseSerializer;
 
     /// <summary>The server's node.</summary>
     public Node Node => _node;
@@ -146,8 +211,11 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
     /// <summary>The ops listener started from <see cref="AsterServerOptions.Health"/>, or null.</summary>
     public HealthServer? Health => _health;
 
-    /// <summary>The Gate-0 policy guarding the node (admit peers here unless dev mode is on).</summary>
-    public Gate Gate { get; }
+    /// <summary>
+    /// The explicit Gate-0 policy (<see cref="AsterServerOptions.Gate"/>), or null: an unenrolled
+    /// server is open and an enrolled one is guarded by <see cref="Enrollment"/>.
+    /// </summary>
+    public Gate? Gate { get; }
 
     /// <summary>The server's node id (64 hex).</summary>
     public string NodeId() => _node.NodeId();
@@ -179,8 +247,8 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
     public event Action<ulong>? SessionClosed;
 
     /// <summary>
-    /// Raised (on the poll thread) for a connection on one of the node's non-RPC ALPNs (e.g.
-    /// <see cref="ConsumerAdmissionAlpn"/>) that Rust does not handle. The handler owns the
+    /// Raised (on the poll thread) for a connection on one of the node's non-RPC ALPNs (those in
+    /// <see cref="AsterConfig.Alpns"/>) that Rust does not handle. The handler owns the
     /// <see cref="Connection"/>; without a handler the connection is closed.
     /// </summary>
     public event Action<string, Connection>? NonRpcConnection;
@@ -450,8 +518,9 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
             _health?.Dispose();
             foreach (var state in _sessions.Values) DisposeSession(state);
             _sessions.Clear();
+            _leaseSerializer?.Dispose();
+            if (_leaseUpcalls is not null) await _leaseUpcalls.DisposeAsync().ConfigureAwait(false);
             await _node.DisposeAsync().ConfigureAwait(false);
-            _ownedGate?.Dispose();
         }
         finally { _httpLifecycleGate.Release(); }
     }
@@ -467,8 +536,33 @@ public sealed class AsterServerOptions
     /// <summary>Optional native Gate-3 requirement for the topology RPC, without host authorization logic.</summary>
     public CapabilityRequirement? TopologyRequirement { get; init; }
 
-    /// <summary>Node configuration (null = defaults).</summary>
+    /// <summary>
+    /// Node configuration (null = defaults). With enrollment configured
+    /// (<see cref="AsterConfig.IsEnrollmentEnabled"/>) the server admits only nodes holding a
+    /// credential from the configured root, and each peer's verified claims become the roles
+    /// <see cref="CapabilityRequirement"/>s are checked against, on every call. Without it the
+    /// node is open. A missing or malformed enrollment setting fails the start, naming it.
+    /// </summary>
     public AsterConfig? Config { get; init; }
+
+    /// <summary>
+    /// Overrides <see cref="EnrollmentConfig.Policy"/> (Rust <c>AsterServerBuilder::enrollment_policy</c>).
+    /// Enablement still comes from <see cref="Config"/>.
+    /// </summary>
+    public EnrollmentPolicy? EnrollmentPolicy { get; init; }
+
+    /// <summary>
+    /// Overrides <see cref="EnrollmentConfig.Roles"/> (Rust <c>AsterServerBuilder::enrollment_roles</c>).
+    /// Enablement still comes from <see cref="Config"/>.
+    /// </summary>
+    public RoleMapping? EnrollmentRoles { get; init; }
+
+    /// <summary>
+    /// Serves <c>aster.lease.Grantor</c> (Rust <c>aster::rpc::lease::LeaseGrantor</c>): a designated
+    /// serialization point other nodes acquire, renew and release leases through
+    /// (<see cref="AsterClient.LeaseGrantorAsync(NodeAddrInfo, CancellationToken)"/>). Null = none.
+    /// </summary>
+    public LeaseGrantorOptions? LeaseGrantor { get; init; }
 
     /// <summary>The services to serve.</summary>
     public IList<ServiceDefinition> Services { get; init; } = new List<ServiceDefinition>();
@@ -477,9 +571,9 @@ public sealed class AsterServerOptions
     public ICodec? Codec { get; init; }
 
     /// <summary>
-    /// Gate-0 policy. Default: a gate owned by the server, <see cref="TrustMode.OpenDev"/> when
-    /// <see cref="AsterConfig.AllowAllConsumers"/> is set, else <see cref="TrustMode.Protected"/>
-    /// (only admitted peers reach <c>aster/1</c>).
+    /// An explicit Gate-0 policy (an escape hatch; Rust's <c>Gate0</c>), owned by the caller.
+    /// Default: none, so an unenrolled server is open and an enrolled one is guarded by
+    /// Enrollment. Setting it with enrollment configured is an error.
     /// </summary>
     public Gate? Gate { get; init; }
 

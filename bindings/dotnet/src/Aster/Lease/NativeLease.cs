@@ -26,11 +26,13 @@ public sealed class NativeLeaseSerializer : IDisposable
     private readonly ulong _handle;
     private int _disposed;
 
-    private NativeLeaseSerializer(Runtime runtime, ulong handle)
+    internal NativeLeaseSerializer(Runtime runtime, ulong handle)
     {
         _runtime = runtime;
         _handle = handle;
     }
+
+    internal ulong Handle => _handle;
 
     /// <summary>
     /// A serializer whose transitions and snapshots are upcalls on <paramref name="upcalls"/>

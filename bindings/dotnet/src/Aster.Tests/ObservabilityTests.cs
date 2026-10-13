@@ -86,7 +86,7 @@ public class ObservabilityTests : IAsyncLifetime
                 .Build();
             Server = await AsterServer.StartAsync(new AsterServerOptions
             {
-                Config = Loopback with { AllowAllConsumers = true },
+                Config = Loopback,
                 Services = { svc },
                 Health = health,
             });
@@ -156,7 +156,7 @@ public class ObservabilityTests : IAsyncLifetime
     {
         Assert.Equal(17, (int)Status.AlreadyExists);
         Assert.Equal("ASTER_STATUS_ALREADY_EXISTS", Marshal.PtrToStringUTF8(Native.aster_status_name(17)));
-        Assert.Equal(0u, Native.RequiredAbiMinor);
+        Assert.Equal(1u, Native.RequiredAbiMinor);
     }
 
     [Fact]
@@ -755,7 +755,7 @@ public class ObservabilityTests : IAsyncLifetime
             .Build();
         await using var server = await AsterServer.StartAsync(new AsterServerOptions
         {
-            Config = Loopback with { AllowAllConsumers = true, HealthEnabled = true }, // port 0 + enabled: ephemeral
+            Config = Loopback with { HealthEnabled = true }, // port 0 + enabled: ephemeral
             Services = { svc },
         });
         var health = server.Health;
@@ -781,7 +781,7 @@ public class ObservabilityTests : IAsyncLifetime
         using var occupied = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
         occupied.Start();
         var port = (ushort)((System.Net.IPEndPoint)occupied.LocalEndpoint).Port;
-        var disabled = Loopback with { AllowAllConsumers = true, HealthEnabled = false, HealthPort = port };
+        var disabled = Loopback with { HealthEnabled = false, HealthPort = port };
         await using (var off = await AsterServer.StartAsync(new AsterServerOptions { Config = disabled }))
             Assert.Null(off.Health);
         var conflict = disabled with { HealthEnabled = true };
