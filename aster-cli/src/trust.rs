@@ -467,6 +467,17 @@ fn record(
         profile.next_root_commitment = Some(hex::encode(state.next_commitment));
         profile.root_seq = state.seq;
         profile.exec_policy_namespace = Some(fleet.clone());
+        // Kept so the node relays the rotation to peers still on the old
+        // root; the enrollment service verifies the history against the pin.
+        let statement = rotation.statement().to_owned();
+        if !profile.root_rotations.contains(&statement) {
+            profile.root_rotations.push(statement);
+        }
+        let excess = profile
+            .root_rotations
+            .len()
+            .saturating_sub(aster::enrollment::MAX_FORWARDED_ROTATIONS);
+        profile.root_rotations.drain(..excess);
         Ok(())
     })?;
     Ok(Rotated {

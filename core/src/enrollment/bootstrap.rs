@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot, Semaphore, SemaphorePermit};
 use tokio::task::AbortHandle;
 
-use super::rotation::{RotationJournal, RotationPin, MAX_FORWARDED_ROTATIONS};
+use super::rotation::{verified_history, RotationJournal, RotationPin, MAX_FORWARDED_ROTATIONS};
 use super::{
     admit, local_clock_synchronization, AdmissionContext, AdmissionDecision,
     AdmissionEvidenceSource, AdmissionPolicy, ClockSynchronization, DenialReason, EnrollmentError,
@@ -82,6 +82,13 @@ pub struct EnrollmentOptions {
     /// consumer pins beside its root. `None` refuses every rotation
     /// statement, and the root can then only change by reinstalling.
     pub rotation: Option<RotationPin>,
+    /// Rotation statements that produced the pinned root, when it was moved
+    /// on out of band (`aster trust rotate --apply`, a configuration update),
+    /// oldest first. They are verified back from the pin and journaled, so
+    /// this node relays them to peers still on an older root. Ignored
+    /// without [`Self::rotation`]; a statement that is not part of the pinned
+    /// history fails installation.
+    pub applied_rotations: Vec<String>,
 }
 
 impl Default for EnrollmentOptions {
@@ -104,6 +111,7 @@ impl Default for EnrollmentOptions {
             session_idle_eviction: Duration::from_secs(300),
             require_synchronized_clock: false,
             rotation: None,
+            applied_rotations: Vec::new(),
         }
     }
 }
@@ -488,7 +496,12 @@ impl EnrollmentService {
             );
             tracing::warn!("enrollment: local clock is not synchronized; admission may fail");
         }
-        let (store, verifier, rotation) = resume_rotation(store, verifier, options.rotation)?;
+        let (store, verifier, rotation) = resume_rotation(
+            store,
+            verifier,
+            options.rotation,
+            &options.applied_rotations,
+        )?;
         let own = identity(&node.node_id())?;
         // A credential anchored at a root this node has since rotated away
         // from is not presented; the node is admitted by records instead.
@@ -2241,6 +2254,7 @@ fn resume_rotation(
     store: Arc<EnrollmentPolicyStore>,
     verifier: JwtEnrollmentVerifier,
     pin: Option<RotationPin>,
+    applied: &[String],
 ) -> Result<(
     Arc<EnrollmentPolicyStore>,
     JwtEnrollmentVerifier,
@@ -2249,12 +2263,17 @@ fn resume_rotation(
     let Some(pin) = pin else {
         return Ok((store, verifier, None));
     };
-    let journal = RotationJournal::load(store.rotation_journal_path())?;
+    let mut journal = RotationJournal::load(store.rotation_journal_path())?;
     let mut root = RootState {
         root: *store.root(),
         next_commitment: pin.next_commitment,
         seq: pin.seq,
     };
+    if !applied.is_empty() {
+        let history = verified_history(applied, root, unix_now(), verifier.activation_leeway())
+            .map_err(|_| anyhow!("applied root rotations are not the pinned root's history"))?;
+        journal.seed(&history)?;
+    }
     let applied = journal.replay(root, unix_now(), verifier.activation_leeway());
     let Some(last) = applied.last() else {
         return Ok((store, verifier, Some(RotationState { root, journal })));

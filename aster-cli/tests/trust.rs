@@ -148,5 +148,8 @@ fn commit_rotate_and_apply_a_root_rotation() {
         Some(fleet.as_str())
     );
     assert_eq!(profile.root_seq, 1);
+    // Kept for the node's enrollment service to relay to peers on R0.
+    let issued = std::fs::read_to_string(&statement).unwrap();
+    assert_eq!(profile.root_rotations, vec![issued.trim().to_owned()]);
     node.fails(&["trust", "rotate", "--apply", s(&statement)]);
 }

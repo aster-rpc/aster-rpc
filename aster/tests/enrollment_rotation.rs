@@ -397,3 +397,83 @@ fn stores_are_kept_per_root_at_one_path() {
     // A root whose namespace differs from what was kept for it is refused.
     assert!(EnrollmentPolicyStore::open(&path, public(R1), [3; 32], FLEET).is_err());
 }
+
+/// A node whose pin was moved on out of band (`aster trust rotate --apply`
+/// updates the profile, not the running service's journal) still relays the
+/// rotation to peers on the old root: the statements it is given are verified
+/// back from the pin and offered in its handshakes. A statement that is not
+/// the pinned root's history refuses installation.
+#[tokio::test]
+async fn out_of_band_rotation_is_relayed_and_foreign_history_refused() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let files = tempfile::tempdir().unwrap();
+        let statement = issue_root_rotation(
+            &key(R1),
+            &aster::PublicKey::from_bytes(public(R0)),
+            1,
+            &next_root_commitment(&public(R2)),
+            &[[7; 32]],
+            now(),
+            RotationReason::Routine,
+        )
+        .unwrap();
+        let install = |node: &Node, path: &str, applied: Vec<String>| {
+            Enrollment::install(
+                node,
+                Arc::new(
+                    EnrollmentPolicyStore::open(
+                        files.path().join(path),
+                        public(R1),
+                        [7; 32],
+                        FLEET,
+                    )
+                    .unwrap(),
+                ),
+                JwtEnrollmentVerifier::new(public(R1), FLEET).unwrap(),
+                None,
+                Arc::new(PolicyExpressionV1::Predicate(
+                    PolicyPredicate::TolerateStalePolicy,
+                )),
+                EnrollmentOptions {
+                    rotation: Some(RotationPin {
+                        next_commitment: next_root_commitment(&public(R2)),
+                        seq: 1,
+                    }),
+                    applied_rotations: applied,
+                    ..Default::default()
+                },
+            )
+        };
+
+        let relay = node(REPLICA).await;
+        let enroll = install(&relay, "relay.json", vec![statement.clone()]).unwrap();
+        assert_eq!(enroll.root_rotations(), vec![statement.clone()]);
+        assert_eq!(enroll.root_state().unwrap().seq, 1);
+        drop(enroll);
+        relay.shutdown().await;
+        // The journal keeps it across a restart with no statements supplied.
+        let relay = node(REPLICA).await;
+        let enroll = install(&relay, "relay.json", vec![]).unwrap();
+        assert_eq!(enroll.root_rotations(), vec![statement.clone()]);
+        drop(enroll);
+        relay.shutdown().await;
+
+        // A statement from another history (signed by R0 for itself) is not
+        // what produced the pin.
+        let foreign = issue_root_rotation(
+            &key(R0),
+            &aster::PublicKey::from_bytes(public(STRANGER)),
+            1,
+            &next_root_commitment(&public(R2)),
+            &[[7; 32]],
+            now(),
+            RotationReason::Routine,
+        )
+        .unwrap();
+        let other = node(MEMBER).await;
+        assert!(install(&other, "other.json", vec![foreign]).is_err());
+        other.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

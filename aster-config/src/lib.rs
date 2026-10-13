@@ -117,6 +117,11 @@ pub struct Profile {
     /// Rotations applied to reach `root_pubkey`; 0 for an original root.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub root_seq: u64,
+    /// The rotation statements applied to reach `root_pubkey`, oldest first
+    /// (at most the latest eight). Nodes relay them to peers still on an
+    /// older root; they are verified against the pin, never trusted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub root_rotations: Vec<String>,
     /// How often the root comes online to promote and renew, as a duration
     /// such as "6h" or "1d". Sizes persistent credentials and delegations.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use super::store::write_atomic;
 use super::RecordError;
-use crate::delegation::{claimed_rotation_seq, verify_root_rotation, RootRotation, RootState};
+use crate::delegation::{
+    claimed_rotation_seq, verify_applied_rotation, verify_root_rotation, RootRotation, RootState,
+};
 
 /// Applied statements kept in the journal and offered to peers in the
 /// enrollment handshake. A peer further behind than this re-pins out of
@@ -97,11 +99,30 @@ impl RotationJournal {
 
     /// Record an applied statement durably before it takes effect.
     pub(super) fn append(&mut self, statement: &str) -> Result<(), RecordError> {
+        self.merge(std::slice::from_ref(&statement.to_owned()))
+    }
+
+    /// Add verified statements of the pinned history that this node applied
+    /// out of band, so it relays them to peers that are further behind.
+    /// Statements stay ordered by sequence and capped at the latest
+    /// [`MAX_FORWARDED_ROTATIONS`].
+    pub(super) fn seed(&mut self, history: &[String]) -> Result<(), RecordError> {
+        self.merge(history)
+    }
+
+    fn merge(&mut self, added: &[String]) -> Result<(), RecordError> {
         let mut statements = self.statements.clone();
-        if statements.iter().any(|known| known == statement) {
+        for statement in added {
+            if !statements.iter().any(|known| known == statement) {
+                statements.push(statement.clone());
+            }
+        }
+        if statements == self.statements {
             return Ok(());
         }
-        statements.push(statement.to_owned());
+        // Journaled statements were verified when applied or seeded, so
+        // their claimed sequence is the verified one.
+        statements.sort_by_key(|statement| claimed_rotation_seq(statement).unwrap_or(0));
         if statements.len() > MAX_FORWARDED_ROTATIONS {
             statements.drain(..statements.len() - MAX_FORWARDED_ROTATIONS);
         }
@@ -114,6 +135,46 @@ impl RotationJournal {
         self.statements = statements;
         Ok(())
     }
+}
+
+/// Verify statements a consumer says produced its pinned root, walking back
+/// from the pin: the statement at the pinned sequence must yield the pin,
+/// the one before it that statement's predecessor, and so on. The walk ends
+/// at the first missing sequence (older history may be omitted). Any
+/// supplied statement that is not part of the verified walk is an error,
+/// because an operator handed this node something that is not its history.
+pub(super) fn verified_history(
+    history: &[String],
+    pinned: RootState,
+    now: u64,
+    leeway: u64,
+) -> Result<Vec<String>, RecordError> {
+    let mut remaining: Vec<&String> = history.iter().collect();
+    let mut verified = Vec::new();
+    let mut after = pinned;
+    while after.seq > 0 {
+        let Some(index) = remaining
+            .iter()
+            .position(|statement| claimed_rotation_seq(statement) == Some(after.seq))
+        else {
+            break;
+        };
+        let statement = remaining.remove(index);
+        let rotation = verify_applied_rotation(statement, &after, now, leeway)
+            .map_err(|_| RecordError::InvalidRecord)?;
+        after = RootState {
+            root: *rotation.previous_root(),
+            // The state before a rotation committed to the root it produced.
+            next_commitment: crate::delegation::next_root_commitment(&after.root),
+            seq: after.seq - 1,
+        };
+        verified.push(statement.clone());
+    }
+    if !remaining.is_empty() {
+        return Err(RecordError::InvalidRecord);
+    }
+    verified.reverse();
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -186,6 +247,37 @@ mod tests {
         }
         assert_eq!(journal.statements().len(), MAX_FORWARDED_ROTATIONS);
         assert_eq!(claimed_rotation_seq(&journal.statements()[0]), Some(3));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Out-of-band history verifies back from the pin: full or truncated
+    /// history is accepted in sequence order, and anything that is not the
+    /// pinned root's history is refused.
+    #[test]
+    fn applied_history_is_verified_back_from_the_pin() {
+        // R1 -> R2 (seq 1, signed by 2), R2 -> R3 (seq 2, signed by 3).
+        let first = statement(2, 1, 1, 3);
+        let second = statement(3, 2, 2, 4);
+        let pin = pinned(3, 4, 2);
+        assert_eq!(
+            verified_history(&[second.clone(), first.clone()], pin, 10, 0).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        // Older history may be omitted.
+        assert_eq!(
+            verified_history(std::slice::from_ref(&second), pin, 10, 0).unwrap(),
+            vec![second.clone()]
+        );
+        // A statement that did not produce this pin is an error, as is one
+        // left over below a gap.
+        assert!(verified_history(std::slice::from_ref(&first), pin, 10, 0).is_err());
+        assert!(verified_history(&[statement(9, 1, 2, 4)], pin, 10, 0).is_err());
+        // Seeding keeps the journal ordered by sequence.
+        let path = scratch("seeded");
+        let mut journal = RotationJournal::load(path.clone()).unwrap();
+        journal.append(&second).unwrap();
+        journal.seed(std::slice::from_ref(&first)).unwrap();
+        assert_eq!(journal.statements(), [first, second]);
         let _ = std::fs::remove_file(path);
     }
 }

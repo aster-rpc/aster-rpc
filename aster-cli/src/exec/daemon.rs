@@ -356,6 +356,7 @@ async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
     let enrollment_options = aster::enrollment::EnrollmentOptions {
         require_synchronized_clock: true,
         rotation,
+        applied_rotations: settings.root_rotations.clone(),
         ..Default::default()
     };
     let handshakes = enrollment_options.max_concurrent_handshakes;

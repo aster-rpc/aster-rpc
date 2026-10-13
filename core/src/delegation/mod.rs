@@ -27,8 +27,9 @@ pub use links::{
     DELEGATION_JWT_TYPE, ENROLLMENT_LINK_TYPE,
 };
 pub use rotation::{
-    claimed_rotation_seq, issue_root_rotation, next_root_commitment, verify_root_rotation,
-    RootRotation, RootState, RotationReason, MAX_ROTATION_BYTES, ROOT_ROTATION_JWT_TYPE,
+    claimed_rotation_seq, issue_root_rotation, next_root_commitment, verify_applied_rotation,
+    verify_root_rotation, RootRotation, RootState, RotationReason, MAX_ROTATION_BYTES,
+    ROOT_ROTATION_JWT_TYPE,
 };
 /// Untrusted decoding helpers for enrollment diagnostics and reporting.
 #[cfg(feature = "enrollment")]

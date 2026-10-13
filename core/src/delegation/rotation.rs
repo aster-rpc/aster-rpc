@@ -146,6 +146,37 @@ pub fn claimed_rotation_seq(statement: &str) -> Option<u64> {
         .map(|claims| claims.seq)
 }
 
+/// Check that `statement` is the rotation that produced `after`: verified
+/// against the state it claims to continue, it must yield exactly `after`.
+/// A node that applied a rotation out of band (a profile or configuration
+/// update) uses this to relay its history without trusting the statements.
+pub fn verify_applied_rotation(
+    statement: &str,
+    after: &RootState,
+    now: u64,
+    leeway: u64,
+) -> Result<RootRotation, ChainError> {
+    if statement.len() > MAX_ROTATION_BYTES {
+        return Err(ChainError::Size);
+    }
+    let compact = jws::decode(statement).map_err(|_| ChainError::Malformed)?;
+    if compact.typ != ROOT_ROTATION_JWT_TYPE {
+        return Err(ChainError::Header);
+    }
+    let claims: RotationClaims =
+        serde_json::from_slice(&compact.payload).map_err(|_| ChainError::Malformed)?;
+    let before = RootState {
+        root: parse_key(&claims.prev).ok_or(ChainError::Malformed)?,
+        next_commitment: next_root_commitment(&after.root),
+        seq: claims.seq.checked_sub(1).ok_or(ChainError::Sequence)?,
+    };
+    let rotation = verify_root_rotation(statement, &before, now, leeway)?;
+    if rotation.apply() != *after {
+        return Err(ChainError::Bridge);
+    }
+    Ok(rotation)
+}
+
 /// Accept a rotation only if it is signed by the key matching the pinned
 /// commitment, names the current root as `prev`, and is exactly the next
 /// sequence number. A statement signed by the current root never matches.

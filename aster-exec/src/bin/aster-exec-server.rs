@@ -36,6 +36,10 @@ mod linux {
         /// Rotations already applied to `root_public_key`.
         #[serde(default)]
         root_seq: u64,
+        /// The rotation statements that produced `root_public_key`, oldest
+        /// first, so this node relays them to peers on an older root.
+        #[serde(default)]
+        root_rotations: Vec<String>,
         policy_namespace: String,
         policy_replicas: Vec<Replica>,
         audience: String,
@@ -163,6 +167,7 @@ mod linux {
                         })
                     })
                     .transpose()?,
+                applied_rotations: config.root_rotations.clone(),
                 ..Default::default()
             },
         )?;
