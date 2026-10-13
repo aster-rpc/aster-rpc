@@ -65,6 +65,9 @@ public class IrohNode implements AutoCloseable {
 
   private final HealthSettings healthSettings;
 
+  /** The Enrollment installed when this node started (null = none). */
+  private volatile site.aster.enrollment.Enrollment enrollment;
+
   /** The health-only creation settings; null for a node without source configuration. */
   public HealthSettings healthSettings() {
     return healthSettings;
@@ -229,8 +232,20 @@ public class IrohNode implements AutoCloseable {
     }
   }
 
+  /**
+   * The Enrollment {@code AsterServer} / {@code AsterClient} installed on this node from its config
+   * (null otherwise). The node owns it: closing the node releases it.
+   */
+  public site.aster.enrollment.Enrollment enrollment() {
+    return enrollment;
+  }
+
   /** Close this node and free its handle. */
   public void close() {
+    site.aster.enrollment.Enrollment e = enrollment;
+    if (e != null) {
+      e.markReleased();
+    }
     runtime.removeInboundHandler(acceptHandler);
     IrohLibrary lib = IrohLibrary.getInstance();
     lib.nodeFree(runtime.nativeHandle(), nodeHandle);
@@ -317,6 +332,48 @@ public class IrohNode implements AutoCloseable {
             return new IrohNode(runtime, handle, hooks, healthSettings);
           } catch (RuntimeException e) {
             if (gate == null) runtime.close();
+            throw e;
+          }
+        },
+        ForkJoinPool.commonPool());
+  }
+
+  /**
+   * Start a node as {@code AsterServer} / {@code AsterClient} do ({@code
+   * aster_node_start_enrolled}, ABI 5.1): when {@code trustJson} (see {@link
+   * site.aster.enrollment.TrustJson}) enables enrollment, Rust validates it (failing closed),
+   * starts the node with fail-closed hooks and installs Enrollment ({@link #enrollment()});
+   * otherwise this is {@link #start(AsterConfig, java.util.List, Gate)} without a gate. {@code
+   * side} is {@link NativeConfig#ENROLLMENT_SIDE_SERVER} or {@link
+   * NativeConfig#ENROLLMENT_SIDE_CLIENT}.
+   */
+  public static CompletableFuture<IrohNode> startEnrolled(
+      AsterConfig config, java.util.List<byte[]> alpns, byte[] trustJson, int side) {
+    AsterConfig effectiveConfig = config == null ? AsterConfig.builder().build() : config;
+    HealthSettings healthSettings =
+        new HealthSettings(
+            effectiveConfig.healthHost(),
+            effectiveConfig.healthPort(),
+            effectiveConfig.isHealthEnabled());
+    IrohRuntime runtime = IrohRuntime.create();
+    return CompletableFuture.supplyAsync(
+        () -> {
+          try {
+            NativeConfig.EnrolledNode started =
+                NativeConfig.startNodeEnrolled(
+                    runtime, effectiveConfig, alpns, trustJson, side, null, null);
+            IrohNode node =
+                new IrohNode(
+                    runtime,
+                    started.node(),
+                    started.enrollment() != 0 || effectiveConfig.enableHooks(),
+                    healthSettings);
+            if (started.enrollment() != 0) {
+              node.enrollment = new site.aster.enrollment.Enrollment(runtime, started.enrollment());
+            }
+            return node;
+          } catch (RuntimeException e) {
+            runtime.close();
             throw e;
           }
         },

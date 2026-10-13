@@ -18,11 +18,7 @@ import site.aster.server.AsterServer;
 final class LoopbackConfigE2ETest {
 
   static AsterConfig loopback() {
-    return AsterConfig.builder()
-        .relayMode("disabled")
-        .bindAddr("127.0.0.1:0")
-        .allowAllConsumers(true)
-        .build();
+    return AsterConfig.builder().relayMode("disabled").bindAddr("127.0.0.1:0").build();
   }
 
   static ForyCodec codec() {

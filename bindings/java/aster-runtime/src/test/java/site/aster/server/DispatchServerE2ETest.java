@@ -270,12 +270,7 @@ final class DispatchServerE2ETest {
             .sessionService(Counter.class, peer -> new Counter(), new Session())
             .build()
             .get(20, TimeUnit.SECONDS);
-    client =
-        AsterClient.builder()
-            .codec(clientCodec)
-            .consumerAdmission(false)
-            .build()
-            .get(20, TimeUnit.SECONDS);
+    client = AsterClient.builder().codec(clientCodec).build().get(20, TimeUnit.SECONDS);
     addr = server.node().nodeAddr();
   }
 

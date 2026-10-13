@@ -175,12 +175,7 @@ final class ObservabilityE2ETest {
             .health("127.0.0.1", 0)
             .build()
             .get(20, TimeUnit.SECONDS);
-    client =
-        AsterClient.builder()
-            .codec(clientCodec)
-            .consumerAdmission(false)
-            .build()
-            .get(20, TimeUnit.SECONDS);
+    client = AsterClient.builder().codec(clientCodec).build().get(20, TimeUnit.SECONDS);
     addr = server.node().nodeAddr();
     http = HttpClient.newHttpClient();
   }

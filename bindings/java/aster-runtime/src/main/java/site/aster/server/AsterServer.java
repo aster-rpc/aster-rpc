@@ -58,11 +58,21 @@ import site.aster.server.wire.RpcStatus;
  * id with payloads and {@code RpcStatus}.
  *
  * <p>Manifest submission runs at {@link Builder#build()} (non-fatal); hook dispatch is not wired.
+ *
+ * <p><b>Enrollment</b> (design §15 of {@code docs/_internal/working_ideas/aster-enrollment.md}):
+ * with enrollment configured in the {@link AsterConfig} ({@code [trust]} and {@code [enrollment]},
+ * {@code ASTER_ENROLLMENT_*}; {@link AsterConfig#isEnrollmentEnabled()}), the server admits only
+ * nodes holding a credential from the configured root, and each peer's verified claims become the
+ * roles {@code @Requires} checks, on every call, with no application code. A root revocation
+ * refuses the peer's next call and closes its connections. A configured issuer ({@code
+ * [enrollment.issuer]}) serves credential renewals. Any missing or malformed setting fails {@link
+ * Builder#build()} naming the setting; nothing falls back to an open node. Without enrollment
+ * configured the server is open. Serve enrollment-gated services over Iroh only: HTTP callers never
+ * get enrollment roles.
  */
 public final class AsterServer implements AutoCloseable {
 
   public static final String ASTER_ALPN = "aster/1";
-  public static final String CONSUMER_ADMISSION_ALPN = "aster.consumer_admission";
   private static final int DEFAULT_RING_CAPACITY = 256;
   private static final int DEFAULT_POLL_BATCH = 64;
   private static final int POLL_TIMEOUT_MS = 100;
@@ -89,7 +99,12 @@ public final class AsterServer implements AutoCloseable {
   private final Thread pollThread;
   private final ExecutorService callExecutor;
   private final ExecutorService streamingExecutor;
-  private final site.aster.trust.ConsumerAdmissionHandler admissionHandler;
+
+  /** The configured delegated issuer (null = none). */
+  private final site.aster.enrollment.EnrollmentIssuer issuer;
+
+  /** The serializer behind {@link Builder#leaseGrantor} (null = none). */
+  private final site.aster.lease.LeaseGrantor.Backend grantor;
 
   /** The ops listener attached to this server (null = none); closed with the server if owned. */
   private final site.aster.health.HealthServer health;
@@ -126,8 +141,10 @@ public final class AsterServer implements AutoCloseable {
       Dispatch dispatch,
       RegisteredService[] byIndex,
       site.aster.health.HealthServer health,
-      boolean ownsHealth) {
+      boolean ownsHealth,
+      site.aster.lease.LeaseGrantor.Backend grantor) {
     this.node = node;
+    this.grantor = grantor;
     this.health = health;
     this.ownsHealth = ownsHealth;
     this.dispatch = dispatch;
@@ -147,38 +164,13 @@ public final class AsterServer implements AutoCloseable {
               t.setDaemon(true);
               return t;
             });
-    // Consumer admission (open-gate): serves the service summaries on the
-    // aster.consumer_admission ALPN, which Rust hands over as NON_RPC events.
-    this.admissionHandler =
-        new site.aster.trust.ConsumerAdmissionHandler(
-            this::buildServiceSummaries,
-            () -> registryNamespace,
-            this::setPeerAttributes,
-            () -> this.config == null || this.config.allowAllConsumers());
+    site.aster.enrollment.Enrollment enrollment = node.enrollment();
+    this.issuer =
+        enrollment != null && enrollment.status().issuer() != null
+            ? new site.aster.enrollment.EnrollmentIssuer(enrollment)
+            : null;
     this.pollThread =
         Thread.ofPlatform().daemon(true).name("aster-server-poll").start(this::pollLoop);
-  }
-
-  private List<site.aster.registry.ServiceSummary> buildServiceSummaries() {
-    // channels["rpc"] = this node's address, so consumers dial aster/1 directly (Python's
-    // ServiceSummary in runtime.py does the same).
-    String rpcAddr = node.nodeAddr().toBase64();
-    List<site.aster.registry.ServiceSummary> out = new ArrayList<>();
-    for (RegisteredService rs : services.values()) {
-      var summary = new site.aster.registry.ServiceSummary();
-      summary.name = rs.descriptor.name();
-      summary.version = rs.descriptor.version();
-      String cid = publishedContractIds.get(rs.descriptor.name());
-      if (cid == null || cid.isEmpty()) {
-        cid = rs.contractId;
-      }
-      summary.contractId = cid == null ? "" : cid;
-      summary.pattern = rs.descriptor.scope() == Scope.SHARED ? "shared" : "session";
-      summary.serializationModes = List.of("xlang");
-      summary.channels.put("rpc", rpcAddr);
-      out.add(summary);
-    }
-    return List.copyOf(out);
   }
 
   /** 64-char hex doc-id of the registry doc hosting this server's manifests; empty until set. */
@@ -207,6 +199,31 @@ public final class AsterServer implements AutoCloseable {
 
   public AsterConfig config() {
     return config;
+  }
+
+  /**
+   * The Enrollment installed from the config (null when enrollment is off). Roles and revocations
+   * need nothing from it; it is for audit ({@code peerClaims}), checks before a sensitive operation
+   * ({@code checkPeer}) and revocation events ({@code nextRevocation}).
+   */
+  public site.aster.enrollment.Enrollment enrollment() {
+    return node.enrollment();
+  }
+
+  /**
+   * The delegated issuer the server runs when {@code [enrollment.issuer] delegation_file} is
+   * configured (null otherwise). It already serves renewals; use {@code issue} to enroll new nodes.
+   */
+  public site.aster.enrollment.EnrollmentIssuer issuer() {
+    return issuer;
+  }
+
+  /**
+   * The serialization point behind {@link Builder#leaseGrantor} (null without one): the grantor's
+   * own rows, for snapshots and for co-located holders on this node.
+   */
+  public site.aster.lease.NativeLeaseSerializer leaseSerializer() {
+    return grantor == null ? null : grantor.serializer();
   }
 
   /**
@@ -249,7 +266,9 @@ public final class AsterServer implements AutoCloseable {
   /**
    * Attach admission attributes (e.g. {@code aster.role}) to every subsequent call from {@code
    * peerId}: Rust's Gate 3 checks {@code @Requires} against them, and they are merged into {@link
-   * CallContext#attributes()}. Pass {@code null} or an empty map to clear.
+   * CallContext#attributes()}. Pass {@code null} or an empty map to clear. An escape hatch for
+   * roles decided at runtime: with enrollment configured, roles come from each peer's credential
+   * ({@code [enrollment.roles]}) and win on a key clash.
    */
   public void setPeerAttributes(String peerId, Map<String, String> attributes) {
     if (peerId == null) {
@@ -328,13 +347,15 @@ public final class AsterServer implements AutoCloseable {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
-    admissionHandler.close();
     for (Object instance : sessions.values()) {
       closeIfAutoCloseable(instance);
     }
     sessions.clear();
     connections.clear();
     dispatch.close(); // aster_server_destroy clears the attached listener's ready flag first
+    if (grantor != null) {
+      grantor.close();
+    }
     if (ownsHealth && health != null) {
       health.close();
     }
@@ -460,17 +481,10 @@ public final class AsterServer implements AutoCloseable {
   }
 
   private void onNonRpc(MemorySegment ev) {
-    byte[] alpn = bytes(ev, Dispatch.OFFSET_REQUEST_PTR, Dispatch.OFFSET_REQUEST_LEN);
     dispatch.bufferRelease(ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_BUFFER));
     long handle = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CONNECTION_HANDLE);
-    // Owned by us: the wrapper frees it.
-    site.aster.handle.IrohConnection conn =
-        new site.aster.handle.IrohConnection(node.runtime(), handle);
-    if (site.aster.trust.ConsumerAdmissionHandler.matches(alpn)) {
-      admissionHandler.onConnection(conn);
-    } else {
-      conn.close();
-    }
+    // An extra ALPN of the config that Rust does not serve itself: owned by us, closed.
+    new site.aster.handle.IrohConnection(node.runtime(), handle).close();
   }
 
   private static byte[] bytes(MemorySegment ev, long ptrOffset, long lenOffset) {
@@ -683,7 +697,10 @@ public final class AsterServer implements AutoCloseable {
     private site.aster.contract.CapabilityRequirement topologyRequirement;
     private final Map<String, RegisteredService> services = new LinkedHashMap<>();
     private List<Interceptor> interceptors = List.of();
-    private List<String> alpns = List.of(ASTER_ALPN, CONSUMER_ADMISSION_ALPN);
+    private List<String> alpns = List.of(ASTER_ALPN);
+    private site.aster.enrollment.Policy enrollmentPolicy;
+    private site.aster.enrollment.RoleMapping enrollmentRoles;
+    private site.aster.lease.LeaseGrantor leaseGrantor;
     private int ringCapacity = DEFAULT_RING_CAPACITY;
     private int maxSessionsPerConnection = DEFAULT_MAX_SESSIONS_PER_CONNECTION;
     private site.aster.health.HealthServer health;
@@ -716,8 +733,42 @@ public final class AsterServer implements AutoCloseable {
       return this;
     }
 
+    /**
+     * The node and Enrollment configuration (usually {@link AsterConfig#fromEnv()} or {@link
+     * AsterConfig#fromFile}). With enrollment configured the server is guarded by Enrollment and
+     * each peer's credential roles reach {@code @Requires}.
+     */
     public Builder config(AsterConfig config) {
       this.config = config;
+      return this;
+    }
+
+    /**
+     * Judge peers' enrollment evidence with {@code policy} instead of the configured {@code
+     * [enrollment] policy} (Rust {@code AsterServerBuilder::enrollment_policy}). Enablement still
+     * comes from the config.
+     */
+    public Builder enrollmentPolicy(site.aster.enrollment.Policy policy) {
+      this.enrollmentPolicy = policy;
+      return this;
+    }
+
+    /**
+     * Map verified claims to roles with {@code roles} instead of the configured {@code
+     * [enrollment.roles]} (Rust {@code AsterServerBuilder::enrollment_roles}).
+     */
+    public Builder enrollmentRoles(site.aster.enrollment.RoleMapping roles) {
+      this.enrollmentRoles = roles;
+      return this;
+    }
+
+    /**
+     * Serve {@code aster.lease.Grantor} (Rust {@code aster::rpc::lease::LeaseGrantor}): the
+     * designated serialization point other nodes acquire leases through ({@code
+     * AsterClient.leaseGrantor}).
+     */
+    public Builder leaseGrantor(site.aster.lease.LeaseGrantor grantor) {
+      this.leaseGrantor = grantor;
       return this;
     }
 
@@ -744,9 +795,9 @@ public final class AsterServer implements AutoCloseable {
     }
 
     public Builder alpns(List<String> extraAlpns) {
-      var all = new ArrayList<>(List.of(ASTER_ALPN, CONSUMER_ADMISSION_ALPN));
+      var all = new ArrayList<>(List.of(ASTER_ALPN));
       for (String a : extraAlpns) {
-        if (!a.equals(ASTER_ALPN) && !a.equals(CONSUMER_ADMISSION_ALPN)) {
+        if (!a.equals(ASTER_ALPN)) {
           all.add(a);
         }
       }
@@ -825,8 +876,21 @@ public final class AsterServer implements AutoCloseable {
       Observability
           .ensureStarted(); // opens the log bridge (design Q2); exporters only if OTEL_* asks
       List<byte[]> alpnBytes = alpns.stream().map(s -> s.getBytes(StandardCharsets.UTF_8)).toList();
-      // aster_node_start with the full config (ABI 3.2), plus the RPC + admission ALPNs.
-      CompletableFuture<IrohNode> nodeFuture = IrohNode.start(config, alpnBytes, null);
+      byte[] trust;
+      try {
+        trust =
+            site.aster.enrollment.TrustJson.encode(
+                config == null ? AsterConfig.builder().build() : config,
+                enrollmentPolicy,
+                enrollmentRoles);
+      } catch (RuntimeException e) {
+        return CompletableFuture.failedFuture(e);
+      }
+      // aster_node_start_enrolled (ABI 5.1): validates and installs Enrollment when the config
+      // enables it (failing closed), else a plain aster_node_start; plus the RPC ALPN.
+      CompletableFuture<IrohNode> nodeFuture =
+          IrohNode.startEnrolled(
+              config, alpnBytes, trust, site.aster.ffi.NativeConfig.ENROLLMENT_SIDE_SERVER);
       Builder self = this;
       return nodeFuture
           .thenApply(
@@ -835,7 +899,10 @@ public final class AsterServer implements AutoCloseable {
                   return self.serve(node);
                 } catch (RuntimeException e) {
                   node.close();
-                  throw new IrohException("Failed to start the dispatch server: " + e.getMessage());
+                  throw e instanceof IrohException ie
+                      ? IrohException.forStatus(
+                          ie.status(), "Failed to start the server: " + e.getMessage())
+                      : new IrohException("Failed to start the server: " + e.getMessage());
                 }
               })
           .thenCompose(
@@ -886,13 +953,25 @@ public final class AsterServer implements AutoCloseable {
               site.aster.health.HealthServer.start(node, config.healthHost(), config.healthPort());
           owned = true;
         }
+        site.aster.lease.LeaseGrantor.Backend grantor = null;
         try {
           if (attached != null) {
             b.attachHealth(attached.nativeHandle());
           }
+          if (leaseGrantor != null) {
+            grantor = leaseGrantor.start(node.runtime());
+            b.leaseGrantor(
+                grantor.serializer().nativeHandle(),
+                leaseGrantor.requiresJson(),
+                leaseGrantor.revokeRequiresJson());
+          }
+          // With enrollment and replicas this blocks up to sync_timeout_ms (policy sync).
           Dispatch dispatch = b.start(ringCapacity);
-          return new AsterServer(this, node, dispatch, byIndex, attached, owned);
+          return new AsterServer(this, node, dispatch, byIndex, attached, owned, grantor);
         } catch (RuntimeException e) {
+          if (grantor != null) {
+            grantor.close();
+          }
           if (owned) {
             attached.close();
           }

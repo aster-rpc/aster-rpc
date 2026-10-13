@@ -9,10 +9,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Compact service descriptor returned in ConsumerAdmissionResponse (Aster-SPEC.md §3.2.2).
- *
- * <p>Provides enough information for a consumer to select a service and fetch its contract without
- * joining the registry doc.
+ * Compact service descriptor (Aster-SPEC.md §3.2.2): enough information for a consumer to select a
+ * service and fetch its contract without joining the registry doc.
  */
 @JsonInclude(JsonInclude.Include.ALWAYS)
 public final class ServiceSummary {

@@ -25,6 +25,12 @@ public final class NativeConfig {
   /** {@code sizeof(aster_config_t)}. */
   public static final long SIZE = 280;
 
+  /** {@code aster_enrollment_side_t}: a server (durable state; may run an issuer). */
+  public static final int ENROLLMENT_SIDE_SERVER = 0;
+
+  /** {@code aster_enrollment_side_t}: a client (enrolls with each server it calls). */
+  public static final int ENROLLMENT_SIDE_CLIENT = 1;
+
   // aster_relay_mode_t
   static final int RELAY_DEFAULT = 0;
   static final int RELAY_CUSTOM = 1;
@@ -240,6 +246,137 @@ public final class NativeConfig {
       } finally {
         lib.configRelease(seg);
       }
+    }
+  }
+
+  // ── [trust] / [enrollment] (ABI 5.1) ────────────────────────────────
+
+  /**
+   * Set the trust and enrollment fields of {@code b} from the {@code ASTER_*} environment (Rust
+   * {@code AsterConfig::from_env}, {@code aster_config_enrollment_from_env}).
+   */
+  public static AsterConfig.Builder applyEnrollmentEnv(AsterConfig.Builder b) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment out = arena.allocate(IrohLibrary.ASTER_BYTES);
+      int status =
+          (int)
+              IrohLibrary.getInstance()
+                  .getHandle(
+                      "aster_config_enrollment_from_env",
+                      java.lang.foreign.FunctionDescriptor.of(
+                          ValueLayout.JAVA_INT, ValueLayout.ADDRESS))
+                  .invoke(out);
+      check(status, "aster_config_enrollment_from_env");
+      return site.aster.enrollment.TrustJson.apply(takeOwned(out), b);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IrohException("aster_config_enrollment_from_env: " + t);
+    }
+  }
+
+  /**
+   * Set the trust and enrollment fields of {@code b} from an {@code aster.toml} file, then the
+   * environment (Rust {@code AsterConfig::from_file}, {@code aster_config_enrollment_from_toml}).
+   */
+  public static AsterConfig.Builder applyEnrollmentToml(Path path, AsterConfig.Builder b) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment out = arena.allocate(IrohLibrary.ASTER_BYTES);
+      int status =
+          (int)
+              IrohLibrary.getInstance()
+                  .getHandle(
+                      "aster_config_enrollment_from_toml",
+                      java.lang.foreign.FunctionDescriptor.of(
+                          ValueLayout.JAVA_INT, IrohLibrary.ASTER_BYTES, ValueLayout.ADDRESS))
+                  .invoke(bytesStruct(utf8(path.toString()), arena), out);
+      check(status, "aster_config_enrollment_from_toml(" + path + ")");
+      return site.aster.enrollment.TrustJson.apply(takeOwned(out), b);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IrohException("aster_config_enrollment_from_toml: " + t);
+    }
+  }
+
+  /** Copy and release an owned {@code aster_bytes_t}. */
+  private static byte[] takeOwned(MemorySegment bytes) {
+    byte[] data = getBytes(bytes, 0);
+    MemorySegment ptr = bytes.get(ValueLayout.ADDRESS, 0);
+    if (!ptr.equals(MemorySegment.NULL)) {
+      IrohLibrary.getInstance().stringRelease(ptr, bytes.get(ValueLayout.JAVA_LONG, 8));
+    }
+    return data;
+  }
+
+  /** A node started by {@link #startNodeEnrolled}: its handle and enrollment (0 = none). */
+  public record EnrolledNode(long node, long enrollment) {}
+
+  /**
+   * Start a node as {@code AsterServer} / {@code AsterClient} do ({@code
+   * aster_node_start_enrolled}, ABI 5.1): when {@code trustJson} enables enrollment Rust validates
+   * the whole plan first (an {@code INVALID_ARGUMENT} naming the setting; nothing runs open),
+   * starts the node with fail-closed hooks and {@code aster.enrollment/1} and installs Enrollment;
+   * otherwise this is a plain {@code aster_node_start}. Blocks until the node is up.
+   */
+  public static EnrolledNode startNodeEnrolled(
+      IrohRuntime runtime,
+      AsterConfig config,
+      List<byte[]> extraAlpns,
+      byte[] trustJson,
+      int side,
+      byte[] secretKeyOverride,
+      String secretKeyFileOverride) {
+    long opId;
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment cfg =
+          toNative(config == null ? AsterConfig.builder().build() : config, extraAlpns, arena);
+      if (secretKeyOverride != null) {
+        putBytes(cfg, SECRET_KEY, secretKeyOverride, arena);
+      }
+      if (secretKeyFileOverride != null) {
+        putStr(cfg, SECRET_KEY_FILE, secretKeyFileOverride, arena);
+      }
+      MemorySegment op = arena.allocate(ValueLayout.JAVA_LONG);
+      int status =
+          (int)
+              IrohLibrary.getInstance()
+                  .getHandle(
+                      "aster_node_start_enrolled",
+                      java.lang.foreign.FunctionDescriptor.of(
+                          ValueLayout.JAVA_INT,
+                          ValueLayout.JAVA_LONG,
+                          ValueLayout.ADDRESS,
+                          IrohLibrary.ASTER_BYTES,
+                          ValueLayout.JAVA_INT,
+                          ValueLayout.JAVA_LONG,
+                          ValueLayout.ADDRESS))
+                  .invoke(runtime.nativeHandle(), cfg, bytesStruct(trustJson, arena), side, 0L, op);
+      check(status, "aster_node_start_enrolled");
+      opId = op.get(ValueLayout.JAVA_LONG, 0);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IrohException("aster_node_start_enrolled: " + t);
+    }
+    try {
+      IrohEvent event = runtime.registry().register(opId).get(120, TimeUnit.SECONDS);
+      if (event.kind() != IrohEventKind.NODE_CREATED) {
+        throw new IrohException("aster_node_start_enrolled failed: " + event.kind());
+      }
+      return new EnrolledNode(event.handle(), event.related());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IrohException("aster_node_start_enrolled interrupted");
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      if (cause instanceof IrohException ie) {
+        throw IrohException.forStatus(
+            ie.status(), "aster_node_start_enrolled failed: " + ie.getMessage());
+      }
+      throw new IrohException("aster_node_start_enrolled failed: " + cause.getMessage());
+    } catch (TimeoutException e) {
+      throw new IrohException("aster_node_start_enrolled timed out");
     }
   }
 

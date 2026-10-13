@@ -63,7 +63,6 @@ final class HealthConfigTest {
         AsterConfig.builder()
             .relayMode("disabled")
             .bindAddr("127.0.0.1:0")
-            .allowAllConsumers(true)
             .healthEnabled(true) // port 0 + enabled: an ephemeral port
             .build();
     AsterServer server = AsterServer.builder().config(cfg).build().get(30, TimeUnit.SECONDS);
@@ -117,7 +116,6 @@ final class HealthConfigTest {
           AsterConfig.builder()
               .relayMode("disabled")
               .bindAddr("127.0.0.1:0")
-              .allowAllConsumers(true)
               .healthPort(port)
               .healthEnabled(false)
               .build();
@@ -131,7 +129,6 @@ final class HealthConfigTest {
           AsterConfig.builder()
               .relayMode("disabled")
               .bindAddr("127.0.0.1:0")
-              .allowAllConsumers(true)
               .healthPort(port)
               .healthEnabled(true)
               .build();

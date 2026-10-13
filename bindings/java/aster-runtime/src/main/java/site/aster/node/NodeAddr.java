@@ -26,8 +26,8 @@ public record NodeAddr(
   private static final int TICKET_ENCODE_BUF_SIZE = 4096;
 
   /**
-   * Serialize this {@link NodeAddr} to the canonical byte form used in consumer-admission responses
-   * and registry documents. Matches Python's {@code NodeAddr.to_bytes} (see {@code
+   * Serialize this {@link NodeAddr} to the canonical byte form used in registry documents ({@code
+   * channels["rpc"]}). Matches Python's {@code NodeAddr.to_bytes} (see {@code
    * bindings/python/rust/src/net.rs} line 71): {@code endpoint_id\n relay_url\n
    * direct_addresses-newline-joined}. Empty relay URL renders as an empty line; direct addresses
    * are joined with {@code \n}.
@@ -45,9 +45,8 @@ public record NodeAddr(
 
   /**
    * Inverse of {@link #toBase64()}: parse the base64-wrapped {@code endpoint_id\n relay_url\n
-   * direct_addresses-newline-joined} form served by consumer-admission responses and registry
-   * documents (spec §3.2). Empty relay line yields a {@code null} {@code relayUrl}; empty direct
-   * line yields an empty list.
+   * direct_addresses-newline-joined} form stored in registry documents (spec §3.2). Empty relay
+   * line yields a {@code null} {@code relayUrl}; empty direct line yields an empty list.
    *
    * @throws IllegalArgumentException if the input is not valid base64 or does not contain at least
    *     two newlines (endpointId line + relay line + direct-addresses line).

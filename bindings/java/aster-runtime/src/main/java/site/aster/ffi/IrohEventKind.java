@@ -126,7 +126,8 @@ public enum IrohEventKind {
   RAW_WT_READ(123),
   RAW_WT_DATAGRAM(124),
   RAW_WT_CLOSED(125),
-  RAW_WT_ACKED(126);
+  RAW_WT_ACKED(126),
+  ENROLLMENT_RESULT(127);
 
   public final int code;
 

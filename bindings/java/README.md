@@ -1,7 +1,59 @@
 # Java and Kotlin runtime
 
-The Java runtime requires JDK 25 and native Aster ABI **4.15 or newer**. Set
+The Java runtime requires JDK 25 and native Aster ABI **5.1 or newer** (within major 5). Set
 `IROH_LIB_PATH` or `-Daster.ffi.lib` to the native library when it is not bundled.
+
+## Enrollment: who may connect, and with which roles
+
+`AsterServer` and `AsterClient` admit peers with **Enrollment**, configured
+entirely through `AsterConfig`, exactly as the Rust `AsterServer` /
+`AsterClient` do (`[trust]` and `[enrollment]` in `aster.toml`,
+`ASTER_ROOT_PUBKEY` / `ASTER_ENROLLMENT_*` in the environment; the same names,
+defaults and precedence, resolved by the Rust loader). With enrollment
+configured (`config.isEnrollmentEnabled()`):
+
+- the server admits only nodes holding a credential from your root, and each
+  peer's verified `aster.role` claim (and optionally its scopes and tags,
+  `[enrollment.roles]`) becomes the role set `requires` is checked against, in
+  Rust, on every call. A root revocation refuses the peer's next call and
+  closes its connections;
+- a client presents its credential, enrolls with each server before its first
+  call, and renews from a configured issuer;
+- any missing or malformed value fails `build()` with an error naming the
+  setting; nothing falls back to an open node.
+
+Without enrollment configured the server is open. Produce the files with the
+Rust `aster` CLI (`aster key root generate`, `aster enroll namespace create`,
+`aster key node generate`, `aster enroll node`); see the
+[Mission Control auth chapter](aster-examples-mission-control/README.md).
+
+```java
+// ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_AUDIENCE, ASTER_ENROLLMENT_FLEET_NAMESPACE,
+// ASTER_SECRET_KEY_FILE, ASTER_ENROLLMENT_CREDENTIAL, ASTER_ENROLLMENT_STATE_PATH
+AsterServer server = AsterServer.builder()
+    .config(AsterConfig.fromEnv())
+    .service(new MissionControl())
+    .build().get();
+
+AsterClient client = AsterClient.builder().config(AsterConfig.fromEnv()).build().get();
+client.call(serverAddr, "MissionControl", "getStatus", req, StatusResponse.class).get();
+```
+
+Escape hatches mirror Rust and Go: `server.enrollment()` / `client.enrollment()`
+(`status()`, `credential()`, `peerClaims(peer)`, `checkPeer(peer)`,
+`nextRevocation()`), `server.issuer()` (`info()`, `issue(subject, claims,
+registration)`) when `[enrollment.issuer] delegation_file` is set,
+`client.isRenewing()`, and the builder overrides
+`AsterServer.Builder.enrollmentPolicy(Policy)` /
+`enrollmentRoles(RoleMapping)` and `AsterClient.Builder.enrollmentPolicy`.
+
+`AsterServer.Builder.leaseGrantor(LeaseGrantor)` serves `aster.lease.Grantor`
+(over a Java `LeaseSerializer`, or Rust's in-memory one), and
+`client.leaseGrantor(serverAddr)` returns a `NativeLeaseSerializer` that
+acquires through it; the grantor binds every lease to the caller's
+authenticated node id.
+
+See [CHANGELOG.md](CHANGELOG.md) for the retired consumer admission.
 
 ## Authenticated HTTPS and WebTransport listeners
 

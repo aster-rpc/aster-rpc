@@ -1,6 +1,5 @@
 package site.aster.config;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,8 +17,16 @@ import org.tomlj.TomlTable;
  * discovery, monitoring, transports, portmapper, proxy, QUIC tuning; table in {@code
  * docs/aster-rust-getstarted.md} §2.2) are resolved by the Rust {@code aster::AsterConfig} through
  * the C ABI ({@code aster_config_from_env} / {@code aster_config_from_toml}), so Java reads env and
- * TOML exactly like Rust, Python and TypeScript. Nodes start through {@code aster_node_start}. The
- * trust, connect and logging fields are still read here.
+ * TOML exactly like Rust, Python and TypeScript. Nodes start through {@code aster_node_start}.
+ *
+ * <p>The <b>trust and Enrollment</b> fields ({@code [trust]}, {@code [enrollment]}; design §15.3 of
+ * {@code docs/_internal/working_ideas/aster-enrollment.md}) are resolved by the same Rust loader
+ * ({@code aster_config_enrollment_from_env} / {@code _from_toml}): same names, defaults and
+ * precedence as the Rust SDK. With enrollment configured ({@link #isEnrollmentEnabled()}), {@code
+ * AsterServer} admits only nodes holding a credential from the configured root and turns each
+ * peer's verified claims into the roles {@code @Requires} checks, on every call; {@code
+ * AsterClient} presents its credential, enrolls with each server and renews. A node is open exactly
+ * when enrollment is not configured. The connect, logging and health fields are read here.
  *
  * <p>Usage:
  *
@@ -31,19 +38,21 @@ import org.tomlj.TomlTable;
  * AsterConfig config = AsterConfig.builder()
  *     .relayMode("disabled")
  *     .bindAddr("127.0.0.1:0")
- *     .allowAllConsumers(true)
  *     .build();
  * }</pre>
  */
 public final class AsterConfig {
 
-  // ── Trust ──────────────────────────────────────────────────────────────
+  // ── Trust and Enrollment ([trust], [enrollment]) ───────────────────────
   private byte[] rootPubkey;
   private String rootPubkeyFile;
+  private String nextRootCommitment;
+  private long rootSeq;
+  private List<String> rootRotations = List.of();
   private String enrollmentCredentialFile;
-  private String enrollmentCredentialIid;
-  private boolean allowAllConsumers;
-  private boolean allowAllProducers = true;
+  private String enrollmentCredentialChain;
+  private site.aster.enrollment.EnrollmentConfig enrollment =
+      site.aster.enrollment.EnrollmentConfig.DEFAULTS;
 
   // ── Connect ────────────────────────────────────────────────────────────
   private String endpointAddr;
@@ -99,28 +108,81 @@ public final class AsterConfig {
 
   // ── Getters ────────────────────────────────────────────────────────────
 
+  /**
+   * The trusted root (32 bytes; {@code ASTER_ROOT_PUBKEY}, {@code [trust] root_pubkey}), shared
+   * with coordination. Required by enrollment.
+   */
   public byte[] rootPubkey() {
     return rootPubkey;
   }
 
+  /**
+   * File holding the root key (64 hex or {@code {"public_key": …}}; {@code
+   * ASTER_ROOT_PUBKEY_FILE}). A configured file that does not exist is an error.
+   */
   public String rootPubkeyFile() {
     return rootPubkeyFile;
   }
 
+  /**
+   * Root rotation pin (64 hex; {@code ASTER_NEXT_ROOT_COMMITMENT}). Without it every rotation
+   * statement is refused.
+   */
+  public String nextRootCommitment() {
+    return nextRootCommitment;
+  }
+
+  /** Rotations applied to reach the root ({@code ASTER_ROOT_SEQ}). */
+  public long rootSeq() {
+    return rootSeq;
+  }
+
+  /** Applied rotation statements, oldest first ({@code ASTER_ROOT_ROTATIONS}, comma-separated). */
+  public List<String> rootRotations() {
+    return rootRotations;
+  }
+
+  /**
+   * This node's enrollment credential chain file ({@code aster enroll node --out}; {@code
+   * ASTER_ENROLLMENT_CREDENTIAL}, {@code [trust] enrollment_credential}). Setting it enables
+   * enrollment.
+   */
   public String enrollmentCredentialFile() {
     return enrollmentCredentialFile;
   }
 
-  public String enrollmentCredentialIid() {
-    return enrollmentCredentialIid;
+  /**
+   * The credential chain inline ({@code ASTER_ENROLLMENT_CREDENTIAL_CHAIN}, {@code [trust]
+   * enrollment_credential_chain}); wins over the file.
+   */
+  public String enrollmentCredentialChain() {
+    return enrollmentCredentialChain;
   }
 
-  public boolean allowAllConsumers() {
-    return allowAllConsumers;
+  /** The {@code [enrollment]} section ({@code ASTER_ENROLLMENT_*}). */
+  public site.aster.enrollment.EnrollmentConfig enrollment() {
+    return enrollment;
   }
 
-  public boolean allowAllProducers() {
-    return allowAllProducers;
+  /**
+   * Whether {@code AsterServer} / {@code AsterClient} install Enrollment from this config: {@code
+   * enrollment().enabled()} when set, else whether an audience, fleet namespace, issuer delegation
+   * or credential (file or chain) is configured. The root and rotation pin alone do not enable it
+   * (Rust {@code AsterConfig::is_enrollment_enabled}).
+   */
+  public boolean isEnrollmentEnabled() {
+    if (enrollment.enabled() != null) {
+      return enrollment.enabled();
+    }
+    return present(enrollment.audience())
+        || present(enrollment.fleetNamespace())
+        || present(enrollment.issuerDelegationFile())
+        || present(enrollmentCredentialFile)
+        || present(enrollmentCredentialChain);
+  }
+
+  private static boolean present(String s) {
+    return s != null && !s.isBlank();
   }
 
   public String endpointAddr() {
@@ -297,7 +359,9 @@ public final class AsterConfig {
    * Rust config ({@code aster_config_from_env}); a malformed value throws.
    */
   public static AsterConfig fromEnv() {
-    return site.aster.ffi.NativeConfig.applyEnv(builder()).applyEnv().build();
+    return site.aster.ffi.NativeConfig.applyEnrollmentEnv(
+            site.aster.ffi.NativeConfig.applyEnv(builder()).applyEnv())
+        .build();
   }
 
   /**
@@ -305,9 +369,8 @@ public final class AsterConfig {
    * the Rust config ({@code aster_config_from_toml}); a malformed file throws.
    */
   public static AsterConfig fromFile(Path path) {
-    return site.aster.ffi.NativeConfig.applyToml(path, builder())
-        .applyToml(path)
-        .applyEnv()
+    return site.aster.ffi.NativeConfig.applyEnrollmentToml(
+            path, site.aster.ffi.NativeConfig.applyToml(path, builder()).applyToml(path).applyEnv())
         .build();
   }
 
@@ -318,21 +381,6 @@ public final class AsterConfig {
 
   public static Builder builder() {
     return new Builder();
-  }
-
-  // ── Conversion ─────────────────────────────────────────────────────────
-
-  /** Resolve the root public key from rootPubkey, rootPubkeyFile, or null. */
-  public byte[] resolveRootPubkey() {
-    if (rootPubkey != null) return rootPubkey;
-    if (rootPubkeyFile != null) {
-      byte[] loaded = loadPubkeyFromFile(rootPubkeyFile);
-      if (loaded != null) {
-        rootPubkey = loaded;
-        return loaded;
-      }
-    }
-    return null;
   }
 
   // ── Builder ────────────────────────────────────────────────────────────
@@ -351,23 +399,30 @@ public final class AsterConfig {
       return this;
     }
 
+    /** Root rotation pin: commitment (64 hex), applied count and statements (oldest first). */
+    public Builder rootRotation(String nextCommitment, long seq, List<String> statements) {
+      c.nextRootCommitment = nextCommitment;
+      c.rootSeq = seq;
+      c.rootRotations = statements == null ? List.of() : List.copyOf(statements);
+      return this;
+    }
+
+    /** This node's credential chain file ({@code aster enroll node --out}). */
     public Builder enrollmentCredentialFile(String path) {
       c.enrollmentCredentialFile = path;
       return this;
     }
 
-    public Builder enrollmentCredentialIid(String iid) {
-      c.enrollmentCredentialIid = iid;
+    /** This node's credential chain inline (wins over the file). */
+    public Builder enrollmentCredentialChain(String chain) {
+      c.enrollmentCredentialChain = chain;
       return this;
     }
 
-    public Builder allowAllConsumers(boolean v) {
-      c.allowAllConsumers = v;
-      return this;
-    }
-
-    public Builder allowAllProducers(boolean v) {
-      c.allowAllProducers = v;
+    /** The {@code [enrollment]} section. */
+    public Builder enrollment(site.aster.enrollment.EnrollmentConfig enrollment) {
+      c.enrollment =
+          enrollment == null ? site.aster.enrollment.EnrollmentConfig.DEFAULTS : enrollment;
       return this;
     }
 
@@ -599,26 +654,14 @@ public final class AsterConfig {
     }
 
     /**
-     * Apply the trust / connect / logging values of an {@code aster.toml} file. Call before {@link
+     * Apply the connect / logging / health values of an {@code aster.toml} file. Call before {@link
      * #applyEnv()} so env wins. Node knobs ({@code [network]}, {@code [storage]}, {@code
-     * [identity]}) are read by {@link AsterConfig#fromFile} through the Rust config.
+     * [identity]}) and {@code [trust]} / {@code [enrollment]} are read by {@link
+     * AsterConfig#fromFile} through the Rust config.
      */
     public Builder applyToml(Path path) {
       try {
         TomlParseResult toml = Toml.parse(path);
-
-        // [trust]
-        TomlTable trust = toml.getTable("trust");
-        if (trust != null) {
-          tomlString(trust, "root_pubkey_file", v -> c.rootPubkeyFile = v);
-          tomlString(trust, "enrollment_credential", v -> c.enrollmentCredentialFile = v);
-          tomlString(trust, "enrollment_credential_iid", v -> c.enrollmentCredentialIid = v);
-          tomlBool(trust, "allow_all_consumers", v -> c.allowAllConsumers = v);
-          tomlBool(trust, "allow_all_producers", v -> c.allowAllProducers = v);
-          if (trust.contains("root_pubkey")) {
-            c.rootPubkey = hexToBytes(trust.getString("root_pubkey"));
-          }
-        }
 
         // [connect]
         TomlTable connect = toml.getTable("connect");
@@ -651,20 +694,15 @@ public final class AsterConfig {
     }
 
     /**
-     * Apply the trust / connect / logging {@code ASTER_*} variables (overrides prior builder
-     * calls). Node knobs ({@code ASTER_RELAY_MODE}, {@code ASTER_BIND_ADDR}, ...) are read by
-     * {@link #applyNodeEnv()} / {@link AsterConfig#fromEnv} through the Rust config.
+     * Apply the connect / logging / health {@code ASTER_*} variables (overrides prior builder
+     * calls). Node knobs ({@code ASTER_RELAY_MODE}, {@code ASTER_BIND_ADDR}, ...) and the trust /
+     * enrollment variables are read by {@link AsterConfig#fromEnv} through the Rust config.
      */
     public Builder applyEnv() {
-      envString("ASTER_ROOT_PUBKEY_FILE", v -> c.rootPubkeyFile = v);
-      envString("ASTER_ENROLLMENT_CREDENTIAL", v -> c.enrollmentCredentialFile = v);
-      envString("ASTER_ENROLLMENT_CREDENTIAL_IID", v -> c.enrollmentCredentialIid = v);
       envString("ASTER_ENDPOINT_ADDR", v -> c.endpointAddr = v);
       envString("ASTER_LOG_FORMAT", v -> c.logFormat = v.toLowerCase());
       envString("ASTER_LOG_LEVEL", v -> c.logLevel = v.toLowerCase());
 
-      envBool("ASTER_ALLOW_ALL_CONSUMERS", v -> c.allowAllConsumers = v);
-      envBool("ASTER_ALLOW_ALL_PRODUCERS", v -> c.allowAllProducers = v);
       envBool("ASTER_LOG_MASK", v -> c.logMask = v);
 
       envString(
@@ -679,8 +717,6 @@ public final class AsterConfig {
           });
       envString("ASTER_HEALTH_HOST", v -> c.healthHost = v);
       envBool("ASTER_HEALTH_ENABLED", v -> c.healthEnabled = v);
-
-      envBytes("ASTER_ROOT_PUBKEY", v -> c.rootPubkey = v);
 
       return this;
     }
@@ -712,13 +748,6 @@ public final class AsterConfig {
       else if (List.of("false", "0", "no", "off").contains(v)) setter.accept(false);
     }
 
-    private static void envBytes(String key, java.util.function.Consumer<byte[]> setter) {
-      String v = System.getenv(key);
-      if (v != null && !v.isBlank()) {
-        setter.accept(hexToBytes(v.trim()));
-      }
-    }
-
     // TOML helpers
     private static void tomlString(
         TomlTable t, String key, java.util.function.Consumer<String> setter) {
@@ -729,42 +758,5 @@ public final class AsterConfig {
         TomlTable t, String key, java.util.function.Consumer<Boolean> setter) {
       if (t.contains(key)) setter.accept(t.getBoolean(key));
     }
-  }
-
-  // ── Helpers ──────────────────────────────────────────────────────────
-
-  private static byte[] hexToBytes(String hex) {
-    int len = hex.length();
-    byte[] data = new byte[len / 2];
-    for (int i = 0; i < len; i += 2) {
-      data[i / 2] =
-          (byte)
-              ((Character.digit(hex.charAt(i), 16) << 4) + Character.digit(hex.charAt(i + 1), 16));
-    }
-    return data;
-  }
-
-  private static byte[] loadPubkeyFromFile(String path) {
-    try {
-      String content = Files.readString(Path.of(path)).trim();
-      if (content.startsWith("{")) {
-        // JSON: extract "public_key" field (minimal parsing)
-        int idx = content.indexOf("\"public_key\"");
-        if (idx >= 0) {
-          int colon = content.indexOf(':', idx);
-          int quote1 = content.indexOf('"', colon + 1);
-          int quote2 = content.indexOf('"', quote1 + 1);
-          if (quote1 >= 0 && quote2 > quote1) {
-            return hexToBytes(content.substring(quote1 + 1, quote2));
-          }
-        }
-      }
-      // Plain hex
-      if (content.length() == 64) {
-        return hexToBytes(content);
-      }
-    } catch (Exception ignored) {
-    }
-    return null;
   }
 }

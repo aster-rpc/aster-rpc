@@ -486,7 +486,6 @@ public final class InteropEcho {
     return AsterConfig.builder()
         .relayMode("disabled")
         .bindAddr("127.0.0.1:0")
-        .allowAllConsumers(true)
         .build();
   }
 
@@ -524,7 +523,7 @@ public final class InteropEcho {
     ForyCodec codec = new ForyCodec();
     registerTypes(codec.fory());
     try (AsterClient client = AsterClient.builder().config(config()).codec(codec)
-        .consumerAdmission(false).build().get(30, TimeUnit.SECONDS)) {
+        .build().get(30, TimeUnit.SECONDS)) {
       chainLeaf = NodeAddr.fromTicket(leafTicket);
       client.connect(chainLeaf).get(15, TimeUnit.SECONDS);
       chainClient = client;
@@ -737,7 +736,7 @@ public final class InteropEcho {
     ForyCodec codec = new ForyCodec(); registerTypes(codec.fory());
     ObjectMapper json = new ObjectMapper();
     try (AsterClient client = AsterClient.builder().config(config()).codec(codec)
-        .consumerAdmission(false).build().get(30, TimeUnit.SECONDS)) {
+        .build().get(30, TimeUnit.SECONDS)) {
       NodeAddr addr = NodeAddr.fromTicket(ticket);
       IrohConnection connection = client.connect(addr).get(2, TimeUnit.SECONDS);
       int generation = 0;
@@ -900,7 +899,6 @@ public final class InteropEcho {
         AsterClient.builder()
             .config(config())
             .codec(codec)
-            .consumerAdmission(false)
             .build()
             .get(30, TimeUnit.SECONDS)) {
       EchoReply first =
@@ -1047,13 +1045,12 @@ public final class InteropEcho {
     registerTypes(codec.fory());
     NodeAddr addr = NodeAddr.fromTicket(ticket);
     boolean ok = true;
-    // Open gate, aster/1 directly (like the other languages' matrix clients): a Rust
-    // AsterServer serves no consumer-admission ALPN.
+    // An open server (no enrollment configured): aster/1 directly, like the other languages'
+    // matrix clients.
     try (AsterClient client =
         AsterClient.builder()
             .config(config())
             .codec(codec)
-            .consumerAdmission(false)
             .build()
             .get(30, TimeUnit.SECONDS)) {
       for (Map.Entry<String, EchoRequest> e : cases()) {

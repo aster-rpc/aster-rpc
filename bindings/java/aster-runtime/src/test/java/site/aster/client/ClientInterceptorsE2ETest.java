@@ -393,7 +393,6 @@ final class ClientInterceptorsE2ETest {
     AsterClient c =
         AsterClient.builder()
             .codec(codec)
-            .consumerAdmission(false)
             .interceptors(List.of(interceptors))
             .build()
             .get(20, TimeUnit.SECONDS);

@@ -358,10 +358,9 @@ public class IrohStream implements AutoCloseable {
 
   /**
    * Read all remaining bytes on this stream until the peer finishes it (mirrors Python's {@code
-   * recv.read_to_end(max_size)}). Used by the non-framed Aster protocols — e.g. {@code
-   * aster.consumer_admission} — that write a single JSON payload and call {@code finish()} on the
-   * send side. Returns the complete payload as one byte array. Fails if the peer writes more than
-   * {@code maxSize} bytes before finishing.
+   * recv.read_to_end(max_size)}). Used by non-framed protocols that write a single payload and call
+   * {@code finish()} on the send side. Returns the complete payload as one byte array. Fails if the
+   * peer writes more than {@code maxSize} bytes before finishing.
    *
    * <p>Unlike {@link #readAsync(long)} (which consumes {@code FRAME_RECEIVED} events fired as
    * inbound notifications), {@code aster_stream_read_to_end} emits exactly one {@code BYTES_RESULT}

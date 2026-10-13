@@ -28,6 +28,11 @@ public final class NativeLeaseSerializer implements AutoCloseable {
       UpcallNative.handle(
           "aster_lease_serializer_memory_new",
           FunctionDescriptor.of(UpcallNative.I, UpcallNative.J, UpcallNative.J, UpcallNative.A));
+  private static final MethodHandle GRANTOR_NEW =
+      UpcallNative.handle(
+          "aster_lease_serializer_grantor_new",
+          FunctionDescriptor.of(
+              UpcallNative.I, UpcallNative.J, UpcallNative.J, UpcallNative.J, UpcallNative.A));
   private static final MethodHandle FREE =
       UpcallNative.handle(
           "aster_lease_serializer_free",
@@ -102,6 +107,20 @@ public final class NativeLeaseSerializer implements AutoCloseable {
         UpcallNative.callForLong(
             "aster_lease_serializer_memory_new",
             (a, out) -> (int) MEMORY_NEW.invoke(runtime.nativeHandle(), u, out));
+    return new NativeLeaseSerializer(runtime, h);
+  }
+
+  /**
+   * A serializer backed by the remote {@code aster.lease.Grantor} on {@code connection} (an {@code
+   * aster/1} connection from {@code node}; ABI 5.1, Rust {@code GrantorSerializer}). The grantor
+   * binds the holder to {@code node}'s authenticated id: acquire with {@code holder} = that id. Use
+   * {@code AsterClient.leaseGrantor(addr)}.
+   */
+  public static NativeLeaseSerializer grantor(IrohRuntime runtime, long node, long connection) {
+    long h =
+        UpcallNative.callForLong(
+            "aster_lease_serializer_grantor_new",
+            (a, out) -> (int) GRANTOR_NEW.invoke(runtime.nativeHandle(), node, connection, out));
     return new NativeLeaseSerializer(runtime, h);
   }
 

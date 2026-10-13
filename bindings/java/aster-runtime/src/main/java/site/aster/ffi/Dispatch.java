@@ -194,6 +194,10 @@ public final class Dispatch implements AutoCloseable {
       h("aster_dispatch_inbound_trace", FunctionDescriptor.of(I32, I64, I64, I64, PTR, PTR, PTR));
   private static final MethodHandle TRACE_CONTEXT =
       h("aster_dispatch_trace_context", FunctionDescriptor.of(I32, I64, I64, I64, PTR));
+  private static final MethodHandle ADD_LEASE_GRANTOR =
+      h(
+          "aster_server_add_lease_grantor",
+          FunctionDescriptor.of(I32, I64, I64, IrohLibrary.ASTER_BYTES, IrohLibrary.ASTER_BYTES));
   private static final MethodHandle ATTACH_HEALTH =
       h("aster_server_attach_health", FunctionDescriptor.of(I32, I64, I64));
 
@@ -274,6 +278,25 @@ public final class Dispatch implements AutoCloseable {
         return this;
       } catch (Throwable t) {
         throw rethrow(t);
+      }
+    }
+
+    /**
+     * {@code aster_server_add_lease_grantor} (ABI 5.1): serve {@code aster.lease.Grantor} backed by
+     * the lease serializer handle {@code serializer}. {@code requiresJson} gates every method
+     * (empty = none); {@code revokeRequiresJson} gates revoke (empty = the {@code operator} role,
+     * {@code null} JSON = only {@code requiresJson}).
+     */
+    public Builder leaseGrantor(long serializer, byte[] requiresJson, byte[] revokeRequiresJson) {
+      try (Arena arena = Arena.ofConfined()) {
+        NativeCall.callChecked(
+            ADD_LEASE_GRANTOR,
+            "aster_server_add_lease_grantor",
+            handle,
+            serializer,
+            NativeCall.bytes(arena, requiresJson),
+            NativeCall.bytes(arena, revokeRequiresJson));
+        return this;
       }
     }
 

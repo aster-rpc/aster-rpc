@@ -104,13 +104,41 @@ final class NodeConfigTest {
   }
 
   @Test
-  void fromFileReadsNodeKnobsThroughRustAndTrustInJava() throws Exception {
+  void fromFileReadsNodeKnobsAndEnrollmentThroughRust() throws Exception {
     Path toml = tmp.resolve("aster.toml");
     Files.writeString(
         toml,
         """
         [trust]
-        allow_all_consumers = true
+        root_pubkey = "%s"
+        enrollment_credential = "node.cred"
+        next_root_commitment = "%s"
+        root_seq = 2
+        root_rotations = ["a", "b"]
+
+        [enrollment]
+        audience = "fleet"
+        fleet_namespace = "%s"
+        state_path = "/var/lib/aster/enrollment.json"
+        replicas = ["%s"]
+        policy = { any_of = [{ scope = "ops" }, "require_registration"] }
+        activation_leeway_secs = 30
+        renew = false
+
+        [enrollment.limits]
+        sync_timeout_ms = 5000
+
+        [enrollment.roles]
+        attribute = "team.roles"
+        scopes_as_roles = true
+        include_attributes = false
+
+        [enrollment.roles.tags]
+        oncall = ["ops.logs", "ops.status"]
+
+        [enrollment.issuer]
+        delegation_file = "issuer.chain"
+        lifetime = "2h"
 
         [storage]
         gc_interval_ms = 60000
@@ -122,9 +150,40 @@ final class NodeConfigTest {
         hook_failure_mode = "fail_closed"
         transport_keep_alive_interval_ms = 2000
         """
-            .formatted("07".repeat(32)));
+            .formatted(
+                "11".repeat(32),
+                "22".repeat(32),
+                "33".repeat(32),
+                "44".repeat(32),
+                "07".repeat(32)));
     AsterConfig c = AsterConfig.fromFile(toml);
-    assertTrue(c.allowAllConsumers());
+    // [trust] / [enrollment] are resolved by the Rust loader (same names as Rust, design §15.3).
+    assertTrue(c.isEnrollmentEnabled());
+    assertEquals("11".repeat(32), java.util.HexFormat.of().formatHex(c.rootPubkey()));
+    assertEquals("node.cred", c.enrollmentCredentialFile());
+    assertEquals("22".repeat(32), c.nextRootCommitment());
+    assertEquals(2L, c.rootSeq());
+    assertEquals(java.util.List.of("a", "b"), c.rootRotations());
+    var e = c.enrollment();
+    assertEquals("fleet", e.audience());
+    assertEquals("33".repeat(32), e.fleetNamespace());
+    assertEquals("/var/lib/aster/enrollment.json", e.statePath());
+    assertEquals(java.util.List.of("44".repeat(32)), e.replicas());
+    assertEquals(
+        site.aster.enrollment.Policy.anyOf(
+            site.aster.enrollment.Policy.scope("ops"),
+            site.aster.enrollment.Policy.requireRegistration()),
+        e.policy());
+    assertEquals(30L, e.activationLeewaySecs());
+    assertEquals(Boolean.FALSE, e.renew());
+    assertEquals(5000L, e.limits().syncTimeoutMs());
+    assertNull(e.limits().handshakeTimeoutMs());
+    assertEquals("team.roles", e.roles().attribute());
+    assertTrue(e.roles().scopesAsRoles());
+    assertEquals(Boolean.FALSE, e.roles().includeAttributes());
+    assertEquals(java.util.List.of("ops.logs", "ops.status"), e.roles().tags().get("oncall"));
+    assertEquals("issuer.chain", e.issuerDelegationFile());
+    assertEquals(7200L, e.issuerLifetimeSecs());
     assertEquals("disabled", c.relayMode());
     assertEquals("127.0.0.1:0", c.bindAddr());
     assertEquals(60000, c.gcIntervalMs());

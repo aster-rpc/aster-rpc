@@ -216,14 +216,17 @@ public final class IrohLibrary implements SymbolLookup {
   public static final int EXPECTED_ABI_MAJOR = 5;
 
   /**
-   * Lowest C ABI minor version this binding runs against. 5.0 removed the attestation functions and
-   * is otherwise 4.17, which added standalone raw WebTransport. Version 4.16 added topology views
-   * and baseline capability policy. 4.15 added offline coordination provisioning. Version 4.14 adds
-   * batch local Docs content reads. Version 4.13 adds temporary blob custody and verified retained
-   * imports. Version 4.12 adds public listeners and certificate helpers; version 4.11 adds
-   * authenticated listeners and 4.10 adds owned Docs receivers.
+   * Lowest C ABI minor version this binding runs against. 5.1 adds Enrollment from configuration
+   * ({@code aster_config_enrollment_from_*}, {@code aster_node_start_enrolled}, {@code
+   * aster_enrollment_*}) and the lease grantor ({@code aster_server_add_lease_grantor}, {@code
+   * aster_lease_serializer_grantor_new}). 5.0 removed the attestation functions and is otherwise
+   * 4.17, which added standalone raw WebTransport. Version 4.16 added topology views and baseline
+   * capability policy. 4.15 added offline coordination provisioning. Version 4.14 adds batch local
+   * Docs content reads. Version 4.13 adds temporary blob custody and verified retained imports.
+   * Version 4.12 adds public listeners and certificate helpers; version 4.11 adds authenticated
+   * listeners and 4.10 adds owned Docs receivers.
    */
-  public static final int REQUIRED_ABI_MINOR = 0;
+  public static final int REQUIRED_ABI_MINOR = 1;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {

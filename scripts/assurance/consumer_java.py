@@ -127,13 +127,13 @@ public class Consumer {
     check(hash(nativePath).equals(expectedHash),"mapped FFI hash mismatch");
     var json=new ObjectMapper();
     System.out.println(json.writeValueAsString(Map.of("phase","java_metadata","version",version,"runtime",runtime.toString(),"annotations",annotations.toString(),"native",nativePath.toString(),"native_sha256",expectedHash,"native_resource",resource.toString(),"abi",library.abiVersion())));
-    var config=AsterConfig.builder().relayMode("disabled").bindAddr("127.0.0.1:0").allowAllConsumers(true).build();
+    var config=AsterConfig.builder().relayMode("disabled").bindAddr("127.0.0.1:0").build();
     ForyCodec serverCodec=new ForyCodec(); register(serverCodec.fory());
     AsterServer server=AsterServer.builder().config(config).codec(serverCodec).service(new Object(),new Dispatcher()).build().get(15,TimeUnit.SECONDS);
     AsterClient client=null;
     try {
       ForyCodec clientCodec=new ForyCodec(); register(clientCodec.fory());
-      client=AsterClient.builder().config(config).codec(clientCodec).consumerAdmission(false).build().get(15,TimeUnit.SECONDS);
+      client=AsterClient.builder().config(config).codec(clientCodec).build().get(15,TimeUnit.SECONDS);
       NodeAddr addr=server.node().nodeAddr();
       for(int i=0;addr.directAddresses().isEmpty() && i<100;i++) { Thread.sleep(20); addr=server.node().nodeAddr(); }
       client.connect(addr).get(8,TimeUnit.SECONDS);
