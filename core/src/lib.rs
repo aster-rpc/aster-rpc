@@ -4425,6 +4425,19 @@ pub struct CoreDoc {
     pub store: BlobStore,
 }
 
+/// Wait before dialling a replica again after a crossed sync.
+pub(crate) const CROSSED_SYNC_RETRY: Duration = Duration::from_millis(100);
+
+/// Whether a failed `SyncFinished` only means both ends dialled at once.
+/// iroh-docs aborts the losing direction with `AlreadySyncing` and reports
+/// that abort before the other direction finishes, so callers waiting for a
+/// completed sync keep waiting (within their deadline) instead of failing.
+/// Every other failure, including other aborts, still fails.
+pub(crate) fn crossed_sync_abort(error: &str) -> bool {
+    use iroh_docs::net::{AbortReason, ConnectError};
+    error == ConnectError::RemoteAbort(AbortReason::AlreadySyncing).to_string()
+}
+
 impl CoreDoc {
     pub fn doc_id(&self) -> String {
         self.doc.id().to_string()
@@ -4732,10 +4745,20 @@ impl CoreDoc {
             while !pending.is_empty() {
                 match futures_lite::StreamExt::next(&mut events).await {
                     Some(Ok(LiveEvent::SyncFinished(event))) if pending.contains(&event.peer) => {
-                        event
-                            .result
-                            .map_err(|error| anyhow!("policy replica sync failed: {error}"))?;
-                        pending.remove(&event.peer);
+                        match &event.result {
+                            Ok(_) => {
+                                pending.remove(&event.peer);
+                            }
+                            Err(error) if crossed_sync_abort(error) => {
+                                // The other direction normally completes on
+                                // its own; dial again in case it cannot.
+                                tokio::time::sleep(CROSSED_SYNC_RETRY).await;
+                                self.start_sync(vec![event.peer.to_string()]).await?;
+                            }
+                            Err(error) => {
+                                return Err(anyhow!("policy replica sync failed: {error}"));
+                            }
+                        }
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error),

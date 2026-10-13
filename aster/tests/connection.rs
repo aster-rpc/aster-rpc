@@ -160,7 +160,7 @@ async fn add_ticket_addr_then_connect_by_id() {
 #[tokio::test]
 async fn bootstrap_alpn_admission_gates_normal_alpn() {
     use aster::enrollment::{
-        issue_jwt, verify_connection, EnrollmentIssueRequest, JwtEnrollmentVerifier,
+        issue_credential, verify_connection, EnrollmentIssueRequest, JwtEnrollmentVerifier,
     };
     use aster::SecretKey;
 
@@ -238,9 +238,8 @@ async fn bootstrap_alpn_admission_gates_normal_alpn() {
     // Client node, enrolled under the root.
     let client = Node::start(cfg(false)).await.unwrap();
     let client_key = client.export_secret_key().unwrap().public_key().to_bytes();
-    let mut request = EnrollmentIssueRequest::new(client_key, "connection-test");
-    request.expires_at = Some(now + 3600);
-    let credential = issue_jwt(&root, &request, now).unwrap();
+    let request = EnrollmentIssueRequest::new(client_key, "connection-test", now + 3600);
+    let credential = issue_credential(&root, &request, now).unwrap();
 
     wait_for_addr(&server).await;
     wait_for_addr(&client).await;
@@ -262,7 +261,7 @@ async fn bootstrap_alpn_admission_gates_normal_alpn() {
     // Phase 2: present the credential on the admission ALPN → admitted.
     let conn = client.connect(&server.id(), ADMISSION_ALPN).await.unwrap();
     let (send, recv) = conn.open_bi().await.unwrap();
-    send.write_all(credential.into_jwt().into_bytes())
+    send.write_all(credential.into_chain().into_bytes())
         .await
         .unwrap();
     send.finish().await.unwrap();

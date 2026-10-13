@@ -1213,10 +1213,19 @@ impl EnrollmentService {
                     Some(Ok(iroh_docs::engine::LiveEvent::SyncFinished(event)))
                         if identity(&event.peer.to_string())? == peer =>
                     {
-                        event
-                            .result
-                            .map_err(|error| anyhow!("policy sync failed: {error}"))?;
-                        synchronized = true;
+                        match &event.result {
+                            Ok(_) => synchronized = true,
+                            // The replica's own sync on gossip neighbour-up
+                            // crossed our direct join. The other direction
+                            // normally completes on its own; dial again in
+                            // case the replica cannot reach us. The deadline
+                            // still bounds it.
+                            Err(error) if crate::crossed_sync_abort(error) => {
+                                tokio::time::sleep(crate::CROSSED_SYNC_RETRY).await;
+                                doc.start_sync(vec![hex::encode(peer)]).await?;
+                            }
+                            Err(error) => bail!("policy sync failed: {error}"),
+                        }
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error),
@@ -2064,6 +2073,29 @@ mod tests {
         assert_eq!(pending(&service), 0);
         client.close().await;
         cleanup(service, path).await;
+    }
+
+    /// Regression: `synchronize` (and `CoreDoc::sync_with_timeout`) failed
+    /// with "Remote peer aborted sync: AlreadySyncing" when the replica's own
+    /// gossip-triggered sync crossed our direct join. Only that exact abort
+    /// is waited out; every other failed sync, including other aborts, still
+    /// fails closed.
+    #[test]
+    fn only_a_crossed_sync_abort_is_waited_out() {
+        use iroh_docs::net::{AbortReason, ConnectError};
+        assert!(crate::crossed_sync_abort(
+            &ConnectError::RemoteAbort(AbortReason::AlreadySyncing).to_string()
+        ));
+        assert_eq!(
+            ConnectError::RemoteAbort(AbortReason::AlreadySyncing).to_string(),
+            "Remote peer aborted sync: AlreadySyncing"
+        );
+        for other in [AbortReason::NotFound, AbortReason::InternalServerError] {
+            assert!(!crate::crossed_sync_abort(
+                &ConnectError::RemoteAbort(other).to_string()
+            ));
+        }
+        assert!(!crate::crossed_sync_abort("failed to sync: AlreadySyncing"));
     }
 
     #[tokio::test]
