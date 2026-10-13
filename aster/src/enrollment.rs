@@ -1,15 +1,24 @@
 //! Enrollment on delegation chains and consumer-selected admission policies.
 //!
 //! A credential is a delegation chain whose leaf enrolls the node: one link
-//! when the root issues it, more when an online issuer does. Core evidence is
-//! opaque and is created only after the whole chain verifies for the peer. Use [`verify_connection`] to obtain the subject key directly
-//! from an Aster authenticated connection, then call [`admit`] with an explicit
-//! consumer policy and the consumer's known revocations. Admission is separate
-//! from application/operation authorization.
+//! when the root issues it, more when an online issuer does. Long-lived
+//! membership is a root-authored [`NodeRegistrationV1`] in the replicated
+//! policy namespaces, which replaces a `persistent` credential once the root
+//! promotes the node. Evidence is opaque and is created only from a chain that
+//! verifies for the authenticated peer, or from an exact-root record. Use
+//! [`verify_connection`] to obtain the subject key directly from an Aster
+//! authenticated connection, then call [`admit`] with an explicit consumer
+//! policy and the consumer's known revocations. Admission is separate from
+//! application/operation authorization.
 //!
 //! [`Enrollment`] installs opt-in restricted-ALPN admission and reciprocal
-//! identity verification. Consumers retain their sole custom ALPN accept loop
-//! and route enrollment connections into [`Enrollment::accept`].
+//! identity verification, keeps policy current, closes every connection of a
+//! denied peer, and follows root rotations. Consumers retain their sole custom
+//! ALPN accept loop and route enrollment connections into
+//! [`Enrollment::accept`]. An online issuer runs `Issuer` (features `rpc`
+//! and `docs`), and nodes renew with `Enrollment::start_renewal`.
+//!
+//! Design and tested invariants: `docs/_internal/working_ideas/aster-enrollment.md`.
 
 pub use aster_transport_core::enrollment::{
     admit, check_root_revision, credential_status_key, issuer_status_key,

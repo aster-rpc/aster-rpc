@@ -353,7 +353,7 @@ impl Docs {
     /// The node-wide default author. Aster sets it to the node's own identity
     /// key, so it **equals the node id** (`AuthorId == NodeId`): a doc entry's
     /// author is exactly the node that wrote it, directly verifiable against the
-    /// attestation chain and QUIC handshake — no separate author↔node binding to
+    /// enrollment credential and QUIC handshake — no separate author↔node binding to
     /// publish. Restart-stable when the node keeps the same secret.
     pub async fn default_author(&self) -> Result<AuthorId> {
         Ok(AuthorId::from_hex(self.inner.default_author().await?))

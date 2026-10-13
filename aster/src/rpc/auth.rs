@@ -5,8 +5,8 @@
 //! via [`ServiceDispatch`](super::server::ServiceDispatch)) and evaluates it
 //! against the caller's attributes from an [`AttributeStore`]. The store is
 //! populated by the **application** — e.g. a Gate-0 admission loop that verifies
-//! an attestation chain assigns the peer a role. Gate 1 (enrollment-credential
-//! verification) and Gate 2 (session authorize → rcan) are deferred; see
+//! an enrollment credential assigns the peer a role (`aster::enrollment`).
+//! Gate 2 (session authorize → rcan) is deferred; see
 //! `docs/_internal/aster-rust.md` Step 2 "Outstanding".
 
 use std::collections::HashMap;

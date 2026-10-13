@@ -258,8 +258,8 @@ tokio::spawn(async move {
     }
 });
 
-// 2) Accept loop on the admission ALPN: read the peer's enrollment JWT and
-//    verify it was issued by the root for exactly this authenticated peer.
+// 2) Accept loop on the admission ALPN: read the peer's enrollment credential
+//    and verify it was issued by the root for exactly this authenticated peer.
 let srv = node.clone();
 tokio::spawn(async move {
     while let Ok((alpn, conn)) = srv.accept().await {
@@ -267,7 +267,7 @@ tokio::spawn(async move {
         let (send, recv) = conn.accept_bi().await?;
         let raw = recv.read_to_end(16 * 1024).await?;        // bound the request
         let token = String::from_utf8(raw).unwrap_or_default();
-        // The JWT's subject must be the peer the QUIC handshake authenticated.
+        // The credential's subject must be the peer the QUIC handshake authenticated.
         let ok = verify_connection(&verifier, &token, &conn, now).is_ok();
         if ok { gate.admit(conn.peer()); }
         send.write_all(if ok { b"ok".to_vec() } else { b"no".to_vec() }).await?;
@@ -288,24 +288,26 @@ Issuing a credential (root side; `aster enroll node` does the same from the CLI)
 
 ```rust
 use aster::SecretKey;
-use aster::enrollment::{issue_jwt, EnrollmentIssueRequest};
+use aster::enrollment::{issue_credential, EnrollmentIssueRequest};
 
 # fn issue(root_secret: &SecretKey, node_public: [u8; 32], now: u64) {
 // The root key is your trust anchor: generate it once, keep it offline,
 // persist `to_bytes()`. The node generates its own key; only its public key
-// reaches the root.
-let mut request = EnrollmentIssueRequest::new(node_public, "my-fleet");
-request.expires_at = Some(now + 7 * 24 * 3600);
-let credential = issue_jwt(root_secret, &request, now).expect("issued");
-let jwt: String = credential.into_jwt();     // hand this to the node
+// reaches the root. Every credential expires (at most 30 days).
+let request = EnrollmentIssueRequest::new(node_public, "my-fleet", now + 7 * 24 * 3600);
+let credential = issue_credential(root_secret, &request, now).expect("issued");
+let chain: String = credential.into_chain();  // hand this to the node
 let trusted_root = root_secret.public_key();  // what verifiers pin
 # }
 ```
 
-`node.export_secret_key()?.public_key()` equals `node.id()`: the enrollment
-subject *is* the transport identity, so a stolen JWT is useless on any other
-node. Delegation chains (an online issuer acting for an offline root) are
-designed in `docs/_internal/ownership-attestations.md`.
+A credential is a delegation chain (`aster-chain-v1~...`) of compact Ed25519
+JWTs. `node.export_secret_key()?.public_key()` equals `node.id()`: the
+enrollment subject *is* the transport identity, so a stolen credential is
+useless on any other node. An online issuer can sign credentials for an
+offline root under a root-signed delegation (`issue_delegated_credential`,
+`aster enroll delegate`); see `docs/_internal/ownership-attestations.md` and
+`docs/_internal/working_ideas/aster-enrollment.md`.
 
 ### 3.1 Allowlist specific node IDs
 

@@ -68,7 +68,7 @@ configuration (replace identities, paths, accounts, and receiver):
   "policy_replicas": [{"node_id": "<enrolled replica public ID>", "relay_url": null, "direct_addresses": ["192.0.2.1:9010"]}],
   "audience": "production-fleet",
   "policy_read_ticket_file": "/etc/aster-exec/policy.ticket",
-  "credential_file": "/etc/aster-exec/enrollment.jwt",
+  "credential_file": "/etc/aster-exec/enrollment.chain",
   "helper_socket": "/run/aster-exec/helper.sock",
   "ceiling": {
     "version": 1,
@@ -98,15 +98,27 @@ configuration (replace identities, paths, accounts, and receiver):
 }
 ```
 
-Issue reusable enrollment credentials on the root operator machine using the
-configured Aster CLI profile (repeat for each client and the API node):
+Optional keys for root pre-rotation, copied from `aster trust show` on the
+root operator machine: `next_root_commitment` (64 lowercase hex), `root_seq`
+(rotations already applied to `root_public_key`, default 0) and
+`root_rotations` (the applied rotation statements, oldest first). Without
+`next_root_commitment` the server refuses every rotation statement.
+
+Issue enrollment credentials on the root operator machine using the
+configured Aster CLI profile (repeat for each client and the API node). A
+credential is a delegation chain (`aster-chain-v1~...`) and every credential
+expires. A long-running API node should be **persistent**: its credential
+admits it until the root's next online session publishes its registration
+(`aster enroll promote`, or a registration you publish directly), after which
+the record is its authority. Its lifetime must cover that gap; the CLI sizes it
+from the profile's `root_cadence` and `replication_allowance`:
 
 ```sh
 aster enroll node --subject NODE_PUBLIC_ID --audience production-fleet \
-  --root-key /secure/root.key --expires-at UNIX_EXPIRY --out enrollment.jwt
+  --root-key /secure/root.key --persistent --out enrollment.chain
 ```
 
-Copy the API JWT to `/etc/aster-exec/enrollment.jwt` and its policy read ticket
+Copy the API credential to `/etc/aster-exec/enrollment.chain` and its policy read ticket
 to `/etc/aster-exec/policy.ticket`, then set the ownership/modes above. The
 root key stays on the operator machine. Publish a complete `ExecGrantV1` JSON file using the selected root profile and
 an owner-only namespace secret file. The node is the destination transport
@@ -120,7 +132,7 @@ aster exec check --node API_NODE_PUBLIC_ID --target API_NODE_PUBLIC_ID
 ```
 
 The selected root profile needs an existing `keys/ROOT.node.key` and its own
-enrollment JWT in `exec_credential_file`. This transport identity is separate
+enrollment credential in `exec_credential_file`. This transport identity is separate
 from the offline root signing key. Supply `--peer` for every current policy
 replica used for publication. The command completes reciprocal enrollment and
 requires successful native Docs synchronization with those replicas, and the
@@ -190,6 +202,57 @@ each job owner's enrollment and grant afresh and acts on the result:
 Revoke the Exec grant to stop a caller's work on a target: grant revocation
 applies even to callers that have not reconnected since an API restart.
 Preserve local denial watermarks when restoring state.
+
+### Grant namespaces
+
+By default grants live in the fleet policy namespace (`policy_namespace`). The
+root can instead bind an Exec-grant namespace per role (`aster enroll namespace
+bind --purpose exec_grants --read-scope ROLE ...`). A node then reads grants
+from the one Exec-grant namespace bound for it; replicas hand its read ticket
+only to nodes whose verified scopes include the binding's read scope. The
+server refuses to start if more than one Exec-grant namespace is bound for it.
+Publish grants into that namespace with `aster exec grant --namespace`.
+
+### Clock synchronization
+
+Enrollment and grants are judged against the local clock. `aster-exec-server`
+refuses to start while the kernel reports the clock unsynchronised, and the
+unit orders after `time-sync.target`. `aster exec setup` refuses as well and
+names the remedy: `systemctl enable --now systemd-timesyncd`, or keep
+`chronyd`. Peers whose clocks differ by more than the activation leeway
+(60 seconds) are refused with a clock-skew error that reports the offset.
+
+### Root rotation
+
+When the root rotates, the server applies the rotation statement it learns from
+an enrollment peer (or from `root_rotations` in its configuration), journals it
+beside its state, and exits so systemd restarts it under the new root and fleet
+namespace; no grant read under the old root stays in force. Grant state for a
+rotated fleet namespace is kept in `grants-<namespace>.redb`. Republish grants
+under the new root (`aster enroll republish` carries enrollment records only;
+Exec grants are republished with `aster exec grant`).
+
+### Submitting on behalf of a principal
+
+A grant names its principal (`caller`), which may be a person's or an agent's
+key. That principal can let another actor submit for it with an action chain:
+
+```sh
+aster exec delegate --subject ORCHESTRATOR_ID ...   # principal -> orchestrator
+aster exec authorize --subject ACTOR_ID --resource exec:target=TARGET_ID \
+  --resource exec:profile=open ...                   # -> actor
+aster exec run --on-behalf-of chain.txt --principal PRINCIPAL_ID ...
+```
+
+The server verifies the chain against the principal alone, then authorizes the
+job as the principal's grant narrowed by the chain's operations and resources
+(`exec:target`, `exec:profile`, `exec:cwd_root`; any other resource is
+refused). The actor's own grant is never used. A grant with
+`require_request_digest: true` also requires the chain to bind the exact
+request (`aster exec run --print-request-digest`); set it for agents. The audit
+record names the principal, the actor, the chain digest and every credential
+id. Revoking the principal's grant cancels the job; revoking a delegate in the
+chain (`IssuerStatusV1`) stops new submissions through it.
 
 Place API and helper state on a filesystem with an explicit project quota or
 dedicated bounded volume, and alert before exhaustion. Keep enough free space
@@ -265,15 +328,15 @@ and bounded build volume after collecting results.
 The local broker requires an existing caller key at
 `$ASTER_HOME/keys/<profile>.node.key` (`~/.aster` by default). Generate it once
 with `aster key node generate --out PATH`; `aster exec whoami` prints the same
-public node ID without creating a replacement key. Issue its enrollment JWT
-with `aster enroll node --subject CALLER_ID --audience FLEET --out /absolute/caller.jwt ...`.
-Keep the key and JWT owned by the operator with mode 0600. Configure the selected
+public node ID without creating a replacement key. Issue its enrollment credential
+with `aster enroll node --subject CALLER_ID --audience FLEET --out /absolute/caller.chain ...`.
+Keep the key and credential owned by the operator with mode 0600. Configure the selected
 profile in `config.toml` before starting the broker:
 
 ```toml
 [profiles.operator]
 root_pubkey = "ROOT_PUBLIC_ID"
-exec_credential_file = "/absolute/caller.jwt"
+exec_credential_file = "/absolute/caller.chain"
 exec_policy_namespace = "POLICY_NAMESPACE_PUBLIC_ID"
 exec_audience = "FLEET"
 
@@ -282,7 +345,7 @@ exec_audience = "FLEET"
 "TARGET_NODE_ID" = ["192.0.2.10:4433"]
 ```
 
-The JWT subject and the Exec grant caller must both equal `aster exec whoami`'s
+The credential's subject and the Exec grant caller must both equal `aster exec whoami`'s
 node ID. The broker performs a real reciprocal enrollment handshake before
 opening Exec RPC. It loads networking and identity from this profile rather
 than inheriting `ASTER_*` networking settings from whichever process starts it.

@@ -372,7 +372,7 @@ impl Server {
 
     /// Use a shared [`AttributeStore`] for Gate-3 capability checks. Keep a clone
     /// of the same store and populate it from your admission logic (e.g. after
-    /// verifying a peer's attestation chain) so per-call `requires` checks see
+    /// verifying a peer's enrollment credential) so per-call `requires` checks see
     /// the peer's roles. Without this, the server uses an empty store (only
     /// no-requirement methods are reachable).
     pub fn attributes(mut self, store: AttributeStore) -> Self {

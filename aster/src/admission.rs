@@ -97,8 +97,8 @@ impl Gate0 {
         self
     }
 
-    /// Mark a peer admitted (e.g. after verifying its attestation chain on an
-    /// admission ALPN). Subsequent connections from it on normal ALPNs pass.
+    /// Mark a peer admitted (e.g. after verifying its enrollment credential on
+    /// an admission ALPN). Subsequent connections from it on normal ALPNs pass.
     pub fn admit(&self, peer: NodeId) {
         self.policy.admit(PeerAdmission::from_source(
             peer.as_str().to_string(),

@@ -93,7 +93,8 @@ pub struct AsterService {
 /// One operator identity.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
-    /// Enrollment JWT issued for this profile's existing node key.
+    /// Enrollment credential (a delegation chain) issued for this profile's
+    /// existing node key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_credential_file: Option<PathBuf>,
     /// Pinned enrollment policy namespace (public ID).
