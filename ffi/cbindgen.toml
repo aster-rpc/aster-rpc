@@ -37,7 +37,6 @@ include = [
   "aster_local_access_t",
   "aster_retire_outcome_t",
   "aster_id_kind_t",
-  "aster_attestation_role_t",
   "aster_grant_state_t",
   "aster_grant_outcome_kind_t",
   "aster_dispatch_event_kind_t",

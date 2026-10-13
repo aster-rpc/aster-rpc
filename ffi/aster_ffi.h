@@ -12,9 +12,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define ASTER_ABI_VERSION_MAJOR 4
+#define ASTER_ABI_VERSION_MAJOR 5
 
-#define ASTER_ABI_VERSION_MINOR 17
+#define ASTER_ABI_VERSION_MINOR 0
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -353,9 +353,8 @@ typedef enum aster_status_t {
   ASTER_STATUS_ABI_MISMATCH = 12,
   /**
    * A well-formed input failed a security check (ABI 3.4): an HPKE / grant
-   * envelope did not open (wrong key, context or AAD, corrupt bytes), an
-   * attestation chain did not verify, or a grant role did not match its
-   * capability. `aster_last_error_message` says which check failed.
+   * envelope did not open (wrong key, context or AAD, corrupt bytes), or a
+   * grant role did not match its capability. `aster_last_error_message` says which check failed.
    */
   ASTER_STATUS_VERIFICATION_FAILED = 13,
   /**
@@ -807,7 +806,7 @@ typedef enum aster_id_kind_t {
    */
   ASTER_ID_NODE_ID = 0,
   /**
-   * An Ed25519 public key, e.g. an attestation anchor (must be a valid point).
+   * An Ed25519 public key, e.g. a root or issuer key (must be a valid point).
    */
   ASTER_ID_PUBLIC_KEY = 1,
   /**
@@ -831,28 +830,6 @@ typedef enum aster_id_kind_t {
    */
   ASTER_ID_AUTHOR_ID = 6,
 } aster_id_kind_t;
-
-/**
- * An identity's role within a verified chain (`aster::attestation::Role`).
- */
-typedef enum aster_attestation_role_t {
-  /**
-   * Not a participant of the chain.
-   */
-  ASTER_ATTESTATION_ROLE_NONE = 0,
-  /**
-   * The leaf node the chain binds (takes precedence if node == anchor).
-   */
-  ASTER_ATTESTATION_ROLE_NODE = 1,
-  /**
-   * The trusted anchor the chain terminates at.
-   */
-  ASTER_ATTESTATION_ROLE_ANCHOR = 2,
-  /**
-   * An intermediate delegating identity.
-   */
-  ASTER_ATTESTATION_ROLE_INTERMEDIATE = 3,
-} aster_attestation_role_t;
 
 /**
  * `state` of an `aster_grant_record_t`.
@@ -2558,68 +2535,6 @@ typedef struct aster_provisioning_result_t {
   struct aster_bytes_t data;
   struct aster_bytes_t error;
 } aster_provisioning_result_t;
-
-/**
- * Policy of a minted attestation edge (`aster::attestation::AttestOptions`).
- */
-typedef struct aster_attest_options_t {
-  /**
-   * `sizeof(aster_attest_options_t)`.
-   */
-  uint32_t struct_size;
-  /**
-   * Set to 0.
-   */
-  uint32_t reserved;
-  /**
-   * Monotonic replay counter (caller-managed; 0 for a first issue).
-   */
-  int64_t epoch;
-  /**
-   * 0 = no lower bound; else unix seconds before which the chain is invalid.
-   */
-  int64_t not_before;
-  /**
-   * 0 = no expiry; else unix seconds after which the chain is invalid.
-   */
-  int64_t not_after;
-} aster_attest_options_t;
-
-/**
- * The result of a successful `aster_attestation_verify_chain`. Release with
- * `aster_verified_chain_release`.
- */
-typedef struct aster_verified_chain_t {
-  /**
-   * `sizeof(aster_verified_chain_t)`, written by the library.
-   */
-  uint32_t struct_size;
-  /**
-   * Number of edges.
-   */
-  uint32_t depth;
-  /**
-   * The node the chain binds (= `expected_node`).
-   */
-  uint8_t node[32];
-  /**
-   * The trusted anchor the chain terminates at.
-   */
-  uint8_t anchor[32];
-  /**
-   * `intermediates_count` consecutive 32-byte public keys, node-ward →
-   * anchor-ward; NULL when there are none (single-edge chain).
-   */
-  const uint8_t *intermediates;
-  /**
-   * Number of 32-byte keys at `intermediates`.
-   */
-  uintptr_t intermediates_count;
-  /**
-   * Library-owned backing store; NULL when there are no intermediates.
-   */
-  void *storage;
-} aster_verified_chain_t;
 
 /**
  * ABI 4.17: inputs copied before start. struct_size must equal sizeof; flags/reserved zero.
@@ -6276,80 +6191,6 @@ int32_t aster_hpke_open(const uint8_t *recipient_private_key,
                         struct aster_bytes_t aad,
                         struct aster_bytes_t envelope,
                         struct aster_bytes_t *out);
-
-/**
- * Mint a single-edge root↔node attestation chain: the root attests it owns
- * the node and the node co-signs. Both secrets are 32-byte Ed25519 seeds.
- * `options` may be NULL (epoch 0, no time bounds). `*out` = the chain's
- * wire bytes; release with `aster_string_release`.
- *
- * # Safety
- * Secrets readable for 32 bytes; `options` NULL or valid; `out` valid.
- */
-int32_t aster_attest_root_node(const uint8_t *root_secret,
-                               const uint8_t *node_secret,
-                               const struct aster_attest_options_t *options,
-                               struct aster_bytes_t *out);
-
-/**
- * Encode chain wire bytes as `aster.attestation.chain.v1:<base64url>` text.
- * Release `*out` with `aster_string_release`. Not NUL-terminated.
- *
- * # Safety
- * `chain` readable for its length; `out` valid.
- */
-int32_t aster_attestation_chain_to_text(struct aster_bytes_t chain, struct aster_bytes_t *out);
-
-/**
- * Decode `aster.attestation.chain.v1:<base64url>` text to chain wire bytes
- * (not verified). Release `*out` with `aster_string_release`.
- *
- * # Safety
- * `text` readable for its length; `out` valid.
- */
-int32_t aster_attestation_chain_from_text(struct aster_bytes_t text, struct aster_bytes_t *out);
-
-/**
- * Verify a chain end to end, offline: size bounds, structure, the leaf
- * binding to `expected_node`, bridging, the top anchor being one of the
- * `anchor_count` 32-byte keys at `trusted_anchors`, and every signature.
- *
- * On success fills `*out` (release with `aster_verified_chain_release`).
- * A chain that fails any check returns `ASTER_STATUS_VERIFICATION_FAILED`
- * with the failed check in `aster_last_error_message`; `*out` is then
- * zeroed (except `struct_size`).
- *
- * # Safety
- * `chain` readable for its length; `trusted_anchors` readable for
- * `anchor_count * 32` bytes (may be NULL when 0); `expected_node` readable
- * for 32 bytes; `out` valid.
- */
-int32_t aster_attestation_verify_chain(struct aster_bytes_t chain,
-                                       const uint8_t *trusted_anchors,
-                                       uintptr_t anchor_count,
-                                       const uint8_t *expected_node,
-                                       struct aster_verified_chain_t *out);
-
-/**
- * Free the storage of a verified chain and zero its pointers. A zeroed or
- * already released struct is a no-op; NULL is a no-op.
- *
- * # Safety
- * `chain` NULL or filled by `aster_attestation_verify_chain`.
- */
-int32_t aster_verified_chain_release(struct aster_verified_chain_t *chain);
-
-/**
- * The role (`aster_attestation_role_t`) of the 32-byte public key `id` in a
- * verified chain; `ASTER_ATTESTATION_ROLE_NONE` if it is not a participant.
- *
- * # Safety
- * `chain` filled by `aster_attestation_verify_chain`; `id` readable for 32
- * bytes; `out_role` valid.
- */
-int32_t aster_verified_chain_role_of(const struct aster_verified_chain_t *chain,
-                                     const uint8_t *id,
-                                     uint32_t *out_role);
 
 /**
  * Bind ready TCP+QUIC listener; foreign auth runs before upgrade (kind80).

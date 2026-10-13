@@ -38,9 +38,7 @@ use crate::observability::{
     aster_log_level_t, aster_log_record_t, aster_observability_config_t, aster_otel_protocol_t,
     aster_span_context_t, aster_span_kind_t, aster_span_record_t,
 };
-use crate::pure::{
-    aster_attest_options_t, aster_attestation_role_t, aster_id_kind_t, aster_verified_chain_t,
-};
+use crate::pure::aster_id_kind_t;
 use crate::raw_webtransport::aster_raw_wt_config_t;
 use crate::rpc::aster_call_options_t;
 use crate::server::{
@@ -88,7 +86,6 @@ const _: () = assert!(size_of::<aster_blob_status_t>() == 4);
 const _: () = assert!(size_of::<aster_local_access_t>() == 4);
 const _: () = assert!(size_of::<aster_retire_outcome_t>() == 4);
 const _: () = assert!(size_of::<aster_id_kind_t>() == 4);
-const _: () = assert!(size_of::<aster_attestation_role_t>() == 4);
 const _: () = assert!(size_of::<aster_grant_state_t>() == 4);
 const _: () = assert!(size_of::<aster_grant_outcome_kind_t>() == 4);
 const _: () = assert!(size_of::<aster_dispatch_event_kind_t>() == 4);
@@ -316,25 +313,6 @@ mod lp64 {
         len = 16,
         storage = 24,
     });
-    // ABI 3.4: attestation (pure.rs).
-    assert_layout!(aster_attest_options_t, size = 32, align = 8, {
-        struct_size = 0,
-        reserved = 4,
-        epoch = 8,
-        not_before = 16,
-        not_after = 24,
-    });
-
-    assert_layout!(aster_verified_chain_t, size = 96, align = 8, {
-        struct_size = 0,
-        depth = 4,
-        node = 8,
-        anchor = 40,
-        intermediates = 72,
-        intermediates_count = 80,
-        storage = 88,
-    });
-
     // ABI 3.4: sealed grants (grants.rs).
     assert_layout!(aster_grant_context_t, size = 104, align = 8, {
         struct_size = 0,

@@ -16,7 +16,14 @@ fn listener_blocked_accept_cancel_and_stop() {
         let mut runtime = 0;
         let mut config = common::default_runtime_config();
         config.max_inflight_operations = 1;
-        assert_eq!(aster_runtime_new(4, &config, &mut runtime), 0);
+        assert_eq!(
+            aster_runtime_new(
+                aster_transport_ffi::ASTER_ABI_VERSION_MAJOR,
+                &config,
+                &mut runtime
+            ),
+            0
+        );
         let c = aster_raw_wt_config_t {
             struct_size: mem::size_of::<aster_raw_wt_config_t>() as u32,
             flags: 0,
@@ -100,7 +107,11 @@ fn real_peer_raw_bytes_fin_ack_priority_and_datagrams() {
     unsafe {
         let mut runtime = 0;
         assert_eq!(
-            aster_runtime_new(4, &common::default_runtime_config(), &mut runtime),
+            aster_runtime_new(
+                aster_transport_ffi::ASTER_ABI_VERSION_MAJOR,
+                &common::default_runtime_config(),
+                &mut runtime
+            ),
             0
         );
         let c = aster_raw_wt_config_t {

@@ -1,4 +1,26 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x changelog (current: 4.16)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x changelog (current: 5.0)
+
+## 5.0 (removals)
+
+ABI 5.0.0 removes the Fory ownership-attestation surface added in 3.4. Aster's
+credentials are now JWT delegation chains (`docs/_internal/ownership-attestations.md`),
+which have no C ABI yet; a delegation ABI will be added in its own release once a
+non-Rust consumer needs one. Everything else in 4.17 is unchanged, so a binding
+moves from 4.17 to 5.0 by updating its expected major and dropping these symbols.
+
+| Kind | Removed | Replacement |
+|---|---|---|
+| function | `aster_attest_root_node` | none (delegation chains, Rust only) |
+| function | `aster_attestation_chain_to_text`, `aster_attestation_chain_from_text` | none |
+| function | `aster_attestation_verify_chain` | none |
+| function | `aster_verified_chain_role_of`, `aster_verified_chain_release` | none |
+| struct | `aster_attest_options_t`, `aster_verified_chain_t` | none |
+| enum | `aster_attestation_role_t` (`ASTER_ATTESTATION_ROLE_*`) | none |
+
+`aster_secret_key_public_key` stays: key derivation now lives in
+`aster_transport_core::keys`. `ASTER_STATUS_VERIFICATION_FAILED` stays for HPKE
+and sealed-grant checks.
+
 
 ## New in 4.16 (local/shared topology views and RPC policy; additive)
 
@@ -836,6 +858,8 @@ also free `aster_rpc_open` calls (an unfinished one is cancelled).
 `aster_reactor_call_t`, and the framed `aster_call_{acquire,acquire_streaming,send_frame,recv_frame,unary}`.
 
 ## New in 3.4 (additive)
+
+**Attestation rows below were removed in 5.0** (see "5.0 (removals)").
 
 ABI 3.4.0 (rest of tranche F2) exports the pure functions: typed ids, HPKE,
 ownership attestations and sealed grants. Nothing in 3.0–3.3 changed shape; a

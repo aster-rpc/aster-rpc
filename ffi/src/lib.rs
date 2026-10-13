@@ -161,9 +161,16 @@ pub mod upcall;
 // - 4.14.0 (additive): locally complete batch document content reads.
 // - 4.15.0 (additive): stateless coordination authority provisioning helpers.
 // - 4.16.0 (additive): topology reads, owned snapshots, reader options and RPC gating.
-pub const ASTER_ABI_VERSION_MAJOR: u32 = 4;
-// ABI 4.17 adds standalone raw WebTransport owners and cancellable operations.
-pub const ASTER_ABI_VERSION_MINOR: u32 = 17;
+// - 4.17.0 (additive): standalone raw WebTransport owners and cancellable operations.
+// - 5.0.0: removals only -- the Fory ownership-attestation functions
+//   (`aster_attest_root_node`, `aster_attestation_chain_{to,from}_text`,
+//   `aster_attestation_verify_chain`, `aster_verified_chain_{role_of,release}`)
+//   and their types (`aster_attest_options_t`, `aster_attestation_role_t`,
+//   `aster_verified_chain_t`). Delegation chains replace them and have no C
+//   ABI yet (`docs/_internal/ownership-attestations.md`). See
+//   `ffi/RENAME_MAP.md` "5.0".
+pub const ASTER_ABI_VERSION_MAJOR: u32 = 5;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 0;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -207,9 +214,8 @@ pub enum aster_status_t {
     /// not match the loaded library's `ASTER_ABI_VERSION_MAJOR`.
     ASTER_STATUS_ABI_MISMATCH = 12,
     /// A well-formed input failed a security check (ABI 3.4): an HPKE / grant
-    /// envelope did not open (wrong key, context or AAD, corrupt bytes), an
-    /// attestation chain did not verify, or a grant role did not match its
-    /// capability. `aster_last_error_message` says which check failed.
+    /// envelope did not open (wrong key, context or AAD, corrupt bytes), or a
+    /// grant role did not match its capability. `aster_last_error_message` says which check failed.
     ASTER_STATUS_VERIFICATION_FAILED = 13,
     /// An auth outcome (ABI 4.3, reserved for auth results): the caller was
     /// not authenticated. Since 4.4: coordination admission answered RPC 16

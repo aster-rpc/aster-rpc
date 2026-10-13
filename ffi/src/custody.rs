@@ -614,7 +614,10 @@ mod tests {
                 max_inflight_operations: 1,
             };
             let mut runtime = 0;
-            assert_eq!(unsafe { aster_runtime_new(4, &config, &mut runtime) }, 0);
+            assert_eq!(
+                unsafe { aster_runtime_new(crate::ASTER_ABI_VERSION_MAJOR, &config, &mut runtime) },
+                0
+            );
             let bridge = load_runtime(runtime).unwrap();
             let (started_tx, started_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();

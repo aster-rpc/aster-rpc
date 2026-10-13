@@ -86,7 +86,11 @@ impl Fixture {
         unsafe {
             let (mut rt, mut server, mut upcalls, mut builder) = (0, 0, 0, 0);
             assert_eq!(
-                aster_runtime_new(4, &common::default_runtime_config(), &mut rt),
+                aster_runtime_new(
+                    aster_transport_ffi::ASTER_ABI_VERSION_MAJOR,
+                    &common::default_runtime_config(),
+                    &mut rt
+                ),
                 0
             );
             let node = common::start_node(rt, &[b"aster/1"]);

@@ -1118,7 +1118,10 @@ mod tests {
     fn cancelled_pending_future_is_dropped() {
         unsafe {
             let mut runtime = 0;
-            assert_eq!(crate::aster_runtime_new(4, ptr::null(), &mut runtime), 0);
+            assert_eq!(
+                crate::aster_runtime_new(crate::ASTER_ABI_VERSION_MAJOR, ptr::null(), &mut runtime),
+                0
+            );
             let b = bridge(runtime).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let guard = Dropped(tx);
