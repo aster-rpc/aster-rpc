@@ -1,55 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ed25519_dalek::pkcs8::EncodePrivateKey;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
-pub const ENROLLMENT_JWT_TYPE: &str = "aster-enrollment-v1+jwt";
+use crate::delegation::jws::{self, JwsError};
+// The claim types are shared with delegation chains, where an enrollment
+// credential is a one-link chain.
+pub use crate::delegation::{
+    AdmissionClaims, Audience, Confirmation, EnrollmentExtensionV1, PublicConfirmationKey,
+    TypedAttribute, ENROLLMENT_LINK_TYPE as ENROLLMENT_JWT_TYPE,
+};
+
 pub const MAX_JWT_BYTES: usize = 16 * 1024;
-
-/// One JWT audience or the standard array representation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum Audience {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Audience {
-    pub fn contains(&self, expected: &str) -> bool {
-        match self {
-            Self::One(value) => value == expected,
-            Self::Many(values) => values.iter().any(|value| value == expected),
-        }
-    }
-}
-
-/// Explicit type tags preserve Portal's primitive vocabulary without coercion.
-/// Integers are signed 64-bit; floats must be finite IEEE-754 doubles.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(
-    tag = "type",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum TypedAttribute {
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    String(String),
-}
-
-/// A complete set is `Some`, including `Some(empty)`; absent data is unknown.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct AdmissionClaims {
-    pub scopes: Option<BTreeSet<String>>,
-    pub tags: Option<BTreeSet<String>>,
-    pub attributes: Option<BTreeMap<String, TypedAttribute>>,
-}
 
 impl AdmissionClaims {
     /// Parse an attribute file before authorized issuance. The input is bounded
@@ -65,29 +28,6 @@ impl AdmissionClaims {
         validate_unique_json(bytes).map_err(|_| EnrollmentError::InvalidClaims)?;
         serde_json::from_slice(bytes).map_err(|_| EnrollmentError::InvalidClaims)
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct EnrollmentExtensionV1 {
-    #[serde(flatten)]
-    pub claims: AdmissionClaims,
-    /// Required even when empty: omission must not discard restrictions.
-    pub mandatory: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PublicConfirmationKey {
-    pub kty: String,
-    pub crv: String,
-    pub x: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Confirmation {
-    pub jwk: PublicConfirmationKey,
 }
 
 /// Untrusted issuance/serialization data. This type never grants admission.
@@ -235,7 +175,6 @@ pub enum EnrollmentError {
     InvalidValidity,
     UnsupportedMandatoryRestriction,
     InvalidClaims,
-    CryptoProviderUnavailable,
     SigningFailed,
     RandomnessUnavailable,
 }
@@ -294,8 +233,7 @@ impl IssuedEnrollmentCredential {
 
 /// An authorized local root signer. Possession of the root's existing secret
 /// key authorizes issuance; this type has no secret-export, Debug or Clone API.
-/// Dalek zeroizes the signing key on drop; its PKCS#8 encoder and JWT's
-/// EncodingKey also zeroize their temporary private-key buffers.
+/// Dalek zeroizes the signing key on drop.
 pub struct JwtEnrollmentIssuer {
     key: ed25519_dalek::SigningKey,
 }
@@ -357,36 +295,18 @@ impl JwtEnrollmentIssuer {
             iat: issued_at,
             nbf: request.not_before,
             exp: request.expires_at,
-            cnf: Confirmation {
-                jwk: PublicConfirmationKey {
-                    kty: "OKP".into(),
-                    crv: "Ed25519".into(),
-                    x: URL_SAFE_NO_PAD.encode(request.subject),
-                },
-            },
+            cnf: Confirmation::ed25519(&request.subject),
             aster_enrollment_v1: EnrollmentExtensionV1 {
                 claims: request.claims.clone(),
                 mandatory: vec![],
             },
         };
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.typ = Some(ENROLLMENT_JWT_TYPE.into());
-        // Check the complete artifact before signing. Compact JWS has two
-        // separators and an 86-byte base64url Ed25519 signature.
-        let encoded_length = |len: usize| len.div_ceil(3) * 4;
+        // Check the complete artifact before signing.
         let payload = serde_json::to_vec(&claims).map_err(|_| EnrollmentError::InvalidClaims)?;
-        let header_bytes =
-            serde_json::to_vec(&header).map_err(|_| EnrollmentError::SigningFailed)?;
-        if encoded_length(payload.len()) + encoded_length(header_bytes.len()) + 88 > MAX_JWT_BYTES {
+        if jws::encoded_len(ENROLLMENT_JWT_TYPE, payload.len()) > MAX_JWT_BYTES {
             return Err(EnrollmentError::TokenTooLarge);
         }
-        let private_der = self
-            .key
-            .to_pkcs8_der()
-            .map_err(|_| EnrollmentError::SigningFailed)?;
-        let encoding_key = EncodingKey::from_ed_der(private_der.as_bytes());
-        let jwt = std::panic::catch_unwind(|| encode(&header, &claims, &encoding_key))
-            .map_err(|_| EnrollmentError::CryptoProviderUnavailable)?
+        let jwt = jws::sign(ENROLLMENT_JWT_TYPE, &payload, self.key.as_bytes())
             .map_err(|_| EnrollmentError::SigningFailed)?;
         if jwt.len() > MAX_JWT_BYTES {
             return Err(EnrollmentError::TokenTooLarge);
@@ -418,7 +338,6 @@ impl std::io::Write for BoundedJsonSize {
 pub struct JwtEnrollmentVerifier {
     root: [u8; 32],
     audience: String,
-    key: DecodingKey,
 }
 
 impl JwtEnrollmentVerifier {
@@ -435,11 +354,7 @@ impl JwtEnrollmentVerifier {
         if !valid_audience(&audience) || validate_key(&root).is_err() {
             return Err(EnrollmentError::InvalidConfiguration);
         }
-        Ok(Self {
-            root,
-            audience,
-            key: DecodingKey::from_ed_der(&root),
-        })
+        Ok(Self { root, audience })
     }
 
     /// `authenticated_peer` MUST come from the authenticated transport, never
@@ -458,46 +373,28 @@ impl JwtEnrollmentVerifier {
         if token.len() > MAX_JWT_BYTES {
             return Err(EnrollmentError::TokenTooLarge);
         }
-        // Reject JOSE extensions before processing any claims. V1 admits only
-        // these two header fields; notably no crit/b64/jku/jwk/kid/x5u.
-        let [header_bytes, payload_bytes, signature_bytes] = compact_parts(token)?;
-        if signature_bytes.len() != 64 {
-            return Err(EnrollmentError::InvalidJwt);
-        }
-        // Reject ambiguous objects everywhere, including optional application
-        // claims, attributes and nested confirmation data. Other consumers
-        // must not see a different value for the same signed JSON property.
-        validate_unique_json(&payload_bytes)?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ProfileHeader {
-            alg: String,
-            typ: String,
-        }
-        let profile: ProfileHeader = serde_json::from_slice(&header_bytes)
-            .map_err(|_| EnrollmentError::UnsupportedHeader)?;
-        if profile.alg != "EdDSA" || profile.typ != ENROLLMENT_JWT_TYPE {
+        // The shared JWS profile rejects JOSE extensions (only alg and typ;
+        // notably no crit/b64/jku/jwk/kid/x5u), noncanonical encodings and
+        // ambiguous objects everywhere, including optional application
+        // claims, attributes and nested confirmation data, before any claim
+        // is processed.
+        let compact = jws::decode(token).map_err(|error| match error {
+            JwsError::Header => EnrollmentError::UnsupportedHeader,
+            _ => EnrollmentError::InvalidJwt,
+        })?;
+        if compact.typ != ENROLLMENT_JWT_TYPE {
             return Err(EnrollmentError::UnsupportedHeader);
         }
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.set_required_spec_claims(&["iss", "sub", "aud"]);
-        validation.set_issuer(&[hex::encode(self.root)]);
-        validation.set_audience(&[&self.audience]);
-        // Apply exact profile time semantics below against the same trusted
-        // clock that policy uses, including equality at exp and optional exp.
-        validation.validate_exp = false;
-        validation.validate_nbf = false;
-        validation.leeway = 0;
-        // jsonwebtoken 11.1 exposes only process-global provider selection.
-        // A consumer unifying both backend features without installing a
-        // provider causes its factory to panic. Contain that configuration
-        // error; do not choose a process-global provider on an app's behalf.
-        let claims = std::panic::catch_unwind(|| {
-            decode::<EnrollmentClaimsV1>(token, &self.key, &validation)
-        })
-        .map_err(|_| EnrollmentError::CryptoProviderUnavailable)?
-        .map_err(|_| EnrollmentError::InvalidJwt)?
-        .claims;
+        compact
+            .verify(&self.root)
+            .map_err(|_| EnrollmentError::InvalidJwt)?;
+        // Time semantics are applied below against the same trusted clock
+        // that policy uses, including equality at exp and optional exp.
+        let claims: EnrollmentClaimsV1 =
+            serde_json::from_slice(&compact.payload).map_err(|_| EnrollmentError::InvalidJwt)?;
+        if claims.iss != hex::encode(self.root) || !claims.aud.contains(&self.audience) {
+            return Err(EnrollmentError::InvalidJwt);
+        }
         let subject = canonical_identity(&claims.sub)?;
         if canonical_identity(&claims.iss)? != self.root {
             return Err(EnrollmentError::InvalidIdentity);
@@ -570,15 +467,9 @@ fn optional_numeric_date<'de, D: serde::Deserializer<'de>>(
 }
 
 fn validate_key(value: &[u8; 32]) -> Result<(), EnrollmentError> {
-    let key = ed25519_dalek::VerifyingKey::from_bytes(value)
-        .map_err(|_| EnrollmentError::InvalidIdentity)?;
-    // Dalek accepts ZIP-215 point encodings; this JWT profile selects RFC 8032
-    // canonical encodings instead. Recompression uses the maintained curve
-    // implementation and rejects aliases without implementing curve arithmetic.
-    if key.is_weak() || key.to_edwards().compress().as_bytes() != value {
-        return Err(EnrollmentError::InvalidIdentity);
-    }
-    Ok(())
+    crate::delegation::links::valid_key(value)
+        .then_some(())
+        .ok_or(EnrollmentError::InvalidIdentity)
 }
 
 fn valid_credential_id(value: &str) -> bool {
@@ -643,82 +534,9 @@ fn validate_evidence_shape(
     Ok(())
 }
 
-fn compact_parts(token: &str) -> Result<[Vec<u8>; 3], EnrollmentError> {
-    let mut segments = token.split('.');
-    let mut result: [Vec<u8>; 3] = Default::default();
-    for decoded in &mut result {
-        let segment = segments
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or(EnrollmentError::InvalidJwt)?;
-        *decoded = URL_SAFE_NO_PAD
-            .decode(segment)
-            .map_err(|_| EnrollmentError::InvalidJwt)?;
-        if URL_SAFE_NO_PAD.encode(&*decoded) != segment {
-            return Err(EnrollmentError::InvalidJwt);
-        }
-    }
-    if segments.next().is_some() {
-        return Err(EnrollmentError::InvalidJwt);
-    }
-    Ok(result)
-}
-
-/// A bounded serde_json traversal that rejects every duplicate object key,
-/// including keys the typed profile intentionally ignores. serde_json's
-/// ordinary recursion limit applies before deep attacker-controlled input can
-/// grow this visitor's stack. The token byte limit bounds its allocated sets.
-struct UniqueJson;
-
+/// Reject duplicate JSON object keys at any depth (the shared JWS check).
 pub(super) fn validate_unique_json(bytes: &[u8]) -> Result<(), EnrollmentError> {
-    serde_json::from_slice::<UniqueJson>(bytes)
-        .map(|_| ())
-        .map_err(|_| EnrollmentError::InvalidJwt)
-}
-
-impl<'de> Deserialize<'de> for UniqueJson {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct UniqueVisitor;
-        impl<'de> Visitor<'de> for UniqueVisitor {
-            type Value = UniqueJson;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("JSON without duplicate object keys")
-            }
-            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-                let mut seen = BTreeSet::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    if !seen.insert(key) {
-                        return Err(serde::de::Error::custom("duplicate JSON object key"));
-                    }
-                    map.next_value::<UniqueJson>()?;
-                }
-                Ok(UniqueJson)
-            }
-            fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
-                while seq.next_element::<UniqueJson>()?.is_some() {}
-                Ok(UniqueJson)
-            }
-            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
-                Ok(UniqueJson)
-            }
-            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
-                Ok(UniqueJson)
-            }
-            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
-                Ok(UniqueJson)
-            }
-            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
-                Ok(UniqueJson)
-            }
-            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
-                Ok(UniqueJson)
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueJson)
-            }
-        }
-        deserializer.deserialize_any(UniqueVisitor)
-    }
+    jws::validate_unique_json(bytes).map_err(|_| EnrollmentError::InvalidJwt)
 }
 
 #[cfg(test)]

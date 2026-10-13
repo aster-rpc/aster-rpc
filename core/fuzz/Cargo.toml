@@ -14,6 +14,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.aster_transport_core]
 path = ".."
+features = ["delegation"]
 
 [[bin]]
 name = "fuzz_ticket_decode"
@@ -32,6 +33,13 @@ bench = false
 [[bin]]
 name = "fuzz_decode_frame"
 path = "fuzz_targets/fuzz_decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_delegation_chain"
+path = "fuzz_targets/fuzz_delegation_chain.rs"
 test = false
 doc = false
 bench = false

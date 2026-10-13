@@ -37,16 +37,18 @@ fory-core = "=1.7.6"
 fory-derive = "=1.7.6"
 thiserror = { version = "2", optional = true }
 base64 = "0.22"
-# Enrollment JWT/JWS parsing and signature verification; reuse the AWS-LC
-# backend already resolved by the native stack. No PEM or remote key lookup.
-jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"], optional = true }
+# Compact Ed25519 JWS signing and verification for delegation chains and
+# enrollment credentials (AWS-LC, the backend the native stack already uses).
+aws-lc-rs = { version = "1.18", optional = true }
 hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
 rand_core = { version = "0.9", features = ["os_rng"] }
 
 [features]
-# Additive JWT enrollment and consumer policy foundation; legacy signing and
-# Fory attestation retain their existing feature/API contracts.
-enrollment = ["dep:jsonwebtoken", "ed25519-dalek/pkcs8"]
+# Delegation chains: bundled compact JWS links verified offline in one call.
+# See docs/_internal/ownership-attestations.md.
+delegation = ["dep:aws-lc-rs"]
+# JWT enrollment and consumer policy, built on delegation's JWS.
+enrollment = ["delegation"]
 # Test-only ingress counters (see reactor::ingress_metrics). Never on in a
 # shipping build; the tests that need them enable them explicitly.
 ingress-metrics = []

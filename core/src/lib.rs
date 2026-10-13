@@ -5,6 +5,8 @@ pub mod attestation;
 pub mod canonical;
 pub mod contract;
 pub mod datagram;
+#[cfg(feature = "delegation")]
+pub mod delegation;
 pub mod dynamic;
 #[cfg(feature = "enrollment")]
 pub mod enrollment;
