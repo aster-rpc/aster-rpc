@@ -140,6 +140,16 @@ pub fn run(args: SetupArgs) -> Result<()> {
             "API and payload UIDs must be distinct non-root accounts",
         ));
     }
+    // Enrollment judges credential validity and peer clocks against this
+    // clock; the server refuses to start without NTP discipline.
+    if aster::enrollment::local_clock_synchronization()
+        == aster::enrollment::ClockSynchronization::Unsynchronized
+    {
+        return Err(Error::new(
+            ErrorKind::Denied,
+            "the system clock is not NTP-synchronized; enable time sync first (for example `systemctl enable --now systemd-timesyncd`, or keep chronyd running)",
+        ));
+    }
     owner_file(&args.server_config, 0, false)?;
     owner_file(&args.helper_config, 0, true)?;
     let server: ServerConfig =

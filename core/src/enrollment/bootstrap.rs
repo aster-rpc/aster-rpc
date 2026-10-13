@@ -19,10 +19,11 @@ use tokio::sync::{broadcast, oneshot, Semaphore, SemaphorePermit};
 use tokio::task::AbortHandle;
 
 use super::{
-    admit, AdmissionContext, AdmissionDecision, AdmissionEvidenceSource, AdmissionPolicy,
-    DenialReason, EnrollmentPolicyStore, JwtEnrollmentVerifier, ObservedSourceAddress,
-    PolicySynchronization, RecordAvailability, RecordError, SourceAddressProvenance,
-    SynchronizationSource, VerifiedAdmissionEvidence, MAX_JWT_BYTES,
+    admit, local_clock_synchronization, AdmissionContext, AdmissionDecision,
+    AdmissionEvidenceSource, AdmissionPolicy, ClockSynchronization, DenialReason, EnrollmentError,
+    EnrollmentPolicyStore, JwtEnrollmentVerifier, ObservedSourceAddress, PolicySynchronization,
+    RecordAvailability, RecordError, SourceAddressProvenance, SynchronizationSource,
+    VerifiedAdmissionEvidence, MAX_JWT_BYTES,
 };
 use crate::{
     CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreHookHandshakeInfo, CoreHookReceiver,
@@ -32,6 +33,9 @@ use crate::{
 pub const ENROLLMENT_ALPN: &[u8] = b"aster.enrollment/1";
 const MAX_ENVELOPE: usize = MAX_JWT_BYTES + 8192;
 const REJECT: u64 = 403;
+/// Close reason prefix carrying the observed offset (remote minus local
+/// seconds) back to a peer whose clock is outside the activation leeway.
+const CLOCK_SKEW_REASON: &str = "enrollment clock skew ";
 const MAX_RATE_KEYS: usize = 8192;
 
 #[derive(Clone, Debug)]
@@ -55,6 +59,9 @@ pub struct EnrollmentOptions {
     /// checked session idle at least this long. Eviction is not revocation:
     /// the evicted peer re-enrolls on its next connection.
     pub session_idle_eviction: Duration,
+    /// Refuse to install while the kernel reports the local clock
+    /// unsynchronized. When false the status is only reported in readiness.
+    pub require_synchronized_clock: bool,
 }
 
 impl Default for EnrollmentOptions {
@@ -73,6 +80,7 @@ impl Default for EnrollmentOptions {
             max_handshakes_per_second_per_source: 128,
             max_admitted_peers: 1024,
             session_idle_eviction: Duration::from_secs(300),
+            require_synchronized_clock: false,
         }
     }
 }
@@ -86,6 +94,8 @@ pub struct EnrollmentReadiness {
     /// Direct selected-path observation at admission/check time; relay paths
     /// provide no originating-peer address.
     pub observed_source: Option<ObservedSourceAddress>,
+    /// This node's clock status when enrollment was installed.
+    pub local_clock: ClockSynchronization,
 }
 
 /// Consumers receive this after a definite denial revokes a formerly admitted
@@ -106,6 +116,10 @@ pub enum AdmissionError {
     NotAdmitted,
     /// Root policy, signed validity or the consumer policy denies the peer.
     Denied(DenialReason),
+    /// The peer's clock, or its credential issuer's, is outside the activation
+    /// leeway by `offset_seconds` (remote minus local). Not definite: any
+    /// session is kept; synchronize clocks and retry.
+    ClockSkew { offset_seconds: i64 },
     /// Policy could not be evaluated now (local storage, pending content, a
     /// timeout or a handler error). Any session is kept; retry later.
     Unavailable(String),
@@ -113,7 +127,9 @@ pub enum AdmissionError {
 
 impl AdmissionError {
     fn from_reason(reason: DenialReason) -> Self {
-        if reason.is_definite() {
+        if let DenialReason::ClockSkew { offset_seconds } = reason {
+            Self::ClockSkew { offset_seconds }
+        } else if reason.is_definite() {
             Self::Denied(reason)
         } else {
             Self::Unavailable(format!("{reason:?}"))
@@ -133,6 +149,10 @@ impl fmt::Display for AdmissionError {
         match self {
             Self::NotAdmitted => write!(f, "peer not admitted; enrollment handshake required"),
             Self::Denied(reason) => write!(f, "enrollment denied: {reason:?}"),
+            Self::ClockSkew { offset_seconds } => write!(
+                f,
+                "enrollment clock skew: peer clock differs by {offset_seconds}s"
+            ),
             Self::Unavailable(detail) => write!(f, "enrollment policy unavailable: {detail}"),
         }
     }
@@ -181,6 +201,8 @@ impl RevokedPeers {
 #[serde(deny_unknown_fields)]
 struct Hello {
     version: u8,
+    /// Sender's Unix seconds, for clock-skew diagnosis.
+    sent_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -188,12 +210,14 @@ struct Hello {
 struct ReplicaProof {
     version: u8,
     credential: Option<String>,
+    sent_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Presentation {
     credential: Option<String>,
+    sent_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -258,6 +282,7 @@ pub struct EnrollmentService {
     context: RwLock<AdmissionContext>,
     sessions: Mutex<BTreeMap<[u8; 32], Session>>,
     revoked_peers: Mutex<RevokedPeers>,
+    local_clock: ClockSynchronization,
     inbound_permits: Semaphore,
     outbound_permits: Semaphore,
     gate_permits: Arc<Semaphore>,
@@ -317,6 +342,17 @@ impl EnrollmentService {
                 && verifier.intended_audience() == store.audience(),
             "enrollment verifier and policy store trust contexts differ"
         );
+        ensure!(
+            verifier.activation_leeway() == store.activation_leeway(),
+            "enrollment verifier and policy store activation leeways differ"
+        );
+        if local_clock_synchronization() == ClockSynchronization::Unsynchronized {
+            ensure!(
+                !options.require_synchronized_clock,
+                "local clock is not synchronized; enable systemd-timesyncd or chronyd"
+            );
+            tracing::warn!("enrollment: local clock is not synchronized; admission may fail");
+        }
         if let Some(token) = &credential {
             verifier.verify(token, &identity(&node.node_id())?, unix_now())?;
         }
@@ -368,6 +404,7 @@ impl EnrollmentService {
             context: RwLock::new(AdmissionContext::default()),
             sessions: Mutex::new(BTreeMap::new()),
             revoked_peers: Mutex::new(RevokedPeers::default()),
+            local_clock: local_clock_synchronization(),
             rate: Mutex::new(RateState {
                 started: Instant::now(),
                 peers: BTreeMap::new(),
@@ -606,7 +643,12 @@ impl EnrollmentService {
         let jwt = token
             .map(|token| self.verifier.verify(token, peer, unix_now()))
             .transpose()
-            .map_err(|_| AdmissionError::Denied(DenialReason::InvalidValidity))?;
+            .map_err(|error| match error {
+                EnrollmentError::ClockSkew { offset_seconds } => {
+                    AdmissionError::ClockSkew { offset_seconds }
+                }
+                _ => AdmissionError::Denied(DenialReason::InvalidValidity),
+            })?;
         if let (Some(doc), Some(id)) = (&doc, jwt.as_ref().and_then(|jwt| jwt.credential_id())) {
             let issue = self.refresh_issue(self.store.refresh_credential(doc, id).await);
             unresolved = unresolved.or(issue);
@@ -776,7 +818,22 @@ impl EnrollmentService {
                 .policy_sync
                 .clone(),
             observed_source,
+            local_clock: self.local_clock,
         }
+    }
+
+    /// Compare a peer's handshake timestamp with this clock. Beyond the
+    /// activation leeway, fresh credentials would be misjudged as well, so
+    /// report the offset rather than an opaque denial.
+    fn check_skew(&self, sent_at: u64) -> Result<(), AdmissionError> {
+        let offset_seconds = i64::try_from(sent_at)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(unix_now()).unwrap_or(i64::MAX));
+        if offset_seconds.unsigned_abs() > self.verifier.activation_leeway() {
+            tracing::warn!(offset_seconds, "enrollment: peer clock outside leeway");
+            return Err(AdmissionError::ClockSkew { offset_seconds });
+        }
+        Ok(())
     }
 
     fn session(&self, peer: &[u8; 32]) -> Option<Session> {
@@ -856,6 +913,7 @@ impl EnrollmentService {
                 .await
                 .map_err(|_| anyhow!("enrollment first message timeout"))??;
             ensure!(hello.version == 1, "unsupported enrollment version");
+            self.check_skew(hello.sent_at)?;
             // Joining credentials are withheld until the client has verified
             // this responder. The responder's own identity proof is explicitly
             // public to bounded unauthenticated probes; no policy ticket yet.
@@ -864,10 +922,12 @@ impl EnrollmentService {
                 &ReplicaProof {
                     version: 1,
                     credential: self.credential.clone(),
+                    sent_at: unix_now(),
                 },
             )
             .await?;
             let presentation: Presentation = receive(&recv).await?;
+            self.check_skew(presentation.sent_at)?;
             let evidence = self
                 .evidence(&peer, presentation.credential.as_deref(), source)
                 .await?;
@@ -902,10 +962,9 @@ impl EnrollmentService {
         .await
         .map_err(|_| anyhow!("enrollment handshake timeout"))
         .and_then(|x| x);
-        let (code, reason) = if result.is_ok() {
-            (0, b"enrollment complete".to_vec())
-        } else {
-            (REJECT, b"enrollment denied".to_vec())
+        let (code, reason) = match &result {
+            Ok(_) => (0, b"enrollment complete".to_vec()),
+            Err(error) => (REJECT, denial_close_reason(error)),
         };
         let _ = connection.close(code, reason);
         result
@@ -941,12 +1000,20 @@ impl EnrollmentService {
             let _close_on_completion_or_cancel = CloseEnrollmentConnection(connection.clone());
             let result = async {
                 let (send, recv) = connection.open_bi().await?;
-                transmit(&send, &Hello { version: 1 }).await?;
+                transmit(
+                    &send,
+                    &Hello {
+                        version: 1,
+                        sent_at: unix_now(),
+                    },
+                )
+                .await?;
                 let proof: ReplicaProof =
                     tokio::time::timeout(self.options.first_message_timeout, receive(&recv))
                         .await
                         .map_err(|_| anyhow!("replica identity proof timeout"))??;
                 ensure!(proof.version == 1, "unsupported enrollment version");
+                self.check_skew(proof.sent_at)?;
                 let peer = identity(&connection.remote_id())?;
                 let source = observed_source(&connection);
                 let evidence = self
@@ -956,6 +1023,7 @@ impl EnrollmentService {
                     &send,
                     &Presentation {
                         credential: self.credential.clone(),
+                        sent_at: unix_now(),
                     },
                 )
                 .await?;
@@ -975,10 +1043,15 @@ impl EnrollmentService {
                 Ok((self.remember(evidence, source)?, welcome.policy_ticket))
             }
             .await;
-            if result.is_err() {
-                let _ = connection.close(REJECT, b"enrollment denied".to_vec());
+            match result {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    // Read the replica's close reason before closing locally.
+                    let error = reported_skew(&connection).map_or(error, anyhow::Error::from);
+                    let _ = connection.close(REJECT, denial_close_reason(&error));
+                    Err(error)
+                }
             }
-            result
         })
         .await
         .map_err(|_| anyhow!("enrollment handshake timeout"))?
@@ -1290,6 +1363,27 @@ fn hook_decision(allow: bool) -> CoreAfterHandshakeDecision {
         }
     }
 }
+fn denial_close_reason(error: &anyhow::Error) -> Vec<u8> {
+    match error.downcast_ref::<AdmissionError>() {
+        Some(AdmissionError::ClockSkew { offset_seconds }) => {
+            format!("{CLOCK_SKEW_REASON}{offset_seconds}").into_bytes()
+        }
+        _ => b"enrollment denied".to_vec(),
+    }
+}
+/// A replica that closed with a skew reason measured our clock against its
+/// own; restate the offset from our side (remote minus local).
+fn reported_skew(connection: &CoreConnection) -> Option<AdmissionError> {
+    let closed = connection.close_info()?;
+    if closed.code != Some(REJECT) {
+        return None;
+    }
+    let reason = String::from_utf8(closed.reason?).ok()?;
+    let theirs: i64 = reason.strip_prefix(CLOCK_SKEW_REASON)?.parse().ok()?;
+    let offset_seconds = theirs.checked_neg()?;
+    tracing::warn!(offset_seconds, "enrollment: replica reports clock skew");
+    Some(AdmissionError::ClockSkew { offset_seconds })
+}
 struct CloseEnrollmentConnection(CoreConnection);
 impl Drop for CloseEnrollmentConnection {
     fn drop(&mut self) {
@@ -1397,17 +1491,7 @@ mod tests {
         policy: Arc<dyn AdmissionPolicy>,
         options: EnrollmentOptions,
     ) -> (Arc<EnrollmentService>, std::path::PathBuf) {
-        let node = CoreNode::memory_with_alpns(
-            Vec::new(),
-            Some(crate::CoreEndpointConfig {
-                relay_mode: Some("disabled".into()),
-                bind_addr: Some("127.0.0.1:0".into()),
-                secret_key: Some(vec![2; 32]),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let node = raw_node(2).await;
         let mut nonce = [0; 8];
         getrandom::getrandom(&mut nonce).unwrap();
         let path = std::env::temp_dir().join(format!(
@@ -1647,6 +1731,160 @@ mod tests {
         }
         assert!(!service.take_rate_slot(public(8), None));
         assert_eq!(service.rate.lock().unwrap().peers.len(), MAX_RATE_KEYS);
+        cleanup(service, path).await;
+    }
+
+    /// A loopback node serving the enrollment ALPN without admission hooks.
+    async fn raw_node(seed: u8) -> CoreNode {
+        CoreNode::memory_with_alpns(
+            vec![ENROLLMENT_ALPN.to_vec()],
+            Some(crate::CoreEndpointConfig {
+                relay_mode: Some("disabled".into()),
+                bind_addr: Some("127.0.0.1:0".into()),
+                secret_key: Some(vec![seed; 32]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Open an enrollment connection from `client` and hand the inbound side
+    /// to `service.accept`.
+    async fn raw_handshake(
+        service: &Arc<EnrollmentService>,
+        client: &CoreNode,
+    ) -> (
+        CoreConnection,
+        tokio::task::JoinHandle<Result<EnrollmentReadiness>>,
+    ) {
+        let outbound = client
+            .net_client()
+            .connect_node_addr(service.node.node_addr_info(), ENROLLMENT_ALPN.to_vec())
+            .await
+            .unwrap();
+        let (_, inbound) = service.node.accept_aster().await.unwrap();
+        let accept = tokio::spawn({
+            let service = service.clone();
+            async move { service.accept(&inbound).await }
+        });
+        (outbound, accept)
+    }
+
+    fn assert_skew(error: &anyhow::Error, expected: i64) {
+        match error.downcast_ref::<AdmissionError>() {
+            Some(AdmissionError::ClockSkew { offset_seconds }) => assert!(
+                (offset_seconds - expected).abs() <= 1,
+                "offset {offset_seconds}, expected {expected}"
+            ),
+            other => panic!("expected clock skew, got {other:?}: {error:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_clock_skew_beyond_leeway_is_diagnosed_on_both_sides() {
+        let (service, path) = service(PausedPolicy::new(false), EnrollmentOptions::default()).await;
+        let client = raw_node(7).await;
+        // Within the 60 s leeway the replica answers with its proof.
+        let (connection, accept) = raw_handshake(&service, &client).await;
+        let (send, recv) = connection.open_bi().await.unwrap();
+        let hello = Hello {
+            version: 1,
+            sent_at: unix_now() + 30,
+        };
+        transmit(&send, &hello).await.unwrap();
+        let proof: ReplicaProof = receive(&recv).await.unwrap();
+        assert!(proof.sent_at.abs_diff(unix_now()) <= 1);
+        connection.close(0, b"done".to_vec()).unwrap();
+        assert!(accept.await.unwrap().is_err());
+
+        // Beyond it the replica refuses before disclosing its proof, and says
+        // why in the close reason.
+        let (connection, accept) = raw_handshake(&service, &client).await;
+        let (send, recv) = connection.open_bi().await.unwrap();
+        let hello = Hello {
+            version: 1,
+            sent_at: unix_now() + 90,
+        };
+        transmit(&send, &hello).await.unwrap();
+        assert!(receive::<ReplicaProof>(&recv).await.is_err());
+        assert_skew(&accept.await.unwrap().unwrap_err(), 90);
+        let closed = connection.closed().await;
+        assert_eq!(closed.code, Some(REJECT));
+        let reason = String::from_utf8(closed.reason.unwrap()).unwrap();
+        let reported: i64 = reason
+            .strip_prefix(CLOCK_SKEW_REASON)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((reported - 90).abs() <= 1, "{reason}");
+
+        // A presented credential issued 90 s ahead is skew too, not a
+        // definite denial.
+        let (connection, accept) = raw_handshake(&service, &client).await;
+        let (send, recv) = connection.open_bi().await.unwrap();
+        transmit(
+            &send,
+            &Hello {
+                version: 1,
+                sent_at: unix_now(),
+            },
+        )
+        .await
+        .unwrap();
+        let _: ReplicaProof = receive(&recv).await.unwrap();
+        let ahead = JwtEnrollmentIssuer::from_seed(&[1; 32])
+            .issue(
+                &EnrollmentIssueRequest::new(public(7), AUDIENCE),
+                unix_now() + 90,
+            )
+            .unwrap();
+        transmit(
+            &send,
+            &Presentation {
+                credential: Some(ahead.into_jwt()),
+                sent_at: unix_now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_skew(&accept.await.unwrap().unwrap_err(), 90);
+        client.close().await;
+        cleanup(service, path).await;
+    }
+
+    #[tokio::test]
+    async fn joiner_reports_replica_clock_skew_in_its_own_frame() {
+        let (service, path) = service(PausedPolicy::new(false), EnrollmentOptions::default()).await;
+        for replica_closes in [false, true] {
+            let replica = raw_node(9).await;
+            let handler = tokio::spawn({
+                let replica = replica.clone();
+                async move {
+                    let (_, connection) = replica.accept_aster().await.unwrap();
+                    let (send, recv) = connection.accept_bi().await.unwrap();
+                    let hello: Hello = receive(&recv).await.unwrap();
+                    if replica_closes {
+                        // The replica measured the joiner 90 s ahead of it.
+                        let _ =
+                            connection.close(REJECT, format!("{CLOCK_SKEW_REASON}90").into_bytes());
+                    } else {
+                        // The replica's own clock runs 90 s behind.
+                        let proof = ReplicaProof {
+                            version: 1,
+                            credential: None,
+                            sent_at: hello.sent_at - 90,
+                        };
+                        transmit(&send, &proof).await.unwrap();
+                    }
+                    connection.closed().await
+                }
+            });
+            let error = service.connect(replica.node_addr_info()).await.unwrap_err();
+            assert_skew(&error, -90);
+            handler.await.unwrap();
+            replica.close().await;
+        }
         cleanup(service, path).await;
     }
 }

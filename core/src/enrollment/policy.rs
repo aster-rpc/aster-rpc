@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::jwt::Activation;
 use super::{TypedAttribute, VerifiedAdmissionEvidence};
 
 pub const MAX_POLICY_DEPTH: usize = 32;
@@ -294,6 +295,11 @@ pub enum DenialReason {
     PolicyStateUnavailable,
     CredentialRevoked,
     InvalidValidity,
+    /// The peer's clock, or its credential issuer's, differs from ours by more
+    /// than the activation leeway. Not definite: fix the clock and retry.
+    ClockSkew {
+        offset_seconds: i64,
+    },
     PolicyDidNotMatch,
     MissingEvidence,
     PolicyError(PolicyError),
@@ -445,5 +451,11 @@ fn mandatory_denial(
 ) -> Option<DenialReason> {
     revocations
         .denial(evidence, now)
-        .or_else(|| (!evidence.valid_at(now)).then_some(DenialReason::InvalidValidity))
+        .or_else(|| match evidence.activation_at(now) {
+            Activation::Active => None,
+            Activation::Early { offset_seconds } => {
+                Some(DenialReason::ClockSkew { offset_seconds })
+            }
+            Activation::Expired => Some(DenialReason::InvalidValidity),
+        })
 }

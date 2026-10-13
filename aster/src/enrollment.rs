@@ -11,20 +11,21 @@
 //! and route enrollment connections into [`Enrollment::accept`].
 
 pub use aster_transport_core::enrollment::{
-    admit, check_root_revision, credential_status_key, node_registration_key,
-    should_record_rejection, validate_root_record_json, AdmissionClaims, AdmissionContext,
-    AdmissionDecision, AdmissionError, AdmissionEvidenceSource, AdmissionGuard, AdmissionPolicy,
-    Audience, Confirmation, CredentialStatusV1, DenialReason, EnrollmentClaimsV1, EnrollmentError,
-    EnrollmentExtensionV1, EnrollmentIssueRequest, EnrollmentOptions, EnrollmentPolicyStore,
-    EnrollmentReadiness, EnrollmentRevoked, IssuedEnrollmentCredential, JwtEnrollmentIssuer,
-    JwtEnrollmentVerifier, KnownRevocations, MatchState, NodeRegistrationStatus,
-    NodeRegistrationV1, ObservedSourceAddress, PolicyError, PolicyExpressionV1, PolicyPredicate,
-    PolicyRefreshIssue, PolicyRefreshReport, PolicySynchronization, PublicConfirmationKey,
-    RecordAvailability, RecordError, RootRecordError, RootRecordRead, RootRevisionError,
-    SourceAddressProvenance, SourceCidr, SynchronizationSource, TypedAttribute,
-    VerifiedAdmissionEvidence, ENROLLMENT_ALPN, ENROLLMENT_JWT_TYPE, MAX_JWT_BYTES,
-    MAX_POLICY_DEPTH, MAX_POLICY_NODES, MAX_POLICY_RECORDS, MAX_POLICY_RECORD_BYTES,
-    POLICY_RECORD_PREFIX, POLICY_RECORD_VERSION,
+    admit, check_root_revision, credential_status_key, local_clock_synchronization,
+    node_registration_key, should_record_rejection, validate_root_record_json, AdmissionClaims,
+    AdmissionContext, AdmissionDecision, AdmissionError, AdmissionEvidenceSource, AdmissionGuard,
+    AdmissionPolicy, Audience, ClockSynchronization, Confirmation, CredentialStatusV1,
+    DenialReason, EnrollmentClaimsV1, EnrollmentError, EnrollmentExtensionV1,
+    EnrollmentIssueRequest, EnrollmentOptions, EnrollmentPolicyStore, EnrollmentReadiness,
+    EnrollmentRevoked, IssuedEnrollmentCredential, JwtEnrollmentIssuer, JwtEnrollmentVerifier,
+    KnownRevocations, MatchState, NodeRegistrationStatus, NodeRegistrationV1,
+    ObservedSourceAddress, PolicyError, PolicyExpressionV1, PolicyPredicate, PolicyRefreshIssue,
+    PolicyRefreshReport, PolicySynchronization, PublicConfirmationKey, RecordAvailability,
+    RecordError, RootRecordError, RootRecordRead, RootRevisionError, SourceAddressProvenance,
+    SourceCidr, SynchronizationSource, TypedAttribute, VerifiedAdmissionEvidence,
+    DEFAULT_ACTIVATION_LEEWAY_SECONDS, ENROLLMENT_ALPN, ENROLLMENT_JWT_TYPE,
+    MAX_ACTIVATION_LEEWAY_SECONDS, MAX_JWT_BYTES, MAX_POLICY_DEPTH, MAX_POLICY_NODES,
+    MAX_POLICY_RECORDS, MAX_POLICY_RECORD_BYTES, POLICY_RECORD_PREFIX, POLICY_RECORD_VERSION,
 };
 
 use aster_transport_core::enrollment::{EnrollmentService, RootAuthoredDocView};

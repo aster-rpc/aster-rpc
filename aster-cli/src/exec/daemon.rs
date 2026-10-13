@@ -342,7 +342,11 @@ async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
     let node =
         aster::Node::start_with_alpns(config, vec![aster::enrollment::ENROLLMENT_ALPN.to_vec()])
             .await?;
-    let enrollment_options = aster::enrollment::EnrollmentOptions::default();
+    // Signed times and peer clocks are judged against this clock.
+    let enrollment_options = aster::enrollment::EnrollmentOptions {
+        require_synchronized_clock: true,
+        ..Default::default()
+    };
     let handshakes = enrollment_options.max_concurrent_handshakes;
     let enrollment = aster::enrollment::Enrollment::install(
         &node,

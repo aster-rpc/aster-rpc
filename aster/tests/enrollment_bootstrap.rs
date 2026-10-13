@@ -137,7 +137,7 @@ async fn raw_presentation(node: &Node, replica: &Node, jwt: &str) -> bool {
     node.add_peer(replica).unwrap();
     let connection = node.connect(&replica.id(), ENROLLMENT_ALPN).await.unwrap();
     let (send, recv) = connection.open_bi().await.unwrap();
-    let payload = serde_json::to_vec(&serde_json::json!({"version":1})).unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!({"version":1,"sent_at":now()})).unwrap();
     send.write_all((payload.len() as u32).to_be_bytes().to_vec())
         .await
         .unwrap();
@@ -147,7 +147,8 @@ async fn raw_presentation(node: &Node, replica: &Node, jwt: &str) -> bool {
         serde_json::from_slice(&recv.read_exact(length as usize).await.unwrap()).unwrap();
     assert!(proof.get("credential").is_some());
     assert!(proof.get("policy_ticket").is_none());
-    let presentation = serde_json::to_vec(&serde_json::json!({"credential":jwt})).unwrap();
+    let presentation =
+        serde_json::to_vec(&serde_json::json!({"credential":jwt,"sent_at":now()})).unwrap();
     send.write_all((presentation.len() as u32).to_be_bytes().to_vec())
         .await
         .unwrap();
@@ -210,16 +211,18 @@ async fn reciprocal_validation_rejects_rogue_replica_and_failopen_install() {
         let count = u32::from_be_bytes(recv.read_exact(4).await.unwrap().try_into().unwrap());
         let probe: serde_json::Value =
             serde_json::from_slice(&recv.read_exact(count as usize).await.unwrap()).unwrap();
-        assert_eq!(probe, serde_json::json!({"version":1}));
+        assert_eq!(probe["version"], 1);
+        assert!(probe["sent_at"].as_u64().unwrap().abs_diff(now()) <= 1);
         let rogue_token = issue_jwt(
             &key(9),
             &EnrollmentIssueRequest::new(public(9), FLEET),
             now(),
         )
         .unwrap();
-        let payload =
-            serde_json::to_vec(&serde_json::json!({"version":1,"credential":rogue_token.jwt()}))
-                .unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version":1,"credential":rogue_token.jwt(),"sent_at":now()
+        }))
+        .unwrap();
         send.write_all((payload.len() as u32).to_be_bytes().to_vec())
             .await
             .unwrap();
@@ -791,4 +794,55 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
     })
     .await
     .expect("bootstrap integration timed out");
+}
+
+#[tokio::test]
+async fn install_rejects_mismatched_activation_leeway() {
+    let files = tempfile::tempdir().unwrap();
+    let node = node(11).await;
+    let store = |name: &str| {
+        Arc::new(
+            EnrollmentPolicyStore::open(files.path().join(name), public(1), [42; 32], FLEET)
+                .unwrap(),
+        )
+    };
+    let install = |store, verifier| {
+        Enrollment::install(
+            &node,
+            store,
+            verifier,
+            Some(token(11)),
+            Arc::new(PolicyExpressionV1::Predicate(
+                PolicyPredicate::TolerateStalePolicy,
+            )),
+            EnrollmentOptions::default(),
+        )
+    };
+    let exact = JwtEnrollmentVerifier::new(public(1), FLEET)
+        .unwrap()
+        .with_activation_leeway(0)
+        .unwrap();
+    let error = install(store("default.json"), exact).err().unwrap();
+    assert!(
+        error.to_string().contains("activation leeways differ"),
+        "{error}"
+    );
+    assert!(
+        EnrollmentPolicyStore::open(files.path().join("bad.json"), public(1), [42; 32], FLEET)
+            .unwrap()
+            .with_activation_leeway(MAX_ACTIVATION_LEEWAY_SECONDS + 1)
+            .is_err()
+    );
+    let matched = Arc::new(
+        EnrollmentPolicyStore::open(files.path().join("exact.json"), public(1), [42; 32], FLEET)
+            .unwrap()
+            .with_activation_leeway(0)
+            .unwrap(),
+    );
+    let exact = JwtEnrollmentVerifier::new(public(1), FLEET)
+        .unwrap()
+        .with_activation_leeway(0)
+        .unwrap();
+    assert!(install(matched, exact).is_ok());
+    node.shutdown().await;
 }

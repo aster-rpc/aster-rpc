@@ -2,7 +2,10 @@
 //! process restart and stale replicas, but cannot detect rollback of the entire
 //! disk including this file. Protect that boundary with an external monotonic
 //! anchor when the application requires whole-machine rollback resistance.
-use super::jwt::{validate_unique_json, RegistrationEvidenceData};
+use super::jwt::{
+    activation, valid_leeway, validate_unique_json, Activation, RegistrationEvidenceData,
+    DEFAULT_ACTIVATION_LEEWAY_SECONDS,
+};
 use super::records::*;
 use super::root_records::{RootAuthoredDocView, RootRecordError, RootRecordRead};
 use super::root_revisions::{check_root_revision, should_record_rejection, RootRevisionError};
@@ -126,6 +129,7 @@ pub struct EnrollmentPolicyStore {
     root: [u8; 32],
     namespace: [u8; 32],
     audience: String,
+    activation_leeway: u64,
 }
 impl EnrollmentPolicyStore {
     pub fn open(
@@ -194,6 +198,7 @@ impl EnrollmentPolicyStore {
             root,
             namespace,
             audience,
+            activation_leeway: DEFAULT_ACTIVATION_LEEWAY_SECONDS,
         };
         {
             let state = store.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -231,6 +236,31 @@ impl EnrollmentPolicyStore {
     pub fn namespace(&self) -> &[u8; 32] {
         &self.namespace
     }
+    pub fn activation_leeway(&self) -> u64 {
+        self.activation_leeway
+    }
+
+    /// Tolerate a root clock up to `seconds` ahead when checking registration
+    /// `issued_at`/`not_before`. Must equal the verifier's leeway; expiry
+    /// never receives leeway.
+    pub fn with_activation_leeway(mut self, seconds: u64) -> Result<Self, RecordError> {
+        if !valid_leeway(seconds) {
+            return Err(RecordError::InvalidConfiguration);
+        }
+        self.activation_leeway = seconds;
+        Ok(self)
+    }
+
+    fn active(&self, record: &NodeRegistrationV1, now: u64) -> bool {
+        activation(
+            record.issued_at,
+            record.not_before,
+            record.expires_at,
+            now,
+            self.activation_leeway,
+        ) == Activation::Active
+    }
+
     pub fn audience(&self) -> &str {
         &self.audience
     }
@@ -528,17 +558,20 @@ impl EnrollmentPolicyStore {
         if !record.mandatory.is_empty() {
             return Err(RecordError::UnsupportedMandatoryRestriction);
         }
-        VerifiedAdmissionEvidence::from_registration(RegistrationEvidenceData {
-            issuer: self.root,
-            subject: identity(&record.subject)?,
-            audience: record.audience.clone(),
-            issued_at: record.issued_at,
-            not_before: record.not_before,
-            expires_at: record.expires_at,
-            claims: record.claims.clone(),
-            document_id: self.namespace,
-            revision: record.revision,
-        })
+        VerifiedAdmissionEvidence::from_registration(
+            RegistrationEvidenceData {
+                issuer: self.root,
+                subject: identity(&record.subject)?,
+                audience: record.audience.clone(),
+                issued_at: record.issued_at,
+                not_before: record.not_before,
+                expires_at: record.expires_at,
+                claims: record.claims.clone(),
+                document_id: self.namespace,
+                revision: record.revision,
+            },
+            self.activation_leeway,
+        )
         .map_err(|_| RecordError::InvalidRecord)?;
         if serde_json::to_vec(record).map_err(storage)?.len() > MAX_POLICY_RECORD_BYTES {
             return Err(RecordError::InvalidRecord);
@@ -738,26 +771,26 @@ impl EnrollmentPolicyStore {
             if record.status != NodeRegistrationStatus::Active {
                 return Err(RecordError::Denied(DenialReason::NodeRevoked));
             }
-            if record.issued_at > now
-                || record.not_before.is_some_and(|nbf| now < nbf)
-                || record.expires_at.is_some_and(|exp| now >= exp)
-            {
+            if !self.active(record, now) {
                 return Err(RecordError::Denied(DenialReason::InvalidValidity));
             }
             if !state.authenticated_nodes.contains(&record.subject) {
                 return Err(RecordError::MissingEvidence);
             }
-            VerifiedAdmissionEvidence::from_registration(RegistrationEvidenceData {
-                issuer: self.root,
-                subject: *peer,
-                audience: record.audience.clone(),
-                issued_at: record.issued_at,
-                not_before: record.not_before,
-                expires_at: record.expires_at,
-                claims: record.claims.clone(),
-                document_id: self.namespace,
-                revision: record.revision,
-            })
+            VerifiedAdmissionEvidence::from_registration(
+                RegistrationEvidenceData {
+                    issuer: self.root,
+                    subject: *peer,
+                    audience: record.audience.clone(),
+                    issued_at: record.issued_at,
+                    not_before: record.not_before,
+                    expires_at: record.expires_at,
+                    claims: record.claims.clone(),
+                    document_id: self.namespace,
+                    revision: record.revision,
+                },
+                self.activation_leeway,
+            )
             .map_err(|_| RecordError::InvalidRecord)?
         } else {
             credential.cloned().ok_or(RecordError::MissingEvidence)?
@@ -772,10 +805,15 @@ impl EnrollmentPolicyStore {
         if let Some(reason) = self.denial(&selected, now) {
             return Err(RecordError::Denied(reason));
         }
-        if !selected.valid_at(now) {
-            return Err(RecordError::Denied(DenialReason::InvalidValidity));
+        match selected.activation_at(now) {
+            Activation::Active => Ok(selected),
+            Activation::Early { offset_seconds } => {
+                Err(RecordError::Denied(DenialReason::ClockSkew {
+                    offset_seconds,
+                }))
+            }
+            Activation::Expired => Err(RecordError::Denied(DenialReason::InvalidValidity)),
         }
-        Ok(selected)
     }
     fn persist(&self, policy: &PersistedPolicy) -> Result<(), RecordError> {
         let bytes = serde_json::to_vec(policy).map_err(storage)?;
@@ -838,10 +876,7 @@ impl AdmissionGuard for EnrollmentPolicyStore {
             if node.status != NodeRegistrationStatus::Active {
                 return Some(DenialReason::NodeRevoked);
             }
-            if node.issued_at > now
-                || node.not_before.is_some_and(|nbf| now < nbf)
-                || node.expires_at.is_some_and(|exp| now >= exp)
-            {
+            if !self.active(node, now) {
                 return Some(DenialReason::InvalidValidity);
             }
             if !state.authenticated_nodes.contains(&node.subject) {

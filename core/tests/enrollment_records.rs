@@ -418,14 +418,15 @@ async fn future_registration_is_cached_but_cannot_allow_or_fall_back_before_issu
     let path = Temp::new();
     let s = store(&path.0, &doc);
     let mut r = registration(1, NodeRegistrationStatus::Active);
-    r.issued_at = NOW + 60;
+    // Beyond the default 60 s activation leeway; records stay definite.
+    r.issued_at = NOW + 61;
     write(&doc, &r).await;
     s.refresh_node(&doc, &peer()).await.unwrap();
     assert_eq!(
         s.select_evidence(&peer(), Some(&token()), NOW).unwrap_err(),
         RecordError::Denied(DenialReason::InvalidValidity)
     );
-    assert!(s.select_evidence(&peer(), None, NOW + 60).is_ok());
+    assert!(s.select_evidence(&peer(), None, NOW + 1).is_ok());
     node.close().await;
 }
 #[tokio::test]

@@ -202,6 +202,20 @@ pub struct CoreClosedInfo {
     pub reason: Option<Vec<u8>>,
 }
 
+fn closed_info(closed: &ConnectionError) -> CoreClosedInfo {
+    let (code, reason) = match closed {
+        ConnectionError::ApplicationClosed(app) => {
+            (Some(app.error_code.into_inner()), Some(app.reason.to_vec()))
+        }
+        _ => (None, Some(closed.to_string().into_bytes())),
+    };
+    CoreClosedInfo {
+        kind: format!("{closed:?}"),
+        code,
+        reason,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CoreGossipEvent {
     pub event_type: String,
@@ -2638,18 +2652,12 @@ impl CoreConnection {
     }
 
     pub async fn closed(&self) -> CoreClosedInfo {
-        let closed = self.inner.closed().await;
-        let (code, reason) = match &closed {
-            ConnectionError::ApplicationClosed(app) => {
-                (Some(app.error_code.into_inner()), Some(app.reason.to_vec()))
-            }
-            _ => (None, Some(closed.to_string().into_bytes())),
-        };
-        CoreClosedInfo {
-            kind: format!("{closed:?}"),
-            code,
-            reason,
-        }
+        closed_info(&self.inner.closed().await)
+    }
+
+    /// How the connection closed, without waiting; `None` while it is open.
+    pub fn close_info(&self) -> Option<CoreClosedInfo> {
+        self.inner.close_reason().map(|closed| closed_info(&closed))
     }
 
     // ============================================================================

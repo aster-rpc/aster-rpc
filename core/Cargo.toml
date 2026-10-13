@@ -66,3 +66,7 @@ proptest = "1"
 [[bench]]
 name = "ring_bench"
 harness = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Read-only adjtimex query for enrollment clock synchronization status.
+libc = { workspace = true }

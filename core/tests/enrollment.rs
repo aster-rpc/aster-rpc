@@ -163,15 +163,19 @@ fn exact_audience_and_validity_boundaries_optional_expiry() {
     c["nbf"] = json!(NOW);
     c["exp"] = json!(NOW + 1);
     let token = sign(&header(), &c, &root());
-    assert!(verifier().verify(&token, &peer(), NOW).is_ok());
+    let exact = verifier().with_activation_leeway(0).unwrap();
+    assert!(exact.verify(&token, &peer(), NOW).is_ok());
     assert_eq!(
-        verifier().verify(&token, &peer(), NOW - 1).unwrap_err(),
-        EnrollmentError::InvalidValidity
+        exact.verify(&token, &peer(), NOW - 1).unwrap_err(),
+        EnrollmentError::ClockSkew { offset_seconds: 1 }
     );
-    assert_eq!(
-        verifier().verify(&token, &peer(), NOW + 1).unwrap_err(),
-        EnrollmentError::InvalidValidity
-    );
+    // Expiry is exact whatever the activation leeway.
+    for verifier in [exact, verifier()] {
+        assert_eq!(
+            verifier.verify(&token, &peer(), NOW + 1).unwrap_err(),
+            EnrollmentError::InvalidValidity
+        );
+    }
     c["aud"] = json!("Build-Fleet");
     assert!(verifier()
         .verify(&sign(&header(), &c, &root()), &peer(), NOW)
@@ -643,5 +647,43 @@ async fn revocation_learned_during_handler_wins_over_allow() {
         )
         .await,
         AdmissionDecision::Deny(DenialReason::NodeRevoked)
+    );
+}
+
+#[test]
+fn activation_leeway_tolerates_issuer_clock_ahead_but_never_extends_expiry() {
+    assert_eq!(
+        verifier().activation_leeway(),
+        DEFAULT_ACTIVATION_LEEWAY_SECONDS
+    );
+    assert_eq!(
+        verifier()
+            .with_activation_leeway(MAX_ACTIVATION_LEEWAY_SECONDS + 1)
+            .err(),
+        Some(EnrollmentError::InvalidConfiguration)
+    );
+    for field in ["iat", "nbf"] {
+        let mut c = claims();
+        c[field] = json!(NOW + 30);
+        let ahead = sign(&header(), &c, &root());
+        assert!(verifier().verify(&ahead, &peer(), NOW).is_ok(), "{field}");
+        c[field] = json!(NOW + 90);
+        assert_eq!(
+            verifier()
+                .verify(&sign(&header(), &c, &root()), &peer(), NOW)
+                .unwrap_err(),
+            EnrollmentError::ClockSkew { offset_seconds: 90 },
+            "{field}"
+        );
+    }
+    let mut c = claims();
+    c["exp"] = json!(NOW);
+    assert_eq!(
+        verifier()
+            .with_activation_leeway(MAX_ACTIVATION_LEEWAY_SECONDS)
+            .unwrap()
+            .verify(&sign(&header(), &c, &root()), &peer(), NOW)
+            .unwrap_err(),
+        EnrollmentError::InvalidValidity
     );
 }

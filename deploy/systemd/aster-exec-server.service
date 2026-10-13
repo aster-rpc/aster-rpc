@@ -1,7 +1,9 @@
 [Unit]
 Description=Aster Exec authenticated RPC service
-After=network-online.target aster-exec-helper.service
-Wants=network-online.target
+# The server refuses an unsynchronized clock; order after NTP. Enable
+# systemd-time-wait-sync.service to make time-sync.target wait for sync.
+After=network-online.target time-sync.target aster-exec-helper.service
+Wants=network-online.target time-sync.target
 Requires=aster-exec-helper.service
 
 [Service]

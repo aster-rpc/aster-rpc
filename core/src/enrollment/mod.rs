@@ -7,10 +7,11 @@
 //! an `OKP`/`Ed25519` public key equal to both `sub` and the authenticated peer.
 //! Trust comes exclusively from the configured root key; headers never select
 //! keys or cause network access. `aud`, `jti`, `iat` and `cnf` are required.
-//! NumericDates are nonnegative integral seconds, with exact `iat <= now`,
-//! `nbf <= now < exp` semantics and zero clock skew. V1 offers no configurable
-//! iat margin or validity leeway; callers provide synchronized, trusted UTC.
-//! Expiry may be omitted.
+//! NumericDates are nonnegative integral seconds. Activation tolerates a
+//! configurable leeway for an issuer clock running ahead (default 60 s, at most
+//! 300 s): `iat <= now + leeway`, `nbf <= now + leeway`. Expiry is exact,
+//! `now < exp`. Callers provide synchronized, trusted UTC; see
+//! [`local_clock_synchronization`]. Expiry may be omitted.
 //!
 //! The namespaced `aster_enrollment_v1` extension contains optional complete
 //! scope/tag/attribute sets and a required `mandatory` list. This slice supports
@@ -42,6 +43,7 @@
 //! incomplete guard is a trusted host decision, not a peer-selectable bypass.
 
 mod bootstrap;
+mod clock;
 mod jwt;
 mod policy;
 
@@ -56,11 +58,14 @@ mod store;
 
 pub(crate) use jwt::canonical_identity;
 
+pub use clock::{local_clock_synchronization, ClockSynchronization};
+
 pub use jwt::{
     AdmissionClaims, AdmissionEvidenceSource, Audience, Confirmation, EnrollmentClaimsV1,
     EnrollmentError, EnrollmentExtensionV1, EnrollmentIssueRequest, IssuedEnrollmentCredential,
     JwtEnrollmentIssuer, JwtEnrollmentVerifier, PublicConfirmationKey, TypedAttribute,
-    VerifiedAdmissionEvidence, ENROLLMENT_JWT_TYPE, MAX_JWT_BYTES,
+    VerifiedAdmissionEvidence, DEFAULT_ACTIVATION_LEEWAY_SECONDS, ENROLLMENT_JWT_TYPE,
+    MAX_ACTIVATION_LEEWAY_SECONDS, MAX_JWT_BYTES,
 };
 pub use policy::{
     admit, AdmissionContext, AdmissionDecision, AdmissionPolicy, DenialReason, KnownRevocations,

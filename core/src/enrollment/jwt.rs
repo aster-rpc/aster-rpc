@@ -13,6 +13,47 @@ pub use crate::delegation::{
 };
 
 pub const MAX_JWT_BYTES: usize = 16 * 1024;
+/// Default tolerance for a signer's clock running ahead of the verifier.
+/// It applies only to activation (`iat`, `nbf`); expiry is never extended.
+pub const DEFAULT_ACTIVATION_LEEWAY_SECONDS: u64 = 60;
+pub const MAX_ACTIVATION_LEEWAY_SECONDS: u64 = 300;
+
+/// Signed validity of one statement at a verifier's trusted time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Activation {
+    Active,
+    /// `iat` or `nbf` is later than `now + leeway`; the statement starts
+    /// `offset_seconds` after `now`.
+    Early {
+        offset_seconds: i64,
+    },
+    Expired,
+}
+
+/// `iat <= now + leeway`, `nbf <= now + leeway` and `now < exp`. Expiry is
+/// checked first so leeway can never revive an expired statement.
+pub(super) fn activation(
+    issued_at: u64,
+    not_before: Option<u64>,
+    expires_at: Option<u64>,
+    now: u64,
+    leeway: u64,
+) -> Activation {
+    if expires_at.is_some_and(|exp| now >= exp) {
+        return Activation::Expired;
+    }
+    let starts = not_before.map_or(issued_at, |nbf| nbf.max(issued_at));
+    if starts > now.saturating_add(leeway) {
+        return Activation::Early {
+            offset_seconds: i64::try_from(starts - now).unwrap_or(i64::MAX),
+        };
+    }
+    Activation::Active
+}
+
+pub(super) fn valid_leeway(seconds: u64) -> bool {
+    seconds <= MAX_ACTIVATION_LEEWAY_SECONDS
+}
 
 impl AdmissionClaims {
     /// Parse an attribute file before authorized issuance. The input is bounded
@@ -92,6 +133,8 @@ pub struct VerifiedAdmissionEvidence {
     credential_id: Option<String>,
     original_jwt: Option<String>,
     source: AdmissionEvidenceSource,
+    /// The verifier's activation leeway, so later rechecks use the same rule.
+    activation_leeway: u64,
 }
 
 impl VerifiedAdmissionEvidence {
@@ -128,14 +171,19 @@ impl VerifiedAdmissionEvidence {
         self.original_jwt.as_deref()
     }
 
-    pub(super) fn valid_at(&self, now: u64) -> bool {
-        self.issued_at <= now
-            && self.not_before.is_none_or(|nbf| nbf <= now)
-            && self.expires_at.is_none_or(|exp| now < exp)
+    pub(super) fn activation_at(&self, now: u64) -> Activation {
+        activation(
+            self.issued_at,
+            self.not_before,
+            self.expires_at,
+            now,
+            self.activation_leeway,
+        )
     }
 
     pub(super) fn from_registration(
         data: RegistrationEvidenceData,
+        activation_leeway: u64,
     ) -> Result<Self, EnrollmentError> {
         validate_key(&data.issuer)?;
         validate_key(&data.subject)?;
@@ -160,6 +208,7 @@ impl VerifiedAdmissionEvidence {
                 document_id: data.document_id,
                 revision: data.revision,
             },
+            activation_leeway,
         })
     }
 }
@@ -173,6 +222,11 @@ pub enum EnrollmentError {
     InvalidIdentity,
     PeerKeyMismatch,
     InvalidValidity,
+    /// Valid except that `iat`/`nbf` is beyond the activation leeway: the
+    /// issuer's clock is ahead of this verifier's by about `offset_seconds`.
+    ClockSkew {
+        offset_seconds: i64,
+    },
     UnsupportedMandatoryRestriction,
     InvalidClaims,
     SigningFailed,
@@ -338,6 +392,7 @@ impl std::io::Write for BoundedJsonSize {
 pub struct JwtEnrollmentVerifier {
     root: [u8; 32],
     audience: String,
+    activation_leeway: u64,
 }
 
 impl JwtEnrollmentVerifier {
@@ -349,21 +404,38 @@ impl JwtEnrollmentVerifier {
         &self.audience
     }
 
+    pub fn activation_leeway(&self) -> u64 {
+        self.activation_leeway
+    }
+
+    /// Tolerate an issuer clock up to `seconds` ahead (0 to
+    /// [`MAX_ACTIVATION_LEEWAY_SECONDS`]). Expiry never receives leeway.
+    pub fn with_activation_leeway(mut self, seconds: u64) -> Result<Self, EnrollmentError> {
+        if !valid_leeway(seconds) {
+            return Err(EnrollmentError::InvalidConfiguration);
+        }
+        self.activation_leeway = seconds;
+        Ok(self)
+    }
+
     pub fn new(root: [u8; 32], audience: impl Into<String>) -> Result<Self, EnrollmentError> {
         let audience = audience.into();
         if !valid_audience(&audience) || validate_key(&root).is_err() {
             return Err(EnrollmentError::InvalidConfiguration);
         }
-        Ok(Self { root, audience })
+        Ok(Self {
+            root,
+            audience,
+            activation_leeway: DEFAULT_ACTIVATION_LEEWAY_SECONDS,
+        })
     }
 
     /// `authenticated_peer` MUST come from the authenticated transport, never
     /// from JWT/request data. Comparing this key supplies proof of possession;
     /// the JWT alone is not a bearer credential. `now` is trusted UTC seconds.
-    /// V1 applies zero clock skew: `iat <= now`, `nbf <= now`, and `now < exp`.
-    /// Future issuance is inactive even without `nbf`; no implicit iat margin or
-    /// configurable validity leeway is applied. Synchronize the trusted clock
-    /// rather than extending a signed expiration to hide clock differences.
+    /// Activation tolerates the configured leeway, `iat <= now + leeway` and
+    /// `nbf <= now + leeway`; expiry is exact, `now < exp`. A credential that
+    /// fails only on activation reports [`EnrollmentError::ClockSkew`].
     pub fn verify(
         &self,
         token: &str,
@@ -435,11 +507,15 @@ impl JwtEnrollmentVerifier {
             credential_id: Some(claims.jti),
             original_jwt: Some(token.to_owned()),
             source: AdmissionEvidenceSource::PresentedJwt,
+            activation_leeway: self.activation_leeway,
         };
-        if !evidence.valid_at(now) {
-            return Err(EnrollmentError::InvalidValidity);
+        match evidence.activation_at(now) {
+            Activation::Active => Ok(evidence),
+            Activation::Early { offset_seconds } => {
+                Err(EnrollmentError::ClockSkew { offset_seconds })
+            }
+            Activation::Expired => Err(EnrollmentError::InvalidValidity),
         }
-        Ok(evidence)
     }
 }
 

@@ -142,7 +142,11 @@ mod linux {
             Arc::new(PolicyExpressionV1::Predicate(
                 PolicyPredicate::TolerateStalePolicy,
             )),
-            EnrollmentOptions::default(),
+            // Signed times and peer clocks are judged against this clock.
+            EnrollmentOptions {
+                require_synchronized_clock: true,
+                ..Default::default()
+            },
         )?;
         let replicas = config
             .policy_replicas

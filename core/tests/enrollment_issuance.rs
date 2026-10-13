@@ -96,11 +96,13 @@ fn issuance_supports_requested_id_multiple_audiences_and_future_activation() {
     assert_eq!(artifact.credential_id(), "root-selected-id");
     for audience in ["build-fleet", "urn:aster:fleet:workers"] {
         let verifier = JwtEnrollmentVerifier::new(issuer.public_key(), audience).unwrap();
+        // The default 60 s activation leeway admits from NOW; earlier is skew.
+        assert!(verifier.verify(artifact.jwt(), &subject(), NOW).is_ok());
         assert_eq!(
             verifier
-                .verify(artifact.jwt(), &subject(), NOW)
+                .verify(artifact.jwt(), &subject(), NOW - 1)
                 .unwrap_err(),
-            EnrollmentError::InvalidValidity
+            EnrollmentError::ClockSkew { offset_seconds: 61 }
         );
         assert!(verifier
             .verify(artifact.jwt(), &subject(), NOW + 60)

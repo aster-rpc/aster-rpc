@@ -566,6 +566,7 @@ dependencies = [
  "iroh-gossip",
  "iroh-mdns-address-lookup",
  "iroh-tickets",
+ "libc",
  "proptest",
  "rand_core 0.9.5",
  "serde",
