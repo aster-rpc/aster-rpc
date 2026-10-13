@@ -32,7 +32,7 @@ pub use rotation::{
 };
 /// Untrusted decoding helpers for enrollment diagnostics and reporting.
 #[cfg(feature = "enrollment")]
-pub(crate) use verify::{claimed_start, leaf_jti};
+pub(crate) use verify::{claimed_start, delegation_limits, leaf_jti};
 pub use verify::{verify_chain, LeafClaims, VerifiedChain};
 
 pub const CHAIN_PREFIX: &str = "aster-chain-v1";

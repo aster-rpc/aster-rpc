@@ -122,6 +122,19 @@ pub struct EnrollmentRevoked {
     pub reason: DenialReason,
 }
 
+/// The root's statement about a subject, as this node last reconciled it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubjectStanding {
+    /// An active, currently valid registration admits it.
+    Registered,
+    /// A definite denial: revoked, superseded, rejected or expired.
+    Denied(DenialReason),
+    /// No registration anywhere; a chain is its only possible evidence.
+    Unregistered,
+    /// Policy could not be evaluated (pending content, store unavailable).
+    Unknown(RecordError),
+}
+
 /// Why a peer is not admitted right now. Only [`AdmissionError::Denied`]
 /// revokes a session; consumers should cancel work only on that variant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -304,6 +317,12 @@ struct HandshakeCounts {
     sources: BTreeMap<IpAddr, usize>,
 }
 
+#[derive(Default)]
+struct OwnCredential {
+    chain: Option<String>,
+    evidence: Option<VerifiedAdmissionEvidence>,
+}
+
 struct HandshakeSlot<'a> {
     counts: &'a Mutex<HandshakeCounts>,
     peer: [u8; 32],
@@ -341,7 +360,9 @@ pub struct EnrollmentService {
     /// The fleet store and one store per bound membership namespace.
     stores: PolicyStores,
     verifier: JwtEnrollmentVerifier,
-    credential: Option<String>,
+    /// This node's own credential, as presented in handshakes, and its
+    /// verified evidence. Renewal replaces both together.
+    own: RwLock<OwnCredential>,
     policy: Arc<dyn AdmissionPolicy>,
     options: EnrollmentOptions,
     document: RwLock<Option<CoreDoc>>,
@@ -349,8 +370,6 @@ pub struct EnrollmentService {
     bound_documents: RwLock<BTreeMap<[u8; 32], CoreDoc>>,
     /// Bound-namespace read tickets each replica offered at `connect`.
     offered_tickets: Mutex<BTreeMap<[u8; 32], Vec<String>>>,
-    /// This node's own presented chain, verified at install.
-    own_evidence: Option<VerifiedAdmissionEvidence>,
     observer: Mutex<Observer>,
     policy_watch: Mutex<Option<AbortHandle>>,
     context: RwLock<AdmissionContext>,
@@ -483,11 +502,13 @@ impl EnrollmentService {
             stores: PolicyStores::new(store.clone()),
             bound_documents: RwLock::new(BTreeMap::new()),
             offered_tickets: Mutex::new(BTreeMap::new()),
-            own_evidence,
             observer: Mutex::new(Observer::default()),
             store,
             verifier,
-            credential,
+            own: RwLock::new(OwnCredential {
+                chain: credential,
+                evidence: own_evidence,
+            }),
             policy,
             inbound_permits: Semaphore::new(options.max_concurrent_handshakes),
             outbound_permits: Semaphore::new(options.max_concurrent_handshakes),
@@ -778,6 +799,90 @@ impl EnrollmentService {
     pub fn delegate_revoked(&self, key: &[u8; 32]) -> bool {
         use crate::delegation::RevokedDelegates;
         self.stores.is_revoked(key)
+    }
+
+    /// The fleet audience this node's verifier and stores pin.
+    pub fn audience(&self) -> &str {
+        self.store.audience()
+    }
+
+    fn own_chain(&self) -> Option<String> {
+        self.own
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .chain
+            .clone()
+    }
+
+    fn own_evidence(&self) -> Option<VerifiedAdmissionEvidence> {
+        self.own
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .evidence
+            .clone()
+    }
+
+    /// This node's current credential chain and its verified evidence.
+    pub fn credential(&self) -> Option<(String, VerifiedAdmissionEvidence)> {
+        let own = self.own.read().unwrap_or_else(|e| e.into_inner());
+        own.chain.clone().zip(own.evidence.clone())
+    }
+
+    /// Verify `chain` for `subject` as admission would: pinned root and
+    /// audience, signed validity, and the root's delegate revocations.
+    pub fn verify_credential(
+        &self,
+        subject: &[u8; 32],
+        chain: &str,
+    ) -> Result<VerifiedAdmissionEvidence, super::EnrollmentError> {
+        self.verifier
+            .verify_with(chain, subject, unix_now(), &self.stores)
+    }
+
+    /// What the root's records, as this node last reconciled them across
+    /// every bound namespace, say about `subject`.
+    pub fn subject_standing(&self, subject: &[u8; 32]) -> SubjectStanding {
+        match self.stores.select_evidence(subject, None, unix_now()) {
+            Ok(_) => SubjectStanding::Registered,
+            Err(RecordError::Denied(reason)) if reason.is_definite() => {
+                SubjectStanding::Denied(reason)
+            }
+            Err(RecordError::MissingEvidence) => SubjectStanding::Unregistered,
+            Err(error) => SubjectStanding::Unknown(error),
+        }
+    }
+
+    /// Replace this node's credential with a renewed chain, then present it
+    /// again to every peer this node has a session with, so their sessions
+    /// rest on it before the old chain expires. The chain must verify for
+    /// this node. Returns the peers that could not be reached; their
+    /// sessions lapse with the old chain unless the peer re-enrolls.
+    pub async fn replace_credential(&self, chain: String) -> Result<Vec<([u8; 32], String)>> {
+        let own = identity(&self.node.node_id())?;
+        let evidence = self.verify_credential(&own, &chain)?;
+        *self.own.write().unwrap_or_else(|e| e.into_inner()) = OwnCredential {
+            chain: Some(chain),
+            evidence: Some(evidence),
+        };
+        let peers: Vec<[u8; 32]> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        let mut unreached = Vec::new();
+        for peer in peers {
+            let address = CoreNodeAddr {
+                endpoint_id: hex::encode(peer),
+                relay_url: None,
+                direct_addresses: Vec::new(),
+            };
+            if let Err(error) = self.connect(address).await {
+                unreached.push((peer, error.to_string()));
+            }
+        }
+        Ok(unreached)
     }
 
     pub fn revocations(&self) -> broadcast::Receiver<EnrollmentRevoked> {
@@ -1083,21 +1188,35 @@ impl EnrollmentService {
         else {
             return;
         };
+        self.observe(evidence.subject(), chain, ObservationKind::Admitted, false);
+    }
+
+    /// As an observer, record that this node signed a persistent credential
+    /// for `subject` (an issuer, enrollment §5): always for a new issuance,
+    /// and for a renewal at most hourly. Returns whether one was written,
+    /// which needs this node to hold the observer scope and sealed grant.
+    pub fn observe_issuance(&self, subject: &[u8; 32], chain: &str, renewal: bool) -> bool {
+        self.observe(subject, chain, ObservationKind::Issued, !renewal)
+    }
+
+    fn observe(&self, subject: &[u8; 32], chain: &str, kind: ObservationKind, force: bool) -> bool {
         let Ok(own) = identity(&self.node.node_id()) else {
-            return;
+            return false;
         };
-        let subject = *evidence.subject();
+        let subject = *subject;
         if subject == own {
-            return;
+            return false;
         }
         let now = unix_now();
         let (doc, first_seen) = {
             let mut observer = self.observer.lock().unwrap_or_else(|e| e.into_inner());
             let Some((_, doc)) = observer.doc.clone() else {
-                return;
+                return false;
             };
             let first_seen = match observer.seen.get(&subject) {
-                Some((_, written)) if now < written + OBSERVATION_INTERVAL_SECONDS => return,
+                Some((_, written)) if !force && now < written + OBSERVATION_INTERVAL_SECONDS => {
+                    return false
+                }
                 Some((first, _)) => *first,
                 None => now,
             };
@@ -1110,18 +1229,12 @@ impl EnrollmentService {
             (doc, first_seen)
         };
         let Ok(secret) = <[u8; 32]>::try_from(self.node.export_secret_key()) else {
-            return;
+            return false;
         };
-        let Ok(token) = super::issue_observation(
-            &secret,
-            &subject,
-            chain,
-            ObservationKind::Admitted,
-            first_seen,
-            now,
-            now,
-        ) else {
-            return;
+        let Ok(token) =
+            super::issue_observation(&secret, &subject, chain, kind, first_seen, now, now)
+        else {
+            return false;
         };
         let docs = self.node.docs_client();
         tokio::spawn(async move {
@@ -1139,6 +1252,7 @@ impl EnrollmentService {
                 tracing::warn!(%error, "enrollment: observation write failed");
             }
         });
+        true
     }
 
     /// Become (or stop being) an observer. This node observes only while the
@@ -1215,7 +1329,7 @@ impl EnrollmentService {
     fn own_scopes(&self) -> Option<std::collections::BTreeSet<String>> {
         let own = identity(&self.node.node_id()).ok()?;
         self.stores
-            .select_evidence(&own, self.own_evidence.as_ref(), unix_now())
+            .select_evidence(&own, self.own_evidence().as_ref(), unix_now())
             .ok()?
             .claims()
             .scopes
@@ -1419,7 +1533,7 @@ impl EnrollmentService {
                 &send,
                 &ReplicaProof {
                     version: 1,
-                    chain: self.credential.clone(),
+                    chain: self.own_chain(),
                     sent_at: unix_now(),
                 },
             )
@@ -1528,7 +1642,7 @@ impl EnrollmentService {
                 transmit(
                     &send,
                     &Presentation {
-                        chain: self.credential.clone(),
+                        chain: self.own_chain(),
                         sent_at: unix_now(),
                     },
                 )

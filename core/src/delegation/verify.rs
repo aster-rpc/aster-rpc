@@ -155,6 +155,30 @@ pub(crate) fn leaf_jti(chain: &super::Chain) -> Option<String> {
     Some(decode_link(&compact.typ, &compact.payload).ok()?.jti)
 }
 
+/// What an issuer's own delegation chain allows it to sign, decoded without
+/// trust from its first (delegation) link. Only for sizing new leaves:
+/// issuance re-checks every bound against the chain.
+#[cfg(feature = "enrollment")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DelegationLimits {
+    pub subject: [u8; 32],
+    pub expires_at: u64,
+    pub max_child_lifetime: u64,
+}
+
+#[cfg(feature = "enrollment")]
+pub(crate) fn delegation_limits(chain: &super::Chain) -> Option<DelegationLimits> {
+    let first = chain.links().next()?;
+    let compact = jws::decode(first).ok()?;
+    let link = decode_link(&compact.typ, &compact.payload).ok()?;
+    let grant = link.delegation()?;
+    Some(DelegationLimits {
+        subject: link.sub,
+        expires_at: link.exp,
+        max_child_lifetime: grant.max_child_lifetime,
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
     Verify,

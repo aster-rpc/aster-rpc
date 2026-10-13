@@ -36,6 +36,16 @@ pub use aster_transport_core::enrollment::{
     ObservationRejection, ObservationReview, ObservationV1, ObserverGrant, PolicyStores,
     ReviewedObservation, MAX_OBSERVATION_LIFETIME, OBSERVATION_JWT_TYPE,
 };
+pub use aster_transport_core::enrollment::{DelegatedIssuer, IssuanceError, SubjectStanding};
+
+#[cfg(all(feature = "rpc", feature = "docs"))]
+pub mod issuer;
+#[cfg(all(feature = "rpc", feature = "docs"))]
+pub use issuer::{
+    renew_from, Issuer, IssuerErrorCodeV1, IssuerErrorV1, RenewRequestV1, RenewalConfig,
+    RenewalHandle, RenewalOutcome, RenewedV1, DEFAULT_ISSUED_LIFETIME, ISSUER_SERVICE,
+    ISSUER_SERVICE_VERSION,
+};
 
 use aster_transport_core::enrollment::{EnrollmentService, RootAuthoredDocView};
 
