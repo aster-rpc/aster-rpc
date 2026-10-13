@@ -182,7 +182,7 @@ async fn topology_rpc_can_be_gated() {
     let err = within(topo.peers()).await;
     assert!(err.is_err(), "must be denied without the operator role");
 
-    attrs.set_role(client.id().to_string(), "operator");
+    attrs.set_role(client.id().to_string(), "operator").unwrap();
     let list = within(topo.peers()).await.unwrap();
     // Gate passed; content correctness is covered elsewhere.
     let _ = list;

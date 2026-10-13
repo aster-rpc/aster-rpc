@@ -21,7 +21,7 @@ use super::{
 };
 use crate::config::{AsterConfig, EnrollmentConfig, RoleMappingConfig};
 use crate::error::{Error, Result};
-use crate::rpc::{AttributeSource, ROLE_ATTRIBUTE};
+use crate::rpc::{AttributeSource, SourcedAttributes, ROLE_ATTRIBUTE};
 use crate::{Node, NodeAddr, NodeId};
 
 /// Default bound on synchronizing the fleet namespace from a replica.
@@ -217,13 +217,16 @@ pub(crate) struct EnrollmentAttributes {
 }
 
 impl AttributeSource for EnrollmentAttributes {
-    fn attributes(&self, peer: &str) -> Option<HashMap<String, String>> {
+    fn attributes(&self, peer: &str) -> Option<SourcedAttributes> {
         let key = parse_hex32(peer)?;
-        let evidence = self.enrollment.peer_evidence(&key)?;
+        let (session, evidence) = self.enrollment.peer_session(&key)?;
         if evidence.expires_at().is_some_and(|exp| unix_now() >= exp) {
             return None;
         }
-        Some(self.mapping.attributes(evidence.claims()))
+        Some(SourcedAttributes {
+            session,
+            attributes: self.mapping.attributes(evidence.claims()),
+        })
     }
 }
 

@@ -1045,6 +1045,9 @@ pub(crate) fn shutdown_runtime(bridge: &BridgeRuntime) {
 
 /// Attribute bridge (design §2.6): set the attributes Gate 3 sees for
 /// `peer` (64-hex node id). `kv` is a k/v list; empty clears the entry.
+/// For a peer with a live enrollment session the credential sets the maximum
+/// roles: a list carrying `aster.role` is `INVALID_ARGUMENT` (use
+/// `aster_server_restrict_peer_roles`).
 #[no_mangle]
 pub unsafe extern "C" fn aster_server_set_peer_attributes(
     server: aster_server_t,
@@ -1073,9 +1076,79 @@ pub unsafe extern "C" fn aster_server_set_peer_attributes(
     };
     if pairs.is_empty() {
         state.attributes.remove(peer);
-    } else {
-        state.attributes.set(peer, pairs.into_iter().collect());
+    } else if let Err(e) = state.attributes.set(peer, pairs.into_iter().collect()) {
+        return fail(aster_status_t::ASTER_STATUS_INVALID_ARGUMENT, e);
     }
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
+fn peer_arg(peer: *const u8, peer_len: u32) -> Result<String, i32> {
+    // SAFETY: caller-provided length.
+    let peer = unsafe { bytes_in(peer, peer_len) };
+    match std::str::from_utf8(peer) {
+        Ok("") => Err(fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "empty peer",
+        )),
+        Ok(peer) => Ok(peer.to_string()),
+        Err(_) => Err(fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "peer not UTF-8",
+        )),
+    }
+}
+
+/// ABI 5.1: narrow an enrolled `peer`'s roles to `roles` (comma-separated
+/// UTF-8; empty = no roles) intersected with its credential roles, from its
+/// next call. The credential sets the maximum: a role it lacks is never
+/// granted. Replaces any earlier restriction; it ends with the peer's
+/// enrollment session and survives renewals. `NOT_FOUND` when the server or
+/// the peer's live enrollment session is unknown.
+#[no_mangle]
+pub unsafe extern "C" fn aster_server_restrict_peer_roles(
+    server: aster_server_t,
+    peer: *const u8,
+    peer_len: u32,
+    roles: *const u8,
+    roles_len: u32,
+) -> i32 {
+    let Some(state) = SERVERS.get(server) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let peer = match peer_arg(peer, peer_len) {
+        Ok(peer) => peer,
+        Err(code) => return code,
+    };
+    // SAFETY: caller-provided length.
+    let Ok(roles) = std::str::from_utf8(unsafe { bytes_in(roles, roles_len) }) else {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "roles not UTF-8",
+        );
+    };
+    match state.attributes.restrict_roles(&peer, roles.split(',')) {
+        Ok(()) => status(aster_status_t::ASTER_STATUS_OK),
+        Err(e) => fail(aster_status_t::ASTER_STATUS_NOT_FOUND, e),
+    }
+}
+
+/// ABI 5.1: remove `peer`'s role restriction, restoring its credential roles
+/// from its next call. `OK` whether or not one was set; `NOT_FOUND` for an
+/// unknown server.
+#[no_mangle]
+pub unsafe extern "C" fn aster_server_clear_peer_restriction(
+    server: aster_server_t,
+    peer: *const u8,
+    peer_len: u32,
+) -> i32 {
+    let Some(state) = SERVERS.get(server) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let peer = match peer_arg(peer, peer_len) {
+        Ok(peer) => peer,
+        Err(code) => return code,
+    };
+    state.attributes.clear_restriction(&peer);
     status(aster_status_t::ASTER_STATUS_OK)
 }
 

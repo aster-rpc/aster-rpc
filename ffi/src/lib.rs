@@ -174,7 +174,9 @@ pub mod upcall;
 //   (`aster_config_enrollment_from_*`, `aster_node_start_enrolled`,
 //   `aster_enrollment_*`, `ASTER_EVENT_ENROLLMENT_RESULT`) and the lease
 //   grantor (`aster_server_add_lease_grantor`,
-//   `aster_lease_serializer_grantor_new`). Root operations stay in the Rust
+//   `aster_lease_serializer_grantor_new`), and runtime role restriction for
+//   enrolled peers (`aster_server_restrict_peer_roles`,
+//   `aster_server_clear_peer_restriction`). Root operations stay in the Rust
 //   CLI. See `ffi/RENAME_MAP.md` "5.1".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 5;
 pub const ASTER_ABI_VERSION_MINOR: u32 = 1;

@@ -106,7 +106,8 @@ async fn public_http_and_wt_preserve_gates_and_reject_spoofed_sessions_before_fa
     let (peer, _, _) = decode_frame(&bytes).unwrap();
     public
         .attributes()
-        .set_role(String::from_utf8(peer).unwrap(), "operator");
+        .set_role(String::from_utf8(peer).unwrap(), "operator")
+        .unwrap();
     let mut response = TestClient::post("http://localhost/aster/Public/secret")
         .body(encode_frame(b"", FLAG_END_STREAM).unwrap())
         .send(&in_process)

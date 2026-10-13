@@ -348,6 +348,13 @@ impl Enrollment {
         self.inner.peer_evidence(peer)
     }
 
+    /// [`Self::peer_evidence`] with the session's lineage: the same while the
+    /// session is renewed in place, new once it ended (revocation, eviction,
+    /// expiry) and the peer was admitted again.
+    pub fn peer_session(&self, peer: &[u8; 32]) -> Option<(u64, VerifiedAdmissionEvidence)> {
+        self.inner.peer_session(peer)
+    }
+
     /// This node's current credential chain and its verified evidence.
     pub fn credential(&self) -> Option<(String, VerifiedAdmissionEvidence)> {
         self.inner.credential()

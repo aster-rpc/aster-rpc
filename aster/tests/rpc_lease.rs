@@ -196,7 +196,7 @@ async fn revoke_requires_operator_role() {
     assert!(store.mutate_fenced(&fence, &h_id, || ()).is_ok());
 
     // Grant the role; revoke passes and the fence advances immediately.
-    attrs.set_role(&auth_id, "operator");
+    attrs.set_role(&auth_id, "operator").unwrap();
     let revoked = grantor_auth
         .transition(
             "db/primary",

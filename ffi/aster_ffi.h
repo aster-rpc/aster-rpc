@@ -7007,12 +7007,38 @@ int32_t aster_server_destroy(aster_runtime_t runtime, aster_server_t server);
 /**
  * Attribute bridge (design §2.6): set the attributes Gate 3 sees for
  * `peer` (64-hex node id). `kv` is a k/v list; empty clears the entry.
+ * For a peer with a live enrollment session the credential sets the maximum
+ * roles: a list carrying `aster.role` is `INVALID_ARGUMENT` (use
+ * `aster_server_restrict_peer_roles`).
  */
 int32_t aster_server_set_peer_attributes(aster_server_t server,
                                          const uint8_t *peer,
                                          uint32_t peer_len,
                                          const uint8_t *kv,
                                          uint32_t kv_len);
+
+/**
+ * ABI 5.1: narrow an enrolled `peer`'s roles to `roles` (comma-separated
+ * UTF-8; empty = no roles) intersected with its credential roles, from its
+ * next call. The credential sets the maximum: a role it lacks is never
+ * granted. Replaces any earlier restriction; it ends with the peer's
+ * enrollment session and survives renewals. `NOT_FOUND` when the server or
+ * the peer's live enrollment session is unknown.
+ */
+int32_t aster_server_restrict_peer_roles(aster_server_t server,
+                                         const uint8_t *peer,
+                                         uint32_t peer_len,
+                                         const uint8_t *roles,
+                                         uint32_t roles_len);
+
+/**
+ * ABI 5.1: remove `peer`'s role restriction, restoring its credential roles
+ * from its next call. `OK` whether or not one was set; `NOT_FOUND` for an
+ * unknown server.
+ */
+int32_t aster_server_clear_peer_restriction(aster_server_t server,
+                                            const uint8_t *peer,
+                                            uint32_t peer_len);
 
 /**
  * Drain up to `max` events into `out`. `timeout_ms` 0 = return at once;

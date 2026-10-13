@@ -1461,14 +1461,41 @@ impl DispatchServer {
 
     /// Attribute bridge (design §2.6): set the attributes Gate 3 checks
     /// `requires` against for `peer` (hex node id). `null` / empty clears
-    /// the entry. Attributes derived from a peer's enrollment credential win
-    /// on a key clash.
+    /// the entry. For a peer with a live enrollment session the credential
+    /// sets the maximum roles: `aster.role` here throws (use
+    /// `restrictPeerRoles`), and the credential's attributes win on a clash.
     #[napi]
-    pub fn set_peer_attributes(&self, peer: String, attributes: Option<HashMap<String, String>>) {
+    pub fn set_peer_attributes(
+        &self,
+        peer: String,
+        attributes: Option<HashMap<String, String>>,
+    ) -> napi::Result<()> {
         match attributes {
-            Some(a) if !a.is_empty() => self.attributes.set(peer, a),
-            _ => self.attributes.remove(&peer),
+            Some(a) if !a.is_empty() => self
+                .attributes
+                .set(peer, a)
+                .map_err(|e| napi::Error::new(Status::InvalidArg, e.to_string())),
+            _ => {
+                self.attributes.remove(&peer);
+                Ok(())
+            }
         }
+    }
+
+    /// Narrow an enrolled `peer`'s roles to `roles` intersected with its
+    /// credential roles, from its next call. Throws without a live
+    /// enrollment session.
+    #[napi]
+    pub fn restrict_peer_roles(&self, peer: String, roles: Vec<String>) -> napi::Result<()> {
+        self.attributes
+            .restrict_roles(&peer, roles)
+            .map_err(|e| napi::Error::new(Status::GenericFailure, e.to_string()))
+    }
+
+    /// Remove `peer`'s role restriction; returns whether one was set.
+    #[napi]
+    pub fn clear_peer_restriction(&self, peer: String) -> bool {
+        self.attributes.clear_restriction(&peer)
     }
 
     /// The attributes Gate 3 currently sees for `peer`.

@@ -121,7 +121,7 @@ async fn gate3_capability_check() {
 
     // Application injects the operator role for this peer (e.g. after verifying
     // its attestation chain at admission).
-    attrs.set_role(client.id().as_str(), "operator");
+    attrs.set_role(client.id().as_str(), "operator").unwrap();
 
     // Now the gated method passes and the handler sees the role.
     let resp = within(conn.unary(&header("restart"), vec![1]))

@@ -279,8 +279,8 @@ impl Server {
 
     /// Attach a pre-dispatch [`Authenticator`] (builder-style). It runs on every
     /// call before the Gate-3 capability check, can reject, and can resolve a
-    /// principal + attributes (merged with the [`AttributeStore`], enrollment
-    /// winning on collision). This is where HTTP Bearer/JWT or any custom auth
+    /// principal + attributes (merged under the [`AttributeStore`]; it never adds
+    /// a role to a peer with a live enrollment session). This is where HTTP Bearer/JWT or any custom auth
     /// lives — it applies to whichever transport drives the dispatcher.
     pub fn authenticator(mut self, auth: impl Authenticator) -> Self {
         self.authenticator = Some(Arc::new(auth));
@@ -1061,7 +1061,7 @@ impl Dispatcher {
     }
 
     /// The async half of routing when an [`Authenticator`] is configured: run
-    /// it, merge its attributes (enrollment wins on key collision), apply its
+    /// it, merge its attributes under the store's (no role for an enrolled peer), apply its
     /// principal, run Gate 3, and resolve an HTTP-scoped session under the
     /// resulting principal.
     async fn authenticate(
@@ -1069,7 +1069,7 @@ impl Dispatcher {
         mut routed: Routed,
         parts: &mut CallParts,
     ) -> std::result::Result<Option<Routed>, RpcStatus> {
-        let mut attrs = self.attributes.get(&parts.peer_id);
+        let (mut attrs, credentialed) = self.attributes.resolve(&parts.peer_id);
         if let Some(auth) = self.authenticator.as_ref() {
             // Authentication spends the same routed deadline as the handler.
             // Register before invoking the hook, so a stalled foreign auth
@@ -1120,6 +1120,10 @@ impl Dispatcher {
                 parts.peer_id = principal;
             }
             for (k, v) in outcome.attributes {
+                // The credential sets an enrolled peer's maximum roles.
+                if credentialed && k == super::auth::ROLE_ATTRIBUTE {
+                    continue;
+                }
                 attrs.entry(k).or_insert(v);
             }
         }

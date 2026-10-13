@@ -136,7 +136,7 @@ async fn node_info_can_be_gated() {
     assert!(err.is_err(), "must be denied without the operator role");
 
     // Inject the role → allowed.
-    attrs.set_role(client.id().to_string(), "operator");
+    attrs.set_role(client.id().to_string(), "operator").unwrap();
     let identity = within(info.describe()).await.unwrap();
     assert_eq!(identity.node_id, srv.id().to_string());
 

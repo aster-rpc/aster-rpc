@@ -124,7 +124,9 @@ async fn service_macro_round_trip_and_auth() {
     );
 
     // Inject the role; the gated method now passes.
-    attrs.set_role(client_node.id().as_str(), "operator");
+    attrs
+        .set_role(client_node.id().as_str(), "operator")
+        .unwrap();
     let resp = within(client.admin_echo(EchoRequest {
         message: "y".into(),
     }))

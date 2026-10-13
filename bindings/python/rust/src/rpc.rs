@@ -299,9 +299,31 @@ impl DispatchServer {
     }
 
     /// Set Gate-3 attributes for `peer` (hex node id) in the server's
-    /// attribute store (merged with any gate attributes).
-    fn set_peer_attributes(&self, peer: String, attributes: HashMap<String, String>) {
-        self.attributes.set(peer, attributes);
+    /// attribute store. For a peer with a live enrollment session the
+    /// credential sets the maximum roles: `aster.role` here raises
+    /// `ValueError` (use `restrict_peer_roles`).
+    fn set_peer_attributes(
+        &self,
+        peer: String,
+        attributes: HashMap<String, String>,
+    ) -> PyResult<()> {
+        self.attributes
+            .set(peer, attributes)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Narrow an enrolled `peer`'s roles to `roles` intersected with its
+    /// credential roles, from its next call. Raises `LookupError` without a
+    /// live enrollment session.
+    fn restrict_peer_roles(&self, peer: &str, roles: Vec<String>) -> PyResult<()> {
+        self.attributes
+            .restrict_roles(peer, roles)
+            .map_err(|e| pyo3::exceptions::PyLookupError::new_err(e.to_string()))
+    }
+
+    /// Remove `peer`'s role restriction; returns whether one was set.
+    fn clear_peer_restriction(&self, peer: &str) -> bool {
+        self.attributes.clear_restriction(peer)
     }
 
     /// Remove `peer`'s entry from the server's attribute store.

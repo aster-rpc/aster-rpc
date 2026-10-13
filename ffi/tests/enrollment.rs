@@ -241,6 +241,18 @@ fn last_error() -> String {
     String::from_utf8_lossy(&buf[..len.min(buf.len())]).into_owned()
 }
 
+/// A k/v list in the C ABI encoding.
+fn kv(entries: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = (entries.len() as u32).to_le_bytes().to_vec();
+    for (key, value) in entries {
+        for part in [key, value] {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part.as_bytes());
+        }
+    }
+    out
+}
+
 /// Start a loopback node (seed, `aster/1`) from `trust`. `Ok((node,
 /// enrollment))`; `Err((status, message))` for a refusal before the start
 /// or an `ASTER_EVENT_ERROR` from it.
@@ -501,6 +513,58 @@ fn config_driven_server_issues_renews_and_follows_revocation() {
         assert!(claims(rt, server, public(9)).is_none());
         check(rt, server, public(7)).expect("admitted");
 
+        // The credential sets the maximum roles: runtime code cannot set
+        // `aster.role` on the enrolled peer, only restrict it; a peer without
+        // a session has nothing to restrict.
+        let enrolled_peer = hex::encode(public(7));
+        let role_kv = kv(&[("aster.role", "ops.admin")]);
+        assert_eq!(
+            aster_server_set_peer_attributes(
+                srv,
+                enrolled_peer.as_ptr(),
+                enrolled_peer.len() as u32,
+                role_kv.as_ptr(),
+                role_kv.len() as u32,
+            ),
+            INVALID
+        );
+        assert!(last_error().contains("restrict_roles"), "{}", last_error());
+        let tenant_kv = kv(&[("tenant", "t1")]);
+        assert_eq!(
+            aster_server_set_peer_attributes(
+                srv,
+                enrolled_peer.as_ptr(),
+                enrolled_peer.len() as u32,
+                tenant_kv.as_ptr(),
+                tenant_kv.len() as u32,
+            ),
+            OK
+        );
+        let restrict = |peer: &str, roles: &str| {
+            aster_server_restrict_peer_roles(
+                srv,
+                peer.as_ptr(),
+                peer.len() as u32,
+                roles.as_ptr(),
+                roles.len() as u32,
+            )
+        };
+        assert_eq!(restrict(&enrolled_peer, "ops.status"), OK);
+        assert_eq!(restrict(&enrolled_peer, ""), OK);
+        assert_eq!(
+            restrict(&hex::encode(public(9)), "ops.status"),
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+        assert_eq!(
+            aster_server_clear_peer_restriction(
+                srv,
+                enrolled_peer.as_ptr(),
+                enrolled_peer.len() as u32
+            ),
+            OK
+        );
+        assert_eq!(restrict(&enrolled_peer, "ops.status"), OK);
+
         // Enrolled nodes take no gate, and a client node cannot serve.
         let mut gate = 0;
         assert_eq!(aster_gate_new(rt, &mut gate), OK);
@@ -539,6 +603,11 @@ fn config_driven_server_issues_renews_and_follows_revocation() {
             aster_enrollment_error_t::ASTER_ENROLLMENT_ERROR_DENIED as u32
         );
         assert!(claims(rt, server, public(7)).is_none());
+        // The session ended, and the restriction with it.
+        assert_eq!(
+            restrict(&enrolled_peer, "ops.status"),
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
 
         // Releasing an enrollment ends a pending revocation wait.
         let mut op = 0;

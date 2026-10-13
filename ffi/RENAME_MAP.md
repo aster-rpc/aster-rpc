@@ -1,6 +1,6 @@
 # C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x changelog (current: 5.1)
 
-## New in 5.1 (Enrollment from configuration, lease grantor; additive)
+## New in 5.1 (Enrollment from configuration, lease grantor, role restriction; additive)
 
 Enrollment reaches the C ABI the way it reaches the Rust `AsterServer` /
 `AsterClient`: from the resolved configuration (`[trust]` + `[enrollment]`,
@@ -29,6 +29,9 @@ whose `flags` carry an `aster_enrollment_error_t` (`NOT_ADMITTED` 1, `DENIED`
 | `aster_enrollment_free(rt, e)` | Release early (pending revocation waits end `ALREADY_CLOSED`). |
 | `aster_server_add_lease_grantor(builder, serializer, requires_json, revoke_requires_json)` | Serve `aster.lease.Grantor` over a lease serializer handle (foreign or memory). Requirements are `CapabilityRequirement` JSON; empty `revoke_requires_json` = the `operator` role, `null` = none. |
 | `aster_lease_serializer_grantor_new(rt, node, connection, *out)` | A serializer backed by a remote grantor over an `aster/1` connection (`GrantorSerializer`); acquire with holder = the node's id. |
+| `aster_server_restrict_peer_roles(server, peer, peer_len, roles, roles_len)` | Narrow an enrolled peer's roles to `roles` (comma-separated UTF-8; empty = none) ∩ its credential roles, from its next call. The credential sets the maximum: a role it lacks is never granted. Replaces an earlier restriction; ends with the peer's enrollment session (revocation, eviction, expiry), survives renewals. `NOT_FOUND` for an unknown server or a peer without a live enrollment session. |
+| `aster_server_clear_peer_restriction(server, peer, peer_len)` | Remove the restriction; the credential roles apply from the next call. `OK` whether or not one was set. |
+| `aster_server_set_peer_attributes` (behaviour change) | For a peer with a live enrollment session, a k/v list carrying `aster.role` is refused with `INVALID_ARGUMENT` (use `aster_server_restrict_peer_roles`); a stored `aster.role` never applies while a peer has a session. Other keys apply as before (the credential's attributes win on a clash). Peers without a session (no enrollment, custom gate) are unchanged. |
 
 Behaviour change: `aster_gate_new`'s default admission ALPNs are
 `aster.producer_admission` and `aster.admission`; the retired

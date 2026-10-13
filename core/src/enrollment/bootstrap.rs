@@ -207,6 +207,10 @@ impl std::error::Error for AdmissionError {}
 #[derive(Clone)]
 struct Session {
     generation: u64,
+    /// Stable across renewals of the same subject while the session lives:
+    /// the generation that started it. A session that ended (revoked,
+    /// evicted, expired) starts a new lineage when the peer is admitted again.
+    lineage: u64,
     evidence: VerifiedAdmissionEvidence,
     /// Connections registered with `track_connection`.
     connections: Vec<CoreConnection>,
@@ -1690,14 +1694,24 @@ impl EnrollmentService {
                 value.checked_add(1)
             })
             .map_err(|_| anyhow!("admission generation exhausted"))?;
-        let (connections, admitted) = sessions
-            .remove(&peer)
+        let previous = sessions.remove(&peer);
+        let lineage = previous
+            .as_ref()
+            .filter(|session| {
+                session
+                    .evidence
+                    .expires_at()
+                    .is_none_or(|exp| unix_now() < exp)
+            })
+            .map_or(generation, |session| session.lineage);
+        let (connections, admitted) = previous
             .map(|session| (session.connections, session.admitted))
             .unwrap_or_default();
         sessions.insert(
             peer,
             Session {
                 generation,
+                lineage,
                 evidence,
                 connections,
                 admitted,
@@ -2083,6 +2097,15 @@ impl EnrollmentService {
     /// [`Self::check_peer`] first to re-evaluate it against current policy.
     pub fn peer_evidence(&self, peer: &[u8; 32]) -> Option<VerifiedAdmissionEvidence> {
         self.session(peer).map(|session| session.evidence)
+    }
+
+    /// [`Self::peer_evidence`] with the session's lineage: an id that stays
+    /// the same while `peer`'s session is renewed in place and changes once
+    /// the session ends (revocation, eviction, expiry) and the peer is
+    /// admitted again. Consumers key per-session state to it.
+    pub fn peer_session(&self, peer: &[u8; 32]) -> Option<(u64, VerifiedAdmissionEvidence)> {
+        self.session(peer)
+            .map(|session| (session.lineage, session.evidence))
     }
 
     /// Evaluate a session's evidence at `source`. When a newer root record

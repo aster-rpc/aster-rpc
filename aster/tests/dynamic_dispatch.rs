@@ -1081,7 +1081,9 @@ async fn gate3_and_frame_limits_apply_to_foreign_methods() {
     // `requires` is enforced in Rust before the binding sees anything.
     let (code, _) = rpc_code(within(conn.unary(&echo("admin"), vec![1])).await);
     assert_eq!(code, StatusCode::PermissionDenied.as_i32());
-    srv.attributes().set_role(client.id().as_str(), "admin");
+    srv.attributes()
+        .set_role(client.id().as_str(), "admin")
+        .unwrap();
     let out = within(conn.unary(&echo("admin"), vec![1])).await.unwrap();
     assert_eq!(out, b"admin", "the binding sees the attributes Gate 3 saw");
 

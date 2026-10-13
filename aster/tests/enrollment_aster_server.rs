@@ -12,7 +12,8 @@ use aster::delegation::{issue_delegation, Chain, DelegationGrant, LinkKind, Vali
 use aster::enrollment::*;
 use aster::rpc::{
     require_any_of, require_role, AsterClient, AsterServer, Call, CapabilityRequirement,
-    RpcConnection, RpcStatus, SerializationMode, ServiceDispatch, StatusCode, StreamHeader,
+    RoleChangeError, RpcConnection, RpcStatus, SerializationMode, ServiceDispatch, StatusCode,
+    StreamHeader,
 };
 use aster::{
     AsterConfig, Credential, Doc, EnrollmentConfig, EnrollmentLimits, Node, PublicKey, RelayMode,
@@ -382,6 +383,118 @@ async fn credential_roles_gate_requires_and_root_revocation_closes_the_connectio
     .unwrap();
 }
 
+/// The credential sets the maximum; runtime settings can only restrict
+/// (design §15.6). A credential granting `ops.status,ops.logs` restricted to
+/// `ops.status` refuses `logs` on the next call; an empty restriction refuses
+/// every gated method; neither `set_role` nor a restriction can grant a role
+/// the credential lacks; clearing restores the credential roles; and a
+/// revocation ends the session and the restriction with it.
+#[tokio::test]
+async fn runtime_restriction_narrows_credential_roles() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let server = start_server(
+            server_base()
+                .enrollment(server_enrollment(&root, files.path()))
+                .build(),
+        )
+        .await
+        .unwrap();
+        let client = connect(
+            &server,
+            client_config(&root, 5, credential(5, Some("ops.status,ops.logs"))),
+        )
+        .await
+        .unwrap();
+        let rpc = client.rpc();
+        let peer = hex::encode(public(5));
+        let attributes = server.attributes();
+        assert_eq!(call(&rpc, "logs").await.unwrap(), "ops.logs,ops.status");
+
+        // Restrict to `ops.status`: `logs` is refused from the next call.
+        attributes.restrict_roles(&peer, ["ops.status"]).unwrap();
+        assert_eq!(call(&rpc, "status").await.unwrap(), "ops.status");
+        assert!(denied(&call(&rpc, "logs").await));
+
+        // Restrict to nothing: every gated method is refused.
+        attributes
+            .restrict_roles(&peer, Vec::<String>::new())
+            .unwrap();
+        assert_eq!(call(&rpc, "ping").await.unwrap(), "");
+        assert!(denied(&call(&rpc, "status").await));
+        assert!(denied(&call(&rpc, "logs").await));
+
+        // A runtime grant of a role the credential lacks is refused outright,
+        // and a restriction naming it grants nothing.
+        assert_eq!(
+            attributes.set_role(&peer, "ops.admin"),
+            Err(RoleChangeError::CredentialOwnsRoles(peer.clone()))
+        );
+        attributes.restrict_roles(&peer, ["ops.admin"]).unwrap();
+        assert!(denied(&call(&rpc, "logs").await));
+
+        // Clearing restores the credential roles.
+        assert!(attributes.clear_restriction(&peer));
+        assert_eq!(call(&rpc, "logs").await.unwrap(), "ops.logs,ops.status");
+
+        // A revocation ends the session, and the restriction with it.
+        attributes.restrict_roles(&peer, ["ops.status"]).unwrap();
+        let mut revoked = server.enrollment().unwrap().revocations();
+        root.enrollment.connect(server.node().addr()).await.unwrap();
+        root.revoke(public(5)).await;
+        root.fleet
+            .sync_with_timeout(&[server.id()], Duration::from_secs(15))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while revoked.recv().await.unwrap().peer != public(5) {}
+        })
+        .await
+        .expect("the server revokes the client");
+        assert_eq!(attributes.restricted_roles(&peer), None);
+        assert_eq!(
+            attributes.restrict_roles(&peer, ["ops.status"]),
+            Err(RoleChangeError::NotEnrolled(peer.clone()))
+        );
+
+        client.close().await;
+        server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Without enrollment there is no credential to bound the roles: the
+/// application's runtime attributes grant them exactly as before, and a
+/// restriction is refused because there is no session to restrict.
+#[tokio::test]
+async fn runtime_roles_still_grant_without_enrollment() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let server = start_server(base(2).build()).await.unwrap();
+        let client = AsterClient::builder()
+            .config(base(9).build())
+            .address(server.address().unwrap())
+            .connect()
+            .await
+            .unwrap();
+        let rpc = client.rpc();
+        let peer = client.node().id().to_string();
+        assert!(denied(&call(&rpc, "status").await));
+        server.attributes().set_role(&peer, "ops.status").unwrap();
+        assert_eq!(call(&rpc, "status").await.unwrap(), "ops.status");
+        assert_eq!(
+            server.attributes().restrict_roles(&peer, ["ops.status"]),
+            Err(RoleChangeError::NotEnrolled(peer.clone()))
+        );
+        client.close().await;
+        server.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
 /// A server configured as a delegated issuer serves renewals; a client whose
 /// credential that server signed renews automatically and stays admitted, and
 /// its roles keep working, across several short lifetimes. The server syncs
@@ -434,7 +547,7 @@ async fn config_driven_issuer_renews_client_credentials() {
         let issued = issuer
             .issue_for(
                 &public(7),
-                role_claims(Some("ops.status")),
+                role_claims(Some("ops.status,ops.logs")),
                 Registration::Ephemeral,
             )
             .unwrap()
@@ -444,9 +557,16 @@ async fn config_driven_issuer_renews_client_credentials() {
             .await
             .unwrap();
         assert!(client.is_renewing(), "the server signed it, so it renews");
+        // A restriction belongs to the session, so it survives renewals of
+        // the same subject.
+        server
+            .attributes()
+            .restrict_roles(&hex::encode(public(7)), ["ops.status"])
+            .unwrap();
         let deadline = now() + 3 * 6 + 2;
         while now() < deadline {
             assert_eq!(call(&client.rpc(), "status").await.unwrap(), "ops.status");
+            assert!(denied(&call(&client.rpc(), "logs").await));
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         let (current, _) = client.enrollment().unwrap().credential().unwrap();

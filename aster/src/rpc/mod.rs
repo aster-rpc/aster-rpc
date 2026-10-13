@@ -49,7 +49,8 @@ pub mod publish;
 pub use aster_client::{AsterClient, AsterClientBuilder};
 pub use auth::{
     require_all_of, require_any_of, require_role, AttributeSource, AttributeStore, AuthContext,
-    AuthOutcome, Authenticator, CapabilityKind, CapabilityRequirement, ROLE_ATTRIBUTE,
+    AuthOutcome, Authenticator, CapabilityKind, CapabilityRequirement, RoleChangeError,
+    SourcedAttributes, ROLE_ATTRIBUTE,
 };
 pub use client::{
     BidiSink, CallOptions, RequestSink, ResponseFuture, ResponseStream, RpcConnection, RpcSession,
