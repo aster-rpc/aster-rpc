@@ -1017,3 +1017,104 @@ async fn definite_denial_closes_every_gate_admitted_connection() {
     .await
     .expect("close-on-deny test timed out");
 }
+
+/// INV-E12: a node restarted from a copied state directory starts with
+/// unknown freshness. A freshness-sensitive policy denies until it syncs; a
+/// stale-tolerant one admits on the restored cache, and the first sync
+/// enforces a revocation published after the snapshot.
+#[tokio::test]
+async fn restored_state_starts_with_unknown_freshness_until_first_sync() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let files = tempfile::tempdir().unwrap();
+        let root = node(1).await;
+        let doc = root.docs().create().await.unwrap();
+        let namespace: [u8; 32] = hex::decode(doc.id().unwrap().to_string())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let root_enroll = enrollment(
+            &root,
+            namespace,
+            &files.path().join("root.json"),
+            Some(token(1)),
+        );
+        root_enroll.set_policy_document(&doc).unwrap();
+        let _root_connections = serve(root.clone(), root_enroll);
+
+        let state = files.path().join("verifier.json");
+        let verifier = node(3).await;
+        let verifier_enroll = enrollment(&verifier, namespace, &state, Some(token(3)));
+        sync(&verifier_enroll, root.addr()).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while verifier_enroll
+                .check_peer(&public(1))
+                .await
+                .map_or(true, |ready| ready.policy_sync.is_none())
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("verifier never recorded a policy sync");
+        verifier.shutdown().await;
+        drop(verifier_enroll);
+        let restored = files.path().join("restored.json");
+        std::fs::copy(&state, &restored).unwrap();
+
+        // Published after the snapshot was taken.
+        write(
+            &root,
+            &doc,
+            &registration(6, 1, NodeRegistrationStatus::Revoked),
+        )
+        .await;
+
+        let verifier = node(3).await;
+        let verifier_enroll = enrollment(&verifier, namespace, &restored, Some(token(3)));
+        let mut inbound = serve_untracked(verifier.clone(), verifier_enroll.clone());
+        let peer = node(6).await;
+        let peer_enroll = enrollment(
+            &peer,
+            namespace,
+            &files.path().join("peer.json"),
+            Some(token(6)),
+        );
+        peer_enroll.connect(verifier.addr()).await.unwrap();
+        let ready = verifier_enroll.check_peer(&public(6)).await.unwrap();
+        assert!(ready.policy_sync.is_none(), "freshness survived restart");
+
+        peer.add_peer(&verifier).unwrap();
+        let _outbound = peer.connect(&verifier.id(), NORMAL).await.unwrap();
+        let connection = inbound.recv().await.unwrap();
+        let fresh = PolicyExpressionV1::Predicate(PolicyPredicate::PolicySynchronizedWithin {
+            max_age: Duration::from_secs(3600),
+            require_root: false,
+        });
+        assert!(verifier_enroll
+            .check_connection_with_policy(&connection, &fresh, Duration::from_secs(2))
+            .await
+            .is_err());
+        assert!(verifier_enroll.check_connection(&connection).await.is_ok());
+
+        sync(&verifier_enroll, root.addr()).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                verifier_enroll.reconcile().await;
+                if matches!(
+                    verifier_enroll.check_peer(&public(6)).await,
+                    Err(AdmissionError::Denied(DenialReason::NodeRevoked))
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("revocation published after the snapshot was not enforced");
+        peer.shutdown().await;
+        verifier.shutdown().await;
+        root.shutdown().await;
+    })
+    .await
+    .expect("restart freshness test timed out");
+}

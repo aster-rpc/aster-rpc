@@ -15,8 +15,8 @@ pub use crate::delegation::{
 pub const MAX_JWT_BYTES: usize = 16 * 1024;
 /// Default tolerance for a signer's clock running ahead of the verifier.
 /// It applies only to activation (`iat`, `nbf`); expiry is never extended.
-pub const DEFAULT_ACTIVATION_LEEWAY_SECONDS: u64 = 60;
-pub const MAX_ACTIVATION_LEEWAY_SECONDS: u64 = 300;
+pub const DEFAULT_ACTIVATION_LEEWAY_SECONDS: u64 = crate::delegation::DEFAULT_LEEWAY_SECONDS;
+pub const MAX_ACTIVATION_LEEWAY_SECONDS: u64 = crate::delegation::MAX_LEEWAY_SECONDS;
 
 /// Signed validity of one statement at a verifier's trusted time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

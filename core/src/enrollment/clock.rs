@@ -62,4 +62,13 @@ mod tests {
         );
         assert_eq!(from_adjtimex(-1, 0), ClockSynchronization::NotChecked);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_query_reads_kernel_status_without_privilege() {
+        assert_ne!(
+            local_clock_synchronization(),
+            ClockSynchronization::NotChecked
+        );
+    }
 }
