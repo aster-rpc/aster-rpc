@@ -66,6 +66,15 @@ type ServerOptions struct {
 	// (default: the logger set with SetLogger, else slog.Default()). Rust log
 	// records go to SetLogger's logger.
 	Logger *slog.Logger
+	// Enrollment, if set, makes Enrollment the node's admission instead of a
+	// Gate (C ABI 5.1; incompatible with Gate): only peers that complete the
+	// enrollment handshake reach aster/1, and the server answers inbound
+	// handshakes. Reach it with AsterServer.Enrollment.
+	Enrollment *EnrollmentConfig
+	// EnrollmentIssuer, with Enrollment, makes the node a delegated issuer
+	// and serves aster.enrollment.IssuerV1 renewals. Reach it with
+	// AsterServer.EnrollmentIssuer.
+	EnrollmentIssuer *IssuerConfig
 	// Health, if set, starts an ops listener (/healthz, /readyz, /metrics)
 	// for the server's node and ties its readiness to the server: ready once
 	// the server serves, not ready first on Close. Reach it with
@@ -96,6 +105,7 @@ type AsterServer struct {
 	onNonRPC  func(string, *Connection)
 	logger    *slog.Logger
 	health    *HealthServer
+	issuer    *EnrollmentIssuer
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -148,8 +158,14 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		}
 	}
 
+	if opts.EnrollmentIssuer != nil && opts.Enrollment == nil {
+		return nil, fmt.Errorf("EnrollmentIssuer needs Enrollment: %w", ErrInvalidArgument)
+	}
+	if opts.Enrollment != nil && opts.Gate != nil {
+		return nil, fmt.Errorf("Enrollment and Gate both decide admission; set one: %w", ErrInvalidArgument)
+	}
 	gate, owned := opts.Gate, false
-	if gate == nil {
+	if gate == nil && opts.Enrollment == nil {
 		var err error
 		if gate, err = NewGate(nil); err != nil {
 			return nil, err
@@ -170,9 +186,16 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		}
 		return nil, err
 	}
-	node, err := StartNode(ctx, opts.Config, NodeOptions{Gate: gate, ExtraALPNs: []string{AsterALPN, ConsumerAdmissionALPN}})
+	node, err := StartNode(ctx, opts.Config, NodeOptions{Gate: gate, ExtraALPNs: []string{AsterALPN, ConsumerAdmissionALPN}, Enrollment: opts.Enrollment})
 	if err != nil {
 		return fail(err)
+	}
+	var issuer *EnrollmentIssuer
+	if opts.EnrollmentIssuer != nil {
+		if issuer, err = node.Enrollment().NewIssuer(*opts.EnrollmentIssuer); err != nil {
+			_ = node.Close()
+			return fail(err)
+		}
 	}
 	EnsureObservability()
 	var health *HealthServer
@@ -192,6 +215,8 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		topology:            opts.Topology,
 		topologyRequirement: opts.TopologyRequirement,
 		ringCapacity:        opts.RingCapacity,
+		enrollment:          node.Enrollment(),
+		issuer:              issuer,
 	}
 	if opts.MaxSessionsPerConnection > 0 {
 		settings.maxSessionsPerConnection = uint64(opts.MaxSessionsPerConnection)
@@ -217,7 +242,7 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 	}
 	sctx, cancel := context.WithCancel(context.Background())
 	s := &AsterServer{
-		node: node, gate: gate, ownedGate: owned, ds: ds, codec: codec,
+		node: node, gate: gate, ownedGate: owned, ds: ds, codec: codec, issuer: issuer,
 		byIndex: append([]*Service(nil), opts.Services...), icpts: opts.Interceptors,
 		onClosed: opts.OnConnectionClosed, onNonRPC: opts.OnNonRPC,
 		logger: logger, health: health, ctx: sctx, cancel: cancel,
@@ -236,8 +261,14 @@ func (s *AsterServer) Health() *HealthServer { return s.health }
 func (s *AsterServer) Node() *Node { return s.node }
 
 // Gate is the Gate-0 policy guarding the node (admit peers on it unless dev
-// mode is on).
+// mode is on); nil when Enrollment decides admission.
 func (s *AsterServer) Gate() *Gate { return s.gate }
+
+// Enrollment is the node's Enrollment (ServerOptions.Enrollment), or nil.
+func (s *AsterServer) Enrollment() *Enrollment { return s.node.Enrollment() }
+
+// EnrollmentIssuer is the delegated issuer (ServerOptions.EnrollmentIssuer), or nil.
+func (s *AsterServer) EnrollmentIssuer() *EnrollmentIssuer { return s.issuer }
 
 // NodeID is the server's node id (64 hex).
 func (s *AsterServer) NodeID() (string, error) { return s.node.NodeID() }

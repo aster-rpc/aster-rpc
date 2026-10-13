@@ -175,9 +175,13 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if ASTER_EVENT_TOPOLOGY_SNAPSHOT != 120 {
 		t.Error("topology snapshot event drifted from header")
 	}
-	// ABI 5.0 removed only the attestation functions; everything else of 4.17 remains.
-	if _, minor, _ := Version(); minor < ABIMinorRequired || ABIMinorRequired != 0 {
-		t.Errorf("library ABI minor %d, binding needs >= 0 (floor %d)", minor, ABIMinorRequired)
+	// ABI 5.0 removed only the attestation functions; 5.1 adds Enrollment.
+	if _, minor, _ := Version(); minor < ABIMinorRequired || ABIMinorRequired != 1 {
+		t.Errorf("library ABI minor %d, binding needs >= 1 (floor %d)", minor, ABIMinorRequired)
+	}
+	if ASTER_EVENT_ENROLLMENT_RESULT != 127 || AdmissionErrorNotAdmitted != 1 || AdmissionErrorDenied != 2 ||
+		AdmissionErrorClockSkew != 3 || AdmissionErrorUnavailable != 4 {
+		t.Error("enrollment event/error values drifted from the header")
 	}
 	if ASTER_STATUS_ALREADY_EXISTS != 17 || !errors.Is(wrapError(ASTER_STATUS_ALREADY_EXISTS), ErrAlreadyExists) ||
 		StatusName(17) != "ASTER_STATUS_ALREADY_EXISTS" {

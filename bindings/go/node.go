@@ -63,7 +63,13 @@ type Node struct {
 	// Immutable health-only snapshot; nil identifies a node without source config.
 	healthSettings *nodeHealthSettings
 	admissions     chan *AdmissionRequest
+	// enrollment is set when started with NodeOptions.Enrollment.
+	enrollment *Enrollment
 }
+
+// Enrollment returns the Enrollment installed by NodeOptions.Enrollment (nil
+// otherwise). The node owns it.
+func (n *Node) Enrollment() *Enrollment { return n.enrollment }
 
 // Connections returns a channel that emits AcceptedAster for each
 // incoming Aster connection accepted by this node.
@@ -175,6 +181,9 @@ func (n *Node) Close() error {
 
 	// Remove accept handler so no new connections arrive.
 	n.runtime.removeAcceptHandler(n.handle)
+	if n.enrollment != nil {
+		_ = n.enrollment.Close()
+	}
 	if n.admissions != nil {
 		n.runtime.unregisterInbound(n.handle)
 		n.mu.Lock()

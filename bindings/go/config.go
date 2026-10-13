@@ -11,7 +11,9 @@ package aster
 import "C"
 
 import (
+	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -91,12 +93,20 @@ type AsterConfig struct {
 
 	// AllowAllConsumers opens Gate 0 to every consumer (dev mode): a server's
 	// default gate uses TrustOpenDev.
-	AllowAllConsumers        bool
-	AllowAllProducers        bool
-	RootPubkey               []byte
-	RootPubkeyFile           string
+	AllowAllConsumers bool
+	AllowAllProducers bool
+	// RootPubkey (32 bytes) or RootPubkeyFile (64 hex, or JSON
+	// {"public_key": "<hex>"}) is the deployment root key. Enrollment
+	// (NodeOptions.Enrollment / ServerOptions.Enrollment) trusts it when
+	// EnrollmentConfig.Root is empty. Env ASTER_ROOT_PUBKEY(_FILE); TOML
+	// [trust] root_pubkey(_file).
+	RootPubkey     []byte
+	RootPubkeyFile string
+	// EnrollmentCredentialFile holds this node's enrollment credential (a
+	// delegation chain, aster-chain-v1~...). Enrollment presents it when
+	// EnrollmentConfig.Credential is empty. Env ASTER_ENROLLMENT_CREDENTIAL;
+	// TOML [trust] enrollment_credential.
 	EnrollmentCredentialFile string
-	EnrollmentCredentialIID  string
 	EndpointAddr             string
 	LogFormat                string // "text" or "json"
 	LogLevel                 string
@@ -179,22 +189,48 @@ func ConfigFromTOML(path string) (AsterConfig, error) {
 	return c, nil
 }
 
-// ResolveRootPubkey returns RootPubkey, else the 64-hex key in RootPubkeyFile.
+// ResolveRootPubkey returns RootPubkey, else the key in RootPubkeyFile, or nil
+// when neither yields a 32-byte key (RootKey reports why).
 func (c *AsterConfig) ResolveRootPubkey() []byte {
-	if c.RootPubkey != nil {
-		return c.RootPubkey
-	}
-	if c.RootPubkeyFile == "" {
-		return nil
-	}
-	data, err := os.ReadFile(c.RootPubkeyFile)
+	key, err := c.RootKey()
 	if err != nil {
 		return nil
 	}
-	if b, err := hex.DecodeString(strings.TrimSpace(string(data))); err == nil && len(b) == 32 {
-		return b
+	return key
+}
+
+// RootKey returns the configured root public key: RootPubkey, else the key in
+// RootPubkeyFile (64 hex, or JSON {"public_key": "<hex>"}, as the Rust config
+// reads it); nil when neither is set. When both are set they must agree.
+func (c *AsterConfig) RootKey() ([]byte, error) {
+	if c.RootPubkey != nil && len(c.RootPubkey) != 32 {
+		return nil, fmt.Errorf("RootPubkey: %d bytes, want 32: %w", len(c.RootPubkey), ErrInvalidArgument)
 	}
-	return nil
+	if c.RootPubkeyFile == "" {
+		return c.RootPubkey, nil
+	}
+	data, err := os.ReadFile(c.RootPubkeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("RootPubkeyFile: %w", err)
+	}
+	text := strings.TrimSpace(string(data))
+	if strings.HasPrefix(text, "{") {
+		var wrapped struct {
+			PublicKey string `json:"public_key"`
+		}
+		if err := json.Unmarshal([]byte(text), &wrapped); err != nil {
+			return nil, fmt.Errorf("RootPubkeyFile %s: %w", c.RootPubkeyFile, err)
+		}
+		text = wrapped.PublicKey
+	}
+	key, err := hex.DecodeString(text)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("RootPubkeyFile %s: want a 64-hex key: %w", c.RootPubkeyFile, ErrInvalidArgument)
+	}
+	if c.RootPubkey != nil && !bytes.Equal(c.RootPubkey, key) {
+		return nil, fmt.Errorf("RootPubkey and RootPubkeyFile %s hold different keys: %w", c.RootPubkeyFile, ErrInvalidArgument)
+	}
+	return key, nil
 }
 
 // String redacts the secret key.
@@ -373,12 +409,11 @@ func (c *AsterConfig) fromNative(n *C.aster_config_t) {
 
 type tomlBinding struct {
 	Trust struct {
-		RootPubkey              string `toml:"root_pubkey"`
-		RootPubkeyFile          string `toml:"root_pubkey_file"`
-		EnrollmentCredential    string `toml:"enrollment_credential"`
-		EnrollmentCredentialIID string `toml:"enrollment_credential_iid"`
-		AllowAllConsumers       *bool  `toml:"allow_all_consumers"`
-		AllowAllProducers       *bool  `toml:"allow_all_producers"`
+		RootPubkey           string `toml:"root_pubkey"`
+		RootPubkeyFile       string `toml:"root_pubkey_file"`
+		EnrollmentCredential string `toml:"enrollment_credential"`
+		AllowAllConsumers    *bool  `toml:"allow_all_consumers"`
+		AllowAllProducers    *bool  `toml:"allow_all_producers"`
 	} `toml:"trust"`
 	Connect struct {
 		EndpointAddr string `toml:"endpoint_addr"`
@@ -407,12 +442,11 @@ func (c *AsterConfig) applyBindingTOML(path string) error {
 	}
 	setStr(&c.RootPubkeyFile, tc.Trust.RootPubkeyFile)
 	setStr(&c.EnrollmentCredentialFile, tc.Trust.EnrollmentCredential)
-	setStr(&c.EnrollmentCredentialIID, tc.Trust.EnrollmentCredentialIID)
 	setStr(&c.EndpointAddr, tc.Connect.EndpointAddr)
 	if tc.Trust.RootPubkey != "" {
 		b, err := hex.DecodeString(tc.Trust.RootPubkey)
-		if err != nil {
-			return fmt.Errorf("%s: trust.root_pubkey: %w", path, err)
+		if err != nil || len(b) != 32 {
+			return fmt.Errorf("%s: trust.root_pubkey: want 64 hex characters: %w", path, ErrInvalidArgument)
 		}
 		c.RootPubkey = b
 	}
@@ -461,13 +495,14 @@ func (c *AsterConfig) applyBindingEnv() error {
 		}
 	}
 	if v := env("ASTER_ROOT_PUBKEY"); v != "" {
-		if b, err := hex.DecodeString(v); err == nil {
-			c.RootPubkey = b
+		b, err := hex.DecodeString(v)
+		if err != nil || len(b) != 32 {
+			return fmt.Errorf("ASTER_ROOT_PUBKEY: want 64 hex characters: %w", ErrInvalidArgument)
 		}
+		c.RootPubkey = b
 	}
 	setStr(&c.RootPubkeyFile, "ASTER_ROOT_PUBKEY_FILE")
 	setStr(&c.EnrollmentCredentialFile, "ASTER_ENROLLMENT_CREDENTIAL")
-	setStr(&c.EnrollmentCredentialIID, "ASTER_ENROLLMENT_CREDENTIAL_IID")
 	setStr(&c.EndpointAddr, "ASTER_ENDPOINT_ADDR")
 	envBool("ASTER_ALLOW_ALL_CONSUMERS", &c.AllowAllConsumers)
 	envBool("ASTER_ALLOW_ALL_PRODUCERS", &c.AllowAllProducers)

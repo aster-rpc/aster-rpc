@@ -40,6 +40,12 @@ type NodeOptions struct {
 	// AdmissionBuffer sizes the Admissions channel (default 64). A request
 	// that does not fit is allowed immediately.
 	AdmissionBuffer int
+	// Enrollment installs Enrollment as the node's admission (C ABI 5.1):
+	// the node starts with fail-closed hooks and EnrollmentALPN, and
+	// Node.Enrollment returns it. Incompatible with Gate. Inbound enrollment
+	// handshakes are served by a server (ServerOptions.Enrollment); a node
+	// started this way without one only dials.
+	Enrollment *EnrollmentConfig
 }
 
 // StartNode starts a node from cfg through the Rust aster::Node::start
@@ -67,6 +73,15 @@ func StartNode(ctx context.Context, cfg AsterConfig, opts NodeOptions) (*Node, e
 }
 
 func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOptions) (*Node, error) {
+	if opts.Enrollment != nil {
+		if opts.Gate != nil {
+			return nil, fmt.Errorf("NodeOptions: Enrollment and Gate both decide admission; set one: %w", ErrInvalidArgument)
+		}
+		// Enrollment decides admission; the node must fail closed while it does.
+		cfg.EnableHooks = true
+		cfg.HookFailureMode = HookFailClosed
+		opts.ExtraALPNs = append(append([]string{}, opts.ExtraALPNs...), EnrollmentALPN)
+	}
 	healthSettings := &nodeHealthSettings{host: cfg.HealthHost, port: cfg.HealthPort, enabled: cfg.IsHealthEnabled()}
 	var a cArena
 	defer a.free()
@@ -99,6 +114,18 @@ func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOpt
 		healthSettings: healthSettings,
 	}
 	rt.registerAcceptHandler(n.handle, n)
+	if opts.Enrollment != nil {
+		// No Admissions channel: until install, unanswered hooks time out
+		// into the fail-closed mode; after it, Rust forwards them to Enrollment.
+		e, err := installEnrollment(n, opts.Enrollment, cfg)
+		if err != nil {
+			n.ownsRuntime = false // StartNode releases the runtime reference
+			_ = n.Close()
+			return nil, err
+		}
+		n.enrollment = e
+		return n, nil
+	}
 	if opts.Gate == nil && cfg.EnableHooks {
 		size := opts.AdmissionBuffer
 		if size <= 0 {

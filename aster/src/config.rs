@@ -74,15 +74,19 @@ pub struct LoadedIdentity {
 /// are persisted there and survive a restart.
 #[derive(Clone, Debug)]
 pub struct AsterConfig {
-    /// 32-byte Ed25519 root public key for the deployment mesh.
+    /// 32-byte Ed25519 root public key for the deployment mesh. Coordination
+    /// pins it; the Go binding's Enrollment install trusts it by default.
+    /// `aster::enrollment::Enrollment::install` takes its root explicitly.
     pub root_pubkey: Option<PublicKey>,
     /// Path to a file containing the root public key as hex or JSON
     /// `{ "public_key": "<hex>" }`.
     pub root_pubkey_file: Option<PathBuf>,
-    /// Path to a JSON enrollment credential signed by the root key.
+    /// Path to this node's enrollment credential (a delegation chain,
+    /// `aster-chain-v1~…`). The Go binding's Enrollment install presents it
+    /// by default; `Enrollment::install` takes the credential explicitly.
     pub enrollment_credential_file: Option<PathBuf>,
-    /// Cloud Instance Identity Document token, when required by credential
-    /// policy.
+    /// Cloud Instance Identity Document token for the legacy Python consumer
+    /// admission. Enrollment does not use it.
     pub enrollment_credential_iid: Option<String>,
     /// Skip the consumer admission gate.
     pub allow_all_consumers: bool,

@@ -90,6 +90,8 @@ type serverSettings struct {
 	setHandlerTimeout        bool
 	ringCapacity             uint32
 	health                   *HealthServer // attached before start (readiness)
+	enrollment               *Enrollment   // routes aster.enrollment/1 (ABI 5.1)
+	issuer                   *EnrollmentIssuer
 }
 
 // startDispatchServer registers every service JSON (in order: the index is
@@ -144,6 +146,21 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 	if s.health != nil {
 		if err := statusError(C.aster_server_attach_health(b, C.uint64_t(s.health.handle))); err != nil {
 			return fail("aster_server_attach_health", err)
+		}
+	}
+	if s.enrollment != nil {
+		eh, err := s.enrollment.live()
+		if err != nil {
+			return fail("aster_server_set_enrollment", err)
+		}
+		ih := uint64(0)
+		if s.issuer != nil {
+			if ih, err = s.issuer.live(); err != nil {
+				return fail("aster_server_set_enrollment", err)
+			}
+		}
+		if err := statusError(C.aster_server_set_enrollment(rt, b, C.aster_enrollment_t(eh), C.aster_enrollment_issuer_t(ih))); err != nil {
+			return fail("aster_server_set_enrollment", err)
 		}
 	}
 	var h C.aster_server_t
