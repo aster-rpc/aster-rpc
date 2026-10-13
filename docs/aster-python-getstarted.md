@@ -292,28 +292,13 @@ Network: `IrohConnection.paths()` lists every open `PathInfo` (`kind`
 `IrohSendStream.set_priority(n)` / `priority()` order send streams on one
 connection (higher first, default 0).
 
-## 7. Attestation, sealed grants, leases and topology
+## 7. Sealed grants, leases and topology
 
-These wrap the Rust SDK's `attestation`, `crypto`, `grants`, `lease` and
-`topology` modules; every wire-defining rule runs in Rust. Value types are
+These wrap the Rust SDK's `crypto`, `grants`, `lease` and `topology`
+modules; every wire-defining rule runs in Rust. Value types are
 frozen dataclasses (vary one with `dataclasses.replace`); durations are
 seconds. Key arguments take a `SecretKey` / `PublicKey` / `NodeId`, 32 bytes,
 or 64 hex characters.
-
-**Attestation** -- a portable, offline-verifiable proof that a root identity
-owns a node:
-
-```python
-from aster import AttestationChain, attest_root_node, verify_chain
-
-chain = attest_root_node(root_secret, node.secret_key(), epoch=1)
-text = chain.to_text()                       # "aster.attestation.chain.v1:..."
-v = verify_chain(AttestationChain.from_text(text), [root_id], node.id)
-v.depth, v.role_of(root_id)                  # 1, "anchor"
-```
-
-`not_before` / `not_after` take unix seconds or a `datetime`; failures raise
-`AttestationError`.
 
 **HPKE keys from identities** -- `hpke_x25519_public_from_node_id(peer_id)`
 gives the recipient key for `hpke_seal`; the peer opens with

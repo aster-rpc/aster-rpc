@@ -2,7 +2,7 @@
 
 `aster` is the first-class Rust API for the Aster peer-to-peer stack: a node with
 content-addressed **blobs**, CRDT **docs**, **gossip**, connection **admission**
-(Gate 0) + ownership **attestations**, and — behind the `rpc` feature — a
+(Gate 0) + root-signed **enrollment** credentials, and — behind the `rpc` feature — a
 **Rust-native RPC framework** (services, clients, streaming, capability checks,
 interceptors, and cross-binding contract publication).
 
@@ -93,18 +93,18 @@ let topic = node.gossip().subscribe(topic_id).await?;
 An Aster identity is a **32-byte Ed25519 secret key**; its public key *is* the
 `NodeId` peers see. If you don't supply one, `Node::start` generates a fresh key
 each boot (a new identity every restart). To control identity yourself — a
-restart-stable node, or an offline **root/vendor** key that signs attestations —
+restart-stable node, or an offline **root/vendor** key that signs enrollment
+credentials —
 mint a key with `SecretKey::generate()`:
 
 ```rust
 use aster::{AsterConfig, Node, SecretKey};
-use aster::attestation::public_key;
 
 # fn demo() -> aster::Result<()> {
 // Fresh random identity (OS CSPRNG). Persist `to_bytes()` to keep it — losing
 // the secret loses the identity; the public key is what others verify against.
 let secret = SecretKey::generate();
-let public = public_key(&secret);        // the NodeId form of this identity
+let public = secret.public_key();        // the NodeId form of this identity
 println!("identity: {}", public.to_hex());
 
 // Restore later from the 32 bytes you stored.
@@ -221,17 +221,25 @@ The ALPNs are exported as `aster::RPC_ALPN` and `aster::alpns::{RPC,
 CONSUMER_ADMISSION, PRODUCER_ADMISSION, DELEGATED_ADMISSION, BLOBS, DOCS,
 GOSSIP}`.
 
-## 3. Admission (Gate 0) and ownership attestations
+## 3. Admission (Gate 0) and enrollment credentials
 
 Use Aster's `Gate0` rather than a separate static allowlist. Built-in
 docs/blobs/gossip ALPNs are always registered; add your admission ALPN(s)
 explicitly and enable hooks.
 
+This needs the `enrollment` feature. For a managed fleet (reciprocal handshake,
+replicated root policy, revocation) use `aster::enrollment::Enrollment::install`
+instead; see `docs/_internal/aster-enrollment-portal-porting-guide.md`. The
+manual loop below shows the moving parts.
+
 ```rust
 use aster::{alpns, AsterConfig, Gate0, Node, PublicKey, RelayMode};
-use aster::attestation::{verify_chain, Chain};
+use aster::enrollment::{verify_connection, JwtEnrollmentVerifier};
 
-# async fn run(root_pub: PublicKey) -> aster::Result<()> {
+# async fn run(root_pub: PublicKey, now: u64) -> aster::Result<()> {
+let verifier = std::sync::Arc::new(
+    JwtEnrollmentVerifier::new(root_pub.to_bytes(), "my-fleet").expect("valid root"),
+);
 let cfg = AsterConfig::builder().relay(RelayMode::Default).hooks(true).build();
 let node = Node::start_with_alpns(cfg, vec![alpns::PRODUCER_ADMISSION.to_vec()]).await?;
 let gate = Gate0::new();
@@ -250,17 +258,17 @@ tokio::spawn(async move {
     }
 });
 
-// 2) Accept loop on the admission ALPN: read the peer's attestation chain,
-//    verify it binds the peer to a trusted anchor, then admit.
+// 2) Accept loop on the admission ALPN: read the peer's enrollment JWT and
+//    verify it was issued by the root for exactly this authenticated peer.
 let srv = node.clone();
 tokio::spawn(async move {
     while let Ok((alpn, conn)) = srv.accept().await {
         if alpn != alpns::PRODUCER_ADMISSION { continue; }
         let (send, recv) = conn.accept_bi().await?;
-        let raw = recv.read_to_end(64 * 1024).await?;        // bound the request
-        let chain = Chain::from_bytes(raw);
-        let expected = PublicKey::from_hex(conn.peer().as_str())?;
-        let ok = verify_chain(&chain, &[root_pub], &expected).is_ok();
+        let raw = recv.read_to_end(16 * 1024).await?;        // bound the request
+        let token = String::from_utf8(raw).unwrap_or_default();
+        // The JWT's subject must be the peer the QUIC handshake authenticated.
+        let ok = verify_connection(&verifier, &token, &conn, now).is_ok();
         if ok { gate.admit(conn.peer()); }
         send.write_all(if ok { b"ok".to_vec() } else { b"no".to_vec() }).await?;
         send.finish().await?;
@@ -276,33 +284,33 @@ tokio::spawn(async move {
 > dropping the connection immediately truncates the peer's read ("closed by
 > peer: 0"). `Connection::closed()` exists for exactly this.
 
-Minting a chain (vendor/root side):
+Issuing a credential (root side; `aster enroll node` does the same from the CLI):
 
 ```rust
 use aster::SecretKey;
-use aster::attestation::{attest_root_node, public_key, AttestOptions};
+use aster::enrollment::{issue_jwt, EnrollmentIssueRequest};
 
-// Mint identities if you don't already have them (§2.1). The root key is your
-// trust anchor — generate it once, keep it offline, persist `to_bytes()`.
-let root_secret = SecretKey::generate();
-let node_secret = SecretKey::generate();
-
-let chain = attest_root_node(&root_secret, &node_secret, &AttestOptions::default())?;
-let text = chain.to_text();                  // "aster.attestation.chain.v1:<base64url>"
-let trusted_anchor = public_key(&root_secret);
+# fn issue(root_secret: &SecretKey, node_public: [u8; 32], now: u64) {
+// The root key is your trust anchor: generate it once, keep it offline,
+// persist `to_bytes()`. The node generates its own key; only its public key
+// reaches the root.
+let mut request = EnrollmentIssueRequest::new(node_public, "my-fleet");
+request.expires_at = Some(now + 7 * 24 * 3600);
+let credential = issue_jwt(root_secret, &request, now).expect("issued");
+let jwt: String = credential.into_jwt();     // hand this to the node
+let trusted_root = root_secret.public_key();  // what verifiers pin
+# }
 ```
 
-`attestation::public_key(&node.export_secret_key()?)` equals `node.id()` — the
-attestation identity *is* the transport identity, so at admission the peer's
-`NodeId` is the value to verify the chain against.
-
-Wire your own versioned envelope for admission rather than raw chain bytes
-long-term (e.g. `portalsync-admission/1 chain=…` → `…-response/1 accepted=true`).
+`node.export_secret_key()?.public_key()` equals `node.id()`: the enrollment
+subject *is* the transport identity, so a stolen JWT is useless on any other
+node. Delegation chains (an online issuer acting for an offline root) are
+designed in `docs/_internal/ownership-attestations.md`.
 
 ### 3.1 Allowlist specific node IDs
 
 When the set of callers is known ahead of time (e.g. only the **root node** from
-your `AsterConfig`, or a fixed list of operators), skip attestation chains and
+your `AsterConfig`, or a fixed list of operators), skip enrollment credentials and
 gate at Gate 0 directly on the peer's node ID. The hook runs **after** the QUIC/
 TLS handshake, so `req.peer` is the peer's TLS-certificate ed25519 key — it is
 cryptographically authenticated and cannot be spoofed. Rejecting here closes the
@@ -635,7 +643,7 @@ let replies = chat.collect().await?;
 
 `#[rpc(requires = …)]` is checked **before** the handler runs, against the
 caller's attributes in the server's `AttributeStore`. Your admission logic
-populates the store (e.g. after verifying the peer's attestation chain). A
+populates the store (e.g. after verifying the peer's enrollment credential). A
 missing capability fails with `PERMISSION_DENIED`.
 
 Give `AsterServer` the store with `.attributes(store)` (or read it back via
@@ -766,7 +774,7 @@ exporters and log-level synchronization.
 | Feature | Default | What it enables |
 |---------|:-------:|-----------------|
 | `blobs` / `docs` / `gossip` | ✅ | the corresponding `Node` accessors |
-| `attestation` | ✅ | ownership-attestation mint/verify |
+| `enrollment` | — | JWT enrollment credentials, root policy and the enrollment handshake |
 | `rpc` | — | the RPC framework (pulls Fory + the proc-macros) |
 | `discovery` / `hooks` | — | Local discovery and admission hooks |
 | `otel` / `health` | — | Observability integration and the health/Prometheus listener |
