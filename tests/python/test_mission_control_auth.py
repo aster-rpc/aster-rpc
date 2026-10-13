@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import os
 import secrets
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,9 +24,15 @@ from aster._aster import _enrollment_test_credential
 from aster.runtime import AdmissionDeniedError
 from aster.status import PermissionDeniedError
 
-from examples.python.mission_control.roles import Role
-from examples.python.mission_control.services_auth import AgentSession, MissionControl
-from examples.python.mission_control.types import (
+# The examples are not a package on the test path (CI runs .venv/bin/pytest,
+# which does not add the working directory), so import them from the repo.
+_REPO = str(Path(__file__).resolve().parents[2])
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+from examples.python.mission_control.roles import Role  # noqa: E402
+from examples.python.mission_control.services_auth import AgentSession, MissionControl  # noqa: E402
+from examples.python.mission_control.types import (  # noqa: E402
     Command,
     LogEntry,
     MetricPoint,
