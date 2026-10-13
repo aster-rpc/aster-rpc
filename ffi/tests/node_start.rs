@@ -312,12 +312,24 @@ fn gate_admit_revoke_and_settings() {
                 rt,
                 gate,
                 bytes(other.as_bytes()),
-                bytes(b"aster.consumer_admission"),
+                bytes(b"aster.producer_admission"),
                 &mut d
             ),
             0
         );
         assert_eq!(d, aster_hook_decision_t::ASTER_HOOK_DECISION_ALLOW as u32);
+        // The retired consumer admission ALPN is not in the default set (5.1).
+        assert_eq!(
+            aster_gate_should_allow(
+                rt,
+                gate,
+                bytes(other.as_bytes()),
+                bytes(b"aster.consumer_admission"),
+                &mut d
+            ),
+            0
+        );
+        assert_eq!(d, aster_hook_decision_t::ASTER_HOOK_DECISION_DENY as u32);
         assert_eq!(
             aster_gate_should_allow(rt, gate, bytes(peer.as_bytes()), bytes(ALPN), &mut d),
             0

@@ -60,4 +60,5 @@ include = [
   "aster_audit_outbox_error_t",
   "aster_topology_separation_t",
   "aster_enrollment_error_t",
+  "aster_enrollment_side_t",
 ]

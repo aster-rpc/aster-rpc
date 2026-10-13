@@ -51,3 +51,14 @@ pub mod provisioning;
 /// handles over `expose::relay_request_streaming`.
 #[cfg(feature = "expose")]
 pub mod relay;
+
+/// Enrollment from `AsterConfig`, for bindings that start their own node (the
+/// C ABI): the same validation ([`enrollment::plan`]), install and server /
+/// client sequences `AsterServer` and `AsterClient` run, so no binding
+/// re-implements them.
+#[cfg(all(feature = "enrollment", feature = "rpc", feature = "docs"))]
+pub mod enrollment {
+    pub use crate::enrollment::runtime::{
+        plan, serve_inbound_enrollment, Installed, Overrides, Plan, Side,
+    };
+}

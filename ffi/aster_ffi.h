@@ -582,7 +582,7 @@ typedef enum aster_event_kind_t {
   ASTER_EVENT_RAW_WT_ACKED = 126,
   /**
    * ABI 5.1: an Enrollment operation's JSON result (payload); `handle` =
-   * the enrollment or renewal it ran on.
+   * the enrollment it ran on.
    */
   ASTER_EVENT_ENROLLMENT_RESULT = 127,
 } aster_event_kind_t;
@@ -908,8 +908,7 @@ typedef enum aster_dispatch_event_kind_t {
    */
   ASTER_DISPATCH_EVENT_CONNECTION_CLOSED = 5,
   /**
-   * A connection on a non-RPC ALPN that no Rust handler claimed (frozen
-   * consumer admission). `request` = the ALPN; `connection_handle` is
+   * A connection on a non-RPC ALPN that no Rust handler claimed. `request` = the ALPN; `connection_handle` is
    * **owned** by the binding (free it with `aster_connection_free`).
    */
   ASTER_DISPATCH_EVENT_NON_RPC = 6,
@@ -1478,6 +1477,22 @@ typedef enum aster_enrollment_error_t {
   ASTER_ENROLLMENT_ERROR_UNAVAILABLE = 4,
 } aster_enrollment_error_t;
 
+/**
+ * `side` of `aster_node_start_enrolled`.
+ */
+typedef enum aster_enrollment_side_t {
+  /**
+   * A server: durable state required; may run a delegated issuer;
+   * `aster_server_start` on the node attaches policy and renews.
+   */
+  ASTER_ENROLLMENT_SIDE_SERVER = 0,
+  /**
+   * A client: state may be temporary; enrolls per server with
+   * `aster_enrollment_enroll`; serves inbound enrollment handshakes.
+   */
+  ASTER_ENROLLMENT_SIDE_CLIENT = 1,
+} aster_enrollment_side_t;
+
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
   uint32_t worker_threads;
@@ -1769,19 +1784,129 @@ typedef struct aster_path_list_t {
 } aster_path_list_t;
 
 /**
- * An installed Enrollment (`aster_enrollment_install`), scoped to a runtime.
+ * Node configuration: every knob of `aster::AsterConfig` that a node uses
+ * (docs/aster-rust-getstarted.md §2.2). Start from `aster_config_init` (or
+ * `aster_config_from_env` / `aster_config_from_toml`), then set fields. See
+ * the module docs for ownership.
+ */
+typedef struct aster_config_t {
+  /**
+   * `sizeof(aster_config_t)`; checked by every function that reads it.
+   */
+  uint32_t struct_size;
+  /**
+   * One of `aster_relay_mode_t`. `ASTER_RELAY_MODE_CUSTOM` needs
+   * `relay_urls`; non-empty `relay_urls` with `DEFAULT` selects `CUSTOM`.
+   */
+  uint32_t relay_mode;
+  /**
+   * Relay URLs (UTF-8) for `ASTER_RELAY_MODE_CUSTOM`.
+   */
+  struct aster_bytes_list_t relay_urls;
+  /**
+   * Inline secret key: exactly 32 raw bytes, or empty for none.
+   */
+  struct aster_bytes_t secret_key;
+  /**
+   * Secret key file (64 hex chars): loaded if it exists, else created from
+   * `secret_key` or a fresh key (mode 0600) at start.
+   */
+  struct aster_bytes_t secret_key_file;
+  /**
+   * Persistent data directory; empty = in-memory node.
+   */
+  struct aster_bytes_t storage_path;
+  /**
+   * Blob GC interval in ms; 0 = no GC.
+   */
+  uint64_t gc_interval_ms;
+  /**
+   * Local bind address, e.g. `127.0.0.1:0`; empty = transport default.
+   */
+  struct aster_bytes_t bind_addr;
+  /**
+   * Extra inbound ALPNs (e.g. `aster/1`) next to blobs/docs/gossip.
+   */
+  struct aster_bytes_list_t alpns;
+  /**
+   * `.aster-identity` credential file (carried for round-trips; not used
+   * by `aster_node_start`).
+   */
+  struct aster_bytes_t identity_file;
+  /**
+   * HTTP/SOCKS proxy URL; empty = none.
+   */
+  struct aster_bytes_t proxy_url;
+  /**
+   * Admission hook timeout in ms; 0 = default (5000).
+   */
+  uint64_t hook_timeout_ms;
+  /**
+   * One of `aster_hook_failure_mode_t`.
+   */
+  uint32_t hook_failure_mode;
+  /**
+   * 1 = raise admission events (forced on when a gate is attached).
+   */
+  uint32_t enable_hooks;
+  uint32_t enable_monitoring;
+  /**
+   * mDNS local discovery.
+   */
+  uint32_t local_discovery;
+  /**
+   * 1 = relay-only.
+   */
+  uint32_t clear_ip_transports;
+  /**
+   * 1 = direct-only.
+   */
+  uint32_t clear_relay_transports;
+  /**
+   * One of `aster_portmapper_t`.
+   */
+  uint32_t portmapper;
+  /**
+   * 1 = read `HTTP(S)_PROXY`.
+   */
+  uint32_t proxy_from_env;
+  /**
+   * Bitmask of `ASTER_TRANSPORT_*`: which `transport_*` fields are set.
+   */
+  uint32_t transport_set;
+  /**
+   * Initial QUIC MTU (≤ 65535).
+   */
+  uint32_t transport_initial_mtu;
+  /**
+   * Bool (0/1).
+   */
+  uint32_t transport_send_fairness;
+  /**
+   * Bool (0/1).
+   */
+  uint32_t transport_enable_segmentation_offload;
+  uint64_t transport_max_concurrent_bidi_streams;
+  uint64_t transport_max_concurrent_uni_streams;
+  uint64_t transport_stream_receive_window;
+  uint64_t transport_receive_window;
+  uint64_t transport_send_window;
+  uint64_t transport_max_idle_timeout_ms;
+  uint64_t transport_keep_alive_interval_ms;
+  uint64_t transport_datagram_receive_buffer_size;
+  uint64_t transport_datagram_send_buffer_size;
+  /**
+   * Library-owned storage of a filled config; NULL for caller-built ones.
+   */
+  void *storage;
+} aster_config_t;
+
+/**
+ * An Enrollment installed by `aster_node_start_enrolled`, scoped to a
+ * runtime. It lives as long as its node (closing the node releases it);
+ * `aster_enrollment_free` releases it earlier.
  */
 typedef uint64_t aster_enrollment_t;
-
-/**
- * A running credential renewal (`aster_enrollment_start_renewal`).
- */
-typedef uint64_t aster_enrollment_renewal_t;
-
-/**
- * A delegated issuer (`aster_enrollment_issuer_new`), scoped to a runtime.
- */
-typedef uint64_t aster_enrollment_issuer_t;
 
 /**
  * `StreamHeader` (payload of a `FLAG_HEADER` frame), Aster-SPEC §6.9.
@@ -2185,124 +2310,6 @@ typedef struct aster_http_server_config_t {
 typedef uint64_t aster_http_listener_t;
 
 /**
- * Node configuration: every knob of `aster::AsterConfig` that a node uses
- * (docs/aster-rust-getstarted.md §2.2). Start from `aster_config_init` (or
- * `aster_config_from_env` / `aster_config_from_toml`), then set fields. See
- * the module docs for ownership.
- */
-typedef struct aster_config_t {
-  /**
-   * `sizeof(aster_config_t)`; checked by every function that reads it.
-   */
-  uint32_t struct_size;
-  /**
-   * One of `aster_relay_mode_t`. `ASTER_RELAY_MODE_CUSTOM` needs
-   * `relay_urls`; non-empty `relay_urls` with `DEFAULT` selects `CUSTOM`.
-   */
-  uint32_t relay_mode;
-  /**
-   * Relay URLs (UTF-8) for `ASTER_RELAY_MODE_CUSTOM`.
-   */
-  struct aster_bytes_list_t relay_urls;
-  /**
-   * Inline secret key: exactly 32 raw bytes, or empty for none.
-   */
-  struct aster_bytes_t secret_key;
-  /**
-   * Secret key file (64 hex chars): loaded if it exists, else created from
-   * `secret_key` or a fresh key (mode 0600) at start.
-   */
-  struct aster_bytes_t secret_key_file;
-  /**
-   * Persistent data directory; empty = in-memory node.
-   */
-  struct aster_bytes_t storage_path;
-  /**
-   * Blob GC interval in ms; 0 = no GC.
-   */
-  uint64_t gc_interval_ms;
-  /**
-   * Local bind address, e.g. `127.0.0.1:0`; empty = transport default.
-   */
-  struct aster_bytes_t bind_addr;
-  /**
-   * Extra inbound ALPNs (e.g. `aster/1`) next to blobs/docs/gossip.
-   */
-  struct aster_bytes_list_t alpns;
-  /**
-   * `.aster-identity` credential file (carried for round-trips; not used
-   * by `aster_node_start`).
-   */
-  struct aster_bytes_t identity_file;
-  /**
-   * HTTP/SOCKS proxy URL; empty = none.
-   */
-  struct aster_bytes_t proxy_url;
-  /**
-   * Admission hook timeout in ms; 0 = default (5000).
-   */
-  uint64_t hook_timeout_ms;
-  /**
-   * One of `aster_hook_failure_mode_t`.
-   */
-  uint32_t hook_failure_mode;
-  /**
-   * 1 = raise admission events (forced on when a gate is attached).
-   */
-  uint32_t enable_hooks;
-  uint32_t enable_monitoring;
-  /**
-   * mDNS local discovery.
-   */
-  uint32_t local_discovery;
-  /**
-   * 1 = relay-only.
-   */
-  uint32_t clear_ip_transports;
-  /**
-   * 1 = direct-only.
-   */
-  uint32_t clear_relay_transports;
-  /**
-   * One of `aster_portmapper_t`.
-   */
-  uint32_t portmapper;
-  /**
-   * 1 = read `HTTP(S)_PROXY`.
-   */
-  uint32_t proxy_from_env;
-  /**
-   * Bitmask of `ASTER_TRANSPORT_*`: which `transport_*` fields are set.
-   */
-  uint32_t transport_set;
-  /**
-   * Initial QUIC MTU (≤ 65535).
-   */
-  uint32_t transport_initial_mtu;
-  /**
-   * Bool (0/1).
-   */
-  uint32_t transport_send_fairness;
-  /**
-   * Bool (0/1).
-   */
-  uint32_t transport_enable_segmentation_offload;
-  uint64_t transport_max_concurrent_bidi_streams;
-  uint64_t transport_max_concurrent_uni_streams;
-  uint64_t transport_stream_receive_window;
-  uint64_t transport_receive_window;
-  uint64_t transport_send_window;
-  uint64_t transport_max_idle_timeout_ms;
-  uint64_t transport_keep_alive_interval_ms;
-  uint64_t transport_datagram_receive_buffer_size;
-  uint64_t transport_datagram_send_buffer_size;
-  /**
-   * Library-owned storage of a filled config; NULL for caller-built ones.
-   */
-  void *storage;
-} aster_config_t;
-
-/**
  * Opaque Gate-0 policy handle (scoped to a runtime).
  */
 typedef uint64_t aster_gate_t;
@@ -2670,6 +2677,11 @@ typedef uint64_t aster_cancel_token_t;
 typedef uint64_t aster_server_builder_t;
 
 /**
+ * A lease serializer (`aster_lease_serializer_*_new`).
+ */
+typedef uint64_t aster_lease_serializer_t;
+
+/**
  * One dispatch event, filled by `aster_server_poll`. 104 bytes (LP64).
  *
  * `request` and `peer` point into one lease, `buffer`, valid until
@@ -2809,11 +2821,6 @@ typedef struct aster_upcall_event_t {
    */
   aster_buffer_t buffer;
 } aster_upcall_event_t;
-
-/**
- * A lease serializer (`aster_lease_serializer_*_new`).
- */
-typedef uint64_t aster_lease_serializer_t;
 
 /**
  * A held lease (`ASTER_EVENT_LEASE_ACQUIRED`).
@@ -4706,99 +4713,122 @@ int32_t aster_send_stream_priority(aster_runtime_t runtime,
                                    aster_operation_t *out_operation);
 
 /**
- * Install Enrollment on `node` from `config_json` and write its handle.
+ * Resolve `[trust]` and `[enrollment]` from the environment
+ * (`AsterConfig::from_env`: `ASTER_ROOT_PUBKEY(_FILE)`,
+ * `ASTER_NEXT_ROOT_COMMITMENT`, `ASTER_ROOT_SEQ`, `ASTER_ROOT_ROTATIONS`,
+ * `ASTER_ENROLLMENT_CREDENTIAL(_CHAIN)`, `ASTER_ENROLLMENT_*`) and write the
+ * trust JSON `aster_node_start_enrolled` takes as owned JSON:
  *
  * ```json
- * {
- *   "root": "<hex32 root public key>",
- *   "audience": "<fleet audience>",
- *   "fleet_namespace": "<hex32 fleet policy namespace>",
- *   "state_path": "/var/lib/app/enrollment.json",
- *   "credential": "aster-chain-v1~…",          // optional: a pure verifier has none
- *   "policy": {"all_of": [{"scope": "session"}, "tolerate_stale_policy"]},
- *   "rotation": {"next_commitment": "<hex32>", "seq": 0},   // optional
- *   "applied_rotations": [],                   // optional
- *   "require_synchronized_clock": false,       // optional
- *   "activation_leeway_secs": 60,              // optional
- *   "limits": {"handshake_timeout_ms": 10000, "step_timeout_ms": 3000,
- *              "policy_timeout_ms": 2000, "reconciliation_interval_ms": 1000,
- *              "max_admitted_peers": 1024}       // optional, each optional
- * }
+ * {"root_pubkey": "<hex>"|null, "root_pubkey_file": "…"|null,
+ *  "next_root_commitment": "<hex>"|null, "root_seq": 0, "root_rotations": [],
+ *  "enrollment_credential_file": "…"|null, "enrollment_credential_chain": "…"|null,
+ *  "enrollment": {"enabled": null, "audience": "…", "fleet_namespace": "<hex>",
+ *    "state_path": "…", "replicas": [], "policy": <PolicyConfig>|null,
+ *    "require_synchronized_clock": false, "activation_leeway_secs": null,
+ *    "limits": {"handshake_timeout_ms", "step_timeout_ms", "policy_timeout_ms",
+ *               "reconciliation_interval_ms", "max_admitted_peers", "sync_timeout_ms"},
+ *    "roles": {"attribute": "aster.role", "scopes_as_roles": false,
+ *              "scopes": {"scope": ["role"]}, "tags": {}, "include_attributes": true},
+ *    "issuer_delegation_file": "…"|null, "issuer_lifetime_secs": null,
+ *    "renew_from": "…"|null, "renew": null, "synchronize": null}}
  * ```
  *
- * Policy nodes: `all_of` / `any_of` / `none_of` (non-empty arrays),
- * `source_cidr`, `audience`, `scope`, `tag` (strings), `attribute_equals`
- * (`{"key", "value": {"type": "bool"|"int"|"float"|"string", "value"}}`),
- * `issued_by` (hex32 key on the chain's issuer path),
- * `max_credential_age_secs`, `policy_synchronized_within`
- * (`{"max_age_secs", "require_root"}`), and the bare strings
- * `"tolerate_stale_policy"` and `"require_registration"`. Admission never
- * grants operation access; map claims to roles with
- * `aster_enrollment_peer_claims`.
- *
- * Returns `INVALID_ARGUMENT` for a malformed configuration or one Enrollment
- * refuses (for example a credential that does not verify for this node),
- * `NOT_FOUND` for an unknown node, `UNSUPPORTED` for a node without hooks or
- * with a gate attached, and `ALREADY_EXISTS` when Enrollment is already
- * installed on it.
+ * A malformed variable is `INVALID_ARGUMENT`.
  *
  * # Safety
- * `config_json` must be readable; `out_enrollment` writable.
+ * `out_json` must be writable.
  */
-int32_t aster_enrollment_install(aster_runtime_t runtime,
-                                 aster_node_t node,
-                                 struct aster_bytes_t config_json,
-                                 aster_enrollment_t *out_enrollment);
+int32_t aster_config_enrollment_from_env(struct aster_bytes_t *out_json);
 
 /**
- * Release an enrollment handle. Enrollment keeps deciding the node's
- * admission while a server or issuer still holds it; once nothing does, the
- * node rejects ordinary inbound connections (fail closed); close the node.
- * Pending `aster_enrollment_next_revocation` waits end with `ALREADY_CLOSED`.
+ * [`aster_config_enrollment_from_env`] for a TOML file
+ * (`AsterConfig::from_file`: defaults < file < environment).
+ *
+ * # Safety
+ * `path` must be readable; `out_json` writable.
+ */
+int32_t aster_config_enrollment_from_toml(struct aster_bytes_t path,
+                                          struct aster_bytes_t *out_json);
+
+/**
+ * Start a node from `config` with Enrollment from `trust_json` (the JSON of
+ * `aster_config_enrollment_from_env`), as `AsterServer` / `AsterClient` do.
+ *
+ * When the trust JSON does not enable enrollment (design §15.3: `enabled`,
+ * else any of audience, fleet namespace, issuer delegation or credential),
+ * this is exactly `aster_node_start(runtime, config, 0, …)`. Otherwise the
+ * whole plan is validated before anything starts (any error is
+ * `INVALID_ARGUMENT` naming the setting, and nothing runs open); the node
+ * starts with fail-closed hooks and `aster.enrollment/1`, and Enrollment is
+ * installed from the credential before the node is handed out (an
+ * install failure, such as a credential issued for another key, closes the
+ * node and completes with `ASTER_EVENT_ERROR`).
+ *
+ * Completes with `ASTER_EVENT_NODE_CREATED`: `handle` = the node, `related`
+ * = its `aster_enrollment_t` (0 when enrollment is off). A server
+ * (`ASTER_ENROLLMENT_SIDE_SERVER`) then builds its dispatch server on the
+ * node; `aster_server_start` wires and attaches Enrollment. A client
+ * (`ASTER_ENROLLMENT_SIDE_CLIENT`) enrolls with each server through
+ * `aster_enrollment_enroll` before its first RPC connection, and serves
+ * inbound enrollment handshakes on the node (do not `aster_accept` on it).
+ * The node accepts no gate.
+ *
+ * # Safety
+ * `config` is NULL or a valid `aster_config_t`; `trust_json` readable;
+ * `out_operation` writable.
+ */
+int32_t aster_node_start_enrolled(aster_runtime_t runtime,
+                                  const struct aster_config_t *config,
+                                  struct aster_bytes_t trust_json,
+                                  uint32_t side,
+                                  uint64_t user_data,
+                                  aster_operation_t *out_operation);
+
+/**
+ * Client sequence against one server (design §15.7, steps 3, 4 and 6):
+ * enroll over the reciprocal handshake (the server verifies this node's
+ * credential and this node verifies the server's) within
+ * `limits.sync_timeout_ms`, synchronize the fleet namespace the server
+ * offers unless `synchronize = false`, then start renewal from `renew_from`,
+ * or from this server when it signed this node's credential, unless
+ * `renew = false` (at most one renewal runs per node). Call it before the
+ * first `aster/1` connection to the server; again after a refused call to
+ * re-enroll.
+ *
+ * `server_json`: `{"node_id": "<hex32>", "relay_url": "…"?,
+ * "direct_addresses": ["ip:port"]?}`. Completes with
+ * `ASTER_EVENT_ENROLLMENT_RESULT`: `{"readiness": {"peer", "source":
+ * "chain"|"registration", "observed_source", "policy_sync", "local_clock"},
+ * "renewing": bool}`, or `ASTER_EVENT_ERROR` (an admission error keeps its
+ * `aster_enrollment_error_t` in `flags`). `INVALID_ARGUMENT` for a server
+ * enrollment.
+ *
+ * # Safety
+ * `server_json` must be readable; `out_operation` writable.
+ */
+int32_t aster_enrollment_enroll(aster_runtime_t runtime,
+                                aster_enrollment_t enrollment,
+                                struct aster_bytes_t server_json,
+                                uint64_t user_data,
+                                aster_operation_t *out_operation);
+
+/**
+ * Release an enrollment handle early (closing the node releases it too).
+ * Pending `aster_enrollment_next_revocation` waits end with
+ * `ALREADY_CLOSED`, a client stops renewing and answering inbound
+ * handshakes. A server built on the node keeps its Enrollment until it is
+ * destroyed; with nothing holding it the node rejects ordinary inbound
+ * connections (fail closed).
  */
 int32_t aster_enrollment_free(aster_runtime_t runtime, aster_enrollment_t enrollment);
 
 /**
- * Enroll reciprocally with the first of `replicas_json` that completes the
- * handshake (tried in order; at most 16). `replicas_json` is an array of
- * `{"node_id": "<hex32>", "relay_url": "…"?, "direct_addresses": ["ip:port"]?}`.
- * Completes with `ASTER_EVENT_ENROLLMENT_RESULT`:
- * `{"readiness": {…}, "policy_ticket": "<doc ticket>"|null}`. Readiness is
- * `{"peer", "source": "chain"|"registration", "observed_source", "policy_sync",
- * "local_clock"}`; pass `peer` and the ticket to `aster_enrollment_synchronize`.
- *
- * # Safety
- * `replicas_json` must be readable; `out_operation` writable.
- */
-int32_t aster_enrollment_connect(aster_runtime_t runtime,
-                                 aster_enrollment_t enrollment,
-                                 struct aster_bytes_t replicas_json,
-                                 uint64_t user_data,
-                                 aster_operation_t *out_operation);
-
-/**
- * Synchronize the fleet policy namespace from an admitted `peer` with a
- * read-only `ticket` (the one `aster_enrollment_connect` returned, or one the
- * consumer was provisioned with), then every bound namespace the peer offered
- * a ticket for, waiting up to `timeout_ms` (0 = 15 s) for reconciliation.
- * Completes with `ASTER_EVENT_ENROLLMENT_RESULT`: `{"namespace": "<hex32>"}`.
- *
- * # Safety
- * `peer` and `ticket` must be readable; `out_operation` writable.
- */
-int32_t aster_enrollment_synchronize(aster_runtime_t runtime,
-                                     aster_enrollment_t enrollment,
-                                     struct aster_bytes_t peer,
-                                     struct aster_bytes_t ticket,
-                                     uint64_t timeout_ms,
-                                     uint64_t user_data,
-                                     aster_operation_t *out_operation);
-
-/**
  * Recheck an admitted peer against current policy (the call to make before
  * a sensitive operation). Completes with `ASTER_EVENT_ENROLLMENT_RESULT`
- * (readiness JSON, as `aster_enrollment_connect`), or `ASTER_EVENT_ERROR`
- * whose `flags` is an `aster_enrollment_error_t`. Only `DENIED` revokes.
+ * (readiness JSON, as `aster_enrollment_enroll`'s `readiness`), or
+ * `ASTER_EVENT_ERROR` whose `flags` is an `aster_enrollment_error_t`. Only
+ * `DENIED` revokes.
  *
  * # Safety
  * `peer` must be readable; `out_operation` writable.
@@ -4811,8 +4841,9 @@ int32_t aster_enrollment_check_peer(aster_runtime_t runtime,
 
 /**
  * The verified evidence a peer's current admission session rests on, for
- * mapping its claims to application roles (for example with
- * `aster_server_set_peer_attributes`). Writes owned JSON to `*out_json`:
+ * audit and diagnostics. A server already maps it to Gate-3 roles on every
+ * call (`[enrollment.roles]`); do not copy it into peer attributes. Writes
+ * owned JSON to `*out_json`:
  *
  * ```json
  * {"subject": "<hex32>", "root": "<hex32>", "issuer": "<hex32 leaf signer>",
@@ -4825,9 +4856,8 @@ int32_t aster_enrollment_check_peer(aster_runtime_t runtime,
  *  "registration": "ephemeral"|"persistent"|null}
  * ```
  *
- * `null` scopes/tags/attributes are unknown, not empty. The session reflects
- * the last admission or check; `aster_enrollment_check_peer` re-evaluates it.
- * Returns `NOT_FOUND` when the peer has no session.
+ * `null` scopes/tags/attributes are unknown, not empty. Returns `NOT_FOUND`
+ * when the peer has no session (never enrolled, revoked or evicted).
  *
  * # Safety
  * `peer` must be readable; `out_json` writable.
@@ -4838,25 +4868,11 @@ int32_t aster_enrollment_peer_claims(aster_runtime_t runtime,
                                      struct aster_bytes_t *out_json);
 
 /**
- * Verify `chain` as a credential for `subject` under this node's trust (root,
- * audience, signed validity and the root's delegate revocations; root
- * records are not consulted). Writes the evidence JSON (as
- * `aster_enrollment_peer_claims`) to `*out_json`, or returns
- * `VERIFICATION_FAILED` with the reason in the last error.
- *
- * # Safety
- * `subject` and `chain` must be readable; `out_json` writable.
- */
-int32_t aster_enrollment_verify_credential(aster_runtime_t runtime,
-                                           aster_enrollment_t enrollment,
-                                           struct aster_bytes_t subject,
-                                           struct aster_bytes_t chain,
-                                           struct aster_bytes_t *out_json);
-
-/**
  * This node's Enrollment state as owned JSON:
- * `{"trusted_root", "fleet_namespace", "audience", "credential": <evidence>|null,
- * "root_state": {"root", "next_commitment", "seq"}|null, "root_rotations": []}`.
+ * `{"side": "server"|"client", "trusted_root", "fleet_namespace",
+ * "audience", "credential": <evidence>|null, "root_state": {"root",
+ * "next_commitment", "seq"}|null, "root_rotations": [], "renewing": bool,
+ * "issuer": "<hex32>"|null}`. `credential` follows renewals;
  * `trusted_root` moves on after an accepted root rotation.
  *
  * # Safety
@@ -4867,28 +4883,14 @@ int32_t aster_enrollment_status(aster_runtime_t runtime,
                                 struct aster_bytes_t *out_json);
 
 /**
- * Replace this node's credential (it must verify for this node) and present
- * it again to every peer it has a session with. Completes with
- * `ASTER_EVENT_ENROLLMENT_RESULT`: `{"unreached": [{"peer", "error"}]}`.
- *
- * # Safety
- * `chain` must be readable; `out_operation` writable.
- */
-int32_t aster_enrollment_replace_credential(aster_runtime_t runtime,
-                                            aster_enrollment_t enrollment,
-                                            struct aster_bytes_t chain,
-                                            uint64_t user_data,
-                                            aster_operation_t *out_operation);
-
-/**
  * Wait for the next revocation of a formerly admitted peer (a definite
- * denial; every connection of that peer is already closed). Completes with
- * `ASTER_EVENT_ENROLLMENT_RESULT`: `{"peer": "<hex32>", "reason": {"code",
- * "definite", "detail"}}`, or `{"lagged": n}` when `n` revocations were
- * missed (recheck every peer relied on). Revocations are buffered from
- * install; receives on one enrollment are serialized. Cancelling the
- * operation consumes nothing; `aster_enrollment_free` ends a pending wait
- * with `ALREADY_CLOSED`.
+ * denial; every connection of that peer is already closed and its roles are
+ * gone from the next call). Completes with `ASTER_EVENT_ENROLLMENT_RESULT`:
+ * `{"peer": "<hex32>", "reason": {"code", "definite", "detail"}}`, or
+ * `{"lagged": n}` when `n` revocations were missed (recheck every peer
+ * relied on). Revocations are buffered from install; receives on one
+ * enrollment are serialized. Cancelling the operation consumes nothing;
+ * releasing the enrollment ends a pending wait with `ALREADY_CLOSED`.
  *
  * # Safety
  * `out_operation` must be writable.
@@ -4899,89 +4901,35 @@ int32_t aster_enrollment_next_revocation(aster_runtime_t runtime,
                                          aster_operation_t *out_operation);
 
 /**
- * Start renewing this node's credential from the issuer that signed it,
- * whenever a third of its lifetime remains, until the root registers the
- * node, the issuer refuses for good, or the credential expires. Renewed
- * credentials are presented to every admitted peer. `config_json`:
- * `{"issuer": {"node_id", "relay_url"?, "direct_addresses"?}, "retry_ms"?,
- * "max_retry_ms"?, "call_timeout_ms"?}`. Free the handle to stop renewing.
- *
- * # Safety
- * `config_json` must be readable; `out_renewal` writable.
- */
-int32_t aster_enrollment_start_renewal(aster_runtime_t runtime,
-                                       aster_enrollment_t enrollment,
-                                       struct aster_bytes_t config_json,
-                                       aster_enrollment_renewal_t *out_renewal);
-
-/**
- * Wait for renewal to stop. Completes with `ASTER_EVENT_ENROLLMENT_RESULT`:
- * `{"outcome": "registered"|"refused"|"expired"|"no_credential",
- * "refusal": {"code", "message"}|null}` (`code` as `aster.enrollment.IssuerV1`
- * reports it, e.g. `subject_denied`). May be awaited more than once.
- *
- * # Safety
- * `out_operation` must be writable.
- */
-int32_t aster_enrollment_renewal_wait(aster_runtime_t runtime,
-                                      aster_enrollment_renewal_t renewal,
-                                      uint64_t user_data,
-                                      aster_operation_t *out_operation);
-
-/**
- * Stop renewing and release the handle.
- */
-int32_t aster_enrollment_renewal_free(aster_runtime_t runtime, aster_enrollment_renewal_t renewal);
-
-/**
- * Make this enrolled node a delegated issuer. `delegation` is the node's
- * delegation chain from the root (`aster-chain-v1~…`; its leaf names this
- * node's key). Credentials it signs last `lifetime_secs` (0 = 24 h),
- * shortened to fit the delegation's `max_child_lifetime` and expiry;
- * renewals use the same lifetime. Serve renewals by passing the issuer to
- * `aster_server_set_enrollment`.
- *
- * # Safety
- * `delegation` must be readable; `out_issuer` writable.
- */
-int32_t aster_enrollment_issuer_new(aster_runtime_t runtime,
-                                    aster_enrollment_t enrollment,
-                                    struct aster_bytes_t delegation,
-                                    uint64_t lifetime_secs,
-                                    aster_enrollment_issuer_t *out_issuer);
-
-/**
- * Release an issuer handle (a server it was set on keeps serving it).
- */
-int32_t aster_enrollment_issuer_free(aster_runtime_t runtime, aster_enrollment_issuer_t issuer);
-
-/**
- * `{"public_key": "<hex32>", "delegation_expires_at": 1700000000}` as owned
- * JSON. Only the root renews the delegation.
+ * The configured delegated issuer of a server enrollment
+ * (`[enrollment.issuer] delegation_file`), as owned JSON:
+ * `{"public_key": "<hex32>", "delegation_expires_at": 1700000000}`.
+ * `NOT_FOUND` when none is configured.
  *
  * # Safety
  * `out_json` must be writable.
  */
 int32_t aster_enrollment_issuer_info(aster_runtime_t runtime,
-                                     aster_enrollment_issuer_t issuer,
+                                     aster_enrollment_t enrollment,
                                      struct aster_bytes_t *out_json);
 
 /**
- * Sign a credential for `subject` after the orchestrator has authenticated
- * it out of band. `request_json`: `{"subject": "<hex32 node id>",
+ * Sign a credential with the server's configured issuer for a subject the
+ * orchestrator has authenticated out of band (renewals are served
+ * automatically). `request_json`: `{"subject": "<hex32 node id>",
  * "claims": {"scopes": [], "tags": [], "attributes": {}}, "registration":
  * "ephemeral"|"persistent"}` (claims default to unknown; registration to
- * ephemeral; a set of `null` is unknown). On success writes
- * `{"chain", "credential_id", "expires_at"}`. When the issuer refuses
- * (a subject the root denied or registered, claims beyond the delegation,
- * a revoked issuer) returns `PERMISSION_DENIED` and writes
- * `{"code", "message", "retryable"}` instead. Both outputs are owned JSON.
+ * ephemeral). On success writes `{"chain", "credential_id", "expires_at"}`.
+ * When the issuer refuses (a subject the root denied or registered, claims
+ * beyond the delegation, a revoked issuer) returns `PERMISSION_DENIED` and
+ * writes `{"code", "message", "retryable"}` instead. Both outputs are owned
+ * JSON. `NOT_FOUND` when no issuer is configured.
  *
  * # Safety
  * `request_json` must be readable; `out_json` writable.
  */
 int32_t aster_enrollment_issue(aster_runtime_t runtime,
-                               aster_enrollment_issuer_t issuer,
+                               aster_enrollment_t enrollment,
                                struct aster_bytes_t request_json,
                                struct aster_bytes_t *out_json);
 
@@ -5892,8 +5840,10 @@ int32_t aster_config_release(struct aster_config_t *config);
 
 /**
  * Create a Gate-0 policy: PROTECTED, admission ALPNs =
- * `aster.producer_admission`, `aster.consumer_admission`, `aster.admission`,
- * reject code 403 with reason "peer not admitted", no admitted peers.
+ * `aster.producer_admission` and `aster.admission`, reject code 403 with
+ * reason "peer not admitted", no admitted peers. (Since 5.1 the retired
+ * consumer admission ALPN is not in the default set; Enrollment, through
+ * `aster_node_start_enrolled`, replaces it.)
  * Free with `aster_gate_free`.
  */
 int32_t aster_gate_new(aster_runtime_t runtime, aster_gate_t *out_gate);
@@ -6001,7 +5951,7 @@ int32_t aster_node_start(aster_runtime_t runtime,
  * started by `aster_node_start` with hooks enabled (or with a gate). Takes
  * effect for the next admission decision. Returns
  * `ASTER_STATUS_UNSUPPORTED` for nodes without admission hooks, and since
- * ABI 5.1 for nodes with Enrollment installed (`aster_enrollment_install`).
+ * ABI 5.1 for nodes started by `aster_node_start_enrolled`.
  */
 int32_t aster_node_set_gate(aster_runtime_t runtime, aster_node_t node, aster_gate_t gate);
 
@@ -6957,8 +6907,11 @@ int32_t aster_call_cancel(aster_runtime_t runtime, aster_call_t call);
 
 /**
  * Start building a dispatch server on `node` (a node from
- * `aster_node_start`, which must have `aster/1` among its ALPNs). Gate 0
- * stays with the node's gate; the server runs Gate 3 (`requires`).
+ * `aster_node_start` or `aster_node_start_enrolled`, which must have
+ * `aster/1` among its ALPNs). Gate 0 stays with the node's gate; the server
+ * runs Gate 3 (`requires`). On a node started by `aster_node_start_enrolled`
+ * (server side) `aster_server_start` also runs the Enrollment server
+ * sequence (design §15.4). `INVALID_ARGUMENT` for a client-side enrollment.
  */
 int32_t aster_server_builder_new(aster_runtime_t runtime,
                                  aster_node_t node,
@@ -7016,18 +6969,25 @@ int32_t aster_server_start(aster_runtime_t runtime,
 int32_t aster_server_attach_health(aster_server_builder_t builder, aster_health_t health);
 
 /**
- * Serve Enrollment on this server (ABI 5.1): inbound `aster.enrollment/1`
- * connections go to `enrollment` (installed on the builder's node), and with
- * `issuer` ≠ 0 the server also serves `aster.enrollment.IssuerV1` renewals
- * (iroh-only, admitted callers). The node must list `aster.enrollment/1`
- * among its ALPNs. A later call replaces the earlier one. `NOT_FOUND` for an
- * unknown builder, enrollment or issuer; `ALREADY_CLOSED` for a builder
- * already started.
+ * Serve `aster.lease.Grantor` (ABI 5.1; Rust `aster::rpc::lease::LeaseGrantor`)
+ * on this server, backed by `serializer` (any `aster_lease_serializer_t`:
+ * a foreign one answered by the binding over upcalls, or the in-memory
+ * one). The grantor binds every operation to the caller's authenticated
+ * node id, never a request field. `requires_json` gates every method
+ * (CapabilityRequirement JSON; empty or `null` = none, admission is the
+ * boundary); `revoke_requires_json` gates `revoke` (empty = the default
+ * `operator` role, `null` = only `requires_json`). Clients acquire through
+ * it with `aster_lease_serializer_grantor_new`. A later call replaces the
+ * earlier one. `NOT_FOUND` for an unknown builder or serializer;
+ * `ALREADY_CLOSED` for a builder already started.
+ *
+ * # Safety
+ * The JSON spans must be readable for their advertised lengths.
  */
-int32_t aster_server_set_enrollment(aster_runtime_t runtime,
-                                    aster_server_builder_t builder,
-                                    aster_enrollment_t enrollment,
-                                    aster_enrollment_issuer_t issuer);
+int32_t aster_server_add_lease_grantor(aster_server_builder_t builder,
+                                       aster_lease_serializer_t serializer,
+                                       struct aster_bytes_t requires_json,
+                                       struct aster_bytes_t revoke_requires_json);
 
 /**
  * Free a builder that was never started.
@@ -7470,6 +7430,20 @@ int32_t aster_lease_serializer_foreign_new(aster_runtime_t runtime,
 int32_t aster_lease_serializer_memory_new(aster_runtime_t runtime,
                                           aster_upcalls_t authorizer_upcalls,
                                           aster_lease_serializer_t *out_serializer);
+
+/**
+ * A lease serializer backed by a remote `aster.lease.Grantor` (ABI 5.1;
+ * Rust `aster::rpc::lease::GrantorSerializer`): every transition and
+ * snapshot is a unary call on `connection` (an `aster/1` connection to the
+ * grantor, from `node`). The grantor binds the holder to `node`'s
+ * authenticated id, so acquire with `holder` = `node`'s id; an operation for
+ * any other actor fails locally. A grantor refusal is a denial; a transport
+ * or grantor fault is a backend error.
+ */
+int32_t aster_lease_serializer_grantor_new(aster_runtime_t runtime,
+                                           aster_node_t node,
+                                           aster_connection_t connection,
+                                           aster_lease_serializer_t *out_serializer);
 
 /**
  * Free a serializer handle. Leases acquired from it keep their own

@@ -232,20 +232,20 @@ impl AttributeSource for EnrollmentAttributes {
 /// Which builder is installing: a server keeps durable state and may issue; a
 /// client may use temporary state and renews from its server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Side {
+pub enum Side {
     Server,
     Client,
 }
 
 /// Where the policy store lives.
-pub(crate) enum StateLocation {
+pub enum StateLocation {
     Path(PathBuf),
     /// A client's temporary directory, removed when the client closes.
     Temporary(TempState),
 }
 
 /// A temporary state directory, removed on drop.
-pub(crate) struct TempState(PathBuf);
+pub struct TempState(PathBuf);
 
 impl TempState {
     fn create() -> Result<Self> {
@@ -265,7 +265,7 @@ impl Drop for TempState {
 
 /// Everything validated before the node starts, so a misconfiguration never
 /// leaves a half-started node behind.
-pub(crate) struct Plan {
+pub struct Plan {
     side: Side,
     root: [u8; 32],
     namespace: [u8; 32],
@@ -287,19 +287,15 @@ pub(crate) struct Plan {
 
 /// Builder-supplied overrides of the configured policy and role mapping.
 #[derive(Clone, Default)]
-pub(crate) struct Overrides {
-    pub(crate) policy: Option<Arc<dyn AdmissionPolicy>>,
-    pub(crate) roles: Option<RoleMapping>,
+pub struct Overrides {
+    pub policy: Option<Arc<dyn AdmissionPolicy>>,
+    pub roles: Option<RoleMapping>,
 }
 
 /// Validate `config`'s enrollment section. `Ok(None)` when it is off. When it
 /// is on, the node configuration is adjusted for Enrollment (fail-closed
 /// hooks) and the caller registers [`super::ENROLLMENT_ALPN`].
-pub(crate) fn plan(
-    config: &mut AsterConfig,
-    side: Side,
-    overrides: Overrides,
-) -> Result<Option<Plan>> {
+pub fn plan(config: &mut AsterConfig, side: Side, overrides: Overrides) -> Result<Option<Plan>> {
     if !config.is_enrollment_enabled() {
         return Ok(None);
     }
@@ -472,9 +468,9 @@ pub(crate) fn plan(
 }
 
 /// Enrollment installed on a started node from a [`Plan`].
-pub(crate) struct Installed {
-    pub(crate) enrollment: Enrollment,
-    pub(crate) issuer: Option<Issuer>,
+pub struct Installed {
+    pub enrollment: Enrollment,
+    pub issuer: Option<Issuer>,
 }
 
 impl Plan {
@@ -487,7 +483,7 @@ impl Plan {
 
     /// Install on `node` (started with fail-closed hooks and the enrollment
     /// ALPN). Refuses a credential that does not verify for this node.
-    pub(crate) fn install(&self, node: &Node) -> Result<Installed> {
+    pub fn install(&self, node: &Node) -> Result<Installed> {
         let path = self.state_path();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
@@ -533,7 +529,7 @@ impl Plan {
     /// Hold the fleet namespace this node serves policy from: synchronize it
     /// from the configured replicas, or, with none, import it read-only so
     /// the root's publication sessions can deliver into it.
-    pub(crate) async fn attach_policy(&self, node: &Node, enrollment: &Enrollment) -> Result<()> {
+    pub async fn attach_policy(&self, node: &Node, enrollment: &Enrollment) -> Result<()> {
         if self.replicas.is_empty() {
             let doc = node
                 .docs()
@@ -563,7 +559,7 @@ impl Plan {
     /// Start renewing this node's credential, when configured: from
     /// `renew_from`, else (client only) from `server` when it signed the
     /// credential. `renew = false` disables both.
-    pub(crate) fn start_renewal(
+    pub fn start_renewal(
         &self,
         enrollment: &Enrollment,
         server: Option<&NodeAddr>,
@@ -584,6 +580,71 @@ impl Plan {
         };
         Some(enrollment.start_renewal(RenewalConfig::new(issuer)))
     }
+
+    /// Which side this plan was validated for.
+    pub fn side(&self) -> Side {
+        self.side
+    }
+
+    /// The Gate-3 attribute source for a server: each peer's roles from its
+    /// live enrollment session, mapped with this plan's [`RoleMapping`].
+    pub fn attribute_source(&self, enrollment: &Enrollment) -> Arc<dyn AttributeSource> {
+        Arc::new(EnrollmentAttributes {
+            enrollment: enrollment.clone(),
+            mapping: self.mapping.clone(),
+        })
+    }
+
+    /// The client sequence against one server (design §15.7, steps 3 and 4):
+    /// enroll over the reciprocal handshake within `sync_timeout_ms`, then
+    /// synchronize the fleet namespace the server offers when `synchronize`.
+    /// Renewal (step 6) is [`start_renewal`](Self::start_renewal) with the
+    /// server's address.
+    pub async fn enroll_with_server(
+        &self,
+        enrollment: &Enrollment,
+        server: &NodeAddr,
+    ) -> Result<super::EnrollmentReadiness> {
+        let (readiness, ticket) =
+            tokio::time::timeout(self.sync_timeout, enrollment.connect(server.clone()))
+                .await
+                .map_err(|_| {
+                    invalid("the server did not complete the enrollment handshake in time")
+                })?
+                .map_err(|e| invalid(format!("enrolling with the server: {e:#}")))?;
+        if self.synchronize {
+            if let Some(ticket) = ticket {
+                enrollment
+                    .synchronize(readiness.peer, ticket, self.sync_timeout)
+                    .await
+                    .map_err(|e| invalid(format!("synchronizing the fleet namespace: {e:#}")))?;
+            }
+        }
+        Ok(readiness)
+    }
+}
+
+/// A client's inbound enrollment handshakes (a server re-presenting a renewed
+/// credential): accept every connection on `node` and route
+/// [`super::ENROLLMENT_ALPN`] ones into `enrollment`. Abort the task to stop.
+pub fn serve_inbound_enrollment(
+    node: &Node,
+    enrollment: &Enrollment,
+) -> tokio::task::JoinHandle<()> {
+    let node = node.clone();
+    let enrollment = enrollment.clone();
+    tokio::spawn(async move {
+        while let Ok((alpn, connection)) = node.accept().await {
+            if alpn == super::ENROLLMENT_ALPN {
+                let enrollment = enrollment.clone();
+                tokio::spawn(async move {
+                    if enrollment.accept(&connection).await.is_ok() {
+                        connection.closed().await;
+                    }
+                });
+            }
+        }
+    })
 }
 
 /// The key that signed this node's credential leaf: a delegated issuer, or

@@ -690,43 +690,17 @@ pub(crate) struct GateEntry {
 }
 
 /// Who decides a hooked node's admission. Shared with the node's admission
-/// drainers, so `aster_node_set_gate` and `aster_enrollment_install` take
-/// effect immediately.
+/// drainers, so `aster_node_set_gate` takes effect immediately. A node
+/// started by `aster_node_start_enrolled` has no slot: Enrollment consumes
+/// its hooks directly.
 #[derive(Default)]
 pub(crate) struct SlotState {
     /// The attached gate, if any.
     pub(crate) gate: Option<Arc<GateEntry>>,
-    /// Set once by `aster_enrollment_install` (ABI 5.1): the drainers forward
-    /// both hook directions to Enrollment from then on, and no gate can be
-    /// attached.
-    pub(crate) enrollment: Option<HookForward>,
 }
 
 /// Per-node admission slot (see [`SlotState`]).
 pub(crate) type GateSlot = RwLock<SlotState>;
-
-/// Senders into an installed Enrollment's hook receiver.
-#[derive(Clone)]
-pub(crate) struct HookForward {
-    pub(crate) before_connect: tokio::sync::mpsc::Sender<(
-        aster_transport_core::CoreHookConnectInfo,
-        tokio::sync::oneshot::Sender<bool>,
-    )>,
-    pub(crate) after_handshake: tokio::sync::mpsc::Sender<(
-        aster_transport_core::CoreHookHandshakeInfo,
-        tokio::sync::oneshot::Sender<CoreAfterHandshakeDecision>,
-    )>,
-}
-
-/// The admission slot of a node started with hooks (`None` otherwise).
-pub(crate) fn admission_slot(bridge: &BridgeRuntime, node: aster_node_t) -> Option<Arc<GateSlot>> {
-    bridge
-        .node_gates
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&node)
-        .cloned()
-}
 
 fn gate_entry(bridge: &BridgeRuntime, gate: aster_gate_t) -> Result<Arc<GateEntry>, i32> {
     bridge.gates.get(gate).ok_or_else(|| {
@@ -758,8 +732,10 @@ fn bridge_for(runtime: aster_runtime_t) -> Result<Arc<BridgeRuntime>, i32> {
 }
 
 /// Create a Gate-0 policy: PROTECTED, admission ALPNs =
-/// `aster.producer_admission`, `aster.consumer_admission`, `aster.admission`,
-/// reject code 403 with reason "peer not admitted", no admitted peers.
+/// `aster.producer_admission` and `aster.admission`, reject code 403 with
+/// reason "peer not admitted", no admitted peers. (Since 5.1 the retired
+/// consumer admission ALPN is not in the default set; Enrollment, through
+/// `aster_node_start_enrolled`, replaces it.)
 /// Free with `aster_gate_free`.
 #[no_mangle]
 pub unsafe extern "C" fn aster_gate_new(
@@ -771,7 +747,10 @@ pub unsafe extern "C" fn aster_gate_new(
     }
     let bridge = try_status!(bridge_for(runtime));
     *out_gate = bridge.gates.insert(GateEntry {
-        policy: RwLock::new(GatePolicy::protected()),
+        policy: RwLock::new(GatePolicy::protected().with_admission_alpns(vec![
+            aster::alpns::PRODUCER_ADMISSION.to_vec(),
+            aster::alpns::DELEGATED_ADMISSION.to_vec(),
+        ])),
     });
     aster_status_t::ASTER_STATUS_OK as i32
 }
@@ -962,25 +941,11 @@ pub(crate) fn spawn_hook_drainers(
         slot.as_ref()
             .and_then(|s| s.read().unwrap_or_else(|e| e.into_inner()).gate.clone())
     };
-    let current_forward = |slot: &Option<Arc<GateSlot>>| -> Option<HookForward> {
-        slot.as_ref().and_then(|s| {
-            s.read()
-                .unwrap_or_else(|e| e.into_inner())
-                .enrollment
-                .clone()
-        })
-    };
-
     let b = bridge.clone();
     let slot = gate.clone();
     bridge.runtime.spawn(async move {
         let mut rx = before_connect_rx;
         while let Some((info, reply_tx)) = rx.recv().await {
-            // Enrollment answers; a failed send drops the reply (fail closed).
-            if let Some(forward) = current_forward(&slot) {
-                let _ = forward.before_connect.send((info, reply_tx)).await;
-                continue;
-            }
             // Outbound dials are this node's own; a gate never blocks them.
             if current_gate(&slot).is_some() {
                 let _ = reply_tx.send(true);
@@ -1012,10 +977,6 @@ pub(crate) fn spawn_hook_drainers(
     bridge.runtime.spawn(async move {
         let mut rx = after_handshake_rx;
         while let Some((info, reply_tx)) = rx.recv().await {
-            if let Some(forward) = current_forward(&slot) {
-                let _ = forward.after_handshake.send((info, reply_tx)).await;
-                continue;
-            }
             if let Some(entry) = current_gate(&slot) {
                 let decision = entry
                     .policy
@@ -1167,12 +1128,9 @@ pub unsafe extern "C" fn aster_node_start(
                 };
                 let handle = bridge2.nodes.insert(core);
                 crate::health::remember_node_config(handle, health);
-                let slot = receiver.as_ref().map(|_| {
-                    Arc::new(RwLock::new(SlotState {
-                        gate: gate_entry,
-                        enrollment: None,
-                    }))
-                });
+                let slot = receiver
+                    .as_ref()
+                    .map(|_| Arc::new(RwLock::new(SlotState { gate: gate_entry })));
                 if let Some(slot) = &slot {
                     bridge2
                         .node_gates
@@ -1208,7 +1166,7 @@ pub unsafe extern "C" fn aster_node_start(
 /// started by `aster_node_start` with hooks enabled (or with a gate). Takes
 /// effect for the next admission decision. Returns
 /// `ASTER_STATUS_UNSUPPORTED` for nodes without admission hooks, and since
-/// ABI 5.1 for nodes with Enrollment installed (`aster_enrollment_install`).
+/// ABI 5.1 for nodes started by `aster_node_start_enrolled`.
 #[no_mangle]
 pub unsafe extern "C" fn aster_node_set_gate(
     runtime: aster_runtime_t,
@@ -1232,13 +1190,17 @@ pub unsafe extern "C" fn aster_node_set_gate(
         .cloned();
     match slot {
         Some(slot) => {
-            let mut state = slot.write().unwrap_or_else(|e| e.into_inner());
-            if state.enrollment.is_some() {
-                set_last_error("Enrollment decides this node's admission; no gate can be attached");
-                return aster_status_t::ASTER_STATUS_UNSUPPORTED as i32;
-            }
-            state.gate = entry;
+            slot.write().unwrap_or_else(|e| e.into_inner()).gate = entry;
             aster_status_t::ASTER_STATUS_OK as i32
+        }
+        None if bridge
+            .node_enrollments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&node) =>
+        {
+            set_last_error("Enrollment decides this node's admission; no gate can be attached");
+            aster_status_t::ASTER_STATUS_UNSUPPORTED as i32
         }
         None => {
             set_last_error("node has no admission hooks (start it with enable_hooks or a gate)");
@@ -1250,6 +1212,7 @@ pub unsafe extern "C" fn aster_node_set_gate(
 /// Remove the gate slot of a node being freed/closed.
 pub(crate) fn forget_node(bridge: &BridgeRuntime, node: aster_node_t) {
     crate::health::forget_node_config(node);
+    crate::enrollment::forget_node(bridge, node);
     bridge
         .node_gates
         .lock()

@@ -626,6 +626,41 @@ pub unsafe extern "C" fn aster_lease_serializer_memory_new(
     OK
 }
 
+/// A lease serializer backed by a remote `aster.lease.Grantor` (ABI 5.1;
+/// Rust `aster::rpc::lease::GrantorSerializer`): every transition and
+/// snapshot is a unary call on `connection` (an `aster/1` connection to the
+/// grantor, from `node`). The grantor binds the holder to `node`'s
+/// authenticated id, so acquire with `holder` = `node`'s id; an operation for
+/// any other actor fails locally. A grantor refusal is a denial; a transport
+/// or grantor fault is a backend error.
+#[no_mangle]
+pub unsafe extern "C" fn aster_lease_serializer_grantor_new(
+    runtime: aster_runtime_t,
+    node: aster_node_t,
+    connection: crate::aster_connection_t,
+    out_serializer: *mut aster_lease_serializer_t,
+) -> i32 {
+    if out_serializer.is_null() {
+        return invalid("aster_lease_serializer_grantor_new: out_serializer is NULL");
+    }
+    *out_serializer = 0;
+    let bridge = try_status!(bridge_for(runtime));
+    let Some(core) = bridge.nodes.get(node) else {
+        return not_found(format!("unknown node {node}"));
+    };
+    let Some(conn) = bridge.connections.get(connection) else {
+        return not_found(format!("unknown connection {connection}"));
+    };
+    let rpc = aster::rpc::RpcConnection::from_core_connection((*conn).clone());
+    let self_id = aster::Node::from_core_node((*core).clone())
+        .id()
+        .to_string();
+    let s: Arc<dyn LeaseSerializer> =
+        Arc::new(aster::rpc::lease::GrantorSerializer::new(rpc, self_id));
+    *out_serializer = SERIALIZERS.insert(s);
+    OK
+}
+
 /// Free a serializer handle. Leases acquired from it keep their own
 /// reference and keep renewing.
 #[no_mangle]
@@ -640,7 +675,9 @@ pub unsafe extern "C" fn aster_lease_serializer_free(
     }
 }
 
-fn serializer_for(serializer: aster_lease_serializer_t) -> Result<Arc<dyn LeaseSerializer>, i32> {
+pub(crate) fn serializer_for(
+    serializer: aster_lease_serializer_t,
+) -> Result<Arc<dyn LeaseSerializer>, i32> {
     SERIALIZERS
         .get(serializer)
         .map(|s| s.as_ref().clone())

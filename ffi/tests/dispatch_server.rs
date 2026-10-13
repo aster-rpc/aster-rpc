@@ -36,7 +36,7 @@ const QUEUE_FULL: i32 = aster_status_t::ASTER_STATUS_QUEUE_FULL as i32;
 const TIMEOUT: i32 = aster_status_t::ASTER_STATUS_TIMEOUT as i32;
 const CLOSED: i32 = aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32;
 const RPC_ALPN: &[u8] = b"aster/1";
-const ADMISSION_ALPN: &[u8] = b"aster.consumer_admission";
+const ADMISSION_ALPN: &[u8] = b"example.custom/1";
 
 // ── the services (as in aster/tests/dynamic_dispatch.rs) ────────────────────
 

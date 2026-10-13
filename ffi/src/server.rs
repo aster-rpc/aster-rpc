@@ -85,8 +85,7 @@ pub enum aster_dispatch_event_kind_t {
     /// `SESSION_CLOSED` events come first. `connection_handle` is the handle
     /// the connection's calls carried, already invalid.
     ASTER_DISPATCH_EVENT_CONNECTION_CLOSED = 5,
-    /// A connection on a non-RPC ALPN that no Rust handler claimed (frozen
-    /// consumer admission). `request` = the ALPN; `connection_handle` is
+    /// A connection on a non-RPC ALPN that no Rust handler claimed. `request` = the ALPN; `connection_handle` is
     /// **owned** by the binding (free it with `aster_connection_free`).
     ASTER_DISPATCH_EVENT_NON_RPC = 6,
 }
@@ -246,8 +245,11 @@ struct BuilderSpec {
     handler_timeout: Option<Option<Duration>>,
     max_foreign_inflight: usize,
     health: Option<HealthState>,
-    /// ABI 5.1: Enrollment (and an issuer) this server routes for.
-    enrollment: Option<crate::enrollment::ServerEnrollment>,
+    /// ABI 5.1: the Enrollment the node was started with
+    /// (`aster_node_start_enrolled`), wired at start.
+    enrollment: Option<Arc<crate::enrollment::EnrollmentState>>,
+    /// ABI 5.1: `aster.lease.Grantor` services (`aster_server_add_lease_grantor`).
+    lease_grantor: Option<aster::rpc::lease::LeaseGrantor>,
 }
 
 pub(crate) struct BuilderState {
@@ -450,8 +452,11 @@ pub(crate) fn decode_kv(mut b: &[u8]) -> Result<Vec<(String, String)>, String> {
 // ============================================================================
 
 /// Start building a dispatch server on `node` (a node from
-/// `aster_node_start`, which must have `aster/1` among its ALPNs). Gate 0
-/// stays with the node's gate; the server runs Gate 3 (`requires`).
+/// `aster_node_start` or `aster_node_start_enrolled`, which must have
+/// `aster/1` among its ALPNs). Gate 0 stays with the node's gate; the server
+/// runs Gate 3 (`requires`). On a node started by `aster_node_start_enrolled`
+/// (server side) `aster_server_start` also runs the Enrollment server
+/// sequence (design §15.4). `INVALID_ARGUMENT` for a client-side enrollment.
 #[no_mangle]
 pub unsafe extern "C" fn aster_server_builder_new(
     runtime: aster_runtime_t,
@@ -468,6 +473,10 @@ pub unsafe extern "C" fn aster_server_builder_new(
     let Some(core) = bridge.nodes.get(node) else {
         return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
     };
+    let enrollment = match crate::enrollment::server_enrollment_for_node(&bridge, node) {
+        Ok(enrollment) => enrollment,
+        Err(code) => return code,
+    };
     let id = BUILDERS.insert(BuilderState {
         spec: Mutex::new(Some(BuilderSpec {
             node: (*core).clone(),
@@ -479,7 +488,8 @@ pub unsafe extern "C" fn aster_server_builder_new(
             handler_timeout: None,
             max_foreign_inflight: aster::binding_support::dispatch::DEFAULT_MAX_FOREIGN_INFLIGHT,
             health: None,
-            enrollment: None,
+            enrollment,
+            lease_grantor: None,
         })),
     });
     // SAFETY: checked non-null above.
@@ -683,6 +693,22 @@ pub unsafe extern "C" fn aster_server_start(
         Ok(b) => b,
         Err(s) => return status(s),
     };
+    // Attaching Enrollment's policy blocks (below); check before removing
+    // the builder so a misplaced call leaves it intact.
+    let enrolled = BUILDERS.get(builder).is_some_and(|b| {
+        b.spec
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.enrollment.is_some())
+    });
+    if enrolled {
+        if let Some(error) =
+            crate::http_server::blocking_on_runtime("aster_server_start (enrolled)")
+        {
+            return error;
+        }
+    }
     let Some(state) = BUILDERS.remove(builder) else {
         return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
     };
@@ -721,10 +747,13 @@ pub unsafe extern "C" fn aster_server_start(
         server = server.with_builtin_topology(&node, spec.topology_requires);
     }
     let mut enrollment_stop = None;
-    if let Some(enrollment) = spec.enrollment {
+    if let Some(enrollment) = &spec.enrollment {
         let (stop, stopped) = tokio::sync::watch::channel(());
-        server = enrollment.apply(server, stopped);
+        server = enrollment.apply(server, &attributes, stopped);
         enrollment_stop = Some(stop);
+    }
+    if let Some(grantor) = spec.lease_grantor {
+        server = server.register(grantor);
     }
     let services = spec.services.len() as u32;
     for svc in spec.services {
@@ -736,6 +765,17 @@ pub unsafe extern "C" fn aster_server_start(
     let table = server.call_table();
     let dispatcher = server.dispatcher();
     let handle = server.serve();
+
+    // The acceptor runs: hold or synchronize the fleet namespace, then renew
+    // (design §15.4 steps 5 and 6). Blocks up to `sync_timeout_ms` with
+    // replicas; a failure stops the server (the binding closes the node).
+    if let Some(enrollment) = &spec.enrollment {
+        drop(_enter);
+        if let Err(error) = bridge.runtime.block_on(enrollment.attach_server()) {
+            handle.abort();
+            return fail(aster_status_t::ASTER_STATUS_INVALID_ARGUMENT, error);
+        }
+    }
 
     let state = ServerState {
         runtime_owner: runtime,
@@ -804,30 +844,70 @@ pub extern "C" fn aster_server_attach_health(
     status(aster_status_t::ASTER_STATUS_OK)
 }
 
-/// Serve Enrollment on this server (ABI 5.1): inbound `aster.enrollment/1`
-/// connections go to `enrollment` (installed on the builder's node), and with
-/// `issuer` ≠ 0 the server also serves `aster.enrollment.IssuerV1` renewals
-/// (iroh-only, admitted callers). The node must list `aster.enrollment/1`
-/// among its ALPNs. A later call replaces the earlier one. `NOT_FOUND` for an
-/// unknown builder, enrollment or issuer; `ALREADY_CLOSED` for a builder
-/// already started.
+/// Parse an optional `CapabilityRequirement` JSON (`aster_server_set_topology`
+/// format): an empty span keeps `default`, JSON `null` is none.
+unsafe fn requirement_arg(
+    json: &aster_bytes_t,
+    what: &str,
+    default: Option<aster::rpc::CapabilityRequirement>,
+) -> Result<Option<aster::rpc::CapabilityRequirement>, i32> {
+    if json.len > 1024 * 1024 {
+        return Err(fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            format!("{what} exceeds 1 MiB"),
+        ));
+    }
+    let input = crate::data::in_slice(json, what)?;
+    if input.is_empty() {
+        return Ok(default);
+    }
+    serde_json::from_slice::<Option<aster::rpc::CapabilityRequirement>>(input).map_err(|error| {
+        fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            format!("invalid {what}: {error}"),
+        )
+    })
+}
+
+/// Serve `aster.lease.Grantor` (ABI 5.1; Rust `aster::rpc::lease::LeaseGrantor`)
+/// on this server, backed by `serializer` (any `aster_lease_serializer_t`:
+/// a foreign one answered by the binding over upcalls, or the in-memory
+/// one). The grantor binds every operation to the caller's authenticated
+/// node id, never a request field. `requires_json` gates every method
+/// (CapabilityRequirement JSON; empty or `null` = none, admission is the
+/// boundary); `revoke_requires_json` gates `revoke` (empty = the default
+/// `operator` role, `null` = only `requires_json`). Clients acquire through
+/// it with `aster_lease_serializer_grantor_new`. A later call replaces the
+/// earlier one. `NOT_FOUND` for an unknown builder or serializer;
+/// `ALREADY_CLOSED` for a builder already started.
+///
+/// # Safety
+/// The JSON spans must be readable for their advertised lengths.
 #[no_mangle]
-pub extern "C" fn aster_server_set_enrollment(
-    runtime: aster_runtime_t,
+pub unsafe extern "C" fn aster_server_add_lease_grantor(
     builder: aster_server_builder_t,
-    enrollment: crate::enrollment::aster_enrollment_t,
-    issuer: crate::enrollment::aster_enrollment_issuer_t,
+    serializer: crate::upcall::aster_lease_serializer_t,
+    requires_json: aster_bytes_t,
+    revoke_requires_json: aster_bytes_t,
 ) -> i32 {
-    let bridge = match load_runtime(runtime) {
-        Ok(b) => b,
-        Err(s) => return status(s),
+    let requires = match requirement_arg(&requires_json, "requires_json", None) {
+        Ok(requirement) => requirement,
+        Err(code) => return code,
+    };
+    let revoke = match requirement_arg(
+        &revoke_requires_json,
+        "revoke_requires_json",
+        Some(aster::rpc::require_role("operator")),
+    ) {
+        Ok(requirement) => requirement,
+        Err(code) => return code,
+    };
+    let backend = match crate::upcall::serializer_for(serializer) {
+        Ok(backend) => backend,
+        Err(code) => return code,
     };
     let Some(state) = BUILDERS.get(builder) else {
         return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
-    };
-    let attached = match crate::enrollment::server_enrollment(&bridge, enrollment, issuer) {
-        Ok(attached) => attached,
-        Err(code) => return code,
     };
     let mut spec = state.spec.lock().unwrap();
     let Some(spec) = spec.as_mut() else {
@@ -836,7 +916,11 @@ pub extern "C" fn aster_server_set_enrollment(
             "builder already started",
         );
     };
-    spec.enrollment = Some(attached);
+    let mut grantor = aster::rpc::lease::LeaseGrantor::new(backend).revoke_requires(revoke);
+    if let Some(requires) = requires {
+        grantor = grantor.requires(requires);
+    }
+    spec.lease_grantor = Some(grantor);
     status(aster_status_t::ASTER_STATUS_OK)
 }
 

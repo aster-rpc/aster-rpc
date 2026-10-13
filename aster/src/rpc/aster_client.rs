@@ -189,42 +189,16 @@ async fn enroll(
     plan: crate::enrollment::runtime::Plan,
     server: &NodeAddr,
 ) -> Result<ClientEnrollment> {
-    use crate::enrollment::ENROLLMENT_ALPN;
+    use crate::enrollment::runtime::serve_inbound_enrollment;
     let installed = plan.install(node)?;
     let enrollment = installed.enrollment;
     // The server re-presents its credential after renewing it, over a new
     // enrollment connection to this node.
-    let accept = {
-        let node = node.clone();
-        let enrollment = enrollment.clone();
-        tokio::spawn(async move {
-            while let Ok((alpn, connection)) = node.accept().await {
-                if alpn == ENROLLMENT_ALPN {
-                    let enrollment = enrollment.clone();
-                    tokio::spawn(async move {
-                        if enrollment.accept(&connection).await.is_ok() {
-                            connection.closed().await;
-                        }
-                    });
-                }
-            }
-        })
-    };
-    let fail = |message: String| Error::InvalidArgument(format!("enrollment: {message}"));
-    let (readiness, ticket) =
-        tokio::time::timeout(plan.sync_timeout, enrollment.connect(server.clone()))
-            .await
-            .map_err(|_| {
-                fail("the server did not complete the enrollment handshake in time".into())
-            })?
-            .map_err(|e| fail(format!("enrolling with the server: {e:#}")))?;
-    if plan.synchronize {
-        if let Some(ticket) = ticket {
-            enrollment
-                .synchronize(readiness.peer, ticket, plan.sync_timeout)
-                .await
-                .map_err(|e| fail(format!("synchronizing the fleet namespace: {e:#}")))?;
-        }
+    let accept = serve_inbound_enrollment(node, &enrollment);
+    let enrolled = plan.enroll_with_server(&enrollment, server).await;
+    if let Err(err) = enrolled {
+        accept.abort();
+        return Err(err);
     }
     let renewal = plan.start_renewal(&enrollment, Some(server));
     Ok(ClientEnrollment {

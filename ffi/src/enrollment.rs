@@ -1,68 +1,79 @@
-//! ABI 5.1 (additive): Enrollment for enrolled nodes and delegated issuers.
+//! ABI 5.1: Enrollment driven by the resolved `AsterConfig`, the C ABI mirror
+//! of `AsterServer` / `AsterClient` (design
+//! `docs/_internal/working_ideas/aster-enrollment.md` §15).
 //!
-//! Thin wrappers over `aster::enrollment` (design
-//! `docs/_internal/working_ideas/aster-enrollment.md`). Bindings get the two
-//! roles a non-Rust process plays:
+//! The binding never re-implements Enrollment: it hands this module the
+//! `[trust]` + `[enrollment]` settings as JSON and the facade's
+//! `binding_support::enrollment::plan` / `Plan::install` and the server and
+//! client sequences do the rest.
 //!
-//! - **Enrolled node**: `aster_enrollment_install` puts Enrollment in charge
-//!   of a node's admission from a JSON configuration (trusted root, audience,
-//!   fleet namespace, durable state path, the node's credential chain, a
-//!   declarative admission policy, root rotation pin). Then connect to
-//!   replicas, synchronize policy, check peers, read a peer's verified claims,
-//!   replace the credential, follow revocations, and renew from an issuer.
-//! - **Delegated issuer**: `aster_enrollment_issuer_new` holds a delegation
-//!   chain from the root and signs credentials for subjects the root has not
-//!   denied (`aster_enrollment_issue`); `aster_server_set_enrollment` serves
-//!   `aster.enrollment.IssuerV1` renewals next to the node's enrollment ALPN.
+//! ```text
+//!   aster_config_enrollment_from_env / _from_toml   resolve [trust]/[enrollment]
+//!                                                   (and ASTER_ENROLLMENT_*) → JSON
+//!   aster_node_start_enrolled(rt, cfg, json, side)   validate (fail closed), start
+//!                                                   the node with fail-closed hooks
+//!                                                   and aster.enrollment/1, install
+//!                                                   → NODE_CREATED, related = enrollment
+//!   aster_server_builder_new / _start                a server on that node routes
+//!                                                   the handshake, serves IssuerV1
+//!                                                   when configured, maps claims to
+//!                                                   Gate-3 roles per call, attaches
+//!                                                   policy and renews (§15.4)
+//!   aster_enrollment_enroll(rt, e, server_addr)      client: handshake, sync,
+//!                                                   renewal (§15.7)
+//! ```
 //!
-//! Root operations (namespace create/bind, promote, revoke, reauthorize,
-//! rotate, delegate) are deliberately absent: they stay in the Rust CLI.
+//! Escape hatches on an installed Enrollment: `aster_enrollment_status`,
+//! `_peer_claims`, `_check_peer`, `_next_revocation`, and on a server with a
+//! configured issuer `_issuer_info` and `_issue`. Root operations (namespace
+//! create/bind, promote, revoke, reauthorize, rotate, delegate) stay in the
+//! Rust CLI.
 //!
 //! # Conventions
 //!
 //! Configuration and results are UTF-8 JSON (`aster_bytes_t`, borrowed for the
 //! call). Synchronous outputs are owned byte spans freed with
 //! `aster_string_release`. Asynchronous operations complete with
-//! `ASTER_EVENT_ENROLLMENT_RESULT` (JSON payload, `handle` = the enrollment or
-//! renewal) or `ASTER_EVENT_ERROR`. Admission errors carry their kind in the
-//! event's `flags` (see `aster_enrollment_error_t`). Keys and node ids are
-//! 64 lowercase-or-uppercase hex characters; outputs are lowercase.
-//!
-//! # Node prerequisites
-//!
-//! The node must come from `aster_node_start` with `enable_hooks = 1`,
-//! `hook_failure_mode = ASTER_HOOK_FAILURE_FAIL_CLOSED`, `aster.enrollment/1`
-//! among its ALPNs, and no gate. After install the node's admission drainers
-//! forward both hook directions to Enrollment; `aster_node_set_gate` returns
-//! `UNSUPPORTED` from then on. Inbound `aster.enrollment/1` connections are
-//! served by an RPC server built with `aster_server_set_enrollment`.
+//! `ASTER_EVENT_ENROLLMENT_RESULT` (JSON payload, `handle` = the enrollment)
+//! or `ASTER_EVENT_ERROR`. Admission errors carry their kind in the event's
+//! `flags` (see `aster_enrollment_error_t`). Keys and node ids are 64 hex
+//! characters; outputs are lowercase.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-use aster::delegation::Chain;
+use aster::binding_support::enrollment::{plan, serve_inbound_enrollment, Overrides, Plan, Side};
 use aster::enrollment::{
     AdmissionClaims, AdmissionError, AdmissionEvidenceSource, DenialReason, Enrollment,
-    EnrollmentOptions, EnrollmentPolicyStore, EnrollmentReadiness, EnrollmentRevoked, Issuer,
-    IssuerErrorV1, JwtEnrollmentVerifier, PolicyExpressionV1, PolicyPredicate, Registration,
-    RenewalConfig, RenewalOutcome, RotationPin, SourceCidr, SynchronizationSource, TypedAttribute,
-    VerifiedAdmissionEvidence, DEFAULT_ISSUED_LIFETIME,
+    EnrollmentReadiness, EnrollmentRevoked, Issuer, IssuerErrorV1, Registration, RenewalHandle,
+    SynchronizationSource, VerifiedAdmissionEvidence,
 };
-use aster_transport_core::CoreHookReceiver;
-use serde::Deserialize;
+use aster::{AsterConfig, EnrollmentConfig, EnrollmentLimits, PublicKey, RoleMappingConfig};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
 
 use crate::data::{bridge_for, in_slice, in_string, invalid, spawn_op_cancellable, Done, OpError};
 use crate::*;
 
-/// An installed Enrollment (`aster_enrollment_install`), scoped to a runtime.
+/// An Enrollment installed by `aster_node_start_enrolled`, scoped to a
+/// runtime. It lives as long as its node (closing the node releases it);
+/// `aster_enrollment_free` releases it earlier.
 pub type aster_enrollment_t = u64;
-/// A delegated issuer (`aster_enrollment_issuer_new`), scoped to a runtime.
-pub type aster_enrollment_issuer_t = u64;
-/// A running credential renewal (`aster_enrollment_start_renewal`).
-pub type aster_enrollment_renewal_t = u64;
+
+/// `side` of `aster_node_start_enrolled`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum aster_enrollment_side_t {
+    /// A server: durable state required; may run a delegated issuer;
+    /// `aster_server_start` on the node attaches policy and renews.
+    ASTER_ENROLLMENT_SIDE_SERVER = 0,
+    /// A client: state may be temporary; enrolls per server with
+    /// `aster_enrollment_enroll`; serves inbound enrollment handshakes.
+    ASTER_ENROLLMENT_SIDE_CLIENT = 1,
+}
 
 /// `flags` of an `ASTER_EVENT_ERROR` from an Enrollment admission check
 /// (`aster_enrollment_check_peer`): which `AdmissionError` it was.
@@ -82,14 +93,20 @@ pub enum aster_enrollment_error_t {
     ASTER_ENROLLMENT_ERROR_UNAVAILABLE = 4,
 }
 
-/// Configuration and policy JSON is bounded before parsing.
+/// Configuration and request JSON is bounded before parsing.
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
-const MAX_REPLICAS: usize = 16;
 
 /// The registry entry behind an `aster_enrollment_t`.
 pub(crate) struct EnrollmentState {
     pub(crate) enrollment: Enrollment,
-    node: aster::Node,
+    pub(crate) issuer: Option<Issuer>,
+    pub(crate) node: aster::Node,
+    /// The validated plan (keeps a client's temporary state directory alive).
+    pub(crate) plan: Plan,
+    /// This node's credential renewal, once started (at most one).
+    renewal: Mutex<Option<RenewalHandle>>,
+    /// A client's inbound enrollment acceptor.
+    acceptor: Option<tokio::task::JoinHandle<()>>,
     /// Subscribed at install, so no revocation after install is missed.
     revocations: tokio::sync::Mutex<broadcast::Receiver<EnrollmentRevoked>>,
     /// Set by `aster_enrollment_free`; ends pending revocation waits.
@@ -101,6 +118,13 @@ impl EnrollmentState {
     fn release(&self) {
         self.released.store(true, Ordering::Release);
         self.released_notify.notify_waiters();
+        if let Some(acceptor) = &self.acceptor {
+            acceptor.abort();
+        }
+        self.renewal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     async fn wait_released(&self) {
@@ -111,191 +135,267 @@ impl EnrollmentState {
             notified.await;
         }
     }
-}
 
-/// The registry entry behind an `aster_enrollment_issuer_t`.
-pub(crate) struct IssuerState {
-    pub(crate) issuer: Issuer,
-    enrollment: Enrollment,
-}
+    fn renewing(&self) -> bool {
+        self.renewal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
 
-/// The registry entry behind an `aster_enrollment_renewal_t`. Dropping it
-/// aborts the watcher, which drops the renewal handle and stops renewal.
-pub(crate) struct RenewalState {
-    outcome: watch::Receiver<Option<RenewalOutcome>>,
-    task: tokio::task::AbortHandle,
-}
+    /// Start renewal unless one runs already (§15.4 step 6, §15.7 step 6).
+    fn start_renewal(&self, server: Option<&aster::NodeAddr>) -> bool {
+        let mut renewal = self.renewal.lock().unwrap_or_else(|e| e.into_inner());
+        if renewal.is_none() {
+            *renewal = self.plan.start_renewal(&self.enrollment, server);
+        }
+        renewal.is_some()
+    }
 
-impl Drop for RenewalState {
-    fn drop(&mut self) {
-        self.task.abort();
+    /// Server sequence after serving (§15.4 steps 5 and 6): hold or
+    /// synchronize the fleet namespace, then renew from `renew_from`.
+    pub(crate) async fn attach_server(&self) -> aster::Result<()> {
+        self.plan
+            .attach_policy(&self.node, &self.enrollment)
+            .await?;
+        self.start_renewal(None);
+        Ok(())
+    }
+
+    /// Wire a server (§15.4 step 4): route `aster.enrollment/1` into
+    /// Enrollment, serve `aster.enrollment.IssuerV1` when an issuer is
+    /// configured, and feed Gate 3 each peer's roles per call. Accepted
+    /// enrollment connections are held until the peer closes them or
+    /// `stopped` ends (the server was destroyed).
+    pub(crate) fn apply(
+        &self,
+        mut server: aster::rpc::Server,
+        attributes: &aster::rpc::AttributeStore,
+        stopped: watch::Receiver<()>,
+    ) -> aster::rpc::Server {
+        attributes.set_source(self.plan.attribute_source(&self.enrollment));
+        if let Some(issuer) = &self.issuer {
+            server = server.register(issuer.clone());
+        }
+        let enrollment = self.enrollment.clone();
+        server.route_alpn(aster::enrollment::ENROLLMENT_ALPN, move |connection| {
+            let enrollment = enrollment.clone();
+            let mut stopped = stopped.clone();
+            tokio::spawn(async move {
+                let accepted = tokio::select! {
+                    accepted = enrollment.accept(&connection) => accepted.is_ok(),
+                    _ = stopped.changed() => false,
+                };
+                drop(enrollment);
+                if accepted {
+                    tokio::select! {
+                        _ = connection.closed() => {}
+                        _ = stopped.changed() => {}
+                    }
+                }
+            });
+        })
     }
 }
 
-// ── JSON inputs ─────────────────────────────────────────────────────────────
+impl Drop for EnrollmentState {
+    fn drop(&mut self) {
+        if let Some(acceptor) = &self.acceptor {
+            acceptor.abort();
+        }
+    }
+}
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InstallConfig {
-    /// The trusted root public key.
-    root: String,
-    /// The fleet audience the verifier and stores pin.
-    audience: String,
-    /// The fleet policy namespace pinned to `root`.
-    fleet_namespace: String,
-    /// Durable policy state file (denials and revision watermarks).
-    state_path: String,
-    /// This node's credential chain; absent for a pure verifier.
-    #[serde(default)]
-    credential: Option<String>,
-    /// The admission policy (required, explicit).
-    policy: PolicyJson,
-    #[serde(default)]
-    rotation: Option<RotationJson>,
-    #[serde(default)]
-    applied_rotations: Vec<String>,
-    #[serde(default)]
+// ── Configuration JSON ──────────────────────────────────────────────────────
+
+/// `[trust]` (root, rotation pin, this node's credential) and `[enrollment]`
+/// as JSON: the field names of `aster::AsterConfig` / `EnrollmentConfig`
+/// (design §15.3). Every field is optional; unknown fields are refused.
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TrustJson {
+    root_pubkey: Option<String>,
+    root_pubkey_file: Option<String>,
+    next_root_commitment: Option<String>,
+    root_seq: u64,
+    root_rotations: Vec<String>,
+    enrollment_credential_file: Option<String>,
+    enrollment_credential_chain: Option<String>,
+    enrollment: EnrollmentJson,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+struct EnrollmentJson {
+    enabled: Option<bool>,
+    audience: Option<String>,
+    fleet_namespace: Option<String>,
+    state_path: Option<String>,
+    replicas: Vec<String>,
+    policy: Option<Value>,
     require_synchronized_clock: bool,
-    #[serde(default)]
     activation_leeway_secs: Option<u64>,
-    #[serde(default)]
     limits: LimitsJson,
+    roles: RolesJson,
+    issuer_delegation_file: Option<String>,
+    issuer_lifetime_secs: Option<u64>,
+    renew_from: Option<String>,
+    renew: Option<bool>,
+    synchronize: Option<bool>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RotationJson {
-    next_commitment: String,
-    #[serde(default)]
-    seq: u64,
-}
-
-/// Overrides of `EnrollmentOptions`; omitted values keep the defaults.
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 struct LimitsJson {
     handshake_timeout_ms: Option<u64>,
     step_timeout_ms: Option<u64>,
     policy_timeout_ms: Option<u64>,
     reconciliation_interval_ms: Option<u64>,
-    max_admitted_peers: Option<usize>,
+    max_admitted_peers: Option<u64>,
+    sync_timeout_ms: Option<u64>,
 }
 
-/// `PolicyExpressionV1` as JSON: an externally tagged tree, e.g.
-/// `{"all_of":[{"scope":"session"},"tolerate_stale_policy"]}`.
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-enum PolicyJson {
-    AllOf(Vec<PolicyJson>),
-    AnyOf(Vec<PolicyJson>),
-    NoneOf(Vec<PolicyJson>),
-    SourceCidr(String),
-    Audience(String),
-    Scope(String),
-    Tag(String),
-    AttributeEquals {
-        key: String,
-        value: TypedAttribute,
-    },
-    TolerateStalePolicy,
-    PolicySynchronizedWithin {
-        max_age_secs: u64,
-        #[serde(default)]
-        require_root: bool,
-    },
-    RequireRegistration,
-    IssuedBy(String),
-    MaxCredentialAgeSecs(u64),
+/// `[enrollment.roles]`; an absent `attribute` / `include_attributes` keeps
+/// the default (`"aster.role"` / `true`), and `""` disables the attribute.
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+struct RolesJson {
+    attribute: Option<String>,
+    scopes_as_roles: bool,
+    scopes: BTreeMap<String, Vec<String>>,
+    tags: BTreeMap<String, Vec<String>>,
+    include_attributes: Option<bool>,
 }
 
-impl PolicyJson {
-    fn lower(self) -> Result<PolicyExpressionV1, String> {
-        let all = |children: Vec<PolicyJson>| -> Result<Vec<PolicyExpressionV1>, String> {
-            children.into_iter().map(PolicyJson::lower).collect()
+fn opt_path(path: &Option<String>) -> Option<PathBuf> {
+    path.as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
+fn opt_text(text: &Option<String>) -> Option<String> {
+    text.as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+fn path_text(path: &Option<PathBuf>) -> Option<String> {
+    path.as_ref().map(|p| p.display().to_string())
+}
+
+impl TrustJson {
+    pub(crate) fn from_config(config: &AsterConfig) -> Self {
+        let e = &config.enrollment;
+        let l = &e.limits;
+        Self {
+            root_pubkey: config.root_pubkey.as_ref().map(PublicKey::to_hex),
+            root_pubkey_file: path_text(&config.root_pubkey_file),
+            next_root_commitment: config.next_root_commitment.clone(),
+            root_seq: config.root_seq,
+            root_rotations: config.root_rotations.clone(),
+            enrollment_credential_file: path_text(&config.enrollment_credential_file),
+            enrollment_credential_chain: config.enrollment_credential_chain.clone(),
+            enrollment: EnrollmentJson {
+                enabled: e.enabled,
+                audience: e.audience.clone(),
+                fleet_namespace: e.fleet_namespace.clone(),
+                state_path: path_text(&e.state_path),
+                replicas: e.replicas.clone(),
+                policy: e.policy.clone(),
+                require_synchronized_clock: e.require_synchronized_clock,
+                activation_leeway_secs: e.activation_leeway_secs,
+                limits: LimitsJson {
+                    handshake_timeout_ms: l.handshake_timeout_ms,
+                    step_timeout_ms: l.step_timeout_ms,
+                    policy_timeout_ms: l.policy_timeout_ms,
+                    reconciliation_interval_ms: l.reconciliation_interval_ms,
+                    max_admitted_peers: l.max_admitted_peers,
+                    sync_timeout_ms: l.sync_timeout_ms,
+                },
+                roles: RolesJson {
+                    attribute: Some(e.roles.attribute.clone()),
+                    scopes_as_roles: e.roles.scopes_as_roles,
+                    scopes: e.roles.scopes.clone(),
+                    tags: e.roles.tags.clone(),
+                    include_attributes: Some(e.roles.include_attributes),
+                },
+                issuer_delegation_file: path_text(&e.issuer_delegation_file),
+                issuer_lifetime_secs: e.issuer_lifetime_secs,
+                renew_from: e.renew_from.clone(),
+                renew: e.renew,
+                synchronize: e.synchronize,
+            },
+        }
+    }
+
+    /// Replace `config`'s trust and enrollment settings with these.
+    pub(crate) fn apply(self, config: &mut AsterConfig) -> Result<(), String> {
+        config.root_pubkey = match opt_text(&self.root_pubkey) {
+            None => None,
+            Some(hex) => Some(
+                PublicKey::from_hex(&hex)
+                    .map_err(|_| "root_pubkey: expected 64 hex characters".to_string())?,
+            ),
         };
-        let predicate = PolicyExpressionV1::Predicate;
-        Ok(match self {
-            Self::AllOf(children) => PolicyExpressionV1::AllOf(all(children)?),
-            Self::AnyOf(children) => PolicyExpressionV1::AnyOf(all(children)?),
-            Self::NoneOf(children) => PolicyExpressionV1::NoneOf(all(children)?),
-            Self::SourceCidr(cidr) => predicate(PolicyPredicate::SourceCidr(
-                cidr.parse::<SourceCidr>()
-                    .map_err(|_| format!("policy: invalid source_cidr {cidr:?}"))?,
-            )),
-            Self::Audience(value) => predicate(PolicyPredicate::Audience(value)),
-            Self::Scope(value) => predicate(PolicyPredicate::Scope(value)),
-            Self::Tag(value) => predicate(PolicyPredicate::Tag(value)),
-            Self::AttributeEquals { key, value } => {
-                predicate(PolicyPredicate::AttributeEquals { key, value })
-            }
-            Self::TolerateStalePolicy => predicate(PolicyPredicate::TolerateStalePolicy),
-            Self::PolicySynchronizedWithin {
-                max_age_secs,
-                require_root,
-            } => predicate(PolicyPredicate::PolicySynchronizedWithin {
-                max_age: Duration::from_secs(max_age_secs),
-                require_root,
-            }),
-            Self::RequireRegistration => predicate(PolicyPredicate::RequireRegistration),
-            Self::IssuedBy(key) => predicate(PolicyPredicate::IssuedBy(hex32(&key, "issued_by")?)),
-            Self::MaxCredentialAgeSecs(seconds) => predicate(PolicyPredicate::MaxCredentialAge(
-                Duration::from_secs(seconds),
-            )),
-        })
+        config.root_pubkey_file = opt_path(&self.root_pubkey_file);
+        config.next_root_commitment = opt_text(&self.next_root_commitment);
+        config.root_seq = self.root_seq;
+        config.root_rotations = self.root_rotations;
+        config.enrollment_credential_file = opt_path(&self.enrollment_credential_file);
+        // Not trimmed to empty-means-unset: plan() refuses a non-chain
+        // value with a hint, and an empty one as "no credential".
+        config.enrollment_credential_chain = self
+            .enrollment_credential_chain
+            .filter(|chain| !chain.trim().is_empty());
+        let e = self.enrollment;
+        let l = e.limits;
+        let defaults = RoleMappingConfig::default();
+        config.enrollment = EnrollmentConfig {
+            enabled: e.enabled,
+            audience: opt_text(&e.audience),
+            fleet_namespace: opt_text(&e.fleet_namespace),
+            state_path: opt_path(&e.state_path),
+            replicas: e
+                .replicas
+                .into_iter()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .collect(),
+            policy: e.policy.filter(|p| !p.is_null()),
+            require_synchronized_clock: e.require_synchronized_clock,
+            activation_leeway_secs: e.activation_leeway_secs,
+            limits: EnrollmentLimits {
+                handshake_timeout_ms: l.handshake_timeout_ms,
+                step_timeout_ms: l.step_timeout_ms,
+                policy_timeout_ms: l.policy_timeout_ms,
+                reconciliation_interval_ms: l.reconciliation_interval_ms,
+                max_admitted_peers: l.max_admitted_peers,
+                sync_timeout_ms: l.sync_timeout_ms,
+            },
+            roles: RoleMappingConfig {
+                attribute: e
+                    .roles
+                    .attribute
+                    .map(|a| a.trim().to_string())
+                    .unwrap_or(defaults.attribute),
+                scopes_as_roles: e.roles.scopes_as_roles,
+                scopes: e.roles.scopes,
+                tags: e.roles.tags,
+                include_attributes: e
+                    .roles
+                    .include_attributes
+                    .unwrap_or(defaults.include_attributes),
+            },
+            issuer_delegation_file: opt_path(&e.issuer_delegation_file),
+            issuer_lifetime_secs: e.issuer_lifetime_secs,
+            renew_from: opt_text(&e.renew_from),
+            renew: e.renew,
+            synchronize: e.synchronize,
+        };
+        Ok(())
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AddrJson {
-    node_id: String,
-    #[serde(default)]
-    relay_url: Option<String>,
-    #[serde(default)]
-    direct_addresses: Vec<String>,
-}
-
-impl AddrJson {
-    fn lower(self) -> Result<aster::NodeAddr, String> {
-        let node_id = hex::encode(hex32(&self.node_id, "node_id")?);
-        Ok(aster::NodeAddr {
-            node_id: aster::NodeId::from_hex(node_id),
-            relay_url: self.relay_url.filter(|url| !url.is_empty()),
-            direct_addresses: self.direct_addresses,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RenewalJson {
-    issuer: AddrJson,
-    #[serde(default)]
-    retry_ms: Option<u64>,
-    #[serde(default)]
-    max_retry_ms: Option<u64>,
-    #[serde(default)]
-    call_timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IssueJson {
-    subject: String,
-    #[serde(default)]
-    claims: AdmissionClaims,
-    #[serde(default)]
-    registration: Registration,
-}
-
-fn hex32(value: &str, what: &str) -> Result<[u8; 32], String> {
-    if value.len() != 64 {
-        return Err(format!("{what}: expected 64 hex characters"));
-    }
-    hex::decode(value)
-        .ok()
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| format!("{what}: expected 64 hex characters"))
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T, i32> {
@@ -307,9 +407,266 @@ fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Resul
     serde_json::from_slice(bytes).map_err(|error| invalid(format!("{what}: {error}")))
 }
 
-unsafe fn in_key(b: &aster_bytes_t, what: &str) -> Result<[u8; 32], i32> {
-    let text = in_string(b, what)?;
-    hex32(&text, what).map_err(invalid)
+unsafe fn prepare(out: *mut aster_bytes_t) -> Result<(), i32> {
+    if out.is_null() {
+        return Err(invalid("NULL output"));
+    }
+    ptr::write(
+        out,
+        aster_bytes_t {
+            ptr: ptr::null(),
+            len: 0,
+        },
+    );
+    Ok(())
+}
+
+unsafe fn output(out: *mut aster_bytes_t, value: Value) {
+    ptr::write(out, alloc_owned_bytes(value.to_string().into_bytes()));
+}
+
+macro_rules! attempt {
+    ($value:expr) => {
+        match $value {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
+    };
+}
+
+/// Resolve `[trust]` and `[enrollment]` from the environment
+/// (`AsterConfig::from_env`: `ASTER_ROOT_PUBKEY(_FILE)`,
+/// `ASTER_NEXT_ROOT_COMMITMENT`, `ASTER_ROOT_SEQ`, `ASTER_ROOT_ROTATIONS`,
+/// `ASTER_ENROLLMENT_CREDENTIAL(_CHAIN)`, `ASTER_ENROLLMENT_*`) and write the
+/// trust JSON `aster_node_start_enrolled` takes as owned JSON:
+///
+/// ```json
+/// {"root_pubkey": "<hex>"|null, "root_pubkey_file": "…"|null,
+///  "next_root_commitment": "<hex>"|null, "root_seq": 0, "root_rotations": [],
+///  "enrollment_credential_file": "…"|null, "enrollment_credential_chain": "…"|null,
+///  "enrollment": {"enabled": null, "audience": "…", "fleet_namespace": "<hex>",
+///    "state_path": "…", "replicas": [], "policy": <PolicyConfig>|null,
+///    "require_synchronized_clock": false, "activation_leeway_secs": null,
+///    "limits": {"handshake_timeout_ms", "step_timeout_ms", "policy_timeout_ms",
+///               "reconciliation_interval_ms", "max_admitted_peers", "sync_timeout_ms"},
+///    "roles": {"attribute": "aster.role", "scopes_as_roles": false,
+///              "scopes": {"scope": ["role"]}, "tags": {}, "include_attributes": true},
+///    "issuer_delegation_file": "…"|null, "issuer_lifetime_secs": null,
+///    "renew_from": "…"|null, "renew": null, "synchronize": null}}
+/// ```
+///
+/// A malformed variable is `INVALID_ARGUMENT`.
+///
+/// # Safety
+/// `out_json` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn aster_config_enrollment_from_env(out_json: *mut aster_bytes_t) -> i32 {
+    attempt!(prepare(out_json));
+    match AsterConfig::from_env() {
+        Ok(config) => {
+            output(out_json, json!(TrustJson::from_config(&config)));
+            aster_status_t::ASTER_STATUS_OK as i32
+        }
+        Err(error) => invalid(error),
+    }
+}
+
+/// [`aster_config_enrollment_from_env`] for a TOML file
+/// (`AsterConfig::from_file`: defaults < file < environment).
+///
+/// # Safety
+/// `path` must be readable; `out_json` writable.
+#[no_mangle]
+pub unsafe extern "C" fn aster_config_enrollment_from_toml(
+    path: aster_bytes_t,
+    out_json: *mut aster_bytes_t,
+) -> i32 {
+    attempt!(prepare(out_json));
+    let path = attempt!(in_string(&path, "path"));
+    match AsterConfig::from_file(&path) {
+        Ok(config) => {
+            output(out_json, json!(TrustJson::from_config(&config)));
+            aster_status_t::ASTER_STATUS_OK as i32
+        }
+        Err(error) => invalid(error),
+    }
+}
+
+// ── Node start ──────────────────────────────────────────────────────────────
+
+/// Start a node from `config` with Enrollment from `trust_json` (the JSON of
+/// `aster_config_enrollment_from_env`), as `AsterServer` / `AsterClient` do.
+///
+/// When the trust JSON does not enable enrollment (design §15.3: `enabled`,
+/// else any of audience, fleet namespace, issuer delegation or credential),
+/// this is exactly `aster_node_start(runtime, config, 0, …)`. Otherwise the
+/// whole plan is validated before anything starts (any error is
+/// `INVALID_ARGUMENT` naming the setting, and nothing runs open); the node
+/// starts with fail-closed hooks and `aster.enrollment/1`, and Enrollment is
+/// installed from the credential before the node is handed out (an
+/// install failure, such as a credential issued for another key, closes the
+/// node and completes with `ASTER_EVENT_ERROR`).
+///
+/// Completes with `ASTER_EVENT_NODE_CREATED`: `handle` = the node, `related`
+/// = its `aster_enrollment_t` (0 when enrollment is off). A server
+/// (`ASTER_ENROLLMENT_SIDE_SERVER`) then builds its dispatch server on the
+/// node; `aster_server_start` wires and attaches Enrollment. A client
+/// (`ASTER_ENROLLMENT_SIDE_CLIENT`) enrolls with each server through
+/// `aster_enrollment_enroll` before its first RPC connection, and serves
+/// inbound enrollment handshakes on the node (do not `aster_accept` on it).
+/// The node accepts no gate.
+///
+/// # Safety
+/// `config` is NULL or a valid `aster_config_t`; `trust_json` readable;
+/// `out_operation` writable.
+#[no_mangle]
+pub unsafe extern "C" fn aster_node_start_enrolled(
+    runtime: aster_runtime_t,
+    config: *const node::aster_config_t,
+    trust_json: aster_bytes_t,
+    side: u32,
+    user_data: u64,
+    out_operation: *mut aster_operation_t,
+) -> i32 {
+    if out_operation.is_null() {
+        return invalid("aster_node_start_enrolled: out_operation is NULL");
+    }
+    let side = match side {
+        x if x == aster_enrollment_side_t::ASTER_ENROLLMENT_SIDE_SERVER as u32 => Side::Server,
+        x if x == aster_enrollment_side_t::ASTER_ENROLLMENT_SIDE_CLIENT as u32 => Side::Client,
+        other => return invalid(format!("unknown enrollment side {other}")),
+    };
+    let mut cfg = match config.as_ref() {
+        None => AsterConfig::default(),
+        Some(c) => match node::lower_config(c) {
+            Ok(cfg) => cfg,
+            Err(e) => return invalid(e),
+        },
+    };
+    let trust: TrustJson = attempt!(parse_json(
+        attempt!(in_slice(&trust_json, "trust_json")),
+        "trust_json"
+    ));
+    if let Err(error) = trust.apply(&mut cfg) {
+        return invalid(error);
+    }
+    let bridge = attempt!(bridge_for(runtime));
+    let plan = match plan(&mut cfg, side, Overrides::default()) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return node::aster_node_start(runtime, config, 0, user_data, out_operation),
+        Err(error) => return invalid(error),
+    };
+
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
+    *out_operation = op_id;
+    let bridge2 = bridge.clone();
+    bridge.runtime.spawn(async move {
+        if check_cancelled(&cancelled, &bridge2, op_id, user_data) {
+            return;
+        }
+        let health = cfg.health_config();
+        let node = match aster::Node::start_with_alpns(
+            cfg,
+            vec![aster::enrollment::ENROLLMENT_ALPN.to_vec()],
+        )
+        .await
+        {
+            Ok(node) => node,
+            Err(error) => return bridge2.emit_error(op_id, user_data, &error.to_string()),
+        };
+        let installed = match plan.install(&node) {
+            Ok(installed) => installed,
+            Err(error) => {
+                node.shutdown().await;
+                bridge2.emit_error_coded(
+                    op_id,
+                    user_data,
+                    aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+                    aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+        let acceptor = (plan.side() == Side::Client)
+            .then(|| serve_inbound_enrollment(&node, &installed.enrollment));
+        let revocations = tokio::sync::Mutex::new(installed.enrollment.revocations());
+        let handle = bridge2.nodes.insert(node.core_node().clone());
+        crate::health::remember_node_config(handle, health);
+        let id = bridge2.enrollments.insert(EnrollmentState {
+            enrollment: installed.enrollment,
+            issuer: installed.issuer,
+            node: node.clone(),
+            plan,
+            renewal: Mutex::new(None),
+            acceptor,
+            revocations,
+            released: AtomicBool::new(false),
+            released_notify: tokio::sync::Notify::new(),
+        });
+        bridge2
+            .node_enrollments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, id);
+        let completed = bridge2.emit_simple(
+            aster_event_kind_t::ASTER_EVENT_NODE_CREATED,
+            aster_status_t::ASTER_STATUS_OK,
+            op_id,
+            handle,
+            id,
+            user_data,
+            0,
+        );
+        if !completed {
+            node::forget_node(&bridge2, handle);
+            bridge2.nodes.remove(handle);
+            node.shutdown().await;
+        }
+    });
+    aster_status_t::ASTER_STATUS_OK as i32
+}
+
+/// Release the Enrollment a node was started with (called when the node is
+/// closed or freed).
+pub(crate) fn forget_node(bridge: &BridgeRuntime, node: aster_node_t) {
+    let id = bridge
+        .node_enrollments
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&node);
+    if let Some(state) = id.and_then(|id| bridge.enrollments.remove(id)) {
+        state.release();
+    }
+}
+
+/// The server-side Enrollment of `node`, for `aster_server_builder_new`.
+/// `Ok(None)` when the node was started without enrollment.
+pub(crate) fn server_enrollment_for_node(
+    bridge: &BridgeRuntime,
+    node: aster_node_t,
+) -> Result<Option<Arc<EnrollmentState>>, i32> {
+    let id = bridge
+        .node_enrollments
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&node)
+        .copied();
+    let Some(id) = id else { return Ok(None) };
+    let Some(state) = bridge.enrollments.get(id) else {
+        set_last_error("the node's enrollment was released; close the node");
+        return Err(aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32);
+    };
+    if state.plan.side() != Side::Server {
+        return Err(invalid(
+            "the node was started with a client enrollment; a server needs \
+             ASTER_ENROLLMENT_SIDE_SERVER",
+        ));
+    }
+    Ok(Some(state))
 }
 
 // ── JSON outputs ────────────────────────────────────────────────────────────
@@ -453,35 +810,9 @@ fn other_error(error: impl std::fmt::Display) -> OpError {
     }
 }
 
-/// An `anyhow` error from Enrollment: an `AdmissionError` keeps its kind.
-fn anyhow_error(error: anyhow::Error) -> OpError {
-    match error.downcast::<AdmissionError>() {
-        Ok(admission) => admission_error(admission),
-        Err(other) => other_error(other),
-    }
-}
-
 fn result(handle: u64, value: Value) -> Done {
     Done::ok(aster_event_kind_t::ASTER_EVENT_ENROLLMENT_RESULT, handle)
         .data(value.to_string().into_bytes())
-}
-
-unsafe fn prepare(out: *mut aster_bytes_t) -> Result<(), i32> {
-    if out.is_null() {
-        return Err(invalid("NULL output"));
-    }
-    ptr::write(
-        out,
-        aster_bytes_t {
-            ptr: ptr::null(),
-            len: 0,
-        },
-    );
-    Ok(())
-}
-
-unsafe fn output(out: *mut aster_bytes_t, value: Value) {
-    ptr::write(out, alloc_owned_bytes(value.to_string().into_bytes()));
 }
 
 fn live(bridge: &BridgeRuntime) -> Result<(), i32> {
@@ -503,197 +834,109 @@ fn enrollment_state(
         .ok_or_else(|| crate::data::not_found(format!("unknown enrollment {enrollment}")))
 }
 
-macro_rules! attempt {
-    ($value:expr) => {
-        match $value {
-            Ok(value) => value,
-            Err(status) => return status,
-        }
-    };
+fn hex32(value: &str, what: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err(format!("{what}: expected 64 hex characters"));
+    }
+    hex::decode(value)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| format!("{what}: expected 64 hex characters"))
 }
 
-// ── Enrolled node ───────────────────────────────────────────────────────────
+unsafe fn in_key(b: &aster_bytes_t, what: &str) -> Result<[u8; 32], i32> {
+    let text = in_string(b, what)?;
+    hex32(text.trim(), what).map_err(invalid)
+}
 
-/// Install Enrollment on `node` from `config_json` and write its handle.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddrJson {
+    node_id: String,
+    #[serde(default)]
+    relay_url: Option<String>,
+    #[serde(default)]
+    direct_addresses: Vec<String>,
+}
+
+impl AddrJson {
+    fn lower(self) -> Result<aster::NodeAddr, String> {
+        let node_id = hex::encode(hex32(self.node_id.trim(), "node_id")?);
+        Ok(aster::NodeAddr {
+            node_id: aster::NodeId::from_hex(node_id),
+            relay_url: self.relay_url.filter(|url| !url.is_empty()),
+            direct_addresses: self.direct_addresses,
+        })
+    }
+}
+
+// ── Client ──────────────────────────────────────────────────────────────────
+
+/// Client sequence against one server (design §15.7, steps 3, 4 and 6):
+/// enroll over the reciprocal handshake (the server verifies this node's
+/// credential and this node verifies the server's) within
+/// `limits.sync_timeout_ms`, synchronize the fleet namespace the server
+/// offers unless `synchronize = false`, then start renewal from `renew_from`,
+/// or from this server when it signed this node's credential, unless
+/// `renew = false` (at most one renewal runs per node). Call it before the
+/// first `aster/1` connection to the server; again after a refused call to
+/// re-enroll.
 ///
-/// ```json
-/// {
-///   "root": "<hex32 root public key>",
-///   "audience": "<fleet audience>",
-///   "fleet_namespace": "<hex32 fleet policy namespace>",
-///   "state_path": "/var/lib/app/enrollment.json",
-///   "credential": "aster-chain-v1~…",          // optional: a pure verifier has none
-///   "policy": {"all_of": [{"scope": "session"}, "tolerate_stale_policy"]},
-///   "rotation": {"next_commitment": "<hex32>", "seq": 0},   // optional
-///   "applied_rotations": [],                   // optional
-///   "require_synchronized_clock": false,       // optional
-///   "activation_leeway_secs": 60,              // optional
-///   "limits": {"handshake_timeout_ms": 10000, "step_timeout_ms": 3000,
-///              "policy_timeout_ms": 2000, "reconciliation_interval_ms": 1000,
-///              "max_admitted_peers": 1024}       // optional, each optional
-/// }
-/// ```
-///
-/// Policy nodes: `all_of` / `any_of` / `none_of` (non-empty arrays),
-/// `source_cidr`, `audience`, `scope`, `tag` (strings), `attribute_equals`
-/// (`{"key", "value": {"type": "bool"|"int"|"float"|"string", "value"}}`),
-/// `issued_by` (hex32 key on the chain's issuer path),
-/// `max_credential_age_secs`, `policy_synchronized_within`
-/// (`{"max_age_secs", "require_root"}`), and the bare strings
-/// `"tolerate_stale_policy"` and `"require_registration"`. Admission never
-/// grants operation access; map claims to roles with
-/// `aster_enrollment_peer_claims`.
-///
-/// Returns `INVALID_ARGUMENT` for a malformed configuration or one Enrollment
-/// refuses (for example a credential that does not verify for this node),
-/// `NOT_FOUND` for an unknown node, `UNSUPPORTED` for a node without hooks or
-/// with a gate attached, and `ALREADY_EXISTS` when Enrollment is already
-/// installed on it.
+/// `server_json`: `{"node_id": "<hex32>", "relay_url": "…"?,
+/// "direct_addresses": ["ip:port"]?}`. Completes with
+/// `ASTER_EVENT_ENROLLMENT_RESULT`: `{"readiness": {"peer", "source":
+/// "chain"|"registration", "observed_source", "policy_sync", "local_clock"},
+/// "renewing": bool}`, or `ASTER_EVENT_ERROR` (an admission error keeps its
+/// `aster_enrollment_error_t` in `flags`). `INVALID_ARGUMENT` for a server
+/// enrollment.
 ///
 /// # Safety
-/// `config_json` must be readable; `out_enrollment` writable.
+/// `server_json` must be readable; `out_operation` writable.
 #[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_install(
+pub unsafe extern "C" fn aster_enrollment_enroll(
     runtime: aster_runtime_t,
-    node: aster_node_t,
-    config_json: aster_bytes_t,
-    out_enrollment: *mut aster_enrollment_t,
+    enrollment: aster_enrollment_t,
+    server_json: aster_bytes_t,
+    user_data: u64,
+    out_operation: *mut aster_operation_t,
 ) -> i32 {
-    if out_enrollment.is_null() {
-        return invalid("NULL enrollment output");
+    if out_operation.is_null() {
+        return invalid("NULL operation output");
     }
-    ptr::write(out_enrollment, 0);
     let bridge = attempt!(bridge_for(runtime));
-    attempt!(live(&bridge));
-    let config: InstallConfig = attempt!(parse_json(
-        attempt!(in_slice(&config_json, "config_json")),
-        "enrollment config"
+    let state = attempt!(enrollment_state(&bridge, enrollment));
+    if state.plan.side() != Side::Client {
+        return invalid(
+            "aster_enrollment_enroll is the client sequence; this is a server enrollment",
+        );
+    }
+    let server: AddrJson = attempt!(parse_json(
+        attempt!(in_slice(&server_json, "server_json")),
+        "server address"
     ));
-    let Some(core) = bridge.nodes.get(node) else {
-        return crate::data::not_found(format!("unknown node {node}"));
-    };
-    let Some(slot) = node::admission_slot(&bridge, node) else {
-        set_last_error("Enrollment needs a node started with enable_hooks and fail-closed hooks");
-        return aster_status_t::ASTER_STATUS_UNSUPPORTED as i32;
-    };
-    let root = attempt!(hex32(&config.root, "root").map_err(invalid));
-    let namespace = attempt!(hex32(&config.fleet_namespace, "fleet_namespace").map_err(invalid));
-    if config.state_path.is_empty() {
-        return invalid("state_path: required (Enrollment keeps denials durably)");
-    }
-    let policy = attempt!(config.policy.lower().map_err(invalid));
-    if let Err(error) = policy.validate() {
-        return invalid(format!("policy: {error}"));
-    }
-    let mut store = match EnrollmentPolicyStore::open(
-        &config.state_path,
-        root,
-        namespace,
-        config.audience.clone(),
-    ) {
-        Ok(store) => store,
-        Err(error) => return invalid(format!("state_path: {error}")),
-    };
-    let mut verifier = match JwtEnrollmentVerifier::new(root, config.audience.clone()) {
-        Ok(verifier) => verifier,
-        Err(error) => return invalid(format!("root/audience: {error}")),
-    };
-    if let Some(leeway) = config.activation_leeway_secs {
-        store = match store.with_activation_leeway(leeway) {
-            Ok(store) => store,
-            Err(error) => return invalid(format!("activation_leeway_secs: {error}")),
-        };
-        verifier = match verifier.with_activation_leeway(leeway) {
-            Ok(verifier) => verifier,
-            Err(error) => return invalid(format!("activation_leeway_secs: {error}")),
-        };
-    }
-    let mut options = EnrollmentOptions {
-        require_synchronized_clock: config.require_synchronized_clock,
-        applied_rotations: config.applied_rotations,
-        ..Default::default()
-    };
-    if let Some(rotation) = config.rotation {
-        options.rotation = Some(RotationPin {
-            next_commitment: attempt!(
-                hex32(&rotation.next_commitment, "rotation.next_commitment").map_err(invalid)
-            ),
-            seq: rotation.seq,
-        });
-    }
-    let limits = config.limits;
-    let ms = Duration::from_millis;
-    if let Some(value) = limits.handshake_timeout_ms {
-        options.handshake_timeout = ms(value);
-    }
-    if let Some(value) = limits.step_timeout_ms {
-        options.step_timeout = ms(value);
-    }
-    if let Some(value) = limits.policy_timeout_ms {
-        options.policy_timeout = ms(value);
-    }
-    if let Some(value) = limits.reconciliation_interval_ms {
-        options.reconciliation_interval = ms(value);
-    }
-    if let Some(value) = limits.max_admitted_peers {
-        options.max_admitted_peers = value;
-    }
-    let credential = config
-        .credential
-        .map(|chain| chain.trim().to_owned())
-        .filter(|chain| !chain.is_empty());
-
-    // Holding the slot across install keeps a concurrent set_gate out.
-    let mut state = slot.write().unwrap_or_else(|e| e.into_inner());
-    if state.gate.is_some() {
-        set_last_error("detach the node's gate before installing Enrollment");
-        return aster_status_t::ASTER_STATUS_UNSUPPORTED as i32;
-    }
-    if state.enrollment.is_some() {
-        set_last_error("Enrollment is already installed on this node");
-        return aster_status_t::ASTER_STATUS_ALREADY_EXISTS as i32;
-    }
-    let (before_connect, before_connect_rx) = tokio::sync::mpsc::channel(64);
-    let (after_handshake, after_handshake_rx) = tokio::sync::mpsc::channel(64);
-    let hooks = CoreHookReceiver {
-        before_connect_rx,
-        after_handshake_rx,
-    };
-    let _context = bridge.runtime.enter();
-    let facade = aster::Node::from_core_node((*core).clone());
-    let enrollment = match Enrollment::install_with_hooks(
-        &facade,
-        hooks,
-        Arc::new(store),
-        verifier,
-        credential,
-        Arc::new(policy),
-        options,
-    ) {
-        Ok(enrollment) => enrollment,
-        Err(error) => return invalid(format!("{error:#}")),
-    };
-    state.enrollment = Some(node::HookForward {
-        before_connect,
-        after_handshake,
-    });
-    drop(state);
-    let revocations = tokio::sync::Mutex::new(enrollment.revocations());
-    let id = bridge.enrollments.insert(EnrollmentState {
-        enrollment,
-        node: facade,
-        revocations,
-        released: AtomicBool::new(false),
-        released_notify: tokio::sync::Notify::new(),
-    });
-    ptr::write(out_enrollment, id);
-    aster_status_t::ASTER_STATUS_OK as i32
+    let server = attempt!(server.lower().map_err(invalid));
+    spawn_op_cancellable(&bridge, user_data, out_operation, move |_| async move {
+        let readiness = state
+            .plan
+            .enroll_with_server(&state.enrollment, &server)
+            .await
+            .map_err(other_error)?;
+        let renewing = state.start_renewal(Some(&server));
+        Ok(result(
+            enrollment,
+            json!({"readiness": readiness_json(&readiness), "renewing": renewing}),
+        ))
+    })
 }
 
-/// Release an enrollment handle. Enrollment keeps deciding the node's
-/// admission while a server or issuer still holds it; once nothing does, the
-/// node rejects ordinary inbound connections (fail closed); close the node.
-/// Pending `aster_enrollment_next_revocation` waits end with `ALREADY_CLOSED`.
+// ── Escape hatches ──────────────────────────────────────────────────────────
+
+/// Release an enrollment handle early (closing the node releases it too).
+/// Pending `aster_enrollment_next_revocation` waits end with
+/// `ALREADY_CLOSED`, a client stops renewing and answering inbound
+/// handshakes. A server built on the node keeps its Enrollment until it is
+/// destroyed; with nothing holding it the node rejects ordinary inbound
+/// connections (fail closed).
 #[no_mangle]
 pub extern "C" fn aster_enrollment_free(
     runtime: aster_runtime_t,
@@ -702,6 +945,11 @@ pub extern "C" fn aster_enrollment_free(
     let bridge = attempt!(bridge_for(runtime));
     match bridge.enrollments.remove(enrollment) {
         Some(state) => {
+            bridge
+                .node_enrollments
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|_, id| *id != enrollment);
             state.release();
             aster_status_t::ASTER_STATUS_OK as i32
         }
@@ -709,102 +957,11 @@ pub extern "C" fn aster_enrollment_free(
     }
 }
 
-/// Enroll reciprocally with the first of `replicas_json` that completes the
-/// handshake (tried in order; at most 16). `replicas_json` is an array of
-/// `{"node_id": "<hex32>", "relay_url": "…"?, "direct_addresses": ["ip:port"]?}`.
-/// Completes with `ASTER_EVENT_ENROLLMENT_RESULT`:
-/// `{"readiness": {…}, "policy_ticket": "<doc ticket>"|null}`. Readiness is
-/// `{"peer", "source": "chain"|"registration", "observed_source", "policy_sync",
-/// "local_clock"}`; pass `peer` and the ticket to `aster_enrollment_synchronize`.
-///
-/// # Safety
-/// `replicas_json` must be readable; `out_operation` writable.
-#[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_connect(
-    runtime: aster_runtime_t,
-    enrollment: aster_enrollment_t,
-    replicas_json: aster_bytes_t,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if out_operation.is_null() {
-        return invalid("NULL operation output");
-    }
-    let bridge = attempt!(bridge_for(runtime));
-    let state = attempt!(enrollment_state(&bridge, enrollment));
-    let replicas: Vec<AddrJson> = attempt!(parse_json(
-        attempt!(in_slice(&replicas_json, "replicas_json")),
-        "replicas"
-    ));
-    if replicas.is_empty() || replicas.len() > MAX_REPLICAS {
-        return invalid(format!("replicas: 1 to {MAX_REPLICAS} addresses"));
-    }
-    let replicas: Vec<aster::NodeAddr> = attempt!(replicas
-        .into_iter()
-        .map(AddrJson::lower)
-        .collect::<Result<_, _>>()
-        .map_err(invalid));
-    spawn_op_cancellable(&bridge, user_data, out_operation, move |_| async move {
-        let (readiness, ticket) = state
-            .enrollment
-            .connect_replicas(replicas)
-            .await
-            .map_err(anyhow_error)?;
-        Ok(result(
-            enrollment,
-            json!({"readiness": readiness_json(&readiness), "policy_ticket": ticket}),
-        ))
-    })
-}
-
-/// Synchronize the fleet policy namespace from an admitted `peer` with a
-/// read-only `ticket` (the one `aster_enrollment_connect` returned, or one the
-/// consumer was provisioned with), then every bound namespace the peer offered
-/// a ticket for, waiting up to `timeout_ms` (0 = 15 s) for reconciliation.
-/// Completes with `ASTER_EVENT_ENROLLMENT_RESULT`: `{"namespace": "<hex32>"}`.
-///
-/// # Safety
-/// `peer` and `ticket` must be readable; `out_operation` writable.
-#[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_synchronize(
-    runtime: aster_runtime_t,
-    enrollment: aster_enrollment_t,
-    peer: aster_bytes_t,
-    ticket: aster_bytes_t,
-    timeout_ms: u64,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if out_operation.is_null() {
-        return invalid("NULL operation output");
-    }
-    let bridge = attempt!(bridge_for(runtime));
-    let state = attempt!(enrollment_state(&bridge, enrollment));
-    let peer = attempt!(in_key(&peer, "peer"));
-    let ticket = attempt!(in_string(&ticket, "ticket")).trim().to_owned();
-    if ticket.is_empty() {
-        return invalid("ticket: required");
-    }
-    let timeout = if timeout_ms == 0 {
-        Duration::from_secs(15)
-    } else {
-        Duration::from_millis(timeout_ms)
-    };
-    spawn_op_cancellable(&bridge, user_data, out_operation, move |_| async move {
-        let document = state
-            .enrollment
-            .synchronize(peer, ticket, timeout)
-            .await
-            .map_err(anyhow_error)?;
-        let namespace = document.id().map_err(other_error)?.to_string();
-        Ok(result(enrollment, json!({ "namespace": namespace })))
-    })
-}
-
 /// Recheck an admitted peer against current policy (the call to make before
 /// a sensitive operation). Completes with `ASTER_EVENT_ENROLLMENT_RESULT`
-/// (readiness JSON, as `aster_enrollment_connect`), or `ASTER_EVENT_ERROR`
-/// whose `flags` is an `aster_enrollment_error_t`. Only `DENIED` revokes.
+/// (readiness JSON, as `aster_enrollment_enroll`'s `readiness`), or
+/// `ASTER_EVENT_ERROR` whose `flags` is an `aster_enrollment_error_t`. Only
+/// `DENIED` revokes.
 ///
 /// # Safety
 /// `peer` must be readable; `out_operation` writable.
@@ -833,8 +990,9 @@ pub unsafe extern "C" fn aster_enrollment_check_peer(
 }
 
 /// The verified evidence a peer's current admission session rests on, for
-/// mapping its claims to application roles (for example with
-/// `aster_server_set_peer_attributes`). Writes owned JSON to `*out_json`:
+/// audit and diagnostics. A server already maps it to Gate-3 roles on every
+/// call (`[enrollment.roles]`); do not copy it into peer attributes. Writes
+/// owned JSON to `*out_json`:
 ///
 /// ```json
 /// {"subject": "<hex32>", "root": "<hex32>", "issuer": "<hex32 leaf signer>",
@@ -847,9 +1005,8 @@ pub unsafe extern "C" fn aster_enrollment_check_peer(
 ///  "registration": "ephemeral"|"persistent"|null}
 /// ```
 ///
-/// `null` scopes/tags/attributes are unknown, not empty. The session reflects
-/// the last admission or check; `aster_enrollment_check_peer` re-evaluates it.
-/// Returns `NOT_FOUND` when the peer has no session.
+/// `null` scopes/tags/attributes are unknown, not empty. Returns `NOT_FOUND`
+/// when the peer has no session (never enrolled, revoked or evicted).
 ///
 /// # Safety
 /// `peer` must be readable; `out_json` writable.
@@ -871,42 +1028,11 @@ pub unsafe extern "C" fn aster_enrollment_peer_claims(
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
-/// Verify `chain` as a credential for `subject` under this node's trust (root,
-/// audience, signed validity and the root's delegate revocations; root
-/// records are not consulted). Writes the evidence JSON (as
-/// `aster_enrollment_peer_claims`) to `*out_json`, or returns
-/// `VERIFICATION_FAILED` with the reason in the last error.
-///
-/// # Safety
-/// `subject` and `chain` must be readable; `out_json` writable.
-#[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_verify_credential(
-    runtime: aster_runtime_t,
-    enrollment: aster_enrollment_t,
-    subject: aster_bytes_t,
-    chain: aster_bytes_t,
-    out_json: *mut aster_bytes_t,
-) -> i32 {
-    attempt!(prepare(out_json));
-    let bridge = attempt!(bridge_for(runtime));
-    let state = attempt!(enrollment_state(&bridge, enrollment));
-    let subject = attempt!(in_key(&subject, "subject"));
-    let chain = attempt!(in_string(&chain, "chain"));
-    match state.enrollment.verify_credential(&subject, chain.trim()) {
-        Ok(evidence) => {
-            output(out_json, evidence_json(&evidence));
-            aster_status_t::ASTER_STATUS_OK as i32
-        }
-        Err(error) => {
-            set_last_error(error);
-            aster_status_t::ASTER_STATUS_VERIFICATION_FAILED as i32
-        }
-    }
-}
-
 /// This node's Enrollment state as owned JSON:
-/// `{"trusted_root", "fleet_namespace", "audience", "credential": <evidence>|null,
-/// "root_state": {"root", "next_commitment", "seq"}|null, "root_rotations": []}`.
+/// `{"side": "server"|"client", "trusted_root", "fleet_namespace",
+/// "audience", "credential": <evidence>|null, "root_state": {"root",
+/// "next_commitment", "seq"}|null, "root_rotations": [], "renewing": bool,
+/// "issuer": "<hex32>"|null}`. `credential` follows renewals;
 /// `trusted_root` moves on after an accepted root rotation.
 ///
 /// # Safety
@@ -920,73 +1046,43 @@ pub unsafe extern "C" fn aster_enrollment_status(
     attempt!(prepare(out_json));
     let bridge = attempt!(bridge_for(runtime));
     let state = attempt!(enrollment_state(&bridge, enrollment));
-    let enrollment = &state.enrollment;
-    let root_state = enrollment.root_state().map(|root| {
+    let e = &state.enrollment;
+    let root_state = e.root_state().map(|root| {
         json!({
             "root": hex::encode(root.root),
             "next_commitment": hex::encode(root.next_commitment),
             "seq": root.seq,
         })
     });
+    let side = match state.plan.side() {
+        Side::Server => "server",
+        Side::Client => "client",
+    };
     output(
         out_json,
         json!({
-            "trusted_root": hex::encode(enrollment.trusted_root()),
-            "fleet_namespace": hex::encode(enrollment.fleet_namespace()),
-            "audience": enrollment.audience(),
-            "credential": enrollment.credential().map(|(_, evidence)| evidence_json(&evidence)),
+            "side": side,
+            "trusted_root": hex::encode(e.trusted_root()),
+            "fleet_namespace": hex::encode(e.fleet_namespace()),
+            "audience": e.audience(),
+            "credential": e.credential().map(|(_, evidence)| evidence_json(&evidence)),
             "root_state": root_state,
-            "root_rotations": enrollment.root_rotations(),
+            "root_rotations": e.root_rotations(),
+            "renewing": state.renewing(),
+            "issuer": state.issuer.as_ref().map(|issuer| hex::encode(issuer.public_key())),
         }),
     );
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
-/// Replace this node's credential (it must verify for this node) and present
-/// it again to every peer it has a session with. Completes with
-/// `ASTER_EVENT_ENROLLMENT_RESULT`: `{"unreached": [{"peer", "error"}]}`.
-///
-/// # Safety
-/// `chain` must be readable; `out_operation` writable.
-#[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_replace_credential(
-    runtime: aster_runtime_t,
-    enrollment: aster_enrollment_t,
-    chain: aster_bytes_t,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if out_operation.is_null() {
-        return invalid("NULL operation output");
-    }
-    let bridge = attempt!(bridge_for(runtime));
-    let state = attempt!(enrollment_state(&bridge, enrollment));
-    let chain = attempt!(in_string(&chain, "chain")).trim().to_owned();
-    if chain.is_empty() {
-        return invalid("chain: required");
-    }
-    spawn_op_cancellable(&bridge, user_data, out_operation, move |_| async move {
-        let unreached = state
-            .enrollment
-            .replace_credential(chain)
-            .await
-            .map_err(anyhow_error)?;
-        let unreached: Vec<Value> = unreached
-            .into_iter()
-            .map(|(peer, error)| json!({"peer": hex::encode(peer), "error": error}))
-            .collect();
-        Ok(result(enrollment, json!({ "unreached": unreached })))
-    })
-}
-
 /// Wait for the next revocation of a formerly admitted peer (a definite
-/// denial; every connection of that peer is already closed). Completes with
-/// `ASTER_EVENT_ENROLLMENT_RESULT`: `{"peer": "<hex32>", "reason": {"code",
-/// "definite", "detail"}}`, or `{"lagged": n}` when `n` revocations were
-/// missed (recheck every peer relied on). Revocations are buffered from
-/// install; receives on one enrollment are serialized. Cancelling the
-/// operation consumes nothing; `aster_enrollment_free` ends a pending wait
-/// with `ALREADY_CLOSED`.
+/// denial; every connection of that peer is already closed and its roles are
+/// gone from the next call). Completes with `ASTER_EVENT_ENROLLMENT_RESULT`:
+/// `{"peer": "<hex32>", "reason": {"code", "definite", "detail"}}`, or
+/// `{"lagged": n}` when `n` revocations were missed (recheck every peer
+/// relied on). Revocations are buffered from install; receives on one
+/// enrollment are serialized. Cancelling the operation consumes nothing;
+/// releasing the enrollment ends a pending wait with `ALREADY_CLOSED`.
 ///
 /// # Safety
 /// `out_operation` must be writable.
@@ -1039,127 +1135,52 @@ pub unsafe extern "C" fn aster_enrollment_next_revocation(
     )
 }
 
-// ── Renewal ─────────────────────────────────────────────────────────────────
+// ── Configured issuer ───────────────────────────────────────────────────────
 
-/// Start renewing this node's credential from the issuer that signed it,
-/// whenever a third of its lifetime remains, until the root registers the
-/// node, the issuer refuses for good, or the credential expires. Renewed
-/// credentials are presented to every admitted peer. `config_json`:
-/// `{"issuer": {"node_id", "relay_url"?, "direct_addresses"?}, "retry_ms"?,
-/// "max_retry_ms"?, "call_timeout_ms"?}`. Free the handle to stop renewing.
+fn issuer_of(state: &EnrollmentState) -> Result<&Issuer, i32> {
+    state.issuer.as_ref().ok_or_else(|| {
+        crate::data::not_found(
+            "no issuer: set [enrollment.issuer] delegation_file \
+             (ASTER_ENROLLMENT_ISSUER_DELEGATION_FILE) on the server",
+        )
+    })
+}
+
+/// The configured delegated issuer of a server enrollment
+/// (`[enrollment.issuer] delegation_file`), as owned JSON:
+/// `{"public_key": "<hex32>", "delegation_expires_at": 1700000000}`.
+/// `NOT_FOUND` when none is configured.
 ///
 /// # Safety
-/// `config_json` must be readable; `out_renewal` writable.
+/// `out_json` must be writable.
 #[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_start_renewal(
+pub unsafe extern "C" fn aster_enrollment_issuer_info(
     runtime: aster_runtime_t,
     enrollment: aster_enrollment_t,
-    config_json: aster_bytes_t,
-    out_renewal: *mut aster_enrollment_renewal_t,
+    out_json: *mut aster_bytes_t,
 ) -> i32 {
-    if out_renewal.is_null() {
-        return invalid("NULL renewal output");
-    }
-    ptr::write(out_renewal, 0);
+    attempt!(prepare(out_json));
     let bridge = attempt!(bridge_for(runtime));
     let state = attempt!(enrollment_state(&bridge, enrollment));
-    let config: RenewalJson = attempt!(parse_json(
-        attempt!(in_slice(&config_json, "config_json")),
-        "renewal config"
-    ));
-    let mut renewal = RenewalConfig::new(attempt!(config.issuer.lower().map_err(invalid)));
-    let ms = Duration::from_millis;
-    if let Some(value) = config.retry_ms.filter(|value| *value > 0) {
-        renewal.retry = ms(value);
-    }
-    if let Some(value) = config.max_retry_ms.filter(|value| *value > 0) {
-        renewal.max_retry = ms(value);
-    }
-    if let Some(value) = config.call_timeout_ms.filter(|value| *value > 0) {
-        renewal.call_timeout = ms(value);
-    }
-    let _context = bridge.runtime.enter();
-    let handle = state.enrollment.start_renewal(renewal);
-    let (sender, outcome) = watch::channel(None);
-    let task = bridge.runtime.spawn(async move {
-        let finished = handle.finished().await;
-        let _ = sender.send(Some(finished));
-    });
-    let id = bridge.enrollment_renewals.insert(RenewalState {
-        outcome,
-        task: task.abort_handle(),
-    });
-    ptr::write(out_renewal, id);
+    let issuer = attempt!(issuer_of(&state));
+    output(
+        out_json,
+        json!({
+            "public_key": hex::encode(issuer.public_key()),
+            "delegation_expires_at": issuer.delegation_expires_at(),
+        }),
+    );
     aster_status_t::ASTER_STATUS_OK as i32
 }
 
-/// Wait for renewal to stop. Completes with `ASTER_EVENT_ENROLLMENT_RESULT`:
-/// `{"outcome": "registered"|"refused"|"expired"|"no_credential",
-/// "refusal": {"code", "message"}|null}` (`code` as `aster.enrollment.IssuerV1`
-/// reports it, e.g. `subject_denied`). May be awaited more than once.
-///
-/// # Safety
-/// `out_operation` must be writable.
-#[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_renewal_wait(
-    runtime: aster_runtime_t,
-    renewal: aster_enrollment_renewal_t,
-    user_data: u64,
-    out_operation: *mut aster_operation_t,
-) -> i32 {
-    if out_operation.is_null() {
-        return invalid("NULL operation output");
-    }
-    let bridge = attempt!(bridge_for(runtime));
-    attempt!(live(&bridge));
-    let Some(state) = bridge.enrollment_renewals.get(renewal) else {
-        return crate::data::not_found(format!("unknown renewal {renewal}"));
-    };
-    let mut outcome = state.outcome.clone();
-    drop(state);
-    spawn_op_cancellable(
-        &bridge,
-        user_data,
-        out_operation,
-        move |cancel| async move {
-            let finished = tokio::select! {
-                biased;
-                () = cancel.wait() => return Err(other_error("cancelled")),
-                finished = outcome.wait_for(Option::is_some) => finished.map(|value| value.clone()),
-            };
-            let Ok(Some(finished)) = finished else {
-                return Err(OpError {
-                    status: aster_status_t::ASTER_STATUS_ALREADY_CLOSED,
-                    code: aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32,
-                    flags: 0,
-                    message: "renewal released".into(),
-                });
-            };
-            let (name, refusal) = match finished {
-                RenewalOutcome::Registered => ("registered", Value::Null),
-                RenewalOutcome::Refused(refusal) => ("refused", refusal_json(&refusal)),
-                RenewalOutcome::Expired => ("expired", Value::Null),
-                RenewalOutcome::NoCredential => ("no_credential", Value::Null),
-            };
-            Ok(result(
-                renewal,
-                json!({"outcome": name, "refusal": refusal}),
-            ))
-        },
-    )
-}
-
-/// Stop renewing and release the handle.
-#[no_mangle]
-pub extern "C" fn aster_enrollment_renewal_free(
-    runtime: aster_runtime_t,
-    renewal: aster_enrollment_renewal_t,
-) -> i32 {
-    let bridge = attempt!(bridge_for(runtime));
-    match bridge.enrollment_renewals.remove(renewal) {
-        Some(_) => aster_status_t::ASTER_STATUS_OK as i32,
-        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueJson {
+    subject: String,
+    #[serde(default)]
+    claims: AdmissionClaims,
+    #[serde(default)]
+    registration: Registration,
 }
 
 fn refusal_json(refusal: &IssuerErrorV1) -> Value {
@@ -1170,127 +1191,36 @@ fn refusal_json(refusal: &IssuerErrorV1) -> Value {
     })
 }
 
-// ── Delegated issuer ────────────────────────────────────────────────────────
-
-/// Make this enrolled node a delegated issuer. `delegation` is the node's
-/// delegation chain from the root (`aster-chain-v1~…`; its leaf names this
-/// node's key). Credentials it signs last `lifetime_secs` (0 = 24 h),
-/// shortened to fit the delegation's `max_child_lifetime` and expiry;
-/// renewals use the same lifetime. Serve renewals by passing the issuer to
-/// `aster_server_set_enrollment`.
-///
-/// # Safety
-/// `delegation` must be readable; `out_issuer` writable.
-#[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_issuer_new(
-    runtime: aster_runtime_t,
-    enrollment: aster_enrollment_t,
-    delegation: aster_bytes_t,
-    lifetime_secs: u64,
-    out_issuer: *mut aster_enrollment_issuer_t,
-) -> i32 {
-    if out_issuer.is_null() {
-        return invalid("NULL issuer output");
-    }
-    ptr::write(out_issuer, 0);
-    let bridge = attempt!(bridge_for(runtime));
-    let state = attempt!(enrollment_state(&bridge, enrollment));
-    let text = attempt!(in_string(&delegation, "delegation"));
-    let chain = match Chain::from_text(text.trim()) {
-        Ok(chain) => chain,
-        Err(error) => return invalid(format!("delegation: {error:?}")),
-    };
-    let lifetime = if lifetime_secs == 0 {
-        DEFAULT_ISSUED_LIFETIME
-    } else {
-        Duration::from_secs(lifetime_secs)
-    };
-    let issuer = match Issuer::new(&state.node, state.enrollment.clone(), chain, lifetime) {
-        Ok(issuer) => issuer,
-        Err(error) => return invalid(format!("delegation: {error:#}")),
-    };
-    let id = bridge.enrollment_issuers.insert(IssuerState {
-        issuer,
-        enrollment: state.enrollment.clone(),
-    });
-    ptr::write(out_issuer, id);
-    aster_status_t::ASTER_STATUS_OK as i32
-}
-
-/// Release an issuer handle (a server it was set on keeps serving it).
-#[no_mangle]
-pub extern "C" fn aster_enrollment_issuer_free(
-    runtime: aster_runtime_t,
-    issuer: aster_enrollment_issuer_t,
-) -> i32 {
-    let bridge = attempt!(bridge_for(runtime));
-    match bridge.enrollment_issuers.remove(issuer) {
-        Some(_) => aster_status_t::ASTER_STATUS_OK as i32,
-        None => aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
-    }
-}
-
-/// `{"public_key": "<hex32>", "delegation_expires_at": 1700000000}` as owned
-/// JSON. Only the root renews the delegation.
-///
-/// # Safety
-/// `out_json` must be writable.
-#[no_mangle]
-pub unsafe extern "C" fn aster_enrollment_issuer_info(
-    runtime: aster_runtime_t,
-    issuer: aster_enrollment_issuer_t,
-    out_json: *mut aster_bytes_t,
-) -> i32 {
-    attempt!(prepare(out_json));
-    let bridge = attempt!(bridge_for(runtime));
-    attempt!(live(&bridge));
-    let Some(state) = bridge.enrollment_issuers.get(issuer) else {
-        return crate::data::not_found(format!("unknown issuer {issuer}"));
-    };
-    output(
-        out_json,
-        json!({
-            "public_key": hex::encode(state.issuer.public_key()),
-            "delegation_expires_at": state.issuer.delegation_expires_at(),
-        }),
-    );
-    aster_status_t::ASTER_STATUS_OK as i32
-}
-
-/// Sign a credential for `subject` after the orchestrator has authenticated
-/// it out of band. `request_json`: `{"subject": "<hex32 node id>",
+/// Sign a credential with the server's configured issuer for a subject the
+/// orchestrator has authenticated out of band (renewals are served
+/// automatically). `request_json`: `{"subject": "<hex32 node id>",
 /// "claims": {"scopes": [], "tags": [], "attributes": {}}, "registration":
 /// "ephemeral"|"persistent"}` (claims default to unknown; registration to
-/// ephemeral; a set of `null` is unknown). On success writes
-/// `{"chain", "credential_id", "expires_at"}`. When the issuer refuses
-/// (a subject the root denied or registered, claims beyond the delegation,
-/// a revoked issuer) returns `PERMISSION_DENIED` and writes
-/// `{"code", "message", "retryable"}` instead. Both outputs are owned JSON.
+/// ephemeral). On success writes `{"chain", "credential_id", "expires_at"}`.
+/// When the issuer refuses (a subject the root denied or registered, claims
+/// beyond the delegation, a revoked issuer) returns `PERMISSION_DENIED` and
+/// writes `{"code", "message", "retryable"}` instead. Both outputs are owned
+/// JSON. `NOT_FOUND` when no issuer is configured.
 ///
 /// # Safety
 /// `request_json` must be readable; `out_json` writable.
 #[no_mangle]
 pub unsafe extern "C" fn aster_enrollment_issue(
     runtime: aster_runtime_t,
-    issuer: aster_enrollment_issuer_t,
+    enrollment: aster_enrollment_t,
     request_json: aster_bytes_t,
     out_json: *mut aster_bytes_t,
 ) -> i32 {
     attempt!(prepare(out_json));
     let bridge = attempt!(bridge_for(runtime));
-    attempt!(live(&bridge));
-    let Some(state) = bridge.enrollment_issuers.get(issuer) else {
-        return crate::data::not_found(format!("unknown issuer {issuer}"));
-    };
+    let state = attempt!(enrollment_state(&bridge, enrollment));
+    let issuer = attempt!(issuer_of(&state));
     let request: IssueJson = attempt!(parse_json(
         attempt!(in_slice(&request_json, "request_json")),
         "issue request"
     ));
-    let subject = attempt!(hex32(&request.subject, "subject").map_err(invalid));
-    match state
-        .issuer
-        .issue_for(&subject, request.claims, request.registration)
-    {
+    let subject = attempt!(hex32(request.subject.trim(), "subject").map_err(invalid));
+    match issuer.issue_for(&subject, request.claims, request.registration) {
         Ok(issued) => {
             let expires_at = state
                 .enrollment
@@ -1316,65 +1246,61 @@ pub unsafe extern "C" fn aster_enrollment_issue(
     }
 }
 
-// ── Server integration ──────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// What `aster_server_set_enrollment` attaches to a server builder.
-pub(crate) struct ServerEnrollment {
-    pub(crate) enrollment: Enrollment,
-    pub(crate) issuer: Option<Issuer>,
-}
+    #[test]
+    fn trust_json_round_trips_the_resolved_config() {
+        let text = r#"
+[trust]
+root_pubkey = "1111111111111111111111111111111111111111111111111111111111111111"
+next_root_commitment = "2222222222222222222222222222222222222222222222222222222222222222"
+root_seq = 2
+enrollment_credential = "node.cred"
 
-impl ServerEnrollment {
-    /// Route `aster.enrollment/1` connections into Enrollment and register
-    /// the issuer's renewal service. Each accepted connection is held until
-    /// the peer closes it or `stopped` ends (the server was destroyed).
-    pub(crate) fn apply(
-        self,
-        mut server: aster::rpc::Server,
-        stopped: watch::Receiver<()>,
-    ) -> aster::rpc::Server {
-        if let Some(issuer) = self.issuer {
-            server = server.register(issuer);
-        }
-        let enrollment = self.enrollment;
-        server.route_alpn(aster::enrollment::ENROLLMENT_ALPN, move |connection| {
-            let enrollment = enrollment.clone();
-            let mut stopped = stopped.clone();
-            tokio::spawn(async move {
-                let accepted = tokio::select! {
-                    accepted = enrollment.accept(&connection) => accepted.is_ok(),
-                    _ = stopped.changed() => false,
-                };
-                drop(enrollment);
-                if accepted {
-                    tokio::select! {
-                        _ = connection.closed() => {}
-                        _ = stopped.changed() => {}
-                    }
-                }
-            });
-        })
+[enrollment]
+audience = "mc"
+fleet_namespace = "33"
+replicas = ["aa"]
+policy = { all_of = [{ scope = "ops" }, "tolerate_stale_policy"] }
+renew = false
+
+[enrollment.limits]
+sync_timeout_ms = 2000
+
+[enrollment.roles]
+attribute = ""
+[enrollment.roles.tags]
+admin = "ops.admin, ops.logs"
+
+[enrollment.issuer]
+delegation_file = "issuer.chain"
+lifetime = "6h"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        std::fs::write(&path, text).unwrap();
+        let config = AsterConfig::from_file(&path).unwrap();
+        let json = TrustJson::from_config(&config);
+        assert_eq!(json.enrollment.roles.attribute.as_deref(), Some(""));
+        assert_eq!(json.enrollment.issuer_lifetime_secs, Some(6 * 3600));
+        let encoded = serde_json::to_string(&json).unwrap();
+        let decoded: TrustJson = serde_json::from_str(&encoded).unwrap();
+        let mut back = AsterConfig::default();
+        decoded.apply(&mut back).unwrap();
+        assert_eq!(back.enrollment, config.enrollment);
+        assert_eq!(back.root_pubkey, config.root_pubkey);
+        assert_eq!(back.root_seq, 2);
+        assert!(back.is_enrollment_enabled());
+
+        // Absent role settings keep the defaults; unknown fields are refused.
+        let mut minimal = AsterConfig::default();
+        serde_json::from_str::<TrustJson>(r#"{"enrollment": {"audience": "mc"}}"#)
+            .unwrap()
+            .apply(&mut minimal)
+            .unwrap();
+        assert_eq!(minimal.enrollment.roles, RoleMappingConfig::default());
+        assert!(serde_json::from_str::<TrustJson>(r#"{"allow_all_consumers": true}"#).is_err());
     }
-}
-
-/// Resolve the handles `aster_server_set_enrollment` names.
-pub(crate) fn server_enrollment(
-    bridge: &BridgeRuntime,
-    enrollment: aster_enrollment_t,
-    issuer: aster_enrollment_issuer_t,
-) -> Result<ServerEnrollment, i32> {
-    let state = enrollment_state(bridge, enrollment)?;
-    let issuer = if issuer == 0 {
-        None
-    } else {
-        let issued = bridge
-            .enrollment_issuers
-            .get(issuer)
-            .ok_or_else(|| crate::data::not_found(format!("unknown issuer {issuer}")))?;
-        Some(issued.issuer.clone())
-    };
-    Ok(ServerEnrollment {
-        enrollment: state.enrollment.clone(),
-        issuer,
-    })
 }

@@ -460,6 +460,16 @@ static void test_abi_version(void) {
     CHECK(ASTER_EVENT_ENROLLMENT_RESULT == 127);
     CHECK(ASTER_ENROLLMENT_ERROR_DENIED == 2 && ASTER_ENROLLMENT_ERROR_UNAVAILABLE == 4);
     CHECK(aster_enrollment_free(0, 0) != ASTER_STATUS_OK);
+    CHECK(ASTER_ENROLLMENT_SIDE_SERVER == 0 && ASTER_ENROLLMENT_SIDE_CLIENT == 1);
+    {
+        aster_operation_t op = 0;
+        aster_bytes_t empty = {NULL, 0};
+        CHECK(aster_node_start_enrolled(0, NULL, empty, 0, 0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_node_start_enrolled(0, NULL, empty, 7, 0, &op) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_config_enrollment_from_env(NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_lease_serializer_grantor_new(0, 0, 0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_server_add_lease_grantor(0, 0, empty, empty) == ASTER_STATUS_NOT_FOUND);
+    }
     CHECK(aster_doc_event_receiver_free(0, 0) == ASTER_STATUS_NOT_FOUND);
     CHECK(sizeof(aster_audit_outbox_error_t) == 4);
     CHECK(sizeof(aster_audit_outbox_t) == 8);

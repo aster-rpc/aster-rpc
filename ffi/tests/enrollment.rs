@@ -1,6 +1,10 @@
-//! ABI 5.1: Enrollment through the C ABI. A Rust root (the CLI's role) owns
-//! the fleet namespace and signs a delegation; everything an enrolled node or
-//! a delegated issuer does goes through `aster_enrollment_*`. Loopback only.
+//! ABI 5.1: Enrollment through the C ABI, driven by configuration exactly as
+//! `AsterServer` / `AsterClient` are (design §15). A Rust root (the CLI's
+//! role) owns the fleet namespace and signs credentials and a delegation;
+//! everything a server or client does goes through `aster_node_start_enrolled`,
+//! `aster_server_*` and `aster_enrollment_*`. Also the lease grantor
+//! (`aster_server_add_lease_grantor`, `aster_lease_serializer_grantor_new`).
+//! Loopback only.
 
 use std::collections::BTreeSet;
 use std::ptr;
@@ -12,12 +16,13 @@ use aster::enrollment::{
     issue_credential, node_registration_key, AdmissionClaims, Audience, Enrollment,
     EnrollmentIssueRequest, EnrollmentOptions, EnrollmentPolicyStore, JwtEnrollmentIssuer,
     JwtEnrollmentVerifier, NodeRegistrationStatus, NodeRegistrationV1, PolicyExpressionV1,
-    PolicyPredicate, ENROLLMENT_ALPN,
+    PolicyPredicate, TypedAttribute, ENROLLMENT_ALPN,
 };
-use aster::{AsterConfig, Doc, Node, RelayMode, SecretKey};
+use aster::{AsterConfig, Credential, Doc, Node, RelayMode, SecretKey, Ticket};
 use aster_transport_ffi::enrollment::*;
 use aster_transport_ffi::node::*;
 use aster_transport_ffi::server::*;
+use aster_transport_ffi::upcall::*;
 use aster_transport_ffi::*;
 use serde_json::{json, Value};
 
@@ -25,6 +30,9 @@ mod common;
 
 const FLEET: &str = "ffi-enrollment";
 const OK: i32 = aster_status_t::ASTER_STATUS_OK as i32;
+const INVALID: i32 = aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32;
+const SERVER: u32 = aster_enrollment_side_t::ASTER_ENROLLMENT_SIDE_SERVER as u32;
+const CLIENT: u32 = aster_enrollment_side_t::ASTER_ENROLLMENT_SIDE_CLIENT as u32;
 
 fn now() -> u64 {
     SystemTime::now()
@@ -48,23 +56,28 @@ fn bytes(b: &[u8]) -> aster_bytes_t {
         len: b.len(),
     }
 }
-fn build_claims() -> AdmissionClaims {
+fn role_claims(roles: Option<&str>) -> AdmissionClaims {
+    let mut attributes = std::collections::BTreeMap::new();
+    if let Some(roles) = roles {
+        attributes.insert("aster.role".into(), TypedAttribute::String(roles.into()));
+    }
     AdmissionClaims {
-        scopes: Some(["build".to_string()].into()),
+        scopes: Some(BTreeSet::new()),
         tags: Some(BTreeSet::new()),
-        attributes: Some(Default::default()),
+        attributes: Some(attributes),
     }
 }
 
 /// A one-link credential the root signs.
 fn root_credential(seed: u8) -> String {
-    let request = EnrollmentIssueRequest::new(public(seed), FLEET, now() + 3600);
+    let mut request = EnrollmentIssueRequest::new(public(seed), FLEET, now() + 3600);
+    request.claims = role_claims(None);
     issue_credential(&key(1), &request, now())
         .unwrap()
         .into_chain()
 }
 
-/// The root (seed 1) delegates enrollment of `build` nodes to seed 2.
+/// The root (seed 1) delegates enrollment, with `aster.role`, to seed 2.
 fn delegation() -> String {
     issue_delegation(
         &key(1),
@@ -74,9 +87,9 @@ fn delegation() -> String {
         &DelegationGrant {
             may_issue: [LinkKind::Enrollment].into(),
             audiences: [FLEET.to_string()].into(),
-            scopes: ["build".to_string()].into(),
+            scopes: BTreeSet::new(),
             tags: BTreeSet::new(),
-            attribute_keys: ["pod".to_string()].into(),
+            attribute_keys: ["aster.role".to_string()].into(),
             max_child_lifetime: 3600,
             max_depth: 0,
             subjects: None,
@@ -118,6 +131,12 @@ fn root(files: &std::path::Path) -> Root {
         )
         .await
         .unwrap();
+        for _ in 0..100 {
+            if !node.addr().direct_addresses.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let fleet = node.docs().create().await.unwrap();
         let namespace: [u8; 32] = hex::decode(fleet.id().unwrap().to_string())
             .unwrap()
@@ -162,9 +181,11 @@ fn root(files: &std::path::Path) -> Root {
 }
 
 impl Root {
-    fn addr_json(&self) -> Value {
-        let addr = self.node.addr();
-        json!([{"node_id": addr.node_id.to_string(), "direct_addresses": addr.direct_addresses}])
+    fn ticket(&self) -> String {
+        Ticket::from_node_addr(&self.node.addr(), Credential::Open)
+            .unwrap()
+            .to_base58()
+            .unwrap()
     }
 
     /// Revoke `subject` in the fleet namespace and push it to `peer`.
@@ -180,7 +201,7 @@ impl Root {
                 not_before: None,
                 expires_at: None,
                 status: NodeRegistrationStatus::Revoked,
-                claims: build_claims(),
+                claims: role_claims(None),
                 mandatory: vec![],
                 reauthorizes_revision: None,
                 reason: Some("test".into()),
@@ -214,9 +235,22 @@ unsafe fn runtime() -> aster_runtime_t {
     rt
 }
 
-/// A loopback node with fail-closed hooks serving `alpns`.
-unsafe fn start(rt: aster_runtime_t, seed: u8, alpns: &[&[u8]], fail_closed: bool) -> u64 {
-    let items: Vec<aster_bytes_t> = alpns.iter().map(|a| bytes(a)).collect();
+fn last_error() -> String {
+    let mut buf = vec![0u8; 4096];
+    let len = unsafe { aster_last_error_message(buf.as_mut_ptr(), buf.len()) };
+    String::from_utf8_lossy(&buf[..len.min(buf.len())]).into_owned()
+}
+
+/// Start a loopback node (seed, `aster/1`) from `trust`. `Ok((node,
+/// enrollment))`; `Err((status, message))` for a refusal before the start
+/// or an `ASTER_EVENT_ERROR` from it.
+unsafe fn start(
+    rt: aster_runtime_t,
+    seed: u8,
+    trust: &Value,
+    side: u32,
+) -> Result<(u64, u64), (i32, String)> {
+    let alpns = [bytes(b"aster/1")];
     let secret = [seed; 32];
     let mut cfg: aster_config_t = std::mem::zeroed();
     assert_eq!(aster_config_init(&mut cfg), OK);
@@ -224,19 +258,27 @@ unsafe fn start(rt: aster_runtime_t, seed: u8, alpns: &[&[u8]], fail_closed: boo
     cfg.bind_addr = bytes(b"127.0.0.1:0");
     cfg.secret_key = bytes(&secret);
     cfg.alpns = aster_bytes_list_t {
-        items: items.as_ptr(),
-        len: items.len(),
+        items: alpns.as_ptr(),
+        len: alpns.len(),
     };
-    cfg.enable_hooks = 1;
-    cfg.hook_failure_mode = if fail_closed {
-        aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_CLOSED
-    } else {
-        aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_OPEN
-    } as u32;
+    let text = trust.to_string();
     let mut op = 0;
-    assert_eq!(aster_node_start(rt, &cfg, 0, 0, &mut op), OK);
-    common::wait_for_successful_operation(rt, op, aster_event_kind_t::ASTER_EVENT_NODE_CREATED)
-        .handle
+    let status = aster_node_start_enrolled(rt, &cfg, bytes(text.as_bytes()), side, 0, &mut op);
+    if status != OK {
+        return Err((status, last_error()));
+    }
+    let event = common::wait_for_operation(rt, op);
+    if event.kind == aster_event_kind_t::ASTER_EVENT_NODE_CREATED as u32 {
+        return Ok((event.handle, event.related));
+    }
+    let message = if event.data_len == 0 {
+        String::new()
+    } else {
+        String::from_utf8_lossy(std::slice::from_raw_parts(event.data_ptr, event.data_len))
+            .into_owned()
+    };
+    aster_buffer_release(rt, event.buffer);
+    Err((event.status as i32, message))
 }
 
 unsafe fn addr_json(rt: aster_runtime_t, node: u64) -> Value {
@@ -260,39 +302,10 @@ unsafe fn addr_json(rt: aster_runtime_t, node: u64) -> Value {
                 .collect()
         };
         if !direct.is_empty() || Instant::now() > deadline {
-            return json!([{"node_id": s(&out.endpoint_id), "direct_addresses": direct}]);
+            return json!({"node_id": s(&out.endpoint_id), "direct_addresses": direct});
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-fn config(namespace: [u8; 32], path: &std::path::Path, credential: Option<String>) -> Value {
-    json!({
-        "root": hex::encode(public(1)),
-        "audience": FLEET,
-        "fleet_namespace": hex::encode(namespace),
-        "state_path": path.to_str().unwrap(),
-        "credential": credential,
-        "policy": {"any_of": [{"scope": "build"}, "tolerate_stale_policy"]},
-        "limits": {"reconciliation_interval_ms": 200},
-    })
-}
-
-unsafe fn install(rt: aster_runtime_t, node: u64, config: &Value) -> Result<u64, (i32, String)> {
-    let text = config.to_string();
-    let mut handle = 0;
-    let status = aster_enrollment_install(rt, node, bytes(text.as_bytes()), &mut handle);
-    if status == OK {
-        Ok(handle)
-    } else {
-        Err((status, last_error()))
-    }
-}
-
-fn last_error() -> String {
-    let mut buf = vec![0u8; 4096];
-    let len = unsafe { aster_last_error_message(buf.as_mut_ptr(), buf.len()) };
-    String::from_utf8_lossy(&buf[..len.min(buf.len())]).into_owned()
 }
 
 /// Take an owned JSON output.
@@ -322,16 +335,6 @@ unsafe fn wait(rt: aster_runtime_t, op: u64) -> Result<Value, (u32, u32, String)
             String::from_utf8_lossy(&payload).into_owned(),
         ))
     }
-}
-
-unsafe fn connect(rt: aster_runtime_t, enrollment: u64, replicas: &Value) -> Value {
-    let text = replicas.to_string();
-    let mut op = 0;
-    assert_eq!(
-        aster_enrollment_connect(rt, enrollment, bytes(text.as_bytes()), 0, &mut op),
-        OK
-    );
-    wait(rt, op).expect("connect")
 }
 
 unsafe fn claims(rt: aster_runtime_t, enrollment: u64, peer: [u8; 32]) -> Option<Value> {
@@ -366,259 +369,197 @@ unsafe fn check(
     wait(rt, op)
 }
 
+unsafe fn enroll(
+    rt: aster_runtime_t,
+    enrollment: u64,
+    server: &Value,
+) -> Result<Value, (u32, u32, String)> {
+    let text = server.to_string();
+    let mut op = 0;
+    assert_eq!(
+        aster_enrollment_enroll(rt, enrollment, bytes(text.as_bytes()), 0, &mut op),
+        OK
+    );
+    wait(rt, op)
+}
+
+unsafe fn close_node(rt: aster_runtime_t, node: u64) {
+    let mut op = 0;
+    assert_eq!(aster_node_close(rt, node, 0, &mut op), OK);
+    common::wait_for_successful_operation(rt, op, aster_event_kind_t::ASTER_EVENT_CLOSED);
+}
+
+/// The `[trust]` + `[enrollment]` JSON of a node with `credential`.
+fn trust(namespace: [u8; 32], credential: &str, enrollment: Value) -> Value {
+    let mut section = json!({"audience": FLEET, "fleet_namespace": hex::encode(namespace)});
+    for (k, v) in enrollment.as_object().unwrap() {
+        section[k] = v.clone();
+    }
+    json!({
+        "root_pubkey": hex::encode(public(1)),
+        "enrollment_credential_chain": credential,
+        "enrollment": section,
+    })
+}
+
+/// A server configured as a delegated issuer with the root as its policy
+/// replica; a client enrolls with an issued credential, renews from the
+/// server automatically (the server signed it), and is revoked by the root.
 #[test]
-fn issuer_enrolls_renews_and_a_revocation_closes_the_peer() {
+fn config_driven_server_issues_renews_and_follows_revocation() {
     let files = tempfile::tempdir().unwrap();
     let root = root(files.path());
+    let delegation_file = files.path().join("issuer.chain");
+    std::fs::write(&delegation_file, format!("{}\n", delegation())).unwrap();
     unsafe {
         let rt = runtime();
-
-        // The issuer node: enrolled by the root, synchronized, serving
-        // enrollment and renewals.
-        let issuer_node = start(rt, 2, &[b"aster/1", ENROLLMENT_ALPN], true);
-        let issuer_enrollment = install(
+        let (server_node, server) = start(
             rt,
-            issuer_node,
-            &config(
+            2,
+            &trust(
                 root.namespace,
-                &files.path().join("issuer.json"),
-                Some(root_credential(2)),
+                &root_credential(2),
+                json!({
+                    "state_path": files.path().join("server.json").to_str().unwrap(),
+                    "replicas": [root.ticket()],
+                    "issuer_delegation_file": delegation_file.to_str().unwrap(),
+                    "issuer_lifetime_secs": 6,
+                    "limits": {"reconciliation_interval_ms": 200},
+                }),
             ),
+            SERVER,
         )
         .unwrap();
-        let joined = connect(rt, issuer_enrollment, &root.addr_json());
-        assert_eq!(joined["readiness"]["peer"], hex::encode(public(1)));
-        let ticket = joined["policy_ticket"].as_str().unwrap().to_owned();
-        let mut op = 0;
-        let peer = hex::encode(public(1));
-        assert_eq!(
-            aster_enrollment_synchronize(
-                rt,
-                issuer_enrollment,
-                bytes(peer.as_bytes()),
-                bytes(ticket.as_bytes()),
-                20_000,
-                0,
-                &mut op
-            ),
-            OK
-        );
-        assert_eq!(
-            wait(rt, op).unwrap()["namespace"],
-            hex::encode(root.namespace)
-        );
-        let state = status(rt, issuer_enrollment);
+        assert_ne!(server, 0);
+        let mut builder = 0;
+        assert_eq!(aster_server_builder_new(rt, server_node, &mut builder), OK);
+        let mut srv = 0;
+        assert_eq!(aster_server_start(rt, builder, 64, &mut srv), OK);
+
+        let state = status(rt, server);
+        assert_eq!(state["side"], "server");
         assert_eq!(state["trusted_root"], hex::encode(public(1)));
         assert_eq!(state["credential"]["subject"], hex::encode(public(2)));
-
-        // The node cannot take a gate once Enrollment decides admission.
-        let mut gate = 0;
-        assert_eq!(aster_gate_new(rt, &mut gate), OK);
-        assert_eq!(
-            aster_node_set_gate(rt, issuer_node, gate),
-            aster_status_t::ASTER_STATUS_UNSUPPORTED as i32
-        );
-        assert_eq!(
-            install(
-                rt,
-                issuer_node,
-                &config(root.namespace, &files.path().join("x.json"), None)
-            )
-            .unwrap_err()
-            .0,
-            aster_status_t::ASTER_STATUS_ALREADY_EXISTS as i32
-        );
-
-        let delegation = delegation();
-        let mut issuer = 0;
-        assert_eq!(
-            aster_enrollment_issuer_new(
-                rt,
-                issuer_enrollment,
-                bytes(delegation.as_bytes()),
-                6,
-                &mut issuer
-            ),
-            OK
-        );
+        assert_eq!(state["issuer"], hex::encode(public(2)));
+        assert_eq!(state["renewing"], false);
         let mut out = bytes(b"");
-        assert_eq!(aster_enrollment_issuer_info(rt, issuer, &mut out), OK);
+        assert_eq!(aster_enrollment_issuer_info(rt, server, &mut out), OK);
         assert_eq!(take(out)["public_key"], hex::encode(public(2)));
-
-        let mut builder = 0;
-        assert_eq!(aster_server_builder_new(rt, issuer_node, &mut builder), OK);
-        assert_eq!(
-            aster_server_set_enrollment(rt, builder, issuer_enrollment, issuer),
-            OK
-        );
-        let mut server = 0;
-        assert_eq!(aster_server_start(rt, builder, 64, &mut server), OK);
 
         // Claims beyond the delegation are refused with a code.
         let wider = json!({"subject": hex::encode(public(7)),
-            "claims": {"scopes": ["build", "deploy"], "tags": [], "attributes": {}}});
-        let text = wider.to_string();
+            "claims": {"scopes": ["deploy"], "tags": [], "attributes": {}}})
+        .to_string();
         let mut out = bytes(b"");
         assert_eq!(
-            aster_enrollment_issue(rt, issuer, bytes(text.as_bytes()), &mut out),
+            aster_enrollment_issue(rt, server, bytes(wider.as_bytes()), &mut out),
             aster_status_t::ASTER_STATUS_PERMISSION_DENIED as i32
         );
         assert_eq!(take(out)["code"], "invalid_credential");
-
-        // The orchestrator authenticated node 7 out of band: issue for it.
         let request = json!({"subject": hex::encode(public(7)),
-            "claims": {"scopes": ["build"], "tags": [], "attributes": {"pod": {"type": "string", "value": "p-1"}}},
-            "registration": "ephemeral"});
-        let text = request.to_string();
+            "claims": {"scopes": [], "tags": [], "attributes": {"aster.role": {"type": "string", "value": "ops.status"}}}})
+        .to_string();
         let mut out = bytes(b"");
         assert_eq!(
-            aster_enrollment_issue(rt, issuer, bytes(text.as_bytes()), &mut out),
+            aster_enrollment_issue(rt, server, bytes(request.as_bytes()), &mut out),
             OK
         );
         let issued = take(out);
         let chain = issued["chain"].as_str().unwrap().to_owned();
         assert!(issued["expires_at"].as_u64().unwrap() <= now() + 6);
 
-        // Node 7 enrolls with the issuer using the issued credential.
-        let node = start(rt, 7, &[ENROLLMENT_ALPN], true);
-        let enrollment = install(
-            rt,
-            node,
-            &config(
-                root.namespace,
-                &files.path().join("node.json"),
-                Some(chain.clone()),
-            ),
-        )
-        .unwrap();
+        // The client: enrolls with the server; renews from it (it signed).
+        let (client_node, client) =
+            start(rt, 7, &trust(root.namespace, &chain, json!({})), CLIENT).unwrap();
+        let server_addr = addr_json(rt, server_node);
         let mut op = 0;
         assert_eq!(
-            aster_enrollment_next_revocation(rt, issuer_enrollment, 0, &mut op),
+            aster_enrollment_enroll(
+                rt,
+                server,
+                bytes(server_addr.to_string().as_bytes()),
+                0,
+                &mut op
+            ),
+            INVALID,
+            "a server enrollment does not run the client sequence"
+        );
+        let mut revocation_op = 0;
+        assert_eq!(
+            aster_enrollment_next_revocation(rt, server, 0, &mut revocation_op),
             OK
         );
-        let revocation_op = op;
-        let issuer_addr = addr_json(rt, issuer_node);
-        let joined = connect(rt, enrollment, &issuer_addr);
-        assert_eq!(joined["readiness"]["peer"], hex::encode(public(2)));
+        let enrolled = enroll(rt, client, &server_addr).expect("enroll");
+        assert_eq!(enrolled["readiness"]["peer"], hex::encode(public(2)));
+        assert_eq!(enrolled["renewing"], true);
+        assert_eq!(status(rt, client)["side"], "client");
 
-        // The issuer reads the verified claims of its peer.
-        let seen = claims(rt, issuer_enrollment, public(7)).expect("session");
-        assert_eq!(seen["subject"], hex::encode(public(7)));
-        assert_eq!(seen["root"], hex::encode(public(1)));
+        // The server sees the verified claims (it maps them to roles itself).
+        let seen = claims(rt, server, public(7)).expect("session");
         assert_eq!(seen["issuer"], hex::encode(public(2)));
-        assert_eq!(seen["source"], "chain");
-        assert_eq!(seen["scopes"], json!(["build"]));
-        assert_eq!(seen["attributes"]["pod"]["value"], "p-1");
-        assert_eq!(seen["registration"], "ephemeral");
-        assert!(claims(rt, issuer_enrollment, public(9)).is_none());
-        check(rt, issuer_enrollment, public(7)).expect("admitted");
+        assert_eq!(seen["attributes"]["aster.role"]["value"], "ops.status");
+        assert!(claims(rt, server, public(9)).is_none());
+        check(rt, server, public(7)).expect("admitted");
 
-        // Offline verification of the chain under the issuer's trust.
-        let subject = hex::encode(public(7));
-        let mut out = bytes(b"");
+        // Enrolled nodes take no gate, and a client node cannot serve.
+        let mut gate = 0;
+        assert_eq!(aster_gate_new(rt, &mut gate), OK);
         assert_eq!(
-            aster_enrollment_verify_credential(
-                rt,
-                issuer_enrollment,
-                bytes(subject.as_bytes()),
-                bytes(chain.as_bytes()),
-                &mut out
-            ),
-            OK
+            aster_node_set_gate(rt, client_node, gate),
+            aster_status_t::ASTER_STATUS_UNSUPPORTED as i32
         );
-        assert_eq!(take(out)["credential_id"], issued["credential_id"]);
-        let other = hex::encode(public(9));
-        let mut out = bytes(b"");
+        let mut client_builder = 0;
         assert_eq!(
-            aster_enrollment_verify_credential(
-                rt,
-                issuer_enrollment,
-                bytes(other.as_bytes()),
-                bytes(chain.as_bytes()),
-                &mut out
-            ),
-            aster_status_t::ASTER_STATUS_VERIFICATION_FAILED as i32
+            aster_server_builder_new(rt, client_node, &mut client_builder),
+            INVALID
         );
 
-        // Renewal keeps node 7 on fresh credentials from the issuer.
-        let renewal_config = json!({"issuer": issuer_addr[0], "retry_ms": 200}).to_string();
-        let mut renewal = 0;
-        assert_eq!(
-            aster_enrollment_start_renewal(
-                rt,
-                enrollment,
-                bytes(renewal_config.as_bytes()),
-                &mut renewal
-            ),
-            OK
-        );
-        // Node 7 switches to the renewed credential first, then presents it
-        // to the issuer: wait for both.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Renewal moves the client and the server's session to new
+        // credentials across lifetimes.
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let current = status(rt, enrollment)["credential"]["credential_id"].clone();
-            let seen = claims(rt, issuer_enrollment, public(7)).unwrap()["credential_id"].clone();
+            let current = status(rt, client)["credential"]["credential_id"].clone();
+            let seen = claims(rt, server, public(7)).unwrap()["credential_id"].clone();
             if current != issued["credential_id"] && seen == current {
                 break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "renewal did not move node 7 and the issuer's session to a new credential"
-            );
+            assert!(Instant::now() < deadline, "no renewal reached the server");
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        // The root revokes node 7: the issuer revokes the session and reports
-        // it; a renewal wait then ends with the issuer's refusal or expiry.
+        // The root revokes the client: the server revokes the session.
         root.revoke(public(7), public(2));
         let revoked = wait(rt, revocation_op).expect("revocation");
         assert_eq!(revoked["peer"], hex::encode(public(7)));
         assert_eq!(revoked["reason"]["code"], "node_revoked");
-        assert_eq!(revoked["reason"]["definite"], true);
-        let (status_code, flags, _) = check(rt, issuer_enrollment, public(7)).unwrap_err();
-        assert_eq!(
-            status_code,
-            aster_status_t::ASTER_STATUS_PERMISSION_DENIED as u32
-        );
+        let (code, flags, _) = check(rt, server, public(7)).unwrap_err();
+        assert_eq!(code, aster_status_t::ASTER_STATUS_PERMISSION_DENIED as u32);
         assert_eq!(
             flags,
             aster_enrollment_error_t::ASTER_ENROLLMENT_ERROR_DENIED as u32
         );
-        assert!(claims(rt, issuer_enrollment, public(7)).is_none());
-        let mut op = 0;
-        assert_eq!(aster_enrollment_renewal_wait(rt, renewal, 0, &mut op), OK);
-        let outcome = wait(rt, op).expect("renewal outcome");
-        assert!(
-            outcome["outcome"] == "refused" || outcome["outcome"] == "expired",
-            "{outcome}"
-        );
-        assert_eq!(aster_enrollment_renewal_free(rt, renewal), OK);
+        assert!(claims(rt, server, public(7)).is_none());
 
-        // A pending revocation wait ends when the enrollment is released.
+        // Releasing an enrollment ends a pending revocation wait.
         let mut op = 0;
+        assert_eq!(aster_enrollment_next_revocation(rt, client, 0, &mut op), OK);
+        assert_eq!(aster_enrollment_free(rt, client), OK);
+        let (code, _, _) = wait(rt, op).unwrap_err();
+        assert_eq!(code, aster_status_t::ASTER_STATUS_ALREADY_CLOSED as u32);
         assert_eq!(
-            aster_enrollment_next_revocation(rt, enrollment, 0, &mut op),
-            OK
-        );
-        assert_eq!(aster_enrollment_free(rt, enrollment), OK);
-        let (status_code, _, _) = wait(rt, op).unwrap_err();
-        assert_eq!(
-            status_code,
-            aster_status_t::ASTER_STATUS_ALREADY_CLOSED as u32
-        );
-        assert_eq!(
-            aster_enrollment_free(rt, enrollment),
+            aster_enrollment_free(rt, client),
             aster_status_t::ASTER_STATUS_NOT_FOUND as i32
         );
 
-        assert_eq!(aster_server_destroy(rt, server), OK);
-        assert_eq!(aster_enrollment_issuer_free(rt, issuer), OK);
-        assert_eq!(aster_enrollment_free(rt, issuer_enrollment), OK);
-        for handle in [node, issuer_node] {
-            let mut op = 0;
-            assert_eq!(aster_node_close(rt, handle, 0, &mut op), OK);
-            common::wait_for_successful_operation(rt, op, aster_event_kind_t::ASTER_EVENT_CLOSED);
-        }
+        assert_eq!(aster_server_destroy(rt, srv), OK);
+        close_node(rt, client_node);
+        close_node(rt, server_node);
+        let mut out = bytes(b"");
+        assert_eq!(
+            aster_enrollment_status(rt, server, &mut out),
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32,
+            "closing the node released its enrollment"
+        );
         assert_eq!(
             aster_runtime_close_and_wait(rt, Duration::from_secs(10)),
             OK
@@ -627,104 +568,295 @@ fn issuer_enrolls_renews_and_a_revocation_closes_the_peer() {
     root.tokio.block_on(root.node.clone().shutdown());
 }
 
+/// Misconfiguration fails before anything starts, naming the setting;
+/// nothing ever runs open. Without enrollment the call is a plain start.
 #[test]
-fn install_refuses_unsuitable_nodes_and_configurations() {
+fn misconfiguration_fails_closed() {
     let files = tempfile::tempdir().unwrap();
     let namespace = [3u8; 32];
+    let state = files.path().join("s.json");
+    let good = json!({"state_path": state.to_str().unwrap()});
     unsafe {
         let rt = runtime();
-        let path = files.path().join("state.json");
+        let refused = |trust: Value, side: u32, expect: &str| {
+            let (code, message) = start(rt, 5, &trust, side).unwrap_err();
+            assert_eq!(code, INVALID, "{expect}: {message}");
+            assert!(message.contains(expect), "{expect:?} not in {message:?}");
+        };
+        let credential = root_credential(5);
 
-        // No hooks: nothing to install into.
-        let plain = common::start_node(rt, &[ENROLLMENT_ALPN]);
-        assert_eq!(
-            install(rt, plain, &config(namespace, &path, None))
-                .unwrap_err()
-                .0,
-            aster_status_t::ASTER_STATUS_UNSUPPORTED as i32
+        let mut no_audience = trust(namespace, &credential, good.clone());
+        no_audience["enrollment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("audience");
+        refused(no_audience, SERVER, "audience is required");
+        let mut no_root = trust(namespace, &credential, good.clone());
+        no_root["root_pubkey"] = Value::Null;
+        refused(no_root, SERVER, "no trusted root");
+        refused(
+            trust(namespace, &credential, json!({})),
+            SERVER,
+            "keeps denials durably",
         );
-
-        // Fail-open hooks are refused by Enrollment itself.
-        let open = start(rt, 4, &[ENROLLMENT_ALPN], false);
-        let (code, message) = install(rt, open, &config(namespace, &path, None)).unwrap_err();
-        assert_eq!(code, aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32);
-        assert!(message.contains("fail-closed"), "{message}");
-
-        let node = start(rt, 5, &[ENROLLMENT_ALPN], true);
-        for (mutate, expect) in [
-            (json!({"policy": {"all_of": []}}), "policy"),
-            (
-                json!({"policy": {"source_cidr": "10.0.0.0/99"}}),
-                "source_cidr",
+        let mut no_credential = trust(namespace, &credential, good.clone());
+        no_credential["enrollment_credential_chain"] = Value::Null;
+        refused(no_credential, SERVER, "no credential");
+        refused(
+            trust(namespace, "/etc/aster/node.cred", good.clone()),
+            SERVER,
+            "ASTER_ENROLLMENT_CREDENTIAL)",
+        );
+        refused(
+            trust(namespace, &credential, json!({"policy": "allow_everyone"})),
+            CLIENT,
+            "policy",
+        );
+        refused(
+            trust(
+                namespace,
+                &credential,
+                json!({"fleet_namespace": "not-hex"}),
             ),
-            (json!({"policy": "allow_everyone"}), "enrollment config"),
-            (json!({"root": "zz"}), "root"),
-            (json!({"state_path": ""}), "state_path"),
-            (json!({"surprise": true}), "enrollment config"),
-            // A credential that does not verify for this node.
-            (json!({"credential": root_credential(6)}), "PeerKeyMismatch"),
-        ] {
-            let mut cfg = config(namespace, &path, None);
-            for (k, v) in mutate.as_object().unwrap() {
-                cfg[k] = v.clone();
-            }
-            let (code, message) = install(rt, node, &cfg).unwrap_err();
-            assert_eq!(
-                code,
-                aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32,
-                "{message}"
-            );
-            assert!(message.contains(expect), "{expect}: {message}");
-        }
-
-        // A gate attached first keeps Enrollment out.
-        let mut gate = 0;
-        assert_eq!(aster_gate_new(rt, &mut gate), OK);
-        assert_eq!(aster_node_set_gate(rt, node, gate), OK);
-        assert_eq!(
-            install(rt, node, &config(namespace, &path, None))
-                .unwrap_err()
-                .0,
-            aster_status_t::ASTER_STATUS_UNSUPPORTED as i32
+            CLIENT,
+            "fleet_namespace",
         );
-        assert_eq!(aster_node_set_gate(rt, node, 0), OK);
-
-        // A pure verifier (no credential) installs; its status has none.
-        let enrollment = install(rt, node, &config(namespace, &path, None)).unwrap();
-        let state = status(rt, enrollment);
-        assert_eq!(state["credential"], Value::Null);
-        assert_eq!(state["fleet_namespace"], hex::encode(namespace));
-
-        // Unknown handles and bad arguments.
-        let mut out = bytes(b"");
-        assert_eq!(
-            aster_enrollment_status(rt, 999_999, &mut out),
-            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        refused(
+            trust(
+                namespace,
+                &credential,
+                json!({"issuer_delegation_file": "x"}),
+            ),
+            CLIENT,
+            "server-only",
         );
+        refused(
+            json!({"root_pubkey": hex::encode(public(1)), "enrollment": {"enabled": true}}),
+            CLIENT,
+            "audience is required",
+        );
+        refused(json!({"allow_all_consumers": true}), CLIENT, "trust_json");
         let mut op = 0;
         assert_eq!(
-            aster_enrollment_connect(rt, enrollment, bytes(b"[]"), 0, &mut op),
-            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32
-        );
-        let mut issuer = 0;
-        assert_eq!(
-            aster_enrollment_issuer_new(rt, enrollment, bytes(b"not-a-chain"), 0, &mut issuer),
-            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32
-        );
-        // A delegation whose leaf names another key.
-        let delegation = delegation();
-        assert_eq!(
-            aster_enrollment_issuer_new(
-                rt,
-                enrollment,
-                bytes(delegation.as_bytes()),
-                0,
-                &mut issuer
-            ),
-            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32
+            aster_node_start_enrolled(rt, ptr::null(), bytes(b"{}"), 9, 0, &mut op),
+            INVALID
         );
 
-        assert_eq!(aster_enrollment_free(rt, enrollment), OK);
+        // A credential issued for another key: the node starts, install
+        // refuses it, and the node is closed again.
+        let (code, message) =
+            start(rt, 6, &trust(namespace, &credential, json!({})), CLIENT).unwrap_err();
+        assert_eq!(code, INVALID, "{message}");
+
+        // Not enabled (the root alone does not enable it): a plain node.
+        let (node, enrollment) = start(
+            rt,
+            8,
+            &json!({"root_pubkey": hex::encode(public(1))}),
+            SERVER,
+        )
+        .unwrap();
+        assert_eq!(enrollment, 0);
+        close_node(rt, node);
+        assert_eq!(
+            aster_runtime_close_and_wait(rt, Duration::from_secs(10)),
+            OK
+        );
+    }
+}
+
+/// `[trust]` / `[enrollment]` resolve through `AsterConfig::from_file` into
+/// the JSON `aster_node_start_enrolled` takes.
+#[test]
+fn trust_json_from_toml() {
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("aster.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[trust]
+root_pubkey = "{root}"
+enrollment_credential = "node.cred"
+next_root_commitment = "{commitment}"
+root_seq = 1
+
+[enrollment]
+audience = "{FLEET}"
+fleet_namespace = "{ns}"
+policy = {{ any_of = [{{ scope = "ops" }}, "tolerate_stale_policy"] }}
+
+[enrollment.roles.scopes]
+ops = "ops.status, ops.logs"
+
+[enrollment.issuer]
+lifetime = "2h"
+"#,
+            root = hex::encode(public(1)),
+            commitment = "ab".repeat(32),
+            ns = "cd".repeat(32),
+        ),
+    )
+    .unwrap();
+    unsafe {
+        let text = path.to_str().unwrap();
+        let mut out = bytes(b"");
+        assert_eq!(
+            aster_config_enrollment_from_toml(bytes(text.as_bytes()), &mut out),
+            OK
+        );
+        let json = take(out);
+        assert_eq!(json["root_pubkey"], hex::encode(public(1)));
+        assert_eq!(json["enrollment_credential_file"], "node.cred");
+        assert_eq!(json["root_seq"], 1);
+        assert_eq!(json["enrollment"]["audience"], FLEET);
+        assert_eq!(
+            json["enrollment"]["policy"],
+            json!({"any_of": [{"scope": "ops"}, "tolerate_stale_policy"]})
+        );
+        assert_eq!(
+            json["enrollment"]["roles"]["scopes"]["ops"],
+            json!(["ops.status", "ops.logs"])
+        );
+        assert_eq!(json["enrollment"]["roles"]["attribute"], "aster.role");
+        assert_eq!(json["enrollment"]["issuer_lifetime_secs"], 7200);
+
+        let missing = files.path().join("missing.toml");
+        let mut out = bytes(b"");
+        assert_eq!(
+            aster_config_enrollment_from_toml(
+                bytes(missing.to_str().unwrap().as_bytes()),
+                &mut out
+            ),
+            INVALID
+        );
+    }
+}
+
+unsafe fn connect_rpc(rt: aster_runtime_t, client: u64, server: u64) -> u64 {
+    let addr = addr_json(rt, server);
+    let id = addr["node_id"].as_str().unwrap().to_owned();
+    let direct: Vec<String> = serde_json::from_value(addr["direct_addresses"].clone()).unwrap();
+    let direct_b: Vec<aster_bytes_t> = direct.iter().map(|d| bytes(d.as_bytes())).collect();
+    let node_addr = aster_node_addr_t {
+        endpoint_id: bytes(id.as_bytes()),
+        relay_url: bytes(&[]),
+        direct_addresses: aster_bytes_list_t {
+            items: direct_b.as_ptr(),
+            len: direct_b.len(),
+        },
+    };
+    let cfg = aster_connect_config_t {
+        struct_size: std::mem::size_of::<aster_connect_config_t>() as u32,
+        flags: 0,
+        node_id: bytes(id.as_bytes()),
+        alpn: bytes(b"aster/1"),
+        addr: &node_addr,
+    };
+    let mut op = 0;
+    assert_eq!(aster_connect(rt, client, &cfg, 0, &mut op), OK);
+    common::wait_for_successful_operation(rt, op, aster_event_kind_t::ASTER_EVENT_CONNECTED).handle
+}
+
+unsafe fn node_id(rt: aster_runtime_t, node: u64) -> String {
+    addr_json(rt, node)["node_id"].as_str().unwrap().to_owned()
+}
+
+/// Returns `(event kind, handle)` of an acquire.
+unsafe fn acquire(rt: aster_runtime_t, ser: u64, resource: &str, holder: &str) -> (u32, u64) {
+    let mut op = 0;
+    assert_eq!(
+        aster_lease_acquire(
+            rt,
+            ser,
+            bytes(resource.as_bytes()),
+            bytes(holder.as_bytes()),
+            5_000,
+            0,
+            0,
+            0,
+            &mut op
+        ),
+        OK
+    );
+    let event = common::wait_for_operation(rt, op);
+    aster_buffer_release(rt, event.buffer);
+    (event.kind, event.handle)
+}
+
+/// A server serves `aster.lease.Grantor` over a serializer handle; clients
+/// acquire through it, bound to their authenticated node ids.
+#[test]
+fn lease_grantor_serves_clients_bound_to_their_identity() {
+    unsafe {
+        let rt = runtime();
+        let server_node = common::start_node(rt, &[b"aster/1"]);
+        let mut backend = 0;
+        assert_eq!(aster_lease_serializer_memory_new(rt, 0, &mut backend), OK);
+        let mut builder = 0;
+        assert_eq!(aster_server_builder_new(rt, server_node, &mut builder), OK);
+        assert_eq!(
+            aster_server_add_lease_grantor(builder, backend, bytes(b"{"), bytes(b"")),
+            INVALID
+        );
+        assert_eq!(
+            aster_server_add_lease_grantor(builder, 999_999, bytes(b""), bytes(b"")),
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+        assert_eq!(
+            aster_server_add_lease_grantor(builder, backend, bytes(b""), bytes(b"")),
+            OK
+        );
+        let mut srv = 0;
+        assert_eq!(aster_server_start(rt, builder, 64, &mut srv), OK);
+
+        let a = common::start_node(rt, &[]);
+        let b = common::start_node(rt, &[]);
+        let (a_id, b_id) = (node_id(rt, a), node_id(rt, b));
+        let mut ser_a = 0;
+        let conn_a = connect_rpc(rt, a, server_node);
+        assert_eq!(
+            aster_lease_serializer_grantor_new(rt, a, conn_a, &mut ser_a),
+            OK
+        );
+        let mut ser_b = 0;
+        let conn_b = connect_rpc(rt, b, server_node);
+        assert_eq!(
+            aster_lease_serializer_grantor_new(rt, b, conn_b, &mut ser_b),
+            OK
+        );
+
+        let granted = aster_event_kind_t::ASTER_EVENT_LEASE_ACQUIRED as u32;
+        let (kind, lease) = acquire(rt, ser_a, "db/primary", &a_id);
+        assert_eq!(kind, granted);
+        assert_ne!(lease, 0, "a holds the lease");
+        // b is denied while a holds it.
+        assert_eq!(acquire(rt, ser_b, "db/primary", &b_id), (granted, 0));
+        // An op built for another actor never reaches the grantor.
+        let (kind, _) = acquire(rt, ser_b, "db/other", &a_id);
+        assert_eq!(kind, aster_event_kind_t::ASTER_EVENT_ERROR as u32);
+        // The grantor's rows are the backend's.
+        let mut op = 0;
+        assert_eq!(
+            aster_lease_snapshot(rt, backend, bytes(b"db/primary"), 0, &mut op),
+            OK
+        );
+        let event = common::wait_for_operation(rt, op);
+        let payload = std::slice::from_raw_parts(event.data_ptr, event.data_len).to_vec();
+        aster_buffer_release(rt, event.buffer);
+        assert!(
+            payload.windows(64).any(|w| w == a_id.as_bytes()),
+            "the backend holds a's grant"
+        );
+
+        assert_eq!(aster_lease_free(rt, lease), OK);
+        for ser in [ser_a, ser_b, backend] {
+            assert_eq!(aster_lease_serializer_free(rt, ser), OK);
+        }
+        assert_eq!(aster_server_destroy(rt, srv), OK);
+        for node in [a, b, server_node] {
+            close_node(rt, node);
+        }
         assert_eq!(
             aster_runtime_close_and_wait(rt, Duration::from_secs(10)),
             OK
