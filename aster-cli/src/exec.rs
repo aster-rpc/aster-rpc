@@ -1,5 +1,6 @@
 //! Thin CLI and MCP adapters over the shared Exec client and local broker.
 mod daemon;
+mod delegate;
 mod grants;
 mod setup;
 use aster_cli_kit::{Ctx, Error, Result, Tool};
@@ -18,6 +19,11 @@ pub enum ExecCommand {
     Grant(grants::PublishArgs),
     /// Durably publish a root-authored revoked Exec grant (never delete the record)
     Revoke(grants::PublishArgs),
+    /// As a principal, delegate bounded on-behalf-of authority to an orchestrator
+    Delegate(delegate::DelegateArgs),
+    /// As a principal or its delegate, let an actor submit jobs under the
+    /// principal's grant (an action chain for `run --on-behalf-of`)
+    Authorize(delegate::AuthorizeArgs),
     /// Check authenticated remote target readiness without launching a job
     Check {
         #[arg(long)]
@@ -53,6 +59,16 @@ pub enum ExecCommand {
         /// Return the job reference immediately without following output
         #[arg(long)]
         detach: bool,
+        /// Submit under another principal's grant with this action chain file
+        #[arg(long, value_name = "FILE", requires = "principal")]
+        on_behalf_of: Option<std::path::PathBuf>,
+        /// The principal (64 hex characters) the action chain is rooted at
+        #[arg(long, requires = "on_behalf_of")]
+        principal: Option<String>,
+        /// Print the request digest an action chain can bind, then exit
+        /// without submitting; pass the same --request-id when submitting
+        #[arg(long)]
+        print_request_digest: bool,
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -148,6 +164,8 @@ pub async fn run(ctx: &Ctx, command: ExecCommand) -> Result<()> {
         ExecCommand::Setup(args) => return setup::run(args),
         ExecCommand::Grant(args) => return grants::publish(ctx, args, false).await,
         ExecCommand::Revoke(args) => return grants::publish(ctx, args, true).await,
+        ExecCommand::Delegate(args) => return delegate::delegate(ctx, args),
+        ExecCommand::Authorize(args) => return delegate::authorize(ctx, args),
         ExecCommand::Check { node, target } => {
             let value = daemon::call(
                 ctx,
@@ -179,6 +197,9 @@ pub async fn run(ctx: &Ctx, command: ExecCommand) -> Result<()> {
             request_id,
             timeout_ms,
             detach,
+            on_behalf_of,
+            principal,
+            print_request_digest,
             command,
         } => {
             follow = !detach;
@@ -189,6 +210,17 @@ pub async fn run(ctx: &Ctx, command: ExecCommand) -> Result<()> {
                 req.request_id = id;
             }
             req.validate()?;
+            if print_request_digest {
+                return print(&json!({
+                    "request_id": req.request_id,
+                    "request_digest": hex::encode(req.on_behalf_digest()?),
+                }));
+            }
+            if let (Some(path), Some(principal)) = (on_behalf_of, principal) {
+                let chain = delegate::read_chain(&path)?;
+                req = req.on_behalf(principal, chain.into_text());
+                req.validate()?;
+            }
             // Print the ID before submission so ambiguous failures can be reconciled.
             eprintln!("request_id: {}", req.request_id);
             invocation(node, "submit", req)?
@@ -425,6 +457,9 @@ struct McpSubmit {
     argv: Vec<String>,
     execution_timeout_ms: Option<u64>,
     output_limit_bytes: Option<u64>,
+    /// Act for a principal with an action chain it issued to this node.
+    #[serde(default)]
+    on_behalf_of: Option<OnBehalfOfV1>,
 }
 
 impl McpSubmit {
@@ -440,6 +475,7 @@ impl McpSubmit {
             stdin_bytes: None,
             execution_timeout_ms: self.execution_timeout_ms,
             output_limit_bytes: self.output_limit_bytes,
+            on_behalf_of: self.on_behalf_of,
         }
     }
 }
@@ -502,7 +538,17 @@ pub fn tools() -> Vec<Tool> {
                     "executable": {"type": "string"},
                     "argv": {"type": "array", "items": {"type": "string"}},
                     "execution_timeout_ms": {"type": ["integer", "null"], "minimum": 1000, "maximum": 86400000},
-                    "output_limit_bytes": {"type": ["integer", "null"], "minimum": 0, "maximum": 268435456}
+                    "output_limit_bytes": {"type": ["integer", "null"], "minimum": 0, "maximum": 268435456},
+                    "on_behalf_of": {
+                        "type": ["object", "null"],
+                        "description": "Submit under another principal's Exec grant with an action chain it issued to this node",
+                        "properties": {
+                            "principal": {"type": "string", "description": "Principal node ID (64 hex characters)"},
+                            "chain": {"type": "string", "description": "Action chain text (aster-chain-v1~...)"}
+                        },
+                        "required": ["principal", "chain"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["request_id", "target_id", "cwd", "executable", "argv"],
                 "additionalProperties": false
@@ -731,6 +777,24 @@ mod tests {
                 .extend(extra.as_object().unwrap().clone());
             assert!(serde_json::from_value::<super::McpSubmit>(request).is_err());
         }
+    }
+
+    #[test]
+    fn mcp_submit_passes_an_on_behalf_of_chain_through() {
+        let request = json!({
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "target_id": "t",
+            "cwd": "/tmp",
+            "executable": "/bin/true",
+            "argv": [],
+            "on_behalf_of": {"principal": "11".repeat(32), "chain": "aster-chain-v1~x"},
+        });
+        let built = serde_json::from_value::<super::McpSubmit>(request)
+            .unwrap()
+            .into_request();
+        let on_behalf = built.on_behalf_of.unwrap();
+        assert_eq!(on_behalf.principal, "11".repeat(32));
+        assert_eq!(on_behalf.chain, "aster-chain-v1~x");
     }
 
     #[test]

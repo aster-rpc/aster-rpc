@@ -440,7 +440,7 @@ fn issue_delegate(ctx: &Ctx, args: DelegateArgs, now: u64) -> Result<IssuedRepor
 
 /// Publish only a complete file, atomically and without replacing an
 /// existing path.
-fn write_new(out: &Path, unique: &str, text: &str) -> Result<()> {
+pub(crate) fn write_new(out: &Path, unique: &str, text: &str) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -465,7 +465,7 @@ fn write_new(out: &Path, unique: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_key(value: &str, what: &str) -> Result<[u8; 32]> {
+pub(crate) fn parse_key(value: &str, what: &str) -> Result<[u8; 32]> {
     hex::decode(value)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
@@ -473,7 +473,7 @@ fn parse_key(value: &str, what: &str) -> Result<[u8; 32]> {
 }
 
 /// `<n>s`, `<n>m`, `<n>h` or `<n>d`; a bare number is seconds.
-fn parse_duration(value: &str) -> Result<u64> {
+pub(crate) fn parse_duration(value: &str) -> Result<u64> {
     let value = value.trim();
     let (digits, unit) = match value.char_indices().last() {
         Some((index, unit)) if unit.is_ascii_alphabetic() => (&value[..index], unit),
