@@ -584,13 +584,16 @@ impl Plan {
         Some(enrollment.start_renewal(RenewalConfig::new(issuer)))
     }
 
-    /// Which side this plan was validated for.
+    /// Which side this plan was validated for. (For the bindings, through
+    /// `binding_support::enrollment`.)
+    #[cfg(all(feature = "binding-support", feature = "rpc"))]
     pub fn side(&self) -> Side {
         self.side
     }
 
     /// The Gate-3 attribute source for a server: each peer's roles from its
     /// live enrollment session, mapped with this plan's [`RoleMapping`].
+    #[cfg(all(feature = "binding-support", feature = "rpc"))]
     pub fn attribute_source(&self, enrollment: &Enrollment) -> Arc<dyn AttributeSource> {
         Arc::new(EnrollmentAttributes {
             enrollment: enrollment.clone(),
