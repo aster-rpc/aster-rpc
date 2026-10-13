@@ -291,6 +291,11 @@ export function registerGenerated(opts: RegisterGeneratedOptions): void {
   for (const svc of opts.SERVICES) {
     const proto = svc.ctor.prototype;
     const methods = new Map<string, MethodInfo>();
+    // `aster-gen` does not evaluate `requires` (it is often an expression
+    // such as `Role.STATUS` or `anyOf(...)`), so the generated entry carries
+    // `undefined`. Keep what the decorators recorded on the class: dropping
+    // it would silently open every gated method.
+    const decorated = (svc.ctor as any)[SERVICE_INFO_KEY] as ServiceInfo | undefined;
     for (const m of svc.methods) {
       const handler = proto[m.name];
       if (typeof handler !== 'function') {
@@ -308,7 +313,7 @@ export function registerGenerated(opts: RegisterGeneratedOptions): void {
         timeout: m.timeout,
         idempotent: m.idempotent,
         serialization: m.serialization,
-        requires: m.requires,
+        requires: m.requires ?? decorated?.methods.get(m.name)?.requires,
         handler,
         metadata: m.metadata,
         acceptsCtx: m.acceptsCtx,
@@ -326,7 +331,7 @@ export function registerGenerated(opts: RegisterGeneratedOptions): void {
       scoped: svc.scoped,
       methods,
       serializationModes: [...svc.serializationModes],
-      requires: svc.requires,
+      requires: svc.requires ?? decorated?.requires,
       metadata: svc.metadata,
       instance: undefined,
     };
