@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import {
   AsterClientWrapper,
   AsterServer,
+  ClientStream,
   Rpc,
   RpcError,
   SecretKey,
@@ -67,6 +68,14 @@ class Ops {
   @Rpc({ request: OpsRequest, response: OpsReply, requires: anyOf('ops.logs', 'ops.admin') })
   async logs(_req: OpsRequest, ctx: CallContext): Promise<OpsReply> {
     return new OpsReply({ role: ctx.attributes?.['aster.role'] ?? '' });
+  }
+
+  /** A client stream gated by `ops.admin`: counts the requests. */
+  @ClientStream({ request: OpsRequest, response: OpsReply, requires: 'ops.admin' })
+  async upload(reqs: AsyncIterable<OpsRequest>): Promise<OpsReply> {
+    let count = 0;
+    for await (const _ of reqs) count += 1;
+    return new OpsReply({ role: String(count) });
   }
 
   /** A server stream gated like `logs`: one reply, then the stream ends. */
@@ -281,6 +290,27 @@ describe.skipIf(!available)('Enrollment on AsterServer / AsterClient from AsterC
     }
   }, 120_000);
 
+  it('a Gate-3 refusal of a client stream sending many items is PERMISSION_DENIED', async () => {
+    // The server stops the request side before the client has sent
+    // everything; the client reports the server's status, not its own
+    // failed send (UNAVAILABLE "sending stopped by peer").
+    async function* items() {
+      for (let i = 0; i < 100; i++) yield new OpsRequest({ note: 'x' });
+    }
+    const server = await startServer(serverConfig());
+    try {
+      const ingest = await connect(server, clientConfig('ops.ingest'));
+      for (let attempt = 0; attempt < 5; attempt++) {
+        expect(await denied(ingest.ops.upload(items())), `attempt ${attempt}`).toBe(true);
+      }
+      const admin = await connect(server, clientConfig('ops.admin'));
+      expect((await admin.ops.upload(items())).role).toBe('100');
+      await ingest.client.close();
+      await admin.client.close();
+    } finally {
+      await server.close();
+    }
+  }, 60_000);
 
   it('a config-driven issuer renews the credentials it signed, across several lifetimes', async () => {
     const key = SecretKey.generate();

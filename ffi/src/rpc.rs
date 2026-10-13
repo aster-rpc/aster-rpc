@@ -637,7 +637,10 @@ pub(crate) struct RpcCall {
     reader: tokio::sync::Mutex<Reader>,
     /// The first failure seen by a send, a read or a cancel: what the
     /// trailer reports (a cancel triggered by a deadline still says
-    /// `DEADLINE_EXCEEDED`).
+    /// `DEADLINE_EXCEEDED`). A status the read side receives replaces a
+    /// send's failure: a server that refuses a streaming call stops the
+    /// request side (the send fails, `UNAVAILABLE`) and then sends the real
+    /// outcome (`PERMISSION_DENIED`) in its trailer.
     failure: Mutex<Option<RpcStatus>>,
     cancelled: AtomicBool,
     cancel: Notify,
@@ -646,6 +649,26 @@ pub(crate) struct RpcCall {
 impl RpcCall {
     fn fail_with(&self, st: RpcStatus) -> RpcStatus {
         self.failure.lock().unwrap().get_or_insert(st).clone()
+    }
+
+    /// The read side ended with `error`. An RPC status (the server's trailer,
+    /// or a client-side deadline) replaces an earlier send failure that was
+    /// only a transport error (`UNAVAILABLE`: the peer stopped the request
+    /// side); any other recorded status (a cancel, a local validation such
+    /// as an empty finish) stays the outcome.
+    fn fail_from_read(&self, error: &aster::Error) -> RpcStatus {
+        let st = error_status(error);
+        if !matches!(error, aster::Error::Rpc { .. }) || self.cancelled.load(Ordering::Acquire) {
+            return self.fail_with(st);
+        }
+        let mut failure = self.failure.lock().unwrap();
+        match failure.as_ref() {
+            Some(sent) if sent.code != StatusCode::Unavailable.as_i32() => sent.clone(),
+            _ => {
+                *failure = Some(st.clone());
+                st
+            }
+        }
     }
 }
 
@@ -789,6 +812,12 @@ pub unsafe extern "C" fn aster_call_send_payload(
         match sent {
             Ok(()) => aster_status_t::ASTER_STATUS_OK as i32,
             Err(aster::Error::InvalidArgument(m)) if m.contains("already finished") => invalid(m),
+            // The call completed (the server answered or refused it) while
+            // this request was being written: not an outcome of its own; the
+            // read side reports the trailer.
+            Err(aster::Error::InvalidArgument(m)) if m == "call already completed" => {
+                aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32
+            }
             Err(e) => {
                 call.fail_with(error_status(&e));
                 aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32
@@ -929,7 +958,7 @@ pub unsafe extern "C" fn aster_call_recv_payload(
                 }
                 Some(Err(e)) => {
                     reader.done = true;
-                    Out::Trailer(call.fail_with(error_status(&e)))
+                    Out::Trailer(call.fail_from_read(&e))
                 }
             };
         }
@@ -977,7 +1006,7 @@ pub unsafe extern "C" fn aster_call_recv_payload(
             }
             Some(Err(e)) => {
                 reader.done = true;
-                Out::Trailer(call.fail_with(error_status(&e)))
+                Out::Trailer(call.fail_from_read(&e))
             }
         }
     });

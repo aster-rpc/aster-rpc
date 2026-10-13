@@ -24,7 +24,7 @@ from aster.codec import ForyCodec, ForyConfig
 from aster.rpc_types import SerializationMode
 from aster.status import RpcError, StatusCode
 from aster.tracing import inject as _inject_trace
-from aster.transport.base import BidiChannel, Transport, TransportError
+from aster.transport.base import BidiChannel, ConnectionLostError, Transport, TransportError
 
 if TYPE_CHECKING:
     import aster
@@ -290,6 +290,26 @@ class IrohTransport(Transport):
                             pass
                         if not produced.done():
                             produced.set_result(None)
+                    elif (
+                        phase == "native"
+                        and isinstance(error, ConnectionLostError)
+                        and "stopped by peer" in str(error)
+                    ):
+                        # A server that refuses the call (Gate 3) or answers early stops
+                        # the request side, so the send fails ("sending stopped by peer",
+                        # UNAVAILABLE) before the server's status arrives. That status,
+                        # or the early reply, is the outcome; the send failure only when
+                        # the response half failed for a transport reason too.
+                        reader_outcome: BaseException | None = None
+                        try:
+                            await asyncio.shield(reader)
+                        except BaseException as outcome:  # noqa: BLE001
+                            reader_outcome = outcome
+                        if not produced.done():
+                            if reader_outcome is None or isinstance(reader_outcome, RpcError):
+                                produced.set_result(None)
+                            else:
+                                produced.set_exception(error)
                     else:
                         produced.set_exception(error)
             finally:

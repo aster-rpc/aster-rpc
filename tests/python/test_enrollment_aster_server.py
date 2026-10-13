@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import pytest
@@ -27,6 +28,7 @@ from aster import (
     EnrollmentConfig,
     SecretKey,
     any_of,
+    client_stream,
     rpc,
     service,
     wire_type,
@@ -88,6 +90,13 @@ class Ops:
     @rpc(requires=any_of("ops.logs", "ops.admin"))
     async def logs(self, req: Empty, ctx: CallContext) -> RoleReply:
         return RoleReply(role=ctx.attributes.get("aster.role", ""))
+
+    @client_stream(requires="ops.admin")
+    async def upload(self, reqs: AsyncIterator[Empty]) -> RoleReply:
+        count = 0
+        async for _ in reqs:
+            count += 1
+        return RoleReply(role=str(count))
 
 
 def base(n: int, **changes) -> AsterConfig:
@@ -254,6 +263,32 @@ async def test_runtime_restriction_refuses_the_next_call(root, tmp_path):
             await client.close()
         await srv.close()
 
+
+async def test_client_stream_refusal_is_permission_denied(root, tmp_path):
+    """A Gate-3 refusal of a client-stream call sending many items is
+    PERMISSION_DENIED, not UNAVAILABLE: the server stops the request side
+    before the client has sent everything, and the client reports the
+    server's status rather than its own failed send."""
+
+    async def items():
+        for _ in range(100):
+            yield Empty("x")
+
+    srv = await start_server(server_config(root, tmp_path))
+    clients: list[AsterClient] = []
+    try:
+        ingest, ing = await connect(srv, client_config(root, 6, credential(6, "ops.ingest")))
+        clients.append(ingest)
+        for _ in range(5):
+            with pytest.raises(PermissionDeniedError):
+                await asyncio.wait_for(ing.upload(items()), 10)
+        admin, adm = await connect(srv, client_config(root, 5, credential(5, "ops.admin")))
+        clients.append(admin)
+        assert (await asyncio.wait_for(adm.upload(items()), 10)).role == "100"
+    finally:
+        for client in clients:
+            await client.close()
+        await srv.close()
 
 
 async def test_config_driven_issuer_renews_client_credentials(root, tmp_path):

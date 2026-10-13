@@ -336,6 +336,7 @@ export class IrohTransport implements AsterTransport {
       (error) => { closeRequests(); throw mapTransportError(error); },
     );
     const producing = (async (): Promise<Buffer> => {
+      let writing = false;
       try {
         const asyncIterator = requests[Symbol.asyncIterator]?.();
         iterator = asyncIterator ?? (requests as unknown as Iterable<unknown>)[Symbol.iterator]();
@@ -344,6 +345,7 @@ export class IrohTransport implements AsterTransport {
           if (terminal) break;
           if (item.done) {
             sourceClosed = true;
+            writing = true;
             await pump.flush();
             if (!terminal) await call.finish();
             break;
@@ -351,7 +353,10 @@ export class IrohTransport implements AsterTransport {
           // for-await unwraps promised values from synchronous iterators only.
           const value = asyncIterator ? item.value : await item.value;
           if (terminal) break;
-          await pump.push(this.codec.encode(value, opts?.hintType));
+          const payload = this.codec.encode(value, opts?.hintType);
+          writing = true;
+          await pump.push(payload);
+          writing = false;
         }
       } catch (error) {
         if (!terminal) {
@@ -367,6 +372,19 @@ export class IrohTransport implements AsterTransport {
             // codes; the response owns the peer's actual terminal status.
             await response;
             throw nativeFailure;
+          }
+          if (writing && nativeFailure?.code === StatusCode.UNAVAILABLE && nativeFailure.message.includes('stopped by peer')) {
+            // A server that refuses the call (Gate 3) or answers early stops
+            // the request side, so the write fails ("sending stopped by peer",
+            // UNAVAILABLE) before its status arrives: that status, or the
+            // early reply, is the outcome. The write failure only when the
+            // response half failed for a transport reason too.
+            try {
+              return await response;
+            } catch (outcome) {
+              if (outcome instanceof RpcError && outcome.code !== StatusCode.UNAVAILABLE) throw outcome;
+              throw nativeFailure;
+            }
           }
           // Local framing validation or a failed write need not end the reader.
           // Cancel it and report that original failure without waiting for a reply.

@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,10 +90,21 @@ func opsService() *Service {
 		}
 		return &opsReply{}, nil
 	}
+	upload := func(ctx context.Context, reqs iter.Seq2[*opsRequest, error]) (*opsReply, error) {
+		n := int32(0)
+		for r, err := range reqs {
+			if err != nil {
+				return nil, err
+			}
+			n += r.N
+		}
+		return &opsReply{Roles: fmt.Sprint(n)}, nil
+	}
 	return NewService("Ops", 1,
 		Unary("ping", echo),
 		Unary("status", echo, Requires(RequireRole("ops.status"))),
 		Unary("logs", echo, Requires(RequireAnyOf("ops.logs", "ops.admin"))),
+		ClientStream("upload", upload, Requires(RequireRole("ops.admin"))),
 	)
 }
 
@@ -298,6 +311,42 @@ func TestEnrollment_CredentialRolesGateRequiresAndRootRevocationClosesTheConnect
 	// Unaffected peers keep working.
 	if roles, err := opsCall(ctx, ingest, server, "ping"); err != nil || roles != "ops.ingest" {
 		t.Fatalf("ingest after the revocation: %q %v", roles, err)
+	}
+}
+
+// A Gate-3 refusal of a client-stream call that sends many items is
+// PERMISSION_DENIED, not UNAVAILABLE: the server stops the request side
+// before the client has sent everything, and the client must still report
+// the server's trailer rather than its own failed send.
+func TestEnrollment_ClientStreamRefusalIsPermissionDenied(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_, server := startOps(t, ctx, ServerOptions{Config: serverCfg(t, t.TempDir())})
+	ingest := startClient(t, ctx, enrolledCfg(6, credentialFor(t, 6, "ops.ingest")))
+	rc, err := ingest.Connect(ctx, server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := func(yield func(*opsRequest) bool) {
+		for i := 0; i < 100; i++ {
+			if !yield(&opsRequest{N: 1}) {
+				return
+			}
+		}
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		_, err := CallClientStream[opsRequest, opsReply](ctx, rc, "Ops", "upload", items)
+		if !errors.Is(err, ErrRpcPermissionDenied) {
+			t.Fatalf("attempt %d: want PERMISSION_DENIED, got %v", attempt, err)
+		}
+	}
+	operator := startClient(t, ctx, enrolledCfg(5, credentialFor(t, 5, "ops.admin")))
+	orc, err := operator.Connect(ctx, server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply, err := CallClientStream[opsRequest, opsReply](ctx, orc, "Ops", "upload", items); err != nil || reply.Roles != "100" {
+		t.Fatalf("admin upload: %+v %v", reply, err)
 	}
 }
 

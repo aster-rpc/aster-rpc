@@ -448,7 +448,9 @@ impl RpcConnection {
             let flags = if last { FLAG_END_STREAM } else { 0 };
             batch.extend_from_slice(&encode_payload_frame(&req, flags)?);
             if last || batch.len() >= WRITE_BATCH {
-                sink.send_framed(std::mem::take(&mut batch), last).await?;
+                if let Err(sent) = sink.send_framed(std::mem::take(&mut batch), last).await {
+                    return settle_failed_send(sent, response).await;
+                }
             }
         }
         response.await
@@ -1189,6 +1191,23 @@ impl ResponseFuture {
     /// then yields `CANCELLED`.
     pub async fn cancel(&self) {
         self.ctl.cancel().await;
+    }
+}
+
+/// A client-stream send failed. A server that refuses the call (Gate 3, or a
+/// handler that answers early) stops the request side, so the send fails
+/// with a transport error ("sending stopped by peer", `UNAVAILABLE`), and then
+/// sends the real outcome: read it. A deadline or cancel (an RPC status) is
+/// already the outcome; so is the send failure when the response half failed
+/// for a transport reason too (the connection was lost).
+async fn settle_failed_send(sent: Error, response: ResponseFuture) -> Result<Vec<u8>> {
+    if matches!(sent, Error::Rpc { .. }) {
+        return Err(sent);
+    }
+    match response.await {
+        Ok(reply) => Ok(reply),
+        Err(status @ Error::Rpc { .. }) => Err(status),
+        Err(_) => Err(sent),
     }
 }
 
