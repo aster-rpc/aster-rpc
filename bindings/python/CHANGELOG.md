@@ -5,6 +5,20 @@ the repository; entries under **Unreleased** ship with the next tag.
 
 ## Unreleased
 
+### Changed: the credential sets the maximum roles; runtime can only restrict
+
+For a peer with a live enrollment session, the roles Gate 3 checks are now the
+roles from its credential (`[enrollment.roles]`) intersected with an optional
+runtime restriction. New `AsterServer.restrict_peer_roles(peer, roles)`
+narrows them from the peer's next call (calls in flight finish); `[]` leaves
+the peer no roles; a role the credential lacks is never granted.
+`AsterServer.clear_peer_restriction(peer)` restores the credential roles. A
+restriction survives renewals of the same credential subject and ends with
+the peer's enrollment session (revocation, eviction, expiry);
+`restrict_peer_roles` raises `LookupError` for a peer without a live session.
+Runtime-set `aster.role` never applies to an enrolled peer. Peers without an
+enrollment session (an open server, a custom `gate=`) are unchanged.
+
 ### Breaking change: consumer admission removed, Enrollment replaces it
 
 The legacy consumer admission is gone, with no compatibility path: the

@@ -1208,6 +1208,39 @@ class AsterServer:
         delegated issuer."""
         return self._enrollment
 
+    def _dispatch_server(self) -> Any:
+        self._require_started()
+        dispatcher = self._server._dispatcher if self._server is not None else None
+        native = dispatcher.server if dispatcher is not None else None
+        if native is None:
+            raise RuntimeError("AsterServer is not serving")
+        return native
+
+    def restrict_peer_roles(self, peer: str, roles: "list[str]") -> None:
+        """Narrow an enrolled peer's roles at runtime.
+
+        The credential sets the maximum; runtime settings can only restrict.
+        From the peer's next call (calls in flight finish) its effective
+        roles are its credential roles intersected with ``roles``; a role the
+        credential lacks is never granted, and ``[]`` leaves it none. The
+        restriction replaces an earlier one, survives renewals of the same
+        credential subject, and ends with the peer's enrollment session
+        (revocation, eviction, expiry).
+
+        Args:
+            peer: The peer's node id (64 hex).
+            roles: The roles the peer keeps.
+
+        Raises:
+            LookupError: ``peer`` has no live enrollment session.
+        """
+        self._dispatch_server().restrict_peer_roles(peer, list(roles))
+
+    def clear_peer_restriction(self, peer: str) -> bool:
+        """Remove ``peer``'s role restriction; its credential roles apply
+        again from its next call. Returns whether one was set."""
+        return self._dispatch_server().clear_peer_restriction(peer)
+
     # ── Iroh protocol clients (lazy) ─────────────────────────────────────────
 
     @property

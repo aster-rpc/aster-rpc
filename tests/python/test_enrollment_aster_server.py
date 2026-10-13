@@ -223,6 +223,39 @@ async def test_credential_roles_gate_requires_and_root_revocation_closes_the_con
         await srv.close()
 
 
+async def test_runtime_restriction_refuses_the_next_call(root, tmp_path):
+    """The credential sets the maximum; runtime settings can only restrict.
+    Restricting a credential's ``ops.status,ops.logs`` to ``ops.status``
+    refuses ``logs`` on the next call; a restriction never grants a role the
+    credential lacks; clearing restores the credential roles; a peer without
+    a session cannot be restricted."""
+    srv = await start_server(server_config(root, tmp_path))
+    client = None
+    try:
+        client, ops = await connect(srv, client_config(root, 5, credential(5, "ops.status,ops.logs")))
+        peer = node_id(5)
+        assert await call(ops, "logs") == "ops.logs,ops.status"
+
+        srv.restrict_peer_roles(peer, ["ops.status"])
+        assert await call(ops, "status") == "ops.status"
+        with pytest.raises(PermissionDeniedError):
+            await call(ops, "logs")
+
+        srv.restrict_peer_roles(peer, ["ops.admin"])
+        with pytest.raises(PermissionDeniedError):
+            await call(ops, "logs")
+
+        assert srv.clear_peer_restriction(peer)
+        assert await call(ops, "logs") == "ops.logs,ops.status"
+        with pytest.raises(LookupError):
+            srv.restrict_peer_roles(node_id(9), ["ops.status"])
+    finally:
+        if client is not None:
+            await client.close()
+        await srv.close()
+
+
+
 async def test_config_driven_issuer_renews_client_credentials(root, tmp_path):
     """A server configured as a delegated issuer serves renewals; a client
     whose credential that server signed renews automatically and stays
