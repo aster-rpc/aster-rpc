@@ -48,6 +48,11 @@ pub struct EnrollmentOptions {
     /// more than `max_pending_probes / first_message_timeout` new connections
     /// per second.
     pub max_pending_probes: usize,
+    /// Bounds each later receive once a handshake slot is held, so a peer
+    /// that completes its probe and then stalls frees the slot within one
+    /// step. It must exceed `policy_timeout`, because an honest peer
+    /// evaluates the other side's evidence between steps.
+    pub step_timeout: Duration,
     pub handshake_timeout: Duration,
     pub policy_timeout: Duration,
     pub reconciliation_interval: Duration,
@@ -75,6 +80,7 @@ impl Default for EnrollmentOptions {
         Self {
             first_message_timeout: Duration::from_secs(2),
             max_pending_probes: 256,
+            step_timeout: Duration::from_secs(3),
             handshake_timeout: Duration::from_secs(10),
             policy_timeout: Duration::from_secs(2),
             reconciliation_interval: Duration::from_secs(1),
@@ -365,6 +371,7 @@ impl EnrollmentService {
                 && !options.first_message_timeout.is_zero()
                 && !options.handshake_timeout.is_zero()
                 && !options.policy_timeout.is_zero()
+                && options.step_timeout > options.policy_timeout
                 && !options.reconciliation_interval.is_zero()
                 && !options.session_idle_eviction.is_zero(),
             "invalid enrollment bounds"
@@ -1019,7 +1026,7 @@ impl EnrollmentService {
                 },
             )
             .await?;
-            let presentation: Presentation = receive(&recv).await?;
+            let presentation: Presentation = self.receive_step(&recv).await?;
             self.check_skew(presentation.sent_at)?;
             let evidence = self
                 .evidence(&peer, presentation.credential.as_deref(), source)
@@ -1043,11 +1050,11 @@ impl EnrollmentService {
             .await?;
             // Explicit reciprocal confirmation: a peer that rejects our identity
             // must not leave a one-way admission behind.
-            let confirmed: bool = receive(&recv).await?;
+            let confirmed: bool = self.receive_step(&recv).await?;
             ensure!(confirmed, "reciprocal enrollment rejected");
             self.evaluate(&evidence, source).await?;
             transmit(&send, &true).await?;
-            let received: bool = receive(&recv).await?;
+            let received: bool = self.receive_step(&recv).await?;
             ensure!(received, "reciprocal confirmation missing");
             self.evaluate(&evidence, source).await?;
             self.remember(evidence, source)
@@ -1061,6 +1068,14 @@ impl EnrollmentService {
         };
         let _ = connection.close(code, reason);
         result
+    }
+
+    /// One handshake step after the probe: a stalled peer costs at most
+    /// `step_timeout` of a held slot, not the whole handshake deadline.
+    async fn receive_step<T: for<'de> Deserialize<'de>>(&self, recv: &CoreRecvStream) -> Result<T> {
+        tokio::time::timeout(self.options.step_timeout, receive(recv))
+            .await
+            .map_err(|_| anyhow!("enrollment step timeout"))?
     }
 
     /// Try configured reachable replicas in order; addresses carry no authority.
@@ -1120,14 +1135,16 @@ impl EnrollmentService {
                     },
                 )
                 .await?;
-                let welcome: Welcome = receive(&recv).await?;
+                let welcome: Welcome = self.receive_step(&recv).await?;
                 ensure!(welcome.version == 1, "unsupported enrollment version");
                 transmit(&send, &true).await?;
-                let confirmed: bool = receive(&recv).await?;
+                let confirmed: bool = self.receive_step(&recv).await?;
                 ensure!(confirmed, "reciprocal enrollment rejected");
                 self.evaluate(&evidence, source).await?;
                 transmit(&send, &true).await?;
-                let closed = connection.closed().await;
+                let closed = tokio::time::timeout(self.options.step_timeout, connection.closed())
+                    .await
+                    .map_err(|_| anyhow!("enrollment step timeout"))?;
                 ensure!(
                     closed.code == Some(0),
                     "replica did not complete enrollment"
@@ -2045,6 +2062,48 @@ mod tests {
             client.close().await;
         }
         assert_eq!(pending(&service), 0);
+        client.close().await;
+        cleanup(service, path).await;
+    }
+
+    #[tokio::test]
+    async fn probe_then_stall_releases_its_slot_within_one_step() {
+        let (service, path) = service(
+            PausedPolicy::new(false),
+            EnrollmentOptions {
+                max_concurrent_handshakes: 1,
+                policy_timeout: Duration::from_millis(100),
+                step_timeout: Duration::from_millis(300),
+                ..Default::default()
+            },
+        )
+        .await;
+        let client = raw_node(7).await;
+        let (connection, accept) = raw_handshake(&service, &client).await;
+        let (send, recv) = connection.open_bi().await.unwrap();
+        transmit(
+            &send,
+            &Hello {
+                version: 1,
+                sent_at: unix_now(),
+            },
+        )
+        .await
+        .unwrap();
+        let _: ReplicaProof = receive(&recv).await.unwrap();
+        assert_eq!(service.inbound_permits.available_permits(), 0);
+        // The client now stalls instead of presenting. The slot is released
+        // after one step deadline, well before the 10 s handshake deadline.
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(2), accept)
+            .await
+            .expect("stalled step must not hold the slot until the handshake deadline")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("step timeout"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(service.inbound_permits.available_permits(), 1);
+        drop((send, recv));
         client.close().await;
         cleanup(service, path).await;
     }
