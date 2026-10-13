@@ -24,6 +24,8 @@
 //!
 //! [profiles.prod]
 //! root_pubkey = "…"
+//! root_cadence = "6h"
+//! replication_allowance = "1h"
 //! email = "ops@example.com"
 //! signer = "local"
 //! published_services = ["svc-a", "svc-b"]
@@ -106,6 +108,14 @@ pub struct Profile {
     /// credential store, never here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_pubkey: Option<String>,
+    /// How often the root comes online to promote and renew, as a duration
+    /// such as "6h" or "1d". Sizes persistent credentials and delegations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cadence: Option<String>,
+    /// Worst-case time for a root record to reach the verifiers that matter,
+    /// as a duration such as "1h".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_allowance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(default)]

@@ -61,6 +61,19 @@ pub struct AdmissionClaims {
     pub attributes: Option<BTreeMap<String, TypedAttribute>>,
 }
 
+/// What an enrolled node expects from its credential.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Registration {
+    /// The credential is the node's whole authority for one job. It is never
+    /// observed or promoted into a root-authored record.
+    #[default]
+    Ephemeral,
+    /// The credential is a registration token: it admits the node until the
+    /// root promotes it to a long-lived registration record.
+    Persistent,
+}
+
 /// The `aster_enrollment_v1` extension of an enrollment leaf.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +82,9 @@ pub struct EnrollmentExtensionV1 {
     pub claims: AdmissionClaims,
     /// Required even when empty: omission must not discard restrictions.
     pub mandatory: Vec<String>,
+    /// Omitted means ephemeral.
+    #[serde(default)]
+    pub registration: Registration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,6 +166,9 @@ pub struct DelegationGrant {
     pub subjects: Option<BTreeSet<String>>,
     pub operations: BTreeSet<String>,
     pub mandatory: BTreeSet<String>,
+    /// Whether the delegate may enroll persistent nodes, or grant this to a
+    /// sub-delegate. Without it the subtree enrolls only ephemeral nodes.
+    pub may_register: bool,
 }
 
 /// `aster_action_v1`: what an actor may do for the anchor principal.
@@ -260,6 +279,15 @@ impl DecodedLink {
             LinkBody::Enrollment(extension) => (None, &extension.mandatory),
         };
         set.into_iter().flatten().chain(list)
+    }
+
+    /// Whether this link asks for, or grants, persistent registration.
+    pub fn registers(&self) -> bool {
+        match &self.body {
+            LinkBody::Delegation(grant) => grant.may_register,
+            LinkBody::Enrollment(extension) => extension.registration == Registration::Persistent,
+            LinkBody::Action(_) => false,
+        }
     }
 
     /// Scopes, tags, attribute keys and operations claimed by this link,

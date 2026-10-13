@@ -1,7 +1,8 @@
-//! JWT enrollment verification and consumer-selected admission policies.
+//! Enrollment on delegation chains and consumer-selected admission policies.
 //!
-//! Core evidence is opaque and is created only after signature/profile/key
-//! verification. Use [`verify_connection`] to obtain the subject key directly
+//! A credential is a delegation chain whose leaf enrolls the node: one link
+//! when the root issues it, more when an online issuer does. Core evidence is
+//! opaque and is created only after the whole chain verifies for the peer. Use [`verify_connection`] to obtain the subject key directly
 //! from an Aster authenticated connection, then call [`admit`] with an explicit
 //! consumer policy and the consumer's known revocations. Admission is separate
 //! from application/operation authorization.
@@ -15,16 +16,16 @@ pub use aster_transport_core::enrollment::{
     node_registration_key, should_record_rejection, validate_root_record_json, AdmissionClaims,
     AdmissionContext, AdmissionDecision, AdmissionError, AdmissionEvidenceSource, AdmissionGuard,
     AdmissionPolicy, Audience, ClockSynchronization, Confirmation, CredentialStatusV1,
-    DenialReason, EnrollmentClaimsV1, EnrollmentError, EnrollmentExtensionV1,
-    EnrollmentIssueRequest, EnrollmentOptions, EnrollmentPolicyStore, EnrollmentReadiness,
-    EnrollmentRevoked, IssuedEnrollmentCredential, JwtEnrollmentIssuer, JwtEnrollmentVerifier,
-    KnownRevocations, MatchState, NodeRegistrationStatus, NodeRegistrationV1,
-    ObservedSourceAddress, PolicyError, PolicyExpressionV1, PolicyPredicate, PolicyRefreshIssue,
-    PolicyRefreshReport, PolicySynchronization, PublicConfirmationKey, RecordAvailability,
-    RecordError, RootRecordError, RootRecordRead, RootRevisionError, SourceAddressProvenance,
-    SourceCidr, SynchronizationSource, TypedAttribute, VerifiedAdmissionEvidence,
+    DenialReason, EnrollmentError, EnrollmentExtensionV1, EnrollmentIssueRequest,
+    EnrollmentOptions, EnrollmentPolicyStore, EnrollmentReadiness, EnrollmentRevoked,
+    IssuedEnrollmentCredential, JwtEnrollmentIssuer, JwtEnrollmentVerifier, KnownRevocations,
+    MatchState, NodeRegistrationStatus, NodeRegistrationV1, ObservedSourceAddress, PolicyError,
+    PolicyExpressionV1, PolicyPredicate, PolicyRefreshIssue, PolicyRefreshReport,
+    PolicySynchronization, PublicConfirmationKey, RecordAvailability, RecordError, Registration,
+    RootRecordError, RootRecordRead, RootRevisionError, SourceAddressProvenance, SourceCidr,
+    SynchronizationSource, TypedAttribute, VerifiedAdmissionEvidence,
     DEFAULT_ACTIVATION_LEEWAY_SECONDS, ENROLLMENT_ALPN, ENROLLMENT_JWT_TYPE,
-    MAX_ACTIVATION_LEEWAY_SECONDS, MAX_JWT_BYTES, MAX_POLICY_DEPTH, MAX_POLICY_NODES,
+    MAX_ACTIVATION_LEEWAY_SECONDS, MAX_CHAIN_BYTES, MAX_POLICY_DEPTH, MAX_POLICY_NODES,
     MAX_POLICY_RECORDS, MAX_POLICY_RECORD_BYTES, POLICY_RECORD_PREFIX, POLICY_RECORD_VERSION,
 };
 
@@ -33,13 +34,25 @@ use aster_transport_core::enrollment::{EnrollmentService, RootAuthoredDocView};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Issue a JWT using an explicitly supplied root identity.
-pub fn issue_jwt(
+/// Issue a one-link credential as the root.
+pub fn issue_credential(
     root: &crate::SecretKey,
     request: &EnrollmentIssueRequest,
     issued_at: u64,
 ) -> Result<IssuedEnrollmentCredential, EnrollmentError> {
     JwtEnrollmentIssuer::from_seed(&root.to_bytes()).issue(request, issued_at)
+}
+
+/// Issue a credential as a delegated issuer holding `delegation`, its own
+/// chain from the root. Refuses anything the delegation does not allow.
+pub fn issue_delegated_credential(
+    issuer: &crate::SecretKey,
+    delegation: &crate::delegation::Chain,
+    request: &EnrollmentIssueRequest,
+    issued_at: u64,
+) -> Result<IssuedEnrollmentCredential, EnrollmentError> {
+    JwtEnrollmentIssuer::from_seed(&issuer.to_bytes())
+        .issue_delegated(request, delegation, issued_at)
 }
 
 /// Reads the records one root author wrote in a Docs namespace, within size
@@ -189,7 +202,7 @@ impl Enrollment {
     }
 }
 
-/// Verify a presented JWT against the actual authenticated connecting peer.
+/// Verify a presented chain against the actual authenticated connecting peer.
 /// The peer identity is read from the connection rather than request metadata.
 /// `now` is trusted UTC time in integral seconds.
 pub fn verify_connection(

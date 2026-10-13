@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use aster_transport_core::delegation::CHAIN_PREFIX;
 use aster_transport_core::enrollment::*;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -22,8 +23,9 @@ fn claims() -> Value {
         "iss": hex::encode(root().verifying_key().to_bytes()),
         "sub": hex::encode(peer()),
         "aud": "build-fleet",
-        "jti": "credential-1",
+        "jti": "credential-0000001",
         "iat": NOW - 60,
+        "exp": NOW + 20 * 86_400,
         "cnf": { "jwk": { "kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(peer()) } },
         "aster_enrollment_v1": {
             "scopes": ["build-worker"], "tags": [], "attributes": {
@@ -38,6 +40,7 @@ fn claims() -> Value {
 fn header() -> Value {
     json!({"alg": "EdDSA", "typ": ENROLLMENT_JWT_TYPE})
 }
+/// A one-link chain: the root-issued credential, signed raw.
 fn sign_raw(header: &[u8], claims: &[u8], key: &SigningKey) -> String {
     let message = format!(
         "{}.{}",
@@ -45,7 +48,7 @@ fn sign_raw(header: &[u8], claims: &[u8], key: &SigningKey) -> String {
         URL_SAFE_NO_PAD.encode(claims)
     );
     format!(
-        "{}.{}",
+        "{CHAIN_PREFIX}~{}.{}",
         message,
         URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes())
     )
@@ -73,14 +76,20 @@ fn offline_policy() -> PolicyExpressionV1 {
 }
 
 #[test]
-fn reusable_jwt_preserves_signed_provenance_and_typed_claims() {
+fn reusable_chain_preserves_signed_provenance_and_typed_claims() {
     let token = sign(&header(), &claims(), &root());
+    let root_key = root().verifying_key().to_bytes();
     for now in [NOW, NOW + 86_400, NOW + 864_000] {
         let evidence = verifier().verify(&token, &peer(), now).unwrap();
-        assert_eq!(evidence.original_jwt(), Some(token.as_str()));
-        assert_eq!(evidence.source(), AdmissionEvidenceSource::PresentedJwt);
+        assert_eq!(evidence.presented_chain(), Some(token.as_str()));
+        assert!(matches!(
+            evidence.source(),
+            AdmissionEvidenceSource::PresentedChain { anchor, issuers, .. }
+                if anchor == root_key && issuers == vec![root_key]
+        ));
         assert_eq!(evidence.subject(), &peer());
-        assert_eq!(evidence.expires_at(), None);
+        assert_eq!(evidence.expires_at(), Some(NOW + 20 * 86_400));
+        assert_eq!(evidence.registration(), Some(Registration::Ephemeral));
         assert_eq!(
             evidence.claims().attributes.as_ref().unwrap()["workers"],
             TypedAttribute::Int(8)
@@ -157,7 +166,7 @@ fn rejects_algorithm_type_key_selection_and_jose_extensions() {
 }
 
 #[test]
-fn exact_audience_and_validity_boundaries_optional_expiry() {
+fn exact_audience_and_validity_boundaries() {
     let mut c = claims();
     c["aud"] = json!(["other", "build-fleet"]);
     c["nbf"] = json!(NOW);
@@ -195,6 +204,7 @@ fn rejects_malformed_missing_restrictions_and_numeric_bounds() {
         "aud",
         "iat",
         "jti",
+        "exp",
         "cnf",
         "aster_enrollment_v1",
     ] {
@@ -259,17 +269,23 @@ fn rejects_malformed_missing_restrictions_and_numeric_bounds() {
 }
 
 #[test]
-fn ignores_optional_claims_but_rejects_oversized_tampered_and_legacy_inputs() {
+fn rejects_unknown_claims_oversized_tampered_and_legacy_inputs() {
+    // The chain profile admits no claims it does not define.
+    let mut unknown = claims();
+    unknown["https://example.org/optional"] = json!({"custom": true});
+    assert_eq!(
+        verifier()
+            .verify(&sign(&header(), &unknown, &root()), &peer(), NOW)
+            .unwrap_err(),
+        EnrollmentError::InvalidJwt
+    );
     let mut c = claims();
-    c["https://example.org/optional"] = json!({"custom": true});
-    assert!(verifier()
-        .verify(&sign(&header(), &c, &root()), &peer(), NOW)
-        .is_ok());
     let token = sign(&header(), &c, &root());
+    let token = token.strip_prefix(&format!("{CHAIN_PREFIX}~")).unwrap();
     let parts: Vec<_> = token.split('.').collect();
-    c["jti"] = json!("tampered");
+    c["jti"] = json!("tampered-credential");
     let tampered = format!(
-        "{}.{}.{}",
+        "{CHAIN_PREFIX}~{}.{}.{}",
         parts[0],
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&c).unwrap()),
         parts[2]
@@ -280,7 +296,7 @@ fn ignores_optional_claims_but_rejects_oversized_tampered_and_legacy_inputs() {
         .is_err());
     assert_eq!(
         verifier()
-            .verify(&"a".repeat(MAX_JWT_BYTES + 1), &peer(), NOW)
+            .verify(&"a".repeat(MAX_CHAIN_BYTES + 1), &peer(), NOW)
             .unwrap_err(),
         EnrollmentError::TokenTooLarge
     );
@@ -540,7 +556,7 @@ async fn revocations_are_unconditional_and_issuer_scoped() {
         AdmissionDecision::Deny(DenialReason::CredentialRevoked)
     );
     let mut replacement = claims();
-    replacement["jti"] = json!("replacement");
+    replacement["jti"] = json!("replacement-credential");
     let replacement = evidence(&replacement);
     assert_eq!(
         admit(

@@ -680,10 +680,14 @@ mod tests {
         let issuer = aster::enrollment::JwtEnrollmentIssuer::from_seed(&root_key.to_bytes());
         let caller_id =
             aster::enrollment::JwtEnrollmentIssuer::from_seed(&key.to_bytes()).public_key();
-        let request = aster::enrollment::EnrollmentIssueRequest::new(caller_id, "test");
-        let token = issuer.issue(&request, 1).unwrap();
-        let credential = home.join("credential.jwt");
-        std::fs::write(&credential, token.jwt()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let request = aster::enrollment::EnrollmentIssueRequest::new(caller_id, "test", now + 3600);
+        let token = issuer.issue(&request, now).unwrap();
+        let credential = home.join("credential.chain");
+        std::fs::write(&credential, token.chain()).unwrap();
         std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
         let server_config = aster::AsterConfig {
             secret_key: Some(root_key.clone()),
@@ -707,8 +711,12 @@ mod tests {
             super::super::grants::identity(&document.id().unwrap().to_string()).unwrap();
         let server_token = issuer
             .issue(
-                &aster::enrollment::EnrollmentIssueRequest::new(issuer.public_key(), "test"),
-                1,
+                &aster::enrollment::EnrollmentIssueRequest::new(
+                    issuer.public_key(),
+                    "test",
+                    now + 3600,
+                ),
+                now,
             )
             .unwrap();
         let admission = aster::enrollment::Enrollment::install(
@@ -723,7 +731,7 @@ mod tests {
                 .unwrap(),
             ),
             aster::enrollment::JwtEnrollmentVerifier::new(issuer.public_key(), "test").unwrap(),
-            Some(server_token.jwt().into()),
+            Some(server_token.chain().into()),
             Arc::new(aster::enrollment::PolicyExpressionV1::Predicate(
                 aster::enrollment::PolicyPredicate::TolerateStalePolicy,
             )),

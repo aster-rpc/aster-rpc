@@ -1,18 +1,17 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use serde::{Deserialize, Serialize};
-
-use crate::delegation::jws::{self, JwsError};
+use crate::delegation::{
+    self, claimed_start, issue_enrollment, leaf_jti, verify_chain, Chain, ChainError, LeafClaims,
+    LeafKind, NoRevocations, RevokedDelegates, TrustContext, Validity, VerifiedChain,
+};
 // The claim types are shared with delegation chains, where an enrollment
-// credential is a one-link chain.
+// credential is the leaf of a chain.
 pub use crate::delegation::{
     AdmissionClaims, Audience, Confirmation, EnrollmentExtensionV1, PublicConfirmationKey,
-    TypedAttribute, ENROLLMENT_LINK_TYPE as ENROLLMENT_JWT_TYPE,
+    Registration, TypedAttribute, ENROLLMENT_LINK_TYPE as ENROLLMENT_JWT_TYPE, MAX_CHAIN_BYTES,
 };
 
-pub const MAX_JWT_BYTES: usize = 16 * 1024;
 /// Default tolerance for a signer's clock running ahead of the verifier.
 /// It applies only to activation (`iat`, `nbf`); expiry is never extended.
 pub const DEFAULT_ACTIVATION_LEEWAY_SECONDS: u64 = crate::delegation::DEFAULT_LEEWAY_SECONDS;
@@ -57,13 +56,13 @@ pub(super) fn valid_leeway(seconds: u64) -> bool {
 
 impl AdmissionClaims {
     /// Parse an attribute file before authorized issuance. The input is bounded
-    /// to [`MAX_JWT_BYTES`], must be an object of strictly typed values, and may
+    /// to one chain link, must be an object of strictly typed values, and may
     /// not contain duplicate keys at any depth. Issuance separately checks the
-    /// size of the complete JWT, so a parsed map can still exceed that limit.
+    /// size of the complete link, so a parsed map can still exceed that limit.
     pub fn parse_attributes_json(
         bytes: &[u8],
     ) -> Result<BTreeMap<String, TypedAttribute>, EnrollmentError> {
-        if bytes.len() > MAX_JWT_BYTES {
+        if bytes.len() > delegation::MAX_LINK_BYTES {
             return Err(EnrollmentError::TokenTooLarge);
         }
         validate_unique_json(bytes).map_err(|_| EnrollmentError::InvalidClaims)?;
@@ -71,33 +70,18 @@ impl AdmissionClaims {
     }
 }
 
-/// Untrusted issuance/serialization data. This type never grants admission.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EnrollmentClaimsV1 {
-    pub iss: String,
-    pub sub: String,
-    pub aud: Audience,
-    pub jti: String,
-    pub iat: u64,
-    #[serde(
-        default,
-        deserialize_with = "optional_numeric_date",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub nbf: Option<u64>,
-    #[serde(
-        default,
-        deserialize_with = "optional_numeric_date",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub exp: Option<u64>,
-    pub cnf: Confirmation,
-    pub aster_enrollment_v1: EnrollmentExtensionV1,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionEvidenceSource {
-    PresentedJwt,
+    /// A delegation chain the peer presented, verified for its key.
+    PresentedChain {
+        /// The pinned root the chain is anchored at.
+        anchor: [u8; 32],
+        /// Each link's issuer, leaf first; the last is the anchor. A
+        /// root-issued credential has exactly one.
+        issuers: Vec<[u8; 32]>,
+        /// `BLAKE3("aster.chain.v1\0" || text)`.
+        digest: [u8; 32],
+    },
     RootAuthoredRecord {
         document_id: [u8; 32],
         revision: u64,
@@ -118,11 +102,12 @@ pub(super) struct RegistrationEvidenceData {
     pub revision: u64,
 }
 
-/// Immutable verified claims. Only signature verification or the pinned-root
+/// Immutable verified claims. Only chain verification or the pinned-root
 /// Docs path can construct this type; deserializing copied claims cannot
 /// manufacture verified evidence.
 #[derive(Debug, Clone)]
 pub struct VerifiedAdmissionEvidence {
+    /// The trusted root: the chain's anchor, or the record's author.
     pub(super) issuer: [u8; 32],
     pub(super) subject: [u8; 32],
     claims: AdmissionClaims,
@@ -131,20 +116,24 @@ pub struct VerifiedAdmissionEvidence {
     not_before: Option<u64>,
     expires_at: Option<u64>,
     credential_id: Option<String>,
-    original_jwt: Option<String>,
+    presented_chain: Option<String>,
+    registration: Option<Registration>,
     source: AdmissionEvidenceSource,
     /// The verifier's activation leeway, so later rechecks use the same rule.
     activation_leeway: u64,
 }
 
 impl VerifiedAdmissionEvidence {
+    /// The trusted root this evidence is anchored at. For a delegated
+    /// credential the issuer path is in [`Self::source`].
     pub fn issuer(&self) -> &[u8; 32] {
         &self.issuer
     }
     pub fn subject(&self) -> &[u8; 32] {
         &self.subject
     }
-    /// Registration is a separate statement and has no JWT credential id.
+    /// The leaf link's `jti`. Registration is a separate statement and has
+    /// no credential id.
     pub fn credential_id(&self) -> Option<&str> {
         self.credential_id.as_deref()
     }
@@ -154,9 +143,11 @@ impl VerifiedAdmissionEvidence {
     pub fn audience(&self) -> &Audience {
         &self.audience
     }
+    /// The leaf's `iat`; ancestors were issued no later.
     pub fn issued_at(&self) -> u64 {
         self.issued_at
     }
+    /// The earliest expiry of any link, or the record's expiry.
     pub fn expires_at(&self) -> Option<u64> {
         self.expires_at
     }
@@ -164,11 +155,16 @@ impl VerifiedAdmissionEvidence {
         self.not_before
     }
     pub fn source(&self) -> AdmissionEvidenceSource {
-        self.source
+        self.source.clone()
+    }
+    /// What a presented credential asks for. `None` for a registration
+    /// record, which is itself the long-lived authority.
+    pub fn registration(&self) -> Option<Registration> {
+        self.registration
     }
     /// Preserve the signed artifact and provenance, never re-sign mapped claims.
-    pub fn original_jwt(&self) -> Option<&str> {
-        self.original_jwt.as_deref()
+    pub fn presented_chain(&self) -> Option<&str> {
+        self.presented_chain.as_deref()
     }
 
     pub(super) fn activation_at(&self, now: u64) -> Activation {
@@ -203,10 +199,46 @@ impl VerifiedAdmissionEvidence {
             not_before: data.not_before,
             expires_at: data.expires_at,
             credential_id: None,
-            original_jwt: None,
+            presented_chain: None,
+            registration: None,
             source: AdmissionEvidenceSource::RootAuthoredRecord {
                 document_id: data.document_id,
                 revision: data.revision,
+            },
+            activation_leeway,
+        })
+    }
+
+    fn from_chain(
+        verified: VerifiedChain,
+        text: &str,
+        activation_leeway: u64,
+    ) -> Result<Self, EnrollmentError> {
+        let LeafClaims::Enrollment(extension) = verified.leaf() else {
+            return Err(EnrollmentError::InvalidJwt);
+        };
+        validate_evidence_shape(
+            verified.audience(),
+            verified.issued_at(),
+            verified.not_before(),
+            Some(verified.not_after()),
+            &extension.claims,
+        )?;
+        Ok(Self {
+            issuer: *verified.anchor(),
+            subject: *verified.subject(),
+            claims: extension.claims.clone(),
+            audience: verified.audience().clone(),
+            issued_at: verified.issued_at(),
+            not_before: verified.not_before(),
+            expires_at: Some(verified.not_after()),
+            credential_id: verified.jtis().first().cloned(),
+            presented_chain: Some(text.to_owned()),
+            registration: Some(extension.registration),
+            source: AdmissionEvidenceSource::PresentedChain {
+                anchor: *verified.anchor(),
+                issuers: verified.issuers().to_vec(),
+                digest: *verified.digest(),
             },
             activation_leeway,
         })
@@ -229,8 +261,10 @@ pub enum EnrollmentError {
     },
     UnsupportedMandatoryRestriction,
     InvalidClaims,
+    /// A chain failed a structural, attenuation or revocation gate; the
+    /// variant names the gate.
+    Chain(ChainError),
     SigningFailed,
-    RandomnessUnavailable,
 }
 
 impl fmt::Display for EnrollmentError {
@@ -240,62 +274,84 @@ impl fmt::Display for EnrollmentError {
 }
 impl std::error::Error for EnrollmentError {}
 
-/// Authorized issuance inputs. The issuer derives root/subject identifiers,
-/// confirmation key, algorithm and token type rather than accepting them from
-/// caller-provided JWT claims. A missing credential id draws 256 random bits.
-#[derive(Debug, Clone)]
-pub struct EnrollmentIssueRequest {
-    pub subject: [u8; 32],
-    pub audience: Audience,
-    pub credential_id: Option<String>,
-    pub not_before: Option<u64>,
-    pub expires_at: Option<u64>,
-    pub claims: AdmissionClaims,
-}
-
-impl EnrollmentIssueRequest {
-    pub fn new(subject: [u8; 32], audience: impl Into<String>) -> Self {
-        Self {
-            subject,
-            audience: Audience::One(audience.into()),
-            credential_id: None,
-            not_before: None,
-            expires_at: None,
-            claims: AdmissionClaims::default(),
+impl From<ChainError> for EnrollmentError {
+    fn from(error: ChainError) -> Self {
+        match error {
+            ChainError::Size => Self::TokenTooLarge,
+            ChainError::Malformed | ChainError::Signature => Self::InvalidJwt,
+            ChainError::Header => Self::UnsupportedHeader,
+            ChainError::LeafMismatch => Self::PeerKeyMismatch,
+            ChainError::NotYetValid | ChainError::Expired | ChainError::Lifetime => {
+                Self::InvalidValidity
+            }
+            ChainError::UnsupportedRestriction => Self::UnsupportedMandatoryRestriction,
+            ChainError::Issuance => Self::SigningFailed,
+            ChainError::Configuration => Self::InvalidConfiguration,
+            other => Self::Chain(other),
         }
     }
 }
 
-/// The public signed artifact and its identifier, containing no root secret.
+/// Authorized issuance inputs. The issuer derives its identity, the
+/// confirmation key, algorithm, token type and a random `jti` rather than
+/// accepting them from caller-provided claims. Every credential expires.
+#[derive(Debug, Clone)]
+pub struct EnrollmentIssueRequest {
+    pub subject: [u8; 32],
+    pub audience: Audience,
+    pub not_before: Option<u64>,
+    pub expires_at: u64,
+    pub claims: AdmissionClaims,
+    pub registration: Registration,
+}
+
+impl EnrollmentIssueRequest {
+    /// An ephemeral credential with no claims, valid until `expires_at`.
+    pub fn new(subject: [u8; 32], audience: impl Into<String>, expires_at: u64) -> Self {
+        Self {
+            subject,
+            audience: Audience::One(audience.into()),
+            not_before: None,
+            expires_at,
+            claims: AdmissionClaims::default(),
+            registration: Registration::Ephemeral,
+        }
+    }
+}
+
+/// The public signed chain and its leaf identifier, containing no secret.
 #[derive(Debug, Clone)]
 pub struct IssuedEnrollmentCredential {
-    jwt: String,
+    chain: Chain,
     credential_id: String,
 }
 
 impl IssuedEnrollmentCredential {
-    pub fn jwt(&self) -> &str {
-        &self.jwt
+    /// The chain's text form, as presented in the enrollment handshake.
+    pub fn chain(&self) -> &str {
+        self.chain.to_text()
     }
+    /// The leaf link's `jti`.
     pub fn credential_id(&self) -> &str {
         &self.credential_id
     }
-    pub fn into_jwt(self) -> String {
-        self.jwt
+    pub fn into_chain(self) -> String {
+        self.chain.into_text()
     }
 }
 
-/// An authorized local root signer. Possession of the root's existing secret
-/// key authorizes issuance; this type has no secret-export, Debug or Clone API.
-/// Dalek zeroizes the signing key on drop.
+/// An authorized local signer: the root, or a delegated issuer holding its
+/// own delegation chain. Possession of the secret key authorizes issuance;
+/// this type has no secret-export, Debug or Clone API. Dalek zeroizes the
+/// signing key on drop.
 pub struct JwtEnrollmentIssuer {
     key: ed25519_dalek::SigningKey,
 }
 
 impl JwtEnrollmentIssuer {
-    pub fn from_seed(root_secret: &[u8; 32]) -> Self {
+    pub fn from_seed(secret: &[u8; 32]) -> Self {
         Self {
-            key: ed25519_dalek::SigningKey::from_bytes(root_secret),
+            key: ed25519_dalek::SigningKey::from_bytes(secret),
         }
     }
 
@@ -303,12 +359,33 @@ impl JwtEnrollmentIssuer {
         self.key.verifying_key().to_bytes()
     }
 
-    /// Issue a reusable proof-of-possession credential with no implicit expiry
-    /// or maximum lifetime. `issued_at` is the root's trusted UTC seconds.
-    /// The caller remains responsible for authorizing the requested grants.
+    /// Issue a one-link credential as the root. `issued_at` is the root's
+    /// trusted UTC seconds. The caller remains responsible for authorizing
+    /// the requested grants.
     pub fn issue(
         &self,
         request: &EnrollmentIssueRequest,
+        issued_at: u64,
+    ) -> Result<IssuedEnrollmentCredential, EnrollmentError> {
+        self.issue_chain(request, None, issued_at)
+    }
+
+    /// Issue a credential under `parent`, this issuer's own delegation
+    /// chain. Refuses anything the delegation does not allow, including a
+    /// persistent credential without `may_register`.
+    pub fn issue_delegated(
+        &self,
+        request: &EnrollmentIssueRequest,
+        parent: &Chain,
+        issued_at: u64,
+    ) -> Result<IssuedEnrollmentCredential, EnrollmentError> {
+        self.issue_chain(request, Some(parent), issued_at)
+    }
+
+    fn issue_chain(
+        &self,
+        request: &EnrollmentIssueRequest,
+        parent: Option<&Chain>,
         issued_at: u64,
     ) -> Result<IssuedEnrollmentCredential, EnrollmentError> {
         validate_key(&request.subject)?;
@@ -316,79 +393,36 @@ impl JwtEnrollmentIssuer {
             &request.audience,
             issued_at,
             request.not_before,
-            request.expires_at,
+            Some(request.expires_at),
             &request.claims,
         )?;
-        // Bound copied caller data before constructing owned JWT claims. The
-        // writer stops serialization at the limit without allocating a payload.
-        let mut size = BoundedJsonSize(0);
-        serde_json::to_writer(&mut size, &(&request.audience, &request.claims)).map_err(
-            |error| {
-                if error.is_io() {
-                    EnrollmentError::TokenTooLarge
-                } else {
-                    EnrollmentError::InvalidClaims
-                }
-            },
-        )?;
-        let credential_id = match &request.credential_id {
-            Some(value) if valid_credential_id(value) => value.clone(),
-            Some(_) => return Err(EnrollmentError::InvalidClaims),
-            None => {
-                let mut bytes = [0; 32];
-                getrandom::getrandom(&mut bytes)
-                    .map_err(|_| EnrollmentError::RandomnessUnavailable)?;
-                URL_SAFE_NO_PAD.encode(bytes)
-            }
-        };
-        let claims = EnrollmentClaimsV1 {
-            iss: hex::encode(self.public_key()),
-            sub: hex::encode(request.subject),
-            aud: request.audience.clone(),
-            jti: credential_id.clone(),
-            iat: issued_at,
-            nbf: request.not_before,
-            exp: request.expires_at,
-            cnf: Confirmation::ed25519(&request.subject),
-            aster_enrollment_v1: EnrollmentExtensionV1 {
+        let chain = issue_enrollment(
+            self.key.as_bytes(),
+            parent,
+            &request.subject,
+            &request.audience,
+            &EnrollmentExtensionV1 {
                 claims: request.claims.clone(),
                 mandatory: vec![],
+                registration: request.registration,
             },
-        };
-        // Check the complete artifact before signing.
-        let payload = serde_json::to_vec(&claims).map_err(|_| EnrollmentError::InvalidClaims)?;
-        if jws::encoded_len(ENROLLMENT_JWT_TYPE, payload.len()) > MAX_JWT_BYTES {
-            return Err(EnrollmentError::TokenTooLarge);
-        }
-        let jwt = jws::sign(ENROLLMENT_JWT_TYPE, &payload, self.key.as_bytes())
-            .map_err(|_| EnrollmentError::SigningFailed)?;
-        if jwt.len() > MAX_JWT_BYTES {
-            return Err(EnrollmentError::TokenTooLarge);
-        }
-        Ok(IssuedEnrollmentCredential { jwt, credential_id })
-    }
-}
-
-struct BoundedJsonSize(usize);
-
-impl std::io::Write for BoundedJsonSize {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(bytes.len())
-            .filter(|size| *size <= MAX_JWT_BYTES)
-            .ok_or_else(|| std::io::Error::other("enrollment claims exceed size limit"))?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+            Validity {
+                issued_at,
+                not_before: request.not_before,
+                expires_at: request.expires_at,
+            },
+        )?;
+        let credential_id = leaf_jti(&chain).ok_or(EnrollmentError::SigningFailed)?;
+        Ok(IssuedEnrollmentCredential {
+            chain,
+            credential_id,
+        })
     }
 }
 
 /// A pinned Ed25519 root and an explicitly selected intended audience.
-/// Configure a separate verifier for each trusted root; token headers cannot
-/// add roots, change algorithms, or supply key URLs.
+/// Configure a separate verifier for each trusted root; chains cannot add
+/// roots, change algorithms, or supply key URLs.
 pub struct JwtEnrollmentVerifier {
     root: [u8; 32],
     audience: String,
@@ -430,91 +464,58 @@ impl JwtEnrollmentVerifier {
         })
     }
 
-    /// `authenticated_peer` MUST come from the authenticated transport, never
-    /// from JWT/request data. Comparing this key supplies proof of possession;
-    /// the JWT alone is not a bearer credential. `now` is trusted UTC seconds.
-    /// Activation tolerates the configured leeway, `iat <= now + leeway` and
-    /// `nbf <= now + leeway`; expiry is exact, `now < exp`. A credential that
-    /// fails only on activation reports [`EnrollmentError::ClockSkew`].
+    /// Verify a presented chain with no delegate revocations.
+    /// See [`Self::verify_with`].
     pub fn verify(
         &self,
-        token: &str,
+        chain: &str,
         authenticated_peer: &[u8; 32],
         now: u64,
     ) -> Result<VerifiedAdmissionEvidence, EnrollmentError> {
-        if token.len() > MAX_JWT_BYTES {
-            return Err(EnrollmentError::TokenTooLarge);
-        }
-        // The shared JWS profile rejects JOSE extensions (only alg and typ;
-        // notably no crit/b64/jku/jwk/kid/x5u), noncanonical encodings and
-        // ambiguous objects everywhere, including optional application
-        // claims, attributes and nested confirmation data, before any claim
-        // is processed.
-        let compact = jws::decode(token).map_err(|error| match error {
-            JwsError::Header => EnrollmentError::UnsupportedHeader,
-            _ => EnrollmentError::InvalidJwt,
-        })?;
-        if compact.typ != ENROLLMENT_JWT_TYPE {
-            return Err(EnrollmentError::UnsupportedHeader);
-        }
-        compact
-            .verify(&self.root)
-            .map_err(|_| EnrollmentError::InvalidJwt)?;
-        // Time semantics are applied below against the same trusted clock
-        // that policy uses, including equality at exp and optional exp.
-        let claims: EnrollmentClaimsV1 =
-            serde_json::from_slice(&compact.payload).map_err(|_| EnrollmentError::InvalidJwt)?;
-        if claims.iss != hex::encode(self.root) || !claims.aud.contains(&self.audience) {
-            return Err(EnrollmentError::InvalidJwt);
-        }
-        let subject = canonical_identity(&claims.sub)?;
-        if canonical_identity(&claims.iss)? != self.root {
-            return Err(EnrollmentError::InvalidIdentity);
-        }
-        let cnf = &claims.cnf.jwk;
-        let confirmation = URL_SAFE_NO_PAD
-            .decode(&cnf.x)
-            .map_err(|_| EnrollmentError::PeerKeyMismatch)?;
-        if cnf.kty != "OKP"
-            || cnf.crv != "Ed25519"
-            || confirmation.as_slice() != subject
-            || subject != *authenticated_peer
-            || URL_SAFE_NO_PAD.encode(&confirmation) != cnf.x
-        {
-            return Err(EnrollmentError::PeerKeyMismatch);
-        }
-        if !valid_credential_id(&claims.jti) || !claims.aud.contains(&self.audience) {
-            return Err(EnrollmentError::InvalidClaims);
-        }
-        if !claims.aster_enrollment_v1.mandatory.is_empty() {
-            return Err(EnrollmentError::UnsupportedMandatoryRestriction);
-        }
-        validate_evidence_shape(
-            &claims.aud,
-            claims.iat,
-            claims.nbf,
-            claims.exp,
-            &claims.aster_enrollment_v1.claims,
-        )?;
-        let evidence = VerifiedAdmissionEvidence {
-            issuer: self.root,
-            subject,
-            claims: claims.aster_enrollment_v1.claims,
-            audience: claims.aud,
-            issued_at: claims.iat,
-            not_before: claims.nbf,
-            expires_at: claims.exp,
-            credential_id: Some(claims.jti),
-            original_jwt: Some(token.to_owned()),
-            source: AdmissionEvidenceSource::PresentedJwt,
-            activation_leeway: self.activation_leeway,
+        self.verify_with(chain, authenticated_peer, now, &NoRevocations)
+    }
+
+    /// `authenticated_peer` MUST come from the authenticated transport, never
+    /// from chain or request data. Comparing this key supplies proof of
+    /// possession; the chain alone is not a bearer credential. `now` is
+    /// trusted UTC seconds. The chain must end at the pinned root, every link
+    /// must name this audience, and every gate of `verify_chain` applies.
+    /// Activation tolerates the configured leeway; expiry is exact. A chain
+    /// that fails only on activation reports [`EnrollmentError::ClockSkew`].
+    pub fn verify_with(
+        &self,
+        chain: &str,
+        authenticated_peer: &[u8; 32],
+        now: u64,
+        revoked: &dyn RevokedDelegates,
+    ) -> Result<VerifiedAdmissionEvidence, EnrollmentError> {
+        let anchors = [self.root];
+        let verify_at = |now: u64| {
+            let mut trust = TrustContext::new(&anchors, &self.audience, now, revoked);
+            trust.leeway = self.activation_leeway;
+            verify_chain(
+                chain.as_bytes(),
+                LeafKind::Enrollment,
+                authenticated_peer,
+                &trust,
+            )
         };
-        match evidence.activation_at(now) {
-            Activation::Active => Ok(evidence),
-            Activation::Early { offset_seconds } => {
-                Err(EnrollmentError::ClockSkew { offset_seconds })
+        match verify_at(now) {
+            Ok(verified) => {
+                VerifiedAdmissionEvidence::from_chain(verified, chain, self.activation_leeway)
             }
-            Activation::Expired => Err(EnrollmentError::InvalidValidity),
+            // Time is checked before structure and signatures. Report skew
+            // only if the chain is otherwise valid when it claims to start.
+            Err(ChainError::NotYetValid) => {
+                let start = claimed_start(chain.as_bytes())
+                    .filter(|start| *start > now)
+                    .ok_or(EnrollmentError::InvalidValidity)?;
+                verify_at(start)?;
+                Err(EnrollmentError::ClockSkew {
+                    offset_seconds: i64::try_from(start - now).unwrap_or(i64::MAX),
+                })
+            }
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -534,22 +535,10 @@ pub(crate) fn canonical_identity(value: &str) -> Result<[u8; 32], EnrollmentErro
     Ok(bytes)
 }
 
-fn optional_numeric_date<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<u64>, D::Error> {
-    // Missing is allowed; an explicit null/string/fraction is not NumericDate
-    // under this integral-seconds profile and cannot erase a signed bound.
-    u64::deserialize(deserializer).map(Some)
-}
-
 fn validate_key(value: &[u8; 32]) -> Result<(), EnrollmentError> {
     crate::delegation::links::valid_key(value)
         .then_some(())
         .ok_or(EnrollmentError::InvalidIdentity)
-}
-
-fn valid_credential_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
 fn valid_audience(value: &str) -> bool {
@@ -612,7 +601,7 @@ fn validate_evidence_shape(
 
 /// Reject duplicate JSON object keys at any depth (the shared JWS check).
 pub(super) fn validate_unique_json(bytes: &[u8]) -> Result<(), EnrollmentError> {
-    jws::validate_unique_json(bytes).map_err(|_| EnrollmentError::InvalidJwt)
+    delegation::jws::validate_unique_json(bytes).map_err(|_| EnrollmentError::InvalidJwt)
 }
 
 #[cfg(test)]

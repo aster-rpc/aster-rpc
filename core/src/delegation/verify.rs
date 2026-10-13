@@ -128,6 +128,31 @@ pub fn verify_chain(
     })
 }
 
+/// The latest `iat`/`nbf` any link of `chain` claims, decoded without trust.
+/// Only for diagnosing a [`ChainError::NotYetValid`]: callers re-verify at
+/// that time before reporting clock skew rather than a definite failure.
+pub(crate) fn claimed_start(chain: &[u8]) -> Option<u64> {
+    let texts = split(chain, MAX_LINKS).ok()?;
+    texts
+        .iter()
+        .map(|text| {
+            let compact = jws::decode(text).ok()?;
+            let link = decode_link(&compact.typ, &compact.payload).ok()?;
+            Some(link.nbf.map_or(link.iat, |nbf| nbf.max(link.iat)))
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()
+}
+
+/// The leaf link's `jti`, decoded without trust. For reporting what an
+/// issuer just signed.
+pub(crate) fn leaf_jti(chain: &super::Chain) -> Option<String> {
+    let leaf = chain.links().next()?;
+    let compact = jws::decode(leaf).ok()?;
+    Some(decode_link(&compact.typ, &compact.payload).ok()?.jti)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
     Verify,
@@ -200,10 +225,12 @@ pub(super) fn gates(
     if !trust.anchors.contains(&top.iss) {
         return Err(ChainError::UntrustedAnchor);
     }
-    // Every issuer and the leaf subject are distinct: no self-issued or
-    // cyclic links.
+    // Every issuer and the leaf subject are distinct: no cyclic links. The
+    // one exception is an anchor's own one-link credential (the root's
+    // self-issued enrollment), which it still presents with its own key.
+    let self_issued_anchor = links.len() == 1 && leaf.iss == leaf.sub;
     let mut keys = BTreeSet::from([leaf.sub]);
-    if !links.iter().all(|link| keys.insert(link.iss)) {
+    if !self_issued_anchor && !links.iter().all(|link| keys.insert(link.iss)) {
         return Err(ChainError::Bridge);
     }
     if !links.iter().all(|link| link.aud.contains(trust.audience)) {
@@ -271,7 +298,10 @@ fn attenuate(parent: &DecodedLink, child: &DecodedLink) -> Result<(), ChainError
         && within(claimed.scopes, &bounds.scopes)
         && within(claimed.tags, &bounds.tags)
         && within(claimed.attribute_keys, &bounds.attribute_keys)
-        && within(claimed.operations, &bounds.operations);
+        && within(claimed.operations, &bounds.operations)
+        // Persistent registration, or the right to grant it, needs the
+        // parent's `may_register`.
+        && (!child.registers() || bounds.may_register);
     if let Some(grant) = child.delegation() {
         // A sub-delegate may never grant more than it was granted.
         ok = ok

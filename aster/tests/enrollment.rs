@@ -22,13 +22,14 @@ fn config(seed: u8) -> AsterConfig {
 }
 
 #[tokio::test]
-async fn jwt_subject_is_bound_to_real_authenticated_connection() {
+async fn chain_subject_is_bound_to_real_authenticated_connection() {
     let root = SigningKey::from_bytes(&[7; 32]);
     let subject = SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes();
     let header = json!({"alg": "EdDSA", "typ": ENROLLMENT_JWT_TYPE});
     let claims = json!({
         "iss": hex::encode(root.verifying_key().to_bytes()),
-        "sub": hex::encode(subject), "aud": "build-fleet", "jti": "reusable", "iat": NOW,
+        "sub": hex::encode(subject), "aud": "build-fleet", "jti": "reusable-credential", "iat": NOW,
+        "exp": NOW + 86_400,
         "cnf": {"jwk": {"kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(subject)}},
         "aster_enrollment_v1": {"mandatory": []}
     });
@@ -38,7 +39,8 @@ async fn jwt_subject_is_bound_to_real_authenticated_connection() {
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
     );
     let token = format!(
-        "{}.{}",
+        "{}~{}.{}",
+        aster::delegation::CHAIN_PREFIX,
         message,
         URL_SAFE_NO_PAD.encode(root.sign(message.as_bytes()).to_bytes())
     );

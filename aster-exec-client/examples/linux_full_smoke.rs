@@ -54,9 +54,10 @@ mod linux {
         std::array::from_fn(|i| u8::from_str_radix(&id[i * 2..i * 2 + 2], 16).unwrap())
     }
     fn token(root: &SecretKey, subject: [u8; 32]) -> String {
-        let mut request = EnrollmentIssueRequest::new(subject, "exec-full-smoke");
-        request.expires_at = Some(now() + 3600);
-        issue_jwt(root, &request, now()).unwrap().into_jwt()
+        let request = EnrollmentIssueRequest::new(subject, "exec-full-smoke", now() + 3600);
+        issue_credential(root, &request, now())
+            .unwrap()
+            .into_chain()
     }
     fn stop_unit_quietly(unit: &str) {
         for operation in ["stop", "reset-failed"] {

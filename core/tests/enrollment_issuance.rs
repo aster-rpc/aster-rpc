@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use aster_transport_core::delegation::{CHAIN_PREFIX, MAX_LINK_BYTES, MAX_LINK_LIFETIME};
 use aster_transport_core::enrollment::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
@@ -19,7 +20,7 @@ fn issuer() -> JwtEnrollmentIssuer {
 }
 
 fn request() -> EnrollmentIssueRequest {
-    let mut request = EnrollmentIssueRequest::new(subject(), "build-fleet");
+    let mut request = EnrollmentIssueRequest::new(subject(), "build-fleet", NOW + 7 * 86_400);
     request.claims.scopes = Some(BTreeSet::from(["build-worker".into()]));
     request.claims.tags = Some(BTreeSet::new());
     request.claims.attributes = Some(BTreeMap::from([
@@ -37,7 +38,7 @@ fn sign_raw(payload: &str) -> String {
         URL_SAFE_NO_PAD.encode(payload)
     );
     format!(
-        "{}.{}",
+        "{CHAIN_PREFIX}~{}.{}",
         message,
         URL_SAFE_NO_PAD.encode(
             SigningKey::from_bytes(&[10; 32])
@@ -49,7 +50,7 @@ fn sign_raw(payload: &str) -> String {
 
 fn issued_payload() -> Value {
     let artifact = issuer().issue(&request(), NOW).unwrap();
-    let payload = artifact.jwt().split('.').nth(1).unwrap();
+    let payload = artifact.chain().split('.').nth(1).unwrap();
     serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
 }
 
@@ -69,54 +70,57 @@ fn authorized_issuer_derives_profile_and_generates_unique_ids() {
                 .decode(artifact.credential_id())
                 .unwrap()
                 .len(),
-            32
+            16
         );
-        let verified = verifier.verify(artifact.jwt(), &subject(), NOW).unwrap();
+        let verified = verifier.verify(artifact.chain(), &subject(), NOW).unwrap();
         assert_eq!(verified.issuer(), &issuer.public_key());
         assert_eq!(verified.subject(), &subject());
         assert_eq!(verified.credential_id(), Some(artifact.credential_id()));
-        assert_eq!(verified.original_jwt(), Some(artifact.jwt()));
+        assert_eq!(verified.presented_chain(), Some(artifact.chain()));
         assert_eq!(verified.claims(), &request.claims);
-        assert_eq!(verified.expires_at(), None);
-        assert!(verifier
-            .verify(artifact.jwt(), &subject(), u64::MAX)
-            .is_ok());
+        assert_eq!(verified.registration(), Some(Registration::Ephemeral));
+        // Every credential expires.
+        assert_eq!(verified.expires_at(), Some(request.expires_at));
+        assert_eq!(
+            verifier
+                .verify(artifact.chain(), &subject(), request.expires_at)
+                .unwrap_err(),
+            EnrollmentError::InvalidValidity
+        );
     }
 }
 
 #[test]
-fn issuance_supports_requested_id_multiple_audiences_and_future_activation() {
+fn issuance_supports_multiple_audiences_and_future_activation() {
     let issuer = issuer();
     let mut request = request();
-    request.credential_id = Some("root-selected-id".into());
     request.audience = Audience::Many(vec!["build-fleet".into(), "urn:aster:fleet:workers".into()]);
     request.not_before = Some(NOW + 60);
-    request.expires_at = Some(NOW + 120);
+    request.expires_at = NOW + 120;
     let artifact = issuer.issue(&request, NOW).unwrap();
-    assert_eq!(artifact.credential_id(), "root-selected-id");
     for audience in ["build-fleet", "urn:aster:fleet:workers"] {
         let verifier = JwtEnrollmentVerifier::new(issuer.public_key(), audience).unwrap();
         // The default 60 s activation leeway admits from NOW; earlier is skew.
-        assert!(verifier.verify(artifact.jwt(), &subject(), NOW).is_ok());
+        assert!(verifier.verify(artifact.chain(), &subject(), NOW).is_ok());
         assert_eq!(
             verifier
-                .verify(artifact.jwt(), &subject(), NOW - 1)
+                .verify(artifact.chain(), &subject(), NOW - 1)
                 .unwrap_err(),
             EnrollmentError::ClockSkew { offset_seconds: 61 }
         );
         assert!(verifier
-            .verify(artifact.jwt(), &subject(), NOW + 60)
+            .verify(artifact.chain(), &subject(), NOW + 60)
             .is_ok());
         assert_eq!(
             verifier
-                .verify(artifact.jwt(), &subject(), NOW + 60)
+                .verify(artifact.chain(), &subject(), NOW + 60)
                 .unwrap()
                 .not_before(),
             Some(NOW + 60)
         );
         assert_eq!(
             verifier
-                .verify(artifact.jwt(), &subject(), NOW + 120)
+                .verify(artifact.chain(), &subject(), NOW + 120)
                 .unwrap_err(),
             EnrollmentError::InvalidValidity
         );
@@ -127,25 +131,24 @@ fn issuance_supports_requested_id_multiple_audiences_and_future_activation() {
 fn issuer_rejects_invalid_grants_before_signing() {
     let issuer = issuer();
     let mut invalid = request();
-    invalid.expires_at = Some(NOW);
+    invalid.expires_at = NOW;
     assert_eq!(
         issuer.issue(&invalid, NOW).unwrap_err(),
         EnrollmentError::InvalidValidity
     );
-    invalid.expires_at = Some(NOW + 1);
+    invalid.expires_at = NOW + 1;
     invalid.not_before = Some(NOW + 1);
     assert_eq!(
         issuer.issue(&invalid, NOW).unwrap_err(),
         EnrollmentError::InvalidValidity
     );
-    for id in [String::new(), "x".repeat(257), "unsafe\nidentifier".into()] {
-        let mut invalid = request();
-        invalid.credential_id = Some(id);
-        assert_eq!(
-            issuer.issue(&invalid, NOW).unwrap_err(),
-            EnrollmentError::InvalidClaims
-        );
-    }
+    // No link may outlive the profile's maximum lifetime.
+    let mut invalid = request();
+    invalid.expires_at = NOW + MAX_LINK_LIFETIME + 1;
+    assert_eq!(
+        issuer.issue(&invalid, NOW).unwrap_err(),
+        EnrollmentError::InvalidValidity
+    );
     for float in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let mut invalid = request();
         invalid
@@ -166,7 +169,7 @@ fn issuer_rejects_invalid_grants_before_signing() {
         EnrollmentError::InvalidIdentity
     );
     let mut huge = request();
-    huge.claims.tags = Some(BTreeSet::from(["a".repeat(MAX_JWT_BYTES)]));
+    huge.claims.tags = Some(BTreeSet::from(["a".repeat(MAX_LINK_BYTES)]));
     assert_eq!(
         issuer.issue(&huge, NOW).unwrap_err(),
         EnrollmentError::TokenTooLarge
@@ -227,7 +230,7 @@ fn signed_profile_rejects_weak_keys_and_malformed_string_or_uri_audiences() {
 }
 
 #[test]
-fn duplicate_fields_are_rejected_even_in_ignored_nested_claims() {
+fn duplicate_and_unknown_fields_are_rejected_at_any_depth() {
     let verifier = JwtEnrollmentVerifier::new(issuer().public_key(), "build-fleet").unwrap();
     let payload = issued_payload().to_string();
     let optional_duplicate = format!(
@@ -258,7 +261,7 @@ fn duplicate_fields_are_rejected_even_in_ignored_nested_claims() {
 #[test]
 fn compact_jwt_rejects_padding_empty_extra_and_noncanonical_segments() {
     let issuer = issuer();
-    let token = issuer.issue(&request(), NOW).unwrap().into_jwt();
+    let token = issuer.issue(&request(), NOW).unwrap().into_chain();
     let verifier = JwtEnrollmentVerifier::new(issuer.public_key(), "build-fleet").unwrap();
     let parts: Vec<_> = token.split('.').collect();
     for changed in [
@@ -278,10 +281,10 @@ fn compact_jwt_rejects_padding_empty_extra_and_noncanonical_segments() {
 async fn previously_verified_evidence_cannot_outlive_its_signed_bounds() {
     let issuer = issuer();
     let mut request = request();
-    request.expires_at = Some(NOW + 1);
+    request.expires_at = NOW + 1;
     let artifact = issuer.issue(&request, NOW).unwrap();
     let verifier = JwtEnrollmentVerifier::new(issuer.public_key(), "build-fleet").unwrap();
-    let evidence = verifier.verify(artifact.jwt(), &subject(), NOW).unwrap();
+    let evidence = verifier.verify(artifact.chain(), &subject(), NOW).unwrap();
     let policy = PolicyExpressionV1::Predicate(PolicyPredicate::TolerateStalePolicy);
     let result = admit(
         &evidence,
@@ -346,7 +349,7 @@ fn attribute_file_parser_rejects_ambiguous_invalid_and_oversized_inputs() {
         );
     }
     assert_eq!(
-        AdmissionClaims::parse_attributes_json(&vec![b' '; MAX_JWT_BYTES + 1]).unwrap_err(),
+        AdmissionClaims::parse_attributes_json(&vec![b' '; MAX_LINK_BYTES + 1]).unwrap_err(),
         EnrollmentError::TokenTooLarge
     );
     // The same strict typed grammar applies to signed credentials, regardless

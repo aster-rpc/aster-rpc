@@ -23,7 +23,7 @@ use super::{
     AdmissionEvidenceSource, AdmissionPolicy, ClockSynchronization, DenialReason, EnrollmentError,
     EnrollmentPolicyStore, JwtEnrollmentVerifier, ObservedSourceAddress, PolicySynchronization,
     RecordAvailability, RecordError, SourceAddressProvenance, SynchronizationSource,
-    VerifiedAdmissionEvidence, MAX_JWT_BYTES,
+    VerifiedAdmissionEvidence, MAX_CHAIN_BYTES,
 };
 use crate::{
     CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreHookHandshakeInfo, CoreHookReceiver,
@@ -31,7 +31,7 @@ use crate::{
 };
 
 pub const ENROLLMENT_ALPN: &[u8] = b"aster.enrollment/1";
-const MAX_ENVELOPE: usize = MAX_JWT_BYTES + 8192;
+const MAX_ENVELOPE: usize = MAX_CHAIN_BYTES + 8192;
 const REJECT: u64 = 403;
 /// Close reason prefix carrying the observed offset (remote minus local
 /// seconds) back to a peer whose clock is outside the activation leeway.
@@ -226,14 +226,16 @@ struct Hello {
 #[serde(deny_unknown_fields)]
 struct ReplicaProof {
     version: u8,
-    credential: Option<String>,
+    /// The responder's own delegation chain, in text form.
+    chain: Option<String>,
     sent_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Presentation {
-    credential: Option<String>,
+    /// The joining node's delegation chain, in text form.
+    chain: Option<String>,
     sent_at: u64,
 }
 
@@ -708,7 +710,7 @@ impl EnrollmentService {
     }
 
     /// Derive this peer's current evidence from root records and an optional
-    /// presented JWT, then evaluate it. A record read failure that recorded
+    /// presented chain, then evaluate it. A record read failure that recorded
     /// no definite denial leaves the peer's standing unknown.
     async fn evidence(
         &self,
@@ -726,7 +728,7 @@ impl EnrollmentService {
             unresolved = self.refresh_issue(self.store.refresh_node(doc, peer).await);
         }
         // Independent root registration replaces presentation evidence. An
-        // obsolete/expired JWT must not block a newer valid registration.
+        // obsolete/expired chain must not block a newer valid registration.
         if let Ok(registration) = self.store.select_evidence(peer, None, unix_now()) {
             if let Some(issue) = unresolved {
                 return Err(issue);
@@ -734,7 +736,7 @@ impl EnrollmentService {
             self.evaluate(&registration, observed_source).await?;
             return Ok(registration);
         }
-        let jwt = token
+        let chain = token
             .map(|token| self.verifier.verify(token, peer, unix_now()))
             .transpose()
             .map_err(|error| match error {
@@ -743,13 +745,15 @@ impl EnrollmentService {
                 }
                 _ => AdmissionError::Denied(DenialReason::InvalidValidity),
             })?;
-        if let (Some(doc), Some(id)) = (&doc, jwt.as_ref().and_then(|jwt| jwt.credential_id())) {
+        if let (Some(doc), Some(id)) =
+            (&doc, chain.as_ref().and_then(|chain| chain.credential_id()))
+        {
             let issue = self.refresh_issue(self.store.refresh_credential(doc, id).await);
             unresolved = unresolved.or(issue);
         }
         let evidence = self
             .store
-            .select_evidence(peer, jwt.as_ref(), unix_now())
+            .select_evidence(peer, chain.as_ref(), unix_now())
             .map_err(AdmissionError::from_record)?;
         if let Some(issue) = unresolved {
             return Err(issue);
@@ -844,7 +848,7 @@ impl EnrollmentService {
         }
         if let Some(session) = sessions.get_mut(&peer).filter(|session| {
             session.evidence.source() == evidence.source()
-                && session.evidence.original_jwt() == evidence.original_jwt()
+                && session.evidence.presented_chain() == evidence.presented_chain()
                 && session.observed_source == observed_source
         }) {
             session.last_used = Instant::now();
@@ -1021,7 +1025,7 @@ impl EnrollmentService {
                 &send,
                 &ReplicaProof {
                     version: 1,
-                    credential: self.credential.clone(),
+                    chain: self.credential.clone(),
                     sent_at: unix_now(),
                 },
             )
@@ -1029,7 +1033,7 @@ impl EnrollmentService {
             let presentation: Presentation = self.receive_step(&recv).await?;
             self.check_skew(presentation.sent_at)?;
             let evidence = self
-                .evidence(&peer, presentation.credential.as_deref(), source)
+                .evidence(&peer, presentation.chain.as_deref(), source)
                 .await?;
             let doc = self
                 .document
@@ -1124,13 +1128,11 @@ impl EnrollmentService {
                 self.check_skew(proof.sent_at)?;
                 let peer = identity(&connection.remote_id())?;
                 let source = observed_source(&connection);
-                let evidence = self
-                    .evidence(&peer, proof.credential.as_deref(), source)
-                    .await?;
+                let evidence = self.evidence(&peer, proof.chain.as_deref(), source).await?;
                 transmit(
                     &send,
                     &Presentation {
-                        credential: self.credential.clone(),
+                        chain: self.credential.clone(),
                         sent_at: unix_now(),
                     },
                 )
@@ -1431,7 +1433,7 @@ impl EnrollmentService {
                     let Some((peer, old, source, generation)) = next else {
                         break;
                     };
-                    match self.evidence(&peer, old.original_jwt(), source).await {
+                    match self.evidence(&peer, old.presented_chain(), source).await {
                         Ok(evidence) => {
                             let _ = self.replace_session(evidence, source, Some(generation));
                         }
@@ -1543,15 +1545,15 @@ mod tests {
         JwtEnrollmentIssuer::from_seed(&[seed; 32]).public_key()
     }
 
-    fn evidence(seed: u8, credential: &str) -> VerifiedAdmissionEvidence {
-        let mut request = EnrollmentIssueRequest::new(public(seed), AUDIENCE);
-        request.credential_id = Some(credential.into());
+    /// A fresh root-issued credential; each has its own random `jti`.
+    fn evidence(seed: u8) -> VerifiedAdmissionEvidence {
+        let request = EnrollmentIssueRequest::new(public(seed), AUDIENCE, unix_now() + 3600);
         let issued = JwtEnrollmentIssuer::from_seed(&[1; 32])
             .issue(&request, unix_now())
             .unwrap();
         JwtEnrollmentVerifier::new(public(1), AUDIENCE)
             .unwrap()
-            .verify(issued.jwt(), &public(seed), unix_now())
+            .verify(issued.chain(), &public(seed), unix_now())
             .unwrap()
     }
 
@@ -1636,7 +1638,7 @@ mod tests {
         for reenroll in [false, true] {
             let policy = PausedPolicy::new(false);
             let (service, path) = service(policy.clone(), EnrollmentOptions::default()).await;
-            service.remember(evidence(3, "old"), None).unwrap();
+            service.remember(evidence(3), None).unwrap();
             let old_generation = service.session(&public(3)).unwrap().generation;
             let task = tokio::spawn({
                 let service = service.clone();
@@ -1644,8 +1646,10 @@ mod tests {
             });
             policy.entered.notified().await;
             service.revoke_generation(&public(3), old_generation, DenialReason::NodeRevoked);
+            let renewed = evidence(3);
+            let renewed_id = renewed.credential_id().map(str::to_owned);
             if reenroll {
-                service.remember(evidence(3, "new"), None).unwrap();
+                service.remember(renewed, None).unwrap();
             }
             policy.release.notify_one();
             task.await.unwrap();
@@ -1656,7 +1660,7 @@ mod tests {
                         .unwrap()
                         .evidence
                         .credential_id(),
-                    Some("new")
+                    renewed_id.as_deref()
                 );
             } else {
                 assert!(service.session(&public(3)).is_none());
@@ -1669,7 +1673,7 @@ mod tests {
     async fn unchanged_reconciliation_preserves_slow_check_generation() {
         let policy = PausedPolicy::new(false);
         let (service, path) = service(policy.clone(), EnrollmentOptions::default()).await;
-        service.remember(evidence(3, "same"), None).unwrap();
+        service.remember(evidence(3), None).unwrap();
         let generation = service.session(&public(3)).unwrap().generation;
         let task = tokio::spawn({
             let service = service.clone();
@@ -1695,14 +1699,10 @@ mod tests {
         )
         .await;
         for seed in [3, 4, 5, 7] {
-            service
-                .remember(evidence(seed, &format!("peer-{seed}")), None)
-                .unwrap();
+            service.remember(evidence(seed), None).unwrap();
         }
         for seed in 20..52 {
-            service
-                .remember(evidence(seed, &format!("queued-{seed}")), None)
-                .unwrap();
+            service.remember(evidence(seed), None).unwrap();
         }
         let task = tokio::spawn({
             let service = service.clone();
@@ -1744,7 +1744,7 @@ mod tests {
             service.check_peer(&public(4)).await.unwrap_err(),
             AdmissionError::NotAdmitted
         );
-        service.remember(evidence(4, "denied"), None).unwrap();
+        service.remember(evidence(4), None).unwrap();
         assert!(matches!(
             service.check_peer(&public(4)).await,
             Err(AdmissionError::Denied(DenialReason::Consumer(_)))
@@ -1758,7 +1758,7 @@ mod tests {
             Err(AdmissionError::Denied(DenialReason::Consumer(_)))
         ));
         // A later successful admission clears it.
-        service.remember(evidence(4, "again"), None).unwrap();
+        service.remember(evidence(4), None).unwrap();
         assert!(service.revoked_peers.lock().unwrap().reasons.is_empty());
         cleanup(service, path).await;
     }
@@ -1774,9 +1774,9 @@ mod tests {
             },
         )
         .await;
-        service.remember(evidence(10, "a"), None).unwrap();
-        service.remember(evidence(11, "b"), None).unwrap();
-        assert!(service.remember(evidence(12, "c"), None).is_err());
+        service.remember(evidence(10), None).unwrap();
+        service.remember(evidence(11), None).unwrap();
+        assert!(service.remember(evidence(12), None).is_err());
         service
             .sessions
             .lock()
@@ -1784,7 +1784,7 @@ mod tests {
             .get_mut(&public(10))
             .unwrap()
             .last_used = Instant::now() - Duration::from_secs(120);
-        service.remember(evidence(12, "c"), None).unwrap();
+        service.remember(evidence(12), None).unwrap();
         assert!(!service.has_session(&public(10)));
         assert!(service.has_session(&public(11)) && service.has_session(&public(12)));
         // Eviction is not a revocation.
@@ -1949,14 +1949,14 @@ mod tests {
         let _: ReplicaProof = receive(&recv).await.unwrap();
         let ahead = JwtEnrollmentIssuer::from_seed(&[1; 32])
             .issue(
-                &EnrollmentIssueRequest::new(public(7), AUDIENCE),
+                &EnrollmentIssueRequest::new(public(7), AUDIENCE, unix_now() + 3600),
                 unix_now() + 90,
             )
             .unwrap();
         transmit(
             &send,
             &Presentation {
-                credential: Some(ahead.into_jwt()),
+                chain: Some(ahead.into_chain()),
                 sent_at: unix_now(),
             },
         )
@@ -1986,7 +1986,7 @@ mod tests {
                         // The replica's own clock runs 90 s behind.
                         let proof = ReplicaProof {
                             version: 1,
-                            credential: None,
+                            chain: None,
                             sent_at: hello.sent_at - 90,
                         };
                         transmit(&send, &proof).await.unwrap();

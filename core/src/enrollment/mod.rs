@@ -61,11 +61,11 @@ pub(crate) use jwt::canonical_identity;
 pub use clock::{local_clock_synchronization, ClockSynchronization};
 
 pub use jwt::{
-    AdmissionClaims, AdmissionEvidenceSource, Audience, Confirmation, EnrollmentClaimsV1,
-    EnrollmentError, EnrollmentExtensionV1, EnrollmentIssueRequest, IssuedEnrollmentCredential,
-    JwtEnrollmentIssuer, JwtEnrollmentVerifier, PublicConfirmationKey, TypedAttribute,
+    AdmissionClaims, AdmissionEvidenceSource, Audience, Confirmation, EnrollmentError,
+    EnrollmentExtensionV1, EnrollmentIssueRequest, IssuedEnrollmentCredential, JwtEnrollmentIssuer,
+    JwtEnrollmentVerifier, PublicConfirmationKey, Registration, TypedAttribute,
     VerifiedAdmissionEvidence, DEFAULT_ACTIVATION_LEEWAY_SECONDS, ENROLLMENT_JWT_TYPE,
-    MAX_ACTIVATION_LEEWAY_SECONDS, MAX_JWT_BYTES,
+    MAX_ACTIVATION_LEEWAY_SECONDS, MAX_CHAIN_BYTES,
 };
 pub use policy::{
     admit, AdmissionContext, AdmissionDecision, AdmissionPolicy, DenialReason, KnownRevocations,

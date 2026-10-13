@@ -47,6 +47,7 @@ fn grant() -> DelegationGrant {
         subjects: None,
         operations: set(&["exec.submit"]),
         mandatory: BTreeSet::new(),
+        may_register: false,
     }
 }
 
@@ -58,6 +59,7 @@ fn enrollment(scopes: &[&str]) -> EnrollmentExtensionV1 {
             attributes: None,
         },
         mandatory: vec![],
+        registration: Registration::Ephemeral,
     }
 }
 
@@ -457,6 +459,99 @@ fn inv_a8_depth_and_may_issue_bound_the_subtree() {
 }
 
 #[test]
+fn inv_e26_persistent_registration_needs_may_register_down_the_chain() {
+    let persistent = EnrollmentExtensionV1 {
+        registration: Registration::Persistent,
+        ..enrollment(&["build"])
+    };
+    // An issuer without may_register cannot sign a persistent leaf...
+    let parent = delegation_to_issuer(&grant());
+    assert_eq!(
+        issue_enrollment(
+            &seed(ISSUER),
+            Some(&parent),
+            &key(NODE),
+            &aud(),
+            &persistent,
+            validity(NOW - 10, DAY),
+        )
+        .unwrap_err(),
+        ChainError::Attenuation
+    );
+    // ...and a verifier rejects one signed around the issuance check.
+    let leaf = raw_leaf(|value| {
+        value["aster_enrollment_v1"]["registration"] = json!("persistent");
+    });
+    let text = chain(&[leaf, parent.links().next().unwrap().to_owned()]);
+    assert_eq!(verify(&text, NODE).unwrap_err(), ChainError::Attenuation);
+
+    // With may_register the same leaf is issued, verifies and says so.
+    let mut registering = grant();
+    registering.may_register = true;
+    let parent = delegation_to_issuer(&registering);
+    let issued = issue_enrollment(
+        &seed(ISSUER),
+        Some(&parent),
+        &key(NODE),
+        &aud(),
+        &persistent,
+        validity(NOW - 10, DAY),
+    )
+    .unwrap();
+    let verified = verify(issued.to_text(), NODE).unwrap();
+    assert!(matches!(
+        verified.leaf(),
+        LeafClaims::Enrollment(extension) if extension.registration == Registration::Persistent
+    ));
+    // An ephemeral leaf needs no permission, and omission means ephemeral.
+    let leaf = raw_leaf(|value| {
+        value["aster_enrollment_v1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("registration");
+    });
+    let text = chain(&[
+        leaf,
+        delegation_to_issuer(&grant())
+            .links()
+            .next()
+            .unwrap()
+            .to_owned(),
+    ]);
+    assert!(matches!(
+        verify(&text, NODE).unwrap().leaf(),
+        LeafClaims::Enrollment(extension) if extension.registration == Registration::Ephemeral
+    ));
+
+    // A sub-delegate cannot grant may_register its parent lacks.
+    let parent = delegation_to_issuer(&grant());
+    let mut sub = payload(ISSUER, OTHER, LinkKind::Delegation, NOW - 10, NOW + DAY);
+    sub["aster_delegation_v1"]["max_depth"] = json!(0);
+    sub["aster_delegation_v1"]["may_register"] = json!(true);
+    let leaf = link(
+        OTHER,
+        &payload(OTHER, NODE, LinkKind::Enrollment, NOW - 5, NOW + DAY / 2),
+    );
+    let text = chain(&[
+        leaf,
+        link(ISSUER, &sub),
+        parent.links().next().unwrap().to_owned(),
+    ]);
+    assert_eq!(verify(&text, NODE).unwrap_err(), ChainError::Attenuation);
+    // A root-issued (one-link) persistent credential needs no delegation.
+    let root_issued = issue_enrollment(
+        &seed(ROOT),
+        None,
+        &key(NODE),
+        &aud(),
+        &persistent,
+        validity(NOW - 10, DAY),
+    )
+    .unwrap();
+    verify(root_issued.to_text(), NODE).unwrap();
+}
+
+#[test]
 fn inv_a9_ancestor_restrictions_accumulate_and_unknown_ones_reject() {
     let mut restricted = grant();
     restricted.mandatory = set(&["source_cidr"]);
@@ -773,13 +868,14 @@ fn inv_a18_no_anchor_means_no_verification() {
 
 #[cfg(feature = "enrollment")]
 #[test]
-fn todays_enrollment_credential_with_exp_is_a_one_link_chain() {
+fn a_root_issued_enrollment_credential_is_a_one_link_chain() {
     use aster_transport_core::enrollment::{EnrollmentIssueRequest, JwtEnrollmentIssuer};
-    let mut request = EnrollmentIssueRequest::new(key(NODE), AUD);
-    request.expires_at = Some(NOW + DAY);
+    let request = EnrollmentIssueRequest::new(key(NODE), AUD, NOW + DAY);
     let credential = JwtEnrollmentIssuer::from_seed(&seed(ROOT))
         .issue(&request, NOW)
         .unwrap();
-    let text = chain(&[credential.into_jwt()]);
-    verify(&text, NODE).unwrap();
+    assert_eq!(credential.chain().matches('~').count(), 1);
+    let verified = verify(credential.chain(), NODE).unwrap();
+    assert_eq!(verified.issuers(), &[key(ROOT)]);
+    assert_eq!(verified.jtis()[0], credential.credential_id());
 }

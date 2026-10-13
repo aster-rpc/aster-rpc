@@ -10,11 +10,11 @@
 pub use aster_transport_core::delegation::{
     next_root_commitment, verify_chain, verify_root_rotation, ActionGrant, AdmissionClaims,
     Audience, Chain, ChainError, DelegationGrant, EnrollmentExtensionV1, LeafClaims, LeafKind,
-    LinkKind, NoRevocations, RevokedDelegates, RootRotation, RootState, RotationReason,
-    TrustContext, TypedAttribute, Validity, VerifiedChain, ACTION_JWT_TYPE, CHAIN_PREFIX,
-    DEFAULT_LEEWAY_SECONDS, DEFAULT_MAX_LINKS, DELEGATION_JWT_TYPE, ENROLLMENT_LINK_TYPE,
-    MAX_CHAIN_BYTES, MAX_LEEWAY_SECONDS, MAX_LINKS, MAX_LINK_BYTES, MAX_LINK_LIFETIME,
-    ROOT_ROTATION_JWT_TYPE,
+    LinkKind, NoRevocations, Registration, RevokedDelegates, RootRotation, RootState,
+    RotationReason, TrustContext, TypedAttribute, Validity, VerifiedChain, ACTION_JWT_TYPE,
+    CHAIN_PREFIX, DEFAULT_LEEWAY_SECONDS, DEFAULT_MAX_LINKS, DELEGATION_JWT_TYPE,
+    ENROLLMENT_LINK_TYPE, MAX_CHAIN_BYTES, MAX_LEEWAY_SECONDS, MAX_LINKS, MAX_LINK_BYTES,
+    MAX_LINK_LIFETIME, ROOT_ROTATION_JWT_TYPE,
 };
 
 use aster_transport_core::delegation as core;

@@ -23,13 +23,13 @@ fn public(seed: u8) -> [u8; 32] {
     JwtEnrollmentIssuer::from_seed(&[seed; 32]).public_key()
 }
 fn token(seed: u8) -> String {
-    issue_jwt(
+    issue_credential(
         &key(1),
-        &EnrollmentIssueRequest::new(public(seed), FLEET),
+        &EnrollmentIssueRequest::new(public(seed), FLEET, now() + 3600),
         now(),
     )
     .unwrap()
-    .into_jwt()
+    .into_chain()
 }
 async fn node(seed: u8) -> Node {
     Node::start_with_alpns(
@@ -133,7 +133,7 @@ async fn ungated_node(seed: u8) -> Node {
     .unwrap()
 }
 
-async fn raw_presentation(node: &Node, replica: &Node, jwt: &str) -> bool {
+async fn raw_presentation(node: &Node, replica: &Node, chain: &str) -> bool {
     node.add_peer(replica).unwrap();
     let connection = node.connect(&replica.id(), ENROLLMENT_ALPN).await.unwrap();
     let (send, recv) = connection.open_bi().await.unwrap();
@@ -145,10 +145,10 @@ async fn raw_presentation(node: &Node, replica: &Node, jwt: &str) -> bool {
     let length = u32::from_be_bytes(recv.read_exact(4).await.unwrap().try_into().unwrap());
     let proof: serde_json::Value =
         serde_json::from_slice(&recv.read_exact(length as usize).await.unwrap()).unwrap();
-    assert!(proof.get("credential").is_some());
+    assert!(proof.get("chain").is_some());
     assert!(proof.get("policy_ticket").is_none());
     let presentation =
-        serde_json::to_vec(&serde_json::json!({"credential":jwt,"sent_at":now()})).unwrap();
+        serde_json::to_vec(&serde_json::json!({"chain":chain,"sent_at":now()})).unwrap();
     send.write_all((presentation.len() as u32).to_be_bytes().to_vec())
         .await
         .unwrap();
@@ -159,6 +159,144 @@ async fn raw_presentation(node: &Node, replica: &Node, jwt: &str) -> bool {
         .is_err();
     connection.close(0, b"done".to_vec()).unwrap();
     denied
+}
+
+/// The root (seed 1) delegates to an issuer (seed 6). Nothing in these tests
+/// runs as the root: it signs offline and is never online.
+fn issuer_delegation(may_register: bool, scopes: &[&str]) -> aster::delegation::Chain {
+    use aster::delegation::{issue_delegation, DelegationGrant, LinkKind, Validity};
+    let grant = DelegationGrant {
+        may_issue: [LinkKind::Enrollment].into(),
+        audiences: [FLEET.to_owned()].into(),
+        scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+        tags: Default::default(),
+        attribute_keys: Default::default(),
+        max_child_lifetime: 86_400,
+        max_depth: 0,
+        subjects: None,
+        operations: Default::default(),
+        mandatory: Default::default(),
+        may_register,
+    };
+    issue_delegation(
+        &key(1),
+        None,
+        &aster::PublicKey::from_bytes(public(6)),
+        &Audience::One(FLEET.into()),
+        &grant,
+        Validity {
+            issued_at: now() - 10,
+            not_before: None,
+            expires_at: now() + 7 * 86_400,
+        },
+    )
+    .unwrap()
+}
+
+fn delegated_token(request: EnrollmentIssueRequest) -> String {
+    issue_delegated_credential(
+        &key(6),
+        &issuer_delegation(false, &["build"]),
+        &request,
+        now(),
+    )
+    .unwrap()
+    .into_chain()
+}
+
+#[tokio::test]
+async fn delegated_issuer_enrolls_a_node_while_the_root_is_offline() {
+    let files = tempfile::tempdir().unwrap();
+    let replica = node(2).await;
+    let replica_enroll = enrollment(
+        &replica,
+        [42; 32],
+        &files.path().join("replica.json"),
+        Some(token(2)),
+    );
+    let _connections = serve(replica.clone(), replica_enroll.clone());
+    let mut request = EnrollmentIssueRequest::new(public(7), FLEET, now() + 3600);
+    request.claims.scopes = Some(["build".to_owned()].into());
+    let joiner = node(7).await;
+    let joiner_enroll = enrollment(
+        &joiner,
+        [42; 32],
+        &files.path().join("joiner.json"),
+        Some(delegated_token(request)),
+    );
+    let (ready, _) = joiner_enroll.connect(replica.addr()).await.unwrap();
+    assert_eq!(ready.peer, public(2));
+    let admitted = replica_enroll.check_peer(&public(7)).await.unwrap();
+    assert!(matches!(
+        admitted.source,
+        AdmissionEvidenceSource::PresentedChain { anchor, issuers, .. }
+            if anchor == public(1) && issuers == vec![public(6), public(1)]
+    ));
+    joiner.shutdown().await;
+    replica.shutdown().await;
+}
+
+#[test]
+fn delegated_credentials_stay_within_the_delegation() {
+    use aster::delegation::{issue_enrollment, ChainError, Validity, CHAIN_PREFIX};
+    let verifier = JwtEnrollmentVerifier::new(public(1), FLEET).unwrap();
+    let delegation = issuer_delegation(false, &["build"]);
+    // Issuance refuses a leaf beyond the delegation's scopes, and a
+    // persistent leaf from an issuer without may_register.
+    let mut over_scoped = EnrollmentIssueRequest::new(public(7), FLEET, now() + 3600);
+    over_scoped.claims.scopes = Some(["deploy".to_owned()].into());
+    let mut persistent = EnrollmentIssueRequest::new(public(7), FLEET, now() + 3600);
+    persistent.registration = Registration::Persistent;
+    for request in [&over_scoped, &persistent] {
+        assert_eq!(
+            issue_delegated_credential(&key(6), &delegation, request, now()).unwrap_err(),
+            EnrollmentError::Chain(ChainError::Attenuation)
+        );
+    }
+    // A verifier rejects the same leaves signed around the issuance check:
+    // the issuer self-signs each leaf, then splices it under its delegation.
+    for request in [&over_scoped, &persistent] {
+        let leaf = issue_enrollment(
+            &key(6),
+            None,
+            &aster::PublicKey::from_bytes(public(7)),
+            &request.audience,
+            &EnrollmentExtensionV1 {
+                claims: request.claims.clone(),
+                mandatory: vec![],
+                registration: request.registration,
+            },
+            Validity {
+                issued_at: now(),
+                not_before: None,
+                expires_at: request.expires_at,
+            },
+        )
+        .unwrap();
+        let spliced = format!(
+            "{CHAIN_PREFIX}~{}~{}",
+            leaf.links().next().unwrap(),
+            delegation.links().next().unwrap()
+        );
+        assert_eq!(
+            verifier.verify(&spliced, &public(7), now()).unwrap_err(),
+            EnrollmentError::Chain(ChainError::Attenuation)
+        );
+    }
+    // With may_register, the issuer may enroll a persistent node.
+    let registering = issuer_delegation(true, &["build"]);
+    let chain = issue_delegated_credential(&key(6), &registering, &persistent, now())
+        .unwrap()
+        .into_chain();
+    let evidence = verifier.verify(&chain, &public(7), now()).unwrap();
+    assert_eq!(evidence.registration(), Some(Registration::Persistent));
+    // A one-link root credential still works, and always expires.
+    let evidence = verifier.verify(&token(7), &public(7), now()).unwrap();
+    assert!(evidence.expires_at().is_some());
+    assert!(matches!(
+        evidence.source(),
+        AdmissionEvidenceSource::PresentedChain { issuers, .. } if issuers == vec![public(1)]
+    ));
 }
 
 #[tokio::test]
@@ -174,20 +312,20 @@ async fn network_rejects_copied_wrong_root_and_wrong_audience_credentials() {
     let _connections = serve(replica.clone(), enroll.clone());
     let attacker = ungated_node(8).await;
     assert!(raw_presentation(&attacker, &replica, &token(4)).await);
-    let wrong_root = issue_jwt(
+    let wrong_root = issue_credential(
         &key(9),
-        &EnrollmentIssueRequest::new(public(8), FLEET),
+        &EnrollmentIssueRequest::new(public(8), FLEET, now() + 3600),
         now(),
     )
     .unwrap();
-    assert!(raw_presentation(&attacker, &replica, wrong_root.jwt()).await);
-    let wrong_audience = issue_jwt(
+    assert!(raw_presentation(&attacker, &replica, wrong_root.chain()).await);
+    let wrong_audience = issue_credential(
         &key(1),
-        &EnrollmentIssueRequest::new(public(8), "other-fleet"),
+        &EnrollmentIssueRequest::new(public(8), "other-fleet", now() + 3600),
         now(),
     )
     .unwrap();
-    assert!(raw_presentation(&attacker, &replica, wrong_audience.jwt()).await);
+    assert!(raw_presentation(&attacker, &replica, wrong_audience.chain()).await);
     assert!(enroll.check_peer(&public(8)).await.is_err());
     attacker.shutdown().await;
     replica.shutdown().await;
@@ -213,14 +351,14 @@ async fn reciprocal_validation_rejects_rogue_replica_and_failopen_install() {
             serde_json::from_slice(&recv.read_exact(count as usize).await.unwrap()).unwrap();
         assert_eq!(probe["version"], 1);
         assert!(probe["sent_at"].as_u64().unwrap().abs_diff(now()) <= 1);
-        let rogue_token = issue_jwt(
+        let rogue_token = issue_credential(
             &key(9),
-            &EnrollmentIssueRequest::new(public(9), FLEET),
+            &EnrollmentIssueRequest::new(public(9), FLEET, now() + 3600),
             now(),
         )
         .unwrap();
         let payload = serde_json::to_vec(&serde_json::json!({
-            "version":1,"credential":rogue_token.jwt(),"sent_at":now()
+            "version":1,"chain":rogue_token.chain(),"sent_at":now()
         }))
         .unwrap();
         send.write_all((payload.len() as u32).to_be_bytes().to_vec())
@@ -529,7 +667,7 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
         sync(&transition_enroll, replica.addr()).await;
         assert!(matches!(
             replica_enroll.check_peer(&public(9)).await.unwrap().source,
-            AdmissionEvidenceSource::PresentedJwt
+            AdmissionEvidenceSource::PresentedChain { .. }
         ));
         write(
             &root,
@@ -569,7 +707,7 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
         let mut revoked = replica_enroll.revocations();
         assert!(matches!(
             sync(&live_enroll, replica.addr()).await.source,
-            AdmissionEvidenceSource::PresentedJwt
+            AdmissionEvidenceSource::PresentedChain { .. }
         ));
         live.add_peer(&replica).unwrap();
         let outbound = live.connect(&replica.id(), NORMAL).await.unwrap();
@@ -612,11 +750,17 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
         assert!(live_enroll.connect(replica.addr()).await.is_err());
         live.shutdown().await;
 
-        // Withdrawing one JWT does not revoke a node or an independent root
-        // registration. A different credential for the same key can replace it.
-        let mut request = EnrollmentIssueRequest::new(public(10), FLEET);
-        request.credential_id = Some("withdraw-10".into());
-        let withdrawn = issue_jwt(&key(1), &request, now()).unwrap().into_jwt();
+        // Withdrawing one credential does not revoke a node or an independent
+        // root registration. A different credential for the same key can
+        // replace it.
+        let issued = issue_credential(
+            &key(1),
+            &EnrollmentIssueRequest::new(public(10), FLEET, now() + 3600),
+            now(),
+        )
+        .unwrap();
+        let withdrawn_id = issued.credential_id().to_owned();
+        let withdrawn = issued.into_chain();
         let credential_node = node(10).await;
         let credential_enroll = enrollment(
             &credential_node,
@@ -632,7 +776,7 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
             .credential_id()
             .unwrap()
             .to_owned();
-        for id in ["withdraw-10".to_owned(), transition_id] {
+        for id in [withdrawn_id.clone(), transition_id] {
             let record = CredentialStatusV1 {
                 version: 1,
                 issuer: hex::encode(public(1)),
@@ -750,7 +894,7 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
             assert_eq!(sync(&fresh_enroll, second.addr()).await.peer, public(3));
             assert!(matches!(
                 replica_enroll.check_peer(&public(4)).await.unwrap().source,
-                AdmissionEvidenceSource::PresentedJwt
+                AdmissionEvidenceSource::PresentedChain { .. }
             ));
             fresh.shutdown().await;
         }

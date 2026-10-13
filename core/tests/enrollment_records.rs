@@ -55,42 +55,29 @@ async fn write(doc: &CoreDoc, record: &NodeRegistrationV1) {
     .await
     .unwrap();
 }
+/// A root-issued one-link chain with a fixed `jti`, signed raw so tests can
+/// publish a credential status for it.
 fn token() -> VerifiedAdmissionEvidence {
-    let c = EnrollmentClaimsV1 {
-        iss: hex::encode(root()),
-        sub: hex::encode(peer()),
-        aud: Audience::One("fleet".into()),
-        jti: "credential-1".into(),
-        iat: NOW - 60,
-        nbf: None,
-        exp: None,
-        cnf: Confirmation {
-            jwk: PublicConfirmationKey {
-                kty: "OKP".into(),
-                crv: "Ed25519".into(),
-                x: {
-                    use base64::Engine;
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(peer())
-                },
-            },
-        },
-        aster_enrollment_v1: EnrollmentExtensionV1 {
-            claims: AdmissionClaims {
-                scopes: Some(BTreeSet::from(["credential-only".into()])),
-                ..Default::default()
-            },
-            mandatory: vec![],
-        },
-    };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use ed25519_dalek::Signer;
+    let c = serde_json::json!({
+        "iss": hex::encode(root()),
+        "sub": hex::encode(peer()),
+        "aud": "fleet",
+        "jti": "credential-0000001",
+        "iat": NOW - 60,
+        "exp": NOW + 20 * 86_400,
+        "cnf": {"jwk": {"kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(peer())}},
+        "aster_enrollment_v1": {"scopes": ["credential-only"], "mandatory": []},
+    });
     let input = format!(
         "{}.{}",
         URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","typ":"aster-enrollment-v1+jwt"}"#),
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&c).unwrap())
     );
-    let jwt = format!(
-        "{}.{}",
+    let chain = format!(
+        "{}~{}.{}",
+        aster_transport_core::delegation::CHAIN_PREFIX,
         input,
         URL_SAFE_NO_PAD.encode(
             SigningKey::from_bytes(&[7; 32])
@@ -100,7 +87,7 @@ fn token() -> VerifiedAdmissionEvidence {
     );
     JwtEnrollmentVerifier::new(root(), "fleet")
         .unwrap()
-        .verify(&jwt, &peer(), NOW)
+        .verify(&chain, &peer(), NOW)
         .unwrap()
 }
 fn store(path: &std::path::Path, doc: &CoreDoc) -> EnrollmentPolicyStore {
@@ -151,7 +138,15 @@ async fn exact_root_ignores_spoofed_writer_and_pending_never_manufactures_eviden
             .select_evidence(&peer(), Some(&token()), NOW)
             .unwrap()
             .source(),
-        AdmissionEvidenceSource::PresentedJwt
+        AdmissionEvidenceSource::PresentedChain {
+            anchor: root(),
+            issuers: vec![root()],
+            digest: *blake3::Hasher::new()
+                .update(b"aster.chain.v1\0")
+                .update(token().presented_chain().unwrap().as_bytes())
+                .finalize()
+                .as_bytes(),
+        }
     );
     let bytes = serde_json::to_vec(&registration(1, NodeRegistrationStatus::Active)).unwrap();
     doc.doc
@@ -185,7 +180,8 @@ async fn exact_root_ignores_spoofed_writer_and_pending_never_manufactures_eviden
     );
     let e = store.select_evidence(&peer(), Some(&token()), NOW).unwrap();
     assert_eq!(e.credential_id(), None);
-    assert_eq!(e.original_jwt(), None);
+    assert_eq!(e.presented_chain(), None);
+    assert_eq!(e.registration(), None);
     assert_eq!(
         e.claims().attributes.as_ref().unwrap()["workers"],
         TypedAttribute::Int(8)
@@ -312,7 +308,7 @@ async fn credential_revoke_does_not_revoke_independent_registration_and_handler_
     let status = CredentialStatusV1 {
         version: 1,
         issuer: hex::encode(root()),
-        credential_id: "credential-1".into(),
+        credential_id: "credential-0000001".into(),
         revision: 1,
         issued_at: NOW - 1,
         revoked: true,
@@ -325,7 +321,9 @@ async fn credential_revoke_does_not_revoke_independent_registration_and_handler_
     )
     .await
     .unwrap();
-    s.refresh_credential(&doc, "credential-1").await.unwrap();
+    s.refresh_credential(&doc, "credential-0000001")
+        .await
+        .unwrap();
     let decision = admit(
         &token(),
         &s,
@@ -437,7 +435,7 @@ async fn credential_denial_restart_and_explicit_reauthorization_are_monotonic() 
     let mut status = CredentialStatusV1 {
         version: 1,
         issuer: hex::encode(root()),
-        credential_id: "credential-1".into(),
+        credential_id: "credential-0000001".into(),
         revision: 2,
         issued_at: NOW - 1,
         revoked: true,
@@ -450,7 +448,9 @@ async fn credential_denial_restart_and_explicit_reauthorization_are_monotonic() 
     )
     .await
     .unwrap();
-    s.refresh_credential(&doc, "credential-1").await.unwrap();
+    s.refresh_credential(&doc, "credential-0000001")
+        .await
+        .unwrap();
     drop(s);
     let s = store(&path.0, &doc);
     assert_eq!(
@@ -467,7 +467,7 @@ async fn credential_denial_restart_and_explicit_reauthorization_are_monotonic() 
     .await
     .unwrap();
     assert_eq!(
-        s.refresh_credential(&doc, "credential-1")
+        s.refresh_credential(&doc, "credential-0000001")
             .await
             .unwrap_err(),
         RecordError::StaleRevision
@@ -481,7 +481,7 @@ async fn credential_denial_restart_and_explicit_reauthorization_are_monotonic() 
     .await
     .unwrap();
     assert_eq!(
-        s.refresh_credential(&doc, "credential-1")
+        s.refresh_credential(&doc, "credential-0000001")
             .await
             .unwrap_err(),
         RecordError::ReauthorizationRequired
@@ -494,7 +494,9 @@ async fn credential_denial_restart_and_explicit_reauthorization_are_monotonic() 
     )
     .await
     .unwrap();
-    s.refresh_credential(&doc, "credential-1").await.unwrap();
+    s.refresh_credential(&doc, "credential-0000001")
+        .await
+        .unwrap();
     assert!(s.select_evidence(&peer(), Some(&token()), NOW).is_ok());
     node.close().await;
 }
@@ -653,7 +655,7 @@ async fn future_issued_credential_denial_is_not_dropped() {
     let status = CredentialStatusV1 {
         version: 1,
         issuer: hex::encode(root()),
-        credential_id: "credential-1".into(),
+        credential_id: "credential-0000001".into(),
         revision: 1,
         issued_at: NOW + 60,
         revoked: true,
@@ -666,7 +668,9 @@ async fn future_issued_credential_denial_is_not_dropped() {
     )
     .await
     .unwrap();
-    s.refresh_credential(&doc, "credential-1").await.unwrap();
+    s.refresh_credential(&doc, "credential-0000001")
+        .await
+        .unwrap();
     assert_eq!(
         s.denial(&token(), NOW),
         Some(DenialReason::CredentialRevoked)

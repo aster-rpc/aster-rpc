@@ -24,13 +24,13 @@ fn public(seed: u8) -> [u8; 32] {
     JwtEnrollmentIssuer::from_seed(&[seed; 32]).public_key()
 }
 fn token(seed: u8) -> String {
-    issue_jwt(
+    issue_credential(
         &key(1),
-        &EnrollmentIssueRequest::new(public(seed), FLEET),
+        &EnrollmentIssueRequest::new(public(seed), FLEET, now() + 3600),
         now(),
     )
     .unwrap()
-    .into_jwt()
+    .into_chain()
 }
 async fn node(seed: u8, hooks: bool) -> Node {
     let builder = AsterConfig::builder()

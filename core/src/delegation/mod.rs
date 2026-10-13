@@ -23,13 +23,14 @@ use std::fmt;
 pub use issue::{issue_action, issue_delegation, issue_enrollment, Validity};
 pub use links::{
     ActionGrant, AdmissionClaims, Audience, Confirmation, DelegationGrant, EnrollmentExtensionV1,
-    LinkKind, PublicConfirmationKey, TypedAttribute, ACTION_JWT_TYPE, DELEGATION_JWT_TYPE,
-    ENROLLMENT_LINK_TYPE,
+    LinkKind, PublicConfirmationKey, Registration, TypedAttribute, ACTION_JWT_TYPE,
+    DELEGATION_JWT_TYPE, ENROLLMENT_LINK_TYPE,
 };
 pub use rotation::{
     issue_root_rotation, next_root_commitment, verify_root_rotation, RootRotation, RootState,
     RotationReason, ROOT_ROTATION_JWT_TYPE,
 };
+pub(crate) use verify::{claimed_start, leaf_jti};
 pub use verify::{verify_chain, LeafClaims, VerifiedChain};
 
 pub const CHAIN_PREFIX: &str = "aster-chain-v1";
