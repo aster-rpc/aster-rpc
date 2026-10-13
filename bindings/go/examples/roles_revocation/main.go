@@ -9,14 +9,17 @@
 //   - The serving node admits only nodes holding a credential from the
 //     configured root, and the roles in each credential's aster.role claim
 //     are what Requires checks, on every call.
-//   - A session node whose credential carries "clipboard.read" reads the
-//     clipboard; a viewer whose credential carries no role is refused; a node
-//     with no credential cannot connect at all.
+//   - A session node whose credential carries "clipboard.read,clipboard.write"
+//     reads and writes the clipboard; a viewer whose credential carries no
+//     role is refused; a node with no credential cannot connect at all.
+//   - Mid-session, the API node restricts the session node to
+//     "clipboard.read" through a small control RPC (Control.RestrictRoles,
+//     itself gated by the roles.admin role from the API node's credential):
+//     the session node's next write is refused. The credential sets the
+//     maximum; runtime settings can only restrict, so the same RPC cannot
+//     grant the viewer a role.
 //   - The root revokes the session node (aster enroll revoke): the serving
 //     node closes its connections, and its next call is refused.
-//   - Secondary: roles that change mid-session without re-issuing a
-//     credential, through a small control RPC (Control.SetRoles, itself gated
-//     by the roles.admin role from the API node's credential).
 //
 // The root operations (keys, credentials, the revocation) are what the aster
 // CLI does; this self-contained demo plays the root in process with
@@ -52,67 +55,76 @@ type ReadReply struct{ Text string }
 
 func (ReadReply) AsterWireType() string { return "examples.roles/ReadReply" }
 
-type SetRolesRequest struct {
-	// Peer is the 64-hex node id whose runtime roles are replaced.
+type WriteRequest struct{ ClipboardID, Text string }
+
+func (WriteRequest) AsterWireType() string { return "examples.roles/WriteRequest" }
+
+type WriteReply struct{ Written int32 }
+
+func (WriteReply) AsterWireType() string { return "examples.roles/WriteReply" }
+
+type RestrictRolesRequest struct {
+	// Peer is the 64-hex node id whose credential roles are narrowed.
 	Peer string
-	// Roles is the complete comma-separated role set; "" revokes all.
+	// Roles is the comma-separated set the peer keeps (intersected with its
+	// credential roles); "" leaves it no roles.
 	Roles string
 }
 
-func (SetRolesRequest) AsterWireType() string { return "examples.roles/SetRolesRequest" }
+func (RestrictRolesRequest) AsterWireType() string { return "examples.roles/RestrictRolesRequest" }
 
-type SetRolesReply struct{ Roles string }
+type RestrictRolesReply struct{ Roles string }
 
-func (SetRolesReply) AsterWireType() string { return "examples.roles/SetRolesReply" }
+func (RestrictRolesReply) AsterWireType() string { return "examples.roles/RestrictRolesReply" }
 
 const (
-	RoleClipboardRead = "clipboard.read"
-	RoleAdmin         = "roles.admin"
-	audience          = "kasm-sessions"
+	RoleClipboardRead  = "clipboard.read"
+	RoleClipboardWrite = "clipboard.write"
+	RoleAdmin          = "roles.admin"
+	audience           = "kasm-sessions"
 )
 
 // ─── serving node ─────────────────────────────────────────────────────────
 
-// Services builds Clipboard (Read requires clipboard.read) and Control
-// (SetRoles requires roles.admin). srv is read when a handler runs (it is
-// set once StartServer returns).
+// Services builds Clipboard (Read requires clipboard.read, Write requires
+// clipboard.write) and Control (RestrictRoles requires roles.admin). srv is
+// read when a handler runs (it is set once StartServer returns).
 func Services(srv **aster.AsterServer) []*aster.Service {
 	clipboard := aster.NewService("Clipboard", 1,
 		aster.Unary("Read", func(ctx context.Context, r *ReadRequest) (*ReadReply, error) {
 			return &ReadReply{Text: "contents of " + r.ClipboardID}, nil
 		}, aster.Requires(aster.RequireRole(RoleClipboardRead))),
+		aster.Unary("Write", func(ctx context.Context, r *WriteRequest) (*WriteReply, error) {
+			return &WriteReply{Written: int32(len(r.Text))}, nil
+		}, aster.Requires(aster.RequireRole(RoleClipboardWrite))),
 	)
 	control := aster.NewService("Control", 1,
-		aster.Unary("SetRoles", func(ctx context.Context, r *SetRolesRequest) (*SetRolesReply, error) {
+		aster.Unary("RestrictRoles", func(ctx context.Context, r *RestrictRolesRequest) (*RestrictRolesReply, error) {
 			peer := strings.ToLower(strings.TrimSpace(r.Peer))
 			if len(peer) != 64 {
 				return nil, aster.NewRpcError(aster.StatusInvalidArgument, "peer must be a 64-hex node id")
 			}
-			roles := normalizeRoles(r.Roles)
-			attrs := map[string]string{}
-			if roles != "" {
-				attrs["aster.role"] = roles
+			roles := splitRoles(r.Roles)
+			// The credential sets the maximum; this can only narrow it. The
+			// restriction applies from the peer's next call and ends with its
+			// enrollment session. It fails when the peer has no live session.
+			if err := (*srv).RestrictPeerRoles(peer, roles); err != nil {
+				return nil, aster.NewRpcError(aster.StatusNotFound, "%v", err)
 			}
-			// Runtime roles (the escape hatch). Roles from a peer's
-			// credential win on a clash, so these apply to peers whose
-			// credentials carry no roles.
-			if err := (*srv).SetPeerAttributes(peer, attrs); err != nil {
-				return nil, err
-			}
-			return &SetRolesReply{Roles: roles}, nil
+			return &RestrictRolesReply{Roles: strings.Join(roles, ",")}, nil
 		}, aster.Requires(aster.RequireRole(RoleAdmin))),
 	)
 	return []*aster.Service{clipboard, control}
 }
 
-func normalizeRoles(s string) string {
-	var out []string
+func splitRoles(s string) []string {
+	out := []string{}
 	for r := range strings.SplitSeq(s, ",") {
 		if r = strings.TrimSpace(r); r != "" {
 			out = append(out, r)
 		}
 	}
-	return strings.Join(out, ",")
+	return out
 }
 
 // ─── the operator's files (what the aster CLI produces) ───────────────────
@@ -291,7 +303,7 @@ func Run(ctx context.Context, out io.Writer) error {
 		cl, err := aster.StartClient(ctx, f.clientConfig(key, cred))
 		return cl, id, err
 	}
-	session, sessID, err := start("session", RoleClipboardRead, true)
+	session, sessID, err := start("session", RoleClipboardRead+","+RoleClipboardWrite, true)
 	if err != nil {
 		return err
 	}
@@ -308,7 +320,7 @@ func Run(ctx context.Context, out io.Writer) error {
 	defer api.Close()
 	srvID, _ := srv.NodeID()
 	say("serving node %s (aster.toml, enrollment on)", short(srvID))
-	say("session node %s (credential roles: %s)", short(sessID), RoleClipboardRead)
+	say("session node %s (credential roles: %s,%s)", short(sessID), RoleClipboardRead, RoleClipboardWrite)
 	say("viewer node  %s (credential roles: none)", short(viewerID))
 
 	read := func(cl *aster.AsterClient) (*ReadReply, error) {
@@ -320,6 +332,16 @@ func Run(ctx context.Context, out io.Writer) error {
 		}
 		return aster.Call[ReadRequest, ReadReply](cctx, conn, "Clipboard", "Read", &ReadRequest{ClipboardID: "desk-7"})
 	}
+	write := func(cl *aster.AsterClient) error {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		conn, err := cl.Connect(cctx, server)
+		if err != nil {
+			return err
+		}
+		_, err = aster.Call[WriteRequest, WriteReply](cctx, conn, "Clipboard", "Write", &WriteRequest{ClipboardID: "desk-7", Text: "hello"})
+		return err
+	}
 	expectDenied := func(step string, err error) error {
 		if !errors.Is(err, aster.ErrRpcPermissionDenied) {
 			return fmt.Errorf("%s: want PERMISSION_DENIED, got %v", step, err)
@@ -328,12 +350,16 @@ func Run(ctx context.Context, out io.Writer) error {
 		return nil
 	}
 
-	say("\n1. the session node reads: its credential carries %s", RoleClipboardRead)
+	say("\n1. the session node reads and writes: its credential carries %s,%s", RoleClipboardRead, RoleClipboardWrite)
 	r, err := read(session)
 	if err != nil {
 		return fmt.Errorf("session read: %w", err)
 	}
-	say("   -> %q", r.Text)
+	say("   read  -> %q", r.Text)
+	if err := write(session); err != nil {
+		return fmt.Errorf("session write: %w", err)
+	}
+	say("   write -> ok")
 
 	say("\n2. the viewer reads: enrolled, but its credential carries no role")
 	_, err = read(viewer)
@@ -353,7 +379,38 @@ func Run(ctx context.Context, out io.Writer) error {
 		say("   -> refused at admission (%v)", firstLine(err))
 	}
 
-	say("\n4. the root revokes the session node (aster enroll revoke --peer <server>)")
+	say("\n4. mid-session, the API node (%s in its credential) restricts the session node to %s",
+		RoleAdmin, RoleClipboardRead)
+	conn, err := api.Connect(ctx, server)
+	if err != nil {
+		return err
+	}
+	restrict := func(peer, roles string) error {
+		_, err := aster.Call[RestrictRolesRequest, RestrictRolesReply](ctx, conn, "Control", "RestrictRoles",
+			&RestrictRolesRequest{Peer: peer, Roles: roles})
+		return err
+	}
+	if err := restrict(sessID, RoleClipboardRead); err != nil {
+		return fmt.Errorf("restrict: %w", err)
+	}
+	if r, err = read(session); err != nil {
+		return fmt.Errorf("session read after the restriction: %w", err)
+	}
+	say("   read  -> %q", r.Text)
+	err = write(session)
+	if err := expectDenied("session write after the restriction", err); err != nil {
+		return err
+	}
+	say("   a restriction cannot add a role: restricting the viewer to %s grants it nothing", RoleClipboardRead)
+	if err := restrict(viewerID, RoleClipboardRead); err != nil {
+		return fmt.Errorf("restrict the viewer: %w", err)
+	}
+	_, err = read(viewer)
+	if err := expectDenied("viewer read after a restriction", err); err != nil {
+		return err
+	}
+
+	say("\n5. the root revokes the session node (aster enroll revoke --peer <server>)")
 	err = f.revoke(ctx, server, sessID, func() error {
 		select {
 		case rev := <-revocations:
@@ -367,7 +424,7 @@ func Run(ctx context.Context, out io.Writer) error {
 		return fmt.Errorf("revoke: %w", err)
 	}
 
-	say("\n5. the session node's next call")
+	say("\n6. the session node's next call")
 	if _, err := read(session); err == nil {
 		return errors.New("a revoked node's call succeeded")
 	} else {
@@ -380,30 +437,6 @@ func Run(ctx context.Context, out io.Writer) error {
 	}
 	say("   -> and it cannot come back: the revocation is the root's, durable on the serving node")
 
-	say("\n6. mid-session change without a new credential: the API node (%s in its credential) grants the viewer %s",
-		RoleAdmin, RoleClipboardRead)
-	conn, err := api.Connect(ctx, server)
-	if err != nil {
-		return err
-	}
-	setRoles := func(roles string) error {
-		_, err := aster.Call[SetRolesRequest, SetRolesReply](ctx, conn, "Control", "SetRoles", &SetRolesRequest{Peer: viewerID, Roles: roles})
-		return err
-	}
-	if err := setRoles(RoleClipboardRead); err != nil {
-		return fmt.Errorf("grant: %w", err)
-	}
-	if r, err = read(viewer); err != nil {
-		return fmt.Errorf("viewer read after the grant: %w", err)
-	}
-	say("   viewer read -> %q", r.Text)
-	if err := setRoles(""); err != nil {
-		return fmt.Errorf("revoke runtime roles: %w", err)
-	}
-	_, err = read(viewer)
-	if err := expectDenied("viewer read after the runtime revoke", err); err != nil {
-		return err
-	}
 	say("\nOK")
 	return nil
 }

@@ -379,6 +379,19 @@ func (d *dispatchServer) setPeerAttributes(peer string, kv []byte) error {
 	return statusError(C.aster_server_set_peer_attributes(d.handle, p, pn, k, kn))
 }
 
+func (d *dispatchServer) restrictPeerRoles(peer, roles string) error {
+	pp, rr := []byte(peer), []byte(roles)
+	p, pn := cBytesArg(pp)
+	r, rn := cBytesArg(rr)
+	return statusError(C.aster_server_restrict_peer_roles(d.handle, p, pn, r, rn))
+}
+
+func (d *dispatchServer) clearPeerRestriction(peer string) error {
+	pp := []byte(peer)
+	p, pn := cBytesArg(pp)
+	return statusError(C.aster_server_clear_peer_restriction(d.handle, p, pn))
+}
+
 func (d *dispatchServer) liveCalls() uint64 {
 	return uint64(C.aster_server_live_calls(d.handle))
 }

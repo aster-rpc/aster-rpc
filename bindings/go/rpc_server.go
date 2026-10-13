@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -301,9 +302,15 @@ func (s *AsterServer) Ticket(ctx context.Context) (string, error) {
 
 // SetPeerAttributes sets the attributes Gate 3 checks Requires against for
 // calls from peer (64-hex node id), and that handlers see in
-// CallInfo.Attributes. Empty or nil clears them. An escape hatch for roles
-// decided at runtime: with enrollment configured, roles come from each
-// peer's credential ([enrollment.roles]) and win on a key clash.
+// CallInfo.Attributes. Empty or nil clears them.
+//
+// With enrollment configured, the credential sets the maximum and runtime
+// settings can only restrict: a peer with a live enrollment session takes
+// its roles from its credential ([enrollment.roles]), so setting aster.role
+// for it fails with INVALID_ARGUMENT (narrow it with RestrictPeerRoles);
+// other keys apply, and the credential's attributes win on a clash. For a
+// peer without a session (no enrollment, or a custom gate) these attributes,
+// aster.role included, apply as given.
 func (s *AsterServer) SetPeerAttributes(peer string, attributes map[string]string) error {
 	entries := make([]MetadataEntry, 0, len(attributes))
 	for k, v := range attributes {
@@ -311,6 +318,23 @@ func (s *AsterServer) SetPeerAttributes(peer string, attributes map[string]strin
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
 	return s.ds.setPeerAttributes(peer, encodeKV(entries))
+}
+
+// RestrictPeerRoles narrows an enrolled peer's roles to roles intersected
+// with its credential roles, from its next call (calls in flight are not
+// interrupted). A role the credential lacks is never granted; an empty
+// roles list refuses every role-gated call. It replaces an earlier
+// restriction, survives renewals of the same credential subject, and ends
+// with the peer's enrollment session (revocation, eviction, expiry). Fails
+// with NOT_FOUND when peer has no live enrollment session.
+func (s *AsterServer) RestrictPeerRoles(peer string, roles []string) error {
+	return s.ds.restrictPeerRoles(peer, strings.Join(roles, ","))
+}
+
+// ClearPeerRestriction removes peer's role restriction; its credential
+// roles apply again from its next call.
+func (s *AsterServer) ClearPeerRestriction(peer string) error {
+	return s.ds.clearPeerRestriction(peer)
 }
 
 // LiveCalls is the number of calls in Rust's call table (diagnostics).

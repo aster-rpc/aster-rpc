@@ -123,8 +123,9 @@ major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment from c
   deadline. Session-scoped services: `NewSessionService(name, v, factory,
   ...)`, instance via `Session[T](ctx)`, closed (`io.Closer`) when the
   session ends. With Enrollment, Gate 3 sees the roles in each peer's
-  credential; `SetPeerAttributes` (attribute bridge) is the escape hatch for
-  roles decided at runtime. `CallInfo.Attributes` / `Metadata` are read lazily
+  credential, and runtime code can only narrow them
+  (`RestrictPeerRoles` / `ClearPeerRestriction`); `SetPeerAttributes`
+  (attribute bridge) sets roles for peers without an enrollment session. `CallInfo.Attributes` / `Metadata` are read lazily
   from Rust. `ServerOptions.LeaseGrantor` serves `aster.lease.Grantor` (see
   "Lease grantor").
   `OnConnectionClosed`, `OnNonRPC` (accepted non-`aster/1` ALPN connections,
@@ -687,8 +688,21 @@ conn, err := client.ConnectTicket(ctx, serverAddress) // enrolls first
   (side, trusted root, own credential, renewing, issuer), `Credential`,
   `PeerClaims(peer)` (verified evidence, for audit), `CheckPeer(ctx, peer)`
   before a sensitive operation (`*AdmissionError`), `NextRevocation(ctx)` for
-  per-peer application state. `srv.SetPeerAttributes` remains for roles that
-  change at runtime; roles from a credential win on a clash.
+  per-peer application state.
+- **Runtime role changes: the credential sets the maximum; runtime settings
+  can only restrict.** For a peer with a live enrollment session, effective
+  roles = credential roles ∩ `srv.RestrictPeerRoles(peer, roles)` (credential
+  roles when no restriction is set). A restriction applies from the peer's
+  next call (calls in flight finish), can go down to no roles, never adds a
+  role the credential lacks, survives renewals of the same subject, and ends
+  with the session (revocation, eviction, expiry);
+  `srv.ClearPeerRestriction(peer)` restores the credential roles. Without a
+  live session `RestrictPeerRoles` fails with `NOT_FOUND`.
+  `srv.SetPeerAttributes` with `aster.role` for an enrolled peer fails with
+  `INVALID_ARGUMENT`; other keys still apply (the credential's attributes
+  win on a clash). Peers without a session (no enrollment, a custom gate)
+  keep runtime-granted roles exactly as before. This replaces the earlier
+  rule where runtime roles were merged under the credential's.
 
 | `AsterConfig` field | TOML | Env |
 |---|---|---|

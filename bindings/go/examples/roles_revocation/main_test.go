@@ -9,10 +9,11 @@ import (
 	"time"
 )
 
-// TestRolesGrantAndRevoke runs the example end to end: grant, self-grant
-// refused, revoke applies from the next call, the in-flight call completes,
-// and the API node's own grant is protected.
-func TestRolesGrantAndRevoke(t *testing.T) {
+// TestRolesRestrictAndRevoke runs the example end to end: credential roles
+// gate calls, a mid-session restriction refuses the session node's next
+// write and cannot grant the viewer a role, and the root's revocation closes
+// the session node out.
+func TestRolesRestrictAndRevoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	var out strings.Builder

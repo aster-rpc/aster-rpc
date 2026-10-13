@@ -146,6 +146,50 @@ func addrOf(t *testing.T, n *Node) NodeAddr {
 	}
 }
 
+// The credential sets the maximum; runtime settings can only restrict. A
+// credential granting ops.status,ops.logs restricted to ops.status refuses
+// logs on the next call; SetPeerAttributes cannot grant an enrolled peer a
+// role; clearing restores the credential roles; a peer without a session
+// cannot be restricted.
+func TestEnrollment_RuntimeRestrictionRefusesTheNextCall(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	srv, server := startOps(t, ctx, ServerOptions{Config: serverCfg(t, t.TempDir())})
+	client := startClient(t, ctx, enrolledCfg(5, credentialFor(t, 5, "ops.status,ops.logs")))
+	peer := enrollPub(5)
+	if roles, err := opsCall(ctx, client, server, "logs"); err != nil || roles != "ops.logs,ops.status" {
+		t.Fatalf("logs before the restriction: %q %v", roles, err)
+	}
+
+	if err := srv.RestrictPeerRoles(peer, []string{"ops.status"}); err != nil {
+		t.Fatal(err)
+	}
+	if roles, err := opsCall(ctx, client, server, "status"); err != nil || roles != "ops.status" {
+		t.Fatalf("status after the restriction: %q %v", roles, err)
+	}
+	if _, err := opsCall(ctx, client, server, "logs"); !errors.Is(err, ErrRpcPermissionDenied) {
+		t.Fatalf("logs after the restriction: want PERMISSION_DENIED, got %v", err)
+	}
+
+	err := srv.SetPeerAttributes(peer, map[string]string{"aster.role": "ops.admin"})
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("a runtime role grant to an enrolled peer: want INVALID_ARGUMENT, got %v", err)
+	}
+	if _, err := opsCall(ctx, client, server, "logs"); !errors.Is(err, ErrRpcPermissionDenied) {
+		t.Fatalf("logs after the refused grant: want PERMISSION_DENIED, got %v", err)
+	}
+
+	if err := srv.ClearPeerRestriction(peer); err != nil {
+		t.Fatal(err)
+	}
+	if roles, err := opsCall(ctx, client, server, "logs"); err != nil || roles != "ops.logs,ops.status" {
+		t.Fatalf("logs after clearing: %q %v", roles, err)
+	}
+	if err := srv.RestrictPeerRoles(enrollPub(9), nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("restricting a peer without a session: want NOT_FOUND, got %v", err)
+	}
+}
+
 // The roles in a client's credential are what Requires checks, with no
 // application code; a credential without the role is refused, and a node
 // with no credential cannot reach the service. A revocation the root
