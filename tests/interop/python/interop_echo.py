@@ -478,7 +478,7 @@ async def _wait_stdin_eof() -> None:
 
 async def serve() -> None:
     config = AsterConfig.from_env().replace(relay_mode="disabled", bind_addr="127.0.0.1:0")
-    srv = AsterServer(services=[InteropEcho(), InteropSession], config=config, allow_all_consumers=True)
+    srv = AsterServer(services=[InteropEcho(), InteropSession], config=config)
     try:
         await srv.start()
         for _ in range(100):

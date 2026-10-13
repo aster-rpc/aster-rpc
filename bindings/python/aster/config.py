@@ -22,7 +22,12 @@ TOML example (``aster.toml``)::
 
     [trust]
     root_pubkey_file = "~/.aster/root.pub"
-    allow_all_consumers = false
+    enrollment_credential = "server.cred"   # `aster enroll node --out`
+
+    [enrollment]                            # see EnrollmentConfig
+    audience = "mission-control"
+    fleet_namespace = "<64 hex>"            # `aster enroll namespace create`
+    state_path = "/var/lib/aster/enrollment.json"
 
     [storage]
     path = "/var/lib/aster"          # omit for in-memory
@@ -39,6 +44,15 @@ TOML example (``aster.toml``)::
 
     [identity]
     file = "~/.aster/.aster-identity"   # credential file (peers, enrollment)
+
+Enrollment: a configuration that sets an ``[enrollment]`` audience, fleet
+namespace or issuer delegation, or a credential (``enrollment_credential_file``
+/ ``enrollment_credential_chain``), switches Enrollment on for
+:class:`aster.AsterServer` and :class:`aster.AsterClient`; ``[enrollment]
+enabled`` forces it on or off. Once on, every value is validated before the
+node starts and any problem raises ``ValueError`` naming the setting: nothing
+falls back to an open node. Without it a node is open (Gate 0 admits every
+peer).
 
 Identity: the node key lives in a **secret key file** (``secret_key_file``):
 32 bytes as 64 hex characters, shared with the Rust SDK and every binding. It
@@ -64,11 +78,14 @@ from ._aster import NativeAsterConfig, PublicKey, SecretKey
 _config_logger = logging.getLogger(__name__)
 
 # Sensitive fields whose values are masked in print_config output.
-_MASKED_FIELDS = frozenset({"secret_key", "enrollment_credential_file"})
+_MASKED_FIELDS = frozenset(
+    {"secret_key", "enrollment_credential_file", "enrollment_credential_chain"}
+)
 
 # Env var spellings that are not simply ``ASTER_<FIELD>``.
 _ENV_OVERRIDES = {
     "enrollment_credential_file": "ASTER_ENROLLMENT_CREDENTIAL",
+    "enrollment": "ASTER_ENROLLMENT_*",
     "storage_path": "ASTER_STORAGE_PATH",
     "log_format": "ASTER_LOG_FORMAT",
     "log_level": "ASTER_LOG_LEVEL",
@@ -85,10 +102,12 @@ def _env_var(name: str) -> str | None:
 
 def _toml_section(name: str) -> str:
     if name in (
-        "root_pubkey", "root_pubkey_file", "enrollment_credential_file",
-        "enrollment_credential_iid", "allow_all_consumers", "allow_all_producers",
+        "root_pubkey", "root_pubkey_file", "next_root_commitment", "root_seq",
+        "root_rotations", "enrollment_credential_file", "enrollment_credential_chain",
     ):
         return "[trust]"
+    if name == "enrollment":
+        return "[enrollment]"
     if name == "endpoint_addr":
         return "[connect]"
     if name in ("storage_path", "gc_interval_ms"):
@@ -123,6 +142,145 @@ def _path_or_none(value: Any) -> str | None:
 
 
 @dataclass(frozen=True)
+class EnrollmentLimits:
+    """``[enrollment.limits]``: overrides of the Enrollment defaults (``None``
+    keeps the default). Env ``ASTER_ENROLLMENT_<FIELD>`` upper-cased."""
+
+    handshake_timeout_ms: int | None = None
+    step_timeout_ms: int | None = None
+    policy_timeout_ms: int | None = None
+    reconciliation_interval_ms: int | None = None
+    max_admitted_peers: int | None = None
+    sync_timeout_ms: int | None = None
+    """Bound on enrolling with and synchronizing from a replica (default 15000)."""
+
+
+@dataclass(frozen=True)
+class RoleMappingConfig:
+    """``[enrollment.roles]``: how a peer's verified claims become the roles
+    ``requires=`` checks.
+
+    Roles = the comma-separated value of the string claim attribute
+    ``attribute`` (default ``aster.role``; ``""`` disables it), plus every
+    verified scope when ``scopes_as_roles``, plus the roles ``scopes`` and
+    ``tags`` map each verified scope or tag to. With ``include_attributes``
+    the other claim attributes reach handlers too (never ``aster.role``,
+    which only the mapping assigns). Evaluated per call, so revocation and
+    renewal apply to the next call.
+    """
+
+    attribute: str = "aster.role"
+    """Claim attribute listing roles (``ASTER_ENROLLMENT_ROLE_ATTRIBUTE``)."""
+    scopes_as_roles: bool = False
+    """Each verified scope is also a role (``ASTER_ENROLLMENT_SCOPES_AS_ROLES``)."""
+    scopes: Mapping[str, tuple[str, ...]] = dc_field(default_factory=dict)
+    """Scope -> roles (``[enrollment.roles.scopes]``)."""
+    tags: Mapping[str, tuple[str, ...]] = dc_field(default_factory=dict)
+    """Tag -> roles (``[enrollment.roles.tags]``)."""
+    include_attributes: bool = True
+    """Pass the other claim attributes through (``ASTER_ENROLLMENT_INCLUDE_ATTRIBUTES``)."""
+
+
+@dataclass(frozen=True)
+class EnrollmentConfig:
+    """The ``[enrollment]`` section (Rust ``aster::EnrollmentConfig``).
+
+    The trusted root and this node's credential live in ``[trust]``
+    (:attr:`AsterConfig.root_pubkey` / ``root_pubkey_file``,
+    ``enrollment_credential_file`` / ``enrollment_credential_chain``, and the
+    rotation pin). Field names, TOML keys and ``ASTER_ENROLLMENT_*``
+    variables match Rust exactly.
+    """
+
+    enabled: bool | None = None
+    """Force on/off; ``None`` enables when an audience, fleet namespace,
+    issuer delegation or credential is set (``ASTER_ENROLLMENT_ENABLED``)."""
+    audience: str | None = None
+    """Fleet audience. Required (``ASTER_ENROLLMENT_AUDIENCE``)."""
+    fleet_namespace: str | None = None
+    """Fleet policy namespace, 64 hex. Required (``ASTER_ENROLLMENT_FLEET_NAMESPACE``)."""
+    state_path: str | None = None
+    """Durable denials/watermarks; default ``<storage_path>/enrollment.json``.
+    A server needs one of the two (``ASTER_ENROLLMENT_STATE_PATH``)."""
+    replicas: tuple[str, ...] = ()
+    """``aster1...`` tickets or node ids of policy replicas (``ASTER_ENROLLMENT_REPLICAS``)."""
+    policy: Any = None
+    """Admission policy tree (``PolicyConfig``): ``"tolerate_stale_policy"``
+    (default), ``{"all_of": [{"scope": "ops"}, "tolerate_stale_policy"]}``, ...
+    (``ASTER_ENROLLMENT_POLICY`` as JSON)."""
+    require_synchronized_clock: bool = False
+    """Refuse to start on an unsynchronized clock (Linux)."""
+    activation_leeway_secs: int | None = None
+    """``iat``/``nbf`` leeway, 0-300 (default 60)."""
+    limits: EnrollmentLimits = dc_field(default_factory=EnrollmentLimits)
+    roles: RoleMappingConfig = dc_field(default_factory=RoleMappingConfig)
+    issuer_delegation_file: str | None = None
+    """Server only: run a delegated issuer serving renewals
+    (``[enrollment.issuer] delegation_file``)."""
+    issuer_lifetime_secs: int | None = None
+    """Lifetime of issued credentials (``[enrollment.issuer] lifetime``; default 24 h)."""
+    renew_from: str | None = None
+    """Issuer to renew this node's credential from (ticket or node id)."""
+    renew: bool | None = None
+    """``False`` disables renewal; ``None`` renews when an issuer is known."""
+    synchronize: bool | None = None
+    """Client: synchronize the fleet namespace the server offers (default on)."""
+
+    def __post_init__(self) -> None:
+        limits = self.limits
+        if isinstance(limits, Mapping):
+            limits = EnrollmentLimits(**limits)
+        roles = self.roles
+        if isinstance(roles, Mapping):
+            roles = RoleMappingConfig(**roles)
+        object.__setattr__(self, "limits", limits)
+        object.__setattr__(self, "roles", roles)
+        if isinstance(self.replicas, str):
+            object.__setattr__(self, "replicas", (self.replicas,))
+        else:
+            object.__setattr__(self, "replicas", tuple(self.replicas or ()))
+        if self.state_path is not None:
+            object.__setattr__(self, "state_path", os.fspath(self.state_path))
+        if self.issuer_delegation_file is not None:
+            object.__setattr__(
+                self, "issuer_delegation_file", os.fspath(self.issuer_delegation_file)
+            )
+
+    def _to_native(self) -> dict[str, Any]:
+        out = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+        out["replicas"] = list(self.replicas)
+        out["policy"] = None if self.policy is None else _json.dumps(self.policy)
+        out["limits"] = dataclasses.asdict(self.limits)
+        out["roles"] = {
+            "attribute": self.roles.attribute,
+            "scopes_as_roles": self.roles.scopes_as_roles,
+            "scopes": {k: _role_list(v) for k, v in dict(self.roles.scopes).items()},
+            "tags": {k: _role_list(v) for k, v in dict(self.roles.tags).items()},
+            "include_attributes": self.roles.include_attributes,
+        }
+        return out
+
+    @classmethod
+    def _from_native(cls, d: Mapping[str, Any]) -> "EnrollmentConfig":
+        d = dict(d)
+        d["replicas"] = tuple(d.get("replicas") or ())
+        policy = d.get("policy")
+        d["policy"] = None if policy is None else _json.loads(policy)
+        d["limits"] = EnrollmentLimits(**d["limits"])
+        roles = dict(d["roles"])
+        roles["scopes"] = {k: tuple(v) for k, v in roles["scopes"].items()}
+        roles["tags"] = {k: tuple(v) for k, v in roles["tags"].items()}
+        d["roles"] = RoleMappingConfig(**roles)
+        return cls(**d)
+
+
+def _role_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [r.strip() for r in value.split(",") if r.strip()]
+    return [str(r).strip() for r in value if str(r).strip()]
+
+
+@dataclass(frozen=True)
 class AsterConfig:
     """Node, trust, storage and logging configuration (frozen).
 
@@ -144,14 +302,21 @@ class AsterConfig:
     """32-byte Ed25519 root public key (accepts ``PublicKey`` / hex too)."""
     root_pubkey_file: str | None = None
     """File holding the root public key (hex, or JSON ``{"public_key": ...}``)."""
+    next_root_commitment: str | None = None
+    """Root rotation pin, 64 hex (``ASTER_NEXT_ROOT_COMMITMENT``). Without it
+    every rotation statement is refused."""
+    root_seq: int = 0
+    """Rotations applied to reach the root (``ASTER_ROOT_SEQ``)."""
+    root_rotations: tuple[str, ...] = ()
+    """Applied rotation statements, oldest first (``ASTER_ROOT_ROTATIONS``,
+    comma-separated); requires ``next_root_commitment``."""
     enrollment_credential_file: str | None = None
-    """Enrollment credential presented during admission."""
-    enrollment_credential_iid: str | None = None
-    """Cloud instance identity document token (``ASTER_ENROLLMENT_CREDENTIAL_IID``)."""
-    allow_all_consumers: bool = False
-    """Skip the consumer admission gate."""
-    allow_all_producers: bool = True
-    """Schema parity with Rust; the Python binding only supports ``True``."""
+    """This node's enrollment credential chain file (``aster enroll node
+    --out``); TOML ``[trust] enrollment_credential``, env
+    ``ASTER_ENROLLMENT_CREDENTIAL``. Setting it enables enrollment."""
+    enrollment_credential_chain: str | None = dc_field(default=None, repr=False)
+    """The credential chain inline; wins over the file
+    (``ASTER_ENROLLMENT_CREDENTIAL_CHAIN``)."""
 
     # -- Connect -------------------------------------------------------------
     endpoint_addr: str | None = None
@@ -217,6 +382,10 @@ class AsterConfig:
     # -- Extra inbound ALPNs (code only) --------------------------------------
     alpns: tuple[bytes, ...] = ()
 
+    # -- Enrollment ([enrollment]) ----------------------------------------------
+    enrollment: EnrollmentConfig = dc_field(default_factory=EnrollmentConfig)
+    """The ``[enrollment]`` section; also accepts a dict of its fields."""
+
     # -- Internal -------------------------------------------------------------
     _sources: Mapping[str, str] = dc_field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -238,14 +407,29 @@ class AsterConfig:
         if raw["relay_urls"] and (raw["relay_mode"] or "default") == "default":
             raw["relay_mode"] = None
         raw["alpns"] = [a.encode() if isinstance(a, str) else bytes(a) for a in (raw["alpns"] or ())]
+        if isinstance(raw["root_rotations"], str):
+            raw["root_rotations"] = [raw["root_rotations"]]
+        raw["root_rotations"] = list(raw["root_rotations"] or ())
+        enrollment = raw["enrollment"]
+        if enrollment is None:
+            enrollment = EnrollmentConfig()
+        elif isinstance(enrollment, Mapping):
+            enrollment = EnrollmentConfig(**enrollment)
+        elif not isinstance(enrollment, EnrollmentConfig):
+            raise TypeError(
+                f"enrollment: expected EnrollmentConfig or dict, got {type(enrollment).__name__}"
+            )
+        raw["enrollment"] = enrollment._to_native()
         native = NativeAsterConfig(**raw)
         self._adopt(native)
 
     def _adopt(self, native: NativeAsterConfig) -> None:
         """Set every field to the canonical value of the Rust config."""
         for name, value in native.to_dict().items():
-            if name in ("relay_urls", "alpns"):
+            if name in ("relay_urls", "alpns", "root_rotations"):
                 value = tuple(value)
+            elif name == "enrollment":
+                value = EnrollmentConfig._from_native(value)
             object.__setattr__(self, name, value)
         object.__setattr__(self, "_native_cfg", native)
 
@@ -311,6 +495,14 @@ class AsterConfig:
     # -- Resolution helpers (all Rust) -------------------------------------------
 
     @property
+    def is_enrollment_enabled(self) -> bool:
+        """Whether this configuration switches Enrollment on (Rust
+        ``AsterConfig::is_enrollment_enabled``): ``enrollment.enabled`` when
+        set, else whether an audience, fleet namespace, issuer delegation or
+        credential is configured. The root key alone does not."""
+        return self._native().is_enrollment_enabled()
+
+    @property
     def is_persistent(self) -> bool:
         """Whether ``storage_path`` selects a persistent node."""
         return self.storage_path is not None
@@ -367,7 +559,7 @@ class AsterConfig:
         """Render the resolved configuration with provenance and masking.
 
         Sensitive fields (``secret_key``, ``enrollment_credential_file``,
-        ``enrollment_credential_iid``) are masked. Returns the rendered text
+        ``enrollment_credential_chain``) are masked. Returns the rendered text
         (also printed to stdout).
         """
         def _or(value: Any, default: str) -> Any:
@@ -377,10 +569,19 @@ class AsterConfig:
             "trust": [
                 ("root_pubkey", self._fmt_bytes(self.root_pubkey, mask=False)),
                 ("root_pubkey_file", self.root_pubkey_file or "<not set>"),
+                ("next_root_commitment", self.next_root_commitment or "<not set>"),
+                ("root_seq", self.root_seq),
                 ("enrollment_credential_file", self._fmt_masked(self.enrollment_credential_file)),
-                ("enrollment_credential_iid", self._fmt_masked(self.enrollment_credential_iid)),
-                ("allow_all_consumers", self.allow_all_consumers),
-                ("allow_all_producers", self.allow_all_producers),
+                ("enrollment_credential_chain", self._fmt_masked(self.enrollment_credential_chain)),
+            ],
+            "enrollment": [
+                ("enabled", self.is_enrollment_enabled),
+                ("audience", self.enrollment.audience or "<not set>"),
+                ("fleet_namespace", self.enrollment.fleet_namespace or "<not set>"),
+                ("state_path", self.enrollment.state_path or "<default>"),
+                ("replicas", ", ".join(self.enrollment.replicas) or "<none>"),
+                ("issuer_delegation_file", self.enrollment.issuer_delegation_file or "<not set>"),
+                ("renew_from", self.enrollment.renew_from or "<not set>"),
             ],
             "connect": [
                 ("endpoint_addr", self.endpoint_addr or "<not set>"),
@@ -408,8 +609,14 @@ class AsterConfig:
             ],
         }
         source_key = {"path": "storage_path"}
+        enrollment_keys = {
+            "enabled", "audience", "fleet_namespace", "state_path", "replicas",
+            "issuer_delegation_file", "renew_from",
+        }
 
         def _source(name: str) -> str:
+            if name in enrollment_keys:
+                return self._sources.get("enrollment", "default")
             return self._sources.get(source_key.get(name, name), "default")
 
         if json:
@@ -476,4 +683,4 @@ def _load_identity_file(
     return (key.to_bytes() if key is not None else None), peer
 
 
-__all__ = ["AsterConfig"]
+__all__ = ["AsterConfig", "EnrollmentConfig", "EnrollmentLimits", "RoleMappingConfig"]

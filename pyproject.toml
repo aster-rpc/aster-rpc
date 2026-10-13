@@ -21,9 +21,6 @@ dependencies = [
     "uvloop>=0.19; sys_platform != 'win32'",
 ]
 
-[project.optional-dependencies]
-iid = ["PyJWT>=2.8"]
-
 [tool.maturin]
 module-name    = "aster._aster"
 manifest-path  = "bindings/python/rust/Cargo.toml"
@@ -34,7 +31,13 @@ python-source  = "bindings/python"
 # at the project root. PyPI's PEP 639 check rejects sdists where the
 # declared license-file is not actually in the tarball, so we have to
 # explicitly include LICENSE in both wheel and sdist artifacts.
-include        = ["LICENSE", "VERSION", "BUILD_NUMBER"]
+include        = [
+    "LICENSE",
+    "VERSION",
+    "BUILD_NUMBER",
+    # Release notes ship with the sdist (PyPI shows them from there).
+    { path = "bindings/python/CHANGELOG.md", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

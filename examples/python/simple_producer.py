@@ -13,18 +13,22 @@ or an ``aster.toml`` file.
   # Terminal 2 (copy the ASTER_ENDPOINT_ADDR from the output above)
   ASTER_ENDPOINT_ADDR=<printed> python simple_consumer.py
 
---- Production mode ---
+--- Production mode (Enrollment, files from the `aster` CLI) ---
 
-  # 1. Generate root keypair (operator's machine):
-  aster keygen root --out root.key
+  # 1. Operator: root key, fleet namespace, the producer's key + credential:
+  aster key root generate
+  ROOT=$(aster key root show --json | jq -r .root_pubkey)
+  FLEET=$(aster enroll namespace create --out-secret fleet.secret --json | jq -r .namespace)
+  SERVER=$(aster key node generate --out server.key --json | jq -r .node_id)
+  aster enroll node --subject $SERVER --audience hello --out server.cred
 
-  # 2. Run producer with root public key:
-  ASTER_ROOT_PUBKEY_FILE=root_pub.key python simple_producer.py
+  # 2. Run the producer with enrollment configured:
+  ASTER_ROOT_PUBKEY=$ROOT ASTER_ENROLLMENT_AUDIENCE=hello \\
+  ASTER_ENROLLMENT_FLEET_NAMESPACE=$FLEET ASTER_SECRET_KEY_FILE=server.key \\
+  ASTER_ENROLLMENT_CREDENTIAL=server.cred \\
+  ASTER_ENROLLMENT_STATE_PATH=./hello-enrollment.json python simple_producer.py
 
-  # 3. Mint consumer credential and run consumer:
-  aster trust sign --root-key root.key --type consumer --out consumer.token
-  ASTER_ENDPOINT_ADDR=<printed> ASTER_ENROLLMENT_CREDENTIAL=consumer.token \\
-    python simple_consumer.py
+  # 3. Issue the consumer a credential and run it (see simple_consumer.py).
 """
 from __future__ import annotations
 

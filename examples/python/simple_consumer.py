@@ -9,7 +9,7 @@ config file via :class:`AsterConfig`).
 
 ─── Dev mode (no credentials) ──────────────────────────────────────────────
 
-  Start simple_producer.py (which auto-opens the consumer gate in dev mode):
+  Start simple_producer.py without enrollment configured (an open server):
 
     # Terminal 1
     python simple_producer.py
@@ -17,22 +17,30 @@ config file via :class:`AsterConfig`).
     # Terminal 2
     ASTER_ENDPOINT_ADDR=<printed by producer> python simple_consumer.py
 
-─── Production mode (with enrollment credential) ──────────────────────────
+─── Production mode (Enrollment) ───────────────────────────────────────────
 
-    # Operator mints a consumer credential offline:
-    aster authorize consumer --root-key root.key --type policy --out consumer.token
+    # Operator (the `aster` CLI), once the producer runs with enrollment
+    # (see simple_producer.py):
+    CLIENT=$(aster key node generate --out client.key --json | jq -r .node_id)
+    aster enroll node --subject $CLIENT --audience hello --out client.cred
 
     # Consumer:
     ASTER_ENDPOINT_ADDR=<producer addr> \\
-    ASTER_ENROLLMENT_CREDENTIAL=consumer.token \\
+    ASTER_ROOT_PUBKEY=$ROOT \\
+    ASTER_ENROLLMENT_AUDIENCE=hello \\
+    ASTER_ENROLLMENT_FLEET_NAMESPACE=$FLEET \\
+    ASTER_SECRET_KEY_FILE=client.key \\
+    ASTER_ENROLLMENT_CREDENTIAL=client.cred \\
     python simple_consumer.py
 
 Environment variables:
-  ASTER_ENDPOINT_ADDR             Producer's endpoint address (required).
-  ASTER_ENROLLMENT_CREDENTIAL     Path to pre-signed enrollment token (production).
-  ASTER_ENROLLMENT_CREDENTIAL_IID Cloud IID token (when credential requires IID).
-  ASTER_SECRET_KEY                Base64 node identity key (for stable EndpointId).
-  ASTER_HELLO_NAME                Name to greet (default: "World").
+  ASTER_ENDPOINT_ADDR               Producer's endpoint address (required).
+  ASTER_ROOT_PUBKEY                 Root public key (enrollment).
+  ASTER_ENROLLMENT_AUDIENCE         Fleet audience (enrollment).
+  ASTER_ENROLLMENT_FLEET_NAMESPACE  Fleet policy namespace (enrollment).
+  ASTER_ENROLLMENT_CREDENTIAL       This node's credential (aster enroll node --out).
+  ASTER_SECRET_KEY_FILE             The node key the credential was issued for.
+  ASTER_HELLO_NAME                  Name to greet (default: "World").
 """
 from __future__ import annotations
 

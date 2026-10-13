@@ -14,7 +14,6 @@ import time
 import pytest
 
 from aster import (
-    ALPN_CONSUMER_ADMISSION,
     ALPN_DELEGATED_ADMISSION,
     ALPN_PRODUCER_ADMISSION,
     AsterConfig,
@@ -40,11 +39,7 @@ APP_ALPN = b"test/gate0/1"
 def test_default_policy_is_protected_with_admission_alpns_open():
     gate = GatePolicy()
     assert gate.trust_mode == TrustMode.PROTECTED
-    assert set(gate.admission_alpns) == {
-        ALPN_PRODUCER_ADMISSION,
-        ALPN_CONSUMER_ADMISSION,
-        ALPN_DELEGATED_ADMISSION,
-    }
+    assert {ALPN_PRODUCER_ADMISSION, ALPN_DELEGATED_ADMISSION} <= set(gate.admission_alpns)
     for alpn in gate.admission_alpns:
         assert gate.should_allow(PEER, alpn) is True
     assert gate.should_allow(PEER, b"aster/1") is False
@@ -137,9 +132,9 @@ def test_store_is_shared_between_gate_and_handles():
 def test_custom_admission_alpns():
     gate = GatePolicy(admission_alpns=[b"custom.admit"])
     assert gate.should_allow(PEER, b"custom.admit") is True
-    assert gate.should_allow(PEER, ALPN_CONSUMER_ADMISSION) is False
-    gate.admission_alpns = [ALPN_CONSUMER_ADMISSION]
-    assert gate.admission_alpns == [ALPN_CONSUMER_ADMISSION]
+    assert gate.should_allow(PEER, ALPN_PRODUCER_ADMISSION) is False
+    gate.admission_alpns = [ALPN_PRODUCER_ADMISSION]
+    assert gate.admission_alpns == [ALPN_PRODUCER_ADMISSION]
     with pytest.raises(ValueError):
         gate.admission_alpns = [b""]
 

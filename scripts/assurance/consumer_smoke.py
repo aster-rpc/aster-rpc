@@ -92,7 +92,7 @@ class Smoke:
 async def main():
     cfg = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0")
     counts = {"unary":0, "stream":0, "deadline":0, "cancel":0, "shutdown":0}
-    async with AsterServer(services=[Smoke()], allow_all_consumers=True, config=cfg) as server:
+    async with AsterServer(services=[Smoke()], config=cfg) as server:
         async with AsterClient(endpoint_addr=server.endpoint_addr_b64, config=cfg) as client:
             svc = await client.client(Smoke)
             out = await asyncio.wait_for(svc.echo(Request(value="candidate")), 12)

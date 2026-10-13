@@ -232,7 +232,6 @@ async def test_python_codegen_against_live_server(tmp_path):
 
     async with AsterServer(
         services=[MissionControl(), AgentSession],
-        allow_all_consumers=True,
     ) as server:
         manifests = await _fetch_manifests_from_server(server)
 
@@ -374,7 +373,6 @@ async def test_typescript_codegen_against_live_server(tmp_path):
 
     async with AsterServer(
         services=[MissionControl(), AgentSession],
-        allow_all_consumers=True,
     ) as server:
         manifests = await _fetch_manifests_from_server(server)
 

@@ -63,13 +63,11 @@ MAX_STATUS_MESSAGE_LEN: int = 4096
 MAX_STATUS_DETAIL_ENTRIES: int = 32
 """Maximum number of detail key-value pairs in an RpcStatus."""
 
-# ── Admission limits ──────────────────────────────────────────────────────────
+# ── Service discovery limits ──────────────────────────────────────────────────
 
-MAX_SERVICES_IN_ADMISSION: int = 10_000
-"""Maximum number of ServiceSummary entries in a ConsumerAdmissionResponse."""
-
-MAX_ADMISSION_PAYLOAD_SIZE: int = 64 * 1024
-"""Maximum size of the admission request/response JSON payload."""
+MAX_ADVERTISED_SERVICES: int = 10_000
+"""Maximum number of ServiceSummary entries an ``AsterClient`` reads from a
+server's ``aster.ops.NodeInfo`` ``aster.services`` attribute."""
 
 MAX_CHANNELS_PER_SERVICE: int = 100
 """Maximum number of channels per ServiceSummary."""

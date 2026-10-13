@@ -185,7 +185,6 @@ async def test_reaps_per_connection_state_on_connection_close():
     _reset_chaos_state()
     async with AsterServer(
         services=[ChaosSessionService],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
         async with AsterClient(endpoint_addr=addr_b64) as client:
@@ -240,7 +239,6 @@ async def test_handler_exception_does_not_poison_session_or_leak_across_sessions
     _reset_chaos_state()
     async with AsterServer(
         services=[ChaosSessionService],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
         async with AsterClient(endpoint_addr=addr_b64) as client:
@@ -288,7 +286,6 @@ async def test_graveyard_rejects_older_session_id_after_last_opened_advanced():
     _reset_chaos_state()
     async with AsterServer(
         services=[ChaosSessionService],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
         async with AsterClient(endpoint_addr=addr_b64) as client:
@@ -349,7 +346,6 @@ async def test_session_cap_enforced_when_open_session_calls_are_serialised():
     EXTRA = 3
     async with AsterServer(
         services=[ChaosSessionService],
-        allow_all_consumers=True,
         max_sessions_per_connection=CAP,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
@@ -388,7 +384,6 @@ async def test_session_cap_under_concurrent_burst():
     BURST = 12
     async with AsterServer(
         services=[ChaosSessionService],
-        allow_all_consumers=True,
         max_sessions_per_connection=CAP,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
@@ -436,7 +431,6 @@ async def test_same_session_id_on_two_distinct_connections_resolves_to_distinct_
     _reset_chaos_state()
     async with AsterServer(
         services=[ChaosSessionService],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
 
@@ -507,7 +501,6 @@ async def test_client_session_client_accepts_session_scoped_classes():
     _reset_chaos_state()
     async with AsterServer(
         services=[ChaosSessionService],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
         async with AsterClient(endpoint_addr=addr_b64) as client:

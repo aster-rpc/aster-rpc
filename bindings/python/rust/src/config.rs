@@ -12,7 +12,9 @@
 //! Field names are the `aster::AsterConfig` field names (also the TOML keys),
 //! except `gc_interval_ms` (the `Duration` in milliseconds) and the relay mode,
 //! which is split into `relay_mode` (`"default"` / `"staging"` / `"disabled"` /
-//! `"custom"`) plus `relay_urls`.
+//! `"custom"`) plus `relay_urls`. `enrollment` is the `[enrollment]` section
+//! (`aster::EnrollmentConfig`) as a dict of its field names, with `limits` and
+//! `roles` nested dicts and `policy` as JSON text.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,7 +23,9 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
-use aster::{AsterConfig, HookFailureMode, RelayMode};
+use aster::{
+    AsterConfig, EnrollmentConfig, EnrollmentLimits, HookFailureMode, RelayMode, RoleMappingConfig,
+};
 
 use crate::error::aster_err_to_py;
 use crate::ids::{extract_public_key, extract_secret_key, PublicKey, SecretKey};
@@ -30,10 +34,11 @@ use crate::ids::{extract_public_key, extract_secret_key, PublicKey, SecretKey};
 pub(crate) const FIELDS: &[&str] = &[
     "root_pubkey",
     "root_pubkey_file",
+    "next_root_commitment",
+    "root_seq",
+    "root_rotations",
     "enrollment_credential_file",
-    "enrollment_credential_iid",
-    "allow_all_consumers",
-    "allow_all_producers",
+    "enrollment_credential_chain",
     "endpoint_addr",
     "storage_path",
     "gc_interval_ms",
@@ -72,6 +77,7 @@ pub(crate) const FIELDS: &[&str] = &[
     "health_enabled",
     "identity_file",
     "alpns",
+    "enrollment",
 ];
 
 /// A resolved `aster::AsterConfig` (see module docs). Immutable.
@@ -187,10 +193,28 @@ fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult
             }
         }
         "root_pubkey_file" => c.root_pubkey_file = opt_path(v)?,
+        "next_root_commitment" => c.next_root_commitment = opt_str(v)?,
+        "root_seq" => c.root_seq = v.extract()?,
+        "root_rotations" => {
+            c.root_rotations = if v.is_none() {
+                Vec::new()
+            } else {
+                v.extract::<Vec<String>>()?
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+        }
         "enrollment_credential_file" => c.enrollment_credential_file = opt_path(v)?,
-        "enrollment_credential_iid" => c.enrollment_credential_iid = opt_str(v)?,
-        "allow_all_consumers" => c.allow_all_consumers = strict_bool(key, v)?,
-        "allow_all_producers" => c.allow_all_producers = strict_bool(key, v)?,
+        "enrollment_credential_chain" => c.enrollment_credential_chain = opt_str(v)?,
+        "enrollment" => {
+            c.enrollment = if v.is_none() {
+                EnrollmentConfig::default()
+            } else {
+                enrollment_from_py(v.cast::<PyDict>()?)?
+            }
+        }
         "endpoint_addr" => c.endpoint_addr = opt_str(v)?,
         "storage_path" => c.storage_path = opt_path(v)?,
         "gc_interval_ms" => {
@@ -288,6 +312,198 @@ fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult
         }
     }
     Ok(())
+}
+
+/// `[enrollment]` from its dict form (see module docs). Unknown keys raise
+/// `TypeError`; omitted keys keep the defaults.
+fn enrollment_from_py(d: &Bound<'_, PyDict>) -> PyResult<EnrollmentConfig> {
+    let mut e = EnrollmentConfig::default();
+    for (k, v) in d.iter() {
+        let key: String = k.extract()?;
+        let named = |err: PyErr| prefix_err(d.py(), &format!("enrollment.{key}"), err);
+        match key.as_str() {
+            "enabled" => e.enabled = opt_bool(&key, &v).map_err(named)?,
+            "audience" => e.audience = opt_str(&v).map_err(named)?,
+            "fleet_namespace" => e.fleet_namespace = opt_str(&v).map_err(named)?,
+            "state_path" => e.state_path = opt_path(&v).map_err(named)?,
+            "replicas" => {
+                e.replicas = if v.is_none() {
+                    Vec::new()
+                } else {
+                    v.extract::<Vec<String>>()
+                        .map_err(named)?
+                        .into_iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                }
+            }
+            "policy" => {
+                e.policy = match opt::<String>(&v).map_err(named)? {
+                    None => None,
+                    Some(text) => Some(serde_json::from_str(&text).map_err(|err| {
+                        PyValueError::new_err(format!("enrollment.policy: invalid JSON: {err}"))
+                    })?),
+                }
+            }
+            "require_synchronized_clock" => {
+                e.require_synchronized_clock = strict_bool(&key, &v).map_err(named)?
+            }
+            "activation_leeway_secs" => e.activation_leeway_secs = opt(&v).map_err(named)?,
+            "limits" => {
+                if !v.is_none() {
+                    e.limits =
+                        limits_from_py(v.cast::<PyDict>().map_err(PyErr::from).map_err(named)?)?;
+                }
+            }
+            "roles" => {
+                if !v.is_none() {
+                    e.roles =
+                        roles_from_py(v.cast::<PyDict>().map_err(PyErr::from).map_err(named)?)?;
+                }
+            }
+            "issuer_delegation_file" => e.issuer_delegation_file = opt_path(&v).map_err(named)?,
+            "issuer_lifetime_secs" => {
+                e.issuer_lifetime_secs = opt::<u64>(&v).map_err(named)?;
+                if e.issuer_lifetime_secs == Some(0) {
+                    return Err(PyValueError::new_err(
+                        "enrollment.issuer_lifetime_secs: must be positive",
+                    ));
+                }
+            }
+            "renew_from" => e.renew_from = opt_str(&v).map_err(named)?,
+            "renew" => e.renew = opt_bool(&key, &v).map_err(named)?,
+            "synchronize" => e.synchronize = opt_bool(&key, &v).map_err(named)?,
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "AsterConfig.enrollment: unknown field {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(e)
+}
+
+fn limits_from_py(d: &Bound<'_, PyDict>) -> PyResult<EnrollmentLimits> {
+    let mut l = EnrollmentLimits::default();
+    for (k, v) in d.iter() {
+        let key: String = k.extract()?;
+        let value: Option<u64> =
+            opt(&v).map_err(|err| prefix_err(d.py(), &format!("enrollment.limits.{key}"), err))?;
+        match key.as_str() {
+            "handshake_timeout_ms" => l.handshake_timeout_ms = value,
+            "step_timeout_ms" => l.step_timeout_ms = value,
+            "policy_timeout_ms" => l.policy_timeout_ms = value,
+            "reconciliation_interval_ms" => l.reconciliation_interval_ms = value,
+            "max_admitted_peers" => l.max_admitted_peers = value,
+            "sync_timeout_ms" => l.sync_timeout_ms = value,
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "AsterConfig.enrollment.limits: unknown field {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(l)
+}
+
+/// A role list: a list of strings, or one comma-separated string.
+fn role_list(v: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let items: Vec<String> = if let Ok(text) = v.extract::<String>() {
+        text.split(',').map(str::to_string).collect()
+    } else {
+        v.extract()?
+    };
+    Ok(items
+        .into_iter()
+        .map(|role| role.trim().to_string())
+        .filter(|role| !role.is_empty())
+        .collect())
+}
+
+fn roles_from_py(d: &Bound<'_, PyDict>) -> PyResult<RoleMappingConfig> {
+    let mut r = RoleMappingConfig::default();
+    for (k, v) in d.iter() {
+        let key: String = k.extract()?;
+        let named = |err: PyErr| prefix_err(d.py(), &format!("enrollment.roles.{key}"), err);
+        match key.as_str() {
+            "attribute" => {
+                r.attribute = opt::<String>(&v)
+                    .map_err(named)?
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            }
+            "scopes_as_roles" => r.scopes_as_roles = strict_bool(&key, &v).map_err(named)?,
+            "include_attributes" => r.include_attributes = strict_bool(&key, &v).map_err(named)?,
+            "scopes" | "tags" => {
+                let mut map = std::collections::BTreeMap::new();
+                if !v.is_none() {
+                    for (name, roles) in v
+                        .cast::<PyDict>()
+                        .map_err(PyErr::from)
+                        .map_err(named)?
+                        .iter()
+                    {
+                        map.insert(name.extract::<String>()?, role_list(&roles).map_err(named)?);
+                    }
+                }
+                if key == "scopes" {
+                    r.scopes = map;
+                } else {
+                    r.tags = map;
+                }
+            }
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "AsterConfig.enrollment.roles: unknown field {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(r)
+}
+
+fn enrollment_to_py<'py>(py: Python<'py>, e: &EnrollmentConfig) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("enabled", e.enabled)?;
+    d.set_item("audience", e.audience.clone())?;
+    d.set_item("fleet_namespace", e.fleet_namespace.clone())?;
+    d.set_item("state_path", path_str(&e.state_path))?;
+    d.set_item("replicas", e.replicas.clone())?;
+    d.set_item(
+        "policy",
+        e.policy.as_ref().map(serde_json::Value::to_string),
+    )?;
+    d.set_item("require_synchronized_clock", e.require_synchronized_clock)?;
+    d.set_item("activation_leeway_secs", e.activation_leeway_secs)?;
+    let l = PyDict::new(py);
+    l.set_item("handshake_timeout_ms", e.limits.handshake_timeout_ms)?;
+    l.set_item("step_timeout_ms", e.limits.step_timeout_ms)?;
+    l.set_item("policy_timeout_ms", e.limits.policy_timeout_ms)?;
+    l.set_item(
+        "reconciliation_interval_ms",
+        e.limits.reconciliation_interval_ms,
+    )?;
+    l.set_item("max_admitted_peers", e.limits.max_admitted_peers)?;
+    l.set_item("sync_timeout_ms", e.limits.sync_timeout_ms)?;
+    d.set_item("limits", l)?;
+    let r = PyDict::new(py);
+    r.set_item("attribute", e.roles.attribute.clone())?;
+    r.set_item("scopes_as_roles", e.roles.scopes_as_roles)?;
+    r.set_item("scopes", e.roles.scopes.clone())?;
+    r.set_item("tags", e.roles.tags.clone())?;
+    r.set_item("include_attributes", e.roles.include_attributes)?;
+    d.set_item("roles", r)?;
+    d.set_item(
+        "issuer_delegation_file",
+        path_str(&e.issuer_delegation_file),
+    )?;
+    d.set_item("issuer_lifetime_secs", e.issuer_lifetime_secs)?;
+    d.set_item("renew_from", e.renew_from.clone())?;
+    d.set_item("renew", e.renew)?;
+    d.set_item("synchronize", e.synchronize)?;
+    Ok(d)
 }
 
 fn path_str(p: &Option<PathBuf>) -> Option<String> {
@@ -395,16 +611,17 @@ impl NativeAsterConfig {
             c.root_pubkey.map(|k| PyBytes::new(py, &k.to_bytes())),
         )?;
         d.set_item("root_pubkey_file", path_str(&c.root_pubkey_file))?;
+        d.set_item("next_root_commitment", c.next_root_commitment.clone())?;
+        d.set_item("root_seq", c.root_seq)?;
+        d.set_item("root_rotations", c.root_rotations.clone())?;
         d.set_item(
             "enrollment_credential_file",
             path_str(&c.enrollment_credential_file),
         )?;
         d.set_item(
-            "enrollment_credential_iid",
-            c.enrollment_credential_iid.clone(),
+            "enrollment_credential_chain",
+            c.enrollment_credential_chain.clone(),
         )?;
-        d.set_item("allow_all_consumers", c.allow_all_consumers)?;
-        d.set_item("allow_all_producers", c.allow_all_producers)?;
         d.set_item("endpoint_addr", c.endpoint_addr.clone())?;
         d.set_item("storage_path", path_str(&c.storage_path))?;
         d.set_item(
@@ -488,7 +705,15 @@ impl NativeAsterConfig {
             alpns.append(PyBytes::new(py, a))?;
         }
         d.set_item("alpns", alpns)?;
+        d.set_item("enrollment", enrollment_to_py(py, &c.enrollment)?)?;
         Ok(d)
+    }
+
+    /// `AsterConfig::is_enrollment_enabled`: `[enrollment] enabled` when set,
+    /// else whether an audience, fleet namespace, issuer delegation or
+    /// credential is configured.
+    fn is_enrollment_enabled(&self) -> bool {
+        self.inner.is_enrollment_enabled()
     }
 
     /// `AsterConfig::resolve_root_pubkey`: the inline key and/or the

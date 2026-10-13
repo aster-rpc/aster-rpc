@@ -1,88 +1,30 @@
 """
-aster.trust -- Trust Foundations.
+aster.trust -- trust helpers.
 
-Provides offline root-key authorization and enrollment credentials. Gate 0
-(connection-level admission) is the Rust implementation: ``aster.GatePolicy``,
-``aster.PeerAdmissionStore``, ``aster.TrustMode`` and ``Node.admission()``.
-(Producer mesh, mesh gossip, mesh bootstrap and clock-drift detection have
-been removed.)
+Admission is Enrollment, configured through :class:`aster.AsterConfig`
+(``[trust]`` + ``[enrollment]``) and run in Rust by :class:`aster.AsterServer`
+and :class:`aster.AsterClient`; credentials are issued by the ``aster`` CLI
+(``aster enroll node``). The former consumer admission (``aster.consumer_
+admission``, consumer credential JSON, ``allow_all_consumers``) has been
+removed.
 
-Spec references:
-  Aster-trust-spec.md §2.2, §2.4, §2.9, §3.1, §3.2, §3.3
-  ASTER_PLAN.md §13
-
-Quick start::
-
-    from aster.trust import (
-        EnrollmentCredential,
-        ConsumerEnrollmentCredential,
-        AdmissionResult,
-        ALPN_PRODUCER_ADMISSION,
-        ALPN_CONSUMER_ADMISSION,
-        ALPN_DELEGATED_ADMISSION,
-        admit,
-        generate_root_keypair,
-        sign_credential,
-        verify_signature,
-        InMemoryNonceStore,
-        NonceStore,
-    )
+Gate 0 primitives for custom admission are the Rust implementation:
+``aster.GatePolicy``, ``aster.PeerAdmissionStore``, ``aster.TrustMode`` and
+``Node.admission()``. This package keeps the ed25519 / canonical-JSON helpers,
+the @aster delegated-token verifier (``aster.trust.delegated``) and the
+capability evaluator (``aster.trust.rcan``).
 """
 
-from .admission import admit, check_offline, check_runtime
-from .credentials import (
-    ATTR_IID_ACCOUNT,
-    ATTR_IID_PROVIDER,
-    ATTR_IID_REGION,
-    ATTR_IID_ROLE_ARN,
-    ATTR_NAME,
-    ATTR_ROLE,
-    AdmissionResult,
-    ConsumerEnrollmentCredential,
-    EnrollmentCredential,
-)
 from aster._aster import (
-    ALPN_CONSUMER_ADMISSION,
     ALPN_DELEGATED_ADMISSION,
     ALPN_PRODUCER_ADMISSION,
 )
-from .iid import IIDBackend, MockIIDBackend, get_iid_backend
-from .nonces import InMemoryNonceStore, NonceStore
-from .signing import (
-    generate_root_keypair,
-    sign_credential,
-    verify_signature,
-)
+from .signing import canonical_json_value_bytes, generate_root_keypair
 
 __all__ = [
-    # Credentials
-    "EnrollmentCredential",
-    "ConsumerEnrollmentCredential",
-    "AdmissionResult",
-    # Attribute key constants
-    "ATTR_ROLE",
-    "ATTR_NAME",
-    "ATTR_IID_PROVIDER",
-    "ATTR_IID_ACCOUNT",
-    "ATTR_IID_REGION",
-    "ATTR_IID_ROLE_ARN",
-    # Signing (canonical_json/canonical_signing_bytes removed -- use Rust core)
+    "canonical_json_value_bytes",
     "generate_root_keypair",
-    "sign_credential",
-    "verify_signature",
-    # Admission
-    "admit",
-    "check_offline",
-    "check_runtime",
-    # IID
-    "IIDBackend",
-    "MockIIDBackend",
-    "get_iid_backend",
-    # Nonces
-    "NonceStore",
-    "InMemoryNonceStore",
-    # Admission ALPNs (always open through Gate 0)
+    # Gate-0 admission ALPNs
     "ALPN_PRODUCER_ADMISSION",
-    "ALPN_CONSUMER_ADMISSION",
     "ALPN_DELEGATED_ADMISSION",
 ]

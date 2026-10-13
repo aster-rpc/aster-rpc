@@ -33,7 +33,7 @@ use aster::binding_support::dispatch::{
     SubmitError,
 };
 use aster::binding_support::CoreConnection;
-use aster::rpc::baseline::{NodeIdentity, NodeInfo, NodeInfoServer};
+use aster::rpc::baseline::{Attr, NodeIdentity, NodeInfo, NodeInfoClient, NodeInfoServer};
 use aster::rpc::{
     AttributeStore, AuthContext, AuthOutcome, Authenticator, CallOptions, DynamicService,
     RequestSink, ResponseFuture, ResponseStream, RpcConnection, RpcStatus, Server, ServerHandle,
@@ -111,9 +111,11 @@ impl NodeInfo for StaticNodeInfo {
     }
 }
 
-/// Gate 3 reads the peer's Gate-0 admission attributes: the bridge from the
-/// (frozen) Python consumer admission, which records attributes in the
-/// node's `GatePolicy` store, to Rust-enforced `requires` (design §2.6).
+/// Gate 3 reads the peer's Gate-0 admission attributes: the bridge from an
+/// application-supplied `GatePolicy` (whose store records per-peer
+/// attributes, e.g. `gate.admit(peer, attributes)`) to Rust-enforced
+/// `requires` (design §2.6). With Enrollment the role source is the
+/// enrollment session instead (`enrollment=`).
 struct GateAttributes(Arc<RwLock<aster::GatePolicy>>);
 
 #[aster::rpc::async_trait]
@@ -154,19 +156,25 @@ impl DispatchServer {
     ///
     /// - `node_info`: the `aster.ops.NodeInfo` identity as `(name, tags,
     ///   roles)`; `None` disables the baseline service.
+    /// - `node_attributes`: text attributes served in that identity.
     /// - `gate`: with `gate_attributes=True`, Gate 3 reads the caller's
     ///   attributes from this policy's admission store.
+    /// - `enrollment`: an installed `Enrollment`: Gate 3 reads each peer's
+    ///   roles from its live enrollment session, the enrollment ALPN is
+    ///   served, and a configured delegated issuer serves renewals.
     /// - `handler_timeout`: cap on any handler, seconds (`None` = the Rust
     ///   default, 300 s; `<= 0` = no cap).
     #[staticmethod]
-    #[pyo3(signature = (node, services, *, node_info=Some((String::new(), Vec::new(), Vec::new())), gate=None, gate_attributes=false, max_sessions_per_connection=None, handler_timeout=None, ring_capacity=256, builtin_topology=false, topology_requires=None))]
+    #[pyo3(signature = (node, services, *, node_info=Some((String::new(), Vec::new(), Vec::new())), node_attributes=Vec::new(), gate=None, gate_attributes=false, enrollment=None, max_sessions_per_connection=None, handler_timeout=None, ring_capacity=256, builtin_topology=false, topology_requires=None))]
     #[allow(clippy::too_many_arguments)]
     fn start(
         node: PyRef<'_, crate::node::Node>,
         services: Vec<String>,
         node_info: Option<(String, Vec<String>, Vec<String>)>,
+        node_attributes: Vec<(String, String)>,
         gate: Option<PyRef<'_, GatePolicy>>,
         gate_attributes: bool,
+        enrollment: Option<PyRef<'_, crate::enrollment::Enrollment>>,
         max_sessions_per_connection: Option<usize>,
         handler_timeout: Option<f64>,
         ring_capacity: usize,
@@ -204,8 +212,19 @@ impl DispatchServer {
                 node_name,
                 tags,
                 roles,
-                attributes: Vec::new(),
+                attributes: node_attributes
+                    .into_iter()
+                    .map(|(name, value)| Attr::new(name, value))
+                    .collect(),
             })));
+        }
+        if let Some(enrollment) = &enrollment {
+            if gate.is_some() {
+                return Err(PyValueError::new_err(
+                    "enrollment owns Gate 0: pass either gate or enrollment, not both",
+                ));
+            }
+            server = enrollment.serve_on(server, &attributes);
         }
         if gate_attributes {
             if let Some(gate) = &gate {
@@ -808,6 +827,46 @@ impl RpcClient {
         RpcClient {
             conn: RpcConnection::from_core_connection(connection.core_clone()),
         }
+    }
+
+    /// Call the peer's baseline `aster.ops.NodeInfo.describe`. Returns
+    /// `{"node_id", "node_name", "tags", "roles", "attributes"}`, with the
+    /// attributes as a `{name: str}` dict (non-text values in their display
+    /// form, a declared null as `None`).
+    fn describe_node<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.conn.clone();
+        future_into_py(py, async move {
+            let identity = NodeInfoClient::new(conn)
+                .describe()
+                .await
+                .map_err(client_err)?;
+            Python::attach(|py| {
+                let attributes = PyDict::new(py);
+                for attr in &identity.attributes {
+                    let value: Option<String> = attr.value.as_ref().map(|value| {
+                        if let Some(text) = value.as_text() {
+                            text.to_string()
+                        } else if let Some(v) = value.as_int() {
+                            v.to_string()
+                        } else if let Some(v) = value.as_float() {
+                            v.to_string()
+                        } else if let Some(v) = value.as_bool() {
+                            v.to_string()
+                        } else {
+                            String::new()
+                        }
+                    });
+                    attributes.set_item(&attr.name, value)?;
+                }
+                let out = PyDict::new(py);
+                out.set_item("node_id", &identity.node_id)?;
+                out.set_item("node_name", &identity.node_name)?;
+                out.set_item("tags", &identity.tags)?;
+                out.set_item("roles", &identity.roles)?;
+                out.set_item("attributes", attributes)?;
+                Ok::<Py<PyAny>, PyErr>(out.into_any().unbind())
+            })
+        })
     }
 
     /// A fresh session id from the connection's shared counter (never 0).

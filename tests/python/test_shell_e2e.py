@@ -46,7 +46,6 @@ async def test_shell_connects_to_real_peer():
     """Shell PeerConnection can connect to a real AsterServer and list services."""
     async with AsterServer(
         services=[ShellTestService()],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
 
@@ -65,7 +64,6 @@ async def test_shell_peer_connection_list_services():
 
     async with AsterServer(
         services=[ShellTestService()],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
 
@@ -93,7 +91,6 @@ async def test_shell_peer_connection_get_contract():
 
     async with AsterServer(
         services=[ShellTestService()],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
 
@@ -119,7 +116,6 @@ async def test_shell_vfs_populated_from_real_peer():
 
     async with AsterServer(
         services=[ShellTestService()],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
 

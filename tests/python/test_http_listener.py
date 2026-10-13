@@ -118,7 +118,7 @@ def pem():
 @pytest.fixture
 async def running_server():
     echo = Echo()
-    async with AsterServer(services=[echo], allow_all_consumers=True) as server:
+    async with AsterServer(services=[echo]) as server:
         yield server, echo
 
 

@@ -222,7 +222,7 @@ def _resolve_peer_arg(peer_arg: str) -> tuple[str, str]:
                 f"error: '{peer_arg}' looks like a peer name but no "
                 f".aster-identity file found in {os.getcwd()}\n"
                 f"  pass an aster1... ticket / base64 NodeAddr / hex EndpointId directly, or\n"
-                f"  run 'aster enroll node' to create an identity file",
+                f"  add the peer to an .aster-identity file",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -354,16 +354,15 @@ class PeerConnection:
         self._artifact_refs: dict[str, dict[str, Any]] = {}  # contract_id → ArtifactRef dict
 
     async def connect(self) -> None:
-        """Connect to the peer via consumer admission, then fetch contract manifests."""
+        """Connect to the peer (enrolling when configured), then fetch contract manifests."""
         from aster import AsterClient
         from aster.config import AsterConfig
 
         # Identity resolution for the shell's QUIC node:
         #
-        # 1. If --rcan is provided, the user has their own identity.
-        #    Load secret_key from the .aster-identity in CWD (which
-        #    was created by `aster enroll node`). The RCAN credential's
-        #    endpoint_id must match this key.
+        # 1. If --rcan is provided, it is this node's enrollment credential
+        #    (`aster enroll node --out`); the node key it was issued for
+        #    comes from ASTER_SECRET_KEY_FILE or a paired .aster-identity.
         #
         # 2. If no --rcan, use the root private key (if available).
         #    This gives the shell the root owner's identity -- free auth.
@@ -373,10 +372,8 @@ class PeerConnection:
         config = config.replace(storage_path=None)
 
         if self._rcan_path:
-            # Look for .aster-identity alongside the credential file.
-            # `aster enroll node` creates them as a pair, so the directory
-            # containing the .cred is the most reliable place to find the
-            # matching identity. Fall back to CWD if not present there.
+            # Look for an .aster-identity (the node key) alongside the
+            # credential file when the env names none.
             cred_dir = os.path.dirname(os.path.abspath(self._rcan_path))
             paired = os.path.join(cred_dir, ".aster-identity")
             if not config.identity_file or not os.path.exists(config.identity_file):
@@ -397,7 +394,7 @@ class PeerConnection:
         self._services = list(self._aster_client.services)
 
         # Fetch manifests in the background -- the shell is usable immediately
-        # with basic service info from the admission response. Manifests add
+        # with basic service info the server advertises. Manifests add
         # rich metadata (field types, descriptions) and are merged in when ready.
         self._manifest_task = asyncio.create_task(self._fetch_manifests_background())
 

@@ -6,6 +6,7 @@ import pyfory
 import pytest
 
 from aster import (
+    GatePolicy,
     AsterClient, AsterConfig, AsterServer, ForyCodec, Node, TopologyTiming,
     all_of, any_of, rpc, service, wire_type,
 )
@@ -67,7 +68,7 @@ def config(*, monitoring=True):
 
 async def test_topology_baseline_is_off_by_default():
     async with AsterServer(
-        [TopologyProbe()], config=config(), allow_all_consumers=True,
+        [TopologyProbe()], config=config(),
     ) as server:
         async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:
             stub = await client.client(TopologyProbe)
@@ -93,7 +94,7 @@ async def test_topology_baseline_requires_monitoring():
 async def test_topology_baseline_native_fory_and_gate3(requirement, ops_allowed):
     codec = ForyCodec(types=[Empty, RpcClusters, SeparatedQuery, SeparatedVerdict])
     async with AsterServer(
-        [TopologyProbe()], config=config(), allow_all_consumers=True,
+        [TopologyProbe()], config=config(), gate=GatePolicy.open_dev(),
         builtin_topology=True, topology_requires=requirement,
     ) as server:
         async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:

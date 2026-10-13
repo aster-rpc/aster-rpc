@@ -160,7 +160,7 @@ def register_cli_subcommands(subparsers: argparse._SubParsersAction) -> None:
                 "peer", help="Peer address to connect to"
             )
             verb_parser.add_argument(
-                "--rcan", default=None, help="Path to RCAN credential"
+                "--rcan", default=None, help="Enrollment credential chain file (aster enroll node --out); also set ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_AUDIENCE, ASTER_ENROLLMENT_FLEET_NAMESPACE and the node key it names (ASTER_SECRET_KEY_FILE)"
             )
             verb_parser.add_argument(
                 "--json", action="store_true", dest="raw_json",

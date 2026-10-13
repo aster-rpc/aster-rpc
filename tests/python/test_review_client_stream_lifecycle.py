@@ -51,7 +51,7 @@ async def test_native_client_stream_ends_with_a_parked_source(phase):
             cleaned.set()
 
     config = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0")
-    async with AsterServer(services=[Probe()], allow_all_consumers=True, config=config) as server:
+    async with AsterServer(services=[Probe()], config=config) as server:
         async with AsterClient(address=server.address, config=config) as owner:
             client = await owner.client(Probe)
             call = asyncio.ensure_future(client.answer(source(), timeout=0.2 if phase == "deadline" else 5))
@@ -90,7 +90,7 @@ async def test_native_client_stream_ends_with_a_parked_source(phase):
 
 async def test_native_local_frame_validation_ends_client_stream_without_dispatch():
     config = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0")
-    async with AsterServer(services=[Probe()], allow_all_consumers=True, config=config) as server:
+    async with AsterServer(services=[Probe()], config=config) as server:
         async with AsterClient(address=server.address, config=config) as owner:
             client = await owner.client(Probe)
             original_codec = client._transport._codec

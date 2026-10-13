@@ -300,7 +300,7 @@ def register_mcp_subparser(subparsers: argparse._SubParsersAction) -> None:
         "--rcan",
         default=None,
         metavar="PATH",
-        help="Path to enrollment credential (scoped AI agent credential)",
+        help="Enrollment credential chain file (aster enroll node --out); also set ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_AUDIENCE, ASTER_ENROLLMENT_FLEET_NAMESPACE and the node key it names (ASTER_SECRET_KEY_FILE)",
     )
     mcp_parser.add_argument(
         "--allow",

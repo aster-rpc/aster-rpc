@@ -83,7 +83,7 @@ class PublicSession:
 async def test_public_https_wt_anonymous_gates_sessions_and_cleanup():
     cert = generate_webtransport_certificate("public-python", ["127.0.0.1"])
     echo = Echo()
-    async with AsterServer(services=[echo, PublicSession], allow_all_consumers=True) as server:
+    async with AsterServer(services=[echo, PublicSession]) as server:
         listener = await server.start_public_http(certificate_pem=cert.certificate_pem,
             private_key_pem=cert.private_key_pem, webtransport=True)
         baseline = PublicSession.created

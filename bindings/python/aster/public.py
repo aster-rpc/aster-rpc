@@ -81,10 +81,11 @@ Error Handling
 All RPC failures raise :class:`RpcError` with a :class:`StatusCode`.
 Specific subclasses give actionable diagnostics:
 
-- :class:`AdmissionDeniedError` -- raised when the server refuses
-  consumer admission (open-gate vs trusted-mode mismatch, expired
-  credential, endpoint id mismatch). The error message enumerates the
-  common causes.
+- :class:`AdmissionDeniedError` -- raised by ``AsterClient.connect`` when
+  the server does not admit this client (no credential for a server with
+  enrollment, or the enrollment handshake was refused: expired or revoked
+  credential, a credential issued to another node key, another root or
+  audience). The error message enumerates the common causes.
 - :class:`ContractViolationError` -- raised when the strict-mode codec
   rejects a payload whose shape doesn't match the contract.
 

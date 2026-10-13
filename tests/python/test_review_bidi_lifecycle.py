@@ -87,7 +87,7 @@ async def test_native_bidi_and_empty_stream_lifecycle(phase):
     config = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0")
     tasks = []
     entered, release = asyncio.Event(), asyncio.Event()
-    async with AsterServer(services=[probe], allow_all_consumers=True, config=config) as server:
+    async with AsterServer(services=[probe], config=config) as server:
         async with AsterClient(address=server.address, config=config) as owner:
             client = await owner.client(NativeProbe)
             native = client._transport._client

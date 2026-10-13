@@ -803,10 +803,6 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         PyBytes::new(py, aster::alpns::PRODUCER_ADMISSION),
     )?;
     m.add(
-        "ALPN_CONSUMER_ADMISSION",
-        PyBytes::new(py, aster::alpns::CONSUMER_ADMISSION),
-    )?;
-    m.add(
         "ALPN_DELEGATED_ADMISSION",
         PyBytes::new(py, aster::alpns::DELEGATED_ADMISSION),
     )?;

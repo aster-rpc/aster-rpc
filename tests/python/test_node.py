@@ -164,13 +164,13 @@ async def test_aster_server_persistent_restart_keeps_identity(tmp_path):
     """A persistent AsterServer keeps its node id across restarts: without a
     configured key it uses ``<storage_path>/node.key``."""
     cfg = _local(storage_path=str(tmp_path / "srv"))
-    srv = AsterServer(services=[_P1NodeService()], config=cfg, allow_all_consumers=True)
+    srv = AsterServer(services=[_P1NodeService()], config=cfg)
     await srv.start()
     first_id = srv.node.id
     await srv.close()
     assert (tmp_path / "srv" / "node.key").exists()
 
-    srv2 = AsterServer(services=[_P1NodeService()], config=cfg, allow_all_consumers=True)
+    srv2 = AsterServer(services=[_P1NodeService()], config=cfg)
     await srv2.start()
     try:
         assert srv2.node.id == first_id
@@ -185,7 +185,6 @@ async def test_aster_server_and_client_over_node(tmp_path):
     async with AsterServer(
         services=[_P1NodeService()],
         config=_local(secret_key_file=str(srv_key)),
-        allow_all_consumers=True,
     ) as srv:
         assert srv.node.id == SecretKey.read_file(str(srv_key)).node_id()
         client = AsterClient(
@@ -214,7 +213,6 @@ async def test_aster_server_identity_key_file_conflict(tmp_path):
     srv = AsterServer(
         services=[_P1NodeService()],
         config=_local(secret_key_file=str(key_file), identity_file=str(ident)),
-        allow_all_consumers=True,
     )
     with pytest.raises(ValueError, match="different keys"):
         await srv.start()

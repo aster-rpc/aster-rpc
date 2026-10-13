@@ -720,57 +720,6 @@ async def test_g3_too_many_metadata_entries_rejected():
 
 
 # =============================================================================
-# G10: OTT nonce replay
-#
-# When a nonce store is configured, replaying an OTT credential must be
-# rejected. When no nonce store is configured, OTT credentials must be
-# denied entirely (not silently accepted).
-# =============================================================================
-
-@pytest.mark.timeout(15)
-async def test_g10_ott_nonce_consumed_on_replay():
-    """G10: OTT nonce replayed a second time must be rejected."""
-    from aster.trust.nonces import InMemoryNonceStore
-
-    store = InMemoryNonceStore()
-    nonce = b"\xaa" * 32  # 32 bytes
-
-    # First consumption succeeds
-    result1 = await store.consume(nonce)
-    assert result1 is True, "first nonce consumption should succeed"
-
-    # Second consumption must fail (replay)
-    result2 = await store.consume(nonce)
-    assert result2 is False, (
-        "NONCE REPLAY: second consumption succeeded -- nonces are not "
-        "being tracked, allowing credential replay attacks"
-    )
-
-
-@pytest.mark.timeout(15)
-async def test_g10_ott_without_nonce_store_is_denied():
-    """G10: OTT credential without nonce_store must be denied, not accepted."""
-    import time
-    from aster.trust.admission import check_offline
-    from aster.trust.credentials import ConsumerEnrollmentCredential
-
-    cred = ConsumerEnrollmentCredential(
-        credential_type="ott",
-        root_pubkey=b"\xbb" * 32,
-        expires_at=int(time.time()) + 3600,
-        nonce=b"\xcc" * 32,
-        signature=b"\xdd" * 64,
-        attributes={"aster.name": "test"},
-    )
-
-    result = await check_offline(cred, peer_endpoint_id="e" * 64, nonce_store=None)
-    assert not result.admitted, (
-        "OTT credential was admitted without a nonce_store -- "
-        "this means dev mode silently skips nonce validation"
-    )
-
-
-# =============================================================================
 # G12: Invalid/corrupt payload must produce error trailer, not crash
 #
 # Sending garbage bytes as a request frame should result in an INTERNAL

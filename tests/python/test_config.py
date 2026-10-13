@@ -14,7 +14,7 @@ import textwrap
 
 import pytest
 
-from aster import AsterConfig, PublicKey, SecretKey
+from aster import AsterConfig, EnrollmentConfig, PublicKey, SecretKey
 
 
 @pytest.fixture(autouse=True)
@@ -72,7 +72,10 @@ OTHER_KNOBS = [
     ("root_pubkey", PUB, "ASTER_ROOT_PUBKEY", PUB.hex(), "trust", f'root_pubkey = "{PUB.hex()}"'),
     ("root_pubkey_file", "/keys/root.pub", "ASTER_ROOT_PUBKEY_FILE", "/keys/root.pub", "trust", 'root_pubkey_file = "/keys/root.pub"'),
     ("enrollment_credential_file", "/c.cred", "ASTER_ENROLLMENT_CREDENTIAL", "/c.cred", "trust", 'enrollment_credential = "/c.cred"'),
-    ("allow_all_consumers", True, "ASTER_ALLOW_ALL_CONSUMERS", "true", "trust", "allow_all_consumers = true"),
+    ("enrollment_credential_chain", "aster-chain-v1~x", "ASTER_ENROLLMENT_CREDENTIAL_CHAIN", "aster-chain-v1~x", "trust", 'enrollment_credential_chain = "aster-chain-v1~x"'),
+    ("next_root_commitment", "ab" * 32, "ASTER_NEXT_ROOT_COMMITMENT", "ab" * 32, "trust", f'next_root_commitment = "{"ab" * 32}"'),
+    ("root_seq", 3, "ASTER_ROOT_SEQ", "3", "trust", "root_seq = 3"),
+    ("root_rotations", ("s1", "s2"), "ASTER_ROOT_ROTATIONS", "s1, s2", "trust", 'root_rotations = ["s1", "s2"]'),
     ("endpoint_addr", "aster1xyz", "ASTER_ENDPOINT_ADDR", "aster1xyz", "connect", 'endpoint_addr = "aster1xyz"'),
     ("log_format", "json", "ASTER_LOG_FORMAT", "JSON", "logging", 'format = "json"'),
     ("log_level", "debug", "ASTER_LOG_LEVEL", "debug", "logging", 'level = "debug"'),
@@ -81,11 +84,14 @@ OTHER_KNOBS = [
 
 
 def _rust(cfg: AsterConfig) -> dict:
-    """The Rust config's view, with lists as tuples (the dataclass spelling)."""
-    return {
+    """The Rust config's view, in the dataclass spelling (lists as tuples,
+    ``enrollment`` as an ``EnrollmentConfig``)."""
+    out = {
         k: tuple(v) if isinstance(v, list) else v
         for k, v in cfg._native().to_dict().items()
     }
+    out["enrollment"] = EnrollmentConfig._from_native(out["enrollment"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +108,8 @@ def test_defaults_match_rust_defaults():
     assert cfg.secret_key is None and cfg.secret_key_file is None
     assert cfg.hook_timeout_ms == 5000
     assert cfg.hook_failure_mode == "fail_open"
-    assert cfg.allow_all_consumers is False
-    assert cfg.allow_all_producers is True
+    assert cfg.enrollment == EnrollmentConfig()
+    assert not cfg.is_enrollment_enabled
     assert cfg.log_format == "text" and cfg.log_level == "info" and cfg.log_mask is True
 
 
@@ -481,3 +487,145 @@ def test_print_config_masks_and_reports_sources(monkeypatch, capsys):
     data = json.loads(cfg.print_config(json=True))
     assert data["network"]["secret_key"]["source"] == "ASTER_SECRET_KEY"
     assert data["storage"]["path"]["source"] == "default"
+
+
+# ---------------------------------------------------------------------------
+# [enrollment] (section 15.3 of the enrollment design): names, enablement
+# ---------------------------------------------------------------------------
+
+ENROLLMENT_TOML = """
+[trust]
+root_pubkey = "{pub}"
+enrollment_credential = "server.cred"
+
+[enrollment]
+audience = "mission-control"
+fleet_namespace = "{ns}"
+state_path = "/var/lib/mc/enrollment.json"
+replicas = ["aster1abc", "bb"]
+policy = {{ all_of = [{{ scope = "ops" }}, "tolerate_stale_policy"] }}
+activation_leeway_secs = 30
+renew_from = "dd"
+synchronize = false
+
+[enrollment.limits]
+handshake_timeout_ms = 5000
+sync_timeout_ms = 2000
+
+[enrollment.roles]
+attribute = ""
+scopes_as_roles = true
+include_attributes = false
+[enrollment.roles.scopes]
+"fleet.ops" = ["ops.status", "ops.logs"]
+[enrollment.roles.tags]
+admin = "ops.admin, ops.logs"
+
+[enrollment.issuer]
+delegation_file = "issuer.chain"
+lifetime = "6h"
+"""
+
+
+def test_enrollment_toml_section_parses_through_rust(tmp_path):
+    ns = "cd" * 32
+    p = _write(tmp_path, "aster.toml", ENROLLMENT_TOML.format(pub=PUB.hex(), ns=ns))
+    cfg = AsterConfig.from_file(p)
+    e = cfg.enrollment
+    assert cfg.enrollment_credential_file == "server.cred"
+    assert cfg.is_enrollment_enabled
+    assert e.audience == "mission-control"
+    assert e.fleet_namespace == ns
+    assert e.state_path == "/var/lib/mc/enrollment.json"
+    assert e.replicas == ("aster1abc", "bb")
+    assert e.policy == {"all_of": [{"scope": "ops"}, "tolerate_stale_policy"]}
+    assert e.activation_leeway_secs == 30
+    assert e.renew_from == "dd" and e.synchronize is False
+    assert e.limits.handshake_timeout_ms == 5000 and e.limits.sync_timeout_ms == 2000
+    assert e.roles.attribute == ""
+    assert e.roles.scopes_as_roles and not e.roles.include_attributes
+    assert e.roles.scopes == {"fleet.ops": ("ops.status", "ops.logs")}
+    assert e.roles.tags == {"admin": ("ops.admin", "ops.logs")}
+    assert e.issuer_delegation_file == "issuer.chain"
+    assert e.issuer_lifetime_secs == 6 * 3600
+    assert cfg._sources["enrollment"] == f"{p} [enrollment]"
+    # Rebuilding from the dataclass is the identity.
+    assert AsterConfig(**cfg.to_dict()) == cfg
+
+
+def test_enrollment_env_vars(monkeypatch):
+    ns = "ef" * 32
+    for var, value in {
+        "ASTER_ENROLLMENT_AUDIENCE": "fleet",
+        "ASTER_ENROLLMENT_FLEET_NAMESPACE": ns,
+        "ASTER_ENROLLMENT_STATE_PATH": "/s.json",
+        "ASTER_ENROLLMENT_REPLICAS": "a, b",
+        "ASTER_ENROLLMENT_POLICY": '{"scope": "ops"}',
+        "ASTER_ENROLLMENT_SYNC_TIMEOUT_MS": "1234",
+        "ASTER_ENROLLMENT_ROLE_ATTRIBUTE": "team",
+        "ASTER_ENROLLMENT_SCOPES_AS_ROLES": "true",
+        "ASTER_ENROLLMENT_ISSUER_LIFETIME": "2h",
+        "ASTER_ENROLLMENT_RENEW": "false",
+    }.items():
+        monkeypatch.setenv(var, value)
+    cfg = AsterConfig.from_env()
+    e = cfg.enrollment
+    assert (e.audience, e.fleet_namespace, e.state_path) == ("fleet", ns, "/s.json")
+    assert e.replicas == ("a", "b")
+    assert e.policy == {"scope": "ops"}
+    assert e.limits.sync_timeout_ms == 1234
+    assert e.roles.attribute == "team" and e.roles.scopes_as_roles
+    assert e.issuer_lifetime_secs == 7200 and e.renew is False
+    assert cfg.is_enrollment_enabled
+    assert cfg._sources["enrollment"] == "ASTER_ENROLLMENT_*"
+
+
+def test_enrollment_kwargs_dict_or_dataclass():
+    as_dict = AsterConfig(
+        enrollment={
+            "audience": "fleet",
+            "policy": "require_registration",
+            "limits": {"step_timeout_ms": 7},
+            "roles": {"tags": {"admin": "ops.admin,ops.logs"}},
+        }
+    )
+    e = as_dict.enrollment
+    assert isinstance(e, EnrollmentConfig)
+    assert e.policy == "require_registration"
+    assert e.limits.step_timeout_ms == 7
+    assert e.roles.tags == {"admin": ("ops.admin", "ops.logs")}
+    assert AsterConfig(enrollment=e) == as_dict
+    with pytest.raises(TypeError):
+        AsterConfig(enrollment={"no_such_field": 1})
+    with pytest.raises(ValueError):
+        AsterConfig(enrollment={"issuer_lifetime_secs": 0})
+
+
+def test_enrollment_enablement_rule():
+    assert not AsterConfig().is_enrollment_enabled
+    # The root alone does not enable it (coordination uses the root too).
+    assert not AsterConfig(root_pubkey=PUB, root_seq=1).is_enrollment_enabled
+    assert AsterConfig(enrollment={"audience": "x"}).is_enrollment_enabled
+    assert AsterConfig(enrollment={"fleet_namespace": "ab" * 32}).is_enrollment_enabled
+    assert AsterConfig(enrollment_credential_file="a.cred").is_enrollment_enabled
+    assert AsterConfig(enrollment_credential_chain="aster-chain-v1~x").is_enrollment_enabled
+    assert AsterConfig(enrollment={"enabled": True}).is_enrollment_enabled
+    assert not AsterConfig(enrollment={"enabled": False, "audience": "x"}).is_enrollment_enabled
+
+
+@pytest.mark.parametrize(
+    "field", ["allow_all_consumers", "allow_all_producers", "enrollment_credential_iid"]
+)
+def test_retired_consumer_admission_settings_are_gone(field):
+    with pytest.raises(TypeError):
+        AsterConfig(**{field: True})
+    assert not hasattr(AsterConfig(), field)
+
+
+def test_retired_consumer_admission_toml_keys_open_nothing(tmp_path):
+    p = _write(
+        tmp_path,
+        "aster.toml",
+        '[trust]\nallow_all_consumers = true\nenrollment_credential_iid = "x"\n',
+    )
+    assert not AsterConfig.from_file(p).is_enrollment_enabled

@@ -250,12 +250,13 @@ def test_rust_records_carry_the_span_trace_id_end_to_end():
             observability.init(traces=True, otlp_endpoint="http://127.0.0.1:9",
                                log_filter="warn,aster=trace")
             cap = Cap()
-            async with AsterServer(services=[O6Echo()], allow_all_consumers=True) as server:
-                logging.getLogger("aster").addHandler(cap)
-                logging.getLogger("aster").setLevel(5)
+            async with AsterServer(services=[O6Echo()]) as server:
                 server.serve()
                 async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:
                     svc = await client.client(O6Echo)
+                    # Capture after connect: only the traced call's records.
+                    logging.getLogger("aster").addHandler(cap)
+                    logging.getLogger("aster").setLevel(5)
                     with tracing.span("client.work") as outer:
                         reply = await svc.echo(Req(text="hi"))
                         client_trace = outer.trace_id
@@ -310,7 +311,7 @@ _BAGGAGE_CHILD = """
 
     async def main():
         INIT
-        async with AsterServer(services=[O6Baggage()], allow_all_consumers=True) as server:
+        async with AsterServer(services=[O6Baggage()]) as server:
             server.serve()
             async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:
                 svc = await client.client(O6Baggage)
@@ -687,7 +688,7 @@ class O6InprocEcho:
 
 async def test_asterserver_starts_ops_endpoints_from_config_and_counts_calls():
     cfg = AsterConfig(health_enabled=True)  # port 0 + enabled: an ephemeral port
-    server = AsterServer(services=[O6InprocEcho()], allow_all_consumers=True, config=cfg)
+    server = AsterServer(services=[O6InprocEcho()], config=cfg)
     await server.start()
     try:
         health = server.health
@@ -1195,13 +1196,13 @@ async def test_health_live_disabled_bind_failure_and_port_reuse():
     cfg = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0",
                       health_port=port, health_enabled=False)
     try:
-        off = AsterServer(services=[O6InprocEcho()], allow_all_consumers=True, config=cfg)
+        off = AsterServer(services=[O6InprocEcho()], config=cfg)
         try:
             await off.start()
             assert off.health is None
         finally:
             await off.close()
-        conflict = AsterServer(services=[O6InprocEcho()], allow_all_consumers=True,
+        conflict = AsterServer(services=[O6InprocEcho()],
                                config=cfg.replace(health_enabled=True))
         try:
             with pytest.raises(Exception) as refused:
@@ -1212,7 +1213,7 @@ async def test_health_live_disabled_bind_failure_and_port_reuse():
             await conflict.close()
     finally:
         occupied.close()
-    server = AsterServer(services=[O6InprocEcho()], allow_all_consumers=True,
+    server = AsterServer(services=[O6InprocEcho()],
                          config=cfg.replace(health_enabled=True))
     try:
         await server.start()

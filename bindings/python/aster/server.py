@@ -90,6 +90,8 @@ class Server:
         registry: ServiceRegistry | None = None,
         owns_endpoint: bool = True,
         gate: "GatePolicy | None" = None,
+        enrollment: Any = None,
+        node_attributes: list[tuple[str, str]] | None = None,
         node: Any = None,
         on_non_rpc: Any = None,
         handler_timeout: float | None = None,
@@ -117,6 +119,11 @@ class Server:
                 (e.g. by :class:`AsterServer`).
             gate: The node's ``GatePolicy``; its admission attributes are the
                 caller's ``CallContext.attributes`` and feed Gate 3.
+            enrollment: An installed ``aster.Enrollment`` (see
+                :class:`aster.AsterServer`): each peer's roles come from its
+                enrollment session, and the enrollment ALPN is served.
+            node_attributes: Text attributes served by the baseline
+                ``aster.ops.NodeInfo``.
             node: The ``aster.Node`` to serve on (started with ``aster/1``).
             on_non_rpc: ``callback(alpn, connection)`` for inbound connections
                 on other ALPNs that the node accepted.
@@ -131,6 +138,8 @@ class Server:
         self._endpoint = endpoint
         self._owns_endpoint = owns_endpoint
         self._gate = gate
+        self._enrollment = enrollment
+        self._node_attributes = list(node_attributes or [])
         self._node = node
         self._on_non_rpc = on_non_rpc
         self._handler_timeout_s = handler_timeout
@@ -234,6 +243,8 @@ class Server:
             codec=self._codec,
             interceptors=self._interceptors,
             gate=self._gate,
+            enrollment=self._enrollment,
+            node_attributes=self._node_attributes,
             on_non_rpc=self._on_non_rpc,
             max_sessions_per_connection=self._max_sessions_per_connection,
             handler_timeout=self._handler_timeout_s,

@@ -46,7 +46,7 @@ impl Node {
 
 /// Accept `None`, a `NativeAsterConfig`, or anything with a `_native()`
 /// method returning one (the Python `aster.AsterConfig` dataclass).
-fn extract_config(config: Option<&Bound<'_, PyAny>>) -> PyResult<aster::AsterConfig> {
+pub(crate) fn extract_config(config: Option<&Bound<'_, PyAny>>) -> PyResult<aster::AsterConfig> {
     let Some(obj) = config.filter(|c| !c.is_none()) else {
         return Ok(aster::AsterConfig::default());
     };

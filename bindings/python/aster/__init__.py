@@ -7,7 +7,8 @@ This package provides:
      CRDT docs, gossip -- all exposed as async Python APIs.
 
   2. The Aster RPC framework: contract-first RPC with Fory xlang
-     serialization, consumer/producer admission, and a service registry.
+     serialization, Enrollment-based admission configured through
+     AsterConfig, and a service registry.
 
 Common entry points (all importable from the top-level ``aster`` package):
 
@@ -21,7 +22,6 @@ Sub-modules are also available directly::
 
     from aster.server import Server
     from aster.client import create_client
-    from aster.trust.consumer import handle_consumer_admission_rpc
 """
 
 # ── uvloop auto-install ──────────────────────────────────────────────────────
@@ -121,8 +121,11 @@ try:
         HandshakeRequest,
         ConnectRequest,
         ALPN_PRODUCER_ADMISSION,
-        ALPN_CONSUMER_ADMISSION,
         ALPN_DELEGATED_ADMISSION,
+        # Enrollment (driven by AsterServer / AsterClient from AsterConfig)
+        ENROLLMENT_ALPN,
+        Enrollment,
+        EnrollmentPlan,
         # Ticket
         AsterTicket,
         # Trust config primitives
@@ -148,7 +151,7 @@ except ImportError as e:
 # Former name of DownloadPolicy.
 DocDownloadPolicy = DownloadPolicy
 
-from .config import AsterConfig
+from .config import AsterConfig, EnrollmentConfig, EnrollmentLimits, RoleMappingConfig
 from .provisioning import (
     ProvisioningError, GenesisVoter, GenesisSpec, JoinPermitSpec,
     VerifiedGenesis, VerifiedJoinPermit, canonical_genesis, canonical_join_permit,
@@ -427,8 +430,10 @@ __all__ = [
     "HandshakeRequest",
     "ConnectRequest",
     "ALPN_PRODUCER_ADMISSION",
-    "ALPN_CONSUMER_ADMISSION",
     "ALPN_DELEGATED_ADMISSION",
+    "ENROLLMENT_ALPN",
+    "Enrollment",
+    "EnrollmentPlan",
     "AsterTicket",
     "NamespaceCapability",
     "HpkeEnvelope",
@@ -601,6 +606,9 @@ __all__ = [
     "observability",
     # ── High-level declarative API ──
     "AsterConfig",
+    "EnrollmentConfig",
+    "EnrollmentLimits",
+    "RoleMappingConfig",
     "AsterServer",
     "AsterClient",
     "ClientSession",

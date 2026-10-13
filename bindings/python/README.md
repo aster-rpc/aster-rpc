@@ -1,4 +1,26 @@
-# Python HTTPS, WebTransport and certificate helpers
+# aster-rpc for Python
+
+## Enrollment
+
+Admission for `AsterServer` and `AsterClient` is configuration. A config that
+sets an `[enrollment]` audience or fleet namespace, an issuer delegation, or a
+credential (`[trust] enrollment_credential` / `ASTER_ENROLLMENT_CREDENTIAL`)
+switches Enrollment on; the server then admits only nodes holding a
+credential from `[trust] root_pubkey`, and each peer's verified `aster.role`
+claim (mapped by `[enrollment.roles]`) is what `requires=` checks, evaluated
+on every call. The schema, names and fail-closed validation match the Rust
+`AsterConfig` exactly (`aster.EnrollmentConfig`, `EnrollmentLimits`,
+`RoleMappingConfig`); credentials come from the `aster` CLI (`aster enroll
+node`). See `examples/python/mission_control/README.md` (Chapter 5) and
+`CHANGELOG.md` for the migration from the removed consumer admission.
+
+```python
+config = AsterConfig.from_env()   # ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_* ...
+async with AsterServer(services=[MissionControl()], config=config) as server:
+    await server.serve()
+```
+
+## HTTPS, WebTransport and certificate helpers
 
 Python services registered on `AsterServer` can also serve through the shared
 Rust HTTP/WT dispatcher. `start_http` binds an owned listener using
@@ -9,7 +31,7 @@ pump and returns after TCP and optional QUIC are bound.
 import asyncio
 from pathlib import Path
 
-from aster import AsterServer, RPCAuthRequest, RPCAuthResponse
+from aster import AsterConfig, AsterServer, RPCAuthRequest, RPCAuthResponse
 
 
 async def authenticate(request: RPCAuthRequest) -> RPCAuthResponse:
@@ -20,7 +42,7 @@ async def authenticate(request: RPCAuthRequest) -> RPCAuthResponse:
 
 
 async def run(services, shutdown: asyncio.Event):
-    async with AsterServer(services=services, allow_all_consumers=True) as server:
+    async with AsterServer(services=services, config=AsterConfig.from_env()) as server:
         listener = await server.start_http(
             authenticator=authenticate,
             certificate_pem=Path("server.pem").read_bytes(),
@@ -38,9 +60,10 @@ async def run(services, shutdown: asyncio.Event):
             await listener.aclose()
 ```
 
-`allow_all_consumers` in this example selects the Iroh admission policy. The
-HTTP authenticator is a separate policy on a dispatcher clone; it does not
-change Iroh admission. A lower-level `aster.Server` also exposes `start_http`
+The configuration selects the Iroh admission policy: Enrollment when
+`[enrollment]` is configured (see "Enrollment" below), otherwise an open node.
+The HTTP authenticator is a separate policy on a dispatcher clone; it does not
+change Iroh admission, and HTTP callers never receive enrollment roles. A lower-level `aster.Server` also exposes `start_http`
 with the same arguments. Services, Fory payloads, all four RPC patterns, Gate 3,
 sessions and deadlines use the existing native dispatch path.
 

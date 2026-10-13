@@ -17,7 +17,6 @@ canonical_bytes_from_json = _contract.canonical_bytes_from_json
 compute_type_hash = _contract.compute_type_hash
 encode_frame = _aster.wire.encode_frame
 decode_frame = _aster.wire.decode_frame
-canonical_signing_bytes_from_json = _contract.canonical_signing_bytes_from_json
 canonical_json = _contract.canonical_json
 
 
@@ -271,99 +270,11 @@ class TestFramingConsistency:
         assert flags == 0x02
 
 
-class TestSigningBytesConsistency:
-    """Python canonical_signing_bytes == Rust canonical_signing_bytes_from_json."""
-
-    def test_producer_credential(self):
-        from aster.trust.signing import _canonical_signing_bytes as canonical_signing_bytes
-        from aster.trust.credentials import EnrollmentCredential
-
-        root_pubkey = bytes(range(32))
-        cred = EnrollmentCredential(
-            endpoint_id="abc123",
-            root_pubkey=root_pubkey,
-            expires_at=1700000000,
-            attributes={"aster.role": "producer", "aster.name": "test"},
-            signature=b"",
-        )
-        py_bytes = canonical_signing_bytes(cred)
-
-        cred_json = json.dumps({
-            "kind": "producer",
-            "endpoint_id": "abc123",
-            "root_pubkey": root_pubkey.hex(),
-            "expires_at": 1700000000,
-            "attributes": {"aster.role": "producer", "aster.name": "test"},
-        })
-        rust_bytes = canonical_signing_bytes_from_json(cred_json)
-
-        assert py_bytes == rust_bytes
-
-    def test_consumer_credential_policy(self):
-        from aster.trust.signing import _canonical_signing_bytes as canonical_signing_bytes
-        from aster.trust.credentials import ConsumerEnrollmentCredential
-
-        root_pubkey = bytes(range(32))
-        cred = ConsumerEnrollmentCredential(
-            credential_type="policy",
-            root_pubkey=root_pubkey,
-            expires_at=1700000000,
-            attributes={"aster.role": "consumer"},
-            endpoint_id=None,
-            nonce=None,
-            signature=b"",
-        )
-        py_bytes = canonical_signing_bytes(cred)
-
-        cred_json = json.dumps({
-            "kind": "consumer",
-            "credential_type": "policy",
-            "root_pubkey": root_pubkey.hex(),
-            "expires_at": 1700000000,
-            "attributes": {"aster.role": "consumer"},
-            "endpoint_id": None,
-            "nonce": None,
-        })
-        rust_bytes = canonical_signing_bytes_from_json(cred_json)
-
-        assert py_bytes == rust_bytes
-
-    def test_consumer_credential_ott(self):
-        from aster.trust.signing import _canonical_signing_bytes as canonical_signing_bytes
-        from aster.trust.credentials import ConsumerEnrollmentCredential
-
-        root_pubkey = bytes(range(32))
-        nonce = bytes(range(32, 64))
-        cred = ConsumerEnrollmentCredential(
-            credential_type="ott",
-            root_pubkey=root_pubkey,
-            expires_at=1700000000,
-            attributes={"aster.role": "consumer"},
-            endpoint_id="node123",
-            nonce=nonce,
-            signature=b"",
-        )
-        py_bytes = canonical_signing_bytes(cred)
-
-        cred_json = json.dumps({
-            "kind": "consumer",
-            "credential_type": "ott",
-            "root_pubkey": root_pubkey.hex(),
-            "expires_at": 1700000000,
-            "attributes": {"aster.role": "consumer"},
-            "endpoint_id": "node123",
-            "nonce": nonce.hex(),
-        })
-        rust_bytes = canonical_signing_bytes_from_json(cred_json)
-
-        assert py_bytes == rust_bytes
-
-
 class TestCanonicalJsonConsistency:
     """Python canonical_json == Rust canonical_json."""
 
     def test_sorted_keys(self):
-        from aster.trust.signing import _canonical_json as py_canonical_json
+        from aster.trust.signing import canonical_json_value_bytes as py_canonical_json
 
         attrs = {"b": "2", "a": "1", "c": "3"}
         py_bytes = py_canonical_json(attrs)
@@ -372,7 +283,7 @@ class TestCanonicalJsonConsistency:
         assert py_bytes == rust_bytes
 
     def test_empty(self):
-        from aster.trust.signing import _canonical_json as py_canonical_json
+        from aster.trust.signing import canonical_json_value_bytes as py_canonical_json
 
         py_bytes = py_canonical_json({})
         rust_bytes = canonical_json("{}")

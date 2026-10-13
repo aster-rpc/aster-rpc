@@ -10,6 +10,8 @@
 //! - gossip.rs: GossipClient, GossipTopicHandle wrappers
 //! - monitor.rs: Phase 1b monitoring utilities
 //! - admission.rs: Gate 0 (`GatePolicy`, `PeerAdmissionStore`, `Admission`)
+//! - enrollment.rs: Enrollment from `AsterConfig` for `AsterServer` /
+//!   `AsterClient` (`EnrollmentPlan`, `Enrollment`)
 //! - grants.rs, lease.rs, topology.rs: plan P7 (values are
 //!   the frozen dataclasses of the matching `aster.*` Python modules)
 //! - coordination.rs: plan P9, the wrapped coordination client (+ the
@@ -39,6 +41,7 @@ mod contract;
 mod coordination;
 mod crypto;
 mod docs;
+mod enrollment;
 mod error;
 mod expose;
 mod gossip;
@@ -109,6 +112,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     docs::register(py, m)?;
     gossip::register(py, m)?;
     admission::register(py, m)?;
+    enrollment::register(py, m)?;
     monitor::register(py, m)?;
     contract::register(py, m)?;
     ticket::register(py, m)?;

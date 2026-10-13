@@ -25,6 +25,7 @@ from typing import AsyncIterator
 import pytest
 
 from aster import (
+    GatePolicy,
     AsterClient,
     AsterServer,
     bidi_stream,
@@ -291,9 +292,10 @@ def test_vector_cases_through_native():
 
 @pytest.fixture
 async def p4_pair():
+    # An open gate whose store carries per-peer attributes (no enrollment).
     async with AsterServer(
         services=[P4Echo(), P4Session, P4Guarded()],
-        allow_all_consumers=True,
+        gate=GatePolicy.open_dev(),
     ) as server:
         async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:
             yield server, client
@@ -429,7 +431,7 @@ async def test_sessions(p4_pair):
 @pytest.mark.timeout(30)
 async def test_session_close_hook_on_disconnect():
     EVENTS.clear()
-    async with AsterServer(services=[P4Session], allow_all_consumers=True) as server:
+    async with AsterServer(services=[P4Session]) as server:
         async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:
             s = await client.open_session(service_cls=P4Session)
             c = await s.client(P4Session)

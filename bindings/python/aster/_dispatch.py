@@ -244,8 +244,12 @@ class Dispatcher:
         gate: the node's ``GatePolicy``; its admission attributes feed
             ``CallContext.attributes`` and, when any service declares
             ``requires``, Rust's Gate 3.
+        enrollment: an installed ``aster.Enrollment``: Gate 3 reads each
+            peer's roles from its enrollment session (mutually exclusive
+            with ``gate``).
+        node_attributes: text attributes served by ``aster.ops.NodeInfo``.
         on_non_rpc: ``callback(alpn, connection)`` for connections on other
-            ALPNs (e.g. the frozen consumer-admission handler).
+            ALPNs nothing in Rust routes.
     """
 
     def __init__(
@@ -255,6 +259,8 @@ class Dispatcher:
         codec: Any,
         interceptors: list[Any] | None = None,
         gate: Any = None,
+        enrollment: Any = None,
+        node_attributes: list[tuple[str, str]] | None = None,
         on_non_rpc: Callable[[bytes, Any], None] | None = None,
         max_sessions_per_connection: int | None = None,
         handler_timeout: float | None = None,
@@ -266,6 +272,8 @@ class Dispatcher:
         self._services = [_Service(s, base) for s in services]
         self._codec = codec
         self._gate = gate
+        self._enrollment = enrollment
+        self._node_attributes = list(node_attributes or [])
         self._on_non_rpc = on_non_rpc
         self._max_sessions = max_sessions_per_connection
         self._handler_timeout = handler_timeout
@@ -310,8 +318,10 @@ class Dispatcher:
             node,
             [lower_json(s.cls) for s in self._services],
             node_info=self._node_info,
+            node_attributes=self._node_attributes,
             gate=self._gate,
             gate_attributes=bool(self._gate is not None and any_requires),
+            enrollment=self._enrollment,
             max_sessions_per_connection=self._max_sessions,
             handler_timeout=self._handler_timeout,
             builtin_topology=self._builtin_topology,

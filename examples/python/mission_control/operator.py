@@ -4,6 +4,11 @@
 Demonstrates server streaming (Chapter 2):
   - tailLogs streams log entries as they arrive
 
+Configuration comes from ASTER_* environment variables (AsterConfig.from_env):
+with enrollment set up (README, Chapter 5) set ASTER_SECRET_KEY_FILE and
+ASTER_ENROLLMENT_CREDENTIAL to this node's key and credential, plus
+ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_AUDIENCE and ASTER_ENROLLMENT_FLEET_NAMESPACE.
+
 Usage:
     python -m mission_control.operator <server-address>
 

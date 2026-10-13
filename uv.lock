@@ -16,19 +16,12 @@ dependencies = [
     { name = "uvloop", marker = "sys_platform != 'win32'" },
 ]
 
-[package.optional-dependencies]
-iid = [
-    { name = "pyjwt" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "pyfory", specifier = "==1.7.5" },
-    { name = "pyjwt", marker = "extra == 'iid'", specifier = ">=2.8" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.19" },
 ]
-provides-extras = ["iid"]
 
 [[package]]
 name = "pyfory"
@@ -55,18 +48,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/66/8d/c44be691ecd6a568ead62140234016ae34f89b9f3761aad4e5ed2835cf02/pyfory-1.7.5-cp39-cp39-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9718dbe694f3c7c9696729338f17613456c42d8dd4b9e85461a63076a380f733", size = 1463806, upload-time = "2026-09-25T03:06:56.71Z" },
     { url = "https://files.pythonhosted.org/packages/14/39/9e1802f11a67ff65f1e6cca5eb65916e6f2cc6ba5ca3c0d29f81edf2082b/pyfory-1.7.5-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:96aac7408fba0ba89d375b1a85abfd777eb6643714bd52c4203c04a7a5e69e5e", size = 1525781, upload-time = "2026-09-25T03:06:58.485Z" },
     { url = "https://files.pythonhosted.org/packages/a5/ee/9ef5f428bc42b65f059ea5bba75e39c2c39d6c6b874b2b90928b45c0989a/pyfory-1.7.5-cp39-cp39-win_amd64.whl", hash = "sha256:78ad8441cfb203f832e00bbba04b1e391c3578ceddaa28b1da8b2c18adfda29b", size = 1146735, upload-time = "2026-09-25T03:10:00.517Z" },
-]
-
-[[package]]
-name = "pyjwt"
-version = "2.12.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c2/27/a3b6e5bf6ff856d2509292e95c8f57f0df7017cf5394921fc4e4ef40308a/pyjwt-2.12.1.tar.gz", hash = "sha256:c74a7a2adf861c04d002db713dd85f84beb242228e671280bf709d765b03672b", size = 102564, upload-time = "2026-03-13T19:27:37.25Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/7a/8dd906bd22e79e47397a61742927f6747fe93242ef86645ee9092e610244/pyjwt-2.12.1-py3-none-any.whl", hash = "sha256:28ca37c070cad8ba8cd9790cd940535d40274d22f80ab87f3ac6a713e6e8454c", size = 29726, upload-time = "2026-03-13T19:27:35.677Z" },
 ]
 
 [[package]]
@@ -103,15 +84,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/6a/1e/71dfd96bcc1c775420cb8befe7a9d35f2e5b1309798f009dca17b7708c1e/tomli-2.4.1-cp313-cp313-win_amd64.whl", hash = "sha256:8d65a2fbf9d2f8352685bc1364177ee3923d6baf5e7f43ea4959d7d8bc326a36", size = 108755, upload-time = "2026-03-25T20:21:40.248Z" },
     { url = "https://files.pythonhosted.org/packages/83/7a/d34f422a021d62420b78f5c538e5b102f62bea616d1d75a13f0a88acb04a/tomli-2.4.1-cp313-cp313-win_arm64.whl", hash = "sha256:4b605484e43cdc43f0954ddae319fb75f04cc10dd80d830540060ee7cd0243cd", size = 95265, upload-time = "2026-03-25T20:21:41.219Z" },
     { url = "https://files.pythonhosted.org/packages/7b/61/cceae43728b7de99d9b847560c262873a1f6c98202171fd5ed62640b494b/tomli-2.4.1-py3-none-any.whl", hash = "sha256:0d85819802132122da43cb86656f8d1f8c6587d54ae7dcaf30e90533028b49fe", size = 14583, upload-time = "2026-03-25T20:22:03.012Z" },
-]
-
-[[package]]
-name = "typing-extensions"
-version = "4.15.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466", size = 109391, upload-time = "2025-08-25T13:49:26.313Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", size = 44614, upload-time = "2025-08-25T13:49:24.86Z" },
 ]
 
 [[package]]

@@ -53,10 +53,11 @@ class GossipEventType(IntEnum):
 
 @dataclass
 class ServiceSummary:
-    """Compact service descriptor returned in ConsumerAdmissionResponse (§3.2.2).
+    """Compact service descriptor a Python ``AsterServer`` advertises in its
+    ``aster.ops.NodeInfo`` (``aster.services`` attribute).
 
     Provides enough information for a consumer to select a service and fetch
-    its contract without joining the registry doc.
+    its contract from the registry doc.
     """
 
     name: str

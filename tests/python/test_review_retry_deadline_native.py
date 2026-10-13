@@ -66,8 +66,8 @@ async def test_native_healthy_peer_progresses_beside_stalled_and_disconnected_pe
     config = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0")
     task = None
     transports = []
-    async with AsterServer(services=[stalled], allow_all_consumers=True, config=config) as bad:
-        async with AsterServer(services=[healthy], allow_all_consumers=True, config=config) as good:
+    async with AsterServer(services=[stalled], config=config) as bad:
+        async with AsterServer(services=[healthy], config=config) as good:
             async with AsterClient(address=bad.address, config=config) as owner:
                 client = await owner.client(Probe)
                 try:
@@ -141,7 +141,7 @@ async def test_native_pool_retry_deadline_and_recovery(phase, monkeypatch):
     if phase != "without_interceptor":
         interceptors.insert(0, DeadlineInterceptor())
 
-    async with AsterServer(services=[probe], allow_all_consumers=True, config=config) as server:
+    async with AsterServer(services=[probe], config=config) as server:
         async with AsterClient(address=server.address, config=config) as owner:
             client = await owner.client(Probe, interceptors=interceptors)
             blocker = await owner.client(Probe)
@@ -236,7 +236,7 @@ async def test_native_saturated_pool_cancellation_and_recovery(monkeypatch):
     tasks = []
     entered = asyncio.Event()
     attempted = []
-    async with AsterServer(services=[probe], allow_all_consumers=True, config=config) as server:
+    async with AsterServer(services=[probe], config=config) as server:
         async with AsterClient(address=server.address, config=config) as owner:
             client = await owner.client(Probe)
             client._transport._client.shared_pool_size = 1
@@ -303,7 +303,7 @@ async def test_native_breaker_probe_recovery(aftermath):
     second = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=60)
     breakers = [first, second] if aftermath == "later_refusal" else [first]
     pending = None
-    async with AsterServer(services=[probe], allow_all_consumers=True, config=config) as server:
+    async with AsterServer(services=[probe], config=config) as server:
         async with AsterClient(address=server.address, config=config) as owner:
             client = await owner.client(Probe, interceptors=breakers)
             try:

@@ -1,28 +1,27 @@
 """
 aster.runtime -- Declarative ``AsterServer`` / ``AsterClient`` wrappers.
 
-Thin composition over the existing low-level primitives
-(:class:`aster.Server`, :func:`aster.trust.consumer.handle_consumer_admission_rpc`,
-:func:`aster.client.create_client`) to give application code a one-line,
-declarative producer/consumer experience.
+Thin composition over the low-level primitives (:class:`aster.Server`,
+:func:`aster.client.create_client`) for a one-line, declarative
+producer/consumer experience, configured by :class:`aster.AsterConfig`.
 
-The ``AsterServer`` starts a single :class:`aster.Node` (``aster::Node``,
-configured by :class:`aster.AsterConfig`) serving blobs + docs +
-gossip + aster RPC + admission ALPNs on one endpoint, one node ID. Gate 0
-(connection-level admission, trust spec section 3.3) is the Rust
-``GatePolicy`` attached to the node (``AsterServer.gate``).
+The ``AsterServer`` starts a single :class:`aster.Node` serving blobs + docs +
+gossip + aster RPC on one endpoint, one node ID. Admission is configuration:
+with ``[enrollment]`` configured (see :class:`aster.EnrollmentConfig`) the
+server admits only nodes holding a credential from the configured root, each
+peer's verified claims become the roles ``requires=`` checks, and revocation,
+renewal and policy synchronization run in Rust (``aster::binding_support::
+enrollment``). Without it the node is open.
 
 Example (producer)::
 
-    async with AsterServer(services=[HelloService()], root_pubkey=pub) as srv:
-        print(srv.endpoint_addr_b64)
+    async with AsterServer(services=[HelloService()], config=AsterConfig.from_env()) as srv:
+        print(srv.address)
         await srv.serve()  # blocks until cancelled
 
 Example (consumer)::
 
-    async with AsterClient(
-        root_pubkey=pub, root_privkey=priv, admission_addr=addr_b64,
-    ) as c:
+    async with AsterClient(config=AsterConfig.from_env(), address=addr) as c:
         hello = await c.client(HelloService)
         print((await hello.say_hello(HelloRequest(name="World"))).message)
 """
@@ -67,31 +66,29 @@ from .registry.models import ServiceSummary
 from .rpc_types import RpcScope, SerializationMode
 from .server import Server
 from .http import HTTPListener
-from .trust.consumer import (
-    ConsumerAdmissionRequest,
-    ConsumerAdmissionResponse,
-    consumer_cred_to_json,
-    handle_consumer_admission_connection,
-)
-from .trust.credentials import ConsumerEnrollmentCredential
-from ._aster import ALPN_CONSUMER_ADMISSION
-from .trust.nonces import InMemoryNonceStore
-from .trust.signing import sign_credential
+from ._aster import ENROLLMENT_ALPN, EnrollmentPlan
 
 __all__ = ["AsterServer", "AsterClient", "AdmissionDeniedError", "RPC_ALPN"]
 
 RPC_ALPN: bytes = b"aster/1"
+
+# `aster.ops.NodeInfo` attributes through which a Python server advertises
+# its services and registry namespace to clients (`AsterClient.services`).
+_SERVICES_ATTRIBUTE = "aster.services"
+_REGISTRY_ATTRIBUTE = "aster.registry_namespace"
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────
 
 
 class AdmissionDeniedError(PermissionError):
-    """Raised when a consumer is refused by the server's admission check.
+    """Raised by :meth:`AsterClient.connect` when the server does not admit
+    this client.
 
-    The server never reveals *why* admission failed (no oracle leak), so this
-    exception enumerates the common causes as a hint to the user rather than
-    a precise diagnosis.
+    With a credential (enrollment configured), the enrollment handshake was
+    refused; ``__cause__`` carries the Rust error. Without one, the server
+    refused the connection, which is what a server with enrollment does to a
+    node that holds no credential.
     """
 
     def __init__(
@@ -101,39 +98,45 @@ class AdmissionDeniedError(PermissionError):
         credential_file: str | None,
         our_endpoint_id: str,
         server_address: str,
+        detail: str = "",
     ) -> None:
         self.had_credential = had_credential
         self.credential_file = credential_file
         self.our_endpoint_id = our_endpoint_id
         self.server_address = server_address
+        self.detail = detail
         super().__init__(self.format_hint())
 
     def format_hint(self) -> str:
         """Return a multi-line actionable hint suitable for CLI output."""
         short_id = (self.our_endpoint_id[:16] + "...") if self.our_endpoint_id else "<unknown>"
         if not self.had_credential:
+            detail = f"  detail: {self.detail}\n" if self.detail else ""
             return (
-                "consumer admission denied -- this server requires a credential.\n"
-                "  - Get an enrollment credential file (.cred) from the server's operator.\n"
-                "  - Then retry with: --rcan <path/to/file.cred>\n"
-                "    (or set ASTER_ENROLLMENT_CREDENTIAL=<path> in the environment)"
+                "connection refused -- the server did not admit this node (it requires\n"
+                "an enrollment credential) or could not be reached.\n"
+                f"{detail}"
+                "  - Ask the operator for a credential issued to this node:\n"
+                f"      aster enroll node --subject {self.our_endpoint_id or '<node id>'} "
+                "--audience <fleet> --out node.cred\n"
+                "  - Then set ASTER_ENROLLMENT_CREDENTIAL=node.cred (or [trust]\n"
+                "    enrollment_credential), ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_AUDIENCE\n"
+                "    and ASTER_ENROLLMENT_FLEET_NAMESPACE, and keep the node key the\n"
+                "    credential names (ASTER_SECRET_KEY_FILE)."
             )
-        cred_label = self.credential_file or "<credential>"
+        cred_label = self.credential_file or "<inline credential>"
+        detail = f"\n  detail:     {self.detail}" if self.detail else ""
         return (
-            f"consumer admission denied -- the server rejected your credential.\n"
+            f"enrollment refused -- the server did not admit this node.\n"
             f"  credential: {cred_label}\n"
-            f"  your node:  {short_id}\n"
+            f"  your node:  {short_id}{detail}\n"
             "  Common causes:\n"
-            "    1. The credential expired (check the 'Expires' field on the file).\n"
-            "    2. The credential was issued to a DIFFERENT node. Credentials are\n"
-            "       bound to a single endpoint id: if you copied this file from\n"
-            "       another machine/process, the server sees a different node id\n"
-            "       and refuses admission. Ask the operator to re-issue it for\n"
-            f"       endpoint_id={short_id}.\n"
-            "    3. The server trusts a different root key than the one that signed\n"
-            "       this credential.\n"
-            "    4. The credential's role/capabilities don't match this server's\n"
-            "       policy (the server may reject unknown capabilities outright)."
+            "    1. The credential expired, or the root revoked this node.\n"
+            "    2. The credential was issued to a DIFFERENT node key: keep the key\n"
+            "       it names (ASTER_SECRET_KEY_FILE) or have it re-issued with\n"
+            f"       aster enroll node --subject {self.our_endpoint_id or '<node id>'}.\n"
+            "    3. The server trusts a different root, or another audience.\n"
+            "    4. The server's admission policy ([enrollment] policy) excludes it."
         )
 
 
@@ -144,16 +147,19 @@ class AsterServer:
     """High-level, declarative producer.
 
     Starts a single :class:`aster.Node` that serves blobs + docs + gossip
-    (iroh built-in protocols) alongside aster RPC (``aster/1``) and any
-    enabled admission ALPNs -- all on **one endpoint, one node ID**.
+    (iroh built-in protocols) alongside aster RPC (``aster/1``) -- all on
+    **one endpoint, one node ID**.
 
-    Gate 0 is the Rust ``GatePolicy`` attached to the node (``self.gate``):
-    every inbound connection on *every* protocol (blobs, docs, gossip,
-    aster/1) is admitted or rejected in Rust at the QUIC handshake. With
-    consumer admission active (``allow_all_consumers=False``) the gate is
-    ``PROTECTED``: only the admission ALPN is open until the peer presents a
-    valid credential, which admits it into the gate's store. With
-    ``allow_all_consumers=True`` it is ``OPEN_DEV``.
+    Admission comes from the configuration. With enrollment configured
+    (``[enrollment]`` / ``ASTER_ENROLLMENT_*`` and a credential; see
+    :class:`aster.EnrollmentConfig`), Enrollment owns Gate 0: only nodes
+    holding a valid credential from ``[trust] root_pubkey`` connect, each
+    peer's verified claims become the roles ``requires=`` checks (evaluated
+    per call), a root revocation refuses the next call and closes the peer's
+    connections, and the server's own credential renews. Any missing or
+    malformed enrollment setting fails :meth:`start` with ``ValueError``.
+    Without enrollment the node is open; ``gate=`` attaches a custom
+    :class:`aster.GatePolicy` instead.
     """
 
     def __init__(
@@ -165,14 +171,11 @@ class AsterServer:
         identity: str | None = None,
         # Inline overrides (take priority over config):
         root_pubkey: bytes | None = None,
-        allow_all_consumers: bool | None = None,
-        allow_all_producers: bool | None = None,
         # Internal wiring:
         channel_name: str = "rpc",
         codec: Any | None = None,
         interceptors: list[Any] | None = None,
         gate: GatePolicy | None = None,
-        nonce_store: Any | None = None,
         registry_namespace: str = "",
         max_sessions_per_connection: int | None = None,
         handler_timeout: float | None = None,
@@ -193,21 +196,21 @@ class AsterServer:
         Args:
             services: List of ``@service``-decorated class instances to serve.
                 At least one is required.
-            config: Optional :class:`AsterConfig` for trust, storage, and
-                networking settings. If omitted, settings are loaded from
-                environment variables and defaults. With ``storage_path``
-                set the node is persistent; its key is kept in
-                ``secret_key_file`` (default ``<storage_path>/node.key``).
-            peer: Optional peer name for this server (used in config lookup
-                and identity file resolution).
+            config: Optional :class:`AsterConfig` for trust, enrollment,
+                storage and networking settings. If omitted, settings are
+                loaded from environment variables (``AsterConfig.from_env()``).
+                With ``storage_path`` set the node is persistent; its key is
+                kept in ``secret_key_file`` (default
+                ``<storage_path>/node.key``).
+            peer: Optional peer name for this server (used in identity file
+                resolution).
             identity: Path to ``.aster-identity`` file (default: auto-detected
                 from CWD). Overrides ``config.identity_file``.
-            root_pubkey: 32-byte ed25519 public key for the trust anchor.
-                Overrides ``config.root_pubkey`` if both are set.
-            allow_all_consumers: If ``True``, skip consumer admission
-                (open gate). Overrides ``config.allow_all_consumers``.
-            gate: Optional :class:`aster.GatePolicy` to use as Gate 0
-                instead of the one derived from ``allow_all_consumers``.
+            root_pubkey: 32-byte ed25519 root public key; overrides
+                ``config.root_pubkey``.
+            gate: Optional :class:`aster.GatePolicy` deciding Gate 0 on a
+                server without enrollment (enrollment owns Gate 0; passing
+                both raises ``ValueError`` at start).
             handler_timeout: Cap on any handler, in seconds (default 300;
                 ``<= 0`` = no cap). Enforced in Rust together with the
                 caller's deadline and each method's ``timeout``.
@@ -215,20 +218,16 @@ class AsterServer:
                 RPC service. Requires ``config.enable_monitoring=True``.
             topology_requires: Native role/``any_of``/``all_of`` Gate-3 requirement
                 for the opt-in topology baseline service.
-            allow_all_producers: Must be ``True`` (the default). Producer
-                mesh admission (``aster.producer_admission``) is not
-                supported; ``False`` raises ``NotImplementedError``.
-                Overrides ``config.allow_all_producers``.
 
         Example::
 
             @service(name="MyService", version=1)
             class MyService:
-                @rpc()
+                @rpc(requires=role("ops.status"))
                 async def hello(self, req: HelloRequest) -> HelloResponse:
                     return HelloResponse(message=f"Hello {req.name}")
 
-            async with AsterServer(services=[MyService()]) as srv:
+            async with AsterServer(services=[MyService()], config=AsterConfig.from_env()) as srv:
                 print(srv.address)
                 await srv.serve()
         """
@@ -241,61 +240,16 @@ class AsterServer:
             config = AsterConfig.from_env()
         if identity is not None:
             config = config.replace(identity_file=identity)
+        if root_pubkey is not None:
+            config = config.replace(root_pubkey=root_pubkey)
 
-        # Inline overrides win over config.
-        self._allow_all_consumers = (
-            allow_all_consumers if allow_all_consumers is not None
-            else config.allow_all_consumers
-        )
-        self._allow_all_producers = (
-            allow_all_producers if allow_all_producers is not None
-            else config.allow_all_producers
-        )
-        if not self._allow_all_producers:
-            raise NotImplementedError(
-                "allow_all_producers=False is not supported: producer mesh "
-                "admission (aster.producer_admission) has been removed from "
-                "the Python binding. Leave allow_all_producers at its default "
-                "(True)."
-            )
-
-        # Load identity file if present (.aster-identity).
+        # Load the node key from an identity file if present (.aster-identity).
         self._peer_name = peer
-        secret_key_from_identity, peer_entry = config.load_identity(
+        secret_key_from_identity, _peer_entry = config.load_identity(
             peer_name=peer, role="producer"
         )
-        if peer_entry and not root_pubkey:
-            # Root pubkey comes from the credential in the identity file.
-            root_pubkey = bytes.fromhex(peer_entry["root_pubkey"])
         config = _with_node_identity(config, secret_key_from_identity)
         self._config = config
-
-        # Resolve root public key: inline > identity file > config file > ephemeral.
-        # The root private key is NEVER on a running node (trust spec §1.1).
-        pub, ephemeral = _resolve_root_pubkey(config)
-        self._root_pubkey = root_pubkey if root_pubkey is not None else pub
-
-        # Dev mode: if using an ephemeral root key (no explicit pubkey file),
-        # auto-open the consumer gate so the quickstart works without
-        # credential files. In production (explicit root_pubkey_file),
-        # the default allow_all_consumers=False requires credentials.
-        if (
-            ephemeral
-            and allow_all_consumers is None
-            and config.root_pubkey_file is None
-        ):
-            self._allow_all_consumers = True
-            logger.info(
-                "Dev mode: allow_all_consumers=True (ephemeral root key). "
-                "Set ASTER_ROOT_PUBKEY_FILE for production admission."
-            )
-
-        if not self._allow_all_consumers and self._root_pubkey is None:
-            raise ValueError(
-                "root_pubkey is required when admission is enabled "
-                "(allow_all_consumers=False). "
-                "Set ASTER_ROOT_PUBKEY_FILE or pass root_pubkey= explicitly."
-            )
 
         self._services_in: list = list(services)
         self._channel_name = channel_name
@@ -303,17 +257,11 @@ class AsterServer:
         # Deadlines are enforced by the Rust dispatcher (design sec. 2.4), so
         # there is no server-side deadline interceptor by default.
         self._interceptors = list(interceptors) if interceptors is not None else []
-        self._nonce_store = nonce_store
 
-        # Gate 0 (Rust): admits/rejects every inbound connection. Its store
-        # also carries the per-peer admission attributes the RPC server reads.
-        self._gate: GatePolicy = (
-            gate
-            if gate is not None
-            else GatePolicy(
-                TrustMode.OPEN_DEV if self._allow_all_consumers else TrustMode.PROTECTED
-            )
-        )
+        # Gate 0: Enrollment when configured (installed at start), else an
+        # application-supplied GatePolicy, else open.
+        self._gate: GatePolicy | None = gate
+        self._enrollment: Any | None = None
         self._registry_namespace = registry_namespace
         self._max_sessions_per_connection = max_sessions_per_connection
         self._handler_timeout = handler_timeout
@@ -363,21 +311,30 @@ class AsterServer:
         from aster import observability
         observability.ensure_started()
 
-        # Determine which aster ALPNs to register on the Router.
-        # Consumer admission is ALWAYS registered -- even in open-gate mode
-        # the consumer uses it to discover services.
-        aster_alpns: list[bytes] = [RPC_ALPN, ALPN_CONSUMER_ADMISSION]
-        if not self._allow_all_consumers and self._nonce_store is None:
-            self._nonce_store = InMemoryNonceStore()
-
-        # Gate 0 runs in Rust on the node's admission hooks, failing closed
-        # when protected.
         node_config = self._config.replace(
-            alpns=tuple(aster_alpns) + tuple(self._config.alpns),
+            alpns=(RPC_ALPN,) + tuple(a for a in self._config.alpns if a != RPC_ALPN),
         )
-        if self._gate.trust_mode == TrustMode.PROTECTED:
-            node_config = node_config.replace(hook_failure_mode="fail_closed")
-        self._node = await Node.start(node_config, gate=self._gate)
+        # Enrollment from `[enrollment]`: validated in full (in Rust) before
+        # the node starts, so a misconfiguration fails here, closed.
+        plan = EnrollmentPlan.from_config(node_config, side="server")
+        if plan is not None:
+            if self._gate is not None:
+                raise ValueError(
+                    "enrollment owns Gate 0: remove gate= or the [enrollment] configuration"
+                )
+            self._node = await Node.start(plan.config, alpns=[ENROLLMENT_ALPN])
+            try:
+                self._enrollment = plan.install(self._node)
+            except BaseException:
+                await self._node.close()
+                self._node = None
+                raise
+        else:
+            # Gate 0 runs in Rust on the node's admission hooks, failing
+            # closed when protected.
+            if self._gate is not None and self._gate.trust_mode == TrustMode.PROTECTED:
+                node_config = node_config.replace(hook_failure_mode="fail_closed")
+            self._node = await Node.start(node_config, gate=self._gate)
         await self._start_health()
         logger.debug(
             "Producer node: %s",
@@ -465,10 +422,10 @@ class AsterServer:
         # capability interceptor is wired.
 
         # S12.2: default-deny startup warning.
-        # When Gate 0 is disabled (allow_all_consumers=True), any service
-        # without explicit authorization is wide open.  Emit a warning so
-        # the developer knows.
-        if self._allow_all_consumers:
+        # When Gate 0 is open (no enrollment, no gate), any service without
+        # explicit authorization is wide open.  Emit a warning so the
+        # developer knows.
+        if self._is_open:
             for svc in self._services_in:
                 svc_cls = svc if inspect.isclass(svc) else type(svc)
                 info = getattr(svc_cls, "__aster_service_info__", None)
@@ -490,10 +447,10 @@ class AsterServer:
                     if not has_explicit_auth:
                         warnings.warn(
                             f"Service '{info.name}' has no authorization configured "
-                            f"and Gate 0 is disabled (allow_all_consumers=True). "
+                            f"and Gate 0 is open (no [enrollment] configured). "
                             f"All consumers can call this service without "
-                            f"authentication. Add @service(requires=...) or "
-                            f"configure an auth interceptor for production use.",
+                            f"authentication. Configure enrollment and add "
+                            f"@service(requires=...) for production use.",
                             UserWarning,
                             stacklevel=2,
                         )
@@ -506,6 +463,8 @@ class AsterServer:
             interceptors=self._interceptors,
             owns_endpoint=False,
             gate=self._gate,
+            enrollment=self._enrollment,
+            node_attributes=self._discovery_attributes(),
             node=self._node,
             on_non_rpc=self._on_non_rpc,
             handler_timeout=self._handler_timeout,
@@ -516,13 +475,51 @@ class AsterServer:
             server_kwargs["max_sessions_per_connection"] = self._max_sessions_per_connection
         self._server = Server(net_client(self._node), **server_kwargs)
 
+        if self._enrollment is not None:
+            # Serve (the enrollment ALPN included), then hold policy: sync
+            # the fleet namespace from the replicas, or import it for the
+            # root to publish into. Then renew this server's credential.
+            self._server.start()
+            try:
+                await self._enrollment.attach_policy(self._node)
+            except BaseException:
+                self._server._dispatcher.close()
+                self._enrollment.close()
+                await self._node.close()
+                raise
+            self._enrollment.start_renewal()
+
         self._print_banner()
         self._started = True
 
         # Always log startup info (visible even when stderr is not a TTY)
         service_names = ", ".join(s.name for s in self._service_summaries)
-        mode = "open-gate" if self._allow_all_consumers else "trusted"
+        mode = self._mode
         logger.info("server starting runtime=python services=[%s] mode=%s", service_names, mode)
+
+    @property
+    def _is_open(self) -> bool:
+        """Gate 0 admits every peer: no enrollment and no protecting gate."""
+        if self._enrollment is not None:
+            return False
+        return self._gate is None or self._gate.trust_mode != TrustMode.PROTECTED
+
+    @property
+    def _mode(self) -> str:
+        if self._enrollment is not None:
+            return "enrollment"
+        return "open" if self._is_open else "gate"
+
+    def _discovery_attributes(self) -> list[tuple[str, str]]:
+        """``aster.ops.NodeInfo`` attributes advertising this server's
+        services and registry namespace (read by ``AsterClient``)."""
+        import json as _json
+
+        services = [s.to_json_dict() for s in self._service_summaries]
+        out = [(_SERVICES_ATTRIBUTE, _json.dumps(services, separators=(",", ":")))]
+        if self._registry_namespace:
+            out.append((_REGISTRY_ATTRIBUTE, self._registry_namespace))
+        return out
 
     def _print_banner(self) -> None:
         """Print the startup banner with service info."""
@@ -585,10 +582,10 @@ class AsterServer:
 
         # ── Mode ──────────────────────────────────────────────────────────
         mode_parts = []
-        if self._allow_all_consumers:
-            mode_parts.append(f"{Y}open-gate{R}")
+        if self._is_open:
+            mode_parts.append(f"{Y}open{R}")
         else:
-            mode_parts.append(f"{G}trusted{R}")
+            mode_parts.append(f"{G}{self._mode}{R}")
         if self._registry_namespace:
             mode_parts.append(f"{G}registry{R}")
         w(f"    {D}mode:{R}      {' '.join(mode_parts)}\n")
@@ -617,7 +614,7 @@ class AsterServer:
         """Create a registry doc and publish each service's contract collection.
 
         After publication, ``self._registry_namespace`` is set to the 64-char
-        hex namespace_id so consumer admission can return it.
+        hex namespace_id, advertised to clients through ``aster.ops.NodeInfo``.
         """
         assert self._node is not None
 
@@ -831,24 +828,8 @@ class AsterServer:
         return self._serve_task
 
     def _on_non_rpc(self, alpn: bytes, conn: Any) -> None:
-        """A connection on a non-RPC ALPN, handed over by the Rust acceptor."""
-        if alpn == ALPN_CONSUMER_ADMISSION:
-            # Always handle consumer admission -- even when
-            # allow_all_consumers=True the consumer needs the services list
-            # from the admission response.
-            services_snapshot = list(self._service_summaries)
-            asyncio.ensure_future(
-                handle_consumer_admission_connection(
-                    conn,
-                    root_pubkey=self._root_pubkey or b"\x00" * 32,
-                    gate=self._gate,
-                    nonce_store=self._nonce_store,
-                    services_getter=lambda: services_snapshot,
-                    registry_namespace_getter=lambda: self._registry_namespace,
-                    allow_unenrolled=self._allow_all_consumers,
-                )
-            )
-            return
+        """A connection on an ALPN nothing routes, handed over by the Rust
+        acceptor (the enrollment ALPN is served in Rust)."""
         try:
             conn.close(0, b"unexpected alpn")
         except Exception:  # noqa: BLE001
@@ -888,6 +869,8 @@ class AsterServer:
                 await self._serve_task
             except (asyncio.CancelledError, Exception):
                 pass
+        if self._enrollment is not None:
+            self._enrollment.close()
 
         # Close the node -- this triggers router.shutdown() which closes all
         # protocol handlers (including aster queue handlers) and the endpoint.
@@ -949,9 +932,8 @@ class AsterServer:
         Delegated admission (``aster.admission`` ALPN, Aster-trust-spec §3a)
         is NOT implemented in the Python binding: the ALPN is not registered
         and no handler runs, so consumers holding @aster enrollment tokens
-        cannot be admitted by a Python producer. Use consumer credentials
-        (``aster.consumer_admission``) instead. Tracked by
-        BINDINGS_CATCHUP_PLAN.md P5 (credential admission moves into Rust).
+        cannot be admitted by a Python producer. Use Enrollment
+        (``[enrollment]``) instead.
         """
         _, peer_entry = self._config.load_identity(
             peer_name=self._peer_name, role="producer"
@@ -972,7 +954,7 @@ class AsterServer:
             logger.warning(
                 "Delegated admission (aster.admission) is not supported by the "
                 "Python binding; @aster enrollment tokens for %s will not be "
-                "accepted. Consumers must use consumer-admission credentials.",
+                "accepted. Admit consumers with Enrollment ([enrollment]).",
                 ", ".join(delegated),
             )
 
@@ -1047,13 +1029,7 @@ class AsterServer:
                     }
 
                     # Invoke register_endpoint on PublicationService
-                    conn = await aster_client._rpc_conn_for(
-                        next(
-                            (s.channels.get("rpc", "") for s in aster_client._services
-                             if s.name == "PublicationService"),
-                            ""
-                        )
-                    )
+                    conn = await aster_client._rpc_conn_for(aster_client._server_key)
                     from .transport.iroh import IrohTransport
                     transport = IrohTransport(conn, codec=self._codec)
                     resp = await transport.unary(
@@ -1214,18 +1190,6 @@ class AsterServer:
         return self.endpoint_addr_b64
 
     @property
-    def _admission_addr_b64(self) -> str | None:
-        if self._allow_all_consumers:
-            return None
-        return self.endpoint_addr_b64
-
-    @property
-    def _consumer_admission_addr_b64(self) -> str | None:
-        if self._allow_all_consumers:
-            return None
-        return self.endpoint_addr_b64
-
-    @property
     def services(self) -> list[ServiceSummary]:
         """List of services hosted by this server."""
         self._require_started()
@@ -1233,14 +1197,23 @@ class AsterServer:
 
     @property
     def root_pubkey(self) -> bytes | None:
-        """The 32-byte ed25519 trust anchor public key, or ``None``."""
-        return self._root_pubkey
+        """The 32-byte ed25519 root public key from the configuration, or ``None``."""
+        return self._config.resolve_root_pubkey()
+
+    @property
+    def enrollment(self) -> Any | None:
+        """The ``aster.Enrollment`` installed from ``[enrollment]`` (``None``
+        when enrollment is off): ``credential``, ``is_renewing``, and
+        ``issue_for(subject, attributes=...)`` when the server runs a
+        delegated issuer."""
+        return self._enrollment
 
     # ── Iroh protocol clients (lazy) ─────────────────────────────────────────
 
     @property
-    def gate(self) -> GatePolicy:
-        """This server's Gate 0 policy (``aster.GatePolicy``).
+    def gate(self) -> GatePolicy | None:
+        """The application-supplied Gate 0 policy (``aster.GatePolicy``), or
+        ``None`` (open, or Enrollment owns Gate 0).
 
         ``gate.admit(peer)`` / ``gate.revoke(peer)`` change who may connect;
         changes apply to new connections.
@@ -1300,16 +1273,21 @@ class AsterServer:
 class AsterClient:
     """High-level, declarative consumer.
 
-    Reads configuration from :class:`AsterConfig` (env vars / TOML file)
-    just like :class:`AsterServer`.  In dev mode (no credentials, ephemeral
-    producer), ``AsterClient()`` with just ``ASTER_ENDPOINT_ADDR`` set is
-    enough.  In production, set ``ASTER_ENROLLMENT_CREDENTIAL`` to the
-    path of a pre-signed token from the operator.
+    Reads configuration from :class:`AsterConfig` (env vars / TOML file) just
+    like :class:`AsterServer`. Against an open server, ``AsterClient(address=
+    ...)`` is enough. With enrollment configured (a credential in ``[trust]
+    enrollment_credential`` / ``ASTER_ENROLLMENT_CREDENTIAL`` plus
+    ``[enrollment]``), :meth:`connect` presents the credential and verifies
+    the server's over the reciprocal enrollment handshake, synchronizes the
+    fleet namespace the server offers (so it learns revocations of the
+    server), and renews the credential from ``renew_from`` or from the server
+    when the server signed it. A misconfiguration raises ``ValueError``; a
+    refusal raises :class:`AdmissionDeniedError`.
 
-    ``endpoint_addr`` may be a base64 ``NodeAddr`` string (as printed by
-    :class:`AsterServer`), an ``EndpointId`` hex string (when discovery is
-    enabled), a :class:`NodeAddr` object, or raw ``NodeAddr.to_bytes()``
-    bytes.
+    ``address`` may be an ``aster1...`` ticket (as printed by
+    :class:`AsterServer`), a base64 ``NodeAddr`` string, an ``EndpointId`` hex
+    string (when discovery is enabled), a :class:`NodeAddr` object, or raw
+    ``NodeAddr.to_bytes()`` bytes.
     """
 
     def __init__(
@@ -1340,23 +1318,23 @@ class AsterClient:
                 - Base64-encoded ``NodeAddr``
                 - Hex ``EndpointId`` (requires discovery)
             endpoint_addr: Alias for *address* (back-compat).
-            root_pubkey: 32-byte ed25519 public key of the server's trust
-                anchor. Required for credential-based admission.
-            enrollment_credential_file: Path to a pre-signed enrollment
-                credential (``.cred`` file from ``aster enroll``).
+            root_pubkey: 32-byte ed25519 root public key; overrides
+                ``config.root_pubkey``.
+            enrollment_credential_file: Path to this node's enrollment
+                credential chain (``aster enroll node --out``); overrides
+                ``config.enrollment_credential_file``. Setting it enables
+                enrollment.
 
         Example::
 
-            # Dev mode -- open gate, no credentials
+            # Open server -- no credentials
             client = AsterClient(address="aster1...")
             await client.connect()
 
-            # Production -- with credential
-            client = AsterClient(
-                address="aster1...",
-                root_pubkey=pub_key,
-                enrollment_credential_file="my-agent.cred",
-            )
+            # Enrollment -- ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_AUDIENCE,
+            # ASTER_ENROLLMENT_FLEET_NAMESPACE, ASTER_ENROLLMENT_CREDENTIAL and
+            # ASTER_SECRET_KEY_FILE in the environment
+            client = AsterClient(config=AsterConfig.from_env(), address="aster1...")
             await client.connect()
         """
         from .config import AsterConfig
@@ -1365,85 +1343,34 @@ class AsterClient:
             config = AsterConfig.from_env()
         if identity is not None:
             config = config.replace(identity_file=identity)
+        if root_pubkey is not None:
+            config = config.replace(root_pubkey=root_pubkey)
+        if enrollment_credential_file is not None:
+            config = config.replace(enrollment_credential_file=enrollment_credential_file)
         self._peer_name = peer
 
-        # Load identity file if present (.aster-identity).
-        secret_key_from_identity, peer_entry = config.load_identity(
+        # The node key from an identity file if present (.aster-identity).
+        secret_key_from_identity, _peer_entry = config.load_identity(
             peer_name=peer, role="consumer"
         )
-
-        # If the user only passed `enrollment_credential_file` (no separate
-        # `identity=`), and that file is a TOML `.aster-identity` (which is
-        # what `aster enroll node` produces), reach into the same file for
-        # the [node] secret_key. Otherwise the QUIC endpoint id we generate
-        # at startup won't match the one baked into the credential and the
-        # server rejects admission with no useful error.
-        #
-        # This makes `enrollment_credential_file=` and `identity=` do the
-        # same thing for the same TOML file -- mirrors how the TS binding's
-        # AsterClientWrapper now treats `enrollmentCredentialFile`.
-        cred_file_for_identity = enrollment_credential_file or config.enrollment_credential_file
-        if (
-            not secret_key_from_identity
-            and not peer_entry
-            and cred_file_for_identity
-            and os.path.exists(os.path.expanduser(cred_file_for_identity))
-        ):
-            try:
-                paired_secret, paired_peer = config.load_identity_from_path(
-                    os.path.expanduser(cred_file_for_identity),
-                    peer_name=peer,
-                    role="consumer",
-                )
-                if paired_secret:
-                    secret_key_from_identity = paired_secret
-                if paired_peer:
-                    peer_entry = paired_peer
-            except Exception:
-                # Best-effort: if the .cred isn't a TOML identity file
-                # (e.g. it's a flat JSON credential), fall through to the
-                # existing _load_enrollment_credential path which handles
-                # both formats. The user just won't get the secret key
-                # auto-loaded -- they'll need to pass `identity=` too.
-                pass
-
         config = _with_node_identity(config, secret_key_from_identity)
         self._config = config
-        if peer_entry and not root_pubkey:
-            root_pubkey = bytes.fromhex(peer_entry["root_pubkey"])
 
         # Resolve endpoint address: address > endpoint_addr > config > error.
         addr = address or endpoint_addr or config.endpoint_addr
         if addr is None:
             raise ValueError(
                 "AsterClient requires an endpoint address. "
-                "Set ASTER_ENDPOINT_ADDR or pass endpoint_addr= explicitly."
+                "Set ASTER_ENDPOINT_ADDR or pass address= explicitly."
             )
         self._endpoint_addr_in = addr
-
-        # Root pubkey (for optional response validation).
-        pub, _ephemeral = _resolve_root_pubkey(config)
-        self._root_pubkey = root_pubkey if root_pubkey is not None else pub
-
-        # Enrollment credential: identity file peer > inline > config > None.
-        if peer_entry and not enrollment_credential_file:
-            # The peer entry IS the credential -- write it to a temp file
-            # that _load_enrollment_credential can read, or inline it.
-            self._inline_credential = peer_entry
-            self._enrollment_credential_file = None
-        else:
-            self._inline_credential = None
-            self._enrollment_credential_file = (
-                enrollment_credential_file or config.enrollment_credential_file
-            )
-        self._enrollment_credential_iid = config.enrollment_credential_iid
         self._channel_name = channel_name
 
         self._node: Any | None = None
         self._ep: Any | None = None
+        self._enrollment: Any | None = None
         self._services: list[ServiceSummary] = []
         self._registry_namespace: str = ""
-        self._open_gate: bool = False
         self._rpc_conns: dict[str, Any] = {}
         # Serialises concurrent `_rpc_conn_for` lookups so bursts of
         # `open_session()` calls can't each race past the cache miss
@@ -1476,10 +1403,24 @@ class AsterClient:
             str, tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]
         ] = {}
 
-    async def connect(self) -> None:
-        """Create endpoint, run admission if credential present, store services.
+    @property
+    def _server_key(self) -> str:
+        """The cache key of the RPC connection to the server."""
+        addr = self._endpoint_addr_in
+        if isinstance(addr, NodeAddr):
+            return base64.b64encode(addr.to_bytes()).decode()
+        if isinstance(addr, (bytes, bytearray)):
+            return base64.b64encode(bytes(addr)).decode()
+        return str(addr)
 
-        Idempotent -- second call is a no-op.
+    async def connect(self) -> None:
+        """Start the node, enroll with the server when configured, and read
+        the services the server advertises. Idempotent.
+
+        Raises:
+            ValueError: the enrollment configuration is incomplete or
+                malformed (nothing falls back to an open client).
+            AdmissionDeniedError: the server refused this client.
         """
         if self._connected:
             return
@@ -1491,31 +1432,106 @@ class AsterClient:
         from aster import observability
         observability.ensure_started()
 
-        node_config = self._config.replace(
-            alpns=(ALPN_CONSUMER_ADMISSION, RPC_ALPN) + tuple(self._config.alpns),
-        )
-        self._node = await Node.start(node_config)
-        if node_config.storage_path:
-            logger.debug("Consumer node: persistent at %s", node_config.storage_path)
+        target = _coerce_node_addr(self._endpoint_addr_in)
+        # Enrollment from `[enrollment]`: validated in Rust before the node
+        # starts (a client may not run an issuer; state defaults to a
+        # temporary directory removed when the client closes).
+        plan = EnrollmentPlan.from_config(self._config, side="client")
+        if plan is not None:
+            self._node = await Node.start(plan.config, alpns=[ENROLLMENT_ALPN])
+        else:
+            self._node = await Node.start(self._config)
+        if self._config.storage_path:
+            logger.debug("Consumer node: persistent at %s", self._config.storage_path)
         else:
             logger.debug("Consumer node: in-memory (set ASTER_STORAGE_PATH for persistence)")
         self._ep = net_client(self._node)
 
-        logger.debug(
-            "Consumer node ready: endpoint_id=%s",
-            self._node.node_addr_info().endpoint_id[:16] + "…",
-        )
-
-        # Always run the admission handshake -- even when the consumer gate
-        # is open, the response carries the services list + registry ticket.
-        await self._run_admission()
+        try:
+            if plan is not None:
+                self._enrollment = plan.install(self._node)
+                try:
+                    await self._enrollment.enroll_with(self._node, target)
+                except Exception as exc:  # noqa: BLE001
+                    raise self._denied(True, str(exc)) from exc
+                self._enrollment.start_renewal(target)
+            await self._discover()
+        except BaseException:
+            await self._shutdown_node()
+            raise
         self._connected = True
         self._reconnect_attempts = 0
+
+    def _denied(self, had_credential: bool, detail: str = "") -> AdmissionDeniedError:
+        our_endpoint_id = ""
+        try:
+            if self._node is not None:
+                our_endpoint_id = self._node.node_addr_info().endpoint_id
+        except Exception:  # noqa: BLE001
+            pass
+        return AdmissionDeniedError(
+            had_credential=had_credential,
+            credential_file=self._config.enrollment_credential_file,
+            our_endpoint_id=our_endpoint_id,
+            server_address=str(self._endpoint_addr_in),
+            detail=detail,
+        )
+
+    async def _discover(self) -> None:
+        """Open the RPC connection and read the services the server
+        advertises through ``aster.ops.NodeInfo`` (a server that does not
+        advertise them still serves typed clients)."""
+        import json as _json
+        from .status import RpcError
+        from .transport.iroh import rpc_client
+
+        enrolled = self._enrollment is not None
+        try:
+            conn = await self._rpc_conn_for(self._server_key)
+        except Exception as exc:  # noqa: BLE001
+            if enrolled:
+                raise
+            raise self._denied(False, str(exc)) from exc
+        try:
+            info = await asyncio.wait_for(rpc_client(conn).describe_node(), 15)
+        except RpcError as exc:
+            logger.debug("server does not describe its services: %s", exc)
+            info = {"attributes": {}}
+        except Exception as exc:  # noqa: BLE001
+            self._rpc_conns.pop(self._server_key, None)
+            if enrolled:
+                raise
+            raise self._denied(False, str(exc)) from exc
+
+        attributes = info.get("attributes") or {}
+        services: list[ServiceSummary] = []
+        raw = attributes.get(_SERVICES_ATTRIBUTE)
+        if raw:
+            try:
+                from .limits import MAX_ADVERTISED_SERVICES
+
+                for d in _json.loads(raw)[:MAX_ADVERTISED_SERVICES]:
+                    summary = ServiceSummary.from_json_dict(d)
+                    # Every channel is this server's RPC connection.
+                    summary.channels = {
+                        name: self._server_key for name in (summary.channels or {self._channel_name: ""})
+                    }
+                    services.append(summary)
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning("ignoring malformed %s attribute: %s", _SERVICES_ATTRIBUTE, exc)
+        self._services = services
+        self._registry_namespace = attributes.get(_REGISTRY_ATTRIBUTE) or ""
+        logger.info(
+            "Connected -- services: %s, registry_namespace: %s, enrollment: %s",
+            [s.name for s in self._services],
+            bool(self._registry_namespace),
+            enrolled,
+        )
 
     async def reconnect(self) -> None:
         """Reconnect after a connection drop.
 
-        Closes stale connections, re-runs admission, and rebuilds the
+        Closes stale connections, opens a new RPC connection and rereads the
         services list. Uses exponential backoff on repeated failures.
         """
         self._rpc_conns.clear()
@@ -1532,7 +1548,7 @@ class AsterClient:
                     )
                     await asyncio.sleep(delay)
 
-                await self._run_admission()
+                await self._discover()
                 self._connected = True
                 self._reconnect_attempts = 0
                 logger.info("Reconnected successfully")
@@ -1543,70 +1559,6 @@ class AsterClient:
 
         raise ConnectionError(
             f"Failed to reconnect after {self._max_reconnect_attempts} attempts"
-        )
-
-    async def _run_admission(self) -> None:
-        """Connect via ``aster.consumer_admission`` to get services.
-
-        If an enrollment credential is configured, it's presented for
-        verification.  If not (dev mode / open gate), an empty credential
-        is sent -- the producer auto-admits when ``allow_all_consumers=True``.
-        """
-        assert self._ep is not None
-
-        # Build credential from: inline peer entry > credential file > empty.
-        credential_file: str | None = None
-        if self._inline_credential:
-            cred = _credential_from_peer_entry(self._inline_credential)
-            cred_json = consumer_cred_to_json(cred)
-            credential_file = "<inline .aster-identity peer entry>"
-        elif self._enrollment_credential_file:
-            cred = _load_enrollment_credential(self._enrollment_credential_file)
-            cred_json = consumer_cred_to_json(cred)
-            credential_file = self._enrollment_credential_file
-        else:
-            # No credential -- dev mode / open-gate flow.
-            cred_json = ""
-
-        iid_token = self._enrollment_credential_iid or ""
-
-        target = _coerce_node_addr(self._endpoint_addr_in)
-        conn = await self._ep.connect_node_addr(target, ALPN_CONSUMER_ADMISSION)
-        send, recv = await conn.open_bi()
-        req = ConsumerAdmissionRequest(
-            credential_json=cred_json,
-            iid_token=iid_token,
-        )
-        await send.write_all(req.to_json().encode())
-        await send.finish()
-        raw = await recv.read_to_end(64 * 1024)
-        resp = ConsumerAdmissionResponse.from_json(raw)
-        if not resp.admitted:
-            our_endpoint_id = ""
-            try:
-                if self._node is not None:
-                    our_endpoint_id = self._node.node_addr_info().endpoint_id
-            except Exception:
-                pass
-            raise AdmissionDeniedError(
-                had_credential=bool(cred_json),
-                credential_file=credential_file,
-                our_endpoint_id=our_endpoint_id,
-                server_address=str(self._endpoint_addr_in),
-            )
-
-        # If the admission succeeded without us presenting a credential,
-        # the server must be running in open-gate mode (allow_all_consumers).
-        # The shell uses this to suppress noisy "Identity not configured"
-        # banners that are irrelevant on open-gate servers.
-        self._open_gate = not cred_json
-
-        self._services = list(resp.services)
-        self._registry_namespace = resp.registry_namespace or ""
-        logger.info(
-            "Admitted -- services: %s, registry_namespace: %s",
-            [s.name for s in self._services],
-            bool(self._registry_namespace),
         )
 
     async def _rpc_conn_for(self, rpc_addr_b64: str) -> Any:
@@ -1704,7 +1656,7 @@ class AsterClient:
             return doc
 
     async def _ensure_manifest(
-        self, service_name: str, version: int
+        self, service_name: str, version: int, summary: "ServiceSummary | None" = None
     ) -> Any | None:
         """Fetch and cache the contract manifest for (name, version). Uses the
         ``manifests/{contract_id}`` fast-path shortcut when available, falls
@@ -1716,11 +1668,11 @@ class AsterClient:
         if cached is not None:
             return cached
 
-        summary: ServiceSummary | None = None
-        for s in self._services:
-            if s.name == service_name and s.version == version:
-                summary = s
-                break
+        if summary is None:
+            for s in self._services:
+                if s.name == service_name and s.version == version:
+                    summary = s
+                    break
         if summary is None or not getattr(summary, "contract_id", ""):
             return None
 
@@ -1959,25 +1911,33 @@ class AsterClient:
                 f"{service_cls!r} is not @service-decorated "
                 f"(missing __aster_service_info__)"
             )
+        rpc_addr_key = self._rpc_key_for(info.name, info.version, channel)
+        conn = await self._rpc_conn_for(rpc_addr_key)
+        return conn, rpc_addr_key, info
+
+    def _rpc_key_for(self, name: str, version: int, channel: str | None) -> str:
+        """The RPC connection key for a typed client of ``(name, version)``.
+        A server that advertises its services must list it; one that does not
+        (another binding, or a Rust ``AsterServer``) is called directly."""
+        if not self._services:
+            return self._server_key
         summary: ServiceSummary | None = None
         for s in self._services:
-            if s.name == info.name and s.version == info.version:
+            if s.name == name and s.version == version:
                 summary = s
                 break
         if summary is None:
             raise LookupError(
-                f"service {info.name!r} v{info.version} not offered by producer "
+                f"service {name!r} v{version} not offered by producer "
                 f"(got: {[(s.name, s.version) for s in self._services]})"
             )
         channel_key = channel or self._channel_name
         if channel_key not in summary.channels:
             raise LookupError(
-                f"service {info.name!r} has no channel {channel_key!r} "
+                f"service {name!r} has no channel {channel_key!r} "
                 f"(available: {list(summary.channels)})"
             )
-        rpc_addr_key = summary.channels[channel_key]
-        conn = await self._rpc_conn_for(rpc_addr_key)
-        return conn, rpc_addr_key, info
+        return summary.channels[channel_key]
 
     async def open_session(
         self,
@@ -2003,19 +1963,8 @@ class AsterClient:
         if service_cls is not None:
             conn, rpc_addr_key, _ = await self._resolve_service(service_cls, channel)
         else:
-            # Fall back to any advertised RPC channel. Every service
-            # summary from admission carries the same `rpc_addr` when
-            # the producer serves a single channel, so this is
-            # deterministic in the common case.
-            summary = next(iter(self._services), None)
-            if summary is None:
-                raise LookupError("no services advertised by the producer")
-            channel_key = channel or self._channel_name
-            if channel_key not in summary.channels:
-                raise LookupError(
-                    f"producer has no channel {channel_key!r}"
-                )
-            rpc_addr_key = summary.channels[channel_key]
+            # The server's RPC connection.
+            rpc_addr_key = self._server_key
             conn = await self._rpc_conn_for(rpc_addr_key)
 
         session_id = self._next_session_id(rpc_addr_key)
@@ -2045,25 +1994,8 @@ class AsterClient:
                 f"(missing __aster_service_info__)"
             )
 
-        summary: ServiceSummary | None = None
-        for s in self._services:
-            if s.name == info.name and s.version == info.version:
-                summary = s
-                break
-        if summary is None:
-            raise LookupError(
-                f"service {info.name!r} v{info.version} not offered by producer "
-                f"(got: {[(s.name, s.version) for s in self._services]})"
-            )
-
-        channel_key = channel or self._channel_name
-        if channel_key not in summary.channels:
-            raise LookupError(
-                f"service {info.name!r} has no channel {channel_key!r} "
-                f"(available: {list(summary.channels)})"
-            )
-
-        conn = await self._rpc_conn_for(summary.channels[channel_key])
+        rpc_addr_key = self._rpc_key_for(info.name, info.version, channel)
+        conn = await self._rpc_conn_for(rpc_addr_key)
 
         # Session-scoped services route via a ClientSession allocated on
         # the fly. Every call threads the same monotonic sessionId into
@@ -2071,11 +2003,11 @@ class AsterClient:
         # session-instance (spec Sec. 6 / 7.5). Callers who want explicit
         # session lifecycle should use AsterClient.open_session() instead.
         if info.scoped == RpcScope.SESSION:
-            session_id = self._next_session_id(summary.channels[channel_key])
+            session_id = self._next_session_id(rpc_addr_key)
             session = ClientSession(
                 parent=self,
                 connection=conn,
-                rpc_addr_key=summary.channels[channel_key],
+                rpc_addr_key=rpc_addr_key,
                 session_id=session_id,
             )
             client = await session.client(
@@ -2105,7 +2037,11 @@ class AsterClient:
                 pass
         self._clients.clear()
         self._rpc_conns.clear()
+        await self._shutdown_node()
 
+    async def _shutdown_node(self) -> None:
+        if self._enrollment is not None:
+            self._enrollment.close()
         if self._node is not None:
             try:
                 await self._node.shutdown()
@@ -2132,20 +2068,27 @@ class AsterClient:
     def registry_namespace(self) -> str:
         """64-char hex namespace_id for the registry doc.
 
-        Empty string if no registry doc was provided by the producer.
+        Empty string if the server advertised no registry doc.
         """
         return self._registry_namespace
 
     @property
-    def open_gate(self) -> bool:
-        """True if the server admitted this client without a credential.
+    def enrollment(self) -> Any | None:
+        """The ``aster.Enrollment`` installed from ``[enrollment]``, or
+        ``None`` when enrollment is off (``credential``, ``is_renewing``)."""
+        return self._enrollment
 
-        When True, the server is running with ``allow_all_consumers=True``
-        and no credential was required. Useful for clients (e.g. the shell)
-        that want to suppress identity-related banners that are irrelevant
-        on open-gate servers.
-        """
-        return self._open_gate
+    @property
+    def is_renewing(self) -> bool:
+        """Whether this client is renewing its credential."""
+        return self._enrollment is not None and self._enrollment.is_renewing
+
+    @property
+    def open_gate(self) -> bool:
+        """True when this client connected without enrollment (the server
+        admits any node). Clients such as the shell use it to suppress
+        identity banners that are irrelevant on an open server."""
+        return self._connected and self._enrollment is None
 
     async def proxy(self, service_name: str) -> "ProxyClient":
         """Create a dynamic proxy client for a shared (stream-per-call) service.
@@ -2177,7 +2120,7 @@ class AsterClient:
         if not self._connected:
             raise RuntimeError("AsterClient not connected; call connect() first")
 
-        summary = self._find_service(service_name)
+        summary = await self._resolve_named_service(service_name)
 
         if getattr(summary, "pattern", "shared") == "session":
             raise TypeError(
@@ -2218,7 +2161,7 @@ class AsterClient:
         if not self._connected:
             raise RuntimeError("AsterClient not connected; call connect() first")
 
-        summary = self._find_service(service_name)
+        summary = await self._resolve_named_service(service_name)
 
         channel_key = self._channel_name
         if channel_key not in summary.channels:
@@ -2240,8 +2183,61 @@ class AsterClient:
         self._clients.append(session_client)
         return session_client
 
+    async def _resolve_named_service(self, service_name: str) -> "ServiceSummary":
+        """A service by name: from the ``aster.services`` NodeInfo attribute a
+        Python server advertises, else from the registry doc named by the
+        ``aster.registry_namespace`` attribute (every binding's server
+        publishes that one), else ``ValueError``."""
+        for s in self._services:
+            if s.name == service_name:
+                return s
+        summary = await self._summary_from_registry(service_name)
+        if summary is not None:
+            self._services.append(summary)
+            return summary
+        return self._find_service(service_name)
+
+    async def _summary_from_registry(self, service_name: str) -> "ServiceSummary | None":
+        """Build a summary from the registry doc's
+        ``services/{name}/versions/v{n}`` pointer (highest version) and the
+        published manifest."""
+        import re as _re
+
+        doc = await self._ensure_registry_doc()
+        if doc is None:
+            return None
+        prefix = f"services/{service_name}/versions/v".encode()
+        try:
+            entries = await doc.query_key_prefix(prefix)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("registry lookup for %s failed: %s", service_name, exc)
+            return None
+        best: tuple[int, str] | None = None
+        for entry in entries:
+            key = bytes(entry.key).decode(errors="replace")
+            m = _re.fullmatch(rf"services/{_re.escape(service_name)}/versions/v(\d+)", key)
+            if not m:
+                continue
+            version = int(m.group(1))
+            if best is None or version > best[0]:
+                cid = bytes(await doc.read_entry_content(entry.content_hash)).decode().strip()
+                best = (version, cid)
+        if best is None:
+            return None
+        summary = ServiceSummary(
+            name=service_name,
+            version=best[0],
+            contract_id=best[1],
+            channels={self._channel_name: self._server_key},
+        )
+        manifest = await self._ensure_manifest(service_name, best[0], summary)
+        if manifest is not None:
+            summary.pattern = getattr(manifest, "scoped", "shared") or "shared"
+            summary.serialization_modes = list(getattr(manifest, "serialization_modes", []) or [])
+        return summary
+
     def _find_service(self, service_name: str) -> "ServiceSummary":
-        """Look up a service by name in the admission response."""
+        """Look up a service by name in the services the server advertises."""
         for s in self._services:
             if s.name == service_name:
                 return s
@@ -2535,103 +2531,6 @@ def _with_node_identity(config: AsterConfig, identity_key: bytes | None) -> Aste
     return config
 
 
-def _resolve_root_pubkey(config: AsterConfig) -> tuple[bytes | None, bool]:
-    """Resolve the root public key; ``(key, ephemeral)``.
-
-    Inline ``root_pubkey`` / ``root_pubkey_file`` are resolved by Rust. With
-    neither, and an admission gate configured, a transient root key pair is
-    generated (dev mode; the private half is discarded -- the root private
-    key never lives on a running node, trust spec section 1.1).
-    """
-    pub = config.resolve_root_pubkey()
-    if pub is not None:
-        return pub, False
-    if config.root_pubkey_file:
-        logger.warning(
-            "Root pubkey file %s not found", config.root_pubkey_file
-        )
-    if not config.allow_all_consumers or not config.allow_all_producers:
-        from .trust.signing import generate_root_keypair
-
-        _priv, pub = generate_root_keypair()
-        logger.info(
-            "Generated ephemeral root key "
-            "(set ASTER_ROOT_PUBKEY_FILE for production)"
-        )
-        return pub, True
-    return None, False
-
-
-def _credential_from_peer_entry(peer: dict) -> ConsumerEnrollmentCredential:
-    """Build a ConsumerEnrollmentCredential from a [[peers]] entry in .aster-identity."""
-    nonce_hex = peer.get("nonce")
-    return ConsumerEnrollmentCredential(
-        credential_type=peer.get("type", "policy"),
-        root_pubkey=bytes.fromhex(peer["root_pubkey"]),
-        expires_at=int(peer["expires_at"]),
-        attributes=peer.get("attributes", {}),
-        endpoint_id=peer.get("endpoint_id"),
-        nonce=bytes.fromhex(nonce_hex) if nonce_hex else None,
-        signature=bytes.fromhex(peer.get("signature", "")),
-    )
-
-
-def _load_enrollment_credential(path: str) -> ConsumerEnrollmentCredential:
-    """Load a pre-signed ConsumerEnrollmentCredential from a credential file.
-
-    Supports two formats:
-    - JSON: standalone ``{"credential_type":..., "root_pubkey":..., ...}``
-    - TOML (.aster-identity): reads the first consumer ``[[peers]]`` entry
-    """
-    import json as _json
-
-    expanded = os.path.expanduser(path)
-    with open(expanded) as f:
-        raw = f.read()
-
-    # Try JSON first
-    raw_stripped = raw.strip()
-    if raw_stripped.startswith("{"):
-        d = _json.loads(raw_stripped)
-    elif raw_stripped.startswith("[node]") or raw_stripped.startswith("[") or raw_stripped.startswith("#"):
-        # TOML identity file -- extract the first consumer peer entry
-        d = _extract_credential_from_identity(raw_stripped)
-    else:
-        # Try JSON anyway (may be array or other format)
-        d = _json.loads(raw_stripped)
-
-    nonce_hex = d.get("nonce")
-    cred = ConsumerEnrollmentCredential(
-        credential_type=d.get("credential_type") or d.get("type", "policy"),
-        root_pubkey=bytes.fromhex(d["root_pubkey"]),
-        expires_at=int(d["expires_at"]),
-        attributes=d.get("attributes", {}),
-        endpoint_id=d.get("endpoint_id"),
-        nonce=bytes.fromhex(nonce_hex) if nonce_hex else None,
-        signature=bytes.fromhex(d.get("signature", "")),
-    )
-    return cred
-
-
-def _extract_credential_from_identity(toml_text: str) -> dict:
-    """Extract the first consumer peer entry from a TOML .aster-identity file."""
-    try:
-        import tomllib
-    except ImportError:
-        import tomli as tomllib  # type: ignore[no-redef]
-
-    data = tomllib.loads(toml_text)
-    peers = data.get("peers", [])
-    # Find the first consumer-role peer
-    for peer in peers:
-        if peer.get("role") == "consumer":
-            return peer
-    # Fall back to first peer
-    if peers:
-        return peers[0]
-    raise ValueError(f"No peer entries found in identity file")
-
-
 def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:
     if isinstance(addr, NodeAddr):
         return addr
@@ -2652,7 +2551,7 @@ def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:
         return NodeAddr.from_bytes(base64.b64decode(addr))
     if isinstance(addr, (bytes, bytearray)):
         return NodeAddr.from_bytes(bytes(addr))
-    raise TypeError(f"unsupported admission_addr type: {type(addr).__name__}")
+    raise TypeError(f"unsupported address type: {type(addr).__name__}")
 
 
 # ── ProxyClient ──────────────────────────────────────────────────────────────

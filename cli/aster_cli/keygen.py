@@ -132,8 +132,8 @@ def _keygen_producer(args) -> int:
     print("Use it as the node identity:")
     print(f"  ASTER_SECRET_KEY_FILE={out_path}")
     print()
-    print("Next step -- sign an enrollment token for this producer:")
-    print(f"  aster authorize --root-key <root.key> --producer-id {node_id} --out enrollment.token")
+    print("Next step -- issue this node an enrollment credential (Rust aster CLI):")
+    print(f"  aster enroll node --subject {node_id} --audience <fleet> --out node.cred")
     return 0
 
 

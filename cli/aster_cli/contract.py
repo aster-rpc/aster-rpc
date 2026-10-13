@@ -432,10 +432,8 @@ def _call_command(args: argparse.Namespace) -> int:
         config = config.replace(storage_path=None)
 
         if rcan_path:
-            # Look for the .aster-identity file alongside the credential
-            # file. `aster enroll node` creates them as a pair in the same
-            # directory. If the env didn't already point at one and the
-            # CWD doesn't have one, fall back to the credential's dir.
+            # Look for an .aster-identity file (the node key) alongside the
+            # credential file when the env names none.
             cred_dir = _os.path.dirname(_os.path.abspath(rcan_path))
             paired = _os.path.join(cred_dir, ".aster-identity")
             if not config.identity_file or not _os.path.exists(config.identity_file):
@@ -1033,7 +1031,7 @@ def main() -> None:
         "--rcan",
         default=None,
         metavar="PATH",
-        help="Path to enrollment credential (.cred file) for trusted-mode connections",
+        help="Enrollment credential chain file (aster enroll node --out); also set ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_AUDIENCE, ASTER_ENROLLMENT_FLEET_NAMESPACE and the node key it names (ASTER_SECRET_KEY_FILE)",
     )
 
     # ``aster contract export``
@@ -1101,10 +1099,6 @@ def main() -> None:
         help="Path to manifest.json to preview (toolchain-agnostic)",
     )
 
-    # ``aster trust`` subcommand group (Phase 11)
-    from aster_cli.trust import register_trust_subparser, run_trust_command
-    trust_parser = register_trust_subparser(subparsers)
-
     # ``aster keygen`` subcommand group
     from aster_cli.keygen import register_keygen_subparser, run_keygen_command
     register_keygen_subparser(subparsers)
@@ -1112,10 +1106,6 @@ def main() -> None:
     # ``aster profile`` subcommand group
     from aster_cli.profile import register_profile_subparser
     register_profile_subparser(subparsers)
-
-    # ``aster enroll`` subcommand group
-    from aster_cli.enroll import register_enroll_subparser
-    register_enroll_subparser(subparsers)
 
     # Identity / registration commands
     from aster_cli.join import register_join_subparser
@@ -1173,7 +1163,7 @@ def main() -> None:
     )
     call_parser.add_argument(
         "--rcan", default=None, metavar="PATH",
-        help="Path to credential file (JSON or .aster-identity TOML)",
+        help="Enrollment credential chain file (aster enroll node --out); also set ASTER_ROOT_PUBKEY, ASTER_ENROLLMENT_AUDIENCE, ASTER_ENROLLMENT_FLEET_NAMESPACE and the node key it names (ASTER_SECRET_KEY_FILE)",
     )
 
     # ``aster init`` subcommand
@@ -1183,32 +1173,6 @@ def main() -> None:
     # ``aster mcp`` subcommand
     from aster_cli.mcp.server import register_mcp_subparser
     register_mcp_subparser(subparsers)
-
-    # ``aster authorize`` -- sign a producer enrollment credential (legacy)
-    auth_parser = subparsers.add_parser(
-        "authorize",
-        help="Sign a producer enrollment credential (offline)",
-    )
-    auth_parser.add_argument(
-        "--root-key", required=True, metavar="PATH",
-        help="Path to root key JSON (from 'aster keygen root')",
-    )
-    auth_parser.add_argument(
-        "--producer-id", required=True, metavar="NODE_ID",
-        help="Producer NodeId to bind to the credential",
-    )
-    auth_parser.add_argument(
-        "--attributes", default=None, metavar="JSON",
-        help='Optional JSON attributes, e.g. \'{"aster.role":"producer"}\'',
-    )
-    auth_parser.add_argument(
-        "--expires", default=None, metavar="ISO8601",
-        help="Expiry datetime in ISO 8601 (default: +30 days)",
-    )
-    auth_parser.add_argument(
-        "--out", default="enrollment.token", metavar="PATH",
-        help="Output path for the signed credential JSON (default: enrollment.token)",
-    )
 
     args = parser.parse_args()
 
@@ -1235,16 +1199,11 @@ def main() -> None:
             sys.exit(1)
     elif args.command == "call":
         sys.exit(_call_command(args))
-    elif args.command == "trust":
-        sys.exit(run_trust_command(args))
     elif args.command == "keygen":
         sys.exit(run_keygen_command(args))
     elif args.command == "profile":
         from aster_cli.profile import run_profile_command
         sys.exit(run_profile_command(args))
-    elif args.command == "enroll":
-        from aster_cli.enroll import run_enroll_command
-        sys.exit(run_enroll_command(args))
     elif args.command in {"join", "verify", "status", "whoami"}:
         from aster_cli.join import run_join_command
         sys.exit(run_join_command(args))
@@ -1263,12 +1222,6 @@ def main() -> None:
     elif args.command == "mcp":
         from aster_cli.mcp.server import run_mcp_command
         sys.exit(run_mcp_command(args))
-    elif args.command == "authorize":
-        # Map to trust sign --type producer (legacy)
-        args.endpoint_id = args.producer_id
-        args.type = "producer"
-        args.trust_command = "sign"
-        sys.exit(run_trust_command(args))
     else:
         parser.print_help()
         sys.exit(1)

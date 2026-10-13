@@ -11,7 +11,6 @@ from aster.limits import (
     HEX_FIELD_LENGTHS,
     LimitExceeded,
     MAX_ACL_LIST_SIZE,
-    MAX_ADMISSION_PAYLOAD_SIZE,
     MAX_COLLECTION_INDEX_ENTRIES,
     MAX_DECOMPRESSED_SIZE,
     MAX_FRAME_SIZE,
@@ -20,7 +19,7 @@ from aster.limits import (
     MAX_MANIFEST_TYPE_HASHES,
     MAX_METADATA_ENTRIES,
     MAX_METADATA_TOTAL_BYTES,
-    MAX_SERVICES_IN_ADMISSION,
+    MAX_ADVERTISED_SERVICES,
     MAX_STATUS_MESSAGE_LEN,
     validate_hex_field,
     validate_metadata,
@@ -190,26 +189,12 @@ class TestServerMetadataCap:
         assert len(result) <= MAX_METADATA_ENTRIES
 
 
-# ── H1: Admission services cap ───────────────────────────────────────────────
+# ── H1: Advertised services cap ──────────────────────────────────────────────
 
 
-class TestAdmissionServicesCap:
-    def test_services_capped(self):
-        from aster.trust.consumer import ConsumerAdmissionResponse
-
-        # Build a response with too many services
-        services = [
-            {"name": f"svc{i}", "version": 1, "contract_id": "ab" * 32, "channels": {}}
-            for i in range(MAX_SERVICES_IN_ADMISSION + 10)
-        ]
-        raw = json.dumps({
-            "admitted": True,
-            "services": services,
-            "registry_namespace": "",
-            "root_pubkey": "",
-        })
-        resp = ConsumerAdmissionResponse.from_json(raw)
-        assert len(resp.services) == MAX_SERVICES_IN_ADMISSION
+class TestAdvertisedServicesCap:
+    def test_limits_constant_reasonable(self):
+        assert 100 <= MAX_ADVERTISED_SERVICES <= 100_000
 
 
 # ── H2: RpcStatus message cap ────────────────────────────────────────────────
@@ -229,38 +214,6 @@ class TestCollectionIndexCap:
     def test_limits_constant_reasonable(self):
         assert MAX_COLLECTION_INDEX_ENTRIES >= 100
         assert MAX_COLLECTION_INDEX_ENTRIES <= 100_000
-
-
-# ── H4: Hex field validation in credentials ──────────────────────────────────
-
-
-class TestCredentialHexValidation:
-    def test_valid_credential(self):
-        from aster.trust.consumer import consumer_cred_from_json
-
-        cred_json = json.dumps({
-            "credential_type": "policy",
-            "root_pubkey": "ab" * 32,
-            "expires_at": 9999999999,
-            "attributes": {},
-            "endpoint_id": "cd" * 32,
-            "nonce": "ef" * 32,
-            "signature": "01" * 64,
-        })
-        cred = consumer_cred_from_json(cred_json)
-        assert len(cred.root_pubkey) == 32
-        assert len(cred.signature) == 64
-
-    def test_invalid_pubkey_length_rejected(self):
-        from aster.trust.consumer import consumer_cred_from_json
-
-        cred_json = json.dumps({
-            "credential_type": "policy",
-            "root_pubkey": "ab" * 16,  # too short
-            "expires_at": 9999999999,
-        })
-        with pytest.raises(LimitExceeded):
-            consumer_cred_from_json(cred_json)
 
 
 # ── M1: ACL type validation ──────────────────────────────────────────────────

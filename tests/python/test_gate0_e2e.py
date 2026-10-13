@@ -1,55 +1,36 @@
 """
-End-to-end tests for Gate 0 (connection-level admission hook).
+End-to-end Gate 0 (connection-level admission) through ``AsterServer``.
 
-Spec reference: Aster-trust-spec.md section 3.3.
+Enrollment owns Gate 0 when ``[enrollment]`` is configured (see
+``test_enrollment_aster_server.py``). Without it a server is open, or an
+application supplies its own Rust ``GatePolicy`` (``gate=``), the escape
+hatch these tests cover:
 
-Gate 0 is the QUIC connection-level admission gate.  When enabled on
-AsterServer (allow_all_consumers=False), the Rust GatePolicy attached to
-the node checks every incoming connection:
-
-  - Admission ALPNs (aster.consumer_admission, aster.producer_admission)
-    are ALWAYS allowed through so new peers can present credentials.
-  - Non-admitted peers trying to use the RPC ALPN (aster/1) are denied
-    at the QUIC handshake layer.
-  - After successful admission (valid credential), the peer's EndpointId
-    is added to the admitted set and RPC calls succeed.
-
-Tests:
-  1. Unadmitted peer is denied on the RPC ALPN.
-  2. Admission ALPN is always open (even for unadmitted peers).
-  3. Admitted peer can make RPC calls after presenting a valid credential.
+  1. A peer the gate has not admitted cannot reach ``aster/1``; the client
+     sees ``AdmissionDeniedError``.
+  2. After ``gate.admit(peer, attributes)`` the peer connects, and the
+     attributes reach Gate 3 (``requires=``).
+  3. Without enrollment or a gate the server is open.
 """
 
 from __future__ import annotations
 
-import asyncio
-import time
 from dataclasses import dataclass
 
 import pytest
 
 from aster import (
-    AsterServer,
     AsterClient,
     AsterConfig,
-    create_endpoint_with_config,
-    EndpointConfig,
-    service,
+    AsterServer,
+    GatePolicy,
+    SecretKey,
     rpc,
+    service,
     wire_type,
 )
-from aster.runtime import RPC_ALPN
-from aster import ALPN_CONSUMER_ADMISSION, TrustMode
-from aster.trust.credentials import ConsumerEnrollmentCredential
-from aster.trust.consumer import (
-    ConsumerAdmissionRequest,
-    ConsumerAdmissionResponse,
-    consumer_cred_to_json,
-)
-from aster.trust.signing import generate_root_keypair, sign_credential
-
-
-# ── Test service + wire types ────────────────────────────────────────────────
+from aster.runtime import AdmissionDeniedError
+from aster.status import PermissionDeniedError
 
 
 @wire_type("test.gate0/PingRequest")
@@ -70,265 +51,51 @@ class Gate0PingService:
     async def ping(self, req: PingRequest) -> PingResponse:
         return PingResponse(payload=f"pong:{req.payload}")
 
+    @rpc(requires="ops.admin")
+    async def admin(self, req: PingRequest) -> PingResponse:
+        return PingResponse(payload=f"admin:{req.payload}")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
-
-def _make_policy_cred(
-    priv_raw: bytes,
-    pub_raw: bytes,
-) -> ConsumerEnrollmentCredential:
-    """Create a valid policy credential signed with the given root key."""
-    cred = ConsumerEnrollmentCredential(
-        credential_type="policy",
-        root_pubkey=pub_raw,
-        expires_at=int(time.time()) + 3600,
-        attributes={},
+def _config(key: SecretKey | None = None) -> AsterConfig:
+    return AsterConfig(
+        relay_mode="disabled",
+        bind_addr="127.0.0.1:0",
+        secret_key=key.to_bytes() if key is not None else None,
     )
-    cred.signature = sign_credential(cred, priv_raw)
-    return cred
 
 
-# ── Tests ────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_unadmitted_peer_denied_on_rpc_alpn():
-    """An unadmitted peer connecting directly on aster/1 is rejected by Gate 0.
-
-    The server has allow_all_consumers=False and Gate 0 is active.  A bare
-    endpoint that has never been through admission tries to open a bidi
-    stream on the RPC ALPN.  The connection should fail because the hook
-    loop denies the peer.
-    """
-    priv_raw, pub_raw = generate_root_keypair()
-
-    async with AsterServer(
-        services=[Gate0PingService()],
-        root_pubkey=pub_raw,
-        allow_all_consumers=False,
-    ) as srv:
-        # Create a bare client endpoint that tries to connect directly on
-        # the RPC ALPN, bypassing admission entirely.
-        ep = await create_endpoint_with_config(
-            EndpointConfig(alpns=[RPC_ALPN])
-        )
-        try:
-            server_addr = srv.node.node_addr_info()
-            conn = await ep.connect_node_addr(server_addr, RPC_ALPN)
-
-            # The connection itself may succeed at the QUIC level, but the
-            # hook loop should deny it.  The denial surfaces when we try to
-            # open a stream or the connection is reset.
-            with pytest.raises(Exception):
-                send, recv = await asyncio.wait_for(
-                    conn.open_bi(), timeout=5
-                )
-                # If open_bi succeeds, try to actually use the stream --
-                # the server side will have rejected the connection so the
-                # stream should fail.
-                await send.write_all(b"hello")
-                await send.finish()
-                await asyncio.wait_for(
-                    recv.read_to_end(64 * 1024), timeout=5
-                )
-        finally:
-            await ep.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(30)
-async def test_admission_alpn_always_open():
-    """An unadmitted peer can connect on consumer_admission ALPN.
-
-    Even with Gate 0 active, admission ALPNs are always allowed so that
-    new peers can present their credentials.
-    """
-    priv_raw, pub_raw = generate_root_keypair()
-
-    async with AsterServer(
-        services=[Gate0PingService()],
-        root_pubkey=pub_raw,
-        allow_all_consumers=False,
-    ) as srv:
-        # Create a bare endpoint and connect on the consumer_admission ALPN.
-        ep = await create_endpoint_with_config(
-            EndpointConfig(alpns=[ALPN_CONSUMER_ADMISSION])
-        )
-        try:
-            server_addr = srv.node.node_addr_info()
-            conn = await ep.connect_node_addr(
-                server_addr, ALPN_CONSUMER_ADMISSION
-            )
-
-            # Open a bidi stream and send an admission request.  Even with
-            # an empty credential, the server will respond (denied, but the
-            # connection itself is not blocked by Gate 0).
-            send, recv = await conn.open_bi()
-            req = ConsumerAdmissionRequest(credential_json="")
-            await send.write_all(req.to_json().encode())
-            await send.finish()
-
-            raw_resp = await asyncio.wait_for(
-                recv.read_to_end(64 * 1024), timeout=10
-            )
-            resp = ConsumerAdmissionResponse.from_json(raw_resp)
-
-            # The response should be denied (empty credential + gate closed),
-            # but the important thing is that we GOT a response at all --
-            # proving Gate 0 let the admission ALPN through.
-            assert resp.admitted is False
-        finally:
-            await ep.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(30)
-async def test_admitted_peer_can_use_rpc():
-    """After admission with a valid credential, the peer can make RPC calls.
-
-    Full flow:
-      1. Server starts with Gate 0 active (allow_all_consumers=False).
-      2. Client connects via AsterClient with a valid policy credential.
-         AsterClient automatically runs the admission handshake.
-      3. After admission, the client can call the RPC service.
-    """
-    priv_raw, pub_raw = generate_root_keypair()
-
-    # Build a credential file-like inline credential for AsterClient.
-    cred = _make_policy_cred(priv_raw, pub_raw)
-
-    async with AsterServer(
-        services=[Gate0PingService()],
-        root_pubkey=pub_raw,
-        allow_all_consumers=False,
-    ) as srv:
-        addr_b64 = srv.endpoint_addr_b64
-
-        # AsterClient with an inline credential.  We provide it via the
-        # config enrollment_credential mechanism by writing a temp file.
-        import json
-        import tempfile
-        import os
-
-        cred_dict = {
-            "credential_type": cred.credential_type,
-            "root_pubkey": cred.root_pubkey.hex(),
-            "expires_at": cred.expires_at,
-            "attributes": cred.attributes,
-            "endpoint_id": cred.endpoint_id,
-            "nonce": cred.nonce.hex() if cred.nonce else None,
-            "signature": cred.signature.hex(),
-        }
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as tf:
-            json.dump(cred_dict, tf)
-            cred_path = tf.name
-
-        try:
-            client = AsterClient(
-                endpoint_addr=addr_b64,
-                root_pubkey=pub_raw,
-                enrollment_credential_file=cred_path,
-            )
+async def test_unadmitted_peer_is_refused():
+    gate = GatePolicy()
+    async with AsterServer(services=[Gate0PingService()], config=_config(), gate=gate) as srv:
+        assert srv.gate is gate
+        client = AsterClient(config=_config(), address=srv.address)
+        with pytest.raises(AdmissionDeniedError) as denied:
             await client.connect()
-
-            # The client is now admitted.  Make an RPC call.
-            svc = await client.client(Gate0PingService)
-            resp = await svc.ping(PingRequest(payload="gate0"))
-            assert isinstance(resp, PingResponse)
-            assert resp.payload == "pong:gate0"
-
-            await client.close()
-        finally:
-            os.unlink(cred_path)
+        assert not denied.value.had_credential
+        assert "aster enroll node" in str(denied.value)
+        await client.close()
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_admission_then_rpc_manual_flow():
-    """Manual admission flow followed by RPC, proving Gate 0 transitions.
-
-    This test uses low-level primitives (no AsterClient) to demonstrate
-    the exact sequence:
-      1. Unadmitted peer connects on consumer_admission ALPN (allowed).
-      2. Peer presents a valid credential and is admitted.
-      3. Same peer connects on RPC ALPN (now allowed by Gate 0).
-    """
-    priv_raw, pub_raw = generate_root_keypair()
-
-    async with AsterServer(
-        services=[Gate0PingService()],
-        root_pubkey=pub_raw,
-        allow_all_consumers=False,
-    ) as srv:
-        # Peer endpoint that registers both ALPNs.
-        ep = await create_endpoint_with_config(
-            EndpointConfig(alpns=[ALPN_CONSUMER_ADMISSION, RPC_ALPN])
-        )
-        try:
-            server_addr = srv.node.node_addr_info()
-
-            # Step 1: Connect on consumer_admission and present credential.
-            cred = _make_policy_cred(priv_raw, pub_raw)
-            conn_adm = await ep.connect_node_addr(
-                server_addr, ALPN_CONSUMER_ADMISSION
-            )
-            send, recv = await conn_adm.open_bi()
-            req = ConsumerAdmissionRequest(
-                credential_json=consumer_cred_to_json(cred)
-            )
-            await send.write_all(req.to_json().encode())
-            await send.finish()
-
-            raw_resp = await asyncio.wait_for(
-                recv.read_to_end(64 * 1024), timeout=10
-            )
-            resp = ConsumerAdmissionResponse.from_json(raw_resp)
-            assert resp.admitted is True
-            assert len(resp.services) == 1
-            assert resp.services[0].name == "Gate0PingService"
-
-            # Step 2: Now connect on the RPC ALPN.  Gate 0 should let us
-            # through because we were admitted in step 1.
-            from aster.client import create_client
-
-            conn_rpc = await ep.connect_node_addr(server_addr, RPC_ALPN)
-            client = create_client(Gate0PingService, connection=conn_rpc)
-            resp = await client.ping(PingRequest(payload="manual"))
-            assert isinstance(resp, PingResponse)
-            assert resp.payload == "pong:manual"
-            await client.close()
-
-            # The credential admitted the peer into the Rust Gate-0 store,
-            # bounded by the credential's expiry.
-            peer = ep.endpoint_id()
-            assert srv.gate.trust_mode == TrustMode.PROTECTED
-            assert srv.gate.is_admitted(peer)
-            record = srv.gate.store.get(peer)
-            assert record.source == "credential"
-            assert record.expires_at <= cred.expires_at
-
-            # Revoking closes the gate for new connections.
-            srv.gate.revoke(peer)
-            conn_denied = await ep.connect_node_addr(server_addr, RPC_ALPN)
-            closed = await asyncio.wait_for(conn_denied.closed(), timeout=10)
-            assert closed["code"] == 403
-            assert closed["reason"] == b"peer not admitted"
-        finally:
-            await ep.close()
+async def test_admitted_peer_reaches_rpc_with_gate_attributes():
+    gate = GatePolicy()
+    key = SecretKey.generate()
+    async with AsterServer(services=[Gate0PingService()], config=_config(), gate=gate) as srv:
+        gate.admit(key.public_key().to_hex(), attributes={"aster.role": "ops.admin"})
+        async with AsterClient(config=_config(key), address=srv.address) as client:
+            svc = await client.client(Gate0PingService)
+            assert (await svc.ping(PingRequest(payload="x"))).payload == "pong:x"
+            assert (await svc.admin(PingRequest(payload="y"))).payload == "admin:y"
 
 
-def test_producer_mesh_admission_rejected():
-    """Producer mesh admission was removed; allow_all_producers=False must
-    fail loudly instead of silently running without a producer gate."""
-    _, pub_raw = generate_root_keypair()
-    with pytest.raises(NotImplementedError, match="allow_all_producers"):
-        AsterServer(
-            services=[Gate0PingService()],
-            config=AsterConfig(),
-            root_pubkey=pub_raw,
-            allow_all_producers=False,
-        )
+@pytest.mark.timeout(30)
+async def test_open_server_admits_anyone_but_requires_still_applies():
+    async with AsterServer(services=[Gate0PingService()], config=_config()) as srv:
+        assert srv.gate is None and srv.enrollment is None
+        async with AsterClient(config=_config(), address=srv.address) as client:
+            assert client.open_gate
+            svc = await client.client(Gate0PingService)
+            assert (await svc.ping(PingRequest(payload="z"))).payload == "pong:z"
+            with pytest.raises(PermissionDeniedError):
+                await svc.admin(PingRequest(payload="z"))

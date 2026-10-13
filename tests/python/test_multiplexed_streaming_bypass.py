@@ -103,7 +103,6 @@ async def test_streaming_substreams_bypass_the_pool():
 
     async with AsterServer(
         services=[StreamingBypassService()],
-        allow_all_consumers=True,
     ) as server:
         addr_b64 = server.endpoint_addr_b64
 

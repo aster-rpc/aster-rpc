@@ -103,9 +103,10 @@ every start unless you set `secret_key` or `secret_key_file`. `AsterServer` and
 configured, they use `<storage_path>/node.key`.
 
 The `.aster-identity` TOML file, selected by `identity_file` or found
-automatically in the working directory, is a *credential* file. It holds peers,
-the root key and enrollment material, not the node key file. If it has a
-`[node] secret_key`, that key is used when the config does not set one.
+automatically in the working directory, holds peers and published-service
+tokens, not the node key file. If it has a `[node] secret_key`, that key is
+used when the config does not set one. Enrollment credentials are separate
+chain files (`[trust] enrollment_credential`, section 4).
 
 ## 4. `AsterServer` / `AsterClient`
 
@@ -114,13 +115,24 @@ config is given, and start their node with `Node.start`. Persistent storage,
 relay settings, transport tuning and the identity rules above therefore apply
 to both.
 
-`AsterServer` always attaches a Rust Gate 0 (section 5), exposed as
-`server.gate`. It is `PROTECTED` (failing closed) when consumer admission is
-on (`allow_all_consumers=False`) and `OPEN_DEV` otherwise; pass
-`AsterServer(..., gate=GatePolicy(...))` to supply your own. A peer that
-passes credential admission is admitted into `server.gate` with the
-credential's attributes and expiry (capped by `ASTER_PEER_TTL_S`, default 24
-hours), and RPC handlers read those attributes from the same store.
+Admission is configuration. With Enrollment configured (`[trust]
+root_pubkey` and a credential, plus `[enrollment] audience` and
+`fleet_namespace`; the schema, TOML keys and `ASTER_ENROLLMENT_*` variables
+are those of the Rust `AsterConfig`, `aster.EnrollmentConfig` in Python),
+Enrollment owns Gate 0: `AsterServer` admits only nodes holding a credential
+from the root, maps each peer's verified claims to roles (`[enrollment.roles]`,
+default the `aster.role` claim) that `requires=` checks on every call, closes
+a revoked peer's connections, and renews its own credential. `AsterClient`
+presents its credential over the reciprocal enrollment handshake, syncs the
+fleet namespace the server offers, and renews. Any missing or malformed
+setting fails `start()` / `connect()` with `ValueError`; nothing falls back
+to an open node. `server.enrollment` / `client.enrollment` expose the
+installed `aster.Enrollment`. Credentials come from the `aster` CLI (`aster
+enroll node`); see `examples/python/mission_control/README.md`.
+
+Without enrollment the server is open. `AsterServer(..., gate=GatePolicy(...))`
+supplies a custom Gate 0 instead (section 5); `server.gate.admit(peer,
+attributes=...)` then records the attributes `requires=` reads, and
 `server.gate.revoke(peer_id)` shuts the peer out of new connections.
 
 ### How RPC is served
@@ -137,8 +149,8 @@ in Rust (`aster::rpc::Server` with dynamic dispatch):
 - **Pre-dispatch.** Rust decodes the header and looks up the service and
   method. It checks the serialization mode and applies the session rules
   (per-connection sessions, graveyard, `max_sessions_per_connection`). It
-  then runs Gate 3 (`requires=`, checked against the attributes your gate
-  recorded for the caller) and arms the deadline. A refused call never
+  then runs Gate 3 (`requires=`, checked against the caller's enrollment
+  roles or the attributes your gate recorded) and arms the deadline. A refused call never
   reaches Python.
 - **Deadlines.** The effective deadline is the minimum of the caller's
   deadline, the method's `timeout=` and the server's handler cap (300 s,
@@ -157,7 +169,8 @@ in Rust (`aster::rpc::Server` with dynamic dispatch):
 - **Interceptors** run in Python as before: request, handler, response, and
   for streams also error.
 - **Baseline services.** The node also serves `aster.ops.NodeInfo`, from
-  Rust.
+  Rust; its `aster.services` / `aster.registry_namespace` attributes tell an
+  `AsterClient` which services the server offers.
 
 Clients (`create_client`, `AsterClient.client`, the proxies) call through the
 pooled Rust `RpcConnection` (`aster._aster.RpcClient`). A unary call is one
@@ -167,10 +180,10 @@ Rust clients on one connection never collide.
 
 ## 5. Gate 0: connection-level admission
 
-Gate 0 runs in Rust (the `aster` crate's `GatePolicy` and
-`PeerAdmissionStore`). Admission ALPNs (`ALPN_CONSUMER_ADMISSION`,
-`ALPN_PRODUCER_ADMISSION`, `ALPN_DELEGATED_ADMISSION`) are always open, so an
-unknown peer can present a credential. In `TrustMode.PROTECTED` every other
+Gate 0 runs in Rust. With Enrollment configured it is Enrollment's
+(section 4). Otherwise you may attach a `GatePolicy` (the `aster` crate's
+`GatePolicy` and `PeerAdmissionStore`). Its admission ALPNs
+(`ALPN_PRODUCER_ADMISSION`, `ALPN_DELEGATED_ADMISSION`) are always open. In `TrustMode.PROTECTED` every other
 ALPN (RPC, blobs, docs, gossip, your own) needs an unexpired admission. In
 `TrustMode.OPEN_DEV` everything is open.
 

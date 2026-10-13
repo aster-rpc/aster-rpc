@@ -1,8 +1,10 @@
 """Capability roles for Mission Control (Chapter 5).
 
-Each role maps to a string that appears in the aster.role attribute
-of enrollment credentials. The CapabilityInterceptor matches these
-against the requires= declarations on service methods.
+Each role is a string carried in the aster.role claim of a node's
+enrollment credential (aster enroll node --attributes roles.json). With
+enrollment configured, the server maps each peer's verified claims to its
+roles and Rust checks them against the requires= declarations on service
+methods (identical to the Rust example's roles.rs).
 """
 
 from enum import Enum
